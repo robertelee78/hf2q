@@ -60,14 +60,14 @@ pub(super) fn full_attention(
                 vec![query_rows, hidden],
                 Qwen35FutureDType::Bf16,
             )?,
-            wq_ggml_type: GgmlType::F32,
+            wq_ggml_type: GgmlType::BF16,
             w_gate: take(
                 "attn_gate",
                 "attn_q.gate",
                 vec![query_rows, hidden],
                 Qwen35FutureDType::Bf16,
             )?,
-            w_gate_ggml_type: GgmlType::F32,
+            w_gate_ggml_type: GgmlType::BF16,
         },
         wk: take(
             "attn_k",
@@ -75,14 +75,14 @@ pub(super) fn full_attention(
             vec![kv_rows, hidden],
             Qwen35FutureDType::Bf16,
         )?,
-        wk_ggml_type: GgmlType::F32,
+        wk_ggml_type: GgmlType::BF16,
         wv: take(
             "attn_v",
             "attn_v.weight",
             vec![kv_rows, hidden],
             Qwen35FutureDType::Bf16,
         )?,
-        wv_ggml_type: GgmlType::F32,
+        wv_ggml_type: GgmlType::BF16,
         attn_q_norm: take(
             "attn_q_norm",
             "attn_q_norm.weight",
@@ -101,7 +101,7 @@ pub(super) fn full_attention(
             vec![hidden, query_rows],
             Qwen35FutureDType::Bf16,
         )?,
-        wo_ggml_type: GgmlType::F32,
+        wo_ggml_type: GgmlType::BF16,
     })
 }
 
@@ -198,22 +198,22 @@ pub(super) fn linear_attention(
         attn_norm,
         post_attn_norm,
         attn_qkv,
-        attn_qkv_ggml_type: GgmlType::F32,
+        attn_qkv_ggml_type: GgmlType::BF16,
         attn_gate,
-        attn_gate_ggml_type: GgmlType::F32,
+        attn_gate_ggml_type: GgmlType::BF16,
         ssm_conv1d,
         ssm_alpha,
-        ssm_alpha_ggml_type: GgmlType::F32,
+        ssm_alpha_ggml_type: GgmlType::BF16,
         ssm_dt_bias,
         ssm_dt_bias_cpu,
         ssm_beta,
-        ssm_beta_ggml_type: GgmlType::F32,
+        ssm_beta_ggml_type: GgmlType::BF16,
         ssm_a,
         ssm_a_cpu,
         ssm_norm,
         ssm_norm_cpu,
         ssm_out,
-        ssm_out_ggml_type: GgmlType::F32,
+        ssm_out_ggml_type: GgmlType::BF16,
     })
 }
 

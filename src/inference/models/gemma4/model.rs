@@ -6,18 +6,23 @@
 //!
 //! Moved from `src/serve/forward_mlx.rs` by ADR-038 Step 3.
 
-use anyhow::Result;
-use mlx_native::{MlxBuffer, MlxDevice};
+use anyhow::{Context, Result};
+use mlx_native::{DType, GgmlType, MlxBuffer, MlxDevice};
 
 use crate::debug::INVESTIGATION_ENV;
+use crate::inference::dense_bf16_activation::NativeBf16Matrix;
+use crate::inference::dense_expert_activation::NativeScalarExpertMatrix;
 use crate::inference::models::gemma4::kv_cache::{
     DecodeRegime, DenseKvBuffers, HbKvBuffers, HybridKvBuffers, MlxKvCache,
 };
+use crate::inference::models::gemma4::native_matrix::{
+    load_mapped_projection, map_admitted_tensor_data, preflight_f32_state, preflight_io,
+    preflight_projections, resolve_tied_or_explicit, NativeF32StatePlan,
+};
 use crate::serve::config::{Gemma4Config, LayerType};
 use crate::serve::forward_mlx_shared::{
-    load_gguf_qweight, parse_dwq_moe_expert_role, parse_dwq_overlay_metadata,
-    parse_dwq_overlay_role, populate_f16_shadow_if_enabled, DwqOverlayRole, MlxAffineMoeStack,
-    MlxQWeight, MoeBaseRole,
+    map_native_gguf_tensor_view, parse_dwq_moe_expert_role, parse_dwq_overlay_metadata,
+    parse_dwq_overlay_role, DwqOverlayRole, MlxAffineMoeStack, MlxQWeight, MoeBaseRole,
 };
 use crate::serve::gpu::{GpuContext, QuantWeightInfo};
 
@@ -81,16 +86,20 @@ fn alloc_one_f32_placeholder(
 /// would falsify the runtime MoE `stacked_*.is_some()` gate (same iter-227
 /// pattern as `MlxMoeWeights::dense_placeholder`).
 ///
-/// Detection rule: deterministic, GGUF-metadata-only (never filename-based,
-/// per the iter-227 correctness pin) — `gguf.tensor_info(name).is_some()`.
+/// Detection rule: the preflight plan records deterministic GGUF-metadata
+/// presence (never filename-based, per the iter-227 correctness pin). A
+/// present optional norm is an exact mapped F32 view; only absence allocates
+/// the documented one-element placeholder.
 fn load_optional_norm_or_placeholder(
-    gguf: &mlx_native::gguf::GgufFile,
+    state_plan: &NativeF32StatePlan,
+    mapped: &mlx_native::gguf::GgufMappedTensorSet<'_>,
     name: &str,
     mlx_device: &mlx_native::MlxDevice,
     label: &'static str,
 ) -> Result<MlxBuffer> {
-    if gguf.tensor_info(name).is_some() {
-        gguf.load_tensor_f32(name, mlx_device)
+    if state_plan.is_present(name)? {
+        state_plan
+            .load_mapped(mapped, name)
             .map_err(|e| anyhow::anyhow!("{label} ({name}): {e}"))
     } else {
         alloc_one_f32_placeholder(mlx_device, label)
@@ -169,11 +178,23 @@ pub struct MlxMoeWeights {
 }
 
 impl MlxMoeWeights {
+    /// Affine expert overlays are one representation replacement, never two
+    /// independently optional role overrides. Every execution path calls this
+    /// before choosing a route so partial overlays fail closed consistently.
+    pub(crate) fn affine_pair(&self) -> Result<Option<(&MlxAffineMoeStack, &MlxAffineMoeStack)>> {
+        match (self.gate_up_affine.as_ref(), self.down_affine.as_ref()) {
+            (None, None) => Ok(None),
+            (Some(gate_up), Some(down)) => Ok(Some((gate_up, down))),
+            _ => anyhow::bail!("Gemma MoE affine overlays must replace gate/up and down together"),
+        }
+    }
+}
+
+impl MlxMoeWeights {
     /// Construct a placeholder MoE bundle for **dense** layers.
     ///
-    /// Wedge-4 / iter-227 (2026-05-02): dense GGUFs (e.g.
-    /// `qwen3-vl-2b-q4_0.gguf` from Wedge-4f convert) carry zero MoE
-    /// expert tensors. To keep the per-layer struct (`MlxDecoderLayerWeights`)
+    /// Dense GGUF layers carry zero MoE expert tensors. To keep the
+    /// per-layer struct (`MlxDecoderLayerWeights`)
     /// uniform across dense + MoE layers without rippling
     /// `Vec<Option<MlxMoeWeights>>` through the forward path, we expose
     /// this constructor: it returns a bundle with `stacked_gate_up: None`
@@ -205,7 +226,6 @@ impl MlxMoeWeights {
                     cols: 1,
                 },
                 affine: None,
-                f16_shadow: None,
                 decode_record_q6k_m1: std::sync::OnceLock::new(),
             },
             per_expert_scale: alloc_one_f32_placeholder(mlx_device, "per_expert_scale")?,
@@ -252,12 +272,69 @@ pub struct MlxDecoderLayerWeights {
     pub layer_type: LayerType,
 }
 
+/// One deliberately anonymous model-state allocation. Ordinary GGUF matrix
+/// and state bytes are excluded from this ledger and must remain file-backed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamedAnonymousModelBuffer {
+    name: String,
+    byte_len: u64,
+}
+
+/// Residency audit for ordinary GGUF model weights and state. The named list
+/// contains only the router-derived value and documented one-F32 placeholders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GemmaOrdinaryStorageSummary {
+    ordinary: crate::serve::forward_mlx_shared::NativeMatrixStorageSummary,
+    named_anonymous: Vec<NamedAnonymousModelBuffer>,
+}
+
+fn verify_ordinary_gguf_storage(storage: &GemmaOrdinaryStorageSummary) -> Result<u64> {
+    anyhow::ensure!(
+        storage.ordinary.unique_matrix_views > 0,
+        "Gemma production load retained no ordinary GGUF matrix/state views"
+    );
+    anyhow::ensure!(
+        storage.ordinary.anonymous_bytes == 0,
+        "Gemma production load created {} anonymous ordinary matrix/state bytes",
+        storage.ordinary.anonymous_bytes
+    );
+    storage
+        .named_anonymous
+        .iter()
+        .try_fold(0_u64, |total, entry| {
+            anyhow::ensure!(
+                entry.byte_len > 0,
+                "Gemma named anonymous model buffer '{}' is empty",
+                entry.name
+            );
+            total
+                .checked_add(entry.byte_len)
+                .ok_or_else(|| anyhow::anyhow!("Gemma named anonymous storage byte count overflow"))
+        })
+}
+
+fn push_qweight_storage<'a>(weight: &'a MlxQWeight, buffers: &mut Vec<&'a MlxBuffer>) {
+    buffers.push(&weight.buffer);
+    if let Some(affine) = weight.affine.as_ref() {
+        buffers.extend([&affine.scales, &affine.biases]);
+    }
+}
+
+fn is_documented_one_f32_placeholder(buffer: &MlxBuffer) -> bool {
+    !buffer.is_file_backed()
+        && buffer.dtype() == mlx_native::DType::F32
+        && buffer.shape() == [1]
+        && buffer.data_byte_len() == std::mem::size_of::<f32>()
+}
+
 // MlxKvCache, HbKvBuffers, DenseKvBuffers, HybridKvBuffers, alloc_hybrid_kv_for_layer,
 // and DecodeRegime moved to crate::inference::models::gemma4::kv_cache
 // (ADR-038 Step 2). Imported above via the use statement.
 
 /// Reusable activation buffers for one forward pass.
 pub struct MlxActivationBuffers {
+    /// Reusable token-id input for one-row native embedding gather.
+    pub embedding_token_id: MlxBuffer,
     /// Hidden state `[1, hidden_size]` F32.
     pub hidden: MlxBuffer,
     /// Scratch buffer for attention Q output `[1, num_heads * head_dim]` F32.
@@ -294,7 +371,7 @@ pub struct MlxActivationBuffers {
     pub argmax_index: MlxBuffer,
     /// Argmax output value buffer `[1]` F32.
     pub argmax_value: MlxBuffer,
-    /// Argmax params buffer.
+    /// Argmax params buffer `[vocab_size]` as U32.
     pub argmax_params: MlxBuffer,
     /// Logits output buffer `[1, vocab_size]` F32.
     pub logits: MlxBuffer,
@@ -317,10 +394,6 @@ pub struct MlxActivationBuffers {
     pub moe_down_id_out: MlxBuffer,
     /// MoE scratch: swiglu output for _id path `[top_k, moe_intermediate]` F32.
     pub moe_swiglu_id_out: MlxBuffer,
-    /// F16 scratch for lm_head GPU path: hidden state cast to F16 `[1, hidden_size]`.
-    pub hidden_f16: MlxBuffer,
-    /// F16 scratch for lm_head GPU path: logits output `[1, vocab_size]`.
-    pub logits_f16: MlxBuffer,
     // --- Session merge buffers (S1+S2 collapse) ---
     /// Per-head norm params for sliding layers: `[eps, sliding_head_dim]` F32.
     pub norm_params_sliding_hd: MlxBuffer,
@@ -341,22 +414,17 @@ pub struct MlxActivationBuffers {
 
 /// All mlx-native weights for the full Gemma 4 model.
 pub struct MlxModelWeights {
-    pub embed_weight: MlxBuffer,
+    /// Model-lifetime authority for artifact-native route plans. Zero means
+    /// the loaded weights have not completed activation against a GPU context.
+    pub(super) native_activation_epoch: std::sync::atomic::AtomicU64,
+    /// Artifact-native token table.  When `lm_head` is `None`, this exact
+    /// buffer is also the tied output head.
+    pub embed_weight: MlxQWeight,
     pub layers: Vec<MlxDecoderLayerWeights>,
     pub final_norm: MlxBuffer,
-    pub lm_head_f16: Option<MlxBuffer>,
-    /// Optional Q8_0-quantized lm_head (gated on HF2Q_LMHEAD_Q8=1 at load).
-    /// When present and the env var is still set at decode time, used instead
-    /// of lm_head_f16 via dispatch_qmatmul. Halves weight memory traffic vs F16.
-    pub lm_head_q8: Option<MlxQWeight>,
-    /// Optional Q6_K-native lm_head (gated on HF2Q_LMHEAD_Q6K=1 at load).
-    /// ADR-028 iter-188: gemma4 ships token_embd.weight as Q6_K [2816, 262144]
-    /// = 605 MB; current Q8_0 re-quant path stores 784 MB.  Loading the
-    /// on-disk Q6_K storage directly saves ~0.33 ms/token in lm_head
-    /// (= ~2% gemma4 throughput).  Embedding lookup at input still uses
-    /// the F32 `embed_weight`, so this is purely additive at load.
-    /// Preferred over `lm_head_q8` when both are present.
-    pub lm_head_q6k: Option<MlxQWeight>,
+    /// Explicit untied `output.weight`, if the artifact declares one.
+    /// Absence means tied storage; no duplicate buffer is synthesized.
+    pub lm_head: Option<MlxQWeight>,
     pub hidden_size: usize,
     pub vocab_size: usize,
     pub num_attention_heads: usize,
@@ -452,7 +520,7 @@ pub struct MlxModelWeights {
     // iter-222 (2026-05-01) along with the iter-34 dense-on-shadow Leg F decode
     // branch and `dense_sdpa_on_tq_kv_enabled()` helper. See the file-level
     // iter-222 closure note above the deleted helper site for the rationale
-    // (Gate H regression + peer-impl research + "no fallback" mantra). The
+    // (Gate H regression plus the "no fallback" contract). The
     // inline-fused TQ-native kernels (`flash_attn_vec_tq` / `flash_attn_vec_tq_hb`)
     // read directly from the TQ-packed `kv_caches[layer].{k,v}_packed` and
     // `leg_hb_encoded` buffers respectively — no F32 shadow cache required.
@@ -698,7 +766,313 @@ const _: fn() = || {
 // MoeBaseRole, parse_dwq_moe_expert_role moved to forward_mlx_shared.rs
 // (ADR-038 Step 1). Re-exported via the pub use shim above.
 
+fn gemma_native_bf16_matrix<'a>(
+    label: &'a str,
+    weight: &'a MlxQWeight,
+) -> Result<Option<NativeBf16Matrix<'a>>> {
+    if weight.affine.is_some() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        (weight.buffer.dtype() == DType::BF16) == (weight.info.ggml_dtype == GgmlType::BF16),
+        "{label}: Gemma buffer storage {} disagrees with declared type {:?}",
+        weight.buffer.dtype(),
+        weight.info.ggml_dtype
+    );
+    if weight.info.ggml_dtype != GgmlType::BF16 {
+        return Ok(None);
+    }
+    Ok(Some(NativeBf16Matrix::unbatched(
+        label,
+        &weight.buffer,
+        u32::try_from(weight.info.rows)?,
+        u32::try_from(weight.info.cols)?,
+    )))
+}
+
 impl MlxModelWeights {
+    pub(crate) fn native_bf16_matrices(&self) -> Result<Vec<NativeBf16Matrix<'_>>> {
+        fn push<'a>(
+            out: &mut Vec<NativeBf16Matrix<'a>>,
+            label: &'static str,
+            weight: &'a MlxQWeight,
+        ) -> Result<()> {
+            if let Some(matrix) = gemma_native_bf16_matrix(label, weight)? {
+                out.push(matrix);
+            }
+            Ok(())
+        }
+
+        let mut out = Vec::new();
+        for layer in &self.layers {
+            push(&mut out, "Gemma Q projection", &layer.attn.q_proj)?;
+            push(&mut out, "Gemma K projection", &layer.attn.k_proj)?;
+            if let Some(v_proj) = layer.attn.v_proj.as_ref() {
+                push(&mut out, "Gemma V projection", v_proj)?;
+            }
+            push(&mut out, "Gemma attention output", &layer.attn.o_proj)?;
+            push(&mut out, "Gemma FFN gate", &layer.mlp.gate_proj)?;
+            push(&mut out, "Gemma FFN up", &layer.mlp.up_proj)?;
+            push(&mut out, "Gemma FFN down", &layer.mlp.down_proj)?;
+            push(&mut out, "Gemma MoE router", &layer.moe.router_proj)?;
+        }
+        push(
+            &mut out,
+            "Gemma output head",
+            self.lm_head.as_ref().unwrap_or(&self.embed_weight),
+        )?;
+        Ok(out)
+    }
+
+    pub(crate) fn native_scalar_expert_matrices(
+        &self,
+    ) -> Result<Vec<NativeScalarExpertMatrix<'_>>> {
+        use mlx_native::{DenseMatmulIdInputLayout, DenseMatmulIdMultiplicity};
+
+        let calibrated_m = super::native_expert_activation_widths();
+        let mut out = Vec::new();
+        for layer in &self.layers {
+            let moe = &layer.moe;
+            if let Some((gate_up, down)) = moe.affine_pair()? {
+                gate_up.validate_geometry(
+                    "Gemma expert gate/up",
+                    moe.moe_intermediate_size
+                        .checked_mul(2)
+                        .context("Gemma affine gate/up width overflow")?,
+                    self.hidden_size,
+                    self.num_experts,
+                )?;
+                down.validate_geometry(
+                    "Gemma expert down",
+                    self.hidden_size,
+                    moe.moe_intermediate_size,
+                    self.num_experts,
+                )?;
+                continue;
+            }
+            let Some(gate_up) = moe.stacked_gate_up.as_ref() else {
+                continue;
+            };
+            let down = moe
+                .stacked_down
+                .as_ref()
+                .context("Gemma MoE layer has gate/up experts but no down experts")?;
+            for (label, weight, ggml_type, n, k, stride, input_layout) in [
+                (
+                    "Gemma expert gate/up",
+                    gate_up,
+                    moe.gate_up_ggml_dtype,
+                    moe.moe_intermediate_size
+                        .checked_mul(2)
+                        .context("Gemma gate/up expert width overflow")?,
+                    self.hidden_size,
+                    moe.gate_up_expert_stride,
+                    DenseMatmulIdInputLayout::SharedPerToken,
+                ),
+                (
+                    "Gemma expert down",
+                    down,
+                    moe.down_ggml_dtype,
+                    self.hidden_size,
+                    moe.moe_intermediate_size,
+                    moe.down_expert_stride,
+                    DenseMatmulIdInputLayout::Slotted,
+                ),
+            ] {
+                if !matches!(ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+                    continue;
+                }
+                let expected_dtype = match ggml_type {
+                    GgmlType::F32 => DType::F32,
+                    GgmlType::F16 => DType::F16,
+                    GgmlType::BF16 => DType::BF16,
+                    _ => unreachable!(),
+                };
+                anyhow::ensure!(
+                    weight.dtype() == expected_dtype,
+                    "{label}: declared {ggml_type:?} but maps as {}",
+                    weight.dtype()
+                );
+                out.push(NativeScalarExpertMatrix {
+                    label,
+                    weight,
+                    n: u32::try_from(n)?,
+                    k: u32::try_from(k)?,
+                    top_k: u32::try_from(moe.top_k)?,
+                    n_experts: u32::try_from(self.num_experts)?,
+                    expert_stride_bytes: stride,
+                    input_layout,
+                    id_multiplicity: DenseMatmulIdMultiplicity::DistinctPerToken,
+                    calibrated_m: calibrated_m.clone(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Freeze the complete target representation union before any Gemma
+    /// projection can execute. Drafter matrices extend only the dense BF16
+    /// portion; target scalar expert identities are always included.
+    pub(crate) fn activate_native_routes(
+        &self,
+        ctx: &mut GpuContext,
+        extra_bf16: &[NativeBf16Matrix<'_>],
+    ) -> Result<()> {
+        let mut dense = self.native_bf16_matrices()?;
+        dense.extend_from_slice(extra_bf16);
+        // Inventory and validate both representation families before either
+        // helper can freeze immutable registry state.
+        let experts = self.native_scalar_expert_matrices()?;
+        ctx.activate_native_bf16_dense(&dense)?;
+        ctx.activate_native_scalar_experts(&experts)?;
+        let activation_epoch = ctx.activation_epoch();
+        self.native_activation_epoch
+            .compare_exchange(
+                0,
+                activation_epoch,
+                std::sync::atomic::Ordering::Release,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|bound| {
+                anyhow::anyhow!(
+                    "Gemma weights are already bound to activation epoch {bound}; cannot bind epoch {activation_epoch}"
+                )
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn native_activation_epoch(&self) -> Result<u64> {
+        let epoch = self
+            .native_activation_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        anyhow::ensure!(epoch != 0, "Gemma native routes were not activated");
+        Ok(epoch)
+    }
+
+    /// Resolve the artifact-declared output head.  A missing `output.weight`
+    /// is the tied case and intentionally returns the embedding allocation.
+    #[inline]
+    pub fn resolved_lm_head(&self) -> &MlxQWeight {
+        resolve_tied_or_explicit(&self.embed_weight, self.lm_head.as_ref())
+    }
+
+    /// Account every ordinary GGUF matrix/state view retained by the model.
+    /// Any anonymous byte in `ordinary` is an implicit transform and therefore
+    /// a load-contract violation. The separate named ledger is limited to the
+    /// precomputed router weight and exact one-F32 structural placeholders.
+    fn ordinary_gguf_storage_summary(&self) -> Result<GemmaOrdinaryStorageSummary> {
+        let mut ordinary = Vec::new();
+        let mut named_anonymous = Vec::new();
+        push_qweight_storage(&self.embed_weight, &mut ordinary);
+        if let Some(head) = self.lm_head.as_ref() {
+            push_qweight_storage(head, &mut ordinary);
+        }
+        ordinary.push(&self.final_norm);
+
+        let mut record_named = |name: String, buffer: &MlxBuffer| -> Result<()> {
+            if buffer.is_file_backed() {
+                anyhow::bail!(
+                    "Gemma named anonymous model buffer '{name}' unexpectedly has file backing"
+                );
+            }
+            named_anonymous.push(NamedAnonymousModelBuffer {
+                name,
+                byte_len: u64::try_from(buffer.data_byte_len())?,
+            });
+            Ok(())
+        };
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            for projection in [
+                &layer.attn.q_proj,
+                &layer.attn.k_proj,
+                &layer.attn.o_proj,
+                &layer.mlp.gate_proj,
+                &layer.mlp.up_proj,
+                &layer.mlp.down_proj,
+            ] {
+                push_qweight_storage(projection, &mut ordinary);
+            }
+            if let Some(projection) = layer.attn.v_proj.as_ref() {
+                push_qweight_storage(projection, &mut ordinary);
+            }
+            ordinary.extend([
+                &layer.attn.q_norm_weight,
+                &layer.attn.k_norm_weight,
+                &layer.norms.input_layernorm,
+                &layer.norms.post_attention_layernorm,
+                &layer.norms.pre_feedforward_layernorm,
+                &layer.norms.post_feedforward_layernorm,
+                &layer.layer_scalar,
+            ]);
+
+            for (suffix, buffer) in [
+                (
+                    "pre_ffw_norm_2.weight",
+                    &layer.norms.pre_feedforward_layernorm_2,
+                ),
+                (
+                    "post_ffw_norm_1.weight",
+                    &layer.norms.post_feedforward_layernorm_1,
+                ),
+                (
+                    "post_ffw_norm_2.weight",
+                    &layer.norms.post_feedforward_layernorm_2,
+                ),
+            ] {
+                if is_documented_one_f32_placeholder(buffer) {
+                    record_named(format!("blk.{layer_index}.{suffix}:placeholder"), buffer)?;
+                } else {
+                    ordinary.push(buffer);
+                }
+            }
+
+            match (&layer.moe.stacked_gate_up, &layer.moe.stacked_down) {
+                (Some(gate_up), Some(down)) => {
+                    ordinary.extend([gate_up, down, &layer.moe.per_expert_scale]);
+                    push_qweight_storage(&layer.moe.router_proj, &mut ordinary);
+                    record_named(
+                        format!("blk.{layer_index}.router_combined_weight:derived"),
+                        &layer.moe.router_combined_weight,
+                    )?;
+                }
+                (None, None) => {
+                    for (role, buffer) in [
+                        ("router_proj", &layer.moe.router_proj.buffer),
+                        ("per_expert_scale", &layer.moe.per_expert_scale),
+                        ("router_combined_weight", &layer.moe.router_combined_weight),
+                    ] {
+                        if is_documented_one_f32_placeholder(buffer) {
+                            record_named(
+                                format!("blk.{layer_index}.{role}:dense-placeholder"),
+                                buffer,
+                            )?;
+                        } else {
+                            ordinary.push(buffer);
+                        }
+                    }
+                }
+                _ => anyhow::bail!(
+                    "Gemma layer {layer_index} retained only one of its two expert stacks"
+                ),
+            }
+        }
+        if self.activations.rope_freq_factors_gpu.is_file_backed() {
+            ordinary.push(&self.activations.rope_freq_factors_gpu);
+        } else if is_documented_one_f32_placeholder(&self.activations.rope_freq_factors_gpu) {
+            record_named(
+                "rope_freqs.weight:placeholder".to_owned(),
+                &self.activations.rope_freq_factors_gpu,
+            )?;
+        } else {
+            ordinary.push(&self.activations.rope_freq_factors_gpu);
+        }
+
+        Ok(GemmaOrdinaryStorageSummary {
+            ordinary: crate::serve::forward_mlx_shared::summarize_native_matrix_storage(ordinary)?,
+            named_anonymous,
+        })
+    }
+
     /// ADR-030 Phase 4 — install a DFlash hidden-state capture session.
     ///
     /// While installed, `forward_prefill_batched` will populate the
@@ -752,44 +1126,50 @@ impl MlxModelWeights {
         if n_tokens == 0 {
             anyhow::bail!("embed_tokens: empty tokens");
         }
-        let scale = (hs as f32).sqrt();
-        let (exec, _reg) = gpu.split();
+        for &token in tokens {
+            if token as usize >= self.embed_weight.info.rows {
+                anyhow::bail!(
+                    "embed_tokens: token id {} out of vocab range {}",
+                    token,
+                    self.embed_weight.info.rows
+                );
+            }
+        }
+        let (exec, reg) = gpu.split();
         let dev = exec.device();
-        let mut out = dev
+        let out = dev
             .alloc_buffer(
                 n_tokens * hs * 4,
                 mlx_native::DType::F32,
                 vec![n_tokens, hs],
             )
             .map_err(|e| anyhow::anyhow!("alloc embed output: {e}"))?;
-        let embed_f32: &[f32] = self
-            .embed_weight
-            .as_slice()
-            .map_err(|e| anyhow::anyhow!("embed_weight slice: {e}"))?;
-        // Validate vocab bound
-        let vocab_in_buf = embed_f32.len() / hs;
-        for &tok in tokens.iter() {
-            if (tok as usize) >= vocab_in_buf {
-                anyhow::bail!(
-                    "embed_tokens: token id {} out of vocab range {}",
-                    tok,
-                    vocab_in_buf
-                );
-            }
-        }
-        {
-            let out_slice: &mut [f32] = out
-                .as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("embed output slice: {e}"))?;
-            for (i, &tok) in tokens.iter().enumerate() {
-                let src = (tok as usize) * hs;
-                let dst = i * hs;
-                out_slice[dst..dst + hs].copy_from_slice(&embed_f32[src..src + hs]);
-            }
-            for v in out_slice.iter_mut() {
-                *v *= scale;
-            }
-        }
+        let mut token_ids = dev
+            .alloc_buffer(
+                n_tokens * std::mem::size_of::<u32>(),
+                mlx_native::DType::U32,
+                vec![n_tokens],
+            )
+            .map_err(|e| anyhow::anyhow!("alloc embed token ids: {e}"))?;
+        token_ids
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow::anyhow!("write embed token ids: {e}"))?
+            .copy_from_slice(tokens);
+        let mut session = exec
+            .begin()
+            .map_err(|e| anyhow::anyhow!("begin embed session: {e}"))?;
+        crate::inference::models::gemma4::native_matrix::encode_embedding(
+            &mut session,
+            reg,
+            dev,
+            &self.embed_weight,
+            &token_ids,
+            &out,
+            n_tokens,
+        )?;
+        session
+            .finish()
+            .map_err(|e| anyhow::anyhow!("finish embed session: {e}"))?;
         Ok(out)
     }
 
@@ -811,16 +1191,40 @@ impl MlxModelWeights {
         let mlx_device = gpu.device();
         tracing::debug!("Loading mlx-native weights directly from GGUF...");
 
-        // ADR-028 iter-482: time pre-loop loads (embed_weight + final_norm)
-        // separately to verify iter-481's embed_weight ~200ms estimate.
+        // Preflight the tied/untied IO contract before any Metal allocation.
+        // Malformed or unsupported storage therefore cannot leave a partially
+        // loaded multi-gigabyte model behind.
         let load_timing = std::env::var("HF2Q_LOAD_TIMING").as_deref() == Ok("1");
         let t_pre = std::time::Instant::now();
-
-        // --- Embedding weight (F32) ---
-        tracing::debug!("Loading embed_weight");
-        let embed_weight = gguf
-            .load_tensor_f32("token_embd.weight", mlx_device)
-            .map_err(|e| anyhow::anyhow!("embed: {e}"))?;
+        let io_plan = preflight_io(gguf, cfg.vocab_size, cfg.hidden_size)?;
+        preflight_projections(gguf, cfg)?;
+        let state_plan = preflight_f32_state(gguf, cfg)?;
+        let mapped = map_admitted_tensor_data(gguf, mlx_device)?;
+        let embed_weight = MlxQWeight::from_mapped_gguf_tensor(
+            &mapped,
+            gguf.tensor_info(&io_plan.embedding.name)
+                .expect("embedding passed preflight"),
+        )?;
+        let lm_head = io_plan
+            .output
+            .as_ref()
+            .map(|spec| {
+                MlxQWeight::from_mapped_gguf_tensor(
+                    &mapped,
+                    gguf.tensor_info(&spec.name)
+                        .expect("output head passed preflight"),
+                )
+            })
+            .transpose()?;
+        tracing::info!(
+            "Gemma IO matrices retain artifact storage: embedding={:?}, head={}, tied={}, file_backed=true",
+            embed_weight.info.ggml_dtype,
+            lm_head
+                .as_ref()
+                .map(|weight| format!("{:?}", weight.info.ggml_dtype))
+                .unwrap_or_else(|| "embedding".to_owned()),
+            lm_head.is_none(),
+        );
         if load_timing {
             tracing::info!(
                 "[LOAD_TIMING] embed_weight_load={:.0}ms",
@@ -831,8 +1235,8 @@ impl MlxModelWeights {
 
         // --- Final norm (F32) ---
         tracing::debug!("Loading final_norm");
-        let final_norm = gguf
-            .load_tensor_f32("output_norm.weight", mlx_device)
+        let final_norm = state_plan
+            .load_mapped(&mapped, "output_norm.weight")
             .map_err(|e| anyhow::anyhow!("final_norm: {e}"))?;
         if load_timing {
             tracing::info!(
@@ -840,254 +1244,6 @@ impl MlxModelWeights {
                 t_fn.elapsed().as_secs_f64() * 1000.0
             );
         }
-
-        // --- lm_head: auto-pick Q8_0 vs F16 based on model size ---
-        //
-        // lm_head is memory-bandwidth-bound at batch=1; Q8_0 halves the
-        // weight traffic vs F16 and recovers ~12% decode throughput on
-        // Gemma-4-26B (1.47 GB F16 → 784 MB Q8). Raw Q8 occasionally flips
-        // a near-tiebreak (pad-emit mode, see ADR-010) — the rerank path
-        // (HF2Q_LMHEAD_RERANK; default on when Q8 is active) recovers the
-        // exact F16 trajectory by reranking top candidates on CPU using
-        // the F32 embed_weight already resident for the embedding gather.
-        //
-        // Heuristic: enable Q8_0 when F16 weight would exceed 256 MB and
-        // hidden_size % 32 == 0. Smaller models skip Q8 because the head
-        // time is already negligible.
-        //
-        // Env overrides:
-        //   HF2Q_LMHEAD_Q8=1   force Q8 (errors if hidden_size % 32 != 0)
-        //   HF2Q_LMHEAD_Q8=0   force F16 (escape hatch)
-        //   HF2Q_LMHEAD_RERANK=0   disable rerank (raw Q8 argmax, unsafe)
-        //   (unset)            auto-detect by size
-        let lm_head_f16_bytes = cfg.vocab_size * cfg.hidden_size * 2;
-        // HF2Q_LMHEAD_Q8 is a category-2 operator knob — documented in
-        // docs/operator-env-vars.md and docs/shipping-contract.md. It is
-        // intentionally read directly here (not via InvestigationEnv) because
-        // it is part of the supported user-facing product surface.
-        let q8_env = std::env::var("HF2Q_LMHEAD_Q8").ok();
-        let compare_mode = INVESTIGATION_ENV.lmhead_compare;
-
-        // ADR-028 iter-188: HF2Q_LMHEAD_Q6K — load token_embd.weight as
-        // native on-disk Q6_K (no F32→Q8 re-quant). Saves 0.33 ms/token
-        // (~2% decode).
-        //
-        // iter-326 default-flipped to ON; iter-344 reverted because of
-        // batched-prefill conflict; iter-345 RESTORED to default-ON
-        // because forward_prefill_batched.rs now has a Q6_K arm
-        // dispatching via dispatch_qmatmul + kernel_mul_mv_q6_K_f32_nr2.
-        // Q6_K lm_head + batched prefill COEXIST.  Opt-out via
-        // HF2Q_LMHEAD_Q6K=0/false/off.
-        let q6k_env_off = matches!(
-            std::env::var("HF2Q_LMHEAD_Q6K").ok().as_deref(),
-            Some(v) if v.eq_ignore_ascii_case("0")
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("off")
-        );
-        let use_q6k = !q6k_env_off && {
-            gguf.tensor_info("token_embd.weight")
-                .map(|t| t.ggml_type == mlx_native::GgmlType::Q6_K)
-                .unwrap_or(false)
-        };
-
-        let use_q8 = if use_q6k {
-            false
-        } else {
-            match q8_env.as_deref() {
-                Some("1") => true,
-                Some("0") => false,
-                _ => {
-                    // Auto: Q8 when F16 weight would exceed 256 MB and the
-                    // shape is Q8-compatible.
-                    lm_head_f16_bytes > 256 * 1024 * 1024 && cfg.hidden_size % 32 == 0
-                }
-            }
-        };
-
-        // Decide which buffers to allocate. Compare mode always keeps F16
-        // (needed as the oracle for A/B), and Q8 if requested.
-        let need_q8 = use_q8;
-        let need_f16 = !use_q8 && !use_q6k || compare_mode;
-        if use_q8 && cfg.hidden_size % 32 != 0 {
-            anyhow::bail!(
-                "HF2Q_LMHEAD_Q8=1 requires hidden_size % 32 == 0 (got {})",
-                cfg.hidden_size
-            );
-        }
-
-        let lm_head_q8: Option<MlxQWeight> = if need_q8 {
-            let source = match q8_env.as_deref() {
-                Some("1") => "forced",
-                _ => "auto",
-            };
-            tracing::info!(
-                "Quantizing lm_head to Q8_0 ({} — F16 size {:.1} MB)",
-                source,
-                lm_head_f16_bytes as f64 / 1e6
-            );
-            let embed_f32: &[f32] = embed_weight
-                .as_slice()
-                .map_err(|e| anyhow::anyhow!("embed as_slice for q8 quantize: {e}"))?;
-            let cols = cfg.hidden_size;
-            // ADR-005 iter-214 follow-up — vocab-pad slice OOB fix.
-            //
-            // Derive `rows` from the actual embed tensor's element count,
-            // NOT from `cfg.vocab_size`. ADR-012 Phase 1.8's vocab-pad
-            // de-pad transform strips the trailing padded row from
-            // `token_embd.weight` (e.g., Qwen3.6 27B carries the de-padded
-            // tensor on-disk while `cfg.vocab_size` may still reflect the
-            // padded count read from a different GGUF metadata key) — so
-            // `cfg.vocab_size > embed_f32.len() / cols` by exactly the
-            // pad-stride when de-pad fired upstream.
-            //
-            // The pre-fix code iterated `0..cfg.vocab_size` and hit a
-            // slice-OOB panic at row `embed_rows` (one past the actual
-            // tensor) on `forward_mlx.rs:861` — observed concretely on
-            // /opt/hf2q/models/qwen3.6-27b-dwq46/...gguf where the loop
-            // wanted row 248045 but the tensor had only 248044 rows.
-            //
-            // Per Engineering Mantra "code + test == truth": the tensor's
-            // actual element count is the source of truth here, not the
-            // metadata header. Surface a warn! when they differ so an
-            // upstream cfg-vs-tensor inconsistency stays visible.
-            if embed_f32.len() % cols != 0 {
-                anyhow::bail!(
-                    "embed_weight length {} is not divisible by hidden_size {} \
-                     (cannot derive Q8_0 LMHEAD row count)",
-                    embed_f32.len(),
-                    cols
-                );
-            }
-            let rows = embed_f32.len() / cols;
-            if rows != cfg.vocab_size {
-                tracing::warn!(
-                    "Q8_0 LMHEAD: embed_weight has {} rows but cfg.vocab_size={} \
-                     (ADR-012 Phase 1.8 vocab-pad de-pad likely fired; using tensor's \
-                     actual row count for Q8 quantize loop bound)",
-                    rows,
-                    cfg.vocab_size
-                );
-            }
-            let blocks_per_row = cols / 32;
-            let block_bytes: usize = 34;
-            let total_bytes = rows * blocks_per_row * block_bytes;
-            let q_buf = mlx_device
-                .alloc_buffer(
-                    total_bytes,
-                    mlx_native::DType::U8,
-                    vec![rows, blocks_per_row * block_bytes],
-                )
-                .map_err(|e| anyhow::anyhow!("lm_head_q8 alloc: {e}"))?;
-            let dst_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(q_buf.contents_ptr() as *mut u8, total_bytes)
-            };
-            for r in 0..rows {
-                let row_src = &embed_f32[r * cols..(r + 1) * cols];
-                let row_dst = &mut dst_bytes
-                    [r * blocks_per_row * block_bytes..(r + 1) * blocks_per_row * block_bytes];
-                for b in 0..blocks_per_row {
-                    let block_src = &row_src[b * 32..(b + 1) * 32];
-                    let amax = block_src.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-                    let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
-                    let inv_d = if d != 0.0 { 1.0 / d } else { 0.0 };
-                    let block_off = b * block_bytes;
-                    let d_bits = half::f16::from_f32(d).to_bits();
-                    row_dst[block_off] = (d_bits & 0xFF) as u8;
-                    row_dst[block_off + 1] = (d_bits >> 8) as u8;
-                    for (i, &v) in block_src.iter().enumerate() {
-                        let q = (v * inv_d).round().clamp(-127.0, 127.0) as i8;
-                        row_dst[block_off + 2 + i] = q as u8;
-                    }
-                }
-            }
-            tracing::info!(
-                "Q8_0 lm_head created ({:.1} MB, {:.2}× smaller than F16){}",
-                total_bytes as f64 / 1e6,
-                lm_head_f16_bytes as f64 / total_bytes as f64,
-                if compare_mode {
-                    " [COMPARE MODE — F16 also resident]"
-                } else {
-                    ""
-                }
-            );
-            Some(MlxQWeight {
-                buffer: q_buf,
-                info: QuantWeightInfo {
-                    ggml_dtype: mlx_native::GgmlType::Q8_0,
-                    rows,
-                    cols,
-                },
-                affine: None,
-                f16_shadow: None,
-                decode_record_q6k_m1: std::sync::OnceLock::new(),
-            })
-        } else {
-            None
-        };
-
-        // ADR-028 iter-188 — load token_embd.weight as Q6_K natively (no
-        // F32→Q8_0 re-quant).  Same source tensor as `embed_weight` but
-        // loaded directly from the GGUF Q6_K storage.  Used for lm_head
-        // dispatch via dispatch_qmatmul (Q6_K mat-vec kernel).
-        let lm_head_q6k: Option<MlxQWeight> = if use_q6k {
-            tracing::info!(
-                "Loading lm_head Q6_K natively (HF2Q_LMHEAD_Q6K=1, save \
-                 ~179 MB vs Q8_0)"
-            );
-            Some(
-                load_gguf_qweight(gguf, "token_embd.weight", mlx_device)
-                    .map_err(|e| anyhow::anyhow!("lm_head_q6k native load: {e}"))?,
-            )
-        } else {
-            None
-        };
-
-        let lm_head_f16: Option<MlxBuffer> = if need_f16 {
-            let reason = if use_q8 && compare_mode {
-                "COMPARE MODE oracle".to_string()
-            } else if q8_env.as_deref() == Some("0") {
-                "forced — HF2Q_LMHEAD_Q8=0".to_string()
-            } else if cfg.hidden_size % 32 != 0 {
-                format!("auto — hidden_size {} not divisible by 32", cfg.hidden_size)
-            } else {
-                format!(
-                    "auto — F16 size {:.1} MB ≤ 256 MB threshold",
-                    lm_head_f16_bytes as f64 / 1e6
-                )
-            };
-            eprintln!(
-                "  Creating F16 embed weight for GPU lm_head ({})...",
-                reason
-            );
-            let embed_f32: &[f32] = embed_weight
-                .as_slice()
-                .map_err(|e| anyhow::anyhow!("embed as_slice for f16 copy: {e}"))?;
-            let n_elements = embed_f32.len();
-            let f16_buf = mlx_device
-                .alloc_buffer(
-                    lm_head_f16_bytes,
-                    mlx_native::DType::F16,
-                    vec![cfg.vocab_size, cfg.hidden_size],
-                )
-                .map_err(|e| anyhow::anyhow!("lm_head_f16 alloc: {e}"))?;
-            let dst_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(f16_buf.contents_ptr() as *mut u8, lm_head_f16_bytes)
-            };
-            for i in 0..n_elements {
-                let f16_val = half::f16::from_f32(embed_f32[i]);
-                let bits = f16_val.to_bits();
-                dst_bytes[i * 2] = (bits & 0xFF) as u8;
-                dst_bytes[i * 2 + 1] = (bits >> 8) as u8;
-            }
-            eprintln!(
-                "  F16 embed weight created ({} elements, {:.1} MB).",
-                n_elements,
-                lm_head_f16_bytes as f64 / 1e6
-            );
-            Some(f16_buf)
-        } else {
-            None
-        };
 
         // --- Per-layer weights ---
         let num_layers = cfg.num_hidden_layers;
@@ -1114,26 +1270,26 @@ impl MlxModelWeights {
 
             // -- Attention quantized weights --
             let t_attn = std::time::Instant::now();
-            let q_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_q.weight"), mlx_device)?;
-            let k_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_k.weight"), mlx_device)?;
+            let q_proj = load_mapped_projection(gguf, &mapped, &format!("blk.{i}.attn_q.weight"))?;
+            let k_proj = load_mapped_projection(gguf, &mapped, &format!("blk.{i}.attn_k.weight"))?;
             let v_proj = if cfg.is_full_attention(i) && cfg.attention_k_eq_v {
                 None
             } else {
-                Some(load_gguf_qweight(
+                Some(load_mapped_projection(
                     gguf,
+                    &mapped,
                     &format!("blk.{i}.attn_v.weight"),
-                    mlx_device,
                 )?)
             };
             let o_proj =
-                load_gguf_qweight(gguf, &format!("blk.{i}.attn_output.weight"), mlx_device)?;
+                load_mapped_projection(gguf, &mapped, &format!("blk.{i}.attn_output.weight"))?;
 
             // -- Attention head norms (F32) --
-            let q_norm_weight = gguf
-                .load_tensor_f32(&format!("blk.{i}.attn_q_norm.weight"), mlx_device)
+            let q_norm_weight = state_plan
+                .load_mapped(&mapped, &format!("blk.{i}.attn_q_norm.weight"))
                 .map_err(|e| anyhow::anyhow!("layer {i} q_norm: {e}"))?;
-            let k_norm_weight = gguf
-                .load_tensor_f32(&format!("blk.{i}.attn_k_norm.weight"), mlx_device)
+            let k_norm_weight = state_plan
+                .load_mapped(&mapped, &format!("blk.{i}.attn_k_norm.weight"))
                 .map_err(|e| anyhow::anyhow!("layer {i} k_norm: {e}"))?;
             cum_attn_ns += t_attn.elapsed().as_nanos();
 
@@ -1149,10 +1305,10 @@ impl MlxModelWeights {
             // -- Dense MLP (quantized) --
             let t_mlp = std::time::Instant::now();
             let gate_proj =
-                load_gguf_qweight(gguf, &format!("blk.{i}.ffn_gate.weight"), mlx_device)?;
-            let up_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_up.weight"), mlx_device)?;
+                load_mapped_projection(gguf, &mapped, &format!("blk.{i}.ffn_gate.weight"))?;
+            let up_proj = load_mapped_projection(gguf, &mapped, &format!("blk.{i}.ffn_up.weight"))?;
             let down_proj =
-                load_gguf_qweight(gguf, &format!("blk.{i}.ffn_down.weight"), mlx_device)?;
+                load_mapped_projection(gguf, &mapped, &format!("blk.{i}.ffn_down.weight"))?;
 
             let mlp = MlxMlpWeights {
                 gate_proj,
@@ -1163,15 +1319,12 @@ impl MlxModelWeights {
 
             // -- MoE expert weights (3D tensors, already stacked in GGUF) --
             //
-            // Wedge-4 / iter-227 (2026-05-02): make the MoE expert load
-            // conditional on tensor presence. Pre-iter-227 the loader
+            // Keep the MoE expert load conditional on tensor presence. The
+            // earlier loader
             // unconditionally required `blk.{i}.ffn_gate_up_exps.weight`
             // and bailed with `missing blk.0.ffn_gate_up_exps.weight`
-            // when handed a dense GGUF (e.g. the real Qwen3-VL-2B-Instruct
-            // GGUF emitted by `scripts/wedge4_qwen3vl.sh` Step 3, which
-            // is structurally dense — `general.architecture = "qwen3_vl"`
-            // with `ffn_{gate,up,down}.weight` per layer and no expert
-            // tensors).
+            // when handed a structurally dense GGUF with
+            // `ffn_{gate,up,down}.weight` per layer and no expert tensors.
             //
             // Detection rule (deterministic, GGUF-metadata-only — never
             // filename-based per the iter-227 correctness pin): a layer
@@ -1187,8 +1340,7 @@ impl MlxModelWeights {
             // `MlxMlpWeights` (loaded above unconditionally at lines
             // 962-971) and never reads the placeholder MoE fields.
             // Layer mixing (some layers MoE, some dense) is supported
-            // structurally, mirroring the peer's
-            // `LLM_ARCH_QWEN3VLMOE` per-block decision.
+            // structurally: expert presence is a per-block decision.
             let gu_name = format!("blk.{i}.ffn_gate_up_exps.weight");
             let dn_name = format!("blk.{i}.ffn_down_exps.weight");
             let gu_info_opt = gguf.tensor_info(&gu_name);
@@ -1202,19 +1354,15 @@ impl MlxModelWeights {
                 // safe; we already established both are Some above.
                 let t_gu = std::time::Instant::now();
                 let gu_info = gu_info_opt.unwrap();
-                let stacked_gate_up_buf = gguf
-                    .load_tensor(&gu_name, mlx_device)
-                    .map_err(|e| anyhow::anyhow!("load {gu_name}: {e}"))?;
-                let gate_up_expert_stride = stacked_gate_up_buf.byte_len() / cfg.num_experts;
+                let stacked_gate_up_buf = map_native_gguf_tensor_view(&mapped, gu_info)?;
+                let gate_up_expert_stride = stacked_gate_up_buf.data_byte_len() / cfg.num_experts;
                 let gate_up_ggml_dtype = gu_info.ggml_type;
                 cum_moe_gate_up_ns += t_gu.elapsed().as_nanos();
 
                 let t_dn = std::time::Instant::now();
                 let dn_info = dn_info_opt.unwrap();
-                let stacked_down_buf = gguf
-                    .load_tensor(&dn_name, mlx_device)
-                    .map_err(|e| anyhow::anyhow!("load {dn_name}: {e}"))?;
-                let down_expert_stride = stacked_down_buf.byte_len() / cfg.num_experts;
+                let stacked_down_buf = map_native_gguf_tensor_view(&mapped, dn_info)?;
+                let down_expert_stride = stacked_down_buf.data_byte_len() / cfg.num_experts;
                 let down_ggml_dtype = dn_info.ggml_type;
                 cum_moe_down_ns += t_dn.elapsed().as_nanos();
 
@@ -1223,19 +1371,19 @@ impl MlxModelWeights {
                         "GGUF layer {}/{}: MoE experts loaded (stacked, {:.1} MB + {:.1} MB)",
                         i + 1,
                         num_layers,
-                        stacked_gate_up_buf.byte_len() as f64 / 1e6,
-                        stacked_down_buf.byte_len() as f64 / 1e6
+                        stacked_gate_up_buf.data_byte_len() as f64 / 1e6,
+                        stacked_down_buf.data_byte_len() as f64 / 1e6
                     );
                 }
 
                 // -- Router and scales (F32) --
                 let router_proj =
-                    load_gguf_qweight(gguf, &format!("blk.{i}.ffn_gate_inp.weight"), mlx_device)?;
-                let router_scale = gguf
-                    .load_tensor_f32(&format!("blk.{i}.ffn_gate_inp.scale"), mlx_device)
+                    load_mapped_projection(gguf, &mapped, &format!("blk.{i}.ffn_gate_inp.weight"))?;
+                let router_scale = state_plan
+                    .load_mapped(&mapped, &format!("blk.{i}.ffn_gate_inp.scale"))
                     .map_err(|e| anyhow::anyhow!("layer {i} router_scale: {e}"))?;
-                let per_expert_scale = gguf
-                    .load_tensor_f32(&format!("blk.{i}.ffn_down_exps.scale"), mlx_device)
+                let per_expert_scale = state_plan
+                    .load_mapped(&mapped, &format!("blk.{i}.ffn_down_exps.scale"))
                     .map_err(|e| anyhow::anyhow!("layer {i} per_expert_scale: {e}"))?;
 
                 // Pre-compute router combined weight:
@@ -1292,8 +1440,8 @@ impl MlxModelWeights {
                 // 2863 / 3922) so the placeholders are consulted only
                 // by metadata fields like `top_k` (read but unused on
                 // the dense path). Buffer sizes are 1 element to
-                // minimize wasted allocation; on a 28-layer Qwen3-VL-2B
-                // dense load this adds 28 × ~16 bytes = ~448 bytes
+                // minimize wasted allocation; on a 28-layer dense model
+                // this adds 28 × ~16 bytes = ~448 bytes
                 // overhead vs. the pre-iter-227 unconditional path
                 // (which would have OOM-allocated GBs of expert
                 // tensors that don't exist on disk).
@@ -1332,32 +1480,35 @@ impl MlxModelWeights {
             // dense-only entry point. A misroute would falsify the
             // `stacked_*.is_some()` gate, not silently consume garbage.
             let norms = MlxLayerNorms {
-                input_layernorm: gguf
-                    .load_tensor_f32(&format!("blk.{i}.attn_norm.weight"), mlx_device)
+                input_layernorm: state_plan
+                    .load_mapped(&mapped, &format!("blk.{i}.attn_norm.weight"))
                     .map_err(|e| anyhow::anyhow!("layer {i} attn_norm: {e}"))?,
-                post_attention_layernorm: gguf
-                    .load_tensor_f32(&format!("blk.{i}.post_attention_norm.weight"), mlx_device)
+                post_attention_layernorm: state_plan
+                    .load_mapped(&mapped, &format!("blk.{i}.post_attention_norm.weight"))
                     .map_err(|e| anyhow::anyhow!("layer {i} post_attn_norm: {e}"))?,
-                pre_feedforward_layernorm: gguf
-                    .load_tensor_f32(&format!("blk.{i}.ffn_norm.weight"), mlx_device)
+                pre_feedforward_layernorm: state_plan
+                    .load_mapped(&mapped, &format!("blk.{i}.ffn_norm.weight"))
                     .map_err(|e| anyhow::anyhow!("layer {i} ffn_norm: {e}"))?,
-                post_feedforward_layernorm: gguf
-                    .load_tensor_f32(&format!("blk.{i}.post_ffw_norm.weight"), mlx_device)
+                post_feedforward_layernorm: state_plan
+                    .load_mapped(&mapped, &format!("blk.{i}.post_ffw_norm.weight"))
                     .map_err(|e| anyhow::anyhow!("layer {i} post_ffw_norm: {e}"))?,
                 pre_feedforward_layernorm_2: load_optional_norm_or_placeholder(
-                    gguf,
+                    &state_plan,
+                    &mapped,
                     &format!("blk.{i}.pre_ffw_norm_2.weight"),
                     mlx_device,
                     "pre_ffw_norm_2",
                 )?,
                 post_feedforward_layernorm_1: load_optional_norm_or_placeholder(
-                    gguf,
+                    &state_plan,
+                    &mapped,
                     &format!("blk.{i}.post_ffw_norm_1.weight"),
                     mlx_device,
                     "post_ffw_norm_1",
                 )?,
                 post_feedforward_layernorm_2: load_optional_norm_or_placeholder(
-                    gguf,
+                    &state_plan,
+                    &mapped,
                     &format!("blk.{i}.post_ffw_norm_2.weight"),
                     mlx_device,
                     "post_ffw_norm_2",
@@ -1365,8 +1516,8 @@ impl MlxModelWeights {
             };
 
             // -- Layer scalar (F32) --
-            let layer_scalar = gguf
-                .load_tensor_f32(&format!("blk.{i}.layer_output_scale.weight"), mlx_device)
+            let layer_scalar = state_plan
+                .load_mapped(&mapped, &format!("blk.{i}.layer_output_scale.weight"))
                 .map_err(|e| anyhow::anyhow!("layer {i} layer_scalar: {e}"))?;
 
             // -- Per-layer config --
@@ -1498,21 +1649,20 @@ impl MlxModelWeights {
         let mut activations = alloc_activation_buffers(mlx_device, cfg)?;
 
         // -- RoPE freq_factors from GGUF --
-        if let Some(_info) = gguf.tensor_info("rope_freqs.weight") {
-            let ff_buf = gguf
-                .load_tensor_f32("rope_freqs.weight", mlx_device)
+        if state_plan.is_present("rope_freqs.weight")? {
+            let ff_buf = state_plan
+                .load_mapped(&mapped, "rope_freqs.weight")
                 .map_err(|e| anyhow::anyhow!("rope_freqs: {e}"))?;
             activations.rope_freq_factors_gpu = ff_buf;
         }
 
         // -- Build result --
         let mut result = Ok(Self {
+            native_activation_epoch: std::sync::atomic::AtomicU64::new(0),
             embed_weight,
             layers,
             final_norm,
-            lm_head_f16,
-            lm_head_q8,
-            lm_head_q6k,
+            lm_head,
             hidden_size: cfg.hidden_size,
             vocab_size: cfg.vocab_size,
             num_attention_heads: cfg.num_attention_heads,
@@ -1608,89 +1758,21 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("argmax_params init: {e}"))?;
                 p[0] = w.vocab_size as u32;
             }
+        }
 
-            // ADR-029 iter-28 H29 / iter-31 — F16 shadow population pass.
-            //
-            // Materializes an F16 pre-dequantized buffer for every attn
-            // and dense-MLP quantized weight in every layer, so that the
-            // runtime dispatch_qmatmul fast-paths through the F16-input
-            // matmul kernel (peer's gemma4 strategy).
-            //
-            // iter-31 default-flip: HF2Q_F16_SHADOW now default-true
-            // (opt-out via =0/false/off).  Multi-regime bench (4 ctxs ×
-            // 3 trials each, gemma4-APEX-Q5_K_M):
-            //   2K prefill: +16.0%
-            //   4K prefill: +7.3%
-            //   8K prefill: +1.9%
-            //   decode m=1: unaffected (V2 path gated on m > 8, H29 too)
-            // Byte-identical first decode tokens at every context.
-            // ~1 GB extra resident on gemma4-26B; 128 GB M5 Max budget
-            // accommodates without pressure.  0.4s load-time pass.
-            //
-            // Doing this in a second pass (after weight load) avoids
-            // borrow-checker conflicts between `gpu.device()` (read) and
-            // `gpu.registry` (write) during the per-layer load loop.
-            let f16_shadow_enabled = std::env::var("HF2Q_F16_SHADOW")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
-                .unwrap_or(true);
-            if f16_shadow_enabled {
-                let dev = gpu.executor.device();
-                let n_layers = w.layers.len();
-                eprintln!("[ADR-029 H29] Materializing F16 shadows for {} layers' attn + dense MLP weights...", n_layers);
-                let t0 = std::time::Instant::now();
-                for li in 0..n_layers {
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].attn.q_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.attn_q"),
-                    )?;
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].attn.k_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.attn_k"),
-                    )?;
-                    if let Some(ref mut v) = w.layers[li].attn.v_proj {
-                        populate_f16_shadow_if_enabled(
-                            v,
-                            dev,
-                            &mut gpu.registry,
-                            &format!("blk.{li}.attn_v"),
-                        )?;
-                    }
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].attn.o_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.attn_output"),
-                    )?;
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].mlp.gate_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.ffn_gate"),
-                    )?;
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].mlp.up_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.ffn_up"),
-                    )?;
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].mlp.down_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.ffn_down"),
-                    )?;
-                }
-                let elapsed = t0.elapsed();
-                eprintln!(
-                    "[ADR-029 H29] F16 shadow population done in {:.2}s",
-                    elapsed.as_secs_f64()
-                );
-            }
+        if let Ok(ref weights) = result {
+            let storage = weights
+                .ordinary_gguf_storage_summary()
+                .context("account Gemma ordinary GGUF storage")?;
+            let named_anonymous_bytes = verify_ordinary_gguf_storage(&storage)?;
+            tracing::info!(
+                ordinary_views = storage.ordinary.unique_matrix_views,
+                ordinary_file_backed_bytes = storage.ordinary.file_backed_bytes,
+                ordinary_anonymous_bytes = storage.ordinary.anonymous_bytes,
+                named_anonymous_buffers = storage.named_anonymous.len(),
+                named_anonymous_bytes,
+                "Gemma matrices and ordinary state retain exact scoped GGUF storage"
+            );
         }
 
         result
@@ -1755,6 +1837,13 @@ impl MlxModelWeights {
     ) -> Result<usize> {
         use crate::core::mlx_safetensors_loader::MlxAffineLinear;
         use anyhow::Context;
+
+        anyhow::ensure!(
+            self.native_activation_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0,
+            "Gemma DWQ overlay cannot mutate weights after native routes are activated; reload the model with the overlay"
+        );
 
         let bytes = std::fs::read(path)
             .with_context(|| format!("apply_dwq_overlay: read {}", path.display()))?;
@@ -1930,16 +2019,25 @@ impl MlxModelWeights {
                 if l.n != n || l.k != k || l.bits != bits_per || l.group_size != gs_per {
                     anyhow::bail!(
                         "DWQ overlay MoE bucket (layer={layer_idx}, base={:?}) expert {} shape ({},{},bits={},gs={}) ≠ expert 0 ({},{},bits={},gs={})",
-                        base, e,
-                        l.n, l.k, l.bits, l.group_size,
-                        n, k, bits_per, gs_per,
+                        base,
+                        e,
+                        l.n,
+                        l.k,
+                        l.bits,
+                        l.group_size,
+                        n,
+                        k,
+                        bits_per,
+                        gs_per,
                     );
                 }
             }
             if bits_per != 4 || gs_per != 32 {
                 anyhow::bail!(
                     "DWQ overlay MoE bucket (layer={layer_idx}, base={:?}): only bits=4 group_size=32 supported in Iter C2.2 (got bits={}, gs={})",
-                    base, bits_per, gs_per,
+                    base,
+                    bits_per,
+                    gs_per,
                 );
             }
             let pack_factor = 32 / bits_per as usize;
@@ -2173,12 +2271,68 @@ impl MlxModelWeights {
 /// constructor is pure CPU + tiny MlxBuffer allocations.
 ///
 /// Live-load coverage of the conditional MoE-expert load itself
-/// (skipping `blk.0.ffn_gate_up_exps.weight` when the dense GGUF lacks
-/// it) is covered by the `iter227_*` arch-dispatch tests in
-/// `serve::tests` plus the operator-gated regression test referenced by
-/// `scripts/wedge4_qwen3vl.sh` (the real Qwen3-VL-2B GGUF ships with
-/// dense FFN tensors and surfaces the iter-227 actionable error from
-/// `LoadedModel::load`, not from the per-layer MoE expert loader).
+/// (skipping `blk.0.ffn_gate_up_exps.weight` when a dense GGUF lacks it)
+/// is covered by the `iter227_*` architecture-dispatch tests in
+/// `serve::tests`.
+#[cfg(test)]
+mod native_bf16_inventory_tests {
+    use super::*;
+
+    fn weight(device: &MlxDevice, storage: DType, declared: GgmlType) -> MlxQWeight {
+        let bytes_per_element = match storage {
+            DType::F32 => 4,
+            DType::F16 | DType::BF16 => 2,
+            other => panic!("unsupported scalar fixture dtype {other}"),
+        };
+        let buffer = device
+            .alloc_buffer(32 * 64 * bytes_per_element, storage, vec![32, 64])
+            .expect("scalar matrix fixture");
+        MlxQWeight::from_test_buffer(buffer, declared, 32, 64)
+    }
+
+    #[test]
+    fn native_bf16_inventory_admits_only_matching_artifact_storage() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device");
+        let native = weight(&device, DType::BF16, GgmlType::BF16);
+        let matrix = gemma_native_bf16_matrix("native", &native)
+            .expect("matching BF16 metadata")
+            .expect("native BF16 matrix");
+        assert_eq!((matrix.n, matrix.k), (32, 64));
+        assert_eq!(matrix.reachable_row_mask, u16::MAX);
+
+        let f16 = weight(&device, DType::F16, GgmlType::F16);
+        assert!(
+            gemma_native_bf16_matrix("f16", &f16)
+                .expect("matching F16 metadata")
+                .is_none(),
+            "F16 must remain on its artifact-native F16 route"
+        );
+        let f32 = weight(&device, DType::F32, GgmlType::F32);
+        assert!(
+            gemma_native_bf16_matrix("f32", &f32)
+                .expect("matching F32 metadata")
+                .is_none(),
+            "F32 must remain on its artifact-native F32 route"
+        );
+    }
+
+    #[test]
+    fn native_bf16_inventory_rejects_declared_storage_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device");
+        let mismatch = weight(&device, DType::F16, GgmlType::BF16);
+        let error = match gemma_native_bf16_matrix("mismatch", &mismatch) {
+            Err(error) => error,
+            Ok(_) => panic!("declared BF16 over F16 bytes must fail closed"),
+        };
+        assert!(
+            error.to_string().contains("disagrees with declared type"),
+            "unexpected mismatch error: {error:#}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod dense_placeholder_tests {
     use super::*;
@@ -2198,7 +2352,9 @@ mod dense_placeholder_tests {
             Err(_) => {
                 // No Metal device available (e.g. CI without GPU);
                 // skip — the live load path on M5 Max exercises this.
-                eprintln!("skipping iter227_dense_placeholder_has_no_stacked_expert_buffers: no MlxDevice");
+                eprintln!(
+                    "skipping iter227_dense_placeholder_has_no_stacked_expert_buffers: no MlxDevice"
+                );
                 return;
             }
         };
@@ -2239,7 +2395,7 @@ mod dense_placeholder_tests {
     }
 
     /// Allocation cost regression guard: the placeholder bundle must
-    /// stay tiny so a 28-layer Qwen3-VL-2B dense load adds <1 KB total
+    /// stay tiny so a 28-layer dense load adds <1 KB total
     /// MoE-bookkeeping overhead vs. the previous unconditional path
     /// (which would have OOM-allocated GBs of expert tensors that
     /// don't exist on disk).
@@ -2272,6 +2428,505 @@ mod dense_placeholder_tests {
             moe.router_proj.buffer.byte_len(),
             std::mem::size_of::<f32>(),
             "router_proj placeholder buffer must be 1 F32 element"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ordinary_gguf_state_tests {
+    use super::*;
+    use crate::backends::gguf::writer::GgufWriter;
+    use crate::quantize::ggml_quants::GgmlType as WriterGgmlType;
+
+    #[derive(Clone, Copy)]
+    enum StateMutation {
+        None,
+        RequiredOutputNormQ8,
+        OptionalRopeF16,
+        AbsentRope,
+    }
+
+    struct SyntheticGemmaGguf {
+        file: tempfile::NamedTempFile,
+        cfg: Gemma4Config,
+        tensor_count: usize,
+        payload_bytes: u64,
+    }
+
+    struct FixtureTensor {
+        name: String,
+        dims: Vec<u64>,
+        ggml_type: WriterGgmlType,
+        payload: Vec<u8>,
+    }
+
+    fn q8_matrix(name: &str, rows: usize, cols: usize) -> FixtureTensor {
+        assert_eq!(cols % 32, 0);
+        FixtureTensor {
+            name: name.to_owned(),
+            dims: vec![cols as u64, rows as u64],
+            ggml_type: WriterGgmlType::Q8_0,
+            payload: vec![0; rows * (cols / 32) * 34],
+        }
+    }
+
+    fn f32_matrix(name: &str, rows: usize, cols: usize) -> FixtureTensor {
+        FixtureTensor {
+            name: name.to_owned(),
+            dims: vec![cols as u64, rows as u64],
+            ggml_type: WriterGgmlType::F32,
+            payload: vec![0; rows * cols * std::mem::size_of::<f32>()],
+        }
+    }
+
+    fn q8_expert_stack(name: &str, experts: usize, rows: usize, cols: usize) -> FixtureTensor {
+        assert_eq!(cols % 32, 0);
+        FixtureTensor {
+            name: name.to_owned(),
+            dims: vec![cols as u64, rows as u64, experts as u64],
+            ggml_type: WriterGgmlType::Q8_0,
+            payload: vec![0; experts * rows * (cols / 32) * 34],
+        }
+    }
+
+    fn state_tensor(name: &str, elements: usize, ggml_type: WriterGgmlType) -> FixtureTensor {
+        let bytes = match ggml_type {
+            WriterGgmlType::F32 => elements * std::mem::size_of::<f32>(),
+            WriterGgmlType::F16 => elements * std::mem::size_of::<u16>(),
+            WriterGgmlType::Q8_0 => {
+                assert_eq!(elements % 32, 0);
+                (elements / 32) * 34
+            }
+            other => panic!("unsupported synthetic state type {other:?}"),
+        };
+        FixtureTensor {
+            name: name.to_owned(),
+            dims: vec![elements as u64],
+            ggml_type,
+            payload: vec![0; bytes],
+        }
+    }
+
+    fn synthetic_gemma(mutation: StateMutation, with_experts: bool) -> SyntheticGemmaGguf {
+        let hidden = 256usize;
+        let vocab = 32usize;
+        let num_experts = if with_experts { 2 } else { 0 };
+        let top_k_experts = if with_experts { 1 } else { 0 };
+        let moe_intermediate_size = if with_experts { 32 } else { 0 };
+        let mut tensors = vec![
+            q8_matrix("token_embd.weight", vocab, hidden),
+            q8_matrix("blk.0.attn_q.weight", hidden, hidden),
+            q8_matrix("blk.0.attn_k.weight", hidden, hidden),
+            q8_matrix("blk.0.attn_v.weight", hidden, hidden),
+            q8_matrix("blk.0.attn_output.weight", hidden, hidden),
+            q8_matrix("blk.0.ffn_gate.weight", hidden, hidden),
+            q8_matrix("blk.0.ffn_up.weight", hidden, hidden),
+            q8_matrix("blk.0.ffn_down.weight", hidden, hidden),
+        ];
+        if with_experts {
+            tensors.extend([
+                q8_expert_stack(
+                    "blk.0.ffn_gate_up_exps.weight",
+                    num_experts,
+                    2 * moe_intermediate_size,
+                    hidden,
+                ),
+                q8_expert_stack(
+                    "blk.0.ffn_down_exps.weight",
+                    num_experts,
+                    hidden,
+                    moe_intermediate_size,
+                ),
+                f32_matrix("blk.0.ffn_gate_inp.weight", num_experts, hidden),
+            ]);
+        }
+        for name in [
+            "output_norm.weight",
+            "blk.0.attn_q_norm.weight",
+            "blk.0.attn_k_norm.weight",
+            "blk.0.attn_norm.weight",
+            "blk.0.post_attention_norm.weight",
+            "blk.0.ffn_norm.weight",
+            "blk.0.post_ffw_norm.weight",
+        ] {
+            let ggml_type = if name == "output_norm.weight"
+                && matches!(mutation, StateMutation::RequiredOutputNormQ8)
+            {
+                WriterGgmlType::Q8_0
+            } else {
+                WriterGgmlType::F32
+            };
+            tensors.push(state_tensor(name, hidden, ggml_type));
+        }
+        tensors.push(state_tensor(
+            "blk.0.layer_output_scale.weight",
+            1,
+            WriterGgmlType::F32,
+        ));
+        if with_experts {
+            for name in [
+                "blk.0.pre_ffw_norm_2.weight",
+                "blk.0.post_ffw_norm_1.weight",
+                "blk.0.post_ffw_norm_2.weight",
+            ] {
+                tensors.push(state_tensor(name, hidden, WriterGgmlType::F32));
+            }
+            tensors.extend([
+                state_tensor("blk.0.ffn_gate_inp.scale", hidden, WriterGgmlType::F32),
+                state_tensor(
+                    "blk.0.ffn_down_exps.scale",
+                    num_experts,
+                    WriterGgmlType::F32,
+                ),
+            ]);
+        }
+        if !matches!(mutation, StateMutation::AbsentRope) {
+            tensors.push(state_tensor(
+                "rope_freqs.weight",
+                hidden / 2,
+                if matches!(mutation, StateMutation::OptionalRopeF16) {
+                    WriterGgmlType::F16
+                } else {
+                    WriterGgmlType::F32
+                },
+            ));
+        }
+
+        let tensor_count = tensors.len();
+        let payload_bytes = tensors
+            .iter()
+            .map(|tensor| tensor.payload.len() as u64)
+            .sum();
+        let file = tempfile::NamedTempFile::new().expect("temporary Gemma GGUF");
+        let sink = std::fs::File::create(file.path()).expect("create Gemma GGUF");
+        let mut writer = GgufWriter::new(sink);
+        writer
+            .write_header(tensor_count as u64, 0)
+            .expect("write Gemma GGUF header");
+        let mut indices = Vec::with_capacity(tensor_count);
+        for tensor in &tensors {
+            indices.push(
+                writer
+                    .reserve_tensor_info(&tensor.name, &tensor.dims, tensor.ggml_type)
+                    .unwrap_or_else(|error| {
+                        panic!("reserve synthetic tensor '{}': {error}", tensor.name)
+                    }),
+            );
+        }
+        writer.pad_to_alignment().expect("align Gemma GGUF");
+        for (tensor, index) in tensors.iter().zip(indices) {
+            writer
+                .stream_tensor_payload(index, &tensor.payload)
+                .unwrap_or_else(|error| {
+                    panic!("write synthetic tensor '{}': {error}", tensor.name)
+                });
+        }
+        writer.finalize().expect("finalize Gemma GGUF");
+
+        SyntheticGemmaGguf {
+            file,
+            cfg: Gemma4Config {
+                vocab_size: vocab,
+                hidden_size: hidden,
+                intermediate_size: hidden,
+                moe_intermediate_size,
+                num_hidden_layers: 1,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                num_global_key_value_heads: 1,
+                head_dim: hidden,
+                global_head_dim: hidden,
+                rms_norm_eps: 1e-6,
+                rope_theta_sliding: 10_000.0,
+                rope_theta_global: 1_000_000.0,
+                sliding_window: 8,
+                max_position_embeddings: 16,
+                final_logit_softcapping: None,
+                attention_bias: false,
+                attention_k_eq_v: false,
+                tie_word_embeddings: true,
+                num_experts,
+                top_k_experts,
+                layer_types: vec![LayerType::Sliding],
+            },
+            tensor_count,
+            payload_bytes,
+        }
+    }
+
+    fn preflight_state_error(mutation: StateMutation) -> String {
+        let fixture = synthetic_gemma(mutation, false);
+        let gguf = mlx_native::gguf::GgufFile::open(fixture.file.path())
+            .expect("open synthetic Gemma GGUF");
+        preflight_f32_state(&gguf, &fixture.cfg)
+            .expect_err("wrong F32 state storage must fail admission")
+            .to_string()
+    }
+
+    #[test]
+    fn activation_argmax_params_match_native_operator_contract() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => {
+                eprintln!(
+                    "skipping activation_argmax_params_match_native_operator_contract: no MlxDevice"
+                );
+                return;
+            }
+        };
+        let fixture = synthetic_gemma(StateMutation::None, false);
+        let buffers = alloc_activation_buffers(&device, &fixture.cfg)
+            .expect("allocate synthetic Gemma activation buffers");
+        assert_eq!(buffers.argmax_params.dtype(), DType::U32);
+        assert_eq!(buffers.argmax_params.shape(), &[1]);
+        assert_eq!(buffers.argmax_params.byte_len(), std::mem::size_of::<u32>());
+    }
+
+    fn real_loader_error_before_map(mutation: StateMutation) -> Option<String> {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let fixture = synthetic_gemma(mutation, false);
+        let gguf = mlx_native::gguf::GgufFile::open(fixture.file.path())
+            .expect("open synthetic Gemma GGUF");
+        let mut gpu = crate::serve::gpu::GpuContext::new().ok()?;
+        crate::inference::models::gemma4::native_matrix::reset_map_attempts_for_test();
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 1);
+        let error =
+            match MlxModelWeights::load_from_gguf(&gguf, &fixture.cfg, &mut gpu, &mut progress) {
+                Ok(_) => panic!("wrong F32 state storage must fail the real loader"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            crate::inference::models::gemma4::native_matrix::map_attempts_for_test(),
+            0,
+            "state admission must fail before GGUF tensor-data mapping"
+        );
+        Some(error.to_string())
+    }
+
+    #[test]
+    fn f32_state_catalog_is_complete_for_dense_and_moe_artifacts() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use crate::inference::models::gemma4::native_matrix::NativeF32StateRequirement::{
+            Optional, Required,
+        };
+
+        for (with_experts, expert_requirement) in [(false, Optional), (true, Required)] {
+            let fixture = synthetic_gemma(StateMutation::None, with_experts);
+            let gguf = mlx_native::gguf::GgufFile::open(fixture.file.path())
+                .expect("open synthetic Gemma GGUF");
+            let plan =
+                preflight_f32_state(&gguf, &fixture.cfg).expect("catalog exact Gemma F32 state");
+            let actual: std::collections::BTreeMap<_, _> = plan
+                .states()
+                .iter()
+                .map(|state| {
+                    (
+                        state.name.as_str(),
+                        (state.requirement, state.present, state.shape.as_slice()),
+                    )
+                })
+                .collect();
+            assert_eq!(actual.len(), if with_experts { 14 } else { 12 });
+            for state in plan.states() {
+                let expected_bytes =
+                    state.shape.iter().product::<usize>() * std::mem::size_of::<f32>();
+                assert_eq!(state.byte_len, expected_bytes, "{}", state.name);
+            }
+            for (name, shape) in [
+                ("output_norm.weight", &[256][..]),
+                ("blk.0.attn_q_norm.weight", &[256][..]),
+                ("blk.0.attn_k_norm.weight", &[256][..]),
+                ("blk.0.attn_norm.weight", &[256][..]),
+                ("blk.0.post_attention_norm.weight", &[256][..]),
+                ("blk.0.ffn_norm.weight", &[256][..]),
+                ("blk.0.post_ffw_norm.weight", &[256][..]),
+                ("blk.0.layer_output_scale.weight", &[1][..]),
+            ] {
+                assert_eq!(actual[name], (Required, true, shape), "{name}");
+            }
+            assert_eq!(actual["rope_freqs.weight"], (Optional, true, &[128][..]));
+            for name in [
+                "blk.0.pre_ffw_norm_2.weight",
+                "blk.0.post_ffw_norm_1.weight",
+                "blk.0.post_ffw_norm_2.weight",
+            ] {
+                assert_eq!(
+                    actual[name],
+                    (expert_requirement, with_experts, &[256][..]),
+                    "{name}"
+                );
+            }
+            for (name, shape) in [
+                ("blk.0.ffn_gate_inp.scale", &[256][..]),
+                ("blk.0.ffn_down_exps.scale", &[2][..]),
+            ] {
+                if with_experts {
+                    assert_eq!(actual[name], (Required, true, shape), "{name}");
+                } else {
+                    assert!(!actual.contains_key(name), "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn required_quantized_state_fails_hosted_admission() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let error = preflight_state_error(StateMutation::RequiredOutputNormQ8);
+        assert!(error.contains("output_norm.weight"), "{error}");
+        assert!(error.contains("exact F32 storage"), "{error}");
+        assert!(error.contains("Q8_0"), "{error}");
+    }
+
+    #[test]
+    fn optional_present_non_f32_state_fails_hosted_admission() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let error = preflight_state_error(StateMutation::OptionalRopeF16);
+        assert!(error.contains("rope_freqs.weight"), "{error}");
+        assert!(error.contains("exact F32 storage"), "{error}");
+        assert!(error.contains("F16"), "{error}");
+    }
+
+    #[test]
+    fn real_loader_rejects_state_mutations_before_mapping() {
+        for mutation in [
+            StateMutation::RequiredOutputNormQ8,
+            StateMutation::OptionalRopeF16,
+        ] {
+            let Some(error) = real_loader_error_before_map(mutation) else {
+                return;
+            };
+            assert!(error.contains("exact F32 storage"), "{error}");
+        }
+    }
+
+    #[test]
+    fn ordinary_real_loader_retains_all_artifact_model_bytes_file_backed() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let fixture = synthetic_gemma(StateMutation::AbsentRope, false);
+        let gguf = mlx_native::gguf::GgufFile::open(fixture.file.path())
+            .expect("open synthetic Gemma GGUF");
+        let Some(mut gpu) = crate::serve::gpu::GpuContext::new().ok() else {
+            return;
+        };
+        crate::inference::models::gemma4::native_matrix::reset_map_attempts_for_test();
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 1);
+        let model = MlxModelWeights::load_from_gguf(&gguf, &fixture.cfg, &mut gpu, &mut progress)
+            .expect("load synthetic Gemma GGUF");
+        assert_eq!(
+            crate::inference::models::gemma4::native_matrix::map_attempts_for_test(),
+            1,
+            "valid ordinary load must create exactly one scoped GGUF mapping"
+        );
+        let storage = model
+            .ordinary_gguf_storage_summary()
+            .expect("summarize ordinary Gemma model storage");
+        assert_eq!(storage.ordinary.unique_matrix_views, fixture.tensor_count);
+        assert_eq!(storage.ordinary.file_backed_bytes, fixture.payload_bytes);
+        assert_eq!(storage.ordinary.anonymous_bytes, 0);
+
+        let names: std::collections::BTreeSet<_> = storage
+            .named_anonymous
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "blk.0.per_expert_scale:dense-placeholder",
+                "blk.0.post_ffw_norm_1.weight:placeholder",
+                "blk.0.post_ffw_norm_2.weight:placeholder",
+                "blk.0.pre_ffw_norm_2.weight:placeholder",
+                "blk.0.router_combined_weight:dense-placeholder",
+                "blk.0.router_proj:dense-placeholder",
+                "rope_freqs.weight:placeholder",
+            ])
+        );
+        assert!(
+            storage
+                .named_anonymous
+                .iter()
+                .all(|entry| entry.byte_len == std::mem::size_of::<f32>() as u64),
+            "only documented one-F32 dense placeholders may be anonymous"
+        );
+    }
+
+    #[test]
+    fn production_storage_gate_rejects_anonymous_or_empty_ordinary_state() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let valid = GemmaOrdinaryStorageSummary {
+            ordinary: crate::serve::forward_mlx_shared::NativeMatrixStorageSummary {
+                unique_matrix_views: 1,
+                file_backed_bytes: 128,
+                anonymous_bytes: 0,
+            },
+            named_anonymous: vec![NamedAnonymousModelBuffer {
+                name: "documented-placeholder".to_owned(),
+                byte_len: 4,
+            }],
+        };
+        assert_eq!(verify_ordinary_gguf_storage(&valid).unwrap(), 4);
+
+        let mut anonymous = valid.clone();
+        anonymous.ordinary.anonymous_bytes = 4;
+        assert!(verify_ordinary_gguf_storage(&anonymous)
+            .unwrap_err()
+            .to_string()
+            .contains("anonymous ordinary matrix/state bytes"));
+
+        let mut empty = valid.clone();
+        empty.ordinary.unique_matrix_views = 0;
+        assert!(verify_ordinary_gguf_storage(&empty)
+            .unwrap_err()
+            .to_string()
+            .contains("retained no ordinary GGUF"));
+
+        let mut empty_named = valid;
+        empty_named.named_anonymous[0].byte_len = 0;
+        assert!(verify_ordinary_gguf_storage(&empty_named)
+            .unwrap_err()
+            .to_string()
+            .contains("is empty"));
+    }
+
+    #[test]
+    fn ordinary_moe_real_loader_names_only_router_derived_storage() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let fixture = synthetic_gemma(StateMutation::None, true);
+        let gguf = mlx_native::gguf::GgufFile::open(fixture.file.path())
+            .expect("open synthetic Gemma MoE GGUF");
+        let Some(mut gpu) = crate::serve::gpu::GpuContext::new().ok() else {
+            return;
+        };
+        crate::inference::models::gemma4::native_matrix::reset_map_attempts_for_test();
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 1);
+        let model = MlxModelWeights::load_from_gguf(&gguf, &fixture.cfg, &mut gpu, &mut progress)
+            .expect("load synthetic Gemma MoE GGUF");
+        assert_eq!(
+            crate::inference::models::gemma4::native_matrix::map_attempts_for_test(),
+            1,
+            "valid ordinary MoE load must create exactly one scoped GGUF mapping"
+        );
+        let storage = model
+            .ordinary_gguf_storage_summary()
+            .expect("summarize ordinary Gemma MoE model storage");
+        let transient_router_scale_bytes = fixture.cfg.hidden_size * std::mem::size_of::<f32>();
+        assert_eq!(
+            storage.ordinary.unique_matrix_views,
+            fixture.tensor_count - 1
+        );
+        assert_eq!(
+            storage.ordinary.file_backed_bytes,
+            fixture.payload_bytes - transient_router_scale_bytes as u64
+        );
+        assert_eq!(storage.ordinary.anonymous_bytes, 0);
+        assert_eq!(
+            storage.named_anonymous,
+            vec![NamedAnonymousModelBuffer {
+                name: "blk.0.router_combined_weight:derived".to_owned(),
+                byte_len: (fixture.cfg.hidden_size * std::mem::size_of::<f32>()) as u64,
+            }]
         );
     }
 }
@@ -2324,10 +2979,11 @@ fn alloc_activation_buffers(
     // Softcap params
     let softcap_params = alloc_f32(2, "softcap_params")?;
 
-    // Argmax params
-    let argmax_params = alloc_f32(2, "argmax_params")?;
+    // Native argmax consumes one U32 parameter: the row width (vocab size).
+    let argmax_params = alloc_u32(1, "argmax_params")?;
 
     Ok(MlxActivationBuffers {
+        embedding_token_id: alloc_u32(1, "embedding_token_id")?,
         hidden: alloc_f32(hs, "hidden")?,
         attn_q: alloc_f32(num_heads * max_hd, "attn_q")?,
         attn_k: alloc_f32(max_kv_heads * max_hd, "attn_k")?,
@@ -2376,12 +3032,6 @@ fn alloc_activation_buffers(
         )?,
         moe_down_id_out: alloc_f32((cfg.top_k_experts * hs).max(1), "moe_down_id_out")?,
         moe_swiglu_id_out: alloc_f32((cfg.top_k_experts * moe_interm).max(1), "moe_swiglu_id_out")?,
-        hidden_f16: device
-            .alloc_buffer(hs * 2, mlx_native::DType::F16, vec![1, hs])
-            .map_err(|e| anyhow::anyhow!("alloc hidden_f16 ({hs} f16): {e}"))?,
-        logits_f16: device
-            .alloc_buffer(vocab * 2, mlx_native::DType::F16, vec![1, vocab])
-            .map_err(|e| anyhow::anyhow!("alloc logits_f16 ({vocab} f16): {e}"))?,
         // --- Session merge buffers (S1+S2 collapse) ---
         norm_params_sliding_hd: {
             let sliding_hd = cfg.head_dim;

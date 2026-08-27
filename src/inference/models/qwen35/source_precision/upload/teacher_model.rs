@@ -8,13 +8,12 @@
 //! method. The only production execution transition consumes the sealed
 //! run-input owner in the family-owned one-shot worker.
 
-#[cfg(test)]
-use anyhow::ensure;
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use mlx_native::MlxDevice;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::inference::dense_bf16_activation::NativeBf16Matrix;
 use crate::inference::models::qwen35::gpu_delta_net::DeltaNetWeightsGpu;
 use crate::inference::models::qwen35::gpu_ffn::DenseFfnWeightsGpu;
 #[cfg(test)]
@@ -185,6 +184,106 @@ pub(crate) struct PreparedQwen35SourceTeacherV1 {
 }
 
 impl PreparedQwen35SourceTeacherV1 {
+    /// Inventory the exact source-BF16 projections consumed by the private
+    /// teacher runner. The session freezes this complete set before its first
+    /// call; low-level projection helpers remain fail-closed when no plan was
+    /// installed.
+    fn native_bf16_matrices(&self) -> Result<Vec<NativeBf16Matrix<'_>>> {
+        fn push<'a>(
+            matrices: &mut Vec<NativeBf16Matrix<'a>>,
+            label: &'static str,
+            weight: &'a mlx_native::MlxBuffer,
+            single_row: bool,
+        ) -> Result<()> {
+            ensure!(
+                weight.dtype() == mlx_native::DType::BF16 && weight.shape().len() == 2,
+                "{label}: source-teacher projection must be rank-two BF16, got {} {:?}",
+                weight.dtype(),
+                weight.shape()
+            );
+            let n = u32::try_from(weight.shape()[0])?;
+            let k = u32::try_from(weight.shape()[1])?;
+            matrices.push(if single_row {
+                NativeBf16Matrix::unbatched_single_row(label, weight, n, k)
+            } else {
+                NativeBf16Matrix::unbatched(label, weight, n, k)
+            });
+            Ok(())
+        }
+
+        let mut matrices = Vec::new();
+        push(
+            &mut matrices,
+            "source teacher output head",
+            &self.output,
+            true,
+        )?;
+        for layer in &self.layers {
+            match &layer.attention {
+                PreparedQwen35SourceAttentionV1::Full(weights) => {
+                    match &weights.q_gate {
+                        crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu::Split {
+                            wq, w_gate, ..
+                        } => {
+                            push(&mut matrices, "source teacher attention Q", wq, false)?;
+                            push(
+                                &mut matrices,
+                                "source teacher attention gate",
+                                w_gate,
+                                false,
+                            )?;
+                        }
+                        crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu::Fused {
+                            weight, ..
+                        } => push(
+                            &mut matrices,
+                            "source teacher fused Q/gate",
+                            weight,
+                            false,
+                        )?,
+                    }
+                    push(
+                        &mut matrices,
+                        "source teacher attention K",
+                        &weights.wk,
+                        false,
+                    )?;
+                    push(
+                        &mut matrices,
+                        "source teacher attention V",
+                        &weights.wv,
+                        false,
+                    )?;
+                    push(
+                        &mut matrices,
+                        "source teacher attention output",
+                        &weights.wo,
+                        false,
+                    )?;
+                }
+                PreparedQwen35SourceAttentionV1::Linear(weights) => {
+                    for (label, weight) in [
+                        ("source teacher Delta QKV", &weights.attn_qkv),
+                        ("source teacher Delta gate", &weights.attn_gate),
+                        ("source teacher Delta alpha", &weights.ssm_alpha),
+                        ("source teacher Delta beta", &weights.ssm_beta),
+                        ("source teacher Delta output", &weights.ssm_out),
+                    ] {
+                        push(&mut matrices, label, weight, false)?;
+                    }
+                }
+            }
+            for (label, weight) in [
+                ("source teacher FFN gate", &layer.ffn.gate),
+                ("source teacher FFN up", &layer.ffn.up),
+                ("source teacher FFN down", &layer.ffn.down),
+            ] {
+                push(&mut matrices, label, weight, false)?;
+            }
+        }
+        Ok(matrices)
+    }
+
     #[cfg(test)]
     pub(crate) fn graph_catalog_sha256(&self) -> &str {
         &self.receipt.graph_catalog_sha256

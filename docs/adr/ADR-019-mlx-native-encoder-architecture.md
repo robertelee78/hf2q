@@ -9,6 +9,11 @@ is accepted architecture, pending publication of the corrected `mlx-native`
 patch and clean-artifact release gates. Earlier local dependency-spike trials
 are causal evidence, not registry release authority.
 
+**Updated:** 2026-08-22. The drained-session acquisition rule in the
+[2026-08-22 addendum](#2026-08-22--drained-session-acquisition-after-external-stages)
+is accepted architecture; exact-artifact and physical-width evidence remains
+the landing gate.
+
 
 
 - **Status:** Proposed (2026-05-03)
@@ -1532,3 +1537,43 @@ publication degradation rather than retroactive pre-publication authority.
 hf2q still must repeat the applicable packed-artifact and family heap gates
 from a clean source tree resolving that exact registry pin. Raising the queue
 cap, reducing slot count, or restarting periodically is rejected as a fix.
+
+## 2026-08-22 — drained-session acquisition after external stages
+
+### Observed failure and discriminator
+
+The native BF16 Qwen3.8 artifact loaded directly from mapped GGUF storage, and
+its ordinary CLI prefill completed. The first SlotAware server request instead
+aborted in Metal while opening a compute encoder on a command buffer whose
+status was already committed. With the same binary, artifact, prompt, and
+request, disabling reusable encoder sessions completed successfully; a Q4_K_M
+artifact also completed with session reuse enabled. This excludes model
+storage, SlotAware scheduling, and general memory pressure as primary causes.
+
+### Root cause
+
+Native F32/F16/BF16 dense FFNs and the legacy F32 MoE path use an external
+encoder for the FFN body. Their preceding residual/norm stage commits the
+borrowed `EncoderSession` through `commit_stage`, which deliberately leaves the
+session drained. `LayerEncoder::from_session_or_plain` documented that the
+next borrow would rotate a drained session, but the implementation returned it
+unchanged. The next layer's first dispatch therefore tried to open a compute
+encoder on the committed command buffer. Quantized dense and MoE paths did not
+expose the defect because they encode into the borrowed session and perform
+their own carry or terminal rotation.
+
+### Accepted invariant and proof gates
+
+Acquiring a borrowed layer encoder must first call
+`EncoderSession::reset_for_next_stage`. The operation is a no-op for a fresh or
+still-encoding session and allocates exactly one fresh command buffer for a
+drained session. This makes lifecycle repair an acquisition invariant rather
+than a format- or call-site exception, covering all current and future
+non-fused external stages. Final terminal stages remain drained because no
+subsequent acquisition occurs, so they still avoid an unused command buffer.
+
+The model-free canary commits a session-backed producer, proves the session is
+drained, reacquires it, proves one rotation occurred, and successfully drains
+the next stage. Landing additionally requires the exact-source BF16 server
+request with session reuse enabled, the five-format native-trajectory matrix,
+and physical SlotAware N=1/2/4/8/16 execution with uncached scalar replays.

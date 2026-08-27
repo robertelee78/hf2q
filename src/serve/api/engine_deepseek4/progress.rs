@@ -14,6 +14,65 @@ use crate::serve::operator_ui;
 const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct LatencyGapReceipt {
+    observations: usize,
+    first: Option<Duration>,
+    last: Option<Duration>,
+    max_gap: Duration,
+}
+
+impl LatencyGapReceipt {
+    pub(super) fn with_origin() -> Self {
+        Self {
+            last: Some(Duration::ZERO),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn observe(&mut self, at: Duration) -> anyhow::Result<()> {
+        if let Some(previous) = self.last {
+            anyhow::ensure!(
+                at >= previous,
+                "DeepSeek-V4 latency receipt moved backwards: previous={previous:?}, current={at:?}"
+            );
+            self.max_gap = self.max_gap.max(at - previous);
+        }
+        self.first.get_or_insert(at);
+        self.last = Some(at);
+        self.observations = self.observations.saturating_add(1);
+        Ok(())
+    }
+
+    pub(super) fn observations(&self) -> usize {
+        self.observations
+    }
+
+    pub(super) fn first(&self) -> Option<Duration> {
+        self.first
+    }
+
+    pub(super) fn max_gap(&self) -> Duration {
+        self.max_gap
+    }
+
+    #[cfg(test)]
+    fn require_bound(&self, minimum_observations: usize, bound: Duration) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.observations >= minimum_observations,
+            "DeepSeek-V4 latency receipt is incomplete: {} observations, need {minimum_observations}",
+            self.observations
+        );
+        anyhow::ensure!(
+            self.max_gap <= bound,
+            "DeepSeek-V4 latency gap {:?} exceeds {:?}",
+            self.max_gap,
+            bound
+        );
+        Ok(())
+    }
+}
+
 pub(super) struct RequestProgress {
     id: u64,
     started: Instant,
@@ -259,6 +318,27 @@ impl RequestProgress {
         );
     }
 
+    pub(super) fn mixed_latency_receipt(
+        &self,
+        scheduler_decode: LatencyGapReceipt,
+        semantic_sse: LatencyGapReceipt,
+    ) {
+        tracing::info!(
+            request_id = self.id,
+            scheduler_decode_visits = scheduler_decode.observations(),
+            scheduler_decode_first_visit_ms = scheduler_decode
+                .first()
+                .map(|value| value.as_secs_f64() * 1000.0),
+            scheduler_decode_max_gap_ms = scheduler_decode.max_gap().as_secs_f64() * 1000.0,
+            semantic_sse_events = semantic_sse.observations(),
+            semantic_sse_first_event_ms = semantic_sse
+                .first()
+                .map(|value| value.as_secs_f64() * 1000.0),
+            semantic_sse_max_gap_ms = semantic_sse.max_gap().as_secs_f64() * 1000.0,
+            "DeepSeek-V4 slot latency receipt"
+        );
+    }
+
     pub(super) fn complete(
         &mut self,
         decoder_stop_reason: &'static str,
@@ -316,7 +396,7 @@ fn should_report(previous: Duration, now: Duration, completed: usize, total: usi
 
 #[cfg(test)]
 mod tests {
-    use super::{should_report, tokens_per_second, REPORT_INTERVAL};
+    use super::{should_report, tokens_per_second, LatencyGapReceipt, REPORT_INTERVAL};
     use std::time::Duration;
 
     #[test]
@@ -350,5 +430,20 @@ mod tests {
             0,
             0
         ));
+    }
+
+    #[test]
+    fn latency_gap_receipt_is_measurable_and_fails_closed() {
+        let mut receipt = LatencyGapReceipt::with_origin();
+        for at in [4, 11, 18, 26] {
+            receipt.observe(Duration::from_millis(at)).unwrap();
+        }
+        assert_eq!(receipt.observations(), 4);
+        assert_eq!(receipt.first(), Some(Duration::from_millis(4)));
+        assert_eq!(receipt.max_gap(), Duration::from_millis(8));
+        receipt.require_bound(4, Duration::from_millis(8)).unwrap();
+        assert!(receipt.require_bound(5, Duration::from_millis(8)).is_err());
+        assert!(receipt.require_bound(4, Duration::from_millis(7)).is_err());
+        assert!(receipt.observe(Duration::from_millis(25)).is_err());
     }
 }

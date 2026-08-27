@@ -3,10 +3,10 @@
 Default behavior on a supported model class (e.g., Gemma-4 26B GGUF,
 Qwen 3.5/3.6 GGUF):
 
-- **Coherence:** matches the F16 lm_head reference on the locked gates
-  (Qwen sourdough byte-identical vs llama.cpp; Gemma 300-Format greedy
-  enumeration coherent through 94+ items; chemistry+thinking probe
-  first-token byte-identical vs llama.cpp `--reasoning on`).
+- **Coherence:** matches the locked reference trajectories on the qualified
+  family gates. Gemma executes the artifact's declared embedding and output
+  matrix representation directly; it does not silently change the target
+  head at load time.
 - **Throughput** (M5 Max, APEX-Q5_K_M, post-ADR-032):
   - Gemma 4 26B-A4B-it: 1.51× AHEAD of llama.cpp `-fa 1` at tg2000,
     1.67× AHEAD at tg200.
@@ -23,29 +23,15 @@ defaults—are typed CLI/config fields, not hidden environment variables. See
 
 ---
 
-## lm_head path
+## Gemma matrix storage
 
-The decoder's lm_head is the single biggest memory-bandwidth consumer
-at batch=1. hf2q auto-selects between an F16 dense mat-vec and a Q8_0
-quantized mat-vec based on the loaded weights' size, and when Q8 is
-used, a CPU-side exact rerank recovers the F16 trajectory.
-
-| Var | Default | Values | Effect |
-|---|---|---|---|
-| `HF2Q_LMHEAD_Q8` | auto | `1`, `0` | `1` forces Q8 (requires `hidden_size % 32 == 0`); `0` forces F16 (the escape hatch). Unset = auto: Q8 when F16 weight > 256 MB AND hidden_size % 32 == 0. |
-| `HF2Q_LMHEAD_RERANK` | on when Q8 | `0` | `0` disables the exact-F32 rerank of top candidates, leaving raw Q8 argmax. **Unsafe** — Q8's ~5e-3 logit noise envelope occasionally flips a near-tiebreak (observed as rare mid-decode `<pad>` emission). Only set for speed-vs-correctness benchmarking. |
-| `HF2Q_LMHEAD_COMPARE` | off | `1` | Keeps both F16 and Q8 buffers resident so a future A/B diagnostic can compare logits at every step. Not wired into the live decode path today. |
-
-**Why the default is Q8+rerank on large-vocab models:** Q8 alone
-recovers ~12% decode throughput vs F16 by halving the lm_head weight
-traffic (1.47 GB → 784 MB on Gemma-4 26B). The rerank adds ~0.4% back
-of overhead and preserves F16 output byte-for-byte on the locked gates.
-A dormant GPU top-K kernel exists (mlx-native `top_k_f32`); it is
-intentionally unused because for vocab=262144 the CPU threshold scan
-costs ~40 μs/token while the single-threadgroup GPU kernel costs
-~5 ms/token on phase-2 serial extraction. If a parallel-phase-2 redesign
-lands, the GPU path can be wired in without changing the Rust-side
-rerank logic.
+Gemma embeds tokens and projects logits from the exact matrix encoding stored
+in the GGUF. The loader checks that embedding gather and projection kernels
+both support that encoding before mapping model storage. A tied output head
+shares the embedding allocation; an explicit `output.weight` retains its own
+declared encoding. There is no head-format environment override because
+silently dequantizing or re-quantizing a served artifact would change its
+model semantics. Unsupported encodings fail closed before allocation.
 
 ---
 
@@ -54,8 +40,8 @@ rerank logic.
 | Var | Default | Values | Effect |
 |---|---|---|---|
 | `HF2Q_BATCHED_PREFILL` | on | `0`/`false`/`off` | Batched prefill (`forward_prefill_batched`) — the production path since ADR-028 iter-344 (default-flipped from per-token, which was 14-45× slower than peer at pp512–pp4096).  Coherence intact at every tested length up to pp3813 (4× sliding_window). Opt-out via `0`/`false`/`off` reverts to per-token prefill for parity diagnostics only. |
-| `HF2Q_CROSS_SLOT_ADMIT` | off globally; `1` in the canonical Gemma launcher | `1` | Allows the Gemma SlotAware admission loop to coalesce one contiguous FIFO class into a multi-sequence prefill. The engine applies one shared 4,096-row transaction cap across all lanes; it does not multiply the cap by slot count. This launcher-owned production policy is queued for typed internalization by ADR-050; it is not acceptable ordinary shell UX. |
-| `HF2Q_ADMIT_COALESCE_US` | `25000` in the canonical Gemma launcher | positive integer microseconds | Maximum first-cohort collection window used only with cross-slot admission. A larger value may improve initial batching at the cost of admission latency; it does not relax FIFO, transaction-row, context, or KV-budget checks. This is part of the same typed-admission follow-up, not a recommended user knob. |
+| `HF2Q_CROSS_SLOT_ADMIT` | off globally; `1` in the canonical Gemma and Qwen launchers | `0`/`1` | Allows a SlotAware worker to aggregate an already-runnable compatible FIFO prefix without skipping or waiting. Gemma applies one shared 4,096-row cap across all lanes. Qwen admits two to four cold text lanes only at an identical stable boundary of 16–128 rows per lane and publishes every lane atomically; `0` is the matched serial-control and incident-isolation path. This launcher-owned production policy is queued for typed internalization by ADR-050; it is not acceptable ordinary shell UX. |
+| `HF2Q_ADMIT_COALESCE_US` | `25000` in the canonical Gemma and Qwen launchers | integer microseconds, `0..=100000` | Maximum idle-worker first-cohort collection window used only with cross-slot admission. A larger value may improve initial batching at the cost of admission latency; zero disables collection without disabling other cross-slot routes. Invalid direct-runtime values warn and disable collection. It does not relax FIFO, transaction-row, context, or KV-budget checks. |
 | `HF2Q_F16_KV` | off | `1` | Allocate the dense KV cache as F16 instead of F32. Experimental — the current F16 path has a separate bug worse than F32; per ADR-009 the default F32 path is preferred. |
 | `HF2Q_NO_FA` | off | `1`/`true`/`on` | Diagnostic A/B knob.  When set, routes the global D=512 attention path through F32 tensor-mm instead of flash-attention.  Forced off at `seq_len < 32` (the dense-matmul kernel requires K ≥ 32).  Per ADR-032 the FA path is the production default — peer-aligned with llama.cpp's `kernel_flash_attn_ext_*_dk512_dv512`.  This flag exists for bisection work against the tensor-mm reference, not for production use. |
 | `HF2Q_FA_F16` | on | `0`/`false`/`off` | F16 (`half`, 10-bit mantissa) Q/K/V in flash-attention shared memory.  Matches llama.cpp's default `FA_TYPES` template specialisation for F16 KV cache (the standard production path).  Per ADR-032 this is the peer-aligned default — Q-shmem precision is the binding constraint on argmax stability at D=512 global layers (BF16's 7-bit mantissa accumulates ~9% relative error over a 512-element dot product, flipping argmax on narrow-margin greedy decode).  Opt-out reverts to BF16 (`bfloat`, 7-bit mantissa) shmem — peer's `FA_TYPES_BF` specialisation, only used in llama.cpp when KV cache is explicitly BF16.  Provided for diagnostic A/B against the BF16 instantiation; not for production. |
@@ -75,16 +61,16 @@ the qualified agentic profile (`1.05`, `2048`, `512`) when the operator chooses
 long agent/tool serving. The former `HF2Q_DEFAULT_*` readers and process bridge
 were removed because they were both poor UX and initialization-order unsafe.
 
-The remaining Qwen rows are technical routing escape hatches. ADR-050's
-inventory marks speculation and process-global decode routing for typed backend
-policy: their current environment implementation is not the final multi-model
-architecture.
+The remaining Qwen rows are technical routing escape hatches. The Qwen GGUF
+loader resolves them once into immutable model-owned routing state; it does not
+mutate process environment. ADR-050 still tracks replacement of their shell UX
+with typed operator configuration.
 
 | Var | Default | Values | Effect |
 |---|---|---|---|
 | `HF2Q_QWEN_SPECULATION` | `auto` | `off`, `auto` | Controls the live SlotAware Qwen server path. Default `auto` since 2026-08-21 (previously `off` outside the canonical Qwen3.8 launcher): `auto` measures ordinary decode first, tries exact request-history lookup (6-12-token match, up to three draft tokens), then fixed-K3 native MTP when available; each proposer disables itself for the generation after two consecutive four-round windows are not better than equivalent ordinary output. Stochastic sampling, logprobs, stop strings, logit bias, frequency/presence/min-p, parallel tool calls, and unsupported tool policy stay on ordinary target decode. Invalid values warn and fail safe to `off`. Explicit `off` remains the escape hatch. |
-| `HF2Q_DECODE_MVN` | `1`; `0` applied automatically when loading a Qwen3.8-identified model | `0`, `1` | Controls exact-tree Q4_K/Q6_K multi-column matvec routing. The Qwen3.8-qualified route disables it because the K=3 verifier is qualified on the weight-amortized width-four route. Previously only `serve_qwen38_opencode.sh` applied this; `hf2q serve` now applies it at engine load for Qwen3.8-identified models. |
-| `HF2Q_DECODE_MV_EXT` | `0`; `1` applied automatically when loading a Qwen3.8-identified model | `0`, `1` | Enables weight-amortized multi-column matvec. K-quants route only at widths 4-8; legacy Q4_0/Q8_0 retain widths 2-8. Enabled after the real-model four-position decision, hybrid-cache cursor, and eight-step continuation gate. Unlike the byte-exact default-on mvN route, `mul_mv_ext` is not bit-exact, so the default stays Qwen3.8-scoped — no other family carries the qualifying receipt. |
+| `HF2Q_DECODE_MVN` | `1` | `0`, `1` | Controls exact-tree Q4_K/Q6_K multi-column matvec routing. All Qwen artifacts use the shared native default; model labels do not alter it. The multi-row kernels preserve the scalar accumulator and reduction order, and explicit operator values are resolved into immutable per-model routing without mutating process environment. |
+| `HF2Q_DECODE_MV_EXT` | `0` | `0`, `1` | Experimental weight-amortized multi-column matvec. K-quants route only at widths 4-8; legacy Q4_0/Q8_0 retain widths 2-8. Its different reduction tree is not byte-exact: a Qwen3.8 repeated-verifier gate changed a target decision at completion token 206 despite an earlier four-position pass. Enabling it therefore invalidates exact speculative-decoding authority; production launchers leave it disabled. |
 | `HF2Q_QWEN_GQA_Q2` | `auto` | `auto`, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 TQ-HB decode shares each KV-head load/dequantization across two query heads when the exact D=256/GQA/no-mask geometry is supported. `auto` selects it at KV length ≥8,192; `off` is the production escape hatch; `on` forces the candidate only where its hard geometry checks pass. Invalid values fail safe to `off`. Release requires the exact-output, thermally supervised short/long receipt in the shipping contract. |
 
 ## Dense KV / decode layout
@@ -130,8 +116,8 @@ fixable single-kernel mismatch. Closing it would require pervasive
 pre-MoE kernel alignment (option 1 in the ADR). Not pursuing in the
 current phase.
 
-Speed line: `shipping`. Default decode matches llama.cpp's coherence
+Speed line: `shipping`. Default decode matches the locked reference coherence
 on the locked gates at 1.31–1.67× of its throughput across Gemma 4
-and Qwen 3.6 APEX-Q5_K_M (see "Default behavior" at top for per-regime
-numbers).  Q8+rerank is the production lm_head strategy; F16 remains
-available via `HF2Q_LMHEAD_Q8=0`.
+and Qwen 3.6 APEX-Q5_K_M (see "Default behavior" at top for the historical
+per-regime measurements). Gemma's current output path uses the stored artifact
+representation directly.

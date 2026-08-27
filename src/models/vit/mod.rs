@@ -193,7 +193,7 @@ fn load_vision_config(hf_repo_dir: &Path) -> Result<VisionConfig, VitConvertErro
         .map_err(|e| VitConvertError::Config(VisionConfigError::BadJson(e.to_string())))?;
     let mut vision_config = VisionConfig::from_hf_config(&root)?;
     let processor_path = hf_repo_dir.join("preprocessor_config.json");
-    let requires_processor_config = vision_config.is_qwen3vl();
+    let requires_processor_config = vision_config.is_qwen_vision();
     if processor_path.exists() {
         let processor_raw = std::fs::read_to_string(&processor_path)?;
         let processor: serde_json::Value = serde_json::from_str(&processor_raw)

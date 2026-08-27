@@ -24,9 +24,11 @@
 
 use anyhow::{anyhow, bail, Result};
 use mlx_native::gguf::{GgufFile, MetadataValue};
+use mlx_native::GgmlType;
 
 pub mod activation_capture_real;
 pub mod chunk_allocs_arena;
+pub(crate) mod decode_observation;
 pub mod decode_pool;
 pub mod delta_net;
 pub mod dense;
@@ -49,6 +51,7 @@ pub mod ffn;
 pub mod forward_cpu;
 pub mod forward_gpu;
 pub mod full_attn;
+pub(super) mod gguf_preflight;
 pub mod gpu_delta_net;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;
@@ -82,68 +85,74 @@ pub const ARCH_QWEN35: &str = "qwen35";
 /// `general.architecture` value for the MoE variant.
 pub const ARCH_QWEN35MOE: &str = "qwen35moe";
 
-/// `general.architecture` value emitted by hf2q's Wedge-4f convert pipeline
-/// for **Qwen3-VL text** models (`Qwen/Qwen3-VL-2B-Instruct`,
-/// `Qwen/Qwen3-VL-4B-Instruct`, etc.).
+/// Runtime role for a Qwen tensor whose storage codec is constrained by the
+/// native execution path.
 ///
-/// This is the dense Qwen3-VL variant. Note the underscore: the value is
-/// `qwen3_vl`, not the peer's `qwen3vl`. hf2q's convert pipeline
-/// (`src/convert/...`) preserves HF's `model_type = "qwen3_vl_text"` family
-/// stem when it stamps `general.architecture`. Both the underscored and
-/// non-underscored variants are recognized by [`is_qwen3_vl_arch`] so we
-/// stay forward-compatible with future convert-pipeline alignment.
-///
-/// Wedge-4 / iter-227 (2026-05-02) introduces this constant solely so the
-/// runtime arch dispatch in `serve::cmd_generate` and
-/// `serve::api::engine::LoadedModel::load` can detect Qwen3-VL GGUFs and
-/// route them with an operator-actionable error rather than falling
-/// through to the Gemma 4 path and dying inside the per-layer MoE expert
-/// loader with `missing blk.0.ffn_gate_up_exps.weight`.
-///
-/// **Why not route to `Qwen35Model::load_from_gguf`?** Qwen3-VL text is a
-/// plain dense transformer with `attn_{q,k,v,o}` + `ffn_{gate,up,down}`
-/// tensors and zero SSM / DeltaNet structure. [`Qwen35Config::from_gguf`]
-/// requires `{prefix}.ssm.{state_size,group_count,inner_size,conv_kernel}`
-/// and `{prefix}.full_attention_interval` keys, none of which are emitted
-/// by Wedge-4f convert (correctly: Qwen3-VL has none of those features).
-/// A separate `Qwen3VlModel` load path is the structurally honest answer
-/// and is iter-228+ scope; iter-227 closes only the dispatch gap.
-pub const ARCH_QWEN3_VL: &str = "qwen3_vl";
-
-/// The peer's `general.architecture` string for the same family
-/// (no underscore). Recognized so a future convert-pipeline alignment to
-/// that string doesn't silently re-break dispatch.
-pub const ARCH_QWEN3VL_UPSTREAM: &str = "qwen3vl";
-
-/// The peer's `general.architecture` string for the **MoE**
-/// Qwen3-VL variant (e.g. `Qwen3-VL-30B-A3B`). hf2q does not yet emit
-/// or load this variant, but it is recognized by [`is_qwen3_vl_arch`]
-/// so the dispatch error message tells the operator we know what they
-/// have but cannot serve it yet (rather than falling through silently).
-pub const ARCH_QWEN3VLMOE_UPSTREAM: &str = "qwen3vlmoe";
-
-/// True iff `arch` is any Qwen3-VL `general.architecture` string we
-/// recognize — covers both hf2q's underscored convention (`qwen3_vl`) and
-/// the peer's no-underscore convention (`qwen3vl`,
-/// `qwen3vlmoe`). Used at the runtime dispatch sites in
-/// `serve::cmd_generate` and `serve::api::engine::LoadedModel::load` so
-/// either arch-string spelling lands on the same operator-actionable
-/// error path.
-///
-/// Returns `false` for `qwen35` / `qwen35moe` (those route through the
-/// existing Qwen3.5 dense + MoE paths) and for unrelated arches like
-/// `gemma4`, `bert`, `nomic-bert`, etc.
-pub fn is_qwen3_vl_arch(arch: &str) -> bool {
-    arch == ARCH_QWEN3_VL || arch == ARCH_QWEN3VL_UPSTREAM || arch == ARCH_QWEN3VLMOE_UPSTREAM
+/// Hosted admission and local inventory validation deliberately share this
+/// classifier with the loader. A newly executable codec must therefore be
+/// admitted everywhere at once instead of being rejected by a stale outer
+/// allowlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Qwen35NativeTensorRole {
+    TokenEmbedding,
+    DenseFfn,
+    MoeExpert,
+    Projection,
 }
 
-/// True iff a Qwen3-VL `general.architecture` string identifies the
-/// MoE variant (Qwen3-VL-30B-A3B etc.). Today only the upstream
-/// `qwen3vlmoe` value triggers this; hf2q's convert pipeline does not
-/// yet emit a Qwen3-VL-MoE GGUF, but the predicate is wired so the
-/// dispatch error message can distinguish dense vs MoE Qwen3-VL.
-pub fn is_qwen3_vl_moe_arch(arch: &str) -> bool {
-    arch == ARCH_QWEN3VLMOE_UPSTREAM
+impl Qwen35NativeTensorRole {
+    pub(crate) fn for_name(name: &str) -> Option<Self> {
+        if name == "token_embd.weight" {
+            return Some(Self::TokenEmbedding);
+        }
+        if [".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        {
+            return Some(Self::DenseFfn);
+        }
+        if [
+            ".ffn_gate_exps.weight",
+            ".ffn_up_exps.weight",
+            ".ffn_down_exps.weight",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+        {
+            return Some(Self::MoeExpert);
+        }
+        if name == "output.weight"
+            || [
+                ".attn_q.weight",
+                ".attn_k.weight",
+                ".attn_v.weight",
+                ".attn_output.weight",
+                ".attn_qkv.weight",
+                ".attn_gate.weight",
+                ".ssm_alpha.weight",
+                ".ssm_beta.weight",
+                ".ssm_out.weight",
+            ]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        {
+            return Some(Self::Projection);
+        }
+        None
+    }
+
+    pub(crate) fn supports(self, ggml_type: GgmlType) -> bool {
+        match self {
+            Self::TokenEmbedding => {
+                forward_gpu::qwen35_native_embedding_type_supported(ggml_type)
+            }
+            Self::DenseFfn => weight_loader::qwen35_dense_ffn_type_supported(ggml_type),
+            Self::MoeExpert => weight_loader::qwen35_moe_expert_type_supported(ggml_type),
+            Self::Projection => {
+                weight_loader::qwen35_native_projection_type_supported(ggml_type)
+            }
+        }
+    }
 }
 
 /// Dense vs MoE flavor.
@@ -625,6 +634,18 @@ pub fn is_qwen36_gguf(gguf: &mlx_native::gguf::GgufFile) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve one immutable policy for this model lifetime. Every Qwen artifact
+/// uses the shared native defaults unless the operator explicitly overrides
+/// them. A model label must never opt a speculative verifier into a
+/// width-dependent reduction tree: repeated verification proved that the old
+/// Qwen3.8-local `mul_mv_ext` default could change a target decision. No
+/// process environment is mutated, so A→B→A model swaps remain isolated.
+pub fn ggml_routing_policy_for_gguf(
+    _gguf: &mlx_native::gguf::GgufFile,
+) -> mlx_native::GgmlRoutingPolicy {
+    mlx_native::ggml_routing_policy_from_environment()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,84 +834,6 @@ mod tests {
         assert_eq!(Qwen35Variant::Moe.key_prefix(), ARCH_QWEN35MOE);
     }
 
-    // ------------------------------------------------------------------
-    // Wedge-4 / iter-227 — Qwen3-VL arch dispatch predicates
-    // ------------------------------------------------------------------
-
-    /// hf2q's convert pipeline (Wedge-4f) emits `general.architecture =
-    /// "qwen3_vl"` (with underscore). The real GGUF inspected on
-    /// 2026-05-02 at `.cfa-archive/wedge4f-out/qwen3-vl-2b-q4_0.gguf`
-    /// carries this exact string. Pin the predicate against it so a
-    /// future convert-pipeline drift does not silently break the
-    /// `cmd_generate` / `cmd_serve` dispatch arm.
-    #[test]
-    fn iter227_recognizes_underscored_qwen3_vl_arch_string() {
-        assert!(is_qwen3_vl_arch(ARCH_QWEN3_VL));
-        assert!(is_qwen3_vl_arch("qwen3_vl"));
-        assert!(!is_qwen3_vl_moe_arch("qwen3_vl"));
-    }
-
-    /// The peer emits the no-underscore variant. We recognize
-    /// it so a future hf2q convert-pipeline alignment to that
-    /// string does not re-break dispatch.
-    #[test]
-    fn iter227_recognizes_upstream_no_underscore_qwen3vl_arch_string() {
-        assert!(is_qwen3_vl_arch(ARCH_QWEN3VL_UPSTREAM));
-        assert!(is_qwen3_vl_arch("qwen3vl"));
-        assert!(!is_qwen3_vl_moe_arch("qwen3vl"));
-    }
-
-    /// The peer's MoE variant (Qwen3-VL-30B-A3B). hf2q does
-    /// not yet emit or serve this, but the predicate must distinguish it
-    /// from the dense variant so the dispatch error message can be
-    /// MoE-specific.
-    #[test]
-    fn iter227_recognizes_upstream_qwen3vlmoe_arch_string() {
-        assert!(is_qwen3_vl_arch(ARCH_QWEN3VLMOE_UPSTREAM));
-        assert!(is_qwen3_vl_moe_arch("qwen3vlmoe"));
-    }
-
-    /// Regression guard — `is_qwen3_vl_arch` must NOT widen onto the
-    /// existing Qwen3.5 / Qwen3.5-MoE arches (which have working
-    /// dispatch through `Qwen35LoadedModel::load`) or onto unrelated
-    /// families (Gemma 4, BERT, etc.). Iter-227 must be additive.
-    #[test]
-    fn iter227_does_not_widen_onto_existing_arches() {
-        for arch in &[
-            "qwen35",
-            "qwen35moe",
-            "gemma4",
-            "gemma3",
-            "bert",
-            "nomic-bert",
-            "llama",
-            "qwen3", // base Qwen3 (no VL)
-            "qwen2",
-            "",
-            "totally-fake-arch-name",
-        ] {
-            assert!(
-                !is_qwen3_vl_arch(arch),
-                "is_qwen3_vl_arch({arch:?}) must be false (regression guard for iter-227 dispatch)"
-            );
-            assert!(
-                !is_qwen3_vl_moe_arch(arch),
-                "is_qwen3_vl_moe_arch({arch:?}) must be false (regression guard for iter-227 dispatch)"
-            );
-        }
-    }
-
-    /// Sanity: `qwen3_vl` is NOT a `Qwen35Variant` — it routes through a
-    /// separate dispatch path. This test ensures Qwen35Variant::from_arch
-    /// stays narrow to the Qwen3.5 family even after the iter-227 const
-    /// additions.
-    #[test]
-    fn iter227_qwen3_vl_is_not_a_qwen35_variant() {
-        assert_eq!(Qwen35Variant::from_arch(ARCH_QWEN3_VL), None);
-        assert_eq!(Qwen35Variant::from_arch(ARCH_QWEN3VL_UPSTREAM), None);
-        assert_eq!(Qwen35Variant::from_arch(ARCH_QWEN3VLMOE_UPSTREAM), None);
-    }
-
     /// Integration test against the real apex GGUF on disk. Runtime-
     /// skips when artefact absent (existing path-exists check). Path
     /// fixed to `APEX-Q5_K_M.gguf` — the canonical fixture name.
@@ -917,14 +860,9 @@ mod tests {
         let gguf = match GgufFile::open(&path) {
             Ok(g) => g,
             Err(e) => {
-                // mlx-native's GGUF loader supports F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/
-                // Q6_K/I16 (verified at /opt/mlx-native/src/gguf/mod.rs:300-313
-                // and dequant table :755-765, as of 2026-04-25).  Q5_K mv_id +
-                // dequant are wired (see weight_loader.rs:405-411 and
-                // /opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs:65-70);
-                // only the Q5_K mm_id kernel (large-batch prefill > 8 tokens)
-                // is not yet ported.  If GGUF open fails here it's almost
-                // certainly an unrelated parse/IO issue, not a Q5_K limitation.
+                // Stored-type execution is admitted by the model preflight
+                // after the container opens. An error here is a parse or I/O
+                // failure, not evidence for substituting a weight codec.
                 eprintln!("skipping: apex GGUF open failed ({e})");
                 return;
             }

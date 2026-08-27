@@ -109,7 +109,6 @@ mod tests {
             for operation in [
                 "GGML projection dispatch",
                 "fused q4_k gate/up dispatch",
-                "fused q5_k gate/up dispatch",
                 "fused q6_k gate/up dispatch",
                 "fused q8_0 gate/up dispatch",
                 "fused iq4_nl gate/up dispatch",

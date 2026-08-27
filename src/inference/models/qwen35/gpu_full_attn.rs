@@ -43,8 +43,9 @@
 //! P7b complete: every op wired, parity test passes |GPU−CPU|∞ < 1e-3 F32.
 
 use anyhow::{anyhow, ensure, Context, Result};
-use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
-use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::dense_matmul_bf16_f32_auto;
+use mlx_native::ops::dense_mm_bf16::DenseMmBf16F32Params;
+use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::flash_attn_prefill::{
@@ -532,15 +533,10 @@ impl FullAttnWeightsGpu {
     /// Upload a synthetic, lazy, or explicit floating-point
     /// [`FullAttnLayerWeights`] to Metal buffers.
     ///
-    /// Precision: Q4_0 (4-bit with F16 per-block scale) introduces ~1% magnitude
-    /// error, well within the I16→F32→Q4_0 chain used by APEX GGUF attn weights.
-    /// The peer uses Q5_K_M for these same weights; Q4_0 is slightly less
-    /// precise but produces the same token selections in practice (sourdough gate
-    /// must confirm).
-    /// This compatibility constructor encodes those caller-owned F32 matrices
-    /// as Q4_0. GGUF-backed production models never call it: their exact native
-    /// blocks are loaded by `load_full_attn_layer_native` and remain in the
-    /// conversion-emitted representation.
+    /// This compatibility constructor encodes caller-owned synthetic F32
+    /// matrices as Q4_0. GGUF-backed production models never call it: their
+    /// exact native blocks are loaded by `load_full_attn_layer_native` and
+    /// remain in the conversion-emitted representation.
     pub fn from_cpu(weights: &FullAttnLayerWeights, device: &MlxDevice) -> Result<Self> {
         // W-5b.7 iter 2: F32 norm weights uploaded via the residency-aware
         // helper so they join MTLResidencySet alongside the Q4_0 projection
@@ -1027,33 +1023,28 @@ pub fn apply_pre_attn_rms_norm(
 }
 
 // ================================================================
-// Linear projection (F32 weights via BF16 cast)
+// Scalar linear projection
 // ================================================================
 
 /// Apply a single linear projection: `output = input @ weight^T`.
 ///
 /// `input`  shape: `[seq_len, in_features]`  F32.
-/// `weight` shape: `[out_features, in_features]` — BF16 or Q4_0 raw blocks (U8).
+/// `weight` shape: `[out_features, in_features]` — F32, F16, or BF16.
 ///
 /// Returns `[seq_len, out_features]` F32.
 ///
 /// # Implementation
 ///
-/// Dispatches based on weight dtype:
+/// Dispatches based on the exact scalar weight dtype:
 ///
-/// - **U8** (Q4_0 GGML blocks): uses `quantized_matmul_ggml` which routes
-///   to `dispatch_mv` for M=1 (decode) and `dispatch_mm` for M>8 (prefill).
-///   This is the production path: 3.56× less bandwidth than BF16, and uses
-///   the same deterministic simd_sum accumulation as the FFN projection path.
+/// - **BF16** (artifact-native): uses the immutable activation-time route.
 ///
-/// - **BF16** (dense pre-cast): uses `dense_matmul_bf16_f32_tensor` (MMA
-///   tensor-core tiled GEMM). Kept for lm_head and any weight not yet
-///   quantized.
+/// - **F16/F32** (artifact-native): dispatches the exact stored scalar matrix
+///   directly; inference does not cast or rewrite the weight.
 ///
-/// - **F32** (legacy inline cast): casts to BF16 on the GPU then calls the
-///   BF16 path. Per-inference cost; only used for un-pre-cast weights.
-///
-/// Requires `in_features >= 32` for Q4_0 (block size) and BF16 (tile size).
+/// Raw U8 is deliberately rejected because dtype alone cannot distinguish
+/// Q4_0, Q5_0, or another packed codec. Artifact-backed callers must use the
+/// codec-explicit `*_with_ggml_type` entry point.
 pub fn apply_linear_projection_f32(
     encoder: &mut mlx_native::CommandEncoder,
     registry: &mut KernelRegistry,
@@ -1064,17 +1055,45 @@ pub fn apply_linear_projection_f32(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
+    let ggml_type = match weight.dtype() {
+        DType::F32 => GgmlType::F32,
+        DType::F16 => GgmlType::F16,
+        DType::BF16 => GgmlType::BF16,
+        other => {
+            return Err(anyhow!(
+                "apply_linear_projection_f32 requires an exact scalar dtype, got {other}; packed weights require an explicit GGML codec"
+            ));
+        }
+    };
     apply_linear_projection_f32_with_ggml_type(
         encoder,
         registry,
         device,
         input,
         weight,
-        GgmlType::Q4_0,
+        ggml_type,
         seq_len,
         in_features,
         out_features,
     )
+}
+
+pub(crate) fn ensure_native_projection_storage(
+    weight: &MlxBuffer,
+    ggml_type: GgmlType,
+) -> Result<()> {
+    let expected = match ggml_type {
+        GgmlType::F32 => DType::F32,
+        GgmlType::F16 => DType::F16,
+        GgmlType::BF16 => DType::BF16,
+        _ => DType::U8,
+    };
+    ensure!(
+        weight.dtype() == expected,
+        "artifact-native projection type {ggml_type:?} requires {expected} storage, got {}",
+        weight.dtype()
+    );
+    Ok(())
 }
 
 /// Dtype-aware projection that preserves the GGML quantization selected by
@@ -1103,17 +1122,16 @@ pub fn apply_linear_projection_f32_with_ggml_type(
     // which uses the pre-allocated `logits_buf` from `DecodeBuffers` (not
     // this code path), so leaving this device-allocated has no decode cost.
     // ADR-030 iter-114 — defense-in-depth dtype check.  Every kernel
-    // path below (quantized_matmul_ggml, dense_gemv_bf16_f32,
-    // dense_matmul_bf16_f32_tensor) assumes F32 input.  Passing BF16
+    // path below assumes F32 input for every projection kernel. Passing BF16
     // would silently mis-stride at the kernel (iter-106 class of bug,
     // see ADR-030 iter-110/111/112/113 for the mlx-native dispatcher-
     // level guards).
-    debug_assert_eq!(
-        input.dtype(),
-        DType::F32,
-        "apply_linear_projection_f32: input must be F32 (kernel paths assume F32); got {}",
+    ensure!(
+        input.dtype() == DType::F32,
+        "artifact-native projection requires F32 input, got {}",
         input.dtype()
     );
+    ensure_native_projection_storage(weight, ggml_type)?;
 
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
@@ -1145,21 +1163,26 @@ pub fn apply_linear_projection_f32_with_ggml_type(
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            if seq_len == 1 {
-                // GEMV path — bandwidth-optimized for M=1 decode.
-                // mul_mv_bf16_f32_4: processes multiple
-                // weight rows per threadgroup, ~2× faster than tiled MM for M=1.
-                // Process multiple weight rows per threadgroup; this is about
-                // 2× faster than tiled MM for M=1.
-                dense_gemv_bf16_f32(encoder, registry, device, weight, input, &mut dst, &params)
-                    .context("dense_gemv_bf16_f32 (M=1)")?;
-            } else {
-                // BF16 tiled GEMM path — MMA tensor-core, optimal for M > 1.
-                dense_matmul_bf16_f32_tensor(
-                    encoder, registry, device, weight, input, &mut dst, &params,
-                )
-                .context("dense_matmul_bf16_f32_tensor")?;
-            }
+            dense_matmul_bf16_f32_auto(encoder, registry, device, weight, input, &dst, &params)
+                .context("activated native BF16 projection")?;
+        }
+        DType::F16 => {
+            dense_matmul_f16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                weight,
+                input,
+                &dst,
+                &DenseMmF16F32Params {
+                    m: seq_len,
+                    n: out_features,
+                    k: in_features,
+                    src0_batch: 1,
+                    src1_batch: 1,
+                },
+            )
+            .context("dense_matmul_f16_f32_tensor")?;
         }
         DType::F32 => {
             let params = DenseMmF32F32Params {
@@ -1210,9 +1233,11 @@ pub fn apply_linear_projection_f32_with_ggml_type(
 ///
 /// Behavior is identical for `Q4_0` weights (Qwen path), `BF16`, and `F32` —
 /// the only material change is the U8 arm reading `qweight.info.ggml_dtype`.
-/// `qweight.affine` and `qweight.f16_shadow` are NOT consulted; the encoder
-/// path does not currently have F16-shadow integration. Future cleanup can
-/// converge with `dispatch_qmatmul` once tree-verify migrates to sessions.
+/// Declared affine overlays use a separate entry point and therefore fail
+/// closed here. GGUF weights execute according to their stored type.
+/// Tree verification deliberately accepts an existing encoder so its whole
+/// target round remains one transaction; `dispatch_qmatmul` owns the separate
+/// session entry point for callers that do not already have an encoder.
 pub fn apply_linear_projection_f32_qweight(
     encoder: &mut mlx_native::CommandEncoder,
     registry: &mut KernelRegistry,
@@ -1223,12 +1248,23 @@ pub fn apply_linear_projection_f32_qweight(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
-    debug_assert_eq!(
-        input.dtype(),
-        DType::F32,
-        "apply_linear_projection_f32_qweight: input must be F32; got {}",
+    ensure!(
+        input.dtype() == DType::F32,
+        "artifact-native qweight projection requires F32 input, got {}",
         input.dtype()
     );
+    ensure!(
+        qweight.affine.is_none(),
+        "artifact-native qweight projection cannot consume an affine overlay"
+    );
+    ensure!(
+        qweight.info.rows == out_features as usize
+            && qweight.info.cols == in_features as usize,
+        "artifact-native qweight projection metadata is [{}, {}], expected [{out_features}, {in_features}]",
+        qweight.info.rows,
+        qweight.info.cols
+    );
+    ensure_native_projection_storage(&qweight.buffer, qweight.info.ggml_dtype)?;
 
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
@@ -1274,29 +1310,34 @@ pub fn apply_linear_projection_f32_qweight(
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            if seq_len == 1 {
-                dense_gemv_bf16_f32(
-                    encoder,
-                    registry,
-                    device,
-                    &qweight.buffer,
-                    input,
-                    &mut dst,
-                    &params,
-                )
-                .context("dense_gemv_bf16_f32 (M=1)")?;
-            } else {
-                dense_matmul_bf16_f32_tensor(
-                    encoder,
-                    registry,
-                    device,
-                    &qweight.buffer,
-                    input,
-                    &mut dst,
-                    &params,
-                )
-                .context("dense_matmul_bf16_f32_tensor")?;
-            }
+            dense_matmul_bf16_f32_auto(
+                encoder,
+                registry,
+                device,
+                &qweight.buffer,
+                input,
+                &dst,
+                &params,
+            )
+            .context("activated native BF16 projection")?;
+        }
+        DType::F16 => {
+            dense_matmul_f16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                &qweight.buffer,
+                input,
+                &dst,
+                &DenseMmF16F32Params {
+                    m: seq_len,
+                    n: out_features,
+                    k: in_features,
+                    src0_batch: 1,
+                    src1_batch: 1,
+                },
+            )
+            .context("dense_matmul_f16_f32_tensor qweight")?;
         }
         DType::F32 => {
             let params = DenseMmF32F32Params {
@@ -1345,13 +1386,23 @@ pub fn apply_linear_projection_f32_into(
     in_features: u32,
     out_features: u32,
 ) -> Result<()> {
+    let ggml_type = match weight.dtype() {
+        DType::F32 => GgmlType::F32,
+        DType::F16 => GgmlType::F16,
+        DType::BF16 => GgmlType::BF16,
+        other => {
+            return Err(anyhow!(
+                "apply_linear_projection_f32_into requires an exact scalar dtype, got {other}; packed weights require an explicit GGML codec"
+            ));
+        }
+    };
     apply_linear_projection_f32_into_with_ggml_type(
         encoder,
         registry,
         device,
         input,
         weight,
-        GgmlType::Q4_0,
+        ggml_type,
         dst,
         seq_len,
         in_features,
@@ -1377,18 +1428,13 @@ pub fn apply_linear_projection_f32_into_with_ggml_type(
     // ADR-030 iter-115 — defense-in-depth dtype check (mirrors
     // apply_linear_projection_f32 in iter-114).  Caller-supplied dst must
     // also be F32 since every kernel path below writes F32.
-    debug_assert_eq!(
+    ensure!(
+        input.dtype() == DType::F32 && dst.dtype() == DType::F32,
+        "artifact-native projection requires F32 input/output, got input={} output={}",
         input.dtype(),
-        DType::F32,
-        "apply_linear_projection_f32_into: input must be F32; got {}",
-        input.dtype()
-    );
-    debug_assert_eq!(
-        dst.dtype(),
-        DType::F32,
-        "apply_linear_projection_f32_into: dst must be F32; got {}",
         dst.dtype()
     );
+    ensure_native_projection_storage(weight, ggml_type)?;
 
     match weight.dtype() {
         DType::U8 => {
@@ -1409,15 +1455,26 @@ pub fn apply_linear_projection_f32_into_with_ggml_type(
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            if seq_len == 1 {
-                dense_gemv_bf16_f32(encoder, registry, device, weight, input, dst, &params)
-                    .context("dense_gemv_bf16_f32 (M=1, into)")?;
-            } else {
-                dense_matmul_bf16_f32_tensor(
-                    encoder, registry, device, weight, input, dst, &params,
-                )
-                .context("dense_matmul_bf16_f32_tensor (into)")?;
-            }
+            dense_matmul_bf16_f32_auto(encoder, registry, device, weight, input, dst, &params)
+                .context("activated native BF16 projection (into)")?;
+        }
+        DType::F16 => {
+            dense_matmul_f16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                weight,
+                input,
+                dst,
+                &DenseMmF16F32Params {
+                    m: seq_len,
+                    n: out_features,
+                    k: in_features,
+                    src0_batch: 1,
+                    src1_batch: 1,
+                },
+            )
+            .context("dense_matmul_f16_f32_tensor (into)")?;
         }
         DType::F32 => {
             let params = DenseMmF32F32Params {
@@ -2353,6 +2410,208 @@ pub fn apply_flash_attn_prefill_seq_major_into(
     // No commit — caller owns the encoder lifecycle. See the wrapper
     // [`apply_flash_attn_prefill_seq_major`] for the "open + delegate +
     // commit_labeled" composition that preserves the legacy behavior.
+    Ok(())
+}
+
+/// Encode equal-width independent fresh prefills through one tiled attention
+/// dispatch. Aggregate input/output rows remain sequence-major
+/// `[batch * seq_len, heads, head_dim]`; only the BF16 staging buffers use the
+/// native `[batch, heads, seq_len, head_dim]` layout.
+///
+/// This deliberately preserves the production scalar operator class. It does
+/// not route long prefill through the byte-packed TQ decode-vector kernel.
+/// The caller owns the encoder and the arena lifetime and must commit after
+/// all consumers of `out_seq` have been encoded.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_flash_attn_prefill_seq_major_batched_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_seq_major: &MlxBuffer,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    out_seq: &MlxBuffer,
+    batch: u32,
+    seq_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    arena: &mut crate::inference::models::qwen35::FaPrefillArena,
+) -> Result<()> {
+    ensure!(batch >= 2, "batched FA prefill requires at least two lanes");
+    ensure!(
+        seq_len >= 16,
+        "batched FA prefill requires the production tiled route (seq_len >= 16)"
+    );
+    ensure!(
+        head_dim == 256,
+        "batched FA prefill requires the D=256 tiled dispatcher"
+    );
+    let rows = batch
+        .checked_mul(seq_len)
+        .context("batched FA prefill row count overflow")?;
+    arena
+        .validate_fits(rows, n_heads, n_kv_heads, head_dim)
+        .context("batched FA prefill arena")?;
+
+    let batch_usize = batch as usize;
+    let seq = seq_len as usize;
+    let nh = n_heads as usize;
+    let nkv = n_kv_heads as usize;
+    let d = head_dim as usize;
+    let q_lane_elems = seq
+        .checked_mul(nh)
+        .and_then(|value| value.checked_mul(d))
+        .context("batched FA prefill Q lane size overflow")?;
+    let kv_lane_elems = seq
+        .checked_mul(nkv)
+        .and_then(|value| value.checked_mul(d))
+        .context("batched FA prefill KV lane size overflow")?;
+    let q_elems = batch_usize
+        .checked_mul(q_lane_elems)
+        .context("batched FA prefill Q size overflow")?;
+    let kv_elems = batch_usize
+        .checked_mul(kv_lane_elems)
+        .context("batched FA prefill KV size overflow")?;
+    ensure!(
+        out_seq.byte_len() >= q_elems * std::mem::size_of::<f32>(),
+        "batched FA prefill output buffer is smaller than the aggregate row extent"
+    );
+
+    cast(
+        enc,
+        registry,
+        device.metal_device(),
+        q_seq_major,
+        &arena.q_bf16_seq,
+        q_elems,
+        CastDirection::F32ToBF16,
+    )
+    .context("batched FA prefill cast Q F32→BF16")?;
+    enc.memory_barrier();
+    for lane in 0..batch_usize {
+        let input = arena
+            .q_bf16_seq
+            .slice_view((lane * q_lane_elems * 2) as u64, q_lane_elems);
+        let output = arena
+            .q_bf16_hm
+            .slice_view((lane * q_lane_elems * 2) as u64, q_lane_elems);
+        permute_021_bf16(
+            enc,
+            registry,
+            device.metal_device(),
+            &input,
+            &output,
+            seq,
+            nh,
+            d,
+        )
+        .with_context(|| format!("batched FA prefill permute Q lane {lane}"))?;
+    }
+
+    cast(
+        enc,
+        registry,
+        device.metal_device(),
+        k_seq_major,
+        &arena.k_bf16_seq,
+        kv_elems,
+        CastDirection::F32ToBF16,
+    )
+    .context("batched FA prefill cast K F32→BF16")?;
+    enc.memory_barrier();
+    for lane in 0..batch_usize {
+        let input = arena
+            .k_bf16_seq
+            .slice_view((lane * kv_lane_elems * 2) as u64, kv_lane_elems);
+        let output = arena
+            .k_bf16_hm
+            .slice_view((lane * kv_lane_elems * 2) as u64, kv_lane_elems);
+        permute_021_bf16(
+            enc,
+            registry,
+            device.metal_device(),
+            &input,
+            &output,
+            seq,
+            nkv,
+            d,
+        )
+        .with_context(|| format!("batched FA prefill permute K lane {lane}"))?;
+    }
+
+    cast(
+        enc,
+        registry,
+        device.metal_device(),
+        v_seq_major,
+        &arena.v_bf16_seq,
+        kv_elems,
+        CastDirection::F32ToBF16,
+    )
+    .context("batched FA prefill cast V F32→BF16")?;
+    enc.memory_barrier();
+    for lane in 0..batch_usize {
+        let input = arena
+            .v_bf16_seq
+            .slice_view((lane * kv_lane_elems * 2) as u64, kv_lane_elems);
+        let output = arena
+            .v_bf16_hm
+            .slice_view((lane * kv_lane_elems * 2) as u64, kv_lane_elems);
+        permute_021_bf16(
+            enc,
+            registry,
+            device.metal_device(),
+            &input,
+            &output,
+            seq,
+            nkv,
+            d,
+        )
+        .with_context(|| format!("batched FA prefill permute V lane {lane}"))?;
+    }
+    enc.memory_barrier();
+
+    dispatch_flash_attn_prefill_bf16_d256(
+        enc,
+        device,
+        registry,
+        &arena.q_bf16_hm,
+        &arena.k_bf16_hm,
+        &arena.v_bf16_hm,
+        None,
+        &mut arena.out_bf16_hm,
+        &FlashAttnPrefillParams {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len_q: seq_len,
+            seq_len_k: seq_len,
+            batch,
+            scale: 1.0 / (d as f32).sqrt(),
+            do_causal: true,
+        },
+    )
+    .context("batched FA prefill tiled attention")?;
+    enc.memory_barrier();
+
+    for lane in 0..batch_usize {
+        let input = arena
+            .out_bf16_hm
+            .slice_view((lane * q_lane_elems * 2) as u64, q_lane_elems);
+        let output = out_seq.slice_view((lane * q_lane_elems * 4) as u64, q_lane_elems);
+        permute_021_bf16_to_f32(
+            enc,
+            registry,
+            device.metal_device(),
+            &input,
+            &output,
+            nh,
+            seq,
+            d,
+        )
+        .with_context(|| format!("batched FA prefill restore lane {lane}"))?;
+    }
     Ok(())
 }
 
@@ -3723,15 +3982,9 @@ impl Qwen35TreeVerifyFullLayerShapeQMoe {
 ///
 /// # ggml_type validation invariant (INV-Q-ggml-type-validation)
 ///
-/// At function entry, BEFORE shape.validate(), this function asserts:
-///   `weights.ggml_type_gate_up == GgmlType::Q4_0`
-/// AND
-///   `weights.ggml_type_down == GgmlType::Q4_0`.
-///
-/// `apply_linear_projection_f32` hardcodes `GgmlType::Q4_0` in its U8 branch. Passing
-/// Q5_K / Q6_K / IQ4_NL weights would silently mis-dequantize without this guard.
-/// Future CFAs that thread per-projection ggml_type through the dispatcher may relax
-/// this strict check.
+/// Every FFN projection is validated against its own declared artifact codec
+/// and dispatched with that codec. Mixed native quantization is valid; no
+/// projection inherits another projection's block geometry.
 ///
 /// # shape↔weights cross-check invariant (INV-Q-shape-weights-cross-check)
 ///
@@ -3816,36 +4069,37 @@ pub fn qwen35_tree_verify_full_layer_q(
                 )
             })
     };
-    let gate_expected_bytes = encoded_bytes("gate/up", ffn_weights.ggml_type_gate_up, m, h)?;
-    if ffn_weights.gate_q.element_count() != gate_expected_bytes {
+    let gate_expected_bytes = encoded_bytes("gate", ffn_weights.ggml_type_gate, m, h)?;
+    if ffn_weights.gate_q.data_byte_len() != gate_expected_bytes {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: gate_q has {} bytes, \
              expected exactly {} for {:?} [{}, {}]",
-            ffn_weights.gate_q.element_count(),
+            ffn_weights.gate_q.data_byte_len(),
             gate_expected_bytes,
-            ffn_weights.ggml_type_gate_up,
+            ffn_weights.ggml_type_gate,
             m,
             h
         ));
     }
-    if ffn_weights.up_q.element_count() != gate_expected_bytes {
+    let up_expected_bytes = encoded_bytes("up", ffn_weights.ggml_type_up, m, h)?;
+    if ffn_weights.up_q.data_byte_len() != up_expected_bytes {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: up_q has {} bytes, \
              expected exactly {} for {:?} [{}, {}]",
-            ffn_weights.up_q.element_count(),
-            gate_expected_bytes,
-            ffn_weights.ggml_type_gate_up,
+            ffn_weights.up_q.data_byte_len(),
+            up_expected_bytes,
+            ffn_weights.ggml_type_up,
             m,
             h
         ));
     }
     // down_proj: [hidden_size, intermediate_size] → rows=h, cols=m
     let down_expected_bytes = encoded_bytes("down", ffn_weights.ggml_type_down, h, m)?;
-    if ffn_weights.down_q.element_count() != down_expected_bytes {
+    if ffn_weights.down_q.data_byte_len() != down_expected_bytes {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: down_q has {} bytes, \
              expected exactly {} for {:?} [{}, {}]",
-            ffn_weights.down_q.element_count(),
+            ffn_weights.down_q.data_byte_len(),
             down_expected_bytes,
             ffn_weights.ggml_type_down,
             h,
@@ -3922,7 +4176,7 @@ pub fn qwen35_tree_verify_full_layer_q(
         device,
         &post_attn_normed,
         &ffn_weights.gate_q,
-        ffn_weights.ggml_type_gate_up,
+        ffn_weights.ggml_type_gate,
         shape.attn.tree_seq_len,
         shape.attn.hidden_size,
         shape.intermediate_size,
@@ -3935,7 +4189,7 @@ pub fn qwen35_tree_verify_full_layer_q(
         device,
         &post_attn_normed,
         &ffn_weights.up_q,
-        ffn_weights.ggml_type_gate_up,
+        ffn_weights.ggml_type_up,
         shape.attn.tree_seq_len,
         shape.attn.hidden_size,
         shape.intermediate_size,
@@ -4068,10 +4322,8 @@ pub fn qwen35_tree_verify_full_layer_q(
 ///
 /// # ggml_type validation invariant (INV-QMoE-ggml-type-validation)
 ///
-/// At function entry, BEFORE shape.validate(), this function asserts:
-///   `weights.ggml_type_gate_up == GgmlType::Q4_0` AND `weights.ggml_type_down == GgmlType::Q4_0`
-///   (expert weights) AND router/shared_* tensors are BF16 (defense-in-depth).
-/// Future CFAs will relax to Q5_K/Q6_K mixed-quant.
+/// Each expert stack retains its own declared artifact codec and byte stride.
+/// Router/shared tensors retain their independent native matrix metadata.
 ///
 /// # shape↔weights cross-check invariant (INV-QMoE-shape-weights-cross-check)
 ///
@@ -4103,58 +4355,19 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
     moe_weights: &super::gpu_ffn::MoeFfnWeightsGpuQ,
     shape: Qwen35TreeVerifyFullLayerShapeQMoe,
 ) -> Result<MlxBuffer> {
-    // ── STEP 0a: ggml_type + BF16 dtype validation (INV-QMoE-ggml-type-validation) ──
-    // MUST fire BEFORE shape.validate() — defense-in-depth ordering.
-    if moe_weights.ggml_type_gate_up != GgmlType::Q4_0 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: ggml_type_gate_up must be Q4_0 \
-             (got {:?}). Future CFAs will support Q5_K/Q6_K mixed-quant via \
-             per-projection ggml_type threading.",
-            moe_weights.ggml_type_gate_up
-        ));
-    }
-    if moe_weights.ggml_type_down != GgmlType::Q4_0 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: ggml_type_down must be Q4_0 \
-             (got {:?}). Future CFAs will support Q5_K/Q6_K mixed-quant via \
-             per-projection ggml_type threading.",
-            moe_weights.ggml_type_down
-        ));
-    }
-    if moe_weights.router.dtype() != mlx_native::DType::BF16 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: router dtype must be BF16 \
-             (got {:?}). MoeFfnWeightsGpuQ::from_quantized always uploads router as BF16.",
-            moe_weights.router.dtype()
-        ));
-    }
-    if moe_weights.shared_gate_inp.dtype() != mlx_native::DType::BF16 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_gate_inp dtype must be BF16 \
-             (got {:?}).",
-            moe_weights.shared_gate_inp.dtype()
-        ));
-    }
-    if moe_weights.shared_gate.dtype() != mlx_native::DType::BF16 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_gate dtype must be BF16 \
-             (got {:?}).",
-            moe_weights.shared_gate.dtype()
-        ));
-    }
-    if moe_weights.shared_up.dtype() != mlx_native::DType::BF16 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_up dtype must be BF16 \
-             (got {:?}).",
-            moe_weights.shared_up.dtype()
-        ));
-    }
-    if moe_weights.shared_down.dtype() != mlx_native::DType::BF16 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_down dtype must be BF16 \
-             (got {:?}).",
-            moe_weights.shared_down.dtype()
-        ));
+    // ── STEP 0a: native dense metadata validation ──
+    for (name, weight) in [
+        ("router", &moe_weights.router),
+        ("shared_gate_inp", &moe_weights.shared_gate_inp),
+        ("shared_gate", &moe_weights.shared_gate),
+        ("shared_up", &moe_weights.shared_up),
+        ("shared_down", &moe_weights.shared_down),
+    ] {
+        if weight.affine.is_some() {
+            return Err(anyhow!(
+                "qwen35_tree_verify_full_layer_q_moe: {name} unexpectedly uses affine overlay metadata"
+            ));
+        }
     }
 
     // ── STEP 0b: Validate full-layer shape ───────────────────────────────
@@ -4166,19 +4379,13 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
     let m_sh = shape.moe.shared_intermediate_size as usize;
 
     // ── STEP 0c: shape↔weights cross-check (INV-QMoE-shape-weights-cross-check) ──
-    // Router: [num_experts, hidden_size] BF16 → element_count == num_experts * hidden_size.
-    let expected_router_elems = ne.checked_mul(h).ok_or_else(|| {
-        anyhow!("qwen35_tree_verify_full_layer_q_moe: router element count overflows usize")
-    })?;
-    if moe_weights.router.element_count() != expected_router_elems {
+    // Router and shared matrices retain their declared GGUF codec, so shape
+    // metadata—not encoded element_count—is authoritative.
+    if (moe_weights.router.info.rows, moe_weights.router.info.cols) != (ne, h) {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: router has {} BF16 elements, \
-             expected {} (num_experts={} * hidden_size={}). \
-             Shape and weights were built from different model configs.",
-            moe_weights.router.element_count(),
-            expected_router_elems,
-            ne,
-            h
+            "qwen35_tree_verify_full_layer_q_moe: router shape [{},{}] != [{ne},{h}]",
+            moe_weights.router.info.rows,
+            moe_weights.router.info.cols
         ));
     }
     if moe_weights.num_experts != shape.moe.num_experts {
@@ -4190,115 +4397,111 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
         ));
     }
 
-    // Q4_0 block geometry: 32 elements per block, 18 bytes per block.
-    // expert_gate_q / expert_up_q: [num_experts, moe_intermediate, hidden_size]
-    // bytes = num_experts * moe_intermediate * (hidden_size / 32) * 18
-    if h % 32 != 0 {
+    let encoded_stack_bytes = |name: &str,
+                               ty: GgmlType,
+                               experts: usize,
+                               rows: usize,
+                               cols: usize|
+     -> Result<usize> {
+        let block_values = ty.block_values() as usize;
+        ensure!(
+                block_values > 0 && cols % block_values == 0,
+                "qwen35_tree_verify_full_layer_q_moe: {name} cols {cols} not divisible by {ty:?} block width {block_values}"
+            );
+        experts
+            .checked_mul(rows)
+            .and_then(|v| v.checked_mul(cols / block_values))
+            .and_then(|v| v.checked_mul(ty.block_bytes() as usize))
+            .ok_or_else(|| {
+                anyhow!(
+                    "qwen35_tree_verify_full_layer_q_moe: {name} {ty:?} byte count overflows usize"
+                )
+            })
+    };
+    let expert_gate_expected =
+        encoded_stack_bytes("expert_gate", moe_weights.ggml_type_gate, ne, m_moe, h)?;
+    if moe_weights.expert_gate_q.data_byte_len() != expert_gate_expected {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: hidden_size ({}) must be divisible by 32 \
-             for Q4_0 block encoding",
+            "qwen35_tree_verify_full_layer_q_moe: expert_gate_q has {} bytes, \
+             expected exactly {} for {:?} [{}, {}, {}]",
+            moe_weights.expert_gate_q.data_byte_len(),
+            expert_gate_expected,
+            moe_weights.ggml_type_gate,
+            ne,
+            m_moe,
             h
         ));
     }
-    let gate_blocks_per_row = h / 32;
-    let expert_gate_expected = ne
-        .checked_mul(m_moe)
-        .and_then(|v| v.checked_mul(gate_blocks_per_row))
-        .and_then(|v| v.checked_mul(18))
-        .ok_or_else(|| {
-            anyhow!(
-                "qwen35_tree_verify_full_layer_q_moe: expert_gate Q4_0 byte count overflows usize"
-            )
-        })?;
-    if moe_weights.expert_gate_q.element_count() != expert_gate_expected {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: expert_gate_q has {} bytes, \
-             expected exactly {} (num_experts={} * moe_intermediate={} * hidden_size={} Q4_0 encoding: \
-             {} experts × {} rows/expert × {} blocks/row × 18 bytes/block)",
-            moe_weights.expert_gate_q.element_count(), expert_gate_expected,
-            ne, m_moe, h, ne, m_moe, gate_blocks_per_row
-        ));
-    }
-    if moe_weights.expert_up_q.element_count() != expert_gate_expected {
+    let expert_up_expected =
+        encoded_stack_bytes("expert_up", moe_weights.ggml_type_up, ne, m_moe, h)?;
+    if moe_weights.expert_up_q.data_byte_len() != expert_up_expected {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q_moe: expert_up_q has {} bytes, \
-             expected exactly {} (same shape as expert_gate_q)",
-            moe_weights.expert_up_q.element_count(),
-            expert_gate_expected
+             expected exactly {} for {:?} [{}, {}, {}]",
+            moe_weights.expert_up_q.data_byte_len(),
+            expert_up_expected,
+            moe_weights.ggml_type_up,
+            ne,
+            m_moe,
+            h
         ));
     }
-    // expert_down_q: [num_experts, hidden_size, moe_intermediate_size]
-    // bytes = num_experts * hidden_size * (moe_intermediate / 32) * 18
-    if m_moe % 32 != 0 {
+    let expert_down_expected =
+        encoded_stack_bytes("expert_down", moe_weights.ggml_type_down, ne, h, m_moe)?;
+    if moe_weights.expert_down_q.data_byte_len() != expert_down_expected {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: moe_intermediate_size ({}) must be divisible by 32 \
-             for Q4_0 block encoding",
+            "qwen35_tree_verify_full_layer_q_moe: expert_down_q has {} bytes, \
+             expected exactly {} for {:?} [{}, {}, {}]",
+            moe_weights.expert_down_q.data_byte_len(),
+            expert_down_expected,
+            moe_weights.ggml_type_down,
+            ne,
+            h,
             m_moe
         ));
     }
-    let down_blocks_per_row = m_moe / 32;
-    let expert_down_expected = ne
-        .checked_mul(h)
-        .and_then(|v| v.checked_mul(down_blocks_per_row))
-        .and_then(|v| v.checked_mul(18))
-        .ok_or_else(|| {
-            anyhow!(
-                "qwen35_tree_verify_full_layer_q_moe: expert_down Q4_0 byte count overflows usize"
-            )
-        })?;
-    if moe_weights.expert_down_q.element_count() != expert_down_expected {
+    if (
+        moe_weights.shared_gate_inp.info.rows,
+        moe_weights.shared_gate_inp.info.cols,
+    ) != (1, h)
+    {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: expert_down_q has {} bytes, \
-             expected exactly {} (num_experts={} * hidden_size={} * moe_intermediate={} Q4_0 encoding: \
-             {} experts × {} rows/expert × {} blocks/row × 18 bytes/block)",
-            moe_weights.expert_down_q.element_count(), expert_down_expected,
-            ne, h, m_moe, ne, h, down_blocks_per_row
+            "qwen35_tree_verify_full_layer_q_moe: shared_gate_inp shape [{},{}] != [1,{h}]",
+            moe_weights.shared_gate_inp.info.rows,
+            moe_weights.shared_gate_inp.info.cols
         ));
     }
-    // Shared expert weight element counts (BF16 → element_count == num_BF16_elements).
-    // shared_gate_inp: [1, hidden_size] → h elements
-    if moe_weights.shared_gate_inp.element_count() != h {
+    if (
+        moe_weights.shared_gate.info.rows,
+        moe_weights.shared_gate.info.cols,
+    ) != (m_sh, h)
+    {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_gate_inp has {} BF16 elements, \
-             expected {} (hidden_size={})",
-            moe_weights.shared_gate_inp.element_count(),
-            h,
-            h
+            "qwen35_tree_verify_full_layer_q_moe: shared_gate shape [{},{}] != [{m_sh},{h}]",
+            moe_weights.shared_gate.info.rows,
+            moe_weights.shared_gate.info.cols
         ));
     }
-    // shared_gate: [shared_intermediate, hidden_size] → m_sh * h elements
-    let shared_proj_expected = m_sh.checked_mul(h).ok_or_else(|| {
-        anyhow!("qwen35_tree_verify_full_layer_q_moe: shared_gate element count overflows usize")
-    })?;
-    if moe_weights.shared_gate.element_count() != shared_proj_expected {
+    if (
+        moe_weights.shared_up.info.rows,
+        moe_weights.shared_up.info.cols,
+    ) != (m_sh, h)
+    {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_gate has {} BF16 elements, \
-             expected {} (shared_intermediate={} * hidden_size={})",
-            moe_weights.shared_gate.element_count(),
-            shared_proj_expected,
-            m_sh,
-            h
+            "qwen35_tree_verify_full_layer_q_moe: shared_up shape [{},{}] != [{m_sh},{h}]",
+            moe_weights.shared_up.info.rows,
+            moe_weights.shared_up.info.cols
         ));
     }
-    if moe_weights.shared_up.element_count() != shared_proj_expected {
+    if (
+        moe_weights.shared_down.info.rows,
+        moe_weights.shared_down.info.cols,
+    ) != (h, m_sh)
+    {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_up has {} BF16 elements, \
-             expected {} (shared_intermediate={} * hidden_size={})",
-            moe_weights.shared_up.element_count(),
-            shared_proj_expected,
-            m_sh,
-            h
-        ));
-    }
-    // shared_down: [hidden_size, shared_intermediate] → h * m_sh elements (same count)
-    if moe_weights.shared_down.element_count() != shared_proj_expected {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_down has {} BF16 elements, \
-             expected {} (hidden_size={} * shared_intermediate={})",
-            moe_weights.shared_down.element_count(),
-            shared_proj_expected,
-            h,
-            m_sh
+            "qwen35_tree_verify_full_layer_q_moe: shared_down shape [{},{}] != [{h},{m_sh}]",
+            moe_weights.shared_down.info.rows,
+            moe_weights.shared_down.info.cols
         ));
     }
 
@@ -5187,6 +5390,15 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
         .tq
         .as_ref()
         .ok_or_else(|| anyhow!("direct TQ prefill requires a TQ-active full-attention slot"))?;
+    let views = tq
+        .slot_views(slot_id, n_kv_heads, cache_capacity, head_dim)
+        .context("direct TQ prefill physical slot view")?;
+    anyhow::ensure!(
+        kv_seq_len <= views.capacity_tokens,
+        "direct TQ prefill needs {kv_seq_len} rows but slot {} has physical capacity {}",
+        slot_id.0,
+        views.capacity_tokens
+    );
     let output_elems = (seq_len as usize) * (n_heads as usize) * (head_dim as usize);
     let output = device
         .alloc_buffer(
@@ -5216,7 +5428,9 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
     slot_ids
         .as_mut_slice::<u32>()
         .map_err(|error| anyhow!("direct TQ prefill slot-id mapping: {error}"))?
-        .fill(slot_id.0);
+        // The slot view already selects the physical bank, so this scalar
+        // batch is expressed as slot zero inside that view.
+        .fill(0);
     let mut sequence_positions = super::decode_pool::pooled_alloc_buffer(
         device,
         (seq_len as usize) * std::mem::size_of::<u32>(),
@@ -5243,7 +5457,7 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
         num_kv_heads: n_kv_heads,
         head_dim,
         kv_seq_len,
-        kv_capacity: cache_capacity,
+        kv_capacity: views.capacity_tokens,
         scale: 1.0 / (head_dim as f32).sqrt(),
         mask_type: 0,
         sliding_window: 0,
@@ -5263,10 +5477,10 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
         device,
         seq_len,
         q_seq_major,
-        &tq.k_packed,
-        &tq.k_norms,
-        &tq.v_packed,
-        &tq.v_norms,
+        &views.k_packed,
+        &views.k_norms,
+        &views.v_packed,
+        &views.v_norms,
         &output,
         &tmp,
         &slot_ids,
@@ -5315,6 +5529,17 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct(
 // ================================================================
 // KV-cache-aware SDPA
 // ================================================================
+
+/// Whether a fresh short D=256 row must use the F32 vector-attention route.
+///
+/// Both tiled prefill kernels have partial-tile defects for qL=2..15. These
+/// rows are evaluated as a bounded series of proven qL=1 causal vector
+/// dispatches over the just-produced Q/K/V chunk, without reading back or
+/// expanding the persistent cache representation.
+#[inline]
+fn uses_fresh_short_vec_path(seq_len: u32, cur_len: u32, head_dim: u32) -> bool {
+    head_dim == 256 && cur_len == 0 && (2..16).contains(&seq_len)
+}
 
 /// Apply SDPA with a pre-allocated KV cache.
 ///
@@ -5574,6 +5799,54 @@ pub fn apply_sdpa_with_kv_cache(
         //   src layout: [seq * n_kv_heads, head_dim] = seq-major
         //   dst layout: slot.k/v = [n_kv_heads, max_seq_len, head_dim] = head-major
         //   slot = (cur_len + t) for full-attn (capacity == max_seq_len, no wrap)
+        //
+        // Preserve a stable dense copy of a fresh short chunk before the
+        // persistent-cache encoder runs. TQ encoding is an independent
+        // representation write and must never influence the exact attention
+        // result for the same fresh row.
+        let fresh_short_kv = if uses_fresh_short_vec_path(seq_len, cur_len as u32, head_dim) {
+            let nkv = n_kv_heads as usize;
+            let scratch_capacity = 16_usize;
+            let k_hm = device
+                .alloc_buffer(
+                    scratch_capacity * nkv * d * 4,
+                    DType::F32,
+                    vec![nkv, scratch_capacity, d],
+                )
+                .map_err(|e| anyhow!("fresh-short vec: alloc k_hm: {e}"))?;
+            let v_hm = device
+                .alloc_buffer(
+                    scratch_capacity * nkv * d * 4,
+                    DType::F32,
+                    vec![nkv, scratch_capacity, d],
+                )
+                .map_err(|e| anyhow!("fresh-short vec: alloc v_hm: {e}"))?;
+            let mut enc = device
+                .command_encoder()
+                .context("fresh-short vec: preserve K/V encoder")?;
+            dispatch_kv_cache_copy_seq_f32_dual(
+                &mut enc,
+                registry,
+                device.metal_device(),
+                k_seq_major,
+                v_seq_major,
+                &k_hm,
+                &v_hm,
+                n_kv_heads,
+                head_dim,
+                scratch_capacity as u32,
+                0,
+                seq_len,
+                0,
+            )
+            .context("fresh-short vec: preserve K/V")?;
+            enc.commit_and_wait_labeled("layer.full_attn.fresh_short_vec.preserve_kv")
+                .context("fresh-short vec: preserve K/V commit")?;
+            Some((k_hm, v_hm))
+        } else {
+            None
+        };
+
         if kv_write_tokens > 0 {
             let _w5b9_kv_dl_copy = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
@@ -5659,16 +5932,12 @@ pub fn apply_sdpa_with_kv_cache(
         //   Bisection: qL=15 NaN, qL=17 coherent.  HF2Q_DUMP_LAYER=ALL
         //   masks via dense flush_gpu sync points (see ADR-005 iter-19).
         //
-        // So qL ∈ [1, 15] has no known-good path on this kernel set:
-        //   * FA: dim=10 NaN at qL < 16
-        //   * Legacy SDPA: all-NaN at qL <= 15
-        //   * decode (flash_attn_vec): only fires at qL == 1
+        // So fresh qL ∈ [2, 15] bypasses both tiled kernels and uses
+        // flash_attn_vec directly from the fresh F32 Q/K/V chunk below.
         //
         // The qL=16-31 range becomes coherent under the new >= 16 gate
         // (was previously routed to broken legacy SDPA when gate was
         // >= 32).  Long-prefill perf preserved (FA always fires).
-        // qL ∈ [2, 15] remains broken — workaround is the user
-        // padding their prompt up to qL >= 16.
         let new_path_eligible = head_dim == 256 && cur_len == 0 && seq_len >= 16;
         // ADR-028 iter-177: trace branch eligibility for K=1 batched-verify
         // bug bisect. HF2Q_FA_TRACE=1 prints all booleans + actual branch.
@@ -5682,6 +5951,14 @@ pub fn apply_sdpa_with_kv_cache(
             );
         }
         if new_path_eligible {
+            #[cfg(test)]
+            super::forward_gpu::segmented_route_trace::record(
+                super::forward_gpu::segmented_route_trace::OperatorRoute::FullFreshTiled,
+                seq_len,
+                n_heads * head_dim,
+                head_dim,
+                cur_len as u32,
+            );
             // Dispatch flash_attn_prefill on the chunk seq-major Q/K/V
             // directly. Output is seq-major F32, matching the legacy
             // path's return shape.
@@ -5709,6 +5986,106 @@ pub fn apply_sdpa_with_kv_cache(
             let new_len = kv_seq_len;
             slot.current_len[slot_id.0 as usize] = new_len;
             return Ok(out_uploaded);
+        }
+
+        // Fresh D=256 qL=2..15 correctness fallback. This uses bounded qL=1
+        // vector dispatches over the current chunk. It is independent of
+        // whether the persistent cache is F32 or TQ: the normal cache write
+        // above still records the chunk in its native representation for
+        // later decode.
+        if uses_fresh_short_vec_path(seq_len, cur_len as u32, head_dim) {
+            let _w5b10_kernel = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaSdpaKernel,
+            );
+            let (k_hm, v_hm) = fresh_short_kv
+                .expect("fresh-short route must preserve dense K/V before cache encoding");
+            let tmp_bytes = flash_attn_vec_tmp_bytes(n_heads, head_dim);
+            let tmp_buf = device
+                .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+                .map_err(|e| anyhow!("fresh-short vec: alloc tmp: {e}"))?;
+
+            let mut enc = device
+                .command_encoder()
+                .context("fresh-short vec: command_encoder")?;
+            // The batched qL>1 vector kernel is not finite at every short
+            // row (qL=5 is a model-free reproducer). Execute the bounded
+            // fallback as qL=1 causal steps instead. Each query token is
+            // contiguous in the seq-major source, and qL=1 makes that layout
+            // identical to the head-major layout expected by the kernel.
+            let query_elems = nh * d;
+            for query in 0..seq {
+                let query_offset = (query * query_elems * 4) as u64;
+                let q_token = q_seq_major.slice_view(query_offset, query_elems);
+                let out_token = out_buf.slice_view(query_offset, query_elems);
+                let params = FlashAttnVecParams {
+                    num_heads: n_heads,
+                    num_kv_heads: n_kv_heads,
+                    head_dim,
+                    kv_seq_len: (query + 1) as u32,
+                    kv_capacity: 16,
+                    scale: 1.0 / (d as f32).sqrt(),
+                    mask_type: 1,
+                    sliding_window: 0,
+                    softcap: 0.0,
+                    q_seq_len: 1,
+                };
+                flash_attn_vec(
+                    &mut enc, registry, device, &q_token, &k_hm, &v_hm, &out_token, &tmp_buf,
+                    &params,
+                )
+                .with_context(|| format!("fresh-short vec: query {query} dispatch"))?;
+                // Consecutive queries reuse tmp_buf. Keep their write/reduce
+                // phases ordered inside the concurrent compute encoder.
+                enc.memory_barrier();
+            }
+            enc.commit_and_wait_labeled("layer.full_attn.fresh_short_vec")
+                .context("fresh-short vec: commit")?;
+
+            slot.current_len[slot_id.0 as usize] = kv_seq_len;
+            return Ok(out_buf);
+        }
+
+        // A stable-boundary clamp can split a short prompt into two chunks
+        // whose combined K/V length is still below the tiled prefill kernel's
+        // 16-row safety floor (for example 5 + 7). TQ-only caches have no F32
+        // backing to feed the legacy fallback, but the direct packed-KV
+        // verifier is valid for the same bounded query widths. Route that
+        // region explicitly instead of falling through to an impossible F32
+        // cache access.
+        let tq_short_resume_eligible = head_dim == 256
+            && cur_len > 0
+            && seq_len <= QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES
+            && slot.k.is_none()
+            && slot.v.is_none()
+            && slot.tq.is_some();
+        if tq_short_resume_eligible {
+            #[cfg(test)]
+            super::forward_gpu::segmented_route_trace::record(
+                super::forward_gpu::segmented_route_trace::OperatorRoute::FullTqDirectResume,
+                seq_len,
+                n_heads * head_dim,
+                head_dim,
+                cur_len as u32,
+            );
+            let _w5b10_kernel = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaSdpaKernel,
+            );
+            let output = apply_tq_prefill_seq_major_resume_direct_for_slot(
+                device,
+                registry,
+                slot,
+                q_seq_major,
+                seq_len,
+                cur_len as u32,
+                kv_seq_len,
+                max_seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                slot_id,
+            )?;
+            slot.current_len[slot_id.0 as usize] = kv_seq_len;
+            return Ok(output);
         }
 
         // ── ADR-034 task #89 Step 3a (2026-05-21): vec_small_path ──
@@ -6281,7 +6658,7 @@ pub fn build_gated_attn_layer(
                 // cur_len==0: existing fresh-prefill path.
                 // cur_len>0 + seq_len<16 + head_dim==256 + slot.k/v F32:
                 //   new vec-small path inside fused encoder.
-                cur == 0
+                (cur == 0 && seq_len >= 16)
                     || (allow_vec_small_in_fused
                         && cur > 0
                         && seq_len < 16
@@ -6419,8 +6796,8 @@ pub fn build_gated_attn_layer(
             //
             // Eligibility:
             //   - HF2Q_FUSED_QKVG=1
-            //   - weights are Q4_0 (DType::U8). FA weights are ALWAYS Q4_0 per
-            //     FullAttnWeightsGpu::from_cpu line 334-337 — universal path.
+            //   - all four weights explicitly declare Q4_0. Other native
+            //     codecs take the ordinary typed projection path below.
             // Codex cont. 23 hardening: DType::U8 alone is "raw bytes" — verify
             // byte-len matches Q4_0 block layout (18 bytes per 32-element block)
             // to ensure we're not feeding the kernel some other U8-packed quant.
@@ -6709,6 +7086,14 @@ pub fn build_gated_attn_layer(
                         super::wave5b8_profile::SectionKind::FaSdpaKernel,
                     );
                     if cur_len_u32 == 0 {
+                        #[cfg(test)]
+                        super::forward_gpu::segmented_route_trace::record(
+                            super::forward_gpu::segmented_route_trace::OperatorRoute::FullFreshTiled,
+                            seq_len,
+                            n_heads * head_dim,
+                            head_dim,
+                            cur_len_u32,
+                        );
                         apply_flash_attn_prefill_seq_major_into(
                             enc.encoder(),
                             device,
@@ -7900,6 +8285,740 @@ pub fn apply_gated_attn_layer_decode_into(
     Ok(out)
 }
 
+/// Decode one independent token for each physical cache slot in a single
+/// `[N, hidden]` full-attention layer invocation.
+///
+/// This is intentionally narrower than sequence prefill: every input row is a
+/// different request, selected by `slot_ids`. The canonical TQ cache kernels
+/// consume the complete multi-sequence allocation plus explicit row-to-slot
+/// and row-to-position maps, so no row can observe another request's KV.
+/// Cursor lengths may differ. Rows must share the same flash-attention
+/// execution bucket so the shared reduction geometry remains identical to the
+/// scalar path selected for every row.
+#[inline]
+pub(crate) fn tq_decode_execution_bucket(kv_seq_len: u32) -> (bool, bool) {
+    // mlx-native selects NWG=32 above 512 tokens and NSG=4 above 1024 tokens.
+    // Environment overrides choose one process-wide value, so this default
+    // partition is conservative when an override is active.
+    (kv_seq_len > 512, kv_seq_len > 1024)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_gated_attn_layer_decode_batched_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    positions: &MlxBuffer,
+    weights_gpu: &FullAttnWeightsGpu,
+    slot: &mut FullAttnKvSlot,
+    max_seq_len: u32,
+    slot_ids: &[SlotId],
+    hidden_size: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    freq_base: f32,
+    mrope_section: [u32; 4],
+    rms_norm_eps: f32,
+) -> Result<MlxBuffer> {
+    let n = u32::try_from(slot_ids.len()).context("Qwen batched full-attention width overflow")?;
+    ensure!(
+        n >= 2,
+        "Qwen batched full-attention requires at least two slots"
+    );
+    ensure!(
+        head_dim == 256 || head_dim == 512,
+        "Qwen batched full-attention requires TQ-supported head_dim, got {head_dim}"
+    );
+    let tq = slot
+        .tq
+        .as_ref()
+        .ok_or_else(|| anyhow!("Qwen batched full-attention requires the canonical TQ cache"))?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut current_lens = Vec::with_capacity(slot_ids.len());
+    let mut execution_bucket = None;
+    let mut max_kv_seq_len = 0_u32;
+    for slot_id in slot_ids {
+        ensure!(
+            seen.insert(slot_id.0),
+            "Qwen batched full-attention received duplicate slot {}",
+            slot_id.0
+        );
+        let cursor = *slot.current_len.get(slot_id.0 as usize).ok_or_else(|| {
+            anyhow!(
+                "Qwen batched full-attention slot {} outside cursor axis {}",
+                slot_id.0,
+                slot.current_len.len()
+            )
+        })?;
+        ensure!(
+            cursor < max_seq_len,
+            "Qwen batched full-attention slot {} cursor {} reached max_seq_len {}",
+            slot_id.0,
+            cursor,
+            max_seq_len
+        );
+        let kv_seq_len = cursor
+            .checked_add(1)
+            .context("Qwen batched full-attention cursor overflow")?;
+        let bucket = tq_decode_execution_bucket(kv_seq_len);
+        if let Some(expected) = execution_bucket {
+            ensure!(
+                bucket == expected,
+                "Qwen batched full-attention execution-bucket mismatch; slot {} has cursor {}",
+                slot_id.0,
+                cursor
+            );
+        } else {
+            execution_bucket = Some(bucket);
+        }
+        current_lens.push(cursor);
+        max_kv_seq_len = max_kv_seq_len.max(kv_seq_len);
+    }
+    debug_assert!(execution_bucket.is_some());
+
+    let q_total = n_heads * head_dim;
+    let kv_total = n_kv_heads * head_dim;
+
+    let x_norm = apply_pre_attn_rms_norm(
+        enc,
+        registry,
+        device,
+        x,
+        weights_gpu,
+        n,
+        hidden_size,
+        rms_norm_eps,
+    )?;
+    enc.memory_barrier();
+    let (q_flat, gate_flat) = apply_q_gate_projection_f32(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.q_gate,
+        n,
+        n_heads,
+        head_dim,
+        hidden_size,
+    )?;
+    let k_flat = apply_linear_projection_f32_pooled_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.wk,
+        weights_gpu.wk_ggml_type,
+        n,
+        hidden_size,
+        kv_total,
+    )?;
+    let v_flat = apply_linear_projection_f32_pooled_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.wv,
+        weights_gpu.wv_ggml_type,
+        n,
+        hidden_size,
+        kv_total,
+    )?;
+    enc.memory_barrier();
+    let q_normed = apply_q_or_k_per_head_rms_norm(
+        enc,
+        registry,
+        device,
+        &q_flat,
+        &weights_gpu.attn_q_norm,
+        n,
+        n_heads,
+        head_dim,
+        rms_norm_eps,
+    )?;
+    let k_normed = apply_q_or_k_per_head_rms_norm(
+        enc,
+        registry,
+        device,
+        &k_flat,
+        &weights_gpu.attn_k_norm,
+        n,
+        n_kv_heads,
+        head_dim,
+        rms_norm_eps,
+    )?;
+    enc.memory_barrier();
+    let q_rope = apply_imrope(
+        enc,
+        registry,
+        device,
+        &q_normed,
+        positions,
+        n,
+        n_heads,
+        head_dim,
+        rotary_dim,
+        freq_base,
+        mrope_section,
+    )?;
+    let k_rope = apply_imrope(
+        enc,
+        registry,
+        device,
+        &k_normed,
+        positions,
+        n,
+        n_kv_heads,
+        head_dim,
+        rotary_dim,
+        freq_base,
+        mrope_section,
+    )?;
+    enc.memory_barrier();
+
+    let (base_token_rows, physical_capacities, arena_token_rows) = tq
+        .banked_geometry_for_slots(slot_ids)
+        .context("Qwen batched full-attention banked arena geometry")?;
+    for ((slot_id, &cursor), &capacity) in
+        slot_ids.iter().zip(&current_lens).zip(&physical_capacities)
+    {
+        ensure!(
+            cursor < capacity,
+            "Qwen batched full-attention slot {} cursor {} reached physical capacity {}",
+            slot_id.0,
+            cursor,
+            capacity
+        );
+    }
+    let max_physical_capacity = physical_capacities.iter().copied().max().unwrap_or(0);
+    let mut base_token_rows_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        slot_ids.len() * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![slot_ids.len()],
+    )
+    .map_err(|error| anyhow!("Qwen batched full-attention base map allocation: {error}"))?;
+    base_token_rows_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched full-attention base map: {error}"))?
+        .copy_from_slice(&base_token_rows);
+    let mut physical_capacities_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        slot_ids.len() * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![slot_ids.len()],
+    )
+    .map_err(|error| anyhow!("Qwen batched full-attention capacity map allocation: {error}"))?;
+    physical_capacities_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched full-attention capacity map: {error}"))?
+        .copy_from_slice(&physical_capacities);
+    let mut position_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        slot_ids.len() * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![slot_ids.len()],
+    )
+    .map_err(|error| anyhow!("Qwen batched full-attention position map allocation: {error}"))?;
+    position_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched full-attention position map: {error}"))?
+        .copy_from_slice(&current_lens);
+
+    let codebook_bits = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+    let codebook_bits = if matches!(codebook_bits, 5 | 6 | 8) {
+        codebook_bits
+    } else {
+        8
+    };
+    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_banked(
+        enc,
+        registry,
+        device.metal_device(),
+        &k_rope,
+        &tq.k_packed,
+        &tq.k_norms,
+        &base_token_rows_buf,
+        &physical_capacities_buf,
+        &position_buf,
+        n,
+        n_kv_heads,
+        head_dim,
+        arena_token_rows,
+        false,
+        1.0,
+        codebook_bits,
+    )
+    .map_err(|error| anyhow!("Qwen batched TQ K encode: {error}"))?;
+    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_banked(
+        enc,
+        registry,
+        device.metal_device(),
+        &v_flat,
+        &tq.v_packed,
+        &tq.v_norms,
+        &base_token_rows_buf,
+        &physical_capacities_buf,
+        &position_buf,
+        n,
+        n_kv_heads,
+        head_dim,
+        arena_token_rows,
+        false,
+        1.0,
+        codebook_bits,
+    )
+    .map_err(|error| anyhow!("Qwen batched TQ V encode: {error}"))?;
+    mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+        enc,
+        registry,
+        device.metal_device(),
+        &q_rope,
+        n * n_heads,
+        head_dim,
+    )
+    .context("Qwen batched TQ query pre-rotation")?;
+    enc.memory_barrier();
+
+    let output_elems = (n as usize) * (n_heads as usize) * (head_dim as usize);
+    let attn_out = super::decode_pool::pooled_alloc_buffer(
+        device,
+        output_elems * std::mem::size_of::<f32>(),
+        DType::F32,
+        vec![n as usize, n_heads as usize, head_dim as usize],
+    )
+    .map_err(|error| anyhow!("Qwen batched attention output allocation: {error}"))?;
+    let tmp_bytes = mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(n * n_heads, head_dim);
+    let tmp = super::decode_pool::pooled_alloc_buffer(
+        device,
+        tmp_bytes,
+        DType::F32,
+        vec![tmp_bytes / std::mem::size_of::<f32>()],
+    )
+    .map_err(|error| anyhow!("Qwen batched attention scratch allocation: {error}"))?;
+    let params = mlx_native::ops::flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+        num_heads: n_heads,
+        num_kv_heads: n_kv_heads,
+        head_dim,
+        // The batched kernel reads each row's real length from position_buf.
+        // This maximum selects the one execution bucket shared by the cohort.
+        kv_seq_len: max_kv_seq_len,
+        kv_capacity: max_physical_capacity,
+        scale: 1.0 / (head_dim as f32).sqrt(),
+        mask_type: 0,
+        sliding_window: 0,
+        softcap: 0.0,
+        ring_start: 0,
+        scale_factor_d512: 1.0,
+        codebook_bits,
+        fuse_fwht_pre: 0,
+        nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(max_kv_seq_len),
+    };
+    mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_batched_banked(
+        enc,
+        registry,
+        device,
+        n,
+        &q_rope,
+        &tq.k_packed,
+        &tq.k_norms,
+        &tq.v_packed,
+        &tq.v_norms,
+        &attn_out,
+        &tmp,
+        &base_token_rows_buf,
+        &physical_capacities_buf,
+        &position_buf,
+        arena_token_rows,
+        &params,
+    )
+    .map_err(|error| anyhow!("Qwen batched TQ attention: {error}"))?;
+    // The batched TQ dispatcher is the fused-reduce-and-undo entry point:
+    // its output is already back in the model domain for both NWG=1 and
+    // NWG>1. A second FWHT undo here would rotate the result again and make
+    // physical width-N diverge from N scalar attention calls.
+    enc.memory_barrier();
+
+    let gated =
+        apply_sigmoid_gate_multiply(enc, registry, device, &attn_out, &gate_flat, n * q_total)?;
+    enc.memory_barrier();
+    let out = apply_linear_projection_f32_pooled_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &gated,
+        &weights_gpu.wo,
+        weights_gpu.wo_ggml_type,
+        n,
+        q_total,
+        hidden_size,
+    )?;
+
+    for (slot_id, current_len) in slot_ids.iter().zip(current_lens) {
+        slot.current_len[slot_id.0 as usize] = current_len + 1;
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_banked_tq_rows(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    slot: &FullAttnKvSlot,
+    slot_ids: &[SlotId],
+    start_positions: &[u32],
+    n_tokens: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<()> {
+    ensure!(
+        slot_ids.len() == start_positions.len(),
+        "banked TQ writer slot/start cardinality mismatch"
+    );
+    let n_seqs = u32::try_from(slot_ids.len()).context("banked TQ width overflow")?;
+    let rows = n_seqs
+        .checked_mul(n_tokens)
+        .context("banked TQ row count overflow")?;
+    let expected_elements = (rows as usize)
+        .checked_mul(n_kv_heads as usize)
+        .and_then(|value| value.checked_mul(head_dim as usize))
+        .context("banked TQ source extent overflow")?;
+    ensure!(
+        k_seq_major.element_count() >= expected_elements
+            && v_seq_major.element_count() >= expected_elements,
+        "banked TQ K/V source is smaller than the rectangular extent"
+    );
+    let tq = slot
+        .tq
+        .as_ref()
+        .ok_or_else(|| anyhow!("banked TQ writer requires the canonical TQ cache"))?;
+    let (slot_bases, slot_capacities, arena_token_rows) = tq
+        .banked_geometry_for_slots(slot_ids)
+        .context("banked TQ writer arena geometry")?;
+    let row_count = rows as usize;
+    let mut base_token_rows = Vec::with_capacity(row_count);
+    let mut physical_capacities = Vec::with_capacity(row_count);
+    let mut row_positions = Vec::with_capacity(row_count);
+    for (((slot_id, &base), &capacity), &start) in slot_ids
+        .iter()
+        .zip(&slot_bases)
+        .zip(&slot_capacities)
+        .zip(start_positions)
+    {
+        let end = start
+            .checked_add(n_tokens)
+            .context("banked TQ writer position overflow")?;
+        ensure!(
+            end <= capacity,
+            "banked TQ writer slot {} needs rows [{start},{end}) beyond physical capacity {capacity}",
+            slot_id.0
+        );
+        for token in 0..n_tokens {
+            base_token_rows.push(base);
+            physical_capacities.push(capacity);
+            row_positions.push(start + token);
+        }
+    }
+    let upload_map = |values: &[u32], label: &str| -> Result<MlxBuffer> {
+        let mut buffer = super::decode_pool::pooled_alloc_buffer(
+            device,
+            std::mem::size_of_val(values),
+            DType::U32,
+            vec![values.len()],
+        )
+        .map_err(|error| anyhow!("banked TQ {label} allocation: {error}"))?;
+        buffer
+            .as_mut_slice::<u32>()
+            .map_err(|error| anyhow!("banked TQ {label} map: {error}"))?
+            .copy_from_slice(values);
+        Ok(buffer)
+    };
+    let base_token_rows_buf = upload_map(&base_token_rows, "base")?;
+    let physical_capacities_buf = upload_map(&physical_capacities, "capacity")?;
+    let position_buf = upload_map(&row_positions, "position")?;
+    let configured_bits = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+    let codebook_bits = if matches!(configured_bits, 5 | 6 | 8) {
+        configured_bits
+    } else {
+        8
+    };
+    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_banked(
+        enc,
+        registry,
+        device.metal_device(),
+        k_seq_major,
+        &tq.k_packed,
+        &tq.k_norms,
+        &base_token_rows_buf,
+        &physical_capacities_buf,
+        &position_buf,
+        rows,
+        n_kv_heads,
+        head_dim,
+        arena_token_rows,
+        false,
+        1.0,
+        codebook_bits,
+    )
+    .map_err(|error| anyhow!("banked TQ K encode: {error}"))?;
+    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_banked(
+        enc,
+        registry,
+        device.metal_device(),
+        v_seq_major,
+        &tq.v_packed,
+        &tq.v_norms,
+        &base_token_rows_buf,
+        &physical_capacities_buf,
+        &position_buf,
+        rows,
+        n_kv_heads,
+        head_dim,
+        arena_token_rows,
+        false,
+        1.0,
+        codebook_bits,
+    )
+    .map_err(|error| anyhow!("banked TQ V encode: {error}"))?;
+    Ok(())
+}
+
+/// Advance independent fresh tiled-prefill lanes through one full-attention layer
+/// while retaining the scalar tiled-attention operator and one aggregate set
+/// of projections. Cache writes use explicit physical-slot maps; attention
+/// isolation uses the native batch axis.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_gated_attn_layer_fresh_prefill_batched_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    positions: &MlxBuffer,
+    weights_gpu: &FullAttnWeightsGpu,
+    slot: &mut FullAttnKvSlot,
+    slot_ids: &[SlotId],
+    n_tokens: u32,
+    hidden_size: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    freq_base: f32,
+    mrope_section: [u32; 4],
+    rms_norm_eps: f32,
+    fa_arena: &mut crate::inference::models::qwen35::FaPrefillArena,
+) -> Result<MlxBuffer> {
+    let n_seqs = u32::try_from(slot_ids.len()).context("Qwen fresh prefill width overflow")?;
+    ensure!(
+        (2..=4).contains(&n_seqs),
+        "Qwen fresh prefill batch width must be in 2..=4"
+    );
+    ensure!(
+        (16..=128).contains(&n_tokens),
+        "Qwen fresh prefill batch requires the admitted tiled range 16..=128 rows"
+    );
+    ensure!(
+        head_dim == 256,
+        "Qwen fresh prefill batch requires the production D=256 route"
+    );
+    ensure!(
+        slot.tq.is_some(),
+        "Qwen fresh prefill batch requires the canonical TQ cache"
+    );
+    let rows = n_seqs
+        .checked_mul(n_tokens)
+        .context("Qwen fresh prefill aggregate row overflow")?;
+    ensure!(
+        x.dtype() == DType::F32 && x.element_count() == rows as usize * hidden_size as usize,
+        "Qwen fresh prefill input must be exact F32 [batch * rows, hidden]"
+    );
+    ensure!(
+        positions.dtype() == DType::I32 && positions.element_count() == 4 * rows as usize,
+        "Qwen fresh prefill positions must be exact axis-major I32 [4, batch * rows]"
+    );
+    fa_arena
+        .validate_fits(rows, n_heads, n_kv_heads, head_dim)
+        .context("Qwen fresh prefill arena preflight")?;
+    let mut seen = std::collections::BTreeSet::new();
+    for slot_id in slot_ids {
+        ensure!(
+            seen.insert(slot_id.0),
+            "Qwen fresh prefill received duplicate slot {}",
+            slot_id.0
+        );
+        let current_len = slot
+            .current_len
+            .get(slot_id.0 as usize)
+            .copied()
+            .ok_or_else(|| anyhow!("Qwen fresh prefill slot {} is out of range", slot_id.0))?;
+        ensure!(
+            current_len == 0,
+            "Qwen fresh prefill slot {} is not cold (cursor={current_len})",
+            slot_id.0
+        );
+    }
+    let (_, capacities, _) = slot
+        .tq
+        .as_ref()
+        .expect("TQ presence was checked above")
+        .banked_geometry_for_slots(slot_ids)
+        .context("Qwen fresh prefill capacity preflight")?;
+    for (slot_id, capacity) in slot_ids.iter().zip(capacities) {
+        ensure!(
+            n_tokens <= capacity,
+            "Qwen fresh prefill slot {} needs {n_tokens} rows beyond physical capacity {capacity}",
+            slot_id.0
+        );
+    }
+
+    let q_total = n_heads * head_dim;
+    let kv_total = n_kv_heads * head_dim;
+    let x_norm = apply_pre_attn_rms_norm(
+        enc,
+        registry,
+        device,
+        x,
+        weights_gpu,
+        rows,
+        hidden_size,
+        rms_norm_eps,
+    )?;
+    enc.memory_barrier();
+    let (q_flat, gate_flat) = apply_q_gate_projection_f32(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.q_gate,
+        rows,
+        n_heads,
+        head_dim,
+        hidden_size,
+    )?;
+    let k_flat = apply_linear_projection_f32_pooled_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.wk,
+        weights_gpu.wk_ggml_type,
+        rows,
+        hidden_size,
+        kv_total,
+    )?;
+    let v_flat = apply_linear_projection_f32_pooled_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.wv,
+        weights_gpu.wv_ggml_type,
+        rows,
+        hidden_size,
+        kv_total,
+    )?;
+    enc.memory_barrier();
+    let q_normed = apply_q_or_k_per_head_rms_norm(
+        enc,
+        registry,
+        device,
+        &q_flat,
+        &weights_gpu.attn_q_norm,
+        rows,
+        n_heads,
+        head_dim,
+        rms_norm_eps,
+    )?;
+    let k_normed = apply_q_or_k_per_head_rms_norm(
+        enc,
+        registry,
+        device,
+        &k_flat,
+        &weights_gpu.attn_k_norm,
+        rows,
+        n_kv_heads,
+        head_dim,
+        rms_norm_eps,
+    )?;
+    enc.memory_barrier();
+    let q_rope = apply_imrope(
+        enc,
+        registry,
+        device,
+        &q_normed,
+        positions,
+        rows,
+        n_heads,
+        head_dim,
+        rotary_dim,
+        freq_base,
+        mrope_section,
+    )?;
+    let k_rope = apply_imrope(
+        enc,
+        registry,
+        device,
+        &k_normed,
+        positions,
+        rows,
+        n_kv_heads,
+        head_dim,
+        rotary_dim,
+        freq_base,
+        mrope_section,
+    )?;
+    enc.memory_barrier();
+
+    write_banked_tq_rows(
+        enc,
+        device,
+        registry,
+        &k_rope,
+        &v_flat,
+        slot,
+        slot_ids,
+        &vec![0; slot_ids.len()],
+        n_tokens,
+        n_kv_heads,
+        head_dim,
+    )?;
+    let attn_out = super::decode_pool::pooled_alloc_buffer(
+        device,
+        rows as usize * q_total as usize * std::mem::size_of::<f32>(),
+        DType::F32,
+        vec![rows as usize, n_heads as usize, head_dim as usize],
+    )
+    .map_err(|error| anyhow!("Qwen fresh prefill attention output allocation: {error}"))?;
+    apply_flash_attn_prefill_seq_major_batched_into(
+        enc, device, registry, &q_rope, &k_rope, &v_flat, &attn_out, n_seqs, n_tokens, n_heads,
+        n_kv_heads, head_dim, fa_arena,
+    )?;
+    enc.memory_barrier();
+    let gated =
+        apply_sigmoid_gate_multiply(enc, registry, device, &attn_out, &gate_flat, rows * q_total)?;
+    enc.memory_barrier();
+    let output = apply_linear_projection_f32_pooled_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &gated,
+        &weights_gpu.wo,
+        weights_gpu.wo_ggml_type,
+        rows,
+        q_total,
+        hidden_size,
+    )?;
+    for slot_id in slot_ids {
+        slot.current_len[slot_id.0 as usize] = n_tokens;
+    }
+    Ok(output)
+}
+
 // ================================================================
 // Tests
 // ================================================================
@@ -7907,6 +9026,408 @@ pub fn apply_gated_attn_layer_decode_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_native_weight(
+        buffer: MlxBuffer,
+        ggml_type: GgmlType,
+        rows: usize,
+        cols: usize,
+    ) -> crate::serve::forward_mlx_shared::MlxQWeight {
+        crate::serve::forward_mlx_shared::MlxQWeight::from_test_buffer(
+            buffer, ggml_type, rows, cols,
+        )
+    }
+
+    #[test]
+    fn projection_rejects_declared_physical_codec_mismatch_before_dispatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        let input = upload_f32(&[0.25, -0.5, 0.75, 1.0], &device).expect("upload input");
+        let mut registry = KernelRegistry::new();
+
+        for (weight, declared) in [
+            (
+                device
+                    .alloc_buffer(4 * 4 * 2, DType::BF16, vec![4, 4])
+                    .expect("allocate BF16 weight"),
+                GgmlType::F16,
+            ),
+            (
+                device
+                    .alloc_buffer(18, DType::U8, vec![18])
+                    .expect("allocate block weight"),
+                GgmlType::F16,
+            ),
+        ] {
+            let physical = weight.dtype().to_string();
+            let dispatches_before = mlx_native::dispatch_count();
+            let commits_before = mlx_native::commit_count();
+            let mut encoder = device.command_encoder().expect("projection encoder");
+            let error = apply_linear_projection_f32_with_ggml_type(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &weight,
+                declared,
+                1,
+                4,
+                4,
+            )
+            .expect_err("declared/physical mismatch must fail closed");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("artifact-native projection type F16 requires")
+                    && message.contains(&format!("got {physical}")),
+                "{message}"
+            );
+            assert_eq!(mlx_native::dispatch_count(), dispatches_before);
+            assert_eq!(mlx_native::commit_count(), commits_before);
+
+            let qweight = crate::serve::forward_mlx_shared::MlxQWeight::from_test_buffer(
+                weight.clone(),
+                declared,
+                4,
+                4,
+            );
+            let dispatches_before = mlx_native::dispatch_count();
+            let commits_before = mlx_native::commit_count();
+            let mut encoder = device
+                .command_encoder()
+                .expect("qweight projection encoder");
+            let error = apply_linear_projection_f32_qweight(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &qweight,
+                1,
+                4,
+                4,
+            )
+            .expect_err("qweight declared/physical mismatch must fail closed");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("artifact-native projection type F16 requires")
+                    && message.contains(&format!("got {physical}")),
+                "{message}"
+            );
+            assert_eq!(mlx_native::dispatch_count(), dispatches_before);
+            assert_eq!(mlx_native::commit_count(), commits_before);
+        }
+    }
+
+    #[test]
+    fn scalar_projection_entry_rejects_packed_codec_without_guessing_q4_0() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        let input = upload_f32(&[0.25; 32], &device).expect("upload input");
+        let packed = device
+            .alloc_buffer(22, DType::U8, vec![22])
+            .expect("allocate one Q5_0 block");
+        let mut registry = KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("projection encoder");
+        let dispatches_before = mlx_native::dispatch_count();
+        let commits_before = mlx_native::commit_count();
+
+        let error = apply_linear_projection_f32(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input,
+            &packed,
+            1,
+            32,
+            1,
+        )
+        .expect_err("an untyped packed weight must fail closed");
+
+        assert!(
+            format!("{error:#}").contains("packed weights require an explicit GGML codec"),
+            "unexpected diagnostic: {error:#}"
+        );
+        assert_eq!(mlx_native::dispatch_count(), dispatches_before);
+        assert_eq!(mlx_native::commit_count(), commits_before);
+    }
+
+    #[test]
+    fn tq_decode_execution_buckets_pin_geometry_boundaries() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        assert_eq!(tq_decode_execution_bucket(512), (false, false));
+        assert_eq!(tq_decode_execution_bucket(513), (true, false));
+        assert_eq!(tq_decode_execution_bucket(1024), (true, false));
+        assert_eq!(tq_decode_execution_bucket(1025), (true, true));
+    }
+
+    #[test]
+    fn fresh_short_d256_prefill_selects_finite_vector_route() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for seq_len in 2..16 {
+            assert!(uses_fresh_short_vec_path(seq_len, 0, 256));
+        }
+
+        assert!(!uses_fresh_short_vec_path(1, 0, 256));
+        assert!(!uses_fresh_short_vec_path(16, 0, 256));
+        assert!(!uses_fresh_short_vec_path(8, 32, 256));
+        assert!(!uses_fresh_short_vec_path(8, 0, 512));
+    }
+
+    fn cpu_fresh_causal_gqa(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        let heads_per_kv = n_heads / n_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut output = vec![0.0_f32; seq * n_heads * head_dim];
+        for query in 0..seq {
+            for head in 0..n_heads {
+                let kv_head = head / heads_per_kv;
+                let q_base = (query * n_heads + head) * head_dim;
+                let mut scores = Vec::with_capacity(query + 1);
+                for key_pos in 0..=query {
+                    let k_base = (key_pos * n_kv_heads + kv_head) * head_dim;
+                    let mut dot = 0.0_f64;
+                    for col in 0..head_dim {
+                        dot += q[q_base + col] as f64 * k[k_base + col] as f64;
+                    }
+                    scores.push(dot as f32 * scale);
+                }
+                let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let normalizer = scores
+                    .iter()
+                    .map(|score| (*score - max_score).exp())
+                    .sum::<f32>();
+                let out_base = (query * n_heads + head) * head_dim;
+                for col in 0..head_dim {
+                    let mut value = 0.0_f32;
+                    for (key_pos, score) in scores.iter().enumerate() {
+                        let weight = (*score - max_score).exp() / normalizer;
+                        let v_base = (key_pos * n_kv_heads + kv_head) * head_dim;
+                        value += weight * v[v_base + col];
+                    }
+                    output[out_base + col] = value;
+                }
+            }
+        }
+        output
+    }
+
+    fn fresh_short_d256_cfg() -> super::super::Qwen35Config {
+        use super::super::{Qwen35LayerKind, Qwen35Variant};
+        super::super::Qwen35Config {
+            variant: Qwen35Variant::Dense,
+            hidden_size: 512,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 256,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_key_head_dim: 256,
+            linear_value_head_dim: 256,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 1,
+            layer_types: vec![Qwen35LayerKind::FullAttention],
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            rotary_dim: 64,
+            mrope_section: [16, 16, 0, 0],
+            mrope_interleaved: true,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 32,
+            vocab_size: 32,
+            attn_output_gate: true,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: true,
+            intermediate_size: Some(512),
+            moe: None,
+        }
+    }
+
+    #[test]
+    fn fresh_short_d256_executes_finite_exact_semantics_for_f32_and_tq_cache() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let cfg = fresh_short_d256_cfg();
+        let mut registry = KernelRegistry::new();
+        let mut seed = 0xD256_0002_u32;
+
+        for seq_len in 2_u32..16 {
+            let seq = seq_len as usize;
+            let q = mk_rand(&mut seed, seq * 2 * 256, 0.2);
+            let k = mk_rand(&mut seed, seq * 256, 0.2);
+            let v = mk_rand(&mut seed, seq * 256, 0.2);
+            let expected = cpu_fresh_causal_gqa(&q, &k, &v, seq, 2, 1, 256);
+            let q_buf = upload_f32(&q, &device).expect("upload fresh-short Q");
+            let k_buf = upload_f32(&k, &device).expect("upload fresh-short K");
+            let v_buf = upload_f32(&v, &device).expect("upload fresh-short V");
+            let mut representations = Vec::new();
+
+            for tq_active in [false, true] {
+                let mut cache = super::super::kv_cache::HybridKvCache::new_with_options(
+                    &cfg, &device, 16, 1, tq_active,
+                )
+                .expect("allocate fresh-short cache");
+                let actual_buf = apply_sdpa_with_kv_cache(
+                    &device,
+                    &mut registry,
+                    &q_buf,
+                    &k_buf,
+                    &v_buf,
+                    &mut cache.full_attn[0],
+                    seq_len,
+                    2,
+                    1,
+                    256,
+                    16,
+                    None,
+                    SlotId(0),
+                )
+                .expect("fresh-short vector attention must execute");
+                let actual = actual_buf
+                    .as_slice::<f32>()
+                    .expect("fresh-short output")
+                    .to_vec();
+                assert_eq!(cache.full_attn[0].current_len, vec![seq_len]);
+                for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        got.is_finite(),
+                        "qL={seq_len} tq={tq_active} output[{index}]={got}"
+                    );
+                    assert!(
+                        (got - want).abs() <= 1e-2,
+                        "qL={seq_len} tq={tq_active} output[{index}]={got} expected={want}"
+                    );
+                }
+                representations.push(actual);
+            }
+
+            assert_eq!(
+                representations[0]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                representations[1]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "qL={seq_len}: attention result must not depend on persistent cache representation"
+            );
+        }
+    }
+
+    #[test]
+    fn tq_short_resume_below_sixteen_is_finite_and_slot_exact() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let cfg = fresh_short_d256_cfg();
+        let mut registry = KernelRegistry::new();
+        let mut cache =
+            super::super::kv_cache::HybridKvCache::new_with_options(&cfg, &device, 16, 4, true)
+                .expect("allocate four-slot TQ cache");
+        let mut seed = 0xD256_0507_u32;
+        let q_first =
+            upload_f32(&mk_rand(&mut seed, 5 * 2 * 256, 0.2), &device).expect("upload first Q");
+        let k_first =
+            upload_f32(&mk_rand(&mut seed, 5 * 256, 0.2), &device).expect("upload first K");
+        let v_first =
+            upload_f32(&mk_rand(&mut seed, 5 * 256, 0.2), &device).expect("upload first V");
+        let q_resume =
+            upload_f32(&mk_rand(&mut seed, 7 * 2 * 256, 0.2), &device).expect("upload resume Q");
+        let k_resume =
+            upload_f32(&mk_rand(&mut seed, 7 * 256, 0.2), &device).expect("upload resume K");
+        let v_resume =
+            upload_f32(&mk_rand(&mut seed, 7 * 256, 0.2), &device).expect("upload resume V");
+
+        let mut slot_outputs = Vec::new();
+        for slot_id in [SlotId(0), SlotId(3)] {
+            apply_sdpa_with_kv_cache(
+                &device,
+                &mut registry,
+                &q_first,
+                &k_first,
+                &v_first,
+                &mut cache.full_attn[0],
+                5,
+                2,
+                1,
+                256,
+                16,
+                None,
+                slot_id,
+            )
+            .expect("fresh five-token TQ prefill");
+            let output = apply_sdpa_with_kv_cache(
+                &device,
+                &mut registry,
+                &q_resume,
+                &k_resume,
+                &v_resume,
+                &mut cache.full_attn[0],
+                7,
+                2,
+                1,
+                256,
+                16,
+                None,
+                slot_id,
+            )
+            .expect("seven-token TQ resume below tiled safety floor");
+            let values = output
+                .as_slice::<f32>()
+                .expect("map short-resume output")
+                .to_vec();
+            assert!(values.iter().all(|value| value.is_finite()));
+            assert_eq!(cache.full_attn[0].current_len[slot_id.0 as usize], 12);
+            slot_outputs.push(values);
+        }
+        assert_eq!(
+            slot_outputs[0]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            slot_outputs[1]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "identical short resumes must not depend on physical slot"
+        );
+        assert_eq!(cache.full_attn[0].current_len[1], 0);
+        assert_eq!(cache.full_attn[0].current_len[2], 0);
+    }
+
+    #[test]
+    fn physical_batch_uses_the_batched_tq_dispatchers_fused_undo_contract() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let source = include_str!("gpu_full_attn.rs");
+        let start = source
+            .find("pub fn apply_gated_attn_layer_decode_batched_into(")
+            .expect("physical-batch full-attention function");
+        let end = start
+            + source[start..]
+                .find(
+                    "// ================================================================\n// Tests",
+                )
+                .expect("tests follow physical-batch full-attention function");
+        let physical = &source[start..end];
+        assert!(physical.contains("dispatch_hadamard_quantize_kv_hb_banked("));
+        assert!(physical.contains("flash_attn_vec_tq_hb_batched_banked("));
+        assert!(physical.contains("banked_geometry_for_slots(slot_ids)"));
+        assert!(!physical.contains("dispatch_hadamard_quantize_kv_hb_batched("));
+        assert!(
+            !physical.contains("dispatch_fwht_sign_undo_f32("),
+            "batched TQ attention already returns model-domain output"
+        );
+    }
 
     #[test]
     fn native_f32_projection_qwen_m4_is_deterministic() {
@@ -8118,7 +9639,7 @@ mod tests {
         // inflate the counts it asserts.
         let test_attr = format!("#[{}]", "test");
         let lock_call = format!("{}();", "hf2q_gpu_test_lock");
-        let modules: [(&str, &str); 44] = [
+        let modules: [(&str, &str); 41] = [
             (
                 "inference/models/bert/bert_gpu.rs",
                 include_str!("../bert/bert_gpu.rs"),
@@ -8227,14 +9748,6 @@ mod tests {
                 ),
             ),
             (
-                "inference/models/qwen3vl_text/forward.rs",
-                include_str!("../qwen3vl_text/forward.rs"),
-            ),
-            (
-                "inference/models/qwen3vl_text/mod.rs",
-                include_str!("../qwen3vl_text/mod.rs"),
-            ),
-            (
                 "inference/spec_decode/dflash/forward.rs",
                 include_str!("../../spec_decode/dflash/forward.rs"),
             ),
@@ -8285,10 +9798,6 @@ mod tests {
             (
                 "inference/vision/vit_gpu.rs",
                 include_str!("../../vision/vit_gpu.rs"),
-            ),
-            (
-                "inference/vision/vit_gpu_qwen3vl.rs",
-                include_str!("../../vision/vit_gpu_qwen3vl.rs"),
             ),
             (
                 "serve/forward_mlx_shared.rs",
@@ -9500,6 +11009,213 @@ mod tests {
         assert!(max_err < 1e-3, "projection max_err={:.2e} >= 1e-3", max_err);
     }
 
+    #[test]
+    fn native_f16_projection_executes_every_admitted_helper() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        let mut registry = KernelRegistry::new();
+        let (n, k) = (32_u32, 32_u32);
+        let weight_values: Vec<half::f16> = (0..n * k)
+            .map(|index| half::f16::from_f32((index as f32 % 29.0 - 14.0) / 128.0))
+            .collect();
+        let mut weight = device
+            .alloc_buffer(
+                weight_values.len() * std::mem::size_of::<half::f16>(),
+                DType::F16,
+                vec![n as usize, k as usize],
+            )
+            .expect("allocate native F16 weight");
+        weight
+            .as_mut_slice::<half::f16>()
+            .expect("map native F16 weight")
+            .copy_from_slice(&weight_values);
+
+        let qweight = crate::serve::forward_mlx_shared::MlxQWeight {
+            buffer: weight.clone(),
+            info: crate::serve::gpu::QuantWeightInfo {
+                ggml_dtype: GgmlType::F16,
+                rows: n as usize,
+                cols: k as usize,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        };
+
+        for m in [1_u32, 2] {
+            let input_values: Vec<f32> = (0..m * k)
+                .map(|index| (index as f32 - 17.0) / 64.0)
+                .collect();
+            let input = upload_f32(&input_values, &device).expect("upload F16-route input");
+            let mut into = device
+                .alloc_buffer(
+                    (m * n) as usize * std::mem::size_of::<f32>(),
+                    DType::F32,
+                    vec![m as usize, n as usize],
+                )
+                .expect("allocate F16-route output");
+            let mut encoder = device.command_encoder().expect("F16-route encoder");
+            let direct = apply_linear_projection_f32_with_ggml_type(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &weight,
+                GgmlType::F16,
+                m,
+                k,
+                n,
+            )
+            .expect("direct native F16 projection");
+            let wrapped = apply_linear_projection_f32_qweight(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &qweight,
+                m,
+                k,
+                n,
+            )
+            .expect("qweight native F16 projection");
+            apply_linear_projection_f32_into_with_ggml_type(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &weight,
+                GgmlType::F16,
+                &mut into,
+                m,
+                k,
+                n,
+            )
+            .expect("caller-owned native F16 projection");
+            encoder
+                .commit_and_wait()
+                .expect("execute native F16 helpers");
+
+            let direct = download_f32(&direct).expect("download direct F16 result");
+            let wrapped = download_f32(&wrapped).expect("download qweight F16 result");
+            let into = download_f32(&into).expect("download into F16 result");
+            assert_eq!(direct, wrapped, "F16 helper routes must be byte-identical");
+            assert_eq!(direct, into, "F16 into route must be byte-identical");
+            assert!(direct.iter().all(|value| value.is_finite()));
+
+            for row in 0..m as usize {
+                for col in 0..n as usize {
+                    let expected = (0..k as usize)
+                        .map(|inner| {
+                            input_values[row * k as usize + inner]
+                                * weight_values[col * k as usize + inner].to_f32()
+                        })
+                        .sum::<f32>();
+                    let actual = direct[row * n as usize + col];
+                    assert!(
+                        (actual - expected).abs() < 1e-3,
+                        "native F16 projection mismatch at M={m} [{row},{col}]: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_q5_0_dense_projection_executes_physical_widths_without_rewrite() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        let mut registry = KernelRegistry::new();
+        let (n, k) = (3_u32, 32_u32);
+        let source_weight = (0..n * k)
+            .map(|index| ((index * 29 % 97) as f32 - 48.0) / 53.0)
+            .collect::<Vec<_>>();
+        let packed = crate::quantize::ggml_quants::q5_0::quantize(&source_weight, k as usize, None);
+        let mut dequantized = vec![0.0_f32; source_weight.len()];
+        mlx_native::gguf::test_only_dequantize(&packed, GgmlType::Q5_0, &mut dequantized)
+            .expect("dequantize Q5_0 oracle");
+        let mut weight = device
+            .alloc_buffer(packed.len(), DType::U8, vec![packed.len()])
+            .expect("allocate native Q5_0 weight");
+        weight
+            .as_mut_slice::<u8>()
+            .expect("map native Q5_0 weight")
+            .copy_from_slice(&packed);
+        let qweight = test_native_weight(weight.clone(), GgmlType::Q5_0, n as usize, k as usize);
+
+        for m in [1_u32, 2, 4, 8, 9, 16] {
+            let input_values = (0..m * k)
+                .map(|index| ((index * 17 % 71) as f32 - 35.0) / 41.0)
+                .collect::<Vec<_>>();
+            let input = upload_f32(&input_values, &device).expect("upload Q5_0 input");
+            let mut into = device
+                .alloc_buffer(
+                    (m * n) as usize * std::mem::size_of::<f32>(),
+                    DType::F32,
+                    vec![m as usize, n as usize],
+                )
+                .expect("allocate Q5_0 output");
+            let mut encoder = device.command_encoder().expect("Q5_0 encoder");
+            let direct = apply_linear_projection_f32_with_ggml_type(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &weight,
+                GgmlType::Q5_0,
+                m,
+                k,
+                n,
+            )
+            .expect("direct Q5_0 projection");
+            let wrapped = apply_linear_projection_f32_qweight(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &qweight,
+                m,
+                k,
+                n,
+            )
+            .expect("Q5_0 qweight projection");
+            apply_linear_projection_f32_into_with_ggml_type(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &weight,
+                GgmlType::Q5_0,
+                &mut into,
+                m,
+                k,
+                n,
+            )
+            .expect("Q5_0 caller-owned projection");
+            encoder.commit_and_wait().expect("execute Q5_0 projections");
+
+            let direct = download_f32(&direct).expect("download direct Q5_0 result");
+            let wrapped = download_f32(&wrapped).expect("download wrapped Q5_0 result");
+            let into = download_f32(&into).expect("download into Q5_0 result");
+            assert_eq!(direct, wrapped, "Q5_0 helper routes differ at M={m}");
+            assert_eq!(direct, into, "Q5_0 into route differs at M={m}");
+            assert!(direct.iter().any(|value| *value != 0.0));
+            for row in 0..m as usize {
+                for col in 0..n as usize {
+                    let expected = (0..k as usize)
+                        .map(|inner| {
+                            input_values[row * k as usize + inner]
+                                * dequantized[col * k as usize + inner]
+                        })
+                        .sum::<f32>();
+                    let actual = direct[row * n as usize + col];
+                    assert!(
+                        (actual - expected).abs() <= 5e-3,
+                        "Q5_0 dense projection mismatch at M={m} [{row},{col}]: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+    }
+
     /// **ADR-019 Phase 2 iter89e2-E kernel-equivalence parity test**: the
     /// [`apply_flash_attn_prefill_seq_major_into`] variant produces
     /// *numerically-equivalent* output to the legacy
@@ -9708,6 +11424,496 @@ mod tests {
             "flash_attn_prefill_into_kernel_equivalence_with_wrapper: \
              PASS at seq_len={seq_len}, n_heads={n_heads}, \
              n_kv_heads={n_kv_heads}, head_dim={head_dim}",
+        );
+    }
+
+    #[test]
+    fn rectangular_tiled_prefill_matches_two_scalar_128_row_lanes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use super::super::FaPrefillArena;
+
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+
+        let batch = 2_u32;
+        let seq_len = 128_u32;
+        let n_heads = 2_u32;
+        let n_kv_heads = 1_u32;
+        let head_dim = 256_u32;
+        let rows = (batch * seq_len) as usize;
+        let seq = seq_len as usize;
+        let nh = n_heads as usize;
+        let nkv = n_kv_heads as usize;
+        let d = head_dim as usize;
+        let q_lane_elems = seq * nh * d;
+        let kv_lane_elems = seq * nkv * d;
+
+        let mut seed = 0xA049_B203_u32;
+        let q = mk_rand(&mut seed, rows * nh * d, 0.2);
+        let k = mk_rand(&mut seed, rows * nkv * d, 0.2);
+        let v = mk_rand(&mut seed, rows * nkv * d, 0.2);
+        let q_buf = upload_f32(&q, &device).expect("upload batched Q");
+        let k_buf = upload_f32(&k, &device).expect("upload batched K");
+        let v_buf = upload_f32(&v, &device).expect("upload batched V");
+        let out_buf = device
+            .alloc_buffer(
+                rows * nh * d * std::mem::size_of::<f32>(),
+                DType::F32,
+                vec![rows, nh, d],
+            )
+            .expect("allocate batched output");
+        let mut arena =
+            FaPrefillArena::new(&device, batch * seq_len, n_heads, n_kv_heads, head_dim)
+                .expect("allocate batched FA arena");
+        let mut enc = device.command_encoder().expect("batched FA encoder");
+        apply_flash_attn_prefill_seq_major_batched_into(
+            &mut enc,
+            &device,
+            &mut registry,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &out_buf,
+            batch,
+            seq_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            &mut arena,
+        )
+        .expect("rectangular tiled FA");
+        enc.commit_and_wait_labeled("test.qwen.rectangular_tiled_fa")
+            .expect("wait rectangular tiled FA");
+        let batched = download_f32(&out_buf).expect("download batched output");
+        assert!(batched.iter().all(|value| value.is_finite()));
+        assert!(batched.iter().any(|value| *value != 0.0));
+
+        let mut scalar = Vec::with_capacity(batched.len());
+        for lane in 0..batch as usize {
+            let q_start = lane * q_lane_elems;
+            let kv_start = lane * kv_lane_elems;
+            let q_lane =
+                upload_f32(&q[q_start..q_start + q_lane_elems], &device).expect("upload scalar Q");
+            let k_lane = upload_f32(&k[kv_start..kv_start + kv_lane_elems], &device)
+                .expect("upload scalar K");
+            let v_lane = upload_f32(&v[kv_start..kv_start + kv_lane_elems], &device)
+                .expect("upload scalar V");
+            let output = apply_flash_attn_prefill_seq_major(
+                &device,
+                &mut registry,
+                &q_lane,
+                &k_lane,
+                &v_lane,
+                seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                None,
+            )
+            .with_context(|| format!("scalar tiled FA lane {lane}"))
+            .expect("scalar tiled FA");
+            scalar.extend(download_f32(&output).expect("download scalar output"));
+        }
+
+        let bit_differences = batched
+            .iter()
+            .zip(&scalar)
+            .filter(|(actual, expected)| actual.to_bits() != expected.to_bits())
+            .count();
+        let max_abs_error = batched
+            .iter()
+            .zip(&scalar)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        assert_eq!(
+            bit_differences, 0,
+            "rectangular tiled FA must preserve scalar output bits; \
+             bit_differences={bit_differences}, max_abs_error={max_abs_error:.3e}"
+        );
+
+        crate::core::kernel_parity::assert_kernel_equivalence(
+            &batched,
+            &scalar,
+            0.9999,
+            1e-4,
+            "ADR-049 rectangular tiled FA vs scalar lanes",
+        );
+        for lane in 0..batch as usize {
+            let start = lane * q_lane_elems;
+            let end = start + q_lane_elems;
+            crate::core::kernel_parity::assert_kernel_equivalence(
+                &batched[start..end],
+                &scalar[start..end],
+                0.9999,
+                1e-4,
+                &format!("ADR-049 rectangular tiled FA lane {lane}"),
+            );
+        }
+    }
+
+    fn run_rectangular_full_attention_case(selected: &[SlotId]) {
+        use super::super::kv_cache::HybridKvCache;
+        use super::super::FaPrefillArena;
+
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+        let cfg = fresh_short_d256_cfg();
+        let batch = selected.len();
+        let seq_len = 128_u32;
+        let rows = batch * seq_len as usize;
+        let hidden = cfg.hidden_size as usize;
+        let nh = cfg.num_attention_heads as usize;
+        let nkv = cfg.num_key_value_heads as usize;
+        let d = cfg.head_dim as usize;
+        let mut seed = 0xA049_B204_u32;
+        let weights = layer_weights_f32(hidden, nh, nkv, d, &mut seed, &device);
+        let input = mk_rand(&mut seed, rows * hidden, 0.05);
+        let input_buf = upload_f32(&input, &device).expect("upload rectangular input");
+        let mut positions = vec![0_i32; 4 * rows];
+        for axis in 0..4 {
+            for lane in 0..batch {
+                for token in 0..seq_len as usize {
+                    positions[axis * rows + lane * seq_len as usize + token] = token as i32;
+                }
+            }
+        }
+        let mut positions_buf = device
+            .alloc_buffer(
+                positions.len() * std::mem::size_of::<i32>(),
+                DType::I32,
+                vec![4, rows],
+            )
+            .expect("allocate axis-major positions");
+        positions_buf
+            .as_mut_slice::<i32>()
+            .expect("map axis-major positions")
+            .copy_from_slice(&positions);
+
+        let mut batch_cache = HybridKvCache::new_with_options(&cfg, &device, 256, 5, true)
+            .expect("allocate batch cache");
+        let mut arena = FaPrefillArena::new(
+            &device,
+            rows as u32,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        )
+        .expect("allocate rectangular FA arena");
+        let mut enc = device.command_encoder().expect("rectangular layer encoder");
+        let batch_output = apply_gated_attn_layer_fresh_prefill_batched_into(
+            &mut enc,
+            &device,
+            &mut registry,
+            &input_buf,
+            &positions_buf,
+            &weights,
+            &mut batch_cache.full_attn[0],
+            selected,
+            seq_len,
+            cfg.hidden_size,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            cfg.rope_theta as f32,
+            cfg.mrope_section,
+            cfg.rms_norm_eps,
+            &mut arena,
+        )
+        .expect("rectangular full-attention layer");
+        enc.commit_and_wait_labeled("test.qwen.rectangular_full_attention")
+            .expect("wait rectangular full-attention layer");
+        let batch_output = download_f32(&batch_output).expect("download rectangular output");
+
+        let mut scalar_cache = HybridKvCache::new_with_options(&cfg, &device, 256, 5, true)
+            .expect("allocate scalar cache");
+        let mut scalar_output = Vec::with_capacity(batch_output.len());
+        let lane_elements = seq_len as usize * hidden;
+        for (lane, slot_id) in selected.iter().copied().enumerate() {
+            let start = lane * lane_elements;
+            let lane_input = upload_f32(&input[start..start + lane_elements], &device)
+                .expect("upload scalar layer input");
+            let mut lane_positions = device
+                .alloc_buffer(
+                    4 * seq_len as usize * std::mem::size_of::<i32>(),
+                    DType::I32,
+                    vec![4, seq_len as usize],
+                )
+                .expect("allocate scalar positions");
+            {
+                let values = lane_positions
+                    .as_mut_slice::<i32>()
+                    .expect("map scalar positions");
+                for axis in 0..4 {
+                    for token in 0..seq_len as usize {
+                        values[axis * seq_len as usize + token] = token as i32;
+                    }
+                }
+            }
+            let output = build_gated_attn_layer(
+                &device,
+                &mut registry,
+                &lane_input,
+                &lane_positions,
+                &weights,
+                Some(&mut scalar_cache.full_attn[0]),
+                256,
+                seq_len,
+                cfg.hidden_size,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                cfg.rope_theta as f32,
+                cfg.mrope_section,
+                cfg.rms_norm_eps,
+                None,
+                None,
+                None,
+                None,
+                slot_id,
+            )
+            .with_context(|| format!("scalar full-attention slot {}", slot_id.0))
+            .expect("scalar full-attention layer");
+            scalar_output.extend(download_f32(&output).expect("download scalar layer output"));
+        }
+
+        let bit_differences = batch_output
+            .iter()
+            .zip(&scalar_output)
+            .filter(|(actual, expected)| actual.to_bits() != expected.to_bits())
+            .count();
+        let max_abs_error = batch_output
+            .iter()
+            .zip(&scalar_output)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        assert_eq!(
+            bit_differences, 0,
+            "rectangular full-attention output changed scalar bits; \
+             bit_differences={bit_differences}, max_abs_error={max_abs_error:.3e}"
+        );
+        assert_eq!(
+            batch_cache.full_attn[0].current_len,
+            scalar_cache.full_attn[0].current_len
+        );
+        let mut expected_cursors = vec![0; 5];
+        for slot_id in selected {
+            expected_cursors[slot_id.0 as usize] = seq_len;
+        }
+        assert_eq!(batch_cache.full_attn[0].current_len, expected_cursors);
+        let batch_tq = batch_cache.full_attn[0].tq.as_ref().expect("batch TQ");
+        let scalar_tq = scalar_cache.full_attn[0].tq.as_ref().expect("scalar TQ");
+        assert_eq!(
+            batch_tq.k_packed.as_slice::<u8>().expect("batch packed K"),
+            scalar_tq
+                .k_packed
+                .as_slice::<u8>()
+                .expect("scalar packed K")
+        );
+        assert_eq!(
+            batch_tq.v_packed.as_slice::<u8>().expect("batch packed V"),
+            scalar_tq
+                .v_packed
+                .as_slice::<u8>()
+                .expect("scalar packed V")
+        );
+        assert_eq!(
+            batch_tq
+                .k_norms
+                .as_slice::<f32>()
+                .expect("batch K norms")
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            scalar_tq
+                .k_norms
+                .as_slice::<f32>()
+                .expect("scalar K norms")
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            batch_tq
+                .v_norms
+                .as_slice::<f32>()
+                .expect("batch V norms")
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            scalar_tq
+                .v_norms
+                .as_slice::<f32>()
+                .expect("scalar V norms")
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rectangular_full_attention_width_two_matches_scalar_output_cache_and_sparse_slots() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        run_rectangular_full_attention_case(&[SlotId(3), SlotId(1)]);
+    }
+
+    #[test]
+    fn rectangular_full_attention_width_four_matches_scalar_output_cache_and_sparse_slots() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        run_rectangular_full_attention_case(&[SlotId(4), SlotId(1), SlotId(3), SlotId(0)]);
+    }
+
+    #[test]
+    fn rectangular_full_attention_rejects_incompatible_slots_before_dispatch_or_mutation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use super::super::kv_cache::HybridKvCache;
+        use super::super::FaPrefillArena;
+
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+        let cfg = fresh_short_d256_cfg();
+        let seq_len = 128_u32;
+        let rows = 2 * seq_len as usize;
+        let mut seed = 0xA049_B205_u32;
+        let weights = layer_weights_f32(
+            cfg.hidden_size as usize,
+            cfg.num_attention_heads as usize,
+            cfg.num_key_value_heads as usize,
+            cfg.head_dim as usize,
+            &mut seed,
+            &device,
+        );
+        let input = upload_f32(
+            &mk_rand(&mut seed, rows * cfg.hidden_size as usize, 0.05),
+            &device,
+        )
+        .expect("upload incompatible-case input");
+        let mut positions = device
+            .alloc_buffer(
+                4 * rows * std::mem::size_of::<i32>(),
+                DType::I32,
+                vec![4, rows],
+            )
+            .expect("allocate incompatible-case positions");
+        {
+            let values = positions.as_mut_slice::<i32>().expect("map positions");
+            for axis in 0..4 {
+                for lane in 0..2 {
+                    for token in 0..seq_len as usize {
+                        values[axis * rows + lane * seq_len as usize + token] = token as i32;
+                    }
+                }
+            }
+        }
+
+        let mut assert_rejected =
+            |mut cache: HybridKvCache, selected: &[SlotId], expected: &str| {
+                let mut arena = FaPrefillArena::new(
+                    &device,
+                    rows as u32,
+                    cfg.num_attention_heads,
+                    cfg.num_key_value_heads,
+                    cfg.head_dim,
+                )
+                .expect("allocate incompatible-case arena");
+                let cursors_before = cache.full_attn[0].current_len.clone();
+                let tq = cache.full_attn[0].tq.as_ref().expect("TQ cache");
+                let packed_k_before = tq.k_packed.as_slice::<u8>().expect("map packed K").to_vec();
+                let packed_v_before = tq.v_packed.as_slice::<u8>().expect("map packed V").to_vec();
+                let k_norms_before = tq
+                    .k_norms
+                    .as_slice::<f32>()
+                    .expect("map K norms")
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>();
+                let v_norms_before = tq
+                    .v_norms
+                    .as_slice::<f32>()
+                    .expect("map V norms")
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>();
+                let dispatches_before = mlx_native::dispatch_count();
+                let commits_before = mlx_native::commit_count();
+                let mut enc = device.command_encoder().expect("rejection encoder");
+                let error = apply_gated_attn_layer_fresh_prefill_batched_into(
+                    &mut enc,
+                    &device,
+                    &mut registry,
+                    &input,
+                    &positions,
+                    &weights,
+                    &mut cache.full_attn[0],
+                    selected,
+                    seq_len,
+                    cfg.hidden_size,
+                    cfg.num_attention_heads,
+                    cfg.num_key_value_heads,
+                    cfg.head_dim,
+                    cfg.rotary_dim,
+                    cfg.rope_theta as f32,
+                    cfg.mrope_section,
+                    cfg.rms_norm_eps,
+                    &mut arena,
+                )
+                .expect_err("incompatible rectangular batch must reject");
+                assert!(format!("{error:#}").contains(expected), "{error:#}");
+                drop(enc);
+                assert_eq!(mlx_native::dispatch_count(), dispatches_before);
+                assert_eq!(mlx_native::commit_count(), commits_before);
+                assert_eq!(cache.full_attn[0].current_len, cursors_before);
+                let tq = cache.full_attn[0].tq.as_ref().expect("TQ cache after");
+                assert_eq!(
+                    tq.k_packed.as_slice::<u8>().expect("packed K after"),
+                    packed_k_before
+                );
+                assert_eq!(
+                    tq.v_packed.as_slice::<u8>().expect("packed V after"),
+                    packed_v_before
+                );
+                assert_eq!(
+                    tq.k_norms
+                        .as_slice::<f32>()
+                        .expect("K norms after")
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    k_norms_before
+                );
+                assert_eq!(
+                    tq.v_norms
+                        .as_slice::<f32>()
+                        .expect("V norms after")
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    v_norms_before
+                );
+            };
+
+        assert_rejected(
+            HybridKvCache::new_with_options(&cfg, &device, 256, 2, true).expect("duplicate cache"),
+            &[SlotId(0), SlotId(0)],
+            "duplicate slot",
+        );
+        assert_rejected(
+            HybridKvCache::new_with_options(&cfg, &device, 256, 2, true).expect("range cache"),
+            &[SlotId(0), SlotId(2)],
+            "out of range",
+        );
+        let mut warm =
+            HybridKvCache::new_with_options(&cfg, &device, 256, 2, true).expect("warm cache");
+        warm.full_attn[0].current_len[1] = 1;
+        assert_rejected(warm, &[SlotId(0), SlotId(1)], "is not cold");
+        assert_rejected(
+            HybridKvCache::new_with_options(&cfg, &device, 64, 2, true).expect("capacity cache"),
+            &[SlotId(0), SlotId(1)],
+            "beyond physical capacity",
         );
     }
 
@@ -12533,7 +14739,8 @@ mod tests {
             gate_q,
             up_q,
             down_q,
-            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_gate: GgmlType::Q4_0,
+            ggml_type_up: GgmlType::Q4_0,
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: intermediate_size as u32,
             hidden_size: hidden_size as u32,
@@ -12798,7 +15005,8 @@ mod tests {
                 gate_q: wrong_gate_buf,
                 up_q: base_ffn_q.up_q.clone(),
                 down_q: base_ffn_q.down_q.clone(),
-                ggml_type_gate_up: GgmlType::Q4_0,
+                ggml_type_gate: GgmlType::Q4_0,
+                ggml_type_up: GgmlType::Q4_0,
                 ggml_type_down: GgmlType::Q4_0,
                 intermediate_size: m as u32,
                 hidden_size: h as u32,
@@ -12844,7 +15052,8 @@ mod tests {
                 gate_q: base_ffn_q.gate_q.clone(),
                 up_q: wrong_up_buf,
                 down_q: base_ffn_q.down_q.clone(),
-                ggml_type_gate_up: GgmlType::Q4_0,
+                ggml_type_gate: GgmlType::Q4_0,
+                ggml_type_up: GgmlType::Q4_0,
                 ggml_type_down: GgmlType::Q4_0,
                 intermediate_size: m as u32,
                 hidden_size: h as u32,
@@ -12890,7 +15099,8 @@ mod tests {
                 gate_q: base_ffn_q.gate_q.clone(),
                 up_q: base_ffn_q.up_q.clone(),
                 down_q: wrong_down_buf,
-                ggml_type_gate_up: GgmlType::Q4_0,
+                ggml_type_gate: GgmlType::Q4_0,
+                ggml_type_up: GgmlType::Q4_0,
                 ggml_type_down: GgmlType::Q4_0,
                 intermediate_size: m as u32,
                 hidden_size: h as u32,
@@ -12997,7 +15207,8 @@ mod tests {
                 gate_q: base_ffn_q.gate_q.clone(),
                 up_q: base_ffn_q.up_q.clone(),
                 down_q: base_ffn_q.down_q.clone(),
-                ggml_type_gate_up: GgmlType::Q5_K,
+                ggml_type_gate: GgmlType::Q5_K,
+                ggml_type_up: GgmlType::Q5_K,
                 ggml_type_down: GgmlType::Q4_0,
                 intermediate_size: m as u32,
                 hidden_size: h as u32,
@@ -13020,7 +15231,7 @@ mod tests {
             .unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("gate/up") && msg.contains("Q5_K"),
+                msg.contains("gate") && msg.contains("Q5_K"),
                 "(f) mismatched gate/up GGML geometry not caught: {msg}"
             );
             assert!(
@@ -13035,7 +15246,8 @@ mod tests {
                 gate_q: base_ffn_q.gate_q.clone(),
                 up_q: base_ffn_q.up_q.clone(),
                 down_q: base_ffn_q.down_q.clone(),
-                ggml_type_gate_up: GgmlType::Q4_0,
+                ggml_type_gate: GgmlType::Q4_0,
+                ggml_type_up: GgmlType::Q4_0,
                 ggml_type_down: GgmlType::Q4_0,
                 intermediate_size: m as u32,
                 hidden_size: h as u32 + 1, // mismatch
@@ -13134,7 +15346,8 @@ mod tests {
             gate_q: make_u8_buf(&gate_q_bytes, &device),
             up_q: make_u8_buf(&up_q_bytes, &device),
             down_q: make_u8_buf(&down_q_bytes, &device),
-            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_gate: GgmlType::Q4_0,
+            ggml_type_up: GgmlType::Q4_0,
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: m as u32,
             hidden_size: h as u32,
@@ -13300,7 +15513,8 @@ mod tests {
             gate_q: make_u8_buf(&gate_q_bytes, &device),
             up_q: make_u8_buf(&up_q_bytes, &device),
             down_q: make_u8_buf(&down_q_bytes, &device),
-            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_gate: GgmlType::Q4_0,
+            ggml_type_up: GgmlType::Q4_0,
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: m as u32,
             hidden_size: h as u32,
@@ -13537,7 +15751,8 @@ mod tests {
             gate_q: make_u8_buf(&gate_q_bytes, &device),
             up_q: make_u8_buf(&up_q_bytes, &device),
             down_q: make_u8_buf(&down_q_bytes, &device),
-            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_gate: GgmlType::Q4_0,
+            ggml_type_up: GgmlType::Q4_0,
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: m as u32,
             hidden_size: h as u32,
@@ -13723,21 +15938,47 @@ mod tests {
         };
 
         let gpu_weights = super::super::gpu_ffn::MoeFfnWeightsGpuQ {
-            router: upload_bf16_from_f32(&router_f32, device).expect("upload router bf16"),
+            activation_epoch: 1,
+            router: test_native_weight(
+                upload_bf16_from_f32(&router_f32, device).expect("upload router bf16"),
+                GgmlType::BF16,
+                ne,
+                h,
+            ),
             expert_gate_q: make_u8_buf(&gate_q4),
             expert_up_q: make_u8_buf(&up_q4),
             expert_down_q: make_u8_buf(&down_q4),
-            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_gate: GgmlType::Q4_0,
+            ggml_type_up: GgmlType::Q4_0,
             ggml_type_down: GgmlType::Q4_0,
             expert_gate_stride: gate_stride,
             expert_up_stride: gate_stride,
             expert_down_stride: down_stride,
             num_experts: ne as u32,
-            shared_gate_inp: upload_bf16_from_f32(&shared_gate_logit_f32, device)
-                .expect("sh_gate_inp"),
-            shared_gate: upload_bf16_from_f32(&shared_gate_f32, device).expect("sh_gate"),
-            shared_up: upload_bf16_from_f32(&shared_up_f32, device).expect("sh_up"),
-            shared_down: upload_bf16_from_f32(&shared_down_f32, device).expect("sh_down"),
+            shared_gate_inp: test_native_weight(
+                upload_bf16_from_f32(&shared_gate_logit_f32, device).expect("sh_gate_inp"),
+                GgmlType::BF16,
+                1,
+                h,
+            ),
+            shared_gate: test_native_weight(
+                upload_bf16_from_f32(&shared_gate_f32, device).expect("sh_gate"),
+                GgmlType::BF16,
+                m_sh,
+                h,
+            ),
+            shared_up: test_native_weight(
+                upload_bf16_from_f32(&shared_up_f32, device).expect("sh_up"),
+                GgmlType::BF16,
+                m_sh,
+                h,
+            ),
+            shared_down: test_native_weight(
+                upload_bf16_from_f32(&shared_down_f32, device).expect("sh_down"),
+                GgmlType::BF16,
+                h,
+                m_sh,
+            ),
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
@@ -13755,6 +15996,40 @@ mod tests {
         };
 
         (gpu_weights, cpu_weights)
+    }
+
+    fn activate_moe_q_bf16_test_routes(
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        weights: &super::super::gpu_ffn::MoeFfnWeightsGpuQ,
+    ) {
+        fn matrix<'a>(
+            label: &'static str,
+            weight: &'a crate::serve::forward_mlx_shared::MlxQWeight,
+        ) -> crate::inference::dense_bf16_activation::NativeBf16Matrix<'a> {
+            crate::inference::dense_bf16_activation::NativeBf16Matrix::unbatched_through(
+                label,
+                &weight.buffer,
+                weight.info.rows as u32,
+                weight.info.cols as u32,
+                8,
+            )
+            .expect("valid MoE BF16 test shape")
+        }
+        let matrices = [
+            matrix("test quantized MoE router", &weights.router),
+            matrix(
+                "test quantized MoE shared gate input",
+                &weights.shared_gate_inp,
+            ),
+            matrix("test quantized MoE shared gate", &weights.shared_gate),
+            matrix("test quantized MoE shared up", &weights.shared_up),
+            matrix("test quantized MoE shared down", &weights.shared_down),
+        ];
+        crate::inference::dense_bf16_activation::activate_native_bf16_test_plan(
+            registry, device, &matrices,
+        )
+        .expect("activate quantized MoE BF16 test routes");
     }
 
     /// Assert that every element of a slice is non-zero (RF-5: no identity-path tests).
@@ -14009,6 +16284,7 @@ mod tests {
         let attn_weights = layer_weights_f32(h, nq, nkv, d, &mut seed, &device);
         let (moe_gpu_weights, _cpu_weights) =
             moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
+        activate_moe_q_bf16_test_routes(&mut registry, &device, &moe_gpu_weights);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
         let hidden_in = upload_f32(&hidden_data, &device).unwrap();
@@ -14102,6 +16378,7 @@ mod tests {
         let mut seed = 0xAC03_u32;
         let base_attn_weights = layer_weights_f32(h, nq, nkv, d, &mut seed, &device);
         let (base_moe_weights, _) = moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
+        activate_moe_q_bf16_test_routes(&mut registry, &device, &base_moe_weights);
 
         let valid_shape = moe_layer_shape_tiny(ne as u32, topk as u32, m_moe as u32, m_sh as u32);
 
@@ -14132,20 +16409,22 @@ mod tests {
         };
 
         // Helper: build a MoeFfnWeightsGpuQ from base, substituting a single field.
-        let make_weights = |router: MlxBuffer,
+        let make_weights = |router: crate::serve::forward_mlx_shared::MlxQWeight,
                             expert_gate_q: MlxBuffer,
                             expert_up_q: MlxBuffer,
                             expert_down_q: MlxBuffer,
-                            ggml_type_gate_up: GgmlType,
+                            ggml_type_gate: GgmlType,
                             ggml_type_down: GgmlType,
-                            shared_gate_inp: MlxBuffer|
+                            shared_gate_inp: crate::serve::forward_mlx_shared::MlxQWeight|
          -> super::super::gpu_ffn::MoeFfnWeightsGpuQ {
             super::super::gpu_ffn::MoeFfnWeightsGpuQ {
+                activation_epoch: 1,
                 router,
                 expert_gate_q,
                 expert_up_q,
                 expert_down_q,
-                ggml_type_gate_up,
+                ggml_type_gate,
+                ggml_type_up: ggml_type_gate,
                 ggml_type_down,
                 expert_gate_stride: base_moe_weights.expert_gate_stride,
                 expert_up_stride: base_moe_weights.expert_up_stride,
@@ -14161,14 +16440,17 @@ mod tests {
             }
         };
 
-        // neg_1: ggml_type_gate_up != Q4_0 → Err with 'ggml_type_gate_up must be Q4_0'.
+        // neg_1: gate codec metadata that disagrees with the encoded physical
+        // layout must fail before any expert dispatch. Q5_K can reject this
+        // fixture at its 256-value block-width gate before byte-count proof;
+        // both diagnostics prove the same fail-closed storage contract.
         {
             let bad_weights = make_weights(
                 base_moe_weights.router.clone(),
                 base_moe_weights.expert_gate_q.clone(),
                 base_moe_weights.expert_up_q.clone(),
                 base_moe_weights.expert_down_q.clone(),
-                GgmlType::Q5_K, // bad gate_up type
+                GgmlType::Q5_K,
                 GgmlType::Q4_0,
                 base_moe_weights.shared_gate_inp.clone(),
             );
@@ -14190,12 +16472,16 @@ mod tests {
             .unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("ggml_type_gate_up must be Q4_0"),
+                msg.contains("Q5_K")
+                    && (msg.contains("expert_gate_q has")
+                        || (msg.contains("expert_gate cols") && msg.contains("block width"))),
                 "neg_1: wrong message: {msg}"
             );
         }
 
-        // neg_2: ggml_type_down != Q4_0 → Err with 'ggml_type_down must be Q4_0'.
+        // neg_2: down codec metadata that disagrees with the encoded physical
+        // layout must fail before any expert dispatch. As above, the K-block
+        // geometry gate may prove the mismatch before exact byte count.
         {
             let bad_weights = make_weights(
                 base_moe_weights.router.clone(),
@@ -14203,7 +16489,7 @@ mod tests {
                 base_moe_weights.expert_up_q.clone(),
                 base_moe_weights.expert_down_q.clone(),
                 GgmlType::Q4_0,
-                GgmlType::Q6_K, // bad down type
+                GgmlType::Q6_K,
                 base_moe_weights.shared_gate_inp.clone(),
             );
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
@@ -14224,16 +16510,18 @@ mod tests {
             .unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("ggml_type_down must be Q4_0"),
+                msg.contains("Q6_K")
+                    && (msg.contains("expert_down_q has")
+                        || (msg.contains("expert_down cols") && msg.contains("block width"))),
                 "neg_2: wrong message: {msg}"
             );
         }
 
-        // neg_3: router uploaded as F32 (not BF16) → Err with 'router dtype must be BF16'.
+        // neg_3: router native-matrix metadata disagrees with the graph shape.
         {
             let router_f32_buf = upload_f32(&mk_rand(&mut seed, ne * h, 0.3), &device).unwrap();
             let bad_weights = make_weights(
-                router_f32_buf, // F32 instead of BF16
+                test_native_weight(router_f32_buf, GgmlType::F32, ne + 1, h),
                 base_moe_weights.expert_gate_q.clone(),
                 base_moe_weights.expert_up_q.clone(),
                 base_moe_weights.expert_down_q.clone(),
@@ -14258,10 +16546,7 @@ mod tests {
             )
             .unwrap_err();
             let msg = err.to_string();
-            assert!(
-                msg.contains("router dtype must be BF16"),
-                "neg_3: wrong message: {msg}"
-            );
+            assert!(msg.contains("router shape"), "neg_3: wrong message: {msg}");
         }
 
         // neg_4: shape.attn.hidden_size != router element count (shape=2048 but router=128*4=512).
@@ -14491,6 +16776,7 @@ mod tests {
 
         let (gpu_moe_weights, cpu_moe_weights) =
             moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
+        activate_moe_q_bf16_test_routes(&mut registry, &device, &gpu_moe_weights);
 
         // Pre-test non-zero assertion (RF-5).
         assert_all_nonzero("router_f32", &cpu_moe_weights.router);
@@ -14628,6 +16914,7 @@ mod tests {
         let gpu_attn_weights =
             FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
         let (gpu_moe_weights, _) = moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
+        activate_moe_q_bf16_test_routes(&mut registry, &device, &gpu_moe_weights);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
         let mask_stride = prefix + seq;
@@ -14779,6 +17066,7 @@ mod tests {
         let mut seed = 0xAC06_u32;
         let attn_weights = layer_weights_f32(h, nq, nkv, d, &mut seed, &device);
         let (moe_gpu_weights, _) = moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
+        activate_moe_q_bf16_test_routes(&mut registry, &device, &moe_gpu_weights);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
         let mask =
@@ -14866,6 +17154,7 @@ mod tests {
         let mut seed = 0xAC07_u32;
         let attn_weights = layer_weights_f32(h, nq, nkv, d, &mut seed, &device);
         let (base_moe, _) = moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
+        activate_moe_q_bf16_test_routes(&mut registry, &device, &base_moe);
 
         // Build router that saturates softmax to experts {0, 1}.
         // Row 0 = +1e3 * ones, Row 1 = +1e3 * ones, Rows 2,3 = -1e6 * ones.
@@ -14890,11 +17179,13 @@ mod tests {
         // by ~7 * scale (sentinel magnitude) on many elements.
         // We keep experts 0 and 1 with normal random weights.
         let routed_moe = super::super::gpu_ffn::MoeFfnWeightsGpuQ {
-            router: router_bf16,
+            activation_epoch: 1,
+            router: test_native_weight(router_bf16, GgmlType::BF16, ne, h),
             expert_gate_q: base_moe.expert_gate_q.clone(),
             expert_up_q: base_moe.expert_up_q.clone(),
             expert_down_q: base_moe.expert_down_q.clone(),
-            ggml_type_gate_up: base_moe.ggml_type_gate_up,
+            ggml_type_gate: base_moe.ggml_type_gate,
+            ggml_type_up: base_moe.ggml_type_up,
             ggml_type_down: base_moe.ggml_type_down,
             expert_gate_stride: base_moe.expert_gate_stride,
             expert_up_stride: base_moe.expert_up_stride,
@@ -14985,6 +17276,7 @@ mod tests {
         let mut seed = 0xAC08_u32;
         let attn_weights = layer_weights_f32(h, nq, nkv, d, &mut seed, &device);
         let (base_moe, _) = moe_ffn_weights_q4_0(h, ne, m_moe, m_sh, &mut seed, &device);
+        activate_moe_q_bf16_test_routes(&mut registry, &device, &base_moe);
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
 
@@ -14994,17 +17286,24 @@ mod tests {
 
         // Run A: shared gate fully ON.
         let moe_a = super::super::gpu_ffn::MoeFfnWeightsGpuQ {
+            activation_epoch: 1,
             router: base_moe.router.clone(),
             expert_gate_q: base_moe.expert_gate_q.clone(),
             expert_up_q: base_moe.expert_up_q.clone(),
             expert_down_q: base_moe.expert_down_q.clone(),
-            ggml_type_gate_up: base_moe.ggml_type_gate_up,
+            ggml_type_gate: base_moe.ggml_type_gate,
+            ggml_type_up: base_moe.ggml_type_up,
             ggml_type_down: base_moe.ggml_type_down,
             expert_gate_stride: base_moe.expert_gate_stride,
             expert_up_stride: base_moe.expert_up_stride,
             expert_down_stride: base_moe.expert_down_stride,
             num_experts: base_moe.num_experts,
-            shared_gate_inp: upload_bf16_from_f32(&sh_gate_on_f32, &device).expect("sh_gate_on"),
+            shared_gate_inp: test_native_weight(
+                upload_bf16_from_f32(&sh_gate_on_f32, &device).expect("sh_gate_on"),
+                GgmlType::BF16,
+                1,
+                h,
+            ),
             shared_gate: base_moe.shared_gate.clone(),
             shared_up: base_moe.shared_up.clone(),
             shared_down: base_moe.shared_down.clone(),
@@ -15037,17 +17336,24 @@ mod tests {
 
         // Run B: shared gate fully OFF (sigmoid ≈ 0).
         let moe_b = super::super::gpu_ffn::MoeFfnWeightsGpuQ {
+            activation_epoch: 1,
             router: base_moe.router.clone(),
             expert_gate_q: base_moe.expert_gate_q.clone(),
             expert_up_q: base_moe.expert_up_q.clone(),
             expert_down_q: base_moe.expert_down_q.clone(),
-            ggml_type_gate_up: base_moe.ggml_type_gate_up,
+            ggml_type_gate: base_moe.ggml_type_gate,
+            ggml_type_up: base_moe.ggml_type_up,
             ggml_type_down: base_moe.ggml_type_down,
             expert_gate_stride: base_moe.expert_gate_stride,
             expert_up_stride: base_moe.expert_up_stride,
             expert_down_stride: base_moe.expert_down_stride,
             num_experts: base_moe.num_experts,
-            shared_gate_inp: upload_bf16_from_f32(&sh_gate_off_f32, &device).expect("sh_gate_off"),
+            shared_gate_inp: test_native_weight(
+                upload_bf16_from_f32(&sh_gate_off_f32, &device).expect("sh_gate_off"),
+                GgmlType::BF16,
+                1,
+                h,
+            ),
             shared_gate: base_moe.shared_gate.clone(),
             shared_up: base_moe.shared_up.clone(),
             shared_down: base_moe.shared_down.clone(),

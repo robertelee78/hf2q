@@ -20,7 +20,7 @@ use crate::serve::multi_seq_kv::SlotId;
 use super::execution_config::Qwen35ExecutionConfiguration;
 use super::execution_dispatch::{
     with_execution_configuration, with_execution_trace_capture, Qwen35EncodedDispatchObservation,
-    Qwen35TraceWeightSlot,
+    Qwen35TraceWeightKey, Qwen35TraceWeightSlot,
 };
 use super::execution_observation::{
     capture_loaded_tensor_catalog, VerifiedExecutedTensorCatalog, VerifiedLoadedTensorCatalog,
@@ -57,7 +57,7 @@ pub(crate) struct NoDwqQwen35TextSession<'a> {
     candidate: &'a NoDwqQwen35LoadedCandidate,
     kv_cache: HybridKvCache,
     executed_catalog: Arc<VerifiedExecutedTensorCatalog>,
-    trace_weight_slots: BTreeMap<usize, Qwen35TraceWeightSlot>,
+    trace_weight_slots: BTreeMap<Qwen35TraceWeightKey, Qwen35TraceWeightSlot>,
     dispatches: Vec<Qwen35EncodedDispatchObservation>,
     captured_prompt: bool,
     captured_decode: bool,
@@ -203,6 +203,21 @@ impl NoDwqQwen35TextSession<'_> {
             return false;
         };
         observations.push(first);
+        verify_encoded_dispatch_catalog(
+            &self.candidate.execution,
+            &self.executed_catalog,
+            observations,
+        )
+        .is_err()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wrong_backend_version_fails_sealing(&self) -> bool {
+        let mut observations = self.dispatches.clone();
+        let Some(first) = observations.first_mut() else {
+            return false;
+        };
+        first.trace.mlx_native_version = "0.0.0-substituted".into();
         verify_encoded_dispatch_catalog(
             &self.candidate.execution,
             &self.executed_catalog,

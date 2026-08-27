@@ -778,9 +778,9 @@ where
 /// (qwen35 mid-prefill snapshots — see
 /// `engine_qwen35.rs::generate_qwen35_*` chunked-prefill stores at
 /// every `chunk_pos = k_end` boundary), the BASE-key probe in
-/// [`probe_lcp_opportunity`] never matches because stored keys carry
-/// chunk_pos in their `params_hash` and the BASE key uses chunk_pos=0
-/// (or unset). Result: `hf2q_kv_lcp_detected_total` was always 0 for
+/// [`probe_lcp_opportunity`] never matches because the chunk position is
+/// mangled into `tenant_id` while the BASE key has no chunk suffix. Result:
+/// `hf2q_kv_lcp_detected_total` was always 0 for
 /// production qwen35 chunked workloads — a known observability bug
 /// from iter-2 (caught by Codex Phase-2b 2026-05-06; counter-fix
 /// landed here).

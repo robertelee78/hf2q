@@ -50,7 +50,7 @@ mod resize_bicubic;
 pub mod vit;
 pub mod vit_dump;
 pub mod vit_gpu;
-pub mod vit_gpu_qwen3vl;
+pub mod vit_gpu_qwen;
 
 const MAX_ENCODED_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 

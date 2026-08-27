@@ -32,6 +32,34 @@ expect_failure() {
 }
 
 failure_count=0
+
+verify_standalone_sha_binding() {
+  local workflow_path=$1
+  local env_count verify_count env_line build_line verify_line
+  env_count=$(grep -cF 'cargo_env+=(GIT_COMMIT_SHA="$EXPECTED_SHA")' \
+    "$workflow_path" || true)
+  [[ "$env_count" == 1 ]] || {
+    echo "standalone workflow does not inject the exact source SHA into the build" >&2
+    return 1
+  }
+  verify_count=$(grep -cF 'grep -aFq -- "$EXPECTED_SHA" "$built_binary"' \
+    "$workflow_path" || true)
+  [[ "$verify_count" == 1 ]] || {
+    echo "standalone workflow does not verify the embedded exact source SHA" >&2
+    return 1
+  }
+  env_line=$(grep -nF 'cargo_env+=(GIT_COMMIT_SHA="$EXPECTED_SHA")' \
+    "$workflow_path" | cut -d: -f1)
+  build_line=$(grep -nF '"${cargo_env[@]}" cargo build --release --locked' \
+    "$workflow_path" | cut -d: -f1)
+  verify_line=$(grep -nF 'grep -aFq -- "$EXPECTED_SHA" "$built_binary"' \
+    "$workflow_path" | cut -d: -f1)
+  [[ "$env_line" -lt "$build_line" && "$build_line" -lt "$verify_line" ]] || {
+    echo "standalone source-SHA injection and verification are out of order" >&2
+    return 1
+  }
+}
+
 package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' \
   "$ROOT_DIR/Cargo.toml" | head -1)
 [[ "$package_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || \
@@ -62,9 +90,9 @@ dependencies = [
 
 [[package]]
 name = "mlx-native"
-version = "0.11.2"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22f4bd6661e77994c6f26a79fdd2c188f3d5252aa7e51616f5feb080b22da8e0"
+checksum = "09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822"
 LOCK
 
 jq -n --arg workspace_root "$package_root" \
@@ -77,12 +105,12 @@ jq -n --arg workspace_root "$package_root" \
         dependencies:[{
           name:"mlx-native",
           source:"registry+https://github.com/rust-lang/crates.io-index",
-          req:"=0.11.2"
+          req:"=0.15.0"
         }]
       },
       {
         name:"mlx-native",
-        version:"0.11.2",
+        version:"0.15.0",
         source:"registry+https://github.com/rust-lang/crates.io-index",
         dependencies:[]
       }
@@ -97,7 +125,7 @@ bash "$VERIFIER" verify "$evidence" "$package_root/Cargo.lock"
 
 wrong_checksum="$scratch/wrong-checksum"
 cp -R "$evidence" "$wrong_checksum"
-awk '{gsub(/22f4bd6661e77994c6f26a79fdd2c188f3d5252aa7e51616f5feb080b22da8e0/, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}1' \
+awk '{gsub(/09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822/, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}1' \
   "$wrong_checksum/Cargo.lock" > "$wrong_checksum/Cargo.lock.tmp"
 mv "$wrong_checksum/Cargo.lock.tmp" "$wrong_checksum/Cargo.lock"
 expect_failure "verifier accepted a substituted mlx-native checksum" \
@@ -182,6 +210,20 @@ printf '\n# release-side packed lock mutation\n' >> "$different_lock"
 expect_failure "verifier accepted a different release-side packed Cargo.lock" \
   "downloaded evidence Cargo.lock differs from expected Cargo.lock" \
   bash "$VERIFIER" verify "$evidence" "$different_lock"
+
+verify_standalone_sha_binding "$STANDALONE_WORKFLOW"
+without_sha_injection="$scratch/standalone-without-sha-injection.yml"
+sed '/cargo_env+=(GIT_COMMIT_SHA/d' "$STANDALONE_WORKFLOW" \
+  > "$without_sha_injection"
+expect_failure "standalone SHA contract accepted a build without SHA injection" \
+  "standalone workflow does not inject the exact source SHA into the build" \
+  verify_standalone_sha_binding "$without_sha_injection"
+without_sha_verification="$scratch/standalone-without-sha-verification.yml"
+sed '/grep -aFq --/d' "$STANDALONE_WORKFLOW" \
+  > "$without_sha_verification"
+expect_failure "standalone SHA contract accepted a binary without embedded-SHA verification" \
+  "standalone workflow does not verify the embedded exact source SHA" \
+  verify_standalone_sha_binding "$without_sha_verification"
 
 grep -qF 'packed_build_root=$(mktemp -d "/private/var/tmp/hf2q-packed-build.XXXXXX")' \
   "$STANDALONE_WORKFLOW" || fail "standalone workflow does not allocate a config-isolated packed build root"

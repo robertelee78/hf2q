@@ -8,9 +8,54 @@
 //!
 //! Populated by ADR-013 (Qwen3.5 / Qwen3.5-MoE).
 
+pub(crate) mod argmax;
+pub(crate) mod dense_bf16_activation;
+pub(crate) mod dense_expert_activation;
 pub mod models;
 pub mod spec_decode;
 pub mod vision;
+
+/// Exact published inference backend resolved by this source candidate.
+/// Receipt producers and validators share this seal; a unit test binds it to
+/// the exact Cargo dependency requirement.
+pub(crate) const MLX_NATIVE_VERSION: &str = "0.15.0";
+
+#[cfg(test)]
+mod dependency_version_tests {
+    use super::MLX_NATIVE_VERSION;
+
+    #[test]
+    fn mlx_native_version_seal_matches_exact_manifest_dependency() {
+        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("read Cargo.toml");
+        let manifest: toml::Value = toml::from_str(&manifest).expect("parse Cargo.toml");
+        let dependency = manifest
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .and_then(|dependencies| dependencies.get("mlx-native"))
+            .expect("Cargo.toml must declare mlx-native exactly once");
+        let requirement = match dependency {
+            toml::Value::String(requirement) => requirement.as_str(),
+            toml::Value::Table(table) => {
+                assert_eq!(
+                    table.len(),
+                    1,
+                    "mlx-native dependency must contain only an exact registry version"
+                );
+                table
+                    .get("version")
+                    .and_then(toml::Value::as_str)
+                    .expect("normalized mlx-native dependency must contain a version")
+            }
+            _ => panic!("mlx-native dependency has an unsupported manifest representation"),
+        };
+        assert_eq!(
+            requirement,
+            format!("={MLX_NATIVE_VERSION}"),
+            "Cargo.toml must exactly require the receipt-sealed mlx-native version"
+        );
+    }
+}
 
 /// ADR-005 iter-230 A2 — crate-wide serialization lock for GPU-executing
 /// tests.

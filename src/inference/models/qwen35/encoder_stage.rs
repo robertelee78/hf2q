@@ -133,12 +133,16 @@ impl<'sess> LayerEncoder<'sess> {
     /// * `session = None` → `Plain(device.command_encoder()?)`.  This is the
     ///   env=0 path and is byte-identical to the pre-iter91 `LayerEncoder::new`
     ///   Plain arm.  Callers under env=0 always pass `None`.
-    /// * `session = Some(sess)` → `Sessioned(sess)`.  The borrow is held for
-    ///   the lifetime of the returned `LayerEncoder`; when the encoder is
-    ///   consumed by `fence_or_commit` / `carry_into_next_stage` /
-    ///   `commit_unlabeled` / `commit_and_wait_labeled`, the borrow is
-    ///   released back to the caller's `Option<EncoderSession>` and the
-    ///   next stage can re-borrow.
+    /// * `session = Some(sess)` → refresh a drained session, then
+    ///   `Sessioned(sess)`.  The refresh is required after a non-fused stage:
+    ///   the session-backed residual/norm command buffer is committed first,
+    ///   while the dense or F32-MoE body runs on its own encoder.  The next
+    ///   layer must never try to open a compute encoder on that already-
+    ///   committed command buffer.  `reset_for_next_stage` is a no-op while
+    ///   the session is still encoding, so this acquisition rule also covers
+    ///   the initial and carried-session paths without a call-site branch.
+    ///   The borrow is held for the lifetime of the returned `LayerEncoder`;
+    ///   when the encoder is consumed, the next stage can re-borrow it.
     ///
     /// # Caller contract for env=1
     ///
@@ -153,16 +157,18 @@ impl<'sess> LayerEncoder<'sess> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` only on the Plain arm, propagating
-    /// `MlxDevice::command_encoder` failures.  The Sessioned arm is
-    /// infallible (the borrow is already validated by the caller's outer
-    /// allocation site).
+    /// Propagates command-buffer allocation/reset failures from either arm.
     pub(super) fn from_session_or_plain(
         device: &MlxDevice,
         session: Option<&'sess mut EncoderSession>,
     ) -> Result<Self> {
         match session {
-            Some(sess) => Ok(LayerEncoder::Sessioned(sess)),
+            Some(sess) => {
+                sess.reset_for_next_stage().context(
+                    "LayerEncoder::from_session_or_plain: refresh drained EncoderSession",
+                )?;
+                Ok(LayerEncoder::Sessioned(sess))
+            }
             None => {
                 let enc = device
                     .command_encoder()
@@ -500,5 +506,42 @@ mod tests {
             2,
             "reusable drain must allocate exactly one next-stage command buffer"
         );
+    }
+
+    #[test]
+    fn acquiring_a_drained_session_rotates_before_the_next_dispatch() {
+        if !LayerEncoder::env_enabled() {
+            eprintln!("SKIP: rerun with HF2Q_ENCODER_SESSION=1");
+            return;
+        }
+
+        let _gpu_test_lock = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("create Metal device");
+        mlx_native::reset_counters();
+        let mut session = device
+            .encoder_session()
+            .expect("create encoder session")
+            .expect("HF2Q_ENCODER_SESSION=1 must create a session");
+
+        LayerEncoder::Sessioned(&mut session)
+            .commit_unlabeled()
+            .expect("commit session-backed producer before external stage");
+        assert!(session.is_drained());
+        assert_eq!(mlx_native::cmd_buf_count(), 1);
+
+        let next = LayerEncoder::from_session_or_plain(&device, Some(&mut session))
+            .expect("acquire session for next layer");
+        assert!(
+            !matches!(&next, LayerEncoder::Sessioned(sess) if sess.is_drained()),
+            "next layer must not receive an already-committed command buffer"
+        );
+        assert_eq!(
+            mlx_native::cmd_buf_count(),
+            2,
+            "drained-session acquisition must allocate exactly one fresh command buffer"
+        );
+
+        next.commit_and_wait_labeled_terminal("test.next_layer")
+            .expect("fresh command buffer remains usable by the next layer");
     }
 }

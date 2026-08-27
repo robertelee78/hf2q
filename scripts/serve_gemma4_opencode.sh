@@ -99,6 +99,9 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/hf2q_process_guard.sh"
+# shellcheck source=scripts/hf2q_q5_policy.sh
+source "$SCRIPT_DIR/hf2q_q5_policy.sh"
+hf2q_resolve_q5k_canonical_policy
 
 MODEL="${MODEL:-/opt/hf2q/models/gemma4/gemma4-ara-2pass-APEX-Q5_K_M.gguf}"
 MMPROJ="${MMPROJ:-/opt/hf2q/models/gemma4/mmproj-gemma4-f16.gguf}"
@@ -108,6 +111,11 @@ LCP_CAPACITY="${LCP_CAPACITY:-8g}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
+# The canonical agentic launcher enables compatible-lane aggregation. Keep
+# the OFF arm reachable through the same operator entry point for matched
+# release gates and incident isolation; the worker snapshots both values once.
+CROSS_SLOT_ADMIT="${HF2Q_CROSS_SLOT_ADMIT:-1}"
+ADMIT_COALESCE_US="${HF2Q_ADMIT_COALESCE_US:-25000}"
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
@@ -121,6 +129,15 @@ if ! [[ "$MAX_SLOTS" =~ ^[0-9]+$ ]] || (( MAX_SLOTS < 1 || MAX_SLOTS > 8 )); the
 fi
 if ! [[ "$KV_CACHE_BUDGET_BYTES" =~ ^[0-9]+$ ]] || (( KV_CACHE_BUDGET_BYTES < 1 )); then
     echo "KV_CACHE_BUDGET_BYTES must be a positive integer (got: $KV_CACHE_BUDGET_BYTES)" >&2
+    exit 3
+fi
+if [[ "$CROSS_SLOT_ADMIT" != 0 && "$CROSS_SLOT_ADMIT" != 1 ]]; then
+    echo "HF2Q_CROSS_SLOT_ADMIT must be 0 or 1 (got: $CROSS_SLOT_ADMIT)" >&2
+    exit 3
+fi
+if ! [[ "$ADMIT_COALESCE_US" =~ ^[0-9]+$ ]] \
+    || (( 10#$ADMIT_COALESCE_US > 100000 )); then
+    echo "HF2Q_ADMIT_COALESCE_US must be an integer from 0 through 100000 (got: $ADMIT_COALESCE_US)" >&2
     exit 3
 fi
 
@@ -168,11 +185,12 @@ fi
 # 2026-08-03). Branch the exec instead of relying on the expansion.
 if [[ -f "$MMPROJ" ]]; then
     exec env \
+        HF2Q_Q5K_CANONICAL_Q4X4="$HF2Q_Q5K_CANONICAL_Q4X4" \
         HF2Q_KV_LCP_RESUME=1 \
         HF2Q_KV_LCP_LONG_RESUME=1 \
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
-        HF2Q_CROSS_SLOT_ADMIT=1 \
-        HF2Q_ADMIT_COALESCE_US="${ADMIT_COALESCE_US:-25000}" \
+        HF2Q_CROSS_SLOT_ADMIT="$CROSS_SLOT_ADMIT" \
+        HF2Q_ADMIT_COALESCE_US="$ADMIT_COALESCE_US" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
@@ -187,11 +205,12 @@ if [[ -f "$MMPROJ" ]]; then
             --default-repetition-penalty "${REP_PENALTY:-1.05}"
 else
     exec env \
+        HF2Q_Q5K_CANONICAL_Q4X4="$HF2Q_Q5K_CANONICAL_Q4X4" \
         HF2Q_KV_LCP_RESUME=1 \
         HF2Q_KV_LCP_LONG_RESUME=1 \
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
-        HF2Q_CROSS_SLOT_ADMIT=1 \
-        HF2Q_ADMIT_COALESCE_US="${ADMIT_COALESCE_US:-25000}" \
+        HF2Q_CROSS_SLOT_ADMIT="$CROSS_SLOT_ADMIT" \
+        HF2Q_ADMIT_COALESCE_US="$ADMIT_COALESCE_US" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \

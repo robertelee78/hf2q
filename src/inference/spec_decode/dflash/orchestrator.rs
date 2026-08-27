@@ -1420,6 +1420,12 @@ mod tests {
             DFlashModelTensors::upload(exec.device(), &drafter_cfg, &drafter_weights)
                 .expect("drafter GPU upload")
         };
+        let drafter_bf16 = drafter_tensors
+            .native_bf16_matrices(8)
+            .expect("inventory target + drafter BF16 routes");
+        target
+            .activate_native_routes(&mut gpu, &drafter_bf16)
+            .expect("activate target + drafter native routes");
 
         // Allocate drafter KV cache.  The cache caps total ctx the drafter
         // can absorb across rounds; for max_new_tokens=16 + ~10 prompt
@@ -1693,6 +1699,12 @@ mod tests {
             DFlashModelTensors::upload(exec.device(), &drafter_cfg, &drafter_weights)
                 .expect("drafter upload")
         };
+        let drafter_bf16 = drafter_tensors
+            .native_bf16_matrices(8)
+            .expect("inventory target + drafter BF16 routes");
+        target
+            .activate_native_routes(&mut gpu, &drafter_bf16)
+            .expect("activate target + drafter native routes");
         let drafter_cache_cap: u32 = 4096;
         let mut drafter_cache = {
             let (exec, _reg) = gpu.split();

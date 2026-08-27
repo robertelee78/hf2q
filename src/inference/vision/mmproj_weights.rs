@@ -1,10 +1,10 @@
 //! mmproj GGUF weight loader (ADR-005 Phase 2c, Task #15 iter 31).
 //!
-//! Reads every required tensor from a parsed `GgufFile` onto the Metal
-//! device as F32 buffers, dequantizing Q-type tensors on the CPU first
-//! via `mlx_native::gguf::GgufFile::load_tensor_f32`. The produced
-//! `LoadedMmprojWeights` holds one `MlxBuffer` per tensor keyed by its
-//! GGUF name (e.g. `"v.patch_embd.weight"`).
+//! Maps every required tensor from a parsed `GgufFile` into Metal without
+//! changing its stored representation. Matrix weights have role-typed
+//! [`MlxQWeight`] ownership; F32 runtime state has a separate role. The
+//! `MlxBuffer` map is a zero-copy source/state index; production matrix
+//! execution resolves only through the typed matrix map.
 //!
 //! # Sequencing vs iter 30's validator
 //!
@@ -15,71 +15,289 @@
 //! error message specific (missing list) rather than a generic
 //! "tensor not found" from mid-load.
 //!
-//! # GPU cost
-//!
-//! Gemma 4 vision tower ≈ 400 MB of F32 after dequant (221 tensors).
-//! The load sequentially dispatches a small allocation per tensor;
-//! total time on M5 Max ≈ 150-300ms for a cold-page-cache load of the
-//! Gemma 4 mmproj. Deliberately NOT parallelized: mlx-native's
-//! `load_tensor_f32` serializes through the GGUF `BufReader` mutex,
-//! and the cost is already dominated by the page-cache fill rather
-//! than CPU dequant.
-//!
-//! # Not in this iter
-//!
-//! - Handler wiring. The loader is usable in isolation; the
-//!   `process_multimodal_content` short-circuit at 501 is unchanged.
-//!   iter 32+ threads the loaded weights through `patch_embed_forward`
-//!   etc. as the ViT forward pass ports block-by-block.
-//! - Lazy tensor loading. Every required tensor is loaded eagerly at
-//!   `load()` time. A future iter can add a per-layer lazy mode if a
-//!   memory-constrained deployment needs it.
+//! Physical storage accounting is allocation-aware: all tensor views into one
+//! mapped Metal segment count that segment exactly once, and fused-QKV aliases
+//! never add storage bytes.
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
-use mlx_native::gguf::GgufFile;
-use mlx_native::{MlxBuffer, MlxDevice};
-
-// W59 ADR-005 Phase 2c iter-128: route F16-stored mmproj tensors through
-// `gguf.load_tensor` (native dtype-preserving) instead of
-// `gguf.load_tensor_f32` (CPU-dequant to F32). Every Gemma 4 ViT weight
-// is GGML F16 in storage; pre-iter-128 the load path dequantized to F32
-// at upload, then `vit_linear_gpu` re-cast F32→BF16 inside the matmul,
-// costing 8x the per-element rounding budget vs peer's F16 staging
-// (W58 iter-127 numerical bisect, ADR-005 iter-127 entry).
-//
-// This module uses `mlx_native::gguf::tensor_info(name).ggml_type` to
-// gate the load branch — F16 tensors keep their native `DType::F16`
-// MlxBuffer, every other type still dequants to F32 (norms, embeddings,
-// scalars, and any non-F16 weight a future producer might emit).
-//
-// `vit_linear_gpu` reads the resulting buffer's `dtype()` and dispatches
-// the matching tensor-core kernel:
-//   - DType::F16  -> mlx_native::dense_matmul_f16_f32_tensor (NEW, 0.4.8)
-//   - DType::BF16 -> existing dense_matmul_bf16_f32_tensor
-//   - DType::F32  -> existing F32->BF16 cast + BF16 matmul (legacy path,
-//                    kept for non-F16-stored weight types).
-//
-// Dispatch is determined by the buffer's storage dtype — natural,
-// deterministic, no env-gated fallback (per the iter-128 prompt
-// constraint and `feedback_no_shortcuts.md`).
-use mlx_native::GgmlType;
+use mlx_native::gguf::{GgufFile, TensorInfo};
+use mlx_native::{DType, GgmlType, MlxBuffer, MlxDevice};
 
 use super::mmproj::{vit_layer_tensor, MmprojConfig};
+use crate::serve::forward_mlx_shared::{native_gguf_matrix_bytes, MlxQWeight};
 
-/// Collection of mmproj tensors loaded onto a Metal device as F32.
+/// Runtime role of one mmproj GGUF tensor.
+///
+/// Matrices retain their source codec and are eligible for native matrix
+/// dispatch. The admitted stored formats are F32, F16, BF16, Q4_0, Q5_0,
+/// Q8_0, Q4_K, Q5_K, and Q6_K. F32 state is intentionally not admitted
+/// through matrix kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmprojTensorRole {
+    Matrix,
+    F32State,
+}
+
+/// Allocation-aware storage receipt for one loaded mmproj generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MmprojStorageAccounting {
+    pub source_tensor_count: usize,
+    pub source_matrix_count: usize,
+    pub source_f32_state_count: usize,
+    pub alias_view_count: usize,
+    pub unique_backing_allocations: usize,
+    pub mapped_backing_bytes: u64,
+    pub anonymous_backing_bytes: u64,
+    pub source_logical_bytes: u64,
+    pub matrix_logical_bytes: u64,
+    pub f32_state_logical_bytes: u64,
+}
+
+impl MmprojStorageAccounting {
+    pub fn total_backing_bytes(self) -> Result<u64> {
+        self.mapped_backing_bytes
+            .checked_add(self.anonymous_backing_bytes)
+            .ok_or_else(|| anyhow!("mmproj backing-byte accounting overflow"))
+    }
+}
+
+fn classify_mmproj_tensor_role(name: &str) -> Result<MmprojTensorRole> {
+    let is_scalar_bound = ["input_min", "input_max", "output_min", "output_max"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix));
+    let is_f32_state = crate::models::vit::convert::vit_emission_is_f32(name)
+        || matches!(name, "v.std_bias" | "v.std_scale")
+        || is_scalar_bound;
+    if is_f32_state {
+        return Ok(MmprojTensorRole::F32State);
+    }
+    if name.ends_with(".weight") || name.ends_with(".weight.1") {
+        return Ok(MmprojTensorRole::Matrix);
+    }
+    Err(anyhow!(
+        "mmproj tensor '{name}' has no admitted Matrix or F32State role"
+    ))
+}
+
+fn block_alias_suffix(suffix: &str) -> Option<&'static str> {
+    match suffix {
+        "attn_output.weight" => Some("attn_out.weight"),
+        "attn_output.bias" => Some("attn_out.bias"),
+        "attn_out.weight" => Some("attn_output.weight"),
+        "attn_out.bias" => Some("attn_output.bias"),
+        "post_ffw_norm.weight" => Some("ffn_post_norm.weight"),
+        "post_ffw_norm.bias" => Some("ffn_post_norm.bias"),
+        "ffn_post_norm.weight" => Some("post_ffw_norm.weight"),
+        "ffn_post_norm.bias" => Some("post_ffw_norm.bias"),
+        _ => None,
+    }
+}
+
+fn checked_shape_elements(info: &TensorInfo) -> Result<usize> {
+    anyhow::ensure!(
+        !info.shape.is_empty(),
+        "mmproj tensor '{}' must not be scalar-rank metadata",
+        info.name
+    );
+    info.shape.iter().try_fold(1usize, |product, dimension| {
+        anyhow::ensure!(
+            *dimension > 0,
+            "mmproj tensor '{}' has a zero dimension in {:?}",
+            info.name,
+            info.shape
+        );
+        product
+            .checked_mul(*dimension)
+            .ok_or_else(|| anyhow!("mmproj tensor '{}' shape product overflow", info.name))
+    })
+}
+
+/// Return the exact logical matrix view for one admitted matrix tensor.
+/// Rank > 2 flattening is limited to the two contiguous patch-convolution
+/// weights whose contract is `[N, C, ...] -> [N, K]`.
+fn matrix_shape(info: &TensorInfo) -> Result<(usize, usize)> {
+    anyhow::ensure!(
+        info.shape.len() >= 2,
+        "mmproj matrix '{}' must have rank >= 2, got {:?}",
+        info.name,
+        info.shape
+    );
+    if info.shape.len() == 2 {
+        return Ok((info.shape[0], info.shape[1]));
+    }
+    anyhow::ensure!(
+        matches!(
+            info.name.as_str(),
+            "v.patch_embd.weight" | "v.patch_embd.weight.1"
+        ),
+        "mmproj matrix '{}' may not flatten rank-{} shape {:?}; only patch weights have a rank>2 matrix-view contract",
+        info.name,
+        info.shape.len(),
+        info.shape
+    );
+    let rows = info.shape[0];
+    let cols = info.shape[1..]
+        .iter()
+        .try_fold(1usize, |product, dimension| {
+            product
+                .checked_mul(*dimension)
+                .ok_or_else(|| anyhow!("mmproj patch matrix '{}' flattened K overflow", info.name))
+        })?;
+    Ok((rows, cols))
+}
+
+fn validate_mmproj_tensor_role_codec(info: &TensorInfo, role: MmprojTensorRole) -> Result<()> {
+    let elements = checked_shape_elements(info)?;
+    match role {
+        MmprojTensorRole::Matrix => {
+            let (rows, cols) = matrix_shape(info)?;
+            anyhow::ensure!(
+                rows.checked_mul(cols) == Some(elements),
+                "mmproj matrix '{}' flattened shape does not preserve element count",
+                info.name
+            );
+            let expected = native_gguf_matrix_bytes(info.ggml_type, rows, cols)?;
+            anyhow::ensure!(
+                info.byte_len == expected,
+                "mmproj matrix '{}' {:?} metadata has {} bytes, expected exactly {expected} for [{rows}, {cols}]",
+                info.name,
+                info.ggml_type,
+                info.byte_len
+            );
+        }
+        MmprojTensorRole::F32State => {
+            anyhow::ensure!(
+                info.ggml_type == GgmlType::F32,
+                "mmproj state '{}' must be stored as F32, got {:?}; no dequantization or widening fallback is allowed",
+                info.name,
+                info.ggml_type
+            );
+            let expected = elements
+                .checked_mul(DType::F32.size_of())
+                .ok_or_else(|| anyhow!("mmproj F32 state '{}' byte extent overflow", info.name))?;
+            anyhow::ensure!(
+                info.byte_len == expected,
+                "mmproj F32 state '{}' metadata has {} bytes, expected exactly {expected}",
+                info.name,
+                info.byte_len
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_tensor_roles(
+    gguf: &GgufFile,
+    names: &[&str],
+) -> Result<HashMap<String, MmprojTensorRole>> {
+    let mut roles = HashMap::with_capacity(names.len());
+    for &name in names {
+        let info = gguf
+            .tensor_info(name)
+            .ok_or_else(|| anyhow!("mmproj tensor metadata disappeared for '{name}'"))?;
+        let role = classify_mmproj_tensor_role(name)?;
+        validate_mmproj_tensor_role_codec(info, role)?;
+        roles.insert(name.to_string(), role);
+    }
+    Ok(roles)
+}
+
+fn checked_add_bytes(total: &mut u64, bytes: usize, label: &str) -> Result<()> {
+    let bytes = u64::try_from(bytes).map_err(|_| anyhow!("{label} exceeds u64"))?;
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| anyhow!("{label} accounting overflow"))?;
+    Ok(())
+}
+
+fn summarize_source_storage(
+    tensors: &HashMap<String, MlxBuffer>,
+    roles: &HashMap<String, MmprojTensorRole>,
+) -> Result<MmprojStorageAccounting> {
+    anyhow::ensure!(
+        tensors.len() == roles.len(),
+        "mmproj storage accounting requires one role per source tensor"
+    );
+    let mut storage = MmprojStorageAccounting {
+        source_tensor_count: tensors.len(),
+        ..MmprojStorageAccounting::default()
+    };
+    let mut allocations = HashSet::new();
+    for (name, buffer) in tensors {
+        let role = roles
+            .get(name)
+            .ok_or_else(|| anyhow!("mmproj storage accounting missing role for '{name}'"))?;
+        checked_add_bytes(
+            &mut storage.source_logical_bytes,
+            buffer.data_byte_len(),
+            "mmproj source logical bytes",
+        )?;
+        match role {
+            MmprojTensorRole::Matrix => {
+                storage.source_matrix_count += 1;
+                checked_add_bytes(
+                    &mut storage.matrix_logical_bytes,
+                    buffer.data_byte_len(),
+                    "mmproj matrix logical bytes",
+                )?;
+            }
+            MmprojTensorRole::F32State => {
+                storage.source_f32_state_count += 1;
+                checked_add_bytes(
+                    &mut storage.f32_state_logical_bytes,
+                    buffer.data_byte_len(),
+                    "mmproj F32-state logical bytes",
+                )?;
+            }
+        }
+        let allocation = (buffer.contents_ptr() as usize, buffer.byte_len());
+        if allocations.insert(allocation) {
+            storage.unique_backing_allocations += 1;
+            if buffer.is_file_backed() {
+                checked_add_bytes(
+                    &mut storage.mapped_backing_bytes,
+                    buffer.byte_len(),
+                    "mmproj mapped backing bytes",
+                )?;
+            } else {
+                checked_add_bytes(
+                    &mut storage.anonymous_backing_bytes,
+                    buffer.byte_len(),
+                    "mmproj anonymous backing bytes",
+                )?;
+            }
+        }
+    }
+    Ok(storage)
+}
+
+/// Collection of role-typed mmproj tensors mapped onto a Metal device.
 ///
 /// Cheap to move; cloning requires the caller to pay the GPU-alloc
 /// cost again (not implemented here — if a use case needs cheap
 /// cloning, wrap in `Arc` at the call site).
 pub struct LoadedMmprojWeights {
-    /// Keyed by the tensor's GGUF name. Values are F32 `MlxBuffer`s
-    /// with shape preserved from the source GGUF.
+    /// Zero-copy source/state index. Production matrix execution does not
+    /// consume untyped entries from this map.
     tensors: HashMap<String, MlxBuffer>,
+    /// Exact native stored-format matrices. Fused-QKV split aliases are
+    /// represented here as independent logical `MlxQWeight`s sharing the
+    /// source allocation.
+    matrix_weights: HashMap<String, MlxQWeight>,
+    /// Names admitted as F32 runtime state. Their buffers live in `tensors`.
+    f32_state_names: HashSet<String>,
+    storage: MmprojStorageAccounting,
+    /// Exact page-rounded segment sizes of the file-backed Metal mappings.
+    /// Alias views do not appear here because they retain existing segments.
+    mapped_segment_physical_bytes: Vec<u64>,
+    /// Exact physical bytes owned by this generation's primary mappings (or
+    /// by synthetic anonymous buffers in test-only constructors).
+    owned_bytes: u64,
     /// Device handle kept alive for the lifetime of the buffers.
     /// Held for RAII even though public accessors go through `tensors`.
     _device: MlxDevice,
@@ -89,107 +307,119 @@ impl std::fmt::Debug for LoadedMmprojWeights {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoadedMmprojWeights")
             .field("tensor_count", &self.tensors.len())
+            .field("matrix_count", &self.matrix_weights.len())
+            .field("f32_state_count", &self.f32_state_names.len())
+            .field("storage", &self.storage)
+            .field(
+                "mapped_segment_physical_bytes",
+                &self.mapped_segment_physical_bytes,
+            )
+            .field("owned_bytes", &self.owned_bytes)
             .finish()
     }
 }
 
 impl LoadedMmprojWeights {
-    /// Load every tensor from the GGUF file onto the supplied device
-    /// as F32. Arch-agnostic — walks `gguf.tensor_names()` and doesn't
-    /// assume a particular naming convention, so it transparently
-    /// handles both Gemma 4's SigLIP-style tower AND classic CLIP
-    /// producers. Callers should run `validate_tensor_set` + detect
-    /// `ArchProfile` first to know what the forward-pass dispatch
-    /// branch needs.
-    ///
-    /// `_cfg` is accepted but currently unused — kept in the signature
-    /// because a future lazy/tiered loader will partition tensor loads
-    /// by cfg (e.g., load only stem + first few blocks on cold start,
-    /// lazy-load remaining blocks on first request).
+    /// Validate the complete stored-format role/codec contract without
+    /// creating mmap or Metal resources.
+    pub fn validate_native_storage(gguf: &GgufFile) -> Result<()> {
+        let names = gguf.tensor_names();
+        validate_source_tensor_roles(gguf, &names).map(|_| ())
+    }
+
+    /// Map every source tensor once, validate its semantic role and codec,
+    /// then build zero-copy role-typed views. Unknown names, quantized state,
+    /// and unsupported matrix codecs fail before any runtime publication.
     pub fn load(gguf: &GgufFile, cfg: &MmprojConfig, device: MlxDevice) -> Result<Self> {
         let names = gguf.tensor_names();
+        // Preflight every semantic role, codec, shape, and byte extent before
+        // creating mmap or Metal resources. A later mapping error therefore
+        // cannot leave a partially admitted projector contract.
+        let roles = validate_source_tensor_roles(gguf, &names)?;
+        let mapped = gguf
+            .map_tensor_data(&device)
+            .map_err(|error| anyhow!("map mmproj GGUF tensor data: {error}"))?;
+        let mapped_segment_physical_bytes = mapped
+            .storage_plan()
+            .segment_physical_byte_lens()
+            .iter()
+            .map(|&bytes| u64::try_from(bytes).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        let owned_bytes = u64::try_from(mapped.physical_byte_len())?;
         let mut tensors = HashMap::with_capacity(names.len());
+        let mut matrix_weights = HashMap::with_capacity(names.len());
+        let mut f32_state_names = HashSet::with_capacity(names.len());
         for name in &names {
-            // W59 ADR-005 Phase 2c iter-128: route F16-stored tensors
-            // through `load_tensor` (native F16 MlxBuffer, no CPU
-            // dequant) so the downstream matmul can dispatch the
-            // matching mlx-native 0.4.8 F16 tensor-core kernel without
-            // a lossy F16 -> F32 -> BF16 round-trip. Every other ggml
-            // type (F32, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, I16) keeps the
-            // legacy F32-dequant path — those are non-weight tensors
-            // (norms, embeddings, scalars) where F32 is the right
-            // intermediate, OR weight types this loader doesn't yet
-            // wire to a non-BF16 kernel.
-            //
-            // GGUF tensor_info() returns None only when the lookup name
-            // doesn't exist — but we're iterating gguf.tensor_names() so
-            // every name is guaranteed present. The else-branch on
-            // tensor_info absence is defensive only; falls back to the
-            // F32 dequant path so a future GGUF format change can't
-            // silently break the loader.
-            let info = gguf.tensor_info(*name);
-            let is_f16 = info.map(|i| i.ggml_type == GgmlType::F16).unwrap_or(false);
-            let buf = if is_f16 {
-                gguf.load_tensor(*name, &device)
-                    .map_err(|e| anyhow!("mmproj load_tensor (F16-native) '{}': {e}", name))?
-            } else {
-                gguf.load_tensor_f32(*name, &device)
-                    .map_err(|e| anyhow!("mmproj load_tensor_f32 '{}': {e}", name))?
-            };
-            tensors.insert((*name).to_string(), buf);
+            let info = gguf
+                .tensor_info(name)
+                .ok_or_else(|| anyhow!("mmproj tensor metadata disappeared for '{name}'"))?;
+            let role = *roles
+                .get(*name)
+                .ok_or_else(|| anyhow!("mmproj role preflight disappeared for '{name}'"))?;
+            match role {
+                MmprojTensorRole::Matrix => {
+                    let (rows, cols) = matrix_shape(info)?;
+                    let weight =
+                        MlxQWeight::from_mapped_gguf_matrix_view(&mapped, info, rows, cols)?;
+                    tensors.insert((*name).to_string(), weight.buffer.clone());
+                    matrix_weights.insert((*name).to_string(), weight);
+                }
+                MmprojTensorRole::F32State => {
+                    let buffer = mapped
+                        .load_tensor(name)
+                        .map_err(|error| anyhow!("map mmproj F32 state '{name}': {error}"))?;
+                    anyhow::ensure!(
+                        buffer.is_file_backed()
+                            && buffer.dtype() == DType::F32
+                            && buffer.data_byte_len() == info.byte_len,
+                        "mmproj F32 state '{name}' did not retain its exact file-backed payload"
+                    );
+                    tensors.insert((*name).to_string(), buffer);
+                    f32_state_names.insert((*name).to_string());
+                }
+            }
         }
 
-        // -------------------------------------------------------------------
-        // Wedge-4c.5: fused `attn_qkv` → split `attn_q/k/v` slice views.
-        //
-        // The peer's HF converter emits Qwen3-VL's ViT QKV as a single
-        // fused tensor named `v.blk.{N}.attn_qkv.weight`
-        // (and optional `.bias`).
-        // The runtime forward consumer at vit_gpu_qwen3vl.rs requests split
-        // tensors by name (`attn_q.weight`, `attn_k.weight`, `attn_v.weight`)
-        // — so when we detect a fused tensor, we install three slice-view
-        // buffers under those split names. The slice views share the
-        // fused tensor's underlying Metal buffer; no extra copy is paid.
-        //
-        // Layout (matches the peer's fused-QKV convention):
-        //   fused weight `[3*hidden, hidden]` row-major (output dim first
-        //   per hf2q's vit_linear_gpu convention) — Q rows are
-        //   `[0..hidden][0..hidden]`, K rows `[hidden..2*hidden][0..hidden]`,
-        //   V rows `[2*hidden..3*hidden][0..hidden]`. Each slice is
-        //   exactly `hidden * hidden` contiguous floats.
-        //
-        //   fused bias `[3*hidden]` 1-D — split into three contiguous
-        //   `[hidden]` slices at offsets 0 / hidden / 2*hidden.
-        //
-        // We reject MIXED state (a block has BOTH fused AND split tensors)
-        // because the validator's mixed-state check would have already
-        // rejected at startup; this is a defensive guard against a future
-        // caller that bypasses the validator.
-        Self::install_fused_attn_qkv_slice_views(&mut tensors, cfg)?;
+        let mut storage = summarize_source_storage(&tensors, &roles)?;
+        anyhow::ensure!(
+            storage.anonymous_backing_bytes == 0
+                && storage.mapped_backing_bytes == owned_bytes
+                && storage.unique_backing_allocations == mapped_segment_physical_bytes.len(),
+            "mmproj realized mapping receipt disagrees with mapped tensor storage plan: storage={storage:?}, segments={mapped_segment_physical_bytes:?}"
+        );
+        let source_tensor_count = tensors.len();
+        Self::install_native_fused_attn_qkv_views(
+            &mut tensors,
+            &mut matrix_weights,
+            &mut f32_state_names,
+            cfg,
+        )?;
+        storage.alias_view_count = tensors
+            .len()
+            .checked_sub(source_tensor_count)
+            .ok_or_else(|| anyhow!("mmproj alias-view accounting underflow"))?;
 
         Ok(Self {
             tensors,
+            matrix_weights,
+            f32_state_names,
+            storage,
+            mapped_segment_physical_bytes,
+            owned_bytes,
             _device: device,
         })
     }
 
-    /// Detect fused `v.blk.{N}.attn_qkv.{weight,bias}` per block and
-    /// install three split-name slice views (`attn_q/k/v.{weight,bias}`)
-    /// pointing at the fused tensor's underlying Metal storage. Idempotent
-    /// for split-only mmprojs (no fused tensors to slice).
-    ///
-    /// See `LoadedMmprojWeights::load` for the layout reasoning. Reject
-    /// MIXED state loud — a single block with both fused and split is
-    /// ambiguous.
-    fn install_fused_attn_qkv_slice_views(
-        tensors: &mut HashMap<String, mlx_native::MlxBuffer>,
+    /// Install codec-aware split matrix/state aliases for fused QKV tensors.
+    /// Every alias shares the source allocation; no payload is transformed.
+    fn install_native_fused_attn_qkv_views(
+        tensors: &mut HashMap<String, MlxBuffer>,
+        matrix_weights: &mut HashMap<String, MlxQWeight>,
+        f32_state_names: &mut HashSet<String>,
         cfg: &MmprojConfig,
     ) -> Result<()> {
         let hidden = cfg.hidden_size as usize;
         if hidden == 0 {
-            // No vision tower → nothing to slice. Defensive: a zero hidden
-            // size would also break every downstream consumer; the parser
-            // already rejects this via from_gguf, but we don't re-check here.
             return Ok(());
         }
         for layer_idx in 0..cfg.num_hidden_layers as usize {
@@ -198,84 +428,137 @@ impl LoadedMmprojWeights {
             let split_q_w = vit_layer_tensor(layer_idx, "attn_q.weight");
             let split_k_w = vit_layer_tensor(layer_idx, "attn_k.weight");
             let split_v_w = vit_layer_tensor(layer_idx, "attn_v.weight");
+            let split_q_b = vit_layer_tensor(layer_idx, "attn_q.bias");
+            let split_k_b = vit_layer_tensor(layer_idx, "attn_k.bias");
+            let split_v_b = vit_layer_tensor(layer_idx, "attn_v.bias");
 
-            let has_fused_w = tensors.contains_key(&fused_w);
-            let has_split_w = tensors.contains_key(&split_q_w)
-                || tensors.contains_key(&split_k_w)
-                || tensors.contains_key(&split_v_w);
+            let has_fused_w = matrix_weights.contains_key(&fused_w);
+            let has_split_w = matrix_weights.contains_key(&split_q_w)
+                || matrix_weights.contains_key(&split_k_w)
+                || matrix_weights.contains_key(&split_v_w);
+            let has_fused_b = tensors.contains_key(&fused_b);
+            let has_split_b = tensors.contains_key(&split_q_b)
+                || tensors.contains_key(&split_k_b)
+                || tensors.contains_key(&split_v_b);
 
-            if has_fused_w && has_split_w {
+            if (has_fused_w && has_split_w) || (has_fused_b && has_split_b) {
                 return Err(anyhow!(
-                    "mmproj loader: block {layer_idx} has BOTH fused '{}' AND \
-                     split attn_q/k/v.weight tensors — refusing to mix conventions \
+                    "mmproj loader: block {layer_idx} has BOTH fused and split \
+                     attn_q/k/v tensors (fused weight '{}') — refusing to mix conventions \
                      (validator should have caught this at startup; bypassing \
                      validator is unsupported)",
                     fused_w
                 ));
             }
+            anyhow::ensure!(
+                has_fused_w || !has_fused_b,
+                "mmproj loader: block {layer_idx} has fused bias '{fused_b}' without fused weight '{fused_w}'"
+            );
             if !has_fused_w {
-                continue; // split-only block (or no QKV at all — that's a
-                          // validator job). Nothing to slice.
+                continue;
             }
 
-            // The fused-only path. Slice the weight.
-            let fused_buf = tensors
-                .get(&fused_w)
-                .expect("has_fused_w=true contract violated by tensors.get");
-            let elem_size = fused_buf.dtype().size_of();
-            let chunk_elems = hidden * hidden;
-            let chunk_bytes = chunk_elems * elem_size;
-            // Validate the fused tensor's storage is exactly 3 * chunk_bytes.
-            // Anything else means the converter wrote an off-spec shape; we
-            // refuse rather than silently slice the wrong region.
-            let expected_bytes = 3 * chunk_bytes;
-            if fused_buf.byte_len() < expected_bytes {
-                return Err(anyhow!(
-                    "mmproj loader: fused '{fused_w}' byte_len {} < expected 3*hidden*hidden*{}={} \
-                     (hidden={hidden}, dtype={:?}); converter likely wrote a wrong shape",
-                    fused_buf.byte_len(),
-                    elem_size,
-                    expected_bytes,
-                    fused_buf.dtype(),
-                ));
-            }
-            let q_w = fused_buf.slice_view(0u64, chunk_elems);
-            let k_w = fused_buf.slice_view(chunk_bytes as u64, chunk_elems);
-            let v_w = fused_buf.slice_view((2 * chunk_bytes) as u64, chunk_elems);
-            tensors.insert(split_q_w, q_w);
-            tensors.insert(split_k_w, k_w);
-            tensors.insert(split_v_w, v_w);
+            let (q_weight, k_weight, v_weight) = {
+                let fused = matrix_weights
+                    .get(&fused_w)
+                    .expect("has_fused_w=true contract violated by matrix_weights.get");
+                let expected_rows = hidden
+                    .checked_mul(3)
+                    .ok_or_else(|| anyhow!("fused QKV row count overflow"))?;
+                anyhow::ensure!(
+                    fused.info.rows == expected_rows && fused.info.cols == hidden,
+                    "mmproj loader: fused '{fused_w}' is {:?} [{}, {}], expected [3*{hidden}, {hidden}]",
+                    fused.info.ggml_dtype,
+                    fused.info.rows,
+                    fused.info.cols
+                );
+                (
+                    fused.exact_row_range(0, hidden)?,
+                    fused.exact_row_range(hidden, hidden)?,
+                    fused.exact_row_range(
+                        hidden
+                            .checked_mul(2)
+                            .ok_or_else(|| anyhow!("fused QKV V-row offset overflow"))?,
+                        hidden,
+                    )?,
+                )
+            };
+            tensors.insert(split_q_w.clone(), q_weight.buffer.clone());
+            tensors.insert(split_k_w.clone(), k_weight.buffer.clone());
+            tensors.insert(split_v_w.clone(), v_weight.buffer.clone());
+            matrix_weights.insert(split_q_w, q_weight);
+            matrix_weights.insert(split_k_w, k_weight);
+            matrix_weights.insert(split_v_w, v_weight);
 
-            // Slice the optional bias if present. Bias is 1-D `[3*hidden]`.
-            if tensors.contains_key(&fused_b) {
-                let split_q_b = vit_layer_tensor(layer_idx, "attn_q.bias");
-                let split_k_b = vit_layer_tensor(layer_idx, "attn_k.bias");
-                let split_v_b = vit_layer_tensor(layer_idx, "attn_v.bias");
+            if has_fused_b {
+                anyhow::ensure!(
+                    f32_state_names.contains(&fused_b),
+                    "mmproj loader: fused QKV bias '{fused_b}' is not admitted F32 state"
+                );
                 let fused_bias_buf = tensors
                     .get(&fused_b)
                     .expect("tensors.contains_key(&fused_b) contract violated by tensors.get");
-                let bias_elem = fused_bias_buf.dtype().size_of();
-                let bias_chunk_bytes = hidden * bias_elem;
-                let bias_expected = 3 * bias_chunk_bytes;
-                if fused_bias_buf.byte_len() < bias_expected {
-                    return Err(anyhow!(
-                        "mmproj loader: fused '{fused_b}' byte_len {} < expected 3*hidden*{}={} \
-                         (hidden={hidden}, dtype={:?})",
-                        fused_bias_buf.byte_len(),
-                        bias_elem,
-                        bias_expected,
-                        fused_bias_buf.dtype(),
-                    ));
-                }
-                let q_b = fused_bias_buf.slice_view(0u64, hidden);
-                let k_b = fused_bias_buf.slice_view(bias_chunk_bytes as u64, hidden);
-                let v_b = fused_bias_buf.slice_view((2 * bias_chunk_bytes) as u64, hidden);
-                tensors.insert(split_q_b, q_b);
-                tensors.insert(split_k_b, k_b);
-                tensors.insert(split_v_b, v_b);
+                let bias_chunk_bytes = hidden
+                    .checked_mul(DType::F32.size_of())
+                    .ok_or_else(|| anyhow!("fused QKV bias chunk byte extent overflow"))?;
+                let bias_expected = bias_chunk_bytes
+                    .checked_mul(3)
+                    .ok_or_else(|| anyhow!("fused QKV bias byte extent overflow"))?;
+                anyhow::ensure!(
+                    fused_bias_buf.dtype() == DType::F32
+                        && fused_bias_buf.shape() == [3 * hidden]
+                        && fused_bias_buf.data_byte_len() == bias_expected,
+                    "mmproj loader: fused '{fused_b}' must be exact F32 [3*{hidden}] state (shape={:?}, logical_bytes={})",
+                    fused_bias_buf.shape(),
+                    fused_bias_buf.data_byte_len()
+                );
+                let k_offset = u64::try_from(bias_chunk_bytes)
+                    .map_err(|_| anyhow!("fused QKV bias K offset exceeds u64"))?;
+                let v_offset_bytes = bias_chunk_bytes
+                    .checked_mul(2)
+                    .ok_or_else(|| anyhow!("fused QKV bias V offset overflow"))?;
+                let v_offset = u64::try_from(v_offset_bytes)
+                    .map_err(|_| anyhow!("fused QKV bias V offset exceeds u64"))?;
+                let q_bias = fused_bias_buf.slice_view(0, hidden);
+                let k_bias = fused_bias_buf.slice_view(k_offset, hidden);
+                let v_bias = fused_bias_buf.slice_view(v_offset, hidden);
+                tensors.insert(split_q_b.clone(), q_bias);
+                tensors.insert(split_k_b.clone(), k_bias);
+                tensors.insert(split_v_b.clone(), v_bias);
+                f32_state_names.insert(split_q_b);
+                f32_state_names.insert(split_k_b);
+                f32_state_names.insert(split_v_b);
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_fused_attn_qkv_slice_views(
+        tensors: &mut HashMap<String, MlxBuffer>,
+        cfg: &MmprojConfig,
+    ) -> Result<()> {
+        let mut matrix_weights = HashMap::new();
+        let mut f32_state_names = HashSet::new();
+        for (name, buffer) in tensors.iter() {
+            if name.ends_with(".bias") {
+                f32_state_names.insert(name.clone());
+            } else if name.ends_with(".weight") {
+                let [rows, cols] = buffer.shape() else {
+                    return Err(anyhow!("test matrix '{name}' must be rank 2"));
+                };
+                matrix_weights.insert(
+                    name.clone(),
+                    MlxQWeight::from_test_buffer(buffer.clone(), GgmlType::F32, *rows, *cols),
+                );
+            }
+        }
+        Self::install_native_fused_attn_qkv_views(
+            tensors,
+            &mut matrix_weights,
+            &mut f32_state_names,
+            cfg,
+        )
     }
 
     /// Load from a GGUF file path. Opens the file, creates a default
@@ -296,25 +579,45 @@ impl LoadedMmprojWeights {
         self.tensors.get(name)
     }
 
-    /// Read a tensor's contents as an owned `Vec<f32>`, regardless of
-    /// the storage dtype. Use ONLY for CPU consumers — the production
-    /// matmul path dispatches the dtype-matching tensor-core kernel
-    /// directly via `vit_linear_gpu`.
+    /// Resolve an admitted native matrix by semantic role.
+    pub fn matrix(&self, name: &str) -> Result<&MlxQWeight> {
+        self.matrix_weights
+            .get(name)
+            .ok_or_else(|| anyhow!("mmproj matrix '{name}' is absent or has a non-matrix role"))
+    }
+
+    /// Resolve admitted F32 runtime state by semantic role.
+    pub fn f32_state(&self, name: &str) -> Result<&MlxBuffer> {
+        anyhow::ensure!(
+            self.f32_state_names.contains(name),
+            "mmproj F32 state '{name}' is absent or has a non-state role"
+        );
+        self.tensors
+            .get(name)
+            .ok_or_else(|| anyhow!("mmproj F32 state index is inconsistent for '{name}'"))
+    }
+
+    pub fn storage_accounting(&self) -> MmprojStorageAccounting {
+        self.storage
+    }
+
+    pub fn owned_bytes(&self) -> u64 {
+        self.owned_bytes
+    }
+
+    pub fn mapped_segment_physical_bytes(&self) -> &[u64] {
+        &self.mapped_segment_physical_bytes
+    }
+
+    /// CPU-oracle utility for F32/F16 buffers.
     ///
-    /// W59 ADR-005 Phase 2c iter-128: with `LoadedMmprojWeights::load`
-    /// keeping F16 GGUF tensors as native F16 MlxBuffers, callers that
-    /// need an `&[f32]` view (CPU patch_embed reference, test parity
-    /// L2 distance, etc.) must explicitly convert. This helper performs
-    /// the float-narrowing only when needed; for an F32 buffer it
+    /// Callers that need an `&[f32]` view (CPU patch reference or test
+    /// parity) must explicitly convert. For an F32 buffer this helper
     /// allocates and copies, for an F16 buffer it widens via `half::f16`.
-    /// Returns `Err` for non-{F32,F16} dtypes (caller must handle
-    /// quant/U8 storage, which currently doesn't appear on the mmproj
-    /// load path).
+    /// It fails closed for BF16 and packed matrices. Production request
+    /// forward code does not call it and uses native stored-format dispatch.
     ///
-    /// Cost: O(N) heap alloc + per-element widen. The Gemma 4 mmproj's
-    /// largest single tensor is `v.patch_embd.weight` at 884,736 f16
-    /// elements ≈ 3.5 MB allocation; the SigLIP CPU patch_embed call
-    /// site does this once per image. Acceptable.
+    /// Cost: O(N) heap allocation plus any F16 widening.
     ///
     /// # Errors
     ///
@@ -350,6 +653,11 @@ impl LoadedMmprojWeights {
     pub fn empty(device: MlxDevice) -> Self {
         Self {
             tensors: HashMap::new(),
+            matrix_weights: HashMap::new(),
+            f32_state_names: HashSet::new(),
+            storage: MmprojStorageAccounting::default(),
+            mapped_segment_physical_bytes: Vec::new(),
+            owned_bytes: 0,
             _device: device,
         }
     }
@@ -357,11 +665,83 @@ impl LoadedMmprojWeights {
     /// Test-only: build a `LoadedMmprojWeights` from a pre-populated
     /// tensor map. Used by parity tests that synthesize block weights
     /// in-process rather than load a real GGUF (which would require a
-    /// fixture file on disk and the full 400 MB dequant cost).
+    /// fixture file and its mapped Metal storage).
     #[cfg(test)]
     pub fn from_tensors_for_test(tensors: HashMap<String, MlxBuffer>, device: MlxDevice) -> Self {
+        let mut roles = HashMap::with_capacity(tensors.len());
+        let mut matrix_weights = HashMap::with_capacity(tensors.len());
+        let mut f32_state_names = HashSet::with_capacity(tensors.len());
+        for (name, buffer) in &tensors {
+            if classify_mmproj_tensor_role(name).ok() == Some(MmprojTensorRole::Matrix) {
+                let shape = buffer.shape();
+                let (rows, cols) = if shape.len() == 2 {
+                    (shape[0], shape[1])
+                } else if matches!(
+                    name.as_str(),
+                    "v.patch_embd.weight" | "v.patch_embd.weight.1"
+                ) && shape.len() > 2
+                {
+                    (shape[0], shape[1..].iter().copied().product())
+                } else {
+                    panic!("synthetic mmproj matrix '{name}' has invalid shape {shape:?}");
+                };
+                let codec = match buffer.dtype() {
+                    DType::F32 => GgmlType::F32,
+                    DType::F16 => GgmlType::F16,
+                    DType::BF16 => GgmlType::BF16,
+                    other => panic!(
+                        "synthetic mmproj matrix '{name}' has ambiguous dtype {other:?}; construct its MlxQWeight explicitly"
+                    ),
+                };
+                roles.insert(name.clone(), MmprojTensorRole::Matrix);
+                matrix_weights.insert(
+                    name.clone(),
+                    MlxQWeight::from_test_buffer(buffer.clone(), codec, rows, cols),
+                );
+            } else {
+                roles.insert(name.clone(), MmprojTensorRole::F32State);
+                f32_state_names.insert(name.clone());
+            }
+        }
+        let storage = summarize_source_storage(&tensors, &roles)
+            .expect("synthetic mmproj storage accounting must not overflow");
+        let owned_bytes = storage
+            .total_backing_bytes()
+            .expect("synthetic mmproj backing bytes must not overflow");
         Self {
             tensors,
+            matrix_weights,
+            f32_state_names,
+            storage,
+            mapped_segment_physical_bytes: Vec::new(),
+            owned_bytes,
+            _device: device,
+        }
+    }
+
+    /// Test-only realized-storage receipt without allocating a production
+    /// matrix. This lets serving tests mutate admission totals/topology while
+    /// keeping production construction restricted to real mapped resources.
+    #[cfg(test)]
+    pub(crate) fn empty_with_mapped_storage_for_test(
+        device: MlxDevice,
+        mapped_segment_physical_bytes: Vec<u64>,
+    ) -> Self {
+        let owned_bytes = mapped_segment_physical_bytes
+            .iter()
+            .try_fold(0u64, |total, &bytes| total.checked_add(bytes))
+            .expect("synthetic mapped storage bytes must not overflow");
+        Self {
+            tensors: HashMap::new(),
+            matrix_weights: HashMap::new(),
+            f32_state_names: HashSet::new(),
+            storage: MmprojStorageAccounting {
+                unique_backing_allocations: mapped_segment_physical_bytes.len(),
+                mapped_backing_bytes: owned_bytes,
+                ..MmprojStorageAccounting::default()
+            },
+            mapped_segment_physical_bytes,
+            owned_bytes,
             _device: device,
         }
     }
@@ -388,10 +768,16 @@ impl LoadedMmprojWeights {
             .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_PATCH_EMBD))
     }
 
+    pub fn patch_embd_matrix(&self) -> Result<&MlxQWeight> {
+        self.matrix(super::mmproj::TENSOR_PATCH_EMBD)
+    }
+
+    pub fn patch_embd_matrix_1(&self) -> Result<&MlxQWeight> {
+        self.matrix("v.patch_embd.weight.1")
+    }
+
     pub fn position_embd_weight(&self) -> Result<&MlxBuffer> {
-        self.tensors
-            .get(super::mmproj::TENSOR_POS_EMBD)
-            .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_POS_EMBD))
+        self.f32_state(super::mmproj::TENSOR_POS_EMBD)
     }
 
     /// Read the gemma4v dual position-embed table as a typed
@@ -445,10 +831,10 @@ impl LoadedMmprojWeights {
         // Buffer-element-count cross-check: 2 * pos_size * hidden f32s.
         let expected_bytes =
             2usize * (pos_size as usize) * (hidden as usize) * std::mem::size_of::<f32>();
-        if buf.byte_len() < expected_bytes {
+        if buf.data_byte_len() != expected_bytes {
             return Err(anyhow!(
-                "v.position_embd.weight: byte_len {} < expected {} (2 * {} * {} * 4)",
-                buf.byte_len(),
+                "v.position_embd.weight: logical byte extent {} != expected {} (2 * {} * {} * 4)",
+                buf.data_byte_len(),
                 expected_bytes,
                 pos_size,
                 hidden
@@ -458,9 +844,7 @@ impl LoadedMmprojWeights {
     }
 
     pub fn post_ln_weight(&self) -> Result<&MlxBuffer> {
-        self.tensors
-            .get(super::mmproj::TENSOR_POST_LN_WEIGHT)
-            .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_POST_LN_WEIGHT))
+        self.f32_state(super::mmproj::TENSOR_POST_LN_WEIGHT)
     }
 
     /// Per-block tensor accessor.
@@ -486,17 +870,7 @@ impl LoadedMmprojWeights {
             return Ok(b);
         }
         // Try the legacy/canonical alias.
-        let alias_suffix: Option<&str> = match suffix {
-            "attn_output.weight" => Some("attn_out.weight"),
-            "attn_output.bias" => Some("attn_out.bias"),
-            "attn_out.weight" => Some("attn_output.weight"),
-            "attn_out.bias" => Some("attn_output.bias"),
-            "post_ffw_norm.weight" => Some("ffn_post_norm.weight"),
-            "post_ffw_norm.bias" => Some("ffn_post_norm.bias"),
-            "ffn_post_norm.weight" => Some("post_ffw_norm.weight"),
-            "ffn_post_norm.bias" => Some("post_ffw_norm.bias"),
-            _ => None,
-        };
+        let alias_suffix = block_alias_suffix(suffix);
         if let Some(alt) = alias_suffix {
             let alt_key = vit_layer_tensor(layer_idx, alt);
             if let Some(b) = self.tensors.get(&alt_key) {
@@ -504,6 +878,40 @@ impl LoadedMmprojWeights {
             }
         }
         Err(anyhow!("mmproj missing '{}'", key))
+    }
+
+    pub fn block_matrix(&self, layer_idx: usize, suffix: &str) -> Result<&MlxQWeight> {
+        let key = vit_layer_tensor(layer_idx, suffix);
+        if let Some(weight) = self.matrix_weights.get(&key) {
+            return Ok(weight);
+        }
+        if let Some(alias) = block_alias_suffix(suffix) {
+            let alias_key = vit_layer_tensor(layer_idx, alias);
+            if let Some(weight) = self.matrix_weights.get(&alias_key) {
+                return Ok(weight);
+            }
+        }
+        Err(anyhow!(
+            "mmproj matrix '{}' is absent or has a non-matrix role",
+            key
+        ))
+    }
+
+    pub fn block_f32_state(&self, layer_idx: usize, suffix: &str) -> Result<&MlxBuffer> {
+        let key = vit_layer_tensor(layer_idx, suffix);
+        if let Ok(state) = self.f32_state(&key) {
+            return Ok(state);
+        }
+        if let Some(alias) = block_alias_suffix(suffix) {
+            let alias_key = vit_layer_tensor(layer_idx, alias);
+            if let Ok(state) = self.f32_state(&alias_key) {
+                return Ok(state);
+            }
+        }
+        Err(anyhow!(
+            "mmproj F32 state '{}' is absent or has a non-state role",
+            key
+        ))
     }
 
     /// Projector head weight tensor.
@@ -534,10 +942,31 @@ impl LoadedMmprojWeights {
         ))
     }
 
+    pub fn mm_0_matrix(&self) -> Result<&MlxQWeight> {
+        if let Some(weight) = self.matrix_weights.get(super::mmproj::TENSOR_MM_0_WEIGHT) {
+            return Ok(weight);
+        }
+        if let Some(weight) = self
+            .matrix_weights
+            .get(super::mmproj::TENSOR_MM_INPUT_PROJECTION_WEIGHT)
+        {
+            return Ok(weight);
+        }
+        Err(anyhow!(
+            "mmproj matrix missing '{}' (and gemma4v fallback '{}')",
+            super::mmproj::TENSOR_MM_0_WEIGHT,
+            super::mmproj::TENSOR_MM_INPUT_PROJECTION_WEIGHT,
+        ))
+    }
+
     pub fn mm_2_weight(&self) -> Result<&MlxBuffer> {
         self.tensors
             .get(super::mmproj::TENSOR_MM_2_WEIGHT)
             .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_MM_2_WEIGHT))
+    }
+
+    pub fn mm_2_matrix(&self) -> Result<&MlxQWeight> {
+        self.matrix(super::mmproj::TENSOR_MM_2_WEIGHT)
     }
 
     // -----------------------------------------------------------------------
@@ -557,7 +986,7 @@ impl LoadedMmprojWeights {
     // -----------------------------------------------------------------------
 
     fn read_scalar_f32(&self, name: &str) -> Option<f32> {
-        let buf = self.tensors.get(name)?;
+        let buf = self.f32_state(name).ok()?;
         let slice = buf.as_slice::<f32>().ok()?;
         // Defensive: clamp scalars are 1-element. If we ever load a
         // mis-shaped sibling (e.g. converter wrote a vector), reject
@@ -630,6 +1059,338 @@ mod tests {
     const GEMMA4_MMPROJ_PATH: &str =
         "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf";
 
+    fn info(name: &str, shape: Vec<usize>, ggml_type: GgmlType, byte_len: usize) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            shape,
+            ggml_type,
+            offset: 0,
+            byte_len,
+        }
+    }
+
+    #[test]
+    fn role_classifier_separates_native_matrices_from_f32_state() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for name in [
+            "v.patch_embd.bias",
+            "v.position_embd.weight",
+            "v.blk.0.ln1.weight",
+            "v.blk.0.attn_norm.weight",
+            "v.blk.0.attn_q_norm.weight",
+            "v.blk.0.attn_k_norm.weight",
+            "v.blk.0.attn_post_norm.weight",
+            "v.deepstack.7.norm.weight",
+            "v.std_bias",
+            "v.std_scale",
+            "mm.input_norm.weight",
+            "mm.input_projection.input_min",
+        ] {
+            assert_eq!(
+                classify_mmproj_tensor_role(name).expect("known F32 state"),
+                MmprojTensorRole::F32State,
+                "{name}"
+            );
+        }
+        for name in [
+            "v.patch_embd.weight",
+            "v.patch_embd.weight.1",
+            "v.blk.0.attn_qkv.weight",
+            "v.blk.0.ffn_up.weight",
+            "v.deepstack.7.fc1.weight",
+            "mm.0.weight",
+        ] {
+            assert_eq!(
+                classify_mmproj_tensor_role(name).expect("known matrix"),
+                MmprojTensorRole::Matrix,
+                "{name}"
+            );
+        }
+        assert!(classify_mmproj_tensor_role("v.future.untyped_payload").is_err());
+    }
+
+    #[test]
+    fn matrix_codec_admission_is_exact_and_fail_closed() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for (codec, cols) in [
+            (GgmlType::F32, 7usize),
+            (GgmlType::F16, 7),
+            (GgmlType::BF16, 7),
+            (GgmlType::Q4_0, 32),
+            (GgmlType::Q5_0, 32),
+            (GgmlType::Q8_0, 32),
+            (GgmlType::Q4_K, 256),
+            (GgmlType::Q5_K, 256),
+            (GgmlType::Q6_K, 256),
+        ] {
+            let bytes = native_gguf_matrix_bytes(codec, 3, cols).expect("admitted codec bytes");
+            validate_mmproj_tensor_role_codec(
+                &info("v.blk.0.ffn_up.weight", vec![3, cols], codec, bytes),
+                MmprojTensorRole::Matrix,
+            )
+            .unwrap_or_else(|error| panic!("{codec:?} must be admitted: {error}"));
+        }
+
+        let unsupported = info("v.blk.0.ffn_up.weight", vec![3, 256], GgmlType::I16, 1);
+        let error = validate_mmproj_tensor_role_codec(&unsupported, MmprojTensorRole::Matrix)
+            .expect_err("unsupported matrix codec must fail closed");
+        assert!(format!("{error}").contains("not admitted"));
+
+        let quantized_state = info("v.blk.0.ln1.weight", vec![256], GgmlType::Q4_0, 144);
+        let error = validate_mmproj_tensor_role_codec(&quantized_state, MmprojTensorRole::F32State)
+            .expect_err("quantized runtime state must fail closed");
+        assert!(format!("{error}").contains("must be stored as F32"));
+
+        let exact = native_gguf_matrix_bytes(GgmlType::Q5_K, 3, 256).unwrap();
+        let oversized = info(
+            "v.blk.0.ffn_up.weight",
+            vec![3, 256],
+            GgmlType::Q5_K,
+            exact + 1,
+        );
+        assert!(validate_mmproj_tensor_role_codec(&oversized, MmprojTensorRole::Matrix).is_err());
+    }
+
+    #[test]
+    fn rank_greater_than_two_flattens_only_patch_matrices() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for (codec, tail) in [
+            (GgmlType::F32, vec![2usize, 2, 2]),
+            (GgmlType::F16, vec![2, 2, 2]),
+            (GgmlType::BF16, vec![2, 2, 2]),
+            (GgmlType::Q4_0, vec![2, 2, 8]),
+            (GgmlType::Q5_0, vec![2, 2, 8]),
+            (GgmlType::Q8_0, vec![2, 2, 8]),
+            (GgmlType::Q4_K, vec![2, 8, 16]),
+            (GgmlType::Q5_K, vec![2, 8, 16]),
+            (GgmlType::Q6_K, vec![2, 8, 16]),
+        ] {
+            let rows = 3usize;
+            let cols = tail.iter().product::<usize>();
+            let mut shape = vec![rows];
+            shape.extend(tail);
+            let bytes = native_gguf_matrix_bytes(codec, rows, cols).unwrap();
+            let patch = info("v.patch_embd.weight", shape, codec, bytes);
+            assert_eq!(matrix_shape(&patch).unwrap(), (rows, cols), "{codec:?}");
+            validate_mmproj_tensor_role_codec(&patch, MmprojTensorRole::Matrix)
+                .unwrap_or_else(|error| panic!("{codec:?} patch view: {error}"));
+        }
+
+        let projection = info(
+            "v.blk.0.attn_q.weight",
+            vec![2, 32, 32],
+            GgmlType::F16,
+            2 * 32 * 32 * 2,
+        );
+        let error = matrix_shape(&projection).expect_err("non-patch rank-3 must fail");
+        assert!(format!("{error}").contains("only patch weights"));
+    }
+
+    #[test]
+    fn production_loader_has_no_transform_fallback_canary() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let source = include_str!("mmproj_weights.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        assert!(production.contains(".map_tensor_data("));
+        assert!(production.contains("from_mapped_gguf_matrix_view"));
+        assert!(!production.contains(".load_tensor_f32("));
+        assert!(!production.contains("dispatch_dequant"));
+    }
+
+    #[test]
+    fn production_vision_source_wiring_smoke_has_native_role_typed_callsites() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing source start marker: {start}"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing source end marker: {end}"))
+                .0
+        }
+
+        let vit = include_str!("vit_gpu.rs");
+        let linear = between(
+            vit,
+            "pub(crate) fn vit_linear_gpu",
+            "fn vit_patch_embed_native_gpu",
+        );
+        for token in ["GgmlType::F32", "GgmlType::F16", "GgmlType::BF16"] {
+            assert!(linear.contains(token), "missing scalar route {token}");
+        }
+        for token in [
+            "GgmlType::Q4_0",
+            "GgmlType::Q5_0",
+            "GgmlType::Q8_0",
+            "GgmlType::Q4_K",
+            "GgmlType::Q5_K",
+            "GgmlType::Q6_K",
+        ] {
+            assert!(linear.contains(token), "missing quantized route {token}");
+        }
+        assert!(linear.contains("quantized_matmul_ggml"));
+        assert!(!linear.contains("F32ToBF16"));
+        assert!(!linear.contains("dispatch_dequant"));
+
+        let classic = between(
+            vit,
+            "pub fn apply_vit_full_forward_gpu",
+            "pub fn warmup_vit_gpu",
+        );
+        assert!(classic.contains("patch_embd_matrix"));
+        assert!(classic.contains("mm_0_matrix"));
+        assert!(classic.contains("f32_state(\"v.std_bias\")"));
+        assert!(!classic.contains("tensor_as_f32_owned"));
+        assert!(!classic.contains("patch_embed_cpu"));
+
+        let classic_block = between(
+            vit,
+            "pub fn apply_vit_block_forward_gpu",
+            "pub fn apply_vit_blocks_loop_gpu",
+        );
+        assert!(classic_block.contains(".block_matrix("));
+        assert!(classic_block.contains(".block_f32_state("));
+        assert!(!classic_block.contains(".block_tensor("));
+
+        let gemma_block = between(
+            vit,
+            "pub fn gemma4v_block_forward_gpu",
+            "pub(crate) fn gemma4v_clippable_linear_gpu",
+        );
+        assert!(gemma_block.contains(".block_matrix("));
+        assert!(gemma_block.contains(".block_f32_state("));
+        assert!(!gemma_block.contains(".block_tensor("));
+
+        let gemma_forward = between(
+            vit,
+            "pub fn gemma4v_apply_full_forward_gpu",
+            "#[cfg(test)]\nmod tests",
+        );
+        assert!(gemma_forward.contains(".patch_embd_matrix("));
+        assert!(gemma_forward.contains(".mm_0_matrix("));
+        assert!(!gemma_forward.contains(".patch_embd_weight("));
+        assert!(!gemma_forward.contains(".mm_0_weight("));
+        assert!(!gemma_forward.contains("tensor_as_f32_owned"));
+
+        let qwen = include_str!("vit_gpu_qwen.rs");
+        let stage_a = between(
+            qwen,
+            "fn qwen_vision_stage_a_dispatch",
+            "pub(crate) fn qwen_vision_resize_position_embeddings_bilinear",
+        );
+        assert!(stage_a.contains("weight_0: &MlxQWeight"));
+        assert!(stage_a.contains("weight_1: &MlxQWeight"));
+        assert!(stage_a.contains("vit_linear_gpu"));
+        assert!(!stage_a.contains("weight_0: &[f32]"));
+        assert!(!stage_a.contains("alloc weight_0"));
+        assert!(!stage_a.contains("tensor_as_f32_owned"));
+
+        let qwen_block = between(
+            qwen,
+            "fn apply_qwen_vision_block_forward_gpu",
+            "fn apply_qwen_vision_deepstack_head_gpu",
+        );
+        assert!(qwen_block.contains(".block_matrix("));
+        assert!(qwen_block.contains(".block_f32_state("));
+        assert!(!qwen_block.contains(".block_tensor("));
+
+        let qwen_forward = between(
+            qwen,
+            "pub fn compute_vision_embeddings_gpu_qwen",
+            "#[cfg(test)]\nmod tests",
+        );
+        assert!(qwen_forward.contains("patch_embd_matrix"));
+        assert!(qwen_forward.contains("patch_embd_matrix_1"));
+        assert!(!qwen_forward.contains("tensor_as_f32_owned"));
+        assert!(!qwen_forward.contains("patch_embd_f32"));
+    }
+
+    #[test]
+    fn backing_storage_accounting_deduplicates_aliases() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let base = device
+            .alloc_buffer(64, DType::F32, vec![16])
+            .expect("base allocation");
+        let allocation_bytes = base.byte_len();
+        let mut tensors = HashMap::new();
+        tensors.insert("v.blk.0.attn_q.weight".to_string(), base.clone());
+        tensors.insert("v.blk.0.attn_k.weight".to_string(), base.slice_view(16, 4));
+        tensors.insert("v.blk.0.attn_v.weight".to_string(), base.slice_view(32, 4));
+        let roles = tensors
+            .keys()
+            .map(|name| (name.clone(), MmprojTensorRole::Matrix))
+            .collect();
+        let storage = summarize_source_storage(&tensors, &roles).expect("storage receipt");
+        assert_eq!(storage.unique_backing_allocations, 1);
+        assert_eq!(storage.anonymous_backing_bytes, allocation_bytes as u64);
+        assert_eq!(storage.mapped_backing_bytes, 0);
+        assert_eq!(storage.source_logical_bytes, (64 + 16 + 16) as u64);
+    }
+
+    #[test]
+    fn fused_qkv_native_views_are_codec_aware_and_zero_copy() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        for (codec, hidden, dtype) in [
+            (GgmlType::F32, 8usize, DType::F32),
+            (GgmlType::F16, 8, DType::F16),
+            (GgmlType::BF16, 8, DType::BF16),
+            (GgmlType::Q4_0, 32, DType::U8),
+            (GgmlType::Q5_0, 32, DType::U8),
+            (GgmlType::Q8_0, 32, DType::U8),
+            (GgmlType::Q4_K, 256, DType::U8),
+            (GgmlType::Q5_K, 256, DType::U8),
+            (GgmlType::Q6_K, 256, DType::U8),
+        ] {
+            let rows = hidden * 3;
+            let bytes = native_gguf_matrix_bytes(codec, rows, hidden).unwrap();
+            let elements = bytes / dtype.size_of();
+            let buffer = device
+                .alloc_buffer(bytes, dtype, vec![elements])
+                .unwrap_or_else(|error| panic!("allocate {codec:?}: {error}"));
+            let base_ptr = buffer.contents_ptr();
+            let mut tensors =
+                HashMap::from([("v.blk.0.attn_qkv.weight".to_string(), buffer.clone())]);
+            let mut matrices = HashMap::from([(
+                "v.blk.0.attn_qkv.weight".to_string(),
+                MlxQWeight::from_test_buffer(buffer, codec, rows, hidden),
+            )]);
+            let mut state = HashSet::new();
+            let cfg = synth_qwen_vision_loader_cfg(hidden as u32, 1);
+            LoadedMmprojWeights::install_native_fused_attn_qkv_views(
+                &mut tensors,
+                &mut matrices,
+                &mut state,
+                &cfg,
+            )
+            .unwrap_or_else(|error| panic!("slice {codec:?}: {error}"));
+            let row_bytes = native_gguf_matrix_bytes(codec, 1, hidden).unwrap();
+            for (suffix, row_start) in [
+                ("attn_q.weight", 0usize),
+                ("attn_k.weight", hidden),
+                ("attn_v.weight", hidden * 2),
+            ] {
+                let alias = matrices
+                    .get(&format!("v.blk.0.{suffix}"))
+                    .unwrap_or_else(|| panic!("missing {codec:?} {suffix}"));
+                assert_eq!(alias.info.ggml_dtype, codec);
+                assert_eq!(alias.info.rows, hidden);
+                assert_eq!(alias.info.cols, hidden);
+                assert_eq!(alias.buffer.contents_ptr(), base_ptr);
+                assert_eq!(alias.buffer.byte_offset(), (row_start * row_bytes) as u64);
+                assert_eq!(
+                    alias.buffer.data_byte_len(),
+                    native_gguf_matrix_bytes(codec, hidden, hidden).unwrap()
+                );
+            }
+        }
+    }
+
     #[test]
     fn load_gemma4_mmproj_populates_arch_tensors() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
@@ -670,6 +1431,21 @@ mod tests {
             .position_embd_weight()
             .expect("position_embd_weight");
         weights.mm_0_weight().expect("mm_0_weight");
+        weights
+            .matrix(super::super::mmproj::TENSOR_PATCH_EMBD)
+            .expect("role-typed patch matrix");
+        weights
+            .f32_state(super::super::mmproj::TENSOR_POS_EMBD)
+            .expect("role-typed position state");
+        assert!(weights
+            .matrix(super::super::mmproj::TENSOR_POS_EMBD)
+            .is_err());
+        let storage = weights.storage_accounting();
+        assert_eq!(
+            storage.source_matrix_count + storage.source_f32_state_count,
+            storage.source_tensor_count
+        );
+        assert!(weights.owned_bytes() > 0);
         // post_ln + mm.2 do NOT exist in Gemma 4 mmproj.
         assert!(weights.post_ln_weight().is_err());
         assert!(weights.mm_2_weight().is_err());
@@ -694,21 +1470,59 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires HF2Q_QWEN_VISION_MMPROJ and Apple Metal"]
+    fn real_mapping_plan_equals_realized_storage_and_fused_aliases_add_no_bytes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let path = std::env::var("HF2Q_QWEN_VISION_MMPROJ")
+            .expect("set HF2Q_QWEN_VISION_MMPROJ to a fused-QKV Qwen projector");
+        let gguf = GgufFile::open(Path::new(&path)).expect("open Qwen projector");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("parse projector config");
+        let device = MlxDevice::new().expect("Metal device");
+        let plan = gguf
+            .mapped_tensor_storage_plan(device.metal_device())
+            .expect("plan mapped storage");
+        let expected_segments = plan
+            .segment_physical_byte_lens()
+            .iter()
+            .map(|&bytes| u64::try_from(bytes).expect("segment bytes fit u64"))
+            .collect::<Vec<_>>();
+        let expected_total = u64::try_from(plan.physical_byte_len()).expect("total fits u64");
+
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("map projector");
+        assert_eq!(weights.owned_bytes(), expected_total);
+        assert_eq!(
+            weights.mapped_segment_physical_bytes(),
+            expected_segments.as_slice()
+        );
+        assert!(
+            weights.storage_accounting().alias_view_count >= 3,
+            "fused QKV fixture must install at least Q/K/V aliases"
+        );
+
+        let fused = weights
+            .matrix("v.blk.0.attn_qkv.weight")
+            .expect("fused QKV matrix");
+        for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight"] {
+            let alias = weights
+                .matrix(&format!("v.blk.0.{suffix}"))
+                .unwrap_or_else(|error| panic!("missing fused alias {suffix}: {error}"));
+            assert_eq!(alias.buffer.contents_ptr(), fused.buffer.contents_ptr());
+        }
+        assert_eq!(weights.owned_bytes(), expected_total);
+    }
+
+    #[test]
     fn load_gemma4_mmproj_patch_embd_has_expected_shape_and_values() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         // `v.patch_embd.weight` in Gemma 4 is a 2D tensor [hidden,
         // 3*patch*patch] = [1152, 768] = 884,736 elements. The GGUF
         // stores it as F16 (per W58 iter-127 audit + gguf_dump.py
-        // verification); pre-iter-128 the loader dequantized to F32 at
-        // upload, post-iter-128 the loader keeps F16 native so the
-        // matmul can dispatch the mlx-native 0.4.8 F16 tensor-core
-        // kernel (8x tighter per-element rounding than BF16 staging,
-        // closes the 1.16x/block ViT cascade compound).
+        // verification). The loader retains the exact F16 file bytes so
+        // Phase 2 can dispatch the matching native matrix kernel.
         //
         // This test asserts shape (element count) AND non-trivial
         // content (non-zero patch weights) without depending on the
-        // storage dtype — works whether the loader keeps F16 native or
-        // dequantizes to F32.
+        // storage dtype.
         let path = Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
             eprintln!(
@@ -779,10 +1593,7 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Synthetic LoadedMmprojWeights with an empty tensor map — every
         // accessor should return Err naming the missing tensor.
-        let weights = LoadedMmprojWeights {
-            tensors: HashMap::new(),
-            _device: MlxDevice::new().expect("device"),
-        };
+        let weights = LoadedMmprojWeights::empty(MlxDevice::new().expect("device"));
         let err = weights.patch_embd_weight().unwrap_err();
         assert!(format!("{err}").contains("v.patch_embd.weight"));
 
@@ -799,10 +1610,7 @@ mod tests {
     #[test]
     fn empty_weights_report_len_zero_and_is_empty_true() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let weights = LoadedMmprojWeights {
-            tensors: HashMap::new(),
-            _device: MlxDevice::new().expect("device"),
-        };
+        let weights = LoadedMmprojWeights::empty(MlxDevice::new().expect("device"));
         assert_eq!(weights.len(), 0);
         assert!(weights.is_empty());
     }
@@ -810,10 +1618,7 @@ mod tests {
     #[test]
     fn get_returns_none_for_absent_tensor() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let weights = LoadedMmprojWeights {
-            tensors: HashMap::new(),
-            _device: MlxDevice::new().expect("device"),
-        };
+        let weights = LoadedMmprojWeights::empty(MlxDevice::new().expect("device"));
         assert!(weights.get("v.patch_embd.weight").is_none());
     }
 
@@ -828,10 +1633,7 @@ mod tests {
             .expect("alloc");
         let mut tensors = HashMap::new();
         tensors.insert(super::super::mmproj::TENSOR_POS_EMBD.to_string(), buf);
-        let weights = LoadedMmprojWeights {
-            tensors,
-            _device: device,
-        };
+        let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
         let err = weights.position_embd_table_3d().unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("expected 3-D"), "wrong error msg: {msg}");
@@ -846,10 +1648,7 @@ mod tests {
             .expect("alloc");
         let mut tensors = HashMap::new();
         tensors.insert(super::super::mmproj::TENSOR_POS_EMBD.to_string(), buf);
-        let weights = LoadedMmprojWeights {
-            tensors,
-            _device: device,
-        };
+        let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
         let err = weights.position_embd_table_3d().unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("first dim 2"), "wrong error msg: {msg}");
@@ -870,10 +1669,7 @@ mod tests {
             .expect("alloc");
         let mut tensors = HashMap::new();
         tensors.insert(super::super::mmproj::TENSOR_POS_EMBD.to_string(), buf);
-        let weights = LoadedMmprojWeights {
-            tensors,
-            _device: device,
-        };
+        let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
         let (buf, ps, h) = weights.position_embd_table_3d().expect("3d ok");
         assert_eq!(ps, pos_size as u32);
         assert_eq!(h, hidden as u32);
@@ -970,7 +1766,7 @@ mod tests {
     /// Build a small synthetic Qwen3-VL-style MmprojConfig that
     /// `install_fused_attn_qkv_slice_views` consumes for hidden_size +
     /// num_hidden_layers. Other fields don't affect the slice-view path.
-    fn synth_qwen3vl_loader_cfg(hidden: u32, num_layers: u32) -> MmprojConfig {
+    fn synth_qwen_vision_loader_cfg(hidden: u32, num_layers: u32) -> MmprojConfig {
         MmprojConfig {
             image_size: 32,
             patch_size: 16,
@@ -980,7 +1776,7 @@ mod tests {
             num_attention_heads: 4,
             num_hidden_layers: num_layers,
             layer_norm_eps: 1e-6,
-            projector: super::super::mmproj::ProjectorType::Qwen3VlMerger,
+            projector: super::super::mmproj::ProjectorType::QwenVisionMerger,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
             image_min_pixels: None,
@@ -1030,7 +1826,7 @@ mod tests {
         // /opt/mlx-native/src/encoder.rs:218-220
         // (`set_buffer(index, metal_buffer(), buf.byte_offset())`).
         let device = MlxDevice::new().expect("device");
-        let cfg = synth_qwen3vl_loader_cfg(4, 1);
+        let cfg = synth_qwen_vision_loader_cfg(4, 1);
         let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
         let fused_buf = alloc_f32_with(&device, 48, vec![12, 4], |i| i as f32);
         tensors.insert("v.blk.0.attn_qkv.weight".to_string(), fused_buf);
@@ -1084,7 +1880,7 @@ mod tests {
         // Q bias = [0..8] @ off 0; K bias = [8..16] @ off 32;
         // V bias = [16..24] @ off 64.
         let device = MlxDevice::new().expect("device");
-        let cfg = synth_qwen3vl_loader_cfg(8, 1);
+        let cfg = synth_qwen_vision_loader_cfg(8, 1);
         let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
         let weight_buf = alloc_f32_with(&device, 3 * 8 * 8, vec![24, 8], |i| i as f32);
         let bias_buf = alloc_f32_with(&device, 24, vec![24], |i| -(i as f32));
@@ -1121,7 +1917,7 @@ mod tests {
         // Pre-existing split tensors must pass through untouched —
         // the helper is a no-op on split-only inputs.
         let device = MlxDevice::new().expect("device");
-        let cfg = synth_qwen3vl_loader_cfg(4, 1);
+        let cfg = synth_qwen_vision_loader_cfg(4, 1);
         let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
         for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight"] {
             let key = format!("v.blk.0.{suffix}");
@@ -1145,7 +1941,7 @@ mod tests {
         // validator catches it normally; this test guards the
         // defense-in-depth check inside the loader.
         let device = MlxDevice::new().expect("device");
-        let cfg = synth_qwen3vl_loader_cfg(4, 1);
+        let cfg = synth_qwen_vision_loader_cfg(4, 1);
         let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
         tensors.insert(
             "v.blk.0.attn_qkv.weight".to_string(),
@@ -1167,13 +1963,45 @@ mod tests {
     }
 
     #[test]
+    fn install_fused_attn_qkv_rejects_mixed_or_orphan_bias_state() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = synth_qwen_vision_loader_cfg(4, 1);
+
+        let mut mixed = HashMap::new();
+        mixed.insert(
+            "v.blk.0.attn_qkv.weight".to_string(),
+            alloc_f32_with(&device, 48, vec![12, 4], |_| 0.0),
+        );
+        mixed.insert(
+            "v.blk.0.attn_qkv.bias".to_string(),
+            alloc_f32_with(&device, 12, vec![12], |_| 0.0),
+        );
+        mixed.insert(
+            "v.blk.0.attn_q.bias".to_string(),
+            alloc_f32_with(&device, 4, vec![4], |_| 0.0),
+        );
+        let error = LoadedMmprojWeights::install_fused_attn_qkv_slice_views(&mut mixed, &cfg)
+            .expect_err("mixed fused/split bias must fail closed");
+        assert!(format!("{error}").contains("BOTH fused and split"));
+
+        let mut orphan = HashMap::from([(
+            "v.blk.0.attn_qkv.bias".to_string(),
+            alloc_f32_with(&device, 12, vec![12], |_| 0.0),
+        )]);
+        let error = LoadedMmprojWeights::install_fused_attn_qkv_slice_views(&mut orphan, &cfg)
+            .expect_err("fused bias without fused weight must fail closed");
+        assert!(format!("{error}").contains("without fused weight"));
+    }
+
+    #[test]
     fn install_fused_attn_qkv_rejects_undersized_fused_weight() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Fused weight that's smaller than 3*hidden*hidden floats is a
         // converter bug — slicing would silently return wrong data.
         // Reject loud.
         let device = MlxDevice::new().expect("device");
-        let cfg = synth_qwen3vl_loader_cfg(4, 1);
+        let cfg = synth_qwen_vision_loader_cfg(4, 1);
         let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
         // Allocate only 2*4*4 = 32 floats instead of 48.
         let undersized = alloc_f32_with(&device, 32, vec![8, 4], |i| i as f32);
@@ -1182,8 +2010,8 @@ mod tests {
             .expect_err("undersized fused weight must fail loud");
         let msg = format!("{err}");
         assert!(
-            msg.contains("byte_len") && msg.contains("expected"),
-            "loader error must name byte_len + expected size; got: {msg}"
+            msg.contains("fused") && msg.contains("expected"),
+            "loader error must name the fused tensor + expected shape; got: {msg}"
         );
     }
 
@@ -1194,7 +2022,7 @@ mod tests {
         // tensor. Block N's Q view points at block N's storage at
         // byte_offset 0 — distinct backing storage from block M (M≠N).
         let device = MlxDevice::new().expect("device");
-        let cfg = synth_qwen3vl_loader_cfg(4, 3);
+        let cfg = synth_qwen_vision_loader_cfg(4, 3);
         let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
         for layer_idx in 0..3 {
             let fused = alloc_f32_with(&device, 48, vec![12, 4], |i| (layer_idx * 100 + i) as f32);

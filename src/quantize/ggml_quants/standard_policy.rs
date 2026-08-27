@@ -935,7 +935,6 @@ mod tests {
             ArchName::Qwen35,
             ArchName::Qwen35Moe,
             ArchName::Qwen35MoeFull,
-            ArchName::Qwen3VlText,
             ArchName::Bert,
             ArchName::NomicBert,
             ArchName::Llama3,

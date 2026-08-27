@@ -76,27 +76,29 @@ fn gguf_bool(gguf: &mlx_native::gguf::GgufFile, key: &str) -> bool {
 /// Resolve a special-token ID from GGUF metadata, validated against
 /// the HF tokenizer's vocab. Returns `None` if absent or if the ID is
 /// out of the tokenizer's vocabulary.
-fn resolve_token_id(
+pub(crate) fn resolve_token_id(
     gguf: &mlx_native::gguf::GgufFile,
     tokenizer: &tokenizers::Tokenizer,
     metadata_key: &str,
 ) -> Option<u32> {
-    peer_special_token_id(gguf, metadata_key).and_then(|id| tokenizer.id_to_token(id).map(|_| id))
+    gguf_special_token_id(gguf, metadata_key).and_then(|id| tokenizer.id_to_token(id).map(|_| id))
 }
 
-fn peer_special_token_id(gguf: &mlx_native::gguf::GgufFile, metadata_key: &str) -> Option<u32> {
+fn gguf_special_token_id(gguf: &mlx_native::gguf::GgufFile, metadata_key: &str) -> Option<u32> {
     if let Some(id) = gguf.metadata_u32(metadata_key) {
         return Some(id);
     }
     let tokenizer_model = gguf.metadata_string("tokenizer.ggml.model")?;
-    peer_special_token_id_for_model(tokenizer_model, metadata_key)
+    gguf_special_token_id_for_model(tokenizer_model, metadata_key)
 }
 
-fn peer_special_token_id_for_model(tokenizer_model: &str, metadata_key: &str) -> Option<u32> {
+pub(crate) fn gguf_special_token_id_for_model(
+    tokenizer_model: &str,
+    metadata_key: &str,
+) -> Option<u32> {
     match (tokenizer_model, metadata_key) {
-        // Mirrors the peer's vocab defaults: for tokenizer
-        // model `gpt2`, the peer initializes both BOS and EOS to
-        // token id 11 before applying GGUF metadata overrides.
+        // The GGUF `gpt2` tokenizer convention initializes both BOS and EOS
+        // to token id 11 before applying explicit metadata overrides.
         ("gpt2", "tokenizer.ggml.bos_token_id") | ("gpt2", "tokenizer.ggml.eos_token_id") => {
             Some(11)
         }
@@ -104,8 +106,7 @@ fn peer_special_token_id_for_model(tokenizer_model: &str, metadata_key: &str) ->
     }
 }
 
-/// Tokenize a rendered prompt with the peer's `common_tokenize(...,
-/// add_special=true, parse_special=true)` semantics.
+/// Tokenize a rendered prompt with GGUF-compatible special-token semantics.
 ///
 /// See module docs for the contract.
 pub fn tokenize_with_bos_eos_from_gguf(

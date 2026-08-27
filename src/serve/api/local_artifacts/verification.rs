@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use super::{is_hex, quant_from_file_type};
+use crate::serve::multi_model::{ArtifactFileStamp, TextArtifactIdentity};
 use crate::serve::quant_select::QuantType;
 
 #[derive(Debug)]
@@ -18,6 +19,17 @@ pub struct LocalVerificationRequest<'a> {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct LocalVerificationReceipt {
     pub path: PathBuf,
+    pub sha256: String,
+    pub file_stamp: ArtifactFileStamp,
+}
+
+impl LocalVerificationReceipt {
+    pub fn text_identity(&self) -> TextArtifactIdentity {
+        TextArtifactIdentity {
+            sha256: self.sha256.clone(),
+            stamp: self.file_stamp.clone(),
+        }
+    }
 }
 
 pub(crate) struct VerifiedLocalArtifact {
@@ -67,6 +79,10 @@ pub(crate) fn verify_retained_local_artifact_with_progress(
     if !canonical.starts_with(&canonical_root) {
         bail!("local artifact escaped its configured root");
     }
+    let before_stamp = ArtifactFileStamp::inspect(&canonical)?;
+    if before_stamp.bytes() != request.bytes {
+        bail!("local artifact size changed before content verification");
+    }
     let actual_sha = opened
         .sha256_with_progress(&mut progress)
         .context("hash selected local artifact")?
@@ -83,11 +99,19 @@ pub(crate) fn verify_retained_local_artifact_with_progress(
     {
         bail!("selected local artifact GGUF quant no longer matches its hf2q authority");
     }
+    let after_stamp = ArtifactFileStamp::inspect(&canonical)?;
+    if before_stamp != after_stamp {
+        bail!("selected local artifact changed while it was being verified");
+    }
     if !opened.is_stable()? {
         bail!("selected local artifact changed while it was being verified");
     }
     Ok(VerifiedLocalArtifact {
-        receipt: LocalVerificationReceipt { path: canonical },
+        receipt: LocalVerificationReceipt {
+            path: canonical,
+            sha256: actual_sha,
+            file_stamp: after_stamp,
+        },
         retained: opened,
     })
 }

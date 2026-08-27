@@ -9,6 +9,11 @@
 > DFlash investigation. It is not current Qwen3.8 server authority. For that
 > surface, code is authoritative and ADR-044 records the accepted transaction,
 > policy, exact-artifact gates, and measured receipts.
+>
+> The historical table's “fused across all five dense quants” statement is
+> not current runtime policy. ADR-049 rev 51 records the measured removal of
+> Q5_K from hf2q fused-FFN eligibility; Q5_K now uses the faster exact separate
+> gate/up route while the other qualified fused codecs remain unchanged.
 
 - **Supersedes**:
   - ADR-013 §15 "MTP tensors and speculative draft execution" + ADR-013 P10 + ADR-013 P14 "MTP speculative-decoding execution (COMPLETE)" — the "COMPLETE" status is **inaccurate at HEAD `eab0220b`**; convert side does not exist, loader/forward have never been validated against a known-good reference, and no acceptance-rate or throughput-improvement number has ever been measured. This ADR documents the actual state and the path to genuine completion.
@@ -42,8 +47,9 @@ of `HF2Q_SPEC_DECODE=0` was dead configuration because the server worker never
 read that CLI-only variable. It was not a functioning safety gate.
 
 The live SlotAware server now reads `HF2Q_QWEN_SPECULATION=off|auto`. The
-canonical Qwen3.8 launcher selects `auto`; the bare process default remains
-`off`. Qwen3.8 auto owns two exact target-verified proposers:
+canonical Qwen3.8 launcher selects `auto`, and the bare process also defaults
+to `auto`; an explicit `off` remains the operator escape. Qwen3.8 auto owns two
+exact target-verified proposers:
 
 1. A request-local token-position history index compares the current 6-12
    token suffix exactly and proposes up to three tokens from the most recent
@@ -636,6 +642,48 @@ seq_len natively); just lift off the prefill-only orchestration. ~300-500 LOC.
 Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
+
+### Iteration 2026-08-22 — fresh short-prefill route and exact state transactions
+
+The D=256 fresh-prefill gap is executable for every row `2..=15`. Both tiled
+prefill kernels have non-finite partial-tile cases in this range, and a first
+attempt to use one batched `flash_attn_vec` dispatch was falsified at qL=5.
+The accepted bounded fallback copies the fresh K/V chunk once into a dense
+head-major scratch with fixed capacity 16, then evaluates each query through
+the proven qL=1 causal vector kernel. The persistent F32 or TQ cache is still
+written in its native representation; attention does not expand or
+dequantize that cache. Fresh rows of at least 16 tokens retain the tiled fast
+path, and non-zero-cursor verifier rows retain their existing route.
+
+Model-free gates:
+
+- `fresh_short_d256_prefill_selects_finite_vector_route`
+- `fresh_short_d256_executes_finite_exact_semantics_for_f32_and_tq_cache`
+- `fresh_short_d256_prefill_executes_without_non_finite_logits`
+
+The exhaustive qL=2..15 gate compares against an independent F32 causal-GQA
+oracle and requires finite output plus bit-identical results between F32 and
+TQ persistent-cache modes. The fallback is intentionally latency-bounded and
+correctness-first; full-model latency and full-logit parity remain hardware
+gates before a performance claim.
+
+Serving mutations now use a lightweight per-slot transaction. It records all
+target/MTP cursors and the pre-forward DeltaNet ping-pong selection. A round
+may run at most one target forward, so the previous recurrent and convolution
+bytes remain intact in the inactive buffer. Every post-mutation error in
+bounded prefill, ordinary decode, history verification, MTP K3, and coherent
+MTP warmup restores that buffer selection and rewinds cursors; appended K/V
+rows remain physically present but unobservable. Twelve injected mutation
+boundaries prove target and peer-slot state bytes plus target/MTP cursors are
+restored exactly.
+
+The same transaction boundary also covers request-local semantic state. A
+forced-reasoning cursor is advanced on a private copy and published only after
+the target decision succeeds; a target, supervision, shape, or constrained
+sampling error therefore cannot consume an uncommitted forced token. Coherent
+MTP warmup derives its next carried hidden row privately and publishes it only
+after the fallible canonical selector succeeds. KV rollback alone is not proof
+of an exact retry when either semantic value has already escaped.
 
 ### Iteration 2026-05-21 (cont. 20) — Task #94 QKVG fusion SHIPPED + parity passes, but spec gain FALSIFIED
 

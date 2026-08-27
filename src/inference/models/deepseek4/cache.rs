@@ -493,6 +493,17 @@ impl Deepseek4Cache {
         self.resident_bytes
     }
 
+    /// Exact logical Metal payload plus host control allocations owned by
+    /// this live cache. Allocator-private Metal bookkeeping is excluded.
+    pub fn owned_bytes(&self) -> u64 {
+        self.resident_bytes
+            .saturating_add(
+                (self.layers.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<LayerCache>() as u64),
+            )
+            .saturating_add(cache_plan_control_bytes(&self.plan))
+    }
+
     pub fn position(&self) -> usize {
         self.next_position
     }
@@ -516,34 +527,24 @@ impl Deepseek4Cache {
         self.poisoned
     }
 
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&mut self) {
+        self.poisoned = true;
+    }
+
     /// Copy a valid live prefix into a larger, prefix-compatible cache.
     ///
     /// The source remains untouched until every destination copy succeeds, so
     /// callers can discard the partially populated destination and continue
-    /// serving from the old cache after an allocation or copy failure. The
-    /// optional compact rollback snapshot is rebound only after all live bytes
-    /// have migrated; this keeps recovery-anchor restore exact across the
-    /// capacity boundary without accepting unrelated old-plan snapshots.
-    pub fn migrate_from(
-        &mut self,
-        source: &Deepseek4Cache,
-        snapshot: Option<&mut Deepseek4CacheSnapshot>,
-    ) -> Result<(), CacheError> {
+    /// serving from the old cache after an allocation or copy failure.
+    /// Compact rollback snapshots are capacity-portable: callers preflight
+    /// every retained snapshot with `preflight_snapshot_migration` before this
+    /// copy, and the snapshots themselves remain immutable.
+    pub fn migrate_from(&mut self, source: &Deepseek4Cache) -> Result<(), CacheError> {
         if source.poisoned {
             return Err(CacheError::Poisoned);
         }
         validate_growth_plans(&source.plan, &self.plan)?;
-        if let Some(snapshot) = snapshot.as_ref() {
-            if snapshot.plan != source.plan {
-                return Err(CacheError::MigrationSnapshotPlanMismatch);
-            }
-            if snapshot.next_position > source.next_position {
-                return Err(CacheError::MigrationSnapshotPosition {
-                    snapshot_position: snapshot.next_position,
-                    source_position: source.next_position,
-                });
-            }
-        }
 
         for (layer_index, (source_layer, destination_layer)) in
             source.layers.iter().zip(self.layers.iter_mut()).enumerate()
@@ -608,10 +609,75 @@ impl Deepseek4Cache {
 
         self.next_position = source.next_position;
         self.poisoned = false;
-        if let Some(snapshot) = snapshot {
-            snapshot.plan = self.plan.clone();
-        }
         Ok(())
+    }
+
+    /// Validate one retained compact snapshot against both sides of a cache
+    /// growth before the destination receives any bytes. A snapshot may have
+    /// been captured before an earlier growth, so its plan can be any strict
+    /// prefix-compatible ancestor of the live source plan.
+    pub fn preflight_snapshot_migration(
+        &self,
+        source: &Deepseek4Cache,
+        snapshot: &Deepseek4CacheSnapshot,
+    ) -> Result<(), CacheError> {
+        if source.poisoned {
+            return Err(CacheError::Poisoned);
+        }
+        validate_growth_plans(&source.plan, &self.plan)?;
+        if snapshot.plan != source.plan {
+            validate_growth_plans(&snapshot.plan, &source.plan)
+                .map_err(|_| CacheError::MigrationSnapshotPlanMismatch)?;
+        }
+        if snapshot.next_position > source.next_position {
+            return Err(CacheError::MigrationSnapshotPosition {
+                snapshot_position: snapshot.next_position,
+                source_position: source.next_position,
+            });
+        }
+        preflight_snapshot_restore(snapshot, &self.plan, &self.layers)
+    }
+
+    /// Capture exact prompt-boundary rollback state before generation mutates
+    /// the circular window and recurrent compressor state.
+    pub fn prospective_snapshot_owned_bytes(&self) -> Result<u64, CacheError> {
+        if self.poisoned {
+            return Err(CacheError::Poisoned);
+        }
+        let mut resident_bytes = 0_u64;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let layer_bytes = std::iter::once(&layer.window_kv)
+                .chain(layer.main_kv_state.iter())
+                .chain(layer.main_score_state.iter())
+                .chain(layer.indexer_kv_state.iter())
+                .chain(layer.indexer_score_state.iter())
+                .try_fold(0_u64, |total, buffer| {
+                    u64::try_from(buffer.data_byte_len())
+                        .ok()
+                        .and_then(|bytes| total.checked_add(bytes))
+                })
+                .ok_or(CacheError::ByteOverflow {
+                    layer: layer_index,
+                    kind: CacheKind::WindowKv,
+                })?;
+            resident_bytes =
+                resident_bytes
+                    .checked_add(layer_bytes)
+                    .ok_or(CacheError::ByteOverflow {
+                        layer: layer_index,
+                        kind: CacheKind::WindowKv,
+                    })?;
+        }
+        resident_bytes
+            .checked_add(
+                (self.layers.len() as u64)
+                    .saturating_mul(std::mem::size_of::<LayerCacheSnapshot>() as u64),
+            )
+            .and_then(|bytes| bytes.checked_add(cache_plan_control_bytes(&self.plan)))
+            .ok_or(CacheError::ByteOverflow {
+                layer: self.layers.len().saturating_sub(1),
+                kind: CacheKind::WindowKv,
+            })
     }
 
     /// Capture exact prompt-boundary rollback state before generation mutates
@@ -690,15 +756,10 @@ impl Deepseek4Cache {
     /// Restore a prior token-boundary snapshot into this fixed-capacity cache.
     /// The cache remains allocated; only its bytes and logical position move.
     pub fn restore(&mut self, snapshot: &Deepseek4CacheSnapshot) -> Result<(), CacheError> {
-        if snapshot.plan != self.plan {
-            return Err(CacheError::SnapshotPlanMismatch);
-        }
-        if snapshot.layers.len() != self.layers.len() {
-            return Err(CacheError::SnapshotLayerCount {
-                expected: self.layers.len(),
-                actual: snapshot.layers.len(),
-            });
-        }
+        // This is deliberately a complete read-only pass. No destination
+        // cursor or byte may change until every layer and optional payload is
+        // known to be compatible.
+        preflight_snapshot_restore(snapshot, &self.plan, &self.layers)?;
         for (layer_index, (source, destination)) in snapshot
             .layers
             .iter()
@@ -841,6 +902,9 @@ impl Deepseek4Cache {
     /// remain validity-bounded, but pooling state participates in future
     /// writes and therefore must be restored exactly between requests.
     pub fn reset(&mut self) -> Result<(), CacheError> {
+        // A failure after any state write must never leave a partially reset
+        // cache eligible for reuse. Successful completion clears the poison.
+        self.poisoned = true;
         for (layer_index, layer) in self.layers.iter_mut().enumerate() {
             fill_state(
                 layer.main_kv_state.as_mut(),
@@ -880,6 +944,137 @@ impl Deepseek4CacheSnapshot {
 
     pub fn resident_bytes(&self) -> u64 {
         self.resident_bytes
+    }
+
+    /// Exact logical payload plus host control allocations owned solely by
+    /// this snapshot. Buffer allocator metadata is outside hf2q's ownership
+    /// accounting; every buffer's full logical allocation is included.
+    pub fn owned_bytes(&self) -> u64 {
+        self.resident_bytes
+            .saturating_add(
+                (self.layers.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<LayerCacheSnapshot>() as u64),
+            )
+            .saturating_add(cache_plan_control_bytes(&self.plan))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_last_layer_window_shape_for_test(&mut self) {
+        let layer = self.layers.last_mut().expect("snapshot has a layer");
+        let elements = layer.window_kv.data_byte_len() / layer.window_kv.dtype().size_of();
+        let shortened = elements.saturating_sub(1);
+        layer.window_kv = layer
+            .window_kv
+            .slice_view(0, shortened)
+            .with_shape(vec![shortened])
+            .expect("shape deliberately malformed snapshot window");
+    }
+}
+
+fn cache_plan_control_bytes(plan: &Deepseek4CachePlan) -> u64 {
+    let layer_control = (plan.layers.capacity() as u64)
+        .saturating_mul(std::mem::size_of::<LayerCachePlan>() as u64);
+    let shape_control = plan.layers.iter().fold(0u64, |total, layer| {
+        std::iter::once(&layer.attention_kv)
+            .chain(std::iter::once(&layer.window_kv))
+            .chain(layer.compressed_kv.iter())
+            .chain(layer.indexer_kv.iter())
+            .chain(layer.main_kv_state.iter())
+            .chain(layer.main_score_state.iter())
+            .chain(layer.indexer_kv_state.iter())
+            .chain(layer.indexer_score_state.iter())
+            .fold(total, |bytes, buffer| {
+                bytes.saturating_add(
+                    (buffer.shape.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<usize>() as u64),
+                )
+            })
+    });
+    layer_control.saturating_add(shape_control)
+}
+
+fn preflight_snapshot_restore(
+    snapshot: &Deepseek4CacheSnapshot,
+    destination_plan: &Deepseek4CachePlan,
+    destination_layers: &[LayerCache],
+) -> Result<(), CacheError> {
+    if snapshot.plan != *destination_plan {
+        validate_growth_plans(&snapshot.plan, destination_plan)
+            .map_err(|_| CacheError::SnapshotPlanMismatch)?;
+    }
+    if snapshot.next_position > destination_plan.context_length {
+        return Err(CacheError::SnapshotPlanMismatch);
+    }
+    if snapshot.layers.len() != destination_layers.len() {
+        return Err(CacheError::SnapshotLayerCount {
+            expected: destination_layers.len(),
+            actual: snapshot.layers.len(),
+        });
+    }
+    for (layer_index, (source, destination)) in
+        snapshot.layers.iter().zip(destination_layers).enumerate()
+    {
+        preflight_restore_buffer(
+            &source.window_kv,
+            &destination.window_kv,
+            layer_index,
+            CacheKind::WindowKv,
+        )?;
+        preflight_optional_restore_buffer(
+            source.main_kv_state.as_ref(),
+            destination.main_kv_state.as_ref(),
+            layer_index,
+            CacheKind::MainKvState,
+        )?;
+        preflight_optional_restore_buffer(
+            source.main_score_state.as_ref(),
+            destination.main_score_state.as_ref(),
+            layer_index,
+            CacheKind::MainScoreState,
+        )?;
+        preflight_optional_restore_buffer(
+            source.indexer_kv_state.as_ref(),
+            destination.indexer_kv_state.as_ref(),
+            layer_index,
+            CacheKind::IndexerKvState,
+        )?;
+        preflight_optional_restore_buffer(
+            source.indexer_score_state.as_ref(),
+            destination.indexer_score_state.as_ref(),
+            layer_index,
+            CacheKind::IndexerScoreState,
+        )?;
+    }
+    Ok(())
+}
+
+fn preflight_restore_buffer(
+    source: &MlxBuffer,
+    destination: &MlxBuffer,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<(), CacheError> {
+    if source.data_byte_len() != destination.data_byte_len()
+        || source.dtype() != destination.dtype()
+        || source.shape() != destination.shape()
+    {
+        return Err(CacheError::SnapshotBufferMismatch { layer, kind });
+    }
+    Ok(())
+}
+
+fn preflight_optional_restore_buffer(
+    source: Option<&MlxBuffer>,
+    destination: Option<&MlxBuffer>,
+    layer: usize,
+    kind: CacheKind,
+) -> Result<(), CacheError> {
+    match (source, destination) {
+        (Some(source), Some(destination)) => {
+            preflight_restore_buffer(source, destination, layer, kind)
+        }
+        (None, None) => Ok(()),
+        _ => Err(CacheError::SnapshotBufferMismatch { layer, kind }),
     }
 }
 

@@ -202,6 +202,15 @@ pub fn dispatch_qwen35_dflash_generate(
         }
     }
 
+    let drafter_bf16 = drafter_tensors.native_bf16_matrices(block_size)?;
+    target
+        .model
+        .activate_gpu_dense_routes(
+            crate::inference::models::qwen35::forward_gpu::QwenDenseBf16Provider::DFlash,
+            &drafter_bf16,
+        )
+        .context("activate target + MTP + DFlash BF16 routes")?;
+
     // ─── Prime GPU cache (LA capture allocated later) ──────────────
     target
         .model

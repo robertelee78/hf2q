@@ -19,8 +19,18 @@ const LOCAL_VERIFY_CONCURRENCY: usize = 1;
 
 #[derive(Clone, Debug)]
 pub enum StoredArtifact {
-    Hosted(HubGgufArtifact),
+    Hosted(HostedArtifactSelection),
     Local(LocalGgufArtifact),
+}
+
+/// Exact hosted text artifact plus every same-revision projector companion
+/// retained server-side. After the text GGUF is authenticated, its embedded
+/// projector SHA selects exactly one companion without exposing path or hash
+/// authority to the client.
+#[derive(Clone, Debug)]
+pub struct HostedArtifactSelection {
+    pub text: HubGgufArtifact,
+    pub companions: Vec<HubGgufArtifact>,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +162,12 @@ impl ArtifactCatalogCoordinator {
         while state.candidates.len() + issued > MAX_CANDIDATES {
             remove_oldest(&mut state.candidates);
         }
+        let companions = catalog
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.role == "companion")
+            .cloned()
+            .collect::<Vec<_>>();
         let mut candidates = Vec::with_capacity(catalog.artifacts.len());
         for artifact in catalog.artifacts {
             let candidate_id = if artifact.selectable {
@@ -159,7 +175,10 @@ impl ArtifactCatalogCoordinator {
                 state.candidates.insert(
                     id.clone(),
                     StoredCandidate {
-                        artifact: StoredArtifact::Hosted(artifact.clone()),
+                        artifact: StoredArtifact::Hosted(HostedArtifactSelection {
+                            text: artifact.clone(),
+                            companions: companions.clone(),
+                        }),
                         issued_at: now,
                     },
                 );
@@ -282,12 +301,17 @@ mod tests {
             filename: if selectable {
                 "model-q5_k_m.gguf".into()
             } else {
-                "model-bf16.gguf".into()
+                "mmproj-model-f16.gguf".into()
             },
             bytes: 42,
             sha256: "b".repeat(64),
-            quant_hint: Some(if selectable { "Q5_K_M" } else { "BF16" }.into()),
-            role: "text_model".into(),
+            quant_hint: selectable.then(|| "Q5_K_M".into()),
+            role: if selectable {
+                "text_model"
+            } else {
+                "companion"
+            }
+            .into(),
             selectable,
             unavailable_reason: (!selectable).then(|| "unsupported".into()),
         }
@@ -311,7 +335,8 @@ mod tests {
         let StoredArtifact::Hosted(selected) = coordinator.resolve(selected).unwrap() else {
             panic!("expected hosted authority");
         };
-        assert_eq!(selected.sha256, "b".repeat(64));
+        assert_eq!(selected.text.sha256, "b".repeat(64));
+        assert_eq!(selected.companions.len(), 1);
         assert!(view.candidates[1].candidate_id.is_none());
     }
 
@@ -349,8 +374,8 @@ mod tests {
         let StoredArtifact::Hosted(selected) = coordinator.resolve(first_id).unwrap() else {
             panic!("expected hosted authority");
         };
-        assert_eq!(selected.revision, "a".repeat(40));
-        assert_eq!(selected.sha256, "b".repeat(64));
+        assert_eq!(selected.text.revision, "a".repeat(40));
+        assert_eq!(selected.text.sha256, "b".repeat(64));
     }
 
     #[test]
@@ -366,6 +391,7 @@ mod tests {
                     filename: "model.gguf".into(),
                     root: private_root.clone(),
                     path: private_path.clone(),
+                    projector_path: None,
                     bytes: 42,
                     sha256: "b".repeat(64),
                     quant_hint: "Q4_K_M".into(),

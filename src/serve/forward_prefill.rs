@@ -14,7 +14,6 @@
 //! - After all tokens: extract last-row logits, argmax → first decode token
 
 use anyhow::Result;
-use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::ops::flash_attn_vec::FlashAttnVecParams;
 use mlx_native::MlxBuffer;
 use std::ops::Range;
@@ -58,14 +57,6 @@ pub(crate) fn gemma_slot_prefill_batched_work_eligible(
     has_soft_tokens: bool,
 ) -> bool {
     !has_soft_tokens && work_len >= GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS
-}
-
-fn validate_linear_prefill_argmax(value: f32, token_index: usize) -> Result<()> {
-    anyhow::ensure!(
-        value.is_finite(),
-        "linear prefill produced a non-finite argmax value at token {token_index}: {value}"
-    );
-    Ok(())
 }
 
 fn gemma_use_batched_slot_prefill(
@@ -220,9 +211,9 @@ pub struct SoftTokenInjection<'a> {
 /// `n_image_tokens` row count of every chunk.
 ///
 /// **Wedge-4c.5 status**: this struct is the engine seam between the
-/// ViT side (vit_gpu_qwen3vl.rs's augmented embed) and the LM side
+/// ViT side (vit_gpu_qwen.rs's augmented embed) and the LM side
 /// (forward_gpu.rs's image_token_residual_add hook). The handler-side
-/// path that constructs it from `compute_vision_embeddings_gpu_qwen3vl`'s
+/// path that constructs it from `compute_vision_embeddings_gpu_qwen`'s
 /// output is Wedge-4d territory — until that lands, only the
 /// LM-side test fixtures construct DeepstackInjection directly.
 pub struct DeepstackInjection<'a> {
@@ -260,7 +251,7 @@ impl<'a> DeepstackInjection<'a> {
 /// `n_x * n_y` and matches `n_image_tokens` flowing through the
 /// `expand_image_placeholders` per-image expansion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Qwen3VlImageGrid {
+pub struct QwenImageGrid {
     /// Post-merge token-grid width (X axis). For canonical Qwen3-VL
     /// preprocessor at `image_size=768, patch_size=16,
     /// spatial_merge_size=2`: `n_x = 24`.
@@ -269,7 +260,7 @@ pub struct Qwen3VlImageGrid {
     pub n_y: u32,
 }
 
-impl Qwen3VlImageGrid {
+impl QwenImageGrid {
     /// `n_image_tokens` = `n_x * n_y`.
     pub fn n_image_tokens(&self) -> u32 {
         self.n_x.saturating_mul(self.n_y)
@@ -343,9 +334,9 @@ impl Qwen3VlImageGrid {
 /// - Image regions overlap or extend past `prompt_len`.
 /// - `image_grids` is not sorted by `sequence_start`.
 /// - Any `grid.n_image_tokens() == 0`.
-pub fn build_qwen3vl_positions(
+pub fn build_qwen_vision_positions(
     prompt_len: usize,
-    image_grids: &[(Qwen3VlImageGrid, u32)],
+    image_grids: &[(QwenImageGrid, u32)],
 ) -> anyhow::Result<Vec<i32>> {
     use anyhow::anyhow;
 
@@ -355,7 +346,7 @@ pub fn build_qwen3vl_positions(
         let n_tokens = grid.n_image_tokens();
         if n_tokens == 0 {
             return Err(anyhow!(
-                "build_qwen3vl_positions: image[{i}] has zero tokens \
+                "build_qwen_vision_positions: image[{i}] has zero tokens \
                  (n_x={}, n_y={})",
                 grid.n_x,
                 grid.n_y
@@ -363,17 +354,17 @@ pub fn build_qwen3vl_positions(
         }
         if (*seq_start) < last_end {
             return Err(anyhow!(
-                "build_qwen3vl_positions: image[{i}] starts at {seq_start} \
+                "build_qwen_vision_positions: image[{i}] starts at {seq_start} \
                  which is before the prior region's end {last_end} — \
                  overlapping or unsorted image regions"
             ));
         }
         let region_end = (*seq_start)
             .checked_add(n_tokens)
-            .ok_or_else(|| anyhow!("build_qwen3vl_positions: image[{i}] region overflow"))?;
+            .ok_or_else(|| anyhow!("build_qwen_vision_positions: image[{i}] region overflow"))?;
         if (region_end as usize) > prompt_len {
             return Err(anyhow!(
-                "build_qwen3vl_positions: image[{i}] region {seq_start}..{region_end} \
+                "build_qwen_vision_positions: image[{i}] region {seq_start}..{region_end} \
                  extends past prompt_len {prompt_len}"
             ));
         }
@@ -1538,18 +1529,20 @@ impl MlxModelWeights {
                     })?;
                     s.track_dispatch(&[st.embeddings], &[&self.activations.hidden]);
                 } else {
-                    mlx_native::ops::elementwise::embedding_gather_scale_f32(
-                        s.encoder_mut(),
+                    self.activations
+                        .embedding_token_id
+                        .as_mut_slice::<u32>()
+                        .map_err(|e| anyhow::anyhow!("prefill token id write: {e}"))?[0] = tok;
+                    crate::inference::models::gemma4::native_matrix::encode_embedding(
+                        &mut s,
                         reg,
-                        metal_dev,
+                        dev,
                         &self.embed_weight,
+                        &self.activations.embedding_token_id,
                         &self.activations.hidden,
-                        tok,
-                        hs,
-                        (hs as f32).sqrt(),
+                        1,
                     )
-                    .map_err(|e| anyhow::anyhow!("prefill embed T{tok_i}: {e}"))?;
-                    s.track_dispatch(&[&self.embed_weight], &[&self.activations.hidden]);
+                    .map_err(|e| anyhow::anyhow!("prefill native embed T{tok_i}: {e}"))?;
                 }
 
                 // --- 2. Transformer layers ---
@@ -2472,34 +2465,63 @@ impl MlxModelWeights {
 
                     if num_experts > 0 {
                         let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
-                        s.barrier_between(
-                            &[
-                                &self.activations.moe_norm_out,
-                                &self.activations.moe_expert_ids,
-                                self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                            ],
-                            &[&self.activations.moe_gate_up_id_out],
-                        );
-                        s.quantized_matmul_id_ggml(
+                        let (gate_up_affine, down_affine) = self.layers[layer_idx]
+                            .moe
+                            .affine_pair()?
+                            .map_or((None, None), |(gate_up, down)| (Some(gate_up), Some(down)));
+                        let gate_up_weight =
+                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap();
+                        let native_activation_epoch = self.native_activation_epoch()?;
+                        if !crate::inference::models::gemma4::expert_dispatch::dispatch_native_scalar_expert(
+                            &mut s,
                             reg,
                             dev,
+                            native_activation_epoch,
                             &self.activations.moe_norm_out,
-                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                            gate_up_weight,
                             &self.activations.moe_expert_ids,
-                            &mut self.activations.moe_gate_up_id_out,
-                            &mlx_native::GgmlQuantizedMatmulIdParams {
-                                n_tokens: 1,
-                                top_k: top_k as u32,
-                                n: (2 * moe_int) as u32,
-                                k: hs as u32,
-                                n_experts: num_experts as u32,
-                                expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
-                                ggml_type: ggml_type_gu,
-                            },
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("prefill gate_up_id L{layer_idx} T{tok_i}: {e}")
-                        })?;
+                            &self.activations.moe_gate_up_id_out,
+                            gate_up_affine,
+                            ggml_type_gu,
+                            1,
+                            top_k as u32,
+                            (2 * moe_int) as u32,
+                            hs as u32,
+                            num_experts as u32,
+                            self.layers[layer_idx].moe.gate_up_expert_stride,
+                            mlx_native::DenseMatmulIdInputLayout::SharedPerToken,
+                            crate::inference::models::gemma4::expert_dispatch::DenseExpertScratchSlot::GateUp,
+                            "Gemma linear-prefill gate/up",
+                        )? {
+                            s.barrier_between(
+                                &[
+                                    &self.activations.moe_norm_out,
+                                    &self.activations.moe_expert_ids,
+                                    gate_up_weight,
+                                ],
+                                &[&self.activations.moe_gate_up_id_out],
+                            );
+                            s.quantized_matmul_id_ggml(
+                                reg,
+                                dev,
+                                &self.activations.moe_norm_out,
+                                gate_up_weight,
+                                &self.activations.moe_expert_ids,
+                                &mut self.activations.moe_gate_up_id_out,
+                                &mlx_native::GgmlQuantizedMatmulIdParams {
+                                    n_tokens: 1,
+                                    top_k: top_k as u32,
+                                    n: (2 * moe_int) as u32,
+                                    k: hs as u32,
+                                    n_experts: num_experts as u32,
+                                    expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
+                                    ggml_type: ggml_type_gu,
+                                },
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("prefill gate_up_id L{layer_idx} T{tok_i}: {e}")
+                            })?;
+                        }
 
                         // B12: swiglu
                         s.barrier_between(
@@ -2521,34 +2543,57 @@ impl MlxModelWeights {
 
                         // B13: down_id
                         let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
-                        s.barrier_between(
-                            &[
-                                &self.activations.moe_swiglu_id_out,
-                                &self.activations.moe_expert_ids,
-                                self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                            ],
-                            &[&self.activations.moe_down_id_out],
-                        );
-                        s.quantized_matmul_id_ggml(
+                        let down_weight = self.layers[layer_idx].moe.stacked_down.as_ref().unwrap();
+                        if !crate::inference::models::gemma4::expert_dispatch::dispatch_native_scalar_expert(
+                            &mut s,
                             reg,
                             dev,
+                            native_activation_epoch,
                             &self.activations.moe_swiglu_id_out,
-                            self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                            down_weight,
                             &self.activations.moe_expert_ids,
-                            &mut self.activations.moe_down_id_out,
-                            &mlx_native::GgmlQuantizedMatmulIdParams {
-                                n_tokens: top_k as u32,
-                                top_k: 1,
-                                n: hs as u32,
-                                k: moe_int as u32,
-                                n_experts: num_experts as u32,
-                                expert_stride: self.layers[layer_idx].moe.down_expert_stride,
-                                ggml_type: ggml_type_dn,
-                            },
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("prefill down_id L{layer_idx} T{tok_i}: {e}")
-                        })?;
+                            &self.activations.moe_down_id_out,
+                            down_affine,
+                            ggml_type_dn,
+                            1,
+                            top_k as u32,
+                            hs as u32,
+                            moe_int as u32,
+                            num_experts as u32,
+                            self.layers[layer_idx].moe.down_expert_stride,
+                            mlx_native::DenseMatmulIdInputLayout::Slotted,
+                            crate::inference::models::gemma4::expert_dispatch::DenseExpertScratchSlot::Down,
+                            "Gemma linear-prefill down",
+                        )? {
+                            s.barrier_between(
+                                &[
+                                    &self.activations.moe_swiglu_id_out,
+                                    &self.activations.moe_expert_ids,
+                                    down_weight,
+                                ],
+                                &[&self.activations.moe_down_id_out],
+                            );
+                            s.quantized_matmul_id_ggml(
+                                reg,
+                                dev,
+                                &self.activations.moe_swiglu_id_out,
+                                down_weight,
+                                &self.activations.moe_expert_ids,
+                                &mut self.activations.moe_down_id_out,
+                                &mlx_native::GgmlQuantizedMatmulIdParams {
+                                    n_tokens: top_k as u32,
+                                    top_k: 1,
+                                    n: hs as u32,
+                                    k: moe_int as u32,
+                                    n_experts: num_experts as u32,
+                                    expert_stride: self.layers[layer_idx].moe.down_expert_stride,
+                                    ggml_type: ggml_type_dn,
+                                },
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("prefill down_id L{layer_idx} T{tok_i}: {e}")
+                            })?;
+                        }
                     }
 
                     s.barrier_between(&[&self.activations.mlp_down], &[&self.activations.attn_out]);
@@ -2774,61 +2819,22 @@ impl MlxModelWeights {
                 )
                 .map_err(|e| anyhow::anyhow!("prefill final norm T{tok_i}: {e}"))?;
 
-                // ADR-028 iter-188: prefer Q6_K-native lm_head (HF2Q_LMHEAD_Q6K=1).
-                if let Some(ref q6k) = self.lm_head_q6k {
-                    s.barrier_between(
-                        &[&self.activations.norm_out, &q6k.buffer],
-                        &[&self.activations.logits],
-                    );
-                    crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                        &mut s,
-                        reg,
-                        dev,
-                        &self.activations.norm_out,
-                        q6k,
-                        &mut self.activations.logits,
-                        1,
-                        crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                    )
-                    .map_err(|e| anyhow::anyhow!("prefill lm_head Q6_K T{tok_i}: {e}"))?;
-                } else if let Some(ref q8) = self.lm_head_q8 {
-                    s.barrier_between(
-                        &[&self.activations.norm_out, &q8.buffer],
-                        &[&self.activations.logits],
-                    );
-                    crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                        &mut s,
-                        reg,
-                        dev,
-                        &self.activations.norm_out,
-                        q8,
-                        &mut self.activations.logits,
-                        1,
-                        crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                    )
-                    .map_err(|e| anyhow::anyhow!("prefill lm_head Q8 T{tok_i}: {e}"))?;
-                } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-                    s.barrier_between(
-                        &[&self.activations.norm_out, lm_head_f16],
-                        &[&self.activations.logits],
-                    );
-                    mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
-                        s.encoder_mut(),
-                        reg,
-                        metal_dev,
-                        &self.activations.norm_out,
-                        lm_head_f16,
-                        &self.activations.logits,
-                        &DenseGemmF16Params {
-                            m: 1,
-                            n: vocab_size as u32,
-                            k: hs as u32,
-                        },
-                    )
-                    .map_err(|e| anyhow::anyhow!("prefill lm_head T{tok_i}: {e}"))?;
-                } else {
-                    anyhow::bail!("Prefill requires GPU lm_head (F16 or Q8 weight)");
-                }
+                let lm_head = self.resolved_lm_head();
+                s.barrier_between(
+                    &[&self.activations.norm_out, &lm_head.buffer],
+                    &[&self.activations.logits],
+                );
+                crate::serve::forward_mlx_shared::dispatch_qmatmul(
+                    &mut s,
+                    reg,
+                    dev,
+                    &self.activations.norm_out,
+                    lm_head,
+                    &self.activations.logits,
+                    1,
+                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+                )
+                .map_err(|e| anyhow::anyhow!("prefill native lm_head T{tok_i}: {e}"))?;
 
                 if let Some(cap) = self.final_logit_softcapping {
                     s.barrier_between(&[&self.activations.logits], &[&self.activations.logits]);
@@ -2866,22 +2872,12 @@ impl MlxModelWeights {
                 s.finish()
                     .map_err(|e| anyhow::anyhow!("prefill finish T{tok_i}: {e}"))?;
 
-                let argmax_value = {
-                    let value: &[f32] =
-                        self.activations.argmax_value.as_slice().map_err(|e| {
-                            anyhow::anyhow!("prefill argmax value read T{tok_i}: {e}")
-                        })?;
-                    value[0]
-                };
-                validate_linear_prefill_argmax(argmax_value, tok_i)?;
-                last_token = {
-                    let idx: &[u32] = self
-                        .activations
-                        .argmax_index
-                        .as_slice()
-                        .map_err(|e| anyhow::anyhow!("prefill argmax read T{tok_i}: {e}"))?;
-                    idx[0]
-                };
+                last_token = crate::inference::argmax::read_finite_argmax_one(
+                    &self.activations.argmax_index,
+                    &self.activations.argmax_value,
+                    vocab_size as u32,
+                    "Gemma linear prefill",
+                )?;
             }
         }
 
@@ -3000,16 +2996,37 @@ impl MlxModelWeights {
                     (2 * l.num_kv_heads * lcp_snap_cap_est * l.head_dim * kv_elem_bytes) as u64
                 })
                 .sum();
-            let hybrid: u64 = if self.hybrid_kv.is_some() {
-                self.layers
-                    .iter()
-                    .map(|l| {
-                        (l.num_kv_heads * lcp_snap_cap_est * (l.head_dim * 2 + l.head_dim + 4))
-                            as u64
-                    })
-                    .sum()
-            } else {
-                0
+            let hybrid: u64 = match self.hybrid_kv.as_ref() {
+                None => 0,
+                Some(live_hybrid) => {
+                    anyhow::ensure!(
+                        live_hybrid.len() == self.layers.len(),
+                        "hybrid LCP estimate layer count {} != model layers {}",
+                        live_hybrid.len(),
+                        self.layers.len()
+                    );
+                    live_hybrid.iter().enumerate().try_fold(
+                        0u64,
+                        |total, (layer_idx, live)| {
+                            let shape = live.k.shape();
+                            anyhow::ensure!(
+                                shape.len() == 3,
+                                "hybrid LCP estimate K L{layer_idx} must be rank 3, got {shape:?}"
+                            );
+                            let layer_bytes = crate::inference::models::gemma4::kv_cache::hybrid_lcp_snapshot_layer_bytes(
+                                shape[0],
+                                lcp_snap_cap_est,
+                                shape[2],
+                                live.norms_per_pos,
+                                live.k.dtype(),
+                                live.v_packed.dtype(),
+                            )?;
+                            total.checked_add(layer_bytes).ok_or_else(|| {
+                                anyhow::anyhow!("hybrid LCP estimate byte count overflow")
+                            })
+                        },
+                    )?
+                }
             };
             dense + hybrid
         };
@@ -3205,8 +3222,8 @@ impl MlxModelWeights {
             };
 
         // ADR-017 Phase E.a "gemma-hybrid-lcp" (2026-08-03) — end-of-
-        // prefill snapshot of the HYBRID leg (F16 K + TQ-HB V packed +
-        // norms), mirroring the dense snapshot above. Required for LCP
+        // prefill snapshot of the HYBRID leg (F16 K + dtype-authoritative V),
+        // mirroring the dense snapshot above. Required for LCP
         // resume under the production hybrid regime: decode reads
         // `hybrid_kv`, so restoring only the dense leg would leave the
         // decode cache zeroed over the prefix (silent corruption — the
@@ -3214,13 +3231,16 @@ impl MlxModelWeights {
         //
         // Capacity policy + per-head copy semantics mirror the dense
         // snapshot exactly (`snap_cap`, fast-path when live_cap ==
-        // snap_cap, strided per-head otherwise). v_norms' inner axis is
-        // `norms_per_pos` (1 at hd=256 production), with the live
-        // buffer's rank-2 `[nkv, cap]` / rank-3 `[nkv, cap, npp]` shape
-        // preserved on the snapshot side.
+        // snap_cap, strided per-head otherwise). The cache-owned helper keeps
+        // packed U8 V plus per-position norms and full-F16 V plus its canonical
+        // four-byte dummy on one shared serial/batched implementation.
         let hybrid_snapshot_for_lcp: Option<
             Vec<std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>>,
-        > = if crate::debug::INVESTIGATION_ENV.kv_lcp_resume && snapshot_safe && !slot_aware {
+        > = if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+            && snapshot_safe
+            && lcp_fits_budget
+            && !slot_aware
+        {
             match self.hybrid_kv.as_ref() {
                 None => None,
                 Some(live_hybrid) => {
@@ -3231,97 +3251,14 @@ impl MlxModelWeights {
                     let snap_cap = sw.max(gemma_flash_attn_vec_capacity(
                         seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 },
                     ));
-                    let mut hsnap: Vec<
-                        std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>,
-                    > = Vec::with_capacity(live_hybrid.len());
-                    for live_layer in live_hybrid.iter() {
-                        let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
-                        let live_cap_dim = live_layer
-                            .k
-                            .shape()
-                            .get(1)
-                            .copied()
-                            .unwrap_or(live_layer.capacity);
-                        let hd_dim = live_layer.k.shape().get(2).copied().unwrap_or(0);
-                        let npp = live_layer.norms_per_pos.max(1);
-                        // K: F16 (2 B/elem); v_packed: U8 (1 B/elem);
-                        // v_norms: F32 (4 B/elem, inner axis npp).
-                        let k_snap = dev
-                            .alloc_buffer(
-                                nkv_dim * snap_cap * hd_dim * 2,
-                                mlx_native::DType::F16,
-                                vec![nkv_dim, snap_cap, hd_dim],
-                            )
-                            .map_err(|e| anyhow::anyhow!("hybrid snapshot K alloc: {e}"))?;
-                        let vp_snap = dev
-                            .alloc_buffer(
-                                nkv_dim * snap_cap * hd_dim,
-                                mlx_native::DType::U8,
-                                vec![nkv_dim, snap_cap, hd_dim],
-                            )
-                            .map_err(|e| anyhow::anyhow!("hybrid snapshot V packed alloc: {e}"))?;
-                        let vn_shape = if npp == 1 {
-                            vec![nkv_dim, snap_cap]
-                        } else {
-                            vec![nkv_dim, snap_cap, npp]
-                        };
-                        let vn_snap = dev
-                            .alloc_buffer(
-                                nkv_dim * snap_cap * npp * 4,
-                                mlx_native::DType::F32,
-                                vn_shape,
-                            )
-                            .map_err(|e| anyhow::anyhow!("hybrid snapshot V norms alloc: {e}"))?;
-
-                        // Per-head prefix copy for one (src, dst, elem,
-                        // inner) quadruple — same two-branch structure
-                        // as the dense snapshot (fast path when shapes
-                        // match, strided otherwise).
-                        let copy_prefix = |src: &mlx_native::MlxBuffer,
-                                           dst: &mut mlx_native::MlxBuffer,
-                                           elem: usize,
-                                           inner: usize,
-                                           what: &str|
-                         -> anyhow::Result<()> {
-                            let s: &[u8] = src
-                                .as_slice()
-                                .map_err(|e| anyhow::anyhow!("hybrid snapshot {what} src: {e}"))?;
-                            let d: &mut [u8] = dst
-                                .as_mut_slice()
-                                .map_err(|e| anyhow::anyhow!("hybrid snapshot {what} dst: {e}"))?;
-                            let copy_len = seq_len * inner * elem;
-                            let src_stride = live_cap_dim * inner * elem;
-                            let dst_stride = snap_cap * inner * elem;
-                            for h in 0..nkv_dim {
-                                let so = h * src_stride;
-                                let do_ = h * dst_stride;
-                                d[do_..do_ + copy_len].copy_from_slice(&s[so..so + copy_len]);
-                            }
-                            Ok(())
-                        };
-                        let mut k_snap = k_snap;
-                        let mut vp_snap = vp_snap;
-                        let mut vn_snap = vn_snap;
-                        copy_prefix(&live_layer.k, &mut k_snap, 2, hd_dim, "K")?;
-                        copy_prefix(&live_layer.v_packed, &mut vp_snap, 1, hd_dim, "V packed")?;
-                        copy_prefix(&live_layer.v_norms, &mut vn_snap, 4, npp, "V norms")?;
-
-                        hsnap.push(std::sync::Arc::new(
-                            crate::inference::models::gemma4::kv_cache::HybridKvBuffers {
-                                k: k_snap,
-                                v_packed: vp_snap,
-                                v_norms: vn_snap,
-                                capacity: snap_cap,
-                                is_sliding: live_layer.is_sliding,
-                                norms_per_pos: live_layer.norms_per_pos,
-                                // xlen companions are decode-time lazy
-                                // scratch, never part of prefix state.
-                                bf16_xlen_k: None,
-                                bf16_xlen_v: None,
-                            },
-                        ));
-                    }
-                    Some(hsnap)
+                    Some(
+                        crate::inference::models::gemma4::kv_cache::snapshot_hybrid_kv_for_lcp(
+                            dev,
+                            live_hybrid,
+                            seq_len,
+                            snap_cap,
+                        )?,
+                    )
                 }
             }
         } else {
@@ -6402,8 +6339,7 @@ impl MlxModelWeights {
 mod lcp_cursor_tests {
     use super::{
         gemma_flash_attn_vec_capacity, gemma_kv_capacity_plan,
-        gemma_slot_prefill_batched_work_eligible, restored_kv_cursor,
-        validate_linear_prefill_argmax, GEMMA_FLASH_ATTN_VEC_KV_TILE,
+        gemma_slot_prefill_batched_work_eligible, restored_kv_cursor, GEMMA_FLASH_ATTN_VEC_KV_TILE,
         GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS,
     };
 
@@ -6434,10 +6370,6 @@ mod lcp_cursor_tests {
             64
         );
         assert_eq!(GEMMA_FLASH_ATTN_VEC_KV_TILE, 32);
-        assert!(validate_linear_prefill_argmax(17.0, 2).is_ok());
-        for poisoned in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert!(validate_linear_prefill_argmax(poisoned, 2).is_err());
-        }
     }
 
     #[test]
@@ -6490,8 +6422,8 @@ mod lcp_cursor_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod qwen3vl_position_tests {
-    use super::{build_qwen3vl_positions, Qwen3VlImageGrid};
+mod qwen_vision_position_tests {
+    use super::{build_qwen_vision_positions, QwenImageGrid};
 
     /// Helper: extract one axis as a Vec<i32> for assertion.
     fn axis(flat: &[i32], axis: usize, prompt_len: usize) -> Vec<i32> {
@@ -6499,34 +6431,34 @@ mod qwen3vl_position_tests {
     }
 
     #[test]
-    fn build_qwen3vl_positions_empty_prompt_returns_empty_vec() {
+    fn build_qwen_vision_positions_empty_prompt_returns_empty_vec() {
         // Regression gate for the chunks_exact_mut refactor: chunks_exact_mut(0)
         // panics, so the prompt_len == 0 path takes an explicit early-return.
         // This locks the prior behavior: empty prompt + no image regions
         // yields Ok(empty vec) without panic.  (A non-empty image region
         // with prompt_len == 0 still hits the pre-existing
         // region-extends-past-prompt_len error path, validated elsewhere.)
-        let flat = build_qwen3vl_positions(0, &[]).expect("empty prompt accepted");
+        let flat = build_qwen_vision_positions(0, &[]).expect("empty prompt accepted");
         assert!(flat.is_empty(), "empty prompt → empty flat vec");
     }
 
     #[test]
-    fn build_qwen3vl_positions_text_only_broadcast_t_across_axes() {
+    fn build_qwen_vision_positions_text_only_broadcast_t_across_axes() {
         // 5 text tokens, no images. Every axis gets [0,1,2,3,4].
-        let flat = build_qwen3vl_positions(5, &[]).unwrap();
+        let flat = build_qwen_vision_positions(5, &[]).unwrap();
         for ax in 0..4 {
             assert_eq!(axis(&flat, ax, 5), vec![0, 1, 2, 3, 4]);
         }
     }
 
     #[test]
-    fn build_qwen3vl_positions_single_image_emits_correct_grid() {
+    fn build_qwen_vision_positions_single_image_emits_correct_grid() {
         // Layout: [text_0, text_1, IMG(2x3=6 tokens), text_8].
         // Image grid n_x=3, n_y=2, sequence_start=2.
         // After image: temporal advances by max(3,2)=3, so text_8 has t=2+3=5.
-        let grid = Qwen3VlImageGrid { n_x: 3, n_y: 2 };
+        let grid = QwenImageGrid { n_x: 3, n_y: 2 };
         let prompt_len = 2 + 6 + 1;
-        let flat = build_qwen3vl_positions(prompt_len, &[(grid, 2)]).unwrap();
+        let flat = build_qwen_vision_positions(prompt_len, &[(grid, 2)]).unwrap();
         // axis 0 (t): text=0,1; image all=2; text after=5.
         assert_eq!(axis(&flat, 0, prompt_len), vec![0, 1, 2, 2, 2, 2, 2, 2, 5]);
         // axis 1 (y): text=0,1; image i=0..6 → y=0,0,0,1,1,1; text=5.
@@ -6538,12 +6470,12 @@ mod qwen3vl_position_tests {
     }
 
     #[test]
-    fn build_qwen3vl_positions_tail_image_preserves_text_prefix_on_every_axis() {
+    fn build_qwen_vision_positions_tail_image_preserves_text_prefix_on_every_axis() {
         let prompt_len = 12;
         let image_start = 8;
-        let grid = Qwen3VlImageGrid { n_x: 2, n_y: 2 };
-        let multimodal = build_qwen3vl_positions(prompt_len, &[(grid, image_start)]).unwrap();
-        let text_only = build_qwen3vl_positions(image_start as usize, &[]).unwrap();
+        let grid = QwenImageGrid { n_x: 2, n_y: 2 };
+        let multimodal = build_qwen_vision_positions(prompt_len, &[(grid, image_start)]).unwrap();
+        let text_only = build_qwen_vision_positions(image_start as usize, &[]).unwrap();
 
         for axis_index in 0..4 {
             assert_eq!(
@@ -6557,7 +6489,7 @@ mod qwen3vl_position_tests {
     }
 
     #[test]
-    fn build_qwen3vl_positions_multiple_images_global_counter_advances() {
+    fn build_qwen_vision_positions_multiple_images_global_counter_advances() {
         // [text_0, IMG1(2x2=4), text_5, IMG2(3x3=9), text_15]
         // IMG1 at seq 1, advance by max(2,2)=2 → t after IMG1 = 0+1+2 = 3
         //   wait: text_0 has t=0, then IMG1 at t=1, advance by 2 → t=3 after IMG1.
@@ -6565,10 +6497,10 @@ mod qwen3vl_position_tests {
         // IMG2 at seq pos 6, t=4 (after one text token at t=3 → t advances to 4).
         // After IMG2 (n_x=3, n_y=3, advance=3): t = 4+3 = 7.
         // text_15 at seq pos 15, t=7.
-        let img1 = Qwen3VlImageGrid { n_x: 2, n_y: 2 };
-        let img2 = Qwen3VlImageGrid { n_x: 3, n_y: 3 };
+        let img1 = QwenImageGrid { n_x: 2, n_y: 2 };
+        let img2 = QwenImageGrid { n_x: 3, n_y: 3 };
         let prompt_len = 1 + 4 + 1 + 9 + 1; // = 16
-        let flat = build_qwen3vl_positions(prompt_len, &[(img1, 1), (img2, 6)]).unwrap();
+        let flat = build_qwen_vision_positions(prompt_len, &[(img1, 1), (img2, 6)]).unwrap();
         let t_axis = axis(&flat, 0, prompt_len);
         assert_eq!(t_axis[0], 0); // text_0
         assert_eq!(t_axis[1..5], [1, 1, 1, 1]); // IMG1 t-axis (constant)
@@ -6578,11 +6510,11 @@ mod qwen3vl_position_tests {
     }
 
     #[test]
-    fn build_qwen3vl_positions_h_w_swap_detectably_different() {
+    fn build_qwen_vision_positions_h_w_swap_detectably_different() {
         // Sabotage check: if we accidentally swap h/w, the axis 1 vs
         // axis 2 outputs MUST differ for non-square images.
-        let grid_3x2 = Qwen3VlImageGrid { n_x: 3, n_y: 2 };
-        let flat = build_qwen3vl_positions(6, &[(grid_3x2, 0)]).unwrap();
+        let grid_3x2 = QwenImageGrid { n_x: 3, n_y: 2 };
+        let flat = build_qwen_vision_positions(6, &[(grid_3x2, 0)]).unwrap();
         let y = axis(&flat, 1, 6);
         let x = axis(&flat, 2, 6);
         // Image positions 0..6: y=[0,0,0,1,1,1], x=[0,1,2,0,1,2]
@@ -6592,34 +6524,34 @@ mod qwen3vl_position_tests {
     }
 
     #[test]
-    fn build_qwen3vl_positions_rejects_overlapping_images() {
-        let img1 = Qwen3VlImageGrid { n_x: 4, n_y: 4 }; // 16 tokens
-        let img2 = Qwen3VlImageGrid { n_x: 2, n_y: 2 }; // 4 tokens
-                                                        // img1 starts at 0, ends at 16; img2 at 10 overlaps.
-        let err = build_qwen3vl_positions(20, &[(img1, 0), (img2, 10)]).unwrap_err();
+    fn build_qwen_vision_positions_rejects_overlapping_images() {
+        let img1 = QwenImageGrid { n_x: 4, n_y: 4 }; // 16 tokens
+        let img2 = QwenImageGrid { n_x: 2, n_y: 2 }; // 4 tokens
+                                                     // img1 starts at 0, ends at 16; img2 at 10 overlaps.
+        let err = build_qwen_vision_positions(20, &[(img1, 0), (img2, 10)]).unwrap_err();
         assert!(format!("{err}").contains("before the prior region"));
     }
 
     #[test]
-    fn build_qwen3vl_positions_rejects_image_past_prompt_len() {
-        let img = Qwen3VlImageGrid { n_x: 4, n_y: 4 }; // 16 tokens
-                                                       // img at seq=10, region = 10..26, prompt_len=20.
-        let err = build_qwen3vl_positions(20, &[(img, 10)]).unwrap_err();
+    fn build_qwen_vision_positions_rejects_image_past_prompt_len() {
+        let img = QwenImageGrid { n_x: 4, n_y: 4 }; // 16 tokens
+                                                    // img at seq=10, region = 10..26, prompt_len=20.
+        let err = build_qwen_vision_positions(20, &[(img, 10)]).unwrap_err();
         assert!(format!("{err}").contains("extends past prompt_len"));
     }
 
     #[test]
-    fn build_qwen3vl_positions_rejects_zero_tokens() {
-        let img = Qwen3VlImageGrid { n_x: 0, n_y: 5 };
-        let err = build_qwen3vl_positions(10, &[(img, 0)]).unwrap_err();
+    fn build_qwen_vision_positions_rejects_zero_tokens() {
+        let img = QwenImageGrid { n_x: 0, n_y: 5 };
+        let err = build_qwen_vision_positions(10, &[(img, 0)]).unwrap_err();
         assert!(format!("{err}").contains("zero tokens"));
     }
 
     #[test]
-    fn build_qwen3vl_positions_image_at_prompt_start() {
+    fn build_qwen_vision_positions_image_at_prompt_start() {
         // [IMG(2x2=4), text_4] — image at sequence position 0.
-        let grid = Qwen3VlImageGrid { n_x: 2, n_y: 2 };
-        let flat = build_qwen3vl_positions(5, &[(grid, 0)]).unwrap();
+        let grid = QwenImageGrid { n_x: 2, n_y: 2 };
+        let flat = build_qwen_vision_positions(5, &[(grid, 0)]).unwrap();
         // t-axis: image at t=0 (constant), then text at t=2 (advance by max(2,2)=2).
         assert_eq!(axis(&flat, 0, 5), vec![0, 0, 0, 0, 2]);
         // y-axis: image i=0..4 → y=[0,0,1,1] (i/n_x), then text=2.
@@ -6629,16 +6561,16 @@ mod qwen3vl_position_tests {
     }
 
     #[test]
-    fn qwen3vl_image_grid_temporal_advance_uses_max() {
+    fn qwen_vision_image_grid_temporal_advance_uses_max() {
         // Per peer mtmd.cpp:1354-1357 MTMD_POS_TYPE_MROPE returns max(nx, ny).
-        assert_eq!(Qwen3VlImageGrid { n_x: 24, n_y: 24 }.temporal_advance(), 24);
-        assert_eq!(Qwen3VlImageGrid { n_x: 32, n_y: 16 }.temporal_advance(), 32);
-        assert_eq!(Qwen3VlImageGrid { n_x: 8, n_y: 40 }.temporal_advance(), 40);
+        assert_eq!(QwenImageGrid { n_x: 24, n_y: 24 }.temporal_advance(), 24);
+        assert_eq!(QwenImageGrid { n_x: 32, n_y: 16 }.temporal_advance(), 32);
+        assert_eq!(QwenImageGrid { n_x: 8, n_y: 40 }.temporal_advance(), 40);
     }
 
     #[test]
-    fn qwen3vl_image_grid_n_image_tokens_is_product() {
-        assert_eq!(Qwen3VlImageGrid { n_x: 24, n_y: 24 }.n_image_tokens(), 576);
-        assert_eq!(Qwen3VlImageGrid { n_x: 12, n_y: 8 }.n_image_tokens(), 96);
+    fn qwen_vision_image_grid_n_image_tokens_is_product() {
+        assert_eq!(QwenImageGrid { n_x: 24, n_y: 24 }.n_image_tokens(), 576);
+        assert_eq!(QwenImageGrid { n_x: 12, n_y: 8 }.n_image_tokens(), 96);
     }
 }

@@ -427,7 +427,7 @@ fn local_qwen_tensor_layout_admission_matches_runtime_role_support() {
         "blk.0.ffn_gate.weight",
         GgmlType::Q5_1,
     )
-    .is_some());
+    .is_none());
     assert!(local_runtime_tensor_incompatibility(
         "qwen35moe",
         "blk.0.ffn_gate_exps.weight",
@@ -436,14 +436,8 @@ fn local_qwen_tensor_layout_admission_matches_runtime_role_support() {
     .is_none());
     assert!(
         local_runtime_tensor_incompatibility("qwen35", "blk.0.attn_q.weight", GgmlType::F16,)
-            .is_some()
+            .is_none()
     );
-    assert!(local_runtime_tensor_incompatibility(
-        "qwen3_vl",
-        "blk.0.attn_q.weight",
-        GgmlType::Q3_K,
-    )
-    .is_none());
 }
 
 #[test]

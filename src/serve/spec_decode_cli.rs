@@ -188,6 +188,10 @@ pub fn try_dispatch_dflash_spec_decode(
         DFlashModelTensors::upload(exec.device(), &drafter_cfg, &drafter_weights)
             .context("upload DFlash drafter weights to GPU")?
     };
+    let drafter_bf16 = drafter_tensors.native_bf16_matrices(block_size)?;
+    target
+        .activate_native_routes(gpu, &drafter_bf16)
+        .context("activate Gemma target + DFlash native projection routes")?;
     // Drafter cache capacity must cover the maximum prefix length the
     // drafter will see — bounded by the target's max_new_tokens plus
     // prompt length.  The orchestrator's Option C re-prefills the full
@@ -424,12 +428,19 @@ pub fn try_dispatch_qwen35_dflash_spec_decode(
     // failure). The Qwen35Model holds its GPU state in a thread-local
     // cache, so we go through `with_gpu_cache_mut` to fetch the device.
     model
-        .ensure_gpu_cache_primed()
-        .context("ensure_gpu_cache_primed before drafter upload")?;
-    let drafter_tensors = model.with_gpu_cache_mut(|device, _reg| {
+        .prime_gpu_cache_unactivated()
+        .context("prime GPU cache before drafter upload")?;
+    let drafter_tensors = model.with_unactivated_gpu_cache_mut(|device, _reg| {
         DFlashModelTensors::upload(device, &drafter_cfg, &drafter_weights)
             .context("upload Qwen35 DFlash drafter weights to GPU")
     })?;
+    let drafter_bf16 = drafter_tensors.native_bf16_matrices(block_size)?;
+    model
+        .activate_gpu_dense_routes(
+            crate::inference::models::qwen35::forward_gpu::QwenDenseBf16Provider::DFlash,
+            &drafter_bf16,
+        )
+        .context("activate target + MTP + DFlash BF16 routes")?;
     // Drafter cache capacity: worst case is prompt_len + max_new_tokens
     // committed tokens fed as drafter context. Use the +32 buffer +
     // 2048 floor as the Gemma path does.
@@ -597,12 +608,19 @@ pub fn try_dispatch_qwen35_eagle3_spec_decode(
     let weights = Eagle3Weights::load(&weights_bytes, &drafter_cfg)
         .map_err(|e| anyhow::anyhow!("load EAGLE-3 drafter weights: {e}"))?;
     model
-        .ensure_gpu_cache_primed()
-        .context("ensure_gpu_cache_primed before EAGLE-3 drafter upload")?;
-    let drafter_tensors = model.with_gpu_cache_mut(|device, _| {
+        .prime_gpu_cache_unactivated()
+        .context("prime GPU cache before EAGLE-3 drafter upload")?;
+    let drafter_tensors = model.with_unactivated_gpu_cache_mut(|device, _| {
         Eagle3DrafterTensors::upload(device, &drafter_cfg, &weights)
             .map_err(|e| anyhow::anyhow!("upload EAGLE-3 drafter tensors: {e}"))
     })?;
+    let drafter_bf16 = drafter_tensors.native_bf16_matrices()?;
+    model
+        .activate_gpu_dense_routes(
+            crate::inference::models::qwen35::forward_gpu::QwenDenseBf16Provider::Eagle3,
+            &drafter_bf16,
+        )
+        .context("activate target + MTP + EAGLE-3 BF16 routes")?;
 
     let cfg = Eagle3OrchestratorConfig::qwen35_default(
         model,
@@ -716,6 +734,10 @@ pub fn try_dispatch_gemma4_eagle3_spec_decode(
         Eagle3DrafterTensors::upload(exec.device(), &drafter_cfg, &weights)
             .map_err(|e| anyhow::anyhow!("upload EAGLE-3 drafter tensors: {e}"))?
     };
+    let drafter_bf16 = drafter_tensors.native_bf16_matrices()?;
+    target
+        .activate_native_routes(gpu, &drafter_bf16)
+        .context("activate Gemma target + EAGLE-3 native projection routes")?;
     eprintln!(
         "[HF2Q_SPEC_EAGLE3 gemma4] drafter loaded in {:.2}s ({} → {} GPU bytes)",
         t_load.elapsed().as_secs_f64(),

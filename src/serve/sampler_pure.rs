@@ -63,8 +63,9 @@ pub const SAMPLING_EPS: f64 = 1e-5;
 
 /// Return the index of the maximum value in `logits`.
 ///
-/// Returns `0` for an empty slice.  NaN values are treated as less-than any
-/// finite value (consistent with `f32::max`).
+/// Returns `0` for an empty slice. Production callers validate raw model
+/// output before applying sampling transforms; non-finite values reaching
+/// this pure helper may therefore only come from an explicit candidate mask.
 pub fn sample_greedy(logits: &[f32]) -> u32 {
     if logits.is_empty() {
         return 0;
@@ -116,12 +117,10 @@ pub fn sample_token(logits: &mut [f32], params: &SamplingParams, previous_tokens
     // distribution sampler consumes probabilities.
     // ------------------------------------------------------------------
     // Build the indexed-pair Vec in the thread-local scratch buffer.
-    // Drop the per-step is_finite() filter from the build path: NaNs are
-    // exceedingly rare on a healthy logit distribution and the downstream
-    // sort-by/select-by comparators already fall back to `Equal` via
-    // `partial_cmp().unwrap_or(Equal)`, which keeps NaN entries from
-    // distorting the top-k. Drop branches save ~250µs/step on Qwen3.6's
-    // 248K vocab; the rare NaN case is still handled deterministically.
+    // Raw model logits are validated at their inference readback. Do not add
+    // another full-vocabulary scan here: grammar masking may deliberately set
+    // invalid candidates to -inf, and the downstream comparators already keep
+    // those candidates out of the selected distribution.
     let result = SAMPLE_INDEXED_SCRATCH.with(|cell| -> Option<u32> {
         let mut indexed = cell.borrow_mut();
         indexed.clear();
@@ -217,8 +216,9 @@ pub fn sample_token_with_logprob(
         .copied()
         .fold(f32::NEG_INFINITY, |acc, v| if v > acc { v } else { acc });
     if !max_logit.is_finite() {
-        // Degenerate input (all -inf or NaN-only) — fall back to greedy
-        // and report neg-inf logprob so callers can detect the case.
+        // A grammar or candidate mask may legitimately remove every token.
+        // Raw model non-finites were rejected before transforms; preserve the
+        // pure sampler's detectable fallback for the transformed empty set.
         let token = sample_greedy(logits);
         return (token, f32::NEG_INFINITY);
     }
@@ -750,6 +750,26 @@ mod tests {
 
         let mut logits = raw_logits;
         assert_eq!(sample_token(&mut logits, &params, &history), 1);
+    }
+
+    #[test]
+    fn temperature_zero_selection_is_seed_independent() {
+        let select = |seed| {
+            let params = SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                min_p: 0.0,
+                repetition_penalty: 1.0,
+                max_tokens: 1,
+                seed,
+            };
+            let mut logits = [1.0_f32, 9.0, 3.0];
+            sample_token(&mut logits, &params, &[])
+        };
+        assert_eq!(select(None), 1);
+        assert_eq!(select(Some(0)), 1);
+        assert_eq!(select(Some(u64::MAX)), 1);
     }
 
     #[test]

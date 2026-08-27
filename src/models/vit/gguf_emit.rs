@@ -434,7 +434,7 @@ fn write_kv<W: Write>(w: &mut W, key: &str, value: &MetaValue) -> std::io::Resul
 /// Keys per clip-model.h / `src/inference/vision/mmproj.rs` (load side).
 ///
 /// Wedge-4f (iter-224 row 6) adds the Qwen3-VL-specific keys when
-/// `cfg.is_qwen3vl()` returns true:
+/// `cfg.is_qwen_vision()` returns true:
 ///   - `clip.use_gelu = true`               (Bool; clip-impl.h:USE_GELU)
 ///   - `clip.vision.spatial_merge_size`     (u32; typically 2 for Qwen3-VL)
 ///   - `clip.vision.is_deepstack_layers`    (Bool[block_count])
@@ -527,7 +527,7 @@ fn build_metadata(cfg: &VisionConfig) -> Vec<(String, MetaValue)> {
 
     // ---- Qwen3-VL extension keys -------------------------------------
     //
-    // Emitted only when `cfg.is_qwen3vl()` returns true. Mirrors the
+    // Emitted only when `cfg.is_qwen_vision()` returns true. Mirrors the
     // canonical converter's `Qwen3VLVisionModel.set_gguf_parameters`
     // writer. Three keys:
     //
@@ -553,7 +553,7 @@ fn build_metadata(cfg: &VisionConfig) -> Vec<(String, MetaValue)> {
     //     bool array with three trues. Loader walks via
     //     `read_deepstack_indexes` at mmproj.rs:266-308 and converts
     //     to `Vec<u32>` of true-flagged indexes.
-    if cfg.is_qwen3vl() {
+    if cfg.is_qwen_vision() {
         kvs.push(("clip.use_gelu".into(), MetaValue::Bool(true)));
         if let Some(sms) = cfg.spatial_merge_size {
             kvs.push((
@@ -758,7 +758,7 @@ mod tests {
 
     // ----- Wedge-4f (iter-224 row 6) — Qwen3-VL metadata gating -----
 
-    fn qwen3vl_tiny_config() -> VisionConfig {
+    fn qwen_vision_tiny_config() -> VisionConfig {
         VisionConfig {
             hidden_size: 64,
             num_hidden_layers: 2,
@@ -779,12 +779,12 @@ mod tests {
         }
     }
 
-    /// Wedge-4f: when `cfg.is_qwen3vl()` is true, emit the three
+    /// Wedge-4f: when `cfg.is_qwen_vision()` is true, emit the three
     /// extension keys (use_gelu / spatial_merge_size /
     /// is_deepstack_layers) plus the optional projection_dim.
     #[test]
-    fn wedge4f_build_metadata_emits_qwen3vl_keys_when_family_set() {
-        let cfg = qwen3vl_tiny_config();
+    fn wedge4f_build_metadata_emits_qwen_vision_keys_when_family_set() {
+        let cfg = qwen_vision_tiny_config();
         let md = build_metadata(&cfg);
         let keys: Vec<&str> = md.iter().map(|(k, _)| k.as_str()).collect();
 
@@ -797,7 +797,7 @@ mod tests {
             assert!(
                 keys.contains(key),
                 "Wedge-4f: build_metadata must emit Qwen3-VL key {:?} \
-                 when cfg.is_qwen3vl(); got keys: {:?}",
+                 when cfg.is_qwen_vision(); got keys: {:?}",
                 key,
                 keys
             );
@@ -931,7 +931,7 @@ mod tests {
     /// markers) must NOT emit any Qwen3-VL extension keys. The writer
     /// is family-gated, not always-on.
     #[test]
-    fn wedge4f_build_metadata_omits_qwen3vl_keys_for_clip_classic() {
+    fn wedge4f_build_metadata_omits_qwen_vision_keys_for_clip_classic() {
         let cfg = tiny_config(); // projector="mlp", no deepstack
         let md = build_metadata(&cfg);
         let keys: Vec<&str> = md.iter().map(|(k, _)| k.as_str()).collect();
@@ -963,12 +963,12 @@ mod tests {
     /// assert every extension key has the correct typed value the
     /// `MmprojConfig::from_gguf` loader expects.
     #[test]
-    fn wedge4f_qwen3vl_metadata_round_trips_through_gguf_reader() {
+    fn wedge4f_qwen_vision_metadata_round_trips_through_gguf_reader() {
         use mlx_native::gguf::{GgufFile, MetadataValue};
 
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("qwen3vl-roundtrip.mmproj.gguf");
-        write_mmproj_gguf(&out, &qwen3vl_tiny_config(), &tiny_tensors()).expect("write");
+        write_mmproj_gguf(&out, &qwen_vision_tiny_config(), &tiny_tensors()).expect("write");
 
         let gguf = GgufFile::open(&out).expect("open");
         assert_eq!(

@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
+test "$HOST_CONTENTION_POLICY" = process-group-cpu-v2
+test "$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" = 100.0
 
 tmp_dir=$(mktemp -d -t hf2q-thermal-guard.XXXXXX)
 cleanup() {
@@ -134,23 +136,46 @@ read_sequence_state() {
 # Calibrated host measurements distinguish the release gate's existing process
 # group from foreign compiler and hf2q work. The snapshot seam keeps this
 # contract deterministic without launching or killing any foreign process.
-contention_snapshot='100\t100\tbash
-101\t100\thf2q
-102\t100\thf2q-abcdef
-200\t200\tlaunchd'
+contention_snapshot='100\t100\t800.0\tbash
+101\t100\t0.0\thf2q
+102\t100\t0.0\thf2q-abcdef
+200\t200\t99.9\tlaunchd'
 host_contention_process_snapshot() {
   printf '%b\n' "$contention_snapshot"
 }
 contention_log="$tmp_dir/contention.log"
+
+# The stable contention owner must lead a dedicated process group at leaf
+# entry. An inherited same-PGID process is a falsifier, not owned work.
+contention_snapshot='100\t100\t0.0\tbash'
+host_contention_require_isolated_gate_owner 100
+contention_snapshot='100\t100\t0.0\tbash
+101\t100\t0.0\tpython3'
+if host_contention_require_isolated_gate_owner 100; then
+  echo "contention guard accepted an inherited same-PGID process" >&2
+  exit 1
+fi
+contention_snapshot='100\t77\t0.0\tbash'
+if host_contention_require_isolated_gate_owner 100; then
+  echo "contention guard accepted a non-leader owner PID" >&2
+  exit 1
+fi
+
+contention_snapshot='100\t100\t800.0\tbash
+101\t100\t0.0\thf2q
+102\t100\t0.0\thf2q-abcdef
+200\t200\t99.9\tlaunchd'
 host_contention_sample "$contention_log" owned-baseline 100 5000
 test "$HOST_CONTENTION_STATE" = quiet
 test "$HOST_CONTENTION_OWNER_PGID" = 100
-test "$(tail -1 "$contention_log")" = $'5000\tquiet\towned-baseline\t100\t-'
+test "$HOST_CONTENTION_FOREIGN_CPU_PERCENT" = 99.9
+test "$(tail -1 "$contention_log")" = $'5000\tquiet\towned-baseline\t100\t99.9\t-'
 
-for foreign_name in cargo rustc llama-cli llama-server hf2q hf2q-deadbeef; do
-  contention_snapshot="100\\t100\\tbash
-101\\t100\\thf2q
-200\\t200\\t${foreign_name}"
+for foreign_name in cargo rustc llama-cli llama-server llama-bench ollama \
+    mlx-lm mlx_lm swift-frontend hf2q hf2q-deadbeef; do
+  contention_snapshot="100\\t100\\t0.0\\tbash
+101\\t100\\t0.0\\thf2q
+200\\t200\\t0.0\\t${foreign_name}"
   host_contention_sample "$contention_log" "foreign-$foreign_name" 100 5001
   test "$HOST_CONTENTION_STATE" = contended
   test "$HOST_CONTENTION_OFFENDERS" = "200:200:$foreign_name"
@@ -158,27 +183,87 @@ done
 
 # A compiler is never part of a calibrated interval, even if a future harness
 # accidentally launches one inside the owned process group.
-contention_snapshot='100\t100\tbash
-201\t100\tcargo'
+contention_snapshot='100\t100\t0.0\tbash
+201\t100\t0.0\tcargo'
 host_contention_sample "$contention_log" owned-cargo 100 5002
 test "$HOST_CONTENTION_STATE" = contended
 test "$HOST_CONTENTION_OFFENDERS" = '201:100:cargo'
+if host_contention_sample "$contention_log" forged-owned-server 100 5002 201; then
+  echo "host contention guard accepted a compiler as an owned server" >&2
+  exit 1
+fi
 
-contention_snapshot='100\t100\tbash
-200\t200\tpython3'
-host_contention_sample "$contention_log" unrelated-process 100 5003
+# A matched comparison may exempt exactly its verified owned server PID. The
+# exemption never applies to a second peer process, even with the same name.
+contention_snapshot='100\t100\t0.0\tbash
+101\t100\t95.0\tllama-server'
+host_contention_sample "$contention_log" owned-reference 100 5003 101
+test "$HOST_CONTENTION_STATE" = quiet
+test "$HOST_CONTENTION_OFFENDERS" = '-'
+contention_snapshot='100\t100\t0.0\tbash
+101\t101\t95.0\tllama-server'
+if host_contention_sample "$contention_log" escaped-owned-reference 100 5003 101; then
+  echo "host contention guard accepted a server outside the owned group" >&2
+  exit 1
+fi
+contention_snapshot='100\t100\t0.0\tbash
+101\t100\t95.0\tllama-server
+200\t200\t0.0\tllama-server'
+host_contention_sample "$contention_log" foreign-reference 100 5004 101
+test "$HOST_CONTENTION_STATE" = contended
+test "$HOST_CONTENTION_OFFENDERS" = '200:200:llama-server'
+if host_contention_sample "$contention_log" missing-owned-reference 100 5005 999; then
+  echo "host contention guard accepted an absent owned-server exemption" >&2
+  exit 1
+fi
+
+contention_snapshot='100\t100\t0.0\tbash
+200\t200\t99.9\t/usr/bin/python3 calendar_export.py'
+host_contention_sample "$contention_log" unrelated-process 100 5006
 test "$HOST_CONTENTION_STATE" = quiet
 
-contention_snapshot='200\t200\thf2q'
-if host_contention_sample "$contention_log" missing-owner 100 5004; then
+for python_model_command in \
+    '/usr/bin/python3 teacher_model_gen.py' \
+    '/opt/venv/bin/python inference.py' \
+    '/usr/bin/python3 -m mlx_lm.generate'; do
+  contention_snapshot="100\\t100\\t0.0\\tbash
+200\\t200\\t0.0\\t${python_model_command}"
+  host_contention_sample "$contention_log" python-model-work 100 5006
+  test "$HOST_CONTENTION_STATE" = contended
+  test "$HOST_CONTENTION_OFFENDERS" = '200:200:python-model-work'
+done
+
+contention_snapshot='100\t100\t0.0\tbash
+200\t200\t60.0\tpython3
+201\t201\t45.0\tnode'
+host_contention_sample "$contention_log" aggregate-foreign-cpu 100 5007
+test "$HOST_CONTENTION_STATE" = contended
+test "$HOST_CONTENTION_FOREIGN_CPU_PERCENT" = 105.0
+test "$HOST_CONTENTION_OFFENDERS" = '-'
+
+contention_snapshot='100\t100\t0.0\tbash
+200\t200\t100.0\tpython3'
+host_contention_sample "$contention_log" threshold-foreign-cpu 100 5008
+test "$HOST_CONTENTION_STATE" = contended
+test "$HOST_CONTENTION_FOREIGN_CPU_PERCENT" = 100.0
+
+contention_snapshot='200\t200\t0.0\thf2q'
+if host_contention_sample "$contention_log" missing-owner 100 5006; then
   echo "host contention guard accepted a snapshot without its owner" >&2
   exit 1
 fi
-contention_snapshot='not-a-pid\t100\thf2q'
-if host_contention_sample "$contention_log" malformed-snapshot 100 5005; then
+contention_snapshot='not-a-pid\t100\t0.0\thf2q'
+if host_contention_sample "$contention_log" malformed-snapshot 100 5007; then
   echo "host contention guard accepted a malformed process snapshot" >&2
   exit 1
 fi
+for invalid_cpu in NaN -1; do
+  contention_snapshot="100\\t100\\t${invalid_cpu}\\tbash"
+  if host_contention_sample "$contention_log" malformed-cpu 100 5008; then
+    echo "host contention guard accepted malformed CPU telemetry: $invalid_cpu" >&2
+    exit 1
+  fi
+done
 
 # Settle requires a trailing continuous quiet window. A contended sample
 # resets the same monotonic window instead of producing a magic delay or
@@ -192,8 +277,8 @@ host_contention_process_snapshot() {
   contention_index=$(<"$contention_index_file")
   state=${contention_sequence[$contention_index]}
   printf '%s\n' "$((contention_index + 1))" >"$contention_index_file"
-  printf '100\t100\tbash\n'
-  [[ "$state" == quiet ]] || printf '200\t200\tcargo\n'
+  printf '100\t100\t800.0\tbash\n'
+  [[ "$state" == quiet ]] || printf '200\t200\t0.0\tcargo\n'
 }
 sequence=(nominal nominal nominal nominal nominal)
 sequence_index=0
@@ -232,26 +317,26 @@ wait "$supervised_pid" 2>/dev/null || true
 # while a settle receipt may contain an earlier rejected sample if its trailing
 # quiet window is long enough.
 printf '%s\n' \
-  $'100\tquiet\tphase\t100\t-' \
-  $'102\tquiet\tphase\t100\t-' \
-  $'104\tquiet\tphase\t100\t-' >"$tmp_dir/valid-contention.log"
+  $'100\tquiet\tphase\t100\t99.9\t-' \
+  $'102\tquiet\tphase\t100\t99.9\t-' \
+  $'104\tquiet\tphase\t100\t99.9\t-' >"$tmp_dir/valid-contention.log"
 host_contention_validate_measurement_log "$tmp_dir/valid-contention.log" 5
 test "$HOST_CONTENTION_LOG_SAMPLES" = 3
 test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = 0
 
 printf '%s\n' \
-  $'100\tquiet\tsettle\t100\t-' \
-  $'105\tcontended\tsettle\t100\t200:200:cargo' \
-  $'110\tquiet\tsettle\t100\t-' \
-  $'115\tquiet\tsettle\t100\t-' \
-  $'120\tquiet\tsettle\t100\t-' >"$tmp_dir/valid-contention-settle.log"
+  $'100\tquiet\tsettle\t100\t99.9\t-' \
+  $'105\tcontended\tsettle\t100\t0.0\t200:200:cargo' \
+  $'110\tquiet\tsettle\t100\t99.9\t-' \
+  $'115\tquiet\tsettle\t100\t99.9\t-' \
+  $'120\tquiet\tsettle\t100\t99.9\t-' >"$tmp_dir/valid-contention-settle.log"
 host_contention_validate_settle_log "$tmp_dir/valid-contention-settle.log" 10 8
 test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = 1
 test "$HOST_CONTENTION_LOG_DURATION_SECONDS" = 10
 
 printf '%s\n' \
-  $'100\tquiet\tphase\t100\t-' \
-  $'102\tcontended\tphase\t100\t200:200:rustc' \
+  $'100\tquiet\tphase\t100\t99.9\t-' \
+  $'102\tcontended\tphase\t100\t0.0\t200:200:rustc' \
   >"$tmp_dir/contended-measurement.log"
 if host_contention_validate_measurement_log \
   "$tmp_dir/contended-measurement.log" 5; then
@@ -259,17 +344,38 @@ if host_contention_validate_measurement_log \
   exit 1
 fi
 printf '%s\n' \
-  $'100\tquiet\tphase\t100\t-' \
-  $'106\tquiet\tphase\t100\t-' >"$tmp_dir/gapped-contention.log"
+  $'100\tquiet\tphase\t100\t99.9\t-' \
+  $'106\tquiet\tphase\t100\t99.9\t-' >"$tmp_dir/gapped-contention.log"
 if host_contention_validate_measurement_log "$tmp_dir/gapped-contention.log" 5; then
   echo "host validator accepted a contention telemetry gap" >&2
   exit 1
 fi
-printf '100\tquiet\tphase\tnot-a-pgid\t-\n' \
+printf '100\tquiet\tphase\tnot-a-pgid\t0.0\t-\n' \
   >"$tmp_dir/malformed-contention.log"
 if host_contention_validate_measurement_log \
   "$tmp_dir/malformed-contention.log" 5; then
   echo "host validator accepted malformed contention telemetry" >&2
+  exit 1
+fi
+printf '%s\n' \
+  $'100\tquiet\tphase\t100\t100.0\t-' \
+  $'102\tquiet\tphase\t100\t100.0\t-' >"$tmp_dir/quiet-high-cpu.log"
+if host_contention_validate_measurement_log "$tmp_dir/quiet-high-cpu.log" 5; then
+  echo "host validator accepted quiet foreign CPU at the contention threshold" >&2
+  exit 1
+fi
+printf '%s\n' \
+  $'100\tcontended\tphase\t100\t99.9\t-' \
+  $'102\tcontended\tphase\t100\t99.9\t-' >"$tmp_dir/unexplained-contention.log"
+if host_contention_validate_measurement_log "$tmp_dir/unexplained-contention.log" 5; then
+  echo "host validator accepted unexplained sub-threshold contention" >&2
+  exit 1
+fi
+printf '%s\n' \
+  $'100\tquiet\tphase\t100\t-' \
+  $'102\tquiet\tphase\t100\t-' >"$tmp_dir/stale-v1-contention.log"
+if host_contention_validate_measurement_log "$tmp_dir/stale-v1-contention.log" 5; then
+  echo "host validator accepted stale process-group-v1 telemetry" >&2
   exit 1
 fi
 
@@ -548,7 +654,7 @@ for epoch in $(seq 100 5 160); do
   printf '%s\tnominal\tdeepseek-wave-1-settle\n' "$epoch"
 done >"$receipt_dir/settle.log"
 for epoch in $(seq 100 5 160); do
-  printf '%s\tquiet\tdeepseek-wave-1-settle\t100\t-\n' "$epoch"
+  printf '%s\tquiet\tdeepseek-wave-1-settle\t100\t0.0\t-\n' "$epoch"
 done >"$receipt_dir/settle-contention.log"
 printf '200\tnominal\tdeepseek-wave-1-measurement-start\n' \
   >"$receipt_dir/measurement.log"
@@ -556,11 +662,11 @@ printf '202\tnominal\tdeepseek-wave-1-measurement\n' \
   >>"$receipt_dir/measurement.log"
 printf '204\tnominal\tdeepseek-wave-1-measurement-end\n' \
   >>"$receipt_dir/measurement.log"
-printf '200\tquiet\tdeepseek-wave-1-measurement-start\t100\t-\n' \
+printf '200\tquiet\tdeepseek-wave-1-measurement-start\t100\t0.0\t-\n' \
   >"$receipt_dir/measurement-contention.log"
-printf '202\tquiet\tdeepseek-wave-1-measurement\t100\t-\n' \
+printf '202\tquiet\tdeepseek-wave-1-measurement\t100\t0.0\t-\n' \
   >>"$receipt_dir/measurement-contention.log"
-printf '204\tquiet\tdeepseek-wave-1-measurement-end\t100\t-\n' \
+printf '204\tquiet\tdeepseek-wave-1-measurement-end\t100\t0.0\t-\n' \
   >>"$receipt_dir/measurement-contention.log"
 settle_sha=$(shasum -a 256 "$receipt_dir/settle.log" | awk '{print $1}')
 measurement_sha=$(shasum -a 256 "$receipt_dir/measurement.log" | awk '{print $1}')
@@ -590,7 +696,7 @@ jq -n --arg settle_sha "$settle_sha" --arg measurement_sha "$measurement_sha" \
     non_nominal_measurement_samples:0, settle_telemetry_gaps:0,
     telemetry_gaps:0, settle_log_sha256:$settle_sha,
     measurement_log_sha256:$measurement_sha,
-    host_contention:{policy:"process-group-v1",
+    host_contention:{policy:"process-group-cpu-v2",
       settle:{log_sha256:$contention_settle_sha,samples:13,
         duration_seconds:60,contended_samples:0,telemetry_gaps:0},
       measurement:{log_sha256:$contention_measurement_sha,samples:3,
@@ -671,7 +777,7 @@ if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
 fi
 
 awk -F '\t' 'BEGIN { OFS="\t" }
-  NR == 2 { $2="contended"; $5="200:200:hf2q" }
+  NR == 2 { $2="contended"; $5="0.0"; $6="200:200:hf2q" }
   { print }
 ' "$receipt_dir/measurement-contention.log" \
   >"$receipt_dir/contended-host.log"
@@ -718,5 +824,34 @@ if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   echo "thermal receipt accepted misaligned host evidence" >&2
   exit 1
 fi
+
+# Both calibrated helper loops must forward the exact owned server PID while
+# retaining the stable release-gate owner. A same-group peer name is rejected
+# unless that final argument reaches host_contention_sample.
+contention_snapshot='100\t100\t0.0\tbash
+101\t100\t95.0\tllama-server'
+host_contention_process_snapshot() {
+  printf '%b\n' "$contention_snapshot"
+}
+thermal_read_state() { THERMAL_STATE=nominal; }
+thermal_wait_for_nominal "$tmp_dir/owned-server-settle-thermal.log" \
+  owned-server-settle 0 1 0 "$tmp_dir/owned-server-settle-host.log" 100 101
+test "$(awk -F '\t' 'NR == 1 { print $4 }' \
+  "$tmp_dir/owned-server-settle-host.log")" = 100
+
+monitor_state_reads=0
+thermal_read_process_state() {
+  if ((monitor_state_reads == 0)); then
+    THERMAL_PROCESS_STATE=R
+  else
+    THERMAL_PROCESS_STATE=""
+  fi
+  monitor_state_reads=$((monitor_state_reads + 1))
+}
+thermal_monitor_fair_or_better_while_pid \
+  "$tmp_dir/owned-server-measurement-thermal.log" owned-server-measurement \
+  999 0 "$tmp_dir/owned-server-measurement-host.log" 100 101
+test "$(awk -F '\t' 'NR == 1 { print $4 }' \
+  "$tmp_dir/owned-server-measurement-host.log")" = 100
 
 echo "macOS thermal guard contract: pass"

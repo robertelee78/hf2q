@@ -39,7 +39,7 @@ use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 
-use super::cache::{cache_model_path, ModelCache, QuantEntry, SourcePointer};
+use super::cache::{cache_mmproj_path, cache_model_path, ModelCache, QuantEntry, SourcePointer};
 use super::quant_select::{quant_type_from_gguf_path, select_quant, GpuInfo, QuantType};
 use crate::core::hardware::HardwareProfile;
 use crate::core::provenance::{self, compute_source_bundle_sha256, Provenance};
@@ -118,6 +118,7 @@ pub fn looks_like_hf_repo_id(arg: &str) -> bool {
 /// conversion CLI.
 fn map_quant_to_cli(quant: QuantType) -> &'static str {
     match quant {
+        QuantType::BF16 => "bf16",
         QuantType::Q2_K => "q2_k",
         QuantType::Q8_0 => "q8_0",
         QuantType::Q6_K => "q6_k",
@@ -134,6 +135,10 @@ fn map_quant_to_cli(quant: QuantType) -> &'static str {
 pub struct ResolvedModel {
     /// Final filesystem path to a GGUF ready for `mlx_native::gguf::GgufFile::open`.
     pub gguf_path: PathBuf,
+    /// Paired projector emitted or recovered with this exact text artifact.
+    /// `None` is an explicit text-only generation, not permission to search
+    /// for an unrelated sidecar by filename.
+    pub mmproj_path: Option<PathBuf>,
     /// `Some` when the auto-pipeline ran (HF input); `None` for a path passthrough.
     pub repo_id: Option<String>,
     /// `Some` when the auto-pipeline ran; `None` for a path passthrough.
@@ -168,6 +173,7 @@ pub fn resolve_or_prepare_model(
     match input {
         ModelInput::Path(p) => Ok(ResolvedModel {
             gguf_path: p,
+            mmproj_path: None,
             repo_id: None,
             quant: None,
             from_cache: false,
@@ -222,11 +228,20 @@ fn run_auto_pipeline(
 
     // Step 2: invoke convert subprocess to produce the GGUF.
     let target_gguf = cache_model_path(cache.root(), repo_id, quant)?;
+    let target_mmproj = source_has_vision_config(&snapshot.local_dir)?
+        .then(|| cache_mmproj_path(cache.root(), repo_id, quant))
+        .transpose()?;
     if let Some(parent) = target_gguf.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create quant dir: {}", parent.display()))?;
     }
-    run_convert_subprocess(&snapshot.local_dir, &target_gguf, quant, no_integrity)?;
+    run_convert_subprocess(
+        &snapshot.local_dir,
+        &target_gguf,
+        target_mmproj.as_deref(),
+        quant,
+        no_integrity,
+    )?;
     verify_quant_identity(&target_gguf, quant).with_context(|| {
         format!(
             "verify converted GGUF quant identity for {repo_id}@{}",
@@ -242,7 +257,7 @@ fn run_auto_pipeline(
     let entry = QuantEntry {
         quant_type: quant.as_str().to_string(),
         gguf_path: target_gguf.clone(),
-        mmproj_path: None,
+        mmproj_path: target_mmproj.clone(),
         bytes,
         sha256,
         quantized_at_secs: secs_since_epoch(),
@@ -263,6 +278,7 @@ fn run_auto_pipeline(
 
     Ok(ResolvedModel {
         gguf_path: target_gguf,
+        mmproj_path: target_mmproj,
         repo_id: Some(repo_id.to_string()),
         quant: Some(quant),
         from_cache: false,
@@ -304,6 +320,7 @@ fn lookup_and_verify(
         None => return Ok(None),
     };
     let path = entry.gguf_path.clone();
+    let mmproj_path = entry.mmproj_path.clone();
     if !path.exists() {
         tracing::warn!(
             repo = repo_id,
@@ -312,6 +329,14 @@ fn lookup_and_verify(
             "cache manifest entry references missing GGUF; re-quantizing"
         );
         return Ok(None);
+    }
+    if let Some(projector) = mmproj_path.as_ref() {
+        anyhow::ensure!(
+            projector.is_file(),
+            "cached multimodal generation {repo_id}@{} is incomplete: projector '{}' is missing",
+            quant.as_str(),
+            projector.display()
+        );
     }
     if no_integrity {
         tracing::warn!(
@@ -343,6 +368,7 @@ fn lookup_and_verify(
     );
     Ok(Some(ResolvedModel {
         gguf_path: path,
+        mmproj_path,
         repo_id: Some(repo_id.to_string()),
         quant: Some(quant),
         from_cache: true,
@@ -361,6 +387,15 @@ fn verify_quant_identity(path: &Path, expected: QuantType) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn source_has_vision_config(snapshot_dir: &Path) -> Result<bool> {
+    let config_path = snapshot_dir.join("config.json");
+    let raw = std::fs::read(&config_path)
+        .with_context(|| format!("read source config: {}", config_path.display()))?;
+    let root: serde_json::Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("parse source config: {}", config_path.display()))?;
+    Ok(root.get("vision_config").is_some())
 }
 
 /// Outcome of the integrity check after eliminating `--no-integrity`.
@@ -555,8 +590,9 @@ fn ensure_source_present(
 fn run_convert_subprocess(
     snapshot_dir: &Path,
     target_gguf: &Path,
+    target_mmproj: Option<&Path>,
     quant: QuantType,
-    _no_integrity: bool,
+    no_integrity: bool,
 ) -> Result<()> {
     let bin = std::env::var("CARGO_BIN_EXE_hf2q").unwrap_or_else(|_| {
         // Production fallback: same-binary self-spawn.  `current_exe` is
@@ -567,7 +603,13 @@ fn run_convert_subprocess(
     });
     let cli_quant = map_quant_to_cli(quant);
     let mut cmd = Command::new(&bin);
-    cmd.args(convert_command_args(snapshot_dir, target_gguf, quant));
+    cmd.args(convert_command_args(
+        snapshot_dir,
+        target_gguf,
+        target_mmproj,
+        quant,
+        no_integrity,
+    ));
 
     tracing::info!(
         bin = %bin,
@@ -610,16 +652,23 @@ fn run_convert_subprocess(
 fn convert_command_args(
     snapshot_dir: &Path,
     target_gguf: &Path,
+    target_mmproj: Option<&Path>,
     quant: QuantType,
+    _no_integrity: bool,
 ) -> Vec<std::ffi::OsString> {
-    vec![
+    let mut args = vec![
         "convert".into(),
         snapshot_dir.as_os_str().to_owned(),
         "--quant".into(),
         map_quant_to_cli(quant).into(),
         "--output".into(),
         target_gguf.as_os_str().to_owned(),
-    ]
+    ];
+    if let Some(target_mmproj) = target_mmproj {
+        args.push("--mmproj-output".into());
+        args.push(target_mmproj.as_os_str().to_owned());
+    }
+    args
 }
 
 fn secs_since_epoch() -> u64 {
@@ -743,6 +792,7 @@ mod tests {
 
     #[test]
     fn map_quant_uses_exact_conversion_selectors() {
+        assert_eq!(map_quant_to_cli(QuantType::BF16), "bf16");
         assert_eq!(map_quant_to_cli(QuantType::Q2_K), "q2_k");
         assert_eq!(map_quant_to_cli(QuantType::Q8_0), "q8_0");
         assert_eq!(map_quant_to_cli(QuantType::Q6_K), "q6_k");
@@ -759,7 +809,9 @@ mod tests {
         argv.extend(convert_command_args(
             Path::new("/tmp/exact-source"),
             Path::new("/tmp/exact-output.gguf"),
+            Some(Path::new("/tmp/exact-mmproj.gguf")),
             QuantType::Q4_K_M,
+            true,
         ));
         let parsed = crate::cli::Cli::try_parse_from(argv).expect("self-spawn argv must parse");
         let crate::cli::Command::Convert(args) = parsed.command else {
@@ -768,6 +820,10 @@ mod tests {
         assert_eq!(args.hf_dir, Some(PathBuf::from("/tmp/exact-source")));
         assert_eq!(args.quant.as_deref(), Some("q4_k_m"));
         assert_eq!(args.output, Some(PathBuf::from("/tmp/exact-output.gguf")));
+        assert_eq!(
+            args.mmproj_output,
+            Some(PathBuf::from("/tmp/exact-mmproj.gguf"))
+        );
     }
 
     // ── resolve_or_prepare_model — pass-through for filesystem paths ────
@@ -838,8 +894,10 @@ mod tests {
 
         // Drop the cached GGUF on disk, hash it, record it.
         let gguf = cache_model_path(cache.root(), repo_id, quant).unwrap();
+        let mmproj = cache_mmproj_path(cache.root(), repo_id, quant).unwrap();
         std::fs::create_dir_all(gguf.parent().unwrap()).unwrap();
         std::fs::write(&gguf, build_gguf_with_string_metadata(quant, &[])).unwrap();
+        std::fs::write(&mmproj, b"projector fixture").unwrap();
         let sha = sha256_file(&gguf).unwrap();
         let bytes = std::fs::metadata(&gguf).unwrap().len();
         cache
@@ -848,7 +906,7 @@ mod tests {
                 QuantEntry {
                     quant_type: quant.as_str().to_string(),
                     gguf_path: gguf.clone(),
-                    mmproj_path: None,
+                    mmproj_path: Some(mmproj.clone()),
                     bytes,
                     sha256: sha,
                     quantized_at_secs: secs_since_epoch(),
@@ -862,6 +920,7 @@ mod tests {
         let r = resolve_or_prepare_model(repo_id, &mut cache, &hw, false).unwrap();
         assert!(r.from_cache, "expected cache-hit path");
         assert_eq!(r.gguf_path, gguf);
+        assert_eq!(r.mmproj_path, Some(mmproj));
         assert_eq!(r.repo_id.as_deref(), Some(repo_id));
         assert_eq!(r.quant, Some(QuantType::Q8_0));
     }

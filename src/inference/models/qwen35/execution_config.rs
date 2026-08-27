@@ -26,7 +26,8 @@ pub(crate) enum Qwen35ExecutionProfile {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Qwen35GateUpPolicy {
     /// Use a native fused gate/up/SILU entrypoint when the actual codec and
-    /// path support it; the prefill arena may still use separate projections.
+    /// physical storage support it. Scalar, pooled, and arena-backed rows
+    /// share the same eligibility and dispatch decision.
     PreferFusedWhenSupported,
     Separate,
 }
@@ -77,9 +78,6 @@ impl Qwen35ExecutionConfiguration {
         }
         if env_exact_one("HF2Q_FUSED_QKVG") {
             bail!("evidence profile v1 does not admit fused QKVG");
-        }
-        if env_exact_one("HF2Q_F16_SHADOW") {
-            bail!("evidence profile v1 does not admit F16 shadow weights");
         }
         if std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() == Ok("0") {
             bail!("evidence profile v1 requires the production prefill arena topology");

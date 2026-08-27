@@ -1,14 +1,15 @@
 //! Per-model boundary-marker + tool-call registration (ADR-005 Decision #21,
 //! Decision #6).
 //!
-//! Each supported model family registers the literal text markers its chat
+//! Each known chat-protocol family registers the literal text markers its
 //! template emits for:
 //!   - **Reasoning boundaries** — open/close marker pair that delimits
 //!     pre-answer reasoning traces. Tokens between the open and close markers
 //!     go into `message.reasoning_content`; the rest goes into
 //!     `message.content`. Streaming splits into `delta.reasoning_content`
 //!     vs `delta.content` the same way. Per-family marker shapes vary:
-//!     Qwen 3.5/3.6 emits the standard `<think>` / `</think>` HF convention;
+//!     proven local Qwen 3.5/3.6/3.8 artifacts emit the standard
+//!     `<think>` / `</think>` convention;
 //!     Gemma 4 emits its `<|channel>` / `<channel|>` channel-block convention
 //!     (matches the chat-template `strip_thinking` macro and the
 //!     tokenizer_config `x-regex` that spans `<|channel>thought\n…<channel|>`).
@@ -22,7 +23,10 @@
 //! malformed output. Grammar-constrained decoding (Decision #6) guarantees
 //! the JSON is well-formed between the markers.
 //!
-//! Day-one registered models: `gemma4`, `qwen35` (Qwen 3.5 / 3.6 family).
+//! Registration is a protocol-marker heuristic, not architecture admission.
+//! Conversion and model loading independently validate the exact config and
+//! artifact. In particular, the Qwen 3.7 model-id spelling is reserved here
+//! for wire compatibility but has no locally proven architecture artifact.
 //! Additional models are added by calling `register(...)` at process start
 //! or by editing this file.
 //!
@@ -41,7 +45,7 @@
 //!     If the grammar constrained plain `{"key":"val"}` the model would fight
 //!     the constraint and produce degenerate outputs; the constraint must match
 //!     the template's expected emission exactly.
-//!   - **Qwen 3.5/3.6** — the chat template's tool-call block emits
+//!   - **Qwen protocol** — the chat template's tool-call block emits
 //!     `<function=NAME><parameter=key>val</parameter>...</function>` XML.
 //!     Same reason: the constraint must match the template's emission shape.
 //!   - Plain JSON constraints (via json_schema::schema_to_gbnf) are correct
@@ -135,6 +139,12 @@ impl ModelRegistration {
     /// Returns `true` if this registration has a usable tool-call span.
     pub fn has_tools(&self) -> bool {
         self.tool_open.is_some() && self.tool_close.is_some()
+    }
+
+    /// Qwen families share one native reasoning/tool wire dialect while
+    /// retaining separate architecture registrations and cache ownership.
+    pub fn uses_qwen_protocol(&self) -> bool {
+        is_qwen_protocol_family(self.family)
     }
 
     /// Emit a GBNF string that physically constrains the model output to a
@@ -371,14 +381,16 @@ pub const GEMMA4: ModelRegistration = ModelRegistration {
     tool_preamble: None,
 };
 
-/// Qwen 3.5-family models, including Qwen3.6 and Qwen3.8 releases. Uses
+/// Qwen chat-protocol marker heuristic. Qwen 3.5/3.6/3.8 are locally proven;
+/// the 3.7 spellings reserve only protocol selection and do not admit a model.
+/// Uses
 /// `<think>` / `</think>` — the Qwen convention
 /// (no pipe in the closer; distinct from Gemma's). Tool calling also uses
 /// `<tool_call>` / `</tool_call>` (Qwen standard).
 pub const QWEN35: ModelRegistration = ModelRegistration {
     family: "qwen35",
     id_substrings: &[
-        "qwen3.5", "qwen3.6", "qwen3.8", "qwen35", "qwen36", "qwen38",
+        "qwen3.5", "qwen3.6", "qwen3.7", "qwen3.8", "qwen35", "qwen36", "qwen37", "qwen38",
     ],
     reasoning_open: Some("<think>"),
     reasoning_close: Some("</think>"),
@@ -386,6 +398,10 @@ pub const QWEN35: ModelRegistration = ModelRegistration {
     tool_close: Some("</tool_call>"),
     tool_preamble: None,
 };
+
+pub fn is_qwen_protocol_family(family: &str) -> bool {
+    family == "qwen35"
+}
 
 /// DeepSeek-V4-Flash-0731. Tool calls use one outer DSML block containing
 /// one or more invoke elements; the body parser therefore returns a vector
@@ -505,7 +521,7 @@ impl ReasoningSplitter {
             _ => return None,
         };
         let implicit_reasoning_close_marker =
-            (reg.family == "qwen35").then_some(reg.tool_open).flatten();
+            reg.uses_qwen_protocol().then_some(reg.tool_open).flatten();
         let cap = open
             .len()
             .max(close.len())
@@ -3972,10 +3988,9 @@ mod tests {
     #[test]
     fn iter230_b2_factory_only_construction() {
         let direct = format!("{}::{}", "ReasoningSplitter", "from_registration");
-        let modules: [(&str, &str); 4] = [
+        let modules: [(&str, &str); 3] = [
             ("engine.rs", include_str!("engine.rs")),
             ("engine_qwen35.rs", include_str!("engine_qwen35.rs")),
-            ("engine_qwen3vl.rs", include_str!("engine_qwen3vl.rs")),
             ("handlers.rs", include_str!("handlers.rs")),
         ];
         for (name, src) in modules {
@@ -3997,12 +4012,37 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_matches_family_ids() {
+    fn qwen_protocol_matches_proven_and_reserved_ids() {
         assert!(QWEN35.matches("qwen3.5-27b"));
         assert!(QWEN35.matches("qwen3.6-35b-a3b-abliterix"));
+        assert!(QWEN35.matches("Qwen/Qwen3.7-27B"));
+        assert!(QWEN35.matches("qwen37-27b-q5_k_m"));
         assert!(QWEN35.matches("Qwen/Qwen3.8-27B"));
         assert!(QWEN35.matches("qwen38-27b-q4_k_m"));
+        assert!(!QWEN35.matches("Qwen3-VL-2B-Instruct"));
         assert!(QWEN35.matches("Qwen35-14B-chat"));
+    }
+
+    #[test]
+    fn qwen37_protocol_reservation_is_not_architecture_admission() {
+        assert!(QWEN35.matches("Qwen/Qwen3.7-27B"));
+        assert!(
+            crate::core::model_arch::detect_model_arch(&serde_json::json!({
+                "model_type": "qwen3_7",
+                "architectures": ["Qwen3_7ForConditionalGeneration"]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn qwen_vision_is_not_advertised_or_aliased_to_qwen_text() {
+        for id in ["Qwen3-VL-2B-Instruct", "qwen3_vl-4b-q5_k_m", "Qwen3VL-8B"] {
+            assert!(
+                find_for(id).is_none(),
+                "unsupported architecture matched {id}"
+            );
+        }
     }
 
     #[test]

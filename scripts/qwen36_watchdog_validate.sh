@@ -38,9 +38,10 @@ qwen36_file_identity() {
 }
 
 # A release gate hashes each very large model exactly once, then passes the
-# resulting receipt to its child harnesses.  The children bind the expected
-# digest to the same unchanged file without rereading tens of GiB.  Standalone
-# harnesses intentionally retain the full-hash fallback.
+# resulting receipt to its child harnesses.  When a sealed hf2q binary is
+# supplied, its schema-v2 recorder is the sole hash authority and emits the
+# runtime receipt directly.  The v1 shell receipt remains only for legacy
+# harness compatibility; it is never runtime hash-reuse authority.
 hf2q_release_model_snapshot() {
   local path="$1"
   stat -f '%d:%i:%z:%m:%c' "$path" 2>/dev/null \
@@ -51,7 +52,7 @@ hf2q_release_record_model_verification() {
   local path="$1"
   local expected_sha256="$2"
   local receipt="$3"
-  local before_snapshot actual_sha256 after_snapshot
+  local before_snapshot actual_sha256 after_snapshot recorder
 
   [[ -f "$path" && -r "$path" ]] || {
     echo "release model is missing or unreadable: $path" >&2
@@ -61,6 +62,24 @@ hf2q_release_record_model_verification() {
     echo "release model SHA-256 must be a lowercase 64-character digest" >&2
     return 1
   }
+  recorder=${HF2Q_MODEL_VERIFICATION_BINARY:-}
+  if [[ -n "$recorder" ]]; then
+    [[ -x "$recorder" ]] || {
+      echo "schema-v2 model verification recorder is missing or non-executable: $recorder" >&2
+      return 1
+    }
+    "$recorder" __record-model-verification \
+      --artifact "$path" --sha256 "$expected_sha256" >"$receipt.tmp.$$" || return 1
+    hf2q_release_verify_model "$path" "$expected_sha256" "$receipt.tmp.$$" || {
+      rm -f "$receipt.tmp.$$"
+      return 1
+    }
+    mv "$receipt.tmp.$$" "$receipt"
+    return
+  fi
+
+  # Compatibility only: callers that have not supplied a sealed binary still
+  # receive a v1 shell receipt.  A v1 receipt is upgraded before server use.
   before_snapshot=$(hf2q_release_model_snapshot "$path") || return 1
   actual_sha256=$(shasum -a 256 "$path" | awk '{print $1}') || return 1
   after_snapshot=$(hf2q_release_model_snapshot "$path") || return 1
@@ -107,11 +126,14 @@ hf2q_release_verify_model() {
     return 1
   }
   jq -e '
-    .schema_version == 1
+    (.schema_version == 1 or .schema_version == 2)
     and (.path | type == "string" and length > 0)
     and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
     and (.file_snapshot | type == "string" and length > 0)
     and .content_hash_verified == true
+    and (if .schema_version == 2 then
+      (.file_stamp | type == "object")
+    else true end)
   ' "$receipt" >/dev/null || {
     echo "release model verification receipt is malformed: $receipt" >&2
     return 1
@@ -136,7 +158,7 @@ hf2q_release_prepare_model_verification() {
   local run_receipt="$3"
   local cache_dir="$4"
   local cache_receipt="$cache_dir/$expected_sha256.json"
-  local verification_mode=content_hash
+  local verification_mode=content_hash schema_version
 
   [[ ! -e "$run_receipt" ]] || {
     echo "per-run model verification receipt already exists: $run_receipt" >&2
@@ -146,13 +168,56 @@ hf2q_release_prepare_model_verification() {
   if [[ -s "$cache_receipt" ]] \
     && hf2q_release_verify_model "$path" "$expected_sha256" "$cache_receipt" \
       2>/dev/null; then
-    verification_mode=cached_unchanged_file
+    schema_version=$(jq -er .schema_version "$cache_receipt") || return 1
+    if [[ "$schema_version" == 2 ]]; then
+      verification_mode=cached_unchanged_file
+    elif [[ -n ${HF2Q_MODEL_VERIFICATION_BINARY:-} ]]; then
+      # v1 has only second-resolution shell evidence and cannot authorize the
+      # server's runtime skip.  Upgrade it once through the v2 recorder.
+      hf2q_release_record_model_verification \
+        "$path" "$expected_sha256" "$cache_receipt"
+      verification_mode=upgraded_legacy_receipt
+    else
+      verification_mode=cached_unchanged_file
+    fi
   else
     hf2q_release_record_model_verification \
       "$path" "$expected_sha256" "$cache_receipt"
   fi
   jq --arg run_verification "$verification_mode" \
     '. + {run_verification:$run_verification}' "$cache_receipt" \
+    >"$run_receipt.tmp.$$"
+  mv "$run_receipt.tmp.$$" "$run_receipt"
+  hf2q_release_verify_model "$path" "$expected_sha256" "$run_receipt"
+}
+
+# Make a per-run receipt from upstream evidence.  A v2 receipt is copied after
+# its unchanged-file check; a v1 receipt is upgraded exactly once when the
+# sealed recorder is available.  This prevents a v1 receipt from reaching a
+# server that would otherwise perform an unaccounted second full hash.
+hf2q_release_materialize_model_verification() {
+  local path="$1"
+  local expected_sha256="$2"
+  local supplied_receipt="$3"
+  local run_receipt="$4"
+  local schema_version verification_mode
+
+  [[ ! -e "$run_receipt" ]] || {
+    echo "per-run model verification receipt already exists: $run_receipt" >&2
+    return 1
+  }
+  hf2q_release_verify_model "$path" "$expected_sha256" "$supplied_receipt"
+  schema_version=$(jq -er .schema_version "$supplied_receipt") || return 1
+  if [[ "$schema_version" == 1 && -n ${HF2Q_MODEL_VERIFICATION_BINARY:-} ]]; then
+    hf2q_release_record_model_verification "$path" "$expected_sha256" "$run_receipt"
+    verification_mode=upgraded_legacy_receipt
+  else
+    jq . "$supplied_receipt" >"$run_receipt.tmp.$$"
+    mv "$run_receipt.tmp.$$" "$run_receipt"
+    verification_mode=provided_receipt
+  fi
+  jq --arg run_verification "$verification_mode" \
+    '. + {run_verification:$run_verification}' "$run_receipt" \
     >"$run_receipt.tmp.$$"
   mv "$run_receipt.tmp.$$" "$run_receipt"
   hf2q_release_verify_model "$path" "$expected_sha256" "$run_receipt"

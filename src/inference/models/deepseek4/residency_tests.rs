@@ -7,7 +7,9 @@ use crate::backends::gguf::types::MetaValue;
 use crate::backends::gguf::writer::GgufWriter;
 use crate::quantize::ggml_quants::GgmlType;
 
-use super::residency::{Deepseek4Weights, WeightLookupError, WeightResidencyError};
+use super::residency::{
+    classify_hash_route_table, Deepseek4Weights, WeightLookupError, WeightResidencyError,
+};
 use super::weights::{required_tensor_specs, TensorRole, WeightCatalogError};
 use super::Deepseek4Config;
 
@@ -50,6 +52,24 @@ pub(super) fn tiny_config() -> Deepseek4Config {
         hyper_connection_epsilon: 1e-6,
         hash_layer_count: 1,
     }
+}
+
+#[test]
+fn hash_route_payload_classification_enables_fast_path_only_for_unique_rows() {
+    assert!(classify_hash_route_table("lookup", &[0, 1, 2, 3], 2, 4).unwrap());
+    assert!(!classify_hash_route_table("lookup", &[0, 0, 2, 3], 2, 4).unwrap());
+
+    let error = classify_hash_route_table("lookup", &[0, 4], 2, 4).unwrap_err();
+    assert!(matches!(
+        error,
+        WeightResidencyError::HashExpertOutOfRange {
+            row: 0,
+            slot: 1,
+            expert: 4,
+            expert_count: 4,
+            ..
+        }
+    ));
 }
 
 fn metadata(cfg: &Deepseek4Config) -> Vec<(String, MetaValue)> {
@@ -214,11 +234,14 @@ fn metadata(cfg: &Deepseek4Config) -> Vec<(String, MetaValue)> {
     ]
 }
 
-fn tensor_type(role: TensorRole, name: &str, bad_lookup: bool) -> GgmlType {
+fn tensor_type(role: TensorRole, name: &str, bad_lookup: bool, bad_ape: bool) -> GgmlType {
     match role {
-        TensorRole::RawMatrix if name == "token_embd.weight" => GgmlType::Q2_K,
-        TensorRole::RawMatrix => GgmlType::Q4_0,
-        TensorRole::ElementwiseF32 if name.contains("_ape.weight") => GgmlType::Q4_0,
+        TensorRole::EmbeddingMatrix if name == "token_embd.weight" => GgmlType::Q2_K,
+        TensorRole::EmbeddingMatrix
+        | TensorRole::DenseMatrix
+        | TensorRole::GroupedMatrix
+        | TensorRole::ExpertStack => GgmlType::Q4_0,
+        TensorRole::ElementwiseF32 if bad_ape && name.contains("_ape.weight") => GgmlType::Q4_0,
         TensorRole::ElementwiseF32 => GgmlType::F32,
         TensorRole::IntegerLookupI32 if bad_lookup => GgmlType::F32,
         TensorRole::IntegerLookupI32 => GgmlType::I32,
@@ -251,11 +274,25 @@ fn payload(spec_shape: &[usize], ggml_type: GgmlType) -> Vec<u8> {
             }
             data
         }
+        GgmlType::Q5_0 | GgmlType::Q5_K => {
+            let values: Vec<f32> = (0..spec_shape.iter().product::<usize>())
+                .map(|index| ((index % 67) as f32 - 33.0) / 16.0)
+                .collect();
+            match ggml_type {
+                GgmlType::Q5_0 => {
+                    crate::quantize::ggml_quants::q5_0::quantize(&values, columns, None)
+                }
+                GgmlType::Q5_K => {
+                    crate::quantize::ggml_quants::q5_k::quantize(&values, columns, None)
+                }
+                _ => unreachable!(),
+            }
+        }
         GgmlType::F32 => (0..spec_shape.iter().product::<usize>())
             .flat_map(|_| 1.0_f32.to_le_bytes())
             .collect(),
         GgmlType::I32 => (0..spec_shape.iter().product::<usize>())
-            .flat_map(|value| (value as i32).to_le_bytes())
+            .flat_map(|value| ((value % columns) as i32).to_le_bytes())
             .collect(),
         _ => vec![0; bytes],
     }
@@ -265,6 +302,25 @@ pub(super) fn open_fixture(
     cfg: &Deepseek4Config,
     omit_last: bool,
     bad_lookup: bool,
+) -> (tempfile::TempDir, GgufFile) {
+    open_fixture_with_options(cfg, omit_last, bad_lookup, false, None)
+}
+
+pub(super) fn open_fixture_with_embedding_type(
+    cfg: &Deepseek4Config,
+    omit_last: bool,
+    bad_lookup: bool,
+    embedding_type: Option<GgmlType>,
+) -> (tempfile::TempDir, GgufFile) {
+    open_fixture_with_options(cfg, omit_last, bad_lookup, false, embedding_type)
+}
+
+fn open_fixture_with_options(
+    cfg: &Deepseek4Config,
+    omit_last: bool,
+    bad_lookup: bool,
+    bad_ape: bool,
+    embedding_type: Option<GgmlType>,
 ) -> (tempfile::TempDir, GgufFile) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("weights.gguf");
@@ -282,7 +338,12 @@ pub(super) fn open_fixture(
     }
     let mut types = Vec::with_capacity(specs.len());
     for spec in &specs {
-        let ggml_type = tensor_type(spec.role, &spec.name, bad_lookup);
+        let ggml_type = if spec.name == "token_embd.weight" {
+            embedding_type
+                .unwrap_or_else(|| tensor_type(spec.role, &spec.name, bad_lookup, bad_ape))
+        } else {
+            tensor_type(spec.role, &spec.name, bad_lookup, bad_ape)
+        };
         let dims: Vec<u64> = spec.shape.iter().rev().map(|&dim| dim as u64).collect();
         writer
             .reserve_tensor_info(&spec.name, &dims, ggml_type)
@@ -323,6 +384,9 @@ fn loader_preserves_raw_blocks_and_expands_only_elementwise_state() {
     );
     assert!(weights.file_backed_bytes() > weights.anonymous_bytes());
     assert_eq!(weights.mapped_segment_count(), 1);
+    assert_eq!(weights.anonymous_bytes(), 0);
+    assert_eq!(weights.file_backed_bytes(), weights.resident_bytes());
+    assert!(weights.expert_ids_are_distinct_per_token(0));
 
     let embedding = weights.raw_matrix("token_embd.weight").unwrap();
     assert_eq!(embedding.dtype(), DType::U8);
@@ -334,12 +398,13 @@ fn loader_preserves_raw_blocks_and_expands_only_elementwise_state() {
 
     let norm = weights.f32_state("output_norm.weight").unwrap();
     assert_eq!(norm.dtype(), DType::F32);
-    assert_eq!(norm.byte_len(), 256 * 4);
+    assert_eq!(norm.data_byte_len(), 256 * 4);
     let ape = weights
         .f32_state("blk.0.attn_compressor_ape.weight")
         .unwrap();
     assert_eq!(ape.dtype(), DType::F32);
-    assert_eq!(ape.byte_len(), 4 * 64 * 4);
+    assert_eq!(ape.data_byte_len(), 4 * 64 * 4);
+    assert!(ape.is_file_backed());
 
     let lookup = weights.i32_lookup("blk.0.ffn_gate_tid2eid.weight").unwrap();
     assert_eq!(lookup.dtype(), DType::I32);
@@ -350,7 +415,7 @@ fn loader_preserves_raw_blocks_and_expands_only_elementwise_state() {
         weights.f32_state("token_embd.weight"),
         Err(WeightLookupError::RoleMismatch {
             expected: TensorRole::ElementwiseF32,
-            actual: TensorRole::RawMatrix,
+            actual: TensorRole::EmbeddingMatrix,
             ..
         })
     ));
@@ -361,7 +426,7 @@ fn loader_preserves_raw_blocks_and_expands_only_elementwise_state() {
 }
 
 #[test]
-fn loader_rejects_catalog_and_i32_storage_before_residency() {
+fn loader_rejects_catalog_and_i32_storage_but_expands_quantized_elementwise_state() {
     let cfg = tiny_config();
     let (_directory, missing) = open_fixture(&cfg, true, false);
     let _gpu = crate::inference::hf2q_gpu_test_lock();
@@ -380,4 +445,38 @@ fn loader_rejects_catalog_and_i32_storage_before_residency() {
             ..
         })
     ));
+
+    let (_directory, wrong_ape) = open_fixture_with_options(&cfg, false, false, true, None);
+    let weights =
+        Deepseek4Weights::load_from_gguf(&wrong_ape, &cfg, MlxDevice::new().unwrap()).unwrap();
+    let ape = weights
+        .f32_state("blk.0.attn_compressor_ape.weight")
+        .unwrap();
+    assert_eq!(ape.dtype(), DType::F32);
+    assert_eq!(ape.data_byte_len(), 4 * 64 * 4);
+    assert!(!ape.is_file_backed());
+}
+
+#[test]
+fn model_free_preflight_rejects_missing_and_wrong_lookup_but_accepts_quantized_state() {
+    let cfg = tiny_config();
+    let (_directory, missing) = open_fixture(&cfg, true, false);
+    assert!(matches!(
+        Deepseek4Weights::preflight_gguf(&missing, &cfg),
+        Err(WeightResidencyError::Catalog(
+            WeightCatalogError::Missing { .. }
+        ))
+    ));
+
+    let (_directory, wrong_lookup) = open_fixture(&cfg, false, true);
+    assert!(matches!(
+        Deepseek4Weights::preflight_gguf(&wrong_lookup, &cfg),
+        Err(WeightResidencyError::StorageType {
+            role: TensorRole::IntegerLookupI32,
+            ..
+        })
+    ));
+
+    let (_directory, wrong_f32_state) = open_fixture_with_options(&cfg, false, false, true, None);
+    Deepseek4Weights::preflight_gguf(&wrong_f32_state, &cfg).unwrap();
 }

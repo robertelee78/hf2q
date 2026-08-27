@@ -5,6 +5,7 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
+unset HF2Q_MODEL_VERIFICATION_BINARY HF2Q_TEST_RECORDER_CALLS
 
 for command in jq awk cmp diff sed wc tr mktemp seq shasum stat find grep date sleep cat; do
   command -v "$command" >/dev/null || {
@@ -63,14 +64,44 @@ expect_fail hf2q_release_verify_model \
   "$model_path" "$model_sha256" "$model_receipt"
 hf2q_release_verify_model "$model_path" "$model_sha256" ""
 
+# The sealed recorder is the only v2 content-hash authority.  This fixture
+# emits a schema-v2 receipt and records invocation count; the Rust command it
+# stands in for owns the real before/hash/after check.
+v2_recorder="$test_dir/fake-hf2q"
+v2_recorder_calls="$test_dir/v2-recorder-calls"
+cat >"$v2_recorder" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == __record-model-verification && "$2" == --artifact && "$4" == --sha256 ]]
+path=$3
+sha256=$5
+calls=${HF2Q_TEST_RECORDER_CALLS:?}
+printf 'record\n' >>"$calls"
+snapshot=$(stat -f '%d:%i:%z:%m:%c' "$path" 2>/dev/null || stat -c '%d:%i:%s:%Y:%Z' "$path")
+IFS=: read -r device inode bytes modified changed <<<"$snapshot"
+jq -n --arg path "$path" --arg sha256 "$sha256" --arg snapshot "$snapshot" \
+  --argjson device "$device" --argjson inode "$inode" --argjson bytes "$bytes" \
+  --argjson modified "$modified" --argjson changed "$changed" \
+  '{schema_version:2,path:$path,sha256:$sha256,file_snapshot:$snapshot,
+    file_stamp:{device:$device,inode:$inode,bytes:$bytes,
+      modified_seconds:$modified,modified_nanoseconds:0,
+      changed_seconds:$changed,changed_nanoseconds:0},content_hash_verified:true}'
+EOF
+chmod +x "$v2_recorder"
+
 # A second release run with an unchanged file reuses the persistent receipt
-# and performs no content scan. Replacing the file invalidates that cache and
-# forces exactly one new scan before a fresh per-run receipt is issued.
+# and performs neither another recorder invocation nor a shell content scan.
+# Replacing the file invalidates that cache and invokes the recorder exactly
+# once for the replacement.
 first_run_receipt="$test_dir/first-run-model-verification.json"
 second_run_receipt="$test_dir/second-run-model-verification.json"
+export HF2Q_MODEL_VERIFICATION_BINARY="$v2_recorder"
+export HF2Q_TEST_RECORDER_CALLS="$v2_recorder_calls"
 hf2q_release_prepare_model_verification \
   "$model_path" "$model_sha256" "$first_run_receipt" "$model_cache"
 [[ "$(jq -er .run_verification "$first_run_receipt")" == content_hash ]]
+[[ "$(jq -er .schema_version "$first_run_receipt")" == 2 ]]
+[[ "$(wc -l <"$v2_recorder_calls" | tr -d ' ')" == 1 ]]
 unexpected_shasum="$test_dir/unexpected-cached-shasum"
 # shellcheck disable=SC2329
 shasum() {
@@ -81,23 +112,34 @@ hf2q_release_prepare_model_verification \
   "$model_path" "$model_sha256" "$second_run_receipt" "$model_cache"
 [[ "$(jq -er .run_verification "$second_run_receipt")" == cached_unchanged_file ]]
 [[ ! -e "$unexpected_shasum" ]]
+[[ "$(wc -l <"$v2_recorder_calls" | tr -d ' ')" == 1 ]]
 unset -f shasum
 
 third_run_receipt="$test_dir/third-run-model-verification.json"
 replacement="$test_dir/cached-model-replacement.gguf"
 printf 'fixed-model-bytes\n' >"$replacement"
 mv "$replacement" "$model_path"
-rehash_calls="$test_dir/rehash-calls"
-# shellcheck disable=SC2329
-shasum() {
-  printf 'called\n' >>"$rehash_calls"
-  command shasum "$@"
-}
 hf2q_release_prepare_model_verification \
   "$model_path" "$model_sha256" "$third_run_receipt" "$model_cache"
-unset -f shasum
 [[ "$(jq -er .run_verification "$third_run_receipt")" == content_hash ]]
-[[ "$(wc -l <"$rehash_calls" | tr -d ' ')" == 1 ]]
+[[ "$(wc -l <"$v2_recorder_calls" | tr -d ' ')" == 2 ]]
+
+# A supplied valid v1 receipt is never handed through to a v2-capable server:
+# it is upgraded by exactly one recorder invocation, then the v2 run receipt
+# remains reusable without shasum.
+legacy_upgrade_receipt="$test_dir/legacy-upgrade-source.json"
+unset HF2Q_MODEL_VERIFICATION_BINARY
+hf2q_release_record_model_verification \
+  "$model_path" "$model_sha256" "$legacy_upgrade_receipt"
+export HF2Q_MODEL_VERIFICATION_BINARY="$v2_recorder"
+legacy_upgraded_run_receipt="$test_dir/legacy-upgrade-run.json"
+hf2q_release_materialize_model_verification \
+  "$model_path" "$model_sha256" "$legacy_upgrade_receipt" \
+  "$legacy_upgraded_run_receipt"
+[[ "$(jq -er .schema_version "$legacy_upgraded_run_receipt")" == 2 ]]
+[[ "$(jq -er .run_verification "$legacy_upgraded_run_receipt")" == upgraded_legacy_receipt ]]
+[[ "$(wc -l <"$v2_recorder_calls" | tr -d ' ')" == 3 ]]
+unset HF2Q_MODEL_VERIFICATION_BINARY HF2Q_TEST_RECORDER_CALLS
 
 wrong_receipt="$test_dir/wrong-model-verification.json"
 jq '.path = "/unexpected/model.gguf"' "$model_receipt" >"$wrong_receipt"

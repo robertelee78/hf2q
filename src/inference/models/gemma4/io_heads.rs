@@ -55,6 +55,8 @@ impl MlxModelWeights {
     ) -> anyhow::Result<Vec<u32>> {
         let hs = self.hidden_size;
         let vocab_size = self.vocab_size;
+        let vocab_size_u32 = u32::try_from(vocab_size)
+            .map_err(|_| anyhow::anyhow!("Gemma vocabulary size exceeds u32"))?;
         let expected = (seq_len as usize) * hs;
         if hidden.len() != expected {
             anyhow::bail!(
@@ -138,60 +140,22 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("per_pos pre-normed copy: {e}"))?;
             }
 
-            if let Some(ref q6k) = self.lm_head_q6k {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q6k.buffer],
-                    &[&self.activations.logits],
-                );
-                crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q6k,
-                    &mut self.activations.logits,
-                    1,
-                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                )
-                .map_err(|e| anyhow::anyhow!("per_pos lm_head Q6_K: {e}"))?;
-            } else if let Some(ref q8) = self.lm_head_q8 {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q8.buffer],
-                    &[&self.activations.logits],
-                );
-                crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q8,
-                    &mut self.activations.logits,
-                    1,
-                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                )
-                .map_err(|e| anyhow::anyhow!("per_pos lm_head Q8: {e}"))?;
-            } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-                s.barrier_between(
-                    &[&self.activations.norm_out, lm_head_f16],
-                    &[&self.activations.logits],
-                );
-                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &self.activations.norm_out,
-                    lm_head_f16,
-                    &self.activations.logits,
-                    &mlx_native::ops::dense_gemm::DenseGemmF16Params {
-                        m: 1,
-                        n: vocab_size as u32,
-                        k: hs as u32,
-                    },
-                )
-                .map_err(|e| anyhow::anyhow!("per_pos lm_head f16: {e}"))?;
-            } else {
-                anyhow::bail!("per_position_argmax_from_hidden requires lm_head_q6k / q8 / f16");
-            }
+            let lm_head = self.resolved_lm_head();
+            s.barrier_between(
+                &[&self.activations.norm_out, &lm_head.buffer],
+                &[&self.activations.logits],
+            );
+            crate::serve::forward_mlx_shared::dispatch_qmatmul(
+                &mut s,
+                reg,
+                dev,
+                &self.activations.norm_out,
+                lm_head,
+                &self.activations.logits,
+                1,
+                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+            )
+            .map_err(|e| anyhow::anyhow!("per_pos native lm_head: {e}"))?;
 
             if let Some(cap) = self.final_logit_softcapping {
                 s.barrier_between(&[&self.activations.logits], &[&self.activations.logits]);
@@ -222,22 +186,19 @@ impl MlxModelWeights {
                 &self.activations.argmax_index,
                 &self.activations.argmax_value,
                 &self.activations.argmax_params,
-                vocab_size as u32,
+                vocab_size_u32,
             )
             .map_err(|e| anyhow::anyhow!("per_pos argmax: {e}"))?;
 
             s.finish()
                 .map_err(|e| anyhow::anyhow!("per_pos session finish: {e}"))?;
 
-            let argmax_val: u32 = {
-                let idx: &[u32] = self
-                    .activations
-                    .argmax_index
-                    .as_slice()
-                    .map_err(|e| anyhow::anyhow!("per_pos argmax read: {e}"))?;
-                idx[0]
-            };
-            argmaxes.push(argmax_val);
+            argmaxes.push(crate::inference::argmax::read_finite_argmax_one(
+                &self.activations.argmax_index,
+                &self.activations.argmax_value,
+                vocab_size_u32,
+                "Gemma per-position output head",
+            )?);
         }
 
         Ok(argmaxes)
@@ -269,6 +230,8 @@ impl MlxModelWeights {
     ) -> anyhow::Result<Vec<u32>> {
         let hs = self.hidden_size;
         let vocab_size = self.vocab_size;
+        let vocab_size_u32 = u32::try_from(vocab_size)
+            .map_err(|_| anyhow::anyhow!("Gemma vocabulary size exceeds u32"))?;
         let n = seq_len as usize;
         let expected = n * hs;
         if hidden.len() != expected {
@@ -308,7 +271,7 @@ impl MlxModelWeights {
         let norm_out_batched = dev
             .alloc_buffer(n * hs * 4, mlx_native::DType::F32, vec![n, hs])
             .map_err(|e| anyhow::anyhow!("alloc norm_out_batched: {e}"))?;
-        let mut logits_batched = dev
+        let logits_batched = dev
             .alloc_buffer(
                 n * (vocab_size as usize) * 4,
                 mlx_native::DType::F32,
@@ -352,51 +315,19 @@ impl MlxModelWeights {
         // (b) ONE lm_head dispatch with m=n.  dispatch_qmatmul routes
         //     m<=8 through mat-vec (multiple matvecs per dispatch) and
         //     m>8 through mat-mat (simdgroup MMA, tile kernel).
-        if let Some(ref q6k) = self.lm_head_q6k {
-            s.barrier_between(&[&norm_out_batched, &q6k.buffer], &[&logits_batched]);
-            crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                &mut s,
-                reg,
-                dev,
-                &norm_out_batched,
-                q6k,
-                &mut logits_batched,
-                n as u32,
-                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-            )
-            .map_err(|e| anyhow::anyhow!("batched arg lm_head Q6_K: {e}"))?;
-        } else if let Some(ref q8) = self.lm_head_q8 {
-            s.barrier_between(&[&norm_out_batched, &q8.buffer], &[&logits_batched]);
-            crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                &mut s,
-                reg,
-                dev,
-                &norm_out_batched,
-                q8,
-                &mut logits_batched,
-                n as u32,
-                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-            )
-            .map_err(|e| anyhow::anyhow!("batched arg lm_head Q8: {e}"))?;
-        } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-            s.barrier_between(&[&norm_out_batched, lm_head_f16], &[&logits_batched]);
-            mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
-                s.encoder_mut(),
-                reg,
-                metal_dev,
-                &norm_out_batched,
-                lm_head_f16,
-                &logits_batched,
-                &mlx_native::ops::dense_gemm::DenseGemmF16Params {
-                    m: n as u32,
-                    n: vocab_size as u32,
-                    k: hs as u32,
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("batched arg lm_head F16: {e}"))?;
-        } else {
-            anyhow::bail!("per_position_argmax_batched requires lm_head_q6k / q8 / f16");
-        }
+        let lm_head = self.resolved_lm_head();
+        s.barrier_between(&[&norm_out_batched, &lm_head.buffer], &[&logits_batched]);
+        crate::serve::forward_mlx_shared::dispatch_qmatmul(
+            &mut s,
+            reg,
+            dev,
+            &norm_out_batched,
+            lm_head,
+            &logits_batched,
+            n as u32,
+            crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+        )
+        .map_err(|e| anyhow::anyhow!("batched arg native lm_head: {e}"))?;
 
         // (c) ONE softcap on the full n*vocab logits (element-wise).
         //     ADR-040 §0.16: the softcap kernel early-returns `if id >= params[1]`,
@@ -451,7 +382,7 @@ impl MlxModelWeights {
                 &argmax_idx_view,
                 &argmax_val_view,
                 &self.activations.argmax_params,
-                vocab_size as u32,
+                vocab_size_u32,
             )
             .map_err(|e| anyhow::anyhow!("batched arg argmax L{pos}: {e}"))?;
         }
@@ -460,15 +391,13 @@ impl MlxModelWeights {
         s.finish()
             .map_err(|e| anyhow::anyhow!("batched argmax session finish: {e}"))?;
 
-        // (5) Read all argmaxes in one shot.
-        let argmaxes: Vec<u32> = argmax_index_all
-            .as_slice::<u32>()
-            .map_err(|e| anyhow::anyhow!("batched argmax read: {e}"))?
-            .iter()
-            .take(n)
-            .copied()
-            .collect();
-        Ok(argmaxes)
+        crate::inference::argmax::read_finite_argmax_batch(
+            &argmax_index_all,
+            &argmax_value_all,
+            n,
+            vocab_size_u32,
+            "Gemma batched per-position output head",
+        )
     }
     /// Read the `[vocab_size]` F32 logits buffer that was produced by the
     /// most recent `forward_decode` (or `forward_prefill`) call.
@@ -508,7 +437,9 @@ impl MlxModelWeights {
             slice.len(),
             v
         );
-        Ok(&slice[..v])
+        let logits = &slice[..v];
+        crate::inference::argmax::validate_finite_logits(logits, "Gemma logits readback")?;
+        Ok(logits)
     }
 
     /// Compute NLL (negative log-likelihood) for `token_id` from the logits buffer
@@ -524,11 +455,7 @@ impl MlxModelWeights {
     /// Public surface for downstream eval/scoring crates; no internal caller.
     #[allow(dead_code)]
     pub fn token_nll_from_logits(&self, token_id: u32) -> Result<f32> {
-        let logits: &[f32] = self
-            .activations
-            .logits
-            .as_slice()
-            .map_err(|e| anyhow::anyhow!("token_nll logits read: {e}"))?;
+        let logits = self.logits_view()?;
         let v = self.vocab_size;
         anyhow::ensure!(
             (token_id as usize) < v,

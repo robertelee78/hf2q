@@ -7436,3 +7436,82 @@ mirror of `attn_out_holds`:
 - `/opt/hf2q/.cfa-archive/iter95/worker_report.md`
 - `/opt/hf2q/.cfa-archive/iter95/final-report.md`
 
+## 2026-08-22 — native Dense command-buffer qualification
+
+**Status: OPEN HYPOTHESIS.** A clean exact-source matched ABBA run on the
+Qwen3.8 27B BF16 artifact stopped fail-closed at the first format. The hf2q
+worst-band result was 17.600 end-to-end tokens/s for code and 16.964 for
+repetition; the current reference best band was 27.053 and 24.519 tokens/s.
+Outputs, host calibration, source identity, and executable identity passed.
+Evidence is under
+`/private/tmp/qwen38-matched-peer-matrix-f46718c1-exact/bf16/`; the candidate
+was source `f46718c1dc9facab96f2d8581bf62e3a801948d2`, executable SHA-256
+`647e41cdcc559dfed9eb8cca1fd442ac27e49bc554cbaa7a0bd38db693a071f3`.
+
+The physical-width receipt explains the first implementation hypothesis.
+Native Dense BF16 uses 226 command buffers per scalar target forward and 194
+per physical multi-slot forward, while the already-composed dense quantized
+path uses 66. The excess is structural: native Dense is excluded from the
+caller-owned layer encoder, so post-attention norm and the FFN are submitted
+separately.
+
+The deciding spike preserves native F32/F16/BF16 matrices and exact operation
+order, adds a caller-owned native Dense FFN encoder, and admits that graph to
+the same per-layer composition policy. Internal scratch must remain pool-owned
+through submission; the returned residual-stream buffer must be an exact-sized
+device allocation. The source-precision teacher remains on its synchronous
+wrapper. `HF2Q_LEGACY_PER_LAYER_CB=1` is the fresh-process control arm.
+
+The first live control run exposed a proof-integrity defect: physical
+multi-slot admission also rejected that flag, so the scheduler reached width
+2 while the target body and head fell back to scalar width 1. The flag must
+vary encoder composition only, not execution width. Physical admission
+therefore remains enabled under the control flag; the legacy body is still
+selected inside the already-batched graph. Non-vacuous synthetic Dense widths
+2 through 16, staggered slot cursors, and quantized MoE widths all match
+independent scalar trajectories with the flag both absent and present.
+
+Acceptance requires all of the following before the hypothesis may be marked
+accepted: non-vacuous synthetic M=1/M=4 parity and one-created/one-submitted
+proof; exact BF16 OFF/ON token trajectories; physical N=1/2/4/8/16 scalar
+replay with the predicted 66-command-buffer topology; unretained-reference
+coverage; and a thermally matched reversed-order ABBA speed win. A command-
+buffer reduction without wall-time improvement is a falsified speed result and
+must not land as a performance claim.
+
+### Result and reformulation
+
+**Status: MULTI-SLOT ACCEPTED; SINGLE-USER PARITY HYPOTHESIS FALSIFIED.** Exact
+source `0809564237f20d457d26025f53f60b309f11cfc0` passed the BF16 physical
+N=1/2/4/8/16 gate in both default and fresh-process legacy arms. Every body
+and head reached the requested physical width, every lane matched scalar
+replay, and all cross-arm output hashes matched. Default versus legacy
+aggregate decode throughput was 10.612/10.731, 12.708/11.587,
+23.749/21.710, 41.725/38.228, and 68.050/60.057 tokens/s respectively.
+Thus N=1 was neutral within one-run noise (-1.1%), while N=2/4/8/16 improved
+9.7%, 9.4%, 9.1%, and 13.3%. Command-buffer submissions fell from
+14,364/12,746/12,872/13,648/15,200 to
+4,158/4,224/4,356/4,620/5,148. Receipts are under
+`/private/tmp/qwen38-bf16-native-dense-{default,legacy}-08095642/`.
+
+Fresh-process four-position tests at source
+`681842461816616eb9f273b7c0d1f0d9c62fda1a` also passed in both arms and
+emitted the same exact trajectory: verifier `[9707, 15, 9707, 374]`, followed
+by `[279, 15, 9707, 374, 279, 15, 9707, 374]`. This closes the storage,
+four-position verifier, and post-verifier cache-handoff predicates for BF16.
+
+The thermally calibrated matched ABBA still failed the speed bar against the
+current pinned reference. hf2q's worst stable end-to-end bands were 19.083
+tokens/s for code and 18.157 for repetition; reference best bands were 26.821
+and 24.324. The result was stable (hf2q group spreads 1.04% and 1.70%) and is
+therefore conclusive, not thermal noise. Evidence is under
+`/private/tmp/qwen38-bf16-matched-abba-68184246/`.
+
+Draft acceptance is not the residual explanation: hf2q accepted 866 of 903
+drafted tokens (95.9%), issued 301 proposer-backed target forwards, and
+reported 52.641 seconds of complete speculative rounds versus 113.877 seconds
+of measured equivalent ordinary target work. The next deciding spike must
+attribute verifier time among native BF16 projections, attention/cache work,
+encoder/commit overhead, and synchronization. No further command-buffer-only
+change is admitted until that phase evidence identifies a reachable cost
+slice.

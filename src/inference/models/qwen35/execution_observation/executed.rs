@@ -8,13 +8,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::convert::tensor_lineage::ConversionSourceDisposition;
 use crate::core::provenance::tensor_execution::logical_f32_sha256;
 
-use super::loaded::{f32_bytes_sha256, LoadedTensorCodec, VerifiedLoadedTensorCatalog};
+use super::loaded::{
+    buffer_storage_bytes, f32_bytes_sha256, LoadedTensorCodec, VerifiedLoadedTensorCatalog,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum ExecutedTensorTransform {
     CpuF32Retained,
     GpuF32CopyRuntimeBind,
+    DirectF32RuntimeBind,
     DirectGgmlRuntimeBind,
     DeltaConvTwoTransposesRuntimeBind {
         channels: u32,
@@ -182,6 +185,39 @@ impl<'a> ExecutedTensorCatalogBuilder<'a> {
         })
     }
 
+    pub(crate) fn add_direct_f32(
+        &mut self,
+        source_tensor_name: &str,
+        semantic_name: &str,
+        executed: &mlx_native::MlxBuffer,
+    ) -> Result<()> {
+        if !executed.is_file_backed() {
+            bail!("executed F32 {semantic_name} is not file backed");
+        }
+        let values = executed
+            .as_slice::<f32>()
+            .map_err(|error| anyhow::anyhow!("read direct F32 {semantic_name}: {error}"))?;
+        let (raw, logical, shape) = self.loaded_f32_identity(source_tensor_name, values)?;
+        if executed.data_byte_len() != values.len() * std::mem::size_of::<f32>() {
+            bail!("direct F32 {semantic_name} has inconsistent byte extent");
+        }
+        self.insert(ExecutedTensorObservation {
+            node_id: format!("executed:{semantic_name}"),
+            source_tensor_name: source_tensor_name.to_owned(),
+            semantic_name: semantic_name.to_owned(),
+            shape_outermost_first: shape,
+            transform: ExecutedTensorTransform::DirectF32RuntimeBind,
+            loaded_parent_bytes_sha256: raw.clone(),
+            loaded_parent_logical_f32_sha256: logical.clone(),
+            transformed_f32_bytes_sha256: None,
+            transformed_logical_f32_sha256: None,
+            executed_codec: LoadedTensorCodec::DenseF32,
+            executed_byte_len: u64::try_from(executed.data_byte_len())?,
+            executed_byte_sha256: raw,
+            executed_logical_f32_sha256: logical,
+        })
+    }
+
     pub(crate) fn add_direct_ggml(
         &mut self,
         source_tensor_name: &str,
@@ -190,18 +226,14 @@ impl<'a> ExecutedTensorCatalogBuilder<'a> {
     ) -> Result<()> {
         let source = self.loaded.observation(source_tensor_name)?;
         let LoadedTensorCodec::Ggml { .. } = &source.codec else {
-            bail!("{source_tensor_name} was not loaded as native GGML blocks");
+            bail!("{source_tensor_name} was not loaded in native GGUF storage");
         };
-        let data_len = executed.data_byte_len();
-        let allocated = executed
-            .as_slice::<u8>()
-            .map_err(|error| anyhow::anyhow!("read executed GGML {semantic_name}: {error}"))?;
-        let bytes = allocated
-            .get(..data_len)
-            .context("executed GGML byte extent exceeds allocation")?;
+        let bytes = buffer_storage_bytes(executed)
+            .map_err(|error| anyhow::anyhow!("read executed GGUF {semantic_name}: {error}"))?;
+        let data_len = bytes.len();
         let byte_sha = hex::encode(Sha256::digest(bytes));
         if u64::try_from(data_len)? != source.byte_len || byte_sha != source.byte_sha256 {
-            bail!("executed GGML {semantic_name} differs from loaded blocks");
+            bail!("executed GGUF {semantic_name} differs from loaded storage");
         }
         self.consumed_sources.insert(source_tensor_name.to_owned());
         self.insert(ExecutedTensorObservation {

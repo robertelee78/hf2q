@@ -3,7 +3,7 @@
 //! Extracted from `src/serve/forward_mlx.rs` by ADR-038 Step 2.
 //! Mirrors the `qwen35/kv_cache.rs` pattern.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
 /// Per-layer KV cache buffers for the mlx-native path (TurboQuant compressed).
@@ -926,6 +926,267 @@ impl crate::serve::kv_persist::lcp_registry::ByteSized for HybridKvBuffers {
     }
 }
 
+/// Exact bytes owned by one hybrid-KV LCP snapshot layer at `snapshot_capacity`.
+///
+/// The live buffer dtype is the representation authority. Packed V owns one
+/// U8 code per head-dimension element plus `norms_per_pos` F32 norms per
+/// position. Full-F16 V owns two bytes per element and the canonical shared
+/// four-byte norms dummy; it must not be charged as if the dummy had a token
+/// axis.
+pub(crate) fn hybrid_lcp_snapshot_layer_bytes(
+    num_kv_heads: usize,
+    snapshot_capacity: usize,
+    head_dim: usize,
+    norms_per_pos: usize,
+    k_dtype: DType,
+    v_dtype: DType,
+) -> Result<u64> {
+    anyhow::ensure!(
+        num_kv_heads > 0 && snapshot_capacity > 0 && head_dim > 0 && norms_per_pos > 0,
+        "hybrid LCP snapshot dimensions must be nonzero"
+    );
+    anyhow::ensure!(
+        k_dtype == DType::F16,
+        "hybrid LCP snapshot K must be F16, got {k_dtype:?}"
+    );
+    anyhow::ensure!(
+        matches!(v_dtype, DType::U8 | DType::F16),
+        "hybrid LCP snapshot V must be U8 or F16, got {v_dtype:?}"
+    );
+
+    let positions = u64::try_from(num_kv_heads)
+        .ok()
+        .and_then(|heads| heads.checked_mul(snapshot_capacity as u64))
+        .ok_or_else(|| anyhow!("hybrid LCP snapshot position count overflow"))?;
+    let elements = positions
+        .checked_mul(head_dim as u64)
+        .ok_or_else(|| anyhow!("hybrid LCP snapshot element count overflow"))?;
+    let k_bytes = elements
+        .checked_mul(k_dtype.size_of() as u64)
+        .ok_or_else(|| anyhow!("hybrid LCP snapshot K byte count overflow"))?;
+    let v_bytes = elements
+        .checked_mul(v_dtype.size_of() as u64)
+        .ok_or_else(|| anyhow!("hybrid LCP snapshot V byte count overflow"))?;
+    let norms_bytes = if v_dtype == DType::F16 {
+        std::mem::size_of::<f32>() as u64
+    } else {
+        positions
+            .checked_mul(norms_per_pos as u64)
+            .and_then(|norms| norms.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| anyhow!("hybrid LCP snapshot V-norm byte count overflow"))?
+    };
+    k_bytes
+        .checked_add(v_bytes)
+        .and_then(|bytes| bytes.checked_add(norms_bytes))
+        .ok_or_else(|| anyhow!("hybrid LCP snapshot layer byte count overflow"))
+}
+
+/// Snapshot the populated prefix of every hybrid-KV layer without changing its
+/// stored V representation.
+///
+/// Serial and batched prefill use the same cache contract, so keeping this copy
+/// in the representation owner prevents their dtype and dummy-buffer handling
+/// from drifting apart again.
+pub(crate) fn snapshot_hybrid_kv_for_lcp(
+    dev: &MlxDevice,
+    live_hybrid: &[HybridKvBuffers],
+    sequence_len: usize,
+    snapshot_capacity: usize,
+) -> Result<Vec<std::sync::Arc<HybridKvBuffers>>> {
+    anyhow::ensure!(
+        sequence_len <= snapshot_capacity,
+        "hybrid LCP snapshot sequence {sequence_len} exceeds capacity {snapshot_capacity}"
+    );
+    let mut snapshot = Vec::with_capacity(live_hybrid.len());
+    for (layer_idx, live_layer) in live_hybrid.iter().enumerate() {
+        let shape = live_layer.k.shape();
+        anyhow::ensure!(
+            shape.len() == 3,
+            "hybrid LCP snapshot K L{layer_idx} must be rank 3, got {shape:?}"
+        );
+        let num_kv_heads = shape[0];
+        let live_capacity = shape[1];
+        let head_dim = shape[2];
+        anyhow::ensure!(
+            live_capacity == live_layer.capacity,
+            "hybrid LCP snapshot K L{layer_idx} shape capacity {live_capacity} != metadata {}",
+            live_layer.capacity
+        );
+        anyhow::ensure!(
+            sequence_len <= live_capacity,
+            "hybrid LCP snapshot sequence {sequence_len} exceeds live L{layer_idx} capacity {live_capacity}"
+        );
+        let norms_per_pos = live_layer.norms_per_pos;
+        let k_dtype = live_layer.k.dtype();
+        let v_dtype = live_layer.v_packed.dtype();
+        let _ = hybrid_lcp_snapshot_layer_bytes(
+            num_kv_heads,
+            snapshot_capacity,
+            head_dim,
+            norms_per_pos,
+            k_dtype,
+            v_dtype,
+        )?;
+        anyhow::ensure!(
+            live_layer.v_norms.dtype() == DType::F32,
+            "hybrid LCP snapshot V norms L{layer_idx} must be F32, got {:?}",
+            live_layer.v_norms.dtype()
+        );
+
+        let checked_elements = |capacity: usize, inner: usize, what: &str| -> Result<usize> {
+            num_kv_heads
+                .checked_mul(capacity)
+                .and_then(|elements| elements.checked_mul(inner))
+                .ok_or_else(|| anyhow!("hybrid LCP snapshot {what} L{layer_idx} extent overflow"))
+        };
+        let k_elements = checked_elements(snapshot_capacity, head_dim, "K")?;
+        let v_elements = checked_elements(snapshot_capacity, head_dim, "V")?;
+        let k_bytes = k_elements
+            .checked_mul(k_dtype.size_of())
+            .ok_or_else(|| anyhow!("hybrid LCP snapshot K L{layer_idx} byte overflow"))?;
+        let v_bytes = v_elements
+            .checked_mul(v_dtype.size_of())
+            .ok_or_else(|| anyhow!("hybrid LCP snapshot V L{layer_idx} byte overflow"))?;
+        let mut k_snapshot = dev
+            .alloc_buffer(
+                k_bytes,
+                k_dtype,
+                vec![num_kv_heads, snapshot_capacity, head_dim],
+            )
+            .map_err(|error| anyhow!("hybrid LCP snapshot K L{layer_idx} alloc: {error}"))?;
+        let mut v_snapshot = dev
+            .alloc_buffer(
+                v_bytes,
+                v_dtype,
+                vec![num_kv_heads, snapshot_capacity, head_dim],
+            )
+            .map_err(|error| anyhow!("hybrid LCP snapshot V L{layer_idx} alloc: {error}"))?;
+
+        let mut norms_snapshot = if v_dtype == DType::F16 {
+            anyhow::ensure!(
+                live_layer.v_norms.data_byte_len() == std::mem::size_of::<f32>(),
+                "hybrid LCP snapshot F16 V norms L{layer_idx} must be the canonical four-byte dummy, got {} bytes",
+                live_layer.v_norms.data_byte_len()
+            );
+            dev.alloc_buffer(std::mem::size_of::<f32>(), DType::F32, vec![1])
+                .map_err(|error| {
+                    anyhow!("hybrid LCP snapshot V norms dummy L{layer_idx} alloc: {error}")
+                })?
+        } else {
+            let norm_elements = checked_elements(snapshot_capacity, norms_per_pos, "V norms")?;
+            let norm_bytes = norm_elements
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| anyhow!("hybrid LCP snapshot V norms L{layer_idx} byte overflow"))?;
+            let norm_shape = if norms_per_pos == 1 {
+                vec![num_kv_heads, snapshot_capacity]
+            } else {
+                vec![num_kv_heads, snapshot_capacity, norms_per_pos]
+            };
+            dev.alloc_buffer(norm_bytes, DType::F32, norm_shape)
+                .map_err(|error| {
+                    anyhow!("hybrid LCP snapshot V norms L{layer_idx} alloc: {error}")
+                })?
+        };
+
+        let copy_prefix = |source: &MlxBuffer,
+                           destination: &mut MlxBuffer,
+                           element_bytes: usize,
+                           inner: usize,
+                           what: &str|
+         -> Result<()> {
+            let source: &[u8] = source.as_slice().map_err(|error| {
+                anyhow!("hybrid LCP snapshot {what} L{layer_idx} source: {error}")
+            })?;
+            let destination: &mut [u8] = destination.as_mut_slice().map_err(|error| {
+                anyhow!("hybrid LCP snapshot {what} L{layer_idx} destination: {error}")
+            })?;
+            let copy_len = sequence_len
+                .checked_mul(inner)
+                .and_then(|elements| elements.checked_mul(element_bytes))
+                .ok_or_else(|| {
+                    anyhow!("hybrid LCP snapshot {what} L{layer_idx} copy extent overflow")
+                })?;
+            let source_stride = live_capacity
+                .checked_mul(inner)
+                .and_then(|elements| elements.checked_mul(element_bytes))
+                .ok_or_else(|| {
+                    anyhow!("hybrid LCP snapshot {what} L{layer_idx} source stride overflow")
+                })?;
+            let destination_stride = snapshot_capacity
+                .checked_mul(inner)
+                .and_then(|elements| elements.checked_mul(element_bytes))
+                .ok_or_else(|| {
+                    anyhow!("hybrid LCP snapshot {what} L{layer_idx} destination stride overflow")
+                })?;
+            for head in 0..num_kv_heads {
+                let source_offset = head * source_stride;
+                let destination_offset = head * destination_stride;
+                let source_row = source
+                    .get(source_offset..source_offset + copy_len)
+                    .ok_or_else(|| {
+                        anyhow!("hybrid LCP snapshot {what} L{layer_idx} source is truncated")
+                    })?;
+                let destination_row = destination
+                    .get_mut(destination_offset..destination_offset + copy_len)
+                    .ok_or_else(|| {
+                        anyhow!("hybrid LCP snapshot {what} L{layer_idx} destination is truncated")
+                    })?;
+                destination_row.copy_from_slice(source_row);
+            }
+            Ok(())
+        };
+        copy_prefix(
+            &live_layer.k,
+            &mut k_snapshot,
+            k_dtype.size_of(),
+            head_dim,
+            "K",
+        )?;
+        copy_prefix(
+            &live_layer.v_packed,
+            &mut v_snapshot,
+            v_dtype.size_of(),
+            head_dim,
+            "V",
+        )?;
+        if v_dtype == DType::F16 {
+            let source: &[u8] = live_layer.v_norms.as_slice().map_err(|error| {
+                anyhow!("hybrid LCP snapshot V norms dummy L{layer_idx} source: {error}")
+            })?;
+            let destination: &mut [u8] = norms_snapshot.as_mut_slice().map_err(|error| {
+                anyhow!("hybrid LCP snapshot V norms dummy L{layer_idx} destination: {error}")
+            })?;
+            anyhow::ensure!(
+                source.len() == destination.len(),
+                "hybrid LCP snapshot V norms dummy L{layer_idx} extent changed ({} != {})",
+                source.len(),
+                destination.len()
+            );
+            destination.copy_from_slice(source);
+        } else {
+            copy_prefix(
+                &live_layer.v_norms,
+                &mut norms_snapshot,
+                std::mem::size_of::<f32>(),
+                norms_per_pos,
+                "V norms",
+            )?;
+        }
+
+        snapshot.push(std::sync::Arc::new(HybridKvBuffers {
+            k: k_snapshot,
+            v_packed: v_snapshot,
+            v_norms: norms_snapshot,
+            capacity: snapshot_capacity,
+            is_sliding: live_layer.is_sliding,
+            norms_per_pos,
+            bf16_xlen_k: None,
+            bf16_xlen_v: None,
+        }));
+    }
+    Ok(snapshot)
+}
+
 /// ADR-017 Phase E.a sub-iter "gemma-hybrid-lcp" (2026-08-03) — per-layer
 /// payload for Gemma 4's LCP partial-prefill registry across KV regimes.
 ///
@@ -1233,6 +1494,43 @@ impl GemmaHybridSlotAnchor {
             })
             .sum()
     }
+
+    /// Exact reclaimable heap ownership retained by this payload.
+    ///
+    /// The enclosing `AnchorStore` charges the top-level entry and committed
+    /// vector control storage. This method charges every allocation owned by
+    /// the opaque family payload, including spare `Vec` capacity and the
+    /// per-layer option table.
+    pub fn owned_bytes(&self) -> u64 {
+        let layer_table = (self.layers.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<Option<GemmaHybridSlidingLayerAnchor>>() as u64);
+        self.layers
+            .iter()
+            .flatten()
+            .fold(layer_table, |sum, layer| {
+                let vec_bytes = |bytes: &Vec<u8>| bytes.capacity() as u64;
+                sum.saturating_add(vec_bytes(&layer.k))
+                    .saturating_add(vec_bytes(&layer.v_packed))
+                    .saturating_add(layer.v_norms.as_ref().map(vec_bytes).unwrap_or(0))
+                    .saturating_add(layer.bf16_xlen_k.as_ref().map(vec_bytes).unwrap_or(0))
+                    .saturating_add(layer.bf16_xlen_v.as_ref().map(vec_bytes).unwrap_or(0))
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic(prompt_len: usize, layer_payload_bytes: &[usize]) -> Self {
+        let mut layers = Vec::with_capacity(layer_payload_bytes.len());
+        for &bytes in layer_payload_bytes {
+            layers.push(Some(GemmaHybridSlidingLayerAnchor {
+                k: vec![0; bytes],
+                v_packed: Vec::new(),
+                v_norms: None,
+                bf16_xlen_k: None,
+                bf16_xlen_v: None,
+            }));
+        }
+        Self { prompt_len, layers }
+    }
 }
 
 fn gemma4_copy_slot_region_out(
@@ -1257,6 +1555,25 @@ fn gemma4_copy_slot_region_out(
     let per_slot = bytes.len() / n_seqs;
     let start = slot_idx * per_slot;
     Ok(bytes[start..start + per_slot].to_vec())
+}
+
+fn gemma4_slot_region_owned_bytes(
+    buf: &MlxBuffer,
+    slot_idx: usize,
+    n_seqs: usize,
+    name: &str,
+) -> Result<u64> {
+    anyhow::ensure!(n_seqs > 0, "{name}: n_seqs must be positive");
+    anyhow::ensure!(
+        slot_idx < n_seqs,
+        "{name}: slot {slot_idx} outside {n_seqs}"
+    );
+    let bytes = buf.data_byte_len();
+    anyhow::ensure!(
+        bytes % n_seqs == 0,
+        "{name}: byte length {bytes} not divisible by n_seqs={n_seqs}"
+    );
+    Ok((bytes / n_seqs) as u64)
 }
 
 fn gemma4_copy_slot_region_in(
@@ -1288,6 +1605,196 @@ fn gemma4_copy_slot_region_in(
     let start = slot_idx * per_slot;
     bytes[start..start + per_slot].copy_from_slice(src);
     Ok(())
+}
+
+fn gemma4_preflight_slot_region_in(
+    src: &[u8],
+    dst: &MlxBuffer,
+    slot_idx: usize,
+    n_seqs: usize,
+    name: &str,
+) -> Result<()> {
+    anyhow::ensure!(n_seqs > 0, "{name}: n_seqs must be positive");
+    anyhow::ensure!(
+        slot_idx < n_seqs,
+        "{name}: slot {slot_idx} outside {n_seqs}"
+    );
+    let bytes = dst
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("{name}: as_slice<u8>: {e}"))?;
+    anyhow::ensure!(
+        bytes.len() % n_seqs == 0,
+        "{name}: byte length {} not divisible by n_seqs={n_seqs}",
+        bytes.len()
+    );
+    let per_slot = bytes.len() / n_seqs;
+    anyhow::ensure!(
+        src.len() == per_slot,
+        "{name}: checkpoint bytes {} != slot bytes {per_slot}",
+        src.len()
+    );
+    Ok(())
+}
+
+/// Validate every layer, optional buffer, and destination span before the
+/// restore mutates the first byte or cursor. A failed preflight therefore
+/// leaves the physical slot untouched and lets the caller hard-reset and
+/// invalidate the whole checkpoint lineage deterministically.
+pub(crate) fn preflight_gemma_hybrid_slot_anchor_restore(
+    scaffold: &[MultiSeqHybridKvBuffers],
+    slot: crate::serve::multi_seq_kv::SlotId,
+    anchor: &GemmaHybridSlotAnchor,
+    resume_len: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        resume_len <= anchor.prompt_len,
+        "Gemma slot anchor resume length {resume_len} exceeds checkpoint {}",
+        anchor.prompt_len
+    );
+    anyhow::ensure!(
+        scaffold.len() == anchor.layers.len(),
+        "Gemma slot anchor layer count mismatch: live={} saved={}",
+        scaffold.len(),
+        anchor.layers.len()
+    );
+    for (layer_idx, (buf, saved)) in scaffold.iter().zip(&anchor.layers).enumerate() {
+        let slot_idx = slot.0 as usize;
+        let n_seqs = buf.n_seqs as usize;
+        anyhow::ensure!(
+            slot_idx < n_seqs && slot_idx < buf.seq_lens.len(),
+            "Gemma slot anchor restore L{layer_idx}: slot {} outside n_seqs={n_seqs} / cursors={}",
+            slot.0,
+            buf.seq_lens.len()
+        );
+        match (buf.is_sliding, saved) {
+            (false, None) => {}
+            (true, Some(saved)) => {
+                gemma4_preflight_slot_region_in(
+                    &saved.k,
+                    &buf.k,
+                    slot_idx,
+                    n_seqs,
+                    &format!("Gemma slot anchor restore L{layer_idx} K"),
+                )?;
+                gemma4_preflight_slot_region_in(
+                    &saved.v_packed,
+                    &buf.v_packed,
+                    slot_idx,
+                    n_seqs,
+                    &format!("Gemma slot anchor restore L{layer_idx} V"),
+                )?;
+                match (&saved.v_norms, buf.v_norms.byte_len() == 4) {
+                    (Some(bytes), false) => gemma4_preflight_slot_region_in(
+                        bytes,
+                        &buf.v_norms,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor restore L{layer_idx} V norms"),
+                    )?,
+                    (None, true) => {}
+                    _ => anyhow::bail!(
+                        "Gemma slot anchor restore L{layer_idx}: V-norm layout changed"
+                    ),
+                }
+                match (&saved.bf16_xlen_k, buf.bf16_xlen_k.as_ref()) {
+                    (Some(bytes), Some(dst)) => gemma4_preflight_slot_region_in(
+                        bytes,
+                        dst,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor restore L{layer_idx} xlen K"),
+                    )?,
+                    (None, None) => {}
+                    _ => anyhow::bail!(
+                        "Gemma slot anchor restore L{layer_idx}: xlen K layout changed"
+                    ),
+                }
+                match (&saved.bf16_xlen_v, buf.bf16_xlen_v.as_ref()) {
+                    (Some(bytes), Some(dst)) => gemma4_preflight_slot_region_in(
+                        bytes,
+                        dst,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor restore L{layer_idx} xlen V"),
+                    )?,
+                    (None, None) => {}
+                    _ => anyhow::bail!(
+                        "Gemma slot anchor restore L{layer_idx}: xlen V layout changed"
+                    ),
+                }
+            }
+            _ => {
+                anyhow::bail!("Gemma slot anchor restore L{layer_idx}: sliding/full layout changed")
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Capture one slot immediately after prompt prefill and before decode.
+pub fn prospective_gemma_hybrid_slot_anchor_owned_bytes(
+    scaffold: &[MultiSeqHybridKvBuffers],
+    slot: crate::serve::multi_seq_kv::SlotId,
+) -> Result<u64> {
+    let layer_table = (scaffold.len() as u64)
+        .checked_mul(std::mem::size_of::<Option<GemmaHybridSlidingLayerAnchor>>() as u64)
+        .context("Gemma slot anchor layer-table byte overflow")?;
+    scaffold
+        .iter()
+        .enumerate()
+        .try_fold(layer_table, |total, (layer_idx, buf)| {
+            let slot_idx = slot.0 as usize;
+            let n_seqs = buf.n_seqs as usize;
+            anyhow::ensure!(
+                slot_idx < n_seqs,
+                "Gemma slot anchor L{layer_idx}: slot {} outside n_seqs={n_seqs}",
+                slot.0
+            );
+            if !buf.is_sliding {
+                return Ok(total);
+            }
+            let mut layer_bytes = gemma4_slot_region_owned_bytes(
+                &buf.k,
+                slot_idx,
+                n_seqs,
+                &format!("Gemma slot anchor L{layer_idx} K"),
+            )?
+            .checked_add(gemma4_slot_region_owned_bytes(
+                &buf.v_packed,
+                slot_idx,
+                n_seqs,
+                &format!("Gemma slot anchor L{layer_idx} V"),
+            )?)
+            .context("Gemma slot anchor payload byte overflow")?;
+            if buf.v_norms.byte_len() != 4 {
+                layer_bytes = layer_bytes
+                    .checked_add(gemma4_slot_region_owned_bytes(
+                        &buf.v_norms,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor L{layer_idx} V norms"),
+                    )?)
+                    .context("Gemma slot anchor payload byte overflow")?;
+            }
+            for (name, buffer) in [
+                ("xlen K", buf.bf16_xlen_k.as_ref()),
+                ("xlen V", buf.bf16_xlen_v.as_ref()),
+            ] {
+                if let Some(buffer) = buffer {
+                    layer_bytes = layer_bytes
+                        .checked_add(gemma4_slot_region_owned_bytes(
+                            buffer,
+                            slot_idx,
+                            n_seqs,
+                            &format!("Gemma slot anchor L{layer_idx} {name}"),
+                        )?)
+                        .context("Gemma slot anchor payload byte overflow")?;
+                }
+            }
+            total
+                .checked_add(layer_bytes)
+                .context("Gemma slot anchor payload byte overflow")
+        })
 }
 
 /// Capture one slot immediately after prompt prefill and before decode.
@@ -1377,17 +1884,7 @@ pub fn restore_gemma_hybrid_slot_anchor(
     anchor: &GemmaHybridSlotAnchor,
     resume_len: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
-        resume_len <= anchor.prompt_len,
-        "Gemma slot anchor resume length {resume_len} exceeds checkpoint {}",
-        anchor.prompt_len
-    );
-    anyhow::ensure!(
-        scaffold.len() == anchor.layers.len(),
-        "Gemma slot anchor layer count mismatch: live={} saved={}",
-        scaffold.len(),
-        anchor.layers.len()
-    );
+    preflight_gemma_hybrid_slot_anchor_restore(scaffold, slot, anchor, resume_len)?;
     for (layer_idx, (buf, saved)) in scaffold.iter_mut().zip(&anchor.layers).enumerate() {
         let slot_idx = slot.0 as usize;
         let n_seqs = buf.n_seqs as usize;
@@ -3037,6 +3534,94 @@ mod tests {
                 None
             }
         }
+    }
+
+    #[test]
+    fn gemma_anchor_owned_bytes_charge_all_family_allocations() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let anchor = GemmaHybridSlotAnchor::synthetic(7, &[11, 13, 17]);
+        let layer_table = (anchor.layers.capacity() as u64)
+            * std::mem::size_of::<Option<GemmaHybridSlidingLayerAnchor>>() as u64;
+        let heap_payload: u64 = anchor
+            .layers
+            .iter()
+            .flatten()
+            .map(|layer| layer.k.capacity() as u64)
+            .sum();
+        assert_eq!(anchor.owned_bytes(), layer_table + heap_payload);
+        assert_eq!(anchor.total_bytes(), 41);
+    }
+
+    #[test]
+    fn gemma_anchor_restore_preflights_all_layers_before_first_mutation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Some(dev) = skip_dev() else {
+            return;
+        };
+        let mut scaffold = vec![
+            alloc_multi_seq_hybrid_kv_for_layer(&dev, 0, 2, 256, 4, true, 2).expect("layer zero"),
+            alloc_multi_seq_hybrid_kv_for_layer(&dev, 1, 2, 256, 4, true, 2).expect("layer one"),
+        ];
+        for layer in &mut scaffold {
+            layer.seq_lens[0] = 3;
+            layer.k.as_mut_slice::<u8>().unwrap().fill(0x11);
+            layer.v_packed.as_mut_slice::<u8>().unwrap().fill(0x22);
+            layer.v_norms.as_mut_slice::<u8>().unwrap().fill(0x33);
+            if let Some(buffer) = layer.bf16_xlen_k.as_mut() {
+                buffer.as_mut_slice::<u8>().unwrap().fill(0x44);
+            }
+            if let Some(buffer) = layer.bf16_xlen_v.as_mut() {
+                buffer.as_mut_slice::<u8>().unwrap().fill(0x55);
+            }
+        }
+        let mut anchor =
+            snapshot_gemma_hybrid_slot_anchor(&scaffold, crate::serve::multi_seq_kv::SlotId(0), 3)
+                .expect("snapshot");
+        assert_eq!(
+            prospective_gemma_hybrid_slot_anchor_owned_bytes(
+                &scaffold,
+                crate::serve::multi_seq_kv::SlotId(0),
+            )
+            .expect("prospective bytes"),
+            anchor.owned_bytes(),
+            "budget admission must know the exact payload before copying it"
+        );
+
+        // Make layer zero visibly different from its checkpoint, then corrupt
+        // only the final layer's saved layout. A write-before-full-preflight
+        // implementation would silently restore layer zero before failing.
+        scaffold[0].k.as_mut_slice::<u8>().unwrap().fill(0xA5);
+        let layer_zero_before = scaffold[0].k.as_slice::<u8>().unwrap().to_vec();
+        anchor.layers[1].as_mut().expect("sliding layer").k.pop();
+        let cursors_before: Vec<Vec<u32>> = scaffold
+            .iter()
+            .map(|layer| layer.seq_lens.clone())
+            .collect();
+
+        let error = restore_gemma_hybrid_slot_anchor(
+            &mut scaffold,
+            crate::serve::multi_seq_kv::SlotId(0),
+            &anchor,
+            2,
+        )
+        .expect_err("late-layer mismatch must fail");
+        assert!(
+            error.to_string().contains("L1 K"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            scaffold[0].k.as_slice::<u8>().unwrap(),
+            layer_zero_before,
+            "layer zero mutated before layer one failed preflight"
+        );
+        assert_eq!(
+            scaffold
+                .iter()
+                .map(|layer| &layer.seq_lens)
+                .collect::<Vec<_>>(),
+            cursors_before.iter().collect::<Vec<_>>(),
+            "no cursor may change on failed preflight"
+        );
     }
 
     #[test]
@@ -7214,6 +7799,168 @@ mod tests {
     // -----------------------------------------------------------------
     // "gemma-hybrid-lcp" (2026-08-03) — GemmaLcpLayerKv payload contract
     // -----------------------------------------------------------------
+
+    #[test]
+    fn hybrid_lcp_snapshot_estimate_counts_packed_v_and_all_norm_blocks() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let (num_kv_heads, capacity, head_dim, norms_per_pos) = (2usize, 10usize, 512usize, 2usize);
+        let bytes = hybrid_lcp_snapshot_layer_bytes(
+            num_kv_heads,
+            capacity,
+            head_dim,
+            norms_per_pos,
+            DType::F16,
+            DType::U8,
+        )
+        .expect("packed hybrid snapshot estimate");
+        let k = num_kv_heads * capacity * head_dim * DType::F16.size_of();
+        let v = num_kv_heads * capacity * head_dim * DType::U8.size_of();
+        let norms = num_kv_heads * capacity * norms_per_pos * std::mem::size_of::<f32>();
+        assert_eq!(bytes, (k + v + norms) as u64);
+    }
+
+    #[test]
+    fn hybrid_lcp_snapshot_estimate_counts_f16_v_and_one_dummy() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let (num_kv_heads, capacity, head_dim, norms_per_pos) = (2usize, 10usize, 512usize, 2usize);
+        let bytes = hybrid_lcp_snapshot_layer_bytes(
+            num_kv_heads,
+            capacity,
+            head_dim,
+            norms_per_pos,
+            DType::F16,
+            DType::F16,
+        )
+        .expect("full-F16 hybrid snapshot estimate");
+        let k = num_kv_heads * capacity * head_dim * DType::F16.size_of();
+        let v = num_kv_heads * capacity * head_dim * DType::F16.size_of();
+        assert_eq!(
+            bytes,
+            (k + v + std::mem::size_of::<f32>()) as u64,
+            "full-F16 snapshot owns one canonical norms dummy, not a token-shaped norms buffer"
+        );
+    }
+
+    #[test]
+    fn hybrid_lcp_snapshot_copy_preserves_packed_and_f16_v_layouts() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Some(device) = skip_dev() else {
+            return;
+        };
+        const HEADS: usize = 2;
+        const LIVE_CAPACITY: usize = 4;
+        const SNAPSHOT_CAPACITY: usize = 6;
+        const SEQUENCE_LEN: usize = 3;
+        const HEAD_DIM: usize = 256;
+
+        let assert_head_prefixes = |source: &MlxBuffer,
+                                    snapshot: &MlxBuffer,
+                                    inner: usize,
+                                    element_bytes: usize| {
+            let source = source.as_slice::<u8>().expect("live snapshot source bytes");
+            let snapshot = snapshot
+                .as_slice::<u8>()
+                .expect("copied snapshot destination bytes");
+            let copy_bytes = SEQUENCE_LEN * inner * element_bytes;
+            let source_stride = LIVE_CAPACITY * inner * element_bytes;
+            let snapshot_stride = SNAPSHOT_CAPACITY * inner * element_bytes;
+            for head in 0..HEADS {
+                assert_eq!(
+                    &snapshot[head * snapshot_stride..head * snapshot_stride + copy_bytes],
+                    &source[head * source_stride..head * source_stride + copy_bytes],
+                    "head {head} populated prefix changed during LCP snapshot copy"
+                );
+            }
+        };
+
+        std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
+        for full_f16_v in [false, true] {
+            if full_f16_v {
+                std::env::set_var("HF2Q_FULL_F16_KV", "1");
+            } else {
+                std::env::remove_var("HF2Q_FULL_F16_KV");
+            }
+            let mut live = alloc_hybrid_kv_for_layer(
+                &device,
+                usize::from(full_f16_v),
+                HEADS,
+                HEAD_DIM,
+                LIVE_CAPACITY,
+                true,
+            )
+            .expect("allocate live hybrid layer");
+            for (index, byte) in live
+                .k
+                .as_mut_slice::<u8>()
+                .expect("live K bytes")
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = (index as u8).wrapping_mul(17).wrapping_add(3);
+            }
+            for (index, byte) in live
+                .v_packed
+                .as_mut_slice::<u8>()
+                .expect("live V bytes")
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = (index as u8).wrapping_mul(29).wrapping_add(5);
+            }
+            for (index, byte) in live
+                .v_norms
+                .as_mut_slice::<u8>()
+                .expect("live V norms bytes")
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = (index as u8).wrapping_mul(11).wrapping_add(7);
+            }
+
+            let copied = snapshot_hybrid_kv_for_lcp(
+                &device,
+                std::slice::from_ref(&live),
+                SEQUENCE_LEN,
+                SNAPSHOT_CAPACITY,
+            )
+            .expect("copy hybrid LCP snapshot");
+            assert_eq!(copied.len(), 1);
+            let copied = &copied[0];
+            assert_eq!(copied.k.dtype(), live.k.dtype());
+            assert_eq!(copied.v_packed.dtype(), live.v_packed.dtype());
+            assert_eq!(copied.v_norms.dtype(), DType::F32);
+            assert_eq!(copied.capacity, SNAPSHOT_CAPACITY);
+            assert_eq!(copied.is_sliding, live.is_sliding);
+            assert_eq!(copied.norms_per_pos, live.norms_per_pos);
+            assert_head_prefixes(
+                &live.k,
+                &copied.k,
+                HEAD_DIM,
+                live.k.dtype().size_of(),
+            );
+            assert_head_prefixes(
+                &live.v_packed,
+                &copied.v_packed,
+                HEAD_DIM,
+                live.v_packed.dtype().size_of(),
+            );
+            if full_f16_v {
+                assert_eq!(copied.v_norms.shape(), &[1]);
+                assert_eq!(
+                    copied.v_norms.as_slice::<u8>().expect("copied dummy bytes"),
+                    live.v_norms.as_slice::<u8>().expect("live dummy bytes")
+                );
+            } else {
+                assert_head_prefixes(
+                    &live.v_norms,
+                    &copied.v_norms,
+                    live.norms_per_pos,
+                    std::mem::size_of::<f32>(),
+                );
+            }
+        }
+        std::env::remove_var("HF2Q_FULL_F16_KV");
+    }
 
     /// ByteSized must sum both legs exactly (no estimation — the LCP
     /// registry's byte budget is enforced off this value).

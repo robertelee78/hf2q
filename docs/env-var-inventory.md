@@ -202,8 +202,6 @@ this release:
 | `HF2Q_FALSIFIER_STAGGER_MS` | `development-only` | 3 |
 | `HF2Q_FA_F16` | `development-only` | 13 |
 | `HF2Q_FA_LAYER_CKSUM` | `development-only` | 1 |
-| `HF2Q_FA_PEER_PORT` | `development-only` | 7 |
-| `HF2Q_FA_PEER_PORT_NWG32` | `development-only` | 3 |
 | `HF2Q_FA_TRACE` | `development-only` | 2 |
 | `HF2Q_FFN_POOLED_LEGACY` | `development-only` | 2 |
 | `HF2Q_FFN_SPLIT` | `development-only` | 6 |
@@ -272,7 +270,7 @@ this release:
 | `HF2Q_MLX_PROFILE` | `development-only` | 4 |
 | `HF2Q_MLX_TIMING` | `development-only` | 3 |
 | `HF2Q_MM_ID_ROUTING_THRESHOLD` | `development-only` | 3 |
-| `HF2Q_MTP_PHASE_PROFILE` | `development-only` | 1 |
+| `HF2Q_MTP_PHASE_PROFILE` | `development-only` | 1; prints K3 draft/verify/catch-up phases and verifier submission counters; combine with `HF2Q_GPU_BUSY=1` for GPU-busy versus non-GPU residual |
 | `HF2Q_MTP_PROFILE` | `development-only` | 5 |
 | `HF2Q_MVN_BARRIER_TRACE` | `development-only` | 1 |
 | `HF2Q_MVN_ENCODE_TRACE` | `development-only` | 3 |
@@ -297,7 +295,7 @@ this release:
 | `HF2Q_PREFILL_CROSS_SLOT` | `promote-or-internalize` | 1 |
 | `HF2Q_PREFILL_DUMP` | `development-only` | 4 |
 | `HF2Q_PREFILL_SLOT_BATCHED` | `promote-or-internalize` | 4 |
-| `HF2Q_PREFILL_TIMING` | `development-only` | 2 |
+| `HF2Q_PREFILL_TIMING` | `development-only` | 3 |
 | `HF2Q_PROFILE_BUCKETS` | `development-only` | 10 |
 | `HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS` | `development-only` | 5 |
 | `HF2Q_PROFILE_FA` | `development-only` | 5 |
@@ -397,7 +395,6 @@ this release:
 | `HF2Q_TEST_DESCENDANT_PID_FILE` | `development-only` | 2 |
 | `HF2Q_TEST_HELPER_PID_FILE` | `development-only` | 4 |
 | `HF2Q_TEST_PROMPT` | `development-only` | 1 |
-| `HF2Q_TEST_QWEN38_EXPECT_MV_EXT` | `development-only` | 2 |
 | `HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN` | `development-only` | 2 |
 | `HF2Q_TEST_QWEN38_EXPECT_Q5_K_M` | `development-only` | 2 |
 | `HF2Q_TEST_QWEN38_GGUF` | `development-only` | 3 |

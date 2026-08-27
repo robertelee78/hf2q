@@ -733,6 +733,21 @@ impl FifoSchedulerAdapter {
         self.slot_generation
     }
 
+    pub fn preflight_idle_runtime_reset(&self) -> Result<(), &'static str> {
+        if self.in_flight.is_some() || !self.queue.is_empty() {
+            return Err("scheduler still owns in-flight or queued work");
+        }
+        Ok(())
+    }
+
+    /// Invalidate every handle from before a drained worker park. FIFO has no
+    /// persistent arena high-water ledger, so only its generation changes.
+    pub fn reset_idle_runtime_reservations(&mut self) -> Result<(), &'static str> {
+        self.preflight_idle_runtime_reset()?;
+        self.slot_generation = self.slot_generation.wrapping_add(1);
+        Ok(())
+    }
+
     /// Promote the next queued request into the in-flight slot. Caller
     /// guarantees `self.in_flight.is_none()` (asserted in debug builds).
     ///
@@ -1149,6 +1164,35 @@ impl InflightBatchedScheduler {
             .zip(&self.slot_reserved_bytes)
             .map(|(&resident, &reserved)| resident.max(reserved))
             .fold(0u64, u64::saturating_add)
+    }
+
+    pub fn preflight_idle_runtime_reset(&self) -> Result<(), &'static str> {
+        if !self.in_flight.is_empty() || !self.queue.is_empty() {
+            return Err("scheduler still owns in-flight or queued work");
+        }
+        if self.slot_reserved_bytes.iter().any(|bytes| *bytes != 0)
+            || self.slot_committed_on_release.iter().any(Option::is_some)
+        {
+            return Err("scheduler still owns an active KV reservation");
+        }
+        Ok(())
+    }
+
+    /// Forget physical arenas only after the family worker has proved the
+    /// scheduler idle and is about to drop those arenas. Slot generations are
+    /// bumped so no pre-park handle can name the cold replacement state.
+    pub fn reset_idle_runtime_reservations(&mut self) -> Result<(), &'static str> {
+        self.preflight_idle_runtime_reset()?;
+        self.slot_high_water_bytes
+            .fill(self.fixed_kv_bytes_per_slot);
+        self.slot_reserved_bytes.fill(0);
+        self.slot_committed_on_release.fill(None);
+        for generation in &mut self.slot_generations {
+            *generation = generation.wrapping_add(1);
+        }
+        self.slot_id_free_list.clear();
+        self.next_fresh_slot_id = 0;
+        Ok(())
     }
 
     /// Choose an idle or fresh slot whose additional physical demand fits the
@@ -2055,6 +2099,36 @@ mod tests {
             s.slot_generation(SlotId(0)),
             1,
             "generation bumped on release"
+        );
+    }
+
+    #[test]
+    fn fifo_idle_runtime_reset_requires_drain_and_invalidates_old_handles() {
+        let mut scheduler = FifoSchedulerAdapter::new(4);
+        let admitted = scheduler.admit(req(1, 1)).expect("admit");
+        let handle = handle_of(&admitted);
+        assert_eq!(
+            scheduler.preflight_idle_runtime_reset(),
+            Err("scheduler still owns in-flight or queued work")
+        );
+
+        scheduler.release(handle);
+        let generation_before_reset = scheduler.slot_generation(SlotId(0));
+        scheduler
+            .reset_idle_runtime_reservations()
+            .expect("drained FIFO scheduler may reset");
+        assert_eq!(
+            scheduler.slot_generation(SlotId(0)),
+            generation_before_reset + 1
+        );
+
+        let cold = scheduler.admit(req(1, 1)).expect("cold admit");
+        assert_eq!(
+            handle_of(&cold),
+            SlotHandle {
+                slot_id: SlotId(0),
+                generation: generation_before_reset + 1,
+            }
         );
     }
 
@@ -3563,6 +3637,46 @@ mod tests {
         s.release(handle);
         assert_eq!(s.resident_high_water_bytes(), fixed * 2 + 100);
         assert_eq!(s.reserved_high_water_bytes(), fixed * 2 + 100);
+    }
+
+    #[test]
+    fn idle_runtime_reset_requires_a_drained_scheduler_and_forgets_dropped_arenas() {
+        let fixed = 256;
+        let mut scheduler =
+            InflightBatchedScheduler::new_with_kv_budget_and_floor(4, 2, 16_384, fixed);
+        let admitted = scheduler
+            .admit(req_with_kv_parts(1_000, 128, 4_000, 3_000))
+            .expect("request fits")
+            .handle
+            .expect("physical slot");
+
+        assert_eq!(
+            scheduler.preflight_idle_runtime_reset(),
+            Err("scheduler still owns in-flight or queued work")
+        );
+        scheduler.record_slot_high_water(admitted, 3_000);
+        scheduler.release(admitted);
+        assert!(scheduler.resident_high_water_bytes() > fixed * 2);
+        let generation_before_reset = scheduler.slot_generation(admitted.slot_id);
+
+        scheduler
+            .reset_idle_runtime_reservations()
+            .expect("drained scheduler may forget arenas released by the worker");
+        assert_eq!(scheduler.resident_high_water_bytes(), fixed * 2);
+        assert_eq!(scheduler.reserved_high_water_bytes(), fixed * 2);
+        assert_eq!(
+            scheduler.slot_generation(admitted.slot_id),
+            generation_before_reset + 1,
+            "a handle from before park must not name cold replacement state"
+        );
+
+        let cold = scheduler
+            .admit(req_with_kv(1, 1, 1_000))
+            .expect("fresh work is admissible after reactivation")
+            .handle
+            .expect("cold physical slot");
+        assert_eq!(cold.slot_id, SlotId(0));
+        assert_eq!(cold.generation, generation_before_reset + 1);
     }
 
     #[test]

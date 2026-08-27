@@ -23,7 +23,6 @@
 //! `HF2Q_BATCHED_PREFILL=0` for parity diagnostics.
 
 use anyhow::Result;
-use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::{DType, MlxBuffer};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -40,14 +39,6 @@ use crate::serve::forward_mlx_shared::{
     dispatch_qmatmul, dispatch_rms_norm_unit_perhead_dual_perm,
 };
 use crate::serve::multi_seq_kv::SlotId;
-
-fn validate_batched_prefill_argmax(value: f32, head_row: usize) -> Result<()> {
-    anyhow::ensure!(
-        value.is_finite(),
-        "batched prefill produced a non-finite argmax value for row {head_row}: {value}"
-    );
-    Ok(())
-}
 
 /// Bound the live-prefix attention scratch while keeping every dispatch in a
 /// single hybrid-kernel scheduling bucket. The cache-length thresholds mirror
@@ -909,8 +900,10 @@ impl MlxModelWeights {
                     _ => false,
                 };
                 if needs_realloc {
-                    eprintln!("[ADR-028 Phase 10c] Allocating hybrid_kv ({} layers, F16 K + TQ-HB V {}-bit, cap={}) [batched]",
-                        num_layers, tq_codebook_bits_prefill, linear_capacity);
+                    eprintln!(
+                        "[ADR-028 Phase 10c] Allocating hybrid_kv ({} layers, F16 K + TQ-HB V {}-bit, cap={}) [batched]",
+                        num_layers, tq_codebook_bits_prefill, linear_capacity
+                    );
                     let mut hybrid_vec: Vec<crate::inference::models::gemma4::HybridKvBuffers> =
                         Vec::with_capacity(num_layers);
                     for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -1039,7 +1032,7 @@ impl MlxModelWeights {
             .map(|l| l.num_kv_heads)
             .max()
             .unwrap_or(8);
-        let mut pf_hidden = alloc_f32(seq_len * hs, "pf_hidden")?;
+        let pf_hidden = alloc_f32(seq_len * hs, "pf_hidden")?;
         let pf_residual = alloc_f32(seq_len * hs, "pf_residual")?;
         let pf_norm_out = alloc_f32(seq_len * hs, "pf_norm_out")?;
         let pf_moe_norm_out = alloc_f32(seq_len * hs, "pf_moe_norm_out")?;
@@ -1476,63 +1469,25 @@ impl MlxModelWeights {
             // wait transitions (~50-200 µs each) under the profile flag;
             // normal runs keep the single session.
 
-            // 1. Embedding: gather prompt rows from embed_weight into pf_hidden
-            //    and scale by sqrt(hidden_size).
-            //
-            // Wave P4.18 — CPU-side gather.  The GPU kernel version cost
-            // ~48 ms wall-clock at pp2455 on M5 Max (measured 2026-04-20
-            // via HF2Q_SKIP_EMBED: prefill drops from 798 ms → 750 ms
-            // when the GPU embed dispatch is skipped).  That was 50× more
-            // than the ~1 ms a memcpy-speed bound would predict — the
-            // op is a simple scatter/gather over 30 MB.  Root cause:
-            // spawning 7.5 M GPU threads (one per output element) for a
-            // purely-memory-bound op has high per-thread scheduling
-            // latency that dominates the tiny per-thread work.
-            //
-            // The embed_weight buffer is StorageModeShared (CPU/GPU
-            // unified) so the CPU can write pf_hidden directly; the
-            // next GPU op (layer 0 pre-attn norm) will see the CPU
-            // writes without any flush since MTLResourceOptions::
-            // StorageModeShared is coherent.
-            //
-            // Per-row memcpy pattern: 2455 rows × 12 KB each.  On M5 Max
-            // single-core memory copy runs at ~25 GB/s, so 30 MB → ~1.2 ms
-            // pure data; with row-loop overhead, measure <5 ms in practice.
-            // Saves ~45 ms vs the GPU dispatch.
+            // 1. Embedding: native stored rows -> F32 activations.  The gather
+            // kernel is type-specific and touches only requested rows; no
+            // whole-table dense shadow exists.
             let t0_embed = if profile_buckets_on {
                 Some(std::time::Instant::now())
             } else {
                 None
             };
-            {
-                let scale = (hs as f32).sqrt();
-                let embed_f32: &[f32] = self
-                    .embed_weight
-                    .as_slice()
-                    .map_err(|e| anyhow::anyhow!("batched embed read: {e}"))?;
-                let out: &mut [f32] = pf_hidden
-                    .as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("batched pf_hidden write: {e}"))?;
-                // Two-pass: memcpy then scale.  copy_from_slice compiles
-                // to a full-width memcpy (NEON on arm64) that streams at
-                // ~50 GB/s; the subsequent scale loop auto-vectorizes to
-                // NEON fmul.  Rayon parallel was tested (Wave P4.18 drafts)
-                // and measured high-variance with no reliable speedup —
-                // the gather is cold-page-touch bound, and spreading the
-                // random reads across threads doesn't help when the
-                // bottleneck is DRAM latency for cache-miss lines.
-                for (tok_idx, &tok_id) in prompt_tokens.iter().enumerate() {
-                    let src_off = (tok_id as usize) * hs;
-                    let dst_off = tok_idx * hs;
-                    out[dst_off..dst_off + hs].copy_from_slice(&embed_f32[src_off..src_off + hs]);
-                }
-                for v in out[..seq_len * hs].iter_mut() {
-                    *v *= scale;
-                }
-            }
+            crate::inference::models::gemma4::native_matrix::encode_embedding(
+                &mut s,
+                reg,
+                dev,
+                &self.embed_weight,
+                &pf_token_ids,
+                &pf_hidden,
+                seq_len,
+            )
+            .map_err(|e| anyhow::anyhow!("batched native embed: {e}"))?;
             if let Some(t0) = t0_embed {
-                // No s.finish() needed — no GPU dispatch was made; just
-                // record the CPU-side wall-clock of the scatter+scale.
                 PROFILE_B_EMBED_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 PROFILE_B_EMBED_COUNT.fetch_add(1, Ordering::Relaxed);
             }
@@ -1810,8 +1765,10 @@ impl MlxModelWeights {
                             let ka = 3.min(l0.saturating_sub(1)); // a seq0 (A) key (causal)
                             eprintln!(
                                 "[SMDUMP] T={t} L0={l0} o1={o1} | mask[A_q{qa},B_k{kb}]=0x{:04x} (want FF80) | mask[A_q{qa},A_k{ka}]=0x{:04x} (want 0000) | mask[A_q{qa},A_k{}]=0x{:04x}",
-                                sm[qa*t+kb].to_bits(), sm[qa*t+ka].to_bits(),
-                                qa+1, sm[qa*t+qa+1].to_bits(), // future A key → want FF80
+                                sm[qa * t + kb].to_bits(),
+                                sm[qa * t + ka].to_bits(),
+                                qa + 1,
+                                sm[qa * t + qa + 1].to_bits(), // future A key → want FF80
                             );
                         }
                     }
@@ -1836,6 +1793,46 @@ impl MlxModelWeights {
         // started during the layer loop — needed so the teardown at the
         // end of the function knows whether to call stop_capture.
         let mut capture_active: bool = false;
+
+        // Validate an admitted live rectangle before the first transformer or
+        // KV mutation, then reuse its Copy shape at every layer. Legitimate
+        // unequal-width/start cohorts keep the existing aggregate route.
+        let rectangular_live_shape = if live_prefix_resume {
+            self.multi_seq_prefill.as_ref().map_or(Ok(None), |state| {
+                crate::inference::models::gemma4::rectangular_prefill::rectangular_prefill_shape_if_eligible(
+                    &state.seq_lens,
+                    &state.seq_offsets,
+                    &state.start_positions,
+                    &state.slot_ids,
+                )
+            })?
+        } else {
+            None
+        };
+        let rectangular_ffn_plans = rectangular_live_shape
+            .map(|shape| {
+                self.layers
+                    .iter()
+                    .map(|layer| {
+                        crate::inference::models::gemma4::rectangular_ffn::plan_rectangular_ffn(
+                            shape,
+                            self.hidden_size,
+                            layer.moe.moe_intermediate_size,
+                            layer.moe.top_k,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        // The tiled-F16 live-attention route is a different numerical
+        // algorithm from the canonical compressed-KV hybrid resume. Exact
+        // M64 whole-route authority found the first divergence at layer-0
+        // SDPA even though norm and Q/K/V inputs were bit-identical. A
+        // rectangular stable cohort therefore keeps the scalar hybrid
+        // attention schedule per lane; only equality-preserving body work is
+        // shared across lanes.
+        let use_tiled_live_attention =
+            gemma_tiled_live_enabled() && rectangular_live_shape.is_none();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Metal-1 — begin/end programmatic GPU capture around the
@@ -1873,7 +1870,6 @@ impl MlxModelWeights {
             let is_sliding = layer.layer_type == LayerType::Sliding;
             let top_k = layer.moe.top_k;
             let moe_int = layer.moe.moe_intermediate_size;
-
             // ADR-040 §0.19 localization (HF2Q_S019_CKSUM=1): FNV-1a checksum of
             // the residual stream ENTERING this layer (= prev layer's output).
             // An empty session finish() commits+waits → on the in-order command
@@ -1917,7 +1913,8 @@ impl MlxModelWeights {
                     let off = target_tok * hs;
                     let row = &h[off..off + hs];
                     let path = format!(
-                        "{batched_dump_dir}/hf2q_batched_pre_layer_hidden_row_layer{layer_idx:02}_tok{target_tok:03}.bin");
+                        "{batched_dump_dir}/hf2q_batched_pre_layer_hidden_row_layer{layer_idx:02}_tok{target_tok:03}.bin"
+                    );
                     let bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4)
                     };
@@ -2082,7 +2079,8 @@ impl MlxModelWeights {
                         let off = target_tok * hs;
                         let row = &nrm[off..off + hs];
                         let path = format!(
-                            "{batched_dump_dir}/hf2q_batched_post_input_norm_row_layer{layer_idx:02}_tok{target_tok:03}.bin");
+                            "{batched_dump_dir}/hf2q_batched_post_input_norm_row_layer{layer_idx:02}_tok{target_tok:03}.bin"
+                        );
                         let bytes: &[u8] = unsafe {
                             std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4)
                         };
@@ -2428,7 +2426,7 @@ impl MlxModelWeights {
                             .expect("live SDPA tmp allocated with live resume");
                         let row_elems = nh * hd;
                         let ring_stage = if is_ring {
-                            let query_chunk = if gemma_tiled_live_enabled() {
+                            let query_chunk = if use_tiled_live_attention {
                                 GEMMA_LIVE_TILED_QUERY_CHUNK
                             } else {
                                 GEMMA_LIVE_QUERY_CHUNK
@@ -2486,7 +2484,7 @@ impl MlxModelWeights {
                             let start_i = ms.start_positions[seq_idx];
                             let mut local_start = 0usize;
                             while local_start < seq_len_i {
-                                let chunk_len = if gemma_tiled_live_enabled() {
+                                let chunk_len = if use_tiled_live_attention {
                                     if is_ring {
                                         (seq_len_i - local_start).min(GEMMA_LIVE_TILED_QUERY_CHUNK)
                                     } else {
@@ -2612,7 +2610,7 @@ impl MlxModelWeights {
                                         0u32,
                                     )
                                 };
-                                if gemma_tiled_live_enabled() && attn_v.dtype() != DType::F16 {
+                                if use_tiled_live_attention && attn_v.dtype() != DType::F16 {
                                     // Persistent V remains TQ-HB compressed. Expand only
                                     // this layer's active range, then use the same tiled F16
                                     // prefill kernel as the coherent cold path. Scratch is
@@ -3007,7 +3005,13 @@ impl MlxModelWeights {
                         let ring_stage = if is_ring {
                             let stage_capacity =
                                 cap.saturating_sub(1) + seq_len.min(GEMMA_LIVE_QUERY_CHUNK);
-                            let norms_per_pos = layer_kv.v_norms.element_count() / (nkv * cap);
+                            // Full-F16 V carries a four-byte ABI dummy in
+                            // `v_norms`, so its physical extent cannot encode
+                            // per-position geometry. The allocator-owned
+                            // metadata is authoritative for both F16 and
+                            // packed-V representations; F16 attention
+                            // specializes the staged norms read away.
+                            let norms_per_pos = layer_kv.norms_per_pos;
                             anyhow::ensure!(
                                 stage_capacity > 0 && norms_per_pos > 0,
                                 "live ring stage L{layer_idx} has invalid shape"
@@ -3610,9 +3614,9 @@ impl MlxModelWeights {
                             ).map_err(|e| anyhow::anyhow!("xlen pre-SDPA V copy L{layer_idx}: {e}"))?;
                             } else {
                                 anyhow::bail!(
-                                "xlen SDPA L{layer_idx}: V is not F16 (got {:?}); HF2Q_FULL_F16_KV=1 required",
-                                layer_kv.v_packed.dtype()
-                            );
+                                    "xlen SDPA L{layer_idx}: V is not F16 (got {:?}); HF2Q_FULL_F16_KV=1 required",
+                                    layer_kv.v_packed.dtype()
+                                );
                             }
 
                             // ADR-030 iter-99 — also write BF16 cache pre-SDPA so
@@ -4276,9 +4280,9 @@ impl MlxModelWeights {
                             ).map_err(|e| anyhow::anyhow!("xlen pre-SDPA V copy L{layer_idx}: {e}"))?;
                             } else {
                                 anyhow::bail!(
-                                "xlen SDPA L{layer_idx}: V is not F16 (got {:?}); HF2Q_FULL_F16_KV=1 required",
-                                layer_kv.v_packed.dtype()
-                            );
+                                    "xlen SDPA L{layer_idx}: V is not F16 (got {:?}); HF2Q_FULL_F16_KV=1 required",
+                                    layer_kv.v_packed.dtype()
+                                );
                             }
 
                             // ADR-030 iter-84 — D=512 BF16 cross-length verify
@@ -4347,9 +4351,9 @@ impl MlxModelWeights {
                                 std::env::var("HF2Q_DFLASH_XLEN_DEBUG").as_deref() == Ok("1");
                             if xlen_debug_d512 {
                                 eprintln!(
-                                "[XLEN_DEBUG global L{} verify start_pos={} seq_len={} hd={} F16-cast path]",
-                                layer_idx, start_pos, seq_len, hd,
-                            );
+                                    "[XLEN_DEBUG global L{} verify start_pos={} seq_len={} hd={} F16-cast path]",
+                                    layer_idx, start_pos, seq_len, hd,
+                                );
                                 // ADR-030 iter-102 — D=512 BF16 cache readback.
                                 // For global layers the SDPA reads from `bf16_k`
                                 // (local scratch, F16→F32→BF16 cast).  Dumping the
@@ -4651,7 +4655,7 @@ impl MlxModelWeights {
                     // in the bucket profile at pp2455 and ~30 MB of write+
                     // read traffic per layer (~900 MB across the prefill).
                     //
-                    // Wave P4.19 teaches the O-proj matmul kernel to read
+                    // Wave P4.19 teaches supported O-proj matmul kernels to read
                     // `pf_sdpa_out_perm` DIRECTLY via a bf16-input perm021
                     // variant (`kernel_mul_mm_q{4_0,6_K}_tensor_bf16_perm021`
                     // in quantized_matmul_mm_tensor.metal).  The B-stage of
@@ -4665,16 +4669,19 @@ impl MlxModelWeights {
                     // Both produce identical half bits because bfloat->float
                     // is pure bit-expansion and the float->half RNE round
                     // drops the zero-pad low 16 bits without changing the
-                    // result.  Verified against sourdough gate.
+                    // result. Unsupported stored O-projection codecs keep the
+                    // activation-only permute and execute their ordinary native
+                    // weight route; no weight shadow is synthesized.
                 } // end of !use_no_fa branch
 
                 // 8. O-proj (m = seq_len): [seq_len, nh*hd] -> [seq_len, hs]
                 //
                 // Branches on use_no_fa:
-                //   * !use_no_fa (default FA path): O-proj reads pf_sdpa_out_perm
-                //       [n_heads, seq_len, head_dim] bf16 directly via the
-                //       perm021 tensor-mm variant (Wave P4.19) — no permute
-                //       dispatch needed.
+                //   * !use_no_fa (default FA path): admitted Q4_0/Q8_0/Q6_K
+                //       O-projections read pf_sdpa_out_perm directly through
+                //       the perm021 tensor-MM variant. Other admitted stored
+                //       codecs permute only the activation into seq-major F32,
+                //       then use the ordinary native projection route.
                 //   * use_no_fa (experimental tensor-mm attention path):
                 //       the NO_FA attention steps already permute the
                 //       attention output into [seq_len, n_heads, head_dim]
@@ -4703,68 +4710,57 @@ impl MlxModelWeights {
                         &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
                         &[&pf_attn_out],
                     );
-                    dispatch_qmatmul(
+                    if let Some(shape) = rectangular_live_shape {
+                        crate::inference::models::gemma4::rectangular_prefill::dispatch_rectangular_qmatmul(
+                            &mut s,
+                            reg,
+                            dev,
+                            &pf_sdpa_out,
+                            &self.layers[layer_idx].attn.o_proj,
+                            &pf_attn_out,
+                            shape,
+                            nh * hd,
+                            hs,
+                            crate::quantize::imatrix::ImatrixHint::Layered {
+                                tag: "attn_output",
+                                layer: layer_idx,
+                            },
+                        )?;
+                    } else {
+                        dispatch_qmatmul(
+                            &mut s,
+                            reg,
+                            dev,
+                            &pf_sdpa_out,
+                            &self.layers[layer_idx].attn.o_proj,
+                            &mut pf_attn_out,
+                            seq_len as u32,
+                            crate::quantize::imatrix::ImatrixHint::Layered {
+                                tag: "attn_output",
+                                layer: layer_idx,
+                            },
+                        )?;
+                    }
+                } else {
+                    crate::serve::forward_mlx_shared::dispatch_qmatmul_head_major_bf16(
                         &mut s,
                         reg,
                         dev,
+                        &pf_sdpa_out_perm,
                         &pf_sdpa_out,
                         &self.layers[layer_idx].attn.o_proj,
-                        &mut pf_attn_out,
+                        &pf_attn_out,
                         seq_len as u32,
+                        nh,
+                        hd,
                         crate::quantize::imatrix::ImatrixHint::Layered {
                             tag: "attn_output",
                             layer: layer_idx,
                         },
-                    )?;
-                } else {
-                    let o_info = &self.layers[layer_idx].attn.o_proj.info;
-                    let perm021_params = mlx_native::GgmlQuantizedMatmulPerm021Params {
-                        m: seq_len as u32,
-                        n: o_info.rows as u32,
-                        k: o_info.cols as u32,
-                        head_dim: hd as u32,
-                        ggml_type: o_info.ggml_dtype,
-                    };
-                    // ADR-029 iter-36 H28-D — route O-proj through F16-weight
-                    // perm021 variant when MlxQWeight.f16_shadow was populated
-                    // at load (HF2Q_F16_SHADOW=1 by default per iter-31).
-                    // The F16 kernel reads the half weight directly, bypassing
-                    // the per-call quantized dequant.  Falls back to the
-                    // quantized perm021 kernel when no shadow exists (env
-                    // opt-out or no F16 buffer for this layer).
-                    if let Some(f16_w) = self.layers[layer_idx].attn.o_proj.f16_shadow.as_ref() {
-                        s.barrier_between(&[&pf_sdpa_out_perm, f16_w], &[&pf_attn_out]);
-                        mlx_native::quantized_matmul_mm_tensor_perm021_f16(
-                            s.encoder_mut(),
-                            reg,
-                            dev,
-                            &pf_sdpa_out_perm,
-                            f16_w,
-                            &mut pf_attn_out,
-                            &perm021_params,
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("batched O-proj perm021_f16 L{layer_idx}: {e}")
-                        })?;
-                    } else {
-                        s.barrier_between(
-                            &[
-                                &pf_sdpa_out_perm,
-                                &self.layers[layer_idx].attn.o_proj.buffer,
-                            ],
-                            &[&pf_attn_out],
-                        );
-                        mlx_native::quantized_matmul_mm_tensor_perm021(
-                            s.encoder_mut(),
-                            reg,
-                            dev,
-                            &pf_sdpa_out_perm,
-                            &self.layers[layer_idx].attn.o_proj.buffer,
-                            &mut pf_attn_out,
-                            &perm021_params,
-                        )
-                        .map_err(|e| anyhow::anyhow!("batched O-proj perm021 L{layer_idx}: {e}"))?;
-                    }
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("batched native O-projection L{layer_idx}: {error}")
+                    })?;
                 }
                 if let Some(t0) = o_t0 {
                     bucket_finish!(
@@ -5392,8 +5388,10 @@ impl MlxModelWeights {
                 // mutually exclusive: overlay populates *_affine slots
                 // and the legacy stacked_* buffers stay resident but
                 // unused for the rest of the model lifetime.
-                let gemma_moe_use_affine = self.layers[layer_idx].moe.gate_up_affine.is_some()
-                    && self.layers[layer_idx].moe.down_affine.is_some();
+                let affine_pair = self.layers[layer_idx].moe.affine_pair()?;
+                let gemma_moe_use_affine = affine_pair.is_some();
+                let (gate_up_affine, down_affine) =
+                    affine_pair.map_or((None, None), |(gate_up, down)| (Some(gate_up), Some(down)));
                 if !gemma_moe_use_affine
                     && (self.layers[layer_idx].moe.stacked_gate_up.is_none()
                         || self.layers[layer_idx].moe.stacked_down.is_none())
@@ -5402,19 +5400,10 @@ impl MlxModelWeights {
                 }
                 let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
                 let gu_w_buf: &mlx_native::MlxBuffer = if gemma_moe_use_affine {
-                    &self.layers[layer_idx]
-                        .moe
-                        .gate_up_affine
-                        .as_ref()
-                        .unwrap()
-                        .weight
+                    &gate_up_affine.unwrap().weight
                 } else {
                     self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()
                 };
-                s.barrier_between(
-                    &[&pf_moe_norm_out, &pf_expert_ids, gu_w_buf],
-                    &[&pf_moe_gate_up],
-                );
                 let profile_moe = std::env::var("HF2Q_PROFILE_MOE").is_ok() || profile_buckets_on;
                 let moe_gu_t0 = if profile_moe {
                     s.finish().map_err(|e| {
@@ -5428,33 +5417,52 @@ impl MlxModelWeights {
                 } else {
                     None
                 };
-                if gemma_moe_use_affine {
-                    let stack = self.layers[layer_idx].moe.gate_up_affine.as_ref().unwrap();
-                    mlx_native::quantized_matmul_id_into(
-                        s.encoder_mut(),
+                let native_activation_epoch = self.native_activation_epoch()?;
+                let rectangular_ffn_plan = rectangular_ffn_plans
+                    .as_ref()
+                    .map(|plans| &plans[layer_idx]);
+                let native_dispatched = if let Some(plan) = rectangular_ffn_plan {
+                    crate::inference::models::gemma4::rectangular_ffn::dispatch_rectangular_native_gate_up(
+                        &mut s,
                         reg,
                         dev,
+                        native_activation_epoch,
                         &pf_moe_norm_out,
-                        &stack.weight,
-                        &stack.scales,
-                        &stack.biases,
+                        gu_w_buf,
                         &pf_expert_ids,
                         &pf_moe_gate_up,
-                        &mlx_native::QuantizedMatmulIdParams {
-                            m: seq_len as u32,
-                            k: hs as u32,
-                            n: (2 * moe_int) as u32,
-                            group_size: stack.group_size,
-                            bits: stack.bits,
-                            n_expert_used: top_k as u32,
-                            num_experts: num_experts as u32,
-                        },
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("batched gate_up_id (affine) L{layer_idx}: {e}")
-                    })?;
-                    let _ = ggml_type_gu;
+                        gate_up_affine,
+                        ggml_type_gu,
+                        plan,
+                        (2 * moe_int) as u32,
+                        hs as u32,
+                        num_experts as u32,
+                        self.layers[layer_idx].moe.gate_up_expert_stride,
+                    )?
                 } else {
+                    crate::inference::models::gemma4::expert_dispatch::dispatch_native_scalar_expert(
+                            &mut s,
+                            reg,
+                            dev,
+                            native_activation_epoch,
+                            &pf_moe_norm_out,
+                            gu_w_buf,
+                            &pf_expert_ids,
+                            &pf_moe_gate_up,
+                            gate_up_affine,
+                            ggml_type_gu,
+                            seq_len as u32,
+                            top_k as u32,
+                            (2 * moe_int) as u32,
+                            hs as u32,
+                            num_experts as u32,
+                            self.layers[layer_idx].moe.gate_up_expert_stride,
+                            mlx_native::DenseMatmulIdInputLayout::SharedPerToken,
+                            crate::inference::models::gemma4::expert_dispatch::DenseExpertScratchSlot::GateUp,
+                            "Gemma batched-prefill gate/up",
+                        )?
+                };
+                if !gemma_moe_use_affine {
                     // ADR-033 §Pi Phase B Stage 3b — MoE intercept for
                     // `ffn_gate_up_exps`. Captures the shared per-token
                     // input row + per-token routed expert IDs. Fires
@@ -5491,15 +5499,8 @@ impl MlxModelWeights {
                         anyhow::anyhow!("imatrix moe intercept (gate_up) L{layer_idx}: {e}")
                     })?;
 
-                    s.quantized_matmul_id_ggml_pooled(
-                        reg,
-                        dev,
-                        &pf_moe_norm_out,
-                        self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                        &pf_expert_ids,
-                        &mut pf_moe_gate_up,
-                        &mut pf_moe_mm_scratch,
-                        &mlx_native::GgmlQuantizedMatmulIdParams {
+                    if !native_dispatched {
+                        let params = mlx_native::GgmlQuantizedMatmulIdParams {
                             n_tokens: seq_len as u32,
                             top_k: top_k as u32,
                             n: (2 * moe_int) as u32,
@@ -5507,9 +5508,38 @@ impl MlxModelWeights {
                             n_experts: num_experts as u32,
                             expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
                             ggml_type: ggml_type_gu,
-                        },
-                    )
-                    .map_err(|e| anyhow::anyhow!("batched gate_up_id L{layer_idx}: {e}"))?;
+                        };
+                        if let Some(plan) = rectangular_ffn_plan {
+                            crate::inference::models::gemma4::rectangular_ffn::dispatch_rectangular_ggml_gate_up(
+                                &mut s,
+                                reg,
+                                dev,
+                                &pf_moe_norm_out,
+                                self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                                &pf_expert_ids,
+                                &pf_moe_gate_up,
+                                &mut pf_moe_mm_scratch,
+                                plan,
+                                params,
+                            )?;
+                        } else {
+                            s.barrier_between(
+                                &[&pf_moe_norm_out, &pf_expert_ids, gu_w_buf],
+                                &[&pf_moe_gate_up],
+                            );
+                            s.quantized_matmul_id_ggml_pooled(
+                                reg,
+                                dev,
+                                &pf_moe_norm_out,
+                                self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                                &pf_expert_ids,
+                                &mut pf_moe_gate_up,
+                                &mut pf_moe_mm_scratch,
+                                &params,
+                            )
+                            .map_err(|e| anyhow::anyhow!("batched gate_up_id L{layer_idx}: {e}"))?;
+                        }
+                    }
                 }
                 if let Some(t0) = moe_gu_t0 {
                     bucket_finish!(
@@ -5565,16 +5595,10 @@ impl MlxModelWeights {
                 // MoE down experts: same affine vs ggml routing as gate_up.
                 let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
                 let dn_w_buf: &mlx_native::MlxBuffer = if gemma_moe_use_affine {
-                    &self.layers[layer_idx]
-                        .moe
-                        .down_affine
-                        .as_ref()
-                        .unwrap()
-                        .weight
+                    &down_affine.unwrap().weight
                 } else {
                     self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()
                 };
-                s.barrier_between(&[&pf_moe_swiglu, &pf_expert_ids, dn_w_buf], &[&pf_moe_down]);
                 let moe_dn_t0 = if std::env::var("HF2Q_PROFILE_MOE").is_ok() || profile_buckets_on {
                     s.finish().map_err(|e| {
                         anyhow::anyhow!("MoE-profile pre-finish (dn) L{layer_idx}: {e}")
@@ -5587,31 +5611,29 @@ impl MlxModelWeights {
                 } else {
                     None
                 };
-                if gemma_moe_use_affine {
-                    let stack = self.layers[layer_idx].moe.down_affine.as_ref().unwrap();
-                    mlx_native::quantized_matmul_id_into(
-                        s.encoder_mut(),
-                        reg,
-                        dev,
-                        &pf_moe_swiglu,
-                        &stack.weight,
-                        &stack.scales,
-                        &stack.biases,
-                        &pf_expert_ids,
-                        &pf_moe_down,
-                        &mlx_native::QuantizedMatmulIdParams {
-                            m: (seq_len * top_k) as u32,
-                            k: moe_int as u32,
-                            n: hs as u32,
-                            group_size: stack.group_size,
-                            bits: stack.bits,
-                            n_expert_used: 1,
-                            num_experts: num_experts as u32,
-                        },
-                    )
-                    .map_err(|e| anyhow::anyhow!("batched down_id (affine) L{layer_idx}: {e}"))?;
-                    let _ = ggml_type_dn;
-                } else {
+                let native_activation_epoch = self.native_activation_epoch()?;
+                let native_dispatched = crate::inference::models::gemma4::expert_dispatch::dispatch_native_scalar_expert(
+                            &mut s,
+                            reg,
+                            dev,
+                            native_activation_epoch,
+                            &pf_moe_swiglu,
+                            dn_w_buf,
+                            &pf_expert_ids,
+                            &pf_moe_down,
+                            down_affine,
+                            ggml_type_dn,
+                            seq_len as u32,
+                            top_k as u32,
+                            hs as u32,
+                            moe_int as u32,
+                            num_experts as u32,
+                            self.layers[layer_idx].moe.down_expert_stride,
+                            mlx_native::DenseMatmulIdInputLayout::Slotted,
+                            crate::inference::models::gemma4::expert_dispatch::DenseExpertScratchSlot::Down,
+                            "Gemma batched-prefill down",
+                        )?;
+                if !gemma_moe_use_affine {
                     // ADR-033 §Pi Phase B Stage 3b — MoE intercept for
                     // `ffn_down_exps`. Captures the post-SwiGLU input
                     // row + per-row routed expert ID (top_k=1 since
@@ -5645,25 +5667,31 @@ impl MlxModelWeights {
                         anyhow::anyhow!("imatrix moe intercept (down) L{layer_idx}: {e}")
                     })?;
 
-                    s.quantized_matmul_id_ggml_pooled(
-                        reg,
-                        dev,
-                        &pf_moe_swiglu,
-                        self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                        &pf_expert_ids,
-                        &mut pf_moe_down,
-                        &mut pf_moe_mm_scratch,
-                        &mlx_native::GgmlQuantizedMatmulIdParams {
-                            n_tokens: (seq_len * top_k) as u32,
-                            top_k: 1,
-                            n: hs as u32,
-                            k: moe_int as u32,
-                            n_experts: num_experts as u32,
-                            expert_stride: self.layers[layer_idx].moe.down_expert_stride,
-                            ggml_type: ggml_type_dn,
-                        },
-                    )
-                    .map_err(|e| anyhow::anyhow!("batched down_id L{layer_idx}: {e}"))?;
+                    if !native_dispatched {
+                        s.barrier_between(
+                            &[&pf_moe_swiglu, &pf_expert_ids, dn_w_buf],
+                            &[&pf_moe_down],
+                        );
+                        s.quantized_matmul_id_ggml_pooled(
+                            reg,
+                            dev,
+                            &pf_moe_swiglu,
+                            self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                            &pf_expert_ids,
+                            &mut pf_moe_down,
+                            &mut pf_moe_mm_scratch,
+                            &mlx_native::GgmlQuantizedMatmulIdParams {
+                                n_tokens: (seq_len * top_k) as u32,
+                                top_k: 1,
+                                n: hs as u32,
+                                k: moe_int as u32,
+                                n_experts: num_experts as u32,
+                                expert_stride: self.layers[layer_idx].moe.down_expert_stride,
+                                ggml_type: ggml_type_dn,
+                            },
+                        )
+                        .map_err(|e| anyhow::anyhow!("batched down_id L{layer_idx}: {e}"))?;
+                    }
                 }
                 if let Some(t0) = moe_dn_t0 {
                     bucket_finish!(
@@ -5954,7 +5982,8 @@ impl MlxModelWeights {
                                        tag_shape: &str|
                      -> anyhow::Result<()> {
                         let path = format!(
-                            "{batched_dump_dir}/hf2q_batched_{name}_layer{layer_idx:02}_tok{target_tok:03}.bin");
+                            "{batched_dump_dir}/hf2q_batched_{name}_layer{layer_idx:02}_tok{target_tok:03}.bin"
+                        );
                         let bytes: &[u8] = unsafe {
                             std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
                         };
@@ -6045,7 +6074,8 @@ impl MlxModelWeights {
                     // u32 expert IDs — separate byte format
                     let eid_slice = &eids_full[exp_off..exp_off + top_k];
                     let path_eid = format!(
-                        "{batched_dump_dir}/hf2q_batched_expert_ids_row_layer{layer_idx:02}_tok{target_tok:03}.bin");
+                        "{batched_dump_dir}/hf2q_batched_expert_ids_row_layer{layer_idx:02}_tok{target_tok:03}.bin"
+                    );
                     let eid_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(
                             eid_slice.as_ptr() as *const u8,
@@ -6211,71 +6241,28 @@ impl MlxModelWeights {
                 );
             }
 
-            // lm_head: whichever weight was loaded.  ADR-028 iter-345
-            // adds Q6_K arm so HF2Q_LMHEAD_Q6K=1 (iter-188 lever, +2%
-            // decode) coexists with HF2Q_BATCHED_PREFILL=1 (iter-344
-            // default, 34× prefill).  Q6_K dispatched via the same
-            // dispatch_qmatmul as Q8/Q4_0 (kernel_mul_mv_q6_K_f32_nr2
-            // since iter-309 + iter-326 default).
+            // Execute the artifact-declared head representation.
             let t0_lm_head = if profile_buckets_on {
                 Some(std::time::Instant::now())
             } else {
                 None
             };
-            if let Some(ref q6k) = self.lm_head_q6k {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q6k.buffer],
-                    &[&self.activations.logits],
-                );
-                crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q6k,
-                    &mut self.activations.logits,
-                    1,
-                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                )
-                .map_err(|e| anyhow::anyhow!("batched lm_head Q6_K: {e}"))?;
-            } else if let Some(ref q8) = self.lm_head_q8 {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q8.buffer],
-                    &[&self.activations.logits],
-                );
-                crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q8,
-                    &mut self.activations.logits,
-                    1,
-                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                )
-                .map_err(|e| anyhow::anyhow!("batched lm_head Q8: {e}"))?;
-            } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-                s.barrier_between(
-                    &[&self.activations.norm_out, lm_head_f16],
-                    &[&self.activations.logits],
-                );
-                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &self.activations.norm_out,
-                    lm_head_f16,
-                    &self.activations.logits,
-                    &DenseGemmF16Params {
-                        m: 1,
-                        n: vocab_size as u32,
-                        k: hs as u32,
-                    },
-                )
-                .map_err(|e| anyhow::anyhow!("batched lm_head: {e}"))?;
-            } else {
-                anyhow::bail!("batched prefill requires GPU lm_head (Q6_K, F16, or Q8 weight)");
-            }
+            let lm_head = self.resolved_lm_head();
+            s.barrier_between(
+                &[&self.activations.norm_out, &lm_head.buffer],
+                &[&self.activations.logits],
+            );
+            crate::serve::forward_mlx_shared::dispatch_qmatmul(
+                &mut s,
+                reg,
+                dev,
+                &self.activations.norm_out,
+                lm_head,
+                &self.activations.logits,
+                1,
+                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+            )
+            .map_err(|e| anyhow::anyhow!("batched native lm_head: {e}"))?;
             if let Some(t0) = t0_lm_head {
                 bucket_finish!(
                     s,
@@ -6368,26 +6355,20 @@ impl MlxModelWeights {
                     logits.len(),
                     vocab_size
                 );
-                ms_logits.push(logits[..vocab_size].to_vec());
+                let logits = &logits[..vocab_size];
+                crate::inference::argmax::validate_finite_logits(
+                    logits,
+                    "Gemma multi-sequence prefill",
+                )?;
+                ms_logits.push(logits.to_vec());
             }
 
-            let tok = {
-                let idx: &[u32] = self
-                    .activations
-                    .argmax_index
-                    .as_slice()
-                    .map_err(|e| anyhow::anyhow!("argmax read: {e}"))?;
-                idx[0]
-            };
-            let argmax_value = {
-                let value: &[f32] = self
-                    .activations
-                    .argmax_value
-                    .as_slice()
-                    .map_err(|e| anyhow::anyhow!("argmax value read: {e}"))?;
-                value[0]
-            };
-            validate_batched_prefill_argmax(argmax_value, head_row)?;
+            let tok = crate::inference::argmax::read_finite_argmax_one(
+                &self.activations.argmax_index,
+                &self.activations.argmax_value,
+                vocab_size as u32,
+                "Gemma batched prefill",
+            )?;
             // first_token (the fn's return) is seq 0's token — single-seq
             // callers read it; multi-seq callers read out_first_tokens.
             if ms_tokens.is_empty() {
@@ -6497,9 +6478,18 @@ impl MlxModelWeights {
             let total_ms = mm_ns as f64 / 1_000_000.0;
             eprintln!(
                 "[MM_PROFILE] dense qmatmul: {} calls, {:.2} ms total ({:.3} ms/call) ({:.1}% of prefill {:.1} ms)",
-                mm_n, total_ms,
-                if mm_n > 0 { total_ms / mm_n as f64 } else { 0.0 },
-                if prefill_ms > 0.0 { 100.0 * total_ms / prefill_ms } else { 0.0 },
+                mm_n,
+                total_ms,
+                if mm_n > 0 {
+                    total_ms / mm_n as f64
+                } else {
+                    0.0
+                },
+                if prefill_ms > 0.0 {
+                    100.0 * total_ms / prefill_ms
+                } else {
+                    0.0
+                },
                 prefill_ms,
             );
         }
@@ -6509,9 +6499,18 @@ impl MlxModelWeights {
             let total_ms = post_ns as f64 / 1_000_000.0;
             eprintln!(
                 "[MOE_POST_PROFILE] swiglu+wsum: {} calls, {:.2} ms total ({:.3} ms/call) ({:.1}% of prefill {:.1} ms)",
-                post_n, total_ms,
-                if post_n > 0 { total_ms / post_n as f64 } else { 0.0 },
-                if prefill_ms > 0.0 { 100.0 * total_ms / prefill_ms } else { 0.0 },
+                post_n,
+                total_ms,
+                if post_n > 0 {
+                    total_ms / post_n as f64
+                } else {
+                    0.0
+                },
+                if prefill_ms > 0.0 {
+                    100.0 * total_ms / prefill_ms
+                } else {
+                    0.0
+                },
                 prefill_ms,
             );
         }
@@ -6744,7 +6743,7 @@ impl MlxModelWeights {
         //     sliding layers are always ring cap=sw — no LONG_RESUME
         //     linear trick exists on the batched route).
         // Dense snapshot copies the first seq_len positions per head;
-        // hybrid snapshot (F16 K + U8 V packed + F32 V norms) same.
+        // hybrid snapshot preserves the live V representation.
         let any_sliding_layer = self
             .layers
             .iter()
@@ -6754,27 +6753,54 @@ impl MlxModelWeights {
         // the seq>sw guard — sliding layers were allocated LINEAR this
         // prefill, so the snapshot captures [0..seq) faithfully.
         let snapshot_safe = !any_sliding_layer || seq_len <= sw || kv_lcp_long_resume;
-        // Pre-copy budget gate (2026-08-03): estimate dual-leg entry
-        // bytes from shapes BEFORE the snapshot alloc+memcpy; skip when
-        // the entry cannot fit the registry budget (97K-token dual-leg
-        // ≈ 64 GB → swap-storm, measured live 2026-08-03).
+        // Pre-copy budget gate (2026-08-03): estimate a dual-leg entry only
+        // for the non-live route that can actually publish an LCP snapshot.
+        // Live prefix resume mounts the slot-banked rank-4 cache and captures
+        // its boundary through the slot-local anchor transaction instead; it
+        // must not be interpreted as a rank-3 LCP snapshot source.
+        // Skip when the entry cannot fit the registry budget (97K-token
+        // dual-leg ≈ 64 GB → swap-storm, measured live 2026-08-03).
         let snap_cap_est =
             sw.max(seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 });
-        let lcp_est_bytes: u64 = {
+        let lcp_est_bytes: u64 = if live_prefix_resume {
+            0
+        } else {
             let dense: u64 = self
                 .layers
                 .iter()
                 .map(|l| (2 * l.num_kv_heads * snap_cap_est * l.head_dim * kv_elem_bytes) as u64)
                 .sum();
-            let hybrid: u64 = if self.hybrid_kv.is_some() {
-                self.layers
-                    .iter()
-                    .map(|l| {
-                        (l.num_kv_heads * snap_cap_est * (l.head_dim * 2 + l.head_dim + 4)) as u64
-                    })
-                    .sum()
-            } else {
-                0
+            let hybrid: u64 = match self.hybrid_kv.as_ref() {
+                None => 0,
+                Some(live_hybrid) => {
+                    anyhow::ensure!(
+                        live_hybrid.len() == self.layers.len(),
+                        "batched hybrid LCP estimate layer count {} != model layers {}",
+                        live_hybrid.len(),
+                        self.layers.len()
+                    );
+                    live_hybrid.iter().enumerate().try_fold(
+                        0u64,
+                        |total, (layer_idx, live)| {
+                            let shape = live.k.shape();
+                            anyhow::ensure!(
+                                shape.len() == 3,
+                                "batched hybrid LCP estimate K L{layer_idx} must be rank 3, got {shape:?}"
+                            );
+                            let layer_bytes = crate::inference::models::gemma4::kv_cache::hybrid_lcp_snapshot_layer_bytes(
+                                shape[0],
+                                snap_cap_est,
+                                shape[2],
+                                live.norms_per_pos,
+                                live.k.dtype(),
+                                live.v_packed.dtype(),
+                            )?;
+                            total.checked_add(layer_bytes).ok_or_else(|| {
+                                anyhow::anyhow!("batched hybrid LCP estimate byte count overflow")
+                            })
+                        },
+                    )?
+                }
             };
             dense + hybrid
         };
@@ -6877,84 +6903,14 @@ impl MlxModelWeights {
         > = if lcp_snapshots_on {
             match self.hybrid_kv.as_ref() {
                 None => None,
-                Some(live_hybrid) => {
-                    let mut hsnap: Vec<
-                        std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>,
-                    > = Vec::with_capacity(live_hybrid.len());
-                    for live_layer in live_hybrid.iter() {
-                        let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
-                        let live_cap_dim = live_layer
-                            .k
-                            .shape()
-                            .get(1)
-                            .copied()
-                            .unwrap_or(live_layer.capacity);
-                        let hd_dim = live_layer.k.shape().get(2).copied().unwrap_or(0);
-                        let npp = live_layer.norms_per_pos.max(1);
-                        let mut k_snap = dev
-                            .alloc_buffer(
-                                nkv_dim * snap_cap * hd_dim * 2,
-                                DType::F16,
-                                vec![nkv_dim, snap_cap, hd_dim],
-                            )
-                            .map_err(|e| anyhow::anyhow!("lcp hybrid snapshot K alloc: {e}"))?;
-                        let mut vp_snap = dev
-                            .alloc_buffer(
-                                nkv_dim * snap_cap * hd_dim,
-                                DType::U8,
-                                vec![nkv_dim, snap_cap, hd_dim],
-                            )
-                            .map_err(|e| anyhow::anyhow!("lcp hybrid snapshot V alloc: {e}"))?;
-                        let vn_shape = if npp == 1 {
-                            vec![nkv_dim, snap_cap]
-                        } else {
-                            vec![nkv_dim, snap_cap, npp]
-                        };
-                        let mut vn_snap = dev
-                            .alloc_buffer(nkv_dim * snap_cap * npp * 4, DType::F32, vn_shape)
-                            .map_err(|e| {
-                                anyhow::anyhow!("lcp hybrid snapshot V norms alloc: {e}")
-                            })?;
-                        let copy_prefix = |src: &MlxBuffer,
-                                           dst: &mut MlxBuffer,
-                                           elem: usize,
-                                           inner: usize,
-                                           what: &str|
-                         -> anyhow::Result<()> {
-                            let s: &[u8] = src.as_slice().map_err(|e| {
-                                anyhow::anyhow!("lcp hybrid snapshot {what} src: {e}")
-                            })?;
-                            let d: &mut [u8] = dst.as_mut_slice().map_err(|e| {
-                                anyhow::anyhow!("lcp hybrid snapshot {what} dst: {e}")
-                            })?;
-                            let copy_len = seq_len * inner * elem;
-                            let src_stride = live_cap_dim * inner * elem;
-                            let dst_stride = snap_cap * inner * elem;
-                            for h in 0..nkv_dim {
-                                let so = h * src_stride;
-                                let do_ = h * dst_stride;
-                                d[do_..do_ + copy_len].copy_from_slice(&s[so..so + copy_len]);
-                            }
-                            Ok(())
-                        };
-                        copy_prefix(&live_layer.k, &mut k_snap, 2, hd_dim, "K")?;
-                        copy_prefix(&live_layer.v_packed, &mut vp_snap, 1, hd_dim, "V packed")?;
-                        copy_prefix(&live_layer.v_norms, &mut vn_snap, 4, npp, "V norms")?;
-                        hsnap.push(std::sync::Arc::new(
-                            crate::inference::models::gemma4::kv_cache::HybridKvBuffers {
-                                k: k_snap,
-                                v_packed: vp_snap,
-                                v_norms: vn_snap,
-                                capacity: snap_cap,
-                                is_sliding: live_layer.is_sliding,
-                                norms_per_pos: live_layer.norms_per_pos,
-                                bf16_xlen_k: None,
-                                bf16_xlen_v: None,
-                            },
-                        ));
-                    }
-                    Some(hsnap)
-                }
+                Some(live_hybrid) => Some(
+                    crate::inference::models::gemma4::kv_cache::snapshot_hybrid_kv_for_lcp(
+                        dev,
+                        live_hybrid,
+                        seq_len,
+                        snap_cap,
+                    )?,
+                ),
             }
         } else {
             None
@@ -7623,17 +7579,15 @@ mod route_viability_tests {
     use super::{
         batched_route_overhead_bytes as overhead, gemma_batched_mask_seq_len,
         gemma_lcp_resume_worthwhile, gemma_live_query_chunk_len, gemma_live_stage_history_len,
-        validate_batched_prefill_argmax,
     };
 
     #[test]
-    fn batched_prefill_rejects_non_finite_argmax_poison() {
-        assert!(validate_batched_prefill_argmax(17.0, 0).is_ok());
-        for poisoned in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let error = validate_batched_prefill_argmax(poisoned, 3)
-                .expect_err("non-finite argmax poison must fail closed");
-            assert!(error.to_string().contains("row 3"));
-        }
+    fn batched_prefill_has_one_checked_affine_dispatch_authority() {
+        let source = include_str!("forward_prefill_batched.rs");
+        let shared = ["dispatch_native_scalar_expert", "("].concat();
+        let direct = ["quantized_matmul_id_into", "("].concat();
+        assert_eq!(source.matches(&shared).count(), 2);
+        assert_eq!(source.matches(&direct).count(), 0);
     }
 
     #[test]

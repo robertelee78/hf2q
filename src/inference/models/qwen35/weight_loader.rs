@@ -25,7 +25,7 @@
 //! tensors (norms, biases) are 1-D and drop in directly.
 
 use anyhow::{anyhow, Context, Result};
-use mlx_native::gguf::{GgufFile, TensorInfo};
+use mlx_native::gguf::{GgufFile, GgufMappedTensorSet, TensorInfo};
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType as MlxDType, MlxBuffer, MlxDevice};
 use std::collections::BTreeMap;
@@ -37,44 +37,49 @@ use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
 use super::gpu_delta_net::DeltaNetWeightsGpu;
-use super::gpu_full_attn::{upload_f32_weight, FullAttnQGateWeightsGpu, FullAttnWeightsGpu};
+use super::gpu_full_attn::{FullAttnQGateWeightsGpu, FullAttnWeightsGpu};
 use super::in_memory_loader::{
     bf16_bytes_to_f32, f16_bytes_to_f32, f32_bytes_to_f32, quantize_f32_to_q8_0_buffer,
 };
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 use super::{default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant};
+use crate::serve::forward_mlx_shared::{map_native_gguf_tensor_view, MlxQWeight};
 
 // ============================================================================
 // Quantized MoE weight container
 // ============================================================================
 
-/// Per-layer MoE FFN weights with expert tensors kept in their native GGML
-/// quantization.  Small tensors (router, shared-expert) are still f32.
+/// Per-layer MoE FFN weights retaining every production matrix in the exact
+/// storage representation declared by the GGUF.
 ///
 /// This struct is the bridge between GGUF disk bytes and
 /// `MoeFfnWeightsGpuQ`: it holds the raw Metal buffers that `GgufFile::load_tensor`
-/// produced, plus the f32 scalars needed for routing and shared-expert computation.
+/// produced. Router and shared-expert matrices use the same native dense
+/// dispatch abstraction as ordinary projections; they are never expanded and
+/// uploaded as a BF16 shadow.
 pub struct MoeFfnWeightsQ {
-    /// Router: `[num_experts, hidden_size]` F32.
-    pub router: Vec<f32>,
-    /// Stacked expert gate_proj: raw GGML blocks, dtype U8 on Metal.
+    /// Router: `[num_experts, hidden_size]` artifact-native matrix.
+    pub router: MlxQWeight,
+    /// Stacked expert gate_proj in exact artifact storage: scalar dtype for
+    /// F32/F16/BF16, U8-packed bytes for block codecs.
     pub expert_gate_q: MlxBuffer,
-    /// Stacked expert up_proj: raw GGML blocks, dtype U8 on Metal.
+    /// Stacked expert up_proj in exact artifact storage.
     pub expert_up_q: MlxBuffer,
-    /// Stacked expert down_proj: raw GGML blocks, dtype U8 on Metal.
+    /// Stacked expert down_proj in exact artifact storage.
     pub expert_down_q: MlxBuffer,
-    /// GGML quantization type for the gate and up expert buffers (must match).
-    /// In the apex GGUF these are Q5_K.
-    pub ggml_type_gate_up: GgmlType,
-    /// GGML quantization type for the down expert buffer (may differ from gate/up).
+    /// GGML quantization type for the gate expert buffer.
+    pub ggml_type_gate: GgmlType,
+    /// GGML quantization type for the up expert buffer.
+    pub ggml_type_up: GgmlType,
+    /// GGML quantization type for the down expert buffer.
     /// In the apex GGUF this is Q6_K.
     pub ggml_type_down: GgmlType,
-    /// Shared-expert sigmoid gate: `[hidden_size]` F32.
-    pub shared_gate_logit: Vec<f32>,
-    /// Shared-expert SwiGLU weights (F32).
-    pub shared_gate: Vec<f32>,
-    pub shared_up: Vec<f32>,
-    pub shared_down: Vec<f32>,
+    /// Shared-expert sigmoid gate: `[1, hidden_size]` artifact-native matrix.
+    pub shared_gate_logit: MlxQWeight,
+    /// Shared-expert SwiGLU matrices in their declared artifact codecs.
+    pub shared_gate: MlxQWeight,
+    pub shared_up: MlxQWeight,
+    pub shared_down: MlxQWeight,
     /// ADR-020 AC#5 Iter C2.4 — DWQ-overlay mlx-affine expert stacks
     /// (packed-U32 weight + BF16 scales + BF16 biases).  When `Some`,
     /// the corresponding `expert_*_q` buffer above stays
@@ -108,13 +113,33 @@ pub struct DenseFfnWeightsQ {
     pub up_q: MlxBuffer,
     /// Down projection raw GGML blocks: `[hidden_size, intermediate_size]`.
     pub down_q: MlxBuffer,
-    /// GGML quantization type for gate/up (must be same — they share k=hidden_size).
-    pub ggml_type_gate_up: GgmlType,
-    /// GGML quantization type for down (may differ from gate/up in mixed-quant GGUFs).
+    /// GGML quantization type for the gate projection.
+    pub ggml_type_gate: GgmlType,
+    /// GGML quantization type for the up projection.
+    pub ggml_type_up: GgmlType,
+    /// GGML quantization type for the down projection.
     pub ggml_type_down: GgmlType,
     /// Dense FFN intermediate dimension (number of rows in gate/up weight).
     pub intermediate_size: u32,
     /// Model hidden dimension (number of columns in gate/up weight).
+    pub hidden_size: u32,
+}
+
+/// Per-layer dense SwiGLU weights retaining native scalar GGUF storage.
+///
+/// F32, F16, and BF16 buffers remain typed Metal buffers exactly as loaded;
+/// execution selects the matching dense kernel per projection. This is
+/// intentionally separate from [`DenseFfnWeights`] so production GGUF loads
+/// can never materialize a second F32 copy as an incidental CPU-reference
+/// representation.
+pub struct DenseFfnWeightsNative {
+    pub gate: MlxBuffer,
+    pub up: MlxBuffer,
+    pub down: MlxBuffer,
+    pub gate_type: GgmlType,
+    pub up_type: GgmlType,
+    pub down_type: GgmlType,
+    pub intermediate_size: u32,
     pub hidden_size: u32,
 }
 
@@ -132,6 +157,58 @@ pub fn load_f32_tensor(gguf: &GgufFile, name: &str, device: &MlxDevice) -> Resul
     Ok(slice.to_vec())
 }
 
+/// Retain one exact F32 state tensor from the model's shared GGUF mapping.
+///
+/// Production GGUF loads run the complete role/codec preflight before this
+/// helper is reached. Re-checking the storage contract here keeps the binding
+/// fail closed even when a future caller is added outside that load path. The
+/// returned buffer aliases the artifact mapping; no anonymous upload, dtype
+/// conversion, or weight shadow is created.
+pub(super) fn map_f32_state_with_residency(
+    gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
+    name: &str,
+    device: &MlxDevice,
+) -> Result<MlxBuffer> {
+    let info = gguf
+        .tensor_info(name)
+        .ok_or_else(|| anyhow!("Qwen F32 state tensor '{name}' not found"))?;
+    anyhow::ensure!(
+        info.ggml_type == GgmlType::F32,
+        "Qwen state tensor '{name}' must retain F32 storage, got {:?}",
+        info.ggml_type
+    );
+    let expected_bytes = info
+        .shape
+        .iter()
+        .try_fold(1usize, |product, dimension| product.checked_mul(*dimension))
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| anyhow!("Qwen F32 state tensor '{name}' byte extent overflow"))?;
+    anyhow::ensure!(
+        info.byte_len == expected_bytes,
+        "Qwen F32 state tensor '{name}' has {} bytes, expected {expected_bytes}",
+        info.byte_len
+    );
+    let buffer = map_native_gguf_tensor_view(mapped, info)
+        .with_context(|| format!("retain native Qwen F32 state '{name}'"))?;
+    anyhow::ensure!(
+        buffer.dtype() == MlxDType::F32
+            && buffer.data_byte_len() == expected_bytes
+            && buffer.is_file_backed(),
+        "Qwen F32 state tensor '{name}' did not retain its exact mapped payload"
+    );
+    super::weight_pool::register_weight_buffer(device, &buffer)
+        .map_err(|e| anyhow!("register_weight_buffer({name}): {e}"))?;
+    #[cfg(test)]
+    {
+        let values = buffer
+            .as_slice::<f32>()
+            .map_err(|e| anyhow!("read mapped F32 state {name}: {e}"))?;
+        super::execution_observation::observe_loaded_f32(name, values)?;
+    }
+    Ok(buffer)
+}
+
 /// Load a quantized tensor as raw GGML blocks (DType::U8 on Metal) and
 /// register the resulting Metal buffer with the thread-local weight pool's
 /// `MTLResidencySet`.
@@ -143,14 +220,13 @@ pub fn load_f32_tensor(gguf: &GgufFile, name: &str, device: &MlxDevice) -> Resul
 /// [`super::weight_pool::register_weight_buffer`] helper.  No bucket-rounding
 /// — buffers are allocated at their exact GGML byte length.  No-op for the
 /// residency call when `HF2Q_NO_RESIDENCY=1`.
-fn load_tensor_with_residency(
-    gguf: &GgufFile,
-    name: &str,
+fn map_tensor_with_residency(
+    mapped: &GgufMappedTensorSet<'_>,
+    info: &mlx_native::gguf::TensorInfo,
     device: &MlxDevice,
 ) -> Result<MlxBuffer> {
-    let buf = gguf
-        .load_tensor(name, device)
-        .map_err(|e| anyhow!("load_tensor({name}): {e}"))?;
+    let name = info.name.as_str();
+    let buf = map_native_gguf_tensor_view(mapped, info)?;
     super::weight_pool::register_weight_buffer(device, &buf)
         .map_err(|e| anyhow!("register_weight_buffer({name}): {e}"))?;
     #[cfg(test)]
@@ -160,6 +236,7 @@ fn load_tensor_with_residency(
 
 pub(super) fn load_native_projection(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
     name: &str,
     rows: usize,
     cols: usize,
@@ -169,32 +246,20 @@ pub(super) fn load_native_projection(
         .tensor_info(name)
         .ok_or_else(|| anyhow!("native Qwen projection '{name}' not found"))?;
     let expected = validate_native_projection_info(name, info, rows, cols)?;
-    let buffer = load_tensor_with_residency(gguf, name, device)?;
-    let loaded_bytes = match info.ggml_type {
-        GgmlType::F32 => {
-            anyhow::ensure!(
-                buffer.dtype() == MlxDType::F32,
-                "native Qwen projection '{name}' F32 tensor loaded as {:?}",
-                buffer.dtype()
-            );
-            buffer
-                .as_slice::<f32>()
-                .map_err(|e| anyhow!("map native Qwen projection '{name}': {e}"))?
-                .len()
-                * std::mem::size_of::<f32>()
-        }
-        _ => {
-            anyhow::ensure!(
-                buffer.dtype() == MlxDType::U8,
-                "native Qwen projection '{name}' quantized tensor loaded as {:?}",
-                buffer.dtype()
-            );
-            buffer
-                .as_slice::<u8>()
-                .map_err(|e| anyhow!("map native Qwen projection '{name}': {e}"))?
-                .len()
-        }
+    let buffer = map_tensor_with_residency(mapped, info, device)?;
+    let expected_dtype = match info.ggml_type {
+        GgmlType::F32 => MlxDType::F32,
+        GgmlType::F16 => MlxDType::F16,
+        GgmlType::BF16 => MlxDType::BF16,
+        _ => MlxDType::U8,
     };
+    anyhow::ensure!(
+        buffer.dtype() == expected_dtype,
+        "native Qwen projection '{name}' {:?} tensor loaded as {:?}",
+        info.ggml_type,
+        buffer.dtype()
+    );
+    let loaded_bytes = buffer.data_byte_len();
     anyhow::ensure!(
         loaded_bytes == expected,
         "native Qwen projection '{name}' loaded byte length {loaded_bytes} != {expected}"
@@ -240,13 +305,53 @@ pub(crate) fn validate_native_projection_info(
     Ok(expected)
 }
 
+/// Descriptor-only contract for the shared-expert sigmoid gate. GGUF stores
+/// this logical one-row projection as an exact rank-one vector; accepting a
+/// rank-two squeeze here would make preflight, target loading, and MTP loading
+/// disagree about the artifact's native representation.
+pub(crate) fn validate_native_row_projection_info(
+    name: &str,
+    info: &TensorInfo,
+    cols: usize,
+) -> Result<usize> {
+    anyhow::ensure!(
+        info.shape.as_slice() == [cols],
+        "native Qwen row projection '{name}' must be exact rank 1 with shape [{cols}], got {:?}",
+        info.shape
+    );
+    anyhow::ensure!(
+        qwen35_native_projection_type_supported(info.ggml_type),
+        "native Qwen row projection '{name}' uses {:?}, which has no complete scalar decode/prefill route",
+        info.ggml_type
+    );
+    anyhow::ensure!(
+        cols > 0 && cols % info.ggml_type.block_values() as usize == 0,
+        "native Qwen row projection '{name}' width {cols} is not aligned to {:?}'s {}-value blocks",
+        info.ggml_type,
+        info.ggml_type.block_values()
+    );
+    let expected = (cols / info.ggml_type.block_values() as usize)
+        .checked_mul(info.ggml_type.block_bytes() as usize)
+        .ok_or_else(|| anyhow!("native Qwen row projection '{name}' byte length overflow"))?;
+    anyhow::ensure!(
+        info.byte_len == expected,
+        "native Qwen row projection '{name}' byte length {} != expected {expected} for {:?}",
+        info.byte_len,
+        info.ggml_type
+    );
+    Ok(expected)
+}
+
 pub(crate) fn qwen35_native_projection_type_supported(t: GgmlType) -> bool {
     matches!(
         t,
         GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::BF16
             | GgmlType::Q2_K
             | GgmlType::Q3_K
             | GgmlType::Q4_0
+            | GgmlType::Q5_0
             | GgmlType::Q5_1
             | GgmlType::Q8_0
             | GgmlType::Q4_K
@@ -257,11 +362,32 @@ pub(crate) fn qwen35_native_projection_type_supported(t: GgmlType) -> bool {
     )
 }
 
+fn load_native_row_projection(
+    gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
+    name: &str,
+    cols: usize,
+    device: &MlxDevice,
+) -> Result<MlxQWeight> {
+    let info = gguf
+        .tensor_info(name)
+        .ok_or_else(|| anyhow!("native Qwen row projection '{name}' not found"))?;
+    validate_native_row_projection_info(name, info, cols)?;
+    let weight = MlxQWeight::from_mapped_gguf_row_vector(mapped, info, cols)
+        .with_context(|| format!("retain native Qwen row projection '{name}'"))?;
+    super::weight_pool::register_weight_buffer(device, &weight.buffer)
+        .map_err(|error| anyhow!("register_weight_buffer({name}): {error}"))?;
+    #[cfg(test)]
+    super::execution_observation::observe_loaded_ggml(name, &weight.buffer)?;
+    Ok(weight)
+}
+
 /// Load one full-attention block with the conversion-emitted quantized
 /// representation intact. The fused Q/gate matrix stays fused and native;
 /// inference projects it once and deinterleaves only the F32 activation.
 pub fn load_full_attn_layer_native(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
     cfg: &Qwen35Config,
     layer_idx: u32,
     device: &MlxDevice,
@@ -276,9 +402,10 @@ pub fn load_full_attn_layer_native(
 
     let fused_name = format!("{p}.attn_q.weight");
     let (fused, fused_type) =
-        load_native_projection(gguf, &fused_name, 2 * q_total, hidden, device)?;
+        load_native_projection(gguf, mapped, &fused_name, 2 * q_total, hidden, device)?;
     let (wk, wk_ggml_type) = load_native_projection(
         gguf,
+        mapped,
         &format!("{p}.attn_k.weight"),
         kv_total,
         hidden,
@@ -286,6 +413,7 @@ pub fn load_full_attn_layer_native(
     )?;
     let (wv, wv_ggml_type) = load_native_projection(
         gguf,
+        mapped,
         &format!("{p}.attn_v.weight"),
         kv_total,
         hidden,
@@ -293,6 +421,7 @@ pub fn load_full_attn_layer_native(
     )?;
     let (wo, wo_ggml_type) = load_native_projection(
         gguf,
+        mapped,
         &format!("{p}.attn_output.weight"),
         hidden,
         q_total,
@@ -300,12 +429,16 @@ pub fn load_full_attn_layer_native(
     )?;
 
     Ok(FullAttnWeightsGpu {
-        attn_norm: upload_f32_weight(
-            &load_f32_tensor(gguf, &format!("{p}.attn_norm.weight"), device)?,
+        attn_norm: map_f32_state_with_residency(
+            gguf,
+            mapped,
+            &format!("{p}.attn_norm.weight"),
             device,
         )?,
-        post_attn_norm: upload_f32_weight(
-            &load_f32_tensor(gguf, &format!("{p}.post_attention_norm.weight"), device)?,
+        post_attn_norm: map_f32_state_with_residency(
+            gguf,
+            mapped,
+            &format!("{p}.post_attention_norm.weight"),
             device,
         )?,
         q_gate: FullAttnQGateWeightsGpu::Fused {
@@ -316,12 +449,16 @@ pub fn load_full_attn_layer_native(
         wk_ggml_type,
         wv,
         wv_ggml_type,
-        attn_q_norm: upload_f32_weight(
-            &load_f32_tensor(gguf, &format!("{p}.attn_q_norm.weight"), device)?,
+        attn_q_norm: map_f32_state_with_residency(
+            gguf,
+            mapped,
+            &format!("{p}.attn_q_norm.weight"),
             device,
         )?,
-        attn_k_norm: upload_f32_weight(
-            &load_f32_tensor(gguf, &format!("{p}.attn_k_norm.weight"), device)?,
+        attn_k_norm: map_f32_state_with_residency(
+            gguf,
+            mapped,
+            &format!("{p}.attn_k_norm.weight"),
             device,
         )?,
         wo,
@@ -331,9 +468,10 @@ pub fn load_full_attn_layer_native(
 
 /// Load one DeltaNet block with all five large projections in their native
 /// GGML representation. Small F32 state/norm tensors keep their declared F32
-/// storage; the conv kernel receives the same layout transpose as before.
+/// storage; the rank-two convolution matrix remains the exact mapped GGUF view.
 pub fn load_delta_net_layer_native(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
     cfg: &Qwen35Config,
     layer_idx: u32,
     device: &MlxDevice,
@@ -350,6 +488,7 @@ pub fn load_delta_net_layer_native(
 
     let (attn_qkv, attn_qkv_ggml_type) = load_native_projection(
         gguf,
+        mapped,
         &format!("{p}.attn_qkv.weight"),
         qkv_channels,
         hidden,
@@ -357,64 +496,95 @@ pub fn load_delta_net_layer_native(
     )?;
     let (attn_gate, attn_gate_ggml_type) = load_native_projection(
         gguf,
+        mapped,
         &format!("{p}.attn_gate.weight"),
         z_channels,
         hidden,
         device,
     )?;
-    let (ssm_alpha, ssm_alpha_ggml_type) =
-        load_native_projection(gguf, &format!("{p}.ssm_alpha.weight"), nv, hidden, device)?;
-    let (ssm_beta, ssm_beta_ggml_type) =
-        load_native_projection(gguf, &format!("{p}.ssm_beta.weight"), nv, hidden, device)?;
+    let (ssm_alpha, ssm_alpha_ggml_type) = load_native_projection(
+        gguf,
+        mapped,
+        &format!("{p}.ssm_alpha.weight"),
+        nv,
+        hidden,
+        device,
+    )?;
+    let (ssm_beta, ssm_beta_ggml_type) = load_native_projection(
+        gguf,
+        mapped,
+        &format!("{p}.ssm_beta.weight"),
+        nv,
+        hidden,
+        device,
+    )?;
     let (ssm_out, ssm_out_ggml_type) = load_native_projection(
         gguf,
+        mapped,
         &format!("{p}.ssm_out.weight"),
         hidden,
         z_channels,
         device,
     )?;
 
-    let conv_gguf = load_f32_tensor(gguf, &format!("{p}.ssm_conv1d.weight"), device)?;
+    let (ssm_conv1d, ssm_conv1d_type) = load_native_projection(
+        gguf,
+        mapped,
+        &format!("{p}.ssm_conv1d.weight"),
+        qkv_channels,
+        k_width,
+        device,
+    )?;
     anyhow::ensure!(
-        conv_gguf.len() == qkv_channels * k_width,
-        "layer {layer_idx}: ssm_conv1d length {} != {}",
-        conv_gguf.len(),
-        qkv_channels * k_width
+        ssm_conv1d_type == GgmlType::F32,
+        "layer {layer_idx}: ssm_conv1d must retain F32 storage, got {ssm_conv1d_type:?}"
     );
-    let mut conv_transposed = vec![0.0f32; conv_gguf.len()];
-    for channel in 0..qkv_channels {
-        for ki in 0..k_width {
-            conv_transposed[channel * k_width + ki] = conv_gguf[channel * k_width + ki];
-        }
-    }
-    let ssm_dt_bias = load_f32_tensor(gguf, &format!("{p}.ssm_dt.bias"), device)?;
-    let ssm_a = load_f32_tensor(gguf, &format!("{p}.ssm_a"), device)?;
-    let ssm_norm = load_f32_tensor(gguf, &format!("{p}.ssm_norm.weight"), device)?;
+    let ssm_dt_bias =
+        map_f32_state_with_residency(gguf, mapped, &format!("{p}.ssm_dt.bias"), device)?;
+    let ssm_a = map_f32_state_with_residency(gguf, mapped, &format!("{p}.ssm_a"), device)?;
+    let ssm_norm =
+        map_f32_state_with_residency(gguf, mapped, &format!("{p}.ssm_norm.weight"), device)?;
+    let ssm_dt_bias_cpu = ssm_dt_bias
+        .as_slice::<f32>()
+        .map_err(|error| anyhow!("read mapped {p}.ssm_dt.bias: {error}"))?
+        .to_vec();
+    let ssm_a_cpu = ssm_a
+        .as_slice::<f32>()
+        .map_err(|error| anyhow!("read mapped {p}.ssm_a: {error}"))?
+        .to_vec();
+    let ssm_norm_cpu = ssm_norm
+        .as_slice::<f32>()
+        .map_err(|error| anyhow!("read mapped {p}.ssm_norm.weight: {error}"))?
+        .to_vec();
 
     Ok(DeltaNetWeightsGpu {
-        attn_norm: upload_f32_weight(
-            &load_f32_tensor(gguf, &format!("{p}.attn_norm.weight"), device)?,
+        attn_norm: map_f32_state_with_residency(
+            gguf,
+            mapped,
+            &format!("{p}.attn_norm.weight"),
             device,
         )?,
-        post_attn_norm: upload_f32_weight(
-            &load_f32_tensor(gguf, &format!("{p}.post_attention_norm.weight"), device)?,
+        post_attn_norm: map_f32_state_with_residency(
+            gguf,
+            mapped,
+            &format!("{p}.post_attention_norm.weight"),
             device,
         )?,
         attn_qkv,
         attn_qkv_ggml_type,
         attn_gate,
         attn_gate_ggml_type,
-        ssm_conv1d: upload_f32_weight(&conv_transposed, device)?,
+        ssm_conv1d,
         ssm_alpha,
         ssm_alpha_ggml_type,
-        ssm_dt_bias: upload_f32_weight(&ssm_dt_bias, device)?,
-        ssm_dt_bias_cpu: ssm_dt_bias,
+        ssm_dt_bias,
+        ssm_dt_bias_cpu,
         ssm_beta,
         ssm_beta_ggml_type,
-        ssm_a: upload_f32_weight(&ssm_a, device)?,
-        ssm_a_cpu: ssm_a,
-        ssm_norm: upload_f32_weight(&ssm_norm, device)?,
-        ssm_norm_cpu: ssm_norm,
+        ssm_a,
+        ssm_a_cpu,
+        ssm_norm,
+        ssm_norm_cpu,
         ssm_out,
         ssm_out_ggml_type,
     })
@@ -930,17 +1100,52 @@ fn load_lazy_moe_ffn_quantized(
     device: &MlxDevice,
 ) -> Result<MoeFfnWeightsQ> {
     let p = format!("blk.{}", layer_idx);
+    let as_test_f32_matrix = |name: &str, rows: usize, cols: usize| -> Result<MlxQWeight> {
+        let values = load_lazy_f32(lookup, name)?;
+        anyhow::ensure!(
+            values.len() == rows * cols,
+            "lazy matrix {name} has {} values, expected {} for [{rows},{cols}]",
+            values.len(),
+            rows * cols
+        );
+        let mut buffer = device
+            .alloc_buffer(values.len() * 4, MlxDType::F32, vec![rows, cols])
+            .map_err(|error| anyhow!("allocate lazy matrix {name}: {error}"))?;
+        buffer
+            .as_mut_slice::<f32>()
+            .map_err(|error| anyhow!("map lazy matrix {name}: {error}"))?
+            .copy_from_slice(&values);
+        Ok(MlxQWeight {
+            buffer,
+            info: crate::serve::gpu::QuantWeightInfo {
+                ggml_dtype: GgmlType::F32,
+                rows,
+                cols,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        })
+    };
+    let cfg = infer_lazy_qwen35_config(lookup)?;
+    let moe = cfg
+        .moe
+        .as_ref()
+        .context("lazy MoE matrix load requires MoE config")?;
+    let h = cfg.hidden_size as usize;
+    let ne = moe.num_experts as usize;
+    let shared = moe.shared_expert_intermediate_size as usize;
     Ok(MoeFfnWeightsQ {
-        router: load_lazy_f32(lookup, &format!("{p}.ffn_gate_inp.weight"))?,
+        router: as_test_f32_matrix(&format!("{p}.ffn_gate_inp.weight"), ne, h)?,
         expert_gate_q: load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_gate_exps.weight"), device)?,
         expert_up_q: load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_up_exps.weight"), device)?,
         expert_down_q: load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_down_exps.weight"), device)?,
-        ggml_type_gate_up: GgmlType::Q8_0,
+        ggml_type_gate: GgmlType::Q8_0,
+        ggml_type_up: GgmlType::Q8_0,
         ggml_type_down: GgmlType::Q8_0,
-        shared_gate_logit: load_lazy_f32(lookup, &format!("{p}.ffn_gate_inp_shexp.weight"))?,
-        shared_gate: load_lazy_f32(lookup, &format!("{p}.ffn_gate_shexp.weight"))?,
-        shared_up: load_lazy_f32(lookup, &format!("{p}.ffn_up_shexp.weight"))?,
-        shared_down: load_lazy_f32(lookup, &format!("{p}.ffn_down_shexp.weight"))?,
+        shared_gate_logit: as_test_f32_matrix(&format!("{p}.ffn_gate_inp_shexp.weight"), 1, h)?,
+        shared_gate: as_test_f32_matrix(&format!("{p}.ffn_gate_shexp.weight"), shared, h)?,
+        shared_up: as_test_f32_matrix(&format!("{p}.ffn_up_shexp.weight"), shared, h)?,
+        shared_down: as_test_f32_matrix(&format!("{p}.ffn_down_shexp.weight"), h, shared)?,
         expert_gate_affine: None,
         expert_up_affine: None,
         expert_down_affine: None,
@@ -958,8 +1163,8 @@ impl Qwen35Model {
     pub fn load_from_lazy_tensor_map(model: &LazyTensorMap) -> Result<Self> {
         let lookup = LazyQwen35Lookup::new(model);
         let mut cfg = infer_lazy_qwen35_config(&lookup)?;
-        let device =
-            MlxDevice::new().map_err(|e| anyhow!("MlxDevice::new for lazy qwen35 loading: {e}"))?;
+        let device = super::forward_gpu::new_model_load_device()
+            .map_err(|e| anyhow!("MlxDevice::new for lazy qwen35 loading: {e}"))?;
 
         let mut token_embd = load_lazy_f32(&lookup, "token_embd.weight")?;
         let output_weight = load_lazy_f32(&lookup, "output.weight")?;
@@ -1008,6 +1213,9 @@ impl Qwen35Model {
         }
 
         Ok(Self {
+            activation_epoch: Self::next_activation_epoch(),
+            native_routes_activated: std::sync::atomic::AtomicBool::new(false),
+            ggml_routing_policy: mlx_native::ggml_routing_policy_from_environment(),
             cfg,
             layers,
             token_embd,
@@ -1016,6 +1224,7 @@ impl Qwen35Model {
             output_weight_native: None,
             tied_word_embeddings: false,
             output_norm,
+            output_norm_native: None,
             mtp: None,
             #[cfg(test)]
             loaded_candidate_identity: None,
@@ -1289,83 +1498,111 @@ pub fn load_moe_ffn(gguf: &GgufFile, layer_idx: u32, device: &MlxDevice) -> Resu
 /// Load an MoE FFN layer's weights, keeping expert tensors in their native
 /// GGML quantization (e.g. Q6_K).
 ///
-/// Expert weight buffers (`ffn_{gate,up,down}_exps`) are loaded via
-/// `GgufFile::load_tensor` (raw GGML blocks, DType::U8 on Metal) rather than
-/// `load_tensor_f32`.  This avoids the ~3.2 GB per-layer F32 expansion that
-/// causes the OOM on the 35B apex model.
-///
-/// Small tensors (router, shared-expert) are still dequantized to f32 because
-/// they are projected with the existing F32 dense kernel.
+/// Expert stacks (`ffn_{gate,up,down}_exps`) retain exact file-backed GGML
+/// views. Router and shared-expert matrices use the same mapped native matrix
+/// representation and dispatch directly from their declared storage type.
+/// No production MoE matrix is dequantized or re-encoded during load.
 pub fn load_moe_ffn_quantized(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
+    cfg: &Qwen35Config,
     layer_idx: u32,
     device: &MlxDevice,
 ) -> Result<MoeFfnWeightsQ> {
     let p = format!("blk.{}", layer_idx);
-
-    // Router and shared-expert weights are small — dequantize to f32.
-    let router = load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp.weight"), device)?;
-    let shared_gate_logit =
-        load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp_shexp.weight"), device)?;
-    let shared_gate = load_f32_tensor(gguf, &format!("{p}.ffn_gate_shexp.weight"), device)?;
-    let shared_up = load_f32_tensor(gguf, &format!("{p}.ffn_up_shexp.weight"), device)?;
-    let shared_down = load_f32_tensor(gguf, &format!("{p}.ffn_down_shexp.weight"), device)?;
+    let moe = cfg
+        .moe
+        .as_ref()
+        .context("native MoE load requires MoE configuration")?;
+    let h = cfg.hidden_size as usize;
+    let ne = moe.num_experts as usize;
+    let expert = moe.moe_intermediate_size as usize;
+    let shared = moe.shared_expert_intermediate_size as usize;
+    let load_matrix = |name: &str, rows: usize, cols: usize| -> Result<MlxQWeight> {
+        let info = gguf
+            .tensor_info(name)
+            .ok_or_else(|| anyhow!("layer {layer_idx}: {name} not found in GGUF"))?;
+        anyhow::ensure!(
+            info.shape.as_slice() == [rows, cols],
+            "layer {layer_idx}: {name} shape {:?} != [{rows},{cols}]",
+            info.shape
+        );
+        let weight = MlxQWeight::from_mapped_gguf_tensor(mapped, info)
+            .with_context(|| format!("layer {layer_idx}: retain {name}"))?;
+        super::weight_pool::register_weight_buffer(device, &weight.buffer)
+            .with_context(|| format!("register {name}"))?;
+        #[cfg(test)]
+        super::execution_observation::observe_loaded_ggml(name, &weight.buffer)?;
+        Ok(weight)
+    };
+    let router = load_matrix(&format!("{p}.ffn_gate_inp.weight"), ne, h)?;
+    let shared_gate_logit = load_native_row_projection(
+        gguf,
+        mapped,
+        &format!("{p}.ffn_gate_inp_shexp.weight"),
+        h,
+        device,
+    )?;
+    let shared_gate = load_matrix(&format!("{p}.ffn_gate_shexp.weight"), shared, h)?;
+    let shared_up = load_matrix(&format!("{p}.ffn_up_shexp.weight"), shared, h)?;
+    let shared_down = load_matrix(&format!("{p}.ffn_down_shexp.weight"), h, shared)?;
 
     // Expert weights: load raw GGML blocks, preserving quantization.
-    // W-5b.7 iter 2: residency-aware via `load_tensor_with_residency`.
-    let expert_gate_q =
-        load_tensor_with_residency(gguf, &format!("{p}.ffn_gate_exps.weight"), device)
-            .with_context(|| format!("layer {layer_idx} ffn_gate_exps (quantized)"))?;
-    let expert_up_q = load_tensor_with_residency(gguf, &format!("{p}.ffn_up_exps.weight"), device)
-        .with_context(|| format!("layer {layer_idx} ffn_up_exps (quantized)"))?;
-    let expert_down_q =
-        load_tensor_with_residency(gguf, &format!("{p}.ffn_down_exps.weight"), device)
-            .with_context(|| format!("layer {layer_idx} ffn_down_exps (quantized)"))?;
-
-    // Gate and up may have a different quant type than down (e.g. Q5_K vs Q6_K
-    // in the apex GGUF).  Read each separately.
+    // Residency registration retains the same mapped Metal allocation.
+    let gate_name = format!("{p}.ffn_gate_exps.weight");
+    let up_name = format!("{p}.ffn_up_exps.weight");
+    let down_name = format!("{p}.ffn_down_exps.weight");
     let gate_info = gguf
-        .tensor_info(&format!("{p}.ffn_gate_exps.weight"))
+        .tensor_info(&gate_name)
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_gate_exps not found in GGUF"))?;
-    let ggml_type_gate_up = gate_info.ggml_type;
-
-    // ADR-034 post-codex audit (2026-05-21): the kernel dispatch path uses
-    // `ggml_type_gate_up` (derived from `ffn_gate_exps`) to interpret the
-    // bytes of BOTH gate and up expert buffers. A malformed GGUF where
-    // `ffn_up_exps` has a different ggml_type would be silently dequantized
-    // with the wrong block geometry. Refuse to load such inputs.
     let up_info = gguf
-        .tensor_info(&format!("{p}.ffn_up_exps.weight"))
+        .tensor_info(&up_name)
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_up_exps not found in GGUF"))?;
-    anyhow::ensure!(
-        up_info.ggml_type == ggml_type_gate_up,
-        "layer {layer_idx}: ffn_up_exps quant type {:?} differs from ffn_gate_exps {:?}; \
-         malformed GGUF — both must share the same ggml_type for routed-matmul dispatch",
-        up_info.ggml_type,
-        ggml_type_gate_up,
-    );
-
     let down_info = gguf
-        .tensor_info(&format!("{p}.ffn_down_exps.weight"))
+        .tensor_info(&down_name)
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_down_exps not found in GGUF"))?;
+    anyhow::ensure!(
+        gate_info.shape.as_slice() == [ne, expert, h]
+            && up_info.shape.as_slice() == [ne, expert, h]
+            && down_info.shape.as_slice() == [ne, h, expert],
+        "layer {layer_idx}: malformed expert stack shapes gate={:?} up={:?} down={:?}",
+        gate_info.shape,
+        up_info.shape,
+        down_info.shape
+    );
+    let expert_gate_q = map_tensor_with_residency(mapped, gate_info, device)
+        .with_context(|| format!("layer {layer_idx} ffn_gate_exps (native mapped)"))?;
+    let expert_up_q = map_tensor_with_residency(mapped, up_info, device)
+        .with_context(|| format!("layer {layer_idx} ffn_up_exps (native mapped)"))?;
+    let expert_down_q = map_tensor_with_residency(mapped, down_info, device)
+        .with_context(|| format!("layer {layer_idx} ffn_down_exps (native mapped)"))?;
+
+    // Every expert projection retains and dispatches from its own declared
+    // artifact codec. Gate/up fusion is an execution optimization and is
+    // considered later only when both codecs are equal and natively fused.
+    let ggml_type_gate = gate_info.ggml_type;
+    let ggml_type_up = up_info.ggml_type;
     let ggml_type_down = down_info.ggml_type;
 
     let supported = qwen35_moe_expert_type_supported;
 
-    // Validate that the types are supported by quantized_matmul_id_ggml.
-    // The locked mlx-native 0.11.2 route covers Q2_K/Q3_K in decode,
-    // prefill, tensor, and routed expert kernels.
-    if !supported(ggml_type_gate_up) {
+    // Validate that every stored type has an artifact-native expert-ID route.
+    // Scalar and block codecs remain in their mapped GGUF representation.
+    if !supported(ggml_type_gate) {
         return Err(anyhow!(
-            "layer {layer_idx}: gate/up expert weights have unsupported quant type {:?} \
-             (expected Q2_K, Q3_K, Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, or IQ4_XS)",
-            ggml_type_gate_up
+            "layer {layer_idx}: gate expert weights have unsupported quant type {:?}",
+            ggml_type_gate
+        ));
+    }
+    if !supported(ggml_type_up) {
+        return Err(anyhow!(
+            "layer {layer_idx}: up expert weights have unsupported quant type {:?}",
+            ggml_type_up
         ));
     }
     if !supported(ggml_type_down) {
         return Err(anyhow!(
-            "layer {layer_idx}: down expert weights have unsupported quant type {:?} \
-             (expected Q2_K, Q3_K, Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, or IQ4_XS)",
+            "layer {layer_idx}: down expert weights have unsupported quant type {:?}",
             ggml_type_down
         ));
     }
@@ -1375,7 +1612,8 @@ pub fn load_moe_ffn_quantized(
         expert_gate_q,
         expert_up_q,
         expert_down_q,
-        ggml_type_gate_up,
+        ggml_type_gate,
+        ggml_type_up,
         ggml_type_down,
         shared_gate_logit,
         shared_gate,
@@ -1390,9 +1628,13 @@ pub fn load_moe_ffn_quantized(
 pub(crate) fn qwen35_moe_expert_type_supported(t: GgmlType) -> bool {
     matches!(
         t,
-        GgmlType::Q2_K
+        GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::BF16
+            | GgmlType::Q2_K
             | GgmlType::Q3_K
             | GgmlType::Q4_0
+            | GgmlType::Q5_0
             | GgmlType::Q5_1
             | GgmlType::Q8_0
             | GgmlType::Q4_K
@@ -1422,12 +1664,14 @@ pub fn load_dense_ffn(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DenseFfnStorage {
-    Float,
+    NativeScalar,
     Quantized,
+    MixedNative,
 }
 
 pub(crate) fn qwen35_dense_ffn_type_supported(t: GgmlType) -> bool {
-    matches!(t, GgmlType::F16 | GgmlType::F32) || qwen35_dense_ffn_quant_type_supported(t)
+    matches!(t, GgmlType::F16 | GgmlType::BF16 | GgmlType::F32)
+        || qwen35_dense_ffn_quant_type_supported(t)
 }
 
 fn qwen35_dense_ffn_quant_type_supported(t: GgmlType) -> bool {
@@ -1436,10 +1680,14 @@ fn qwen35_dense_ffn_quant_type_supported(t: GgmlType) -> bool {
         GgmlType::Q2_K
             | GgmlType::Q3_K
             | GgmlType::Q4_0
+            | GgmlType::Q5_0
+            | GgmlType::Q5_1
             | GgmlType::Q8_0
             | GgmlType::Q4_K
             | GgmlType::Q5_K
             | GgmlType::Q6_K
+            | GgmlType::IQ4_NL
+            | GgmlType::IQ4_XS
     )
 }
 
@@ -1449,24 +1697,25 @@ pub(super) fn dense_ffn_storage(
     up: GgmlType,
     down: GgmlType,
 ) -> Result<DenseFfnStorage> {
-    let is_float = |t: GgmlType| matches!(t, GgmlType::F16 | GgmlType::F32);
+    let is_scalar = |t: GgmlType| matches!(t, GgmlType::F16 | GgmlType::BF16 | GgmlType::F32);
     let is_supported_quant = qwen35_dense_ffn_quant_type_supported;
 
-    if is_float(gate) && is_float(up) && is_float(down) {
-        return Ok(DenseFfnStorage::Float);
+    if is_scalar(gate) && is_scalar(up) && is_scalar(down) {
+        return Ok(DenseFfnStorage::NativeScalar);
     }
     if is_supported_quant(gate) && is_supported_quant(up) && is_supported_quant(down) {
-        anyhow::ensure!(
-            gate == up,
-            "layer {layer_idx}: dense gate/up quant types differ ({gate:?} vs {up:?}); \
-             both buffers share one dispatch type"
-        );
         return Ok(DenseFfnStorage::Quantized);
+    }
+    if [gate, up, down]
+        .into_iter()
+        .all(|storage| is_scalar(storage) || is_supported_quant(storage))
+    {
+        return Ok(DenseFfnStorage::MixedNative);
     }
 
     Err(anyhow!(
-        "layer {layer_idx}: unsupported or mixed dense FFN storage: \
-         gate={gate:?}, up={up:?}, down={down:?}; refusing a silent F32 expansion"
+        "layer {layer_idx}: unsupported dense FFN storage: \
+         gate={gate:?}, up={up:?}, down={down:?}; refusing a silent transform"
     ))
 }
 
@@ -1480,6 +1729,56 @@ pub(crate) fn validate_qwen35_dense_ffn_storage(
     down: GgmlType,
 ) -> Result<()> {
     dense_ffn_storage(layer_idx, gate, up, down).map(|_| ())
+}
+
+/// Load native scalar dense-FFN projections without changing their storage
+/// dtype or allocating a dequantized/re-encoded shadow.
+pub fn load_dense_ffn_native(
+    gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
+    layer_idx: u32,
+    cfg: &Qwen35Config,
+    device: &MlxDevice,
+) -> Result<DenseFfnWeightsNative> {
+    let p = format!("blk.{layer_idx}");
+    let hidden_size = cfg.hidden_size;
+    let intermediate_size = cfg
+        .intermediate_size
+        .ok_or_else(|| anyhow!("layer {layer_idx}: dense FFN but intermediate size is absent"))?;
+    let (gate, gate_type) = load_native_projection(
+        gguf,
+        mapped,
+        &format!("{p}.ffn_gate.weight"),
+        intermediate_size as usize,
+        hidden_size as usize,
+        device,
+    )?;
+    let (up, up_type) = load_native_projection(
+        gguf,
+        mapped,
+        &format!("{p}.ffn_up.weight"),
+        intermediate_size as usize,
+        hidden_size as usize,
+        device,
+    )?;
+    let (down, down_type) = load_native_projection(
+        gguf,
+        mapped,
+        &format!("{p}.ffn_down.weight"),
+        hidden_size as usize,
+        intermediate_size as usize,
+        device,
+    )?;
+    Ok(DenseFfnWeightsNative {
+        gate,
+        up,
+        down,
+        gate_type,
+        up_type,
+        down_type,
+        intermediate_size,
+        hidden_size,
+    })
 }
 
 pub(super) fn dense_ffn_tensor_types(
@@ -1499,44 +1798,54 @@ pub(super) fn dense_ffn_tensor_types(
     ))
 }
 
-/// Load a dense FFN layer's weights, keeping projections in their native GGML
-/// quantization (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K) — the production path for dense
-/// quantized GGUFs.
+/// Load a dense FFN layer's weights, keeping every projection in its native
+/// GGML scalar or block representation. Sibling gate/up/down matrices may
+/// deliberately use different codecs.
 ///
-/// Gate/up/down projection buffers are loaded via `GgufFile::load_tensor` (raw
-/// GGML blocks, DType::U8 on Metal) rather than `load_tensor_f32`.  This
-/// eliminates the Q4_0→F32 round-trip that expands a 27B model from ~14 GB
-/// on-disk to ~129 GB in RAM, causing an OOM hang on M5 Max 128 GB.
+/// Gate/up/down projection buffers are retained as exact mapped views rather
+/// than expanded through `load_tensor_f32`. This avoids a load-time
+/// dequantize/re-encode cycle and its full-precision memory expansion.
 ///
 /// Returns `Err` if any weight tensor has an unsupported quantization type.
 /// Float storage is selected explicitly by [`load_layer`]; an error here must
 /// never trigger a silent full-model F32 expansion.
 pub fn load_dense_ffn_quantized(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
     layer_idx: u32,
     cfg: &Qwen35Config,
     device: &MlxDevice,
 ) -> Result<DenseFfnWeightsQ> {
     let p = format!("blk.{}", layer_idx);
 
-    // Classify metadata before loading any buffers. Gate and up share one
-    // dispatch type, while down may intentionally use a different quant type.
-    let (ggml_type_gate_up, ggml_type_up, ggml_type_down) =
-        dense_ffn_tensor_types(gguf, layer_idx)?;
+    // Classify metadata before loading any buffers. Every projection retains
+    // an independent artifact codec; fusion is an execution-only decision.
+    let (ggml_type_gate, ggml_type_up, ggml_type_down) = dense_ffn_tensor_types(gguf, layer_idx)?;
     anyhow::ensure!(
-        dense_ffn_storage(layer_idx, ggml_type_gate_up, ggml_type_up, ggml_type_down)?
-            == DenseFfnStorage::Quantized,
-        "layer {layer_idx}: dense FFN is not quantized"
+        matches!(
+            dense_ffn_storage(layer_idx, ggml_type_gate, ggml_type_up, ggml_type_down)?,
+            DenseFfnStorage::Quantized | DenseFfnStorage::MixedNative
+        ),
+        "layer {layer_idx}: dense FFN does not require the encoded native path"
     );
 
     // Load raw GGML blocks — DType::U8 on Metal, no F32 expansion.
-    // W-5b.7 iter 2: residency-aware via `load_tensor_with_residency`.
-    let gate_q = load_tensor_with_residency(gguf, &format!("{p}.ffn_gate.weight"), device)
-        .with_context(|| format!("layer {layer_idx} ffn_gate.weight (quantized)"))?;
-    let up_q = load_tensor_with_residency(gguf, &format!("{p}.ffn_up.weight"), device)
-        .with_context(|| format!("layer {layer_idx} ffn_up.weight (quantized)"))?;
-    let down_q = load_tensor_with_residency(gguf, &format!("{p}.ffn_down.weight"), device)
-        .with_context(|| format!("layer {layer_idx} ffn_down.weight (quantized)"))?;
+    // Residency registration retains the same mapped Metal allocation.
+    let map_matrix = |name: &str| -> Result<MlxBuffer> {
+        let info = gguf
+            .tensor_info(name)
+            .ok_or_else(|| anyhow!("layer {layer_idx}: {name} not found in GGUF"))?;
+        let weight = MlxQWeight::from_mapped_gguf_tensor(mapped, info)
+            .with_context(|| format!("layer {layer_idx} {name} (native mapped)"))?;
+        super::weight_pool::register_weight_buffer(device, &weight.buffer)
+            .with_context(|| format!("register {name}"))?;
+        #[cfg(test)]
+        super::execution_observation::observe_loaded_ggml(name, &weight.buffer)?;
+        Ok(weight.buffer)
+    };
+    let gate_q = map_matrix(&format!("{p}.ffn_gate.weight"))?;
+    let up_q = map_matrix(&format!("{p}.ffn_up.weight"))?;
+    let down_q = map_matrix(&format!("{p}.ffn_down.weight"))?;
 
     // Use config values as authoritative (already validated against GGUF metadata
     // by Qwen35Config::from_gguf).
@@ -1549,7 +1858,8 @@ pub fn load_dense_ffn_quantized(
         gate_q,
         up_q,
         down_q,
-        ggml_type_gate_up,
+        ggml_type_gate,
+        ggml_type_up,
         ggml_type_down,
         intermediate_size,
         hidden_size,
@@ -1564,13 +1874,16 @@ pub fn load_layer(
     layer_idx: u32,
     device: &MlxDevice,
 ) -> Result<Qwen35LayerWeights> {
+    let mapped = gguf
+        .map_tensor_data(device)
+        .context("map GGUF tensor data for standalone layer load")?;
     let kind = cfg
         .layer_types
         .get(layer_idx as usize)
         .copied()
         .ok_or_else(|| anyhow!("layer_idx {layer_idx} out of range"))?;
 
-    let ffn = load_ffn(gguf, cfg, layer_idx, device)?;
+    let ffn = load_ffn(gguf, &mapped, cfg, layer_idx, device)?;
 
     match kind {
         Qwen35LayerKind::FullAttention => {
@@ -1588,6 +1901,7 @@ pub fn load_layer(
 /// with a native attention variant so quantized attention is never expanded.
 pub fn load_ffn(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
     cfg: &Qwen35Config,
     layer_idx: u32,
     device: &MlxDevice,
@@ -1602,12 +1916,14 @@ pub fn load_ffn(
         Qwen35Variant::Dense => {
             let (gate, up, down) = dense_ffn_tensor_types(gguf, layer_idx)?;
             match dense_ffn_storage(layer_idx, gate, up, down)? {
-                DenseFfnStorage::Quantized => Qwen35FfnWeights::DenseQ(load_dense_ffn_quantized(
-                    gguf, layer_idx, cfg, device,
-                )?),
-                DenseFfnStorage::Float => {
-                    Qwen35FfnWeights::Dense(load_dense_ffn(gguf, layer_idx, device)?)
+                DenseFfnStorage::Quantized | DenseFfnStorage::MixedNative => {
+                    Qwen35FfnWeights::DenseQ(load_dense_ffn_quantized(
+                        gguf, mapped, layer_idx, cfg, device,
+                    )?)
                 }
+                DenseFfnStorage::NativeScalar => Qwen35FfnWeights::DenseNative(
+                    load_dense_ffn_native(gguf, mapped, layer_idx, cfg, device)?,
+                ),
             }
         }
         Qwen35Variant::Moe => {
@@ -1617,7 +1933,9 @@ pub fn load_ffn(
             // 112 GB working set cap). The F32 `load_moe_ffn` / `Qwen35FfnWeights::Moe`
             // variant is preserved for synthetic-weight unit tests that deliberately use
             // F32 inputs (see gpu_ffn.rs::build_moe_ffn_layer_gpu).
-            Qwen35FfnWeights::MoeQ(load_moe_ffn_quantized(gguf, layer_idx, device)?)
+            Qwen35FfnWeights::MoeQ(load_moe_ffn_quantized(
+                gguf, mapped, cfg, layer_idx, device,
+            )?)
         }
     })
 }
@@ -1625,9 +1943,122 @@ pub fn load_ffn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::gguf::writer::GgufWriter;
     use crate::inference::models::qwen35::model::Qwen35Model;
     use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
     use crate::ir::DType;
+    use crate::quantize::ggml_quants::GgmlType as WriterGgmlType;
+
+    #[test]
+    fn production_qwen_projection_retains_file_backed_artifact_storage() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Some(device) = MlxDevice::new().ok() else {
+            eprintln!("[skip] Metal device unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("qwen-native-projection.gguf");
+        let rows = 4usize;
+        let cols = 256usize;
+        let payload: Vec<f32> = (0..rows * cols).map(|value| value as f32).collect();
+        {
+            let file = std::fs::File::create(&path).expect("create GGUF");
+            let mut writer = GgufWriter::new(file);
+            writer.write_header(1, 0).expect("header");
+            let tensor = writer
+                .reserve_tensor_info(
+                    "blk.0.attn_q.weight",
+                    &[cols as u64, rows as u64],
+                    WriterGgmlType::F32,
+                )
+                .expect("tensor info");
+            writer.pad_to_alignment().expect("alignment");
+            writer
+                .stream_tensor_payload(tensor, bytemuck::cast_slice(&payload))
+                .expect("tensor payload");
+            writer.finalize().expect("finalize");
+        }
+
+        let gguf = GgufFile::open(&path).expect("open GGUF");
+        let mapped = gguf.map_tensor_data(&device).expect("map GGUF");
+        let (projection, storage) =
+            load_native_projection(&gguf, &mapped, "blk.0.attn_q.weight", rows, cols, &device)
+                .expect("load projection");
+        assert_eq!(storage, GgmlType::F32);
+        assert!(
+            projection.is_file_backed(),
+            "production Qwen matrices must be views of the scoped GGUF mapping"
+        );
+        assert_eq!(projection.data_byte_len(), payload.len() * 4);
+    }
+
+    #[test]
+    fn production_shared_gate_retains_exact_rank_one_row_view_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Some(device) = MlxDevice::new().ok() else {
+            eprintln!("[skip] Metal device unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("qwen-native-row-vector.gguf");
+        let cols = 256usize;
+        let payload = vec![0u8; cols * 4];
+        {
+            let file = std::fs::File::create(&path).expect("create GGUF");
+            let mut writer = GgufWriter::new(file);
+            writer.write_header(2, 0).expect("header");
+            let row = writer
+                .reserve_tensor_info(
+                    "blk.0.ffn_gate_inp_shexp.weight",
+                    &[cols as u64],
+                    WriterGgmlType::F32,
+                )
+                .expect("row tensor info");
+            let rank_two = writer
+                .reserve_tensor_info(
+                    "blk.0.rank_two.weight",
+                    &[cols as u64, 1],
+                    WriterGgmlType::F32,
+                )
+                .expect("rank-two tensor info");
+            writer.pad_to_alignment().expect("alignment");
+            writer
+                .stream_tensor_payload(row, &payload)
+                .expect("row payload");
+            writer
+                .stream_tensor_payload(rank_two, &payload)
+                .expect("rank-two payload");
+            writer.finalize().expect("finalize");
+        }
+
+        let gguf = GgufFile::open(&path).expect("open GGUF");
+        let mapped = gguf.map_tensor_data(&device).expect("map GGUF");
+        let row = load_native_row_projection(
+            &gguf,
+            &mapped,
+            "blk.0.ffn_gate_inp_shexp.weight",
+            cols,
+            &device,
+        )
+        .expect("load exact rank-one row projection");
+        assert_eq!((row.info.rows, row.info.cols), (1, cols));
+        assert!(row.buffer.is_file_backed());
+        assert_eq!(row.buffer.data_byte_len(), payload.len());
+
+        let ordinary_error = MlxQWeight::from_mapped_gguf_tensor(
+            &mapped,
+            gguf.tensor_info("blk.0.ffn_gate_inp_shexp.weight").unwrap(),
+        )
+        .err()
+        .expect("ordinary native matrices must remain rank two");
+        assert!(ordinary_error.to_string().contains("must be rank 2"));
+
+        let squeeze_error =
+            load_native_row_projection(&gguf, &mapped, "blk.0.rank_two.weight", cols, &device)
+                .err()
+                .expect("rank-two storage must not be implicitly squeezed");
+        assert!(format!("{squeeze_error:#}").contains("must be exact rank 1"));
+    }
 
     #[test]
     fn qwen38_dense_q4k_q6k_storage_stays_quantized() {
@@ -1656,25 +2087,60 @@ mod tests {
     }
 
     #[test]
-    fn dense_float_fixtures_use_explicit_float_storage() {
+    fn every_native_quantized_text_codec_retains_artifact_blocks() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for ggml_type in [
+            GgmlType::Q2_K,
+            GgmlType::Q3_K,
+            GgmlType::Q4_0,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q8_0,
+            GgmlType::IQ4_NL,
+            GgmlType::IQ4_XS,
+        ] {
+            assert_eq!(
+                dense_ffn_storage(0, ggml_type, ggml_type, ggml_type)
+                    .expect("linked quantized text artifact must retain native blocks"),
+                DenseFfnStorage::Quantized
+            );
+        }
+    }
+
+    #[test]
+    fn dense_scalar_fixtures_keep_native_storage() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for storage in [GgmlType::F32, GgmlType::F16, GgmlType::BF16] {
+            assert_eq!(
+                dense_ffn_storage(0, storage, storage, storage)
+                    .expect("native scalar fixtures remain supported"),
+                DenseFfnStorage::NativeScalar
+            );
+        }
         assert_eq!(
-            dense_ffn_storage(0, GgmlType::F32, GgmlType::F16, GgmlType::F32)
-                .expect("float fixtures remain supported"),
-            DenseFfnStorage::Float
+            dense_ffn_storage(1, GgmlType::F32, GgmlType::F16, GgmlType::BF16)
+                .expect("mixed native scalar storage is dispatched per projection"),
+            DenseFfnStorage::NativeScalar
         );
     }
 
     #[test]
-    fn dense_storage_rejects_silent_float_expansion_and_gate_up_mismatch() {
+    fn dense_storage_admits_cross_class_and_mixed_quant_codecs_without_substitution() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let mixed = dense_ffn_storage(7, GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::F16)
-            .expect_err("mixed quantized/float storage must fail loud");
-        assert!(format!("{mixed:#}").contains("refusing a silent F32 expansion"));
+        assert_eq!(
+            dense_ffn_storage(7, GgmlType::Q4_K, GgmlType::BF16, GgmlType::F16)
+                .expect("each cross-class sibling has an exact native dispatch"),
+            DenseFfnStorage::MixedNative
+        );
 
-        let mismatched = dense_ffn_storage(8, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K)
-            .expect_err("gate/up share one dispatch type and must match");
-        assert!(format!("{mismatched:#}").contains("gate/up quant types differ"));
+        assert_eq!(
+            dense_ffn_storage(8, GgmlType::Q2_K, GgmlType::Q5_K, GgmlType::IQ4_NL)
+                .expect("each projection has an independent exact native dispatch"),
+            DenseFfnStorage::Quantized
+        );
     }
 
     fn f32_bytes(values: impl Iterator<Item = f32>) -> Vec<u8> {
@@ -1887,7 +2353,8 @@ mod tests {
             Qwen35FfnWeights::MoeQ(moe) => moe,
             other => panic!("expected MoeQ, got {}", other.variant()),
         };
-        assert_eq!(moe.ggml_type_gate_up, GgmlType::Q8_0);
+        assert_eq!(moe.ggml_type_gate, GgmlType::Q8_0);
+        assert_eq!(moe.ggml_type_up, GgmlType::Q8_0);
         assert_eq!(moe.ggml_type_down, GgmlType::Q8_0);
         assert_eq!(moe.expert_gate_q.dtype(), mlx_native::DType::U8);
         let gate_bytes = moe.expert_gate_q.as_slice::<u8>().expect("gate bytes");
@@ -2015,9 +2482,14 @@ mod tests {
                 assert!(router_finite, "router has non-finite values");
             }
             Qwen35FfnWeights::MoeQ(m) => {
-                // Router stays F32 (small, projected with F32 dense kernel).
-                assert_eq!(m.router.len(), expected_router_len);
-                let router_finite = m.router.iter().all(|v| v.is_finite());
+                assert_eq!(m.router.info.rows * m.router.info.cols, expected_router_len);
+                let router_finite = m
+                    .router
+                    .buffer
+                    .as_slice::<f32>()
+                    .expect("synthetic router F32 storage")
+                    .iter()
+                    .all(|v| v.is_finite());
                 assert!(router_finite, "router has non-finite values");
                 // Expert tensors are GGML blocks on the device — assert
                 // dtype is U8 (block bytes) and byte count is non-zero.

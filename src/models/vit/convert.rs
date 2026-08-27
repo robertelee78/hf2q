@@ -60,7 +60,7 @@ pub fn plan_vision_tensors(
         .unwrap_or_default();
     let mut out = HashMap::new();
     for (name, lazy) in tensor_map.iter() {
-        if let Some(gguf_name) = hf_qwen3vl_deepstack_to_gguf(name, &deepstack_indexes) {
+        if let Some(gguf_name) = hf_qwen_vision_deepstack_to_gguf(name, &deepstack_indexes) {
             let dtype = if vit_emission_is_f32(&gguf_name) {
                 DType::F32
             } else {
@@ -223,7 +223,7 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
     // (`V_POST_NORM: "v.post_ln"`). The previous `mm.input_norm.*`
     // mapping was the YOUTUVL projector convention,
     // not Qwen3-VL — emitting it produced an mmproj that Wedge-4c.5's
-    // `compute_vision_embeddings_gpu_qwen3vl` could not load (no
+    // `compute_vision_embeddings_gpu_qwen` could not load (no
     // `v.post_ln.*` to feed the post-block LayerNorm).
     static QWEN36_GLOBAL_MAP: &[(&str, &str)] = &[
         // patch_embed: 5-D [out, in, T=2, H, W] needs caller-side split
@@ -324,11 +324,15 @@ pub(crate) fn vit_emission_is_f32(gguf_name: &str) -> bool {
     if gguf_name.contains("ln1.weight")
         || gguf_name.contains("ln2.weight")
         || gguf_name.contains("attn_norm.weight")
+        || gguf_name.contains("attn_q_norm.weight")
+        || gguf_name.contains("attn_k_norm.weight")
+        || gguf_name.contains("attn_post_norm.weight")
         || gguf_name.contains("ffn_norm.weight")
         || gguf_name.contains("post_ffw_norm.weight")
         || gguf_name.contains("ffn_post_norm.weight")
         || gguf_name.contains("pre_ln.weight")
         || gguf_name.contains("post_ln.weight")
+        || gguf_name.contains("input_norm.weight")
         || gguf_name.ends_with(".norm.weight")
     {
         return true;
@@ -435,7 +439,7 @@ fn ensure_f16_bytes(tensor: &TensorRef) -> Result<Vec<u8>, VitConvertError> {
 ///     `deepstack_visual_indexes` declared).
 ///   - The component is unrecognized (writer-bug: caller emitted a
 ///     deepstack tensor whose suffix is none of `norm`/`linear_fc1`/`linear_fc2`).
-fn hf_qwen3vl_deepstack_to_gguf(hf_name: &str, deepstack_indexes: &[u32]) -> Option<String> {
+fn hf_qwen_vision_deepstack_to_gguf(hf_name: &str, deepstack_indexes: &[u32]) -> Option<String> {
     // Strip optional `model.` prefix to match convert_hf_to_gguf.py:4908-4909.
     let canon = hf_name.strip_prefix("model.").unwrap_or(hf_name);
     let rest = canon.strip_prefix("visual.deepstack_merger_list.")?;
@@ -498,12 +502,12 @@ pub fn load_vision_tensors(
             )));
         };
 
-        let is_deepstack = hf_qwen3vl_deepstack_to_gguf(&name, &deepstack_indexes).is_some();
-        let is_qwen3vl_patch_5d = (name == "model.visual.patch_embed.proj.weight"
+        let is_deepstack = hf_qwen_vision_deepstack_to_gguf(&name, &deepstack_indexes).is_some();
+        let is_qwen_vision_patch_5d = (name == "model.visual.patch_embed.proj.weight"
             || name == "visual.patch_embed.proj.weight")
             && lazy.shape().len() == 5;
         let is_mapped = mapped_vit_name(&name).is_some();
-        if !is_deepstack && !is_qwen3vl_patch_5d && !is_mapped {
+        if !is_deepstack && !is_qwen_vision_patch_5d && !is_mapped {
             continue;
         }
 
@@ -518,7 +522,7 @@ pub fn load_vision_tensors(
         // map (which doesn't pattern-match this prefix) and BEFORE
         // the per-block ViT encoder match (which strips
         // `model.vision_tower.encoder.layer.` — different prefix).
-        if let Some(gguf_name) = hf_qwen3vl_deepstack_to_gguf(&name, &deepstack_indexes) {
+        if let Some(gguf_name) = hf_qwen_vision_deepstack_to_gguf(&name, &deepstack_indexes) {
             // ADR-021 iter-11b: route F32 (norms + biases) through the
             // F32 path; weights stay F16. Peer convention.
             let (data, dtype) = if vit_emission_is_f32(&gguf_name) {
@@ -551,8 +555,8 @@ pub fn load_vision_tensors(
         // `hf_vit_name_to_gguf::QWEN36_GLOBAL_MAP` keeps the
         // `model.visual.*` form for backward-compat with synthetic
         // fixtures that embed the prefix.
-        if is_qwen3vl_patch_5d {
-            let (slice0, slice1) = split_qwen3vl_patch_embed_temporal(&tensor)?;
+        if is_qwen_vision_patch_5d {
+            let (slice0, slice1) = split_qwen_vision_patch_embed_temporal(&tensor)?;
             out.insert(
                 "v.patch_embd.weight".to_string(),
                 VitTensor {
@@ -611,7 +615,7 @@ pub fn load_vision_tensors(
 ///   src[o, i, t, h, w] at byte offset
 ///     ((o * I + i) * T + t) * H * W * elem_size + (h * W + w) * elem_size
 /// where I = in_channels, T = 2 (temporal frames), H = W = patch_size.
-fn split_qwen3vl_patch_embed_temporal(
+fn split_qwen_vision_patch_embed_temporal(
     tensor: &TensorRef,
 ) -> Result<((Vec<usize>, Vec<u8>), (Vec<usize>, Vec<u8>)), VitConvertError> {
     if tensor.shape.len() != 5 {
@@ -940,7 +944,7 @@ mod tests {
     /// convention) which made the emitted mmproj unloadable by
     /// Wedge-4c.5's qwen3vl ViT forward.
     #[test]
-    fn wedge4f_qwen3vl_merger_norm_maps_to_v_post_ln() {
+    fn wedge4f_qwen_vision_merger_norm_maps_to_v_post_ln() {
         let w = hf_vit_name_to_gguf("model.visual.merger.norm.weight").unwrap();
         let b = hf_vit_name_to_gguf("model.visual.merger.norm.bias").unwrap();
         assert_eq!(w, "v.post_ln.weight");
@@ -950,7 +954,7 @@ mod tests {
     /// Qwen3-VL `merger.linear_fc1`/`linear_fc2` map to `mm.0`/`mm.2`
     /// per clip.cpp:1844-1850 (PROJECTOR_TYPE_QWEN3VL section).
     #[test]
-    fn wedge4f_qwen3vl_merger_fc_maps_to_mm_0_and_mm_2() {
+    fn wedge4f_qwen_vision_merger_fc_maps_to_mm_0_and_mm_2() {
         assert_eq!(
             hf_vit_name_to_gguf("model.visual.merger.linear_fc1.weight"),
             Some("mm.0.weight".to_string())
@@ -967,7 +971,7 @@ mod tests {
     /// over the fused tensor, so the converter's job is just to keep
     /// the on-disk name fused.
     #[test]
-    fn wedge4f_qwen3vl_per_block_fused_qkv_name_preserved() {
+    fn wedge4f_qwen_vision_per_block_fused_qkv_name_preserved() {
         assert_eq!(
             hf_vit_name_to_gguf("model.visual.blocks.5.attn.qkv.weight"),
             Some("v.blk.5.attn_qkv.weight".to_string())
@@ -994,16 +998,19 @@ mod tests {
     /// Spec: `convert_hf_to_gguf.py:4914`
     ///   `idx = self.hparams_vision.get("deepstack_visual_indexes", [])[int(prefix)]`
     #[test]
-    fn wedge4f_qwen3vl_deepstack_relative_to_absolute_index_remap() {
+    fn wedge4f_qwen_vision_deepstack_relative_to_absolute_index_remap() {
         let indexes = vec![5, 11, 17];
         // rel_idx=0 → abs 5
         assert_eq!(
-            hf_qwen3vl_deepstack_to_gguf("visual.deepstack_merger_list.0.norm.weight", &indexes,),
+            hf_qwen_vision_deepstack_to_gguf(
+                "visual.deepstack_merger_list.0.norm.weight",
+                &indexes,
+            ),
             Some("v.deepstack.5.norm.weight".to_string())
         );
         // rel_idx=1 → abs 11
         assert_eq!(
-            hf_qwen3vl_deepstack_to_gguf(
+            hf_qwen_vision_deepstack_to_gguf(
                 "visual.deepstack_merger_list.1.linear_fc1.weight",
                 &indexes,
             ),
@@ -1011,7 +1018,7 @@ mod tests {
         );
         // rel_idx=2 → abs 17
         assert_eq!(
-            hf_qwen3vl_deepstack_to_gguf(
+            hf_qwen_vision_deepstack_to_gguf(
                 "visual.deepstack_merger_list.2.linear_fc2.bias",
                 &indexes,
             ),
@@ -1023,10 +1030,10 @@ mod tests {
     /// fixtures may include the prefix; real Qwen3-VL strips it). Both
     /// must work.
     #[test]
-    fn wedge4f_qwen3vl_deepstack_with_model_prefix_supported() {
+    fn wedge4f_qwen_vision_deepstack_with_model_prefix_supported() {
         let indexes = vec![5];
         assert_eq!(
-            hf_qwen3vl_deepstack_to_gguf(
+            hf_qwen_vision_deepstack_to_gguf(
                 "model.visual.deepstack_merger_list.0.norm.weight",
                 &indexes,
             ),
@@ -1037,10 +1044,10 @@ mod tests {
     /// Out-of-range relative index returns None (writer-bug guard:
     /// caller fed more relative heads than declared).
     #[test]
-    fn wedge4f_qwen3vl_deepstack_out_of_range_relative_returns_none() {
+    fn wedge4f_qwen_vision_deepstack_out_of_range_relative_returns_none() {
         let indexes = vec![5, 11];
         // rel_idx=2 is out of range when only 2 indexes declared.
-        assert!(hf_qwen3vl_deepstack_to_gguf(
+        assert!(hf_qwen_vision_deepstack_to_gguf(
             "visual.deepstack_merger_list.2.norm.weight",
             &indexes,
         )
@@ -1049,9 +1056,9 @@ mod tests {
 
     /// Unknown component returns None (no `linear_fc3` etc).
     #[test]
-    fn wedge4f_qwen3vl_deepstack_unknown_component_returns_none() {
+    fn wedge4f_qwen_vision_deepstack_unknown_component_returns_none() {
         let indexes = vec![5];
-        assert!(hf_qwen3vl_deepstack_to_gguf(
+        assert!(hf_qwen_vision_deepstack_to_gguf(
             "visual.deepstack_merger_list.0.linear_fc3.weight",
             &indexes,
         )
@@ -1062,15 +1069,18 @@ mod tests {
     /// match anything outside the `visual.deepstack_merger_list.*`
     /// prefix.
     #[test]
-    fn wedge4f_qwen3vl_deepstack_non_deepstack_returns_none() {
+    fn wedge4f_qwen_vision_deepstack_non_deepstack_returns_none() {
         let indexes = vec![5, 11, 17];
         assert!(
-            hf_qwen3vl_deepstack_to_gguf("visual.merger.linear_fc1.weight", &indexes,).is_none()
+            hf_qwen_vision_deepstack_to_gguf("visual.merger.linear_fc1.weight", &indexes,)
+                .is_none()
         );
-        assert!(hf_qwen3vl_deepstack_to_gguf("visual.blocks.0.norm1.weight", &indexes,).is_none());
+        assert!(
+            hf_qwen_vision_deepstack_to_gguf("visual.blocks.0.norm1.weight", &indexes,).is_none()
+        );
         // CLIP-classic per-block tensor must not match the deepstack
         // helper (different prefix).
-        assert!(hf_qwen3vl_deepstack_to_gguf(
+        assert!(hf_qwen_vision_deepstack_to_gguf(
             "model.vision_tower.encoder.layer.5.layer_norm1.weight",
             &indexes,
         )

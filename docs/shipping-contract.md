@@ -5,7 +5,15 @@
 Current published release: `v0.1.18`. Public availability is authoritative
 only after exact-artifact release proof completes.
 
-This document defines the public hf2q product surface for `v0.1.18`. It also defines
+The next-release source candidate pins published `mlx-native = 0.15.0` from
+crates.io at SHA-256
+`09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822`.
+The backend's fail-closed exact-source/package/publication workflow run
+`32917226470` passed. This dependency publication does not by itself publish
+or qualify a new hf2q release.
+
+This document defines the public hf2q product surface for `v0.1.18` and the
+**next-release candidate** where explicitly marked. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
 and defines *what is supported*.
@@ -31,7 +39,6 @@ family's graph, cache, or scheduler contract by approximation.
 | Qwen3.5 / Qwen3.6 (`qwen35`, `qwen35moe`) | Supported | Text CLI generation plus OpenAI-compatible chat, SSE, tools, embeddings, retained-prefix reuse, and source-matched paired vision | Uses the shared Qwen35 autoregressive graph. Multimodal requests must pass the Qwen soft-token, DeepStack, 3D-position, and projector-binding checks. |
 | Qwen3.8-27B (`qwen35`) | Supported; an ordinary conversion of a multimodal source automatically publishes the bound text GGUF and F16 projector pair | The Qwen35 surface above, including the qualified SlotAware paired-vision, exact-speculation, and long-context decode paths | `hf2q generate` is text-only; paired vision uses `hf2q serve --mmproj` through `scripts/serve_qwen38_opencode.sh`. The text and projector provenance/digests must match. |
 | Legacy Qwen 3 MoE (`qwen3moe`) | Supported | None | Conversion-only. It is not silently routed through the `qwen35moe` runtime. |
-| Standalone Qwen3-VL dense (`qwen3vl` / `qwen3_vl`) | Supported | None | CLI generation and server startup fail closed before loading weights pending the ADR-041 engine seam. Qwen3-VL MoE conversion/runtime is unsupported. This is distinct from the qualified Qwen3.8 text/projector pair. |
 | DeepSeek-V4 (`deepseek4`) | Supported | CLI generation and OpenAI-compatible chat, SSE, tools, embeddings, and retained-prefix reuse | Uses the DeepSeek-V4 graph and compressed-cache contract only. |
 | BERT / Nomic-BERT (`bert`, `nomic-bert`) | Supported | OpenAI-compatible `/v1/embeddings` when loaded with `--embedding-model` | Embeddings-only; no chat generation. |
 | Llama 3 / MiniMax M2.7 (`llama`, `minimax_m2`) | Supported | None | Conversion-only; no native generation or serving graph. |
@@ -85,9 +92,29 @@ without Hub traffic or full-payload hashing.
   cache contracts rather than inheriting Qwen's representation.
 - Default decode (single-buffer or dual-buffer internal tuning; not
   user-configurable).
-- **Auto Q8 lm_head** with exact F32 rerank, selected when
-  `hidden_size % 32 == 0` **and** F16 lm_head weight > 256 MB;
-  otherwise F16.
+- **Artifact-native Gemma matrix storage.** The loader admits the declared
+  GGUF encoding before Metal allocation, maps the exact stored embedding,
+  output-head, dense-projection, and expert bytes, and routes those bytes
+  through a matching native kernel. A tied output head reuses the embedding
+  allocation. Production load does not manufacture an F16, F32, or re-quantized
+  shadow; an unsupported encoding fails before model allocation. Explicit
+  affine overlay formats remain a separate, declared representation. The real
+  A→B→A gate requires Gemma's live artifact mapping to disappear on eviction,
+  reappear only for a fresh A generation, preserve exact A replay, and remain
+  within the endpoint-based no-double-residency and reload memory bounds.
+- **Artifact-native Qwen3.5-family matrix storage.** Before Metal allocation,
+  the loader admits every embedding, head, dense, MoE, and MTP matrix codec and
+  all serving widths. One model-scoped GGUF mapping owns exact rank-2 matrices,
+  rank-3 expert stacks, and the single schema-declared rank-1 shared-expert
+  gate exposed as a zero-copy logical row. No other implicit squeeze is
+  admitted; only elementwise/state tensors may materialize F32.
+  Router and shared-expert matrices are not decoded and uploaded as BF16, and
+  tied/shared heads are aliases rather than duplicate allocations. Runtime
+  unique-view count and bytes must exactly equal the independent preflight
+  matrix receipt with zero anonymous matrix bytes. Model swap applies the same
+  mapping-disappearance, fresh-generation, exact-replay, bounded-peak, and
+  reclaim contract described above; copied storage is not an accepted Qwen
+  matrix fallback.
 - **Public by 0.1.6; strengthened through the 0.1.8 release:**
   Qwen3.5/Qwen3.6 and Qwen3.8 generation and OpenAI-compatible
   serving use the shared autoregressive `qwen35`/`qwen35moe` graph by default.
@@ -126,7 +153,8 @@ without Hub traffic or full-payload hashing.
   pre-request turn anchor; poisoned or inconsistent state resets fully.
   The 0.1.7 release also pairs large automatic MoE gate/up
   projections through the routing-schedule primitive introduced in
-  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.11.2`.
+  `mlx-native 0.10.10` and retained by the current candidate's pinned
+  `mlx-native 0.15.0`.
   Decode-sized and forced diagnostic routes remain independent;
   native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
@@ -163,10 +191,27 @@ descendant does not rerun it merely to publish the CLI:
 | Disconnect | Dropping the long SSE is observed at a transaction boundary, releases the same physical slot once, and a following request succeeds. |
 | Agentic four-slot gate | Required/automatic tools, unary/SSE, tool-result continuation, exact arguments, and retained-prefix reuse pass for four independent slots. Qwen uses the canonical prompt-visible `/opt/hf2q/Cargo.toml` path, a direct-tool system instruction, and an unambiguous completed-tool-result envelope; their SHA-256 identities are receipt-bound so an ephemeral package path or prompt rewrite cannot silently change the workload. |
 | Qwen3.8 exact speculation | `scripts/qwen38_speculation_ab.sh` requires the expected `MODEL_SHA256` and runs fresh one-slot servers in fixed OFF/AUTO/AUTO/OFF order from the same binary and artifact. Each arm executes three deterministic code prompts and three repeat-heavy prompts; all 24 `choices[0]` values must be byte-identical, AUTO must record accepted target-verified proposals, and each workload's six-sample per-mode median throughput must improve by at least 5%. The exact artifact must also pass required-tool unary, tool-result continuation with nonzero retained-prefix reuse, valid SSE plus one `[DONE]`, cancellation recovery, and a four-slot exact-output wave. The four-slot wave is a correctness gate only until a true width-N body/head establishes aggregate throughput; scalar slot interleaving must not be marketed as batched speed. |
+| Qwen3.8 agentic lifecycle | The protected cross-family release gate starts the canonical Qwen3.8 launcher in an explicit text-only phase and runs `scripts/test_agentic_cache_lifecycle.sh` against the checksum-pinned text artifact. Cold tool use, retained-prefix continuation, an active SSE owner, a queued exact retry, cancellation rollback, and unrelated-slot isolation must all pass. Every unary and SSE response must carry one generation-bound execution receipt for the same leased Qwen3.8 artifact, `qwen35` family, and `qwen35` GGUF architecture. The terminal sealed manifest embeds the lifecycle receipt and its digest alongside the already-sealed binary, packed-crate dependency provenance, and snapshot-bound model identity. A missing route, receipt, identity field, or matching seal fails closed. This is lifecycle authority, not a performance claim. |
 | Qwen3.8 short/long decode | The same packed binary and model run a fixed OFF/AUTO/AUTO/OFF comparison. Every fresh server first emits 512 greedy tokens below the 8,192-token selector crossover, then emits 512 greedy tokens at 100K–120K prompt tokens. Short and long output bytes must match across all arms; AUTO's short mean may regress by at most 2%; AUTO must improve long mean decode throughput by at least 15%; and each short and long arm's two trials must remain within 5%. AUTO must reduce mean long-request curl wall time. Every request binds curl time and shell phase time within two seconds of the response's total timer, requires its own unary SlotAware decode-complete event from the same decode clock, and runs inside the release gate's continuous fair-or-better thermal envelope. The short log snapshot must prove AUTO stayed on the scalar path below crossover; the long AUTO log must prove Q2 selection. A benchmark-only summary is diagnostic evidence, not release authority. |
 | Native lifetime/fatal recovery | Exact-artifact hardware waves keep command-buffer and CFString populations bounded and reject every timeout or ignored-submission signature. Packed model-free fail-stop and supervisor tests inject the fatal return/dead-worker state, prove no post-fatal submission, preserve `/health` as process liveness, and require `/readyz` plus new generation to fail closed. The hardware gate does not intentionally poison Metal. |
 
 The shared cross-family changes additionally require:
+
+The pool-resident generative-family swap gate executes one fixed 13-phase,
+two-cycle chain in one long-lived server process:
+Qwen dense -> DeepSeek -> Qwen MoE -> DeepSeek -> Gemma -> DeepSeek -> Qwen
+dense, then the same three spokes a second time. DeepSeek is the eviction hub;
+every adjacent pair exceeds the largest-artifact pool budget, so a smaller
+pair cannot accidentally co-reside and masquerade as replacement. Every phase
+must join its semantic family canary and execution receipt to a fresh resident
+generation, report zero generation-local cached tokens, preserve process
+policy, remove the evicted artifact mapping, remain within independently
+recomputed RSS and host-wired bounds, and replay each returning family exactly.
+`data/generative_swap_matrix.v1.json` and its model-free mutation gate define
+this source contract. The Apple-Silicon four-artifact execution is still
+required; the checked-in source gate is not hardware or performance evidence.
+BERT and Nomic are excluded because their process-global embedding lifecycle
+has a separate acceptance gate.
 
 The hardware binary is compiled only from the `.crate` unpacked into a fresh
 temporary directory outside the source checkout. That build uses a fresh,
@@ -174,7 +219,7 @@ checkout-disjoint `CARGO_HOME` and target directory, clears Rust toolchain,
 compiler, documentation, flags, wrapper, target, and profile override
 variables, and rejects Cargo config anywhere in the packed root's ancestry.
 Its dependency receipt binds the packed `Cargo.lock` and raw `cargo metadata`
-bytes, including the exact `mlx-native 0.11.2` crates.io source and checksum.
+bytes, including the exact `mlx-native 0.15.0` crates.io source and checksum.
 The protected release workflow rehashes and revalidates those downloaded raw
 files, then requires its newly packed `Cargo.lock` to be byte-identical before
 publishing.
@@ -238,8 +283,8 @@ good operator UX merely because a release script exports it.
 |---|---|---|
 | `HF2Q_LMHEAD_Q8` | `1`, `0`, unset | Force Q8 on, force F16, or auto-select. Escape hatch for models the auto heuristic classifies incorrectly. |
 | `HF2Q_QWEN_SPECULATION` | `off`, `auto` | Live Qwen SlotAware speculation policy. The qwen35 server engine defaults to `auto` when the variable is unset (since 2026-08-21; previously the default was off outside the canonical Qwen3.8 launcher). Auto preserves the target sampler/grammar state, requires coherent request-owned cache metadata, and cost-gates history lookup and fixed-K3 MTP independently. Unsupported semantics and runtime failures fail closed to ordinary decode or invalidate the affected slot; invalid values warn and resolve to off. Explicit `off` remains the escape hatch. |
-| `HF2Q_DECODE_MVN` | `0`, `1` | Exact-tree Q4_K/Q6_K multi-column matvec routing. The global default is `1`; loading a Qwen3.8-identified model applies `0` at engine load (previously only via the canonical Qwen3.8 launcher) because its K=3 verifier is qualified on the weight-amortized width-four route. Explicit values always win. |
-| `HF2Q_DECODE_MV_EXT` | `0`, `1` | Weight-amortized multi-column matvec routing. The global default is `0`; loading a Qwen3.8-identified model applies `1` at engine load (previously only via the canonical Qwen3.8 launcher). K-quants route only at widths 4–8; legacy Q4_0/Q8_0 route at widths 2–8. Unlike the byte-exact default-on mvN route, `mul_mv_ext` is not bit-exact, so the default remains Qwen3.8-scoped. |
+| `HF2Q_DECODE_MVN` | `0`, `1` | Exact-tree multi-column matvec routing. The shared default is `1`; model labels do not change it. Admitted kernels must preserve the scalar accumulator and reduction order. Explicit values resolve into immutable per-model policy without mutating process environment, and A→B→A swaps must preserve each model's policy. |
+| `HF2Q_DECODE_MV_EXT` | `0`, `1` | Experimental weight-amortized multi-column matvec routing. The shared default is `0`. K-quants route only at widths 4–8; legacy Q4_0/Q8_0 route at widths 2–8. Its different reduction tree is not byte-exact: the repeated Qwen3.8 verifier gate changed a target decision at completion token 206. Enabling it invalidates exact speculative-decoding authority. |
 | `HF2Q_QWEN_GQA_Q2` | `auto`/unset, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 long-context TQ-HB selector. Auto uses the bit-exact Q2 cooperative kernel only at KV length ≥8,192 and only for its hard D=256/GQA/no-mask geometry. Off is the supported escape hatch. On cannot bypass geometry checks. Invalid values fail safe to off. |
 | `HF2Q_BATCHED_PREFILL` | `0`/`false`/`off`, unset | Opt out of the default batched prefill path (Category 1) back to per-token `forward_prefill`. For parity diagnostics only — per-token is 14-45× slower than peer. Default-on since ADR-028 iter-344; decoupled from the `HF2Q_UNSAFE_EXPERIMENTS` ack at that iter. The remaining `sliding_wrap` long-sequence byte-parity gap is the operator-signed deferral (2026-04-16; see ADR-010), a coherence deferral — not a runtime error. |
 | `HF2Q_STREAMING_PHASE3` | `1`, unset | ADR-014 P7 iter-3 production wire-up. Routes all 4 Phase 3 quantize dispatch arms (K-quant codec direct / ImatrixAdaptive / StaticQuantizer / DwqK) and Phase 4.5 quality measurement through the streaming `LazyTensorMap` pipeline (`quantize_via_streaming_borrowed` + `measure_quality_streaming_lazy`). Output is byte-identical to the eager path — every wired arm has a per-arm byte-identity gate. Currently a TEST INTEGRATION channel, not a memory win (wedge clones bytes ~2× peak briefly); actual memory savings land when iter-3 wholesale surgery removes the upstream `materialize_all()` bridge. Default OFF; default behavior unchanged. |
@@ -253,7 +298,6 @@ an explicit acknowledgment: `HF2Q_UNSAFE_EXPERIMENTS=1`.
 
 | Var | Unsafe-ack | Purpose |
 |---|---|---|
-| `HF2Q_LMHEAD_RERANK=0` | **required** | Measure raw Q8 argmax cost. Reintroduces the rare near-tiebreak flip (observed as mid-decode `<pad>` emission). |
 | `HF2Q_CHUNK_SCAN_PREFILL=1` | **required** | Wave 5b iter 5 opt-in: route Qwen3.6 prefills at `seq_len > 64` through the mlx-native chunk-parallel delta-rule pipeline (`mlx_native::ops::chunk_gated_delta_rule::dispatch_chunk_gated_delta_rule_fwd`). This is a performance experiment distinct from the production autoregressive path. Decode parity ±5% (AC 5468) and walk-bar parity at pp4096+ (W-5b.3) are required before this experimental kernel can become Category 1. |
 
 ---
@@ -282,13 +326,14 @@ compatibility writers, and replay remain test-only or unavailable.
 | `HF2Q_F16_KV` | Known-worse KV cache representation; separate bug vs F32 path. |
 | `HF2Q_SKIP_TQ_ENCODE` | Bisection scaffolding; produces garbage output. |
 | `HF2Q_SKIP_TQ_SDPA` | Bisection scaffolding; produces garbage output. |
+| `HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS` | Positive integer selecting one Qwen SlotAware request for the ADR-049 hardware gate. After that request completes a non-empty GPU prefill slice, a one-shot request failure is injected before scheduler publication so the real reset/AnchorStore invalidation lifecycle can be proven. Requires `HF2Q_UNSAFE_EXPERIMENTS=1`; never active in ordinary serving. |
+| `HF2Q_TEST_ANCHOR_RESTORE_FAILURE_MAX_TOKENS` | Positive integer selecting one real Gemma4 or DeepSeek4 prompt-anchor restore for ADR-049 failure-path validation. The first restore whose request has that exact `max_tokens` value fails through the family's ordinary hard-reset and full-lineage invalidation path; live-prefix hits and cancellation cannot consume the one-shot fault. Requires `HF2Q_UNSAFE_EXPERIMENTS=1`; never active in ordinary serving. |
 
 **Warn-on-activation, no ack (ineffective but safe):**
 
 | Var | Notes |
 |---|---|
 | `HF2Q_GRAPH_OPT` | No measured win; reorder aborts on unannotated dispatches. |
-| `HF2Q_LMHEAD_COMPARE` | Keeps both F16 and Q8 resident; inert (not wired into live decode). |
 | `HF2Q_DUAL_BUFFER` | Internal perf tuning; default (3) is part of category 1. |
 
 **Silent / read-only diagnostics (no warning, no ack):**
@@ -532,13 +577,10 @@ These are deliberately not part of any category:
 - Byte-identical batched-prefill parity with the peer at the ~752-byte
   `sliding_wrap` level (see `docs/adr/ADR-010-exact-batched-kernel-parity.md`;
   deferred).
-- Standalone Qwen3-VL generation and serving, pending the ADR-041 engine seam.
-  Dense conversion is supported, but server startup and CLI generation fail
-  closed before weights load; the Qwen3-VL MoE variant is also unsupported.
 - Qwen multimodal artifacts or request geometries that have not passed the
   source-pair binding and family-specific soft-token/DeepStack/3D-position
   validation gates. The accepted Qwen3.8 pair does not qualify arbitrary
-  Qwen projectors or standalone Qwen3-VL.
+  Qwen projectors.
 - In-process recovery after a fatal Metal command-buffer/watchdog/ignored-
   submission failure or an expired non-returning transaction. The worker and
   HTTP surfaces fail closed, but an OS supervisor must recreate the
@@ -564,8 +606,6 @@ These are deliberately not part of any category:
   and persisted-family contract.
 - `docs/adr/ADR-040-continuous-batching-reopen.md` — Qwen SlotAware bounded
   text/multimodal prefill and cross-family fatal-device ownership.
-- `docs/adr/ADR-041-qwen3vl-text-lm-engine-seam.md` — standalone Qwen3-VL
-  runtime blocker and fail-closed boundary.
 - `docs/adr/diary/ADR-014-streaming-convert-pipeline.md` — streaming pipeline +
   Decision-15 peer-parity gate matrix (the source of truth for the
   8-cell table above).

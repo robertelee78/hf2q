@@ -66,7 +66,11 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/hf2q_process_guard.sh
 source "$SCRIPT_DIR/hf2q_process_guard.sh"
+# shellcheck source=scripts/hf2q_q5_policy.sh
+source "$SCRIPT_DIR/hf2q_q5_policy.sh"
+hf2q_resolve_q5k_canonical_policy
 
 # The default is the schema-v2, source-bound reproduction used by the strict
 # coherence/performance gate. Operators may still set MODEL to any explicitly
@@ -80,6 +84,7 @@ CHECK_ONLY="${CHECK_ONLY:-0}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-8589934592}" # 8 GiB shared
 REQUIRED_TOOL_THINKING_TOKEN_BUDGET="${REQUIRED_TOOL_THINKING_TOKEN_BUDGET:-8}"
+MIXED_COHORT="${HF2Q_DEEPSEEK_MIXED_COHORT:-1}"
 
 # Keep the wrapper's context override identical to the real hf2q flag. The
 # qualified launcher defaults to 262144, while direct `hf2q serve` omits
@@ -133,6 +138,10 @@ for SETTING in CHECK_ONLY MAX_SWAP_USED_GIB MAX_COMPRESSOR_USED_GIB \
         exit 3
     fi
 done
+if [[ "$MIXED_COHORT" != 0 && "$MIXED_COHORT" != 1 ]]; then
+    echo "HF2Q_DEEPSEEK_MIXED_COHORT must be 0 or 1 (got: $MIXED_COHORT)" >&2
+    exit 3
+fi
 if (( CHECK_ONLY > 1 || UNSAFE_MEMORY_OVERRIDE > 1 )); then
     echo "CHECK_ONLY and HF2Q_DEEPSEEK_UNSAFE_MEMORY_OVERRIDE must be 0 or 1" >&2
     exit 3
@@ -148,6 +157,11 @@ if [[ -n "${PREFILL_WINDOWS:-}" ]]; then
     fi
     export HF2Q_DEEPSEEK_PREFILL_WINDOWS="$PREFILL_WINDOWS"
 fi
+# Resolve this once before the worker starts. The default is the accepted B.1
+# candidate; zero is the exact same-binary serial Mixed control used by the
+# fail-closed hardware gate. The worker repeats the resolved value in its
+# startup receipt so a dead or misspelled launcher setting cannot pass.
+export HF2Q_DEEPSEEK_MIXED_COHORT="$MIXED_COHORT"
 
 # Fail before loading the ~100 GiB model when another service owns the port.
 # macOS ships lsof; nc is a portable fallback for leaner environments.
@@ -259,7 +273,8 @@ if (( MODEL_BYTES >= LARGE_MODEL_BYTES )); then
 fi
 
 if (( CHECK_ONLY == 1 )); then
-    "$HF2Q_BIN" info \
+    env HF2Q_Q5K_CANONICAL_Q4X4="$HF2Q_Q5K_CANONICAL_Q4X4" \
+        "$HF2Q_BIN" info \
         --model "$MODEL" \
         --ctx "$CONTEXT_TOKENS" \
         --scheduler inflight-batched \
@@ -269,7 +284,8 @@ if (( CHECK_ONLY == 1 )); then
     exit 0
 fi
 
-exec "$HF2Q_BIN" -v serve \
+exec env HF2Q_Q5K_CANONICAL_Q4X4="$HF2Q_Q5K_CANONICAL_Q4X4" \
+    "$HF2Q_BIN" -v serve \
         --model "$MODEL" \
         --host "$HOST" \
         --port "$PORT" \

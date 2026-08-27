@@ -82,8 +82,6 @@ pub enum ArchName {
     /// (inherits `_Qwen35MtpMixin`, `_Qwen35MRopeMixin`,
     /// `_LinearAttentionVReorderBase`).
     Qwen35MoeFull,
-    /// Qwen3-VL text-side decoder.
-    Qwen3VlText,
     /// BERT family (BAAI bge-large-en, etc.).
     Bert,
     /// Nomic-BERT embedding model family.
@@ -112,7 +110,6 @@ impl ArchName {
             ArchName::Qwen35 => "qwen35",
             ArchName::Qwen35Moe => "qwen3moe",
             ArchName::Qwen35MoeFull => "qwen35moe",
-            ArchName::Qwen3VlText => "qwen3vl",
             ArchName::Bert => "bert",
             ArchName::NomicBert => "nomic-bert",
             ArchName::Llama3 => "llama",
@@ -150,7 +147,6 @@ impl ArchName {
             "qwen3moe" => Some(ArchName::Qwen35Moe),
             // "qwen35moe" — newer linear-attn + MTP variant
             "qwen35moe" => Some(ArchName::Qwen35MoeFull),
-            "qwen3vl" => Some(ArchName::Qwen3VlText),
             "bert" => Some(ArchName::Bert),
             "nomic-bert" => Some(ArchName::NomicBert),
             "llama" => Some(ArchName::Llama3),

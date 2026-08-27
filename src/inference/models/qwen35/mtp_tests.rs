@@ -1,8 +1,10 @@
 use super::super::gpu_full_attn::{download_f32, upload_f32};
 use super::super::kv_cache::HybridKvCache;
 use super::super::mtp::MtpFfnKind;
-use super::super::mtp_weights_load::mtp_tensor_names;
-use super::super::{default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
+use super::super::mtp_weights_load::{mtp_tensor_names, validate_mtp_tensor_topology};
+use super::super::{
+    default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant,
+};
 use super::{
     load_mtp_weights_if_present, load_mtp_weights_if_present_with_shared_head,
     shifted_nextn_copy_plan, upload_i32,
@@ -56,10 +58,10 @@ fn zeros(n: usize) -> Vec<f32> {
     vec![0.0; n]
 }
 
-fn tiny_tensors() -> Vec<TestTensor> {
-    let h = 32usize;
-    let v = 64usize;
-    let m = 32usize;
+fn dense_mtp_tensors_for_cfg(cfg: &Qwen35Config) -> Vec<TestTensor> {
+    let h = cfg.hidden_size as usize;
+    let v = cfg.vocab_size as usize;
+    let m = cfg.intermediate_size.expect("dense MTP fixture width") as usize;
     vec![
         TestTensor {
             name: "blk.2.nextn.enorm.weight",
@@ -149,6 +151,86 @@ fn tiny_tensors() -> Vec<TestTensor> {
     ]
 }
 
+fn tiny_tensors() -> Vec<TestTensor> {
+    dense_mtp_tensors_for_cfg(&tiny_nonzero_mtp_cfg())
+}
+
+fn tiny_moe_cfg() -> Qwen35Config {
+    let mut cfg = tiny_cfg(1);
+    cfg.variant = Qwen35Variant::Moe;
+    cfg.intermediate_size = None;
+    cfg.moe = Some(Qwen35MoeConfig {
+        moe_intermediate_size: 16,
+        num_experts: 4,
+        num_experts_per_tok: 2,
+        shared_expert_intermediate_size: 16,
+    });
+    cfg
+}
+
+fn tiny_moe_tensors(rank_two_shared_gate: bool) -> Vec<TestTensor> {
+    let h = 32usize;
+    let experts = 4usize;
+    let intermediate = 16usize;
+    let shared = 16usize;
+    let mut tensors = tiny_tensors()
+        .into_iter()
+        .filter(|tensor| {
+            !matches!(
+                tensor.name,
+                "blk.2.ffn_gate.weight" | "blk.2.ffn_up.weight" | "blk.2.ffn_down.weight"
+            )
+        })
+        .collect::<Vec<_>>();
+    tensors.extend([
+        TestTensor {
+            name: "blk.2.ffn_gate_inp.weight",
+            dims: vec![h as u64, experts as u64],
+            data: zeros(experts * h),
+        },
+        TestTensor {
+            name: "blk.2.ffn_gate_exps.weight",
+            dims: vec![h as u64, intermediate as u64, experts as u64],
+            data: zeros(experts * intermediate * h),
+        },
+        TestTensor {
+            name: "blk.2.ffn_up_exps.weight",
+            dims: vec![h as u64, intermediate as u64, experts as u64],
+            data: zeros(experts * intermediate * h),
+        },
+        TestTensor {
+            name: "blk.2.ffn_down_exps.weight",
+            dims: vec![intermediate as u64, h as u64, experts as u64],
+            data: zeros(experts * h * intermediate),
+        },
+        TestTensor {
+            name: "blk.2.ffn_gate_inp_shexp.weight",
+            dims: if rank_two_shared_gate {
+                vec![h as u64, 1]
+            } else {
+                vec![h as u64]
+            },
+            data: zeros(h),
+        },
+        TestTensor {
+            name: "blk.2.ffn_gate_shexp.weight",
+            dims: vec![h as u64, shared as u64],
+            data: zeros(shared * h),
+        },
+        TestTensor {
+            name: "blk.2.ffn_up_shexp.weight",
+            dims: vec![h as u64, shared as u64],
+            data: zeros(shared * h),
+        },
+        TestTensor {
+            name: "blk.2.ffn_down_shexp.weight",
+            dims: vec![shared as u64, h as u64],
+            data: zeros(h * shared),
+        },
+    ]);
+    tensors
+}
+
 fn write_gguf(path: &std::path::Path, tensors: &[TestTensor]) {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"GGUF");
@@ -192,6 +274,56 @@ fn write_gguf(path: &std::path::Path, tensors: &[TestTensor]) {
     let mut f = std::fs::File::create(path).expect("create gguf");
     f.write_all(&buf).expect("write gguf");
     f.flush().expect("flush gguf");
+}
+
+pub(crate) fn tiny_nonzero_mtp_cfg() -> Qwen35Config {
+    tiny_cfg(1)
+}
+
+pub(crate) fn load_tiny_nonzero_mtp_fixture(
+    device: &MlxDevice,
+) -> (Qwen35Config, super::MtpWeights) {
+    let cfg = tiny_nonzero_mtp_cfg();
+    let mtp = load_nonzero_mtp_fixture_for_cfg(device, &cfg);
+    (cfg, mtp)
+}
+
+pub(crate) fn load_nonzero_mtp_fixture_for_cfg(
+    device: &MlxDevice,
+    cfg: &Qwen35Config,
+) -> super::MtpWeights {
+    static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    assert_eq!(cfg.num_hidden_layers, 2, "fixture tensor names use blk.2");
+    assert_eq!(cfg.mtp_num_hidden_layers, 1, "fixture requires one MTP layer");
+    assert!(cfg.moe.is_none(), "fixture supplies a dense MTP FFN");
+    let mut tensors = dense_mtp_tensors_for_cfg(cfg);
+    for tensor in &mut tensors {
+        if matches!(
+            tensor.name,
+            "blk.2.nextn.eh_proj.weight"
+                | "blk.2.nextn.embed_tokens.weight"
+                | "blk.2.attn_k.weight"
+                | "blk.2.attn_v.weight"
+        ) {
+            for (index, value) in tensor.data.iter_mut().enumerate() {
+                let centered = (index % 29) as f32 - 14.0;
+                *value = centered * 0.0005;
+            }
+        }
+    }
+    let sequence = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!(
+        "hf2q_segmented_mtp_{}_{}.gguf",
+        std::process::id(),
+        sequence
+    ));
+    write_gguf(&tmp, &tensors);
+    let gguf = GgufFile::open(&tmp).expect("open segmented MTP fixture");
+    let mtp = load_mtp_weights_if_present(&gguf, cfg, device)
+        .expect("load segmented MTP fixture")
+        .expect("segmented MTP fixture present");
+    std::fs::remove_file(&tmp).ok();
+    mtp
 }
 
 fn try_device() -> Option<MlxDevice> {
@@ -238,6 +370,32 @@ fn mtp_absent_scan_returns_empty() {
 }
 
 #[test]
+fn mtp_moe_topology_uses_the_same_exact_rank_one_shared_gate_as_target_loading() {
+    let cfg = tiny_moe_cfg();
+    let exact_path =
+        std::env::temp_dir().join(format!("mtp_moe_row_exact_{}.gguf", std::process::id()));
+    write_gguf(&exact_path, &tiny_moe_tensors(false));
+    let exact = GgufFile::open(&exact_path).expect("open rank-one MoE MTP fixture");
+    validate_mtp_tensor_topology(&exact, &cfg)
+        .expect("MTP topology must admit the artifact-native rank-one shared gate");
+    std::fs::remove_file(&exact_path).ok();
+
+    let squeezed_path =
+        std::env::temp_dir().join(format!("mtp_moe_row_squeezed_{}.gguf", std::process::id()));
+    write_gguf(&squeezed_path, &tiny_moe_tensors(true));
+    let squeezed = GgufFile::open(&squeezed_path).expect("open rank-two MoE MTP fixture");
+    let error = validate_mtp_tensor_topology(&squeezed, &cfg)
+        .expect_err("MTP topology must not invent rank-two squeeze semantics");
+    assert!(
+        error
+            .to_string()
+            .contains("must be exact rank 1 with shape [32], got [1, 32]"),
+        "rejection must identify the exact native row-vector contract: {error:#}"
+    );
+    std::fs::remove_file(&squeezed_path).ok();
+}
+
+#[test]
 fn mtp_loads_gpu_weights_from_synthetic_gguf() {
     let Some(device) = try_device() else { return };
     let tmp = std::env::temp_dir().join(format!("mtp_present_{}.gguf", std::process::id()));
@@ -261,18 +419,21 @@ fn mtp_loads_gpu_weights_from_synthetic_gguf() {
 }
 
 /// ADR-013 P14 follow-up (2026-04-30): Qwen3.6 27B + 35B-A3B share the main
-/// model's `token_embd.weight`; convert correctly skips emitting
-/// `blk.{N}.nextn.embed_tokens.weight`. The loader must succeed (not bail) when
-/// `mtp_use_dedicated_embeddings=false` AND the dedicated tensor is absent, and
-/// must populate `embed_tokens = None` to signal the shared path.
+/// model's `token_embd.weight`; convert correctly skips both dedicated MTP
+/// embedding/head tensors. The loader must succeed when the metadata selects
+/// sharing and both dedicated tensors are absent, and must populate
+/// `embed_tokens = None` while borrowing the native main head.
 #[test]
 fn mtp_loads_with_shared_embeddings_when_flag_false_and_tensor_absent() {
     let Some(device) = try_device() else { return };
-    // tiny_tensors() includes the dedicated embed_tokens tensor; strip it for
-    // the shared-embeddings scenario.
+    // tiny_tensors() includes both dedicated tensors; strip them and provide
+    // the tied main embedding that is authoritative in shared mode.
     let mut tensors: Vec<TestTensor> = tiny_tensors()
         .into_iter()
-        .filter(|t| t.name != "blk.2.nextn.embed_tokens.weight")
+        .filter(|t| {
+            t.name != "blk.2.nextn.embed_tokens.weight"
+                && t.name != "blk.2.nextn.shared_head_head.weight"
+        })
         .collect();
     tensors.push(TestTensor {
         name: "token_embd.weight",
@@ -302,8 +463,9 @@ fn mtp_loads_with_shared_embeddings_when_flag_false_and_tensor_absent() {
     assert!(
         !mtp.loaded_tensor_names
             .iter()
-            .any(|n| n == "blk.2.nextn.embed_tokens.weight"),
-        "dedicated tensor must not appear in loaded_tensor_names"
+            .any(|n| n == "blk.2.nextn.embed_tokens.weight"
+                || n == "blk.2.nextn.shared_head_head.weight"),
+        "dedicated tensors must not appear in loaded_tensor_names"
     );
     std::fs::remove_file(&tmp).ok();
 }
@@ -341,12 +503,6 @@ fn mtp_shared_head_falls_back_to_tied_main_token_embedding() {
 
 #[test]
 fn mtp_shared_head_borrows_the_supplied_main_buffer_without_a_second_allocation() {
-    use crate::serve::forward_mlx_shared::MlxQWeight;
-    use crate::serve::gpu::QuantWeightInfo;
-    use mlx_native::metal::foreign_types::ForeignType;
-    use mlx_native::ops::quantized_matmul_ggml::GgmlType;
-    use mlx_native::DType;
-
     let Some(device) = try_device() else { return };
     let h = 32usize;
     let vocab = 64usize;
@@ -368,28 +524,155 @@ fn mtp_shared_head_borrows_the_supplied_main_buffer_without_a_second_allocation(
     let mut cfg = tiny_cfg(1);
     cfg.mtp_use_dedicated_embeddings = false;
 
-    let bytes = vocab * h / 32 * 34;
+    let mapped = gguf.map_tensor_data(&device).expect("map GGUF");
+    let supplied =
+        crate::serve::forward_mlx_shared::load_gguf_qweight(&gguf, &mapped, "token_embd.weight")
+            .expect("map exact main head");
+    let supplied_identity = (
+        supplied.buffer.contents_ptr(),
+        supplied.buffer.byte_offset(),
+        supplied.buffer.data_byte_len(),
+    );
+    let mtp = load_mtp_weights_if_present_with_shared_head(
+        &gguf,
+        &mapped,
+        &cfg,
+        &device,
+        Some(&supplied),
+    )
+    .expect("supplied main head is valid")
+    .expect("MTP weights");
+
+    assert_eq!(
+        (
+            mtp.shared_head_head.contents_ptr(),
+            mtp.shared_head_head.byte_offset(),
+            mtp.shared_head_head.data_byte_len(),
+        ),
+        supplied_identity
+    );
+    assert_eq!(mtp.shared_head_head_ggml_type, mlx_native::GgmlType::F32);
+    assert_eq!(mtp.vocab_size, vocab as u32);
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn mtp_shared_head_rejects_anonymous_same_shape_replacement() {
+    use crate::serve::forward_mlx_shared::MlxQWeight;
+    use crate::serve::gpu::QuantWeightInfo;
+    use mlx_native::DType;
+
+    let Some(device) = try_device() else { return };
+    let h = 32usize;
+    let vocab = 64usize;
+    let mut tensors: Vec<TestTensor> = tiny_tensors()
+        .into_iter()
+        .filter(|tensor| {
+            tensor.name != "blk.2.nextn.embed_tokens.weight"
+                && tensor.name != "blk.2.nextn.shared_head_head.weight"
+        })
+        .collect();
+    tensors.push(TestTensor {
+        name: "token_embd.weight",
+        dims: vec![h as u64, vocab as u64],
+        data: zeros(vocab * h),
+    });
+    let tmp = std::env::temp_dir().join(format!("mtp_wrong_head_{}.gguf", std::process::id()));
+    write_gguf(&tmp, &tensors);
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let mapped = gguf.map_tensor_data(&device).expect("map GGUF");
+    let mut cfg = tiny_cfg(1);
+    cfg.mtp_use_dedicated_embeddings = false;
     let supplied = MlxQWeight {
         buffer: device
-            .alloc_buffer(bytes, DType::U8, vec![bytes])
-            .expect("allocate supplied Q8_0 head"),
+            .alloc_buffer(vocab * h * 4, DType::F32, vec![vocab, h])
+            .expect("allocate anonymous same-shape head"),
         info: QuantWeightInfo {
-            ggml_dtype: GgmlType::Q8_0,
+            ggml_dtype: mlx_native::GgmlType::F32,
             rows: vocab,
             cols: h,
         },
         affine: None,
-        f16_shadow: None,
         decode_record_q6k_m1: std::sync::OnceLock::new(),
     };
-    let supplied_ptr = supplied.buffer.metal_buffer().as_ptr();
-    let mtp = load_mtp_weights_if_present_with_shared_head(&gguf, &cfg, &device, Some(&supplied))
-        .expect("supplied main head is valid")
-        .expect("MTP weights");
+    let error = load_mtp_weights_if_present_with_shared_head(
+        &gguf,
+        &mapped,
+        &cfg,
+        &device,
+        Some(&supplied),
+    )
+    .err()
+    .expect("same metadata on an anonymous buffer must not replace the resolved GGUF head");
+    assert!(format!("{error:#}").contains("exact mapped byte range"));
+    std::fs::remove_file(&tmp).ok();
+}
 
-    assert_eq!(mtp.shared_head_head.metal_buffer().as_ptr(), supplied_ptr);
-    assert_eq!(mtp.shared_head_head_ggml_type, GgmlType::Q8_0);
-    assert_eq!(mtp.vocab_size, vocab as u32);
+#[test]
+fn mtp_shared_head_rejects_wrong_mapped_range_and_metadata() {
+    use crate::serve::forward_mlx_shared::MlxQWeight;
+
+    let Some(device) = try_device() else { return };
+    let h = 32usize;
+    let vocab = 64usize;
+    let mut tensors: Vec<TestTensor> = tiny_tensors()
+        .into_iter()
+        .filter(|tensor| {
+            tensor.name != "blk.2.nextn.embed_tokens.weight"
+                && tensor.name != "blk.2.nextn.shared_head_head.weight"
+        })
+        .collect();
+    tensors.push(TestTensor {
+        name: "token_embd.weight",
+        dims: vec![h as u64, vocab as u64],
+        data: zeros(vocab * h),
+    });
+    let tmp = std::env::temp_dir().join(format!("mtp_wrong_range_{}.gguf", std::process::id()));
+    write_gguf(&tmp, &tensors);
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let mapped = gguf.map_tensor_data(&device).expect("map GGUF");
+    let exact =
+        crate::serve::forward_mlx_shared::load_gguf_qweight(&gguf, &mapped, "token_embd.weight")
+            .expect("map exact main head");
+    let mut cfg = tiny_cfg(1);
+    cfg.mtp_use_dedicated_embeddings = false;
+
+    let wrong = [
+        (
+            "offset/range",
+            MlxQWeight::from_test_buffer(
+                exact.buffer.slice_view(4, vocab * h - 1),
+                exact.info.ggml_dtype,
+                vocab,
+                h,
+            ),
+        ),
+        (
+            "codec",
+            MlxQWeight::from_test_buffer(exact.buffer.clone(), mlx_native::GgmlType::F16, vocab, h),
+        ),
+        (
+            "rows",
+            MlxQWeight::from_test_buffer(exact.buffer.clone(), exact.info.ggml_dtype, vocab - 1, h),
+        ),
+    ];
+    for (case, supplied) in wrong {
+        let error = load_mtp_weights_if_present_with_shared_head(
+            &gguf,
+            &mapped,
+            &cfg,
+            &device,
+            Some(&supplied),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{case} mismatch must reject shared-head substitution"));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("does not match resolved GGUF tensor")
+                || message.contains("not the exact mapped byte range"),
+            "unexpected {case} error: {message}"
+        );
+    }
     std::fs::remove_file(&tmp).ok();
 }
 
@@ -408,6 +691,34 @@ fn mtp_rejects_inconsistent_shared_flag_with_dedicated_tensor_present() {
     assert!(
         result.is_err(),
         "loader must refuse when flag=false but dedicated tensor present"
+    );
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn mtp_rejects_shared_mode_with_only_a_dedicated_head_present() {
+    let Some(device) = try_device() else { return };
+    let tmp = std::env::temp_dir().join(format!(
+        "mtp_inconsistent_head_only_{}.gguf",
+        std::process::id()
+    ));
+    let mut tensors = tiny_tensors();
+    tensors.retain(|tensor| tensor.name != "blk.2.nextn.embed_tokens.weight");
+    tensors.push(TestTensor {
+        name: "token_embd.weight",
+        dims: vec![32, 64],
+        data: zeros(64 * 32),
+    });
+    write_gguf(&tmp, &tensors);
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let mut cfg = tiny_cfg(1);
+    cfg.mtp_use_dedicated_embeddings = false;
+    let error = load_mtp_weights_if_present(&gguf, &cfg, &device)
+        .err()
+        .expect("shared MTP must reject a dedicated head-only replacement");
+    assert!(
+        format!("{error:#}").contains("shared_head_head"),
+        "rejection must identify the conflicting head: {error:#}"
     );
     std::fs::remove_file(&tmp).ok();
 }

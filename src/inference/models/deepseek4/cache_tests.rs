@@ -644,8 +644,14 @@ fn compact_snapshot_restores_overwritten_window_state_and_position_without_alias
         cache.commit_step(step.position).unwrap();
     }
 
+    let prospective_snapshot_bytes = cache.prospective_snapshot_owned_bytes().unwrap();
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.position(), 7);
+    assert_eq!(
+        prospective_snapshot_bytes,
+        snapshot.owned_bytes(),
+        "budget admission must know the exact payload before allocating it"
+    );
     let expected_snapshot_bytes: u64 = plan
         .layers
         .iter()
@@ -663,6 +669,7 @@ fn compact_snapshot_restores_overwritten_window_state_and_position_without_alias
         })
         .sum();
     assert_eq!(snapshot.resident_bytes(), expected_snapshot_bytes);
+    assert!(snapshot.owned_bytes() > snapshot.resident_bytes());
     assert!(snapshot.resident_bytes() < cache.resident_bytes());
 
     cache.layers_mut()[1]
@@ -712,6 +719,51 @@ fn compact_snapshot_restores_overwritten_window_state_and_position_without_alias
     assert_eq!(
         cache.layers()[1].window_kv.as_slice::<u16>().unwrap()[3],
         0x1234
+    );
+}
+
+#[test]
+fn restore_preflights_a_late_layer_before_mutating_earlier_layers_or_cursor() {
+    let mut cfg = config(vec![4, 128]);
+    cfg.max_position_embeddings = 128;
+    cfg.head_dim = 8;
+    cfg.index_head_dim = 4;
+    let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
+
+    cache.layers_mut()[0]
+        .window_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[3] = 0x1234;
+    for expected in 0..7 {
+        cache.commit_step(expected).unwrap();
+    }
+    let mut snapshot = cache.snapshot().unwrap();
+
+    cache.layers_mut()[0]
+        .window_kv
+        .as_mut_slice::<u16>()
+        .unwrap()[3] = 0xabcd;
+    cache.commit_step(7).unwrap();
+    snapshot.corrupt_last_layer_window_shape_for_test();
+
+    assert!(matches!(
+        cache.restore(&snapshot),
+        Err(CacheError::SnapshotBufferMismatch {
+            layer: 1,
+            kind: CacheKind::WindowKv,
+        })
+    ));
+    assert_eq!(
+        cache.position(),
+        8,
+        "failed restore changed the live cursor"
+    );
+    assert_eq!(
+        cache.layers()[0].window_kv.as_slice::<u16>().unwrap()[3],
+        0xabcd,
+        "late-layer validation failure mutated an earlier layer"
     );
 }
 
@@ -815,7 +867,7 @@ fn compatible_growth_migrates_live_prefix_and_leaves_new_tail_zeroed() {
         source.commit_step(expected).unwrap();
     }
 
-    target.migrate_from(&source, None).unwrap();
+    target.migrate_from(&source).unwrap();
     assert_eq!(source.position(), 11);
     assert_eq!(source.capacity(), 128);
     assert_eq!(target.position(), 11);
@@ -874,7 +926,7 @@ fn compatible_growth_migrates_live_prefix_and_leaves_new_tail_zeroed() {
 }
 
 #[test]
-fn compatible_growth_rebinds_and_restores_the_recovery_anchor() {
+fn compatible_growth_preserves_a_capacity_portable_recovery_anchor() {
     let mut cfg = config(vec![4, 128]);
     cfg.max_position_embeddings = 256;
     cfg.head_dim = 8;
@@ -904,7 +956,7 @@ fn compatible_growth_rebinds_and_restores_the_recovery_anchor() {
     for expected in 0..7 {
         source.commit_step(expected).unwrap();
     }
-    let mut snapshot = source.snapshot().unwrap();
+    let snapshot = source.snapshot().unwrap();
 
     source.layers_mut()[0]
         .window_kv
@@ -918,7 +970,10 @@ fn compatible_growth_rebinds_and_restores_the_recovery_anchor() {
         .unwrap()[1] = -1.0;
     source.commit_step(7).unwrap();
 
-    target.migrate_from(&source, Some(&mut snapshot)).unwrap();
+    target
+        .preflight_snapshot_migration(&source, &snapshot)
+        .unwrap();
+    target.migrate_from(&source).unwrap();
     assert_eq!(target.position(), 8);
     target.restore(&snapshot).unwrap();
     assert_eq!(target.position(), 7);
@@ -947,6 +1002,46 @@ fn compatible_growth_rebinds_and_restores_the_recovery_anchor() {
 }
 
 #[test]
+fn compatible_growth_preflights_and_preserves_every_retained_snapshot() {
+    let mut cfg = config(vec![4, 128]);
+    cfg.max_position_embeddings = 256;
+    cfg.head_dim = 8;
+    cfg.index_head_dim = 4;
+    let source_plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let target_plan = Deepseek4CachePlan::for_context(&cfg, 256).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut source = Deepseek4Cache::allocate(&source_plan, MlxDevice::new().unwrap()).unwrap();
+    let mut snapshots = Vec::new();
+    for depth in [3, 7, 11] {
+        while source.position() < depth {
+            source.commit_step(source.position()).unwrap();
+        }
+        source.layers_mut()[0]
+            .window_kv
+            .as_mut_slice::<u16>()
+            .unwrap()[0] = depth as u16;
+        snapshots.push(source.snapshot().unwrap());
+    }
+
+    let mut target = Deepseek4Cache::allocate(&target_plan, MlxDevice::new().unwrap()).unwrap();
+    for snapshot in &snapshots {
+        target
+            .preflight_snapshot_migration(&source, snapshot)
+            .unwrap();
+    }
+    target.migrate_from(&source).unwrap();
+
+    for (snapshot, expected_depth) in snapshots.iter().zip([3, 7, 11]) {
+        target.restore(snapshot).unwrap();
+        assert_eq!(target.position(), expected_depth);
+        assert_eq!(
+            target.layers()[0].window_kv.as_slice::<u16>().unwrap()[0],
+            expected_depth as u16
+        );
+    }
+}
+
+#[test]
 fn incompatible_or_poisoned_growth_leaves_the_destination_unchanged() {
     let mut source_cfg = config(vec![4]);
     source_cfg.max_position_embeddings = 256;
@@ -965,7 +1060,7 @@ fn incompatible_or_poisoned_growth_leaves_the_destination_unchanged() {
         .unwrap()[0] = 0xbeef;
 
     assert!(matches!(
-        target.migrate_from(&source, None),
+        target.migrate_from(&source),
         Err(CacheError::MigrationPlanMismatch {
             layer: 0,
             kind: CacheKind::IndexerKv
@@ -978,7 +1073,7 @@ fn incompatible_or_poisoned_growth_leaves_the_destination_unchanged() {
 
     source.poison();
     assert!(matches!(
-        target.migrate_from(&source, None),
+        target.migrate_from(&source),
         Err(CacheError::Poisoned)
     ));
     assert_eq!(

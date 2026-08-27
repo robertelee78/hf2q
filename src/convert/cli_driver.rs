@@ -38,7 +38,7 @@ use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
 use crate::convert::arch::qwen35moe_full::Qwen35MoeFullCtx;
 use crate::convert::arch::{
     bake, bert, deepseek4, deepseek4_metadata, gemma4, gemma4_mmproj, llama3, minimax_m2,
-    nomic_bert, qwen35_dense, qwen35moe, qwen35moe_full, qwen3vl_text,
+    nomic_bert, qwen35_dense, qwen35moe, qwen35moe_full,
 };
 use crate::convert::evidence_source::VerifiedEvidenceSource;
 use crate::convert::orchestrator::PlanEntry;
@@ -294,7 +294,7 @@ impl std::fmt::Display for ConvertError {
                     f,
                     "convert: unsupported architecture `{arch_name}` \
                      (supported: llama, gemma3, bert, nomic_bert, qwen3_moe, qwen3_5, qwen3_5_moe, \
-                     qwen3_vl, minimax_m2)"
+                     minimax_m2)"
                 )
             }
             ConvertError::UnmappedTensor { hf_name, arch } => write!(
@@ -596,10 +596,7 @@ fn run_convert_internal(
         });
     }
     if matches!(args.mode, ConvertMode::ProjectorOnly)
-        && matches!(
-            detected_arch,
-            ArchName::Qwen35 | ArchName::Qwen35MoeFull | ArchName::Qwen3VlText
-        )
+        && matches!(detected_arch, ArchName::Qwen35 | ArchName::Qwen35MoeFull)
     {
         if config.get("vision_config").is_none() {
             return Err(ConvertError::UnsupportedArch {
@@ -912,22 +909,6 @@ fn run_convert_internal(
     } else {
         None
     };
-    // Qwen3-VL deepstack count comes from vision_config (sibling to
-    // text_config at root). After `effective_config()` unwraps to
-    // text_config the vision_config is invisible — so we read it from
-    // the original src.config here. Mirrors the canonical converter.
-    let qwen3vl_n_deepstack = if matches!(arch, ArchName::Qwen3VlText) {
-        let vc = src
-            .config
-            .get("thinker_config")
-            .and_then(|tc| tc.get("vision_config"))
-            .or_else(|| config.get("vision_config"));
-        vc.and_then(|v| v.get("deepstack_visual_indexes"))
-            .and_then(|a| a.as_array())
-            .map(|a| a.len() as u32)
-    } else {
-        None
-    };
     let arch_metadata = build_metadata_for_arch(
         arch,
         config,
@@ -937,7 +918,6 @@ fn run_convert_internal(
         sampling.as_ref(),
         dir_basename.as_deref(),
         bert_pooling_override,
-        qwen3vl_n_deepstack,
     );
 
     // Canonical emits `general.quantization_version` and
@@ -1811,7 +1791,7 @@ fn synthesized_tensors_for_arch(arch: ArchName, config: &serde_json::Value) -> V
     match arch {
         ArchName::Gemma4 => gemma4::build_synthesized_tensors(config),
         // Other arches have no synthesized tensors at v1 (Qwen3MoE,
-        // MiniMaxM2, Llama3, Bert, NomicBert, Qwen3VlText, Gemma4Mmproj
+        // MiniMaxM2, Llama3, Bert, NomicBert, Gemma4Mmproj
         // — all read every tensor straight from safetensors).
         _ => Vec::new(),
     }
@@ -1835,11 +1815,10 @@ fn build_metadata_for_arch(
     sampling: Option<&crate::convert::model_card::SamplingConfig>,
     model_dir_basename: Option<&str>,
     bert_pooling_override: Option<u32>,
-    qwen3vl_n_deepstack: Option<u32>,
 ) -> Vec<(String, MetaValue)> {
     let wrapper_config = config;
     // Multimodal-wrapper flatten: text-decoder hparams live in
-    // config["text_config"] for Gemma 4 / Qwen3-VL omni-shape configs.
+    // config["text_config"] for supported conditional-generation configs.
     // Per-arch mappers don't each have to handle this; we resolve at the
     // driver boundary. Surfaced 2026-05-18 by the operator's
     // google-gemma-4-26b-a4b-it real-model convert smoke test.
@@ -1922,14 +1901,6 @@ fn build_metadata_for_arch(
             // for every tensor when ctx is missing.
             None => qwen35moe::build_metadata(config, ftype),
         },
-        ArchName::Qwen3VlText => qwen3vl_text::build_metadata(
-            config,
-            ftype,
-            model_card,
-            sampling,
-            model_dir_basename,
-            qwen3vl_n_deepstack,
-        ),
         ArchName::MiniMaxM2 => minimax_m2::build_metadata(
             config,
             ftype,
@@ -1959,7 +1930,7 @@ fn build_metadata_for_arch(
 ///
 /// Unifies the two mapper signatures:
 ///  - Dense arches expose `map_tensor_name(&str) -> Option<String>`
-///    (Llama3, Gemma4, Gemma4Mmproj, Bert, NomicBert, Qwen3VlText).
+///    (Llama3, Gemma4, Gemma4Mmproj, Bert, NomicBert).
 ///  - MoE arches expose `map_tensor_name(&str) -> Option<MappedTensor>`
 ///    (Qwen35Moe, MiniMaxM2).
 ///
@@ -2168,32 +2139,6 @@ fn map_tensor(
             }
             Some(nomic_bert::MappedTensor::Drop) => MapOutcome::Drop,
             None => MapOutcome::Unmapped,
-        },
-        ArchName::Qwen3VlText => match qwen3vl_text::map_tensor_name(hf_name) {
-            Some(s) => MapOutcome::Direct(s),
-            None => {
-                // The canonical converter SILENTLY DROPS
-                // multimodal-side tensors (visual,
-                // audio, vision-projector) rather than erroring. The
-                // mmproj sidecar is written by a separate `--mmproj`
-                // run. Unmapped genuinely-unknown names still surface
-                // as Unmapped (typed error).
-                if hf_name.contains("visual.")
-                    || hf_name.contains("vision.")
-                    || hf_name.contains("audio.")
-                    || hf_name.contains("audio_tower.")
-                    || hf_name.starts_with("mtp.")
-                    || hf_name.contains("patch_embed")
-                    || hf_name.contains("patch_embedding")
-                    || hf_name.contains("patch_merger.")
-                    || hf_name.contains("merger.")
-                    || hf_name.contains("vit.")
-                {
-                    MapOutcome::Drop
-                } else {
-                    MapOutcome::Unmapped
-                }
-            }
         },
         ArchName::Qwen35Moe => lift_qwen_mapped(qwen35moe::map_tensor_name(hf_name)),
         ArchName::Qwen35 => match qwen35_dense_ctx {
@@ -3335,7 +3280,6 @@ mod tests {
             None,
             Some("Qwen3.8-27B"),
             None,
-            None,
         );
         let map: std::collections::HashMap<_, _> = metadata.into_iter().collect();
         assert_eq!(
@@ -3479,9 +3423,7 @@ mod tests {
         );
     }
 
-    /// Codex 3b478164 review locked in: operator-released variants
-    /// `qwen3_5_moe_text` and `qwen3_6_moe_text` also resolve to
-    /// ArchName::Qwen35Moe.
+    /// Qwen 3.5 schema variants resolve to the full hybrid MoE graph.
     #[test]
     fn detect_arch_qwen35moe_release_variants_codex_3b478164() {
         // Qwen 3.5 variants with linear-attn + MTP route to
@@ -3490,9 +3432,8 @@ mod tests {
         // The older qwen3_moe canonical (no linear-attn, no MTP)
         // remains on ArchName::Qwen35Moe.
         //
-        // Note: "Qwen 3.6" is a model VERSION name; all locally-
-        // available qwen3.6-* models use Qwen3_5* arch strings
-        // (the canonical converter only registers Qwen3_5Moe*).
+        // Qwen 3.6 is a release name; locally proven 3.6 artifacts retain
+        // Qwen3_5* architecture strings. Do not invent a qwen3_6 alias.
         for mt in ["qwen3_5_moe", "qwen3_5_moe_text"] {
             assert_eq!(
                 detect_arch(&json!({ "model_type": mt })).unwrap(),
@@ -3570,14 +3511,30 @@ mod tests {
         assert!(build_qwen35_dense_ctx(&config).is_none());
     }
 
-    /// All three qwen3_vl flavors land on Qwen3VlText.
+    /// Standalone Qwen3-VL architectures are deliberately unsupported.
     #[test]
-    fn detect_arch_qwen3vl_flavors() {
-        for mt in ["qwen3_vl", "qwen3_vl_moe", "qwen3_vl_text"] {
-            assert_eq!(
-                detect_arch(&json!({ "model_type": mt })).unwrap(),
-                ArchName::Qwen3VlText,
+    fn detect_arch_rejects_qwen_vision_flavors() {
+        for mt in [
+            "qwen3_vl",
+            "qwen3vl",
+            "qwen3_vl_moe",
+            "qwen3vlmoe",
+            "qwen3_vl_text",
+        ] {
+            assert!(
+                detect_arch(&json!({ "model_type": mt })).is_err(),
                 "model_type={mt}"
+            );
+        }
+
+        for architecture in [
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3VLTextForCausalLM",
+        ] {
+            assert!(
+                detect_arch(&json!({ "architectures": [architecture] })).is_err(),
+                "architecture={architecture}"
             );
         }
     }

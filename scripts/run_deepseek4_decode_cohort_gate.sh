@@ -6,6 +6,8 @@ model=${2:?DeepSeek model path is required}
 out_dir=${3:?output directory is required}
 expected_source_sha=${4:?expected source SHA is required}
 expected_model_sha=${5:?expected model SHA-256 is required}
+dependency_receipt=${6:?verified dependency receipt is required}
+expected_dependency_receipt_sha=${7:?verified dependency receipt SHA-256 is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -37,8 +39,25 @@ readonly loaded_nominal_timeout_seconds=240
 [[ -f "$model" ]]
 [[ "$expected_source_sha" =~ ^[0-9a-f]{40}$ ]]
 [[ "$expected_model_sha" =~ ^[0-9a-f]{64}$ ]]
+[[ -f "$dependency_receipt" && -r "$dependency_receipt" \
+  && ! -L "$dependency_receipt" ]]
+[[ "$expected_dependency_receipt_sha" =~ ^[0-9a-f]{64}$ ]]
 mkdir -p "$out_dir"
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+[[ "$(sha256_file "$dependency_receipt")" == \
+  "$expected_dependency_receipt_sha" ]]
+mlx_native_version=$(jq -er '
+  select(
+    .schema_version == 1 and .status == "pass"
+    and .dependency.name == "mlx-native"
+    and (.dependency.version
+      | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+    and .dependency.requirement == ("=" + .dependency.version)
+    and .dependency.source
+      == "registry+https://github.com/rust-lang/crates.io-index"
+    and (.dependency.checksum | test("^[0-9a-f]{64}$"))
+  ) | .dependency.version
+' "$dependency_receipt")
 
 raw="$out_dir/raw.json"
 test_log="$out_dir/test.log"
@@ -436,11 +455,12 @@ jq --arg source_sha "$expected_source_sha" \
   --argjson contention_measurement_contended_samples \
     "$contention_measurement_contended_samples" \
   --argjson contention_measurement_gaps "$contention_measurement_gaps" \
+  --arg mlx_native_version "$mlx_native_version" \
   --argjson setup_memory "$setup_memory_summary" \
   --argjson loaded_idle_memory "$loaded_idle_memory_summary" \
   --argjson measurement_memory "$measurement_memory_summary" '
   . + {schema_version:6,source_sha:$source_sha,model_sha256:$model_sha256,
-    mlx_native_version:"0.11.2",producer_exit_code:$producer_exit_code,
+    mlx_native_version:$mlx_native_version,producer_exit_code:$producer_exit_code,
     raw_sha256:$raw_sha256,test_log_sha256:$test_log_sha256,
     phase_evidence:{policy:"fsynced-run-bound-markers-v1",run_uuid:$run_uuid,
       producer_pid:$producer_pid,test_spawned_at:$test_spawned_at,
@@ -503,6 +523,7 @@ bash "$ROOT_DIR/scripts/verify_deepseek4_decode_cohort_receipt.sh" \
   "$settle_log" "$expected_source_sha" "$expected_model_sha" \
   "$contention_measurement_log" "$contention_settle_log" "$memory_log" \
   "$phase_log" "$setup_thermal_log" "$setup_contention_log" \
-  "$setup_memory_log" "$loaded_idle_memory_log"
+  "$setup_memory_log" "$loaded_idle_memory_log" "$dependency_receipt" \
+  "$expected_dependency_receipt_sha"
 test "$test_rc" = 0
 sha256_file "$out_dir/summary.json" >"$out_dir/summary.json.sha256"

@@ -65,7 +65,8 @@
 #                           packed/norm buffers carry an outer slot axis and
 #                           zero-copy Metal views select the active agent.
 #   --kv-cache-budget       Shared physical high-water across the full-context
-#                           slots. MAX_SLOTS=8 is the np8-like setting.
+#                           slots. MAX_SLOTS=16 is the largest physical-decode
+#                           gate width; the operator default remains four.
 #
 # Family contract and prefix-cache stack:
 #   * The loader uses the GGUF-embedded Qwen ChatML template and validates its
@@ -85,6 +86,9 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/hf2q_process_guard.sh"
+# shellcheck source=scripts/hf2q_q5_policy.sh
+source "$SCRIPT_DIR/hf2q_q5_policy.sh"
+hf2q_resolve_q5k_canonical_policy
 
 MODEL="${MODEL:-/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf}"
 MMPROJ="${MMPROJ:-/opt/hf2q/models/qwen3.6/mmproj-qwen36-F16.gguf}"
@@ -96,6 +100,10 @@ MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
 THINKING_TOKEN_BUDGET="${THINKING_TOKEN_BUDGET:-2048}"
 TOOL_THINKING_TOKEN_BUDGET="${TOOL_THINKING_TOKEN_BUDGET:-512}"
+# The canonical agentic launcher enables exact compatible-lane aggregation.
+# Set 0 only for a matched serial control run or incident isolation.
+CROSS_SLOT_ADMIT="${HF2Q_CROSS_SLOT_ADMIT:-1}"
+ADMIT_COALESCE_US="${HF2Q_ADMIT_COALESCE_US:-25000}"
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
@@ -103,8 +111,8 @@ if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
     echo "PORT must be an integer from 1 through 65535 (got: $PORT)" >&2
     exit 3
 fi
-if ! [[ "$MAX_SLOTS" =~ ^[0-9]+$ ]] || (( MAX_SLOTS < 1 || MAX_SLOTS > 8 )); then
-    echo "MAX_SLOTS must be from 1 through 8 (got: $MAX_SLOTS)" >&2
+if ! [[ "$MAX_SLOTS" =~ ^[0-9]+$ ]] || (( MAX_SLOTS < 1 || MAX_SLOTS > 16 )); then
+    echo "MAX_SLOTS must be from 1 through 16 (got: $MAX_SLOTS)" >&2
     exit 3
 fi
 if ! [[ "$KV_CACHE_BUDGET_BYTES" =~ ^[0-9]+$ ]] || (( KV_CACHE_BUDGET_BYTES < 1 )); then
@@ -117,6 +125,15 @@ if ! [[ "$THINKING_TOKEN_BUDGET" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "$TOOL_THINKING_TOKEN_BUDGET" =~ ^[0-9]+$ ]]; then
     echo "TOOL_THINKING_TOKEN_BUDGET must be a non-negative integer (got: $TOOL_THINKING_TOKEN_BUDGET)" >&2
+    exit 3
+fi
+if [[ "$CROSS_SLOT_ADMIT" != 0 && "$CROSS_SLOT_ADMIT" != 1 ]]; then
+    echo "HF2Q_CROSS_SLOT_ADMIT must be 0 or 1 (got: $CROSS_SLOT_ADMIT)" >&2
+    exit 3
+fi
+if ! [[ "$ADMIT_COALESCE_US" =~ ^[0-9]+$ ]] \
+    || (( 10#$ADMIT_COALESCE_US > 100000 )); then
+    echo "HF2Q_ADMIT_COALESCE_US must be an integer from 0 through 100000 (got: $ADMIT_COALESCE_US)" >&2
     exit 3
 fi
 case "$VISION_MODE" in
@@ -193,7 +210,10 @@ HF2Q_SERVE_ARGS+=(
 )
 
 exec env \
+    HF2Q_Q5K_CANONICAL_Q4X4="$HF2Q_Q5K_CANONICAL_Q4X4" \
     HF2Q_TQ_KV=1 \
+    HF2Q_CROSS_SLOT_ADMIT="$CROSS_SLOT_ADMIT" \
+    HF2Q_ADMIT_COALESCE_US="$ADMIT_COALESCE_US" \
     HF2Q_ENCODER_SESSION=1 \
     HF2Q_FFN_TERMINAL_K_BATCH=8 \
     "$HF2Q_BIN" "${HF2Q_SERVE_ARGS[@]}"

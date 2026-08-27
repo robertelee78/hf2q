@@ -1,0 +1,67 @@
+{
+  "schema": "hf2q.generative-swap-matrix.v1",
+  "load_budget_seconds": 60,
+  "artifacts": [
+    {
+      "id": "qwen-dense",
+      "architecture": "qwen35",
+      "arch_family": "qwen35",
+      "path_env": "HF2Q_SWAP_QWEN_DENSE_PATH",
+      "file": "Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf",
+      "bytes": 16810714944,
+      "sha256": "1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a",
+      "canary": "HF2Q_SWAP_QWEN_DENSE_OK"
+    },
+    {
+      "id": "qwen-moe",
+      "architecture": "qwen35moe",
+      "arch_family": "qwen35",
+      "path_env": "HF2Q_SWAP_QWEN_MOE_PATH",
+      "file": "APEX-Q5_K_M.gguf",
+      "bytes": 25043007488,
+      "sha256": "f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25",
+      "canary": "HF2Q_SWAP_QWEN_MOE_OK"
+    },
+    {
+      "id": "gemma",
+      "architecture": "gemma4",
+      "arch_family": "gemma4",
+      "path_env": "HF2Q_SWAP_GEMMA_PATH",
+      "file": "gemma4-ara-2pass-APEX-Q5_K_M.gguf",
+      "bytes": 20576631488,
+      "sha256": "82beae39cdee643824dde5bc3fb1a3d6e2e4f8701572930163b0d703298bcf82",
+      "canary": "HF2Q_SWAP_GEMMA_OK"
+    },
+    {
+      "id": "deepseek",
+      "architecture": "deepseek4",
+      "arch_family": "deepseek4",
+      "path_env": "HF2Q_SWAP_DEEPSEEK_PATH",
+      "file": "DeepSeek-V4-Flash-0731-agentic-q2.gguf",
+      "bytes": 107431343168,
+      "sha256": "936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d",
+      "canary": "HF2Q_SWAP_DEEPSEEK_OK"
+    }
+  ],
+  "pairs": [
+    { "id": "qwen-dense--deepseek", "a": "qwen-dense", "b": "deepseek" },
+    { "id": "qwen-moe--deepseek", "a": "qwen-moe", "b": "deepseek" },
+    { "id": "gemma--deepseek", "a": "gemma", "b": "deepseek" }
+  ],
+  "sequence": [
+    "qwen-dense",
+    "deepseek",
+    "qwen-moe",
+    "deepseek",
+    "gemma",
+    "deepseek",
+    "qwen-dense",
+    "deepseek",
+    "qwen-moe",
+    "deepseek",
+    "gemma",
+    "deepseek",
+    "qwen-dense"
+  ],
+  "excluded_subsystems": ["bert", "nomic"]
+}

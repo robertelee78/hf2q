@@ -7,7 +7,9 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::{DType, KernelRegistry};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::inference::dense_bf16_activation::activate_native_bf16_dense;
 use crate::inference::models::qwen35::delta_net::DeltaNetLayerShape;
 use crate::inference::models::qwen35::execution_dispatch::{
     source_teacher_graph_policy_sha256, SourceTeacherGraphScope,
@@ -71,10 +73,31 @@ impl<'scope> SourceTeacherSessionV1<'scope> {
             _scope: scope,
         };
         preflight_source_teacher_state(&teacher, &cache.cache, 0)?;
+        static NEXT_SOURCE_TEACHER_ACTIVATION_EPOCH: AtomicU64 = AtomicU64::new(1);
+        let activation_epoch = NEXT_SOURCE_TEACHER_ACTIVATION_EPOCH.fetch_add(1, Ordering::Relaxed);
+        ensure!(
+            activation_epoch != 0,
+            "source teacher activation epoch exhausted"
+        );
+        let mut registry = KernelRegistry::new();
+        let native_bf16 = teacher
+            .native_bf16_matrices()
+            .context("inventory source-teacher BF16 projections")?;
+        ensure!(
+            activate_native_bf16_dense(
+                &mut registry,
+                &teacher.device,
+                activation_epoch,
+                &native_bf16,
+            )
+            .context("activate source-teacher BF16 routes")?
+            .is_some(),
+            "source teacher contains no BF16 projection to activate"
+        );
         Ok(Self {
             teacher,
             cache,
-            registry: KernelRegistry::new(),
+            registry,
             next_position: 0,
             poisoned: false,
             _scope: scope,

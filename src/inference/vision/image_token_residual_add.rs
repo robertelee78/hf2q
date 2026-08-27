@@ -16,7 +16,7 @@
 //! add is therefore full-tensor but a no-op at non-image positions.
 //!
 //! Hf2q's path does NOT pre-zero the deepstack chunks across all
-//! positions — the `compute_vision_embeddings_gpu_qwen3vl` augmented
+//! positions — the `compute_vision_embeddings_gpu_qwen` augmented
 //! buffer is dense over `n_image_tokens` rows, not the full LM
 //! sequence. We could pre-zero a `[n_tokens, hidden]` scatter at the
 //! engine seam (simpler, one-time CPU cost) BUT processing all

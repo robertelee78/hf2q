@@ -27,6 +27,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::metal::MTLSize;
+use mlx_native::ops::add_bias_row_2d::{
+    dispatch_add_bias_row_2d_f32, register as register_add_bias_row_2d,
+};
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
@@ -35,12 +38,20 @@ use mlx_native::ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_
 use mlx_native::ops::encode_helpers::KernelArg;
 use mlx_native::ops::flash_attn_prefill::{AttnParamsGpu, FLASH_ATTN_PREFILL_SHADER_SOURCE};
 use mlx_native::ops::gather::dispatch_gather_f32;
+use mlx_native::ops::im2col_2d_3ch::{
+    dispatch_im2col_2d_3ch_f32, register as register_im2col_2d_3ch,
+};
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::ops::softmax::dispatch_softmax;
 use mlx_native::ops::transpose::{permute_021_f32, transpose_last2_f16};
-use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{
+    CommandEncoder, DType, GgmlQuantizedMatmulParams, GgmlType, KernelRegistry, MlxBuffer,
+    MlxDevice,
+};
 use std::sync::LazyLock;
+
+use crate::serve::forward_mlx_shared::{native_gguf_matrix_bytes, MlxQWeight};
 
 const VIT_FLASH_ATTN_F16_D72: &str = "hf2q_vit_flash_attn_f16_d72";
 
@@ -87,88 +98,168 @@ pub(crate) static VIT_F32_ATTENTION_ACTIVE: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or(false)
 });
 
-/// GPU dense linear projection `y = x @ W.T`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VisionMatrixContract {
+    codec: GgmlType,
+    rows: Option<usize>,
+    cols: Option<usize>,
+    exact_native: bool,
+}
+
+pub(crate) trait VisionMatrixWeight {
+    fn vision_buffer(&self) -> &MlxBuffer;
+    fn vision_contract(&self) -> Result<VisionMatrixContract>;
+}
+
+impl VisionMatrixWeight for MlxQWeight {
+    fn vision_buffer(&self) -> &MlxBuffer {
+        &self.buffer
+    }
+
+    fn vision_contract(&self) -> Result<VisionMatrixContract> {
+        Ok(VisionMatrixContract {
+            codec: self.info.ggml_dtype,
+            rows: Some(self.info.rows),
+            cols: Some(self.info.cols),
+            exact_native: self.affine.is_none(),
+        })
+    }
+}
+
+/// Scalar-only compatibility for existing synthetic unit fixtures. Production
+/// call sites cannot pass an untyped buffer because this implementation is
+/// absent from non-test builds.
+#[cfg(test)]
+impl VisionMatrixWeight for MlxBuffer {
+    fn vision_buffer(&self) -> &MlxBuffer {
+        self
+    }
+
+    fn vision_contract(&self) -> Result<VisionMatrixContract> {
+        let codec = match self.dtype() {
+            DType::F32 => GgmlType::F32,
+            DType::F16 => GgmlType::F16,
+            DType::BF16 => GgmlType::BF16,
+            other => {
+                return Err(anyhow!(
+                    "synthetic vision matrix dtype {other:?} is ambiguous without GGML codec metadata"
+                ));
+            }
+        };
+        Ok(VisionMatrixContract {
+            codec,
+            rows: None,
+            cols: None,
+            exact_native: true,
+        })
+    }
+}
+
+/// GPU native stored-format linear projection `y = x @ W.T`.
 ///
-/// Dtype contract:
-///   - `input`  is F32 `[seq_len, in_features]` row-major on device.
-///   - `weight` is F16, BF16, or F32 `[out_features, in_features]`
-///     row-major on device. The dispatch branches on the buffer's
-///     dtype (W59 ADR-005 Phase 2c iter-128):
-///       * `DType::F16` → `dense_matmul_f16_f32_tensor` (mlx-native
-///         0.4.8). Native peer-precision path: stages BOTH A (weight)
-///         and B (activation) as `half` in shmem and runs
-///         `simdgroup_half8x8` MMA with float4x4 accumulator. 10-bit
-///         mantissa per element, matches the peer's
-///         f16×f32 matmul kernel. Used for every Gemma 4 ViT weight
-///         (all are F16 in GGUF storage).
-///       * `DType::BF16` → `dense_matmul_bf16_f32_tensor`. 7-bit
-///         mantissa per element; legacy path retained for tensor types
-///         that the loader pre-casts to BF16.
-///       * `DType::F32` → cast F32→BF16 at dispatch, then BF16 matmul.
-///         Legacy path for F32-stored weights or for production fallback
-///         where the loader has not (yet) preserved the GGUF native
-///         dtype. Same arithmetic as the pre-iter-128 path.
-///   - Returned buffer is F32 `[seq_len, out_features]` row-major.
-///
-/// The dispatch is determined by the weight's MlxBuffer dtype — natural,
-/// deterministic, no env-gated fallback. F16-stored mmproj weights flow
-/// through the F16 kernel automatically once `LoadedMmprojWeights::load`
-/// preserves their native dtype (also iter-128).
-///
-/// Constraint: `in_features >= 32` (tensor-core tile requires one
-/// NK=32 slice).
-///
-/// # Errors
-///
-/// Any mlx-native dispatch error, the `in_features < 32` check, or
-/// an unsupported weight dtype (only F16/BF16/F32 accepted).
-pub fn vit_linear_gpu(
+/// The input and output are exact F32 `[M,K]` / `[M,N]` buffers. Matrix
+/// ownership supplies the exact logical `[N,K]` and stored codec. Scalar
+/// codecs dispatch without conversion; Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K
+/// dispatch through mlx-native's physical-M-aware GGML route on the original
+/// GGUF bytes.
+pub(crate) fn vit_linear_gpu<W: VisionMatrixWeight + ?Sized>(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input: &MlxBuffer,
-    weight: &MlxBuffer,
+    weight: &W,
     seq_len: u32,
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
-    if in_features < 32 {
-        return Err(anyhow!(
-            "vit_linear_gpu: in_features ({}) must be >= 32",
-            in_features
-        ));
+    anyhow::ensure!(
+        seq_len > 0 && in_features > 0 && out_features > 0,
+        "vit_linear_gpu: seq_len ({seq_len}), in_features ({in_features}), and out_features ({out_features}) must be > 0"
+    );
+    anyhow::ensure!(
+        in_features >= 32,
+        "vit_linear_gpu: in_features ({in_features}) must be >= 32"
+    );
+    let contract = weight.vision_contract()?;
+    anyhow::ensure!(
+        contract.exact_native,
+        "vit_linear_gpu requires exact stored-format ownership without affine or dense-shadow state"
+    );
+    if let Some(rows) = contract.rows {
+        anyhow::ensure!(
+            rows == out_features as usize,
+            "vit_linear_gpu matrix rows {rows} != out_features {out_features}"
+        );
     }
-    if seq_len == 0 || out_features == 0 {
-        return Err(anyhow!(
-            "vit_linear_gpu: seq_len ({}) and out_features ({}) must be > 0",
-            seq_len,
-            out_features
-        ));
+    if let Some(cols) = contract.cols {
+        anyhow::ensure!(
+            cols == in_features as usize,
+            "vit_linear_gpu matrix cols {cols} != in_features {in_features}"
+        );
     }
 
-    let metal_dev = device.metal_device();
+    let weight = weight.vision_buffer();
+    let expected_weight_bytes =
+        native_gguf_matrix_bytes(contract.codec, out_features as usize, in_features as usize)?;
+    let expected_weight_dtype = match contract.codec {
+        GgmlType::F32 => DType::F32,
+        GgmlType::F16 => DType::F16,
+        GgmlType::BF16 => DType::BF16,
+        GgmlType::Q4_0
+        | GgmlType::Q5_0
+        | GgmlType::Q8_0
+        | GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q6_K => DType::U8,
+        other => return Err(anyhow!("vision matrix codec {other:?} is not admitted")),
+    };
+    anyhow::ensure!(
+        weight.dtype() == expected_weight_dtype && weight.data_byte_len() == expected_weight_bytes,
+        "vit_linear_gpu {:?} weight mismatch: dtype={:?}, logical_bytes={}, expected {:?}/{}",
+        contract.codec,
+        weight.dtype(),
+        weight.data_byte_len(),
+        expected_weight_dtype,
+        expected_weight_bytes
+    );
+    let expected_input_bytes = (seq_len as usize)
+        .checked_mul(in_features as usize)
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| anyhow!("vit_linear_gpu input byte extent overflow"))?;
+    anyhow::ensure!(
+        input.dtype() == DType::F32 && input.data_byte_len() == expected_input_bytes,
+        "vit_linear_gpu input must be exact F32 [{seq_len}, {in_features}], got {:?}/{} bytes",
+        input.dtype(),
+        input.data_byte_len()
+    );
 
-    // --- Allocate F32 output ---
-    let out_bytes = (seq_len as usize) * (out_features as usize) * 4;
+    let out_bytes = (seq_len as usize)
+        .checked_mul(out_features as usize)
+        .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+        .ok_or_else(|| anyhow!("vit_linear_gpu output byte extent overflow"))?;
     let mut dst = device
         .alloc_buffer(
             out_bytes,
             DType::F32,
             vec![seq_len as usize, out_features as usize],
         )
-        .map_err(|e| anyhow!("alloc output: {e}"))?;
+        .map_err(|e| anyhow!("vit_linear_gpu output allocation: {e}"))?;
 
-    // --- Dispatch dense matmul, branching on the weight's storage dtype.
-    // Layout for all branches:
-    //   src0 = weight [1, N=out, K=in] in the storage dtype
-    //   src1 = input  [1, M=seq, K=in] F32
-    //   dst  = output [1, M=seq, N=out] F32
-    match weight.dtype() {
-        DType::F16 => {
-            // Peer-precision path (W59 iter-128). The kernel reads the
-            // F16 weight directly — no F32 round-trip and no F16→BF16
-            // narrowing. Per-element rounding budget matches the peer's
-            // f16×f32 matmul kernel exactly.
+    match contract.codec {
+        GgmlType::F32 => {
+            let params = DenseMmF32F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            dense_matmul_f32_f32_tensor(
+                encoder, registry, device, weight, input, &mut dst, &params,
+            )
+            .context("vit_linear_gpu: dense_matmul_f32_f32_tensor")?;
+        }
+        GgmlType::F16 => {
             let params = DenseMmF16F32Params {
                 m: seq_len,
                 n: out_features,
@@ -181,9 +272,7 @@ pub fn vit_linear_gpu(
             )
             .context("vit_linear_gpu: dense_matmul_f16_f32_tensor")?;
         }
-        DType::BF16 => {
-            // Legacy BF16 path: weight is already BF16 in the buffer,
-            // dispatch directly. No cast needed.
+        GgmlType::BF16 => {
             let params = DenseMmBf16F32Params {
                 m: seq_len,
                 n: out_features,
@@ -194,66 +283,166 @@ pub fn vit_linear_gpu(
             dense_matmul_bf16_f32_tensor(
                 encoder, registry, device, weight, input, &mut dst, &params,
             )
-            .context("vit_linear_gpu: dense_matmul_bf16_f32_tensor (BF16-native)")?;
+            .context("vit_linear_gpu: dense_matmul_bf16_f32_tensor")?;
         }
-        DType::F32 => {
-            // Legacy F32 path (pre-iter-128 behaviour, retained for
-            // F32-stored weights). Cast F32 → BF16 once, then dispatch
-            // the BF16 matmul. NOTE: this path costs the 8x rounding
-            // budget vs the F16 sibling above; it's acceptable here
-            // because F32-stored weights have already discarded
-            // higher-precision storage by the time they reach this
-            // dispatch (norms, embeddings, etc., are not consumed by
-            // vit_linear_gpu).
-            let n_w = (out_features as usize) * (in_features as usize);
-            let weight_bf16 = device
-                .alloc_buffer(
-                    n_w * 2,
-                    DType::BF16,
-                    vec![out_features as usize, in_features as usize],
-                )
-                .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
-            cast(
-                encoder,
-                registry,
-                metal_dev,
-                weight,
-                &weight_bf16,
-                n_w,
-                CastDirection::F32ToBF16,
-            )
-            .context("vit_linear_gpu: F32→BF16 cast (legacy F32 path)")?;
-            // mlx-native dispatches with Concurrent execution; the matmul
-            // below reads `weight_bf16` written by the cast above (RAW).
-            // An explicit barrier is required to guarantee the matmul
-            // observes the cast's writes.
-            encoder.memory_barrier();
-            let params = DenseMmBf16F32Params {
+        GgmlType::Q4_0
+        | GgmlType::Q5_0
+        | GgmlType::Q8_0
+        | GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q6_K => {
+            let params = GgmlQuantizedMatmulParams {
                 m: seq_len,
                 n: out_features,
                 k: in_features,
-                src0_batch: 1,
-                src1_batch: 1,
+                ggml_type: contract.codec,
             };
-            dense_matmul_bf16_f32_tensor(
-                encoder,
-                registry,
-                device,
-                &weight_bf16,
-                input,
-                &mut dst,
-                &params,
+            mlx_native::quantized_matmul_ggml(
+                encoder, registry, device, input, weight, &dst, &params,
             )
-            .context("vit_linear_gpu: dense_matmul_bf16_f32_tensor (F32→BF16 legacy path)")?;
+            .context("vit_linear_gpu: native GGML stored-format matmul")?;
         }
-        other => {
-            return Err(anyhow!(
-                "vit_linear_gpu: unsupported weight dtype {other:?} (expected F16/BF16/F32)"
-            ));
-        }
+        other => return Err(anyhow!("vision matrix codec {other:?} is not admitted")),
     }
 
     Ok(dst)
+}
+
+/// Native patch-convolution projection for three-channel planar F32 pixels.
+///
+/// Request pixels are uploaded and unfolded to `[M, 3*patch²]`; the loaded
+/// patch matrix stays in its exact mapped codec and is dispatched with the
+/// physical patch count `M`. Optional bias is exact F32 state.
+#[allow(clippy::too_many_arguments)]
+fn vit_patch_embed_native_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    pixel_values: &[f32],
+    weight: &MlxQWeight,
+    bias: Option<&MlxBuffer>,
+    pixel_h: u32,
+    pixel_w: u32,
+    patch_size: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    anyhow::ensure!(
+        pixel_h > 0
+            && pixel_w > 0
+            && patch_size > 0
+            && pixel_h % patch_size == 0
+            && pixel_w % patch_size == 0,
+        "vit_patch_embed_native_gpu requires a non-empty pixel grid divisible by patch_size"
+    );
+    let expected_pixels = 3usize
+        .checked_mul(pixel_h as usize)
+        .and_then(|elements| elements.checked_mul(pixel_w as usize))
+        .ok_or_else(|| anyhow!("vit_patch_embed_native_gpu pixel extent overflow"))?;
+    anyhow::ensure!(
+        pixel_values.len() == expected_pixels,
+        "vit_patch_embed_native_gpu pixels {} != expected {expected_pixels}",
+        pixel_values.len()
+    );
+    let patch_elements = 3usize
+        .checked_mul(patch_size as usize)
+        .and_then(|elements| elements.checked_mul(patch_size as usize))
+        .ok_or_else(|| anyhow!("vit_patch_embed_native_gpu patch extent overflow"))?;
+    anyhow::ensure!(
+        weight.info.rows == hidden as usize && weight.info.cols == patch_elements,
+        "vit_patch_embed_native_gpu native weight shape [{}, {}] != [{hidden}, {patch_elements}]",
+        weight.info.rows,
+        weight.info.cols
+    );
+    if let Some(bias) = bias {
+        let expected_bias_bytes = (hidden as usize)
+            .checked_mul(DType::F32.size_of())
+            .ok_or_else(|| anyhow!("vit_patch_embed_native_gpu bias extent overflow"))?;
+        anyhow::ensure!(
+            bias.dtype() == DType::F32 && bias.data_byte_len() == expected_bias_bytes,
+            "vit_patch_embed_native_gpu bias must be exact F32 [{hidden}], got {:?}/{} bytes",
+            bias.dtype(),
+            bias.data_byte_len()
+        );
+    }
+
+    let n_patches = (pixel_h / patch_size)
+        .checked_mul(pixel_w / patch_size)
+        .ok_or_else(|| anyhow!("vit_patch_embed_native_gpu patch-count overflow"))?;
+    let mut pixels = device
+        .alloc_buffer(
+            expected_pixels
+                .checked_mul(DType::F32.size_of())
+                .ok_or_else(|| anyhow!("vit_patch_embed_native_gpu pixel bytes overflow"))?,
+            DType::F32,
+            vec![3, pixel_h as usize, pixel_w as usize],
+        )
+        .map_err(|e| anyhow!("vit_patch_embed_native_gpu pixels allocation: {e}"))?;
+    pixels
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("vit_patch_embed_native_gpu pixels view: {e}"))?
+        .copy_from_slice(pixel_values);
+
+    let im2col_elements = (n_patches as usize)
+        .checked_mul(patch_elements)
+        .ok_or_else(|| anyhow!("vit_patch_embed_native_gpu im2col extent overflow"))?;
+    let im2col = device
+        .alloc_buffer(
+            im2col_elements
+                .checked_mul(DType::F32.size_of())
+                .ok_or_else(|| anyhow!("vit_patch_embed_native_gpu im2col bytes overflow"))?,
+            DType::F32,
+            vec![n_patches as usize, patch_elements],
+        )
+        .map_err(|e| anyhow!("vit_patch_embed_native_gpu im2col allocation: {e}"))?;
+    dispatch_im2col_2d_3ch_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        &pixels,
+        &im2col,
+        pixel_h,
+        pixel_w,
+        patch_size,
+    )
+    .map_err(|e| anyhow!("vit_patch_embed_native_gpu im2col dispatch: {e}"))?;
+    encoder.memory_barrier();
+
+    let projected = vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &im2col,
+        weight,
+        n_patches,
+        patch_elements as u32,
+        hidden,
+    )?;
+    let Some(bias) = bias else {
+        return Ok(projected);
+    };
+    encoder.memory_barrier();
+    let biased = device
+        .alloc_buffer(
+            (n_patches as usize)
+                .checked_mul(hidden as usize)
+                .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
+                .ok_or_else(|| anyhow!("vit_patch_embed_native_gpu output extent overflow"))?,
+            DType::F32,
+            vec![n_patches as usize, hidden as usize],
+        )
+        .map_err(|e| anyhow!("vit_patch_embed_native_gpu biased allocation: {e}"))?;
+    dispatch_add_bias_row_2d_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        &projected,
+        bias,
+        &biased,
+        n_patches,
+        hidden,
+    )
+    .map_err(|e| anyhow!("vit_patch_embed_native_gpu bias dispatch: {e}"))?;
+    Ok(biased)
 }
 
 /// GPU RMSNorm with affine gain (single-parameter; no bias).
@@ -1367,10 +1556,9 @@ pub fn vit_silu_mul_gpu(
 /// Gemma4V `scale=1.0`, V-RMSNorm, 2D RoPE — all currently skipped
 /// pending mlx-lm reference).
 ///
-/// Input/output: F32 `[batch, hidden]` buffers on device. Tensors
-/// looked up via `weights.block_tensor(block_idx, suffix)` and
-/// uploaded to a fresh device (caller's `LoadedMmprojWeights` already
-/// has them on the device matching `executor`).
+/// Input/output: F32 `[batch, hidden]` buffers on device. Matrix tensors
+/// are resolved through the native stored-format role while normalization
+/// state is resolved through the exact F32-state role.
 ///
 /// Pipeline (each step separated by `encoder.memory_barrier()`):
 ///   1. cur = rms_norm_gpu(input, ln1)
@@ -1420,10 +1608,14 @@ pub fn apply_vit_block_forward_gpu(
     let eps = cfg.layer_norm_eps;
     let n_hidden = (batch as usize) * (hidden as usize);
 
-    // Helper to fetch a block-local tensor f32 buffer.
-    let block = |suffix: &str| -> Result<&MlxBuffer> {
+    let block_matrix = |suffix: &str| -> Result<&MlxQWeight> {
         weights
-            .block_tensor(block_idx, suffix)
+            .block_matrix(block_idx, suffix)
+            .map_err(|e| anyhow!("block {} {}: {e}", block_idx, suffix))
+    };
+    let block_state = |suffix: &str| -> Result<&MlxBuffer> {
+        weights
+            .block_f32_state(block_idx, suffix)
             .map_err(|e| anyhow!("block {} {}: {e}", block_idx, suffix))
     };
 
@@ -1433,7 +1625,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         input,
-        block("ln1.weight")?,
+        block_state("ln1.weight")?,
         batch,
         hidden,
         eps,
@@ -1445,7 +1637,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &cur,
-        block("attn_q.weight")?,
+        block_matrix("attn_q.weight")?,
         batch,
         hidden,
         hidden,
@@ -1456,7 +1648,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &cur,
-        block("attn_k.weight")?,
+        block_matrix("attn_k.weight")?,
         batch,
         hidden,
         hidden,
@@ -1467,7 +1659,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &cur,
-        block("attn_v.weight")?,
+        block_matrix("attn_v.weight")?,
         batch,
         hidden,
         hidden,
@@ -1479,7 +1671,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &q,
-        block("attn_q_norm.weight")?,
+        block_state("attn_q_norm.weight")?,
         batch,
         num_heads,
         head_dim,
@@ -1491,7 +1683,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &k,
-        block("attn_k_norm.weight")?,
+        block_state("attn_k_norm.weight")?,
         batch,
         num_heads,
         head_dim,
@@ -1511,7 +1703,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &attn,
-        block("attn_output.weight")?,
+        block_matrix("attn_output.weight")?,
         batch,
         hidden,
         hidden,
@@ -1534,7 +1726,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &post_attn,
-        block("ln2.weight")?,
+        block_state("ln2.weight")?,
         batch,
         hidden,
         eps,
@@ -1546,7 +1738,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &pre_ffn,
-        block("ffn_gate.weight")?,
+        block_matrix("ffn_gate.weight")?,
         batch,
         hidden,
         intermediate,
@@ -1557,7 +1749,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &pre_ffn,
-        block("ffn_up.weight")?,
+        block_matrix("ffn_up.weight")?,
         batch,
         hidden,
         intermediate,
@@ -1579,7 +1771,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &activated,
-        block("ffn_down.weight")?,
+        block_matrix("ffn_down.weight")?,
         batch,
         intermediate,
         hidden,
@@ -1591,7 +1783,7 @@ pub fn apply_vit_block_forward_gpu(
         registry,
         device,
         &down,
-        block("post_ffw_norm.weight")?,
+        block_state("post_ffw_norm.weight")?,
         batch,
         hidden,
         eps,
@@ -1945,6 +2137,8 @@ fn pod_as_bytes<T: Copy>(p: &T) -> &[u8] {
 /// Idempotent — `register_source` overwrites any previous registration
 /// for the same name. Caller invokes once per `KernelRegistry`.
 pub fn register_vit_custom_shaders(registry: &mut KernelRegistry) {
+    register_im2col_2d_3ch(registry);
+    register_add_bias_row_2d(registry);
     registry.register_source("vit_avg_pool_2x2_f32", VIT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("vit_avg_pool_kxk_f32", VIT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("vit_std_bias_scale_f32", VIT_CUSTOM_SHADERS_SOURCE);
@@ -2378,10 +2572,8 @@ pub fn apply_vit_blocks_loop_gpu(
 /// Full GPU ViT forward: pixel tensor → projected multimodal embeddings.
 ///
 /// Pipeline (matches the peer's gemma4v graph):
-///   1. CPU `patch_embed_from_mmproj_weights(pixels, weights, cfg)` →
-///      `[num_patches, hidden]` F32 (one-time per image; dominated by
-///      the 27-block GPU compute that follows).
-///   2. Upload to GPU as input to the blocks loop.
+///   1. GPU im2col of request pixels followed by native stored-format
+///      `v.patch_embd.weight` execution → `[num_patches, hidden]` F32.
 ///   3. `apply_vit_blocks_loop_gpu` × 27 blocks → `[num_patches, hidden]`.
 ///   4. `vit_avg_pool_2x2_gpu` → `[(num_patches/4), hidden]`. For Gemma 4:
 ///      `[14, 14, 1152] → [49, 1152]`.
@@ -2409,15 +2601,13 @@ pub fn apply_vit_blocks_loop_gpu(
 /// # Errors
 ///
 /// Propagated from any sub-stage. The `weights` arg's per-tensor
-/// access (`weights.get`, `weights.mm_0_weight`) returns errors for
+/// access (`weights.f32_state`, `weights.mm_0_matrix`) returns errors for
 /// missing tensors.
 ///
 /// # Cost
 ///
-/// Gemma 4 ViT (27 blocks, [14×14, 1152] → [49, 2816]): ~57 ms for
-/// the 27-block compute on M5 Max + a few ms for the post-blocks
-/// pipeline. Total well under 100 ms. CPU patch_embed at the start
-/// is ~5–15 ms for a 224×224 image. End-to-end < 150 ms per image.
+/// Family-level image-forward gates own timing claims. This function performs
+/// no request-time matrix conversion or CPU projection.
 pub fn apply_vit_full_forward_gpu(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -2427,59 +2617,29 @@ pub fn apply_vit_full_forward_gpu(
     pixel_values: &[f32],
     scale: f32,
 ) -> Result<MlxBuffer> {
-    use super::vit::patch_embed_forward as patch_embed_cpu;
-
     let hidden = cfg.hidden_size;
     let num_patches_side = cfg.num_patches_side;
     let n_patches = (num_patches_side as u32) * (num_patches_side as u32);
 
-    // --- Stage 1: CPU patch_embed ---
-    // W59 ADR-005 Phase 2c iter-128: patch_embd is F16 in GGUF storage
-    // for gemma4v mmprojs (and legacy F32 for some SigLIP-49 producers);
-    // `LoadedMmprojWeights::tensor_as_f32_owned` widens F16→F32 once
-    // for the CPU patch_embed reference. The cost is one ~3.5 MB
-    // alloc + per-element widen per image — negligible vs the 5–15 ms
-    // CPU patch_embed dominating this stage. The gemma4v-native
-    // production path uses `gemma4v_patch_embed_gpu` (a `vit_linear_gpu`
-    // wrapper) which dispatches the F16 tensor-core kernel directly
-    // without any CPU detour.
-    let patch_embd_buf = weights
-        .patch_embd_weight()
+    // --- Stage 1: native stored-format patch embedding ---
+    let patch_embd = weights
+        .patch_embd_matrix()
         .map_err(|e| anyhow!("apply_vit_full_forward_gpu: {e}"))?;
-    let patch_embd_f32_owned = weights
-        .tensor_as_f32_owned(patch_embd_buf)
-        .context("apply_vit_full_forward_gpu: patch_embd → f32 widen")?;
-    let patch_bias_f32_owned: Option<Vec<f32>> = weights
-        .get("v.patch_embd.bias")
-        .and_then(|b| weights.tensor_as_f32_owned(b).ok());
-    let patch_embeds_cpu = patch_embed_cpu(
+    let patch_bias = weights.f32_state("v.patch_embd.bias").ok();
+    let input_gpu = vit_patch_embed_native_gpu(
+        encoder,
+        registry,
+        device,
         pixel_values,
-        &patch_embd_f32_owned,
-        patch_bias_f32_owned.as_deref(),
+        patch_embd,
+        patch_bias,
+        cfg.image_size,
         cfg.image_size,
         cfg.patch_size,
         hidden,
     )
-    .context("apply_vit_full_forward_gpu: cpu patch_embed")?;
-
-    // --- Stage 2: Upload to GPU ---
-    let n_hidden = (n_patches as usize) * (hidden as usize);
-    let input_gpu = device
-        .alloc_buffer(
-            n_hidden * 4,
-            DType::F32,
-            vec![n_patches as usize, hidden as usize],
-        )
-        .map_err(|e| anyhow!("alloc input_gpu: {e}"))?;
-    {
-        // SAFETY: just-allocated f32 buffer; copy-in is single-threaded
-        // and Apple unified memory makes this byte-equivalent to a CPU
-        // memcpy that's later read by the GPU.
-        let dst: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(input_gpu.contents_ptr() as *mut f32, n_hidden)
-        };
-        dst.copy_from_slice(&patch_embeds_cpu);
-    }
+    .context("apply_vit_full_forward_gpu: native patch embed")?;
+    encoder.memory_barrier();
 
     // --- Stage 3: 27-block transformer loop ---
     let after_blocks = apply_vit_blocks_loop_gpu(
@@ -2512,12 +2672,8 @@ pub fn apply_vit_full_forward_gpu(
     encoder.memory_barrier();
 
     // --- Stage 6: std_bias / std_scale normalization ---
-    let std_bias = weights
-        .get("v.std_bias")
-        .ok_or_else(|| anyhow!("apply_vit_full_forward_gpu: missing v.std_bias"))?;
-    let std_scale = weights
-        .get("v.std_scale")
-        .ok_or_else(|| anyhow!("apply_vit_full_forward_gpu: missing v.std_scale"))?;
+    let std_bias = weights.f32_state("v.std_bias")?;
+    let std_scale = weights.f32_state("v.std_scale")?;
     let normed = vit_std_bias_scale_gpu(
         encoder,
         registry,
@@ -2531,17 +2687,17 @@ pub fn apply_vit_full_forward_gpu(
     encoder.memory_barrier();
 
     // --- Stage 7: mm.0 projector ---
-    // W59 iter-128: derive `text_hidden` from `element_count()` not
-    // from `as_slice::<f32>()`, since mm.0.weight may now be F16 in
-    // the buffer (gemma4v's `mm.input_projection.weight` is F16; the
-    // legacy SigLIP `mm.0.weight` is F32). Both report the same
-    // `element_count()`, so the dimension math is dtype-agnostic.
-    // The matmul itself flows through `vit_linear_gpu` which branches
-    // on the buffer dtype.
+    // Logical matrix metadata remains valid for packed codecs; raw buffer
+    // element counts do not.
     let mm0 = weights
-        .mm_0_weight()
+        .mm_0_matrix()
         .map_err(|e| anyhow!("apply_vit_full_forward_gpu: mm.0.weight: {e}"))?;
-    let text_hidden = (mm0.element_count() / (hidden as usize)) as u32;
+    anyhow::ensure!(
+        mm0.info.cols == hidden as usize,
+        "apply_vit_full_forward_gpu: mm.0 K {} != hidden {hidden}",
+        mm0.info.cols
+    );
+    let text_hidden = mm0.info.rows as u32;
     let projected = vit_linear_gpu(
         encoder,
         registry,
@@ -2625,7 +2781,7 @@ pub fn warmup_vit_gpu(
         .filter(|value| *value > 0)
         .ok_or_else(|| anyhow!("warmup_vit_gpu attention shape is invalid"))?;
     let input = match arch {
-        super::mmproj::ArchProfile::Qwen3VlSiglip => {
+        super::mmproj::ArchProfile::QwenVisionSiglip => {
             let merge = cfg.spatial_merge_size.ok_or_else(|| {
                 anyhow!("warmup_vit_gpu Qwen vision config is missing spatial_merge_size")
             })?;
@@ -2774,15 +2930,16 @@ pub fn compute_vision_embeddings_gpu(
         // Read back to CPU. Shape is [(N_side/2)², text_hidden].
         let n_patches_out =
             ((mmproj_cfg.num_patches_side / 2) * (mmproj_cfg.num_patches_side / 2)) as usize;
-        // W59 iter-128: `element_count()` is dtype-agnostic; mm.0
-        // may be F32 (SigLIP-49 producers) or F16 (gemma4v's
-        // mm.input_projection — though that path uses the gemma4v
-        // sibling `compute_vision_embeddings_gpu_gemma4v`, not this
-        // SigLIP-49 entry point).
         let mm0 = mmproj_weights
-            .mm_0_weight()
+            .mm_0_matrix()
             .map_err(|e| anyhow!("mm.0: {e}"))?;
-        let text_hidden = mm0.element_count() / (mmproj_cfg.hidden_size as usize);
+        anyhow::ensure!(
+            mm0.info.cols == mmproj_cfg.hidden_size as usize,
+            "compute_vision_embeddings_gpu: mm.0 K {} != hidden {}",
+            mm0.info.cols,
+            mmproj_cfg.hidden_size
+        );
+        let text_hidden = mm0.info.rows;
         let total = n_patches_out * text_hidden;
         let slice: &[f32] = buf
             .as_slice::<f32>()
@@ -2960,16 +3117,16 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
         }
 
         let pooled_n = ((img.n_x / 3) as usize) * ((img.n_y / 3) as usize);
-        // W59 iter-128: dtype-agnostic shape inference. gemma4v's
-        // `mm.input_projection.weight` is F16; pre-iter-128 the loader
-        // dequantized it to F32. Iter-128 keeps it native — the matmul
-        // dispatch at the gemma4v block path branches on the buffer's
-        // dtype, but for a length-only derivation `element_count()`
-        // works identically for F16 and F32.
         let mm0 = mmproj_weights
-            .mm_0_weight()
+            .mm_0_matrix()
             .map_err(|e| anyhow!("mm.0: {e}"))?;
-        let text_hidden = mm0.element_count() / (mmproj_cfg.hidden_size as usize);
+        anyhow::ensure!(
+            mm0.info.cols == mmproj_cfg.hidden_size as usize,
+            "compute_vision_embeddings_gpu_gemma4v: mm.0 K {} != hidden {}",
+            mm0.info.cols,
+            mmproj_cfg.hidden_size
+        );
+        let text_hidden = mm0.info.rows;
         let total = pooled_n * text_hidden;
         let slice: &[f32] = buf
             .as_slice::<f32>()
@@ -3054,16 +3211,16 @@ pub fn compute_vision_embeddings_gpu_dispatch(
             // produces a square fixed-resolution `Siglip49(_)` payload
             // (Risk R4 in Worker W's plan §F: "ship fixed-resolution;
             // dynamic resolution is Phase 2"). The dispatch step below
-            // partitions Qwen3VlSiglip+Siglip49 inputs and delegates to
-            // `vit_gpu_qwen3vl::compute_vision_embeddings_gpu_qwen3vl`,
+            // partitions QwenVisionSiglip+Siglip49 inputs and delegates to
+            // `vit_gpu_qwen::compute_vision_embeddings_gpu_qwen`,
             // which currently returns the 4c.1 scaffold Err. The defense
             // here mirrors the (ClipClassic, Gemma4v) preprocessing-
             // mismatch arm above.
-            (super::mmproj::ArchProfile::Qwen3VlSiglip, VisionInput::Siglip49(_)) => {}
-            (super::mmproj::ArchProfile::Qwen3VlSiglip, VisionInput::Gemma4v(_)) => {
+            (super::mmproj::ArchProfile::QwenVisionSiglip, VisionInput::Siglip49(_)) => {}
+            (super::mmproj::ArchProfile::QwenVisionSiglip, VisionInput::Gemma4v(_)) => {
                 return Err(anyhow!(
                     "compute_vision_embeddings_gpu_dispatch: input {idx} is Gemma4v \
-                     but arch is Qwen3VlSiglip — preprocessing/arch mismatch (Qwen3-VL \
+                     but arch is QwenVisionSiglip — preprocessing/arch mismatch (Qwen3-VL \
                      uses square-fixed-resolution Siglip49 preprocessing in Phase 1)"
                 ));
             }
@@ -3091,15 +3248,15 @@ pub fn compute_vision_embeddings_gpu_dispatch(
     }
 
     let mut out: Vec<Option<Vec<f32>>> = (0..inputs.len()).map(|_| None).collect();
-    // iter-224 Wedge-4c.5 LANDED: Qwen3VlSiglip routes through
-    // `compute_vision_embeddings_gpu_qwen3vl` for the full ViT
+    // iter-224 Wedge-4c.5 LANDED: QwenVisionSiglip routes through
+    // `compute_vision_embeddings_gpu_qwen` for the full ViT
     // forward (CPU prelude + per-block transformer + DeepStack heads
     // + main projector + augmented embed concat). The validator
     // accepts the file at `serve --mmproj` startup; this branch is
     // the production path for any image-bearing chat that survives
     // the Wedge-4d preprocess gate at handlers.rs (text-only chat
     // doesn't enter dispatch at all).
-    if matches!(arch, super::mmproj::ArchProfile::Qwen3VlSiglip) {
+    if matches!(arch, super::mmproj::ArchProfile::QwenVisionSiglip) {
         // Sub-iter 4c.2 closure: `num_position_embeddings` is sourced
         // from the loaded `v.position_embd.weight` tensor's outer
         // (count) axis. ggml stores the table as
@@ -3114,17 +3271,17 @@ pub fn compute_vision_embeddings_gpu_dispatch(
             .position_embd_weight()
             .map_err(|e| {
                 anyhow!(
-                    "compute_vision_embeddings_gpu_dispatch (Qwen3VlSiglip): \
+                    "compute_vision_embeddings_gpu_dispatch (QwenVisionSiglip): \
                      v.position_embd.weight required for shape extraction: {e}"
                 )
             })?
             .shape()[0] as u32;
-        let cfg = super::vit_gpu_qwen3vl::Qwen3VlViTConfig::from_mmproj(
+        let cfg = super::vit_gpu_qwen::QwenVisionViTConfig::from_mmproj(
             mmproj_cfg,
             num_position_embeddings,
         )?;
         for (index, input) in inputs.iter().enumerate() {
-            let mut projected = super::vit_gpu_qwen3vl::compute_vision_embeddings_gpu_qwen3vl(
+            let mut projected = super::vit_gpu_qwen::compute_vision_embeddings_gpu_qwen(
                 std::slice::from_ref(input),
                 mmproj_weights,
                 &cfg,
@@ -3141,7 +3298,7 @@ pub fn compute_vision_embeddings_gpu_dispatch(
             );
             out[index] = Some(embedding);
         }
-        // Skip the gemma/siglip dispatch entirely — Qwen3VlSiglip arch
+        // Skip the gemma/siglip dispatch entirely — QwenVisionSiglip arch
         // implies all inputs are Qwen3-VL Siglip49 (validated above).
         return out
             .into_iter()
@@ -3212,12 +3369,12 @@ pub fn compute_vision_embeddings_gpu_dispatch(
 /// # Errors
 ///
 /// Propagated from `vit_linear_gpu`.
-pub fn gemma4v_patch_embed_gpu(
+pub(crate) fn gemma4v_patch_embed_gpu<W: VisionMatrixWeight + ?Sized>(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     patches: &MlxBuffer,
-    weight: &MlxBuffer,
+    weight: &W,
     n_patches: u32,
     inner: u32,
     hidden: u32,
@@ -3808,9 +3965,14 @@ pub fn gemma4v_block_forward_gpu(
         ));
     }
 
-    let block = |suffix: &str| -> Result<&MlxBuffer> {
+    let block_matrix = |suffix: &str| -> Result<&MlxQWeight> {
         weights
-            .block_tensor(block_idx, suffix)
+            .block_matrix(block_idx, suffix)
+            .map_err(|e| anyhow!("block {} {}: {e}", block_idx, suffix))
+    };
+    let block_state = |suffix: &str| -> Result<&MlxBuffer> {
+        weights
+            .block_f32_state(block_idx, suffix)
             .map_err(|e| anyhow!("block {} {}: {e}", block_idx, suffix))
     };
     let n_hidden = batch
@@ -3864,7 +4026,7 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         input,
-        block("ln1.weight")?,
+        block_state("ln1.weight")?,
         batch,
         hidden,
         eps,
@@ -3882,7 +4044,7 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &cur,
-        block("attn_q.weight")?,
+        block_matrix("attn_q.weight")?,
         batch,
         hidden,
         q_dim,
@@ -3892,7 +4054,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("attn_q_proj"), &q);
         super::vit_dump::record_audit(
             &intra_name("attn_q_weight_storage"),
-            block("attn_q.weight")?,
+            &block_matrix("attn_q.weight")?.buffer,
         );
     }
     let k = vit_linear_gpu(
@@ -3900,7 +4062,7 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &cur,
-        block("attn_k.weight")?,
+        block_matrix("attn_k.weight")?,
         batch,
         hidden,
         kv_dim,
@@ -3910,7 +4072,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("attn_k_proj"), &k);
         super::vit_dump::record_audit(
             &intra_name("attn_k_weight_storage"),
-            block("attn_k.weight")?,
+            &block_matrix("attn_k.weight")?.buffer,
         );
     }
     let v = vit_linear_gpu(
@@ -3918,7 +4080,7 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &cur,
-        block("attn_v.weight")?,
+        block_matrix("attn_v.weight")?,
         batch,
         hidden,
         kv_dim,
@@ -3928,7 +4090,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("attn_v_proj"), &v);
         super::vit_dump::record_audit(
             &intra_name("attn_v_weight_storage"),
-            block("attn_v.weight")?,
+            &block_matrix("attn_v.weight")?.buffer,
         );
     }
 
@@ -3937,7 +4099,7 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &q,
-        block("attn_q_norm.weight")?,
+        block_state("attn_q_norm.weight")?,
         batch,
         num_heads,
         head_dim,
@@ -3948,7 +4110,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("attn_q_normed"), &q);
         super::vit_dump::record_audit(
             &intra_name("attn_q_norm_weight_storage"),
-            block("attn_q_norm.weight")?,
+            block_state("attn_q_norm.weight")?,
         );
     }
     let k = vit_gemma_per_head_rms_norm_gpu(
@@ -3956,7 +4118,7 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &k,
-        block("attn_k_norm.weight")?,
+        block_state("attn_k_norm.weight")?,
         batch,
         num_kv_heads,
         head_dim,
@@ -3967,7 +4129,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("attn_k_normed"), &k);
         super::vit_dump::record_audit(
             &intra_name("attn_k_norm_weight_storage"),
-            block("attn_k_norm.weight")?,
+            block_state("attn_k_norm.weight")?,
         );
     }
     let v = vit_v_norm_no_scale_gpu(
@@ -4075,7 +4237,7 @@ pub fn gemma4v_block_forward_gpu(
         // writer rename). `block_tensor`'s legacy alias still
         // accepts `attn_output.weight`, but this site uses the
         // canonical name to match the writer's emit.
-        block("attn_out.weight")?,
+        block_matrix("attn_out.weight")?,
         batch,
         hidden,
         hidden,
@@ -4089,7 +4251,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("attn_out_proj"), &attn_proj);
         super::vit_dump::record_audit(
             &intra_name("attn_out_weight_storage"),
-            block("attn_out.weight")?,
+            &block_matrix("attn_out.weight")?.buffer,
         );
     }
 
@@ -4102,7 +4264,7 @@ pub fn gemma4v_block_forward_gpu(
         // NOT `ln2`. W36
         // iter-116f writer maps HF `post_attention_layernorm` →
         // `attn_post_norm.weight` per the peer's naming.
-        block("attn_post_norm.weight")?,
+        block_state("attn_post_norm.weight")?,
         batch,
         hidden,
         eps,
@@ -4116,7 +4278,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("attn_post_normed"), &attn_out);
         super::vit_dump::record_audit(
             &intra_name("attn_post_norm_weight_storage"),
-            block("attn_post_norm.weight")?,
+            block_state("attn_post_norm.weight")?,
         );
     }
 
@@ -4142,7 +4304,7 @@ pub fn gemma4v_block_forward_gpu(
         // NOT `ffn_norm`. W36 iter-116f writer
         // maps HF `pre_feedforward_layernorm` → `ln2.weight`
         // (`v.blk.{bid}.ln2` per the peer's naming).
-        block("ln2.weight")?,
+        block_state("ln2.weight")?,
         batch,
         hidden,
         eps,
@@ -4154,7 +4316,10 @@ pub fn gemma4v_block_forward_gpu(
     }
     if audit_intra {
         super::vit_dump::record_audit(&intra_name("ffn_inp_normed"), &cur);
-        super::vit_dump::record_audit(&intra_name("ln2_weight_storage"), block("ln2.weight")?);
+        super::vit_dump::record_audit(
+            &intra_name("ln2_weight_storage"),
+            block_state("ln2.weight")?,
+        );
     }
 
     let gate = vit_linear_gpu(
@@ -4162,7 +4327,7 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &cur,
-        block("ffn_gate.weight")?,
+        block_matrix("ffn_gate.weight")?,
         batch,
         hidden,
         intermediate,
@@ -4172,7 +4337,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("ffn_gate_proj"), &gate);
         super::vit_dump::record_audit(
             &intra_name("ffn_gate_weight_storage"),
-            block("ffn_gate.weight")?,
+            &block_matrix("ffn_gate.weight")?.buffer,
         );
     }
     let up = vit_linear_gpu(
@@ -4180,7 +4345,7 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &cur,
-        block("ffn_up.weight")?,
+        block_matrix("ffn_up.weight")?,
         batch,
         hidden,
         intermediate,
@@ -4190,7 +4355,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("ffn_up_proj"), &up);
         super::vit_dump::record_audit(
             &intra_name("ffn_up_weight_storage"),
-            block("ffn_up.weight")?,
+            &block_matrix("ffn_up.weight")?.buffer,
         );
     }
 
@@ -4228,7 +4393,7 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &activated,
-        block("ffn_down.weight")?,
+        block_matrix("ffn_down.weight")?,
         batch,
         intermediate,
         hidden,
@@ -4244,7 +4409,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("ffn_down_proj"), &down);
         super::vit_dump::record_audit(
             &intra_name("ffn_down_weight_storage"),
-            block("ffn_down.weight")?,
+            &block_matrix("ffn_down.weight")?.buffer,
         );
     }
 
@@ -4260,7 +4425,7 @@ pub fn gemma4v_block_forward_gpu(
         // naming. `block_tensor`'s legacy alias
         // still accepts `post_ffw_norm.weight`, but this site
         // uses the canonical name to match the writer's emit.
-        block("ffn_post_norm.weight")?,
+        block_state("ffn_post_norm.weight")?,
         batch,
         hidden,
         eps,
@@ -4274,7 +4439,7 @@ pub fn gemma4v_block_forward_gpu(
         super::vit_dump::record_audit(&intra_name("ffn_post_normed"), &down);
         super::vit_dump::record_audit(
             &intra_name("ffn_post_norm_weight_storage"),
-            block("ffn_post_norm.weight")?,
+            block_state("ffn_post_norm.weight")?,
         );
     }
 
@@ -4310,12 +4475,12 @@ pub fn gemma4v_block_forward_gpu(
 ///
 /// Propagated from `vit_clip_gpu` and `vit_linear_gpu`.
 #[allow(clippy::too_many_arguments)]
-pub fn gemma4v_clippable_linear_gpu(
+pub(crate) fn gemma4v_clippable_linear_gpu<W: VisionMatrixWeight + ?Sized>(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input: &MlxBuffer,
-    weight_f32: &MlxBuffer,
+    weight: &W,
     bounds: &super::vit::Gemma4ClippableLinearBounds,
     seq_len: u32,
     in_features: u32,
@@ -4345,7 +4510,7 @@ pub fn gemma4v_clippable_linear_gpu(
         registry,
         device,
         input_ref,
-        weight_f32,
+        weight,
         seq_len,
         in_features,
         out_features,
@@ -4590,7 +4755,7 @@ pub fn gemma4v_apply_full_forward_gpu(
 
     // --- Stage 2: patch-embed (Linear, no bias) ---
     let patch_w = weights
-        .patch_embd_weight()
+        .patch_embd_matrix()
         .map_err(|e| anyhow!("gemma4v_apply_full_forward_gpu: {e}"))?;
     let patch_embeds = gemma4v_patch_embed_gpu(
         encoder,
@@ -4638,9 +4803,9 @@ pub fn gemma4v_apply_full_forward_gpu(
     // the loaded `attn_k.weight` shape — its row count = num_kv_heads
     // * head_dim. This matches W24's per-block test approach.
     let attn_k0 = weights
-        .block_tensor(0, "attn_k.weight")
+        .block_matrix(0, "attn_k.weight")
         .map_err(|e| anyhow!("gemma4v_apply_full_forward_gpu: probe num_kv_heads: {e}"))?;
-    let attn_k0_rows = attn_k0.shape().first().copied().unwrap_or(0) as u32;
+    let attn_k0_rows = attn_k0.info.rows as u32;
     if attn_k0_rows == 0 || attn_k0_rows % head_dim != 0 {
         return Err(anyhow!(
             "gemma4v_apply_full_forward_gpu: cannot infer num_kv_heads from attn_k.weight \
@@ -4714,12 +4879,8 @@ pub fn gemma4v_apply_full_forward_gpu(
     super::vit_dump::record("31_pool_sqrt_scale", &pooled);
 
     // --- Stage 7: std_bias / std_scale normalize ---
-    let std_bias = weights
-        .get("v.std_bias")
-        .ok_or_else(|| anyhow!("gemma4v_apply_full_forward_gpu: missing v.std_bias"))?;
-    let std_scale = weights
-        .get("v.std_scale")
-        .ok_or_else(|| anyhow!("gemma4v_apply_full_forward_gpu: missing v.std_scale"))?;
+    let std_bias = weights.f32_state("v.std_bias")?;
+    let std_scale = weights.f32_state("v.std_scale")?;
     let normed = vit_std_bias_scale_gpu(
         encoder,
         registry,
@@ -4734,15 +4895,15 @@ pub fn gemma4v_apply_full_forward_gpu(
     super::vit_dump::record("32_std_bias_scale", &normed);
 
     // --- Stage 8: Gemma4ClippableLinear projection ---
-    // W59 iter-128: derive `text_hidden` from `element_count()` so the
-    // call site is dtype-agnostic. gemma4v stores
-    // `mm.input_projection.weight` as F16; the matmul dispatch in
-    // `vit_linear_gpu` (used inside `gemma4v_clippable_linear_gpu`)
-    // branches on the buffer's dtype.
     let mm0 = weights
-        .mm_0_weight()
+        .mm_0_matrix()
         .map_err(|e| anyhow!("gemma4v_apply_full_forward_gpu: mm.0.weight: {e}"))?;
-    let text_hidden = (mm0.element_count() / (hidden as usize)) as u32;
+    anyhow::ensure!(
+        mm0.info.cols == hidden as usize,
+        "gemma4v_apply_full_forward_gpu: mm.0 K {} != hidden {hidden}",
+        mm0.info.cols
+    );
+    let text_hidden = mm0.info.rows as u32;
     if text_hidden == 0 {
         return Err(anyhow!(
             "gemma4v_apply_full_forward_gpu: text_hidden derived from mm.0.weight is 0"
@@ -4846,7 +5007,7 @@ mod tests {
         // Small shape parity. seq=4, in=64 (≥32 required), out=32.
         // Use deterministic synthetic input + deterministic synthetic
         // weight; compare GPU output to CPU linear_forward within 1e-3
-        // (bf16 weight round-trip tolerance).
+        // (normal floating-point reduction-order tolerance).
         let seq = 4usize;
         let in_features = 64usize;
         let out_features = 32usize;
@@ -4897,7 +5058,6 @@ mod tests {
 
         let got = readback_f32(&out_buf, seq * out_features);
 
-        // BF16 weight round-trip: ≤ 1e-3 per element vs F32 reference.
         for (i, (g, e)) in got.iter().zip(expected_cpu.iter()).enumerate() {
             let diff = (g - e).abs();
             assert!(
@@ -4913,6 +5073,141 @@ mod tests {
             .map(|(g, e)| (g - e).abs())
             .fold(0f32, f32::max);
         assert!(max_diff < 1e-2, "overall max_diff = {max_diff}");
+    }
+
+    #[test]
+    fn vit_linear_admitted_codec_zero_smoke_at_prompt_widths_and_odd_n() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+
+        for (codec, k, dtype) in [
+            (GgmlType::F32, 32usize, DType::F32),
+            (GgmlType::F16, 32, DType::F16),
+            (GgmlType::BF16, 32, DType::BF16),
+            (GgmlType::Q4_0, 32, DType::U8),
+            (GgmlType::Q5_0, 32, DType::U8),
+            (GgmlType::Q8_0, 32, DType::U8),
+            (GgmlType::Q4_K, 256, DType::U8),
+            (GgmlType::Q5_K, 256, DType::U8),
+            (GgmlType::Q6_K, 256, DType::U8),
+        ] {
+            for m in [9usize, 33] {
+                let n = 7usize;
+                let input_values: Vec<f32> = (0..m * k)
+                    .map(|index| ((index as f32 + 0.5) * 0.017).sin())
+                    .collect();
+                let input = upload_f32(executor.device(), &input_values, vec![m, k]);
+                let weight_bytes = native_gguf_matrix_bytes(codec, n, k)
+                    .unwrap_or_else(|error| panic!("{codec:?} bytes: {error}"));
+                let weight = executor
+                    .device()
+                    .alloc_buffer(weight_bytes, dtype, vec![weight_bytes / dtype.size_of()])
+                    .unwrap_or_else(|error| panic!("{codec:?} allocation: {error}"));
+                // SAFETY: the buffer is newly allocated and exclusively owned here.
+                unsafe {
+                    std::ptr::write_bytes(weight.contents_ptr() as *mut u8, 0, weight_bytes);
+                }
+                let weight = MlxQWeight::from_test_buffer(weight, codec, n, k);
+
+                let mut session = executor.begin().expect("begin");
+                let mut registry = KernelRegistry::new();
+                let device_ref: *const MlxDevice = executor.device() as *const _;
+                // SAFETY: executor outlives the session and loop body.
+                let device: &MlxDevice = unsafe { &*device_ref };
+                let output = vit_linear_gpu(
+                    session.encoder_mut(),
+                    &mut registry,
+                    device,
+                    &input,
+                    &weight,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                )
+                .unwrap_or_else(|error| panic!("{codec:?} M={m}: {error}"));
+                session
+                    .finish()
+                    .unwrap_or_else(|error| panic!("{codec:?} M={m} finish: {error}"));
+                let values = readback_f32(&output, m * n);
+                assert!(
+                    values
+                        .iter()
+                        .all(|value| value.is_finite() && *value == 0.0),
+                    "{codec:?} M={m} zero native matrix must fully overwrite output: {values:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vit_linear_q5_0_matches_nonzero_oracle_at_all_short_physical_widths() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let (n, k) = (7usize, 32usize);
+        let source_weight = (0..n * k)
+            .map(|index| ((index * 29 % 97) as f32 - 48.0) / 53.0)
+            .collect::<Vec<_>>();
+        let packed = crate::quantize::ggml_quants::q5_0::quantize(&source_weight, k, None);
+        let mut dequantized = vec![0.0_f32; source_weight.len()];
+        mlx_native::gguf::test_only_dequantize(&packed, GgmlType::Q5_0, &mut dequantized)
+            .expect("dequantize vision Q5_0 oracle");
+        let mut weight_buffer = executor
+            .device()
+            .alloc_buffer(packed.len(), DType::U8, vec![packed.len()])
+            .expect("allocate vision Q5_0 weight");
+        weight_buffer
+            .as_mut_slice::<u8>()
+            .expect("map vision Q5_0 weight")
+            .copy_from_slice(&packed);
+        let weight = MlxQWeight::from_test_buffer(weight_buffer, GgmlType::Q5_0, n, k);
+
+        for m in [1usize, 2, 4, 8, 16] {
+            let input_values = (0..m * k)
+                .map(|index| ((index * 17 % 71) as f32 - 35.0) / 41.0)
+                .collect::<Vec<_>>();
+            let input = upload_f32(executor.device(), &input_values, vec![m, k]);
+            let mut session = executor.begin().expect("begin vision Q5_0 projection");
+            let mut registry = KernelRegistry::new();
+            let device_ref: *const MlxDevice = executor.device() as *const _;
+            // SAFETY: executor outlives the session and loop body.
+            let device: &MlxDevice = unsafe { &*device_ref };
+            let output = vit_linear_gpu(
+                session.encoder_mut(),
+                &mut registry,
+                device,
+                &input,
+                &weight,
+                m as u32,
+                k as u32,
+                n as u32,
+            )
+            .unwrap_or_else(|error| panic!("vision Q5_0 M={m} dispatch: {error}"));
+            session
+                .finish()
+                .unwrap_or_else(|error| panic!("vision Q5_0 M={m} finish: {error}"));
+            let actual = readback_f32(&output, m * n);
+            assert!(actual.iter().all(|value| value.is_finite()));
+            assert!(
+                actual.iter().any(|value| *value != 0.0),
+                "vision Q5_0 M={m} must execute nonzero math"
+            );
+            for row in 0..m {
+                for column in 0..n {
+                    let expected = (0..k)
+                        .map(|inner| {
+                            input_values[row * k + inner] * dequantized[column * k + inner]
+                        })
+                        .sum::<f32>();
+                    let got = actual[row * n + column];
+                    assert!(
+                        (got - expected).abs() <= 1e-2,
+                        "vision Q5_0 M={m} mismatch at [{row},{column}]: {got} vs {expected}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -6793,10 +7088,8 @@ mod tests {
     // gemma4v_clippable_linear (CPU + GPU, iter 115)
     // -----------------------------------------------------------------------
 
-    /// Three-case parity: (no clamp, input only, both clamps) — the GPU
-    /// path matches the CPU reference within bf16 round-trip tolerance
-    /// (`vit_linear_gpu` casts weight F32→BF16 internally, so the
-    /// expected diff for the linear stage alone is ≤ 1e-3).
+    /// Three-case parity: (no clamp, input only, both clamps) — the native
+    /// F32 matrix path matches the CPU reference without a weight cast.
     #[test]
     fn gemma4v_clippable_linear_with_and_without_clamp() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();

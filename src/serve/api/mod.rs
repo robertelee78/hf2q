@@ -25,21 +25,24 @@
 pub(crate) const DIAGNOSTIC_NO_EVICT_HEADER: &str = "x-hf2q-diagnostic-no-evict";
 pub(crate) const DIAGNOSTIC_NO_EVICT_VALUE: &str = "1";
 
+mod anchor_store;
 pub mod artifact_catalog;
 pub mod cancellation;
 pub mod control;
+mod deepseek4_anchor_store;
 pub mod embedding_pool;
 pub mod engine;
 pub mod engine_deepseek4;
 pub mod engine_qwen35;
-pub mod engine_qwen3vl;
 mod engine_supervisor;
+mod gemma4_anchor_store;
 pub mod grammar;
 pub mod handlers;
 pub mod kv_spill_descriptor;
 pub mod lifecycle;
 pub mod local_artifacts;
 pub mod middleware;
+mod qwen35_anchor_store;
 pub mod qwen35_speculation;
 mod qwen_thinking_policy;
 pub mod registry;

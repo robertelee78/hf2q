@@ -71,7 +71,7 @@ pub(super) fn run(mut args: ConvertArgs) -> Result<(), ConvertError> {
     let requires_processor_config = emitter == ProjectorEmitter::NativeVit
         && VisionConfig::from_hf_config(&source.config)
             .map_err(crate::models::vit::VitConvertError::from)?
-            .is_qwen3vl();
+            .is_qwen_vision();
     if requires_processor_config && !args.hf_dir.join("preprocessor_config.json").is_file() {
         return Err(pair_error(format!(
             "Qwen multimodal conversion requires {} before either pair member is written",
@@ -103,7 +103,7 @@ pub(super) fn run(mut args: ConvertArgs) -> Result<(), ConvertError> {
 
 fn projector_emitter(arch: ArchName) -> Result<ProjectorEmitter, ConvertError> {
     match arch {
-        ArchName::Qwen35 | ArchName::Qwen35MoeFull | ArchName::Qwen3VlText => {
+        ArchName::Qwen35 | ArchName::Qwen35MoeFull => {
             Ok(ProjectorEmitter::NativeVit)
         }
         ArchName::Gemma4 => Ok(ProjectorEmitter::GemmaMapper),

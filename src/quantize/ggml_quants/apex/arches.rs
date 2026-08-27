@@ -310,7 +310,6 @@ mod tests {
         assert!(!is_apex_supported_arch(ArchName::Llama3));
         assert!(!is_apex_supported_arch(ArchName::Bert));
         assert!(!is_apex_supported_arch(ArchName::NomicBert));
-        assert!(!is_apex_supported_arch(ArchName::Qwen3VlText));
         assert!(!is_apex_supported_arch(ArchName::Falcon));
     }
 }

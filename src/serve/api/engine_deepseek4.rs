@@ -18,6 +18,7 @@ pub(super) use slots::{
 pub(super) use stream::generate_stream;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,21 +27,48 @@ use mlx_native::MlxBuffer;
 use tokenizers::Tokenizer;
 
 use crate::inference::models::deepseek4::{
-    cache::{Deepseek4Cache, Deepseek4CacheSnapshot},
-    decode_scratch_stats, matrix_prefill_chunk_len, prefill_scratch_stats, release_decode_scratch,
-    release_prefill_scratch, tokenizer as deepseek_tokenizer, Deepseek4Model,
-    TransientScratchStats, MIN_MATRIX_APPEND_TOKENS,
+    cache::Deepseek4Cache, decode_scratch_stats, matrix_prefill_chunk_len, prefill_scratch_stats,
+    release_decode_scratch, release_prefill_scratch, tokenizer as deepseek_tokenizer,
+    Deepseek4Model, TransientScratchStats, MIN_MATRIX_APPEND_TOKENS,
 };
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape, TokenizerSource,
 };
 
 use self::progress::RequestProgress;
+use super::anchor_store::{
+    maybe_inject_anchor_restore_failure, AnchorDivergence, AnchorEntry, AnchorRestoreEvent,
+    AnchorRestoreFaultFamily, AnchorRestoreOutcome, StagePending,
+};
+use super::deepseek4_anchor_store::{
+    self as anchor_store_policy, Deepseek4AnchorBudget, Deepseek4AnchorStore,
+    Deepseek4PromptAnchor, DEFAULT_MAX_COMMITTED_ANCHORS,
+};
 use super::engine::LoadOptions;
 use super::engine_supervisor::EngineSupervisor;
 
 const INITIAL_CACHE_LENGTH: usize = 131_072;
 const RECOVERY_TAIL_TOKENS: usize = 8;
+
+fn anchor_aggregate_budget_bytes() -> u64 {
+    crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget()
+}
+
+fn anchor_reprovision_budget_bytes(budget: &Deepseek4AnchorBudget) -> u64 {
+    budget.aggregate_budget_bytes()
+}
+
+fn anchor_control_capacity(configured_stores: usize, aggregate_budget_bytes: u64) -> usize {
+    let full_control_fits = (std::mem::size_of::<Deepseek4PromptAnchor>() as u64)
+        .checked_mul(DEFAULT_MAX_COMMITTED_ANCHORS as u64)
+        .and_then(|bytes| bytes.checked_mul(configured_stores as u64))
+        .is_some_and(|bytes| bytes <= aggregate_budget_bytes);
+    if full_control_fits {
+        DEFAULT_MAX_COMMITTED_ANCHORS
+    } else {
+        0
+    }
+}
 
 fn resumable_matrix_prefill_chunk_len(
     cache_position: usize,
@@ -63,6 +91,33 @@ fn resumable_matrix_prefill_chunk_len(
 enum ResumablePrefillChunk {
     Matrix(usize),
     Incremental(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShortRecoveryExecution {
+    Standard,
+    FullPromptOnly,
+    CapturePrepassThenFullPrompt,
+}
+
+fn plan_short_recovery_execution(
+    candidate: bool,
+    admission: Option<StagePending>,
+) -> Result<ShortRecoveryExecution> {
+    if !candidate {
+        return Ok(ShortRecoveryExecution::Standard);
+    }
+    match admission.context("DeepSeek-V4 short-recovery candidate is missing admission")? {
+        StagePending::Staged => Ok(ShortRecoveryExecution::CapturePrepassThenFullPrompt),
+        StagePending::NoCommittedCapacity | StagePending::BudgetExceeded { .. } => {
+            Ok(ShortRecoveryExecution::FullPromptOnly)
+        }
+        StagePending::PendingOccupied => {
+            anyhow::bail!(
+                "DeepSeek-V4 short-recovery anchor preflight found an occupied pending payload"
+            )
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,16 +315,13 @@ pub struct Deepseek4LoadedModel {
     committed_tokens: Vec<u32>,
     /// Logits following the last committed token, retained for an exact hit.
     live_logits: Option<MlxBuffer>,
-    /// Cache state a small fixed tail before the end of a recent prompt. The
-    /// official encoder can rewrite that tail when it drops old reasoning.
-    turn_anchor: Option<Deepseek4CacheSnapshot>,
-    turn_anchor_tokens: Vec<u32>,
-    /// Prompt-boundary checkpoint captured by the current request. It is not
-    /// promoted to reusable affinity until that request completes.
-    pending_turn_anchor: Option<Deepseek4CacheSnapshot>,
-    pending_turn_anchor_tokens: Vec<u32>,
-    keep_turn_anchor_on_success: bool,
+    /// Accumulated recovery-tail checkpoints over this mutable cache lineage.
+    anchor_store: Deepseek4AnchorStore,
+    anchor_budget: Arc<Deepseek4AnchorBudget>,
     request_anchor_transaction_active: bool,
+    /// The logical SlotAware slot currently swapped into this execution
+    /// surface. SerialFifo keeps this `None`.
+    telemetry_slot: Option<u32>,
     /// Full-logical-context agent sessions provisioned only for SlotAware.
     slot_sessions: Option<Vec<Deepseek4Session>>,
 }
@@ -281,12 +333,10 @@ pub(super) struct Deepseek4Session {
     cache: Deepseek4Cache,
     committed_tokens: Vec<u32>,
     live_logits: Option<MlxBuffer>,
-    turn_anchor: Option<Deepseek4CacheSnapshot>,
-    turn_anchor_tokens: Vec<u32>,
-    pending_turn_anchor: Option<Deepseek4CacheSnapshot>,
-    pending_turn_anchor_tokens: Vec<u32>,
-    keep_turn_anchor_on_success: bool,
+    anchor_store: Deepseek4AnchorStore,
+    anchor_budget: Arc<Deepseek4AnchorBudget>,
     request_anchor_transaction_active: bool,
+    telemetry_slot: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -307,6 +357,131 @@ fn deepseek4_cancellation_recovery(
     }
 }
 
+fn deepest_recovery_anchor(store: &Deepseek4AnchorStore, prompt_tokens: &[u32]) -> Option<usize> {
+    store.deepest_matching_index(|anchor| {
+        anchor.snapshot.position() == anchor.prompt_tokens.len()
+            && !anchor.prompt_tokens.is_empty()
+            // DeepSeek recovery anchors intentionally carry no output logits.
+            // Equality must stay on the live-ledger path; an anchor requires a
+            // nonempty suffix whose first forward produces aligned logits.
+            && prompt_tokens.len() > anchor.prompt_tokens.len()
+            && prompt_tokens.starts_with(&anchor.prompt_tokens)
+    })
+}
+
+fn deepest_cancellation_anchor(store: &Deepseek4AnchorStore, live_cursor: usize) -> Option<usize> {
+    store.deepest_matching_index(|anchor| {
+        anchor.snapshot.position() == anchor.prompt_tokens.len()
+            && !anchor.prompt_tokens.is_empty()
+            && anchor.prompt_tokens.len() <= live_cursor
+    })
+}
+
+fn capture_anchor_candidate(
+    cache: &Deepseek4Cache,
+    prompt_prefix: &[u32],
+    context: &'static str,
+) -> Result<Deepseek4PromptAnchor> {
+    let started = Instant::now();
+    let snapshot = cache.snapshot().context(context)?;
+    anyhow::ensure!(
+        snapshot.position() == prompt_prefix.len(),
+        "DeepSeek-V4 prompt anchor position {} does not match {} rendered tokens",
+        snapshot.position(),
+        prompt_prefix.len()
+    );
+    Ok(Deepseek4PromptAnchor::new(
+        prompt_prefix,
+        snapshot,
+        started.elapsed(),
+    ))
+}
+
+fn prospective_anchor_candidate_owned_bytes(
+    cache: &Deepseek4Cache,
+    prompt_tokens: usize,
+) -> Result<u64> {
+    cache
+        .prospective_snapshot_owned_bytes()
+        .context("preflight DeepSeek-V4 snapshot ownership")?
+        .checked_add(
+            (prompt_tokens as u64)
+                .checked_mul(std::mem::size_of::<u32>() as u64)
+                .context("DeepSeek-V4 anchor token-byte overflow")?,
+        )
+        .context("DeepSeek-V4 prospective anchor byte overflow")
+}
+
+fn preflight_anchor_capture(
+    cache: &Deepseek4Cache,
+    store: &Deepseek4AnchorStore,
+    budget: &Deepseek4AnchorBudget,
+    prompt_tokens: usize,
+) -> Result<(StagePending, u64)> {
+    let anchor_bytes = prospective_anchor_candidate_owned_bytes(cache, prompt_tokens)?;
+    Ok((budget.preflight_capture(store, anchor_bytes), anchor_bytes))
+}
+
+fn capture_turn_anchor_with_source(
+    cache: &Deepseek4Cache,
+    store: &mut Deepseek4AnchorStore,
+    budget: &Deepseek4AnchorBudget,
+    prompt_prefix: &[u32],
+    snapshot_context: &'static str,
+    capture_source: &'static str,
+) -> Result<bool> {
+    let (admission, anchor_bytes) =
+        preflight_anchor_capture(cache, store, budget, prompt_prefix.len())?;
+    let anchor = super::anchor_store::capture_if_anchor_admitted(admission, || {
+        capture_anchor_candidate(cache, prompt_prefix, snapshot_context)
+    })?;
+    let Some(anchor) = anchor else {
+        anchor_store_policy::record_preflight_budget_skip(
+            store,
+            budget,
+            anchor_bytes,
+            admission,
+            capture_source,
+        );
+        return Ok(false);
+    };
+    let outcome = anchor_store_policy::stage_pending(store, budget, anchor, capture_source)?;
+    anyhow::ensure!(
+        outcome == StagePending::Staged,
+        "DeepSeek-V4 anchor admission changed between preflight and staging: {outcome:?}"
+    );
+    Ok(true)
+}
+
+fn preflight_anchor_store_migration(
+    destination: &Deepseek4Cache,
+    source: &Deepseek4Cache,
+    store: &Deepseek4AnchorStore,
+    previous: usize,
+    target: usize,
+) -> Result<()> {
+    for index in 0..store.committed_len() {
+        let anchor = store
+            .committed(index)
+            .context("DeepSeek-V4 committed anchor disappeared during growth preflight")?;
+        destination
+            .preflight_snapshot_migration(source, &anchor.snapshot)
+            .with_context(|| {
+                format!(
+                    "preflight DeepSeek-V4 committed anchor {index} across {previous}->{target} growth"
+                )
+            })?;
+    }
+    if let Some(anchor) = store.pending() {
+        destination
+            .preflight_snapshot_migration(source, &anchor.snapshot)
+            .with_context(|| {
+                format!("preflight DeepSeek-V4 pending anchor across {previous}->{target} growth")
+            })?;
+    }
+    Ok(())
+}
+
 impl Deepseek4Session {
     /// Start with the same bounded cache shape as the proven SerialFifo path,
     /// while keeping append-only KV lazy so four idle slots do not register
@@ -315,7 +490,12 @@ impl Deepseek4Session {
     /// 131K-token steps when its request needs more space, up to the complete
     /// per-slot logical context. Logical context is therefore independent of
     /// slot count without making short turns pay 524K-shaped Metal strides.
-    pub(super) fn new(loaded: &Deepseek4LoadedModel) -> Result<Self> {
+    pub(super) fn new(
+        loaded: &Deepseek4LoadedModel,
+        anchor_budget: Arc<Deepseek4AnchorBudget>,
+        anchor_control_capacity: usize,
+        slot: u32,
+    ) -> Result<Self> {
         let initial_capacity = loaded.context_limit().min(INITIAL_CACHE_LENGTH);
         let cache = loaded
             .model
@@ -327,12 +507,10 @@ impl Deepseek4Session {
             cache,
             committed_tokens: Vec::new(),
             live_logits: None,
-            turn_anchor: None,
-            turn_anchor_tokens: Vec::new(),
-            pending_turn_anchor: None,
-            pending_turn_anchor_tokens: Vec::new(),
-            keep_turn_anchor_on_success: false,
+            anchor_store: Deepseek4AnchorStore::with_committed_capacity(anchor_control_capacity),
+            anchor_budget,
             request_anchor_transaction_active: false,
+            telemetry_slot: Some(slot),
         })
     }
 
@@ -342,6 +520,21 @@ impl Deepseek4Session {
 
     pub(super) fn cache_position(&self) -> usize {
         self.cache.position()
+    }
+
+    pub(super) fn idle_owned_bytes(&self) -> Result<(u64, u64)> {
+        let kv_bytes = self.cache.owned_bytes();
+        let prefix_bytes = (self.committed_tokens.capacity() as u64)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .and_then(|bytes| bytes.checked_add(self.anchor_store.owned_bytes()))
+            .context("DeepSeek-V4 session-owned byte total overflow")?;
+        Ok((kv_bytes, prefix_bytes))
+    }
+
+    pub(super) fn live_logits_allocation(&self) -> Option<(usize, u64)> {
+        self.live_logits
+            .as_ref()
+            .map(|logits| (logits.contents_ptr() as usize, logits.byte_len() as u64))
     }
 
     pub(super) fn decode_cohort_compatible_with(&self, other: &Self) -> bool {
@@ -400,23 +593,18 @@ impl Deepseek4Session {
         self.committed_tokens.extend_from_slice(tokens);
     }
 
-    pub(super) fn capture_cooperative_turn_anchor(&mut self, prompt_prefix: &[u32]) -> Result<()> {
-        self.pending_turn_anchor = None;
-        self.pending_turn_anchor_tokens.clear();
-        let snapshot = self
-            .cache
-            .snapshot()
-            .context("snapshot DeepSeek-V4 cooperative prompt-boundary cache")?;
-        anyhow::ensure!(
-            snapshot.position() == prompt_prefix.len(),
-            "DeepSeek-V4 cooperative prompt anchor position {} does not match {} rendered tokens",
-            snapshot.position(),
-            prompt_prefix.len()
-        );
-        self.pending_turn_anchor = Some(snapshot);
-        self.pending_turn_anchor_tokens
-            .extend_from_slice(prompt_prefix);
-        Ok(())
+    pub(super) fn capture_cooperative_turn_anchor(
+        &mut self,
+        prompt_prefix: &[u32],
+    ) -> Result<bool> {
+        capture_turn_anchor_with_source(
+            &self.cache,
+            &mut self.anchor_store,
+            &self.anchor_budget,
+            prompt_prefix,
+            "snapshot DeepSeek-V4 cooperative prompt-boundary cache",
+            "cooperative-prefill",
+        )
     }
 
     /// Return the longest prefix this retained slot can safely resume for the
@@ -432,46 +620,49 @@ impl Deepseek4Session {
             && prompt_tokens.starts_with(&self.committed_tokens))
         .then_some(self.committed_tokens.len())
         .unwrap_or(0);
-        let recovery = self
-            .turn_anchor
-            .as_ref()
-            .filter(|anchor| {
-                anchor.position() == self.turn_anchor_tokens.len()
-                    && !self.turn_anchor_tokens.is_empty()
-                    && prompt_tokens.len() > self.turn_anchor_tokens.len()
-                    && prompt_tokens.starts_with(&self.turn_anchor_tokens)
-            })
-            .map_or(0, |_| self.turn_anchor_tokens.len());
+        let recovery = deepest_recovery_anchor(&self.anchor_store, prompt_tokens)
+            .and_then(|index| self.anchor_store.committed(index))
+            .map_or(0, |anchor| anchor.prompt_tokens.len());
         let selected = if live >= recovery && live > 0 {
             PrefixReuse::Live(live)
         } else if recovery > 0 {
-            PrefixReuse::RecoveryAnchor(recovery)
+            PrefixReuse::RecoveryAnchor {
+                count: recovery,
+                index: deepest_recovery_anchor(&self.anchor_store, prompt_tokens)
+                    .expect("positive recovery score has an anchor"),
+            }
         } else {
             PrefixReuse::Reset
         };
         match prefer_matrix_prefill(prompt_tokens.len(), selected) {
-            PrefixReuse::Live(count) | PrefixReuse::RecoveryAnchor(count) => count,
+            PrefixReuse::Live(count) | PrefixReuse::RecoveryAnchor { count, .. } => count,
             PrefixReuse::Reset => 0,
         }
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.committed_tokens.is_empty() && self.turn_anchor_tokens.is_empty()
+        self.committed_tokens.is_empty() && self.anchor_store.committed_len() == 0
     }
 
     pub(super) fn reset(&mut self) -> Result<()> {
-        self.cache
-            .reset()
-            .context("reset DeepSeek-V4 agent slot cache")?;
+        let clear = anchor_store_policy::clear_all(
+            &mut self.anchor_store,
+            &self.anchor_budget,
+            "agent-slot-reset",
+        );
         self.committed_tokens.clear();
         self.live_logits = None;
-        self.turn_anchor = None;
-        self.turn_anchor_tokens.clear();
-        self.pending_turn_anchor = None;
-        self.pending_turn_anchor_tokens.clear();
-        self.keep_turn_anchor_on_success = false;
         self.request_anchor_transaction_active = false;
-        Ok(())
+        let reset = self
+            .cache
+            .reset()
+            .context("reset DeepSeek-V4 agent slot cache");
+        match (clear, reset) {
+            (Ok(()), Ok(())) => Ok(()),
+            (clear, reset) => anyhow::bail!(
+                "DeepSeek-V4 agent slot reset did not complete fail-closed cleanup (clear={clear:?}, reset={reset:?})"
+            ),
+        }
     }
 
     /// Cancelled work must not publish its partially extended live cursor, but
@@ -479,54 +670,92 @@ impl Deepseek4Session {
     /// compact checkpoint when possible; cold/no-anchor cancellation retains
     /// the conservative full-reset fallback.
     pub(super) fn recover_after_cancellation(&mut self) -> Result<()> {
-        self.pending_turn_anchor = None;
-        self.pending_turn_anchor_tokens.clear();
-        self.keep_turn_anchor_on_success = false;
         self.request_anchor_transaction_active = false;
+        let pending_discarded =
+            anchor_store_policy::discard_pending(&mut self.anchor_store, &self.anchor_budget)?;
+        let live_cursor = self.cache.position();
+        let recovery_index = deepest_cancellation_anchor(&self.anchor_store, self.cache.position());
         let recovery = deepseek4_cancellation_recovery(
             self.cache.is_poisoned(),
-            self.turn_anchor
-                .as_ref()
-                .map(Deepseek4CacheSnapshot::position),
-            self.turn_anchor_tokens.len(),
+            recovery_index.and_then(|index| {
+                self.anchor_store
+                    .committed(index)
+                    .map(|anchor| anchor.snapshot.position())
+            }),
+            recovery_index
+                .and_then(|index| self.anchor_store.committed(index))
+                .map_or(0, |anchor| anchor.prompt_tokens.len()),
         );
         if recovery == Deepseek4CancellationRecovery::Reset {
-            return self.reset();
+            let divergence = AnchorDivergence::rewind(
+                live_cursor,
+                recovery_index
+                    .and_then(|index| self.anchor_store.committed(index))
+                    .map_or(0, |anchor| anchor.prompt_tokens.len()),
+            );
+            let reset = self.reset();
+            anchor_store_policy::record_restore(AnchorRestoreEvent {
+                family: "deepseek4",
+                slot: self.telemetry_slot,
+                cause: "cancellation rollback",
+                outcome: if reset.is_ok() {
+                    AnchorRestoreOutcome::MissNoMatch
+                } else {
+                    AnchorRestoreOutcome::FailedCleanup
+                },
+                attempted_hit_depth: 0,
+                hit_depth: 0,
+                divergence,
+                tokens_saved: 0,
+                descendant_prune_count: 0,
+                pending_discarded,
+                publication_disposition: None,
+                capture_duration: Duration::ZERO,
+                peak_committed_pending_bytes: self.anchor_store.peak_owned_bytes(),
+            });
+            return reset;
         }
-        let anchor = self
-            .turn_anchor
-            .as_ref()
-            .context("DeepSeek-V4 cancellation turn anchor disappeared")?;
-        self.cache
-            .restore(anchor)
-            .context("restore DeepSeek-V4 turn anchor after cancellation")?;
-        self.committed_tokens.clone_from(&self.turn_anchor_tokens);
-        self.live_logits = None;
-        anyhow::ensure!(
-            self.cache.position() == self.committed_tokens.len(),
-            "DeepSeek-V4 cancellation rollback cache position {} disagrees with token ledger {}",
+        let recovery_index =
+            recovery_index.context("DeepSeek-V4 cancellation anchor disappeared")?;
+        let anchor_tokens = self
+            .anchor_store
+            .committed(recovery_index)
+            .map_or(0, |anchor| anchor.prompt_tokens.len());
+        self.restore_committed_anchor(
+            recovery_index,
+            "cancellation rollback",
+            AnchorDivergence::rewind(self.cache.position(), anchor_tokens),
+            pending_discarded,
+            None,
+        )?;
+        anchor_store_policy::cancel_at_cursor(
+            &mut self.anchor_store,
+            &self.anchor_budget,
             self.cache.position(),
-            self.committed_tokens.len()
-        );
+        )?;
         Ok(())
     }
 
     /// Publish the current request's candidate checkpoint only after its
     /// terminal result is known to be successful.
-    pub(super) fn commit_request_anchor(&mut self) {
+    pub(super) fn commit_request_anchor(&mut self) -> Result<()> {
         if !self.request_anchor_transaction_active {
-            return;
+            return Ok(());
         }
         self.request_anchor_transaction_active = false;
-        if let Some(anchor) = self.pending_turn_anchor.take() {
-            self.turn_anchor = Some(anchor);
-            self.turn_anchor_tokens = std::mem::take(&mut self.pending_turn_anchor_tokens);
-        } else if !self.keep_turn_anchor_on_success {
-            self.turn_anchor = None;
-            self.turn_anchor_tokens.clear();
+        if let Some(publication) =
+            anchor_store_policy::publish_pending(&mut self.anchor_store, &self.anchor_budget)?
+        {
+            tracing::info!(
+                target: "hf2q::serve::api::deepseek4_anchor",
+                committed_anchors = self.anchor_store.committed_len(),
+                anchor_owned_bytes = self.anchor_store.owned_bytes(),
+                evicted = publication.evicted,
+                replaced_equal_depth = publication.replaced_equal_depth,
+                "DeepSeek-V4 pending anchor published after terminal ledger commit"
+            );
         }
-        self.pending_turn_anchor_tokens.clear();
-        self.keep_turn_anchor_on_success = false;
+        Ok(())
     }
 
     /// Swap this slot into the single model execution surface. The staging
@@ -536,28 +765,155 @@ impl Deepseek4Session {
         std::mem::swap(&mut self.cache, &mut loaded.cache);
         std::mem::swap(&mut self.committed_tokens, &mut loaded.committed_tokens);
         std::mem::swap(&mut self.live_logits, &mut loaded.live_logits);
-        std::mem::swap(&mut self.turn_anchor, &mut loaded.turn_anchor);
-        std::mem::swap(&mut self.turn_anchor_tokens, &mut loaded.turn_anchor_tokens);
-        std::mem::swap(
-            &mut self.pending_turn_anchor,
-            &mut loaded.pending_turn_anchor,
-        );
-        std::mem::swap(
-            &mut self.pending_turn_anchor_tokens,
-            &mut loaded.pending_turn_anchor_tokens,
-        );
-        std::mem::swap(
-            &mut self.keep_turn_anchor_on_success,
-            &mut loaded.keep_turn_anchor_on_success,
-        );
+        std::mem::swap(&mut self.anchor_store, &mut loaded.anchor_store);
         std::mem::swap(
             &mut self.request_anchor_transaction_active,
             &mut loaded.request_anchor_transaction_active,
         );
+        std::mem::swap(&mut self.telemetry_slot, &mut loaded.telemetry_slot);
+    }
+
+    fn restore_committed_anchor(
+        &mut self,
+        index: usize,
+        cause: &'static str,
+        divergence: AnchorDivergence,
+        pending_discarded_before_restore: bool,
+        request_max_tokens: Option<usize>,
+    ) -> Result<()> {
+        let (tokens, token_count, capture_duration, publication_disposition) = {
+            let anchor = self
+                .anchor_store
+                .committed(index)
+                .context("DeepSeek-V4 committed anchor disappeared before restore")?;
+            (
+                anchor.prompt_tokens.to_vec(),
+                anchor.prompt_tokens.len(),
+                anchor.capture_duration,
+                anchor.publication_disposition(),
+            )
+        };
+        let pending_discarded = pending_discarded_before_restore || self.anchor_store.has_pending();
+        let observation = AnchorRestoreEvent {
+            family: "deepseek4",
+            slot: self.telemetry_slot,
+            cause,
+            outcome: AnchorRestoreOutcome::Hit,
+            attempted_hit_depth: index + 1,
+            hit_depth: index + 1,
+            divergence,
+            tokens_saved: token_count,
+            descendant_prune_count: 0,
+            pending_discarded,
+            publication_disposition: Some(publication_disposition),
+            capture_duration,
+            peak_committed_pending_bytes: self.anchor_store.peak_owned_bytes(),
+        };
+        let restore = (|| -> Result<()> {
+            maybe_inject_anchor_restore_failure(
+                AnchorRestoreFaultFamily::Deepseek4,
+                request_max_tokens,
+            )?;
+            let anchor = self
+                .anchor_store
+                .committed(index)
+                .context("DeepSeek-V4 committed anchor disappeared during restore")?;
+            self.cache.restore(&anchor.snapshot)?;
+            Ok(())
+        })();
+        if let Err(error) = restore {
+            return self.fail_closed_restore(error, observation);
+        }
+        let prune = match anchor_store_policy::prune_after_restore(
+            &mut self.anchor_store,
+            &self.anchor_budget,
+            index,
+        ) {
+            Ok(prune) => prune,
+            Err(error) => return self.fail_closed_restore(error, observation),
+        };
+        if self.cache.position() != token_count {
+            return self.fail_closed_restore(
+                anyhow::anyhow!(
+                    "restored cache position {} disagrees with token ledger {}",
+                    self.cache.position(),
+                    token_count
+                ),
+                observation,
+            );
+        }
+        self.committed_tokens = tokens;
+        self.live_logits = None;
+        let mut observation = observation;
+        observation.descendant_prune_count = prune.pruned;
+        observation.pending_discarded |= prune.pending_discarded;
+        anchor_store_policy::record_restore(observation);
+        Ok(())
+    }
+
+    fn fail_closed_restore(
+        &mut self,
+        restore_error: impl std::fmt::Display,
+        mut observation: AnchorRestoreEvent,
+    ) -> Result<()> {
+        let cause = observation.cause;
+        let restore_error = restore_error.to_string();
+        let clear = anchor_store_policy::clear_all(
+            &mut self.anchor_store,
+            &self.anchor_budget,
+            "failed-restore",
+        );
+        self.committed_tokens.clear();
+        self.live_logits = None;
+        self.request_anchor_transaction_active = false;
+        let reset = self.cache.reset();
+        observation.outcome = if clear.is_ok() && reset.is_ok() {
+            AnchorRestoreOutcome::RestoreFailedResetSucceeded
+        } else {
+            AnchorRestoreOutcome::FailedCleanup
+        };
+        observation.hit_depth = 0;
+        observation.tokens_saved = 0;
+        observation.peak_committed_pending_bytes = self.anchor_store.peak_owned_bytes();
+        anchor_store_policy::record_restore(observation);
+        match (clear, reset) {
+            (Ok(()), Ok(())) => anyhow::bail!(
+                "DeepSeek-V4 {cause} failed; cache hard-reset and anchor lineage cleared: {restore_error}"
+            ),
+            (clear, reset) => anyhow::bail!(
+                "DeepSeek-V4 {cause} failed ({restore_error}); fail-closed cleanup also failed (clear={clear:?}, reset={reset:?})"
+            ),
+        }
     }
 }
 
 impl Deepseek4LoadedModel {
+    pub(super) fn idle_runtime_release_encoder(&self) -> Result<mlx_native::CommandEncoder> {
+        self.model
+            .ctx
+            .device()
+            .command_encoder()
+            .context("create DeepSeek-V4 idle-release residency commit")
+    }
+
+    pub(super) fn idle_slot_staging_owned_bytes(&self) -> Result<(u64, u64)> {
+        anyhow::ensure!(
+            self.cache.position() == 0
+                && self.committed_tokens.is_empty()
+                && self.live_logits.is_none()
+                && self.anchor_store.committed_len() == 0
+                && !self.anchor_store.has_pending()
+                && !self.request_anchor_transaction_active
+                && self.telemetry_slot.is_none(),
+            "DeepSeek-V4 SlotAware staging cache is not cold at idle park"
+        );
+        let prefix_bytes = (self.committed_tokens.capacity() as u64)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .and_then(|bytes| bytes.checked_add(self.anchor_store.owned_bytes()))
+            .context("DeepSeek-V4 staging-owned byte total overflow")?;
+        Ok((self.cache.owned_bytes(), prefix_bytes))
+    }
+
     pub(super) fn commit_generated_tokens_cohort(
         &mut self,
         token_ids: [u32; 4],
@@ -765,6 +1121,11 @@ impl Deepseek4LoadedModel {
             allocated_cache_context = initial_cache_length,
             "DeepSeek-V4 cache admitted with demand-grown capacity"
         );
+        let aggregate_anchor_budget = anchor_aggregate_budget_bytes();
+        let anchor_control_capacity = anchor_control_capacity(1, aggregate_anchor_budget);
+        let anchor_store = Deepseek4AnchorStore::with_committed_capacity(anchor_control_capacity);
+        let anchor_budget =
+            Deepseek4AnchorBudget::new(1, aggregate_anchor_budget, anchor_store.owned_bytes())?;
 
         Ok(Self {
             model,
@@ -781,12 +1142,10 @@ impl Deepseek4LoadedModel {
             provenance,
             committed_tokens: Vec::new(),
             live_logits: None,
-            turn_anchor: None,
-            turn_anchor_tokens: Vec::new(),
-            pending_turn_anchor: None,
-            pending_turn_anchor_tokens: Vec::new(),
-            keep_turn_anchor_on_success: false,
+            anchor_store,
+            anchor_budget,
             request_anchor_transaction_active: false,
+            telemetry_slot: None,
             slot_sessions: None,
         })
     }
@@ -822,16 +1181,42 @@ impl Deepseek4LoadedModel {
 
     pub(super) fn provision_slot_sessions(&mut self, max_slots: u32) -> Result<()> {
         anyhow::ensure!(max_slots > 0, "DeepSeek-V4 max_slots must be nonzero");
+        anyhow::ensure!(
+            self.anchor_store.committed_len() == 0 && !self.anchor_store.has_pending(),
+            "DeepSeek-V4 SlotAware sessions must be provisioned before anchor publication"
+        );
+        let configured_stores = max_slots as usize + 1;
+        let aggregate_anchor_budget = anchor_reprovision_budget_bytes(&self.anchor_budget);
+        let anchor_control_capacity =
+            anchor_control_capacity(configured_stores, aggregate_anchor_budget);
+        self.anchor_store = Deepseek4AnchorStore::with_committed_capacity(anchor_control_capacity);
+        let initial_anchor_owned_bytes = self
+            .anchor_store
+            .owned_bytes()
+            .checked_mul(configured_stores as u64)
+            .context("DeepSeek-V4 initial aggregate anchor control bytes overflow")?;
+        self.anchor_budget = Deepseek4AnchorBudget::new(
+            max_slots as usize,
+            aggregate_anchor_budget,
+            initial_anchor_owned_bytes,
+        )?;
         let mut sessions = Vec::with_capacity(max_slots as usize);
         for slot in 0..max_slots {
             sessions.push(
-                Deepseek4Session::new(self)
-                    .with_context(|| format!("reserve DeepSeek-V4 logical slot {slot}"))?,
+                Deepseek4Session::new(
+                    self,
+                    Arc::clone(&self.anchor_budget),
+                    anchor_control_capacity,
+                    slot,
+                )
+                .with_context(|| format!("reserve DeepSeek-V4 logical slot {slot}"))?,
             );
         }
         tracing::info!(
             max_slots,
             logical_context_per_slot = self.context_limit(),
+            anchor_aggregate_budget_bytes = aggregate_anchor_budget,
+            anchor_control_capacity,
             "DeepSeek-V4 full-context agent slots reserved"
         );
         self.slot_sessions = Some(sessions);
@@ -850,27 +1235,41 @@ impl Deepseek4LoadedModel {
     }
 
     pub(super) fn reset_live_cache(&mut self) -> Result<()> {
-        self.cache
-            .reset()
-            .context("reset DeepSeek-V4 serving cache")?;
+        let clear = anchor_store_policy::clear_all(
+            &mut self.anchor_store,
+            &self.anchor_budget,
+            "serving-cache-reset",
+        );
         self.committed_tokens.clear();
         self.live_logits = None;
-        self.turn_anchor = None;
-        self.turn_anchor_tokens.clear();
-        self.pending_turn_anchor = None;
-        self.pending_turn_anchor_tokens.clear();
-        self.keep_turn_anchor_on_success = false;
         self.request_anchor_transaction_active = false;
-        Ok(())
+        let reset = self
+            .cache
+            .reset()
+            .context("reset DeepSeek-V4 serving cache");
+        match (clear, reset) {
+            (Ok(()), Ok(())) => Ok(()),
+            (clear, reset) => anyhow::bail!(
+                "DeepSeek-V4 serving reset did not complete fail-closed cleanup (clear={clear:?}, reset={reset:?})"
+            ),
+        }
     }
 
-    fn reset_live_cache_preserving_turn_anchor(&mut self) -> Result<()> {
-        self.cache
-            .reset()
-            .context("reset DeepSeek-V4 serving cache")?;
+    fn reset_live_cache_and_clear_anchors(&mut self, cause: &'static str) -> Result<()> {
+        let clear =
+            anchor_store_policy::clear_all(&mut self.anchor_store, &self.anchor_budget, cause);
         self.committed_tokens.clear();
         self.live_logits = None;
-        Ok(())
+        let reset = self
+            .cache
+            .reset()
+            .context("reset DeepSeek-V4 serving cache");
+        match (clear, reset) {
+            (Ok(()), Ok(())) => Ok(()),
+            (clear, reset) => anyhow::bail!(
+                "DeepSeek-V4 {cause} did not complete fail-closed cleanup (clear={clear:?}, reset={reset:?})"
+            ),
+        }
     }
 
     fn ensure_cache_capacity(&mut self, prompt_tokens: usize, max_tokens: usize) -> Result<bool> {
@@ -891,11 +1290,29 @@ impl Deepseek4LoadedModel {
         let mut grown = self.model.allocate_logical_cache(target).with_context(|| {
             format!("grow DeepSeek-V4 cache from {previous} to {target} tokens")
         })?;
-        grown
-            .migrate_from(&self.cache, self.turn_anchor.as_mut())
-            .with_context(|| {
-                format!("migrate DeepSeek-V4 live cache from {previous} to {target} tokens")
-            })?;
+        let anchor_preflight = preflight_anchor_store_migration(
+            &grown,
+            &self.cache,
+            &self.anchor_store,
+            previous,
+            target,
+        );
+        if let Err(error) = anchor_preflight {
+            tracing::warn!(
+                previous_cache_context = previous,
+                allocated_cache_context = target,
+                error = %error,
+                "DeepSeek-V4 cache growth invalidated an incompatible anchor lineage"
+            );
+            anchor_store_policy::clear_all(
+                &mut self.anchor_store,
+                &self.anchor_budget,
+                "cache-growth-anchor-preflight",
+            )?;
+        }
+        grown.migrate_from(&self.cache).with_context(|| {
+            format!("migrate DeepSeek-V4 live cache from {previous} to {target} tokens")
+        })?;
         let target_cache_bytes = grown.resident_bytes();
         let old = std::mem::replace(&mut self.cache, grown);
         drop(old);
@@ -912,86 +1329,221 @@ impl Deepseek4LoadedModel {
         Ok(true)
     }
 
-    fn begin_request_anchor_transaction(&mut self, prompt_tokens: &[u32]) {
-        self.pending_turn_anchor = None;
-        self.pending_turn_anchor_tokens.clear();
+    fn begin_request_anchor_transaction(&mut self, _prompt_tokens: &[u32]) -> Result<()> {
+        anchor_store_policy::discard_pending(&mut self.anchor_store, &self.anchor_budget)?;
         self.request_anchor_transaction_active = true;
-        self.keep_turn_anchor_on_success = self.turn_anchor.as_ref().is_some_and(|anchor| {
-            anchor.position() == self.turn_anchor_tokens.len()
-                && !self.turn_anchor_tokens.is_empty()
-                && prompt_tokens.starts_with(&self.turn_anchor_tokens)
-        });
+        Ok(())
     }
 
-    pub(super) fn commit_request_anchor(&mut self) {
+    pub(super) fn commit_request_anchor(&mut self) -> Result<()> {
         if !self.request_anchor_transaction_active {
-            return;
+            return Ok(());
         }
         self.request_anchor_transaction_active = false;
-        if let Some(anchor) = self.pending_turn_anchor.take() {
-            self.turn_anchor = Some(anchor);
-            self.turn_anchor_tokens = std::mem::take(&mut self.pending_turn_anchor_tokens);
-        } else if !self.keep_turn_anchor_on_success {
-            self.turn_anchor = None;
-            self.turn_anchor_tokens.clear();
+        if let Some(publication) =
+            anchor_store_policy::publish_pending(&mut self.anchor_store, &self.anchor_budget)?
+        {
+            tracing::info!(
+                target: "hf2q::serve::api::deepseek4_anchor",
+                committed_anchors = self.anchor_store.committed_len(),
+                anchor_owned_bytes = self.anchor_store.owned_bytes(),
+                evicted = publication.evicted,
+                replaced_equal_depth = publication.replaced_equal_depth,
+                "DeepSeek-V4 pending anchor published after terminal ledger commit"
+            );
         }
-        self.pending_turn_anchor_tokens.clear();
-        self.keep_turn_anchor_on_success = false;
+        Ok(())
     }
 
     pub(super) fn recover_after_cancellation(&mut self) -> Result<()> {
-        self.pending_turn_anchor = None;
-        self.pending_turn_anchor_tokens.clear();
-        self.keep_turn_anchor_on_success = false;
         self.request_anchor_transaction_active = false;
+        let pending_discarded =
+            anchor_store_policy::discard_pending(&mut self.anchor_store, &self.anchor_budget)?;
+        let live_cursor = self.cache.position();
+        let recovery_index = deepest_cancellation_anchor(&self.anchor_store, self.cache.position());
         let recovery = deepseek4_cancellation_recovery(
             self.cache.is_poisoned(),
-            self.turn_anchor
-                .as_ref()
-                .map(Deepseek4CacheSnapshot::position),
-            self.turn_anchor_tokens.len(),
+            recovery_index.and_then(|index| {
+                self.anchor_store
+                    .committed(index)
+                    .map(|anchor| anchor.snapshot.position())
+            }),
+            recovery_index
+                .and_then(|index| self.anchor_store.committed(index))
+                .map_or(0, |anchor| anchor.prompt_tokens.len()),
         );
         if recovery == Deepseek4CancellationRecovery::Reset {
-            return self.reset_live_cache();
+            let divergence = AnchorDivergence::rewind(
+                live_cursor,
+                recovery_index
+                    .and_then(|index| self.anchor_store.committed(index))
+                    .map_or(0, |anchor| anchor.prompt_tokens.len()),
+            );
+            let reset = self.reset_live_cache();
+            anchor_store_policy::record_restore(AnchorRestoreEvent {
+                family: "deepseek4",
+                slot: self.telemetry_slot,
+                cause: "cancellation rollback",
+                outcome: if reset.is_ok() {
+                    AnchorRestoreOutcome::MissNoMatch
+                } else {
+                    AnchorRestoreOutcome::FailedCleanup
+                },
+                attempted_hit_depth: 0,
+                hit_depth: 0,
+                divergence,
+                tokens_saved: 0,
+                descendant_prune_count: 0,
+                pending_discarded,
+                publication_disposition: None,
+                capture_duration: Duration::ZERO,
+                peak_committed_pending_bytes: self.anchor_store.peak_owned_bytes(),
+            });
+            return reset;
         }
-        let anchor = self
-            .turn_anchor
-            .as_ref()
-            .context("DeepSeek-V4 cancellation turn anchor disappeared")?;
-        self.cache
-            .restore(anchor)
-            .context("restore DeepSeek-V4 turn anchor after cancellation")?;
-        self.committed_tokens.clone_from(&self.turn_anchor_tokens);
-        self.live_logits = None;
-        anyhow::ensure!(
-            self.cache.position() == self.committed_tokens.len(),
-            "DeepSeek-V4 cancellation rollback cache position {} disagrees with token ledger {}",
+        let recovery_index =
+            recovery_index.context("DeepSeek-V4 cancellation anchor disappeared")?;
+        let anchor_tokens = self
+            .anchor_store
+            .committed(recovery_index)
+            .map_or(0, |anchor| anchor.prompt_tokens.len());
+        self.restore_committed_anchor(
+            recovery_index,
+            "cancellation rollback",
+            AnchorDivergence::rewind(self.cache.position(), anchor_tokens),
+            pending_discarded,
+            None,
+        )?;
+        anchor_store_policy::cancel_at_cursor(
+            &mut self.anchor_store,
+            &self.anchor_budget,
             self.cache.position(),
-            self.committed_tokens.len()
-        );
+        )?;
         Ok(())
     }
 
-    fn capture_turn_anchor(&mut self, prompt_prefix: &[u32]) -> Result<()> {
-        // Release only this request's prior candidate before allocating its
-        // replacement. The committed pre-request checkpoint remains private
-        // until success promotes the new candidate.
-        self.pending_turn_anchor = None;
-        self.pending_turn_anchor_tokens.clear();
-        let snapshot = self
-            .cache
-            .snapshot()
-            .context("snapshot DeepSeek-V4 prompt-boundary cache")?;
-        anyhow::ensure!(
-            snapshot.position() == prompt_prefix.len(),
-            "DeepSeek-V4 prompt anchor position {} does not match {} rendered tokens",
-            snapshot.position(),
-            prompt_prefix.len()
-        );
-        self.pending_turn_anchor = Some(snapshot);
-        self.pending_turn_anchor_tokens
-            .extend_from_slice(prompt_prefix);
+    fn capture_turn_anchor(&mut self, prompt_prefix: &[u32]) -> Result<bool> {
+        capture_turn_anchor_with_source(
+            &self.cache,
+            &mut self.anchor_store,
+            &self.anchor_budget,
+            prompt_prefix,
+            "snapshot DeepSeek-V4 prompt-boundary cache",
+            "serial-or-swapped-prefill",
+        )
+    }
+
+    fn restore_committed_anchor(
+        &mut self,
+        index: usize,
+        cause: &'static str,
+        divergence: AnchorDivergence,
+        pending_discarded_before_restore: bool,
+        request_max_tokens: Option<usize>,
+    ) -> Result<()> {
+        let (tokens, token_count, capture_duration, publication_disposition) = {
+            let anchor = self
+                .anchor_store
+                .committed(index)
+                .context("DeepSeek-V4 committed anchor disappeared before restore")?;
+            (
+                anchor.prompt_tokens.to_vec(),
+                anchor.prompt_tokens.len(),
+                anchor.capture_duration,
+                anchor.publication_disposition(),
+            )
+        };
+        let pending_discarded = pending_discarded_before_restore || self.anchor_store.has_pending();
+        let observation = AnchorRestoreEvent {
+            family: "deepseek4",
+            slot: self.telemetry_slot,
+            cause,
+            outcome: AnchorRestoreOutcome::Hit,
+            attempted_hit_depth: index + 1,
+            hit_depth: index + 1,
+            divergence,
+            tokens_saved: token_count,
+            descendant_prune_count: 0,
+            pending_discarded,
+            publication_disposition: Some(publication_disposition),
+            capture_duration,
+            peak_committed_pending_bytes: self.anchor_store.peak_owned_bytes(),
+        };
+        let restore = (|| -> Result<()> {
+            maybe_inject_anchor_restore_failure(
+                AnchorRestoreFaultFamily::Deepseek4,
+                request_max_tokens,
+            )?;
+            let anchor = self
+                .anchor_store
+                .committed(index)
+                .context("DeepSeek-V4 committed anchor disappeared during restore")?;
+            self.cache.restore(&anchor.snapshot)?;
+            Ok(())
+        })();
+        if let Err(error) = restore {
+            return self.fail_closed_restore(error, observation);
+        }
+        let prune = match anchor_store_policy::prune_after_restore(
+            &mut self.anchor_store,
+            &self.anchor_budget,
+            index,
+        ) {
+            Ok(prune) => prune,
+            Err(error) => return self.fail_closed_restore(error, observation),
+        };
+        if self.cache.position() != token_count {
+            return self.fail_closed_restore(
+                anyhow::anyhow!(
+                    "restored cache position {} disagrees with token ledger {}",
+                    self.cache.position(),
+                    token_count
+                ),
+                observation,
+            );
+        }
+        self.committed_tokens = tokens;
+        self.live_logits = None;
+        let mut observation = observation;
+        observation.descendant_prune_count = prune.pruned;
+        observation.pending_discarded |= prune.pending_discarded;
+        anchor_store_policy::record_restore(observation);
         Ok(())
+    }
+
+    fn fail_closed_restore(
+        &mut self,
+        restore_error: impl std::fmt::Display,
+        mut observation: AnchorRestoreEvent,
+    ) -> Result<()> {
+        let cause = observation.cause;
+        let restore_error = restore_error.to_string();
+        let clear = anchor_store_policy::clear_all(
+            &mut self.anchor_store,
+            &self.anchor_budget,
+            "failed-restore",
+        );
+        self.committed_tokens.clear();
+        self.live_logits = None;
+        self.request_anchor_transaction_active = false;
+        let reset = self.cache.reset();
+        observation.outcome = if clear.is_ok() && reset.is_ok() {
+            AnchorRestoreOutcome::RestoreFailedResetSucceeded
+        } else {
+            AnchorRestoreOutcome::FailedCleanup
+        };
+        observation.hit_depth = 0;
+        observation.tokens_saved = 0;
+        observation.peak_committed_pending_bytes = self.anchor_store.peak_owned_bytes();
+        anchor_store_policy::record_restore(observation);
+        match (clear, reset) {
+            (Ok(()), Ok(())) => anyhow::bail!(
+                "DeepSeek-V4 {cause} failed; cache hard-reset and anchor lineage cleared: {restore_error}"
+            ),
+            (clear, reset) => anyhow::bail!(
+                "DeepSeek-V4 {cause} failed ({restore_error}); fail-closed cleanup also failed (clear={clear:?}, reset={reset:?})"
+            ),
+        }
     }
 
     fn prefill_window_multiplier(&self, token_count: usize) -> Result<usize> {
@@ -1027,22 +1579,47 @@ impl Deepseek4LoadedModel {
             prompt_tokens.len(),
             self.context_limit()
         );
-        self.begin_request_anchor_transaction(prompt_tokens);
+        self.begin_request_anchor_transaction(prompt_tokens)?;
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
+        let diagnostic_anchor_index = self.anchor_store.newest_committed_at_or_before(usize::MAX);
+        let diagnostic_anchor =
+            diagnostic_anchor_index.and_then(|index| self.anchor_store.committed(index));
+        let diagnostic_anchor_tokens = diagnostic_anchor
+            .map(|anchor| anchor.prompt_tokens.as_ref())
+            .unwrap_or(&[]);
         progress.cache_reset_diagnostic(
             self.committed_tokens.len(),
             self.cache.position(),
             common_prefix_len(prompt_tokens, &self.committed_tokens),
-            self.turn_anchor_tokens.len(),
-            self.turn_anchor
-                .as_ref()
-                .map_or(0, Deepseek4CacheSnapshot::position),
-            common_prefix_len(prompt_tokens, &self.turn_anchor_tokens),
+            diagnostic_anchor_tokens.len(),
+            diagnostic_anchor.map_or(0, |anchor| anchor.snapshot.position()),
+            common_prefix_len(prompt_tokens, diagnostic_anchor_tokens),
             self.cache.is_poisoned(),
             false,
             cache_grew,
         );
-        self.reset_live_cache_preserving_turn_anchor()?;
+        let divergence = AnchorDivergence::between(&self.committed_tokens, prompt_tokens);
+        let mut observation = AnchorRestoreEvent {
+            family: "deepseek4",
+            slot: self.telemetry_slot,
+            cause: "cold-resumable-prefill",
+            outcome: AnchorRestoreOutcome::MissNoMatch,
+            attempted_hit_depth: 0,
+            hit_depth: 0,
+            divergence,
+            tokens_saved: 0,
+            descendant_prune_count: 0,
+            pending_discarded: self.anchor_store.has_pending(),
+            publication_disposition: None,
+            capture_duration: Duration::ZERO,
+            peak_committed_pending_bytes: self.anchor_store.peak_owned_bytes(),
+        };
+        let reset = self.reset_live_cache_and_clear_anchors("cold-resumable-prefill");
+        if reset.is_err() {
+            observation.outcome = AnchorRestoreOutcome::FailedCleanup;
+        }
+        anchor_store_policy::record_restore(observation);
+        reset?;
         progress.plan_prefill(
             0,
             prompt_tokens.len(),
@@ -1071,7 +1648,7 @@ impl Deepseek4LoadedModel {
             prompt_tokens.len(),
             self.context_limit()
         );
-        self.begin_request_anchor_transaction(prompt_tokens);
+        self.begin_request_anchor_transaction(prompt_tokens)?;
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
         let cache_poisoned = self.cache.is_poisoned();
         let live_position = self.cache.position();
@@ -1080,29 +1657,24 @@ impl Deepseek4LoadedModel {
         } else {
             live_position
         };
-        let anchor_position = self
-            .turn_anchor
-            .as_ref()
-            .map_or(0, Deepseek4CacheSnapshot::position);
-        let selected_reuse = select_prefix_reuse(
+        let selected_reuse = select_prefix_reuse_from_store(
             prompt_tokens,
             &self.committed_tokens,
             selectable_live_position,
-            &self.turn_anchor_tokens,
-            anchor_position,
+            &self.anchor_store,
         );
         let reuse = prefer_matrix_prefill(prompt_tokens.len(), selected_reuse);
         let (cached_tokens, cache_action) = match reuse {
             PrefixReuse::Live(count) => (count, if cache_grew { "grow-live" } else { "live" }),
-            PrefixReuse::RecoveryAnchor(count) => {
-                let snapshot = self
-                    .turn_anchor
-                    .as_ref()
-                    .context("DeepSeek-V4 turn anchor disappeared before cached resume")?;
-                self.cache
-                    .restore(snapshot)
-                    .context("restore DeepSeek-V4 prompt-boundary cache for cached resume")?;
-                self.committed_tokens.clone_from(&self.turn_anchor_tokens);
+            PrefixReuse::RecoveryAnchor { count, index } => {
+                let divergence = AnchorDivergence::between(&self.committed_tokens, prompt_tokens);
+                self.restore_committed_anchor(
+                    index,
+                    "cached resumable restore",
+                    divergence,
+                    false,
+                    Some(max_tokens),
+                )?;
                 (
                     count,
                     if cache_grew {
@@ -1222,8 +1794,9 @@ impl Deepseek4LoadedModel {
                 "DeepSeek-V4 generation cancelled after committed incremental prefill"
             );
             if slice.capture_anchor_after {
-                self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])?;
-                progress.recovery_anchor_captured(plan.recovery_position);
+                if self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])? {
+                    progress.recovery_anchor_captured(plan.recovery_position);
+                }
             }
             if plan.cursor < prompt_tokens.len() {
                 drop(state);
@@ -1257,8 +1830,9 @@ impl Deepseek4LoadedModel {
         );
 
         if slice.capture_anchor_after {
-            self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])?;
-            progress.recovery_anchor_captured(plan.recovery_position);
+            if self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])? {
+                progress.recovery_anchor_captured(plan.recovery_position);
+            }
         }
         if plan.cursor < prompt_tokens.len() {
             drop(state);
@@ -1344,7 +1918,7 @@ impl Deepseek4LoadedModel {
             prompt_tokens.len(),
             self.context_limit()
         );
-        self.begin_request_anchor_transaction(prompt_tokens);
+        self.begin_request_anchor_transaction(prompt_tokens)?;
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
 
         let cache_poisoned = self.cache.is_poisoned();
@@ -1354,26 +1928,28 @@ impl Deepseek4LoadedModel {
         } else {
             live_position
         };
-        let anchor_position = self
-            .turn_anchor
-            .as_ref()
-            .map_or(0, Deepseek4CacheSnapshot::position);
-        let selected_reuse = select_prefix_reuse(
+        let selected_reuse = select_prefix_reuse_from_store(
             prompt_tokens,
             &self.committed_tokens,
             selectable_live_position,
-            &self.turn_anchor_tokens,
-            anchor_position,
+            &self.anchor_store,
         );
         let reuse = prefer_matrix_prefill(prompt_tokens.len(), selected_reuse);
         if matches!(reuse, PrefixReuse::Reset) {
+            let diagnostic_anchor_index =
+                self.anchor_store.newest_committed_at_or_before(usize::MAX);
+            let diagnostic_anchor =
+                diagnostic_anchor_index.and_then(|index| self.anchor_store.committed(index));
+            let diagnostic_anchor_tokens = diagnostic_anchor
+                .map(|anchor| anchor.prompt_tokens.as_ref())
+                .unwrap_or(&[]);
             progress.cache_reset_diagnostic(
                 self.committed_tokens.len(),
                 live_position,
                 common_prefix_len(prompt_tokens, &self.committed_tokens),
-                self.turn_anchor_tokens.len(),
-                anchor_position,
-                common_prefix_len(prompt_tokens, &self.turn_anchor_tokens),
+                diagnostic_anchor_tokens.len(),
+                diagnostic_anchor.map_or(0, |anchor| anchor.snapshot.position()),
+                common_prefix_len(prompt_tokens, diagnostic_anchor_tokens),
                 cache_poisoned,
                 selected_reuse != reuse,
                 cache_grew,
@@ -1382,16 +1958,15 @@ impl Deepseek4LoadedModel {
         let reset_from_scratch = matches!(reuse, PrefixReuse::Reset);
         let (cached_tokens, cache_action) = match reuse {
             PrefixReuse::Live(count) => (count, if cache_grew { "grow-live" } else { "live" }),
-            PrefixReuse::RecoveryAnchor(count) => {
-                let snapshot = self
-                    .turn_anchor
-                    .as_ref()
-                    .context("DeepSeek-V4 turn anchor disappeared before restore")?;
-                self.cache
-                    .restore(snapshot)
-                    .context("restore DeepSeek-V4 prompt-boundary cache")?;
-                self.committed_tokens.clone_from(&self.turn_anchor_tokens);
-                self.live_logits = None;
+            PrefixReuse::RecoveryAnchor { count, index } => {
+                let divergence = AnchorDivergence::between(&self.committed_tokens, prompt_tokens);
+                self.restore_committed_anchor(
+                    index,
+                    "prompt-boundary restore",
+                    divergence,
+                    false,
+                    Some(max_tokens),
+                )?;
                 (
                     count,
                     if cache_grew {
@@ -1402,14 +1977,65 @@ impl Deepseek4LoadedModel {
                 )
             }
             PrefixReuse::Reset => {
-                self.reset_live_cache_preserving_turn_anchor()?;
+                let divergence = AnchorDivergence::between(&self.committed_tokens, prompt_tokens);
+                let mut observation = AnchorRestoreEvent {
+                    family: "deepseek4",
+                    slot: self.telemetry_slot,
+                    cause: "cold-prefill",
+                    outcome: AnchorRestoreOutcome::MissNoMatch,
+                    attempted_hit_depth: 0,
+                    hit_depth: 0,
+                    divergence,
+                    tokens_saved: 0,
+                    descendant_prune_count: 0,
+                    pending_discarded: self.anchor_store.has_pending(),
+                    publication_disposition: None,
+                    capture_duration: Duration::ZERO,
+                    peak_committed_pending_bytes: self.anchor_store.peak_owned_bytes(),
+                };
+                let reset = self.reset_live_cache_and_clear_anchors("cold-prefill");
+                if reset.is_err() {
+                    observation.outcome = AnchorRestoreOutcome::FailedCleanup;
+                }
+                anchor_store_policy::record_restore(observation);
+                reset?;
                 (0, if cache_grew { "grow-reset" } else { "reset" })
             }
         };
         let recovery_position = prompt_tokens.len().saturating_sub(RECOVERY_TAIL_TOKENS);
         let native_prefill_rows = self.model.cfg.sliding_window as usize;
-        let short_recovery_prepass =
+        let short_recovery_candidate =
             reset_from_scratch && recovery_position > 0 && recovery_position < native_prefill_rows;
+        let short_recovery_admission = short_recovery_candidate
+            .then(|| {
+                preflight_anchor_capture(
+                    &self.cache,
+                    &self.anchor_store,
+                    &self.anchor_budget,
+                    recovery_position,
+                )
+            })
+            .transpose()?;
+        let short_recovery_execution = plan_short_recovery_execution(
+            short_recovery_candidate,
+            short_recovery_admission.map(|(admission, _)| admission),
+        )?;
+        let short_recovery_prepass =
+            short_recovery_execution == ShortRecoveryExecution::CapturePrepassThenFullPrompt;
+        if let Some((admission, anchor_bytes)) = short_recovery_admission.filter(|(admission, _)| {
+            matches!(
+                admission,
+                StagePending::NoCommittedCapacity | StagePending::BudgetExceeded { .. }
+            )
+        }) {
+            anchor_store_policy::record_preflight_budget_skip(
+                &self.anchor_store,
+                &self.anchor_budget,
+                anchor_bytes,
+                admission,
+                "short-recovery-prepass",
+            );
+        }
         let work_tokens = prompt_tokens
             .len()
             .saturating_sub(cached_tokens)
@@ -1427,6 +2053,13 @@ impl Deepseek4LoadedModel {
                 .context("DeepSeek-V4 exact-prefix cache hit has no aligned live logits");
         }
 
+        if short_recovery_execution == ShortRecoveryExecution::FullPromptOnly {
+            let final_state = self
+                .append_prompt_tokens(prompt_tokens, &cancelled, progress, supervisor)?
+                .context("DeepSeek-V4 prompt produced no verifier state")?;
+            return self.finish_prefill(final_state, 0, supervisor);
+        }
+
         // Short position-zero prompts must execute as one verifier batch.
         // Build their small recovery checkpoint in a separate prepass.
         if short_recovery_prepass {
@@ -1436,8 +2069,15 @@ impl Deepseek4LoadedModel {
                 progress,
                 supervisor,
             )?;
-            self.capture_turn_anchor(&prompt_tokens[..recovery_position])?;
-            progress.recovery_anchor_captured(recovery_position);
+            // Keep the prepass checkpoint request-local and outside the store
+            // while the identical full prompt replay resets the mutable log.
+            // Publication remains impossible until replay and terminal request
+            // success both complete.
+            let recovery_anchor = capture_anchor_candidate(
+                &self.cache,
+                &prompt_tokens[..recovery_position],
+                "snapshot DeepSeek-V4 short recovery prepass",
+            )?;
             self.cache
                 .reset()
                 .context("reset DeepSeek-V4 live cache after recovery prepass")?;
@@ -1447,6 +2087,17 @@ impl Deepseek4LoadedModel {
             let final_state = self
                 .append_prompt_tokens(prompt_tokens, &cancelled, progress, supervisor)?
                 .context("DeepSeek-V4 prompt produced no verifier state")?;
+            let outcome = anchor_store_policy::stage_pending(
+                &mut self.anchor_store,
+                &self.anchor_budget,
+                recovery_anchor,
+                "short-recovery-prepass",
+            )?;
+            anyhow::ensure!(
+                outcome == StagePending::Staged,
+                "DeepSeek-V4 short-recovery admission changed before staging: {outcome:?}"
+            );
+            progress.recovery_anchor_captured(recovery_position);
             return self.finish_prefill(final_state, 0, supervisor);
         }
 
@@ -1460,8 +2111,9 @@ impl Deepseek4LoadedModel {
                 supervisor,
             )?;
             cursor = recovery_position;
-            self.capture_turn_anchor(&prompt_tokens[..recovery_position])?;
-            progress.recovery_anchor_captured(recovery_position);
+            if self.capture_turn_anchor(&prompt_tokens[..recovery_position])? {
+                progress.recovery_anchor_captured(recovery_position);
+            }
         }
         final_state = self
             .append_prompt_tokens(&prompt_tokens[cursor..], &cancelled, progress, supervisor)?
@@ -1535,7 +2187,7 @@ fn cache_capacity_for_request(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrefixReuse {
     Live(usize),
-    RecoveryAnchor(usize),
+    RecoveryAnchor { count: usize, index: usize },
     Reset,
 }
 
@@ -1548,7 +2200,7 @@ fn common_prefix_len(left: &[u32], right: &[u32]) -> usize {
 
 fn prefer_matrix_prefill(prompt_len: usize, reuse: PrefixReuse) -> PrefixReuse {
     let cached = match reuse {
-        PrefixReuse::Live(count) | PrefixReuse::RecoveryAnchor(count) => count,
+        PrefixReuse::Live(count) | PrefixReuse::RecoveryAnchor { count, .. } => count,
         PrefixReuse::Reset => return PrefixReuse::Reset,
     };
     let suffix = prompt_len.saturating_sub(cached);
@@ -1573,9 +2225,33 @@ fn select_prefix_reuse(
         && prompt.len() > anchor.len()
         && prompt.starts_with(anchor)
     {
-        PrefixReuse::RecoveryAnchor(anchor.len())
+        PrefixReuse::RecoveryAnchor {
+            count: anchor.len(),
+            index: 0,
+        }
     } else {
         PrefixReuse::Reset
+    }
+}
+
+fn select_prefix_reuse_from_store(
+    prompt: &[u32],
+    live: &[u32],
+    live_position: usize,
+    store: &Deepseek4AnchorStore,
+) -> PrefixReuse {
+    let live = (!live.is_empty() && live_position == live.len() && prompt.starts_with(live))
+        .then_some(live.len());
+    let recovery = deepest_recovery_anchor(store, prompt).and_then(|index| {
+        store
+            .committed(index)
+            .map(|anchor| (anchor.prompt_tokens.len(), index))
+    });
+    match (live, recovery) {
+        (Some(live), Some((recovery, _))) if live >= recovery => PrefixReuse::Live(live),
+        (_, Some((count, index))) => PrefixReuse::RecoveryAnchor { count, index },
+        (Some(live), None) => PrefixReuse::Live(live),
+        (None, None) => PrefixReuse::Reset,
     }
 }
 
@@ -1638,13 +2314,243 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        balance_fresh_three_chunk_prefill, cache_capacity_for_request, common_prefix_len,
-        deepseek4_cancellation_recovery, plan_resumable_prefill_chunk, prefer_matrix_prefill,
-        resumable_matrix_prefill_chunk_len, select_prefix_reuse, should_retain_decode_scratch,
-        Deepseek4CancellationRecovery, PrefixReuse, ResumablePrefillChunk, ResumablePrefillSlice,
-        TransientScratchStats, MIN_MATRIX_APPEND_TOKENS, RECOVERY_TAIL_TOKENS,
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use mlx_native::MlxDevice;
+    use tracing_subscriber::prelude::*;
+
+    use crate::inference::models::deepseek4::{
+        cache::{Deepseek4Cache, Deepseek4CachePlan},
+        Deepseek4Config,
     };
+
+    use super::super::anchor_store::StagePending;
+    use super::super::deepseek4_anchor_store::{
+        assert_budget_conservation, publish_pending, stage_pending, Deepseek4AnchorBudget,
+        Deepseek4AnchorStore, Deepseek4PromptAnchor, DEFAULT_MAX_COMMITTED_ANCHORS,
+    };
+    use super::{
+        anchor_reprovision_budget_bytes, balance_fresh_three_chunk_prefill,
+        cache_capacity_for_request, common_prefix_len, deepseek4_cancellation_recovery,
+        plan_resumable_prefill_chunk, plan_short_recovery_execution, prefer_matrix_prefill,
+        preflight_anchor_store_migration,
+        resumable_matrix_prefill_chunk_len, select_prefix_reuse, select_prefix_reuse_from_store,
+        should_retain_decode_scratch, AnchorDivergence, Deepseek4CancellationRecovery,
+        Deepseek4Session, PrefixReuse, ResumablePrefillChunk, ResumablePrefillSlice,
+        ShortRecoveryExecution, TransientScratchStats, MIN_MATRIX_APPEND_TOKENS,
+        RECOVERY_TAIL_TOKENS,
+    };
+
+    #[derive(Clone, Default)]
+    struct AnchorEventLayer {
+        events: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    struct AnchorFieldVisitor<'a> {
+        fields: &'a mut BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for AnchorFieldVisitor<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for AnchorEventLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut AnchorFieldVisitor {
+                fields: &mut fields,
+            });
+            if fields
+                .get("family")
+                .is_some_and(|family| family == "deepseek4")
+            {
+                self.events.lock().expect("events lock").push(fields);
+            }
+        }
+    }
+
+    fn capture_anchor_events<T>(f: impl FnOnce() -> T) -> (T, Vec<BTreeMap<String, String>>) {
+        let layer = AnchorEventLayer::default();
+        let events = Arc::clone(&layer.events);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let captured = events.lock().expect("events lock").clone();
+        (result, captured)
+    }
+
+    fn test_config() -> Deepseek4Config {
+        Deepseek4Config {
+            num_hidden_layers: 2,
+            hidden_size: 64,
+            hidden_size_out: 256,
+            max_position_embeddings: 256,
+            vocab_size: 128,
+            num_attention_heads: 8,
+            num_key_value_heads: 1,
+            head_dim: 8,
+            rope_head_dim: 4,
+            rope_theta: 10_000.0,
+            rope_factor: 1.0,
+            original_context_length: 256,
+            yarn_beta_fast: 32.0,
+            yarn_beta_slow: 1.0,
+            q_lora_rank: 16,
+            o_lora_rank: 16,
+            output_groups: 2,
+            sliding_window: 128,
+            compress_ratios: vec![4, 128],
+            compress_rope_theta: 160_000.0,
+            index_num_heads: 8,
+            index_head_dim: 4,
+            index_top_k: 8,
+            rms_norm_eps: 1e-6,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            num_shared_experts: 1,
+            expert_intermediate_size: 32,
+            route_scale: 1.0,
+            normalize_topk: true,
+            swiglu_clamp_experts: vec![10.0; 2],
+            swiglu_clamp_shared: vec![10.0; 2],
+            hyper_connection_count: 2,
+            hyper_connection_sinkhorn_iterations: 2,
+            hyper_connection_epsilon: 1e-6,
+            hash_layer_count: 2,
+        }
+    }
+
+    fn test_cache() -> Deepseek4Cache {
+        let plan = Deepseek4CachePlan::for_context(&test_config(), 128).unwrap();
+        Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap()
+    }
+
+    fn new_test_session() -> Deepseek4Session {
+        let store = Deepseek4AnchorStore::with_committed_capacity(DEFAULT_MAX_COMMITTED_ANCHORS);
+        let budget = Deepseek4AnchorBudget::new(1, 64 * 1024 * 1024, store.owned_bytes()).unwrap();
+        Deepseek4Session {
+            cache: test_cache(),
+            committed_tokens: Vec::new(),
+            live_logits: None,
+            anchor_store: store,
+            anchor_budget: budget,
+            request_anchor_transaction_active: false,
+            telemetry_slot: Some(7),
+        }
+    }
+
+    #[test]
+    fn zero_depth_anchor_grant_skips_deepseek_snapshot_before_copy() {
+        let store = Deepseek4AnchorStore::with_committed_capacity(0);
+        let budget = Deepseek4AnchorBudget::new(4, 1_024, store.owned_bytes()).unwrap();
+        let admission = budget.preflight_capture(&store, 2_048);
+        assert_eq!(admission, StagePending::NoCommittedCapacity);
+
+        let mut called = false;
+        let captured = super::super::anchor_store::capture_if_anchor_admitted::<u64>(
+            admission,
+            || {
+                called = true;
+                Ok(99)
+            },
+        )
+        .unwrap();
+        assert_eq!(captured, None);
+        assert!(!called, "DeepSeek snapshot must not run at effective K=0");
+    }
+
+    #[test]
+    fn slot_reprovision_keeps_the_worker_lifetime_anchor_grant() {
+        let store = Deepseek4AnchorStore::with_committed_capacity(0);
+        let frozen_grant = 987_654_u64;
+        let budget = Deepseek4AnchorBudget::new(4, frozen_grant, store.owned_bytes()).unwrap();
+        assert_eq!(anchor_reprovision_budget_bytes(&budget), frozen_grant);
+    }
+
+    #[test]
+    fn short_recovery_capacity_only_changes_checkpoint_work() {
+        assert_eq!(
+            plan_short_recovery_execution(false, None).unwrap(),
+            ShortRecoveryExecution::Standard
+        );
+        assert_eq!(
+            plan_short_recovery_execution(
+                true,
+                Some(StagePending::NoCommittedCapacity),
+            )
+            .unwrap(),
+            ShortRecoveryExecution::FullPromptOnly,
+            "K=0 must retain one authoritative full-prompt append without a snapshot prepass"
+        );
+        assert_eq!(
+            plan_short_recovery_execution(true, Some(StagePending::Staged)).unwrap(),
+            ShortRecoveryExecution::CapturePrepassThenFullPrompt,
+            "admitted capture adds only the request-local prefix prepass"
+        );
+        assert!(plan_short_recovery_execution(
+            true,
+            Some(StagePending::PendingOccupied),
+        )
+        .is_err());
+    }
+
+    fn publish_current_anchor(session: &mut Deepseek4Session, tokens: &[u32]) {
+        assert_eq!(session.cache.position(), tokens.len());
+        let snapshot = session.cache.snapshot().unwrap();
+        let anchor = Deepseek4PromptAnchor::new(tokens, snapshot, Duration::ZERO);
+        assert_eq!(
+            stage_pending(
+                &mut session.anchor_store,
+                &session.anchor_budget,
+                anchor,
+                "test",
+            )
+            .unwrap(),
+            StagePending::Staged
+        );
+        assert!(
+            publish_pending(&mut session.anchor_store, &session.anchor_budget)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn advance_to(cache: &mut Deepseek4Cache, depth: usize) {
+        while cache.position() < depth {
+            cache.commit_step(cache.position()).unwrap();
+        }
+    }
 
     #[test]
     fn fresh_three_chunk_prefill_balances_only_the_underfilled_band() {
@@ -1788,7 +2694,7 @@ mod tests {
     fn canonical_reasoning_drop_restores_pre_answer_turn_anchor() {
         assert_eq!(
             select_prefix_reuse(&[1, 2, 7, 8], &[1, 2, 9, 7], 4, &[1, 2], 2),
-            PrefixReuse::RecoveryAnchor(2)
+            PrefixReuse::RecoveryAnchor { count: 2, index: 0 }
         );
     }
 
@@ -1822,7 +2728,7 @@ mod tests {
     #[test]
     fn trivial_prefix_reuse_yields_to_full_matrix_prefill() {
         assert_eq!(
-            prefer_matrix_prefill(306, PrefixReuse::RecoveryAnchor(1)),
+            prefer_matrix_prefill(306, PrefixReuse::RecoveryAnchor { count: 1, index: 0 }),
             PrefixReuse::Reset
         );
         assert_eq!(
@@ -1838,8 +2744,310 @@ mod tests {
             PrefixReuse::Live(37)
         );
         assert_eq!(
-            prefer_matrix_prefill(180, PrefixReuse::RecoveryAnchor(140)),
-            PrefixReuse::RecoveryAnchor(140)
+            prefer_matrix_prefill(
+                180,
+                PrefixReuse::RecoveryAnchor {
+                    count: 140,
+                    index: 0,
+                }
+            ),
+            PrefixReuse::RecoveryAnchor {
+                count: 140,
+                index: 0,
+            }
         );
+    }
+
+    #[test]
+    fn deepseek_anchor_lineage_rewind_rejects_old_descendants() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut session = new_test_session();
+        let lineage = [10, 11, 12, 13, 14, 15];
+        for depth in [2, 4, 6] {
+            advance_to(&mut session.cache, depth);
+            session.committed_tokens = lineage[..depth].to_vec();
+            publish_current_anchor(&mut session, &lineage[..depth]);
+        }
+        assert_eq!(session.anchor_store.committed_token_counts(), vec![2, 4, 6]);
+
+        let branch = [10, 11, 99];
+        let PrefixReuse::RecoveryAnchor { count: 2, index } = select_prefix_reuse_from_store(
+            &branch,
+            &session.committed_tokens,
+            session.cache.position(),
+            &session.anchor_store,
+        ) else {
+            panic!("branch must select the oldest surviving ancestor");
+        };
+        let divergence = AnchorDivergence::between(&session.committed_tokens, &branch);
+        session
+            .restore_committed_anchor(index, "lineage regression", divergence, false, None)
+            .unwrap();
+        assert_eq!(session.anchor_store.committed_token_counts(), vec![2]);
+
+        session.cache.commit_step(2).unwrap();
+        session.committed_tokens.push(99);
+        let old_c = [10, 11, 12, 13, 14, 15, 16];
+        assert_eq!(
+            select_prefix_reuse_from_store(
+                &old_c,
+                &session.committed_tokens,
+                session.cache.position(),
+                &session.anchor_store,
+            ),
+            PrefixReuse::RecoveryAnchor { count: 2, index: 0 },
+            "old B/C checkpoints must not regain authority after branch X writes"
+        );
+    }
+
+    #[test]
+    fn pending_anchor_is_affinity_invisible_and_cancellation_preserves_committed_set() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut session = new_test_session();
+        advance_to(&mut session.cache, 2);
+        publish_current_anchor(&mut session, &[1, 2]);
+        advance_to(&mut session.cache, 6);
+        session.committed_tokens = vec![9; 6];
+
+        let snapshot = session.cache.snapshot().unwrap();
+        let pending = Deepseek4PromptAnchor::new(&[1, 2, 3, 4, 5, 6], snapshot, Duration::ZERO);
+        assert_eq!(
+            stage_pending(
+                &mut session.anchor_store,
+                &session.anchor_budget,
+                pending,
+                "test-cancellation",
+            )
+            .unwrap(),
+            StagePending::Staged
+        );
+        assert_eq!(
+            session.reusable_prefix_len(&[1, 2, 3, 4, 5, 6, 7]),
+            2,
+            "request-local pending checkpoint leaked into affinity"
+        );
+
+        let committed_before = session.anchor_store.committed_token_counts();
+        let expected_peak = session.anchor_store.peak_owned_bytes();
+        let (recovery, events) = capture_anchor_events(|| session.recover_after_cancellation());
+        recovery.unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "cancellation restore must emit exactly once"
+        );
+        assert_eq!(events[0]["slot"], "Some(7)");
+        assert_eq!(events[0]["outcome"], "hit");
+        assert_eq!(events[0]["pending_discarded"], "true");
+        assert_eq!(
+            events[0]["peak_committed_pending_bytes"],
+            expected_peak.to_string()
+        );
+        assert_eq!(
+            session.anchor_store.committed_token_counts(),
+            committed_before
+        );
+        assert!(!session.anchor_store.has_pending());
+        assert_eq!(session.committed_tokens, vec![1, 2]);
+    }
+
+    #[test]
+    fn growth_preflights_every_committed_and_pending_store_anchor() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut session = new_test_session();
+        for depth in [2, 4] {
+            advance_to(&mut session.cache, depth);
+            let tokens = (0..depth as u32).collect::<Vec<_>>();
+            session.committed_tokens.clone_from(&tokens);
+            publish_current_anchor(&mut session, &tokens);
+        }
+        advance_to(&mut session.cache, 6);
+        session.committed_tokens = (0..6).collect();
+        let pending = Deepseek4PromptAnchor::new(
+            &session.committed_tokens,
+            session.cache.snapshot().unwrap(),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            stage_pending(
+                &mut session.anchor_store,
+                &session.anchor_budget,
+                pending,
+                "test-growth",
+            )
+            .unwrap(),
+            StagePending::Staged
+        );
+
+        let target_plan = Deepseek4CachePlan::for_context(&test_config(), 256).unwrap();
+        let mut grown = Deepseek4Cache::allocate(&target_plan, MlxDevice::new().unwrap()).unwrap();
+        preflight_anchor_store_migration(&grown, &session.cache, &session.anchor_store, 128, 256)
+            .unwrap();
+        grown.migrate_from(&session.cache).unwrap();
+
+        for (index, expected) in [2, 4].into_iter().enumerate() {
+            grown
+                .restore(&session.anchor_store.committed(index).unwrap().snapshot)
+                .unwrap();
+            assert_eq!(grown.position(), expected);
+        }
+        grown
+            .restore(&session.anchor_store.pending().unwrap().snapshot)
+            .unwrap();
+        assert_eq!(grown.position(), 6);
+        assert_budget_conservation(&session.anchor_budget, [session.anchor_store.owned_bytes()]);
+    }
+
+    #[test]
+    fn late_restore_failure_hard_resets_and_clears_the_whole_store() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut session = new_test_session();
+        advance_to(&mut session.cache, 7);
+        session.committed_tokens = (0..7).collect();
+        let mut snapshot = session.cache.snapshot().unwrap();
+        snapshot.corrupt_last_layer_window_shape_for_test();
+        let anchor =
+            Deepseek4PromptAnchor::new(&session.committed_tokens, snapshot, Duration::ZERO);
+        assert_eq!(
+            stage_pending(
+                &mut session.anchor_store,
+                &session.anchor_budget,
+                anchor,
+                "test-failed-restore",
+            )
+            .unwrap(),
+            StagePending::Staged
+        );
+        publish_pending(&mut session.anchor_store, &session.anchor_budget)
+            .unwrap()
+            .unwrap();
+        advance_to(&mut session.cache, 8);
+        session.committed_tokens.push(7);
+
+        let divergence = AnchorDivergence::rewind(session.cache.position(), 7);
+        let (restore, events) = capture_anchor_events(|| {
+            session.restore_committed_anchor(
+                0,
+                "injected late-layer restore",
+                divergence,
+                false,
+                None,
+            )
+        });
+        let error = restore.unwrap_err();
+        assert_eq!(events.len(), 1, "failed restore must emit exactly once");
+        assert_eq!(events[0]["slot"], "Some(7)");
+        assert_eq!(events[0]["outcome"], "restore_failed_reset_succeeded");
+        assert!(error.to_string().contains("hard-reset"));
+        assert_eq!(session.cache.position(), 0);
+        assert!(session.committed_tokens.is_empty());
+        assert_eq!(session.anchor_store.committed_len(), 0);
+        assert!(!session.anchor_store.has_pending());
+        assert_budget_conservation(&session.anchor_budget, [session.anchor_store.owned_bytes()]);
+    }
+
+    #[test]
+    fn cold_reset_and_poison_both_invalidate_anchor_authority() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut cold = new_test_session();
+        advance_to(&mut cold.cache, 2);
+        cold.committed_tokens = vec![1, 2];
+        publish_current_anchor(&mut cold, &[1, 2]);
+        cold.reset().unwrap();
+        assert_eq!(cold.anchor_store.committed_len(), 0);
+        assert_eq!(cold.cache.position(), 0);
+
+        let mut no_anchor = new_test_session();
+        advance_to(&mut no_anchor.cache, 1);
+        let (reset, no_anchor_events) =
+            capture_anchor_events(|| no_anchor.recover_after_cancellation());
+        reset.unwrap();
+        assert_eq!(
+            no_anchor_events.len(),
+            1,
+            "no-anchor cancellation reset must emit exactly once"
+        );
+        assert_eq!(no_anchor_events[0]["slot"], "Some(7)");
+        assert_eq!(no_anchor_events[0]["outcome"], "miss_no_match");
+
+        let mut poisoned = new_test_session();
+        advance_to(&mut poisoned.cache, 2);
+        poisoned.committed_tokens = vec![3, 4];
+        publish_current_anchor(&mut poisoned, &[3, 4]);
+        poisoned.cache.poison_for_test();
+        let (reset, poisoned_events) =
+            capture_anchor_events(|| poisoned.recover_after_cancellation());
+        reset.unwrap();
+        assert_eq!(
+            poisoned_events.len(),
+            1,
+            "poison cancellation reset must emit exactly once"
+        );
+        assert_eq!(poisoned_events[0]["slot"], "Some(7)");
+        assert_eq!(poisoned_events[0]["outcome"], "miss_no_match");
+        assert_eq!(poisoned.anchor_store.committed_len(), 0);
+        assert_eq!(poisoned.cache.position(), 0);
+        assert!(!poisoned.cache.is_poisoned());
+    }
+
+    #[test]
+    fn slot_anchor_stores_are_family_isolated_and_aggregate_bytes_conserve() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let store_a = Deepseek4AnchorStore::with_committed_capacity(DEFAULT_MAX_COMMITTED_ANCHORS);
+        let store_b = Deepseek4AnchorStore::with_committed_capacity(DEFAULT_MAX_COMMITTED_ANCHORS);
+        let initial_owned = store_a
+            .owned_bytes()
+            .checked_add(store_b.owned_bytes())
+            .unwrap();
+        let budget = Deepseek4AnchorBudget::new(2, 64 * 1024 * 1024, initial_owned).unwrap();
+        let mut a = Deepseek4Session {
+            cache: test_cache(),
+            committed_tokens: Vec::new(),
+            live_logits: None,
+            anchor_store: store_a,
+            anchor_budget: Arc::clone(&budget),
+            request_anchor_transaction_active: false,
+            telemetry_slot: Some(0),
+        };
+        let mut b = Deepseek4Session {
+            cache: test_cache(),
+            committed_tokens: Vec::new(),
+            live_logits: None,
+            anchor_store: store_b,
+            anchor_budget: Arc::clone(&budget),
+            request_anchor_transaction_active: false,
+            telemetry_slot: Some(1),
+        };
+        advance_to(&mut a.cache, 2);
+        a.committed_tokens = vec![1, 2];
+        publish_current_anchor(&mut a, &[1, 2]);
+        advance_to(&mut b.cache, 3);
+        b.committed_tokens = vec![7, 8, 9];
+        publish_current_anchor(&mut b, &[7, 8, 9]);
+        assert_budget_conservation(
+            &budget,
+            [a.anchor_store.owned_bytes(), b.anchor_store.owned_bytes()],
+        );
+
+        a.reset().unwrap();
+        assert_eq!(a.anchor_store.committed_len(), 0);
+        assert_eq!(b.anchor_store.committed_token_counts(), vec![3]);
+        assert_eq!(b.reusable_prefix_len(&[7, 8, 9, 10]), 3);
+        assert_budget_conservation(
+            &budget,
+            [a.anchor_store.owned_bytes(), b.anchor_store.owned_bytes()],
+        );
+    }
+
+    #[test]
+    fn anchor_equality_never_impersonates_a_live_logit_hit() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut session = new_test_session();
+        advance_to(&mut session.cache, 2);
+        session.committed_tokens = vec![9, 9];
+        publish_current_anchor(&mut session, &[1, 2]);
+        assert_eq!(session.reusable_prefix_len(&[1, 2]), 0);
+        session.committed_tokens = vec![1, 2];
+        assert_eq!(session.reusable_prefix_len(&[1, 2]), 2);
     }
 }

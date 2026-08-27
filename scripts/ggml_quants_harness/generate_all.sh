@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate ADR-033 P0 reference fixtures for all 11 v1 ggml_quants types.
+# Generate ADR-033 P0 reference fixtures for all 12 v1 ggml_quants types.
 #
 # Output: tests/fixtures/ggml_quants/<type>_<n_per_row>_<variant>_{input,expected}.bin
 # Variants: noim (no imatrix), im (imatrix on; required for IQ-family).

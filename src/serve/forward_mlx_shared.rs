@@ -11,9 +11,14 @@
 use crate::core::mlx_safetensors_loader::MlxAffineLinear;
 use crate::quantize::imatrix::{intercept_qmatmul_with_hint, ImatrixHint};
 use crate::serve::gpu::QuantWeightInfo;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
-use mlx_native::{GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice};
+use mlx_native::{
+    ggml_capability, DType, GgmlCapabilityRequest, GgmlInvocation, GgmlQuantizedMatmulParams,
+    GgmlRoutingPolicy, GgmlType, GgmlWorkloadClass, GraphSession, MlxBuffer, MlxDevice,
+    GGML_CAPABILITY_SCHEMA_VERSION,
+};
+use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
 // Cluster 1 — Quantized weight types
@@ -29,6 +34,7 @@ use mlx_native::{GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice};
 /// DWQ-trained safetensors.  Held as F32 buffers (cast at load time
 /// from BF16/F32 depending on the on-disk safetensors dtype) so the
 /// kernel can read them without an inline cast.
+#[derive(Clone)]
 pub struct MlxAffineExtra {
     /// Per-group scales, F32, shape `[N, K/group_size]`.
     pub scales: MlxBuffer,
@@ -40,8 +46,13 @@ pub struct MlxAffineExtra {
     pub group_size: u32,
 }
 
-/// Pre-loaded quantized weight buffer paired with its GGML metadata
-/// (or its mlx-affine metadata, when `affine` is `Some`).
+/// Artifact-backed matrix buffer paired with its GGML metadata (or its
+/// explicitly declared mlx-affine metadata, when `affine` is `Some`).
+///
+/// The ordinary GGUF constructor retains a read-only view of the artifact's
+/// stored bytes. It does not dequantize or re-quantize the matrix during model
+/// load, and owns no process-global state, so dropping the model releases the
+/// view before another artifact is loaded.
 pub struct MlxQWeight {
     pub buffer: MlxBuffer,
     pub info: QuantWeightInfo,
@@ -50,19 +61,6 @@ pub struct MlxQWeight {
     /// path.  Routing in `dispatch_qmatmul` checks `affine.is_some()`
     /// FIRST and skips both the F32 and GGML branches when set.
     pub affine: Option<MlxAffineExtra>,
-    /// ADR-029 iter-28 H29 — F16 pre-dequantized shadow.  When `Some`,
-    /// `dispatch_qmatmul` at m > MM_ROUTING_THRESHOLD routes through
-    /// `kernel_mul_mm_f16_f32_*` (peer's gemma4 pattern) instead of
-    /// per-call dequant inside `kernel_mul_mm_<qtype>_tensor_f32`.
-    ///
-    /// Materialized at load via `dispatch_dequant_to_f16` when the
-    /// `HF2Q_F16_SHADOW=1` env gate is set and the weight is a quantized
-    /// type the dequant kernel supports (Q4_0/Q8_0/Q5_1/IQ4_NL/Q4_K/
-    /// Q5_K/Q6_K).  ~1 GB extra resident on gemma4-26B; M5 Max's 128 GB
-    /// unified memory accommodates this without pressure.
-    ///
-    /// Default OFF until coherence + multi-regime bench parity proven.
-    pub f16_shadow: Option<MlxBuffer>,
     /// ADR-029 iter-175 Step 1d — pre-baked dispatch record for the
     /// Q6_K NR2 decode-m=1 mat-vec hot path.  Lazy-init on the first
     /// `dispatch_qmatmul` call (held in a `OnceLock` so the bake cost
@@ -76,13 +74,235 @@ pub struct MlxQWeight {
     ///
     /// Gated by [`mlx_native::ops::quantized_matmul_ggml::build_q6k_nr2_m1_record`]
     /// — only Q6_K with `HF2Q_Q6K_MV_NR2` truthy is bakeable through
-    /// this slot.  Other weight types (Q8_0, Q5_K, Q4_K, F32, affine,
-    /// F16 shadow) keep using the legacy dispatch path until additional
-    /// bake helpers land in later substeps.
+    /// this slot. Other weight types keep using their ordinary dispatch path
+    /// until additional bake helpers land.
     pub decode_record_q6k_m1: std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
 }
 
+impl Clone for MlxQWeight {
+    fn clone(&self) -> Self {
+        Self {
+            buffer: self.buffer.clone(),
+            info: self.info,
+            affine: self.affine.clone(),
+            // Dispatch records are an execution cache, not matrix identity.
+            // A cloned model-local handle lazily bakes its own record while
+            // retaining the same underlying artifact-backed buffer owner.
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+/// How a head-major BF16 activation reached an ordinary native projection.
+/// Both routes retain the weight's declared storage bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadMajorQmatmulRoute {
+    /// The stored codec has a kernel that consumes `[heads, tokens, dim]`
+    /// directly.
+    DirectPerm021,
+    /// Only the activation was permuted to `[tokens, hidden]` F32 before the
+    /// ordinary stored-weight projection.
+    ActivationPermute,
+}
+
 impl MlxQWeight {
+    #[cfg(test)]
+    pub(crate) fn from_test_buffer(
+        buffer: MlxBuffer,
+        ggml_dtype: mlx_native::GgmlType,
+        rows: usize,
+        cols: usize,
+    ) -> Self {
+        Self {
+            buffer,
+            info: QuantWeightInfo {
+                ggml_dtype,
+                rows,
+                cols,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Retain one exact, file-backed matrix view from a mapped GGUF.
+    ///
+    /// Family loaders remain responsible for capability admission before
+    /// calling this constructor. This shared ownership primitive independently
+    /// checks rank, dimensions, byte length, and file backing so every family
+    /// can use the same unload/reload-safe representation.
+    pub fn from_mapped_gguf_tensor(
+        mapped: &mlx_native::gguf::GgufMappedTensorSet<'_>,
+        info: &mlx_native::gguf::TensorInfo,
+    ) -> Result<Self> {
+        let [rows, cols] = info.shape.as_slice() else {
+            anyhow::bail!(
+                "native GGUF matrix '{}' must be rank 2, got {:?}",
+                info.name,
+                info.shape
+            );
+        };
+        if *rows == 0 || *cols == 0 {
+            anyhow::bail!("native GGUF matrix '{}' has a zero dimension", info.name);
+        }
+        Self::from_mapped_gguf_matrix_view(mapped, info, *rows, *cols)
+    }
+
+    /// Retain one exact file-backed GGUF tensor as a logical `[rows, cols]`
+    /// matrix without changing its stored representation.
+    ///
+    /// `rows` and `cols` may flatten an explicitly contiguous higher-rank
+    /// source tensor (vision patch kernels use `[N, C, H, W]` as `[N, K]`).
+    /// The logical element count and codec-specific byte extent must both
+    /// match exactly; callers cannot reinterpret a prefix of a larger tensor.
+    pub(crate) fn from_mapped_gguf_matrix_view(
+        mapped: &mlx_native::gguf::GgufMappedTensorSet<'_>,
+        info: &mlx_native::gguf::TensorInfo,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            rows > 0 && cols > 0,
+            "native GGUF matrix '{}' must have non-zero [rows, cols], got [{rows}, {cols}]",
+            info.name
+        );
+        let source_elements = info.shape.iter().try_fold(1usize, |product, dimension| {
+            product.checked_mul(*dimension).ok_or_else(|| {
+                anyhow::anyhow!("native GGUF matrix '{}' shape product overflow", info.name)
+            })
+        })?;
+        let matrix_elements = rows.checked_mul(cols).ok_or_else(|| {
+            anyhow::anyhow!("native GGUF matrix '{}' [rows, cols] overflow", info.name)
+        })?;
+        anyhow::ensure!(
+            source_elements == matrix_elements,
+            "native GGUF matrix '{}' source shape {:?} has {source_elements} elements, not declared [{rows}, {cols}] ({matrix_elements})",
+            info.name,
+            info.shape
+        );
+        let expected_bytes = native_gguf_matrix_bytes(info.ggml_type, rows, cols)?;
+        anyhow::ensure!(
+            info.byte_len == expected_bytes,
+            "native GGUF matrix '{}' metadata has {} bytes, expected exactly {expected_bytes} for {:?} [{rows}, {cols}]",
+            info.name,
+            info.byte_len,
+            info.ggml_type
+        );
+        let buffer = map_native_gguf_tensor_view(mapped, info)?;
+        anyhow::ensure!(
+            buffer.dtype() == native_gguf_buffer_dtype(info.ggml_type)?,
+            "native GGUF matrix '{}' did not retain its exact {:?} payload dtype",
+            info.name,
+            info.ggml_type
+        );
+        Ok(Self {
+            buffer,
+            info: QuantWeightInfo {
+                ggml_dtype: info.ggml_type,
+                rows,
+                cols,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Create one independently executable row-contiguous alias without
+    /// copying, dequantizing, or retaining a dense shadow.
+    pub(crate) fn exact_row_range(&self, start_row: usize, row_count: usize) -> Result<Self> {
+        anyhow::ensure!(
+            self.affine.is_none(),
+            "native GGUF row aliases require an exact stored matrix without affine state"
+        );
+        anyhow::ensure!(
+            row_count > 0,
+            "native GGUF row alias must contain at least one row"
+        );
+        let end_row = start_row
+            .checked_add(row_count)
+            .ok_or_else(|| anyhow::anyhow!("native GGUF row alias range overflow"))?;
+        anyhow::ensure!(
+            end_row <= self.info.rows,
+            "native GGUF row alias [{start_row}, {end_row}) exceeds parent rows {}",
+            self.info.rows
+        );
+        let row_bytes = native_gguf_matrix_row_bytes(self.info.ggml_dtype, self.info.cols)?;
+        let parent_bytes = row_bytes
+            .checked_mul(self.info.rows)
+            .ok_or_else(|| anyhow::anyhow!("native GGUF parent matrix byte extent overflow"))?;
+        anyhow::ensure!(
+            self.buffer.data_byte_len() == parent_bytes,
+            "native GGUF parent matrix has {} bytes, expected exactly {parent_bytes}",
+            self.buffer.data_byte_len()
+        );
+        let relative_offset = row_bytes
+            .checked_mul(start_row)
+            .ok_or_else(|| anyhow::anyhow!("native GGUF row alias byte offset overflow"))?;
+        let alias_bytes = row_bytes
+            .checked_mul(row_count)
+            .ok_or_else(|| anyhow::anyhow!("native GGUF row alias byte extent overflow"))?;
+        let absolute_offset = usize::try_from(self.buffer.byte_offset())?
+            .checked_add(relative_offset)
+            .ok_or_else(|| anyhow::anyhow!("native GGUF row alias absolute offset overflow"))?;
+        anyhow::ensure!(
+            absolute_offset % 4 == 0,
+            "native GGUF row alias absolute byte offset {absolute_offset} is not Metal-buffer aligned"
+        );
+        let dtype_bytes = self.buffer.dtype().size_of();
+        anyhow::ensure!(
+            alias_bytes % dtype_bytes == 0,
+            "native GGUF row alias byte extent {alias_bytes} is not divisible by {:?} element size {dtype_bytes}",
+            self.buffer.dtype()
+        );
+        let buffer = self
+            .buffer
+            .slice_view(u64::try_from(relative_offset)?, alias_bytes / dtype_bytes);
+        anyhow::ensure!(
+            buffer.data_byte_len() == alias_bytes,
+            "native GGUF row alias produced {} bytes, expected {alias_bytes}",
+            buffer.data_byte_len()
+        );
+        Ok(Self {
+            buffer,
+            info: QuantWeightInfo {
+                ggml_dtype: self.info.ggml_dtype,
+                rows: row_count,
+                cols: self.info.cols,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Retain an explicitly declared GGUF row vector as a logical `[1, K]`
+    /// projection without copying or reshaping its payload. This is narrower
+    /// than [`Self::from_mapped_gguf_tensor`]: only exact rank-1 `[K]` storage
+    /// is admitted, so ordinary matrices cannot acquire implicit squeeze
+    /// semantics through this constructor.
+    pub fn from_mapped_gguf_row_vector(
+        mapped: &mlx_native::gguf::GgufMappedTensorSet<'_>,
+        info: &mlx_native::gguf::TensorInfo,
+        expected_cols: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            expected_cols > 0 && info.shape.as_slice() == [expected_cols],
+            "native GGUF row vector '{}' must be exact rank 1 [{expected_cols}], got {:?}",
+            info.name,
+            info.shape
+        );
+        let buffer = map_native_gguf_tensor_view(mapped, info)?;
+        Ok(Self {
+            buffer,
+            info: QuantWeightInfo {
+                ggml_dtype: info.ggml_type,
+                rows: 1,
+                cols: expected_cols,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        })
+    }
+
     /// Build `GgmlQuantizedMatmulParams` for a mat-vec dispatch.
     ///
     /// `m` is the number of input tokens (1 for decode).
@@ -191,9 +411,254 @@ impl MlxQWeight {
                 bits: linear.bits,
                 group_size: linear.group_size as u32,
             }),
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         })
+    }
+}
+
+/// Checked byte width of one row in an admitted native GGUF matrix.
+pub(crate) fn native_gguf_matrix_row_bytes(ggml_dtype: GgmlType, cols: usize) -> Result<usize> {
+    anyhow::ensure!(cols > 0, "native GGUF matrix columns must be non-zero");
+    match ggml_dtype {
+        GgmlType::F32 => cols
+            .checked_mul(DType::F32.size_of())
+            .ok_or_else(|| anyhow::anyhow!("F32 GGUF matrix row byte extent overflow")),
+        GgmlType::F16 => cols
+            .checked_mul(DType::F16.size_of())
+            .ok_or_else(|| anyhow::anyhow!("F16 GGUF matrix row byte extent overflow")),
+        GgmlType::BF16 => cols
+            .checked_mul(DType::BF16.size_of())
+            .ok_or_else(|| anyhow::anyhow!("BF16 GGUF matrix row byte extent overflow")),
+        GgmlType::Q4_0
+        | GgmlType::Q5_0
+        | GgmlType::Q8_0
+        | GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q6_K => {
+            let cols = u32::try_from(cols)
+                .map_err(|_| anyhow::anyhow!("native GGUF matrix columns exceed u32"))?;
+            usize::try_from(mlx_native::ggml_packed_row_bytes(ggml_dtype, cols)?)
+                .map_err(Into::into)
+        }
+        other => anyhow::bail!(
+            "native GGUF matrix codec {other:?} is not admitted; no transform fallback is allowed"
+        ),
+    }
+}
+
+/// Checked exact payload bytes for an admitted native GGUF `[rows, cols]`
+/// matrix.
+pub(crate) fn native_gguf_matrix_bytes(
+    ggml_dtype: GgmlType,
+    rows: usize,
+    cols: usize,
+) -> Result<usize> {
+    anyhow::ensure!(rows > 0, "native GGUF matrix rows must be non-zero");
+    native_gguf_matrix_row_bytes(ggml_dtype, cols)?
+        .checked_mul(rows)
+        .ok_or_else(|| anyhow::anyhow!("native GGUF matrix byte extent overflow"))
+}
+
+fn native_gguf_buffer_dtype(ggml_dtype: GgmlType) -> Result<DType> {
+    match ggml_dtype {
+        GgmlType::F32 => Ok(DType::F32),
+        GgmlType::F16 => Ok(DType::F16),
+        GgmlType::BF16 => Ok(DType::BF16),
+        GgmlType::Q4_0
+        | GgmlType::Q5_0
+        | GgmlType::Q8_0
+        | GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q6_K => Ok(DType::U8),
+        other => anyhow::bail!(
+            "native GGUF matrix codec {other:?} is not admitted; no transform fallback is allowed"
+        ),
+    }
+}
+
+/// Return one row from an exact logical F32 matrix view.
+///
+/// Callers use this before any fixed-width row offset reaches Metal. Checking
+/// dtype, shape-derived elements, and logical bytes together prevents a BF16
+/// buffer or an over/undersized parent view from being reinterpreted with an
+/// F32 stride. A nonzero parent byte offset remains valid and is preserved by
+/// `slice_view`.
+pub(crate) fn exact_f32_row_view(
+    buffer: &MlxBuffer,
+    rows: usize,
+    cols: usize,
+    row: usize,
+    operation: &str,
+) -> Result<MlxBuffer> {
+    anyhow::ensure!(
+        rows > 0 && cols > 0,
+        "{operation}: F32 matrix dimensions must be nonzero, got [{rows},{cols}]"
+    );
+    anyhow::ensure!(
+        row < rows,
+        "{operation}: row {row} out of range for {rows} rows"
+    );
+    anyhow::ensure!(
+        buffer.dtype() == DType::F32,
+        "{operation}: row slicing requires F32 storage, got {:?}",
+        buffer.dtype()
+    );
+    let elements = rows
+        .checked_mul(cols)
+        .ok_or_else(|| anyhow::anyhow!("{operation}: element count overflow"))?;
+    let bytes = elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("{operation}: byte length overflow"))?;
+    anyhow::ensure!(
+        buffer.element_count() == elements && buffer.data_byte_len() == bytes,
+        "{operation}: expected exact F32 [{rows},{cols}] view ({elements} elements, {bytes} bytes), got {} elements and {} logical bytes",
+        buffer.element_count(),
+        buffer.data_byte_len()
+    );
+    let relative_bytes = row
+        .checked_mul(cols)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| anyhow::anyhow!("{operation}: row byte offset overflow"))?;
+    Ok(buffer.slice_view(u64::try_from(relative_bytes)?, cols))
+}
+
+/// Exact logical-byte accounting for model-owned matrix views. Views that
+/// name the same Metal allocation range are counted once, so tied output
+/// heads and MTP aliases cannot inflate residency reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeMatrixStorageSummary {
+    pub unique_matrix_views: usize,
+    pub file_backed_bytes: u64,
+    pub anonymous_bytes: u64,
+}
+
+impl NativeMatrixStorageSummary {
+    pub fn resident_bytes(self) -> u64 {
+        self.file_backed_bytes + self.anonymous_bytes
+    }
+}
+
+/// Summarize the physical backing of exact model matrix views. The identity
+/// includes the underlying Metal resource and logical byte range: separate
+/// tensors in one scoped GGUF mapping remain distinct, while ARC clones of a
+/// tied tensor collapse to one entry.
+pub fn summarize_native_matrix_storage<'a>(
+    buffers: impl IntoIterator<Item = &'a MlxBuffer>,
+) -> Result<NativeMatrixStorageSummary> {
+    let mut seen = BTreeSet::new();
+    let mut summary = NativeMatrixStorageSummary::default();
+    for buffer in buffers {
+        let identity = (
+            buffer.contents_ptr() as usize,
+            buffer.byte_offset(),
+            buffer.data_byte_len(),
+        );
+        if !seen.insert(identity) {
+            continue;
+        }
+        let bytes = u64::try_from(buffer.data_byte_len())?;
+        summary.unique_matrix_views += 1;
+        if buffer.is_file_backed() {
+            summary.file_backed_bytes = summary
+                .file_backed_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow::anyhow!("file-backed matrix byte accounting overflow"))?;
+        } else {
+            summary.anonymous_bytes = summary
+                .anonymous_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow::anyhow!("anonymous matrix byte accounting overflow"))?;
+        }
+    }
+    Ok(summary)
+}
+
+/// Retain one exact, file-backed tensor view from a mapped GGUF.
+///
+/// Rank-2 matrices normally use [`MlxQWeight::from_mapped_gguf_tensor`]. Expert
+/// stacks use this raw form because their rank-3 dispatch metadata is carried
+/// by the family graph.
+pub fn map_native_gguf_tensor_view(
+    mapped: &mlx_native::gguf::GgufMappedTensorSet<'_>,
+    info: &mlx_native::gguf::TensorInfo,
+) -> Result<MlxBuffer> {
+    let buffer = mapped
+        .load_tensor(&info.name)
+        .map_err(|error| anyhow::anyhow!("map native GGUF tensor '{}': {error}", info.name))?;
+    if !buffer.is_file_backed() || buffer.data_byte_len() != info.byte_len {
+        anyhow::bail!(
+            "native GGUF tensor '{}' did not retain its file-backed {}-byte payload",
+            info.name,
+            info.byte_len
+        );
+    }
+    Ok(buffer)
+}
+
+#[cfg(test)]
+mod native_matrix_mapped_tests {
+    use super::*;
+    use crate::backends::gguf::writer::GgufWriter;
+    use crate::quantize::ggml_quants::GgmlType as WriterGgmlType;
+
+    #[test]
+    fn native_matrix_mapped_lifecycle_is_path_independent_across_a_b_a() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Some(device) = MlxDevice::new().ok() else {
+            eprintln!("[skip] Metal device unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = 4usize;
+        let cols = 256usize;
+
+        let load_once = |name: &str, base: f32| {
+            let path = tmp.path().join(name);
+            let payload: Vec<f32> = (0..rows * cols).map(|value| base + value as f32).collect();
+            {
+                let file = std::fs::File::create(&path).unwrap();
+                let mut writer = GgufWriter::new(file);
+                writer.write_header(1, 0).unwrap();
+                let tensor = writer
+                    .reserve_tensor_info(
+                        "token_embd.weight",
+                        &[cols as u64, rows as u64],
+                        WriterGgmlType::F32,
+                    )
+                    .unwrap();
+                writer.pad_to_alignment().unwrap();
+                writer
+                    .stream_tensor_payload(tensor, bytemuck::cast_slice(&payload))
+                    .unwrap();
+                writer.finalize().unwrap();
+            }
+
+            let gguf = mlx_native::gguf::GgufFile::open(&path).unwrap();
+            let info = gguf.tensor_info("token_embd.weight").unwrap();
+            let mapped = gguf.map_tensor_data(&device).unwrap();
+            let weight = MlxQWeight::from_mapped_gguf_tensor(&mapped, info).unwrap();
+            drop(mapped);
+            drop(gguf);
+            std::fs::remove_file(&path).unwrap();
+
+            let tied_head = weight.clone();
+            let storage =
+                summarize_native_matrix_storage([&weight.buffer, &tied_head.buffer]).unwrap();
+            assert_eq!(storage.unique_matrix_views, 1);
+            assert_eq!(storage.file_backed_bytes, (rows * cols * 4) as u64);
+            assert_eq!(storage.anonymous_bytes, 0);
+
+            let retained = weight.buffer.as_slice::<f32>().unwrap();
+            assert_eq!(retained[0], base);
+            assert_eq!(retained[rows * cols - 1], base + (rows * cols - 1) as f32);
+            drop(weight);
+        };
+
+        // Only one mapping is resident at a time. Reopening A at the same path
+        // after B must derive state solely from the new A artifact bytes.
+        load_once("model-a.gguf", 1000.0);
+        load_once("model-b.gguf", 2000.0);
+        load_once("model-a.gguf", 1000.0);
     }
 }
 
@@ -227,15 +692,81 @@ pub struct MlxAffineMoeStack {
     pub num_experts: usize,
 }
 
-/// Helper: load a GGUF tensor as raw quantized bytes into an MlxQWeight.
-///
-/// The tensor name is looked up in the GGUF file, its raw GGML block data
-/// is copied into a new MlxBuffer, and the `QuantWeightInfo` is derived
-/// from the tensor's metadata (shape and GGML type).
+impl MlxAffineMoeStack {
+    /// Validate a complete affine expert representation before any immutable
+    /// native route is activated. Request-time validation is too late: a bad
+    /// overlay must not leave unrelated BF16 or scalar route authority frozen.
+    pub(crate) fn validate_geometry(
+        &self,
+        label: &str,
+        expected_n: usize,
+        expected_k: usize,
+        expected_experts: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.n == expected_n
+                && self.k == expected_k
+                && self.num_experts == expected_experts,
+            "{label}: affine shape [{}, {}, {} experts] != expected [{expected_n}, {expected_k}, {expected_experts} experts]",
+            self.n,
+            self.k,
+            self.num_experts,
+        );
+        anyhow::ensure!(
+            self.bits == 4 && self.group_size == 32,
+            "{label}: affine representation requires bits=4 and group_size=32, got bits={} group_size={}",
+            self.bits,
+            self.group_size,
+        );
+        anyhow::ensure!(
+            expected_k % 8 == 0 && expected_k % self.group_size as usize == 0,
+            "{label}: affine input width {expected_k} is not divisible by packing/group geometry"
+        );
+        anyhow::ensure!(
+            self.weight.dtype() == DType::U32,
+            "{label}: affine weights must be U32"
+        );
+        anyhow::ensure!(
+            self.scales.dtype() == DType::BF16,
+            "{label}: affine scales must be BF16"
+        );
+        anyhow::ensure!(
+            self.biases.dtype() == DType::BF16,
+            "{label}: affine biases must be BF16"
+        );
+
+        let weight_bytes = expected_experts
+            .checked_mul(expected_n)
+            .and_then(|v| v.checked_mul(expected_k / 8))
+            .and_then(|v| v.checked_mul(std::mem::size_of::<u32>()))
+            .context("affine expert weight extent overflow")?;
+        let affine_elements = expected_experts
+            .checked_mul(expected_n)
+            .and_then(|v| v.checked_mul(expected_k / self.group_size as usize))
+            .context("affine expert scale extent overflow")?;
+        let affine_bytes = affine_elements
+            .checked_mul(std::mem::size_of::<u16>())
+            .context("affine expert scale byte extent overflow")?;
+        anyhow::ensure!(
+            self.weight.byte_len() == weight_bytes,
+            "{label}: affine weight buffer has {} bytes, expected {weight_bytes}",
+            self.weight.byte_len()
+        );
+        anyhow::ensure!(
+            self.scales.byte_len() == affine_bytes && self.biases.byte_len() == affine_bytes,
+            "{label}: affine scale/bias buffers have {}/{} bytes, expected {affine_bytes}",
+            self.scales.byte_len(),
+            self.biases.byte_len(),
+        );
+        Ok(())
+    }
+}
+
+/// Resolve a rank-2 GGUF matrix as an exact view of one scoped mapping.
 pub(crate) fn load_gguf_qweight(
     gguf: &mlx_native::gguf::GgufFile,
+    mapped: &mlx_native::gguf::GgufMappedTensorSet<'_>,
     name: &str,
-    device: &MlxDevice,
 ) -> Result<MlxQWeight> {
     let full_name = if name.ends_with(".weight") {
         name.to_string()
@@ -245,96 +776,139 @@ pub(crate) fn load_gguf_qweight(
     let info = gguf
         .tensor_info(&full_name)
         .ok_or_else(|| crate::serve::load_diagnostic::MissingGgufTensor::new(full_name.clone()))?;
-    anyhow::ensure!(
-        info.shape.len() == 2,
-        "native GGUF weight {full_name} must be rank 2, got shape {:?}",
-        info.shape
-    );
-    let buffer = gguf
-        .load_tensor(&full_name, device)
-        .map_err(|e| anyhow::anyhow!("load {}: {e}", full_name))?;
-
-    // Shape: [rows, cols] for 2D weight matrices.
-    let rows = info.shape[0];
-    let cols = info.shape[1];
-
-    Ok(MlxQWeight {
-        buffer,
-        info: QuantWeightInfo {
-            ggml_dtype: info.ggml_type,
-            rows,
-            cols,
-        },
-        affine: None,
-        f16_shadow: None,
-        decode_record_q6k_m1: std::sync::OnceLock::new(),
-    })
+    MlxQWeight::from_mapped_gguf_tensor(mapped, info)
+        .map_err(|error| anyhow::anyhow!("load {full_name} from scoped GGUF mapping: {error}"))
 }
 
-/// ADR-029 iter-28 H29 — populate the F16 pre-dequantized shadow for a
-/// quantized weight.  Returns Ok(()) silently if:
-///   * HF2Q_F16_SHADOW is unset / falsy (default), OR
-///   * the weight is not a quantized type that dequant_to_f16 supports
-///     (F32 / F16 / I16 / affine).
+/// Whether a stored projection can consume head-major BF16 activations
+/// directly. Explicit affine overlays retain their own route and therefore
+/// always use the activation-permute path here.
+pub fn supports_native_perm021(weight: &MlxQWeight, m: u32, head_dim: u32) -> bool {
+    if weight.affine.is_some() {
+        return false;
+    }
+    let Ok(n) = u32::try_from(weight.info.rows) else {
+        return false;
+    };
+    let Ok(k) = u32::try_from(weight.info.cols) else {
+        return false;
+    };
+    ggml_capability(GgmlCapabilityRequest {
+        schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
+        invocation: GgmlInvocation::DensePerm021Bf16 { m, n, k, head_dim },
+        ggml_type: weight.info.ggml_dtype,
+        workload: GgmlWorkloadClass::Prompt,
+        routing: GgmlRoutingPolicy::default(),
+    })
+    .executable
+}
+
+/// Project a head-major BF16 activation through an artifact-native matrix.
 ///
-/// When ENABLED and the weight type is supported, dispatches the dequant
-/// kernel at load time, allocates a 2-bytes/elem F16 buffer, and stores
-/// it as the `f16_shadow` field.  Subsequent `dispatch_qmatmul` at m > 8
-/// will fast-path through the F16-input matmul kernel (kernel_mul_mm_f16
-/// _f32_tensor) which avoids per-call dequant overhead.
-///
-/// Memory cost: ~1 GB extra resident for gemma4-26B attn weights when
-/// applied to attn_q/k/v/output + ffn_gate/up.  On the M5 Max target
-/// (128 GB unified), this is well within budget; matches peer's strategy.
-pub(crate) fn populate_f16_shadow_if_enabled(
-    qweight: &mut MlxQWeight,
-    device: &MlxDevice,
+/// Codecs with a declared direct kernel read `[heads, tokens, head_dim]`
+/// without an intermediate. Every other admitted codec permutes only the
+/// activation into the caller-provided F32 scratch and then uses the ordinary
+/// native stored-weight route. This helper never transforms or shadows the
+/// weight.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_qmatmul_head_major_bf16(
+    session: &mut GraphSession<'_>,
     registry: &mut mlx_native::KernelRegistry,
-    tensor_name: &str,
-) -> Result<()> {
-    // iter-31 default-flip: H29 default-true; opt-out via =0/false/off.
-    let enabled = std::env::var("HF2Q_F16_SHADOW")
-        .ok()
-        .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
-        .unwrap_or(true);
-    if !enabled {
-        return Ok(());
+    device: &MlxDevice,
+    input_head_major: &MlxBuffer,
+    seq_major_scratch: &MlxBuffer,
+    weight: &MlxQWeight,
+    output: &MlxBuffer,
+    m: u32,
+    n_heads: usize,
+    head_dim: usize,
+    imatrix_hint: ImatrixHint<'_>,
+) -> Result<HeadMajorQmatmulRoute> {
+    anyhow::ensure!(m > 0, "head-major projection token count must be positive");
+    anyhow::ensure!(
+        n_heads > 0 && head_dim > 0,
+        "head-major projection dimensions must be positive"
+    );
+    let hidden = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow::anyhow!("head-major projection hidden width overflow"))?;
+    anyhow::ensure!(
+        hidden == weight.info.cols,
+        "head-major projection width {hidden} does not match stored weight width {}",
+        weight.info.cols
+    );
+    anyhow::ensure!(
+        input_head_major.dtype() == mlx_native::DType::BF16,
+        "head-major projection input must be BF16, got {:?}",
+        input_head_major.dtype()
+    );
+    anyhow::ensure!(
+        seq_major_scratch.dtype() == mlx_native::DType::F32,
+        "head-major projection scratch must be F32, got {:?}",
+        seq_major_scratch.dtype()
+    );
+    anyhow::ensure!(
+        output.dtype() == mlx_native::DType::F32,
+        "head-major projection output must be F32, got {:?}",
+        output.dtype()
+    );
+    let head_dim_u32 = u32::try_from(head_dim)
+        .map_err(|_| anyhow::anyhow!("head-major projection head_dim exceeds u32"))?;
+    let n = u32::try_from(weight.info.rows)
+        .map_err(|_| anyhow::anyhow!("head-major projection rows exceed u32"))?;
+    let k = u32::try_from(weight.info.cols)
+        .map_err(|_| anyhow::anyhow!("head-major projection cols exceed u32"))?;
+
+    if supports_native_perm021(weight, m, head_dim_u32) {
+        let params = mlx_native::GgmlQuantizedMatmulPerm021Params {
+            m,
+            n,
+            k,
+            head_dim: head_dim_u32,
+            ggml_type: weight.info.ggml_dtype,
+        };
+        // `barrier_between` both resolves prior hazards and registers this
+        // dispatch with the graph conflict tracker.
+        session.barrier_between(&[input_head_major, &weight.buffer], &[output]);
+        mlx_native::quantized_matmul_mm_tensor_perm021(
+            session.encoder_mut(),
+            registry,
+            device,
+            input_head_major,
+            &weight.buffer,
+            output,
+            &params,
+        )
+        .map_err(|error| anyhow::anyhow!("native head-major projection failed: {error}"))?;
+        return Ok(HeadMajorQmatmulRoute::DirectPerm021);
     }
 
-    // Skip when affine — that path doesn't go through dispatch_qmatmul's
-    // quantized branch.
-    if qweight.affine.is_some() {
-        return Ok(());
-    }
-
-    // Skip types the dequant kernel doesn't handle.
-    use mlx_native::GgmlType;
-    match qweight.info.ggml_dtype {
-        GgmlType::Q4_0
-        | GgmlType::Q8_0
-        | GgmlType::Q5_1
-        | GgmlType::IQ4_NL
-        | GgmlType::Q4_K
-        | GgmlType::Q5_K
-        | GgmlType::Q6_K => {}
-        _ => return Ok(()),
-    }
-
-    let n_rows = qweight.info.rows as u32;
-    let n_cols = qweight.info.cols as u32;
-
-    let f16 = mlx_native::ops::dequant_to_f16::materialize_f16_shadow(
-        device,
+    let m_usize = usize::try_from(m)
+        .map_err(|_| anyhow::anyhow!("head-major projection token count exceeds usize"))?;
+    session.barrier_between(&[input_head_major], &[seq_major_scratch]);
+    mlx_native::ops::transpose::permute_021_bf16_to_f32(
+        session.encoder_mut(),
         registry,
-        &qweight.buffer,
-        n_rows,
-        n_cols,
-        qweight.info.ggml_dtype,
+        device.metal_device(),
+        input_head_major,
+        seq_major_scratch,
+        n_heads,
+        m_usize,
+        head_dim,
     )
-    .map_err(|e| anyhow::anyhow!("F16 shadow materialize for '{}': {e}", tensor_name))?;
-
-    qweight.f16_shadow = Some(f16);
-    Ok(())
+    .map_err(|error| anyhow::anyhow!("head-major activation permute failed: {error}"))?;
+    session.barrier_between(&[seq_major_scratch, &weight.buffer], &[output]);
+    dispatch_qmatmul(
+        session,
+        registry,
+        device,
+        seq_major_scratch,
+        weight,
+        output,
+        m,
+        imatrix_hint,
+    )?;
+    Ok(HeadMajorQmatmulRoute::ActivationPermute)
 }
 
 /// ADR-022 P1.9 — APEX-format Gemma4 GGUFs preserve `ffn_gate_inp.weight`
@@ -470,38 +1044,6 @@ pub fn dispatch_qmatmul(
         .map_err(|e| anyhow::anyhow!("qmm_affine_t_packed_simd4_b4 failed: {e}"));
     }
 
-    // ADR-029 iter-28 H29 / iter-30 H29-speed — F16 pre-dequant fast path.
-    //
-    // When a quantized weight has been pre-dequantized to F16 at load
-    // (via populate_f16_shadow_if_enabled under HF2Q_F16_SHADOW=1),
-    // route m > MM_ROUTING_THRESHOLD (= 8, prefill) through the V2-tile
-    // F16-weight × F32-input mat-mat kernel (`hf2q_mul_mm_tensor_v2_f16`).
-    // This is the F16-input analog of the V2 quantized kernel — same
-    // 64×128 tile + direct-device B-read — without the per-call dequant
-    // work inside the matmul.  Peer's gemma4 strategy.
-    //
-    // Decode m=1 still routes through the quantized branch below (the
-    // dequant cost is amortized over fewer dispatches, and the m=1 mv
-    // kernel is bandwidth-bound — no clear win for F16 there).
-    if m > mlx_native::ops::quantized_matmul_ggml::MM_ROUTING_THRESHOLD {
-        if let Some(ref f16w) = weight.f16_shadow {
-            let n = weight.info.rows as u32;
-            let k = weight.info.cols as u32;
-            return mlx_native::ops::quantized_matmul_ggml::dispatch_mm_v2_f16(
-                session.encoder_mut(),
-                registry,
-                device,
-                f16w,
-                input,
-                output,
-                m,
-                n,
-                k,
-            )
-            .map_err(|e| anyhow::anyhow!("dispatch_qmatmul F16-shadow V2 path failed: {e}"));
-        }
-    }
-
     if weight.info.ggml_dtype == mlx_native::GgmlType::F32 {
         // F32 dense path.  Weight buffer holds [n_rows, k_cols] f32 row-major.
         //
@@ -509,8 +1051,7 @@ pub fn dispatch_qmatmul(
         // kernel `dense_matmul_f32_f32_tensor` wastes 87.5% of its 8x8 SIMD-
         // group-matrix tile (uses 1 row of input out of 8 loaded).  Route
         // m=1 dispatches through `dispatch_dense_matvec_f32` (mat-VECTOR
-        // kernel, MTLSize threads=32x2, 4 rows/dst x 2 SGs) which matches
-        // peer's `kernel_mul_mv_f32_f32` pattern.  Gemma4 router_proj
+        // kernel, MTLSize threads=32x2, 4 rows/dst x 2 SGs). Gemma4 router_proj
         // (ffn_gate_inp F32 [2816,128]) measured ~73 µs/layer via the
         // mat-mat kernel under HF2Q_FFN_SPLIT bisect; the mat-vec kernel
         // is bandwidth-bound at ~7-10 µs/layer = ~63 µs/layer x 30 layers
@@ -555,23 +1096,20 @@ pub fn dispatch_qmatmul(
         .map_err(|e| anyhow::anyhow!("dense_matmul_f32_f32_tensor failed: {e}"));
     }
 
-    // Native F16 weight tensor from GGUF (NOT the Q*→F16 shadow path above).
+    // Native F16 weight tensor from GGUF.
     //
     // Some convert pipelines, including hf2q's own (`should_emit_f16_for_kquant`
     // in `src/quantize/layer_mix.rs`), emit raw F16 for tensors whose row length
     // isn't a multiple of the K-quant super-block size (256) — e.g. Gemma 4
     // 26B-A4B's `ffn_down.weight` (intermediate=2112) and `ffn_down_exps.weight`
-    // (moe_intermediate=704).  Community quants (bartowski, unsloth) instead
-    // fall back to 32-aligned legacy quants (Q5_1 / IQ4_NL / Q8_0); both
-    // patterns are valid per the GGUF spec and the peer accepts either.
+    // (moe_intermediate=704). Other valid artifacts instead use 32-aligned
+    // legacy quants (Q5_1 / IQ4_NL / Q8_0); both are admitted explicitly.
     //
     // `quantized_matmul_ggml` below only handles Q-family block types, so
     // F16 weights would error there ("does not support F16").  Route them to
     // the matching F16 kernels — F16 weight × F32 input → F32 output — at
     // both prefill (m > 1, `dispatch_mm_v2_f16`) and decode (m = 1,
-    // `dispatch_dense_matvec_f16w_f32io`).  These are the same kernels used
-    // by the F16-shadow prefill path above, plus the decode-m=1 matvec
-    // already used by lm_head's F16 weight when present.
+    // `dispatch_dense_matvec_f16w_f32io`).
     if weight.info.ggml_dtype == mlx_native::GgmlType::F16 {
         let n = weight.info.rows as u32;
         let k = weight.info.cols as u32;
@@ -604,6 +1142,32 @@ pub fn dispatch_qmatmul(
         .map_err(|e| anyhow::anyhow!("dispatch_mm_v2_f16 (native F16) failed: {e}"));
     }
 
+    // Native BF16 GGUF storage. Execute the retained typed buffer directly at
+    // both decode and prompt widths; there is no BF16→F32/F16 shadow and no
+    // load-time or inference-time weight re-encoding.
+    if weight.info.ggml_dtype == mlx_native::GgmlType::BF16 {
+        let n = weight.info.rows as u32;
+        let k = weight.info.cols as u32;
+        let params = mlx_native::DenseMmBf16F32Params {
+            m,
+            n,
+            k,
+            src0_batch: 1,
+            src1_batch: 1,
+        };
+        return mlx_native::dense_matmul_bf16_f32_auto(
+            session.encoder_mut(),
+            registry,
+            device,
+            &weight.buffer,
+            input,
+            output,
+            &params,
+        )
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("activated native BF16 projection failed: {e}"));
+    }
+
     // ADR-029 iter-175 Step 1d — Q6_K NR2 decode-m=1 fast path via
     // pre-baked DispatchRecord.  Eliminates per-call HashMap pipeline
     // lookup, MTLSize::new, ggml_type match arms, and
@@ -617,8 +1181,6 @@ pub fn dispatch_qmatmul(
     //
     // Pre-conditions established by earlier branches in this function:
     //   - weight.affine.is_none() (would have returned at affine block)
-    //   - weight.f16_shadow not applicable at m=1 (only consulted at
-    //     m > MM_ROUTING_THRESHOLD)
     //   - weight.info.ggml_dtype != F32 (would have returned at F32 block)
     //   - weight.info.ggml_dtype != F16 (would have returned at F16 block)
     if m == 1 && weight.info.ggml_dtype == mlx_native::GgmlType::Q6_K {
@@ -1156,7 +1718,6 @@ mod dispatch_qmatmul_f32_router_test {
                 cols: k,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         };
 

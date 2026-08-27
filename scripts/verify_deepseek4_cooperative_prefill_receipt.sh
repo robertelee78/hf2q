@@ -10,6 +10,8 @@ expected_source_sha=${6:?expected source SHA is required}
 expected_model_sha=${7:?expected model SHA-256 is required}
 contention_measurement_log=${8:?contention measurement log is required}
 contention_settle_log=${9:?contention settle log is required}
+dependency_receipt=${10:?verified dependency receipt is required}
+expected_dependency_receipt_sha=${11:?verified dependency receipt SHA-256 is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -18,7 +20,8 @@ source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 for path in "$summary" "$raw" "$test_log" "$measurement_log" "$settle_log" \
-  "$contention_measurement_log" "$contention_settle_log"; do
+  "$contention_measurement_log" "$contention_settle_log" \
+  "$dependency_receipt"; do
   [[ -s "$path" ]] || {
     echo "cooperative prefill receipt input is missing or empty: $path" >&2
     exit 1
@@ -32,6 +35,23 @@ done
   echo "invalid expected model SHA-256: $expected_model_sha" >&2
   exit 2
 }
+[[ ! -L "$dependency_receipt" \
+  && "$expected_dependency_receipt_sha" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "invalid verified dependency receipt identity" >&2
+  exit 2
+}
+test "$(sha256_file "$dependency_receipt")" = \
+  "$expected_dependency_receipt_sha"
+jq -e '
+  .schema_version == 1 and .status == "pass"
+  and .dependency.name == "mlx-native"
+  and (.dependency.version
+    | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+  and .dependency.requirement == ("=" + .dependency.version)
+  and .dependency.source
+    == "registry+https://github.com/rust-lang/crates.io-index"
+  and (.dependency.checksum | test("^[0-9a-f]{64}$"))
+' "$dependency_receipt" >/dev/null
 
 test "$(sha256_file "$raw")" = "$(jq -er .raw_sha256 "$summary")"
 test "$(sha256_file "$test_log")" = "$(jq -er .test_log_sha256 "$summary")"
@@ -46,6 +66,7 @@ test "$(sha256_file "$contention_settle_log")" = \
 jq -s -e 'length == 1' "$summary" >/dev/null
 
 jq -e --slurpfile raw "$raw" \
+  --slurpfile dependency "$dependency_receipt" \
   --arg source_sha "$expected_source_sha" \
   --arg model_sha256 "$expected_model_sha" '
   def abs: if . < 0 then -. else . end;
@@ -85,7 +106,7 @@ jq -e --slurpfile raw "$raw" \
     and $raw_receipt.schema_version == 1
     and .schema_version == 2 and .status == "pass"
     and .source_sha == $source_sha and .model_sha256 == $model_sha256
-    and .mlx_native_version == "0.11.2"
+    and .mlx_native_version == $dependency[0].dependency.version
     and .artifact_bytes == 107431343168 and .layers == 43
     and .prefix_rows == 148 and .prefix_mod_128 == 20 and .prefix_mod_4 == 0
     and [.parity_shapes[] | [.sequences,.rows_per_lane,.aggregate_rows]]
@@ -131,7 +152,7 @@ jq -e --slurpfile raw "$raw" \
     and .over_limit_measurement_samples == 0
     and .non_nominal_measurement_samples == .fair_measurement_samples
     and .settle_telemetry_gaps == 0 and .telemetry_gaps == 0
-    and .host_contention.policy == "process-group-v1"
+    and .host_contention.policy == "process-group-cpu-v2"
     and (.host_contention.settle.log_sha256 | test("^[0-9a-f]{64}$"))
     and (.host_contention.settle.samples | type) == "number"
     and .host_contention.settle.samples > 0

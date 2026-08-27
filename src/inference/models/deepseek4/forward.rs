@@ -57,6 +57,17 @@ impl Deepseek4Model {
         if token_ids.is_empty() {
             bail!("DeepSeek-V4 forward requires at least one token");
         }
+        if let Some((position, token)) = token_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, token)| *token >= self.cfg.vocab_size)
+        {
+            bail!(
+                "DeepSeek-V4 token ID {token} at position {position} exceeds vocabulary {}",
+                self.cfg.vocab_size
+            );
+        }
         let hidden = self.cfg.hidden_size as usize;
         let tokens = token_ids.len();
         let device = self.ctx.device().clone();
@@ -121,6 +132,76 @@ impl Deepseek4Model {
                     },
                 )
                 .context("encode DeepSeek-V4 Q2_K embedding gather")?,
+            GgmlType::Q4_0 => session
+                .embedding_gather_q4_0(
+                    registry,
+                    device,
+                    embedding,
+                    &arena.ids,
+                    &arena.gathered,
+                    &mlx_native::EmbeddingQ4_0Params {
+                        vocab_size: vocab,
+                        embed_dim: hidden,
+                        n_tokens: tokens,
+                    },
+                )
+                .context("encode DeepSeek-V4 Q4_0 embedding gather")?,
+            GgmlType::Q5_0 => session
+                .embedding_gather_q5_0(
+                    registry,
+                    device,
+                    embedding,
+                    &arena.ids,
+                    &arena.gathered,
+                    &mlx_native::EmbeddingQ5_0Params {
+                        vocab_size: vocab,
+                        embed_dim: hidden,
+                        n_tokens: tokens,
+                    },
+                )
+                .context("encode DeepSeek-V4 Q5_0 embedding gather")?,
+            GgmlType::Q4_K => session
+                .embedding_gather_q4_k(
+                    registry,
+                    device,
+                    embedding,
+                    &arena.ids,
+                    &arena.gathered,
+                    &mlx_native::EmbeddingQ4KParams {
+                        vocab_size: vocab,
+                        embed_dim: hidden,
+                        n_tokens: tokens,
+                    },
+                )
+                .context("encode DeepSeek-V4 Q4_K embedding gather")?,
+            GgmlType::Q5_K => session
+                .embedding_gather_q5_k(
+                    registry,
+                    device,
+                    embedding,
+                    &arena.ids,
+                    &arena.gathered,
+                    &mlx_native::EmbeddingQ5KParams {
+                        vocab_size: vocab,
+                        embed_dim: hidden,
+                        n_tokens: tokens,
+                    },
+                )
+                .context("encode DeepSeek-V4 Q5_K embedding gather")?,
+            GgmlType::Q6_K => session
+                .embedding_gather_q6_k(
+                    registry,
+                    device,
+                    embedding,
+                    &arena.ids,
+                    &arena.gathered,
+                    &mlx_native::EmbeddingQ6KParams {
+                        vocab_size: vocab,
+                        embed_dim: hidden,
+                        n_tokens: tokens,
+                    },
+                )
+                .context("encode DeepSeek-V4 Q6_K embedding gather")?,
             GgmlType::Q8_0 => session
                 .embedding_gather_q8_0(
                     registry,
@@ -135,9 +216,21 @@ impl Deepseek4Model {
                     },
                 )
                 .context("encode DeepSeek-V4 Q8_0 embedding gather")?,
-            other => bail!(
-                "DeepSeek-V4 optimized runtime requires Q2_K or Q8_0 token embeddings, got {other:?}"
-            ),
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => mlx_native::embedding_gather_dense(
+                session.encoder_mut(),
+                registry,
+                device,
+                embedding,
+                &arena.ids,
+                &arena.gathered,
+                &mlx_native::EmbeddingDenseParams {
+                    vocab_size: vocab,
+                    embed_dim: hidden,
+                    n_tokens: tokens,
+                },
+            )
+            .context("encode DeepSeek-V4 native-scalar embedding gather")?,
+            other => bail!("DeepSeek-V4 token embedding has no native route for {other:?}"),
         }
         session.barrier_between(&[&arena.gathered], &[&arena.state]);
         dispatch_repeat_tiled_f32(

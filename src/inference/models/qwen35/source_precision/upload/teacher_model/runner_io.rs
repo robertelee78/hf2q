@@ -331,6 +331,19 @@ mod tests {
             .unwrap()
             .copy_from_slice(&head_bits);
         let mut registry = KernelRegistry::new();
+        let head_matrix =
+            crate::inference::dense_bf16_activation::NativeBf16Matrix::unbatched_single_row(
+                "source teacher output-head IO test",
+                &head,
+                vocabulary_size,
+                hidden_size,
+            );
+        crate::inference::dense_bf16_activation::activate_native_bf16_test_plan(
+            &mut registry,
+            &device,
+            &[head_matrix],
+        )
+        .expect("activate source-teacher output-head test route");
         let eps = 1.0e-6;
         let actual = source_bf16_output_head_last(
             &device,

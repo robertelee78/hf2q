@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::convert::receipt::{ConversionReceipt, CONVERSION_RECEIPT_SCHEMA_VERSION};
+use crate::serve::cache::cache_mmproj_path;
 use crate::serve::cache::{cache_model_path, CacheManifest, ModelEntry, QuantEntry};
 use crate::serve::quant_select::QuantType;
 
@@ -59,6 +60,9 @@ pub struct LocalGgufArtifact {
     pub filename: String,
     pub root: PathBuf,
     pub path: PathBuf,
+    /// Exact same-generation projector discovered from a paired conversion
+    /// receipt or managed cache entry. Kept server-private.
+    pub projector_path: Option<PathBuf>,
     pub bytes: u64,
     pub sha256: String,
     pub quant_hint: String,
@@ -163,6 +167,7 @@ impl LocalArtifactInventory {
                 break;
             }
         }
+        bind_local_projectors(&mut artifacts, &mut warnings);
         let mut artifacts = artifacts.into_values().collect::<Vec<_>>();
         artifacts.sort_by(|left, right| {
             (!left.selectable)
@@ -367,6 +372,7 @@ fn inspect_receipt(
         filename: artifact_name.to_owned(),
         root: root.to_path_buf(),
         path: canonical,
+        projector_path: None,
         bytes: receipt.output.size,
         sha256: receipt.output.sha256.to_ascii_lowercase(),
         quant_hint,
@@ -432,6 +438,7 @@ fn discover_cache_model(
         };
         let legacy =
             crate::serve::cache::legacy_cache_model_path(&canonical_root, &model.repo_id, quant);
+        let is_legacy = canonical == legacy;
         if canonical != expected && canonical != legacy {
             push_warning(
                 warnings,
@@ -439,8 +446,7 @@ fn discover_cache_model(
             );
             continue;
         }
-        if canonical == legacy && !legacy_cache_authority_matches(&legacy, model, quant_name, entry)
-        {
+        if is_legacy && !legacy_cache_authority_matches(&legacy, model, quant_name, entry) {
             push_warning(
                 warnings,
                 "ignored a legacy cache artifact without matching repository and quant companions",
@@ -466,6 +472,7 @@ fn discover_cache_model(
                 filename: "model.gguf".into(),
                 root: canonical_root.clone(),
                 path: canonical,
+                projector_path: None,
                 bytes: entry.bytes,
                 sha256: entry.sha256.to_ascii_lowercase(),
                 quant_hint: quant.as_str().to_owned(),
@@ -476,6 +483,122 @@ fn discover_cache_model(
             },
             warnings,
         );
+
+        if let Some(projector_path) = entry.mmproj_path.as_ref() {
+            let expected_projector_path = if is_legacy {
+                legacy
+                    .parent()
+                    .expect("validated legacy cache artifact has a quant directory")
+                    .join("mmproj.gguf")
+            } else {
+                let Ok(path) = cache_mmproj_path(&canonical_root, &model.repo_id, quant) else {
+                    continue;
+                };
+                path
+            };
+            let Ok(projector_metadata) = fs::symlink_metadata(projector_path) else {
+                push_warning(warnings, "ignored a stale managed-cache projector");
+                continue;
+            };
+            if projector_metadata.file_type().is_symlink() || !projector_metadata.is_file() {
+                push_warning(warnings, "ignored a non-regular managed-cache projector");
+                continue;
+            }
+            let Ok(canonical_projector) = projector_path.canonicalize() else {
+                continue;
+            };
+            if canonical_projector != expected_projector_path {
+                push_warning(
+                    warnings,
+                    "ignored a managed-cache projector outside canonical layout",
+                );
+                continue;
+            }
+            let expected_sha = crate::core::provenance::projector_sha256(&header)
+                .ok()
+                .flatten();
+            let Some(expected_sha) = expected_sha else {
+                push_warning(warnings, "ignored an unbound managed-cache projector");
+                continue;
+            };
+            insert_artifact(
+                artifacts,
+                conflicts,
+                LocalGgufArtifact {
+                    repository: model.repo_id.clone(),
+                    revision: bounded_cache_revision(&model.revision),
+                    filename: "mmproj.gguf".into(),
+                    root: canonical_root.clone(),
+                    path: canonical_projector,
+                    projector_path: None,
+                    bytes: projector_metadata.len(),
+                    sha256: expected_sha,
+                    quant_hint: "F16-MMPROJ".into(),
+                    quant: None,
+                    selectable: false,
+                    unavailable_reason: Some(
+                        "vision projector companion; selected through its bound text model".into(),
+                    ),
+                    provenance: LocalArtifactProvenance::ManagedCache,
+                },
+                warnings,
+            );
+        }
+    }
+}
+
+fn bind_local_projectors(
+    artifacts: &mut BTreeMap<String, LocalGgufArtifact>,
+    warnings: &mut Vec<String>,
+) {
+    let companions = artifacts
+        .values()
+        .filter(|artifact| !artifact.selectable && artifact.quant_hint == "F16-MMPROJ")
+        .map(|artifact| {
+            (
+                artifact.repository.clone(),
+                artifact.revision.clone(),
+                artifact.sha256.clone(),
+                artifact.path.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for artifact in artifacts
+        .values_mut()
+        .filter(|artifact| artifact.selectable)
+    {
+        let expected = mlx_native::gguf::GgufFile::open(&artifact.path)
+            .ok()
+            .and_then(|gguf| {
+                crate::core::provenance::projector_sha256(&gguf)
+                    .ok()
+                    .flatten()
+            });
+        let Some(expected) = expected else {
+            continue;
+        };
+        let matches = companions
+            .iter()
+            .filter(|(repository, revision, sha256, path)| {
+                repository == &artifact.repository
+                    && revision == &artifact.revision
+                    && sha256.eq_ignore_ascii_case(&expected)
+                    && path.parent() == artifact.path.parent()
+            })
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            artifact.projector_path = Some(matches[0].3.clone());
+        } else {
+            artifact.selectable = false;
+            artifact.unavailable_reason = Some(format!(
+                "bound projector {expected} has {} exact local companions",
+                matches.len()
+            ));
+            push_warning(
+                warnings,
+                "ignored an incomplete or ambiguous local multimodal pair",
+            );
+        }
     }
 }
 
@@ -554,7 +677,7 @@ fn bounded_quant_hint(value: &str) -> Result<String> {
         || value.len() > 32
         || !value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
         bail!("receipt quant selector is malformed");
     }

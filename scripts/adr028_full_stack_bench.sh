@@ -14,7 +14,7 @@
 #
 # Requires: gemma-4-26B-A4B-it-DFlash-not-required model file at
 #   /opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf
-# AND llama-bench at /opt/llama.cpp/build/bin/llama-bench (optional).
+# AND the peer benchmark executable (optional).
 
 set -euo pipefail
 

@@ -6,7 +6,7 @@
   cache growth revalidated 2026-08-08
 - **Context operator surface:** superseded by
   [ADR-050](ADR-050-operator-context-and-static-info.md) on 2026-08-23
-- **Updated:** 2026-08-22 — the four-agent workload is bound to an immutable
+- **Updated:** 2026-08-24 — the four-agent workload is bound to an immutable
   insertion-ordered prompt contract and historical tool-result payload;
   `mlx-native =0.10.12` fixes non-aligned D512 tail loads; warm compatible
   suffixes cooperate through FFN/MoE; and an exact four-lane decode transaction
@@ -2427,9 +2427,13 @@ foreign `hf2q` process appeared at the measurement tail; cold response was
 65.742 seconds. The failure does not authorize a wider latency limit. Release
 measurement must begin only after the existing 60-second thermal settle and a
 new process-group-scoped contention check prove that no foreign compiler or
-model runtime is active. The model identity continues to use the cached,
-unchanged-file verification receipt; these reruns do not reread the 107 GB
-artifact merely to restate its SHA-256.
+model runtime is active. The release gate continues to use the cached,
+unchanged-file verification receipt. Its sealed schema-v2 recorder is the
+single content-hash authority: the shell reuses the portable snapshot and
+runtime reuses the loader's complete nanosecond stamp from that same receipt.
+A legacy v1 receipt remains shell-compatible evidence only and is upgraded
+through one v2 hash before it can reach the server, so a coarse snapshot
+cannot weaken same-path replacement detection.
 
 Model-free validation after the exact planner hardening passed 134 DeepSeek
 tests with zero failures and eight hardware-only tests ignored. Publication

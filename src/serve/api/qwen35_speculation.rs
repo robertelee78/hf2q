@@ -124,6 +124,10 @@ impl QwenSpeculationController {
         self.policy
     }
 
+    pub(crate) fn invalidate_conversation(&mut self) {
+        self.conversation_prompt = None;
+    }
+
     /// Decide the transaction path. A non-extension resets the state before
     /// inspection, which prevents one chat's negative acceptance outcome from
     /// disabling (or enabling) another chat.

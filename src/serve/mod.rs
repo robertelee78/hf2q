@@ -7,6 +7,7 @@ pub mod api;
 pub mod auto_pipeline;
 #[allow(dead_code)]
 pub mod cache;
+mod candidate_preflight;
 pub mod config;
 mod deepseek4_cli;
 pub(crate) mod discovery;
@@ -27,6 +28,7 @@ pub(crate) mod load_diagnostic;
 #[allow(dead_code)]
 pub mod load_info;
 pub(crate) mod managed_artifacts;
+pub(crate) mod model_identity_receipt;
 #[allow(dead_code)]
 pub mod multi_model;
 // ADR-040 Phase A iter-1 scaffolding — MultiSeqKvCache trait + types.
@@ -42,6 +44,7 @@ pub(crate) use info::print_early_rejection as print_info_early_rejection;
 // InflightBatchedScheduler signature stub. Production activation gated on
 // Phase B iter-3+ + Phase C iter-2 (Engine wiring).
 pub mod parity_quality;
+pub(crate) mod process_policy;
 #[allow(dead_code)]
 #[allow(dead_code)]
 pub mod quant_select;
@@ -51,12 +54,32 @@ pub mod sampler_pure;
 pub mod scheduler;
 pub mod spec_decode_cli;
 
+pub(crate) use candidate_preflight::preflight_engine_candidate;
+
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::chat::startup_ui::{interactive_startup_enabled, StartupOutput, StartupUi};
 use crate::cli;
+use crate::core::tokenizer_adapter::resolve_token_id;
 use crate::debug::INVESTIGATION_ENV;
+
+fn inspect_serve_projector(
+    path: &Path,
+    automatic: bool,
+) -> Result<Option<multi_model::ProjectorAdmission>> {
+    let cache_budget =
+        u64::try_from(crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES)?;
+    match multi_model::ProjectorAdmission::inspect(path, cache_budget) {
+        Ok(admission) => Ok(Some(admission)),
+        Err(error) if automatic => {
+            tracing::warn!(%error, path = %path.display(), "automatic mmproj admission rejected; continuing text-only");
+            eprintln!("Warning: automatic mmproj admission rejected; serving text-only: {error}");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
 
 /// Build a `KernelRegistry` with every shader the embedding forward
 /// path needs registered AND compiled. One warmup forward is run
@@ -775,34 +798,6 @@ fn render_jinja_template_with_specials(
     Ok(rendered)
 }
 
-fn resolve_token_id(
-    gguf: &mlx_native::gguf::GgufFile,
-    tokenizer: &tokenizers::Tokenizer,
-    metadata_key: &str,
-) -> Option<u32> {
-    peer_special_token_id(gguf, metadata_key).and_then(|id| tokenizer.id_to_token(id).map(|_| id))
-}
-
-fn peer_special_token_id(gguf: &mlx_native::gguf::GgufFile, metadata_key: &str) -> Option<u32> {
-    if let Some(id) = gguf.metadata_u32(metadata_key) {
-        return Some(id);
-    }
-
-    let tokenizer_model = gguf.metadata_string("tokenizer.ggml.model")?;
-    peer_special_token_id_for_model(tokenizer_model, metadata_key)
-}
-
-fn peer_special_token_id_for_model(tokenizer_model: &str, metadata_key: &str) -> Option<u32> {
-    match (tokenizer_model, metadata_key) {
-        // For tokenizer model `gpt2`, the peer initializes both BOS and EOS
-        // to token id 11 before applying GGUF metadata overrides.
-        ("gpt2", "tokenizer.ggml.bos_token_id") | ("gpt2", "tokenizer.ggml.eos_token_id") => {
-            Some(11)
-        }
-        _ => None,
-    }
-}
-
 fn resolve_token_text(
     gguf: &mlx_native::gguf::GgufFile,
     tokenizer: Option<&tokenizers::Tokenizer>,
@@ -852,45 +847,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         let gguf_peek = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open (arch peek): {e}"))?;
         if let Some(arch) = gguf_peek.metadata_string("general.architecture") {
-            use crate::inference::models::qwen35::{
-                is_qwen36_gguf, is_qwen3_vl_arch, is_qwen3_vl_moe_arch, ARCH_QWEN35, ARCH_QWEN35MOE,
-            };
-            // Wedge-4 / iter-227 (2026-05-02): originally a runtime
-            // actionable-error dispatch shim that bailed on Qwen3-VL
-            // arches because the LM forward path wasn't wired yet.
-            //
-            // **iter-228a (2026-05-02)**: the SERVE-side load path
-            // (`LoadedModel::load`) now routes dense Qwen3-VL through
-            // `Qwen3VlTextLoadedModel::load` and short-circuits chat
-            // completion to a `qwen3vl_text_forward_pending` 501 (the
-            // iter-215 → Wedge-3 split for Qwen3.5/3.6 in miniature).
-            //
-            // The CLI `hf2q generate` path stays bailed at this site:
-            // CLI generate has no chat-completion 501 fallback (it
-            // would have to actually decode tokens), so its blocker is
-            // iter-228b's LM forward, not iter-228a's load surface.
-            // Operators who want to validate the iter-228a load
-            // surface should run `hf2q serve --model <Qwen3-VL.gguf>`
-            // and confirm `/readyz=200` / `/v1/models` reports the
-            // model.
-            if is_qwen3_vl_arch(arch) {
-                let variant_label = if is_qwen3_vl_moe_arch(arch) {
-                    "MoE"
-                } else {
-                    "dense"
-                };
-                anyhow::bail!(
-                    "Qwen3-VL ({variant_label}, general.architecture = {arch:?}) GGUFs are recognized \
-                     but the CLI `hf2q generate` path requires a working LM forward (iter-228b \
-                     scope). iter-228a (this commit) lands the SERVE-side load path: \
-                     `hf2q serve --model <gguf>` will load this GGUF and surface it on \
-                     `/v1/models`, but chat completion still returns HTTP 501 with the \
-                     `qwen3vl_text_forward_pending` sentinel until iter-228b wires the \
-                     dense transformer forward. For text-only chat today, use a \
-                     Qwen3.5 / Qwen3.6 GGUF (full chat path). Model: {}",
-                    model_path.display(),
-                );
-            }
+            use crate::inference::models::qwen35::{is_qwen36_gguf, ARCH_QWEN35, ARCH_QWEN35MOE};
             if arch == ARCH_QWEN35 || arch == ARCH_QWEN35MOE {
                 anyhow::ensure!(
                     args.mmproj.is_none() && args.image.is_none(),
@@ -976,8 +933,8 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         kv_persist_budget_bytes: 0,
     };
     let load_start = std::time::Instant::now();
-    let loaded =
-        api::engine::GemmaLoadedModel::load(&load_opts).context("GemmaLoadedModel::load")?;
+    let loaded = api::engine::GemmaLoadedModel::load_unactivated(&load_opts)
+        .context("GemmaLoadedModel::load_unactivated")?;
     let load_elapsed = load_start.elapsed();
 
     // ADR-018 C3: emit the unified 13-line load banner on stdout (dim
@@ -1265,13 +1222,11 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                     },
                 )
             }
-            crate::inference::vision::mmproj::ArchProfile::Qwen3VlSiglip => {
+            crate::inference::vision::mmproj::ArchProfile::QwenVisionSiglip => {
                 anyhow::bail!(
-                    "--image with Qwen3-VL mmproj on `hf2q generate` is not \
-                     supported: the Qwen3-VL text LM forward path lives behind \
-                     iter-228b (cmd_generate routes via `qwen3vl_text_forward_pending` \
-                     501 today). Use `hf2q serve --mmproj <qwen3vl-mmproj>` for \
-                     Qwen3-VL vision; this CLI works for Gemma4 + classic-CLIP."
+                    "--image with a Qwen conditional-model projector is not \
+                     supported by `hf2q generate`; use `hf2q serve --mmproj \
+                     <projector>` so text and vision artifacts are loaded atomically"
                 );
             }
             crate::inference::vision::mmproj::ArchProfile::Unknown => {
@@ -1390,6 +1345,13 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     )? {
         return Ok(());
     }
+
+    // Neither external drafter was selected. Freeze the exact target-only
+    // manifest before n-gram verification or ordinary generation can issue a
+    // projection. DFlash/EAGLE helpers perform their own target+drafter union.
+    mlx_w
+        .activate_native_routes(&mut ctx, &[])
+        .context("activate Gemma target-only native projection routes")?;
 
     // ADR-030 iter-216 Plan B — HF2Q_SPEC_NGRAM=1 opt-in path.  Uses
     // pure-CPU n-gram proposer from ADR-029 Phase 1 instead of the
@@ -2442,7 +2404,8 @@ fn find_special_token_stop_pos(generated_text: &str) -> Option<(usize, &'static 
 /// at their non-disabled defaults (40 / 0.95 / 0.05) regardless of temperature.
 /// That meant `--temperature 0` still routed through the slower sampler path
 /// (forward_gpu_last_logits downloads ~600KB of vocab logits to host;
-/// forward_gpu_greedy returns 4 bytes after a GPU argmax kernel). On
+/// forward_gpu_greedy reads the 8-byte index/value pair after a GPU argmax
+/// kernel). On
 /// qwen3.6-35B-A3B-dwq48 that cost ~19 tok/s vs the truly-greedy path at
 /// 122 tok/s — the regression that matched 4adf689's pre-CLI-sampling perf.
 fn qwen35_generate_uses_sampling(args: &cli::GenerateArgs) -> bool {
@@ -2892,8 +2855,17 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // the parameter handle.
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
 
+    let debug_tokenize_peer_style = std::env::var("HF2Q_DEBUG_TOKENIZE_ONLY").as_deref() == Ok("1");
+    // Gate-only tokenizer diagnostic. Unlike `HF2Q_DEBUG_TOKENIZE_ONLY`, this
+    // deliberately uses `Tokenizer::encode(..., false)` and therefore does
+    // not synthesize the GGUF's prompt BOS/EOS. It measures an immutable
+    // response byte string, not a prompt. The matched physical gate binds the
+    // resulting IDs to the exact GGUF and binary before comparing repeat TPS.
+    let debug_tokenize_no_special =
+        std::env::var("HF2Q_DEBUG_TOKENIZE_NO_SPECIAL_TOKENS").as_deref() == Ok("1");
     if INVESTIGATION_ENV.dump_rendered_prompt.is_some()
-        || std::env::var("HF2Q_DEBUG_TOKENIZE_ONLY").as_deref() == Ok("1")
+        || debug_tokenize_peer_style
+        || debug_tokenize_no_special
     {
         let tokenizer =
             crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf(&gguf)
@@ -2912,9 +2884,16 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             );
         }
 
-        if std::env::var("HF2Q_DEBUG_TOKENIZE_ONLY").as_deref() == Ok("1") {
-            let prompt_tokens =
-                tokenize_rendered_prompt_peer_style(&gguf, &tokenizer, &prompt_text)?;
+        if debug_tokenize_peer_style || debug_tokenize_no_special {
+            let prompt_tokens = if debug_tokenize_no_special {
+                tokenizer
+                    .encode(prompt_text, false)
+                    .map_err(|error| anyhow::anyhow!("Qwen35 raw tokenizer diagnostic: {error}"))?
+                    .get_ids()
+                    .to_vec()
+            } else {
+                tokenize_rendered_prompt_peer_style(&gguf, &tokenizer, &prompt_text)?
+            };
             let id_str: Vec<String> = prompt_tokens.iter().map(|i| i.to_string()).collect();
             println!("TOKENIZE_DEBUG_IDS: {}", id_str.join(" "));
         }
@@ -3640,7 +3619,8 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             |prev_token, pos, _generated_tokens| -> Result<u32> {
                 let decode_positions = vec![pos; 4];
                 let _t_step = step_profile_enabled.then(std::time::Instant::now);
-                // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
+                // forward_gpu_greedy: GPU argmax → 8-byte index/value
+                // readback (vs 600KB full logits).
                 // Eliminates ~5ms/token vocabulary download for greedy decode.
                 let next = model
                     // ADR-040 Phase B4d (2026-05-30) — see sibling at
@@ -3904,9 +3884,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     }
     // ADR-017 Phase E.a iter-2: thread the metrics sink onto the
     // GemmaLoadedModel BEFORE Engine::spawn moves `loaded` into the
-    // worker. Qwen35 / Qwen3VlText variants don't yet have an LCP
-    // probe site (their worker arm returns 501 before any prefill);
-    // skip them. None on the EngineConfig ⇒ no-op (test path).
+    // worker. None on the EngineConfig means no-op (test path).
     //
     // ADR-017 Phase B-hybrid.1: Qwen35 ALSO gains kv_metrics_sink so
     // its probe (added in this iter) can record `lcp_lookups_total`
@@ -3918,9 +3896,6 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             }
             api::engine::LoadedModel::Qwen35(q) => {
                 q.kv_metrics_sink = Some(std::sync::Arc::clone(sink));
-            }
-            api::engine::LoadedModel::Qwen3VlText(_) => {
-                // Qwen3VlText path doesn't have an LCP probe yet.
             }
             api::engine::LoadedModel::Deepseek4(_) => {
                 // DeepSeek-V4 accounts exact-prefix hits in generation stats.
@@ -4151,16 +4126,112 @@ pub(crate) fn validate_mmproj_text_binding(
     Ok(())
 }
 
-fn validate_mmproj_diagnostic_mode(
-    skip_load: bool,
-    skip_warmup: bool,
-    unsafe_experiments_acked: bool,
-) -> anyhow::Result<()> {
+/// Load one projector as part of a text-engine admission transaction. No
+/// projector state is published separately; the manager validates the
+/// returned descriptor against `ProjectorAdmission` before constructing the
+/// generation Arc.
+pub(crate) fn load_projector_for_engine(
+    text_path: &Path,
+    text_engine: &api::engine::Engine,
+    admission: &multi_model::ProjectorAdmission,
+) -> anyhow::Result<std::sync::Arc<api::state::LoadedMmproj>> {
+    admission.validate()?;
     anyhow::ensure!(
-        !(skip_load && skip_warmup && !unsafe_experiments_acked),
-        "HF2Q_SKIP_MMPROJ_LOAD=1 with HF2Q_SKIP_VIT_WARMUP=1 would advertise a projector that cannot execute; set HF2Q_UNSAFE_EXPERIMENTS=1 only for an intentional diagnostic session"
+        std::env::var("HF2Q_SKIP_MMPROJ_LOAD").as_deref() != Ok("1"),
+        "HF2Q_SKIP_MMPROJ_LOAD cannot publish an atomic text+projector generation"
     );
-    Ok(())
+    let pair_guard =
+        crate::core::paired_artifact::PairReadGuard::acquire(text_path, &admission.path)
+            .map_err(|error| anyhow::anyhow!(error))?;
+    let text_gguf = mlx_native::gguf::GgufFile::open(text_path)
+        .map_err(|error| anyhow::anyhow!("text GGUF pair preflight failed: {error}"))?;
+    let projector_gguf = mlx_native::gguf::GgufFile::open(&admission.path)
+        .map_err(|error| anyhow::anyhow!("projector GGUF open failed: {error}"))?;
+    pair_guard
+        .validate(&text_gguf, &projector_gguf, &admission.artifact_sha256)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&projector_gguf)
+        .map_err(|error| anyhow::anyhow!("projector config failed: {error}"))?;
+    let names = projector_gguf.tensor_names();
+    crate::inference::vision::mmproj::validate_tensor_set(&config, &names)
+        .map_err(|error| anyhow::anyhow!("projector tensor validation failed: {error}"))?;
+    let profile = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
+        &config.projector,
+        &names,
+    );
+    anyhow::ensure!(
+        profile == admission.profile,
+        "projector profile changed after admission"
+    );
+    let provenance = crate::core::provenance::detect(&projector_gguf);
+    let source_sha256 = match provenance {
+        crate::core::provenance::Provenance::Hf2q { source_sha256, .. } => Some(source_sha256),
+        crate::core::provenance::Provenance::External => None,
+    };
+    validate_mmproj_text_binding(
+        text_engine.vision_consumer_contract(),
+        profile,
+        config.projection_dim,
+        config.deepstack_indexes.as_ref().map_or(0, Vec::len),
+        source_sha256.as_deref(),
+        Some(&admission.artifact_sha256),
+    )?;
+
+    let device = mlx_native::MlxDevice::new()
+        .map_err(|error| anyhow::anyhow!("create MlxDevice for projector: {error}"))?;
+    let weights = crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(
+        &projector_gguf,
+        &config,
+        device,
+    )
+    .map_err(|error| anyhow::anyhow!("projector weight load failed: {error}"))?;
+    admission.validate_realized_weights(&weights)?;
+    if std::env::var("HF2Q_SKIP_VIT_WARMUP").as_deref() != Ok("1") {
+        crate::inference::vision::vit_gpu::warmup_vit_gpu(
+            &weights,
+            &config,
+            profile,
+            text_engine.hidden_size(),
+        )
+        .with_context(|| {
+            format!(
+                "vision projector warmup failed for '{}' ({})",
+                admission.path.display(),
+                profile.as_str()
+            )
+        })?;
+    }
+    drop(projector_gguf);
+    drop(text_gguf);
+    anyhow::ensure!(
+        admission.file_stamp.matches_path(&admission.path),
+        "projector filesystem identity changed between admission and publication"
+    );
+    let model_id = admission
+        .path
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mmproj".to_owned());
+    let loaded = std::sync::Arc::new(api::state::LoadedMmproj {
+        gguf_path: admission.path.clone(),
+        config,
+        arch: profile,
+        weights: std::sync::Arc::new(weights),
+        model_id,
+        artifact_sha256: admission.artifact_sha256.clone(),
+        source_sha256,
+        vision_cache: std::sync::Arc::new(
+            crate::inference::vision::pipeline::VisionEmbeddingCache::new(usize::try_from(
+                admission.cache_budget_bytes,
+            )?),
+        ),
+    });
+    anyhow::ensure!(
+        loaded.committed_resident_bytes()? == admission.reserved_bytes()?,
+        "projector committed allocation differs from admission"
+    );
+    drop(pair_guard);
+    Ok(loaded)
 }
 
 fn automatic_pair_guard_authority_paths(
@@ -4304,6 +4375,7 @@ pub fn cmd_serve(
         requested_context = ?requested_context,
         kv_cache_budget_bytes,
         kv_cache_budget_origin = ?kv_cache_budget.origin,
+        kv_persist_enabled = kv_persist_dir.is_some(),
         kv_persist_budget_bytes,
         kv_persist_budget_origin = ?kv_persist_budget.origin,
         "resolved serving plan"
@@ -4359,6 +4431,8 @@ pub fn cmd_serve(
     let dynamic_kv_metrics_sink = std::sync::Arc::clone(&state.kv_spill_counters)
         as std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>;
     state = state.with_engine_config_template(multi_model::EngineConfig {
+        expected_text_artifact_stamp: None,
+        verified_text_artifact: None,
         operator_model_path: None,
         tokenizer_path: None,
         config_path: None,
@@ -4366,12 +4440,25 @@ pub fn cmd_serve(
         warmup_synchronously: true,
         kv_metrics_sink: Some(dynamic_kv_metrics_sink),
         dwq_overlay_path: None,
+        projector: None,
         engine_mode,
         requested_context,
         kv_cache_budget_bytes,
         kv_persist_dir: kv_persist_dir.clone(),
         kv_persist_budget_bytes,
     });
+    let verified_swap_entries = model_identity_receipt::verified_entries_from_directory_env()?;
+    for (path, identity) in &verified_swap_entries {
+        let mut artifact_config = state.engine_config_template.clone();
+        artifact_config.bind_verified_text_artifact(identity.clone())?;
+        state.register_engine_config_for_path(path, artifact_config)?;
+    }
+    if !verified_swap_entries.is_empty() {
+        tracing::info!(
+            artifacts = verified_swap_entries.len(),
+            "registered exact preverified model-swap identities"
+        );
+    }
 
     let mut automatic_mmproj = false;
     let human_startup_progress = !args.quiet && matches!(log_format, cli::LogFormat::Text);
@@ -4486,7 +4573,7 @@ pub fn cmd_serve(
     }
 
     let pair_paths = args.model.clone().zip(args.mmproj.clone());
-    let pair_read_guard = match pair_paths {
+    let mut pair_read_guard = match pair_paths {
         Some((text, projector)) => {
             let acquire_pair_guard = || -> anyhow::Result<_> {
                 let authority_paths = if automatic_mmproj {
@@ -4904,7 +4991,42 @@ pub fn cmd_serve(
     //
     // Filesystem-path passthrough uses the file stem as the pool's `repo`
     // key and the exact `general.file_type` as its quant identity.
+    let startup_projector_identity = match args.mmproj.as_deref() {
+        Some(path) => inspect_serve_projector(path, automatic_mmproj)?,
+        None => None,
+    };
+    let startup_projector_identity = match (
+        startup_projector_identity,
+        startup_mmproj_sha256.as_deref(),
+    ) {
+        (Some(admission), Some(expected))
+            if !admission.artifact_sha256.eq_ignore_ascii_case(expected) =>
+        {
+            if automatic_mmproj {
+                tracing::warn!(
+                    path = %admission.path.display(),
+                    "automatic mmproj no longer matches the exact repository catalog; continuing text-only"
+                );
+                None
+            } else {
+                anyhow::bail!(
+                    "mmproj '{}' no longer matches the exact repository catalog",
+                    admission.path.display()
+                );
+            }
+        }
+        (admission, _) => admission,
+    };
+    if automatic_mmproj && args.mmproj.is_some() && startup_projector_identity.is_none() {
+        args.mmproj = None;
+        pair_read_guard = None;
+    }
+    anyhow::ensure!(
+        startup_projector_identity.is_none() || default_model_arg.is_some(),
+        "--mmproj requires --model so the text and projector can be admitted as one generation"
+    );
     let mut startup_engine_for_banner: Option<api::engine::Engine> = None;
+    let mut startup_vision_projector: Option<load_info::VisionProjector> = None;
     if let Some(model_arg) = default_model_arg.as_ref() {
         let mut cache_guard = state
             .cache
@@ -4950,10 +5072,30 @@ pub fn cmd_serve(
             quant_select::quant_type_from_gguf_path(&resolved.gguf_path)
                 .context("derive exact pool quant from --model GGUF")?
         };
-        let mut engine_config = state.engine_config_template.clone();
+        let mut engine_config = state.engine_config_for_path(&resolved.gguf_path)?;
         engine_config.tokenizer_path = args.tokenizer.clone();
         engine_config.config_path = args.config.clone();
         engine_config.dwq_overlay_path = args.dwq_overlay.clone();
+        engine_config.projector = match startup_projector_identity.clone() {
+            Some(explicit) => Some(explicit),
+            None => resolved
+                .mmproj_path
+                .as_ref()
+                .map(|path| {
+                    multi_model::ProjectorAdmission::inspect(
+                        path,
+                        u64::try_from(
+                            crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
+                        )?,
+                    )
+                })
+                .transpose()?,
+        };
+        if let Some(identity) = model_identity_receipt::identity_from_env(&resolved.gguf_path)? {
+            engine_config.bind_verified_text_artifact(identity)?;
+        } else if engine_config.verified_text_artifact.is_none() {
+            engine_config.bind_text_artifact(&resolved.gguf_path)?;
+        }
         state.register_engine_config_for_path(&resolved.gguf_path, engine_config.clone())?;
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
         // the about-to-fire load_or_get. Synchronous contract — see
@@ -5017,6 +5159,14 @@ pub fn cmd_serve(
             );
         }
         startup_engine_for_banner = Some(loaded_engine.engine.clone());
+        startup_vision_projector =
+            loaded_engine
+                .projector
+                .as_ref()
+                .map(|projector| load_info::VisionProjector {
+                    mmproj_path: projector.gguf_path.clone(),
+                    mmproj_sha256: Some(projector.artifact_sha256.clone()),
+                });
         drop(pool_guard);
         emit_startup_event(
             chat_startup_progress.as_mut(),
@@ -5031,6 +5181,7 @@ pub fn cmd_serve(
             "hf2q startup pre-warm: model admitted to pool"
         );
     }
+    drop(pair_read_guard);
 
     // --- Optionally validate + load the BERT embedding model config ---
     // Decision: load config only (header parse), NOT weights. Per
@@ -5145,286 +5296,10 @@ pub fn cmd_serve(
         None
     };
 
-    // --- Optionally validate + load the mmproj (multimodal projector) ---
-    // Header parse only; weight loading lands alongside the ViT forward
-    // pass (ADR-005 Phase 2c Task #15). Fail fast if the file is absent
-    // or malformed so the server never advertises multimodal capability
-    // it can't back.
-    let mut load_startup_mmproj = || -> Result<(
-        Option<api::state::LoadedMmproj>,
-        Option<load_info::VisionProjector>,
-    )> {
-        if let Some(mmp_path) = args.mmproj.as_ref() {
-        let mmproj_activation_path = startup_mmproj_authority
-            .as_ref()
-            .map(|authority| authority.activation_path())
-            .transpose()?
-            .unwrap_or_else(|| mmp_path.clone());
-        anyhow::ensure!(
-            mmproj_activation_path.exists(),
-            "mmproj not found: {}",
-            mmp_path.display()
-        );
-        if let Some(authority) = startup_mmproj_authority.as_ref() {
-            anyhow::ensure!(
-                authority.is_stable()?
-                    && crate::core::bounded_file::regular_path_matches_identity(
-                        mmp_path,
-                        authority.identity(),
-                    )?,
-                "automatically selected mmproj changed before runtime activation"
-            );
-        }
-        // On macOS, opening /dev/fd/N duplicates the same open-file
-        // description and therefore shares its seek offset. Hash the retained
-        // authority first (which rewinds and stability-checks it), then let
-        // the GGUF reader seek its fresh activation descriptor.
-        let mmproj_sha256 = match startup_mmproj_authority.as_mut() {
-            Some(authority) => authority
-                .sha256()?
-                .context("automatically selected mmproj changed while hashing")?,
-            None => crate::core::sha256::compute_file_sha256(&mmproj_activation_path)
-                .with_context(|| format!("hash vision projector '{}'", mmp_path.display()))?,
-        };
-        if let Some(expected) = startup_mmproj_sha256.as_deref() {
-            anyhow::ensure!(
-                mmproj_sha256.eq_ignore_ascii_case(expected),
-                "automatically selected mmproj no longer matches the exact repository catalog"
-            );
-        }
-        let gguf = mlx_native::gguf::GgufFile::open(&mmproj_activation_path)
-            .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
-        let text_path = args.model.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--mmproj requires --model so hf2q can lock and validate the complete pair"
-            )
-        })?;
-        let text_activation_path = startup_model_authority
-            .as_ref()
-            .map(|authority| authority.activation_path())
-            .transpose()?
-            .unwrap_or_else(|| text_path.clone());
-        let text_gguf = mlx_native::gguf::GgufFile::open(&text_activation_path)
-            .map_err(|error| anyhow::anyhow!("text GGUF pair preflight failed: {error}"))?;
-        pair_read_guard
-            .as_ref()
-            .expect("pair guard acquired whenever --model and --mmproj are present")
-            .validate(&text_gguf, &gguf, &mmproj_sha256)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        let mmp_config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&gguf)
-            .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
-        // Walk the GGUF's tensor list against the arch-agnostic
-        // required set (iter 30 + iter 31). Fails fast on an incomplete
-        // producer rather than hitting NotFound mid-forward-pass.
-        let actual_names: Vec<&str> = gguf.tensor_names();
-        crate::inference::vision::mmproj::validate_tensor_set(&mmp_config, &actual_names)
-            .map_err(|e| anyhow::anyhow!("mmproj GGUF tensor-set validation: {e}"))?;
-        // Detect the arch profile so forward-pass dispatch knows
-        // which per-block-norm shape to expect (Gemma 4 SigLIP vs
-        // classic CLIP vs Qwen3-VL SigLIP vs Unknown).
-        //
-        // 2026-05-02 Wedge-4c.5 Phase-2c (Codex review of 2eb1e36):
-        // call the projector-aware detector here, NOT the tensor-only
-        // `detect_arch_profile`. Real Qwen3-VL GGUFs may flag DeepStack
-        // at indices > 0 (e.g. [3, 7, 15, 23] for a 24-layer ViT),
-        // which would leave `v.deepstack.0.fc1.weight` absent and the
-        // tensor-only detector would emit `Unknown`, blocking even
-        // text-only chat against a perfectly valid Qwen3-VL projector.
-        // The parsed `MmprojConfig.projector` is the upstream-most
-        // signal (`clip.cpp:865-867` gates the qwen3vl builder on it).
-        let arch = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
-            &mmp_config.projector,
-            &actual_names,
-        );
-        let mmproj_provenance = crate::core::provenance::detect(&gguf);
-        let mmproj_source_sha256 = match &mmproj_provenance {
-            crate::core::provenance::Provenance::Hf2q { source_sha256, .. } => {
-                Some(source_sha256.as_str())
-            }
-            crate::core::provenance::Provenance::External => None,
-        };
-        if !arch.is_supported() {
-            anyhow::bail!(
-                "mmproj arch profile is Unknown — neither Gemma 4 \
-                 SigLIP markers (ln1/ln2/post_ffw_norm) nor CLIP marker \
-                 (attn_norm) found in block 0. hf2q's ViT forward pass \
-                 cannot dispatch on this file."
-            );
-        }
-        let text_engine = startup_engine_for_banner.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--mmproj requires --model so hf2q can prove the projector/text-model binding before loading GPU weights"
-            )
-        })?;
-        validate_mmproj_text_binding(
-            text_engine.vision_consumer_contract(),
-            arch,
-            mmp_config.projection_dim,
-            mmp_config.deepstack_indexes.as_ref().map_or(0, Vec::len),
-            mmproj_source_sha256,
-            Some(mmproj_sha256.as_str()),
-        )?;
-        // Load every tensor onto the Metal device. For Gemma 4 this is
-        // ~400MB / 356 tensors / ~10s cold-cache on M5 Max.
-        //
-        // Iter-103 added the `HF2Q_SKIP_MMPROJ_LOAD=1` escape hatch
-        // for bisecting the chat-warmup-logits-go-NaN bug: if
-        // skipping the mmproj weight load (just keep the config +
-        // arch detection) makes chat warmup produce valid logits,
-        // the bug is in `LoadedMmprojWeights::load`'s buffer-alloc
-        // / dequant path; if NaN persists, the bug is somewhere
-        // earlier (the GGUF mmap itself).
-        let skip_mmproj_load = std::env::var("HF2Q_SKIP_MMPROJ_LOAD").as_deref() == Ok("1");
-        let skip_vit_warmup = std::env::var("HF2Q_SKIP_VIT_WARMUP").as_deref() == Ok("1");
-        validate_mmproj_diagnostic_mode(
-            skip_mmproj_load,
-            skip_vit_warmup,
-            std::env::var("HF2Q_UNSAFE_EXPERIMENTS").as_deref() == Ok("1"),
-        )?;
-        let device = mlx_native::MlxDevice::new()
-            .map_err(|e| anyhow::anyhow!("create MlxDevice for mmproj load: {e}"))?;
-        let mmp_weights = if skip_mmproj_load {
-            tracing::warn!(
-                "HF2Q_SKIP_MMPROJ_LOAD=1 — using empty mmproj weights; \
-                 vision requests will 500 on first forward attempt"
-            );
-            crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty(device)
-        } else {
-            crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(
-                &gguf,
-                &mmp_config,
-                device,
-            )
-            .map_err(|e| anyhow::anyhow!("mmproj weight load: {e}"))?
-        };
-        let model_id = mmp_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "mmproj".into());
-        tracing::info!(
-            path = %mmp_path.display(),
-            image_size = mmp_config.image_size,
-            patch_size = mmp_config.patch_size,
-            hidden = mmp_config.hidden_size,
-            layers = mmp_config.num_hidden_layers,
-            projector = mmp_config.projector.as_str(),
-            arch = arch.as_str(),
-            tensors_loaded = mmp_weights.len(),
-            "Loaded mmproj GGUF header + tensor set + weights"
-        );
-        if let Some(authority) = startup_mmproj_authority.as_ref() {
-            anyhow::ensure!(
-                authority.is_stable()?
-                    && crate::core::bounded_file::regular_path_matches_identity(
-                        mmp_path,
-                        authority.identity(),
-                    )?,
-                "automatically selected mmproj changed during runtime activation"
-            );
-        }
-        // Iter 53: ViT GPU warmup — runs one synthetic full forward
-        // to trigger Metal kernel pipeline compilation. Drops first
-        // user-visible multimodal request from ~5–10s (cold compile)
-        // to ~1.3s (steady-state) on M5 Max.
-        //
-        // Iter-103 added the `HF2Q_SKIP_VIT_WARMUP=1` escape hatch
-        // for bisecting the chat-warmup-logits-go-NaN bug: if
-        // skipping the ViT warmup makes chat warmup produce valid
-        // logits, the bug lives in `warmup_vit_gpu`'s leftover GPU
-        // state; if NaN persists, the bug lives in
-        // `LoadedMmprojWeights::load`.
-        if skip_vit_warmup {
-            tracing::warn!(
-                "HF2Q_SKIP_VIT_WARMUP=1 — skipping ViT GPU warmup; first \
-                 multimodal request will pay kernel-compile cost"
-            );
-        } else {
-            let warmup_t0 = std::time::Instant::now();
-            crate::inference::vision::vit_gpu::warmup_vit_gpu(
-                &mmp_weights,
-                &mmp_config,
-                arch,
-                text_engine.hidden_size(),
-            )
-            .with_context(|| {
-                format!(
-                    "vision projector warmup failed for '{}' ({})",
-                    mmp_path.display(),
-                    arch.as_str()
-                )
-            })?;
-            tracing::info!(
-                elapsed_ms = warmup_t0.elapsed().as_millis() as u64,
-                "ViT GPU warmup complete"
-            );
-        }
-        Ok((
-            Some(api::state::LoadedMmproj {
-                gguf_path: mmp_path.clone(),
-                config: mmp_config,
-                arch,
-                weights: std::sync::Arc::new(mmp_weights),
-                model_id,
-                artifact_sha256: mmproj_sha256.clone(),
-                source_sha256: mmproj_source_sha256.map(str::to_owned),
-                vision_cache: std::sync::Arc::new(
-                    crate::inference::vision::pipeline::VisionEmbeddingCache::new(
-                        crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
-                    ),
-                ),
-            }),
-            Some(load_info::VisionProjector {
-                mmproj_path: mmp_path.clone(),
-                mmproj_sha256: Some(mmproj_sha256),
-            }),
-        ))
-        } else {
-            Ok((None, None))
-        }
-    };
-    let projector_started = args.mmproj.as_ref().map(|path| {
-        emit_startup_event(
-            chat_startup_progress.as_mut(),
-            direct_startup_ui.as_mut(),
-            startup_progress::StartupEvent::ProjectorLoad {
-                bytes: std::fs::metadata(path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0),
-                filename: path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "<unnamed projector>".into()),
-            },
-        );
-        std::time::Instant::now()
-    });
-    let (mmproj, startup_vision_projector) = match load_startup_mmproj() {
-        Ok(loaded) => loaded,
-        Err(error) if automatic_mmproj => {
-            tracing::warn!(%error, "automatic mmproj rejected; continuing text-only");
-            emit_startup_event(
-                chat_startup_progress.as_mut(),
-                direct_startup_ui.as_mut(),
-                startup_progress::StartupEvent::TextOnlyFallback {
-                    reason: startup_progress::TextOnlyReason::ProjectorLoadRejected,
-                },
-            );
-            (None, None)
-        }
-        Err(error) => return Err(error),
-    };
-    if mmproj.is_some() {
-        if let Some(started) = projector_started {
-            emit_startup_event(
-                chat_startup_progress.as_mut(),
-                direct_startup_ui.as_mut(),
-                startup_progress::StartupEvent::ProjectorReady {
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                },
-            );
-        }
-    }
-    drop(pair_read_guard);
+    // The pool admission above loaded, warmed, and published the resolved
+    // text path and projector atomically. The pair guard is owned inside that
+    // transaction, after repository resolution, so hosted model ids are never
+    // mistaken for local artifact paths here.
 
     // --- Build router ---
     // `state` was constructed above (iter-209) with the cache + hardware
@@ -5443,9 +5318,6 @@ pub fn cmd_serve(
         state = state
             .with_embedding_model(em)
             .with_embedding_registry(std::sync::Arc::new(std::sync::Mutex::new(registry)));
-    }
-    if let Some(m) = mmproj {
-        state = state.with_mmproj(m);
     }
     let state_for_warmup = state.clone();
     let router = api::build_router(state);
@@ -6732,6 +6604,9 @@ fn cmd_parity_check(
         &mut ctx,
         &mut parity_progress,
     )?;
+    mlx_w
+        .activate_native_routes(&mut ctx, &[])
+        .context("activate Gemma native routes for parity check")?;
 
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Tokenizer: {e}"))?;
@@ -6753,8 +6628,8 @@ fn cmd_parity_check(
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: tokens,
-            mmproj: None,
             image: None,
+            mmproj: None,
             chat_template: None,
             chat_template_file: None,
             benchmark: false,
@@ -6880,7 +6755,6 @@ fn cmd_parity_capture(
 
     // Load model once
     let tokenizer_path = find_tokenizer(model_path, None)?;
-    let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
     // ADR-022 P1.8 — prefer GGUF-self-sufficient config; see cmd_parity_check.
@@ -6914,7 +6788,10 @@ fn cmd_parity_capture(
         eprintln!("Capturing: {} ({} tokens)", pname, tokens);
 
         // Need to reload model for each prompt since KV cache state persists
-        // Re-create model weights (reset KV caches).
+        // Re-create both model weights and their route-authority context. A
+        // frozen plan is bound to exact buffer identities and must never be
+        // reused across the prompt-capture model swap.
+        let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
         // cmd_parity has its own output contract — no progress line.
         let mut parity_progress = header::LoadProgress::new(false, 1, 0);
         let mut mlx_w_fresh = crate::inference::models::gemma4::MlxModelWeights::load_from_gguf(
@@ -6923,6 +6800,9 @@ fn cmd_parity_capture(
             &mut ctx,
             &mut parity_progress,
         )?;
+        mlx_w_fresh
+            .activate_native_routes(&mut ctx, &[])
+            .with_context(|| format!("activate Gemma native routes for parity capture {pname}"))?;
 
         let rendered = render_chat_template(
             &gguf,
@@ -6938,8 +6818,8 @@ fn cmd_parity_capture(
                 min_p: 0.0,
                 repetition_penalty: 1.0,
                 max_tokens: tokens,
-                mmproj: None,
                 image: None,
+                mmproj: None,
                 chat_template: None,
                 chat_template_file: None,
                 benchmark: false,
@@ -6990,10 +6870,10 @@ mod tests {
     use super::{
         build_chat_template_env, detect_greedy_repetition_loop,
         detect_greedy_repetition_loop_with_text, direct_health_url, find_special_token_stop,
-        maybe_print_serve_banner, peer_special_token_id_for_model, render_jinja_template,
+        inspect_serve_projector, maybe_print_serve_banner, render_jinja_template,
         resolve_enable_thinking, resolve_serve_endpoint, run_decode_loop,
         validate_chat_parent_lifeline_socket, validate_configured_endpoint_auth,
-        validate_greedy_only_speculative_cli_path, validate_mmproj_diagnostic_mode,
+        validate_greedy_only_speculative_cli_path,
         validate_mmproj_text_binding, DecodeStopReason, RaisePolicy,
         FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
@@ -7007,17 +6887,33 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn llama_cpp_gpt2_special_token_defaults_match_vocab_cpp() {
+    fn automatic_projector_admission_falls_back_but_explicit_remains_fatal() {
+        let projector = tempfile::NamedTempFile::new().expect("projector fixture");
+        std::fs::write(projector.path(), b"not a GGUF projector").unwrap();
+
+        assert!(inspect_serve_projector(projector.path(), true)
+            .expect("automatic projector rejection is a text-only fallback")
+            .is_none());
+        assert!(
+            inspect_serve_projector(projector.path(), false).is_err(),
+            "an explicit --mmproj rejection must remain fatal"
+        );
+    }
+
+    #[test]
+    fn gpt2_gguf_special_token_defaults_are_stable() {
+        use crate::core::tokenizer_adapter::gguf_special_token_id_for_model;
+
         assert_eq!(
-            peer_special_token_id_for_model("gpt2", "tokenizer.ggml.bos_token_id"),
+            gguf_special_token_id_for_model("gpt2", "tokenizer.ggml.bos_token_id"),
             Some(11)
         );
         assert_eq!(
-            peer_special_token_id_for_model("gpt2", "tokenizer.ggml.eos_token_id"),
+            gguf_special_token_id_for_model("gpt2", "tokenizer.ggml.eos_token_id"),
             Some(11)
         );
         assert_eq!(
-            peer_special_token_id_for_model("gpt2", "tokenizer.ggml.padding_token_id"),
+            gguf_special_token_id_for_model("gpt2", "tokenizer.ggml.padding_token_id"),
             None
         );
     }
@@ -7224,6 +7120,8 @@ mod tests {
     fn load_engine_routes_qwen35_to_qwen35_loaded_model() {
         let tmp = write_minimal_gguf_with_arch("qwen35");
         let cfg = super::multi_model::EngineConfig {
+            expected_text_artifact_stamp: None,
+            verified_text_artifact: None,
             operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
@@ -7231,6 +7129,7 @@ mod tests {
             warmup_synchronously: false,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
+            projector: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
@@ -7267,6 +7166,8 @@ mod tests {
     fn load_engine_routes_qwen35moe_to_qwen35_loaded_model() {
         let tmp = write_minimal_gguf_with_arch("qwen35moe");
         let cfg = super::multi_model::EngineConfig {
+            expected_text_artifact_stamp: None,
+            verified_text_artifact: None,
             operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
@@ -7274,6 +7175,7 @@ mod tests {
             warmup_synchronously: false,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
+            projector: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
@@ -7291,137 +7193,30 @@ mod tests {
         );
     }
 
-    // ── Wedge-4 / iter-227 — Qwen3-VL arch dispatch tests ──
-    //
-    // Pin the new dispatch arm in `LoadedModel::load` (api/engine.rs)
-    // and `cmd_generate` (this file's runtime arch peek) so the
-    // operator-actionable error message reaches the caller instead of
-    // the pre-iter-227 silent fall-through into the Gemma 4 loader's
-    // `missing blk.0.ffn_gate_up_exps.weight` panic.
-
-    /// Guarantees tune-up item 1 (2026-08-20): dense Qwen3-VL REFUSES at
-    /// serve spawn until ADR-041 (iter-9b) wires the engine seam. The
-    /// iter-228a state this replaces — load succeeds, `/readyz` flips
-    /// 200, and every chat / embed / soft-token request 501s — violated
-    /// the published "unsupported families are refused up front"
-    /// guarantee. This test REPLACES
-    /// `iter228a_load_engine_routes_qwen3_vl_to_qwen3vl_text_loader`
-    /// (a routing pin for the superseded behavior). ADR-041 iter-9b-4
-    /// deletes the bail with the real worker dispatch and will flip
-    /// this pin again.
+    /// Retired standalone Qwen vision architectures must fail at dispatch.
+    /// Existing Qwen 3.5+ conditional-generation models use their text
+    /// architecture plus a paired projector and do not enter this branch.
     #[test]
-    fn load_engine_refuses_dense_qwen3vl_until_adr041_engine_seam() {
-        let tmp = write_minimal_gguf_with_arch("qwen3_vl");
-        let cfg = super::multi_model::EngineConfig {
-            operator_model_path: None,
-            tokenizer_path: None,
-            config_path: None,
-            queue_capacity: 4,
-            warmup_synchronously: false,
-            kv_metrics_sink: None,
-            dwq_overlay_path: None,
-            // ADR-040 Phase C iter-4 (C4) — test path stays on the
-            // SerialFifo default (the ADR-005 byte-equivalent route).
-            engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
-            requested_context: None,
-            kv_cache_budget_bytes: None,
-            kv_persist_dir: None,
-            kv_persist_budget_bytes: 0,
-        };
-        let result = super::load_engine(tmp.path(), &cfg);
-        assert!(
-            result.is_err(),
-            "dense qwen3_vl must refuse at spawn until the ADR-041 seam lands"
-        );
-        let msg = format!("{:#}", result.err().unwrap());
-        // The refusal is the guarantee-level spawn bail, naming the
-        // gating ADR and a working alternative…
-        assert!(
-            msg.contains("ADR-041"),
-            "spawn refusal must name the gating ADR; got: {msg}"
-        );
-        assert!(
-            msg.contains("Qwen3.5") || msg.contains("Gemma"),
-            "spawn refusal must name a working alternative; got: {msg}"
-        );
-        // …not the MoE-variant bail, and not a loader-level failure
-        // (the guard fires BEFORE tensors are touched).
-        assert!(
-            !msg.contains("MoE, general.architecture"),
-            "dense refusal must be distinguishable from the MoE bail; got: {msg}"
-        );
-        assert!(
-            !msg.contains("Qwen3VlTextConfig::from_gguf"),
-            "refusal must fire BEFORE the loader/config parser; got: {msg}"
-        );
-        // Preserved iter-227 regression guard: never fall through to
-        // the Gemma loader's panic surface.
-        assert!(
-            !msg.contains("missing blk.0.ffn_gate_up_exps.weight"),
-            "must intercept BEFORE the Gemma MoE expert load; got: {msg}"
-        );
-    }
-
-    /// Symmetric for the peer's arch-string convention (no underscore —
-    /// `qwen3vl`). Both arch spellings hit the same item-1 spawn
-    /// refusal.
-    #[test]
-    fn load_engine_refuses_dense_qwen3vl_upstream_arch_until_adr041_engine_seam() {
-        let tmp = write_minimal_gguf_with_arch("qwen3vl");
-        let cfg = super::multi_model::EngineConfig {
-            operator_model_path: None,
-            tokenizer_path: None,
-            config_path: None,
-            queue_capacity: 4,
-            warmup_synchronously: false,
-            kv_metrics_sink: None,
-            dwq_overlay_path: None,
-            // ADR-040 Phase C iter-4 (C4) — test path stays on the
-            // SerialFifo default (the ADR-005 byte-equivalent route).
-            engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
-            requested_context: None,
-            kv_cache_budget_bytes: None,
-            kv_persist_dir: None,
-            kv_persist_budget_bytes: 0,
-        };
-        let result = super::load_engine(tmp.path(), &cfg);
-        assert!(result.is_err());
-        let msg = format!("{:#}", result.err().unwrap());
-        assert!(
-            msg.contains("ADR-041") && !msg.contains("MoE, general.architecture"),
-            "upstream-arch dense Qwen3-VL must hit the item-1 spawn refusal; got: {msg}"
-        );
-    }
-
-    /// MoE Qwen3-VL variant (Qwen3-VL-30B-A3B etc., upstream
-    /// `qwen3vlmoe` arch). The error must distinguish MoE from dense
-    /// so the operator knows which variant we recognized.
-    #[test]
-    fn iter227_load_engine_rejects_qwen3vlmoe_with_moe_specific_error() {
-        let tmp = write_minimal_gguf_with_arch("qwen3vlmoe");
-        let cfg = super::multi_model::EngineConfig {
-            operator_model_path: None,
-            tokenizer_path: None,
-            config_path: None,
-            queue_capacity: 4,
-            warmup_synchronously: false,
-            kv_metrics_sink: None,
-            dwq_overlay_path: None,
-            // ADR-040 Phase C iter-4 (C4) — test path stays on the
-            // SerialFifo default (the ADR-005 byte-equivalent route).
-            engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
-            requested_context: None,
-            kv_cache_budget_bytes: None,
-            kv_persist_dir: None,
-            kv_persist_budget_bytes: 0,
-        };
-        let result = super::load_engine(tmp.path(), &cfg);
-        assert!(result.is_err());
-        let msg = format!("{:#}", result.err().unwrap());
-        assert!(
-            msg.contains("Qwen3-VL") && msg.contains("MoE"),
-            "iter-227 MoE-variant error must include 'MoE' to distinguish from dense; got: {msg}"
-        );
+    fn load_engine_rejects_retired_standalone_qwen_vision_architectures() {
+        for arch in ["qwen3_vl", "qwen3vl", "qwen3vlmoe"] {
+            let tmp = write_minimal_gguf_with_arch(arch);
+            let cfg = super::multi_model::EngineConfig {
+                queue_capacity: 4,
+                engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+                ..Default::default()
+            };
+            let result = super::load_engine(tmp.path(), &cfg);
+            assert!(result.is_err(), "retired architecture must fail: {arch}");
+            let msg = format!("{:#}", result.err().unwrap());
+            assert!(
+                msg.contains("unsupported GGUF general.architecture") && msg.contains(arch),
+                "retired architecture must fail before any family loader: {msg}"
+            );
+            assert!(
+                !msg.contains("missing blk.0.ffn_gate_up_exps.weight"),
+                "retired architecture must not fall through to Gemma: {msg}"
+            );
+        }
     }
 
     /// Unknown architectures must fail closed at dispatch rather than
@@ -7431,6 +7226,8 @@ mod tests {
     fn load_engine_rejects_unknown_arch_without_gemma_fallback() {
         let tmp = write_minimal_gguf_with_arch("totally-fake-arch-name");
         let cfg = super::multi_model::EngineConfig {
+            expected_text_artifact_stamp: None,
+            verified_text_artifact: None,
             operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
@@ -7438,6 +7235,7 @@ mod tests {
             warmup_synchronously: false,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
+            projector: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
@@ -7467,6 +7265,8 @@ mod tests {
     fn load_engine_routes_deepseek4_to_native_loader_without_gemma_fallback() {
         let tmp = write_minimal_gguf_with_arch("deepseek4");
         let cfg = super::multi_model::EngineConfig {
+            expected_text_artifact_stamp: None,
+            verified_text_artifact: None,
             operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
@@ -7474,6 +7274,7 @@ mod tests {
             warmup_synchronously: false,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
+            projector: None,
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
             requested_context: None,
             kv_cache_budget_bytes: None,
@@ -7499,15 +7300,15 @@ mod tests {
         );
     }
 
-    /// Iter-227 regression guard for the existing qwen35 / qwen35moe
-    /// dispatch arms — they MUST still route to `Qwen35LoadedModel::load`,
-    /// NOT into the new iter-227 Qwen3-VL bail. The new is_qwen3_vl_arch
-    /// predicate is narrow and additive.
+    /// Retiring the standalone vision architecture must not affect the
+    /// qwen35 / qwen35moe text dispatch arms used by newer Qwen families.
     #[test]
     fn iter227_does_not_regress_qwen35_dispatch() {
         for arch in &["qwen35", "qwen35moe"] {
             let tmp = write_minimal_gguf_with_arch(arch);
             let cfg = super::multi_model::EngineConfig {
+                expected_text_artifact_stamp: None,
+                verified_text_artifact: None,
                 operator_model_path: None,
                 tokenizer_path: None,
                 config_path: None,
@@ -7515,6 +7316,7 @@ mod tests {
                 warmup_synchronously: false,
                 kv_metrics_sink: None,
                 dwq_overlay_path: None,
+                projector: None,
                 // ADR-040 Phase C iter-4 (C4) — test path stays on the
                 // SerialFifo default (the ADR-005 byte-equivalent route).
                 engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
@@ -7529,12 +7331,9 @@ mod tests {
                 "0-tensor synthetic GGUF for {arch} must fail load (routed to qwen35 path)"
             );
             let msg = format!("{:#}", result.err().unwrap());
-            // The Qwen3-VL bail message must NOT fire on real qwen35
-            // arch strings — that would mean iter-227's predicate
-            // widened past its intended scope.
             assert!(
-                !msg.contains("Qwen3-VL"),
-                "iter-227 Qwen3-VL dispatch must NOT fire on arch={arch}; got: {msg}"
+                !msg.contains("unsupported GGUF general.architecture"),
+                "supported Qwen text architecture was rejected at dispatch: arch={arch}; {msg}"
             );
         }
     }
@@ -8090,8 +7889,8 @@ mod tests {
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
-            mmproj: None,
             image: None,
+            mmproj: None,
             chat_template: None,
             chat_template_file: None,
             benchmark: false,
@@ -8890,13 +8689,13 @@ mod tests {
         .expect("Gemma exact pair");
         validate_mmproj_text_binding(
             Some(VisionConsumerContract {
-                profile: ArchProfile::Qwen3VlSiglip,
+                profile: ArchProfile::QwenVisionSiglip,
                 output_width: 5120,
                 deepstack_output_count: Some(0),
                 source_sha256: None,
                 expected_projector_sha256: None,
             }),
-            ArchProfile::Qwen3VlSiglip,
+            ArchProfile::QwenVisionSiglip,
             Some(5120),
             0,
             None,
@@ -8918,7 +8717,7 @@ mod tests {
                 source_sha256: None,
                 expected_projector_sha256: None,
             }),
-            ArchProfile::Qwen3VlSiglip,
+            ArchProfile::QwenVisionSiglip,
             Some(2816),
             0,
             None,
@@ -8927,13 +8726,13 @@ mod tests {
         .is_err());
         let error = validate_mmproj_text_binding(
             Some(VisionConsumerContract {
-                profile: ArchProfile::Qwen3VlSiglip,
+                profile: ArchProfile::QwenVisionSiglip,
                 output_width: 5120,
                 deepstack_output_count: Some(0),
                 source_sha256: None,
                 expected_projector_sha256: None,
             }),
-            ArchProfile::Qwen3VlSiglip,
+            ArchProfile::QwenVisionSiglip,
             Some(2048),
             0,
             None,
@@ -8951,13 +8750,13 @@ mod tests {
 
         validate_mmproj_text_binding(
             Some(VisionConsumerContract {
-                profile: ArchProfile::Qwen3VlSiglip,
+                profile: ArchProfile::QwenVisionSiglip,
                 output_width: 2048,
                 deepstack_output_count: None,
                 source_sha256: None,
                 expected_projector_sha256: None,
             }),
-            ArchProfile::Qwen3VlSiglip,
+            ArchProfile::QwenVisionSiglip,
             Some(2048),
             0,
             None,
@@ -8972,7 +8771,7 @@ mod tests {
 
         let error = validate_mmproj_text_binding(
             None,
-            ArchProfile::Qwen3VlSiglip,
+            ArchProfile::QwenVisionSiglip,
             Some(7168),
             0,
             None,
@@ -8991,7 +8790,7 @@ mod tests {
         use crate::serve::api::engine::VisionConsumerContract;
 
         let contract = VisionConsumerContract {
-            profile: ArchProfile::Qwen3VlSiglip,
+            profile: ArchProfile::QwenVisionSiglip,
             output_width: 5120,
             deepstack_output_count: Some(0),
             source_sha256: Some("source-a".into()),
@@ -8999,7 +8798,7 @@ mod tests {
         };
         validate_mmproj_text_binding(
             Some(contract.clone()),
-            ArchProfile::Qwen3VlSiglip,
+            ArchProfile::QwenVisionSiglip,
             Some(5120),
             0,
             Some("source-a"),
@@ -9008,7 +8807,7 @@ mod tests {
         .expect("exact source and artifact identity");
         assert!(validate_mmproj_text_binding(
             Some(contract.clone()),
-            ArchProfile::Qwen3VlSiglip,
+            ArchProfile::QwenVisionSiglip,
             Some(5120),
             0,
             Some("source-b"),
@@ -9017,7 +8816,7 @@ mod tests {
         .is_err());
         assert!(validate_mmproj_text_binding(
             Some(contract),
-            ArchProfile::Qwen3VlSiglip,
+            ArchProfile::QwenVisionSiglip,
             Some(5120),
             0,
             Some("source-a"),
@@ -9025,14 +8824,6 @@ mod tests {
         )
         .is_err());
     }
-
-    #[test]
-    fn vision_diagnostic_empty_projector_requires_explicit_unsafe_ack() {
-        assert!(validate_mmproj_diagnostic_mode(true, true, false).is_err());
-        validate_mmproj_diagnostic_mode(true, true, true).expect("explicit diagnostic ack");
-        validate_mmproj_diagnostic_mode(false, true, false).expect("warmup-only skip");
-    }
-
     #[cfg(unix)]
     #[test]
     fn chat_lifeline_transport_accepts_only_unix_sockets() {

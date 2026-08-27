@@ -4,7 +4,7 @@
 # Usage: scripts/byte_cmp_full_pipeline.sh [<hf_model_dir>] [<output_dir>]
 #
 # Validates that hf2q's full convert pipeline produces byte-equivalent output
-# to canonical /opt/llama.cpp's convert+quantize chain. Reports per-tensor-type
+# to the canonical peer conversion-and-quantization chain. Reports per-tensor-type
 # residuals plus overall percentage.
 #
 # Prerequisite: /opt/llama.cpp HEAD matches `data/llama_cpp_pin.txt` (or be

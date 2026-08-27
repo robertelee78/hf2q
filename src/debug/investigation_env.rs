@@ -15,13 +15,6 @@
 //! line so the user notices. This preserves prod-binary debuggability
 //! while preventing accidental bug reports.
 //!
-//! # Not in scope here
-//!
-//! - `HF2Q_LMHEAD_Q8` is a category-2 operator knob (user-facing,
-//!   documented in `docs/operator-env-vars.md`) and is read at load
-//!   time inside the lm_head init path. It does not belong in this
-//!   struct.
-//!
 //! # Parse semantics
 //!
 //! Each field's doc comment notes the original inline parse shape —
@@ -124,9 +117,8 @@ pub struct InvestigationEnv {
     /// coherent BUT zero perf gain (126.2 vs 125.7 tok/s — MoE
     /// sparse activation makes KV bandwidth not the bottleneck).
     ///
-    /// → **No remaining safe use case**.  Use Path E+G (USE_DENSE +
-    /// LMHEAD_Q6K) for gemma4 perf instead — F32 KV preserved,
-    /// +3.7% over default at 1000-tok, coherent at long context.
+    /// → **No remaining safe use case**. The declared native head keeps
+    /// the model's artifact semantics while preserving F32 KV.
     /// Activation banner now warns DEPRECATED.
     ///
     /// Original parse: `map_or(false, |v| v == "1")`.
@@ -243,11 +235,6 @@ pub struct InvestigationEnv {
     /// unannotated dispatches).
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub graph_opt: bool,
-
-    /// `HF2Q_LMHEAD_COMPARE=1` — keep both F16 and Q8 lm_head resident
-    /// for future A/B diagnostics. Not wired into live decode today.
-    /// Original parse: `map_or(false, |v| v == "1")`.
-    pub lmhead_compare: bool,
 
     // ========================================================================
     // Category 4 — internal perf tuning (not part of product surface).
@@ -430,6 +417,22 @@ pub struct InvestigationEnv {
     /// gated by `env_eq_one("HF2Q_UNSAFE_EXPERIMENTS")`.
     pub chunk_scan_prefill: bool,
 
+    /// `HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS=N` —
+    /// one-shot ADR-049 acceptance fault. After a matching Qwen SlotAware
+    /// request completes its first non-empty GPU prefill slice, the worker
+    /// routes it through the ordinary failed-prefill reset path before
+    /// publishing the slice to the scheduler ledger. `N` must be positive.
+    /// Effective only with `HF2Q_UNSAFE_EXPERIMENTS=1`.
+    pub qwen_post_admission_prefill_failure_max_tokens: Option<usize>,
+
+    /// `HF2Q_TEST_ANCHOR_RESTORE_FAILURE_MAX_TOKENS=N` — one-shot
+    /// ADR-049 acceptance fault shared by the Gemma4 and DeepSeek4 serving
+    /// paths. The first real prompt-anchor restore whose request has exactly
+    /// `N` output tokens fails through that family's ordinary fail-closed
+    /// cleanup path. Equality/live-prefix hits cannot consume it. `N` must be
+    /// positive. Effective only with `HF2Q_UNSAFE_EXPERIMENTS=1`.
+    pub anchor_restore_failure_max_tokens: Option<usize>,
+
     // ========================================================================
     // Wave 5b.20 `gqa_expand_legacy` field + `HF2Q_GQA_EXPAND_LEGACY` env gate
     // removed in W-5b.21 after a 30/30 cross-path determinism audit at PP4106
@@ -575,10 +578,11 @@ pub struct InvestigationEnv {
     /// `chunk_gated_delta_rule` precondition at gpu_delta_net.rs:1078).
     /// Default 1024 = 16 internal chunks per stride.
     ///
-    /// Memory cost: per cached entry, `ceil(N / stride)` checkpoints
-    /// at ~96 MB each (Qwen 3.6 27B 48 DeltaNet layers × ~2 MB
-    /// recurrent state). For N=8192, stride=1024: 8 checkpoints =
-    /// ~768 MB per cached entry. Capacity=1 registry ⇒ bounded.
+    /// Memory cost: per cached entry, `ceil(N / stride)` checkpoints at
+    /// about 149.6 MiB each for the 48-DeltaNet-layer 27B shape, computed
+    /// from recurrent plus conv allocation code. For N=8192 and stride=1024,
+    /// eight checkpoints retain about 1.17 GiB before payload metadata. The
+    /// registry is byte-budgeted rather than entry-count bounded.
     pub kv_lcp_deltanet_checkpoint_stride: usize,
 
     /// `HF2Q_LAYER_POLICY` — per-layer SDPA policy selector.
@@ -615,10 +619,10 @@ pub struct InvestigationEnv {
     pub decode_emit_tokens: bool,
 
     /// `HF2Q_DECODE_INPUT_TOKENS=<space-separated u32 list>` — replay fixed
-    /// tokens overriding the on-GPU argmax (and any rerank). When set, for
+    /// tokens overriding the on-GPU argmax. When set, for
     /// step `i < replay.len()` the decode loop returns `replay[i]` instead
     /// of the sampler's pick. After the replay buffer is exhausted, control
-    /// falls through to the normal sampler. The argmax/rerank still runs
+    /// falls through to the normal sampler. The argmax still runs
     /// (so cosine/NLL captures see live logits) — only the *picked* token
     /// is overridden.  Format mirrors the audit-binary contract:
     /// `iter23_audit.rs:206-216` writes the env var as
@@ -654,7 +658,7 @@ pub struct InvestigationEnv {
     /// Parity byte-identical at gemma4 prod shape (dim=2816, top_k=8) — see
     /// test_fused_moe_wsum_endlayer_v2_parity.rs.
     /// **Default-OFF**: ADR-029 iter-3 re-test on adr-029 HEAD with full
-    /// default-flag stack (LMHEAD_Q6K + Q6K_MV_NR2 + Q6K_ID_MV_NR2 all on)
+    /// default native-head + Q6K_MV_NR2 + Q6K_ID_MV_NR2 stack
     /// produces byte-identical 50-tok haiku output on gemma4-APEX-Q5_K_M
     /// — coherence regresses are no longer reproducible at HEAD (the iter-367
     /// claim is stale).  Throughput at HEAD: 74.4 t/s median (σ-pct 0.11%)
@@ -736,16 +740,6 @@ pub struct InvestigationEnv {
     pub mlx_profile: bool,
 
     // ========================================================================
-    // Category 3 — benchmarking-only; ack-required.
-    // EFFECTIVE value (post-gate).
-    // ========================================================================
-    /// `HF2Q_LMHEAD_RERANK=0` — disable the exact-F32 rerank of top
-    /// Q8 candidates. Reintroduces the rare near-tiebreak flip.
-    /// Effective: `true` only when the env var is literally `"0"` AND
-    /// `HF2Q_UNSAFE_EXPERIMENTS=1` is set.
-    pub lmhead_rerank_disabled: bool,
-
-    // ========================================================================
     // Ack gate state (consumed by `activate` to print startup summary).
     // ========================================================================
     /// `HF2Q_UNSAFE_EXPERIMENTS=1` — explicit acknowledgment that the
@@ -785,8 +779,9 @@ struct RawAckIntent {
     skip_o_proj: bool,
     skip_routing: bool,
     skip_v_norm: bool,
-    lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
+    qwen_post_admission_prefill_failure_max_tokens: Option<usize>,
+    anchor_restore_failure_max_tokens: Option<usize>,
 }
 
 impl InvestigationEnv {
@@ -813,8 +808,15 @@ impl InvestigationEnv {
             skip_o_proj: env_eq_one("HF2Q_SKIP_O_PROJ"),
             skip_routing: env_eq_one("HF2Q_SKIP_ROUTING"),
             skip_v_norm: env_eq_one("HF2Q_SKIP_V_NORM"),
-            lmhead_rerank_disabled: matches!(env::var("HF2Q_LMHEAD_RERANK").as_deref(), Ok("0")),
             chunk_scan_prefill: env_eq_one("HF2Q_CHUNK_SCAN_PREFILL"),
+            qwen_post_admission_prefill_failure_max_tokens: env_usize(
+                "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS",
+            )
+            .filter(|&value| value > 0),
+            anchor_restore_failure_max_tokens: env_usize(
+                "HF2Q_TEST_ANCHOR_RESTORE_FAILURE_MAX_TOKENS",
+            )
+            .filter(|&value| value > 0),
         };
         let ack = env_eq_one("HF2Q_UNSAFE_EXPERIMENTS");
 
@@ -842,13 +844,16 @@ impl InvestigationEnv {
             skip_o_proj: raw.skip_o_proj && ack,
             skip_routing: raw.skip_routing && ack,
             skip_v_norm: raw.skip_v_norm && ack,
-            lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
+            qwen_post_admission_prefill_failure_max_tokens: ack
+                .then_some(raw.qwen_post_admission_prefill_failure_max_tokens)
+                .flatten(),
+            anchor_restore_failure_max_tokens: ack
+                .then_some(raw.anchor_restore_failure_max_tokens)
+                .flatten(),
 
             // Warn-only — no gate.
             graph_opt: env_eq_one("HF2Q_GRAPH_OPT"),
-            lmhead_compare: env_eq_one("HF2Q_LMHEAD_COMPARE"),
-
             // Dual buffer: store raw for call-site resolution with num_layers.
             dual_buffer_raw: env::var("HF2Q_DUAL_BUFFER").ok(),
 
@@ -1090,17 +1095,26 @@ impl InvestigationEnv {
                 "timing bisection; PRODUCES GARBAGE OUTPUT",
             ));
         }
-        if self.lmhead_rerank_disabled {
-            active_unsafe.push((
-                "HF2Q_LMHEAD_RERANK=0",
-                "raw Q8 argmax; rare near-tiebreak flips",
-            ));
-        }
         if self.chunk_scan_prefill {
             active_unsafe.push((
                 "HF2Q_CHUNK_SCAN_PREFILL=1",
                 "Wave 5b iter 5 chunk-pipeline prefill at seq_len > 64; \
                  sourdough/walk-bar parity validation pending",
+            ));
+        }
+        if self
+            .qwen_post_admission_prefill_failure_max_tokens
+            .is_some()
+        {
+            active_unsafe.push((
+                "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS=N",
+                "one-shot ADR-049 post-admission failed-prefill lifecycle gate",
+            ));
+        }
+        if self.anchor_restore_failure_max_tokens.is_some() {
+            active_unsafe.push((
+                "HF2Q_TEST_ANCHOR_RESTORE_FAILURE_MAX_TOKENS=N",
+                "one-shot ADR-049 Gemma4/DeepSeek4 failed-restore lifecycle gate",
             ));
         }
 
@@ -1127,15 +1141,30 @@ impl InvestigationEnv {
                 "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
             ));
         }
-        if self.raw.lmhead_rerank_disabled && !self.lmhead_rerank_disabled {
-            refused.push((
-                "HF2Q_LMHEAD_RERANK=0",
-                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
-            ));
-        }
         if self.raw.chunk_scan_prefill && !self.chunk_scan_prefill {
             refused.push((
                 "HF2Q_CHUNK_SCAN_PREFILL=1",
+                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
+            ));
+        }
+        if self
+            .raw
+            .qwen_post_admission_prefill_failure_max_tokens
+            .is_some()
+            && self
+                .qwen_post_admission_prefill_failure_max_tokens
+                .is_none()
+        {
+            refused.push((
+                "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS=N",
+                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
+            ));
+        }
+        if self.raw.anchor_restore_failure_max_tokens.is_some()
+            && self.anchor_restore_failure_max_tokens.is_none()
+        {
+            refused.push((
+                "HF2Q_TEST_ANCHOR_RESTORE_FAILURE_MAX_TOKENS=N",
                 "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
             ));
         }
@@ -1146,12 +1175,6 @@ impl InvestigationEnv {
             active_safe.push((
                 "HF2Q_GRAPH_OPT=1",
                 "no measured win; reorder aborts on unannotated dispatches",
-            ));
-        }
-        if self.lmhead_compare {
-            active_safe.push((
-                "HF2Q_LMHEAD_COMPARE=1",
-                "inert today (not wired into live decode)",
             ));
         }
         // iter-487: per-token opt-out is the noteworthy state, not the
@@ -1763,7 +1786,95 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qwen_post_admission_prefill_failure_requires_positive_value_and_unsafe_ack() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&[
+            "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS",
+            "HF2Q_UNSAFE_EXPERIMENTS",
+        ]);
+
+        assert_eq!(
+            InvestigationEnv::from_env().qwen_post_admission_prefill_failure_max_tokens,
+            None
+        );
+
+        guard.set(
+            "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS",
+            "39",
+        );
+        let refused = InvestigationEnv::from_env();
+        assert_eq!(
+            refused.qwen_post_admission_prefill_failure_max_tokens, None,
+            "a request-mutating test fault must be inert without explicit unsafe ack"
+        );
+        assert_eq!(
+            refused.raw.qwen_post_admission_prefill_failure_max_tokens,
+            Some(39),
+            "raw intent remains visible for the startup REFUSED banner"
+        );
+
+        guard.set("HF2Q_UNSAFE_EXPERIMENTS", "1");
+        assert_eq!(
+            InvestigationEnv::from_env().qwen_post_admission_prefill_failure_max_tokens,
+            Some(39)
+        );
+
+        for invalid in ["0", "not-a-number", "-1"] {
+            guard.set(
+                "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS",
+                invalid,
+            );
+            assert_eq!(
+                InvestigationEnv::from_env().qwen_post_admission_prefill_failure_max_tokens,
+                None,
+                "invalid trigger {invalid:?} must fail closed"
+            );
+        }
+    }
+
     // ── layer_policy ─────────────────────────────────────────────────
+
+    #[test]
+    fn anchor_restore_failure_requires_positive_value_and_unsafe_ack() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&[
+            "HF2Q_TEST_ANCHOR_RESTORE_FAILURE_MAX_TOKENS",
+            "HF2Q_UNSAFE_EXPERIMENTS",
+        ]);
+
+        assert_eq!(
+            InvestigationEnv::from_env().anchor_restore_failure_max_tokens,
+            None
+        );
+
+        guard.set("HF2Q_TEST_ANCHOR_RESTORE_FAILURE_MAX_TOKENS", "47");
+        let refused = InvestigationEnv::from_env();
+        assert_eq!(
+            refused.anchor_restore_failure_max_tokens, None,
+            "a state-mutating restore fault must be inert without explicit unsafe ack"
+        );
+        assert_eq!(
+            refused.raw.anchor_restore_failure_max_tokens,
+            Some(47),
+            "raw intent remains visible for the startup REFUSED banner"
+        );
+
+        guard.set("HF2Q_UNSAFE_EXPERIMENTS", "1");
+        assert_eq!(
+            InvestigationEnv::from_env().anchor_restore_failure_max_tokens,
+            Some(47)
+        );
+
+        for invalid in ["0", "not-a-number", "-1"] {
+            guard.set("HF2Q_TEST_ANCHOR_RESTORE_FAILURE_MAX_TOKENS", invalid);
+            assert_eq!(
+                InvestigationEnv::from_env().anchor_restore_failure_max_tokens,
+                None,
+                "invalid trigger {invalid:?} must fail closed"
+            );
+        }
+    }
 
     #[test]
     fn layer_policy_default_when_unset() {

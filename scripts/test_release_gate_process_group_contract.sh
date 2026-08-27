@@ -133,7 +133,7 @@ if grep -Eq 'qwen|deepseek|gemma|agentic_cache|model_recipe|hf_download' \
   echo "publication still executes model-family qualification" >&2
   exit 1
 fi
-grep -F 'name ~ /^hf2q(-|$)/ && pgid[i] != owner_pgid' \
+grep -F 'name ~ /^hf2q([0-9.-]|$)/ && pgid[i] != owner_pgid' \
   "$thermal_guard" >/dev/null
 if awk '
   /^host_contention_process_snapshot\(\)/ { in_guard=1 }

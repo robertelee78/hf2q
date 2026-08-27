@@ -1470,139 +1470,26 @@ impl MlxModelWeights {
                     fuse_fwht_pre: 0,
                     nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(hb_kv_seq_len),
                 };
-                // HF2Q_FA_PEER_PORT*: dispatch peer-port kernel variant instead of hybrid.
-                // Preconditions: head_dim==256, K dtype==F16, V dtype==F16.
-                //
-                // iter-137 — two variants:
-                //   HF2Q_FA_PEER_PORT       = NWG=1 verbatim port (iter-126).
-                //                             Falsified at tg5000 (-25%) because peer's
-                //                             actual runtime uses NWG=32 (iter-133 root
-                //                             cause). Kept for A/B + documentation;
-                //                             additionally gated on is_sliding so
-                //                             full-attn fallthrough to HYBRID.
-                //   HF2Q_FA_PEER_PORT_NWG32 = NWG=32 + reduce-kernel port (iters 134-137).
-                //                             Matches peer's actual runtime dispatch.
-                //                             Validated WIN +1.8-3.1pp at tg100/tg2000/tg5000
-                //                             vs HYBRID at PORT's f16-V regime (iter-138/140).
-                //                             Default-flipped ON iter-149 per operator
-                //                             approval: "best possible outcome for users —
-                //                             if coherent + TQ still enabled + marginally
-                //                             faster, of course default."
-                //                             Reuses existing sdpa_tmp buffer (identical
-                //                             size formula nrows*32*(dv+2)*4).
-                //
-                // PORT_NWG32 default ON; opt out via HF2Q_FA_PEER_PORT_NWG32=0.
-                // PORT (NWG=1, falsified) default OFF — explicit HF2Q_FA_PEER_PORT=1 only.
-                // The precondition `v_packed.dtype()==F16` means PORT_NWG32 ONLY fires when
-                // TQ-HB-V is bypassed (HF2Q_FULL_F16_KV=1 or otherwise F16-V regime).
-                // With default TQ-HB-V active, PORT_NWG32 gate falls through to hybrid —
-                // zero behavior change. With explicit F16-V request, PORT_NWG32 wins +2pp.
-                static FA_PEER_PORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let use_peer_port = *FA_PEER_PORT.get_or_init(|| {
-                    std::env::var("HF2Q_FA_PEER_PORT")
-                        .map(|v| v == "1")
-                        .unwrap_or(false)
-                });
-                static FA_PEER_PORT_NWG32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let use_peer_port_nwg32 = *FA_PEER_PORT_NWG32.get_or_init(|| {
-                    // env_default_true pattern (mirrors HF2Q_Q6K_MV_NR2 iter-326):
-                    // unset → ON; "0"/"false"/"off" → OFF; "1"/"true"/"on" → ON.
-                    match std::env::var("HF2Q_FA_PEER_PORT_NWG32").ok().as_deref() {
-                        None => true,
-                        Some(v)
-                            if v.eq_ignore_ascii_case("0")
-                                || v.eq_ignore_ascii_case("false")
-                                || v.eq_ignore_ascii_case("off") =>
-                        {
-                            false
-                        }
-                        Some(_) => true,
-                    }
-                });
-
-                if use_peer_port_nwg32
-                    && hd == 256
-                    && hybrid_kv[layer_idx].k.dtype() == mlx_native::DType::F16
-                    && hybrid_kv[layer_idx].v_packed.dtype() == mlx_native::DType::F16
-                {
-                    let p_peer =
-                        mlx_native::ops::flash_attn_vec_peer_port_f16::FlashAttnVecPeerPortParams {
-                            num_heads: nh as u32,
-                            num_kv_heads: nkv as u32,
-                            head_dim: hd as u32,
-                            kv_seq_len: hb_kv_seq_len,
-                            kv_capacity: hb_cap as u32,
-                            scale: 1.0,
-                            mask_type: if is_sliding { 2 } else { 1 },
-                            sliding_window: if is_sliding {
-                                self.sliding_window as u32
-                            } else {
-                                0
-                            },
-                            ring_start: ring_start_hb,
-                        };
-                    mlx_native::ops::flash_attn_vec_peer_port_f16::flash_attn_vec_peer_port_f16_nwg32(
-                                session.encoder_mut(), reg, dev,
-                                &self.activations.attn_q_normed,
-                                &hybrid_kv[layer_idx].k,
-                                &hybrid_kv[layer_idx].v_packed,
-                                &self.activations.sdpa_tmp,
-                                &self.activations.sdpa_out,
-                                &p_peer,
-                            ).map_err(|e| anyhow::anyhow!("flash_attn_vec_peer_port_f16_nwg32 L{layer_idx}: {e}"))?;
-                    *total_dispatches += 2; // vec + reduce
-                } else if use_peer_port
-                    && is_sliding
-                    && hd == 256
-                    && hybrid_kv[layer_idx].k.dtype() == mlx_native::DType::F16
-                    && hybrid_kv[layer_idx].v_packed.dtype() == mlx_native::DType::F16
-                {
-                    let p_peer =
-                        mlx_native::ops::flash_attn_vec_peer_port_f16::FlashAttnVecPeerPortParams {
-                            num_heads: nh as u32,
-                            num_kv_heads: nkv as u32,
-                            head_dim: hd as u32,
-                            kv_seq_len: hb_kv_seq_len,
-                            kv_capacity: hb_cap as u32,
-                            scale: 1.0,
-                            mask_type: if is_sliding { 2 } else { 1 },
-                            sliding_window: if is_sliding {
-                                self.sliding_window as u32
-                            } else {
-                                0
-                            },
-                            ring_start: ring_start_hb,
-                        };
-                    mlx_native::ops::flash_attn_vec_peer_port_f16::flash_attn_vec_peer_port_f16(
-                        session.encoder_mut(),
-                        reg,
-                        dev,
-                        &self.activations.attn_q_normed,
-                        &hybrid_kv[layer_idx].k,
-                        &hybrid_kv[layer_idx].v_packed,
-                        &self.activations.sdpa_out,
-                        &p_peer,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("flash_attn_vec_peer_port_f16 L{layer_idx}: {e}")
-                    })?;
-                    *total_dispatches += 1; // NWG=1: no reduce kernel
-                } else {
-                    mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
-                        session.encoder_mut(),
-                        reg,
-                        dev,
-                        &self.activations.attn_q_normed,
-                        &hybrid_kv[layer_idx].k,
-                        &hybrid_kv[layer_idx].v_packed,
-                        &hybrid_kv[layer_idx].v_norms,
-                        &self.activations.sdpa_out,
-                        &self.activations.sdpa_tmp,
-                        &p_hyb,
-                    )
-                    .map_err(|e| anyhow::anyhow!("flash_attn_vec_hybrid L{layer_idx}: {e}"))?;
-                    *total_dispatches += 2; // main + reduce (conservative)
-                }
+                // One dtype-specialized hybrid dispatcher is authoritative
+                // for both packed and full-F16 V. The retired F16-only port
+                // produced non-finite logits after a B2→B4 slot transition;
+                // a first-token check had not covered that stateful shape
+                // sequence. Keep representation selection inside the native
+                // dispatcher instead of forking request semantics here.
+                mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
+                    session.encoder_mut(),
+                    reg,
+                    dev,
+                    &self.activations.attn_q_normed,
+                    &hybrid_kv[layer_idx].k,
+                    &hybrid_kv[layer_idx].v_packed,
+                    &hybrid_kv[layer_idx].v_norms,
+                    &self.activations.sdpa_out,
+                    &self.activations.sdpa_tmp,
+                    &p_hyb,
+                )
+                .map_err(|e| anyhow::anyhow!("flash_attn_vec_hybrid L{layer_idx}: {e}"))?;
+                *total_dispatches += 2; // main + reduce (conservative)
                 // BUG-coherence fix (supersedes Phase 10e.5 iter-351):
                 // V is now FWHT-rotated then quantized (see V-encode site
                 // ~line 3724).  SDPA output is therefore in the FWHT domain
@@ -2468,14 +2355,11 @@ impl MlxModelWeights {
             }
 
             let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
-            session.barrier_between(
-                &[
-                    &self.activations.moe_norm_out,
-                    &self.activations.moe_expert_ids,
-                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                ],
-                &[&self.activations.moe_gate_up_id_out],
-            );
+            let native_activation_epoch = self.native_activation_epoch()?;
+            let (gate_up_affine, down_affine) = self.layers[layer_idx]
+                .moe
+                .affine_pair()?
+                .map_or((None, None), |(gate_up, down)| (Some(gate_up), Some(down)));
             let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
                 n_tokens: 1,
                 top_k: top_k as u32,
@@ -2504,6 +2388,7 @@ impl MlxModelWeights {
                             gu_params.n,
                             gu_params.k,
                             gu_params.top_k,
+                            gu_params.n_experts,
                             gu_params.expert_stride,
                         )
                         .ok()
@@ -2517,28 +2402,59 @@ impl MlxModelWeights {
             // gate_up_id + swiglu + down_id dispatches.  Produces
             // garbage moe_down_id_out (stale buffer).
             if !INVESTIGATION_ENV.skip_moe_experts {
-                if let Some(rec) = q6k_id_record_opt {
-                    session.encoder_mut().dispatch_record(
-                        rec,
+                let gate_up_weight = self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap();
+                if !super::expert_dispatch::dispatch_native_scalar_expert(
+                    session,
+                    reg,
+                    dev,
+                    native_activation_epoch,
+                    &self.activations.moe_norm_out,
+                    gate_up_weight,
+                    &self.activations.moe_expert_ids,
+                    &self.activations.moe_gate_up_id_out,
+                    gate_up_affine,
+                    ggml_type_gu,
+                    1,
+                    top_k as u32,
+                    gu_params.n,
+                    gu_params.k,
+                    gu_params.n_experts,
+                    gu_params.expert_stride,
+                    mlx_native::DenseMatmulIdInputLayout::SharedPerToken,
+                    super::expert_dispatch::DenseExpertScratchSlot::GateUp,
+                    "Gemma decode gate/up",
+                )? {
+                    session.barrier_between(
                         &[
-                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
                             &self.activations.moe_norm_out,
-                            &self.activations.moe_gate_up_id_out,
                             &self.activations.moe_expert_ids,
+                            gate_up_weight,
                         ],
+                        &[&self.activations.moe_gate_up_id_out],
                     );
-                } else {
-                    session
-                        .quantized_matmul_id_ggml(
-                            reg,
-                            dev,
-                            &self.activations.moe_norm_out,
-                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                            &self.activations.moe_expert_ids,
-                            &self.activations.moe_gate_up_id_out,
-                            &gu_params,
-                        )
-                        .map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                    if let Some(rec) = q6k_id_record_opt {
+                        session.encoder_mut().dispatch_record(
+                            rec,
+                            &[
+                                gate_up_weight,
+                                &self.activations.moe_norm_out,
+                                &self.activations.moe_gate_up_id_out,
+                                &self.activations.moe_expert_ids,
+                            ],
+                        );
+                    } else {
+                        session
+                            .quantized_matmul_id_ggml(
+                                reg,
+                                dev,
+                                &self.activations.moe_norm_out,
+                                gate_up_weight,
+                                &self.activations.moe_expert_ids,
+                                &self.activations.moe_gate_up_id_out,
+                                &gu_params,
+                            )
+                            .map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                    }
                 }
                 *total_dispatches += 1;
 
@@ -2569,14 +2485,6 @@ impl MlxModelWeights {
             // down_id reads moe_swiglu_id_out (from B12). post-FF norm1 reads
             // mlp_down (from B11). Disjoint writes.
             let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
-            session.barrier_between(
-                &[
-                    &self.activations.moe_swiglu_id_out,
-                    &self.activations.moe_expert_ids,
-                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                ],
-                &[&self.activations.moe_down_id_out],
-            );
             let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
                 n_tokens: top_k as u32,
                 top_k: 1,
@@ -2603,6 +2511,7 @@ impl MlxModelWeights {
                             dn_params.n,
                             dn_params.k,
                             dn_params.n_tokens, // = real_top_k for the down dispatch
+                            dn_params.n_experts,
                             dn_params.expert_stride,
                         )
                         .ok()
@@ -2613,28 +2522,59 @@ impl MlxModelWeights {
                 None
             };
             if !INVESTIGATION_ENV.skip_moe_experts {
-                if let Some(rec) = q8_0_id_record_opt {
-                    session.encoder_mut().dispatch_record(
-                        rec,
+                let down_weight = self.layers[layer_idx].moe.stacked_down.as_ref().unwrap();
+                if !super::expert_dispatch::dispatch_native_scalar_expert(
+                    session,
+                    reg,
+                    dev,
+                    native_activation_epoch,
+                    &self.activations.moe_swiglu_id_out,
+                    down_weight,
+                    &self.activations.moe_expert_ids,
+                    &self.activations.moe_down_id_out,
+                    down_affine,
+                    ggml_type_dn,
+                    1,
+                    top_k as u32,
+                    dn_params.n,
+                    dn_params.k,
+                    dn_params.n_experts,
+                    dn_params.expert_stride,
+                    mlx_native::DenseMatmulIdInputLayout::Slotted,
+                    super::expert_dispatch::DenseExpertScratchSlot::Down,
+                    "Gemma decode down",
+                )? {
+                    session.barrier_between(
                         &[
-                            self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
                             &self.activations.moe_swiglu_id_out,
-                            &self.activations.moe_down_id_out,
                             &self.activations.moe_expert_ids,
+                            down_weight,
                         ],
+                        &[&self.activations.moe_down_id_out],
                     );
-                } else {
-                    session
-                        .quantized_matmul_id_ggml(
-                            reg,
-                            dev,
-                            &self.activations.moe_swiglu_id_out,
-                            self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                            &self.activations.moe_expert_ids,
-                            &self.activations.moe_down_id_out,
-                            &dn_params,
-                        )
-                        .map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                    if let Some(rec) = q8_0_id_record_opt {
+                        session.encoder_mut().dispatch_record(
+                            rec,
+                            &[
+                                down_weight,
+                                &self.activations.moe_swiglu_id_out,
+                                &self.activations.moe_down_id_out,
+                                &self.activations.moe_expert_ids,
+                            ],
+                        );
+                    } else {
+                        session
+                            .quantized_matmul_id_ggml(
+                                reg,
+                                dev,
+                                &self.activations.moe_swiglu_id_out,
+                                down_weight,
+                                &self.activations.moe_expert_ids,
+                                &self.activations.moe_down_id_out,
+                                &dn_params,
+                            )
+                            .map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                    }
                 }
                 *total_dispatches += 1;
             }
@@ -4217,7 +4157,6 @@ mod g4_cfa_tests {
                 cols,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         }
     }
@@ -5144,7 +5083,6 @@ mod g4_cfa_tests {
                 cols,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         }
     }
@@ -5486,7 +5424,6 @@ mod g4_cfa_tests {
                 cols,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         }
     }

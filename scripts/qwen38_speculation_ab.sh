@@ -12,8 +12,9 @@ OUT_DIR=${OUT_DIR:?OUT_DIR is required and must be fresh}
 PORT=${PORT:-18084}
 MIN_CODE_IMPROVEMENT_PERCENT=${MIN_CODE_IMPROVEMENT_PERCENT:-5}
 MIN_REPEAT_IMPROVEMENT_PERCENT=${MIN_REPEAT_IMPROVEMENT_PERCENT:-5}
-DECODE_MVN=${HF2Q_DECODE_MVN:-0}
-DECODE_MV_EXT=${HF2Q_DECODE_MV_EXT:-1}
+DECODE_MVN=${HF2Q_DECODE_MVN:-1}
+DECODE_MV_EXT=${HF2Q_DECODE_MV_EXT:-0}
+Q5K_CANONICAL_Q4X4=${HF2Q_Q5K_CANONICAL_Q4X4:-1}
 
 MODEL_ID=${MODEL_ID:-}
 readonly MAX_TOKENS=128
@@ -24,7 +25,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
-for command in awk cmp curl find jq sed shasum sort stat; do
+for command in awk cmp curl find jq perl sed shasum sort stat; do
     command -v "$command" >/dev/null || {
         echo "missing required command: $command" >&2
         exit 2
@@ -34,6 +35,7 @@ done
     echo "hf2q binary is missing or non-executable: $BINARY_PATH" >&2
     exit 2
 }
+export HF2Q_MODEL_VERIFICATION_BINARY="$BINARY_PATH"
 [[ -f "$MODEL_PATH" ]] || {
     echo "Qwen3.8 model is missing: $MODEL_PATH" >&2
     exit 2
@@ -52,10 +54,10 @@ for threshold in "$MIN_CODE_IMPROVEMENT_PERCENT" "$MIN_REPEAT_IMPROVEMENT_PERCEN
         exit 2
     }
 done
-case "$DECODE_MVN:$DECODE_MV_EXT" in
-    0:1|0:0|1:0|1:1) ;;
+case "$DECODE_MVN:$DECODE_MV_EXT:$Q5K_CANONICAL_Q4X4" in
+    0:1:0|0:1:1|0:0:0|0:0:1|1:0:0|1:0:1|1:1:0|1:1:1) ;;
     *)
-        echo "HF2Q_DECODE_MVN and HF2Q_DECODE_MV_EXT must each be 0 or 1" >&2
+        echo "dense routing settings must each be 0 or 1" >&2
         exit 2
         ;;
 esac
@@ -81,7 +83,13 @@ if [[ -z "$model_verification_receipt" ]]; then
     model_verification_mode=$(jq -er .run_verification \
         "$model_verification_receipt")
 else
-    model_verification_mode=provided_receipt
+    supplied_model_verification_receipt=$model_verification_receipt
+    model_verification_receipt="$OUT_DIR/model-verification.json"
+    hf2q_release_materialize_model_verification \
+        "$MODEL_PATH" "$MODEL_SHA256" "$supplied_model_verification_receipt" \
+        "$model_verification_receipt"
+    model_verification_mode=$(jq -er .run_verification \
+        "$model_verification_receipt")
 fi
 hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
     "$model_verification_receipt"
@@ -220,6 +228,7 @@ run_trial() {
 
     env \
         HF2Q_BIN="$BINARY_PATH" \
+        HF2Q_MODEL_VERIFICATION_RECEIPT="$model_verification_receipt" \
         MODEL="$MODEL_PATH" \
         PORT="$PORT" \
         MAX_SLOTS=1 \
@@ -231,10 +240,23 @@ run_trial() {
         REP_PENALTY=1.05 \
         HF2Q_DECODE_MVN="$DECODE_MVN" \
         HF2Q_DECODE_MV_EXT="$DECODE_MV_EXT" \
+        HF2Q_Q5K_CANONICAL_Q4X4="$Q5K_CANONICAL_Q4X4" \
         "$script_dir/serve_qwen38_opencode.sh" >"$log_path" 2>&1 &
     server_pid=$!
     wait_ready "$log_path"
     resolve_loaded_model_id
+    local expected_q5k_policy=false
+    [[ "$Q5K_CANONICAL_Q4X4" == 1 ]] && expected_q5k_policy=true
+    EXPECTED_Q5K_POLICY="$expected_q5k_policy" perl -ne '
+      if (/frozen Qwen GGML routing policy/) {
+        $seen++;
+        $q5=$1 if /dense_q5k_canonical_q4x4=(true|false)/;
+      }
+      END {exit 1 unless $seen == 1 && $q5 eq $ENV{EXPECTED_Q5K_POLICY}}
+    ' "$log_path" || {
+        echo "Qwen3.8 speculation trial did not freeze the recorded Q5_K route" >&2
+        return 1
+    }
 
     curl --fail --silent --show-error \
         --header 'Content-Type: application/json' \
@@ -340,6 +362,7 @@ jq -n \
     --argjson max_tokens "$MAX_TOKENS" \
     --argjson decode_mvn "$DECODE_MVN" \
     --argjson decode_mv_ext "$DECODE_MV_EXT" \
+    --argjson q5k_canonical_q4x4 "$Q5K_CANONICAL_Q4X4" \
     --argjson off_code_median_seconds "$off_code_median" \
     --argjson auto_code_median_seconds "$auto_code_median" \
     --argjson code_throughput_improvement_percent "$code_improvement" \
@@ -348,11 +371,12 @@ jq -n \
     --argjson repeat_throughput_improvement_percent "$repeat_improvement" \
     --argjson auto_proposals "$auto_proposals" \
     --argjson auto_accepted_tokens "$auto_accepted" \
-    '{schema:1,verdict:"pass",exact_choices_parity:true,
+    '{schema:2,verdict:"pass",exact_choices_parity:true,
       binary:{path:$binary_path,sha256:$binary_sha256},
       model:{id:$model_id,path:$model_path,sha256:$model_sha256,bytes:$model_bytes,
              verification:$model_verification,file_snapshot:$model_file_snapshot},
-      routing:{dense_decode_mvn:$decode_mvn,dense_decode_mv_ext:$decode_mv_ext},
+      routing:{dense_decode_mvn:$decode_mvn,dense_decode_mv_ext:$decode_mv_ext,
+               dense_q5k_canonical_q4x4:$q5k_canonical_q4x4},
       workload:{trial_order:"off auto auto off",cases_per_group_per_trial:3,
                 repetitions_per_mode:2,max_tokens:$max_tokens,temperature:0},
       code:{off_median_seconds:$off_code_median_seconds,

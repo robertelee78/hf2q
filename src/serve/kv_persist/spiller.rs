@@ -1112,8 +1112,11 @@ mod tests {
     fn fresh_engine(repo: &str, quant: QuantType) -> Arc<LoadedEngine<TestEngine>> {
         Arc::new(LoadedEngine {
             engine: TestEngine,
+            projector: None,
             repo: repo.to_string(),
             gguf_path: std::path::PathBuf::new(),
+            text_artifact: None,
+            projector_file_stamp: None,
             quant,
             bytes_resident: 1 << 30,
             loaded_at: SystemTime::now(),

@@ -18,6 +18,7 @@ if MLX_NATIVE_SKIP_METALLIB=1 \
   DEPENDENCY_PROVENANCE_DIR="$tmp_dir/dummy-dependency-provenance" \
   HF2Q_BIN=/bin/true \
   EXPECTED_BINARY_SHA256="$MODEL_SHA" \
+  HF2Q_SOURCE_ROOT="$ROOT_DIR" \
   DEEPSEEK_MODEL=/dev/null GEMMA_MODEL=/dev/null \
   QWEN_MODEL=/dev/null QWEN38_MODEL=/dev/null \
   DEEPSEEK_MODEL_SHA256="$MODEL_SHA" GEMMA_MODEL_SHA256="$MODEL_SHA" \
@@ -38,6 +39,7 @@ settle="$tmp_dir/settle.log"
 contention_measurement="$tmp_dir/measurement-contention.log"
 contention_settle="$tmp_dir/settle-contention.log"
 summary="$tmp_dir/summary.json"
+dependency_receipt="$tmp_dir/dependency-provenance.json"
 
 jq -n '{
   schema_version:1,status:"pass",artifact_bytes:107431343168,layers:43,
@@ -58,19 +60,30 @@ printf 'cooperative hardware test passed\n' >"$test_log"
 printf '2000\tnominal\tcooperative-prefill-measurement-start\n' >"$measurement"
 printf '2002\tfair\tcooperative-prefill-measurement\n' >>"$measurement"
 printf '2004\tfair\tcooperative-prefill-measurement-end\n' >>"$measurement"
-printf '2000\tquiet\tcooperative-prefill-measurement-start\t100\t-\n' \
+printf '2000\tquiet\tcooperative-prefill-measurement-start\t100\t0.0\t-\n' \
   >"$contention_measurement"
-printf '2002\tquiet\tcooperative-prefill-measurement\t100\t-\n' \
+printf '2002\tquiet\tcooperative-prefill-measurement\t100\t0.0\t-\n' \
   >>"$contention_measurement"
-printf '2004\tquiet\tcooperative-prefill-measurement-end\t100\t-\n' \
+printf '2004\tquiet\tcooperative-prefill-measurement-end\t100\t0.0\t-\n' \
   >>"$contention_measurement"
 for timestamp in 1000 1005 1010 1015 1020 1025 1030 1035 1040 1045 1050 1055 1060; do
   printf '%s\tnominal\tcooperative-prefill-settle\n' "$timestamp" >>"$settle"
-  printf '%s\tquiet\tcooperative-prefill-settle\t100\t-\n' "$timestamp" \
+  printf '%s\tquiet\tcooperative-prefill-settle\t100\t0.0\t-\n' "$timestamp" \
     >>"$contention_settle"
 done
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+mlx_native_version=9.8.7
+jq -n --arg version "$mlx_native_version" '{
+  schema_version:1,status:"pass",
+  package:{source:"packed-crate",crate_sha256:("c" * 64)},
+  build:{cargo_target_checkout_disjoint:true,
+    rust_build_override_env_cleared:true},
+  dependency:{name:"mlx-native",version:$version,requirement:("=" + $version),
+    source:"registry+https://github.com/rust-lang/crates.io-index",
+    checksum:("d" * 64)}
+}' >"$dependency_receipt"
+dependency_receipt_sha=$(sha256_file "$dependency_receipt")
 write_summary() {
   local output=$1
   local measurement_path=${2:-$measurement}
@@ -104,6 +117,7 @@ write_summary() {
       "$(sha256_file "$contention_measurement")" \
     --arg contention_settle_log_sha256 \
       "$(sha256_file "$contention_settle")" \
+    --arg mlx_native_version "$mlx_native_version" \
     --argjson measurement_samples "$measurement_samples" \
     --argjson measurement_duration_seconds "$measurement_duration_seconds" \
     --argjson non_nominal_measurement_samples \
@@ -113,7 +127,7 @@ write_summary() {
       "$over_limit_measurement_samples" \
     --argjson telemetry_gaps "$telemetry_gaps" '
     . + {schema_version:2,source_sha:$source_sha,model_sha256:$model_sha256,
-      mlx_native_version:"0.11.2",raw_sha256:$raw_sha256,
+      mlx_native_version:$mlx_native_version,raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
       required_start_state:"nominal",maximum_measurement_state:"fair",
       measurement_log_sha256:$measurement_log_sha256,
@@ -127,7 +141,7 @@ write_summary() {
       fair_measurement_samples:$fair_measurement_samples,
       over_limit_measurement_samples:$over_limit_measurement_samples,
       telemetry_gaps:$telemetry_gaps,
-      host_contention:{policy:"process-group-v1",
+      host_contention:{policy:"process-group-cpu-v2",
         settle:{log_sha256:$contention_settle_log_sha256,samples:13,
           duration_seconds:60,contended_samples:0,telemetry_gaps:0},
         measurement:{log_sha256:$contention_measurement_log_sha256,samples:3,
@@ -138,13 +152,15 @@ write_summary() {
 write_summary "$summary"
 bash "$VERIFY" "$summary" "$raw" "$test_log" "$measurement" "$settle" \
   "$SOURCE_SHA" "$MODEL_SHA" "$contention_measurement" \
-  "$contention_settle" >/dev/null
+  "$contention_settle" "$dependency_receipt" "$dependency_receipt_sha" \
+  >/dev/null
 
 expect_rejected() {
   local label=$1
   shift
   if bash "$VERIFY" "$@" "$contention_measurement" \
-      "$contention_settle" >/dev/null 2>&1; then
+      "$contention_settle" "$dependency_receipt" "$dependency_receipt_sha" \
+      >/dev/null 2>&1; then
     echo "cooperative receipt verifier accepted invalid case: $label" >&2
     exit 1
   fi
@@ -153,6 +169,11 @@ expect_rejected() {
 jq '.benchmark.speedup = 9' "$summary" >"$tmp_dir/bad-speedup.json"
 expect_rejected derived-speedup "$tmp_dir/bad-speedup.json" "$raw" "$test_log" \
   "$measurement" "$settle" "$SOURCE_SHA" "$MODEL_SHA"
+
+jq '.mlx_native_version = "9.8.6"' "$summary" \
+  >"$tmp_dir/bad-dependency-version.json"
+expect_rejected dependency-version "$tmp_dir/bad-dependency-version.json" \
+  "$raw" "$test_log" "$measurement" "$settle" "$SOURCE_SHA" "$MODEL_SHA"
 
 cp "$raw" "$tmp_dir/mutated-raw.json"
 printf '\n' >>"$tmp_dir/mutated-raw.json"
@@ -250,8 +271,19 @@ jq --arg sha "$(sha256_file "$tmp_dir/contended-host.log")" \
   "$summary" >"$tmp_dir/contended-host-summary.json"
 if bash "$VERIFY" "$tmp_dir/contended-host-summary.json" "$raw" "$test_log" \
     "$measurement" "$settle" "$SOURCE_SHA" "$MODEL_SHA" \
-    "$tmp_dir/contended-host.log" "$contention_settle" >/dev/null 2>&1; then
+    "$tmp_dir/contended-host.log" "$contention_settle" \
+    "$dependency_receipt" "$dependency_receipt_sha" >/dev/null 2>&1; then
   echo "cooperative receipt verifier accepted host contention" >&2
+  exit 1
+fi
+
+jq '.dependency.version = "9.8.6" | .dependency.requirement = "=9.8.6"' \
+  "$dependency_receipt" >"$tmp_dir/mutated-dependency.json"
+if bash "$VERIFY" "$summary" "$raw" "$test_log" "$measurement" "$settle" \
+    "$SOURCE_SHA" "$MODEL_SHA" "$contention_measurement" \
+    "$contention_settle" "$tmp_dir/mutated-dependency.json" \
+    "$dependency_receipt_sha" >/dev/null 2>&1; then
+  echo "cooperative verifier accepted a mutated verified dependency receipt" >&2
   exit 1
 fi
 

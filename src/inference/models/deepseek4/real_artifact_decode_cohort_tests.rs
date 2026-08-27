@@ -331,7 +331,7 @@ fn grow_and_extend_caches(
                 .allocate_logical_cache(BENCHMARK_LOGICAL_CAPACITY)
                 .expect("allocate production-capacity benchmark cache");
             grown
-                .migrate_from(&source, None)
+                .migrate_from(&source)
                 .expect("grow parity cache into production logical capacity");
             model
                 .forward_verifier_prompt(&benchmark_extension(logical_lane), &mut grown)
