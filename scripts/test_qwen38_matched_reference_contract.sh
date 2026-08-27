@@ -57,6 +57,10 @@ expect_failure() {
 # predicates. Exercise their behavior directly so a caller's conditional
 # context cannot turn a failed probe into a successful observation.
 (
+    # Hosted macOS runners do not install ripgrep. Port safety must not become
+    # a false success merely because a developer workstation does.
+    # shellcheck disable=SC2329
+    rg() { return 127; }
     # shellcheck disable=SC2329
     lsof() {
         printf '%s\n' \

@@ -8,7 +8,7 @@ matched_require_port_available() {
 
     [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 2
     if lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null \
-      | sed -n '2p' | rg -q .; then
+      | sed -n '2p' | grep -q .; then
         echo "server listener already occupies port: $port" >&2
         return 1
     fi
