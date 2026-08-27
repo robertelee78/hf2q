@@ -4955,6 +4955,13 @@ impl TqFullAttnKvBuffers {
     /// admission has already provisioned the destination capacity. Arena
     /// growth itself uses ordered GPU blits and never maps live KV through the
     /// CPU.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "Rust 1.89 does not mark helpers reached only by the dormant MultiSeqKvCache::fork_seq production seam as live"
+        )
+    )]
     fn copy_slot_prefix_within(
         &mut self,
         src: crate::serve::multi_seq_kv::SlotId,
@@ -5019,6 +5026,13 @@ impl TqFullAttnKvBuffers {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Rust 1.89 does not mark helpers reached only by the dormant MultiSeqKvCache::fork_seq production seam as live"
+    )
+)]
 fn copy_tq_component_slot_prefix_within(
     buffer: &mut MlxBuffer,
     layout: &TqArenaLayout,
