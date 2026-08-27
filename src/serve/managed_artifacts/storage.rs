@@ -156,6 +156,15 @@ pub(super) fn candidate_from_binding(
     path: PathBuf,
     sidecar: PathBuf,
 ) -> Result<Candidate> {
+    candidate_from_binding_in(&hf_hub_cache_dir(), binding, path, sidecar)
+}
+
+pub(super) fn candidate_from_binding_in(
+    hub_cache: &Path,
+    binding: ManagedBinding,
+    path: PathBuf,
+    sidecar: PathBuf,
+) -> Result<Candidate> {
     validate_binding(&binding)?;
     if path.file_name().and_then(|name| name.to_str())
         != Some(binding.artifact.local_filename.as_str())
@@ -164,24 +173,56 @@ pub(super) fn candidate_from_binding(
     }
     let metadata = fs::symlink_metadata(&path)
         .with_context(|| format!("managed artifact is missing: {}", path.display()))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() != binding.artifact.bytes
-    {
-        bail!("managed artifact is not an exact-size non-symlink regular file");
-    }
+    let receipt_target_identity = if metadata.file_type().is_symlink() {
+        let retained = retain_managed_hub_cache_link_in(
+            hub_cache,
+            &path,
+            &binding.repository,
+            &binding.revision,
+            &binding.artifact.hub_filename,
+            binding.artifact.bytes,
+            &binding.artifact.sha256,
+        )?
+        .context("managed artifact link is not an authenticated Hugging Face cache link")?;
+        Some(retained.identity())
+    } else {
+        if !metadata.is_file() || metadata.len() != binding.artifact.bytes {
+            bail!("managed artifact is not an exact-size regular file");
+        }
+        None
+    };
     let root = path
         .parent()
         .context("managed artifact has no parent")?
         .to_path_buf();
-    let projector = binding.projector.as_ref().and_then(|projector| {
-        let projector_path = path.with_file_name(&projector.local_filename);
-        let metadata = fs::symlink_metadata(&projector_path).ok()?;
-        (metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.len() == projector.bytes)
-            .then(|| (projector_path, projector.bytes, projector.sha256.clone()))
-    });
+    let projector = binding
+        .projector
+        .as_ref()
+        .map(|projector| -> Result<_> {
+            let projector_path = path.with_file_name(&projector.local_filename);
+            let metadata = match fs::symlink_metadata(&projector_path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let exact = if metadata.file_type().is_symlink() {
+                retain_managed_hub_cache_link_in(
+                    hub_cache,
+                    &projector_path,
+                    &binding.repository,
+                    &binding.revision,
+                    &projector.hub_filename,
+                    projector.bytes,
+                    &projector.sha256,
+                )?
+                .is_some()
+            } else {
+                metadata.is_file() && metadata.len() == projector.bytes
+            };
+            Ok(exact.then(|| (projector_path, projector.bytes, projector.sha256.clone())))
+        })
+        .transpose()?
+        .flatten();
     Ok(Candidate {
         repository: binding.repository,
         revision: binding.revision,
@@ -195,7 +236,7 @@ pub(super) fn candidate_from_binding(
         last_used_at_secs: binding.last_used_at_secs,
         projector,
         sidecar: Some(sidecar),
-        receipt_target_identity: None,
+        receipt_target_identity,
     })
 }
 

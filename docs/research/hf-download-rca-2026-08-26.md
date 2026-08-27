@@ -137,16 +137,21 @@ would add a second dependency/runtime/cache/error model and violate hf2q's
 in-process Rust download boundary. The native Rust Xet client supplies the same
 class of concurrent range reconstruction without outsourcing product behavior.
 
-### Not forced: `HF_XET_HIGH_PERFORMANCE=1`
+### Qualified-host amendment: `HF_XET_HIGH_PERFORMANCE=1`
 
 Normal Xet already uses adaptive concurrent range retrieval. Hugging Face's
 current Xet documentation says the adaptive defaults are tuned to saturate most
 network paths and reserves high-performance mode for high-bandwidth machines
 with at least 64 GB of RAM. Xet 1.5.3's source raises its download-buffer limit
-from 8 GB to 64 GB in that mode. Forcing it would therefore be slower or unsafe
-on part of hf2q's Apple-Silicon support range. hf2q ships one production
-transport—native Xet—with its upstream adaptive policy rather than a matrix of
-hf2q-specific modes.
+from 8 GB to 64 GB in that mode. Forcing it would therefore be unsafe on part
+of hf2q's Apple-Silicon support range. The 2026-08-27 exact-artifact
+interleaved A/B measured a 251.23-second adaptive median against a 225.99-second
+high-performance median (10.05% lower wall time), while median peak RSS
+increased from 3,301,113,856 to 10,223,222,784 bytes. hf2q therefore enables
+the upstream preset only on Apple Silicon with at least 64 GiB physical memory
+and only when neither upstream mode variable is explicit. Adaptive remains the
+default everywhere else. This is one production transport with a resource
+qualification, not multiple download implementations.
 
 ### Fallback considered: old async `hf-hub 0.5` high mode
 
@@ -262,6 +267,16 @@ pass, while the control rate is only partial-file growth and does not include
 successful publication or final verification. Live inspection observed 64
 simultaneous candidate CAS sockets at the adaptive ceiling, versus the old
 client's single TLS connection.
+
+The observable-transfer follow-up then ran the checked-in alternating-order
+`scripts/benchmark_hf_xet_mode_ab.sh` against the same exact artifact. All six
+outputs matched the expected bytes and digest. Adaptive trials were 250.12,
+257.77, and 251.23 seconds; high-performance trials were 222.24, 225.99, and
+260.04 seconds. Median throughput was 63.814 versus 70.941 MiB/s,
+respectively. The retained adverse HP run prevents an overclaim: the preset
+improved median time by 10.05% but did not win every trial. Its roughly 10.22
+GB median RSS is the measured reason hf2q does not enable it below the
+documented 64 GiB floor.
 
 Reproduce it as:
 

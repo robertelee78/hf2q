@@ -121,6 +121,13 @@ pub(crate) enum StartupEvent {
         filename: String,
         bytes: u64,
     },
+    HostedDownloadProgress {
+        filename: String,
+        completed_bytes: u64,
+        total_bytes: u64,
+        bytes_per_second: Option<u64>,
+        elapsed_ms: u64,
+    },
     ProjectorPrepare {
         filename: String,
         bytes: u64,
@@ -196,6 +203,18 @@ impl StartupEvent {
             Self::HubMetadata { repository } => valid_repository(repository),
             Self::HostedDownload { filename, bytes }
             | Self::ProjectorPrepare { filename, bytes } => valid_filename(filename) && *bytes > 0,
+            Self::HostedDownloadProgress {
+                filename,
+                completed_bytes,
+                total_bytes,
+                bytes_per_second,
+                ..
+            } => {
+                valid_filename(filename)
+                    && *total_bytes > 0
+                    && *completed_bytes <= *total_bytes
+                    && bytes_per_second.is_none_or(|rate| rate > 0)
+            }
             Self::NativeConversion { repository, quant } => {
                 valid_repository(repository) && valid_quant(quant)
             }
@@ -306,10 +325,41 @@ impl StartupEvent {
                 filename,
                 bytes,
             } => format!(
-                "download: fetching {} ({}) into the managed model store",
+                "download: fetching {} ({}) into the Hugging Face cache; final artifact is a managed-store symlink",
                 clean(filename),
                 human_bytes(*bytes)
             ),
+            Self::HostedDownloadProgress {
+                filename,
+                completed_bytes,
+                total_bytes,
+                bytes_per_second,
+                elapsed_ms,
+            } => {
+                let percent = completed_bytes.saturating_mul(100) / total_bytes;
+                let measured_rate = if *elapsed_ms == 0 {
+                    0
+                } else {
+                    ((*completed_bytes as u128).saturating_mul(1_000) / u128::from(*elapsed_ms))
+                        .min(u128::from(u64::MAX)) as u64
+                };
+                let rate = bytes_per_second.unwrap_or(measured_rate);
+                let remaining = total_bytes.saturating_sub(*completed_bytes);
+                let eta = if rate > 0 {
+                    format_duration(Duration::from_secs_f64(remaining as f64 / rate as f64))
+                } else {
+                    "unknown".to_owned()
+                };
+                format!(
+                    "download: {} {}/{} ({}%, {}/s, ETA {})",
+                    clean(filename),
+                    human_bytes(*completed_bytes),
+                    human_bytes(*total_bytes),
+                    percent.min(100),
+                    human_bytes(rate),
+                    eta
+                )
+            }
             Self::ProjectorPrepare { filename, bytes } => format!(
                 "projector: locating or downloading exact-revision {} ({})",
                 clean(filename),
@@ -367,7 +417,9 @@ impl StartupEvent {
                 "preparing the compatible local model".into()
             }
             Self::HubMetadata { .. } => "querying Hugging Face metadata".into(),
-            Self::HostedDownload { .. } => "downloading the selected hosted GGUF".into(),
+            Self::HostedDownload { .. } | Self::HostedDownloadProgress { .. } => {
+                "downloading the selected hosted GGUF".into()
+            }
             Self::ProjectorPrepare { .. } => {
                 "locating or downloading the multimodal projector".into()
             }
@@ -527,6 +579,24 @@ mod tests {
     }
 
     #[test]
+    fn hosted_download_progress_includes_bytes_percent_rate_and_eta() {
+        let event = StartupEvent::HostedDownloadProgress {
+            filename: "model-q4_k_m.gguf".into(),
+            completed_bytes: 5 * 1024 * 1024 * 1024,
+            total_bytes: 10 * 1024 * 1024 * 1024,
+            bytes_per_second: Some(1024 * 1024 * 1024),
+            elapsed_ms: 5_000,
+        };
+        assert!(event.wire_valid());
+        let rendered = event.render();
+        assert!(rendered.contains("model-q4_k_m.gguf"));
+        assert!(rendered.contains("5.0 GiB/10.0 GiB"));
+        assert!(rendered.contains("50%"));
+        assert!(rendered.contains("1.0 GiB/s"));
+        assert!(rendered.contains("ETA 5s"));
+    }
+
+    #[test]
     fn wire_validation_rejects_paths_and_impossible_progress() {
         assert!(!StartupEvent::LocalReady {
             quant: "Q6_K".into(),
@@ -548,6 +618,22 @@ mod tests {
             artifact: "text GGUF".into(),
             completed_bytes: 2,
             total_bytes: 1,
+            elapsed_ms: 1,
+        }
+        .wire_valid());
+        assert!(!StartupEvent::HostedDownloadProgress {
+            filename: "model.gguf".into(),
+            completed_bytes: 2,
+            total_bytes: 1,
+            bytes_per_second: Some(1),
+            elapsed_ms: 1,
+        }
+        .wire_valid());
+        assert!(!StartupEvent::HostedDownloadProgress {
+            filename: "../model.gguf".into(),
+            completed_bytes: 1,
+            total_bytes: 2,
+            bytes_per_second: Some(1),
             elapsed_ms: 1,
         }
         .wire_valid());

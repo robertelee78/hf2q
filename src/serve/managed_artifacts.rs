@@ -20,15 +20,19 @@ use local::{
     find_best_matching_cached_hub_with_progress, find_best_matching_loose_with_progress,
     hash_hosted_local_candidate, select_local_with_progress,
 };
-#[cfg(test)]
-use materialize::clone_requires_copy;
 use materialize::verify_or_refuse_existing_destination;
+#[cfg(test)]
+use materialize::{clone_requires_copy, materialize_preverified_exact};
 use materialize::{
-    materialize_preverified_exact, materialize_retained_exact, PreparedLocalArtifact,
+    materialize_hub_cache_symlink, materialize_retained_exact, PreparedLocalArtifact,
 };
+#[cfg(test)]
+use projector::best_effort_projector_with_catalog;
 use projector::{
-    best_effort_projector_with_catalog, materialize_prepared_projector, prepare_projector_action,
-    retain_cached_projector_at, select_projector_companion, PreparedProjectorSource,
+    best_effort_projector_with_catalog_expected_with_progress,
+    best_effort_projector_with_catalog_with_progress, materialize_prepared_projector,
+    prepare_projector_action, retain_cached_projector_at, select_projector_companion,
+    PreparedProjectorSource,
 };
 #[cfg(test)]
 use projector::{resolve_projector, resolve_projector_with_catalog};
@@ -48,12 +52,12 @@ use resolution::{
     reverify_candidate_after_catalog, select_compatible_hosted, select_hosted,
     select_native_fallback_quant, select_native_quant_from_exact_plans,
 };
-#[cfg(test)]
-use storage::validate_binding;
 use storage::{
     candidate_from_binding, conversion_authority, projector_authority_from_receipt, read_binding,
     safe_basename, scan_bindings, sidecar_path, write_binding,
 };
+#[cfg(test)]
+use storage::{candidate_from_binding_in, validate_binding};
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -71,13 +75,17 @@ use super::multi_model::LoadedPool;
 use super::quant_select::{quant_type_from_gguf_file, select_quant, GpuInfo, QuantType};
 use super::startup_progress::{StartupEvent, StartupOrigin};
 use crate::core::hardware::HardwareProfile;
+#[cfg(test)]
+use crate::input::hf_download::managed_hub_cache_link_is_expected_dangling_in;
 use crate::input::hf_download::{
     cached_hub_gguf_path, check_hosted_text_local_projector_plan_with_device,
     check_hub_artifact_destination, check_hub_artifact_pair_plan_from_state,
     check_hub_artifact_plan, check_local_artifact_pair_plan_with_authorities,
-    check_local_text_hosted_projector_plan_with_authorities, download_hub_companion,
-    download_hub_gguf, resolve_hub_gguf_catalog, validate_hub_gguf_header_compatibility,
-    validate_retained_local_hub_gguf_compatibility, DownloadError, HubGgufArtifact, HubGgufCatalog,
+    check_local_text_hosted_projector_plan_with_authorities, download_hub_companion_with_progress,
+    download_hub_gguf_with_progress, hf_hub_cache_dir, managed_hub_cache_link_is_expected_dangling,
+    resolve_hub_gguf_catalog, retain_managed_hub_cache_link, retain_managed_hub_cache_link_in,
+    validate_hub_gguf_header_compatibility, validate_retained_local_hub_gguf_compatibility,
+    DownloadError, DownloadedHubArtifact, HubGgufArtifact, HubGgufCatalog,
 };
 use crate::input::hf_reference::HfModelReference;
 use crate::model_spec::{
@@ -174,7 +182,10 @@ fn verify_candidate_with_progress(
         .receipt_target_identity
         .is_some_and(|expected| retained.identity() != expected)
     {
-        bail!("linked conversion target changed after receipt authentication");
+        if candidate.origin == LocalArtifactProvenance::ConversionReceipt.as_str() {
+            bail!("linked conversion target changed after receipt authentication");
+        }
+        bail!("linked managed cache target changed after binding authentication");
     }
     let actual_quant = quant_type_from_gguf_file(retained.try_clone()?, &candidate.path)
         .context("read local GGUF quant metadata")?;

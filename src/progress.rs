@@ -4,8 +4,8 @@
 //! No direct indicatif calls outside this module.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -66,7 +66,7 @@ impl ProgressReporter {
         let pb = self.multi.add(ProgressBar::new(total_bytes));
         pb.set_style(
             ProgressStyle::with_template(
-                "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+                "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({bytes_per_sec}, {eta})",
             )
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("=> "),
@@ -77,11 +77,7 @@ impl ProgressReporter {
 
     /// Adapt hf-hub's concurrent HTTP/Xet events to one non-chatty byte bar.
     pub fn hub_download(&self, message: &str) -> hf_hub::progress::Progress {
-        hf_hub::progress::Progress::new(HubDownloadProgress {
-            bar: self.bytes_bar(0, message),
-            files: Mutex::new(BTreeMap::new()),
-            aggregate_bytes: AtomicU64::new(0),
-        })
+        HubDownloadObserver::new().progress_with_bar(Some(self.bytes_bar(0, message)))
     }
 
     /// Elapsed time since the reporter was created.
@@ -108,8 +104,106 @@ impl ProgressReporter {
     }
 }
 
+/// Output-agnostic state from one hf-hub download operation.
+///
+/// The sequence changes after every accepted event so a foreground owner can
+/// coalesce the native Xet poller's ~10 Hz stream without coupling transfer
+/// tasks to terminal rendering or a potentially blocking IPC sink.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HubDownloadSnapshot {
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
+    pub bytes_per_second: Option<u64>,
+    pub complete: bool,
+    pub sequence: u64,
+}
+
+#[derive(Default)]
+struct HubDownloadState {
+    completed_bytes: AtomicU64,
+    total_bytes: AtomicU64,
+    bytes_per_second: AtomicU64,
+    rate_known: AtomicBool,
+    complete: AtomicBool,
+    sequence: AtomicU64,
+}
+
+/// Cloneable bridge between hf-hub worker callbacks and the foreground
+/// operation that owns user-visible presentation.
+#[derive(Clone, Default)]
+pub struct HubDownloadObserver {
+    state: Arc<HubDownloadState>,
+}
+
+impl HubDownloadObserver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn progress(&self) -> hf_hub::progress::Progress {
+        self.progress_with_bar(None)
+    }
+
+    pub fn snapshot(&self) -> HubDownloadSnapshot {
+        HubDownloadSnapshot {
+            completed_bytes: self.state.completed_bytes.load(Ordering::Acquire),
+            total_bytes: self.state.total_bytes.load(Ordering::Acquire),
+            bytes_per_second: self
+                .state
+                .rate_known
+                .load(Ordering::Acquire)
+                .then(|| self.state.bytes_per_second.load(Ordering::Acquire)),
+            complete: self.state.complete.load(Ordering::Acquire),
+            sequence: self.state.sequence.load(Ordering::Acquire),
+        }
+    }
+
+    fn progress_with_bar(&self, bar: Option<ProgressBar>) -> hf_hub::progress::Progress {
+        hf_hub::progress::Progress::new(HubDownloadProgress {
+            bar,
+            observer: self.clone(),
+            files: Mutex::new(BTreeMap::new()),
+            aggregate_bytes: AtomicU64::new(0),
+        })
+    }
+
+    fn set_total(&self, total_bytes: u64) {
+        self.state
+            .total_bytes
+            .fetch_max(total_bytes, Ordering::Release);
+    }
+
+    fn set_position(&self, completed_bytes: u64) {
+        self.state
+            .completed_bytes
+            .fetch_max(completed_bytes, Ordering::Release);
+    }
+
+    fn set_rate(&self, bytes_per_second: Option<f64>) {
+        if let Some(rate) = bytes_per_second.filter(|rate| rate.is_finite() && *rate > 0.0) {
+            self.state.bytes_per_second.store(
+                rate.round().clamp(1.0, u64::MAX as f64) as u64,
+                Ordering::Release,
+            );
+            self.state.rate_known.store(true, Ordering::Release);
+        }
+    }
+
+    fn publish_event(&self) {
+        self.state.sequence.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish(&self) {
+        let total = self.state.total_bytes.load(Ordering::Acquire);
+        self.set_position(total);
+        self.state.complete.store(true, Ordering::Release);
+        self.publish_event();
+    }
+}
+
 struct HubDownloadProgress {
-    bar: ProgressBar,
+    bar: Option<ProgressBar>,
+    observer: HubDownloadObserver,
     files: Mutex<BTreeMap<String, u64>>,
     aggregate_bytes: AtomicU64,
 }
@@ -123,15 +217,27 @@ impl hf_hub::progress::ProgressHandler for HubDownloadProgress {
         };
         match event {
             DownloadEvent::Start { total_bytes, .. } => {
-                self.bar.set_length(*total_bytes);
+                self.observer.set_total(*total_bytes);
+                if let Some(bar) = self.bar.as_ref() {
+                    bar.set_length(*total_bytes);
+                }
+                self.observer.publish_event();
             }
             DownloadEvent::AggregateProgress {
-                bytes_completed, ..
+                bytes_completed,
+                total_bytes,
+                bytes_per_sec,
             } => {
                 self.aggregate_bytes
                     .store(*bytes_completed, Ordering::Relaxed);
-                self.bar
-                    .set_position(self.bar.position().max(*bytes_completed));
+                self.observer.set_total(*total_bytes);
+                self.observer.set_position(*bytes_completed);
+                self.observer.set_rate(*bytes_per_sec);
+                if let Some(bar) = self.bar.as_ref() {
+                    bar.set_length(bar.length().unwrap_or(0).max(*total_bytes));
+                    bar.set_position(bar.position().max(*bytes_completed));
+                }
+                self.observer.publish_event();
             }
             DownloadEvent::Progress { files } => {
                 if let Ok(mut positions) = self.files.try_lock() {
@@ -144,11 +250,20 @@ impl hf_hub::progress::ProgressHandler for HubDownloadProgress {
                     // and reaches the full total when all files complete.
                     let file_bytes = positions.values().copied().sum::<u64>();
                     let aggregate_bytes = self.aggregate_bytes.load(Ordering::Relaxed);
-                    self.bar
-                        .set_position(self.bar.position().max(file_bytes).max(aggregate_bytes));
+                    let completed_bytes = file_bytes.max(aggregate_bytes);
+                    self.observer.set_position(completed_bytes);
+                    if let Some(bar) = self.bar.as_ref() {
+                        bar.set_position(bar.position().max(completed_bytes));
+                    }
+                    self.observer.publish_event();
                 }
             }
-            DownloadEvent::Complete => self.bar.finish_with_message("Download complete"),
+            DownloadEvent::Complete => {
+                self.observer.finish();
+                if let Some(bar) = self.bar.as_ref() {
+                    bar.finish_with_message("Download complete");
+                }
+            }
         }
     }
 }
@@ -178,7 +293,8 @@ mod hub_download_progress_tests {
     #[test]
     fn mixed_hub_progress_never_regresses_or_double_counts() {
         let handler = HubDownloadProgress {
-            bar: ProgressBar::hidden(),
+            bar: Some(ProgressBar::hidden()),
+            observer: HubDownloadObserver::new(),
             files: Mutex::new(BTreeMap::new()),
             aggregate_bytes: AtomicU64::new(0),
         };
@@ -189,27 +305,40 @@ mod hub_download_progress_tests {
         handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
             files: vec![file("ordinary.bin", 40, 100)],
         }));
-        assert_eq!(handler.bar.position(), 40);
+        assert_eq!(handler.bar.as_ref().unwrap().position(), 40);
+        assert_eq!(handler.observer.snapshot().completed_bytes, 40);
         handler.on_progress(&ProgressEvent::Download(DownloadEvent::AggregateProgress {
             bytes_completed: 120,
             total_bytes: 200,
             bytes_per_sec: Some(1.0),
         }));
-        assert_eq!(handler.bar.position(), 120);
+        assert_eq!(handler.bar.as_ref().unwrap().position(), 120);
+        assert_eq!(handler.observer.snapshot().bytes_per_second, Some(1));
         handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
             files: vec![file("ordinary.bin", 100, 100)],
         }));
-        assert_eq!(handler.bar.position(), 120);
+        assert_eq!(handler.bar.as_ref().unwrap().position(), 120);
         handler.on_progress(&ProgressEvent::Download(DownloadEvent::AggregateProgress {
             bytes_completed: 80,
             total_bytes: 200,
             bytes_per_sec: Some(1.0),
         }));
-        assert_eq!(handler.bar.position(), 120);
+        assert_eq!(handler.bar.as_ref().unwrap().position(), 120);
         handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
             files: vec![file("xet.bin", 200, 200)],
         }));
-        assert_eq!(handler.bar.position(), 300);
+        assert_eq!(handler.bar.as_ref().unwrap().position(), 300);
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Complete));
+        assert_eq!(
+            handler.observer.snapshot(),
+            HubDownloadSnapshot {
+                completed_bytes: 300,
+                total_bytes: 300,
+                bytes_per_second: Some(1),
+                complete: true,
+                sequence: 7,
+            }
+        );
     }
 }
 

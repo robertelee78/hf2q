@@ -45,13 +45,14 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
 use crate::input::hf_reference::{HfModelReference, HfReferenceError, ResolvedHfModelReference};
-use crate::progress::ProgressReporter;
+use crate::progress::{HubDownloadObserver, HubDownloadSnapshot, ProgressReporter};
 
 type HubRepo = hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>;
 
@@ -1860,13 +1861,45 @@ pub fn download_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, Download
             reason: format!("GGUF artifact `{}` is not selectable", artifact.filename),
         });
     }
-    download_hub_artifact(artifact, "text_model")
+    let transfer_progress = ProgressReporter::new();
+    download_hub_artifact(
+        artifact,
+        "text_model",
+        Some(transfer_progress.hub_download("Downloading hosted GGUF")),
+    )
+    .map(|download| download.snapshot_path)
 }
 
-/// Download and authenticate one projector companion returned by the exact
-/// hosted catalog. Companions are deliberately not `selectable` text models,
-/// so they require this role-specific entry point.
-pub fn download_hub_companion(artifact: &HubGgufArtifact) -> Result<PathBuf, DownloadError> {
+/// Foreground-safe progress from one hosted Hub payload transfer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HubTransferProgress {
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
+    pub bytes_per_second: Option<u64>,
+    pub elapsed_ms: u64,
+    pub complete: bool,
+}
+
+/// Download a hosted text artifact while keeping terminal ownership with the
+/// caller. The native Xet handler writes only output-agnostic atomics; this
+/// synchronous foreground loop coalesces those updates before invoking the
+/// caller's potentially stateful startup renderer or IPC publisher.
+pub(crate) fn download_hub_gguf_with_progress(
+    artifact: &HubGgufArtifact,
+    progress: &mut dyn FnMut(HubTransferProgress),
+) -> Result<DownloadedHubArtifact, DownloadError> {
+    if !artifact.selectable || artifact.role != "text_model" {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!("GGUF artifact `{}` is not selectable", artifact.filename),
+        });
+    }
+    download_hub_artifact_observed(artifact, "text_model", progress)
+}
+
+pub(crate) fn download_hub_companion_with_progress(
+    artifact: &HubGgufArtifact,
+    progress: &mut dyn FnMut(HubTransferProgress),
+) -> Result<DownloadedHubArtifact, DownloadError> {
     if artifact.role != "companion" || artifact.selectable {
         return Err(DownloadError::InvalidRepositoryInventory {
             reason: format!(
@@ -1875,13 +1908,20 @@ pub fn download_hub_companion(artifact: &HubGgufArtifact) -> Result<PathBuf, Dow
             ),
         });
     }
-    download_hub_artifact(artifact, "companion")
+    download_hub_artifact_observed(artifact, "companion", progress)
+}
+
+pub(crate) struct DownloadedHubArtifact {
+    pub(crate) snapshot_path: PathBuf,
+    pub(crate) blob_path: PathBuf,
+    pub(crate) retained: crate::core::bounded_file::StableRegularFile,
 }
 
 fn download_hub_artifact(
     artifact: &HubGgufArtifact,
     expected_role: &str,
-) -> Result<PathBuf, DownloadError> {
+    progress: Option<hf_hub::progress::Progress>,
+) -> Result<DownloadedHubArtifact, DownloadError> {
     validate_repo_filename(&artifact.filename)?;
     if !hosted_gguf_identity_valid_for_role(artifact, expected_role) {
         return Err(DownloadError::InvalidRepositoryInventory {
@@ -1904,20 +1944,142 @@ fn download_hub_artifact(
         });
     }
     if let Some(path) = cached_hub_artifact_path_in(&cache_dir, artifact) {
-        verify_shard(&artifact.repository, &artifact.revision, &path, &record)?;
-        return Ok(path);
+        return authenticate_hub_artifact(&cache_dir, artifact, &path, &record);
     }
     check_artifact_disk_preflight(&artifact.repository, &cache_dir, artifact.bytes)?;
-    let transfer_progress = ProgressReporter::new();
     let path = download_file(
         &repo,
         &artifact.repository,
         &artifact.revision,
         &artifact.filename,
-        Some(transfer_progress.hub_download("Downloading hosted GGUF")),
+        progress,
     )?;
-    verify_shard(&artifact.repository, &artifact.revision, &path, &record)?;
-    Ok(path)
+    authenticate_hub_artifact(&cache_dir, artifact, &path, &record)
+}
+
+fn authenticate_hub_artifact(
+    cache_dir: &Path,
+    artifact: &HubGgufArtifact,
+    snapshot_path: &Path,
+    record: &ShardIntegrity,
+) -> Result<DownloadedHubArtifact, DownloadError> {
+    let mut retained = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        snapshot_path,
+        record.bytes,
+    )
+    .map_err(download_failed)?
+    .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+        reason: format!(
+            "downloaded hosted artifact `{}` is not a stable exact-size cache file",
+            artifact.filename
+        ),
+    })?;
+    let blob_path = retained
+        .canonical_path_for_identity()
+        .map_err(download_failed)?
+        .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "downloaded hosted artifact `{}` has no stable cache blob identity",
+                artifact.filename
+            ),
+        })?;
+    let blob_root = cache_dir
+        .join(hub_model_cache_folder(&artifact.repository))
+        .join("blobs")
+        .canonicalize()
+        .map_err(download_failed)?;
+    if blob_path.parent() != Some(blob_root.as_path())
+        || blob_path.file_name().and_then(|name| name.to_str()) != Some(artifact.sha256.as_str())
+    {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "downloaded hosted artifact `{}` resolved outside its authenticated repository blob store",
+                artifact.filename
+            ),
+        });
+    }
+    let actual_sha256 = retained.sha256().map_err(download_failed)?.ok_or_else(|| {
+        DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "downloaded hosted artifact `{}` changed during digest verification",
+                artifact.filename
+            ),
+        }
+    })?;
+    if !actual_sha256.eq_ignore_ascii_case(&artifact.sha256) {
+        return Err(DownloadError::Integrity(IntegrityError::ShardMismatch {
+            repo: artifact.repository.clone(),
+            revision: artifact.revision.clone(),
+            filename: artifact.filename.clone(),
+            expected: artifact.sha256.clone(),
+            actual: actual_sha256,
+            local_path: snapshot_path.display().to_string(),
+        }));
+    }
+    if !retained.is_stable().map_err(download_failed)? {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "downloaded hosted artifact `{}` changed after digest verification",
+                artifact.filename
+            ),
+        });
+    }
+    Ok(DownloadedHubArtifact {
+        snapshot_path: snapshot_path.to_path_buf(),
+        blob_path,
+        retained,
+    })
+}
+
+fn download_hub_artifact_observed(
+    artifact: &HubGgufArtifact,
+    expected_role: &str,
+    progress: &mut dyn FnMut(HubTransferProgress),
+) -> Result<DownloadedHubArtifact, DownloadError> {
+    let observer = HubDownloadObserver::new();
+    let handler = observer.progress();
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        let transfer =
+            scope.spawn(|| download_hub_artifact(artifact, expected_role, Some(handler)));
+        let mut last_sequence = 0;
+        loop {
+            publish_hub_transfer_progress(&observer, started, &mut last_sequence, progress);
+            if transfer.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result = transfer.join().map_err(|_| DownloadError::DownloadFailed {
+            reason: "native Hugging Face download worker panicked".to_owned(),
+        })?;
+        publish_hub_transfer_progress(&observer, started, &mut last_sequence, progress);
+        result
+    })
+}
+
+fn publish_hub_transfer_progress(
+    observer: &HubDownloadObserver,
+    started: Instant,
+    last_sequence: &mut u64,
+    progress: &mut dyn FnMut(HubTransferProgress),
+) {
+    let snapshot = observer.snapshot();
+    if snapshot.sequence == 0 || snapshot.sequence == *last_sequence || snapshot.total_bytes == 0 {
+        return;
+    }
+    *last_sequence = snapshot.sequence;
+    progress(hub_transfer_progress(snapshot, started.elapsed()));
+}
+
+fn hub_transfer_progress(snapshot: HubDownloadSnapshot, elapsed: Duration) -> HubTransferProgress {
+    HubTransferProgress {
+        completed_bytes: snapshot.completed_bytes.min(snapshot.total_bytes),
+        total_bytes: snapshot.total_bytes,
+        bytes_per_second: snapshot.bytes_per_second,
+        elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+        complete: snapshot.complete,
+    }
 }
 
 /// Return exact-revision Hub-cache bytes for a catalog-bound GGUF without
@@ -1926,6 +2088,156 @@ fn download_hub_artifact(
 /// still require callers to bind the complete digest.
 pub(crate) fn cached_hub_gguf_path(artifact: &HubGgufArtifact) -> Option<PathBuf> {
     cached_hub_artifact_path_in(&resolve_hf_cache_dir(), artifact)
+}
+
+/// Retain a managed final-leaf link only when it still targets the active
+/// standard Hub cache's exact repository blob and exact-revision snapshot.
+/// This is a cheap repeat-start check: the blob name is the authenticated LFS
+/// SHA-256 already recorded in the regular managed sidecar, so no model-sized
+/// rehash is needed after first publication.
+pub(crate) fn retain_managed_hub_cache_link(
+    path: &Path,
+    repository: &str,
+    revision: &str,
+    hub_filename: &str,
+    bytes: u64,
+    sha256: &str,
+) -> Result<Option<crate::core::bounded_file::StableRegularFile>, DownloadError> {
+    retain_managed_hub_cache_link_in(
+        &resolve_hf_cache_dir(),
+        path,
+        repository,
+        revision,
+        hub_filename,
+        bytes,
+        sha256,
+    )
+}
+
+pub(crate) fn retain_managed_hub_cache_link_in(
+    cache_dir: &Path,
+    path: &Path,
+    repository: &str,
+    revision: &str,
+    hub_filename: &str,
+    bytes: u64,
+    sha256: &str,
+) -> Result<Option<crate::core::bounded_file::StableRegularFile>, DownloadError> {
+    validate_repo_filename(hub_filename)?;
+    if revision.len() != 40
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || sha256.len() != 64
+        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: "managed Hub cache link has malformed immutable identity".into(),
+        });
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let Some(retained) =
+        crate::core::bounded_file::StableRegularFile::open_operator_path_exact(path, bytes)
+            .map_err(download_failed)?
+    else {
+        return Ok(None);
+    };
+    let Some(blob_path) = retained
+        .canonical_path_for_identity()
+        .map_err(download_failed)?
+    else {
+        return Ok(None);
+    };
+    let blob_root = match cache_dir
+        .join(hub_model_cache_folder(repository))
+        .join("blobs")
+        .canonicalize()
+    {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if blob_path.parent() != Some(blob_root.as_path())
+        || blob_path.file_name().and_then(|name| name.to_str()) != Some(sha256)
+    {
+        return Ok(None);
+    }
+    let Some(snapshot_path) =
+        cached_hub_file_path(cache_dir, repository, revision, hub_filename, bytes)
+    else {
+        return Ok(None);
+    };
+    let Some(snapshot) = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        &snapshot_path,
+        bytes,
+    )
+    .map_err(download_failed)?
+    else {
+        return Ok(None);
+    };
+    Ok((retained.identity() == snapshot.identity()
+        && retained.is_stable().map_err(download_failed)?
+        && snapshot.is_stable().map_err(download_failed)?)
+    .then_some(retained))
+}
+
+/// Recognize only the dangling link spelling hf2q itself publishes for one
+/// immutable repository blob. This permits a cleared Hub cache to be repaired
+/// by redownload without treating an arbitrary or retargeted symlink as a
+/// cache miss.
+pub(crate) fn managed_hub_cache_link_is_expected_dangling(
+    path: &Path,
+    repository: &str,
+    sha256: &str,
+) -> Result<bool, DownloadError> {
+    managed_hub_cache_link_is_expected_dangling_in(
+        &resolve_hf_cache_dir(),
+        path,
+        repository,
+        sha256,
+    )
+}
+
+pub(crate) fn managed_hub_cache_link_is_expected_dangling_in(
+    cache_dir: &Path,
+    path: &Path,
+    repository: &str,
+    sha256: &str,
+) -> Result<bool, DownloadError> {
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(false);
+    }
+    HfModelReference::parse(repository, None)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    match fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    let target = fs::read_link(path)?;
+    let cache_authority = match cache_dir.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && cache_dir.is_absolute() => {
+            cache_dir.to_path_buf()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::env::current_dir()?.join(cache_dir)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let expected = cache_authority
+        .join(hub_model_cache_folder(repository))
+        .join("blobs")
+        .join(sha256);
+    Ok(target == expected)
 }
 
 #[cfg(test)]
@@ -2085,27 +2397,22 @@ fn native_source_conversion_extents(
 }
 
 /// Preflight the complete hosted-artifact plan before payload transfer.
-/// The Hub cache always needs room for uncached bytes. The managed destination
-/// needs a second full copy only when it is on another filesystem; same-volume
-/// materialization is an APFS clone and consumes no second model-sized extent.
+/// The Hub cache is the sole model-sized allocation. Managed publication is a
+/// tiny symlink even when its destination is on another filesystem.
 pub fn check_hub_artifact_plan(
     artifact: &HubGgufArtifact,
-    destination: &Path,
+    _destination: &Path,
 ) -> Result<(), DownloadError> {
     let cache_dir = resolve_hf_cache_dir();
     if cached_hub_artifact_path_in(&cache_dir, artifact).is_none() {
         check_artifact_disk_preflight(&artifact.repository, &cache_dir, artifact.bytes)?;
     }
-    if !same_filesystem(&cache_dir, destination) {
-        check_artifact_disk_preflight(&artifact.repository, destination, artifact.bytes)?;
-    }
     Ok(())
 }
 
 /// Admit a text GGUF and its selected projector as one disk transaction before
-/// either payload is transferred. The Hub cache and managed destination are
-/// accounted as aggregate filesystem extents, avoiding two individually valid
-/// checks that cannot coexist on disk.
+/// either payload is transferred. Only uncached Hub bytes are model-sized;
+/// managed destinations receive tiny authenticated symlinks.
 pub fn check_hub_artifact_pair_plan(
     text: &HubGgufArtifact,
     text_destination: &Path,
@@ -2125,7 +2432,7 @@ pub fn check_hub_artifact_pair_plan_from_state(
     text_destination_exact: bool,
     projector: Option<(&HubGgufArtifact, &Path, bool)>,
 ) -> Result<(), DownloadError> {
-    let Some((projector, projector_destination, projector_destination_exact)) = projector else {
+    let Some((projector, _projector_destination, projector_destination_exact)) = projector else {
         return if text_destination_exact {
             Ok(())
         } else {
@@ -2146,46 +2453,8 @@ pub fn check_hub_artifact_pair_plan_from_state(
         .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
             reason: "hosted text plus projector cache plan overflowed u64".into(),
         })?;
-    let text_copy = (!text_destination_exact && !same_filesystem(&cache_dir, text_destination))
-        .then_some(text.bytes)
-        .unwrap_or(0);
-    let projector_copy = (!projector_destination_exact
-        && !same_filesystem(&cache_dir, projector_destination))
-    .then_some(projector.bytes)
-    .unwrap_or(0);
-    if same_filesystem(text_destination, projector_destination) {
-        let destination_required = text_copy.checked_add(projector_copy).ok_or_else(|| {
-            DownloadError::InvalidRepositoryInventory {
-                reason: "hosted text plus projector destination plan overflowed u64".into(),
-            }
-        })?;
-        if same_filesystem(&cache_dir, text_destination) {
-            let required = cache_required.max(destination_required);
-            if required > 0 {
-                check_artifact_disk_preflight(&text.repository, &cache_dir, required)?;
-            }
-        } else {
-            if cache_required > 0 {
-                check_artifact_disk_preflight(&text.repository, &cache_dir, cache_required)?;
-            }
-            if destination_required > 0 {
-                check_artifact_disk_preflight(
-                    &text.repository,
-                    text_destination,
-                    destination_required,
-                )?;
-            }
-        }
-    } else {
-        if cache_required > 0 {
-            check_artifact_disk_preflight(&text.repository, &cache_dir, cache_required)?;
-        }
-        if text_copy > 0 {
-            check_artifact_disk_preflight(&text.repository, text_destination, text_copy)?;
-        }
-        if projector_copy > 0 {
-            check_artifact_disk_preflight(&text.repository, projector_destination, projector_copy)?;
-        }
+    if cache_required > 0 {
+        check_artifact_disk_preflight(&text.repository, &cache_dir, cache_required)?;
     }
     Ok(())
 }
@@ -2406,7 +2675,7 @@ pub fn check_local_text_hosted_projector_plan_with_device(
     text_bytes: u64,
     text_destination_exact: bool,
     projector: &HubGgufArtifact,
-    projector_destination: &Path,
+    _projector_destination: &Path,
     projector_destination_exact: bool,
 ) -> Result<(), DownloadError> {
     let cache_dir = resolve_hf_cache_dir();
@@ -2418,19 +2687,9 @@ pub fn check_local_text_hosted_projector_plan_with_device(
         && cached_hub_artifact_path_in(&cache_dir, projector).is_none())
     .then_some(projector.bytes)
     .unwrap_or(0);
-    let projector_copy = (!projector_destination_exact
-        && !same_filesystem(&cache_dir, projector_destination))
-    .then_some(projector.bytes)
-    .unwrap_or(0);
     let cache_and_text_share = same_filesystem(&cache_dir, text_destination);
-    let text_and_projector_share = same_filesystem(text_destination, projector_destination);
-    let (cache_required, text_required, projector_required) = mixed_local_hosted_extents(
-        text_copy,
-        projector_uncached,
-        projector_copy,
-        cache_and_text_share,
-        text_and_projector_share,
-    )?;
+    let (cache_required, text_required) =
+        local_text_hosted_projector_extents(text_copy, projector_uncached, cache_and_text_share)?;
     if cache_required > 0 {
         check_exact_disk_preflight(
             format!("hosted projector cache for {repository}"),
@@ -2444,14 +2703,6 @@ pub fn check_local_text_hosted_projector_plan_with_device(
             format!("local text plus hosted projector for {repository}"),
             text_destination,
             text_required,
-            None,
-        )?;
-    }
-    if projector_required > 0 {
-        check_exact_disk_preflight(
-            format!("hosted projector destination for {repository}"),
-            projector_destination,
-            projector_required,
             None,
         )?;
     }
@@ -2467,9 +2718,9 @@ pub fn check_local_text_hosted_projector_plan_with_authorities(
     text_bytes: u64,
     text_destination_exact: bool,
     projector: &HubGgufArtifact,
-    projector_destination: &Path,
-    projector_destination_device: Option<u64>,
-    projector_destination_available: Option<u64>,
+    _projector_destination: &Path,
+    _projector_destination_device: Option<u64>,
+    _projector_destination_available: Option<u64>,
     projector_destination_exact: bool,
 ) -> Result<(), DownloadError> {
     let cache_dir = resolve_hf_cache_dir();
@@ -2485,25 +2736,11 @@ pub fn check_local_text_hosted_projector_plan_with_authorities(
         && cached_hub_artifact_path_in(&cache_dir, projector).is_none())
     .then_some(projector.bytes)
     .unwrap_or(0);
-    let projector_copy = (!projector_destination_exact
-        && cache_device
-            .zip(projector_destination_device)
-            .is_none_or(|(cache, destination)| cache != destination))
-    .then_some(projector.bytes)
-    .unwrap_or(0);
     let cache_and_text_share = cache_device
         .zip(text_destination_device)
         .is_some_and(|(cache, text)| cache == text);
-    let text_and_projector_share = text_destination_device
-        .zip(projector_destination_device)
-        .is_some_and(|(text, projector)| text == projector);
-    let (cache_required, text_required, projector_required) = mixed_local_hosted_extents(
-        text_copy,
-        projector_uncached,
-        projector_copy,
-        cache_and_text_share,
-        text_and_projector_share,
-    )?;
+    let (cache_required, text_required) =
+        local_text_hosted_projector_extents(text_copy, projector_uncached, cache_and_text_share)?;
     if cache_required > 0 {
         check_exact_disk_capacity(
             format!("hosted projector cache for {repository}"),
@@ -2518,14 +2755,6 @@ pub fn check_local_text_hosted_projector_plan_with_authorities(
             text_destination,
             text_required,
             text_destination_available,
-        )?;
-    }
-    if projector_required > 0 {
-        check_exact_disk_capacity(
-            format!("hosted projector destination for {repository}"),
-            projector_destination,
-            projector_required,
-            projector_destination_available,
         )?;
     }
     Ok(())
@@ -2557,7 +2786,7 @@ pub fn check_hosted_text_local_projector_plan(
 
 pub fn check_hosted_text_local_projector_plan_with_device(
     text: &HubGgufArtifact,
-    text_destination: &Path,
+    _text_destination: &Path,
     text_destination_exact: bool,
     projector_source: &Path,
     projector_source_device: Option<u64>,
@@ -2570,9 +2799,6 @@ pub fn check_hosted_text_local_projector_plan_with_device(
         && cached_hub_artifact_path_in(&cache_dir, text).is_none())
     .then_some(text.bytes)
     .unwrap_or(0);
-    let text_extent = (!text_destination_exact && !same_filesystem(&cache_dir, text_destination))
-        .then_some(text.bytes)
-        .unwrap_or(0);
     let projector_extent = (!projector_destination_exact
         && !same_filesystem_authority(
             projector_source,
@@ -2581,26 +2807,16 @@ pub fn check_hosted_text_local_projector_plan_with_device(
         ))
     .then_some(projector_bytes)
     .unwrap_or(0);
-    let (cache_required, text_required, projector_required) = mixed_local_hosted_extents(
-        text_extent,
+    let (cache_required, projector_required) = hosted_text_local_projector_extents(
         cache_extent,
         projector_extent,
-        same_filesystem(&cache_dir, text_destination),
-        same_filesystem(text_destination, projector_destination),
+        same_filesystem(&cache_dir, projector_destination),
     )?;
     if cache_required > 0 {
         check_exact_disk_preflight(
             format!("hosted text cache for {}", text.repository),
             &cache_dir,
             cache_required,
-            None,
-        )?;
-    }
-    if text_required > 0 {
-        check_exact_disk_preflight(
-            format!("hosted text plus local projector for {}", text.repository),
-            text_destination,
-            text_required,
             None,
         )?;
     }
@@ -2615,66 +2831,54 @@ pub fn check_hosted_text_local_projector_plan_with_device(
     Ok(())
 }
 
-fn mixed_local_hosted_extents(
+fn local_text_hosted_projector_extents(
     text_copy: u64,
     projector_uncached: u64,
-    projector_copy: u64,
     cache_and_text_share_filesystem: bool,
-    text_and_projector_share_filesystem: bool,
-) -> Result<(u64, u64, u64), DownloadError> {
-    let mut cache = projector_uncached;
-    let mut text = text_copy;
-    let mut projector = projector_copy;
+) -> Result<(u64, u64), DownloadError> {
     if cache_and_text_share_filesystem {
-        cache =
-            cache
-                .checked_add(text)
-                .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
-                    reason: "local text plus hosted projector cache plan overflowed u64".into(),
-                })?;
-        text = 0;
-        if text_and_projector_share_filesystem {
-            cache = cache.checked_add(projector).ok_or_else(|| {
+        Ok((
+            projector_uncached.checked_add(text_copy).ok_or_else(|| {
                 DownloadError::InvalidRepositoryInventory {
-                    reason: "local text plus hosted projector aggregate plan overflowed u64".into(),
+                    reason: "local text plus hosted projector cache plan overflowed u64".into(),
                 }
-            })?;
-            projector = 0;
-        }
-    } else if text_and_projector_share_filesystem {
-        text = text.checked_add(projector).ok_or_else(|| {
-            DownloadError::InvalidRepositoryInventory {
-                reason: "local text plus hosted projector destination plan overflowed u64".into(),
-            }
-        })?;
-        projector = 0;
+            })?,
+            0,
+        ))
+    } else {
+        Ok((projector_uncached, text_copy))
     }
-    Ok((cache, text, projector))
+}
+
+fn hosted_text_local_projector_extents(
+    text_uncached: u64,
+    projector_copy: u64,
+    cache_and_projector_share_filesystem: bool,
+) -> Result<(u64, u64), DownloadError> {
+    if cache_and_projector_share_filesystem {
+        Ok((
+            text_uncached.checked_add(projector_copy).ok_or_else(|| {
+                DownloadError::InvalidRepositoryInventory {
+                    reason: "hosted text plus local projector cache plan overflowed u64".into(),
+                }
+            })?,
+            0,
+        ))
+    } else {
+        Ok((text_uncached, projector_copy))
+    }
 }
 
 #[cfg(test)]
 fn hosted_pair_required_extents(
     text_uncached: u64,
     projector_uncached: u64,
-    text_bytes: u64,
-    projector_bytes: u64,
-    cache_and_destination_share_filesystem: bool,
-) -> Result<(u64, u64), DownloadError> {
-    let cache = text_uncached
+) -> Result<u64, DownloadError> {
+    text_uncached
         .checked_add(projector_uncached)
         .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
             reason: "hosted pair cache extent overflowed u64".into(),
-        })?;
-    let destination = if cache_and_destination_share_filesystem {
-        0
-    } else {
-        text_bytes.checked_add(projector_bytes).ok_or_else(|| {
-            DownloadError::InvalidRepositoryInventory {
-                reason: "hosted pair destination extent overflowed u64".into(),
-            }
-        })?
-    };
-    Ok((cache, destination))
+        })
 }
 
 #[cfg(unix)]
@@ -4960,25 +5164,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn hosted_multimodal_pair_is_admitted_as_one_pretransfer_extent() {
+    fn hosted_multimodal_pair_only_reserves_hub_cache_payload_bytes() {
         let gib = 1024_u64 * 1024 * 1024;
         assert_eq!(
-            hosted_pair_required_extents(20 * gib, 2 * gib, 20 * gib, 2 * gib, true).unwrap(),
-            (22 * gib, 0)
+            hosted_pair_required_extents(20 * gib, 2 * gib).unwrap(),
+            22 * gib
         );
         assert_eq!(
-            hosted_pair_required_extents(20 * gib, 2 * gib, 20 * gib, 2 * gib, false).unwrap(),
-            (22 * gib, 22 * gib)
+            hosted_pair_required_extents(0, 2 * gib).unwrap(),
+            2 * gib,
+            "a cached text model reserves only the missing projector cache bytes"
         );
         assert_eq!(
-            hosted_pair_required_extents(0, 2 * gib, 20 * gib, 2 * gib, false).unwrap(),
-            (2 * gib, 22 * gib),
-            "a split-filesystem plan charges only uncached Hub bytes but both destination copies"
-        );
-        assert_eq!(
-            hosted_pair_required_extents(0, 0, 20 * gib, 2 * gib, true).unwrap(),
-            (0, 0),
-            "an already-cached same-filesystem pair requires no new disk extent"
+            hosted_pair_required_extents(0, 0).unwrap(),
+            0,
+            "managed symlinks require no model-sized destination extent"
         );
         assert!(check_exact_disk_preflight(
             "already cached hosted pair".into(),
@@ -4987,7 +5187,7 @@ pub(crate) mod tests {
             Some(1),
         )
         .is_ok());
-        assert!(hosted_pair_required_extents(u64::MAX, 1, 1, 1, true).is_err());
+        assert!(hosted_pair_required_extents(u64::MAX, 1).is_err());
     }
 
     #[test]
@@ -5009,24 +5209,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn mixed_local_text_hosted_projector_extents_are_aggregated_by_filesystem() {
+    fn mixed_local_and_hosted_extents_charge_only_real_payload_allocations() {
         let gib = 1024_u64.pow(3);
         assert_eq!(
-            mixed_local_hosted_extents(10 * gib, 10 * gib, 0, true, true).unwrap(),
-            (20 * gib, 0, 0),
+            local_text_hosted_projector_extents(10 * gib, 10 * gib, true).unwrap(),
+            (20 * gib, 0),
             "a local text copy and hosted download on one device are additive"
         );
         assert_eq!(
-            mixed_local_hosted_extents(10 * gib, 10 * gib, 10 * gib, false, true).unwrap(),
-            (10 * gib, 20 * gib, 0),
-            "split cache and shared destination devices keep independent exact sums"
+            local_text_hosted_projector_extents(10 * gib, 10 * gib, false).unwrap(),
+            (10 * gib, 10 * gib),
+            "a hosted projector symlink consumes no destination payload extent"
         );
         assert_eq!(
-            mixed_local_hosted_extents(0, 0, 0, true, true).unwrap(),
-            (0, 0, 0),
-            "already exact members consume no new extent"
+            hosted_text_local_projector_extents(10 * gib, 2 * gib, true).unwrap(),
+            (12 * gib, 0),
+            "hosted text cache bytes and a local projector copy aggregate on one device"
         );
-        assert!(mixed_local_hosted_extents(u64::MAX, 1, 0, true, true).is_err());
+        assert_eq!(
+            hosted_text_local_projector_extents(10 * gib, 2 * gib, false).unwrap(),
+            (10 * gib, 2 * gib)
+        );
+        assert!(local_text_hosted_projector_extents(u64::MAX, 1, true).is_err());
+        assert!(hosted_text_local_projector_extents(u64::MAX, 1, true).is_err());
     }
 
     #[test]

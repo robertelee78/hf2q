@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) enum PreparedProjectorSource {
     Existing(crate::core::bounded_file::StableRegularFile),
+    HubCache(DownloadedHubArtifact),
     Local(inventory::ExactLooseFile),
     Hosted,
 }
@@ -20,21 +21,15 @@ pub(super) fn prepare_projector_action(
     model_dirs: &[PathBuf],
 ) -> Result<PreparedProjector> {
     let source =
-        if verify_or_refuse_existing_destination(&destination, artifact.bytes, &artifact.sha256)? {
-            let mut retained = crate::core::bounded_file::StableRegularFile::open_exact(
+        if resolution::verify_or_refuse_existing_hosted_destination(&destination, &artifact)? {
+            let retained = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
                 &destination,
                 artifact.bytes,
             )?
             .context("exact projector destination changed after planning")?;
-            if !retained
-                .sha256()?
-                .is_some_and(|digest| digest.eq_ignore_ascii_case(&artifact.sha256))
-            {
-                bail!("exact projector destination changed after planning");
-            }
             PreparedProjectorSource::Existing(retained)
-        } else if let Some(local) = retain_cached_projector(&artifact)? {
-            PreparedProjectorSource::Local(local)
+        } else if let Some(cached) = retain_cached_projector_download(&artifact)? {
+            PreparedProjectorSource::HubCache(cached)
         } else if let Some(local) = find_matching_loose(&artifact, model_dirs)? {
             PreparedProjectorSource::Local(local)
         } else {
@@ -44,14 +39,14 @@ pub(super) fn prepare_projector_action(
         .file_name()
         .context("projector destination has no filename")?
         .to_os_string();
-    let destination_parent = if matches!(source, PreparedProjectorSource::Existing(_)) {
-        None
-    } else {
+    let destination_parent = if matches!(source, PreparedProjectorSource::Local(_)) {
         Some(crate::core::bounded_file::StableDirectory::create_and_open(
             destination
                 .parent()
                 .context("projector destination has no parent")?,
         )?)
+    } else {
+        None
     };
     Ok(PreparedProjector {
         artifact,
@@ -65,6 +60,7 @@ pub(super) fn prepare_projector_action(
 impl PreparedProjector {
     pub(super) fn source_device_id(&self) -> Option<u64> {
         match &self.source {
+            PreparedProjectorSource::HubCache(source) => Some(source.retained.device_id()),
             PreparedProjectorSource::Local(source) => Some(source.retained.device_id()),
             _ => None,
         }
@@ -91,6 +87,7 @@ impl PreparedProjector {
     pub(super) fn is_current(&self) -> Result<bool> {
         let source_current = match &self.source {
             PreparedProjectorSource::Existing(retained) => retained.is_stable()?,
+            PreparedProjectorSource::HubCache(source) => source.retained.is_stable()?,
             PreparedProjectorSource::Local(source) => source.retained.is_stable()?,
             PreparedProjectorSource::Hosted => true,
         };
@@ -102,13 +99,18 @@ impl PreparedProjector {
     }
 }
 
-fn retain_cached_projector(
+fn retain_cached_projector_download(
     artifact: &HubGgufArtifact,
-) -> Result<Option<inventory::ExactLooseFile>> {
+) -> Result<Option<DownloadedHubArtifact>> {
     let Some(snapshot_path) = cached_hub_gguf_path(artifact) else {
         return Ok(None);
     };
-    retain_cached_projector_at(artifact, &snapshot_path).map(Some)
+    let source = retain_cached_projector_at(artifact, &snapshot_path)?;
+    Ok(Some(DownloadedHubArtifact {
+        snapshot_path,
+        blob_path: source.path,
+        retained: source.retained,
+    }))
 }
 
 pub(super) fn retain_cached_projector_at(
@@ -166,6 +168,7 @@ pub(super) fn materialize_prepared_projector(
     plan: PreparedProjector,
     candidate: &mut Candidate,
     warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
 ) -> Result<PathBuf> {
     if !plan.is_current()? {
         bail!("prepared projector authority changed before activation");
@@ -176,6 +179,12 @@ pub(super) fn materialize_prepared_projector(
                 bail!("exact projector destination changed before activation");
             }
         }
+        PreparedProjectorSource::HubCache(source) => materialize_hub_cache_symlink(
+            source,
+            &plan.destination,
+            plan.artifact.bytes,
+            &plan.artifact.sha256,
+        )?,
         PreparedProjectorSource::Local(source) => materialize::materialize_retained_exact_at(
             source.retained,
             plan.destination_parent
@@ -186,13 +195,10 @@ pub(super) fn materialize_prepared_projector(
             &plan.artifact.sha256,
         )?,
         PreparedProjectorSource::Hosted => {
-            let source = download_hub_companion(&plan.artifact)?;
-            materialize::materialize_preverified_exact_at(
-                &source,
-                plan.destination_parent
-                    .context("prepared hosted projector has no destination authority")?,
-                &plan.destination_name,
-                &plan.artifact.repository,
+            let source = download_projector_with_progress(&plan.artifact, progress)?;
+            materialize_hub_cache_symlink(
+                source,
+                &plan.destination,
                 plan.artifact.bytes,
                 &plan.artifact.sha256,
             )?;
@@ -205,6 +211,25 @@ pub(super) fn materialize_prepared_projector(
     ));
     persist_candidate_projector(candidate, &plan.destination, &plan.artifact, warnings);
     Ok(plan.destination)
+}
+
+pub(super) fn download_projector_with_progress(
+    artifact: &HubGgufArtifact,
+    progress: &mut StartupProgress<'_>,
+) -> Result<DownloadedHubArtifact> {
+    let filename = display_filename(Path::new(&artifact.filename));
+    Ok(download_hub_companion_with_progress(
+        artifact,
+        &mut |update| {
+            progress(StartupEvent::HostedDownloadProgress {
+                filename: filename.clone(),
+                completed_bytes: update.completed_bytes,
+                total_bytes: update.total_bytes,
+                bytes_per_second: update.bytes_per_second,
+                elapsed_ms: update.elapsed_ms,
+            });
+        },
+    )?)
 }
 
 #[cfg(test)]
@@ -241,6 +266,7 @@ pub(super) fn resolve_projector(
     }
 }
 
+#[cfg(test)]
 pub(super) fn best_effort_projector_with_catalog(
     candidate: &mut Candidate,
     model_dirs: &[PathBuf],
@@ -248,23 +274,43 @@ pub(super) fn best_effort_projector_with_catalog(
     repository_requires_projector: bool,
     warnings: &mut Vec<String>,
 ) -> Option<PathBuf> {
-    best_effort_projector_with_catalog_expected(
+    best_effort_projector_with_catalog_with_progress(
+        candidate,
+        model_dirs,
+        catalog,
+        repository_requires_projector,
+        warnings,
+        &mut |_| {},
+    )
+}
+
+pub(super) fn best_effort_projector_with_catalog_with_progress(
+    candidate: &mut Candidate,
+    model_dirs: &[PathBuf],
+    catalog: &HubGgufCatalog,
+    repository_requires_projector: bool,
+    warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
+) -> Option<PathBuf> {
+    best_effort_projector_with_catalog_expected_with_progress(
         candidate,
         model_dirs,
         catalog,
         repository_requires_projector,
         None,
         warnings,
+        progress,
     )
 }
 
-pub(super) fn best_effort_projector_with_catalog_expected(
+pub(super) fn best_effort_projector_with_catalog_expected_with_progress(
     candidate: &mut Candidate,
     model_dirs: &[PathBuf],
     catalog: &HubGgufCatalog,
     repository_requires_projector: bool,
     retained_expected_projector_sha256: Option<&str>,
     warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
 ) -> Option<PathBuf> {
     match resolve_projector_with_catalog_requirement(
         candidate,
@@ -273,6 +319,7 @@ pub(super) fn best_effort_projector_with_catalog_expected(
         repository_requires_projector,
         retained_expected_projector_sha256,
         warnings,
+        progress,
     ) {
         Ok(path) => path,
         Err(error) => {
@@ -298,6 +345,7 @@ pub(super) fn resolve_projector_with_catalog(
         catalog.requires_projector,
         None,
         warnings,
+        &mut |_| {},
     )
 }
 
@@ -308,6 +356,7 @@ fn resolve_projector_with_catalog_requirement(
     repository_requires_projector: bool,
     retained_expected_projector_sha256: Option<&str>,
     warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
 ) -> Result<Option<PathBuf>> {
     if !repository_requires_projector && !text_requires_projector(&candidate.path)? {
         return Ok(None);
@@ -352,16 +401,15 @@ fn resolve_projector_with_catalog_requirement(
     };
     let parent = candidate.path.parent().context("text GGUF has no parent")?;
     let destination = parent.join(safe_basename(&artifact.filename)?);
-    if !verify_or_refuse_existing_destination(&destination, artifact.bytes, &artifact.sha256)? {
+    if !resolution::verify_or_refuse_existing_hosted_destination(&destination, &artifact)? {
         let source = match find_matching_loose(&artifact, model_dirs)? {
             Some(source) => source,
             None => {
                 check_hub_artifact_plan(&artifact, &destination)?;
-                let path = download_hub_companion(&artifact)?;
-                materialize_preverified_exact(
-                    &path,
+                let source = download_projector_with_progress(&artifact, progress)?;
+                materialize_hub_cache_symlink(
+                    source,
                     &destination,
-                    &artifact.repository,
                     artifact.bytes,
                     &artifact.sha256,
                 )?;

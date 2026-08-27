@@ -201,9 +201,125 @@ pub(super) fn verify_or_refuse_existing_destination(
     Ok(true)
 }
 
+/// Publish one already-authenticated Hugging Face cache blob as a managed
+/// final-leaf symlink. The multi-GiB payload is neither cloned nor copied;
+/// only the tiny link is staged and atomically renamed into place.
+pub(super) fn materialize_hub_cache_symlink(
+    source: DownloadedHubArtifact,
+    destination: &Path,
+    bytes: u64,
+    sha256: &str,
+) -> Result<()> {
+    use rustix::fs::{AtFlags, RenameFlags};
+
+    if !source
+        .blob_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(sha256))
+        || !source.retained.is_stable()?
+    {
+        bail!("authenticated Hugging Face cache blob changed before link publication");
+    }
+    if existing_hub_cache_symlink_matches(destination, &source, bytes)? {
+        return Ok(());
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            bail!(
+                "destination conflicts with the selected immutable artifact: {}",
+                destination.display()
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let parent = destination
+        .parent()
+        .context("managed artifact has no parent")?;
+    let destination_parent = crate::core::bounded_file::StableDirectory::create_and_open(parent)
+        .context("retain managed symlink destination parent")?;
+    let destination_name = destination
+        .file_name()
+        .context("managed artifact destination has no filename")?;
+    let parent_fd = destination_parent.try_clone()?;
+    let staged_name =
+        std::ffi::OsString::from(format!(".hf2q-link-{}.partial", uuid::Uuid::new_v4()));
+    let mut guard = StagedAtGuard::new(parent_fd.try_clone()?, staged_name.clone());
+    rustix::fs::symlinkat(&source.blob_path, &parent_fd, &staged_name)?;
+    guard.arm();
+
+    let staged_path = destination_parent.canonical_path().join(&staged_name);
+    let staged = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        &staged_path,
+        bytes,
+    )?
+    .context("staged managed cache link did not resolve to the expected regular file")?;
+    if staged.identity() != source.retained.identity()
+        || !staged.is_stable()?
+        || !source.retained.is_stable()?
+        || !destination_parent.is_current()?
+    {
+        bail!("managed cache link authority changed before publication");
+    }
+
+    match rustix::fs::renameat_with(
+        &parent_fd,
+        &staged_name,
+        &parent_fd,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
+        Err(error) if error == rustix::io::Errno::EXIST => {
+            let _ = rustix::fs::unlinkat(&parent_fd, &staged_name, AtFlags::empty());
+            guard.disarm();
+            if existing_hub_cache_symlink_matches(destination, &source, bytes)? {
+                return Ok(());
+            }
+            return Err(std::io::Error::from_raw_os_error(error.raw_os_error()).into());
+        }
+        Err(error) => return Err(std::io::Error::from_raw_os_error(error.raw_os_error()).into()),
+    }
+    guard.disarm();
+
+    if !existing_hub_cache_symlink_matches(destination, &source, bytes)?
+        || !destination_parent.is_current()?
+    {
+        bail!("published managed cache link changed before authority binding");
+    }
+    Ok(())
+}
+
+fn existing_hub_cache_symlink_matches(
+    destination: &Path,
+    source: &DownloadedHubArtifact,
+    bytes: u64,
+) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let Some(retained) =
+        crate::core::bounded_file::StableRegularFile::open_operator_path_exact(destination, bytes)?
+    else {
+        return Ok(false);
+    };
+    Ok(retained.identity() == source.retained.identity()
+        && retained.canonical_path_for_identity()?.as_deref() == Some(source.blob_path.as_path())
+        && retained.is_stable()?
+        && source.retained.is_stable()?)
+}
+
 /// Materialize bytes whose complete SHA-256 was verified by the immediately
 /// preceding selection/download step. On Apple filesystems a clone avoids a
 /// second model-sized allocation; cross-filesystem fallback copies and hashes.
+#[cfg(test)]
 pub(super) fn materialize_preverified_exact(
     source: &Path,
     destination: &Path,
@@ -229,6 +345,7 @@ pub(super) fn materialize_preverified_exact(
 #[derive(Clone, Copy)]
 enum RetainedProof {
     AlreadyVerified,
+    #[cfg(test)]
     VerifyStagedClone,
 }
 
@@ -298,30 +415,6 @@ pub(super) fn materialize_retained_exact_at(
     )
 }
 
-pub(super) fn materialize_preverified_exact_at(
-    source: &Path,
-    destination_parent: crate::core::bounded_file::StableDirectory,
-    destination_name: &std::ffi::OsStr,
-    repository: &str,
-    bytes: u64,
-    sha256: &str,
-) -> Result<()> {
-    let canonical = source
-        .canonicalize()
-        .with_context(|| format!("resolve materialization source {}", source.display()))?;
-    let retained = crate::core::bounded_file::StableRegularFile::open_exact(&canonical, bytes)?
-        .context("materialization source is not the expected regular file")?;
-    materialize_retained_exact_at_with_proof(
-        retained,
-        destination_parent,
-        destination_name,
-        repository,
-        bytes,
-        sha256,
-        RetainedProof::VerifyStagedClone,
-    )
-}
-
 fn materialize_retained_exact_at_with_proof(
     mut source: crate::core::bounded_file::StableRegularFile,
     destination_parent: crate::core::bounded_file::StableDirectory,
@@ -329,7 +422,7 @@ fn materialize_retained_exact_at_with_proof(
     repository: &str,
     bytes: u64,
     sha256: &str,
-    proof: RetainedProof,
+    _proof: RetainedProof,
 ) -> Result<()> {
     use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 
@@ -344,7 +437,7 @@ fn materialize_retained_exact_at_with_proof(
     let staged_name =
         std::ffi::OsString::from(format!(".hf2q-adopt-{}.partial", uuid::Uuid::new_v4()));
     let mut guard = StagedAtGuard::new(parent_fd.try_clone()?, staged_name.clone());
-    let (staged_file, cloned) = match source.clone_to_at(&parent_fd, &staged_name) {
+    let (staged_file, _cloned) = match source.clone_to_at(&parent_fd, &staged_name) {
         Ok(()) => {
             guard.arm();
             (
@@ -382,19 +475,24 @@ fn materialize_retained_exact_at_with_proof(
         }
     };
     let staged_path = destination_parent.canonical_path().join(&staged_name);
-    let mut staged = crate::core::bounded_file::StableRegularFile::from_open_file(
+    let staged = crate::core::bounded_file::StableRegularFile::from_open_file(
         staged_file,
         &staged_path,
         bytes,
     )?
     .context("retained adoption did not produce the expected regular file")?;
-    if cloned
-        && matches!(proof, RetainedProof::VerifyStagedClone)
-        && !staged
+    #[cfg(test)]
+    let mut staged = staged;
+    #[cfg(not(test))]
+    let staged = staged;
+    #[cfg(test)]
+    if _cloned && matches!(_proof, RetainedProof::VerifyStagedClone) {
+        if !staged
             .sha256()?
             .is_some_and(|digest| digest.eq_ignore_ascii_case(sha256))
-    {
-        bail!("staged clone failed exact SHA-256 verification");
+        {
+            bail!("staged clone failed exact SHA-256 verification");
+        }
     }
     if !source.is_stable()? || !staged.descriptor_is_stable()? {
         bail!("materialization source or staged clone changed before publication");

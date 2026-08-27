@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.89+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | hf2q 0.1.18 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.18` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | hf2q 0.1.19 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.19` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -295,7 +295,8 @@ required. These commands share one local-first resolver:
 hf2q serve list                    # `hf2q chat list` is identical
 
 # Exact quant: reuse an hf2q-bound artifact or compatible local structural
-# match, or download that exact hosted quant into the managed XDG data store.
+# match, or download that exact hosted quant into the standard Hugging Face
+# cache and publish a managed XDG symlink after complete authentication.
 hf2q serve owner/repository:Q4_K_M
 
 # No quant: use the most recently used compatible local artifact, otherwise
@@ -332,9 +333,21 @@ metadata, hosted download selection, native conversion fallback, text
 load/warmup, projector load/warmup, and finally an authenticated ready
 endpoint. A compatible local structural hit explicitly says
 `no model download or full-file hash needed`.
-Spinners are used for work without real byte counters; byte bars and ETA appear
-only when measured completed/total bytes exist. Non-TTY output carries the same
-facts as stable lines, without ANSI or a live dashboard.
+Spinners are used for work without real byte counters. Native-Xet payloads show
+completed/total bytes, percentage, measured transfer rate, and ETA. Non-TTY
+output carries the same facts as bounded stable lines, without ANSI or a live
+dashboard. On Apple Silicon systems with at least 64 GiB unified memory, hf2q
+uses Xet's upstream high-performance preset unless the operator explicitly sets
+`HF_XET_HIGH_PERFORMANCE` or `HF_XET_HP`; smaller systems keep Xet's adaptive
+defaults.
+
+New managed paths are readable:
+`~/.local/share/hf2q/models/<owner>/<repository>/<revision>/<artifact>`.
+Hosted text and projector payloads remain in the authenticated Hugging Face
+cache; after verification hf2q creates a final-leaf symlink in the managed
+path. It does not make a second model-sized copy or move the cache blob. Legacy
+`v2-<hex>` managed directories remain discoverable but are never created by a
+new write.
 
 For supported multimodal text GGUFs, serve automatically uses an exact bound
 local projector or downloads the one unambiguous matching hosted `mmproj`.
@@ -748,7 +761,7 @@ are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.18 serving release
+#### Test the 0.1.19 serving release
 
 Build and verify the exact checkout before loading a model:
 

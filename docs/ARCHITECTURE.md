@@ -163,7 +163,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── info_report.rs           human-readable static-preflight rendering
 │   ├── operator_settings.rs     typed CLI/config/GGUF plan resolution
 │   ├── managed_artifacts.rs     ADR-051 shared types and public resolver surface
-│   ├── managed_artifacts/       local/hosted resolution, storage/adoption,
+│   ├── managed_artifacts/       local/hosted resolution, authenticated Hub-cache
+│   │                            link publication, readable storage/adoption,
 │   │                            projector pairing, inventory, and tests
 │   ├── api/                   axum router + handlers + state
 │   │   ├── artifact_catalog.rs        bounded opaque hosted-artifact authority
