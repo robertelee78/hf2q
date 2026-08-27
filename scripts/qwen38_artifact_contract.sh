@@ -639,6 +639,7 @@ qwen38_validate_evidence_manifest_paths() {
 
 qwen38_validate_exact_source_binary_binding() {
     local source_root=$1 binary_path=$2 source_commit=$3 binary_sha=$4
+    local build_info binary_git_commit
     [[ "$source_commit" =~ ^[0-9a-f]{40}$ \
       && "$binary_sha" =~ ^[0-9a-f]{64}$ \
       && ( -d "$source_root/.git" || -f "$source_root/.git" ) \
@@ -654,8 +655,24 @@ qwen38_validate_exact_source_binary_binding() {
         echo "physical matrix binary identity differs from receipt" >&2
         return 1
     }
-    grep -aFq "$source_commit" "$binary_path" || {
-        echo "physical matrix binary lacks its recorded source commit" >&2
+    build_info=$("$binary_path" __build-info) || {
+        echo "physical matrix binary build-info command failed" >&2
+        return 1
+    }
+    binary_git_commit=$(jq -er -s '
+      if length == 1
+        and .[0].schema == "hf2q.build-info.v1"
+        and (.[0].git_commit | type == "string")
+        and (.[0].git_commit | test("^[0-9a-f]{40}$"))
+      then .[0].git_commit
+      else error("invalid hf2q build-info authority")
+      end
+    ' <<<"$build_info") || {
+        echo "physical matrix binary build-info is malformed or ambiguous" >&2
+        return 1
+    }
+    [[ "$binary_git_commit" == "$source_commit" ]] || {
+        echo "physical matrix binary build-info commit differs from source" >&2
         return 1
     }
 }

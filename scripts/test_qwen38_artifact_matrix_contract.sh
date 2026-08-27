@@ -108,6 +108,10 @@ trap cleanup EXIT
 binding_root="$test_dir/exact-source-binding"
 binding_binary="$test_dir/hf2q-source-bound"
 missing_commit_binary="$test_dir/hf2q-missing-source"
+wrong_schema_binary="$test_dir/hf2q-wrong-schema"
+wrong_commit_binary="$test_dir/hf2q-wrong-commit"
+multiple_records_binary="$test_dir/hf2q-multiple-build-info"
+failed_build_info_binary="$test_dir/hf2q-failed-build-info"
 mkdir -p "$binding_root"
 git -C "$binding_root" init -q
 printf '%s\n' source >"$binding_root/source.txt"
@@ -116,7 +120,9 @@ GIT_AUTHOR_NAME=hf2q GIT_AUTHOR_EMAIL=hf2q@example.invalid \
 GIT_COMMITTER_NAME=hf2q GIT_COMMITTER_EMAIL=hf2q@example.invalid \
     git -C "$binding_root" commit -qm source
 binding_commit=$(git -C "$binding_root" rev-parse HEAD)
-printf '#!/bin/sh\n# source commit: %s\nexit 0\n' "$binding_commit" \
+# shellcheck disable=SC2016
+printf '#!/bin/sh\n[ "$1" = __build-info ] || exit 64\nprintf '\''%%s\\n'\'' '\''{"schema":"hf2q.build-info.v1","git_commit":"%s"}'\''\n' \
+    "$binding_commit" \
     >"$binding_binary"
 chmod +x "$binding_binary"
 binding_binary_sha=$(shasum -a 256 "$binding_binary" | awk '{print $1}')
@@ -126,13 +132,51 @@ expect_failure exact-binding-wrong-source \
     qwen38_validate_exact_source_binary_binding \
     "$binding_root" "$binding_binary" "$(printf '6%.0s' {1..40})" \
     "$binding_binary_sha"
-printf '#!/bin/sh\nexit 0\n' >"$missing_commit_binary"
+expect_failure exact-binding-wrong-binary-sha \
+    qwen38_validate_exact_source_binary_binding \
+    "$binding_root" "$binding_binary" "$binding_commit" \
+    "$(printf '6%.0s' {1..64})"
+printf '#!/bin/sh\nprintf '\''%%s\\n'\'' '\''{"schema":"hf2q.build-info.v1"}'\''\n' \
+    >"$missing_commit_binary"
 chmod +x "$missing_commit_binary"
 missing_commit_sha=$(shasum -a 256 "$missing_commit_binary" | awk '{print $1}')
 expect_failure exact-binding-missing-embedded-source \
     qwen38_validate_exact_source_binary_binding \
     "$binding_root" "$missing_commit_binary" "$binding_commit" \
     "$missing_commit_sha"
+printf '#!/bin/sh\nprintf '\''%%s\\n'\'' '\''{"schema":"other.v1","git_commit":"%s"}'\''\n' \
+    "$binding_commit" >"$wrong_schema_binary"
+chmod +x "$wrong_schema_binary"
+wrong_schema_sha=$(shasum -a 256 "$wrong_schema_binary" | awk '{print $1}')
+expect_failure exact-binding-wrong-build-info-schema \
+    qwen38_validate_exact_source_binary_binding \
+    "$binding_root" "$wrong_schema_binary" "$binding_commit" \
+    "$wrong_schema_sha"
+printf '#!/bin/sh\nprintf '\''%%s\\n'\'' '\''{"schema":"hf2q.build-info.v1","git_commit":"%s"}'\''\n' \
+    "$(printf '6%.0s' {1..40})" >"$wrong_commit_binary"
+chmod +x "$wrong_commit_binary"
+wrong_commit_sha=$(shasum -a 256 "$wrong_commit_binary" | awk '{print $1}')
+expect_failure exact-binding-wrong-build-info-commit \
+    qwen38_validate_exact_source_binary_binding \
+    "$binding_root" "$wrong_commit_binary" "$binding_commit" \
+    "$wrong_commit_sha"
+printf '#!/bin/sh\nprintf '\''%%s\\n%%s\\n'\'' '\''{"schema":"hf2q.build-info.v1","git_commit":"%s"}'\'' '\''{"schema":"hf2q.build-info.v1","git_commit":"%s"}'\''\n' \
+    "$binding_commit" "$binding_commit" >"$multiple_records_binary"
+chmod +x "$multiple_records_binary"
+multiple_records_sha=$(shasum -a 256 "$multiple_records_binary" \
+    | awk '{print $1}')
+expect_failure exact-binding-multiple-build-info-records \
+    qwen38_validate_exact_source_binary_binding \
+    "$binding_root" "$multiple_records_binary" "$binding_commit" \
+    "$multiple_records_sha"
+printf '#!/bin/sh\nexit 17\n' >"$failed_build_info_binary"
+chmod +x "$failed_build_info_binary"
+failed_build_info_sha=$(shasum -a 256 "$failed_build_info_binary" \
+    | awk '{print $1}')
+expect_failure exact-binding-build-info-exit \
+    qwen38_validate_exact_source_binary_binding \
+    "$binding_root" "$failed_build_info_binary" "$binding_commit" \
+    "$failed_build_info_sha"
 printf '%s\n' dirty >>"$binding_root/source.txt"
 expect_failure exact-binding-dirty-source \
     qwen38_validate_exact_source_binary_binding \
@@ -735,7 +779,8 @@ jq '.results[0].model.sha256 = ("0" * 64)' \
     "$test_dir/physical.json" >"$test_dir/physical-wrong-artifact.json"
 expect_failure physical-wrong-artifact qwen38_validate_physical_matrix_receipt \
     "$test_dir/physical-wrong-artifact.json"
-jq '.binding.source_commit = ("6" * 40)' \
+jq '.binding.source_commit = ("6" * 40)
+    | .binding.binary_git_commit = ("6" * 40)' \
     "$test_dir/physical.json" >"$test_dir/physical-wrong-source.json"
 expect_failure physical-wrong-source qwen38_validate_physical_matrix_receipt \
     "$test_dir/physical-wrong-source.json"

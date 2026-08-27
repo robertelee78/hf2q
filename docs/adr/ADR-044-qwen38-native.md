@@ -85,9 +85,11 @@
   four-position parent and matched-performance consumer. Physical schema 3
   now records one source/binary binding, requires every child binary digest and
   the copied four-position source commit to match it, proves the executable
-  embeds that commit against a clean exact worktree at start and final reopen,
+  reports that commit through exactly one canonical `hf2q.build-info.v1`
+  record against a clean exact worktree at start and final reopen,
   and carries the same source commit into the matched matrix. Wrong-commit,
-  missing-embedded-commit, dirty-source, and binary-digest mutations fail. All
+  malformed/ambiguous build-info, dirty-source, and binary-digest mutations
+  fail. All
   schema-2 physical receipts remain useful historical measurements but cannot
   authorize a current exact-source matched run.
   ADR-049 revs 66 and 72 subsequently sealed the corrected historical
@@ -707,8 +709,9 @@ snapshot after all five cells, so an early artifact cannot change while later
 formats run and still contribute to a sealed matrix.
 
 The physical matrix uses schema 3. Its top-level binding contains the clean
-source commit, executable SHA-256, and embedded executable commit. The
-validator requires those identities to agree, requires all five child receipts
+source commit, executable SHA-256, and canonical build-info commit. The
+validator requires exactly one valid `hf2q.build-info.v1` record and those
+identities to agree, requires all five child receipts
 to name that executable digest, and requires the sealed four-position matrix to
 name that source commit. Generation and final sealing additionally reopen the
 live source tree and executable. The matched matrix repeats the source and
