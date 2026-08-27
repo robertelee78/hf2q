@@ -564,6 +564,9 @@ jobs:
           bash scripts/test_release_tag_recovery_contract.sh
           bash scripts/test_frictionless_diagnostics_contract.sh
           bash scripts/test_gemma4_long_short_overlap_contract.sh
+          # These three tests compile cooperative-tensor Metal kernels that
+          # GitHub's hosted compiler rejects. Exact-head release validation
+          # runs them on the reserved Apple Silicon host before merge.
           cargo test --locked --bin hf2q --all-features deepseek4 -- \
             --skip attention_forward_tests \
             --skip allocator_materializes_the_plan_as_zeroed_bf16_buffers \
@@ -571,7 +574,10 @@ jobs:
             --skip partial_token_poison_requires_reset_before_replay \
             --skip start_zero_prefill_span_counts_complete_groups_and_publishes_once \
             --skip ffn_forward_tests \
+            --skip grouped_output_a_native_bf16_matches_independent_groups_for_decode_and_prefill \
+            --skip mixed_expert_codecs_execute_independently_at_decode_and_mm_widths \
             --skip raw_matmul_accepts_quality_sensitive_f32_weights \
+            --skip raw_matmul_consumes_native_bf16_without_a_shadow_weight \
             --skip embedding_forward_rejects_empty_input \
             --skip q2_k_embeddings_expand_to_four_identical_hc_streams \
             --skip native_model_load_keeps_weights_and_cache_on_one_device \
