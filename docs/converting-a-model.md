@@ -111,6 +111,15 @@ The cache directory follows `HF_HUB_CACHE`, then `HF_HOME`, then
 `XDG_CACHE_HOME`, then `~/.cache/huggingface/hub`. Tokens are never copied
 into hf2q configuration or receipts.
 
+Payloads use pinned `hf-hub 1.0` native Xet when the Hub advertises an Xet
+object. Hosted GGUFs use Xet range reconstruction for the selected file;
+native safetensors use one exact, allow-listed snapshot operation with up to
+eight concurrent file workers. A `.gguf` or `.safetensors` payload without a
+valid Xet identity is rejected rather than downloaded through a legacy
+single-stream path. Small Git-managed metadata still uses bounded HTTP. hf2q
+does not invoke Python, `huggingface-cli`, curl, or another
+converter/downloader process.
+
 Before each selected transfer, hf2q requires the file metadata to name the
 already-resolved commit and a supported immutable identity. Safetensors must
 be LFS objects with a SHA-256 identity. Git-managed configuration/tokenizer
@@ -201,9 +210,12 @@ models. These are conservative transfer safeguards; the operator still chooses
 the model, output path, and quantization explicitly or through `hf2q setup`'s
 consumed default.
 
-`hf-hub` reuses complete cache objects. An interrupted in-flight object is
-retried by the client; already completed objects are not downloaded again.
-hf2q never deletes source data from the shared Hub cache.
+`hf-hub` reuses complete cache objects. Transfers publish a blob/snapshot link
+only after the `.incomplete` HTTP/Xet operation succeeds; already completed
+objects are not downloaded again. An interrupted Xet reconstruction may reuse
+its CAS/chunk state, but hf2q does not promise exact output-file byte-offset
+resume across processes. hf2q never deletes source data from the shared Hub
+cache.
 
 ## Current boundary
 

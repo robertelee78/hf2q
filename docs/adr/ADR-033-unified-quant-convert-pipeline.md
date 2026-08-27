@@ -915,6 +915,30 @@ and mismatched inputs fail closed. The verified manifest produces the legacy
 LFS `SourceShard` bundle hash; remote outputs carry both
 `hf2q.producer_version` and `hf2q.source_sha256` metadata.
 
+**2026-08-26 native-Xet transfer amendment.** The integrity and selection
+contract above is unchanged, but its payload transport is now pinned
+`hf-hub 1.0.0` with the coherent Xet 1.5.3 dependency family. Hosted artifacts
+use the client's exact-revision `download_file`; native source weights are
+submitted once through `snapshot_download` with eight file workers and
+glob-escaped literal allow-patterns derived only from the authenticated index.
+The existing immutable source plan is reused rather than resolving the
+repository and metadata a second time. Every `.safetensors` or `.gguf` payload
+must advertise a valid `X-Xet-Hash`; hf2q fails closed instead of silently
+downgrading a large model payload to the single-stream HTTP path. Small
+Git-managed metadata remains ordinary HTTP because it is not stored in Xet.
+The standard Hub cache layout and exact snapshot-parent check remain
+authoritative, and every completed payload still undergoes hf2q's full local
+digest verification before conversion.
+
+A live proof exposed that `hf-hub 1.0.0`'s public `get_file_metadata` follows
+the absolute CDN redirect and then loses the origin-only `X-Repo-Commit`
+header. hf2q therefore retains one pooled, exact-origin, no-redirect Rust HEAD
+client for trust metadata while using hf-hub/Xet for payloads. It requires
+`X-Repo-Commit`, linked ETag, linked size, and the existing Git/LFS identity
+rules before transfer. This is not a second payload downloader. The detailed
+source RCA, alternatives, and completed cold-cache performance proof are in
+`docs/research/hf-download-rca-2026-08-26.md`.
+
 After successful temporary-GGUF finalization and durable sync, hf2q hashes
 those exact bytes and prepares a schema-v3 `<output>.receipt.json`. Version 3
 adds the original operator reference, normalized repository ID/type, canonical

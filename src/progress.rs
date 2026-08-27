@@ -3,6 +3,9 @@
 //! All progress bar usage in the codebase goes through `ProgressReporter`.
 //! No direct indicatif calls outside this module.
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -72,6 +75,15 @@ impl ProgressReporter {
         pb
     }
 
+    /// Adapt hf-hub's concurrent HTTP/Xet events to one non-chatty byte bar.
+    pub fn hub_download(&self, message: &str) -> hf_hub::progress::Progress {
+        hf_hub::progress::Progress::new(HubDownloadProgress {
+            bar: self.bytes_bar(0, message),
+            files: Mutex::new(BTreeMap::new()),
+            aggregate_bytes: AtomicU64::new(0),
+        })
+    }
+
     /// Elapsed time since the reporter was created.
     pub fn elapsed(&self) -> std::time::Duration {
         self.start_time.elapsed()
@@ -96,9 +108,108 @@ impl ProgressReporter {
     }
 }
 
+struct HubDownloadProgress {
+    bar: ProgressBar,
+    files: Mutex<BTreeMap<String, u64>>,
+    aggregate_bytes: AtomicU64,
+}
+
+impl hf_hub::progress::ProgressHandler for HubDownloadProgress {
+    fn on_progress(&self, event: &hf_hub::progress::ProgressEvent) {
+        use hf_hub::progress::{DownloadEvent, ProgressEvent};
+
+        let ProgressEvent::Download(event) = event else {
+            return;
+        };
+        match event {
+            DownloadEvent::Start { total_bytes, .. } => {
+                self.bar.set_length(*total_bytes);
+            }
+            DownloadEvent::AggregateProgress {
+                bytes_completed, ..
+            } => {
+                self.aggregate_bytes
+                    .store(*bytes_completed, Ordering::Relaxed);
+                self.bar
+                    .set_position(self.bar.position().max(*bytes_completed));
+            }
+            DownloadEvent::Progress { files } => {
+                if let Ok(mut positions) = self.files.try_lock() {
+                    for file in files {
+                        positions.insert(file.filename.clone(), file.bytes_completed);
+                    }
+                    // Aggregate Xet events and per-file HTTP/completion events
+                    // overlap, so summing the channels can double-count. Their
+                    // maximum is a monotonic lower bound for mixed snapshots
+                    // and reaches the full total when all files complete.
+                    let file_bytes = positions.values().copied().sum::<u64>();
+                    let aggregate_bytes = self.aggregate_bytes.load(Ordering::Relaxed);
+                    self.bar
+                        .set_position(self.bar.position().max(file_bytes).max(aggregate_bytes));
+                }
+            }
+            DownloadEvent::Complete => self.bar.finish_with_message("Download complete"),
+        }
+    }
+}
+
 impl Default for ProgressReporter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod hub_download_progress_tests {
+    use super::*;
+    use hf_hub::progress::{
+        DownloadEvent, FileProgress, FileStatus, ProgressEvent, ProgressHandler,
+    };
+
+    fn file(filename: &str, bytes_completed: u64, total_bytes: u64) -> FileProgress {
+        FileProgress {
+            filename: filename.to_owned(),
+            bytes_completed,
+            total_bytes,
+            status: FileStatus::InProgress,
+        }
+    }
+
+    #[test]
+    fn mixed_hub_progress_never_regresses_or_double_counts() {
+        let handler = HubDownloadProgress {
+            bar: ProgressBar::hidden(),
+            files: Mutex::new(BTreeMap::new()),
+            aggregate_bytes: AtomicU64::new(0),
+        };
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
+            total_files: 2,
+            total_bytes: 300,
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![file("ordinary.bin", 40, 100)],
+        }));
+        assert_eq!(handler.bar.position(), 40);
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::AggregateProgress {
+            bytes_completed: 120,
+            total_bytes: 200,
+            bytes_per_sec: Some(1.0),
+        }));
+        assert_eq!(handler.bar.position(), 120);
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![file("ordinary.bin", 100, 100)],
+        }));
+        assert_eq!(handler.bar.position(), 120);
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::AggregateProgress {
+            bytes_completed: 80,
+            total_bytes: 200,
+            bytes_per_sec: Some(1.0),
+        }));
+        assert_eq!(handler.bar.position(), 120);
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![file("xet.bin", 200, 200)],
+        }));
+        assert_eq!(handler.bar.position(), 300);
     }
 }
 
