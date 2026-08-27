@@ -22,6 +22,17 @@ if "$script_dir/verify_qwen35_agentic_lifecycle_cell.sh" \
     exit 1
 fi
 
+copy="$tmp_dir/q5-policy-numeric"
+cp -R "$root" "$copy"
+jq '.runtime.routing.dense_q5k_canonical_q4x4 = 1' \
+    "$copy/receipt.json" >"$copy/receipt.json.tmp"
+mv "$copy/receipt.json.tmp" "$copy/receipt.json"
+if "$script_dir/verify_qwen35_agentic_lifecycle_cell.sh" \
+    "$copy/receipt.json" "$source_root" >/dev/null 2>&1; then
+    echo "lifecycle verifier accepted a numeric routing-policy surrogate" >&2
+    exit 1
+fi
+
 copy="$tmp_dir/rebound-summary"
 cp -R "$root" "$copy"
 jq '.queued_exact_retry_cached_tokens += 1000000' \
@@ -136,4 +147,4 @@ expect_rebound_response_mutation_rejected \
 expect_rebound_response_mutation_rejected \
     isolation-length-finish '.choices[0].finish_reason = "length"'
 
-echo "Qwen agentic lifecycle receipt mutations: summary + 17/17 mutations REJECTED"
+echo "Qwen agentic lifecycle receipt mutations: summary + 18/18 mutations REJECTED"

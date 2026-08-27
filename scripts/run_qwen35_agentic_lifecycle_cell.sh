@@ -224,7 +224,7 @@ jq -n --arg source_commit "$source_commit" --arg binary "$HF2Q_BIN" \
     --argjson model_bytes "$MODEL_BYTES" --arg architecture "$expected_arch" \
     --arg run_id "$run_id" --arg manifest_sha "$manifest_sha" \
     --arg summary_sha "$summary_sha" \
-    --argjson q5k_canonical_q4x4 "$Q5K_CANONICAL_Q4X4" '{
+    --argjson q5k_canonical_q4x4 "$expected_q5k_policy" '{
       schema:2,verdict:"pass",gate:"qwen35-agentic-lifecycle-cell",
       source:{commit:$source_commit,binary:$binary,sha256:$binary_sha256},
       model:{shape:$model_shape,path:$model_path,sha256:$model_sha256,

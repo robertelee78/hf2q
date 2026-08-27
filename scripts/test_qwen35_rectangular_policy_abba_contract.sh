@@ -181,6 +181,10 @@ grep -Fq 'test_agentic_cache_lifecycle.sh' "$lifecycle_runner" \
 # shellcheck disable=SC2016
 grep -Fq 'HF2Q_Q5K_CANONICAL_Q4X4="$Q5K_CANONICAL_Q4X4"' "$lifecycle_runner" \
     || fail "lifecycle server does not receive the explicit Q5_K routing policy"
+# shellcheck disable=SC2016
+grep -Fq -- '--argjson q5k_canonical_q4x4 "$expected_q5k_policy"' \
+    "$lifecycle_runner" \
+    || fail "lifecycle receipt does not serialize the Q5_K route as a boolean"
 grep -Fq 'dense_q5k_canonical_q4x4=(true|false)' "$lifecycle_verifier" \
     || fail "lifecycle verifier does not reopen the frozen Q5_K routing policy"
 grep -Fq 'CONTINUATION_THINKING_TOKEN_BUDGET=16' "$lifecycle_runner" \
@@ -189,7 +193,7 @@ grep -Fq 'all(.[1:4][]; .thinking_token_budget == 16)' "$lifecycle_verifier" \
     || fail "lifecycle verifier does not reopen every budgeted continuation"
 grep -Fq '.[4].hf2q_enable_thinking == false' "$lifecycle_verifier" \
     || fail "lifecycle verifier does not reopen non-thinking isolation"
-grep -Fq '17/17 mutations REJECTED' "$lifecycle_mutations" \
+grep -Fq '18/18 mutations REJECTED' "$lifecycle_mutations" \
     || fail "lifecycle budget mutation battery is incomplete"
 grep -Fq 'for command in awk curl date grep jq sed' "$lifecycle_client" \
     || fail "scrubbed lifecycle client depends on a non-system search tool"
