@@ -2,8 +2,8 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
-Current published release: `v0.1.20`. Public availability is authoritative
-only after exact-artifact release proof completes.
+Release line described by this checkout: `v0.1.20`. Treat it as a release
+candidate until exact-artifact release proof establishes public availability.
 
 This document defines the public hf2q product surface for `v0.1.20`. It also defines
 the policy each environment variable is classified under. Per-variable

@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.89+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | hf2q 0.1.20 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.20` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | This checkout describes the hf2q 0.1.20 release line and resolves published, checksum-pinned `mlx-native 0.11.2`. Treat 0.1.20 as a release candidate until the `v0.1.20` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
