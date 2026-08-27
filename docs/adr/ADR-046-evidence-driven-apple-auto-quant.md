@@ -3,9 +3,9 @@
 - Status: Accepted; measured-selector foundation implemented, artifact
   generation and CLI activation remain gated by the phases below
 - Date: 2026-08-18
-- Updated: 2026-08-25 — the current release boundary pins exact published
-  `mlx-native = 0.14.0` (registry SHA-256
-  `c7b359aa9ea2603f58b49151ba54e37ed1aac10e76faf530865ea30a95f051b4`),
+- Updated: 2026-08-26 — the current release boundary pins exact published
+  `mlx-native = 0.15.0` (registry SHA-256
+  `09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822`),
   including direct execution of packed Q4_0/Q5_K/Q6_K embedding rows and
   mapped GGUF tensor ownership plus exact width-amortized Q4_K/Q5_K/Q6_K
   decode; the first official source-teacher gate below
@@ -15,6 +15,16 @@
   sensitivity, measurement, and quality evidence
 - Owners: hf2q product pipeline; mlx-native model-agnostic execution primitives
 - Supersedes: ADR-020's proposed DWQ architecture and performance claims
+
+### 2026-08-26 published dependency boundary
+
+`mlx-native 0.15.0` was published from exact source commit
+`25b4eab6cd2de0d790c34d046473febf798543c4`. Fail-closed workflow run
+`32917226470` verified exact source, packed crate, registry and GitHub release
+bytes, tag, and publication. The exact crate SHA-256 is
+`09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822`.
+`Cargo.toml` and the sole `mlx-native` lock entry are the current source
+authority; the 0.14.0 boundary below remains historical.
 
 ### 2026-08-25 published dependency boundary
 

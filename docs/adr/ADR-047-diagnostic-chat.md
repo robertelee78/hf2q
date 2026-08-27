@@ -2,7 +2,7 @@
 
 - **Status:** Accepted; model-swap proof-integrity corrections and the one-process universal generative-family hardware matrix are sealed; the exact Qwen3.8 cross-format single-hash swap matrix is hardware-sealed; embedding and projector lifecycle execution remains separate
 - **Date:** 2026-08-20
-- **Updated:** 2026-08-25
+- **Updated:** 2026-08-26
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
 ## Context
@@ -980,11 +980,11 @@ boundary. Its five hardware rows, two long-lived cycles, and final seal had not
 yet executed; publication and pinning were prerequisites, not runtime
 acceptance.
 
-The current candidate now pins published `mlx-native 0.14.0` from exact commit
-`32f076c7502151e7ca9cb20c06d0f3fe5e1d5641`; fail-closed workflow run
-`32873363483` binds its source, packed crate, crates.io bytes, tag, and GitHub
+The current candidate now pins published `mlx-native 0.15.0` from exact commit
+`25b4eab6cd2de0d790c34d046473febf798543c4`; fail-closed workflow run
+`32917226470` binds its source, packed crate, crates.io bytes, tag, and GitHub
 release to SHA-256
-`c7b359aa9ea2603f58b49151ba54e37ed1aac10e76faf530865ea30a95f051b4`.
+`09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822`.
 This updates the reproducible dependency boundary only; the swap matrix still
 requires its own exact-artifact execution seal.
 
