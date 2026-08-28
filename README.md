@@ -500,6 +500,8 @@ validated starting point is `temperature=0.55`, `top_p=0.95`, and the model's
 hf2q accepts `reasoning_effort` (`low`, `high`, or `max`) directly on a
 DeepSeek chat-completion request and retains the older
 `chat_template_kwargs.reasoning_effort` form for compatibility. A supplied
+top-level `none` sentinel from stock clients is treated as the `low` baseline;
+it is not a fourth native effort tier. A supplied
 integer `seed` now drives a decode-step-indexed deterministic sampler; identical
 rendered prompts and sampling settings reproduce across worker threads.
 
