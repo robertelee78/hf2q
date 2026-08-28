@@ -27,6 +27,20 @@ reject_literal() {
     fi
 }
 
+require_before() {
+    local file="$1"
+    local first="$2"
+    local second="$3"
+    local first_line
+    local second_line
+    first_line="$(awk -v needle="$first" 'index($0, needle) { print NR; exit }' "$file")"
+    second_line="$(awk -v needle="$second" 'index($0, needle) { print NR; exit }' "$file")"
+    [[ -n "$first_line" ]] || fail "missing '$first' in ${file#"$repo_root"/}"
+    [[ -n "$second_line" ]] || fail "missing '$second' in ${file#"$repo_root"/}"
+    [[ "$first_line" -lt "$second_line" ]] \
+        || fail "'$first' must precede '$second' in ${file#"$repo_root"/}"
+}
+
 # There is exactly one guide. Do not reintroduce a core/complete split.
 [[ ! -e "$extra_guide" ]] || fail "second onboarding guide must not exist"
 
@@ -125,7 +139,14 @@ require_literal "$assets/web-search-fetch.js" 'webfetch: false'
 require_literal "$assets/web-search-fetch.js" 'webfetch: "deny"'
 require_literal "$assets/web-search-fetch.js" 'normalizeJsonCssSchema'
 reject_literal "$assets/web-search-fetch.js" '"*": false'
+require_literal "$installer" 'SEARX_SETUPTOOLS_VERSION="84.0.0"'
+require_literal "$installer" '"setuptools==$SEARX_SETUPTOOLS_VERSION"'
 require_literal "$installer" '--no-build-isolation'
+require_before \
+    "$installer" \
+    '"setuptools==$SEARX_SETUPTOOLS_VERSION"' \
+    '--no-build-isolation'
+require_literal "$installer" 'uv pip check --python "$SEARX_DIR/.venv/bin/python"'
 require_literal "$installer" 'BROWSER_SETUP_MARKER'
 require_literal "$installer" 'LEGACY_BACKUPS'
 require_literal "$installer" "BACKUP_DIR=\"\$FETCH_DIR/backups/\$BACKUP_TAG\""

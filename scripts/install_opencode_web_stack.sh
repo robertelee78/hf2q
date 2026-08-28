@@ -277,6 +277,7 @@ install -m 0644 "$ASSET_DIR/test_server.py" "$FETCH_DIR/test_server.py"
 install -m 0644 "$ASSET_DIR/web-search-fetch.js" "$PLUGIN_DIR/web-search-fetch.js"
 
 SEARX_REV="b023a28bab8839dba9eac96e9a51cc91bbd0a267"
+SEARX_SETUPTOOLS_VERSION="84.0.0"
 if [[ ! -d "$SEARX_DIR/.git" ]]; then
     git clone --filter=blob:none --no-checkout \
         https://github.com/searxng/searxng.git "$SEARX_DIR"
@@ -306,10 +307,15 @@ uv pip install --python "$SEARX_DIR/.venv/bin/python" \
 # SearXNG's legacy editable build imports runtime modules (including msgspec)
 # from searx/__init__.py while evaluating setup.py. Its declared requirements
 # are installed immediately above, so use that exact environment instead of a
-# fresh PEP 517 build sandbox that cannot import them.
+# fresh PEP 517 build sandbox that cannot import them. Disabling isolation also
+# makes the target environment responsible for the legacy setuptools backend,
+# which a fresh uv Python 3.13 environment does not seed.
+uv pip install --python "$SEARX_DIR/.venv/bin/python" \
+    "setuptools==$SEARX_SETUPTOOLS_VERSION"
 uv pip install --python "$SEARX_DIR/.venv/bin/python" \
     --no-build-isolation \
     -e "$SEARX_DIR"
+uv pip check --python "$SEARX_DIR/.venv/bin/python"
 
 if [[ ! -x "$FETCH_DIR/.venv/bin/python" ]]; then
     uv venv --python 3.13 "$FETCH_DIR/.venv"
