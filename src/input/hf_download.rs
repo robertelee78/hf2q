@@ -61,11 +61,17 @@ struct HubApi {
     metadata: reqwest::blocking::Client,
 }
 
+#[derive(Debug)]
 struct HubFileMetadata {
     commit_hash: String,
     etag: String,
     file_size: u64,
     xet_hash: Option<String>,
+}
+
+struct HubMetadataResponse {
+    status: reqwest::StatusCode,
+    headers: reqwest::header::HeaderMap,
 }
 
 mod gguf_probe;
@@ -1800,7 +1806,15 @@ fn validate_qwen_hosted_topology(
                     &format!("{p}.ffn_down_exps.weight"),
                     &[experts, h, expert_intermediate],
                 )?;
-                require_shape(gguf, &format!("{p}.ffn_gate_inp_shexp.weight"), &[1, h])?;
+                // hf2q's Qwen3.5/3.6 converter deliberately squeezes the HF
+                // `[1, hidden]` shared-expert gate to canonical GGUF `[hidden]`
+                // so the scalar router stays F32. Runtime consumes it as one
+                // length-hidden dot-product vector.
+                require_shape(
+                    gguf,
+                    &format!("{p}.ffn_gate_inp_shexp.weight"),
+                    &crate::inference::models::qwen35::shared_expert_gate_shape(h),
+                )?;
                 require_shape(
                     gguf,
                     &format!("{p}.ffn_gate_shexp.weight"),
@@ -3345,7 +3359,34 @@ fn fetch_hub_file_metadata(
     resolved: &ResolvedHfModelReference,
     filename: &str,
 ) -> Result<HubFileMetadata, DownloadError> {
-    use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, ETAG};
+    use reqwest::header::AUTHORIZATION;
+
+    let token = resolve_auth_token();
+    fetch_hub_file_metadata_with(resolved, filename, |url| {
+        let mut request = api.metadata.head(url.clone());
+        if let Some(token) = token.as_deref() {
+            request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = request
+            .send()
+            .map_err(|error| DownloadError::DownloadFailed {
+                reason: format!("Failed to fetch immutable metadata for `{filename}`: {error}"),
+            })?;
+        Ok(HubMetadataResponse {
+            status: response.status(),
+            headers: response.headers().clone(),
+        })
+    })
+}
+
+fn fetch_hub_file_metadata_with(
+    resolved: &ResolvedHfModelReference,
+    filename: &str,
+    mut fetch: impl FnMut(&reqwest::Url) -> Result<HubMetadataResponse, DownloadError>,
+) -> Result<HubFileMetadata, DownloadError> {
+    use reqwest::header::{CONTENT_LENGTH, ETAG, LOCATION};
+
+    const MAX_METADATA_REDIRECTS: usize = 4;
 
     validate_repo_filename(filename)?;
     let mut url = reqwest::Url::parse(CANONICAL_HF_ENDPOINT).map_err(download_failed)?;
@@ -3361,75 +3402,169 @@ fn fetch_hub_file_metadata(
         segments.push(resolved.revision());
         segments.extend(filename.split('/'));
     }
-    let mut request = api.metadata.head(url.clone());
-    if let Some(token) = resolve_auth_token() {
-        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
-    }
-    let response = request
-        .send()
-        .map_err(|error| DownloadError::DownloadFailed {
-            reason: format!("Failed to fetch immutable metadata for `{filename}`: {error}"),
-        })?;
-    let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(DownloadError::AuthError {
-            repo: resolved.repo_id().to_owned(),
-        });
-    }
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(DownloadError::RepoNotFound {
-            repo: resolved.repo_id().to_owned(),
-        });
-    }
-    if !status.is_success() && !status.is_redirection() {
-        return Err(DownloadError::DownloadFailed {
-            reason: format!(
-                "Failed to fetch immutable metadata for `{filename}`: HTTP {status} at {url}"
-            ),
-        });
-    }
-    let headers = response.headers();
-    let text = |name: &'static str| {
-        headers
-            .get(name)
+    let canonical = reqwest::Url::parse(CANONICAL_HF_ENDPOINT).map_err(download_failed)?;
+    let mut immutable_identity: Option<(String, String)> = None;
+    let mut xet_hash: Option<String> = None;
+    let mut visited = BTreeSet::new();
+
+    for redirect_count in 0..=MAX_METADATA_REDIRECTS {
+        if !visited.insert(url.as_str().to_owned()) {
+            return Err(DownloadError::InvalidRepositoryInventory {
+                reason: format!("metadata for `{filename}` entered a redirect loop"),
+            });
+        }
+        let response = fetch(&url)?;
+        let status = response.status;
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(DownloadError::AuthError {
+                repo: resolved.repo_id().to_owned(),
+            });
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(DownloadError::RepoNotFound {
+                repo: resolved.repo_id().to_owned(),
+            });
+        }
+        if !status.is_success() && !status.is_redirection() {
+            return Err(DownloadError::DownloadFailed {
+                reason: format!(
+                    "Failed to fetch immutable metadata for `{filename}`: HTTP {status} at {url}"
+                ),
+            });
+        }
+
+        let headers = &response.headers;
+        let text = |name: &'static str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+                    reason: format!("metadata for `{filename}` omitted `{name}`"),
+                })
+        };
+        let commit_hash = text("x-repo-commit")?.to_owned();
+        let etag = headers
+            .get("x-linked-etag")
+            .or_else(|| headers.get(ETAG))
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .trim()
+                    .trim_start_matches("W/")
+                    .trim_matches('"')
+                    .to_owned()
+            })
+            .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+                reason: format!("metadata for `{filename}` omitted its immutable ETag"),
+            })?;
+        match immutable_identity.as_ref() {
+            Some((expected_commit, expected_etag))
+                if !expected_commit.eq_ignore_ascii_case(&commit_hash)
+                    || !expected_etag.eq_ignore_ascii_case(&etag) =>
+            {
+                return Err(DownloadError::InvalidRepositoryInventory {
+                    reason: format!(
+                        "metadata redirect for `{filename}` changed immutable identity"
+                    ),
+                });
+            }
+            None => immutable_identity = Some((commit_hash, etag)),
+            Some(_) => {}
+        }
+        if let Some(value) = headers
+            .get("x-xet-hash")
+            .and_then(|value| value.to_str().ok())
+        {
+            match xet_hash.as_deref() {
+                Some(expected) if !expected.eq_ignore_ascii_case(value) => {
+                    return Err(DownloadError::InvalidRepositoryInventory {
+                        reason: format!(
+                            "metadata redirect for `{filename}` changed immutable Xet identity"
+                        ),
+                    });
+                }
+                None => xet_hash = Some(value.to_owned()),
+                Some(_) => {}
+            }
+        }
+
+        let linked_size = headers.get("x-linked-size");
+        if let Some(value) = linked_size {
+            let file_size = value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+                    reason: format!("metadata for `{filename}` has an invalid `x-linked-size`"),
+                })?;
+            let (commit_hash, etag) = immutable_identity
+                .clone()
+                .expect("metadata identity is set before size resolution");
+            return Ok(HubFileMetadata {
+                commit_hash,
+                etag,
+                file_size,
+                xet_hash,
+            });
+        }
+        if status.is_success() {
+            let file_size = headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+                    reason: format!("metadata for `{filename}` omitted its byte length"),
+                })?;
+            let (commit_hash, etag) = immutable_identity
+                .clone()
+                .expect("metadata identity is set before size resolution");
+            return Ok(HubFileMetadata {
+                commit_hash,
+                etag,
+                file_size,
+                xet_hash,
+            });
+        }
+        if redirect_count == MAX_METADATA_REDIRECTS {
+            return Err(DownloadError::InvalidRepositoryInventory {
+                reason: format!(
+                    "metadata for `{filename}` exceeded {MAX_METADATA_REDIRECTS} redirects"
+                ),
+            });
+        }
+
+        // A redirect response's Content-Length describes the redirect body,
+        // not the immutable file. Small Git-backed Hub metadata omits
+        // x-linked-size on its first 307, so follow only the credential-safe
+        // same-origin cache URL and require identity continuity at the target.
+        let location = headers
+            .get(LOCATION)
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
-                reason: format!("metadata for `{filename}` omitted `{name}`"),
-            })
-    };
-    let commit_hash = text("x-repo-commit")?.to_owned();
-    let etag = headers
-        .get("x-linked-etag")
-        .or_else(|| headers.get(ETAG))
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .trim()
-                .trim_start_matches("W/")
-                .trim_matches('"')
-                .to_owned()
-        })
-        .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
-            reason: format!("metadata for `{filename}` omitted its immutable ETag"),
-        })?;
-    let file_size = headers
-        .get("x-linked-size")
-        .or_else(|| headers.get(CONTENT_LENGTH))
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
-            reason: format!("metadata for `{filename}` omitted its byte length"),
-        })?;
-    let xet_hash = headers
-        .get("x-xet-hash")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    Ok(HubFileMetadata {
-        commit_hash,
-        etag,
-        file_size,
-        xet_hash,
-    })
+                reason: format!("metadata redirect for `{filename}` omitted `location`"),
+            })?;
+        let target =
+            url.join(location)
+                .map_err(|error| DownloadError::InvalidRepositoryInventory {
+                    reason: format!("metadata redirect for `{filename}` is invalid: {error}"),
+                })?;
+        let same_origin = target.scheme() == "https"
+            && target.host_str() == canonical.host_str()
+            && target.port_or_known_default() == canonical.port_or_known_default()
+            && target.username().is_empty()
+            && target.password().is_none()
+            && target.fragment().is_none();
+        if !same_origin {
+            return Err(DownloadError::InvalidRepositoryInventory {
+                reason: format!(
+                    "metadata redirect for `{filename}` is not a credential-safe same-origin Hugging Face HTTPS URL"
+                ),
+            });
+        }
+        url = target;
+    }
+
+    unreachable!("bounded metadata redirect loop always returns")
 }
 
 pub(super) fn validate_file_metadata(
@@ -3839,6 +3974,177 @@ pub(crate) mod tests {
         assert!(require_native_xet_payload("model.gguf", None).is_err());
         assert!(require_native_xet_payload("model.gguf", Some("not-a-xet-hash")).is_err());
         assert!(require_native_xet_payload("config.json", None).is_ok());
+    }
+
+    fn metadata_test_headers(revision: &str, etag: &str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-repo-commit", revision.parse().unwrap());
+        headers.insert("x-linked-etag", format!("\"{etag}\"").parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn metadata_redirect_uses_final_file_length_not_redirect_body_length() {
+        use reqwest::header::{CONTENT_LENGTH, ETAG, LOCATION};
+
+        let revision = "a".repeat(40);
+        let etag = "b".repeat(40);
+        let resolved = HfModelReference::parse("owner/model", Some(&revision))
+            .unwrap()
+            .resolve(&revision)
+            .unwrap();
+        let mut hop = 0;
+        let metadata = fetch_hub_file_metadata_with(&resolved, "config.json", |url| {
+            hop += 1;
+            match hop {
+                1 => {
+                    assert_eq!(url.path(), format!("/owner/model/resolve/{revision}/config.json"));
+                    let mut headers = metadata_test_headers(&revision, &etag);
+                    headers.insert(CONTENT_LENGTH, "348".parse().unwrap());
+                    headers.insert(
+                        LOCATION,
+                        format!(
+                            "/api/resolve-cache/models/owner/model/{revision}/config.json?etag={etag}"
+                        )
+                        .parse()
+                        .unwrap(),
+                    );
+                    Ok(HubMetadataResponse {
+                        status: reqwest::StatusCode::TEMPORARY_REDIRECT,
+                        headers,
+                    })
+                }
+                2 => {
+                    assert_eq!(url.host_str(), Some("huggingface.co"));
+                    assert!(url.path().starts_with("/api/resolve-cache/models/"));
+                    let mut headers = metadata_test_headers(&revision, &etag);
+                    headers.remove("x-linked-etag");
+                    headers.insert(ETAG, format!("\"{etag}\"").parse().unwrap());
+                    headers.insert(CONTENT_LENGTH, "2317".parse().unwrap());
+                    Ok(HubMetadataResponse {
+                        status: reqwest::StatusCode::OK,
+                        headers,
+                    })
+                }
+                _ => panic!("metadata resolution followed more than one redirect"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(hop, 2);
+        assert_eq!(metadata.commit_hash, revision);
+        assert_eq!(metadata.etag, etag);
+        assert_eq!(metadata.file_size, 2317);
+        assert_eq!(metadata.xet_hash, None);
+    }
+
+    #[test]
+    fn metadata_redirect_rejects_cross_origin_before_second_request() {
+        use reqwest::header::{CONTENT_LENGTH, LOCATION};
+
+        let revision = "a".repeat(40);
+        let etag = "b".repeat(40);
+        let resolved = HfModelReference::parse("owner/model", Some(&revision))
+            .unwrap()
+            .resolve(&revision)
+            .unwrap();
+        let mut calls = 0;
+        let error = fetch_hub_file_metadata_with(&resolved, "config.json", |_| {
+            calls += 1;
+            assert_eq!(calls, 1, "an untrusted redirect must not be requested");
+            let mut headers = metadata_test_headers(&revision, &etag);
+            headers.insert(CONTENT_LENGTH, "348".parse().unwrap());
+            headers.insert(
+                LOCATION,
+                "https://example.invalid/stolen-config.json"
+                    .parse()
+                    .unwrap(),
+            );
+            Ok(HubMetadataResponse {
+                status: reqwest::StatusCode::TEMPORARY_REDIRECT,
+                headers,
+            })
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert!(error
+            .to_string()
+            .contains("same-origin Hugging Face HTTPS URL"));
+    }
+
+    #[test]
+    fn metadata_redirect_rejects_identity_change() {
+        use reqwest::header::{CONTENT_LENGTH, ETAG, LOCATION};
+
+        let revision = "a".repeat(40);
+        let etag = "b".repeat(40);
+        let resolved = HfModelReference::parse("owner/model", Some(&revision))
+            .unwrap()
+            .resolve(&revision)
+            .unwrap();
+        let mut hop = 0;
+        let error = fetch_hub_file_metadata_with(&resolved, "config.json", |_| {
+            hop += 1;
+            let mut headers = metadata_test_headers(&revision, &etag);
+            if hop == 1 {
+                headers.insert(LOCATION, "/api/resolve-cache/config.json".parse().unwrap());
+                Ok(HubMetadataResponse {
+                    status: reqwest::StatusCode::TEMPORARY_REDIRECT,
+                    headers,
+                })
+            } else {
+                headers.remove("x-linked-etag");
+                headers.insert(ETAG, format!("\"{}\"", "c".repeat(40)).parse().unwrap());
+                headers.insert(CONTENT_LENGTH, "2317".parse().unwrap());
+                Ok(HubMetadataResponse {
+                    status: reqwest::StatusCode::OK,
+                    headers,
+                })
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(hop, 2);
+        assert!(error.to_string().contains("changed immutable identity"));
+    }
+
+    #[test]
+    fn xet_linked_size_keeps_the_single_hop_fast_path() {
+        use reqwest::header::{CONTENT_LENGTH, LOCATION};
+
+        let revision = "a".repeat(40);
+        let etag = "b".repeat(64);
+        let xet_hash = "c".repeat(64);
+        let resolved = HfModelReference::parse("owner/model", Some(&revision))
+            .unwrap()
+            .resolve(&revision)
+            .unwrap();
+        let mut calls = 0;
+        let metadata = fetch_hub_file_metadata_with(&resolved, "model.safetensors", |_| {
+            calls += 1;
+            assert_eq!(
+                calls, 1,
+                "x-linked-size must avoid following the payload redirect"
+            );
+            let mut headers = metadata_test_headers(&revision, &etag);
+            headers.insert("x-linked-size", "25043007488".parse().unwrap());
+            headers.insert("x-xet-hash", xet_hash.parse().unwrap());
+            headers.insert(CONTENT_LENGTH, "976".parse().unwrap());
+            headers.insert(
+                LOCATION,
+                "https://us.aws.cdn.hf.co/xet/signed".parse().unwrap(),
+            );
+            Ok(HubMetadataResponse {
+                status: reqwest::StatusCode::TEMPORARY_REDIRECT,
+                headers,
+            })
+        })
+        .unwrap();
+
+        assert_eq!(calls, 1);
+        assert_eq!(metadata.file_size, 25_043_007_488);
+        assert_eq!(metadata.xet_hash.as_deref(), Some(xet_hash.as_str()));
     }
 
     fn write_test_gguf(path: &Path, arch: &str, file_type: u32) -> u64 {
@@ -5364,6 +5670,32 @@ pub(crate) mod tests {
                 .expect("authenticate bounded Qwen3.8 config metadata");
         assert_eq!(config.filename, "config.json");
         assert!(config.bytes > 0 && config.bytes <= MAX_HF_SMALL_METADATA_BYTES);
+    }
+
+    /// Opt-in live regression for the small Git-backed config redirect that
+    /// previously mistook the 307 response body's Content-Length for the
+    /// immutable file length and rejected a complete cached config as corrupt.
+    #[test]
+    fn live_qwen36_redirected_config_uses_the_final_representation_length() {
+        if std::env::var("HF2Q_NETWORK_TESTS").ok().as_deref() != Some("1") {
+            eprintln!("skipping network test (set HF2Q_NETWORK_TESTS=1 to run)");
+            return;
+        }
+        const REPO: &str = "jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated";
+        const REVISION: &str = "afde6ca7c35272a4b5eefb3b97576fdac0f74ba0";
+
+        let api =
+            build_hub_api(&resolve_hf_cache_dir(), false).expect("build exact-origin Hub client");
+        let repo = hub_model_repo(&api, REPO);
+        let resolved = HfModelReference::parse(REPO, Some(REVISION))
+            .unwrap()
+            .resolve(REVISION)
+            .unwrap();
+        let config = fetch_expected_file_metadata(&api, &repo, &resolved, "config.json")
+            .expect("resolve the final immutable config representation");
+
+        assert_eq!(config.filename, "config.json");
+        assert_eq!(config.bytes, 2_317);
     }
 
     /// Opt-in end-to-end proof that the production snapshot path selects the

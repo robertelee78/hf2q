@@ -33,10 +33,10 @@ on:
         required: false
         default: ""
       min_decode_tps:
-        description: "Decode tok/s floor for the perf-sanity gate (default: 95)."
+        description: "Decode tok/s floor for the perf-sanity gate (default: 100)."
         type: string
         required: false
-        default: "95"
+        default: "100"
       max_tokens:
         description: "Max tokens for the perf sanity run (default: 1000)."
         type: string

@@ -397,7 +397,13 @@ pub(crate) fn validate_mtp_tensor_topology(gguf: &GgufFile, cfg: &Qwen35Config) 
             &format!("{p}.ffn_down_exps.weight"),
             &[experts, h, intermediate],
         )?;
-        require_shape(&format!("{p}.ffn_gate_inp_shexp.weight"), &[1, h])?;
+        // The conversion contract squeezes HF `[1, hidden]` to canonical
+        // GGUF `[hidden]`; the main-stack and MTP shared-expert gates use the
+        // same runtime dot-product representation.
+        require_shape(
+            &format!("{p}.ffn_gate_inp_shexp.weight"),
+            &super::shared_expert_gate_shape(h),
+        )?;
         require_shape(&format!("{p}.ffn_gate_shexp.weight"), &[shared, h])?;
         require_shape(&format!("{p}.ffn_up_shexp.weight"), &[shared, h])?;
         require_shape(&format!("{p}.ffn_down_shexp.weight"), &[h, shared])?;

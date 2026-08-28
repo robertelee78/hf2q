@@ -1620,6 +1620,13 @@ fn resolve_api_template_kwargs(
     }
     if registration.is_some_and(|candidate| candidate.family == "deepseek4") {
         if let Some(effort) = reasoning_effort {
+            // Stock OpenCode sends `none` when no reasoning variant is
+            // selected. DeepSeek's native lowest tier is `low`, which adds no
+            // effort-specific instruction, so normalize only that top-level
+            // client sentinel at the compatibility boundary. An explicit
+            // chat_template_kwargs value retains precedence and remains
+            // subject to the native low/high/max validator.
+            let effort = if effort == "none" { "low" } else { effort };
             resolved
                 .entry("reasoning_effort")
                 .or_insert_with(|| serde_json::Value::String(effort.to_owned()));
@@ -12584,6 +12591,19 @@ mod api_thinking_default_tests {
         assert_eq!(
             resolved.get("reasoning_effort"),
             Some(&serde_json::Value::String("max".into()))
+        );
+    }
+
+    #[test]
+    fn deepseek_normalizes_stock_client_none_reasoning_effort_to_low() {
+        let registration = registry::find_for("deepseek-v4-flash")
+            .or_else(|| registry::find_for("deepseek4"))
+            .expect("DeepSeek-V4 registration");
+        let resolved = resolve_api_template_kwargs(Some(&registration), None, Some("none"))
+            .expect("stock-client sentinel must produce template kwargs");
+        assert_eq!(
+            resolved.get("reasoning_effort"),
+            Some(&serde_json::Value::String("low".into()))
         );
     }
 

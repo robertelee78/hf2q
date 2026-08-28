@@ -249,7 +249,7 @@ fn exact_incompatible_hosted_quant_falls_through_but_transport_failure_does_not(
 }
 
 #[test]
-fn unqualified_hosted_selection_uses_recommendation_then_nearest_lower() {
+fn unqualified_hosted_selection_uses_lower_before_resource_admitted_higher() {
     let choices = vec![
         hosted(QuantType::Q3_K_M, "model-q3_k_m.gguf"),
         hosted(QuantType::Q5_K_M, "model-q5_k_m.gguf"),
@@ -274,10 +274,76 @@ fn unqualified_hosted_selection_uses_recommendation_then_nearest_lower() {
         Some("Q2_K")
     );
 
-    let q8_only = vec![hosted(QuantType::Q8_0, "model-q8_0.gguf")];
-    assert!(select_hosted(&q8_only, None, QuantType::Q4_K_M)
-        .unwrap()
-        .is_none());
+    let nearest_higher_only = vec![
+        hosted(QuantType::Q5_K_M, "model-q5_k_m.gguf"),
+        hosted(QuantType::Q8_0, "model-q8_0.gguf"),
+    ];
+    assert_eq!(
+        select_hosted(&nearest_higher_only, None, QuantType::Q4_K_M)
+            .unwrap()
+            .unwrap()
+            .quant_hint
+            .as_deref(),
+        Some("Q5_K_M")
+    );
+
+    let lower_and_higher = vec![
+        hosted(QuantType::Q3_K_M, "model-q3_k_m.gguf"),
+        hosted(QuantType::Q5_K_M, "model-q5_k_m.gguf"),
+    ];
+    assert_eq!(
+        select_hosted(&lower_and_higher, None, QuantType::Q4_K_M)
+            .unwrap()
+            .unwrap()
+            .quant_hint
+            .as_deref(),
+        Some("Q3_K_M")
+    );
+}
+
+#[test]
+fn live_bare_qwen36_selects_admitted_hosted_q5_before_native_conversion() {
+    if std::env::var("HF2Q_NETWORK_TESTS").ok().as_deref() != Some("1") {
+        eprintln!("skipping network test (set HF2Q_NETWORK_TESTS=1 to run)");
+        return;
+    }
+    const REPO: &str = "jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated";
+    const REVISION: &str = "afde6ca7c35272a4b5eefb3b97576fdac0f74ba0";
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    let reference = HfModelReference::parse(REPO, Some(REVISION)).unwrap();
+    let catalog = resolve_hub_gguf_catalog(reference).unwrap();
+    let choices = catalog
+        .artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact.selectable
+                && artifact.role == "text_model"
+                && automatic_artifact_admissible(artifact.bytes, 128 * GIB, 96 * GIB)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+    let selected = select_compatible_hosted(
+        &choices,
+        None,
+        QuantType::Q4_K_M,
+        |artifact| validate_hub_gguf_header_compatibility(artifact).map(|_| ()),
+        &mut warnings,
+    )
+    .unwrap()
+    .unwrap_or_else(|| {
+        panic!(
+            "a resource-admitted hosted artifact must win before native conversion; choices={:?}; warnings={warnings:?}",
+            choices
+                .iter()
+                .map(|artifact| (&artifact.filename, &artifact.quant_hint, artifact.bytes))
+                .collect::<Vec<_>>()
+        )
+    });
+
+    assert_eq!(selected.filename, "gguf/APEX-Q5_K_M.gguf");
+    assert_eq!(selected.quant_hint.as_deref(), Some("Q5_K_M"));
 }
 
 #[test]

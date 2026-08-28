@@ -1706,8 +1706,12 @@ the same setting at the request top level, where it was ignored. The request
 schema now accepts `reasoning_effort` directly and merges it into the native
 template context for DeepSeek only. Valid values remain `low`, `high`, and
 `max`; an explicitly supplied compatibility kwarg retains its documented
-precedence. Eight focused API/template tests pass, including top-level `max`
-and compatibility precedence.
+precedence. Stock OpenCode 1.18.23 also emits the top-level sentinel `none`
+when no reasoning variant is selected. The OpenAI-compatible boundary maps
+that sentinel to `low`, DeepSeek's existing no-extra-effort baseline, without
+adding a fourth native tier or weakening validation of explicit compatibility
+kwargs. Focused API/template tests cover top-level `max`, the stock-client
+sentinel, and compatibility precedence.
 
 The canonical OpenCode profile and isolated coding gate now declare
 `temperature=0.55`, `top_p=0.95`, interleaved `reasoning_content`, and a `max`

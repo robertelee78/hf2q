@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.89+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | hf2q 0.1.19 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.19` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | This checkout describes the hf2q 0.1.20 release line and resolves published, checksum-pinned `mlx-native 0.11.2`. Treat 0.1.20 as a release candidate until the `v0.1.20` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -301,8 +301,10 @@ hf2q serve owner/repository:Q4_K_M
 
 # No quant: use the most recently used compatible local artifact, otherwise
 # the newest compatible local artifact. Only with no local candidate, choose
-# the setup/live hardware recommendation and nearest lower hosted tier. Native
-# source conversion is the final fallback when no admitted hosted GGUF exists.
+# the setup/live hardware recommendation and nearest lower hosted tier. When
+# none exists, use the nearest higher hosted tier that already passed runtime
+# resource admission. Native source conversion is the final fallback when no
+# admitted hosted GGUF exists.
 hf2q serve owner/repository
 
 # Chat uses the same preparation path and owns the server it starts.
@@ -498,6 +500,8 @@ validated starting point is `temperature=0.55`, `top_p=0.95`, and the model's
 hf2q accepts `reasoning_effort` (`low`, `high`, or `max`) directly on a
 DeepSeek chat-completion request and retains the older
 `chat_template_kwargs.reasoning_effort` form for compatibility. A supplied
+top-level `none` sentinel from stock clients is treated as the `low` baseline;
+it is not a fourth native effort tier. A supplied
 integer `seed` now drives a decode-step-indexed deterministic sampler; identical
 rendered prompts and sampling settings reproduce across worker threads.
 
@@ -761,7 +765,7 @@ are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.19 serving release
+#### Test the 0.1.20 serving release
 
 Build and verify the exact checkout before loading a model:
 

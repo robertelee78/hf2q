@@ -8,6 +8,7 @@ manifest="$repo_root/Cargo.toml"
 arch_catalog="$repo_root/src/quantize/ggml_quants/tensor_ref.rs"
 deepseek_launcher="$repo_root/scripts/serve_deepseek4_opencode.sh"
 deepseek_parity="$repo_root/scripts/benchmark_deepseek4_server_parity.sh"
+release_check_workflow="$repo_root/.github/workflows/release-check.yml"
 
 fail() {
     echo "shipping-contract check failed: $*" >&2
@@ -62,7 +63,8 @@ expected_variants="$(printf '%s\n' \
     exit 1
 }
 
-require_literal "$contract" "Current published release: \`v${crate_version}\`"
+require_literal "$contract" "Release line described by this checkout: \`v${crate_version}\`"
+require_literal "$contract" "candidate until exact-artifact release proof establishes public availability"
 require_literal "$contract" "### Supported family and command matrix"
 require_literal "$contract" "| Qwen3.5 / Qwen3.6"
 require_literal "$contract" "| Qwen3.8-27B"
@@ -85,6 +87,11 @@ require_literal "$deepseek_launcher" '--ctx "$CONTEXT_TOKENS"'
 reject_literal "$deepseek_launcher" 'CONTEXT_LEN'
 require_literal "$deepseek_parity" 'serve_deepseek4_opencode.sh" --ctx "$CONTEXT_LEN"'
 reject_literal "$deepseek_parity" 'HF2Q_BIN="$HF2Q_BIN" CONTEXT_LEN='
+
+# Keep the declarative manual gate in sync with release-check.sh's measured
+# default. A stale workflow default silently weakens an operator-triggered run.
+require_literal "$release_check_workflow" 'description: "Decode tok/s floor for the perf-sanity gate (default: 100)."'
+require_literal "$release_check_workflow" 'default: "100"'
 
 bash "$repo_root/scripts/test_getting_started_guide.sh"
 

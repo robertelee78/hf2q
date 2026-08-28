@@ -866,7 +866,8 @@ pub struct ChatCompletionRequest {
     pub seed: Option<u64>,
     /// DeepSeek-V4 reasoning budget. Accepted at the OpenAI-compatible
     /// top level so clients need not know hf2q's `chat_template_kwargs`
-    /// extension. Valid values are `low`, `high`, and `max`.
+    /// extension. Native values are `low`, `high`, and `max`; the top-level
+    /// stock-client sentinel `none` is normalized to the `low` baseline.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     /// Optional per-request cap on tokens emitted while the model remains in
