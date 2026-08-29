@@ -156,8 +156,8 @@ engines:
     disabled: false
     inactive: false
   - name: bing
-    weight: 0.5
-    disabled: true
+    weight: 1.5
+    disabled: false
     inactive: false
   - name: duckduckgo
     weight: 1.3

@@ -2,6 +2,7 @@
 
 Endpoints:
   GET  /healthz
+  POST /search-fallback {query, language?, max_results?}
   POST /fetch     {url, mode=auto|static|browser|stealth, css_selector?, max_chars?, timeout?}
   POST /crawl     {url, max_depth?, max_pages?, allowed_domains?, blocked_domains?,
                    include_external?, query?, max_chars?}
@@ -27,6 +28,9 @@ import trafilatura
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+from egress_guard import UnsafeUrlError, guarded_get, resolve_public_target
+from search_fallback import build_bing_search_url, page_is_blocked, parse_bing_results
+
 HOST = os.environ.get("FETCH_HOST", "127.0.0.1")
 PORT = int(os.environ.get("FETCH_PORT", "11235"))
 STATIC_MIN_CHARS = 800  # below this in auto mode, escalate to browser
@@ -34,9 +38,11 @@ DEFAULT_MAX_CHARS = 40_000
 ANTI_BOT_MARKERS = (
     "anti-bot protection",
     "access denied",
+    "captcha",
     "cf-challenge",
     "checking your browser",
     "cloudflare",
+    "consent interstitial",
     "just a moment",
     "performing security verification",
     "turnstile",
@@ -95,6 +101,13 @@ class FetchRequest(BaseModel):
     css_selector: str | None = None
     max_chars: int = Field(default=DEFAULT_MAX_CHARS, le=200_000)
     timeout: int = Field(default=75, le=120)
+    public_only: bool = False
+
+
+class SearchFallbackRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=512)
+    language: str | None = Field(default=None, pattern=r"^[A-Za-z]{2,3}(?:-[A-Za-z]{2})?$")
+    max_results: int = Field(default=5, ge=1, le=10)
 
 
 class CrawlRequest(BaseModel):
@@ -131,22 +144,33 @@ def md_of(result) -> str:
 
 
 async def fetch_static(req: FetchRequest) -> dict:
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=req.timeout,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-        },
-    ) as client:
-        resp = await client.get(req.url)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    }
+    if req.public_only:
+        resp = await guarded_get(req.url, timeout=req.timeout, headers=headers)
+        response_url = resp.url
+        status_code = resp.status_code
         html = resp.text
-        from crawl4ai.antibot_detector import is_blocked
+    else:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=req.timeout,
+            headers=headers,
+        ) as client:
+            response = await client.get(req.url)
+            response_url = str(response.url)
+            status_code = response.status_code
+            html = response.text
 
-        blocked, reason = is_blocked(resp.status_code, html)
-        if blocked:
-            raise AntiBotError(reason or f"anti-bot HTTP {resp.status_code}")
-        resp.raise_for_status()
+    from crawl4ai.antibot_detector import is_blocked
+
+    blocked, reason = is_blocked(status_code, html)
+    if blocked:
+        raise AntiBotError(reason or f"anti-bot HTTP {status_code}")
+    if status_code >= 400:
+        raise RuntimeError(f"HTTP {status_code}")
     extracted = trafilatura.extract(
         html,
         output_format="markdown",
@@ -155,7 +179,7 @@ async def fetch_static(req: FetchRequest) -> dict:
         favor_recall=True,
     )
     return {
-        "url": str(resp.url),
+        "url": response_url,
         "title": None,
         "markdown": extracted or "",
         "via": "static",
@@ -164,6 +188,7 @@ async def fetch_static(req: FetchRequest) -> dict:
 
 async def fetch_browser(req: FetchRequest) -> dict:
     from crawl4ai import CrawlerRunConfig, CacheMode
+    from crawl4ai.antibot_detector import is_blocked
 
     crawler = await get_crawler()
     cfg = CrawlerRunConfig(
@@ -178,6 +203,9 @@ async def fetch_browser(req: FetchRequest) -> dict:
         if is_antibot_error(error):
             raise AntiBotError(error)
         raise RuntimeError(error)
+    blocked, reason = is_blocked(getattr(result, "status_code", 200) or 200, result.html or "")
+    if blocked:
+        raise AntiBotError(reason or "browser reached an anti-bot interstitial")
     return {
         "url": result.url,
         "title": (result.metadata or {}).get("title"),
@@ -186,16 +214,9 @@ async def fetch_browser(req: FetchRequest) -> dict:
     }
 
 
-async def fetch_stealth(req: FetchRequest) -> dict:
-    """Fetch a protected page with Scrapling's Cloudflare-aware browser.
-
-    Scrapling is deliberately serialized because each request launches a real
-    browser and Cloudflare challenges are CPU/memory intensive. The ordinary
-    static and warm Crawl4AI paths remain concurrent.
-    """
-
+async def run_stealth_helper(request: dict, timeout: int) -> dict:
     async with _stealth_lock:
-        logger.info("escalating to stealth browser url=%s", req.url)
+        logger.info("escalating to stealth browser url=%s", request["url"])
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             str(STEALTH_HELPER),
@@ -204,17 +225,12 @@ async def fetch_stealth(req: FetchRequest) -> dict:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
-        request_json = json.dumps(
-            {
-                "url": req.url,
-                "css_selector": req.css_selector,
-                "timeout": max(req.timeout, STEALTH_MIN_TIMEOUT_SECONDS),
-            }
-        ).encode()
+        request["timeout"] = max(timeout, STEALTH_MIN_TIMEOUT_SECONDS)
+        request_json = json.dumps(request).encode()
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(input=request_json),
-                timeout=max(req.timeout, STEALTH_MIN_TIMEOUT_SECONDS) + STEALTH_TIMEOUT_GRACE_SECONDS,
+                timeout=max(timeout, STEALTH_MIN_TIMEOUT_SECONDS) + STEALTH_TIMEOUT_GRACE_SECONDS,
             )
         except TimeoutError as error:
             if process.returncode is None:
@@ -226,7 +242,7 @@ async def fetch_stealth(req: FetchRequest) -> dict:
                     await process.wait()
             raise TimeoutError(
                 "stealth browser exceeded "
-                f"{max(req.timeout, STEALTH_MIN_TIMEOUT_SECONDS) + STEALTH_TIMEOUT_GRACE_SECONDS}s"
+                f"{max(timeout, STEALTH_MIN_TIMEOUT_SECONDS) + STEALTH_TIMEOUT_GRACE_SECONDS}s"
             ) from error
 
         stderr_text = stderr.decode(errors="replace").strip()
@@ -249,6 +265,57 @@ async def fetch_stealth(req: FetchRequest) -> dict:
         return payload
 
 
+async def fetch_stealth(req: FetchRequest) -> dict:
+    """Fetch a protected page with one serialized Scrapling worker."""
+
+    return await run_stealth_helper(
+        {
+            "operation": "fetch",
+            "url": req.url,
+            "css_selector": req.css_selector,
+        },
+        req.timeout,
+    )
+
+
+async def search_browser(url: str, max_results: int) -> list[dict]:
+    from crawl4ai import CacheMode, CrawlerRunConfig
+
+    crawler = await get_crawler()
+    config = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        page_timeout=45_000,
+        word_count_threshold=0,
+    )
+    result = await crawler.arun(url=url, config=config)
+    if not result.success:
+        raise RuntimeError(result.error_message or "browser search failed")
+    results = parse_bing_results(result.html, max_results)
+    if not results and page_is_blocked(result.html):
+        raise AntiBotError("browser search reached a CAPTCHA or consent interstitial")
+    return results
+
+
+async def search_stealth(url: str, max_results: int) -> list[dict]:
+    payload = await run_stealth_helper(
+        {"operation": "search", "url": url, "max_results": max_results},
+        75,
+    )
+    return payload.get("results", [])
+
+
+async def validated_search_results(results: list[dict]) -> list[dict]:
+    validated = []
+    for result in results:
+        try:
+            await asyncio.wait_for(resolve_public_target(result["url"]), timeout=5)
+        except (KeyError, UnsafeUrlError, OSError) as error:
+            logger.warning("discarding unsafe search result url=%r error=%s", result.get("url"), error)
+            continue
+        validated.append(result)
+    return validated
+
+
 @app.get("/healthz")
 async def healthz():
     try:
@@ -260,31 +327,62 @@ async def healthz():
     return {
         "ok": True,
         "browser_warm": _crawler is not None,
-        "stealth_available": stealth_version is not None,
+        "stealth_installed": stealth_version is not None,
         "stealth_version": stealth_version,
+    }
+
+
+@app.post("/search-fallback")
+async def search_fallback(req: SearchFallbackRequest):
+    """One bounded, fixed-origin browser discovery attempt after SearXNG fails."""
+
+    url = build_bing_search_url(req.query, req.language)
+    attempts = []
+    for route, search in (("browser", search_browser), ("stealth", search_stealth)):
+        try:
+            results = await validated_search_results(await search(url, req.max_results))
+            if results:
+                return {
+                    "ok": True,
+                    "provider": "bing-browser-fallback",
+                    "via": route,
+                    "results": results,
+                }
+            attempts.append(f"{route}: no organic results")
+        except Exception as error:
+            attempts.append(f"{route}: {type(error).__name__}: {error}")
+    return {
+        "ok": False,
+        "provider": "bing-browser-fallback",
+        "results": [],
+        "error": "; ".join(attempts),
     }
 
 
 @app.post("/fetch")
 async def fetch(req: FetchRequest):
     try:
-        if req.mode == "static":
+        if req.public_only and req.mode not in {"auto", "static"}:
+            raise UnsafeUrlError("public_only automatic reads are static-only")
+        if req.public_only or req.mode == "static":
             out = await fetch_static(req)
         elif req.mode == "browser":
             out = await fetch_browser(req)
         elif req.mode == "stealth":
             out = await fetch_stealth(req)
         else:  # auto
+            static_error = None
             try:
                 out = await fetch_static(req)
-                if len(out["markdown"]) < STATIC_MIN_CHARS:
-                    out = await fetch_browser(req)
-            except Exception as static_error:
+            except Exception as error:
+                static_error = error
                 logger.debug("static fetch failed url=%s error=%s", req.url, static_error)
+
+            if static_error is not None or len(out["markdown"]) < STATIC_MIN_CHARS:
                 try:
                     out = await fetch_browser(req)
                 except Exception as browser_error:
-                    if not is_antibot_error(static_error) and not is_antibot_error(browser_error):
+                    if not is_antibot_error(static_error or "") and not is_antibot_error(browser_error):
                         raise
                     out = await fetch_stealth(req)
         md, truncated = truncate(out["markdown"], req.max_chars)

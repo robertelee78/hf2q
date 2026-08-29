@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# The literal contract assertions intentionally use single quotes around strings
+# containing shell metacharacters so that the test checks bytes, not expansion.
+# shellcheck disable=SC2016
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -81,6 +84,12 @@ require_literal "$guide" "web_search"
 require_literal "$guide" "web_fetch"
 require_literal "$guide" "web_crawl"
 require_literal "$guide" "web_extract"
+require_literal "$guide" "/search"
+require_literal "$guide" "bing-browser-fallback"
+require_literal "$guide" "WEB_SEARCH_FAILED"
+require_literal "$guide" "today's gold price"
+require_literal "$guide" "wrote Unicornscan"
+require_literal "$guide" "IOActive"
 require_literal "$guide" "--status"
 
 # --- The guide must not reintroduce the slop it replaced ---
@@ -127,8 +136,13 @@ for asset in \
     web-search-fetch.js \
     server.py \
     stealth_fetch.py \
+    egress_guard.py \
+    search_fallback.py \
     requirements.txt \
     test_server.py \
+    test_egress_guard.py \
+    test_search_fallback.py \
+    search-command.md \
     searxng-settings.yml
 do
     [[ -s "$assets/$asset" ]] || fail "missing web-stack asset: $asset"
@@ -138,6 +152,15 @@ reject_literal "$assets/searxng-settings.yml" 'bce60a2c2f73acf96d64eac04a6591d04
 require_literal "$assets/web-search-fetch.js" 'webfetch: false'
 require_literal "$assets/web-search-fetch.js" 'webfetch: "deny"'
 require_literal "$assets/web-search-fetch.js" 'normalizeJsonCssSchema'
+require_literal "$assets/web-search-fetch.js" 'bing,google,duckduckgo,mojeek'
+require_literal "$assets/web-search-fetch.js" 'public_only: true'
+require_literal "$assets/web-search-fetch.js" '/search-fallback'
+require_literal "$assets/web-search-fetch.js" 'resultsLookRelevant'
+require_literal "$assets/server.py" '@app.post("/search-fallback")'
+require_literal "$assets/server.py" 'stealth_installed'
+require_literal "$assets/egress_guard.py" 'trust_env=False'
+require_literal "$assets/egress_guard.py" 'sni_hostname'
+require_literal "$assets/search-command.md" 'Call `web_search` exactly once'
 reject_literal "$assets/web-search-fetch.js" '"*": false'
 require_literal "$installer" 'SEARX_SETUPTOOLS_VERSION="84.0.0"'
 require_literal "$installer" '"setuptools==$SEARX_SETUPTOOLS_VERSION"'
@@ -150,6 +173,11 @@ require_literal "$installer" 'uv pip check --python "$SEARX_DIR/.venv/bin/python
 require_literal "$installer" 'BROWSER_SETUP_MARKER'
 require_literal "$installer" 'LEGACY_BACKUPS'
 require_literal "$installer" "BACKUP_DIR=\"\$FETCH_DIR/backups/\$BACKUP_TAG\""
+require_literal "$installer" 'COMMAND_PATH="$COMMAND_DIR/search.md"'
+require_literal "$installer" 'Functional search gate failed'
+require_literal "$installer" 'who wrote unicornscan'
+require_literal "$installer" 'tell me about the company IOActive'
+require_literal "$installer" 'Installation failed closed'
 
 bash -n "$installer"
 bash "$repo_root/scripts/test_opencode_web_stack_lifecycle.sh"
@@ -165,7 +193,13 @@ cleanup() {
 trap cleanup EXIT
 
 PYTHONPYCACHEPREFIX="$pycache_dir" python3 -m py_compile \
-    "$assets/server.py" "$assets/stealth_fetch.py" "$assets/test_server.py"
+    "$assets/server.py" \
+    "$assets/stealth_fetch.py" \
+    "$assets/egress_guard.py" \
+    "$assets/search_fallback.py" \
+    "$assets/test_server.py" \
+    "$assets/test_egress_guard.py" \
+    "$assets/test_search_fallback.py"
 
 awk '
     /^```bash$/ { in_shell = 1; next }

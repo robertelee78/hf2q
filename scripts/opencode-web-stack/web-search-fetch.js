@@ -58,8 +58,35 @@ const JUNK_DOMAINS = new Set([
   "wattpad.com",
 ]);
 
+const QUERY_STOP_WORDS = new Set([
+  "about",
+  "company",
+  "current",
+  "does",
+  "for",
+  "from",
+  "how",
+  "into",
+  "latest",
+  "please",
+  "tell",
+  "that",
+  "the",
+  "their",
+  "this",
+  "today",
+  "what",
+  "when",
+  "where",
+  "which",
+  "who",
+  "why",
+  "with",
+  "wrote",
+]);
+
 const BETTER_ENGINES = {
-  general: "google,duckduckgo,mojeek,yahoo",
+  general: "bing,google,duckduckgo,mojeek",
   academic: "arxiv,google scholar,semantic scholar,pubmed,crossref,openalex",
   tech: "github,stackoverflow,mdn,docker hub,arch linux wiki,gentoo",
   news: "google,duckduckgo,mastodon hashtags",
@@ -90,6 +117,22 @@ function dedupByUrl(results) {
     }
   }
   return out;
+}
+
+function significantQueryTerms(query) {
+  return [...new Set(query.toLowerCase().match(/[a-z0-9][a-z0-9.+#-]*/g) || [])].filter(
+    (term) => term.length >= 3 && !QUERY_STOP_WORDS.has(term),
+  );
+}
+
+export function resultsLookRelevant(query, results) {
+  const terms = significantQueryTerms(query);
+  if (!terms.length) return true;
+  return results.slice(0, 5).some((result) => {
+    const evidence = `${result.title || ""} ${result.url || ""} ${result.content || ""}`.toLowerCase();
+    const matched = terms.filter((term) => evidence.includes(term)).length;
+    return matched === terms.length || (terms.length >= 3 && matched / terms.length >= 0.67);
+  });
 }
 
 async function postJSON(url, body, timeoutMs) {
@@ -124,27 +167,99 @@ function commaList(value) {
   return values.length ? values : undefined;
 }
 
-async function searchExecute(args) {
+function primaryFailures(data) {
+  return (data?.unresponsive_engines || []).map((failure) =>
+    Array.isArray(failure) ? `${failure[0]}: ${failure[1]}` : String(failure),
+  );
+}
+
+function mayUseDiscoveryFallback(args) {
+  return !args.engines && (!args.category || args.category === "general") && !args.time_range;
+}
+
+export async function searchExecute(args) {
   const pages = Math.min(Math.max(Math.trunc(args.pages ?? 2), 1), 3);
   const excerpt = Math.min(Math.max(Math.trunc(args.excerpt_chars ?? 4000), 500), 8000);
   try {
     const engines = args.engines || BETTER_ENGINES[args.category] || BETTER_ENGINES.general;
-    const data = await searx(args.query, {
-      time_range: args.time_range,
-      engines,
-      language: args.language,
-    });
-    const results = dedupByUrl(data.results || [])
+    let data;
+    let primaryError;
+    try {
+      data = await searx(args.query, {
+        time_range: args.time_range,
+        engines,
+        language: args.language,
+      });
+    } catch (error) {
+      primaryError = error;
+      data = { results: [], unresponsive_engines: [] };
+    }
+
+    let results = dedupByUrl(data.results || [])
       .filter((r) => !isJunkUrl(r.url))
       .slice(0, pages);
-    if (!results.length) return `No search results for: ${args.query}`;
+    let route = "SearXNG primary";
+    let fallbackError;
+    let qualityError = results.length && !resultsLookRelevant(args.query, results)
+      ? "SearXNG results failed the query-term relevance gate"
+      : null;
+    if ((!results.length || qualityError) && mayUseDiscoveryFallback(args)) {
+      try {
+        const fallback = await postJSON(
+          `${FETCH}/search-fallback`,
+          {
+            query: args.query,
+            language: args.language,
+            max_results: pages,
+          },
+          FETCH_TIMEOUT_MS,
+        );
+        if (fallback.ok) {
+          const fallbackResults = dedupByUrl(fallback.results || [])
+            .filter((result) => !isJunkUrl(result.url))
+            .slice(0, pages);
+          if (resultsLookRelevant(args.query, fallbackResults)) {
+            results = fallbackResults;
+            qualityError = null;
+            route = `${fallback.provider || "browser fallback"} via ${fallback.via || "unknown"}`;
+          } else {
+            fallbackError = "returned no query-relevant organic results";
+          }
+        } else {
+          fallbackError = fallback.error || "no validated organic results";
+        }
+      } catch (error) {
+        fallbackError = error.message;
+      }
+    }
+
+    if (qualityError) results = [];
+
+    if (!results.length) {
+      const failures = primaryFailures(data);
+      if (primaryError || failures.length || fallbackError || qualityError) {
+        const details = [
+          primaryError ? `SearXNG: ${primaryError.message}` : null,
+          failures.length ? `engines: ${failures.join(", ")}` : null,
+          qualityError,
+          fallbackError ? `fallback: ${fallbackError}` : null,
+          !mayUseDiscoveryFallback(args) ? "fallback skipped to preserve explicit constraints" : null,
+        ].filter(Boolean);
+        return `WEB_SEARCH_FAILED for "${args.query}": ${details.join("; ")}. Do not guess URLs.`;
+      }
+      return `No search results for: ${args.query} (SearXNG reported no engine failures)`;
+    }
     const sections = await Promise.all(
       results.map(async (result, index) => {
         const engines = (result.engines || [result.engine]).filter(Boolean).join(",");
         const date = result.publishedDate ? ` (${result.publishedDate.slice(0, 10)})` : "";
         const searchEvidence = clip(result.content, 500);
         try {
-          const page = await fetchPage(result.url, { mode: "auto", max_chars: excerpt });
+          const page = await fetchPage(result.url, {
+            mode: "static",
+            max_chars: excerpt,
+            public_only: true,
+          });
           const body = page.ok ? clip(page.markdown, excerpt) : `(page read failed: ${page.error})`;
           return `## Source ${index + 1}: ${result.title}${date}\n${result.url} [${engines}]\n\nSearch excerpt: ${searchEvidence}\n\n${body}`;
         } catch (error) {
@@ -152,7 +267,7 @@ async function searchExecute(args) {
         }
       }),
     );
-    return `# Web research: "${args.query}"\n\n${sections.join("\n\n---\n\n")}`;
+    return `# Web research: "${args.query}"\nSearch route: ${route}\n\n${sections.join("\n\n---\n\n")}`;
   } catch (error) {
     return `WEB_SEARCH_FAILED: ${error.message}. Do not guess URLs or retry with web_fetch.`;
   }
@@ -274,7 +389,7 @@ async function extractExecute(args) {
   }
 }
 
-async function searx(query, opts = {}) {
+export async function searx(query, opts = {}) {
   const params = new URLSearchParams({ q: query, format: "json" });
   if (opts.categories) params.set("categories", opts.categories);
   if (opts.engines) params.set("engines", opts.engines);
@@ -284,17 +399,7 @@ async function searx(query, opts = {}) {
     signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} from SearXNG`);
-  const data = await res.json();
-  // If the requested engines were all rate-limited and returned nothing,
-  // retry once with the broad engine set before giving up.
-  if (!(data.results || []).length && opts.engines && opts.engines !== BETTER_ENGINES.general) {
-    params.delete("engines");
-    const retry = await fetch(`${SEARXNG}/search?${params}`, {
-      signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
-    });
-    if (retry.ok) return retry.json();
-  }
-  return data;
+  return res.json();
 }
 
 async function fetchPage(url, opts = {}) {
@@ -305,6 +410,7 @@ async function fetchPage(url, opts = {}) {
       mode: opts.mode || "auto",
       css_selector: opts.css_selector,
       max_chars: opts.max_chars,
+      public_only: opts.public_only ?? false,
     },
     FETCH_TIMEOUT_MS,
   );
@@ -336,7 +442,8 @@ export default async function webSearchFetch() {
       web_search: tool({
         description:
           "Canonical front door for every request to search, research, find, look up, or get current web information. " +
-          "Searches via local SearXNG, then reads the top pages in parallel via local Crawl4AI. " +
+          "Searches via local SearXNG, rejects irrelevant result sets, uses one bounded browser discovery fallback when needed, " +
+          "then reads the top public pages through the guarded static path with route and engine provenance. " +
           "Always call this before web_fetch; never guess a URL. One call should normally complete the research.",
         args: {
           query: tool.schema.string().describe("The search or research query"),
@@ -429,8 +536,8 @@ export default async function webSearchFetch() {
       WebSearch: tool({
         description:
           "Alias of web_search. Canonical front door for every request to search, research, find, look up, or get " +
-          "current web information. Searches via local SearXNG, then reads the top pages in parallel via local " +
-          "Crawl4AI. Always call this before WebFetch; never guess a URL.",
+          "current web information. Uses local SearXNG, relevance validation, a bounded browser discovery fallback, " +
+          "and guarded public page reads with provenance. Always call this before WebFetch; never guess a URL.",
         args: {
           query: tool.schema.string().describe("The search or research query"),
           category: tool.schema
