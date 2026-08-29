@@ -47,6 +47,51 @@ if (!mod.resultsLookRelevant("tell me about the company IOActive", [
 if (mod.resultsLookRelevant("who wrote unicornscan", [
   {title: "WROTE Definition", url: "https://dictionary.example/wrote", content: "past tense"},
 ])) throw new Error("Unicornscan relevance false positive");
+const laptopGoldJunk = [
+  {
+    title: "Price.com: Save with Cash Back, Coupons & Price Comparison",
+    url: "https://price.com/",
+    content: "Offers for more than 100,000 brands.",
+  },
+  {
+    title: "Home - Price Industries",
+    url: "https://priceindustries.com/",
+    content: "A market leader in supplying air distribution products.",
+  },
+  {
+    title: "Priceline.com - Hotels, Flights and Rental Cars",
+    url: "https://www.priceline.com/",
+    content: "Members get our best travel price.",
+  },
+];
+if (mod.resultsLookRelevant("what is the price of gold today", laptopGoldJunk)) {
+  throw new Error("exact laptop junk passed relevance");
+}
+if (mod.resultsLookRelevant("what is the price of gold today", [{
+  title: "Goldman Sachs market outlook",
+  url: "https://example.com/goldman-outlook",
+  content: "Current equity prices",
+}])) throw new Error("substring matched gold without a token boundary");
+if (!mod.resultsLookRelevant("what is the price of gold today", [{
+  title: "Gold prices today",
+  url: "https://example.com/metals",
+  content: "Latest bullion quote",
+}])) throw new Error("plural prices did not match singular price query term");
+if (!mod.resultsLookRelevant("what are the prices of gold today", [{
+  title: "Gold price today",
+  url: "https://example.com/metals",
+  content: "Latest bullion quote",
+}])) throw new Error("singular price did not match plural prices query term");
+if (!mod.resultsLookRelevant("rust async runtime", [{
+  title: "Rust runtime design",
+  url: "https://example.com/runtime",
+  content: "A systems guide",
+}])) throw new Error("two of three query terms did not satisfy the intended threshold");
+if (mod.resultsLookRelevant("who", [{
+  title: "Anything",
+  url: "https://example.com/",
+  content: "",
+}])) throw new Error("query without identifying terms did not fail closed");
 
 const response = (payload, ok = true, status = 200) => ({
   ok,
@@ -100,6 +145,56 @@ if (!output.includes("[bing-browser-fallback]")) throw new Error(output);
 if (calls.filter(({url}) => url.endsWith("/search-fallback")).length !== 1) {
   throw new Error("forced outage did not make exactly one fallback request");
 }
+
+calls = [];
+globalThis.fetch = async (url) => {
+  calls.push({url: String(url)});
+  if (String(url).includes(":8888/search")) {
+    return response({results: laptopGoldJunk, unresponsive_engines: []});
+  }
+  if (String(url).endsWith("/search-fallback")) {
+    return response({
+      ok: true,
+      provider: "bing-browser-fallback",
+      via: "browser",
+      results: laptopGoldJunk,
+    });
+  }
+  if (String(url).endsWith("/fetch")) throw new Error("irrelevant laptop URL was fetched");
+  throw new Error(`unexpected URL ${url}`);
+};
+output = await mod.searchExecute({query: "what is the price of gold today", pages: 3});
+if (!output.includes("WEB_SEARCH_FAILED")) throw new Error(output);
+if (!output.includes("Do not guess URLs")) throw new Error(output);
+if (output.includes("Price.com") || output.includes("Priceline")) throw new Error(output);
+
+calls = [];
+globalThis.fetch = async (url, options = {}) => {
+  calls.push({url: String(url), options});
+  if (String(url).includes(":8888/search")) {
+    return response({
+      results: [
+        laptopGoldJunk[0],
+        {
+          title: "Gold Price Today",
+          url: "https://www.kitco.com/charts/gold",
+          content: "Live gold price per ounce.",
+          engines: ["bing"],
+        },
+      ],
+      unresponsive_engines: [],
+    });
+  }
+  if (String(url).endsWith("/fetch")) {
+    const body = JSON.parse(options.body);
+    if (body.url !== "https://www.kitco.com/charts/gold") throw new Error(options.body);
+    return response({ok: true, url: body.url, markdown: "Gold price evidence", via: "static"});
+  }
+  throw new Error(`unexpected URL ${url}`);
+};
+output = await mod.searchExecute({query: "what is the price of gold today", pages: 3});
+if (!output.includes("Gold Price Today") || output.includes("Price.com")) throw new Error(output);
+if (calls.some(({url}) => url.endsWith("/search-fallback"))) throw new Error("fallback ran despite relevant primary result");
 
 calls = [];
 globalThis.fetch = async (url, options = {}) => {

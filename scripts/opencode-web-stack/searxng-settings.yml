@@ -165,7 +165,7 @@ engines:
     inactive: false
   - name: yahoo
     weight: 1.0
-    disabled: false
+    disabled: true
     inactive: false
   - name: mojeek
     weight: 1.0

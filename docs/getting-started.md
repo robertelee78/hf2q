@@ -207,8 +207,8 @@ This gives OpenCode a visible `/search QUERY` command plus `web_search`,
 `web_fetch`, `web_crawl`, and `web_extract` (and capitalized aliases), backed
 by local SearXNG and fetch services. Both
 services bind to `127.0.0.1` only, restart automatically at login, and need
-no API keys. Google Chrome is required for JavaScript page reads and the one
-bounded browser-discovery attempt used when SearXNG produces no usable URLs:
+no API keys. Google Chrome is required for JavaScript page reads and the
+bounded discovery cascade used when SearXNG produces no usable URLs:
 
 ```bash
 if [ ! -d '/Applications/Google Chrome.app' ]; then
@@ -226,17 +226,19 @@ verifies a current fact (today's gold price), an obscure attribution (who
 wrote Unicornscan), and company research (IOActive) before activating the
 OpenCode assets. A result counts only when its title, URL, or excerpt contains
 the query's identifying term; unrelated URLs fail the gate. If both SearXNG
-and the bounded browser route fail, the installer exits nonzero,
+and the bounded fallback cascade fail, the installer exits nonzero,
 stops the managed services, and does not activate a new plugin or command.
 A successful run is the installation proof. Restart OpenCode once afterward
 so it loads the plugin and `/search` command.
 
-The browser route is a best-effort discovery fallback, not a promise to solve
-every search-engine CAPTCHA. Success requires parsed organic results, and all
-results identify either their SearXNG engines or
-`bing-browser-fallback`. Automatic page reads are limited to public HTTP(S)
-targets and revalidate every redirect; a blocked page read leaves the search
-excerpt and source URL intact.
+The fallback is a best-effort, fixed-provider cascade, not a promise to solve
+every search-engine CAPTCHA. It tries guarded static Brave results
+(`brave-search-fallback`), guarded Bing RSS (`bing-rss-fallback`), and only
+then bounded Bing browser/stealth transport (`bing-browser-fallback`). The
+service accepts only query-relevant parsed organic results and validates every
+result URL before reporting success. Automatic page reads are limited to
+public HTTP(S) targets and revalidate every redirect; a blocked page read
+leaves the search excerpt and source URL intact.
 
 ## 10. Use the full stack
 

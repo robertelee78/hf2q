@@ -29,6 +29,7 @@ chmod 0755 "$fake_bin/launchctl"
 
 cat > "$fake_bin/curl" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "$HOME/curl.calls"
 case "$*" in
     *127.0.0.1:11235/healthz*)
         printf '%s\n' '{"ok":true,"browser_warm":true,"stealth_installed":true}'
@@ -38,7 +39,9 @@ case "$*" in
         ;;
     *127.0.0.1:11235/search-fallback*)
         if [[ "${FAKE_FALLBACK_OK:-0}" -eq 1 ]]; then
-            printf '%s\n' '{"ok":true,"provider":"bing-browser-fallback","via":"browser","results":[{"title":"About Unicornscan","url":"https://unicornscan.org/about"}]}'
+            printf '%s\n' '{"ok":true,"provider":"brave-search-fallback","via":"guarded-static","results":[{"title":"About Unicornscan","url":"https://unicornscan.org/about"}]}'
+        elif [[ "${FAKE_FALLBACK_OK:-0}" -eq 2 ]]; then
+            printf '%s\n' '{"ok":true,"provider":"bing-rss-fallback","via":"guarded-static","results":[{"title":"Unicornscanner product page","url":"https://example.com/scanner"}]}'
         else
             printf '%s\n' '{"ok":false,"error":"forced failure","results":[]}'
         fi
@@ -74,11 +77,18 @@ if HOME="$test_home" PATH="$fake_bin:$PATH" "$installer" --status >"$test_root/s
     echo "status accepted a broken primary and fallback" >&2
     exit 1
 fi
-grep -Fq "browser discovery fallback: FAILED" "$test_root/status-failed"
+grep -Fq "fixed-provider discovery fallback: FAILED" "$test_root/status-failed"
 HOME="$test_home" PATH="$fake_bin:$PATH" FAKE_FALLBACK_OK=1 \
     "$installer" --status >"$test_root/status-fallback"
-grep -Fq "browser discovery fallback: 1 results via browser" "$test_root/status-fallback"
+grep -Fq "fixed-provider discovery fallback: 1 results via brave-search-fallback/guarded-static" "$test_root/status-fallback"
+grep -Fq "engines=bing,google,duckduckgo,mojeek" "$test_home/curl.calls"
 grep -Fq "status: healthy" "$test_root/status-fallback"
+if HOME="$test_home" PATH="$fake_bin:$PATH" FAKE_FALLBACK_OK=2 \
+    "$installer" --status >"$test_root/status-substring" 2>&1; then
+    echo "status accepted a substring-only Unicornscan match" >&2
+    exit 1
+fi
+grep -Fq "fixed-provider discovery fallback: FAILED" "$test_root/status-substring"
 
 HOME="$test_home" PATH="$fake_bin:$PATH" "$installer" --disable >/dev/null
 [[ ! -e "$plugin" ]]
