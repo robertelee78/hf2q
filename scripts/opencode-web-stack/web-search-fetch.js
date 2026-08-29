@@ -126,12 +126,48 @@ function significantQueryTerms(query) {
 }
 
 export function resultsLookRelevant(query, results) {
+  return filterRelevantResults(query, results).length > 0;
+}
+
+function evidenceContainsTerm(evidence, term) {
+  return termVariants(term).some((variant) => {
+    const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, "i").test(evidence);
+  });
+}
+
+function termVariants(term) {
+  const variants = new Set([term]);
+  if (term.length > 4 && term.endsWith("ies")) {
+    variants.add(`${term.slice(0, -3)}y`);
+  } else if (["ches", "shes", "sses", "xes", "zes"].some((suffix) => term.endsWith(suffix))) {
+    variants.add(term.slice(0, -2));
+  } else if (term.length > 3 && term.endsWith("es")) {
+    variants.add(term.slice(0, -1));
+  } else if (
+    term.length > 3 &&
+    term.endsWith("s") &&
+    !["ss", "is", "us"].some((suffix) => term.endsWith(suffix)) &&
+    !["news", "series", "species"].includes(term)
+  ) {
+    variants.add(term.slice(0, -1));
+  } else if (term.endsWith("y") && term.length > 1 && !"aeiou".includes(term[term.length - 2])) {
+    variants.add(`${term.slice(0, -1)}ies`);
+  } else if (["s", "x", "z", "ch", "sh"].some((suffix) => term.endsWith(suffix))) {
+    variants.add(`${term}es`);
+  } else if (!["is", "us"].some((suffix) => term.endsWith(suffix))) {
+    variants.add(`${term}s`);
+  }
+  return [...variants];
+}
+
+export function filterRelevantResults(query, results) {
   const terms = significantQueryTerms(query);
-  if (!terms.length) return true;
-  return results.slice(0, 5).some((result) => {
+  if (!terms.length) return [];
+  return results.filter((result) => {
     const evidence = `${result.title || ""} ${result.url || ""} ${result.content || ""}`.toLowerCase();
-    const matched = terms.filter((term) => evidence.includes(term)).length;
-    return matched === terms.length || (terms.length >= 3 && matched / terms.length >= 0.67);
+    const matched = terms.filter((term) => evidenceContainsTerm(evidence, term)).length;
+    return matched === terms.length || (terms.length >= 3 && matched * 3 >= terms.length * 2);
   });
 }
 
@@ -195,12 +231,11 @@ export async function searchExecute(args) {
       data = { results: [], unresponsive_engines: [] };
     }
 
-    let results = dedupByUrl(data.results || [])
-      .filter((r) => !isJunkUrl(r.url))
-      .slice(0, pages);
+    const primaryCandidates = dedupByUrl(data.results || []).filter((r) => !isJunkUrl(r.url));
+    let results = filterRelevantResults(args.query, primaryCandidates).slice(0, pages);
     let route = "SearXNG primary";
     let fallbackError;
-    let qualityError = results.length && !resultsLookRelevant(args.query, results)
+    let qualityError = primaryCandidates.length && !results.length
       ? "SearXNG results failed the query-term relevance gate"
       : null;
     if ((!results.length || qualityError) && mayUseDiscoveryFallback(args)) {
@@ -215,10 +250,11 @@ export async function searchExecute(args) {
           FETCH_TIMEOUT_MS,
         );
         if (fallback.ok) {
-          const fallbackResults = dedupByUrl(fallback.results || [])
-            .filter((result) => !isJunkUrl(result.url))
-            .slice(0, pages);
-          if (resultsLookRelevant(args.query, fallbackResults)) {
+          const fallbackCandidates = dedupByUrl(fallback.results || []).filter(
+            (result) => !isJunkUrl(result.url),
+          );
+          const fallbackResults = filterRelevantResults(args.query, fallbackCandidates).slice(0, pages);
+          if (fallbackResults.length) {
             results = fallbackResults;
             qualityError = null;
             route = `${fallback.provider || "browser fallback"} via ${fallback.via || "unknown"}`;
@@ -442,7 +478,7 @@ export default async function webSearchFetch() {
       web_search: tool({
         description:
           "Canonical front door for every request to search, research, find, look up, or get current web information. " +
-          "Searches via local SearXNG, rejects irrelevant result sets, uses one bounded browser discovery fallback when needed, " +
+          "Searches via local SearXNG, rejects irrelevant result sets, uses one bounded fixed-provider discovery cascade when needed, " +
           "then reads the top public pages through the guarded static path with route and engine provenance. " +
           "Always call this before web_fetch; never guess a URL. One call should normally complete the research.",
         args: {
@@ -536,7 +572,7 @@ export default async function webSearchFetch() {
       WebSearch: tool({
         description:
           "Alias of web_search. Canonical front door for every request to search, research, find, look up, or get " +
-          "current web information. Uses local SearXNG, relevance validation, a bounded browser discovery fallback, " +
+          "current web information. Uses local SearXNG, relevance validation, a bounded fixed-provider discovery cascade, " +
           "and guarded public page reads with provenance. Always call this before WebFetch; never guess a URL.",
         args: {
           query: tool.schema.string().describe("The search or research query"),

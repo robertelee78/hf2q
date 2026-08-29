@@ -6,9 +6,10 @@
   plus explicit purge landed the same day; the issue-146 guide contract was
   corrected after a post-landing regression review; installed completion
   ownership was restored on 2026-08-21 and managed-model completion scope was
-  corrected on 2026-08-22; distinct-account proof remains
+  corrected on 2026-08-22; the issue-181 search fallback was corrected after
+  a second-host portability failure on 2026-08-28; distinct-account proof remains
 - Date: 2026-08-17
-- Updated: 2026-08-22
+- Updated: 2026-08-28
 - Owners: hf2q release engineering and operator experience
 - Related: `docs/shipping-contract.md`,
   `docs/adr/diary/ADR-005-inference-server.md`,
@@ -374,13 +375,29 @@ fallback results. The live installation matrix covers a current fact, an obscure
 attribution, and company research so a search engine returning unrelated popular
 pages cannot satisfy onboarding.
 
+The first implementation passed its three live probes on the development host
+but failed on a second Mac: DuckDuckGo returned a CAPTCHA, Yahoo returned a
+protocol error, and the nominal Bing fallback returned Price.com, Price
+Industries, and Priceline for the gold-price query. The fail-closed activation
+gate behaved correctly, but the fallback was not portable because its browser
+and stealth routes were two transports to the same evidence origin and the
+service itself treated any structurally safe nonempty result as success.
+
 For an unconstrained general query only, the fetch service may make one bounded
-fixed-origin browser discovery attempt after the primary route errors or returns
-no usable URLs. The caller cannot supply that fallback's URL. Success requires
-parsed, validated organic results with explicit fallback provenance; an HTTP 200,
-installed stealth package, consent wall, or CAPTCHA page is not success. This is
-a best-effort transport fallback and not a claim that the stack solves every
-CAPTCHA or provides an independent network failure domain.
+fixed-provider discovery cascade after the primary route errors or returns no
+usable URLs. The ordered providers are Brave's static search page, Bing RSS,
+and Bing browser followed by stealth transport. The caller supplies only the
+query and optional language, never a provider URL. Each route uses a focused
+query, explicit provenance, public-target validation, and server-side
+query-term relevance filtering before it may return `ok: true`; the plugin
+repeats the relevance filter as a defense in depth. The entire worst-case
+cascade remains below the plugin's 150-second deadline.
+
+An HTTP 200, installed stealth package, consent wall, CAPTCHA page, or unrelated
+popular result is not success. Brave supplies a genuinely different search
+origin from Bing, but the cascade is still a best-effort local-host fallback,
+not a claim that every CAPTCHA is solvable or that it provides an independent
+network failure domain.
 
 Search-discovered result URLs are untrusted. Automatic reads therefore use a
 server-enforced public-only static path: globally routable DNS answers only,

@@ -29,7 +29,17 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from egress_guard import UnsafeUrlError, guarded_get, resolve_public_target
-from search_fallback import build_bing_search_url, page_is_blocked, parse_bing_results
+from search_fallback import (
+    build_bing_rss_search_url,
+    build_bing_search_url,
+    build_brave_search_url,
+    filter_relevant_results,
+    focused_query,
+    page_is_blocked,
+    parse_bing_results,
+    parse_bing_rss_results,
+    parse_brave_results,
+)
 
 HOST = os.environ.get("FETCH_HOST", "127.0.0.1")
 PORT = int(os.environ.get("FETCH_PORT", "11235"))
@@ -61,6 +71,21 @@ STEALTH_HELPER = Path(__file__).with_name("stealth_fetch.py")
 STEALTH_RESULT_PREFIX = "OPENCODE_STEALTH_RESULT="
 STEALTH_MIN_TIMEOUT_SECONDS = 60
 STEALTH_TIMEOUT_GRACE_SECONDS = 15
+STATIC_SEARCH_TIMEOUT_SECONDS = 6
+STATIC_SEARCH_ROUTE_TIMEOUT_SECONDS = 7
+BROWSER_SEARCH_TIMEOUT_SECONDS = 25
+BROWSER_SEARCH_ROUTE_TIMEOUT_SECONDS = 27
+SEARCH_RESULT_DNS_TIMEOUT_SECONDS = 3
+SEARCH_STEALTH_TIMEOUT_SECONDS = 60
+SEARCH_CANDIDATE_LIMIT = 10
+SEARCH_FALLBACK_WORST_CASE_SECONDS = (
+    2 * (STATIC_SEARCH_ROUTE_TIMEOUT_SECONDS + SEARCH_RESULT_DNS_TIMEOUT_SECONDS)
+    + BROWSER_SEARCH_ROUTE_TIMEOUT_SECONDS
+    + SEARCH_RESULT_DNS_TIMEOUT_SECONDS
+    + max(SEARCH_STEALTH_TIMEOUT_SECONDS, STEALTH_MIN_TIMEOUT_SECONDS)
+    + STEALTH_TIMEOUT_GRACE_SECONDS
+    + SEARCH_RESULT_DNS_TIMEOUT_SECONDS
+)
 
 
 class AntiBotError(RuntimeError):
@@ -284,7 +309,7 @@ async def search_browser(url: str, max_results: int) -> list[dict]:
     crawler = await get_crawler()
     config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,
-        page_timeout=45_000,
+        page_timeout=BROWSER_SEARCH_TIMEOUT_SECONDS * 1000,
         word_count_threshold=0,
     )
     result = await crawler.arun(url=url, config=config)
@@ -299,21 +324,52 @@ async def search_browser(url: str, max_results: int) -> list[dict]:
 async def search_stealth(url: str, max_results: int) -> list[dict]:
     payload = await run_stealth_helper(
         {"operation": "search", "url": url, "max_results": max_results},
-        75,
+        SEARCH_STEALTH_TIMEOUT_SECONDS,
     )
     return payload.get("results", [])
 
 
+async def search_static(url: str, parser, max_results: int) -> list[dict]:
+    response = await guarded_get(
+        url,
+        timeout=STATIC_SEARCH_TIMEOUT_SECONDS,
+        headers={
+            "Accept": "text/html,application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        },
+        max_redirects=2,
+        max_bytes=4 * 1024 * 1024,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    results = parser(response.text, max_results)
+    if not results and page_is_blocked(response.text):
+        raise AntiBotError("static search reached a CAPTCHA or consent interstitial")
+    return results
+
+
 async def validated_search_results(results: list[dict]) -> list[dict]:
-    validated = []
-    for result in results:
+    async def validate(result: dict) -> dict | None:
         try:
-            await asyncio.wait_for(resolve_public_target(result["url"]), timeout=5)
-        except (KeyError, UnsafeUrlError, OSError) as error:
+            await asyncio.wait_for(
+                resolve_public_target(result["url"]),
+                timeout=SEARCH_RESULT_DNS_TIMEOUT_SECONDS,
+            )
+        except (KeyError, UnsafeUrlError, OSError, TimeoutError) as error:
             logger.warning("discarding unsafe search result url=%r error=%s", result.get("url"), error)
-            continue
-        validated.append(result)
-    return validated
+            return None
+        return result
+
+    checked = await asyncio.gather(*(validate(result) for result in results))
+    return [result for result in checked if result is not None]
+
+
+async def relevant_public_results(
+    query: str, results: list[dict], max_results: int
+) -> list[dict]:
+    validated = await validated_search_results(results)
+    return filter_relevant_results(query, validated, max_results)
 
 
 @app.get("/healthz")
@@ -334,26 +390,68 @@ async def healthz():
 
 @app.post("/search-fallback")
 async def search_fallback(req: SearchFallbackRequest):
-    """One bounded, fixed-origin browser discovery attempt after SearXNG fails."""
+    """One bounded, fixed-provider discovery cascade after SearXNG fails."""
 
-    url = build_bing_search_url(req.query, req.language)
-    attempts = []
-    for route, search in (("browser", search_browser), ("stealth", search_stealth)):
+    strict_query = focused_query(req.query)
+    attempts: list[str] = []
+    static_plans = (
+        (
+            "brave-search-fallback",
+            build_brave_search_url(strict_query, req.language),
+            parse_brave_results,
+        ),
+        (
+            "bing-rss-fallback",
+            build_bing_rss_search_url(strict_query, req.language),
+            parse_bing_rss_results,
+        ),
+    )
+    for provider, url, parser in static_plans:
         try:
-            results = await validated_search_results(await search(url, req.max_results))
+            candidates = await asyncio.wait_for(
+                search_static(url, parser, SEARCH_CANDIDATE_LIMIT),
+                timeout=STATIC_SEARCH_ROUTE_TIMEOUT_SECONDS,
+            )
+            results = await relevant_public_results(req.query, candidates, req.max_results)
             if results:
                 return {
                     "ok": True,
-                    "provider": "bing-browser-fallback",
+                    "provider": provider,
+                    "via": "guarded-static",
+                    "results": results,
+                    "attempts": attempts,
+                }
+            attempts.append(f"{provider}: no query-relevant organic results")
+        except Exception as error:
+            attempts.append(f"{provider}: {type(error).__name__}: {error}")
+
+    bing_url = build_bing_search_url(strict_query, req.language)
+    for route, search in (("browser", search_browser), ("stealth", search_stealth)):
+        provider = "bing-browser-fallback"
+        try:
+            operation = search(bing_url, SEARCH_CANDIDATE_LIMIT)
+            candidates = (
+                await asyncio.wait_for(
+                    operation, timeout=BROWSER_SEARCH_ROUTE_TIMEOUT_SECONDS
+                )
+                if route == "browser"
+                else await operation
+            )
+            results = await relevant_public_results(req.query, candidates, req.max_results)
+            if results:
+                return {
+                    "ok": True,
+                    "provider": provider,
                     "via": route,
                     "results": results,
+                    "attempts": attempts,
                 }
-            attempts.append(f"{route}: no organic results")
+            attempts.append(f"{provider}/{route}: no query-relevant organic results")
         except Exception as error:
-            attempts.append(f"{route}: {type(error).__name__}: {error}")
+            attempts.append(f"{provider}/{route}: {type(error).__name__}: {error}")
     return {
         "ok": False,
-        "provider": "bing-browser-fallback",
+        "provider": "multi-provider-fallback",
         "results": [],
         "error": "; ".join(attempts),
     }

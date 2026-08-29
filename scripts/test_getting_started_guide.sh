@@ -86,6 +86,8 @@ require_literal "$guide" "web_crawl"
 require_literal "$guide" "web_extract"
 require_literal "$guide" "/search"
 require_literal "$guide" "bing-browser-fallback"
+require_literal "$guide" "brave-search-fallback"
+require_literal "$guide" "bing-rss-fallback"
 require_literal "$guide" "WEB_SEARCH_FAILED"
 require_literal "$guide" "today's gold price"
 require_literal "$guide" "wrote Unicornscan"
@@ -157,6 +159,9 @@ require_literal "$assets/web-search-fetch.js" 'public_only: true'
 require_literal "$assets/web-search-fetch.js" '/search-fallback'
 require_literal "$assets/web-search-fetch.js" 'resultsLookRelevant'
 require_literal "$assets/server.py" '@app.post("/search-fallback")'
+require_literal "$assets/server.py" 'build_brave_search_url'
+require_literal "$assets/server.py" 'build_bing_rss_search_url'
+require_literal "$assets/server.py" 'relevant_public_results'
 require_literal "$assets/server.py" 'stealth_installed'
 require_literal "$assets/egress_guard.py" 'trust_env=False'
 require_literal "$assets/egress_guard.py" 'sni_hostname'

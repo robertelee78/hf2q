@@ -44,6 +44,18 @@ LAUNCH_DIR="$HOME/Library/LaunchAgents"
 SEARX_PLIST="$LAUNCH_DIR/com.opencode.searxng.plist"
 FETCH_PLIST="$LAUNCH_DIR/com.opencode.crawl4ai.plist"
 USER_DOMAIN="gui/$(id -u)"
+GENERAL_SEARCH_ENGINES="bing,google,duckduckgo,mojeek"
+# `$needle` belongs to jq and must remain literal here.
+# shellcheck disable=SC2016
+FALLBACK_RESULT_FILTER='
+    .ok == true and (
+        ((.provider == "brave-search-fallback" or .provider == "bing-rss-fallback") and .via == "guarded-static") or
+        (.provider == "bing-browser-fallback" and (.via == "browser" or .via == "stealth"))
+    ) and any(.results[]?; (
+        ((.title // "") + " " + (.url // "") + " " + (.content // ""))
+        | ascii_downcase
+        | test("(^|[^a-z0-9])" + $needle + "([^a-z0-9]|$)")
+    ))'
 
 stop_services() {
     launchctl bootout "$USER_DOMAIN" "$SEARX_PLIST" >/dev/null 2>&1 || true
@@ -166,10 +178,11 @@ if [[ "$ACTION" == "status" ]]; then
         if SEARCH_JSON="$(curl --connect-timeout 2 --max-time 25 -fsS --get \
             http://127.0.0.1:8888/search \
             --data-urlencode "q=$SEARCH_QUERY" \
+            --data-urlencode "engines=$GENERAL_SEARCH_ENGINES" \
             --data 'format=json' 2>/dev/null)"; then
             RESULTS="$(echo "$SEARCH_JSON" | jq -r '.results | length')"
             RELEVANT="$(echo "$SEARCH_JSON" | jq -r --arg needle "$SEARCH_NEEDLE" \
-                'any(.results[:2][]?; (((.title // "") + " " + (.url // "") + " " + (.content // "")) | ascii_downcase | contains($needle)))')"
+                'any(.results[]?; (((.title // "") + " " + (.url // "") + " " + (.content // "")) | ascii_downcase | test("(^|[^a-z0-9])" + $needle + "([^a-z0-9]|$)")))')"
             echo "searxng live search: ${RESULTS:-0} results; query-relevant=$RELEVANT"
             if [[ ("${RESULTS:-0}" -eq 0 || "$RELEVANT" != "true") && "$FETCH_LOADED" -eq 1 ]]; then
                 FAILURES="$(echo "$SEARCH_JSON" | jq -c '.unresponsive_engines // []')"
@@ -179,11 +192,11 @@ if [[ "$ACTION" == "status" ]]; then
                     -X POST http://127.0.0.1:11235/search-fallback \
                     -H 'Content-Type: application/json' -d @- 2>/dev/null)" \
                     && echo "$FALLBACK_JSON" | jq -e --arg needle "$SEARCH_NEEDLE" \
-                        '.ok == true and .provider == "bing-browser-fallback" and any(.results[:2][]?; (((.title // "") + " " + (.url // "") + " " + (.content // "")) | ascii_downcase | contains($needle)))' \
+                        "$FALLBACK_RESULT_FILTER" \
                         >/dev/null; then
-                    echo "$FALLBACK_JSON" | jq -r '"browser discovery fallback: \(.results | length) results via \(.via)"'
+                    echo "$FALLBACK_JSON" | jq -r '"fixed-provider discovery fallback: \(.results | length) results via \(.provider)/\(.via)"'
                 else
-                    echo "browser discovery fallback: FAILED"
+                    echo "fixed-provider discovery fallback: FAILED"
                     STATUS_FAIL=1
                 fi
             elif [[ "${RESULTS:-0}" -eq 0 || "$RELEVANT" != "true" ]]; then
@@ -528,9 +541,10 @@ for index in 0 1 2; do
     if SEARCH_JSON="$(curl --connect-timeout 2 --max-time 25 -fsS --get \
         http://127.0.0.1:8888/search \
         --data-urlencode "q=$query" \
+        --data-urlencode "engines=$GENERAL_SEARCH_ENGINES" \
         --data 'format=json' 2>/dev/null)" \
         && echo "$SEARCH_JSON" | jq -e --arg needle "$needle" \
-            'any(.results[:2][]?; (((.title // "") + " " + (.url // "") + " " + (.content // "")) | ascii_downcase | contains($needle)))' \
+            'any(.results[]?; (((.title // "") + " " + (.url // "") + " " + (.content // "")) | ascii_downcase | test("(^|[^a-z0-9])" + $needle + "([^a-z0-9]|$)")))' \
             >/dev/null 2>&1; then
         FUNCTIONAL_OK=$((FUNCTIONAL_OK + 1))
         echo "functional search probe passed via SearXNG: $query"
@@ -544,10 +558,11 @@ for index in 0 1 2; do
         -X POST http://127.0.0.1:11235/search-fallback \
         -H 'Content-Type: application/json' -d @- 2>/dev/null || true)"
     if echo "$FALLBACK_JSON" | jq -e --arg needle "$needle" \
-        '.ok == true and .provider == "bing-browser-fallback" and any(.results[:2][]?; (((.title // "") + " " + (.url // "") + " " + (.content // "")) | ascii_downcase | contains($needle)))' \
+        "$FALLBACK_RESULT_FILTER" \
         >/dev/null 2>&1; then
         FUNCTIONAL_OK=$((FUNCTIONAL_OK + 1))
-        echo "functional search probe passed via browser fallback: $query"
+        FALLBACK_ROUTE="$(echo "$FALLBACK_JSON" | jq -r '.provider + "/" + .via')"
+        echo "functional search probe passed via fallback ($FALLBACK_ROUTE): $query"
     else
         echo "functional search probe FAILED: $query" >&2
         echo "Fallback response: ${FALLBACK_JSON:-unreachable}" >&2
