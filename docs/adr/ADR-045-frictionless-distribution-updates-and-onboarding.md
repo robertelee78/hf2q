@@ -359,6 +359,43 @@ projector digest
 The guide exercises both text and vision and does not treat a community
 checkpoint as an official upstream release.
 
+#### Research-stack reliability amendment (issue 181)
+
+The guide's optional local OpenCode research stack is accepted only when the
+installer proves usable discovery rather than process liveness. SearXNG remains
+the primary route with a curated multi-engine pool. Zero usable URLs accompanied
+by engine failures are an infrastructure failure, never a truthful "no results"
+answer, and an explicit engine, category, language, or time constraint is never
+silently discarded.
+
+Nonempty is not synonymous with useful. The runtime and installer apply a
+small deterministic query-term relevance gate before accepting primary or
+fallback results. The live installation matrix covers a current fact, an obscure
+attribution, and company research so a search engine returning unrelated popular
+pages cannot satisfy onboarding.
+
+For an unconstrained general query only, the fetch service may make one bounded
+fixed-origin browser discovery attempt after the primary route errors or returns
+no usable URLs. The caller cannot supply that fallback's URL. Success requires
+parsed, validated organic results with explicit fallback provenance; an HTTP 200,
+installed stealth package, consent wall, or CAPTCHA page is not success. This is
+a best-effort transport fallback and not a claim that the stack solves every
+CAPTCHA or provides an independent network failure domain.
+
+Search-discovered result URLs are untrusted. Automatic reads therefore use a
+server-enforced public-only static path: globally routable DNS answers only,
+validated and pinned connections with original TLS SNI/Host, proxy-environment
+isolation, standard web ports, no URL credentials, bounded bodies and redirects,
+and revalidation at every redirect hop. Browser and stealth fetches remain
+available for explicit user-directed URLs but are not automatic result readers
+until they can enforce an equivalent connect-time boundary.
+
+The installer activates the plugin and visible `/search` command only after the
+functional search gate passes. On a late failure it stops the managed services
+and exits nonzero. `--status` likewise exits nonzero when neither the primary nor
+bounded fallback returns a usable result; package import is reported as
+`stealth_installed`, not as proof of anti-bot capability.
+
 ### 5. Make `hf2q update` honor the installation channel
 
 `hf2q update` is the universal operator-facing update command, but it does not

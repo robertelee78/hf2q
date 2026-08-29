@@ -1,6 +1,8 @@
 crawl4ai==0.9.2
+cssselect==1.5.0
 fastapi==0.141.1
 httpx==0.28.1
+lxml==6.1.1
 patchright==1.62.1
 scrapling[fetchers]==0.4.14
 trafilatura==2.2.0

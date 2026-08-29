@@ -203,11 +203,12 @@ and OpenCode convergence as healthy.
 
 ## 9. Install the local research stack
 
-This gives the agent `web_search`, `web_fetch`, `web_crawl`, and `web_extract`
-(plus capitalized aliases) backed by local SearXNG and fetch services. Both
+This gives OpenCode a visible `/search QUERY` command plus `web_search`,
+`web_fetch`, `web_crawl`, and `web_extract` (and capitalized aliases), backed
+by local SearXNG and fetch services. Both
 services bind to `127.0.0.1` only, restart automatically at login, and need
-no API keys. Google Chrome is required for the JavaScript and anti-bot fetch
-fallbacks:
+no API keys. Google Chrome is required for JavaScript page reads and the one
+bounded browser-discovery attempt used when SearXNG produces no usable URLs:
 
 ```bash
 if [ ! -d '/Applications/Google Chrome.app' ]; then
@@ -221,8 +222,21 @@ curl -fsSL \
 
 If `brew` is missing, install Chrome from <https://www.google.com/chrome/>
 first. The installer pins every dependency, backs up changed files, and
-verifies the services live before exiting — a successful run is the
-installation proof. Restart OpenCode once afterward so it loads the plugin.
+verifies a current fact (today's gold price), an obscure attribution (who
+wrote Unicornscan), and company research (IOActive) before activating the
+OpenCode assets. A result counts only when its title, URL, or excerpt contains
+the query's identifying term; unrelated URLs fail the gate. If both SearXNG
+and the bounded browser route fail, the installer exits nonzero,
+stops the managed services, and does not activate a new plugin or command.
+A successful run is the installation proof. Restart OpenCode once afterward
+so it loads the plugin and `/search` command.
+
+The browser route is a best-effort discovery fallback, not a promise to solve
+every search-engine CAPTCHA. Success requires parsed organic results, and all
+results identify either their SearXNG engines or
+`bing-browser-fallback`. Automatic page reads are limited to public HTTP(S)
+targets and revalidate every redirect; a blocked page read leaves the search
+excerpt and source URL intact.
 
 ## 10. Use the full stack
 
@@ -234,6 +248,16 @@ Ask it to research something current, for example a library released this
 month. The transcript must contain a real `web_search` tool call with fetched
 page content, and ordinary Bash/file tools must work in the same session.
 That transcript is the end-to-end acceptance proof.
+
+You can also invoke the visible command directly inside OpenCode:
+
+```text
+/search OpenCode AI coding agent
+```
+
+The result must show `Search route:` and engine or fallback provenance. A
+`WEB_SEARCH_FAILED` response is an infrastructure failure, not evidence that
+the web has no matching pages.
 
 To stop the model server, press Ctrl-C in terminal 1. To manage the research
 services, rerun the installer with `--status`, `--disable`, `--enable`, or
@@ -255,5 +279,6 @@ model, hf2q, OpenCode, and Agentic Kit are untouched).
   agent-level `permission: "deny"` or `tools: {"*": false}` left by other
   configuration; this guide writes neither.
 - **Agentic Kit unhealthy** — run `ak sync`, then `ak status`.
-- **Research tools missing** — restart OpenCode, then rerun the installer
-  with `--status` to see which check fails.
+- **Research tools or `/search` missing** — restart OpenCode, then rerun the
+  installer with `--status`. Status exits nonzero when neither primary nor
+  fallback discovery returns a usable URL and prints the failing route.

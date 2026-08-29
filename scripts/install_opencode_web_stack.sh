@@ -37,6 +37,9 @@ SEARX_DIR="$HOME/.local/opt/searxng"
 PLUGIN_DIR="$HOME/.config/opencode/plugins"
 PLUGIN_PATH="$PLUGIN_DIR/web-search-fetch.js"
 DISABLED_PLUGIN_PATH="$PLUGIN_PATH.disabled"
+COMMAND_DIR="$HOME/.config/opencode/commands"
+COMMAND_PATH="$COMMAND_DIR/search.md"
+DISABLED_COMMAND_PATH="$COMMAND_PATH.disabled"
 LAUNCH_DIR="$HOME/Library/LaunchAgents"
 SEARX_PLIST="$LAUNCH_DIR/com.opencode.searxng.plist"
 FETCH_PLIST="$LAUNCH_DIR/com.opencode.crawl4ai.plist"
@@ -56,6 +59,13 @@ if [[ "$ACTION" == "disable" ]]; then
         }
         mv "$PLUGIN_PATH" "$DISABLED_PLUGIN_PATH"
     fi
+    if [[ -f "$COMMAND_PATH" ]]; then
+        [[ ! -e "$DISABLED_COMMAND_PATH" ]] || {
+            echo "refusing to overwrite existing $DISABLED_COMMAND_PATH" >&2
+            exit 2
+        }
+        mv "$COMMAND_PATH" "$DISABLED_COMMAND_PATH"
+    fi
     echo "OpenCode web stack disabled. Restart OpenCode to unload its tools."
     exit 0
 fi
@@ -67,6 +77,13 @@ if [[ "$ACTION" == "enable" ]]; then
             exit 2
         }
         mv "$DISABLED_PLUGIN_PATH" "$PLUGIN_PATH"
+    fi
+    if [[ -f "$DISABLED_COMMAND_PATH" ]]; then
+        [[ ! -e "$COMMAND_PATH" ]] || {
+            echo "refusing to overwrite existing $COMMAND_PATH" >&2
+            exit 2
+        }
+        mv "$DISABLED_COMMAND_PATH" "$COMMAND_PATH"
     fi
     [[ -f "$SEARX_PLIST" && -f "$FETCH_PLIST" ]] || {
         echo "LaunchAgents are missing; run the installer without a flag first" >&2
@@ -94,22 +111,39 @@ if [[ "$ACTION" == "status" ]]; then
         echo "plugin: not installed"
         STATUS_FAIL=1
     fi
+    if [[ -f "$COMMAND_PATH" ]]; then
+        echo "command: enabled ($COMMAND_PATH)"
+    elif [[ -f "$DISABLED_COMMAND_PATH" ]]; then
+        echo "command: disabled ($DISABLED_COMMAND_PATH)"
+        STATUS_FAIL=1
+    else
+        echo "command: not installed"
+        STATUS_FAIL=1
+    fi
     SEARX_LOADED=0
     FETCH_LOADED=0
-    launchctl print "$USER_DOMAIN/com.opencode.searxng" >/dev/null 2>&1 \
-        && { echo "searxng: loaded"; SEARX_LOADED=1; } \
-        || { echo "searxng: not loaded"; STATUS_FAIL=1; }
-    launchctl print "$USER_DOMAIN/com.opencode.crawl4ai" >/dev/null 2>&1 \
-        && { echo "crawl4ai: loaded"; FETCH_LOADED=1; } \
-        || { echo "crawl4ai: not loaded"; STATUS_FAIL=1; }
+    if launchctl print "$USER_DOMAIN/com.opencode.searxng" >/dev/null 2>&1; then
+        echo "searxng: loaded"
+        SEARX_LOADED=1
+    else
+        echo "searxng: not loaded"
+        STATUS_FAIL=1
+    fi
+    if launchctl print "$USER_DOMAIN/com.opencode.crawl4ai" >/dev/null 2>&1; then
+        echo "crawl4ai: loaded"
+        FETCH_LOADED=1
+    else
+        echo "crawl4ai: not loaded"
+        STATUS_FAIL=1
+    fi
 
     if [[ "$FETCH_LOADED" -eq 1 ]]; then
         if HEALTH="$(curl --connect-timeout 2 --max-time 5 -fsS \
             http://127.0.0.1:11235/healthz 2>/dev/null)"; then
-            echo "$HEALTH" | jq -r '"fetch /healthz: ok=\(.ok) browser_warm=\(.browser_warm) stealth_available=\(.stealth_available)"'
+            echo "$HEALTH" | jq -r '"fetch /healthz: ok=\(.ok) browser_warm=\(.browser_warm) stealth_installed=\(.stealth_installed)"'
             [[ "$(echo "$HEALTH" | jq -r '.ok')" == "true" ]] || STATUS_FAIL=1
-            [[ "$(echo "$HEALTH" | jq -r '.stealth_available')" == "true" ]] \
-                || echo "warning: stealth fallback unavailable (scrapling/patchright)"
+            [[ "$(echo "$HEALTH" | jq -r '.stealth_installed')" == "true" ]] \
+                || echo "warning: stealth fallback not installed (scrapling/patchright)"
         else
             echo "fetch /healthz: unreachable"
             STATUS_FAIL=1
@@ -127,13 +161,34 @@ if [[ "$ACTION" == "status" ]]; then
     fi
 
     if [[ "$SEARX_LOADED" -eq 1 ]]; then
-        if RESULTS="$(curl --connect-timeout 2 --max-time 25 -fsS --get \
+        SEARCH_QUERY="who wrote unicornscan"
+        SEARCH_NEEDLE="unicornscan"
+        if SEARCH_JSON="$(curl --connect-timeout 2 --max-time 25 -fsS --get \
             http://127.0.0.1:8888/search \
-            --data-urlencode 'q=hf2q local inference' \
-            --data 'format=json' 2>/dev/null | jq -r '.results | length' 2>/dev/null)"; then
-            echo "searxng live search: ${RESULTS:-0} results"
-            [[ "${RESULTS:-0}" -gt 0 ]] \
-                || echo "warning: search returned no results (public engines may be rate-limiting; retry shortly)"
+            --data-urlencode "q=$SEARCH_QUERY" \
+            --data 'format=json' 2>/dev/null)"; then
+            RESULTS="$(echo "$SEARCH_JSON" | jq -r '.results | length')"
+            RELEVANT="$(echo "$SEARCH_JSON" | jq -r --arg needle "$SEARCH_NEEDLE" \
+                'any(.results[:2][]?; (((.title // "") + " " + (.url // "") + " " + (.content // "")) | ascii_downcase | contains($needle)))')"
+            echo "searxng live search: ${RESULTS:-0} results; query-relevant=$RELEVANT"
+            if [[ ("${RESULTS:-0}" -eq 0 || "$RELEVANT" != "true") && "$FETCH_LOADED" -eq 1 ]]; then
+                FAILURES="$(echo "$SEARCH_JSON" | jq -c '.unresponsive_engines // []')"
+                echo "searxng engine failures: $FAILURES"
+                if FALLBACK_JSON="$(jq -n --arg query "$SEARCH_QUERY" \
+                    '{query: $query, max_results: 3}' | curl --connect-timeout 2 --max-time 150 -fsS \
+                    -X POST http://127.0.0.1:11235/search-fallback \
+                    -H 'Content-Type: application/json' -d @- 2>/dev/null)" \
+                    && echo "$FALLBACK_JSON" | jq -e --arg needle "$SEARCH_NEEDLE" \
+                        '.ok == true and .provider == "bing-browser-fallback" and any(.results[:2][]?; (((.title // "") + " " + (.url // "") + " " + (.content // "")) | ascii_downcase | contains($needle)))' \
+                        >/dev/null; then
+                    echo "$FALLBACK_JSON" | jq -r '"browser discovery fallback: \(.results | length) results via \(.via)"'
+                else
+                    echo "browser discovery fallback: FAILED"
+                    STATUS_FAIL=1
+                fi
+            elif [[ "${RESULTS:-0}" -eq 0 || "$RELEVANT" != "true" ]]; then
+                STATUS_FAIL=1
+            fi
         else
             echo "searxng live search: FAILED"
             STATUS_FAIL=1
@@ -156,12 +211,16 @@ if [[ "$ACTION" == "uninstall" ]]; then
     LEGACY_BACKUPS=(
         "$PLUGIN_PATH".*.bak
         "$DISABLED_PLUGIN_PATH".*.bak
+        "$COMMAND_PATH".*.bak
+        "$DISABLED_COMMAND_PATH".*.bak
         "$SEARX_PLIST".*.bak
         "$FETCH_PLIST".*.bak
     )
     for path in \
         "$PLUGIN_PATH" \
         "$DISABLED_PLUGIN_PATH" \
+        "$COMMAND_PATH" \
+        "$DISABLED_COMMAND_PATH" \
         "$SEARX_PLIST" \
         "$FETCH_PLIST" \
         "$SEARX_DIR" \
@@ -210,6 +269,21 @@ else
 fi
 LOCAL_ASSET_DIR="$SCRIPT_DIR/opencode-web-stack"
 ASSET_TMP=""
+INSTALL_ACTIVE=0
+cleanup() {
+    exit_status=$?
+    if [[ -n "$ASSET_TMP" && -d "$ASSET_TMP" ]]; then
+        rm -r -- "$ASSET_TMP"
+    fi
+    if [[ "$INSTALL_ACTIVE" -eq 1 && "$exit_status" -ne 0 ]]; then
+        stop_services
+        echo "Installation failed closed; managed services were stopped and OpenCode assets were not activated." >&2
+        echo "Inspect the error above, then rerun the installer." >&2
+    fi
+    return "$exit_status"
+}
+trap cleanup EXIT
+
 if [[ -d "$LOCAL_ASSET_DIR" ]]; then
     ASSET_DIR="$LOCAL_ASSET_DIR"
 else
@@ -220,26 +294,30 @@ else
         web-search-fetch.js \
         server.py \
         stealth_fetch.py \
+        egress_guard.py \
+        search_fallback.py \
         requirements.txt \
         test_server.py \
+        test_egress_guard.py \
+        test_search_fallback.py \
+        search-command.md \
         searxng-settings.yml
     do
         curl -fsSL "$RAW_BASE/$asset" -o "$ASSET_DIR/$asset"
     done
 fi
-cleanup() {
-    if [[ -n "$ASSET_TMP" && -d "$ASSET_TMP" ]]; then
-        rm -r -- "$ASSET_TMP"
-    fi
-}
-trap cleanup EXIT
 
 for asset in \
     web-search-fetch.js \
     server.py \
     stealth_fetch.py \
+    egress_guard.py \
+    search_fallback.py \
     requirements.txt \
     test_server.py \
+    test_egress_guard.py \
+    test_search_fallback.py \
+    search-command.md \
     searxng-settings.yml
 do
     [[ -s "$ASSET_DIR/$asset" ]] || {
@@ -259,22 +337,27 @@ backup_if_changed() {
     fi
 }
 
-mkdir -p "$STATE_DIR" "$FETCH_DIR" "$PLUGIN_DIR" "$LAUNCH_DIR"
+mkdir -p "$STATE_DIR" "$FETCH_DIR" "$PLUGIN_DIR" "$COMMAND_DIR" "$LAUNCH_DIR"
 
 backup_if_changed "$ASSET_DIR/server.py" "$FETCH_DIR/server.py"
 backup_if_changed "$ASSET_DIR/stealth_fetch.py" "$FETCH_DIR/stealth_fetch.py"
+backup_if_changed "$ASSET_DIR/egress_guard.py" "$FETCH_DIR/egress_guard.py"
+backup_if_changed "$ASSET_DIR/search_fallback.py" "$FETCH_DIR/search_fallback.py"
 backup_if_changed "$ASSET_DIR/requirements.txt" "$FETCH_DIR/requirements.txt"
 backup_if_changed "$ASSET_DIR/test_server.py" "$FETCH_DIR/test_server.py"
+backup_if_changed "$ASSET_DIR/test_egress_guard.py" "$FETCH_DIR/test_egress_guard.py"
+backup_if_changed "$ASSET_DIR/test_search_fallback.py" "$FETCH_DIR/test_search_fallback.py"
 backup_if_changed "$ASSET_DIR/web-search-fetch.js" "$PLUGIN_DIR/web-search-fetch.js"
-if [[ -f "$DISABLED_PLUGIN_PATH" ]]; then
-    mkdir -p "$BACKUP_DIR"
-    mv "$DISABLED_PLUGIN_PATH" "$BACKUP_DIR/web-search-fetch.js.disabled"
-fi
+backup_if_changed "$ASSET_DIR/search-command.md" "$COMMAND_PATH"
+INSTALL_ACTIVE=1
 install -m 0644 "$ASSET_DIR/server.py" "$FETCH_DIR/server.py"
 install -m 0644 "$ASSET_DIR/stealth_fetch.py" "$FETCH_DIR/stealth_fetch.py"
+install -m 0644 "$ASSET_DIR/egress_guard.py" "$FETCH_DIR/egress_guard.py"
+install -m 0644 "$ASSET_DIR/search_fallback.py" "$FETCH_DIR/search_fallback.py"
 install -m 0644 "$ASSET_DIR/requirements.txt" "$FETCH_DIR/requirements.txt"
 install -m 0644 "$ASSET_DIR/test_server.py" "$FETCH_DIR/test_server.py"
-install -m 0644 "$ASSET_DIR/web-search-fetch.js" "$PLUGIN_DIR/web-search-fetch.js"
+install -m 0644 "$ASSET_DIR/test_egress_guard.py" "$FETCH_DIR/test_egress_guard.py"
+install -m 0644 "$ASSET_DIR/test_search_fallback.py" "$FETCH_DIR/test_search_fallback.py"
 
 SEARX_REV="b023a28bab8839dba9eac96e9a51cc91bbd0a267"
 SEARX_SETUPTOOLS_VERSION="84.0.0"
@@ -403,18 +486,25 @@ done
 }
 
 "$FETCH_DIR/.venv/bin/python" -m py_compile \
-    "$FETCH_DIR/server.py" "$FETCH_DIR/stealth_fetch.py" "$FETCH_DIR/test_server.py"
+    "$FETCH_DIR/server.py" \
+    "$FETCH_DIR/stealth_fetch.py" \
+    "$FETCH_DIR/egress_guard.py" \
+    "$FETCH_DIR/search_fallback.py" \
+    "$FETCH_DIR/test_server.py" \
+    "$FETCH_DIR/test_egress_guard.py" \
+    "$FETCH_DIR/test_search_fallback.py"
 (
     cd "$FETCH_DIR"
-    .venv/bin/python -m unittest -v test_server.py
+    .venv/bin/python -m unittest -v \
+        test_server.py test_egress_guard.py test_search_fallback.py
 )
-node --check "$PLUGIN_DIR/web-search-fetch.js"
+node --check "$ASSET_DIR/web-search-fetch.js"
 plutil -lint "$SEARX_PLIST" "$FETCH_PLIST"
 
 HEALTH="$(curl -fsS http://127.0.0.1:11235/healthz)"
 echo "$HEALTH" | jq -e '.ok == true' >/dev/null
-if [[ "$(echo "$HEALTH" | jq -r '.stealth_available')" != "true" ]]; then
-    echo "warning: stealth fallback unavailable (scrapling/patchright); ordinary fetch works, anti-bot pages will not" >&2
+if [[ "$(echo "$HEALTH" | jq -r '.stealth_installed')" != "true" ]]; then
+    echo "warning: stealth fallback not installed (scrapling/patchright); ordinary fetch works, anti-bot pages will not" >&2
 fi
 
 curl -fsS -X POST http://127.0.0.1:11235/fetch \
@@ -422,27 +512,69 @@ curl -fsS -X POST http://127.0.0.1:11235/fetch \
     -d '{"url":"https://example.com/","mode":"auto","max_chars":2000}' \
     | jq -e '.ok == true and (.markdown | length > 0)' >/dev/null
 
-# An empty result set is not a working search: public engines occasionally
-# rate-limit, so retry briefly, but never report success on zero results.
-SEARCH_OK=0
-for _ in 1 2 3; do
-    if curl -fsS --get http://127.0.0.1:8888/search \
-        --data-urlencode 'q=hf2q local inference' \
-        --data 'format=json' 2>/dev/null \
-        | jq -e '.results | length > 0' >/dev/null 2>&1; then
-        SEARCH_OK=1
-        break
+# Require useful answers across current-fact, obscure-attribution, and company
+# research queries. A pile of unrelated URLs is not a passing search result.
+PROBE_QUERIES=(
+    "what is the price of gold today"
+    "who wrote unicornscan"
+    "tell me about the company IOActive"
+)
+PROBE_NEEDLES=("gold" "unicornscan" "ioactive")
+FUNCTIONAL_OK=0
+for index in 0 1 2; do
+    query="${PROBE_QUERIES[$index]}"
+    needle="${PROBE_NEEDLES[$index]}"
+    SEARCH_JSON=""
+    if SEARCH_JSON="$(curl --connect-timeout 2 --max-time 25 -fsS --get \
+        http://127.0.0.1:8888/search \
+        --data-urlencode "q=$query" \
+        --data 'format=json' 2>/dev/null)" \
+        && echo "$SEARCH_JSON" | jq -e --arg needle "$needle" \
+            'any(.results[:2][]?; (((.title // "") + " " + (.url // "") + " " + (.content // "")) | ascii_downcase | contains($needle)))' \
+            >/dev/null 2>&1; then
+        FUNCTIONAL_OK=$((FUNCTIONAL_OK + 1))
+        echo "functional search probe passed via SearXNG: $query"
+        continue
     fi
-    sleep 10
+
+    FAILURES="$(echo "${SEARCH_JSON:-{}}" | jq -c '.unresponsive_engines // []' 2>/dev/null || echo '[]')"
+    echo "primary search probe was empty or irrelevant: $query; engines=$FAILURES" >&2
+    FALLBACK_JSON="$(jq -n --arg query "$query" \
+        '{query: $query, max_results: 3}' | curl --connect-timeout 2 --max-time 150 -fsS \
+        -X POST http://127.0.0.1:11235/search-fallback \
+        -H 'Content-Type: application/json' -d @- 2>/dev/null || true)"
+    if echo "$FALLBACK_JSON" | jq -e --arg needle "$needle" \
+        '.ok == true and .provider == "bing-browser-fallback" and any(.results[:2][]?; (((.title // "") + " " + (.url // "") + " " + (.content // "")) | ascii_downcase | contains($needle)))' \
+        >/dev/null 2>&1; then
+        FUNCTIONAL_OK=$((FUNCTIONAL_OK + 1))
+        echo "functional search probe passed via browser fallback: $query"
+    else
+        echo "functional search probe FAILED: $query" >&2
+        echo "Fallback response: ${FALLBACK_JSON:-unreachable}" >&2
+    fi
 done
-[[ "$SEARCH_OK" -eq 1 ]] || {
-    echo "SearXNG returned no results after 3 attempts; engines may be rate-limiting." >&2
-    echo "Re-check later with: $SELF_CMD --status" >&2
+
+[[ "$FUNCTIONAL_OK" -eq 3 ]] || {
+    echo "Functional search gate failed: $FUNCTIONAL_OK/3 representative queries were useful." >&2
+    echo "Re-check after fixing the reported route with: $SELF_CMD --status" >&2
     exit 1
 }
+echo "functional search gate: 3/3 representative queries returned relevant results"
+
+if [[ -f "$DISABLED_PLUGIN_PATH" ]]; then
+    mkdir -p "$BACKUP_DIR"
+    mv "$DISABLED_PLUGIN_PATH" "$BACKUP_DIR/web-search-fetch.js.disabled"
+fi
+if [[ -f "$DISABLED_COMMAND_PATH" ]]; then
+    mkdir -p "$BACKUP_DIR"
+    mv "$DISABLED_COMMAND_PATH" "$BACKUP_DIR/search.md.disabled"
+fi
+install -m 0644 "$ASSET_DIR/web-search-fetch.js" "$PLUGIN_PATH"
+install -m 0644 "$ASSET_DIR/search-command.md" "$COMMAND_PATH"
+INSTALL_ACTIVE=0
 
 echo
 echo "OpenCode web stack installed and verified."
 echo "Re-check at any time with: $SELF_CMD --status"
-echo "Restart OpenCode, then use: web_search, web_fetch, web_crawl, web_extract."
+echo "Restart OpenCode, then use /search or: web_search, web_fetch, web_crawl, web_extract."
 echo "Ruflo aliases are also present: WebSearch, WebFetch, WebCrawl, WebExtract."
