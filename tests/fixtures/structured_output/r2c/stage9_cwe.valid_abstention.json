@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "primary_cwe": null,
+  "related_cwes": [],
+  "rationale": "Insufficient evidence",
+  "evidence_refs": ["G1"]
+}

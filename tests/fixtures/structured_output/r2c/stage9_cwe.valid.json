@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "primary_cwe": "CWE-918",
+  "related_cwes": ["CWE-79"],
+  "rationale": "SSRF",
+  "evidence_refs": ["M1"]
+}

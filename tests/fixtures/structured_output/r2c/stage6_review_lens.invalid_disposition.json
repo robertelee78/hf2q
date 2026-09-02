@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "review_unit_alias": "U1",
+  "lens_alias": "L1",
+  "disposition": "approved",
+  "member_coverage": [],
+  "relationship_coverage": [],
+  "fact_coverage": [],
+  "gap_coverage": [],
+  "observations": []
+}

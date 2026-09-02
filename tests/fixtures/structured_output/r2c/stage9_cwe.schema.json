@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hf2q:r2c:stage9-cwe:v1",
+  "title": "r2c Stage 9 CWE classification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "primary_cwe",
+    "related_cwes",
+    "rationale",
+    "evidence_refs"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "minimum": 0 },
+    "primary_cwe": {
+      "type": ["string", "null"],
+      "pattern": "^CWE-[1-9][0-9]*$"
+    },
+    "related_cwes": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^CWE-[1-9][0-9]*$" }
+    },
+    "rationale": { "type": "string", "minLength": 1 },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["M1", "M2", "R1", "F1", "F2", "G1"]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "primary_cwe": { "type": "null" } },
+        "required": ["primary_cwe"]
+      },
+      "then": {
+        "properties": { "related_cwes": { "maxItems": 0 } },
+        "required": ["related_cwes"]
+      }
+    }
+  ]
+}
