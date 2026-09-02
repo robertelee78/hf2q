@@ -178,21 +178,28 @@ impl ModelRegistration {
         params_schema: &serde_json::Value,
         shape: GrammarShape,
     ) -> Result<String, String> {
-        match self.family {
-            "gemma4" => {
-                gemma4_tool_call_gbnf(fn_name, params_schema, shape).map_err(|e| e.to_string())
-            }
-            "qwen35" => {
-                qwen35_tool_call_gbnf(fn_name, params_schema, shape).map_err(|e| e.to_string())
-            }
-            "deepseek4" => {
-                deepseek4_tool_call_gbnf(fn_name, params_schema, shape).map_err(|e| e.to_string())
-            }
-            other => Err(format!(
-                "tool_call_gbnf: no per-model grammar emitter for family '{}'",
-                other
-            )),
+        let variants =
+            crate::serve::api::grammar::json_schema::normalize_schema_variants(params_schema)
+                .map_err(|error| error.to_string())?;
+        let mut grammars = Vec::with_capacity(variants.len());
+        for variant in variants {
+            let grammar = match self.family {
+                "gemma4" => gemma4_tool_call_gbnf(fn_name, &variant, shape)
+                    .map_err(|error| error.to_string())?,
+                "qwen35" => qwen35_tool_call_gbnf(fn_name, &variant, shape)
+                    .map_err(|error| error.to_string())?,
+                "deepseek4" => deepseek4_tool_call_gbnf(fn_name, &variant, shape)
+                    .map_err(|error| error.to_string())?,
+                other => {
+                    return Err(format!(
+                        "tool_call_gbnf: no per-model grammar emitter for family '{}'",
+                        other
+                    ))
+                }
+            };
+            grammars.push(grammar);
         }
+        combine_schema_variant_grammars(grammars)
     }
 
     /// Per-family separator that appears between calls 2+ in a parallel
@@ -1629,7 +1636,7 @@ pub fn split_full_output_forced(
 /// public API surface (`Result<String, String>`) is unchanged.
 ///
 /// Variants:
-/// - `TooManyRequiredKeys` — schema's `required` array exceeds the 8-key
+/// - `TooManyRequiredKeys` — schema's `required` array exceeds the 12-key
 ///   cap; the O(2^N) permutation grammar would be unreasonably large.
 /// - `UnsupportedSchemaFeature` — a nested schema uses a feature the
 ///   iter-231b recursive compiler cannot enforce (`allOf`, `$ref`/`$defs`,
@@ -1637,12 +1644,9 @@ pub fn split_full_output_forced(
 ///   depth > 32).  The 400 names the feature and the dot-path.
 ///
 /// # ADR-005 Wave-2.7 design note
-/// The 8-key cap is the SOTA hard bound established by json_schema.rs
-/// (ANY_ORDER_MAX_REQUIRED = 8, 256 rules worst-case — practical and fast).
-/// The previous 16-key cap in this file was misaligned: json_schema.rs
-/// hard-errors at >8, so a tool with 9–16 required keys would slip through
-/// registry.rs and be silently exposed to O(2^N) grammar growth before
-/// json_schema.rs caught it.  Both caps are now 8 — Q3 audit finding fixed.
+/// The 12-key cap is shared with json_schema.rs. It bounds the exponential
+/// subset grammar at 4096 states while admitting the nine-key r2c ReviewLens
+/// contract.
 ///
 /// # iter-231a/3.7 note
 /// The wave-2.5 `UnsupportedSchema` variant (B3 — hard rejection of
@@ -1653,7 +1657,7 @@ pub fn split_full_output_forced(
 /// mantra — no call site may re-introduce a scalar-only gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmitterError {
-    /// `required` array length exceeds `MAX_REQUIRED_KEYS` (8).
+    /// `required` array length exceeds `MAX_REQUIRED_KEYS` (12).
     TooManyRequiredKeys { fn_name: String, count: usize },
     /// Nested schema feature the iter-231b recursive compiler cannot
     /// enforce — see variant docs above.
@@ -1665,9 +1669,9 @@ pub enum EmitterError {
 }
 
 /// Hard cap on the number of required keys for the permutation grammar.
-/// Aligned with json_schema.rs ANY_ORDER_MAX_REQUIRED = 8 (ADR-005 W-ζ).
+/// Aligned with json_schema.rs ANY_ORDER_MAX_REQUIRED = 12 (ADR-052).
 /// Larger schemas return `EmitterError::TooManyRequiredKeys`.
-const MAX_REQUIRED_KEYS: usize = 8;
+const MAX_REQUIRED_KEYS: usize = 12;
 
 /// iter-231b — recursion depth cap for nested parameter schemas.  JSON
 /// Schema cannot self-reference without `$ref` (rejected as an
@@ -1680,6 +1684,27 @@ const MAX_NESTED_DEPTH: usize = 32;
 /// same shape).  Larger objects return
 /// `EmitterError::UnsupportedSchemaFeature`.
 const MAX_NESTED_PROPERTIES: usize = 32;
+
+fn combine_schema_variant_grammars(grammars: Vec<String>) -> Result<String, String> {
+    if grammars.len() == 1 {
+        return Ok(grammars.into_iter().next().expect("one grammar"));
+    }
+    use crate::serve::api::grammar::{parse, rename_rules, serialize};
+
+    let mut roots = Vec::with_capacity(grammars.len());
+    let mut bodies = String::new();
+    for (index, source) in grammars.iter().enumerate() {
+        let parsed = parse(source)
+            .map_err(|error| format!("schema variant {index} grammar failed to parse: {error}"))?;
+        let renamed = rename_rules(&parsed, |name| format!("variant-{index}-{name}"));
+        roots.push(format!("variant-{index}-root"));
+        bodies.push_str(&serialize(&renamed));
+    }
+    let combined = format!("root ::= {}\n{}", roots.join(" | "), bodies);
+    parse(&combined)
+        .map_err(|error| format!("combined schema variants failed to parse: {error}"))?;
+    Ok(combined)
+}
 
 /// JSON object keys are strings by construction.  OpenCode plugin tools built
 /// from a Zod `record(string, unknown)` nevertheless emit the redundant JSON
@@ -1793,6 +1818,9 @@ fn gemma4_value_gbnf(
     rules: &mut Vec<(String, String)>,
     rule_counter: &mut u32,
 ) -> Result<String, EmitterError> {
+    if schema == &serde_json::Value::Bool(false) {
+        return Ok(r#"[^\U00000000-\U0010FFFF]"#.to_string());
+    }
     let obj = match schema.as_object() {
         Some(o) => o,
         None => {
@@ -1801,6 +1829,22 @@ fn gemma4_value_gbnf(
             return Ok(GEMMA4_TOP_ANY_VAL.to_string());
         }
     };
+
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(serde_json::Value::Array(branches)) = obj.get(keyword) {
+            let mut alternatives = Vec::with_capacity(branches.len());
+            for (index, branch) in branches.iter().enumerate() {
+                alternatives.push(gemma4_value_gbnf(
+                    fn_name,
+                    &format!("{param_name}-{keyword}-{index}"),
+                    branch,
+                    rules,
+                    rule_counter,
+                )?);
+            }
+            return Ok(format!("( {} )", alternatives.join(" | ")));
+        }
+    }
 
     // enum (string values only in Gemma 4's canonical use) → literal alternation.
     if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
@@ -1850,8 +1894,19 @@ fn gemma4_value_gbnf(
                     body,
                     gbnf_literal("<|\"|>")
                 )),
-                None => Ok("gemma4-str-val".to_string()),
+                None => match bounded_string_body(obj, "gemma4-str-char") {
+                    Some(body) => Ok(format!(
+                        "{} {} {}",
+                        gbnf_literal("<|\"|>"),
+                        body,
+                        gbnf_literal("<|\"|>")
+                    )),
+                    None => Ok("gemma4-str-val".to_string()),
+                },
             }
+        }
+        "integer" if obj.get("minimum").and_then(serde_json::Value::as_i64) == Some(0) => {
+            Ok("([0] | [1-9] [0-9]{0,15})".to_string())
         }
         "integer" => Ok("gemma4-int-val".to_string()),
         "number" => Ok("gemma4-num-val".to_string()),
@@ -1888,7 +1943,7 @@ const GEMMA4_TOP_ANY_VAL: &str = "( gemma4-any-val | gemma4-json-obj | gemma4-js
 ///
 ///   * scalars / enums / type-unions / anyOf / oneOf — exact bodies.
 ///   * `object` with `properties` — declared keys with per-key value
-///     grammars; `required` (≤8) enforced any-order via permutation;
+///     grammars; `required` (≤12) enforced any-order via permutation;
 ///     optional keys follow in a Kleene suffix (top-level contract).
 ///     `additionalProperties:false` closes the key set; unset/true adds
 ///     a wildcard kv tail.
@@ -1914,6 +1969,9 @@ fn gemma4_nested_value_rule(
             param_path: path.to_string(),
             feature: format!("nesting depth > {}", MAX_NESTED_DEPTH),
         });
+    }
+    if schema == &serde_json::Value::Bool(false) {
+        return Ok(r#"[^\U00000000-\U0010FFFF]"#.to_string());
     }
     let obj = match schema.as_object() {
         Some(o) => o,
@@ -2051,8 +2109,19 @@ fn gemma4_nested_value_rule(
                         body,
                         gbnf_literal("<|\"|>")
                     )),
-                    None => Ok("gemma4-str-val".to_string()),
+                    None => match bounded_string_body(obj, "gemma4-str-char") {
+                        Some(body) => Ok(format!(
+                            "{} {} {}",
+                            gbnf_literal("<|\"|>"),
+                            body,
+                            gbnf_literal("<|\"|>")
+                        )),
+                        None => Ok("gemma4-str-val".to_string()),
+                    },
                 }
+            }
+            "integer" if obj.get("minimum").and_then(serde_json::Value::as_i64) == Some(0) => {
+                Ok("([0] | [1-9] [0-9]{0,15})".to_string())
             }
             "integer" => Ok("gemma4-int-val".to_string()),
             "number" => Ok("gemma4-num-val".to_string()),
@@ -2176,9 +2245,15 @@ fn gemma4_nested_array(
     rule_counter: &mut u32,
     depth: usize,
 ) -> Result<String, EmitterError> {
+    let min = obj
+        .get("minItems")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let max = obj.get("maxItems").and_then(serde_json::Value::as_u64);
     match obj.get("items") {
-        None => Ok("gemma4-json-arr".to_string()),
-        Some(serde_json::Value::Object(_)) => {
+        None if min == 0 && max.is_none() => Ok("gemma4-json-arr".to_string()),
+        None => Ok(bounded_array_body("gemma4-json-val", r#"",""#, min, max)),
+        Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Bool(_)) => {
             let item_rule = gemma4_nested_value_rule(
                 fn_name,
                 &format!("{}/items", path),
@@ -2187,7 +2262,7 @@ fn gemma4_nested_array(
                 rule_counter,
                 depth + 1,
             )?;
-            Ok(format!(r#""[" ( {0} ("," {0})* )? "]""#, item_rule))
+            Ok(bounded_array_body(&item_rule, r#"",""#, min, max))
         }
         Some(serde_json::Value::Array(_)) => Err(EmitterError::UnsupportedSchemaFeature {
             fn_name: fn_name.to_string(),
@@ -2221,7 +2296,7 @@ fn gemma4_nested_array(
 /// If `params_schema` has a `required` array those keys are enforced via a
 /// permutation grammar: required keys MUST all appear in any order; omitting
 /// one causes the grammar stack to die.  Optional keys follow in a
-/// Kleene-star suffix.  Hard cap `MAX_REQUIRED_KEYS` (8) prevents O(2^N)
+/// Kleene-star suffix. Hard cap `MAX_REQUIRED_KEYS` (12) bounds O(2^N)
 /// grammar blowup.
 ///
 /// # Structured parameters (iter-231a, supersedes Wave 2.5 B3)
@@ -2603,7 +2678,7 @@ fn build_gemma4_required_permutation(
 /// # Required parameter enforcement (Wave 2.5 B1)
 ///
 /// Same as Gemma 4: required keys enforced via permutation grammar; optional
-/// keys in Kleene-star suffix.  Hard cap `MAX_REQUIRED_KEYS` (8).
+/// keys in Kleene-star suffix. Hard cap `MAX_REQUIRED_KEYS` (12).
 ///
 /// # Structured parameters (iter-231a, supersedes Wave 2.5 B3)
 ///
@@ -2930,6 +3005,92 @@ fn qwen35_tool_call_gbnf(
     Ok(out)
 }
 
+fn deepseek4_value_variants(
+    fn_name: &str,
+    path: &str,
+    schema: &serde_json::Value,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
+) -> Result<Vec<(bool, String)>, EmitterError> {
+    if schema == &serde_json::Value::Bool(false) {
+        return Ok(vec![(false, r#"[^\U00000000-\U0010FFFF]"#.to_string())]);
+    }
+    let Some(object) = schema.as_object() else {
+        return Ok(vec![
+            (true, "dsml-string-val".to_string()),
+            (false, "qwen35-json-val".to_string()),
+        ]);
+    };
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(branches) = object.get(keyword).and_then(serde_json::Value::as_array) {
+            let mut variants = Vec::new();
+            for (index, branch) in branches.iter().enumerate() {
+                variants.extend(deepseek4_value_variants(
+                    fn_name,
+                    &format!("{path}/{keyword}/{index}"),
+                    branch,
+                    rules,
+                    rule_counter,
+                )?);
+            }
+            return Ok(variants);
+        }
+    }
+    if let Some(values) = object.get("enum").and_then(serde_json::Value::as_array) {
+        let mut string_values = Vec::new();
+        let mut json_values = Vec::new();
+        for value in values {
+            match value {
+                serde_json::Value::String(value) => string_values.push(gbnf_literal(value)),
+                serde_json::Value::Number(_)
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Null => {
+                    let serialized = serde_json::to_string(value).map_err(|error| {
+                        EmitterError::UnsupportedSchemaFeature {
+                            fn_name: fn_name.to_string(),
+                            param_path: path.to_string(),
+                            feature: format!("enum serialize: {error}"),
+                        }
+                    })?;
+                    json_values.push(gbnf_literal(&serialized));
+                }
+                _ => {
+                    return Err(EmitterError::UnsupportedSchemaFeature {
+                        fn_name: fn_name.to_string(),
+                        param_path: path.to_string(),
+                        feature: "container enum value".to_string(),
+                    });
+                }
+            }
+        }
+        let mut variants = Vec::new();
+        if !string_values.is_empty() {
+            variants.push((true, format!("( {} )", string_values.join(" | "))));
+        }
+        if !json_values.is_empty() {
+            variants.push((false, format!("( {} )", json_values.join(" | "))));
+        }
+        return Ok(variants);
+    }
+    if object.get("type").and_then(serde_json::Value::as_str) == Some("string") {
+        let value = match compile_pattern(
+            fn_name,
+            path,
+            object.get("pattern"),
+            crate::serve::api::grammar::regex_gbnf::Surface::DeepSeekRawString,
+        )? {
+            Some(body) => body,
+            None => bounded_string_body(object, "dsml-string-char")
+                .unwrap_or_else(|| "dsml-string-val".to_string()),
+        };
+        return Ok(vec![(true, value)]);
+    }
+    Ok(vec![(
+        false,
+        qwen35_nested_value_rule(fn_name, path, schema, rules, rule_counter, 1)?,
+    )])
+}
+
 /// Emit DeepSeek-V4's native DSML tool-call syntax. The outer marker pair
 /// contains one or more invoke elements; parameter names are restricted to
 /// the declared schema and non-string values are constrained to valid JSON.
@@ -3022,31 +3183,27 @@ fn deepseek4_tool_call_gbnf(
         keys.sort();
         for key in keys {
             let schema = &properties[key];
-            let is_string = schema
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|kind| kind == "string");
-            let value_rule = if is_string {
-                "dsml-string-val".to_string()
-            } else {
-                qwen35_nested_value_rule(
-                    fn_name,
-                    &format!("/{key}"),
-                    schema,
-                    &mut rules,
-                    &mut rule_counter,
-                    1,
-                )?
-            };
-            let open = gbnf_literal(&format!(
-                "<｜DSML｜parameter name=\"{}\" string=\"{}\">",
-                key,
-                if is_string { "true" } else { "false" }
-            ));
+            let variants = deepseek4_value_variants(
+                fn_name,
+                &format!("/{key}"),
+                schema,
+                &mut rules,
+                &mut rule_counter,
+            )?;
             let rule_name = format!("dsml-param-{}", sanitize_rule_name_local(key));
+            let alternatives = variants
+                .into_iter()
+                .map(|(is_string, value_rule)| {
+                    let open = gbnf_literal(&format!(
+                        "<｜DSML｜parameter name=\"{}\" string=\"{}\">",
+                        key, is_string
+                    ));
+                    format!("{} {} {} {}", open, value_rule, parameter_close, newline)
+                })
+                .collect::<Vec<_>>();
             rules.push((
                 rule_name.clone(),
-                format!("{} {} {} {}", open, value_rule, parameter_close, newline),
+                format!("( {} )", alternatives.join(" | ")),
             ));
             if required_set.contains(key.as_str()) {
                 required_parameter_rules.push(rule_name);
@@ -3247,10 +3404,28 @@ fn qwen35_value_rule(
     rules: &mut Vec<(String, String)>,
     rule_counter: &mut u32,
 ) -> Result<String, EmitterError> {
+    if schema == &serde_json::Value::Bool(false) {
+        return Ok(r#"[^\U00000000-\U0010FFFF]"#.to_string());
+    }
     let obj = match schema.as_object() {
         Some(o) => o,
         None => return Ok(QWEN35_TOP_ANY_VAL.to_string()),
     };
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(serde_json::Value::Array(branches)) = obj.get(keyword) {
+            let mut alternatives = Vec::with_capacity(branches.len());
+            for (index, branch) in branches.iter().enumerate() {
+                alternatives.push(qwen35_value_rule(
+                    fn_name,
+                    &format!("{param_name}-{keyword}-{index}"),
+                    branch,
+                    rules,
+                    rule_counter,
+                )?);
+            }
+            return Ok(format!("( {} )", alternatives.join(" | ")));
+        }
+    }
     // enum → accept only the declared string literals.  TOP-LEVEL string
     // values are RAW text between the parameter tags (the template only
     // `tojson`s NON-string values), so enum literals stay unquoted here.
@@ -3275,8 +3450,12 @@ fn qwen35_value_rule(
                 crate::serve::api::grammar::regex_gbnf::Surface::QwenRawString,
             )? {
                 Some(body) => Ok(body),
-                None => Ok("qwen35-str-val".to_string()),
+                None => Ok(bounded_string_body(obj, "qwen35-str-char")
+                    .unwrap_or_else(|| "qwen35-str-val".to_string())),
             }
+        }
+        "integer" if obj.get("minimum").and_then(serde_json::Value::as_i64) == Some(0) => {
+            Ok("([0] | [1-9] [0-9]{0,15})".to_string())
         }
         "integer" => Ok("qwen35-int-val".to_string()),
         "number" => Ok("qwen35-num-val".to_string()),
@@ -3330,6 +3509,58 @@ fn compile_pattern(
     }
 }
 
+fn bounded_repeat(atom: &str, min: u64, max: Option<u64>) -> String {
+    match max {
+        Some(upper) if upper == min => format!("{atom}{{{min}}}"),
+        Some(upper) => format!("{atom}{{{min},{upper}}}"),
+        None if min == 0 => format!("{atom}*"),
+        None if min == 1 => format!("{atom}+"),
+        None => format!("{atom}{{{min},}}"),
+    }
+}
+
+fn bounded_string_body(
+    object: &serde_json::Map<String, serde_json::Value>,
+    atom: &str,
+) -> Option<String> {
+    let min = object
+        .get("minLength")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let max = object.get("maxLength").and_then(serde_json::Value::as_u64);
+    (min > 0 || max.is_some()).then(|| bounded_repeat(atom, min, max))
+}
+
+fn bounded_array_body(item: &str, comma: &str, min: u64, max: Option<u64>) -> String {
+    if max == Some(0) {
+        return r#""[" "]""#.to_string();
+    }
+    let comma_item = format!("( {comma} {item} )");
+    let sequence = if min == 0 {
+        match max {
+            None => format!("( {item} {comma_item}* )?"),
+            Some(upper) => format!("( {item} {comma_item}{{0,{}}} )?", upper - 1),
+        }
+    } else {
+        let required_tail = min - 1;
+        let suffix = match max {
+            None if required_tail == 0 => format!(" {comma_item}*"),
+            None => format!(" {comma_item}{{{required_tail}}} {comma_item}*"),
+            Some(upper) if upper == min && required_tail == 0 => String::new(),
+            Some(upper) if upper == min => format!(" {comma_item}{{{required_tail}}}"),
+            Some(upper) if required_tail == 0 => {
+                format!(" {comma_item}{{0,{}}}", upper - min)
+            }
+            Some(upper) => format!(
+                " {comma_item}{{{required_tail}}} {comma_item}{{0,{}}}",
+                upper - min
+            ),
+        };
+        format!("{item}{suffix}")
+    };
+    format!(r#""[" {sequence} "]""#)
+}
+
 /// iter-231b — recursive nested-schema compiler for Qwen 3.5/3.6 tool
 /// parameters (`tojson` JSON surface).
 ///
@@ -3338,7 +3569,7 @@ fn compile_pattern(
 ///
 ///   * scalars / enums / type-unions / anyOf / oneOf — exact bodies.
 ///   * `object` with `properties` — declared keys with per-key value
-///     grammars; `required` (≤8) enforced any-order via permutation;
+///     grammars; `required` (≤12) enforced any-order via permutation;
 ///     optional keys follow in a Kleene suffix (SAME contract as the
 ///     top-level parameter grammar: required keys in any order, then
 ///     optional keys in any order; optional duplicates are accepted the
@@ -3386,6 +3617,9 @@ fn qwen35_nested_value_rule(
             param_path: path.to_string(),
             feature: format!("nesting depth > {}", MAX_NESTED_DEPTH),
         });
+    }
+    if schema == &serde_json::Value::Bool(false) {
+        return Ok(r#"[^\U00000000-\U0010FFFF]"#.to_string());
     }
     let obj = match schema.as_object() {
         Some(o) => o,
@@ -3524,8 +3758,19 @@ fn qwen35_nested_value_rule(
                         body,
                         gbnf_literal("\"")
                     )),
-                    None => Ok("qwen35-json-str".to_string()),
+                    None => match bounded_string_body(obj, "qwen35-json-char") {
+                        Some(body) => Ok(format!(
+                            "{} {} {}",
+                            gbnf_literal("\""),
+                            body,
+                            gbnf_literal("\"")
+                        )),
+                        None => Ok("qwen35-json-str".to_string()),
+                    },
                 }
+            }
+            "integer" if obj.get("minimum").and_then(serde_json::Value::as_i64) == Some(0) => {
+                Ok("([0] | [1-9] [0-9]{0,15})".to_string())
             }
             "integer" => Ok("qwen35-int-val".to_string()),
             "number" => Ok("qwen35-num-val".to_string()),
@@ -3653,9 +3898,20 @@ fn qwen35_nested_array(
     rule_counter: &mut u32,
     depth: usize,
 ) -> Result<String, EmitterError> {
+    let min = obj
+        .get("minItems")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let max = obj.get("maxItems").and_then(serde_json::Value::as_u64);
     match obj.get("items") {
-        None => Ok("qwen35-json-arr".to_string()),
-        Some(serde_json::Value::Object(_)) => {
+        None if min == 0 && max.is_none() => Ok("qwen35-json-arr".to_string()),
+        None => Ok(bounded_array_body(
+            "qwen35-json-val",
+            "qwen35-json-comma",
+            min,
+            max,
+        )),
+        Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Bool(_)) => {
             let item_rule = qwen35_nested_value_rule(
                 fn_name,
                 &format!("{}/items", path),
@@ -3664,9 +3920,11 @@ fn qwen35_nested_array(
                 rule_counter,
                 depth + 1,
             )?;
-            Ok(format!(
-                r#""[" ( {0} (qwen35-json-comma {0})* )? "]""#,
-                item_rule
+            Ok(bounded_array_body(
+                &item_rule,
+                "qwen35-json-comma",
+                min,
+                max,
             ))
         }
         Some(serde_json::Value::Array(_)) => Err(EmitterError::UnsupportedSchemaFeature {
@@ -4764,6 +5022,143 @@ mod tests {
         grammar_runtime_for_gbnf(&gbnf)
     }
 
+    fn gemma4_fixture_value(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Null => "null".to_string(),
+            serde_json::Value::Bool(value) => value.to_string(),
+            serde_json::Value::Number(value) => value.to_string(),
+            serde_json::Value::String(value) => format!(r#"<|"|>{value}<|"|>"#),
+            serde_json::Value::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(gemma4_fixture_value)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            serde_json::Value::Object(values) => format!(
+                "{{{}}}",
+                values
+                    .iter()
+                    .map(|(key, value)| format!("{key}:{}", gemma4_fixture_value(value)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }
+    }
+
+    fn fixture_tool_wire(
+        registration: &ModelRegistration,
+        fn_name: &str,
+        payload: &serde_json::Value,
+    ) -> String {
+        let object = payload.as_object().expect("fixture payload object");
+        match registration.family {
+            "gemma4" => format!(
+                "call:{fn_name}{{{}}}",
+                object
+                    .iter()
+                    .map(|(key, value)| format!("{key}:{}", gemma4_fixture_value(value)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            "qwen35" => {
+                let mut output = format!("<function={fn_name}>\n");
+                for (key, value) in object {
+                    let body = value.as_str().map(ToOwned::to_owned).unwrap_or_else(|| {
+                        serde_json::to_string(value).expect("serialize fixture")
+                    });
+                    output.push_str(&format!("<parameter={key}>\n{body}\n</parameter>\n"));
+                }
+                output.push_str("</function>");
+                output
+            }
+            "deepseek4" => {
+                let mut output = format!("<｜DSML｜invoke name=\"{fn_name}\">\n");
+                for (key, value) in object {
+                    let (is_string, body) = match value.as_str() {
+                        Some(value) => (true, value.to_string()),
+                        None => (
+                            false,
+                            serde_json::to_string(value).expect("serialize fixture"),
+                        ),
+                    };
+                    output.push_str(&format!(
+                        "<｜DSML｜parameter name=\"{key}\" string=\"{is_string}\">{body}</｜DSML｜parameter>\n"
+                    ));
+                }
+                output.push_str("</｜DSML｜invoke>");
+                output
+            }
+            family => panic!("unexpected fixture family {family}"),
+        }
+    }
+
+    fn assert_r2c_fixture_across_families(
+        fn_name: &str,
+        schema_json: &str,
+        accepted_json: &[&str],
+        rejected_json: &[&str],
+    ) {
+        let schema: serde_json::Value = serde_json::from_str(schema_json).expect("schema fixture");
+        for registration in [&GEMMA4, &QWEN35, &DEEPSEEK4] {
+            let grammar = registration
+                .tool_call_gbnf(fn_name, &schema, GrammarShape::SingleBody)
+                .unwrap_or_else(|error| panic!("{} schema compile: {error}", registration.family));
+            for payload in accepted_json {
+                let payload: serde_json::Value =
+                    serde_json::from_str(payload).expect("valid payload fixture");
+                let wire = fixture_tool_wire(registration, fn_name, &payload);
+                let mut runtime = grammar_runtime_for_gbnf(&grammar);
+                assert!(
+                    runtime.accept_bytes(wire.as_bytes()) && runtime.is_accepted(),
+                    "{} rejected valid {fn_name} wire:\n{wire}",
+                    registration.family
+                );
+            }
+            for payload in rejected_json {
+                let payload: serde_json::Value =
+                    serde_json::from_str(payload).expect("invalid payload fixture");
+                let wire = fixture_tool_wire(registration, fn_name, &payload);
+                let mut runtime = grammar_runtime_for_gbnf(&grammar);
+                assert!(
+                    !runtime.accept_bytes(wire.as_bytes()) || !runtime.is_accepted(),
+                    "{} accepted invalid {fn_name} wire:\n{wire}",
+                    registration.family
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r2c_stage6_schema_is_enforced_across_all_generative_families() {
+        assert_r2c_fixture_across_families(
+            "r2c_stage6",
+            include_str!("../../../tests/fixtures/structured_output/r2c/stage6_review_lens.schema.json"),
+            &[include_str!("../../../tests/fixtures/structured_output/r2c/stage6_review_lens.valid.json")],
+            &[
+                include_str!("../../../tests/fixtures/structured_output/r2c/stage6_review_lens.invalid_disposition.json"),
+                include_str!("../../../tests/fixtures/structured_output/r2c/stage6_review_lens.invalid_missing_detail.json"),
+            ],
+        );
+    }
+
+    #[test]
+    fn r2c_stage9_schema_is_enforced_across_all_generative_families() {
+        assert_r2c_fixture_across_families(
+            "r2c_stage9",
+            include_str!("../../../tests/fixtures/structured_output/r2c/stage9_cwe.schema.json"),
+            &[
+                include_str!("../../../tests/fixtures/structured_output/r2c/stage9_cwe.valid.json"),
+                include_str!("../../../tests/fixtures/structured_output/r2c/stage9_cwe.valid_abstention.json"),
+            ],
+            &[
+                include_str!("../../../tests/fixtures/structured_output/r2c/stage9_cwe.invalid_cwe.json"),
+                include_str!("../../../tests/fixtures/structured_output/r2c/stage9_cwe.invalid_abstention.json"),
+            ],
+        );
+    }
+
     #[test]
     fn deepseek4_registration_and_multi_invoke_parser_are_openai_compatible() {
         let registration = find_for("DeepSeek-V4-Flash-0731").expect("DeepSeek registration");
@@ -5796,10 +6191,10 @@ mod tests {
     /// W-ζ: cap lowered from 16 to 8 to match json_schema.rs ANY_ORDER_MAX_REQUIRED.
     #[test]
     fn b1_gemma4_too_many_required_keys_err() {
-        // Build a schema with 9 required keys (> MAX_REQUIRED_KEYS = 8).
+        // Build a schema with 13 required keys (> MAX_REQUIRED_KEYS = 12).
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..9usize {
+        for i in 0..13usize {
             let k = format!("key{}", i);
             props.insert(k.clone(), serde_json::json!({"type": "string"}));
             required.push(serde_json::Value::String(k));
@@ -5810,27 +6205,27 @@ mod tests {
             "required": required
         });
         let result = GEMMA4.tool_call_gbnf("f", &schema, GrammarShape::SingleBody);
-        assert!(result.is_err(), "9 required keys must return Err");
+        assert!(result.is_err(), "13 required keys must return Err");
         let msg = result.unwrap_err();
         assert!(
-            msg.contains("9"),
+            msg.contains("13"),
             "error message should mention count: {}",
             msg
         );
         assert!(
-            msg.contains("8"),
+            msg.contains("12"),
             "error message should mention cap: {}",
             msg
         );
     }
 
-    /// W-ζ HIGH-2: Gemma4 boundary — exactly 8 required keys compiles OK.
+    /// ADR-052 boundary — exactly 12 required keys compiles OK.
     #[test]
-    fn nine_required_keys_in_gemma_tool_call_gbnf_returns_too_many_required_keys() {
-        // 9 keys — must be rejected (boundary at 8).
+    fn thirteen_required_keys_in_gemma_tool_call_gbnf_returns_too_many_required_keys() {
+        // 13 keys — must be rejected (boundary at 12).
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..9usize {
+        for i in 0..13usize {
             let k = format!("p{}", i);
             props.insert(k.clone(), serde_json::json!({"type": "integer"}));
             required.push(serde_json::Value::String(k));
@@ -5840,22 +6235,22 @@ mod tests {
             "properties": props,
             "required": required
         });
-        let result = GEMMA4.tool_call_gbnf("tool9", &schema, GrammarShape::SingleBody);
+        let result = GEMMA4.tool_call_gbnf("tool13", &schema, GrammarShape::SingleBody);
         assert!(
             result.is_err(),
-            "9 required keys must return TooManyRequiredKeys"
+            "13 required keys must return TooManyRequiredKeys"
         );
         let msg = result.unwrap_err();
-        assert!(msg.contains("9"), "error must mention count 9: {}", msg);
-        assert!(msg.contains("8"), "error must mention cap 8: {}", msg);
+        assert!(msg.contains("13"), "error must mention count 13: {}", msg);
+        assert!(msg.contains("12"), "error must mention cap 12: {}", msg);
     }
 
-    /// W-ζ HIGH-2: Gemma4 boundary — exactly 8 required keys compiles OK.
+    /// ADR-052 boundary — exactly 12 required keys compiles OK.
     #[test]
-    fn eight_required_keys_in_gemma_tool_call_gbnf_compiles_ok() {
+    fn twelve_required_keys_in_gemma_tool_call_gbnf_compiles_ok() {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..8usize {
+        for i in 0..12usize {
             let k = format!("p{}", i);
             props.insert(k.clone(), serde_json::json!({"type": "integer"}));
             required.push(serde_json::Value::String(k));
@@ -5865,8 +6260,11 @@ mod tests {
             "properties": props,
             "required": required
         });
-        let result = GEMMA4.tool_call_gbnf("tool8", &schema, GrammarShape::SingleBody);
-        assert!(result.is_ok(), "8 required keys must compile without error");
+        let result = GEMMA4.tool_call_gbnf("tool12", &schema, GrammarShape::SingleBody);
+        assert!(
+            result.is_ok(),
+            "12 required keys must compile without error"
+        );
     }
 
     /// B1 Qwen35: required key present → accept.
@@ -5931,13 +6329,12 @@ mod tests {
         assert!(rt.is_accepted());
     }
 
-    /// B1 Qwen35: 9 required keys → EmitterError::TooManyRequiredKeys.
-    /// W-ζ: cap lowered from 16 to 8 to match json_schema.rs ANY_ORDER_MAX_REQUIRED.
+    /// B1 Qwen35: 13 required keys → EmitterError::TooManyRequiredKeys.
     #[test]
     fn b1_qwen35_too_many_required_keys_err() {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..9usize {
+        for i in 0..13usize {
             let k = format!("key{}", i);
             props.insert(k.clone(), serde_json::json!({"type": "string"}));
             required.push(serde_json::Value::String(k));
@@ -5948,26 +6345,26 @@ mod tests {
             "required": required
         });
         let result = QWEN35.tool_call_gbnf("f", &schema, GrammarShape::SingleBody);
-        assert!(result.is_err(), "9 required keys must return Err");
+        assert!(result.is_err(), "13 required keys must return Err");
         let msg = result.unwrap_err();
         assert!(
-            msg.contains("9"),
+            msg.contains("13"),
             "error message should mention count: {}",
             msg
         );
         assert!(
-            msg.contains("8"),
+            msg.contains("12"),
             "error message should mention cap: {}",
             msg
         );
     }
 
-    /// W-ζ HIGH-2: Qwen35 boundary — 9 required keys returns TooManyRequiredKeys.
+    /// ADR-052 boundary — 13 required keys returns TooManyRequiredKeys.
     #[test]
-    fn nine_required_keys_in_qwen35_tool_call_gbnf_returns_too_many_required_keys() {
+    fn thirteen_required_keys_in_qwen35_tool_call_gbnf_returns_too_many_required_keys() {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..9usize {
+        for i in 0..13usize {
             let k = format!("q{}", i);
             props.insert(k.clone(), serde_json::json!({"type": "string"}));
             required.push(serde_json::Value::String(k));
@@ -5977,22 +6374,22 @@ mod tests {
             "properties": props,
             "required": required
         });
-        let result = QWEN35.tool_call_gbnf("qtool9", &schema, GrammarShape::SingleBody);
+        let result = QWEN35.tool_call_gbnf("qtool13", &schema, GrammarShape::SingleBody);
         assert!(
             result.is_err(),
-            "9 required keys must return TooManyRequiredKeys"
+            "13 required keys must return TooManyRequiredKeys"
         );
         let msg = result.unwrap_err();
-        assert!(msg.contains("9"), "error must mention count 9: {}", msg);
-        assert!(msg.contains("8"), "error must mention cap 8: {}", msg);
+        assert!(msg.contains("13"), "error must mention count 13: {}", msg);
+        assert!(msg.contains("12"), "error must mention cap 12: {}", msg);
     }
 
-    /// W-ζ HIGH-2: Qwen35 boundary — exactly 8 required keys compiles OK.
+    /// ADR-052 boundary — exactly 12 required keys compiles OK.
     #[test]
-    fn eight_required_keys_in_qwen35_tool_call_gbnf_compiles_ok() {
+    fn twelve_required_keys_in_qwen35_tool_call_gbnf_compiles_ok() {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..8usize {
+        for i in 0..12usize {
             let k = format!("q{}", i);
             props.insert(k.clone(), serde_json::json!({"type": "string"}));
             required.push(serde_json::Value::String(k));
@@ -6002,8 +6399,11 @@ mod tests {
             "properties": props,
             "required": required
         });
-        let result = QWEN35.tool_call_gbnf("qtool8", &schema, GrammarShape::SingleBody);
-        assert!(result.is_ok(), "8 required keys must compile without error");
+        let result = QWEN35.tool_call_gbnf("qtool12", &schema, GrammarShape::SingleBody);
+        assert!(
+            result.is_ok(),
+            "12 required keys must compile without error"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6498,8 +6898,8 @@ mod tests {
     /// Qwen35: >8 nested required keys → TooManyRequiredKeys (same SOTA
     /// O(2^N) bound as the top level).
     #[test]
-    fn iter231b_qwen35_nested_nine_required_keys_errors() {
-        let props: serde_json::Map<String, serde_json::Value> = (0..9)
+    fn iter231b_qwen35_nested_thirteen_required_keys_errors() {
+        let props: serde_json::Map<String, serde_json::Value> = (0..13)
             .map(|i| (format!("k{}", i), serde_json::json!({"type": "integer"})))
             .collect();
         let schema = serde_json::json!({
@@ -6508,16 +6908,16 @@ mod tests {
                 "cfg": {
                     "type": "object",
                     "properties": props,
-                    "required": ["k0","k1","k2","k3","k4","k5","k6","k7","k8"]
+                    "required": ["k0","k1","k2","k3","k4","k5","k6","k7","k8","k9","k10","k11","k12"]
                 }
             }
         });
         // Public API converts EmitterError → String; assert the payload.
         let err = QWEN35
             .tool_call_gbnf("f", &schema, GrammarShape::SingleBody)
-            .expect_err("9 nested required keys must error");
+            .expect_err("13 nested required keys must error");
         assert!(
-            err.contains("9 required parameters"),
+            err.contains("13 required parameters"),
             "error must carry the required-key count: {}",
             err
         );

@@ -1,9 +1,7 @@
 //! JSON Schema → GBNF translator.
 //!
-//! A minimal viable subset: it covers the
-//! common cases actually exercised by OpenAI `response_format: {type:
-//! "json_schema", json_schema: {schema: {...}}}` requests and by tool-call
-//! parameter schemas:
+//! A fail-closed generator-oriented subset used by OpenAI
+//! `response_format`, structured outputs, and family tool-call schemas.
 //!
 //!   - Primitive types: `string`, `number`, `integer`, `boolean`, `null`.
 //!   - `object` with `properties` and `required`.
@@ -12,15 +10,8 @@
 //!   - `type` as either a single string or an array of strings (unions).
 //!   - Type-agnostic schema (bare `{}`) → `value` primitive.
 //!
-//! Features deliberately deferred (landed when a concrete user requests
-//! them — mantra: no stubs, but also no speculative features):
-//!   - `$ref` / `$defs` (requires ref resolution).
-//!   - `pattern` (regex → grammar conversion).
-//!   - `minLength` / `maxLength` / `minimum` / `maximum` / `minItems` /
-//!     `maxItems`.
-//!   - `anyOf` / `oneOf` / `allOf`.
-//!   - `additionalProperties: {schema}` (schema-typed additional props).
-//!   - Tuple-form arrays (`items: [schemaA, schemaB, ...]`).
+//! Every encountered assertion is either compiled exactly or rejected with a
+//! [`SchemaError`]. Assertions are never accepted and silently discarded.
 //!
 //! `additionalProperties: false` IS enforced (iter 75): the grammar rejects
 //! any key not declared in `properties`. `additionalProperties: true` or
@@ -28,7 +19,7 @@
 //! `additionalProperties: {schema}` is deferred (treated as permissive).
 //!
 //! Object key order (iter 75): grammar accepts keys in ANY order for up to
-//! 8 required keys (2^8 = 256 rules worst-case). For N_req > 8 the emitter
+//! 12 required keys. For N_req > 12 the emitter
 //! returns a `SchemaError` → HTTP 400; no sequential fallback is provided
 //! because sorted-order is a semantic downgrade (Moshier & Rounds ACL 1987).
 //! Previously keys were required alphabetically (iter 8 simplification, never
@@ -42,6 +33,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
+
+use super::regex_gbnf::{regex_to_gbnf_body, Surface};
+
+const MAX_SCHEMA_DEPTH: usize = 64;
+const MAX_LOCAL_REFS: usize = 1024;
+const MAX_ENUM_VALUES: usize = 1024;
+const MAX_LITERAL_BYTES: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Primitive rule library.
@@ -180,7 +178,7 @@ pub fn format_literal(literal: &str) -> String {
 /// # Variants
 ///
 /// - `TooManyRequiredKeys` — the object's `required` array exceeds
-///   `ANY_ORDER_MAX_REQUIRED` (8).  Carries the function/path name, the
+///   `ANY_ORDER_MAX_REQUIRED` (12).  Carries the function/path name, the
 ///   actual count, and the cap so callers can format a precise 400 body.
 ///   Introduced in ADR-005 W-ζ (wave-2.7) to replace the generic struct
 ///   that the audit (commit 5110dc0) implied but never created.
@@ -190,7 +188,7 @@ pub fn format_literal(literal: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaError {
     /// Object schema has more required properties than the any-order
-    /// grammar supports (> `ANY_ORDER_MAX_REQUIRED` = 8).
+    /// grammar supports (> `ANY_ORDER_MAX_REQUIRED` = 12).
     TooManyRequiredKeys {
         /// Dot-path of the offending object in the schema (empty = root).
         fn_name: String,
@@ -244,11 +242,16 @@ impl std::error::Error for SchemaError {}
 /// Returns `Err(SchemaError)` if the schema contains a feature that isn't
 /// yet supported (see the module-level doc for the supported subset).
 pub fn schema_to_gbnf(schema: &Value) -> Result<String, SchemaError> {
+    validate_schema_profile(schema)?;
     let mut conv = Converter {
         rules: BTreeMap::new(),
         added_primitives: HashSet::new(),
+        root_schema: schema.clone(),
+        ref_rules: HashMap::new(),
+        resolving_refs: HashSet::new(),
+        resolved_refs: 0,
     };
-    let root_body = conv.visit(schema, "")?;
+    let root_body = conv.visit(schema, "", 0)?;
     conv.rules.insert("root".to_string(), root_body);
 
     // `space` is always needed since all primitives reference it.
@@ -279,6 +282,10 @@ struct Converter {
     /// Emitted rules keyed by name. BTreeMap for deterministic output order.
     rules: BTreeMap<String, String>,
     added_primitives: HashSet<&'static str>,
+    root_schema: Value,
+    ref_rules: HashMap<String, String>,
+    resolving_refs: HashSet<String>,
+    resolved_refs: usize,
 }
 
 impl Converter {
@@ -296,7 +303,20 @@ impl Converter {
 
     /// Return the GBNF rule body that matches `schema`. `path` is used in
     /// error messages.
-    fn visit(&mut self, schema: &Value, path: &str) -> Result<String, SchemaError> {
+    fn visit(&mut self, schema: &Value, path: &str, depth: usize) -> Result<String, SchemaError> {
+        if depth > MAX_SCHEMA_DEPTH {
+            return Err(schema_error(
+                path,
+                format!("schema nesting exceeds {MAX_SCHEMA_DEPTH}"),
+            ));
+        }
+        if let Some(allowed) = schema.as_bool() {
+            if allowed {
+                self.add_primitive("value");
+                return Ok("value".into());
+            }
+            return Ok(self.uninhabited_rule(path));
+        }
         let obj = match schema.as_object() {
             Some(o) => o,
             None => {
@@ -307,43 +327,80 @@ impl Converter {
             }
         };
 
+        if let Some(Value::String(reference)) = obj.get("$ref") {
+            return self.visit_ref(reference, path, depth);
+        }
+
+        if let Some(value) = obj.get("const") {
+            self.rules
+                .entry("space".to_string())
+                .or_insert_with(|| SPACE_RULE.to_string());
+            let text = serde_json::to_string(value)
+                .map_err(|error| schema_error(path, format!("cannot serialize const: {error}")))?;
+            return Ok(format!("{} space", format_literal(&text)));
+        }
+
+        if let Some(Value::Array(branches)) = obj.get("allOf") {
+            return self.visit_all_of(obj, branches, path, depth);
+        }
+
+        for keyword in ["anyOf", "oneOf"] {
+            if let Some(Value::Array(branches)) = obj.get(keyword) {
+                if branches.is_empty() {
+                    return Ok(self.uninhabited_rule(&format!("{path}/{keyword}")));
+                }
+                if keyword == "oneOf" {
+                    for left in 0..branches.len() {
+                        for right in left + 1..branches.len() {
+                            if !schemas_provably_disjoint(&branches[left], &branches[right]) {
+                                return Err(schema_error(
+                                    &format!("{path}/oneOf"),
+                                    format!(
+                                        "branches {left} and {right} are not provably disjoint; exact oneOf cannot be lowered"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+                let slug = path_slug(path);
+                let mut alternatives = Vec::with_capacity(branches.len());
+                for (index, branch) in branches.iter().enumerate() {
+                    let body =
+                        self.visit(branch, &format!("{path}/{keyword}/{index}"), depth + 1)?;
+                    let name = format!("{slug}-{keyword}-{index}");
+                    self.rules.insert(name.clone(), body);
+                    alternatives.push(name);
+                }
+                return Ok(alternatives.join(" | "));
+            }
+        }
+
         // enum: alternation of literal strings.
         if let Some(Value::Array(values)) = obj.get("enum") {
             if values.is_empty() {
-                return Err(SchemaError::Generic {
-                    path: path.to_string(),
-                    message: "enum cannot be empty".into(),
-                });
+                return Ok(self.uninhabited_rule(path));
+            }
+            if values.len() > MAX_ENUM_VALUES {
+                return Err(schema_error(
+                    &format!("{path}/enum"),
+                    format!("{} values exceed {MAX_ENUM_VALUES}", values.len()),
+                ));
             }
             let mut alts: Vec<String> = Vec::with_capacity(values.len());
+            let mut literal_bytes = 0usize;
             for v in values {
-                match v {
-                    Value::String(s) => {
-                        // Literal string value in JSON → double-quoted literal
-                        // in the emitted JSON. The grammar must match the
-                        // quoted form, so embed `"value"` literally.
-                        let quoted_value =
-                            serde_json::to_string(s).map_err(|e| SchemaError::Generic {
-                                path: path.to_string(),
-                                message: format!("enum serialize: {e}"),
-                            })?;
-                        alts.push(format_literal(&quoted_value));
-                    }
-                    Value::Number(_) | Value::Bool(_) | Value::Null => {
-                        // Non-string enum — serialize to JSON text.
-                        let text = serde_json::to_string(v).map_err(|e| SchemaError::Generic {
-                            path: path.to_string(),
-                            message: format!("enum serialize: {e}"),
-                        })?;
-                        alts.push(format_literal(&text));
-                    }
-                    Value::Array(_) | Value::Object(_) => {
-                        return Err(SchemaError::Generic {
-                            path: format!("{}/enum", path),
-                            message: "enum values must be scalars (string/number/bool/null)".into(),
-                        });
-                    }
+                let text = serde_json::to_string(v).map_err(|error| {
+                    schema_error(path, format!("cannot serialize enum value: {error}"))
+                })?;
+                literal_bytes = literal_bytes.saturating_add(text.len());
+                if literal_bytes > MAX_LITERAL_BYTES {
+                    return Err(schema_error(
+                        &format!("{path}/enum"),
+                        format!("literal bytes exceed {MAX_LITERAL_BYTES}"),
+                    ));
                 }
+                alts.push(format_literal(&text));
             }
             // After an enum value we still emit `space` so trailing whitespace
             // is accepted — matches the peer's convention.
@@ -363,7 +420,9 @@ impl Converter {
             }
             Some(Value::String(s)) => s.clone(),
             Some(Value::Array(types)) => {
-                // Union type — emit an alternation.
+                // A type union retains every sibling assertion that applies
+                // to the selected branch. Dropping them would silently widen
+                // schemas such as `{type:["string","null"],pattern:...}`.
                 let mut alts: Vec<String> = Vec::with_capacity(types.len());
                 for (i, t) in types.iter().enumerate() {
                     let tstr = t.as_str().ok_or_else(|| SchemaError::Generic {
@@ -372,8 +431,16 @@ impl Converter {
                     })?;
                     let mut stub = serde_json::Map::new();
                     stub.insert("type".into(), Value::String(tstr.into()));
-                    let body =
-                        self.visit(&Value::Object(stub), &format!("{}/type[{}]", path, i))?;
+                    for (key, value) in obj {
+                        if key != "type" && !is_schema_annotation(key) {
+                            stub.insert(key.clone(), value.clone());
+                        }
+                    }
+                    let body = self.visit(
+                        &Value::Object(stub),
+                        &format!("{}/type/{}", path, i),
+                        depth + 1,
+                    )?;
                     alts.push(body);
                 }
                 return Ok(alts.join(" | "));
@@ -388,6 +455,27 @@ impl Converter {
 
         match type_str.as_str() {
             "string" => {
+                if let Some(Value::String(pattern)) = obj.get("pattern") {
+                    let body =
+                        regex_to_gbnf_body(pattern, Surface::JsonString).map_err(|error| {
+                            schema_error(&format!("{path}/pattern"), error.to_string())
+                        })?;
+                    return Ok(format!(r#""\"" {} "\"" space"#, body));
+                }
+                let min = obj.get("minLength").and_then(Value::as_u64).unwrap_or(0);
+                let max = obj.get("maxLength").and_then(Value::as_u64);
+                if min > 0 || max.is_some() {
+                    if max.is_some_and(|upper| upper < min) {
+                        return Ok(self.uninhabited_rule(path));
+                    }
+                    self.add_primitive("char");
+                    let repetition = match max {
+                        Some(upper) if upper == min => format!("char{{{min}}}"),
+                        Some(upper) => format!("char{{{min},{upper}}}"),
+                        None => format!("char{{{min},}}"),
+                    };
+                    return Ok(format!(r#""\"" {} "\"" space"#, repetition));
+                }
                 self.add_primitive("string");
                 Ok("string".into())
             }
@@ -396,6 +484,14 @@ impl Converter {
                 Ok("number".into())
             }
             "integer" => {
+                if obj.get("minimum").and_then(Value::as_i64) == Some(0)
+                    && obj.get("maximum").is_none()
+                    && obj.get("exclusiveMinimum").is_none()
+                    && obj.get("exclusiveMaximum").is_none()
+                {
+                    self.add_primitive("integral-part");
+                    return Ok("integral-part space".into());
+                }
                 self.add_primitive("integer");
                 Ok("integer".into())
             }
@@ -407,8 +503,8 @@ impl Converter {
                 self.add_primitive("null");
                 Ok("null".into())
             }
-            "object" => self.visit_object(obj, path),
-            "array" => self.visit_array(obj, path),
+            "object" => self.visit_object(obj, path, depth),
+            "array" => self.visit_array(obj, path, depth),
             other => Err(SchemaError::Generic {
                 path: format!("{}/type", path),
                 message: format!("unsupported type '{}'", other),
@@ -416,10 +512,108 @@ impl Converter {
         }
     }
 
+    fn uninhabited_rule(&mut self, path: &str) -> String {
+        let name = format!("{}-uninhabited", path_slug(path));
+        self.rules
+            .entry(name.clone())
+            .or_insert_with(|| r#"[^\U00000000-\U0010FFFF]"#.to_string());
+        name
+    }
+
+    fn visit_ref(
+        &mut self,
+        reference: &str,
+        path: &str,
+        depth: usize,
+    ) -> Result<String, SchemaError> {
+        if !reference.starts_with('#') || reference.contains('%') {
+            return Err(schema_error(
+                &format!("{path}/$ref"),
+                "only unescaped local JSON Pointer references are supported",
+            ));
+        }
+        if let Some(rule) = self.ref_rules.get(reference) {
+            return Ok(rule.clone());
+        }
+        self.resolved_refs += 1;
+        if self.resolved_refs > MAX_LOCAL_REFS {
+            return Err(schema_error(
+                &format!("{path}/$ref"),
+                format!("resolved references exceed {MAX_LOCAL_REFS}"),
+            ));
+        }
+        let target = if reference == "#" {
+            self.root_schema.clone()
+        } else {
+            self.root_schema
+                .pointer(reference.trim_start_matches('#'))
+                .cloned()
+                .ok_or_else(|| {
+                    schema_error(
+                        &format!("{path}/$ref"),
+                        format!("unresolved local reference {reference:?}"),
+                    )
+                })?
+        };
+        let rule = ref_rule_name(reference);
+        self.ref_rules.insert(reference.to_string(), rule.clone());
+        self.rules.insert(rule.clone(), String::new());
+        self.resolving_refs.insert(reference.to_string());
+        let body = self.visit(&target, reference, depth + 1)?;
+        self.resolving_refs.remove(reference);
+        self.rules.insert(rule.clone(), body);
+        Ok(rule)
+    }
+
+    fn visit_all_of(
+        &mut self,
+        object: &serde_json::Map<String, Value>,
+        branches: &[Value],
+        path: &str,
+        depth: usize,
+    ) -> Result<String, SchemaError> {
+        if branches.is_empty() {
+            let mut base = object.clone();
+            base.remove("allOf");
+            return self.visit(&Value::Object(base), path, depth + 1);
+        }
+        let mut base = Value::Object(object.clone());
+        base.as_object_mut().expect("object").remove("allOf");
+        let conditional_count = branches
+            .iter()
+            .filter(|branch| branch.get("if").is_some())
+            .count();
+        if conditional_count > 0 {
+            if conditional_count != branches.len() || branches.len() != 1 {
+                return Err(schema_error(
+                    &format!("{path}/allOf"),
+                    "conditional allOf currently supports exactly one if/then/else entry",
+                ));
+            }
+            let expanded = expand_conditional(&base, &branches[0], path)?;
+            let slug = path_slug(path);
+            let mut alternatives = Vec::with_capacity(expanded.len());
+            for (index, branch) in expanded.iter().enumerate() {
+                let body =
+                    self.visit(branch, &format!("{path}/allOf/0/branch/{index}"), depth + 1)?;
+                let name = format!("{slug}-conditional-{index}");
+                self.rules.insert(name.clone(), body);
+                alternatives.push(name);
+            }
+            return Ok(alternatives.join(" | "));
+        }
+
+        for (index, branch) in branches.iter().enumerate() {
+            base = merge_schemas(&base, branch, &format!("{path}/allOf/{index}"))?;
+        }
+        self.visit(&base, path, depth + 1)
+    }
+
     fn visit_object(
         &mut self,
         obj: &serde_json::Map<String, Value>,
         path: &str,
+        depth: usize,
     ) -> Result<String, SchemaError> {
         self.add_primitive("string");
         self.add_primitive("value");
@@ -454,12 +648,29 @@ impl Converter {
         //     permissive for now.
         let additional_props = obj.get("additionalProperties");
         let additional_closed = matches!(additional_props, Some(Value::Bool(false)));
+        let additional_value_rule = match additional_props {
+            Some(Value::Object(_)) | Some(Value::Bool(true)) => Some(self.visit(
+                additional_props.expect("present"),
+                &format!("{path}/additionalProperties"),
+                depth + 1,
+            )?),
+            _ => None,
+        };
 
         if properties.is_empty() {
             if additional_closed {
                 // additionalProperties:false + no declared properties means
                 // only the empty object {} is valid.
                 return Ok(r#""{" space "}" space"#.into());
+            }
+            if let Some(value_rule) = additional_value_rule {
+                let name = format!("{}-typed-extra-kv", path_slug(path));
+                self.rules
+                    .insert(name.clone(), format!("string \":\" space {value_rule}"));
+                return Ok(format!(
+                    r#""{{" space ( {0} ("," space {0})* )? "}}" space"#,
+                    name
+                ));
             }
             // No explicit properties — accept any object.
             self.add_primitive("object");
@@ -496,7 +707,7 @@ impl Converter {
 
         for k in &all_keys {
             let v = &properties[*k];
-            let vbody = self.visit(v, &format!("{}/properties/{}", path, k))?;
+            let vbody = self.visit(v, &format!("{}/properties/{}", path, k), depth + 1)?;
             // Value rule: path-slug prefix avoids collisions when two
             // different object schemas share a property name.
             let val_rule = format!("{}-{}", slug, sanitize_rule_name(k));
@@ -542,9 +753,8 @@ impl Converter {
         // The bitmask-based any-order algorithm generates O(2^N_req) unique
         // grammar rules — one per subset of remaining required keys.  This is
         // practical for small N_req but intractable at N_req > ~16.
-        // Threshold = 8 keeps the worst-case to 2^8 = 256 rules, compiling
-        // in microseconds and covering the common case (tool schemas rarely
-        // have more than 8 required keys at the same level).
+        // Threshold = 12 keeps the worst-case bounded at 4096 subset rules
+        // and covers the nine-key r2c ReviewLens contract.
         //
         // For N_req > threshold a hard SchemaError (→ HTTP 400) is returned.
         // A sequential-sorted fallback would silently change semantics from
@@ -553,14 +763,17 @@ impl Converter {
         // xgrammar, outlines-core) all enforce declaration order for the same
         // reason: Moshier & Rounds ACL 1987 prove CFG-for-permutations is
         // exponential; Barton 1985 proves ID/LP recognition is NP-complete.
-        const ANY_ORDER_MAX_REQUIRED: usize = 8;
+        const ANY_ORDER_MAX_REQUIRED: usize = 12;
 
         // Build extra-kv wildcard rule (shared across all states if allowed).
         if !additional_closed {
             let extra_kv_name = format!("{}-extra-kv", slug);
-            self.rules
-                .entry(extra_kv_name)
-                .or_insert_with(|| "string \":\" space value".to_string());
+            self.rules.entry(extra_kv_name).or_insert_with(|| {
+                format!(
+                    "string \":\" space {}",
+                    additional_value_rule.as_deref().unwrap_or("value")
+                )
+            });
         }
 
         // Compute the inner rule reference (the first key-value pair and all
@@ -612,8 +825,8 @@ impl Converter {
             // which is a semantic downgrade.
             //
             // Hard error.  Operator must reduce required parameters or split the
-            // function.  The threshold is ANY_ORDER_MAX_REQUIRED = 8 (256 rules
-            // worst-case — practical and fast).  Propagates as HTTP 400.
+            // function.  The threshold is ANY_ORDER_MAX_REQUIRED = 12 (4096
+            // subset rules worst-case).  Propagates as HTTP 400.
             return Err(SchemaError::TooManyRequiredKeys {
                 fn_name: path.to_string(),
                 count: required_keys.len(),
@@ -828,36 +1041,107 @@ impl Converter {
         &mut self,
         obj: &serde_json::Map<String, Value>,
         path: &str,
+        depth: usize,
     ) -> Result<String, SchemaError> {
         self.rules
             .entry("space".to_string())
             .or_insert_with(|| SPACE_RULE.to_string());
-        let item_schema = obj.get("items");
-        let item_rule = match item_schema {
-            None => {
-                self.add_primitive("value");
-                "value".to_string()
+        let min = obj.get("minItems").and_then(Value::as_u64).unwrap_or(0);
+        let max = obj.get("maxItems").and_then(Value::as_u64);
+        if max.is_some_and(|upper| upper < min) {
+            return Ok(self.uninhabited_rule(path));
+        }
+
+        if let Some(Value::Array(prefix)) = obj.get("prefixItems") {
+            return self.visit_prefix_array(obj, prefix, path, depth, min, max);
+        }
+
+        let item_schema = obj.get("items").unwrap_or(&Value::Bool(true));
+        let item_rule = self.visit(item_schema, &format!("{path}/items"), depth + 1)?;
+        if item_rule.contains("-uninhabited") {
+            return if min == 0 {
+                Ok(r#""[" space "]" space"#.to_string())
+            } else {
+                Ok(self.uninhabited_rule(path))
+            };
+        }
+        let body = repeated_sequence(&item_rule, min, max);
+        Ok(format!(r#""[" space {} "]" space"#, body))
+    }
+
+    fn visit_prefix_array(
+        &mut self,
+        obj: &serde_json::Map<String, Value>,
+        prefix: &[Value],
+        path: &str,
+        depth: usize,
+        min: u64,
+        max: Option<u64>,
+    ) -> Result<String, SchemaError> {
+        if prefix.len() > 32 {
+            return Err(schema_error(
+                &format!("{path}/prefixItems"),
+                format!("{} entries exceed 32", prefix.len()),
+            ));
+        }
+        let mut prefix_rules = Vec::with_capacity(prefix.len());
+        for (index, schema) in prefix.iter().enumerate() {
+            prefix_rules.push(self.visit(
+                schema,
+                &format!("{path}/prefixItems/{index}"),
+                depth + 1,
+            )?);
+        }
+        let tail_schema = obj.get("items").unwrap_or(&Value::Bool(true));
+        let tail_rule = self.visit(tail_schema, &format!("{path}/items"), depth + 1)?;
+        let tail_allowed = !tail_rule.contains("-uninhabited");
+        let prefix_len = prefix_rules.len() as u64;
+        let maximum = max.unwrap_or(u64::MAX);
+        let mut alternatives = Vec::new();
+
+        let short_end = maximum.min(prefix_len.saturating_sub(1));
+        if min <= short_end {
+            for length in min..=short_end {
+                alternatives.push(join_array_items(&prefix_rules[..length as usize]));
             }
-            Some(Value::Object(_)) => {
-                self.visit(item_schema.unwrap(), &format!("{}/items", path))?
+        }
+
+        if maximum >= prefix_len && min <= maximum {
+            if prefix_len == 0
+                || !prefix_rules
+                    .iter()
+                    .any(|rule| rule.contains("-uninhabited"))
+            {
+                let fixed = join_array_items(&prefix_rules);
+                let min_tail = min.saturating_sub(prefix_len);
+                let max_tail = max.map(|upper| upper.saturating_sub(prefix_len));
+                if tail_allowed {
+                    let tail = repeated_sequence(&tail_rule, min_tail, max_tail);
+                    let combined = match (fixed.is_empty(), tail.is_empty()) {
+                        (true, _) => tail,
+                        (_, true) => fixed,
+                        _ if min_tail == 0 => format!(
+                            "{} ( \",\" space {} )?",
+                            fixed,
+                            repeated_sequence(&tail_rule, 1, max_tail)
+                        ),
+                        _ => format!("{} \",\" space {}", fixed, tail),
+                    };
+                    alternatives.push(combined);
+                } else if min_tail == 0 {
+                    alternatives.push(fixed);
+                }
             }
-            Some(Value::Array(_)) => {
-                return Err(SchemaError::Generic {
-                    path: format!("{}/items", path),
-                    message: "tuple-form arrays (items: [...]) not yet supported".into(),
-                });
-            }
-            _ => {
-                return Err(SchemaError::Generic {
-                    path: format!("{}/items", path),
-                    message: "items must be an object schema".into(),
-                });
-            }
-        };
-        // [ items ] with zero-or-more elements, comma-separated.
+        }
+
+        if alternatives.is_empty() {
+            return Ok(self.uninhabited_rule(path));
+        }
+        alternatives.sort();
+        alternatives.dedup();
         Ok(format!(
-            r#""[" space ( {0} ("," space {0})* )? "]" space"#,
-            item_rule
+            r#""[" space ( {} ) "]" space"#,
+            alternatives.join(" | ")
         ))
     }
 }
@@ -886,6 +1170,1010 @@ fn path_slug(path: &str) -> String {
         return "root".into();
     }
     sanitize_rule_name(path.trim_start_matches('/'))
+}
+
+fn schema_error(path: &str, message: impl Into<String>) -> SchemaError {
+    SchemaError::Generic {
+        path: if path.is_empty() { "/" } else { path }.to_string(),
+        message: message.into(),
+    }
+}
+
+fn ref_rule_name(reference: &str) -> String {
+    // Stable FNV-1a suffix prevents two JSON Pointers that sanitize to the
+    // same GBNF identifier from aliasing one another.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in reference.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("ref-{}-{hash:016x}", sanitize_rule_name(reference))
+}
+
+fn empty_expression() -> String {
+    "\"\"".to_string()
+}
+
+fn repeated_sequence(item: &str, min: u64, max: Option<u64>) -> String {
+    if max == Some(0) {
+        return empty_expression();
+    }
+    let comma_item = format!("( \",\" space {item} )");
+    if min == 0 {
+        return match max {
+            None => format!("( {item} {comma_item}* )?"),
+            Some(upper) => format!("( {item} {comma_item}{{0,{}}} )?", upper - 1),
+        };
+    }
+    let required_tail = min - 1;
+    let suffix = match max {
+        None if required_tail == 0 => format!(" {comma_item}*"),
+        None => format!(" {comma_item}{{{required_tail}}} {comma_item}*"),
+        Some(upper) if upper == min && required_tail == 0 => String::new(),
+        Some(upper) if upper == min => format!(" {comma_item}{{{required_tail}}}"),
+        Some(upper) if required_tail == 0 => {
+            format!(" {comma_item}{{0,{}}}", upper - min)
+        }
+        Some(upper) => format!(
+            " {comma_item}{{{required_tail}}} {comma_item}{{0,{}}}",
+            upper - min
+        ),
+    };
+    format!("{item}{suffix}")
+}
+
+fn join_array_items(items: &[String]) -> String {
+    if items.is_empty() {
+        return empty_expression();
+    }
+    items.join(" \",\" space ")
+}
+
+fn is_schema_annotation(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "$schema"
+            | "$id"
+            | "$anchor"
+            | "$comment"
+            | "title"
+            | "description"
+            | "default"
+            | "examples"
+            | "deprecated"
+            | "readOnly"
+            | "writeOnly"
+            | "$defs"
+            | "definitions"
+    )
+}
+
+/// Validate the exact assertion profile accepted by [`schema_to_gbnf`].
+/// This function is also the preflight entry point for family tool emitters:
+/// a lowerer MUST NOT receive an assertion that it could silently weaken.
+pub fn validate_schema_profile(schema: &Value) -> Result<(), SchemaError> {
+    validate_schema_node(schema, "", 0)
+}
+
+/// Resolve local references and lower schema composition into the common
+/// subset consumed by model-family wire emitters. Multiple returned schemas
+/// are disjoint root variants (currently produced by finite conditionals).
+pub fn normalize_schema_variants(schema: &Value) -> Result<Vec<Value>, SchemaError> {
+    validate_schema_profile(schema)?;
+    let mut active = HashSet::new();
+    let mut references = 0usize;
+    let normalized = normalize_schema_node(schema, schema, "", 0, &mut active, &mut references)?;
+    if let Some(branches) = normalized
+        .as_object()
+        .and_then(|object| object.get("oneOf"))
+        .and_then(Value::as_array)
+    {
+        if branches.iter().enumerate().all(|(left, branch)| {
+            branches
+                .iter()
+                .skip(left + 1)
+                .all(|right| schemas_provably_disjoint(branch, right))
+        }) {
+            return Ok(branches.clone());
+        }
+    }
+    Ok(vec![normalized])
+}
+
+fn normalize_schema_node(
+    schema: &Value,
+    root: &Value,
+    path: &str,
+    depth: usize,
+    active: &mut HashSet<String>,
+    references: &mut usize,
+) -> Result<Value, SchemaError> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(schema_error(
+            path,
+            format!("schema nesting exceeds {MAX_SCHEMA_DEPTH}"),
+        ));
+    }
+    if schema.is_boolean() {
+        return Ok(schema.clone());
+    }
+    let object = schema
+        .as_object()
+        .ok_or_else(|| schema_error(path, "schema must be an object or boolean"))?;
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        *references += 1;
+        if *references > MAX_LOCAL_REFS {
+            return Err(schema_error(
+                path,
+                format!("resolved references exceed {MAX_LOCAL_REFS}"),
+            ));
+        }
+        if !active.insert(reference.to_string()) {
+            return Err(schema_error(
+                &format!("{path}/$ref"),
+                "recursive references are supported by response grammars but cannot be inlined into a family tool wire grammar",
+            ));
+        }
+        let target = if reference == "#" {
+            root
+        } else {
+            root.pointer(reference.trim_start_matches('#'))
+                .ok_or_else(|| {
+                    schema_error(
+                        &format!("{path}/$ref"),
+                        format!("unresolved local reference {reference:?}"),
+                    )
+                })?
+        };
+        let result = normalize_schema_node(target, root, reference, depth + 1, active, references);
+        active.remove(reference);
+        return result;
+    }
+
+    let mut normalized = object.clone();
+    normalized.remove("$defs");
+    normalized.remove("definitions");
+    if let Some(value) = normalized.remove("const") {
+        normalized.insert("enum".into(), Value::Array(vec![value]));
+    }
+
+    if let Some(Value::Array(all_of)) = normalized.remove("allOf") {
+        let base = Value::Object(normalized);
+        if all_of.len() == 1 && all_of[0].get("if").is_some() {
+            let branches = expand_conditional(&base, &all_of[0], path)?;
+            let mut output = Vec::with_capacity(branches.len());
+            for (index, branch) in branches.iter().enumerate() {
+                output.push(normalize_schema_node(
+                    branch,
+                    root,
+                    &format!("{path}/allOf/0/branch/{index}"),
+                    depth + 1,
+                    active,
+                    references,
+                )?);
+            }
+            return Ok(serde_json::json!({"oneOf": output}));
+        }
+        let mut merged = base;
+        for (index, branch) in all_of.iter().enumerate() {
+            merged = merge_schemas(&merged, branch, &format!("{path}/allOf/{index}"))?;
+        }
+        return normalize_schema_node(&merged, root, path, depth + 1, active, references);
+    }
+
+    if let Some(Value::Array(kinds)) = normalized.get("type") {
+        let mut branches = Vec::with_capacity(kinds.len());
+        for (index, kind) in kinds.iter().enumerate() {
+            let kind = kind.as_str().expect("validated type union");
+            let mut branch = serde_json::Map::new();
+            for (keyword, value) in &normalized {
+                if keyword == "type" {
+                    branch.insert(keyword.clone(), Value::String(kind.to_string()));
+                } else if is_schema_annotation(keyword) || keyword_applies_to_type(keyword, kind) {
+                    branch.insert(keyword.clone(), value.clone());
+                }
+            }
+            branches.push(normalize_schema_node(
+                &Value::Object(branch),
+                root,
+                &format!("{path}/type/{index}"),
+                depth + 1,
+                active,
+                references,
+            )?);
+        }
+        return Ok(serde_json::json!({"anyOf": branches}));
+    }
+
+    for container in ["properties"] {
+        if let Some(values) = normalized.get_mut(container).and_then(Value::as_object_mut) {
+            for (name, child) in values.iter_mut() {
+                *child = normalize_schema_node(
+                    child,
+                    root,
+                    &format!("{path}/{container}/{name}"),
+                    depth + 1,
+                    active,
+                    references,
+                )?;
+            }
+        }
+    }
+    for keyword in ["items", "additionalProperties"] {
+        if let Some(child) = normalized.get_mut(keyword) {
+            *child = normalize_schema_node(
+                child,
+                root,
+                &format!("{path}/{keyword}"),
+                depth + 1,
+                active,
+                references,
+            )?;
+        }
+    }
+    if let Some(items) = normalized
+        .get_mut("prefixItems")
+        .and_then(Value::as_array_mut)
+    {
+        for (index, child) in items.iter_mut().enumerate() {
+            *child = normalize_schema_node(
+                child,
+                root,
+                &format!("{path}/prefixItems/{index}"),
+                depth + 1,
+                active,
+                references,
+            )?;
+        }
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(branches) = normalized.get_mut(keyword).and_then(Value::as_array_mut) {
+            for (index, branch) in branches.iter_mut().enumerate() {
+                *branch = normalize_schema_node(
+                    branch,
+                    root,
+                    &format!("{path}/{keyword}/{index}"),
+                    depth + 1,
+                    active,
+                    references,
+                )?;
+            }
+        }
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn keyword_applies_to_type(keyword: &str, kind: &str) -> bool {
+    match keyword {
+        "pattern" | "minLength" | "maxLength" => kind == "string",
+        "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" => {
+            kind == "integer" || kind == "number"
+        }
+        "items" | "prefixItems" | "minItems" | "maxItems" => kind == "array",
+        "properties" | "required" | "additionalProperties" | "propertyNames" => kind == "object",
+        "enum" => true,
+        "anyOf" | "oneOf" => true,
+        _ => false,
+    }
+}
+
+fn validate_schema_node(schema: &Value, path: &str, depth: usize) -> Result<(), SchemaError> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(schema_error(
+            path,
+            format!("schema nesting exceeds {MAX_SCHEMA_DEPTH}"),
+        ));
+    }
+    if schema.is_boolean() {
+        return Ok(());
+    }
+    let object = schema
+        .as_object()
+        .ok_or_else(|| schema_error(path, "schema must be an object or boolean"))?;
+
+    const ALLOWED: &[&str] = &[
+        "$schema",
+        "$id",
+        "$anchor",
+        "$comment",
+        "$defs",
+        "definitions",
+        "$ref",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "type",
+        "const",
+        "enum",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "if",
+        "then",
+        "else",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "prefixItems",
+        "minItems",
+        "maxItems",
+        "pattern",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "propertyNames",
+    ];
+    for keyword in object.keys() {
+        if !ALLOWED.contains(&keyword.as_str()) {
+            return Err(schema_error(
+                &format!("{path}/{keyword}"),
+                "unsupported JSON Schema assertion",
+            ));
+        }
+    }
+
+    if object.contains_key("$ref") {
+        let reference = object["$ref"]
+            .as_str()
+            .ok_or_else(|| schema_error(&format!("{path}/$ref"), "$ref must be a string"))?;
+        if !reference.starts_with('#') || reference.contains('%') {
+            return Err(schema_error(
+                &format!("{path}/$ref"),
+                "only unescaped local JSON Pointer references are supported",
+            ));
+        }
+        for keyword in object.keys() {
+            if keyword != "$ref" && !is_schema_annotation(keyword) {
+                return Err(schema_error(
+                    path,
+                    format!("assertion sibling {keyword:?} beside $ref cannot be merged exactly"),
+                ));
+            }
+        }
+    }
+
+    if let Some(kind) = object.get("type") {
+        let valid = match kind {
+            Value::String(value) => is_json_type(value),
+            Value::Array(values) => {
+                !values.is_empty()
+                    && values
+                        .iter()
+                        .all(|value| value.as_str().is_some_and(is_json_type))
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(schema_error(
+                &format!("{path}/type"),
+                "type must name one or more JSON instance types",
+            ));
+        }
+    }
+
+    if let Some(Value::Array(values)) = object.get("enum") {
+        if values.len() > MAX_ENUM_VALUES {
+            return Err(schema_error(
+                &format!("{path}/enum"),
+                format!("{} values exceed {MAX_ENUM_VALUES}", values.len()),
+            ));
+        }
+    } else if object.contains_key("enum") {
+        return Err(schema_error(
+            &format!("{path}/enum"),
+            "enum must be an array",
+        ));
+    }
+
+    if object.contains_key("pattern") {
+        if object.get("pattern").and_then(Value::as_str).is_none() {
+            return Err(schema_error(
+                &format!("{path}/pattern"),
+                "pattern must be a string",
+            ));
+        }
+        if object.contains_key("minLength") || object.contains_key("maxLength") {
+            return Err(schema_error(
+                path,
+                "pattern combined with minLength/maxLength is not exactly representable",
+            ));
+        }
+    }
+
+    for keyword in ["minLength", "maxLength", "minItems", "maxItems"] {
+        if let Some(value) = object.get(keyword) {
+            let bound = value.as_u64().ok_or_else(|| {
+                schema_error(
+                    &format!("{path}/{keyword}"),
+                    "bound must be a nonnegative integer",
+                )
+            })?;
+            if bound > 2000 {
+                return Err(schema_error(
+                    &format!("{path}/{keyword}"),
+                    "bound exceeds repetition limit 2000",
+                ));
+            }
+        }
+    }
+
+    let has_numeric_bound = ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]
+        .iter()
+        .any(|keyword| object.contains_key(*keyword));
+    if has_numeric_bound {
+        let exact_min_zero = object.get("type").and_then(Value::as_str) == Some("integer")
+            && object.get("minimum").and_then(Value::as_i64) == Some(0)
+            && object.get("maximum").is_none()
+            && object.get("exclusiveMinimum").is_none()
+            && object.get("exclusiveMaximum").is_none();
+        if !exact_min_zero {
+            return Err(schema_error(
+                path,
+                "only the exact nonnegative-integer bound minimum: 0 is currently supported",
+            ));
+        }
+    }
+
+    if let Some(properties) = object.get("properties") {
+        let properties = properties.as_object().ok_or_else(|| {
+            schema_error(
+                &format!("{path}/properties"),
+                "properties must be an object",
+            )
+        })?;
+        if properties.len() > 32 {
+            return Err(schema_error(
+                &format!("{path}/properties"),
+                format!("{} properties exceed 32", properties.len()),
+            ));
+        }
+        for (name, child) in properties {
+            validate_schema_node(child, &format!("{path}/properties/{name}"), depth + 1)?;
+        }
+    }
+
+    if let Some(property_names) = object.get("propertyNames") {
+        let tautology = match property_names {
+            Value::Bool(true) => true,
+            Value::Object(schema) if schema.is_empty() => true,
+            Value::Object(schema) => {
+                schema.len() == 1 && schema.get("type").and_then(Value::as_str) == Some("string")
+            }
+            _ => false,
+        };
+        if !tautology {
+            return Err(schema_error(
+                &format!("{path}/propertyNames"),
+                "constrained propertyNames is not exactly representable",
+            ));
+        }
+    }
+
+    if let Some(required) = object.get("required") {
+        let required = required.as_array().ok_or_else(|| {
+            schema_error(&format!("{path}/required"), "required must be an array")
+        })?;
+        let properties = object
+            .get("properties")
+            .and_then(Value::as_object)
+            .ok_or_else(|| schema_error(path, "required needs an explicit properties object"))?;
+        let mut names = HashSet::new();
+        for (index, value) in required.iter().enumerate() {
+            let name = value.as_str().ok_or_else(|| {
+                schema_error(
+                    &format!("{path}/required/{index}"),
+                    "required entries must be strings",
+                )
+            })?;
+            if !properties.contains_key(name) {
+                return Err(schema_error(
+                    &format!("{path}/required/{index}"),
+                    format!("required property {name:?} is not declared"),
+                ));
+            }
+            if !names.insert(name) {
+                return Err(schema_error(
+                    &format!("{path}/required/{index}"),
+                    format!("duplicate required property {name:?}"),
+                ));
+            }
+        }
+    }
+
+    if let Some(additional) = object.get("additionalProperties") {
+        if !additional.is_boolean() && !additional.is_object() {
+            return Err(schema_error(
+                &format!("{path}/additionalProperties"),
+                "additionalProperties must be a schema",
+            ));
+        }
+        if additional.is_object()
+            && object
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| !properties.is_empty())
+        {
+            return Err(schema_error(
+                &format!("{path}/additionalProperties"),
+                "typed additional properties alongside declared properties require exact key exclusion",
+            ));
+        }
+        validate_schema_node(
+            additional,
+            &format!("{path}/additionalProperties"),
+            depth + 1,
+        )?;
+    }
+
+    for container in ["$defs", "definitions", "properties"] {
+        if let Some(values) = object.get(container).and_then(Value::as_object) {
+            if container != "properties" {
+                for (name, child) in values {
+                    validate_schema_node(child, &format!("{path}/{container}/{name}"), depth + 1)?;
+                }
+            }
+        }
+    }
+    if let Some(items) = object.get("items") {
+        validate_schema_node(items, &format!("{path}/items"), depth + 1)?;
+    }
+    if let Some(prefix) = object.get("prefixItems") {
+        let prefix = prefix.as_array().ok_or_else(|| {
+            schema_error(
+                &format!("{path}/prefixItems"),
+                "prefixItems must be an array",
+            )
+        })?;
+        if prefix.len() > 32 {
+            return Err(schema_error(
+                &format!("{path}/prefixItems"),
+                format!("{} entries exceed 32", prefix.len()),
+            ));
+        }
+        for (index, child) in prefix.iter().enumerate() {
+            validate_schema_node(child, &format!("{path}/prefixItems/{index}"), depth + 1)?;
+        }
+    }
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = object.get(keyword) {
+            let branches = branches.as_array().ok_or_else(|| {
+                schema_error(
+                    &format!("{path}/{keyword}"),
+                    format!("{keyword} must be an array"),
+                )
+            })?;
+            for (index, branch) in branches.iter().enumerate() {
+                validate_schema_node(branch, &format!("{path}/{keyword}/{index}"), depth + 1)?;
+            }
+        }
+    }
+    for keyword in ["if", "then", "else"] {
+        if let Some(branch) = object.get(keyword) {
+            validate_schema_node(branch, &format!("{path}/{keyword}"), depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_json_type(value: &str) -> bool {
+    matches!(
+        value,
+        "null" | "boolean" | "object" | "array" | "number" | "integer" | "string"
+    )
+}
+
+fn schema_types(schema: &Value) -> Option<HashSet<String>> {
+    let object = schema.as_object()?;
+    match object.get("type") {
+        Some(Value::String(value)) => Some([value.clone()].into_iter().collect()),
+        Some(Value::Array(values)) => Some(
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn finite_values(schema: &Value) -> Option<HashSet<String>> {
+    let object = schema.as_object()?;
+    if let Some(value) = object.get("const") {
+        return Some([serde_json::to_string(value).ok()?].into_iter().collect());
+    }
+    object.get("enum").and_then(Value::as_array).map(|values| {
+        values
+            .iter()
+            .filter_map(|value| serde_json::to_string(value).ok())
+            .collect()
+    })
+}
+
+fn types_overlap(left: &HashSet<String>, right: &HashSet<String>) -> bool {
+    left.iter().any(|kind| {
+        right.contains(kind)
+            || (kind == "integer" && right.contains("number"))
+            || (kind == "number" && right.contains("integer"))
+    })
+}
+
+fn schemas_provably_disjoint(left: &Value, right: &Value) -> bool {
+    if left == &Value::Bool(false) || right == &Value::Bool(false) {
+        return true;
+    }
+    if let (Some(left_values), Some(right_values)) = (finite_values(left), finite_values(right)) {
+        return left_values.is_disjoint(&right_values);
+    }
+    if let (Some(left_types), Some(right_types)) = (schema_types(left), schema_types(right)) {
+        if !types_overlap(&left_types, &right_types) {
+            return true;
+        }
+    }
+    let (Some(left_object), Some(right_object)) = (left.as_object(), right.as_object()) else {
+        return false;
+    };
+    let left_required: HashSet<&str> = left_object
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let right_required: HashSet<&str> = right_object
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let left_properties = left_object.get("properties").and_then(Value::as_object);
+    let right_properties = right_object.get("properties").and_then(Value::as_object);
+    let (Some(left_properties), Some(right_properties)) = (left_properties, right_properties)
+    else {
+        return false;
+    };
+    left_properties.iter().any(|(name, left_schema)| {
+        left_required.contains(name.as_str())
+            && right_required.contains(name.as_str())
+            && right_properties
+                .get(name)
+                .is_some_and(|right_schema| schemas_provably_disjoint(left_schema, right_schema))
+    })
+}
+
+fn merge_schemas(left: &Value, right: &Value, path: &str) -> Result<Value, SchemaError> {
+    match (left, right) {
+        (Value::Bool(false), _) | (_, Value::Bool(false)) => return Ok(Value::Bool(false)),
+        (Value::Bool(true), value) | (value, Value::Bool(true)) => return Ok(value.clone()),
+        _ => {}
+    }
+    let mut merged = left
+        .as_object()
+        .cloned()
+        .ok_or_else(|| schema_error(path, "allOf branches must be schemas"))?;
+    let right = right
+        .as_object()
+        .ok_or_else(|| schema_error(path, "allOf branches must be schemas"))?;
+    for (keyword, value) in right {
+        if is_schema_annotation(keyword) {
+            merged
+                .entry(keyword.clone())
+                .or_insert_with(|| value.clone());
+            continue;
+        }
+        match keyword.as_str() {
+            "type" => {
+                if let Some(existing) = merged.get("type") {
+                    let left_types = type_value_set(existing, path)?;
+                    let right_types = type_value_set(value, path)?;
+                    let mut intersection: Vec<String> =
+                        left_types.intersection(&right_types).cloned().collect();
+                    if left_types.contains("number") && right_types.contains("integer")
+                        || left_types.contains("integer") && right_types.contains("number")
+                    {
+                        intersection.push("integer".to_string());
+                    }
+                    intersection.sort();
+                    intersection.dedup();
+                    if intersection.is_empty() {
+                        return Ok(Value::Bool(false));
+                    }
+                    merged.insert(
+                        "type".into(),
+                        if intersection.len() == 1 {
+                            Value::String(intersection.remove(0))
+                        } else {
+                            Value::Array(intersection.into_iter().map(Value::String).collect())
+                        },
+                    );
+                } else {
+                    merged.insert(keyword.clone(), value.clone());
+                }
+            }
+            "required" => {
+                let mut names: Vec<Value> = merged
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                names.extend(value.as_array().cloned().ok_or_else(|| {
+                    schema_error(&format!("{path}/required"), "required must be an array")
+                })?);
+                names.sort_by_key(|entry| entry.as_str().unwrap_or_default().to_string());
+                names.dedup();
+                merged.insert("required".into(), Value::Array(names));
+            }
+            "properties" => {
+                let mut properties = merged
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                for (name, child) in value.as_object().ok_or_else(|| {
+                    schema_error(
+                        &format!("{path}/properties"),
+                        "properties must be an object",
+                    )
+                })? {
+                    if let Some(existing) = properties.get(name) {
+                        properties.insert(
+                            name.clone(),
+                            merge_schemas(existing, child, &format!("{path}/properties/{name}"))?,
+                        );
+                    } else {
+                        properties.insert(name.clone(), child.clone());
+                    }
+                }
+                merged.insert("properties".into(), Value::Object(properties));
+            }
+            "minimum" | "exclusiveMinimum" | "minLength" | "minItems" => {
+                let chosen = match merged.get(keyword) {
+                    Some(existing) if number_as_f64(existing)? >= number_as_f64(value)? => {
+                        existing.clone()
+                    }
+                    _ => value.clone(),
+                };
+                merged.insert(keyword.clone(), chosen);
+            }
+            "maximum" | "exclusiveMaximum" | "maxLength" | "maxItems" => {
+                let chosen = match merged.get(keyword) {
+                    Some(existing) if number_as_f64(existing)? <= number_as_f64(value)? => {
+                        existing.clone()
+                    }
+                    _ => value.clone(),
+                };
+                merged.insert(keyword.clone(), chosen);
+            }
+            "additionalProperties" => match merged.get(keyword) {
+                None | Some(Value::Bool(true)) => {
+                    merged.insert(keyword.clone(), value.clone());
+                }
+                Some(Value::Bool(false)) => {}
+                Some(existing) if existing == value => {}
+                Some(_) if value == &Value::Bool(false) => {
+                    merged.insert(keyword.clone(), Value::Bool(false));
+                }
+                Some(_) => {
+                    return Err(schema_error(
+                        &format!("{path}/{keyword}"),
+                        "additionalProperties intersection is not exactly representable",
+                    ))
+                }
+            },
+            "const" | "enum" => {
+                let current = Value::Object(merged.clone());
+                let mut right_finite = serde_json::Map::new();
+                right_finite.insert(keyword.clone(), value.clone());
+                if let (Some(left_values), Some(right_values)) = (
+                    finite_values(&current),
+                    finite_values(&Value::Object(right_finite)),
+                ) {
+                    let values: Vec<Value> = left_values
+                        .intersection(&right_values)
+                        .filter_map(|encoded| serde_json::from_str(encoded).ok())
+                        .collect();
+                    if values.is_empty() {
+                        return Ok(Value::Bool(false));
+                    }
+                    merged.remove("const");
+                    merged.insert("enum".into(), Value::Array(values));
+                } else {
+                    merged.insert(keyword.clone(), value.clone());
+                }
+            }
+            _ => match merged.get(keyword) {
+                None => {
+                    merged.insert(keyword.clone(), value.clone());
+                }
+                Some(existing) if existing == value => {}
+                Some(_) => {
+                    return Err(schema_error(
+                        &format!("{path}/{keyword}"),
+                        "allOf intersection is not exactly representable",
+                    ))
+                }
+            },
+        }
+    }
+    Ok(Value::Object(merged))
+}
+
+fn type_value_set(value: &Value, path: &str) -> Result<HashSet<String>, SchemaError> {
+    match value {
+        Value::String(kind) => Ok([kind.clone()].into_iter().collect()),
+        Value::Array(kinds) => kinds
+            .iter()
+            .map(|kind| {
+                kind.as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| schema_error(path, "type union entries must be strings"))
+            })
+            .collect(),
+        _ => Err(schema_error(path, "type must be a string or array")),
+    }
+}
+
+fn number_as_f64(value: &Value) -> Result<f64, SchemaError> {
+    value
+        .as_f64()
+        .ok_or_else(|| schema_error("/", "numeric bound must be a finite JSON number"))
+}
+
+fn expand_conditional(
+    base: &Value,
+    conditional: &Value,
+    path: &str,
+) -> Result<Vec<Value>, SchemaError> {
+    let object = conditional
+        .as_object()
+        .ok_or_else(|| schema_error(&format!("{path}/allOf/0"), "conditional must be an object"))?;
+    let predicate = object
+        .get("if")
+        .and_then(Value::as_object)
+        .ok_or_else(|| schema_error(&format!("{path}/allOf/0/if"), "if must be an object"))?;
+    let predicate_properties = predicate
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| schema_error(&format!("{path}/allOf/0/if"), "if needs properties"))?;
+    if predicate_properties.len() != 1 {
+        return Err(schema_error(
+            &format!("{path}/allOf/0/if/properties"),
+            "conditional discriminator must contain exactly one property",
+        ));
+    }
+    let (name, condition_schema) = predicate_properties.iter().next().expect("one property");
+    let predicate_required = predicate
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| required.iter().any(|entry| entry.as_str() == Some(name)));
+    if !predicate_required {
+        return Err(schema_error(
+            &format!("{path}/allOf/0/if/required"),
+            "conditional discriminator must be required",
+        ));
+    }
+    let original = base
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(name))
+        .ok_or_else(|| {
+            schema_error(
+                &format!("{path}/properties/{name}"),
+                "conditional discriminator must be declared by the base schema",
+            )
+        })?;
+
+    let mut matched = base.clone();
+    set_property_schema(
+        &mut matched,
+        name,
+        merge_schemas(original, condition_schema, path)?,
+    )?;
+    add_required_property(&mut matched, name)?;
+    if let Some(then_schema) = object.get("then") {
+        matched = merge_schemas(&matched, then_schema, &format!("{path}/allOf/0/then"))?;
+    }
+
+    let complement = complement_discriminator(original, condition_schema, path)?;
+    let mut unmatched = base.clone();
+    set_property_schema(&mut unmatched, name, complement)?;
+    if let Some(else_schema) = object.get("else") {
+        unmatched = merge_schemas(&unmatched, else_schema, &format!("{path}/allOf/0/else"))?;
+    }
+    Ok(vec![matched, unmatched])
+}
+
+fn set_property_schema(target: &mut Value, name: &str, schema: Value) -> Result<(), SchemaError> {
+    target
+        .as_object_mut()
+        .and_then(|object| object.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| schema_error("/properties", "base schema needs properties"))?
+        .insert(name.to_string(), schema);
+    Ok(())
+}
+
+fn add_required_property(target: &mut Value, name: &str) -> Result<(), SchemaError> {
+    let object = target
+        .as_object_mut()
+        .ok_or_else(|| schema_error("/", "base schema must be an object"))?;
+    let required = object
+        .entry("required")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| schema_error("/required", "required must be an array"))?;
+    if !required.iter().any(|entry| entry.as_str() == Some(name)) {
+        required.push(Value::String(name.to_string()));
+    }
+    Ok(())
+}
+
+fn complement_discriminator(
+    original: &Value,
+    condition: &Value,
+    path: &str,
+) -> Result<Value, SchemaError> {
+    if condition.get("type").and_then(Value::as_str) == Some("null") {
+        let mut object = original
+            .as_object()
+            .cloned()
+            .ok_or_else(|| schema_error(path, "discriminator schema must be an object"))?;
+        let mut kinds: Vec<String> = schema_types(original)
+            .unwrap_or_else(|| {
+                ["boolean", "object", "array", "number", "string"]
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .into_iter()
+            .filter(|kind| kind != "null")
+            .collect();
+        kinds.sort();
+        if kinds.is_empty() {
+            return Ok(Value::Bool(false));
+        }
+        object.insert(
+            "type".into(),
+            if kinds.len() == 1 {
+                Value::String(kinds.remove(0))
+            } else {
+                Value::Array(kinds.into_iter().map(Value::String).collect())
+            },
+        );
+        return Ok(Value::Object(object));
+    }
+    let Some(original_values) = finite_values(original) else {
+        return Err(schema_error(
+            path,
+            "finite const/enum discriminator needs a finite base domain",
+        ));
+    };
+    let Some(condition_values) = finite_values(condition) else {
+        return Err(schema_error(
+            path,
+            "conditional discriminator must be type:null, const, or enum",
+        ));
+    };
+    let values: Vec<Value> = original_values
+        .difference(&condition_values)
+        .filter_map(|encoded| serde_json::from_str(encoded).ok())
+        .collect();
+    if values.is_empty() {
+        return Ok(Value::Bool(false));
+    }
+    let mut object = original.as_object().cloned().unwrap_or_default();
+    object.remove("const");
+    object.insert("enum".into(), Value::Array(values));
+    Ok(Value::Object(object))
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,19 +2394,17 @@ mod tests {
     fn unsupported_type_rejected_at_compile_time() {
         let schema: Value = serde_json::from_str(r#"{"type":"notathing"}"#).unwrap();
         let err = schema_to_gbnf(&schema).unwrap_err();
-        assert!(err.to_string().contains("unsupported type"));
+        assert!(err.to_string().contains("JSON instance types"));
     }
 
     #[test]
-    fn pattern_not_yet_supported_but_compiles_when_ignored() {
-        // `pattern` isn't in our subset — we ignore unknown keys silently.
-        // (The test documents this behavior: the grammar compiles as if
-        // pattern weren't there. Stricter mode comes with iter 9+.)
+    fn pattern_is_enforced_in_response_schema() {
         let schema = r#"{"type":"string","pattern":"^[a-z]+$"}"#;
-        let mut rt = runtime(schema);
-        // No constraint beyond "any JSON string".
-        assert!(rt.accept_bytes(b"\"ABC123\""));
-        assert!(rt.is_accepted());
+        let mut good = runtime(schema);
+        assert!(good.accept_bytes(b"\"lowercase\""));
+        assert!(good.is_accepted());
+        let mut bad = runtime(schema);
+        assert!(!bad.accept_bytes(b"\"ABC123\""));
     }
 
     #[test]
@@ -1697,7 +2983,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Q3 — hard 400 at >8 required keys (Wave 2.6 W-β2)
+    // ADR-052 — hard 400 above the 12-key bounded permutation budget.
     //
     // Research grounding: Moshier & Rounds ACL 1987 prove CFG-for-permutations
     // of n required keys is exponential. All production engines (the peer,
@@ -1706,14 +2992,14 @@ mod tests {
     // violation). Replaced with hard SchemaError → HTTP 400.
     // -----------------------------------------------------------------
 
-    /// Boundary at 9 required keys (just over ANY_ORDER_MAX_REQUIRED=8):
+    /// Boundary at 13 required keys (just over ANY_ORDER_MAX_REQUIRED=12):
     /// must return SchemaError with an operator-actionable message.
     /// HTTP 400 propagation is handled by compile_tool_grammar → ApiError.
     #[test]
-    fn nine_required_keys_returns_too_many_required_keys() {
+    fn thirteen_required_keys_returns_too_many_required_keys() {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..9usize {
+        for i in 0..13usize {
             let key = format!("k{}", i);
             props.insert(key.clone(), serde_json::json!({"type": "string"}));
             required.push(serde_json::Value::String(key));
@@ -1730,16 +3016,16 @@ mod tests {
         // W-ζ LOW: assert the typed TooManyRequiredKeys variant is returned.
         match &err {
             SchemaError::TooManyRequiredKeys { count, max, .. } => {
-                assert_eq!(*count, 9, "variant must carry count=9");
-                assert_eq!(*max, 8_usize, "variant must carry max=8");
+                assert_eq!(*count, 13, "variant must carry count=13");
+                assert_eq!(*max, 12_usize, "variant must carry max=12");
             }
             other => panic!("expected TooManyRequiredKeys variant; got {:?}", other),
         }
         // Display must be operator-actionable: count, limit, citation, action.
         let msg = err.to_string();
         assert!(
-            msg.contains("9") && msg.contains("8"),
-            "expected error mentioning count=9 and limit=8; got: {:?}",
+            msg.contains("13") && msg.contains("12"),
+            "expected error mentioning count=13 and limit=12; got: {:?}",
             msg
         );
         assert!(
@@ -1754,13 +3040,13 @@ mod tests {
         );
     }
 
-    /// Boundary at exactly 8 required keys (the supported maximum):
+    /// Boundary at exactly 12 required keys (the supported maximum):
     /// must compile successfully with full any-position semantics.
     #[test]
-    fn eight_required_keys_compiles_ok() {
+    fn twelve_required_keys_compiles_ok() {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..8usize {
+        for i in 0..12usize {
             let key = format!("k{}", i);
             props.insert(key.clone(), serde_json::json!({"type": "integer"}));
             required.push(serde_json::Value::String(key));
@@ -1777,7 +3063,7 @@ mod tests {
         let result = schema_to_gbnf(&schema);
         assert!(
             result.is_ok(),
-            "8 required keys should compile (is the supported max); got: {:?}",
+            "12 required keys should compile (is the supported max); got: {:?}",
             result.err()
         );
 
@@ -1787,14 +3073,14 @@ mod tests {
         let rid = g.rule_id("root").unwrap();
         let mut rt = GrammarRuntime::new(g, rid).unwrap();
         // Emit keys in reverse alphabetical order (k7..k0).
-        let reversed = br#"{"k7":7,"k6":6,"k5":5,"k4":4,"k3":3,"k2":2,"k1":1,"k0":0}"#;
+        let reversed = br#"{"k11":11,"k10":10,"k9":9,"k8":8,"k7":7,"k6":6,"k5":5,"k4":4,"k3":3,"k2":2,"k1":1,"k0":0}"#;
         assert!(
             rt.accept_bytes(reversed),
-            "8-key schema rejected reversed-order input (any-position not enforced)"
+            "12-key schema rejected reversed-order input (any-position not enforced)"
         );
         assert!(
             rt.is_accepted(),
-            "8-key schema not accepted after reversed input"
+            "12-key schema not accepted after reversed input"
         );
     }
 
@@ -1870,7 +3156,7 @@ mod tests {
         let err = schema_to_gbnf(&schema).unwrap_err();
         // Must be Generic variant.
         assert!(
-            matches!(&err, SchemaError::Generic { message, .. } if message.contains("unsupported type")),
+            matches!(&err, SchemaError::Generic { message, .. } if message.contains("JSON instance types")),
             "unsupported-type error must be SchemaError::Generic; got {:?}",
             err
         );
@@ -1882,19 +3168,19 @@ mod tests {
             s
         );
         assert!(
-            s.contains("unsupported type"),
+            s.contains("JSON instance types"),
             "Display must contain message: {}",
             s
         );
     }
 
-    /// W-ζ LOW: >8-required-keys path emits TooManyRequiredKeys variant
+    /// W-ζ LOW: >12-required-keys path emits TooManyRequiredKeys variant
     /// carrying fn_name + count.
     #[test]
     fn too_many_required_keys_variant_carries_fn_name_and_count() {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..9usize {
+        for i in 0..13usize {
             let k = format!("field{}", i);
             props.insert(k.clone(), serde_json::json!({"type": "string"}));
             required.push(serde_json::Value::String(k));
@@ -1913,14 +3199,163 @@ mod tests {
             } => {
                 // fn_name holds the path (empty = root in schema_to_gbnf context).
                 let _ = fn_name; // path is empty string at root; just assert presence
-                assert_eq!(*count, 9, "TooManyRequiredKeys must carry count=9");
-                assert_eq!(*max, 8, "TooManyRequiredKeys must carry max=8");
+                assert_eq!(*count, 13, "TooManyRequiredKeys must carry count=13");
+                assert_eq!(*max, 12, "TooManyRequiredKeys must carry max=12");
             }
             other => panic!("expected SchemaError::TooManyRequiredKeys; got {:?}", other),
         }
         // Display must be actionable.
         let s = err.to_string();
-        assert!(s.contains("9"), "Display must mention count: {}", s);
-        assert!(s.contains("8"), "Display must mention cap: {}", s);
+        assert!(s.contains("13"), "Display must mention count: {}", s);
+        assert!(s.contains("12"), "Display must mention cap: {}", s);
+    }
+
+    fn accepts_fixture(schema: &str, instance: &str) -> bool {
+        let schema: Value = serde_json::from_str(schema).expect("schema fixture JSON");
+        let instance: Value = serde_json::from_str(instance).expect("instance fixture JSON");
+        let bytes = serde_json::to_vec(&instance).expect("serialize instance");
+        let grammar = schema_to_gbnf(&schema).expect("compile schema fixture");
+        let grammar = parse(&grammar)
+            .unwrap_or_else(|error| panic!("parse generated grammar: {error}\n{grammar}"));
+        let root = grammar.rule_id("root").expect("root rule");
+        let mut runtime = GrammarRuntime::new(grammar, root).expect("runtime");
+        runtime.accept_bytes(&bytes) && runtime.is_accepted()
+    }
+
+    #[test]
+    fn r2c_stage6_review_lens_fixture_and_mutants() {
+        let schema = include_str!(
+            "../../../../tests/fixtures/structured_output/r2c/stage6_review_lens.schema.json"
+        );
+        assert!(accepts_fixture(
+            schema,
+            include_str!(
+                "../../../../tests/fixtures/structured_output/r2c/stage6_review_lens.valid.json"
+            )
+        ));
+        assert!(!accepts_fixture(
+            schema,
+            include_str!(
+                "../../../../tests/fixtures/structured_output/r2c/stage6_review_lens.invalid_disposition.json"
+            )
+        ));
+        assert!(!accepts_fixture(
+            schema,
+            include_str!(
+                "../../../../tests/fixtures/structured_output/r2c/stage6_review_lens.invalid_missing_detail.json"
+            )
+        ));
+    }
+
+    #[test]
+    fn r2c_stage9_cwe_fixture_and_mutants() {
+        let schema =
+            include_str!("../../../../tests/fixtures/structured_output/r2c/stage9_cwe.schema.json");
+        for valid in [
+            include_str!("../../../../tests/fixtures/structured_output/r2c/stage9_cwe.valid.json"),
+            include_str!(
+                "../../../../tests/fixtures/structured_output/r2c/stage9_cwe.valid_abstention.json"
+            ),
+        ] {
+            assert!(accepts_fixture(schema, valid));
+        }
+        for invalid in [
+            include_str!(
+                "../../../../tests/fixtures/structured_output/r2c/stage9_cwe.invalid_cwe.json"
+            ),
+            include_str!(
+                "../../../../tests/fixtures/structured_output/r2c/stage9_cwe.invalid_abstention.json"
+            ),
+        ] {
+            assert!(!accepts_fixture(schema, invalid));
+        }
+    }
+
+    #[test]
+    fn local_refs_decode_json_pointer_and_reuse_rules() {
+        let schema = r##"{
+            "$defs":{"a/b":{"type":"string","const":"ok"}},
+            "type":"array","items":{"$ref":"#/$defs/a~1b"},"minItems":2,"maxItems":2
+        }"##;
+        let mut good = runtime(schema);
+        assert!(good.accept_bytes(br#"["ok","ok"]"#));
+        assert!(good.is_accepted());
+        let mut bad = runtime(schema);
+        assert!(!bad.accept_bytes(br#"["ok","bad"]"#));
+    }
+
+    #[test]
+    fn exact_one_of_rejects_overlapping_branches() {
+        let schema: Value = serde_json::json!({
+            "oneOf": [{"type":"string"}, {"type":"string","minLength":1}]
+        });
+        let error = schema_to_gbnf(&schema).expect_err("overlap must fail closed");
+        assert!(error.to_string().contains("not provably disjoint"));
+    }
+
+    #[test]
+    fn all_of_intersects_const_and_enum_without_dynamic_key_loss() {
+        let schema = serde_json::json!({
+            "allOf": [
+                {"type":"string", "enum":["allow", "deny"]},
+                {"const":"allow"}
+            ]
+        });
+        let grammar = schema_to_gbnf(&schema).expect("intersect allOf");
+        let parsed = parse(&grammar).expect("parse allOf grammar");
+        let root = parsed.rule_id("root").expect("root");
+        let mut allowed = GrammarRuntime::new(parsed.clone(), root).expect("runtime");
+        assert!(allowed.accept_bytes(br#""allow""#));
+        assert!(allowed.is_accepted());
+        let mut denied = GrammarRuntime::new(parsed, root).expect("runtime");
+        assert!(!denied.accept_bytes(br#""deny""#) || !denied.is_accepted());
+    }
+
+    #[test]
+    fn false_schema_compiles_to_empty_language() {
+        let grammar = schema_to_gbnf(&Value::Bool(false)).expect("false schema grammar");
+        let grammar = parse(&grammar).expect("parse false schema grammar");
+        let root = grammar.rule_id("root").expect("root");
+        let runtime = GrammarRuntime::new(grammar, root).expect("runtime");
+        assert!(!runtime.is_accepted());
+        for bytes in [b"null".as_slice(), b"0", br#""x""#, b"{}", b"[]"] {
+            let grammar = schema_to_gbnf(&Value::Bool(false)).unwrap();
+            let grammar = parse(&grammar).unwrap();
+            let root = grammar.rule_id("root").unwrap();
+            let mut runtime = GrammarRuntime::new(grammar, root).unwrap();
+            assert!(!runtime.accept_bytes(bytes));
+        }
+    }
+
+    #[test]
+    fn unsupported_assertions_fail_closed_with_pointer() {
+        for keyword in [
+            "multipleOf",
+            "uniqueItems",
+            "contains",
+            "not",
+            "patternProperties",
+        ] {
+            let schema = serde_json::json!({"type":"array", keyword: true});
+            let error = schema_to_gbnf(&schema).expect_err(keyword);
+            assert!(error.to_string().contains(keyword), "{error}");
+        }
+    }
+
+    #[test]
+    fn bounded_strings_and_arrays_enforce_both_edges() {
+        let mut string = runtime(r#"{"type":"string","minLength":2,"maxLength":3}"#);
+        assert!(string.accept_bytes(br#""ab""#));
+        assert!(string.is_accepted());
+        let mut short = runtime(r#"{"type":"string","minLength":2,"maxLength":3}"#);
+        assert!(!short.accept_bytes(br#""a""#) || !short.is_accepted());
+
+        let mut array =
+            runtime(r#"{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":2}"#);
+        assert!(array.accept_bytes(b"[1,2]"));
+        assert!(array.is_accepted());
+        let mut too_many =
+            runtime(r#"{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":2}"#);
+        assert!(!too_many.accept_bytes(b"[1,2,3]"));
     }
 }

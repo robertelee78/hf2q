@@ -222,7 +222,7 @@ Untrusted constraints MUST be bounded before runtime. Initial limits are:
 - schema traversal depth: 64;
 - resolved local references: 1,024;
 - object properties: 32 per object;
-- unordered required properties: 8 per object;
+- unordered required properties: 12 per object (Stage 6 requires nine);
 - choices/enumerants/structural-tag structures: 1,024;
 - total choice/enumerant literal bytes: 1 MiB;
 - repetition bound: 2,000;

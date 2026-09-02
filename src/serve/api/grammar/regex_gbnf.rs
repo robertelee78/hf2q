@@ -51,6 +51,9 @@ use std::fmt;
 /// (negated classes, `.`, contains-wrappers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
+    /// Ordinary JSON string content. Quotes, backslashes, and raw controls
+    /// are structural; `<` is ordinary data (unlike tool-marker surfaces).
+    JsonString,
     /// Qwen nested JSON string: content between `"..."` — `"` and `\`
     /// (JSON syntax) and `<` (the `</parameter>` first byte) are
     /// forbidden; raw control bytes are invalid JSON.
@@ -58,6 +61,9 @@ pub enum Surface {
     /// Qwen top-level raw string: content between XML tags — `<`
     /// forbidden (close-tag first byte).
     QwenRawString,
+    /// DeepSeek DSML raw string. The runtime keeps the close-tag parse alive
+    /// while `<` is ambiguous, so source text may contain angle brackets.
+    DeepSeekRawString,
     /// Gemma marker string: content between `<|"|>...<|"|>` — `<`
     /// forbidden (marker first byte).
     GemmaMarkerString,
@@ -115,8 +121,10 @@ pub fn regex_to_gbnf_body(pattern: &str, surface: Surface) -> Result<String, Reg
 /// linefeed", intersected with the surface's structural forbiddens.
 fn dot_class(surface: Surface) -> &'static str {
     match surface {
+        Surface::JsonString => r#"[^"\\\n\x00-\x1F]"#,
         Surface::QwenJsonString => r#"[^"\\<\n\x00-\x1F]"#,
         Surface::QwenRawString => "[^<\n]",
+        Surface::DeepSeekRawString => "[^\n]",
         Surface::GemmaMarkerString => "[^<\n]",
     }
 }
@@ -390,10 +398,12 @@ impl<'a> Parser<'a> {
     /// can never swallow the string terminator.
     fn negated_class(&self, items: &str) -> String {
         match self.surface {
+            Surface::JsonString => format!("[^{}\"\\\\\\x00-\\x1F]", items),
             Surface::QwenJsonString => format!("[^{}\"\\\\<\\x00-\\x1F]", items),
             Surface::QwenRawString | Surface::GemmaMarkerString => {
                 format!("[^{}<]", items)
             }
+            Surface::DeepSeekRawString => format!("[^{}]", items),
         }
     }
 
@@ -580,6 +590,10 @@ mod tests {
         assert_eq!(
             regex_to_gbnf_body("^.$", Surface::GemmaMarkerString).unwrap(),
             "[^<\n]"
+        );
+        assert_eq!(
+            regex_to_gbnf_body("^.$", Surface::DeepSeekRawString).unwrap(),
+            "[^\n]"
         );
     }
 
