@@ -4449,6 +4449,12 @@ ws ::= | " " | "\n" [ \t]{0,20}
                 }
             }
         }
+        ResponseFormat::StructuralTag { .. } => {
+            return Err(ApiError::grammar_error(
+                "response_format structural_tag is not implemented",
+            )
+            .into_response());
+        }
     };
     match grammar::parser::parse(&gbnf) {
         Ok(g) => Ok(Some(g)),
@@ -4996,6 +5002,12 @@ mod compile_tool_grammar_precondition_tests {
             tools,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
@@ -7254,6 +7266,26 @@ mod grammar_kind_selection_tests {
              through the PRODUCTION helper (not a stand-in match). This proves \
              the wave-2.5 audit fix is wired through the real selection path."
         );
+    }
+
+    /// The typed structural-tag request surface lands before its XGrammar
+    /// lowerer. Until that lowerer is connected, the request must fail closed
+    /// rather than silently generate unconstrained text.
+    #[test]
+    fn response_format_structural_tag_fails_closed_until_lowerer_is_wired() {
+        use super::super::schema::ResponseFormat;
+
+        let rf = ResponseFormat::StructuralTag {
+            spec: serde_json::Map::from_iter([(
+                "format".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
+        };
+        let result = super::compile_response_format(&rf);
+        match result {
+            Err(response) => assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST),
+            Ok(_) => panic!("structural_tag without a lowerer must fail closed"),
+        }
     }
 
     /// Tool grammar present (regardless of response_format) MUST resolve
@@ -10513,6 +10545,12 @@ mod readiness_guard_tests {
             tools: None,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
@@ -10626,6 +10664,12 @@ mod readiness_guard_tests {
             tools: None,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
@@ -10911,6 +10955,12 @@ mod pool_error_tests {
             tools: None,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
@@ -10998,6 +11048,12 @@ mod iter215_qwen35_chat_501_tests {
             tools: None,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
@@ -11941,6 +11997,12 @@ mod a5d_handler_429_tests {
             tools: None,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
