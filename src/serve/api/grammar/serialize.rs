@@ -542,28 +542,14 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_json_grammar_fixture() {
-        // The peer's canonical json grammar.  Stress-tests every
-        // GBNF feature we serialize: nested groups, recursion,
-        // quoted-literal escapes, negated char class with
-        // backslash, ranges, comments (not preserved).
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture present");
-        roundtrip(&src);
-    }
-
-    #[test]
-    fn round_trip_arithmetic_grammar_fixture() {
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/arithmetic.gbnf")
-            .expect("arithmetic.gbnf fixture present");
-        roundtrip(&src);
-    }
-
-    #[test]
-    fn round_trip_list_grammar_fixture() {
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/list.gbnf")
-            .expect("list.gbnf fixture present");
-        roundtrip(&src);
+    fn round_trip_all_vendored_llama_cpp_grammars() {
+        for (name, src) in super::super::test_fixtures::LLAMA_CPP_GRAMMARS {
+            let reparsed = roundtrip(src);
+            assert!(
+                reparsed.rule_id("root").is_some(),
+                "{name} lost its root rule"
+            );
+        }
     }
 
     #[test]

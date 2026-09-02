@@ -573,9 +573,8 @@ mod tests {
         // Use the canonical json.gbnf fixture. From root=object, the only
         // valid first char is '{' — every token starting with any other
         // char must be masked.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture");
-        let g = parse(&src).unwrap();
+        let src = super::super::test_fixtures::llama_cpp_grammar("json.gbnf");
+        let g = parse(src).unwrap();
         let rid = g.rule_id("root").unwrap();
         let runtime = GrammarRuntime::new(g, rid).unwrap();
         let token_bytes = vocab(&["{", "}", "[", "\"", "a", "1"]);

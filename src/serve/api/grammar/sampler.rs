@@ -1041,8 +1041,7 @@ mod tests {
         // a top-level object), but `value ::= object | array | string |
         // number | ("true" | "false" | "null") ws` accepts everything.
         // Verify each alternative against the `value` rule.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture");
+        let src = super::super::test_fixtures::llama_cpp_grammar("json.gbnf");
         for input in [
             "null",
             "true",
@@ -1056,7 +1055,7 @@ mod tests {
             "{\"k\":\"v\"}",
             "{\"a\":1,\"b\":[true,false]}",
         ] {
-            let g = parse(&src).expect("parse");
+            let g = parse(src).expect("parse");
             let rid = g.rule_id("value").unwrap();
             let mut rt = GrammarRuntime::new(g, rid).unwrap();
             assert!(
@@ -1075,17 +1074,16 @@ mod tests {
     #[test]
     fn json_grammar_root_rule_requires_object() {
         // `root ::= object` — bare scalars rejected, objects accepted.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture");
+        let src = super::super::test_fixtures::llama_cpp_grammar("json.gbnf");
         for good_object in ["{}", "{\"k\":\"v\"}", "{\"a\":1,\"b\":[true,false]}"] {
-            let g = parse(&src).expect("parse");
+            let g = parse(src).expect("parse");
             let rid = g.rule_id("root").unwrap();
             let mut rt = GrammarRuntime::new(g, rid).unwrap();
             assert!(rt.accept_bytes(good_object.as_bytes()));
             assert!(rt.is_accepted(), "root must accept {:?}", good_object);
         }
         for bad_scalar in ["null", "42", "\"hello\""] {
-            let g = parse(&src).expect("parse");
+            let g = parse(src).expect("parse");
             let rid = g.rule_id("root").unwrap();
             let mut rt = GrammarRuntime::new(g, rid).unwrap();
             let ok = rt.accept_bytes(bad_scalar.as_bytes());
@@ -1099,8 +1097,7 @@ mod tests {
 
     #[test]
     fn json_grammar_rejects_malformed() {
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture");
+        let src = super::super::test_fixtures::llama_cpp_grammar("json.gbnf");
         for input in [
             "nul",      // truncated
             "tru e",    // space in literal
@@ -1108,7 +1105,7 @@ mod tests {
             "{\"k\":}", // missing value
             "\"unterminated",
         ] {
-            let g = parse(&src).expect("parse");
+            let g = parse(src).expect("parse");
             let rid = g.rule_id("root").unwrap();
             let mut rt = GrammarRuntime::new(g, rid).unwrap();
             let ok = rt.accept_bytes(input.as_bytes());
@@ -1127,9 +1124,8 @@ mod tests {
     fn json_grammar_rejects_trailing_garbage_after_object() {
         // `root ::= object` — after a valid object, only trailing ws is
         // allowed. Alphabetic garbage is rejected.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture");
-        let g = parse(&src).expect("parse");
+        let src = super::super::test_fixtures::llama_cpp_grammar("json.gbnf");
+        let g = parse(src).expect("parse");
         let rid = g.rule_id("root").unwrap();
         let mut rt = GrammarRuntime::new(g, rid).unwrap();
         assert!(rt.accept_bytes(b"{}"));
@@ -1147,6 +1143,35 @@ mod tests {
         assert!(rt.is_dead());
         assert!(!rt.accept_char('a' as u32));
         assert!(rt.is_dead());
+    }
+
+    #[test]
+    fn all_vendored_llama_cpp_grammars_accept_representative_output() {
+        let cases = [
+            ("arithmetic.gbnf", "x=1\n"),
+            ("c.gbnf", "int main(){return 0;}"),
+            ("chess.gbnf", "1. e4 e5\n2. Nf3 Nc6\n"),
+            ("english.gbnf", "Hello world"),
+            ("japanese.gbnf", "日本語"),
+            ("json.gbnf", "{\"ok\":true}"),
+            ("json_arr.gbnf", "[\n]"),
+            ("list.gbnf", "- first\n- second\n"),
+        ];
+        for (name, output) in cases {
+            let source = super::super::test_fixtures::llama_cpp_grammar(name);
+            let grammar = parse(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let root = grammar.rule_id("root").expect("fixture has root");
+            let mut runtime =
+                GrammarRuntime::new(grammar, root).unwrap_or_else(|| panic!("{name}: runtime"));
+            assert!(
+                runtime.accept_bytes(output.as_bytes()),
+                "{name} rejected representative output {output:?}"
+            );
+            assert!(
+                runtime.is_accepted(),
+                "{name} did not finish in an accepting state for {output:?}"
+            );
+        }
     }
 
     #[test]

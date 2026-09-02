@@ -163,10 +163,109 @@ pub fn parse(src: &str) -> Result<Grammar, ParseError> {
             }
         }
     }
+    validate_no_left_recursion(&state.rules)?;
     Ok(Grammar {
         rules: state.rules,
         symbol_ids: state.symbol_ids,
     })
+}
+
+/// Reject grammars whose left-corner graph contains a cycle.
+///
+/// A reference is a left corner when it can be reached before consuming a
+/// terminal. Nullable references therefore expose the next reference in the
+/// same alternative. The runtime expands left corners before it consumes a
+/// character; a cycle here would otherwise grow its work stack without a
+/// progress bound.
+fn validate_no_left_recursion(rules: &[Vec<GretElement>]) -> Result<(), ParseError> {
+    let mut nullable = vec![false; rules.len()];
+    loop {
+        let mut changed = false;
+        for (rule_id, rule) in rules.iter().enumerate() {
+            if !nullable[rule_id] && has_nullable_alternative(rule, &nullable) {
+                nullable[rule_id] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut left_corners = vec![Vec::new(); rules.len()];
+    for (rule_id, rule) in rules.iter().enumerate() {
+        let mut before_terminal = true;
+        for element in rule {
+            match element.ty {
+                GretType::Alt => before_terminal = true,
+                GretType::End => break,
+                GretType::RuleRef if before_terminal => {
+                    let target = element.value as usize;
+                    if !left_corners[rule_id].contains(&target) {
+                        left_corners[rule_id].push(target);
+                    }
+                    before_terminal = nullable[target];
+                }
+                _ => before_terminal = false,
+            }
+        }
+    }
+
+    // Iterative DFS avoids moving the unbounded recursion risk from the
+    // grammar runtime into validation itself.
+    let mut state = vec![0u8; rules.len()]; // 0 = unseen, 1 = active, 2 = done
+    for start in 0..rules.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        let mut work = vec![(start, 0usize)];
+        while let Some((rule_id, next_edge)) = work.last_mut() {
+            if *next_edge == left_corners[*rule_id].len() {
+                state[*rule_id] = 2;
+                work.pop();
+                continue;
+            }
+            let target = left_corners[*rule_id][*next_edge];
+            *next_edge += 1;
+            match state[target] {
+                0 => {
+                    state[target] = 1;
+                    work.push((target, 0));
+                }
+                1 => {
+                    return Err(ParseError {
+                        offset: 0,
+                        message: "unsupported grammar: left recursion detected".into(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_nullable_alternative(rule: &[GretElement], nullable: &[bool]) -> bool {
+    let mut alternative_is_nullable = true;
+    for element in rule {
+        match element.ty {
+            GretType::Alt | GretType::End => {
+                if alternative_is_nullable {
+                    return true;
+                }
+                if element.ty == GretType::End {
+                    return false;
+                }
+                alternative_is_nullable = true;
+            }
+            GretType::RuleRef if alternative_is_nullable => {
+                alternative_is_nullable = nullable[element.value as usize];
+            }
+            _ => alternative_is_nullable = false,
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -712,7 +811,7 @@ fn parse_char(bytes: &[u8], pos: usize) -> Result<(u32, usize), ParseError> {
             b't' => Ok(('\t' as u32, pos + 2)),
             b'r' => Ok(('\r' as u32, pos + 2)),
             b'n' => Ok(('\n' as u32, pos + 2)),
-            b'\\' | b'"' | b'[' | b']' => Ok((c as u32, pos + 2)),
+            b'\\' | b'"' | b'[' | b']' | b'-' => Ok((c as u32, pos + 2)),
             _ => Err(ParseError {
                 offset: pos,
                 message: format!("unknown escape '\\{}'", c as char),
@@ -968,40 +1067,59 @@ mod tests {
     }
 
     #[test]
-    fn json_grammar_fixture_parses() {
-        // The peer's canonical json grammar. Used verbatim to validate
-        // against the exact grammar OpenAI-compatible grammar-constrained
-        // JSON will rely on.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture present");
-        let g = parse_ok(&src);
-        // root + value + object + array + string + number + ws + synthesized.
-        assert!(g.rules.len() >= 7, "got {} rules", g.rules.len());
-        assert!(g.rule_id("root").is_some());
-        assert!(g.rule_id("value").is_some());
-        assert!(g.rule_id("object").is_some());
-        assert!(g.rule_id("array").is_some());
-        assert!(g.rule_id("string").is_some());
-        assert!(g.rule_id("number").is_some());
-        assert!(g.rule_id("ws").is_some());
+    fn all_vendored_llama_cpp_grammars_parse() {
+        for (name, src) in super::super::test_fixtures::LLAMA_CPP_GRAMMARS {
+            let g = parse_ok(src);
+            assert!(!g.rules.is_empty(), "{name} produced no rules");
+            assert!(g.rule_id("root").is_some(), "{name} has no root rule");
+        }
     }
 
     #[test]
-    fn arithmetic_grammar_fixture_parses() {
-        // Another canonical fixture from the peer.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/arithmetic.gbnf")
-            .expect("arithmetic.gbnf fixture present");
-        let g = parse_ok(&src);
-        assert!(!g.rules.is_empty());
-        assert!(g.rule_id("root").is_some());
+    fn escaped_dash_is_a_literal_character_in_a_class() {
+        let g = parse_ok(r#"root ::= [a\-z]"#);
+        let rule = &g.rules[0];
+        assert_eq!(rule[0], GretElement::new(GretType::Char, 'a' as u32));
+        assert_eq!(rule[1], GretElement::new(GretType::CharAlt, '-' as u32));
+        assert_eq!(rule[2], GretElement::new(GretType::CharAlt, 'z' as u32));
+        assert_eq!(rule[3], GretElement::new(GretType::End, 0));
     }
 
     #[test]
-    fn list_grammar_fixture_parses() {
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/list.gbnf")
-            .expect("list.gbnf fixture present");
-        let g = parse_ok(&src);
-        assert!(g.rule_id("root").is_some());
+    fn rejects_direct_left_recursion() {
+        let err = parse("root ::= \"a\" | root \"a\"\n").unwrap_err();
+        assert!(err.message.contains("left recursion"));
+    }
+
+    #[test]
+    fn rejects_indirect_left_recursion() {
+        let err = parse(
+            "root ::= asdf\n\
+             asdf ::= \"a\" | foo \"b\"\n\
+             foo ::= \"c\" | asdf \"d\"\n",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("left recursion"));
+    }
+
+    #[test]
+    fn rejects_left_recursion_after_nullable_prefix() {
+        let err = parse(
+            "root ::= maybe loop | \"x\"\n\
+             maybe ::= | \"m\"\n\
+             loop ::= root \"y\"\n",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("left recursion"));
+    }
+
+    #[test]
+    fn accepts_right_recursion_and_terminal_guarded_cycles() {
+        parse_ok(
+            "root ::= \"a\" root | guarded\n\
+             guarded ::= \"g\" tail\n\
+             tail ::= \"t\" guarded |\n",
+        );
     }
 
     #[test]
