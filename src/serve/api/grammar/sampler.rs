@@ -160,11 +160,51 @@ fn is_end_of_sequence(e: &GretElement) -> bool {
     matches!(e.ty, GretType::End | GretType::Alt)
 }
 
-fn match_token(element: GretElement, token_id: u32) -> bool {
+fn is_token_terminal(ty: GretType) -> bool {
+    matches!(
+        ty,
+        GretType::Token | GretType::TokenNot | GretType::TokenAny | GretType::TokenNotSet
+    )
+}
+
+/// Return whether `token_id` matches the token terminal at `pos`, plus the
+/// first element after that terminal. `TokenNotSet` owns the immediately
+/// following sorted `TokenSetMember` run. Membership is logarithmic in the
+/// bounded exclusion count and never enumerates the vocabulary.
+fn match_token(grammar: &Grammar, pos: Pos, token_id: u32) -> (bool, Pos) {
+    let Some(element) = at(grammar, pos).copied() else {
+        return (false, pos);
+    };
+    let mut after = pos.advance();
     match element.ty {
-        GretType::Token => element.value == token_id,
-        GretType::TokenNot => element.value != token_id,
-        _ => false,
+        GretType::Token => (element.value == token_id, after),
+        GretType::TokenNot => (element.value != token_id, after),
+        GretType::TokenAny => (true, after),
+        GretType::TokenNotSet => {
+            let Some(rule) = grammar.rules.get(pos.rule_id as usize) else {
+                return (false, pos);
+            };
+            let start = pos.elem_idx as usize + 1;
+            let Some(end) = start.checked_add(element.value as usize) else {
+                return (false, pos);
+            };
+            let Some(members) = rule.get(start..end) else {
+                return (false, pos);
+            };
+            if members.len() < 2
+                || members
+                    .iter()
+                    .any(|member| member.ty != GretType::TokenSetMember)
+            {
+                return (false, pos);
+            }
+            let excluded = members
+                .binary_search_by_key(&token_id, |member| member.value)
+                .is_ok();
+            after.elem_idx = end as u32;
+            (!excluded, after)
+        }
+        _ => (false, pos),
     }
 }
 
@@ -355,7 +395,9 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
             | GretType::CharNot
             | GretType::CharAny
             | GretType::Token
-            | GretType::TokenNot => {
+            | GretType::TokenNot
+            | GretType::TokenAny
+            | GretType::TokenNotSet => {
                 if !new_stacks.contains(&curr_stack) {
                     new_stacks.push(curr_stack);
                 }
@@ -388,7 +430,13 @@ fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut 
     };
     if matches!(
         elem.ty,
-        GretType::End | GretType::Alt | GretType::Token | GretType::TokenNot
+        GretType::End
+            | GretType::Alt
+            | GretType::Token
+            | GretType::TokenNot
+            | GretType::TokenAny
+            | GretType::TokenNotSet
+            | GretType::TokenSetMember
     ) {
         return;
     }
@@ -477,12 +525,13 @@ fn reject_candidates_for_stack(
     let Some(elem) = at(grammar, top) else {
         return candidates.to_vec();
     };
-    if matches!(elem.ty, GretType::Token | GretType::TokenNot) {
+    if is_token_terminal(elem.ty) {
         return candidates
             .iter()
             .copied()
             .filter(|candidate| {
-                candidate.partial_utf8.n_remain != 0 || !match_token(*elem, candidate.token_id)
+                candidate.partial_utf8.n_remain != 0
+                    || !match_token(grammar, top, candidate.token_id).0
             })
             .collect();
     }
@@ -792,12 +841,12 @@ impl GrammarRuntime {
             let Some(element) = at(&self.grammar, top).copied() else {
                 continue;
             };
-            if matches!(element.ty, GretType::Token | GretType::TokenNot) {
-                if match_token(element, token_id) {
+            if is_token_terminal(element.ty) {
+                let (matched, after) = match_token(&self.grammar, top, token_id);
+                if matched {
                     let mut stack_after = stack[..stack.len() - 1].to_vec();
-                    let follow = top.advance();
-                    if at(&self.grammar, follow).is_some_and(|next| !is_end_of_sequence(next)) {
-                        stack_after.push(follow);
+                    if at(&self.grammar, after).is_some_and(|next| !is_end_of_sequence(next)) {
+                        stack_after.push(after);
                     }
                     advance_stack(&self.grammar, stack_after, &mut stacks_new);
                 }
@@ -829,7 +878,7 @@ impl GrammarRuntime {
         if self.awaiting_trigger {
             return true;
         }
-        if self.is_accepted() {
+        if self.is_terminally_accepted() {
             return true;
         }
         self.stacks.clear();
@@ -953,6 +1002,13 @@ impl GrammarRuntime {
             return false;
         }
         self.stacks.iter().any(|s| s.is_empty())
+    }
+
+    /// Return whether generation may terminate successfully at this exact
+    /// byte boundary. Structural acceptance alone is insufficient while a
+    /// decoded token has left an incomplete UTF-8 sequence pending.
+    pub fn is_terminally_accepted(&self) -> bool {
+        self.is_accepted() && self.partial_utf8.n_remain == 0
     }
 
     /// Is the grammar dead? (no stacks remain; no continuation can satisfy it).
@@ -1079,6 +1135,63 @@ mod tests {
 
         let mut bytes_only = runtime_from(grammar, "root");
         assert!(!bytes_only.accept_bytes(b"not-x"));
+    }
+
+    #[test]
+    fn token_any_and_exclusion_sets_support_quantifiers_without_vocab_expansion() {
+        let grammar = "root ::= <[*]>{2} !<[1,2,3]>+\n";
+        let mut runtime = runtime_from(grammar, "root");
+        assert!(runtime.accept_token(1, b"first"));
+        assert!(runtime.accept_token(2, b"second"));
+        assert!(runtime.accept_token(4, b"fourth"));
+        assert!(runtime.accept_token(5, b"fifth"));
+        assert!(runtime.is_terminally_accepted());
+
+        for excluded in [1, 2, 3] {
+            let mut rejected = runtime_from(grammar, "root");
+            assert!(rejected.accept_token(8, b"first"));
+            assert!(rejected.accept_token(9, b"second"));
+            assert!(!rejected.accept_token(excluded, b"excluded"));
+            assert!(rejected.is_dead());
+        }
+    }
+
+    #[test]
+    fn token_exclusion_set_and_character_alternative_use_separate_domains() {
+        let grammar = "root ::= !<[1,2]> | \"x\"\n";
+
+        let mut token_branch = runtime_from(grammar, "root");
+        assert!(token_branch.accept_token(3, b"not-x"));
+        assert!(token_branch.is_terminally_accepted());
+
+        let mut character_branch = runtime_from(grammar, "root");
+        assert!(character_branch.accept_token(1, b"x"));
+        assert!(character_branch.is_terminally_accepted());
+
+        let mut rejected = runtime_from(grammar, "root");
+        assert!(!rejected.accept_token(2, b"not-x"));
+    }
+
+    #[test]
+    fn terminal_acceptance_requires_a_complete_utf8_tail() {
+        let mut runtime = runtime_from("root ::= \"\" | .\n", "root");
+        assert!(runtime.is_terminally_accepted());
+
+        assert!(runtime.accept_bytes(&[0xCE]));
+        assert!(
+            runtime.is_accepted(),
+            "empty alternate remains structurally accepted"
+        );
+        assert!(
+            !runtime.is_terminally_accepted(),
+            "partial UTF-8 is not terminal"
+        );
+        let mut premature_eog = runtime.clone();
+        assert!(!premature_eog.accept_eog());
+        assert!(premature_eog.is_dead());
+
+        assert!(runtime.accept_bytes(&[0xB1]));
+        assert!(runtime.is_terminally_accepted());
     }
 
     #[test]

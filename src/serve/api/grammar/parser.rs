@@ -35,6 +35,12 @@ pub enum GretType {
     CharAny = 7,
     Token = 8,
     TokenNot = 9,
+    /// hf2q-local extension: match any non-EOG vocabulary token.
+    TokenAny = 10,
+    /// hf2q-local extension: value is the count of following set members.
+    TokenNotSet = 11,
+    /// Continuation member for the preceding `TokenNotSet` element.
+    TokenSetMember = 12,
 }
 
 impl GretType {
@@ -52,8 +58,10 @@ impl GretType {
 
 /// A single grammar element: a type + a 32-bit value interpreted per type.
 /// For `Char*` types `value` is a Unicode code point, for `RuleRef` it is a
-/// rule id, and for `Token` / `TokenNot` it is a tokenizer token id. For
-/// `End` / `Alt` / `CharAny` it is unused (stored as 0).
+/// rule id, and for token elements it is a tokenizer token id. `TokenAny`'s
+/// value is unused, while `TokenNotSet` stores the count of immediately
+/// following sorted `TokenSetMember` IDs. For `End` / `Alt` / `CharAny` it is
+/// unused (stored as 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GretElement {
     pub ty: GretType,
@@ -116,6 +124,9 @@ impl std::error::Error for ParseError {}
 // exploding.
 // ---------------------------------------------------------------------------
 const MAX_REPETITION_THRESHOLD: u64 = 2000;
+/// Maximum explicitly excluded IDs in one local token-set terminal. The set
+/// is stored compactly; the vocabulary is never enumerated.
+const MAX_TOKEN_SET_MEMBERS: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Top-level parser
@@ -163,8 +174,10 @@ pub fn parse_with_tokenizer(
     })?;
 
     if let Some(invalid) = grammar.rules.iter().flatten().find(|element| {
-        matches!(element.ty, GretType::Token | GretType::TokenNot)
-            && tokenizer.id_to_token(element.value).is_none()
+        matches!(
+            element.ty,
+            GretType::Token | GretType::TokenNot | GretType::TokenSetMember
+        ) && tokenizer.id_to_token(element.value).is_none()
     }) {
         return Err(ParseError {
             offset: 0,
@@ -528,16 +541,16 @@ impl<'a, 'r> ParserState<'a, 'r> {
                 // Token terminal. Numeric token ids do not require a
                 // tokenizer/vocabulary binding and are therefore accepted by
                 // the standalone parser exactly as llama.cpp accepts them.
-                let ty = if c == b'!' {
+                let negated = if c == b'!' {
                     pos += 1;
-                    GretType::TokenNot
+                    true
                 } else {
-                    GretType::Token
+                    false
                 };
-                let (token_id, token_end) = self.parse_token(pos)?;
+                let (token_elements, token_end) = self.parse_token(pos, negated)?;
                 last_sym_start = rule.len();
                 n_prev_rules = 1;
-                rule.push(GretElement::new(ty, token_id));
+                rule.extend(token_elements);
                 pos = parse_space(self.bytes, token_end, is_nested);
             } else if is_word_char(c) {
                 // Rule reference.
@@ -685,7 +698,11 @@ impl<'a, 'r> ParserState<'a, 'r> {
         Ok(pos)
     }
 
-    fn parse_token(&mut self, start: usize) -> Result<(u32, usize), ParseError> {
+    fn parse_token(
+        &mut self,
+        start: usize,
+        negated: bool,
+    ) -> Result<(Vec<GretElement>, usize), ParseError> {
         if self.bytes.get(start) != Some(&b'<') {
             return Err(ParseError {
                 offset: start,
@@ -693,7 +710,7 @@ impl<'a, 'r> ParserState<'a, 'r> {
             });
         }
         if self.bytes.get(start + 1) == Some(&b'[') {
-            return parse_explicit_token_id(self.bytes, start);
+            return parse_bracket_token(self.bytes, start, negated);
         }
 
         let close = self.bytes[start + 1..]
@@ -720,7 +737,12 @@ impl<'a, 'r> ParserState<'a, 'r> {
             offset: start,
             message: format!("invalid textual token {lexeme:?}: {message}"),
         })?;
-        Ok((token_id, close + 1))
+        let ty = if negated {
+            GretType::TokenNot
+        } else {
+            GretType::Token
+        };
+        Ok((vec![GretElement::new(ty, token_id)], close + 1))
     }
 
     // --- repetition expansion ---
@@ -878,17 +900,25 @@ fn parse_int(bytes: &[u8], start: usize) -> Result<usize, ParseError> {
     Ok(pos)
 }
 
-/// Parse llama.cpp's vocabulary-independent numeric token form `<[id]>`.
-/// Textual `<token>` forms require a tokenizer binding and are intentionally
-/// rejected by this standalone parser instead of being guessed from text.
-fn parse_explicit_token_id(bytes: &[u8], start: usize) -> Result<(u32, usize), ParseError> {
+/// Parse vocabulary-independent token syntax.
+///
+/// Peer-compatible `<[id]>` / `!<[id]>` retain `Token = 8` and
+/// `TokenNot = 9`. hf2q adds compact structural primitives `<[*]>` (any
+/// non-EOG token) and `!<[id,...]>` (any token except the bounded listed
+/// IDs). Exclusion sets are sorted and deduplicated in the AST, so the
+/// serializer emits one canonical representation without enumerating the
+/// model vocabulary.
+fn parse_bracket_token(
+    bytes: &[u8],
+    start: usize,
+    negated: bool,
+) -> Result<(Vec<GretElement>, usize), ParseError> {
     if bytes.get(start) != Some(&b'<') {
         return Err(ParseError {
             offset: start,
             message: "expecting '<' for token terminal".into(),
         });
     }
-    let id_start = start + 2;
     if bytes.get(start + 1) != Some(&b'[') {
         return Err(ParseError {
             offset: start + 1,
@@ -896,27 +926,89 @@ fn parse_explicit_token_id(bytes: &[u8], start: usize) -> Result<(u32, usize), P
                 .into(),
         });
     }
-    let id_end = parse_int(bytes, id_start)?;
-    let id = std::str::from_utf8(&bytes[id_start..id_end])
-        .ok()
-        .and_then(|text| text.parse::<u32>().ok())
-        .ok_or_else(|| ParseError {
-            offset: id_start,
-            message: "token id is outside the u32 range".into(),
-        })?;
-    if bytes.get(id_end) != Some(&b']') {
+    let mut pos = start + 2;
+    if bytes.get(pos) == Some(&b'*') {
+        if negated {
+            return Err(ParseError {
+                offset: pos,
+                message: "negated token wildcard is not supported".into(),
+            });
+        }
+        if bytes.get(pos + 1) != Some(&b']') || bytes.get(pos + 2) != Some(&b'>') {
+            return Err(ParseError {
+                offset: pos + 1,
+                message: "expecting ']>' after token wildcard".into(),
+            });
+        }
+        return Ok((vec![GretElement::new(GretType::TokenAny, 0)], pos + 3));
+    }
+
+    let mut ids = Vec::new();
+    loop {
+        if ids.len() >= MAX_TOKEN_SET_MEMBERS {
+            return Err(ParseError {
+                offset: pos,
+                message: format!("token exclusion set exceeds {MAX_TOKEN_SET_MEMBERS} members"),
+            });
+        }
+        let id_start = pos;
+        let id_end = parse_int(bytes, id_start)?;
+        let id = std::str::from_utf8(&bytes[id_start..id_end])
+            .ok()
+            .and_then(|text| text.parse::<u32>().ok())
+            .ok_or_else(|| ParseError {
+                offset: id_start,
+                message: "token id is outside the u32 range".into(),
+            })?;
+        ids.push(id);
+        pos = id_end;
+        if bytes.get(pos) == Some(&b',') {
+            pos += 1;
+            continue;
+        }
+        break;
+    }
+
+    if bytes.get(pos) != Some(&b']') {
         return Err(ParseError {
-            offset: id_end,
+            offset: pos,
             message: "expecting ']' after token id".into(),
         });
     }
-    if bytes.get(id_end + 1) != Some(&b'>') {
+    if bytes.get(pos + 1) != Some(&b'>') {
         return Err(ParseError {
-            offset: id_end + 1,
+            offset: pos + 1,
             message: "expecting '>' after token id".into(),
         });
     }
-    Ok((id, id_end + 2))
+
+    ids.sort_unstable();
+    ids.dedup();
+    if !negated && ids.len() != 1 {
+        return Err(ParseError {
+            offset: start,
+            message: "positive token sets are not supported; use one id or <[*]>".into(),
+        });
+    }
+    let elements = if negated && ids.len() > 1 {
+        let mut elements = Vec::with_capacity(ids.len() + 1);
+        elements.push(GretElement::new(GretType::TokenNotSet, ids.len() as u32));
+        elements.extend(
+            ids.into_iter()
+                .map(|id| GretElement::new(GretType::TokenSetMember, id)),
+        );
+        elements
+    } else {
+        vec![GretElement::new(
+            if negated {
+                GretType::TokenNot
+            } else {
+                GretType::Token
+            },
+            ids[0],
+        )]
+    };
+    Ok((elements, pos + 2))
 }
 
 /// Parse `N` hex digits starting at `pos`. Returns the decoded value.
@@ -1090,6 +1182,45 @@ mod tests {
         ] {
             assert!(parse(src).is_err(), "malformed token parsed: {src:?}");
         }
+    }
+
+    #[test]
+    fn bounded_token_set_extensions_have_a_compact_canonical_ast() {
+        let grammar = parse_ok("root ::= <[*]> !<[3,1,2,2]>\n");
+        assert_eq!(
+            grammar.rules[0],
+            vec![
+                GretElement::new(GretType::TokenAny, 0),
+                GretElement::new(GretType::TokenNotSet, 3),
+                GretElement::new(GretType::TokenSetMember, 1),
+                GretElement::new(GretType::TokenSetMember, 2),
+                GretElement::new(GretType::TokenSetMember, 3),
+                GretElement::new(GretType::End, 0),
+            ]
+        );
+        assert_eq!(GretType::Token as u8, 8);
+        assert_eq!(GretType::TokenNot as u8, 9);
+    }
+
+    #[test]
+    fn token_set_extensions_reject_malformed_or_unbounded_sets() {
+        for src in [
+            "root ::= <[1,2]>\n",
+            "root ::= !<[*]>\n",
+            "root ::= !<[]>\n",
+            "root ::= !<[1,]>\n",
+            "root ::= !<[,1]>\n",
+        ] {
+            assert!(parse(src).is_err(), "malformed token set parsed: {src:?}");
+        }
+
+        let ids = (0..=MAX_TOKEN_SET_MEMBERS)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let error = parse(&format!("root ::= !<[{ids}]>\n"))
+            .expect_err("oversized token exclusion set must fail closed");
+        assert!(error.message.contains("exceeds"));
     }
 
     #[test]

@@ -11,7 +11,9 @@
 //! Numeric token terminals (`<[id]>` / `!<[id]>`) are supported without a
 //! vocabulary binding. Textual `<token>` forms use
 //! [`parse_with_token_resolver`] so tokenizer-specific resolution remains an
-//! explicit model-bound operation.
+//! explicit model-bound operation. hf2q-local structural extensions use
+//! `<[*]>` for any non-EOG token and sorted, deduplicated `!<[id,...]>` for a
+//! bounded exclusion set; neither form expands across the model vocabulary.
 
 pub mod json_schema;
 pub mod lark;

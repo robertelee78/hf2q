@@ -106,7 +106,7 @@ pub fn sample_greedy_valid_token(
                 return Some(token as u32);
             };
             if eog_token_ids.contains(&(token as u32)) {
-                if grammar.is_accepted() {
+                if grammar.is_terminally_accepted() {
                     return Some(token as u32);
                 }
                 logits[token] = f32::NEG_INFINITY;
@@ -185,7 +185,7 @@ pub fn mask_invalid_tokens_with_eog(
     for i in 0..n {
         let bytes = &token_bytes[i];
         if eog_token_ids.contains(&(i as u32)) {
-            if !grammar.is_accepted() && logits[i].is_finite() {
+            if !grammar.is_terminally_accepted() && logits[i].is_finite() {
                 logits[i] = f32::NEG_INFINITY;
                 masked += 1;
             }
@@ -315,6 +315,45 @@ mod tests {
         assert!(!logits[0].is_finite());
         assert!(logits[1].is_finite());
         assert!(!logits[2].is_finite());
+    }
+
+    #[test]
+    fn token_any_and_exclusion_set_mask_by_id_without_enumerating_vocab() {
+        let token_bytes = vocab(&["same", "same", "same", "same", "same"]);
+
+        let any = rt("root ::= <[*]>\n", "root");
+        let mut any_logits = vec![1.0; token_bytes.len()];
+        assert_eq!(
+            mask_invalid_tokens_with_eog(&any, &token_bytes, &[], &mut any_logits),
+            0
+        );
+
+        let exclusion = rt("root ::= !<[1,3]>\n", "root");
+        let mut exclusion_logits = vec![1.0; token_bytes.len()];
+        assert_eq!(
+            mask_invalid_tokens_with_eog(&exclusion, &token_bytes, &[], &mut exclusion_logits,),
+            2
+        );
+        assert!(exclusion_logits[0].is_finite());
+        assert!(!exclusion_logits[1].is_finite());
+        assert!(exclusion_logits[2].is_finite());
+        assert!(!exclusion_logits[3].is_finite());
+        assert!(exclusion_logits[4].is_finite());
+    }
+
+    #[test]
+    fn eog_remains_masked_while_an_accepted_alternate_has_pending_utf8() {
+        let mut runtime = rt("root ::= \"\" | .\n", "root");
+        assert!(runtime.accept_bytes(&[0xCE]));
+        assert!(runtime.is_accepted());
+        assert!(!runtime.is_terminally_accepted());
+
+        let mut logits = vec![1.0];
+        assert_eq!(
+            mask_invalid_tokens_with_eog(&runtime, &[Vec::new()], &[0], &mut logits),
+            1
+        );
+        assert!(!logits[0].is_finite());
     }
 
     #[test]
