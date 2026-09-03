@@ -26,7 +26,7 @@ existed in April 2026. The September 2026 product contract is broader:
 
 1. r2c ReviewLens Stage 6 and CWE Stage 9 schemas are mandatory conformance
    cases, not compiler special cases.
-2. hf2q must expose the structured-output modes expected by current llama.cpp
+2. hf2q must expose the structured-output modes expected by the current peer
    and vLLM clients.
 3. every hf2q text-generating family must obey the same constraint semantics.
 4. no supplied assertion may be silently weakened or ignored.
@@ -38,11 +38,11 @@ this ADR are to be interpreted as described by
 ## Source-bound baselines
 
 - hf2q integration base: `cfcd79c1835e69bedc6d1d033c1219c5dea10562`.
-- local llama.cpp research snapshot:
+- local peer research snapshot:
   `9cffdcc801582616250520966699cb5b25d28243`.
 - hf2q's existing peer pin:
   `e15384a5cb092b080c2a01c0b9e3f8635079d6df`. That object is not present in
-  the local non-shallow llama.cpp checkout, so research against the live
+  the local non-shallow peer checkout, so research against the live
   snapshot MUST NOT be mislabeled as pin parity.
 - vLLM and XGrammar behavior is bound to their official `main` sources read on
   2026-09-03: vLLM
@@ -59,7 +59,7 @@ The absent peer object was researched rather than silently substituted:
 `git fetch origin e15384a5cb092b080c2a01c0b9e3f8635079d6df`
 returns `upload-pack: not our ref`, and neither the local object database,
 reflogs, nor unreachable-object scan contains it. This ADR therefore creates a
-separate grammar-compatibility pin at the inspected `/opt/llama.cpp` commit
+separate grammar-compatibility pin at the inspected local peer checkout commit
 `9cffdcc801582616250520966699cb5b25d28243`; it does not change or falsely
 validate the repository's broader quantization/parity pin.
 
@@ -78,7 +78,7 @@ The model-free baseline passed:
 - nested family tool grammars: 27 passed;
 - response-format/cache precedence: 7 passed.
 
-The upstream llama.cpp grammar parser/runtime binaries also passed. The audit
+The upstream peer grammar parser/runtime binaries also passed. The audit
 then found that the green baseline explicitly tests silent `pattern` widening,
 loads only three of eight upstream grammar fixtures through absolute paths,
 does not expose llama/vLLM structured-output fields, accepts left recursion,
@@ -120,14 +120,14 @@ before decoding begins.
 - `json_object`;
 - `json_schema`.
 
-For llama.cpp compatibility, `json_object` MAY carry its optional top-level
+For peer compatibility, `json_object` MAY carry its optional top-level
 `schema` member. When present, hf2q MUST compile and enforce that schema; it
 MUST NOT silently widen it to the generic JSON-object grammar.
 
 It MUST also accept the current compatibility surfaces:
 
-- llama.cpp-style `grammar` and `json_schema`;
-- llama.cpp-style lazy grammar configuration where the runtime can preserve
+- the peer-style `grammar` and `json_schema`;
+- the peer-style lazy grammar configuration where the runtime can preserve
   equivalent semantics;
 - vLLM-style `structured_outputs.choice`;
 - `structured_outputs.regex`;
@@ -205,7 +205,7 @@ hf2q-native JSON semantics remain authoritative:
 
 ### 4. Grammar dialect contract
 
-The llama.cpp GBNF character language MUST remain supported, including all
+The peer GBNF character language MUST remain supported, including all
 eight bundled upstream grammar fixtures. hf2q's underscore rule-name extension
 MUST remain supported because its serializer and grammar combiner emit it.
 
@@ -290,13 +290,13 @@ compile/runtime evidence.
 
 ### 7. Test and provenance contract
 
-CI MUST be hermetic. It MUST NOT require `/opt/llama.cpp`, `/tmp` diagnostics,
+CI MUST be hermetic. It MUST NOT require a local peer checkout, `/tmp` diagnostics,
 or a network connection.
 
 The repository MUST contain attributed, revision-bound fixtures for:
 
-- all eight current llama.cpp bundled grammars;
-- llama.cpp parser/runtime positive and negative vectors, including tokens and
+- all eight current peer-bundled grammars;
+- the peer parser/runtime positive and negative vectors, including tokens and
   left recursion;
 - current vLLM/XGrammar request modes and accepted/rejected schema vocabulary;
 - r2c ReviewLens Stage 6 and CWE Stage 9 schemas;
@@ -335,7 +335,7 @@ reference lanes remain read-only.
 
 The isolated `feat/grammar-token-terminals` lane, based on
 `ecae7bdda931ea05000cebab33402660585ba034`, tested the grammar vocabulary
-hypothesis against the local llama.cpp snapshot before implementation. The
+hypothesis against the local peer snapshot before implementation. The
 result requires token ids to remain distinct from decoded byte text:
 
 - `TOKEN = 8` and `TOKEN_NOT = 9` preserve the upstream element encoding;
@@ -408,7 +408,7 @@ now return HTTP 400. That compatibility break is intentional: rejecting an
 unsupported constraint is safer than claiming success while generating output
 that violates it.
 
-The supported grammar-language baseline is therefore llama.cpp-compatible
+The supported grammar-language baseline is therefore the peer-compatible
 GBNF plus vLLM choice, regex, JSON Schema, grammar, and structural-tag modes.
 It is not a claim that every model-specific serializer or every validation-only
 Draft 2020-12 vocabulary can be represented as a context-free generation

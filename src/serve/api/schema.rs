@@ -795,7 +795,7 @@ pub enum StructuredOutputJson {
     String(String),
 }
 
-/// A JSON Schema accepted by llama.cpp's top-level `json_schema` surface.
+/// A JSON Schema accepted by the peer's top-level `json_schema` surface.
 /// Draft 2020-12 permits both object schemas and the boolean `true`/`false`
 /// schemas. Other JSON types are not schemas and fail during deserialization.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -906,7 +906,7 @@ impl StructuredOutputs {
     }
 }
 
-/// Numeric trigger kinds used by llama.cpp's server request schema.
+/// Numeric trigger kinds used by the peer's server request schema.
 ///
 /// These discriminants are wire values, not implementation-local ordinals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -944,7 +944,7 @@ struct LlamaGrammarTriggerWire {
     token: Option<i32>,
 }
 
-/// A single llama.cpp lazy-grammar trigger.
+/// A single peer lazy-grammar trigger.
 ///
 /// Token triggers (`type: 0`) require the resolved token id. Word and regex
 /// triggers must not carry one, preventing ambiguous or ignored input.
@@ -1138,10 +1138,10 @@ pub struct ChatCompletionRequest {
     /// compiling the selected constraint.
     #[serde(default)]
     pub structured_outputs: Option<StructuredOutputs>,
-    /// llama.cpp-compatible top-level GBNF grammar.
+    /// Peer-compatible top-level GBNF grammar.
     #[serde(default)]
     pub grammar: Option<String>,
-    /// llama.cpp-compatible top-level JSON Schema. JSON Schema Draft 2020-12
+    /// Peer-compatible top-level JSON Schema. JSON Schema Draft 2020-12
     /// permits an object or a boolean schema; all other JSON types reject at
     /// the request boundary.
     #[serde(default)]
@@ -1152,7 +1152,7 @@ pub struct ChatCompletionRequest {
     /// Token strings that must remain atomic for lazy token triggers.
     #[serde(default)]
     pub preserved_tokens: Option<Vec<String>>,
-    /// llama.cpp-compatible lazy trigger objects.
+    /// Peer-compatible lazy trigger objects.
     #[serde(default)]
     pub grammar_triggers: Option<Vec<LlamaGrammarTrigger>>,
 
@@ -2216,7 +2216,7 @@ mod tests {
             assert_eq!(request.json_schema.unwrap().into_value(), expected);
         }
 
-        // llama.cpp treats explicit null like omission; serde's Option wire
+        // the peer treats explicit null like omission; serde's Option wire
         // shape preserves that compatibility.
         let request: ChatCompletionRequest = serde_json::from_str(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"json_schema":null}"#,

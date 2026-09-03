@@ -1787,7 +1787,7 @@ where
         qwen3vl_image_grids,
     ) = prepare_vision_context(&req.messages, state.mmproj.as_ref(), engine, cancellation).await?;
 
-    // Compile every OpenAI/vLLM/llama.cpp structured-output surface only
+    // Compile every OpenAI/vLLM/peer structured-output surface only
     // after the requested model has resolved. Raw token terminals, preserved
     // tokens, and lazy token/word triggers must bind to this authoritative
     // tokenizer; model-free validation would silently assign the wrong ids.

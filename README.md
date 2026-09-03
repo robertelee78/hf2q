@@ -624,9 +624,9 @@ another family or runtime.
 Structured output is normalized once and enforced by the same request-local
 grammar runtime for Gemma, Qwen 3.5/3.6, Qwen3-VL text generation, and
 DeepSeek4. The chat endpoint accepts OpenAI `response_format` (`text`,
-`json_object`, and `json_schema`), llama.cpp `grammar`/`json_schema` and lazy
+`json_object`, and `json_schema`), peer `grammar`/`json_schema` and lazy
 grammar triggers, and vLLM `structured_outputs` choice, regex, JSON,
-`json_object`, grammar, and structural-tag modes. llama.cpp's optional
+`json_object`, grammar, and structural-tag modes. The peer's optional
 `response_format: {"type":"json_object","schema":...}` form is also
 enforced. Conflicting constraints, unknown or unsupported schema assertions,
 and constraints that exceed their documented resource limits return HTTP 400;

@@ -91,7 +91,7 @@ fn is_supported_schema_keyword(keyword: &str) -> bool {
     SUPPORTED_SCHEMA_KEYWORDS.contains(&keyword)
 }
 
-/// Return the XGrammar/llama.cpp-compatible lexical pattern for a supported
+/// Return the peer/XGrammar-compatible lexical pattern for a supported
 /// JSON Schema string format. These are generator constraints: they validate
 /// the same lexical shapes upstream constrained decoders use, not calendar or
 /// DNS existence.
@@ -602,7 +602,7 @@ pub fn schema_to_gbnf(schema: &Value) -> Result<String, SchemaError> {
 
 /// Compile a schema with an optional full-match regex for inter-token JSON
 /// whitespace. `Some("")` means no whitespace; `None` keeps the default
-/// llama.cpp-compatible whitespace rule.
+/// Peer-compatible whitespace rule.
 pub fn schema_to_gbnf_with_whitespace(
     schema: &Value,
     whitespace_pattern: Option<&str>,
@@ -2163,7 +2163,7 @@ fn integer_bound(
 
 /// Exact bounded-integer GBNF body shared by response JSON and all native
 /// tool-call wire emitters. The lexical domain intentionally matches hf2q's
-/// existing 16-digit JSON integer primitive and llama.cpp's bounded emitter.
+/// existing 16-digit JSON integer primitive and the peer's bounded emitter.
 pub fn integer_range_gbnf(object: &serde_json::Map<String, Value>) -> Result<String, SchemaError> {
     let requested_min = integer_bound(object, "minimum", "exclusiveMinimum", true)?;
     let requested_max = integer_bound(object, "maximum", "exclusiveMaximum", false)?;

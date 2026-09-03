@@ -606,8 +606,8 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_all_vendored_llama_cpp_grammars() {
-        for (name, src) in super::super::test_fixtures::LLAMA_CPP_GRAMMARS {
+    fn round_trip_all_vendored_peer_grammars() {
+        for (name, src) in super::super::test_fixtures::PEER_GRAMMARS {
             let reparsed = roundtrip(src);
             assert!(
                 reparsed.rule_id("root").is_some(),

@@ -112,7 +112,7 @@ pub fn sample_greedy_valid_token(
                 logits[token] = f32::NEG_INFINITY;
                 continue;
             }
-            // llama.cpp rejects empty non-EOG pieces even after acceptance.
+            // the peer rejects empty non-EOG pieces even after acceptance.
             if bytes.is_empty() || bytes.first() == Some(&0) {
                 logits[token] = f32::NEG_INFINITY;
                 continue;
@@ -145,7 +145,7 @@ pub fn sample_greedy_valid_token(
 /// and the sampler's top-k / top-p pruning drops it naturally.
 ///
 /// Declared EOG tokens survive only when the grammar is already accepting.
-/// Empty non-EOG pieces are always masked, matching llama.cpp's fail-closed
+/// Empty non-EOG pieces are always masked, matching the peer's fail-closed
 /// vocabulary path.
 ///
 /// # Panics
@@ -159,7 +159,7 @@ pub fn mask_invalid_tokens(
     mask_invalid_tokens_with_eog(grammar, token_bytes, &[], logits)
 }
 
-/// EOG-aware grammar mask matching llama.cpp's vocabulary-bound apply path.
+/// EOG-aware grammar mask matching the peer's vocabulary-bound apply path.
 /// EOG ids survive only in an already-accepting state and never participate
 /// in token-terminal matching. Empty non-EOG pieces are always rejected.
 pub fn mask_invalid_tokens_with_eog(
@@ -717,7 +717,7 @@ mod tests {
         // Use the canonical json.gbnf fixture. From root=object, the only
         // valid first char is '{' — every token starting with any other
         // char must be masked.
-        let src = super::super::test_fixtures::llama_cpp_grammar("json.gbnf");
+        let src = super::super::test_fixtures::peer_grammar("json.gbnf");
         let g = parse(src).unwrap();
         let rid = g.rule_id("root").unwrap();
         let runtime = GrammarRuntime::new(g, rid).unwrap();

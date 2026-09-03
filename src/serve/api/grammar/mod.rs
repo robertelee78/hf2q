@@ -40,45 +40,45 @@ pub use serialize::{rename_rules, serialize};
 
 #[cfg(test)]
 pub(crate) mod test_fixtures {
-    pub(crate) const LLAMA_CPP_GRAMMARS: &[(&str, &str)] = &[
+    pub(crate) const PEER_GRAMMARS: &[(&str, &str)] = &[
         (
             "arithmetic.gbnf",
-            include_str!("../../../../tests/fixtures/grammars/llama_cpp/arithmetic.gbnf"),
+            include_str!("../../../../scripts/fixtures/grammars/peer/arithmetic.gbnf"),
         ),
         (
             "c.gbnf",
-            include_str!("../../../../tests/fixtures/grammars/llama_cpp/c.gbnf"),
+            include_str!("../../../../scripts/fixtures/grammars/peer/c.gbnf"),
         ),
         (
             "chess.gbnf",
-            include_str!("../../../../tests/fixtures/grammars/llama_cpp/chess.gbnf"),
+            include_str!("../../../../scripts/fixtures/grammars/peer/chess.gbnf"),
         ),
         (
             "english.gbnf",
-            include_str!("../../../../tests/fixtures/grammars/llama_cpp/english.gbnf"),
+            include_str!("../../../../scripts/fixtures/grammars/peer/english.gbnf"),
         ),
         (
             "japanese.gbnf",
-            include_str!("../../../../tests/fixtures/grammars/llama_cpp/japanese.gbnf"),
+            include_str!("../../../../scripts/fixtures/grammars/peer/japanese.gbnf"),
         ),
         (
             "json.gbnf",
-            include_str!("../../../../tests/fixtures/grammars/llama_cpp/json.gbnf"),
+            include_str!("../../../../scripts/fixtures/grammars/peer/json.gbnf"),
         ),
         (
             "json_arr.gbnf",
-            include_str!("../../../../tests/fixtures/grammars/llama_cpp/json_arr.gbnf"),
+            include_str!("../../../../scripts/fixtures/grammars/peer/json_arr.gbnf"),
         ),
         (
             "list.gbnf",
-            include_str!("../../../../tests/fixtures/grammars/llama_cpp/list.gbnf"),
+            include_str!("../../../../scripts/fixtures/grammars/peer/list.gbnf"),
         ),
     ];
 
-    pub(crate) fn llama_cpp_grammar(name: &str) -> &'static str {
-        LLAMA_CPP_GRAMMARS
+    pub(crate) fn peer_grammar(name: &str) -> &'static str {
+        PEER_GRAMMARS
             .iter()
             .find_map(|(fixture_name, source)| (*fixture_name == name).then_some(*source))
-            .unwrap_or_else(|| panic!("unknown llama.cpp grammar fixture: {name}"))
+            .unwrap_or_else(|| panic!("unknown peer grammar fixture: {name}"))
     }
 }

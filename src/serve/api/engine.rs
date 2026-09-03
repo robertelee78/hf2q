@@ -361,7 +361,7 @@ pub struct SamplingParams {
     /// `SamplingParams` without touching the field gets the
     /// pre-wave-2.5 unconditional-enforcement behavior.
     pub grammar_kind: GrammarKind,
-    /// Model-bound llama.cpp-compatible public lazy-grammar triggers. `None`
+    /// Model-bound peer-compatible public lazy-grammar triggers. `None`
     /// retains eager response grammar behavior (or the existing internal
     /// family tool-marker gate selected by `grammar_kind`).
     pub grammar_lazy: Option<super::grammar::LazyGrammarConfig>,

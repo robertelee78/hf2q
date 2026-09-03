@@ -23,7 +23,7 @@ use regex::bytes::Regex;
 use std::sync::Arc;
 
 /// Maximum unconstrained output retained while a public lazy grammar waits
-/// for a regex trigger. llama.cpp currently leaves this buffer unbounded;
+/// for a regex trigger. The peer currently leaves this buffer unbounded;
 /// hf2q fails closed at the repository's structured-output resource limit.
 pub const MAX_LAZY_TRIGGER_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -718,9 +718,9 @@ pub struct GrammarRuntime {
     /// At most `lazy_trigger.len() - 1` trailing bytes retained so a marker
     /// split across adjacent tokens can still be recognized.
     lazy_trigger_tail: Vec<u8>,
-    /// Public llama.cpp-compatible trigger machinery. This is deliberately
+    /// Public peer-compatible trigger machinery. This is deliberately
     /// separate from `lazy_trigger`: the internal tool marker strips its
-    /// marker before applying a body grammar, whereas llama.cpp replays the
+    /// marker before applying a body grammar, whereas the peer replays the
     /// matched marker (or first non-empty capture) through the public grammar.
     public_lazy: Option<PublicLazyRuntime>,
 }
@@ -822,7 +822,7 @@ impl GrammarRuntime {
         self.public_lazy = None;
     }
 
-    /// Suspend this runtime until one of llama.cpp's public token or regex
+    /// Suspend this runtime until one of the peer's public token or regex
     /// triggers fires. Regexes are compiled once at runtime construction; an
     /// unsupported expression is an error rather than an ignored trigger.
     pub fn configure_public_lazy(
@@ -1338,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn llama_cpp_simple_token_grammar_sequence_matches() {
+    fn peer_simple_token_grammar_sequence_matches() {
         let grammar = "root ::= <[10]> content <[11]>\ncontent ::= (!<[11]>)*\n";
         let mut runtime = runtime_from(grammar, "root");
 
@@ -1566,7 +1566,7 @@ mod tests {
         // a top-level object), but `value ::= object | array | string |
         // number | ("true" | "false" | "null") ws` accepts everything.
         // Verify each alternative against the `value` rule.
-        let src = super::super::test_fixtures::llama_cpp_grammar("json.gbnf");
+        let src = super::super::test_fixtures::peer_grammar("json.gbnf");
         for input in [
             "null",
             "true",
@@ -1599,7 +1599,7 @@ mod tests {
     #[test]
     fn json_grammar_root_rule_requires_object() {
         // `root ::= object` — bare scalars rejected, objects accepted.
-        let src = super::super::test_fixtures::llama_cpp_grammar("json.gbnf");
+        let src = super::super::test_fixtures::peer_grammar("json.gbnf");
         for good_object in ["{}", "{\"k\":\"v\"}", "{\"a\":1,\"b\":[true,false]}"] {
             let g = parse(src).expect("parse");
             let rid = g.rule_id("root").unwrap();
@@ -1622,7 +1622,7 @@ mod tests {
 
     #[test]
     fn json_grammar_rejects_malformed() {
-        let src = super::super::test_fixtures::llama_cpp_grammar("json.gbnf");
+        let src = super::super::test_fixtures::peer_grammar("json.gbnf");
         for input in [
             "nul",      // truncated
             "tru e",    // space in literal
@@ -1649,7 +1649,7 @@ mod tests {
     fn json_grammar_rejects_trailing_garbage_after_object() {
         // `root ::= object` — after a valid object, only trailing ws is
         // allowed. Alphabetic garbage is rejected.
-        let src = super::super::test_fixtures::llama_cpp_grammar("json.gbnf");
+        let src = super::super::test_fixtures::peer_grammar("json.gbnf");
         let g = parse(src).expect("parse");
         let rid = g.rule_id("root").unwrap();
         let mut rt = GrammarRuntime::new(g, rid).unwrap();
@@ -1671,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn all_vendored_llama_cpp_grammars_accept_representative_output() {
+    fn all_vendored_peer_grammars_accept_representative_output() {
         let cases = [
             ("arithmetic.gbnf", "x=1\n"),
             ("c.gbnf", "int main(){return 0;}"),
@@ -1683,7 +1683,7 @@ mod tests {
             ("list.gbnf", "- first\n- second\n"),
         ];
         for (name, output) in cases {
-            let source = super::super::test_fixtures::llama_cpp_grammar(name);
+            let source = super::super::test_fixtures::peer_grammar(name);
             let grammar = parse(source).unwrap_or_else(|error| panic!("{name}: {error}"));
             let root = grammar.rule_id("root").expect("fixture has root");
             let mut runtime =

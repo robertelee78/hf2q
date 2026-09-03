@@ -162,7 +162,7 @@ pub(crate) fn parse_generated(src: &str) -> Result<Grammar, ParseError> {
 /// Numeric `<[id]>` forms bypass the resolver. For textual forms, `resolver`
 /// receives the complete bracketed lexeme (for example `<think>`) and must
 /// return exactly one tokenizer token id or a diagnostic explaining why the
-/// lexeme is not one token. This mirrors llama.cpp's `add_special=false,
+/// lexeme is not one token. This mirrors the peer's `add_special=false,
 /// parse_special=true` single-token requirement without coupling the grammar
 /// module to one tokenizer implementation.
 pub fn parse_with_token_resolver<F>(src: &str, mut resolver: F) -> Result<Grammar, ParseError>
@@ -601,7 +601,7 @@ impl<'a, 'r> ParserState<'a, 'r> {
             } else if c == b'<' || c == b'!' {
                 // Token terminal. Numeric token ids do not require a
                 // tokenizer/vocabulary binding and are therefore accepted by
-                // the standalone parser exactly as llama.cpp accepts them.
+                // the standalone parser exactly as the peer accepts them.
                 let negated = if c == b'!' {
                     pos += 1;
                     true
@@ -1217,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_token_terminals_match_llama_cpp_encoding() {
+    fn explicit_token_terminals_match_peer_encoding() {
         let g = parse_ok("root ::= <[1000]> !<[1001]> <[1001]>\n");
         assert_eq!(
             g.rules[0],
@@ -1526,8 +1526,8 @@ mod tests {
     }
 
     #[test]
-    fn all_vendored_llama_cpp_grammars_parse() {
-        for (name, src) in super::super::test_fixtures::LLAMA_CPP_GRAMMARS {
+    fn all_vendored_peer_grammars_parse() {
+        for (name, src) in super::super::test_fixtures::PEER_GRAMMARS {
             let g = parse_ok(src);
             assert!(!g.rules.is_empty(), "{name} produced no rules");
             assert!(g.rule_id("root").is_some(), "{name} has no root rule");

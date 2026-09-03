@@ -1,4 +1,4 @@
-//! Request-surface normalization for OpenAI, vLLM, and llama.cpp grammar
+//! Request-surface normalization for OpenAI, vLLM, and the peer grammar
 //! controls. Every accepted surface is lowered to the one hf2q GBNF runtime;
 //! ambiguous or unsupported combinations fail before generation starts.
 
@@ -823,7 +823,7 @@ pub fn compile_request_output_constraint(
         if let Some(param) = first_lazy_param(request) {
             return Err(RequestGrammarError::new(
                 param,
-                "llama.cpp lazy grammar fields cannot modify a required native tool grammar",
+                "the peer lazy grammar fields cannot modify a required native tool grammar",
             ));
         }
         return Ok(None);
@@ -870,7 +870,7 @@ pub fn compile_request_output_constraint_with_tokenizer(
         if let Some(param) = first_lazy_param(request) {
             return Err(RequestGrammarError::new(
                 param,
-                "llama.cpp lazy grammar fields cannot modify a required native tool grammar",
+                "the peer lazy grammar fields cannot modify a required native tool grammar",
             ));
         }
         return Ok(CompiledRequestConstraint {
