@@ -19,12 +19,14 @@
 //!   a parser concern. Belongs with the sampler iter.
 
 pub mod json_schema;
+pub mod lark;
 pub mod mask;
 pub mod parser;
 pub mod regex_gbnf;
 pub mod request;
 pub mod sampler;
 pub mod serialize;
+pub mod structural_tag;
 
 #[allow(unused_imports)]
 pub use parser::{parse, Grammar, GretElement, GretType, ParseError};
