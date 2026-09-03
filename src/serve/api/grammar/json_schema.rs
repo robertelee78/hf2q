@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
-use super::regex_gbnf::{regex_to_gbnf_body, regex_to_gbnf_full_match, Surface};
+use super::regex_gbnf::{Surface, regex_to_gbnf_body, regex_to_gbnf_full_match};
 
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_LOCAL_REFS: usize = 1024;
@@ -326,6 +326,22 @@ pub fn schema_to_gbnf_with_whitespace(
     schema: &Value,
     whitespace_pattern: Option<&str>,
 ) -> Result<String, SchemaError> {
+    schema_to_gbnf_with_options(schema, whitespace_pattern, true)
+}
+
+/// Compile a schema with explicit object-order semantics.
+///
+/// The historical public helpers preserve hf2q's any-order response-format
+/// behavior. Structural tags need XGrammar's distinct `any_order` switch:
+/// false follows the declaration order carried by serde_json's
+/// `preserve_order` map, while true retains the existing permutation grammar.
+/// This deliberately remains a narrow compiler option rather than a new API
+/// surface for request handling.
+pub fn schema_to_gbnf_with_options(
+    schema: &Value,
+    whitespace_pattern: Option<&str>,
+    any_order: bool,
+) -> Result<String, SchemaError> {
     validate_schema_profile(schema)?;
     let space_rule = match whitespace_pattern {
         None => SPACE_RULE.to_string(),
@@ -340,6 +356,7 @@ pub fn schema_to_gbnf_with_whitespace(
         ref_rules: HashMap::new(),
         resolving_refs: HashSet::new(),
         resolved_refs: 0,
+        any_order,
     };
     conv.rules.insert("space".to_string(), space_rule);
     let root_body = conv.visit(schema, "", 0)?;
@@ -377,6 +394,10 @@ struct Converter {
     ref_rules: HashMap<String, String>,
     resolving_refs: HashSet<String>,
     resolved_refs: usize,
+    /// Whether object properties may be emitted in arbitrary order.  The
+    /// structural-tag surface sets this from XGrammar's `any_order`; existing
+    /// callers retain the historical any-order behavior.
+    any_order: bool,
 }
 
 impl Converter {
@@ -834,8 +855,11 @@ impl Converter {
         // by the grammar mask. This was never a feature — it was a
         // coincidence of implementation. Iter 75 fixes it.
         // ---------------------------------------------------------------
+        let declared_keys: Vec<String> = properties.keys().cloned().collect();
         let mut all_keys: Vec<&String> = properties.keys().collect();
-        all_keys.sort();
+        if self.any_order {
+            all_keys.sort();
+        }
 
         let slug = path_slug(path);
 
@@ -913,6 +937,23 @@ impl Converter {
                     additional_value_rule.as_deref().unwrap_or("value")
                 )
             });
+        }
+
+        if !self.any_order {
+            if obj.contains_key("minProperties") || obj.contains_key("maxProperties") {
+                return Err(schema_error(
+                    path,
+                    "minProperties/maxProperties with ordered structural-tag objects is not yet representable",
+                ));
+            }
+            let inner = self.build_ordered_object_inner(
+                &slug,
+                &declared_keys,
+                &required_list,
+                &kv_rule_name,
+                !additional_closed,
+            );
+            return Ok(format!(r#""{{" space {} "}}" space"#, inner));
         }
 
         if obj.contains_key("minProperties") || obj.contains_key("maxProperties") {
@@ -1029,6 +1070,93 @@ impl Converter {
         };
 
         Ok(format!(r#""{{" space {} "}}" space"#, inner))
+    }
+
+    /// Build the declared-order object grammar used by XGrammar
+    /// `any_order=false`.  A state carries whether a previous item was
+    /// emitted, so omitted optional properties never leave a stray comma.
+    fn build_ordered_object_inner(
+        &mut self,
+        slug: &str,
+        keys: &[String],
+        required: &HashSet<String>,
+        kv_rule_name: &HashMap<String, String>,
+        allow_extra_kv: bool,
+    ) -> String {
+        self.build_ordered_object_state(
+            slug,
+            keys,
+            required,
+            kv_rule_name,
+            allow_extra_kv,
+            0,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_ordered_object_state(
+        &mut self,
+        slug: &str,
+        keys: &[String],
+        required: &HashSet<String>,
+        kv_rule_name: &HashMap<String, String>,
+        allow_extra_kv: bool,
+        index: usize,
+        emitted: bool,
+    ) -> String {
+        let state = format!("{slug}-ordered-{index}-{}", u8::from(emitted));
+        if self.rules.contains_key(&state) {
+            return state;
+        }
+        self.rules.insert(state.clone(), String::new());
+        let body = if index == keys.len() {
+            if !allow_extra_kv {
+                r#""""#.to_owned()
+            } else {
+                let extra = format!("{slug}-extra-kv");
+                if emitted {
+                    format!(r#"( "," space {extra} )*"#)
+                } else {
+                    format!(r#"( {extra} ("," space {extra})* )?"#)
+                }
+            }
+        } else {
+            let key = &keys[index];
+            let kv = kv_rule_name
+                .get(key)
+                .expect("declared key must have a key/value rule");
+            let next = self.build_ordered_object_state(
+                slug,
+                keys,
+                required,
+                kv_rule_name,
+                allow_extra_kv,
+                index + 1,
+                true,
+            );
+            let emit = if emitted {
+                format!(r#""," space {kv} {next}"#)
+            } else {
+                format!("{kv} {next}")
+            };
+            if required.contains(key) {
+                emit
+            } else {
+                let skip = self.build_ordered_object_state(
+                    slug,
+                    keys,
+                    required,
+                    kv_rule_name,
+                    allow_extra_kv,
+                    index + 1,
+                    emitted,
+                );
+                format!("( {emit} | {skip} )")
+            }
+        };
+        self.rules.insert(state.clone(), body);
+        state
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2524,7 +2652,7 @@ fn merge_schemas(left: &Value, right: &Value, path: &str) -> Result<Value, Schem
                     return Err(schema_error(
                         &format!("{path}/{keyword}"),
                         "additionalProperties intersection is not exactly representable",
-                    ))
+                    ));
                 }
             },
             "const" | "enum" => {
@@ -2557,7 +2685,7 @@ fn merge_schemas(left: &Value, right: &Value, path: &str) -> Result<Value, Schem
                     return Err(schema_error(
                         &format!("{path}/{keyword}"),
                         "allOf intersection is not exactly representable",
-                    ))
+                    ));
                 }
             },
         }

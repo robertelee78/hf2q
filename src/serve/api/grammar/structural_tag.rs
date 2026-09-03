@@ -21,8 +21,44 @@ pub fn compile(payload: &Value) -> Result<Grammar, StructuralTagError> {
     })
 }
 
+/// Compile a structural tag with a tokenizer-bound token-string resolver.
+///
+/// Numeric token IDs work with [`compile`]. XGrammar also accepts tokenizer
+/// token strings, which must resolve to exactly one authoritative token ID at
+/// the serving boundary; this API keeps that model dependency explicit.
+pub fn compile_with_token_resolver<F>(
+    payload: &Value,
+    resolver: F,
+) -> Result<Grammar, StructuralTagError>
+where
+    F: FnMut(&str) -> Result<u32, String>,
+{
+    let source = lower_to_gbnf_with_token_resolver(payload, resolver)?;
+    parser::parse(&source).map_err(|error| {
+        StructuralTagError::Invalid(format!("generated GBNF was invalid: {error}"))
+    })
+}
+
 /// Lower either accepted structural-tag shape to standalone GBNF text.
 pub fn lower_to_gbnf(payload: &Value) -> Result<String, StructuralTagError> {
+    lower_to_gbnf_inner(payload, None)
+}
+
+/// Lower a structural tag while resolving XGrammar token-string values.
+pub fn lower_to_gbnf_with_token_resolver<F>(
+    payload: &Value,
+    mut resolver: F,
+) -> Result<String, StructuralTagError>
+where
+    F: FnMut(&str) -> Result<u32, String>,
+{
+    lower_to_gbnf_inner(payload, Some(&mut resolver))
+}
+
+fn lower_to_gbnf_inner(
+    payload: &Value,
+    resolver: Option<&mut dyn FnMut(&str) -> Result<u32, String>>,
+) -> Result<String, StructuralTagError> {
     let root = object(payload, "structural_tag")?;
     exact_keys(
         root,
@@ -37,7 +73,7 @@ pub fn lower_to_gbnf(payload: &Value) -> Result<String, StructuralTagError> {
             "structural_tag may use current format or legacy structures/triggers, not both".into(),
         ));
     }
-    let mut lowerer = Lowerer::default();
+    let mut lowerer = Lowerer::new(resolver);
     let entry = if has_format {
         lowerer.format(required(root, "format", "structural_tag")?)?
     } else if has_legacy {
@@ -55,13 +91,20 @@ pub fn lower_to_gbnf(payload: &Value) -> Result<String, StructuralTagError> {
     Ok(lowerer.finish(&entry))
 }
 
-#[derive(Default)]
-struct Lowerer {
+struct Lowerer<'a> {
     next: usize,
     rules: Vec<(String, String)>,
+    token_resolver: Option<&'a mut dyn FnMut(&str) -> Result<u32, String>>,
 }
 
-impl Lowerer {
+impl<'a> Lowerer<'a> {
+    fn new(token_resolver: Option<&'a mut dyn FnMut(&str) -> Result<u32, String>>) -> Self {
+        Self {
+            next: 0,
+            rules: Vec::new(),
+            token_resolver,
+        }
+    }
     fn rule(&mut self, body: impl Into<String>) -> String {
         let name = format!("struct-{}", self.next);
         self.next += 1;
@@ -95,6 +138,14 @@ impl Lowerer {
     }
 
     fn format(&mut self, value: &Value) -> Result<String, StructuralTagError> {
+        self.format_with_token_end(value, None)
+    }
+
+    fn format_with_token_end(
+        &mut self,
+        value: &Value,
+        enclosing_end_token: Option<u32>,
+    ) -> Result<String, StructuralTagError> {
         let map = object(value, "format")?;
         let kind = string(required(map, "type", "format")?, "format.type")?;
         match kind {
@@ -117,6 +168,9 @@ impl Lowerer {
                 Ok(self.rule(body))
             }
             "any_text" => self.any_text(map),
+            "token" => self.token(map),
+            "exclude_token" => self.exclude_token(map),
+            "any_tokens" => self.any_tokens(map, enclosing_end_token),
             "sequence" | "or" => self.list(map, kind),
             "optional" | "plus" | "star" => self.unary(map, kind),
             "repeat" => self.repeat(map),
@@ -124,9 +178,8 @@ impl Lowerer {
             "triggered_tags" => self.triggered(map),
             "tags_with_separator" => self.tags_with_separator(map),
             "dispatch" => self.dispatch(map),
-            "token" | "exclude_token" | "any_tokens" | "token_triggered_tags" | "token_dispatch" => {
-                Err(StructuralTagError::NeedsTokenVocabulary(kind.to_owned()))
-            }
+            "token_triggered_tags" => self.token_triggered(map),
+            "token_dispatch" => self.token_dispatch(map),
             "qwen_xml_parameter" => Err(StructuralTagError::Unsupported("qwen_xml_parameter requires an XML-schema lowering not provided by the JSON-only foundation".into())),
             _ => Err(StructuralTagError::Invalid(format!("unknown structural-tag format type '{kind}'"))),
         }
@@ -152,30 +205,161 @@ impl Lowerer {
                 )));
             }
         }
-        if map
-            .get("any_order")
-            .is_some_and(|v| v == &Value::Bool(true))
-        {
+        let any_order = optional_bool(map, "any_order", false, "json_schema")?;
+        if any_order {
+            // XGrammar deliberately relaxes both the required-property and
+            // duplicate-property checks in this mode.  The shared historical
+            // any-order JSON Schema lowering retains those checks, so using it
+            // here would accept a different language.  Keep the boundary
+            // fail-closed until that distinct compiler mode is introduced.
             return Err(StructuralTagError::Unsupported(
-                "json_schema.any_order is not represented by the shared schema compiler".into(),
-            ));
-        }
-        if map.contains_key("max_whitespace_cnt") {
-            return Err(StructuralTagError::Unsupported(
-                "json_schema.max_whitespace_cnt is not represented by the shared schema compiler"
+                "json_schema.any_order=true requires XGrammar's relaxed required/duplicate-property semantics"
                     .into(),
             ));
         }
+        let whitespace = match map.get("max_whitespace_cnt") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let maximum = bounded(value, "json_schema.max_whitespace_cnt")?;
+                if maximum == 0 {
+                    return Err(StructuralTagError::Invalid(
+                        "json_schema.max_whitespace_cnt must be positive when present".into(),
+                    ));
+                }
+                Some(format!("[ \\n\\r\\t]{{0,{maximum}}}"))
+            }
+        };
         let schema = required(map, "json_schema", "json_schema")?;
         if !schema.is_object() && !schema.is_boolean() {
             return Err(StructuralTagError::Invalid(
                 "json_schema.json_schema must be an object or boolean".into(),
             ));
         }
-        let source = json_schema::schema_to_gbnf(schema).map_err(|error| {
-            StructuralTagError::Invalid(format!("invalid structural-tag JSON Schema: {error}"))
-        })?;
+        let source = json_schema::schema_to_gbnf_with_options(schema, whitespace.as_deref(), false)
+            .map_err(|error| {
+                StructuralTagError::Invalid(format!("invalid structural-tag JSON Schema: {error}"))
+            })?;
         self.embed(&source, "structural-tag JSON Schema")
+    }
+
+    fn token(&mut self, map: &Map<String, Value>) -> Result<String, StructuralTagError> {
+        exact_keys(map, &["type", "token"], "token")?;
+        let token = self.resolve_token(required(map, "token", "token")?, "token.token")?;
+        Ok(self.rule(token_expression(token)?))
+    }
+
+    fn exclude_token(&mut self, map: &Map<String, Value>) -> Result<String, StructuralTagError> {
+        exact_keys(map, &["type", "exclude_tokens"], "exclude_token")?;
+        let excludes = map
+            .get("exclude_tokens")
+            .map(|value| self.resolve_tokens(value, "exclude_token.exclude_tokens"))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(self.rule(exclude_tokens_expression(&excludes)?))
+    }
+
+    fn any_tokens(
+        &mut self,
+        map: &Map<String, Value>,
+        enclosing_end_token: Option<u32>,
+    ) -> Result<String, StructuralTagError> {
+        exact_keys(map, &["type", "exclude_tokens", "max_tokens"], "any_tokens")?;
+        let mut excludes = map
+            .get("exclude_tokens")
+            .map(|value| self.resolve_tokens(value, "any_tokens.exclude_tokens"))
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(end) = enclosing_end_token {
+            excludes.push(end);
+        }
+        canonicalize_tokens(&mut excludes);
+        let max = match map.get("max_tokens") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(bounded(value, "any_tokens.max_tokens")?),
+        };
+        let atom = exclude_tokens_expression(&excludes)?;
+        let body = match max {
+            None => format!("( {atom} )*"),
+            Some(0) => "\"\"".to_owned(),
+            Some(maximum) => format!("( {atom} ){{0,{maximum}}}"),
+        };
+        Ok(self.rule(body))
+    }
+
+    fn resolve_token(&mut self, value: &Value, context: &str) -> Result<u32, StructuralTagError> {
+        if let Some(id) = value.as_u64() {
+            return u32::try_from(id).map_err(|_| {
+                StructuralTagError::Invalid(format!("{context} token id is outside the u32 range"))
+            });
+        }
+        let token = string(value, context)?;
+        let Some(resolver) = self.token_resolver.as_mut() else {
+            return Err(StructuralTagError::NeedsTokenVocabulary(context.to_owned()));
+        };
+        resolver(token).map_err(|error| {
+            StructuralTagError::Invalid(format!(
+                "{context} token {token:?} did not resolve: {error}"
+            ))
+        })
+    }
+
+    fn resolve_tokens(
+        &mut self,
+        value: &Value,
+        context: &str,
+    ) -> Result<Vec<u32>, StructuralTagError> {
+        let mut tokens = Vec::new();
+        for (index, value) in array(value, context)?.iter().enumerate() {
+            tokens.push(self.resolve_token(value, &format!("{context}[{index}]"))?);
+        }
+        canonicalize_tokens(&mut tokens);
+        Ok(tokens)
+    }
+
+    fn terminal(&mut self, value: &Value, context: &str) -> Result<Terminal, StructuralTagError> {
+        match value {
+            Value::String(value) => Ok(Terminal::Text(value.clone())),
+            Value::Object(map) => {
+                exact_keys(map, &["type", "token"], context)?;
+                expect_type(map, "token", context)?;
+                Ok(Terminal::Token(self.resolve_token(
+                    required(map, "token", context)?,
+                    &format!("{context}.token"),
+                )?))
+            }
+            _ => Err(StructuralTagError::Invalid(format!(
+                "{context} must be a string or token format"
+            ))),
+        }
+    }
+
+    fn terminals(
+        &mut self,
+        value: &Value,
+        context: &str,
+    ) -> Result<Vec<Terminal>, StructuralTagError> {
+        match value {
+            Value::Array(values) => values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| self.terminal(value, &format!("{context}[{index}]")))
+                .collect(),
+            _ => Ok(vec![self.terminal(value, context)?]),
+        }
+    }
+
+    fn single_terminal(
+        &mut self,
+        value: &Value,
+        context: &str,
+    ) -> Result<Terminal, StructuralTagError> {
+        let mut terminals = self.terminals(value, context)?;
+        if terminals.len() != 1 {
+            return Err(StructuralTagError::Unsupported(format!(
+                "{context} must contain exactly one terminal"
+            )));
+        }
+        Ok(terminals.remove(0))
     }
 
     fn any_text(&mut self, map: &Map<String, Value>) -> Result<String, StructuralTagError> {
@@ -184,18 +368,29 @@ impl Lowerer {
             &["type", "excludes", "max_tokens", "max_chars"],
             "any_text",
         )?;
-        if let Some(value) = map.get("max_tokens") {
-            if !value.is_null() {
-                return Err(StructuralTagError::NeedsTokenVocabulary(
-                    "any_text.max_tokens".into(),
-                ));
-            }
-        }
         let excludes = map
             .get("excludes")
             .map(|value| strings(value, "any_text.excludes"))
             .transpose()?
             .unwrap_or_default();
+        let max_tokens = match map.get("max_tokens") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(bounded(value, "any_text.max_tokens")?),
+        };
+        if let Some(maximum) = max_tokens {
+            if !excludes.is_empty() {
+                return Err(StructuralTagError::Unsupported(
+                    "any_text cannot combine max_tokens with string excludes in the token-terminal runtime"
+                        .into(),
+                ));
+            }
+            let body = if maximum == 0 {
+                "\"\"".to_owned()
+            } else {
+                format!("( <[*]> ){{0,{maximum}}}")
+            };
+            return Ok(self.rule(body));
+        }
         let max_chars = match map.get("max_chars") {
             None | Some(Value::Null) => None,
             Some(value) => Some(bounded(value, "any_text.max_chars")?),
@@ -281,13 +476,14 @@ impl Lowerer {
 
     fn tag(&mut self, map: &Map<String, Value>) -> Result<String, StructuralTagError> {
         exact_keys(map, &["type", "begin", "content", "end"], "tag")?;
-        let begin = string_or_token(required(map, "begin", "tag")?, "tag.begin")?;
-        let content = self.format(required(map, "content", "tag")?)?;
-        let end = endings(required(map, "end", "tag")?)?;
+        let begin = self.terminal(required(map, "begin", "tag")?, "tag.begin")?;
+        let end = self.terminals(required(map, "end", "tag")?, "tag.end")?;
+        let token_end = (end.len() == 1).then(|| end[0].token_id()).flatten();
+        let content = self.format_with_token_end(required(map, "content", "tag")?, token_end)?;
         Ok(self.rule(format!(
             "{} {content} {}",
-            literal(&begin)?,
-            end_expression(&end)?
+            begin.expression()?,
+            terminal_expression(&end)?
         )))
     }
 
@@ -367,17 +563,21 @@ impl Lowerer {
                 "legacy JSON Schema",
             )?;
             tags.push(TagSpec {
-                begin: string(
-                    required(map, "begin", "legacy structure")?,
-                    "legacy structure.begin",
-                )?
-                .to_owned(),
+                begin: Terminal::Text(
+                    string(
+                        required(map, "begin", "legacy structure")?,
+                        "legacy structure.begin",
+                    )?
+                    .to_owned(),
+                ),
                 content,
-                end: string(
-                    required(map, "end", "legacy structure")?,
-                    "legacy structure.end",
-                )?
-                .to_owned(),
+                end: vec![Terminal::Text(
+                    string(
+                        required(map, "end", "legacy structure")?,
+                        "legacy structure.end",
+                    )?
+                    .to_owned(),
+                )],
             });
         }
         self.string_triggered(tags, triggers, &[], false, false)
@@ -418,12 +618,23 @@ impl Lowerer {
             )?;
             expect_type(tag, "tag", "triggered_tags tag")?;
             tags.push(TagSpec {
-                begin: string_or_token(
+                begin: match self.terminal(
                     required(tag, "begin", "triggered_tags tag")?,
                     "triggered_tags tag.begin",
-                )?,
+                )? {
+                    Terminal::Text(text) => Terminal::Text(text),
+                    Terminal::Token(_) => {
+                        return Err(StructuralTagError::Invalid(
+                            "triggered_tags tag.begin must be a string; use token_triggered_tags"
+                                .into(),
+                        ));
+                    }
+                },
                 content: self.format(required(tag, "content", "triggered_tags tag")?)?,
-                end: single_end(required(tag, "end", "triggered_tags tag")?)?,
+                end: self.terminals(
+                    required(tag, "end", "triggered_tags tag")?,
+                    "triggered_tags tag.end",
+                )?,
             });
         }
         self.string_triggered(
@@ -456,9 +667,9 @@ impl Lowerer {
             let content = self.format(&pair[1])?;
             triggers.push(pattern.clone());
             tags.push(TagSpec {
-                begin: pattern,
+                begin: Terminal::Text(pattern),
                 content,
-                end: String::new(),
+                end: vec![Terminal::Text(String::new())],
             });
         }
         let excludes = map
@@ -473,6 +684,183 @@ impl Lowerer {
             false,
             !optional_bool(map, "loop", true, "dispatch")?,
         )
+    }
+
+    fn token_triggered(&mut self, map: &Map<String, Value>) -> Result<String, StructuralTagError> {
+        exact_keys(
+            map,
+            &[
+                "type",
+                "trigger_tokens",
+                "tags",
+                "exclude_tokens",
+                "at_least_one",
+                "stop_after_first",
+            ],
+            "token_triggered_tags",
+        )?;
+        let triggers = self.resolve_tokens(
+            required(map, "trigger_tokens", "token_triggered_tags")?,
+            "token_triggered_tags.trigger_tokens",
+        )?;
+        if triggers.is_empty() {
+            return Err(StructuralTagError::Invalid(
+                "token_triggered_tags.trigger_tokens must not be empty".into(),
+            ));
+        }
+        let excludes = map
+            .get("exclude_tokens")
+            .map(|value| self.resolve_tokens(value, "token_triggered_tags.exclude_tokens"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut tags = Vec::new();
+        for (index, value) in array(
+            required(map, "tags", "token_triggered_tags")?,
+            "token_triggered_tags.tags",
+        )?
+        .iter()
+        .enumerate()
+        {
+            let tag = object(value, &format!("token_triggered_tags.tags[{index}]"))?;
+            exact_keys(
+                tag,
+                &["type", "begin", "content", "end"],
+                "token_triggered_tags tag",
+            )?;
+            expect_type(tag, "tag", "token_triggered_tags tag")?;
+            let begin = self.terminal(
+                required(tag, "begin", "token_triggered_tags tag")?,
+                "token_triggered_tags tag.begin",
+            )?;
+            let Some(begin_token) = begin.token_id() else {
+                return Err(StructuralTagError::Invalid(
+                    "token_triggered_tags tag.begin must be a token format".into(),
+                ));
+            };
+            if !triggers.contains(&begin_token) {
+                return Err(StructuralTagError::Invalid(format!(
+                    "token-triggered tag begin token {begin_token} is absent from trigger_tokens"
+                )));
+            }
+            let end = self.terminals(
+                required(tag, "end", "token_triggered_tags tag")?,
+                "token_triggered_tags tag.end",
+            )?;
+            let end_token = (end.len() == 1).then(|| end[0].token_id()).flatten();
+            let content = self.format_with_token_end(
+                required(tag, "content", "token_triggered_tags tag")?,
+                end_token,
+            )?;
+            tags.push(TagSpec {
+                begin,
+                content,
+                end,
+            });
+        }
+        self.token_triggered_inner(
+            tags,
+            &triggers,
+            &excludes,
+            optional_bool(map, "at_least_one", false, "token_triggered_tags")?,
+            optional_bool(map, "stop_after_first", false, "token_triggered_tags")?,
+        )
+    }
+
+    fn token_dispatch(&mut self, map: &Map<String, Value>) -> Result<String, StructuralTagError> {
+        exact_keys(
+            map,
+            &["type", "rules", "loop", "exclude_tokens"],
+            "token_dispatch",
+        )?;
+        let rules = array(
+            required(map, "rules", "token_dispatch")?,
+            "token_dispatch.rules",
+        )?;
+        if rules.is_empty() {
+            return Err(StructuralTagError::Invalid(
+                "token_dispatch.rules must not be empty".into(),
+            ));
+        }
+        let mut triggers = Vec::with_capacity(rules.len());
+        let mut tags = Vec::with_capacity(rules.len());
+        for (index, rule) in rules.iter().enumerate() {
+            let pair = array(rule, &format!("token_dispatch.rules[{index}]"))?;
+            if pair.len() != 2 {
+                return Err(StructuralTagError::Invalid(format!(
+                    "token_dispatch.rules[{index}] must contain [token, format]"
+                )));
+            }
+            let token =
+                self.resolve_token(&pair[0], &format!("token_dispatch.rules[{index}][0]"))?;
+            triggers.push(token);
+            tags.push(TagSpec {
+                begin: Terminal::Token(token),
+                content: self.format(&pair[1])?,
+                end: vec![Terminal::Text(String::new())],
+            });
+        }
+        canonicalize_tokens(&mut triggers);
+        let excludes = map
+            .get("exclude_tokens")
+            .map(|value| self.resolve_tokens(value, "token_dispatch.exclude_tokens"))
+            .transpose()?
+            .unwrap_or_default();
+        self.token_triggered_inner(
+            tags,
+            &triggers,
+            &excludes,
+            false,
+            !optional_bool(map, "loop", true, "token_dispatch")?,
+        )
+    }
+
+    fn token_triggered_inner(
+        &mut self,
+        tags: Vec<TagSpec>,
+        triggers: &[u32],
+        excludes: &[u32],
+        at_least_one: bool,
+        stop_after_first: bool,
+    ) -> Result<String, StructuralTagError> {
+        if tags.is_empty() {
+            return Err(StructuralTagError::Invalid(
+                "token-triggered tags must not be empty".into(),
+            ));
+        }
+        let state = self.rule("");
+        let tail = if stop_after_first {
+            "\"\"".to_owned()
+        } else {
+            state.clone()
+        };
+        let mut tagged = Vec::new();
+        for tag in &tags {
+            for end in &tag.end {
+                tagged.push(format!(
+                    "{} {} {} {}",
+                    tag.begin.expression()?,
+                    tag.content,
+                    end.expression()?,
+                    tail
+                ));
+            }
+        }
+        let mut blocked = triggers.to_vec();
+        blocked.extend_from_slice(excludes);
+        canonicalize_tokens(&mut blocked);
+        let free = exclude_tokens_expression(&blocked)?;
+        let body = format!("( {} | {free} {state} | \"\" )", tagged.join(" | "));
+        let rule = self
+            .rules
+            .iter_mut()
+            .find(|(name, _)| name == &state)
+            .expect("token dispatch state rule exists");
+        rule.1 = body;
+        if at_least_one {
+            Ok(self.rule(format!("( {} )", tagged.join(" | "))))
+        } else {
+            Ok(state)
+        }
     }
 
     fn string_triggered(
@@ -491,15 +879,44 @@ impl Lowerer {
     }
 }
 
-#[derive(Clone)]
-struct TagSpec {
-    begin: String,
-    content: String,
-    end: String,
+#[derive(Clone, Debug)]
+enum Terminal {
+    Text(String),
+    Token(u32),
 }
 
-struct Scanner<'a> {
-    lowerer: &'a mut Lowerer,
+impl Terminal {
+    fn expression(&self) -> Result<String, StructuralTagError> {
+        match self {
+            Self::Text(value) => literal(value),
+            Self::Token(token) => token_expression(*token),
+        }
+    }
+
+    fn as_text(&self) -> Option<&String> {
+        match self {
+            Self::Text(value) => Some(value),
+            Self::Token(_) => None,
+        }
+    }
+
+    fn token_id(&self) -> Option<u32> {
+        match self {
+            Self::Text(_) => None,
+            Self::Token(token) => Some(*token),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TagSpec {
+    begin: Terminal,
+    content: String,
+    end: Vec<Terminal>,
+}
+
+struct Scanner<'lowerer, 'resolver> {
+    lowerer: &'lowerer mut Lowerer<'resolver>,
     tags: Vec<TagSpec>,
     triggers: Vec<String>,
     excludes: Vec<String>,
@@ -508,9 +925,9 @@ struct Scanner<'a> {
     states: BTreeMap<(String, Option<u64>), String>,
 }
 
-impl<'a> Scanner<'a> {
+impl<'lowerer, 'resolver> Scanner<'lowerer, 'resolver> {
     fn new(
-        lowerer: &'a mut Lowerer,
+        lowerer: &'lowerer mut Lowerer<'resolver>,
         tags: Vec<TagSpec>,
         triggers: &[String],
         excludes: &[String],
@@ -624,19 +1041,25 @@ impl<'a> Scanner<'a> {
     fn initial_tag_alternatives(&mut self) -> Result<String, StructuralTagError> {
         let mut alternatives = Vec::new();
         for tag in self.tags.clone() {
-            let tail = if self.stop {
-                "\"\"".to_owned()
-            } else {
-                let patterns = self.patterns().cloned().collect::<Vec<_>>();
-                self.state(&longest_prefix_suffix(&tag.end, &patterns), self.max_chars)?
-            };
-            alternatives.push(format!(
-                "{} {} {} {}",
-                literal(&tag.begin)?,
-                tag.content,
-                literal(&tag.end)?,
-                tail
-            ));
+            for end in &tag.end {
+                let tail = if self.stop {
+                    "\"\"".to_owned()
+                } else {
+                    let patterns = self.patterns().cloned().collect::<Vec<_>>();
+                    self.state(
+                        &end.as_text()
+                            .map_or_else(String::new, |end| longest_prefix_suffix(end, &patterns)),
+                        self.max_chars,
+                    )?
+                };
+                alternatives.push(format!(
+                    "{} {} {} {}",
+                    tag.begin.expression()?,
+                    tag.content,
+                    end.expression()?,
+                    tail
+                ));
+            }
         }
         if alternatives.is_empty() {
             return Err(StructuralTagError::Invalid(
@@ -652,22 +1075,31 @@ impl<'a> Scanner<'a> {
     fn tag_for_trigger(&mut self, trigger: &str) -> Result<Vec<String>, StructuralTagError> {
         let mut out = Vec::new();
         for tag in self.tags.clone() {
-            if tag.begin.starts_with(trigger) {
-                let suffix =
-                    &tag.begin[trigger.len() - trigger.chars().last().unwrap().len_utf8()..];
-                let tail = if self.stop {
-                    "\"\"".to_owned()
-                } else {
-                    let patterns = self.patterns().cloned().collect::<Vec<_>>();
-                    self.state(&longest_prefix_suffix(&tag.end, &patterns), self.max_chars)?
-                };
-                out.push(format!(
-                    "{} {} {} {}",
-                    literal(suffix)?,
-                    tag.content,
-                    literal(&tag.end)?,
-                    tail
-                ));
+            let Some(begin) = tag.begin.as_text() else {
+                continue;
+            };
+            if begin.starts_with(trigger) {
+                let suffix = &begin[trigger.len() - trigger.chars().last().unwrap().len_utf8()..];
+                for end in &tag.end {
+                    let tail = if self.stop {
+                        "\"\"".to_owned()
+                    } else {
+                        let patterns = self.patterns().cloned().collect::<Vec<_>>();
+                        self.state(
+                            &end.as_text().map_or_else(String::new, |end| {
+                                longest_prefix_suffix(end, &patterns)
+                            }),
+                            self.max_chars,
+                        )?
+                    };
+                    out.push(format!(
+                        "{} {} {} {}",
+                        literal(suffix)?,
+                        tag.content,
+                        end.expression()?,
+                        tail
+                    ));
+                }
             }
         }
         Ok(out)
@@ -684,14 +1116,19 @@ fn validate_trigger_topology(
         ));
     }
     for tag in tags {
+        let Some(begin) = tag.begin.as_text() else {
+            return Err(StructuralTagError::Invalid(
+                "string-triggered tags require string begin terminals".into(),
+            ));
+        };
         let matching = triggers
             .iter()
-            .filter(|trigger| tag.begin.starts_with(trigger.as_str()))
+            .filter(|trigger| begin.starts_with(trigger.as_str()))
             .count();
         if matching != 1 {
             return Err(StructuralTagError::Invalid(format!(
                 "tag begin '{}' must match exactly one trigger",
-                tag.begin
+                begin
             )));
         }
     }
@@ -763,49 +1200,48 @@ fn literal(value: &str) -> Result<String, StructuralTagError> {
         Ok(json_schema::format_literal(value))
     }
 }
-fn end_expression(ends: &[String]) -> Result<String, StructuralTagError> {
-    if ends.len() == 1 {
-        literal(&ends[0])
+fn terminal_expression(terminals: &[Terminal]) -> Result<String, StructuralTagError> {
+    if terminals.is_empty() {
+        return Err(StructuralTagError::Invalid(
+            "tag.end must not be an empty array".into(),
+        ));
+    }
+    if terminals.len() == 1 {
+        terminals[0].expression()
     } else {
         Ok(format!(
             "( {} )",
-            ends.iter()
-                .map(|end| literal(end))
+            terminals
+                .iter()
+                .map(Terminal::expression)
                 .collect::<Result<Vec<_>, _>>()?
                 .join(" | ")
         ))
     }
 }
-fn single_end(value: &Value) -> Result<String, StructuralTagError> {
-    let ends = endings(value)?;
-    if ends.len() != 1 {
-        Err(StructuralTagError::Unsupported(
-            "triggered_tags requires a single string end".into(),
-        ))
-    } else {
-        Ok(ends.into_iter().next().unwrap())
-    }
+
+fn token_expression(token: u32) -> Result<String, StructuralTagError> {
+    Ok(format!("<[{token}]>"))
 }
-fn endings(value: &Value) -> Result<Vec<String>, StructuralTagError> {
-    match value {
-        Value::String(s) => Ok(vec![s.clone()]),
-        Value::Array(_) => strings(value, "tag.end"),
-        Value::Object(_) => Err(StructuralTagError::NeedsTokenVocabulary(
-            "tag.end token".into(),
-        )),
-        _ => Err(StructuralTagError::Invalid(
-            "tag.end must be a string, string array, or token format".into(),
+
+fn exclude_tokens_expression(tokens: &[u32]) -> Result<String, StructuralTagError> {
+    match tokens {
+        [] => Ok("<[*]>".to_owned()),
+        [token] => Ok(format!("!<[{token}]>")),
+        tokens => Ok(format!(
+            "!<[{}]>",
+            tokens
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
         )),
     }
 }
-fn string_or_token(value: &Value, context: &str) -> Result<String, StructuralTagError> {
-    match value {
-        Value::String(s) => Ok(s.clone()),
-        Value::Object(_) => Err(StructuralTagError::NeedsTokenVocabulary(context.into())),
-        _ => Err(StructuralTagError::Invalid(format!(
-            "{context} must be a string or token format"
-        ))),
-    }
+
+fn canonicalize_tokens(tokens: &mut Vec<u32>) {
+    tokens.sort_unstable();
+    tokens.dedup();
 }
 fn char_expression(chars: &[char], negated: bool) -> Result<String, StructuralTagError> {
     let mut inner = String::new();
@@ -1030,16 +1466,153 @@ mod tests {
     }
 
     #[test]
-    fn token_and_unbounded_token_budget_are_explicit_errors() {
-        let token = json!({"type":"structural_tag","format":{"type":"token","token":1}});
+    fn string_triggered_tags_keep_xgrammar_alternative_string_endings() {
+        let value = json!({
+            "type":"structural_tag",
+            "format":{
+                "type":"triggered_tags",
+                "triggers":["<call>"],
+                "tags":[{"type":"tag","begin":"<call>","content":{"type":"const_string","value":"ok"},"end":["</call>","</alt>"]}]
+            }
+        });
+        let grammar = compile(&value).unwrap();
+        assert!(accepts(grammar.clone(), "before<call>ok</call>after"));
+        assert!(accepts(grammar, "before<call>ok</alt>after"));
+    }
+
+    #[test]
+    fn json_schema_defaults_to_xgrammar_declaration_order() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"second": {"type": "integer"}, "first": {"type": "string"}},
+            "required": ["second", "first"],
+            "additionalProperties": false
+        });
+        let value =
+            json!({"type":"structural_tag","format":{"type":"json_schema","json_schema":schema}});
+        let grammar = compile(&value).unwrap();
+        assert!(accepts(grammar.clone(), r#"{"second":1,"first":"ok"}"#));
+        assert!(!accepts(grammar, r#"{"first":"ok","second":1}"#));
+
+        let unordered = json!({
+            "type":"structural_tag",
+            "format":{"type":"json_schema","json_schema": {"type":"object"}, "any_order": true}
+        });
         assert!(matches!(
-            lower_to_gbnf(&token),
+            lower_to_gbnf(&unordered),
+            Err(StructuralTagError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn json_schema_bounds_whitespace_and_rejects_zero() {
+        let value = json!({
+            "type":"structural_tag",
+            "format":{
+                "type":"json_schema",
+                "json_schema":{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"],"additionalProperties":false},
+                "max_whitespace_cnt":2
+            }
+        });
+        assert!(accepts(compile(&value).unwrap(), r#"{  "x":  1  }"#));
+
+        let zero = json!({"type":"structural_tag","format":{"type":"json_schema","json_schema":{},"max_whitespace_cnt":0}});
+        assert!(matches!(
+            lower_to_gbnf(&zero),
+            Err(StructuralTagError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn numeric_token_formats_lower_to_canonical_token_terminals() {
+        let token = json!({"type":"structural_tag","format":{"type":"token","token":7}});
+        assert!(lower_to_gbnf(&token).unwrap().contains("<[7]>"));
+
+        let excluded = json!({"type":"structural_tag","format":{"type":"exclude_token","exclude_tokens":[9,2,9]}});
+        assert!(lower_to_gbnf(&excluded).unwrap().contains("!<[2,9]>"));
+
+        let bounded = json!({"type":"structural_tag","format":{"type":"any_tokens","exclude_tokens":[5],"max_tokens":2}});
+        let source = lower_to_gbnf(&bounded).unwrap();
+        assert!(source.contains("!<[5]>"));
+        let root = parser::parse(&source).unwrap().rule_id("root").unwrap();
+        let mut runtime =
+            crate::serve::api::grammar::GrammarRuntime::new(parser::parse(&source).unwrap(), root)
+                .unwrap();
+        assert!(runtime.accept_token(1, b"irrelevant"));
+        assert!(runtime.accept_token(2, b"irrelevant"));
+        assert!(runtime.is_terminally_accepted());
+        assert!(!runtime.accept_token(3, b"third token is over the bound"));
+
+        let any_text = json!({"type":"structural_tag","format":{"type":"any_text","max_tokens":0}});
+        assert!(accepts(compile(&any_text).unwrap(), ""));
+    }
+
+    #[test]
+    fn token_strings_require_or_use_an_authoritative_resolver() {
+        let value = json!({"type":"structural_tag","format":{"type":"token","token":"<open>"}});
+        assert!(matches!(
+            lower_to_gbnf(&value),
             Err(StructuralTagError::NeedsTokenVocabulary(_))
         ));
-        let budget = json!({"type":"structural_tag","format":{"type":"any_text","max_tokens":1}});
-        assert!(matches!(
-            lower_to_gbnf(&budget),
-            Err(StructuralTagError::NeedsTokenVocabulary(_))
-        ));
+        assert!(
+            lower_to_gbnf_with_token_resolver(&value, |token| {
+                assert_eq!(token, "<open>");
+                Ok(42)
+            })
+            .unwrap()
+            .contains("<[42]>")
+        );
+    }
+
+    #[test]
+    fn token_tag_end_excludes_it_from_unbounded_any_tokens() {
+        let value = json!({
+            "type":"structural_tag",
+            "format":{
+                "type":"tag",
+                "begin":{"type":"token","token":1},
+                "content":{"type":"any_tokens","exclude_tokens":[8]},
+                "end":{"type":"token","token":2}
+            }
+        });
+        let source = lower_to_gbnf(&value).unwrap();
+        assert!(source.contains("<[1]>"));
+        assert!(source.contains("!<[2,8]>"));
+        assert!(source.contains("<[2]>"));
+
+        let grammar = compile(&value).unwrap();
+        let root = grammar.rule_id("root").unwrap();
+        let mut runtime = crate::serve::api::grammar::GrammarRuntime::new(grammar, root).unwrap();
+        assert!(runtime.accept_token(1, b"start"));
+        assert!(runtime.accept_token(7, b"body"));
+        assert!(runtime.accept_token(2, b"end"));
+        assert!(runtime.is_accepted());
+    }
+
+    #[test]
+    fn token_triggered_and_dispatch_lower_with_trigger_safe_free_tokens() {
+        let triggered = json!({
+            "type":"structural_tag",
+            "format":{
+                "type":"token_triggered_tags",
+                "trigger_tokens":[3],
+                "exclude_tokens":[9],
+                "tags":[{"type":"tag","begin":{"type":"token","token":3},"content":{"type":"const_string","value":"ok"},"end":{"type":"token","token":4}}]
+            }
+        });
+        let source = lower_to_gbnf(&triggered).unwrap();
+        assert!(source.contains("!<[3,9]>"));
+        assert!(source.contains("<[3]>"));
+        assert!(source.contains("<[4]>"));
+        assert!(compile(&triggered).is_ok());
+
+        let dispatch = json!({
+            "type":"structural_tag",
+            "format":{"type":"token_dispatch","rules":[[5,{"type":"const_string","value":"x"}]],"exclude_tokens":[8],"loop":false}
+        });
+        let source = lower_to_gbnf(&dispatch).unwrap();
+        assert!(source.contains("!<[5,8]>"));
+        assert!(source.contains("<[5]>"));
+        assert!(compile(&dispatch).is_ok());
     }
 }
