@@ -32,19 +32,22 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tokenizers::Tokenizer;
 
 use crate::core::provenance::{self, Provenance};
-use crate::inference::models::qwen3vl_text::forward::forward_text_prefill_logits_last;
 use crate::inference::models::qwen3vl_text::Qwen3VlTextModel;
+use crate::inference::models::qwen3vl_text::forward::forward_text_prefill_logits_last;
 use crate::serve::forward_prefill::{DeepstackInjection, SoftTokenInjection};
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, TokenizerSource,
 };
-use crate::serve::sampler_pure::{self, SamplingParams as SamplerPureParams};
+use crate::serve::sampler_pure::SamplingParams as SamplerPureParams;
 
-use super::engine::{effective_repetition_penalty, GenerationResult, LoadOptions, SamplingParams};
+use super::engine::{
+    GenerationResult, GrammarKind, LoadOptions, SamplingParams, accept_grammar_token,
+    effective_repetition_penalty, grammar_runtime_for_request, sample_logits_with_grammar,
+};
 use super::registry::ModelRegistration;
 
 /// All artifacts the SERVE worker needs to handle requests against a
@@ -545,7 +548,14 @@ fn argmax_u32(logits: &[f32]) -> u32 {
 /// Sample one token from `logits` per `params`, with the standard
 /// repetition-penalty + temperature + top-p / top-k / min-p chain
 /// (`sampler_pure::sample_token`).
-fn sample_logits_qwen3vl(logits: &mut [f32], params: &SamplingParams, generated: &[u32]) -> u32 {
+fn sample_logits_qwen3vl(
+    logits: &mut [f32],
+    params: &SamplingParams,
+    generated: &[u32],
+    grammar_runtime: Option<&super::grammar::GrammarRuntime>,
+    token_bytes: Option<&[Vec<u8>]>,
+    eog_token_ids: &[u32],
+) -> Result<u32> {
     let sp = SamplerPureParams {
         temperature: params.temperature as f64,
         top_p: params.top_p as f64,
@@ -555,7 +565,33 @@ fn sample_logits_qwen3vl(logits: &mut [f32], params: &SamplingParams, generated:
         max_tokens: params.max_tokens,
         seed: params.seed,
     };
-    sampler_pure::sample_token(logits, &sp, generated)
+    sample_logits_with_grammar(
+        logits,
+        &sp,
+        generated,
+        grammar_runtime,
+        token_bytes,
+        eog_token_ids,
+        false,
+    )
+    .map(|(token, _)| token)
+}
+
+fn validate_qwen3vl_grammar_completion(
+    runtime: Option<&super::grammar::GrammarRuntime>,
+    kind: GrammarKind,
+) -> Result<()> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    if kind == GrammarKind::ToolCallBodyAuto && runtime.is_awaiting_trigger() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        runtime.is_accepted(),
+        "grammar constraint was not complete when Qwen3-VL generation terminated"
+    );
+    Ok(())
 }
 
 /// Decode tokens to text via the loaded HF tokenizer. The
@@ -605,7 +641,7 @@ pub fn generate_qwen3vl_text_once(
     qwen: &mut Qwen3VlTextLoadedModel,
     prompt_tokens: &[u32],
     params: &SamplingParams,
-    _registration: Option<&ModelRegistration>,
+    registration: Option<&ModelRegistration>,
 ) -> Result<GenerationResult> {
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
@@ -613,7 +649,8 @@ pub fn generate_qwen3vl_text_once(
     );
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
-    let is_greedy = is_greedy_eligible_qwen3vl(params);
+    let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
+    let grammar_token_bytes = params.token_bytes.as_deref().map(Vec::as_slice);
 
     // The "prefill" duration in the iter-9b naive loop covers the
     // FIRST forward + sample (which carries the full prompt cost).
@@ -652,11 +689,25 @@ pub fn generate_qwen3vl_text_once(
             prefill_duration = prefill_start.elapsed();
         }
 
-        let next_token: u32 = if is_greedy {
+        let next_token: u32 = if is_greedy_eligible_qwen3vl(params) && grammar_runtime.is_none() {
             argmax_u32(&logits)
         } else {
-            sample_logits_qwen3vl(&mut logits, params, &decoded_tokens)
+            sample_logits_qwen3vl(
+                &mut logits,
+                params,
+                &decoded_tokens,
+                grammar_runtime.as_ref(),
+                grammar_token_bytes,
+                &qwen.eos_token_ids,
+            )?
         };
+
+        accept_grammar_token(
+            &mut grammar_runtime,
+            grammar_token_bytes,
+            &qwen.eos_token_ids,
+            next_token,
+        )?;
 
         // EOS: terminate before pushing — peer convention is that the
         // EOS token is the SIGNAL, not part of the visible output. The
@@ -672,6 +723,8 @@ pub fn generate_qwen3vl_text_once(
     let decode_duration = decode_start_outer
         .elapsed()
         .saturating_sub(prefill_duration);
+
+    validate_qwen3vl_grammar_completion(grammar_runtime.as_ref(), params.grammar_kind)?;
 
     let text = decode_to_text(&qwen.tokenizer, &decoded_tokens)?;
 
@@ -752,7 +805,7 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
     deepstack: Option<&DeepstackInjection<'_>>,
     positions_flat: &[i32],
     params: &SamplingParams,
-    _registration: Option<&ModelRegistration>,
+    registration: Option<&ModelRegistration>,
 ) -> Result<GenerationResult> {
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
@@ -768,7 +821,8 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
         ));
     }
     let max_tokens = params.max_tokens.max(1);
-    let is_greedy = is_greedy_eligible_qwen3vl(params);
+    let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
+    let grammar_token_bytes = params.token_bytes.as_deref().map(Vec::as_slice);
 
     let mut tokens_so_far: Vec<u32> = prompt_tokens.to_vec();
     let mut decoded_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
@@ -845,11 +899,25 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
             prefill_duration = prefill_start.elapsed();
         }
 
-        let next_token: u32 = if is_greedy {
+        let next_token: u32 = if is_greedy_eligible_qwen3vl(params) && grammar_runtime.is_none() {
             argmax_u32(&logits)
         } else {
-            sample_logits_qwen3vl(&mut logits, params, &decoded_tokens)
+            sample_logits_qwen3vl(
+                &mut logits,
+                params,
+                &decoded_tokens,
+                grammar_runtime.as_ref(),
+                grammar_token_bytes,
+                &qwen.eos_token_ids,
+            )?
         };
+
+        accept_grammar_token(
+            &mut grammar_runtime,
+            grammar_token_bytes,
+            &qwen.eos_token_ids,
+            next_token,
+        )?;
 
         if qwen.eos_token_ids.contains(&next_token) {
             finish_reason = "stop";
@@ -862,6 +930,8 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
     let decode_duration = decode_start_outer
         .elapsed()
         .saturating_sub(prefill_duration);
+
+    validate_qwen3vl_grammar_completion(grammar_runtime.as_ref(), params.grammar_kind)?;
 
     let text = decode_to_text(&qwen.tokenizer, &decoded_tokens)?;
 
@@ -877,4 +947,54 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
         cached_tokens: 0,
         logprobs: None,
     })
+}
+
+#[cfg(test)]
+mod grammar_tests {
+    use super::*;
+
+    #[test]
+    fn qwen3vl_sampler_masks_with_the_shared_grammar_runtime() {
+        let grammar = crate::serve::api::grammar::parse("root ::= \"a\"\n").unwrap();
+        let root = grammar.rule_id("root").unwrap();
+        let runtime = crate::serve::api::grammar::GrammarRuntime::new(grammar, root).unwrap();
+        let token_bytes = vec![b"x".to_vec(), b"a".to_vec(), Vec::new()];
+        let mut logits = vec![10.0, 1.0, 9.0];
+        let params = SamplingParams {
+            max_tokens: 1,
+            ..Default::default()
+        };
+
+        let token = sample_logits_qwen3vl(
+            &mut logits,
+            &params,
+            &[],
+            Some(&runtime),
+            Some(&token_bytes),
+            &[2],
+        )
+        .unwrap();
+        assert_eq!(token, 1);
+        let mut runtime = Some(runtime);
+        accept_grammar_token(&mut runtime, Some(&token_bytes), &[2], token).unwrap();
+        validate_qwen3vl_grammar_completion(runtime.as_ref(), GrammarKind::ResponseFormat).unwrap();
+    }
+
+    #[test]
+    fn qwen3vl_rejects_incomplete_required_grammar_but_allows_untriggered_auto() {
+        let grammar = crate::serve::api::grammar::parse("root ::= \"ab\"\n").unwrap();
+        let root = grammar.rule_id("root").unwrap();
+        let mut incomplete =
+            crate::serve::api::grammar::GrammarRuntime::new(grammar.clone(), root).unwrap();
+        assert!(incomplete.accept_token(1, b"a"));
+        assert!(
+            validate_qwen3vl_grammar_completion(Some(&incomplete), GrammarKind::ResponseFormat)
+                .is_err()
+        );
+
+        let mut optional = crate::serve::api::grammar::GrammarRuntime::new(grammar, root).unwrap();
+        optional.set_awaiting_trigger(true);
+        validate_qwen3vl_grammar_completion(Some(&optional), GrammarKind::ToolCallBodyAuto)
+            .unwrap();
+    }
 }
