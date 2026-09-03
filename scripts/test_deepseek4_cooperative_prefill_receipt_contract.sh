@@ -14,6 +14,8 @@ trap cleanup EXIT
 
 if MLX_NATIVE_SKIP_METALLIB=1 \
   EXPECTED_SHA="$SOURCE_SHA" \
+  EXPECTED_VERSION=0.0.0 \
+  STANDALONE_CANDIDATE_RUN_ID=1 \
   CRATE_SHA256="$MODEL_SHA" \
   DEPENDENCY_PROVENANCE_DIR="$tmp_dir/dummy-dependency-provenance" \
   HF2Q_BIN=/bin/true \
