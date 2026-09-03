@@ -122,6 +122,24 @@ jobs:
             assets/head.svg.base64 \
             scripts/install.sh.in \
             scripts/sign_notarize_standalone_release.sh \
+            scripts/verify_cache_lifecycle_candidate.sh \
+            scripts/package_cache_lifecycle_evidence.sh \
+            scripts/test_cache_lifecycle_evidence_contract.sh \
+            scripts/extract_openai_sse_data.sh \
+            scripts/verify_r2c_structured_output_receipt.sh \
+            scripts/test_r2c_structured_output_receipt_contract.sh \
+            scripts/test_r2c_structured_outputs.sh \
+            tests/fixtures/structured_output/r2c/MANIFEST.json \
+            tests/fixtures/structured_output/r2c/README.md \
+            tests/fixtures/structured_output/r2c/stage6_review_lens.invalid_disposition.json \
+            tests/fixtures/structured_output/r2c/stage6_review_lens.invalid_missing_detail.json \
+            tests/fixtures/structured_output/r2c/stage6_review_lens.schema.json \
+            tests/fixtures/structured_output/r2c/stage6_review_lens.valid.json \
+            tests/fixtures/structured_output/r2c/stage9_cwe.invalid_abstention.json \
+            tests/fixtures/structured_output/r2c/stage9_cwe.invalid_cwe.json \
+            tests/fixtures/structured_output/r2c/stage9_cwe.schema.json \
+            tests/fixtures/structured_output/r2c/stage9_cwe.valid.json \
+            tests/fixtures/structured_output/r2c/stage9_cwe.valid_abstention.json \
             scripts/test_standalone_installer.sh \
             scripts/test_standalone_release_signing_contract.sh \
             tests/frictionless_cli.rs \
@@ -519,6 +537,13 @@ jobs:
             scripts/test_release_dependency_provenance_contract.sh \
             scripts/run_release_gate_process_group.sh \
             scripts/test_release_gate_process_group_contract.sh \
+            scripts/verify_cache_lifecycle_candidate.sh \
+            scripts/package_cache_lifecycle_evidence.sh \
+            scripts/test_cache_lifecycle_evidence_contract.sh \
+            scripts/extract_openai_sse_data.sh \
+            scripts/verify_r2c_structured_output_receipt.sh \
+            scripts/test_r2c_structured_output_receipt_contract.sh \
+            scripts/test_r2c_structured_outputs.sh \
             scripts/ensure_github_release_tag.sh \
             scripts/test_release_tag_recovery_contract.sh \
             scripts/test_deepseek4_cached_suffix.sh \
@@ -546,6 +571,8 @@ jobs:
           bash scripts/test_standalone_release_signing_contract.sh
           bash scripts/test_release_dependency_provenance_contract.sh
           bash scripts/test_release_gate_process_group_contract.sh
+          bash scripts/test_cache_lifecycle_evidence_contract.sh
+          bash scripts/test_r2c_structured_output_receipt_contract.sh
           bash scripts/test_release_tag_recovery_contract.sh
           bash scripts/test_frictionless_diagnostics_contract.sh
           bash scripts/test_gemma4_long_short_overlap_contract.sh

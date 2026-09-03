@@ -414,6 +414,36 @@ SSE evidence is reproducible with `scripts/test_r2c_structured_outputs.sh`.
 Standalone Qwen3-VL was not loaded: no authoritative GGUF is present and its
 documented ADR-041 startup guard makes artifact preparation insufficient.
 
+The strengthened dense-Qwen spike initially retained the 768-token ceiling.
+It failed closed on the nested Stage 6 vector: Qwen's measured adaptive
+reasoning budget was 576 tokens, leaving only 192 tokens for a valid nested
+object. At a 1,536-token ceiling the object completed, but the model selected a
+different schema-valid `oneOf` branch than the fixture intended to exercise.
+The reformulated conformance test supplies exact semantic JSON content while
+leaving serialization to the model, retains a contradictory adversarial case
+to prove that the schema wins, and raises the ceiling to 2,048. The resulting
+dense `qwen35` run passed all eight unary/SSE cases; its nested response used
+1,686 completion tokens (1,543 reasoning tokens) and emitted a 605-byte valid
+object. This is evidence for the constraint path, not a claim that arbitrary
+weights share the reference model's semantic quality.
+
+Branch-local model evidence is not release authority. Beginning with the
+0.1.21 line, the protected release workflow MUST run the revision-bound empty
+and nested Stage 6 vectors, Stage 9 primary/related/null unary and SSE vectors,
+and an adversarial `const`/`additionalProperties` vector against the exact
+signed binary. One protected reference artifact MUST cover each enabled GGUF
+runtime architecture: `gemma4`, `qwen35`, `qwen35moe`, and `deepseek4`.
+Qwen3.8 supplies the dense `qwen35` reference and Qwen3.6 supplies the
+`qwen35moe` reference. Because grammar masking runs after family-specific
+logits production, dense and MoE checkpoints within one GGUF architecture do
+not create another grammar implementation. The gate MUST nevertheless inspect
+and bind the actual architecture so substituting two same-branch artifacts
+cannot satisfy the matrix. It MUST independently rehash each raw request and
+response receipt and refuse publication when the cross-family manifest is
+absent, malformed, or bound to different source, crate, binary, model,
+architecture, or candidate-run identities. The fixture schemas are test
+vectors, not an r2c runtime or build dependency.
+
 ## Completion gates
 
 This ADR moves to **Implemented** only when:
