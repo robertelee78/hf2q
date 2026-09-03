@@ -9,7 +9,7 @@ use super::{
 };
 use crate::serve::api::schema::{
     ChatCompletionRequest, LlamaGrammarTriggerType, ResponseFormat, StructuredOutputJson,
-    StructuredOutputs, ToolChoiceValue,
+    StructuredOutputs, ToolChoiceValue, StopSequence,
 };
 
 #[path = "request_validation.rs"]
@@ -272,7 +272,8 @@ fn structured_constraint_kind(
 fn response_constraint_kind(response: &ResponseFormat) -> Option<ConstraintKind> {
     match response {
         ResponseFormat::Text => None,
-        ResponseFormat::JsonObject => Some(ConstraintKind::JsonObject),
+        ResponseFormat::JsonObject { schema: Some(_) } => Some(ConstraintKind::Json),
+        ResponseFormat::JsonObject { schema: None } => Some(ConstraintKind::JsonObject),
         ResponseFormat::JsonSchema { .. } => Some(ConstraintKind::Json),
         ResponseFormat::StructuralTag { .. } => Some(ConstraintKind::StructuralTag),
     }
@@ -289,16 +290,26 @@ fn compile_response_format_impl(
         .flatten();
     match response {
         ResponseFormat::Text => Ok(None),
-        ResponseFormat::JsonObject => {
-            if structured_options
-                .is_some_and(|options| options.disable_additional_properties.is_some())
-            {
-                return Err(RequestGrammarError::new(
-                    "structured_outputs.disable_additional_properties",
-                    "disable_additional_properties requires an explicit JSON Schema",
-                ));
+        ResponseFormat::JsonObject { schema } => {
+            if let Some(schema) = schema {
+                let mut schema = schema.as_value();
+                if structured_options
+                    .is_some_and(|options| options.disable_additional_properties == Some(true))
+                {
+                    close_implicit_objects(&mut schema);
+                }
+                compile_schema(&schema, "response_format.schema", whitespace_pattern).map(Some)
+            } else {
+                if structured_options
+                    .is_some_and(|options| options.disable_additional_properties.is_some())
+                {
+                    return Err(RequestGrammarError::new(
+                        "structured_outputs.disable_additional_properties",
+                        "disable_additional_properties requires an explicit JSON Schema",
+                    ));
+                }
+                parse_gbnf(&json_object_grammar(whitespace_pattern)?, "response_format").map(Some)
             }
-            parse_gbnf(&json_object_grammar(whitespace_pattern)?, "response_format").map(Some)
         }
         ResponseFormat::JsonSchema { json_schema: spec } => {
             let mut schema = spec.schema.clone();
@@ -830,6 +841,27 @@ pub fn compile_request_output_constraint_with_tokenizer(
         });
     }
     compile_request_constraint_with_tokenizer(request, tokenizer)
+}
+
+/// Stop-string stripping can remove bytes that were part of the accepted
+/// grammar language. Until every unary/SSE family buffers and validates the
+/// stripped suffix identically, reject the ambiguous combination explicitly.
+pub fn validate_stop_with_constraint(
+    request: &ChatCompletionRequest,
+    constraint_present: bool,
+) -> Result<(), RequestGrammarError> {
+    let has_stop = match request.stop.as_ref() {
+        None => false,
+        Some(StopSequence::Single(_)) => true,
+        Some(StopSequence::Multiple(values)) => !values.is_empty(),
+    };
+    if constraint_present && has_stop {
+        return Err(RequestGrammarError::new(
+            "stop",
+            "stop cannot be combined with a grammar-constrained response because stripping the stop sequence could invalidate the constrained output",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

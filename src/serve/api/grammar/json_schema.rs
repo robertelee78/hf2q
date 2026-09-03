@@ -576,6 +576,30 @@ pub fn schema_to_gbnf_with_options(
     whitespace_pattern: Option<&str>,
     any_order: bool,
 ) -> Result<String, SchemaError> {
+    schema_to_gbnf_with_order_mode(schema, whitespace_pattern, any_order, false)
+}
+
+/// Compile the JSON-schema component of an XGrammar structural tag.
+///
+/// XGrammar's `any_order=true` is intentionally weaker than ordinary JSON
+/// Schema validation: it permits duplicate keys and does not track which
+/// required keys appeared, while retaining the effective entry-count bound.
+/// Keep that compatibility behavior isolated from hf2q's normal strict,
+/// unordered response-schema compiler.
+pub fn schema_to_gbnf_for_structural_tag(
+    schema: &Value,
+    whitespace_pattern: Option<&str>,
+    any_order: bool,
+) -> Result<String, SchemaError> {
+    schema_to_gbnf_with_order_mode(schema, whitespace_pattern, any_order, any_order)
+}
+
+fn schema_to_gbnf_with_order_mode(
+    schema: &Value,
+    whitespace_pattern: Option<&str>,
+    any_order: bool,
+    relaxed_any_order: bool,
+) -> Result<String, SchemaError> {
     validate_schema_profile(schema)?;
     let space_rule = match whitespace_pattern {
         None => SPACE_RULE.to_string(),
@@ -591,6 +615,7 @@ pub fn schema_to_gbnf_with_options(
         resolving_refs: HashSet::new(),
         resolved_refs: 0,
         any_order,
+        relaxed_any_order,
     };
     conv.rules.insert("space".to_string(), space_rule);
     let root_body = conv.visit(schema, "", 0)?;
@@ -632,6 +657,9 @@ struct Converter {
     /// structural-tag surface sets this from XGrammar's `any_order`; existing
     /// callers retain the historical any-order behavior.
     any_order: bool,
+    /// XGrammar structural tags deliberately relax required-key presence and
+    /// uniqueness when `any_order=true`; ordinary hf2q schemas never set it.
+    relaxed_any_order: bool,
 }
 
 impl Converter {
@@ -1188,6 +1216,31 @@ impl Converter {
                     additional_value_rule.as_deref().unwrap_or("value")
                 )
             });
+        }
+
+        if self.relaxed_any_order {
+            let mut item_rules = declared_keys
+                .iter()
+                .map(|key| kv_rule_name[key].clone())
+                .collect::<Vec<_>>();
+            if !additional_closed {
+                item_rules.push(format!("{slug}-extra-kv"));
+            }
+            if item_rules.is_empty() {
+                return if min_properties == 0 {
+                    Ok(r#""{" space "}" space"#.into())
+                } else {
+                    Ok(self.uninhabited_rule(path))
+                };
+            }
+            let effective_min = min_properties.max(required_keys.len() as u64);
+            if max_properties.is_some_and(|maximum| maximum < effective_min) {
+                return Ok(self.uninhabited_rule(path));
+            }
+            let item_name = format!("{slug}-relaxed-item");
+            self.rules.insert(item_name.clone(), item_rules.join(" | "));
+            let inner = repeated_sequence(&item_name, effective_min, max_properties);
+            return Ok(format!(r#""{{" space {} "}}" space"#, inner));
         }
 
         if !self.any_order {

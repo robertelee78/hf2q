@@ -48,6 +48,12 @@ this ADR are to be interpreted as described by
   2026-09-03: vLLM
   `443febe723f62381cda46a9d4f989b8e74a8a857` and XGrammar
   `71ab2256cf06be93e97c22fb5c0b2c6e09893be3`.
+- Qwen3-VL native tool-call rendering is bound to the official
+  `Qwen/Qwen3-VL-2B-Instruct` template at
+  `89644892e4d85e24eaac8bacfd4f463576704203`: one JSON object containing
+  `name` and object-valued `arguments`, surrounded by `<tool_call>` and
+  `</tool_call>`. It MUST NOT be routed through Qwen 3.5/3.6's distinct
+  `<function=...><parameter=...>` body.
 
 The absent peer object was researched rather than silently substituted:
 `git fetch origin e15384a5cb092b080c2a01c0b9e3f8635079d6df`
@@ -104,6 +110,10 @@ those measurements; public wire input remains capped independently.
 - `text`;
 - `json_object`;
 - `json_schema`.
+
+For llama.cpp compatibility, `json_object` MAY carry its optional top-level
+`schema` member. When present, hf2q MUST compile and enforce that schema; it
+MUST NOT silently widen it to the generic JSON-object grammar.
 
 It MUST also accept the current compatibility surfaces:
 
@@ -197,6 +207,23 @@ XGrammar EBNF extensions and Lark input MUST be implemented only when their
 syntax and semantics are proven by immutable upstream fixtures. The common
 GBNF subset MUST NOT be described as full XGrammar or Lark compatibility.
 
+The vLLM structural-tag surface MUST accept the pinned XGrammar format-node
+vocabulary (`const_string`, `json_schema`, `grammar`, `regex`, `any_text`,
+token formats, combinators, tags, and string/token dispatch). Its
+`json_schema.any_order=true` mode MUST preserve XGrammar's deliberately
+relaxed semantics at every object depth: declared-key/value validity and
+entry counts remain enforced, but duplicate keys are permitted and required
+key identity is not tracked. Ordinary hf2q response schemas MUST retain their
+stricter unordered semantics.
+
+XGrammar's non-JSON `JSONSchemaFormat.style` values and deprecated
+`qwen_xml_parameter` node are model-specific argument serializers, not
+standard grammar languages. They are outside this compatibility baseline and
+MUST return a typed request error. hf2q's supported Qwen and DeepSeek4 native
+tool calls instead MUST use the source-bound family emitters above; adding a
+future MiniMax, GLM, Cohere, Kimi, or different DeepSeek wire requires its own
+model-family contract and fixtures.
+
 ### 5. Runtime activation and termination
 
 Output constraints MUST be request- and slot-local.
@@ -215,6 +242,12 @@ unaccepted constrained output into normal success. Empty or undecodable
 non-terminal token pieces MUST NOT bypass the grammar. An all-invalid candidate
 set MUST produce a generation error; it MUST NOT sample from all negative
 infinity logits.
+
+Until stop matching can validate a stripped suffix identically in every unary
+and SSE family path, a non-empty `stop` value combined with an effective output
+constraint MUST be rejected before generation. An empty stop array is inert
+and MAY be accepted. This is an explicit fail-closed request limitation, not a
+runtime grammar fallback.
 
 Unary, SSE, speculative verification, cache replay, and multi-slot execution
 MUST implement identical grammar-state transitions.
@@ -329,3 +362,9 @@ Some schemas accepted historically because hf2q ignored their assertions will
 now return HTTP 400. That compatibility break is intentional: rejecting an
 unsupported constraint is safer than claiming success while generating output
 that violates it.
+
+The supported grammar-language baseline is therefore llama.cpp-compatible
+GBNF plus vLLM choice, regex, JSON Schema, grammar, and structural-tag modes.
+It is not a claim that every model-specific serializer or every validation-only
+Draft 2020-12 vocabulary can be represented as a context-free generation
+grammar. Unsupported assertions and serializers remain typed errors.

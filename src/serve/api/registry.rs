@@ -183,12 +183,15 @@ impl ModelRegistration {
                 .map_err(|error| error.to_string())?;
         let mut grammars = Vec::with_capacity(variants.len());
         for variant in variants {
-            validate_native_tool_schema_compat(&variant, "")?;
+            if self.family != "qwen3vl" {
+                validate_native_tool_schema_compat(&variant, "")?;
+            }
             let grammar = match self.family {
                 "gemma4" => gemma4_tool_call_gbnf(fn_name, &variant, shape)
                     .map_err(|error| error.to_string())?,
                 "qwen35" => qwen35_tool_call_gbnf(fn_name, &variant, shape)
                     .map_err(|error| error.to_string())?,
+                "qwen3vl" => qwen3vl_tool_call_gbnf(fn_name, &variant, shape)?,
                 "deepseek4" => deepseek4_tool_call_gbnf(fn_name, &variant, shape)
                     .map_err(|error| error.to_string())?,
                 other => {
@@ -220,6 +223,7 @@ impl ModelRegistration {
         match self.family {
             "gemma4" => "",
             "qwen35" => "\n",
+            "qwen3vl" => "\n",
             "deepseek4" => "\n",
             _ => "",
         }
@@ -254,6 +258,7 @@ impl ModelRegistration {
         match self.family {
             "gemma4" => "<|tool_call>",
             "qwen35" => "\n<tool_call>\n",
+            "qwen3vl" => "\n<tool_call>\n",
             // DeepSeek puts multiple invokes inside one outer block. The
             // dedicated emitter carries that repetition; multi-function
             // combination uses a newline between body alternatives.
@@ -433,6 +438,20 @@ pub const QWEN35: ModelRegistration = ModelRegistration {
     tool_preamble: None,
 };
 
+/// Qwen3-VL uses the official Hermes-style JSON tool body rather than the
+/// `<function=...>` body used by hf2q's Qwen 3.5/3.6 family. The outer marker
+/// pair is shared, but keeping a distinct registration prevents silent wire
+/// approximation between the model families.
+pub const QWEN3VL: ModelRegistration = ModelRegistration {
+    family: "qwen3vl",
+    id_substrings: &["qwen3-vl", "qwen3_vl", "qwen3vl"],
+    reasoning_open: None,
+    reasoning_close: None,
+    tool_open: Some("<tool_call>"),
+    tool_close: Some("</tool_call>"),
+    tool_preamble: None,
+};
+
 /// DeepSeek-V4-Flash-0731. Tool calls use one outer DSML block containing
 /// one or more invoke elements; the body parser therefore returns a vector
 /// rather than assuming one marker pair equals one function call.
@@ -449,7 +468,7 @@ pub const DEEPSEEK4: ModelRegistration = ModelRegistration {
 /// All built-in registrations in priority order. Later entries override
 /// earlier ones when substrings overlap — but day-one substrings are
 /// disjoint.
-pub const BUILTIN_REGISTRATIONS: &[ModelRegistration] = &[GEMMA4, QWEN35, DEEPSEEK4];
+pub const BUILTIN_REGISTRATIONS: &[ModelRegistration] = &[GEMMA4, QWEN3VL, QWEN35, DEEPSEEK4];
 
 // ---------------------------------------------------------------------------
 // Registry (process-global)
@@ -1317,6 +1336,7 @@ pub fn parse_tool_call_bodies_with_wire_kinds(
     match reg.family {
         "gemma4" => parse_gemma4_tool_call(body).map(|call| vec![call]),
         "qwen35" => parse_qwen35_tool_call_with_wire_kinds(body, wire_kinds).map(|call| vec![call]),
+        "qwen3vl" => parse_qwen3vl_tool_call(body).map(|call| vec![call]),
         "deepseek4" => crate::core::deepseek_v4_encoding::parse_tool_calls_body(body)
             .ok()
             .map(|calls| {
@@ -1330,6 +1350,34 @@ pub fn parse_tool_call_bodies_with_wire_kinds(
             }),
         _ => None,
     }
+}
+
+fn parse_qwen3vl_tool_call(body: &str) -> Option<ParsedToolCall> {
+    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 2 {
+        return None;
+    }
+    let name = object.get("name")?.as_str()?;
+    if !is_valid_tool_name(name) {
+        return None;
+    }
+    let arguments = object.get("arguments")?;
+    let arguments = match arguments {
+        serde_json::Value::Object(_) => arguments.clone(),
+        serde_json::Value::String(source) => {
+            let parsed: serde_json::Value = serde_json::from_str(source).ok()?;
+            if !parsed.is_object() {
+                return None;
+            }
+            parsed
+        }
+        _ => return None,
+    };
+    Some(ParsedToolCall {
+        name: name.to_string(),
+        arguments_json: serde_json::to_string(&arguments).ok()?,
+    })
 }
 
 /// Parse Gemma 4's `call:NAME{kv-list}` body. Whitespace-tolerant.
@@ -2811,6 +2859,61 @@ fn build_gemma4_required_permutation(
         }
     }
     rule_name
+}
+
+/// Emit the Qwen3-VL chat-template wire: JSON `{name, arguments}` inside
+/// `<tool_call>` markers. The JSON body uses the shared schema compiler so
+/// response and native-tool assertions cannot drift.
+fn qwen3vl_tool_call_gbnf(
+    fn_name: &str,
+    params_schema: &serde_json::Value,
+    shape: GrammarShape,
+) -> Result<String, String> {
+    use crate::serve::api::grammar::{json_schema, parser, rename_rules, serialize};
+
+    let wrapper = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": {"const": fn_name},
+            "arguments": params_schema
+        },
+        "required": ["name", "arguments"],
+        "additionalProperties": false
+    });
+    let source = json_schema::schema_to_gbnf(&wrapper).map_err(|error| error.to_string())?;
+    let parsed = parser::parse_generated(&source)
+        .map_err(|error| format!("Qwen3-VL tool body failed to parse: {error}"))?;
+    let body = rename_rules(&parsed, |name| format!("qwen3vl-{name}"));
+    let open = gbnf_literal("<tool_call>");
+    let close = gbnf_literal("</tool_call>");
+    let newline = gbnf_literal("\n");
+    let body_rule = "qwen3vl-root";
+    let call_rule = "qwen3vl-call";
+    let mut extra = String::new();
+    let root = match shape {
+        GrammarShape::SingleBody => body_rule.to_string(),
+        GrammarShape::OneOrMoreCalls { parallel } => {
+            extra.push_str(&format!(
+                "{call_rule} ::= {open} {newline} {body_rule} {newline} {close}\n"
+            ));
+            if parallel {
+                format!("[ \\t\\r\\n]* {call_rule} ( {newline} {call_rule} )*")
+            } else {
+                format!("[ \\t\\r\\n]* {call_rule}")
+            }
+        }
+        GrammarShape::OneOrMoreCallsBodyOnly { parallel } => {
+            if parallel {
+                extra.push_str(&format!(
+                    "{call_rule} ::= {open} {newline} {body_rule} {newline} {close}\n"
+                ));
+                format!("{newline} {body_rule} {newline} {close} ( {newline} {call_rule} )*")
+            } else {
+                format!("{newline} {body_rule} {newline} {close}")
+            }
+        }
+    };
+    Ok(format!("root ::= {root}\n{extra}{}", serialize(&body)))
 }
 
 /// Emit a GBNF grammar string constraining output to Qwen 3.5/3.6's
@@ -4463,6 +4566,14 @@ mod tests {
     }
 
     #[test]
+    fn qwen3vl_matches_only_its_native_wire_family() {
+        assert!(QWEN3VL.matches("Qwen/Qwen3-VL-2B-Instruct"));
+        assert!(QWEN3VL.matches("qwen3vl-8b"));
+        assert_eq!(find_for("Qwen/Qwen3-VL-2B-Instruct").unwrap(), QWEN3VL);
+        assert!(!QWEN35.matches("Qwen/Qwen3-VL-2B-Instruct"));
+    }
+
+    #[test]
     fn non_matching_model_id_returns_none() {
         assert!(find_for("llama-3.2-1b").is_none());
         assert!(find_for("unknown-model").is_none());
@@ -4763,6 +4874,7 @@ mod tests {
         let fams = list_families();
         assert!(fams.iter().any(|f| f == "gemma4"));
         assert!(fams.iter().any(|f| f == "qwen35"));
+        assert!(fams.iter().any(|f| f == "qwen3vl"));
     }
 
     // --- ToolCallSplitter (iter-133 Iter B-2) ---
@@ -5141,6 +5253,53 @@ mod tests {
         assert!(parse_tool_call_body(&QWEN35, "<function=>").is_none());
     }
 
+    #[test]
+    fn qwen3vl_json_tool_body_round_trips_and_rejects_drift() {
+        let parsed = parse_tool_call_body(
+            &QWEN3VL,
+            r#"{"name":"lookup","arguments":{"query":"grammar"}}"#,
+        )
+        .expect("parse Qwen3-VL tool body");
+        assert_eq!(parsed.name, "lookup");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.arguments_json).unwrap(),
+            serde_json::json!({"query":"grammar"})
+        );
+        assert!(
+            parse_tool_call_body(&QWEN3VL, r#"{"name":"lookup","arguments":[],"extra":true}"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn qwen3vl_native_tool_grammar_enforces_arguments_and_markers() {
+        let schema = serde_json::json!({
+            "type":"object",
+            "properties":{"query":{"type":"string","minLength":1}},
+            "required":["query"],
+            "additionalProperties":false
+        });
+        let source = QWEN3VL
+            .tool_call_gbnf(
+                "lookup",
+                &schema,
+                GrammarShape::OneOrMoreCalls { parallel: false },
+            )
+            .expect("Qwen3-VL grammar");
+        let mut valid = grammar_runtime_for_gbnf(&source);
+        assert!(valid.accept_bytes(
+            b"<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"query\":\"grammar\"}}\n</tool_call>"
+        ));
+        assert!(valid.is_accepted());
+
+        let mut invalid = grammar_runtime_for_gbnf(&source);
+        assert!(
+            !invalid.accept_bytes(
+                b"<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"query\":\"\"}}\n</tool_call>"
+            ) || !invalid.is_accepted()
+        );
+    }
+
     // Merge adjacent same-slot runs — useful for asserting against streaming
     // output where the splitter might emit a Content run as two pieces split
     // on the tail-buffer boundary.
@@ -5272,6 +5431,11 @@ mod tests {
                 output.push_str("</function>");
                 output
             }
+            "qwen3vl" => serde_json::to_string(&serde_json::json!({
+                "name": fn_name,
+                "arguments": payload
+            }))
+            .expect("serialize Qwen3-VL fixture"),
             "deepseek4" => {
                 let mut output = format!("<｜DSML｜invoke name=\"{fn_name}\">\n");
                 for (key, value) in object {
@@ -5300,7 +5464,7 @@ mod tests {
         rejected_json: &[&str],
     ) {
         let schema: serde_json::Value = serde_json::from_str(schema_json).expect("schema fixture");
-        for registration in [&GEMMA4, &QWEN35, &DEEPSEEK4] {
+        for registration in [&GEMMA4, &QWEN35, &QWEN3VL, &DEEPSEEK4] {
             let grammar = registration
                 .tool_call_gbnf(fn_name, &schema, GrammarShape::SingleBody)
                 .unwrap_or_else(|error| panic!("{} schema compile: {error}", registration.family));

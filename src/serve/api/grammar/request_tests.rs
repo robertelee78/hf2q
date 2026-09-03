@@ -253,6 +253,45 @@ fn response_format_replaces_same_structured_slot_and_keeps_backend_options() {
 }
 
 #[test]
+fn llama_json_object_schema_is_enforced_instead_of_widened() {
+    let request = request_with(serde_json::json!({
+        "response_format": {
+            "type":"json_object",
+            "schema": {
+                "type":"object",
+                "properties":{"verdict":{"const":"allow"}},
+                "required":["verdict"],
+                "additionalProperties":false
+            }
+        }
+    }));
+    let grammar = compile_request_constraint(&request)
+        .unwrap()
+        .expect("llama json_object schema grammar");
+    assert!(accepts(&grammar, br#"{"verdict":"allow"}"#));
+    assert!(!accepts(&grammar, br#"{"verdict":"deny"}"#));
+    assert!(!accepts(&grammar, br#"{"verdict":"allow","extra":true}"#));
+}
+
+#[test]
+fn stop_strings_fail_closed_when_a_constraint_is_active() {
+    let request = request_with(serde_json::json!({
+        "stop":"}",
+        "response_format":{"type":"json_object"}
+    }));
+    let grammar = compile_request_constraint(&request).unwrap();
+    let error = validate_stop_with_constraint(&request, grammar.is_some()).unwrap_err();
+    assert_eq!(error.param, "stop");
+    assert!(error.message.contains("could invalidate"));
+
+    let empty = request_with(serde_json::json!({
+        "stop":[],
+        "response_format":{"type":"json_object"}
+    }));
+    assert!(validate_stop_with_constraint(&empty, true).is_ok());
+}
+
+#[test]
 fn response_format_conflicts_with_a_different_structured_slot() {
     let request = request_with(serde_json::json!({
         "structured_outputs": {"regex":"[a-z]+"},

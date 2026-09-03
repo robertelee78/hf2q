@@ -621,6 +621,27 @@ progress without duplicating model weights. Embeddings and multimodal messages
 remain unsupported for DeepSeek and fail explicitly rather than selecting
 another family or runtime.
 
+Structured output is normalized once and enforced by the same request-local
+grammar runtime for Gemma, Qwen 3.5/3.6, Qwen3-VL text generation, and
+DeepSeek4. The chat endpoint accepts OpenAI `response_format` (`text`,
+`json_object`, and `json_schema`), llama.cpp `grammar`/`json_schema` and lazy
+grammar triggers, and vLLM `structured_outputs` choice, regex, JSON,
+`json_object`, grammar, and structural-tag modes. llama.cpp's optional
+`response_format: {"type":"json_object","schema":...}` form is also
+enforced. Conflicting constraints, unknown or unsupported schema assertions,
+and constraints that exceed their documented resource limits return HTTP 400;
+they never fall back to unconstrained decoding. A non-empty `stop` value is
+currently rejected when an output constraint is active because stripping the
+stop suffix could invalidate otherwise accepted output.
+
+The structural-tag implementation covers the pinned XGrammar format-node
+vocabulary, including tokenizer-bound token terminals and the exact relaxed
+semantics of `json_schema.any_order=true`. XGrammar's non-JSON XML styles are
+model-specific serializers rather than standard grammar languages and remain
+typed errors; OpenAI tools for supported hf2q families use their native,
+source-bound tool-call emitters instead. Embedding-only models do not decode
+text and therefore have no grammar runtime.
+
 DeepSeek production prefill now uses the exact gathered-attention path for
 every nonempty prompt and retained-prefix suffix. The older dense kernel is a
 diagnostic oracle only: it produced a different, incoherent first-token

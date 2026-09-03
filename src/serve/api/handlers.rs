@@ -1890,6 +1890,11 @@ where
     let tool_grammar_kind = tool_grammar_kind_for(&tool_choice);
     let (effective_grammar, effective_grammar_kind) =
         select_effective_grammar(tool_grammar, tool_grammar_kind, response_grammar);
+    if let Err(error) =
+        grammar::request::validate_stop_with_constraint(req, effective_grammar.is_some())
+    {
+        return Err(ApiError::invalid_request(error.message, Some(error.param)).into_response());
+    }
     // A stock OpenAI-compatible client cannot be expected to know an hf2q
     // extension. An explicit request override still wins; when it is absent,
     // derive the native default from the loaded chat template using the same
@@ -7332,7 +7337,7 @@ mod grammar_kind_selection_tests {
         // Two distinct real grammars so we can confirm precedence by
         // identity (the chosen output IS the tool grammar, not the
         // response-format grammar).
-        let rf_resp = ResponseFormat::JsonObject;
+        let rf_resp = ResponseFormat::JsonObject { schema: None };
         let resp_grammar = super::compile_response_format(&rf_resp).expect("compile json_object");
         assert!(resp_grammar.is_some());
 

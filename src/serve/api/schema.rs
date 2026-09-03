@@ -794,7 +794,7 @@ pub enum StructuredOutputJson {
 /// A JSON Schema accepted by llama.cpp's top-level `json_schema` surface.
 /// Draft 2020-12 permits both object schemas and the boolean `true`/`false`
 /// schemas. Other JSON types are not schemas and fail during deserialization.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum JsonSchemaValue {
     Boolean(bool),
@@ -994,7 +994,10 @@ pub enum ResponseFormat {
     #[serde(rename = "text")]
     Text,
     #[serde(rename = "json_object")]
-    JsonObject,
+    JsonObject {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<JsonSchemaValue>,
+    },
     #[serde(rename = "json_schema")]
     JsonSchema { json_schema: JsonSchemaSpec },
     /// vLLM structural-tag formats are validated by the structured-output
@@ -1028,12 +1031,17 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                 Ok(Self::Text)
             }
             "json_object" => {
+                let schema = object
+                    .remove("schema")
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(D::Error::custom)?;
                 if !object.is_empty() {
                     return Err(D::Error::custom(
-                        "response_format type=json_object does not accept additional fields",
+                        "response_format type=json_object accepts only an optional schema field",
                     ));
                 }
-                Ok(Self::JsonObject)
+                Ok(Self::JsonObject { schema })
             }
             "json_schema" => {
                 let json_schema = object.remove("json_schema").ok_or_else(|| {
@@ -1975,7 +1983,7 @@ mod tests {
         assert_eq!(req.temperature, Some(0.7));
         assert!(matches!(
             req.response_format,
-            Some(ResponseFormat::JsonObject)
+            Some(ResponseFormat::JsonObject { schema: None })
         ));
         assert_eq!(req.top_p, Some(0.9));
         assert_eq!(req.seed, Some(42));

@@ -206,17 +206,6 @@ impl<'a> Lowerer<'a> {
             }
         }
         let any_order = optional_bool(map, "any_order", false, "json_schema")?;
-        if any_order {
-            // XGrammar deliberately relaxes both the required-property and
-            // duplicate-property checks in this mode.  The shared historical
-            // any-order JSON Schema lowering retains those checks, so using it
-            // here would accept a different language.  Keep the boundary
-            // fail-closed until that distinct compiler mode is introduced.
-            return Err(StructuralTagError::Unsupported(
-                "json_schema.any_order=true requires XGrammar's relaxed required/duplicate-property semantics"
-                    .into(),
-            ));
-        }
         let whitespace = match map.get("max_whitespace_cnt") {
             None | Some(Value::Null) => None,
             Some(value) => {
@@ -235,10 +224,14 @@ impl<'a> Lowerer<'a> {
                 "json_schema.json_schema must be an object or boolean".into(),
             ));
         }
-        let source = json_schema::schema_to_gbnf_with_options(schema, whitespace.as_deref(), false)
-            .map_err(|error| {
-                StructuralTagError::Invalid(format!("invalid structural-tag JSON Schema: {error}"))
-            })?;
+        let source = json_schema::schema_to_gbnf_for_structural_tag(
+            schema,
+            whitespace.as_deref(),
+            any_order,
+        )
+        .map_err(|error| {
+            StructuralTagError::Invalid(format!("invalid structural-tag JSON Schema: {error}"))
+        })?;
         self.embed(&source, "structural-tag JSON Schema")
     }
 
@@ -1496,12 +1489,46 @@ mod tests {
 
         let unordered = json!({
             "type":"structural_tag",
-            "format":{"type":"json_schema","json_schema": {"type":"object"}, "any_order": true}
+            "format":{"type":"json_schema","json_schema": schema, "any_order": true}
         });
-        assert!(matches!(
-            lower_to_gbnf(&unordered),
-            Err(StructuralTagError::Unsupported(_))
-        ));
+        let grammar = compile(&unordered).unwrap();
+        assert!(accepts(grammar.clone(), r#"{"first":"ok","second":1}"#));
+        assert!(
+            accepts(grammar.clone(), r#"{"second":1,"second":2}"#),
+            "XGrammar any_order deliberately permits duplicates and does not track required-key identity"
+        );
+        assert!(!accepts(grammar.clone(), r#"{"second":1}"#));
+        assert!(!accepts(grammar, r#"{"unknown":1,"second":2}"#));
+    }
+
+    #[test]
+    fn json_schema_any_order_relaxation_applies_to_nested_objects_and_entry_counts() {
+        let value = json!({
+            "type":"structural_tag",
+            "format":{
+                "type":"json_schema",
+                "any_order":true,
+                "json_schema":{
+                    "type":"object",
+                    "properties":{
+                        "cfg":{
+                            "type":"object",
+                            "properties":{"a":{"type":"integer"},"b":{"type":"integer"}},
+                            "required":["a","b"],
+                            "minProperties":3,
+                            "maxProperties":3,
+                            "additionalProperties":false
+                        }
+                    },
+                    "required":["cfg"],
+                    "additionalProperties":false
+                }
+            }
+        });
+        let grammar = compile(&value).unwrap();
+        assert!(accepts(grammar.clone(), r#"{"cfg":{"a":1,"a":2,"b":3}}"#));
+        assert!(!accepts(grammar.clone(), r#"{"cfg":{"a":1,"b":2}}"#));
+        assert!(!accepts(grammar, r#"{"cfg":{"a":1,"a":2,"b":3,"b":4}}"#));
     }
 
     #[test]
