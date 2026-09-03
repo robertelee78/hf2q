@@ -632,6 +632,32 @@ pub(super) fn accept_grammar_token(
     Ok(())
 }
 
+/// Refuse to report a successful completion while an active output
+/// constraint is dead or incomplete. An AUTO tool grammar is the sole
+/// optional case: if its trigger never appeared, ordinary assistant text is
+/// a valid outcome. Once triggered, AUTO is as strict as every other grammar.
+pub(super) fn validate_grammar_terminal(
+    runtime: Option<&super::grammar::GrammarRuntime>,
+    kind: GrammarKind,
+    cause: &str,
+) -> Result<()> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    if kind == GrammarKind::ToolCallBodyAuto && runtime.is_awaiting_trigger() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !runtime.is_dead(),
+        "grammar constraint became unsatisfiable before {cause}"
+    );
+    anyhow::ensure!(
+        runtime.is_terminally_accepted(),
+        "grammar constraint was incomplete at {cause}"
+    );
+    Ok(())
+}
+
 /// Owned soft-token override sent through the worker channel.
 ///
 /// Identical contract to [`SoftTokenInjection`] but owns the
@@ -6958,6 +6984,7 @@ struct Gemma4DecodeState {
     /// greedy fast-path (reuse the forward's on-GPU argmax).
     sampler_params: Option<sampler_pure::SamplingParams>,
     grammar_runtime: Option<super::grammar::GrammarRuntime>,
+    grammar_kind: GrammarKind,
     /// Shared handle to `params.token_bytes` (the serial ref borrows via
     /// `as_deref()`; the hoist holds the cheap `Arc` clone for the slot's
     /// lifetime). `None` ⇒ no grammar byte-masking.
@@ -7518,6 +7545,7 @@ impl Gemma4DecodeState {
             max_decode_tokens,
             sampler_params,
             grammar_runtime,
+            grammar_kind: params.grammar_kind,
             token_bytes,
             tc_splitter,
             reasoning_splitter,
@@ -7790,7 +7818,15 @@ impl Gemma4DecodeState {
 
     /// Assemble the `GenerationResult` at end-of-decode — mirror of serial
     /// ref engine.rs:9277-9299.
-    fn finish(self, registration: Option<&super::registry::ModelRegistration>) -> GenerationResult {
+    fn finish(
+        self,
+        registration: Option<&super::registry::ModelRegistration>,
+    ) -> Result<GenerationResult> {
+        validate_grammar_terminal(
+            self.grammar_runtime.as_ref(),
+            self.grammar_kind,
+            self.finish_reason,
+        )?;
         let (content, reasoning_text) = match registration {
             Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(
                 reg,
@@ -7800,7 +7836,7 @@ impl Gemma4DecodeState {
             _ => (self.decoded_text, None),
         };
         let decode_duration = self.decode_started.elapsed();
-        GenerationResult {
+        Ok(GenerationResult {
             text: content,
             reasoning_text,
             prompt_tokens: self.prompt_len,
@@ -7815,7 +7851,7 @@ impl Gemma4DecodeState {
             decode_duration,
             cached_tokens: self.cached_tokens,
             logprobs: self.logprobs_acc,
-        }
+        })
     }
 }
 
@@ -13395,7 +13431,7 @@ fn admit_gemma4_slot(
         };
         scheduler.release(handle);
         finish_gemma4_operator_request(handle, "cancelled");
-        let gr = Ok(state.finish(registration));
+        let gr = state.finish(registration);
         slot_fire_done(reply, gr, true);
         return None;
     }
@@ -13411,7 +13447,7 @@ fn admit_gemma4_slot(
         scheduler.advance_after_decode(handle);
         scheduler.release(handle);
         finish_gemma4_operator_request(handle, "complete");
-        let gr = Ok(state.finish(registration));
+        let gr = state.finish(registration);
         slot_fire_done(reply, gr, false);
         return None;
     }
@@ -13556,7 +13592,7 @@ fn install_gemma4_prefill_advance(
                 };
                 scheduler.release(handle);
                 finish_gemma4_operator_request(handle, "cancelled");
-                let result = Ok(state.finish(registration));
+                let result = state.finish(registration);
                 slot_fire_done(reply, result, true);
             } else if state.finished_at_seed() {
                 retained_tokens[slot_idx] = state.retained_prefix();
@@ -13569,7 +13605,7 @@ fn install_gemma4_prefill_advance(
                 scheduler.advance_after_decode(handle);
                 scheduler.release(handle);
                 finish_gemma4_operator_request(handle, "complete");
-                slot_fire_done(reply, Ok(state.finish(registration)), false);
+                slot_fire_done(reply, state.finish(registration), false);
             } else {
                 slots[slot_idx] = Some((Gemma4SlotWork::Decode(state), reply, handle));
             }
@@ -14532,7 +14568,7 @@ fn admit_gemma4_slots_batched(
             retained_tokens[handle.slot_id.0 as usize].clear();
             scheduler.release(handle);
             finish_gemma4_operator_request(handle, "cancelled");
-            let gr = Ok(state.finish(registration));
+            let gr = state.finish(registration);
             slot_fire_done(reply, gr, true);
             continue;
         }
@@ -14547,7 +14583,7 @@ fn admit_gemma4_slots_batched(
             scheduler.advance_after_decode(handle);
             scheduler.release(handle);
             finish_gemma4_operator_request(handle, "complete");
-            let gr = Ok(state.finish(registration));
+            let gr = state.finish(registration);
             slot_fire_done(reply, gr, false);
             continue;
         }
@@ -15144,7 +15180,7 @@ fn admit_gemma4_slots_stable_batched(
             };
             scheduler.release(handle);
             finish_gemma4_operator_request(handle, "cancelled");
-            slot_fire_done(reply, Ok(state.finish(registration)), true);
+            slot_fire_done(reply, state.finish(registration), true);
         } else if state.finished_at_seed() {
             retained_tokens[handle.slot_id.0 as usize] = state.retained_prefix();
             record_retained_slot_kv(
@@ -15156,7 +15192,7 @@ fn admit_gemma4_slots_stable_batched(
             scheduler.advance_after_decode(handle);
             scheduler.release(handle);
             finish_gemma4_operator_request(handle, "complete");
-            slot_fire_done(reply, Ok(state.finish(registration)), false);
+            slot_fire_done(reply, state.finish(registration), false);
         } else {
             slots[handle.slot_id.0 as usize] = Some((Gemma4SlotWork::Decode(state), reply, handle));
         }
@@ -15505,7 +15541,7 @@ fn decode_batch_gemma4(
                     }
                 };
                 scheduler.release(handle);
-                slot_fire_done(reply, Ok(state.finish(registration)), true);
+                slot_fire_done(reply, state.finish(registration), true);
                 continue;
             }
             positions.push(state.prompt_len + state.generated_tokens.len() - 1);
@@ -15715,7 +15751,7 @@ fn decode_batch_gemma4(
                     }
                 };
                 scheduler.release(handle);
-                slot_fire_done(reply, Ok(state.finish(registration)), true);
+                slot_fire_done(reply, state.finish(registration), true);
                 continue;
             }
             match supervised_gemma4_gpu_call(supervisor, "gemma4_decode_body", || {
@@ -16001,7 +16037,7 @@ fn decode_batch_gemma4(
                     "complete"
                 },
             );
-            let gr = Ok(state.finish(registration));
+            let gr = state.finish(registration);
             slot_fire_done(reply, gr, client_dropped);
         } else {
             // Still generating: re-seat the slot for the next tick.
@@ -19253,7 +19289,7 @@ fn finish_qwen35_prefill(
         };
         scheduler.release(handle);
         finish_qwen35_operator_request(handle, "cancelled");
-        let result = Ok(state.finish(guard.model, registration));
+        let result = state.finish(guard.model, registration);
         slot_fire_done(reply, result, true);
         return None;
     }
@@ -19293,7 +19329,7 @@ fn finish_qwen35_prefill(
         scheduler.advance_after_decode(handle);
         scheduler.release(handle);
         finish_qwen35_operator_request(handle, "complete");
-        let result = Ok(state.finish(guard.model, registration));
+        let result = state.finish(guard.model, registration);
         if let Ok(generation) = result.as_ref() {
             log_qwen35_slot_decode_complete(generation, &reply, false);
             prompt_caches[slot_idx].store(&prompt_tokens, &params, generation);
@@ -19622,7 +19658,7 @@ fn decode_batch_qwen35(
                 let (prompt, params) = state.prompt_cache_identity();
                 (prompt.to_vec(), params.clone())
             };
-            let gr = Ok(state.finish(guard.model, registration));
+            let gr = state.finish(guard.model, registration);
             if let Ok(result) = gr.as_ref() {
                 log_qwen35_slot_decode_complete(result, &reply, client_dropped);
                 if !client_dropped {
@@ -23872,6 +23908,8 @@ fn generate_once_with_soft_tokens(
         }
     }
     let decode_duration = decode_start.elapsed();
+
+    validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)?;
 
     // When finish_reason == "stop" but the EOS was seen, make sure the EOS
     // token text isn't present in the returned content.
@@ -29100,6 +29138,13 @@ fn generate_stream_once(
         finish_reason = "tool_calls";
     }
 
+    if let Err(error) =
+        validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)
+    {
+        send!(GenerationEvent::Error(error.to_string()));
+        return Ok(SerialStreamEnd::TerminalSent);
+    }
+
     let decode_duration = decode_start.elapsed();
 
     let stats = StreamStats {
@@ -29871,6 +29916,59 @@ mod tests {
         let error = accept_grammar_token(&mut empty_non_eog, Some(&table), &[], 1)
             .expect_err("empty non-EOG piece must abort constrained generation");
         assert!(error.to_string().contains("empty or undecodable"));
+    }
+
+    #[test]
+    fn grammar_terminal_validation_is_fail_closed_except_untriggered_auto() {
+        let grammar =
+            crate::serve::api::grammar::parse("root ::= \"ab\"\n").expect("literal grammar");
+        let root = grammar.rule_id("root").expect("root rule");
+
+        let mut incomplete = crate::serve::api::grammar::GrammarRuntime::new(grammar.clone(), root)
+            .expect("runtime");
+        assert!(incomplete.accept_bytes(b"a"));
+        assert!(validate_grammar_terminal(
+            Some(&incomplete),
+            GrammarKind::ResponseFormat,
+            "length"
+        )
+        .is_err());
+
+        let mut accepted = crate::serve::api::grammar::GrammarRuntime::new(grammar.clone(), root)
+            .expect("runtime");
+        assert!(accepted.accept_bytes(b"ab"));
+        validate_grammar_terminal(Some(&accepted), GrammarKind::ResponseFormat, "stop")
+            .expect("complete constrained output");
+
+        let mut dead = crate::serve::api::grammar::GrammarRuntime::new(grammar.clone(), root)
+            .expect("runtime");
+        assert!(!dead.accept_bytes(b"x"));
+        assert!(
+            validate_grammar_terminal(Some(&dead), GrammarKind::ResponseFormat, "stop")
+                .expect_err("dead grammar must not complete successfully")
+                .to_string()
+                .contains("unsatisfiable")
+        );
+
+        let mut optional = crate::serve::api::grammar::GrammarRuntime::new(grammar.clone(), root)
+            .expect("runtime");
+        optional.set_awaiting_trigger(true);
+        validate_grammar_terminal(Some(&optional), GrammarKind::ToolCallBodyAuto, "stop")
+            .expect("an untriggered automatic tool call is optional");
+        assert!(validate_grammar_terminal(
+            Some(&optional),
+            GrammarKind::ToolCallBodyRequired,
+            "stop"
+        )
+        .is_err());
+
+        let mut partial =
+            crate::serve::api::grammar::GrammarRuntime::new(grammar, root).expect("runtime");
+        assert!(partial.accept_bytes(b"ab"));
+        assert!(partial.accept_bytes(&[0xc3]));
+        assert!(
+            validate_grammar_terminal(Some(&partial), GrammarKind::ResponseFormat, "stop").is_err()
+        );
     }
 
     #[test]

@@ -32,12 +32,12 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use tokenizers::Tokenizer;
 
 use crate::core::provenance::{self, Provenance};
-use crate::inference::models::qwen3vl_text::Qwen3VlTextModel;
 use crate::inference::models::qwen3vl_text::forward::forward_text_prefill_logits_last;
+use crate::inference::models::qwen3vl_text::Qwen3VlTextModel;
 use crate::serve::forward_prefill::{DeepstackInjection, SoftTokenInjection};
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, TokenizerSource,
@@ -45,8 +45,9 @@ use crate::serve::load_info::{
 use crate::serve::sampler_pure::SamplingParams as SamplerPureParams;
 
 use super::engine::{
-    GenerationResult, GrammarKind, LoadOptions, SamplingParams, accept_grammar_token,
-    effective_repetition_penalty, grammar_runtime_for_request, sample_logits_with_grammar,
+    accept_grammar_token, effective_repetition_penalty, grammar_runtime_for_request,
+    sample_logits_with_grammar, validate_grammar_terminal, GenerationResult, LoadOptions,
+    SamplingParams,
 };
 use super::registry::ModelRegistration;
 
@@ -577,23 +578,6 @@ fn sample_logits_qwen3vl(
     .map(|(token, _)| token)
 }
 
-fn validate_qwen3vl_grammar_completion(
-    runtime: Option<&super::grammar::GrammarRuntime>,
-    kind: GrammarKind,
-) -> Result<()> {
-    let Some(runtime) = runtime else {
-        return Ok(());
-    };
-    if kind == GrammarKind::ToolCallBodyAuto && runtime.is_awaiting_trigger() {
-        return Ok(());
-    }
-    anyhow::ensure!(
-        runtime.is_accepted(),
-        "grammar constraint was not complete when Qwen3-VL generation terminated"
-    );
-    Ok(())
-}
-
 /// Decode tokens to text via the loaded HF tokenizer. The
 /// `skip_special_tokens` flag is `false` to match the qwen35 path
 /// (special tokens like `<|im_end|>` ARE meaningful and should not be
@@ -724,7 +708,11 @@ pub fn generate_qwen3vl_text_once(
         .elapsed()
         .saturating_sub(prefill_duration);
 
-    validate_qwen3vl_grammar_completion(grammar_runtime.as_ref(), params.grammar_kind)?;
+    validate_grammar_terminal(
+        grammar_runtime.as_ref(),
+        params.grammar_kind,
+        "Qwen3-VL generation termination",
+    )?;
 
     let text = decode_to_text(&qwen.tokenizer, &decoded_tokens)?;
 
@@ -931,7 +919,11 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
         .elapsed()
         .saturating_sub(prefill_duration);
 
-    validate_qwen3vl_grammar_completion(grammar_runtime.as_ref(), params.grammar_kind)?;
+    validate_grammar_terminal(
+        grammar_runtime.as_ref(),
+        params.grammar_kind,
+        "Qwen3-VL multimodal generation termination",
+    )?;
 
     let text = decode_to_text(&qwen.tokenizer, &decoded_tokens)?;
 
@@ -951,6 +943,8 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
 
 #[cfg(test)]
 mod grammar_tests {
+    use crate::serve::api::engine::GrammarKind;
+
     use super::*;
 
     #[test]
@@ -977,7 +971,12 @@ mod grammar_tests {
         assert_eq!(token, 1);
         let mut runtime = Some(runtime);
         accept_grammar_token(&mut runtime, Some(&token_bytes), &[2], token).unwrap();
-        validate_qwen3vl_grammar_completion(runtime.as_ref(), GrammarKind::ResponseFormat).unwrap();
+        validate_grammar_terminal(
+            runtime.as_ref(),
+            GrammarKind::ResponseFormat,
+            "Qwen3-VL test",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -987,14 +986,20 @@ mod grammar_tests {
         let mut incomplete =
             crate::serve::api::grammar::GrammarRuntime::new(grammar.clone(), root).unwrap();
         assert!(incomplete.accept_token(1, b"a"));
-        assert!(
-            validate_qwen3vl_grammar_completion(Some(&incomplete), GrammarKind::ResponseFormat)
-                .is_err()
-        );
+        assert!(validate_grammar_terminal(
+            Some(&incomplete),
+            GrammarKind::ResponseFormat,
+            "Qwen3-VL test"
+        )
+        .is_err());
 
         let mut optional = crate::serve::api::grammar::GrammarRuntime::new(grammar, root).unwrap();
         optional.set_awaiting_trigger(true);
-        validate_qwen3vl_grammar_completion(Some(&optional), GrammarKind::ToolCallBodyAuto)
-            .unwrap();
+        validate_grammar_terminal(
+            Some(&optional),
+            GrammarKind::ToolCallBodyAuto,
+            "Qwen3-VL test",
+        )
+        .unwrap();
     }
 }

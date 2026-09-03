@@ -37,8 +37,9 @@ use crate::serve::multi_seq_kv::SlotId;
 
 use super::engine::{
     accept_grammar_token, effective_repetition_penalty, grammar_runtime_for_request,
-    sample_logits_with_grammar, supervised_gpu_call, DeepstackData, LoadOptions, SamplingParams,
-    SerialStreamEnd, SerialStreamResult, SoftTokenData, ToolCallPolicy,
+    sample_logits_with_grammar, supervised_gpu_call, validate_grammar_terminal, DeepstackData,
+    LoadOptions, SamplingParams, SerialStreamEnd, SerialStreamResult, SoftTokenData,
+    ToolCallPolicy,
 };
 use super::engine_supervisor::EngineSupervisor;
 
@@ -1567,9 +1568,6 @@ fn qwen35_grammar_terminal_token(
     let Some(runtime) = runtime else {
         return false;
     };
-    if runtime.is_dead() {
-        return true;
-    }
     runtime.is_accepted()
         && params.token_bytes.as_deref().is_some_and(|token_bytes| {
             token_bytes
@@ -2810,6 +2808,8 @@ fn generate_qwen35_once_ordinary(
         total_ms = request_start.elapsed().as_secs_f64() * 1000.0,
         "Qwen35 request complete"
     );
+
+    validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)?;
 
     Ok(GenerationResult {
         text: content,
@@ -5973,7 +5973,12 @@ impl Qwen35DecodeState {
         self,
         qwen: &Qwen35LoadedModel,
         registration: Option<&ModelRegistration>,
-    ) -> GenerationResult {
+    ) -> Result<GenerationResult> {
+        validate_grammar_terminal(
+            self.grammar_runtime.as_ref(),
+            self.params.grammar_kind,
+            self.finish_reason,
+        )?;
         let (content_text, reasoning_text) = match registration {
             Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(
                 reg,
@@ -6003,7 +6008,7 @@ impl Qwen35DecodeState {
             _ => 0,
         };
         let decode_duration = self.decode_start.elapsed();
-        GenerationResult {
+        Ok(GenerationResult {
             text: content_text,
             reasoning_text,
             prompt_tokens: self.prompt_len,
@@ -6018,7 +6023,7 @@ impl Qwen35DecodeState {
             decode_duration,
             cached_tokens: self.cached_tokens,
             logprobs: self.logprobs_vec,
-        }
+        })
     }
 }
 
@@ -6866,6 +6871,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
     } else {
         None
     };
+    let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
 
     let device = MlxDevice::new()
         .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate w/ soft tokens): {e}"))?;
@@ -6897,20 +6903,29 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
         prefill_logits.len(),
         qwen.vocab_size
     );
-    let mut next_token: u32 = if want_logprobs {
-        // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
-        let mut logits = prefill_logits.clone();
-        let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
-        if let Some(v) = logprobs_vec.as_mut() {
-            v.push(lp);
-        }
-        tok
-    } else if is_greedy {
+    let mut next_token: u32 = if is_greedy {
         greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
     } else {
         let mut logits = prefill_logits.clone();
-        sample_logits_qwen35(&mut logits, params, &[])
+        let (token, logprob) = sample_logits_qwen35_constrained(
+            &mut logits,
+            params,
+            &[],
+            grammar_runtime.as_ref(),
+            &qwen.eos_token_ids,
+            want_logprobs,
+        )?;
+        if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
+            values.push(logprob);
+        }
+        token
     };
+    advance_qwen35_grammar(
+        &mut grammar_runtime,
+        params,
+        &qwen.eos_token_ids,
+        next_token,
+    )?;
     let prefill_duration = prefill_start.elapsed();
 
     // Decode loop — identical to `generate_qwen35_once`.  Decode
@@ -6947,30 +6962,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
             }
             let decode_positions = vec![pos; 4];
 
-            next_token = if want_logprobs {
-                // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
-                let logits_full = supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
-                    qwen.model
-                        .forward_gpu_last_logits(
-                            &[next_token],
-                            &decode_positions,
-                            &mut kv_cache,
-                            SlotId(0),
-                        )
-                        .with_context(|| {
-                            format!(
-                            "forward_gpu_last_logits decode step {step} (soft tokens, logprobs)"
-                        )
-                        })
-                })?;
-                let mut logits = logits_full;
-                let (tok, lp) =
-                    sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
-                if let Some(v) = logprobs_vec.as_mut() {
-                    v.push(lp);
-                }
-                tok
-            } else if is_greedy {
+            next_token = if is_greedy {
                 supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
                     qwen.model
                         // ADR-040 Phase B4d (2026-05-30) — see sibling at
@@ -6999,10 +6991,32 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
                         })
                 })?;
                 let mut logits = logits_full;
-                sample_logits_qwen35(&mut logits, params, &generated_tokens)
+                let (token, logprob) = sample_logits_qwen35_constrained(
+                    &mut logits,
+                    params,
+                    &generated_tokens,
+                    grammar_runtime.as_ref(),
+                    &qwen.eos_token_ids,
+                    want_logprobs,
+                )?;
+                if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
+                    values.push(logprob);
+                }
+                token
             };
 
+            advance_qwen35_grammar(
+                &mut grammar_runtime,
+                params,
+                &qwen.eos_token_ids,
+                next_token,
+            )?;
+
             if qwen.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+                break;
+            }
+            if qwen35_grammar_terminal_token(grammar_runtime.as_ref(), params, next_token) {
                 finish_reason = "stop";
                 break;
             }
@@ -7020,6 +7034,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
         }
     }
     let decode_duration = decode_start.elapsed();
+    validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)?;
 
     // Reasoning split — same registry helper as generate_qwen35_once.
     let (content, reasoning_text) = match registration {
@@ -7120,6 +7135,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     } else {
         None
     };
+    let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
 
     let device = MlxDevice::new()
         .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 vision generate): {e}"))?;
@@ -7188,18 +7204,22 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
             prefill_logits.len(),
             qwen.vocab_size
         );
-        next_token = if want_logprobs {
-            let mut logits = prefill_logits.clone();
-            let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
-            if let Some(v) = logprobs_vec.as_mut() {
-                v.push(lp);
-            }
-            tok
-        } else if is_greedy {
+        next_token = if is_greedy {
             greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
         } else {
             let mut logits = prefill_logits.clone();
-            sample_logits_qwen35(&mut logits, params, &[])
+            let (token, logprob) = sample_logits_qwen35_constrained(
+                &mut logits,
+                params,
+                &[],
+                grammar_runtime.as_ref(),
+                &qwen.eos_token_ids,
+                want_logprobs,
+            )?;
+            if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
+                values.push(logprob);
+            }
+            token
         };
         if is_greedy && params.vision_fingerprint.is_some() {
             match kv_cache.snapshot_prefix(&device, prompt_len) {
@@ -7211,6 +7231,12 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
             }
         }
     }
+    advance_qwen35_grammar(
+        &mut grammar_runtime,
+        params,
+        &qwen.eos_token_ids,
+        next_token,
+    )?;
     let prefill_duration = prefill_start.elapsed();
 
     // Decode loop — for the post-prefill text steps, the global
@@ -7274,28 +7300,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
             }
             let decode_positions = vec![pos; 4];
 
-            next_token = if want_logprobs {
-                // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
-                let logits_full =
-                    supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
-                        qwen.model.forward_gpu_last_logits(
-                        &[next_token],
-                        &decode_positions,
-                        &mut kv_cache,
-                        SlotId(0),
-                    )
-                    .with_context(|| {
-                        format!("forward_gpu_last_logits decode step {step} (wedge-4d, logprobs)")
-                    })
-                    })?;
-                let mut logits = logits_full;
-                let (tok, lp) =
-                    sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
-                if let Some(v) = logprobs_vec.as_mut() {
-                    v.push(lp);
-                }
-                tok
-            } else if is_greedy {
+            next_token = if is_greedy {
                 supervised_gpu_call(supervisor, "qwen35_serial_decode", || {
                     qwen.model
                         // ADR-040 Phase B4d (2026-05-30) — see sibling at
@@ -7324,10 +7329,32 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
                         })
                 })?;
                 let mut logits = logits_full;
-                sample_logits_qwen35(&mut logits, params, &generated_tokens)
+                let (token, logprob) = sample_logits_qwen35_constrained(
+                    &mut logits,
+                    params,
+                    &generated_tokens,
+                    grammar_runtime.as_ref(),
+                    &qwen.eos_token_ids,
+                    want_logprobs,
+                )?;
+                if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
+                    values.push(logprob);
+                }
+                token
             };
 
+            advance_qwen35_grammar(
+                &mut grammar_runtime,
+                params,
+                &qwen.eos_token_ids,
+                next_token,
+            )?;
+
             if qwen.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+                break;
+            }
+            if qwen35_grammar_terminal_token(grammar_runtime.as_ref(), params, next_token) {
                 finish_reason = "stop";
                 break;
             }
@@ -7345,6 +7372,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
         }
     }
     let decode_duration = decode_start.elapsed();
+    validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)?;
     qwen.persistent_kv_cache = Some(kv_cache);
 
     let (content, reasoning_text) = match registration {
@@ -8537,6 +8565,13 @@ pub(super) fn generate_stream_qwen35_once_extended(
 
     if saw_tool_call {
         finish_reason = "tool_calls";
+    }
+
+    if let Err(error) =
+        validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)
+    {
+        send!(GenerationEvent::Error(error.to_string()));
+        return Ok(SerialStreamEnd::TerminalSent);
     }
 
     let decode_duration = decode_start.elapsed();

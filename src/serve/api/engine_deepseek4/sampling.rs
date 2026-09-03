@@ -5,7 +5,8 @@ use mlx_native::MlxBuffer;
 
 use crate::serve::api::engine::{
     accept_grammar_token, effective_repetition_penalty, grammar_runtime_for_request,
-    sample_logits_with_grammar, GenerationResult, GrammarKind, SamplingParams,
+    sample_logits_with_grammar, validate_grammar_terminal, GenerationResult, GrammarKind,
+    SamplingParams,
 };
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::grammar::GrammarRuntime;
@@ -281,6 +282,7 @@ pub(in crate::serve::api) fn generate_once(
     }
 
     let (text, reasoning_text) = split_reasoning(&raw, registration, params.reasoning_forced_open);
+    validate_grammar_terminal(runtime.as_ref(), params.grammar_kind, finish_reason)?;
     loaded.commit_request_anchor();
     progress.complete(finish_reason, generated.len(), None);
     scratch_guard.complete();
