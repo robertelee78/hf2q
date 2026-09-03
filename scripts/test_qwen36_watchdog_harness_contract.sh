@@ -312,6 +312,34 @@ QWEN36_TEST_PMSET_FAIL=1 \
   expect_fail qwen36_capture_power_events "$test_dir/failed-power-events"
 unset -f pmset
 
+# Release power policy follows the effective live mode rather than requiring
+# a cable: battery/high and AC/automatic-or-high pass; low-power and
+# battery/automatic fail; changing the mode during a run fails.
+pmset() {
+  case "$*" in
+    '-g batt') printf "Now drawing from '%s Power'\n" "${TEST_POWER_SOURCE:-Battery}" ;;
+    '-g live') printf ' powermode            %s\n' "${TEST_POWER_MODE:-2}" ;;
+    *) return 1 ;;
+  esac
+}
+unset QWEN36_EXPECTED_POWER_MODE_CODE
+TEST_POWER_SOURCE=Battery TEST_POWER_MODE=2 \
+  qwen36_validate_release_power_policy
+[[ "$QWEN36_POWER_SOURCE" == battery && "$QWEN36_POWER_MODE_NAME" == high ]]
+TEST_POWER_SOURCE=AC TEST_POWER_MODE=0 qwen36_validate_release_power_policy
+[[ "$QWEN36_POWER_SOURCE" == ac && "$QWEN36_POWER_MODE_NAME" == automatic ]]
+TEST_POWER_SOURCE=AC TEST_POWER_MODE=2 qwen36_validate_release_power_policy
+[[ "$QWEN36_POWER_MODE_NAME" == high ]]
+TEST_POWER_SOURCE=Battery TEST_POWER_MODE=0 \
+  expect_fail qwen36_validate_release_power_policy
+TEST_POWER_SOURCE=AC TEST_POWER_MODE=1 \
+  expect_fail qwen36_validate_release_power_policy
+QWEN36_EXPECTED_POWER_MODE_CODE=2
+TEST_POWER_SOURCE=AC TEST_POWER_MODE=0 \
+  expect_fail qwen36_validate_release_power_policy
+unset QWEN36_EXPECTED_POWER_MODE_CODE TEST_POWER_SOURCE TEST_POWER_MODE
+unset -f pmset
+
 # Bash 3.2 suppresses `errexit` when a function is evaluated by `if` or a
 # command substitution. A capture error must return explicitly instead of
 # reusing a pre-existing clean final snapshot and reporting a zero delta.
@@ -330,6 +358,7 @@ pmset() {
   case "$*" in
     '-g assertions') printf 'mock assertion\n' ;;
     '-g batt') printf "Now drawing from 'AC Power'\n" ;;
+    '-g live') printf ' powermode            0\n' ;;
     '-g log') return 1 ;;
     *) return 1 ;;
   esac

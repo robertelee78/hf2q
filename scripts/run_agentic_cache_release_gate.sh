@@ -3,10 +3,11 @@ set -euo pipefail
 
 # Exact-artifact, one-model-at-a-time cache lifecycle release authority.
 # This wrapper is intentionally macOS/Apple-Silicon only. It continuously
-# requires AC power, holds a caffeinate assertion, runs the same user-shaped
-# lifecycle fixture for DeepSeek, Gemma, and Qwen, exercises structured output
-# on those families plus Qwen3.8, and binds all receipts to one packed crate
-# and release binary.
+# binds the effective performance power policy, holds a caffeinate assertion,
+# runs the same user-shaped lifecycle fixture for DeepSeek, Gemma, and Qwen,
+# exercises structured output on those families plus Qwen3.8, and binds all
+# receipts to one packed crate and release binary. Battery execution is valid
+# only in High Power Mode; the cable itself is not a performance invariant.
 
 EXPECTED_SHA=${EXPECTED_SHA:?EXPECTED_SHA is required}
 EXPECTED_VERSION=${EXPECTED_VERSION:?EXPECTED_VERSION is required}
@@ -109,27 +110,36 @@ server_pid=""
 power_pid=""
 caffeinate_pid=""
 wave_harness_pid=""
+release_initial_power_source=""
+release_power_mode_code=""
+release_power_mode_name=""
 
-require_ac() {
-  local state
-  state=$(pmset -g batt)
-  printf 'sample_utc=%s\n%s\n' "$(date -u +%FT%TZ)" "$state" \
+require_release_power_policy() {
+  qwen36_validate_release_power_policy || return 1
+  printf 'sample_utc=%s source=%s mode=%s mode_code=%s\n' \
+    "$(date -u +%FT%TZ)" "$QWEN36_POWER_SOURCE" \
+    "$QWEN36_POWER_MODE_NAME" "$QWEN36_POWER_MODE_CODE" \
     >> "$OUT_ROOT/power.log"
-  rg -q "Now drawing from 'AC Power'" <<<"$state" || {
-    echo "cache lifecycle release gate requires continuous AC power" >&2
-    return 1
-  }
+}
+
+initialize_release_power_policy() {
+  require_release_power_policy
+  release_initial_power_source=$QWEN36_POWER_SOURCE
+  release_power_mode_code=$QWEN36_POWER_MODE_CODE
+  release_power_mode_name=$QWEN36_POWER_MODE_NAME
+  QWEN36_EXPECTED_POWER_MODE_CODE=$release_power_mode_code
+  export QWEN36_EXPECTED_POWER_MODE_CODE
 }
 
 ensure_guard_health() {
   local assertions=""
-  require_ac
-  [[ ! -e "$OUT_ROOT/power-failure.txt" ]] || {
-    cat "$OUT_ROOT/power-failure.txt" >&2
+  require_release_power_policy
+  [[ ! -e "$OUT_ROOT/power-policy-failure.txt" ]] || {
+    cat "$OUT_ROOT/power-policy-failure.txt" >&2
     return 1
   }
   if [[ -z "$power_pid" ]] || ! kill -0 "$power_pid" 2>/dev/null; then
-    echo "AC power monitor is not running" >&2
+    echo "power-policy monitor is not running" >&2
     return 1
   fi
   if [[ -z "$caffeinate_pid" ]] || ! kill -0 "$caffeinate_pid" 2>/dev/null; then
@@ -204,14 +214,15 @@ trap on_exit EXIT
 trap 'exit 1' INT TERM
 
 thermal_prepare_probe
-require_ac
+initialize_release_power_policy
 pmset -g assertions > "$OUT_ROOT/power-assertions.before.txt"
 caffeinate -dimsu -w "$parent_pid" &
 caffeinate_pid=$!
 (
   while kill -0 "$parent_pid" 2>/dev/null; do
-    if ! require_ac; then
-      printf 'AC power lost at %s\n' "$(date -u +%FT%TZ)" > "$OUT_ROOT/power-failure.txt"
+    if ! require_release_power_policy; then
+      printf 'release power policy changed at %s\n' "$(date -u +%FT%TZ)" \
+        > "$OUT_ROOT/power-policy-failure.txt"
       kill -TERM "$parent_pid" 2>/dev/null || true
       exit 1
     fi
@@ -1625,7 +1636,14 @@ hf2q_release_verify_model "$QWEN38_MODEL" "$QWEN38_MODEL_SHA256" \
   "$OUT_ROOT/qwen38/model-verification.json"
 ensure_guard_health
 pmset -g assertions > "$OUT_ROOT/power-assertions.after.txt"
-power_guarded_ac=true
+release_final_power_source=$QWEN36_POWER_SOURCE
+power_policy_guarded=true
+if [[ "$release_initial_power_source" == ac \
+  && "$release_final_power_source" == ac ]]; then
+  power_guarded_ac=true
+else
+  power_guarded_ac=false
+fi
 power_snapshot_manifest="$OUT_ROOT/power-event-snapshots.sha256"
 power_snapshot_prefixes=()
 while IFS= read -r prefix; do
@@ -1653,6 +1671,10 @@ jq -n \
   --arg binary_sha256 "$binary_sha" \
   --arg dependency_provenance_receipt_sha "$dependency_provenance_receipt_sha" \
   --arg power_event_snapshots_sha256 "$power_snapshot_manifest_sha" \
+  --arg power_initial_source "$release_initial_power_source" \
+  --arg power_final_source "$release_final_power_source" \
+  --arg power_mode_name "$release_power_mode_name" \
+  --argjson power_mode_code "$release_power_mode_code" \
   --arg deepseek_path "$DEEPSEEK_MODEL" \
   --arg gemma_path "$GEMMA_MODEL" \
   --arg qwen_path "$QWEN_MODEL" \
@@ -1698,6 +1720,7 @@ jq -n \
   --arg qwen_cancellation_sha "$(sha256_file "$OUT_ROOT/qwen/cancellation/cancellation-summary.json")" \
   --arg qwen38_long_decode_sha "$(sha256_file "$OUT_ROOT/qwen38/long-decode/receipt.json")" \
   --arg qwen38_r2c_sha "$(sha256_file "$OUT_ROOT/qwen38/r2c-structured/summary.json")" \
+  --argjson power_policy_guarded "$power_policy_guarded" \
   --argjson power_guarded_ac "$power_guarded_ac" \
   --argjson deepseek_bytes "$deepseek_bytes" \
   --argjson gemma_bytes "$gemma_bytes" \
@@ -1746,6 +1769,13 @@ jq -n \
     binary_sha256: $binary_sha256,
     dependency_provenance: $dependency_provenance[0],
     power_guarded_ac: $power_guarded_ac,
+    power_policy: {
+      guarded: $power_policy_guarded,
+      cable_required: false,
+      initial_source: $power_initial_source,
+      final_source: $power_final_source,
+      mode: {name: $power_mode_name, numeric_canary: $power_mode_code}
+    },
     power_event_snapshots_sha256: $power_event_snapshots_sha256,
     models: {
       deepseek: {path: $deepseek_path, bytes: $deepseek_bytes, sha256: $deepseek_sha,
@@ -1783,6 +1813,20 @@ mv "$OUT_ROOT/manifest.json.tmp" "$OUT_ROOT/manifest.json"
 shasum -a 256 "$OUT_ROOT/manifest.json" >"$OUT_ROOT/manifest.json.sha256"
 jq -e '
   (.power_event_snapshots_sha256 | test("^[0-9a-f]{64}$"))
+  and .power_policy.guarded == true
+  and .power_policy.cable_required == false
+  and (.power_policy.initial_source == "ac"
+    or .power_policy.initial_source == "battery")
+  and (.power_policy.final_source == "ac"
+    or .power_policy.final_source == "battery")
+  and ((.power_policy.mode.name == "high"
+      and .power_policy.mode.numeric_canary == 2)
+    or (.power_policy.mode.name == "automatic"
+      and .power_policy.mode.numeric_canary == 0
+      and .power_policy.initial_source == "ac"
+      and .power_policy.final_source == "ac"))
+  and (.power_guarded_ac == (.power_policy.initial_source == "ac"
+    and .power_policy.final_source == "ac"))
   and .models.deepseek.architecture == "deepseek4"
   and .models.gemma.architecture == "gemma4"
   and .models.qwen.architecture == "qwen35moe"

@@ -124,6 +124,17 @@ while IFS= read -r line; do
 done <<<"$decode_monitor"
 grep -F 'scripts/run_release_gate_process_group.sh env' "$model_workflow" >/dev/null
 grep -F 'scripts/run_agentic_cache_release_gate.sh' "$model_workflow" >/dev/null
+# The release gate binds effective compute policy. Apple permits High Power
+# Mode on battery, so a cable must not stand in for the actual live mode.
+grep -F 'qwen36_validate_release_power_policy' "$release_gate" >/dev/null
+grep -F 'QWEN36_EXPECTED_POWER_MODE_CODE' "$release_gate" >/dev/null
+grep -F 'cable_required: false' "$release_gate" >/dev/null
+grep -F '.power_policy.cable_required == false' \
+  "$script_dir/verify_cache_lifecycle_candidate.sh" >/dev/null
+if grep -Fq 'requires continuous AC power' "$release_gate"; then
+  echo "release gate still substitutes an AC cable for effective power mode" >&2
+  exit 1
+fi
 # One reference artifact for every enabled text-generation architecture must
 # run the r2c compatibility gate from the sealed binary before retirement.
 for family in deepseek gemma qwen qwen38; do

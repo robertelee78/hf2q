@@ -798,6 +798,92 @@ qwen36_bound_caffeinate_pid() {
   return 1
 }
 
+qwen36_read_power_source() {
+  local state
+  state=$(pmset -g batt) || {
+    echo "Qwen hardware gate could not read the active power source" >&2
+    return 1
+  }
+  case "$state" in
+    *"Now drawing from 'AC Power'"*) printf 'ac\n' ;;
+    *"Now drawing from 'Battery Power'"*) printf 'battery\n' ;;
+    *)
+      echo "Qwen hardware gate could not classify the active power source" >&2
+      return 1
+      ;;
+  esac
+}
+
+qwen36_read_power_mode_code() {
+  local mode
+  mode=$(pmset -g live | awk '
+    $1 == "powermode" && $2 ~ /^[0-9]+$/ && NF == 2 {
+      value = $2
+      matches++
+    }
+    END {
+      if (matches != 1) exit 1
+      print value
+    }
+  ') || {
+    echo "Qwen hardware gate could not read the live power mode" >&2
+    return 1
+  }
+  case "$mode" in
+    0|1|2) printf '%s\n' "$mode" ;;
+    *)
+      echo "Qwen hardware gate read an unknown live power mode: $mode" >&2
+      return 1
+      ;;
+  esac
+}
+
+qwen36_power_mode_name() {
+  case "$1" in
+    0) printf 'automatic\n' ;;
+    1) printf 'low\n' ;;
+    2) printf 'high\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Apple supports High Power Mode on either battery or external power. Release
+# measurements therefore bind the effective live policy, not the cable. AC
+# Automatic remains admissible for the historical calibrated baseline;
+# battery execution must explicitly select High Power Mode.
+qwen36_validate_release_power_policy() {
+  local source mode name expected_mode
+  source=$(qwen36_read_power_source) || return 1
+  mode=$(qwen36_read_power_mode_code) || return 1
+  name=$(qwen36_power_mode_name "$mode") || return 1
+
+  case "$source:$mode" in
+    ac:0|ac:2|battery:2) ;;
+    battery:0)
+      echo "Qwen hardware gate requires High Power Mode while on battery" >&2
+      return 1
+      ;;
+    *:1)
+      echo "Qwen hardware gate rejects Low Power Mode" >&2
+      return 1
+      ;;
+    *)
+      echo "Qwen hardware gate rejects power policy $source/$name" >&2
+      return 1
+      ;;
+  esac
+
+  expected_mode=${QWEN36_EXPECTED_POWER_MODE_CODE:-}
+  if [[ -n "$expected_mode" && "$mode" != "$expected_mode" ]]; then
+    echo "Qwen hardware gate power mode changed: expected=$expected_mode actual=$mode" >&2
+    return 1
+  fi
+  QWEN36_POWER_SOURCE=$source
+  QWEN36_POWER_MODE_CODE=$mode
+  QWEN36_POWER_MODE_NAME=$name
+  export QWEN36_POWER_SOURCE QWEN36_POWER_MODE_CODE QWEN36_POWER_MODE_NAME
+}
+
 qwen36_start_power_guard() {
   local target_pid="$1"
   local guard_log="$2"
@@ -824,10 +910,10 @@ qwen36_start_power_guard() {
     echo "Qwen gate could not count the baseline macOS power events" >&2
     return 1
   }
-  pmset -g batt | grep -Fq "Now drawing from 'AC Power'" || {
-    echo "Qwen hardware gate requires AC power" >&2
-    return 1
-  }
+  qwen36_validate_release_power_policy || return 1
+  if [[ -z "${QWEN36_EXPECTED_POWER_MODE_CODE:-}" ]]; then
+    QWEN36_EXPECTED_POWER_MODE_CODE=$QWEN36_POWER_MODE_CODE
+  fi
   caffeinate -dimsu -w "$target_pid" >"$guard_log" 2>&1 &
   QWEN36_POWER_GUARD_LAUNCH_PID=$!
   QWEN36_POWER_GUARD_TARGET_PID=$target_pid
@@ -870,10 +956,7 @@ qwen36_assert_power_guard() {
     echo "Qwen hardware gate lost its bound caffeinate assertion" >&2
     return 1
   }
-  pmset -g batt | grep -Fq "Now drawing from 'AC Power'" || {
-    echo "Qwen hardware gate lost AC power" >&2
-    return 1
-  }
+  qwen36_validate_release_power_policy || return 1
   qwen36_capture_power_events "$QWEN36_POWER_EVENT_FINAL_PATH" || return 1
   qwen36_extract_new_power_events \
     "$QWEN36_POWER_EVENT_BASELINE_PATH" \

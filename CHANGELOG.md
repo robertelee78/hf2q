@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Qualify exact-artifact model and grammar gates on battery when macOS High
+  Power Mode is active. The gate now binds and continuously monitors the live
+  performance policy instead of treating an AC cable as a compute proxy.
 - Make the OpenCode web-search stack install reliably across supported hosts,
   including environments that require an explicit SearXNG build backend.
 - Keep release-build proc macros loadable under macOS 27's stricter Mach-O

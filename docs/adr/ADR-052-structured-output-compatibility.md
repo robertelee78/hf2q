@@ -444,6 +444,23 @@ absent, malformed, or bound to different source, crate, binary, model,
 architecture, or candidate-run identities. The fixture schemas are test
 vectors, not an r2c runtime or build dependency.
 
+The first exact `0.1.21` qualification dispatch, run `33766879795`, verified
+the signed/notarized artifact and then failed before loading any model because
+the gate required an AC cable. That rule was a proxy for the earlier Battery
+Automatic configuration, not a grammar or runtime requirement. Apple supports
+High Power Mode on battery ([Apple Support 101613](https://support.apple.com/en-us/101613)),
+and Apple's published `pmset` source defines `0` as Automatic/off, `1` as Low
+Power, and `2` as High Power
+([PowerManagement `d415e455`](https://github.com/apple-oss-distributions/PowerManagement/blob/d415e45501842834a280930c3eed9186544a67f0/pmset/pmset.m#L1315-L1317)).
+The host's live `pmset -g live` value was `2` while `system_profiler` emitted
+contradictory Low/High labels on macOS 27. The reformulated contract uses the
+live numeric mode: battery is
+admitted only at High Power (`2`), AC remains admitted at Automatic (`0`) or
+High Power (`2`), the initial mode is receipt-bound, and any mode change aborts
+the run. Source, sleep/wake events, thermal state, host contention, and the
+bound `caffeinate` assertion remain continuously observed. Cable and remaining
+charge are operator-managed rather than product invariants.
+
 ## Completion gates
 
 This ADR moves to **Implemented** only when:
