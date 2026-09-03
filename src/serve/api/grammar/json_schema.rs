@@ -40,6 +40,76 @@ const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_LOCAL_REFS: usize = 1024;
 const MAX_ENUM_VALUES: usize = 1024;
 const MAX_LITERAL_BYTES: usize = 1024 * 1024;
+const MAX_INTEGER_MAGNITUDE: i64 = 9_999_999_999_999_999;
+
+/// Return the XGrammar/llama.cpp-compatible lexical pattern for a supported
+/// JSON Schema string format. These are generator constraints: they validate
+/// the same lexical shapes upstream constrained decoders use, not calendar or
+/// DNS existence.
+fn string_format_pattern(format: &str) -> Option<&'static str> {
+    match format {
+        "email" => Some(
+            r#"^([a-zA-Z0-9_!#$%&'*+/=?^`{|}~-]+(\.[a-zA-Z0-9_!#$%&'*+/=?^`{|}~-]+)*|\"[^\"\r\n]*\")@[A-Za-z0-9]([-A-Za-z0-9]*[A-Za-z0-9])?(\.[A-Za-z0-9]([-A-Za-z0-9]*[A-Za-z0-9])?)*$"#,
+        ),
+        "date" => Some(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2]\d|3[01])$"),
+        "time" => {
+            Some(r"^([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d+)?(Z|[+-]([01]\d|2[0-3]):[0-5]\d)$")
+        }
+        "date-time" => Some(
+            r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d+)?(Z|[+-]([01]\d|2[0-3]):[0-5]\d)$",
+        ),
+        "duration" => Some(
+            r"^P((\d+D|\d+M(\d+D)?|\d+Y(\d+M(\d+D)?)?)(T(\d+S|\d+M(\d+S)?|\d+H(\d+M(\d+S)?)?))?|T(\d+S|\d+M(\d+S)?|\d+H(\d+M(\d+S)?)?)|\d+W)$",
+        ),
+        "ipv4" => Some(r"^((25[0-5]|2[0-4]\d|[0-1]?\d?\d)\.){3}(25[0-5]|2[0-4]\d|[0-1]?\d?\d)$"),
+        "ipv6" => Some(
+            r"^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$",
+        ),
+        "hostname" => Some(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$"),
+        "uuid" | "uuid1" | "uuid2" | "uuid3" | "uuid4" | "uuid5" => {
+            Some(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
+        }
+        "uri" => Some(r#"^[a-zA-Z][a-zA-Z+.-]*:[^\s\"\\]+$"#),
+        "uri-reference" => Some(r#"^[^\s\"\\]*$"#),
+        "uri-template" => Some(
+            r#"^([^\s\"\\{}]|\{[+#./;?&=,!@|]?[a-zA-Z0-9_%]+([.:*][a-zA-Z0-9_%]+)*(,[a-zA-Z0-9_%]+([.:*][a-zA-Z0-9_%]+)*)*\})*$"#,
+        ),
+        "json-pointer" | "relative-json-pointer" => None,
+        _ => None,
+    }
+}
+
+fn is_supported_string_format(format: &str) -> bool {
+    string_format_pattern(format).is_some()
+        || matches!(format, "json-pointer" | "relative-json-pointer")
+}
+
+/// Compile a supported JSON Schema format for a particular string surface.
+/// Family-native tool emitters use this same helper so no model family gets a
+/// weaker interpretation than response JSON.
+pub fn string_format_gbnf(format: &str, surface: Surface) -> Result<String, SchemaError> {
+    match format {
+        "json-pointer" => {
+            let char_class = match surface {
+                Surface::JsonString => r#"[^"\\/~\x00-\x1F]"#,
+                Surface::QwenJsonString => r#"[^"\\</~\x00-\x1F]"#,
+                Surface::QwenRawString | Surface::GemmaMarkerString => r#"[^</~]"#,
+                Surface::DeepSeekRawString | Surface::RawOutput => r#"[^/~]"#,
+            };
+            Ok(format!(r#"( "/" ( {char_class} | "~" [01] )* )*"#))
+        }
+        "relative-json-pointer" => {
+            let pointer = string_format_gbnf("json-pointer", surface)?;
+            Ok(format!(r##"( "0" | [1-9] [0-9]* ) ( "#" | {pointer} )"##))
+        }
+        other => {
+            let pattern = string_format_pattern(other)
+                .ok_or_else(|| schema_error("/format", format!("unsupported format {other:?}")))?;
+            regex_to_gbnf_full_match(pattern, surface)
+                .map_err(|error| schema_error("/format", error.to_string()))
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Primitive rule library.
@@ -428,13 +498,36 @@ impl Converter {
         }
 
         // `type`: the dominant dispatch.
+        let inferred_type = if obj.contains_key("format")
+            || obj.contains_key("pattern")
+            || obj.contains_key("minLength")
+            || obj.contains_key("maxLength")
+        {
+            Some("string")
+        } else if obj.contains_key("properties")
+            || obj.contains_key("required")
+            || obj.contains_key("additionalProperties")
+            || obj.contains_key("minProperties")
+            || obj.contains_key("maxProperties")
+        {
+            Some("object")
+        } else if obj.contains_key("items")
+            || obj.contains_key("prefixItems")
+            || obj.contains_key("minItems")
+            || obj.contains_key("maxItems")
+        {
+            Some("array")
+        } else {
+            None
+        };
         let type_val = obj.get("type");
         let type_str = match type_val {
-            None => {
+            None if inferred_type.is_none() => {
                 // Untyped — accept any JSON value.
                 self.add_primitive("value");
                 return Ok("value".into());
             }
+            None => inferred_type.expect("checked").to_string(),
             Some(Value::String(s)) => s.clone(),
             Some(Value::Array(types)) => {
                 // A type union retains every sibling assertion that applies
@@ -472,6 +565,13 @@ impl Converter {
 
         match type_str.as_str() {
             "string" => {
+                if let Some(format) = obj.get("format").and_then(Value::as_str) {
+                    let body =
+                        string_format_gbnf(format, Surface::JsonString).map_err(|error| {
+                            schema_error(&format!("{path}/format"), error.to_string())
+                        })?;
+                    return Ok(format!(r#""\"" {} "\"" space"#, body));
+                }
                 if let Some(Value::String(pattern)) = obj.get("pattern") {
                     let body =
                         regex_to_gbnf_body(pattern, Surface::JsonString).map_err(|error| {
@@ -501,13 +601,11 @@ impl Converter {
                 Ok("number".into())
             }
             "integer" => {
-                if obj.get("minimum").and_then(Value::as_i64) == Some(0)
-                    && obj.get("maximum").is_none()
-                    && obj.get("exclusiveMinimum").is_none()
-                    && obj.get("exclusiveMaximum").is_none()
+                if ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]
+                    .iter()
+                    .any(|keyword| obj.contains_key(*keyword))
                 {
-                    self.add_primitive("integral-part");
-                    return Ok("integral-part space".into());
+                    return Ok(format!("{} space", integer_range_gbnf(obj)?));
                 }
                 self.add_primitive("integer");
                 Ok("integer".into())
@@ -673,20 +771,40 @@ impl Converter {
             )?),
             _ => None,
         };
+        let min_properties = obj
+            .get("minProperties")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let max_properties = obj.get("maxProperties").and_then(Value::as_u64);
 
         if properties.is_empty() {
             if additional_closed {
                 // additionalProperties:false + no declared properties means
                 // only the empty object {} is valid.
-                return Ok(r#""{" space "}" space"#.into());
+                return if min_properties == 0 {
+                    Ok(r#""{" space "}" space"#.into())
+                } else {
+                    Ok(self.uninhabited_rule(path))
+                };
             }
-            if let Some(value_rule) = additional_value_rule {
+            if additional_value_rule.is_some()
+                || obj.contains_key("minProperties")
+                || obj.contains_key("maxProperties")
+            {
                 let name = format!("{}-typed-extra-kv", path_slug(path));
-                self.rules
-                    .insert(name.clone(), format!("string \":\" space {value_rule}"));
+                self.rules.insert(
+                    name.clone(),
+                    format!(
+                        "string \":\" space {}",
+                        additional_value_rule.as_deref().unwrap_or("value")
+                    ),
+                );
+                if max_properties.is_some_and(|maximum| maximum < min_properties) {
+                    return Ok(self.uninhabited_rule(path));
+                }
                 return Ok(format!(
-                    r#""{{" space ( {0} ("," space {0})* )? "}}" space"#,
-                    name
+                    r#""{{" space {} "}}" space"#,
+                    repeated_sequence(&name, min_properties, max_properties)
                 ));
             }
             // No explicit properties — accept any object.
@@ -793,6 +911,61 @@ impl Converter {
             });
         }
 
+        if obj.contains_key("minProperties") || obj.contains_key("maxProperties") {
+            if required_keys.len() > ANY_ORDER_MAX_REQUIRED {
+                return Err(SchemaError::TooManyRequiredKeys {
+                    fn_name: path.to_string(),
+                    count: required_keys.len(),
+                    max: ANY_ORDER_MAX_REQUIRED,
+                });
+            }
+            let required_count = required_keys.len() as u64;
+            let declared_count = n_total as u64;
+            let effective_min = min_properties.max(required_count);
+            let effective_max = if additional_closed {
+                Some(max_properties.unwrap_or(declared_count).min(declared_count))
+            } else {
+                max_properties
+            };
+            if effective_max.is_some_and(|maximum| maximum < effective_min)
+                || (additional_closed && effective_min > declared_count)
+            {
+                return Ok(self.uninhabited_rule(path));
+            }
+            if effective_min == 0 && effective_max == Some(0) {
+                return Ok(r#""{" space "}" space"#.into());
+            }
+            let req_full = if required_keys.is_empty() {
+                0
+            } else {
+                u32::MAX >> (32 - required_keys.len())
+            };
+            let opt_full = if optional_keys.is_empty() {
+                0
+            } else {
+                u32::MAX >> (32 - optional_keys.len())
+            };
+            let counted = self.build_counted_object_inner(
+                &slug,
+                req_full,
+                opt_full,
+                0,
+                effective_min,
+                effective_max,
+                &required_keys,
+                &optional_keys,
+                &kv_rule_name,
+                !additional_closed,
+                path,
+            )?;
+            let inner = if effective_min == 0 {
+                format!("( {counted} )?")
+            } else {
+                counted
+            };
+            return Ok(format!(r#""{{" space {} "}}" space"#, inner));
+        }
+
         // Compute the inner rule reference (the first key-value pair and all
         // subsequent ones).
         let inner = if required_keys.is_empty() {
@@ -852,6 +1025,135 @@ impl Converter {
         };
 
         Ok(format!(r#""{{" space {} "}}" space"#, inner))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_counted_object_inner(
+        &mut self,
+        slug: &str,
+        req_remaining: u32,
+        opt_remaining: u32,
+        emitted: u64,
+        minimum: u64,
+        maximum: Option<u64>,
+        required_keys: &[String],
+        optional_keys: &[String],
+        kv_rule_name: &HashMap<String, String>,
+        allow_extra_kv: bool,
+        path: &str,
+    ) -> Result<String, SchemaError> {
+        // With no upper bound, all counts at or above the minimum are
+        // equivalent. Saturation gives the extra-property branch a finite,
+        // right-recursive state.
+        let count_state = maximum.map_or(emitted.min(minimum), |_| emitted);
+        let rule_name =
+            format!("{slug}-count-r{req_remaining:08x}-o{opt_remaining:08x}-n{count_state}");
+        if self.rules.contains_key(&rule_name) {
+            return Ok(rule_name);
+        }
+        if self.rules.len() >= 8192 {
+            return Err(schema_error(
+                path,
+                "object count grammar exceeds 8192-rule budget",
+            ));
+        }
+        self.rules.insert(rule_name.clone(), String::new());
+
+        let may_continue = |next_count: u64| maximum.is_none_or(|limit| next_count < limit);
+        let may_close = |next_req: u32, next_count: u64| {
+            next_req == 0
+                && next_count >= minimum
+                && maximum.is_none_or(|limit| next_count <= limit)
+        };
+        let mut alternatives = Vec::new();
+
+        for (index, key) in required_keys.iter().enumerate() {
+            if req_remaining & (1u32 << index) == 0 {
+                continue;
+            }
+            let next_req = req_remaining & !(1u32 << index);
+            let next_count = emitted + 1;
+            let kv = &kv_rule_name[key];
+            if may_close(next_req, next_count) {
+                alternatives.push(kv.clone());
+            }
+            if may_continue(next_count) {
+                let next = self.build_counted_object_inner(
+                    slug,
+                    next_req,
+                    opt_remaining,
+                    next_count,
+                    minimum,
+                    maximum,
+                    required_keys,
+                    optional_keys,
+                    kv_rule_name,
+                    allow_extra_kv,
+                    path,
+                )?;
+                alternatives.push(format!("{kv} \",\" space {next}"));
+            }
+        }
+
+        for (index, key) in optional_keys.iter().enumerate() {
+            if opt_remaining & (1u32 << index) == 0 {
+                continue;
+            }
+            let next_opt = opt_remaining & !(1u32 << index);
+            let next_count = emitted + 1;
+            let kv = &kv_rule_name[key];
+            if may_close(req_remaining, next_count) {
+                alternatives.push(kv.clone());
+            }
+            if may_continue(next_count) {
+                let next = self.build_counted_object_inner(
+                    slug,
+                    req_remaining,
+                    next_opt,
+                    next_count,
+                    minimum,
+                    maximum,
+                    required_keys,
+                    optional_keys,
+                    kv_rule_name,
+                    allow_extra_kv,
+                    path,
+                )?;
+                alternatives.push(format!("{kv} \",\" space {next}"));
+            }
+        }
+
+        if allow_extra_kv {
+            let next_count = emitted + 1;
+            let kv = format!("{slug}-extra-kv");
+            if may_close(req_remaining, next_count) {
+                alternatives.push(kv.clone());
+            }
+            if may_continue(next_count) {
+                let next = self.build_counted_object_inner(
+                    slug,
+                    req_remaining,
+                    opt_remaining,
+                    next_count,
+                    minimum,
+                    maximum,
+                    required_keys,
+                    optional_keys,
+                    kv_rule_name,
+                    allow_extra_kv,
+                    path,
+                )?;
+                alternatives.push(format!("{kv} \",\" space {next}"));
+            }
+        }
+
+        let body = if alternatives.is_empty() {
+            r#"[^\U00000000-\U0010FFFF]"#.to_string()
+        } else {
+            alternatives.join(" | ")
+        };
+        self.rules.insert(rule_name.clone(), body);
+        Ok(rule_name)
     }
 
     /// Build the unified any-position inner rule for state
@@ -1239,6 +1541,182 @@ fn repeated_sequence(item: &str, min: u64, max: Option<u64>) -> String {
     format!("{item}{suffix}")
 }
 
+fn decimal_digit_range(low: u8, high: u8) -> String {
+    debug_assert!(low <= high && high <= 9);
+    if low == high {
+        format!("[{}]", char::from(b'0' + low))
+    } else {
+        format!("[{}-{}]", char::from(b'0' + low), char::from(b'0' + high))
+    }
+}
+
+fn fixed_width_decimal_range(low: &str, high: &str) -> String {
+    debug_assert_eq!(low.len(), high.len());
+    debug_assert!(low <= high);
+    if low == high {
+        return format_literal(low);
+    }
+
+    let prefix_len = low
+        .bytes()
+        .zip(high.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let prefix = &low[..prefix_len];
+    let low_tail = &low[prefix_len..];
+    let high_tail = &high[prefix_len..];
+    let low_digit = low_tail.as_bytes()[0] - b'0';
+    let high_digit = high_tail.as_bytes()[0] - b'0';
+    let suffix_len = low_tail.len() - 1;
+    let mut alternatives = Vec::new();
+
+    if suffix_len == 0 {
+        alternatives.push(decimal_digit_range(low_digit, high_digit));
+    } else {
+        let low_suffix = &low_tail[1..];
+        let high_suffix = &high_tail[1..];
+        let zero_suffix = "0".repeat(suffix_len);
+        let nine_suffix = "9".repeat(suffix_len);
+        alternatives.push(format!(
+            "{} {}",
+            decimal_digit_range(low_digit, low_digit),
+            fixed_width_decimal_range(low_suffix, &nine_suffix)
+        ));
+        if low_digit + 1 < high_digit {
+            alternatives.push(format!(
+                "{} [0-9]{{{suffix_len}}}",
+                decimal_digit_range(low_digit + 1, high_digit - 1)
+            ));
+        }
+        alternatives.push(format!(
+            "{} {}",
+            decimal_digit_range(high_digit, high_digit),
+            fixed_width_decimal_range(&zero_suffix, high_suffix)
+        ));
+    }
+
+    let body = if alternatives.len() == 1 {
+        alternatives.remove(0)
+    } else {
+        format!("( {} )", alternatives.join(" | "))
+    };
+    if prefix.is_empty() {
+        body
+    } else {
+        format!("{} {body}", format_literal(prefix))
+    }
+}
+
+fn nonnegative_integer_range(low: u64, high: u64) -> String {
+    debug_assert!(low <= high);
+    let low_text = low.to_string();
+    let high_text = high.to_string();
+    let mut alternatives = Vec::new();
+    for width in low_text.len()..=high_text.len() {
+        let lower = if width == low_text.len() {
+            low_text.clone()
+        } else if width == 1 {
+            "0".to_string()
+        } else {
+            format!("1{}", "0".repeat(width - 1))
+        };
+        let upper = if width == high_text.len() {
+            high_text.clone()
+        } else {
+            "9".repeat(width)
+        };
+        if lower <= upper {
+            alternatives.push(fixed_width_decimal_range(&lower, &upper));
+        }
+    }
+    if alternatives.len() == 1 {
+        alternatives.remove(0)
+    } else {
+        format!("( {} )", alternatives.join(" | "))
+    }
+}
+
+fn integer_bound(
+    object: &serde_json::Map<String, Value>,
+    inclusive: &str,
+    exclusive: &str,
+    lower: bool,
+) -> Result<Option<i64>, SchemaError> {
+    let inclusive = object.get(inclusive).map(|value| {
+        value
+            .as_i64()
+            .ok_or_else(|| schema_error(&format!("/{inclusive}"), "integer bound must be an i64"))
+    });
+    let exclusive = object.get(exclusive).map(|value| {
+        let value = value.as_i64().ok_or_else(|| {
+            schema_error(
+                &format!("/{exclusive}"),
+                "exclusive integer bound must be an i64",
+            )
+        })?;
+        if lower {
+            value.checked_add(1).ok_or_else(|| {
+                schema_error(
+                    &format!("/{exclusive}"),
+                    "exclusive lower bound overflows i64",
+                )
+            })
+        } else {
+            value.checked_sub(1).ok_or_else(|| {
+                schema_error(
+                    &format!("/{exclusive}"),
+                    "exclusive upper bound overflows i64",
+                )
+            })
+        }
+    });
+    match (inclusive.transpose()?, exclusive.transpose()?) {
+        (Some(left), Some(right)) if lower => Ok(Some(left.max(right))),
+        (Some(left), Some(right)) => Ok(Some(left.min(right))),
+        (Some(value), None) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Exact bounded-integer GBNF body shared by response JSON and all native
+/// tool-call wire emitters. The lexical domain intentionally matches hf2q's
+/// existing 16-digit JSON integer primitive and llama.cpp's bounded emitter.
+pub fn integer_range_gbnf(object: &serde_json::Map<String, Value>) -> Result<String, SchemaError> {
+    let requested_min = integer_bound(object, "minimum", "exclusiveMinimum", true)?;
+    let requested_max = integer_bound(object, "maximum", "exclusiveMaximum", false)?;
+    let minimum = requested_min
+        .unwrap_or(-MAX_INTEGER_MAGNITUDE)
+        .max(-MAX_INTEGER_MAGNITUDE);
+    let maximum = requested_max
+        .unwrap_or(MAX_INTEGER_MAGNITUDE)
+        .min(MAX_INTEGER_MAGNITUDE);
+    if minimum > maximum {
+        return Ok(r#"[^\U00000000-\U0010FFFF]"#.to_string());
+    }
+
+    let mut alternatives = Vec::new();
+    if minimum < 0 {
+        let negative_max = maximum.min(-1);
+        let magnitude_low = negative_max.unsigned_abs();
+        let magnitude_high = minimum.unsigned_abs();
+        alternatives.push(format!(
+            r#""-" ( {} )"#,
+            nonnegative_integer_range(magnitude_low, magnitude_high)
+        ));
+    }
+    if maximum >= 0 {
+        alternatives.push(nonnegative_integer_range(
+            minimum.max(0) as u64,
+            maximum as u64,
+        ));
+    }
+    Ok(if alternatives.len() == 1 {
+        alternatives.remove(0)
+    } else {
+        format!("( {} )", alternatives.join(" | "))
+    })
+}
+
 fn join_array_items(items: &[String]) -> String {
     if items.is_empty() {
         return empty_expression();
@@ -1348,6 +1826,33 @@ fn normalize_schema_node(
     }
 
     let mut normalized = object.clone();
+    if !normalized.contains_key("type") {
+        let inferred = if normalized.contains_key("format")
+            || normalized.contains_key("pattern")
+            || normalized.contains_key("minLength")
+            || normalized.contains_key("maxLength")
+        {
+            Some("string")
+        } else if normalized.contains_key("properties")
+            || normalized.contains_key("required")
+            || normalized.contains_key("additionalProperties")
+            || normalized.contains_key("minProperties")
+            || normalized.contains_key("maxProperties")
+        {
+            Some("object")
+        } else if normalized.contains_key("items")
+            || normalized.contains_key("prefixItems")
+            || normalized.contains_key("minItems")
+            || normalized.contains_key("maxItems")
+        {
+            Some("array")
+        } else {
+            None
+        };
+        if let Some(kind) = inferred {
+            normalized.insert("type".into(), Value::String(kind.into()));
+        }
+    }
     normalized.remove("$defs");
     normalized.remove("definitions");
     if let Some(value) = normalized.remove("const") {
@@ -1462,12 +1967,17 @@ fn normalize_schema_node(
 
 fn keyword_applies_to_type(keyword: &str, kind: &str) -> bool {
     match keyword {
-        "pattern" | "minLength" | "maxLength" => kind == "string",
+        "pattern" | "format" | "minLength" | "maxLength" => kind == "string",
         "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" => {
             kind == "integer" || kind == "number"
         }
         "items" | "prefixItems" | "minItems" | "maxItems" => kind == "array",
-        "properties" | "required" | "additionalProperties" | "propertyNames" => kind == "object",
+        "properties"
+        | "required"
+        | "additionalProperties"
+        | "propertyNames"
+        | "minProperties"
+        | "maxProperties" => kind == "object",
         "enum" => true,
         "anyOf" | "oneOf" => true,
         _ => false,
@@ -1520,8 +2030,11 @@ fn validate_schema_node(schema: &Value, path: &str, depth: usize) -> Result<(), 
         "minItems",
         "maxItems",
         "pattern",
+        "format",
         "minLength",
         "maxLength",
+        "minProperties",
+        "maxProperties",
         "minimum",
         "maximum",
         "exclusiveMinimum",
@@ -1605,7 +2118,35 @@ fn validate_schema_node(schema: &Value, path: &str, depth: usize) -> Result<(), 
         }
     }
 
-    for keyword in ["minLength", "maxLength", "minItems", "maxItems"] {
+    if let Some(format) = object.get("format") {
+        let format = format
+            .as_str()
+            .ok_or_else(|| schema_error(&format!("{path}/format"), "format must be a string"))?;
+        if !is_supported_string_format(format) {
+            return Err(schema_error(
+                &format!("{path}/format"),
+                format!("unsupported string format {format:?}"),
+            ));
+        }
+        if object.contains_key("pattern")
+            || object.contains_key("minLength")
+            || object.contains_key("maxLength")
+        {
+            return Err(schema_error(
+                path,
+                "format combined with pattern/minLength/maxLength is not exactly representable",
+            ));
+        }
+    }
+
+    for keyword in [
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minProperties",
+        "maxProperties",
+    ] {
         if let Some(value) = object.get(keyword) {
             let bound = value.as_u64().ok_or_else(|| {
                 schema_error(
@@ -1626,17 +2167,13 @@ fn validate_schema_node(schema: &Value, path: &str, depth: usize) -> Result<(), 
         .iter()
         .any(|keyword| object.contains_key(*keyword));
     if has_numeric_bound {
-        let exact_min_zero = object.get("type").and_then(Value::as_str) == Some("integer")
-            && object.get("minimum").and_then(Value::as_i64) == Some(0)
-            && object.get("maximum").is_none()
-            && object.get("exclusiveMinimum").is_none()
-            && object.get("exclusiveMaximum").is_none();
-        if !exact_min_zero {
+        if object.get("type").and_then(Value::as_str) != Some("integer") {
             return Err(schema_error(
                 path,
-                "only the exact nonnegative-integer bound minimum: 0 is currently supported",
+                "numeric bounds are currently exact only for integer schemas",
             ));
         }
+        integer_range_gbnf(object)?;
     }
 
     if let Some(properties) = object.get("properties") {
@@ -3374,5 +3911,90 @@ mod tests {
         let mut too_many =
             runtime(r#"{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":2}"#);
         assert!(!too_many.accept_bytes(b"[1,2,3]"));
+    }
+
+    #[test]
+    fn integer_bounds_enforce_inclusive_and_exclusive_edges() {
+        let schema = r#"{"type":"integer","minimum":-12,"exclusiveMaximum":35}"#;
+        for accepted in ["-12", "-1", "0", "9", "34"] {
+            let mut candidate = runtime(schema);
+            assert!(candidate.accept_bytes(accepted.as_bytes()), "{accepted}");
+            assert!(candidate.is_accepted(), "{accepted}");
+        }
+        for rejected in ["-13", "35", "100", "01", "-0"] {
+            let mut candidate = runtime(schema);
+            assert!(
+                !candidate.accept_bytes(rejected.as_bytes()) || !candidate.is_accepted(),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_format_allowlist_compiles_and_enforces_mutants() {
+        let fixtures = [
+            ("email", "a.b@example.com", "missing-at.example.com"),
+            ("date", "2026-09-03", "2026-19-03"),
+            ("time", "23:59:60Z", "25:00:00Z"),
+            ("date-time", "2026-09-03T12:30:00Z", "2026-09-03 12:30:00Z"),
+            ("duration", "P3DT4H", "three days"),
+            ("ipv4", "192.168.1.1", "999.168.1.1"),
+            ("ipv6", "2001:db8::1", "not:ipv6"),
+            ("hostname", "api.example-2.com", "-bad.example"),
+            ("uuid", "550e8400-e29b-41d4-a716-446655440000", "550e8400"),
+            ("uri", "https://example.com/a?q=1", "relative/path"),
+            ("uri-reference", "../a?q=1", "contains space"),
+            ("uri-template", "/users/{id}", "/users/{"),
+            ("json-pointer", "/a~1b/0", "/bad~2escape"),
+            ("relative-json-pointer", "2/owner", "02/owner"),
+        ];
+        for (format, valid, invalid) in fixtures {
+            let schema = format!(r#"{{"type":"string","format":"{format}"}}"#);
+            let mut good = runtime(&schema);
+            let valid = serde_json::to_string(valid).unwrap();
+            assert!(good.accept_bytes(valid.as_bytes()), "{format}: {valid}");
+            assert!(good.is_accepted(), "{format}: {valid}");
+            let mut bad = runtime(&schema);
+            let invalid = serde_json::to_string(invalid).unwrap();
+            assert!(
+                !bad.accept_bytes(invalid.as_bytes()) || !bad.is_accepted(),
+                "{format}: {invalid}"
+            );
+        }
+        let error = schema_to_gbnf(&serde_json::json!({
+            "type":"string", "format":"unknown-format"
+        }))
+        .expect_err("unknown format must fail closed");
+        assert!(error.to_string().contains("/format"));
+    }
+
+    #[test]
+    fn property_count_bounds_apply_to_declared_and_extra_keys() {
+        let closed = r#"{
+            "type":"object",
+            "properties":{"a":{"type":"integer"},"b":{"type":"integer"},"c":{"type":"integer"}},
+            "required":["a"],"additionalProperties":false,
+            "minProperties":2,"maxProperties":2
+        }"#;
+        for accepted in [r#"{"a":1,"b":2}"#, r#"{"c":3,"a":1}"#] {
+            let mut candidate = runtime(closed);
+            assert!(candidate.accept_bytes(accepted.as_bytes()), "{accepted}");
+            assert!(candidate.is_accepted(), "{accepted}");
+        }
+        for rejected in [r#"{"a":1}"#, r#"{"a":1,"b":2,"c":3}"#] {
+            let mut candidate = runtime(closed);
+            assert!(!candidate.accept_bytes(rejected.as_bytes()) || !candidate.is_accepted());
+        }
+
+        let open = r#"{"type":"object","minProperties":1,"maxProperties":2}"#;
+        for accepted in [r#"{"x":1}"#, r#"{"x":1,"y":2}"#] {
+            let mut candidate = runtime(open);
+            assert!(candidate.accept_bytes(accepted.as_bytes()), "{accepted}");
+            assert!(candidate.is_accepted(), "{accepted}");
+        }
+        for rejected in ["{}", r#"{"x":1,"y":2,"z":3}"#] {
+            let mut candidate = runtime(open);
+            assert!(!candidate.accept_bytes(rejected.as_bytes()) || !candidate.is_accepted());
+        }
     }
 }

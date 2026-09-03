@@ -183,6 +183,7 @@ impl ModelRegistration {
                 .map_err(|error| error.to_string())?;
         let mut grammars = Vec::with_capacity(variants.len());
         for variant in variants {
+            validate_native_tool_schema_compat(&variant, "")?;
             let grammar = match self.family {
                 "gemma4" => gemma4_tool_call_gbnf(fn_name, &variant, shape)
                     .map_err(|error| error.to_string())?,
@@ -260,6 +261,44 @@ impl ModelRegistration {
             _ => "",
         }
     }
+}
+
+fn validate_native_tool_schema_compat(
+    schema: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    let Some(object) = schema.as_object() else {
+        return Ok(());
+    };
+    for keyword in ["minProperties", "maxProperties", "prefixItems"] {
+        if object.contains_key(keyword) {
+            return Err(format!(
+                "native tool wire cannot enforce JSON Schema assertion at {}/{}; use a response structured-output constraint or remove the assertion",
+                if path.is_empty() { "" } else { path },
+                keyword
+            ));
+        }
+    }
+    for container in ["properties", "$defs", "definitions"] {
+        if let Some(children) = object.get(container).and_then(serde_json::Value::as_object) {
+            for (name, child) in children {
+                validate_native_tool_schema_compat(child, &format!("{path}/{container}/{name}"))?;
+            }
+        }
+    }
+    for keyword in ["items", "additionalProperties"] {
+        if let Some(child) = object.get(keyword) {
+            validate_native_tool_schema_compat(child, &format!("{path}/{keyword}"))?;
+        }
+    }
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(children) = object.get(keyword).and_then(serde_json::Value::as_array) {
+            for (index, child) in children.iter().enumerate() {
+                validate_native_tool_schema_compat(child, &format!("{path}/{keyword}/{index}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Root-rule shape selector for `tool_call_gbnf`.
@@ -1882,10 +1921,10 @@ fn gemma4_value_gbnf(
             //
             // iter-231c: `pattern` replaces the generic char* body with the
             // compiled regex between the markers.
-            match compile_pattern(
+            match compile_string_assertion(
                 fn_name,
                 &format!("/{}", param_name),
-                obj.get("pattern"),
+                obj,
                 crate::serve::api::grammar::regex_gbnf::Surface::GemmaMarkerString,
             )? {
                 Some(body) => Ok(format!(
@@ -1905,10 +1944,10 @@ fn gemma4_value_gbnf(
                 },
             }
         }
-        "integer" if obj.get("minimum").and_then(serde_json::Value::as_i64) == Some(0) => {
-            Ok("([0] | [1-9] [0-9]{0,15})".to_string())
-        }
-        "integer" => Ok("gemma4-int-val".to_string()),
+        "integer" => Ok(
+            compile_integer_assertion(fn_name, &format!("/{}", param_name), obj)?
+                .unwrap_or_else(|| "gemma4-int-val".to_string()),
+        ),
         "number" => Ok("gemma4-num-val".to_string()),
         "boolean" => Ok("gemma4-bool-val".to_string()),
         "null" => Ok("gemma4-null-val".to_string()),
@@ -2097,10 +2136,10 @@ fn gemma4_nested_value_rule(
         Some(serde_json::Value::String(t)) => match t.as_str() {
             "string" => {
                 // iter-231c: `pattern` constrains the marker-string content.
-                match compile_pattern(
+                match compile_string_assertion(
                     fn_name,
                     path,
-                    obj.get("pattern"),
+                    obj,
                     crate::serve::api::grammar::regex_gbnf::Surface::GemmaMarkerString,
                 )? {
                     Some(body) => Ok(format!(
@@ -2120,10 +2159,8 @@ fn gemma4_nested_value_rule(
                     },
                 }
             }
-            "integer" if obj.get("minimum").and_then(serde_json::Value::as_i64) == Some(0) => {
-                Ok("([0] | [1-9] [0-9]{0,15})".to_string())
-            }
-            "integer" => Ok("gemma4-int-val".to_string()),
+            "integer" => Ok(compile_integer_assertion(fn_name, path, obj)?
+                .unwrap_or_else(|| "gemma4-int-val".to_string())),
             "number" => Ok("gemma4-num-val".to_string()),
             "boolean" => Ok("gemma4-bool-val".to_string()),
             "null" => Ok("gemma4-null-val".to_string()),
@@ -3073,10 +3110,10 @@ fn deepseek4_value_variants(
         return Ok(variants);
     }
     if object.get("type").and_then(serde_json::Value::as_str) == Some("string") {
-        let value = match compile_pattern(
+        let value = match compile_string_assertion(
             fn_name,
             path,
-            object.get("pattern"),
+            object,
             crate::serve::api::grammar::regex_gbnf::Surface::DeepSeekRawString,
         )? {
             Some(body) => body,
@@ -3443,10 +3480,10 @@ fn qwen35_value_rule(
     match schema_type {
         "string" => {
             // iter-231c: `pattern` constrains the RAW string text.
-            match compile_pattern(
+            match compile_string_assertion(
                 fn_name,
                 &format!("/{}", param_name),
-                obj.get("pattern"),
+                obj,
                 crate::serve::api::grammar::regex_gbnf::Surface::QwenRawString,
             )? {
                 Some(body) => Ok(body),
@@ -3454,10 +3491,10 @@ fn qwen35_value_rule(
                     .unwrap_or_else(|| "qwen35-str-val".to_string())),
             }
         }
-        "integer" if obj.get("minimum").and_then(serde_json::Value::as_i64) == Some(0) => {
-            Ok("([0] | [1-9] [0-9]{0,15})".to_string())
-        }
-        "integer" => Ok("qwen35-int-val".to_string()),
+        "integer" => Ok(
+            compile_integer_assertion(fn_name, &format!("/{}", param_name), obj)?
+                .unwrap_or_else(|| "qwen35-int-val".to_string()),
+        ),
         "number" => Ok("qwen35-num-val".to_string()),
         "boolean" => Ok("qwen35-bool-val".to_string()),
         "null" => Ok("qwen35-null-val".to_string()),
@@ -3507,6 +3544,44 @@ fn compile_pattern(
             feature: format!("pattern {:?}: {}", pat, e.0),
         }),
     }
+}
+
+fn compile_string_assertion(
+    fn_name: &str,
+    path: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+    surface: crate::serve::api::grammar::regex_gbnf::Surface,
+) -> Result<Option<String>, EmitterError> {
+    if let Some(format) = object.get("format").and_then(serde_json::Value::as_str) {
+        return crate::serve::api::grammar::json_schema::string_format_gbnf(format, surface)
+            .map(Some)
+            .map_err(|error| EmitterError::UnsupportedSchemaFeature {
+                fn_name: fn_name.to_string(),
+                param_path: path.to_string(),
+                feature: error.to_string(),
+            });
+    }
+    compile_pattern(fn_name, path, object.get("pattern"), surface)
+}
+
+fn compile_integer_assertion(
+    fn_name: &str,
+    path: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<String>, EmitterError> {
+    let has_bound = ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]
+        .iter()
+        .any(|keyword| object.contains_key(*keyword));
+    if !has_bound {
+        return Ok(None);
+    }
+    crate::serve::api::grammar::json_schema::integer_range_gbnf(object)
+        .map(Some)
+        .map_err(|error| EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: error.to_string(),
+        })
 }
 
 fn bounded_repeat(atom: &str, min: u64, max: Option<u64>) -> String {
@@ -3746,10 +3821,10 @@ fn qwen35_nested_value_rule(
         Some(serde_json::Value::String(t)) => match t.as_str() {
             "string" => {
                 // iter-231c: `pattern` constrains the JSON string content.
-                match compile_pattern(
+                match compile_string_assertion(
                     fn_name,
                     path,
-                    obj.get("pattern"),
+                    obj,
                     crate::serve::api::grammar::regex_gbnf::Surface::QwenJsonString,
                 )? {
                     Some(body) => Ok(format!(
@@ -3769,10 +3844,8 @@ fn qwen35_nested_value_rule(
                     },
                 }
             }
-            "integer" if obj.get("minimum").and_then(serde_json::Value::as_i64) == Some(0) => {
-                Ok("([0] | [1-9] [0-9]{0,15})".to_string())
-            }
-            "integer" => Ok("qwen35-int-val".to_string()),
+            "integer" => Ok(compile_integer_assertion(fn_name, path, obj)?
+                .unwrap_or_else(|| "qwen35-int-val".to_string())),
             "number" => Ok("qwen35-num-val".to_string()),
             "boolean" => Ok("qwen35-bool-val".to_string()),
             "null" => Ok("qwen35-null-val".to_string()),
@@ -5157,6 +5230,47 @@ mod tests {
                 include_str!("../../../tests/fixtures/structured_output/r2c/stage9_cwe.invalid_abstention.json"),
             ],
         );
+    }
+
+    #[test]
+    fn standard_format_and_integer_bounds_are_enforced_across_all_generative_families() {
+        assert_r2c_fixture_across_families(
+            "bounded_event",
+            r#"{
+                "type":"object",
+                "properties":{
+                    "date":{"type":"string","format":"date"},
+                    "count":{"type":"integer","minimum":-2,"exclusiveMaximum":3}
+                },
+                "required":["date","count"],
+                "additionalProperties":false
+            }"#,
+            &[r#"{"date":"2026-09-03","count":2}"#],
+            &[
+                r#"{"date":"2026-19-03","count":2}"#,
+                r#"{"date":"2026-09-03","count":3}"#,
+                r#"{"date":"2026-09-03","count":-3}"#,
+            ],
+        );
+    }
+
+    #[test]
+    fn native_tool_wires_reject_property_count_and_tuple_assertions_instead_of_widening() {
+        for registration in [&GEMMA4, &QWEN35, &DEEPSEEK4] {
+            for schema in [
+                serde_json::json!({"type":"object","minProperties":1}),
+                serde_json::json!({"type":"array","prefixItems":[{"type":"string"}]}),
+            ] {
+                let error = registration
+                    .tool_call_gbnf("f", &schema, GrammarShape::SingleBody)
+                    .expect_err("unsupported native-wire assertion must fail closed");
+                assert!(
+                    error.contains("cannot enforce JSON Schema assertion"),
+                    "{}: {error}",
+                    registration.family
+                );
+            }
+        }
     }
 
     #[test]
@@ -7498,14 +7612,14 @@ mod tests {
             b" ".to_vec(),            // 4: whitespace           — masked
             b"\n".to_vec(),           // 5: newline              — masked
             b"call:".to_vec(),        // 6: body-prefix          — masked
-            b"".to_vec(),             // 7: empty / EOS          — exempt by design
+            b"".to_vec(),             // 7: empty / EOS — illegal before acceptance
         ];
         let mut logits = vec![0.0_f32; token_bytes.len()];
         let masked = mask::mask_invalid_tokens(&rt, &token_bytes, &mut logits);
 
-        // Marker-prefix tokens (0, 1) survive; empty token (7) is exempt;
-        // everything else (2..=6) is masked to -inf.  That's 5 masked tokens.
-        assert_eq!(masked, 5, "expected 5 masked tokens, logits = {:?}", logits);
+        // Marker-prefix tokens (0, 1) survive. Everything else, including an
+        // empty/EOS piece before the grammar accepts, is masked.
+        assert_eq!(masked, 6, "expected 6 masked tokens, logits = {:?}", logits);
         assert!(
             logits[0].is_finite(),
             "token 0 (`<`) must survive — prefixes open marker"
@@ -7523,8 +7637,8 @@ mod tests {
             "token 6 (`call:`) must be masked — body bytes only legal AFTER open marker"
         );
         assert!(
-            logits[7].is_finite(),
-            "token 7 (empty bytes) is exempt from mask per mask.rs:77-80 (EOS contract)"
+            !logits[7].is_finite(),
+            "token 7 (empty bytes) must not bypass an unaccepted eager grammar"
         );
     }
 

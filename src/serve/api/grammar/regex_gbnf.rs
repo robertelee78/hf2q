@@ -511,11 +511,11 @@ impl<'a> Parser<'a> {
 /// GBNF literal for a single char — `"c"` with `"` and `\` escaped.
 fn gbnf_literal_char(c: char) -> String {
     match c {
-        '"' => r#"\""#.to_string(),
-        '\\' => r#"\\"#.to_string(),
-        '\n' => r#"\n"#.to_string(),
-        '\r' => r#"\r"#.to_string(),
-        '\t' => r#"\t"#.to_string(),
+        '"' => r#""\"""#.to_string(),
+        '\\' => r#""\\""#.to_string(),
+        '\n' => r#""\n""#.to_string(),
+        '\r' => r#""\r""#.to_string(),
+        '\t' => r#""\t""#.to_string(),
         other => format!("\"{}\"", other),
     }
 }
