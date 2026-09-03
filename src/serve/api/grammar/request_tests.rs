@@ -502,3 +502,34 @@ fn native_required_tool_choice_rejects_external_lazy_modifiers() {
     let error = compile_request_output_constraint(&request, &choice).unwrap_err();
     assert_eq!(error.param, "grammar_lazy");
 }
+
+#[test]
+fn model_independent_preflight_defers_only_tokenizer_bound_terminals() {
+    let request = request_with(serde_json::json!({
+        "grammar":"root ::= <tool_call>",
+    }));
+    let choice = validate_tool_request(&request).unwrap();
+    validate_request_output_constraint_before_model(&request, &choice)
+        .expect("textual token resolution must wait for the selected model");
+
+    let structural = request_with(serde_json::json!({
+        "response_format": {
+            "type":"structural_tag",
+            "format":{"type":"token","token":"<tool_call>"}
+        }
+    }));
+    let choice = validate_tool_request(&structural).unwrap();
+    validate_request_output_constraint_before_model(&structural, &choice)
+        .expect("structural token resolution must wait for the selected model");
+
+    let malformed = request_with(serde_json::json!({
+        "response_format": {
+            "type":"json_schema",
+            "json_schema":{"name":"bad","schema":{"type":"not_a_real_type"}}
+        }
+    }));
+    let choice = validate_tool_request(&malformed).unwrap();
+    let error = validate_request_output_constraint_before_model(&malformed, &choice).unwrap_err();
+    assert_eq!(error.param, "response_format");
+    assert!(error.message.contains("JSON Schema compilation failed"));
+}

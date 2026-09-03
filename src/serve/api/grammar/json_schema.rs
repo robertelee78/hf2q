@@ -36,13 +36,60 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
-use super::regex_gbnf::{Surface, regex_to_gbnf_body, regex_to_gbnf_full_match};
+use super::regex_gbnf::{regex_to_gbnf_body, regex_to_gbnf_full_match, Surface};
 
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_LOCAL_REFS: usize = 1024;
 const MAX_ENUM_VALUES: usize = 1024;
 const MAX_LITERAL_BYTES: usize = 1024 * 1024;
 const MAX_INTEGER_MAGNITUDE: i64 = 9_999_999_999_999_999;
+const SUPPORTED_SCHEMA_KEYWORDS: &[&str] = &[
+    "$schema",
+    "$id",
+    "$anchor",
+    "$comment",
+    "$defs",
+    "definitions",
+    "$ref",
+    "title",
+    "description",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "type",
+    "const",
+    "enum",
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "if",
+    "then",
+    "else",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "prefixItems",
+    "minItems",
+    "maxItems",
+    "pattern",
+    "format",
+    "minLength",
+    "maxLength",
+    "minProperties",
+    "maxProperties",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "propertyNames",
+];
+
+fn is_supported_schema_keyword(keyword: &str) -> bool {
+    SUPPORTED_SCHEMA_KEYWORDS.contains(&keyword)
+}
 
 /// Return the XGrammar/llama.cpp-compatible lexical pattern for a supported
 /// JSON Schema string format. These are generator constraints: they validate
@@ -2492,51 +2539,8 @@ fn validate_schema_node(schema: &Value, path: &str, depth: usize) -> Result<(), 
         .as_object()
         .ok_or_else(|| schema_error(path, "schema must be an object or boolean"))?;
 
-    const ALLOWED: &[&str] = &[
-        "$schema",
-        "$id",
-        "$anchor",
-        "$comment",
-        "$defs",
-        "definitions",
-        "$ref",
-        "title",
-        "description",
-        "default",
-        "examples",
-        "deprecated",
-        "readOnly",
-        "writeOnly",
-        "type",
-        "const",
-        "enum",
-        "anyOf",
-        "oneOf",
-        "allOf",
-        "if",
-        "then",
-        "else",
-        "properties",
-        "required",
-        "additionalProperties",
-        "items",
-        "prefixItems",
-        "minItems",
-        "maxItems",
-        "pattern",
-        "format",
-        "minLength",
-        "maxLength",
-        "minProperties",
-        "maxProperties",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "propertyNames",
-    ];
     for keyword in object.keys() {
-        if !ALLOWED.contains(&keyword.as_str()) {
+        if !is_supported_schema_keyword(keyword) {
             return Err(schema_error(
                 &format!("{path}/{keyword}"),
                 "unsupported JSON Schema assertion",
@@ -4654,6 +4658,16 @@ mod tests {
             let schema = serde_json::json!({"type":"array", keyword: true});
             let error = schema_to_gbnf(&schema).expect_err(keyword);
             assert!(error.to_string().contains(keyword), "{error}");
+        }
+    }
+
+    #[test]
+    fn supported_schema_keyword_policy_is_module_scoped_and_closed() {
+        for keyword in ["type", "$ref", "properties", "pattern", "maxProperties"] {
+            assert!(is_supported_schema_keyword(keyword), "{keyword}");
+        }
+        for keyword in ["multipleOf", "uniqueItems", "contains", "not"] {
+            assert!(!is_supported_schema_keyword(keyword), "{keyword}");
         }
     }
 

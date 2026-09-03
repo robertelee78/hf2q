@@ -101,6 +101,15 @@ Stage 9. The supported twelve-key reverse-order boundary peaks at 32,768 active
 stacks. The limits below are therefore reformulated with bounded headroom above
 those measurements; public wire input remains capped independently.
 
+The first complete locked-suite spike then falsified one request-ordering
+hypothesis: compiling every public constraint only after model resolution let
+an unresolvable model mask malformed schemas and conflicting structured-output
+surfaces as `model_not_loaded`. The reformulated boundary performs
+model-independent structured validation before model lookup and returns the
+field-qualified HTTP 400 there. Only textual token-terminal resolution is
+deferred to the selected model's authoritative tokenizer; it is still proved
+before decoding begins.
+
 ## Decision
 
 ### 1. Supported request surfaces
@@ -130,6 +139,9 @@ It MUST also accept the current compatibility surfaces:
 Exactly one user-output constraint MUST be active after normalization.
 Malformed, empty, conflicting, or unknown structured-output constraints MUST
 return HTTP 400 and MUST NOT become unconstrained generation.
+Model-independent failures MUST be reported before model resolution so they
+retain the exact offending request parameter. Vocabulary-dependent token
+strings MUST instead be bound after model resolution and before decode.
 
 Existing hf2q tool grammar has precedence when tool choice requires a native
 tool-call wire format. That precedence MUST be resolved before compiling an
@@ -340,6 +352,39 @@ The focused grammar suite and
 `cargo check --locked --all-targets --all-features` are the proof boundary for
 this lane. Request normalization, handler wiring, full-suite validation, and
 real-model gates remain completion-gate work rather than inferred success.
+
+## Current proof ledger
+
+The implementation worktree has passed the model-free and build gates:
+
+- the focused grammar suite passed 262 tests with one explicitly
+  hardware/tokenizer-gated diagnostic ignored;
+- the family registry suite passed 138 tests with two exact-tokenizer
+  diagnostics ignored;
+- the request-router suite passed 51 tests, including pre-model error
+  attribution for malformed and conflicting structured-output requests;
+- `cargo check --locked --all-targets --all-features`,
+  `cargo test --locked`, and `cargo build --release --locked` passed;
+- the nightly branch-instrumented full binary suite passed 5,020 tests with 55
+  explicitly gated tests ignored. LLVM then crashed while merging the
+  repository-wide raw profile set, after test completion; the valid focused
+  profile remains the coverage authority.
+
+The focused LLVM profile measures grammar code at 83.03% lines, 80.33%
+functions, 85.67% regions/statements, and 66.60% branches. Agentic-QE consumes
+those real values and reports 78.91% when averaging its four dimensions, below
+its default 80% advisory threshold. Its separate quality command also fails
+closed because it has no measured Cargo `testsPassing` evidence adapter. These
+tool verdicts MUST NOT be relabeled as green and do not replace the locked Rust
+gates above.
+
+The realistic all-family gate is not yet runnable safely. The shared host has
+an active hf2q 0.1.20 DeepSeek4 server on port 8081 under the release driver's
+authority, and no Qwen3-VL text GGUF is present in the approved model roots.
+The grammar branch MUST NOT stop that server, substitute another family's
+artifact, or merge until coordination supplies a safe window and an
+authoritative Qwen3-VL artifact. Gemma, Qwen, and DeepSeek4 artifacts are
+present but remain unloaded by this work.
 
 ## Completion gates
 

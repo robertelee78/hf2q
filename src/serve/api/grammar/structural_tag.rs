@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
-use super::{Grammar, json_schema, parser, regex_gbnf, serialize};
+use super::{json_schema, parser, regex_gbnf, serialize, Grammar};
 
 const MAX_CHAR_BOUND: u64 = 2_000;
 const MAX_DISPATCH_STATES: usize = 4_096;
@@ -520,7 +520,11 @@ impl<'a> Lowerer<'a> {
         let required = optional_bool(map, "at_least_one", false, "tags_with_separator")?;
         let stop = optional_bool(map, "stop_after_first", false, "tags_with_separator")?;
         let body = if stop {
-            if required { tags } else { format!("{tags}?") }
+            if required {
+                tags
+            } else {
+                format!("{tags}?")
+            }
         } else if required {
             format!("{tags} ({separator} {tags})*")
         } else {
@@ -1581,14 +1585,12 @@ mod tests {
             lower_to_gbnf(&value),
             Err(StructuralTagError::NeedsTokenVocabulary(_))
         ));
-        assert!(
-            lower_to_gbnf_with_token_resolver(&value, |token| {
-                assert_eq!(token, "<open>");
-                Ok(42)
-            })
-            .unwrap()
-            .contains("<[42]>")
-        );
+        assert!(lower_to_gbnf_with_token_resolver(&value, |token| {
+            assert_eq!(token, "<open>");
+            Ok(42)
+        })
+        .unwrap()
+        .contains("<[42]>"));
     }
 
     #[test]

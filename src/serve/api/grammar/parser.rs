@@ -119,6 +119,16 @@ impl std::fmt::Display for ParseError {
 }
 impl std::error::Error for ParseError {}
 
+impl ParseError {
+    /// Whether parsing stopped only because a textual token terminal must be
+    /// resolved against the selected model's tokenizer. Callers may defer
+    /// this one condition until model resolution; every other parse error is
+    /// request-local and must fail immediately.
+    pub(crate) fn requires_tokenizer(&self) -> bool {
+        self.message == "textual token terminal requires a tokenizer resolver"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Max repetition threshold. Prevents grammars like `a{999999}` from
 // exploding.
@@ -1628,17 +1638,13 @@ mod tests {
             too_many_rules.push_str(&format!("r{index} ::= \"x\"\n"));
         }
         let error = parse_generated(&too_many_rules).expect_err("rule limit + 1");
-        assert!(error
-            .message
-            .contains("262144-rule resource limit"));
+        assert!(error.message.contains("262144-rule resource limit"));
 
         let mut too_many_elements = String::from("root ::= \"");
         // The closing End element makes this exactly one over the limit.
         too_many_elements.push_str(&"a".repeat(MAX_GRAMMAR_ELEMENTS));
         too_many_elements.push_str("\"\n");
         let error = parse_generated(&too_many_elements).expect_err("expanded element limit + 1");
-        assert!(error
-            .message
-            .contains("4194304-element resource limit"));
+        assert!(error.message.contains("4194304-element resource limit"));
     }
 }

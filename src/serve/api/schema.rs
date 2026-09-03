@@ -454,7 +454,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        use axum::http::{HeaderValue, header};
+        use axum::http::{header, HeaderValue};
 
         let status = self.status;
         let retry_after = self.retry_after_seconds;
@@ -688,7 +688,11 @@ impl MessageContent {
     /// `Some(text)` if non-empty, else `None`.
     pub fn as_text_opt(&self) -> Option<String> {
         let text = self.text();
-        if text.is_empty() { None } else { Some(text) }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 }
 
@@ -1728,12 +1732,10 @@ mod tests {
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(json["error"]["code"], "grammar_error");
         assert_eq!(json["error"]["param"], "response_format");
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("unclosed brace at pos 42")
-        );
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unclosed brace at pos 42"));
     }
 
     #[test]
@@ -1741,12 +1743,10 @@ mod tests {
         let err = ApiError::generation_error("Metal command buffer error");
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["error"]["code"], "generation_error");
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("Metal command buffer error")
-        );
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Metal command buffer error"));
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 

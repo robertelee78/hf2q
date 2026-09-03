@@ -4,12 +4,10 @@
 
 use serde_json::Value;
 
-use super::{
-    json_schema, lark, parser, regex_gbnf, structural_tag, Grammar, LazyGrammarConfig,
-};
+use super::{json_schema, lark, parser, regex_gbnf, structural_tag, Grammar, LazyGrammarConfig};
 use crate::serve::api::schema::{
-    ChatCompletionRequest, LlamaGrammarTriggerType, ResponseFormat, StructuredOutputJson,
-    StructuredOutputs, ToolChoiceValue, StopSequence,
+    ChatCompletionRequest, LlamaGrammarTriggerType, ResponseFormat, StopSequence,
+    StructuredOutputJson, StructuredOutputs, ToolChoiceValue,
 };
 
 #[path = "request_validation.rs"]
@@ -49,6 +47,7 @@ const MAX_CHOICE_LITERAL_BYTES: usize = 1024 * 1024;
 pub struct RequestGrammarError {
     pub param: String,
     pub message: String,
+    deferred_to_tokenizer: bool,
 }
 
 impl RequestGrammarError {
@@ -56,6 +55,15 @@ impl RequestGrammarError {
         Self {
             param: param.into(),
             message: message.into(),
+            deferred_to_tokenizer: false,
+        }
+    }
+
+    fn deferred_to_tokenizer(param: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            param: param.into(),
+            message: message.into(),
+            deferred_to_tokenizer: true,
         }
     }
 }
@@ -78,14 +86,19 @@ fn parse_gbnf_bound(
     param: &'static str,
     tokenizer: Option<&tokenizers::Tokenizer>,
 ) -> Result<Grammar, RequestGrammarError> {
-    tokenizer.map_or_else(
-        || parse_gbnf(source, param),
-        |tokenizer| {
-            parser::parse_with_tokenizer(source, tokenizer).map_err(|error| {
-                RequestGrammarError::new(param, format!("GBNF parse failed: {error}"))
-            })
-        },
-    )
+    match tokenizer {
+        Some(tokenizer) => parser::parse_with_tokenizer(source, tokenizer).map_err(|error| {
+            RequestGrammarError::new(param, format!("GBNF parse failed: {error}"))
+        }),
+        None => parser::parse(source).map_err(|error| {
+            let message = format!("GBNF parse failed: {error}");
+            if error.requires_tokenizer() {
+                RequestGrammarError::deferred_to_tokenizer(param, message)
+            } else {
+                RequestGrammarError::new(param, message)
+            }
+        }),
+    }
 }
 
 fn parse_vllm_grammar(
@@ -129,7 +142,12 @@ fn compile_structural_tag(
         }),
         None => structural_tag::compile(payload),
     }
-    .map_err(|error| RequestGrammarError::new(param, error.to_string()))?;
+    .map_err(|error| match error {
+        structural_tag::StructuralTagError::NeedsTokenVocabulary(_) if tokenizer.is_none() => {
+            RequestGrammarError::deferred_to_tokenizer(param, error.to_string())
+        }
+        _ => RequestGrammarError::new(param, error.to_string()),
+    })?;
     if let Some(tokenizer) = tokenizer {
         parser::validate_token_ids(&grammar, tokenizer).map_err(|error| {
             RequestGrammarError::new(param, format!("token binding failed: {error}"))
@@ -491,11 +509,7 @@ fn compile_structured_outputs_impl(
             format!("serialized structural tag is invalid JSON: {error}"),
         )
     })?;
-    compile_structural_tag(
-        &payload,
-        "structured_outputs.structural_tag",
-        tokenizer,
-    )
+    compile_structural_tag(&payload, "structured_outputs.structural_tag", tokenizer)
 }
 
 pub fn compile_structured_outputs(
@@ -815,6 +829,30 @@ pub fn compile_request_output_constraint(
         return Ok(None);
     }
     compile_request_constraint(request)
+}
+
+/// Validate model-independent structured-output semantics before resolving or
+/// loading a model. Textual token terminals are the sole deferred condition:
+/// their syntax and vocabulary membership are proved later by the
+/// tokenizer-bound compiler. This keeps malformed schemas, conflicting
+/// surfaces, and invalid lazy controls attributable to their request fields
+/// instead of letting model lookup mask them.
+pub fn validate_request_output_constraint_before_model(
+    request: &ChatCompletionRequest,
+    tool_choice: &ToolChoiceValue,
+) -> Result<(), RequestGrammarError> {
+    let result = if matches!(
+        tool_choice,
+        ToolChoiceValue::Required | ToolChoiceValue::Function(_)
+    ) {
+        compile_request_output_constraint(request, tool_choice).map(|_| ())
+    } else {
+        compile_request_constraint_impl(request, None).map(|_| ())
+    };
+    match result {
+        Err(error) if error.deferred_to_tokenizer => Ok(()),
+        other => other,
+    }
 }
 
 /// Tokenizer-bound counterpart of [`compile_request_output_constraint`].
@@ -1142,9 +1180,11 @@ mod tokenizer_tests {
         )
         .unwrap();
         let grammar = compiled.grammar.unwrap();
-        assert!(grammar.rules.iter().flatten().any(|element| {
-            element.ty == parser::GretType::Token && element.value == token_id
-        }));
+        assert!(grammar
+            .rules
+            .iter()
+            .flatten()
+            .any(|element| { element.ty == parser::GretType::Token && element.value == token_id }));
 
         let error = compile_request_constraint_with_tokenizer(
             &request(serde_json::json!({

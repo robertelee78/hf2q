@@ -1737,6 +1737,11 @@ where
             return Err(ApiError::invalid_request(error.message, Some(error.param)).into_response())
         }
     };
+    if let Err(error) =
+        grammar::request::validate_request_output_constraint_before_model(req, &tool_choice)
+    {
+        return Err(ApiError::grammar_error_for(error.param, error.message).into_response());
+    }
     // --- Pool-routed engine resolution (iter-209) ---
     // Pre-iter-209: rejected with 400 `model_not_loaded` whenever
     // `state.engine.is_none()`.  Iter-209 routes `req.model` through
