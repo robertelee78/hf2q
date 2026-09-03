@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.89+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | This checkout describes the hf2q 0.1.20 release line and resolves published, checksum-pinned `mlx-native 0.11.2`. Treat 0.1.20 as a release candidate until the `v0.1.20` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | This checkout describes the hf2q 0.1.21 release line and resolves published, checksum-pinned `mlx-native 0.11.2`. Treat 0.1.21 as a release candidate until the `v0.1.21` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -622,8 +622,10 @@ remain unsupported for DeepSeek and fail explicitly rather than selecting
 another family or runtime.
 
 Structured output is normalized once and enforced by the same request-local
-grammar runtime for Gemma, Qwen 3.5/3.6, Qwen3-VL text generation, and
-DeepSeek4. The chat endpoint accepts OpenAI `response_format` (`text`,
+grammar runtime for Gemma, Qwen 3.5/3.6/3.8, and DeepSeek4. The staged
+Qwen3-VL generation implementation consumes that runtime too, but its CLI and
+server entry points remain disabled under ADR-041 and are not part of the
+release surface. The chat endpoint accepts OpenAI `response_format` (`text`,
 `json_object`, and `json_schema`), peer `grammar`/`json_schema` and lazy
 grammar triggers, and vLLM `structured_outputs` choice, regex, JSON,
 `json_object`, grammar, and structural-tag modes. The peer's optional
@@ -633,6 +635,13 @@ and constraints that exceed their documented resource limits return HTTP 400;
 they never fall back to unconstrained decoding. A non-empty `stop` value is
 currently rejected when an output constraint is active because stripping the
 stop suffix could invalidate otherwise accepted output.
+
+Release qualification covers every enabled text-generation GGUF architecture
+(`gemma4`, `qwen35`, `qwen35moe`, and `deepseek4`) with an exact-artifact r2c
+conformance receipt. This guarantees the protocol surface and grammar
+enforcement for any successfully loaded supported checkpoint; model-specific
+answer quality remains a property of the checkpoint. hf2q does not link to or
+invoke r2c—the r2c schemas are revision-bound release test vectors.
 
 The structural-tag implementation covers the pinned XGrammar format-node
 vocabulary, including tokenizer-bound token terminals and the exact relaxed
@@ -771,12 +780,14 @@ resolving published `mlx-native 0.11.2`:
   inherit private history. Run it once per process; never co-reside the large
   family artifacts on a 128 GiB host.
 - `scripts/run_agentic_cache_release_gate.sh` is the model-qualification wrapper
-  used by the manual `Cache lifecycle` workflow. It consumes the exact signed
+  used by the protected `Cache lifecycle` job, both standalone and inside the
+  Release workflow. It consumes the exact signed
   standalone candidate, runs DeepSeek, Gemma, Qwen, and the Qwen3.8 short/long
   decode discriminator sequentially under continuous AC and
   `caffeinate` guards, verifies each GGUF against a protected SHA-256, and
-  emits a source/crate/binary/model-bound qualification manifest. Publication
-  does not consume that manifest. Its calibrated four-slot Gemma waves run
+  emits a source/crate/binary/model-bound qualification manifest. The protected
+  release workflow consumes and independently verifies that manifest before
+  publication. Its calibrated four-slot Gemma waves run
   before the long overlap/lifecycle soak, retain the default latency limits,
   and bind continuous Nominal thermal telemetry across every cold, cached,
   automatic-tool, and tool-result turn.
@@ -786,7 +797,7 @@ are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.20 serving release
+#### Test the 0.1.21 serving release
 
 Build and verify the exact checkout before loading a model:
 

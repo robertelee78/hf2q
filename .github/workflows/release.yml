@@ -30,14 +30,24 @@ jobs:
       version: ${{ inputs.version }}
     secrets: inherit
 
-  publish:
+  cache-lifecycle:
     needs: standalone-candidate
+    uses: ./.github/workflows/cache-lifecycle.yml
+    with:
+      commit_sha: ${{ inputs.commit_sha }}
+      version: ${{ inputs.version }}
+      standalone_candidate_run_id: ${{ github.run_id }}
+    secrets: inherit
+
+  publish:
+    needs: [standalone-candidate, cache-lifecycle]
     runs-on: macos-latest
     timeout-minutes: 90
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
       EXPECTED_VERSION: ${{ inputs.version }}
       EXPECTED_STANDALONE_CANDIDATE_RUN_ID: ${{ github.run_id }}
+      EXPECTED_CACHE_LIFECYCLE_RUN_ID: ${{ github.run_id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -81,6 +91,29 @@ jobs:
             "$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" \
             "$EXPECTED_SHA" "$EXPECTED_VERSION" \
             "$proof_root" "$GITHUB_ENV" Release
+
+      - name: Require exact signed-binary model and grammar qualification
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          qualification_root="$RUNNER_TEMP/cache-lifecycle-proof"
+          scripts/verify_cache_lifecycle_candidate.sh \
+            "$EXPECTED_CACHE_LIFECYCLE_RUN_ID" \
+            "$EXPECTED_SHA" "$EXPECTED_VERSION" \
+            "$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" \
+            "$EXPECTED_CRATE_SHA256" "$STANDALONE_BINARY_SHA256" \
+            "$qualification_root"
+          evidence_env="$RUNNER_TEMP/qualification-evidence.env"
+          scripts/package_cache_lifecycle_evidence.sh \
+            "$qualification_root" "$EXPECTED_SHA" "$EXPECTED_VERSION" \
+            "$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" \
+            "$EXPECTED_CRATE_SHA256" "$STANDALONE_BINARY_SHA256" \
+            "$RUNNER_TEMP/public-qualification-evidence" >"$evidence_env"
+          while IFS= read -r assignment; do
+            printf '%s\n' "$assignment" >>"$GITHUB_ENV"
+          done <"$evidence_env"
 
       - name: Toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -139,11 +172,19 @@ jobs:
             bash -n scripts/verify_release_dependency_provenance.sh \
               scripts/test_release_dependency_provenance_contract.sh \
               scripts/verify_standalone_candidate.sh \
+              scripts/verify_cache_lifecycle_candidate.sh \
+              scripts/package_cache_lifecycle_evidence.sh \
+              scripts/test_cache_lifecycle_evidence_contract.sh \
+              scripts/extract_openai_sse_data.sh \
+              scripts/verify_r2c_structured_output_receipt.sh \
+              scripts/test_r2c_structured_output_receipt_contract.sh \
               scripts/sign_notarize_standalone_release.sh \
               scripts/test_standalone_release_signing_contract.sh \
               scripts/test_standalone_installer.sh \
               scripts/test_frictionless_binary.sh \
               scripts/test_frictionless_diagnostics_contract.sh
+            bash scripts/test_r2c_structured_output_receipt_contract.sh
+            bash scripts/test_cache_lifecycle_evidence_contract.sh
             bash scripts/test_frictionless_diagnostics_contract.sh
             bash scripts/test_release_dependency_provenance_contract.sh
             HF2Q_BIN="$package_root/target/debug/hf2q" \
@@ -325,6 +366,10 @@ jobs:
             "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json" \
             "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json" \
             "$STANDALONE_STAGE/install.sh" \
+            "$QUALIFICATION_ARCHIVE" \
+            "$QUALIFICATION_ARCHIVE_CHECKSUM" \
+            "$PUBLIC_RELEASE_PROOF" \
+            "$PUBLIC_RELEASE_PROOF_CHECKSUM" \
             "target/package/hf2q-${EXPECTED_VERSION}.crate" \
             "$RUNNER_TEMP/release-crate.sha256"; do
             ensure_exact_asset "$asset"
@@ -346,6 +391,10 @@ jobs:
             "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json" \
             "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json" \
             "$STANDALONE_STAGE/install.sh" \
+            "$QUALIFICATION_ARCHIVE" \
+            "$QUALIFICATION_ARCHIVE_CHECKSUM" \
+            "$PUBLIC_RELEASE_PROOF" \
+            "$PUBLIC_RELEASE_PROOF_CHECKSUM" \
             "target/package/hf2q-${EXPECTED_VERSION}.crate" \
             "$RUNNER_TEMP/release-crate.sha256"; do
             cmp -s "$asset" "$release_dir/$(basename "$asset")"
@@ -445,6 +494,10 @@ jobs:
             hf2q-aarch64-apple-darwin.notary-log.json \
             stable-aarch64-apple-darwin.json \
             install.sh \
+            "hf2q-${EXPECTED_VERSION}-qualification.tar.gz" \
+            "hf2q-${EXPECTED_VERSION}-qualification.tar.gz.sha256" \
+            "hf2q-${EXPECTED_VERSION}-release-proof.json" \
+            "hf2q-${EXPECTED_VERSION}-release-proof.json.sha256" \
             "hf2q-${EXPECTED_VERSION}.crate" \
             release-crate.sha256; do
             downloaded=0
@@ -465,6 +518,10 @@ jobs:
             "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json" \
             "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json" \
             "$STANDALONE_STAGE/install.sh" \
+            "$QUALIFICATION_ARCHIVE" \
+            "$QUALIFICATION_ARCHIVE_CHECKSUM" \
+            "$PUBLIC_RELEASE_PROOF" \
+            "$PUBLIC_RELEASE_PROOF_CHECKSUM" \
             "target/package/hf2q-${EXPECTED_VERSION}.crate" \
             "$RUNNER_TEMP/release-crate.sha256"; do
             cmp -s "$asset" "$release_dir/$(basename "$asset")"

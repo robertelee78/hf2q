@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.21] — 2026-09-03
+
+### Added
+
+- Add one fail-closed structured-output subsystem for every supported text
+  serving family, covering OpenAI response formats, peer-compatible GBNF and
+  JSON Schema inputs, and vLLM choice, regex, JSON, grammar, and structural-tag
+  modes. The generic JSON Schema profile includes the r2c ReviewLens Stage 6
+  and CWE Stage 9 contracts without adding an r2c runtime dependency.
+- Add exact signed-binary release receipts for every enabled text-generation
+  GGUF architecture (`gemma4`, `qwen35`, `qwen35moe`, and `deepseek4`). The
+  gate covers empty and nested Stage 6 branches, Stage 9
+  primary/related/null unary and SSE branches, and adversarial
+  `const`/`additionalProperties` enforcement, while binding each reference
+  artifact's actual architecture so same-branch substitutions fail closed.
+
+### Changed
+
+- Make the protected Release workflow run and independently verify the
+  cross-family model/grammar qualification manifest before publication, then
+  publish deterministic qualification evidence with the release assets.
+
+### Fixed
+
+- Make the OpenCode web-search stack install reliably across supported hosts,
+  including environments that require an explicit SearXNG build backend.
+
 ## [0.1.15] — 2026-08-24
 
 ### Added

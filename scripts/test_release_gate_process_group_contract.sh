@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -123,6 +124,37 @@ while IFS= read -r line; do
 done <<<"$decode_monitor"
 grep -F 'scripts/run_release_gate_process_group.sh env' "$model_workflow" >/dev/null
 grep -F 'scripts/run_agentic_cache_release_gate.sh' "$model_workflow" >/dev/null
+# One reference artifact for every enabled text-generation architecture must
+# run the r2c compatibility gate from the sealed binary before retirement.
+for family in deepseek gemma qwen qwen38; do
+  test "$(grep -Ec "^[[:space:]]*run_r2c_structured_outputs $family$" "$release_gate")" = 1
+done
+for contract in \
+  'verify_model deepseek "$DEEPSEEK_MODEL" "$DEEPSEEK_MODEL_SHA256" deepseek4' \
+  'verify_model gemma "$GEMMA_MODEL" "$GEMMA_MODEL_SHA256" gemma4' \
+  'verify_model qwen "$QWEN_MODEL" "$QWEN_MODEL_SHA256" qwen35moe' \
+  'verify_model qwen38 "$QWEN38_MODEL" "$QWEN38_MODEL_SHA256" qwen35'; do
+  grep -F "$contract" "$release_gate" >/dev/null
+done
+for architecture in deepseek4 gemma4 qwen35moe qwen35; do
+  grep -F "architecture == \"$architecture\"" \
+    "$script_dir/verify_cache_lifecycle_candidate.sh" >/dev/null
+done
+grep -F 'verify_r2c_structured_output_receipt.sh' "$release_gate" >/dev/null
+grep -F 'extract_openai_sse_data.sh' "$script_dir/test_r2c_structured_outputs.sh" >/dev/null
+grep -F 'extract_openai_sse_data.sh' "$script_dir/verify_r2c_structured_output_receipt.sh" >/dev/null
+# shellcheck disable=SC2016
+grep -F 'STANDALONE_CANDIDATE_RUN_ID="$EXPECTED_STANDALONE_CANDIDATE_RUN_ID"' \
+  "$model_workflow" >/dev/null
+grep -F 'workflow_call:' "$model_workflow" >/dev/null
+grep -F 'uses: ./.github/workflows/cache-lifecycle.yml' "$release_workflow" >/dev/null
+grep -F 'needs: [standalone-candidate, cache-lifecycle]' "$release_workflow" >/dev/null
+grep -F 'scripts/verify_cache_lifecycle_candidate.sh' "$release_workflow" >/dev/null
+grep -F 'scripts/package_cache_lifecycle_evidence.sh' "$release_workflow" >/dev/null
+for suffix in qualification.tar.gz qualification.tar.gz.sha256 \
+  release-proof.json release-proof.json.sha256; do
+  test "$(grep -Fc "hf2q-\${EXPECTED_VERSION}-$suffix" "$release_workflow")" -ge 1
+done
 # shellcheck disable=SC2016
 if grep -Fq '$d.cooperative_prefill.schema_version == 2' "$release_workflow"; then
   echo "publication still owns model-qualification process receipts" >&2

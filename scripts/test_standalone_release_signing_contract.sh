@@ -109,7 +109,8 @@ for forbidden_release_dependency in \
     fail "routine standalone release still depends on model qualification: $forbidden_release_dependency"
   fi
 done
-if grep -Fq 'standalone_candidate_run_id:' "$RELEASE_WORKFLOW"; then
+if sed -n '/^on:/,/^permissions:/p' "$RELEASE_WORKFLOW" | \
+  grep -Fq 'standalone_candidate_run_id:'; then
   fail "release still requires an operator to hand off a candidate run ID"
 fi
 grep -Fq 'uses: ./.github/workflows/standalone-candidate.yml' \
@@ -118,13 +119,20 @@ grep -Fq 'uses: ./.github/workflows/standalone-candidate.yml' \
 standalone_call=$(workflow_job "$RELEASE_WORKFLOW" standalone-candidate)
 grep -Fq 'secrets: inherit' <<<"$standalone_call" || \
   fail "release does not pass its secret context to the reusable candidate workflow"
-grep -Fq 'needs: standalone-candidate' "$RELEASE_WORKFLOW" || \
-  fail "publication does not wait for the candidate workflow"
+grep -Fq 'uses: ./.github/workflows/cache-lifecycle.yml' \
+  "$RELEASE_WORKFLOW" || \
+  fail "release workflow does not run exact signed-binary qualification"
+grep -Fq 'needs: [standalone-candidate, cache-lifecycle]' \
+  "$RELEASE_WORKFLOW" || \
+  fail "publication does not wait for candidate and model qualification"
 grep -Fq 'EXPECTED_STANDALONE_CANDIDATE_RUN_ID: ${{ github.run_id }}' \
   "$RELEASE_WORKFLOW" || \
   fail "release does not consume candidate artifacts from its own run"
 grep -Fq '"$proof_root" "$GITHUB_ENV" Release' "$RELEASE_WORKFLOW" || \
   fail "release candidate verifier is not pinned to the Release workflow"
+grep -Fq 'scripts/verify_cache_lifecycle_candidate.sh' \
+  "$RELEASE_WORKFLOW" || \
+  fail "release does not revalidate the current run qualification manifest"
 grep -Fq 'workflow_call:' "$STANDALONE_WORKFLOW" || \
   fail "standalone candidate workflow is not reusable by Release"
 if grep -Fq -- '--json conclusion,event,headSha,workflowName,url' \

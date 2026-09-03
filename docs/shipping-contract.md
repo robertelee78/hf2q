@@ -2,10 +2,10 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
-Release line described by this checkout: `v0.1.20`. Treat it as a release
+Release line described by this checkout: `v0.1.21`. Treat it as a release
 candidate until exact-artifact release proof establishes public availability.
 
-This document defines the public hf2q product surface for `v0.1.20`. It also defines
+This document defines the public hf2q product surface for `v0.1.21`. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
 and defines *what is supported*.
@@ -42,7 +42,7 @@ cache, or forward graph.
 
 ### Repository model operands and managed local artifacts
 
-hf2q `v0.1.20` accepts `owner/repository[:QUANT]` as the common
+hf2q `v0.1.21` accepts `owner/repository[:QUANT]` as the common
 model operand for `convert`, `serve`, and `chat`, as governed by ADR-051.
 `serve` and model-targeted `chat` prefer hf2q-bound local authority, then a
 unique compatible structural match among manually downloaded or canonical
@@ -182,6 +182,28 @@ descendant does not rerun it merely to publish the CLI:
 | Native lifetime/fatal recovery | Exact-artifact hardware waves keep command-buffer and CFString populations bounded and reject every timeout or ignored-submission signature. Packed model-free fail-stop and supervisor tests inject the fatal return/dead-worker state, prove no post-fatal submission, preserve `/health` as process liveness, and require `/readyz` plus new generation to fail closed. The hardware gate does not intentionally poison Metal. |
 
 The shared cross-family changes additionally require:
+
+Every enabled text-generation runtime architecture MUST have a protected
+reference artifact pass the r2c structured-output conformance gate through the
+ordinary OpenAI-compatible API using the exact signed binary selected for
+publication. The architecture matrix is exactly `gemma4`, `qwen35`,
+`qwen35moe`, and `deepseek4`; `qwen35` is exercised by the Qwen3.8 reference
+artifact and `qwen35moe` by the Qwen3.6 reference artifact. Dense and MoE
+checkpoints that share one GGUF architecture also share the post-logits grammar
+runtime; the gate MUST bind and verify each reference artifact's actual
+`general.architecture` so a same-branch substitution cannot falsely satisfy
+the matrix.
+
+The gate covers empty and nested ReviewLens Stage 6 branches, CWE Stage 9
+primary/related/null branches in unary and SSE form, and an adversarial
+`const`/`additionalProperties` constraint. Each receipt binds the source,
+crate, signed binary, model digest and architecture, requests, raw responses,
+and reconstructed stream bytes. The protected release workflow MUST consume
+the resulting cross-family manifest before publication. The revision-bound r2c
+schemas are conformance test vectors only; hf2q MUST NOT depend on r2c code or
+services at build time or runtime. This gate proves request compatibility and
+constraint enforcement; it does not promise equal semantic quality from every
+third-party checkpoint.
 
 The hardware binary is compiled only from the `.crate` unpacked into a fresh
 temporary directory outside the source checkout. That build uses a fresh,

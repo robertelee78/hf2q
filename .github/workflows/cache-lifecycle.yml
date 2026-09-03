@@ -1,6 +1,20 @@
 name: Cache lifecycle
 
 on:
+  workflow_call:
+    inputs:
+      commit_sha:
+        description: Exact main-branch commit and signed candidate to qualify
+        required: true
+        type: string
+      version:
+        description: Exact stable candidate version to qualify
+        required: true
+        type: string
+      standalone_candidate_run_id:
+        description: Successful exact-SHA candidate run, or the current Release run
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       commit_sha:
@@ -96,9 +110,13 @@ jobs:
           set -euo pipefail
           run_json=$(gh run view "$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" \
             --json conclusion,event,workflowName,url)
-          test "$(jq -r .workflowName <<<"$run_json")" = "Standalone candidate"
           test "$(jq -r .event <<<"$run_json")" = "workflow_dispatch"
-          test "$(jq -r .conclusion <<<"$run_json")" = "success"
+          if test "$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" = "$GITHUB_RUN_ID"; then
+            test "$(jq -r .workflowName <<<"$run_json")" = "Release"
+          else
+            test "$(jq -r .workflowName <<<"$run_json")" = "Standalone candidate"
+            test "$(jq -r .conclusion <<<"$run_json")" = "success"
+          fi
           input_root="$RUNNER_TEMP/cache-lifecycle-inputs"
           mkdir -m 0700 "$input_root"
           gh run download "$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" \
@@ -212,6 +230,8 @@ jobs:
           cd "$PACKAGE_ROOT"
           exec scripts/run_release_gate_process_group.sh env \
             EXPECTED_SHA="$EXPECTED_SHA" \
+            EXPECTED_VERSION="$EXPECTED_VERSION" \
+            STANDALONE_CANDIDATE_RUN_ID="$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" \
             CRATE_SHA256="$CRATE_SHA256" \
             DEPENDENCY_PROVENANCE_DIR="$DEPENDENCY_PROVENANCE_DIR" \
             HF2Q_BIN="$HF2Q_BIN" \

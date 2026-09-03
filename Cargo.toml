@@ -1,6 +1,6 @@
 [package]
 name = "hf2q"
-version = "0.1.20"
+version = "0.1.21"
 edition = "2021"
 rust-version = "1.89.0"
 build = "src/build_script.rs"
@@ -44,6 +44,7 @@ exclude = [
     "!tests/fixtures/deepseek_v4_encoding/**",
     "!tests/fixtures/ggml_quants/**",
     "!tests/fixtures/qwen38/**",
+    "!tests/fixtures/structured_output/r2c/**",
     # Reference paper PDF (TurboQuant arxiv 2504.19874).
     "docs/2306.14048.pdf",
     # Iter-log ADRs — internal investigation diaries, not user-facing
