@@ -1,8 +1,9 @@
 # ADR-052: Structured-output compatibility for every generative model
 
-**Status:** Accepted — implementation complete; merge pending
+**Status:** Implemented
 **Date:** 2026-09-03
 **Updated:** 2026-09-03
+**Implemented by:** PR #184, merge commit `719366328cfac4a7bb72c602802ccfd8b2de13c0`
 **Supersedes:** the closed grammar-subset plan in ADR-005 Decision #6
 **Related:** ADR-005, ADR-017, ADR-042, ADR-044, RFC 2119
 
