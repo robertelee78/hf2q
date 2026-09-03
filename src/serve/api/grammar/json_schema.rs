@@ -6,7 +6,8 @@
 //!   - Primitive types: `string`, `number`, `integer`, `boolean`, `null`.
 //!   - `object` with `properties` and `required`.
 //!   - `array` with `items`.
-//!   - `enum` (string values only at this iter).
+//!   - `const` and `enum` for every JSON value kind.
+//!   - Exact sibling intersection for finite values and composition.
 //!   - `type` as either a single string or an array of strings (unions).
 //!   - Type-agnostic schema (bare `{}`) → `value` primitive.
 //!
@@ -15,8 +16,9 @@
 //!
 //! `additionalProperties: false` IS enforced (iter 75): the grammar rejects
 //! any key not declared in `properties`. `additionalProperties: true` or
-//! unset (the default per JSON Schema spec) allows extra keys permissively.
-//! `additionalProperties: {schema}` is deferred (treated as permissive).
+//! unset (the default per JSON Schema spec) allows only undeclared extra keys
+//! through an exact exclusion trie. `additionalProperties: {schema}` applies
+//! that schema to those extra values.
 //!
 //! Object key order (iter 75): grammar accepts keys in ANY order for up to
 //! 12 required keys. For N_req > 12 the emitter
@@ -243,6 +245,238 @@ pub fn format_literal(literal: &str) -> String {
     out
 }
 
+#[derive(Default)]
+struct JsonKeyTrie {
+    terminal: bool,
+    children: BTreeMap<char, JsonKeyTrie>,
+}
+
+/// Match a JSON string whose decoded value is not one of `excluded`.
+///
+/// Declared object keys may otherwise be consumed by an open object's
+/// wildcard key rule, bypassing the declared value schema.  The trie works on
+/// decoded ASCII characters and accounts for both raw and `\u00XX` spellings
+/// (plus JSON's short escapes), so alternate JSON escaping cannot reopen that
+/// path. Non-ASCII declared names fail closed rather than being approximated.
+pub(crate) fn json_string_excluding_gbnf(
+    excluded: &[String],
+    char_rule: &str,
+    allow_escaped_slash: bool,
+    allow_raw_del: bool,
+) -> Result<String, String> {
+    let mut trie = JsonKeyTrie::default();
+    let mut total_characters = 0usize;
+    for name in excluded {
+        if !name.is_ascii() {
+            return Err(format!(
+                "declared property {name:?} is non-ASCII; exact wildcard key exclusion is unavailable"
+            ));
+        }
+        let characters = name.chars().count();
+        total_characters = total_characters.saturating_add(characters);
+        if characters > 256 || total_characters > 4096 {
+            return Err(
+                "declared property names exceed the exact wildcard exclusion budget (256 characters per key, 4096 total)"
+                    .to_string(),
+            );
+        }
+        let mut node = &mut trie;
+        for character in name.chars() {
+            node = node.children.entry(character).or_default();
+        }
+        node.terminal = true;
+    }
+    let body = json_key_trie_body(&trie, char_rule, allow_escaped_slash, allow_raw_del);
+    Ok(format!(r#""\"" {body} "\"""#))
+}
+
+fn json_key_trie_body(
+    node: &JsonKeyTrie,
+    char_rule: &str,
+    allow_slash: bool,
+    allow_raw_del: bool,
+) -> String {
+    let mut alternatives = Vec::new();
+    if !node.terminal {
+        alternatives.push(empty_expression());
+    }
+    for (character, child) in &node.children {
+        alternatives.push(format!(
+            "{} {}",
+            json_character_encoding(*character, allow_slash, allow_raw_del),
+            json_key_trie_body(child, char_rule, allow_slash, allow_raw_del)
+        ));
+    }
+    alternatives.push(format!(
+        "{} {char_rule}*",
+        json_character_except(node.children.keys().copied(), allow_slash, allow_raw_del,)
+    ));
+    format!("( {} )", alternatives.join(" | "))
+}
+
+fn json_character_encoding(character: char, allow_slash: bool, allow_raw_del: bool) -> String {
+    let mut alternatives = Vec::new();
+    if character >= ' '
+        && character != '"'
+        && character != '\\'
+        && (allow_raw_del || character != '\u{7f}')
+    {
+        alternatives.push(format_literal(&character.to_string()));
+    }
+    let short = match character {
+        '"' => Some("\\\""),
+        '\\' => Some("\\\\"),
+        '/' if allow_slash => Some("\\/"),
+        '\u{0008}' => Some("\\b"),
+        '\u{000c}' => Some("\\f"),
+        '\n' => Some("\\n"),
+        '\r' => Some("\\r"),
+        '\t' => Some("\\t"),
+        _ => None,
+    };
+    if let Some(short) = short {
+        alternatives.push(format_literal(short));
+    }
+    alternatives.push(json_unicode_escape(character as u8));
+    format!("( {} )", alternatives.join(" | "))
+}
+
+fn json_unicode_escape(byte: u8) -> String {
+    let digits = format!("{byte:04x}");
+    format!(
+        "{} {}",
+        format_literal("\\u"),
+        digits
+            .chars()
+            .map(hex_exact_symbol)
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+fn hex_exact_symbol(symbol: char) -> String {
+    if symbol.is_ascii_digit() {
+        format_literal(&symbol.to_string())
+    } else {
+        format!("[{}{}]", symbol, symbol.to_ascii_uppercase())
+    }
+}
+
+fn json_character_except(
+    excluded: impl Iterator<Item = char>,
+    allow_slash: bool,
+    allow_raw_del: bool,
+) -> String {
+    let excluded: HashSet<char> = excluded.collect();
+    let mut raw = if allow_raw_del {
+        String::from(r#"[^"\\\x00-\x1F"#)
+    } else {
+        String::from(r#"[^"\\\x7F\x00-\x1F"#)
+    };
+    for character in &excluded {
+        if *character >= ' '
+            && *character != '"'
+            && *character != '\\'
+            && (allow_raw_del || *character != '\u{7f}')
+        {
+            match character {
+                ']' | '-' => {
+                    raw.push('\\');
+                    raw.push(*character);
+                }
+                _ => raw.push(*character),
+            }
+        }
+    }
+    raw.push(']');
+
+    let mut alternatives = vec![raw];
+    let short_escapes = [
+        ('"', '"'),
+        ('\\', '\\'),
+        ('/', '/'),
+        ('b', '\u{0008}'),
+        ('f', '\u{000c}'),
+        ('n', '\n'),
+        ('r', '\r'),
+        ('t', '\t'),
+    ];
+    let mut short_class = String::new();
+    for (encoded, decoded) in short_escapes {
+        if (encoded != '/' || allow_slash) && !excluded.contains(&decoded) {
+            if encoded == '\\' {
+                short_class.push_str("\\\\");
+            } else {
+                short_class.push(encoded);
+            }
+        }
+    }
+    if !short_class.is_empty() {
+        alternatives.push(format!(r#"[\\] [{short_class}]"#));
+    }
+    let excluded_hex: Vec<[u8; 4]> = excluded
+        .iter()
+        .map(|character| {
+            let text = format!("{:04x}", *character as u8);
+            text.as_bytes().try_into().expect("four hex digits")
+        })
+        .collect();
+    alternatives.push(format!(
+        "{} {} {}",
+        r#"[\\]"#,
+        format_literal("u"),
+        hex4_except(&excluded_hex, 0)
+    ));
+    format!("( {} )", alternatives.join(" | "))
+}
+
+fn hex4_except(excluded: &[[u8; 4]], position: usize) -> String {
+    if excluded.is_empty() {
+        return format!("[0-9a-fA-F]{{{}}}", 4 - position);
+    }
+    let mut alternatives = Vec::new();
+    let mut child_symbols = excluded
+        .iter()
+        .map(|value| value[position])
+        .collect::<Vec<_>>();
+    child_symbols.sort_unstable();
+    child_symbols.dedup();
+    let allowed = b"0123456789abcdef"
+        .iter()
+        .copied()
+        .filter(|symbol| !child_symbols.contains(symbol))
+        .collect::<Vec<_>>();
+    if !allowed.is_empty() {
+        let mut class = String::from("[");
+        for symbol in allowed {
+            class.push(symbol as char);
+            if symbol.is_ascii_lowercase() {
+                class.push((symbol as char).to_ascii_uppercase());
+            }
+        }
+        class.push(']');
+        if position + 1 < 4 {
+            class.push_str(&format!(" [0-9a-fA-F]{{{}}}", 3 - position));
+        }
+        alternatives.push(class);
+    }
+    if position + 1 < 4 {
+        for symbol in child_symbols {
+            let descendants = excluded
+                .iter()
+                .copied()
+                .filter(|value| value[position] == symbol)
+                .collect::<Vec<_>>();
+            alternatives.push(format!(
+                "{} {}",
+                hex_exact_symbol(symbol as char),
+                hex4_except(&descendants, position + 1)
+            ));
+        }
+    }
+    format!("( {} )", alternatives.join(" | "))
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -443,13 +677,40 @@ impl Converter {
             return self.visit_ref(reference, path, depth);
         }
 
-        if let Some(value) = obj.get("const") {
+        if let Some(values) = finite_candidates(obj) {
+            let mut siblings = obj.clone();
+            siblings.remove("const");
+            siblings.remove("enum");
+            let sibling_schema = Value::Object(siblings);
+            let mut narrowed_values = Vec::new();
+            for value in values {
+                if instance_matches_schema(&value, &sibling_schema, &self.root_schema, depth + 1)? {
+                    narrowed_values.push(value);
+                }
+            }
+            let values = narrowed_values;
+            if values.is_empty() {
+                return Ok(self.uninhabited_rule(path));
+            }
             self.rules
                 .entry("space".to_string())
                 .or_insert_with(|| SPACE_RULE.to_string());
-            let text = serde_json::to_string(value)
-                .map_err(|error| schema_error(path, format!("cannot serialize const: {error}")))?;
-            return Ok(format!("{} space", format_literal(&text)));
+            let mut alternatives = Vec::with_capacity(values.len());
+            let mut literal_bytes = 0usize;
+            for value in values {
+                let text = serde_json::to_string(&value).map_err(|error| {
+                    schema_error(path, format!("cannot serialize finite value: {error}"))
+                })?;
+                literal_bytes = literal_bytes.saturating_add(text.len());
+                if literal_bytes > MAX_LITERAL_BYTES {
+                    return Err(schema_error(
+                        path,
+                        format!("literal bytes exceed {MAX_LITERAL_BYTES}"),
+                    ));
+                }
+                alternatives.push(format_literal(&text));
+            }
+            return Ok(format!("({}) space", alternatives.join(" | ")));
         }
 
         if let Some(Value::Array(branches)) = obj.get("allOf") {
@@ -461,10 +722,24 @@ impl Converter {
                 if branches.is_empty() {
                     return Ok(self.uninhabited_rule(&format!("{path}/{keyword}")));
                 }
+                let mut siblings = obj.clone();
+                siblings.remove(keyword);
+                let sibling_schema = Value::Object(siblings);
+                let narrowed = branches
+                    .iter()
+                    .enumerate()
+                    .map(|(index, branch)| {
+                        merge_schemas(
+                            &sibling_schema,
+                            branch,
+                            &format!("{path}/{keyword}/{index}"),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 if keyword == "oneOf" {
-                    for left in 0..branches.len() {
-                        for right in left + 1..branches.len() {
-                            if !schemas_provably_disjoint(&branches[left], &branches[right]) {
+                    for left in 0..narrowed.len() {
+                        for right in left + 1..narrowed.len() {
+                            if !schemas_provably_disjoint(&narrowed[left], &narrowed[right]) {
                                 return Err(schema_error(
                                     &format!("{path}/oneOf"),
                                     format!(
@@ -476,8 +751,8 @@ impl Converter {
                     }
                 }
                 let slug = path_slug(path);
-                let mut alternatives = Vec::with_capacity(branches.len());
-                for (index, branch) in branches.iter().enumerate() {
+                let mut alternatives = Vec::with_capacity(narrowed.len());
+                for (index, branch) in narrowed.iter().enumerate() {
                     let body =
                         self.visit(branch, &format!("{path}/{keyword}/{index}"), depth + 1)?;
                     let name = format!("{slug}-{keyword}-{index}");
@@ -486,40 +761,6 @@ impl Converter {
                 }
                 return Ok(alternatives.join(" | "));
             }
-        }
-
-        // enum: alternation of literal strings.
-        if let Some(Value::Array(values)) = obj.get("enum") {
-            if values.is_empty() {
-                return Ok(self.uninhabited_rule(path));
-            }
-            if values.len() > MAX_ENUM_VALUES {
-                return Err(schema_error(
-                    &format!("{path}/enum"),
-                    format!("{} values exceed {MAX_ENUM_VALUES}", values.len()),
-                ));
-            }
-            let mut alts: Vec<String> = Vec::with_capacity(values.len());
-            let mut literal_bytes = 0usize;
-            for v in values {
-                let text = serde_json::to_string(v).map_err(|error| {
-                    schema_error(path, format!("cannot serialize enum value: {error}"))
-                })?;
-                literal_bytes = literal_bytes.saturating_add(text.len());
-                if literal_bytes > MAX_LITERAL_BYTES {
-                    return Err(schema_error(
-                        &format!("{path}/enum"),
-                        format!("literal bytes exceed {MAX_LITERAL_BYTES}"),
-                    ));
-                }
-                alts.push(format_literal(&text));
-            }
-            // After an enum value we still emit `space` so trailing whitespace
-            // is accepted — matches the peer's convention.
-            self.rules
-                .entry("space".to_string())
-                .or_insert_with(|| SPACE_RULE.to_string());
-            return Ok(format!("({}) space", alts.join(" | ")));
         }
 
         // `type`: the dominant dispatch.
@@ -776,16 +1017,15 @@ impl Converter {
             })
             .unwrap_or_default();
 
-        // additionalProperties handling (iter 75):
-        //   - unset or true  → permissive: accept any extra keys (JSON Schema
-        //     default). The grammar allows unknown kv-pairs via a wildcard
-        //     `string ":" space value` rule in the optional chain.
+        // additionalProperties handling:
+        //   - unset or true  → accept undeclared extra keys (JSON Schema
+        //     default) through a wildcard whose key trie exactly excludes
+        //     every declared property name.
         //   - false          → closed: grammar rejects keys not in properties.
         //     Implemented by omitting the wildcard rule from the optional
         //     chain — only declared property keys can appear, so extra keys
         //     cause the grammar stack to die.
-        //   - {schema}       → deferred (module docstring). Treated as
-        //     permissive for now.
+        //   - {schema}       → apply that value grammar to undeclared keys.
         let additional_props = obj.get("additionalProperties");
         let additional_closed = matches!(additional_props, Some(Value::Bool(false)));
         let additional_value_rule = match additional_props {
@@ -877,7 +1117,13 @@ impl Converter {
             self.rules.insert(val_rule.clone(), vbody);
 
             // kv rule: literal key + ":" + space + value-rule.
-            let quoted_key = format_literal(&format!("\"{}\"", k));
+            let key_json = serde_json::to_string(k).map_err(|error| {
+                schema_error(
+                    &format!("{path}/properties/{k}"),
+                    format!("cannot serialize property name: {error}"),
+                )
+            })?;
+            let quoted_key = format_literal(&key_json);
             let kv_body = format!("{} \":\" space {}", quoted_key, val_rule);
             let kv_name = format!("{}-{}-kv", slug, sanitize_rule_name(k));
             self.rules.insert(kv_name.clone(), kv_body);
@@ -930,10 +1176,15 @@ impl Converter {
 
         // Build extra-kv wildcard rule (shared across all states if allowed).
         if !additional_closed {
+            let declared_keys = properties.keys().cloned().collect::<Vec<_>>();
+            let extra_key = json_string_excluding_gbnf(&declared_keys, "char", false, false)
+                .map_err(|message| schema_error(path, message))?;
+            let extra_key_name = format!("{}-extra-key", slug);
+            self.rules.insert(extra_key_name.clone(), extra_key);
             let extra_kv_name = format!("{}-extra-kv", slug);
             self.rules.entry(extra_kv_name).or_insert_with(|| {
                 format!(
-                    "string \":\" space {}",
+                    "{extra_key_name} \":\" space {}",
                     additional_value_rule.as_deref().unwrap_or("value")
                 )
             });
@@ -2094,6 +2345,64 @@ fn normalize_schema_node(
             }
         }
     }
+
+    if let Some(values) = finite_candidates(&normalized) {
+        let mut siblings = normalized.clone();
+        siblings.remove("const");
+        siblings.remove("enum");
+        let sibling_schema = Value::Object(siblings);
+        let mut narrowed_values = Vec::new();
+        for value in values {
+            if instance_matches_schema(&value, &sibling_schema, root, depth + 1)? {
+                narrowed_values.push(value);
+            }
+        }
+        let values = narrowed_values;
+        return if values.is_empty() {
+            Ok(Value::Bool(false))
+        } else {
+            Ok(serde_json::json!({"enum": values}))
+        };
+    }
+
+    for keyword in ["anyOf", "oneOf"] {
+        if normalized.contains_key(keyword) {
+            let branches = normalized
+                .remove(keyword)
+                .and_then(|value| value.as_array().cloned())
+                .expect("validated composition array");
+            let base = Value::Object(normalized);
+            let mut narrowed = Vec::with_capacity(branches.len());
+            for (index, branch) in branches.iter().enumerate() {
+                let merged = merge_schemas(&base, branch, &format!("{path}/{keyword}/{index}"))?;
+                narrowed.push(normalize_schema_node(
+                    &merged,
+                    root,
+                    &format!("{path}/{keyword}/{index}"),
+                    depth + 1,
+                    active,
+                    references,
+                )?);
+            }
+            if keyword == "oneOf" {
+                for left in 0..narrowed.len() {
+                    for right in left + 1..narrowed.len() {
+                        if !schemas_provably_disjoint(&narrowed[left], &narrowed[right]) {
+                            return Err(schema_error(
+                                &format!("{path}/oneOf"),
+                                format!(
+                                    "branches {left} and {right} are not provably disjoint; exact oneOf cannot be lowered"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            let mut union = serde_json::Map::new();
+            union.insert(keyword.to_string(), Value::Array(narrowed));
+            return Ok(Value::Object(union));
+        }
+    }
     Ok(Value::Object(normalized))
 }
 
@@ -2381,17 +2690,6 @@ fn validate_schema_node(schema: &Value, path: &str, depth: usize) -> Result<(), 
                 "additionalProperties must be a schema",
             ));
         }
-        if additional.is_object()
-            && object
-                .get("properties")
-                .and_then(Value::as_object)
-                .is_some_and(|properties| !properties.is_empty())
-        {
-            return Err(schema_error(
-                &format!("{path}/additionalProperties"),
-                "typed additional properties alongside declared properties require exact key exclusion",
-            ));
-        }
         validate_schema_node(
             additional,
             &format!("{path}/additionalProperties"),
@@ -2482,6 +2780,282 @@ fn finite_values(schema: &Value) -> Option<HashSet<String>> {
             .filter_map(|value| serde_json::to_string(value).ok())
             .collect()
     })
+}
+
+fn finite_candidates(object: &serde_json::Map<String, Value>) -> Option<Vec<Value>> {
+    let mut values = if let Some(value) = object.get("const") {
+        vec![value.clone()]
+    } else if let Some(Value::Array(values)) = object.get("enum") {
+        values.clone()
+    } else {
+        return None;
+    };
+    if let Some(Value::Array(enumeration)) = object.get("enum") {
+        values.retain(|candidate| enumeration.contains(candidate));
+    }
+    let mut seen = HashSet::new();
+    values.retain(|candidate| {
+        serde_json::to_string(candidate)
+            .ok()
+            .is_some_and(|encoded| seen.insert(encoded))
+    });
+    Some(values)
+}
+
+fn instance_matches_schema(
+    instance: &Value,
+    schema: &Value,
+    root: &Value,
+    depth: usize,
+) -> Result<bool, SchemaError> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(schema_error(
+            "/",
+            "finite-value validation exceeds schema depth",
+        ));
+    }
+    if let Some(allowed) = schema.as_bool() {
+        return Ok(allowed);
+    }
+    let object = schema
+        .as_object()
+        .ok_or_else(|| schema_error("/", "schema must be an object or boolean"))?;
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        let target = if reference == "#" {
+            root
+        } else {
+            root.pointer(reference.trim_start_matches('#'))
+                .ok_or_else(|| {
+                    schema_error("/$ref", format!("unresolved local reference {reference:?}"))
+                })?
+        };
+        return instance_matches_schema(instance, target, root, depth + 1);
+    }
+    if object.get("const").is_some_and(|value| value != instance) {
+        return Ok(false);
+    }
+    if object
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.contains(instance))
+    {
+        return Ok(false);
+    }
+    if let Some(branches) = object.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            if !instance_matches_schema(instance, branch, root, depth + 1)? {
+                return Ok(false);
+            }
+        }
+    }
+    if let Some(branches) = object.get("anyOf").and_then(Value::as_array) {
+        let mut matched = false;
+        for branch in branches {
+            matched |= instance_matches_schema(instance, branch, root, depth + 1)?;
+        }
+        if !matched {
+            return Ok(false);
+        }
+    }
+    if let Some(branches) = object.get("oneOf").and_then(Value::as_array) {
+        let mut matches = 0usize;
+        for branch in branches {
+            matches += usize::from(instance_matches_schema(instance, branch, root, depth + 1)?);
+        }
+        if matches != 1 {
+            return Ok(false);
+        }
+    }
+    if let Some(condition) = object.get("if") {
+        let condition_matches = instance_matches_schema(instance, condition, root, depth + 1)?;
+        let selected = if condition_matches {
+            object.get("then")
+        } else {
+            object.get("else")
+        };
+        if let Some(selected) = selected {
+            if !instance_matches_schema(instance, selected, root, depth + 1)? {
+                return Ok(false);
+            }
+        }
+    }
+
+    if let Some(kind) = object.get("type") {
+        let kinds: Vec<&str> = match kind {
+            Value::String(kind) => vec![kind],
+            Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        if !kinds
+            .iter()
+            .any(|kind| instance_matches_type(instance, kind))
+        {
+            return Ok(false);
+        }
+    }
+
+    if let Some(text) = instance.as_str() {
+        let length = text.chars().count() as u64;
+        if object
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| length < min)
+            || object
+                .get("maxLength")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| length > max)
+        {
+            return Ok(false);
+        }
+        if let Some(pattern) = object.get("pattern").and_then(Value::as_str) {
+            let expression = regex::Regex::new(pattern)
+                .map_err(|error| schema_error("/pattern", format!("invalid regex: {error}")))?;
+            if !expression.is_match(text) {
+                return Ok(false);
+            }
+        }
+        if let Some(format) = object.get("format").and_then(Value::as_str) {
+            let matches = match format {
+                "json-pointer" => is_json_pointer(text),
+                "relative-json-pointer" => is_relative_json_pointer(text),
+                _ => regex::Regex::new(
+                    string_format_pattern(format)
+                        .ok_or_else(|| schema_error("/format", "unsupported string format"))?,
+                )
+                .map_err(|error| schema_error("/format", format!("invalid format regex: {error}")))?
+                .is_match(text),
+            };
+            if !matches {
+                return Ok(false);
+            }
+        }
+    }
+
+    if let Some(number) = instance.as_f64() {
+        if object
+            .get("minimum")
+            .and_then(Value::as_f64)
+            .is_some_and(|min| number < min)
+            || object
+                .get("maximum")
+                .and_then(Value::as_f64)
+                .is_some_and(|max| number > max)
+            || object
+                .get("exclusiveMinimum")
+                .and_then(Value::as_f64)
+                .is_some_and(|min| number <= min)
+            || object
+                .get("exclusiveMaximum")
+                .and_then(Value::as_f64)
+                .is_some_and(|max| number >= max)
+        {
+            return Ok(false);
+        }
+    }
+
+    if let Some(values) = instance.as_array() {
+        if object
+            .get("minItems")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| values.len() < min as usize)
+            || object
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| values.len() > max as usize)
+        {
+            return Ok(false);
+        }
+        let prefix = object.get("prefixItems").and_then(Value::as_array);
+        for (index, value) in values.iter().enumerate() {
+            let item_schema = prefix
+                .and_then(|items| items.get(index))
+                .or_else(|| object.get("items"));
+            if let Some(item_schema) = item_schema {
+                if !instance_matches_schema(value, item_schema, root, depth + 1)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
+    if let Some(values) = instance.as_object() {
+        if object
+            .get("minProperties")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| values.len() < min as usize)
+            || object
+                .get("maxProperties")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| values.len() > max as usize)
+        {
+            return Ok(false);
+        }
+        if let Some(required) = object.get("required").and_then(Value::as_array) {
+            if required
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|name| !values.contains_key(name))
+            {
+                return Ok(false);
+            }
+        }
+        let properties = object.get("properties").and_then(Value::as_object);
+        for (name, value) in values {
+            if let Some(child) = properties.and_then(|properties| properties.get(name)) {
+                if !instance_matches_schema(value, child, root, depth + 1)? {
+                    return Ok(false);
+                }
+            } else if let Some(additional) = object.get("additionalProperties") {
+                if !instance_matches_schema(value, additional, root, depth + 1)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn instance_matches_type(instance: &Value, kind: &str) -> bool {
+    match kind {
+        "null" => instance.is_null(),
+        "boolean" => instance.is_boolean(),
+        "object" => instance.is_object(),
+        "array" => instance.is_array(),
+        "number" => instance.is_number(),
+        "integer" => instance
+            .as_f64()
+            .is_some_and(|number| number.is_finite() && number.fract() == 0.0),
+        "string" => instance.is_string(),
+        _ => false,
+    }
+}
+
+fn is_json_pointer(value: &str) -> bool {
+    value.is_empty()
+        || (value.starts_with('/')
+            && value
+                .split('/')
+                .skip(1)
+                .all(|part| !part.contains('~') || valid_pointer_escapes(part)))
+}
+
+fn valid_pointer_escapes(value: &str) -> bool {
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character == '~' && !matches!(chars.next(), Some('0' | '1')) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_relative_json_pointer(value: &str) -> bool {
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || (digits > 1 && value.starts_with('0')) {
+        return false;
+    }
+    let suffix = &value[digits..];
+    suffix == "#" || is_json_pointer(suffix)
 }
 
 fn types_overlap(left: &HashSet<String>, right: &HashSet<String>) -> bool {
@@ -2621,7 +3195,7 @@ fn merge_schemas(left: &Value, right: &Value, path: &str) -> Result<Value, Schem
                 }
                 merged.insert("properties".into(), Value::Object(properties));
             }
-            "minimum" | "exclusiveMinimum" | "minLength" | "minItems" => {
+            "minimum" | "exclusiveMinimum" | "minLength" | "minItems" | "minProperties" => {
                 let chosen = match merged.get(keyword) {
                     Some(existing) if number_as_f64(existing)? >= number_as_f64(value)? => {
                         existing.clone()
@@ -2630,7 +3204,7 @@ fn merge_schemas(left: &Value, right: &Value, path: &str) -> Result<Value, Schem
                 };
                 merged.insert(keyword.clone(), chosen);
             }
-            "maximum" | "exclusiveMaximum" | "maxLength" | "maxItems" => {
+            "maximum" | "exclusiveMaximum" | "maxLength" | "maxItems" | "maxProperties" => {
                 let chosen = match merged.get(keyword) {
                     Some(existing) if number_as_f64(existing)? <= number_as_f64(value)? => {
                         existing.clone()
@@ -4130,5 +4704,91 @@ mod tests {
             let mut candidate = runtime(open);
             assert!(!candidate.accept_bytes(rejected.as_bytes()) || !candidate.is_accepted());
         }
+    }
+
+    #[test]
+    fn composition_siblings_narrow_finite_values() {
+        let schema = r#"{
+            "type":"string",
+            "minLength":2,
+            "enum":["x","ok"],
+            "anyOf":[{"const":"x"},{"const":"ok"}]
+        }"#;
+        let mut good = runtime(schema);
+        assert!(good.accept_bytes(br#""ok""#) && good.is_accepted());
+
+        let mut short = runtime(schema);
+        assert!(
+            !short.accept_bytes(br#""x""#) || !short.is_accepted(),
+            "enum/anyOf early returns must not discard sibling minLength"
+        );
+
+        let one_of = r#"{
+            "type":"string",
+            "minLength":2,
+            "oneOf":[{"const":"x"},{"const":"ok"}]
+        }"#;
+        let mut one_of_good = runtime(one_of);
+        assert!(one_of_good.accept_bytes(br#""ok""#) && one_of_good.is_accepted());
+        let mut one_of_short = runtime(one_of);
+        assert!(!one_of_short.accept_bytes(br#""x""#) || !one_of_short.is_accepted());
+
+        let impossible_const = r#"{"type":"integer","const":"wrong-type"}"#;
+        let mut impossible = runtime(impossible_const);
+        assert!(!impossible.accept_bytes(br#""wrong-type""#) || !impossible.is_accepted());
+    }
+
+    #[test]
+    fn open_object_wildcard_cannot_rematch_a_declared_key() {
+        let schema = r#"{
+            "type":"object",
+            "properties":{"count":{"type":"integer"}}
+        }"#;
+        let mut declared = runtime(schema);
+        assert!(declared.accept_bytes(br#"{"count":1}"#) && declared.is_accepted());
+
+        let mut extra = runtime(schema);
+        assert!(extra.accept_bytes(br#"{"note":true}"#) && extra.is_accepted());
+
+        for mutant in [
+            br#"{"count":1.5}"#.as_slice(),
+            br#"{"\u0063ount":1.5}"#.as_slice(),
+        ] {
+            let mut runtime = runtime(schema);
+            assert!(
+                !runtime.accept_bytes(mutant) || !runtime.is_accepted(),
+                "open-object wildcard rematched a declared key: {}",
+                String::from_utf8_lossy(mutant)
+            );
+        }
+    }
+
+    #[test]
+    fn typed_additional_properties_are_enforced_beside_declared_keys() {
+        let schema = r#"{
+            "type":"object",
+            "properties":{"count":{"type":"integer"}},
+            "additionalProperties":{"type":"string"}
+        }"#;
+        let mut good = runtime(schema);
+        assert!(good.accept_bytes(br#"{"count":1,"note":"ok"}"#) && good.is_accepted());
+
+        for mutant in [
+            br#"{"count":1.5,"note":"ok"}"#.as_slice(),
+            br#"{"count":1,"note":2}"#.as_slice(),
+        ] {
+            let mut runtime = runtime(schema);
+            assert!(!runtime.accept_bytes(mutant) || !runtime.is_accepted());
+        }
+    }
+
+    #[test]
+    fn open_object_non_ascii_declared_key_fails_closed() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"café": {"type": "integer"}}
+        });
+        let error = schema_to_gbnf(&schema).expect_err("must not approximate key exclusion");
+        assert!(error.to_string().contains("non-ASCII"));
     }
 }

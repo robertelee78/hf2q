@@ -1678,9 +1678,8 @@ pub fn split_full_output_forced(
 /// - `TooManyRequiredKeys` — schema's `required` array exceeds the 12-key
 ///   cap; the O(2^N) permutation grammar would be unreasonably large.
 /// - `UnsupportedSchemaFeature` — a nested schema uses a feature the
-///   iter-231b recursive compiler cannot enforce (`allOf`, `$ref`/`$defs`,
-///   `pattern`, `not`, tuple-form `items`, container `enum` values,
-///   depth > 32).  The 400 names the feature and the dot-path.
+///   recursive compiler cannot enforce exactly (for example `not`,
+///   tuple-form `items`, or depth > 32). The 400 names the feature and path.
 ///
 /// # ADR-005 Wave-2.7 design note
 /// The 12-key cap is shared with json_schema.rs. It bounds the exponential
@@ -1830,6 +1829,103 @@ fn gbnf_literal(s: &str) -> String {
     out
 }
 
+fn gemma4_enum_wire(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::String(value) => Ok(format!("<|\"|>{value}<|\"|>")),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
+            serde_json::to_string(value).map_err(|error| error.to_string())
+        }
+        serde_json::Value::Array(values) => Ok(format!(
+            "[{}]",
+            values
+                .iter()
+                .map(gemma4_enum_wire)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(",")
+        )),
+        serde_json::Value::Object(values) => {
+            let mut fields = Vec::with_capacity(values.len());
+            for (name, value) in values {
+                if name.is_empty()
+                    || name.chars().any(|character| {
+                        matches!(character, ',' | ':' | '{' | '}' | '[' | ']' | '<')
+                    })
+                {
+                    return Err(format!(
+                        "container enum has an unrepresentable Gemma key {name:?}"
+                    ));
+                }
+                fields.push(format!("{name}:{}", gemma4_enum_wire(value)?));
+            }
+            Ok(format!("{{{}}}", fields.join(",")))
+        }
+    }
+}
+
+#[derive(Default)]
+struct GemmaBareKeyTrie {
+    terminal: bool,
+    children: std::collections::BTreeMap<char, GemmaBareKeyTrie>,
+}
+
+fn gemma4_bare_key_excluding_gbnf(excluded: &[String]) -> Result<String, String> {
+    let mut trie = GemmaBareKeyTrie::default();
+    let mut total_characters = 0usize;
+    for name in excluded {
+        if name.is_empty()
+            || name.chars().any(|character| {
+                character.is_control()
+                    || matches!(character, ',' | ':' | '{' | '}' | '[' | ']' | '<')
+            })
+        {
+            return Err(format!(
+                "declared property {name:?} cannot be represented as an exact Gemma bare key"
+            ));
+        }
+        let characters = name.chars().count();
+        total_characters = total_characters.saturating_add(characters);
+        if characters > 256 || total_characters > 4096 {
+            return Err(
+                "declared property names exceed the exact Gemma wildcard exclusion budget (256 characters per key, 4096 total)"
+                    .to_string(),
+            );
+        }
+        let mut node = &mut trie;
+        for character in name.chars() {
+            node = node.children.entry(character).or_default();
+        }
+        node.terminal = true;
+    }
+    Ok(gemma4_bare_key_trie_body(&trie, true))
+}
+
+fn gemma4_bare_key_trie_body(node: &GemmaBareKeyTrie, root: bool) -> String {
+    let mut alternatives = Vec::new();
+    if !root && !node.terminal {
+        alternatives.push(gbnf_literal(""));
+    }
+    for (character, child) in &node.children {
+        alternatives.push(format!(
+            "{} {}",
+            gbnf_literal(&character.to_string()),
+            gemma4_bare_key_trie_body(child, false)
+        ));
+    }
+    let mut mismatch = String::from(r#"[^,:{}\[\]<"#);
+    for character in node.children.keys() {
+        match character {
+            '[' | ']' | '-' | '\\' => {
+                mismatch.push('\\');
+                mismatch.push(*character);
+            }
+            _ => mismatch.push(*character),
+        }
+    }
+    mismatch.push(']');
+    alternatives.push(format!("{mismatch} gemma4-json-key*"));
+    format!("( {} )", alternatives.join(" | "))
+}
+
 /// Map a JSON Schema type string to the GBNF value rule appropriate for
 /// **Gemma 4's kv-list syntax**.
 ///
@@ -1885,23 +1981,26 @@ fn gemma4_value_gbnf(
         }
     }
 
-    // enum (string values only in Gemma 4's canonical use) → literal alternation.
+    // Every finite value is rendered through Gemma's native recursive wire
+    // syntax; filtering only strings would silently widen scalar/container
+    // enums through the type fallback below.
     if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
-        let alts: Vec<String> = values
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(|s| {
-                format!(
-                    "{} {} {}",
-                    gbnf_literal("<|\"|>"),
-                    gbnf_literal(s),
-                    gbnf_literal("<|\"|>")
-                )
-            })
-            .collect();
-        if !alts.is_empty() {
-            return Ok(format!("( {} )", alts.join(" | ")));
+        if values.is_empty() {
+            return Ok(r#"[^\U00000000-\U0010FFFF]"#.to_string());
         }
+        let alts = values
+            .iter()
+            .map(|value| {
+                gemma4_enum_wire(value)
+                    .map(|wire| gbnf_literal(&wire))
+                    .map_err(|feature| EmitterError::UnsupportedSchemaFeature {
+                        fn_name: fn_name.to_string(),
+                        param_path: param_name.to_string(),
+                        feature,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(format!("( {} )", alts.join(" | ")));
     }
 
     let schema_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -2064,47 +2163,23 @@ fn gemma4_nested_value_rule(
         }
     }
 
-    // enum → literal alternation.  Strings render as `<|"|>s<|"|>`
-    // (format_argument string branch); non-string scalars render bare
-    // (`1`, `true`, `null` — format_argument's else branch).  Container
-    // enum values are rejected (json_schema.rs parity).
+    // enum → exact native Gemma wire literals, including containers.
     if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
         if values.is_empty() {
-            return Err(EmitterError::UnsupportedSchemaFeature {
-                fn_name: fn_name.to_string(),
-                param_path: path.to_string(),
-                feature: "empty enum".to_string(),
-            });
+            return Ok(r#"[^\U00000000-\U0010FFFF]"#.to_string());
         }
-        let mut alts: Vec<String> = Vec::with_capacity(values.len());
-        for v in values {
-            match v {
-                serde_json::Value::String(s) => alts.push(format!(
-                    "{} {} {}",
-                    gbnf_literal("<|\"|>"),
-                    gbnf_literal(s),
-                    gbnf_literal("<|\"|>")
-                )),
-                serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
-                    let text = serde_json::to_string(v).map_err(|e| {
-                        EmitterError::UnsupportedSchemaFeature {
-                            fn_name: fn_name.to_string(),
-                            param_path: path.to_string(),
-                            feature: format!("enum serialize: {}", e),
-                        }
-                    })?;
-                    alts.push(gbnf_literal(&text));
-                }
-                serde_json::Value::Null => alts.push(gbnf_literal("null")),
-                _ => {
-                    return Err(EmitterError::UnsupportedSchemaFeature {
+        let alts = values
+            .iter()
+            .map(|value| {
+                gemma4_enum_wire(value)
+                    .map(|wire| gbnf_literal(&wire))
+                    .map_err(|feature| EmitterError::UnsupportedSchemaFeature {
                         fn_name: fn_name.to_string(),
                         param_path: path.to_string(),
-                        feature: "container enum value".to_string(),
-                    });
-                }
-            }
-        }
+                        feature,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         return Ok(format!("( {} )", alts.join(" | ")));
     }
 
@@ -2196,15 +2271,28 @@ fn gemma4_nested_object(
         obj.get("additionalProperties"),
         Some(serde_json::Value::Bool(false))
     );
+    let additional_schema = obj.get("additionalProperties");
 
     let props = match properties {
         Some(p) if !p.is_empty() => p,
         _ => {
-            return Ok(if additional_closed {
-                r#""{" "}""#.to_string()
-            } else {
-                "gemma4-json-obj".to_string()
-            });
+            if additional_closed {
+                return Ok(r#""{" "}""#.to_string());
+            }
+            if additional_schema.is_some_and(serde_json::Value::is_object) {
+                let value = gemma4_nested_value_rule(
+                    fn_name,
+                    &format!("{path}/additionalProperties"),
+                    additional_schema.expect("present"),
+                    rules,
+                    rule_counter,
+                    depth + 1,
+                )?;
+                return Ok(format!(
+                    r#""{{" ( "}}" | gemma4-json-key ":" {value} ( "," gemma4-json-key ":" {value} )* "}}" )"#
+                ));
+            }
+            return Ok("gemma4-json-obj".to_string());
         }
     };
 
@@ -2254,11 +2342,34 @@ fn gemma4_nested_object(
         }
     }
 
-    // Wildcard kv for open objects: bare key + any structured value.
+    // Wildcard kv for open objects: an exact key complement prevents a
+    // declared optional key from bypassing its own value schema.
     let extra_kv: Option<String> = if additional_closed {
         None
     } else {
-        Some(r#"gemma4-json-key ":" gemma4-json-val"#.to_string())
+        let names = props.keys().cloned().collect::<Vec<_>>();
+        let key_body = gemma4_bare_key_excluding_gbnf(&names).map_err(|feature| {
+            EmitterError::UnsupportedSchemaFeature {
+                fn_name: fn_name.to_string(),
+                param_path: path.to_string(),
+                feature,
+            }
+        })?;
+        let value_body = match additional_schema {
+            Some(schema) => gemma4_nested_value_rule(
+                fn_name,
+                &format!("{path}/additionalProperties"),
+                schema,
+                rules,
+                rule_counter,
+                depth + 1,
+            )?,
+            None => "gemma4-json-val".to_string(),
+        };
+        *rule_counter += 1;
+        let name = format!("g4n-{}-extra-kv", *rule_counter);
+        rules.push((name.clone(), format!("{key_body} \":\" {value_body}")));
+        Some(name)
     };
 
     build_nested_obj_body(
@@ -3081,7 +3192,9 @@ fn deepseek4_value_variants(
                 serde_json::Value::String(value) => string_values.push(gbnf_literal(value)),
                 serde_json::Value::Number(_)
                 | serde_json::Value::Bool(_)
-                | serde_json::Value::Null => {
+                | serde_json::Value::Null
+                | serde_json::Value::Array(_)
+                | serde_json::Value::Object(_) => {
                     let serialized = serde_json::to_string(value).map_err(|error| {
                         EmitterError::UnsupportedSchemaFeature {
                             fn_name: fn_name.to_string(),
@@ -3090,13 +3203,6 @@ fn deepseek4_value_variants(
                         }
                     })?;
                     json_values.push(gbnf_literal(&serialized));
-                }
-                _ => {
-                    return Err(EmitterError::UnsupportedSchemaFeature {
-                        fn_name: fn_name.to_string(),
-                        param_path: path.to_string(),
-                        feature: "container enum value".to_string(),
-                    });
                 }
             }
         }
@@ -3463,18 +3569,26 @@ fn qwen35_value_rule(
             return Ok(format!("( {} )", alternatives.join(" | ")));
         }
     }
-    // enum → accept only the declared string literals.  TOP-LEVEL string
-    // values are RAW text between the parameter tags (the template only
-    // `tojson`s NON-string values), so enum literals stay unquoted here.
+    // TOP-LEVEL strings are raw between parameter tags; every non-string is
+    // rendered by the template's JSON path, including container values.
     if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
-        let alts: Vec<String> = values
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(|s| gbnf_literal(s))
-            .collect();
-        if !alts.is_empty() {
-            return Ok(format!("( {} )", alts.join(" | ")));
+        if values.is_empty() {
+            return Ok(r#"[^\U00000000-\U0010FFFF]"#.to_string());
         }
+        let alts = values
+            .iter()
+            .map(|value| match value {
+                serde_json::Value::String(value) => Ok(gbnf_literal(value)),
+                _ => serde_json::to_string(value)
+                    .map(|value| gbnf_literal(&value))
+                    .map_err(|error| EmitterError::UnsupportedSchemaFeature {
+                        fn_name: fn_name.to_string(),
+                        param_path: param_name.to_string(),
+                        feature: format!("enum serialize: {error}"),
+                    }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(format!("( {} )", alts.join(" | ")));
     }
     let schema_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match schema_type {
@@ -3649,7 +3763,9 @@ fn bounded_array_body(item: &str, comma: &str, min: u64, max: Option<u64>) -> St
 ///     top-level parameter grammar: required keys in any order, then
 ///     optional keys in any order; optional duplicates are accepted the
 ///     same way top-level duplicates are).  `additionalProperties:false`
-///     closes the key set; unset/true adds a wildcard kv tail.
+///     closes the key set; unset/true adds a wildcard kv tail whose exact
+///     decoded-key complement cannot re-match declared keys; a schema-valued
+///     `additionalProperties` constrains extra values.
 ///   * `object`/`array` with NO declared shape → the permissive
 ///     recursive `qwen35-json-obj` / `qwen35-json-arr` rules (any
 ///     well-formed compact JSON — the free-form MCP case).
@@ -3662,22 +3778,11 @@ fn bounded_array_body(item: &str, comma: &str, min: u64, max: Option<u64>) -> St
 /// Rejected with `EmitterError::UnsupportedSchemaFeature` (→ HTTP 400
 /// naming the feature + dot-path): `allOf`, `$ref`/`$defs`,
 /// `not`/`if`/`then`/`else`, `dependentSchemas`, tuple-form `items`,
-/// container `enum` values, >32 properties per object, depth > 32.
+/// >32 properties per object, depth > 32.
 /// Constraint keywords the grammar cannot enforce (`minLength`,
 /// `minimum`, `minItems`, `format`, …) are IGNORED, mirroring
 /// json_schema.rs's deferred-feature list.
 ///
-/// # Rejection-strength contract (CFG limitation, SOTA parity)
-///
-/// A REQUIRED key's value is always constrained by its declared grammar
-/// (the permutation position cannot be filled by the wildcard extra-kv
-/// branch), and a CLOSED object (`additionalProperties: false`) rejects
-/// any key/value mismatch.  For OPEN objects (the JSON Schema default),
-/// the wildcard extra-kv tail can re-match a declared OPTIONAL key with
-/// an unconstrained value — a CFG cannot express "any key except these".
-/// The peer's json-schema-to-grammar and this crate's json_schema.rs
-/// share the identical limitation; value validation for optional keys on
-/// open objects belongs to the tool server.
 fn qwen35_nested_value_rule(
     fn_name: &str,
     path: &str,
@@ -3753,41 +3858,21 @@ fn qwen35_nested_value_rule(
         }
     }
 
-    // enum → literal alternation of the JSON-serialized values (compact
-    // tojson form; strings keep their JSON quotes).  Container enum
-    // values are rejected (json_schema.rs parity).
+    // enum → literal alternation of every JSON-serialized value (compact
+    // tojson form; strings keep their JSON quotes).
     if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
         if values.is_empty() {
-            return Err(EmitterError::UnsupportedSchemaFeature {
-                fn_name: fn_name.to_string(),
-                param_path: path.to_string(),
-                feature: "empty enum".to_string(),
-            });
+            return Ok(r#"[^\U00000000-\U0010FFFF]"#.to_string());
         }
         let mut alts: Vec<String> = Vec::with_capacity(values.len());
         for v in values {
-            match v {
-                serde_json::Value::String(_)
-                | serde_json::Value::Number(_)
-                | serde_json::Value::Bool(_)
-                | serde_json::Value::Null => {
-                    let text = serde_json::to_string(v).map_err(|e| {
-                        EmitterError::UnsupportedSchemaFeature {
-                            fn_name: fn_name.to_string(),
-                            param_path: path.to_string(),
-                            feature: format!("enum serialize: {}", e),
-                        }
-                    })?;
-                    alts.push(gbnf_literal(&text));
-                }
-                _ => {
-                    return Err(EmitterError::UnsupportedSchemaFeature {
-                        fn_name: fn_name.to_string(),
-                        param_path: path.to_string(),
-                        feature: "container enum value".to_string(),
-                    });
-                }
-            }
+            let text =
+                serde_json::to_string(v).map_err(|e| EmitterError::UnsupportedSchemaFeature {
+                    fn_name: fn_name.to_string(),
+                    param_path: path.to_string(),
+                    feature: format!("enum serialize: {}", e),
+                })?;
+            alts.push(gbnf_literal(&text));
         }
         return Ok(format!("( {} )", alts.join(" | ")));
     }
@@ -3880,16 +3965,28 @@ fn qwen35_nested_object(
         obj.get("additionalProperties"),
         Some(serde_json::Value::Bool(false))
     );
+    let additional_schema = obj.get("additionalProperties");
 
     let props = match properties {
         Some(p) if !p.is_empty() => p,
         _ => {
-            // No declared shape: closed → only `{}`; open → permissive.
-            return Ok(if additional_closed {
-                r#""{" "}""#.to_string()
-            } else {
-                "qwen35-json-obj".to_string()
-            });
+            if additional_closed {
+                return Ok(r#""{" "}""#.to_string());
+            }
+            if additional_schema.is_some_and(serde_json::Value::is_object) {
+                let value = qwen35_nested_value_rule(
+                    fn_name,
+                    &format!("{path}/additionalProperties"),
+                    additional_schema.expect("present"),
+                    rules,
+                    rule_counter,
+                    depth + 1,
+                )?;
+                return Ok(format!(
+                    r#""{{" ( "}}" | qwen35-json-str qwen35-json-colon {value} ( qwen35-json-comma qwen35-json-str qwen35-json-colon {value} )* "}}" )"#
+                ));
+            }
+            return Ok("qwen35-json-obj".to_string());
         }
     };
 
@@ -3942,12 +4039,41 @@ fn qwen35_nested_object(
         }
     }
 
-    // Wildcard kv for open objects (additionalProperties unset/true):
-    // any JSON-string key with any JSON value.
+    // Wildcard kv for open objects. The decoded-character trie excludes
+    // declared names even when the model spells them with `\u00XX` escapes.
     let extra_kv: Option<String> = if additional_closed {
         None
     } else {
-        Some(r#"qwen35-json-str qwen35-json-colon qwen35-json-val"#.to_string())
+        let names = props.keys().cloned().collect::<Vec<_>>();
+        let key_body = crate::serve::api::grammar::json_schema::json_string_excluding_gbnf(
+            &names,
+            "qwen35-json-char",
+            true,
+            true,
+        )
+        .map_err(|feature| EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature,
+        })?;
+        let value_body = match additional_schema {
+            Some(schema) => qwen35_nested_value_rule(
+                fn_name,
+                &format!("{path}/additionalProperties"),
+                schema,
+                rules,
+                rule_counter,
+                depth + 1,
+            )?,
+            None => "qwen35-json-val".to_string(),
+        };
+        *rule_counter += 1;
+        let name = format!("q35n-{}-extra-kv", *rule_counter);
+        rules.push((
+            name.clone(),
+            format!("{key_body} qwen35-json-colon {value_body}"),
+        ));
+        Some(name)
     };
 
     build_nested_obj_body(
@@ -5250,6 +5376,49 @@ mod tests {
                 r#"{"date":"2026-19-03","count":2}"#,
                 r#"{"date":"2026-09-03","count":3}"#,
                 r#"{"date":"2026-09-03","count":-3}"#,
+            ],
+        );
+    }
+
+    #[test]
+    fn finite_composition_and_open_object_narrowing_hold_across_all_families() {
+        assert_r2c_fixture_across_families(
+            "narrowed_values",
+            r#"{
+                "type":"object",
+                "properties":{
+                    "count":{"type":"integer","enum":[1,2]},
+                    "mode":{
+                        "type":"string",
+                        "minLength":2,
+                        "enum":["x","ok"],
+                        "anyOf":[{"const":"x"},{"const":"ok"}]
+                    },
+                    "exclusive":{
+                        "type":"string",
+                        "minLength":2,
+                        "oneOf":[{"const":"x"},{"const":"ok"}]
+                    },
+                    "choice":{"enum":[{"ok":true},[1,2]]},
+                    "cfg":{
+                        "type":"object",
+                        "properties":{"limit":{"type":"integer"}},
+                        "additionalProperties":{"type":"string"}
+                    }
+                },
+                "required":["count","mode","exclusive","choice","cfg"],
+                "additionalProperties":false
+            }"#,
+            &[
+                r#"{"count":1,"mode":"ok","exclusive":"ok","choice":{"ok":true},"cfg":{"limit":2,"note":"yes"}}"#,
+            ],
+            &[
+                r#"{"count":3,"mode":"ok","exclusive":"ok","choice":{"ok":true},"cfg":{}}"#,
+                r#"{"count":1,"mode":"x","exclusive":"ok","choice":{"ok":true},"cfg":{}}"#,
+                r#"{"count":1,"mode":"ok","exclusive":"x","choice":{"ok":true},"cfg":{}}"#,
+                r#"{"count":1,"mode":"ok","exclusive":"ok","choice":{"ok":false},"cfg":{}}"#,
+                r#"{"count":1,"mode":"ok","exclusive":"ok","choice":{"ok":true},"cfg":{"limit":2.5}}"#,
+                r#"{"count":1,"mode":"ok","exclusive":"ok","choice":{"ok":true},"cfg":{"note":3}}"#,
             ],
         );
     }
@@ -6899,16 +7068,7 @@ mod tests {
 
     /// Qwen35: nested enum + anyOf union bodies are enforced.
     ///
-    /// NOTE on rejection strength (iter-231b documented contract): a
-    /// REQUIRED key's value is always constrained by its declared grammar
-    /// (the permutation position cannot be filled by the wildcard
-    /// extra-kv branch), and a CLOSED object (`additionalProperties:
-    /// false`) rejects any value/key mismatch.  For OPEN objects the
-    /// wildcard extra-kv tail can re-match a declared OPTIONAL key with
-    /// an unconstrained value — an inherent CFG limitation shared with
-    /// the peer + json_schema.rs (a CFG cannot express "any key except
-    /// these").  The anyOf-mismatch rejection below is therefore asserted
-    /// on a CLOSED object, where the guarantee holds.
+    /// The closed object also proves that no undeclared key can enter.
     #[test]
     fn iter231b_qwen35_nested_enum_and_anyof() {
         let schema = r#"{
@@ -6947,13 +7107,10 @@ mod tests {
         );
     }
 
-    /// Qwen35 (documented contract): for OPEN objects the wildcard
-    /// extra-kv tail accepts any well-formed JSON value for any key —
-    /// including a declared optional key carrying a value that violates
-    /// its declared sub-schema.  Pin the behavior so the caveat is
-    /// explicit, not silent.
+    /// Qwen35: an OPEN object's wildcard accepts undeclared keys but cannot
+    /// re-match a declared optional key, including via JSON unicode escapes.
     #[test]
-    fn iter231b_qwen35_open_object_wildcard_tail_documented() {
+    fn iter231b_qwen35_open_object_wildcard_excludes_declared_keys() {
         let schema = r#"{
             "type": "object",
             "properties": {
@@ -6968,15 +7125,20 @@ mod tests {
             }
         }"#;
         let mut rt = qwen35_runtime("f", schema);
-        // limit:3.5 violates items integer, but the OPEN object's
-        // wildcard tail accepts it as an extra key (CFG limitation,
-        // peer + json_schema.rs parity).  Value validation for
-        // optional keys on open objects is the tool server's job.
         let input = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"safe\",\"limit\":3.5}\n</parameter>\n</function>";
         assert!(
-            rt.accept_bytes(input) && rt.is_accepted(),
-            "open-object wildcard tail must accept (documented CFG limitation)"
+            !rt.accept_bytes(input) || !rt.is_accepted(),
+            "open-object wildcard re-matched a declared key"
         );
+        let mut escaped = qwen35_runtime("f", schema);
+        let escaped_input = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"safe\",\"\\u006cimit\":3.5}\n</parameter>\n</function>";
+        assert!(
+            !escaped.accept_bytes(escaped_input) || !escaped.is_accepted(),
+            "unicode-escaped declared key bypassed the exclusion trie"
+        );
+        let mut extra = qwen35_runtime("f", schema);
+        let extra_input = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"safe\",\"note\":3.5}\n</parameter>\n</function>";
+        assert!(extra.accept_bytes(extra_input) && extra.is_accepted());
         // But a REQUIRED key mismatch is still physically impossible:
         let mut rt2 = qwen35_runtime("f", schema);
         let bad = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"warp\",\"limit\":3}\n</parameter>\n</function>";
