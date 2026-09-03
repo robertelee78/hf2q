@@ -30,6 +30,12 @@ chmod 0755 "$fake_bin/launchctl"
 cat > "$fake_bin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$HOME/curl.calls"
+# Match curl's `-d @-` behavior: consume the complete request body before
+# returning the fake response. Otherwise the upstream jq can race this process
+# and fail with SIGPIPE under `set -o pipefail`.
+if [[ " $* " == *" -d @- "* ]]; then
+    cat > "$HOME/fallback.request.json"
+fi
 case "$*" in
     *127.0.0.1:11235/healthz*)
         printf '%s\n' '{"ok":true,"browser_warm":true,"stealth_installed":true}'
@@ -81,6 +87,8 @@ grep -Fq "fixed-provider discovery fallback: FAILED" "$test_root/status-failed"
 HOME="$test_home" PATH="$fake_bin:$PATH" FAKE_FALLBACK_OK=1 \
     "$installer" --status >"$test_root/status-fallback"
 grep -Fq "fixed-provider discovery fallback: 1 results via brave-search-fallback/guarded-static" "$test_root/status-fallback"
+jq -e '.query == "who wrote unicornscan" and .max_results == 3' \
+    "$test_home/fallback.request.json" >/dev/null
 grep -Fq "engines=bing,google,duckduckgo,mojeek" "$test_home/curl.calls"
 grep -Fq "status: healthy" "$test_root/status-fallback"
 if HOME="$test_home" PATH="$fake_bin:$PATH" FAKE_FALLBACK_OK=2 \

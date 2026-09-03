@@ -128,8 +128,29 @@ jobs:
             bash "$trusted_verifier" check-build-root \
               "$package_root" "$checkout_root" "$cargo_home" "$cargo_target"
           )
+          assert_macho_string_pool_aligned() {
+            local macho=$1
+            local stroff
+            stroff=$(/usr/bin/otool -l "$macho" | awk '
+              $1 == "cmd" && $2 == "LC_SYMTAB" { in_symtab = 1; next }
+              in_symtab && $1 == "cmd" { in_symtab = 0 }
+              in_symtab && $1 == "stroff" { print $2; exit }
+            ')
+            [[ -z "$stroff" || "$stroff" =~ ^[0-9]+$ ]]
+            if [[ -n "$stroff" && $((stroff % 8)) -ne 0 ]]; then
+              echo "misaligned Mach-O LINKEDIT string pool: $macho (stroff=$stroff)" >&2
+              exit 1
+            fi
+          }
+          dylib_count=0
+          while IFS= read -r -d '' dylib; do
+            assert_macho_string_pool_aligned "$dylib"
+            ((dylib_count += 1))
+          done < <(find "$cargo_target/release" -type f -name '*.dylib' -print0)
+          test "$dylib_count" -gt 0
           built_binary="$cargo_target/release/hf2q"
           test -x "$built_binary"
+          assert_macho_string_pool_aligned "$built_binary"
           test "$(/usr/bin/lipo -archs "$built_binary")" = arm64
           test "$(/usr/bin/vtool -show-build "$built_binary" | awk '$1 == "minos" {print $2}')" = 14.0
           test "$("$built_binary" --version)" = \

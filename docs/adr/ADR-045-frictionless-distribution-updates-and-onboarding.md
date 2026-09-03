@@ -9,7 +9,7 @@
   corrected on 2026-08-22; the issue-181 search fallback was corrected after
   a second-host portability failure on 2026-08-28; distinct-account proof remains
 - Date: 2026-08-17
-- Updated: 2026-08-28
+- Updated: 2026-09-03
 - Owners: hf2q release engineering and operator experience
 - Related: `docs/shipping-contract.md`,
   `docs/adr/diary/ADR-005-inference-server.md`,
@@ -235,6 +235,20 @@ receipts; GitHub's workflow-definition `headSha` is not misused as candidate
 identity, so unrelated later merges do not invalidate an in-flight release.
 The publication verifier drops its GitHub API credentials immediately after
 artifact download and before executing even a verified candidate.
+
+The packed release build MUST remain valid on the supported release host. On
+2026-09-03, macOS 27's stricter `dyld` checks rejected Rust proc-macro dylibs
+whose `LC_SYMTAB.stroff` was only four-byte aligned. The failure was reproduced
+twice in the exact candidate workflow and once from a fresh local packed crate;
+the underlying `dlopen` error matches rust-lang/rust issue
+[#157750](https://github.com/rust-lang/rust/issues/157750). A fresh locked
+spike proved that disabling debuginfo stripping only for Cargo release build
+scripts and proc macros preserves the normal hf2q release profile and produces
+eight-byte-aligned Mach-O string pools with the macOS 14 deployment floor.
+Accordingly, `Cargo.toml` MUST set `strip = "none"` in its
+`[profile.release.build-override]` table, and the standalone candidate MUST
+reject any generated dylib or final binary whose LINKEDIT string-pool offset
+is not eight-byte aligned.
 
 Model-family quality, cache, and performance qualification is independent. It
 may consume the same signed candidate and remains required when a governing
