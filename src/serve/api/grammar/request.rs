@@ -6,8 +6,13 @@ use serde_json::Value;
 
 use super::{json_schema, parser, regex_gbnf, Grammar};
 use crate::serve::api::schema::{
-    ChatCompletionRequest, ResponseFormat, StructuredOutputJson, StructuredOutputs,
+    ChatCompletionRequest, ResponseFormat, StructuredOutputJson, StructuredOutputs, ToolChoiceValue,
 };
+
+#[path = "request_validation.rs"]
+mod validation;
+pub use validation::validate_tool_request;
+use validation::{first_lazy_param, validate_lazy_fields};
 
 const JSON_OBJECT_GRAMMAR: &str = r#"root   ::= object
 value  ::= object | array | string | number | ("true" | "false" | "null") ws
@@ -32,14 +37,14 @@ ws ::= | " " | "\n" [ \t]{0,20}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestGrammarError {
-    pub param: &'static str,
+    pub param: String,
     pub message: String,
 }
 
 impl RequestGrammarError {
-    fn new(param: &'static str, message: impl Into<String>) -> Self {
+    fn new(param: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            param,
+            param: param.into(),
             message: message.into(),
         }
     }
@@ -146,12 +151,98 @@ fn structured_schema(value: &StructuredOutputJson) -> Result<Value, RequestGramm
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstraintKind {
+    Choice,
+    Regex,
+    Json,
+    JsonObject,
+    Grammar,
+    StructuralTag,
+}
+
+fn structured_constraint_kind(
+    structured: &StructuredOutputs,
+) -> Result<ConstraintKind, RequestGrammarError> {
+    structured
+        .validate_exactly_one_constraint()
+        .map_err(|error| RequestGrammarError::new("structured_outputs", error.to_string()))?;
+    Ok(if structured.choice.is_some() {
+        ConstraintKind::Choice
+    } else if structured.regex.is_some() {
+        ConstraintKind::Regex
+    } else if structured.json.is_some() {
+        ConstraintKind::Json
+    } else if structured.json_object.is_some() {
+        ConstraintKind::JsonObject
+    } else if structured.grammar.is_some() {
+        ConstraintKind::Grammar
+    } else {
+        ConstraintKind::StructuralTag
+    })
+}
+
+fn response_constraint_kind(response: &ResponseFormat) -> Option<ConstraintKind> {
+    match response {
+        ResponseFormat::Text => None,
+        ResponseFormat::JsonObject => Some(ConstraintKind::JsonObject),
+        ResponseFormat::JsonSchema { .. } => Some(ConstraintKind::Json),
+        ResponseFormat::StructuralTag { .. } => Some(ConstraintKind::StructuralTag),
+    }
+}
+
+pub(crate) fn compile_response_format(
+    response: &ResponseFormat,
+    structured_options: Option<&StructuredOutputs>,
+) -> Result<Option<Grammar>, RequestGrammarError> {
+    let whitespace_pattern = structured_options
+        .map(configured_whitespace)
+        .transpose()?
+        .flatten();
+    match response {
+        ResponseFormat::Text => Ok(None),
+        ResponseFormat::JsonObject => {
+            if structured_options
+                .is_some_and(|options| options.disable_additional_properties.is_some())
+            {
+                return Err(RequestGrammarError::new(
+                    "structured_outputs.disable_additional_properties",
+                    "disable_additional_properties requires an explicit JSON Schema",
+                ));
+            }
+            parse_gbnf(&json_object_grammar(whitespace_pattern)?, "response_format").map(Some)
+        }
+        ResponseFormat::JsonSchema { json_schema: spec } => {
+            let mut schema = spec.schema.clone();
+            if structured_options
+                .is_some_and(|options| options.disable_additional_properties == Some(true))
+            {
+                close_implicit_objects(&mut schema);
+            }
+            compile_schema(&schema, "response_format", whitespace_pattern).map(Some)
+        }
+        ResponseFormat::StructuralTag { .. } => Err(RequestGrammarError::new(
+            "response_format",
+            "structural_tag compilation is not yet implemented",
+        )),
+    }
+}
+
 pub fn compile_structured_outputs(
     structured: &StructuredOutputs,
 ) -> Result<Grammar, RequestGrammarError> {
     structured
         .validate_exactly_one_constraint()
         .map_err(|error| RequestGrammarError::new("structured_outputs", error.to_string()))?;
+    if structured.json.is_none()
+        && structured.json_object.is_none()
+        && (structured.disable_any_whitespace.is_some() || structured.whitespace_pattern.is_some())
+    {
+        return Err(RequestGrammarError::new(
+            "structured_outputs",
+            "disable_any_whitespace and whitespace_pattern apply only to JSON constraints",
+        ));
+    }
     let whitespace_pattern = configured_whitespace(structured)?;
 
     if let Some(choices) = structured.choice.as_ref() {
@@ -236,58 +327,66 @@ pub fn compile_structured_outputs(
     ))
 }
 
-/// Resolve all non-tool request surfaces to one grammar. vLLM's documented
-/// response-format conversion wins over `structured_outputs`, except `text`,
-/// which preserves the explicit structured-output request.
+/// Resolve all non-tool request surfaces to one grammar. A non-text OpenAI
+/// response format replaces the same vLLM structured-output slot while
+/// retaining backend options; selecting a different slot is a conflict.
+/// `text` contributes no constraint and preserves another explicit surface.
 pub fn compile_request_constraint(
     request: &ChatCompletionRequest,
 ) -> Result<Option<Grammar>, RequestGrammarError> {
+    let structured_kind = request
+        .structured_outputs
+        .as_ref()
+        .map(structured_constraint_kind)
+        .transpose()?;
+    let response_kind = request
+        .response_format
+        .as_ref()
+        .and_then(response_constraint_kind);
+
     if request.grammar.is_some() && request.json_schema.is_some() {
         return Err(RequestGrammarError::new(
             "grammar",
             "grammar and json_schema are mutually exclusive",
         ));
     }
-    let response_overrides = request
-        .response_format
-        .as_ref()
-        .is_some_and(|format| !matches!(format, ResponseFormat::Text));
-    if response_overrides && (request.grammar.is_some() || request.json_schema.is_some()) {
+    if response_kind.is_some() && (request.grammar.is_some() || request.json_schema.is_some()) {
         return Err(RequestGrammarError::new(
             "response_format",
             "response_format cannot be combined with top-level grammar or json_schema",
         ));
     }
-    if !response_overrides
-        && request.structured_outputs.is_some()
-        && (request.grammar.is_some() || request.json_schema.is_some())
-    {
+    if structured_kind.is_some() && (request.grammar.is_some() || request.json_schema.is_some()) {
         return Err(RequestGrammarError::new(
             "structured_outputs",
             "structured_outputs cannot be combined with top-level grammar or json_schema",
         ));
     }
-
-    match request.response_format.as_ref() {
-        Some(ResponseFormat::JsonObject) => {
-            return parse_gbnf(JSON_OBJECT_GRAMMAR, "response_format").map(Some)
-        }
-        Some(ResponseFormat::JsonSchema { json_schema: spec }) => {
-            return compile_schema(&spec.schema, "response_format", None).map(Some)
-        }
-        Some(ResponseFormat::StructuralTag { .. }) => {
+    if let (Some(response), Some(structured)) = (response_kind, structured_kind) {
+        if response != structured {
             return Err(RequestGrammarError::new(
                 "response_format",
-                "structural_tag compilation is not yet implemented",
-            ))
+                "response_format and structured_outputs select a different constraint type",
+            ));
         }
-        Some(ResponseFormat::Text) | None => {}
+    }
+
+    let has_constraint = response_kind.is_some()
+        || structured_kind.is_some()
+        || request.grammar.is_some()
+        || request.json_schema.is_some();
+    validate_lazy_fields(request, has_constraint)?;
+
+    if let Some(response) = request.response_format.as_ref() {
+        if response_kind.is_some() {
+            return compile_response_format(response, request.structured_outputs.as_ref());
+        }
     }
     if let Some(structured) = request.structured_outputs.as_ref() {
         return compile_structured_outputs(structured).map(Some);
     }
     if let Some(schema) = request.json_schema.as_ref() {
-        return compile_schema(&Value::Object(schema.clone()), "json_schema", None).map(Some);
+        return compile_schema(&schema.as_value(), "json_schema", None).map(Some);
     }
     if let Some(source) = request.grammar.as_ref() {
         if source.trim().is_empty() {
@@ -301,128 +400,28 @@ pub fn compile_request_constraint(
     Ok(None)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn accepts(grammar: &Grammar, bytes: &[u8]) -> bool {
-        let root = grammar.rule_id("root").expect("root");
-        let mut runtime =
-            super::super::GrammarRuntime::new(grammar.clone(), root).expect("runtime");
-        runtime.accept_bytes(bytes) && runtime.is_accepted()
-    }
-
-    #[test]
-    fn vllm_choice_regex_json_and_raw_grammar_compile_and_enforce() {
-        let choice = StructuredOutputs {
-            choice: Some(vec!["allow".into(), "deny".into()]),
-            ..Default::default()
-        };
-        let grammar = compile_structured_outputs(&choice).unwrap();
-        assert!(accepts(&grammar, b"allow"));
-        assert!(!accepts(&grammar, b"allowed"));
-
-        let regex = StructuredOutputs {
-            regex: Some("[A-Z]{2}[0-9]{2}".into()),
-            ..Default::default()
-        };
-        let grammar = compile_structured_outputs(&regex).unwrap();
-        assert!(accepts(&grammar, b"AB12"));
-        assert!(!accepts(&grammar, b"xAB12y"));
-
-        let json = StructuredOutputs {
-            json: Some(StructuredOutputJson::String(
-                r#"{"type":"string","enum":["ok"]}"#.into(),
-            )),
-            ..Default::default()
-        };
-        let grammar = compile_structured_outputs(&json).unwrap();
-        assert!(accepts(&grammar, br#""ok""#));
-        assert!(!accepts(&grammar, br#""no""#));
-
-        let raw = StructuredOutputs {
-            grammar: Some("root ::= \"yes\" | \"no\"\n".into()),
-            ..Default::default()
-        };
-        let grammar = compile_structured_outputs(&raw).unwrap();
-        assert!(accepts(&grammar, b"yes"));
-        assert!(!accepts(&grammar, b"maybe"));
-    }
-
-    #[test]
-    fn vllm_invalid_and_ambiguous_constraints_fail_closed() {
-        for structured in [
-            StructuredOutputs::default(),
-            StructuredOutputs {
-                choice: Some(Vec::new()),
-                ..Default::default()
-            },
-            StructuredOutputs {
-                grammar: Some("  ".into()),
-                ..Default::default()
-            },
-            StructuredOutputs {
-                regex: Some("x\0y".into()),
-                ..Default::default()
-            },
-            StructuredOutputs {
-                choice: Some(vec!["x".into()]),
-                regex: Some("x".into()),
-                ..Default::default()
-            },
-        ] {
-            assert!(compile_structured_outputs(&structured).is_err());
+/// Apply native tool-call precedence before compiling an output constraint.
+/// Required and named choices use the model-family tool grammar, so an
+/// otherwise-unused response constraint is deliberately not compiled.
+pub fn compile_request_output_constraint(
+    request: &ChatCompletionRequest,
+    tool_choice: &ToolChoiceValue,
+) -> Result<Option<Grammar>, RequestGrammarError> {
+    if matches!(
+        tool_choice,
+        ToolChoiceValue::Required | ToolChoiceValue::Function(_)
+    ) {
+        if let Some(param) = first_lazy_param(request) {
+            return Err(RequestGrammarError::new(
+                param,
+                "llama.cpp lazy grammar fields cannot modify a required native tool grammar",
+            ));
         }
+        return Ok(None);
     }
-
-    #[test]
-    fn disable_additional_properties_closes_implicit_nested_objects() {
-        let structured = StructuredOutputs {
-            json: Some(StructuredOutputJson::Object(
-                serde_json::json!({
-                    "type":"object",
-                    "properties":{"nested":{"type":"object","properties":{"x":{"type":"integer"}}}}
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-            )),
-            disable_additional_properties: Some(true),
-            ..Default::default()
-        };
-        let grammar = compile_structured_outputs(&structured).unwrap();
-        assert!(accepts(&grammar, br#"{"nested":{"x":1}}"#));
-        assert!(!accepts(&grammar, br#"{"nested":{"x":1,"y":2}}"#));
-    }
-
-    #[test]
-    fn whitespace_options_are_enforced_for_json_constraints() {
-        let compact = StructuredOutputs {
-            json: Some(StructuredOutputJson::Object(
-                serde_json::json!({
-                    "type":"object",
-                    "properties":{"x":{"type":"integer"}},
-                    "required":["x"],
-                    "additionalProperties":false
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-            )),
-            disable_any_whitespace: Some(true),
-            ..Default::default()
-        };
-        let grammar = compile_structured_outputs(&compact).unwrap();
-        assert!(accepts(&grammar, br#"{"x":1}"#));
-        assert!(!accepts(&grammar, br#"{ "x": 1 }"#));
-
-        let custom = StructuredOutputs {
-            json_object: Some(true),
-            whitespace_pattern: Some("[ ]*".into()),
-            ..Default::default()
-        };
-        let grammar = compile_structured_outputs(&custom).unwrap();
-        assert!(accepts(&grammar, br#"{ "x": 1 }"#));
-        assert!(!accepts(&grammar, b"{\n\"x\":1}"));
-    }
+    compile_request_constraint(request)
 }
+
+#[cfg(test)]
+#[path = "request_tests.rs"]
+mod tests;

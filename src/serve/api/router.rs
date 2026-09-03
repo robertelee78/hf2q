@@ -484,10 +484,9 @@ mod tests {
 
     #[tokio::test]
     async fn bad_json_schema_returns_grammar_error() {
-        // Engine gate still runs first (no engine → model_not_loaded).
-        // To exercise the grammar path, the test would need a loaded engine;
-        // for now we assert the error kind is model_not_loaded (gate order)
-        // and document: engine-loaded variant gets the grammar_error path.
+        // Public request constraints are normalized before model resolution,
+        // so malformed schemas receive stable request-local attribution even
+        // when no model is loaded.
         let app = build_router(state_default());
         let body = r#"{
             "model":"nope",
@@ -501,12 +500,11 @@ mod tests {
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // Without an engine loaded, the engine gate runs first and we
-        // return model_not_loaded. The grammar pre-compile kicks in only
-        // after engine-gate passes; this is the documented ordering.
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-        assert_eq!(v["error"]["code"], "model_not_loaded");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "grammar_error");
+        assert_eq!(v["error"]["param"], "response_format");
     }
 
     // --- Multimodal validation (Phase 2c, iter 23) ---
@@ -573,8 +571,78 @@ mod tests {
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // axum's default JSON extractor rejection surface.
-        assert_eq!(resp.status().as_u16() / 100, 4, "4xx expected");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["param"], "body");
+        assert_eq!(v["error"]["code"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn structured_request_errors_are_openai_400s_with_exact_params() {
+        for (body, param, code) in [
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":"sometimes"}"#,
+                "tool_choice",
+                serde_json::Value::Null,
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[]}"#,
+                "tools",
+                serde_json::Value::Null,
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"structured_outputs":{"regex":"x"},"response_format":{"type":"json_object"}}"#,
+                "response_format",
+                serde_json::json!("grammar_error"),
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"structural_tag","format":{}}}"#,
+                "response_format",
+                serde_json::json!("grammar_error"),
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"grammar":"root ::= \"ok\"","grammar_lazy":true}"#,
+                "grammar_triggers",
+                serde_json::json!("grammar_error"),
+            ),
+        ] {
+            let app = build_router(state_default());
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body: {body}");
+            let value: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert_eq!(value["error"]["param"], param, "body: {body}");
+            assert_eq!(value["error"]["code"], code, "body: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_typed_structured_surface_is_an_openai_body_error() {
+        let app = build_router(state_default());
+        let body = r#"{
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "json_schema":["not", "a", "schema"]
+        }"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(value["error"]["param"], "body");
     }
 
     #[tokio::test]

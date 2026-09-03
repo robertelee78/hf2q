@@ -741,6 +741,7 @@ pub struct ToolCallFunction {
 
 /// A tool definition in the request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tool {
     #[serde(rename = "type")]
     pub tool_type: String,
@@ -749,6 +750,7 @@ pub struct Tool {
 
 /// Function definition within a tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolFunction {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -788,6 +790,32 @@ impl StopSequence {
 pub enum StructuredOutputJson {
     Object(serde_json::Map<String, serde_json::Value>),
     String(String),
+}
+
+/// A JSON Schema accepted by llama.cpp's top-level `json_schema` surface.
+/// Draft 2020-12 permits both object schemas and the boolean `true`/`false`
+/// schemas. Other JSON types are not schemas and fail during deserialization.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum JsonSchemaValue {
+    Boolean(bool),
+    Object(serde_json::Map<String, serde_json::Value>),
+}
+
+impl JsonSchemaValue {
+    pub fn as_value(&self) -> serde_json::Value {
+        match self {
+            Self::Boolean(value) => serde_json::Value::Bool(*value),
+            Self::Object(value) => serde_json::Value::Object(value.clone()),
+        }
+    }
+
+    pub fn into_value(self) -> serde_json::Value {
+        match self {
+            Self::Boolean(value) => serde_json::Value::Bool(value),
+            Self::Object(value) => serde_json::Value::Object(value),
+        }
+    }
 }
 
 /// vLLM-compatible per-request structured-output controls.
@@ -963,7 +991,7 @@ impl TryFrom<LlamaGrammarTriggerWire> for LlamaGrammarTrigger {
 ///                              — vLLM/XGrammar tagged structured content.
 ///
 /// All three compile down to a grammar the sampler applies token-by-token.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ResponseFormat {
     #[serde(rename = "text")]
@@ -981,6 +1009,53 @@ pub enum ResponseFormat {
         #[serde(flatten)]
         spec: serde_json::Map<String, serde_json::Value>,
     },
+}
+
+impl<'de> Deserialize<'de> for ResponseFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut object = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let format_type = object
+            .remove("type")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| D::Error::custom("response_format.type must be a string"))?;
+        match format_type.as_str() {
+            "text" => {
+                if !object.is_empty() {
+                    return Err(D::Error::custom(
+                        "response_format type=text does not accept additional fields",
+                    ));
+                }
+                Ok(Self::Text)
+            }
+            "json_object" => {
+                if !object.is_empty() {
+                    return Err(D::Error::custom(
+                        "response_format type=json_object does not accept additional fields",
+                    ));
+                }
+                Ok(Self::JsonObject)
+            }
+            "json_schema" => {
+                let json_schema = object.remove("json_schema").ok_or_else(|| {
+                    D::Error::custom("response_format type=json_schema requires json_schema")
+                })?;
+                if !object.is_empty() {
+                    return Err(D::Error::custom(
+                        "response_format type=json_schema does not accept additional fields",
+                    ));
+                }
+                let json_schema = serde_json::from_value(json_schema).map_err(D::Error::custom)?;
+                Ok(Self::JsonSchema { json_schema })
+            }
+            "structural_tag" => Ok(Self::StructuralTag { spec: object }),
+            other => Err(D::Error::custom(format!(
+                "unsupported response_format.type {other:?}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -1057,10 +1132,11 @@ pub struct ChatCompletionRequest {
     /// llama.cpp-compatible top-level GBNF grammar.
     #[serde(default)]
     pub grammar: Option<String>,
-    /// llama.cpp-compatible top-level JSON Schema. The peer server accepts a
-    /// JSON object here and rejects other JSON types.
+    /// llama.cpp-compatible top-level JSON Schema. JSON Schema Draft 2020-12
+    /// permits an object or a boolean schema; all other JSON types reject at
+    /// the request boundary.
     #[serde(default)]
-    pub json_schema: Option<serde_json::Map<String, serde_json::Value>>,
+    pub json_schema: Option<JsonSchemaValue>,
     /// Apply the explicit grammar only after a configured trigger fires.
     #[serde(default)]
     pub grammar_lazy: Option<bool>,
@@ -1387,23 +1463,50 @@ pub enum ToolChoiceValue {
 }
 
 impl ToolChoiceValue {
-    pub fn parse(value: Option<&serde_json::Value>) -> Self {
+    /// Parse the OpenAI `tool_choice` union without a permissive fallback.
+    /// Unknown strings and malformed named-function objects are request
+    /// errors; they must never turn into `auto` generation.
+    pub fn try_parse(value: Option<&serde_json::Value>) -> Result<Self, String> {
         match value {
-            None => ToolChoiceValue::Auto,
+            None => Ok(ToolChoiceValue::Auto),
             Some(serde_json::Value::String(s)) => match s.as_str() {
-                "none" => ToolChoiceValue::None,
-                "required" => ToolChoiceValue::Required,
-                _ => ToolChoiceValue::Auto,
+                "auto" => Ok(ToolChoiceValue::Auto),
+                "none" => Ok(ToolChoiceValue::None),
+                "required" => Ok(ToolChoiceValue::Required),
+                _ => Err(format!(
+                    "tool_choice must be 'auto', 'none', 'required', or a named function object; got {s:?}"
+                )),
             },
             Some(serde_json::Value::Object(obj)) => {
-                if let Some(func_obj) = obj.get("function") {
-                    if let Some(name) = func_obj.get("name").and_then(|n| n.as_str()) {
-                        return ToolChoiceValue::Function(name.to_string());
-                    }
+                if obj.len() != 2
+                    || obj.get("type").and_then(serde_json::Value::as_str) != Some("function")
+                {
+                    return Err(
+                        "named tool_choice must contain exactly type='function' and function"
+                            .into(),
+                    );
                 }
-                ToolChoiceValue::Auto
+                let function = obj
+                    .get("function")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| "tool_choice.function must be an object".to_string())?;
+                if function.len() != 1 {
+                    return Err(
+                        "tool_choice.function must contain exactly one name field".into(),
+                    );
+                }
+                let name = function
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "tool_choice.function.name must be a string".to_string())?;
+                if name.is_empty() {
+                    return Err("tool_choice.function.name must not be empty".into());
+                }
+                Ok(ToolChoiceValue::Function(name.to_string()))
             }
-            _ => ToolChoiceValue::Auto,
+            Some(_) => Err(
+                "tool_choice must be a string or a named function object".to_string(),
+            ),
         }
     }
 }
@@ -2039,7 +2142,10 @@ mod tests {
             Ok(())
         );
         assert_eq!(req.grammar.as_deref(), Some("root ::= \"ok\""));
-        assert_eq!(req.json_schema.as_ref().unwrap()["type"], "object");
+        assert_eq!(
+            req.json_schema.as_ref().unwrap().as_value()["type"],
+            "object"
+        );
         assert_eq!(req.grammar_lazy, Some(true));
         assert_eq!(
             req.preserved_tokens.as_deref(),
@@ -2066,6 +2172,8 @@ mod tests {
         for fields in [
             r#""grammar": {"root": "ok"}"#,
             r#""json_schema": "{\"type\":\"object\"}""#,
+            r#""json_schema": [true]"#,
+            r#""json_schema": 7"#,
             r#""grammar_lazy": "true""#,
             r#""preserved_tokens": [1]"#,
             r#""grammar_triggers": [{"type": 4, "value": "x"}]"#,
@@ -2077,6 +2185,59 @@ mod tests {
             assert!(
                 serde_json::from_str::<ChatCompletionRequest>(&json).is_err(),
                 "invalid surface must fail: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_llama_top_level_json_schema_accepts_object_and_boolean_schemas() {
+        for (wire, expected) in [
+            (r#"{"type":"object"}"#, serde_json::json!({"type":"object"})),
+            ("true", serde_json::Value::Bool(true)),
+            ("false", serde_json::Value::Bool(false)),
+        ] {
+            let json = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"json_schema":{wire}}}"#
+            );
+            let request: ChatCompletionRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(request.json_schema.unwrap().into_value(), expected);
+        }
+
+        // llama.cpp treats explicit null like omission; serde's Option wire
+        // shape preserves that compatibility.
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"json_schema":null}"#,
+        )
+        .unwrap();
+        assert!(request.json_schema.is_none());
+    }
+
+    #[test]
+    fn test_tool_definition_wire_shape_is_strict() {
+        let valid = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "description": "Look up weather",
+                "parameters": {"type": "object"}
+            }
+        });
+        serde_json::from_value::<Tool>(valid).unwrap();
+
+        for invalid in [
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "lookup", "unknown": true}
+            }),
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "lookup"},
+                "unknown": true
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<Tool>(invalid.clone()).is_err(),
+                "unknown tool fields must reject: {invalid}"
             );
         }
     }
@@ -2114,6 +2275,21 @@ mod tests {
             }
         });
         assert!(serde_json::from_value::<ResponseFormat>(value).is_err());
+
+        for value in [
+            serde_json::json!({"type":"text", "extra":true}),
+            serde_json::json!({"type":"json_object", "extra":true}),
+            serde_json::json!({
+                "type":"json_schema",
+                "json_schema":{"name":"answer", "schema":{}},
+                "extra":true
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<ResponseFormat>(value.clone()).is_err(),
+                "unknown response_format fields must reject: {value}"
+            );
+        }
     }
 
     #[test]
@@ -2189,33 +2365,62 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_choice_parse_auto() {
-        assert_eq!(ToolChoiceValue::parse(None), ToolChoiceValue::Auto);
+    fn test_tool_choice_try_parse_auto() {
+        assert_eq!(
+            ToolChoiceValue::try_parse(None).unwrap(),
+            ToolChoiceValue::Auto
+        );
         let val = serde_json::json!("auto");
-        assert_eq!(ToolChoiceValue::parse(Some(&val)), ToolChoiceValue::Auto);
+        assert_eq!(
+            ToolChoiceValue::try_parse(Some(&val)).unwrap(),
+            ToolChoiceValue::Auto
+        );
     }
 
     #[test]
-    fn test_tool_choice_parse_none() {
+    fn test_tool_choice_try_parse_none() {
         let val = serde_json::json!("none");
-        assert_eq!(ToolChoiceValue::parse(Some(&val)), ToolChoiceValue::None);
+        assert_eq!(
+            ToolChoiceValue::try_parse(Some(&val)).unwrap(),
+            ToolChoiceValue::None
+        );
     }
 
     #[test]
-    fn test_tool_choice_parse_required() {
+    fn test_tool_choice_try_parse_required() {
         let val = serde_json::json!("required");
         assert_eq!(
-            ToolChoiceValue::parse(Some(&val)),
+            ToolChoiceValue::try_parse(Some(&val)).unwrap(),
             ToolChoiceValue::Required
         );
     }
 
     #[test]
-    fn test_tool_choice_parse_forced_function() {
+    fn test_tool_choice_try_parse_forced_function() {
         let val = serde_json::json!({"type": "function", "function": {"name": "get_weather"}});
-        match ToolChoiceValue::parse(Some(&val)) {
+        match ToolChoiceValue::try_parse(Some(&val)).unwrap() {
             ToolChoiceValue::Function(name) => assert_eq!(name, "get_weather"),
             other => panic!("Expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tool_choice_try_parse_rejects_malformed_values() {
+        for value in [
+            serde_json::json!("sometimes"),
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!({"type":"function"}),
+            serde_json::json!({"type":"other","function":{"name":"lookup"}}),
+            serde_json::json!({"type":"function","function":{}}),
+            serde_json::json!({"type":"function","function":{"name":""}}),
+            serde_json::json!({"type":"function","function":{"name":"lookup","extra":true}}),
+            serde_json::json!({"type":"function","function":{"name":"lookup"},"extra":true}),
+        ] {
+            assert!(
+                ToolChoiceValue::try_parse(Some(&value)).is_err(),
+                "malformed tool_choice must fail closed: {value}"
+            );
         }
     }
 
