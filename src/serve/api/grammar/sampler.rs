@@ -317,7 +317,12 @@ pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8)
 /// Transforms one stack into the set of stacks that all end at a character or
 /// token terminal. Handles `RuleRef` expansion (with alternatives) and
 /// skips `End`/`Alt` elements at the stack top.
-pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
+// Stage 9's supported twelve-key any-order object reaches exactly 32,768
+// active stacks at its widest byte boundary. This measured baseline is the
+// smallest power-of-two cap that preserves the required schema.
+const MAX_ACTIVE_STACKS: usize = 32_768;
+
+pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) -> bool {
     let mut todo: Vec<Stack> = Vec::new();
     todo.push(stack);
     // `seen` dedups across our BFS frontier.
@@ -332,6 +337,9 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
         if curr_stack.is_empty() {
             if !new_stacks.contains(&curr_stack) {
                 new_stacks.push(curr_stack);
+                if new_stacks.len() > MAX_ACTIVE_STACKS {
+                    return false;
+                }
             }
             continue;
         }
@@ -400,6 +408,9 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
             | GretType::TokenNotSet => {
                 if !new_stacks.contains(&curr_stack) {
                     new_stacks.push(curr_stack);
+                    if new_stacks.len() > MAX_ACTIVE_STACKS {
+                        return false;
+                    }
                 }
             }
             _ => {
@@ -412,6 +423,7 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
             }
         }
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -419,14 +431,14 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
 // ---------------------------------------------------------------------------
 
 /// Feeds one character to one stack, producing zero or more successor stacks.
-fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut Stacks) {
+fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut Stacks) -> bool {
     if stack.is_empty() {
-        return;
+        return true;
     }
     let top = *stack.last().unwrap();
     let elem = match at(grammar, top) {
         Some(e) => *e,
-        None => return,
+        None => return true,
     };
     if matches!(
         elem.ty,
@@ -438,7 +450,7 @@ fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut 
             | GretType::TokenNotSet
             | GretType::TokenSetMember
     ) {
-        return;
+        return true;
     }
 
     let (matched, after) = match_char(grammar, top, chr);
@@ -450,15 +462,18 @@ fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut 
                 new_stack.push(after);
             }
         }
-        advance_stack(grammar, new_stack, new_stacks);
+        return advance_stack(grammar, new_stack, new_stacks);
     }
+    true
 }
 
 /// Accept one character against the current stack set, returning the new set.
 pub fn accept_char(grammar: &Grammar, stacks: &Stacks, chr: u32) -> Stacks {
     let mut new_stacks: Stacks = Vec::with_capacity(stacks.len());
     for stack in stacks {
-        accept_chr_into(grammar, stack, chr, &mut new_stacks);
+        if !accept_chr_into(grammar, stack, chr, &mut new_stacks) {
+            return Vec::new();
+        }
     }
     new_stacks
 }
@@ -589,7 +604,10 @@ fn reject_candidates_for_stack(
         }
     }
     let mut next_stacks = Vec::new();
-    advance_stack(grammar, stack_after, &mut next_stacks);
+    if !advance_stack(grammar, stack_after, &mut next_stacks) {
+        rejects.extend(next_candidates);
+        return rejects;
+    }
 
     let mut deeper_rejects =
         reject_candidates(grammar, &next_stacks, &next_candidates, code_points);
@@ -686,10 +704,15 @@ impl GrammarRuntime {
                 }
             }
             let mut advanced: Stacks = Vec::new();
-            advance_stack(&grammar, stack, &mut advanced);
+            if !advance_stack(&grammar, stack, &mut advanced) {
+                return None;
+            }
             for s in advanced {
                 if !stacks.contains(&s) {
                     stacks.push(s);
+                    if stacks.len() > MAX_ACTIVE_STACKS {
+                        return None;
+                    }
                 }
             }
             // Scan to end-of-sequence.
@@ -848,7 +871,10 @@ impl GrammarRuntime {
                     if at(&self.grammar, after).is_some_and(|next| !is_end_of_sequence(next)) {
                         stack_after.push(after);
                     }
-                    advance_stack(&self.grammar, stack_after, &mut stacks_new);
+                    if !advance_stack(&self.grammar, stack_after, &mut stacks_new) {
+                        self.stacks.clear();
+                        return false;
+                    }
                 }
                 continue;
             }
@@ -863,6 +889,10 @@ impl GrammarRuntime {
             for surviving in current_stacks {
                 if !stacks_new.contains(&surviving) {
                     stacks_new.push(surviving);
+                    if stacks_new.len() > MAX_ACTIVE_STACKS {
+                        self.stacks.clear();
+                        return false;
+                    }
                 }
             }
         }
@@ -1688,5 +1718,23 @@ mod tests {
             "(call)+ grammar MUST accept a second complete call without runtime reset"
         );
         assert!(rt.is_accepted(), "still accepting after the second call");
+    }
+
+    #[test]
+    fn runtime_rejects_more_than_the_active_stack_budget() {
+        let mut source = String::from("root ::= ");
+        for index in 0..=MAX_ACTIVE_STACKS {
+            if index > 0 {
+                source.push_str(" | ");
+            }
+            source.push_str(&format!("\"a{index:05}\""));
+        }
+        source.push('\n');
+        let grammar = crate::serve::api::grammar::parse(&source).expect("bounded grammar parse");
+        let root = grammar.rule_id("root").expect("root rule");
+        assert!(
+            GrammarRuntime::new(grammar, root).is_none(),
+            "runtime MUST fail closed when initial alternatives exceed 32,768 active stacks"
+        );
     }
 }

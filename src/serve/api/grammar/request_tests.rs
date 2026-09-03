@@ -65,6 +65,30 @@ fn vllm_choice_regex_json_and_raw_grammar_compile_and_enforce() {
 }
 
 #[test]
+fn public_choice_resources_are_bounded_before_grammar_expansion() {
+    let at_limit = StructuredOutputs {
+        choice: Some((0..MAX_CHOICES).map(|index| format!("v{index}")).collect()),
+        ..Default::default()
+    };
+    compile_structured_outputs(&at_limit).expect("choice count at limit");
+
+    let above_limit = StructuredOutputs {
+        choice: Some((0..=MAX_CHOICES).map(|index| format!("v{index}")).collect()),
+        ..Default::default()
+    };
+    let error = compile_structured_outputs(&above_limit).expect_err("choice count above limit");
+    assert!(error.message.contains("1024-entry resource limit"));
+
+    let oversized_literals = StructuredOutputs {
+        choice: Some(vec!["x".repeat(MAX_CHOICE_LITERAL_BYTES + 1)]),
+        ..Default::default()
+    };
+    let error =
+        compile_structured_outputs(&oversized_literals).expect_err("literal bytes above limit");
+    assert!(error.message.contains("1048576-byte aggregate"));
+}
+
+#[test]
 fn current_and_legacy_structural_tag_surfaces_compile_and_enforce() {
     let current = request_with(serde_json::json!({
         "structured_outputs": {
@@ -341,11 +365,9 @@ fn required_tool_choice_precedes_unused_output_constraint() {
         "response_format":{"type":"structural_tag", "format":{}}
     }));
     let tool_choice = validate_tool_request(&request).unwrap();
-    assert!(
-        compile_request_output_constraint(&request, &tool_choice)
-            .unwrap()
-            .is_none()
-    );
+    assert!(compile_request_output_constraint(&request, &tool_choice)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -356,11 +378,9 @@ fn automatic_tools_do_not_erase_an_explicit_output_constraint() {
     }));
     let tool_choice = validate_tool_request(&request).unwrap();
     assert_eq!(tool_choice, ToolChoiceValue::Auto);
-    assert!(
-        compile_request_output_constraint(&request, &tool_choice)
-            .unwrap()
-            .is_some()
-    );
+    assert!(compile_request_output_constraint(&request, &tool_choice)
+        .unwrap()
+        .is_some());
 }
 
 #[test]

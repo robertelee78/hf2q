@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use super::{Grammar, json_schema, lark, parser, regex_gbnf, structural_tag};
+use super::{json_schema, lark, parser, regex_gbnf, structural_tag, Grammar};
 use crate::serve::api::schema::{
     ChatCompletionRequest, ResponseFormat, StructuredOutputJson, StructuredOutputs, ToolChoiceValue,
 };
@@ -35,6 +35,10 @@ number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1
 ws ::= | " " | "\n" [ \t]{0,20}
 "#;
 
+const MAX_RAW_CONSTRAINT_BYTES: usize = 1024 * 1024;
+const MAX_CHOICES: usize = 1_024;
+const MAX_CHOICE_LITERAL_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestGrammarError {
     pub param: String,
@@ -64,6 +68,12 @@ fn parse_gbnf(source: &str, param: &'static str) -> Result<Grammar, RequestGramm
 }
 
 fn parse_vllm_grammar(source: &str, param: &'static str) -> Result<Grammar, RequestGrammarError> {
+    if source.len() > MAX_RAW_CONSTRAINT_BYTES {
+        return Err(RequestGrammarError::new(
+            param,
+            format!("grammar input exceeds the {MAX_RAW_CONSTRAINT_BYTES}-byte resource limit"),
+        ));
+    }
     let normalized = lark::normalize_for_gbnf(source)
         .map_err(|error| RequestGrammarError::new(param, error.to_string()))?;
     parse_gbnf(&normalized, param)
@@ -73,6 +83,20 @@ fn compile_structural_tag(
     payload: &Value,
     param: &'static str,
 ) -> Result<Grammar, RequestGrammarError> {
+    let bytes = serde_json::to_vec(payload).map_err(|error| {
+        RequestGrammarError::new(
+            param,
+            format!("structural tag serialization failed: {error}"),
+        )
+    })?;
+    if bytes.len() > MAX_RAW_CONSTRAINT_BYTES {
+        return Err(RequestGrammarError::new(
+            param,
+            format!(
+                "serialized structural tag exceeds the {MAX_RAW_CONSTRAINT_BYTES}-byte resource limit"
+            ),
+        ));
+    }
     structural_tag::compile(payload)
         .map_err(|error| RequestGrammarError::new(param, error.to_string()))
 }
@@ -82,10 +106,22 @@ fn compile_schema(
     param: &'static str,
     whitespace_pattern: Option<&str>,
 ) -> Result<Grammar, RequestGrammarError> {
+    let bytes = serde_json::to_vec(schema).map_err(|error| {
+        RequestGrammarError::new(param, format!("JSON Schema serialization failed: {error}"))
+    })?;
+    if bytes.len() > MAX_RAW_CONSTRAINT_BYTES {
+        return Err(RequestGrammarError::new(
+            param,
+            format!(
+                "serialized JSON Schema exceeds the {MAX_RAW_CONSTRAINT_BYTES}-byte resource limit"
+            ),
+        ));
+    }
     let source = json_schema::schema_to_gbnf_with_whitespace(schema, whitespace_pattern).map_err(
         |error| RequestGrammarError::new(param, format!("JSON Schema compilation failed: {error}")),
     )?;
-    parse_gbnf(&source, param)
+    parser::parse_generated(&source)
+        .map_err(|error| RequestGrammarError::new(param, format!("GBNF parse failed: {error}")))
 }
 
 fn configured_whitespace(
@@ -277,6 +313,28 @@ pub fn compile_structured_outputs(
                 "choice must contain at least one string",
             ));
         }
+        if choices.len() > MAX_CHOICES {
+            return Err(RequestGrammarError::new(
+                "structured_outputs.choice",
+                format!("choice exceeds the {MAX_CHOICES}-entry resource limit"),
+            ));
+        }
+        let literal_bytes = choices.iter().try_fold(0usize, |total, choice| {
+            total.checked_add(choice.len()).ok_or_else(|| {
+                RequestGrammarError::new(
+                    "structured_outputs.choice",
+                    "choice literal byte count overflowed the resource counter",
+                )
+            })
+        })?;
+        if literal_bytes > MAX_CHOICE_LITERAL_BYTES {
+            return Err(RequestGrammarError::new(
+                "structured_outputs.choice",
+                format!(
+                    "choice literals exceed the {MAX_CHOICE_LITERAL_BYTES}-byte aggregate resource limit"
+                ),
+            ));
+        }
         if structured.disable_additional_properties.is_some() {
             return Err(RequestGrammarError::new(
                 "structured_outputs.disable_additional_properties",
@@ -298,6 +356,12 @@ pub fn compile_structured_outputs(
             return Err(RequestGrammarError::new(
                 "structured_outputs.regex",
                 "regex must not contain NUL",
+            ));
+        }
+        if expression.len() > MAX_RAW_CONSTRAINT_BYTES {
+            return Err(RequestGrammarError::new(
+                "structured_outputs.regex",
+                format!("regex exceeds the {MAX_RAW_CONSTRAINT_BYTES}-byte resource limit"),
             ));
         }
         if structured.disable_additional_properties.is_some() {
@@ -356,6 +420,14 @@ pub fn compile_structured_outputs(
         .structural_tag
         .as_deref()
         .expect("validated structural_tag constraint");
+    if source.len() > MAX_RAW_CONSTRAINT_BYTES {
+        return Err(RequestGrammarError::new(
+            "structured_outputs.structural_tag",
+            format!(
+                "serialized structural tag exceeds the {MAX_RAW_CONSTRAINT_BYTES}-byte resource limit"
+            ),
+        ));
+    }
     let payload = serde_json::from_str(source).map_err(|error| {
         RequestGrammarError::new(
             "structured_outputs.structural_tag",

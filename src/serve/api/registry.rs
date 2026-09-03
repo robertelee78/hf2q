@@ -1728,19 +1728,19 @@ fn combine_schema_variant_grammars(grammars: Vec<String>) -> Result<String, Stri
     if grammars.len() == 1 {
         return Ok(grammars.into_iter().next().expect("one grammar"));
     }
-    use crate::serve::api::grammar::{parse, rename_rules, serialize};
+    use crate::serve::api::grammar::{parser::parse_generated, rename_rules, serialize};
 
     let mut roots = Vec::with_capacity(grammars.len());
     let mut bodies = String::new();
     for (index, source) in grammars.iter().enumerate() {
-        let parsed = parse(source)
+        let parsed = parse_generated(source)
             .map_err(|error| format!("schema variant {index} grammar failed to parse: {error}"))?;
         let renamed = rename_rules(&parsed, |name| format!("variant-{index}-{name}"));
         roots.push(format!("variant-{index}-root"));
         bodies.push_str(&serialize(&renamed));
     }
     let combined = format!("root ::= {}\n{}", roots.join(" | "), bodies);
-    parse(&combined)
+    parse_generated(&combined)
         .map_err(|error| format!("combined schema variants failed to parse: {error}"))?;
     Ok(combined)
 }
@@ -5048,7 +5048,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn grammar_runtime_for_gbnf(gbnf: &str) -> crate::serve::api::grammar::sampler::GrammarRuntime {
-        let g = crate::serve::api::grammar::parser::parse(gbnf)
+        let g = crate::serve::api::grammar::parser::parse_generated(gbnf)
             .unwrap_or_else(|e| panic!("parse GBNF:\n{}\nerror: {}", gbnf, e));
         let rid = g
             .rule_id("root")

@@ -124,6 +124,9 @@ impl std::error::Error for ParseError {}
 // exploding.
 // ---------------------------------------------------------------------------
 const MAX_REPETITION_THRESHOLD: u64 = 2000;
+const MAX_RAW_GRAMMAR_BYTES: usize = 1024 * 1024;
+const MAX_GRAMMAR_RULES: usize = 262_144;
+const MAX_GRAMMAR_ELEMENTS: usize = 4_194_304;
 /// Maximum explicitly excluded IDs in one local token-set terminal. The set
 /// is stored compactly; the vocabulary is never enumerated.
 const MAX_TOKEN_SET_MEMBERS: usize = 1024;
@@ -134,7 +137,14 @@ const MAX_TOKEN_SET_MEMBERS: usize = 1024;
 
 /// Parse a GBNF grammar string. Returns `Err(ParseError)` on malformed input.
 pub fn parse(src: &str) -> Result<Grammar, ParseError> {
-    parse_impl(src, None)
+    parse_impl(src, None, true)
+}
+
+/// Parse compiler-generated GBNF after its original untrusted input has
+/// already passed the 1 MiB request limit. Generated grammar expansion is
+/// governed by the rule/element limits, not by the wire-size limit.
+pub(crate) fn parse_generated(src: &str) -> Result<Grammar, ParseError> {
+    parse_impl(src, None, false)
 }
 
 /// Parse GBNF with a model-bound textual token resolver.
@@ -149,7 +159,7 @@ pub fn parse_with_token_resolver<F>(src: &str, mut resolver: F) -> Result<Gramma
 where
     F: FnMut(&str) -> Result<u32, String>,
 {
-    parse_impl(src, Some(&mut resolver))
+    parse_impl(src, Some(&mut resolver), true)
 }
 
 /// Resolve token terminals against a concrete Hugging Face tokenizer.
@@ -194,7 +204,16 @@ pub fn parse_with_tokenizer(
 fn parse_impl(
     src: &str,
     token_resolver: Option<&mut dyn FnMut(&str) -> Result<u32, String>>,
+    enforce_raw_limit: bool,
 ) -> Result<Grammar, ParseError> {
+    if enforce_raw_limit && src.len() > MAX_RAW_GRAMMAR_BYTES {
+        return Err(ParseError {
+            offset: MAX_RAW_GRAMMAR_BYTES,
+            message: format!(
+                "grammar input exceeds the {MAX_RAW_GRAMMAR_BYTES}-byte resource limit"
+            ),
+        });
+    }
     let bytes = src.as_bytes();
     let mut state = ParserState {
         bytes,
@@ -205,6 +224,29 @@ fn parse_impl(
     let mut pos = parse_space(bytes, 0, true);
     while pos < bytes.len() && bytes[pos] != 0 {
         pos = state.parse_rule(pos)?;
+    }
+    if state.rules.len() > MAX_GRAMMAR_RULES {
+        return Err(ParseError {
+            offset: 0,
+            message: format!(
+                "grammar has {} rules, exceeding the {MAX_GRAMMAR_RULES}-rule resource limit",
+                state.rules.len()
+            ),
+        });
+    }
+    let element_count = state.rules.iter().try_fold(0usize, |total, rule| {
+        total.checked_add(rule.len()).ok_or(ParseError {
+            offset: 0,
+            message: "grammar element count overflowed the resource counter".into(),
+        })
+    })?;
+    if element_count > MAX_GRAMMAR_ELEMENTS {
+        return Err(ParseError {
+            offset: 0,
+            message: format!(
+                "grammar has {element_count} expanded elements, exceeding the {MAX_GRAMMAR_ELEMENTS}-element resource limit"
+            ),
+        });
     }
     // Validate: every referenced rule must be defined (non-empty).
     for (rule_idx, rule) in state.rules.iter().enumerate() {
@@ -1556,5 +1598,38 @@ mod tests {
         let g = parse_ok("root ::= \n");
         assert_eq!(g.rules.len(), 1);
         assert_eq!(g.rules[0], vec![GretElement::new(GretType::End, 0)]);
+    }
+
+    #[test]
+    fn raw_grammar_resource_limit_is_exact_and_deterministic() {
+        let mut source = String::from("root ::= \"a\"\n");
+        source.push_str(&" ".repeat(MAX_RAW_GRAMMAR_BYTES - source.len()));
+        assert_eq!(source.len(), MAX_RAW_GRAMMAR_BYTES);
+        parse(&source).expect("grammar at the raw byte limit");
+
+        source.push(' ');
+        let error = parse(&source).expect_err("grammar above the raw byte limit");
+        assert!(error.message.contains("1048576-byte resource limit"));
+    }
+
+    #[test]
+    fn rule_and_expanded_element_limits_fail_closed() {
+        let mut too_many_rules = String::from("root ::= \"x\"\n");
+        for index in 1..=MAX_GRAMMAR_RULES {
+            too_many_rules.push_str(&format!("r{index} ::= \"x\"\n"));
+        }
+        let error = parse_generated(&too_many_rules).expect_err("rule limit + 1");
+        assert!(error
+            .message
+            .contains("262144-rule resource limit"));
+
+        let mut too_many_elements = String::from("root ::= \"");
+        // The closing End element makes this exactly one over the limit.
+        too_many_elements.push_str(&"a".repeat(MAX_GRAMMAR_ELEMENTS));
+        too_many_elements.push_str("\"\n");
+        let error = parse_generated(&too_many_elements).expect_err("expanded element limit + 1");
+        assert!(error
+            .message
+            .contains("4194304-element resource limit"));
     }
 }

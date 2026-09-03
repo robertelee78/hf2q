@@ -63,14 +63,18 @@ fn string_format_pattern(format: &str) -> Option<&'static str> {
         ),
         "ipv4" => Some(r"^((25[0-5]|2[0-4]\d|[0-1]?\d?\d)\.){3}(25[0-5]|2[0-4]\d|[0-1]?\d?\d)$"),
         "ipv6" => Some(
-            r"^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$",
+            r"^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$",
         ),
         "hostname" => Some(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$"),
         "uuid" | "uuid1" | "uuid2" | "uuid3" | "uuid4" | "uuid5" => {
             Some(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
         }
-        "uri" => Some(r#"^[a-zA-Z][a-zA-Z+.-]*:[^\s\"\\]+$"#),
-        "uri-reference" => Some(r#"^[^\s\"\\]*$"#),
+        "uri" => Some(
+            r#"^[a-zA-Z][a-zA-Z+\.-]*:(//(([\w\.~!$&'()*+,;=:-]|%[0-9A-Fa-f][0-9A-Fa-f])*@)?([\w\.~!$&'()*+,;=-]|%[0-9A-Fa-f][0-9A-Fa-f])*(\:\d*)?(/([\w\.~!$&'()*+,;=:@-]|%[0-9A-Fa-f][0-9A-Fa-f])*)*|/?(([\w\.~!$&'()*+,;=:@-]|%[0-9A-Fa-f][0-9A-Fa-f])+(/([\w\.~!$&'()*+,;=:@-]|%[0-9A-Fa-f][0-9A-Fa-f])*)*)?)(\?([\w\.~!$&'()*+,;=:@/\?-]|%[0-9A-Fa-f][0-9A-Fa-f])*)?(#([\w\.~!$&'()*+,;=:@/\?-]|%[0-9A-Fa-f][0-9A-Fa-f])*)?$"#,
+        ),
+        "uri-reference" => Some(
+            r#"^(//(([\w\.~!$&'()*+,;=:-]|%[0-9A-Fa-f][0-9A-Fa-f])*@)?([\w\.~!$&'()*+,;=-]|%[0-9A-Fa-f][0-9A-Fa-f])*(\:\d*)?(/([\w\.~!$&'()*+,;=:@-]|%[0-9A-Fa-f][0-9A-Fa-f])*)*|/(([\w\.~!$&'()*+,;=:@-]|%[0-9A-Fa-f][0-9A-Fa-f])+(/([\w\.~!$&'()*+,;=:@-]|%[0-9A-Fa-f][0-9A-Fa-f])*)*)?|([\w\.~!$&'()*+,;=@-]|%[0-9A-Fa-f][0-9A-Fa-f])+(/([\w\.~!$&'()*+,;=:@-]|%[0-9A-Fa-f][0-9A-Fa-f])*)*)?(\?([\w\.~!$&'()*+,;=:@/\?-]|%[0-9A-Fa-f][0-9A-Fa-f])*)?(#([\w\.~!$&'()*+,;=:@/\?-]|%[0-9A-Fa-f][0-9A-Fa-f])*)?$"#,
+        ),
         "uri-template" => Some(
             r#"^([^\s\"\\{}]|\{[+#./;?&=,!@|]?[a-zA-Z0-9_%]+([.:*][a-zA-Z0-9_%]+)*(,[a-zA-Z0-9_%]+([.:*][a-zA-Z0-9_%]+)*)*\})*$"#,
         ),
@@ -2747,7 +2751,8 @@ mod tests {
 
     fn runtime(schema_json: &str) -> GrammarRuntime {
         let gbnf = compile(schema_json);
-        let g = parse(&gbnf).unwrap_or_else(|e| panic!("parse gbnf:\n{}\nerror: {}", gbnf, e));
+        let g = super::super::parser::parse_generated(&gbnf)
+            .unwrap_or_else(|e| panic!("parse gbnf:\n{}\nerror: {}", gbnf, e));
         let rid = g.rule_id("root").unwrap();
         GrammarRuntime::new(g, rid).unwrap()
     }
@@ -3623,7 +3628,8 @@ mod tests {
 
         // Spot-check: any-position must be enforced — reversed order accepted.
         let gbnf = result.unwrap();
-        let g = super::super::parser::parse(&gbnf).unwrap_or_else(|e| panic!("parse gbnf: {}", e));
+        let g = super::super::parser::parse_generated(&gbnf)
+            .unwrap_or_else(|e| panic!("parse gbnf: {}", e));
         let rid = g.rule_id("root").unwrap();
         let mut rt = GrammarRuntime::new(g, rid).unwrap();
         // Emit keys in reverse alphabetical order (k7..k0).
@@ -3769,7 +3775,7 @@ mod tests {
         let instance: Value = serde_json::from_str(instance).expect("instance fixture JSON");
         let bytes = serde_json::to_vec(&instance).expect("serialize instance");
         let grammar = schema_to_gbnf(&schema).expect("compile schema fixture");
-        let grammar = parse(&grammar)
+        let grammar = super::super::parser::parse_generated(&grammar)
             .unwrap_or_else(|error| panic!("parse generated grammar: {error}\n{grammar}"));
         let root = grammar.rule_id("root").expect("root rule");
         let mut runtime = GrammarRuntime::new(grammar, root).expect("runtime");
@@ -3939,11 +3945,11 @@ mod tests {
             ("date-time", "2026-09-03T12:30:00Z", "2026-09-03 12:30:00Z"),
             ("duration", "P3DT4H", "three days"),
             ("ipv4", "192.168.1.1", "999.168.1.1"),
-            ("ipv6", "2001:db8::1", "not:ipv6"),
+            ("ipv6", "::ffff:192.0.2.128", "not:ipv6"),
             ("hostname", "api.example-2.com", "-bad.example"),
             ("uuid", "550e8400-e29b-41d4-a716-446655440000", "550e8400"),
-            ("uri", "https://example.com/a?q=1", "relative/path"),
-            ("uri-reference", "../a?q=1", "contains space"),
+            ("uri", "https://example.com/a?q=1", "http:%GG"),
+            ("uri-reference", "../a?q=1", "%GG"),
             ("uri-template", "/users/{id}", "/users/{"),
             ("json-pointer", "/a~1b/0", "/bad~2escape"),
             ("relative-json-pointer", "2/owner", "02/owner"),

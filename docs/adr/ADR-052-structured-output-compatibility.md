@@ -88,6 +88,13 @@ wire-format emitter MAY render that model differently, but it MUST enforce the
 same assertions or reject the request. Runtime activation and termination MUST
 be explicit state transitions shared by unary and streaming generation.
 
+The initial 8,192-rule, 262,144-element, and 16,384-active-stack resource
+hypothesis also rejected required inputs. Measured compiler output is 66,226
+rules / 930,013 elements for Stage 6 and 131,226 rules / 1,835,799 elements for
+Stage 9. The supported twelve-key reverse-order boundary peaks at 32,768 active
+stacks. The limits below are therefore reformulated with bounded headroom above
+those measurements; public wire input remains capped independently.
+
 ## Decision
 
 ### 1. Supported request surfaces
@@ -217,8 +224,8 @@ MUST implement identical grammar-state transitions.
 Untrusted constraints MUST be bounded before runtime. Initial limits are:
 
 - raw grammar or serialized schema input: 1 MiB;
-- rules: 8,192;
-- total grammar elements after expansion: 262,144;
+- compiler-generated rules: 262,144;
+- total compiler-generated grammar elements after expansion: 4,194,304;
 - schema traversal depth: 64;
 - resolved local references: 1,024;
 - object properties: 32 per object;
@@ -226,7 +233,9 @@ Untrusted constraints MUST be bounded before runtime. Initial limits are:
 - choices/enumerants/structural-tag structures: 1,024;
 - total choice/enumerant literal bytes: 1 MiB;
 - repetition bound: 2,000;
-- runtime active stacks: 16,384;
+- runtime active stacks: 32,768 (the measured peak for the supported twelve-key
+  reverse-order boundary; the 16,384 hypothesis rejected it at its seventh
+  object member);
 - structural-tag formats: 256, nesting depth: 32;
 - lazy-trigger buffer: 64 KiB.
 
