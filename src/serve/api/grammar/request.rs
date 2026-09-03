@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use super::{json_schema, parser, regex_gbnf, Grammar};
+use super::{Grammar, json_schema, lark, parser, regex_gbnf, structural_tag};
 use crate::serve::api::schema::{
     ChatCompletionRequest, ResponseFormat, StructuredOutputJson, StructuredOutputs, ToolChoiceValue,
 };
@@ -61,6 +61,20 @@ impl std::error::Error for RequestGrammarError {}
 fn parse_gbnf(source: &str, param: &'static str) -> Result<Grammar, RequestGrammarError> {
     parser::parse(source)
         .map_err(|error| RequestGrammarError::new(param, format!("GBNF parse failed: {error}")))
+}
+
+fn parse_vllm_grammar(source: &str, param: &'static str) -> Result<Grammar, RequestGrammarError> {
+    let normalized = lark::normalize_for_gbnf(source)
+        .map_err(|error| RequestGrammarError::new(param, error.to_string()))?;
+    parse_gbnf(&normalized, param)
+}
+
+fn compile_structural_tag(
+    payload: &Value,
+    param: &'static str,
+) -> Result<Grammar, RequestGrammarError> {
+    structural_tag::compile(payload)
+        .map_err(|error| RequestGrammarError::new(param, error.to_string()))
 }
 
 fn compile_schema(
@@ -221,10 +235,21 @@ pub(crate) fn compile_response_format(
             }
             compile_schema(&schema, "response_format", whitespace_pattern).map(Some)
         }
-        ResponseFormat::StructuralTag { .. } => Err(RequestGrammarError::new(
-            "response_format",
-            "structural_tag compilation is not yet implemented",
-        )),
+        ResponseFormat::StructuralTag { spec } => {
+            if structured_options.is_some_and(|options| {
+                options.disable_any_whitespace.is_some()
+                    || options.disable_additional_properties.is_some()
+                    || options.whitespace_pattern.is_some()
+            }) {
+                return Err(RequestGrammarError::new(
+                    "structured_outputs",
+                    "JSON backend options cannot modify a structural_tag constraint",
+                ));
+            }
+            let mut payload = spec.clone();
+            payload.insert("type".into(), Value::String("structural_tag".into()));
+            compile_structural_tag(&Value::Object(payload), "response_format").map(Some)
+        }
     }
 }
 
@@ -319,12 +344,25 @@ pub fn compile_structured_outputs(
                 "disable_additional_properties applies only to JSON Schema constraints",
             ));
         }
-        return parse_gbnf(source, "structured_outputs.grammar");
+        return parse_vllm_grammar(source, "structured_outputs.grammar");
     }
-    Err(RequestGrammarError::new(
-        "structured_outputs.structural_tag",
-        "structural_tag compilation is not yet implemented",
-    ))
+    if structured.disable_additional_properties.is_some() {
+        return Err(RequestGrammarError::new(
+            "structured_outputs.disable_additional_properties",
+            "disable_additional_properties applies only to JSON Schema constraints",
+        ));
+    }
+    let source = structured
+        .structural_tag
+        .as_deref()
+        .expect("validated structural_tag constraint");
+    let payload = serde_json::from_str(source).map_err(|error| {
+        RequestGrammarError::new(
+            "structured_outputs.structural_tag",
+            format!("serialized structural tag is invalid JSON: {error}"),
+        )
+    })?;
+    compile_structural_tag(&payload, "structured_outputs.structural_tag")
 }
 
 /// Resolve all non-tool request surfaces to one grammar. A non-text OpenAI

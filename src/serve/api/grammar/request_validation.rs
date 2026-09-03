@@ -25,7 +25,7 @@ pub fn validate_tool_request(
             return Err(RequestGrammarError::new(
                 "tools",
                 "tools must contain at least one function when specified",
-            ))
+            ));
         }
         Some(tools) => tools,
         None => {

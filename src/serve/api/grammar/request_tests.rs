@@ -54,6 +54,48 @@ fn vllm_choice_regex_json_and_raw_grammar_compile_and_enforce() {
     let grammar = compile_structured_outputs(&raw).unwrap();
     assert!(accepts(&grammar, b"yes"));
     assert!(!accepts(&grammar, b"maybe"));
+
+    let lark = StructuredOutputs {
+        grammar: Some("start: \"yes\" | \"no\"".into()),
+        ..Default::default()
+    };
+    let grammar = compile_structured_outputs(&lark).unwrap();
+    assert!(accepts(&grammar, b"yes"));
+    assert!(!accepts(&grammar, b"maybe"));
+}
+
+#[test]
+fn current_and_legacy_structural_tag_surfaces_compile_and_enforce() {
+    let current = request_with(serde_json::json!({
+        "structured_outputs": {
+            "structural_tag": serde_json::json!({
+                "type":"structural_tag",
+                "format":{"type":"const_string","value":"ok"}
+            }).to_string()
+        }
+    }));
+    let grammar = compile_request_constraint(&current)
+        .unwrap()
+        .expect("current structural tag grammar");
+    assert!(accepts(&grammar, b"ok"));
+    assert!(!accepts(&grammar, b"no"));
+
+    let legacy = request_with(serde_json::json!({
+        "response_format": {
+            "type":"structural_tag",
+            "structures":[{
+                "begin":"<call>",
+                "schema":{"type":"string","const":"ok"},
+                "end":"</call>"
+            }],
+            "triggers":["<call>"]
+        }
+    }));
+    let grammar = compile_request_constraint(&legacy)
+        .unwrap()
+        .expect("legacy structural tag grammar");
+    assert!(accepts(&grammar, b"text<call>\"ok\"</call>tail"));
+    assert!(!accepts(&grammar, b"text<call>\"no\"</call>tail"));
 }
 
 #[test]
@@ -299,9 +341,11 @@ fn required_tool_choice_precedes_unused_output_constraint() {
         "response_format":{"type":"structural_tag", "format":{}}
     }));
     let tool_choice = validate_tool_request(&request).unwrap();
-    assert!(compile_request_output_constraint(&request, &tool_choice)
-        .unwrap()
-        .is_none());
+    assert!(
+        compile_request_output_constraint(&request, &tool_choice)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -312,9 +356,11 @@ fn automatic_tools_do_not_erase_an_explicit_output_constraint() {
     }));
     let tool_choice = validate_tool_request(&request).unwrap();
     assert_eq!(tool_choice, ToolChoiceValue::Auto);
-    assert!(compile_request_output_constraint(&request, &tool_choice)
-        .unwrap()
-        .is_some());
+    assert!(
+        compile_request_output_constraint(&request, &tool_choice)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

@@ -96,7 +96,10 @@ impl ApiError {
     pub fn model_not_loaded(model_name: &str) -> Self {
         Self::bare(
             StatusCode::BAD_REQUEST,
-            format!("The model '{}' is cached but not currently loaded. Start the server with `--model <path>` for this model.", model_name),
+            format!(
+                "The model '{}' is cached but not currently loaded. Start the server with `--model <path>` for this model.",
+                model_name
+            ),
             "invalid_request_error",
             Some("model_not_loaded"),
             Some("model".into()),
@@ -451,7 +454,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        use axum::http::{header, HeaderValue};
+        use axum::http::{HeaderValue, header};
 
         let status = self.status;
         let retry_after = self.retry_after_seconds;
@@ -685,11 +688,7 @@ impl MessageContent {
     /// `Some(text)` if non-empty, else `None`.
     pub fn as_text_opt(&self) -> Option<String> {
         let text = self.text();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.is_empty() { None } else { Some(text) }
     }
 }
 
@@ -837,12 +836,10 @@ pub struct StructuredOutputs {
     pub json_object: Option<bool>,
     #[serde(default)]
     pub grammar: Option<String>,
-    /// XGrammar structural-tag input is intentionally retained as raw JSON.
-    /// Its evolving legacy/current shapes require compiler-side semantic
-    /// validation, but the enclosing object and mutual exclusivity remain
-    /// fail-closed here.
+    /// vLLM carries XGrammar's current or legacy structural-tag object as a
+    /// serialized JSON string. Compiler-side validation remains fail closed.
     #[serde(default)]
-    pub structural_tag: Option<serde_json::Value>,
+    pub structural_tag: Option<String>,
     #[serde(default)]
     pub disable_any_whitespace: Option<bool>,
     #[serde(default)]
@@ -961,12 +958,12 @@ impl TryFrom<LlamaGrammarTriggerWire> for LlamaGrammarTrigger {
     fn try_from(wire: LlamaGrammarTriggerWire) -> Result<Self, Self::Error> {
         match (wire.trigger_type, wire.token) {
             (LlamaGrammarTriggerType::Token, None) => {
-                return Err("grammar trigger type 0 requires a token field".into())
+                return Err("grammar trigger type 0 requires a token field".into());
             }
             (LlamaGrammarTriggerType::Word, Some(_))
             | (LlamaGrammarTriggerType::Pattern, Some(_))
             | (LlamaGrammarTriggerType::PatternFull, Some(_)) => {
-                return Err("only grammar trigger type 0 may contain a token field".into())
+                return Err("only grammar trigger type 0 may contain a token field".into());
             }
             _ => {}
         }
@@ -1491,9 +1488,7 @@ impl ToolChoiceValue {
                     .and_then(serde_json::Value::as_object)
                     .ok_or_else(|| "tool_choice.function must be an object".to_string())?;
                 if function.len() != 1 {
-                    return Err(
-                        "tool_choice.function must contain exactly one name field".into(),
-                    );
+                    return Err("tool_choice.function must contain exactly one name field".into());
                 }
                 let name = function
                     .get("name")
@@ -1504,9 +1499,7 @@ impl ToolChoiceValue {
                 }
                 Ok(ToolChoiceValue::Function(name.to_string()))
             }
-            Some(_) => Err(
-                "tool_choice must be a string or a named function object".to_string(),
-            ),
+            Some(_) => Err("tool_choice must be a string or a named function object".to_string()),
         }
     }
 }
@@ -1727,10 +1720,12 @@ mod tests {
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(json["error"]["code"], "grammar_error");
         assert_eq!(json["error"]["param"], "response_format");
-        assert!(json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unclosed brace at pos 42"));
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unclosed brace at pos 42")
+        );
     }
 
     #[test]
@@ -1738,10 +1733,12 @@ mod tests {
         let err = ApiError::generation_error("Metal command buffer error");
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["error"]["code"], "generation_error");
-        assert!(json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Metal command buffer error"));
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Metal command buffer error")
+        );
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -2034,7 +2031,7 @@ mod tests {
             serde_json::json!({"json": "{\"type\":\"object\"}"}),
             serde_json::json!({"json_object": true}),
             serde_json::json!({"grammar": "root ::= \"ok\""}),
-            serde_json::json!({"structural_tag": {"format": {"type": "object"}}}),
+            serde_json::json!({"structural_tag": "{\"type\":\"structural_tag\",\"format\":{\"type\":\"const_string\",\"value\":\"ok\"}}"}),
         ];
 
         for value in cases {
@@ -2042,6 +2039,14 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{value} must deserialize: {error}"));
             assert_eq!(parsed.validate_exactly_one_constraint(), Ok(()));
         }
+
+        assert!(
+            serde_json::from_value::<StructuredOutputs>(serde_json::json!({
+                "structural_tag": {"type":"structural_tag","format":{"type":"const_string","value":"ok"}}
+            }))
+            .is_err(),
+            "vLLM structural_outputs.structural_tag is a serialized JSON string"
+        );
 
         let object: StructuredOutputs =
             serde_json::from_value(serde_json::json!({"json": {"type": "array"}})).unwrap();
