@@ -361,6 +361,10 @@ pub struct SamplingParams {
     /// `SamplingParams` without touching the field gets the
     /// pre-wave-2.5 unconditional-enforcement behavior.
     pub grammar_kind: GrammarKind,
+    /// Model-bound llama.cpp-compatible public lazy-grammar triggers. `None`
+    /// retains eager response grammar behavior (or the existing internal
+    /// family tool-marker gate selected by `grammar_kind`).
+    pub grammar_lazy: Option<super::grammar::LazyGrammarConfig>,
 
     // --- Wave-2.5 A4 — Tool-call parse-failure policy ---
     /// Policy for handling tool-call body parse failures.  Set from
@@ -439,6 +443,7 @@ impl Default for SamplingParams {
             grammar: None,
             token_bytes: None,
             grammar_kind: GrammarKind::default(),
+            grammar_lazy: None,
             tool_call_policy: ToolCallPolicy::Auto,
             tool_argument_wire_kinds: None,
             reasoning_forced_open: false,
@@ -516,6 +521,10 @@ pub(super) fn grammar_runtime_for_request(
             params.token_bytes.is_none(),
             "grammar token table present without a grammar"
         );
+        anyhow::ensure!(
+            params.grammar_lazy.is_none(),
+            "lazy grammar triggers present without a grammar"
+        );
         return Ok(None);
     };
     let root = grammar
@@ -527,12 +536,18 @@ pub(super) fn grammar_runtime_for_request(
     );
     let mut runtime = super::grammar::GrammarRuntime::new(grammar.clone(), root)
         .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
-    arm_lazy_tool_grammar(
-        &mut runtime,
-        params.grammar_kind,
-        registration,
-        params.reasoning_forced_open,
-    );
+    if let Some(lazy) = params.grammar_lazy.as_ref() {
+        runtime
+            .configure_public_lazy(lazy)
+            .map_err(|error| anyhow::anyhow!("invalid lazy grammar trigger pattern: {error}"))?;
+    } else {
+        arm_lazy_tool_grammar(
+            &mut runtime,
+            params.grammar_kind,
+            registration,
+            params.reasoning_forced_open,
+        );
+    }
     Ok(Some(runtime))
 }
 
@@ -2781,6 +2796,9 @@ pub struct PromptCacheKey {
     /// `None` means no grammar constraint; `Some(g)` means the entire
     /// GBNF rule set must match.
     pub grammar: Option<super::grammar::Grammar>,
+    /// Public lazy trigger configuration changes when enforcement begins and
+    /// therefore participates in terminal-response cache identity.
+    pub grammar_lazy: Option<super::grammar::LazyGrammarConfig>,
     /// ResponseFormat vs ToolCallBody — same Grammar but different kind
     /// produces different enforcement timing and therefore different output.
     /// Wired in wave-2.6 W-α5.
@@ -2831,6 +2849,7 @@ impl PromptCacheKey {
             stop_strings: params.stop_strings.clone(),
             logit_bias_sorted: bias_sorted,
             grammar: params.grammar.clone(),
+            grammar_lazy: params.grammar_lazy.clone(),
             grammar_kind: params.grammar_kind,
             frequency_penalty_bits: params.frequency_penalty.to_bits(),
             presence_penalty_bits: params.presence_penalty.to_bits(),
@@ -3111,6 +3130,7 @@ impl PromptCache {
                 stop_strings: Vec::new(),
                 logit_bias_sorted: Vec::new(),
                 grammar: None,
+                grammar_lazy: None,
                 grammar_kind: GrammarKind::default(),
                 frequency_penalty_bits: 0u32,
                 presence_penalty_bits: 0u32,
@@ -29886,6 +29906,57 @@ mod tests {
             .expect_err("Gemma grammar without table must fail before GPU sampling")
             .to_string()
             .contains("without its authoritative token byte table"));
+
+        let mut lazy_only = SamplingParams::default();
+        lazy_only.grammar_lazy = Some(super::super::grammar::LazyGrammarConfig {
+            token_triggers: vec![0],
+            ..Default::default()
+        });
+        assert!(grammar_runtime_for_request(&lazy_only, None)
+            .expect_err("lazy triggers without grammar must fail before sampling")
+            .to_string()
+            .contains("without a grammar"));
+    }
+
+    #[test]
+    fn request_runtime_uses_public_lazy_config_instead_of_family_marker() {
+        let registration = super::super::registry::find_for("qwen3.6").expect("Qwen registration");
+        let grammar = super::super::grammar::parse("root ::= <[7]> \"x\"\n").unwrap();
+        let params = SamplingParams {
+            grammar: Some(grammar),
+            token_bytes: Some(Arc::new(vec![Vec::new(); 8])),
+            grammar_kind: GrammarKind::ToolCallBodyAuto,
+            grammar_lazy: Some(super::super::grammar::LazyGrammarConfig {
+                token_triggers: vec![7],
+                ..Default::default()
+            }),
+            ..SamplingParams::default()
+        };
+        let mut runtime = grammar_runtime_for_request(&params, Some(&registration))
+            .unwrap()
+            .unwrap();
+
+        assert!(runtime.accept_token(1, b"not the registered family marker"));
+        assert!(runtime.is_awaiting_trigger());
+        assert!(runtime.accept_token(7, b"<public-trigger>"));
+        assert!(!runtime.is_awaiting_trigger());
+        assert!(!runtime.is_terminally_accepted());
+    }
+
+    #[test]
+    fn public_lazy_config_participates_in_prompt_cache_identity() {
+        let mut first = SamplingParams::default();
+        first.grammar_lazy = Some(super::super::grammar::LazyGrammarConfig {
+            token_triggers: vec![1],
+            ..Default::default()
+        });
+        let mut second = first.clone();
+        second.grammar_lazy.as_mut().unwrap().token_triggers = vec![2];
+
+        assert_ne!(
+            PromptCacheKey::from_params(&first),
+            PromptCacheKey::from_params(&second)
+        );
     }
 
     #[test]

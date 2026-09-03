@@ -184,11 +184,5 @@ pub(super) fn validate_lazy_fields(
         }
     }
 
-    // The request shape is valid, but hf2q's public-output runtime does not
-    // yet accept llama.cpp lazy trigger configuration. Reject explicitly so
-    // the fields can never be accepted and ignored.
-    Err(RequestGrammarError::new(
-        "grammar_lazy",
-        "lazy grammar activation is not yet implemented for public output constraints",
-    ))
+    Ok(())
 }

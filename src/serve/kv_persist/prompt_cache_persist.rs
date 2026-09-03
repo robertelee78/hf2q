@@ -183,6 +183,7 @@ pub fn try_serialize(cache: &PromptCache) -> Option<Vec<u8>> {
 ///     reasoning_tokens, finish_reason — restored verbatim.
 ///   * `key.grammar` defaults to `None` (persistence gated on
 ///     `grammar_was_none == true`).
+///   * `key.grammar_lazy` defaults to `None` for the same reason.
 ///   * `key.grammar_kind` defaults to `GrammarKind::default()`.
 ///   * `key.tool_call_policy` defaults to `ToolCallPolicy::default()`.
 ///   * `fragments` defaults to `None` — iter-96 lookup falls back
@@ -210,6 +211,7 @@ pub fn try_deserialize(bytes: &[u8]) -> Option<PromptCache> {
             stop_strings: snap.key.stop_strings,
             logit_bias_sorted: snap.key.logit_bias_sorted,
             grammar: None,
+            grammar_lazy: None,
             grammar_kind: GrammarKind::default(),
             frequency_penalty_bits: snap.key.frequency_penalty_bits,
             presence_penalty_bits: snap.key.presence_penalty_bits,

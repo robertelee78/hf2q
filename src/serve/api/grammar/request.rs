@@ -4,15 +4,21 @@
 
 use serde_json::Value;
 
-use super::{json_schema, lark, parser, regex_gbnf, structural_tag, Grammar};
+use super::{
+    json_schema, lark, parser, regex_gbnf, structural_tag, Grammar, LazyGrammarConfig,
+};
 use crate::serve::api::schema::{
-    ChatCompletionRequest, ResponseFormat, StructuredOutputJson, StructuredOutputs, ToolChoiceValue,
+    ChatCompletionRequest, LlamaGrammarTriggerType, ResponseFormat, StructuredOutputJson,
+    StructuredOutputs, ToolChoiceValue,
 };
 
 #[path = "request_validation.rs"]
 mod validation;
 pub use validation::validate_tool_request;
 use validation::{first_lazy_param, validate_lazy_fields};
+
+const MAX_LAZY_TRIGGER_COUNT: usize = 1024;
+const MAX_LAZY_PATTERN_BYTES: usize = 1024 * 1024;
 
 const JSON_OBJECT_GRAMMAR: &str = r#"root   ::= object
 value  ::= object | array | string | number | ("true" | "false" | "null") ws
@@ -67,7 +73,26 @@ fn parse_gbnf(source: &str, param: &'static str) -> Result<Grammar, RequestGramm
         .map_err(|error| RequestGrammarError::new(param, format!("GBNF parse failed: {error}")))
 }
 
-fn parse_vllm_grammar(source: &str, param: &'static str) -> Result<Grammar, RequestGrammarError> {
+fn parse_gbnf_bound(
+    source: &str,
+    param: &'static str,
+    tokenizer: Option<&tokenizers::Tokenizer>,
+) -> Result<Grammar, RequestGrammarError> {
+    tokenizer.map_or_else(
+        || parse_gbnf(source, param),
+        |tokenizer| {
+            parser::parse_with_tokenizer(source, tokenizer).map_err(|error| {
+                RequestGrammarError::new(param, format!("GBNF parse failed: {error}"))
+            })
+        },
+    )
+}
+
+fn parse_vllm_grammar(
+    source: &str,
+    param: &'static str,
+    tokenizer: Option<&tokenizers::Tokenizer>,
+) -> Result<Grammar, RequestGrammarError> {
     if source.len() > MAX_RAW_CONSTRAINT_BYTES {
         return Err(RequestGrammarError::new(
             param,
@@ -76,7 +101,7 @@ fn parse_vllm_grammar(source: &str, param: &'static str) -> Result<Grammar, Requ
     }
     let normalized = lark::normalize_for_gbnf(source)
         .map_err(|error| RequestGrammarError::new(param, error.to_string()))?;
-    parse_gbnf(&normalized, param)
+    parse_gbnf_bound(&normalized, param, tokenizer)
 }
 
 fn compile_structural_tag(
@@ -289,8 +314,9 @@ pub(crate) fn compile_response_format(
     }
 }
 
-pub fn compile_structured_outputs(
+fn compile_structured_outputs_impl(
     structured: &StructuredOutputs,
+    tokenizer: Option<&tokenizers::Tokenizer>,
 ) -> Result<Grammar, RequestGrammarError> {
     structured
         .validate_exactly_one_constraint()
@@ -408,7 +434,7 @@ pub fn compile_structured_outputs(
                 "disable_additional_properties applies only to JSON Schema constraints",
             ));
         }
-        return parse_vllm_grammar(source, "structured_outputs.grammar");
+        return parse_vllm_grammar(source, "structured_outputs.grammar", tokenizer);
     }
     if structured.disable_additional_properties.is_some() {
         return Err(RequestGrammarError::new(
@@ -437,12 +463,204 @@ pub fn compile_structured_outputs(
     compile_structural_tag(&payload, "structured_outputs.structural_tag")
 }
 
-/// Resolve all non-tool request surfaces to one grammar. A non-text OpenAI
-/// response format replaces the same vLLM structured-output slot while
-/// retaining backend options; selecting a different slot is a conflict.
-/// `text` contributes no constraint and preserves another explicit surface.
-pub fn compile_request_constraint(
+pub fn compile_structured_outputs(
+    structured: &StructuredOutputs,
+) -> Result<Grammar, RequestGrammarError> {
+    compile_structured_outputs_impl(structured, None)
+}
+
+fn resolve_single_token(
+    value: &str,
+    param: &'static str,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<u32, RequestGrammarError> {
+    let encoding = tokenizer.encode(value, false).map_err(|error| {
+        RequestGrammarError::new(param, format!("tokenizer rejected value: {error}"))
+    })?;
+    let [token_id] = encoding.get_ids() else {
+        return Err(RequestGrammarError::new(
+            param,
+            format!(
+                "value must resolve to exactly one token id, resolved {}",
+                encoding.get_ids().len()
+            ),
+        ));
+    };
+    if tokenizer.id_to_token(*token_id).is_none() {
+        return Err(RequestGrammarError::new(
+            param,
+            format!("resolved token id {token_id} is outside the model vocabulary"),
+        ));
+    }
+    Ok(*token_id)
+}
+
+fn compile_lazy_config(
     request: &ChatCompletionRequest,
+    grammar_present: bool,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<Option<LazyGrammarConfig>, RequestGrammarError> {
+    if request.grammar_lazy != Some(true) {
+        if request.preserved_tokens.is_some() || request.grammar_triggers.is_some() {
+            return Err(RequestGrammarError::new(
+                "grammar_lazy",
+                "preserved_tokens and grammar_triggers require grammar_lazy=true",
+            ));
+        }
+        return Ok(None);
+    }
+    if !grammar_present {
+        return Err(RequestGrammarError::new(
+            "grammar_lazy",
+            "grammar_lazy=true requires a grammar constraint",
+        ));
+    }
+
+    let triggers = request.grammar_triggers.as_deref().ok_or_else(|| {
+        RequestGrammarError::new(
+            "grammar_triggers",
+            "grammar_lazy=true requires at least one grammar trigger",
+        )
+    })?;
+    if triggers.is_empty() {
+        return Err(RequestGrammarError::new(
+            "grammar_triggers",
+            "grammar_lazy=true requires at least one grammar trigger",
+        ));
+    }
+    if triggers.len() > MAX_LAZY_TRIGGER_COUNT {
+        return Err(RequestGrammarError::new(
+            "grammar_triggers",
+            format!("at most {MAX_LAZY_TRIGGER_COUNT} grammar triggers are allowed"),
+        ));
+    }
+
+    let preserved = request.preserved_tokens.as_deref().unwrap_or_default();
+    if preserved.len() > MAX_LAZY_TRIGGER_COUNT {
+        return Err(RequestGrammarError::new(
+            "preserved_tokens",
+            format!("at most {MAX_LAZY_TRIGGER_COUNT} preserved tokens are allowed"),
+        ));
+    }
+    let mut preserved_tokens = preserved
+        .iter()
+        .map(|value| resolve_single_token(value, "preserved_tokens", tokenizer))
+        .collect::<Result<Vec<_>, _>>()?;
+    preserved_tokens.sort_unstable();
+    preserved_tokens.dedup();
+
+    let mut token_triggers = Vec::new();
+    let mut trigger_patterns = Vec::new();
+    let mut pattern_bytes = 0usize;
+    for trigger in triggers {
+        match trigger.trigger_type {
+            LlamaGrammarTriggerType::Token => {
+                let signed = trigger.token.expect("schema validates token trigger");
+                let token_id = u32::try_from(signed).map_err(|_| {
+                    RequestGrammarError::new(
+                        "grammar_triggers",
+                        format!("token trigger id {signed} must be non-negative"),
+                    )
+                })?;
+                if tokenizer.id_to_token(token_id).is_none() {
+                    return Err(RequestGrammarError::new(
+                        "grammar_triggers",
+                        format!("token trigger id {token_id} is outside the model vocabulary"),
+                    ));
+                }
+                token_triggers.push(token_id);
+            }
+            LlamaGrammarTriggerType::Word => {
+                let encoding =
+                    tokenizer
+                        .encode(trigger.value.as_str(), false)
+                        .map_err(|error| {
+                            RequestGrammarError::new(
+                                "grammar_triggers",
+                                format!("tokenizer rejected word trigger: {error}"),
+                            )
+                        })?;
+                if let [token_id] = encoding.get_ids() {
+                    if !preserved_tokens.contains(token_id) {
+                        return Err(RequestGrammarError::new(
+                            "grammar_triggers",
+                            format!(
+                                "single-token word trigger {:?} must also appear in preserved_tokens",
+                                trigger.value
+                            ),
+                        ));
+                    }
+                    token_triggers.push(*token_id);
+                } else {
+                    trigger_patterns.push(regex::escape(&trigger.value));
+                }
+            }
+            LlamaGrammarTriggerType::Pattern => {
+                trigger_patterns.push(trigger.value.clone());
+            }
+            LlamaGrammarTriggerType::PatternFull => {
+                let pattern = if trigger.value.is_empty() {
+                    "^$".to_string()
+                } else {
+                    format!(
+                        "{}{}{}",
+                        if trigger.value.starts_with('^') {
+                            ""
+                        } else {
+                            "^"
+                        },
+                        trigger.value,
+                        if trigger.value.ends_with('$') {
+                            ""
+                        } else {
+                            "$"
+                        }
+                    )
+                };
+                trigger_patterns.push(pattern);
+            }
+        }
+    }
+
+    token_triggers.sort_unstable();
+    token_triggers.dedup();
+    for pattern in &trigger_patterns {
+        pattern_bytes = pattern_bytes.checked_add(pattern.len()).ok_or_else(|| {
+            RequestGrammarError::new("grammar_triggers", "grammar trigger patterns are too large")
+        })?;
+        if pattern_bytes > MAX_LAZY_PATTERN_BYTES {
+            return Err(RequestGrammarError::new(
+                "grammar_triggers",
+                format!("grammar trigger patterns exceed the {MAX_LAZY_PATTERN_BYTES}-byte limit"),
+            ));
+        }
+        regex::bytes::Regex::new(pattern).map_err(|error| {
+            RequestGrammarError::new(
+                "grammar_triggers",
+                format!("unsupported grammar trigger pattern {pattern:?}: {error}"),
+            )
+        })?;
+    }
+
+    Ok(Some(LazyGrammarConfig {
+        token_triggers,
+        trigger_patterns,
+        preserved_tokens,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledRequestConstraint {
+    pub grammar: Option<Grammar>,
+    pub lazy: Option<LazyGrammarConfig>,
+}
+
+/// Resolve all non-tool request surfaces to one grammar. vLLM's documented
+/// response-format conversion wins over `structured_outputs`, except `text`,
+/// which preserves the explicit structured-output request.
+fn compile_request_constraint_impl(
+    request: &ChatCompletionRequest,
+    tokenizer: Option<&tokenizers::Tokenizer>,
 ) -> Result<Option<Grammar>, RequestGrammarError> {
     let structured_kind = request
         .structured_outputs
@@ -493,7 +711,7 @@ pub fn compile_request_constraint(
         }
     }
     if let Some(structured) = request.structured_outputs.as_ref() {
-        return compile_structured_outputs(structured).map(Some);
+        return compile_structured_outputs_impl(structured, tokenizer).map(Some);
     }
     if let Some(schema) = request.json_schema.as_ref() {
         return compile_schema(&schema.as_value(), "json_schema", None).map(Some);
@@ -505,9 +723,39 @@ pub fn compile_request_constraint(
                 "grammar must not be empty",
             ));
         }
-        return parse_gbnf(source, "grammar").map(Some);
+        return parse_gbnf_bound(source, "grammar", tokenizer).map(Some);
     }
     Ok(None)
+}
+
+/// Compile a request before a model/tokenizer has been selected. Lazy fields
+/// are rejected on this boundary because accepting them without authoritative
+/// token resolution would silently change their meaning.
+pub fn compile_request_constraint(
+    request: &ChatCompletionRequest,
+) -> Result<Option<Grammar>, RequestGrammarError> {
+    if request.grammar_lazy.is_some()
+        || request.preserved_tokens.is_some()
+        || request.grammar_triggers.is_some()
+    {
+        return Err(RequestGrammarError::new(
+            "grammar_lazy",
+            "lazy grammar fields require the tokenizer-bound compiler",
+        ));
+    }
+    compile_request_constraint_impl(request, None)
+}
+
+/// Compile every public structured-output surface after model resolution.
+/// Raw GBNF token terminals and lazy trigger strings are resolved against the
+/// selected model's authoritative tokenizer, including numeric OOV checks.
+pub fn compile_request_constraint_with_tokenizer(
+    request: &ChatCompletionRequest,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<CompiledRequestConstraint, RequestGrammarError> {
+    let grammar = compile_request_constraint_impl(request, Some(tokenizer))?;
+    let lazy = compile_lazy_config(request, grammar.is_some(), tokenizer)?;
+    Ok(CompiledRequestConstraint { grammar, lazy })
 }
 
 /// Apply native tool-call precedence before compiling an output constraint.
@@ -530,6 +778,296 @@ pub fn compile_request_output_constraint(
         return Ok(None);
     }
     compile_request_constraint(request)
+}
+
+/// Tokenizer-bound counterpart of [`compile_request_output_constraint`].
+/// This preserves native tool precedence while resolving public token
+/// terminals and lazy triggers against the selected model.
+pub fn compile_request_output_constraint_with_tokenizer(
+    request: &ChatCompletionRequest,
+    tool_choice: &ToolChoiceValue,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<CompiledRequestConstraint, RequestGrammarError> {
+    if matches!(
+        tool_choice,
+        ToolChoiceValue::Required | ToolChoiceValue::Function(_)
+    ) {
+        if let Some(param) = first_lazy_param(request) {
+            return Err(RequestGrammarError::new(
+                param,
+                "llama.cpp lazy grammar fields cannot modify a required native tool grammar",
+            ));
+        }
+        return Ok(CompiledRequestConstraint {
+            grammar: None,
+            lazy: None,
+        });
+    }
+    compile_request_constraint_with_tokenizer(request, tokenizer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokenizers::{models::bpe::BPE, AddedToken, Tokenizer};
+
+    fn accepts(grammar: &Grammar, bytes: &[u8]) -> bool {
+        let root = grammar.rule_id("root").expect("root");
+        let mut runtime =
+            super::super::GrammarRuntime::new(grammar.clone(), root).expect("runtime");
+        runtime.accept_bytes(bytes) && runtime.is_accepted()
+    }
+
+    fn tokenizer_with_specials(values: &[&str]) -> Tokenizer {
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        tokenizer.add_special_tokens(
+            &values
+                .iter()
+                .map(|value| AddedToken::from((*value).to_string(), true))
+                .collect::<Vec<_>>(),
+        );
+        tokenizer
+    }
+
+    fn request(fields: serde_json::Value) -> ChatCompletionRequest {
+        let mut value = serde_json::json!({"model":"fixture", "messages":[]});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn vllm_choice_regex_json_and_raw_grammar_compile_and_enforce() {
+        let choice = StructuredOutputs {
+            choice: Some(vec!["allow".into(), "deny".into()]),
+            ..Default::default()
+        };
+        let grammar = compile_structured_outputs(&choice).unwrap();
+        assert!(accepts(&grammar, b"allow"));
+        assert!(!accepts(&grammar, b"allowed"));
+
+        let regex = StructuredOutputs {
+            regex: Some("[A-Z]{2}[0-9]{2}".into()),
+            ..Default::default()
+        };
+        let grammar = compile_structured_outputs(&regex).unwrap();
+        assert!(accepts(&grammar, b"AB12"));
+        assert!(!accepts(&grammar, b"xAB12y"));
+
+        let json = StructuredOutputs {
+            json: Some(StructuredOutputJson::String(
+                r#"{"type":"string","enum":["ok"]}"#.into(),
+            )),
+            ..Default::default()
+        };
+        let grammar = compile_structured_outputs(&json).unwrap();
+        assert!(accepts(&grammar, br#""ok""#));
+        assert!(!accepts(&grammar, br#""no""#));
+
+        let raw = StructuredOutputs {
+            grammar: Some("root ::= \"yes\" | \"no\"\n".into()),
+            ..Default::default()
+        };
+        let grammar = compile_structured_outputs(&raw).unwrap();
+        assert!(accepts(&grammar, b"yes"));
+        assert!(!accepts(&grammar, b"maybe"));
+    }
+
+    #[test]
+    fn vllm_invalid_and_ambiguous_constraints_fail_closed() {
+        for structured in [
+            StructuredOutputs::default(),
+            StructuredOutputs {
+                choice: Some(Vec::new()),
+                ..Default::default()
+            },
+            StructuredOutputs {
+                grammar: Some("  ".into()),
+                ..Default::default()
+            },
+            StructuredOutputs {
+                regex: Some("x\0y".into()),
+                ..Default::default()
+            },
+            StructuredOutputs {
+                choice: Some(vec!["x".into()]),
+                regex: Some("x".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(compile_structured_outputs(&structured).is_err());
+        }
+    }
+
+    #[test]
+    fn disable_additional_properties_closes_implicit_nested_objects() {
+        let structured = StructuredOutputs {
+            json: Some(StructuredOutputJson::Object(
+                serde_json::json!({
+                    "type":"object",
+                    "properties":{"nested":{"type":"object","properties":{"x":{"type":"integer"}}}}
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            )),
+            disable_additional_properties: Some(true),
+            ..Default::default()
+        };
+        let grammar = compile_structured_outputs(&structured).unwrap();
+        assert!(accepts(&grammar, br#"{"nested":{"x":1}}"#));
+        assert!(!accepts(&grammar, br#"{"nested":{"x":1,"y":2}}"#));
+    }
+
+    #[test]
+    fn whitespace_options_are_enforced_for_json_constraints() {
+        let compact = StructuredOutputs {
+            json: Some(StructuredOutputJson::Object(
+                serde_json::json!({
+                    "type":"object",
+                    "properties":{"x":{"type":"integer"}},
+                    "required":["x"],
+                    "additionalProperties":false
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            )),
+            disable_any_whitespace: Some(true),
+            ..Default::default()
+        };
+        let grammar = compile_structured_outputs(&compact).unwrap();
+        assert!(accepts(&grammar, br#"{"x":1}"#));
+        assert!(!accepts(&grammar, br#"{ "x": 1 }"#));
+
+        let custom = StructuredOutputs {
+            json_object: Some(true),
+            whitespace_pattern: Some("[ ]*".into()),
+            ..Default::default()
+        };
+        let grammar = compile_structured_outputs(&custom).unwrap();
+        assert!(accepts(&grammar, br#"{ "x": 1 }"#));
+        assert!(!accepts(&grammar, b"{\n\"x\":1}"));
+    }
+
+    #[test]
+    fn tokenizer_bound_raw_grammar_resolves_text_and_rejects_every_oov_form() {
+        let tokenizer = tokenizer_with_specials(&["<tok>"]);
+        let token_id = tokenizer.token_to_id("<tok>").unwrap();
+        let compiled = compile_request_constraint_with_tokenizer(
+            &request(serde_json::json!({"grammar":"root ::= <tok>\n"})),
+            &tokenizer,
+        )
+        .unwrap();
+        assert_eq!(compiled.grammar.unwrap().rules[0][0].value, token_id);
+
+        for source in [
+            "root ::= <[999]>\n",
+            "root ::= !<[999]>\n",
+            "root ::= !<[0,999]>\n",
+        ] {
+            let error = compile_request_constraint_with_tokenizer(
+                &request(serde_json::json!({"grammar":source})),
+                &tokenizer,
+            )
+            .expect_err("numeric token ids outside the selected vocab must fail");
+            assert_eq!(error.param, "grammar");
+            assert!(error.message.contains("not present"), "{error}");
+        }
+    }
+
+    #[test]
+    fn lazy_fields_compile_all_llama_trigger_types_after_tokenizer_binding() {
+        let tokenizer = tokenizer_with_specials(&["<tok>", "<a>", "<b>"]);
+        let token_id = tokenizer.token_to_id("<tok>").unwrap();
+        let compiled = compile_request_constraint_with_tokenizer(
+            &request(serde_json::json!({
+                "grammar":"root ::= \"BODY\"\n",
+                "grammar_lazy":true,
+                "preserved_tokens":["<tok>"],
+                "grammar_triggers":[
+                    {"type":0,"value":"ignored-by-token-kind","token":token_id},
+                    {"type":1,"value":"<tok>"},
+                    {"type":1,"value":"<a><b>"},
+                    {"type":2,"value":"tool:(BODY)"},
+                    {"type":3,"value":"whole"}
+                ]
+            })),
+            &tokenizer,
+        )
+        .unwrap();
+
+        let lazy = compiled.lazy.unwrap();
+        assert_eq!(lazy.preserved_tokens, vec![token_id]);
+        assert_eq!(lazy.token_triggers, vec![token_id]);
+        assert_eq!(
+            lazy.trigger_patterns,
+            vec![
+                regex::escape("<a><b>"),
+                "tool:(BODY)".to_string(),
+                "^whole$".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn lazy_fields_reject_non_atomic_preserved_oov_and_silent_combinations() {
+        let tokenizer = tokenizer_with_specials(&["<a>", "<b>"]);
+        let cases = [
+            serde_json::json!({
+                "grammar":"root ::= \"x\"\n",
+                "grammar_lazy":true,
+                "preserved_tokens":["<a><b>"],
+                "grammar_triggers":[{"type":2,"value":"x"}]
+            }),
+            serde_json::json!({
+                "grammar":"root ::= \"x\"\n",
+                "grammar_lazy":true,
+                "grammar_triggers":[{"type":0,"value":"x","token":999}]
+            }),
+            serde_json::json!({
+                "grammar":"root ::= \"x\"\n",
+                "preserved_tokens":["<a>"]
+            }),
+            serde_json::json!({
+                "grammar":"root ::= \"x\"\n",
+                "grammar_lazy":true,
+                "grammar_triggers":[]
+            }),
+            serde_json::json!({
+                "grammar_lazy":true,
+                "grammar_triggers":[{"type":2,"value":"x"}]
+            }),
+            serde_json::json!({
+                "grammar":"root ::= \"x\"\n",
+                "grammar_lazy":true,
+                "grammar_triggers":[{"type":2,"value":"(?=unsupported-lookahead)"}]
+            }),
+        ];
+        for fields in cases {
+            assert!(
+                compile_request_constraint_with_tokenizer(&request(fields), &tokenizer).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn single_token_word_trigger_requires_preservation() {
+        let tokenizer = tokenizer_with_specials(&["<word>"]);
+        let error = compile_request_constraint_with_tokenizer(
+            &request(serde_json::json!({
+                "grammar":"root ::= \"x\"\n",
+                "grammar_lazy":true,
+                "grammar_triggers":[{"type":1,"value":"<word>"}]
+            })),
+            &tokenizer,
+        )
+        .unwrap_err();
+        assert_eq!(error.param, "grammar_triggers");
+        assert!(error.message.contains("preserved_tokens"));
+    }
 }
 
 #[cfg(test)]

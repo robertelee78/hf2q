@@ -19,7 +19,42 @@
 //! is why the full JSON-acceptance test suite below has no fixture cost.
 
 use super::parser::{Grammar, GretElement, GretType};
+use regex::bytes::Regex;
 use std::sync::Arc;
+
+/// Maximum unconstrained output retained while a public lazy grammar waits
+/// for a regex trigger. llama.cpp currently leaves this buffer unbounded;
+/// hf2q fails closed at the repository's structured-output resource limit.
+pub const MAX_LAZY_TRIGGER_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Model-bound lazy-grammar controls after request strings and token ids have
+/// been resolved against the authoritative tokenizer.
+///
+/// `preserved_tokens` is retained as part of the request/runtime contract and
+/// cache identity. hf2q's token-byte table already decodes every sampled token
+/// without dropping special tokens, so it does not require a second decoder
+/// allow-list at runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LazyGrammarConfig {
+    pub token_triggers: Vec<u32>,
+    pub trigger_patterns: Vec<String>,
+    pub preserved_tokens: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct LazyBufferedToken {
+    token_id: u32,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PublicLazyRuntime {
+    token_triggers: Vec<u32>,
+    trigger_patterns: Vec<Regex>,
+    buffer: Vec<u8>,
+    positions: Vec<LazyBufferedToken>,
+}
 
 // ---------------------------------------------------------------------------
 // Position + Stack types
@@ -683,6 +718,11 @@ pub struct GrammarRuntime {
     /// At most `lazy_trigger.len() - 1` trailing bytes retained so a marker
     /// split across adjacent tokens can still be recognized.
     lazy_trigger_tail: Vec<u8>,
+    /// Public llama.cpp-compatible trigger machinery. This is deliberately
+    /// separate from `lazy_trigger`: the internal tool marker strips its
+    /// marker before applying a body grammar, whereas llama.cpp replays the
+    /// matched marker (or first non-empty capture) through the public grammar.
+    public_lazy: Option<PublicLazyRuntime>,
 }
 
 impl GrammarRuntime {
@@ -740,6 +780,7 @@ impl GrammarRuntime {
             awaiting_trigger: false,
             lazy_trigger: None,
             lazy_trigger_tail: Vec::new(),
+            public_lazy: None,
         })
     }
 
@@ -778,6 +819,31 @@ impl GrammarRuntime {
         self.awaiting_trigger = true;
         self.lazy_trigger = (!marker.is_empty()).then(|| marker.to_vec());
         self.lazy_trigger_tail.clear();
+        self.public_lazy = None;
+    }
+
+    /// Suspend this runtime until one of llama.cpp's public token or regex
+    /// triggers fires. Regexes are compiled once at runtime construction; an
+    /// unsupported expression is an error rather than an ignored trigger.
+    pub fn configure_public_lazy(
+        &mut self,
+        config: &LazyGrammarConfig,
+    ) -> Result<(), regex::Error> {
+        let trigger_patterns = config
+            .trigger_patterns
+            .iter()
+            .map(|pattern| Regex::new(pattern))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.awaiting_trigger = true;
+        self.lazy_trigger = None;
+        self.lazy_trigger_tail.clear();
+        self.public_lazy = Some(PublicLazyRuntime {
+            token_triggers: config.token_triggers.clone(),
+            trigger_patterns,
+            buffer: Vec::new(),
+            positions: Vec::new(),
+        });
+        Ok(())
     }
 
     /// Flip the trigger gate to `false`.  Called by the engine when the
@@ -811,6 +877,137 @@ impl GrammarRuntime {
     pub fn trigger(&mut self) {
         self.awaiting_trigger = false;
         self.lazy_trigger_tail.clear();
+        if let Some(lazy) = self.public_lazy.as_mut() {
+            lazy.buffer.clear();
+            lazy.positions.clear();
+        }
+    }
+
+    fn reject_lazy_buffer_overflow(&mut self) -> bool {
+        self.awaiting_trigger = false;
+        self.stacks.clear();
+        self.partial_utf8 = PartialUtf8::default();
+        if let Some(lazy) = self.public_lazy.as_mut() {
+            lazy.buffer.clear();
+            lazy.positions.clear();
+        }
+        false
+    }
+
+    /// Return `Some(result)` while the public lazy gate owns this token, or
+    /// `None` when normal/legacy processing should continue.
+    fn accept_public_lazy_token(&mut self, token_id: u32, bytes: &[u8]) -> Option<bool> {
+        if !self.awaiting_trigger || self.public_lazy.is_none() {
+            return None;
+        }
+
+        if self
+            .public_lazy
+            .as_ref()
+            .is_some_and(|lazy| lazy.token_triggers.contains(&token_id))
+        {
+            self.trigger();
+            return Some(self.accept_token(token_id, bytes));
+        }
+
+        let new_len = self
+            .public_lazy
+            .as_ref()
+            .expect("checked above")
+            .buffer
+            .len()
+            .checked_add(bytes.len());
+        if new_len.is_none_or(|len| len > MAX_LAZY_TRIGGER_BUFFER_BYTES) {
+            return Some(self.reject_lazy_buffer_overflow());
+        }
+
+        let replay = {
+            let lazy = self.public_lazy.as_mut().expect("checked above");
+            let start = lazy.buffer.len();
+            lazy.buffer.extend_from_slice(bytes);
+            lazy.positions.push(LazyBufferedToken {
+                token_id,
+                start,
+                end: lazy.buffer.len(),
+            });
+
+            let trigger_start = lazy.trigger_patterns.iter().find_map(|pattern| {
+                let captures = pattern.captures(&lazy.buffer)?;
+                (1..captures.len())
+                    .find_map(|index| {
+                        captures
+                            .get(index)
+                            .filter(|capture| !capture.is_empty())
+                            .map(|capture| capture.start())
+                    })
+                    .or_else(|| captures.get(0).map(|capture| capture.start()))
+            });
+            trigger_start.map(|trigger_start| {
+                lazy.positions
+                    .iter()
+                    .filter(|position| position.end > trigger_start)
+                    .map(|position| {
+                        let piece_start = position.start.max(trigger_start);
+                        (
+                            position.token_id,
+                            lazy.buffer[piece_start..position.end].to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        let Some(replay) = replay else {
+            return Some(true);
+        };
+        self.trigger();
+        for (replay_token, replay_bytes) in replay {
+            if !self.accept_token(replay_token, &replay_bytes) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Byte-only counterpart used by direct runtime callers. Production
+    /// sampling always uses `accept_token`, retaining token identity for token
+    /// terminals. A regex match replays the constrained byte suffix exactly
+    /// once, which is sufficient for character-terminal grammars.
+    fn accept_public_lazy_bytes(&mut self, bytes: &[u8]) -> Option<bool> {
+        if !self.awaiting_trigger || self.public_lazy.is_none() {
+            return None;
+        }
+        let new_len = self
+            .public_lazy
+            .as_ref()
+            .expect("checked above")
+            .buffer
+            .len()
+            .checked_add(bytes.len());
+        if new_len.is_none_or(|len| len > MAX_LAZY_TRIGGER_BUFFER_BYTES) {
+            return Some(self.reject_lazy_buffer_overflow());
+        }
+        let suffix = {
+            let lazy = self.public_lazy.as_mut().expect("checked above");
+            lazy.buffer.extend_from_slice(bytes);
+            lazy.trigger_patterns.iter().find_map(|pattern| {
+                let captures = pattern.captures(&lazy.buffer)?;
+                let start = (1..captures.len())
+                    .find_map(|index| {
+                        captures
+                            .get(index)
+                            .filter(|capture| !capture.is_empty())
+                            .map(|capture| capture.start())
+                    })
+                    .or_else(|| captures.get(0).map(|capture| capture.start()))?;
+                Some(lazy.buffer[start..].to_vec())
+            })
+        };
+        let Some(suffix) = suffix else {
+            return Some(true);
+        };
+        self.trigger();
+        Some(self.accept_bytes(&suffix))
     }
 
     /// Feed one Unicode code point. Returns `true` if any stacks remain
@@ -825,6 +1022,9 @@ impl GrammarRuntime {
     /// the decoded `bytes`. This preserves both domains when alternatives
     /// mix token and character rules.
     pub fn accept_token(&mut self, token_id: u32, bytes: &[u8]) -> bool {
+        if let Some(result) = self.accept_public_lazy_token(token_id, bytes) {
+            return result;
+        }
         if self.awaiting_trigger {
             let Some(marker) = self.lazy_trigger.as_deref() else {
                 return true;
@@ -925,6 +1125,9 @@ impl GrammarRuntime {
     /// engine calls [`trigger`] (typically in the `ToolCallOpen`
     /// handler).
     pub fn accept_bytes(&mut self, bytes: &[u8]) -> bool {
+        if let Some(result) = self.accept_public_lazy_bytes(bytes) {
+            return result;
+        }
         if self.awaiting_trigger {
             let Some(marker) = self.lazy_trigger.as_deref() else {
                 // Legacy explicit-trigger mode: no advance while suspended.
@@ -1681,6 +1884,85 @@ mod tests {
         assert!(rt.accept_bytes(&vec![b'a'; 64 * 1024]));
         assert!(rt.is_awaiting_trigger());
         assert!(rt.lazy_trigger_tail.len() < b"<tool_call>".len());
+    }
+
+    #[test]
+    fn public_lazy_token_trigger_is_inactive_then_replays_whole_token() {
+        let mut rt = runtime_from("root ::= <[7]> \"x\"\n", "root");
+        rt.configure_public_lazy(&LazyGrammarConfig {
+            token_triggers: vec![7],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(rt.accept_token(1, b"unconstrained preamble"));
+        assert!(rt.is_awaiting_trigger());
+        assert!(rt.accept_eog(), "EOG is unconstrained before activation");
+        assert!(rt.accept_token(7, b"<special>"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(!rt.is_terminally_accepted());
+        assert!(!rt.accept_eog(), "EOG must fail closed after activation");
+    }
+
+    #[test]
+    fn public_lazy_pattern_replays_split_capture_with_original_token_ids() {
+        let mut rt = runtime_from("root ::= \"BODY\"\n", "root");
+        rt.configure_public_lazy(&LazyGrammarConfig {
+            trigger_patterns: vec!["tool:(BODY)".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(rt.accept_token(11, b"noise tool:BO"));
+        assert!(rt.is_awaiting_trigger());
+        assert!(rt.accept_token(12, b"DY"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.is_terminally_accepted());
+    }
+
+    #[test]
+    fn public_lazy_pattern_replays_marker_and_body_exactly_once() {
+        let mut rt = runtime_from("root ::= \"<tag>BODY\"\n", "root");
+        rt.configure_public_lazy(&LazyGrammarConfig {
+            trigger_patterns: vec![regex::escape("<tag>")],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(rt.accept_token(5, b"preamble<tag>BODY"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.is_terminally_accepted());
+    }
+
+    #[test]
+    fn public_lazy_full_pattern_requires_the_whole_buffer() {
+        let config = LazyGrammarConfig {
+            trigger_patterns: vec!["^tool:(BODY)$".into()],
+            ..Default::default()
+        };
+        let mut prefixed = runtime_from("root ::= \"BODY\"\n", "root");
+        prefixed.configure_public_lazy(&config).unwrap();
+        assert!(prefixed.accept_token(1, b"prefix tool:BODY"));
+        assert!(prefixed.is_awaiting_trigger());
+
+        let mut exact = runtime_from("root ::= \"BODY\"\n", "root");
+        exact.configure_public_lazy(&config).unwrap();
+        assert!(exact.accept_token(2, b"tool:BODY"));
+        assert!(exact.is_terminally_accepted());
+    }
+
+    #[test]
+    fn public_lazy_buffer_limit_fails_closed() {
+        let mut rt = runtime_from("root ::= \"x\"\n", "root");
+        rt.configure_public_lazy(&LazyGrammarConfig {
+            trigger_patterns: vec!["never".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(!rt.accept_token(1, &vec![b'a'; MAX_LAZY_TRIGGER_BUFFER_BYTES + 1]));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.is_dead());
     }
 
     /// Multi-tool-call regression guard.  The peer does NOT reset

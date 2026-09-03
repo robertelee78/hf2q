@@ -31,7 +31,10 @@ pub use parser::{
     ParseError,
 };
 #[allow(unused_imports)]
-pub use sampler::{GrammarRuntime, PartialUtf8, Pos, Stack, Stacks};
+pub use sampler::{
+    GrammarRuntime, LazyGrammarConfig, PartialUtf8, Pos, Stack, Stacks,
+    MAX_LAZY_TRIGGER_BUFFER_BYTES,
+};
 #[allow(unused_imports)]
 pub use serialize::{rename_rules, serialize};
 

@@ -1737,14 +1737,6 @@ where
             return Err(ApiError::invalid_request(error.message, Some(error.param)).into_response())
         }
     };
-    let response_grammar =
-        match grammar::request::compile_request_output_constraint(req, &tool_choice) {
-            Ok(grammar) => grammar,
-            Err(error) => {
-                return Err(ApiError::grammar_error_for(error.param, error.message).into_response())
-            }
-        };
-
     // --- Pool-routed engine resolution (iter-209) ---
     // Pre-iter-209: rejected with 400 `model_not_loaded` whenever
     // `state.engine.is_none()`.  Iter-209 routes `req.model` through
@@ -1790,6 +1782,22 @@ where
         qwen3vl_image_grids,
     ) = prepare_vision_context(&req.messages, state.mmproj.as_ref(), engine, cancellation).await?;
 
+    // Compile every OpenAI/vLLM/llama.cpp structured-output surface only
+    // after the requested model has resolved. Raw token terminals, preserved
+    // tokens, and lazy token/word triggers must bind to this authoritative
+    // tokenizer; model-free validation would silently assign the wrong ids.
+    let public_constraint = match grammar::request::compile_request_output_constraint_with_tokenizer(
+        req,
+        &tool_choice,
+        engine.tokenizer(),
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            return Err(ApiError::grammar_error_for(error.param, error.message).into_response())
+        }
+    };
+    let response_grammar = public_constraint.grammar;
+    let public_grammar_lazy = public_constraint.lazy;
     // Render + tokenize + apply context-overflow policy (Decision #23).
     // `apply_overflow_policy` handles the three policies:
     //   Reject        → 400 context_length_exceeded when prompt ≥ ctx_len.
@@ -1853,6 +1861,13 @@ where
         Ok(g) => g,
         Err(resp) => return Err(resp),
     };
+    if tool_grammar.is_some() && public_grammar_lazy.is_some() {
+        return Err(ApiError::invalid_request(
+            "grammar_lazy cannot be combined with a tool grammar that overrides the response constraint",
+            Some("grammar_lazy".into()),
+        )
+        .into_response());
+    }
     // Select the effective grammar: tool > response > none.
     //
     // Wave 2.6 W-α5 Q1 + Wave 2.7 W-η Q-A: also pick the `GrammarKind`
@@ -2260,6 +2275,7 @@ where
         grammar: effective_grammar,
         token_bytes: grammar_token_bytes,
         grammar_kind: effective_grammar_kind,
+        grammar_lazy: public_grammar_lazy,
         tool_call_policy: tc_policy,
         tool_argument_wire_kinds,
         reasoning_forced_open,
