@@ -734,16 +734,14 @@ fn compile_request_constraint_impl(
 pub fn compile_request_constraint(
     request: &ChatCompletionRequest,
 ) -> Result<Option<Grammar>, RequestGrammarError> {
-    if request.grammar_lazy.is_some()
-        || request.preserved_tokens.is_some()
-        || request.grammar_triggers.is_some()
-    {
+    let grammar = compile_request_constraint_impl(request, None)?;
+    if first_lazy_param(request).is_some() {
         return Err(RequestGrammarError::new(
             "grammar_lazy",
             "lazy grammar fields require the tokenizer-bound compiler",
         ));
     }
-    compile_request_constraint_impl(request, None)
+    Ok(grammar)
 }
 
 /// Compile every public structured-output surface after model resolution.
@@ -807,7 +805,7 @@ pub fn compile_request_output_constraint_with_tokenizer(
 }
 
 #[cfg(test)]
-mod tests {
+mod tokenizer_tests {
     use super::*;
     use tokenizers::{models::bpe::BPE, AddedToken, Tokenizer};
 

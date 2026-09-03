@@ -384,7 +384,7 @@ fn automatic_tools_do_not_erase_an_explicit_output_constraint() {
 }
 
 #[test]
-fn llama_lazy_fields_validate_consistently_and_fail_if_runtime_is_unavailable() {
+fn llama_lazy_fields_validate_consistently_and_require_tokenizer_binding() {
     for (fields, param) in [
         (serde_json::json!({"grammar_lazy":false}), "grammar_lazy"),
         (
@@ -440,15 +440,15 @@ fn llama_lazy_fields_validate_consistently_and_fail_if_runtime_is_unavailable() 
         assert_eq!(error.param, param);
     }
 
-    let valid_but_not_yet_executable = request_with(serde_json::json!({
+    let valid_but_model_unbound = request_with(serde_json::json!({
         "grammar":"root ::= \"ok\"",
         "grammar_lazy":true,
         "grammar_triggers":[{"type":1,"value":"<tool>"}],
         "preserved_tokens":["<tool>"]
     }));
-    let error = compile_request_constraint(&valid_but_not_yet_executable).unwrap_err();
+    let error = compile_request_constraint(&valid_but_model_unbound).unwrap_err();
     assert_eq!(error.param, "grammar_lazy");
-    assert!(error.message.contains("not yet implemented"));
+    assert!(error.message.contains("tokenizer-bound compiler"));
 }
 
 #[test]
