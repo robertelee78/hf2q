@@ -183,6 +183,16 @@ pub fn parse_with_tokenizer(
         }
     })?;
 
+    validate_token_ids(&grammar, tokenizer)?;
+    Ok(grammar)
+}
+
+/// Prove that every explicit numeric token terminal belongs to the selected
+/// model vocabulary. TokenAny is vocabulary-relative by construction.
+pub fn validate_token_ids(
+    grammar: &Grammar,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<(), ParseError> {
     if let Some(invalid) = grammar.rules.iter().flatten().find(|element| {
         matches!(
             element.ty,
@@ -197,8 +207,7 @@ pub fn parse_with_tokenizer(
             ),
         });
     }
-
-    Ok(grammar)
+    Ok(())
 }
 
 fn parse_impl(

@@ -16,7 +16,7 @@ const MAX_DISPATCH_STATES: usize = 4_096;
 /// Compile either the current XGrammar object or vLLM's legacy structure.
 pub fn compile(payload: &Value) -> Result<Grammar, StructuralTagError> {
     let source = lower_to_gbnf(payload)?;
-    parser::parse(&source).map_err(|error| {
+    parser::parse_generated(&source).map_err(|error| {
         StructuralTagError::Invalid(format!("generated GBNF was invalid: {error}"))
     })
 }
@@ -34,7 +34,7 @@ where
     F: FnMut(&str) -> Result<u32, String>,
 {
     let source = lower_to_gbnf_with_token_resolver(payload, resolver)?;
-    parser::parse(&source).map_err(|error| {
+    parser::parse_generated(&source).map_err(|error| {
         StructuralTagError::Invalid(format!("generated GBNF was invalid: {error}"))
     })
 }

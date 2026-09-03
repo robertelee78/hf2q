@@ -107,6 +107,7 @@ fn parse_vllm_grammar(
 fn compile_structural_tag(
     payload: &Value,
     param: &'static str,
+    tokenizer: Option<&tokenizers::Tokenizer>,
 ) -> Result<Grammar, RequestGrammarError> {
     let bytes = serde_json::to_vec(payload).map_err(|error| {
         RequestGrammarError::new(
@@ -122,8 +123,19 @@ fn compile_structural_tag(
             ),
         ));
     }
-    structural_tag::compile(payload)
-        .map_err(|error| RequestGrammarError::new(param, error.to_string()))
+    let grammar = match tokenizer {
+        Some(tokenizer) => structural_tag::compile_with_token_resolver(payload, |token| {
+            resolve_single_token(token, param, tokenizer).map_err(|error| error.message)
+        }),
+        None => structural_tag::compile(payload),
+    }
+    .map_err(|error| RequestGrammarError::new(param, error.to_string()))?;
+    if let Some(tokenizer) = tokenizer {
+        parser::validate_token_ids(&grammar, tokenizer).map_err(|error| {
+            RequestGrammarError::new(param, format!("token binding failed: {error}"))
+        })?;
+    }
+    Ok(grammar)
 }
 
 fn compile_schema(
@@ -266,9 +278,10 @@ fn response_constraint_kind(response: &ResponseFormat) -> Option<ConstraintKind>
     }
 }
 
-pub(crate) fn compile_response_format(
+fn compile_response_format_impl(
     response: &ResponseFormat,
     structured_options: Option<&StructuredOutputs>,
+    tokenizer: Option<&tokenizers::Tokenizer>,
 ) -> Result<Option<Grammar>, RequestGrammarError> {
     let whitespace_pattern = structured_options
         .map(configured_whitespace)
@@ -309,9 +322,16 @@ pub(crate) fn compile_response_format(
             }
             let mut payload = spec.clone();
             payload.insert("type".into(), Value::String("structural_tag".into()));
-            compile_structural_tag(&Value::Object(payload), "response_format").map(Some)
+            compile_structural_tag(&Value::Object(payload), "response_format", tokenizer).map(Some)
         }
     }
+}
+
+pub(crate) fn compile_response_format(
+    response: &ResponseFormat,
+    structured_options: Option<&StructuredOutputs>,
+) -> Result<Option<Grammar>, RequestGrammarError> {
+    compile_response_format_impl(response, structured_options, None)
 }
 
 fn compile_structured_outputs_impl(
@@ -460,7 +480,11 @@ fn compile_structured_outputs_impl(
             format!("serialized structural tag is invalid JSON: {error}"),
         )
     })?;
-    compile_structural_tag(&payload, "structured_outputs.structural_tag")
+    compile_structural_tag(
+        &payload,
+        "structured_outputs.structural_tag",
+        tokenizer,
+    )
 }
 
 pub fn compile_structured_outputs(
@@ -707,7 +731,11 @@ fn compile_request_constraint_impl(
 
     if let Some(response) = request.response_format.as_ref() {
         if response_kind.is_some() {
-            return compile_response_format(response, request.structured_outputs.as_ref());
+            return compile_response_format_impl(
+                response,
+                request.structured_outputs.as_ref(),
+                tokenizer,
+            );
         }
     }
     if let Some(structured) = request.structured_outputs.as_ref() {
@@ -1065,6 +1093,39 @@ mod tokenizer_tests {
         .unwrap_err();
         assert_eq!(error.param, "grammar_triggers");
         assert!(error.message.contains("preserved_tokens"));
+    }
+
+    #[test]
+    fn structural_tag_tokens_bind_to_the_selected_model_vocabulary() {
+        let tokenizer = tokenizer_with_specials(&["<open>"]);
+        let token_id = tokenizer.token_to_id("<open>").unwrap();
+        let compiled = compile_request_constraint_with_tokenizer(
+            &request(serde_json::json!({
+                "response_format": {
+                    "type":"structural_tag",
+                    "format":{"type":"token","token":"<open>"}
+                }
+            })),
+            &tokenizer,
+        )
+        .unwrap();
+        let grammar = compiled.grammar.unwrap();
+        assert!(grammar.rules.iter().flatten().any(|element| {
+            element.ty == parser::GretType::Token && element.value == token_id
+        }));
+
+        let error = compile_request_constraint_with_tokenizer(
+            &request(serde_json::json!({
+                "response_format": {
+                    "type":"structural_tag",
+                    "format":{"type":"token","token":999}
+                }
+            })),
+            &tokenizer,
+        )
+        .unwrap_err();
+        assert_eq!(error.param, "response_format");
+        assert!(error.message.contains("not present"), "{error}");
     }
 }
 
