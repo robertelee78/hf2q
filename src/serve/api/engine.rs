@@ -473,12 +473,12 @@ pub fn effective_repetition_penalty(params: &SamplingParams) -> f64 {
     params.repetition_penalty as f64
 }
 
-/// Configure a tool grammar whose enforcement begins at a native boundary.
-/// AUTO wakes on the tool-open marker. A required call whose prompt already
-/// opened a reasoning span wakes on the reasoning-close marker, so reasoning
-/// remains unconstrained but the complete call that follows is still enforced.
-/// The runtime scans accepted token bytes itself, including markers split
-/// across tokens and marker-plus-body tokens.
+/// Configure a grammar whose enforcement begins at a native boundary. AUTO
+/// tool grammars wake on the tool-open marker. Required calls and structured
+/// responses whose prompt already opened reasoning wake on the reasoning-close
+/// marker, so hidden reasoning remains unconstrained and only the semantic
+/// answer is matched. The runtime scans token bytes itself, including markers
+/// split across tokens and marker-plus-body tokens.
 pub(super) fn arm_lazy_tool_grammar(
     runtime: &mut super::grammar::GrammarRuntime,
     kind: GrammarKind,
@@ -486,6 +486,9 @@ pub(super) fn arm_lazy_tool_grammar(
     reasoning_forced_open: bool,
 ) {
     let marker = match kind {
+        GrammarKind::ResponseFormat if reasoning_forced_open => {
+            registration.and_then(|registration| registration.reasoning_close)
+        }
         GrammarKind::ToolCallBodyAuto => {
             registration.and_then(|registration| registration.tool_open)
         }
@@ -29794,6 +29797,38 @@ mod tests {
         assert!(runtime.accept_bytes(
             b"<tool_call>\n<function=echo_probe>\n<parameter=value>\n42\n</parameter>\n</function>\n</tool_call>"
         ));
+        assert!(runtime.is_accepted());
+    }
+
+    #[test]
+    fn structured_response_waits_for_forced_reasoning_close_on_qwen() {
+        let registration = super::super::registry::find_for("qwen3.6").expect("Qwen registration");
+        let grammar = super::super::grammar::parse(
+            &super::super::grammar::json_schema::schema_to_gbnf(&serde_json::json!({
+                "type": "object",
+                "properties": {"status": {"const": "ok"}},
+                "required": ["status"],
+                "additionalProperties": false
+            }))
+            .expect("schema grammar"),
+        )
+        .expect("parse grammar");
+        let params = SamplingParams {
+            grammar: Some(grammar),
+            token_bytes: Some(Arc::new(vec![Vec::new()])),
+            grammar_kind: GrammarKind::ResponseFormat,
+            reasoning_forced_open: true,
+            ..SamplingParams::default()
+        };
+        let mut runtime = grammar_runtime_for_request(&params, Some(&registration))
+            .expect("runtime")
+            .expect("grammar runtime");
+
+        assert!(runtime.is_awaiting_trigger());
+        assert!(runtime.accept_bytes(b"consider the schema</thi"));
+        assert!(runtime.accept_bytes(b"nk>"));
+        assert!(!runtime.is_awaiting_trigger());
+        assert!(runtime.accept_bytes(br#"{"status":"ok"}"#));
         assert!(runtime.is_accepted());
     }
 

@@ -337,12 +337,17 @@ impl ApiError {
     /// Grammar-rejection (HTTP 400) — a malformed JSON schema or GBNF grammar
     /// was supplied in `response_format` or `tools` (Decision #6).
     pub fn grammar_error(detail: impl Into<String>) -> Self {
+        Self::grammar_error_for("response_format", detail)
+    }
+
+    /// Grammar compilation error attributed to the exact request surface.
+    pub fn grammar_error_for(param: impl Into<String>, detail: impl Into<String>) -> Self {
         Self::bare(
             StatusCode::BAD_REQUEST,
             format!("Grammar compilation failed: {}", detail.into()),
             "invalid_request_error",
             Some("grammar_error"),
-            Some("response_format".into()),
+            Some(param.into()),
         )
     }
 

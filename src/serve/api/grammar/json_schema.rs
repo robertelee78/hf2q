@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
-use super::regex_gbnf::{regex_to_gbnf_body, Surface};
+use super::regex_gbnf::{regex_to_gbnf_body, regex_to_gbnf_full_match, Surface};
 
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_LOCAL_REFS: usize = 1024;
@@ -242,7 +242,23 @@ impl std::error::Error for SchemaError {}
 /// Returns `Err(SchemaError)` if the schema contains a feature that isn't
 /// yet supported (see the module-level doc for the supported subset).
 pub fn schema_to_gbnf(schema: &Value) -> Result<String, SchemaError> {
+    schema_to_gbnf_with_whitespace(schema, None)
+}
+
+/// Compile a schema with an optional full-match regex for inter-token JSON
+/// whitespace. `Some("")` means no whitespace; `None` keeps the default
+/// llama.cpp-compatible whitespace rule.
+pub fn schema_to_gbnf_with_whitespace(
+    schema: &Value,
+    whitespace_pattern: Option<&str>,
+) -> Result<String, SchemaError> {
     validate_schema_profile(schema)?;
+    let space_rule = match whitespace_pattern {
+        None => SPACE_RULE.to_string(),
+        Some("") => r#""""#.to_string(),
+        Some(pattern) => regex_to_gbnf_full_match(pattern, Surface::RawOutput)
+            .map_err(|error| schema_error("/whitespace_pattern", error.to_string()))?,
+    };
     let mut conv = Converter {
         rules: BTreeMap::new(),
         added_primitives: HashSet::new(),
@@ -251,6 +267,7 @@ pub fn schema_to_gbnf(schema: &Value) -> Result<String, SchemaError> {
         resolving_refs: HashSet::new(),
         resolved_refs: 0,
     };
+    conv.rules.insert("space".to_string(), space_rule);
     let root_body = conv.visit(schema, "", 0)?;
     conv.rules.insert("root".to_string(), root_body);
 
