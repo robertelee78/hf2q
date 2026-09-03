@@ -234,6 +234,14 @@ starting the hardware gate. Cancellation terminates that scoped group, so an
 in-flight compiler, model runtime, and power helpers cannot survive a canceled
 job as orphan processes.
 
+Release performance evidence binds the effective macOS power mode rather than
+the presence of an AC cable. Battery execution MUST use High Power Mode; AC
+execution MAY use Automatic or High Power Mode. The live numeric mode is
+sampled throughout the run and MUST remain unchanged. Low Power Mode and
+Battery Automatic mode fail closed. The power source is recorded, but cable
+and charge management remain operator responsibilities. Sleep/wake event,
+thermal-state, host-contention, and `caffeinate` assertions remain mandatory.
+
 Calibrated macOS gates compile the checked-in Foundation thermal-state helper
 once before any model load and reuse that executable for every observation.
 They must not launch the Swift interpreter/compiler inside the sampling loop.

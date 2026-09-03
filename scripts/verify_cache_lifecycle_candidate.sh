@@ -77,6 +77,20 @@ jq -e --arg source_sha "$source_sha" --arg version "$version" \
     and .standalone_candidate_run_id == $candidate_run_id
     and .crate_sha256 == $crate_sha256
     and .binary_sha256 == $binary_sha256
+    and .power_policy.guarded == true
+    and .power_policy.cable_required == false
+    and (.power_policy.initial_source == "ac"
+      or .power_policy.initial_source == "battery")
+    and (.power_policy.final_source == "ac"
+      or .power_policy.final_source == "battery")
+    and ((.power_policy.mode.name == "high"
+        and .power_policy.mode.numeric_canary == 2)
+      or (.power_policy.mode.name == "automatic"
+        and .power_policy.mode.numeric_canary == 0
+        and .power_policy.initial_source == "ac"
+        and .power_policy.final_source == "ac"))
+    and (.power_guarded_ac == (.power_policy.initial_source == "ac"
+      and .power_policy.final_source == "ac"))
     and .models.deepseek.architecture == "deepseek4"
     and .models.gemma.architecture == "gemma4"
     and .models.qwen.architecture == "qwen35moe"
