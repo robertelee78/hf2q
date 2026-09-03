@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "generated_at": "2026-09-03",
+  "stage6": {
+    "source_repository": "r2c",
+    "source_commit": "f0e0fe2de1f472ed7bf73cb67e9a89a0d421976b",
+    "source_path": "src/pipeline/stage6_securityreview/candidate_family/review_lens.rs",
+    "source_sha256": "af8213bc8e577052a0f45b6352235fef8015b402f8c323c20a67172223a39ebf",
+    "schema_sha256": "34143c4dcf963dfa40d66cd3f484f60e7f22922db7a03e72dc1d581638438d25"
+  },
+  "stage9": {
+    "source": "hf2q/r2c integration acceptance contract",
+    "upstream_schema_found": false,
+    "schema_sha256": "6138580856c5887fd49bb950ea56672a5391094d013d0cd60f31661c68861adf"
+  }
+}

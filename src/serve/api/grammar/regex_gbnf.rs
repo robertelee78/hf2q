@@ -51,6 +51,9 @@ use std::fmt;
 /// (negated classes, `.`, contains-wrappers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
+    /// Ordinary JSON string content. Quotes, backslashes, and raw controls
+    /// are structural; `<` is ordinary data (unlike tool-marker surfaces).
+    JsonString,
     /// Qwen nested JSON string: content between `"..."` — `"` and `\`
     /// (JSON syntax) and `<` (the `</parameter>` first byte) are
     /// forbidden; raw control bytes are invalid JSON.
@@ -58,6 +61,12 @@ pub enum Surface {
     /// Qwen top-level raw string: content between XML tags — `<`
     /// forbidden (close-tag first byte).
     QwenRawString,
+    /// DeepSeek DSML raw string. The runtime keeps the close-tag parse alive
+    /// while `<` is ambiguous, so source text may contain angle brackets.
+    DeepSeekRawString,
+    /// Whole generated output. Only regex's ordinary dot/newline semantics
+    /// apply; there is no enclosing quote or tool delimiter to reserve.
+    RawOutput,
     /// Gemma marker string: content between `<|"|>...<|"|>` — `<`
     /// forbidden (marker first byte).
     GemmaMarkerString,
@@ -80,6 +89,26 @@ const MAX_REPEAT: u64 = 2000;
 /// Compile a JSON Schema `pattern` regex into a GBNF expression for the
 /// string CONTENT (no surrounding quotes/markers — the caller wraps).
 pub fn regex_to_gbnf_body(pattern: &str, surface: Surface) -> Result<String, RegexError> {
+    let (body, anchored_start, anchored_end) = compile_core(pattern, surface)?;
+    // Anchoring: JSON Schema pattern is "contains" unless anchored.
+    let dot = dot_class(surface);
+    match (anchored_start, anchored_end) {
+        (true, true) => Ok(body),
+        (true, false) => Ok(format!("{} {}*", body, dot)),
+        (false, true) => Ok(format!("{}* {}", dot, body)),
+        (false, false) => Ok(format!("{}* {} {}*", dot, body, dot)),
+    }
+}
+
+/// Compile a regular expression as the complete generated output. Optional
+/// leading `^` and trailing `$` anchors are accepted but are redundant: the
+/// grammar root is inherently a full match.
+pub fn regex_to_gbnf_full_match(pattern: &str, surface: Surface) -> Result<String, RegexError> {
+    let (body, _, _) = compile_core(pattern, surface)?;
+    Ok(body)
+}
+
+fn compile_core(pattern: &str, surface: Surface) -> Result<(String, bool, bool), RegexError> {
     let chars: Vec<char> = pattern.chars().collect();
     let anchored_start = chars.first() == Some(&'^');
     let anchored_end = chars.last() == Some(&'$') && chars.len() > (anchored_start as usize);
@@ -101,22 +130,18 @@ pub fn regex_to_gbnf_body(pattern: &str, surface: Surface) -> Result<String, Reg
             p.pos
         )));
     }
-    // Anchoring: JSON Schema pattern is "contains" unless anchored.
-    let dot = dot_class(surface);
-    match (anchored_start, anchored_end) {
-        (true, true) => Ok(body),
-        (true, false) => Ok(format!("{} {}*", body, dot)),
-        (false, true) => Ok(format!("{}* {}", dot, body)),
-        (false, false) => Ok(format!("{}* {} {}*", dot, body, dot)),
-    }
+    Ok((body, anchored_start, anchored_end))
 }
 
 /// The `.` expansion for a surface — regex `.` is "any char except
 /// linefeed", intersected with the surface's structural forbiddens.
 fn dot_class(surface: Surface) -> &'static str {
     match surface {
+        Surface::JsonString => r#"[^"\\\n\x00-\x1F]"#,
         Surface::QwenJsonString => r#"[^"\\<\n\x00-\x1F]"#,
         Surface::QwenRawString => "[^<\n]",
+        Surface::DeepSeekRawString => "[^\n]",
+        Surface::RawOutput => "[^\n]",
         Surface::GemmaMarkerString => "[^<\n]",
     }
 }
@@ -390,10 +415,13 @@ impl<'a> Parser<'a> {
     /// can never swallow the string terminator.
     fn negated_class(&self, items: &str) -> String {
         match self.surface {
+            Surface::JsonString => format!("[^{}\"\\\\\\x00-\\x1F]", items),
             Surface::QwenJsonString => format!("[^{}\"\\\\<\\x00-\\x1F]", items),
             Surface::QwenRawString | Surface::GemmaMarkerString => {
                 format!("[^{}<]", items)
             }
+            Surface::DeepSeekRawString => format!("[^{}]", items),
+            Surface::RawOutput => format!("[^{}]", items),
         }
     }
 
@@ -483,11 +511,11 @@ impl<'a> Parser<'a> {
 /// GBNF literal for a single char — `"c"` with `"` and `\` escaped.
 fn gbnf_literal_char(c: char) -> String {
     match c {
-        '"' => r#"\""#.to_string(),
-        '\\' => r#"\\"#.to_string(),
-        '\n' => r#"\n"#.to_string(),
-        '\r' => r#"\r"#.to_string(),
-        '\t' => r#"\t"#.to_string(),
+        '"' => r#""\"""#.to_string(),
+        '\\' => r#""\\""#.to_string(),
+        '\n' => r#""\n""#.to_string(),
+        '\r' => r#""\r""#.to_string(),
+        '\t' => r#""\t""#.to_string(),
         other => format!("\"{}\"", other),
     }
 }
@@ -541,6 +569,18 @@ mod tests {
     }
 
     #[test]
+    fn structured_output_regex_is_always_a_full_match() {
+        assert_eq!(
+            regex_to_gbnf_full_match("foo", Surface::RawOutput).unwrap(),
+            r#""f" "o" "o""#
+        );
+        assert_eq!(
+            regex_to_gbnf_full_match("^foo$", Surface::RawOutput).unwrap(),
+            r#""f" "o" "o""#
+        );
+    }
+
+    #[test]
     fn quantifiers_compile_verbatim() {
         assert_eq!(compile(r"^\d{4}$"), r#"[0-9]{4,4}"#);
         assert_eq!(compile(r"^\d{2,4}$"), r#"[0-9]{2,4}"#);
@@ -580,6 +620,10 @@ mod tests {
         assert_eq!(
             regex_to_gbnf_body("^.$", Surface::GemmaMarkerString).unwrap(),
             "[^<\n]"
+        );
+        assert_eq!(
+            regex_to_gbnf_body("^.$", Surface::DeepSeekRawString).unwrap(),
+            "[^\n]"
         );
     }
 

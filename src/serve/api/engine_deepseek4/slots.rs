@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use mlx_native::MlxBuffer;
 use tokio::sync::mpsc;
 
-use crate::serve::api::engine::{GenerationResult, SamplingParams};
+use crate::serve::api::engine::{validate_grammar_terminal, GenerationResult, SamplingParams};
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::grammar::GrammarRuntime;
 use crate::serve::api::registry::ModelRegistration;
@@ -702,6 +702,11 @@ impl Deepseek4SlotState {
                 self.finish_reason = "tool_calls";
             }
         }
+        validate_grammar_terminal(
+            self.runtime.as_ref(),
+            self.params.grammar_kind,
+            self.finish_reason,
+        )?;
         let semantic_ttft = self
             .stream_router
             .as_ref()

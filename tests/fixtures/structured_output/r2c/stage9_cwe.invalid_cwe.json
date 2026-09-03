@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "primary_cwe": "CWE-0",
+  "related_cwes": [],
+  "rationale": "Invalid identifier",
+  "evidence_refs": ["M1"]
+}

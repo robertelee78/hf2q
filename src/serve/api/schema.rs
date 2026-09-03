@@ -17,7 +17,8 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 
 // ---------------------------------------------------------------------------
 // Error types (Decision #24 — OpenAI-compliant `{error: {...}}` envelope)
@@ -95,7 +96,10 @@ impl ApiError {
     pub fn model_not_loaded(model_name: &str) -> Self {
         Self::bare(
             StatusCode::BAD_REQUEST,
-            format!("The model '{}' is cached but not currently loaded. Start the server with `--model <path>` for this model.", model_name),
+            format!(
+                "The model '{}' is cached but not currently loaded. Start the server with `--model <path>` for this model.",
+                model_name
+            ),
             "invalid_request_error",
             Some("model_not_loaded"),
             Some("model".into()),
@@ -336,12 +340,17 @@ impl ApiError {
     /// Grammar-rejection (HTTP 400) — a malformed JSON schema or GBNF grammar
     /// was supplied in `response_format` or `tools` (Decision #6).
     pub fn grammar_error(detail: impl Into<String>) -> Self {
+        Self::grammar_error_for("response_format", detail)
+    }
+
+    /// Grammar compilation error attributed to the exact request surface.
+    pub fn grammar_error_for(param: impl Into<String>, detail: impl Into<String>) -> Self {
         Self::bare(
             StatusCode::BAD_REQUEST,
             format!("Grammar compilation failed: {}", detail.into()),
             "invalid_request_error",
             Some("grammar_error"),
-            Some("response_format".into()),
+            Some(param.into()),
         )
     }
 
@@ -735,6 +744,7 @@ pub struct ToolCallFunction {
 
 /// A tool definition in the request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tool {
     #[serde(rename = "type")]
     pub tool_type: String,
@@ -743,6 +753,7 @@ pub struct Tool {
 
 /// Function definition within a tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolFunction {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -771,29 +782,293 @@ impl StopSequence {
     }
 }
 
+/// A JSON Schema supplied through vLLM's `structured_outputs.json` field.
+///
+/// vLLM accepts either the schema object itself or a string containing the
+/// serialized schema. Keeping those forms distinct lets the compiler reject a
+/// malformed JSON string with a request-local diagnostic instead of silently
+/// treating it as an unconstrained string schema.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum StructuredOutputJson {
+    Object(serde_json::Map<String, serde_json::Value>),
+    String(String),
+}
+
+/// A JSON Schema accepted by the peer's top-level `json_schema` surface.
+/// Draft 2020-12 permits both object schemas and the boolean `true`/`false`
+/// schemas. Other JSON types are not schemas and fail during deserialization.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum JsonSchemaValue {
+    Boolean(bool),
+    Object(serde_json::Map<String, serde_json::Value>),
+}
+
+impl JsonSchemaValue {
+    pub fn as_value(&self) -> serde_json::Value {
+        match self {
+            Self::Boolean(value) => serde_json::Value::Bool(*value),
+            Self::Object(value) => serde_json::Value::Object(value.clone()),
+        }
+    }
+
+    pub fn into_value(self) -> serde_json::Value {
+        match self {
+            Self::Boolean(value) => serde_json::Value::Bool(value),
+            Self::Object(value) => serde_json::Value::Object(value),
+        }
+    }
+}
+
+/// vLLM-compatible per-request structured-output controls.
+///
+/// Exactly one of the six constraint fields must be present. Backend options
+/// do not count as constraints and may accompany the selected constraint.
+/// Unknown fields are rejected so misspelled constraints cannot degrade to
+/// unconstrained generation.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredOutputs {
+    #[serde(default)]
+    pub choice: Option<Vec<String>>,
+    #[serde(default)]
+    pub regex: Option<String>,
+    #[serde(default)]
+    pub json: Option<StructuredOutputJson>,
+    #[serde(default)]
+    pub json_object: Option<bool>,
+    #[serde(default)]
+    pub grammar: Option<String>,
+    /// vLLM carries XGrammar's current or legacy structural-tag object as a
+    /// serialized JSON string. Compiler-side validation remains fail closed.
+    #[serde(default)]
+    pub structural_tag: Option<String>,
+    #[serde(default)]
+    pub disable_any_whitespace: Option<bool>,
+    #[serde(default)]
+    pub disable_additional_properties: Option<bool>,
+    #[serde(default)]
+    pub whitespace_pattern: Option<String>,
+}
+
+/// Why a [`StructuredOutputs`] request is not a single usable constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredOutputsValidationError {
+    NoConstraint,
+    MultipleConstraints,
+    JsonObjectMustBeTrue,
+}
+
+impl std::fmt::Display for StructuredOutputsValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoConstraint => f.write_str(
+                "structured_outputs must specify exactly one of choice, regex, json, \
+                 json_object, grammar, or structural_tag",
+            ),
+            Self::MultipleConstraints => f.write_str(
+                "structured_outputs may specify only one of choice, regex, json, \
+                 json_object, grammar, or structural_tag",
+            ),
+            Self::JsonObjectMustBeTrue => {
+                f.write_str("structured_outputs.json_object must be true when specified")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StructuredOutputsValidationError {}
+
+impl StructuredOutputs {
+    /// Enforce vLLM's one-constraint invariant before grammar compilation.
+    pub fn validate_exactly_one_constraint(&self) -> Result<(), StructuredOutputsValidationError> {
+        let count = [
+            self.choice.is_some(),
+            self.regex.is_some(),
+            self.json.is_some(),
+            self.json_object.is_some(),
+            self.grammar.is_some(),
+            self.structural_tag.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+
+        match count {
+            0 => Err(StructuredOutputsValidationError::NoConstraint),
+            1 if self.json_object == Some(false) => {
+                Err(StructuredOutputsValidationError::JsonObjectMustBeTrue)
+            }
+            1 => Ok(()),
+            _ => Err(StructuredOutputsValidationError::MultipleConstraints),
+        }
+    }
+}
+
+/// Numeric trigger kinds used by the peer's server request schema.
+///
+/// These discriminants are wire values, not implementation-local ordinals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlamaGrammarTriggerType {
+    Token,
+    Word,
+    Pattern,
+    PatternFull,
+}
+
+impl<'de> Deserialize<'de> for LlamaGrammarTriggerType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match u8::deserialize(deserializer)? {
+            0 => Ok(Self::Token),
+            1 => Ok(Self::Word),
+            2 => Ok(Self::Pattern),
+            3 => Ok(Self::PatternFull),
+            other => Err(D::Error::custom(format!(
+                "grammar trigger type must be an integer from 0 through 3, got {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LlamaGrammarTriggerWire {
+    #[serde(rename = "type")]
+    trigger_type: LlamaGrammarTriggerType,
+    value: String,
+    #[serde(default)]
+    token: Option<i32>,
+}
+
+/// A single peer lazy-grammar trigger.
+///
+/// Token triggers (`type: 0`) require the resolved token id. Word and regex
+/// triggers must not carry one, preventing ambiguous or ignored input.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "LlamaGrammarTriggerWire")]
+pub struct LlamaGrammarTrigger {
+    pub trigger_type: LlamaGrammarTriggerType,
+    pub value: String,
+    pub token: Option<i32>,
+}
+
+impl TryFrom<LlamaGrammarTriggerWire> for LlamaGrammarTrigger {
+    type Error = String;
+
+    fn try_from(wire: LlamaGrammarTriggerWire) -> Result<Self, Self::Error> {
+        match (wire.trigger_type, wire.token) {
+            (LlamaGrammarTriggerType::Token, None) => {
+                return Err("grammar trigger type 0 requires a token field".into());
+            }
+            (LlamaGrammarTriggerType::Word, Some(_))
+            | (LlamaGrammarTriggerType::Pattern, Some(_))
+            | (LlamaGrammarTriggerType::PatternFull, Some(_)) => {
+                return Err("only grammar trigger type 0 may contain a token field".into());
+            }
+            _ => {}
+        }
+        Ok(Self {
+            trigger_type: wire.trigger_type,
+            value: wire.value,
+            token: wire.token,
+        })
+    }
+}
+
 /// `response_format` parameter (Decision #6; Tier 1 surface).
 ///
-/// Three shapes are accepted:
+/// Four shapes are accepted:
 ///   `{"type": "text"}`         — unconstrained (default).
 ///   `{"type": "json_object"}`  — legacy "any valid JSON" constraint.
 ///   `{"type": "json_schema",
 ///     "json_schema": {"name": "...", "schema": {...}, "strict": true}}`
 ///                              — schema-constrained JSON via the ported
 ///                                 `json-schema-to-grammar` + GBNF sampler.
+///   `{"type": "structural_tag", ...}`
+///                              — vLLM/XGrammar tagged structured content.
 ///
 /// All three compile down to a grammar the sampler applies token-by-token.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ResponseFormat {
     #[serde(rename = "text")]
     Text,
     #[serde(rename = "json_object")]
-    JsonObject,
+    JsonObject {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<JsonSchemaValue>,
+    },
     #[serde(rename = "json_schema")]
     JsonSchema { json_schema: JsonSchemaSpec },
+    /// vLLM structural-tag formats are validated by the structured-output
+    /// compiler. Preserve all fields after the `type` discriminator so both
+    /// the current `format` shape and the legacy `structures`/`triggers`
+    /// shape survive request parsing without premature interpretation.
+    #[serde(rename = "structural_tag")]
+    StructuralTag {
+        #[serde(flatten)]
+        spec: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+impl<'de> Deserialize<'de> for ResponseFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut object = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let format_type = object
+            .remove("type")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| D::Error::custom("response_format.type must be a string"))?;
+        match format_type.as_str() {
+            "text" => {
+                if !object.is_empty() {
+                    return Err(D::Error::custom(
+                        "response_format type=text does not accept additional fields",
+                    ));
+                }
+                Ok(Self::Text)
+            }
+            "json_object" => {
+                let schema = object
+                    .remove("schema")
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(D::Error::custom)?;
+                if !object.is_empty() {
+                    return Err(D::Error::custom(
+                        "response_format type=json_object accepts only an optional schema field",
+                    ));
+                }
+                Ok(Self::JsonObject { schema })
+            }
+            "json_schema" => {
+                let json_schema = object.remove("json_schema").ok_or_else(|| {
+                    D::Error::custom("response_format type=json_schema requires json_schema")
+                })?;
+                if !object.is_empty() {
+                    return Err(D::Error::custom(
+                        "response_format type=json_schema does not accept additional fields",
+                    ));
+                }
+                let json_schema = serde_json::from_value(json_schema).map_err(D::Error::custom)?;
+                Ok(Self::JsonSchema { json_schema })
+            }
+            "structural_tag" => Ok(Self::StructuralTag { spec: object }),
+            other => Err(D::Error::custom(format!(
+                "unsupported response_format.type {other:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct JsonSchemaSpec {
     pub name: String,
     #[serde(default)]
@@ -858,6 +1133,28 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    /// vLLM structured-output surface. The handler must call
+    /// [`StructuredOutputs::validate_exactly_one_constraint`] before
+    /// compiling the selected constraint.
+    #[serde(default)]
+    pub structured_outputs: Option<StructuredOutputs>,
+    /// Peer-compatible top-level GBNF grammar.
+    #[serde(default)]
+    pub grammar: Option<String>,
+    /// Peer-compatible top-level JSON Schema. JSON Schema Draft 2020-12
+    /// permits an object or a boolean schema; all other JSON types reject at
+    /// the request boundary.
+    #[serde(default)]
+    pub json_schema: Option<JsonSchemaValue>,
+    /// Apply the explicit grammar only after a configured trigger fires.
+    #[serde(default)]
+    pub grammar_lazy: Option<bool>,
+    /// Token strings that must remain atomic for lazy token triggers.
+    #[serde(default)]
+    pub preserved_tokens: Option<Vec<String>>,
+    /// Peer-compatible lazy trigger objects.
+    #[serde(default)]
+    pub grammar_triggers: Option<Vec<LlamaGrammarTrigger>>,
 
     // --- Tier 2: important ---
     #[serde(default)]
@@ -1175,23 +1472,46 @@ pub enum ToolChoiceValue {
 }
 
 impl ToolChoiceValue {
-    pub fn parse(value: Option<&serde_json::Value>) -> Self {
+    /// Parse the OpenAI `tool_choice` union without a permissive fallback.
+    /// Unknown strings and malformed named-function objects are request
+    /// errors; they must never turn into `auto` generation.
+    pub fn try_parse(value: Option<&serde_json::Value>) -> Result<Self, String> {
         match value {
-            None => ToolChoiceValue::Auto,
+            None => Ok(ToolChoiceValue::Auto),
             Some(serde_json::Value::String(s)) => match s.as_str() {
-                "none" => ToolChoiceValue::None,
-                "required" => ToolChoiceValue::Required,
-                _ => ToolChoiceValue::Auto,
+                "auto" => Ok(ToolChoiceValue::Auto),
+                "none" => Ok(ToolChoiceValue::None),
+                "required" => Ok(ToolChoiceValue::Required),
+                _ => Err(format!(
+                    "tool_choice must be 'auto', 'none', 'required', or a named function object; got {s:?}"
+                )),
             },
             Some(serde_json::Value::Object(obj)) => {
-                if let Some(func_obj) = obj.get("function") {
-                    if let Some(name) = func_obj.get("name").and_then(|n| n.as_str()) {
-                        return ToolChoiceValue::Function(name.to_string());
-                    }
+                if obj.len() != 2
+                    || obj.get("type").and_then(serde_json::Value::as_str) != Some("function")
+                {
+                    return Err(
+                        "named tool_choice must contain exactly type='function' and function"
+                            .into(),
+                    );
                 }
-                ToolChoiceValue::Auto
+                let function = obj
+                    .get("function")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| "tool_choice.function must be an object".to_string())?;
+                if function.len() != 1 {
+                    return Err("tool_choice.function must contain exactly one name field".into());
+                }
+                let name = function
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "tool_choice.function.name must be a string".to_string())?;
+                if name.is_empty() {
+                    return Err("tool_choice.function.name must not be empty".into());
+                }
+                Ok(ToolChoiceValue::Function(name.to_string()))
             }
-            _ => ToolChoiceValue::Auto,
+            Some(_) => Err("tool_choice must be a string or a named function object".to_string()),
         }
     }
 }
@@ -1663,7 +1983,7 @@ mod tests {
         assert_eq!(req.temperature, Some(0.7));
         assert!(matches!(
             req.response_format,
-            Some(ResponseFormat::JsonObject)
+            Some(ResponseFormat::JsonObject { schema: None })
         ));
         assert_eq!(req.top_p, Some(0.9));
         assert_eq!(req.seed, Some(42));
@@ -1711,6 +2031,281 @@ mod tests {
     }
 
     #[test]
+    fn test_structured_outputs_accepts_each_vllm_constraint_shape() {
+        let cases = [
+            serde_json::json!({"choice": ["yes", "no"]}),
+            serde_json::json!({"regex": "[a-z]+"}),
+            serde_json::json!({"json": {"type": "object"}}),
+            serde_json::json!({"json": "{\"type\":\"object\"}"}),
+            serde_json::json!({"json_object": true}),
+            serde_json::json!({"grammar": "root ::= \"ok\""}),
+            serde_json::json!({"structural_tag": "{\"type\":\"structural_tag\",\"format\":{\"type\":\"const_string\",\"value\":\"ok\"}}"}),
+        ];
+
+        for value in cases {
+            let parsed: StructuredOutputs = serde_json::from_value(value.clone())
+                .unwrap_or_else(|error| panic!("{value} must deserialize: {error}"));
+            assert_eq!(parsed.validate_exactly_one_constraint(), Ok(()));
+        }
+
+        assert!(
+            serde_json::from_value::<StructuredOutputs>(serde_json::json!({
+                "structural_tag": {"type":"structural_tag","format":{"type":"const_string","value":"ok"}}
+            }))
+            .is_err(),
+            "vLLM structural_outputs.structural_tag is a serialized JSON string"
+        );
+
+        let object: StructuredOutputs =
+            serde_json::from_value(serde_json::json!({"json": {"type": "array"}})).unwrap();
+        assert!(matches!(object.json, Some(StructuredOutputJson::Object(_))));
+        let string: StructuredOutputs = serde_json::from_value(serde_json::json!({
+            "json": "{\"type\":\"array\"}"
+        }))
+        .unwrap();
+        assert!(matches!(string.json, Some(StructuredOutputJson::String(_))));
+    }
+
+    #[test]
+    fn test_structured_outputs_options_do_not_count_as_constraints() {
+        let parsed: StructuredOutputs = serde_json::from_value(serde_json::json!({
+            "grammar": "root ::= \"ok\"",
+            "disable_any_whitespace": true,
+            "disable_additional_properties": true,
+            "whitespace_pattern": "[ ]?"
+        }))
+        .unwrap();
+        assert_eq!(parsed.validate_exactly_one_constraint(), Ok(()));
+    }
+
+    #[test]
+    fn test_structured_outputs_validation_is_fail_closed() {
+        let empty: StructuredOutputs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            empty.validate_exactly_one_constraint(),
+            Err(StructuredOutputsValidationError::NoConstraint)
+        );
+
+        let multiple: StructuredOutputs = serde_json::from_value(serde_json::json!({
+            "choice": ["yes", "no"],
+            "regex": "yes|no"
+        }))
+        .unwrap();
+        assert_eq!(
+            multiple.validate_exactly_one_constraint(),
+            Err(StructuredOutputsValidationError::MultipleConstraints)
+        );
+
+        let false_json_object: StructuredOutputs =
+            serde_json::from_value(serde_json::json!({"json_object": false})).unwrap();
+        assert_eq!(
+            false_json_object.validate_exactly_one_constraint(),
+            Err(StructuredOutputsValidationError::JsonObjectMustBeTrue)
+        );
+
+        assert!(
+            serde_json::from_value::<StructuredOutputs>(serde_json::json!({
+                "guided_regex": "[a-z]+"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StructuredOutputs>(serde_json::json!({
+                "choice": "yes"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StructuredOutputs>(serde_json::json!({
+                "json": ["not", "a", "schema"]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StructuredOutputs>(serde_json::json!({
+                "grammar": {"root": "ok"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_chat_request_deserializes_vllm_and_llama_grammar_surfaces() {
+        let json = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "structured_outputs": {"choice": ["allow", "deny"]},
+            "grammar": "root ::= \"ok\"",
+            "json_schema": {"type": "object"},
+            "grammar_lazy": true,
+            "preserved_tokens": ["<tool>", "</tool>"],
+            "grammar_triggers": [
+                {"type": 0, "value": "<tool>", "token": 32000},
+                {"type": 1, "value": "<tool>"},
+                {"type": 2, "value": "^tool:"},
+                {"type": 3, "value": "tool:(.*)"}
+            ]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.structured_outputs
+                .as_ref()
+                .unwrap()
+                .validate_exactly_one_constraint(),
+            Ok(())
+        );
+        assert_eq!(req.grammar.as_deref(), Some("root ::= \"ok\""));
+        assert_eq!(
+            req.json_schema.as_ref().unwrap().as_value()["type"],
+            "object"
+        );
+        assert_eq!(req.grammar_lazy, Some(true));
+        assert_eq!(
+            req.preserved_tokens.as_deref(),
+            Some(["<tool>".to_string(), "</tool>".to_string()].as_slice())
+        );
+        let triggers = req.grammar_triggers.unwrap();
+        assert_eq!(triggers.len(), 4);
+        assert_eq!(triggers[0].trigger_type, LlamaGrammarTriggerType::Token);
+        assert_eq!(triggers[0].token, Some(32000));
+        assert_eq!(triggers[1].trigger_type, LlamaGrammarTriggerType::Word);
+        assert_eq!(triggers[2].trigger_type, LlamaGrammarTriggerType::Pattern);
+        assert_eq!(
+            triggers[3].trigger_type,
+            LlamaGrammarTriggerType::PatternFull
+        );
+    }
+
+    #[test]
+    fn test_llama_grammar_surface_rejects_type_and_trigger_drift() {
+        let request_with = |fields: &str| {
+            format!(r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],{fields}}}"#)
+        };
+
+        for fields in [
+            r#""grammar": {"root": "ok"}"#,
+            r#""json_schema": "{\"type\":\"object\"}""#,
+            r#""json_schema": [true]"#,
+            r#""json_schema": 7"#,
+            r#""grammar_lazy": "true""#,
+            r#""preserved_tokens": [1]"#,
+            r#""grammar_triggers": [{"type": 4, "value": "x"}]"#,
+            r#""grammar_triggers": [{"type": 0, "value": "x"}]"#,
+            r#""grammar_triggers": [{"type": 1, "value": "x", "token": 7}]"#,
+            r#""grammar_triggers": [{"type": 1, "value": "x", "extra": true}]"#,
+        ] {
+            let json = request_with(fields);
+            assert!(
+                serde_json::from_str::<ChatCompletionRequest>(&json).is_err(),
+                "invalid surface must fail: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_llama_top_level_json_schema_accepts_object_and_boolean_schemas() {
+        for (wire, expected) in [
+            (r#"{"type":"object"}"#, serde_json::json!({"type":"object"})),
+            ("true", serde_json::Value::Bool(true)),
+            ("false", serde_json::Value::Bool(false)),
+        ] {
+            let json = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"json_schema":{wire}}}"#
+            );
+            let request: ChatCompletionRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(request.json_schema.unwrap().into_value(), expected);
+        }
+
+        // the peer treats explicit null like omission; serde's Option wire
+        // shape preserves that compatibility.
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"json_schema":null}"#,
+        )
+        .unwrap();
+        assert!(request.json_schema.is_none());
+    }
+
+    #[test]
+    fn test_tool_definition_wire_shape_is_strict() {
+        let valid = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "description": "Look up weather",
+                "parameters": {"type": "object"}
+            }
+        });
+        serde_json::from_value::<Tool>(valid).unwrap();
+
+        for invalid in [
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "lookup", "unknown": true}
+            }),
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "lookup"},
+                "unknown": true
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<Tool>(invalid.clone()).is_err(),
+                "unknown tool fields must reject: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_response_format_structural_tag_preserves_current_and_legacy_shapes() {
+        for value in [
+            serde_json::json!({
+                "type": "structural_tag",
+                "format": {"type": "object", "properties": {}}
+            }),
+            serde_json::json!({
+                "type": "structural_tag",
+                "structures": [{"begin": "<json>", "schema": {}, "end": "</json>"}],
+                "triggers": ["<json>"]
+            }),
+        ] {
+            let parsed: ResponseFormat = serde_json::from_value(value.clone()).unwrap();
+            match &parsed {
+                ResponseFormat::StructuralTag { spec } => assert!(!spec.is_empty()),
+                other => panic!("expected StructuralTag, got {other:?}"),
+            }
+            assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn test_json_schema_response_wrapper_rejects_unknown_fields() {
+        let value = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {"type": "object"},
+                "strcit": true
+            }
+        });
+        assert!(serde_json::from_value::<ResponseFormat>(value).is_err());
+
+        for value in [
+            serde_json::json!({"type":"text", "extra":true}),
+            serde_json::json!({"type":"json_object", "extra":true}),
+            serde_json::json!({
+                "type":"json_schema",
+                "json_schema":{"name":"answer", "schema":{}},
+                "extra":true
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<ResponseFormat>(value.clone()).is_err(),
+                "unknown response_format fields must reject: {value}"
+            );
+        }
+    }
+
+    #[test]
     fn test_chat_completion_request_minimal() {
         let json = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
@@ -1721,6 +2316,12 @@ mod tests {
         assert!(req.max_completion_tokens.is_none());
         assert!(req.stop.is_none());
         assert!(req.response_format.is_none());
+        assert!(req.structured_outputs.is_none());
+        assert!(req.grammar.is_none());
+        assert!(req.json_schema.is_none());
+        assert!(req.grammar_lazy.is_none());
+        assert!(req.preserved_tokens.is_none());
+        assert!(req.grammar_triggers.is_none());
         assert!(req.seed.is_none());
         assert!(req.top_k.is_none());
         assert!(req.logprobs.is_none());
@@ -1777,33 +2378,62 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_choice_parse_auto() {
-        assert_eq!(ToolChoiceValue::parse(None), ToolChoiceValue::Auto);
+    fn test_tool_choice_try_parse_auto() {
+        assert_eq!(
+            ToolChoiceValue::try_parse(None).unwrap(),
+            ToolChoiceValue::Auto
+        );
         let val = serde_json::json!("auto");
-        assert_eq!(ToolChoiceValue::parse(Some(&val)), ToolChoiceValue::Auto);
+        assert_eq!(
+            ToolChoiceValue::try_parse(Some(&val)).unwrap(),
+            ToolChoiceValue::Auto
+        );
     }
 
     #[test]
-    fn test_tool_choice_parse_none() {
+    fn test_tool_choice_try_parse_none() {
         let val = serde_json::json!("none");
-        assert_eq!(ToolChoiceValue::parse(Some(&val)), ToolChoiceValue::None);
+        assert_eq!(
+            ToolChoiceValue::try_parse(Some(&val)).unwrap(),
+            ToolChoiceValue::None
+        );
     }
 
     #[test]
-    fn test_tool_choice_parse_required() {
+    fn test_tool_choice_try_parse_required() {
         let val = serde_json::json!("required");
         assert_eq!(
-            ToolChoiceValue::parse(Some(&val)),
+            ToolChoiceValue::try_parse(Some(&val)).unwrap(),
             ToolChoiceValue::Required
         );
     }
 
     #[test]
-    fn test_tool_choice_parse_forced_function() {
+    fn test_tool_choice_try_parse_forced_function() {
         let val = serde_json::json!({"type": "function", "function": {"name": "get_weather"}});
-        match ToolChoiceValue::parse(Some(&val)) {
+        match ToolChoiceValue::try_parse(Some(&val)).unwrap() {
             ToolChoiceValue::Function(name) => assert_eq!(name, "get_weather"),
             other => panic!("Expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tool_choice_try_parse_rejects_malformed_values() {
+        for value in [
+            serde_json::json!("sometimes"),
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!({"type":"function"}),
+            serde_json::json!({"type":"other","function":{"name":"lookup"}}),
+            serde_json::json!({"type":"function","function":{}}),
+            serde_json::json!({"type":"function","function":{"name":""}}),
+            serde_json::json!({"type":"function","function":{"name":"lookup","extra":true}}),
+            serde_json::json!({"type":"function","function":{"name":"lookup"},"extra":true}),
+        ] {
+            assert!(
+                ToolChoiceValue::try_parse(Some(&value)).is_err(),
+                "malformed tool_choice must fail closed: {value}"
+            );
         }
     }
 

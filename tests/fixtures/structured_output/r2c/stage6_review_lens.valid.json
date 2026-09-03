@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "review_unit_alias": "U1",
+  "lens_alias": "L1",
+  "disposition": "supported_observation",
+  "member_coverage": [
+    { "member_alias": "M1", "assessment": { "status": "examined" } }
+  ],
+  "relationship_coverage": [],
+  "fact_coverage": [],
+  "gap_coverage": [
+    {
+      "gap_alias": "G1",
+      "assessment": {
+        "status": "unresolved",
+        "detail": "missing sink proof"
+      }
+    }
+  ],
+  "observations": [
+    {
+      "local_id": "provider-1",
+      "kind": "supported_observation",
+      "summary": "validated finding",
+      "evidence_refs": ["M1"]
+    }
+  ]
+}

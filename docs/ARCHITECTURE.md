@@ -386,7 +386,13 @@ the shipping contract pass.
    from the persisted block store.
 3. Samples through `serve/sampler_pure.rs` (temp / top-k / top-p) and
    optionally a grammar-constrained `serve/api/grammar/` sampler for
-   tool calls and JSON-mode.
+   tool calls and structured output. `grammar/request.rs` normalizes OpenAI,
+   peer and vLLM request surfaces into one typed constraint;
+   `json_schema.rs`, `structural_tag.rs`, and `regex_gbnf.rs` compile it;
+   the parser/runtime/mask layer then applies the same constraint lifecycle to
+   Gemma, Qwen 3.5/3.6, Qwen3-VL text, and DeepSeek4 decoding. Family-specific
+   registration controls only native reasoning/tool wire syntax and MUST NOT
+   create an unconstrained fallback.
 
 ### 4.4 Speculative decode (ADR-029 / ADR-030)
 

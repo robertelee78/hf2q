@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "review_unit_alias": "U1",
+  "lens_alias": "L1",
+  "disposition": "unresolved_with_gap",
+  "member_coverage": [],
+  "relationship_coverage": [],
+  "fact_coverage": [],
+  "gap_coverage": [
+    { "gap_alias": "G1", "assessment": { "status": "unresolved" } }
+  ],
+  "observations": []
+}

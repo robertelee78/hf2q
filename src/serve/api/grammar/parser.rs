@@ -33,6 +33,14 @@ pub enum GretType {
     CharRngUpper = 5,
     CharAlt = 6,
     CharAny = 7,
+    Token = 8,
+    TokenNot = 9,
+    /// hf2q-local extension: match any non-EOG vocabulary token.
+    TokenAny = 10,
+    /// hf2q-local extension: value is the count of following set members.
+    TokenNotSet = 11,
+    /// Continuation member for the preceding `TokenNotSet` element.
+    TokenSetMember = 12,
 }
 
 impl GretType {
@@ -49,8 +57,11 @@ impl GretType {
 }
 
 /// A single grammar element: a type + a 32-bit value interpreted per type.
-/// For `Char*` types `value` is a Unicode code point; for `RuleRef` it's a
-/// rule id; for `End` / `Alt` / `CharAny` it's unused (stored as 0).
+/// For `Char*` types `value` is a Unicode code point, for `RuleRef` it is a
+/// rule id, and for token elements it is a tokenizer token id. `TokenAny`'s
+/// value is unused, while `TokenNotSet` stores the count of immediately
+/// following sorted `TokenSetMember` IDs. For `End` / `Alt` / `CharAny` it is
+/// unused (stored as 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GretElement {
     pub ty: GretType,
@@ -108,11 +119,27 @@ impl std::fmt::Display for ParseError {
 }
 impl std::error::Error for ParseError {}
 
+impl ParseError {
+    /// Whether parsing stopped only because a textual token terminal must be
+    /// resolved against the selected model's tokenizer. Callers may defer
+    /// this one condition until model resolution; every other parse error is
+    /// request-local and must fail immediately.
+    pub(crate) fn requires_tokenizer(&self) -> bool {
+        self.message == "textual token terminal requires a tokenizer resolver"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Max repetition threshold. Prevents grammars like `a{999999}` from
 // exploding.
 // ---------------------------------------------------------------------------
 const MAX_REPETITION_THRESHOLD: u64 = 2000;
+const MAX_RAW_GRAMMAR_BYTES: usize = 1024 * 1024;
+const MAX_GRAMMAR_RULES: usize = 262_144;
+const MAX_GRAMMAR_ELEMENTS: usize = 4_194_304;
+/// Maximum explicitly excluded IDs in one local token-set terminal. The set
+/// is stored compactly; the vocabulary is never enumerated.
+const MAX_TOKEN_SET_MEMBERS: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Top-level parser
@@ -120,15 +147,125 @@ const MAX_REPETITION_THRESHOLD: u64 = 2000;
 
 /// Parse a GBNF grammar string. Returns `Err(ParseError)` on malformed input.
 pub fn parse(src: &str) -> Result<Grammar, ParseError> {
+    parse_impl(src, None, true)
+}
+
+/// Parse compiler-generated GBNF after its original untrusted input has
+/// already passed the 1 MiB request limit. Generated grammar expansion is
+/// governed by the rule/element limits, not by the wire-size limit.
+pub(crate) fn parse_generated(src: &str) -> Result<Grammar, ParseError> {
+    parse_impl(src, None, false)
+}
+
+/// Parse GBNF with a model-bound textual token resolver.
+///
+/// Numeric `<[id]>` forms bypass the resolver. For textual forms, `resolver`
+/// receives the complete bracketed lexeme (for example `<think>`) and must
+/// return exactly one tokenizer token id or a diagnostic explaining why the
+/// lexeme is not one token. This mirrors the peer's `add_special=false,
+/// parse_special=true` single-token requirement without coupling the grammar
+/// module to one tokenizer implementation.
+pub fn parse_with_token_resolver<F>(src: &str, mut resolver: F) -> Result<Grammar, ParseError>
+where
+    F: FnMut(&str) -> Result<u32, String>,
+{
+    parse_impl(src, Some(&mut resolver), true)
+}
+
+/// Resolve token terminals against a concrete Hugging Face tokenizer.
+/// Added/special textual tokens remain parseable while BOS/EOS processors are
+/// disabled, a textual lexeme that produces zero or multiple ids is rejected,
+/// and every resulting numeric token id must exist in this vocabulary.
+pub fn parse_with_tokenizer(
+    src: &str,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<Grammar, ParseError> {
+    let grammar = parse_with_token_resolver(src, |lexeme| {
+        let encoding = tokenizer
+            .encode(lexeme, false)
+            .map_err(|error| error.to_string())?;
+        match encoding.get_ids() {
+            [token_id] => Ok(*token_id),
+            ids => Err(format!(
+                "must resolve to exactly one token id, resolved {}",
+                ids.len()
+            )),
+        }
+    })?;
+
+    validate_token_ids(&grammar, tokenizer)?;
+    Ok(grammar)
+}
+
+/// Prove that every explicit numeric token terminal belongs to the selected
+/// model vocabulary. TokenAny is vocabulary-relative by construction.
+pub fn validate_token_ids(
+    grammar: &Grammar,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<(), ParseError> {
+    if let Some(invalid) = grammar.rules.iter().flatten().find(|element| {
+        matches!(
+            element.ty,
+            GretType::Token | GretType::TokenNot | GretType::TokenSetMember
+        ) && tokenizer.id_to_token(element.value).is_none()
+    }) {
+        return Err(ParseError {
+            offset: 0,
+            message: format!(
+                "token id {} is not present in the bound tokenizer vocabulary",
+                invalid.value
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn parse_impl(
+    src: &str,
+    token_resolver: Option<&mut dyn FnMut(&str) -> Result<u32, String>>,
+    enforce_raw_limit: bool,
+) -> Result<Grammar, ParseError> {
+    if enforce_raw_limit && src.len() > MAX_RAW_GRAMMAR_BYTES {
+        return Err(ParseError {
+            offset: MAX_RAW_GRAMMAR_BYTES,
+            message: format!(
+                "grammar input exceeds the {MAX_RAW_GRAMMAR_BYTES}-byte resource limit"
+            ),
+        });
+    }
     let bytes = src.as_bytes();
     let mut state = ParserState {
         bytes,
+        token_resolver,
         symbol_ids: HashMap::new(),
         rules: Vec::new(),
     };
     let mut pos = parse_space(bytes, 0, true);
     while pos < bytes.len() && bytes[pos] != 0 {
         pos = state.parse_rule(pos)?;
+    }
+    if state.rules.len() > MAX_GRAMMAR_RULES {
+        return Err(ParseError {
+            offset: 0,
+            message: format!(
+                "grammar has {} rules, exceeding the {MAX_GRAMMAR_RULES}-rule resource limit",
+                state.rules.len()
+            ),
+        });
+    }
+    let element_count = state.rules.iter().try_fold(0usize, |total, rule| {
+        total.checked_add(rule.len()).ok_or(ParseError {
+            offset: 0,
+            message: "grammar element count overflowed the resource counter".into(),
+        })
+    })?;
+    if element_count > MAX_GRAMMAR_ELEMENTS {
+        return Err(ParseError {
+            offset: 0,
+            message: format!(
+                "grammar has {element_count} expanded elements, exceeding the {MAX_GRAMMAR_ELEMENTS}-element resource limit"
+            ),
+        });
     }
     // Validate: every referenced rule must be defined (non-empty).
     for (rule_idx, rule) in state.rules.iter().enumerate() {
@@ -163,23 +300,123 @@ pub fn parse(src: &str) -> Result<Grammar, ParseError> {
             }
         }
     }
+    validate_no_left_recursion(&state.rules)?;
     Ok(Grammar {
         rules: state.rules,
         symbol_ids: state.symbol_ids,
     })
 }
 
+/// Reject grammars whose left-corner graph contains a cycle.
+///
+/// A reference is a left corner when it can be reached before consuming a
+/// terminal. Nullable references therefore expose the next reference in the
+/// same alternative. The runtime expands left corners before it consumes a
+/// character; a cycle here would otherwise grow its work stack without a
+/// progress bound.
+fn validate_no_left_recursion(rules: &[Vec<GretElement>]) -> Result<(), ParseError> {
+    let mut nullable = vec![false; rules.len()];
+    loop {
+        let mut changed = false;
+        for (rule_id, rule) in rules.iter().enumerate() {
+            if !nullable[rule_id] && has_nullable_alternative(rule, &nullable) {
+                nullable[rule_id] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut left_corners = vec![Vec::new(); rules.len()];
+    for (rule_id, rule) in rules.iter().enumerate() {
+        let mut before_terminal = true;
+        for element in rule {
+            match element.ty {
+                GretType::Alt => before_terminal = true,
+                GretType::End => break,
+                GretType::RuleRef if before_terminal => {
+                    let target = element.value as usize;
+                    if !left_corners[rule_id].contains(&target) {
+                        left_corners[rule_id].push(target);
+                    }
+                    before_terminal = nullable[target];
+                }
+                _ => before_terminal = false,
+            }
+        }
+    }
+
+    // Iterative DFS avoids moving the unbounded recursion risk from the
+    // grammar runtime into validation itself.
+    let mut state = vec![0u8; rules.len()]; // 0 = unseen, 1 = active, 2 = done
+    for start in 0..rules.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        let mut work = vec![(start, 0usize)];
+        while let Some((rule_id, next_edge)) = work.last_mut() {
+            if *next_edge == left_corners[*rule_id].len() {
+                state[*rule_id] = 2;
+                work.pop();
+                continue;
+            }
+            let target = left_corners[*rule_id][*next_edge];
+            *next_edge += 1;
+            match state[target] {
+                0 => {
+                    state[target] = 1;
+                    work.push((target, 0));
+                }
+                1 => {
+                    return Err(ParseError {
+                        offset: 0,
+                        message: "unsupported grammar: left recursion detected".into(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_nullable_alternative(rule: &[GretElement], nullable: &[bool]) -> bool {
+    let mut alternative_is_nullable = true;
+    for element in rule {
+        match element.ty {
+            GretType::Alt | GretType::End => {
+                if alternative_is_nullable {
+                    return true;
+                }
+                if element.ty == GretType::End {
+                    return false;
+                }
+                alternative_is_nullable = true;
+            }
+            GretType::RuleRef if alternative_is_nullable => {
+                alternative_is_nullable = nullable[element.value as usize];
+            }
+            _ => alternative_is_nullable = false,
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Parser state & internal methods
 // ---------------------------------------------------------------------------
 
-struct ParserState<'a> {
+struct ParserState<'a, 'r> {
     bytes: &'a [u8],
+    token_resolver: Option<&'r mut dyn FnMut(&str) -> Result<u32, String>>,
     symbol_ids: HashMap<String, u32>,
     rules: Vec<Vec<GretElement>>,
 }
 
-impl<'a> ParserState<'a> {
+impl<'a, 'r> ParserState<'a, 'r> {
     fn get_or_create_symbol(&mut self, name: String) -> u32 {
         let next_id = self.symbol_ids.len() as u32;
         let entry = self.symbol_ids.entry(name).or_insert(next_id);
@@ -361,6 +598,21 @@ impl<'a> ParserState<'a> {
                     });
                 }
                 pos = parse_space(self.bytes, pos + 1, is_nested);
+            } else if c == b'<' || c == b'!' {
+                // Token terminal. Numeric token ids do not require a
+                // tokenizer/vocabulary binding and are therefore accepted by
+                // the standalone parser exactly as the peer accepts them.
+                let negated = if c == b'!' {
+                    pos += 1;
+                    true
+                } else {
+                    false
+                };
+                let (token_elements, token_end) = self.parse_token(pos, negated)?;
+                last_sym_start = rule.len();
+                n_prev_rules = 1;
+                rule.extend(token_elements);
+                pos = parse_space(self.bytes, token_end, is_nested);
             } else if is_word_char(c) {
                 // Rule reference.
                 let name_end = parse_name(self.bytes, pos)?;
@@ -505,6 +757,53 @@ impl<'a> ParserState<'a> {
             }
         }
         Ok(pos)
+    }
+
+    fn parse_token(
+        &mut self,
+        start: usize,
+        negated: bool,
+    ) -> Result<(Vec<GretElement>, usize), ParseError> {
+        if self.bytes.get(start) != Some(&b'<') {
+            return Err(ParseError {
+                offset: start,
+                message: "expecting '<' for token terminal".into(),
+            });
+        }
+        if self.bytes.get(start + 1) == Some(&b'[') {
+            return parse_bracket_token(self.bytes, start, negated);
+        }
+
+        let close = self.bytes[start + 1..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .map(|relative| start + 1 + relative)
+            .ok_or_else(|| ParseError {
+                offset: self.bytes.len(),
+                message: "expecting '>' after textual token".into(),
+            })?;
+        let lexeme = std::str::from_utf8(&self.bytes[start..=close])
+            .map_err(|_| ParseError {
+                offset: start,
+                message: "textual token terminal is not valid UTF-8".into(),
+            })?
+            .to_string();
+        let Some(resolver) = self.token_resolver.as_mut() else {
+            return Err(ParseError {
+                offset: start,
+                message: "textual token terminal requires a tokenizer resolver".into(),
+            });
+        };
+        let token_id = resolver(&lexeme).map_err(|message| ParseError {
+            offset: start,
+            message: format!("invalid textual token {lexeme:?}: {message}"),
+        })?;
+        let ty = if negated {
+            GretType::TokenNot
+        } else {
+            GretType::Token
+        };
+        Ok((vec![GretElement::new(ty, token_id)], close + 1))
     }
 
     // --- repetition expansion ---
@@ -662,6 +961,117 @@ fn parse_int(bytes: &[u8], start: usize) -> Result<usize, ParseError> {
     Ok(pos)
 }
 
+/// Parse vocabulary-independent token syntax.
+///
+/// Peer-compatible `<[id]>` / `!<[id]>` retain `Token = 8` and
+/// `TokenNot = 9`. hf2q adds compact structural primitives `<[*]>` (any
+/// non-EOG token) and `!<[id,...]>` (any token except the bounded listed
+/// IDs). Exclusion sets are sorted and deduplicated in the AST, so the
+/// serializer emits one canonical representation without enumerating the
+/// model vocabulary.
+fn parse_bracket_token(
+    bytes: &[u8],
+    start: usize,
+    negated: bool,
+) -> Result<(Vec<GretElement>, usize), ParseError> {
+    if bytes.get(start) != Some(&b'<') {
+        return Err(ParseError {
+            offset: start,
+            message: "expecting '<' for token terminal".into(),
+        });
+    }
+    if bytes.get(start + 1) != Some(&b'[') {
+        return Err(ParseError {
+            offset: start + 1,
+            message: "textual token terminal requires a tokenizer resolver; expecting '[id]'"
+                .into(),
+        });
+    }
+    let mut pos = start + 2;
+    if bytes.get(pos) == Some(&b'*') {
+        if negated {
+            return Err(ParseError {
+                offset: pos,
+                message: "negated token wildcard is not supported".into(),
+            });
+        }
+        if bytes.get(pos + 1) != Some(&b']') || bytes.get(pos + 2) != Some(&b'>') {
+            return Err(ParseError {
+                offset: pos + 1,
+                message: "expecting ']>' after token wildcard".into(),
+            });
+        }
+        return Ok((vec![GretElement::new(GretType::TokenAny, 0)], pos + 3));
+    }
+
+    let mut ids = Vec::new();
+    loop {
+        if ids.len() >= MAX_TOKEN_SET_MEMBERS {
+            return Err(ParseError {
+                offset: pos,
+                message: format!("token exclusion set exceeds {MAX_TOKEN_SET_MEMBERS} members"),
+            });
+        }
+        let id_start = pos;
+        let id_end = parse_int(bytes, id_start)?;
+        let id = std::str::from_utf8(&bytes[id_start..id_end])
+            .ok()
+            .and_then(|text| text.parse::<u32>().ok())
+            .ok_or_else(|| ParseError {
+                offset: id_start,
+                message: "token id is outside the u32 range".into(),
+            })?;
+        ids.push(id);
+        pos = id_end;
+        if bytes.get(pos) == Some(&b',') {
+            pos += 1;
+            continue;
+        }
+        break;
+    }
+
+    if bytes.get(pos) != Some(&b']') {
+        return Err(ParseError {
+            offset: pos,
+            message: "expecting ']' after token id".into(),
+        });
+    }
+    if bytes.get(pos + 1) != Some(&b'>') {
+        return Err(ParseError {
+            offset: pos + 1,
+            message: "expecting '>' after token id".into(),
+        });
+    }
+
+    ids.sort_unstable();
+    ids.dedup();
+    if !negated && ids.len() != 1 {
+        return Err(ParseError {
+            offset: start,
+            message: "positive token sets are not supported; use one id or <[*]>".into(),
+        });
+    }
+    let elements = if negated && ids.len() > 1 {
+        let mut elements = Vec::with_capacity(ids.len() + 1);
+        elements.push(GretElement::new(GretType::TokenNotSet, ids.len() as u32));
+        elements.extend(
+            ids.into_iter()
+                .map(|id| GretElement::new(GretType::TokenSetMember, id)),
+        );
+        elements
+    } else {
+        vec![GretElement::new(
+            if negated {
+                GretType::TokenNot
+            } else {
+                GretType::Token
+            },
+            ids[0],
+        )]
+    };
+    Ok((elements, pos + 2))
+}
+
 /// Parse `N` hex digits starting at `pos`. Returns the decoded value.
 fn parse_hex(bytes: &[u8], pos: usize, n: usize) -> Result<(u32, usize), ParseError> {
     let mut value: u32 = 0;
@@ -712,7 +1122,7 @@ fn parse_char(bytes: &[u8], pos: usize) -> Result<(u32, usize), ParseError> {
             b't' => Ok(('\t' as u32, pos + 2)),
             b'r' => Ok(('\r' as u32, pos + 2)),
             b'n' => Ok(('\n' as u32, pos + 2)),
-            b'\\' | b'"' | b'[' | b']' => Ok((c as u32, pos + 2)),
+            b'\\' | b'"' | b'[' | b']' | b'-' => Ok((c as u32, pos + 2)),
             _ => Err(ParseError {
                 offset: pos,
                 message: format!("unknown escape '\\{}'", c as char),
@@ -804,6 +1214,154 @@ mod tests {
             ][..]
         );
         assert_eq!(r[5], GretElement::new(GretType::End, 0));
+    }
+
+    #[test]
+    fn explicit_token_terminals_match_peer_encoding() {
+        let g = parse_ok("root ::= <[1000]> !<[1001]> <[1001]>\n");
+        assert_eq!(
+            g.rules[0],
+            vec![
+                GretElement::new(GretType::Token, 1000),
+                GretElement::new(GretType::TokenNot, 1001),
+                GretElement::new(GretType::Token, 1001),
+                GretElement::new(GretType::End, 0),
+            ]
+        );
+        assert_eq!(GretType::Token as u8, 8);
+        assert_eq!(GretType::TokenNot as u8, 9);
+    }
+
+    #[test]
+    fn explicit_token_terminal_rejects_malformed_ids() {
+        for src in [
+            "root ::= <[]>\n",
+            "root ::= <[x]>\n",
+            "root ::= <[10>\n",
+            "root ::= <[10]\n",
+            "root ::= ! [10]\n",
+        ] {
+            assert!(parse(src).is_err(), "malformed token parsed: {src:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_token_set_extensions_have_a_compact_canonical_ast() {
+        let grammar = parse_ok("root ::= <[*]> !<[3,1,2,2]>\n");
+        assert_eq!(
+            grammar.rules[0],
+            vec![
+                GretElement::new(GretType::TokenAny, 0),
+                GretElement::new(GretType::TokenNotSet, 3),
+                GretElement::new(GretType::TokenSetMember, 1),
+                GretElement::new(GretType::TokenSetMember, 2),
+                GretElement::new(GretType::TokenSetMember, 3),
+                GretElement::new(GretType::End, 0),
+            ]
+        );
+        assert_eq!(GretType::Token as u8, 8);
+        assert_eq!(GretType::TokenNot as u8, 9);
+    }
+
+    #[test]
+    fn token_set_extensions_reject_malformed_or_unbounded_sets() {
+        for src in [
+            "root ::= <[1,2]>\n",
+            "root ::= !<[*]>\n",
+            "root ::= !<[]>\n",
+            "root ::= !<[1,]>\n",
+            "root ::= !<[,1]>\n",
+        ] {
+            assert!(parse(src).is_err(), "malformed token set parsed: {src:?}");
+        }
+
+        let ids = (0..=MAX_TOKEN_SET_MEMBERS)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let error = parse(&format!("root ::= !<[{ids}]>\n"))
+            .expect_err("oversized token exclusion set must fail closed");
+        assert!(error.message.contains("exceeds"));
+    }
+
+    #[test]
+    fn textual_token_terminals_use_model_bound_resolver() {
+        let mut seen = Vec::new();
+        let grammar = parse_with_token_resolver(
+            "root ::= <think> !</think>\n",
+            |lexeme| -> Result<u32, String> {
+                seen.push(lexeme.to_string());
+                match lexeme {
+                    "<think>" => Ok(10),
+                    "</think>" => Ok(11),
+                    _ => Err(format!("not one tokenizer token: {lexeme}")),
+                }
+            },
+        )
+        .expect("resolved textual tokens");
+
+        assert_eq!(seen, vec!["<think>", "</think>"]);
+        assert_eq!(
+            grammar.rules[0],
+            vec![
+                GretElement::new(GretType::Token, 10),
+                GretElement::new(GretType::TokenNot, 11),
+                GretElement::new(GretType::End, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn textual_token_terminal_fails_closed_without_or_from_resolver() {
+        let missing = parse("root ::= <think>\n").expect_err("resolver is required");
+        assert!(missing.message.contains("resolver"));
+
+        let rejected = parse_with_token_resolver("root ::= <two-tokens>\n", |_lexeme| {
+            Err::<u32, _>("must resolve to exactly one token".to_string())
+        })
+        .expect_err("resolver rejection must surface");
+        assert!(rejected.message.contains("exactly one token"));
+    }
+
+    #[test]
+    fn textual_tokenizer_binding_resolves_registered_special_tokens() {
+        use tokenizers::{models::bpe::BPE, AddedToken, Tokenizer};
+
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        tokenizer.add_special_tokens(&[
+            AddedToken::from("<think>".to_string(), true),
+            AddedToken::from("</think>".to_string(), true),
+        ]);
+        let think = tokenizer.token_to_id("<think>").expect("think id");
+        let end_think = tokenizer.token_to_id("</think>").expect("end id");
+
+        let grammar = parse_with_tokenizer("root ::= <think> (!</think>)* </think>\n", &tokenizer)
+            .expect("model-bound token parse");
+        assert_eq!(
+            grammar.rules[0][0],
+            GretElement::new(GretType::Token, think)
+        );
+        assert!(grammar
+            .rules
+            .iter()
+            .flatten()
+            .any(|element| { *element == GretElement::new(GretType::TokenNot, end_think) }));
+        assert!(grammar
+            .rules
+            .iter()
+            .flatten()
+            .any(|element| *element == GretElement::new(GretType::Token, end_think)));
+
+        let numeric = parse_with_tokenizer(
+            &format!("root ::= <[{think}]> !<[{end_think}]>\n"),
+            &tokenizer,
+        )
+        .expect("numeric ids present in the model vocabulary");
+        assert_eq!(numeric.rules[0][0].value, think);
+
+        let invalid = parse_with_tokenizer("root ::= <[4294967295]>\n", &tokenizer)
+            .expect_err("unknown numeric token id must fail before decode");
+        assert!(invalid.message.contains("not present"));
     }
 
     #[test]
@@ -968,40 +1526,59 @@ mod tests {
     }
 
     #[test]
-    fn json_grammar_fixture_parses() {
-        // The peer's canonical json grammar. Used verbatim to validate
-        // against the exact grammar OpenAI-compatible grammar-constrained
-        // JSON will rely on.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture present");
-        let g = parse_ok(&src);
-        // root + value + object + array + string + number + ws + synthesized.
-        assert!(g.rules.len() >= 7, "got {} rules", g.rules.len());
-        assert!(g.rule_id("root").is_some());
-        assert!(g.rule_id("value").is_some());
-        assert!(g.rule_id("object").is_some());
-        assert!(g.rule_id("array").is_some());
-        assert!(g.rule_id("string").is_some());
-        assert!(g.rule_id("number").is_some());
-        assert!(g.rule_id("ws").is_some());
+    fn all_vendored_peer_grammars_parse() {
+        for (name, src) in super::super::test_fixtures::PEER_GRAMMARS {
+            let g = parse_ok(src);
+            assert!(!g.rules.is_empty(), "{name} produced no rules");
+            assert!(g.rule_id("root").is_some(), "{name} has no root rule");
+        }
     }
 
     #[test]
-    fn arithmetic_grammar_fixture_parses() {
-        // Another canonical fixture from the peer.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/arithmetic.gbnf")
-            .expect("arithmetic.gbnf fixture present");
-        let g = parse_ok(&src);
-        assert!(!g.rules.is_empty());
-        assert!(g.rule_id("root").is_some());
+    fn escaped_dash_is_a_literal_character_in_a_class() {
+        let g = parse_ok(r#"root ::= [a\-z]"#);
+        let rule = &g.rules[0];
+        assert_eq!(rule[0], GretElement::new(GretType::Char, 'a' as u32));
+        assert_eq!(rule[1], GretElement::new(GretType::CharAlt, '-' as u32));
+        assert_eq!(rule[2], GretElement::new(GretType::CharAlt, 'z' as u32));
+        assert_eq!(rule[3], GretElement::new(GretType::End, 0));
     }
 
     #[test]
-    fn list_grammar_fixture_parses() {
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/list.gbnf")
-            .expect("list.gbnf fixture present");
-        let g = parse_ok(&src);
-        assert!(g.rule_id("root").is_some());
+    fn rejects_direct_left_recursion() {
+        let err = parse("root ::= \"a\" | root \"a\"\n").unwrap_err();
+        assert!(err.message.contains("left recursion"));
+    }
+
+    #[test]
+    fn rejects_indirect_left_recursion() {
+        let err = parse(
+            "root ::= asdf\n\
+             asdf ::= \"a\" | foo \"b\"\n\
+             foo ::= \"c\" | asdf \"d\"\n",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("left recursion"));
+    }
+
+    #[test]
+    fn rejects_left_recursion_after_nullable_prefix() {
+        let err = parse(
+            "root ::= maybe loop | \"x\"\n\
+             maybe ::= | \"m\"\n\
+             loop ::= root \"y\"\n",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("left recursion"));
+    }
+
+    #[test]
+    fn accepts_right_recursion_and_terminal_guarded_cycles() {
+        parse_ok(
+            "root ::= \"a\" root | guarded\n\
+             guarded ::= \"g\" tail\n\
+             tail ::= \"t\" guarded |\n",
+        );
     }
 
     #[test]
@@ -1040,5 +1617,34 @@ mod tests {
         let g = parse_ok("root ::= \n");
         assert_eq!(g.rules.len(), 1);
         assert_eq!(g.rules[0], vec![GretElement::new(GretType::End, 0)]);
+    }
+
+    #[test]
+    fn raw_grammar_resource_limit_is_exact_and_deterministic() {
+        let mut source = String::from("root ::= \"a\"\n");
+        source.push_str(&" ".repeat(MAX_RAW_GRAMMAR_BYTES - source.len()));
+        assert_eq!(source.len(), MAX_RAW_GRAMMAR_BYTES);
+        parse(&source).expect("grammar at the raw byte limit");
+
+        source.push(' ');
+        let error = parse(&source).expect_err("grammar above the raw byte limit");
+        assert!(error.message.contains("1048576-byte resource limit"));
+    }
+
+    #[test]
+    fn rule_and_expanded_element_limits_fail_closed() {
+        let mut too_many_rules = String::from("root ::= \"x\"\n");
+        for index in 1..=MAX_GRAMMAR_RULES {
+            too_many_rules.push_str(&format!("r{index} ::= \"x\"\n"));
+        }
+        let error = parse_generated(&too_many_rules).expect_err("rule limit + 1");
+        assert!(error.message.contains("262144-rule resource limit"));
+
+        let mut too_many_elements = String::from("root ::= \"");
+        // The closing End element makes this exactly one over the limit.
+        too_many_elements.push_str(&"a".repeat(MAX_GRAMMAR_ELEMENTS));
+        too_many_elements.push_str("\"\n");
+        let error = parse_generated(&too_many_elements).expect_err("expanded element limit + 1");
+        assert!(error.message.contains("4194304-element resource limit"));
     }
 }

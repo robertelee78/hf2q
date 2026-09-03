@@ -2,6 +2,12 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
+**Updated:** 2026-09-03 — the historical inference-server phases below remain
+closed. Structured-output compatibility is reopened and governed by
+[ADR-052](../ADR-052-structured-output-compatibility.md), currently Accepted
+with implementation and proof in progress. ADR-052 supersedes Decision #6's
+closed grammar subset without rewriting this diary's historical closure.
+
 **Status:** Phase 1b Walk **CLOSED with full coverage 2026-04-26 (iter-112b W39)** — `scripts/release-check.sh` PASS on **all eight gates A–H** end-to-end at HEAD `8e5776e` (Gate B median-of-3 = 101.1 tok/s, parity suite 6/6, prefill = 3279.5 tok/s, dispatches/decode_tok = 988.2, syncs = 1, **Gate H cosine_mean=0.999672, p1=0.996080, argmax=0.0080, PPL Δ=0.0014**). Original seven-dense-gate closure landed iter-110 W20 2026-04-25 at HEAD `24b4029`; the TQ-active companion Gate H (ADR-007 §853-866) closed iter-112b W39 after fixing W21's two layered LazyLock-freeze + static-atomic bugs. Original closeout-in-progress declared 2026-04-16 via backend migration (ADR-008 candle divorce) + sharpened closure contract (party-mode disposition, same date). Walk-correctness end gate met 2026-04-11; Walk-speed end gate met within measurement variance (101.7 tok/s median sourdough decode on HEAD `388ad3d` vs 102.01 peer). The 2026-04-16 amendment reclassified the four "open after closeout" items and the historical `[ ]` checklist into a concrete gate set (A–G) enforced mechanically by `scripts/release-check.sh`; Phase 1b is formally closed when release-check.sh PASSes on all seven gates. Residual parity and determinism work that was "tracked downstream" is now surfaced as Phase 1b gates A–G prerequisites. **Phase 2 scope refined 2026-04-23 (party-mode session `adr_005_phase_2`)**: vision absorbed into Phase 2 as sub-phase **2c**; downstream phases renumbered (old Phase 3 → 2c, old Phase 4 → Phase 3, old Phase 5 → Phase 4); 27 design decisions recorded; continuous-batching carved out to a future ADR (see "Concurrent-deployment scaling (deferred)" section).
 
 **ADR-005 OVERALL STATUS — CLOSED 2026-04-30 (iter-219 baseline regression guards added 2026-05-01).** Every phase reached terminal state for today's tree:

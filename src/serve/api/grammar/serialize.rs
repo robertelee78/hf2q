@@ -28,6 +28,8 @@
 //!   - Comments are not preserved (the AST does not carry them).
 //!   - Whitespace is normalized.
 //!   - Rule emission order follows ascending rule-id.
+//!   - hf2q token-set extensions normalize to `<[*]>` and sorted,
+//!     deduplicated `!<[id,...]>` syntax.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -141,6 +143,42 @@ fn write_rule(
                     .unwrap_or("<unknown>");
                 let _ = write!(out, "{} ", ref_name);
                 alt_is_empty = false;
+            }
+            GretType::Token => {
+                let _ = write!(out, "<[{}]> ", elem.value);
+                alt_is_empty = false;
+            }
+            GretType::TokenNot => {
+                let _ = write!(out, "!<[{}]> ", elem.value);
+                alt_is_empty = false;
+            }
+            GretType::TokenAny => {
+                let _ = write!(out, "<[*]> ");
+                alt_is_empty = false;
+            }
+            GretType::TokenNotSet => {
+                let member_count = elem.value as usize;
+                if member_count < 2 || i + member_count >= n {
+                    return;
+                }
+                let _ = write!(out, "!<[");
+                for member_index in 0..member_count {
+                    i += 1;
+                    if rule[i].ty != GretType::TokenSetMember {
+                        return;
+                    }
+                    if member_index > 0 {
+                        let _ = write!(out, ",");
+                    }
+                    let _ = write!(out, "{}", rule[i].value);
+                }
+                let _ = write!(out, "]> ");
+                alt_is_empty = false;
+            }
+            GretType::TokenSetMember => {
+                // A continuation without a preceding TokenNotSet is a corrupt
+                // hand-built AST. Fail closed by refusing to serialize it.
+                return;
             }
             GretType::Char => {
                 let _ = write!(out, "[");
@@ -433,6 +471,32 @@ mod tests {
         roundtrip("root ::= \"hi\"\n");
     }
 
+    #[test]
+    fn token_terminals_serialize_to_canonical_numeric_ids() {
+        let grammar = parse("root ::= <[10]> !<[11]>\n").expect("parse token grammar");
+        let text = serialize(&grammar);
+        assert_eq!(text, "root ::= <[10]> !<[11]> \n");
+        assert_eq!(parse(&text).expect("reparse"), grammar);
+    }
+
+    #[test]
+    fn token_set_extensions_serialize_canonically_and_round_trip() {
+        let grammar = parse("root ::= <[*]> !<[9,2,5,2]>\n").expect("parse token-set grammar");
+        let text = serialize(&grammar);
+        assert_eq!(text, "root ::= <[*]> !<[2,5,9]> \n");
+        assert_eq!(parse(&text).expect("reparse"), grammar);
+
+        let renamed = rename_rules(&grammar, |name| format!("structural-{name}"));
+        assert_eq!(
+            renamed.rules, grammar.rules,
+            "rename must preserve token sets"
+        );
+        assert_eq!(
+            parse(&serialize(&renamed)).expect("reparse renamed token set"),
+            renamed
+        );
+    }
+
     /// Spec test #2: the wave-2.5 audit's failing case literally.
     /// Negated char class with backslash → must NOT be corrupted to
     /// `[<\\]` (positive class) by the round-trip.
@@ -542,28 +606,14 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_json_grammar_fixture() {
-        // The peer's canonical json grammar.  Stress-tests every
-        // GBNF feature we serialize: nested groups, recursion,
-        // quoted-literal escapes, negated char class with
-        // backslash, ranges, comments (not preserved).
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture present");
-        roundtrip(&src);
-    }
-
-    #[test]
-    fn round_trip_arithmetic_grammar_fixture() {
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/arithmetic.gbnf")
-            .expect("arithmetic.gbnf fixture present");
-        roundtrip(&src);
-    }
-
-    #[test]
-    fn round_trip_list_grammar_fixture() {
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/list.gbnf")
-            .expect("list.gbnf fixture present");
-        roundtrip(&src);
+    fn round_trip_all_vendored_peer_grammars() {
+        for (name, src) in super::super::test_fixtures::PEER_GRAMMARS {
+            let reparsed = roundtrip(src);
+            assert!(
+                reparsed.rule_id("root").is_some(),
+                "{name} lost its root rule"
+            );
+        }
     }
 
     #[test]

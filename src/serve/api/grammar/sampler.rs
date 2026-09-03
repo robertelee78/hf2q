@@ -1,10 +1,10 @@
 //! GBNF runtime sampler for hf2q constrained decoding.
 //!
 //! The runtime maintains a set of pushdown stacks over `(rule_id, elem_idx)`
-//! positions in the parsed grammar. After each decoded character the stacks
-//! are advanced; a token candidate is **accepted** iff at least one stack
-//! remains valid after feeding all its characters, and **rejected** if every
-//! stack dead-ends.
+//! positions in the parsed grammar. Character terminals consume decoded
+//! Unicode while token terminals consume one tokenizer token by id. A
+//! candidate is accepted iff at least one stack remains valid after applying
+//! the appropriate terminal domain.
 //!
 //! Implementation notes:
 //!   - `Pos(rule_id, elem_idx)` identifies a position in the flat rules —
@@ -19,7 +19,42 @@
 //! is why the full JSON-acceptance test suite below has no fixture cost.
 
 use super::parser::{Grammar, GretElement, GretType};
+use regex::bytes::Regex;
 use std::sync::Arc;
+
+/// Maximum unconstrained output retained while a public lazy grammar waits
+/// for a regex trigger. The peer currently leaves this buffer unbounded;
+/// hf2q fails closed at the repository's structured-output resource limit.
+pub const MAX_LAZY_TRIGGER_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Model-bound lazy-grammar controls after request strings and token ids have
+/// been resolved against the authoritative tokenizer.
+///
+/// `preserved_tokens` is retained as part of the request/runtime contract and
+/// cache identity. hf2q's token-byte table already decodes every sampled token
+/// without dropping special tokens, so it does not require a second decoder
+/// allow-list at runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LazyGrammarConfig {
+    pub token_triggers: Vec<u32>,
+    pub trigger_patterns: Vec<String>,
+    pub preserved_tokens: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct LazyBufferedToken {
+    token_id: u32,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PublicLazyRuntime {
+    token_triggers: Vec<u32>,
+    trigger_patterns: Vec<Regex>,
+    buffer: Vec<u8>,
+    positions: Vec<LazyBufferedToken>,
+}
 
 // ---------------------------------------------------------------------------
 // Position + Stack types
@@ -59,6 +94,7 @@ pub type Stacks = Vec<Stack>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GrammarCandidate {
     pub index: usize,
+    pub token_id: u32,
     pub cursor: usize,
     pub end: usize,
     pub partial_utf8: PartialUtf8,
@@ -157,6 +193,54 @@ pub(super) fn decode_candidate_utf8(
 
 fn is_end_of_sequence(e: &GretElement) -> bool {
     matches!(e.ty, GretType::End | GretType::Alt)
+}
+
+fn is_token_terminal(ty: GretType) -> bool {
+    matches!(
+        ty,
+        GretType::Token | GretType::TokenNot | GretType::TokenAny | GretType::TokenNotSet
+    )
+}
+
+/// Return whether `token_id` matches the token terminal at `pos`, plus the
+/// first element after that terminal. `TokenNotSet` owns the immediately
+/// following sorted `TokenSetMember` run. Membership is logarithmic in the
+/// bounded exclusion count and never enumerates the vocabulary.
+fn match_token(grammar: &Grammar, pos: Pos, token_id: u32) -> (bool, Pos) {
+    let Some(element) = at(grammar, pos).copied() else {
+        return (false, pos);
+    };
+    let mut after = pos.advance();
+    match element.ty {
+        GretType::Token => (element.value == token_id, after),
+        GretType::TokenNot => (element.value != token_id, after),
+        GretType::TokenAny => (true, after),
+        GretType::TokenNotSet => {
+            let Some(rule) = grammar.rules.get(pos.rule_id as usize) else {
+                return (false, pos);
+            };
+            let start = pos.elem_idx as usize + 1;
+            let Some(end) = start.checked_add(element.value as usize) else {
+                return (false, pos);
+            };
+            let Some(members) = rule.get(start..end) else {
+                return (false, pos);
+            };
+            if members.len() < 2
+                || members
+                    .iter()
+                    .any(|member| member.ty != GretType::TokenSetMember)
+            {
+                return (false, pos);
+            }
+            let excluded = members
+                .binary_search_by_key(&token_id, |member| member.value)
+                .is_ok();
+            after.elem_idx = end as u32;
+            (!excluded, after)
+        }
+        _ => (false, pos),
+    }
 }
 
 /// Look up `pos` in the grammar's flat rule buffer. Returns `None` if the
@@ -262,13 +346,18 @@ pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8)
 }
 
 // ---------------------------------------------------------------------------
-// advance_stack — expand a stack until every entry is a char-class element
+// advance_stack — expand a stack until every entry is a terminal element
 // ---------------------------------------------------------------------------
 
-/// Transforms one stack into the set of stacks that all end at a terminal
-/// (char-class) element. Handles `RuleRef` expansion (with alternatives) and
+/// Transforms one stack into the set of stacks that all end at a character or
+/// token terminal. Handles `RuleRef` expansion (with alternatives) and
 /// skips `End`/`Alt` elements at the stack top.
-pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
+// Stage 9's supported twelve-key any-order object reaches exactly 32,768
+// active stacks at its widest byte boundary. This measured baseline is the
+// smallest power-of-two cap that preserves the required schema.
+const MAX_ACTIVE_STACKS: usize = 32_768;
+
+pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) -> bool {
     let mut todo: Vec<Stack> = Vec::new();
     todo.push(stack);
     // `seen` dedups across our BFS frontier.
@@ -283,6 +372,9 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
         if curr_stack.is_empty() {
             if !new_stacks.contains(&curr_stack) {
                 new_stacks.push(curr_stack);
+                if new_stacks.len() > MAX_ACTIVE_STACKS {
+                    return false;
+                }
             }
             continue;
         }
@@ -342,9 +434,18 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
                     }
                 }
             }
-            GretType::Char | GretType::CharNot | GretType::CharAny => {
+            GretType::Char
+            | GretType::CharNot
+            | GretType::CharAny
+            | GretType::Token
+            | GretType::TokenNot
+            | GretType::TokenAny
+            | GretType::TokenNotSet => {
                 if !new_stacks.contains(&curr_stack) {
                     new_stacks.push(curr_stack);
+                    if new_stacks.len() > MAX_ACTIVE_STACKS {
+                        return false;
+                    }
                 }
             }
             _ => {
@@ -357,6 +458,7 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
             }
         }
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -364,18 +466,26 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
 // ---------------------------------------------------------------------------
 
 /// Feeds one character to one stack, producing zero or more successor stacks.
-fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut Stacks) {
+fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut Stacks) -> bool {
     if stack.is_empty() {
-        return;
+        return true;
     }
     let top = *stack.last().unwrap();
     let elem = match at(grammar, top) {
         Some(e) => *e,
-        None => return,
+        None => return true,
     };
-    // Tokens aren't handled here (see mod-level docs).
-    if matches!(elem.ty, GretType::End | GretType::Alt) {
-        return;
+    if matches!(
+        elem.ty,
+        GretType::End
+            | GretType::Alt
+            | GretType::Token
+            | GretType::TokenNot
+            | GretType::TokenAny
+            | GretType::TokenNotSet
+            | GretType::TokenSetMember
+    ) {
+        return true;
     }
 
     let (matched, after) = match_char(grammar, top, chr);
@@ -387,15 +497,18 @@ fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut 
                 new_stack.push(after);
             }
         }
-        advance_stack(grammar, new_stack, new_stacks);
+        return advance_stack(grammar, new_stack, new_stacks);
     }
+    true
 }
 
 /// Accept one character against the current stack set, returning the new set.
 pub fn accept_char(grammar: &Grammar, stacks: &Stacks, chr: u32) -> Stacks {
     let mut new_stacks: Stacks = Vec::with_capacity(stacks.len());
     for stack in stacks {
-        accept_chr_into(grammar, stack, chr, &mut new_stacks);
+        if !accept_chr_into(grammar, stack, chr, &mut new_stacks) {
+            return Vec::new();
+        }
     }
     new_stacks
 }
@@ -452,7 +565,9 @@ fn reject_candidates_for_stack(
         return candidates
             .iter()
             .copied()
-            .filter(|candidate| candidate.cursor < candidate.end)
+            .filter(|candidate| {
+                candidate.cursor < candidate.end || candidate.partial_utf8.n_remain != 0
+            })
             .collect();
     }
 
@@ -460,6 +575,16 @@ fn reject_candidates_for_stack(
     let Some(elem) = at(grammar, top) else {
         return candidates.to_vec();
     };
+    if is_token_terminal(elem.ty) {
+        return candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                candidate.partial_utf8.n_remain != 0
+                    || !match_token(grammar, top, candidate.token_id).0
+            })
+            .collect();
+    }
     if !matches!(
         elem.ty,
         GretType::Char | GretType::CharNot | GretType::CharAny
@@ -514,7 +639,10 @@ fn reject_candidates_for_stack(
         }
     }
     let mut next_stacks = Vec::new();
-    advance_stack(grammar, stack_after, &mut next_stacks);
+    if !advance_stack(grammar, stack_after, &mut next_stacks) {
+        rejects.extend(next_candidates);
+        return rejects;
+    }
 
     let mut deeper_rejects =
         reject_candidates(grammar, &next_stacks, &next_candidates, code_points);
@@ -590,6 +718,11 @@ pub struct GrammarRuntime {
     /// At most `lazy_trigger.len() - 1` trailing bytes retained so a marker
     /// split across adjacent tokens can still be recognized.
     lazy_trigger_tail: Vec<u8>,
+    /// Public peer-compatible trigger machinery. This is deliberately
+    /// separate from `lazy_trigger`: the internal tool marker strips its
+    /// marker before applying a body grammar, whereas the peer replays the
+    /// matched marker (or first non-empty capture) through the public grammar.
+    public_lazy: Option<PublicLazyRuntime>,
 }
 
 impl GrammarRuntime {
@@ -611,10 +744,15 @@ impl GrammarRuntime {
                 }
             }
             let mut advanced: Stacks = Vec::new();
-            advance_stack(&grammar, stack, &mut advanced);
+            if !advance_stack(&grammar, stack, &mut advanced) {
+                return None;
+            }
             for s in advanced {
                 if !stacks.contains(&s) {
                     stacks.push(s);
+                    if stacks.len() > MAX_ACTIVE_STACKS {
+                        return None;
+                    }
                 }
             }
             // Scan to end-of-sequence.
@@ -642,6 +780,7 @@ impl GrammarRuntime {
             awaiting_trigger: false,
             lazy_trigger: None,
             lazy_trigger_tail: Vec::new(),
+            public_lazy: None,
         })
     }
 
@@ -680,6 +819,31 @@ impl GrammarRuntime {
         self.awaiting_trigger = true;
         self.lazy_trigger = (!marker.is_empty()).then(|| marker.to_vec());
         self.lazy_trigger_tail.clear();
+        self.public_lazy = None;
+    }
+
+    /// Suspend this runtime until one of the peer's public token or regex
+    /// triggers fires. Regexes are compiled once at runtime construction; an
+    /// unsupported expression is an error rather than an ignored trigger.
+    pub fn configure_public_lazy(
+        &mut self,
+        config: &LazyGrammarConfig,
+    ) -> Result<(), regex::Error> {
+        let trigger_patterns = config
+            .trigger_patterns
+            .iter()
+            .map(|pattern| Regex::new(pattern))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.awaiting_trigger = true;
+        self.lazy_trigger = None;
+        self.lazy_trigger_tail.clear();
+        self.public_lazy = Some(PublicLazyRuntime {
+            token_triggers: config.token_triggers.clone(),
+            trigger_patterns,
+            buffer: Vec::new(),
+            positions: Vec::new(),
+        });
+        Ok(())
     }
 
     /// Flip the trigger gate to `false`.  Called by the engine when the
@@ -713,6 +877,137 @@ impl GrammarRuntime {
     pub fn trigger(&mut self) {
         self.awaiting_trigger = false;
         self.lazy_trigger_tail.clear();
+        if let Some(lazy) = self.public_lazy.as_mut() {
+            lazy.buffer.clear();
+            lazy.positions.clear();
+        }
+    }
+
+    fn reject_lazy_buffer_overflow(&mut self) -> bool {
+        self.awaiting_trigger = false;
+        self.stacks.clear();
+        self.partial_utf8 = PartialUtf8::default();
+        if let Some(lazy) = self.public_lazy.as_mut() {
+            lazy.buffer.clear();
+            lazy.positions.clear();
+        }
+        false
+    }
+
+    /// Return `Some(result)` while the public lazy gate owns this token, or
+    /// `None` when normal/legacy processing should continue.
+    fn accept_public_lazy_token(&mut self, token_id: u32, bytes: &[u8]) -> Option<bool> {
+        if !self.awaiting_trigger || self.public_lazy.is_none() {
+            return None;
+        }
+
+        if self
+            .public_lazy
+            .as_ref()
+            .is_some_and(|lazy| lazy.token_triggers.contains(&token_id))
+        {
+            self.trigger();
+            return Some(self.accept_token(token_id, bytes));
+        }
+
+        let new_len = self
+            .public_lazy
+            .as_ref()
+            .expect("checked above")
+            .buffer
+            .len()
+            .checked_add(bytes.len());
+        if new_len.is_none_or(|len| len > MAX_LAZY_TRIGGER_BUFFER_BYTES) {
+            return Some(self.reject_lazy_buffer_overflow());
+        }
+
+        let replay = {
+            let lazy = self.public_lazy.as_mut().expect("checked above");
+            let start = lazy.buffer.len();
+            lazy.buffer.extend_from_slice(bytes);
+            lazy.positions.push(LazyBufferedToken {
+                token_id,
+                start,
+                end: lazy.buffer.len(),
+            });
+
+            let trigger_start = lazy.trigger_patterns.iter().find_map(|pattern| {
+                let captures = pattern.captures(&lazy.buffer)?;
+                (1..captures.len())
+                    .find_map(|index| {
+                        captures
+                            .get(index)
+                            .filter(|capture| !capture.is_empty())
+                            .map(|capture| capture.start())
+                    })
+                    .or_else(|| captures.get(0).map(|capture| capture.start()))
+            });
+            trigger_start.map(|trigger_start| {
+                lazy.positions
+                    .iter()
+                    .filter(|position| position.end > trigger_start)
+                    .map(|position| {
+                        let piece_start = position.start.max(trigger_start);
+                        (
+                            position.token_id,
+                            lazy.buffer[piece_start..position.end].to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        let Some(replay) = replay else {
+            return Some(true);
+        };
+        self.trigger();
+        for (replay_token, replay_bytes) in replay {
+            if !self.accept_token(replay_token, &replay_bytes) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Byte-only counterpart used by direct runtime callers. Production
+    /// sampling always uses `accept_token`, retaining token identity for token
+    /// terminals. A regex match replays the constrained byte suffix exactly
+    /// once, which is sufficient for character-terminal grammars.
+    fn accept_public_lazy_bytes(&mut self, bytes: &[u8]) -> Option<bool> {
+        if !self.awaiting_trigger || self.public_lazy.is_none() {
+            return None;
+        }
+        let new_len = self
+            .public_lazy
+            .as_ref()
+            .expect("checked above")
+            .buffer
+            .len()
+            .checked_add(bytes.len());
+        if new_len.is_none_or(|len| len > MAX_LAZY_TRIGGER_BUFFER_BYTES) {
+            return Some(self.reject_lazy_buffer_overflow());
+        }
+        let suffix = {
+            let lazy = self.public_lazy.as_mut().expect("checked above");
+            lazy.buffer.extend_from_slice(bytes);
+            lazy.trigger_patterns.iter().find_map(|pattern| {
+                let captures = pattern.captures(&lazy.buffer)?;
+                let start = (1..captures.len())
+                    .find_map(|index| {
+                        captures
+                            .get(index)
+                            .filter(|capture| !capture.is_empty())
+                            .map(|capture| capture.start())
+                    })
+                    .or_else(|| captures.get(0).map(|capture| capture.start()))?;
+                Some(lazy.buffer[start..].to_vec())
+            })
+        };
+        let Some(suffix) = suffix else {
+            return Some(true);
+        };
+        self.trigger();
+        Some(self.accept_bytes(&suffix))
     }
 
     /// Feed one Unicode code point. Returns `true` if any stacks remain
@@ -720,6 +1015,104 @@ impl GrammarRuntime {
     pub fn accept_char(&mut self, chr: u32) -> bool {
         self.stacks = accept_char(&self.grammar, &self.stacks, chr);
         !self.stacks.is_empty()
+    }
+
+    /// Feed one sampled tokenizer token. Token terminals compare `token_id`
+    /// and consume the whole token atomically; character terminals consume
+    /// the decoded `bytes`. This preserves both domains when alternatives
+    /// mix token and character rules.
+    pub fn accept_token(&mut self, token_id: u32, bytes: &[u8]) -> bool {
+        if let Some(result) = self.accept_public_lazy_token(token_id, bytes) {
+            return result;
+        }
+        if self.awaiting_trigger {
+            let Some(marker) = self.lazy_trigger.as_deref() else {
+                return true;
+            };
+
+            let mut scan = std::mem::take(&mut self.lazy_trigger_tail);
+            scan.extend_from_slice(bytes);
+            if let Some(marker_start) = scan.windows(marker.len()).position(|w| w == marker) {
+                let body_start = marker_start + marker.len();
+                let body_suffix = scan[body_start..].to_vec();
+                self.trigger();
+                return self.accept_token(token_id, &body_suffix);
+            }
+
+            let keep = marker.len().saturating_sub(1).min(scan.len());
+            self.lazy_trigger_tail
+                .extend_from_slice(&scan[scan.len().saturating_sub(keep)..]);
+            return true;
+        }
+
+        let mut code_points = Vec::new();
+        let Some(partial_utf8) = decode_candidate_utf8(bytes, self.partial_utf8, &mut code_points)
+        else {
+            self.partial_utf8 = PartialUtf8 {
+                value: 0,
+                n_remain: -1,
+            };
+            self.stacks.clear();
+            return false;
+        };
+
+        let mut stacks_new = Vec::with_capacity(self.stacks.len());
+        for stack in &self.stacks {
+            let Some(top) = stack.last().copied() else {
+                continue;
+            };
+            let Some(element) = at(&self.grammar, top).copied() else {
+                continue;
+            };
+            if is_token_terminal(element.ty) {
+                let (matched, after) = match_token(&self.grammar, top, token_id);
+                if matched {
+                    let mut stack_after = stack[..stack.len() - 1].to_vec();
+                    if at(&self.grammar, after).is_some_and(|next| !is_end_of_sequence(next)) {
+                        stack_after.push(after);
+                    }
+                    if !advance_stack(&self.grammar, stack_after, &mut stacks_new) {
+                        self.stacks.clear();
+                        return false;
+                    }
+                }
+                continue;
+            }
+
+            let mut current_stacks = vec![stack.clone()];
+            for &chr in &code_points {
+                current_stacks = accept_char(&self.grammar, &current_stacks, chr);
+                if current_stacks.is_empty() {
+                    break;
+                }
+            }
+            for surviving in current_stacks {
+                if !stacks_new.contains(&surviving) {
+                    stacks_new.push(surviving);
+                    if stacks_new.len() > MAX_ACTIVE_STACKS {
+                        self.stacks.clear();
+                        return false;
+                    }
+                }
+            }
+        }
+        self.stacks = stacks_new;
+        self.partial_utf8 = partial_utf8;
+        !self.stacks.is_empty()
+    }
+
+    /// Accept an end-of-generation token only after the grammar is already
+    /// complete. EOG never consumes a grammar token terminal. An unexpected
+    /// EOG kills the runtime so callers that violate masking fail closed.
+    pub fn accept_eog(&mut self) -> bool {
+        if self.awaiting_trigger {
+            return true;
+        }
+        if self.is_terminally_accepted() {
+            return true;
+        }
+        self.stacks.clear();
+        false
     }
 
     /// Feed a byte string (e.g. a decoded token text). Partial UTF-8 bytes
@@ -732,6 +1125,9 @@ impl GrammarRuntime {
     /// engine calls [`trigger`] (typically in the `ToolCallOpen`
     /// handler).
     pub fn accept_bytes(&mut self, bytes: &[u8]) -> bool {
+        if let Some(result) = self.accept_public_lazy_bytes(bytes) {
+            return result;
+        }
         if self.awaiting_trigger {
             let Some(marker) = self.lazy_trigger.as_deref() else {
                 // Legacy explicit-trigger mode: no advance while suspended.
@@ -841,6 +1237,13 @@ impl GrammarRuntime {
         self.stacks.iter().any(|s| s.is_empty())
     }
 
+    /// Return whether generation may terminate successfully at this exact
+    /// byte boundary. Structural acceptance alone is insufficient while a
+    /// decoded token has left an incomplete UTF-8 sequence pending.
+    pub fn is_terminally_accepted(&self) -> bool {
+        self.is_accepted() && self.partial_utf8.n_remain == 0
+    }
+
     /// Is the grammar dead? (no stacks remain; no continuation can satisfy it).
     ///
     /// Wave 2.6 W-α5 Q2: a suspended runtime
@@ -912,6 +1315,128 @@ mod tests {
 
         let mut rt2 = runtime_from("root ::= [^abc]\n", "root");
         assert!(!rt2.accept_char('a' as u32));
+    }
+
+    #[test]
+    fn token_terminal_consumes_id_and_ignores_piece_text() {
+        let mut runtime = runtime_from("root ::= <[10]> <[11]>\n", "root");
+        assert!(runtime.accept_token(10, b"unrelated decoded text"));
+        assert!(!runtime.is_accepted());
+        assert!(runtime.accept_token(11, b"more unrelated text"));
+        assert!(runtime.is_accepted());
+    }
+
+    #[test]
+    fn token_not_terminal_rejects_only_the_named_id() {
+        let mut allowed = runtime_from("root ::= !<[11]>\n", "root");
+        assert!(allowed.accept_token(12, b"same-piece"));
+        assert!(allowed.is_accepted());
+
+        let mut denied = runtime_from("root ::= !<[11]>\n", "root");
+        assert!(!denied.accept_token(11, b"same-piece"));
+        assert!(denied.is_dead());
+    }
+
+    #[test]
+    fn peer_simple_token_grammar_sequence_matches() {
+        let grammar = "root ::= <[10]> content <[11]>\ncontent ::= (!<[11]>)*\n";
+        let mut runtime = runtime_from(grammar, "root");
+
+        assert!(runtime.accept_token(10, b"<[10]>"));
+        assert!(runtime.accept_token(12, b"hello world"));
+        assert!(runtime.accept_token(13, b" mixed in"));
+        assert!(runtime.accept_token(11, b"<[11]>"));
+        assert!(runtime.is_accepted());
+
+        let mut missing_end = runtime_from(grammar, "root");
+        assert!(missing_end.accept_token(10, b"<[10]>"));
+        assert!(missing_end.accept_token(12, b"missing end token"));
+        assert!(!missing_end.is_accepted());
+    }
+
+    #[test]
+    fn mixed_token_and_character_alternatives_use_the_correct_domain() {
+        let grammar = "root ::= <[7]> | \"x\"\n";
+
+        let mut token_branch = runtime_from(grammar, "root");
+        assert!(token_branch.accept_token(7, b"not-x"));
+        assert!(token_branch.is_accepted());
+
+        let mut character_branch = runtime_from(grammar, "root");
+        assert!(character_branch.accept_token(99, b"x"));
+        assert!(character_branch.is_accepted());
+
+        let mut bytes_only = runtime_from(grammar, "root");
+        assert!(!bytes_only.accept_bytes(b"not-x"));
+    }
+
+    #[test]
+    fn token_any_and_exclusion_sets_support_quantifiers_without_vocab_expansion() {
+        let grammar = "root ::= <[*]>{2} !<[1,2,3]>+\n";
+        let mut runtime = runtime_from(grammar, "root");
+        assert!(runtime.accept_token(1, b"first"));
+        assert!(runtime.accept_token(2, b"second"));
+        assert!(runtime.accept_token(4, b"fourth"));
+        assert!(runtime.accept_token(5, b"fifth"));
+        assert!(runtime.is_terminally_accepted());
+
+        for excluded in [1, 2, 3] {
+            let mut rejected = runtime_from(grammar, "root");
+            assert!(rejected.accept_token(8, b"first"));
+            assert!(rejected.accept_token(9, b"second"));
+            assert!(!rejected.accept_token(excluded, b"excluded"));
+            assert!(rejected.is_dead());
+        }
+    }
+
+    #[test]
+    fn token_exclusion_set_and_character_alternative_use_separate_domains() {
+        let grammar = "root ::= !<[1,2]> | \"x\"\n";
+
+        let mut token_branch = runtime_from(grammar, "root");
+        assert!(token_branch.accept_token(3, b"not-x"));
+        assert!(token_branch.is_terminally_accepted());
+
+        let mut character_branch = runtime_from(grammar, "root");
+        assert!(character_branch.accept_token(1, b"x"));
+        assert!(character_branch.is_terminally_accepted());
+
+        let mut rejected = runtime_from(grammar, "root");
+        assert!(!rejected.accept_token(2, b"not-x"));
+    }
+
+    #[test]
+    fn terminal_acceptance_requires_a_complete_utf8_tail() {
+        let mut runtime = runtime_from("root ::= \"\" | .\n", "root");
+        assert!(runtime.is_terminally_accepted());
+
+        assert!(runtime.accept_bytes(&[0xCE]));
+        assert!(
+            runtime.is_accepted(),
+            "empty alternate remains structurally accepted"
+        );
+        assert!(
+            !runtime.is_terminally_accepted(),
+            "partial UTF-8 is not terminal"
+        );
+        let mut premature_eog = runtime.clone();
+        assert!(!premature_eog.accept_eog());
+        assert!(premature_eog.is_dead());
+
+        assert!(runtime.accept_bytes(&[0xB1]));
+        assert!(runtime.is_terminally_accepted());
+    }
+
+    #[test]
+    fn eog_cannot_force_a_token_terminal() {
+        let mut runtime = runtime_from("root ::= <[2]>\n", "root");
+        assert!(!runtime.accept_eog());
+        assert!(runtime.is_dead());
+
+        let mut accepted = runtime_from("root ::= \"x\"\n", "root");
+        assert!(accepted.accept_token(5, b"x"));
+        assert!(accepted.accept_eog());
+        assert!(accepted.is_accepted());
     }
 
     #[test]
@@ -1041,8 +1566,7 @@ mod tests {
         // a top-level object), but `value ::= object | array | string |
         // number | ("true" | "false" | "null") ws` accepts everything.
         // Verify each alternative against the `value` rule.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture");
+        let src = super::super::test_fixtures::peer_grammar("json.gbnf");
         for input in [
             "null",
             "true",
@@ -1056,7 +1580,7 @@ mod tests {
             "{\"k\":\"v\"}",
             "{\"a\":1,\"b\":[true,false]}",
         ] {
-            let g = parse(&src).expect("parse");
+            let g = parse(src).expect("parse");
             let rid = g.rule_id("value").unwrap();
             let mut rt = GrammarRuntime::new(g, rid).unwrap();
             assert!(
@@ -1075,17 +1599,16 @@ mod tests {
     #[test]
     fn json_grammar_root_rule_requires_object() {
         // `root ::= object` — bare scalars rejected, objects accepted.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture");
+        let src = super::super::test_fixtures::peer_grammar("json.gbnf");
         for good_object in ["{}", "{\"k\":\"v\"}", "{\"a\":1,\"b\":[true,false]}"] {
-            let g = parse(&src).expect("parse");
+            let g = parse(src).expect("parse");
             let rid = g.rule_id("root").unwrap();
             let mut rt = GrammarRuntime::new(g, rid).unwrap();
             assert!(rt.accept_bytes(good_object.as_bytes()));
             assert!(rt.is_accepted(), "root must accept {:?}", good_object);
         }
         for bad_scalar in ["null", "42", "\"hello\""] {
-            let g = parse(&src).expect("parse");
+            let g = parse(src).expect("parse");
             let rid = g.rule_id("root").unwrap();
             let mut rt = GrammarRuntime::new(g, rid).unwrap();
             let ok = rt.accept_bytes(bad_scalar.as_bytes());
@@ -1099,8 +1622,7 @@ mod tests {
 
     #[test]
     fn json_grammar_rejects_malformed() {
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture");
+        let src = super::super::test_fixtures::peer_grammar("json.gbnf");
         for input in [
             "nul",      // truncated
             "tru e",    // space in literal
@@ -1108,7 +1630,7 @@ mod tests {
             "{\"k\":}", // missing value
             "\"unterminated",
         ] {
-            let g = parse(&src).expect("parse");
+            let g = parse(src).expect("parse");
             let rid = g.rule_id("root").unwrap();
             let mut rt = GrammarRuntime::new(g, rid).unwrap();
             let ok = rt.accept_bytes(input.as_bytes());
@@ -1127,9 +1649,8 @@ mod tests {
     fn json_grammar_rejects_trailing_garbage_after_object() {
         // `root ::= object` — after a valid object, only trailing ws is
         // allowed. Alphabetic garbage is rejected.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture");
-        let g = parse(&src).expect("parse");
+        let src = super::super::test_fixtures::peer_grammar("json.gbnf");
+        let g = parse(src).expect("parse");
         let rid = g.rule_id("root").unwrap();
         let mut rt = GrammarRuntime::new(g, rid).unwrap();
         assert!(rt.accept_bytes(b"{}"));
@@ -1147,6 +1668,35 @@ mod tests {
         assert!(rt.is_dead());
         assert!(!rt.accept_char('a' as u32));
         assert!(rt.is_dead());
+    }
+
+    #[test]
+    fn all_vendored_peer_grammars_accept_representative_output() {
+        let cases = [
+            ("arithmetic.gbnf", "x=1\n"),
+            ("c.gbnf", "int main(){return 0;}"),
+            ("chess.gbnf", "1. e4 e5\n2. Nf3 Nc6\n"),
+            ("english.gbnf", "Hello world"),
+            ("japanese.gbnf", "日本語"),
+            ("json.gbnf", "{\"ok\":true}"),
+            ("json_arr.gbnf", "[\n]"),
+            ("list.gbnf", "- first\n- second\n"),
+        ];
+        for (name, output) in cases {
+            let source = super::super::test_fixtures::peer_grammar(name);
+            let grammar = parse(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let root = grammar.rule_id("root").expect("fixture has root");
+            let mut runtime =
+                GrammarRuntime::new(grammar, root).unwrap_or_else(|| panic!("{name}: runtime"));
+            assert!(
+                runtime.accept_bytes(output.as_bytes()),
+                "{name} rejected representative output {output:?}"
+            );
+            assert!(
+                runtime.is_accepted(),
+                "{name} did not finish in an accepting state for {output:?}"
+            );
+        }
     }
 
     #[test]
@@ -1336,6 +1886,85 @@ mod tests {
         assert!(rt.lazy_trigger_tail.len() < b"<tool_call>".len());
     }
 
+    #[test]
+    fn public_lazy_token_trigger_is_inactive_then_replays_whole_token() {
+        let mut rt = runtime_from("root ::= <[7]> \"x\"\n", "root");
+        rt.configure_public_lazy(&LazyGrammarConfig {
+            token_triggers: vec![7],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(rt.accept_token(1, b"unconstrained preamble"));
+        assert!(rt.is_awaiting_trigger());
+        assert!(rt.accept_eog(), "EOG is unconstrained before activation");
+        assert!(rt.accept_token(7, b"<special>"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(!rt.is_terminally_accepted());
+        assert!(!rt.accept_eog(), "EOG must fail closed after activation");
+    }
+
+    #[test]
+    fn public_lazy_pattern_replays_split_capture_with_original_token_ids() {
+        let mut rt = runtime_from("root ::= \"BODY\"\n", "root");
+        rt.configure_public_lazy(&LazyGrammarConfig {
+            trigger_patterns: vec!["tool:(BODY)".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(rt.accept_token(11, b"noise tool:BO"));
+        assert!(rt.is_awaiting_trigger());
+        assert!(rt.accept_token(12, b"DY"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.is_terminally_accepted());
+    }
+
+    #[test]
+    fn public_lazy_pattern_replays_marker_and_body_exactly_once() {
+        let mut rt = runtime_from("root ::= \"<tag>BODY\"\n", "root");
+        rt.configure_public_lazy(&LazyGrammarConfig {
+            trigger_patterns: vec![regex::escape("<tag>")],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(rt.accept_token(5, b"preamble<tag>BODY"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.is_terminally_accepted());
+    }
+
+    #[test]
+    fn public_lazy_full_pattern_requires_the_whole_buffer() {
+        let config = LazyGrammarConfig {
+            trigger_patterns: vec!["^tool:(BODY)$".into()],
+            ..Default::default()
+        };
+        let mut prefixed = runtime_from("root ::= \"BODY\"\n", "root");
+        prefixed.configure_public_lazy(&config).unwrap();
+        assert!(prefixed.accept_token(1, b"prefix tool:BODY"));
+        assert!(prefixed.is_awaiting_trigger());
+
+        let mut exact = runtime_from("root ::= \"BODY\"\n", "root");
+        exact.configure_public_lazy(&config).unwrap();
+        assert!(exact.accept_token(2, b"tool:BODY"));
+        assert!(exact.is_terminally_accepted());
+    }
+
+    #[test]
+    fn public_lazy_buffer_limit_fails_closed() {
+        let mut rt = runtime_from("root ::= \"x\"\n", "root");
+        rt.configure_public_lazy(&LazyGrammarConfig {
+            trigger_patterns: vec!["never".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(!rt.accept_token(1, &vec![b'a'; MAX_LAZY_TRIGGER_BUFFER_BYTES + 1]));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.is_dead());
+    }
+
     /// Multi-tool-call regression guard.  The peer does NOT reset
     /// awaiting_trigger on the close marker — multi-call support comes
     /// from the chat-template-rendered grammar accepting `(call)+`
@@ -1371,5 +2000,23 @@ mod tests {
             "(call)+ grammar MUST accept a second complete call without runtime reset"
         );
         assert!(rt.is_accepted(), "still accepting after the second call");
+    }
+
+    #[test]
+    fn runtime_rejects_more_than_the_active_stack_budget() {
+        let mut source = String::from("root ::= ");
+        for index in 0..=MAX_ACTIVE_STACKS {
+            if index > 0 {
+                source.push_str(" | ");
+            }
+            source.push_str(&format!("\"a{index:05}\""));
+        }
+        source.push('\n');
+        let grammar = crate::serve::api::grammar::parse(&source).expect("bounded grammar parse");
+        let root = grammar.rule_id("root").expect("root rule");
+        assert!(
+            GrammarRuntime::new(grammar, root).is_none(),
+            "runtime MUST fail closed when initial alternatives exceed 32,768 active stacks"
+        );
     }
 }

@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 use crate::serve::api::engine::{
-    is_fatal_command_buffer_error, SamplingParams, SerialStreamEnd, SerialStreamResult,
+    is_fatal_command_buffer_error, validate_grammar_terminal, SamplingParams, SerialStreamEnd,
+    SerialStreamResult,
 };
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::grammar::GrammarRuntime;
@@ -603,6 +604,7 @@ pub(in crate::serve::api) fn generate_stream(
         if saw_tool {
             finish_reason = "tool_calls";
         }
+        validate_grammar_terminal(runtime.as_ref(), params.grammar_kind, finish_reason)?;
         let decode_duration = decode_started.elapsed();
         let semantic_ttft = first_visible_at.unwrap_or_else(|| request_started.elapsed());
         events

@@ -453,9 +453,23 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     cancellation: Option<Extension<super::middleware::RequestCancellation>>,
-    Json(req): Json<ChatCompletionRequest>,
+    request: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    let Json(req) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            state
+                .metrics
+                .requests_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
+            return ApiError::invalid_request(
+                format!("Invalid JSON request body: {}", rejection.body_text()),
+                Some("body".into()),
+            )
+            .into_response();
+        }
+    };
     let diagnostic_no_evict = match diagnostic_no_evict_from_headers(&headers) {
         Ok(enabled) => enabled,
         Err(response) => {
@@ -1713,6 +1727,21 @@ where
         .into_response());
     }
 
+    // Normalize public tool and output controls before model resolution.
+    // Malformed tool choices and declarations are ordinary request errors;
+    // grammar/schema compilation errors retain the existing grammar_error
+    // code and exact request-field attribution.
+    let tool_choice = match grammar::request::validate_tool_request(req) {
+        Ok(choice) => choice,
+        Err(error) => {
+            return Err(ApiError::invalid_request(error.message, Some(error.param)).into_response())
+        }
+    };
+    if let Err(error) =
+        grammar::request::validate_request_output_constraint_before_model(req, &tool_choice)
+    {
+        return Err(ApiError::grammar_error_for(error.param, error.message).into_response());
+    }
     // --- Pool-routed engine resolution (iter-209) ---
     // Pre-iter-209: rejected with 400 `model_not_loaded` whenever
     // `state.engine.is_none()`.  Iter-209 routes `req.model` through
@@ -1758,20 +1787,22 @@ where
         qwen3vl_image_grids,
     ) = prepare_vision_context(&req.messages, state.mmproj.as_ref(), engine, cancellation).await?;
 
-    // Compile the response_format grammar (Decision #6).  Iter-95 wires
-    // the parsed grammar into `SamplingParams.grammar` so the decode loop
-    // can mask invalid tokens at every step.  Pre-iter-95 the grammar
-    // was discarded after parse-validation; bad requests still fail
-    // fast in <1 ms but valid grammars now constrain decoding instead
-    // of being silently ignored.
-    let response_grammar: Option<grammar::Grammar> = match req.response_format.as_ref() {
-        Some(rf) => match compile_response_format(rf) {
-            Ok(g) => g,
-            Err(resp) => return Err(resp),
-        },
-        None => None,
+    // Compile every OpenAI/vLLM/peer structured-output surface only
+    // after the requested model has resolved. Raw token terminals, preserved
+    // tokens, and lazy token/word triggers must bind to this authoritative
+    // tokenizer; model-free validation would silently assign the wrong ids.
+    let public_constraint = match grammar::request::compile_request_output_constraint_with_tokenizer(
+        req,
+        &tool_choice,
+        engine.tokenizer(),
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            return Err(ApiError::grammar_error_for(error.param, error.message).into_response())
+        }
     };
-
+    let response_grammar = public_constraint.grammar;
+    let public_grammar_lazy = public_constraint.lazy;
     // Render + tokenize + apply context-overflow policy (Decision #23).
     // `apply_overflow_policy` handles the three policies:
     //   Reject        → 400 context_length_exceeded when prompt ≥ ctx_len.
@@ -1811,8 +1842,7 @@ where
     // system block regardless. tool_choice="auto" / "required" /
     // forced-function still pass tools through; the per-call-shape
     // grammar enforcement (Decision #6) is now wired (T1.8 Option B).
-    let tool_choice = super::schema::ToolChoiceValue::parse(req.tool_choice.as_ref());
-    let req_tools: Option<&[super::schema::Tool]> = match tool_choice {
+    let req_tools: Option<&[super::schema::Tool]> = match &tool_choice {
         super::schema::ToolChoiceValue::None => None,
         _ => req.tools.as_deref(),
     };
@@ -1823,17 +1853,26 @@ where
     // structurally impossible for the constrained paths, which unblocks the
     // T2.4 fallback removal (wave 3).
     //
-    // Precedence rule: tool grammar overrides response_format grammar when
-    // both are present — a request cannot simultaneously enforce
-    // response_format=json_schema AND tool_choice=required, because the model
-    // output is either a tool call OR a structured JSON response, never both.
-    // The tool grammar is the more specific constraint; response_grammar is
-    // ignored when a tool grammar is produced.
-    let tool_grammar: Option<grammar::Grammar> =
-        match compile_tool_grammar_with_registration(req, &tool_choice, engine.registration()) {
-            Ok(g) => g,
-            Err(resp) => return Err(resp),
-        };
+    // Precedence rule: Required/named tool choice suppresses the otherwise
+    // unused output constraint before compilation. Under Auto, an explicit
+    // output constraint suppresses the optional lazy tool grammar instead, so
+    // it cannot be erased by a marker that never fires.
+    let tool_grammar: Option<grammar::Grammar> = match compile_tool_grammar_for_request(
+        req,
+        &tool_choice,
+        engine.registration(),
+        response_grammar.is_some(),
+    ) {
+        Ok(g) => g,
+        Err(resp) => return Err(resp),
+    };
+    if tool_grammar.is_some() && public_grammar_lazy.is_some() {
+        return Err(ApiError::invalid_request(
+            "grammar_lazy cannot be combined with a tool grammar that overrides the response constraint",
+            Some("grammar_lazy".into()),
+        )
+        .into_response());
+    }
     // Select the effective grammar: tool > response > none.
     //
     // Wave 2.6 W-α5 Q1 + Wave 2.7 W-η Q-A: also pick the `GrammarKind`
@@ -1856,6 +1895,11 @@ where
     let tool_grammar_kind = tool_grammar_kind_for(&tool_choice);
     let (effective_grammar, effective_grammar_kind) =
         select_effective_grammar(tool_grammar, tool_grammar_kind, response_grammar);
+    if let Err(error) =
+        grammar::request::validate_stop_with_constraint(req, effective_grammar.is_some())
+    {
+        return Err(ApiError::invalid_request(error.message, Some(error.param)).into_response());
+    }
     // A stock OpenAI-compatible client cannot be expected to know an hf2q
     // extension. An explicit request override still wins; when it is absent,
     // derive the native default from the loaded chat template using the same
@@ -2241,6 +2285,7 @@ where
         grammar: effective_grammar,
         token_bytes: grammar_token_bytes,
         grammar_kind: effective_grammar_kind,
+        grammar_lazy: public_grammar_lazy,
         tool_call_policy: tc_policy,
         tool_argument_wire_kinds,
         reasoning_forced_open,
@@ -4409,51 +4454,8 @@ fn expand_image_placeholders_family(
 fn compile_response_format(
     rf: &ResponseFormat,
 ) -> std::result::Result<Option<grammar::Grammar>, Response> {
-    let gbnf = match rf {
-        ResponseFormat::Text => return Ok(None),
-        ResponseFormat::JsonObject => {
-            // Unconstrained JSON object grammar — same shape as
-            // the peer's built-in json_object.gbnf.
-            static JSON_OBJECT_GRAMMAR: &str = r#"root   ::= object
-value  ::= object | array | string | number | ("true" | "false" | "null") ws
-object ::=
-  "{" ws (
-            string ":" ws value
-    ("," ws string ":" ws value)*
-  )? "}" ws
-array  ::=
-  "[" ws (
-            value
-    ("," ws value)*
-  )? "]" ws
-string ::=
-  "\"" (
-    [^"\\\x7F\x00-\x1F] |
-    "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
-  )* "\"" ws
-number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
-ws ::= | " " | "\n" [ \t]{0,20}
-"#;
-            JSON_OBJECT_GRAMMAR.to_string()
-        }
-        ResponseFormat::JsonSchema { json_schema } => {
-            // Compile json_schema → GBNF via iter-8's translator.
-            match grammar::json_schema::schema_to_gbnf(&json_schema.schema) {
-                Ok(g) => g,
-                Err(e) => {
-                    return Err(ApiError::grammar_error(format!(
-                        "json_schema → GBNF failed: {}",
-                        e
-                    ))
-                    .into_response());
-                }
-            }
-        }
-    };
-    match grammar::parser::parse(&gbnf) {
-        Ok(g) => Ok(Some(g)),
-        Err(e) => Err(ApiError::grammar_error(format!("GBNF parse failed: {}", e)).into_response()),
-    }
+    grammar::request::compile_response_format(rf, None)
+        .map_err(|error| ApiError::grammar_error_for(error.param, error.message).into_response())
 }
 
 /// Combine the optional tool grammar (from `compile_tool_grammar`) and
@@ -4960,6 +4962,22 @@ fn compile_tool_grammar_with_registration(
     }
 }
 
+/// Compile the native tool grammar after request-output precedence has been
+/// normalized. An explicit output constraint suppresses only Auto's optional
+/// lazy tool grammar; Required and named-function choices remain eager and
+/// have already suppressed the output constraint upstream.
+fn compile_tool_grammar_for_request(
+    req: &super::schema::ChatCompletionRequest,
+    tool_choice: &super::schema::ToolChoiceValue,
+    registration: Option<&registry::ModelRegistration>,
+    has_output_constraint: bool,
+) -> std::result::Result<Option<grammar::Grammar>, Response> {
+    if has_output_constraint && matches!(tool_choice, super::schema::ToolChoiceValue::Auto) {
+        return Ok(None);
+    }
+    compile_tool_grammar_with_registration(req, tool_choice, registration)
+}
+
 // ---------------------------------------------------------------------------
 // Wave 2.8 W-θ MED — compile_tool_grammar precondition tests.
 //
@@ -4996,6 +5014,12 @@ mod compile_tool_grammar_precondition_tests {
             tools,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
@@ -5211,6 +5235,36 @@ mod compile_tool_grammar_precondition_tests {
         let res = compile_tool_grammar(&req, &ToolChoiceValue::None);
         let g = res.expect("None choice MUST stay Ok(None)");
         assert!(g.is_none());
+    }
+
+    #[test]
+    fn automatic_tool_grammar_cannot_override_an_output_constraint() {
+        let req = req_with("gemma4-27b-it", Some(one_scalar_tool("lookup")));
+        let registration = registry::find_for("gemma4-27b-it").expect("Gemma registration");
+
+        let automatic = compile_tool_grammar_for_request(
+            &req,
+            &ToolChoiceValue::Auto,
+            Some(&registration),
+            true,
+        )
+        .expect("Auto precedence");
+        assert!(
+            automatic.is_none(),
+            "explicit output constraint must suppress Auto's optional tool grammar"
+        );
+
+        let required = compile_tool_grammar_for_request(
+            &req,
+            &ToolChoiceValue::Required,
+            Some(&registration),
+            true,
+        )
+        .expect("Required precedence");
+        assert!(
+            required.is_some(),
+            "Required's native tool grammar must retain precedence"
+        );
     }
 
     /// iter-218 regression guard: `parallel_tool_calls` defaults to FALSE
@@ -7256,6 +7310,26 @@ mod grammar_kind_selection_tests {
         );
     }
 
+    /// The typed structural-tag request surface lands before its XGrammar
+    /// lowerer. Until that lowerer is connected, the request must fail closed
+    /// rather than silently generate unconstrained text.
+    #[test]
+    fn response_format_structural_tag_fails_closed_until_lowerer_is_wired() {
+        use super::super::schema::ResponseFormat;
+
+        let rf = ResponseFormat::StructuralTag {
+            spec: serde_json::Map::from_iter([(
+                "format".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
+        };
+        let result = super::compile_response_format(&rf);
+        match result {
+            Err(response) => assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST),
+            Ok(_) => panic!("structural_tag without a lowerer must fail closed"),
+        }
+    }
+
     /// Tool grammar present (regardless of response_format) MUST resolve
     /// to `GrammarKind::ToolCallBodyRequired` through the production
     /// helper. Both grammars are constructed from real
@@ -7268,7 +7342,7 @@ mod grammar_kind_selection_tests {
         // Two distinct real grammars so we can confirm precedence by
         // identity (the chosen output IS the tool grammar, not the
         // response-format grammar).
-        let rf_resp = ResponseFormat::JsonObject;
+        let rf_resp = ResponseFormat::JsonObject { schema: None };
         let resp_grammar = super::compile_response_format(&rf_resp).expect("compile json_object");
         assert!(resp_grammar.is_some());
 
@@ -10513,6 +10587,12 @@ mod readiness_guard_tests {
             tools: None,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
@@ -10626,6 +10706,12 @@ mod readiness_guard_tests {
             tools: None,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
@@ -10911,6 +10997,12 @@ mod pool_error_tests {
             tools: None,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
@@ -10998,6 +11090,12 @@ mod iter215_qwen35_chat_501_tests {
             tools: None,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,
@@ -11941,6 +12039,12 @@ mod a5d_handler_429_tests {
             tools: None,
             tool_choice: None,
             response_format: None,
+            structured_outputs: None,
+            grammar: None,
+            json_schema: None,
+            grammar_lazy: None,
+            preserved_tokens: None,
+            grammar_triggers: None,
             top_p: None,
             seed: None,
             reasoning_effort: None,

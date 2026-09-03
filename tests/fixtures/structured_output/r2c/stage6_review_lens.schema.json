@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hf2q:r2c:stage6-review-lens:v1",
+  "title": "r2c Stage 6 ReviewLens evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "review_unit_alias",
+    "lens_alias",
+    "disposition",
+    "member_coverage",
+    "relationship_coverage",
+    "fact_coverage",
+    "gap_coverage",
+    "observations"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "minimum": 0 },
+    "review_unit_alias": { "type": "string" },
+    "lens_alias": { "type": "string" },
+    "disposition": {
+      "type": "string",
+      "enum": [
+        "examined_no_material_observation",
+        "supported_observation",
+        "candidate_hypothesis",
+        "unresolved_with_gap"
+      ]
+    },
+    "member_coverage": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/member" }
+    },
+    "relationship_coverage": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/relationship" }
+    },
+    "fact_coverage": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fact" }
+    },
+    "gap_coverage": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/gap" }
+    },
+    "observations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/observation" }
+    }
+  },
+  "$defs": {
+    "assessment": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": { "status": { "const": "examined" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "detail"],
+          "properties": {
+            "status": { "const": "unresolved" },
+            "detail": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "member": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["member_alias", "assessment"],
+      "properties": {
+        "member_alias": { "type": "string" },
+        "assessment": { "$ref": "#/$defs/assessment" }
+      }
+    },
+    "relationship": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relationship_alias", "assessment"],
+      "properties": {
+        "relationship_alias": { "type": "string" },
+        "assessment": { "$ref": "#/$defs/assessment" }
+      }
+    },
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fact_alias", "assessment"],
+      "properties": {
+        "fact_alias": { "type": "string" },
+        "assessment": { "$ref": "#/$defs/assessment" }
+      }
+    },
+    "gap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gap_alias", "assessment"],
+      "properties": {
+        "gap_alias": { "type": "string" },
+        "assessment": { "$ref": "#/$defs/assessment" }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["local_id", "kind", "summary", "evidence_refs"],
+      "properties": {
+        "local_id": { "type": "string" },
+        "kind": {
+          "type": "string",
+          "enum": ["supported_observation", "candidate_hypothesis"]
+        },
+        "summary": { "type": "string" },
+        "evidence_refs": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -28,7 +28,7 @@
 //!   alternations, broad strings, UTF-8 partials, and dead/accepting states.
 //! - Token text may contain partial UTF-8 (tokenizer pieces like GPT-2's
 //!   `Ġ` prefix ARE full UTF-8 here after decoding; BPE byte-fallback
-//!   tokens are handled by `GrammarRuntime::accept_bytes`'s incremental
+//!   tokens are handled by `GrammarRuntime::accept_token`'s incremental
 //!   UTF-8 decoder).
 
 use super::sampler::{decode_candidate_utf8, reject_candidates, GrammarCandidate, GrammarRuntime};
@@ -60,6 +60,7 @@ pub fn sample_greedy_valid_token(
     repetition_penalty: f64,
     grammar: &GrammarRuntime,
     token_bytes: &[Vec<u8>],
+    eog_token_ids: &[u32],
 ) -> u32 {
     if repetition_penalty != 1.0 && !previous_tokens.is_empty() {
         crate::serve::sampler_pure::apply_repetition_penalty(
@@ -104,13 +105,20 @@ pub fn sample_greedy_valid_token(
             let Some(bytes) = token_bytes.get(token) else {
                 return Some(token as u32);
             };
-            // Empty/special pieces are intentionally valid under the shared
-            // grammar contract; EOS handling remains the decode loop's job.
-            if bytes.is_empty() {
-                return Some(token as u32);
+            if eog_token_ids.contains(&(token as u32)) {
+                if grammar.is_terminally_accepted() {
+                    return Some(token as u32);
+                }
+                logits[token] = f32::NEG_INFINITY;
+                continue;
+            }
+            // the peer rejects empty non-EOG pieces even after acceptance.
+            if bytes.is_empty() || bytes.first() == Some(&0) {
+                logits[token] = f32::NEG_INFINITY;
+                continue;
             }
             let mut probe = grammar.clone();
-            if probe.accept_bytes(bytes) {
+            if probe.accept_token(token as u32, bytes) {
                 return Some(token as u32);
             }
             logits[token] = f32::NEG_INFINITY;
@@ -121,7 +129,7 @@ pub fn sample_greedy_valid_token(
         return token;
     }
 
-    mask_invalid_tokens(grammar, token_bytes, logits);
+    mask_invalid_tokens_with_eog(grammar, token_bytes, eog_token_ids, logits);
     crate::serve::sampler_pure::sample_greedy(logits)
 }
 
@@ -136,11 +144,9 @@ pub fn sample_greedy_valid_token(
 /// standard logit-mask value: after softmax it becomes zero probability
 /// and the sampler's top-k / top-p pruning drops it naturally.
 ///
-/// Tokens whose `token_bytes` entry is empty (e.g. special `<|endoftext|>`
-/// tokens without a printable form) are **NOT** masked — they're left at
-/// their original logit so the sampler can pick them. The caller is
-/// responsible for stop-sequence / EOS handling; the grammar doesn't
-/// govern them.
+/// Declared EOG tokens survive only when the grammar is already accepting.
+/// Empty non-EOG pieces are always masked, matching the peer's fail-closed
+/// vocabulary path.
 ///
 /// # Panics
 ///
@@ -148,6 +154,18 @@ pub fn sample_greedy_valid_token(
 pub fn mask_invalid_tokens(
     grammar: &GrammarRuntime,
     token_bytes: &[Vec<u8>],
+    logits: &mut [f32],
+) -> usize {
+    mask_invalid_tokens_with_eog(grammar, token_bytes, &[], logits)
+}
+
+/// EOG-aware grammar mask matching the peer's vocabulary-bound apply path.
+/// EOG ids survive only in an already-accepting state and never participate
+/// in token-terminal matching. Empty non-EOG pieces are always rejected.
+pub fn mask_invalid_tokens_with_eog(
+    grammar: &GrammarRuntime,
+    token_bytes: &[Vec<u8>],
+    eog_token_ids: &[u32],
     logits: &mut [f32],
 ) -> usize {
     // Wave 2.6 W-α5 Q2: a suspended runtime (lazy-grammar awaiting its
@@ -166,8 +184,18 @@ pub fn mask_invalid_tokens(
 
     for i in 0..n {
         let bytes = &token_bytes[i];
-        if bytes.is_empty() {
-            // Special/unprintable token — don't mask.
+        if eog_token_ids.contains(&(i as u32)) {
+            if !grammar.is_terminally_accepted() && logits[i].is_finite() {
+                logits[i] = f32::NEG_INFINITY;
+                masked += 1;
+            }
+            continue;
+        }
+        if bytes.is_empty() || bytes.first() == Some(&0) {
+            if logits[i].is_finite() {
+                logits[i] = f32::NEG_INFINITY;
+                masked += 1;
+            }
             continue;
         }
         if !logits[i].is_finite() {
@@ -184,6 +212,7 @@ pub fn mask_invalid_tokens(
         };
         candidates.push(GrammarCandidate {
             index: i,
+            token_id: i as u32,
             cursor: start,
             end: code_points.len(),
             partial_utf8,
@@ -215,11 +244,16 @@ fn mask_invalid_tokens_clone_oracle(
     let n = token_bytes.len().min(logits.len());
     for i in 0..n {
         let bytes = &token_bytes[i];
-        if bytes.is_empty() || !logits[i].is_finite() {
+        if !logits[i].is_finite() {
+            continue;
+        }
+        if bytes.is_empty() || bytes.first() == Some(&0) {
+            logits[i] = f32::NEG_INFINITY;
+            masked += 1;
             continue;
         }
         let mut runtime = grammar.clone();
-        if !runtime.accept_bytes(bytes) {
+        if !runtime.accept_token(i as u32, bytes) {
             logits[i] = f32::NEG_INFINITY;
             masked += 1;
         }
@@ -248,7 +282,7 @@ pub fn surviving_token_ids(
             continue;
         }
         let mut rt = grammar.clone();
-        if rt.accept_bytes(bytes) {
+        if rt.accept_token(i as u32, bytes) {
             out.push(i as u32);
         }
     }
@@ -268,6 +302,109 @@ mod tests {
         let g = parse(grammar_src).expect("parse");
         let rid = g.rule_id(start).expect("start");
         GrammarRuntime::new(g, rid).expect("runtime")
+    }
+
+    #[test]
+    fn token_terminal_masks_by_id_not_decoded_bytes() {
+        let runtime = rt("root ::= <[1]>\n", "root");
+        let token_bytes = vocab(&["same", "same", "different"]);
+        let mut logits = vec![1.0; token_bytes.len()];
+
+        mask_invalid_tokens_with_eog(&runtime, &token_bytes, &[], &mut logits);
+
+        assert!(!logits[0].is_finite());
+        assert!(logits[1].is_finite());
+        assert!(!logits[2].is_finite());
+    }
+
+    #[test]
+    fn token_any_and_exclusion_set_mask_by_id_without_enumerating_vocab() {
+        let token_bytes = vocab(&["same", "same", "same", "same", "same"]);
+
+        let any = rt("root ::= <[*]>\n", "root");
+        let mut any_logits = vec![1.0; token_bytes.len()];
+        assert_eq!(
+            mask_invalid_tokens_with_eog(&any, &token_bytes, &[], &mut any_logits),
+            0
+        );
+
+        let exclusion = rt("root ::= !<[1,3]>\n", "root");
+        let mut exclusion_logits = vec![1.0; token_bytes.len()];
+        assert_eq!(
+            mask_invalid_tokens_with_eog(&exclusion, &token_bytes, &[], &mut exclusion_logits,),
+            2
+        );
+        assert!(exclusion_logits[0].is_finite());
+        assert!(!exclusion_logits[1].is_finite());
+        assert!(exclusion_logits[2].is_finite());
+        assert!(!exclusion_logits[3].is_finite());
+        assert!(exclusion_logits[4].is_finite());
+    }
+
+    #[test]
+    fn eog_remains_masked_while_an_accepted_alternate_has_pending_utf8() {
+        let mut runtime = rt("root ::= \"\" | .\n", "root");
+        assert!(runtime.accept_bytes(&[0xCE]));
+        assert!(runtime.is_accepted());
+        assert!(!runtime.is_terminally_accepted());
+
+        let mut logits = vec![1.0];
+        assert_eq!(
+            mask_invalid_tokens_with_eog(&runtime, &[Vec::new()], &[0], &mut logits),
+            1
+        );
+        assert!(!logits[0].is_finite());
+    }
+
+    #[test]
+    fn eog_is_masked_until_accepted_and_never_satisfies_token_terminal() {
+        let eog = [2_u32];
+        let token_bytes = vocab(&["x", "y", "<eos>"]);
+
+        let token_runtime = rt("root ::= <[2]>\n", "root");
+        let mut token_logits = vec![1.0; token_bytes.len()];
+        mask_invalid_tokens_with_eog(&token_runtime, &token_bytes, &eog, &mut token_logits);
+        assert!(!token_logits[2].is_finite());
+
+        let mut accepted = rt("root ::= \"x\"\n", "root");
+        assert!(accepted.accept_token(0, b"x"));
+        let mut accepted_logits = vec![1.0; token_bytes.len()];
+        mask_invalid_tokens_with_eog(&accepted, &token_bytes, &eog, &mut accepted_logits);
+        assert!(accepted_logits[2].is_finite());
+        assert!(!accepted_logits[1].is_finite());
+    }
+
+    #[test]
+    fn empty_non_eog_piece_is_always_masked() {
+        let mut runtime = rt("root ::= \"x\"\n", "root");
+        assert!(runtime.accept_token(0, b"x"));
+        let token_bytes = vec![b"x".to_vec(), Vec::new()];
+        let mut logits = vec![1.0; token_bytes.len()];
+
+        mask_invalid_tokens_with_eog(&runtime, &token_bytes, &[], &mut logits);
+
+        assert!(!logits[1].is_finite());
+    }
+
+    #[test]
+    fn greedy_probe_obeys_eog_boundary() {
+        let token_bytes = vocab(&["x", "<eos>"]);
+        let eog = [1_u32];
+
+        let runtime = rt("root ::= \"x\"\n", "root");
+        let mut logits = vec![1.0_f32, 10.0];
+        assert_eq!(
+            sample_greedy_valid_token(&mut logits, &[], 1.0, &runtime, &token_bytes, &eog),
+            0
+        );
+
+        let mut accepted = rt("root ::= \"x\"\n", "root");
+        assert!(accepted.accept_token(0, b"x"));
+        let mut logits = vec![1.0_f32, 10.0];
+        assert_eq!(
+            sample_greedy_valid_token(&mut logits, &[], 1.0, &accepted, &token_bytes, &eog),
+            1
+        );
     }
 
     fn vocab(strings: &[&str]) -> Vec<Vec<u8>> {
@@ -370,8 +507,8 @@ mod tests {
 
         // Accepting and dead runtimes have intentionally different behavior:
         // an accepting empty stack rejects further non-empty bytes; a dead
-        // runtime rejects every non-empty token.  Empty special tokens remain
-        // under the existing caller-owned EOS contract in both cases.
+        // runtime rejects every candidate. Empty special tokens survive only
+        // for the accepting runtime.
         let mut accepted = rt("root ::= \"a\"\n", "root");
         assert!(accepted.accept_bytes(b"a"));
         assert!(accepted.is_accepted());
@@ -498,17 +635,24 @@ mod tests {
     }
 
     #[test]
-    fn mask_skips_empty_token_strings() {
-        // Empty-string tokens (special tokens) are left unmasked regardless
-        // of grammar state.
+    fn mask_allows_declared_eog_only_after_grammar_acceptance() {
         let runtime = rt("root ::= \"a\"\n", "root");
         let token_bytes = vec![b"a".to_vec(), vec![], b"b".to_vec()];
         let mut logits = vec![1.0, 2.0, 3.0];
-        let masked = mask_invalid_tokens(&runtime, &token_bytes, &mut logits);
-        assert_eq!(masked, 1); // only 'b' masked
+        let masked = mask_invalid_tokens_with_eog(&runtime, &token_bytes, &[1], &mut logits);
+        assert_eq!(masked, 2);
         assert_eq!(logits[0], 1.0); // 'a' survives
-        assert_eq!(logits[1], 2.0); // empty token untouched
+        assert!(logits[1].is_infinite()); // early EOS cannot truncate "a"
         assert!(logits[2].is_infinite()); // 'b' masked
+
+        let mut accepted = rt("root ::= \"a\"\n", "root");
+        assert!(accepted.accept_bytes(b"a"));
+        let mut terminal_logits = vec![2.0];
+        assert_eq!(
+            mask_invalid_tokens_with_eog(&accepted, &[Vec::new()], &[0], &mut terminal_logits,),
+            0
+        );
+        assert_eq!(terminal_logits[0], 2.0);
     }
 
     #[test]
@@ -573,9 +717,8 @@ mod tests {
         // Use the canonical json.gbnf fixture. From root=object, the only
         // valid first char is '{' — every token starting with any other
         // char must be masked.
-        let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
-            .expect("json.gbnf fixture");
-        let g = parse(&src).unwrap();
+        let src = super::super::test_fixtures::peer_grammar("json.gbnf");
+        let g = parse(src).unwrap();
         let rid = g.rule_id("root").unwrap();
         let runtime = GrammarRuntime::new(g, rid).unwrap();
         let token_bytes = vocab(&["{", "}", "[", "\"", "a", "1"]);
@@ -855,10 +998,8 @@ mod tests {
             surviving
         );
 
-        // Tokens with empty decoded bytes are skipped by the mask
-        // (intentional contract — see mask.rs:77-79). Verify at least
-        // some such tokens exist in the special-token block to confirm
-        // we are exercising the contract.
+        // Record how many empty decoded pieces were exercised. In this
+        // non-accepting state all are now masked, closing the EOS bypass.
         let empty_byte_tokens: usize = token_bytes.iter().filter(|b| b.is_empty()).count();
         // We don't assert a specific number — it depends on the
         // tokenizer's special-token registration shape — but assert
@@ -871,7 +1012,7 @@ mod tests {
         let runtime = rt("root ::= \"a\" | \"b\"\n", "root");
         let token_bytes = vocab(&["x", "b", "a"]);
         let mut logits = vec![9.0, 8.0, 7.0];
-        let token = sample_greedy_valid_token(&mut logits, &[], 1.0, &runtime, &token_bytes);
+        let token = sample_greedy_valid_token(&mut logits, &[], 1.0, &runtime, &token_bytes, &[]);
         assert_eq!(
             token, 1,
             "invalid top token must yield to highest valid token"
@@ -884,7 +1025,7 @@ mod tests {
         runtime.set_awaiting_trigger(true);
         let token_bytes = vocab(&["x", "a"]);
         let mut logits = vec![9.0, 8.0];
-        let token = sample_greedy_valid_token(&mut logits, &[], 1.0, &runtime, &token_bytes);
+        let token = sample_greedy_valid_token(&mut logits, &[], 1.0, &runtime, &token_bytes, &[]);
         assert_eq!(token, 0);
         assert_eq!(logits, vec![9.0, 8.0]);
     }
@@ -894,7 +1035,7 @@ mod tests {
         let runtime = rt("root ::= \"a\" | \"b\"\n", "root");
         let token_bytes = vocab(&["a", "b"]);
         let mut logits = vec![10.0, 9.0];
-        let token = sample_greedy_valid_token(&mut logits, &[0], 2.0, &runtime, &token_bytes);
+        let token = sample_greedy_valid_token(&mut logits, &[0], 2.0, &runtime, &token_bytes, &[]);
         assert_eq!(token, 1, "penalized prior token must no longer win");
     }
 }
