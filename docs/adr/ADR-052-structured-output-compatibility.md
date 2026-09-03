@@ -1,6 +1,6 @@
 # ADR-052: Structured-output compatibility for every generative model
 
-**Status:** Accepted — implementation and proof in progress
+**Status:** Accepted — implementation complete; merge pending
 **Date:** 2026-09-03
 **Updated:** 2026-09-03
 **Supersedes:** the closed grammar-subset plan in ADR-005 Decision #6
@@ -150,13 +150,23 @@ silently ignored when their combination has no defined meaning.
 
 ### 2. Model-family coverage
 
-The same normalized constraint and runtime MUST operate for every text decoder:
+The same normalized constraint and runtime MUST operate for every enabled text
+decoder:
 
 - Gemma;
 - Qwen 3.5/3.6;
-- Qwen3-VL text decoding;
 - DeepSeek 4;
 - future registered text-generating families.
+
+Standalone Qwen3-VL is not currently an enabled text-generating family: the
+shipping contract and ADR-041 require `hf2q serve` to refuse it before model
+load. Its staged Generate and GenerateWithSoftTokens implementation already
+consumes the shared grammar runtime and has focused mask/terminal tests, but
+that is not live-model proof. ADR-041 MUST NOT remove the startup guard or mark
+Qwen3-VL serving implemented until unary response-schema, SSE, native tool,
+tool-result continuation, and prefix-reuse grammar gates pass on an
+authoritative artifact. This prevents the grammar feature from silently
+creating a false claim that the currently disabled decoder can generate.
 
 Family code MAY provide native reasoning and tool markers. It MUST NOT provide
 a weaker JSON-Schema implementation. A family that cannot activate a requested
@@ -378,13 +388,30 @@ closed because it has no measured Cargo `testsPassing` evidence adapter. These
 tool verdicts MUST NOT be relabeled as green and do not replace the locked Rust
 gates above.
 
-The realistic all-family gate is not yet runnable safely. The shared host has
-an active hf2q 0.1.20 DeepSeek4 server on port 8081 under the release driver's
-authority, and no Qwen3-VL text GGUF is present in the approved model roots.
-The grammar branch MUST NOT stop that server, substitute another family's
-artifact, or merge until coordination supplies a safe window and an
-authoritative Qwen3-VL artifact. Gemma, Qwen, and DeepSeek4 artifacts are
-present but remain unloaded by this work.
+The realistic serving-family gate passed on the exact branch binary at
+`776e4858a4ccf54619725f01ba223a900938b341` on an Apple M5 Max. Models were
+loaded one at a time and shut down cleanly:
+
+- Qwen3.5-4B Q4_K_M: the native-tool unary/SSE/recovery/continuation gate
+  passed; repeated requests reused 392-450 prompt tokens. Stage 6 and Stage 9
+  `response_format=json_schema` outputs passed live validation. An initial
+  Stage 6 run exhausted the request's completion budget before reaching an
+  accepting grammar state and returned an error rather than incomplete JSON;
+  the reformulated 768-token run passed.
+- Gemma4 Ara 2pass: the same native-tool gate passed with 171-216 cached
+  prompt tokens; Stage 6 and Stage 9 passed live validation.
+- DeepSeek-V4 Flash 0731 agentic Q2: the same native-tool gate passed with
+  487-542 cached prompt tokens; Stage 6 and Stage 9 passed live validation.
+  The 100.05 GiB artifact was loaded only after static capacity validation and
+  with the launcher's explicit controlled-diagnostic memory override because
+  the otherwise-idle host retained 23.83 GiB historical swap and 8.36 GiB in
+  the compressor.
+
+The native-tool evidence is reproducible with
+`scripts/test_deepseek4_structured_tools.sh`. The r2c unary and response-format
+SSE evidence is reproducible with `scripts/test_r2c_structured_outputs.sh`.
+Standalone Qwen3-VL was not loaded: no authoritative GGUF is present and its
+documented ADR-041 startup guard makes artifact preparation insufficient.
 
 ## Completion gates
 
@@ -395,8 +422,9 @@ This ADR moves to **Implemented** only when:
 3. `cargo check --locked --all-targets --all-features` passes;
 4. `cargo test --locked` passes;
 5. `cargo build --release --locked` passes;
-6. realistic all-family unary/SSE/tool-result/prefix-reuse evidence passes or
-   an unavailable artifact is named as a merge blocker;
+6. realistic unary/SSE/tool-result/prefix-reuse evidence passes for every
+   enabled text-generating family, and disabled staged families retain an
+   explicit activation gate requiring the same proof;
 7. the exact feature commit is pushed, ordinary exact-head CI passes, and the
    pull request is merged to `main`.
 
