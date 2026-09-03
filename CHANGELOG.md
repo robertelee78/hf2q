@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Make the OpenCode web-search stack install reliably across supported hosts,
   including environments that require an explicit SearXNG build backend.
+- Keep release-build proc macros loadable under macOS 27's stricter Mach-O
+  validation, while preserving the normal optimized profile for the hf2q
+  executable and verifying LINKEDIT alignment before signing.
 
 ## [0.1.15] — 2026-08-24
 

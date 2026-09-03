@@ -5,6 +5,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+CARGO_MANIFEST="$ROOT_DIR/Cargo.toml"
 SIGN_SCRIPT="$ROOT_DIR/scripts/sign_notarize_standalone_release.sh"
 VERIFY_SCRIPT="$ROOT_DIR/scripts/verify_standalone_candidate.sh"
 STANDALONE_WORKFLOW="$ROOT_DIR/.github/workflows/standalone-candidate.yml"
@@ -36,11 +37,46 @@ workflow_executes_unsigned_candidate() {
       <<<"$source"
 }
 
+release_build_tools_disable_strip() {
+  awk '
+    $0 == "[profile.release.build-override]" { capture = 1; next }
+    capture && /^\[/ { exit }
+    capture && /^[[:space:]]*strip[[:space:]]*=[[:space:]]*"none"[[:space:]]*$/ {
+      found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
 bash -n "$SIGN_SCRIPT"
 bash -n "$VERIFY_SCRIPT"
 if "$SIGN_SCRIPT" >/dev/null 2>&1; then
   fail "signing script accepted a missing release contract"
 fi
+release_build_tools_disable_strip < "$CARGO_MANIFEST" ||
+  fail "release build tools do not disable rustc debuginfo stripping"
+if release_build_tools_disable_strip <<'EOF'
+[profile.release]
+strip = "none"
+EOF
+then
+  fail "global release-strip override was mistaken for the build-tool boundary"
+fi
+if release_build_tools_disable_strip <<'EOF'
+[profile.release.build-override]
+strip = "debuginfo"
+EOF
+then
+  fail "build-tool profile accepted the macOS 27-breaking strip mode"
+fi
+for required in \
+  'assert_macho_string_pool_aligned()' \
+  'assert_macho_string_pool_aligned "$dylib"' \
+  'assert_macho_string_pool_aligned "$built_binary"' \
+  'test "$dylib_count" -gt 0'; do
+  grep -Fq -- "$required" "$STANDALONE_WORKFLOW" ||
+    fail "standalone candidate omits Mach-O alignment proof: $required"
+done
 
 for required in \
   '/usr/bin/codesign --force --sign' \

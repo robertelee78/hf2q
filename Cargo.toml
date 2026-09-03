@@ -276,6 +276,14 @@ resvg = { version = "=0.47.0", default-features = false }
 resvg = { version = "=0.47.0", default-features = false }
 base64 = "0.22"
 
+# ADR-045: macOS 27 rejects proc-macro dylibs produced by rustc's deferred
+# release-profile debuginfo stripping because their LINKEDIT string pool can
+# be only four-byte aligned. Build scripts and proc macros are temporary build
+# tools, so keep their Mach-O images unstripped. The hf2q workspace binary
+# remains on Cargo's normal optimized release profile.
+[profile.release.build-override]
+strip = "none"
+
 # ADR-008: vendored candle patches removed (candle no longer used for inference).
 
 # Local mlx-native development: place this in a gitignored .cargo/config.toml
