@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
-use super::{json_schema, parser, regex_gbnf, serialize, Grammar};
+use super::{Grammar, json_schema, parser, regex_gbnf, serialize};
 
 const MAX_CHAR_BOUND: u64 = 2_000;
-const MAX_DISPATCH_STATES: usize = 256;
+const MAX_DISPATCH_STATES: usize = 4_096;
 
 /// Compile either the current XGrammar object or vLLM's legacy structure.
 pub fn compile(payload: &Value) -> Result<Grammar, StructuralTagError> {
@@ -123,7 +123,7 @@ impl Lowerer {
             "tag" => self.tag(map),
             "triggered_tags" => self.triggered(map),
             "tags_with_separator" => self.tags_with_separator(map),
-            "dispatch" => Err(StructuralTagError::Unsupported("string dispatch requires a lazy trigger runtime and is not representable by this GBNF-only foundation".into())),
+            "dispatch" => self.dispatch(map),
             "token" | "exclude_token" | "any_tokens" | "token_triggered_tags" | "token_dispatch" => {
                 Err(StructuralTagError::NeedsTokenVocabulary(kind.to_owned()))
             }
@@ -191,18 +191,28 @@ impl Lowerer {
                 ));
             }
         }
-        if let Some(excludes) = map.get("excludes") {
-            if !strings(excludes, "any_text.excludes")?.is_empty() {
-                return Err(StructuralTagError::Unsupported(
-                    "any_text.excludes requires negative string matching".into(),
-                ));
-            }
-        }
-        let body = match map.get("max_chars") {
-            None | Some(Value::Null) => "[^\\x00]*".to_owned(),
-            Some(value) => format!("[^\\x00]{{0,{}}}", bounded(value, "any_text.max_chars")?),
+        let excludes = map
+            .get("excludes")
+            .map(|value| strings(value, "any_text.excludes"))
+            .transpose()?
+            .unwrap_or_default();
+        let max_chars = match map.get("max_chars") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(bounded(value, "any_text.max_chars")?),
         };
-        Ok(self.rule(body))
+        if excludes.is_empty() {
+            let body = match max_chars {
+                None => "[^\\x00]*".to_owned(),
+                Some(maximum) => format!("[^\\x00]{{0,{maximum}}}"),
+            };
+            return Ok(self.rule(body));
+        }
+        validate_scan_patterns(&[], &excludes)?;
+        let entry = {
+            let mut scanner = Scanner::new(self, Vec::new(), &[], &excludes, false, max_chars)?;
+            scanner.start(false)?
+        };
+        Ok(self.rule(entry))
     }
 
     fn list(&mut self, map: &Map<String, Value>, kind: &str) -> Result<String, StructuralTagError> {
@@ -321,11 +331,7 @@ impl Lowerer {
         let required = optional_bool(map, "at_least_one", false, "tags_with_separator")?;
         let stop = optional_bool(map, "stop_after_first", false, "tags_with_separator")?;
         let body = if stop {
-            if required {
-                tags
-            } else {
-                format!("{tags}?")
-            }
+            if required { tags } else { format!("{tags}?") }
         } else if required {
             format!("{tags} ({separator} {tags})*")
         } else {
@@ -374,7 +380,7 @@ impl Lowerer {
                 .to_owned(),
             });
         }
-        self.string_triggered(tags, triggers, false, false)
+        self.string_triggered(tags, triggers, &[], false, false)
     }
 
     fn triggered(&mut self, map: &Map<String, Value>) -> Result<String, StructuralTagError> {
@@ -390,13 +396,11 @@ impl Lowerer {
             ],
             "triggered_tags",
         )?;
-        if let Some(excludes) = map.get("excludes") {
-            if !strings(excludes, "triggered_tags.excludes")?.is_empty() {
-                return Err(StructuralTagError::Unsupported(
-                    "triggered_tags.excludes requires negative string matching".into(),
-                ));
-            }
-        }
+        let excludes = map
+            .get("excludes")
+            .map(|value| strings(value, "triggered_tags.excludes"))
+            .transpose()?
+            .unwrap_or_default();
         let triggers = strings(
             required(map, "triggers", "triggered_tags")?,
             "triggered_tags.triggers",
@@ -425,8 +429,49 @@ impl Lowerer {
         self.string_triggered(
             tags,
             &triggers,
+            &excludes,
             optional_bool(map, "at_least_one", false, "triggered_tags")?,
             optional_bool(map, "stop_after_first", false, "triggered_tags")?,
+        )
+    }
+
+    fn dispatch(&mut self, map: &Map<String, Value>) -> Result<String, StructuralTagError> {
+        exact_keys(map, &["type", "rules", "loop", "excludes"], "dispatch")?;
+        let rules = array(required(map, "rules", "dispatch")?, "dispatch.rules")?;
+        if rules.is_empty() {
+            return Err(StructuralTagError::Invalid(
+                "dispatch.rules must not be empty".into(),
+            ));
+        }
+        let mut triggers = Vec::with_capacity(rules.len());
+        let mut tags = Vec::with_capacity(rules.len());
+        for (index, rule) in rules.iter().enumerate() {
+            let pair = array(rule, &format!("dispatch.rules/{index}"))?;
+            if pair.len() != 2 {
+                return Err(StructuralTagError::Invalid(format!(
+                    "dispatch.rules/{index} must contain [pattern, format]"
+                )));
+            }
+            let pattern = string(&pair[0], &format!("dispatch.rules/{index}/0"))?.to_owned();
+            let content = self.format(&pair[1])?;
+            triggers.push(pattern.clone());
+            tags.push(TagSpec {
+                begin: pattern,
+                content,
+                end: String::new(),
+            });
+        }
+        let excludes = map
+            .get("excludes")
+            .map(|value| strings(value, "dispatch.excludes"))
+            .transpose()?
+            .unwrap_or_default();
+        self.string_triggered(
+            tags,
+            &triggers,
+            &excludes,
+            false,
+            !optional_bool(map, "loop", true, "dispatch")?,
         )
     }
 
@@ -434,17 +479,14 @@ impl Lowerer {
         &mut self,
         tags: Vec<TagSpec>,
         triggers: &[String],
+        excludes: &[String],
         at_least_one: bool,
         stop_after_first: bool,
     ) -> Result<String, StructuralTagError> {
         validate_trigger_topology(&tags, triggers)?;
-        let mut scanner = Scanner::new(self, tags, triggers, stop_after_first)?;
-        let free_start = scanner.state("")?;
-        let required_start = if at_least_one {
-            scanner.initial_tag_alternatives()?
-        } else {
-            free_start
-        };
+        validate_scan_patterns(triggers, excludes)?;
+        let mut scanner = Scanner::new(self, tags, triggers, excludes, stop_after_first, None)?;
+        let required_start = scanner.start(at_least_one)?;
         Ok(self.rule(required_start))
     }
 }
@@ -460,8 +502,10 @@ struct Scanner<'a> {
     lowerer: &'a mut Lowerer,
     tags: Vec<TagSpec>,
     triggers: Vec<String>,
+    excludes: Vec<String>,
     stop: bool,
-    states: BTreeMap<String, String>,
+    max_chars: Option<u64>,
+    states: BTreeMap<(String, Option<u64>), String>,
 }
 
 impl<'a> Scanner<'a> {
@@ -469,9 +513,17 @@ impl<'a> Scanner<'a> {
         lowerer: &'a mut Lowerer,
         tags: Vec<TagSpec>,
         triggers: &[String],
+        excludes: &[String],
         stop: bool,
+        max_chars: Option<u64>,
     ) -> Result<Self, StructuralTagError> {
-        let state_count = triggers.iter().map(|t| t.chars().count()).sum::<usize>();
+        let state_count = triggers
+            .iter()
+            .chain(excludes)
+            .map(|pattern| pattern.chars().count().max(1))
+            .sum::<usize>()
+            .max(1)
+            .saturating_mul(max_chars.map_or(1, |maximum| maximum as usize + 1));
         if state_count > MAX_DISPATCH_STATES {
             return Err(StructuralTagError::Invalid(format!(
                 "trigger prefix automaton exceeds {MAX_DISPATCH_STATES} states"
@@ -481,25 +533,52 @@ impl<'a> Scanner<'a> {
             lowerer,
             tags,
             triggers: triggers.to_vec(),
+            excludes: excludes.to_vec(),
             stop,
+            max_chars,
             states: BTreeMap::new(),
         })
     }
-    fn state(&mut self, prefix: &str) -> Result<String, StructuralTagError> {
-        if let Some(name) = self.states.get(prefix) {
+    fn patterns(&self) -> impl Iterator<Item = &String> {
+        self.triggers.iter().chain(&self.excludes)
+    }
+    fn start(&mut self, at_least_one: bool) -> Result<String, StructuralTagError> {
+        if at_least_one {
+            self.initial_tag_alternatives()
+        } else if self.excludes.iter().any(String::is_empty) {
+            Ok("\"\"".to_owned())
+        } else {
+            self.state("", self.max_chars)
+        }
+    }
+    fn state(
+        &mut self,
+        prefix: &str,
+        remaining: Option<u64>,
+    ) -> Result<String, StructuralTagError> {
+        let key = (prefix.to_owned(), remaining);
+        if let Some(name) = self.states.get(&key) {
             return Ok(name.clone());
         }
         let name = format!("dispatch-{}", self.lowerer.next);
         self.lowerer.next += 1;
-        self.states.insert(prefix.to_owned(), name.clone());
-        let body = self.state_body(prefix)?;
+        self.states.insert(key, name.clone());
+        let body = self.state_body(prefix, remaining)?;
         self.lowerer.rules.push((name.clone(), body));
         Ok(name)
     }
-    fn state_body(&mut self, prefix: &str) -> Result<String, StructuralTagError> {
+    fn state_body(
+        &mut self,
+        prefix: &str,
+        remaining: Option<u64>,
+    ) -> Result<String, StructuralTagError> {
+        if remaining == Some(0) {
+            return Ok("\"\"".to_owned());
+        }
+        let next_remaining = remaining.map(|value| value - 1);
         let mut chars = BTreeSet::new();
-        for trigger in &self.triggers {
-            if let Some(ch) = next_prefix_char(prefix, trigger) {
+        for pattern in self.patterns() {
+            if let Some(ch) = next_prefix_char(prefix, pattern) {
                 chars.insert(ch);
             }
         }
@@ -507,17 +586,22 @@ impl<'a> Scanner<'a> {
         let mut transitions: BTreeMap<String, Vec<char>> = BTreeMap::new();
         for ch in chars.iter().copied() {
             let emitted = format!("{prefix}{ch}");
-            let completed = self
+            let completed_triggers = self
                 .triggers
                 .iter()
                 .filter(|trigger| emitted.ends_with(*trigger))
                 .cloned()
                 .collect::<Vec<_>>();
-            if completed.is_empty() {
-                let next = longest_prefix_suffix(&emitted, &self.triggers);
+            let completed_exclusion = self
+                .excludes
+                .iter()
+                .any(|exclude| emitted.ends_with(exclude));
+            if completed_triggers.is_empty() && !completed_exclusion {
+                let patterns = self.patterns().cloned().collect::<Vec<_>>();
+                let next = longest_prefix_suffix(&emitted, &patterns);
                 transitions.entry(next).or_default().push(ch);
-            } else {
-                for trigger in completed {
+            } else if !completed_exclusion {
+                for trigger in completed_triggers {
                     branches.extend(self.tag_for_trigger(&trigger)?);
                 }
             }
@@ -526,13 +610,13 @@ impl<'a> Scanner<'a> {
             branches.push(format!(
                 "{} {}",
                 char_expression(&chars, false)?,
-                self.state(&next)?
+                self.state(&next, next_remaining)?
             ));
         }
         branches.push(format!(
             "{} {}",
             char_expression(&chars.into_iter().collect::<Vec<_>>(), true)?,
-            self.state("")?
+            self.state("", next_remaining)?
         ));
         branches.push("\"\"".into());
         Ok(format!("( {} )", branches.join(" | ")))
@@ -543,7 +627,8 @@ impl<'a> Scanner<'a> {
             let tail = if self.stop {
                 "\"\"".to_owned()
             } else {
-                self.state(&longest_prefix_suffix(&tag.end, &self.triggers))?
+                let patterns = self.patterns().cloned().collect::<Vec<_>>();
+                self.state(&longest_prefix_suffix(&tag.end, &patterns), self.max_chars)?
             };
             alternatives.push(format!(
                 "{} {} {} {}",
@@ -573,7 +658,8 @@ impl<'a> Scanner<'a> {
                 let tail = if self.stop {
                     "\"\"".to_owned()
                 } else {
-                    self.state(&longest_prefix_suffix(&tag.end, &self.triggers))?
+                    let patterns = self.patterns().cloned().collect::<Vec<_>>();
+                    self.state(&longest_prefix_suffix(&tag.end, &patterns), self.max_chars)?
                 };
                 out.push(format!(
                     "{} {} {} {}",
@@ -607,6 +693,35 @@ fn validate_trigger_topology(
                 "tag begin '{}' must match exactly one trigger",
                 tag.begin
             )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_scan_patterns(
+    triggers: &[String],
+    excludes: &[String],
+) -> Result<(), StructuralTagError> {
+    let patterns = triggers
+        .iter()
+        .map(|pattern| (pattern, "trigger"))
+        .chain(excludes.iter().map(|pattern| (pattern, "exclusion")))
+        .filter(|(pattern, _)| !pattern.is_empty())
+        .collect::<Vec<_>>();
+    for (pattern, kind) in &patterns {
+        if pattern.contains('\0') {
+            return Err(StructuralTagError::Invalid(format!(
+                "{kind} patterns must not contain NUL"
+            )));
+        }
+    }
+    for (index, (left, _)) in patterns.iter().enumerate() {
+        for (right, _) in patterns.iter().skip(index + 1) {
+            if left.starts_with(right.as_str()) || right.starts_with(left.as_str()) {
+                return Err(StructuralTagError::Invalid(format!(
+                    "trigger and exclusion patterns must be distinct and prefix-free: {left:?}, {right:?}"
+                )));
+            }
         }
     }
     Ok(())
@@ -703,13 +818,13 @@ fn char_expression(chars: &[char], negated: bool) -> Result<String, StructuralTa
             '\0' => {
                 return Err(StructuralTagError::Invalid(
                     "NUL trigger unsupported".into(),
-                ))
+                ));
             }
             _ => inner.push(*ch),
         }
     }
     Ok(if negated {
-        format!("[^{}]", inner)
+        format!("[^\\x00{}]", inner)
     } else if chars.len() == 1 {
         literal(&chars[0].to_string())?
     } else {
@@ -867,6 +982,51 @@ mod tests {
         assert!(compile(&forced).is_ok());
         let separated = json!({"type":"structural_tag","format":{"type":"tags_with_separator","tags":[{"type":"tag","begin":"<x>","content":{"type":"const_string","value":"x"},"end":"</x>"}],"separator":","}});
         assert!(compile(&separated).is_ok());
+    }
+
+    #[test]
+    fn any_text_exclusions_and_character_budget_are_exact() {
+        let value = json!({
+            "type":"structural_tag",
+            "format":{"type":"any_text","excludes":["STOP"],"max_chars":5}
+        });
+        let grammar = compile(&value).unwrap();
+        assert!(accepts(grammar.clone(), "hello"));
+        assert!(!accepts(grammar.clone(), "sixsix"));
+        assert!(!accepts(grammar, "STOP"));
+    }
+
+    #[test]
+    fn string_dispatch_constrains_matched_content_and_honors_exclusions() {
+        let value = json!({
+            "type":"structural_tag",
+            "format":{
+                "type":"dispatch",
+                "rules":[["<call>",{"type":"const_string","value":"ok"}]],
+                "loop":true,
+                "excludes":["BLOCK"]
+            }
+        });
+        let grammar = compile(&value).unwrap();
+        assert!(accepts(grammar.clone(), "free<call>oktail"));
+        assert!(!accepts(grammar.clone(), "free<call>nope"));
+        assert!(!accepts(grammar, "freeBLOCKtail"));
+    }
+
+    #[test]
+    fn triggered_tags_honor_free_text_exclusions() {
+        let value = json!({
+            "type":"structural_tag",
+            "format":{
+                "type":"triggered_tags",
+                "triggers":["<call>"],
+                "tags":[{"type":"tag","begin":"<call>","content":{"type":"const_string","value":"ok"},"end":"</call>"}],
+                "excludes":["BLOCK"]
+            }
+        });
+        let grammar = compile(&value).unwrap();
+        assert!(accepts(grammar.clone(), "free<call>ok</call>tail"));
+        assert!(!accepts(grammar, "freeBLOCKtail"));
     }
 
     #[test]
