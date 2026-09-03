@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use mlx_native::MlxBuffer;
 
 use crate::serve::api::engine::{
-    effective_repetition_penalty, grammar_runtime_for_request, sample_logits_with_grammar,
-    GenerationResult, GrammarKind, SamplingParams,
+    accept_grammar_token, effective_repetition_penalty, grammar_runtime_for_request,
+    sample_logits_with_grammar, GenerationResult, GrammarKind, SamplingParams,
 };
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::grammar::GrammarRuntime;
@@ -77,6 +77,7 @@ fn sample_cpu_logits(
     sampler: &sampler_pure::SamplingParams,
     previous: &[u32],
     runtime: Option<&GrammarRuntime>,
+    eog_token_ids: &[u32],
 ) -> Result<(u32, Option<f32>)> {
     sample_logits_with_grammar(
         values,
@@ -84,6 +85,7 @@ fn sample_cpu_logits(
         previous,
         runtime,
         params.token_bytes.as_deref().map(Vec::as_slice),
+        eog_token_ids,
         params.logprobs,
     )
 }
@@ -121,15 +123,20 @@ pub(super) fn sample(
             *logit += bias;
         }
     }
-    let (token, logprob) =
-        sample_cpu_logits(&mut values, params, sampler, previous, runtime.as_ref())?;
-    if let (Some(runtime), Some(token_bytes)) = (runtime.as_mut(), params.token_bytes.as_deref()) {
-        if let Some(bytes) = token_bytes.get(token as usize) {
-            if !bytes.is_empty() {
-                runtime.accept_bytes(bytes);
-            }
-        }
-    }
+    let (token, logprob) = sample_cpu_logits(
+        &mut values,
+        params,
+        sampler,
+        previous,
+        runtime.as_ref(),
+        &loaded.eos_token_ids,
+    )?;
+    accept_grammar_token(
+        runtime,
+        params.token_bytes.as_deref().map(Vec::as_slice),
+        &loaded.eos_token_ids,
+        token,
+    )?;
     Ok((token, logprob))
 }
 
@@ -156,7 +163,7 @@ pub(super) fn accept_forced_token(
         !bytes.is_empty(),
         "DeepSeek-V4 forced reasoning token {token} has no wire bytes"
     );
-    runtime.accept_bytes(bytes);
+    runtime.accept_token(token, bytes);
     anyhow::ensure!(
         !runtime.is_dead(),
         "DeepSeek-V4 forced reasoning close made the tool grammar dead"
@@ -377,7 +384,7 @@ mod tests {
             let runtime = grammar_runtime(&params, None).expect("runtime");
             let mut logits = vec![10.0, 9.0, 8.0];
             assert!(
-                sample_cpu_logits(&mut logits, &params, &sampler, &[], runtime.as_ref(),)
+                sample_cpu_logits(&mut logits, &params, &sampler, &[], runtime.as_ref(), &[])
                     .expect_err("table length mismatch must fail")
                     .to_string()
                     .contains("logits vocabulary")
@@ -389,7 +396,7 @@ mod tests {
         let runtime = grammar_runtime(&params, None).expect("runtime");
         let mut logits = vec![10.0, 9.0, 8.0];
         let (token, logprob) =
-            sample_cpu_logits(&mut logits, &params, &sampler, &[], runtime.as_ref())
+            sample_cpu_logits(&mut logits, &params, &sampler, &[], runtime.as_ref(), &[])
                 .expect("exact table");
         assert_eq!(token, 1);
         assert_eq!(logprob, None);

@@ -142,6 +142,14 @@ fn write_rule(
                 let _ = write!(out, "{} ", ref_name);
                 alt_is_empty = false;
             }
+            GretType::Token => {
+                let _ = write!(out, "<[{}]> ", elem.value);
+                alt_is_empty = false;
+            }
+            GretType::TokenNot => {
+                let _ = write!(out, "!<[{}]> ", elem.value);
+                alt_is_empty = false;
+            }
             GretType::Char => {
                 let _ = write!(out, "[");
                 write_char(out, elem.value, /* in_class = */ true);
@@ -431,6 +439,14 @@ mod tests {
     #[test]
     fn parser_round_trip_simple_grammar() {
         roundtrip("root ::= \"hi\"\n");
+    }
+
+    #[test]
+    fn token_terminals_serialize_to_canonical_numeric_ids() {
+        let grammar = parse("root ::= <[10]> !<[11]>\n").expect("parse token grammar");
+        let text = serialize(&grammar);
+        assert_eq!(text, "root ::= <[10]> !<[11]> \n");
+        assert_eq!(parse(&text).expect("reparse"), grammar);
     }
 
     /// Spec test #2: the wave-2.5 audit's failing case literally.

@@ -36,9 +36,9 @@ use crate::core::provenance::{self, Provenance};
 use crate::serve::multi_seq_kv::SlotId;
 
 use super::engine::{
-    effective_repetition_penalty, grammar_runtime_for_request, sample_logits_with_grammar,
-    supervised_gpu_call, DeepstackData, LoadOptions, SamplingParams, SerialStreamEnd,
-    SerialStreamResult, SoftTokenData, ToolCallPolicy,
+    accept_grammar_token, effective_repetition_penalty, grammar_runtime_for_request,
+    sample_logits_with_grammar, supervised_gpu_call, DeepstackData, LoadOptions, SamplingParams,
+    SerialStreamEnd, SerialStreamResult, SoftTokenData, ToolCallPolicy,
 };
 use super::engine_supervisor::EngineSupervisor;
 
@@ -1517,6 +1517,7 @@ fn sample_logits_qwen35_constrained(
     params: &SamplingParams,
     generated: &[u32],
     runtime: Option<&super::grammar::GrammarRuntime>,
+    eog_token_ids: &[u32],
     want_logprobs: bool,
 ) -> Result<(u32, Option<f32>)> {
     for (&token, &bias) in &params.logit_bias {
@@ -1539,6 +1540,7 @@ fn sample_logits_qwen35_constrained(
         generated,
         runtime,
         params.token_bytes.as_deref().map(Vec::as_slice),
+        eog_token_ids,
         want_logprobs,
     )
 }
@@ -1546,15 +1548,15 @@ fn sample_logits_qwen35_constrained(
 fn advance_qwen35_grammar(
     runtime: &mut Option<super::grammar::GrammarRuntime>,
     params: &SamplingParams,
+    eog_token_ids: &[u32],
     token: u32,
-) {
-    if let (Some(runtime), Some(token_bytes)) = (runtime.as_mut(), params.token_bytes.as_deref()) {
-        if let Some(bytes) = token_bytes.get(token as usize) {
-            if !bytes.is_empty() {
-                runtime.accept_bytes(bytes);
-            }
-        }
-    }
+) -> Result<()> {
+    accept_grammar_token(
+        runtime,
+        params.token_bytes.as_deref().map(Vec::as_slice),
+        eog_token_ids,
+        token,
+    )
 }
 
 fn qwen35_grammar_terminal_token(
@@ -2557,6 +2559,7 @@ fn generate_qwen35_once_ordinary(
                 params,
                 &[],
                 grammar_runtime.as_ref(),
+                &qwen.eos_token_ids,
                 want_logprobs,
             )?;
             next_token = token;
@@ -2564,7 +2567,12 @@ fn generate_qwen35_once_ordinary(
                 values.push(logprob);
             }
         }
-        advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
+        advance_qwen35_grammar(
+            &mut grammar_runtime,
+            params,
+            &qwen.eos_token_ids,
+            next_token,
+        )?;
 
         // Snapshot + cache update.  The snapshot captures KV state AFTER
         // the prefill (current_len[0] == prompt_len for full-attn slots;
@@ -2705,6 +2713,7 @@ fn generate_qwen35_once_ordinary(
                     params,
                     &generated_tokens,
                     grammar_runtime.as_ref(),
+                    &qwen.eos_token_ids,
                     want_logprobs,
                 )?;
                 if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
@@ -2712,7 +2721,12 @@ fn generate_qwen35_once_ordinary(
                 }
                 token
             };
-            advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
+            advance_qwen35_grammar(
+                &mut grammar_runtime,
+                params,
+                &qwen.eos_token_ids,
+                next_token,
+            )?;
 
             if qwen.eos_token_ids.contains(&next_token) {
                 finish_reason = "stop";
@@ -4417,11 +4431,17 @@ impl Qwen35SpecSemanticState {
                 params,
                 &self.sampling_history,
                 self.grammar_runtime.as_ref(),
+                &qwen.eos_token_ids,
                 false,
             )?
             .0
         };
-        advance_qwen35_grammar(&mut self.grammar_runtime, params, token);
+        advance_qwen35_grammar(
+            &mut self.grammar_runtime,
+            params,
+            &qwen.eos_token_ids,
+            token,
+        )?;
         let terminal = qwen.eos_token_ids.contains(&token)
             || qwen35_grammar_terminal_token(self.grammar_runtime.as_ref(), params, token);
         if terminal {
@@ -4616,6 +4636,7 @@ impl Qwen35DecodeState {
                 &params,
                 &sampling_history,
                 grammar_runtime.as_ref(),
+                &qwen.eos_token_ids,
                 want_logprobs,
             )?;
             if let (Some(values), Some(logprob)) = (logprobs_vec.as_mut(), logprob) {
@@ -4623,7 +4644,12 @@ impl Qwen35DecodeState {
             }
             token
         };
-        advance_qwen35_grammar(&mut grammar_runtime, &params, next_token);
+        advance_qwen35_grammar(
+            &mut grammar_runtime,
+            &params,
+            &qwen.eos_token_ids,
+            next_token,
+        )?;
 
         let mut generated_tokens = Vec::with_capacity(max_tokens);
         generated_tokens.push(next_token);
@@ -4891,6 +4917,7 @@ impl Qwen35DecodeState {
                     &self.params,
                     &self.sampling_history,
                     self.grammar_runtime.as_ref(),
+                    &qwen.eos_token_ids,
                     self.want_logprobs,
                 )?
             };
@@ -4904,7 +4931,12 @@ impl Qwen35DecodeState {
             .observe_ordinary_target(ordinary_target_elapsed);
         self.history_cost
             .observe_ordinary_target(ordinary_target_elapsed);
-        advance_qwen35_grammar(&mut self.grammar_runtime, &self.params, tok);
+        advance_qwen35_grammar(
+            &mut self.grammar_runtime,
+            &self.params,
+            &qwen.eos_token_ids,
+            tok,
+        )?;
         if qwen.eos_token_ids.contains(&tok) {
             self.finish_reason = "stop";
             return Ok(Qwen35TickOutcome {
@@ -5880,7 +5912,12 @@ impl Qwen35DecodeState {
                 );
             }
         }
-        advance_qwen35_grammar(&mut self.grammar_runtime, &self.params, token);
+        advance_qwen35_grammar(
+            &mut self.grammar_runtime,
+            &self.params,
+            &qwen.eos_token_ids,
+            token,
+        )?;
         if qwen35_grammar_terminal_token(self.grammar_runtime.as_ref(), &self.params, token) {
             self.finish_reason = "stop";
             return Ok(Qwen35TickOutcome {
@@ -8009,11 +8046,17 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 params,
                 &[],
                 grammar_runtime.as_ref(),
+                &qwen.eos_token_ids,
                 false,
             )?
             .0;
         }
-        advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
+        advance_qwen35_grammar(
+            &mut grammar_runtime,
+            params,
+            &qwen.eos_token_ids,
+            next_token,
+        )?;
         // The image fingerprint in `HybridPromptCacheKey` makes a
         // vision-tainted snapshot safe and reusable only for the exact same
         // image embeddings. Generic extension callers without that digest
@@ -8324,6 +8367,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                             params,
                             &generated_tokens,
                             grammar_runtime.as_ref(),
+                            &qwen.eos_token_ids,
                             false,
                         )?
                         .0;
@@ -8339,7 +8383,12 @@ pub(super) fn generate_stream_qwen35_once_extended(
                         .with_context(|| format!("Qwen35 SerialFifo stream decode step {step}"));
                 }
             };
-            advance_qwen35_grammar(&mut grammar_runtime, params, next_token);
+            advance_qwen35_grammar(
+                &mut grammar_runtime,
+                params,
+                &qwen.eos_token_ids,
+                next_token,
+            )?;
             if qwen.eos_token_ids.contains(&next_token) {
                 finish_reason = "stop";
                 break;
@@ -9874,7 +9923,7 @@ mod tests {
         logits[17] = 10.0;
         logits[3] = 9.9;
         let (token, _) =
-            sample_logits_qwen35_constrained(&mut logits, &params, &history, None, false)
+            sample_logits_qwen35_constrained(&mut logits, &params, &history, None, &[], false)
                 .expect("prompt-aware repetition sample");
         assert_eq!(
             token, 3,
@@ -10060,7 +10109,7 @@ mod tests {
         let mut logits = vec![100.0, 1.0];
 
         let (token, logprob) =
-            sample_logits_qwen35_constrained(&mut logits, &params, &[], Some(&runtime), false)
+            sample_logits_qwen35_constrained(&mut logits, &params, &[], Some(&runtime), &[], false)
                 .expect("valid grammar/table invariant");
 
         assert_eq!(token, 1);
@@ -10098,6 +10147,7 @@ mod tests {
             &[],
             Some(&runtime),
             params.token_bytes.as_deref().map(Vec::as_slice),
+            &[],
             false,
         )
         .expect_err("short token table must fail closed");
@@ -10116,6 +10166,7 @@ mod tests {
             &[],
             Some(&runtime),
             params.token_bytes.as_deref().map(Vec::as_slice),
+            &[],
             false,
         )
         .expect_err("long token table must fail closed");

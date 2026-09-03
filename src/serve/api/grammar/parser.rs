@@ -33,6 +33,8 @@ pub enum GretType {
     CharRngUpper = 5,
     CharAlt = 6,
     CharAny = 7,
+    Token = 8,
+    TokenNot = 9,
 }
 
 impl GretType {
@@ -49,8 +51,9 @@ impl GretType {
 }
 
 /// A single grammar element: a type + a 32-bit value interpreted per type.
-/// For `Char*` types `value` is a Unicode code point; for `RuleRef` it's a
-/// rule id; for `End` / `Alt` / `CharAny` it's unused (stored as 0).
+/// For `Char*` types `value` is a Unicode code point, for `RuleRef` it is a
+/// rule id, and for `Token` / `TokenNot` it is a tokenizer token id. For
+/// `End` / `Alt` / `CharAny` it is unused (stored as 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GretElement {
     pub ty: GretType,
@@ -120,9 +123,69 @@ const MAX_REPETITION_THRESHOLD: u64 = 2000;
 
 /// Parse a GBNF grammar string. Returns `Err(ParseError)` on malformed input.
 pub fn parse(src: &str) -> Result<Grammar, ParseError> {
+    parse_impl(src, None)
+}
+
+/// Parse GBNF with a model-bound textual token resolver.
+///
+/// Numeric `<[id]>` forms bypass the resolver. For textual forms, `resolver`
+/// receives the complete bracketed lexeme (for example `<think>`) and must
+/// return exactly one tokenizer token id or a diagnostic explaining why the
+/// lexeme is not one token. This mirrors llama.cpp's `add_special=false,
+/// parse_special=true` single-token requirement without coupling the grammar
+/// module to one tokenizer implementation.
+pub fn parse_with_token_resolver<F>(src: &str, mut resolver: F) -> Result<Grammar, ParseError>
+where
+    F: FnMut(&str) -> Result<u32, String>,
+{
+    parse_impl(src, Some(&mut resolver))
+}
+
+/// Resolve token terminals against a concrete Hugging Face tokenizer.
+/// Added/special textual tokens remain parseable while BOS/EOS processors are
+/// disabled, a textual lexeme that produces zero or multiple ids is rejected,
+/// and every resulting numeric token id must exist in this vocabulary.
+pub fn parse_with_tokenizer(
+    src: &str,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<Grammar, ParseError> {
+    let grammar = parse_with_token_resolver(src, |lexeme| {
+        let encoding = tokenizer
+            .encode(lexeme, false)
+            .map_err(|error| error.to_string())?;
+        match encoding.get_ids() {
+            [token_id] => Ok(*token_id),
+            ids => Err(format!(
+                "must resolve to exactly one token id, resolved {}",
+                ids.len()
+            )),
+        }
+    })?;
+
+    if let Some(invalid) = grammar.rules.iter().flatten().find(|element| {
+        matches!(element.ty, GretType::Token | GretType::TokenNot)
+            && tokenizer.id_to_token(element.value).is_none()
+    }) {
+        return Err(ParseError {
+            offset: 0,
+            message: format!(
+                "token id {} is not present in the bound tokenizer vocabulary",
+                invalid.value
+            ),
+        });
+    }
+
+    Ok(grammar)
+}
+
+fn parse_impl(
+    src: &str,
+    token_resolver: Option<&mut dyn FnMut(&str) -> Result<u32, String>>,
+) -> Result<Grammar, ParseError> {
     let bytes = src.as_bytes();
     let mut state = ParserState {
         bytes,
+        token_resolver,
         symbol_ids: HashMap::new(),
         rules: Vec::new(),
     };
@@ -272,13 +335,14 @@ fn has_nullable_alternative(rule: &[GretElement], nullable: &[bool]) -> bool {
 // Parser state & internal methods
 // ---------------------------------------------------------------------------
 
-struct ParserState<'a> {
+struct ParserState<'a, 'r> {
     bytes: &'a [u8],
+    token_resolver: Option<&'r mut dyn FnMut(&str) -> Result<u32, String>>,
     symbol_ids: HashMap<String, u32>,
     rules: Vec<Vec<GretElement>>,
 }
 
-impl<'a> ParserState<'a> {
+impl<'a, 'r> ParserState<'a, 'r> {
     fn get_or_create_symbol(&mut self, name: String) -> u32 {
         let next_id = self.symbol_ids.len() as u32;
         let entry = self.symbol_ids.entry(name).or_insert(next_id);
@@ -460,6 +524,21 @@ impl<'a> ParserState<'a> {
                     });
                 }
                 pos = parse_space(self.bytes, pos + 1, is_nested);
+            } else if c == b'<' || c == b'!' {
+                // Token terminal. Numeric token ids do not require a
+                // tokenizer/vocabulary binding and are therefore accepted by
+                // the standalone parser exactly as llama.cpp accepts them.
+                let ty = if c == b'!' {
+                    pos += 1;
+                    GretType::TokenNot
+                } else {
+                    GretType::Token
+                };
+                let (token_id, token_end) = self.parse_token(pos)?;
+                last_sym_start = rule.len();
+                n_prev_rules = 1;
+                rule.push(GretElement::new(ty, token_id));
+                pos = parse_space(self.bytes, token_end, is_nested);
             } else if is_word_char(c) {
                 // Rule reference.
                 let name_end = parse_name(self.bytes, pos)?;
@@ -604,6 +683,44 @@ impl<'a> ParserState<'a> {
             }
         }
         Ok(pos)
+    }
+
+    fn parse_token(&mut self, start: usize) -> Result<(u32, usize), ParseError> {
+        if self.bytes.get(start) != Some(&b'<') {
+            return Err(ParseError {
+                offset: start,
+                message: "expecting '<' for token terminal".into(),
+            });
+        }
+        if self.bytes.get(start + 1) == Some(&b'[') {
+            return parse_explicit_token_id(self.bytes, start);
+        }
+
+        let close = self.bytes[start + 1..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .map(|relative| start + 1 + relative)
+            .ok_or_else(|| ParseError {
+                offset: self.bytes.len(),
+                message: "expecting '>' after textual token".into(),
+            })?;
+        let lexeme = std::str::from_utf8(&self.bytes[start..=close])
+            .map_err(|_| ParseError {
+                offset: start,
+                message: "textual token terminal is not valid UTF-8".into(),
+            })?
+            .to_string();
+        let Some(resolver) = self.token_resolver.as_mut() else {
+            return Err(ParseError {
+                offset: start,
+                message: "textual token terminal requires a tokenizer resolver".into(),
+            });
+        };
+        let token_id = resolver(&lexeme).map_err(|message| ParseError {
+            offset: start,
+            message: format!("invalid textual token {lexeme:?}: {message}"),
+        })?;
+        Ok((token_id, close + 1))
     }
 
     // --- repetition expansion ---
@@ -761,6 +878,47 @@ fn parse_int(bytes: &[u8], start: usize) -> Result<usize, ParseError> {
     Ok(pos)
 }
 
+/// Parse llama.cpp's vocabulary-independent numeric token form `<[id]>`.
+/// Textual `<token>` forms require a tokenizer binding and are intentionally
+/// rejected by this standalone parser instead of being guessed from text.
+fn parse_explicit_token_id(bytes: &[u8], start: usize) -> Result<(u32, usize), ParseError> {
+    if bytes.get(start) != Some(&b'<') {
+        return Err(ParseError {
+            offset: start,
+            message: "expecting '<' for token terminal".into(),
+        });
+    }
+    let id_start = start + 2;
+    if bytes.get(start + 1) != Some(&b'[') {
+        return Err(ParseError {
+            offset: start + 1,
+            message: "textual token terminal requires a tokenizer resolver; expecting '[id]'"
+                .into(),
+        });
+    }
+    let id_end = parse_int(bytes, id_start)?;
+    let id = std::str::from_utf8(&bytes[id_start..id_end])
+        .ok()
+        .and_then(|text| text.parse::<u32>().ok())
+        .ok_or_else(|| ParseError {
+            offset: id_start,
+            message: "token id is outside the u32 range".into(),
+        })?;
+    if bytes.get(id_end) != Some(&b']') {
+        return Err(ParseError {
+            offset: id_end,
+            message: "expecting ']' after token id".into(),
+        });
+    }
+    if bytes.get(id_end + 1) != Some(&b'>') {
+        return Err(ParseError {
+            offset: id_end + 1,
+            message: "expecting '>' after token id".into(),
+        });
+    }
+    Ok((id, id_end + 2))
+}
+
 /// Parse `N` hex digits starting at `pos`. Returns the decoded value.
 fn parse_hex(bytes: &[u8], pos: usize, n: usize) -> Result<(u32, usize), ParseError> {
     let mut value: u32 = 0;
@@ -903,6 +1061,115 @@ mod tests {
             ][..]
         );
         assert_eq!(r[5], GretElement::new(GretType::End, 0));
+    }
+
+    #[test]
+    fn explicit_token_terminals_match_llama_cpp_encoding() {
+        let g = parse_ok("root ::= <[1000]> !<[1001]> <[1001]>\n");
+        assert_eq!(
+            g.rules[0],
+            vec![
+                GretElement::new(GretType::Token, 1000),
+                GretElement::new(GretType::TokenNot, 1001),
+                GretElement::new(GretType::Token, 1001),
+                GretElement::new(GretType::End, 0),
+            ]
+        );
+        assert_eq!(GretType::Token as u8, 8);
+        assert_eq!(GretType::TokenNot as u8, 9);
+    }
+
+    #[test]
+    fn explicit_token_terminal_rejects_malformed_ids() {
+        for src in [
+            "root ::= <[]>\n",
+            "root ::= <[x]>\n",
+            "root ::= <[10>\n",
+            "root ::= <[10]\n",
+            "root ::= ! [10]\n",
+        ] {
+            assert!(parse(src).is_err(), "malformed token parsed: {src:?}");
+        }
+    }
+
+    #[test]
+    fn textual_token_terminals_use_model_bound_resolver() {
+        let mut seen = Vec::new();
+        let grammar = parse_with_token_resolver(
+            "root ::= <think> !</think>\n",
+            |lexeme| -> Result<u32, String> {
+                seen.push(lexeme.to_string());
+                match lexeme {
+                    "<think>" => Ok(10),
+                    "</think>" => Ok(11),
+                    _ => Err(format!("not one tokenizer token: {lexeme}")),
+                }
+            },
+        )
+        .expect("resolved textual tokens");
+
+        assert_eq!(seen, vec!["<think>", "</think>"]);
+        assert_eq!(
+            grammar.rules[0],
+            vec![
+                GretElement::new(GretType::Token, 10),
+                GretElement::new(GretType::TokenNot, 11),
+                GretElement::new(GretType::End, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn textual_token_terminal_fails_closed_without_or_from_resolver() {
+        let missing = parse("root ::= <think>\n").expect_err("resolver is required");
+        assert!(missing.message.contains("resolver"));
+
+        let rejected = parse_with_token_resolver("root ::= <two-tokens>\n", |_lexeme| {
+            Err::<u32, _>("must resolve to exactly one token".to_string())
+        })
+        .expect_err("resolver rejection must surface");
+        assert!(rejected.message.contains("exactly one token"));
+    }
+
+    #[test]
+    fn textual_tokenizer_binding_resolves_registered_special_tokens() {
+        use tokenizers::{models::bpe::BPE, AddedToken, Tokenizer};
+
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        tokenizer.add_special_tokens(&[
+            AddedToken::from("<think>".to_string(), true),
+            AddedToken::from("</think>".to_string(), true),
+        ]);
+        let think = tokenizer.token_to_id("<think>").expect("think id");
+        let end_think = tokenizer.token_to_id("</think>").expect("end id");
+
+        let grammar = parse_with_tokenizer("root ::= <think> (!</think>)* </think>\n", &tokenizer)
+            .expect("model-bound token parse");
+        assert_eq!(
+            grammar.rules[0][0],
+            GretElement::new(GretType::Token, think)
+        );
+        assert!(grammar
+            .rules
+            .iter()
+            .flatten()
+            .any(|element| { *element == GretElement::new(GretType::TokenNot, end_think) }));
+        assert!(grammar
+            .rules
+            .iter()
+            .flatten()
+            .any(|element| *element == GretElement::new(GretType::Token, end_think)));
+
+        let numeric = parse_with_tokenizer(
+            &format!("root ::= <[{think}]> !<[{end_think}]>\n"),
+            &tokenizer,
+        )
+        .expect("numeric ids present in the model vocabulary");
+        assert_eq!(numeric.rules[0][0].value, think);
+
+        let invalid = parse_with_tokenizer("root ::= <[4294967295]>\n", &tokenizer)
+            .expect_err("unknown numeric token id must fail before decode");
+        assert!(invalid.message.contains("not present"));
     }
 
     #[test]

@@ -277,6 +277,28 @@ The implementation is sequenced by dependency:
 The integration worktree is the only writing lane. Independent audit and
 reference lanes remain read-only.
 
+### Token-terminal refinement evidence
+
+The isolated `feat/grammar-token-terminals` lane, based on
+`ecae7bdda931ea05000cebab33402660585ba034`, tested the grammar vocabulary
+hypothesis against the local llama.cpp snapshot before implementation. The
+result requires token ids to remain distinct from decoded byte text:
+
+- `TOKEN = 8` and `TOKEN_NOT = 9` preserve the upstream element encoding;
+- `<[id]>` and `!<[id]>` parse without a vocabulary, while textual terminals
+  require a model-bound resolver and exactly one token id;
+- binding a concrete tokenizer also rejects numeric ids absent from that
+  vocabulary before generation;
+- masking and advancement receive both token id and decoded bytes, so token
+  terminals use identity while character terminals retain byte semantics;
+- declared EOG ids bypass token terminals, survive only in an accepting state,
+  and otherwise terminate fail-closed; empty non-EOG pieces are rejected.
+
+The focused grammar suite and
+`cargo check --locked --all-targets --all-features` are the proof boundary for
+this lane. Request normalization, handler wiring, full-suite validation, and
+real-model gates remain completion-gate work rather than inferred success.
+
 ## Completion gates
 
 This ADR moves to **Implemented** only when:

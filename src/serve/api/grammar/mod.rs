@@ -8,15 +8,10 @@
 //! {type: "json_object"}` and `{type: "json_schema", ...}` ride this same
 //! infrastructure via json-schema → GBNF translation.
 //!
-//! # Deliberate omissions vs. the peer's parser
-//!
-//! - **`TOKEN` / `TOKEN_NOT` elements** (`<token>` / `!<[id]>` syntax):
-//!   require a vocab at parse time. hf2q's first use case (OpenAI
-//!   `response_format`) does not need token-level grammars; we add these
-//!   when a concrete use case arises (e.g. tool-choice=required forcing a
-//!   specific EOS).
-//! - **Trigger patterns / lazy grammars**: a runtime-sampler feature, not
-//!   a parser concern. Belongs with the sampler iter.
+//! Numeric token terminals (`<[id]>` / `!<[id]>`) are supported without a
+//! vocabulary binding. Textual `<token>` forms use
+//! [`parse_with_token_resolver`] so tokenizer-specific resolution remains an
+//! explicit model-bound operation.
 
 pub mod json_schema;
 pub mod lark;
@@ -29,7 +24,10 @@ pub mod serialize;
 pub mod structural_tag;
 
 #[allow(unused_imports)]
-pub use parser::{parse, Grammar, GretElement, GretType, ParseError};
+pub use parser::{
+    parse, parse_with_token_resolver, parse_with_tokenizer, Grammar, GretElement, GretType,
+    ParseError,
+};
 #[allow(unused_imports)]
 pub use sampler::{GrammarRuntime, PartialUtf8, Pos, Stack, Stacks};
 #[allow(unused_imports)]

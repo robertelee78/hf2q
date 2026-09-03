@@ -1,10 +1,10 @@
 //! GBNF runtime sampler for hf2q constrained decoding.
 //!
 //! The runtime maintains a set of pushdown stacks over `(rule_id, elem_idx)`
-//! positions in the parsed grammar. After each decoded character the stacks
-//! are advanced; a token candidate is **accepted** iff at least one stack
-//! remains valid after feeding all its characters, and **rejected** if every
-//! stack dead-ends.
+//! positions in the parsed grammar. Character terminals consume decoded
+//! Unicode while token terminals consume one tokenizer token by id. A
+//! candidate is accepted iff at least one stack remains valid after applying
+//! the appropriate terminal domain.
 //!
 //! Implementation notes:
 //!   - `Pos(rule_id, elem_idx)` identifies a position in the flat rules —
@@ -59,6 +59,7 @@ pub type Stacks = Vec<Stack>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GrammarCandidate {
     pub index: usize,
+    pub token_id: u32,
     pub cursor: usize,
     pub end: usize,
     pub partial_utf8: PartialUtf8,
@@ -157,6 +158,14 @@ pub(super) fn decode_candidate_utf8(
 
 fn is_end_of_sequence(e: &GretElement) -> bool {
     matches!(e.ty, GretType::End | GretType::Alt)
+}
+
+fn match_token(element: GretElement, token_id: u32) -> bool {
+    match element.ty {
+        GretType::Token => element.value == token_id,
+        GretType::TokenNot => element.value != token_id,
+        _ => false,
+    }
 }
 
 /// Look up `pos` in the grammar's flat rule buffer. Returns `None` if the
@@ -262,11 +271,11 @@ pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8)
 }
 
 // ---------------------------------------------------------------------------
-// advance_stack — expand a stack until every entry is a char-class element
+// advance_stack — expand a stack until every entry is a terminal element
 // ---------------------------------------------------------------------------
 
-/// Transforms one stack into the set of stacks that all end at a terminal
-/// (char-class) element. Handles `RuleRef` expansion (with alternatives) and
+/// Transforms one stack into the set of stacks that all end at a character or
+/// token terminal. Handles `RuleRef` expansion (with alternatives) and
 /// skips `End`/`Alt` elements at the stack top.
 pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
     let mut todo: Vec<Stack> = Vec::new();
@@ -342,7 +351,11 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
                     }
                 }
             }
-            GretType::Char | GretType::CharNot | GretType::CharAny => {
+            GretType::Char
+            | GretType::CharNot
+            | GretType::CharAny
+            | GretType::Token
+            | GretType::TokenNot => {
                 if !new_stacks.contains(&curr_stack) {
                     new_stacks.push(curr_stack);
                 }
@@ -373,8 +386,10 @@ fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut 
         Some(e) => *e,
         None => return,
     };
-    // Tokens aren't handled here (see mod-level docs).
-    if matches!(elem.ty, GretType::End | GretType::Alt) {
+    if matches!(
+        elem.ty,
+        GretType::End | GretType::Alt | GretType::Token | GretType::TokenNot
+    ) {
         return;
     }
 
@@ -452,7 +467,9 @@ fn reject_candidates_for_stack(
         return candidates
             .iter()
             .copied()
-            .filter(|candidate| candidate.cursor < candidate.end)
+            .filter(|candidate| {
+                candidate.cursor < candidate.end || candidate.partial_utf8.n_remain != 0
+            })
             .collect();
     }
 
@@ -460,6 +477,15 @@ fn reject_candidates_for_stack(
     let Some(elem) = at(grammar, top) else {
         return candidates.to_vec();
     };
+    if matches!(elem.ty, GretType::Token | GretType::TokenNot) {
+        return candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                candidate.partial_utf8.n_remain != 0 || !match_token(*elem, candidate.token_id)
+            })
+            .collect();
+    }
     if !matches!(
         elem.ty,
         GretType::Char | GretType::CharNot | GretType::CharAny
@@ -722,6 +748,94 @@ impl GrammarRuntime {
         !self.stacks.is_empty()
     }
 
+    /// Feed one sampled tokenizer token. Token terminals compare `token_id`
+    /// and consume the whole token atomically; character terminals consume
+    /// the decoded `bytes`. This preserves both domains when alternatives
+    /// mix token and character rules.
+    pub fn accept_token(&mut self, token_id: u32, bytes: &[u8]) -> bool {
+        if self.awaiting_trigger {
+            let Some(marker) = self.lazy_trigger.as_deref() else {
+                return true;
+            };
+
+            let mut scan = std::mem::take(&mut self.lazy_trigger_tail);
+            scan.extend_from_slice(bytes);
+            if let Some(marker_start) = scan.windows(marker.len()).position(|w| w == marker) {
+                let body_start = marker_start + marker.len();
+                let body_suffix = scan[body_start..].to_vec();
+                self.trigger();
+                return self.accept_token(token_id, &body_suffix);
+            }
+
+            let keep = marker.len().saturating_sub(1).min(scan.len());
+            self.lazy_trigger_tail
+                .extend_from_slice(&scan[scan.len().saturating_sub(keep)..]);
+            return true;
+        }
+
+        let mut code_points = Vec::new();
+        let Some(partial_utf8) = decode_candidate_utf8(bytes, self.partial_utf8, &mut code_points)
+        else {
+            self.partial_utf8 = PartialUtf8 {
+                value: 0,
+                n_remain: -1,
+            };
+            self.stacks.clear();
+            return false;
+        };
+
+        let mut stacks_new = Vec::with_capacity(self.stacks.len());
+        for stack in &self.stacks {
+            let Some(top) = stack.last().copied() else {
+                continue;
+            };
+            let Some(element) = at(&self.grammar, top).copied() else {
+                continue;
+            };
+            if matches!(element.ty, GretType::Token | GretType::TokenNot) {
+                if match_token(element, token_id) {
+                    let mut stack_after = stack[..stack.len() - 1].to_vec();
+                    let follow = top.advance();
+                    if at(&self.grammar, follow).is_some_and(|next| !is_end_of_sequence(next)) {
+                        stack_after.push(follow);
+                    }
+                    advance_stack(&self.grammar, stack_after, &mut stacks_new);
+                }
+                continue;
+            }
+
+            let mut current_stacks = vec![stack.clone()];
+            for &chr in &code_points {
+                current_stacks = accept_char(&self.grammar, &current_stacks, chr);
+                if current_stacks.is_empty() {
+                    break;
+                }
+            }
+            for surviving in current_stacks {
+                if !stacks_new.contains(&surviving) {
+                    stacks_new.push(surviving);
+                }
+            }
+        }
+        self.stacks = stacks_new;
+        self.partial_utf8 = partial_utf8;
+        !self.stacks.is_empty()
+    }
+
+    /// Accept an end-of-generation token only after the grammar is already
+    /// complete. EOG never consumes a grammar token terminal. An unexpected
+    /// EOG kills the runtime so callers that violate masking fail closed.
+    pub fn accept_eog(&mut self) -> bool {
+        if self.awaiting_trigger {
+            return true;
+        }
+        if self.is_accepted() {
+            return true;
+        }
+        self.stacks.clear();
+        false
+    }
+
     /// Feed a byte string (e.g. a decoded token text). Partial UTF-8 bytes
     /// at the tail are carried in `self.partial_utf8`. Returns `true` if the
     /// grammar still has a valid continuation after consuming all the bytes.
@@ -912,6 +1026,71 @@ mod tests {
 
         let mut rt2 = runtime_from("root ::= [^abc]\n", "root");
         assert!(!rt2.accept_char('a' as u32));
+    }
+
+    #[test]
+    fn token_terminal_consumes_id_and_ignores_piece_text() {
+        let mut runtime = runtime_from("root ::= <[10]> <[11]>\n", "root");
+        assert!(runtime.accept_token(10, b"unrelated decoded text"));
+        assert!(!runtime.is_accepted());
+        assert!(runtime.accept_token(11, b"more unrelated text"));
+        assert!(runtime.is_accepted());
+    }
+
+    #[test]
+    fn token_not_terminal_rejects_only_the_named_id() {
+        let mut allowed = runtime_from("root ::= !<[11]>\n", "root");
+        assert!(allowed.accept_token(12, b"same-piece"));
+        assert!(allowed.is_accepted());
+
+        let mut denied = runtime_from("root ::= !<[11]>\n", "root");
+        assert!(!denied.accept_token(11, b"same-piece"));
+        assert!(denied.is_dead());
+    }
+
+    #[test]
+    fn llama_cpp_simple_token_grammar_sequence_matches() {
+        let grammar = "root ::= <[10]> content <[11]>\ncontent ::= (!<[11]>)*\n";
+        let mut runtime = runtime_from(grammar, "root");
+
+        assert!(runtime.accept_token(10, b"<[10]>"));
+        assert!(runtime.accept_token(12, b"hello world"));
+        assert!(runtime.accept_token(13, b" mixed in"));
+        assert!(runtime.accept_token(11, b"<[11]>"));
+        assert!(runtime.is_accepted());
+
+        let mut missing_end = runtime_from(grammar, "root");
+        assert!(missing_end.accept_token(10, b"<[10]>"));
+        assert!(missing_end.accept_token(12, b"missing end token"));
+        assert!(!missing_end.is_accepted());
+    }
+
+    #[test]
+    fn mixed_token_and_character_alternatives_use_the_correct_domain() {
+        let grammar = "root ::= <[7]> | \"x\"\n";
+
+        let mut token_branch = runtime_from(grammar, "root");
+        assert!(token_branch.accept_token(7, b"not-x"));
+        assert!(token_branch.is_accepted());
+
+        let mut character_branch = runtime_from(grammar, "root");
+        assert!(character_branch.accept_token(99, b"x"));
+        assert!(character_branch.is_accepted());
+
+        let mut bytes_only = runtime_from(grammar, "root");
+        assert!(!bytes_only.accept_bytes(b"not-x"));
+    }
+
+    #[test]
+    fn eog_cannot_force_a_token_terminal() {
+        let mut runtime = runtime_from("root ::= <[2]>\n", "root");
+        assert!(!runtime.accept_eog());
+        assert!(runtime.is_dead());
+
+        let mut accepted = runtime_from("root ::= \"x\"\n", "root");
+        assert!(accepted.accept_token(5, b"x"));
+        assert!(accepted.accept_eog());
+        assert!(accepted.is_accepted());
     }
 
     #[test]

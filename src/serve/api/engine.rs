@@ -230,7 +230,7 @@ pub enum GrammarKind {
     /// User-supplied or `response_format`-derived grammar.
     /// Applies UNCONDITIONALLY for the entire generation, from the very
     /// first token.  The grammar runtime never enters `awaiting_trigger`
-    /// state — the mask fires every step and `accept_bytes` advances
+    /// state — the mask fires every step and token-id acceptance advances
     /// every step.  Pre-A1 (wave 2.4 and earlier) behavior.
     ///
     /// Mirrors the peer's `USER` + `OUTPUT_FORMAT` grammar types.
@@ -547,6 +547,7 @@ pub(super) fn sample_logits_with_grammar(
     previous_tokens: &[u32],
     runtime: Option<&super::grammar::GrammarRuntime>,
     token_bytes: Option<&[Vec<u8>]>,
+    eog_token_ids: &[u32],
     want_logprobs: bool,
 ) -> Result<(u32, Option<f32>)> {
     match (runtime, token_bytes) {
@@ -571,6 +572,7 @@ pub(super) fn sample_logits_with_grammar(
                     sampler.repetition_penalty,
                     runtime,
                     token_bytes,
+                    eog_token_ids,
                 ),
                 None,
             ));
@@ -578,7 +580,12 @@ pub(super) fn sample_logits_with_grammar(
     }
 
     if let (Some(runtime), Some(token_bytes)) = (runtime, token_bytes) {
-        super::grammar::mask::mask_invalid_tokens(runtime, token_bytes, logits);
+        super::grammar::mask::mask_invalid_tokens_with_eog(
+            runtime,
+            token_bytes,
+            eog_token_ids,
+            logits,
+        );
     }
     if want_logprobs {
         let (token, logprob) =
@@ -590,6 +597,39 @@ pub(super) fn sample_logits_with_grammar(
             None,
         ))
     }
+}
+
+/// Advance an active grammar with the sampled vocabulary token. EOG is a
+/// transport terminator: it is accepted only at an already-complete grammar
+/// and never consumes a `Token`/`TokenNot` terminal.
+pub(super) fn accept_grammar_token(
+    runtime: &mut Option<super::grammar::GrammarRuntime>,
+    token_bytes: Option<&[Vec<u8>]>,
+    eog_token_ids: &[u32],
+    token: u32,
+) -> Result<()> {
+    let Some(runtime) = runtime.as_mut() else {
+        return Ok(());
+    };
+    if eog_token_ids.contains(&token) {
+        anyhow::ensure!(
+            runtime.accept_eog(),
+            "grammar rejected end-of-generation token {token} before acceptance"
+        );
+        return Ok(());
+    }
+    let bytes = token_bytes
+        .and_then(|table| table.get(token as usize))
+        .ok_or_else(|| anyhow::anyhow!("grammar token {token} has no decoded byte entry"))?;
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.first() != Some(&0),
+        "grammar rejected empty or undecodable non-EOG token {token}"
+    );
+    anyhow::ensure!(
+        runtime.accept_token(token, bytes),
+        "grammar rejected sampled token {token}"
+    );
+    Ok(())
 }
 
 /// Owned soft-token override sent through the worker channel.
@@ -5150,10 +5190,9 @@ impl Engine {
     ///
     /// `token_bytes[id]` is the bytes the tokenizer emits when token `id`
     /// is sampled — exactly `tokenizer.decode(&[id], false)` lowered to
-    /// raw UTF-8 bytes.  Empty entries (special / unprintable tokens
-    /// like `<eos>` / `<turn|>`) are left blank; the mask treats them
-    /// as "do not constrain" — the decode loop's EOS/stop-string layer
-    /// owns those.
+    /// raw UTF-8 bytes. Empty non-EOG entries are rejected by the grammar
+    /// mask. Model EOG ids are handled separately and survive only once the
+    /// grammar is accepting.
     ///
     /// Cost: vocab × one tokenizer.decode call.  At Gemma-4's vocab=256K
     /// this is ~50-200 ms on first call (CPU work; not on hot path),
@@ -7399,17 +7438,18 @@ impl Gemma4DecodeState {
                 &[],
                 grammar_runtime.as_ref(),
                 token_bytes_ref,
+                &loaded.eos_token_ids,
                 want_logprobs,
             )?;
             if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
                 acc.push(lp_val);
             }
-            if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-                let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                if !bytes.is_empty() {
-                    rt.accept_bytes(bytes);
-                }
-            }
+            accept_grammar_token(
+                &mut grammar_runtime,
+                token_bytes_ref,
+                &loaded.eos_token_ids,
+                tok,
+            )?;
             tok
         } else {
             first_decode_token
@@ -7606,17 +7646,18 @@ impl Gemma4DecodeState {
                 &self.generated_tokens,
                 self.grammar_runtime.as_ref(),
                 token_bytes_ref,
+                &loaded.eos_token_ids,
                 self.want_logprobs,
             )?;
             if let (Some(acc), Some(lp_val)) = (self.logprobs_acc.as_mut(), lp_opt) {
                 acc.push(lp_val);
             }
-            if let (Some(rt), Some(tb)) = (self.grammar_runtime.as_mut(), token_bytes_ref) {
-                let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                if !bytes.is_empty() {
-                    rt.accept_bytes(bytes);
-                }
-            }
+            accept_grammar_token(
+                &mut self.grammar_runtime,
+                token_bytes_ref,
+                &loaded.eos_token_ids,
+                tok,
+            )?;
             tok
         } else {
             greedy_token
@@ -23498,6 +23539,7 @@ fn generate_once_with_soft_tokens(
             generated,
             runtime,
             token_bytes_ref,
+            &loaded.eos_token_ids,
             want_logprobs,
         )
     };
@@ -23607,17 +23649,16 @@ fn generate_once_with_soft_tokens(
             acc.push(lp_val);
         }
         let tok = tok;
-        // Feed the chosen token's bytes through the grammar runtime so
-        // the next step's mask is correctly narrowed.  No-op when no
-        // grammar OR when the runtime is awaiting trigger (suspended
-        // runtime self-gates).  Empty token_bytes (special/unprintable)
-        // is also skipped — accept_bytes on empty is a true no-op.
-        if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-            let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-            if !bytes.is_empty() {
-                rt.accept_bytes(bytes);
-            }
-        }
+        // Feed the chosen token id and decoded bytes through the grammar
+        // runtime so the next step's mask is correctly narrowed. This is a
+        // no-op when no grammar exists or the runtime awaits its trigger.
+        // Declared EOG ids use the separate fail-closed terminal path.
+        accept_grammar_token(
+            &mut grammar_runtime,
+            token_bytes_ref,
+            &loaded.eos_token_ids,
+            tok,
+        )?;
         tok
     } else {
         prefill_argmax
@@ -23736,14 +23777,14 @@ fn generate_once_with_soft_tokens(
                 if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp) {
                     acc.push(lp_val);
                 }
-                // Advance the grammar runtime by the chosen token's bytes.
-                // Self-gates internally — see GrammarRuntime::accept_bytes.
-                if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-                    let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                    if !bytes.is_empty() {
-                        rt.accept_bytes(bytes);
-                    }
-                }
+                // Advance by the chosen token id and decoded bytes. The
+                // runtime self-gates while awaiting a lazy trigger.
+                accept_grammar_token(
+                    &mut grammar_runtime,
+                    token_bytes_ref,
+                    &loaded.eos_token_ids,
+                    tok,
+                )?;
                 tok
             } else {
                 // Greedy fast path — use forward_decode's on-GPU argmax.
@@ -24431,7 +24472,12 @@ fn generate_gemma4_once_slot_aware(
                 }
             }
             if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                super::grammar::mask::mask_invalid_tokens_with_eog(
+                    rt,
+                    tb,
+                    &loaded.eos_token_ids,
+                    &mut logits,
+                );
             }
             let (tok, lp_opt) = if want_logprobs {
                 let (t, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
@@ -24442,12 +24488,12 @@ fn generate_gemma4_once_slot_aware(
             if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
                 acc.push(lp_val);
             }
-            if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-                let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                if !bytes.is_empty() {
-                    rt.accept_bytes(bytes);
-                }
-            }
+            accept_grammar_token(
+                &mut grammar_runtime,
+                token_bytes_ref,
+                &loaded.eos_token_ids,
+                tok,
+            )?;
             tok
         } else {
             first_decode_token
@@ -24531,7 +24577,12 @@ fn generate_gemma4_once_slot_aware(
                         }
                     }
                     if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                        super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                        super::grammar::mask::mask_invalid_tokens_with_eog(
+                            rt,
+                            tb,
+                            &loaded.eos_token_ids,
+                            &mut logits,
+                        );
                     }
                     let (tok, lp_opt) = if want_logprobs {
                         let (t, lp) = sampler_pure::sample_token_with_logprob(
@@ -24549,12 +24600,12 @@ fn generate_gemma4_once_slot_aware(
                     if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
                         acc.push(lp_val);
                     }
-                    if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-                        let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                        if !bytes.is_empty() {
-                            rt.accept_bytes(bytes);
-                        }
-                    }
+                    accept_grammar_token(
+                        &mut grammar_runtime,
+                        token_bytes_ref,
+                        &loaded.eos_token_ids,
+                        tok,
+                    )?;
                     tok
                 } else {
                     greedy_token
@@ -25294,7 +25345,12 @@ fn generate_stream_gemma4_once_slot_aware(
                     }
                 }
                 if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                    super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                    super::grammar::mask::mask_invalid_tokens_with_eog(
+                        rt,
+                        tb,
+                        &loaded.eos_token_ids,
+                        &mut logits,
+                    );
                 }
                 let (tok, lp_opt) = if want_logprobs {
                     let (t, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
@@ -25323,11 +25379,16 @@ fn generate_stream_gemma4_once_slot_aware(
                     // per-token logprob granularity for streaming
                     // is the documented sub-deferral.
                 }
-                if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-                    let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                    if !bytes.is_empty() {
-                        rt.accept_bytes(bytes);
-                    }
+                if let Err(error) = accept_grammar_token(
+                    &mut grammar_runtime,
+                    token_bytes_ref,
+                    &loaded.eos_token_ids,
+                    tok,
+                ) {
+                    send!(super::sse::GenerationEvent::Error(format!(
+                        "gemma4 stream slot-aware grammar rejected sampled token: {error:#}",
+                    )));
+                    return;
                 }
                 tok
             } else {
@@ -25416,7 +25477,12 @@ fn generate_stream_gemma4_once_slot_aware(
                             }
                         }
                         if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                            super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                            super::grammar::mask::mask_invalid_tokens_with_eog(
+                                rt,
+                                tb,
+                                &loaded.eos_token_ids,
+                                &mut logits,
+                            );
                         }
                         let (tok, _lp_opt) = if want_logprobs {
                             let (t, lp) = sampler_pure::sample_token_with_logprob(
@@ -25431,11 +25497,14 @@ fn generate_stream_gemma4_once_slot_aware(
                                 None,
                             )
                         };
-                        if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-                            let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                            if !bytes.is_empty() {
-                                rt.accept_bytes(bytes);
-                            }
+                        if let Err(error) = accept_grammar_token(
+                            &mut grammar_runtime,
+                            token_bytes_ref,
+                            &loaded.eos_token_ids,
+                            tok,
+                        ) {
+                            decode_err = Some(error);
+                            break;
                         }
                         tok
                     } else {
@@ -26193,7 +26262,12 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 }
             }
             if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                super::grammar::mask::mask_invalid_tokens_with_eog(
+                    rt,
+                    tb,
+                    &loaded.eos_token_ids,
+                    &mut logits,
+                );
             }
             let (tok, lp_opt) = if want_logprobs {
                 let (t, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
@@ -26204,12 +26278,12 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
             if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
                 acc.push(lp_val);
             }
-            if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-                let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                if !bytes.is_empty() {
-                    rt.accept_bytes(bytes);
-                }
-            }
+            accept_grammar_token(
+                &mut grammar_runtime,
+                token_bytes_ref,
+                &loaded.eos_token_ids,
+                tok,
+            )?;
             tok
         } else {
             first_decode_token
@@ -26287,7 +26361,12 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                         }
                     }
                     if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                        super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                        super::grammar::mask::mask_invalid_tokens_with_eog(
+                            rt,
+                            tb,
+                            &loaded.eos_token_ids,
+                            &mut logits,
+                        );
                     }
                     let (tok, lp_opt) = if want_logprobs {
                         let (t, lp) = sampler_pure::sample_token_with_logprob(
@@ -26305,12 +26384,12 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                     if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
                         acc.push(lp_val);
                     }
-                    if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-                        let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                        if !bytes.is_empty() {
-                            rt.accept_bytes(bytes);
-                        }
-                    }
+                    accept_grammar_token(
+                        &mut grammar_runtime,
+                        token_bytes_ref,
+                        &loaded.eos_token_ids,
+                        tok,
+                    )?;
                     tok
                 } else {
                     greedy_token
@@ -28404,8 +28483,8 @@ fn generate_stream_once(
     // sibling-state pattern is REMOVED.  The trigger gate now lives
     // inside `GrammarRuntime` itself (`is_awaiting_trigger()`); the
     // `route_content` closure flips it via `runtime.trigger()` on
-    // ToolCallOpen, and the decode loop calls `mask_invalid_tokens` /
-    // `accept_bytes` / `is_dead` UNCONDITIONALLY — all three self-gate
+    // ToolCallOpen, and the decode loop calls the EOG-aware mask /
+    // token-aware accept / `is_dead` UNCONDITIONALLY — all three self-gate
     // on the SAME boolean, eliminating the split-state condition the
     // wave-2.5 audit caught at engine.rs:1401, 1489, 1554, 2041, 2145,
     // 2195.  See cfa-20260427-adr005-wave2.6 research-report.md Q2 +
@@ -28756,14 +28835,15 @@ fn generate_stream_once(
             &[],
             grammar_runtime.as_ref(),
             token_bytes_ref,
+            &loaded.eos_token_ids,
             false,
         )?;
-        if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-            let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-            if !bytes.is_empty() {
-                rt.accept_bytes(bytes);
-            }
-        }
+        accept_grammar_token(
+            &mut grammar_runtime,
+            token_bytes_ref,
+            &loaded.eos_token_ids,
+            tok,
+        )?;
         tok
     } else {
         prefill_argmax
@@ -28872,14 +28952,15 @@ fn generate_stream_once(
                     &generated_tokens,
                     grammar_runtime.as_ref(),
                     token_bytes_ref,
+                    &loaded.eos_token_ids,
                     false,
                 )?;
-                if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
-                    let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
-                    if !bytes.is_empty() {
-                        rt.accept_bytes(bytes);
-                    }
-                }
+                accept_grammar_token(
+                    &mut grammar_runtime,
+                    token_bytes_ref,
+                    &loaded.eos_token_ids,
+                    tok,
+                )?;
                 tok
             } else {
                 greedy_token
@@ -29760,6 +29841,36 @@ mod tests {
             .expect_err("Gemma grammar without table must fail before GPU sampling")
             .to_string()
             .contains("without its authoritative token byte table"));
+    }
+
+    #[test]
+    fn grammar_token_acceptance_propagates_eog_and_empty_piece_failures() {
+        let grammar =
+            crate::serve::api::grammar::parse("root ::= \"x\"\n").expect("literal grammar");
+        let root = grammar.rule_id("root").expect("root rule");
+        let table = vec![b"x".to_vec(), Vec::new()];
+
+        let mut premature = Some(
+            crate::serve::api::grammar::GrammarRuntime::new(grammar.clone(), root)
+                .expect("runtime"),
+        );
+        let error = accept_grammar_token(&mut premature, Some(&table), &[1], 1)
+            .expect_err("premature EOG must abort constrained generation");
+        assert!(error.to_string().contains("before acceptance"));
+        assert!(premature.as_ref().is_some_and(|runtime| runtime.is_dead()));
+
+        let mut accepted = Some(
+            crate::serve::api::grammar::GrammarRuntime::new(grammar.clone(), root)
+                .expect("runtime"),
+        );
+        accept_grammar_token(&mut accepted, Some(&table), &[1], 0).expect("literal token");
+        accept_grammar_token(&mut accepted, Some(&table), &[1], 1).expect("EOG after acceptance");
+
+        let mut empty_non_eog =
+            Some(crate::serve::api::grammar::GrammarRuntime::new(grammar, root).expect("runtime"));
+        let error = accept_grammar_token(&mut empty_non_eog, Some(&table), &[], 1)
+            .expect_err("empty non-EOG piece must abort constrained generation");
+        assert!(error.to_string().contains("empty or undecodable"));
     }
 
     #[test]
@@ -52300,11 +52411,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
     /// **H131 (skip-mode)** — Generate orchestrator grammar wiring
     /// landed.  Gemma 4 supports grammar (Wave 2.5 W-α5 lazy grammar
     /// via ToolCallSplitter on per-model markers); iter-2-decode-C
-    /// MUST wire the grammar runtime + per-token mask + accept_bytes.
+    /// MUST wire the grammar runtime + per-token mask + token-id acceptance.
     ///
     /// (a) `GrammarRuntime::new(` runtime construction present.
-    /// (b) `mask::mask_invalid_tokens(` mask call present.
-    /// (c) `accept_bytes(` advance call present.
+    /// (b) `mask::mask_invalid_tokens_with_eog(` mask call present.
+    /// (c) `accept_grammar_token(` advance call present.
     #[test]
     fn h131_generate_orchestrator_grammar_wired() {
         let src = include_str!("engine.rs");
@@ -52319,8 +52430,8 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
         let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         for required in [
             "GrammarRuntime::new(",
-            "mask::mask_invalid_tokens(",
-            ".accept_bytes(",
+            "mask::mask_invalid_tokens_with_eog(",
+            "accept_grammar_token(",
         ] {
             assert!(
                 fn_window.contains(required),
