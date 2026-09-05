@@ -282,7 +282,7 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
 ) -> Result<ResolvedManagedModel> {
     progress(StartupEvent::LocalSearch {
         repository: spec.repository.clone(),
-        requested_quant: spec.quant.map(|quant| quant.as_str().to_owned()),
+        requested_quant: spec.requested_selector().map(str::to_owned),
     });
     let pool_budget_bytes = LoadedPool::from_hardware(hardware).memory_budget_bytes();
     let mut warnings = Vec::new();
@@ -400,13 +400,17 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
     let selectable = catalog
         .artifacts
         .iter()
-        .filter(|artifact| artifact.selectable && artifact.role == "text_model")
+        .filter(|artifact| {
+            artifact.selectable
+                && artifact.role == "text_model"
+                && spec.matches_hosted_filename(&artifact.filename)
+        })
         .cloned()
         .collect::<Vec<_>>();
     let selectable = selectable
         .into_iter()
         .filter(|artifact| {
-            if spec.quant.is_some()
+            if spec.requested_selector().is_some()
                 || automatic_artifact_admissible(
                     artifact.bytes,
                     hardware.available_memory_bytes,
@@ -423,6 +427,31 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
             }
         })
         .collect::<Vec<_>>();
+
+    // Discover runtime quant from bounded metadata when the publisher label
+    // supplies no canonical hint. Preserve that exact artifact, not an alias.
+    let mut probed = std::collections::BTreeMap::new();
+    let mut admitted_hints = Vec::new();
+    for mut artifact in selectable {
+        if artifact.quant_hint.is_none() {
+            match validate_hub_gguf_header_compatibility(&artifact) {
+                Ok(compatibility) => {
+                    artifact.quant_hint = Some(compatibility.quant.as_str().to_owned());
+                    probed.insert(artifact.filename.clone(), compatibility);
+                }
+                Err(DownloadError::IncompatibleHostedGguf { reason }) => {
+                    warnings.push(format!(
+                        "ignored incompatible hosted {}: {reason}",
+                        artifact.filename
+                    ));
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        admitted_hints.push(artifact);
+    }
+    let selectable = admitted_hints;
 
     let excluded_identity = initial_local
         .as_ref()
@@ -499,8 +528,13 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
             &selectable,
             spec.quant,
             recommended,
+            spec.is_hosted_only()
+                .then(|| spec.requested_selector().unwrap()),
             |artifact| {
-                let compatibility = validate_hub_gguf_header_compatibility(artifact)?;
+                let compatibility = match probed.get(&artifact.filename) {
+                    Some(known) => known.clone(),
+                    None => validate_hub_gguf_header_compatibility(artifact)?,
+                };
                 selected_requires_projector = compatibility.requires_projector;
                 Ok(())
             },
@@ -509,6 +543,16 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
     } else {
         None
     };
+    if spec.is_hosted_only() && loose.is_none() && selected.is_none() {
+        let available = catalog
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.filename.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("no compatible hosted artifact matches selector {:?}; available exact filenames: {available}. {}",
+            spec.requested_selector().unwrap_or(""), warnings.join("; "));
+    }
     let (native_fallback_quant, native_product_bytes) = if loose.is_none() && selected.is_none() {
         let source_reference =
             HfModelReference::parse(&catalog.repository, Some(catalog.revision.as_str()))?;
@@ -601,6 +645,7 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
         let projector_required = prepare_projector
             && hosted_pair_requires_projector(catalog.requires_projector, loose.requires_projector);
         let mut candidate = Candidate {
+            hub_filename: Some(loose.artifact.filename.clone()),
             repository: loose.artifact.repository,
             revision: loose.artifact.revision,
             root: loose
@@ -693,6 +738,7 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
         };
         report_local_ready(&candidate, progress);
         return Ok(ResolvedManagedModel {
+            pool_identity: candidate.pool_identity(),
             gguf_path: candidate.path,
             mmproj_path: mmproj,
             repository: candidate.repository,
@@ -1163,6 +1209,7 @@ fn planned_hosted_projector(
         .and_then(|value| QuantType::from_canonical_str(value).ok())
         .context("selected hosted text artifact has no supported quant identity")?;
     let candidate = Candidate {
+        hub_filename: Some(text.filename.clone()),
         repository: text.repository.clone(),
         revision: text.revision.clone(),
         path: PathBuf::from(text_name),
@@ -1605,26 +1652,69 @@ pub(super) fn select_compatible_hosted(
     artifacts: &[HubGgufArtifact],
     exact: Option<QuantType>,
     recommended: QuantType,
+    literal_selector: Option<&str>,
     mut probe: impl FnMut(&HubGgufArtifact) -> Result<(), DownloadError>,
     warnings: &mut Vec<String>,
 ) -> Result<Option<HubGgufArtifact>> {
-    let mut candidates = artifacts.to_vec();
-    loop {
-        let Some(artifact) = select_hosted(&candidates, exact, recommended)? else {
-            return Ok(None);
-        };
-        match probe(&artifact) {
-            Ok(()) => return Ok(Some(artifact)),
-            Err(DownloadError::IncompatibleHostedGguf { reason }) => {
-                warnings.push(format!(
+    let tiers = if literal_selector.is_some() {
+        vec![None]
+    } else {
+        hosted_tiers(exact, recommended)
+            .into_iter()
+            .map(Some)
+            .collect()
+    };
+    for tier in tiers {
+        let mut compatible = Vec::new();
+        for artifact in artifacts.iter().filter(|artifact| {
+            tier.is_none_or(|tier| {
+                artifact
+                    .quant_hint
+                    .as_deref()
+                    .and_then(|hint| QuantType::from_canonical_str(hint).ok())
+                    == Some(tier)
+            })
+        }) {
+            match probe(artifact) {
+                Ok(()) => compatible.push(artifact.clone()),
+                Err(DownloadError::IncompatibleHostedGguf { reason }) => warnings.push(format!(
                     "ignored incompatible hosted {} before payload transfer: {reason}",
                     artifact.filename
-                ));
-                candidates.retain(|candidate| candidate.filename != artifact.filename);
+                )),
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
+        }
+        if let Some(selector) = literal_selector {
+            match compatible.as_slice() {
+                [] => return Ok(None),
+                [artifact] => return Ok(Some(artifact.clone())),
+                _ => bail!("multiple compatible hosted artifacts match selector {selector:?}: {}; use an exact repository-relative filename",
+                    compatible.iter().map(|artifact| artifact.filename.as_str()).collect::<Vec<_>>().join(", ")),
+            }
+        }
+        let tier = tier.expect("quant-ranked selection has a tier");
+        if let Some(selected) = select_hosted(&compatible, Some(tier), tier)? {
+            return Ok(Some(selected));
         }
     }
+    Ok(None)
+}
+
+fn hosted_tiers(exact: Option<QuantType>, recommended: QuantType) -> Vec<QuantType> {
+    if let Some(exact) = exact {
+        return vec![exact];
+    }
+    let quality = quality_descending();
+    quality
+        .into_iter()
+        .filter(|quant| quant_quality(*quant) <= quant_quality(recommended))
+        .chain(
+            quality
+                .into_iter()
+                .rev()
+                .filter(|quant| quant_quality(*quant) > quant_quality(recommended)),
+        )
+        .collect()
 }
 
 pub(super) fn select_hosted(
@@ -1754,17 +1844,24 @@ fn bind_hosted_destination(
     )?)
 }
 
-fn hosted_destination(
+pub(super) fn hosted_destination(
     artifact: &HubGgufArtifact,
     explicit_output: Option<&Path>,
 ) -> Result<PathBuf> {
+    use sha2::Digest;
     let basename = safe_basename(&artifact.filename)?;
-    let default = managed_revision_dir(
+    let revision_dir = managed_revision_dir(
         &managed_model_root()?,
         &artifact.repository,
         &artifact.revision,
-    )?
-    .join(basename);
+    )?;
+    // One bounded directory level keeps arbitrary Hub subpaths distinct while
+    // preserving the filename and fitting the existing bounded cache scan.
+    let default = revision_dir
+        .join(hex::encode(sha2::Sha256::digest(
+            artifact.filename.as_bytes(),
+        )))
+        .join(basename);
     resolve_output_path(explicit_output, default)
 }
 
@@ -2031,7 +2128,7 @@ pub(super) fn prepare_selected_local_decision_with_preflight(
     Ok((candidate, suppress_automatic_projector))
 }
 
-fn binding_from_candidate(candidate: &Candidate) -> Result<ManagedBinding> {
+pub(super) fn binding_from_candidate(candidate: &Candidate) -> Result<ManagedBinding> {
     let artifact_filename = candidate
         .path
         .file_name()
@@ -2068,7 +2165,7 @@ fn binding_from_candidate(candidate: &Candidate) -> Result<ManagedBinding> {
         last_used_at_secs: candidate.last_used_at_secs,
         artifact: ArtifactBinding {
             local_filename: artifact_filename.clone(),
-            hub_filename: artifact_filename,
+            hub_filename: candidate.hub_filename.clone().unwrap_or(artifact_filename),
             bytes: candidate.bytes,
             sha256: candidate.sha256.to_ascii_lowercase(),
         },

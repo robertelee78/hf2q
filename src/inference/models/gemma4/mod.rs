@@ -17,6 +17,7 @@
 //! * `profile.rs` — kernel/token profile + accumulator.
 //! * `tokenizer.rs` — GGUF-embedded tokenizer (unchanged).
 
+pub(crate) mod admission;
 pub mod batched_body;
 pub mod batched_head;
 pub mod forward_gpu;
@@ -35,3 +36,6 @@ pub use kv_cache::{
 };
 pub use model::{MlxModelWeights, MultiSeqPrefillOutput};
 pub use profile::{KernelTypeProfile, ProfileAccumulator, TokenProfile};
+
+#[cfg(test)]
+mod admission_tests;

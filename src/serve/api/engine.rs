@@ -2538,7 +2538,9 @@ impl LoadedModel {
         }
 
         match arch {
-            "qwen35" | "qwen35moe" | "gemma4" | "deepseek4" => Ok(()),
+            supported if crate::inference::gguf_contract::runtime_contract(supported).is_some() => {
+                Ok(())
+            }
             "" => anyhow::bail!(
                 "GGUF is missing required `general.architecture`; refusing to guess Gemma. \
                  Model: {}",
@@ -3368,6 +3370,9 @@ impl LoadedModel {
             .map(|s| s.to_string())
             .unwrap_or_default();
         Self::validate_architecture_for_load(&arch, model_path)?;
+        if let Some(contract) = crate::inference::gguf_contract::runtime_contract(&arch) {
+            contract.validate_before_load(&gguf)?;
+        }
         match arch.as_str() {
             "qwen35" | "qwen35moe" => {
                 let q = super::engine_qwen35::Qwen35LoadedModel::load_with_context(

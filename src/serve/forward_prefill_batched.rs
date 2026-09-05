@@ -5491,7 +5491,8 @@ impl MlxModelWeights {
                         anyhow::anyhow!("imatrix moe intercept (gate_up) L{layer_idx}: {e}")
                     })?;
 
-                    s.quantized_matmul_id_ggml_pooled(
+                    crate::inference::expert_dispatch::dispatch_expert_matmul_id_pooled(
+                        &mut s,
                         reg,
                         dev,
                         &pf_moe_norm_out,
@@ -5645,7 +5646,8 @@ impl MlxModelWeights {
                         anyhow::anyhow!("imatrix moe intercept (down) L{layer_idx}: {e}")
                     })?;
 
-                    s.quantized_matmul_id_ggml_pooled(
+                    crate::inference::expert_dispatch::dispatch_expert_matmul_id_pooled(
+                        &mut s,
                         reg,
                         dev,
                         &pf_moe_swiglu,

@@ -185,7 +185,7 @@ impl Deepseek4Model {
                                     &attention,
                                     token_ids[lane],
                                     layer,
-                                    None,
+                                    Some(&mut in_flight),
                                     Some(&mut session),
                                 )
                                 .with_context(|| {

@@ -21,6 +21,17 @@ use crate::serve::forward_mlx_shared::{
 };
 use crate::serve::gpu::{GpuContext, QuantWeightInfo};
 
+fn native_q8_head_selected(
+    q8_head_selected: bool,
+    source_type: Option<mlx_native::GgmlType>,
+) -> bool {
+    q8_head_selected && source_type == Some(mlx_native::GgmlType::Q8_0)
+}
+
+#[cfg(test)]
+#[path = "native_head_tests.rs"]
+mod native_q8_head_tests;
+
 // ---------------------------------------------------------------------------
 // Weight storage for the mlx-native forward path
 // ---------------------------------------------------------------------------
@@ -915,7 +926,29 @@ impl MlxModelWeights {
             );
         }
 
-        let lm_head_q8: Option<MlxQWeight> = if need_q8 {
+        let source_head_type = gguf
+            .tensor_info("token_embd.weight")
+            .map(|tensor| tensor.ggml_type);
+        let load_native_q8 = native_q8_head_selected(need_q8, source_head_type);
+        let lm_head_q8: Option<MlxQWeight> = if load_native_q8 {
+            let weight = load_gguf_qweight(gguf, "token_embd.weight", mlx_device)
+                .map_err(|e| anyhow::anyhow!("native Q8_0 lm_head load: {e}"))?;
+            anyhow::ensure!(
+                weight.info.cols == cfg.hidden_size,
+                "native Q8_0 lm_head width {} does not match hidden size {}",
+                weight.info.cols,
+                cfg.hidden_size
+            );
+            if weight.info.rows != cfg.vocab_size {
+                tracing::warn!(
+                    "native Q8_0 LMHEAD has {} rows but cfg.vocab_size={}; using tensor rows",
+                    weight.info.rows,
+                    cfg.vocab_size
+                );
+            }
+            tracing::info!("Using token_embd.weight's native Q8_0 bytes for lm_head");
+            Some(weight)
+        } else if need_q8 {
             let source = match q8_env.as_deref() {
                 Some("1") => "forced",
                 _ => "auto",

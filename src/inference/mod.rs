@@ -55,3 +55,6 @@ pub(crate) fn hf2q_gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+pub(crate) mod expert_dispatch;
+pub(crate) mod gguf_contract;

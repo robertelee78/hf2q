@@ -608,7 +608,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                     .collect::<std::collections::BTreeSet<_>>();
                 assert_eq!(observed_bindings, expected_bindings);
                 for (index, observation) in session.encoded_dispatches().iter().enumerate() {
-                    assert_eq!(observation.trace.mlx_native_version, "0.11.2");
+                    assert_eq!(observation.trace.mlx_native_version, "0.15.1");
                     assert_eq!(
                         observation.trace.request.workload,
                         if index < 16 {

@@ -2480,7 +2480,8 @@ impl MlxModelWeights {
                             ],
                             &[&self.activations.moe_gate_up_id_out],
                         );
-                        s.quantized_matmul_id_ggml(
+                        crate::inference::expert_dispatch::dispatch_expert_matmul_id(
+                            &mut s,
                             reg,
                             dev,
                             &self.activations.moe_norm_out,
@@ -2529,7 +2530,8 @@ impl MlxModelWeights {
                             ],
                             &[&self.activations.moe_down_id_out],
                         );
-                        s.quantized_matmul_id_ggml(
+                        crate::inference::expert_dispatch::dispatch_expert_matmul_id(
+                            &mut s,
                             reg,
                             dev,
                             &self.activations.moe_swiglu_id_out,

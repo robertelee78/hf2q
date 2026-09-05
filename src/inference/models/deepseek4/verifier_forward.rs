@@ -623,6 +623,7 @@ impl Deepseek4Model {
 
                 begin_prefill_pool_layer();
                 let ffn_result: Result<MlxBuffer> = (|| {
+                    let mut completion = SubmissionChain::with_capacity(0);
                     let mut session = executor.begin_recorded().with_context(|| {
                         format!("begin DeepSeek-V4 cooperative prefill layer {layer} FFN")
                     })?;
@@ -630,7 +631,7 @@ impl Deepseek4Model {
                         &combined_attention,
                         &combined_tokens,
                         layer,
-                        None,
+                        Some(&mut completion),
                         Some(&mut session),
                         Some(reusable_states[layer % reusable_states.len()].clone()),
                         id_mm_scratch.as_mut(),
@@ -638,6 +639,7 @@ impl Deepseek4Model {
                     session.finish().with_context(|| {
                         format!("execute DeepSeek-V4 cooperative prefill layer-{layer} FFN")
                     })?;
+                    completion.validate_moe_statuses()?;
                     Ok(next_state)
                 })();
                 end_prefill_pool_layer();
@@ -748,6 +750,7 @@ impl Deepseek4Model {
                 let end = (start + graph_layers_per_command_buffer).min(layers);
                 begin_prefill_submission_inputs();
                 let group_result: Result<()> = (|| {
+                    let mut completion = SubmissionChain::with_capacity(0);
                     let mut session = executor.begin_recorded().with_context(|| {
                         format!("begin DeepSeek-V4 recorded prefill layers {start}..{end}")
                     })?;
@@ -762,6 +765,7 @@ impl Deepseek4Model {
                             reusable_states[layer % reusable_states.len()].clone(),
                             id_mm_scratch.as_mut(),
                             &mut session,
+                            &mut completion,
                         );
                         if layer_result.is_ok() && layer + 1 < end {
                             session.barrier();
@@ -778,6 +782,7 @@ impl Deepseek4Model {
                             "[GRAPH_REORDER] layers={start}..{end} reordered={reordered} barriers={barriers}"
                         );
                     }
+                    completion.validate_moe_statuses()?;
                     Ok(())
                 })();
                 end_prefill_submission_inputs();
@@ -792,6 +797,7 @@ impl Deepseek4Model {
             begin_prefill_pool_layer();
             let layer_start = std::time::Instant::now();
             let layer_result: Result<MlxBuffer> = (|| {
+                let mut completion = SubmissionChain::with_capacity(0);
                 let record_graph = (layer == 0 && graph_diag) || graph_reorder;
                 let mut session = if record_graph {
                     executor.begin_recorded()
@@ -808,6 +814,7 @@ impl Deepseek4Model {
                     reusable_states[layer % reusable_states.len()].clone(),
                     id_mm_scratch.as_mut(),
                     &mut session,
+                    &mut completion,
                 )?;
                 if graph_reorder {
                     let (reordered, barriers) = session
@@ -832,6 +839,7 @@ impl Deepseek4Model {
                         .finish()
                         .with_context(|| format!("execute DeepSeek-V4 prefill layer {layer}"))?;
                 }
+                completion.validate_moe_statuses()?;
                 self.dump_verifier_layer_state(
                     &next_state,
                     layer,
@@ -868,6 +876,7 @@ impl Deepseek4Model {
         output_state: MlxBuffer,
         id_mm_scratch: Option<&mut [IdMmScratch; 2]>,
         session: &mut GraphSession<'_>,
+        completion: &mut SubmissionChain,
     ) -> Result<MlxBuffer> {
         let dump_attention = std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_some();
         let attention_session = (!dump_attention).then_some(&mut *session);
@@ -926,7 +935,7 @@ impl Deepseek4Model {
             &attention,
             token_ids,
             layer,
-            None,
+            Some(completion),
             Some(session),
             Some(output_state),
             id_mm_scratch,
@@ -1082,7 +1091,7 @@ impl Deepseek4Model {
                         state.as_ref(),
                         cache,
                         Some(&mut session),
-                        None,
+                        Some(&mut in_flight),
                     )?);
                 }
                 in_flight.push((

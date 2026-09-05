@@ -1970,17 +1970,17 @@ impl MlxModelWeights {
         // `mm_id` is a prefill optimization + a measured regression at N≤8, so
         // there is no decode-width cost. gate_up is mv at N≤4 anyway; pinning it
         // keeps the whole MoE byte-identical for any future N.
-        session
-            .quantized_matmul_id_ggml_mv(
-                reg,
-                dev,
-                &bufs.moe_norm_out,
-                stacked_gate_up,
-                &bufs.moe_expert_ids,
-                &bufs.moe_gate_up_id_out,
-                &gu_params,
-            )
-            .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
+        crate::inference::expert_dispatch::dispatch_expert_matmul_id_mv(
+            session,
+            reg,
+            dev,
+            &bufs.moe_norm_out,
+            stacked_gate_up,
+            &bufs.moe_expert_ids,
+            &bufs.moe_gate_up_id_out,
+            &gu_params,
+        )
+        .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
         // catsplit: MoE gate_up `_id` (per-token mv_id) — the big expert read.
         cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
 
@@ -2015,17 +2015,17 @@ impl MlxModelWeights {
         };
         // ADR-040 Phase F `iter-F-moe-mvid`: per-token `mv_id` (byte-identical).
         // This is THE divergence site at N≥5 (`n_tokens = N*top_k > 32`).
-        session
-            .quantized_matmul_id_ggml_mv(
-                reg,
-                dev,
-                &bufs.moe_swiglu_id_out,
-                stacked_down,
-                &bufs.moe_expert_ids,
-                &bufs.moe_down_id_out,
-                &dn_params,
-            )
-            .map_err(|e| anyhow::anyhow!("batched down _id L{layer_idx}: {e}"))?;
+        crate::inference::expert_dispatch::dispatch_expert_matmul_id_mv(
+            session,
+            reg,
+            dev,
+            &bufs.moe_swiglu_id_out,
+            stacked_down,
+            &bufs.moe_expert_ids,
+            &bufs.moe_down_id_out,
+            &dn_params,
+        )
+        .map_err(|e| anyhow::anyhow!("batched down _id L{layer_idx}: {e}"))?;
         // catsplit: MoE down `_id` (per-token mv_id) — the second big expert read.
         cat_boundary(session, exec, catsplit::Cat::MoeDown)?;
 

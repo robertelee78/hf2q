@@ -1059,6 +1059,7 @@ pub(crate) fn native_output_upper_bound_bytes(
 pub struct HubGgufHeaderCompatibility {
     pub architecture: String,
     pub requires_projector: bool,
+    pub quant: crate::serve::quant_select::QuantType,
 }
 
 pub fn validate_hub_gguf_header_compatibility(
@@ -1080,10 +1081,12 @@ pub fn validate_hub_gguf_header_compatibility(
         match gguf_probe::parse_bounded_header(&prefix, artifact.bytes) {
             Ok(header) => {
                 validate_probed_gguf_header(&header, artifact)?;
-                validate_qwen_hosted_prefix(&prefix, &header)?;
+                validate_runtime_hosted_prefix(&prefix, &header)?;
                 return Ok(HubGgufHeaderCompatibility {
                     architecture: header.architecture,
                     requires_projector: header.requires_projector,
+                    quant: crate::serve::quant_select::QuantType::from_gguf_file_type(header.file_type)
+                        .expect("header file type validated"),
                 });
             }
             Err(error) => last_parse_error = Some(error),
@@ -1151,8 +1154,8 @@ pub(crate) fn validate_retained_local_hub_gguf_compatibility(
             .map_err(|error| DownloadError::IncompatibleHostedGguf {
                 reason: format!("owned GGUF does not parse with the runtime reader: {error}"),
             })?;
-    validate_qwen_runtime_admission(&gguf)
-        .map_err(|reason| DownloadError::IncompatibleHostedGguf { reason })?;
+    crate::inference::gguf_contract::validate_hosted(&gguf)
+        .map_err(|error| DownloadError::IncompatibleHostedGguf { reason: format!("{error:#}") })?;
     if !retained.is_stable().map_err(download_failed)? {
         return Err(DownloadError::IncompatibleHostedGguf {
             reason: "owned GGUF changed during local admission".to_owned(),
@@ -1161,6 +1164,8 @@ pub(crate) fn validate_retained_local_hub_gguf_compatibility(
     Ok(HubGgufHeaderCompatibility {
         architecture: header.architecture,
         requires_projector: header.requires_projector,
+        quant: crate::serve::quant_select::QuantType::from_gguf_file_type(header.file_type)
+            .expect("header file type validated"),
     })
 }
 
@@ -1392,7 +1397,9 @@ fn validate_probed_gguf_header(
     artifact: &HubGgufArtifact,
 ) -> Result<(), DownloadError> {
     let arch = header.architecture.as_str();
-    if !matches!(arch, "qwen35" | "qwen35moe") {
+    if crate::inference::gguf_contract::runtime_contract(arch)
+        .is_none_or(|contract| !contract.supports_hosted())
+    {
         return Err(DownloadError::IncompatibleHostedGguf {
             reason: format!(
                 "selected GGUF `{}` architecture {arch:?} has no complete hosted tensor-layout admission contract in this build",
@@ -1408,7 +1415,7 @@ fn validate_probed_gguf_header(
             ),
         }
     })?;
-    if artifact.quant_hint.as_deref() != Some(file_type) {
+    if artifact.quant_hint.as_deref().is_some_and(|hint| hint != file_type) {
         return Err(DownloadError::IncompatibleHostedGguf {
             reason: format!(
                 "selected GGUF `{}` header quant {file_type} disagrees with catalog quant {:?}",
@@ -1433,420 +1440,27 @@ fn validate_probed_gguf_header(
             ),
         });
     }
-    if let Some(reason) = header.incompatible_tensor.as_deref() {
-        return Err(DownloadError::IncompatibleHostedGguf {
-            reason: format!(
-                "selected GGUF `{}` has a runtime-incompatible tensor layout: {reason}",
-                artifact.filename
-            ),
-        });
-    }
-    if matches!(arch, "qwen35" | "qwen35moe") {
-        if let Some(ggml_type) = header.token_embedding_type {
-            // Qwen3.5/Qwen3.8 performs a direct native embedding gather.
-            // mlx-native 0.11.2 has no Q3_K (or Q4_0/F16) gather route even
-            // though its matrix kernels support those types. Reject that
-            // per-tensor layout before downloading the payload; native hf2q
-            // conversion promotes its embedding to a supported type.
-            if !matches!(ggml_type, 0 | 8 | 10 | 12 | 13 | 14) {
-                return Err(DownloadError::IncompatibleHostedGguf {
-                    reason: format!(
-                        "selected GGUF `{}` uses unsupported Qwen native token embedding GGML type {ggml_type}",
-                        artifact.filename
-                    ),
-                });
-            }
-        }
-    }
     Ok(())
 }
 
-fn validate_qwen_hosted_prefix(
+fn validate_runtime_hosted_prefix(
     prefix: &[u8],
-    header: &gguf_probe::ProbedGgufHeader,
+    _header: &gguf_probe::ProbedGgufHeader,
 ) -> Result<(), DownloadError> {
     use std::io::Write;
-
-    let key_prefix = match header.architecture.as_str() {
-        "qwen35" => "qwen35",
-        "qwen35moe" => "qwen35moe",
-        _ => return Ok(()),
-    };
-    // Qwen35Config constructs one entry per declared block. Bound that scalar
-    // before invoking the shared runtime parser so hostile metadata cannot
-    // turn a bounded network prefix into an unbounded allocation.
     let mut file = tempfile::tempfile().map_err(download_failed)?;
     file.write_all(prefix).map_err(download_failed)?;
     let gguf = mlx_native::gguf::GgufFile::from_file(file).map_err(|error| {
         DownloadError::IncompatibleHostedGguf {
-            reason: format!("bounded GGUF prefix does not parse with the runtime reader: {error}"),
+            reason: format!("bounded GGUF prefix does not parse with runtime reader: {error}"),
         }
     })?;
-    let block_count = gguf
-        .metadata_u32(&format!("{key_prefix}.block_count"))
-        .ok_or_else(|| DownloadError::IncompatibleHostedGguf {
-            reason: format!("GGUF is missing required {key_prefix}.block_count metadata"),
-        })?;
-    if block_count == 0 || block_count > 4096 || u64::from(block_count) > header.tensor_count {
-        return Err(DownloadError::IncompatibleHostedGguf {
-            reason: format!(
-                "GGUF declares invalid {key_prefix}.block_count={block_count} for {} tensors",
-                header.tensor_count
-            ),
-        });
-    }
-    validate_qwen_runtime_admission(&gguf)
-        .map_err(|reason| DownloadError::IncompatibleHostedGguf { reason })
+    crate::inference::gguf_contract::validate_hosted(&gguf)
+        .map_err(|error| DownloadError::IncompatibleHostedGguf { reason: format!("{error:#}") })
 }
 
-pub(crate) fn validate_qwen_runtime_admission(
-    gguf: &mlx_native::gguf::GgufFile,
-) -> Result<(), String> {
-    let key_prefix = match gguf.metadata_string("general.architecture").unwrap_or("") {
-        "qwen35" => "qwen35",
-        "qwen35moe" => "qwen35moe",
-        _ => return Ok(()),
-    };
-    let block_count = gguf
-        .metadata_u32(&format!("{key_prefix}.block_count"))
-        .ok_or_else(|| format!("GGUF is missing required {key_prefix}.block_count metadata"))?;
-    let tensor_count = gguf.tensor_names().len() as u64;
-    if block_count == 0 || block_count > 4096 || u64::from(block_count) > tensor_count {
-        return Err(format!(
-            "GGUF declares invalid {key_prefix}.block_count={block_count} for {tensor_count} tensors"
-        ));
-    }
-    let cfg = crate::inference::models::qwen35::Qwen35Config::from_gguf(gguf)
-        .map_err(|error| format!("Qwen runtime metadata admission failed: {error}"))?;
-    crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf(gguf)
-        .map_err(|error| format!("Qwen tokenizer metadata admission failed: {error}"))?;
-    validate_qwen_operational_config(&cfg)
-        .map_err(|reason| format!("Qwen operational config admission failed: {reason}"))?;
-    validate_qwen_hosted_topology(gguf, &cfg)
-        .map_err(|reason| format!("Qwen tensor topology admission failed: {reason}"))?;
-    crate::inference::models::qwen35::mtp_weights_load::validate_mtp_tensor_topology(gguf, &cfg)
-        .map_err(|error| format!("Qwen MTP topology admission failed: {error}"))
-}
-
-fn validate_qwen_operational_config(
-    cfg: &crate::inference::models::qwen35::Qwen35Config,
-) -> Result<(), String> {
-    if cfg.hidden_size == 0
-        || cfg.num_hidden_layers == 0
-        || cfg.num_attention_heads == 0
-        || cfg.num_key_value_heads == 0
-        || cfg.head_dim == 0
-    {
-        return Err("hidden, layer, Q-head, KV-head, and head dimensions must be nonzero".into());
-    }
-    if cfg.num_attention_heads % cfg.num_key_value_heads != 0 {
-        return Err(format!(
-            "Q head count {} is not divisible by KV head count {}",
-            cfg.num_attention_heads, cfg.num_key_value_heads
-        ));
-    }
-    if cfg.linear_num_key_heads == 0
-        || cfg.linear_num_value_heads == 0
-        || cfg.linear_num_value_heads % cfg.linear_num_key_heads != 0
-        || cfg.linear_key_head_dim == 0
-        || cfg.linear_value_head_dim == 0
-        || cfg.linear_conv_kernel_dim == 0
-    {
-        return Err("linear-attention head counts/dimensions/kernel are not executable".into());
-    }
-    let mrope_sum = cfg.mrope_section.iter().try_fold(0_u32, |sum, value| {
-        sum.checked_add(*value)
-            .ok_or_else(|| "mRoPE section sum overflow".to_owned())
-    })?;
-    if cfg.rotary_dim == 0
-        || cfg.rotary_dim > cfg.head_dim
-        || cfg.rotary_dim % 2 != 0
-        || mrope_sum != cfg.rotary_dim / 2
-    {
-        return Err(format!(
-            "rotary/mRoPE dimensions are incoherent: rotary_dim={}, head_dim={}, sections={:?}",
-            cfg.rotary_dim, cfg.head_dim, cfg.mrope_section
-        ));
-    }
-    if !cfg.rope_theta.is_finite()
-        || cfg.rope_theta <= 0.0
-        || !cfg.rms_norm_eps.is_finite()
-        || cfg.rms_norm_eps <= 0.0
-        || cfg.max_position_embeddings == 0
-        || cfg.vocab_size == 0
-    {
-        return Err(
-            "rope, norm, context, and vocabulary scalars must be finite and positive".into(),
-        );
-    }
-    match cfg.variant {
-        crate::inference::models::qwen35::Qwen35Variant::Dense => {
-            if cfg.intermediate_size.is_none_or(|value| value == 0) {
-                return Err("dense feed-forward length must be nonzero".into());
-            }
-        }
-        crate::inference::models::qwen35::Qwen35Variant::Moe => {
-            let moe = cfg
-                .moe
-                .as_ref()
-                .ok_or_else(|| "MoE configuration is absent".to_owned())?;
-            if moe.num_experts == 0
-                || moe.num_experts_per_tok == 0
-                || moe.num_experts_per_tok > moe.num_experts
-                || moe.moe_intermediate_size == 0
-                || moe.shared_expert_intermediate_size == 0
-            {
-                return Err(format!(
-                    "MoE expert routing is not executable: experts={}, top_k={}, expert_ffn={}, shared_ffn={}",
-                    moe.num_experts,
-                    moe.num_experts_per_tok,
-                    moe.moe_intermediate_size,
-                    moe.shared_expert_intermediate_size
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_qwen_hosted_topology(
-    gguf: &mlx_native::gguf::GgufFile,
-    cfg: &crate::inference::models::qwen35::Qwen35Config,
-) -> Result<(), String> {
-    use crate::inference::models::qwen35::{Qwen35LayerKind, Qwen35Variant};
-
-    fn checked_product(values: &[u32], label: &str) -> Result<usize, String> {
-        values.iter().try_fold(1_usize, |product, value| {
-            product
-                .checked_mul(*value as usize)
-                .ok_or_else(|| format!("{label} dimension product overflow"))
-        })
-    }
-
-    fn require_shape(
-        gguf: &mlx_native::gguf::GgufFile,
-        name: &str,
-        expected: &[usize],
-    ) -> Result<(), String> {
-        let info = gguf
-            .tensor_info(name)
-            .ok_or_else(|| format!("missing required tensor `{name}`"))?;
-        if info.shape != expected {
-            return Err(format!(
-                "tensor `{name}` shape {:?} != expected {expected:?}",
-                info.shape
-            ));
-        }
-        Ok(())
-    }
-
-    let h = cfg.hidden_size as usize;
-    if h == 0 || cfg.num_hidden_layers == 0 {
-        return Err("hidden size and normal block count must be nonzero".into());
-    }
-    let token_count = match gguf.metadata("tokenizer.ggml.tokens") {
-        Some(mlx_native::gguf::MetadataValue::Array(tokens)) if !tokens.is_empty() => tokens.len(),
-        _ => return Err("missing nonempty tokenizer.ggml.tokens array".into()),
-    };
-    let token = gguf
-        .tensor_info("token_embd.weight")
-        .ok_or_else(|| "missing required tensor `token_embd.weight`".to_owned())?;
-    if token.shape.len() != 2 || token.shape[1] != h || token.shape[0] < token_count {
-        return Err(format!(
-            "token_embd.weight shape {:?} cannot cover {token_count} tokenizer rows at hidden size {h}",
-            token.shape
-        ));
-    }
-    require_shape(gguf, "output_norm.weight", &[h])?;
-    let output_rows = gguf
-        .tensor_info("output.weight")
-        .map(|output| output.shape.first().copied())
-        .flatten()
-        .unwrap_or(token.shape[0]);
-    if let Some(output) = gguf.tensor_info("output.weight") {
-        if output.shape.len() != 2 || output.shape[1] != h {
-            return Err(format!(
-                "output.weight shape {:?} is not [vocab,{h}]",
-                output.shape
-            ));
-        }
-    }
-    if token.shape[0] < output_rows {
-        return Err(format!(
-            "token_embd.weight rows {} cannot cover resolved output-head rows {output_rows}",
-            token.shape[0]
-        ));
-    }
-
-    let q_rows = checked_product(&[cfg.num_attention_heads, cfg.head_dim], "full-attention Q")?;
-    let kv_rows = checked_product(
-        &[cfg.num_key_value_heads, cfg.head_dim],
-        "full-attention KV",
-    )?;
-    let nk_d = checked_product(
-        &[cfg.linear_num_key_heads, cfg.linear_key_head_dim],
-        "linear-attention K",
-    )?;
-    let nv_d = checked_product(
-        &[cfg.linear_num_value_heads, cfg.linear_value_head_dim],
-        "linear-attention V",
-    )?;
-    let qkv_rows = nk_d
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(nv_d))
-        .ok_or_else(|| "linear-attention QKV dimension overflow".to_owned())?;
-    let q_projection_rows = q_rows
-        .checked_mul(2)
-        .ok_or_else(|| "full-attention gated Q projection dimension overflow".to_owned())?;
-
-    if cfg.layer_types.len() != cfg.num_hidden_layers as usize {
-        return Err("runtime layer-kind topology length differs from block count".into());
-    }
-    for (layer, kind) in cfg.layer_types.iter().copied().enumerate() {
-        let p = format!("blk.{layer}");
-        require_shape(gguf, &format!("{p}.attn_norm.weight"), &[h])?;
-        require_shape(gguf, &format!("{p}.post_attention_norm.weight"), &[h])?;
-        match kind {
-            Qwen35LayerKind::FullAttention => {
-                require_shape(gguf, &format!("{p}.attn_q.weight"), &[q_projection_rows, h])?;
-                require_shape(gguf, &format!("{p}.attn_k.weight"), &[kv_rows, h])?;
-                require_shape(gguf, &format!("{p}.attn_v.weight"), &[kv_rows, h])?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.attn_q_norm.weight"),
-                    &[cfg.head_dim as usize],
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.attn_k_norm.weight"),
-                    &[cfg.head_dim as usize],
-                )?;
-                require_shape(gguf, &format!("{p}.attn_output.weight"), &[h, q_rows])?;
-            }
-            Qwen35LayerKind::LinearAttention => {
-                require_shape(gguf, &format!("{p}.attn_qkv.weight"), &[qkv_rows, h])?;
-                require_shape(gguf, &format!("{p}.attn_gate.weight"), &[nv_d, h])?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ssm_conv1d.weight"),
-                    &[qkv_rows, cfg.linear_conv_kernel_dim as usize],
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ssm_alpha.weight"),
-                    &[cfg.linear_num_value_heads as usize, h],
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ssm_beta.weight"),
-                    &[cfg.linear_num_value_heads as usize, h],
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ssm_dt.bias"),
-                    &[cfg.linear_num_value_heads as usize],
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ssm_a"),
-                    &[cfg.linear_num_value_heads as usize],
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ssm_norm.weight"),
-                    &[cfg.linear_value_head_dim as usize],
-                )?;
-                require_shape(gguf, &format!("{p}.ssm_out.weight"), &[h, nv_d])?;
-            }
-        }
-
-        match cfg.variant {
-            Qwen35Variant::Dense => {
-                let intermediate = cfg
-                    .intermediate_size
-                    .ok_or_else(|| "dense Qwen config has no intermediate size".to_owned())?
-                    as usize;
-                require_shape(gguf, &format!("{p}.ffn_gate.weight"), &[intermediate, h])?;
-                require_shape(gguf, &format!("{p}.ffn_up.weight"), &[intermediate, h])?;
-                require_shape(gguf, &format!("{p}.ffn_down.weight"), &[h, intermediate])?;
-                let tensor_type = |role: &str| {
-                    gguf.tensor_info(&format!("{p}.ffn_{role}.weight"))
-                        .map(|info| info.ggml_type)
-                        .ok_or_else(|| format!("{p}.ffn_{role}.weight is missing"))
-                };
-                crate::inference::models::qwen35::weight_loader::validate_qwen35_dense_ffn_storage(
-                    layer as u32,
-                    tensor_type("gate")?,
-                    tensor_type("up")?,
-                    tensor_type("down")?,
-                )
-                .map_err(|error| error.to_string())?;
-            }
-            Qwen35Variant::Moe => {
-                let moe = cfg
-                    .moe
-                    .as_ref()
-                    .ok_or_else(|| "MoE Qwen config has no expert topology".to_owned())?;
-                let experts = moe.num_experts as usize;
-                let expert_intermediate = moe.moe_intermediate_size as usize;
-                let shared_intermediate = moe.shared_expert_intermediate_size as usize;
-                require_shape(gguf, &format!("{p}.ffn_gate_inp.weight"), &[experts, h])?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ffn_gate_exps.weight"),
-                    &[experts, expert_intermediate, h],
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ffn_up_exps.weight"),
-                    &[experts, expert_intermediate, h],
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ffn_down_exps.weight"),
-                    &[experts, h, expert_intermediate],
-                )?;
-                // hf2q's Qwen3.5/3.6 converter deliberately squeezes the HF
-                // `[1, hidden]` shared-expert gate to canonical GGUF `[hidden]`
-                // so the scalar router stays F32. Runtime consumes it as one
-                // length-hidden dot-product vector.
-                require_shape(
-                    gguf,
-                    &format!("{p}.ffn_gate_inp_shexp.weight"),
-                    &crate::inference::models::qwen35::shared_expert_gate_shape(h),
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ffn_gate_shexp.weight"),
-                    &[shared_intermediate, h],
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ffn_up_shexp.weight"),
-                    &[shared_intermediate, h],
-                )?;
-                require_shape(
-                    gguf,
-                    &format!("{p}.ffn_down_shexp.weight"),
-                    &[h, shared_intermediate],
-                )?;
-                let gate = gguf
-                    .tensor_info(&format!("{p}.ffn_gate_exps.weight"))
-                    .expect("shape validated");
-                let up = gguf
-                    .tensor_info(&format!("{p}.ffn_up_exps.weight"))
-                    .expect("shape validated");
-                if gate.ggml_type != up.ggml_type {
-                    return Err(format!(
-                        "{p} expert gate/up GGML types differ ({:?} vs {:?})",
-                        gate.ggml_type, up.ggml_type
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
+#[cfg(test)]
+use crate::inference::models::qwen35::admission::{validate_qwen_operational_config, validate_qwen_hosted_topology};
 
 fn hosted_quant_from_file_type(file_type: u32) -> Option<&'static str> {
     use crate::quantize::ggml_quants::GgufFtype;
@@ -2311,7 +1925,7 @@ fn hosted_gguf_identity_valid_for_role(artifact: &HubGgufArtifact, expected_role
         && artifact.sha256.len() == 64
         && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
         && inferred_role == expected_role
-        && inferred_quant == artifact.quant_hint
+        && inferred_quant.as_ref().is_none_or(|hint| artifact.quant_hint.as_ref() == Some(hint))
         && artifact.role == inferred_role
         && match expected_role {
             "text_model" => {
@@ -2973,25 +2587,11 @@ fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<St
         );
     }
     let quant_hint = infer_filename_quant(stem);
-    if quant_hint.as_deref() == Some("BF16") {
-        return (
-            "text_model",
-            quant_hint,
-            Some("BF16 GGUF weights are not supported by the current mlx-native loader".to_owned()),
-        );
-    }
-    if quant_hint.is_none() {
-        return (
-            "text_model",
-            None,
-            Some("GGUF quant type cannot be established from metadata-only inventory".to_owned()),
-        );
-    }
     ("text_model", quant_hint, None)
 }
 
 fn infer_filename_quant(stem: &str) -> Option<String> {
-    ["q2_k", "q3_k_m", "q4_k_m", "q5_k_m", "q6_k", "q8_0", "bf16"]
+    ["q2_k", "q3_k_m", "q4_k_m", "q5_k_m", "q6_k", "q8_0"]
         .into_iter()
         .find(|quant| stem.ends_with(quant))
         .map(|quant| quant.to_ascii_uppercase())
@@ -3947,6 +3547,23 @@ fn home_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    #[ignore = "requires pinned bounded header fixtures in HF2Q_HOSTED_HEADER_FIXTURES"]
+    fn hosted_resolution_kata_real_headers_follow_runtime_contracts() {
+        let root = std::path::PathBuf::from(std::env::var_os("HF2Q_HOSTED_HEADER_FIXTURES")
+            .expect("set HF2Q_HOSTED_HEADER_FIXTURES to the pinned prefix directory"));
+        for (filename, logical_bytes, admitted) in [
+            ("gemma-4-26B-A4B-it-Q8_0.gguf", 26_859_861_728, true),
+            ("gemma-4-26B-A4B-it-UD-Q8_K_XL.gguf", 27_636_232_928, true),
+            ("mtp-gemma-4-26B-A4B-it-Q8_0.gguf", 461_766_816, false),
+        ] {
+            let prefix = std::fs::read(root.join(filename)).unwrap();
+            let header = super::gguf_probe::parse_bounded_header(&prefix, logical_bytes).unwrap();
+            let result = super::validate_runtime_hosted_prefix(&prefix, &header);
+            assert_eq!(result.is_ok(), admitted, "{filename}: {result:?}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -4434,7 +4051,7 @@ pub(crate) mod tests {
         let logical_bytes = write_complete_qwen_test_gguf(&path);
         let prefix = std::fs::read(path).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, logical_bytes).unwrap();
-        validate_qwen_hosted_prefix(&prefix, &header).unwrap();
+        validate_runtime_hosted_prefix(&prefix, &header).unwrap();
     }
 
     #[test]
@@ -4454,7 +4071,7 @@ pub(crate) mod tests {
         );
         let prefix = std::fs::read(&path).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, logical_bytes).unwrap();
-        validate_qwen_hosted_prefix(&prefix, &header).unwrap();
+        validate_runtime_hosted_prefix(&prefix, &header).unwrap();
         let gguf = mlx_native::gguf::GgufFile::open(&path).unwrap();
         let cfg = crate::inference::models::qwen35::Qwen35Config::from_gguf(&gguf).unwrap();
         assert_eq!(cfg.mtp_num_hidden_layers, 1);
@@ -4485,7 +4102,7 @@ pub(crate) mod tests {
         );
         let prefix = fs::read(&main).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, main_bytes).unwrap();
-        let error = validate_qwen_hosted_prefix(&prefix, &header).unwrap_err();
+        let error = validate_runtime_hosted_prefix(&prefix, &header).unwrap_err();
         assert!(error.to_string().contains("output-head rows"), "{error}");
 
         let mtp = directory.path().join("mtp-vocab-mismatch.gguf");
@@ -4504,7 +4121,7 @@ pub(crate) mod tests {
         );
         let prefix = fs::read(&mtp).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, mtp_bytes).unwrap();
-        let error = validate_qwen_hosted_prefix(&prefix, &header).unwrap_err();
+        let error = validate_runtime_hosted_prefix(&prefix, &header).unwrap_err();
         assert!(error.to_string().contains("MTP embedding rows"), "{error}");
     }
 
@@ -4525,7 +4142,7 @@ pub(crate) mod tests {
         );
         let prefix = std::fs::read(&projection).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, projection_bytes).unwrap();
-        let error = validate_qwen_hosted_prefix(&prefix, &header).unwrap_err();
+        let error = validate_runtime_hosted_prefix(&prefix, &header).unwrap_err();
         assert!(error.to_string().contains("eh_proj.weight"), "{error}");
 
         let embedding = directory.path().join("mtp-bad-embedding.gguf");
@@ -4540,7 +4157,7 @@ pub(crate) mod tests {
         );
         let prefix = std::fs::read(&embedding).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, embedding_bytes).unwrap();
-        let error = validate_qwen_hosted_prefix(&prefix, &header).unwrap_err();
+        let error = validate_runtime_hosted_prefix(&prefix, &header).unwrap_err();
         assert!(error.to_string().contains("embed_tokens.weight"), "{error}");
     }
 
@@ -4563,8 +4180,7 @@ pub(crate) mod tests {
                 write_complete_qwen_test_gguf_with_dense_types(&path, gate, up, down);
             let prefix = std::fs::read(path).unwrap();
             let header = gguf_probe::parse_bounded_header(&prefix, logical_bytes).unwrap();
-            assert!(header.incompatible_tensor.is_none());
-            validate_qwen_hosted_prefix(&prefix, &header).unwrap();
+            validate_runtime_hosted_prefix(&prefix, &header).unwrap();
         }
 
         let mismatched = directory.path().join("mismatched-quant.gguf");
@@ -4576,8 +4192,7 @@ pub(crate) mod tests {
         );
         let prefix = std::fs::read(mismatched).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, logical_bytes).unwrap();
-        assert!(header.incompatible_tensor.is_none());
-        let error = validate_qwen_hosted_prefix(&prefix, &header).unwrap_err();
+        let error = validate_runtime_hosted_prefix(&prefix, &header).unwrap_err();
         assert!(
             error.to_string().contains("gate/up quant types differ"),
             "{error}"
@@ -4704,51 +4319,11 @@ pub(crate) mod tests {
         );
         let prefix = std::fs::read(path).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, logical_bytes).unwrap();
-        let error = validate_qwen_hosted_prefix(&prefix, &header).unwrap_err();
+        let error = validate_runtime_hosted_prefix(&prefix, &header).unwrap_err();
         assert!(
             matches!(error, DownloadError::IncompatibleHostedGguf { .. }),
             "{error}"
         );
-    }
-
-    #[test]
-    fn qwen_q3_embedding_layout_is_rejected_before_payload_transfer() {
-        let artifact = HubGgufArtifact {
-            repository: "owner/model".into(),
-            revision: "a".repeat(40),
-            filename: "model-q3_k_m.gguf".into(),
-            bytes: 4096,
-            sha256: "b".repeat(64),
-            quant_hint: Some("Q3_K_M".into()),
-            role: "text_model".into(),
-            selectable: true,
-            unavailable_reason: None,
-        };
-        let incompatible = gguf_probe::ProbedGgufHeader {
-            architecture: "qwen35".into(),
-            requires_projector: false,
-            file_type: crate::quantize::ggml_quants::GgufFtype::MostlyQ3_K_M as u32,
-            tensor_count: 1,
-            tensor_data_offset: 256,
-            token_embedding_type: Some(11),
-            incompatible_tensor: Some(
-                "token_embd.weight uses unsupported GGML type 11 for qwen35".into(),
-            ),
-            has_output_norm: true,
-            has_block_tensor: true,
-        };
-        let error = validate_probed_gguf_header(&incompatible, &artifact).unwrap_err();
-        assert!(matches!(
-            error,
-            DownloadError::IncompatibleHostedGguf { .. }
-        ));
-
-        let supported = gguf_probe::ProbedGgufHeader {
-            token_embedding_type: Some(14),
-            incompatible_tensor: None,
-            ..incompatible
-        };
-        validate_probed_gguf_header(&supported, &artifact).unwrap();
     }
 
     #[test]
@@ -4771,7 +4346,6 @@ pub(crate) mod tests {
             tensor_count: 1,
             tensor_data_offset: 256,
             token_embedding_type: None,
-            incompatible_tensor: None,
             has_output_norm: false,
             has_block_tensor: false,
         };
@@ -4787,7 +4361,6 @@ pub(crate) mod tests {
             tensor_count: 3,
             tensor_data_offset: 256,
             token_embedding_type: Some(12),
-            incompatible_tensor: None,
             has_output_norm: true,
             has_block_tensor: true,
         };
@@ -5336,8 +4909,8 @@ pub(crate) mod tests {
         assert_eq!(mmproj.0, "companion");
         assert!(mmproj.2.unwrap().contains("not a text model"));
         let bf16 = classify_hub_gguf("gguf/model-bf16.gguf");
-        assert_eq!(bf16.1.as_deref(), Some("BF16"));
-        assert!(bf16.2.unwrap().contains("not supported"));
+        assert!(bf16.1.is_none());
+        assert!(bf16.2.is_none(), "filename alone grants no storage capability");
         let split = classify_hub_gguf("model-q6_k-00001-of-00002.gguf");
         assert!(split.2.unwrap().contains("split GGUF"));
     }
