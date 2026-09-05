@@ -567,6 +567,32 @@ impl Deepseek4Model {
         };
         if let Some(session) = shared_session {
             encode(session)?;
+            // ADR-053: GLP steering must be encoded into the shared session
+            // so it runs in graph order after the FFN's dispatch_hc_post.
+            // A post-hoc CPU-side apply fires before the session commits and
+            // reads a not-yet-written buffer — measured 2026-09-04: hook
+            // fired at layers 9/19/29 with sumsq=0 (empty buffer).
+            if let Some(glp) = self.glp.as_ref() {
+                if glp.alpha != 0.0 {
+                    if let Some(direction) = glp.direction_for(layer as u32 + 1) {
+                        // The weightless 2026-09-04 correction: on DeepSeek-V4
+                        // the measured GLP site is the FFN writer (pre-fold),
+                        // not the post-fold residual. The FFN output buffer is
+                        // `[rows, hidden]` (no HC streams yet); steer it with
+                        // the dense projection kernel before the fold.
+                        crate::inference::glp::apply_layer_gpu_in_session(
+                            session,
+                            registry,
+                            &ffn_output,
+                            direction,
+                            glp.alpha,
+                            rows as u32,
+                            hidden as u32,
+                        )
+                        .with_context(|| format!("GLP FFN-writer encode layer {layer}"))?;
+                    }
+                }
+            }
         } else {
             let local_executor = GraphExecutor::new(device.clone());
             let mut session = local_executor
@@ -579,6 +605,7 @@ impl Deepseek4Model {
                 format!("execute DeepSeek-V4 layer {layer} FFN"),
             )?;
         }
+
         Ok(output_state)
     }
 }

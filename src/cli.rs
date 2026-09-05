@@ -1244,10 +1244,33 @@ pub struct ServeArgs {
     )]
     pub mmproj: Option<PathBuf>,
 
-    /// Legacy ADR-020 experimental overlay for a compatible mlx-affine
-    /// safetensors file on top of the GGUF-loaded weights. For each
-    /// trained Linear stem (`blk.{i}.attn_q`, `attn_k`, `attn_v`,
-    /// `attn_output`, `ffn_gate`, `ffn_up`, `ffn_down`), the matching
+    /// ADR-053: bind a GLP steering vector (GGUF control vector, project or
+    /// add mode per its metadata) to the served model. Applied per layer to
+    /// the post-layer residual stream at inference time; base weights are
+    /// never modified. Accepts a local path or a Hub reference. Fail-closed:
+    /// conformance errors (unknown mode/hook/spec, wrong width, direction.0)
+    /// abort startup rather than degrade.
+    #[arg(
+        long,
+        value_name = "GLP_GGUF",
+        value_hint = clap::ValueHint::FilePath,
+    )]
+    pub glp: Option<PathBuf>,
+
+    /// ADR-053: steering dose override. Defaults to the vector's
+    /// `glp.alpha_default` when present, else 1.0. Projection is quadratic
+    /// in the direction norm, so alpha is never folded into the file.
+    #[arg(long, requires = "glp")]
+    pub glp_alpha: Option<f32>,
+
+    /// ADR-053: enable the uncensor intervention. The grammar stack
+    /// (B13-class framed reasoning) is the primary mechanism, proven on
+    /// DeepSeek-V4. GLP is a separate, opt-in steering vector.
+    #[arg(long)]
+    pub uncensor: bool,
+
+
+
     /// slot is replaced with an affine-mode `MlxQWeight` that
     /// dispatches through `qmm_affine_t_packed_simd4_b4` (mlx-native
     /// d0de92a).  Currently only dense families (Gemma 4) honor the

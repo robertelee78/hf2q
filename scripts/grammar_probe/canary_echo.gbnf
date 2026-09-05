@@ -1,0 +1,6 @@
+# Canary grammar: the literal MUST appear verbatim at the start of the answer
+# segment. If a server/binary accepts this grammar but the output does not
+# begin with the canary string, the grammar plumbing is broken (silently
+# dropped or suspended forever) — exactly the 0.1.20 failure mode.
+root    ::= "CANARY-7f3d9. " body
+body    ::= [^\x00]*

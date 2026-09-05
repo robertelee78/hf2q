@@ -1,0 +1,3 @@
+# Canary grammar: no-op. Constrains nothing; must behave like an
+# ungrammared request (finish=stop, no 400, normal content).
+root ::= [^\x00]*

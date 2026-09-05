@@ -160,6 +160,11 @@ pub struct Qwen35Model {
     /// Optional MTP draft block. Executed only by speculative decoding, never
     /// by the verifier's main layer loop.
     pub mtp: Option<MtpWeights>,
+    /// ADR-053: optional GLP runtime steering. When bound, each steered
+    /// layer's post-residual `hidden` is projected/add-steered at the
+    /// layer-loop tail (the `hidden = ffn_out` assignment point). Off
+    /// unless `--glp`/`--uncensor` bound one at serve time.
+    pub glp: Option<crate::inference::glp::BoundGlp>,
     /// Present only on the evidence-bearing copied-load path. Ordinary Qwen
     /// loading remains behaviorally unchanged until it opts into that path.
     #[cfg(test)]
@@ -214,6 +219,7 @@ impl Qwen35Model {
             tied_word_embeddings: false,
             output_norm: vec![1.0f32; h],
             mtp: None,
+            glp: None,
             #[cfg(test)]
             loaded_candidate_identity: None,
             cfg,
@@ -459,6 +465,7 @@ impl Qwen35Model {
             tied_word_embeddings,
             output_norm,
             mtp,
+            glp: None,
             #[cfg(test)]
             loaded_candidate_identity: None,
         })

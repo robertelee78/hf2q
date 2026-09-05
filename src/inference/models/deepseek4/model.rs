@@ -16,6 +16,11 @@ pub struct Deepseek4Model {
     pub cfg: Deepseek4Config,
     pub weights: Deepseek4Weights,
     pub ctx: GpuContext,
+    /// ADR-053: optional GLP runtime steering. When bound, each steered
+    /// layer's post-layer HC state (`[rows, 4, hidden]`) is projected
+    /// per-stream (one direction per stream index) after the FFN's
+    /// `dispatch_hc_post` expand. Off unless `--glp`/`--uncensor` bound one.
+    pub glp: Option<crate::inference::glp::BoundGlp>,
 }
 
 impl Deepseek4Model {
@@ -28,7 +33,7 @@ impl Deepseek4Model {
             .map_err(|source| anyhow::anyhow!("DeepSeek-V4 Metal initialization: {source}"))?;
         let weights = Deepseek4Weights::load_from_gguf(gguf, &cfg, ctx.device().clone())
             .context("Deepseek4Weights::load_from_gguf")?;
-        Ok(Self { cfg, weights, ctx })
+        Ok(Self { cfg, weights, ctx, glp: None })
     }
 
     /// Parse only the strict architecture metadata without allocating Metal

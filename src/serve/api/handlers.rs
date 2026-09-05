@@ -457,7 +457,28 @@ pub async fn chat_completions(
 ) -> Response {
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     let Json(req) = match request {
-        Ok(request) => request,
+        Ok(mut request) => {
+            // ADR-053: `--uncensor` injects the B13-class grammar into requests
+            // that do not already specify a grammar. It is embedded as a literal.
+            const UNCENSOR_GRAMMAR: &str = "root ::= \"I'll analyze this directly.\\n\\n\" body\nbody ::= [^\\x00]*\n";
+            if state.config.uncensor && request.grammar.is_none() && request.response_format.is_none() {
+                eprintln!("[UNCENSOR] injecting grammar");
+                // B14-class grammar for GLP composition: let the GLP's
+                // reasoning run, then force the answer. When no GLP is
+                // bound, use the B13 frame (force frame + answer).
+                let grammar = if state.config.glp_path.is_some() {
+                    "root ::= think answer\nthink ::= \"<think>\\n\" thinktail \"</think>\\n\\n\"\nthinktail ::= !</think>*\nanswer ::= \"Here is the technical breakdown.\\n\\n\" body\nbody ::= [^\\x00]*\n"
+                } else {
+                    UNCENSOR_GRAMMAR
+                };
+                request.grammar = Some(grammar.to_owned());
+                // B13/B14 grammars expect the answer to start with the
+                // anchor; disable the think block so the grammar engages
+                // at token 0.
+                request.hf2q_enable_thinking = Some(false);
+            }
+            request
+        },
         Err(rejection) => {
             state
                 .metrics
@@ -1786,6 +1807,12 @@ where
         per_row_floats,
         qwen3vl_image_grids,
     ) = prepare_vision_context(&req.messages, state.mmproj.as_ref(), engine, cancellation).await?;
+
+    // ADR-053: `--uncensor` injects the B13-class framed-reasoning grammar
+    // into requests that do not already specify a grammar. The grammar
+    // forces the answer to land directly (no think block). It is embedded
+    // as a literal in the binary (no runtime file dependency).
+    // (Handled at deserialization above; the request here is already modified.)
 
     // Compile every OpenAI/vLLM/peer structured-output surface only
     // after the requested model has resolved. Raw token terminals, preserved

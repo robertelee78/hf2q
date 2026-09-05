@@ -685,7 +685,11 @@ impl Deepseek4Model {
         let graph_diag = std::env::var("HF2Q_DEEPSEEK_GRAPH_DIAG").as_deref() == Ok("1");
         let dump_intermediates = std::env::var_os("HF2Q_DEEPSEEK_DUMP_LAYER_DIR").is_some()
             || std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_some();
-        let graph_reorder = graph_reorder_enabled()?;
+        // ADR-053: GLP steering encodes a custom kernel into the shared FFN
+        // session; the graph reorder pass requires complete buffer-range
+        // metadata that the GLP kernel does not declare. Disable reorder
+        // when a vector is bound — correctness over the reorder optimization.
+        let graph_reorder = if self.glp.is_some() { false } else { graph_reorder_enabled()? };
         let graph_layers_per_command_buffer = graph_layers_per_command_buffer(
             layers,
             graph_reorder,

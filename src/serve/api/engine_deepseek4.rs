@@ -739,6 +739,30 @@ impl Deepseek4LoadedModel {
             .unwrap_or(1);
         let model =
             Deepseek4Model::load_from_gguf(&gguf).context("load native DeepSeek-V4 model")?;
+        eprintln!("[GLP-DEBUG] Deepseek4LoadedModel::load_with_context entered; opts.glp_path={:?}", opts.glp_path);
+
+        // ADR-053: bind a GLP steering vector when the operator supplied one.
+        // Fail-closed at load; never serve unsteered when a vector was asked for.
+        let model = if let Some(glp_path) = opts.glp_path.as_ref() {
+            let device = model.ctx.device().clone();
+            let vector = crate::inference::glp::GlpVector::load(glp_path)
+                .with_context(|| format!("GLP load: {}", glp_path.display()))?;
+            let bound = crate::inference::glp::BoundGlp::bind(vector, opts.glp_alpha, &device)
+                .with_context(|| format!("GLP bind: {}", glp_path.display()))?;
+            eprintln!(
+                "[GLP] vector bound: layers={} width={} alpha={} mode={:?} path={}",
+                bound.vector.layers.len(),
+                bound.vector.width,
+                bound.alpha,
+                bound.mode(),
+                glp_path.display()
+            );
+            let mut model = model;
+            model.glp = Some(bound);
+            model
+        } else {
+            model
+        };
         tracing::info!(
             logical_weight_bytes = model.weights.resident_bytes(),
             file_backed_weight_bytes = model.weights.file_backed_bytes(),

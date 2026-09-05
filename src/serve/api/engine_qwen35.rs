@@ -358,6 +358,28 @@ impl Qwen35LoadedModel {
         );
         let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
             .context("Qwen35Model::load_from_gguf")?;
+
+        // ADR-053: bind a GLP steering vector when the operator supplied one.
+        // Fail-closed: any loader/conformance error aborts the serve load
+        // rather than silently serving unsteered.
+        if let Some(glp_path) = opts.glp_path.as_ref() {
+            let device = mlx_native::MlxDevice::new()
+                .map_err(|e| anyhow::anyhow!("GLP bind device: {e}"))?;
+            let vector = crate::inference::glp::GlpVector::load(glp_path)
+                .with_context(|| format!("GLP load: {}", glp_path.display()))?;
+            let bound = crate::inference::glp::BoundGlp::bind(vector, opts.glp_alpha, &device)
+                .with_context(|| format!("GLP bind: {}", glp_path.display()))?;
+            tracing::info!(
+                layers = bound.vector.layers.len(),
+                width = bound.vector.width,
+                alpha = bound.alpha,
+                mode = ?bound.mode(),
+                path = %glp_path.display(),
+                "GLP vector bound to Qwen35"
+            );
+            model.glp = Some(bound);
+        }
+
         if let Some(context) = effective_context {
             model.cfg.max_position_embeddings = context;
         }
@@ -10523,6 +10545,8 @@ mod tests {
             tokenizer_path: None,
             config_path: None,
             dwq_overlay_path: None,
+            glp_path: None,
+            glp_alpha: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
         };

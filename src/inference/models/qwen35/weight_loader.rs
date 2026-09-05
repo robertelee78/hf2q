@@ -1017,6 +1017,7 @@ impl Qwen35Model {
             tied_word_embeddings: false,
             output_norm,
             mtp: None,
+            glp: None,
             #[cfg(test)]
             loaded_candidate_identity: None,
         })
