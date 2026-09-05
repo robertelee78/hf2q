@@ -131,6 +131,9 @@ struct Candidate {
     root: PathBuf,
     bytes: u64,
     sha256: String,
+    /// Original repository-relative Hub filename when this candidate is bound
+    /// to a hosted artifact. Conversion/cache-only candidates leave it absent.
+    hub_filename: Option<String>,
     quant: QuantType,
     origin: String,
     materialized_at_secs: u64,
@@ -144,6 +147,9 @@ pub(crate) struct ResolvedManagedModel {
     pub(crate) gguf_path: PathBuf,
     pub(crate) mmproj_path: Option<PathBuf>,
     pub(crate) repository: String,
+    /// Runtime pool subject. Hosted artifacts use their immutable
+    /// repo/revision/filename/SHA identity; native products retain the repo id.
+    pub(crate) pool_identity: String,
     pub(crate) revision: String,
     pub(crate) quant: QuantType,
     pub(crate) origin: String,
@@ -335,100 +341,16 @@ fn validate_retained_local_runtime_tensor_layout(
             bail!("GGUF tensor layout is not executable by this build: {reason}");
         }
     }
-    crate::input::hf_download::validate_qwen_runtime_admission(&gguf)
-        .map_err(|reason| anyhow!("GGUF runtime admission failed: {reason}"))?;
+    if let Some(contract) = crate::inference::gguf_contract::runtime_contract(arch) {
+        contract.validate_before_load(&gguf)?;
+    }
     if !retained.is_stable()? {
         bail!("local GGUF changed during runtime layout admission");
     }
     Ok(())
 }
 
-fn local_runtime_tensor_incompatibility(
-    arch: &str,
-    name: &str,
-    ggml_type: mlx_native::ops::quantized_matmul_ggml::GgmlType,
-) -> Option<String> {
-    use crate::inference::models::qwen35::forward_gpu::qwen35_native_embedding_type_supported;
-    use crate::inference::models::qwen35::weight_loader::{
-        qwen35_dense_ffn_type_supported, qwen35_moe_expert_type_supported,
-        qwen35_native_projection_type_supported,
-    };
-    use crate::inference::models::qwen3vl_text::weights::qwen3vl_projection_type_supported;
-
-    if matches!(arch, "qwen35" | "qwen35moe") {
-        let supported = if name == "token_embd.weight" {
-            qwen35_native_embedding_type_supported(ggml_type)
-        } else if qwen35_dense_ffn_name(name) {
-            qwen35_dense_ffn_type_supported(ggml_type)
-        } else if qwen35_moe_expert_name(name) {
-            qwen35_moe_expert_type_supported(ggml_type)
-        } else if qwen35_native_projection_name(name) {
-            qwen35_native_projection_type_supported(ggml_type)
-        } else {
-            true
-        };
-        if !supported {
-            return Some(format!(
-                "{name} uses unsupported {ggml_type:?} storage for {arch}"
-            ));
-        }
-    } else if (arch == "qwen3_vl" || arch == "qwen3vl")
-        && qwen3vl_projection_name(name)
-        && !qwen3vl_projection_type_supported(ggml_type)
-    {
-        return Some(format!(
-            "{name} uses unsupported {ggml_type:?} storage for {arch}"
-        ));
-    }
-    None
-}
-
-fn qwen35_native_projection_name(name: &str) -> bool {
-    name == "output.weight"
-        || [
-            ".attn_q.weight",
-            ".attn_k.weight",
-            ".attn_v.weight",
-            ".attn_output.weight",
-            ".attn_qkv.weight",
-            ".attn_gate.weight",
-            ".ssm_alpha.weight",
-            ".ssm_beta.weight",
-            ".ssm_out.weight",
-        ]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
-}
-
-fn qwen35_dense_ffn_name(name: &str) -> bool {
-    [".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight"]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
-}
-
-fn qwen35_moe_expert_name(name: &str) -> bool {
-    [
-        ".ffn_gate_exps.weight",
-        ".ffn_up_exps.weight",
-        ".ffn_down_exps.weight",
-    ]
-    .iter()
-    .any(|suffix| name.ends_with(suffix))
-}
-
-fn qwen3vl_projection_name(name: &str) -> bool {
-    [
-        ".attn_q.weight",
-        ".attn_k.weight",
-        ".attn_v.weight",
-        ".attn_output.weight",
-        ".ffn_gate.weight",
-        ".ffn_up.weight",
-        ".ffn_down.weight",
-    ]
-    .iter()
-    .any(|suffix| name.ends_with(suffix))
-}
+use crate::inference::models::qwen35::tensor_admission::tensor_incompatibility as local_runtime_tensor_incompatibility;
 
 fn verify_candidate_projector(candidate: &Candidate) -> Result<Option<PathBuf>> {
     let mut silent = |_| {};
@@ -499,6 +421,18 @@ fn display_filename(path: &Path) -> String {
 }
 
 impl Candidate {
+    fn pool_identity(&self) -> String {
+        self.hub_filename.as_ref().map_or_else(
+            || self.repository.clone(),
+            |filename| {
+                format!(
+                    "hf://{}@{}/{}#{}",
+                    self.repository, self.revision, filename, self.sha256
+                )
+            },
+        )
+    }
+
     fn into_resolved(
         self,
         mut mmproj_path: Option<PathBuf>,
@@ -567,10 +501,12 @@ impl Candidate {
             }
             None => None,
         };
+        let pool_identity = self.pool_identity();
         Ok(ResolvedManagedModel {
             gguf_path: self.path,
             mmproj_path,
             repository: self.repository,
+            pool_identity,
             revision: self.revision,
             quant: self.quant,
             origin: self.origin,

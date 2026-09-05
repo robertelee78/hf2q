@@ -100,11 +100,6 @@ mod production {
         mlx_native::ops::fused_gate_up_silu_q4_K::FusedGateUpSiluQ4_KArgs
     );
     define_fused_gate_up_wrapper!(
-        dispatch_fused_gate_up_silu_q5_k,
-        mlx_native::ops::fused_gate_up_silu_q5_K::dispatch_fused_gate_up_silu_q5_K,
-        mlx_native::ops::fused_gate_up_silu_q5_K::FusedGateUpSiluQ5_KArgs
-    );
-    define_fused_gate_up_wrapper!(
         dispatch_fused_gate_up_silu_q6_k,
         mlx_native::ops::fused_gate_up_silu_q6_K::dispatch_fused_gate_up_silu_q6_K,
         mlx_native::ops::fused_gate_up_silu_q6_K::FusedGateUpSiluQ6_KArgs
@@ -181,7 +176,6 @@ mod production_boundary_tests {
     #[test]
     fn release_dispatch_surface_is_complete_and_keeps_plain_chunk_policy() {
         let _ = production::dispatch_fused_gate_up_silu_q4_k;
-        let _ = production::dispatch_fused_gate_up_silu_q5_k;
         let _ = production::dispatch_fused_gate_up_silu_q6_k;
         let _ = production::dispatch_fused_gate_up_silu_q8_0;
         let _ = production::dispatch_fused_gate_up_silu_iq4_nl;

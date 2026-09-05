@@ -91,7 +91,7 @@ impl Deepseek4Model {
         state: &MlxBuffer,
         token_ids: &[u32],
         layer: usize,
-        in_flight: Option<&mut SubmissionChain>,
+        mut in_flight: Option<&mut SubmissionChain>,
         shared_session: Option<&mut GraphSession<'_>>,
         reusable_output_state: Option<MlxBuffer>,
         mut id_mm_scratch: Option<&mut [IdMmScratch; 2]>,
@@ -198,6 +198,9 @@ impl Deepseek4Model {
         let logits = alloc(&device, DType::F32, vec![rows, experts], "MoE logits")?;
         let indices = alloc(&device, DType::I32, vec![rows, top_k], "MoE indices")?;
         let safe_indices = alloc(&device, DType::U32, vec![rows, top_k], "safe MoE indices")?;
+        let mut invalid_status =
+            alloc_persistent(&device, DType::U32, vec![1], "MoE invalid status")?;
+        invalid_status.as_logical_mut_slice::<u32>()?[0] = 0;
         let route_weights = alloc(&device, DType::F32, vec![rows, top_k], "MoE weights")?;
         let routed_gate = alloc(&device, DType::F32, vec![routed_rows, inter], "routed gate")?;
         let routed_up = alloc(&device, DType::F32, vec![routed_rows, inter], "routed up")?;
@@ -362,6 +365,7 @@ impl Deepseek4Model {
                 &device,
                 &indices,
                 &safe_indices,
+                &invalid_status,
                 rows,
             )?;
             split_profile_stage(session, "DeepSeek-V4 FFN router")?;
@@ -472,6 +476,7 @@ impl Deepseek4Model {
                 &routed_up,
                 None,
                 &routed_activated,
+                &invalid_status,
                 routed_rows,
             )?;
             dispatch_deepseek_moe_swiglu(
@@ -482,6 +487,7 @@ impl Deepseek4Model {
                 &shared_up,
                 None,
                 &shared_activated,
+                &invalid_status,
                 rows,
             )?;
             split_profile_stage(session, "DeepSeek-V4 FFN activations")?;
@@ -548,6 +554,7 @@ impl Deepseek4Model {
                 &routed_down,
                 &shared_down,
                 &ffn_output,
+                &invalid_status,
                 rows,
             )?;
             session.barrier_between(&[&ffn_output, state, &post, &comb], &[&output_state]);
@@ -565,6 +572,10 @@ impl Deepseek4Model {
             )?;
             Ok(())
         };
+        let inspect_status = shared_session.is_none() && in_flight.is_none();
+        if let Some(in_flight) = in_flight.as_deref_mut() {
+            in_flight.retain_moe_status(layer, invalid_status.clone());
+        }
         if let Some(session) = shared_session {
             encode(session)?;
         } else {
@@ -578,6 +589,9 @@ impl Deepseek4Model {
                 in_flight,
                 format!("execute DeepSeek-V4 layer {layer} FFN"),
             )?;
+        }
+        if inspect_status && invalid_status.as_logical_slice::<u32>()?[0] != 0 {
+            bail!("DeepSeek-V4 layer {layer} MoE kernels rejected invalid routing data");
         }
         Ok(output_state)
     }

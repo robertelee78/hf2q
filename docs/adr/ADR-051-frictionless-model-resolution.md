@@ -5,6 +5,8 @@
   shipped; the v0.1.20 same-origin Git-metadata redirect and canonical Qwen
   shared-expert admission corrections are implemented with exact-artifact
   publication validation pending
+- **Updated:** 2026-09-05 — accepted metadata-driven admission and exact hosted
+  selector amendment; implementation and validation are in progress (not shipped).
 - **Date:** 2026-08-23; native-Xet transfer amendment 2026-08-26; observable
   transfer/cache-link amendment 2026-08-26; qualified-host Xet policy accepted
   2026-08-27; Git-metadata redirect and canonical Qwen admission corrections
@@ -69,6 +71,52 @@ This ADR changes that product policy without weakening ADR-047's authority
 checks.
 
 ## Decision
+
+### 2026-09-05 amendment: metadata-driven hosted selection and admission
+
+The source-bound spike at `626a62e3` reproduced two failures: ambiguity is
+declared before candidate compatibility is probed, and the bounded GGUF reader
+rejects BF16 storage type 30. The runtime pin `mlx-native 0.11.2` also cannot
+read that storage. A hosted publisher label is not a runtime quantization
+policy: distinct artifacts can both declare `general.file_type = 7` while
+having different tensor types. See `docs/research/hosted-resolution-kata-2026-09-05.md`.
+
+The resolver accepts a bounded literal hosted selector after `:`. It matches
+an exact case-sensitive repository-relative GGUF filename or a
+delimiter-bounded filename suffix, case-insensitively. Canonical quant selectors retain native conversion
+fallback; a publisher-only selector never silently becomes a different quant
+or a native conversion policy. Filenames select requested artifacts but never
+prove their role, architecture, storage compatibility, or immutable identity.
+
+Candidate compatibility is established before reporting genuine ambiguity.
+Admission uses the runtime's exact architecture/configuration/tensor contract,
+shared by hosted preflight and local loading; it has no repository-name,
+model-name, directory-name, MTP-name, or publisher-name exceptions. An unknown
+architecture is not routed through another family's loader. The bounded
+network parser performs generic format and byte-geometry validation; execution
+support comes from the operation that consumes each tensor and its native
+backend capability. Adding a supported runtime contract makes it available to
+admission without a separate hosted architecture allowlist.
+
+Publisher selectors and header-derived runtime quant identities remain
+separate. Hosted local reuse and resident pool identity preserve the original
+repository, immutable revision, exact filename, and digest. A cached artifact
+with the same `general.file_type` cannot satisfy a different explicit selector.
+New hosted destinations include a digest of the full repository-relative
+filename, avoiding basename collisions within the bounded scan depth. Adoption
+preserves that original filename. Existing canonical conversion receipts and
+cache entries remain readable.
+
+BF16 storage is admitted only when the published, locked runtime dependency
+and hf2q dispatch paths support the actual dense and expert operations. Merely
+recognizing its byte width is insufficient. No metadata relabeling, implicit
+weight conversion, external inference, or approximate-family fallback is used.
+
+Completion requires both reported commands to load their selected artifact,
+focused negative-path regressions, locked build/test checks, and exact-artifact
+Apple Silicon multi-turn unary/SSE/tool-result/prefix-reuse validation. Until
+that evidence is recorded, implementation remains under validation and must
+not be described as a proven serving fix.
 
 ### 0. Native Xet is the default remote payload transport
 

@@ -345,6 +345,8 @@ defaults.
 
 New managed paths are readable:
 `~/.local/share/hf2q/models/<owner>/<repository>/<revision>/<artifact>`.
+New hosted entries add a filename-digest directory before `<artifact>`, so
+repository subpaths with identical basenames can coexist.
 Hosted text and projector payloads remain in the authenticated Hugging Face
 cache; after verification hf2q creates a final-leaf symlink in the managed
 path. It does not make a second model-sized copy or move the cache blob. Legacy
@@ -370,10 +372,26 @@ Hosted GGUF bytes never satisfy `convert`; it always runs the Rust-native
 source conversion path. A matching schema-v3 hf2q conversion receipt makes a
 repeat invocation an integrity-verified no-op.
 
-The v0.1.15 hosted fast path has a closed tensor-layout admission contract for
-Qwen3.5/Qwen3.8 GGUF architecture identifiers. Other supported source
-families automatically take the native conversion fallback until their hosted
-GGUF layouts have an equally complete admission contract.
+For `serve` and `chat`, the repository suffix may also select a publisher label
+or an exact repository-relative GGUF filename:
+
+```bash
+hf2q serve owner/repository:UD-Q8_K_XL
+hf2q serve owner/repository:variants/model-Q8_0.gguf
+```
+
+A label matches the literal `-<label>.gguf` suffix. Exact filenames are case
+sensitive. These selectors retain the artifact's original bytes and identity;
+they do not define conversion policies or assert that every tensor has one
+storage type. The GGUF metadata and each tensor's native execution support
+determine compatibility. Only compatible candidates participate in ambiguity
+checks; use an exact filename if multiple compatible artifacts remain.
+
+Hosted admission shares the Gemma 4 and Qwen3.5/Qwen3.8 runtime contracts.
+Other supported source families retain native conversion fallback until a
+complete hosted admission contract exists. A publisher-only selector requires
+a matching compatible hosted artifact and never silently falls back to a
+conversion or another quant.
 
 The `hf2q convert` pipeline reads a Hugging Face model directory
 (`config.json` + safetensors + tokenizer assets) and emits a text GGUF that

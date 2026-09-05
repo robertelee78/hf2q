@@ -141,6 +141,37 @@ fn write_conversion_receipt(artifact: &Path, receipt: &crate::convert::receipt::
 }
 
 #[test]
+fn hosted_resolution_kata_probes_candidates_before_declaring_ambiguity() {
+    // Names and locations deliberately carry no model-family or role hints.
+    let choices = vec![
+        hosted(QuantType::Q8_0, "nested/a-q8_0.gguf"),
+        hosted(QuantType::Q8_0, "other/b-q8_0.gguf"),
+    ];
+    let mut probed = Vec::new();
+    let selected = select_compatible_hosted(
+        &choices,
+        Some(QuantType::Q8_0),
+        QuantType::Q8_0,
+        None,
+        |artifact| {
+            probed.push(artifact.filename.clone());
+            if artifact.filename == choices[0].filename {
+                Err(DownloadError::IncompatibleHostedGguf {
+                    reason: "metadata declares an auxiliary architecture".into(),
+                })
+            } else {
+                Ok(())
+            }
+        },
+        &mut Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.filename, choices[1].filename);
+    assert_eq!(probed.len(), 2);
+}
+
+#[test]
 fn exact_hosted_quant_wins_and_missing_exact_falls_back_to_native_conversion() {
     let choices = vec![
         hosted(QuantType::Q4_K_M, "model-q4_k_m.gguf"),
@@ -217,6 +248,7 @@ fn exact_incompatible_hosted_quant_falls_through_but_transport_failure_does_not(
         &choices,
         Some(QuantType::Q8_0),
         QuantType::Q8_0,
+        None,
         |_| {
             Err(DownloadError::IncompatibleHostedGguf {
                 reason: "authenticated header has the wrong architecture".into(),
@@ -237,6 +269,7 @@ fn exact_incompatible_hosted_quant_falls_through_but_transport_failure_does_not(
         &choices,
         Some(QuantType::Q8_0),
         QuantType::Q8_0,
+        None,
         |_| {
             Err(DownloadError::DownloadFailed {
                 reason: "transport interrupted".into(),
@@ -328,6 +361,7 @@ fn live_bare_qwen36_selects_admitted_hosted_q5_before_native_conversion() {
         &choices,
         None,
         QuantType::Q4_K_M,
+        None,
         |artifact| validate_hub_gguf_header_compatibility(artifact).map(|_| ()),
         &mut warnings,
     )
@@ -599,6 +633,7 @@ fn malformed_projector_binding_is_a_warning_and_text_only_fallback() {
         ],
     );
     let candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         root: directory.path().to_path_buf(),
@@ -703,6 +738,7 @@ fn in_place_markerless_structural_match_prepares_exact_catalog_projector() {
     let mut catalog = Some(catalog);
     let resolved = resolve_repository_with_progress_and_catalog(
         &RepositoryModelSpec {
+            selector: None,
             repository: "owner/model".into(),
             quant: Some(QuantType::Q4_K_M),
         },
@@ -772,6 +808,7 @@ fn fresh_hosted_projector_snapshot_is_retained_from_its_exact_blob() {
     symlink(Path::new("../../../blobs").join(&projector_sha), &snapshot).unwrap();
 
     let mut candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: revision.clone(),
         root: directory.path().to_path_buf(),
@@ -906,6 +943,7 @@ fn in_place_manual_structural_match_reuses_present_sibling_mmproj() {
     let mut catalog = Some(catalog);
     let resolved = resolve_repository_with_progress_and_catalog(
         &RepositoryModelSpec {
+            selector: None,
             repository: "owner/model".into(),
             quant: Some(QuantType::Q4_K_M),
         },
@@ -981,6 +1019,7 @@ fn direct_file_symlink_pair_is_discovered_and_retained_in_place() {
     let mut catalog = Some(catalog);
     let resolved = resolve_repository_with_progress_and_catalog(
         &RepositoryModelSpec {
+            selector: None,
             repository: "owner/model".into(),
             quant: Some(QuantType::Q4_K_M),
         },
@@ -1068,6 +1107,7 @@ fn symlinked_conversion_receipt_wins_without_hosted_gguf_artifacts() {
     let mut events = Vec::new();
     let resolved = resolve_repository_with_progress_and_catalog(
         &RepositoryModelSpec {
+            selector: None,
             repository: repository.into(),
             quant: Some(QuantType::Q4_K_M),
         },
@@ -1201,6 +1241,7 @@ fn symlinked_conversion_receipt_explicit_output_clears_source_identity() {
     let mut catalog = Some(catalog);
     let resolved = resolve_repository_with_progress_and_catalog(
         &RepositoryModelSpec {
+            selector: None,
             repository: repository.into(),
             quant: Some(QuantType::Q4_K_M),
         },
@@ -1470,6 +1511,7 @@ fn receipt_success_history_is_created_for_links_and_regular_outputs_and_selects_
     .unwrap();
 
     let spec = RepositoryModelSpec {
+        selector: None,
         repository: repository.into(),
         quant: None,
     };
@@ -2062,6 +2104,7 @@ fn structurally_valid_wrong_local_sibling_falls_through_to_exact_hosted_projecto
     let mut catalog = Some(catalog);
     let resolved = resolve_repository_with_progress_and_catalog(
         &RepositoryModelSpec {
+            selector: None,
             repository: "owner/model".into(),
             quant: Some(QuantType::Q4_K_M),
         },
@@ -2103,6 +2146,7 @@ fn malformed_local_projector_is_rejected_before_binding() {
     write_quant_gguf(&text, 15);
     fs::write(&projector, b"not a GGUF").unwrap();
     let mut candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         root: directory.path().to_path_buf(),
@@ -2175,6 +2219,7 @@ fn disappearing_automatic_sibling_mmproj_degrades_to_text_only() {
     let mut catalog = Some(catalog);
     let resolved = resolve_repository_with_progress_and_catalog(
         &RepositoryModelSpec {
+            selector: None,
             repository: "owner/model".into(),
             quant: Some(QuantType::Q4_K_M),
         },
@@ -2257,6 +2302,7 @@ fn same_size_projector_replacement_after_hash_admission_degrades_to_text_only() 
     let mut catalog = Some(catalog);
     let resolved = resolve_repository_with_progress_and_catalog(
         &RepositoryModelSpec {
+            selector: None,
             repository: "owner/model".into(),
             quant: Some(QuantType::Q4_K_M),
         },
@@ -2410,6 +2456,7 @@ fn cached_hub_q8_is_selected_locally_before_a_q4_fallback_tier() {
 #[test]
 fn candidate_recency_prefers_use_history_then_materialization() {
     let candidate = |used, materialized| Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         path: PathBuf::from("/tmp/model.gguf"),
@@ -2436,6 +2483,7 @@ fn candidate_recency_prefers_use_history_then_materialization() {
 #[test]
 fn newer_same_quant_hub_cache_revision_is_not_shadowed_by_post_lock_old_binding() {
     let old_bound = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         path: PathBuf::from("/managed/old-q4_k_m.gguf"),
@@ -2466,6 +2514,7 @@ fn newer_same_quant_hub_cache_revision_is_not_shadowed_by_post_lock_old_binding(
 fn admissible_recent_local_quant_is_not_capped_by_the_hardware_recommendation() {
     let gib = 1024_u64 * 1024 * 1024;
     let candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         path: PathBuf::from("/tmp/model-q8_0.gguf"),
@@ -2481,6 +2530,7 @@ fn admissible_recent_local_quant_is_not_capped_by_the_hardware_recommendation() 
         receipt_target_identity: None,
     };
     let spec = RepositoryModelSpec {
+        selector: None,
         repository: "owner/model".into(),
         quant: None,
     };
@@ -2497,6 +2547,7 @@ fn admissible_recent_local_quant_is_not_capped_by_the_hardware_recommendation() 
 #[test]
 fn projector_pairing_prefers_exact_text_stem_then_one_generic_companion() {
     let candidate = |filename: &str| Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         path: PathBuf::from("/tmp").join(filename),
@@ -2556,6 +2607,7 @@ fn projector_pairing_prefers_exact_text_stem_then_one_generic_companion() {
 fn older_local_multimodal_candidate_requests_its_exact_revision_not_head_projector() {
     let revision = "a".repeat(40);
     let candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: revision.clone(),
         path: PathBuf::from("/tmp/model-q4_k_m.gguf"),
@@ -2609,6 +2661,7 @@ fn markerless_local_multimodal_uses_candidate_revision_config_and_companion() {
     fs::write(&loose_projector, b"exact revision projector").unwrap();
     let revision = "a".repeat(40);
     let candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: revision.clone(),
         path: text.clone(),
@@ -2699,6 +2752,7 @@ fn hosted_projector_is_materialized_and_ambiguity_falls_back_text_only() {
     let companion_sha = crate::core::sha256::compute_file_sha256(&companion).unwrap();
     let revision = "a".repeat(40);
     let mut candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: revision.clone(),
         path: text.clone(),
@@ -2800,6 +2854,7 @@ fn prepared_existing_projector_rejects_same_inode_mutation_before_activation() {
     let plan = prepare_projector_action(artifact, destination, &[]).unwrap();
     fs::write(alias, b"projector-two").unwrap();
     let mut candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         path: directory.path().join("text.gguf"),
@@ -2891,6 +2946,7 @@ fn verified_projector_load_survives_sidecar_history_persistence_failure() {
     let invalid_sidecar = text_root.path().join("binding-is-a-directory");
     fs::create_dir(&invalid_sidecar).unwrap();
     let mut candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: revision.clone(),
         path: text.clone(),
@@ -2947,6 +3003,7 @@ fn text_only_qwen_does_not_load_a_digest_valid_stale_projector() {
     let projector = directory.path().join("mmproj-stale.gguf");
     fs::write(&projector, b"digest-valid-but-not-requested").unwrap();
     let mut candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         path: text.clone(),
@@ -2990,6 +3047,7 @@ fn text_only_local_projector_resolution_stops_before_any_hub_lookup() {
     let text = directory.path().join("text-q4_k_m.gguf");
     write_quant_gguf_with_metadata(&text, 15, &[("general.architecture", "qwen35")]);
     let mut candidate = Candidate {
+        hub_filename: None,
         repository: "not a hub repository".into(),
         revision: "not-a-revision".into(),
         path: text.clone(),
@@ -3434,6 +3492,7 @@ fn explicit_output_is_honored_for_an_existing_verified_local_candidate() {
     let mut warnings = Vec::new();
     let prepared = prepare_selected_local(
         Candidate {
+            hub_filename: None,
             repository: "owner/model".into(),
             revision: "a".repeat(40),
             path: source.clone(),
@@ -3477,6 +3536,7 @@ fn explicit_local_output_projector_conflict_warns_and_materializes_text_only() {
     let mut warnings = Vec::new();
     let prepared = prepare_selected_local(
         Candidate {
+            hub_filename: None,
             repository: "owner/model".into(),
             revision: "a".repeat(40),
             path: source.clone(),
@@ -3530,6 +3590,7 @@ fn local_pair_extent_refusal_suppresses_projector_retry_after_text_materializati
     let mut warnings = Vec::new();
     let (prepared, suppress_projector) = prepare_selected_local_decision_with_preflight(
         Candidate {
+            hub_filename: None,
             repository: "owner/model".into(),
             revision: "a".repeat(40),
             path: source.clone(),
@@ -3602,6 +3663,7 @@ fn local_pair_source_and_destination_parent_replacement_refuses_before_first_wri
 
     let error = prepare_selected_local_decision_with_preflight(
         Candidate {
+            hub_filename: None,
             repository: "owner/model".into(),
             revision: "a".repeat(40),
             path: source.clone(),
@@ -3699,6 +3761,7 @@ fn local_adoption_preserves_a_conflicting_operator_sidecar() {
 
     let prepared = prepare_selected_local(
         Candidate {
+            hub_filename: None,
             repository: "owner/model".into(),
             revision: "a".repeat(40),
             path: source.clone(),
@@ -3869,6 +3932,7 @@ fn projector_receipt_and_text_digest_mismatches_fail_closed() {
     receipt.source.repository_id = "owner/model".into();
     write_conversion_receipt(&projector, &receipt);
     let candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision,
         path: text.clone(),
@@ -3903,6 +3967,7 @@ fn bound_projector_digest_is_authenticated_before_it_can_suppress_hosted_repair(
     let projector_sha = crate::core::sha256::compute_file_sha256(&projector).unwrap();
 
     let managed = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: revision.clone(),
         path: text.clone(),
@@ -4011,6 +4076,7 @@ fn hub_cache_loose_projector_selection_uses_retained_text_through_swap_restore()
     .unwrap()
     .unwrap();
     let mut candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         path: text.clone(),
@@ -4126,6 +4192,7 @@ fn manual_loose_sibling_selection_uses_retained_text_through_swap_restore() {
     .unwrap()
     .unwrap();
     let mut candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         path: text.clone(),
@@ -4220,6 +4287,7 @@ fn manual_loose_hosted_fallback_keeps_retained_digest_after_public_swap() {
     .unwrap()
     .unwrap();
     let mut candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         path: text.clone(),
@@ -4321,6 +4389,7 @@ fn actual_local_selection_prefers_successful_use_and_exact_quant_ignores_low_mem
     }
     let mut cache = ModelCache::open_at(cache_dir.path()).unwrap();
     let spec = RepositoryModelSpec {
+        selector: None,
         repository: repository.into(),
         quant: Some(QuantType::Q4_K_M),
     };
@@ -4352,6 +4421,7 @@ fn actual_local_selection_prefers_successful_use_and_exact_quant_ignores_low_mem
     );
 
     let bare_spec = RepositoryModelSpec {
+        selector: None,
         repository: repository.into(),
         quant: None,
     };
@@ -4428,6 +4498,7 @@ fn successfully_used_managed_pair_returns_before_hub_download_or_native_conversi
     reset_verify_projector_calls();
     let resolved = resolve_repository_with_progress_and_catalog(
         &RepositoryModelSpec {
+            selector: None,
             repository: repository.into(),
             quant: None,
         },
@@ -4487,6 +4558,7 @@ fn managed_candidate_same_quant_swap_after_verification_is_rejected() {
     write_quant_gguf(&replacement, 15);
     let bytes = fs::metadata(&path).unwrap().len();
     let candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         root: directory.path().to_path_buf(),
@@ -4547,6 +4619,7 @@ fn first_use_bound_candidate_hashes_once_across_catalog_and_loose_scan() {
     reset_verify_candidate_calls();
     let (candidate, authority, lock) = select_local(
         &RepositoryModelSpec {
+            selector: None,
             repository: "owner/model".into(),
             quant: Some(QuantType::Q4_K_M),
         },
@@ -4593,6 +4666,7 @@ fn local_candidate_mutated_during_catalog_latency_is_discarded_for_fallback() {
     let path = directory.path().join("changed-q4_k_m.gguf");
     write_quant_gguf(&path, 15);
     let candidate = Candidate {
+        hub_filename: None,
         repository: "owner/model".into(),
         revision: "a".repeat(40),
         root: directory.path().to_path_buf(),
@@ -4689,6 +4763,7 @@ fn cache_selection_tracks_the_exact_quant_used_not_the_repository_lru() {
     let mut warnings = Vec::new();
     let selected = select_local(
         &RepositoryModelSpec {
+            selector: None,
             repository: repository.into(),
             quant: None,
         },
@@ -4707,4 +4782,59 @@ fn cache_selection_tracks_the_exact_quant_used_not_the_repository_lru() {
         selected.path.canonicalize().unwrap(),
         q4.canonicalize().unwrap()
     );
+}
+
+#[test]
+fn hosted_resolution_kata_subpath_identity_survives_adoption_and_reuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut identities = Vec::new();
+    let mut destinations = Vec::new();
+    for folder in ["first", "second"] {
+        let filename = format!("{folder}/model-UD-Q8_K_XL.gguf");
+        let artifact = hosted(QuantType::Q8_0, &filename);
+        let destination = resolution::hosted_destination(&artifact, None).unwrap();
+        destinations.push(destination);
+        let path = tmp.path().join(folder).join("model-UD-Q8_K_XL.gguf");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, vec![0; 1024]).unwrap();
+        let candidate = Candidate {
+            repository: artifact.repository.clone(), revision: artifact.revision.clone(),
+            path: path.clone(), root: path.parent().unwrap().to_path_buf(),
+            bytes: artifact.bytes, sha256: artifact.sha256.clone(),
+            hub_filename: Some(filename.clone()), quant: QuantType::Q8_0,
+            origin: "local_adoption".into(), materialized_at_secs: 1, last_used_at_secs: 0,
+            projector: None, sidecar: None, receipt_target_identity: None,
+        };
+        let binding = resolution::binding_from_candidate(&candidate).unwrap();
+        assert_eq!(binding.artifact.hub_filename, filename);
+        let sidecar = sidecar_path(&path);
+        write_binding(&sidecar, &binding).unwrap();
+        let reloaded = candidate_from_binding(read_binding(&sidecar).unwrap().unwrap(), path, sidecar).unwrap();
+        let exact = crate::model_spec::parse_repository_spec(&format!("owner/model:{filename}")).unwrap();
+        // Explicit selectors retain their identity even with no automatic memory budget.
+        assert!(local_candidate_eligible(&exact, &reloaded, None, 0, 0));
+        let other = crate::model_spec::parse_repository_spec("owner/model:third/model-UD-Q8_K_XL.gguf").unwrap();
+        assert!(!local_candidate_eligible(&other, &reloaded, None, u64::MAX, u64::MAX));
+        assert_eq!(reloaded.pool_identity(), candidate.pool_identity());
+        identities.push(reloaded.pool_identity());
+    }
+    assert_ne!(destinations[0], destinations[1]);
+    assert_ne!(identities[0], identities[1]);
+}
+
+#[test]
+fn hosted_resolution_kata_literal_label_ambiguity_spans_runtime_quants() {
+    let choices = vec![
+        hosted(QuantType::Q8_0, "first/model-RECIPE.gguf"),
+        hosted(QuantType::Q6_K, "second/model-RECIPE.gguf"),
+    ];
+    let mut probes = 0;
+    let error = select_compatible_hosted(&choices, None, QuantType::Q8_0, Some("RECIPE"), |_| {
+        probes += 1;
+        Ok(())
+    }, &mut Vec::new()).unwrap_err();
+    assert_eq!(probes, 2);
+    assert!(error.to_string().contains("multiple compatible hosted artifacts"));
+    assert!(error.to_string().contains(&choices[0].filename));
+    assert!(error.to_string().contains(&choices[1].filename));
 }

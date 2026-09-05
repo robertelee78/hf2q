@@ -4442,7 +4442,7 @@ pub fn cmd_serve(
         args.model = Some(resolved.gguf_path.clone());
         default_model_arg = Some(resolved.gguf_path.to_string_lossy().into_owned());
         startup_managed_identity = Some((
-            resolved.repository.clone(),
+            resolved.pool_identity.clone(),
             resolved.quant,
             resolved.gguf_path.clone(),
         ));
