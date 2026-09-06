@@ -54,9 +54,9 @@ use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
 use crate::input::hf_reference::{HfModelReference, HfReferenceError, ResolvedHfModelReference};
 use crate::progress::{HubDownloadObserver, HubDownloadSnapshot, ProgressReporter};
 
-type HubRepo = hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>;
+pub(crate) type HubRepo = hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>;
 
-struct HubApi {
+pub(crate) struct HubApi {
     client: hf_hub::HFClientSync,
     metadata: reqwest::blocking::Client,
 }
@@ -3192,7 +3192,7 @@ fn exact_hub_allow_patterns(filenames: &[String]) -> Result<Vec<String>, Downloa
     Ok(patterns)
 }
 
-fn hub_model_repo(api: &HubApi, repo_id: &str) -> HubRepo {
+pub(crate) fn hub_model_repo(api: &HubApi, repo_id: &str) -> HubRepo {
     let (owner, name) = hf_hub::split_id(repo_id);
     api.client.model(owner.to_owned(), name.to_owned())
 }
@@ -3232,7 +3232,7 @@ fn map_hub_download_error(error: hf_hub::HFError, repo_id: &str, operation: &str
     }
 }
 
-fn build_hub_api(cache_dir: &Path, _progress: bool) -> Result<HubApi, DownloadError> {
+pub(crate) fn build_hub_api(cache_dir: &Path, _progress: bool) -> Result<HubApi, DownloadError> {
     let token = resolve_auth_token();
     debug!(has_token = token.is_some(), "Auth token resolution");
 
@@ -3736,7 +3736,7 @@ pub(super) fn complete_download_files(
     Ok(files.into_iter().collect())
 }
 
-fn download_file(
+pub(crate) fn download_file(
     repo: &HubRepo,
     repo_id: &str,
     revision: &str,
@@ -3892,7 +3892,7 @@ fn read_token_file(path: &std::path::Path) -> Option<String> {
 /// 2. `HF_HOME` env var + `/hub`
 /// 3. `XDG_CACHE_HOME` env var + `/huggingface/hub`
 /// 4. `~/.cache/huggingface/hub`
-fn resolve_hf_cache_dir() -> PathBuf {
+pub(crate) fn resolve_hf_cache_dir() -> PathBuf {
     let hf_hub_cache = std::env::var("HF_HUB_CACHE").ok();
     let hf_home = std::env::var("HF_HOME").ok();
     let xdg_cache_home = std::env::var("XDG_CACHE_HOME").ok();

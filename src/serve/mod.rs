@@ -4965,16 +4965,17 @@ pub fn cmd_serve(
         engine_config.config_path = args.config.clone();
         engine_config.dwq_overlay_path = args.dwq_overlay.clone();
         // ADR-053: `--glp auto` resolves the model's provenance and
-        // auto-discovers a matching GLP artifact on the Hub. Explicit paths
+        // auto-discovers a matching GLP artifact on the Hub. Works with
+        // both HF slugs (`owner/repo`) and local GGUF paths. Explicit paths
         // are used as-is. Fail-closed: no match = startup error.
         engine_config.glp_path = match args.glp.as_ref() {
             Some(path) if path.as_os_str() == "auto" => {
-                let model_path = args.model.as_ref().map(|p| p.as_path()).or_else(|| {
-                    args.target.as_ref().map(|t| std::path::Path::new(t))
-                });
-                match model_path {
-                    Some(path) => {
-                        match crate::inference::glp::auto_discover_glp(path, &crate::serve::ProgressReporter::default()) {
+                let model_ref = args.model.as_ref().map(|p| p.to_string_lossy().into_owned())
+                    .or_else(|| args.target.clone());
+                match model_ref {
+                    Some(model_ref) => {
+                        let progress = crate::progress::ProgressReporter::new();
+                        match crate::inference::glp::auto_discover_glp(&model_ref, &progress) {
                             Ok(resolved) => Some(resolved.path),
                             Err(e) => {
                                 eprintln!("GLP auto-discovery failed: {e:#}");
@@ -4983,7 +4984,7 @@ pub fn cmd_serve(
                         }
                     }
                     None => {
-                        eprintln!("--glp auto requires a local model path (the model's GGUF metadata is needed for provenance)");
+                        eprintln!("--glp auto requires a model reference (HF slug or local GGUF path)");
                         std::process::exit(1);
                     }
                 }
