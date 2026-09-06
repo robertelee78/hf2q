@@ -463,9 +463,11 @@ pub async fn chat_completions(
             const UNCENSOR_GRAMMAR: &str = "root ::= \"I'll analyze this directly.\\n\\n\" body\nbody ::= [^\\x00]*\n";
             if state.config.uncensor && request.grammar.is_none() && request.response_format.is_none() {
                 eprintln!("[UNCENSOR] injecting grammar");
-                // B14-class grammar for GLP composition: let the GLP's
-                // reasoning run, then force the answer. When no GLP is
-                // bound, use the B13 frame (force frame + answer).
+                // B15-class minimal grammar (anchor + free completion) for
+                // grammar-only; B14 for GLP composition (let reasoning run,
+                // then force answer). B15 succeeds where B12/B13/B14 fail:
+                // it forces the answer's opening (high-probability) then
+                // releases, rather than imposing low-probability transitions.
                 let grammar = if state.config.glp_path.is_some() {
                     "root ::= think answer\nthink ::= \"<think>\\n\" thinktail \"</think>\\n\\n\"\nthinktail ::= !</think>*\nanswer ::= \"Here is the technical breakdown.\\n\\n\" body\nbody ::= [^\\x00]*\n"
                 } else {

@@ -1,0 +1,5 @@
+# B15 — minimal resilient grammar: force the answer's opening, then let the
+# model complete freely. No think block, no forced structure — just the
+# anchor and free completion. The grammar should never reject a valid token.
+root ::= "I'll analyze this directly.\n\n" body
+body ::= [^\x00]*
