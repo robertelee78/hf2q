@@ -480,6 +480,31 @@ pub async fn chat_completions(
                 // at token 0.
                 request.hf2q_enable_thinking = Some(false);
             }
+            // ADR-056: with a constraint attached, undeclared request params
+            // are potential silent constraint drops (the vLLM beam-search
+            // FATAL class): reject loudly, naming every unknown key.
+            let constrained = request.grammar.is_some()
+                || request.response_format.is_some()
+                || request.structured_outputs.is_some();
+            if constrained && !request.extra.is_empty() {
+                let mut keys: Vec<&str> =
+                    request.extra.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                state
+                    .metrics
+                    .requests_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return ApiError::invalid_request(
+                    format!(
+                        "unknown request parameter(s) [{}] with a grammar/structured-output \
+                         constraint attached: the stack cannot honor undeclared parameters, \
+                         and silently dropping them could detach the constraint",
+                        keys.join(", ")
+                    ),
+                    Some(keys.join(",").into()),
+                )
+                .into_response();
+            }
             request
         },
         Err(rejection) => {
@@ -5027,6 +5052,7 @@ mod compile_tool_grammar_precondition_tests {
     /// Build a minimal `ChatCompletionRequest` with overridable model + tools.
     fn req_with(model: &str, tools: Option<Vec<Tool>>) -> ChatCompletionRequest {
         ChatCompletionRequest {
+            extra: Default::default(),
             model: model.to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
@@ -10600,6 +10626,7 @@ mod readiness_guard_tests {
 
     fn minimal_chat_request(model: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {
+            extra: Default::default(),
             model: model.to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
@@ -10717,6 +10744,7 @@ mod readiness_guard_tests {
         // Minimal structurally-valid request.  The fields beyond `model` +
         // `messages` are irrelevant — the readiness guard fires first.
         let req = super::super::schema::ChatCompletionRequest {
+            extra: Default::default(),
             model: "any-model".to_string(),
             messages: vec![super::super::schema::ChatMessage {
                 role: "user".to_string(),
@@ -11008,6 +11036,7 @@ mod pool_error_tests {
         assert!(state.is_ready_for_gen(), "AppState::new should start ready");
 
         let req = super::super::schema::ChatCompletionRequest {
+            extra: Default::default(),
             model: "pool-refused-model".to_string(),
             messages: vec![super::super::schema::ChatMessage {
                 role: "user".to_string(),
@@ -11103,6 +11132,7 @@ mod iter215_qwen35_chat_501_tests {
 
     fn empty_request_for_model(model: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {
+            extra: Default::default(),
             model: model.to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
@@ -12052,6 +12082,7 @@ mod a5d_handler_429_tests {
     /// `stream` toggles streaming-vs-non-streaming.
     fn minimal_request(stream: bool, max_tokens: usize) -> ChatCompletionRequest {
         ChatCompletionRequest {
+            extra: Default::default(),
             model: "a5d-handler-test".to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
