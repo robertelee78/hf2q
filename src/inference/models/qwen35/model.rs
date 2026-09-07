@@ -163,7 +163,7 @@ pub struct Qwen35Model {
     /// ADR-053: optional GLP runtime steering. When bound, each steered
     /// layer's post-residual `hidden` is projected/add-steered at the
     /// layer-loop tail (the `hidden = ffn_out` assignment point). Off
-    /// unless `--glp`/`--uncensor` bound one at serve time.
+    /// unless `--glp`/`--gcd` bound one at serve time.
     pub glp: Option<crate::inference::glp::BoundGlp>,
     /// Present only on the evidence-bearing copied-load path. Ordinary Qwen
     /// loading remains behaviorally unchanged until it opts into that path.

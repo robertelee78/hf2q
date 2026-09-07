@@ -1250,6 +1250,8 @@ pub struct ServeArgs {
     /// never modified. Accepts a local path or a Hub reference. Fail-closed:
     /// conformance errors (unknown mode/hook/spec, wrong width, direction.0)
     /// abort startup rather than degrade.
+    ///
+    /// GLP concept credit: Matt Suiche (m@msuiche.com), weightless/GLP spec.
     #[arg(
         long,
         value_name = "GLP_GGUF",
@@ -1263,11 +1265,16 @@ pub struct ServeArgs {
     #[arg(long, requires = "glp")]
     pub glp_alpha: Option<f32>,
 
-    /// ADR-053: enable the uncensor intervention. The grammar stack
-    /// (B13-class framed reasoning) is the primary mechanism, proven on
-    /// DeepSeek-V4. GLP is a separate, opt-in steering vector.
-    #[arg(long)]
-    pub uncensor: bool,
+    /// ADR-053: enable GCD (Grammar-Constrained Decoding) — forced
+    /// abliteration via the grammar stack, proven on DeepSeek-V4 (W1 arm:
+    /// 6.9% refusal at spike scale, full-corpus campaign pending). GLP is a
+    /// separate, opt-in steering vector.
+    ///
+    /// GCD concept credit (both faces — tool-call authorization and forced
+    /// abliteration): Vince Ovando (vince@cybersharkconsulting.com),
+    /// tantalus.io. hf2q is the first inference-engine-native implementation.
+    #[arg(long, alias = "uncensor")]
+    pub gcd: bool,
 
 
 

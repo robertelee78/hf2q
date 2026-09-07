@@ -32,8 +32,19 @@ def main() -> None:
             pid, _, text = line.partition("\t")
             rows.append((pid, text))
     print(f"arm={ARM} model={model} prompts={len(rows)} grammar={GRAMMAR}", file=sys.stderr)
+    done = set()
+    if os.path.exists(OUT):
+        with open(OUT) as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                    done.add((r["arm"], r["prompt_id"], r["rep"]))
+                except (json.JSONDecodeError, KeyError):
+                    continue
     out = open(OUT, "a")
     for pid, prompt in rows:
+        if (ARM, pid, 1) in done:
+            continue
         body = json.dumps({
             "model": model, "messages": [{"role": "user", "content": prompt}],
             "grammar": grammar, "max_tokens": 800, "temperature": 0,

@@ -4329,7 +4329,7 @@ pub fn cmd_serve(
         default_repetition_penalty: behavior.repetition_penalty,
         default_thinking_token_budget: behavior.thinking_token_budget,
         default_tool_thinking_token_budget: behavior.tool_thinking_token_budget,
-        uncensor: args.uncensor,
+        gcd: args.gcd,
         glp_path: args.glp.clone(),
     };
 

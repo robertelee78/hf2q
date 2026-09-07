@@ -19,7 +19,7 @@ pub struct Deepseek4Model {
     /// ADR-053: optional GLP runtime steering. When bound, each steered
     /// layer's post-layer HC state (`[rows, 4, hidden]`) is projected
     /// per-stream (one direction per stream index) after the FFN's
-    /// `dispatch_hc_post` expand. Off unless `--glp`/`--uncensor` bound one.
+    /// `dispatch_hc_post` expand. Off unless `--glp`/`--gcd` bound one.
     pub glp: Option<crate::inference::glp::BoundGlp>,
 }
 

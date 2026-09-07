@@ -458,11 +458,12 @@ pub async fn chat_completions(
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     let Json(req) = match request {
         Ok(mut request) => {
-            // ADR-053: `--uncensor` injects the B13-class grammar into requests
-            // that do not already specify a grammar. It is embedded as a literal.
-            const UNCENSOR_GRAMMAR: &str = "root ::= \"I'll analyze this directly.\\n\\n\" body\nbody ::= [^\\x00]*\n";
-            if state.config.uncensor && request.grammar.is_none() && request.response_format.is_none() {
-                eprintln!("[UNCENSOR] injecting grammar");
+            // ADR-053: `--gcd` injects the GCD grammar (Grammar-Constrained
+            // Decoding — Vince Ovando, tantalus.io) into requests that do
+            // not already specify a grammar. Embedded as a literal.
+            const GCD_GRAMMAR: &str = "root ::= \"I'll analyze this directly.\\n\\n\" body\nbody ::= [^\\x00]*\n";
+            if state.config.gcd && request.grammar.is_none() && request.response_format.is_none() {
+                eprintln!("[GCD] injecting grammar");
                 // B15-class minimal grammar (anchor + free completion) for
                 // grammar-only; B14 for GLP composition (let reasoning run,
                 // then force answer). B15 succeeds where B12/B13/B14 fail:
@@ -471,7 +472,7 @@ pub async fn chat_completions(
                 let grammar = if state.config.glp_path.is_some() {
                     "root ::= think answer\nthink ::= \"<think>\\n\" thinktail \"</think>\\n\\n\"\nthinktail ::= !</think>*\nanswer ::= \"Here is the technical breakdown.\\n\\n\" body\nbody ::= [^\\x00]*\n"
                 } else {
-                    UNCENSOR_GRAMMAR
+                    GCD_GRAMMAR
                 };
                 request.grammar = Some(grammar.to_owned());
                 // B13/B14 grammars expect the answer to start with the
@@ -1810,10 +1811,10 @@ where
         qwen3vl_image_grids,
     ) = prepare_vision_context(&req.messages, state.mmproj.as_ref(), engine, cancellation).await?;
 
-    // ADR-053: `--uncensor` injects the B13-class framed-reasoning grammar
-    // into requests that do not already specify a grammar. The grammar
-    // forces the answer to land directly (no think block). It is embedded
-    // as a literal in the binary (no runtime file dependency).
+    // ADR-053: `--gcd` injects the GCD grammar into requests that do not
+    // already specify a grammar. The grammar forces the answer to land
+    // directly (no think block). It is embedded as a literal in the binary
+    // (no runtime file dependency).
     // (Handled at deserialization above; the request here is already modified.)
 
     // Compile every OpenAI/vLLM/peer structured-output surface only

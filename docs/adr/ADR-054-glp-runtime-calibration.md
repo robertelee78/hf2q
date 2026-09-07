@@ -7,7 +7,7 @@
 
 ## Problem
 
-ADR-053 makes `--uncensor` a two-part intervention (GLP activation steering +
+ADR-053 makes `--gcd` a two-part intervention (GLP activation steering +
 grammar stack). Both parts carry per-model parameters that a frozen universal
 artifact gets wrong, as measured in the 2026-09-04 grammar campaign:
 
@@ -21,7 +21,7 @@ artifact gets wrong, as measured in the 2026-09-04 grammar campaign:
   *hurt* DeepSeek compliance while the same shape may help another family.
 
 A static GLP file (e.g. `msuiche/*-GLP-*`) is exactly right for a model whose
-base checkpoint it was derived from — but the general `--uncensor` promise
+base checkpoint it was derived from — but the general `--gcd` promise
 needs a way to *derive* the vector for any stock model quickly, on-device,
 without shipping weights or running a training loop.
 
