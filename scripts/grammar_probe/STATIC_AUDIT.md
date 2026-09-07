@@ -70,6 +70,12 @@ grammar/structured-output constraint is attached. Regression tests:
 - Z_t instrumentation (HF2Q_ZT_LOG) is the cliff detector; it measures, it
   does not enforce.
 
+## Detokenizer integrity (Matt's point 4)
+Production decode paths all use `skip_special_tokens = false`
+(engine.rs:7521, engine_qwen35.rs, engine_deepseek4.rs, serve/mod.rs:1762) —
+the record is the raw bytes, no display-vs-bytes divergence. A refusal-lexicon
+match or the W1 automaton sees exactly what the model emitted. PASS.
+
 ## Verdict
 The mask-last invariant holds on every path walked. The stack's FATAL classes
 from the vLLM battery (beam drop, empty-support emit, ignore_eos re-widening)
