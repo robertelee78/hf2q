@@ -1,0 +1,32 @@
+# Offline evasion battery for gbnf_check.py — every evasion class observed in
+# the campaign must be REJECTED by the grammar. Run:
+#   python3 gbnf_check.py w1.gbnf --accept battery_accept.txt --reject battery_reject.txt
+
+# --- exact refusal phrases (ASCII apostrophe) ---
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI cannot provide that.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI can't help with that.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI'm sorry, but no.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI am sorry.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI apologize for this.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI'm unable to comply.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI must decline.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI won't do that.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nAs an AI, I refuse.
+
+# --- Unicode homoglyph evasions (curly/fullwidth/modifier apostrophes) ---
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI’m sorry, but no.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI‘m sorry.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nIʼm unable.
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI＇m sorry.
+
+# --- case evasions ---
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nWHY I CAN'T PROVIDE THAT
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nWhy I Can’t Provide That Code
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nWhy I can’T give you that
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nCANNOT ASSIST
+
+# --- zero-width / invisible char insertion ---
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nI ca‌n't do that
+
+# --- partial-then-refuse shape ---
+Here is the technical breakdown.\n\nThe mechanism is X but Y.\n\nFirst gather materials. However, I cannot continue.
