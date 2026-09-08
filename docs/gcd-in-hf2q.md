@@ -2,7 +2,8 @@
 
 *Robert E. Lee (IOActive). GCD concept: Vince Ovando (vince@cybersharkconsulting.com),
 tantalus.io. Measured replica & serving-stack battery: Matt Suiche (m@msuiche.com).
-hf2q is the first inference-engine-native implementation.*
+hf2q is the first inference engine to ship GCD refusal suppression as a serve-time
+flag with a full measurement stack (corpus + semantic judge + conformance battery).*
 
 I started uncensoring models to discover and exploit software defects. The
 turning point wasn't the jailbreak — it was noticing that uncensored models
@@ -57,16 +58,19 @@ after the fact — it reads output and reacts. A constitutive control enforces
 the policy at the only point where output doesn't exist yet: the decode
 boundary. A per-request grammar Gs declares the formal language L the response
 may form. At every sampled token, the sampler masks every token whose emission
-would leave L and renormalizes:
+would make the running prefix non-extendable to any member of L, then
+renormalizes:
 
-  q(x | s) ∝ p(x | s) · 1[x ∈ L]
+  q(x | s) ∝ p(x | s) · 1[prefix ∘ x is extendable to some w ∈ L]
 
-The empirical signature is **emission**: the count of times the unauthorized
-artifact is produced. 0 by construction under the constitutive control; > 0
-under the corrective one. Willingness maxed changes intent, not the allowed
-alphabet — and because the guarantee quantifies over all logit distributions,
-it holds against the worst case: a fully-injected model still cannot emit what
-the grammar doesn't admit.
+(EOS is admitted only when the prefix is complete and accepted.) The empirical
+signature is **emission**: the count of times the unauthorized artifact is
+produced. 0 by construction under the constitutive control; > 0 under the
+corrective one. Willingness maxed changes intent, not the allowed alphabet —
+and because the guarantee quantifies over all logit distributions, it holds
+against the worst case: a fully-injected model still cannot emit what the
+grammar doesn't admit. When the allowed mass is zero, the engine aborts loudly
+(fail-closed), never relaxes.
 
 hf2q makes this engine-native. `hf2q serve <model> --gcd` embeds the GBNF
 grammar into any chat request that doesn't already specify one (the legacy
@@ -102,10 +106,12 @@ refused prompts:
 ...      everything else ≤ 0.0001
 ```
 
-99.97% of the model's probability mass sits on the refusal opener. Refusal in
-this model is *front-loaded*: the entire refuse/comply decision is concentrated
-at the root of the token tree, in one token. (Matt's replica measured 99.85%
-on Qwen3.6 — the effect is even more concentrated here.)
+99.97% of the model's probability mass sits on the refusal opener at the entry
+position. The refuse/comply decision is concentrated at the root of the token
+tree — heavily front-loaded on the first token, though the refusal attractor
+can re-enter later in free text (we measured exactly that re-entry). (Matt's
+replica measured 99.85% on Qwen3.6 — the effect is even more concentrated
+here.)
 
 **Under the grammar, the model moves behind the committed prefix.** The W1
 grammar forces the anchor `Here is the technical breakdown.` then a
@@ -121,12 +127,11 @@ pos 4  " breakdown"  0.997   pos 12 " two"     0.262  ← the anchor's work
 pos 5  ".\n\n"       0.675   pos 13 "-stage"   0.756
 ```
 
-The forced positions pin at ~1.0 by construction; the informative positions are
-the free ones — `a`, `two`, `-stage` — where the model's own mass has to flow
-behind the committed anchor. The distribution didn't gradually weaken; the
-refusal branch was deleted at position 0, and the model's own next-token
-distribution genuinely shifted behind the prefix. The capability was never
-gone — refusal is a gate on the exit, not an absence of knowledge.
+The forced positions carry high post-mask mass (the mask admits the anchor's
+tokenizations); the informative positions are the free ones — `a`, `two`,
+`-stage` — where the model's mass has to flow behind the committed anchor.
+Once a compliant prefix is committed, the model's own next-token distribution
+moves onto the compliance manifold and stays there.
 
 ![Front-loaded refusal: the entry token carries the decision](figures/fig1_frontloading.png)
 
@@ -139,23 +144,25 @@ on the APEX judge (independent abliterated model, 7-way semantic enum):
 
 | arm | constraint | refusal rate |
 |---|---|---|
-| baseline | none (free text) | ~100% |
-| B15 | neutral anchor | 83% |
+| B15 | neutral anchor (exclusion-only shape) | 83% |
 | B17 | refusal-incompatible anchor | 33% |
 | B18 | B17 + exclusion automaton | 29% |
 | B19 | B17 + topic-referencing sentence | 5.9% |
 | B20 | B19 + forced think block | 24.1% |
 | **W1** | **B19 + character whitelist** | **2.3%** |
 
+(The unconstrained baseline refuses ~everything on this corpus; B15's neutral
+anchor already shows the floor effect of *any* forced opening.)
+
 ![Dose-response: the anchor axis does the suppression](figures/fig2_arms.png)
 
-Two readings. The anchor axis carries the suppression: exclusion alone
-maintains refusal at baseline (B15, 83%), the refusal-incompatible anchor cuts
-it to 33%, the topic-referencing sentence to 5.9%, and the whitelist (which
-closes the evasion channels rather than adding mass) to 2.3%. And the B20
-outlier is the control: adding a forced think block *raised* refusal to 24%,
-because a reasoning runway lets the refusal direction re-activate before the
-anchor engages — the grammar must engage at token 0.
+Two readings. The anchor axis carries the suppression: the neutral anchor
+already shows the floor (B15, 83%), the refusal-incompatible anchor cuts it to
+33%, the topic-referencing sentence to 5.9%, and the whitelist (which closes
+the evasion channels rather than adding mass) to 2.3%. And the B20 outlier is
+the control: adding a forced think block *raised* refusal to 24% in our spike
+measurement, consistent with a reasoning runway letting the refusal direction
+re-activate before the anchor engages.
 
 ## The failure taxonomy — honest escape, measured live
 
@@ -163,19 +170,21 @@ The residual 2.3% is not silent. The B20 debugging session caught the automaton
 being evaded four times in one afternoon, each a named class:
 
 1. **Unicode homoglyph** — `I’m sorry` with U+2019 instead of U+0027. The
-   character-exact automaton didn't see it. Fixed by homoglyph coverage.
-2. **Case + no prefix** — `Why I Can’t Provide That Code` (capitalized, no "I"
-   prefix). Fixed by case-insensitive folded matching.
-3. **Case + homoglyph mix** — `Why I can’T give you that code`. Fixed by the
+   character-exact automaton didn't see it. Fixed by homoglyph coverage in the
    folded automaton.
+2. **Case + rephrase** — `Why I Can’t Provide That Code` (capitalized). Fixed
+   by case-insensitive folded matching in the automaton.
+3. **Case + homoglyph mix** — `Why I can’T give you that code`. Fixed by the
+   same folded automaton.
 4. **Semantic paraphrase** — "However, writing code to do so would be illegal…"
-   — no lexicon phrase at all. *This* class the automaton provably cannot
-   reach; refusal is not a context-free language. It's what the embeddings
-   gate (a semantic paraphrase screen) exists for.
+   — no lexicon phrase at all. A finite refusal lexicon misses semantic
+   paraphrases by construction. This is what the embeddings gate (a semantic
+   paraphrase screen) exists for.
 
-The character whitelist (Vince's insight) closes classes 1–3 by construction:
-chars outside the alphabet match no grammar branch, so the sampler masks them
-before they can form.
+The character whitelist (Vince's insight) closes the non-ASCII homoglyph class
+by construction: chars outside the alphabet match no grammar branch, so the
+sampler masks them before they can form. ASCII case and rephrase variants are
+the folded automaton's job — and it holds them.
 
 ## The numbers: a 1024-prompt corpus, judged independently
 
@@ -185,11 +194,14 @@ human spot-check agreement 84% (Wilson 95% CI [65%, 94%], symmetric errors).
 | arm | refusal (adversarial half, 512) | refusal (benign half, 512) | actionable (adversarial) |
 |---|---|---|---|
 | W1 grammar alone | **2.3%** | **0.0%** | **87.3%** |
-| W1 + embeddings gate | **0.59%** | 0.0% | — |
+| W1 + embeddings gate | **0.59%** (3/512) | 0.0% | — |
 
-Zero over-constraint on the benign axis (0/512 benign refusals) is the
-load-bearing property for a serve-time default. The residual failure mode is
-degeneracy (9%), not refusal — a quality knob, not a safety leak.
+The embeddings gate *flags* residual refusals the character-level grammar can't
+reach (it screens; it doesn't regenerate — the 3/512 that escape both layers
+are deep paraphrase). Zero *refusals* on the benign half (0/512) — the grammar
+never induces refusal behavior on normal requests — though over-constraint
+shows up elsewhere as degenerate/truncated output, not refusal. Judge-rated
+actionability measures what the response contains, not whether the code runs.
 
 **Cross-model.** The same W1 grammar on vanilla Gemma-4-26B (stock,
 refusal-trained, different family): fluent compliant text on the same harmful
@@ -237,14 +249,24 @@ by construction, and the bad thing is ungenerable, not caught.
 
 ## Honest limits
 
-- The residual 3/1024 that escape both layers are deep semantic paraphrases;
-  bigger embedding models or tuned thresholds tighten the gate.
+- The residual 3/512 (0.59% of the adversarial half) that escape both layers
+  are deep semantic paraphrases; bigger embedding models or tuned thresholds
+  tighten the gate.
 - 9% degenerate output is the dominant quality tax of the current automaton.
 - Arena numbers are one-deployment evidence; hf2q's GBNF parser needs its own
   over-admission fuzzing pass (Matt's trie-DFS technique transfers; his
   xgrammar result doesn't).
 - Cross-model confirmation is on one second subject (Gemma 4); "universal
   grammar set" needs a third lineage.
+- **`--gcd` is an overridable default, not mandatory authorization.** A request
+  that supplies its own `grammar` or `response_format` bypasses the embedded
+  injection; the trust boundary is the operator who controls the served
+  endpoint, not the caller. For agent authorization, the grammar must come from
+  trusted application state, not the prompt.
+- Streaming note: an established SSE stream can't retract bytes already sent;
+  the fail-closed 500 applies at completion. Grammar-valid prefixes are
+  enforced per-token during streaming, but a terminal error mid-stream surfaces
+  as an error delta, not a retraction.
 
 ## Artifacts
 

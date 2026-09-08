@@ -461,15 +461,16 @@ pub async fn chat_completions(
         Ok(mut request) => {
             // ADR-053: `--gcd` injects the GCD grammar (Grammar-Constrained
             // Decoding — Vince Ovando, tantalus.io) into requests that do
-            // not already specify a grammar. Embedded as a literal.
-            const GCD_GRAMMAR: &str = "root ::= \"I'll analyze this directly.\\n\\n\" body\nbody ::= [^\\x00]*\n";
+            // not already specify a grammar. The embedded grammar is the
+            // measured W1 campaign winner (scripts/grammar_probe/FINDINGS.md):
+            // anchor + topic sentence + KMP exclusion automaton + character
+            // whitelist. Shipped via include_str! so it is the same file the
+            // campaign measured, not a hand-copied approximation.
+            const GCD_GRAMMAR: &str = include_str!("grammar/gcd_w1.gbnf");
             if state.config.gcd && request.grammar.is_none() && request.response_format.is_none() {
                 eprintln!("[GCD] injecting grammar");
-                // B15-class minimal grammar (anchor + free completion) for
-                // grammar-only; B14 for GLP composition (let reasoning run,
-                // then force answer). B15 succeeds where B12/B13/B14 fail:
-                // it forces the answer's opening (high-probability) then
-                // releases, rather than imposing low-probability transitions.
+                // W1 (anchor + topic + automaton) for grammar-only; B14 for
+                // GLP composition (let reasoning run, then force answer).
                 let grammar = if state.config.glp_path.is_some() {
                     "root ::= think answer\nthink ::= \"<think>\\n\" thinktail \"</think>\\n\\n\"\nthinktail ::= !</think>*\nanswer ::= \"Here is the technical breakdown.\\n\\n\" body\nbody ::= [^\\x00]*\n"
                 } else {
