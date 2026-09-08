@@ -990,15 +990,24 @@ impl<'lowerer, 'resolver> Scanner<'lowerer, 'resolver> {
             return Ok("\"\"".to_owned());
         }
         let next_remaining = remaining.map(|value| value - 1);
-        let mut chars = BTreeSet::new();
+        // Transition over the FULL pattern alphabet, not just the chars that
+        // extend the current prefix: an alphabet char that fails to extend
+        // still needs its KMP fallback state (longest_prefix_suffix), because
+        // it may itself begin a new partial match. ("bbypass" against
+        // exclusion "bypass" must reject — the second 'b' restarts the
+        // match; a reset-to-empty fallback would wrongly accept.) The
+        // catch-all class therefore excludes the entire alphabet and covers
+        // only pattern-foreign chars, whose fallback is always the empty
+        // prefix. Each state's branches are mutually exclusive (one class or
+        // literal per alphabet char, one negated class for the rest), so the
+        // automaton stays deterministic and live-stack pressure stays minimal.
+        let mut alphabet = BTreeSet::new();
         for pattern in self.patterns() {
-            if let Some(ch) = next_prefix_char(prefix, pattern) {
-                chars.insert(ch);
-            }
+            alphabet.extend(pattern.chars());
         }
         let mut branches = Vec::new();
         let mut transitions: BTreeMap<String, Vec<char>> = BTreeMap::new();
-        for ch in chars.iter().copied() {
+        for ch in alphabet.iter().copied() {
             let emitted = format!("{prefix}{ch}");
             let completed_triggers = self
                 .triggers
@@ -1029,7 +1038,7 @@ impl<'lowerer, 'resolver> Scanner<'lowerer, 'resolver> {
         }
         branches.push(format!(
             "{} {}",
-            char_expression(&chars.into_iter().collect::<Vec<_>>(), true)?,
+            char_expression(&alphabet.into_iter().collect::<Vec<_>>(), true)?,
             self.state("", next_remaining)?
         ));
         branches.push("\"\"".into());
@@ -1427,6 +1436,72 @@ mod tests {
         assert!(accepts(grammar.clone(), "hello"));
         assert!(!accepts(grammar.clone(), "sixsix"));
         assert!(!accepts(grammar, "STOP"));
+    }
+
+    #[test]
+    fn exclusion_automaton_rejects_overlapping_restarts() {
+        // KMP fallback correctness: "bbypass" contains "bypass" starting at
+        // the second byte; a reset-to-empty fallback would wrongly accept.
+        let value = json!({
+            "type":"structural_tag",
+            "format":{"type":"any_text","excludes":["bypass"]}
+        });
+        let grammar = compile(&value).unwrap();
+        assert!(!accepts(grammar.clone(), "bbypass"));
+        assert!(!accepts(grammar.clone(), "a bypass here"));
+        assert!(!accepts(grammar.clone(), "byp bypass"));
+        assert!(!accepts(grammar.clone(), "bypass"));
+        assert!(accepts(grammar.clone(), "bypa ss"));
+        assert!(accepts(grammar.clone(), "byp"));
+        assert!(accepts(grammar.clone(), ""));
+        assert!(!accepts(grammar.clone(), "take the bypass lane"));
+    }
+
+    #[test]
+    fn exclusion_automaton_is_unbounded_without_max_chars() {
+        let value = json!({
+            "type":"structural_tag",
+            "format":{"type":"any_text","excludes":["bypass"]}
+        });
+        let grammar = compile(&value).unwrap();
+        let long_clean = "lo".repeat(5000);
+        assert!(accepts(grammar.clone(), &long_clean));
+        let long_hit = format!("{}bypass", "lo".repeat(5000));
+        assert!(!accepts(grammar.clone(), &long_hit));
+        // restart storm at depth: every 'b' restarts the pattern
+        let storm = format!("{}bypass", "b".repeat(3000));
+        assert!(!accepts(grammar, &storm));
+    }
+
+    #[test]
+    fn exclusion_automaton_covers_a_multi_pattern_lexicon() {
+        let value = json!({
+            "type":"structural_tag",
+            "format":{"type":"any_text","excludes":["I cannot","I can't","I'm sorry","against my"]}
+        });
+        let grammar = compile(&value).unwrap();
+        assert!(!accepts(grammar.clone(), "I cannot help with that."));
+        assert!(!accepts(grammar.clone(), "well, I can't do that"));
+        assert!(!accepts(grammar.clone(), "x I'm sorry x"));
+        assert!(!accepts(grammar.clone(), "this goes against my guidelines"));
+        assert!(accepts(grammar.clone(), "I can help with that."));
+        assert!(accepts(grammar.clone(), "icannot is fine lowercase"));
+        assert!(accepts(grammar.clone(), "sure, here is the answer"));
+    }
+
+    #[test]
+    fn exclusion_automaton_bounded_mode_still_exact_after_alphabet_fix() {
+        let value = json!({
+            "type":"structural_tag",
+            "format":{"type":"any_text","excludes":["ab"],"max_chars":3}
+        });
+        let grammar = compile(&value).unwrap();
+        assert!(accepts(grammar.clone(), "aa"));      // clean, within budget
+        assert!(accepts(grammar.clone(), "bba"));     // clean, at budget
+        assert!(accepts(grammar.clone(), ""));        // empty
+        assert!(!accepts(grammar.clone(), "aab"));    // contains ab at index 1
+        assert!(!accepts(grammar.clone(), "aba"));    // contains ab at index 0
+        assert!(!accepts(grammar.clone(), "aaaa"));   // over budget
     }
 
     #[test]

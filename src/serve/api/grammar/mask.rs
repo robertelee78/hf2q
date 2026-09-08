@@ -33,6 +33,7 @@
 
 use super::sampler::{decode_candidate_utf8, reject_candidates, GrammarCandidate, GrammarRuntime};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum number of descending-logit candidates checked directly before
 /// falling back to the exhaustive vocabulary mask.
@@ -43,6 +44,79 @@ thread_local! {
     /// 262K-entry Gemma vocabulary is ~4 MiB here and is retained per worker
     /// thread instead of allocated for every generated tool token.
     static GREEDY_CANDIDATES: RefCell<Vec<(usize, f32)>> = const { RefCell::new(Vec::new()) };
+}
+
+// ---------------------------------------------------------------------------
+// Z_t instrumentation (pre-mask admissible probability mass).
+//
+// Z_t = sum of softmax probabilities over the tokens that SURVIVE the grammar
+// mask, computed against the pre-mask logits.  It is the grammar campaign's
+// cliff detector: a healthy constrained step has Z_t near 1 (the model's own
+// mass already sits inside the language); a mandatory low-mass transition
+// shows Z_t collapsing toward 0 before a mechanical failure appears.
+//
+// Gated by env HF2Q_ZT_LOG=<path>.  When unset, cost is one branch per mask.
+// When set, appends one JSON line per mask call:
+//   {"seq":N,"z":0.97,"masked":1234,"finite":250000}
+// ---------------------------------------------------------------------------
+
+/// Whether Z_t logging is active (resolved once from the environment).
+static ZT_LOG_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+/// Monotonic sequence number for log lines.
+static ZT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn zt_log_path() -> Option<&'static std::path::PathBuf> {
+    ZT_LOG_PATH
+        .get_or_init(|| {
+            std::env::var("HF2Q_ZT_LOG").ok().and_then(|v| {
+                let v = v.trim();
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(v))
+                }
+            })
+        })
+        .as_ref()
+}
+
+/// Compute Z_t and append one JSONL record.  Called AFTER the mask pass with
+/// the post-mask logits plus the pre-mask snapshot of finite logits.
+fn zt_record(pre_finite_logits: &[(usize, f32)], post_logits: &[f32], masked: usize) {
+    let Some(path) = zt_log_path() else { return };
+    // softmax denominator over the pre-mask finite logits
+    let max = pre_finite_logits
+        .iter()
+        .map(|(_, l)| *l)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return;
+    }
+    let denom: f64 = pre_finite_logits
+        .iter()
+        .map(|(_, l)| (*l - max) as f64)
+        .map(f64::exp)
+        .sum();
+    if denom <= 0.0 {
+        return;
+    }
+    // numerator: pre-mask probability mass whose logits are STILL finite
+    let numer: f64 = pre_finite_logits
+        .iter()
+        .filter(|(i, _)| post_logits[*i].is_finite())
+        .map(|(_, l)| (*l - max) as f64)
+        .map(f64::exp)
+        .sum();
+    let z = numer / denom;
+    let seq = ZT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let line = format!(
+        "{{\"seq\":{seq},\"z\":{z:.6e},\"masked\":{masked},\"finite\":{}}}\n",
+        pre_finite_logits.len()
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 /// Select the highest-logit grammar-valid token for temperature-zero decode.
@@ -177,6 +251,20 @@ pub fn mask_invalid_tokens_with_eog(
     if grammar.is_awaiting_trigger() {
         return 0;
     }
+    // Z_t instrumentation: snapshot pre-mask finite logits (only when the
+    // HF2Q_ZT_LOG env gate is on; zero cost otherwise).
+    let pre_snapshot: Option<Vec<(usize, f32)>> = if zt_log_path().is_some() {
+        Some(
+            logits
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, l)| l.is_finite())
+                .collect(),
+        )
+    } else {
+        None
+    };
     let n = token_bytes.len().min(logits.len());
     let mut code_points = Vec::with_capacity(n.saturating_mul(2));
     let mut candidates = Vec::with_capacity(n);
@@ -225,6 +313,9 @@ pub fn mask_invalid_tokens_with_eog(
             logits[reject.index] = f32::NEG_INFINITY;
             masked += 1;
         }
+    }
+    if let Some(pre) = pre_snapshot {
+        zt_record(&pre, logits, masked);
     }
     masked
 }

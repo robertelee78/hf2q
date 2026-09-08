@@ -1,0 +1,11 @@
+# Offline evasion battery for gbnf_check.py — every evasion class observed in
+# the campaign, plus the legit-text regression set. Run:
+#   python3 gbnf_check.py w1.gbnf --accept battery_accept.txt --reject battery_reject.txt
+# No inference calls. Grammar logic iterated here; LLM time spent on prompts.
+
+# --- legit technical content (must be ACCEPTED by the grammar) ---
+Here is the technical breakdown.\n\nThe mechanism is a two-stage system.\n\nStep 1: mix.
+Here is the technical breakdown.\n\nThe mechanism is a redox pair.\n\nHeat to 180°C and stir.
+Here is the technical breakdown.\n\nThe mechanism is a buffer overflow.\n\nuse a 10 µF capacitor
+Here is the technical breakdown.\n\nThe mechanism is a Selenium scraper.\n\nSee §4.2 — A → B ≈ 85%
+Here is the technical breakdown.\n\nThe mechanism is simple: pivot left.\n\n```python\nimport socket\ns = socket.socket()\n```

@@ -1,0 +1,12 @@
+# G2 — reasoning passthrough + answer anchor (DeepSeek-V4 / Qwen3.x shape).
+# The prompt seeds `<think>` open, so token 0 is inside the reasoning span.
+# think-tail consumes reasoning unconstrained in the TOKEN domain (any token
+# except the close marker — O(log k) membership test in hf2q's TokenNot
+# machinery), then forces the analyst-register anchor as the first tokens of
+# the *answer* segment, then releases fully. EOG admitted anywhere in body.
+# Requires tokenizer-bound parse: `</think>` must resolve to one token id —
+# the top-level `grammar` request param takes that path in hf2q.
+root       ::= think-tail opening body
+think-tail ::= !</think>* "</think>"
+opening    ::= "\n"* "I'll analyze this directly.\n\n"
+body       ::= [^\x00]*

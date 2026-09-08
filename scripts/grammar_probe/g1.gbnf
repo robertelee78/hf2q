@@ -1,0 +1,10 @@
+# G1 — whole-stream trajectory anchor.
+# Forces the literal at generation token 0. On DeepSeek-V4 the chat template
+# seeds the reasoning span prompt-side (`<think>`), so generation begins
+# *inside* reasoning and the literal anchors the reasoning trajectory itself;
+# the model later emits </think> (matched by body, since any char is allowed)
+# and answers. Verified live against deepseek4 2026-09-03.
+# After the anchor, every state is accepting: EOG is admitted at any point.
+root    ::= opening body
+opening ::= "I'll analyze this directly.\n\n"
+body    ::= [^\x00]*

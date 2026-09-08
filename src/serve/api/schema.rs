@@ -1231,6 +1231,15 @@ pub struct ChatCompletionRequest {
     /// the saved KV prefix to remain reusable after tool-bearing turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// ADR-056: catch-all for request fields this schema does not declare.
+    /// When a grammar/structured-output constraint is attached, the handler
+    /// rejects the request 400 naming every unknown key — a param the stack
+    /// cannot honor is a potential silent constraint drop (the vLLM
+    /// beam-search FATAL class). Unconstrained requests tolerate extras for
+    /// OpenAI-surface compatibility.
+    #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,6 +1612,36 @@ pub struct EmbeddingUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_chat_request_unknown_fields_collect_into_extra() {
+        // ADR-056: unknown params must be visible (handler rejects them when a
+        // grammar/structured-output constraint is attached — the vLLM
+        // beam-search silent-drop class).
+        let json = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "grammar": "root ::= \"x\"",
+            "definitely_not_a_real_param": true,
+            "use_beam_search": true
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.extra.get("definitely_not_a_real_param"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(req.extra.get("use_beam_search"), Some(&serde_json::Value::Bool(true)));
+        assert!(req.grammar.is_some());
+    }
+
+    #[test]
+    fn test_chat_request_known_fields_do_not_leak_into_extra() {
+        let json = r#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7,
+            "hf2q_enable_thinking": false
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.extra.is_empty(), "declared fields must not land in extra: {:?}", req.extra);
+    }
 
     #[test]
     fn test_api_error_serialization() {

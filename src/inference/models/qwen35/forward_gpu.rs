@@ -5681,6 +5681,29 @@ impl Qwen35Model {
             }
 
             // ----------------------------------------------------------
+            // ADR-053: GLP runtime steering — post-layer residual projection.
+            // `hidden` here holds the complete residual stream after this
+            // layer's FFN (either the fused fold from the FFN command buffer,
+            // or `residual_add_gpu` output); the GLP spec's hook point is
+            // `residual_stream_post_layer`, applied per layer at exactly this
+            // assignment. Per-layer dispatch; off unless a vector is bound.
+            if let Some(glp) = self.glp.as_ref() {
+                if let Some(direction) = glp.direction_for((layer_idx + 1) as u32) {
+                    crate::inference::glp::apply_layer_gpu(
+                        &mut hidden,
+                        direction,
+                        glp.mode(),
+                        glp.alpha,
+                        &device,
+                        &mut registry,
+                        seq_len,
+                        h,
+                    )
+                    .with_context(|| format!("glp apply layer {layer_idx}"))?;
+                }
+            }
+
+            // ----------------------------------------------------------
             // Wedge-4c.5: Qwen3-VL DeepStack post-FFN-residual injection.
             //
             // At LM layer `il < n_deepstack`, add the deepstack chunk for layer il

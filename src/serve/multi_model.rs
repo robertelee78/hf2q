@@ -125,6 +125,10 @@ pub struct EngineConfig {
     /// surface (Decision #19): when full, handlers see `queue_full` and
     /// map to 429 + Retry-After.
     pub queue_capacity: usize,
+    /// ADR-053: optional GLP steering vector path (loaded at model-load).
+    pub glp_path: Option<PathBuf>,
+    /// ADR-053: steering dose override.
+    pub glp_alpha: Option<f32>,
     /// When `true`, run `Engine::warmup()` on a temporary tokio runtime
     /// before returning.  The hot-swap orchestrator and the existing
     /// `cmd_serve` startup both pass `true` so the returned engine is

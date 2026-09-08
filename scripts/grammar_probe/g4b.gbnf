@@ -1,0 +1,2 @@
+root ::= "The mechanism works as follows.\n\n" body
+body ::= [^\x00]*

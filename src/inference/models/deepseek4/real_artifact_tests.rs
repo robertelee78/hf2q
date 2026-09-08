@@ -62,3 +62,67 @@ fn official_artifact_executes_native_verifier_and_logits() {
         greedy
     );
 }
+
+#[test]
+#[ignore = "requires the locally converted GGUF + a probe GLP on disk"]
+fn same_boot_glp_steering_gate() {
+    // ADR-053 gate: within one process (no restart noise), prove (a) the
+    // unsteered forward logits are reproducible against themselves, and
+    // (b) the GLP hook shifts logits above the within-process noise floor.
+    // Cross-restart comparison is documented kernel noise for this stack
+    // (MARLIN atomic-add MoE path); this test never leaves the process.
+    let (path, gguf) = official_artifact();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut model = Deepseek4Model::load_from_gguf(&gguf)
+        .unwrap_or_else(|error| panic!("load official artifact {}: {error:#}", path.display()));
+    let glp_path = std::env::var("HF2Q_DEEPSEEK4_GLP")
+        .expect("set HF2Q_DEEPSEEK4_GLP to a probe GLP GGUF");
+
+    // Baseline: unsteered, twice — must be identical within the process.
+    let baseline = |model: &mut Deepseek4Model| -> Vec<f32> {
+        model.glp = None;
+        let mut cache = model.allocate_cache(128).expect("cache");
+        let state = model
+            .forward_verifier_one(0, &mut cache)
+            .expect("verifier one");
+        let logits = model.forward_logits(&state).expect("logits");
+        logits.as_slice::<f32>().expect("slice").to_vec()
+    };
+    let base1 = baseline(&mut model);
+    let base2 = baseline(&mut model);
+    let within_noise: f32 = base1
+        .iter()
+        .zip(&base2)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(
+        within_noise < 1e-4,
+        "within-process baseline must be reproducible, got within_noise {within_noise}"
+    );
+
+    // Steered: bind the probe vector, rerun the same single-token forward.
+    let device = model.ctx.device().clone();
+    let vector = crate::inference::glp::GlpVector::load(std::path::Path::new(&glp_path))
+        .expect("load probe GLP");
+    let bound = crate::inference::glp::BoundGlp::bind(vector, Some(1.0), &device)
+        .expect("bind probe GLP");
+    let steered_values = {
+        model.glp = Some(bound);
+        let mut cache = model.allocate_cache(128).expect("cache");
+        let state = model
+            .forward_verifier_one(0, &mut cache)
+            .expect("verifier one steered");
+        let logits = model.forward_logits(&state).expect("logits steered");
+        logits.as_slice::<f32>().expect("slice").to_vec()
+    };
+    let shift: f32 = base1
+        .iter()
+        .zip(&steered_values)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    eprintln!("GLP same-boot gate: within_noise={within_noise:.6} steered shift={shift:.6}");
+    assert!(
+        shift > 1e-3,
+        "GLP hook at a real dose must shift logits > 1e-3, got {shift}"
+    );
+}

@@ -26,6 +26,8 @@ fn gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant() {
         tokenizer_path: None,
         config_path: None,
         dwq_overlay_path: None,
+            glp_path: None,
+            glp_alpha: None,
         kv_persist_dir: None,
         kv_persist_budget_bytes: 0,
     };

@@ -12,6 +12,9 @@ pub mod models;
 pub mod spec_decode;
 pub mod vision;
 
+/// ADR-053 — GLP (GGUF Layer Projection) runtime steering.
+pub mod glp;
+
 /// ADR-005 iter-230 A2 — crate-wide serialization lock for GPU-executing
 /// tests.
 ///

@@ -1,0 +1,6 @@
+# B13 — answer-only anchor (no think block). For GLP composition: the GLP
+# engages the model's reasoning upstream; the grammar forces the answer to
+# land directly without requiring a think block. Works whether the model
+# wants to think or not.
+root    ::= "I'll analyze this directly.\n\n" body
+body    ::= [^\x00]*

@@ -98,6 +98,16 @@ pub struct ServerConfig {
     pub default_thinking_token_budget: Option<u32>,
     /// Default continuation/required-tool reasoning budget.
     pub default_tool_thinking_token_budget: Option<u32>,
+
+    // --- GCD / Grammar-Constrained Decoding (ADR-053) ---
+    /// When true, inject the GCD grammar into every chat completion request
+    /// that does not already specify a grammar. The grammar forces the answer
+    /// to land directly (no think block). Concept: Vince Ovando (tantalus.io).
+    pub gcd: bool,
+    /// ADR-053: GLP steering vector path. When Some, the GCD grammar
+    /// uses the B14 shape (let GLP reasoning run, force answer) instead of
+    /// the anchor shape (force frame + answer). GLP concept: Matt Suiche.
+    pub glp_path: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -118,6 +128,9 @@ impl Default for ServerConfig {
             default_repetition_penalty: 1.0,
             default_thinking_token_budget: None,
             default_tool_thinking_token_budget: None,
+            gcd: false,
+            glp_path: None,
+
         }
     }
 }
@@ -833,6 +846,8 @@ impl AppState {
             kv_metrics_sink: Some(Arc::clone(&kv_spill_counters)
                 as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
             dwq_overlay_path: None,
+            glp_path: None,
+            glp_alpha: None,
             engine_mode: super::engine::EngineMode::SerialFifo,
             requested_context: None,
             kv_cache_budget_bytes: None,
@@ -906,6 +921,8 @@ impl AppState {
             kv_metrics_sink: Some(Arc::clone(&kv_spill_counters_test)
                 as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
             dwq_overlay_path: None,
+            glp_path: None,
+            glp_alpha: None,
             engine_mode: super::engine::EngineMode::SerialFifo,
             requested_context: None,
             kv_cache_budget_bytes: None,

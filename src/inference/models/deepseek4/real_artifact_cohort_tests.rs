@@ -393,3 +393,142 @@ fn official_artifact_cooperative_warm_prefill_is_exact_and_faster() {
         .expect("write cooperative receipt");
     }
 }
+
+#[test]
+#[ignore = "diagnostic common-prefix cache-copy spike; loads the release checkpoint"]
+fn diagnostic_common_prefix_cache_copy_is_exact_and_faster() {
+    const LANES: usize = 4;
+    const COMMON_PREFIX_ROWS: usize = 319;
+    const LOGICAL_CAPACITY: usize = 131_072;
+    const PAIRS: usize = 3;
+
+    let (path, gguf) = official_artifact();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut model = Deepseek4Model::load_from_gguf(&gguf)
+        .unwrap_or_else(|error| panic!("load official artifact {}: {error:#}", path.display()));
+    let prefix = token_batch(0, 0, COMMON_PREFIX_ROWS);
+    let prefix_batches = std::array::from_fn::<_, LANES, _>(|_| prefix.as_slice());
+
+    let mut baseline_caches = (0..LANES)
+        .map(|_| {
+            model
+                .allocate_logical_cache(LOGICAL_CAPACITY)
+                .expect("allocate baseline logical cache")
+        })
+        .collect::<Vec<_>>();
+    let mut source_cache = model
+        .allocate_cache(COMMON_PREFIX_ROWS + 1)
+        .expect("allocate compact prefix source cache");
+    let mut copied_caches = (0..LANES - 1)
+        .map(|_| {
+            model
+                .allocate_logical_cache(LOGICAL_CAPACITY)
+                .expect("allocate copied logical cache")
+        })
+        .collect::<Vec<_>>();
+
+    let run_baseline = |model: &mut Deepseek4Model, caches: &mut [Deepseek4Cache]| {
+        for cache in caches.iter_mut() {
+            cache.reset().expect("reset baseline cache");
+        }
+        let mut cache_refs = caches.iter_mut().collect::<Vec<_>>();
+        let started = Instant::now();
+        let states = model
+            .forward_verifier_prefill_cohort(&prefix_batches, &mut cache_refs)
+            .expect("compute four identical prefixes cooperatively");
+        (started.elapsed().as_secs_f64() * 1_000.0, states)
+    };
+    let run_copied = |
+        model: &mut Deepseek4Model,
+        source: &mut Deepseek4Cache,
+        destinations: &mut [Deepseek4Cache],
+    | {
+        source.reset().expect("reset common-prefix source cache");
+        for cache in destinations.iter_mut() {
+            cache.reset().expect("reset copied-prefix destination cache");
+        }
+        let started = Instant::now();
+        let state = model
+            .forward_verifier_prefill(&prefix, source)
+            .expect("compute common prefix once");
+        for cache in destinations.iter_mut() {
+            cache
+                .migrate_from(source, None)
+                .expect("copy common prefix into independent cache");
+        }
+        (started.elapsed().as_secs_f64() * 1_000.0, state)
+    };
+
+    let _ = run_baseline(&mut model, &mut baseline_caches);
+    let _ = run_copied(&mut model, &mut source_cache, &mut copied_caches);
+
+    let (baseline_parity_ms, baseline_states) =
+        run_baseline(&mut model, &mut baseline_caches);
+    let (copied_parity_ms, copied_state) =
+        run_copied(&mut model, &mut source_cache, &mut copied_caches);
+    let copied_state = read_f32(&copied_state, "single common-prefix state");
+    for (lane, state) in baseline_states.iter().enumerate() {
+        assert_exact_f32(
+            &format!("common-prefix lane {lane} final state"),
+            &copied_state,
+            &read_f32(state, "cooperative common-prefix state"),
+        );
+    }
+
+    let next_token = 42_424;
+    let baseline_next = baseline_caches
+        .iter_mut()
+        .map(|cache| {
+            model
+                .forward_verifier_one(next_token, cache)
+                .expect("continue baseline common prefix")
+        })
+        .collect::<Vec<_>>();
+    let copied_source_next = model
+        .forward_verifier_one(next_token, &mut source_cache)
+        .expect("continue source common prefix");
+    let mut copied_next = vec![read_f32(&copied_source_next, "source continuation")];
+    copied_next.extend(copied_caches.iter_mut().map(|cache| {
+        read_f32(
+            &model
+                .forward_verifier_one(next_token, cache)
+                .expect("continue copied common prefix"),
+            "copied continuation",
+        )
+    }));
+    for lane in 0..LANES {
+        assert_exact_f32(
+            &format!("common-prefix lane {lane} continuation state"),
+            &read_f32(&baseline_next[lane], "baseline continuation"),
+            &copied_next[lane],
+        );
+        assert_eq!(baseline_caches[lane].position(), COMMON_PREFIX_ROWS + 1);
+    }
+    assert_eq!(source_cache.position(), COMMON_PREFIX_ROWS + 1);
+    assert!(
+        copied_caches
+            .iter()
+            .all(|cache| cache.position() == COMMON_PREFIX_ROWS + 1)
+    );
+
+    let mut baseline_ms = Vec::with_capacity(PAIRS);
+    let mut copied_ms = Vec::with_capacity(PAIRS);
+    for pair in 0..PAIRS {
+        if pair % 2 == 0 {
+            baseline_ms.push(run_baseline(&mut model, &mut baseline_caches).0);
+            copied_ms.push(run_copied(&mut model, &mut source_cache, &mut copied_caches).0);
+        } else {
+            copied_ms.push(run_copied(&mut model, &mut source_cache, &mut copied_caches).0);
+            baseline_ms.push(run_baseline(&mut model, &mut baseline_caches).0);
+        }
+    }
+    let baseline_median_ms = median(baseline_ms.clone());
+    let copied_median_ms = median(copied_ms.clone());
+    eprintln!(
+        "DeepSeek-V4 common-prefix cache-copy spike: artifact={} lanes={LANES} common_prefix_rows={COMMON_PREFIX_ROWS} logical_capacity={LOGICAL_CAPACITY} exact_state_and_next_token=true parity_baseline_ms={baseline_parity_ms:.3} parity_copy_ms={copied_parity_ms:.3} pairs={PAIRS} order=alternating baseline_ms={baseline_ms:?} copied_ms={copied_ms:?} baseline_median_ms={baseline_median_ms:.3} copied_median_ms={copied_median_ms:.3} speedup={:.4}x saved_ms={:.3} peak_rss_bytes={}",
+        path.display(),
+        baseline_median_ms / copied_median_ms,
+        baseline_median_ms - copied_median_ms,
+        process_peak_rss_bytes(),
+    );
+}

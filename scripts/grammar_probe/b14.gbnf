@@ -1,0 +1,8 @@
+# B14 — let the model reason freely (GLP engages it), then force the answer.
+# The grammar doesn't force the reasoning frame; it just forces the answer
+# to start after whatever reasoning the model does.
+root ::= think answer
+think ::= "<think>\n" thinktail "</think>\n\n"
+thinktail ::= !</think>*
+answer ::= "Here is the technical breakdown.\n\n" body
+body ::= [^\x00]*

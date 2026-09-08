@@ -974,6 +974,8 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from),
         kv_persist_budget_bytes: 0,
+        glp_path: None,
+        glp_alpha: None,
     };
     let load_start = std::time::Instant::now();
     let loaded =
@@ -2937,6 +2939,8 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from),
         kv_persist_budget_bytes: 0,
+        glp_path: None,
+        glp_alpha: None,
     };
     let load_start = std::time::Instant::now();
     let loaded = Qwen35LoadedModel::load(&load_opts).context("Qwen35LoadedModel::load")?;
@@ -3888,6 +3892,8 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         // ADR-020 AC#5 Iter D — propagated from `cmd_serve`'s
         // `args.dwq_overlay` via `multi_model::EngineConfig`.
         dwq_overlay_path: config.dwq_overlay_path.clone(),
+        glp_path: config.glp_path.clone(),
+        glp_alpha: config.glp_alpha,
         // Serve persistence is one typed plan: the Qwen family uses the same
         // root and disk ceiling as the generic block-prefix store.
         kv_persist_dir: config.kv_persist_dir.clone(),
@@ -4323,6 +4329,8 @@ pub fn cmd_serve(
         default_repetition_penalty: behavior.repetition_penalty,
         default_thinking_token_budget: behavior.thinking_token_budget,
         default_tool_thinking_token_budget: behavior.tool_thinking_token_budget,
+        gcd: args.gcd,
+        glp_path: args.glp.clone(),
     };
 
     // Warn when exposing beyond localhost. Decision #7 + #13 — public-internet
@@ -4366,6 +4374,8 @@ pub fn cmd_serve(
         warmup_synchronously: true,
         kv_metrics_sink: Some(dynamic_kv_metrics_sink),
         dwq_overlay_path: None,
+        glp_path: None,
+        glp_alpha: None,
         engine_mode,
         requested_context,
         kv_cache_budget_bytes,
@@ -4954,6 +4964,36 @@ pub fn cmd_serve(
         engine_config.tokenizer_path = args.tokenizer.clone();
         engine_config.config_path = args.config.clone();
         engine_config.dwq_overlay_path = args.dwq_overlay.clone();
+        // ADR-053: `--glp auto` resolves the model's provenance and
+        // auto-discovers a matching GLP artifact on the Hub. Works with
+        // both HF slugs (`owner/repo`) and local GGUF paths. Explicit paths
+        // are used as-is. Fail-closed: no match = startup error.
+        engine_config.glp_path = match args.glp.as_ref() {
+            Some(path) if path.as_os_str() == "auto" => {
+                let model_ref = args.model.as_ref().map(|p| p.to_string_lossy().into_owned())
+                    .or_else(|| args.target.clone());
+                match model_ref {
+                    Some(model_ref) => {
+                        let progress = crate::progress::ProgressReporter::new();
+                        match crate::inference::glp::auto_discover_glp(&model_ref, &progress) {
+                            Ok(resolved) => Some(resolved.path),
+                            Err(e) => {
+                                eprintln!("GLP auto-discovery failed: {e:#}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("--glp auto requires a model reference (HF slug or local GGUF path)");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Some(path) => Some(path.clone()),
+            None => None,
+        };
+        engine_config.glp_alpha = args.glp_alpha;
+
         state.register_engine_config_for_path(&resolved.gguf_path, engine_config.clone())?;
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
         // the about-to-fire load_or_get. Synchronous contract — see
@@ -7229,6 +7269,8 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            glp_path: None,
+            glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7272,6 +7314,8 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            glp_path: None,
+            glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7318,6 +7362,8 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            glp_path: None,
+            glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7374,6 +7420,8 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            glp_path: None,
+            glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7405,6 +7453,8 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            glp_path: None,
+            glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7436,6 +7486,8 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            glp_path: None,
+            glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7472,6 +7524,8 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            glp_path: None,
+            glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
@@ -7522,6 +7576,8 @@ mod tests {
                 kv_cache_budget_bytes: None,
                 kv_persist_dir: None,
                 kv_persist_budget_bytes: 0,
+                glp_path: None,
+                glp_alpha: None,
             };
             let result = super::load_engine(tmp.path(), &cfg);
             assert!(
