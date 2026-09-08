@@ -447,6 +447,12 @@ impl Candidate {
                 if !authority.is_stable()? {
                     bail!("managed text GGUF changed after bounded verification");
                 }
+                if !crate::core::bounded_file::regular_path_matches_identity(
+                    &self.path,
+                    authority.identity(),
+                )? {
+                    bail!("managed text GGUF path does not match its retained activation authority");
+                }
                 authority
             }
             None => verify_candidate(&self)
