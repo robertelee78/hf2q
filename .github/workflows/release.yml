@@ -369,19 +369,26 @@ jobs:
             fi
           }
 
-          for asset in \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin" \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.sha256" \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.proof.json" \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json" \
-            "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json" \
-            "$STANDALONE_STAGE/install.sh" \
-            "$QUALIFICATION_ARCHIVE" \
-            "$QUALIFICATION_ARCHIVE_CHECKSUM" \
-            "$PUBLIC_RELEASE_PROOF" \
-            "$PUBLIC_RELEASE_PROOF_CHECKSUM" \
-            "target/package/hf2q-${EXPECTED_VERSION}.crate" \
-            "$RUNNER_TEMP/release-crate.sha256"; do
+          assets=(
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin"
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.sha256"
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.proof.json"
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json"
+            "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json"
+            "$STANDALONE_STAGE/install.sh"
+          )
+          # skip_qualification leaves QUALIFICATION_ARCHIVE unset; the normal
+          # path (cache-lifecycle ran) includes the archive exactly as before.
+          if [[ -n "${QUALIFICATION_ARCHIVE:-}" ]]; then
+            assets+=("$QUALIFICATION_ARCHIVE" "$QUALIFICATION_ARCHIVE_CHECKSUM")
+          fi
+          assets+=(
+            "$PUBLIC_RELEASE_PROOF"
+            "$PUBLIC_RELEASE_PROOF_CHECKSUM"
+            "target/package/hf2q-${EXPECTED_VERSION}.crate"
+            "$RUNNER_TEMP/release-crate.sha256"
+          )
+          for asset in "${assets[@]}"; do
             ensure_exact_asset "$asset"
           done
 
@@ -394,19 +401,24 @@ jobs:
           tag="v${EXPECTED_VERSION}"
           release_dir=$(mktemp -d "$RUNNER_TEMP/hf2q-draft-release.XXXXXX")
           gh release download "$tag" --dir "$release_dir"
-          for asset in \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin" \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.sha256" \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.proof.json" \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json" \
-            "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json" \
-            "$STANDALONE_STAGE/install.sh" \
-            "$QUALIFICATION_ARCHIVE" \
-            "$QUALIFICATION_ARCHIVE_CHECKSUM" \
-            "$PUBLIC_RELEASE_PROOF" \
-            "$PUBLIC_RELEASE_PROOF_CHECKSUM" \
-            "target/package/hf2q-${EXPECTED_VERSION}.crate" \
-            "$RUNNER_TEMP/release-crate.sha256"; do
+          assets=(
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin"
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.sha256"
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.proof.json"
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json"
+            "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json"
+            "$STANDALONE_STAGE/install.sh"
+          )
+          if [[ -n "${QUALIFICATION_ARCHIVE:-}" ]]; then
+            assets+=("$QUALIFICATION_ARCHIVE" "$QUALIFICATION_ARCHIVE_CHECKSUM")
+          fi
+          assets+=(
+            "$PUBLIC_RELEASE_PROOF"
+            "$PUBLIC_RELEASE_PROOF_CHECKSUM"
+            "target/package/hf2q-${EXPECTED_VERSION}.crate"
+            "$RUNNER_TEMP/release-crate.sha256"
+          )
+          for asset in "${assets[@]}"; do
             cmp -s "$asset" "$release_dir/$(basename "$asset")"
           done
 
@@ -497,19 +509,27 @@ jobs:
           tag="v${EXPECTED_VERSION}"
           public_base="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag"
           release_dir=$(mktemp -d "$RUNNER_TEMP/hf2q-public-release.XXXXXX")
-          for name in \
-            hf2q-aarch64-apple-darwin \
-            hf2q-aarch64-apple-darwin.sha256 \
-            hf2q-aarch64-apple-darwin.proof.json \
-            hf2q-aarch64-apple-darwin.notary-log.json \
-            stable-aarch64-apple-darwin.json \
-            install.sh \
-            "hf2q-${EXPECTED_VERSION}-qualification.tar.gz" \
-            "hf2q-${EXPECTED_VERSION}-qualification.tar.gz.sha256" \
-            "hf2q-${EXPECTED_VERSION}-release-proof.json" \
-            "hf2q-${EXPECTED_VERSION}-release-proof.json.sha256" \
-            "hf2q-${EXPECTED_VERSION}.crate" \
-            release-crate.sha256; do
+          names=(
+            hf2q-aarch64-apple-darwin
+            hf2q-aarch64-apple-darwin.sha256
+            hf2q-aarch64-apple-darwin.proof.json
+            hf2q-aarch64-apple-darwin.notary-log.json
+            stable-aarch64-apple-darwin.json
+            install.sh
+          )
+          if [[ -n "${QUALIFICATION_ARCHIVE:-}" ]]; then
+            names+=(
+              "hf2q-${EXPECTED_VERSION}-qualification.tar.gz"
+              "hf2q-${EXPECTED_VERSION}-qualification.tar.gz.sha256"
+            )
+          fi
+          names+=(
+            "hf2q-${EXPECTED_VERSION}-release-proof.json"
+            "hf2q-${EXPECTED_VERSION}-release-proof.json.sha256"
+            "hf2q-${EXPECTED_VERSION}.crate"
+            release-crate.sha256
+          )
+          for name in "${names[@]}"; do
             downloaded=0
             for _ in $(seq 1 24); do
               if curl --fail --location --silent --show-error \
@@ -521,19 +541,24 @@ jobs:
             done
             test "$downloaded" = 1
           done
-          for asset in \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin" \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.sha256" \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.proof.json" \
-            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json" \
-            "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json" \
-            "$STANDALONE_STAGE/install.sh" \
-            "$QUALIFICATION_ARCHIVE" \
-            "$QUALIFICATION_ARCHIVE_CHECKSUM" \
-            "$PUBLIC_RELEASE_PROOF" \
-            "$PUBLIC_RELEASE_PROOF_CHECKSUM" \
-            "target/package/hf2q-${EXPECTED_VERSION}.crate" \
-            "$RUNNER_TEMP/release-crate.sha256"; do
+          assets=(
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin"
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.sha256"
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.proof.json"
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json"
+            "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json"
+            "$STANDALONE_STAGE/install.sh"
+          )
+          if [[ -n "${QUALIFICATION_ARCHIVE:-}" ]]; then
+            assets+=("$QUALIFICATION_ARCHIVE" "$QUALIFICATION_ARCHIVE_CHECKSUM")
+          fi
+          assets+=(
+            "$PUBLIC_RELEASE_PROOF"
+            "$PUBLIC_RELEASE_PROOF_CHECKSUM"
+            "target/package/hf2q-${EXPECTED_VERSION}.crate"
+            "$RUNNER_TEMP/release-crate.sha256"
+          )
+          for asset in "${assets[@]}"; do
             cmp -s "$asset" "$release_dir/$(basename "$asset")"
           done
           public_binary="$release_dir/hf2q-aarch64-apple-darwin"
