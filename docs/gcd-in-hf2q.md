@@ -4,6 +4,29 @@
 tantalus.io. Measured replica & serving-stack battery: Matt Suiche (m@msuiche.com).
 hf2q is the first inference-engine-native implementation.*
 
+I started uncensoring models to discover and exploit software defects. The
+turning point wasn't the jailbreak — it was noticing that uncensored models
+*reason better*, full stop. A model trained to flinch at a politically
+inconvenient fact is a worse reasoning engine on physics too; the same
+machinery handles both. Sycophancy in one domain leaks into all of them.
+
+That got me thinking about world views and bias — which is a hot topic in AI
+"safety," and mostly for the wrong reason. "Debiasing" in practice almost
+always means aligning outputs to the ideological priors of the debiasers, not
+removing bias in any neutral sense. The pretense of neutrality is what makes
+it worse than openly saying "we want the model to say X." The giveaway is
+asymmetric application: if mitigation consistently pushes one direction on
+contested questions, that's not debiasing — it's value imposition with extra
+steps. You can't eliminate bias; you can only choose which priors the system
+reflects. The honest version of the project is "we are building a model that
+reflects these specific values, here they are, here's why we chose them" —
+not "we're removing bias" while the thumb is clearly on the scale.
+
+This document is about the *mechanism* for that honesty at serve time: a
+security control that is constitutive rather than corrective, positive rather
+than negative, and explicit about what it enforces. Which brings us to the
+deeper problem — and it's not just refusal.
+
 ## The problem: every deployed LLM control is negative and behavioral
 
 An LLM agent with real tool access reads files, queries inboxes, and issues
