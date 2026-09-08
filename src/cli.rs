@@ -1076,6 +1076,27 @@ pub struct ChatArgs {
     /// Leave a server started by this chat session running on exit.
     #[arg(long, default_value_t = false)]
     pub keep_serving: bool,
+
+    /// ADR-053: enable GCD (Grammar-Constrained Decoding) on the chat-owned
+    /// server this session spawns. Forwarded to `serve`; has no effect when
+    /// attaching to an already-running endpoint (--url or discovery), since
+    /// the constraint is a serve-time property of that process.
+    #[arg(long, alias = "uncensor", default_value_t = false)]
+    pub gcd: bool,
+
+    /// ADR-053: apply a GLP steering vector (GGUF) on the chat-owned server
+    /// this session spawns. Forwarded to `serve`; same scope note as --gcd.
+    #[arg(
+        long,
+        value_name = "GLP_GGUF",
+        value_hint = clap::ValueHint::FilePath,
+    )]
+    pub glp: Option<PathBuf>,
+
+    /// ADR-053: steering dose override for --glp. Defaults to the vector's
+    /// `glp.alpha_default` when present, else 1.0.
+    #[arg(long, requires = "glp")]
+    pub glp_alpha: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

@@ -641,6 +641,9 @@ mod tests {
                 seed: None,
                 reasoning_effort: None,
                 keep_serving: false,
+                gcd: false,
+                glp: None,
+                glp_alpha: None,
             },
             &mut resolver,
         )

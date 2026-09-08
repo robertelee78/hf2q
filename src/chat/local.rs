@@ -31,6 +31,15 @@ const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const MODEL_STARTUP_HEARTBEAT: Duration = Duration::from_secs(30);
 const MAX_STARTUP_EVENTS_PER_TICK: usize = 32;
 
+/// ADR-053 steering flags forwarded verbatim to the chat-owned `serve` child.
+/// Serve-time properties: they only apply to a server this session spawns.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct OwnedServeFlags {
+    pub gcd: bool,
+    pub glp: Option<std::path::PathBuf>,
+    pub glp_alpha: Option<f32>,
+}
+
 #[derive(Debug)]
 struct VerifiedServer {
     identity: DiscoveryIdentity,
@@ -110,7 +119,16 @@ async fn resolve_local(
 
     let mut startup_ui = StartupUi::new(output, interactive, StartupOutput::Stdout);
     startup_ui.announce_owned(args.target.is_some())?;
-    let mut child = spawn_server(args.target.as_deref(), state_root).context("start hf2q serve")?;
+    let mut child = spawn_server(
+        args.target.as_deref(),
+        state_root,
+        OwnedServeFlags {
+            gcd: args.gcd,
+            glp: args.glp.clone(),
+            glp_alpha: args.glp_alpha,
+        },
+    )
+    .context("start hf2q serve")?;
     let startup = wait_for_spawned_server(
         &http,
         &mut child,
@@ -167,6 +185,7 @@ fn require_credentialless_automatic_discovery(auth_token: Option<&str>) -> Resul
 fn spawn_server(
     target: Option<&str>,
     state_root: Option<&std::path::Path>,
+    flags: OwnedServeFlags,
 ) -> Result<OwnedServerProcess> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
@@ -201,6 +220,7 @@ fn spawn_server(
         &mut command,
         target,
         state_root,
+        &flags,
         child_fd,
         startup_progress_fd,
         listener_fd,
@@ -244,6 +264,7 @@ fn append_owned_server_args(
     command: &mut Command,
     target: Option<&str>,
     state_root: Option<&std::path::Path>,
+    flags: &OwnedServeFlags,
     child_fd: std::os::fd::RawFd,
     startup_progress_fd: std::os::fd::RawFd,
     listener_fd: std::os::fd::RawFd,
@@ -266,12 +287,23 @@ fn append_owned_server_args(
         .arg(startup_progress_fd.to_string())
         .arg("--chat-owned-listener-fd")
         .arg(listener_fd.to_string());
+    // ADR-053: steering flags belong to the spawned serve process.
+    if flags.gcd {
+        command.arg("--gcd");
+    }
+    if let Some(glp) = &flags.glp {
+        command.arg("--glp").arg(glp);
+    }
+    if let Some(alpha) = flags.glp_alpha {
+        command.arg("--glp-alpha").arg(alpha.to_string());
+    }
 }
 
 #[cfg(not(unix))]
 fn spawn_server(
     _target: Option<&str>,
     _state_root: Option<&std::path::Path>,
+    _flags: OwnedServeFlags,
 ) -> Result<OwnedServerProcess> {
     bail!("automatic chat-owned server lifecycle is unavailable on this platform; use --url")
 }
@@ -636,6 +668,7 @@ mod tests {
             &mut command,
             Some("owner/model:Q4_K_M"),
             Some(std::path::Path::new("/tmp/operator-state")),
+            &OwnedServeFlags::default(),
             42,
             43,
             44,
@@ -661,6 +694,38 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--chat-startup-progress-fd", "43"]));
+        // Default flags forward nothing.
+        assert!(!args.iter().any(|a| a == "--gcd"));
+        assert!(!args.iter().any(|a| a == "--glp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steering_flags_are_forwarded_to_the_owned_serve_child() {
+        let mut command = std::process::Command::new("hf2q");
+        append_owned_server_args(
+            &mut command,
+            Some("owner/model:Q4_K_M"),
+            None,
+            &OwnedServeFlags {
+                gcd: true,
+                glp: Some(std::path::PathBuf::from("/tmp/vector.gguf")),
+                glp_alpha: Some(6.0),
+            },
+            42,
+            43,
+            44,
+            9123,
+        );
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|a| a == "--gcd"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--glp", "/tmp/vector.gguf"]));
+        assert!(args.windows(2).any(|pair| pair == ["--glp-alpha", "6"]));
     }
 
     #[cfg(unix)]
