@@ -171,15 +171,19 @@ battery keeps).
 
 ## GLP is complementary — the disposition-side intervention
 
-The grammar moves the logit distribution; it cannot change what the model
-*wants*. GLP (weightless steering vectors — a few hundred KB of GGUF control
-vectors, Matt Suiche's spec) edits the residual stream per layer at inference,
-enabling directional steering without touching weights. The two compose
-cleanly: GLP does the disposition side (refusal direction, or any direction);
-GCD does the emission side (what may leave the sampler). The free-text
-surfaces the grammar deliberately leaves open — `response.message`,
-`search.query`, `data` fields — are grammar-legal but semantically wild;
-the embeddings gate watches exactly that open surface.
+The grammar acts on the logit distribution, and because that distribution is
+fed back into the model on the next step, the grammar *does* change what the
+model wants — the committed prefix becomes the model's own context, and the
+refusal attractor has to fight the established discourse (that's why the
+anchor works). What the grammar cannot do is change the *weights*: the same
+model, unconstrained, would still refuse. GLP (weightless steering vectors —
+a few hundred KB of GGUF control vectors, Matt Suiche's spec) edits the
+residual stream per layer at inference, changing the model's disposition at
+the computation level, not just its output distribution. The two compose:
+GLP steers the model's tendency; GCD constrains what may leave the sampler.
+The free-text surfaces the grammar deliberately leaves open —
+`response.message`, `search.query`, `data` fields — are grammar-legal but
+semantically wild; the embeddings gate watches exactly that open surface.
 
 ## What GCD is really for
 
