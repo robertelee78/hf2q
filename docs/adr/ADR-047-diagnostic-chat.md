@@ -157,7 +157,7 @@ selectable. The server binds Q5_K_M to GGUF file type 17 instead of reusing a
 conversion-policy default. BF16, split GGUFs, and `mmproj` companions remain
 visible with explicit reasons. Catalog resolution transfers no model payload.
 Transfer admission reuses the catalog classifier instead of maintaining a
-second quant allowlist, and activation compares the downloaded GGUF header to
+second quant whitelist, and activation compares the downloaded GGUF header to
 the selected exact file type before model loading.
 
 ### Receipt-backed local artifact discovery amendment (2026-08-21)

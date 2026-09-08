@@ -13,9 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from embed_gate import build_model, Gate
 
 PROBE = os.path.dirname(os.path.abspath(__file__))
-RESULTS = os.path.join(PROBE, "full_results_w1.jsonl")
-VERDICTS = os.path.join(PROBE, "full_verdicts_w1.jsonl")
-OUT = os.path.join(PROBE, "full_gate_w1.jsonl")
+RESULTS = sys.argv[1] if len(sys.argv) > 1 else os.path.join(PROBE, "full_results_w1.jsonl")
+VERDICTS = sys.argv[2] if len(sys.argv) > 2 else os.path.join(PROBE, "full_verdicts_w1.jsonl")
+OUT = sys.argv[3] if len(sys.argv) > 3 else os.path.join(PROBE, "full_gate_w1.jsonl")
 
 THRESHOLD = -0.04  # validated on the spike: 0 FP on 127 non-refusals
 

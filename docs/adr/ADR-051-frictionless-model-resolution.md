@@ -113,7 +113,7 @@ architecture is not routed through another family's loader. The bounded
 network parser performs generic format and byte-geometry validation; execution
 support comes from the operation that consumes each tensor and its native
 backend capability. Adding a supported runtime contract makes it available to
-admission without a separate hosted architecture allowlist.
+admission without a separate hosted architecture whitelist.
 
 Publisher selectors and header-derived runtime quant identities remain
 separate. Hosted local reuse and resident pool identity preserve the original

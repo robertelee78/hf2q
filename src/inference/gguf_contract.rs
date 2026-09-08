@@ -1,7 +1,7 @@
 //! Runtime architecture registrations and their allocation-bounded admission.
 //!
 //! The Hub resolver consumes these callbacks; it does not maintain its own
-//! architecture allowlist. A filename or publisher label grants no capability.
+//! architecture whitelist. A filename or publisher label grants no capability.
 
 use anyhow::{bail, Result};
 use mlx_native::gguf::GgufFile;

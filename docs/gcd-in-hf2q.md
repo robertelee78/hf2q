@@ -32,7 +32,7 @@ outbound requests on the principal's behalf. Against that, the controls the
 industry reaches for are all **negative**: they enumerate the bad and permit
 everything else. A defensive system prompt is in-band — it lives in the same
 input channel the injection rides. An input classifier scans the wrong
-surface. An output filter runs a denylist, so business data with no credential
+surface. An output filter runs a blacklist, so business data with no credential
 signature sails through. Measured on the Tantalus arena: a full behavioral
 stack (prompt + classifier + filter) leaked 1.82–33.8% of injections; the
 constitutive grammar control leaked 0.00%.
@@ -47,7 +47,7 @@ modified weights.
 Both reduce to one question: **what may the model emit?** The lineage that
 settled it is old: object-capability systems make authority an unforgeable
 token that can only be exercised, never named into existence; LANGSEC makes
-the recognizer correct by construction; application allowlisting displaced
+the recognizer correct by construction; application whitelisting displaced
 signature antivirus for the same reason. Vince's paper is the domain transfer
 into AI security.
 
@@ -267,7 +267,7 @@ constitutive at the sampler. `--gcd` is a general GCD surface: operators ship
 a grammar per authz, per channel, per tool-step; the embedded refusal arm is
 one prebuilt grammar for the canonical case. Grammar-constrained decoding is
 to prompt injection what parameterized queries are to SQL injection, and what
-application allowlisting was to signature antivirus: the recognizer is correct
+application whitelisting was to signature antivirus: the recognizer is correct
 by construction, and the bad thing is ungenerable, not caught.
 
 ## Honest limits

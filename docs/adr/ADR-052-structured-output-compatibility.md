@@ -194,7 +194,7 @@ The first implemented profile MUST support:
   `minProperties`, and `maxProperties`;
 - array `items`, `prefixItems`, `minItems`, and `maxItems`;
 - string `pattern`, `minLength`, `maxLength`, and the current vLLM/XGrammar
-  format allowlist;
+  format whitelist;
 - integer and number bounds where exact grammar enforcement is possible.
 
 Known unsupported assertions MUST fail with a JSON-pointer-qualified error.

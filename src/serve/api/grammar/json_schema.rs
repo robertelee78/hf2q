@@ -4706,7 +4706,7 @@ mod tests {
     }
 
     #[test]
-    fn string_format_allowlist_compiles_and_enforces_mutants() {
+    fn string_format_whitelist_compiles_and_enforces_mutants() {
         let fixtures = [
             ("email", "a.b@example.com", "missing-at.example.com"),
             ("date", "2026-09-03", "2026-19-03"),
