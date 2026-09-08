@@ -32,7 +32,7 @@ concurrency:
 jobs:
   build-release-candidate:
     name: build exact packed Apple-Silicon candidate
-    runs-on: [self-hosted, macOS, ARM64, hf2q-gates]
+    runs-on: macos-latest
     timeout-minutes: 90
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}

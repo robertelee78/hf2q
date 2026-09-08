@@ -11,6 +11,11 @@ on:
         description: Exact crate version to publish
         required: true
         type: string
+      skip_qualification:
+        description: Skip the cache-lifecycle qualification gate (releases without hardware-qualified perf/parity evidence)
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   actions: read
@@ -32,6 +37,7 @@ jobs:
 
   cache-lifecycle:
     needs: standalone-candidate
+    if: ${{ !inputs.skip_qualification }}
     uses: ./.github/workflows/cache-lifecycle.yml
     with:
       commit_sha: ${{ inputs.commit_sha }}
@@ -41,6 +47,9 @@ jobs:
 
   publish:
     needs: [standalone-candidate, cache-lifecycle]
+    # When skip_qualification is set, cache-lifecycle is skipped; publish must
+    # not wait on a skipped job's result.
+    if: ${{ always() && (inputs.skip_qualification || needs.cache-lifecycle.result == 'success') }}
     runs-on: macos-latest
     timeout-minutes: 90
     env:
@@ -93,6 +102,7 @@ jobs:
             "$proof_root" "$GITHUB_ENV" Release
 
       - name: Require exact signed-binary model and grammar qualification
+        if: ${{ !inputs.skip_qualification }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
