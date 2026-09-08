@@ -618,8 +618,10 @@ mod tests {
         let info = gguf.tensor_info("test.weight").expect("tensor present");
         assert_eq!(info.shape, vec![32]);
         assert_eq!(info.byte_len, 18);
-        // Q4_0 wire code = 2
-        assert_eq!(info.ggml_type as u32, 2);
+        // Q4_0 wire code = 2 in the GGUF; the reader's GgmlType is a
+        // repr-less enum whose `as u32` is the variant index (Q4_0 = 3:
+        // F32, F16, BF16, Q4_0). Compare the variant, not a raw cast.
+        assert_eq!(info.ggml_type, mlx_native::GgmlType::Q4_0);
 
         // Tensor BYTES round-trip — read from the file at
         // (tensor_data_offset + info.offset), confirm equal to the
