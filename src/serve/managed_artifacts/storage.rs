@@ -230,6 +230,7 @@ pub(super) fn candidate_from_binding_in(
         root,
         bytes: binding.artifact.bytes,
         sha256: binding.artifact.sha256,
+        hub_filename: Some(binding.artifact.hub_filename),
         quant: QuantType::from_canonical_str(&binding.quant).map_err(|error| anyhow!(error))?,
         origin: binding.origin,
         materialized_at_secs: binding.materialized_at_secs,
@@ -279,6 +280,7 @@ pub(super) fn conversion_authority(path: &Path) -> Result<Option<Candidate>> {
         root,
         bytes: receipt.output.size,
         sha256: receipt.output.sha256,
+        hub_filename: None,
         quant,
         origin: LocalArtifactProvenance::ConversionReceipt
             .as_str()

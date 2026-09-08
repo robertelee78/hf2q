@@ -176,6 +176,7 @@ impl Gemma4Config {
         };
 
         let num_layers = u32_required("gemma4.block_count")? as usize;
+        anyhow::ensure!(num_layers > 0 && num_layers <= 4096, "invalid gemma4.block_count {num_layers}");
         let hidden_size = u32_required("gemma4.embedding_length")? as usize;
         let intermediate_size = u32_required("gemma4.feed_forward_length")? as usize;
         let num_attention_heads = u32_required("gemma4.attention.head_count")? as usize;
@@ -265,6 +266,12 @@ impl Gemma4Config {
             .find(|(s, _)| !**s)
             .map(|(_, &h)| h as usize)
             .unwrap_or(num_kv_heads);
+
+        for (layer, (&is_sliding, &heads)) in pattern.iter().zip(&head_count_kv_arr).enumerate() {
+            let expected = if is_sliding { num_kv_heads } else { num_global_kv_heads };
+            anyhow::ensure!(heads as usize == expected,
+                "layer {layer} declares {heads} KV heads but its attention group uses {expected}; heterogeneous KV heads within one attention group are not implemented");
+        }
 
         // vocab_size: dim 0 of token_embd.weight tensor.
         let vocab_size = gguf

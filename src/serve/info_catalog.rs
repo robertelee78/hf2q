@@ -86,55 +86,7 @@ fn require_shape(gguf: &GgufFile, name: &str, expected: &[usize]) -> Result<()> 
 }
 
 pub(super) fn validate_gemma_tensors(gguf: &GgufFile, cfg: &Gemma4Config) -> Result<()> {
-    require_shape(
-        gguf,
-        "token_embd.weight",
-        &[cfg.vocab_size, cfg.hidden_size],
-    )?;
-    require_shape(gguf, "output_norm.weight", &[cfg.hidden_size])?;
-    for layer in 0..cfg.num_hidden_layers {
-        for suffix in [
-            "attn_q.weight",
-            "attn_k.weight",
-            "attn_output.weight",
-            "attn_q_norm.weight",
-            "attn_k_norm.weight",
-            "ffn_gate.weight",
-            "ffn_up.weight",
-            "ffn_down.weight",
-            "attn_norm.weight",
-            "post_attention_norm.weight",
-            "ffn_norm.weight",
-            "post_ffw_norm.weight",
-            "layer_output_scale.weight",
-        ] {
-            require_tensor(gguf, &format!("blk.{layer}.{suffix}"))?;
-        }
-        if !(cfg.is_full_attention(layer) && cfg.attention_k_eq_v) {
-            require_tensor(gguf, &format!("blk.{layer}.attn_v.weight"))?;
-        }
-        let gate_up = format!("blk.{layer}.ffn_gate_up_exps.weight");
-        let down = format!("blk.{layer}.ffn_down_exps.weight");
-        match (
-            gguf.tensor_info(&gate_up).is_some(),
-            gguf.tensor_info(&down).is_some(),
-        ) {
-            (true, true) => {
-                for suffix in [
-                    "ffn_gate_inp.weight",
-                    "ffn_gate_inp.scale",
-                    "ffn_down_exps.scale",
-                ] {
-                    require_tensor(gguf, &format!("blk.{layer}.{suffix}"))?;
-                }
-            }
-            (false, false) => {}
-            _ => anyhow::bail!(
-                "Gemma layer {layer} has an incomplete MoE expert pair; both {gate_up:?} and {down:?} are required together"
-            ),
-        }
-    }
-    Ok(())
+    crate::inference::models::gemma4::admission::validate_tensors(gguf, cfg)
 }
 
 pub(super) fn validate_qwen35_tensors(gguf: &GgufFile, cfg: &Qwen35Config) -> Result<()> {

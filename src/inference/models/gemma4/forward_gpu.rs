@@ -2149,7 +2149,8 @@ impl MlxModelWeights {
                     expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
                     ggml_type: ggml_type_gu,
                 };
-                s.quantized_matmul_id_ggml(
+                crate::inference::expert_dispatch::dispatch_expert_matmul_id(
+                    &mut s,
                     reg,
                     dev,
                     &self.activations.moe_norm_out,
@@ -2182,7 +2183,8 @@ impl MlxModelWeights {
                     expert_stride: self.layers[layer_idx].moe.down_expert_stride,
                     ggml_type: ggml_type_dn,
                 };
-                s.quantized_matmul_id_ggml(
+                crate::inference::expert_dispatch::dispatch_expert_matmul_id(
+                    &mut s,
                     reg,
                     dev,
                     &self.activations.moe_swiglu_id_out,

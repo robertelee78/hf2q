@@ -462,6 +462,9 @@ jobs:
           cargo test --locked --bin hf2q --all-features input::hf_reference_tests::
           cargo test --locked --bin hf2q --all-features input::hf_download_plan_tests::
           cargo test --locked --bin hf2q --all-features model_spec::tests::
+          cargo test --locked --bin hf2q --all-features inference::gguf_contract::tests::
+          cargo test --locked --bin hf2q --all-features inference::models::gemma4::admission_tests::
+          cargo test --locked --bin hf2q --all-features inference::models::qwen35::tensor_admission::tests::
           cargo test --locked --bin hf2q --all-features cli::tests::frictionless_
           cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::
           cargo test --locked --bin hf2q --all-features chat::local::tests::

@@ -945,7 +945,7 @@ pub fn emit_tracing(info: &LoadInfo) {
 /// that metadata is absent or outside the runtime pool's supported profile
 /// set, preserving observability for legacy and custom artifacts.
 ///
-/// Returns `None` for pure-fp GGUFs (every tensor is `F32` or `F16`) and
+/// Returns `None` for pure-fp GGUFs (every tensor is `F32`, `F16`, or `BF16`) and
 /// for empty GGUFs.
 ///
 /// # Why this lives here
@@ -977,13 +977,18 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
         let Some(info) = gguf.tensor_info(name) else {
             continue;
         };
-        if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
+        if matches!(
+            info.ggml_type,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+        ) {
             continue;
         }
         let label = match info.ggml_type {
             GgmlType::F32 => "F32",
             GgmlType::F16 => "F16",
+            GgmlType::BF16 => "BF16",
             GgmlType::Q4_0 => "Q4_0",
+            GgmlType::Q5_0 => "Q5_0",
             GgmlType::Q8_0 => "Q8_0",
             GgmlType::Q2_K => "Q2_K",
             GgmlType::Q3_K => "Q3_K",
@@ -995,6 +1000,7 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
             GgmlType::Q5_1 => "Q5_1",
             GgmlType::IQ4_NL => "IQ4_NL",
             GgmlType::IQ4_XS => "IQ4_XS",
+            _ => "UNKNOWN",
         };
         *histogram.entry(label).or_insert(0) += 1;
     }
@@ -1009,7 +1015,7 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
 ///
 /// # Algorithm
 ///
-/// For each tensor whose `ggml_type` is *not* `F32` or `F16`:
+/// For each tensor whose `ggml_type` is not `F32`, `F16`, or `BF16`:
 ///   1. `n_elements = shape.iter().product::<usize>()` — total elements
 ///      stored.
 ///   2. `block_count = n_elements / block_values` — must be exact (GGUF
@@ -1049,7 +1055,10 @@ pub fn compute_bpw(gguf: &mlx_native::gguf::GgufFile) -> Option<f32> {
         let Some(info) = gguf.tensor_info(name) else {
             continue;
         };
-        if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
+        if matches!(
+            info.ggml_type,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+        ) {
             continue;
         }
 
@@ -1369,13 +1378,18 @@ mod tests {
                 let Some(info) = gguf.tensor_info(name) else {
                     continue;
                 };
-                if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
+                if matches!(
+                    info.ggml_type,
+                    GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+                ) {
                     continue;
                 }
                 let label = match info.ggml_type {
                     GgmlType::F32 => "F32",
                     GgmlType::F16 => "F16",
+                    GgmlType::BF16 => "BF16",
                     GgmlType::Q4_0 => "Q4_0",
+                    GgmlType::Q5_0 => "Q5_0",
                     GgmlType::Q8_0 => "Q8_0",
                     GgmlType::Q2_K => "Q2_K",
                     GgmlType::Q3_K => "Q3_K",
@@ -1387,6 +1401,7 @@ mod tests {
                     GgmlType::Q5_1 => "Q5_1",
                     GgmlType::IQ4_NL => "IQ4_NL",
                     GgmlType::IQ4_XS => "IQ4_XS",
+                    _ => "UNKNOWN",
                 };
                 *histogram.entry(label).or_insert(0) += 1;
             }

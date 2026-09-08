@@ -647,6 +647,7 @@ pub(super) fn select_local_with_progress(
             root: artifact.root,
             bytes: artifact.bytes,
             sha256: artifact.sha256,
+            hub_filename: None,
             quant,
             origin: artifact.provenance.as_str().to_owned(),
             materialized_at_secs: materialized,
@@ -723,15 +724,85 @@ pub(super) fn local_candidate_eligible(
     available_memory_bytes: u64,
     pool_budget_bytes: u64,
 ) -> bool {
-    held_quant_lock.is_none_or(|quant| candidate.quant == quant)
+    let selector_matches = spec.requested_selector().is_none_or(|_| {
+        candidate.hub_filename.as_deref().map_or_else(
+            || spec.quant == Some(candidate.quant),
+            |filename| spec.matches_hosted_filename(filename),
+        )
+    });
+    selector_matches
+        && held_quant_lock.is_none_or(|quant| candidate.quant == quant)
         && spec.quant.map_or_else(
             || {
-                automatic_artifact_admissible(
-                    candidate.bytes,
-                    available_memory_bytes,
-                    pool_budget_bytes,
-                )
+                spec.requested_selector().is_some()
+                    || automatic_artifact_admissible(
+                        candidate.bytes,
+                        available_memory_bytes,
+                        pool_budget_bytes,
+                    )
             },
             |quant| candidate.quant == quant,
         )
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    fn candidate(hub_filename: Option<&str>) -> Candidate {
+        Candidate {
+            repository: "owner/model".into(),
+            revision: "a".repeat(40),
+            path: PathBuf::from("model.gguf"),
+            root: PathBuf::from("."),
+            bytes: 1,
+            sha256: "b".repeat(64),
+            hub_filename: hub_filename.map(str::to_owned),
+            quant: QuantType::Q8_0,
+            origin: "test".into(),
+            materialized_at_secs: 0,
+            last_used_at_secs: 0,
+            projector: None,
+            sidecar: None,
+            receipt_target_identity: None,
+        }
+    }
+
+    #[test]
+    fn publisher_selector_reuses_only_matching_hosted_binding() {
+        let spec = crate::model_spec::parse_repository_spec("owner/model:UD-Q8_K_XL").unwrap();
+        assert!(local_candidate_eligible(
+            &spec,
+            &candidate(Some("model-UD-Q8_K_XL.gguf")),
+            None,
+            u64::MAX,
+            u64::MAX,
+        ));
+        assert!(!local_candidate_eligible(
+            &spec,
+            &candidate(Some("model-Q8_0.gguf")),
+            None,
+            u64::MAX,
+            u64::MAX,
+        ));
+        assert!(!local_candidate_eligible(
+            &spec,
+            &candidate(None),
+            None,
+            u64::MAX,
+            u64::MAX,
+        ));
+    }
+
+    #[test]
+    fn canonical_selector_can_reuse_matching_conversion_receipt() {
+        let spec = crate::model_spec::parse_repository_spec("owner/model:Q8_0").unwrap();
+        assert!(local_candidate_eligible(
+            &spec,
+            &candidate(None),
+            None,
+            u64::MAX,
+            u64::MAX,
+        ));
+    }
 }

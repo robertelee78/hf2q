@@ -31,6 +31,21 @@ registry (`src/arch/`). Conversion-family implementations live under
 `src/convert/arch/`; runtime-family graphs live under
 `src/inference/models/`.
 
+### Native runtime ownership
+
+hf2q owns repository selectors, authenticated artifact identity, conversion and
+quantization policy, architecture-specific graph/tensor validation, and the
+OpenAI serving contract. `inference::gguf_contract` connects hosted preflight
+and local loading to each implemented runtime's admission callback. The bounded
+network reader checks format and extents; it does not define kernel support.
+
+mlx-native owns GGUF storage loading, Metal buffers, operation capabilities,
+kernels, and command submission. The locked published 0.15.1 dependency supplies
+native BF16 dense matmul and F32/F16/BF16 expert-ID matmul. hf2q's shared dense
+and expert dispatchers select those operations from actual tensor storage.
+Block-quantized tensors retain their quantized routes. No publisher label is
+translated into an invented tensor type.
+
 ### Sovereignty rule (`docs/arch-onboarding.md`)
 
 - **Pure Rust.** No `llama.cpp` / `candle` code, crate, binary, or

@@ -2504,6 +2504,7 @@ impl MlxModelWeights {
                             gu_params.n,
                             gu_params.k,
                             gu_params.top_k,
+                            gu_params.n_experts,
                             gu_params.expert_stride,
                         )
                         .ok()
@@ -2528,17 +2529,17 @@ impl MlxModelWeights {
                         ],
                     );
                 } else {
-                    session
-                        .quantized_matmul_id_ggml(
-                            reg,
-                            dev,
-                            &self.activations.moe_norm_out,
-                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                            &self.activations.moe_expert_ids,
-                            &self.activations.moe_gate_up_id_out,
-                            &gu_params,
-                        )
-                        .map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                    crate::inference::expert_dispatch::dispatch_expert_matmul_id(
+                        session,
+                        reg,
+                        dev,
+                        &self.activations.moe_norm_out,
+                        self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                        &self.activations.moe_expert_ids,
+                        &self.activations.moe_gate_up_id_out,
+                        &gu_params,
+                    )
+                    .map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
                 }
                 *total_dispatches += 1;
 
@@ -2603,6 +2604,7 @@ impl MlxModelWeights {
                             dn_params.n,
                             dn_params.k,
                             dn_params.n_tokens, // = real_top_k for the down dispatch
+                            dn_params.n_experts,
                             dn_params.expert_stride,
                         )
                         .ok()
@@ -2624,17 +2626,17 @@ impl MlxModelWeights {
                         ],
                     );
                 } else {
-                    session
-                        .quantized_matmul_id_ggml(
-                            reg,
-                            dev,
-                            &self.activations.moe_swiglu_id_out,
-                            self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                            &self.activations.moe_expert_ids,
-                            &self.activations.moe_down_id_out,
-                            &dn_params,
-                        )
-                        .map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                    crate::inference::expert_dispatch::dispatch_expert_matmul_id(
+                        session,
+                        reg,
+                        dev,
+                        &self.activations.moe_swiglu_id_out,
+                        self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                        &self.activations.moe_expert_ids,
+                        &self.activations.moe_down_id_out,
+                        &dn_params,
+                    )
+                    .map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
                 }
                 *total_dispatches += 1;
             }

@@ -59,6 +59,28 @@ Every other candle dependency is cold-path (model loading). The architecture is 
 
 **Port GGUF parsing and weight loading to pure Rust in mlx-native, replace the candle sampler with pure Rust, then delete all candle code and dependencies from hf2q.**
 
+### 2026-09-06 storage-preserving hosted execution amendment
+
+ADR-051's hosted-resolution spike found mixed GGUFs whose eight BF16 tensors
+need both dense and expert operations. hf2q now pins the published mlx-native
+0.15.1 reader/capability/kernel contract. The scalar expert operation is
+`dense_matmul_id`; scalar tensors must never be sent to the block-quantized
+expert API. Dense BF16 uses `dense_matmul_bf16_f32_tensor`. Both consume the
+original BF16 buffer and produce F32 activations; no BF16-to-Q8/F16 weight
+substitution or external engine is involved.
+
+hf2q owns tensor shapes and graph dispatch; mlx-native owns native storage and
+execution. Qwen storage admission is derived from its actual loader predicates,
+shared with hosted preflight. Gemma admission checks the graph it implements,
+including rejecting an untied output head and unsupported metadata features.
+When Gemma's Q8 head policy selects an embedding already stored as Q8, the
+loader reuses those original blocks without a dequantize/requantize round trip.
+
+Focused Metal numerical and byte-preservation evidence, failed spikes, and the
+remaining full-model validation are recorded in
+`../research/hosted-resolution-kata-2026-09-05.md`. This amendment does not claim
+full-model quality or performance proof before those gates execute.
+
 ### What stays (already in mlx-native)
 
 These are production-ready and unchanged by this ADR:

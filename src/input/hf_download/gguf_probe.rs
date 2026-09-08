@@ -22,7 +22,6 @@ pub(super) struct ProbedGgufHeader {
     pub(super) tensor_count: u64,
     pub(super) tensor_data_offset: u64,
     pub(super) token_embedding_type: Option<u32>,
-    pub(super) incompatible_tensor: Option<String>,
     pub(super) has_output_norm: bool,
     pub(super) has_block_tensor: bool,
 }
@@ -120,7 +119,6 @@ pub(super) fn parse_bounded_header(
 
     let mut maximum_relative_end = 0_u64;
     let mut token_embedding_type = None;
-    let mut incompatible_tensor = None;
     let mut has_output_norm = false;
     let mut has_block_tensor = false;
     for _ in 0..tensor_count {
@@ -146,9 +144,6 @@ pub(super) fn parse_bounded_header(
         }
         has_output_norm |= name == b"output_norm.weight";
         has_block_tensor |= name.starts_with(b"blk.0.");
-        if incompatible_tensor.is_none() {
-            incompatible_tensor = hosted_tensor_incompatibility(&architecture, name, ggml_type);
-        }
         let relative_offset = reader.u64()?;
         let tensor_bytes = tensor_bytes(&shape[..dimensions], ggml_type)?;
         let relative_end = relative_offset
@@ -181,69 +176,9 @@ pub(super) fn parse_bounded_header(
         tensor_count,
         tensor_data_offset,
         token_embedding_type,
-        incompatible_tensor,
         has_output_norm,
         has_block_tensor,
     })
-}
-
-fn hosted_tensor_incompatibility(arch: &str, name: &[u8], ggml_type: u32) -> Option<String> {
-    let name = std::str::from_utf8(name).ok()?;
-    if matches!(arch, "qwen35" | "qwen35moe") {
-        let supported = if name == "token_embd.weight" {
-            matches!(ggml_type, 0 | 8 | 10 | 12 | 13 | 14)
-        } else if qwen35_dense_ffn_name(name) {
-            // The shared topology admission performs the gate/up relational
-            // check. This descriptor-level filter admits the same individual
-            // float and quantized types as the runtime dense loader.
-            matches!(ggml_type, 0 | 1 | 2 | 8 | 10 | 11 | 12 | 13 | 14)
-        } else if qwen35_moe_expert_name(name) {
-            matches!(ggml_type, 2 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 20 | 23)
-        } else if qwen35_native_projection_name(name) {
-            matches!(ggml_type, 0 | 2 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 20 | 23)
-        } else {
-            true
-        };
-        if !supported {
-            return Some(format!(
-                "{name} uses unsupported GGML type {ggml_type} for {arch}"
-            ));
-        }
-    }
-    None
-}
-
-fn qwen35_native_projection_name(name: &str) -> bool {
-    name == "output.weight"
-        || [
-            ".attn_q.weight",
-            ".attn_k.weight",
-            ".attn_v.weight",
-            ".attn_output.weight",
-            ".attn_qkv.weight",
-            ".attn_gate.weight",
-            ".ssm_alpha.weight",
-            ".ssm_beta.weight",
-            ".ssm_out.weight",
-        ]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
-}
-
-fn qwen35_dense_ffn_name(name: &str) -> bool {
-    [".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight"]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
-}
-
-fn qwen35_moe_expert_name(name: &str) -> bool {
-    [
-        ".ffn_gate_exps.weight",
-        ".ffn_up_exps.weight",
-        ".ffn_down_exps.weight",
-    ]
-    .iter()
-    .any(|suffix| name.ends_with(suffix))
 }
 
 struct Reader<'a> {
@@ -393,23 +328,10 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, String> {
 /// GGUF stores dimensions innermost-first. Block-quantized payloads cannot
 /// span rows, so the first wire dimension is divided by the block width.
 fn tensor_bytes(shape: &[u64], ggml_type: u32) -> Result<u64, String> {
-    let (block_values, block_bytes) = match ggml_type {
-        0 => (1, 4),
-        1 => (1, 2),
-        2 => (32, 18),
-        7 => (32, 24),
-        8 => (32, 34),
-        10 => (256, 84),
-        11 => (256, 110),
-        12 => (256, 144),
-        13 => (256, 176),
-        14 => (256, 210),
-        17 => (1, 2),
-        20 => (32, 18),
-        23 => (256, 136),
-        26 => (1, 4),
-        other => return Err(format!("unsupported GGML tensor type {other}")),
-    };
+    let storage = crate::quantize::ggml_quants::GgmlType::try_from(ggml_type)
+        .map_err(|_| format!("unsupported GGML tensor type {ggml_type}"))?;
+    let block_values = storage.block_size() as u64;
+    let block_bytes = storage.type_size() as u64;
     let inner = shape[0];
     if inner % block_values != 0 {
         return Err(format!(
@@ -428,6 +350,11 @@ fn tensor_bytes(shape: &[u64], ggml_type: u32) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hosted_resolution_kata_bf16_geometry_uses_the_shared_wire_type() {
+        assert_eq!(super::tensor_bytes(&[64, 128], 30).unwrap(), 64 * 128 * 2);
+    }
+
     use super::*;
 
     fn string(bytes: &mut Vec<u8>, value: &str) {
@@ -467,7 +394,6 @@ mod tests {
         assert!(!header.requires_projector);
         assert_eq!(header.file_type, 15);
         assert_eq!(header.token_embedding_type, Some(12));
-        assert!(header.incompatible_tensor.is_none());
         assert!(!header.has_output_norm);
         assert!(!header.has_block_tensor);
         assert_eq!(header.tensor_data_offset, bytes.len() as u64);
@@ -521,19 +447,6 @@ mod tests {
         let (bytes, _) = valid_header(1024);
         let error = parse_bounded_header(&bytes, bytes.len() as u64 + 512).unwrap_err();
         assert!(error.contains("beyond authenticated object"), "{error}");
-    }
-
-    #[test]
-    fn qwen_role_specific_tensor_layout_is_summarized_without_a_descriptor_vector() {
-        assert!(hosted_tensor_incompatibility("qwen35", b"token_embd.weight", 11).is_some());
-        assert!(hosted_tensor_incompatibility("qwen35", b"blk.0.ffn_gate.weight", 7,).is_some());
-        assert!(
-            hosted_tensor_incompatibility("qwen35moe", b"blk.0.ffn_gate_exps.weight", 11,)
-                .is_none()
-        );
-        assert!(hosted_tensor_incompatibility("qwen35", b"blk.0.attn_q.weight", 1).is_some());
-        assert!(hosted_tensor_incompatibility("qwen35", b"output.weight", 16).is_some());
-        assert!(hosted_tensor_incompatibility("qwen35", b"blk.0.attn_q.weight", 23).is_none());
     }
 
     #[test]

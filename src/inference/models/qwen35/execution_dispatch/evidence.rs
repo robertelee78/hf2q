@@ -274,12 +274,6 @@ define_fused_gate_up_wrapper!(
     mlx_native::ops::fused_gate_up_silu_q4_K::FusedGateUpSiluQ4_KArgs
 );
 define_fused_gate_up_wrapper!(
-    dispatch_fused_gate_up_silu_q5_k,
-    mlx_native::ops::fused_gate_up_silu_q5_K::dispatch_fused_gate_up_silu_q5_K,
-    mlx_native::ops::fused_gate_up_silu_q5_K::dispatch_fused_gate_up_silu_q5_K_with_trace,
-    mlx_native::ops::fused_gate_up_silu_q5_K::FusedGateUpSiluQ5_KArgs
-);
-define_fused_gate_up_wrapper!(
     dispatch_fused_gate_up_silu_q6_k,
     mlx_native::ops::fused_gate_up_silu_q6_K::dispatch_fused_gate_up_silu_q6_K,
     mlx_native::ops::fused_gate_up_silu_q6_K::dispatch_fused_gate_up_silu_q6_K_with_trace,

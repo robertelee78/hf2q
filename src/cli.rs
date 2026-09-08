@@ -1004,9 +1004,9 @@ pub struct GenerateArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct ChatArgs {
-    /// Local model path, `owner/repository[:QUANT]`, or `list`. Repository
-    /// operands start an owned local server and use the same preparation path
-    /// as `hf2q serve`.
+    /// Local model path, `owner/repository[:SELECTOR]`, or `list`. A selector
+    /// may be a canonical quant, publisher label, or exact repository-relative
+    /// GGUF filename. Repository operands use the same preparation as `serve`.
     #[arg(
         value_name = "MODEL",
         conflicts_with_all = ["url", "model", "quant", "artifact"]
@@ -1106,14 +1106,16 @@ impl DiagnosticQuantArg {
 
 #[derive(clap::Args, Debug)]
 pub struct ServeArgs {
-    /// Local GGUF path, `owner/repository[:QUANT]`, or `list`. A repository
-    /// resolves compatible local bytes first, then a compatible hosted GGUF,
-    /// then native source conversion when no supported hosted artifact exists.
+    /// Local GGUF path, `owner/repository[:SELECTOR]`, or `list`. A selector
+    /// may be a canonical quant, publisher label, or exact repository-relative
+    /// GGUF filename. Compatible local bytes take precedence over downloads.
+    /// Canonical quants retain native conversion fallback; publisher labels
+    /// require a matching compatible hosted artifact.
     #[arg(value_name = "MODEL", conflicts_with = "model")]
     pub target: Option<String>,
 
     /// Compatibility spelling for a GGUF path or
-    /// `owner/repository[:QUANT]`. Prefer the positional MODEL operand.
+    /// `owner/repository[:SELECTOR]`. Prefer the positional MODEL operand.
     /// Fail-fast on bad weights is preserved at startup.
     #[arg(
         long,

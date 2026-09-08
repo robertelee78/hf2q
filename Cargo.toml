@@ -144,8 +144,9 @@ thiserror = "2"
 # prefill-tail reads plus exact GGML routing/capability and host-side GGUF
 # evidence reads, typed resolved-dispatch traces, exact Q4_K inference, and
 # direct packed Q5_K/Q6_K embedding gathers and deterministic lowest-index
-# argmax tie handling require mlx-native 0.11.2.
-mlx-native = "=0.11.2"
+# argmax tie handling, native BF16 GGUF/dense/expert execution, and sticky
+# expert-ID validation use the published mlx-native 0.15.1 contract.
+mlx-native = "=0.15.1"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).

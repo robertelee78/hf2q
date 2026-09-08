@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::serve::auto_pipeline::looks_like_hf_repo_id;
 use crate::serve::quant_select::QuantType;
@@ -11,6 +11,43 @@ use crate::serve::quant_select::QuantType;
 pub(crate) struct RepositoryModelSpec {
     pub(crate) repository: String,
     pub(crate) quant: Option<QuantType>,
+    /// Exact publisher-facing hosted artifact selector supplied after `:`.
+    /// This remains distinct from the runtime GGUF file type: publishers may
+    /// name variants such as `UD-Q8_K_XL` whose header uses a canonical type.
+    pub(crate) selector: Option<String>,
+}
+
+impl RepositoryModelSpec {
+    pub(crate) fn requested_selector(&self) -> Option<&str> {
+        self.selector.as_deref()
+    }
+
+    pub(crate) fn is_hosted_only(&self) -> bool {
+        self.selector.is_some() && self.quant.is_none()
+    }
+
+    /// Match either an exact repository-relative GGUF filename or a literal
+    /// `-<selector>` suffix on its basename stem. The suffix comparison is
+    /// case-insensitive, while exact filenames retain Hub path semantics.
+    pub(crate) fn matches_hosted_filename(&self, filename: &str) -> bool {
+        let Some(selector) = self.requested_selector() else {
+            return true;
+        };
+        if filename == selector {
+            return true;
+        }
+        let Some(basename) = filename.rsplit('/').next() else {
+            return false;
+        };
+        let Some(stem) = basename
+            .get(..basename.len().saturating_sub(5))
+            .filter(|_| basename.to_ascii_lowercase().ends_with(".gguf"))
+        else {
+            return false;
+        };
+        stem.to_ascii_lowercase()
+            .ends_with(&format!("-{}", selector.to_ascii_lowercase()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,16 +84,42 @@ pub(crate) fn parse_repository_spec(raw: &str) -> Result<RepositoryModelSpec> {
     let (repository, suffix) = split_repository_quant_suffix(raw);
     if !looks_like_hf_repo_id(repository) {
         bail!(
-            "model {raw:?} is neither an existing/explicit path nor a Hugging Face repository (expected owner/repository[:QUANT])"
+            "model {raw:?} is neither an existing/explicit path nor a Hugging Face repository (expected owner/repository[:SELECTOR])"
         );
     }
-    let quant = suffix
-        .map(|value| QuantType::from_canonical_str(value).map_err(|error| anyhow!(error)))
-        .transpose()?;
+    let selector = suffix.map(validate_repository_selector).transpose()?;
+    let quant = selector
+        .as_deref()
+        .and_then(|value| QuantType::from_canonical_str(value).ok());
     Ok(RepositoryModelSpec {
         repository: repository.to_owned(),
         quant,
+        selector,
     })
+}
+
+const MAX_REPOSITORY_SELECTOR_BYTES: usize = 512;
+
+fn validate_repository_selector(value: &str) -> Result<String> {
+    if value.is_empty() || value.len() > MAX_REPOSITORY_SELECTOR_BYTES {
+        bail!("hosted artifact selector must contain 1..={MAX_REPOSITORY_SELECTOR_BYTES} bytes");
+    }
+    if !value.is_ascii()
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains('\\')
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    {
+        bail!(
+            "hosted artifact selector must be a bounded safe label or repository-relative filename"
+        );
+    }
+    Ok(value.to_owned())
 }
 
 pub(crate) fn is_explicit_path(path: &Path) -> bool {
@@ -161,11 +224,29 @@ mod tests {
         let parsed = parse_repository_spec("owner/model:Q8_0").unwrap();
         assert_eq!(parsed.repository, "owner/model");
         assert_eq!(parsed.quant, Some(QuantType::Q8_0));
+        assert_eq!(parsed.requested_selector(), Some("Q8_0"));
         assert_eq!(
             parse_repository_spec("owner/model:q4_k_m").unwrap().quant,
             Some(QuantType::Q4_K_M)
         );
-        assert!(parse_repository_spec("owner/model:maybe").is_err());
+        let publisher = parse_repository_spec("owner/model:UD-Q8_K_XL").unwrap();
+        assert_eq!(publisher.quant, None);
+        assert_eq!(publisher.requested_selector(), Some("UD-Q8_K_XL"));
+        assert!(publisher.is_hosted_only());
+        assert!(publisher.matches_hosted_filename("model-UD-Q8_K_XL.gguf"));
+        assert!(!publisher.matches_hosted_filename("model-Q8_0.gguf"));
+        assert!(parse_repository_spec("owner/model:../unsafe.gguf").is_err());
+    }
+
+    #[test]
+    fn selector_matches_exact_repository_filename_or_literal_stem_suffix() {
+        let exact = parse_repository_spec("owner/model:gguf/model-Q8_0.gguf").unwrap();
+        assert!(exact.matches_hosted_filename("gguf/model-Q8_0.gguf"));
+        assert!(!exact.matches_hosted_filename("other/model-Q8_0.gguf"));
+
+        let quant = parse_repository_spec("owner/model:Q8_0").unwrap();
+        assert!(quant.matches_hosted_filename("model-q8_0.GGUF"));
+        assert!(quant.matches_hosted_filename("model-MTP-Q8_0.gguf"));
     }
 
     #[test]

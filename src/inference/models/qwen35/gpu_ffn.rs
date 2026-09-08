@@ -77,8 +77,8 @@ use crate::serve::forward_mlx_shared::MlxAffineMoeStack;
 
 use super::execution_dispatch::{
     dense_gate_up_fusion_enabled, dense_q_arena_reset_enabled, dispatch_fused_gate_up_silu_iq4_nl,
-    dispatch_fused_gate_up_silu_q4_k, dispatch_fused_gate_up_silu_q5_k,
-    dispatch_fused_gate_up_silu_q6_k, dispatch_fused_gate_up_silu_q8_0, quantized_matmul_ggml,
+    dispatch_fused_gate_up_silu_q4_k, dispatch_fused_gate_up_silu_q6_k,
+    dispatch_fused_gate_up_silu_q8_0, quantized_matmul_ggml,
 };
 
 /// ADR-020 AC#5 Iter C2.4 #4 — single-call dispatch wrapper that routes
@@ -1311,16 +1311,12 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         weights.ggml_type_gate_up,
         mlx_native::ops::quantized_matmul_ggml::GgmlType::IQ4_NL
     );
-    let fused_q5_k = matches!(
-        weights.ggml_type_gate_up,
-        mlx_native::ops::quantized_matmul_ggml::GgmlType::Q5_K
-    );
     let fused_q6_k = matches!(
         weights.ggml_type_gate_up,
         mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
     );
-    let fused_eligible = (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k || fused_q6_k)
-        && dense_gate_up_fusion_enabled();
+    let fused_eligible =
+        (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q6_k) && dense_gate_up_fusion_enabled();
     if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
@@ -1341,22 +1337,6 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
                 },
             )
             .context("dense_q fused gate_up_silu_mul IQ4_NL")?;
-        } else if fused_q5_k {
-            dispatch_fused_gate_up_silu_q5_k(
-                enc,
-                registry,
-                device,
-                &weights.gate_q,
-                &weights.up_q,
-                x,
-                &hidden_buf,
-                mlx_native::ops::fused_gate_up_silu_q5_K::FusedGateUpSiluQ5_KArgs {
-                    m: seq_len,
-                    intermediate_size: m,
-                    hidden_size: h,
-                },
-            )
-            .context("dense_q fused gate_up_silu_mul Q5_K")?;
         } else if fused_q6_k {
             dispatch_fused_gate_up_silu_q6_k(
                 enc,

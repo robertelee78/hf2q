@@ -502,6 +502,26 @@ pub fn dispatch_qmatmul(
         }
     }
 
+    if weight.info.ggml_dtype == mlx_native::GgmlType::BF16 {
+        let params = mlx_native::DenseMmBf16F32Params {
+            m,
+            n: weight.info.rows as u32,
+            k: weight.info.cols as u32,
+            src0_batch: 1,
+            src1_batch: 1,
+        };
+        return mlx_native::dense_matmul_bf16_f32_tensor(
+            session.encoder_mut(),
+            registry,
+            device,
+            &weight.buffer,
+            input,
+            output,
+            &params,
+        )
+        .map_err(|e| anyhow::anyhow!("dense_matmul_bf16_f32_tensor failed: {e}"));
+    }
+
     if weight.info.ggml_dtype == mlx_native::GgmlType::F32 {
         // F32 dense path.  Weight buffer holds [n_rows, k_cols] f32 row-major.
         //
@@ -1191,6 +1211,114 @@ mod dispatch_qmatmul_f32_router_test {
             got,
             expected
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_qmatmul_bf16_test {
+    use super::*;
+
+    fn run_case(m: usize) {
+        let Ok(device) = mlx_native::MlxDevice::new() else {
+            eprintln!("skipping native BF16 dense dispatch test: no MlxDevice");
+            return;
+        };
+        let n = 3usize;
+        let k = 4usize;
+        let weight_values = [
+            1.0, 0.5, -2.0, 0.25, -1.0, 2.0, 0.0, 0.5, 0.25, -0.5, 1.5, 2.0,
+        ];
+        let weight_bits: Vec<u16> = weight_values
+            .iter()
+            .map(|value| half::bf16::from_f32(*value).to_bits())
+            .collect();
+        let mut weight_buffer = device
+            .alloc_buffer(weight_bits.len() * 2, mlx_native::DType::BF16, vec![n, k])
+            .expect("BF16 weight");
+        weight_buffer
+            .as_mut_slice::<u16>()
+            .expect("BF16 weight bits")
+            .copy_from_slice(&weight_bits);
+        let qweight = MlxQWeight {
+            buffer: weight_buffer,
+            info: QuantWeightInfo {
+                ggml_dtype: mlx_native::GgmlType::BF16,
+                rows: n,
+                cols: k,
+            },
+            affine: None,
+            f16_shadow: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        };
+        let stored_before = qweight.buffer.as_slice::<u16>().unwrap().to_vec();
+        let input_values: Vec<f32> = (0..m)
+            .flat_map(|row| {
+                let base = row as f32 + 1.0;
+                [base, base + 1.0, -base, 0.5 * base]
+            })
+            .collect();
+        let mut input = device
+            .alloc_buffer(input_values.len() * 4, mlx_native::DType::F32, vec![m, k])
+            .expect("input");
+        input
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&input_values);
+        let output = device
+            .alloc_buffer(m * n * 4, mlx_native::DType::F32, vec![m, n])
+            .expect("output");
+        let executor = mlx_native::GraphExecutor::new(device.clone());
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut session = executor.begin().expect("session");
+        dispatch_qmatmul(
+            &mut session,
+            &mut registry,
+            &device,
+            &input,
+            &qweight,
+            &output,
+            m as u32,
+            crate::quantize::imatrix::ImatrixHint::None,
+        )
+        .expect("native BF16 dense dispatch");
+        session.finish().expect("finish BF16 dense dispatch");
+
+        let decoded_weights: Vec<f32> = weight_bits
+            .iter()
+            .map(|bits| half::bf16::from_bits(*bits).to_f32())
+            .collect();
+        let mut expected = vec![0.0f32; m * n];
+        for row in 0..m {
+            for column in 0..n {
+                expected[row * n + column] = (0..k)
+                    .map(|inner| {
+                        input_values[row * k + inner] * decoded_weights[column * k + inner]
+                    })
+                    .sum();
+            }
+        }
+        let actual = output.as_slice::<f32>().unwrap();
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "BF16 dense output[{index}]={actual}, expected {expected} for M={m}"
+            );
+        }
+        assert_eq!(qweight.buffer.dtype(), mlx_native::DType::BF16);
+        assert_eq!(qweight.buffer.as_slice::<u16>().unwrap(), stored_before);
+        assert!(qweight.f16_shadow.is_none());
+    }
+
+    #[test]
+    fn native_bf16_dense_decode_preserves_storage_and_values() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        run_case(1);
+    }
+
+    #[test]
+    fn native_bf16_dense_batched_preserves_storage_and_values() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        run_case(3);
     }
 }
 
