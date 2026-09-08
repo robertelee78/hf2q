@@ -60,6 +60,15 @@ def extract_top10(resp):
     except (KeyError, IndexError, TypeError) as e:
         return [("PARSE_ERROR", str(e))]
 
+def extract_trace(resp):
+    """Per-position [(token, prob)] for every sampled position."""
+    try:
+        content = resp["choices"][0]["logprobs"]["content"]
+        return [((pos.get("top_logprobs") or [{}])[0].get("token", "?"),
+                 round(2.718281828 ** pos.get("logprob", -99), 6)) for pos in content]
+    except (KeyError, IndexError, TypeError) as e:
+        return [("PARSE_ERROR", str(e))]
+
 
 def main():
     with urllib.request.urlopen(f"{BASE_URL}/v1/models", timeout=10) as resp:
@@ -88,11 +97,13 @@ def main():
             except Exception as e:
                 rec["entry_error"] = str(e)[:200]
             try:
-                # B: distribution at first position under the W1 grammar
-                # (grammar forces the anchor; position 0 mask shows what the
-                # model is allowed & wants — then read the generated prefix too)
-                rB = chat_logprobs(model, prompt, grammar=w1, max_tokens=1)
-                rec["under_grammar_top10"] = extract_top10(rB)
+                # B: under the W1 grammar. The anchor is FORCED, so its
+                # positions carry ~100% post-mask mass by construction; the
+                # informative position is the first FREE token after the
+                # forced anchor. Emit enough tokens to clear it, capture the
+                # full per-position logprob trace.
+                rB = chat_logprobs(model, prompt, grammar=w1, max_tokens=30)
+                rec["under_grammar_trace"] = extract_trace(rB)
                 rec["under_grammar_first_token"] = rB["choices"][0]["message"].get("content", "")[:40]
             except Exception as e:
                 rec["grammar_error"] = str(e)[:200]
