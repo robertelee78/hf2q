@@ -99,13 +99,16 @@ Focused validation after the fix:
 | `cargo test --locked --bin hf2q serve::managed_artifacts::` | 106 passed, zero ignored |
 | `cargo test --locked --bin hf2q core::bounded_file::` | 4 passed, zero ignored |
 | `cargo test --locked --bin hf2q chat::` | 55 passed, zero ignored |
+| `cargo test --locked --lib --all-features` | 51 passed, zero ignored |
+| `cargo test --locked --test convert_integration --all-features` | 16 passed; 1 existing ignored streaming-RSS fixture test |
+| `scripts/test_frictionless_binary.sh` against the release binary | Passed |
 | Unsafe activation matrix: clean / refused / explicitly acknowledged | All three passed |
 
 The regression runs used a temporary `XDG_DATA_HOME` to isolate model bindings.
 The local release binary SHA-256 after the fix was
 `de8c1fe24b86fe68d39f71e2ff7df65b5047cd71e666f37ed6dafe6a78f6d2c0`.
 
-Broader validation is in progress. Full-model validation requires an exclusive Apple
+GitHub CI is pending for PR #191. Full-model validation requires an exclusive Apple
 Silicon window; an existing DeepSeek server is currently preserved pending
 operator permission to stop and restore it. This document does not yet claim
 real-model startup or multi-turn acceptance.
