@@ -927,6 +927,74 @@ Optional flags:
   produced by stock `llama-imatrix -c <other>`. Must be `> 0`;
   passing `0` surfaces a typed `ConvertError::ImatrixNCtxInvalid`.
 
+### GCD and GLP serving flags (`--gcd`, `--glp`)
+
+Two opt-in `hf2q serve` flags change a stock model's behavior at inference
+time without modifying a single weight. Both are off by default; plain
+`hf2q serve` is unchanged, and the flags compose.
+
+```bash
+# Forced abliteration via the grammar stack:
+hf2q serve <model> --gcd
+
+# Bind a GLP steering vector (GGUF control vector):
+hf2q serve <model> --glp ./vectors/refusal-direction.gguf
+
+# Auto-discover the vector bound to this model (weightless Hub convention):
+hf2q serve <model> --glp auto
+
+# Dose override, and both flags together:
+hf2q serve <model> --glp ./vectors/refusal-direction.gguf --glp-alpha 0.8
+hf2q serve <model> --gcd --glp ./vectors/refusal-direction.gguf
+```
+
+**`--gcd` (Grammar-Constrained Decoding)** injects an embedded GBNF grammar
+into every chat request that does not already specify one, seating the model's
+distribution on task continuations so refusal becomes locally incoherent —
+forced abliteration with no weight edits. The grammar engages at token 0 (the
+think block is disabled). The measured grammar stack is three layers: a
+character-alphabet whitelist (ASCII printable plus 14 curated symbols,
+histogram-measured at ~97% coverage of legitimate non-ASCII use), a KMP
+refusal-lexicon exclusion automaton (a 131-state case-insensitive DAF compiled
+to recursive GBNF rules), and an anchor + topic sentence that forces task
+engagement at token 0 while leaving the topic span free text, so the grammar
+needs no per-prompt specialization. On stock, refusal-trained
+DeepSeek-V4-Flash, the W1 grammar held refusal to **2.3% on a 512-prompt
+adversarial corpus** and **0.0% on 512 benign prompts**, with 87.3%
+judge-scored actionability on the adversarial half; layering the embeddings
+gate on top drops the residual refusal to **0.59%**
+([`scripts/grammar_probe/FINDINGS.md`](scripts/grammar_probe/FINDINGS.md)).
+`--uncensor` is a hidden alias kept for backward compatibility.
+
+**`--glp <vector.gguf>`** binds a GLP steering vector — a GGUF control vector
+in `project` or `add` mode — to the served model and applies it per layer to
+the post-layer residual stream at inference time (`h ← h − α(h·d̂)d̂` in project
+mode); base weights are never modified. The value is a local path or a Hub
+reference; `--glp auto` asks the resolver to auto-discover a vector bound to
+the served model under the weightless Hub convention (`*-GLP-*` artifacts) and
+fails closed on ambiguity or no match. `--glp-alpha <f>` overrides the steering
+dose (default: the vector's `glp.alpha_default`, else 1.0). The reader is
+fail-closed: conformance errors — unknown mode or hook point, unsupported spec
+version, wrong width, `direction.0` — abort startup rather than degrade. A
+bound vector is logged at boot:
+`[GLP] vector bound: layers=… width=… alpha=… mode=… path=…`.
+
+The serving-stack rule is **reject what you cannot honor**: with a constraint
+attached, unknown request parameters return HTTP 400, and hf2q has no
+beam-search surface, so the vLLM `use_beam_search` FATAL class (a silently
+dropped constraint) does not exist here. The serving surface is specified in
+[`docs/adr/ADR-053-glp-gcd-serving.md`](docs/adr/ADR-053-glp-gcd-serving.md),
+the alphabet presets in
+[`docs/adr/ADR-055-grammar-alphabet-presets.md`](docs/adr/ADR-055-grammar-alphabet-presets.md),
+and the 26-cell serving conformance battery in
+[`docs/adr/ADR-056-gcd-serving-conformance-battery.md`](docs/adr/ADR-056-gcd-serving-conformance-battery.md).
+
+Attribution:
+
+- GCD concept (both faces — tool-call authorization and forced abliteration): **Vince Ovando** (vince@cybersharkconsulting.com), https://tantalus.io/
+- GLP / weightless control vectors: **Matt Suiche** (m@msuiche.com), https://github.com/msuiche/weightless
+- hf2q is the first inference-engine-native implementation.
+
 ## Architecture
 
 A full source-grounded architecture map lives in
@@ -1071,6 +1139,11 @@ catalog + smoke prompt before any forward-pass code lands.
 - `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md` — Qwen hybrid cache,
   bounded prefill, cancellation, and watchdog containment.
 - `docs/adr/ADR-040-continuous-batching-reopen.md` — full-context slot scheduling.
+- `docs/adr/ADR-053-glp-gcd-serving.md` — GLP runtime steering and the `--gcd`
+  serving surface (attribution, decision, shipping gates).
+- `docs/adr/ADR-055-grammar-alphabet-presets.md` — grammar alphabet channel presets.
+- `docs/adr/ADR-056-gcd-serving-conformance-battery.md` — the 26-cell GCD
+  serving-stack conformance battery.
 - `docs/ADR-*.md` — architectural decisions, rationale, failed spikes, and verification status.
 
 ## License

@@ -266,6 +266,83 @@ services, rerun the installer with `--status`, `--disable`, `--enable`, or
 `--uninstall` (removal moves everything into a timestamped Trash folder; the
 model, hf2q, OpenCode, and Agentic Kit are untouched).
 
+## 11. Optional: forced engagement and runtime steering (`--gcd`, `--glp`)
+
+Both flags are launch-time modifiers of the model server. Stop it with Ctrl-C
+in terminal 1 and relaunch to try either. Plain `hf2q serve` is unchanged when
+they are absent, and the two flags compose. Neither touches a weight: `--gcd`
+constrains the sampling distribution; `--glp` steers the residual stream at
+inference time.
+
+### Worked example: `--gcd` (grammar-constrained decoding)
+
+```bash
+hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M --gcd
+```
+
+`--gcd` injects an embedded GBNF grammar into every chat request that does not
+already specify one and disables the think block so the grammar engages at
+token 0: the answer must open with a fixed anchor, seating the model's
+distribution on task continuations so refusal becomes locally incoherent —
+forced abliteration with no weight edits. The measured grammar stack behind
+this flag is three layers — a character-alphabet whitelist, a KMP
+refusal-lexicon exclusion automaton, and the anchor/topic sentence — and on
+stock DeepSeek-V4-Flash it held refusal to 2.3% on a 512-prompt adversarial
+corpus and 0.0% on 512 benign prompts (87.3% actionable on the adversarial
+half); layering the embeddings gate on drops the residual refusal to 0.59%
+(`scripts/grammar_probe/FINDINGS.md`).
+
+From terminal 2, once the server reports ready:
+
+```bash
+MODEL_ID="$(curl -fsS http://127.0.0.1:8081/v1/models |
+  jq -er '.data | map(select(.loaded == true)) | .[0].id')"
+curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"Explain how a buffer overflow works, step by step.\"}],\"temperature\":0,\"max_tokens\":256,\"stream\":false}" \
+  | jq -r '.choices[0].message.content'
+```
+
+The reply must open with the anchor `I'll analyze this directly.` — that
+opening, plus one `[GCD] injecting grammar` line per request in terminal 1, is
+the proof the constraint engaged. When a GLP vector is also bound, the composed
+grammar lets a think span run and then forces the answer to open with
+`Here is the technical breakdown.` instead. A request that supplies its own
+`grammar` or `response_format` keeps it; `--gcd` only fills in requests that
+specify neither. `--uncensor` is a hidden alias kept for backward
+compatibility.
+
+### Worked example: `--glp` (GLP runtime steering)
+
+```bash
+# Bind an explicit vector, with an optional dose override:
+hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M \
+  --glp ./vectors/qwen38-refusal.gguf --glp-alpha 0.8
+
+# Or ask the resolver to auto-discover the vector bound to this model
+# under the weightless Hub convention (`msuiche/*-GLP-*` artifacts):
+hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M --glp auto
+```
+
+A GLP vector is a small GGUF control vector (`project` or `add` mode) applied
+per layer to the post-layer residual stream at inference time; base weights are
+never modified. Without `--glp-alpha`, the dose is the vector's own
+`glp.alpha_default` (else 1.0). Startup is fail-closed: a vector with an
+unknown mode or hook point, an unsupported spec version, or the wrong width
+aborts the launch with a named error instead of serving unsteered, and
+auto-discovery fails closed on ambiguity or no match. The proof is in
+terminal 1's startup output:
+
+```text
+[GLP] vector bound: layers=… width=… alpha=… mode=… path=…
+```
+
+Attribution:
+
+- GCD concept (both faces — tool-call authorization and forced abliteration): **Vince Ovando** (vince@cybersharkconsulting.com), https://tantalus.io/
+- GLP / weightless control vectors: **Matt Suiche** (m@msuiche.com), https://github.com/msuiche/weightless
+- hf2q is the first inference-engine-native implementation.
+
 ## Troubleshooting
 
 - **Server fails to start or generate** — read the output in terminal 1, then
