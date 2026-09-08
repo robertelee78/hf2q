@@ -211,6 +211,25 @@ pub fn sample_token_with_logprob(
     params: &SamplingParams,
     previous_tokens: &[u32],
 ) -> (u32, f32) {
+    let (token, logprob, _top) =
+        sample_token_with_logprob_topk(logits, params, previous_tokens, 0);
+    (token, logprob)
+}
+
+/// Sample a token and report its raw-softmax logprob plus the top-K
+/// alternatives at this position.
+///
+/// Returns `(token, logprob, topk)` where `topk` is a descending-sorted list
+/// of `(token_id, logprob)` under the model's RAW (pre-temperature /
+/// pre-rep-penalty) softmax — the same distribution the scalar `logprob` is
+/// read from. `topk` has up to `top_k` entries. `top_k == 0` yields an empty
+/// `topk` (identical cost to `sample_token_with_logprob`).
+pub fn sample_token_with_logprob_topk(
+    logits: &mut [f32],
+    params: &SamplingParams,
+    previous_tokens: &[u32],
+    top_k: u32,
+) -> (u32, f32, Vec<(u32, f32)>) {
     // log_softmax(x)[i] = x[i] - (max + log(Σ exp(x - max)))
     let max_logit = logits
         .iter()
@@ -220,7 +239,7 @@ pub fn sample_token_with_logprob(
         // Degenerate input (all -inf or NaN-only) — fall back to greedy
         // and report neg-inf logprob so callers can detect the case.
         let token = sample_greedy(logits);
-        return (token, f32::NEG_INFINITY);
+        return (token, f32::NEG_INFINITY, Vec::new());
     }
     let mut sum_exp = 0.0f32;
     for &v in logits.iter() {
@@ -228,12 +247,30 @@ pub fn sample_token_with_logprob(
     }
     let log_z = max_logit + sum_exp.ln();
     let raw_logprobs: Vec<f32> = logits.iter().map(|&v| v - log_z).collect();
+
+    // Top-K alternatives from the raw distribution (skip -inf/masked).
+    // Sort then truncate: correct, and K is small (<=20) in practice.
+    let topk = if top_k == 0 {
+        Vec::new()
+    } else {
+        let mut indexed: Vec<(u32, f32)> = raw_logprobs
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, lp)| lp.is_finite())
+            .map(|(i, lp)| (i as u32, lp))
+            .collect();
+        indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        indexed.truncate(top_k as usize);
+        indexed
+    };
+
     let token = sample_token(logits, params, previous_tokens);
     let logprob = raw_logprobs
         .get(token as usize)
         .copied()
         .unwrap_or(f32::NEG_INFINITY);
-    (token, logprob)
+    (token, logprob, topk)
 }
 
 /// Sample a single token from a pre-extracted top-K (indices, values) pair.

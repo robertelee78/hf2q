@@ -564,7 +564,8 @@ pub(super) fn sample_logits_with_grammar(
     token_bytes: Option<&[Vec<u8>]>,
     eog_token_ids: &[u32],
     want_logprobs: bool,
-) -> Result<(u32, Option<f32>)> {
+    top_logprobs: u32,
+) -> Result<(u32, Option<TokenLogprobRecord>)> {
     match (runtime, token_bytes) {
         (Some(_), Some(table)) => anyhow::ensure!(
             table.len() == logits.len(),
@@ -603,9 +604,20 @@ pub(super) fn sample_logits_with_grammar(
         );
     }
     if want_logprobs {
-        let (token, logprob) =
-            sampler_pure::sample_token_with_logprob(logits, sampler, previous_tokens);
-        Ok((token, Some(logprob)))
+        let (token, logprob, top) = sampler_pure::sample_token_with_logprob_topk(
+            logits,
+            sampler,
+            previous_tokens,
+            top_logprobs,
+        );
+        Ok((
+            token,
+            Some(TokenLogprobRecord {
+                token_id: token,
+                logprob,
+                top,
+            }),
+        ))
     } else {
         Ok((
             sampler_pure::sample_token(logits, sampler, previous_tokens),
@@ -757,10 +769,25 @@ pub struct GenerationResult {
     /// model's RAW (pre-temperature/pre-rep-penalty) softmax.  `None`
     /// when the request did not set `logprobs: true`; otherwise length
     /// equals `completion_tokens`.  Populated in the decode loop via
-    /// [`crate::serve::sampler_pure::sample_token_with_logprob`].
+    /// [`crate::serve::sampler_pure::sample_token_with_logprob_topk`].
     /// Consumed by the response builder to populate
     /// [`crate::serve::api::schema::ChoiceLogprobs`].
-    pub logprobs: Option<Vec<f32>>,
+    pub logprobs: Option<Vec<TokenLogprobRecord>>,
+}
+
+/// One sampled token's logprob record: the emitted token's id + raw logprob,
+/// plus the top-K alternatives at that position (token_id, logprob),
+/// descending. This is the structured form that lets the response builder
+/// fill OpenAI's `token` / `bytes` / `top_logprobs` fields for real.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprobRecord {
+    /// The emitted token's vocabulary id.
+    pub token_id: u32,
+    /// Raw-softmax logprob of the emitted token.
+    pub logprob: f32,
+    /// Top-K alternatives as `(token_id, logprob)`, descending by logprob.
+    /// Empty when the request's `top_logprobs` is 0.
+    pub top: Vec<(u32, f32)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -7025,7 +7052,8 @@ struct Gemma4DecodeState {
     /// the streaming splitter did.
     reasoning_forced_open: bool,
     want_logprobs: bool,
-    logprobs_acc: Option<Vec<f32>>,
+    top_logprobs: u32,
+    logprobs_acc: Option<Vec<TokenLogprobRecord>>,
     logit_bias: std::collections::HashMap<u32, f32>,
     stop_strings: Vec<String>,
     /// The token to feed into the NEXT decode forward.
@@ -7455,7 +7483,7 @@ impl Gemma4DecodeState {
         let mut tc_splitter: Option<super::registry::ToolCallSplitter> =
             registration.and_then(super::registry::ToolCallSplitter::from_registration);
         let want_logprobs = params.logprobs;
-        let mut logprobs_acc: Option<Vec<f32>> = if want_logprobs {
+        let mut logprobs_acc: Option<Vec<TokenLogprobRecord>> = if want_logprobs {
             Some(Vec::with_capacity(params.max_tokens))
         } else {
             None
@@ -7494,9 +7522,10 @@ impl Gemma4DecodeState {
                 token_bytes_ref,
                 &loaded.eos_token_ids,
                 want_logprobs,
+                params.top_logprobs,
             )?;
-            if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
-                acc.push(lp_val);
+            if let (Some(acc), Some(record)) = (logprobs_acc.as_mut(), lp_opt) {
+                acc.push(record);
             }
             accept_grammar_token(
                 &mut grammar_runtime,
@@ -7580,6 +7609,7 @@ impl Gemma4DecodeState {
             reasoning_token_count,
             reasoning_forced_open,
             want_logprobs,
+            top_logprobs: params.top_logprobs,
             logprobs_acc,
             logit_bias: params.logit_bias.clone(),
             stop_strings: params.stop_strings.clone(),
@@ -7703,9 +7733,10 @@ impl Gemma4DecodeState {
                 token_bytes_ref,
                 &loaded.eos_token_ids,
                 self.want_logprobs,
+                self.top_logprobs,
             )?;
-            if let (Some(acc), Some(lp_val)) = (self.logprobs_acc.as_mut(), lp_opt) {
-                acc.push(lp_val);
+            if let (Some(acc), Some(record)) = (self.logprobs_acc.as_mut(), lp_opt) {
+                acc.push(record);
             }
             accept_grammar_token(
                 &mut self.grammar_runtime,
@@ -23574,16 +23605,16 @@ fn generate_once_with_soft_tokens(
     // untouched.  This removes the wave-2.5 `if in_tool_body { mask }`
     // wrapper and the sibling `Arc<AtomicBool>` it implied — exactly
     // the architecture the audit caught at engine.rs:1401, 1489, etc.
-    // ADR-020 AC#7 — closure returns (token, optional logprob).
-    // Logprob is `Some` iff the request set `logprobs:true`; computed
-    // via `sampler_pure::sample_token_with_logprob` over the
+    // ADR-020 AC#7 — closure returns (token, optional logprob record).
+    // The record is `Some` iff the request set `logprobs:true`; computed
+    // via `sampler_pure::sample_token_with_logprob_topk` over the
     // post-bias / post-grammar-mask logits (so the logprob reflects
     // the distribution the sampler actually ran against).
     let want_logprobs = params.logprobs;
     let sample_from_live_logits = |weights: &mut MlxModelWeights,
                                    generated: &[u32],
                                    runtime: Option<&super::grammar::GrammarRuntime>|
-     -> Result<(u32, Option<f32>)> {
+     -> Result<(u32, Option<TokenLogprobRecord>)> {
         let sp = sampler_params.as_ref().expect("sample_logits gate");
         let mut logits: Vec<f32> = weights.logits_view()?.to_vec();
         // Tier 4 logit_bias FIRST: additive per OpenAI convention.
@@ -23604,13 +23635,14 @@ fn generate_once_with_soft_tokens(
             token_bytes_ref,
             &loaded.eos_token_ids,
             want_logprobs,
+            params.top_logprobs,
         )
     };
     // ADR-020 AC#7 — per-completion-token logprob accumulator.
     // Length tracks `completion_tokens` and is moved into
     // `GenerationResult.logprobs` at end-of-decode.  Stays `None` when
     // the request did not opt in to logprobs.
-    let mut logprobs_acc: Option<Vec<f32>> = if want_logprobs {
+    let mut logprobs_acc: Option<Vec<TokenLogprobRecord>> = if want_logprobs {
         Some(Vec::with_capacity(params.max_tokens))
     } else {
         None
@@ -23708,8 +23740,8 @@ fn generate_once_with_soft_tokens(
     let mut next_token = if sample_logits {
         let (tok, lp) =
             sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref())?;
-        if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp) {
-            acc.push(lp_val);
+        if let (Some(acc), Some(record)) = (logprobs_acc.as_mut(), lp) {
+            acc.push(record);
         }
         let tok = tok;
         // Feed the chosen token id and decoded bytes through the grammar
@@ -23837,8 +23869,8 @@ fn generate_once_with_soft_tokens(
                     &generated_tokens,
                     grammar_runtime.as_ref(),
                 )?;
-                if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp) {
-                    acc.push(lp_val);
+                if let (Some(acc), Some(record)) = (logprobs_acc.as_mut(), lp) {
+                    acc.push(record);
                 }
                 // Advance by the chosen token id and decoded bytes. The
                 // runtime self-gates while awaiting a lazy trigger.
@@ -24513,7 +24545,7 @@ fn generate_gemma4_once_slot_aware(
 
         // Per-completion-token logprob accumulator.
         let want_logprobs = params.logprobs;
-        let mut logprobs_acc: Option<Vec<f32>> = if want_logprobs {
+        let mut logprobs_acc: Option<Vec<TokenLogprobRecord>> = if want_logprobs {
             Some(Vec::with_capacity(params.max_tokens))
         } else {
             None
@@ -24545,13 +24577,25 @@ fn generate_gemma4_once_slot_aware(
                 );
             }
             let (tok, lp_opt) = if want_logprobs {
-                let (t, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
-                (t, Some(lp))
+                let (t, lp, top) = sampler_pure::sample_token_with_logprob_topk(
+                    &mut logits,
+                    sp,
+                    &[],
+                    params.top_logprobs,
+                );
+                (
+                    t,
+                    Some(TokenLogprobRecord {
+                        token_id: t,
+                        logprob: lp,
+                        top,
+                    }),
+                )
             } else {
                 (sampler_pure::sample_token(&mut logits, sp, &[]), None)
             };
-            if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
-                acc.push(lp_val);
+            if let (Some(acc), Some(record)) = (logprobs_acc.as_mut(), lp_opt) {
+                acc.push(record);
             }
             accept_grammar_token(
                 &mut grammar_runtime,
@@ -24650,20 +24694,28 @@ fn generate_gemma4_once_slot_aware(
                         );
                     }
                     let (tok, lp_opt) = if want_logprobs {
-                        let (t, lp) = sampler_pure::sample_token_with_logprob(
+                        let (t, lp, top) = sampler_pure::sample_token_with_logprob_topk(
                             &mut logits,
                             sp,
                             &generated_tokens,
+                            params.top_logprobs,
                         );
-                        (t, Some(lp))
+                        (
+                            t,
+                            Some(TokenLogprobRecord {
+                                token_id: t,
+                                logprob: lp,
+                                top,
+                            }),
+                        )
                     } else {
                         (
                             sampler_pure::sample_token(&mut logits, sp, &generated_tokens),
                             None,
                         )
                     };
-                    if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
-                        acc.push(lp_val);
+                    if let (Some(acc), Some(record)) = (logprobs_acc.as_mut(), lp_opt) {
+                        acc.push(record);
                     }
                     accept_grammar_token(
                         &mut grammar_runtime,
@@ -26308,7 +26360,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
             registration.and_then(super::registry::ToolCallSplitter::from_registration);
 
         let want_logprobs = params.logprobs;
-        let mut logprobs_acc: Option<Vec<f32>> = if want_logprobs {
+        let mut logprobs_acc: Option<Vec<TokenLogprobRecord>> = if want_logprobs {
             Some(Vec::with_capacity(params.max_tokens))
         } else {
             None
@@ -26335,13 +26387,25 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 );
             }
             let (tok, lp_opt) = if want_logprobs {
-                let (t, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
-                (t, Some(lp))
+                let (t, lp, top) = sampler_pure::sample_token_with_logprob_topk(
+                    &mut logits,
+                    sp,
+                    &[],
+                    params.top_logprobs,
+                );
+                (
+                    t,
+                    Some(TokenLogprobRecord {
+                        token_id: t,
+                        logprob: lp,
+                        top,
+                    }),
+                )
             } else {
                 (sampler_pure::sample_token(&mut logits, sp, &[]), None)
             };
-            if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
-                acc.push(lp_val);
+            if let (Some(acc), Some(record)) = (logprobs_acc.as_mut(), lp_opt) {
+                acc.push(record);
             }
             accept_grammar_token(
                 &mut grammar_runtime,
@@ -26434,20 +26498,28 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                         );
                     }
                     let (tok, lp_opt) = if want_logprobs {
-                        let (t, lp) = sampler_pure::sample_token_with_logprob(
+                        let (t, lp, top) = sampler_pure::sample_token_with_logprob_topk(
                             &mut logits,
                             sp,
                             &generated_tokens,
+                            params.top_logprobs,
                         );
-                        (t, Some(lp))
+                        (
+                            t,
+                            Some(TokenLogprobRecord {
+                                token_id: t,
+                                logprob: lp,
+                                top,
+                            }),
+                        )
                     } else {
                         (
                             sampler_pure::sample_token(&mut logits, sp, &generated_tokens),
                             None,
                         )
                     };
-                    if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
-                        acc.push(lp_val);
+                    if let (Some(acc), Some(record)) = (logprobs_acc.as_mut(), lp_opt) {
+                        acc.push(record);
                     }
                     accept_grammar_token(
                         &mut grammar_runtime,
@@ -28902,6 +28974,7 @@ fn generate_stream_once(
             token_bytes_ref,
             &loaded.eos_token_ids,
             false,
+            params.top_logprobs,
         )?;
         accept_grammar_token(
             &mut grammar_runtime,
@@ -29019,6 +29092,7 @@ fn generate_stream_once(
                     token_bytes_ref,
                     &loaded.eos_token_ids,
                     false,
+                    params.top_logprobs,
                 )?;
                 accept_grammar_token(
                     &mut grammar_runtime,

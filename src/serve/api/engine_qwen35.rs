@@ -39,7 +39,7 @@ use super::engine::{
     accept_grammar_token, effective_repetition_penalty, grammar_runtime_for_request,
     sample_logits_with_grammar, supervised_gpu_call, validate_grammar_terminal, DeepstackData,
     LoadOptions, SamplingParams, SerialStreamEnd, SerialStreamResult, SoftTokenData,
-    ToolCallPolicy,
+    TokenLogprobRecord, ToolCallPolicy,
 };
 use super::engine_supervisor::EngineSupervisor;
 
@@ -1516,13 +1516,14 @@ fn sample_logits_qwen35(logits: &mut [f32], params: &SamplingParams, generated: 
 
 /// ADR-020 AC#7 — variant of [`sample_logits_qwen35`] that also returns
 /// the log-probability of the chosen token under the *raw* (pre-rep-penalty,
-/// pre-temperature) distribution.  Routed when `params.logprobs == true`
+/// pre-temperature) distribution plus the request's top-K alternatives
+/// (`params.top_logprobs`).  Routed when `params.logprobs == true`
 /// so the chat handler can populate `ChoiceLogprobs.content[]`.
 fn sample_logits_qwen35_with_logprob(
     logits: &mut [f32],
     params: &SamplingParams,
     generated: &[u32],
-) -> (u32, f32) {
+) -> (u32, f32, Vec<(u32, f32)>) {
     let sp = SamplerPureParams {
         temperature: params.temperature as f64,
         top_p: params.top_p as f64,
@@ -1532,7 +1533,7 @@ fn sample_logits_qwen35_with_logprob(
         max_tokens: params.max_tokens,
         seed: params.seed,
     };
-    sampler_pure::sample_token_with_logprob(logits, &sp, generated)
+    sampler_pure::sample_token_with_logprob_topk(logits, &sp, generated, params.top_logprobs)
 }
 
 fn sample_logits_qwen35_constrained(
@@ -1542,7 +1543,7 @@ fn sample_logits_qwen35_constrained(
     runtime: Option<&super::grammar::GrammarRuntime>,
     eog_token_ids: &[u32],
     want_logprobs: bool,
-) -> Result<(u32, Option<f32>)> {
+) -> Result<(u32, Option<TokenLogprobRecord>)> {
     for (&token, &bias) in &params.logit_bias {
         if let Some(logit) = logits.get_mut(token as usize) {
             *logit += bias;
@@ -1565,6 +1566,7 @@ fn sample_logits_qwen35_constrained(
         params.token_bytes.as_deref().map(Vec::as_slice),
         eog_token_ids,
         want_logprobs,
+        params.top_logprobs,
     )
 }
 
@@ -1955,7 +1957,7 @@ fn generate_qwen35_once_ordinary(
     // to compute log_softmax) but token selection is identical (T=0
     // with sample_token_with_logprob ⇒ argmax).
     let want_logprobs = params.logprobs;
-    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+    let mut logprobs_vec: Option<Vec<TokenLogprobRecord>> = if want_logprobs {
         Some(Vec::with_capacity(max_tokens))
     } else {
         None
@@ -3142,7 +3144,7 @@ pub fn generate_qwen35_once_slot_aware(
 
     let is_greedy = is_greedy_eligible(params);
     let want_logprobs = params.logprobs;
-    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+    let mut logprobs_vec: Option<Vec<TokenLogprobRecord>> = if want_logprobs {
         Some(Vec::with_capacity(max_tokens))
     } else {
         None
@@ -3207,8 +3209,12 @@ pub fn generate_qwen35_once_slot_aware(
         } else {
             let mut logits = prefill_logits;
             if let Some(ref mut lps) = logprobs_vec {
-                let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
-                lps.push(lp);
+                let (tok, lp, top) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
+                lps.push(TokenLogprobRecord {
+                    token_id: tok,
+                    logprob: lp,
+                    top,
+                });
                 next_token = tok;
             } else {
                 next_token = sample_logits_qwen35(&mut logits, params, &[]);
@@ -3286,9 +3292,13 @@ pub fn generate_qwen35_once_slot_aware(
             );
             let mut logits = logits;
             if let Some(ref mut lps) = logprobs_vec {
-                let (tok, lp) =
+                let (tok, lp, top) =
                     sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
-                lps.push(lp);
+                lps.push(TokenLogprobRecord {
+                    token_id: tok,
+                    logprob: lp,
+                    top,
+                });
                 tok
             } else {
                 sample_logits_qwen35(&mut logits, params, &generated_tokens)
@@ -4084,7 +4094,7 @@ pub(crate) struct Qwen35DecodeState {
     max_tokens: usize,
     is_greedy: bool,
     want_logprobs: bool,
-    logprobs_vec: Option<Vec<f32>>,
+    logprobs_vec: Option<Vec<TokenLogprobRecord>>,
     cached_tokens: usize,
     /// Cloned request sampling params — the qwen35 sampling helpers
     /// (`sample_logits_qwen35*`) read temperature/top_p/top_k/rep-penalty/
@@ -4931,7 +4941,14 @@ impl Qwen35DecodeState {
                 qwen.vocab_size
             );
             let (token, logprob) = if let Some((token, _)) = forced_token {
-                (token, self.want_logprobs.then_some(0.0))
+                // Forced (thinking-budget) tokens are not sampled: report the
+                // degenerate certain logprob with no alternatives.
+                let record = TokenLogprobRecord {
+                    token_id: token,
+                    logprob: 0.0,
+                    top: Vec::new(),
+                };
+                (token, self.want_logprobs.then_some(record))
             } else {
                 let mut logits = logits;
                 sample_logits_qwen35_constrained(
@@ -6888,7 +6905,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
 
     // ADR-020 AC#7 — see generate_qwen35_once.
     let want_logprobs = params.logprobs;
-    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+    let mut logprobs_vec: Option<Vec<TokenLogprobRecord>> = if want_logprobs {
         Some(Vec::with_capacity(max_tokens))
     } else {
         None
@@ -7152,7 +7169,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
 
     // ADR-020 AC#7 — see generate_qwen35_once.
     let want_logprobs = params.logprobs;
-    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+    let mut logprobs_vec: Option<Vec<TokenLogprobRecord>> = if want_logprobs {
         Some(Vec::with_capacity(max_tokens))
     } else {
         None
@@ -9035,7 +9052,7 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
 
     let is_greedy = is_greedy_eligible(params);
     let want_logprobs = params.logprobs;
-    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+    let mut logprobs_vec: Option<Vec<TokenLogprobRecord>> = if want_logprobs {
         Some(Vec::with_capacity(max_tokens))
     } else {
         None
@@ -9075,9 +9092,13 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
     );
     let mut next_token: u32 = if want_logprobs {
         let mut logits = prefill_logits.clone();
-        let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
+        let (tok, lp, top) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
         if let Some(v) = logprobs_vec.as_mut() {
-            v.push(lp);
+            v.push(TokenLogprobRecord {
+                token_id: tok,
+                logprob: lp,
+                top,
+            });
         }
         tok
     } else if is_greedy {
@@ -9137,10 +9158,14 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
                         )
                     })?;
                 let mut logits = logits_full;
-                let (tok, lp) =
+                let (tok, lp, top) =
                     sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
                 if let Some(v) = logprobs_vec.as_mut() {
-                    v.push(lp);
+                    v.push(TokenLogprobRecord {
+                        token_id: tok,
+                        logprob: lp,
+                        top,
+                    });
                 }
                 tok
             } else if is_greedy {
@@ -9348,7 +9373,7 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
 
     let is_greedy = is_greedy_eligible(params);
     let want_logprobs = params.logprobs;
-    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+    let mut logprobs_vec: Option<Vec<TokenLogprobRecord>> = if want_logprobs {
         Some(Vec::with_capacity(max_tokens))
     } else {
         None
@@ -9403,9 +9428,13 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
     );
     let mut next_token: u32 = if want_logprobs {
         let mut logits = prefill_logits.clone();
-        let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
+        let (tok, lp, top) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
         if let Some(v) = logprobs_vec.as_mut() {
-            v.push(lp);
+            v.push(TokenLogprobRecord {
+                token_id: tok,
+                logprob: lp,
+                top,
+            });
         }
         tok
     } else if is_greedy {
@@ -9477,10 +9506,14 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
                         )
                     })?;
                 let mut logits = logits_full;
-                let (tok, lp) =
+                let (tok, lp, top) =
                     sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
                 if let Some(v) = logprobs_vec.as_mut() {
-                    v.push(lp);
+                    v.push(TokenLogprobRecord {
+                        token_id: tok,
+                        logprob: lp,
+                        top,
+                    });
                 }
                 tok
             } else if is_greedy {
@@ -10206,6 +10239,7 @@ mod tests {
             params.token_bytes.as_deref().map(Vec::as_slice),
             &[],
             false,
+            0,
         )
         .expect_err("short token table must fail closed");
         assert!(short
@@ -10225,6 +10259,7 @@ mod tests {
             params.token_bytes.as_deref().map(Vec::as_slice),
             &[],
             false,
+            0,
         )
         .expect_err("long token table must fail closed");
         assert!(long.to_string().contains("length 3 != logits vocabulary 2"));

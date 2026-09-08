@@ -41,7 +41,8 @@ use super::schema::{
     ApiError, ApiErrorBody, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
     ChatMessage, ChoiceLogprobs, EmbeddingObject, EmbeddingPayload, EmbeddingRequest,
     EmbeddingResponse, EmbeddingUsage, HealthResponse, MessageContent, ModelListResponse,
-    ModelObject, PromptTokensDetails, ReadyzResponse, ResponseFormat, TokenLogprob, UsageStats,
+    ModelObject, PromptTokensDetails, ReadyzResponse, ResponseFormat, TokenLogprob,
+    TopLogprobEntry, UsageStats,
 };
 use super::state::AppState;
 use crate::serve::auto_pipeline;
@@ -848,24 +849,41 @@ async fn chat_completions_with_prepared(
             finish_reason: effective_finish_reason,
             // ADR-020 AC#7 — populate per-token logprobs when the
             // request opted in via `logprobs:true`.  GenerationResult
-            // .logprobs is Some(Vec<f32>) of length completion_tokens
-            // when the decode loop captured them via
-            // sampler_pure::sample_token_with_logprob.  TokenLogprob
-            // .token / .bytes are filled with empty strings here for
-            // the v1 surface (callers like the AC#7 boundary harness
-            // need only `.logprob`); per-token decoded text is a
-            // follow-up that requires plumbing token IDs through
-            // GenerationResult.
-            logprobs: result.logprobs.as_ref().map(|lps| ChoiceLogprobs {
-                content: lps
-                    .iter()
-                    .map(|&lp| TokenLogprob {
-                        token: String::new(),
-                        logprob: lp,
-                        bytes: None,
-                        top_logprobs: Vec::new(),
-                    })
-                    .collect(),
+            // .logprobs is Some(Vec<TokenLogprobRecord>) of length
+            // completion_tokens when the decode loop captured them via
+            // sampler_pure::sample_token_with_logprob_topk.  Each record
+            // carries the emitted token id, its raw-softmax logprob, and
+            // the request's top-K alternatives; decode ids to text/bytes
+            // via the engine's tokenizer (skip_special_tokens=false,
+            // matching the decode loop's fragment decoding).
+            logprobs: result.logprobs.as_ref().map(|records| {
+                let tokenizer = engine.tokenizer();
+                let decode_id = |id: u32| tokenizer.decode(&[id], false).unwrap_or_default();
+                ChoiceLogprobs {
+                    content: records
+                        .iter()
+                        .map(|record| {
+                            let token_text = decode_id(record.token_id);
+                            TokenLogprob {
+                                bytes: Some(token_text.clone().into_bytes()),
+                                token: token_text,
+                                logprob: record.logprob,
+                                top_logprobs: record
+                                    .top
+                                    .iter()
+                                    .map(|(id, lp)| {
+                                        let alt_text = decode_id(*id);
+                                        TopLogprobEntry {
+                                            bytes: Some(alt_text.clone().into_bytes()),
+                                            token: alt_text,
+                                            logprob: *lp,
+                                        }
+                                    })
+                                    .collect(),
+                            }
+                        })
+                        .collect(),
+                }
             }),
         }],
         usage: UsageStats {

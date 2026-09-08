@@ -6,7 +6,7 @@ use mlx_native::MlxBuffer;
 use crate::serve::api::engine::{
     accept_grammar_token, effective_repetition_penalty, grammar_runtime_for_request,
     sample_logits_with_grammar, validate_grammar_terminal, GenerationResult, GrammarKind,
-    SamplingParams,
+    SamplingParams, TokenLogprobRecord,
 };
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::grammar::GrammarRuntime;
@@ -79,7 +79,7 @@ fn sample_cpu_logits(
     previous: &[u32],
     runtime: Option<&GrammarRuntime>,
     eog_token_ids: &[u32],
-) -> Result<(u32, Option<f32>)> {
+) -> Result<(u32, Option<TokenLogprobRecord>)> {
     sample_logits_with_grammar(
         values,
         sampler,
@@ -88,6 +88,7 @@ fn sample_cpu_logits(
         params.token_bytes.as_deref().map(Vec::as_slice),
         eog_token_ids,
         params.logprobs,
+        params.top_logprobs,
     )
 }
 
@@ -99,7 +100,7 @@ pub(super) fn sample(
     previous: &[u32],
     runtime: &mut Option<GrammarRuntime>,
     supervisor: &EngineSupervisor,
-) -> Result<(u32, Option<f32>)> {
+) -> Result<(u32, Option<TokenLogprobRecord>)> {
     let needs_cpu = params.temperature > 0.0
         || params.top_k > 0
         || params.top_p < 1.0

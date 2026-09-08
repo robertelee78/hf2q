@@ -13,7 +13,9 @@ use anyhow::{Context, Result};
 use mlx_native::MlxBuffer;
 use tokio::sync::mpsc;
 
-use crate::serve::api::engine::{validate_grammar_terminal, GenerationResult, SamplingParams};
+use crate::serve::api::engine::{
+    validate_grammar_terminal, GenerationResult, SamplingParams, TokenLogprobRecord,
+};
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::grammar::GrammarRuntime;
 use crate::serve::api::registry::ModelRegistration;
@@ -383,7 +385,7 @@ pub(crate) struct Deepseek4SlotState {
     thinking_budget: Option<Deepseek4ThinkingBudgetState>,
     max_tokens: usize,
     generated: Vec<u32>,
-    logprobs: Option<Vec<f32>>,
+    logprobs: Option<Vec<TokenLogprobRecord>>,
     decode_ids: Vec<u32>,
     decode_prefix: String,
     decode_prefix_index: usize,
@@ -582,7 +584,14 @@ impl Deepseek4SlotState {
         }
         let (token, logprob) = if let Some((token, _)) = forced_token {
             accept_forced_token(&mut self.runtime, &self.params, token)?;
-            (token, self.params.logprobs.then_some(0.0))
+            // Forced (thinking-budget close) tokens are not sampled: report
+            // the degenerate certain logprob with no alternatives.
+            let record = TokenLogprobRecord {
+                token_id: token,
+                logprob: 0.0,
+                top: Vec::new(),
+            };
+            (token, self.params.logprobs.then_some(record))
         } else {
             sample(
                 loaded,
