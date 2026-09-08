@@ -574,6 +574,7 @@ fn sample_logits_qwen3vl(
         token_bytes,
         eog_token_ids,
         false,
+        params.top_logprobs,
     )
     .map(|(token, _)| token)
 }
