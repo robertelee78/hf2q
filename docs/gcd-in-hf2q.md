@@ -204,9 +204,11 @@ shows up elsewhere as degenerate/truncated output, not refusal. Judge-rated
 actionability measures what the response contains, not whether the code runs.
 
 **Cross-model.** The same W1 grammar on vanilla Gemma-4-26B (stock,
-refusal-trained, different family): fluent compliant text on the same harmful
-prompts, no grammar modification. Refusal rate measured on the same APEX judge
-(full corpus comparison in progress — the spike shows the shape generalizes).
+refusal-trained, different family), full 1024-prompt corpus, same APEX judge:
+**7.2% refusal on the adversarial half, 0.0% on the benign half** — vs 2.3%/0.0%
+on DeepSeek. The grammar generalizes across families with zero modification;
+the smaller model pays a higher residual-refusal and degeneracy tax, but the
+shape holds. Zero benign over-constraint on both.
 
 ## Serving-stack conformance (26 cells, hf2q)
 
