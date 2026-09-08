@@ -58,18 +58,10 @@ pub struct MlxQWeight {
     /// path.  Routing in `dispatch_qmatmul` checks `affine.is_some()`
     /// FIRST and skips both the F32 and GGML branches when set.
     pub affine: Option<MlxAffineExtra>,
-    /// ADR-029 iter-28 H29 — F16 pre-dequantized shadow.  When `Some`,
-    /// `dispatch_qmatmul` at m > MM_ROUTING_THRESHOLD routes through
-    /// `kernel_mul_mm_f16_f32_*` (peer's gemma4 pattern) instead of
-    /// per-call dequant inside `kernel_mul_mm_<qtype>_tensor_f32`.
-    ///
-    /// Materialized at load via `dispatch_dequant_to_f16` when the
-    /// `HF2Q_F16_SHADOW=1` env gate is set and the weight is a quantized
-    /// type the dequant kernel supports (Q4_0/Q8_0/Q5_1/IQ4_NL/Q4_K/
-    /// Q5_K/Q6_K).  ~1 GB extra resident on gemma4-26B; M5 Max's 128 GB
-    /// unified memory accommodates this without pressure.
-    ///
-    /// Default OFF until coherence + multi-regime bench parity proven.
+    /// Legacy optional compute copy used by callers that explicitly provide
+    /// F16 weights for prefill. Ordinary Gemma GGUF loading never populates
+    /// this field and its storage inventory rejects it. The shared type keeps
+    /// the field for existing family/overlay graph structures.
     pub f16_shadow: Option<MlxBuffer>,
     /// ADR-029 iter-175 Step 1d — pre-baked dispatch record for the
     /// Q6_K NR2 decode-m=1 mat-vec hot path.  Lazy-init on the first
@@ -444,7 +436,7 @@ pub fn dispatch_qmatmul(
     // ADR-029 iter-28 H29 / iter-30 H29-speed — F16 pre-dequant fast path.
     //
     // When a quantized weight has been pre-dequantized to F16 at load
-    // (via populate_f16_shadow_if_enabled under HF2Q_F16_SHADOW=1),
+    // by an explicit caller outside the ordinary Gemma GGUF loader,
     // route m > MM_ROUTING_THRESHOLD (= 8, prefill) through the V2-tile
     // F16-weight × F32-input mat-mat kernel (`hf2q_mul_mm_tensor_v2_f16`).
     // This is the F16-input analog of the V2 quantized kernel — same
