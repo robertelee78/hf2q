@@ -18,6 +18,8 @@ import urllib.request
 
 
 def main():
+    if not __debug__:
+        raise RuntimeError("Run this validation harness without Python optimization")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--engine", choices=["hf2q", "peer"], required=True)

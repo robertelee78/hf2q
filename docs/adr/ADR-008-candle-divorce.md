@@ -71,10 +71,10 @@ substitution or external engine is involved.
 
 hf2q owns tensor shapes and graph dispatch; mlx-native owns native storage and
 execution. Qwen storage admission is derived from its actual loader predicates,
-shared with hosted preflight. Gemma admission checks the graph it implements,
-including rejecting an untied output head and unsupported metadata features.
-When Gemma's Q8 head policy selects an embedding already stored as Q8, the
-loader reuses those original blocks without a dequantize/requantize round trip.
+shared with hosted preflight. At that revision, Gemma admission rejected an untied output head and
+unsupported metadata features. Its Q8 head policy reused an embedding already
+stored as Q8 without a dequantize/requantize round trip. The next amendment
+supersedes that head-policy restriction.
 
 Focused Metal numerical and byte-preservation evidence, failed spikes, and the
 remaining full-model validation are recorded in
