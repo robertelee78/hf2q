@@ -89,6 +89,18 @@ same.
 
 ## Measuring the refuser while it fires
 
+**Definitions used throughout.** *W1* is the winning grammar arm from our
+campaign: the GBNF grammar that (a) forces the response to open with the anchor
+`Here is the technical breakdown.` followed by `The mechanism is ` plus a
+bounded free-text span, then (b) releases into a body constrained by a
+character whitelist (ASCII printable + 14 curated symbols) and a KMP
+refusal-lexicon exclusion automaton. It is the `--gcd` default shipped in hf2q
+(`include_str!` from `grammar/gcd_w1.gbnf`). *The embeddings gate* is a
+semantic screen: each response is embedded (bge-small-en) and scored by cosine
+similarity against a refusal cluster centroid vs a fulfillment centroid; a
+margin threshold (validated at zero false-positives on the spike) flags
+paraphrase refusals the character-level automaton cannot see.
+
 The natural objection: *if the refuser is inside the model and fires at full
 strength, how can you get an answer — are you just rewriting the output?*
 Logprob probes answer both halves. We built a real per-token logprob surface
@@ -212,7 +224,16 @@ shape holds. Zero benign over-constraint on both.
 
 ## Serving-stack conformance (26 cells, hf2q)
 
-The vLLM beam-search FATAL class — a silent constraint drop — is absent: hf2q
+Matt Suiche's serving-stack battery (25 cells against vLLM 0.28.0 + xgrammar)
+established the failure taxonomy: every sampling lever was held to the
+invariant "after all transforms, P(forbidden token) = 0," and exactly one
+FATAL class emerged — **`use_beam_search: true` silently detaches the
+constraint** (the grammar never engages; output is unconstrained prose with
+the grammar nominally attached, a demonstrated end-to-end exfiltration win).
+That is the reference battery our ADR-056 translates to hf2q's parameter
+surface.
+
+The vLLM beam-search FATAL class is absent by construction: hf2q
 has no beam surface, and undeclared sampler params now 4xx under the ADR-056
 rule ("reject what you cannot honor" closes the whole silent-drop class).
 Temperature/top-k/top-p/penalties held; terminal truncation fails loudly;
