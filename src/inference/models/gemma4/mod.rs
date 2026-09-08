@@ -27,6 +27,9 @@ pub mod io_heads;
 pub mod kv_cache;
 pub mod kv_persist;
 pub mod model;
+pub mod native_matrix;
+mod native_storage;
+mod native_embedding;
 pub mod profile;
 pub mod tokenizer;
 
@@ -39,3 +42,6 @@ pub use profile::{KernelTypeProfile, ProfileAccumulator, TokenProfile};
 
 #[cfg(test)]
 mod admission_tests;
+
+#[cfg(test)]
+mod native_io_tests;

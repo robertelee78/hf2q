@@ -46,6 +46,14 @@ and expert dispatchers select those operations from actual tensor storage.
 Block-quantized tensors retain their quantized routes. No publisher label is
 translated into an invented tensor type.
 
+Gemma's `native_matrix`, `native_storage`, and shared mapped-storage helpers
+admit and retain original embedding/head, projection, router, and expert bytes.
+A load-time inventory rejects anonymous ordinary matrix copies. Native gather
+produces only requested F32 activation rows; all head paths use the artifact's
+actual tied or explicit output representation. Prefill layout adaptation changes
+activations, never matrix storage. See ADR-008's 2026-09-08 amendment and the
+Gemma chat RCA for the former F32 embedding/F16-shadow behavior and its removal.
+
 ### Sovereignty rule (`docs/arch-onboarding.md`)
 
 - **Pure Rust.** No `llama.cpp` / `candle` code, crate, binary, or
@@ -292,7 +300,7 @@ quality, artifact, kernel, and benchmark gates required before that name can be
 activated.
 
 Native packed inference paths consume each tensor in its recorded GGML
-representation. This is the production contract for Qwen3.8 text inference;
+representation. This is the production contract for Gemma 4 and Qwen3.8 text inference;
 quantization policy is applied while converting source weights, and explicit
 overlay artifacts retain their own declared representation. Serving never
 dequantizes an artifact weight merely to encode it into another runtime codec.

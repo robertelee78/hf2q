@@ -263,12 +263,12 @@ fn rejects_storage_without_a_runtime_route() {
 }
 
 #[test]
-fn rejects_distinct_output_head() {
-    assert!(rejection(Fixture {
+fn admits_distinct_native_output_head() {
+    let (_dir, gguf) = open_fixture(Fixture {
         untied_output: true,
         ..Fixture::default()
-    })
-    .contains("distinct output.weight"));
+    });
+    super::admission::validate(&gguf).unwrap();
 }
 
 #[test]

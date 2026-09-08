@@ -1,79 +1,66 @@
 use super::*;
-use crate::backends::gguf::writer::GgufWriter;
-use crate::quantize::ggml_quants::GgmlType;
-use std::fs;
 
 #[test]
-fn native_q8_head_requires_selected_route_and_q8_source() {
-    assert!(native_q8_head_selected(
-        true,
-        Some(mlx_native::GgmlType::Q8_0)
-    ));
-    assert!(!native_q8_head_selected(
-        false,
-        Some(mlx_native::GgmlType::Q8_0)
-    ));
-    assert!(!native_q8_head_selected(
-        true,
-        Some(mlx_native::GgmlType::Q6_K)
-    ));
-    assert!(!native_q8_head_selected(true, None));
-}
-
-#[test]
-fn native_q8_head_loader_preserves_original_blocks() {
+fn gemma_activation_argmax_executes_native_u32_parameter_contract() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let Ok(device) = mlx_native::MlxDevice::new() else {
-        eprintln!("skipping native Q8 head loader test: no MlxDevice");
-        return;
+    let mut ctx = crate::serve::gpu::GpuContext::new().expect("Metal test requires a GPU");
+    let device = ctx.device().clone();
+    let config = Gemma4Config {
+        vocab_size: 8,
+        hidden_size: 4,
+        intermediate_size: 8,
+        moe_intermediate_size: 4,
+        num_hidden_layers: 1,
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        num_global_key_value_heads: 1,
+        head_dim: 4,
+        global_head_dim: 4,
+        rms_norm_eps: 1e-6,
+        rope_theta_sliding: 10000.0,
+        rope_theta_global: 10000.0,
+        sliding_window: 8,
+        max_position_embeddings: 8,
+        final_logit_softcapping: None,
+        attention_bias: false,
+        attention_k_eq_v: false,
+        tie_word_embeddings: true,
+        num_experts: 2,
+        top_k_experts: 1,
+        layer_types: vec![crate::serve::config::LayerType::Sliding],
     };
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("native-q8-head.gguf");
-    let original: Vec<u8> = (0..68).map(|index| (index * 37 + 11) as u8).collect();
-    let mut writer = GgufWriter::new(fs::File::create(&path).unwrap());
-    writer.write_header(1, 0).unwrap();
-    writer
-        .reserve_tensor_info("token_embd.weight", &[32, 2], GgmlType::Q8_0)
-        .unwrap();
-    writer.pad_to_alignment().unwrap();
-    writer.stream_tensor_payload(0, &original).unwrap();
-    writer.finalize().unwrap();
-
-    let gguf = mlx_native::gguf::GgufFile::open(&path).unwrap();
-    let loaded = load_gguf_qweight(&gguf, "token_embd.weight", &device).unwrap();
-    assert_eq!(loaded.info.ggml_dtype, mlx_native::GgmlType::Q8_0);
-    assert_eq!((loaded.info.rows, loaded.info.cols), (2, 32));
-    assert_eq!(loaded.buffer.dtype(), mlx_native::DType::U8);
-    assert_eq!(loaded.buffer.as_slice::<u8>().unwrap(), original);
-    assert!(loaded.f16_shadow.is_none());
-}
-
-#[test]
-fn native_bf16_gguf_loader_preserves_original_storage() {
-    let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let Ok(device) = mlx_native::MlxDevice::new() else {
-        return;
-    };
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("scalar.gguf");
-    let values = [1.125_f32, -2.5, 0.03125, 7.0, -0.75, 16.0];
-    let original = values.map(|v| half::bf16::from_f32(v).to_bits());
-    let bytes = original
-        .iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect::<Vec<_>>();
-    let mut writer = GgufWriter::new(fs::File::create(&path).unwrap());
-    writer.write_header(1, 0).unwrap();
-    writer
-        .reserve_tensor_info("projection.weight", &[3, 2], GgmlType::BF16)
-        .unwrap();
-    writer.pad_to_alignment().unwrap();
-    writer.stream_tensor_payload(0, &bytes).unwrap();
-    writer.finalize().unwrap();
-    let gguf = mlx_native::gguf::GgufFile::open(&path).unwrap();
-    let loaded = load_gguf_qweight(&gguf, "projection.weight", &device).unwrap();
-    assert_eq!(loaded.info.ggml_dtype, mlx_native::GgmlType::BF16);
-    assert_eq!(loaded.buffer.dtype(), mlx_native::DType::BF16);
-    assert_eq!(loaded.buffer.as_slice::<u16>().unwrap(), original);
-    assert!(loaded.f16_shadow.is_none());
+    let mut buffers = alloc_activation_buffers(&device, &config).unwrap();
+    buffers.argmax_params.as_mut_slice::<u32>().unwrap()[0] = config.vocab_size as u32;
+    for (logits, expected_index, expected_value) in [
+        ([-8.0, -3.0, -9.0, -4.0, -5.0, -6.0, -7.0, -1.0], 7, -1.0),
+        ([0.0, 3.0, 3.0, 1.0, -5.0, -6.0, -7.0, -8.0], 1, 3.0),
+    ] {
+        buffers
+            .logits
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&logits);
+        let (executor, registry) = ctx.split();
+        let mut session = executor.begin().unwrap();
+        mlx_native::ops::argmax::dispatch_argmax_f32(
+            session.encoder_mut(),
+            registry,
+            device.metal_device(),
+            &buffers.logits,
+            &buffers.argmax_index,
+            &buffers.argmax_value,
+            &buffers.argmax_params,
+            config.vocab_size as u32,
+        )
+        .expect("production Gemma buffers must satisfy native argmax ABI");
+        session.finish().unwrap();
+        assert_eq!(
+            buffers.argmax_index.as_slice::<u32>().unwrap()[0],
+            expected_index
+        );
+        assert_eq!(
+            buffers.argmax_value.as_slice::<f32>().unwrap()[0],
+            expected_value
+        );
+    }
 }
