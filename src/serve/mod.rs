@@ -13,6 +13,8 @@ pub(crate) mod discovery;
 pub mod encoder_worker_singleton;
 // forward_mlx removed — gemma4 moved to inference::models::gemma4 (ADR-038 §3.3)
 pub mod forward_mlx_shared;
+pub(crate) mod native_matrix_storage;
+mod native_projection;
 pub mod forward_prefill;
 pub mod forward_prefill_batched;
 pub mod gpu;
@@ -5045,7 +5047,7 @@ pub fn cmd_serve(
                 &activation_path,
                 &engine_config,
             )
-            .map_err(|e| anyhow::anyhow!("startup pre-warm: {e}"))?;
+            .context("startup pre-warm")?;
         if let Some(authority) = startup_model_authority.as_ref() {
             anyhow::ensure!(
                 authority.is_stable()?

@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "activation_tests.rs"]
+mod activation;
+
 fn hosted(quant: QuantType, filename: &str) -> HubGgufArtifact {
     HubGgufArtifact {
         repository: "owner/model".into(),

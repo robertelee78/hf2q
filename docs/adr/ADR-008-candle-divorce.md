@@ -71,15 +71,47 @@ substitution or external engine is involved.
 
 hf2q owns tensor shapes and graph dispatch; mlx-native owns native storage and
 execution. Qwen storage admission is derived from its actual loader predicates,
-shared with hosted preflight. Gemma admission checks the graph it implements,
-including rejecting an untied output head and unsupported metadata features.
-When Gemma's Q8 head policy selects an embedding already stored as Q8, the
-loader reuses those original blocks without a dequantize/requantize round trip.
+shared with hosted preflight. At that revision, Gemma admission rejected an untied output head and
+unsupported metadata features. Its Q8 head policy reused an embedding already
+stored as Q8 without a dequantize/requantize round trip. The next amendment
+supersedes that head-policy restriction.
 
 Focused Metal numerical and byte-preservation evidence, failed spikes, and the
 remaining full-model validation are recorded in
 `../research/hosted-resolution-kata-2026-09-05.md`. This amendment does not claim
 full-model quality or performance proof before those gates execute.
+
+### 2026-09-08 Gemma native matrix execution amendment
+
+Gemma's ordinary GGUF matrix representation is now preserved across embedding,
+scalar/batched output heads, dense prefill projections, routers and expert
+stacks. The loader maps original payloads and verifies that the complete matrix
+inventory contains no anonymous weight allocations or F16 shadows. Tied heads
+reuse embedding storage; an explicit admitted output tensor remains distinct.
+Gather dequantizes only requested rows into activations. No automatic head
+requantization, whole-table F32 embedding, or host embedding-based rerank remains.
+
+The production batch path must support every admitted native head type. Its
+projection uses a row-identical route where batching changes reduction order.
+An O-projection codec without the specialized head-major BF16 input kernel
+permutes only the activation, then invokes the normal native stored-weight
+projection. This is an exact graph operation, not a substituted weight format.
+
+Gemma's header preflight and loader share gather/dense/expert capability checks.
+Existing F32/F16/BF16 scalar-state and scalar-expert support remains explicit;
+elementwise norm/scaling state may be converted to F32 and is outside the
+ordinary matrix inventory. Explicitly selected affine overlays retain their
+separate contract. The published dependency stays at 0.15.1, without local Cargo
+patches or an unpublished revision.
+
+The strict native argmax ABI also requires an actual U32 parameter allocation.
+The earlier F32 allocation with U32-written bits was an hf2q contract error,
+exposed by backend dtype validation. Nested warmup errors retain their source
+chain in the private startup log.
+
+Source history, reproduced failures, artifact inventory and validation evidence:
+`../research/gemma4-chat-activation-rca-2026-09-08.md`. This amendment supersedes
+the earlier Gemma head-selection/shadow behavior, not unrelated family paths.
 
 ### What stays (already in mlx-native)
 

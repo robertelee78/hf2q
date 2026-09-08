@@ -1363,6 +1363,23 @@ pub(super) fn prepare_local_candidate_with_catalog_resolver(
         return Ok((candidate, None));
     }
 
+    if explicit_output.is_none() {
+        // Serving keeps the admitted text inode and its public name together.
+        // Projector discovery must not adopt it into a different managed path:
+        // the caller retains text_authority for activation, including when
+        // an absent or ambiguous companion makes this a text-only startup.
+        let projector = best_effort_manual_projector_with_catalog(
+            &mut candidate,
+            text_authority,
+            model_dirs,
+            catalog,
+            warnings,
+            progress,
+        );
+        let (candidate, _) = prepare_selected_local_decision(candidate, None, warnings)?;
+        return Ok((candidate, projector));
+    }
+
     let default = managed_revision_dir(
         &managed_model_root()?,
         &candidate.repository,

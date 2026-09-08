@@ -231,8 +231,9 @@ pub(crate) fn validate_tensors(gguf: &GgufFile, cfg: &Gemma4Config) -> Result<()
         "tokenizer vocabulary does not fit embedding rows"
     );
     scalar(gguf, "output_norm.weight", &[h])?;
-    ensure!(gguf.tensor_info("output.weight").is_none(),
-        "Gemma runtime requires a tied embedding/output head; distinct output.weight is not implemented");
+    // Use the same native gather/head/projection contracts as activation.
+    super::native_matrix::preflight_io(gguf, cfg.vocab_size, cfg.hidden_size)?;
+    super::native_matrix::preflight_projections(gguf, cfg)?;
     for layer in 0..cfg.num_hidden_layers {
         let p = format!("blk.{layer}");
         let full = cfg.is_full_attention(layer);

@@ -464,6 +464,12 @@ jobs:
           cargo test --locked --bin hf2q --all-features model_spec::tests::
           cargo test --locked --bin hf2q --all-features inference::gguf_contract::tests::
           cargo test --locked --bin hf2q --all-features inference::models::gemma4::admission_tests::
+          cargo test --locked --bin hf2q --all-features inference::models::gemma4::native_matrix::tests::admitted_embedding_types_are_exact_native_intersection -- --exact
+          cargo test --locked --bin hf2q --all-features inference::models::gemma4::native_matrix::tests::unsupported_and_malformed_embeddings_fail_before_loading -- --exact
+          cargo test --locked --bin hf2q --all-features inference::models::gemma4::native_matrix::tests::projections_admit_every_native_dense_codec_without_transforming_it -- --exact
+          cargo test --locked --bin hf2q --all-features inference::models::gemma4::native_matrix::tests::expert_stacks_admit_native_scalar_and_block_codecs -- --exact
+          cargo test --locked --bin hf2q --all-features inference::models::gemma4::native_matrix::tests::tied_resolution_reuses_the_embedding_object -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::activation_tests::
           cargo test --locked --bin hf2q --all-features inference::models::qwen35::tensor_admission::tests::
           cargo test --locked --bin hf2q --all-features cli::tests::frictionless_
           cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::

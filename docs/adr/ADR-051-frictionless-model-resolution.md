@@ -7,6 +7,9 @@
   publication validation pending
 - **Updated:** 2026-09-05 — accepted metadata-driven admission and exact hosted
   selector amendment; implementation and validation are in progress (not shipped).
+- **Updated:** 2026-09-08 — preserve the selected text path and retained inode
+  during automatic projector preparation; validation recorded in
+  `../research/gemma4-chat-activation-rca-2026-09-08.md`.
 - **Date:** 2026-08-23; native-Xet transfer amendment 2026-08-26; observable
   transfer/cache-link amendment 2026-08-26; qualified-host Xet policy accepted
   2026-08-27; Git-metadata redirect and canonical Qwen admission corrections
@@ -71,6 +74,20 @@ This ADR changes that product policy without weakening ADR-047's authority
 checks.
 
 ## Decision
+
+### 2026-09-08 amendment: projector discovery preserves text activation authority
+
+Without an explicit output destination, preparing an automatic projector serves
+the selected text GGUF in place. It must not materialize that text into another
+managed directory, even if the companion is absent, ambiguous, or unusable.
+Projector preparation reuses the existing in-place local/hosted companion path.
+An explicit output destination retains its existing verified publication path.
+
+A resolved managed model must pair its returned public text path with the same
+stable inode held by its retained activation authority. Validate that invariant
+at the resolver boundary as well as before and after runtime activation. Matching
+quant, length, or even identical bytes on a different inode do not satisfy it.
+Do not rehash or copy the text payload to repair an internal path/authority mismatch.
 
 ### 2026-09-05 amendment: metadata-driven hosted selection and admission
 

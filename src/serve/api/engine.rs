@@ -12651,7 +12651,19 @@ fn run_slot_aware_gemma4(
         );
         match step {
             SchedulerStep::Idle => {
-                if shutdown_requested {
+                // Inline prefill can complete at its seed and release the
+                // only slot. Admission may already have buffered more work;
+                // scheduler-idle alone does not mean the inbox is empty.
+                if shutdown_requested
+                    || pending.iter().any(|request| {
+                        gemma4_pending_request_is_ready(
+                            request,
+                            &retained_tokens,
+                            &prompt_anchors,
+                            &slots,
+                        )
+                    })
+                {
                     continue;
                 }
                 // No work. Park until a request arrives, then re-loop to
@@ -15481,7 +15493,6 @@ fn decode_batch_gemma4(
     // finalizes each slot from its logits row. Per-slot output is bit-identical
     // to the prior per-slot full decode (H-S1-rowparity + shared
     // finalize_token_from_logits + decode_tick_finalize).
-    let hs = guard.model.weights.hidden_size;
     let vocab = guard.model.weights.vocab_size;
 
     // ADR-040 Phase F `iter-F-prefill-determinism` (2026-06-24) — clear the
@@ -15948,62 +15959,10 @@ fn decode_batch_gemma4(
     let mut captured = captured.into_iter().enumerate();
     while let Some((i, (handle, slot_idx, mut state, mut reply))) = captured.next() {
         let logits_row = &head.logits[i * vocab..(i + 1) * vocab];
-        let normed_row = &head.normed[i * hs..(i + 1) * hs];
-        // Greedy token: the GPU-argmax index is irrelevant to the rerank and the
-        // top1 VALUE (== CPU max) is bit-identical, so a CPU argmax reproduces
-        // the scalar head's greedy token exactly.
+        // Select directly from the artifact-native head logits. No transformed
+        // head or host embedding copy participates in token selection.
         let _hp_am = std::time::Instant::now();
-        // ADR-040 §26 iter-M: use GPU-side argmax+candidate set (drops the ~0.92ms
-        // host full-vocab scan) when available + not overflowed; the cheap F64
-        // rerank still runs on host. BYTE-IDENTICAL: GPU candidate set == host
-        // threshold scan, both feed the same rerank tail. Host fallback on
-        // overflow (rare) or HF2Q_GPU_SAMPLE off.
-        let gpu_s = head
-            .gpu_sample
-            .as_ref()
-            .filter(|gs| gs.overflow[i] == 0 && (gs.cand_count[i] as usize) <= gs.cap);
-        let greedy_result = if let Some(gs) = gpu_s {
-            let cnt = (gs.cand_count[i] as usize).min(gs.cap);
-            let cands = &gs.cand_ids[i * gs.cap..i * gs.cap + cnt];
-            guard.model.weights.finalize_token_from_gpu_candidates(
-                cands,
-                normed_row,
-                gs.top1_idx[i],
-            )
-        } else {
-            let (ti, tv) = argmax_f32(logits_row);
-            guard
-                .model
-                .weights
-                .finalize_token_from_logits(logits_row, normed_row, ti, tv)
-        };
-        let greedy_token = match greedy_result {
-            Ok(t) => t,
-            Err(e) => {
-                reply = match reset_gemma4_slot_for_reply(
-                    guard,
-                    scheduler,
-                    handle,
-                    kv_bytes_per_token,
-                    reply,
-                ) {
-                    Ok(reply) => reply,
-                    Err(mut fatal) => {
-                        fatal.extend_slots(captured.map(
-                            |(_, (remaining_handle, _, _, remaining_reply))| {
-                                (Some(remaining_handle), remaining_reply)
-                            },
-                        ));
-                        return Some(fatal);
-                    }
-                };
-                retained_tokens[handle.slot_id.0 as usize].clear();
-                prompt_anchors[handle.slot_id.0 as usize] = None;
-                scheduler.release(handle);
-                slot_fire_done(reply, Err(e), false);
-                continue;
-            }
-        };
+        let (greedy_token, _) = argmax_f32(logits_row);
         crate::inference::models::gemma4::batched_body::host_phases::add(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::ArgmaxFinalize,
             _hp_am.elapsed().as_nanos() as u64,
@@ -36105,21 +36064,29 @@ assistant:
         let engine_slot =
             Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 })
                 .expect("spawn SlotAware{max_slots:4}");
-        let slot_results: Vec<GenerationResult> = rt.block_on(async {
+        let slot_results = rt.block_on(async {
             let mut handles = Vec::new();
             for p in prompts.iter().cloned() {
                 let eng = engine_slot.clone();
                 let pr = params.clone();
                 handles.push(tokio::spawn(async move {
-                    eng.generate(p, pr).await.expect("slot generate")
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        eng.generate(p, pr),
+                    )
+                    .await
+                    .context("queued slot generation must complete without another request")?
                 }));
             }
             let mut out = Vec::new();
             for h in handles {
-                out.push(h.await.expect("join"));
+                out.push(h.await.context("join slot generation")??);
             }
-            out
+            Ok::<_, anyhow::Error>(out)
         });
+        // Always release the real model, including timeout/assertion failures.
+        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+        let slot_results = slot_results.expect("all queued slot generations completed");
         for (i, (slot, serial)) in slot_results.iter().zip(serial_refs.iter()).enumerate() {
             assert_genresult_byte_equal(
                 slot,
@@ -36127,7 +36094,6 @@ assistant:
                 &format!("ADR-040 F1 AC1/AC2 — SlotAware N=4 slot {i} vs its serial ref"),
             );
         }
-        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
     }
 
     /// Exact real-model parity across the production 4,096-token Gemma
@@ -37661,8 +37627,6 @@ assistant:
         crate::inference::models::gemma4::batched_body::host_phases::reset();
         // ADR-040 §25 barrier-tracking timing reset (HF2Q_BARRIER_NS=1).
         mlx_native::barrier_ns_reset();
-        // ADR-040 §26 rerank profiling reset (HF2Q_RERANK_PROFILE=1).
-        crate::inference::models::gemma4::batched_head::rerank_profile_reset();
         // ADR-040 §0.21 decode-gap profiling: snapshot process-global GPU
         // dispatch + sync counters around the timed decode (HF2Q_DISP_PROFILE=1).
         let disp0 = mlx_native::dispatch_count();
@@ -37831,15 +37795,7 @@ assistant:
                     eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step (barrier_between conflict-tracking; HF2Q_BARRIER_NS)",
                         "of which barrier-track", bns as f64 / 1e6 / steps as f64);
                 }
-                // §26: split finalize's cost — rerank F64 dots (Metal-no-F64, stuck
-                // on host) vs the rest (argmax+candidate-scan, GPU-movable F32).
-                let (rr_ns, rr_cand, rr_calls) =
-                    crate::inference::models::gemma4::batched_head::rerank_profile();
-                if rr_calls > 0 {
-                    eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step | {:.1} candidates/slot avg ({} calls); HF2Q_RERANK_PROFILE",
-                        "of which rerank-F64-dots", rr_ns as f64 / 1e6 / steps as f64,
-                        rr_cand as f64 / rr_calls as f64, rr_calls);
-                }
+
             }
         }
         rt.block_on(engine.shutdown()).expect("shutdown");

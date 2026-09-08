@@ -13,7 +13,14 @@ use crate::quantize::imatrix::{intercept_qmatmul_with_hint, ImatrixHint};
 use crate::serve::gpu::QuantWeightInfo;
 use anyhow::Result;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
-use mlx_native::{GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice};
+use mlx_native::{
+    GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice,
+};
+
+
+
+pub use super::native_matrix_storage::map_native_gguf_tensor_view;
+pub use super::native_projection::{dispatch_qmatmul_head_major_bf16, supports_native_perm021};
 
 // ---------------------------------------------------------------------------
 // Cluster 1 — Quantized weight types
@@ -29,6 +36,7 @@ use mlx_native::{GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice};
 /// DWQ-trained safetensors.  Held as F32 buffers (cast at load time
 /// from BF16/F32 depending on the on-disk safetensors dtype) so the
 /// kernel can read them without an inline cast.
+#[derive(Clone)]
 pub struct MlxAffineExtra {
     /// Per-group scales, F32, shape `[N, K/group_size]`.
     pub scales: MlxBuffer,
@@ -50,18 +58,10 @@ pub struct MlxQWeight {
     /// path.  Routing in `dispatch_qmatmul` checks `affine.is_some()`
     /// FIRST and skips both the F32 and GGML branches when set.
     pub affine: Option<MlxAffineExtra>,
-    /// ADR-029 iter-28 H29 — F16 pre-dequantized shadow.  When `Some`,
-    /// `dispatch_qmatmul` at m > MM_ROUTING_THRESHOLD routes through
-    /// `kernel_mul_mm_f16_f32_*` (peer's gemma4 pattern) instead of
-    /// per-call dequant inside `kernel_mul_mm_<qtype>_tensor_f32`.
-    ///
-    /// Materialized at load via `dispatch_dequant_to_f16` when the
-    /// `HF2Q_F16_SHADOW=1` env gate is set and the weight is a quantized
-    /// type the dequant kernel supports (Q4_0/Q8_0/Q5_1/IQ4_NL/Q4_K/
-    /// Q5_K/Q6_K).  ~1 GB extra resident on gemma4-26B; M5 Max's 128 GB
-    /// unified memory accommodates this without pressure.
-    ///
-    /// Default OFF until coherence + multi-regime bench parity proven.
+    /// Legacy optional compute copy used by callers that explicitly provide
+    /// F16 weights for prefill. Ordinary Gemma GGUF loading never populates
+    /// this field and its storage inventory rejects it. The shared type keeps
+    /// the field for existing family/overlay graph structures.
     pub f16_shadow: Option<MlxBuffer>,
     /// ADR-029 iter-175 Step 1d — pre-baked dispatch record for the
     /// Q6_K NR2 decode-m=1 mat-vec hot path.  Lazy-init on the first
@@ -80,6 +80,33 @@ pub struct MlxQWeight {
     /// F16 shadow) keep using the legacy dispatch path until additional
     /// bake helpers land in later substeps.
     pub decode_record_q6k_m1: std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
+}
+
+impl Clone for MlxQWeight {
+    fn clone(&self) -> Self {
+        Self {
+            buffer: self.buffer.clone(),
+            info: self.info,
+            affine: self.affine.clone(),
+            f16_shadow: None,
+            // Dispatch records are an execution cache, not matrix identity.
+            // A cloned model-local handle lazily bakes its own record while
+            // retaining the same underlying artifact-backed buffer owner.
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+/// How a head-major BF16 activation reached an ordinary native projection.
+/// Both routes retain the weight's declared storage bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadMajorQmatmulRoute {
+    /// The stored codec has a kernel that consumes `[heads, tokens, dim]`
+    /// directly.
+    DirectPerm021,
+    /// Only the activation was permuted to `[tokens, hidden]` F32 before the
+    /// ordinary stored-weight projection.
+    ActivationPermute,
 }
 
 impl MlxQWeight {
@@ -208,6 +235,7 @@ impl MlxQWeight {
 /// dtype — F32 input from `MlxAffineLinear::scales`/`biases` is cast
 /// at upload time inside `MlxAffineMoeStack::from_per_expert_linears`.
 #[derive(Clone)]
+
 pub struct MlxAffineMoeStack {
     /// Packed-U32 weight stack `[n_experts, N, K/pack_factor]`.
     pub weight: MlxBuffer,
@@ -271,72 +299,6 @@ pub(crate) fn load_gguf_qweight(
     })
 }
 
-/// ADR-029 iter-28 H29 — populate the F16 pre-dequantized shadow for a
-/// quantized weight.  Returns Ok(()) silently if:
-///   * HF2Q_F16_SHADOW is unset / falsy (default), OR
-///   * the weight is not a quantized type that dequant_to_f16 supports
-///     (F32 / F16 / I16 / affine).
-///
-/// When ENABLED and the weight type is supported, dispatches the dequant
-/// kernel at load time, allocates a 2-bytes/elem F16 buffer, and stores
-/// it as the `f16_shadow` field.  Subsequent `dispatch_qmatmul` at m > 8
-/// will fast-path through the F16-input matmul kernel (kernel_mul_mm_f16
-/// _f32_tensor) which avoids per-call dequant overhead.
-///
-/// Memory cost: ~1 GB extra resident for gemma4-26B attn weights when
-/// applied to attn_q/k/v/output + ffn_gate/up.  On the M5 Max target
-/// (128 GB unified), this is well within budget; matches peer's strategy.
-pub(crate) fn populate_f16_shadow_if_enabled(
-    qweight: &mut MlxQWeight,
-    device: &MlxDevice,
-    registry: &mut mlx_native::KernelRegistry,
-    tensor_name: &str,
-) -> Result<()> {
-    // iter-31 default-flip: H29 default-true; opt-out via =0/false/off.
-    let enabled = std::env::var("HF2Q_F16_SHADOW")
-        .ok()
-        .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
-        .unwrap_or(true);
-    if !enabled {
-        return Ok(());
-    }
-
-    // Skip when affine — that path doesn't go through dispatch_qmatmul's
-    // quantized branch.
-    if qweight.affine.is_some() {
-        return Ok(());
-    }
-
-    // Skip types the dequant kernel doesn't handle.
-    use mlx_native::GgmlType;
-    match qweight.info.ggml_dtype {
-        GgmlType::Q4_0
-        | GgmlType::Q8_0
-        | GgmlType::Q5_1
-        | GgmlType::IQ4_NL
-        | GgmlType::Q4_K
-        | GgmlType::Q5_K
-        | GgmlType::Q6_K => {}
-        _ => return Ok(()),
-    }
-
-    let n_rows = qweight.info.rows as u32;
-    let n_cols = qweight.info.cols as u32;
-
-    let f16 = mlx_native::ops::dequant_to_f16::materialize_f16_shadow(
-        device,
-        registry,
-        &qweight.buffer,
-        n_rows,
-        n_cols,
-        qweight.info.ggml_dtype,
-    )
-    .map_err(|e| anyhow::anyhow!("F16 shadow materialize for '{}': {e}", tensor_name))?;
-
-    qweight.f16_shadow = Some(f16);
-    Ok(())
-}
-
 /// ADR-022 P1.9 — APEX-format Gemma4 GGUFs preserve `ffn_gate_inp.weight`
 /// (router projection) as F32 for accuracy. mlx-native's
 /// `quantized_matmul_ggml` correctly refuses F32 because the GGML block
@@ -346,6 +308,7 @@ pub(crate) fn populate_f16_shadow_if_enabled(
 /// Takes `registry` and `device` separately to avoid borrow conflicts on
 /// `GpuContext` (registry is `&mut`, device is `&`).
 #[allow(clippy::too_many_arguments)]
+
 pub fn dispatch_qmatmul(
     session: &mut GraphSession<'_>,
     registry: &mut mlx_native::KernelRegistry,
@@ -473,7 +436,7 @@ pub fn dispatch_qmatmul(
     // ADR-029 iter-28 H29 / iter-30 H29-speed — F16 pre-dequant fast path.
     //
     // When a quantized weight has been pre-dequantized to F16 at load
-    // (via populate_f16_shadow_if_enabled under HF2Q_F16_SHADOW=1),
+    // by an explicit caller outside the ordinary Gemma GGUF loader,
     // route m > MM_ROUTING_THRESHOLD (= 8, prefill) through the V2-tile
     // F16-weight × F32-input mat-mat kernel (`hf2q_mul_mm_tensor_v2_f16`).
     // This is the F16-input analog of the V2 quantized kernel — same
