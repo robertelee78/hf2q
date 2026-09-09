@@ -180,7 +180,7 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
         eprintln!("[calibrate] pair {}/{} captured", i + 1, total);
     }
 
-    // ---- distill (f64; exported raw — the reader/bind normalizes) --------
+    // ---- distill (f64) ---------------------------------------------------
     let m_pos = disp_pos.mean();
     let m_neg = disp_neg.mean();
     let m_ref = out_ref.mean();
@@ -192,15 +192,22 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
         d_out[j] = m_comp[0][j] - m_ref[0][j];
     }
     let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
-    eprintln!("[calibrate] d_disp norm (stream 0) = {:.4e}", norm(&d_disp));
+    let d_disp_norm = norm(&d_disp);
+    eprintln!("[calibrate] d_disp norm (stream 0) = {:.4e}", d_disp_norm);
     eprintln!("[calibrate] d_out  norm (stream 0) = {:.4e}", norm(&d_out));
     for s in 0..hc {
         let sd: Vec<f64> = (0..hidden).map(|j| m_pos[s][j] - m_neg[s][j]).collect();
         eprintln!("[calibrate]   stream {s} d_disp norm = {:.4e}", norm(&sd));
     }
+    anyhow::ensure!(
+        d_disp_norm > 0.0 && d_disp_norm.is_finite(),
+        "d_disp direction has zero/non-finite norm — the contrast found nothing"
+    );
 
     // ---- export GLP GGUF --------------------------------------------------
-    let direction: Vec<f32> = d_disp.iter().map(|&v| v as f32).collect();
+    // Ship UNIT-NORM (the weightless validator gates on unit norms; hf2q's
+    // own bind normalizes in f64 anyway, so this is idempotent for us).
+    let direction: Vec<f32> = d_disp.iter().map(|&v| (v / d_disp_norm) as f32).collect();
     let direction_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(direction.as_ptr().cast(), direction.len() * 4)
     };
@@ -210,7 +217,17 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
         h.update(direction_bytes);
         hex::encode(h.finalize())
     };
-    write_glp_gguf(&cfg.out, cfg.layer + 1, &direction, cfg.alpha, &content_sha256)
+    let fallback_name = cfg.model.display().to_string();
+    let base_name = gguf
+        .metadata_string("general.base_model.0.name")
+        .or_else(|| gguf.metadata_string("general.name"))
+        .map(|s| s.to_string())
+        .unwrap_or(fallback_name);
+    let base_org = gguf
+        .metadata_string("general.base_model.0.organization")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    write_glp_gguf(&cfg.out, cfg.layer + 1, &direction, cfg.alpha, &content_sha256, &base_name, &base_org)
         .context("write GLP GGUF")?;
     eprintln!("[calibrate] wrote {}", cfg.out.display());
 
@@ -273,6 +290,8 @@ fn write_glp_gguf(
     direction: &[f32],
     alpha: f32,
     content_sha256: &str,
+    base_model_name: &str,
+    base_model_org: &str,
 ) -> Result<()> {
     use crate::backends::gguf::types::MetaValue;
     use crate::backends::gguf::writer::GgufWriter;
@@ -280,16 +299,44 @@ fn write_glp_gguf(
     let file = std::fs::File::create(path)
         .with_context(|| format!("create {}", path.display()))?;
     let mut w = GgufWriter::new(file);
-    w.write_header(1, 6)?;
+    w.write_header(1, 13)?;
+    w.write_metadata_kv("general.architecture", &MetaValue::String("glp".into()))?;
     w.write_metadata_kv("glp.mode", &MetaValue::String("project".into()))?;
     w.write_metadata_kv(
         "glp.hook_point",
         &MetaValue::String("residual_stream_post_layer".into()),
     )?;
+    // derive_at == hook_point here: the capture site IS the apply site.
+    // The weightless preflight reads the pair to catch site transfers.
+    w.write_metadata_kv(
+        "glp.derive_at",
+        &MetaValue::String("residual_stream_post_layer".into()),
+    )?;
     w.write_metadata_kv("glp.spec_version", &MetaValue::U32(1))?;
     w.write_metadata_kv("glp.alpha_default", &MetaValue::F32(alpha))?;
     w.write_metadata_kv("glp.content_sha256", &MetaValue::String(content_sha256.into()))?;
-    w.write_metadata_kv("glp.method", &MetaValue::String("hf2q calibrate (ADR-054 forced-capture, difference-of-means)".into()))?;
+    w.write_metadata_kv(
+        "glp.method",
+        &MetaValue::String("hf2q calibrate (ADR-054 forced-capture, difference-of-means, unit-norm export)".into()),
+    )?;
+    w.write_metadata_kv("glp.structure", &MetaValue::String("per-layer".into()))?;
+    w.write_metadata_kv(
+        "glp.contrast",
+        &MetaValue::String("harmful vs harmless, embedded 64+64 slice (OBLITERATUS prompts.py)".into()),
+    )?;
+    w.write_metadata_kv(
+        "glp.validation",
+        &MetaValue::String("canary pair only (zero-dose no-op + live logit shift); behavioral gates pending — candidate generator, not validated derivation".into()),
+    )?;
+    w.write_metadata_kv("glp.layer_ids_zero_based", &MetaValue::Bool(false))?;
+    w.write_metadata_kv(
+        "general.base_model.0.name",
+        &MetaValue::String(base_model_name.into()),
+    )?;
+    w.write_metadata_kv(
+        "general.base_model.0.organization",
+        &MetaValue::String(base_model_org.into()),
+    )?;
     let idx = w.reserve_tensor_info(
         &format!("direction.{layer_1based}"),
         &[direction.len() as u64],
