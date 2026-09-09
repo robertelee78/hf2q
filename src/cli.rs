@@ -1086,10 +1086,14 @@ pub struct ChatArgs {
 
     /// ADR-053: apply a GLP steering vector (GGUF) on the chat-owned server
     /// this session spawns. Forwarded to `serve`; same scope note as --gcd.
+    /// With no value (`--glp` bare), the spawned server auto-discovers the
+    /// bound vector (fail-closed).
     #[arg(
         long,
         value_name = "GLP_GGUF",
         value_hint = clap::ValueHint::FilePath,
+        num_args = 0..=1,
+        default_missing_value = "auto",
     )]
     pub glp: Option<PathBuf>,
 
@@ -1292,10 +1296,14 @@ pub struct ServeArgs {
     /// abort startup rather than degrade.
     ///
     /// GLP concept credit: Matt Suiche (m@msuiche.com), weightless/GLP spec.
+    /// With no value (`--glp` bare), auto-discovers the vector bound to the
+    /// served model under the weightless Hub convention (fail-closed).
     #[arg(
         long,
         value_name = "GLP_GGUF",
         value_hint = clap::ValueHint::FilePath,
+        num_args = 0..=1,
+        default_missing_value = "auto",
     )]
     pub glp: Option<PathBuf>,
 

@@ -4989,10 +4989,11 @@ pub fn cmd_serve(
         engine_config.tokenizer_path = args.tokenizer.clone();
         engine_config.config_path = args.config.clone();
         engine_config.dwq_overlay_path = args.dwq_overlay.clone();
-        // ADR-053: `--glp auto` resolves the model's provenance and
-        // auto-discovers a matching GLP artifact on the Hub. Works with
-        // both HF slugs (`owner/repo`) and local GGUF paths. Explicit paths
-        // are used as-is. Fail-closed: no match = startup error.
+        // ADR-053: bare `--glp` (no value — parsed as the "auto" sentinel)
+        // resolves the model's provenance and auto-discovers a matching GLP
+        // artifact on the Hub. Works with both HF slugs (`owner/repo`) and
+        // local GGUF paths. Explicit paths are used as-is. Fail-closed: no
+        // match = startup error.
         engine_config.glp_path = match args.glp.as_ref() {
             Some(path) if path.as_os_str() == "auto" => {
                 let model_ref = args.model.as_ref().map(|p| p.to_string_lossy().into_owned())

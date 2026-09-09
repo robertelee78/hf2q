@@ -48,14 +48,17 @@ operand — the `--mmproj` shape.
 
 ## Decision
 
-- `hf2q serve <model> --gcd [--glp <ref>] [--glp-alpha <f>]`
-  enables the GLP path plus the grammar stack. Plain `serve` is unchanged.
-- `--gcd --glp <ref>` binds an explicit vector (Hub repo, file, or
-  local path). `--gcd` without `--glp` asks the resolver to search the
-  Hub for `*-GLP-*` artifacts bound to the resolved model family and commit;
-  **ambiguous or absent candidates fail closed** (printed list, exit).
-  `--glp-content-sha256` MAY pin the binding; `glp.content_sha256` from the
-  file is verified against it when present.
+- `hf2q serve <model> --gcd` enables the grammar stack alone. GLP steering is
+  **orthogonal and opt-in**: `--glp <ref>` adds it, with or without `--gcd`.
+  Plain `serve` is unchanged. (Correction 2026-09-09: an earlier draft of
+  this clause had `--gcd` implying GLP auto-discovery — wrong. `--gcd`
+  without `--glp` is GCD only; no resolver runs.)
+- `--glp <ref>` binds an explicit vector (Hub repo, file, or local path).
+  Bare `--glp` (no value) asks the resolver to search the Hub for `*-GLP-*`
+  artifacts bound to the resolved model family and commit; **ambiguous or
+  absent candidates fail closed** (printed list, exit). `--glp-content-sha256`
+  MAY pin the binding; `glp.content_sha256` from the file is verified against
+  it when present.
 - Reader conformance follows the spec verbatim: `glp.mode` absence means
   `add`; unimplemented modes/hooks, `direction.0`, or unknown
   `glp.hook_point` are **fatal**. `project` never merges with another

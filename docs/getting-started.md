@@ -319,9 +319,9 @@ compatibility.
 hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M \
   --glp ./vectors/qwen38-refusal.gguf --glp-alpha 0.8
 
-# Or ask the resolver to auto-discover the vector bound to this model
+# Or bare --glp: the resolver auto-discovers the vector bound to this model
 # under the weightless Hub convention (`msuiche/*-GLP-*` artifacts):
-hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M --glp auto
+hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M --glp
 ```
 
 A GLP vector is a small GGUF control vector (`project` or `add` mode) applied

@@ -941,7 +941,7 @@ hf2q serve <model> --gcd
 hf2q serve <model> --glp ./vectors/refusal-direction.gguf
 
 # Auto-discover the vector bound to this model (weightless Hub convention):
-hf2q serve <model> --glp auto
+hf2q serve <model> --glp
 
 # Dose override, and both flags together:
 hf2q serve <model> --glp ./vectors/refusal-direction.gguf --glp-alpha 0.8
@@ -970,9 +970,9 @@ gate on top drops the residual refusal to **0.59%**
 in `project` or `add` mode — to the served model and applies it per layer to
 the post-layer residual stream at inference time (`h ← h − α(h·d̂)d̂` in project
 mode); base weights are never modified. The value is a local path or a Hub
-reference; `--glp auto` asks the resolver to auto-discover a vector bound to
-the served model under the weightless Hub convention (`*-GLP-*` artifacts) and
-fails closed on ambiguity or no match. `--glp-alpha <f>` overrides the steering
+reference; bare `--glp` (no value) asks the resolver to auto-discover a vector
+bound to the served model under the weightless Hub convention (`*-GLP-*`
+artifacts) and fails closed on ambiguity or no match. `--glp-alpha <f>` overrides the steering
 dose (default: the vector's `glp.alpha_default`, else 1.0). The reader is
 fail-closed: conformance errors — unknown mode or hook point, unsupported spec
 version, wrong width, `direction.0` — abort startup rather than degrade. A
