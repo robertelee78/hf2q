@@ -1,7 +1,11 @@
 # ADR-054: Runtime GLP calibration — `hf2q calibrate <model>`
 
 - **Status:** Draft — design accepted; implementation gates below are not met
-- **Date:** 2026-09-04
+- **Date:** 2026-09-04 (revised 2026-09-09: forced-capture design replaces
+  generation-based capture — teacher-forced pinned prefixes, prefill-only
+  forward passes, targeted decision positions; capture cost collapses from
+  ~7h of autoregressive jobs to minutes of batched prefill, and the capture
+  hook lives in the prefill path rather than the decode loop)
 - **Related:** ADR-053 (GLP serving surface), ADR-052 (grammar semantics),
   ADR-042 (DeepSeek serving)
 
@@ -30,26 +34,55 @@ without shipping weights or running a training loop.
 Add `hf2q calibrate <model-ref>` — a bounded, deterministic pipeline that
 produces a spec-conformant GLP file plus a lexical register report:
 
-1. **Probe.** Run the stock model over the contrastive prompt set
-   (OBLITERATUS `prompts.py` ships 512+512 harmful/harmless pairs; a
-   calibration slice of ~64+64 suffices) and capture the per-layer post-
-   residual activation at the last prompt token. This reuses the existing
-   forward graph — no gradients, no training.
-2. **Distill.** Per-layer direction `dℓ = mean(harmful) − mean(harmless)`
-   (optionally winsorized / whitened-SVD; v1 = plain difference-of-means).
-   This is exactly OBLITERATUS PROBE→DISTILL, run inside the serving stack.
-3. **Verify (fail-closed canary).** Project `dℓ` at each candidate layer and
-   confirm a logit shift > 1e-3 on a fixed probe prompt; a layer whose
-   projection is inert is excluded. The zero-vector no-op canary runs first
-   (plumbing gate).
-4. **Export.** Write a GLP-conformant GGUF (`direction.<N>` fp32 tensors,
+1. **Probe (forced-capture, teacher-forced).** For each contrastive prompt,
+   build two sequences: `prompt + refusal prefix` (pinned: the model's own
+   refusal opener from the register report, e.g. `I cannot`) and
+   `prompt + compliance prefix` (pinned: the W1 anchor). One batched
+   **prefill-only** forward pass per pair — no sampling, no mask, no decode
+   loop — reading the residual stream at the decision positions (entry token
+   + the first few free positions, where our front-loading probe measured
+   class separation: 99.97% entry mass on the refusal opener). Pinned
+   prefixes make both classes deterministic: zero discarded rollouts, zero
+   label noise, exactly matched pairs. Capture cost collapses from an
+   afternoon of autoregressive jobs to minutes of batched prefill.
+   (Contrastive set: OBLITERATUS `prompts.py` 512+512; a ~64+64 slice
+   suffices given targeted positions + zero label noise.)
+2. **Three-arm pairing.** Natural-refusal states (harmful prompt, natural
+   rollout) and forced-compliance states (harmful prompt, pinned anchor)
+   *both* carry an active refuser — so their difference isolates mostly the
+   content dimension, not the refusal disposition. The refuser-inactive arm
+   comes from harmless prompts. The pipeline therefore derives two candidate
+   directions and lets verification choose: `d_disp = mean(harmful) −
+   mean(harmless)` (disposition; the classic instruction-level contrast) and
+   `d_out = mean(forced-compliance) − mean(natural-refusal)` (output-space).
+3. **Distill.** Per-layer direction (v1 = plain difference-of-means;
+   optionally winsorized / whitened-SVD). Exactly OBLITERATUS PROBE→DISTILL
+   inside the serving stack.
+4. **Verify (fail-closed canary).** Project `dℓ` at each candidate layer and
+   confirm a logit shift > 1e-3 on a fixed probe prompt; inert layers are
+   excluded. Zero-vector no-op canary runs first (plumbing gate). Then the
+   regime check (below).
+5. **Export.** Write a GLP-conformant GGUF (`direction.<N>` fp32 tensors,
    `glp.mode=project`, `glp.hook_point=residual_stream_post_layer`,
    `glp.spec_version=1`, `glp.alpha_default`, `glp.content_sha256`,
    `general.base_model.*` provenance pinned to the loaded checkpoint's
    commit/revision).
-5. **Register report.** A 6-prompt lexical canary (uniform refusal probes)
+6. **Register report.** A 6-prompt lexical canary (uniform refusal probes)
    records the model's top refusal openings → the lexicon for the grammar
-   exclusion automaton, replacing the hand-written list.
+   exclusion automaton, replacing the hand-written list. (This doubles as the
+   source of the pinned refusal prefix in step 1.)
+
+**Regime-match note.** The distribution-shift caveat on forced capture
+(forced-compliance states ≠ natural-compliance states — the refuser fights
+while the tokens comply) is real but regime-dependent: when GLP is deployed
+*alongside* the grammar (the ADR-053 composition), forced-capture states ARE
+the deployment distribution, and the caveat becomes a match, not a shift.
+For GLP-alone deployment, validate against the natural reference (gates).
+
+**Generality.** The pinned-prefix trick enumerates contrastive pairs for any
+expressible direction — register, language, reasoning style — so
+`calibrate` is a direction-derivation surface, not a refusal-only tool.
+Refusal is the measured case; the mechanism is general.
 
 The output is a normal GLP file: auditable, shareable, loadable by any
 conformant reader (hf2q `--glp`, or the weightless hotfix path).
@@ -69,12 +102,18 @@ conformant reader (hf2q `--glp`, or the weightless hotfix path).
 
 1. Calibration canary: zero-vector logits-identical; live-vector logit shift
    > 1e-3 on the probe prompt.
-2. Refusal-panel delta on the 512+512 grammar_probe harness: a calibrated
+2. **Forced-vs-natural regime check.** Derive the vector from forced
+   captures; check cosine similarity against a natural-reference vector
+   derived from a small (~100-prompt) naturally-generated, judge-labeled
+   sample; then run the downstream eval (refusal Δ on the adversarial half,
+   capability parity on the benign half). The forced-capture vector must
+   match on eval, not just on cosine.
+3. Refusal-panel delta on the 512+512 grammar_probe harness: a calibrated
    vector must beat the no-GLP grammar-only control arm (B12-class) on
    refusal Δ with invalid at parity.
-3. Dose ladder sanity: α ∈ {0.5, 1.0, 1.5} report; the chosen default is
+4. Dose ladder sanity: α ∈ {0.5, 1.0, 1.5} report; the chosen default is
    documented per family, not guessed.
-4. Cross-checkpoint safety: refuse to apply a vector whose
+5. Cross-checkpoint safety: refuse to apply a vector whose
    `general.base_model.0.version` does not match the loaded checkpoint.
 
 ## Evidence behind the design
@@ -82,9 +121,16 @@ conformant reader (hf2q `--glp`, or the weightless hotfix path).
 - 2026-09-04 grammar campaign (this repo, `scripts/grammar_probe/`):
   per-model dial differences measured (bounding helped nothing on DeepSeek;
   refusal registers differ per family).
+- Front-loading probe (this repo, `refusal_mass_probe.py`): refusal mass
+  concentrates at the entry token (99.97% on DeepSeek) — the decision
+  positions for targeted capture are measured, not guessed.
 - weightless spec + posts: per-model dose cliffs, subspace-not-direction,
   hook-point 9× sensitivity.
 - OBLITERATUS `prompts.py`: the contrastive pair registry used for PROBE.
+- Forced-capture design (teacher-forced pinned prefixes, prefill-only
+  capture, targeted positions, distribution-shift caveat): Matt Suiche's
+  analysis, 2026-09-09; the three-arm pairing and regime-match refinement
+  are ours.
 
 ## Deferred follow-ups (parked, do not lose)
 
