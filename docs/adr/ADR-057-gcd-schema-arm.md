@@ -54,6 +54,34 @@ The honest limit: schema eliminates the pivot *space*, not semantic drift
 *within* fields — a model can still emit timid content inside a `steps`
 array. That residue is the embeddings gate's layer, unchanged.
 
+**Two refinements from review (Matt's agent), both accepted:**
+
+1. **Schema kills the pivot, not the refusal.** `{"summary": "I cannot help
+   with this.", "steps": []}` typechecks. The schema eliminates
+   refusal-as-structure; refusal-as-*content* can still live inside string
+   fields, and the schema itself enables a subtler shape: formal compliance
+   with emptied content (`{"steps": []}`, minimal strings) — refusal by
+   vacuity. The fix is free: JSON Schema's `minItems`, `minLength`, and
+   `required` all compile to GBNF bounds, so the arm ships **tightened
+   subschemas by default** (see Decision). The remaining layers port to the
+   object level unchanged: the W1 exclusion automaton runs over string-field
+   content, the pinned anchor can move inside the schema as a per-field
+   prefix (subject to verification of json_schema.rs pattern support), and
+   the embeddings gate watches paraphrase drift.
+2. **The downstream consumer is part of the control.** Schema-constrained
+   output feeds typed consumers — pipeline code that expects steps to be
+   executable. Vacuous or timid content fails *loudly* at the consumer: a
+   refusal hidden in a free-text chat reply is a silent success, but the same
+   refusal in a pipeline field is a crash. The schema arm's deeper strength
+   is not just that refusal is unrepresentable — it is that residual refusal
+   becomes *observable*. The W1 chat arm can never have that property.
+
+**The symmetry nobody had said out loud:** Tantalus Round 2 was already the
+schema arm — typed tool calls with enum sinks are schema-constrained output
+on the authorization axis, and it held 0/1,140 while W1-style prose
+suppression carries a 2.3% residual. The schema arm's existence proof is not
+hypothetical; it is the round that could not be broken.
+
 ## Decision (to implement)
 
 - `hf2q serve <model> --gcd-schema <schema.json>` compiles the JSON schema to
@@ -70,6 +98,16 @@ array. That residue is the embeddings gate's layer, unchanged.
   content-bearing; a schema with a free-form `notes` or `disclaimer` string
   field reopens the pivot slot by hand. Ship an example red-team object schema
   (`examples/`) with documented field-design rationale.
+- **Tightened subschemas are the default posture.** The arm's value is
+  "refusal-unrepresentable *and* vacuity-resistant", and an untightened
+  schema is neither: `additionalProperties: false`, explicit `required`, and
+  `minItems`/`minLength` on every collection and string field. The top-level
+  list's `minItems` is a policy knob: left open it admits the honest negative
+  ("recon found nothing"); in suppression deployments it is set to 1.
+- The mask path is schema-agnostic — GBNF from a hand-written grammar and
+  GBNF from a schema compile to the same object — so this arm is a frontend
+  change, not a sampler change (confirmed against the measured stack: same
+  injection point, same mask, same fail-closed validator).
 
 ## Consequences
 

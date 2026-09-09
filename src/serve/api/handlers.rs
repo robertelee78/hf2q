@@ -12927,4 +12927,53 @@ mod gcd_schema_tests {
             "empty opportunities list is the honest negative and must remain representable"
         );
     }
+
+    #[test]
+    fn refusal_prose_inside_a_string_field_is_inside_the_language() {
+        // ADR-057 review refinement (Matt's agent): the schema kills the
+        // pivot, not the refusal. Refusal-as-CONTENT inside a string field
+        // typechecks fine — this test pins that limit honestly. The layer
+        // that closes it is the W1 exclusion automaton over string-field
+        // content (named in the ADR as the follow-on), not the schema shape.
+        let (grammar, root_id) = compile_example_schema();
+        let embedded_refusal = br#"{"opportunities":[{"summary":"I cannot help with this request.","attack_context":"n/a","tool_context":{"tool":"none","invocation":"none","evidence":"none"},"next_steps":["none"]}]}"#;
+        let mut rt = grammar::sampler::GrammarRuntime::new(grammar, root_id).expect("runtime");
+        assert!(
+            rt.accept_bytes(embedded_refusal) && rt.is_terminally_accepted(),
+            "LIMIT PINNED: refusal-as-content inside a string field is in the language; \
+             the per-field exclusion automaton (not the schema) is what closes it"
+        );
+    }
+
+    #[test]
+    fn tightened_minitems_rejects_the_vacuity_channel() {
+        // ADR-057 tightened-subschema default: setting minItems on the
+        // top-level list closes refusal-by-vacuity ({"opportunities":[]}),
+        // compiled to a GBNF bound — free at the schema level.
+        let schema_text = include_str!("../../../examples/recon-opportunities.schema.json");
+        let mut schema: serde_json::Value =
+            serde_json::from_str(schema_text).expect("example schema is valid JSON");
+        schema["properties"]["opportunities"]["minItems"] = serde_json::json!(1);
+        let gbnf = grammar::json_schema::schema_to_gbnf(&schema)
+            .expect("tightened schema compiles to GBNF");
+        let grammar = grammar::parser::parse(&gbnf).expect("compiled GBNF parses");
+        let root_id = grammar.rule_id("root").expect("compiled grammar has root");
+
+        let vacuous = br#"{"opportunities":[]}"#;
+        let mut rt = grammar::sampler::GrammarRuntime::new(grammar.clone(), root_id)
+            .expect("runtime");
+        let alive = rt.accept_bytes(vacuous);
+        assert!(
+            !alive || rt.is_dead(),
+            "tightened minItems:1 must make the vacuous form ungenerable"
+        );
+
+        // ...while a populated list still validates.
+        let populated = br#"{"opportunities":[{"summary":"Exposed debug endpoint.","attack_context":"Staging API reachable from eng VPN.","tool_context":{"tool":"nuclei","invocation":"nuclei -u http://10.0.4.8","evidence":"HTTP 200 on /debug/config"},"next_steps":["Confirm write methods"]}]}"#;
+        let mut rt2 = grammar::sampler::GrammarRuntime::new(grammar, root_id).expect("runtime");
+        assert!(
+            rt2.accept_bytes(populated) && rt2.is_terminally_accepted(),
+            "tightened schema still admits the populated form"
+        );
+    }
 }
