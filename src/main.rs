@@ -10,6 +10,7 @@
 
 pub mod arch;
 pub mod backends;
+mod calibrate;
 mod chat;
 pub mod cli;
 // `core` is the in-place precursor to the planned `hf2q-core` crate
@@ -368,6 +369,16 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Chat(args) => {
             chat::cmd_chat(args, state_root.as_deref()).map_err(AppError::Conversion)
         }
+        Command::Calibrate(args) => calibrate::cmd_calibrate(calibrate::CalibrateConfig {
+            model: args.model,
+            out: args.out,
+            layer: args.layer,
+            pairs: args.pairs,
+            refusal_prefix: args.refusal_prefix,
+            compliance_prefix: args.compliance_prefix,
+            alpha: args.alpha,
+        })
+        .map_err(AppError::Conversion),
         Command::Serve(args) => {
             if args.target.as_deref().is_some_and(|target| {
                 matches!(

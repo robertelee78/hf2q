@@ -276,6 +276,51 @@ impl Deepseek4Model {
         self.forward_verifier_prefill_with_commit_gate(token_ids, cache, || Ok(()))
     }
 
+    /// ADR-054: prefill with calibration capture — returns the post-layer
+    /// complete HC state `[hyper_connection_count, hidden]` (f32) at the last
+    /// sequence position (the committed state) for one target layer.
+    /// Capture forces the single-layer path (same forcing as the debug
+    /// dumps). Intended for fresh per-prompt caches; the span is planned
+    /// but the cursor is left unpublished on success and the cache is
+    /// poisoned on error — callers use one cache per prompt.
+    pub fn forward_verifier_prefill_capture_layer(
+        &mut self,
+        token_ids: &[u32],
+        cache: &mut Deepseek4Cache,
+        layer: usize,
+    ) -> Result<Vec<f32>> {
+        anyhow::ensure!(!token_ids.is_empty(), "DeepSeek-V4 calibration prompt is empty");
+        anyhow::ensure!(
+            layer < self.cfg.num_hidden_layers as usize,
+            "calibration capture layer {layer} out of range (num_layers={})",
+            self.cfg.num_hidden_layers
+        );
+        let span = cache
+            .plan_prefill(token_ids.len())
+            .context("plan DeepSeek-V4 calibration prefill transaction")?;
+        let mut captured: Vec<f32> = Vec::new();
+        let result = self.forward_verifier_prefill_uncommitted(
+            token_ids,
+            cache,
+            &span,
+            Some(layer),
+            Some(&mut captured),
+        );
+        match result {
+            Ok(_state) => {
+                anyhow::ensure!(
+                    !captured.is_empty(),
+                    "calibration capture did not fire (target layer never reached?)"
+                );
+                Ok(captured)
+            }
+            Err(error) => {
+                cache.poison();
+                Err(error).context("DeepSeek-V4 calibration prefill failed; cache poisoned")
+            }
+        }
+    }
+
     /// Execute independent prompt transactions as one layer-major cohort.
     ///
     /// Attention and cache writes remain sequence-local. After each sequence's
@@ -367,7 +412,7 @@ impl Deepseek4Model {
         if profile_stages {
             mlx_native::kernel_profile::reset();
         }
-        let result = self.forward_verifier_prefill_uncommitted(token_ids, cache, &span);
+        let result = self.forward_verifier_prefill_uncommitted(token_ids, cache, &span, None, None);
         if profile_stages {
             eprintln!(
                 "DeepSeek-V4 compressed prefill GPU stages at position {} for {} rows:",
@@ -680,6 +725,8 @@ impl Deepseek4Model {
         token_ids: &[u32],
         cache: &mut Deepseek4Cache,
         span: &CacheSpan,
+        capture_layer: Option<usize>,
+        mut capture_out: Option<&mut Vec<f32>>,
     ) -> Result<MlxBuffer> {
         let layers = self.cfg.num_hidden_layers as usize;
         let executor = GraphExecutor::new(self.ctx.device().clone());
@@ -695,7 +742,7 @@ impl Deepseek4Model {
         let graph_layers_per_command_buffer = graph_layers_per_command_buffer(
             layers,
             graph_reorder,
-            profile_timing || dump_intermediates,
+            profile_timing || dump_intermediates || capture_layer.is_some(),
         )?;
         if graph_layers_per_command_buffer > 1 {
             anyhow::ensure!(
@@ -844,6 +891,30 @@ impl Deepseek4Model {
                         .with_context(|| format!("execute DeepSeek-V4 prefill layer {layer}"))?;
                 }
                 completion.validate_moe_statuses()?;
+                // ADR-054 calibration capture: read the post-layer complete
+                // HC state at the last sequence position (the committed
+                // state), host-side f32. Runs only in the forced single-layer
+                // path (capture forces single-layer above, same as dumps).
+                if let (Some(cl), Some(out)) = (capture_layer, capture_out.as_deref_mut()) {
+                    if cl == layer {
+                        let last = self
+                            .last_token_state(&next_state)
+                            .context("view DeepSeek-V4 calibration capture state")?;
+                        let data: &[f32] = last
+                            .as_logical_slice()
+                            .map_err(|e| anyhow::anyhow!("calibration capture read: {e}"))?;
+                        let elements =
+                            self.cfg.hyper_connection_count as usize * self.cfg.hidden_size as usize;
+                        anyhow::ensure!(
+                            data.len() >= elements,
+                            "calibration capture: last-token state has {} f32, expected {}",
+                            data.len(),
+                            elements
+                        );
+                        out.clear();
+                        out.extend_from_slice(&data[..elements]);
+                    }
+                }
                 self.dump_verifier_layer_state(
                     &next_state,
                     layer,

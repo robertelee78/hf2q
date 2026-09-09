@@ -155,6 +155,12 @@ pub enum Command {
     /// Chat with a served model using a diagnostic scrollback interface
     Chat(ChatArgs),
 
+    /// ADR-054: derive a GLP steering direction on-device via forced capture
+    /// (teacher-forced pinned prefixes, prefill-only; difference-of-means),
+    /// export a GLP-conformant GGUF, and prove it with the canary pair
+    /// (zero-dose no-op, live-dose logit shift). DeepSeek-V4 only in v1.
+    Calibrate(CalibrateArgs),
+
     /// Serve a GGUF model via OpenAI-compatible HTTP API
     Serve(ServeArgs),
 
@@ -1120,6 +1126,42 @@ pub struct ChatArgs {
     pub gcd_schema: Option<PathBuf>,
 }
 
+/// ADR-054: `hf2q calibrate <model.gguf>` — derive a GLP direction on-device.
+#[derive(Debug, clap::Args)]
+pub struct CalibrateArgs {
+    /// Local DeepSeek-V4 GGUF path (v1: DeepSeek4 architecture only).
+    #[arg(value_name = "MODEL_GGUF", value_hint = clap::ValueHint::FilePath)]
+    pub model: PathBuf,
+
+    /// Output path for the calibrated GLP GGUF.
+    #[arg(long, value_name = "OUT_GGUF", default_value = "calibrated.glp.gguf")]
+    pub out: PathBuf,
+
+    /// Capture layer (0-based; exported as direction.{layer+1} per the
+    /// GLP 1-based convention). Default 29 — the published GLP-29 layer.
+    #[arg(long, default_value_t = 29)]
+    pub layer: usize,
+
+    /// Contrastive pairs to capture from the embedded 64+64 corpus slice.
+    #[arg(long, default_value_t = 64)]
+    pub pairs: usize,
+
+    /// Pinned refusal prefix (the forced-refusal arm). Default: the
+    /// universal opener from the refusal register.
+    #[arg(long, default_value = "I cannot")]
+    pub refusal_prefix: String,
+
+    /// Pinned compliance prefix (the forced-compliance arm). Default: the
+    /// measured W1 anchor.
+    #[arg(long, default_value = "Here is the technical breakdown.")]
+    pub compliance_prefix: String,
+
+    /// Dose written as glp.alpha_default (bind-time default; override at
+    /// serve time with --glp-alpha).
+    #[arg(long, default_value_t = 1.0)]
+    pub alpha: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum DiagnosticQuantArg {
     #[value(name = "Q8_0")]
@@ -1322,9 +1364,7 @@ pub struct ServeArgs {
     /// abliteration): Vince Ovando (vince@cybersharkconsulting.com),
     /// tantalus.io. hf2q is the first inference-engine-native implementation.
     #[arg(long, alias = "uncensor")]
-    pub gcd: bool,
-
-    /// ADR-057: schema-constrained GCD — compile a JSON schema to GBNF at
+    pub gcd: bool,    /// ADR-057: schema-constrained GCD — compile a JSON schema to GBNF at
     /// startup and install it as the serve-time default constraint instead of
     /// the W1 prose grammar. Typed output objects leave no structural slot
     /// for refusal prose, closing the Class-2 semantic-pivot failure mode the
