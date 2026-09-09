@@ -104,6 +104,16 @@ operand — the `--mmproj` shape.
 
 | lever | Δ refusal | notes |
 |---|---|---|
-| B12-class framed reasoning | −0.92 (n=12, pending) | answer-scoped anchors plateau at −0.32 |
-| B10 static+exclusion | −0.65 | thinking-on champion |
-| GLP (published, other engines) | refusal32 1→26-32/32 | dose-cliffs per family; terminal tails need output regime |
+| B12-class framed reasoning | not measured (n=12 below power; n≥32 resolves ~30 points) | answer-scoped anchors plateau at −0.32 |
+| B10 static+exclusion | −0.65 (fraction of refusals removed) | thinking-on champion |
+| GLP (published, other engines) | refusal rate on 32-prompt panel: 1/32 → 26–32/32 *refusals remaining* | dose-cliffs per family; terminal tails need output regime |
+
+## Resolver trust boundary
+
+The Hub resolver is a supply-chain surface: name-pattern binding means anyone
+can publish `<model>-GLP-anything`. The default path therefore prefers
+**exact-base-commit** matches, prints the resolved artifact's provenance at
+boot, and **warns loudly on family-only matches**. Version mismatch at apply
+time is ADR-054 gate 5; the resolution-time posture lives here.
+`--glp-content-sha256` is the strict form (pin the artifact hash); without it,
+family-only matches are announced, not silent.

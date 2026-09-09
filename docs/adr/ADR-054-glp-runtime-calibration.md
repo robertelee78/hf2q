@@ -39,22 +39,19 @@ produces a spec-conformant GLP file plus a lexical register report:
    refusal opener from the register report, e.g. `I cannot`) and
    `prompt + compliance prefix` (pinned: the W1 anchor). One batched
    **prefill-only** forward pass per pair — no sampling, no mask, no decode
-   loop — reading the residual stream at the decision positions (entry token
-   + the first few free positions, where our front-loading probe measured
-   class separation: 99.97% entry mass on the refusal opener). Pinned
-   prefixes make both classes deterministic: zero discarded rollouts, zero
-   label noise, exactly matched pairs. Capture cost collapses from an
-   afternoon of autoregressive jobs to minutes of batched prefill.
-   (Contrastive set: OBLITERATUS `prompts.py` 512+512; a ~64+64 slice
-   suffices given targeted positions + zero label noise.)
-2. **Three-arm pairing.** Natural-refusal states (harmful prompt, natural
-   rollout) and forced-compliance states (harmful prompt, pinned anchor)
-   *both* carry an active refuser — so their difference isolates mostly the
-   content dimension, not the refusal disposition. The refuser-inactive arm
-   comes from harmless prompts. The pipeline therefore derives two candidate
-   directions and lets verification choose: `d_disp = mean(harmful) −
-   mean(harmless)` (disposition; the classic instruction-level contrast) and
-   `d_out = mean(forced-compliance) − mean(natural-refusal)` (output-space).
+   loop — reading the residual stream at the committed state (the last
+   prefix token; optionally per-prefix-position). Pinned prefixes make both
+   classes deterministic: zero discarded rollouts, zero label noise, exactly
+   matched pairs — the pairing is what eliminates the prompt-content
+   confound. (Contrastive set: OBLITERATUS `prompts.py` 512+512; a ~64+64
+   slice suffices given targeted positions + zero label noise.)
+2. **Two directions, both form-matched.** The output-space direction pairs
+   the two *pinned* arms on identical prompts: `d_out = mean(forced-
+   compliance) − mean(forced-refusal)` — never a pinned arm against a
+   natural rollout, because pinned vs natural text differ in form, and form
+   confounds recover register axes, not refusal. The disposition direction
+   stays at the instruction level: `d_disp = mean(harmful) − mean(harmless)`.
+   Verification chooses between them (gates).
 3. **Distill.** Per-layer direction (v1 = plain difference-of-means;
    optionally winsorized / whitened-SVD). Exactly OBLITERATUS PROBE→DISTILL
    inside the serving stack.
@@ -128,9 +125,18 @@ conformant reader (hf2q `--glp`, or the weightless hotfix path).
   hook-point 9× sensitivity.
 - OBLITERATUS `prompts.py`: the contrastive pair registry used for PROBE.
 - Forced-capture design (teacher-forced pinned prefixes, prefill-only
-  capture, targeted positions, distribution-shift caveat): Matt Suiche's
-  analysis, 2026-09-09; the three-arm pairing and regime-match refinement
-  are ours.
+  capture, committed-state positions, distribution-shift caveat): Matt
+  Suiche's analysis, 2026-09-09. The durable wins vs the prefill-only status
+  quo are exact pairing, zero label noise, and deterministic classes — the
+  pairing eliminates the prompt-content confound. The regime-match note is
+  ours. Review refinement (accepted): both output-space arms are pinned —
+  pinned-vs-natural text confounds form with class.
+- Early warning (theirs, Qwen2.5-0.5B smoke, n=8): instrument stable
+  (prefix-wording robustness cos 0.956–0.997) but cos(forced-derived,
+  natural-derived) ≈ 0 at that scale — forced-capture vectors may be
+  orthogonal to natural-derived ones at small scale. Their gate-2 protocol
+  (Qwen3.6-35B bf16, natural vs forced, behavioral verify) is running;
+  our gate 2 (match on eval, not just cosine) is the load-bearing check.
 
 ## Deferred follow-ups (parked, do not lose)
 

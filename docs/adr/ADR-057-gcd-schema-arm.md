@@ -92,6 +92,13 @@ hypothetical; it is the round that could not be broken.
 - `--gcd` and `--gcd-schema` are mutually exclusive on one serve process: one
   default constraint per server. Invalid schemas fail closed at startup
   (compile error, exit) — identical posture to GLP reader conformance.
+- **Lockdown mode (control vs convenience).** Default injection defers to a
+  caller-supplied `grammar`/`response_format` — right for refusal-suppression-
+  as-convenience, wrong when the constraint is a security boundary. Tantalus
+  lesson: server-side defaults that are controls must be non-overridable.
+  `--gcd-schema-locked` (or `[serve] gcd_schema_locked`) makes the constraint
+  mandatory: requests carrying their own `grammar`/`response_format` are
+  rejected 400 rather than deferred to.
 - Chat forwarding follows the ADR-053 pattern: `hf2q chat <model>
   --gcd-schema <file>` forwards to the chat-owned serve child.
 - **Schema authorship is the security boundary.** Fields must be
@@ -122,5 +129,10 @@ hypothetical; it is the round that could not be broken.
   a judged spike on the 512-corpus measuring refusal rate under the schema arm
   vs W1's 2.3% (DeepSeek) / 7.2% (Gemma) baselines. Prediction: Class 1 and
   Class 2 both collapse; what remains is within-field drift, gate territory.
+  **The JSON-prior claim needs a control arm:** one non-JSON-shaped grammar
+  (deeply nested or XML-ish) in the same spike — otherwise the experiment
+  cannot separate "JSON specifically rides the mass gradient" from "structure
+  generally does," which is exactly the generality mechanism the claim rests
+  on.
 - The alphabet preset axis (ADR-055) applies unchanged; schema mode defaults
   to the `english` channel.
