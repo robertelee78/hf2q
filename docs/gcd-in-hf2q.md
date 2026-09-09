@@ -48,8 +48,13 @@ Both reduce to one question: **what may the model emit?** The lineage that
 settled it is old: object-capability systems make authority an unforgeable
 token that can only be exercised, never named into existence; LANGSEC makes
 the recognizer correct by construction; application whitelisting displaced
-signature antivirus for the same reason. Vince's paper is the domain transfer
-into AI security.
+signature antivirus for the same reason. [Vince's
+paper](https://doi.org/10.17605/OSF.IO/S9GU6) — *Constitutive
+Authorization at the Decoding Boundary: Grammar-Constrained Decoding as a
+Positive, Generation-Time Security Control for LLM Agents* (draft 2026-06-25;
+[code](https://github.com/cybersharkvin/gcd-authz); arena at
+[tantalus.io](https://tantalus.io/)) — is the domain transfer into AI
+security.
 
 ## The mechanism: constitutive, not corrective
 
