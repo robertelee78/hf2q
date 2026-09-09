@@ -1,6 +1,11 @@
 # ADR-054: Runtime GLP calibration — `hf2q calibrate <model>`
 
-- **Status:** Draft — design accepted; implementation gates below are not met
+- **Status:** Draft — design accepted; the capture/export/canary path is
+  implemented and its canary gates are proven on DeepSeek-V4 (2026-09-09:
+  zero-dose logit-identical, live-dose shift 0.213 > 1e-3). The behavioral
+  gates (3–4: refusal-panel delta, dose ladder) remain unmet — the output of
+  `hf2q calibrate` is a candidate vector, not a validated derivation, until
+  those land.
 - **Date:** 2026-09-04 (revised 2026-09-09: forced-capture design replaces
   generation-based capture — teacher-forced pinned prefixes, prefill-only
   forward passes, targeted decision positions; capture cost collapses from
