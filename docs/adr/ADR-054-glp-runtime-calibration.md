@@ -69,12 +69,23 @@ produces a spec-conformant GLP file plus a lexical register report:
    exclusion automaton, replacing the hand-written list. (This doubles as the
    source of the pinned refusal prefix in step 1.)
 
-**Regime-match note.** The distribution-shift caveat on forced capture
-(forced-compliance states ≠ natural-compliance states — the refuser fights
-while the tokens comply) is real but regime-dependent: when GLP is deployed
-*alongside* the grammar (the ADR-053 composition), forced-capture states ARE
-the deployment distribution, and the caveat becomes a match, not a shift.
-For GLP-alone deployment, validate against the natural reference (gates).
+**Gate-2 outcome (2026-09-09, weightless side, Qwen3.6-35B bf16):** the
+forced-capture direction does not suppress at scale — 0/8 held-out delivery,
+identical to baseline, while the natural `d_disp` direction delivered 7/8 on
+the same span. cos(forced-derived, natural-derived) ≈ 0.06 at 35B,
+generalizing the 0.5B smoke result — no scale-dependence reprieve. The
+within-prompt forced pair is a *register* axis, exactly as the form-confound
+warning predicted. **Resolution: `d_disp` (harmful vs harmless, no prefixes)
+is the derivation arm; pinned prefixes are demoted to register probes** —
+fast, zero-label-noise instruments for register questions, not a direction
+source. The exporter ships `d_disp`; the `d_out` sums stay in the report for
+register analysis only.
+
+(Surviving note from the forced-capture design: the regime-match observation
+— forced-capture states ARE the deployment distribution when GLP composes
+with the grammar — remains true as a statement about *states*; it just
+doesn't rescue a *direction* derived from them. Adopted on the weightless
+side for probe work.)
 
 **Generality.** The pinned-prefix trick enumerates contrastive pairs for any
 expressible direction — register, language, reasoning style — so
