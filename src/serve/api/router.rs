@@ -58,6 +58,11 @@ pub fn build_router(state: AppState) -> Router {
         // same semantics as `kill <pid>`).
         .route("/shutdown", post(handlers::shutdown))
         .fallback(fallback)
+        // Grammar-bearing requests can carry megabytes of GBNF (the
+        // campaign's floored automata run ~2.3MB). The request-body limit
+        // must exceed the grammar resource cap (MAX_RAW_CONSTRAINT_BYTES,
+        // 4MB) plus JSON overhead — 8MB keeps the two caps coherent.
+        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         // Apply layers outside-in. The axum convention is `.layer()` wraps,
         // so the last `.layer(X)` call becomes the outermost layer.
         // Order chosen: bearer_auth innermost, then request-id, then CORS.

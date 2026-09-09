@@ -39,7 +39,7 @@ number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1
 ws ::= | " " | "\n" [ \t]{0,20}
 "#;
 
-const MAX_RAW_CONSTRAINT_BYTES: usize = 1024 * 1024;
+const MAX_RAW_CONSTRAINT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CHOICES: usize = 1_024;
 const MAX_CHOICE_LITERAL_BYTES: usize = 1024 * 1024;
 

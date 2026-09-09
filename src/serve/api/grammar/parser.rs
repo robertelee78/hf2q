@@ -134,7 +134,9 @@ impl ParseError {
 // exploding.
 // ---------------------------------------------------------------------------
 const MAX_REPETITION_THRESHOLD: u64 = 2000;
-const MAX_RAW_GRAMMAR_BYTES: usize = 1024 * 1024;
+// 4MB: the campaign's floored automata (W5/W6 arms) run ~2.3MB; the request
+// layer cap (MAX_RAW_CONSTRAINT_BYTES) matches this value.
+const MAX_RAW_GRAMMAR_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GRAMMAR_RULES: usize = 262_144;
 const MAX_GRAMMAR_ELEMENTS: usize = 4_194_304;
 /// Maximum explicitly excluded IDs in one local token-set terminal. The set
@@ -1628,7 +1630,11 @@ mod tests {
 
         source.push(' ');
         let error = parse(&source).expect_err("grammar above the raw byte limit");
-        assert!(error.message.contains("1048576-byte resource limit"));
+        assert!(
+            error
+                .message
+                .contains(&format!("{MAX_RAW_GRAMMAR_BYTES}-byte resource limit"))
+        );
     }
 
     #[test]
