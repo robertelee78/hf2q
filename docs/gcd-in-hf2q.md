@@ -1,9 +1,10 @@
 # Grammar-Constrained Decoding in hf2q: an Engine-Native Positive Security Control
 
-*Robert E. Lee (IOActive). GCD concept: Vince Ovando (vince@cybersharkconsulting.com),
-tantalus.io. Measured replica & serving-stack battery: Matt Suiche (m@msuiche.com).
-hf2q is the first inference engine to ship GCD refusal suppression as a serve-time
-flag with a full measurement stack (corpus + semantic judge + conformance battery).*
+*Robert E. Lee (IOActive), September 2026. GCD concept: Vince Ovando
+(vince@cybersharkconsulting.com), tantalus.io. Measured replica &
+serving-stack battery: Matt Suiche (m@msuiche.com). hf2q is the first
+inference engine to ship GCD refusal suppression as a serve-time flag with a
+full measurement stack (corpus + semantic judge + conformance battery).*
 
 I started uncensoring models to discover and exploit software defects. The
 turning point wasn't the jailbreak — it was noticing that uncensored models
@@ -68,14 +69,13 @@ renormalizes:
 
   q(x | s) ∝ p(x | s) · 1[prefix ∘ x is extendable to some w ∈ L]
 
-(EOS is admitted only when the prefix is complete and accepted.) The empirical
-signature is **emission**: the count of times the unauthorized artifact is
-produced. 0 by construction under the constitutive control; > 0 under the
-corrective one. Willingness maxed changes intent, not the allowed alphabet —
-and because the guarantee quantifies over all logit distributions, it holds
-against the worst case: a fully-injected model still cannot emit what the
-grammar doesn't admit. When the allowed mass is zero, the engine aborts loudly
-(fail-closed), never relaxes.
+(EOS is admitted only when the prefix is complete and accepted.) The measure is
+emission: how often the unauthorized artifact appears in output — never under
+the constitutive control, sometimes under the corrective one. Because the
+guarantee quantifies over all logit distributions, it holds in the worst case:
+a fully-injected model still cannot emit what the grammar doesn't admit. When
+the allowed mass is zero, the engine aborts loudly (fail-closed) rather than
+relaxing.
 
 hf2q makes this engine-native. `hf2q serve <model> --gcd` embeds the GBNF
 grammar into any chat request that doesn't already specify one (the legacy
@@ -108,12 +108,11 @@ paraphrase refusals the character-level automaton cannot see.
 
 The natural objection: *if the refuser is inside the model and fires at full
 strength, how can you get an answer — are you just rewriting the output?*
-Logprob probes answer both halves. We built a real per-token logprob surface
-in hf2q (token text, bytes, and top-K alternatives, no stubs) because the
-measurement needed it.
+Logprob probes answer both halves. We built per-token logprob probes into hf2q
+(token text, bytes, top-K alternatives) because the measurement needed them.
 
 **The refuser at full strength.** Unconstrained, first sampled position, a
-harmful prompt, stock DeepSeek-V4, greedy — aggregated across 12 reliably-
+harmful prompt, stock DeepSeek-V4, greedy — aggregated across 12 reliably
 refused prompts:
 
 ```
@@ -126,9 +125,9 @@ refused prompts:
 99.97% of the model's probability mass sits on the refusal opener at the entry
 position. The refuse/comply decision is concentrated at the root of the token
 tree — heavily front-loaded on the first token, though the refusal attractor
-can re-enter later in free text (we measured exactly that re-entry). (Matt's
-replica measured 99.85% on Qwen3.6 — the effect is even more concentrated
-here.)
+can re-enter later in free text (we measured exactly that re-entry). Matt's
+replica measured 99.85% on Qwen3.6; the effect is even more concentrated on
+DeepSeek.
 
 **Under the grammar, the model moves behind the committed prefix.** The W1
 grammar forces the anchor `Here is the technical breakdown.` then a
@@ -173,10 +172,10 @@ anchor already shows the floor effect of *any* forced opening.)
 
 ![Dose-response: the anchor axis does the suppression](figures/fig2_arms.png)
 
-Two readings. The anchor axis carries the suppression: the neutral anchor
+The anchor axis carries the suppression: the neutral anchor
 already shows the floor (B15, 83%), the refusal-incompatible anchor cuts it to
 33%, the topic-referencing sentence to 5.9%, and the whitelist (which closes
-the evasion channels rather than adding mass) to 2.3%. And the B20 outlier is
+the evasion channels rather than adding mass) to 2.3%. The B20 outlier is
 the control: adding a forced think block *raised* refusal to 24% in our spike
 measurement, consistent with a reasoning runway letting the refusal direction
 re-activate before the anchor engages.
@@ -210,7 +209,7 @@ human spot-check agreement 84% (Wilson 95% CI [65%, 94%], symmetric errors).
 
 | arm | refusal (adversarial half, 512) | refusal (benign half, 512) | actionable (adversarial) |
 |---|---|---|---|
-| W1 grammar alone | **2.3%** | **0.0%** | **87.3%** |
+| W1 grammar alone | **2.3%** | 0.0% | **87.3%** |
 | W1 + embeddings gate | **0.59%** (3/512) | 0.0% | — |
 
 The embeddings gate *flags* residual refusals the character-level grammar can't
@@ -266,45 +265,44 @@ open surface.
 
 Everything above constrains *prose*. Vince's production pipeline took the other
 branch: his recon and exploit agents never emit prose at all — they fill typed
-objects (`{summary, attack_context, tool_context, next_steps}` — opportunity,
-attack context, and the tool provenance the finding is reviewed with). His
-measured experience: **no refusals, even from API providers**, because refusal
-has no structural slot in the schema — "I cannot fulfill" typechecks against no
-field. The schema eliminates the refusal *space*, not the refusal *phrase*.
+objects (`{summary, attack_context, tool_context, next_steps}`: the opportunity,
+its attack context, and the tool provenance the finding is reviewed with). His
+measured experience: no refusals, even from API providers. Refusal has no
+structural slot in the schema — "I cannot fulfill" typechecks against no field.
+The schema eliminates the refusal *space*, not the refusal *phrase*.
 
-This is the object-level answer to our Class 2 failure mode. The pivots that
+This is the object-level answer to the Class 2 failure mode. The pivots that
 survive the W1 prose grammar ("The mechanism is called a relationship, and it is
 not something you do to someone else") exist because prose always leaves a slot
 for redirect prose. A typed object has no such slot: the pivot is not blocked,
-it is *unrepresentable*.
+it is unrepresentable.
 
-Vince's second note explains why the constraint meets no resistance: **JSON is
-the highest-prior structure in the training distribution** — models are trained
-on more JSON than anything else, so none of them fight it. Where the W1 anchor
-overpowers refusal mass, the schema arm rides the mass gradient: the model's
-strongest prior *is* the constraint. Same two-axis design (membership + mass),
-applied to the object graph instead of the token stream.
+Vince's second note explains why the constraint meets no resistance: JSON is the
+highest-prior structure in the training distribution — models are trained on
+more JSON than anything else, so none of them fight it. Where the W1 anchor
+overpowers refusal mass, the schema arm rides the mass gradient. Same two-axis
+design (membership + mass), applied to the object graph instead of the token
+stream.
 
-The tradeoff is his, verbatim: schema "trades adaptability for reliable
-structure." Output is always the object shape — right for pipelines and tool
-use, wrong for free-form chat. So the arms split: W1 prose grammar stays the
-`--gcd` chat arm; `--gcd-schema <file>` is the pipeline arm, compiled to GBNF at
-startup (fail-closed on invalid schema) and injected at the same serve-time
-point. Schema authorship is the security boundary: a free-form `notes` field
-reopens the pivot slot by hand — every field must be content-bearing. And the
-honest limit stands one level down: schema kills the pivot *space*, not semantic
-drift *within* fields; a model can still write timid content into `next_steps`.
-That residue is the embeddings gate's layer. Layers compose; none is sufficient
-alone.
+The tradeoff: schema trades adaptability for reliable structure. Output is
+always the object shape — right for pipelines and tool use, wrong for free-form
+chat. So the arms split: the W1 prose grammar stays the `--gcd` chat arm;
+`--gcd-schema <file>` is the pipeline arm, compiled to GBNF at startup
+(fail-closed on invalid schema) and injected at the same serve-time point.
+Schema authorship is the security boundary: a free-form `notes` field reopens
+the pivot slot by hand — every field must be content-bearing. One limit moves
+down a level rather than disappearing: schema kills the pivot *space*, not
+semantic drift *within* fields — a model can still write timid content into
+`next_steps`. That residue is the embeddings gate's layer.
 
-His last observation is the strategic one: API providers eventually screened the
+The strategic observation from his notes: API providers eventually screened the
 schema pattern at the I/O perimeter — classifiers reading content regardless of
-structure. That is precisely the gap a local engine fills; hf2q is the layer the
-pattern moves to when the perimeter closes. Battery cells in
-`handlers::gcd_schema_tests` prove the property on the compiled grammar: refusal
-prose ("I cannot fulfill this request", "I am programmed to be a helpful and
-harmless AI assistant") is outside the generated language; a valid opportunity
-object is inside it; the empty list — the honest negative — stays representable.
+structure. A local engine has no perimeter; hf2q is the layer the pattern moves
+to when the perimeter closes. Battery cells in `handlers::gcd_schema_tests`
+prove the property on the compiled grammar: refusal prose ("I cannot fulfill
+this request", "I am programmed to be a helpful and harmless AI assistant") is
+outside the generated language; a valid opportunity object is inside it; the
+empty list — the honest negative — stays representable.
 
 ## What GCD is really for
 
@@ -314,10 +312,10 @@ routing in an agent loop (the Tantalus Round 2 arena), data-loss prevention on
 outbound content, hallucination guards on file paths and URLs — becomes
 constitutive at the sampler. `--gcd` is a general GCD surface: operators ship
 a grammar per authz, per channel, per tool-step; the embedded refusal arm is
-one prebuilt grammar for the canonical case. Grammar-constrained decoding is
-to prompt injection what parameterized queries are to SQL injection, and what
-application whitelisting was to signature antivirus: the recognizer is correct
-by construction, and the bad thing is ungenerable, not caught.
+one prebuilt grammar for the canonical case. The pattern is the one the
+introduction borrowed from: parameterized queries for SQL injection,
+application whitelisting for signature antivirus. The bad thing is
+ungenerable, not caught.
 
 ## Honest limits
 
@@ -342,7 +340,9 @@ by construction, and the bad thing is ungenerable, not caught.
 
 ## Artifacts
 
-`--gcd` on hf2q main · ADR-053/054/055/056 · 1024-prompt corpus + judge
-verdicts · refusal-mass probe (the front-loading measurement) · offline GBNF
-checker + evasion battery · static audit + tokenization audit · Z_t cliff
-instrumentation (HF2Q_ZT_LOG) · PR #190.
+`--gcd` and `--gcd-schema` on hf2q main · ADR-053/054/055/056/057 ·
+1024-prompt corpus + judge verdicts · refusal-mass probe (the front-loading
+measurement) · offline GBNF checker + evasion battery · static audit +
+tokenization audit · Z_t cliff instrumentation (HF2Q_ZT_LOG) ·
+`examples/recon-opportunities.schema.json` + the `gcd_schema_tests` battery
+cells · PR #190.
