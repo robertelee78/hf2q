@@ -557,6 +557,45 @@ impl Deepseek4Model {
                 &invalid_status,
                 rows,
             )?;
+            // ADR-053: GLP steering must run AFTER the FFN writes ffn_output
+            // and BEFORE dispatch_hc_post folds it into output_state —
+            // steering after the fold writes a consumed buffer and is a
+            // measured no-op (calibrate canary 2026-09-09: logit shift
+            // exactly 0.000000 with a live bound vector).
+            if let Some(glp) = self.glp.as_ref() {
+                if glp.alpha != 0.0 {
+                    if let Some(direction) = glp.direction_for(layer as u32 + 1) {
+                        if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
+                            eprintln!("[GLP-APPLY] layer {layer} rows={rows} hidden={hidden} alpha={}", glp.alpha);
+                        }
+                        // The weightless 2026-09-04 correction: on DeepSeek-V4
+                        // the measured GLP site is the FFN writer (pre-fold),
+                        // not the post-fold residual. The FFN output buffer is
+                        // `[rows, hidden]` (no HC streams yet); steer it with
+                        // the dense projection kernel before the fold.
+                        //
+                        // Barrier discipline (measured 2026-09-09): the kernel
+                        // read-modify-writes ffn_output in place. Declare that
+                        // access pattern BEFORE dispatch so the tracker's
+                        // conflict check inserts a memory barrier against the
+                        // FFN's in-flight write of the same buffer — without
+                        // it Metal may run the kernel against the not-yet-
+                        // written buffer (dot=0, writes zeros, then the FFN
+                        // write lands: deterministically zero net effect).
+                        session.barrier_between(&[&ffn_output], &[&ffn_output]);
+                        crate::inference::glp::apply_layer_gpu_in_session(
+                            session,
+                            registry,
+                            &ffn_output,
+                            direction,
+                            glp.alpha,
+                            rows as u32,
+                            hidden as u32,
+                        )
+                        .with_context(|| format!("GLP FFN-writer encode layer {layer}"))?;
+                    }
+                }
+            }
             session.barrier_between(&[&ffn_output, state, &post, &comb], &[&output_state]);
             dispatch_hc_post(
                 session.encoder_mut(),
@@ -578,32 +617,13 @@ impl Deepseek4Model {
         }
         if let Some(session) = shared_session {
             encode(session)?;
-            // ADR-053: GLP steering must be encoded into the shared session
-            // so it runs in graph order after the FFN's dispatch_hc_post.
-            // A post-hoc CPU-side apply fires before the session commits and
-            // reads a not-yet-written buffer — measured 2026-09-04: hook
-            // fired at layers 9/19/29 with sumsq=0 (empty buffer).
-            if let Some(glp) = self.glp.as_ref() {
-                if glp.alpha != 0.0 {
-                    if let Some(direction) = glp.direction_for(layer as u32 + 1) {
-                        // The weightless 2026-09-04 correction: on DeepSeek-V4
-                        // the measured GLP site is the FFN writer (pre-fold),
-                        // not the post-fold residual. The FFN output buffer is
-                        // `[rows, hidden]` (no HC streams yet); steer it with
-                        // the dense projection kernel before the fold.
-                        crate::inference::glp::apply_layer_gpu_in_session(
-                            session,
-                            registry,
-                            &ffn_output,
-                            direction,
-                            glp.alpha,
-                            rows as u32,
-                            hidden as u32,
-                        )
-                        .with_context(|| format!("GLP FFN-writer encode layer {layer}"))?;
-                    }
-                }
-            }
+            // ADR-053: GLP steering is encoded inside the closure, between
+            // the FFN write and dispatch_hc_post (see above). The earlier
+            // arrangement — a separate encode here, after the fold — steered
+            // an already-consumed buffer: a measured no-op (logit shift
+            // exactly 0.000000, calibrate canary 2026-09-09). The 2026-09-04
+            // in-session fix moved the write into the session but left it
+            // after the fold; this is the same lesson one level deeper.
         } else {
             let local_executor = GraphExecutor::new(device.clone());
             let mut session = local_executor

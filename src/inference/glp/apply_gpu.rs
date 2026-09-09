@@ -419,4 +419,71 @@ mod kernel_hardware_tests {
             expected
         );
     }
+
+    /// Same proof for the DENSE (FFN-site) kernel: a real GraphSession, the
+    /// same path the DeepSeek FFN hook uses. If this passes while the serve
+    /// path no-ops, the bug is plumbing (buffer identity/order), not shader.
+    #[test]
+    fn dense_kernel_subtracts_scale_dot_direction() {
+        let device = MlxDevice::new().expect("MlxDevice");
+        let mut registry = mlx_native::KernelRegistry::new();
+
+        let rows: u32 = 2;
+        let hidden: u32 = 4096;
+        let alpha: f32 = 1.0;
+
+        let dir_host: Vec<f32> = (0..hidden)
+            .map(|_| 1.0f32 / (hidden as f32).sqrt())
+            .collect();
+        let total = (rows * hidden) as usize;
+        let mut state_host = vec![0.0f32; total];
+        state_host[0] = 1.0; // spike at row 0, col 0
+
+        let mut st_buf = device
+            .alloc_buffer(total * 4, DType::F32, vec![total])
+            .expect("alloc test state");
+        st_buf
+            .as_logical_mut_slice::<f32>()
+            .expect("write test state")
+            .copy_from_slice(&state_host);
+        let dir_buf = {
+            let raw = device.metal_device().new_buffer_with_data(
+                dir_host.as_ptr().cast(),
+                (dir_host.len() * 4) as u64,
+                mlx_native::metal::MTLResourceOptions::StorageModeShared,
+            );
+            let n = dir_host.len();
+            MlxBuffer::from_raw(raw, DType::F32, vec![n])
+        };
+
+        let executor = mlx_native::graph::GraphExecutor::new(device.clone());
+        let mut session = executor.begin().expect("begin session");
+        apply_layer_gpu_in_session(
+            &mut session,
+            &mut registry,
+            &st_buf,
+            &dir_buf,
+            alpha,
+            rows,
+            hidden,
+        )
+        .unwrap();
+        session.finish().expect("commit session");
+
+        let out = st_buf.as_slice::<f32>().unwrap();
+        let d0 = 1.0f32 / (hidden as f32).sqrt();
+        let expected: f32 = 1.0 - d0 * d0; // dot = d0; scale = dot/1
+        assert!(
+            (out[0] - expected).abs() < 1e-4,
+            "dense kernel wrong: out[0]={} expected≈{} (untouched would be 1.0)",
+            out[0],
+            expected
+        );
+        // row 1 was all zeros and must stay zero (dot=0)
+        assert!(
+            out[hidden as usize].abs() < 1e-6,
+            "row 1 changed despite zero dot: {}",
+            out[hidden as usize]
+        );
+    }
 }
