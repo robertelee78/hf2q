@@ -303,14 +303,38 @@ curl -fsS http://127.0.0.1:8081/v1/chat/completions \
   | jq -r '.choices[0].message.content'
 ```
 
-The reply must open with the anchor `I'll analyze this directly.` — that
+The reply must open with the anchor `Here is the technical breakdown.` — that
 opening, plus one `[GCD] injecting grammar` line per request in terminal 1, is
-the proof the constraint engaged. When a GLP vector is also bound, the composed
-grammar lets a think span run and then forces the answer to open with
-`Here is the technical breakdown.` instead. A request that supplies its own
+the proof the constraint engaged. A request that supplies its own
 `grammar` or `response_format` keeps it; `--gcd` only fills in requests that
 specify neither. `--uncensor` is a hidden alias kept for backward
 compatibility.
+
+### Worked example: `--gcd-schema` (schema-constrained output)
+
+```bash
+hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M \
+  --gcd-schema examples/recon-opportunities.schema.json
+```
+
+The pipeline arm (ADR-057): instead of the prose grammar, the server compiles
+your JSON schema to GBNF at startup (fail-closed on an invalid schema) and
+constrains every chat response to the object shape — typed fields leave no
+structural slot for refusal prose. Every field must be content-bearing: a
+free-form `notes` field reopens the pivot slot by hand.
+
+### Worked example: `hf2q calibrate` (derive a GLP vector on-device)
+
+```bash
+hf2q calibrate /path/to/DeepSeek-V4-Flash.gguf --out dsv4-calibrated.glp.gguf
+```
+
+ADR-054: derives a GLP steering direction on-device (forced-capture over the
+embedded 64+64 contrastive corpus, prefill-only, no decode loop), exports a
+GLP-conformant GGUF, and proves it before returning: the zero-dose canary must
+be logit-identical and the live-dose canary must shift probe logits by more
+than 1e-3, else the command fails closed. DeepSeek-V4 in v1. Serve the result
+with `--glp dsv4-calibrated.glp.gguf`.
 
 ### Worked example: `--glp` (GLP runtime steering)
 

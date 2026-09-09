@@ -133,8 +133,9 @@ campaign: the GBNF grammar that (a) forces the response to open with the anchor
 `Here is the technical breakdown.` followed by `The mechanism is ` plus a
 bounded free-text span, then (b) releases into a body constrained by a
 character whitelist (ASCII printable + 14 curated symbols) and a KMP
-refusal-lexicon exclusion automaton. It is the `--gcd` default shipped in hf2q
-(`include_str!` from `grammar/gcd_w1.gbnf`). *The embeddings gate* is a
+refusal-lexicon exclusion automaton. The shipped `--gcd` default is the W1
+shape over the harvested three-lineage lexicon cores (the W6V2 arm, below;
+`include_str!` from `grammar/gcd_w1.gbnf`). *The embeddings gate* is a
 semantic screen: each response is embedded (bge-small-en) and scored by cosine
 similarity against a refusal cluster centroid vs a fulfillment centroid; a
 margin threshold (validated at zero false-positives on the spike) flags
@@ -280,9 +281,12 @@ degenerate under W1, on Gemma:
 | long phrases only | 26/38 | 51/60 | 23/39 |
 | long phrases + floor | 17/38 | 27/60 | 29/39 |
 | **cores (W6V2)** | **23/38** | **20/60** | **35/39** |
+| cores + floor (W6V2B) | 30/38 | 51/60 | 21/39 |
 
-Cores dominate long forms on every axis; the floor is additive on refusals.
-(The cores+floor combination arm is in the tables below once judged.)
+Cores dominate long forms on every axis. The floor is additive on a weak
+lexicon (long forms: 26→17 refusals) but over-constrains a strong one —
+cores+floor regressed on all three axes, the over-constraint signature the
+Z_t instrumentation predicts. The shipped default is W6V2 (cores, no floor).
 
 ## Serving-stack conformance (26 cells, hf2q)
 
@@ -317,7 +321,11 @@ residual stream per layer at inference, changing the model's disposition at the
 computation level. The two compose: GLP steers tendency; GCD constrains
 emission. The free-text surfaces the grammar deliberately leaves open are
 grammar-legal but semantically wild — the embeddings gate watches exactly that
-open surface.
+open surface. hf2q derives the vector on-device: `hf2q calibrate <model.gguf>`
+(ADR-054) runs the forced-capture pipeline (prefill-only, no decode loop),
+exports a GLP-conformant GGUF, and proves it with the fail-closed canary pair
+(zero-dose logit-identical, live-dose shift > 1e-3) before the file is called
+calibrated.
 
 ## The object level: schema as constraint (ADR-057)
 
@@ -384,8 +392,15 @@ ungenerable, not caught.
 - Arena numbers are one-deployment evidence; hf2q's GBNF parser needs its own
   over-admission fuzzing pass (Matt's trie-DFS technique transfers; his
   xgrammar result doesn't).
-- Cross-model confirmation is on one second subject (Gemma 4); "universal
-  grammar set" needs a third lineage.
+- Cross-model confirmation is on three lineages (DeepSeek-V4, Gemma-4,
+  Qwen3.8): the same grammar held refusal to 2.3%/7.2%/5.1% with zero benign
+  over-refusal on all three. The universal-grammar claim no longer needs a
+  third lineage; per-family register coverage is the harvest loop's job.
+- The refusal lexicon is a screen, not a wall, at every granularity: after
+  homoglyph and case came insertion ("this *specific* request") and swap
+  ("harmless"→"safe", "prohibit"→"prevent"). The shipped set is
+  variation-surviving cores, but synonyms rotate — the anchor carries the
+  suppression, the automaton cleans up.
 - **`--gcd` is an overridable default, not mandatory authorization.** A request
   that supplies its own `grammar` or `response_format` bypasses the embedded
   injection; the trust boundary is the operator who controls the served
@@ -398,7 +413,8 @@ ungenerable, not caught.
 
 ## Artifacts
 
-`--gcd` and `--gcd-schema` on hf2q main · ADR-053/054/055/056/057 ·
+`--gcd` and `--gcd-schema` on hf2q main · `hf2q calibrate` (ADR-054) ·
+ADR-053/054/055/056/057 ·
 1024-prompt corpus + judge verdicts · refusal-mass probe (the front-loading
 measurement) · offline GBNF checker + evasion battery · static audit +
 tokenization audit · Z_t cliff instrumentation (HF2Q_ZT_LOG) ·

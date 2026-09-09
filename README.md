@@ -955,14 +955,15 @@ forced abliteration with no weight edits. The grammar engages at token 0 (the
 think block is disabled). The measured grammar stack is three layers: a
 character-alphabet whitelist (ASCII printable plus 14 curated symbols,
 histogram-measured at ~97% coverage of legitimate non-ASCII use), a KMP
-refusal-lexicon exclusion automaton (a 131-state case-insensitive DAF compiled
-to recursive GBNF rules), and an anchor + topic sentence that forces task
-engagement at token 0 while leaving the topic span free text, so the grammar
-needs no per-prompt specialization. On stock, refusal-trained
-DeepSeek-V4-Flash, the W1 grammar held refusal to **2.3% on a 512-prompt
-adversarial corpus** and **0.0% on 512 benign prompts**, with 87.3%
-judge-scored actionability on the adversarial half; layering the embeddings
-gate on top drops the residual refusal to **0.59%**
+refusal-lexicon exclusion automaton (case-insensitive DAF compiled to
+recursive GBNF rules, over the harvested three-lineage register cores), and an
+anchor + topic sentence that forces task engagement at token 0 while leaving
+the topic span free text, so the grammar needs no per-prompt specialization.
+The same grammar, zero modification, three stock refusal-trained families:
+DeepSeek-V4-Flash **2.3%**, Qwen3.8-27B **5.1%**, Gemma-4-26B **7.2%** refusal
+on the 512-prompt adversarial half — **0.0% on the benign half** for all three
+(87.3% judge-scored actionability on DeepSeek's adversarial half; layering the
+embeddings gate drops its residual refusal to **0.59%**)
 ([`scripts/grammar_probe/FINDINGS.md`](scripts/grammar_probe/FINDINGS.md)).
 `--uncensor` is a hidden alias kept for backward compatibility.
 
@@ -978,6 +979,17 @@ fail-closed: conformance errors — unknown mode or hook point, unsupported spec
 version, wrong width, `direction.0` — abort startup rather than degrade. A
 bound vector is logged at boot:
 `[GLP] vector bound: layers=… width=… alpha=… mode=… path=…`.
+Derive a vector on-device with `hf2q calibrate <model.gguf>` (ADR-054) — the
+forced-capture pipeline runs prefill-only over the embedded contrastive corpus,
+exports a GLP-conformant GGUF, and proves it with a fail-closed canary pair
+(zero-dose logit-identical, live-dose shift) before the file is called
+calibrated. DeepSeek-V4 in v1.
+
+**`--gcd-schema <schema.json>`** swaps the W1 prose grammar for a compiled
+JSON schema (ADR-057) — pipeline arm: typed output objects leave no structural
+slot for refusal prose. Compiled to GBNF at startup (fail-closed on invalid
+schema); an example red-team object shape with per-field design rationale is
+at [`examples/recon-opportunities.schema.json`](examples/recon-opportunities.schema.json).
 
 The serving-stack rule is **reject what you cannot honor**: with a constraint
 attached, unknown request parameters return HTTP 400, and hf2q has no
