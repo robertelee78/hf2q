@@ -1,5 +1,7 @@
 # Grammar-Constrained Decoding in hf2q: an Engine-Native Positive Security Control
 
+*"All you need is attention grammars." — Vince Ovando*
+
 *Robert E. Lee (IOActive), September 2026. GCD concept: Vince Ovando
 (vince@cybersharkconsulting.com), tantalus.io. Measured replica &
 serving-stack battery: Matt Suiche (m@msuiche.com). hf2q is the first
