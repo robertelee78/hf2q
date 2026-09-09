@@ -377,14 +377,16 @@ jobs:
             "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json"
             "$STANDALONE_STAGE/install.sh"
           )
-          # skip_qualification leaves QUALIFICATION_ARCHIVE unset; the normal
-          # path (cache-lifecycle ran) includes the archive exactly as before.
+          # QUALIFICATION_ARCHIVE and PUBLIC_RELEASE_PROOF both come from the
+          # cache-lifecycle job; skip_qualification leaves all four unset.
+          # Gate each pair on its own variable so the normal path is unchanged.
           if [[ -n "${QUALIFICATION_ARCHIVE:-}" ]]; then
             assets+=("$QUALIFICATION_ARCHIVE" "$QUALIFICATION_ARCHIVE_CHECKSUM")
           fi
+          if [[ -n "${PUBLIC_RELEASE_PROOF:-}" ]]; then
+            assets+=("$PUBLIC_RELEASE_PROOF" "$PUBLIC_RELEASE_PROOF_CHECKSUM")
+          fi
           assets+=(
-            "$PUBLIC_RELEASE_PROOF"
-            "$PUBLIC_RELEASE_PROOF_CHECKSUM"
             "target/package/hf2q-${EXPECTED_VERSION}.crate"
             "$RUNNER_TEMP/release-crate.sha256"
           )
@@ -412,9 +414,10 @@ jobs:
           if [[ -n "${QUALIFICATION_ARCHIVE:-}" ]]; then
             assets+=("$QUALIFICATION_ARCHIVE" "$QUALIFICATION_ARCHIVE_CHECKSUM")
           fi
+          if [[ -n "${PUBLIC_RELEASE_PROOF:-}" ]]; then
+            assets+=("$PUBLIC_RELEASE_PROOF" "$PUBLIC_RELEASE_PROOF_CHECKSUM")
+          fi
           assets+=(
-            "$PUBLIC_RELEASE_PROOF"
-            "$PUBLIC_RELEASE_PROOF_CHECKSUM"
             "target/package/hf2q-${EXPECTED_VERSION}.crate"
             "$RUNNER_TEMP/release-crate.sha256"
           )
@@ -523,9 +526,13 @@ jobs:
               "hf2q-${EXPECTED_VERSION}-qualification.tar.gz.sha256"
             )
           fi
+          if [[ -n "${PUBLIC_RELEASE_PROOF:-}" ]]; then
+            names+=(
+              "hf2q-${EXPECTED_VERSION}-release-proof.json"
+              "hf2q-${EXPECTED_VERSION}-release-proof.json.sha256"
+            )
+          fi
           names+=(
-            "hf2q-${EXPECTED_VERSION}-release-proof.json"
-            "hf2q-${EXPECTED_VERSION}-release-proof.json.sha256"
             "hf2q-${EXPECTED_VERSION}.crate"
             release-crate.sha256
           )
@@ -552,9 +559,10 @@ jobs:
           if [[ -n "${QUALIFICATION_ARCHIVE:-}" ]]; then
             assets+=("$QUALIFICATION_ARCHIVE" "$QUALIFICATION_ARCHIVE_CHECKSUM")
           fi
+          if [[ -n "${PUBLIC_RELEASE_PROOF:-}" ]]; then
+            assets+=("$PUBLIC_RELEASE_PROOF" "$PUBLIC_RELEASE_PROOF_CHECKSUM")
+          fi
           assets+=(
-            "$PUBLIC_RELEASE_PROOF"
-            "$PUBLIC_RELEASE_PROOF_CHECKSUM"
             "target/package/hf2q-${EXPECTED_VERSION}.crate"
             "$RUNNER_TEMP/release-crate.sha256"
           )
