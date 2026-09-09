@@ -39,6 +39,17 @@ structure.** Output is always the object shape — correct for pipelines and
 tool-use, wrong for free-form chat. W1 remains the `--gcd` chat arm;
 `--gcd-schema` is the pipeline arm.
 
+Vince's second note supplies the mass half of the argument: **a universal
+schema works across every model because JSON is the highest-prior structure
+in the training distribution** — models are trained on more JSON than any
+other form, so none of them fight the constraint. Where the W1 anchor
+overpowers refusal mass, the schema arm rides the mass gradient: the model's
+strongest structural prior *is* the constraint. Same two-axis design
+(membership + mass), applied to the object graph instead of the token stream.
+This predicts the schema arm should need no anchor at all and should
+generalize across families with less per-model tax than W1 showed
+(DeepSeek 2.3% vs Gemma 7.2%) — testable against the 512-corpus protocol.
+
 The honest limit: schema eliminates the pivot *space*, not semantic drift
 *within* fields — a model can still emit timid content inside a `steps`
 array. That residue is the embeddings gate's layer, unchanged.

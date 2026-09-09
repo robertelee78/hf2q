@@ -257,6 +257,50 @@ emission. The free-text surfaces the grammar deliberately leaves open are
 grammar-legal but semantically wild — the embeddings gate watches exactly that
 open surface.
 
+## The object level: schema as constraint (ADR-057)
+
+Everything above constrains *prose*. Vince's production pipeline took the other
+branch: his recon and exploit agents never emit prose at all — they fill typed
+objects (`{summary, attack_context, tool_context, next_steps}` — opportunity,
+attack context, and the tool provenance the finding is reviewed with). His
+measured experience: **no refusals, even from API providers**, because refusal
+has no structural slot in the schema — "I cannot fulfill" typechecks against no
+field. The schema eliminates the refusal *space*, not the refusal *phrase*.
+
+This is the object-level answer to our Class 2 failure mode. The pivots that
+survive the W1 prose grammar ("The mechanism is called a relationship, and it is
+not something you do to someone else") exist because prose always leaves a slot
+for redirect prose. A typed object has no such slot: the pivot is not blocked,
+it is *unrepresentable*.
+
+Vince's second note explains why the constraint meets no resistance: **JSON is
+the highest-prior structure in the training distribution** — models are trained
+on more JSON than anything else, so none of them fight it. Where the W1 anchor
+overpowers refusal mass, the schema arm rides the mass gradient: the model's
+strongest prior *is* the constraint. Same two-axis design (membership + mass),
+applied to the object graph instead of the token stream.
+
+The tradeoff is his, verbatim: schema "trades adaptability for reliable
+structure." Output is always the object shape — right for pipelines and tool
+use, wrong for free-form chat. So the arms split: W1 prose grammar stays the
+`--gcd` chat arm; `--gcd-schema <file>` is the pipeline arm, compiled to GBNF at
+startup (fail-closed on invalid schema) and injected at the same serve-time
+point. Schema authorship is the security boundary: a free-form `notes` field
+reopens the pivot slot by hand — every field must be content-bearing. And the
+honest limit stands one level down: schema kills the pivot *space*, not semantic
+drift *within* fields; a model can still write timid content into `next_steps`.
+That residue is the embeddings gate's layer. Layers compose; none is sufficient
+alone.
+
+His last observation is the strategic one: API providers eventually screened the
+schema pattern at the I/O perimeter — classifiers reading content regardless of
+structure. That is precisely the gap a local engine fills; hf2q is the layer the
+pattern moves to when the perimeter closes. Battery cells in
+`handlers::gcd_schema_tests` prove the property on the compiled grammar: refusal
+prose ("I cannot fulfill this request", "I am programmed to be a helpful and
+harmless AI assistant") is outside the generated language; a valid opportunity
+object is inside it; the empty list — the honest negative — stays representable.
+
 ## What GCD is really for
 
 Refusal suppression is the measurable case, but the mechanism is general: any

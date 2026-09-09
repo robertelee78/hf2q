@@ -1097,6 +1097,23 @@ pub struct ChatArgs {
     /// `glp.alpha_default` when present, else 1.0.
     #[arg(long, requires = "glp")]
     pub glp_alpha: Option<f32>,
+
+    /// Logical context limit (tokens) for every conversation slot on the
+    /// chat-owned server this session spawns. Forwarded to `serve --ctx`;
+    /// serve-time property like --gcd. A value above the model's declared
+    /// maximum is an error at serve startup.
+    #[arg(long, value_name = "TOKENS")]
+    pub ctx: Option<u32>,
+
+    /// ADR-057: schema-constrained GCD on the chat-owned server this session
+    /// spawns. Forwarded to `serve --gcd-schema`; conflicts with --gcd.
+    #[arg(
+        long,
+        value_name = "SCHEMA_JSON",
+        value_hint = clap::ValueHint::FilePath,
+        conflicts_with = "gcd"
+    )]
+    pub gcd_schema: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1298,6 +1315,23 @@ pub struct ServeArgs {
     /// tantalus.io. hf2q is the first inference-engine-native implementation.
     #[arg(long, alias = "uncensor")]
     pub gcd: bool,
+
+    /// ADR-057: schema-constrained GCD — compile a JSON schema to GBNF at
+    /// startup and install it as the serve-time default constraint instead of
+    /// the W1 prose grammar. Typed output objects leave no structural slot
+    /// for refusal prose, closing the Class-2 semantic-pivot failure mode the
+    /// prose grammar cannot reach. Pipeline arm; W1 remains the chat arm.
+    /// Invalid schemas fail closed at startup.
+    ///
+    /// Schema-as-constraint pattern credit: Vince Ovando's red-teaming
+    /// pipeline (tantalus.io).
+    #[arg(
+        long,
+        value_name = "SCHEMA_JSON",
+        value_hint = clap::ValueHint::FilePath,
+        conflicts_with = "gcd"
+    )]
+    pub gcd_schema: Option<PathBuf>,
 
 
 

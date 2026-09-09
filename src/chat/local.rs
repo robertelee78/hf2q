@@ -38,6 +38,8 @@ pub(crate) struct OwnedServeFlags {
     pub gcd: bool,
     pub glp: Option<std::path::PathBuf>,
     pub glp_alpha: Option<f32>,
+    pub ctx: Option<u32>,
+    pub gcd_schema: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -126,6 +128,8 @@ async fn resolve_local(
             gcd: args.gcd,
             glp: args.glp.clone(),
             glp_alpha: args.glp_alpha,
+            ctx: args.ctx,
+            gcd_schema: args.gcd_schema.clone(),
         },
     )
     .context("start hf2q serve")?;
@@ -296,6 +300,12 @@ fn append_owned_server_args(
     }
     if let Some(alpha) = flags.glp_alpha {
         command.arg("--glp-alpha").arg(alpha.to_string());
+    }
+    if let Some(ctx) = flags.ctx {
+        command.arg("--ctx").arg(ctx.to_string());
+    }
+    if let Some(gcd_schema) = &flags.gcd_schema {
+        command.arg("--gcd-schema").arg(gcd_schema);
     }
 }
 
@@ -711,6 +721,8 @@ mod tests {
                 gcd: true,
                 glp: Some(std::path::PathBuf::from("/tmp/vector.gguf")),
                 glp_alpha: Some(6.0),
+                ctx: Some(65536),
+                gcd_schema: Some(std::path::PathBuf::from("/tmp/schema.json")),
             },
             42,
             43,
@@ -726,6 +738,10 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--glp", "/tmp/vector.gguf"]));
         assert!(args.windows(2).any(|pair| pair == ["--glp-alpha", "6"]));
+        assert!(args.windows(2).any(|pair| pair == ["--ctx", "65536"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--gcd-schema", "/tmp/schema.json"]));
     }
 
     #[cfg(unix)]

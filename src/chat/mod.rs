@@ -644,6 +644,8 @@ mod tests {
                 gcd: false,
                 glp: None,
                 glp_alpha: None,
+                ctx: None,
+                gcd_schema: None,
             },
             &mut resolver,
         )

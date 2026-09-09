@@ -4333,6 +4333,29 @@ pub fn cmd_serve(
         default_tool_thinking_token_budget: behavior.tool_thinking_token_budget,
         gcd: args.gcd,
         glp_path: args.glp.clone(),
+        // ADR-057: schema-constrained GCD. Compile the operator's JSON schema
+        // to GBNF at startup; any load/parse/compile error aborts startup
+        // (fail-closed, same posture as the GLP reader).
+        gcd_schema_grammar: match &args.gcd_schema {
+            Some(path) => {
+                let raw = std::fs::read_to_string(path).with_context(|| {
+                    format!("--gcd-schema: cannot read {}", path.display())
+                })?;
+                let schema: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+                    format!("--gcd-schema: {} is not valid JSON", path.display())
+                })?;
+                let gbnf = api::grammar::json_schema::schema_to_gbnf(&schema).map_err(|e| {
+                    anyhow::anyhow!("--gcd-schema: {} failed GBNF compilation: {e}", path.display())
+                })?;
+                eprintln!(
+                    "[GCD] schema constraint compiled from {} ({} bytes GBNF)",
+                    path.display(),
+                    gbnf.len()
+                );
+                Some(gbnf)
+            }
+            None => None,
+        },
     };
 
     // Warn when exposing beyond localhost. Decision #7 + #13 — public-internet

@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ReconOpportunities",
+  "description": "ADR-057 example for `hf2q serve --gcd-schema`: Vince Ovando's recon-pipeline object shape (tantalus.io) — a list of opportunities, each carrying the suspected attack, its context, and the tool provenance that grounds it. Design rationale: (1) every field is content-bearing with minLength so no field can hold refusal prose; (2) additionalProperties:false at every level so no pivot slot exists; (3) tool_context makes each opportunity reviewable with the tool that produced it — the anti-hallucination anchor, since an opportunity without replayable evidence cannot validate; (4) the top-level list may be empty: a legitimate 'nothing found' is a valid result, the schema forbids refusal prose, not negative results.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["opportunities"],
+  "properties": {
+    "opportunities": {
+      "type": "array",
+      "description": "Zero or more suspected attack opportunities. Empty means recon found nothing — an honest negative, not a refusal.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary", "attack_context", "tool_context", "next_steps"],
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The suspected attack in one statement: what it is and why it looks viable."
+          },
+          "attack_context": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Where the attack applies: target component, preconditions, exposure. The 'why here' that a reviewer needs before trusting the summary."
+          },
+          "tool_context": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tool", "invocation", "evidence"],
+            "description": "Provenance grounding this opportunity — the object is reviewed with this tool context. An opportunity whose evidence cannot be replayed is treated as unverified.",
+            "properties": {
+              "tool": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Name of the tool that produced the evidence (e.g. nmap, nuclei, a custom agent tool)."
+              },
+              "invocation": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact command or call that produced the evidence — replayable by the reviewer."
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The raw observation (output excerpt, response, artifact) that grounds the opportunity."
+              }
+            }
+          },
+          "next_steps": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Where the exploit stage picks up: concrete verification or exploitation actions. An opportunity with no direction is not an opportunity.",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    }
+  }
+}

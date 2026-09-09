@@ -108,6 +108,11 @@ pub struct ServerConfig {
     /// uses the B14 shape (let GLP reasoning run, force answer) instead of
     /// the anchor shape (force frame + answer). GLP concept: Matt Suiche.
     pub glp_path: Option<PathBuf>,
+    /// ADR-057: schema-constrained GCD. When Some, holds the GBNF compiled
+    /// from the operator's JSON schema at startup (fail-closed compile) and
+    /// injected as the serve-time default constraint in place of the W1
+    /// prose grammar. Pattern credit: Vince Ovando's red-teaming pipeline.
+    pub gcd_schema_grammar: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -130,6 +135,7 @@ impl Default for ServerConfig {
             default_tool_thinking_token_budget: None,
             gcd: false,
             glp_path: None,
+            gcd_schema_grammar: None,
 
         }
     }
