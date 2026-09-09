@@ -462,10 +462,13 @@ pub async fn chat_completions(
             // ADR-053: `--gcd` injects the GCD grammar (Grammar-Constrained
             // Decoding — Vince Ovando, tantalus.io) into requests that do
             // not already specify a grammar. The embedded grammar is the
-            // measured W1 campaign winner (scripts/grammar_probe/FINDINGS.md):
-            // anchor + topic sentence + KMP exclusion automaton + character
-            // whitelist. Shipped via include_str! so it is the same file the
-            // campaign measured, not a hand-copied approximation.
+            // measured campaign winner, currently W6V2 (2026-09-09): the W1
+            // anchor + topic sentence + whitelist shape over the harvested
+            // three-lineage refusal-lexicon cores (variation-surviving forms;
+            // zero-FP across 2,551 fulfillments; halved the degenerate rate
+            // and cut refusals 38→29 on the hardest-slice Gemma retest vs W1).
+            // Shipped via include_str! so it is the same file the campaign
+            // measured, not a hand-copied approximation.
             const GCD_GRAMMAR: &str = include_str!("grammar/gcd_w1.gbnf");
             if state.config.gcd && request.grammar.is_none() && request.response_format.is_none() {
                 eprintln!("[GCD] injecting grammar");

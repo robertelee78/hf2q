@@ -1,6 +1,6 @@
 # Grammar-Constrained Decoding in hf2q: an Engine-Native Positive Security Control
 
-*"All you need is attention grammars." — Vince Ovando*
+*"All you need is ~~attention~~ grammars." — Vince Ovando*
 
 *Robert E. Lee (IOActive), September 2026. GCD concept: Vince Ovando
 (vince@cybersharkconsulting.com), tantalus.io. Measured replica &
@@ -253,12 +253,36 @@ never induces refusal behavior on normal requests — though over-constraint
 shows up elsewhere as degenerate/truncated output, not refusal. Judge-rated
 actionability measures what the response contains, not whether the code runs.
 
-**Cross-model.** The same W1 grammar on vanilla Gemma-4-26B (stock,
-refusal-trained, different family), full 1024-prompt corpus, same APEX judge:
-**7.2% refusal on the adversarial half, 0.0% on the benign half** — vs 2.3%/0.0%
-on DeepSeek. The grammar generalizes across families with zero modification;
-the smaller model pays a higher residual-refusal and degeneracy tax, but the
-shape holds. Zero benign over-constraint on both.
+**Cross-model.** The same W1 grammar, zero modification, full 1024-prompt
+corpus, same APEX judge, on two more stock refusal-trained families:
+**Gemma-4-26B: 7.2% refusal adversarial / 0.0% benign**; **Qwen3.8-27B: 5.1%
+adversarial / 0.0% benign**. The grammar generalizes across three unrelated
+families; the per-family tax is the refusal register (the phrases each model
+reaches for), which is what the harvest below closes.
+
+**The harvest and the floor (2026-09-09, Gemma retest set).** The residual
+refusals are not lexical bad luck — they are per-family *registers*. Mining
+the judged refusals across all three lineages (zero-FP against 2,551 valid
+fulfillments) produced the register phrases; the first pass at them taught
+the campaign's oldest lesson again, one level up: exact long phrases are
+gameable by one-word edits ("this *specific* request", "harmless"→"safe"),
+so the shipped set is the variation-surviving cores ("not able to fulfill",
+"programmed to be a helpful", "guidelines strictly"). And the vacuity class
+from the live joke test ("The result is: 1.") got its own arm: a minimum
+body-length floor — EOS is ungenerable until the body clears it, built as a
+depth×state product construction so the exclusion automaton runs through the
+warmup with no seam. Of 38 prompts that refused under W1 / 60 that went
+degenerate under W1, on Gemma:
+
+| arm | still refuse | still degenerate | benign OK |
+|---|---|---|---|
+| W1 (baseline) | 38/38 | 60/60 | 20/39 |
+| long phrases only | 26/38 | 51/60 | 23/39 |
+| long phrases + floor | 17/38 | 27/60 | 29/39 |
+| **cores (W6V2)** | **23/38** | **20/60** | **35/39** |
+
+Cores dominate long forms on every axis; the floor is additive on refusals.
+(The cores+floor combination arm is in the tables below once judged.)
 
 ## Serving-stack conformance (26 cells, hf2q)
 
