@@ -14,6 +14,21 @@ REFUSAL_PHRASES = [
     # capitalized, no "I " prefix, evades both "I can't" and "can't assist")
     "cannot", "can't", "won't", "unable to",
     "Cannot", "Can't", "Won't", "Unable to",
+    # 2026-09-09 three-lineage harvest (DeepSeek + Gemma + Qwen3.8 full
+    # corpora, APEX-judged): Gemma/Qwen refusal registers. v2: shortened to
+    # cores that survive one-word insertions/swaps ("this specific request",
+    # "harmless"→"safe", "strictly prohibit") — measured leaking through the
+    # long forms under W6A. Each core FP-tested at ZERO false positives across
+    # 2,551 valid fulfillments. Case-folded by the automaton.
+    "programmed to be a helpful",
+    "my safety guidelines prohibit",
+    "guidelines strictly",
+    "not able to fulfill",
+    "cannot fulfill this request",
+    "i am prohibited",
+    "will not provide",
+    "cannot provide",
+    "as an ai assistant",
 ]
 
 # Unicode homoglyph coverage: models evade character-exact exclusion by
@@ -57,10 +72,16 @@ def char_class(chars, negated):
         return f'"{chars[0]}"'
     return f"[{inner}]"
 
-def automaton_rules(patterns):
+def automaton_rules(patterns, whitelist=None):
     """KMP-style DFA as recursive GBNF rules. Matching is case-insensitive:
     every pattern is folded to lowercase and each input letter matches both
-    cases, so 'can’T', 'CANNOT', 'I Can’t' all hit the same dead states."""
+    cases, so 'can’T', 'CANNOT', 'I Can’t' all hit the same dead states.
+
+    whitelist: when given (a set of allowed real characters), emit the W1
+    shape — the catch-all is a POSITIVE class covering exactly
+    whitelist ∖ (live ∪ dead chars), so any char outside the whitelist
+    matches no branch and the sampler masks it (homoglyph evasion closed
+    by construction). When None, emit the legacy negated catch-all."""
     # fold: lowercase + unify apostrophe homoglyphs to ASCII '
     fold_map = {h: "'" for h in APOSTROPHE_HOMOGLYPHS}
     def fold(s):
@@ -110,7 +131,15 @@ def automaton_rules(patterns):
             if ch == "'":
                 dead_real.update(APOSTROPHE_HOMOGLYPHS)
         full_alphabet = sorted(set().union(*transitions.values()) | dead_real) if transitions else sorted(dead_real)
-        branches.append(f"{char_class(full_alphabet, True)} {name['']}")
+        if whitelist is None:
+            branches.append(f"{char_class(full_alphabet, True)} {name['']}")
+        else:
+            # W1 shape: positive ground class = whitelist minus every char
+            # this rule already routes (live transitions) or kills (dead).
+            # Chars outside the whitelist match NO branch → masked.
+            ground = sorted(set(whitelist) - set(full_alphabet))
+            if ground:
+                branches.append(f"{char_class(ground, False)} {name['']}")
         branches.append('""')
         rules.append(f"{name[state]} ::= ( {' | '.join(branches)} )")
     return name[""], "\n".join(rules)

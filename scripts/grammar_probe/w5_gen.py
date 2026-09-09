@@ -16,14 +16,13 @@ a banned phrase straddling the floor boundary still dies (no seam).
 The automaton rules are reused verbatim from w1.gbnf (the measured file),
 not regenerated — zero drift from the campaign artifact.
 
-Usage: python3 w5_gen.py [L] > w5.gbnf        (default L=48)
+Usage: python3 w5_gen.py [L] [base.gbnf] > w5.gbnf   (defaults: L=48, w1.gbnf)
 """
 import re
 import sys
 import os
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-W1 = os.path.join(SCRIPT_DIR, "w1.gbnf")
 
 RULE_RE = re.compile(r"^([A-Za-z0-9_]+) ::= (?:\( )?(.*?)(?: \))?$")
 
@@ -52,7 +51,8 @@ def retarget(body, depth, floor):
 
 def main():
     floor = int(sys.argv[1]) if len(sys.argv) > 1 else 48
-    rules, order = parse_rules(open(W1).read())
+    base = sys.argv[2] if len(sys.argv) > 2 else os.path.join(SCRIPT_DIR, "w1.gbnf")
+    rules, order = parse_rules(open(base).read())
 
     automaton_states = [n for n in order if n.startswith("b18s")]
     assert "b18s0" in rules, "automaton ground state missing"
