@@ -94,6 +94,38 @@ per-authz grammar makes unauthorized members ungenerable. Whether the control
 guards what the model *says* or what it *does*, the enforcement point is the
 same.
 
+## The stack, on two axes
+
+Matt Suiche's map of the machinery (2026-09-09, weightless × hf2q, v4 after
+our review pass — EOS gating, the alternate-path seam, the template layer,
+and GLP deployment-scope are in the diagram as drawn):
+
+![The request lifecycle × the forward pass — where GLP and GCD sit](figures/fig3_stack.png)
+
+The request lifecycle runs left to right (text → tokenize → prefill → decode →
+detokenize); the mask and sampler act only where a token is *chosen* — the last
+prefill position and every decode step. Inside each forward pass: embedding →
+layers (attention reads across tokens, the FFN writes per-token knowledge —
+and is refusal's main writer) → unembedding → logits → **grammar mask** →
+sampler. GLP edits the residual draft per layer, inside the pass; GCD filters
+token ids after the logits, outside the model. The automaton never reads the
+prompt; it tracks the exit.
+
+hf2q-specific deltas from the diagram as drawn: (1) hf2q computes the candidate
+set per step by collective filtering over a cached vocab byte table — the
+per-state bitmask cache shown in the automaton box is the xgrammar optimization
+class, parked for us as an ADR-054 follow-up; (2) vocab size and layer count
+are per model (129K–262K vocab across our subjects); (3) entry-mass
+concentration measured twice: 99.85% on Qwen3.6 (their replica), 99.97% on
+DeepSeek (ours); (4) the GLP box's "derivation stays prompt-driven, never
+forced" line is stale on both sides — the forced-capture arm (both prefixes
+pinned, teacher-forced prefill) is in gate-2 evaluation (issue #192).
+
+The failure map at the bottom is the vacuity case placed on the stack: pressure
+born in the residual stream, exits closed by the mask, mass pooling in the
+emptiest legal shape — "The result is: 1." Membership edits can't move mass;
+that is what a grammar *is*.
+
 ## Measuring the refuser while it fires
 
 **Definitions used throughout.** *W1* is the winning grammar arm from our
