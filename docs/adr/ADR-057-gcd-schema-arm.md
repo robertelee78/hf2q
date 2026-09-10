@@ -5,10 +5,11 @@
   handlers, chat forwarding, `examples/recon-opportunities.schema.json`, and
   the `gcd_schema_tests` battery cells (including the tightened-subschema
   and observability refinements from issue #192). The lockdown mode
-  (`--gcd-schema-locked`) documented below is implemented on branch
-  `fix/gcd-schema-locked`: the flag (requires `--gcd-schema`), the 400
-  rejection in the handlers ahead of the undeclared-params check, chat
-  forwarding, and the `gcd_schema_lockdown_tests` battery cells.
+  (`--gcd-schema-locked`) requires `--gcd-schema`. Its request contract
+  checks caller controls before injecting the trusted schema, rejects
+  incompatible tool and lazy-grammar controls, and forwards through chat.
+  `src/serve/api/gcd_policy_tests.rs` covers policy composition, retained
+  grammar semantics, and unary/SSE request admission through the real router.
 - **Date:** 2026-09-09
 - **Related:** ADR-053 (GLP/GCD serving surface), ADR-055 (alphabet presets),
   ADR-056 (conformance battery), ADR-052 (structured-output compatibility)
@@ -105,13 +106,26 @@ hypothetical; it is the round that could not be broken.
 - `--gcd` and `--gcd-schema` are mutually exclusive on one serve process: one
   default constraint per server. Invalid schemas fail closed at startup
   (compile error, exit) — identical posture to GLP reader conformance.
-- **Lockdown mode (control vs convenience).** Default injection defers to a
-  caller-supplied `grammar`/`response_format` — right for refusal-suppression-
-  as-convenience, wrong when the constraint is a security boundary. Tantalus
-  lesson: server-side defaults that are controls must be non-overridable.
-  `--gcd-schema-locked` (or `[serve] gcd_schema_locked`) makes the constraint
-  mandatory: requests carrying their own `grammar`/`response_format` are
-  rejected 400 rather than deferred to.
+- **Lockdown mode (control vs convenience).** Unlocked defaults defer to
+  caller-supplied `grammar`, `response_format`, `json_schema`, or
+  `structured_outputs`. `--gcd-schema-locked` makes the configured schema
+  mandatory for response output. One composed request-policy function checks
+  the original caller request before injecting that schema; the injected
+  grammar must never be mistaken for a caller override. A request carrying
+  any of those four output surfaces receives HTTP 400 naming the field.
+- **Locked output scope.** Tool definitions are accepted only with explicit
+  `tool_choice: "none"`, which the existing preparation path removes from the
+  model's tool context. `tool_choice: "required"` and named-function choices
+  receive HTTP 400; nonempty tools with `"auto"` or omitted choice also
+  receive HTTP 400. With no tools, omitted/`"auto"`/`"none"` choices retain
+  the schema. This policy prevents native tool-grammar precedence from
+  replacing the locked response schema. It does not compile tool permissions
+  or authenticate the caller; applications still own those responsibilities.
+- **Immediate activation.** Locked requests cannot supply `grammar_lazy`,
+  `preserved_tokens`, or `grammar_triggers`, including empty/false values.
+  The server schema must apply from the first generated token. All policy
+  errors are ordinary JSON HTTP 400 responses before model resolution or SSE
+  startup. Unlocked grammar and tool behavior remains unchanged.
 - Chat forwarding follows the ADR-053 pattern: `hf2q chat <model>
   --gcd-schema <file>` forwards to the chat-owned serve child.
 - **Schema authorship is the security boundary.** Fields must be
@@ -131,6 +145,13 @@ hypothetical; it is the round that could not be broken.
 
 ## Consequences
 
+- Regression tests drive the production Axum router with both `stream: false`
+  and `stream: true`. A not-ready state deliberately stops admitted requests
+  before model loading; policy rejections remain HTTP 400 and accepted policy
+  requests reach the downstream readiness response. Compiled-grammar tests
+  separately prove that every admitted locked tool-choice combination retains
+  the schema and rejects objects outside it. These model-free tests do not
+  replace real-model unary/SSE completion and multi-turn serving validation.
 - Reuses existing machinery wholesale: schema→GBNF conversion, the mask path,
   the injection point, chat forwarding. New surface is one flag + startup
   compile + docs.

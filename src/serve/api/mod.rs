@@ -34,6 +34,7 @@ pub mod engine_deepseek4;
 pub mod engine_qwen35;
 pub mod engine_qwen3vl;
 mod engine_supervisor;
+mod gcd_policy;
 pub mod grammar;
 pub mod handlers;
 pub mod kv_spill_descriptor;

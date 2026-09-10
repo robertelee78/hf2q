@@ -1388,10 +1388,10 @@ pub struct ServeArgs {
     pub gcd_schema: Option<PathBuf>,
 
     /// ADR-057 lockdown mode: make the --gcd-schema constraint mandatory
-    /// policy instead of a serve-time default. Requests carrying their own
-    /// `grammar`, `response_format`, `structured_outputs`, or `json_schema`
-    /// are rejected 400 rather than deferred to — the Tantalus lesson that
-    /// a server-side default which is a control must be non-overridable.
+    /// for response output instead of a serve-time default. Caller output
+    /// constraints and lazy-grammar modifiers are rejected with HTTP 400.
+    /// Tool definitions require tool_choice='none'; required/named tool
+    /// choices cannot replace the locked schema with a tool-call grammar.
     #[arg(long, requires = "gcd_schema", default_value_t = false)]
     pub gcd_schema_locked: bool,
 

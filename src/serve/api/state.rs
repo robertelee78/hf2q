@@ -114,9 +114,9 @@ pub struct ServerConfig {
     /// prose grammar. Pattern credit: Vince Ovando's red-teaming pipeline.
     pub gcd_schema_grammar: Option<String>,
     /// ADR-057 lockdown mode (`--gcd-schema-locked`, requires the schema
-    /// grammar above): the constraint is mandatory policy, not a
-    /// serve-time default. Requests carrying any explicit constraint
-    /// surface are rejected 400 instead of silently overriding it.
+    /// grammar above): the response constraint cannot be overridden or
+    /// deferred by caller grammar controls. Tool definitions require
+    /// tool_choice="none"; required/named tool choices are rejected.
     pub gcd_schema_locked: bool,
 }
 
