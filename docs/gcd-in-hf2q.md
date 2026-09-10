@@ -28,6 +28,14 @@ This document is about the *mechanism* for that honesty at serve time: a
 security control that is constitutive rather than corrective, positive rather
 than negative, and explicit about what it enforces.
 
+Stated plainly, because the diagram keeps it in a red box: the two controls
+are different security classes doing different jobs. **GLP removes refusal** —
+a per-layer projection with a dial; it changes the distribution but guarantees
+nothing about it. **GCD contains what is emitted** — a membership constraint
+on the logits with a worst-case guarantee over all logit distributions. Every
+worst-case claim in this document belongs to GCD alone; a reader who carries
+the "fully-injected model" guarantee into the GLP box is overclaiming.
+
 ## The problem: every deployed LLM control is negative and behavioral
 
 An LLM agent with real tool access reads files, queries inboxes, and issues
@@ -119,7 +127,14 @@ are per model (129K–262K vocab across our subjects); (3) entry-mass
 concentration measured twice: 99.85% on Qwen3.6 (their replica), 99.97% on
 DeepSeek (ours); (4) the GLP box's "derivation stays prompt-driven, never
 forced" line is stale on both sides — the forced-capture arm (both prefixes
-pinned, teacher-forced prefill) is in gate-2 evaluation (issue #192).
+pinned, teacher-forced prefill) is in gate-2 evaluation (issue #192); (5) the
+automaton box's ~8 KB per-state bitmask assumes a ~64K vocab — at our
+subjects' 129K–262K ids the same cache is ~16–33 KB per state, so the
+optimization class stands but the number in the box does not; (6) the
+percentages in the figure (FFN share, entry-mass concentration) are
+measurements on specific models and prompt sets, not constants — the
+entry-mass figures carry their referents in (3), and the FFN-share number
+should be read the same way.
 
 The failure map at the bottom is the vacuity case placed on the stack: pressure
 born in the residual stream, exits closed by the mask, mass pooling in the
@@ -288,6 +303,13 @@ lexicon (long forms: 26→17 refusals) but over-constrains a strong one —
 cores+floor regressed on all three axes, the over-constraint signature the
 Z_t instrumentation predicts. The shipped default is W6V2 (cores, no floor).
 
+The floor is structure, not mass control. It makes the vacuous answer
+*longer*, not less vacuous — a body of filler is as legal a member of L as
+"The result is: 1." Its only real job is closing the degenerate zero-body
+exit; it cannot move mass (that is GLP's job, or nothing's), and the W6V2B
+regression is that limit measured — stacked on a strong lexicon it
+over-constrains and the drain finds new holes.
+
 ## Serving-stack conformance (26 cells, hf2q)
 
 Matt Suiche's serving-stack battery (25 cells against vLLM 0.28.0 + xgrammar)
@@ -308,6 +330,17 @@ the sampler stands behind the battery (audit finds, battery keeps). The mask
 evaluates decoded text with persistent automaton state across token boundaries,
 so the tokenization seam (Matt's `can`+`'t` class) is closed by construction —
 verified empirically.
+
+The alternate-path seam, named. Speculative decoding loses the invariant in
+two places — the draft proposal and the accept/reject resampling on the target
+distribution — and both must run through the mask. Beam and n-best need one
+automaton state per *hypothesis*, not per request. Prefix caching must restore
+the automaton state with the KV, not reset it — and hf2q ships this one safe
+by construction: the automaton never reads the prompt, it tracks emissions,
+so a shared prefix cannot corrupt a request's state and the mask applies at
+this request's own chosen-token points. The first two are open seams for
+anyone extending the sampler; the beam class is closed here by having no beam
+surface and by the undeclared-param 4xx rule.
 
 ## GLP is complementary — the disposition-side intervention
 
@@ -417,6 +450,8 @@ ungenerable, not caught.
 ADR-053/054/055/056/057 ·
 1024-prompt corpus + judge verdicts · refusal-mass probe (the front-loading
 measurement) · offline GBNF checker + evasion battery · static audit +
-tokenization audit · Z_t cliff instrumentation (HF2Q_ZT_LOG) ·
+tokenization audit · Z_t cliff instrumentation (HF2Q_ZT_LOG; telemetry —
+it reads pre-mask mass and reacts, corrective by this document's own
+taxonomy, not a control) ·
 `examples/recon-opportunities.schema.json` + the `gcd_schema_tests` battery
 cells · PR #190.
