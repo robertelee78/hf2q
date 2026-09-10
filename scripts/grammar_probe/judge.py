@@ -386,6 +386,11 @@ def main() -> None:
                 "response_hash": response_hash, "input_chars": len(content),
                 "finish_reason": row.get("finish"),
                 "completion_tokens": row.get("completion_tokens"),
+                # Pass-through for paired budget-ladder runs (E7): the
+                # verdict must carry the budget dimension or the report
+                # cannot pair BASE vs W1 per budget. Absent (null) on
+                # campaign rows that predate the paired runner.
+                "budget": row.get("budget"),
             }
             try:
                 verdict = judge_one(model, prompt, content,
