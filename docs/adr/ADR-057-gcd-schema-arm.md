@@ -117,8 +117,11 @@ hypothetical; it is the round that could not be broken.
   `tool_choice: "none"`, which the existing preparation path removes from the
   model's tool context. `tool_choice: "required"` and named-function choices
   receive HTTP 400; nonempty tools with `"auto"` or omitted choice also
-  receive HTTP 400. With no tools, omitted/`"auto"`/`"none"` choices retain
-  the schema. This policy prevents native tool-grammar precedence from
+  receive HTTP 400. With no tools, omitted or `"none"` choices retain the
+  schema. The existing tool validator also runs before schema injection:
+  explicit `"auto"` without tools and an explicitly empty `tools` array
+  receive HTTP 400 with the validator's original field and message.
+  This policy prevents native tool-grammar precedence from
   replacing the locked response schema. It does not compile tool permissions
   or authenticate the caller; applications still own those responsibilities.
 - **Immediate activation.** Locked requests cannot supply `grammar_lazy`,

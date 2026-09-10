@@ -62,8 +62,6 @@ fn explicit_constraints() -> Vec<(&'static str, Value)> {
 fn allowed_requests() -> Vec<Value> {
     vec![
         json!({}),
-        json!({"tool_choice": "auto"}),
-        json!({"tool_choice": "auto", "tools": []}),
         json!({"tool_choice": "none"}),
         json!({"tool_choice": "none", "tools": [tool()]}),
     ]
@@ -77,7 +75,6 @@ fn rejected_tool_requests() -> Vec<(&'static str, Value)> {
             "tool_choice",
             json!({"tools": [tool()], "tool_choice": "required"}),
         ),
-        ("tool_choice", json!({"tool_choice": "required"})),
         (
             "tool_choice",
             json!({
@@ -85,6 +82,18 @@ fn rejected_tool_requests() -> Vec<(&'static str, Value)> {
                 "tool_choice": {"type": "function", "function": {"name": "lookup"}}
             }),
         ),
+    ]
+}
+
+fn invalid_tool_requests() -> Vec<(&'static str, Value)> {
+    vec![
+        ("tool_choice", json!({"tool_choice": "auto"})),
+        ("tools", json!({"tool_choice": "auto", "tools": []})),
+        ("tools", json!({"tool_choice": "none", "tools": []})),
+        ("tools", json!({"tools": []})),
+        ("tool_choice", json!({"tool_choice": "required"})),
+        ("tool_choice", json!({"tool_choice": "sometimes"})),
+        ("tool_choice", json!({"tool_choice": {"type": "function"}})),
     ]
 }
 
@@ -148,15 +157,20 @@ fn locked_policy_rejects_caller_constraints_and_activation_modifiers_before_muta
 #[test]
 fn locked_policy_rejects_tool_precedence_and_malformed_choices() {
     let config = schema_config(true);
-    for (param, extra) in rejected_tool_requests().into_iter().chain([
-        ("tool_choice", json!({"tool_choice": "sometimes"})),
-        ("tool_choice", json!({"tool_choice": {"type": "function"}})),
-    ]) {
+    for (param, extra) in rejected_tool_requests()
+        .into_iter()
+        .chain(invalid_tool_requests())
+    {
         let mut req = request(extra.clone());
+        let validation_error = grammar::request::validate_tool_request(&req).err();
         let error = apply_gcd_policy(&config, &mut req).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST, "{extra}");
         assert_eq!(error.error.param.as_deref(), Some(param), "{extra}");
+        if let Some(expected) = validation_error {
+            assert_eq!(error.error.message, expected.message, "{extra}");
+        }
         assert!(req.grammar.is_none(), "{extra}");
+        assert_eq!(req.hf2q_enable_thinking, Some(true), "{extra}");
     }
 }
 
@@ -312,14 +326,23 @@ async fn router_rejects_locked_constraint_and_lazy_overrides_before_unary_or_sse
 #[tokio::test]
 async fn router_rejects_locked_tool_requests_before_unary_or_sse() {
     for stream in [false, true] {
-        for (param, extra) in rejected_tool_requests() {
+        for (param, extra) in rejected_tool_requests()
+            .into_iter()
+            .chain(invalid_tool_requests())
+        {
+            let validation_error =
+                grammar::request::validate_tool_request(&request(extra.clone())).err();
             let (status, body) = routed_request(schema_config(true), extra, stream).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(body["error"]["param"], param, "{body}");
-            assert!(body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("--gcd-schema-locked"));
+            if let Some(expected) = validation_error {
+                assert_eq!(body["error"]["message"], expected.message, "{body}");
+            } else {
+                assert!(body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--gcd-schema-locked"));
+            }
         }
     }
 }

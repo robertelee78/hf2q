@@ -64,8 +64,10 @@ pub(super) fn apply_gcd_policy(
                 "the server schema must remain active from the first generated token",
             ));
         }
-        let tool_choice = ToolChoiceValue::try_parse(request.tool_choice.as_ref())
-            .map_err(|message| ApiError::invalid_request(message, Some("tool_choice".into())))?;
+        // Preserve the normal tool contract before applying the additional
+        // locked-output restrictions or injecting the trusted schema.
+        let tool_choice = super::grammar::request::validate_tool_request(request)
+            .map_err(|error| ApiError::invalid_request(error.message, Some(error.param)))?;
         match tool_choice {
             ToolChoiceValue::Required | ToolChoiceValue::Function(_) => {
                 return Err(locked_request_error(
