@@ -557,37 +557,56 @@ impl Deepseek4Model {
                 &invalid_status,
                 rows,
             )?;
-            // ADR-053: GLP steering must run AFTER the FFN writes ffn_output
-            // and BEFORE dispatch_hc_post folds it into output_state —
-            // steering after the fold writes a consumed buffer and is a
-            // measured no-op (calibrate canary 2026-09-09: logit shift
-            // exactly 0.000000 with a live bound vector).
+            // GLP steering at the DeepSeek-V4 hook: the FFN writer
+            // (`ffn_output = moe + shared`), AFTER the FFN writes it and
+            // BEFORE `dispatch_hc_post` folds it into the hyper-connection
+            // state. This is the spec's `ffn_out_pre_residual` site — the
+            // same site the ds4 reference reader steers ("ffn_out = moe +
+            // shared, immediately before hc_post_one()"), and the
+            // `glp.hook_point` the published GLP-29 declares. The bind
+            // enforces that a loaded vector declares exactly this hook; a
+            // `residual_stream_post_layer` vector is refused there rather
+            // than silently reapplied at this different tensor.
+            //
+            // History (2026-09-09 canary): an earlier arrangement steered
+            // `ffn_output` AFTER `dispatch_hc_post` had already consumed it
+            // — a measured no-op (logit shift exactly 0.000000), because
+            // the fold read the buffer before the steering kernel's
+            // read-modify-write landed. That bug was about write/consume
+            // ordering on THIS buffer, not about the post-fold site being
+            // unsteerable; the fix moved the steering ahead of the fold,
+            // which is also where the spec puts the hook.
             if let Some(glp) = self.glp.as_ref() {
                 if glp.alpha != 0.0 {
-                    if let Some(direction) = glp.direction_for(layer as u32 + 1) {
+                    // Spec layer mapping: `direction.N` applies at layer N
+                    // (0-based graph layer), no offset. The earlier
+                    // `layer + 1` lookup applied every direction one layer
+                    // early — self-consistent with hf2q's own off-by-one
+                    // exporter, but wrong for interchange files (adjacent
+                    // layers' refusal directions have cosine 0.555–0.979,
+                    // so a one-layer shift degrades silently instead of
+                    // failing; only a differential layer-mapping probe
+                    // finds it — ADR-053 gate 2).
+                    if let Some(direction) = glp.direction_for(layer as u32) {
                         if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
-                            eprintln!("[GLP-APPLY] layer {layer} rows={rows} hidden={hidden} alpha={}", glp.alpha);
+                            eprintln!("[GLP-APPLY] layer {layer} rows={rows} hidden={hidden} alpha={} mode={:?}", glp.alpha, glp.mode());
                         }
-                        // The weightless 2026-09-04 correction: on DeepSeek-V4
-                        // the measured GLP site is the FFN writer (pre-fold),
-                        // not the post-fold residual. The FFN output buffer is
-                        // `[rows, hidden]` (no HC streams yet); steer it with
-                        // the dense projection kernel before the fold.
-                        //
-                        // Barrier discipline (measured 2026-09-09): the kernel
-                        // read-modify-writes ffn_output in place. Declare that
-                        // access pattern BEFORE dispatch so the tracker's
-                        // conflict check inserts a memory barrier against the
-                        // FFN's in-flight write of the same buffer — without
-                        // it Metal may run the kernel against the not-yet-
-                        // written buffer (dot=0, writes zeros, then the FFN
-                        // write lands: deterministically zero net effect).
+                        // Barrier discipline (measured 2026-09-09): the
+                        // kernel read-modify-writes ffn_output in place.
+                        // Declare that access pattern BEFORE dispatch so
+                        // the tracker's conflict check inserts a memory
+                        // barrier against the FFN's in-flight write of the
+                        // same buffer — without it Metal may run the
+                        // kernel against the not-yet-written buffer
+                        // (dot=0, writes zeros, then the FFN write lands:
+                        // deterministically zero net effect).
                         session.barrier_between(&[&ffn_output], &[&ffn_output]);
                         crate::inference::glp::apply_layer_gpu_in_session(
                             session,
                             registry,
                             &ffn_output,
                             direction,
+                            glp.mode(),
                             glp.alpha,
                             rows as u32,
                             hidden as u32,
@@ -617,8 +636,8 @@ impl Deepseek4Model {
         }
         if let Some(session) = shared_session {
             encode(session)?;
-            // ADR-053: GLP steering is encoded inside the closure, between
-            // the FFN write and dispatch_hc_post (see above). The earlier
+            // GLP steering is encoded inside the closure, between the FFN
+            // write and dispatch_hc_post (see above). The earlier
             // arrangement — a separate encode here, after the fold — steered
             // an already-consumed buffer: a measured no-op (logit shift
             // exactly 0.000000, calibrate canary 2026-09-09). The 2026-09-04
