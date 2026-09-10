@@ -20,6 +20,7 @@ pub mod bind;
 pub mod compatibility;
 pub mod discovery;
 pub mod reader;
+mod source_identity;
 
 pub use apply::{apply_layer_add, apply_layer_project};
 pub use apply_gpu::{

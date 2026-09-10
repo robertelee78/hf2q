@@ -32,13 +32,10 @@ pub enum Compatibility {
 
 impl CheckpointIdentity {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
-        Self::from_metadata(|key| gguf.metadata(key), true)
+        Self::from_metadata(|key| gguf.metadata(key))
     }
 
-    fn from_metadata<'a>(
-        get: impl Fn(&str) -> Option<&'a MetadataValue>,
-        glp: bool,
-    ) -> Result<Self> {
+    fn from_metadata<'a>(get: impl Fn(&str) -> Option<&'a MetadataValue>) -> Result<Self> {
         if let Some(count) = get("general.base_model.count") {
             if count.as_u32() != Some(1) {
                 bail!("GLP checkpoint binding requires exactly one declared base model");
@@ -59,17 +56,12 @@ impl CheckpointIdentity {
                 .transpose()?,
             revision: string_metadata(&get, "general.base_model.0.version")?,
         };
-        if glp && get("general.base_model.0.version").is_some() && identity.revision.is_none() {
+        if get("general.base_model.0.version").is_some() && identity.revision.is_none() {
             bail!("declared GLP base_model.0.version must name an exact HF commit");
         }
         if let Some(revision) = identity.revision.as_mut() {
             if revision.len() != 40 || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
-                if glp {
-                    bail!("base_model.0.version must be an exact 40-hex HF commit, not a branch or model-byte hash");
-                }
-                // Ordinary model GGUFs also use human version labels. They
-                // cannot satisfy a GLP checkpoint pin, but are not malformed.
-                identity.revision = None;
+                bail!("base_model.0.version must be an exact 40-hex HF commit, not a branch or model-byte hash");
             } else {
                 revision.make_ascii_lowercase();
             }
@@ -95,14 +87,25 @@ impl CheckpointIdentity {
         Ok(identity)
     }
 
-    /// Model display names are a fallback for name-only legacy vectors.
-    /// They never supply an organization, repository, or checkpoint revision.
+    /// Actual model display identity only. general.base_model.* describes
+    /// model-card ancestors and never supplies the served checkpoint identity.
     pub fn from_model_gguf(gguf: &GgufFile) -> Result<Self> {
-        let mut identity = Self::from_metadata(|key| gguf.metadata(key), false)?;
-        if identity.name.is_none() && identity.repository.is_none() {
-            identity.name = gguf.metadata_string("general.name").map(str::to_owned);
-        }
-        Ok(identity)
+        Ok(Self {
+            name: gguf.metadata_string("general.name").map(str::to_owned),
+            organization: gguf
+                .metadata_string("general.organization")
+                .map(str::to_owned),
+            repository: None,
+            revision: None,
+        })
+    }
+
+    /// Prefer the exact selected-output-bound conversion receipt, when present.
+    /// Without it only the model's own display name is known; ancestry is not
+    /// a substitute for an actual source repository or commit.
+    pub fn for_model_path(path: &Path, gguf: &GgufFile) -> Result<Self> {
+        Ok(super::source_identity::from_conversion_receipt(path, gguf)?
+            .unwrap_or(Self::from_model_gguf(gguf)?))
     }
 
     pub fn slug(&self) -> Option<&str> {
@@ -178,10 +181,14 @@ fn string_metadata<'a>(
 }
 
 /// Validate local and downloaded vectors through the same loader boundary.
-pub fn validate_glp_for_model(glp_path: &Path, model: &GgufFile) -> Result<Compatibility> {
+pub fn validate_glp_for_model(
+    glp_path: &Path,
+    model_path: &Path,
+    model: &GgufFile,
+) -> Result<Compatibility> {
     let vector = GgufFile::open(glp_path).context("open GLP checkpoint metadata")?;
     let status = CheckpointIdentity::from_gguf(&vector)?
-        .validate_for(&CheckpointIdentity::from_model_gguf(model)?)?;
+        .validate_for(&CheckpointIdentity::for_model_path(model_path, model)?)?;
     if status != Compatibility::Checkpoint {
         tracing::warn!(
             ?status,

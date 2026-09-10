@@ -38,7 +38,7 @@ pub fn resolve_glp(
     let mut hub = LiveHub { api: None };
     let resolved = resolve_with(reference, model_path, &mut hub)?;
     let model = GgufFile::open(model_path).context("open resolved model for GLP binding")?;
-    validate_glp_for_model(&resolved.path, &model)?;
+    validate_glp_for_model(&resolved.path, model_path, &model)?;
     tracing::info!(
         repository = ?resolved.source_repo,
         revision = ?resolved.source_revision,
@@ -149,7 +149,7 @@ fn resolve_with(reference: &Path, model_path: &Path, hub: &mut impl GlpHub) -> R
     }
     let parsed = if value == "auto" {
         let model = GgufFile::open(model_path).context("open resolved model for GLP discovery")?;
-        let identity = CheckpointIdentity::from_model_gguf(&model)?;
+        let identity = CheckpointIdentity::for_model_path(model_path, &model)?;
         let slug = identity.slug().context("GLP auto-discovery needs a declared model identity; select a local file or Hub reference explicitly")?;
         let search = format!("{}-abliterated-cyber-GLP-", slug.replace(' ', "-"));
         let found = hub.search(DISCOVERY_AUTHOR, &search, MAX_DISCOVERY_REPOS + 1)?;

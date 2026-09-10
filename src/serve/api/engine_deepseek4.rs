@@ -745,7 +745,7 @@ impl Deepseek4LoadedModel {
         // Fail-closed at load; never serve unsteered when a vector was asked for.
         let model = if let Some(glp_path) = opts.glp_path.as_ref() {
             let device = model.ctx.device().clone();
-            crate::inference::glp::validate_glp_for_model(glp_path, &gguf)
+            crate::inference::glp::validate_glp_for_model(glp_path, &opts.model_path, &gguf)
                 .context("GLP checkpoint compatibility")?;
             let vector = crate::inference::glp::GlpVector::load(glp_path)
                 .with_context(|| format!("GLP load: {}", glp_path.display()))?;

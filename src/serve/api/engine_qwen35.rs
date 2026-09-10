@@ -365,7 +365,7 @@ impl Qwen35LoadedModel {
         if let Some(glp_path) = opts.glp_path.as_ref() {
             let device = mlx_native::MlxDevice::new()
                 .map_err(|e| anyhow::anyhow!("GLP bind device: {e}"))?;
-            crate::inference::glp::validate_glp_for_model(glp_path, &gguf)
+            crate::inference::glp::validate_glp_for_model(glp_path, model_path, &gguf)
                 .context("GLP checkpoint compatibility")?;
             let vector = crate::inference::glp::GlpVector::load(glp_path)
                 .with_context(|| format!("GLP load: {}", glp_path.display()))?;

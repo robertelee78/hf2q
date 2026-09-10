@@ -100,15 +100,8 @@ fn legacy_vectors_remain_explicitly_unverified() {
 fn malformed_glp_commit_cannot_be_a_branch_or_tensor_hash() {
     for value in ["main".to_owned(), "a".repeat(64), "z".repeat(40)] {
         let map = metadata(&[("general.base_model.0.version", &value)]);
-        assert!(CheckpointIdentity::from_metadata(|key| map.get(key), true).is_err());
+        assert!(CheckpointIdentity::from_metadata(|key| map.get(key)).is_err());
     }
-}
-
-#[test]
-fn human_model_version_is_not_checkpoint_evidence() {
-    let map = metadata(&[("general.base_model.0.version", "v1")]);
-    let model = CheckpointIdentity::from_metadata(|key| map.get(key), false).unwrap();
-    assert!(model.revision.is_none());
 }
 
 #[test]
@@ -122,7 +115,7 @@ fn repo_url_and_commit_survive_metadata_read() {
         ),
         ("general.base_model.0.version", &revision),
     ]);
-    let identity = CheckpointIdentity::from_metadata(|key| map.get(key), true).unwrap();
+    let identity = CheckpointIdentity::from_metadata(|key| map.get(key)).unwrap();
     assert_eq!(
         identity.repository.as_deref(),
         Some("example/Example-Model")
@@ -139,23 +132,23 @@ fn inconsistent_identity_or_wrong_metadata_type_is_rejected() {
             "https://huggingface.co/example/Example-Model",
         ),
     ]);
-    assert!(CheckpointIdentity::from_metadata(|key| map.get(key), true).is_err());
+    assert!(CheckpointIdentity::from_metadata(|key| map.get(key)).is_err());
     map.clear();
     map.insert(
         "general.base_model.0.version".into(),
         MetadataValue::Uint32(1),
     );
-    assert!(CheckpointIdentity::from_metadata(|key| map.get(key), true).is_err());
+    assert!(CheckpointIdentity::from_metadata(|key| map.get(key)).is_err());
     map.clear();
     map.insert("general.base_model.count".into(), MetadataValue::Uint32(2));
-    assert!(CheckpointIdentity::from_metadata(|key| map.get(key), true).is_err());
+    assert!(CheckpointIdentity::from_metadata(|key| map.get(key)).is_err());
 }
 
 #[test]
 fn tensor_content_hash_is_not_used_as_checkpoint_identity() {
     let map = metadata(&[("glp.content_sha256", &"a".repeat(64))]);
     assert_eq!(
-        CheckpointIdentity::from_metadata(|key| map.get(key), true).unwrap(),
+        CheckpointIdentity::from_metadata(|key| map.get(key)).unwrap(),
         CheckpointIdentity::default()
     );
 }

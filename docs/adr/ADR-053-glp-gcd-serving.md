@@ -151,15 +151,26 @@ Hub repository IDs and canonical tree/blob/resolve URLs use the shared HF
 reference parser. A returned inventory must name an immutable commit, and
 the chosen file is downloaded at that commit rather than a mutable branch.
 
-Declared base repository/name and HF commit are checked against model
-provenance before GLP binding in both family loaders. Conflicts are fatal;
-a declared commit cannot be satisfied by missing revision metadata or a
-human version label. The spec defines `general.base_model.0.version` as the
+A GLP's declared base repository/name and HF commit are checked against the
+served checkpoint before binding in both family loaders. For hf2q conversions,
+the existing adjacent schema-v3 receipt supplies the actual source repository
+and revision only after its output size and SHA-256 match the selected stable
+file. Existing source-bundle metadata, when present, must agree with that
+receipt. The receipt's embedded output path is never dereferenced. A bounded
+process-local cache reuses output digest verification while the stable file
+identity is unchanged, avoiding a second large-file hash at model binding.
+
+Model-card `general.base_model.*` fields describe ancestors, not the served
+checkpoint, and supply no source identity. Without a usable conversion receipt,
+only the model's own `general.name` and organization are available. Conflicts
+are fatal; a declared repository or commit cannot be satisfied by an ancestor,
+missing source evidence, or a human version label. The spec defines `general.base_model.0.version` as the
 HF commit, while `glp.content_sha256` covers direction tensors. The latter
 is checked over raw F32 direction bytes in increasing numeric layer order,
 excluding metadata and alignment padding, before normalization. No model-byte
 hash requirement is inferred. Matching metadata expresses checkpoint
-compatibility; it does not attest that arbitrary local weights are authentic.
+compatibility; a local conversion receipt binds that source claim to output
+bytes, without attesting that its claimed remote derivation is authentic.
 
 Legacy vectors without a declared checkpoint remain loadable, with an
 explicit unverified-revision warning. Name-only matches do not acquire a
