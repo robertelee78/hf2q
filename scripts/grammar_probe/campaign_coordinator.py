@@ -46,8 +46,19 @@ def descendants_include(pid, ancestor):
             return False
     return False
 
-def guard_host(allowed_pids=(), owned_roots=()):
-    for name in ("hf2q", "cargo", "rustc"):
+# Guarded process names. "hf2q" is ALWAYS guarded (one model at a time is a
+# memory-safety rule, not a measurement-preference). "cargo"/"rustc" guard
+# latency-sensitive and binary-identity-sensitive campaigns; a SEMANTIC
+# campaign (deterministic temperature-0 outcomes — refusal/fulfillment/
+# degeneration verdicts and finish reasons — invariant to host CPU load)
+# may narrow the guard to hf2q only via "guarded_processes" in its config,
+# allowing parallel build lanes on the host. Latency fields recorded during
+# such a campaign must not be quoted as performance evidence.
+DEFAULT_GUARDED = ("hf2q", "cargo", "rustc")
+
+
+def guard_host(allowed_pids=(), owned_roots=(), names=DEFAULT_GUARDED):
+    for name in names:
         found = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True)
         for value in found.stdout.split():
             pid = int(value)
@@ -106,6 +117,10 @@ def source_identity(build):
 class Coordinator:
     def __init__(self, config):
         self.config = config
+        guarded = tuple(config.get("guarded_processes", DEFAULT_GUARDED))
+        if "hf2q" not in guarded:
+            raise ValueError("guarded_processes must always include hf2q (one model at a time)")
+        self.guarded = guarded
         self.output = Path(config["output_dir"])
         self.output.mkdir(parents=True, exist_ok=True)
         self.state = {"schema_version": 1, "phase": "starting", "completed_commands": []}
@@ -135,7 +150,7 @@ class Coordinator:
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "TMPDIR", "LANG", "USER", "LOGNAME")}
         env.update(step.get("env", {})); env.update(extra_env or {})
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-        guard_host(allowed, [self.judge.pid] if self.judge else [])
+        guard_host(allowed, [self.judge.pid] if self.judge else [], names=self.guarded)
         self.status(step["name"], command=step["argv"], cwd=cwd)
         with (self.output / (step["name"] + ".log")).open("ab") as log:
             child = subprocess.Popen(step["argv"], env=env, cwd=cwd, stdout=log, stderr=subprocess.STDOUT)
@@ -146,7 +161,7 @@ class Coordinator:
                         raise ValueError("managed judge exited during a command")
                     if allowed and listener_pids(self.config["server_process"]["port"]) != set(allowed):
                         raise ValueError("old server listener changed during generation")
-                    guard_host(allowed, [child.pid] + ([self.judge.pid] if self.judge else []))
+                    guard_host(allowed, [child.pid] + ([self.judge.pid] if self.judge else []), names=self.guarded)
                     time.sleep(1)
                 if child.returncode:
                     raise ValueError(f"{step['name']} exited {child.returncode}")
@@ -164,7 +179,7 @@ class Coordinator:
             raise ValueError("legacy command does not execute a pinned runner")
         self.status("waiting_initial", configuration=c)
         while require_process(c["initial_process"], allow_exited=True):
-            require_process(server); guard_host([server["pid"]])
+            require_process(server); guard_host([server["pid"]], names=self.guarded)
             if listener_pids(server["port"]) != {server["pid"]}:
                 raise ValueError("old server listener changed while waiting")
             time.sleep(5)
@@ -174,7 +189,7 @@ class Coordinator:
         self.status("generation_complete", legacy_results_sha256=verify_results(
             legacy["results_path"], legacy["expected_rows"], legacy["config_sha256"]))
         stop_recorded_server(server)
-        build = c["build"]; source_identity(build); guard_host()
+        build = c["build"]; source_identity(build); guard_host(names=self.guarded)
         if not {"build", "--release", "--locked"}.issubset(build["argv"]):
             raise ValueError("build command must use build --release --locked")
         self.run_command({"name": "build", **build}, cwd=build["worktree"])
@@ -186,14 +201,14 @@ class Coordinator:
         judge = c["judge"]
         if listener_pids(judge["port"]):
             raise ValueError("judge port already has a listener")
-        guard_host(); self.judge_log = (self.output / "managed_judge.log").open("ab")
+        guard_host(names=self.guarded); self.judge_log = (self.output / "managed_judge.log").open("ab")
         argv = [sys.executable, "-B", judge["managed_runner"], "--binary", str(binary),
                 "--model", judge["model"], "--manifest", judge["manifest"], "--port", str(judge["port"])]
         self.judge = subprocess.Popen(argv, stdout=self.judge_log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + judge.get("startup_timeout", 900)
         manifest = None
         while self.judge.poll() is None and time.monotonic() < deadline:
-            guard_host(owned_roots=[self.judge.pid])
+            guard_host(owned_roots=[self.judge.pid], names=self.guarded)
             if Path(judge["manifest"]).exists():
                 manifest = json.loads(Path(judge["manifest"]).read_text())
                 self.remember_judge_server(manifest)
