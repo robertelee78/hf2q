@@ -5,7 +5,10 @@
   handlers, chat forwarding, `examples/recon-opportunities.schema.json`, and
   the `gcd_schema_tests` battery cells (including the tightened-subschema
   and observability refinements from issue #192). The lockdown mode
-  (`--gcd-schema-locked`) documented below is not yet coded.
+  (`--gcd-schema-locked`) documented below is implemented on branch
+  `fix/gcd-schema-locked`: the flag (requires `--gcd-schema`), the 400
+  rejection in the handlers ahead of the undeclared-params check, chat
+  forwarding, and the `gcd_schema_lockdown_tests` battery cells.
 - **Date:** 2026-09-09
 - **Related:** ADR-053 (GLP/GCD serving surface), ADR-055 (alphabet presets),
   ADR-056 (conformance battery), ADR-052 (structured-output compatibility)

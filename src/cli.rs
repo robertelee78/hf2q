@@ -1124,6 +1124,12 @@ pub struct ChatArgs {
         conflicts_with = "gcd"
     )]
     pub gcd_schema: Option<PathBuf>,
+
+    /// ADR-057 lockdown mode on the chat-owned server this session spawns.
+    /// Forwarded to `serve --gcd-schema-locked`; requires --gcd-schema and
+    /// same scope note as --gcd-schema.
+    #[arg(long, requires = "gcd_schema", default_value_t = false)]
+    pub gcd_schema_locked: bool,
 }
 
 /// ADR-054: `hf2q calibrate <model.gguf>` — derive a GLP direction on-device.
@@ -1380,6 +1386,14 @@ pub struct ServeArgs {
         conflicts_with = "gcd"
     )]
     pub gcd_schema: Option<PathBuf>,
+
+    /// ADR-057 lockdown mode: make the --gcd-schema constraint mandatory
+    /// policy instead of a serve-time default. Requests carrying their own
+    /// `grammar`, `response_format`, `structured_outputs`, or `json_schema`
+    /// are rejected 400 rather than deferred to — the Tantalus lesson that
+    /// a server-side default which is a control must be non-overridable.
+    #[arg(long, requires = "gcd_schema", default_value_t = false)]
+    pub gcd_schema_locked: bool,
 
 
 
@@ -1747,6 +1761,38 @@ mod tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["hf2q", "info"]).is_err());
+    }
+
+    #[test]
+    fn gcd_schema_locked_requires_gcd_schema_on_serve_and_chat() {
+        assert!(Cli::try_parse_from(["hf2q", "serve", "--gcd-schema-locked"]).is_err());
+        assert!(Cli::try_parse_from(["hf2q", "chat", "--gcd-schema-locked"]).is_err());
+        let serve = Cli::parse_from([
+            "hf2q",
+            "serve",
+            "--gcd-schema",
+            "/tmp/schema.json",
+            "--gcd-schema-locked",
+        ]);
+        let Command::Serve(serve) = serve.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(
+            serve.gcd_schema.as_deref(),
+            Some(std::path::Path::new("/tmp/schema.json"))
+        );
+        assert!(serve.gcd_schema_locked);
+        let chat = Cli::parse_from([
+            "hf2q",
+            "chat",
+            "--gcd-schema",
+            "/tmp/schema.json",
+            "--gcd-schema-locked",
+        ]);
+        let Command::Chat(chat) = chat.command else {
+            panic!("expected chat");
+        };
+        assert!(chat.gcd_schema_locked);
     }
 
     #[test]

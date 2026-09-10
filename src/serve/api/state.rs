@@ -113,6 +113,11 @@ pub struct ServerConfig {
     /// injected as the serve-time default constraint in place of the W1
     /// prose grammar. Pattern credit: Vince Ovando's red-teaming pipeline.
     pub gcd_schema_grammar: Option<String>,
+    /// ADR-057 lockdown mode (`--gcd-schema-locked`, requires the schema
+    /// grammar above): the constraint is mandatory policy, not a
+    /// serve-time default. Requests carrying any explicit constraint
+    /// surface are rejected 400 instead of silently overriding it.
+    pub gcd_schema_locked: bool,
 }
 
 impl Default for ServerConfig {
@@ -136,7 +141,7 @@ impl Default for ServerConfig {
             gcd: false,
             glp_path: None,
             gcd_schema_grammar: None,
-
+            gcd_schema_locked: false,
         }
     }
 }
