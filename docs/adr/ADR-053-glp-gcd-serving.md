@@ -64,9 +64,10 @@ operand — the `--mmproj` shape.
 - `--glp <ref>` binds an explicit vector (Hub repo, file, or local path).
   Bare `--glp` (no value) asks the resolver to search the Hub for `*-GLP-*`
   artifacts bound to the resolved model family and commit; **ambiguous or
-  absent candidates fail closed** (printed list, exit). `--glp-content-sha256`
-  MAY pin the binding; `glp.content_sha256` from the file is verified against
-  it when present.
+  absent candidates fail closed** (printed list, exit). Explicit Hub file
+  URLs select a filename and may pin an immutable revision. The file's
+  `glp.content_sha256`, when supplied, is verified over raw direction bytes;
+  there is no `--glp-content-sha256` CLI flag.
 - Reader conformance follows the spec verbatim: `glp.mode` absence means
   `add`; unimplemented modes/hooks, `direction.0`, or unknown
   `glp.hook_point` are **fatal**. `project` never merges with another
@@ -139,10 +140,35 @@ operand — the `--mmproj` shape.
 
 ## Resolver trust boundary
 
-The Hub resolver is a supply-chain surface: name-pattern binding means anyone
-can publish `<model>-GLP-anything`. The default path therefore prefers
-**exact-base-commit** matches, prints the resolved artifact's provenance at
-boot, and **warns loudly on family-only matches**. Version mismatch at apply
-time is ADR-054 gate 5; the resolution-time posture lives here.
-`--glp-content-sha256` is the strict form (pin the artifact hash); without it,
-family-only matches are announced, not silent.
+The automatic resolver searches only the public `msuiche` namespace for the
+exact `<base>-abliterated-cyber-GLP-<N>` convention. It uses the model GGUF
+already selected by serving, not a second model download. Searches exceeding
+100 returned repositories fail as incomplete. Multiple matching repositories
+or multiple GGUF files require explicit selection; ordering and coverage do
+not confer priority. An explicit local file performs no Hub work. Explicit
+Hub repository IDs and canonical tree/blob/resolve URLs use the shared HF
+reference parser. A returned inventory must name an immutable commit, and
+the chosen file is downloaded at that commit rather than a mutable branch.
+
+Declared base repository/name and HF commit are checked against model
+provenance before GLP binding in both family loaders. Conflicts are fatal;
+a declared commit cannot be satisfied by missing revision metadata or a
+human version label. The spec defines `general.base_model.0.version` as the
+HF commit, while `glp.content_sha256` covers direction tensors. The latter
+is checked over raw F32 direction bytes in increasing numeric layer order,
+excluding metadata and alignment padding, before normalization. No model-byte
+hash requirement is inferred. Matching metadata expresses checkpoint
+compatibility; it does not attest that arbitrary local weights are authentic.
+
+Legacy vectors without a declared checkpoint remain loadable, with an
+explicit unverified-revision warning. Name-only matches do not acquire a
+checkpoint guarantee. Organization labels are compared when both sides
+supply them, but are not synthesized into HF account names. Quantized model
+bytes may differ while the declared source checkpoint remains identical;
+behavioral transfer across quantizations still needs measurement.
+
+The resolver and compatibility tests use mocked Hub I/O and synthetic
+metadata/tensor fixtures. They cover explicit paths and URLs, immutable
+revision downloads, repository/file ambiguity, failed lookup, wrong namespace
+and revision, missing commit evidence, and direction-hash corruption. These
+checks do not replace the family-specific real-model steering gates.

@@ -1338,10 +1338,11 @@ pub struct ServeArgs {
 
     /// ADR-053: bind a GLP steering vector (GGUF control vector, project or
     /// add mode per its metadata) to the served model. Applied per layer to
-    /// the post-layer residual stream at inference time; base weights are
-    /// never modified. Accepts a local path or a Hub reference. Fail-closed:
-    /// conformance errors (unknown mode/hook/spec, wrong width, direction.0)
-    /// abort startup rather than degrade.
+    /// its declared, family-supported hook at inference time; base weights
+    /// are never modified. Accepts a local file, owner/repo, or a canonical
+    /// Hugging Face file URL (which can pin a revision and filename).
+    /// Conformance or declared checkpoint-compatibility errors, ambiguous
+    /// repositories/files, wrong width, or direction.0 abort startup.
     ///
     /// GLP concept credit: Matt Suiche (m@msuiche.com), weightless/GLP spec.
     /// With no value (`--glp` bare), auto-discovers the vector bound to the

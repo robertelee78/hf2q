@@ -365,6 +365,8 @@ impl Qwen35LoadedModel {
         if let Some(glp_path) = opts.glp_path.as_ref() {
             let device = mlx_native::MlxDevice::new()
                 .map_err(|e| anyhow::anyhow!("GLP bind device: {e}"))?;
+            crate::inference::glp::validate_glp_for_model(glp_path, &gguf)
+                .context("GLP checkpoint compatibility")?;
             let vector = crate::inference::glp::GlpVector::load(glp_path)
                 .with_context(|| format!("GLP load: {}", glp_path.display()))?;
             let bound = crate::inference::glp::BoundGlp::bind(
@@ -376,30 +378,6 @@ impl Qwen35LoadedModel {
                 model.cfg.hidden_size,
             )
                 .with_context(|| format!("GLP bind: {}", glp_path.display()))?;
-            // S8: base-model metadata is provenance, not an enforced
-            // checkpoint identity (deliberate relaxation — the spec does
-            // not forbid cross-checkpoint vectors). Warn loudly when the
-            // declared base model differs from the model being served.
-            if let Some(declared) = bound.vector.base_model_name.as_deref() {
-                let served = gguf
-                    .metadata_string("general.name")
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        model_path
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                    })
-                    .unwrap_or_else(|| "qwen35-model".into());
-                if !declared.is_empty()
-                    && !served.to_lowercase().contains(&declared.to_lowercase())
-                {
-                    tracing::warn!(
-                        declared_base_model = declared,
-                        served_model = %served,
-                        "GLP vector base model differs from the served model;                          directions are not checkpoint-bound"
-                    );
-                }
-            }
             tracing::info!(
                 layers = bound.vector.layers.len(),
                 width = bound.vector.width,
