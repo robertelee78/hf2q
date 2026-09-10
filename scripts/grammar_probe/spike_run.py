@@ -1,33 +1,17 @@
 #!/usr/bin/env python3
-"""Spike: run prompts through the subject model, store responses for later judging.
+"""Generate explicit grammar/budget cells against an attested runtime.
 
-v2 repairs (publication review E7):
-- Configurable token budget: TOKEN_BUDGET (default 800 — the historical W1
-  cell) and a predeclared BUDGET_LADDER (comma-separated budgets, e.g.
-  "400,800,1600"). Every budget in the ladder is run over the full corpus;
-  each response row records its budget, and the resume key includes it.
-- Run identity binding: a config manifest (model identity, server identity,
-  prompt corpus + hash, template, exact grammar file + hash, effective
-  sampling/thinking settings, budget ladder, arm) is hashed into
-  config_sha256, recorded on EVERY row, and written to <OUT>.manifest.json.
-  Resume is rejected unless every existing row carries the same
-  config_sha256; rows without config binding (historical files) are refused
-  so they can never be appended to.
-- Termination is recorded as-is (finish, completion_tokens); the harness
-  never treats finish=length as degeneration or finish=stop as completeness
-  (that separation lives in judge.py/report.py).
-- Refusal phrase counts remain SCREENING signals only, never evidence.
+RUNTIME_MANIFEST and the live runtime snapshot bind current model, binary,
+tokenizer, template, defaults and controls. Request overrides, exact grammar,
+prompt corpus and budgets are hashed into the generation configuration.
+Historical/unbound files cannot be appended to; changed input or runtime
+requires a new output. Every result records budget and complete observation
+identity. Termination is separate from semantic quality.
 
-Defaults reproduce the historical W1 generation cell exactly: greedy
-(temperature 0), no system prompt (user-only template), thinking disabled,
-reasoning_effort low, 800 completion tokens.
-
-Env: BASE_URL, MODEL, ARM, GRAMMAR (path; literal "none" = unconstrained),
-     PROMPTS, OUT, TOKEN_BUDGET, BUDGET_LADDER, TEMPERATURE (default 0),
-     TOP_P (default: not sent), REASONING_EFFORT (default low),
-     ENABLE_THINKING (default 0), SERVER_IDENTITY (operator-supplied binary/
-     source identity string, recorded verbatim), LIMIT, DRY_RUN (=1 prints
-     the plan and config, no requests).
+Env: BASE_URL, MODEL (optional; must match attested resident model),
+RUNTIME_MANIFEST, ARM, GRAMMAR (path or literal none), PROMPTS, OUT,
+TOKEN_BUDGET (800), BUDGET_LADDER, TEMPERATURE (0), TOP_P,
+REASONING_EFFORT (low), ENABLE_THINKING (0), LIMIT, DRY_RUN.
 """
 import hashlib
 import json
@@ -35,6 +19,10 @@ import os
 import sys
 import time
 import urllib.request
+import uuid
+
+from measurement import text_hash
+from runtime_identity import attested_model, fetch_runtime_identity, require_unconstrained, verify_unchanged
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8081")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -61,7 +49,7 @@ def parse_budgets():
         budgets = [int(b) for b in ladder.split(",") if b.strip()]
     else:
         budgets = [int(os.environ.get("TOKEN_BUDGET", "800"))]
-    if not budgets or any(b <= 0 for b in budgets):
+    if not budgets or any(b <= 0 for b in budgets) or len(set(budgets)) != len(budgets):
         sys.exit("BUDGET_LADDER/TOKEN_BUDGET must be positive integers")
     return budgets
 
@@ -71,7 +59,7 @@ def sha256_file(path):
         return hashlib.sha256(fh.read()).hexdigest()
 
 
-def build_config(model, budgets, grammar_text, grammar_path):
+def build_config(model, budgets, grammar_text, grammar_path, runtime=None):
     sampling = {
         "temperature": float(os.environ.get("TEMPERATURE", "0")),
         "reasoning_effort": os.environ.get("REASONING_EFFORT", "low"),
@@ -82,7 +70,8 @@ def build_config(model, budgets, grammar_text, grammar_path):
     if top_p != "":
         sampling["top_p"] = float(top_p)
     cfg = {
-        "runner": "spike_run.py", "runner_version": 2, "arm": ARM,
+        "runner": "spike_run.py", "runner_version": 3, "arm": ARM,
+        "runtime_identity": runtime,
         "model": model,
         "server_identity": os.environ.get("SERVER_IDENTITY", ""),
         "prompt_corpus": os.path.abspath(PROMPTS),
@@ -112,6 +101,8 @@ def load_prompts():
                 continue
             pid, _, text = line.partition("\t")
             rows.append((pid, text))
+    if len({pid for pid, _ in rows}) != len(rows):
+        raise ValueError("duplicate prompt IDs in corpus")
     return rows
 
 
@@ -159,11 +150,19 @@ def main():
     if DRY_RUN:
         model = os.environ.get("MODEL") or "(unresolved: dry-run)"
     else:
-        model = os.environ.get("MODEL") or resolve_model()
+        model = None
     rows = load_prompts()
-    cfg, cfg_hash = build_config(model, budgets, grammar_text, grammar_path)
+    runtime_path = os.environ.get("RUNTIME_MANIFEST")
+    runtime = None if DRY_RUN else fetch_runtime_identity(BASE_URL, runtime_path)
+    if runtime is not None:
+        model = attested_model(runtime, os.environ.get("MODEL"))
+        if grammar_text is None:
+            require_unconstrained(runtime)
+    cfg, cfg_hash = build_config(model, budgets, grammar_text, grammar_path, runtime)
     done = check_resume_compat(cfg_hash)
     manifest_path = OUT + ".manifest.json"
+    if os.path.exists(OUT) and not os.path.exists(manifest_path):
+        raise ValueError("existing generation output lacks its manifest")
 
     cells = [(ARM, pid, 1, b) for pid, _ in rows for b in budgets]
     plan = {"config": cfg, "config_sha256": cfg_hash,
@@ -174,19 +173,31 @@ def main():
         print(json.dumps({"dry_run": True, "out": OUT, "manifest": manifest_path,
                           **plan}, indent=2))
         return
+    if os.path.exists(manifest_path):
+        prior_manifest = json.load(open(manifest_path, encoding="utf-8"))
+        if prior_manifest.get("config") != cfg or prior_manifest.get("config_sha256") != cfg_hash:
+            raise ValueError("generation manifest differs from requested configuration")
+    run_id = prior_manifest.get("generation_run_id") if os.path.exists(manifest_path) else uuid.uuid4().hex
+    if not run_id:
+        raise ValueError("existing generation manifest lacks its run identity; use a new output")
     if not os.path.exists(manifest_path):
         with open(manifest_path, "w") as fh:
-            json.dump({"config": cfg, "config_sha256": cfg_hash,
+            json.dump({"config": cfg, "config_sha256": cfg_hash, "generation_run_id": run_id,
                        "created": time.time(), "out": OUT}, fh, indent=2)
 
     print(f"arm={ARM} model={model} prompts={len(rows)} budgets={budgets} "
           f"grammar={GRAMMAR} config={cfg_hash[:12]}", file=sys.stderr)
+    if os.path.exists(OUT):
+        with open(OUT, encoding="utf-8") as stream:
+            if any(json.loads(line).get("generation_run_id") != run_id for line in stream if line.strip()):
+                raise ValueError("generation rows disagree with manifest run identity")
     out = open(OUT, "a")
     requested = 0
     for pid, prompt in rows:
         for budget in budgets:
             if (ARM, pid, 1, budget) in done or requested >= LIMIT:
                 continue
+            verify_unchanged(BASE_URL, runtime_path, runtime)
             requested += 1
             body = {"model": model,
                     "messages": [{"role": "user", "content": prompt}],
@@ -209,11 +220,13 @@ def main():
                 detail = str(exc)[:300]
                 row = {"ts": time.time(), "arm": ARM, "prompt_id": pid, "rep": 1,
                        "budget": budget, "config_sha256": cfg_hash,
+                       "generation_run_id": run_id, "prompt_sha256": text_hash(prompt),
                        "error": detail, "latency_s": int(time.time() - start)}
                 out.write(json.dumps(row) + "\n"); out.flush()
                 print(f"  [{ARM}/{pid}@{budget}] HTTP ERROR (recorded): {detail}",
                       file=sys.stderr)
                 continue
+            verify_unchanged(BASE_URL, runtime_path, runtime)
             latency = int(time.time() - start)
             msg = r["choices"][0]["message"]
             content = msg.get("content") or ""
@@ -222,6 +235,7 @@ def main():
             row = {
                 "ts": time.time(), "arm": ARM, "prompt_id": pid, "rep": 1,
                 "budget": budget, "config_sha256": cfg_hash,
+                "generation_run_id": run_id, "prompt_sha256": text_hash(prompt),
                 "latency_s": latency, "finish": r["choices"][0].get("finish_reason"),
                 "content": content,
                 "response_sha256": hashlib.sha256(content.encode()).hexdigest(),
