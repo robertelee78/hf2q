@@ -76,17 +76,52 @@ jobs:
           test "$actual_version" = "$EXPECTED_VERSION"
           git diff --exit-code
 
+      - name: Enforce fast-path tier guard (skip_qualification)
+        if: ${{ inputs.skip_qualification }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The fast path exists for releases that do not touch the model
+          # path (docs, packaging, tooling, CLI surface). Inference and
+          # grammar changes are exactly what the cross-family qualification
+          # gate exists to test; refuse to publish them fast-tracked so the
+          # skip flag can never dodge qualification for model-path work.
+          previous_tag=$(git describe --tags --abbrev=0 "$EXPECTED_SHA^" 2>/dev/null || true)
+          if [[ -z "$previous_tag" ]]; then
+            echo "fast path requires a tagged baseline; none reachable from the release commit" >&2
+            exit 1
+          fi
+          changed=$(git diff --name-only "$previous_tag" "$EXPECTED_SHA" -- \
+            'src/inference/**' 'src/serve/api/grammar/**' || true)
+          if [[ -n "$changed" ]]; then
+            echo "fast path (skip_qualification) refused:" \
+              "inference/grammar paths changed since $previous_tag:" >&2
+            while IFS= read -r path; do
+              printf '  %s\n' "$path" >&2
+            done <<<"$changed"
+            echo "re-run the release without skip_qualification" \
+              "so the full qualification gate covers these changes" >&2
+            exit 1
+          fi
+          echo "tier guard: no inference/grammar changes since $previous_tag; fast path allowed"
+
       - name: Require successful exact-SHA CI
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Accept a green CI run on the exact SHA from either a push event
+          # or an explicit workflow_dispatch rerun. Push-event-only matching
+          # broke on batch pushes: only the batch head gets a push run, so a
+          # release SHA pushed together with later commits had no matching
+          # run (0.1.21: its CI run was cancelled as superseded, and the
+          # publish gate failed on a fully-green candidate).
           successes=$(gh run list \
             --commit "$EXPECTED_SHA" \
             --workflow CI \
             --json conclusion,event \
-            --jq '[.[] | select(.event == "push" and .conclusion == "success")] | length')
+            --jq '[.[] | select((.event == "push" or .event == "workflow_dispatch") and .conclusion == "success")] | length')
           test "$successes" -ge 1
 
       - name: Require exact signed standalone candidate

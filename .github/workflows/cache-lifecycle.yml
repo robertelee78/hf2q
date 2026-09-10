@@ -221,6 +221,17 @@ jobs:
             printf 'DEPENDENCY_PROVENANCE_DIR=%s\n' "$dependency_provenance_dir"
           } >> "$GITHUB_ENV"
 
+      - name: Host preflight (fail fast on dirty machine state)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PACKAGE_ROOT"
+          # Same conditions the gate asserts mid-run (no model runtimes,
+          # zero swap, headroom for the ~115 GiB DeepSeek benchmark,
+          # nominal thermal) checked in seconds instead of 20-40 minutes
+          # in. See scripts/release_gate_preflight.sh for the contract.
+          scripts/release_gate_preflight.sh
+
       - name: Run guarded cross-family cache lifecycle gate
         shell: bash
         env:
