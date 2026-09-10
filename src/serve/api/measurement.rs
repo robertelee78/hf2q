@@ -61,6 +61,9 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
         return Value::Null;
     };
     let engine = &loaded.engine;
+    let Ok(model_path) = engine.info().model_path.canonicalize() else {
+        return Value::Null;
+    };
     let Ok(mut cache) = state.measurement_cache.0.lock() else {
         return Value::Null;
     };
@@ -91,11 +94,19 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
         "schema_version": "hf2q.measurement-snapshot.v1",
         "process_pid": std::process::id(),
         "model_id": engine.model_id(),
+        // Locator fingerprint only; the managed launcher separately hashes
+        // the file bytes. Never represent a path digest as a model digest.
+        "model_locator_sha256": digest(model_path.to_string_lossy().as_bytes()),
         "architecture": engine.info().arch_str,
         "engine_generation": loaded.generation,
         "tokenizer_sha256": fingerprints.0,
         "template_sha256": fingerprints.1,
         "engine_config": super::control::engine_config_identity_json(&loaded.config_identity),
+        "admission": {
+            "queue_capacity": state.config.queue_capacity,
+            "max_concurrent_requests": state.config.max_concurrent_requests,
+            "request_timeout_seconds": state.config.request_timeout_seconds,
+        },
         "sampling_defaults": {
             "repetition_penalty": state.config.default_repetition_penalty,
             "thinking_token_budget": state.config.default_thinking_token_budget,
@@ -107,6 +118,7 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
                     "alpha_override_bits": loaded.config_identity.glp_alpha_bits},
             "grammar": grammar_control(&state.config),
             "dwq_overlay": loaded.config_identity.dwq_overlay,
+            "vision_projector": state.mmproj.is_some(),
         },
     }))
 }

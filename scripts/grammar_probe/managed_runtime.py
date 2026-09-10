@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -79,6 +80,32 @@ def validate_snapshot(snapshot, pid):
             raise ValueError(f"unknown {control} state")
 
 
+def validate_requested_configuration(snapshot, artifacts, args):
+    model = next(a for a in artifacts if a["role"] == "model")
+    locator_hash = hashlib.sha256(model["path"].encode()).hexdigest()
+    if snapshot.get("model_locator_sha256") != locator_hash:
+        raise ValueError("loaded model does not match the verified model input")
+    controls = snapshot["active_controls"]
+    grammar = controls["grammar"]
+    if controls["glp"]["active"] != bool(args.glp):
+        raise ValueError("runtime GLP state differs from the requested configuration")
+    expected_bits = None if args.glp_alpha is None else struct.unpack(
+        "!I", struct.pack("!f", args.glp_alpha))[0]
+    if controls["glp"].get("alpha_override_bits") != expected_bits:
+        raise ValueError("runtime GLP dose differs from the requested configuration")
+    if grammar["active"] != bool(args.gcd or args.gcd_schema):
+        raise ValueError("runtime grammar differs from the requested configuration")
+    if grammar.get("locked") != args.gcd_schema_locked:
+        raise ValueError("runtime schema lock differs from the requested configuration")
+    if controls.get("dwq_overlay") is not False:
+        raise ValueError("an unbound weight overlay is active")
+    if controls.get("vision_projector") is not False:
+        raise ValueError("an unbound vision projector is active")
+    expected_kind = "gbnf" if args.gcd else "compiled_json_schema" if args.gcd_schema else None
+    if grammar.get("kind") != expected_kind:
+        raise ValueError("runtime grammar kind differs from the requested configuration")
+
+
 def write_manifest(path, value):
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
@@ -99,6 +126,7 @@ def build_manifest(snapshot, artifacts, environment, command):
         "sampling_defaults": snapshot["sampling_defaults"],
         "active_controls": snapshot["active_controls"],
         "engine_config": snapshot["engine_config"],
+        "admission": snapshot["admission"],
         "environment_sha256": canonical_hash(environment),
     }
     identity["identity_sha256"] = canonical_hash(identity)
@@ -187,6 +215,9 @@ def main():
     verify_seals(artifacts)
     require_free_port(args.port)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    state_root = manifest_path.with_name(manifest_path.name + ".state")
+    state_root.mkdir(exist_ok=False)
+    command[1:1] = ["--state-root", str(state_root)]
     base_url = f"http://127.0.0.1:{args.port}"
     manifest = {"schema_version": "hf2q.measurement-runtime.v1", "state": "starting"}
     stop = False
@@ -217,6 +248,7 @@ def main():
                     time.sleep(1)
                     continue
                 validate_snapshot(snapshot, child.pid)
+                validate_requested_configuration(snapshot, artifacts, args)
                 if manifest["state"] != "running":
                     manifest = build_manifest(snapshot, artifacts, environment, command)
                     write_manifest(manifest_path, manifest)
