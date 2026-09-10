@@ -1,7 +1,15 @@
 # ADR-053: GLP runtime steering and the `--gcd` serving surface
 
-- **Status:** Draft — design accepted; implementation gates listed below are
-  not yet met; do not treat the surface as present in any build
+- **Status:** Accepted — implemented and shipped. The serving surface is
+  present in builds since v0.1.21: `--gcd` (grammar-only; W6V2 cores lexicon
+  as the shipped default), `--glp`/`--glp-alpha` with auto-discovery, chat
+  forwarding of all serve-time flags, and `--gcd-schema` (ADR-057). Gates 1–3
+  and 5 are met (reader conformance, layer-mapping differential, the steering
+  canary — proven on DeepSeek-V4 hardware, zero-dose no-op / live-dose shift
+  0.213–0.256 — and boot auditability). Gate 4's behavioral panels
+  (refusal/benign under the follow-up protocol) remain open; until they land,
+  a calibrated GLP vector is a candidate direction, not a validated
+  derivation (see ADR-054 behavioral gates 3–4).
 - **Date:** 2026-09-04
 - **Related:** ADR-052 (grammar semantics), ADR-050 (serve preflight),
   ADR-051 (model resolution), ADR-042 (DeepSeek serving), ADR-017

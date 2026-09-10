@@ -1,7 +1,14 @@
 # ADR-056: GCD serving-stack conformance battery
 
 ## Status
-Draft — spec accepted direction; battery not yet implemented.
+Partially implemented — `scripts/grammar_probe/battery_gcd.py` is committed
+and its 12 hf2q-surface cells ran green against a live `--gcd` server
+(2026-09-09): sampling levers (temperature/top-p/top-k/min-p/rep-pen/
+logit-bias), terminal truncation, streaming assembly, and the undeclared-
+param 4xx rule. The vLLM-parity 26-cell target (Matt Suiche's reference
+battery) and the beam-search FATAL class translation remain open; hf2q has
+no beam surface, so that class is closed by construction and by the
+undeclared-param rejection rule.
 
 ## Context
 

@@ -1,6 +1,11 @@
 # ADR-057: `--gcd-schema` — schema-constrained output as a refusal-impossibility arm
 
-- **Status:** Draft — accepted direction; not yet implemented
+- **Status:** Accepted — implemented (commit cefaa341, shipped in v0.1.21):
+  serve flag, fail-closed startup schema compile, W1-point injection in the
+  handlers, chat forwarding, `examples/recon-opportunities.schema.json`, and
+  the `gcd_schema_tests` battery cells (including the tightened-subschema
+  and observability refinements from issue #192). The lockdown mode
+  (`--gcd-schema-locked`) documented below is not yet coded.
 - **Date:** 2026-09-09
 - **Related:** ADR-053 (GLP/GCD serving surface), ADR-055 (alphabet presets),
   ADR-056 (conformance battery), ADR-052 (structured-output compatibility)
