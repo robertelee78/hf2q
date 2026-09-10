@@ -1,14 +1,25 @@
 # ADR-056: GCD serving-stack conformance battery
 
 ## Status
-Partially implemented — `scripts/grammar_probe/battery_gcd.py` is committed
-and its 12 hf2q-surface cells ran green against a live `--gcd` server
-(2026-09-09): sampling levers (temperature/top-p/top-k/min-p/rep-pen/
-logit-bias), terminal truncation, streaming assembly, and the undeclared-
-param 4xx rule. The vLLM-parity 26-cell target (Matt Suiche's reference
-battery) and the beam-search FATAL class translation remain open; hf2q has
-no beam surface, so that class is closed by construction and by the
-undeclared-param rejection rule.
+Implemented (v2, 2026-09-10) — `scripts/grammar_probe/battery_gcd.py` runs
+**17 cells, 0 fails, 0 skips** against a live `--gcd` server plus a
+separate unconstrained control server: 10 sampling levers, 2 logit-bias
+cells with REAL tokenizer-resolved token ids (Qwen3.6 token 279 = "Ġthe",
+resolved offline from the model GGUF), a byte-exact literal-grammar canary
+(the strong engagement proof), streaming assembly (stream == non-stream at
+temperature 0), the undeclared-param 400 rule, and loud terminal
+truncation of a closed grammar. The v1 defects are repaired: the "control"
+previously went to the same --gcd server and received the default grammar
+itself (why five cells logged engaged=false); the bias cells shipped empty
+maps; engagement was "different text". v2 requires CONTROL_BASE_URL (a
+server started without --gcd) for a demonstrably unconstrained control and
+writes every cell through to `battery_gcd_v2.jsonl` immediately (the first
+v2 run hung and its end-of-run write destroyed the evidence — a
+measurement harness must survive its own timeouts). The vLLM-parity
+26-cell target and the beam-search FATAL class translation remain open;
+hf2q has no beam surface, so that class is closed by construction and by
+the undeclared-param rejection rule. Run artifact:
+`scripts/grammar_probe/battery_gcd_v2.jsonl`.
 
 ## Context
 

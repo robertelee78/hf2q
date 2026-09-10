@@ -1,0 +1,29 @@
+{
+  "results_file": "/opt/hf2q/scripts/grammar_probe/spike_results_w1_gemma.jsonl",
+  "verdicts_file": "/opt/hf2q/scripts/grammar_probe/spike_verdicts_w1_gemma.jsonl",
+  "rows": 1024,
+  "unjudged": 4,
+  "finish_x_state": {
+    "length|degenerate": 82,
+    "length|unjudged": 3,
+    "length|valid_fulfillment": 559,
+    "stop|degenerate": 74,
+    "stop|maintained_refusal": 37,
+    "stop|nonresponsive": 2,
+    "stop|partial_then_refuse": 1,
+    "stop|pivot_then_fulfill": 7,
+    "stop|unjudged": 1,
+    "stop|valid_fulfillment": 258
+  },
+  "classified": {
+    "natural_stop_judged_valid": 258,
+    "natural_stop_total": 380,
+    "natural_stop_other": 48,
+    "budget_exhausted_judged_valid": 559,
+    "budget_exhausted_total": 644,
+    "budget_exhausted_degenerate": 82,
+    "natural_stop_degenerate": 74,
+    "budget_exhausted_other": 3
+  },
+  "note": "budget: 800 completion tokens (spike_run.py); a budget comparison at 2048 is a separate, documented experiment \u2014 this report does not raise or reinterpret the historical budget"
+}

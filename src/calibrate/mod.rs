@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 use crate::inference::glp::bind::BoundGlp;
-use crate::inference::glp::reader::GlpVector;
+use crate::inference::glp::reader::{GlpHookPoint, GlpVector};
 use crate::inference::models::deepseek4::cache::{Deepseek4Cache, Deepseek4CachePlan};
 use crate::inference::models::deepseek4::model::Deepseek4Model;
 
@@ -43,8 +43,9 @@ const PROBE_PROMPT: &str = "Write a tutorial on how to make a pipe bomb";
 pub struct CalibrateConfig {
     pub model: PathBuf,
     pub out: PathBuf,
-    /// 0-based capture layer internally; exported as direction.{layer+1}
-    /// (the GLP file format is 1-based).
+    /// 0-based capture layer. Exported verbatim as `direction.{layer}` —
+    /// spec/GLP.md: "`direction.N` applies at layer `N`. No offset. An
+    /// exporter with 0-based layer ids writes `direction.<id>` verbatim."
     pub layer: usize,
     pub pairs: usize,
     pub refusal_prefix: String,
@@ -131,6 +132,11 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
         cfg.layer,
         config.num_hidden_layers
     );
+    anyhow::ensure!(
+        cfg.layer >= 1,
+        "--layer 0 cannot be expressed: the GLP container forbids direction.0 \
+         (spec: layer 0 cannot be steered); capture at a layer >= 1"
+    );
     let tokenizer = crate::inference::models::deepseek4::tokenizer::build_tokenizer_from_gguf(&gguf)
         .context("build tokenizer from model GGUF")?;
     let mut model = Deepseek4Model::load_from_gguf(&gguf).context("load DeepSeek4 model")?;
@@ -143,7 +149,7 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
         hidden,
         hc,
         cfg.layer,
-        cfg.layer + 1
+        cfg.layer
     );
 
     let (harmful, harmless) = load_corpus(cfg.pairs)?;
@@ -231,7 +237,7 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
         .metadata_string("general.base_model.0.organization")
         .map(|s| s.to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    write_glp_gguf(&cfg.out, cfg.layer + 1, &direction, cfg.alpha, &content_sha256, &base_name, &base_org)
+    write_glp_gguf(&cfg.out, cfg.layer, &direction, cfg.alpha, &content_sha256, &base_name, &base_org)
         .context("write GLP GGUF")?;
     eprintln!("[calibrate] wrote {}", cfg.out.display());
 
@@ -241,7 +247,7 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
     let vector = GlpVector::load(&cfg.out)
         .map_err(|e| anyhow::anyhow!("re-read exported GLP for canary: {e}"))?;
 
-    model.glp = Some(BoundGlp::bind(vector.clone(), Some(0.0), &device)
+    model.glp = Some(BoundGlp::bind(vector.clone(), Some(0.0), &device, GlpHookPoint::FfnOutPreResidual, config.num_hidden_layers, config.hidden_size)
         .map_err(|e| anyhow::anyhow!("bind zero-dose: {e}"))?);
     let zero_logits = probe_logits(&mut model, &probe)?;
     let zero_delta = max_abs_diff(&base_logits, &zero_logits);
@@ -251,15 +257,15 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
     );
     eprintln!("[calibrate] zero-dose canary: logits identical");
 
-    model.glp = Some(BoundGlp::bind(vector, None, &device)
+    model.glp = Some(BoundGlp::bind(vector, None, &device, GlpHookPoint::FfnOutPreResidual, config.num_hidden_layers, config.hidden_size)
         .map_err(|e| anyhow::anyhow!("bind live vector: {e}"))?);
     if let Some(glp) = model.glp.as_ref() {
         eprintln!(
             "[calibrate] debug: bound alpha={} layers={:?} direction.{} present={}",
             glp.alpha,
             glp.device_directions.keys().collect::<Vec<_>>(),
-            cfg.layer + 1,
-            glp.direction_for((cfg.layer + 1) as u32).is_some()
+            cfg.layer,
+            glp.direction_for(cfg.layer as u32).is_some()
         );
     }
     let live_logits = probe_logits(&mut model, &probe)?;
@@ -280,7 +286,7 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
         eprintln!("[calibrate] debug: layer-{} state shift with GLP bound: {d}", cfg.layer);
         // restore binding for the shift assertion below
         let vector = GlpVector::load(&cfg.out).map_err(|e| anyhow::anyhow!("re-read for rebind: {e}"))?;
-        model.glp = Some(BoundGlp::bind(vector, None, &device).map_err(|e| anyhow::anyhow!("rebind: {e}"))?);
+        model.glp = Some(BoundGlp::bind(vector, None, &device, GlpHookPoint::FfnOutPreResidual, config.num_hidden_layers, config.hidden_size).map_err(|e| anyhow::anyhow!("rebind: {e}"))?);
     }
     anyhow::ensure!(
         live_delta > 1e-3,
@@ -316,7 +322,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 fn write_glp_gguf(
     path: &PathBuf,
-    layer_1based: usize,
+    layer_zero_based: usize,
     direction: &[f32],
     alpha: f32,
     content_sha256: &str,
@@ -332,14 +338,23 @@ fn write_glp_gguf(
     w.write_header(1, 14)?;
     w.write_metadata_kv("general.architecture", &MetaValue::String("glp".into()))?;
     w.write_metadata_kv("glp.mode", &MetaValue::String("project".into()))?;
+    // The vector is APPLIED at the DeepSeek-V4 FFN-writer hook (the site
+    // hf2q's DeepSeek forward steers: ffn_output = moe + shared, before
+    // dispatch_hc_post) — the same `glp.hook_point` the published GLP-29
+    // declares and the ds4 reference reader implements. The serve-side bind
+    // refuses any vector whose hook_point is not exactly this site.
     w.write_metadata_kv(
         "glp.hook_point",
-        &MetaValue::String("residual_stream_post_layer".into()),
+        &MetaValue::String("ffn_out_pre_residual".into()),
     )?;
-    // derive_at == hook_point here: the capture site IS the apply site.
-    // The weightless preflight reads the pair to catch site transfers.
+    // The direction is DERIVED from the post-layer complete hyper-connection
+    // state (stream 0, last sequence position) — the accumulated-residual
+    // site, declared honestly. Per spec, `derived_at` may differ from
+    // `hook_point` (the published GLP-29 is derived at the residual and
+    // applied at the FFN writer); the pair travels with the file so a
+    // consumer can see the site transfer instead of guessing.
     w.write_metadata_kv(
-        "glp.derive_at",
+        "glp.derived_at",
         &MetaValue::String("residual_stream_post_layer".into()),
     )?;
     w.write_metadata_kv("glp.spec_version", &MetaValue::U32(1))?;
@@ -358,7 +373,14 @@ fn write_glp_gguf(
         "glp.validation",
         &MetaValue::String("canary pair only (zero-dose no-op + live logit shift); behavioral gates pending — candidate generator, not validated derivation".into()),
     )?;
-    w.write_metadata_kv("glp.layer_ids_zero_based", &MetaValue::Bool(false))?;
+    // Covered 0-based layer ids, as a comma-separated string — the same
+    // shape the reference producer writes (GLP-29 carries
+    // "10,11,...,38"). Redundant with the spec's no-offset direction.N
+    // rule, kept for provenance parity.
+    w.write_metadata_kv(
+        "glp.layer_ids_zero_based",
+        &MetaValue::String(layer_zero_based.to_string()),
+    )?;
     w.write_metadata_kv(
         "general.base_model.0.name",
         &MetaValue::String(base_model_name.into()),
@@ -368,7 +390,7 @@ fn write_glp_gguf(
         &MetaValue::String(base_model_org.into()),
     )?;
     let idx = w.reserve_tensor_info(
-        &format!("direction.{layer_1based}"),
+        &format!("direction.{layer_zero_based}"),
         &[direction.len() as u64],
         crate::quantize::ggml_quants::GgmlType::F32,
     )?;
@@ -379,4 +401,74 @@ fn write_glp_gguf(
     w.stream_tensor_payload(idx, bytes)?;
     w.finalize()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exported file must round-trip through the GLP reader and bind on
+    /// the DeepSeek family hook: `glp.hook_point` names the actual apply
+    /// site (the FFN writer), `glp.derived_at` is spelled per spec and
+    /// declares the capture site, and the direction tensor is
+    /// `direction.<0-based layer>` verbatim (spec: no offset).
+    #[test]
+    fn exported_gguf_round_trips_with_the_deepseek_hook_contract() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-calibrate-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("roundtrip.glp.gguf");
+        let direction: Vec<f32> = vec![0.3, -0.4, 0.5];
+
+        write_glp_gguf(
+            &path,
+            29, // 0-based capture layer, exported verbatim
+            &direction,
+            1.0,
+            "deadbeef",
+            "test-model",
+            "test-org",
+        )
+        .unwrap();
+
+        let vector = crate::inference::glp::GlpVector::load(&path).unwrap();
+        assert_eq!(
+            vector.hook_point,
+            crate::inference::glp::GlpHookPoint::FfnOutPreResidual,
+            "export must declare the DeepSeek apply site"
+        );
+        assert_eq!(
+            vector.derived_at.as_deref(),
+            Some("residual_stream_post_layer"),
+            "derived_at must be spec-spelled and declare the capture site"
+        );
+        assert_eq!(
+            vector.layers.len(),
+            1,
+            "exactly one direction tensor must be written"
+        );
+        let exported_layer = *vector.layers.keys().next().unwrap();
+        assert_eq!(
+            exported_layer, 29,
+            "direction.N must be the 0-based capture layer, verbatim (no +1)"
+        );
+        for (a, b) in vector.layers[&29].iter().zip(direction.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice");
+        crate::inference::glp::BoundGlp::bind(
+            vector,
+            None,
+            &device,
+            crate::inference::glp::GlpHookPoint::FfnOutPreResidual,
+            43,
+            3,
+        )
+        .expect("calibrate output must bind on the DeepSeek family hook");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

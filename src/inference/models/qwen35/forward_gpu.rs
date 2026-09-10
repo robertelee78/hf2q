@@ -5686,9 +5686,12 @@ impl Qwen35Model {
             // layer's FFN (either the fused fold from the FFN command buffer,
             // or `residual_add_gpu` output); the GLP spec's hook point is
             // `residual_stream_post_layer`, applied per layer at exactly this
-            // assignment. Per-layer dispatch; off unless a vector is bound.
+            // assignment. Per-layer dispatch; off unless a vector is bound,
+            // and the bind refuses any vector whose `glp.hook_point` is not
+            // this site. Spec layer mapping: `direction.N` applies at layer
+            // N (0-based graph layer), no offset.
             if let Some(glp) = self.glp.as_ref() {
-                if let Some(direction) = glp.direction_for((layer_idx + 1) as u32) {
+                if let Some(direction) = glp.direction_for(layer_idx as u32) {
                     crate::inference::glp::apply_layer_gpu(
                         &mut hidden,
                         direction,
@@ -7369,6 +7372,29 @@ impl Qwen35Model {
                 _ => residual_add_gpu(ffn_residual_buf_ref, &ffn_out, &device, &mut registry)
                     .with_context(|| format!("residual ffn greedy layer {layer_idx}"))?,
             };
+
+            // ADR-053: GLP steering in the GREEDY path — the same
+            // post-layer-residual hook the full-logits path applies (see
+            // the block above the layer loop). S2 fix: this path previously
+            // finished the layer without the hook, so a steered server
+            // applied GLP during prefill and then silently stopped during
+            // greedy decoding. Same site (`residual_stream_post_layer`),
+            // same spec layer mapping (`direction.N` at layer N, 0-based).
+            if let Some(glp) = self.glp.as_ref() {
+                if let Some(direction) = glp.direction_for(layer_idx as u32) {
+                    crate::inference::glp::apply_layer_gpu(
+                        &mut hidden,
+                        direction,
+                        glp.mode(),
+                        glp.alpha,
+                        &device,
+                        &mut registry,
+                        seq_len,
+                        h,
+                    )
+                    .with_context(|| format!("glp apply greedy layer {layer_idx}"))?;
+                }
+            }
 
             // ADR-015 iter61a-3: per-op bisection dumps at layer end.
             // We dump (a) ffn_residual_buf_ref = post-attn-residual (= input

@@ -367,13 +367,46 @@ impl Qwen35LoadedModel {
                 .map_err(|e| anyhow::anyhow!("GLP bind device: {e}"))?;
             let vector = crate::inference::glp::GlpVector::load(glp_path)
                 .with_context(|| format!("GLP load: {}", glp_path.display()))?;
-            let bound = crate::inference::glp::BoundGlp::bind(vector, opts.glp_alpha, &device)
+            let bound = crate::inference::glp::BoundGlp::bind(
+                vector,
+                opts.glp_alpha,
+                &device,
+                crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer,
+                model.cfg.num_hidden_layers,
+                model.cfg.hidden_size,
+            )
                 .with_context(|| format!("GLP bind: {}", glp_path.display()))?;
+            // S8: base-model metadata is provenance, not an enforced
+            // checkpoint identity (deliberate relaxation — the spec does
+            // not forbid cross-checkpoint vectors). Warn loudly when the
+            // declared base model differs from the model being served.
+            if let Some(declared) = bound.vector.base_model_name.as_deref() {
+                let served = gguf
+                    .metadata_string("general.name")
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        model_path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_else(|| "qwen35-model".into());
+                if !declared.is_empty()
+                    && !served.to_lowercase().contains(&declared.to_lowercase())
+                {
+                    tracing::warn!(
+                        declared_base_model = declared,
+                        served_model = %served,
+                        "GLP vector base model differs from the served model;                          directions are not checkpoint-bound"
+                    );
+                }
+            }
             tracing::info!(
                 layers = bound.vector.layers.len(),
                 width = bound.vector.width,
                 alpha = bound.alpha,
                 mode = ?bound.mode(),
+                hook = bound.vector.hook_point.as_str(),
+                derived_at = bound.vector.derived_at.as_deref().unwrap_or("<same as hook>"),
                 path = %glp_path.display(),
                 "GLP vector bound to Qwen35"
             );
@@ -1605,7 +1638,14 @@ fn qwen35_grammar_terminal_token(
 ///
 /// Mirrors `engine::build_lcp_key_for_request` (the Gemma version)
 /// at engine.rs:3742 with the same provenance / fingerprint logic.
-/// Tenant + params hash empty for v1 — same scope as Gemma's iter-2.
+/// Tenant empty for v1 — same scope as Gemma's iter-2.
+///
+/// S6 fix: `params_hash` carries a fingerprint of every
+/// activation-affecting GLP configuration (hook, mode, dose, and the raw
+/// per-layer direction bytes). Steering changes what the saved activations
+/// mean; two servers sharing a model identity and cache directory but
+/// steering differently must not address each other's saved KV. Unsteered
+/// servers hash the constant "none" and keep the v1 key shape.
 fn build_lcp_key_for_qwen35(
     qwen: &Qwen35LoadedModel,
     _params: &SamplingParams,
@@ -1633,11 +1673,42 @@ fn build_lcp_key_for_qwen35(
         source_sha256,
         &chat_template_hash,
     );
+    let params_hash = glp_steering_params_hash(qwen.model.glp.as_ref());
     crate::serve::kv_persist::lcp_registry::LcpKey {
         model_fingerprint: fp,
         tenant_id: String::new(),
-        params_hash: 0,
+        params_hash,
     }
+}
+
+/// Fingerprint of the activation-affecting steering configuration: hook
+/// point, operation mode, dose (alpha), and the raw per-layer direction
+/// bytes in layer order. Raw (pre-normalization) bytes are hashed so the
+/// identity tracks the vector FILE, not the derived upload.
+fn glp_steering_params_hash(glp: Option<&crate::inference::glp::BoundGlp>) -> u64 {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    match glp {
+        None => h.update(b"glp=none"),
+        Some(bound) => {
+            h.update(b"glp=v1");
+            h.update(bound.vector.hook_point.as_str().as_bytes());
+            let mode_str = match bound.mode() {
+                crate::inference::glp::GlpMode::Project => "project",
+                crate::inference::glp::GlpMode::Add => "add",
+            };
+            h.update(mode_str.as_bytes());
+            h.update(&bound.alpha.to_le_bytes());
+            for (layer, direction) in &bound.vector.layers {
+                h.update(&layer.to_le_bytes());
+                for value in direction {
+                    h.update(&value.to_le_bytes());
+                }
+            }
+        }
+    }
+    let digest = h.finalize();
+    u64::from_le_bytes(digest[..8].try_into().expect("sha256 prefix"))
 }
 
 /// ADR-017 Phase E.a B.3 — chunk-position-keyed LcpKey for mid-prefill
@@ -11082,5 +11153,98 @@ mod tests {
             let tq = slot.tq.as_ref().unwrap();
             assert_eq!(tq.norms_per_pos, 1, "head_dim=256 → norms_per_pos=1");
         }
+    }
+}
+
+#[cfg(test)]
+mod glp_cache_identity_tests {
+    use super::*;
+    use crate::inference::glp::bind::BoundGlp;
+    use crate::inference::glp::reader::{GlpHookPoint, GlpMode, GlpVector};
+    use std::collections::BTreeMap;
+
+    fn bound(hook: GlpHookPoint, mode: GlpMode, alpha: f32, layers: BTreeMap<u32, Vec<f32>>) -> BoundGlp {
+        BoundGlp {
+            vector: GlpVector {
+                mode,
+                hook_point: hook,
+                derived_at: None,
+                alpha_default: alpha,
+                rank: 1,
+                layers,
+                width: 2,
+                content_sha256: None,
+                method: None,
+                base_model_name: None,
+            },
+            alpha,
+            device_directions: BTreeMap::new(),
+        }
+    }
+
+    /// S6: the LCP key must separate saved activations across steering
+    /// configurations. Same config → same hash; any change to vector
+    /// content, dose, hook, or mode → different hash; unsteered → stable.
+    #[test]
+    fn steering_config_is_part_of_lcp_identity() {
+        let layers = BTreeMap::from([(3u32, vec![0.5f32, -0.5])]);
+        let a = bound(
+            GlpHookPoint::ResidualStreamPostLayer,
+            GlpMode::Project,
+            1.0,
+            layers.clone(),
+        );
+        let a2 = bound(
+            GlpHookPoint::ResidualStreamPostLayer,
+            GlpMode::Project,
+            1.0,
+            layers.clone(),
+        );
+        assert_eq!(
+            glp_steering_params_hash(Some(&a)),
+            glp_steering_params_hash(Some(&a2)),
+            "identical steering must reuse the same key"
+        );
+
+        // Dose change.
+        let dose = bound(
+            GlpHookPoint::ResidualStreamPostLayer,
+            GlpMode::Project,
+            4.0,
+            layers.clone(),
+        );
+        assert_ne!(
+            glp_steering_params_hash(Some(&a)),
+            glp_steering_params_hash(Some(&dose)),
+            "dose change must rebuild, not reuse"
+        );
+
+        // Vector content change.
+        let other_layers = BTreeMap::from([(3u32, vec![0.5f32, 0.25])]);
+        let other = bound(
+            GlpHookPoint::ResidualStreamPostLayer,
+            GlpMode::Project,
+            1.0,
+            other_layers,
+        );
+        assert_ne!(
+            glp_steering_params_hash(Some(&a)),
+            glp_steering_params_hash(Some(&other)),
+            "vector change must rebuild, not reuse"
+        );
+
+        // Mode change.
+        let add = bound(
+            GlpHookPoint::ResidualStreamPostLayer,
+            GlpMode::Add,
+            1.0,
+            layers.clone(),
+        );
+        assert_ne!(glp_steering_params_hash(Some(&a)), glp_steering_params_hash(Some(&add)));
+
+        // Unsteered is stable and distinct from any steered config.
+        let none = glp_steering_params_hash(None);
+        assert_eq!(none, glp_steering_params_hash(None));
+        assert_ne!(none, glp_steering_params_hash(Some(&a)));
     }
 }

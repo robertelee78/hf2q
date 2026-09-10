@@ -71,15 +71,36 @@ operand — the `--mmproj` shape.
   `add`; unimplemented modes/hooks, `direction.0`, or unknown
   `glp.hook_point` are **fatal**. `project` never merges with another
   cvec. `glp.alpha_default` is used unless `--glp-alpha` overrides.
-- The hook point is `hidden_states + residual` per layer (post-layer
-  residual stream). For DeepSeek-V4's multi-hyper connection
-  `[rows, 4, hidden]` output_state after the `dispatch_hc_post` fold —
-  which materializes the complete HC state per layer. (The retraction of
-  2026-09-09 corrects the assertion in the weightless posts: DeepSeek's
-  native graph DOES fold the HC residual into a complete `output_state` at
-  this point, unlike anchor-lift on the FFN write pre-fold.) The
-  per-stream direction discipline says each of the `hc` streams is steered
-  with its own direction slice, never the flattened sum.
+- Hook points are family-specific and enforced at bind (2026-09-10
+  correction, per spec/GLP.md's recognized-values table — the hooks are
+  different tensors and NOT interchangeable, and a reader whose hook does
+  not match must refuse the file):
+  - **Qwen:** `residual_stream_post_layer` — the complete post-layer
+    residual (`hidden + residual` after the FFN fold), applied on every
+    execution path including greedy decode (the greedy path previously
+    omitted the hook — steering silently stopped during greedy decoding).
+  - **DeepSeek-V4:** `ffn_out_pre_residual` — the FFN writer
+    (`ffn_output = moe + shared`) immediately before the
+    `dispatch_hc_post` fold: the same site the ds4 reference reader
+    steers and the `glp.hook_point` the published GLP-29 declares. (The
+    2026-09-09 retraction of the weightless-posts claim stands: the native
+    graph does fold a complete post-layer HC state — but the *declared
+    hook* for this family's vectors is the writer, not the fold.)
+  - Layer mapping is the spec's flat rule: `direction.N` applies at layer
+    N (0-based), no offset. The previous `layer + 1` lookup applied every
+    direction one layer early on both families — self-consistent with
+    hf2q's own off-by-one exporter, silent for interchange files (adjacent
+    layers' refusal directions have cosine 0.555–0.979); proven fixed by
+    the differential layer-mapping probe (below-layer delta 0.00000000,
+    at-layer delta 0.026533).
+  - The mHC per-stream discipline (each `hc` stream steered with its own
+    direction slice, per-stream norms, never the flattened sum) is
+    implemented in the (currently unused) mHC helpers with GPU-vs-CPU
+    reference proofs; the production DeepSeek path steers the writer with
+    the dense projection.
+  - Qwen prefix-cache identity includes the full steering configuration
+    (raw direction bytes, hook, mode, dose) — two differently-steered
+    servers can no longer address each other's saved KV.
 - Grammar class engaged by `--gcd` is a serve-config choice between the
   measured arms (B12-class framed reasoning; B10-class static+exclusion for
   thinking-on turns). Operator overridable via launcher env; the inline

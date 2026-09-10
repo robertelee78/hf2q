@@ -747,14 +747,38 @@ impl Deepseek4LoadedModel {
             let device = model.ctx.device().clone();
             let vector = crate::inference::glp::GlpVector::load(glp_path)
                 .with_context(|| format!("GLP load: {}", glp_path.display()))?;
-            let bound = crate::inference::glp::BoundGlp::bind(vector, opts.glp_alpha, &device)
+            let bound = crate::inference::glp::BoundGlp::bind(
+                vector,
+                opts.glp_alpha,
+                &device,
+                crate::inference::glp::GlpHookPoint::FfnOutPreResidual,
+                model.cfg.num_hidden_layers,
+                model.cfg.hidden_size,
+            )
                 .with_context(|| format!("GLP bind: {}", glp_path.display()))?;
+            // S8: base-model metadata is provenance, not an enforced
+            // checkpoint identity (deliberate relaxation — the spec does
+            // not forbid cross-checkpoint vectors). Warn loudly when the
+            // declared base model differs from the served model.
+            if let Some(declared) = bound.vector.base_model_name.as_deref() {
+                let served = model_id.as_str();
+                if !declared.is_empty()
+                    && !served.to_lowercase().contains(&declared.to_lowercase())
+                {
+                    eprintln!(
+                        "[GLP] warning: vector declares base model {declared:?} \
+                         but serving {served:?}; directions are not checkpoint-bound"
+                    );
+                }
+            }
             eprintln!(
-                "[GLP] vector bound: layers={} width={} alpha={} mode={:?} path={}",
+                "[GLP] vector bound: layers={} width={} alpha={} mode={:?} hook={} derived_at={} path={}",
                 bound.vector.layers.len(),
                 bound.vector.width,
                 bound.alpha,
                 bound.mode(),
+                bound.vector.hook_point.as_str(),
+                bound.vector.derived_at.as_deref().unwrap_or("<same as hook>"),
                 glp_path.display()
             );
             let mut model = model;

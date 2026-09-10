@@ -5,7 +5,10 @@
   handlers, chat forwarding, `examples/recon-opportunities.schema.json`, and
   the `gcd_schema_tests` battery cells (including the tightened-subschema
   and observability refinements from issue #192). The lockdown mode
-  (`--gcd-schema-locked`) documented below is not yet coded.
+  (`--gcd-schema-locked`) documented below is implemented on branch
+  `fix/gcd-schema-locked`: the flag (requires `--gcd-schema`), the 400
+  rejection in the handlers ahead of the undeclared-params check, chat
+  forwarding, and the `gcd_schema_lockdown_tests` battery cells.
 - **Date:** 2026-09-09
 - **Related:** ADR-053 (GLP/GCD serving surface), ADR-055 (alphabet presets),
   ADR-056 (conformance battery), ADR-052 (structured-output compatibility)
@@ -66,9 +69,14 @@ array. That residue is the embeddings gate's layer, unchanged.
    refusal-as-structure; refusal-as-*content* can still live inside string
    fields, and the schema itself enables a subtler shape: formal compliance
    with emptied content (`{"steps": []}`, minimal strings) — refusal by
-   vacuity. The fix is free: JSON Schema's `minItems`, `minLength`, and
-   `required` all compile to GBNF bounds, so the arm ships **tightened
-   subschemas by default** (see Decision). The remaining layers port to the
+   vacuity. The vacuity fix is free: JSON Schema's `minItems`, `minLength`,
+   and `required` all compile to GBNF bounds, so the arm ships **tightened
+   subschemas by default** (see Decision). Scope matters and is stated
+   flatly: these bounds make refusal-by-EMPTIED-CONTENT unrepresentable;
+   no schema bound makes refusal PROSE unrepresentable — an independent
+   validator accepts an object carrying refusal text in every required
+   string field of the shipped example, and catching that residue is the
+   embeddings gate's job, not the schema's. The remaining layers port to the
    object level unchanged: the W1 exclusion automaton runs over string-field
    content, the pinned anchor can move inside the schema as a per-field
    prefix (subject to verification of json_schema.rs pattern support), and

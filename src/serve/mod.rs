@@ -4356,6 +4356,9 @@ pub fn cmd_serve(
             }
             None => None,
         },
+        // ADR-057 lockdown mode: clap guarantees the flag is only set when
+        // --gcd-schema is (requires attribute); the grammar above is Some.
+        gcd_schema_locked: args.gcd_schema_locked,
     };
 
     // Warn when exposing beyond localhost. Decision #7 + #13 — public-internet

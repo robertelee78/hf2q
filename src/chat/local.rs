@@ -40,6 +40,7 @@ pub(crate) struct OwnedServeFlags {
     pub glp_alpha: Option<f32>,
     pub ctx: Option<u32>,
     pub gcd_schema: Option<std::path::PathBuf>,
+    pub gcd_schema_locked: bool,
 }
 
 #[derive(Debug)]
@@ -130,6 +131,7 @@ async fn resolve_local(
             glp_alpha: args.glp_alpha,
             ctx: args.ctx,
             gcd_schema: args.gcd_schema.clone(),
+            gcd_schema_locked: args.gcd_schema_locked,
         },
     )
     .context("start hf2q serve")?;
@@ -306,6 +308,9 @@ fn append_owned_server_args(
     }
     if let Some(gcd_schema) = &flags.gcd_schema {
         command.arg("--gcd-schema").arg(gcd_schema);
+    }
+    if flags.gcd_schema_locked {
+        command.arg("--gcd-schema-locked");
     }
 }
 
@@ -707,6 +712,7 @@ mod tests {
         // Default flags forward nothing.
         assert!(!args.iter().any(|a| a == "--gcd"));
         assert!(!args.iter().any(|a| a == "--glp"));
+        assert!(!args.iter().any(|a| a == "--gcd-schema-locked"));
     }
 
     #[cfg(unix)]
@@ -723,6 +729,7 @@ mod tests {
                 glp_alpha: Some(6.0),
                 ctx: Some(65536),
                 gcd_schema: Some(std::path::PathBuf::from("/tmp/schema.json")),
+                gcd_schema_locked: true,
             },
             42,
             43,
@@ -742,6 +749,7 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--gcd-schema", "/tmp/schema.json"]));
+        assert!(args.iter().any(|a| a == "--gcd-schema-locked"));
     }
 
     #[cfg(unix)]
