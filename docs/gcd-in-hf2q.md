@@ -366,10 +366,10 @@ while preserving useful capability.
 
 ## Refusal control as a case study
 
-The hf2q grammar campaign provides a concrete example of GCD changing model
-behavior with the base weights held unchanged. The **W1** grammar combines a
-fixed opening, a bounded topic sentence, and a body with a restricted alphabet
-and lexical exclusions. It can block the particular forms that its rules
+The hf2q grammar campaign records responses generated under a
+refusal-suppression grammar, with the base weights held unchanged. The **W1**
+grammar combines a fixed opening, a bounded topic sentence, and a body with a
+restricted alphabet and lexical exclusions. It can block the particular forms that its rules
 exclude. It cannot recognize every way of declining a task.
 
 The historical W1 grammar and the later embedded **W6V2** grammar are distinct

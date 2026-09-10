@@ -28,6 +28,8 @@ findings as fixed or establish publication readiness.
 
 ## Prose and rendering
 
+- The case-study opening describes the recorded grammar-conditioned responses
+  without claiming an isolated causal effect.
 - Both independent concept and source reviews were incorporated. The source
   reviewer confirmed S1–S18 and their distinctions between active defects,
   latent helpers, intended boundaries, and unmeasured hardware consequences.
@@ -99,9 +101,9 @@ hash because its creation timestamp changes.
 ## Artifact identity at validation
 
 - `docs/gcd-in-hf2q.md`
-  SHA-256: `e7b4174fc581d715841e7d7bd88173a4c6c8397354539b81b19bb928f5ef353e`
+  SHA-256: `21459bfbe3549e884bfe73d6d45a03d10c5317f2b161755783906a9f6d4e80e3`
 - `docs/gcd-in-hf2q.pdf`
-  SHA-256: `062b3a3273875a4f735d5eb180e6526788f5baba7b58b7e115d6e9ad8c820a4a`
+  SHA-256: `80a4f9bf15a21e90a66b365c7ce7b170ad34a4834faa56f3f57a78f9f86f4a77`
 - `docs/figures/gcd/evidence.json`
   SHA-256: `3eab958f32452dfb6960f9491baf0b923a7a7865377648d3f952d35e39362650`
 
