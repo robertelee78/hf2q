@@ -61,6 +61,24 @@ exclude = [
     "docs/adr/007-pathC/",
     # Per-runbook docs that ship at the URL via repository link.
     "docs/operator-peer-refresh-runbook.md",
+    # The GCD write-up ships at the repository URL; its rebuilt PDF and the
+    # stack diagram are multi-MB binaries that pushed the package past the
+    # crates.io 10 MiB upload cap (0.1.21 measured 12.28 MiB and was rejected
+    # with 413 Payload Too Large). Keep the markdown; drop the binaries.
+    "docs/*.pdf",
+    "docs/figures/",
+    # Generated grammar-probe artifacts and campaign measurement evidence:
+    # reproducible from the committed generators (w5_gen.py, w6_gen.py,
+    # harvest_lexicon.py) and the judged corpora; the shipped default grammar
+    # lives in src/serve/api/grammar/gcd_w1.gbnf. The multi-MB generated
+    # .gbnf outputs and .jsonl results are not consumer source.
+    "scripts/grammar_probe/*.gbnf",
+    "scripts/grammar_probe/*.jsonl",
+    "scripts/grammar_probe/__pycache__/",
+    # CI/CD workflow definitions are not consumer-facing source.
+    ".github/",
+    # macOS Finder metadata never belongs in a published tarball.
+    "**/.DS_Store",
 ]
 
 [features]

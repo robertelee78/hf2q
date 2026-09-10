@@ -101,3 +101,6 @@ tests/fixtures/vision/last_e2e_report.json
 
 # Claude Flow runtime data
 # Environment variables
+
+__pycache__/
+.DS_Store
