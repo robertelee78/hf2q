@@ -5,7 +5,7 @@ figures, source inspection, archived measurements, and PDF rendering.
 
 ## Source and evidence
 
-The implementation account is bound to `c310ec9ce707dca2036f644d3cf2c041e318060f`. This source identity
+The implementation account is bound to `92afc4a317c90ea527033228e0492f392778e412`. This source identity
 is separate from the binary identities in experimental records.
 The historical W1 snapshot remains
 `44004311717d414feaa54384578e2bcf4d140464`; the follow-up extractor retains
@@ -103,9 +103,9 @@ PDF creation timestamps can change the output hash on a later render.
 ## Artifact identity at validation
 
 - `docs/gcd-in-hf2q.md`
-  SHA-256: `498e0e2565c0601b9d9ae5aa7a108cf1bf840fd890a1b3e59f80832eae21537b`
+  SHA-256: `5fbbf29149e17b39f70b688da725204784c6299d3e94ac2a359612c343df4980`
 - `docs/gcd-in-hf2q.pdf`
-  SHA-256: `dbc76b834612856474456a36169f886ef141d066d808ef8fdb58cf6c80fdb2e6`
+  SHA-256: `1d69547e57d1b0c8612a6a7ca1ba86e0a90d4dbb66b960bf341bd80b47689eed`
 - `docs/figures/gcd/evidence.json`
   SHA-256: `3eab958f32452dfb6960f9491baf0b923a7a7865377648d3f952d35e39362650`
 - `docs/figures/gcd/followup-evidence.json`
