@@ -1,88 +1,80 @@
 # Publication artifact validation
 
 Final editorial pass: September 10, 2026. This record covers the article,
-figures, source review, archived measurements, and rendering. It does not
-certify unresolved runtime or measurement paths as validated.
+figures, source inspection, archived measurements, and PDF rendering.
 
 ## Source and evidence
 
-- The current implementation account is bound to
-  `294907cd655ee81eedb8d8b9ea30ab80ade483bb`. Current source references use that
-  revision; historical judge/probe references retain their original snapshot.
-- `evidence.json` remains byte-identical to the prior historical audit. Its
-  source snapshot is `44004311717d414feaa54384578e2bcf4d140464` and its 30 input
-  hashes and 3,072 observations are unchanged.
-- Fresh extraction reproduces that historical JSON exactly after reading
-  source-only inputs from the pinned Git revision. Local tracked observation
-  files must match that revision; later source repairs are not mislabeled as
-  historical code.
-- `followup-evidence.json` separately hashes 59 inputs and recomputes all
-  three historical termination/state/validity cross-tabs, 240 later GLP
-  generation/verdict pairs, calibration-text overlap, and battery attempts.
-  A second extraction reproduces this JSON exactly.
-- DeepSeek's 823 historical capped responses comprise 733 fulfillment labels,
-  85 degenerate labels, and five other labels; 19 of those 733 fulfillment
-  labels also carry an invalid-output flag. The paper does not present these
-  cross-tabs as a new judging pass.
-- The five GLP arms reproduce adversarial maintained-refusal counts of
-  28, 28, 28, 29, and 29 of 32. Benign fulfillment labels are 4, 3, 3, 2, and
-  3 of 16; benign token-limit terminations are 14, 15, 14, 15, and 15.
-  Six panel texts overlap the calibration corpus. All 240 responses fit
-  below that run's 2,500-character judge-input limit.
-- The battery contains 68 rows in four 17-cell attempts, with 14, 15, 16,
-  and 17 passes respectively. The final attempt has no failures or skips.
-  Its incomplete run identity and narrow assertions remain explicit.
-- All 29 historical CSV outcome rows remain unchanged. The workbook has
-  12 sheets, including separate GLP counts/transitions, termination cross-tabs,
-  battery attempts, and follow-up source hashes. GLP count and termination
-  cells were checked against the JSON, independently of prose tables.
+The implementation account is bound to `c310ec9ce707dca2036f644d3cf2c041e318060f`. This source identity
+is separate from the binary identities in experimental records.
+The historical W1 snapshot remains
+`44004311717d414feaa54384578e2bcf4d140464`; the follow-up extractor retains
+`294907cd655ee81eedb8d8b9ea30ab80ade483bb` for the later archived inputs.
 
-## Implementation and measurement review
+- `evidence.json` is unchanged from the historical audit: 30 input hashes
+  and 3,072 observations. Its 29 outcome CSV rows are unchanged.
+- `followup-evidence.json` hashes 59 inputs and recomputes historical
+  termination/validity cross-tabs, 240 GLP generation/verdict pairs,
+  calibration-text overlap, and the operational battery. Both evidence
+  snapshots were independently reproduced from their pinned source inputs.
+- DeepSeek's 823 capped responses comprise 733 historical fulfillment labels,
+  85 degenerate labels, and five other labels. Nineteen of the 733 fulfillment
+  labels also carry an invalid-output flag. This cross-tab is not new judging.
+- The five GLP arms contain 28, 28, 28, 29, and 29 adversarial refusals of 32.
+  Benign fulfillment labels are 4, 3, 3, 2, and 3 of 16; token-limit endings
+  are 14, 15, 14, 15, and 15. Six panel texts overlap calibration. None of
+  these 240 responses reaches that judge driver's 2,500-character input limit.
+- The battery contains four 17-cell attempts, with 14, 15, 16, and 17 passes.
+  The final attempt has no failures or skips; its scope and incomplete
+  runtime identity remain explicit in the article.
+- The workbook contains 12 sheets. GLP and termination cells were checked
+  against JSON independently of the prose tables.
 
-Independent source, concept, and harness reviews were incorporated. The
-source review credits the landed hook/mode, graph-layer, dispatch, greedy-path,
-cache-identity, and grammar-composition repairs. It identifies the remaining
-checkpoint/discovery limitations and two new locked-schema path defects.
+## Implementation and measurement validation
 
-All 13 supplied offline/mock harness tests passed; historical artifacts were
-unchanged by those tests. Additional in-memory probes reproduced reporting
-budget collapse, acceptance of a wrong response hash, ignored pass selection,
-and shortened human-review input. The companion review records those findings
-without changing the runtime, harness, or original measurements. The separate
-repair handoff includes an executed offline reproducer for budget collapse,
-ignored pass selection, and shortened human-review input.
+Source review verified the operation/hook, graph-layer, greedy-path,
+cache-identity, and default-grammar corrections. The final pass also repairs
+locked-schema policy composition, GLP artifact selection and checkpoint
+binding, calibration export provenance, and measurement record integrity.
 
-The paper distinguishes repaired full-response dispatch and cross-field
-validation from a completed replacement scoring pass. It does not claim
-preserved benign capability, a causal reflection effect, exhaustive battery
-conformance, or a latency improvement from the new observations.
+The focused Python suite exercises complete-response judging, versioned
+passes, hash-checked joins, separate run/budget conditions, independent human
+review exports, owned runtime identity, configuration drift, and campaign
+process cleanup. The CI workflow runs these tests alongside focused Rust
+contracts for policy enforcement, runtime snapshots, GLP reading/discovery,
+checkpoint binding, and calibration exports. Exact-head CI results are
+recorded on the associated pull request; this document does not substitute
+for those results.
+
+Offline and mocked checks do not constitute real-model validation of the new
+paths. The existing DeepSeek campaign retains its original generation harness
+and configuration; subsequent managed judging produces a separate scoring
+pass. No completed replacement pass is included in this article. Historical
+observations and unknown historical identities have not been rewritten.
 
 ## Prose, figures, and PDF
 
-- Seven A4 pages, with a full-width title and abstract, seven main sections,
-  three numbered equations, five captioned tables, four captioned figures,
-  and 17 references. All 31 numeric citation links target the references on
-  the final page.
-- Every page received independent visual review. The final opening,
-  implementation, GLP-result, and reference pages were also inspected after
-  the last wording changes. No material clipping, gutter collision, or
-  unreadable table/figure text was found.
-- All four SVGs parse and all PNGs decode. Figure 1 now calls an accepting
-  state structural completion; Figure 4 identifies historical judgment
-  labels. Geometry and entry-probe figures retain their prior meaning.
-- The twelve-prompt mean remains 99.97% in prose and Figure 3; exact raw
-  probabilities remain in the historical snapshot and workbook.
-- Extracted PDF text has no replacement glyphs or words outside page bounds.
-- Twenty-four local file links in the article, companion review, repair handoff,
-  figure guide, and getting-started guide resolve. Historical source links in the companion
-  review were pinned instead of pointing old line numbers into repaired code.
-- Private research is credited only broadly. Publication text, figure sources,
-  JSON, workbook cells, and PDF text/links were checked for private repository
-  identifiers and record filenames, and for the author's terminology preference.
-- README and getting-started guidance now describe the corrected default
-  grammar composition. Source-build and exact-checkpoint caveats remain.
-- Tracked and staged diffs pass Git whitespace checks. The PDF remains scoped
-  as binary in the documentation attributes file.
+- Seven A4 pages with two columns, a full-width title and abstract, seven
+  main sections, three numbered equations, five tables, four figures, and
+  17 references. All 34 numeric citation links resolve to the bibliography.
+- Every page was visually reviewed. No material clipping, gutter collision,
+  or unreadable figure/table text was found. Bibliography spacing keeps the
+  final reference on page seven without reducing the reference font size.
+- Four SVGs parse and all accompanying PNGs decode. The control diagram
+  describes structural acceptance; the outcome figure identifies historical
+  judge labels. The geometry figure is explicitly illustrative.
+- The twelve-prompt mean is 99.97% in prose and Figure 3. The exact raw
+  observations remain in the evidence snapshot and workbook.
+- Extracted PDF text contains no replacement glyphs or words outside page
+  bounds. All 18 checked local links in the article, figure guide, and
+  getting-started guide resolve.
+- Private research is credited broadly. Article text, figures, JSON, workbook
+  cells, and PDF text/links were checked for private repository identifiers
+  and filenames, and for the author's terminology preference.
+- README and getting-started examples describe the same grammar composition,
+  locked-schema behavior, and GLP compatibility rules as the reviewed source.
+- Git whitespace checks pass. The PDF is marked binary in documentation
+  attributes.
 
 ## Tools and reproduction
 
@@ -99,6 +91,8 @@ python3 scripts/grammar_probe/publication_followup.py \
   --out /tmp/gcd-followup-recomputed.json
 python3 scripts/grammar_probe/publication_figures.py
 python3 scripts/grammar_probe/publication_pdf.py
+PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover \
+  -s scripts/grammar_probe -p 'test*.py'
 git diff --check
 ```
 
@@ -109,17 +103,10 @@ PDF creation timestamps can change the output hash on a later render.
 ## Artifact identity at validation
 
 - `docs/gcd-in-hf2q.md`
-  SHA-256: `a5caef5464b05e2563c4cca1e2dfa509d20b66234be7ee18591e0cba5b3bfc3b`
+  SHA-256: `498e0e2565c0601b9d9ae5aa7a108cf1bf840fd890a1b3e59f80832eae21537b`
 - `docs/gcd-in-hf2q.pdf`
-  SHA-256: `4082a0d318876c81770cb55891cebba7a53c256dab2794407739140d6384e70b`
+  SHA-256: `dbc76b834612856474456a36169f886ef141d066d808ef8fdb58cf6c80fdb2e6`
 - `docs/figures/gcd/evidence.json`
   SHA-256: `3eab958f32452dfb6960f9491baf0b923a7a7865377648d3f952d35e39362650`
 - `docs/figures/gcd/followup-evidence.json`
   SHA-256: `99a0951f84e47a68ad5a142b98203264f9f86ca585d206736c7175beae1e4448`
-
-## Remaining implementation work
-
-This rendering validation did not run Rust/Metal compilation, model loading,
-fresh generation, live rejudging, or performance benchmarks. The article
-describes the scope of the runtime and measurement evidence separately.
-The retained historical observations remain unchanged.

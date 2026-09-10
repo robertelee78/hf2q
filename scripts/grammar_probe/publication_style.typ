@@ -14,7 +14,7 @@
 #show table: it => block(stroke: (top: 0.5pt, bottom: 0.5pt), inset: (y: 2pt), it)
 #show enum: set text(size: 8.5pt)
 #show enum: set par(justify: false, first-line-indent: 0pt)
-#set enum(spacing: 0.35em)
+#set enum(spacing: 0.15em)
 #show raw.where(block: false): set text(size: 7.7pt)
 #show link: set text(fill: black)
 #show figure.caption: set text(size: 8.5pt)
