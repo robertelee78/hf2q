@@ -84,10 +84,15 @@ produces a spec-conformant GLP file plus a lexical register report:
    excluded. Zero-vector no-op canary runs first (plumbing gate). Then the
    regime check (below).
 5. **Export.** Write a GLP-conformant GGUF (`direction.<N>` fp32 tensors,
-   `glp.mode=project`, `glp.hook_point=residual_stream_post_layer`,
-   `glp.spec_version=1`, `glp.alpha_default`, `glp.content_sha256`,
-   `general.base_model.*` provenance pinned to the loaded checkpoint's
-   commit/revision).
+   `glp.mode=project`, `glp.hook_point=ffn_out_pre_residual`,
+   `glp.derived_at=residual_stream_post_layer`, `glp.spec_version=1`,
+   `glp.alpha_default`, `glp.content_sha256`). Use the same actual-source
+   identity as the serving binder: an output-verified hf2q conversion receipt
+   supplies the repository and immutable revision when available; otherwise
+   export only the model's own name/organization, without inventing a revision.
+   Model-card ancestors never become the vector's target checkpoint. Re-read
+   the export through checkpoint compatibility validation before the canary;
+   offline export tests cover a finetune whose ancestor differs from its source.
 6. **Register report.** A 6-prompt lexical canary (uniform refusal probes)
    records the model's top refusal openings → the lexicon for the grammar
    exclusion automaton, replacing the hand-written list. (This doubles as the
