@@ -40,6 +40,7 @@ pub mod kv_spill_descriptor;
 pub mod lifecycle;
 pub mod local_artifacts;
 pub mod middleware;
+mod measurement;
 pub mod qwen35_speculation;
 mod qwen_thinking_policy;
 pub mod registry;

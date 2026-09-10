@@ -114,7 +114,7 @@ fn loaded_summary_json(summary: &LoadedSummary) -> serde_json::Value {
     })
 }
 
-fn engine_config_identity_json(
+pub(super) fn engine_config_identity_json(
     identity: &crate::serve::multi_model::EngineConfigIdentity,
 ) -> serde_json::Value {
     let scheduler = match identity.engine_mode {
@@ -137,6 +137,8 @@ fn engine_config_identity_json(
         "explicit_tokenizer": identity.explicit_tokenizer,
         "explicit_config": identity.explicit_config,
         "dwq_overlay": identity.dwq_overlay,
+        "glp_active": identity.glp_active,
+        "glp_alpha_bits": identity.glp_alpha_bits,
     })
 }
 
@@ -168,6 +170,8 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
         Err(_) => return ApiError::internal_error().into_response(),
     };
     let stats = manager.pool_stats();
+    let engines = manager.snapshot_engines();
+    let measurement_snapshot = super::measurement::snapshot(&state, &engines);
     let resident = manager
         .snapshot_engines()
         .into_iter()
@@ -186,6 +190,7 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
         Json(serde_json::json!({
             "schema_version": HF2Q_RUNTIME_SCHEMA,
             "backend": "mlx-native",
+            "measurement_snapshot": measurement_snapshot,
             "capabilities": {
                 "model_activation": HF2Q_ACTIVATION_SCHEMA,
                 "artifact_resolution": ARTIFACT_CATALOG_SCHEMA,
