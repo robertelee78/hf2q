@@ -151,6 +151,9 @@ one response shape or relabel present-day hashes as historical provenance.
 
 ### Remaining handoff before replacing measurements
 
+A self-contained [implementation-agent handoff](gcd-publication-repair-handoff.md)
+collects the repair scope and regression cases.
+
 Repair S19–S20 in the runtime lane and E12–E15 in the harness lane. Then use
 versioned full-response rejudging and independent human validation to reassess
 retained responses. Run fresh matched baseline/W1 and GLP comparisons only

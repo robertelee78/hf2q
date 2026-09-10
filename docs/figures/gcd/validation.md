@@ -48,7 +48,9 @@ All 13 supplied offline/mock harness tests passed; historical artifacts were
 unchanged by those tests. Additional in-memory probes reproduced reporting
 budget collapse, acceptance of a wrong response hash, ignored pass selection,
 and shortened human-review input. The companion review records those findings
-without changing the runtime, harness, or original measurements.
+without changing the runtime, harness, or original measurements. The separate
+repair handoff includes an executed offline reproducer for budget collapse,
+ignored pass selection, and shortened human-review input.
 
 The paper distinguishes repaired full-response dispatch and cross-field
 validation from a completed replacement scoring pass. It does not claim
@@ -71,8 +73,8 @@ conformance, or a latency improvement from the new observations.
 - The twelve-prompt mean remains 99.97% in prose and Figure 3; exact raw
   probabilities remain in the historical snapshot and workbook.
 - Extracted PDF text has no replacement glyphs or words outside page bounds.
-- Twenty-two local file links in the article, companion review, figure guide,
-  and getting-started guide resolve. Historical source links in the companion
+- Twenty-four local file links in the article, companion review, repair handoff,
+  figure guide, and getting-started guide resolve. Historical source links in the companion
   review were pinned instead of pointing old line numbers into repaired code.
 - Private research is credited only broadly. Publication text, figure sources,
   JSON, workbook cells, and PDF text/links were checked for private repository
