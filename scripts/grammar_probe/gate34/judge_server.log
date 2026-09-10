@@ -1,0 +1,8 @@
+Preparing /opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf
+load: loading local Q5_K_M GGUF `APEX-Q5_K_M.gguf` (23.3 GiB) into Metal and warming kernels
+[hf2q lcp] byte_budget=4147 MB (source=sysinfo available_memory=81 GB × 5%)
+load: text model load and warmup complete in 4s
+load: loading and warming local multimodal projector `mmproj-qwen36-F16.gguf` (857.6 MiB)
+load: multimodal projector ready in 0.5s
+listen: model prepared; listener bound at http://127.0.0.1:8081; starting HTTP service
+ WARN hf2q::serve::api::engine_qwen35: Qwen35 thinking token budget reached; forcing reasoning close and continuing answer slot=2 budget=1950 generated_tokens=1950

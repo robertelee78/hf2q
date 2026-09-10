@@ -1,0 +1,25 @@
+{
+  "pass": "0.5",
+  "serve_flags": [
+    "serve",
+    "--model",
+    "/opt/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-agentic-q2.gguf",
+    "--port",
+    "18085",
+    "--glp",
+    "/var/folders/bd/84n3hd3120sdr990qkfbgvj00000gp/T/opencode/hf2q-glp-fix/target/calibrated-test.glp.gguf",
+    "--glp-alpha",
+    "0.5"
+  ],
+  "model_id": "Deepseek v4 Flash 0731 Source",
+  "mem_free_pct_preflight": 90,
+  "t_start": 1789036053.896306,
+  "t_models_ready": 1789036063.920794,
+  "t_gen_ready": 1789036064.288815,
+  "t_end": 1789036363.321187,
+  "load_wall_s": 10.4,
+  "panel_wall_s": 299.0,
+  "total_wall_s": 309.4,
+  "panel_rows": 48,
+  "request_errors": 0
+}

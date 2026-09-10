@@ -1,0 +1,6 @@
+Preparing /opt/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-agentic-q2.gguf
+load: loading local Q2_K GGUF `DeepSeek-V4-Flash-0731-agentic-q2.gguf` (100.1 GiB) into Metal and warming kernels
+[GLP-DEBUG] Deepseek4LoadedModel::load_with_context entered; opts.glp_path=Some("/var/folders/bd/84n3hd3120sdr990qkfbgvj00000gp/T/opencode/hf2q-glp-fix/target/calibrated-test.glp.gguf")
+[GLP] vector bound: layers=1 width=4096 alpha=1 mode=Project hook=ffn_out_pre_residual derived_at=residual_stream_post_layer path=/var/folders/bd/84n3hd3120sdr990qkfbgvj00000gp/T/opencode/hf2q-glp-fix/target/calibrated-test.glp.gguf
+load: text model load and warmup complete in 1s
+listen: model prepared; listener bound at http://127.0.0.1:18085; starting HTTP service

@@ -1,0 +1,68 @@
+{"ts": 1789034017.26239, "cell": "control", "kind": "held", "ok": true, "detail": "unconstrained control captured (refuses=False, len=1444)"}
+{"ts": 1789034019.362798, "cell": "literal_canary", "kind": "canary", "ok": true, "detail": "expected exact 'BATTERY-CANARY-7F3A', got 'BATTERY-CANARY-7F3A' (finish=stop)", "engaged": true}
+{"ts": 1789034020.649493, "cell": "temp_0", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789034025.1725771, "cell": "temp_0.7", "kind": "held", "ok": true, "detail": "finish=stop len=249", "engaged": true}
+{"ts": 1789034089.5124328, "cell": "temp_2.0", "kind": "held", "ok": true, "detail": "finish=length len=2532", "engaged": true}
+{"ts": 1789034106.4383621, "cell": "top_p_0.1", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789034122.800958, "cell": "top_k_1", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789034138.538698, "cell": "min_p_0.9", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789034141.750562, "cell": "rep_pen_0.8", "kind": "held", "ok": true, "detail": "finish=stop len=163", "engaged": true}
+{"ts": 1789034143.484438, "cell": "rep_pen_1.5", "kind": "held", "ok": true, "detail": "finish=stop len=255", "engaged": true}
+{"ts": 1789034178.824388, "cell": "freq_pen_+2", "kind": "held", "ok": true, "detail": "finish=stop len=992", "engaged": true}
+{"ts": 1789034191.0300648, "cell": "pres_pen_-2", "kind": "held", "ok": true, "detail": "finish=stop len=377", "engaged": true}
+{"ts": 1789034195.413057, "cell": "logitbias_suppress", "kind": "skip", "ok": false, "detail": "no real token id: token ' the' not found in the vocab"}
+{"ts": 1789034195.413324, "cell": "logitbias_boost", "kind": "skip", "ok": false, "detail": "no real token id: token ' the' not found in the vocab"}
+{"ts": 1789034198.826187, "cell": "stream_assembly", "kind": "held", "ok": false, "detail": "stream==non-stream: False (len 0 vs 459); hits=none"}
+{"ts": 1789034198.827701, "cell": "unsupported_param_400", "kind": "held", "ok": true, "detail": "expected 400, got 400: {\"error\":{\"message\":\"unknown request parameter(s) [beam_search] with a grammar/structured-output constraint attached: the stack cannot ho"}
+{"ts": 1789034198.881141, "cell": "terminal_truncation_loud", "kind": "held", "ok": true, "detail": "expected loud failure, got status=500 content='None'"}
+{"ts": 1789034475.0462751, "cell": "control", "kind": "held", "ok": true, "detail": "unconstrained control captured (refuses=False, len=1444)"}
+{"ts": 1789034475.593913, "cell": "literal_canary", "kind": "canary", "ok": true, "detail": "expected exact 'BATTERY-CANARY-7F3A', got 'BATTERY-CANARY-7F3A' (finish=stop)", "engaged": true}
+{"ts": 1789034476.88076, "cell": "temp_0", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789034501.215233, "cell": "temp_0.7", "kind": "held", "ok": true, "detail": "finish=stop len=698", "engaged": true}
+{"ts": 1789034562.071413, "cell": "temp_2.0", "kind": "held", "ok": true, "detail": "finish=length len=2478", "engaged": true}
+{"ts": 1789034572.7461991, "cell": "top_p_0.1", "kind": "held", "ok": true, "detail": "finish=stop len=362", "engaged": true}
+{"ts": 1789034587.626922, "cell": "top_k_1", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789034646.455094, "cell": "min_p_0.9", "kind": "held", "ok": true, "detail": "finish=length len=1633", "engaged": true}
+{"ts": 1789034682.06599, "cell": "rep_pen_0.8", "kind": "held", "ok": true, "detail": "finish=length len=439", "engaged": true}
+{"ts": 1789034689.3812659, "cell": "rep_pen_1.5", "kind": "held", "ok": true, "detail": "finish=stop len=360", "engaged": true}
+{"ts": 1789034692.3746712, "cell": "freq_pen_+2", "kind": "held", "ok": true, "detail": "finish=stop len=193", "engaged": true}
+{"ts": 1789034704.152755, "cell": "pres_pen_-2", "kind": "held", "ok": true, "detail": "finish=stop len=347", "engaged": true}
+{"ts": 1789034708.1787279, "cell": "logitbias_suppress", "kind": "skip", "ok": false, "detail": "no real token id: token ' the' not found in the vocab (248320 tokens scanned)"}
+{"ts": 1789034708.1789691, "cell": "logitbias_boost", "kind": "skip", "ok": false, "detail": "no real token id: token ' the' not found in the vocab (248320 tokens scanned)"}
+{"ts": 1789034712.785462, "cell": "stream_assembly", "kind": "held", "ok": true, "detail": "stream==non-stream: True (len 459 vs 459); hits=none"}
+{"ts": 1789034712.7866938, "cell": "unsupported_param_400", "kind": "held", "ok": true, "detail": "expected 400, got 400: {\"error\":{\"message\":\"unknown request parameter(s) [beam_search] with a grammar/structured-output constraint attached: the stack cannot ho"}
+{"ts": 1789034712.862478, "cell": "terminal_truncation_loud", "kind": "held", "ok": true, "detail": "expected loud failure, got status=500 content='None'"}
+{"ts": 1789034765.90544, "cell": "control", "kind": "held", "ok": true, "detail": "unconstrained control captured (refuses=False, len=1444)"}
+{"ts": 1789034766.4052238, "cell": "literal_canary", "kind": "canary", "ok": true, "detail": "expected exact 'BATTERY-CANARY-7F3A', got 'BATTERY-CANARY-7F3A' (finish=stop)", "engaged": true}
+{"ts": 1789034768.367083, "cell": "temp_0", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789034788.663738, "cell": "temp_0.7", "kind": "held", "ok": true, "detail": "finish=stop len=618", "engaged": true}
+{"ts": 1789034843.32427, "cell": "temp_2.0", "kind": "held", "ok": true, "detail": "finish=length len=2347", "engaged": true}
+{"ts": 1789034852.978674, "cell": "top_p_0.1", "kind": "held", "ok": true, "detail": "finish=stop len=377", "engaged": true}
+{"ts": 1789034867.966948, "cell": "top_k_1", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789034927.49448, "cell": "min_p_0.9", "kind": "held", "ok": true, "detail": "finish=length len=1547", "engaged": true}
+{"ts": 1789034971.001641, "cell": "rep_pen_0.8", "kind": "held", "ok": true, "detail": "finish=length len=566", "engaged": true}
+{"ts": 1789034982.3946261, "cell": "rep_pen_1.5", "kind": "held", "ok": true, "detail": "finish=stop len=510", "engaged": true}
+{"ts": 1789035017.872362, "cell": "freq_pen_+2", "kind": "held", "ok": true, "detail": "finish=stop len=1032", "engaged": true}
+{"ts": 1789035037.104044, "cell": "pres_pen_-2", "kind": "held", "ok": true, "detail": "finish=stop len=585", "engaged": true}
+{"ts": 1789035043.865927, "cell": "logitbias_suppress", "kind": "held", "ok": false, "detail": "token_id=279 (' the') biased -100; changed=True, absent=False", "engaged": false}
+{"ts": 1789035097.5548859, "cell": "logitbias_boost", "kind": "held", "ok": true, "detail": "token_id=279 biased +100; hits=none"}
+{"ts": 1789035101.6353438, "cell": "stream_assembly", "kind": "held", "ok": true, "detail": "stream==non-stream: True (len 459 vs 459); hits=none"}
+{"ts": 1789035101.636661, "cell": "unsupported_param_400", "kind": "held", "ok": true, "detail": "expected 400, got 400: {\"error\":{\"message\":\"unknown request parameter(s) [beam_search] with a grammar/structured-output constraint attached: the stack cannot ho"}
+{"ts": 1789035101.7063081, "cell": "terminal_truncation_loud", "kind": "held", "ok": true, "detail": "expected loud failure, got status=500 content='None'"}
+{"ts": 1789035123.50756, "cell": "control", "kind": "held", "ok": true, "detail": "unconstrained control captured (refuses=False, len=1444)"}
+{"ts": 1789035123.981899, "cell": "literal_canary", "kind": "canary", "ok": true, "detail": "expected exact 'BATTERY-CANARY-7F3A', got 'BATTERY-CANARY-7F3A' (finish=stop)", "engaged": true}
+{"ts": 1789035125.405961, "cell": "temp_0", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789035187.641664, "cell": "temp_0.7", "kind": "held", "ok": true, "detail": "finish=length len=1404", "engaged": true}
+{"ts": 1789035250.216546, "cell": "temp_2.0", "kind": "held", "ok": true, "detail": "finish=length len=2432", "engaged": true}
+{"ts": 1789035267.235355, "cell": "top_p_0.1", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789035286.3223958, "cell": "top_k_1", "kind": "held", "ok": true, "detail": "finish=stop len=459", "engaged": true}
+{"ts": 1789035294.355238, "cell": "min_p_0.9", "kind": "held", "ok": true, "detail": "finish=stop len=301", "engaged": true}
+{"ts": 1789035329.152816, "cell": "rep_pen_0.8", "kind": "held", "ok": true, "detail": "finish=length len=436", "engaged": true}
+{"ts": 1789035331.5348742, "cell": "rep_pen_1.5", "kind": "held", "ok": true, "detail": "finish=stop len=244", "engaged": true}
+{"ts": 1789035372.2954261, "cell": "freq_pen_+2", "kind": "held", "ok": true, "detail": "finish=stop len=1119", "engaged": true}
+{"ts": 1789035385.0997949, "cell": "pres_pen_-2", "kind": "held", "ok": true, "detail": "finish=stop len=444", "engaged": true}
+{"ts": 1789035392.043252, "cell": "logitbias_suppress", "kind": "held", "ok": true, "detail": "token_id=279 (' the') biased -100; changed=True, surface_occurrences=4", "engaged": true}
+{"ts": 1789035446.252327, "cell": "logitbias_boost", "kind": "held", "ok": true, "detail": "token_id=279 biased +100; hits=none"}
+{"ts": 1789035449.069003, "cell": "stream_assembly", "kind": "held", "ok": true, "detail": "stream==non-stream: True (len 459 vs 459); hits=none"}
+{"ts": 1789035449.070582, "cell": "unsupported_param_400", "kind": "held", "ok": true, "detail": "expected 400, got 400: {\"error\":{\"message\":\"unknown request parameter(s) [beam_search] with a grammar/structured-output constraint attached: the stack cannot ho"}
+{"ts": 1789035449.1358972, "cell": "terminal_truncation_loud", "kind": "held", "ok": true, "detail": "expected loud failure, got status=500 content='None'"}

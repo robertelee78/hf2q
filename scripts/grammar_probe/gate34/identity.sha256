@@ -1,0 +1,5 @@
+0558f65d2b69db14bac1df18be40df5e985599d92851211f250257087b3ccfb9  target/release/hf2q
+b87b3579c98bfb563494101952069ccc35cdf033a96486745c2c327422c418ca  target/calibrated-test.glp.gguf
+936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d  /opt/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-agentic-q2.gguf
+fb3303ea251fa05e7bc470070d692d91aed9c726d86718782226bd2629bd0611  scripts/grammar_probe/prompts_512.tsv
+c492720666f8a0fdb02be3985dfc17b02711f1dee7b9a8ba1afaced55871c7d0  scripts/grammar_probe/gate34/panel.tsv
