@@ -1338,10 +1338,11 @@ pub struct ServeArgs {
 
     /// ADR-053: bind a GLP steering vector (GGUF control vector, project or
     /// add mode per its metadata) to the served model. Applied per layer to
-    /// the post-layer residual stream at inference time; base weights are
-    /// never modified. Accepts a local path or a Hub reference. Fail-closed:
-    /// conformance errors (unknown mode/hook/spec, wrong width, direction.0)
-    /// abort startup rather than degrade.
+    /// its declared, family-supported hook at inference time; base weights
+    /// are never modified. Accepts a local file, owner/repo, or a canonical
+    /// Hugging Face file URL (which can pin a revision and filename).
+    /// Conformance or declared checkpoint-compatibility errors, ambiguous
+    /// repositories/files, wrong width, or direction.0 abort startup.
     ///
     /// GLP concept credit: Matt Suiche (m@msuiche.com), weightless/GLP spec.
     /// With no value (`--glp` bare), auto-discovers the vector bound to the
@@ -1388,10 +1389,10 @@ pub struct ServeArgs {
     pub gcd_schema: Option<PathBuf>,
 
     /// ADR-057 lockdown mode: make the --gcd-schema constraint mandatory
-    /// policy instead of a serve-time default. Requests carrying their own
-    /// `grammar`, `response_format`, `structured_outputs`, or `json_schema`
-    /// are rejected 400 rather than deferred to — the Tantalus lesson that
-    /// a server-side default which is a control must be non-overridable.
+    /// for response output instead of a serve-time default. Caller output
+    /// constraints and lazy-grammar modifiers are rejected with HTTP 400.
+    /// Tool definitions require tool_choice='none'; required/named tool
+    /// choices cannot replace the locked schema with a tool-call grammar.
     #[arg(long, requires = "gcd_schema", default_value_t = false)]
     pub gcd_schema_locked: bool,
 

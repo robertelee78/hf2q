@@ -2797,6 +2797,23 @@ pub(crate) fn hub_model_repo(api: &HubApi, repo_id: &str) -> HubRepo {
     api.client.model(owner.to_owned(), name.to_owned())
 }
 
+/// Bounded model listing for optional artifacts; it transfers no model files.
+pub(crate) fn search_hub_model_repos(
+    api: &HubApi,
+    author: &str,
+    search: &str,
+    limit: usize,
+) -> Result<Vec<String>, DownloadError> {
+    api.client
+        .list_models()
+        .author(author)
+        .search(search)
+        .limit(limit)
+        .send()
+        .map(|models| models.into_iter().map(|model| model.id).collect())
+        .map_err(|error| map_hub_repository_error(error, author))
+}
+
 fn hub_model_cache_folder(repo_id: &str) -> String {
     format!("models--{}", repo_id.replace('/', "--"))
 }
@@ -3255,7 +3272,7 @@ pub(super) fn default_revision_for(repo_id: &str) -> &'static str {
     }
 }
 
-pub(super) fn validate_repo_inventory<'a>(
+pub(crate) fn validate_repo_inventory<'a>(
     filenames: impl IntoIterator<Item = &'a str>,
 ) -> Result<BTreeSet<String>, DownloadError> {
     let mut inventory = BTreeSet::new();

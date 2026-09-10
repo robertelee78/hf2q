@@ -216,6 +216,10 @@ pub struct EngineConfigIdentity {
     pub explicit_tokenizer: bool,
     pub explicit_config: bool,
     pub dwq_overlay: bool,
+    /// Steering is part of the loaded engine configuration, independently
+    /// of request grammars. Store float bits to retain an exact Eq identity.
+    pub glp_active: bool,
+    pub glp_alpha_bits: Option<u32>,
 }
 
 impl Default for EngineConfigIdentity {
@@ -238,6 +242,8 @@ impl From<&EngineConfig> for EngineConfigIdentity {
             explicit_tokenizer: config.tokenizer_path.is_some(),
             explicit_config: config.config_path.is_some(),
             dwq_overlay: config.dwq_overlay_path.is_some(),
+            glp_active: config.glp_path.is_some(),
+            glp_alpha_bits: config.glp_alpha.map(f32::to_bits),
         }
     }
 }

@@ -27,6 +27,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::inference::glp::bind::BoundGlp;
 use crate::inference::glp::reader::{GlpHookPoint, GlpVector};
+use crate::inference::glp::CheckpointIdentity;
 use crate::inference::models::deepseek4::cache::{Deepseek4Cache, Deepseek4CachePlan};
 use crate::inference::models::deepseek4::model::Deepseek4Model;
 
@@ -137,6 +138,9 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
         "--layer 0 cannot be expressed: the GLP container forbids direction.0 \
          (spec: layer 0 cannot be steered); capture at a layer >= 1"
     );
+    // Export the actual checkpoint identity, never the model-card ancestor.
+    let checkpoint = CheckpointIdentity::for_model_path(&cfg.model, &gguf)
+        .context("resolve calibration source checkpoint")?;
     let tokenizer = crate::inference::models::deepseek4::tokenizer::build_tokenizer_from_gguf(&gguf)
         .context("build tokenizer from model GGUF")?;
     let mut model = Deepseek4Model::load_from_gguf(&gguf).context("load DeepSeek4 model")?;
@@ -227,18 +231,17 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
         h.update(direction_bytes);
         hex::encode(h.finalize())
     };
-    let fallback_name = cfg.model.display().to_string();
-    let base_name = gguf
-        .metadata_string("general.base_model.0.name")
-        .or_else(|| gguf.metadata_string("general.name"))
-        .map(|s| s.to_string())
-        .unwrap_or(fallback_name);
-    let base_org = gguf
-        .metadata_string("general.base_model.0.organization")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    write_glp_gguf(&cfg.out, cfg.layer, &direction, cfg.alpha, &content_sha256, &base_name, &base_org)
-        .context("write GLP GGUF")?;
+    write_glp_gguf(
+        &cfg.out,
+        cfg.layer,
+        &direction,
+        cfg.alpha,
+        &content_sha256,
+        &checkpoint,
+    )
+    .context("write GLP GGUF")?;
+    crate::inference::glp::validate_glp_for_model(&cfg.out, &cfg.model, &gguf)
+        .context("verify exported GLP checkpoint compatibility")?;
     eprintln!("[calibrate] wrote {}", cfg.out.display());
 
     // ---- canary: zero-dose no-op, then live-dose logit shift -------------
@@ -326,8 +329,7 @@ fn write_glp_gguf(
     direction: &[f32],
     alpha: f32,
     content_sha256: &str,
-    base_model_name: &str,
-    base_model_org: &str,
+    checkpoint: &CheckpointIdentity,
 ) -> Result<()> {
     use crate::backends::gguf::types::MetaValue;
     use crate::backends::gguf::writer::GgufWriter;
@@ -335,7 +337,24 @@ fn write_glp_gguf(
     let file = std::fs::File::create(path)
         .with_context(|| format!("create {}", path.display()))?;
     let mut w = GgufWriter::new(file);
-    w.write_header(1, 14)?;
+    let mut provenance = Vec::new();
+    if let Some(name) = &checkpoint.name {
+        provenance.push(("general.base_model.0.name", name.clone()));
+    }
+    if let Some(organization) = &checkpoint.organization {
+        provenance.push(("general.base_model.0.organization", organization.clone()));
+    }
+    if let Some(repository) = &checkpoint.repository {
+        provenance.push((
+            "general.base_model.0.repo_url",
+            format!("https://huggingface.co/{repository}"),
+        ));
+    }
+    if let Some(revision) = &checkpoint.revision {
+        provenance.push(("general.base_model.0.version", revision.clone()));
+    }
+    let provenance_count = provenance.len() + usize::from(!provenance.is_empty());
+    w.write_header(1, 12 + provenance_count as u64)?;
     w.write_metadata_kv("general.architecture", &MetaValue::String("glp".into()))?;
     w.write_metadata_kv("glp.mode", &MetaValue::String("project".into()))?;
     // The vector is APPLIED at the DeepSeek-V4 FFN-writer hook (the site
@@ -381,14 +400,12 @@ fn write_glp_gguf(
         "glp.layer_ids_zero_based",
         &MetaValue::String(layer_zero_based.to_string()),
     )?;
-    w.write_metadata_kv(
-        "general.base_model.0.name",
-        &MetaValue::String(base_model_name.into()),
-    )?;
-    w.write_metadata_kv(
-        "general.base_model.0.organization",
-        &MetaValue::String(base_model_org.into()),
-    )?;
+    if !provenance.is_empty() {
+        w.write_metadata_kv("general.base_model.count", &MetaValue::U32(1))?;
+        for (key, value) in provenance {
+            w.write_metadata_kv(key, &MetaValue::String(value))?;
+        }
+    }
     let idx = w.reserve_tensor_info(
         &format!("direction.{layer_zero_based}"),
         &[direction.len() as u64],
@@ -427,9 +444,19 @@ mod tests {
             29, // 0-based capture layer, exported verbatim
             &direction,
             1.0,
-            "deadbeef",
-            "test-model",
-            "test-org",
+            &{
+                use sha2::Digest;
+                let bytes: Vec<u8> = direction
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect();
+                hex::encode(sha2::Sha256::digest(bytes))
+            },
+            &CheckpointIdentity {
+                name: Some("test-model".into()),
+                organization: Some("test-org".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -472,3 +499,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod export_tests;

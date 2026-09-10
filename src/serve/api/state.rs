@@ -114,9 +114,9 @@ pub struct ServerConfig {
     /// prose grammar. Pattern credit: Vince Ovando's red-teaming pipeline.
     pub gcd_schema_grammar: Option<String>,
     /// ADR-057 lockdown mode (`--gcd-schema-locked`, requires the schema
-    /// grammar above): the constraint is mandatory policy, not a
-    /// serve-time default. Requests carrying any explicit constraint
-    /// surface are rejected 400 instead of silently overriding it.
+    /// grammar above): the response constraint cannot be overridden or
+    /// deferred by caller grammar controls. Tool definitions require
+    /// tool_choice="none"; required/named tool choices are rejected.
     pub gcd_schema_locked: bool,
 }
 
@@ -561,6 +561,7 @@ impl KvCacheMetricsSink for KvSpillCounters {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
+    pub(super) measurement_cache: Arc<super::measurement::FingerprintCache>,
     pub started_at: Arc<Instant>,
     /// `true` once the server is ready to serve generation.  After Phase 4
     /// iter-209 the pool is empty at process start when `--model` is not
@@ -885,6 +886,7 @@ impl AppState {
             engine_queue_capacity,
             engine_config_template,
             engine_config_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            measurement_cache: Arc::new(super::measurement::FingerprintCache::default()),
             default_model,
             embedding_config: None,
             embedding_registry: None,
@@ -973,6 +975,7 @@ impl AppState {
             engine_queue_capacity: 32,
             engine_config_template,
             engine_config_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            measurement_cache: Arc::new(super::measurement::FingerprintCache::default()),
             default_model: None,
             embedding_config: None,
             embedding_registry: None,

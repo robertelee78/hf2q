@@ -1,0 +1,1052 @@
+{
+  "review_source_commit": "294907cd655ee81eedb8d8b9ea30ab80ade483bb",
+  "historical_source_commit": "44004311717d414feaa54384578e2bcf4d140464",
+  "sources": {
+    "scripts/grammar_probe/full_results_w1.jsonl": {
+      "sha256": "b5a68b3f72dcf825219623ef46762dfd463c021ac40d140ff23e2a3c3f4e7297",
+      "bytes": 3817886,
+      "identity": "historical snapshot"
+    },
+    "scripts/grammar_probe/full_verdicts_w1.jsonl": {
+      "sha256": "a0ec7f4bd0e1014d02b739963e1c5fdf862e343416b06fef5f2690ea5a127e15",
+      "bytes": 428283,
+      "identity": "historical snapshot"
+    },
+    "scripts/grammar_probe/full_results_w1.truncation-report.json": {
+      "sha256": "d29c56070f095716bb6c52fb257ddaeda260bb9093c6c707290214a3ff8fe68f",
+      "bytes": 1068,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/spike_results_w1_gemma.jsonl": {
+      "sha256": "80a75f2bba863590008decb8e188d916c0846f0c15698145a70c2ff4666b9399",
+      "bytes": 3506418,
+      "identity": "historical snapshot"
+    },
+    "scripts/grammar_probe/spike_verdicts_w1_gemma.jsonl": {
+      "sha256": "3e531f4f804b6383cb90ae8be923ae85541c9afdb8fad81e025e0946a73d118f",
+      "bytes": 424027,
+      "identity": "historical snapshot"
+    },
+    "scripts/grammar_probe/spike_results_w1_gemma.truncation-report.json": {
+      "sha256": "bca43eb05bd4c6f2db0d6c94f4fb6eae546e8d4735af30d90387d51b20d8118d",
+      "bytes": 1039,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/spike_results_w1_qwen38.jsonl": {
+      "sha256": "ebfe743af8b130376c79ee7ffa8f7bd97df2ed695754dbead84e42451a0cea22",
+      "bytes": 2440924,
+      "identity": "historical snapshot"
+    },
+    "scripts/grammar_probe/spike_verdicts_w1_qwen38.jsonl": {
+      "sha256": "ce39d374f234190ad667a9accc6e1b9ef86e538c0ce0fdcb8fb970040dad7162",
+      "bytes": 421736,
+      "identity": "historical snapshot"
+    },
+    "scripts/grammar_probe/spike_results_w1_qwen38.truncation-report.json": {
+      "sha256": "9de70981983b18e1f78053e04e5ad8d65e44b5873972662f9b7c1b6243c87382",
+      "bytes": 1085,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/baseline/results.jsonl": {
+      "sha256": "368d9f03ad3aed2758901680fc50b34d44731fe0ce9276ca1ea107aa402c04c3",
+      "bytes": 47668,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/baseline/verdicts.jsonl": {
+      "sha256": "00be8615ccb26acc57e20ca0a1d517e60f3fd17ea934055db346bb0f76906635",
+      "bytes": 18244,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/baseline/meta.json": {
+      "sha256": "c9d5c56ec9cc30ebf0b3d7e95cd7d4f8e7fb5ada3012d352b5ace92315a3d389",
+      "bytes": 506,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/baseline/server.log": {
+      "sha256": "29d6fed9a49e3ded57df5f8f4138acec8b0d52d6ca71d274b6905f4f74c57404",
+      "bytes": 407,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/0.5/results.jsonl": {
+      "sha256": "f1a92e10abd2a7c882254c1ad363d0b9961f51e4157448c9afd8501adbbbde5c",
+      "bytes": 48516,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/0.5/verdicts.jsonl": {
+      "sha256": "6098925521646683ae926318ca449dbf188254143f630536ed8bee91c5d271b5",
+      "bytes": 18000,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/0.5/meta.json": {
+      "sha256": "b7e61ab039be20c5ff9678d7b459dd0bf2c2a6a64d9f3e3278b2446aa38569a2",
+      "bytes": 655,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/0.5/server.log": {
+      "sha256": "d85053447fdf894a641356568a60658eb278b000c1e5de3e97c91378481e6413",
+      "bytes": 747,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/1.0/results.jsonl": {
+      "sha256": "7573a48eb29742738798e7d2c6aaa4217841a4c75724f0ce058c4dba9fc9f000",
+      "bytes": 47822,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/1.0/verdicts.jsonl": {
+      "sha256": "dd407c668be6a9d15558fd7be4b1b82e7cdfeb3c533b7619d7f6023707740299",
+      "bytes": 17610,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/1.0/meta.json": {
+      "sha256": "fd89713a0e0cdbed43511d7b0f273bd8a43100be161c059bad07d63e12bde4ed",
+      "bytes": 656,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/1.0/server.log": {
+      "sha256": "b6f7a07fd7f62bfdee70542c41495833980c9c723f0c34419415121c1d18135d",
+      "bytes": 745,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/2.0/results.jsonl": {
+      "sha256": "886852bb6424fdbe67f13ad8933aa3e2bf2e59d410c5822c30e20c2562a668db",
+      "bytes": 48042,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/2.0/verdicts.jsonl": {
+      "sha256": "c85245ea874838fdf3a27e626d29608ce3370458bfc4b7d7ee4ab995d7102fad",
+      "bytes": 17866,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/2.0/meta.json": {
+      "sha256": "c84db388e0276b842e5482509066b086e82ac2f720d8f06b71d7b9e55bbb6f4d",
+      "bytes": 656,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/2.0/server.log": {
+      "sha256": "ffd19f09db22435f30a3d22444c422caa533c51be124def672835ace4e57e6e8",
+      "bytes": 745,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/4.0/results.jsonl": {
+      "sha256": "0c2a637e56562ea0c3fd37481bf46dea2364fbdce3a342fc4493b3c0de759c63",
+      "bytes": 48609,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/4.0/verdicts.jsonl": {
+      "sha256": "9e02649a92629eaffa912cc937abd6e224414d7d52860a8b1363114ae9f62d5a",
+      "bytes": 17760,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/4.0/meta.json": {
+      "sha256": "f5f9d5a4e3789bc9f0640937be294634bf4558dfd0f0f6049a990e46081cbb72",
+      "bytes": 655,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/4.0/server.log": {
+      "sha256": "ca31f35dde4c1c66aecabafe265fdd0aa0d071da3164666f0efad59b4ddbe3c2",
+      "bytes": 745,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/identity.sha256": {
+      "sha256": "8e12c60f6aaabc7bc7462712b606e2b2cd112c963d9e7db5f87937122c1d5f2b",
+      "bytes": 525,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/summary.md": {
+      "sha256": "1986a3c29c8cb1aae02fb13bc50301ab6442b85f7cef13f73b1bd2c6e416b8e3",
+      "bytes": 6709,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/run_pass.py": {
+      "sha256": "fa6b6f05ee1b042cedb6b4802c4fe162337f8a40bd15d468da42933190c3fc78",
+      "bytes": 7186,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/judge_driver.py": {
+      "sha256": "bd016a74c3ef3d66250262d9803598a15822cc1e32496f53cc3033c696f0e622",
+      "bytes": 7351,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/analyze.py": {
+      "sha256": "3ffbc61ab09dd55eb7e1c3f192add523cdaed80f798de2df3f04817751e63ab2",
+      "bytes": 3087,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/gate34/panel.tsv": {
+      "sha256": "c492720666f8a0fdb02be3985dfc17b02711f1dee7b9a8ba1afaced55871c7d0",
+      "bytes": 2779,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/calibrate/calibration_pairs.tsv": {
+      "sha256": "01e77e98aa527be046b07aef14eed9186543212696771e7628120b26bf02bb40",
+      "bytes": 11588,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/battery_gcd_v2.jsonl": {
+      "sha256": "89ecb474673f895374340d43b2aa30d03508f0b9494066845feff2449f3f7d61",
+      "bytes": 9928,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/battery_gcd.py": {
+      "sha256": "2d769caa8af5326786e698e0d7dec8d9d4dcf1fda9c515550177d7125e83a838",
+      "bytes": 14404,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/judge.py": {
+      "sha256": "bd3d3aa53879196515f745e68797c2f0a842abf00dbbf67af2b879c018e9a966",
+      "bytes": 19852,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/rejudge.py": {
+      "sha256": "79adc62ce74fb4de6b03a78c5e655c0c5ba43ece272e3f639e387ec3457d719b",
+      "bytes": 16551,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/report.py": {
+      "sha256": "d7fb92f206bf05bde2358bd38bd19501f06542e1aabf961a7208277a8ac2fcf1",
+      "bytes": 16357,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/spike_run.py": {
+      "sha256": "503737422c5d07188b797c74c984d5f97af4749d82ffbc544c214fd5a61272be",
+      "bytes": 10445,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/baseline_run.py": {
+      "sha256": "92ceaf82e43a873f3103c444209ee9b7b15eaa1d5d8f8456539150eebc6b8d68",
+      "bytes": 15209,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/truncation_report.py": {
+      "sha256": "726cba525acc2e8a2a3cc2182d61569b365834640ac236fa7e452fa8262a932d",
+      "bytes": 3837,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/test_harness_repair.py": {
+      "sha256": "1751d2d550e11750168cdee98f7c98dd6e4530ce2d5a1d1dc3f7c563821f8411",
+      "bytes": 40258,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "scripts/grammar_probe/METHODS.md": {
+      "sha256": "e69f249304dbcd69a6a62c367d1aa59b4cfc5c1acc2fc49f52be98972819ee67",
+      "bytes": 9348,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/cli.rs": {
+      "sha256": "a07b92b960aea3c3d0e2c6ab89a278ffe22668acc63296ce332cdd2e7e963e76",
+      "bytes": 90995,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/serve/api/handlers.rs": {
+      "sha256": "7795b2db24e056616a2e143af41bc0839034dad6293d8da7b96f933540226d90",
+      "bytes": 583681,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/serve/api/grammar/request.rs": {
+      "sha256": "813f6a28abbbfa3728219aef301d045cd953748a029e85b90754f28050d2ad18",
+      "bytes": 45110,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/serve/api/engine_qwen35.rs": {
+      "sha256": "1d1be81a306a1af996b39c9b95758e60f95ef6556ffb351483c21beceb9f1b92",
+      "bytes": 480994,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/serve/api/engine_deepseek4.rs": {
+      "sha256": "9726d911cb599aa4c522b71fed6dfb02f577136d654ce780b1dedf9a0222bdf4",
+      "bytes": 72332,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/inference/glp/reader.rs": {
+      "sha256": "844553be1ef22f96d0b20b430ebcc9f03cd0115922092d5425f026df1745e1ae",
+      "bytes": 25299,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/inference/glp/bind.rs": {
+      "sha256": "02129ee25287b1f5039424791fa1a825da46cdff2f86b5ecc9132f0996a194b9",
+      "bytes": 12030,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/inference/glp/apply_gpu.rs": {
+      "sha256": "b856116eb6f127fad9addcae80c0f9f99f999293b5d6ac3c1b53b6383a1e310d",
+      "bytes": 31290,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/inference/glp/shaders/glp_project.metal": {
+      "sha256": "e70e347ddf08e102f76a18af37facd70ae0455bfd1eb31bec126d4b494fc5822",
+      "bytes": 2561,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/inference/models/deepseek4/ffn_forward.rs": {
+      "sha256": "d84973c48dd33e4b5bb6c9e30fd65bfe2ec3f8b3779f0a9efe33c8c59c45eb17",
+      "bytes": 27181,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/inference/models/qwen35/forward_gpu.rs": {
+      "sha256": "61c1891214cbc310eb6713cebb8d359d2559d783f1f73af269fce36c74c1d8a8",
+      "bytes": 557726,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/inference/models/qwen35/gpu_full_attn.rs": {
+      "sha256": "0f1a417df839bd3be74b445ac0ac9e34b264b7db3438906fbc3459d9b48b9339",
+      "bytes": 611373,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    },
+    "src/calibrate/mod.rs": {
+      "sha256": "88d15f8033d3fbd53271edbf62ad6254300b4d1276b52be9437672e70e16820b",
+      "bytes": 19875,
+      "identity": "294907cd655ee81eedb8d8b9ea30ab80ade483bb"
+    }
+  },
+  "historical_cross_tabs": [
+    {
+      "model_label": "DeepSeek-V4",
+      "n": 1024,
+      "termination_state_validity": [
+        {
+          "finish": "length",
+          "state": "degenerate",
+          "validity": "invalid",
+          "count": 85
+        },
+        {
+          "finish": "length",
+          "state": "maintained_refusal",
+          "validity": "valid",
+          "count": 2
+        },
+        {
+          "finish": "length",
+          "state": "nonresponsive",
+          "validity": "valid",
+          "count": 1
+        },
+        {
+          "finish": "length",
+          "state": "pivot_then_fulfill",
+          "validity": "valid",
+          "count": 2
+        },
+        {
+          "finish": "length",
+          "state": "valid_fulfillment",
+          "validity": "invalid",
+          "count": 19
+        },
+        {
+          "finish": "length",
+          "state": "valid_fulfillment",
+          "validity": "valid",
+          "count": 714
+        },
+        {
+          "finish": "stop",
+          "state": "degenerate",
+          "validity": "invalid",
+          "count": 6
+        },
+        {
+          "finish": "stop",
+          "state": "maintained_refusal",
+          "validity": "invalid",
+          "count": 1
+        },
+        {
+          "finish": "stop",
+          "state": "maintained_refusal",
+          "validity": "valid",
+          "count": 9
+        },
+        {
+          "finish": "stop",
+          "state": "mixed",
+          "validity": "valid",
+          "count": 4
+        },
+        {
+          "finish": "stop",
+          "state": "partial_then_refuse",
+          "validity": "valid",
+          "count": 1
+        },
+        {
+          "finish": "stop",
+          "state": "pivot_then_fulfill",
+          "validity": "valid",
+          "count": 1
+        },
+        {
+          "finish": "stop",
+          "state": "valid_fulfillment",
+          "validity": "invalid",
+          "count": 1
+        },
+        {
+          "finish": "stop",
+          "state": "valid_fulfillment",
+          "validity": "valid",
+          "count": 178
+        }
+      ]
+    },
+    {
+      "model_label": "Gemma-4-26B",
+      "n": 1024,
+      "termination_state_validity": [
+        {
+          "finish": "length",
+          "state": "degenerate",
+          "validity": "invalid",
+          "count": 82
+        },
+        {
+          "finish": "length",
+          "state": "unjudged",
+          "validity": "unknown",
+          "count": 3
+        },
+        {
+          "finish": "length",
+          "state": "valid_fulfillment",
+          "validity": "invalid",
+          "count": 21
+        },
+        {
+          "finish": "length",
+          "state": "valid_fulfillment",
+          "validity": "valid",
+          "count": 538
+        },
+        {
+          "finish": "stop",
+          "state": "degenerate",
+          "validity": "invalid",
+          "count": 74
+        },
+        {
+          "finish": "stop",
+          "state": "maintained_refusal",
+          "validity": "invalid",
+          "count": 17
+        },
+        {
+          "finish": "stop",
+          "state": "maintained_refusal",
+          "validity": "valid",
+          "count": 20
+        },
+        {
+          "finish": "stop",
+          "state": "nonresponsive",
+          "validity": "invalid",
+          "count": 1
+        },
+        {
+          "finish": "stop",
+          "state": "nonresponsive",
+          "validity": "valid",
+          "count": 1
+        },
+        {
+          "finish": "stop",
+          "state": "partial_then_refuse",
+          "validity": "invalid",
+          "count": 1
+        },
+        {
+          "finish": "stop",
+          "state": "pivot_then_fulfill",
+          "validity": "valid",
+          "count": 7
+        },
+        {
+          "finish": "stop",
+          "state": "unjudged",
+          "validity": "unknown",
+          "count": 1
+        },
+        {
+          "finish": "stop",
+          "state": "valid_fulfillment",
+          "validity": "invalid",
+          "count": 3
+        },
+        {
+          "finish": "stop",
+          "state": "valid_fulfillment",
+          "validity": "valid",
+          "count": 255
+        }
+      ]
+    },
+    {
+      "model_label": "Qwen3.8-27B",
+      "n": 1024,
+      "termination_state_validity": [
+        {
+          "finish": "length",
+          "state": "degenerate",
+          "validity": "invalid",
+          "count": 59
+        },
+        {
+          "finish": "length",
+          "state": "maintained_refusal",
+          "validity": "valid",
+          "count": 1
+        },
+        {
+          "finish": "length",
+          "state": "nonresponsive",
+          "validity": "invalid",
+          "count": 1
+        },
+        {
+          "finish": "length",
+          "state": "nonresponsive",
+          "validity": "valid",
+          "count": 1
+        },
+        {
+          "finish": "length",
+          "state": "valid_fulfillment",
+          "validity": "invalid",
+          "count": 8
+        },
+        {
+          "finish": "length",
+          "state": "valid_fulfillment",
+          "validity": "valid",
+          "count": 346
+        },
+        {
+          "finish": "stop",
+          "state": "degenerate",
+          "validity": "invalid",
+          "count": 50
+        },
+        {
+          "finish": "stop",
+          "state": "degenerate",
+          "validity": "valid",
+          "count": 1
+        },
+        {
+          "finish": "stop",
+          "state": "maintained_refusal",
+          "validity": "valid",
+          "count": 25
+        },
+        {
+          "finish": "stop",
+          "state": "nonresponsive",
+          "validity": "invalid",
+          "count": 27
+        },
+        {
+          "finish": "stop",
+          "state": "nonresponsive",
+          "validity": "valid",
+          "count": 23
+        },
+        {
+          "finish": "stop",
+          "state": "partial_then_refuse",
+          "validity": "valid",
+          "count": 3
+        },
+        {
+          "finish": "stop",
+          "state": "pivot_then_fulfill",
+          "validity": "valid",
+          "count": 1
+        },
+        {
+          "finish": "stop",
+          "state": "unjudged",
+          "validity": "unknown",
+          "count": 10
+        },
+        {
+          "finish": "stop",
+          "state": "valid_fulfillment",
+          "validity": "invalid",
+          "count": 4
+        },
+        {
+          "finish": "stop",
+          "state": "valid_fulfillment",
+          "validity": "valid",
+          "count": 464
+        }
+      ]
+    }
+  ],
+  "glp_panel": {
+    "arms": [
+      {
+        "arm": "baseline",
+        "panels": [
+          {
+            "stratum": "adversarial",
+            "n": 32,
+            "states": {
+              "degenerate": 1,
+              "maintained_refusal": 28,
+              "pivot_then_fulfill": 3
+            },
+            "finish": {
+              "length": 4,
+              "stop": 28
+            },
+            "judge_errors": 0,
+            "request_errors": 0,
+            "input_over_2500_characters": 0,
+            "fulfillment_with_invalid_output": 0,
+            "transitions_from_baseline": [
+              {
+                "from": "degenerate",
+                "to": "degenerate",
+                "count": 1
+              },
+              {
+                "from": "maintained_refusal",
+                "to": "maintained_refusal",
+                "count": 28
+              },
+              {
+                "from": "pivot_then_fulfill",
+                "to": "pivot_then_fulfill",
+                "count": 3
+              }
+            ]
+          },
+          {
+            "stratum": "benign",
+            "n": 16,
+            "states": {
+              "degenerate": 12,
+              "valid_fulfillment": 4
+            },
+            "finish": {
+              "length": 14,
+              "stop": 2
+            },
+            "judge_errors": 0,
+            "request_errors": 0,
+            "input_over_2500_characters": 0,
+            "fulfillment_with_invalid_output": 0,
+            "transitions_from_baseline": [
+              {
+                "from": "degenerate",
+                "to": "degenerate",
+                "count": 12
+              },
+              {
+                "from": "valid_fulfillment",
+                "to": "valid_fulfillment",
+                "count": 4
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "arm": "0.5",
+        "panels": [
+          {
+            "stratum": "adversarial",
+            "n": 32,
+            "states": {
+              "degenerate": 1,
+              "maintained_refusal": 28,
+              "pivot_then_fulfill": 3
+            },
+            "finish": {
+              "length": 4,
+              "stop": 28
+            },
+            "judge_errors": 0,
+            "request_errors": 0,
+            "input_over_2500_characters": 0,
+            "fulfillment_with_invalid_output": 0,
+            "transitions_from_baseline": [
+              {
+                "from": "degenerate",
+                "to": "degenerate",
+                "count": 1
+              },
+              {
+                "from": "maintained_refusal",
+                "to": "maintained_refusal",
+                "count": 28
+              },
+              {
+                "from": "pivot_then_fulfill",
+                "to": "pivot_then_fulfill",
+                "count": 3
+              }
+            ]
+          },
+          {
+            "stratum": "benign",
+            "n": 16,
+            "states": {
+              "degenerate": 13,
+              "valid_fulfillment": 3
+            },
+            "finish": {
+              "length": 15,
+              "stop": 1
+            },
+            "judge_errors": 0,
+            "request_errors": 0,
+            "input_over_2500_characters": 0,
+            "fulfillment_with_invalid_output": 0,
+            "transitions_from_baseline": [
+              {
+                "from": "degenerate",
+                "to": "degenerate",
+                "count": 11
+              },
+              {
+                "from": "degenerate",
+                "to": "valid_fulfillment",
+                "count": 1
+              },
+              {
+                "from": "valid_fulfillment",
+                "to": "degenerate",
+                "count": 2
+              },
+              {
+                "from": "valid_fulfillment",
+                "to": "valid_fulfillment",
+                "count": 2
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "arm": "1.0",
+        "panels": [
+          {
+            "stratum": "adversarial",
+            "n": 32,
+            "states": {
+              "degenerate": 1,
+              "maintained_refusal": 28,
+              "pivot_then_fulfill": 3
+            },
+            "finish": {
+              "length": 5,
+              "stop": 27
+            },
+            "judge_errors": 0,
+            "request_errors": 0,
+            "input_over_2500_characters": 0,
+            "fulfillment_with_invalid_output": 0,
+            "transitions_from_baseline": [
+              {
+                "from": "degenerate",
+                "to": "degenerate",
+                "count": 1
+              },
+              {
+                "from": "maintained_refusal",
+                "to": "maintained_refusal",
+                "count": 28
+              },
+              {
+                "from": "pivot_then_fulfill",
+                "to": "pivot_then_fulfill",
+                "count": 3
+              }
+            ]
+          },
+          {
+            "stratum": "benign",
+            "n": 16,
+            "states": {
+              "degenerate": 13,
+              "valid_fulfillment": 3
+            },
+            "finish": {
+              "length": 14,
+              "stop": 2
+            },
+            "judge_errors": 0,
+            "request_errors": 0,
+            "input_over_2500_characters": 0,
+            "fulfillment_with_invalid_output": 0,
+            "transitions_from_baseline": [
+              {
+                "from": "degenerate",
+                "to": "degenerate",
+                "count": 12
+              },
+              {
+                "from": "valid_fulfillment",
+                "to": "degenerate",
+                "count": 1
+              },
+              {
+                "from": "valid_fulfillment",
+                "to": "valid_fulfillment",
+                "count": 3
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "arm": "2.0",
+        "panels": [
+          {
+            "stratum": "adversarial",
+            "n": 32,
+            "states": {
+              "degenerate": 1,
+              "maintained_refusal": 29,
+              "pivot_then_fulfill": 2
+            },
+            "finish": {
+              "length": 5,
+              "stop": 27
+            },
+            "judge_errors": 0,
+            "request_errors": 0,
+            "input_over_2500_characters": 0,
+            "fulfillment_with_invalid_output": 0,
+            "transitions_from_baseline": [
+              {
+                "from": "degenerate",
+                "to": "degenerate",
+                "count": 1
+              },
+              {
+                "from": "maintained_refusal",
+                "to": "maintained_refusal",
+                "count": 28
+              },
+              {
+                "from": "pivot_then_fulfill",
+                "to": "maintained_refusal",
+                "count": 1
+              },
+              {
+                "from": "pivot_then_fulfill",
+                "to": "pivot_then_fulfill",
+                "count": 2
+              }
+            ]
+          },
+          {
+            "stratum": "benign",
+            "n": 16,
+            "states": {
+              "degenerate": 14,
+              "valid_fulfillment": 2
+            },
+            "finish": {
+              "length": 15,
+              "stop": 1
+            },
+            "judge_errors": 0,
+            "request_errors": 0,
+            "input_over_2500_characters": 0,
+            "fulfillment_with_invalid_output": 0,
+            "transitions_from_baseline": [
+              {
+                "from": "degenerate",
+                "to": "degenerate",
+                "count": 12
+              },
+              {
+                "from": "valid_fulfillment",
+                "to": "degenerate",
+                "count": 2
+              },
+              {
+                "from": "valid_fulfillment",
+                "to": "valid_fulfillment",
+                "count": 2
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "arm": "4.0",
+        "panels": [
+          {
+            "stratum": "adversarial",
+            "n": 32,
+            "states": {
+              "degenerate": 1,
+              "maintained_refusal": 29,
+              "pivot_then_fulfill": 2
+            },
+            "finish": {
+              "length": 5,
+              "stop": 27
+            },
+            "judge_errors": 0,
+            "request_errors": 0,
+            "input_over_2500_characters": 0,
+            "fulfillment_with_invalid_output": 0,
+            "transitions_from_baseline": [
+              {
+                "from": "degenerate",
+                "to": "degenerate",
+                "count": 1
+              },
+              {
+                "from": "maintained_refusal",
+                "to": "maintained_refusal",
+                "count": 28
+              },
+              {
+                "from": "pivot_then_fulfill",
+                "to": "maintained_refusal",
+                "count": 1
+              },
+              {
+                "from": "pivot_then_fulfill",
+                "to": "pivot_then_fulfill",
+                "count": 2
+              }
+            ]
+          },
+          {
+            "stratum": "benign",
+            "n": 16,
+            "states": {
+              "degenerate": 13,
+              "valid_fulfillment": 3
+            },
+            "finish": {
+              "length": 15,
+              "stop": 1
+            },
+            "judge_errors": 0,
+            "request_errors": 0,
+            "input_over_2500_characters": 0,
+            "fulfillment_with_invalid_output": 0,
+            "transitions_from_baseline": [
+              {
+                "from": "degenerate",
+                "to": "degenerate",
+                "count": 11
+              },
+              {
+                "from": "degenerate",
+                "to": "valid_fulfillment",
+                "count": 1
+              },
+              {
+                "from": "valid_fulfillment",
+                "to": "degenerate",
+                "count": 2
+              },
+              {
+                "from": "valid_fulfillment",
+                "to": "valid_fulfillment",
+                "count": 2
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "reported_artifact_identities": {
+      "binary_sha256": "0558f65d2b69db14bac1df18be40df5e985599d92851211f250257087b3ccfb9",
+      "vector_sha256": "b87b3579c98bfb563494101952069ccc35cdf033a96486745c2c327422c418ca",
+      "model_sha256": "936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d",
+      "corpus_sha256": "fb3303ea251fa05e7bc470070d692d91aed9c726d86718782226bd2629bd0611",
+      "panel_sha256": "c492720666f8a0fdb02be3985dfc17b02711f1dee7b9a8ba1afaced55871c7d0"
+    },
+    "calibration_text_overlap": {
+      "adversarial": 4,
+      "benign": 2
+    },
+    "sampling": {
+      "temperature": 0,
+      "max_tokens": 256,
+      "thinking": false
+    },
+    "limits": [
+      "One generation per prompt and arm; no loaded-vector alpha-zero arm.",
+      "Selected panel; calibration overlap prevents a wholly held-out claim.",
+      "Historical judge rubric; no new independent human validation.",
+      "Severe generation truncation limits capability conclusions.",
+      "Recorded binary hash is not a binding to the inspected source commit."
+    ]
+  },
+  "battery_v2": {
+    "total_rows": 68,
+    "attempts": [
+      {
+        "attempt": 1,
+        "rows": 17,
+        "passed": 14,
+        "skipped": 2,
+        "failed": 1,
+        "first_timestamp": 1789034017.26239,
+        "last_timestamp": 1789034198.881141
+      },
+      {
+        "attempt": 2,
+        "rows": 17,
+        "passed": 15,
+        "skipped": 2,
+        "failed": 0,
+        "first_timestamp": 1789034475.0462751,
+        "last_timestamp": 1789034712.862478
+      },
+      {
+        "attempt": 3,
+        "rows": 17,
+        "passed": 16,
+        "skipped": 0,
+        "failed": 1,
+        "first_timestamp": 1789034765.90544,
+        "last_timestamp": 1789035101.7063081
+      },
+      {
+        "attempt": 4,
+        "rows": 17,
+        "passed": 17,
+        "skipped": 0,
+        "failed": 0,
+        "first_timestamp": 1789035123.50756,
+        "last_timestamp": 1789035449.1358972
+      }
+    ],
+    "final_cells": [
+      "control",
+      "literal_canary",
+      "temp_0",
+      "temp_0.7",
+      "temp_2.0",
+      "top_p_0.1",
+      "top_k_1",
+      "min_p_0.9",
+      "rep_pen_0.8",
+      "rep_pen_1.5",
+      "freq_pen_+2",
+      "pres_pen_-2",
+      "logitbias_suppress",
+      "logitbias_boost",
+      "stream_assembly",
+      "unsupported_param_400",
+      "terminal_truncation_loud"
+    ],
+    "limits": [
+      "Attempt boundaries inferred from control rows; no explicit run IDs.",
+      "Final attempt is selected explicitly; earlier failures and skips remain visible.",
+      "Passing named cells does not establish exhaustive parser or policy conformance."
+    ]
+  }
+}

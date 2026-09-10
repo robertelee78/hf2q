@@ -101,16 +101,21 @@ def prepare(document):
         index += 1
     result.append(raw("]]"))
     in_sources = False
+    keep_back_matter = False
     while index < len(blocks):
         block = blocks[index]
         if block["t"] == "Header":
+            if keep_back_matter:
+                result.append(raw("]"))
+                keep_back_matter = False
             title = words(block["c"][2])
             block["c"][0] -= 1
             if title in BACK_MATTER:
+                if title in {"Acknowledgments", "Artifacts and reproducibility"}:
+                    result.append(raw("#block(breakable: false)["))
+                    keep_back_matter = True
                 if title == "Artifacts and reproducibility":
                     result.append(raw("#set par(justify: false, first-line-indent: 0pt)"))
-                if title == "References":
-                    result.append(raw("#colbreak(weak: true)"))
                 result.extend([raw("#heading(level: 1, numbering: none)["),
                                {"t": "Plain", "c": block["c"][2]}, raw("]")])
                 in_sources = title == "References"
@@ -131,10 +136,11 @@ def prepare(document):
             table = blocks[index + 1]
             number = int(re.match(r"Table (\d+)", words(block)).group(1))
             widths = {1: [.2, .4, .4], 2: [.25, .35, .4],
-                      3: [.24, .34, .42], 4: [.22, .25, .13, .27, .13]}[number]
+                      3: [.24, .34, .42], 4: [.22, .25, .13, .27, .13],
+                      5: [.18, .28, .25, .29]}[number]
             for column, width in zip(table["c"][2], widths, strict=True):
                 column[1] = {"t": "ColWidth", "c": width}
-            wide = "true" if number in {3, 4} else "false"
+            wide = "true" if number in {3, 4, 5} else "false"
             result.extend([raw("#paper-table(["), table, raw("], ["),
                            caption(block), raw(f"], wide: {wide})")])
             index += 2

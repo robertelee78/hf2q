@@ -1157,7 +1157,7 @@ L 214.019888 188.538628
 " style="fill: none; stroke: #737373; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
    </g>
    <g id="text_21">
-    <!-- Mean: 99.9744% -->
+    <!-- Mean: 99.97% -->
     <g style="fill: #236b8e" transform="translate(66.799038 157.130215) scale(0.08 -0.08)">
      <defs>
       <path id="DejaVuSans-30" d="M 628 4666
@@ -1201,9 +1201,7 @@ z
      <use xlink:href="#DejaVuSans-11" transform="translate(465.1875 0)"/>
      <use xlink:href="#DejaVuSans-1c" transform="translate(496.96875 0)"/>
      <use xlink:href="#DejaVuSans-1a" transform="translate(560.59375 0)"/>
-     <use xlink:href="#DejaVuSans-17" transform="translate(624.21875 0)"/>
-     <use xlink:href="#DejaVuSans-17" transform="translate(687.84375 0)"/>
-     <use xlink:href="#DejaVuSans-8" transform="translate(751.46875 0)"/>
+     <use xlink:href="#DejaVuSans-8" transform="translate(624.21875 0)"/>
     </g>
     <!-- Zoomed probability axis -->
     <g style="fill: #236b8e" transform="translate(66.799038 166.732403) scale(0.08 -0.08)">

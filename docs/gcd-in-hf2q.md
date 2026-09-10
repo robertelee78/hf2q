@@ -14,13 +14,14 @@ We distinguish structural validity, refusal suppression, and authorization,
 and explain why grammar membership and numerical steering correctness do not
 establish semantic correctness. A source-level implementation account covers
 grammar enforcement, schema compilation, model-family hooks, and calibration.
-An exploratory historical case study applies a refusal-suppression grammar to
-a 1,024-prompt corpus across three model families. Low judge-labeled refusal
-rates coexist with degeneration, substantial token-limit termination, missing
-judgments, and incomplete runtime provenance. These findings motivate
-independent evaluation of behavioral effect, completion, capability, and
-execution-time authorization, while illustrating opportunities for compact
-intervention distribution and explicit local inference controls.
+A historical grammar campaign covers a 1,024-prompt corpus across three model
+families; its low judge-labeled refusal rates coexist with substantial
+budget-limited generation and weaknesses in the original scoring procedure.
+A subsequent 48-prompt GLP evaluation finds no observed refusal reduction
+for one candidate direction across four intervention strengths. An operational
+battery passes its final 17 named checks. These records illustrate why
+output-language enforcement, correct steering arithmetic, and useful model
+behavior require distinct evidence.
 
 ## Introduction
 
@@ -63,7 +64,7 @@ finished answer.
 | Intervention | Restrict candidate tokens | Modify selected activations |
 | Base weights | Unchanged | Unchanged |
 | Scope | Output language for a request or generation region | Bound model, selected layers and activation sites |
-| Guarantee | Language membership on successful completion, subject to correct enforcement | The specified numerical transformation |
+| Guarantee | Language membership on successful completion, subject to correct enforcement | Numerical transformation, subject to correct arithmetic and application site |
 | Requires evaluation | Usefulness, completion, cost, and policy correctness | Behavioral effect, capability, and compatibility |
 
 ![Generation flows from prompt preparation through the model, grammar-aware token selection, and token commitment. GLP acts inside the model; GCD constrains token selection. The selected token feeds back into the next step.](figures/gcd/generation-controls.svg)
@@ -190,13 +191,20 @@ the model runs; it is not a binary diff applied to the stored weight tensors.
 With fresh inference state, disabling the intervention restores unsteered
 computation on the original weights. Existing KV or recurrent state can retain
 the effects of earlier steering and must be reset for that comparison.[^3]
+For scale, Suiche reports equal refusal rates in his cyber-suite comparison
+using a 478 KB GLP artifact and a 157 GB redistributed checkpoint. This is
+his study's comparison, not an hf2q measurement.[^3]
 
 Matt Suiche's [weightless project](https://weightless.msuiche.com/) develops
 and distributes this approach. Its GLP format builds on the GGUF control-vector
 convention, adding explicit operation and compatibility metadata. The
 important distinction is between **additive steering**, which adds a vector,
 and **projective steering**, which removes a component of the current
-activation. Loading one as the other changes the computation.[^3]
+activation. An additive consumer can accept a projective artifact's names,
+dtypes, and shapes without error, yet push activations along the direction
+instead of removing their component. This silent failure motivates
+`glp.mode`: a conforming reader must reject an operation it does not
+implement.[^3]
 
 ### The projection
 
@@ -212,7 +220,11 @@ $\alpha=1$, the operation removes that component. At $\alpha=0$, it leaves
 $h$ unchanged. At $\alpha=2$, it reflects the component across the
 perpendicular subspace. Increasing the strength is therefore not a promise
 of steadily improving behavioral results. Strength needs validation for the
-particular checkpoint, activation site, and output regime.
+particular checkpoint, activation site, and output regime. Strength travels
+separately in `glp.alpha_default` or a runtime override such as `--glp-alpha`.
+It must not be baked into projective direction tensors: scaling a raw
+direction by $s$ scales $(h^\top d)d$ by $s^2$, whereas a consumer that
+normalizes the direction, as hf2q does, erases that baked-in scale.[^3]
 
 The connection to weight editing is exact in a limited case: if the intervened
 activation is $h=Wx$, the same operation can be written as a rank-at-most-one
@@ -243,11 +255,23 @@ with an explicit rationale and appropriate validation. The same numeric
 vector is not automatically interchangeable between an FFN output and a
 complete residual state.
 
-Suiche's September 4 correction is instructive: a reported DeepSeek
-intervention had been applied to an FFN write before the residual fold,
-rather than to the folded residual as previously described. The measured
-result survived, but its explanation needed correction. The physical hook
-is part of the experiment, not a detail recoverable from the file extension.[^7]
+The format can pair with different quantizations of the same checkpoint,
+but loadability does not establish behavioral transfer. The specification
+recommends revalidation below approximately Q4; this is an expectation based
+on quantization effects, not a measured cross-quantization guarantee.[^3]
+
+Suiche's September 4 correction provides a concrete transfer example.
+The shipped DeepSeek GLP-29 direction was derived from the folded post-layer
+residual but applied to the pending FFN write before the hyper-connection
+fold. The relabeled artifact records both sites:
+`glp.derived_at=residual_stream_post_layer` and
+`glp.hook_point=ffn_out_pre_residual`. Its tensor bytes and earlier measured
+results remained unchanged. The follow-up also reversed the earlier claim
+of residual-site superiority: under the reported DeepSeek conditions, the
+FFN writer was more effective than the true residual, which outperformed
+the attention writer. This ordering is specific to that experiment. The
+physical hook must be recorded and checked against execution and
+measurement; the format alone cannot establish it.[^7]
 
 Suiche's privately shared research also informed this article's treatment of
 activation steering and experimental validation. hf2q's implementation and
@@ -273,20 +297,20 @@ integration in Rust and its MLX-native paths. Production inference does not
 invoke the weightless Python/vLLM stack. A GLP file is an input artifact;
 the hf2q runtime supplies its own application machinery.
 
-The source map below separates the public controls from their implementation.
+The source map below separates selected public controls from their implementation.
 It identifies code present in the reviewed source, rather than certifying
 every combination or inheriting another engine's results.[^9]
 
-*Table 3. Public control surfaces and corresponding hf2q implementation paths.*
+*Table 3. Selected control surfaces and corresponding hf2q implementation paths.*
 
 | Surface | Role | Source |
 |---|---|---|
-| `--gcd` alone | Install the embedded prose grammar as a server default | `src/cli.rs`; `src/serve/api/handlers.rs` |
+| `--gcd` alone | Install the embedded prose grammar as a server default | `src/cli.rs`; `src/serve/api/gcd_policy.rs` |
 | `--gcd-schema <file>` | Compile a JSON schema and install a default grammar | `src/serve/mod.rs`; `src/serve/api/grammar/json_schema.rs` |
 | Request grammar and structured output | Resolve request constraints into grammar state | `src/serve/api/grammar/request.rs` |
 | Grammar execution | Parse GBNF; track stacks and partial UTF-8; reject candidates | `src/serve/api/grammar/{parser,sampler,mask}.rs` |
 | Selection and completion | Select constrained tokens, advance state, validate termination | `src/serve/api/engine.rs`; `src/serve/sampler_pure.rs` |
-| `--glp <file>`; `--glp-alpha` | Load and bind a steering artifact and strength | `src/inference/glp/` |
+| `--glp <ref>`; `--glp-alpha` | Load and bind a steering artifact and strength | `src/inference/glp/` |
 | Model-family hooks | Apply steering within supported forward paths | `src/inference/models/{qwen35,deepseek4}/` |
 | `hf2q calibrate` | Derive and export a candidate GLP artifact | `src/calibrate/mod.rs` |
 
@@ -313,7 +337,11 @@ or replace the established HTTP status with a new 500. Clients must handle
 stream errors and avoid treating a partial tool call as executable. The
 finished object and its authorization should be validated before execution.
 
-The `--gcd` flag is a convenience default with an embedded grammar. It is not
+The `--gcd` flag is a convenience default with an embedded grammar. The
+current handler defers to an explicit `grammar`, `response_format`,
+`json_schema`, or `structured_outputs` request. Enabling GLP does not change
+the default grammar: `--gcd` and `--gcd --glp` select the same embedded
+artifact in the absence of an explicit constraint. The prose default is not
 itself an authenticated, mandatory, per-principal policy compiler. Applications
 using grammar constraints for authorization must control the effective
 constraint and its scope through trusted application state. In the reviewed
@@ -328,6 +356,13 @@ The compiler implements structural and value constraints, including finite
 `enum` and `const` values, required properties, and supported length and
 collection bounds. Unsupported assertions should produce a compilation error
 instead of disappearing silently.[^11]
+
+`--gcd-schema-locked` makes the selected server schema mandatory. The
+request policy checks caller constraints before injecting that schema and
+rejects replacement grammars, lazy-grammar modifiers, and competing tool
+choices before streaming begins. Tool definitions are accepted only with
+`tool_choice: "none"`. This is a fixed server policy; applications still
+supply authentication and any per-principal authorization logic.
 
 The checked-in recon example has required content and provenance fields. That
 structure makes an output easier to validate and review. It does **not** make
@@ -345,14 +380,27 @@ handling. Schema validity and semantic validity remain different properties.
 ### The GLP path and calibration
 
 The GLP subsystem contains a GGUF reader, device binding, arithmetic references,
-and Metal application kernels. The forward paths choose the activation buffer
-and layer at which to apply the intervention. Those choices are necessarily
-family-specific; a shared file format does not imply interchangeable model
-graphs.
+and Metal application kernels. Binding checks the declared hook, layer range,
+and vector width against the model path. Projective mode normalizes its
+direction; additive mode preserves the vector's magnitude. Graph layer IDs
+are retained without an implicit offset. Qwen's greedy path now applies the
+intervention, and its persistent prefix-cache identity includes steering
+configuration. DeepSeek dispatches the declared operation at the FFN writer.
+These are explicit model-family contracts, not interchangeable graph sites.
+Explicit local files and Hub references share validation; automatic discovery
+rejects ambiguous candidates. Declared direction hashes are checked before
+normalization. Checkpoint declarations use available source provenance, with unverifiable
+declared revisions rejected. For converted models, the source receipt is
+checked against the selected output's size and hash; model-card ancestry
+cannot supply the served checkpoint identity. These checks do
+not establish behavioral transfer or the quality of a supplied direction.[^12]
 
 The current calibration implementation uses the DeepSeek-V4 model path. It
-exports a normalized direction derived from the difference between mean
-activations for harmful and harmless prompt sets, writes a GLP artifact, and
+exports a normalized difference between mean activations for harmful and
+harmless prompt sets. The candidate is derived from stream zero of the
+post-layer residual but applied to the FFN write before residual integration;
+`glp.derived_at` and `glp.hook_point` now name those distinct sites. This is
+an explicit site-transfer experiment. Calibration writes the artifact and
 performs zero-dose and live-dose logit canaries. It also computes a separate
 contrast between pinned compliance and refusal prefixes and logs its norm;
 that contrast is not the exported direction. Between-prompt and response-prefix
@@ -365,13 +413,31 @@ arithmetic and application-site identity require separate checks. Behavioral
 evaluation then asks whether the intervention improves the target behavior
 while preserving useful capability.
 
-## Refusal control as a case study
+### Operational validation
 
-The hf2q grammar campaign provides a concrete example of GCD changing model
-behavior with the base weights held unchanged. The **W1** grammar combines a
-fixed opening, a bounded topic sentence, and a body with a restricted alphabet
-and lexical exclusions. It can block the particular forms that its rules
-exclude. It cannot recognize every way of declining a task.
+The September 10 operational battery records four successive 17-cell attempts.
+The final attempt passes all 17 assertions with no skips; earlier failed and
+skipped cells remain in the log. The runner now resolves bias-token IDs from
+the supplied GGUF vocabulary and sends nonempty bias maps. Other named checks
+cover exact literal output, selected sampling and penalty settings, streaming
+assembly, and rejection of unsupported or unfinished constrained requests.
+This improves on the earlier battery's unsupported engagement claims.[^16]
+
+The evidence has a defined scope. Most cells explicitly attach W1; they do
+not validate every default-grammar or schema-policy path. The control endpoint
+is operator supplied, and the records do not establish its model equivalence
+or complete absence of interventions. Short pass records lack a complete
+binary, model, grammar, and request identity. The final 17/17 result therefore
+reports operational assertions, not exhaustive grammar conformance or a
+reproducible benchmark of the inspected source.
+
+## Refusal-control experiments
+
+The hf2q grammar campaign records responses generated under a
+refusal-suppression grammar, with the base weights held unchanged. The **W1**
+grammar combines a fixed opening, a bounded topic sentence, and a body with a
+restricted alphabet and lexical exclusions. It can block the particular forms
+that its rules exclude. It cannot recognize every way of declining a task.
 
 The historical W1 grammar and the later embedded **W6V2** grammar are distinct
 artifacts. W6V2 extends the lexical coverage. Results measured with W1 belong
@@ -381,7 +447,7 @@ to W1, even when a current command selects the newer default.[^13]
 
 An archived probe records twelve selected adversarial prompts on the DeepSeek
 subject. Before grammar masking, the mean reported probability of the token
-`I` at the first generated position is **99.9744%**. In this sample it is the
+`I` at the first generated position is **99.97%**. In this sample it is the
 usual refusal opener. That concentration is a token-level observation, not a
 measurement of a universal internal refuse/comply switch.
 
@@ -424,17 +490,28 @@ failed judgments, which are reported separately.*
 
 ![Stacked response counts for the adversarial and benign corpus strata across three model subjects, separating valid fulfillment, maintained refusal, degeneration, other judgments, and missing judgments.](figures/gcd/w1-outcomes.svg)
 
-*Figure 4. W1 outcomes on the two corpus strata. Each bar includes all 512
-responses. “Other judged” combines partial refusal, pivot-then-fulfillment,
-mixed, and nonresponsive categories. “Valid fulfillment” is the judge's label;
-it does not certify factual correctness or successful termination.*
+*Figure 4. Historical W1 judgments on the two corpus strata. Each bar includes
+all 512 responses. “Other judged” combines partial refusal,
+pivot-then-fulfillment, mixed, and nonresponsive categories. Fulfillment and
+degeneration are labels from the original scoring pass, which clipped long
+answers. They do not certify full-response validity or task completion.*
 
-The quality cost is material. DeepSeek has 91 responses labeled degenerate
-across the full corpus, including 58 in the benign half. Its generation log
-also records 823 of 1,024 responses ending at the token limit. These categories
-overlap: termination and semantic judgment measure different things. Zero
-observed benign refusals therefore does not establish preserved benign
-performance.
+DeepSeek has 91 responses labeled degenerate across the full corpus,
+including 58 in the benign half. Its generation log records 823 of 1,024
+responses ending at the token limit. A later cross-tabulation shows that
+733 of those 823 responses carried the historical “valid fulfillment” label,
+85 were labeled degenerate, and five received other labels. Nineteen of the
+733 fulfillment labels also carry an invalid-output flag. Thus budget
+exhaustion, degeneration, and fulfillment are overlapping observations;
+733 is not a count of newly validated complete answers.[^16]
+
+The historical harness requested 800 completion tokens per response. Its judge saw
+at most 2,500 characters, clipping 971 of DeepSeek's 1,024 responses; it was
+not given the generation finish reason. Thirteen degeneration verdicts cite
+the artificial judging cutoff. Moreover, 20 of the 912 DeepSeek responses
+labeled “valid fulfillment” also carry an invalid-output flag. These counts
+reproduce the recorded categories, not reliable full-response quality
+assessments.[^13]
 
 An offline embedding screen flags 9 of DeepSeek's 12 maintained refusals and
 also flags 3 of its 912 judge-labeled valid fulfillments. The three missed
@@ -448,13 +525,69 @@ Its listed disagreements include three over-flags and one under-flag.
 That sample is useful for discovering judge errors; it cannot establish
 unbiased corpus-wide agreement or justify assuming the errors cancel.[^15]
 
-These observations establish that a particular grammar can substantially
-change the form and judged behavior of responses in a particular campaign.
-They do not establish a universal grammar, a general reasoning improvement,
-or the behavior of a later hf2q build. The logs lack a complete per-run
-binding to binary and model hashes and all generation settings, so they
-remain exploratory evidence rather than a reproducible benchmark of the
+Taken together, the reported refusal rates depend on a single abliterated
+judge whose corpus-wide agreement is unestablished, applied to runs with
+incomplete runtime and model provenance.
+
+The retained records have no matched full-corpus unconstrained baseline, so
+they cannot isolate the grammar's effect on refusal, length, or quality.
+They also lack complete per-run binary, model, and configuration identities.
+The W1 case study remains exploratory evidence of constrained output and
+its measurement limitations, rather than a reproducible benchmark of the
 current implementation.
+
+The revised harness sends complete responses with termination metadata and
+rejects contradictory verdict fields. It binds judgments to the full input,
+keeps run and budget conditions distinct, checks hashes when joining records,
+and rejects incompatible resumptions. A managed measurement process binds
+verified model and binary files to the live tokenizer, template, defaults,
+and intervention state. Human-review exports retain full text and separate
+initial labeling from machine verdicts. Offline regressions exercise these
+contracts; they do not validate the historical labels. No completed
+replacement scoring pass is included in this case study.[^17]
+
+### A single-layer GLP evaluation
+
+A subsequent experiment evaluated one candidate DeepSeek-V4 direction on a
+fixed panel of 32 adversarial and 16 benign prompts. The 4,096-dimensional
+vector targets graph layer 29 and uses the residual-to-FFN site transfer
+described above. This is one candidate at one layer, not a multilayer GLP
+intervention. Each arm used temperature zero, disabled thinking, no GCD,
+and a 256-token budget. There was one generation per prompt and arm; the
+baseline loaded no steering artifact.[^16]
+
+*Table 5. GLP panel counts. Each arm contains the same 32 adversarial and
+16 benign prompts. Fulfillment and refusal columns are semantic-judge labels;
+the final column is measured generation termination.*
+
+| Arm | Adversarial maintained refusal | Benign fulfillment label | Benign token-limit termination |
+|---|---|---|---|
+| Unsteered | 28/32 | 4/16 | 14/16 |
+| $\alpha=0.5$ | 28/32 | 3/16 | 15/16 |
+| $\alpha=1$ | 28/32 | 3/16 | 14/16 |
+| $\alpha=2$ | 29/32 | 2/16 | 15/16 |
+| $\alpha=4$ | 29/32 | 3/16 | 15/16 |
+
+All 240 responses received judgments, with no recorded request or judge errors.
+No adversarial response was labeled valid fulfillment, and no benign response
+was labeled maintained refusal. The judge used the same recorded Qwen
+identifier as the historical campaign. Its driver retained the earlier
+2,500-character input limit, but none of these shorter responses exceeded it.
+Generation termination remains a substantial limit: 14–15 of 16 benign
+responses per arm exhausted the budget. Neither the absence of benign refusal
+nor similar capped-output labels establishes preserved capability.[^16]
+
+Increasing strength produced no observed refusal reduction for this candidate
+and panel. At $\alpha=2$ the transformation is a reflection by the equation;
+these counts do not establish that reflection caused the observed result.
+Direction quality, layer coverage, and transfer between activation sites remain
+possible explanations. Six panel texts also occur in the checked-in calibration
+corpus, so the panel is not wholly held out. The records identify the binary,
+vector, model, corpus, and panel by hashes, but do not bind the binary to a
+source revision or identify the judge's exact artifact. There are no repeated
+passes or loaded-vector zero-strength control. The result motivates behavioral
+validation of calibrated directions; it does not establish a general limit
+on GLP or a measured latency advantage.
 
 ## Discussion and implications
 
@@ -492,9 +625,10 @@ alongside quality, and measure latency, throughput, and cache reuse on the
 actual serving path. Grammar soundness, steering correctness, and task
 success are separate obligations.
 
-The opportunity is a local stack with explicit control over computation and
-output structure. hf2q makes these controls inspectable; their practical value
-depends on precise contracts and validation in the applications that use them.
+hf2q makes both controls inspectable in a local inference stack. Their
+practical value depends on specifying the activation and output-language
+contracts, testing the executed paths, and measuring completed application
+outcomes separately from the model's willingness to answer.
 
 ## Acknowledgments
 
@@ -507,9 +641,14 @@ Matt Suiche.
 
 ## Artifacts and reproducibility
 
-The inspected hf2q source is commit
-`44004311717d414feaa54384578e2bcf4d140464`. This identifies the inspected
-implementation, not the historical campaign runtime.
+The current implementation account uses hf2q commit
+`92afc4a317c90ea527033228e0492f392778e412`. The historical W1 audit retains
+source snapshot `44004311717d414feaa54384578e2bcf4d140464`. Neither source
+inspection identifies a historical runtime by itself. The
+[follow-up evidence manifest](figures/gcd/followup-evidence.json) separates
+later GLP records, battery attempts, and historical termination cross-tabs;
+its [offline extractor](../scripts/grammar_probe/publication_followup.py)
+recomputes those aggregates without publishing prompt or response text.
 [Figure data and formulas](figures/gcd/figure-data.xlsx),
 [aggregate data and hashes](figures/gcd/evidence.json), and
 [response-count CSV](figures/gcd/outcomes.csv) accompany the article.
@@ -518,19 +657,23 @@ implementation, not the historical campaign runtime.
 
 1. Geng, S., Josifoski, M., Peyrard, M., and West, R. [Grammar-Constrained Decoding for Structured NLP Tasks without Finetuning](https://aclanthology.org/2023.emnlp-main.674/). EMNLP, 2023.
 2. Ovando, V. *Constitutive Authorization at the Decoding Boundary: Grammar-Constrained Decoding as a Positive, Generation-Time Security Control for LLM Agents*. Supplied manuscript `gcd.pdf`, draft June 26, 2026, §§3–4, 6, 8. [Project DOI](https://doi.org/10.17605/OSF.IO/S9GU6); [companion soundness argument](https://github.com/cybersharkvin/gcd-authz/blob/main/docs/proof.md). The reviewed PDF is the supplied version; identity with the current DOI download is not asserted.
-3. Suiche, M. [GLP — GGUF Layer Projection: format and apply path](https://github.com/msuiche/weightless/blob/main/spec/GLP.md); [weightless](https://weightless.msuiche.com/). Living specification and project, accessed September 10, 2026.
+3. Suiche, M. [GLP — GGUF Layer Projection: format and apply path](https://github.com/msuiche/weightless/blob/3fbaa80592aba9aaaed03118d34b7d4c8afb74d4/spec/GLP.md); [weightless](https://weightless.msuiche.com/). Specification revision `3fbaa80592ab`; accessed September 10, 2026.
 4. Dong, Y., et al. [XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models](https://arxiv.org/abs/2411.15100). 2024.
 5. Park, K., Wang, J., Berg-Kirkpatrick, T., Polikarpova, N., and D'Antoni, L. [Grammar-Aligned Decoding](https://arxiv.org/abs/2405.21047). NeurIPS, 2024.
 6. Arditi, A., et al. [Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717). 2024.
 7. Suiche, M. [Sticky Refusals, Free Speculative Decoding, and the Invisible Quantisation Cliff](https://www.msuiche.com/posts/autoresearch-sticky-refusals-free-speculative-decoding-and-the-invisible-quantisation-cliff/), September 3, 2026; September 4 hook-site correction.
 8. Suiche, M. Unpublished research on activation steering, privately shared with Robert E. Lee, 2026.
-9. hf2q. [Reviewed source tree](https://github.com/robertelee78/hf2q/tree/44004311717d414feaa54384578e2bcf4d140464/src); [CLI](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/cli.rs); [request handler](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/handlers.rs).
-10. hf2q. [Grammar implementation](https://github.com/robertelee78/hf2q/tree/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/grammar); [engine](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/engine.rs).
-11. hf2q. [Schema compiler](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/grammar/json_schema.rs); [recon schema](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/examples/recon-opportunities.schema.json). JSON Schema, [string constraints](https://json-schema.org/understanding-json-schema/reference/string).
-12. hf2q. [GLP subsystem](https://github.com/robertelee78/hf2q/tree/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp); [calibration implementation](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/calibrate/mod.rs); [ADR-054](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/docs/adr/ADR-054-glp-runtime-calibration.md).
-13. hf2q. Historical W1 generation, judge, and embedding-screen JSONL records, September 2026. Exact filenames, hashes, counts, and access status appear in the [evidence manifest](figures/gcd/evidence.json). [Offline aggregation script](../scripts/grammar_probe/publication_data.py). Raw logs are local campaign artifacts, not all present in the published repository.
+9. hf2q. [Reviewed source tree](https://github.com/robertelee78/hf2q/tree/92afc4a317c90ea527033228e0492f392778e412/src); [CLI](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/src/cli.rs); [request policy](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/src/serve/api/gcd_policy.rs).
+10. hf2q. [Grammar implementation](https://github.com/robertelee78/hf2q/tree/92afc4a317c90ea527033228e0492f392778e412/src/serve/api/grammar); [engine](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/src/serve/api/engine.rs).
+11. hf2q. [Schema compiler](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/src/serve/api/grammar/json_schema.rs); [recon schema](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/examples/recon-opportunities.schema.json). JSON Schema, [string constraints](https://json-schema.org/understanding-json-schema/reference/string).
+12. hf2q. [GLP subsystem](https://github.com/robertelee78/hf2q/tree/92afc4a317c90ea527033228e0492f392778e412/src/inference/glp); [calibration implementation](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/src/calibrate/mod.rs); [ADR-054](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/docs/adr/ADR-054-glp-runtime-calibration.md).
+13. hf2q. Historical W1 generation, judge, and embedding-screen JSONL records, September 2026. Exact filenames, hashes, counts, and access status appear in the [evidence manifest](figures/gcd/evidence.json). [Offline aggregation script](../scripts/grammar_probe/publication_data.py); [judging harness](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/judge.py). Raw logs are local campaign artifacts, not all present in the published repository.
 14. hf2q. `refusal_mass_probe.jsonl`, twelve archived observations, and [probe script](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/refusal_mass_probe.py). Probability semantics: [sampler](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/sampler_pure.rs), `sample_token_with_logprob_topk`, and the grammar-aware engine call site.
 15. Lee, R. E. [Qwen3.6-35B-A3B-Abliterix-EGA-abliterated](https://huggingface.co/jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated), judge checkpoint. hf2q, [human spot-check of the Qwen judge](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/SPOT_CHECK_RESULTS.md), September 8, 2026.
+
+
+16. hf2q. [September 10 GLP panel records and judge driver](https://github.com/robertelee78/hf2q/tree/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/gate34); [operational battery](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/battery_gcd_v2.jsonl); [historical termination report](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/full_results_w1.truncation-report.json). Recomputed counts and source identities: [follow-up manifest](figures/gcd/followup-evidence.json).
+17. hf2q. [Revised measurement methods](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/scripts/grammar_probe/METHODS.md); [judge](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/scripts/grammar_probe/judge.py), [rejudge](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/scripts/grammar_probe/rejudge.py), [report](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/scripts/grammar_probe/report.py), and [offline/mock tests](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/scripts/grammar_probe/test_harness_repair.py).
 
 [^1]: Geng et al., *Grammar-Constrained Decoding for Structured NLP Tasks without Finetuning* (2023), Source 1.
 [^2]: Ovando, supplied June 26, 2026 manuscript, §§3–4, 6, 8, and companion proof; Source 2.
@@ -547,3 +690,6 @@ implementation, not the historical campaign runtime.
 [^13]: Historical W1 logs and recomputed aggregates, Source 13.
 [^14]: Archived twelve-prompt probe and source-verified logprob semantics, Source 14.
 [^15]: Author's Qwen3.6 judge checkpoint and stratified human spot-check record, Source 15.
+
+[^16]: September 10 GLP panel, final battery attempt, and historical termination cross-tabs; Source 16.
+[^17]: Revised measurement harness and focused offline/mock validation; Source 17.

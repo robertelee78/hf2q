@@ -600,6 +600,32 @@ jobs:
             --skip loader_preserves_raw_blocks_and_expands_only_elementwise_state \
             --skip loader_rejects_catalog_and_i32_storage_before_residency
 
+      - name: GCD policy and measurement identity contracts
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          set -euo pipefail
+          contract_failures=0
+          for contract in \
+            gcd_policy::tests \
+            gcd_schema_tests \
+            gcd_schema_locked_requires_gcd_schema_on_serve_and_chat \
+            measurement::tests \
+            inference::glp::discovery::tests \
+            inference::glp::compatibility::tests \
+            inference::glp::source_identity::tests \
+            calibrate::export_tests \
+            inference::glp::reader::tests; do
+            if ! cargo test --locked --bin hf2q --all-features "$contract"; then
+              contract_failures=1
+            fi
+          done
+          if ! python3 -B -m unittest discover -s scripts/grammar_probe -p 'test*.py'; then
+            contract_failures=1
+          fi
+          exit "$contract_failures"
+
       # --- Blocking: activate() matrix matches the shipping contract ---
       - name: activate() matrix smoke (clean / REFUSED / UNSAFE)
         shell: bash

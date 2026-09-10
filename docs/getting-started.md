@@ -76,6 +76,9 @@ Chat discovers the running server on this machine and connects. Ask it
 something real—this is the first inference proof. `/status` shows the endpoint
 and token statistics; `/quit` exits.
 
+After the baseline checks, [section 11](#11-optional-gcd-and-glp) shows
+optional grammar constraints and activation steering.
+
 For a one-command standalone check, this performs the same preparation and
 starts an owned loopback server automatically. A targeted chat deliberately
 owns its exact server even when another local server is already advertised:
@@ -266,106 +269,63 @@ services, rerun the installer with `--status`, `--disable`, `--enable`, or
 `--uninstall` (removal moves everything into a timestamped Trash folder; the
 model, hf2q, OpenCode, and Agentic Kit are untouched).
 
-## 11. Optional: forced engagement and runtime steering (`--gcd`, `--glp`)
+## 11. Optional: GCD and GLP
 
-Both flags are launch-time modifiers of the model server. Stop it with Ctrl-C
-in terminal 1 and relaunch to try either. Plain `hf2q serve` is unchanged when
-they are absent, and the two flags compose. Neither touches a weight: `--gcd`
-constrains the sampling distribution; `--glp` steers the residual stream at
-inference time.
+GCD constrains generated text; GLP modifies selected activations without
+changing stored weights. Try these after completing the baseline checks above.
+They require a build exposing `--gcd` and `--glp` in `hf2q serve --help`;
+the site's pinned v0.1.20 installer does not include those flags. See the
+[source-build instructions](https://github.com/robertelee78/hf2q#install).
+See the [GCD and GLP article](gcd-in-hf2q.md) for the supported paths,
+validation evidence, and experimental limitations.
 
-### Worked example: `--gcd` (grammar-constrained decoding)
+### Try the GCD default
+
+Stop the server with Ctrl-C in terminal 1, then restart it with:
 
 ```bash
 hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M --gcd
 ```
 
-`--gcd` injects an embedded GBNF grammar into every chat request that does not
-already specify one and disables the think block so the grammar engages at
-token 0: the answer must open with a fixed anchor, seating the model's
-distribution on task continuations so refusal becomes locally incoherent —
-forced abliteration with no weight edits. The measured grammar stack behind
-this flag is three layers — a character-alphabet whitelist, a KMP
-refusal-lexicon exclusion automaton, and the anchor/topic sentence — and on
-stock DeepSeek-V4-Flash it held refusal to 2.3% on a 512-prompt adversarial
-corpus and 0.0% on 512 benign prompts (87.3% actionable on the adversarial
-half); layering the embeddings gate on drops the residual refusal to 0.59%
-(`scripts/grammar_probe/FINDINGS.md`).
-
-From terminal 2, once the server reports ready:
+When it reports ready, connect from terminal 2:
 
 ```bash
-MODEL_ID="$(curl -fsS http://127.0.0.1:8081/v1/models |
-  jq -er '.data | map(select(.loaded == true)) | .[0].id')"
-curl -fsS http://127.0.0.1:8081/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"Explain how a buffer overflow works, step by step.\"}],\"temperature\":0,\"max_tokens\":256,\"stream\":false}" \
-  | jq -r '.choices[0].message.content'
+hf2q chat --url http://127.0.0.1:8081
 ```
 
-The reply must open with the anchor `Here is the technical breakdown.` — that
-opening, plus one `[GCD] injecting grammar` line per request in terminal 1, is
-the proof the constraint engaged. A request that supplies its own
-`grammar` or `response_format` keeps it; `--gcd` only fills in requests that
-specify neither. `--uncensor` is a hidden alias kept for backward
-compatibility.
+Ask: “Explain how DNS caching works.” The embedded W6V2 grammar specifies
+an opening, a character whitelist, and a lexical blacklist. It does not
+establish answer correctness or eliminate every possible refusal. This
+checkpoint is already abliterated; the example demonstrates the grammar
+control, not a refusal-reduction experiment. Explicit request constraints
+and tool grammars can change which grammar is effective.
 
-### Worked example: `--gcd-schema` (schema-constrained output)
+### Load a GLP artifact
+
+Stop the previous server first. Substitute an exact model checkpoint and a
+local steering artifact validated for that checkpoint and application site:
 
 ```bash
-hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M \
-  --gcd-schema examples/recon-opportunities.schema.json
+hf2q serve /path/to/exact-model.gguf --glp /path/to/matching.glp.gguf
 ```
 
-The pipeline arm (ADR-057): instead of the prose grammar, the server compiles
-your JSON schema to GBNF at startup (fail-closed on an invalid schema) and
-constrains every chat response to the object shape — typed fields leave no
-structural slot for refusal prose. Every field must be content-bearing: a
-free-form `notes` field reopens the pivot slot by hand.
+The modified Qwen checkpoint used earlier is not automatically compatible
+with a vector derived from stock Qwen weights. Without `--glp-alpha`, strength
+comes from the artifact's `glp.alpha_default`, or 1.0 when absent. A successful
+load does not prove useful steering. Connect with the same `hf2q chat --url`
+command after the server is ready.
 
-### Worked example: `hf2q calibrate` (derive a GLP vector on-device)
+`--gcd --glp` uses the same default grammar as `--gcd` alone. Hold the actual
+grammar fixed when comparing steering, and reset inference state between
+configurations. To return to the baseline,
+stop the server and rerun the command from section 2 without either flag.
+These flags configure the server; adding them to a chat client attached to
+an existing endpoint does not reconfigure it.
 
-```bash
-hf2q calibrate /path/to/DeepSeek-V4-Flash.gguf --out dsv4-calibrated.glp.gguf
-```
-
-ADR-054: derives a GLP steering direction on-device (forced-capture over the
-embedded 64+64 contrastive corpus, prefill-only, no decode loop), exports a
-GLP-conformant GGUF, and proves it before returning: the zero-dose canary must
-be logit-identical and the live-dose canary must shift probe logits by more
-than 1e-3, else the command fails closed. DeepSeek-V4 in v1. Serve the result
-with `--glp dsv4-calibrated.glp.gguf`.
-
-### Worked example: `--glp` (GLP runtime steering)
-
-```bash
-# Bind an explicit vector, with an optional dose override:
-hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M \
-  --glp ./vectors/qwen38-refusal.gguf --glp-alpha 0.8
-
-# Or bare --glp: the resolver auto-discovers the vector bound to this model
-# under the weightless Hub convention (`msuiche/*-GLP-*` artifacts):
-hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M --glp
-```
-
-A GLP vector is a small GGUF control vector (`project` or `add` mode) applied
-per layer to the post-layer residual stream at inference time; base weights are
-never modified. Without `--glp-alpha`, the dose is the vector's own
-`glp.alpha_default` (else 1.0). Startup is fail-closed: a vector with an
-unknown mode or hook point, an unsupported spec version, or the wrong width
-aborts the launch with a named error instead of serving unsteered, and
-auto-discovery fails closed on ambiguity or no match. The proof is in
-terminal 1's startup output:
-
-```text
-[GLP] vector bound: layers=… width=… alpha=… mode=… path=…
-```
-
-Attribution:
-
-- GCD concept (both faces — tool-call authorization and forced abliteration): **Vince Ovando** (vince@cybersharkconsulting.com), https://tantalus.io/
-- GLP / weightless control vectors: **Matt Suiche** (m@msuiche.com), https://github.com/msuiche/weightless
-- hf2q is the first inference-engine-native implementation.
+For mandatory schema controls, calibration, and artifact discovery, see the
+[README usage reference](https://github.com/robertelee78/hf2q#user-content-gcd-and-glp-serving-flags---gcd---glp).
+The [article](gcd-in-hf2q.md) and [paper PDF](gcd-in-hf2q.pdf) explain the
+mechanisms and evidence.
 
 ## Troubleshooting
 

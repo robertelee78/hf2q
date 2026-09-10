@@ -936,10 +936,9 @@ model. Both are opt-in controls that leave the base weights unchanged. The
 ([paper PDF](docs/gcd-in-hf2q.pdf)) explains their concepts, hf2q implementation,
 and implications for local inference and agent security.
 
-Runtime qualification is still in progress. The
-[implementation review](docs/gcd-in-hf2q-review.md) records the source defects
-and validation required for these controls; loading an artifact or passing a
-logit canary does not establish behavioral quality or interoperability.
+The article distinguishes runtime validation from behavioral evidence.
+Loading an artifact or passing a logit canary does not establish behavioral
+quality or interoperability.
 
 ```bash
 # Install the embedded refusal-suppression grammar as a server default:
@@ -975,11 +974,15 @@ grammar at startup and conflicts with `--gcd`. It constrains object structure
 and supported field values. Free-text strings can still contain refusal or
 incorrect content; `minLength` does not prevent either. See the
 [recon object example](examples/recon-opportunities.schema.json) and the
-paper's schema discussion. These server defaults are convenience controls,
-not authenticated authorization policies. Tool grammars take precedence over
-response grammars. Current default injection checks `grammar` and
-`response_format`, but can conflict with explicit `json_schema` or
-`structured_outputs`; the review records this defect.
+paper's schema discussion. Default injection defers to an explicit `grammar`,
+`response_format`, `json_schema`, or `structured_outputs` request; a selected
+tool grammar can take precedence over an unlocked response default.
+
+Add `--gcd-schema-locked` to make the server schema mandatory. Requests that
+replace or defer that grammar are rejected before streaming starts. Tool
+calls cannot replace the locked response schema; requests with tool definitions
+must use `tool_choice: "none"`. Authentication and per-principal authorization
+remain application responsibilities.
 
 **GLP artifacts and application.** A GLP file distributes steering directions
 and application metadata separately from the base checkpoint, avoiding another
@@ -988,31 +991,35 @@ is not an arbitrary binary weight diff. The format distinguishes additive
 steering from projective steering (`h ← h − α(h·d̂)d̂` for a unit direction).
 Compatibility depends on the checkpoint, graph layers, activation site, mode,
 and strength. The inspected application paths are Qwen 3.5/3.6/3.8 and
-DeepSeek-V4; their hook, mode, and execution-path conformance findings remain
-open in the review.
+DeepSeek-V4. Binding checks the declared hook, layer range, and vector width.
+Qwen applies steering at the post-layer residual; DeepSeek applies the declared
+operation at the FFN writer before residual integration. The reader checks
+declared direction hashes and checkpoint identity. Model-card ancestors do
+not identify the checkpoint being served; converted models use an output-bound
+conversion receipt when available. A declared revision that cannot be verified
+is rejected.
 
-`--glp <file.gguf>` loads a local artifact. Bare `--glp` attempts
-convention-based Hub discovery; it does not currently establish unique
-artifact selection or exact checkpoint compatibility. Use an explicitly
-verified local artifact. `--glp-alpha` overrides the artifact's
+`--glp <file.gguf>` loads a local artifact. Explicit Hub repositories and file
+URLs resolve to immutable revisions. Bare `--glp` uses convention-based Hub
+discovery and rejects ambiguous repositories or files; select an explicit
+artifact when discovery cannot choose uniquely. `--glp-alpha` overrides the artifact's
 `glp.alpha_default`, falling back to 1.0 when that metadata is absent.
 Strength needs validation for the actual checkpoint and application site.
 Reset inference state when comparing steered and unsteered computation,
 since existing KV or recurrent state can retain earlier steering effects.
 
-**Combining the controls.** In the reviewed implementation, `--gcd --glp`
-selects a different default grammar from `--gcd` alone, including at zero
-steering strength. Do not interpret that comparison as changing only GLP.
-Controlled measurements must hold the actual grammar, model, prompts,
-sampling settings, and budget fixed. Default composition is one of the
-implementation findings awaiting correction.
+**Combining the controls.** `--gcd` and `--gcd --glp` select the same embedded
+W6V2 grammar when no explicit request constraint is supplied. Controlled
+measurements must still hold the actual grammar, model, prompts, sampling
+settings, and budget fixed while varying steering.
 
 **Calibration.** `hf2q calibrate <model.gguf>` currently uses DeepSeek-V4 and
-exports a normalized harmful-versus-harmless prompt direction. It also probes
-pinned response prefixes and runs zero-dose and live-dose logit canaries.
-These are candidate derivation and plumbing checks; held-out behavioral and
-capability validation is separate, and the review identifies export metadata
-and layer-mapping defects to resolve.
+exports a normalized harmful-versus-harmless prompt direction. Its metadata
+identifies derivation from the post-layer residual and application at the FFN
+writer. Pinned-prefix diagnostics and zero-dose/live-dose logit canaries remain
+separate from behavioral validation. The later tested dose ladder showed no
+refusal reduction under its recorded conditions; truncation limits the
+capability assessment.
 
 The corresponding `hf2q chat` flags configure a server that chat starts;
 they do not reconfigure an existing endpoint selected with `--url` or discovery.
@@ -1022,8 +1029,9 @@ The serving decisions and current validation status are recorded in
 [ADR-055](docs/adr/ADR-055-grammar-alphabet-presets.md),
 [ADR-056](docs/adr/ADR-056-gcd-serving-conformance-battery.md), and
 [ADR-057](docs/adr/ADR-057-gcd-schema-arm.md).
-The conformance battery is partially implemented; a planned cell inventory
-is not a completed validation result.
+The final recorded 17-cell operational battery passed its assertions without
+skips. Broader conformance coverage and complete run identity remain
+outstanding; see the paper's validation discussion.
 
 Vince Ovando contributed the generation-time authorization framing and GCD
 collaboration. Matt Suiche contributed GLP and
@@ -1178,8 +1186,6 @@ catalog + smoke prompt before any forward-pass code lands.
   serving surface (attribution, decision, shipping gates).
 - [GCD and GLP article](docs/gcd-in-hf2q.md) — concepts, hf2q implementation,
   historical evidence, and implications; [paper PDF](docs/gcd-in-hf2q.pdf).
-- [GCD and GLP implementation review](docs/gcd-in-hf2q-review.md) — source
-  findings and evidence required before publication.
 - `docs/adr/ADR-055-grammar-alphabet-presets.md` — grammar alphabet channel presets.
 - `docs/adr/ADR-056-gcd-serving-conformance-battery.md` — the partially
   implemented GCD serving-stack conformance battery.

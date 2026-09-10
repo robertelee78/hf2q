@@ -117,7 +117,7 @@ pub struct GlpVector {
     pub derived_at: Option<String>,
     pub alpha_default: f32,
     pub rank: u32,
-    /// layer N (1-based per spec) → direction tensor (fp32, width = hidden).
+    /// Graph layer N → direction tensor (fp32, width = hidden); N >= 1.
     pub layers: BTreeMap<u32, Vec<f32>>,
     pub width: usize,
     pub content_sha256: Option<String>,
@@ -364,8 +364,9 @@ impl GlpVector {
         }
 
         let content_sha256 = match metadata.get("glp.content_sha256") {
-            Some(MetaValue::Str(s)) => Some(s.clone()),
-            _ => None,
+            Some(MetaValue::Str(s)) if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) => Some(s.to_ascii_lowercase()),
+            Some(_) => return Err(GlpError::Malformed("glp.content_sha256 must be a 64-hex SHA-256 string".into())),
+            None => None,
         };
         let method = match metadata.get("glp.method") {
             Some(MetaValue::Str(s)) => Some(s.clone()),
@@ -378,6 +379,7 @@ impl GlpVector {
 
         // Gate 4: direction tensors
         let mut layers: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
+        let mut direction_bytes: BTreeMap<u32, &[u8]> = BTreeMap::new();
         let mut width: Option<usize> = None;
         for tensor in &tensors {
             let Some(suffix) = tensor.name.strip_prefix("direction.") else {
@@ -388,7 +390,7 @@ impl GlpVector {
             })?;
             if layer == 0 {
                 return Err(GlpError::Conformance(
-                    "direction.0 is invalid; layers are 1-based".into(),
+                    "direction.0 is invalid; direction.N applies at graph layer N, with N >= 1".into(),
                 ));
             }
             if tensor.n_dims != 1 {
@@ -463,11 +465,28 @@ impl GlpVector {
                     "duplicate direction.{layer}"
                 )));
             }
+            direction_bytes.insert(layer, &bytes[start..end]);
         }
         if layers.is_empty() {
             return Err(GlpError::Conformance(
                 "no direction.N tensors found; not a GLP vector".into(),
             ));
+        }
+        if let Some(expected) = content_sha256.as_deref() {
+            // Producer ordering: direction tensors by numeric graph layer,
+            // raw F32 bytes, excluding metadata and GGUF alignment padding.
+            // Never normalize directions before verifying their content ID.
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            for raw in direction_bytes.values() {
+                hasher.update(raw);
+            }
+            let actual = hex::encode(hasher.finalize());
+            if actual != expected {
+                return Err(GlpError::Conformance(format!(
+                    "glp.content_sha256 mismatch: declared {expected}, computed {actual}"
+                )));
+            }
         }
 
         Ok(Self {
@@ -670,4 +689,45 @@ mod tests {
             Err(GlpError::Conformance(_))
         ));
     }
+
+    #[test]
+    fn content_hash_verifies_raw_directions_in_numeric_layer_order() {
+        // Independently computed SHA-256 of little-endian F32 [1,2,-3,0.5].
+        let hash = "7f7746b005589f4bc87ddec595c260984966fc8180a145533f7c955745aefbab";
+        for tensors in [
+            vec![("direction.3", vec![1.0, 2.0]), ("direction.11", vec![-3.0, 0.5])],
+            vec![("direction.11", vec![-3.0, 0.5]), ("direction.3", vec![1.0, 2.0])],
+        ] {
+            let mut meta = base_meta();
+            meta.push(("glp.content_sha256", MetaValue::Str(hash.to_uppercase())));
+            meta.push(("glp.created", MetaValue::Str("different packaging metadata".into())));
+            let vector = GlpVector::from_bytes(&build_gguf(&meta, &tensors)).unwrap();
+            assert_eq!(vector.content_sha256.as_deref(), Some(hash));
+        }
+    }
+
+    #[test]
+    fn content_hash_rejects_changed_tensor_bytes() {
+        let mut meta = base_meta();
+        meta.push(("glp.content_sha256", MetaValue::Str(
+            "7f7746b005589f4bc87ddec595c260984966fc8180a145533f7c955745aefbab".into(),
+        )));
+        let bytes = build_gguf(&meta, &[
+            ("direction.3", vec![1.0, 2.0]),
+            ("direction.11", vec![-3.0, 0.6]),
+        ]);
+        let error = GlpVector::from_bytes(&bytes).unwrap_err();
+        assert!(error.to_string().contains("content_sha256 mismatch"));
+    }
+
+    #[test]
+    fn malformed_content_hash_is_fatal_when_declared() {
+        for value in [MetaValue::U32(1), MetaValue::Str("a".repeat(63)), MetaValue::Str("g".repeat(64))] {
+            let mut meta = base_meta();
+            meta.push(("glp.content_sha256", value));
+            let bytes = build_gguf(&meta, &[("direction.3", vec![1.0, 2.0])]);
+            assert!(GlpVector::from_bytes(&bytes).unwrap_err().to_string().contains("content_sha256"));
+        }
+    }
+
 }

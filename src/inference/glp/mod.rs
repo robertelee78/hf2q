@@ -17,13 +17,16 @@
 pub mod apply;
 pub mod apply_gpu;
 pub mod bind;
+pub mod compatibility;
 pub mod discovery;
 pub mod reader;
+mod source_identity;
 
 pub use apply::{apply_layer_add, apply_layer_project};
 pub use apply_gpu::{
     apply_layer_gpu, apply_layer_gpu_in_session, apply_layer_gpu_mhc, apply_layer_gpu_mhc_in_session,
 };
 pub use bind::BoundGlp;
-pub use discovery::{ResolvedGlp, auto_discover_glp, validate_glp_provenance};
+pub use compatibility::{validate_glp_for_model, CheckpointIdentity, Compatibility};
+pub use discovery::{resolve_glp, ResolvedGlp};
 pub use reader::{GlpError, GlpHookPoint, GlpMode, GlpVector};
