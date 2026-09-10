@@ -181,6 +181,53 @@ fn multiple_repositories_are_ambiguous_regardless_of_coverage_or_order() {
 }
 
 #[test]
+fn published_deepseek_repository_is_a_discovery_candidate() {
+    let search = "DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-";
+    let shipped = "msuiche/DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-29-L10-38-a4";
+    let wrong_base = "msuiche/DeepSeek-V4-Flash-0731X-abliterated-cyber-GLP-29-L10-38-a4";
+    assert_eq!(
+        unique_discovery_repo(search, vec![wrong_base.into(), shipped.into()]).unwrap(),
+        shipped
+    );
+    assert!(unique_discovery_repo(search, vec![wrong_base.into()]).is_err());
+}
+
+#[test]
+fn published_repository_and_alternate_same_base_are_ambiguous() {
+    let search = "DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-";
+    let shipped = "msuiche/DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-29-L10-38-a4";
+    let alternate = "msuiche/DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-28-L11-38-a4";
+    for repos in [
+        vec![shipped.into(), alternate.into()],
+        vec![alternate.into(), shipped.into()],
+    ] {
+        assert!(unique_discovery_repo(search, repos)
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous GLP repositories"));
+    }
+}
+
+#[test]
+fn only_recognized_layer_and_dose_suffixes_are_candidates() {
+    for tail in ["29", "29-L10-38-a4", "29-L10-38-a0.25", "29-L10-38-a0"] {
+        assert!(weightless_artifact_suffix(tail), "{tail}");
+    }
+    for tail in [
+        "0",
+        "29-extra",
+        "29-L10-38",
+        "29-L38-10-a4",
+        "29-L0-28-a4",
+        "29-L10-38-a-1",
+        "29-L10-38-a1.2.3",
+        "29-L10-38-a4-extra",
+    ] {
+        assert!(!weightless_artifact_suffix(tail), "{tail}");
+    }
+}
+
+#[test]
 fn discovery_filters_author_and_full_convention_and_rejects_incomplete_search() {
     let search = "Example-Model-abliterated-cyber-GLP-";
     let target = format!("msuiche/{search}12");

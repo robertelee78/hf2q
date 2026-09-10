@@ -170,11 +170,12 @@ fn unique_discovery_repo(search: &str, found: Vec<String>) -> Result<String> {
     let mut candidates = std::collections::BTreeSet::new();
     for repo in found {
         // A search result is not selection authority. Keep the exact author,
-        // base slug and numeric coverage convention, and validate the ID.
+        // base slug and published coverage/layer/dose convention; validate
+        // the ID independently before treating it as a candidate.
         HfModelReference::parse(&repo, None)?;
         if repo
             .strip_prefix(&prefix)
-            .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()))
+            .is_some_and(weightless_artifact_suffix)
         {
             candidates.insert(repo);
         }
@@ -188,6 +189,43 @@ fn unique_discovery_repo(search: &str, found: Vec<String>) -> Result<String> {
             "ambiguous GLP repositories: {}; select an explicit Hub reference",
             candidates.into_iter().collect::<Vec<_>>().join(", ")
         ),
+    }
+}
+
+/// Weightless repositories use GLP-<coverage>, optionally followed by the
+/// published -L<first>-<last>-a<dose> suffix. Coverage is a count, and the
+/// layer/dose suffix is identity text, not authorization to override metadata.
+fn weightless_artifact_suffix(tail: &str) -> bool {
+    fn integer(value: &str) -> Option<u32> {
+        (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| value.parse().ok())
+            .flatten()
+    }
+    let (coverage, suffix) = match tail.split_once("-L") {
+        Some((coverage, suffix)) => (coverage, Some(suffix)),
+        None => (tail, None),
+    };
+    if !integer(coverage).is_some_and(|coverage| coverage > 0) {
+        return false;
+    }
+    let Some(suffix) = suffix else {
+        return true;
+    };
+    let Some((layers, dose)) = suffix.split_once("-a") else {
+        return false;
+    };
+    let Some((first, last)) = layers.split_once('-') else {
+        return false;
+    };
+    let (Some(first), Some(last)) = (integer(first), integer(last)) else {
+        return false;
+    };
+    if first == 0 || last < first {
+        return false;
+    }
+    match dose.split_once('.') {
+        Some((whole, fraction)) => integer(whole).is_some() && integer(fraction).is_some(),
+        None => integer(dose).is_some(),
     }
 }
 

@@ -141,8 +141,9 @@ operand — the `--mmproj` shape.
 ## Resolver trust boundary
 
 The automatic resolver searches only the public `msuiche` namespace for the
-exact `<base>-abliterated-cyber-GLP-<N>` convention. It uses the model GGUF
-already selected by serving, not a second model download. Searches exceeding
+exact `<base>-abliterated-cyber-GLP-<N>` convention, including the published
+optional `-L<first>-<last>-a<dose>` suffix. It uses the model GGUF already
+selected by serving, not a second model download. Searches exceeding
 100 returned repositories fail as incomplete. Multiple matching repositories
 or multiple GGUF files require explicit selection; ordering and coverage do
 not confer priority. An explicit local file performs no Hub work. Explicit
