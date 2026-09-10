@@ -1,11 +1,30 @@
 # ADR-054: Runtime GLP calibration — `hf2q calibrate <model>`
 
-- **Status:** Draft — design accepted; the capture/export/canary path is
-  implemented and its canary gates are proven on DeepSeek-V4 (2026-09-09:
-  zero-dose logit-identical, live-dose shift 0.213 > 1e-3). The behavioral
-  gates (3–4: refusal-panel delta, dose ladder) remain unmet — the output of
-  `hf2q calibrate` is a candidate vector, not a validated derivation, until
-  those land.
+- **Status:** Accepted (mechanical) — the capture/export/canary path is
+  implemented and proven on DeepSeek-V4: zero-dose logit-identical,
+  live-dose shift 0.2019 (re-measured 2026-09-10 on the corrected export
+  contract: `glp.hook_point=ffn_out_pre_residual` naming the actual apply
+  site, spec-spelled `glp.derived_at=residual_stream_post_layer` naming
+  the capture site, `direction.<0-based layer>` verbatim per the spec's
+  no-offset rule; the earlier export wrote a typo'd `glp.derive_at` key no
+  reader could read and an off-by-one `direction.{layer+1}`).
+  **Behavioral gates 3–4 are now MEASURED, with a null result (2026-09-10):**
+  dose ladder 0.5/1.0/2.0/4.0 on a fixed 48-prompt panel (32 adversarial +
+  16 benign, temperature 0, judged by the APEX judge, 240/240 judged, 0
+  judge errors) — adversarial maintained refusals moved 28→28→28→29→29
+  across doses, zero adversarial fulfillments at any dose, benign
+  capability intact at every dose, no degeneration spike. **The d_disp
+  stream-0 direction applied at the FFN-writer site is behaviorally inert
+  on this panel.** Interpretation: the declared site transfer (derived at
+  the post-layer residual, applied at the FFN writer) is exactly the
+  experiment spec/GLP.md warns needs its own behavioral validation — and
+  this measurement says it does not transfer. This is consistent with the
+  gate-2 35B result (forced/site-transferred directions 0/8; natural
+  residual-site direction 7/8). The vector remains a candidate; a
+  behaviorally effective hf2q derivation likely needs capture at the
+  apply site (the FFN writer) or application at the capture site (the
+  post-layer residual). Artifacts: `scripts/grammar_probe/gate34/`
+  (per-pass results/verdicts/meta, identity manifest, summary).
 - **Date:** 2026-09-04 (revised 2026-09-09: forced-capture design replaces
   generation-based capture — teacher-forced pinned prefixes, prefill-only
   forward passes, targeted decision positions; capture cost collapses from
