@@ -936,10 +936,9 @@ model. Both are opt-in controls that leave the base weights unchanged. The
 ([paper PDF](docs/gcd-in-hf2q.pdf)) explains their concepts, hf2q implementation,
 and implications for local inference and agent security.
 
-Runtime qualification is still in progress. The
-[implementation review](docs/gcd-in-hf2q-review.md) records the source defects
-and validation required for these controls; loading an artifact or passing a
-logit canary does not establish behavioral quality or interoperability.
+The article distinguishes runtime validation from behavioral evidence.
+Loading an artifact or passing a logit canary does not establish behavioral
+quality or interoperability.
 
 ```bash
 # Install the embedded refusal-suppression grammar as a server default:
@@ -1179,8 +1178,6 @@ catalog + smoke prompt before any forward-pass code lands.
   serving surface (attribution, decision, shipping gates).
 - [GCD and GLP article](docs/gcd-in-hf2q.md) — concepts, hf2q implementation,
   historical evidence, and implications; [paper PDF](docs/gcd-in-hf2q.pdf).
-- [GCD and GLP implementation review](docs/gcd-in-hf2q-review.md) — source
-  findings and evidence required before publication.
 - `docs/adr/ADR-055-grammar-alphabet-presets.md` — grammar alphabet channel presets.
 - `docs/adr/ADR-056-gcd-serving-conformance-battery.md` — the partially
   implemented GCD serving-stack conformance battery.

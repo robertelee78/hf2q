@@ -276,8 +276,8 @@ changing stored weights. Try these after completing the baseline checks above.
 They require a build exposing `--gcd` and `--glp` in `hf2q serve --help`;
 the site's pinned v0.1.20 installer does not include those flags. See the
 [source-build instructions](https://github.com/robertelee78/hf2q#install).
-Runtime qualification remains in progress; the
-[implementation review](gcd-in-hf2q-review.md) records the outstanding findings.
+See the [GCD and GLP article](gcd-in-hf2q.md) for the supported paths,
+validation evidence, and experimental limitations.
 
 ### Try the GCD default
 

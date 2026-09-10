@@ -1,8 +1,6 @@
 # GCD/GLP article figures and evidence
 
-These assets accompany [the article](../../gcd-in-hf2q.md) and its
-[publication review](../../gcd-in-hf2q-review.md). The review records source
-defects and the evidence needed before publication. This package contains
+These assets accompany [the article](../../gcd-in-hf2q.md). This package contains
 historical W1 aggregates, later recorded GLP and battery observations, and
 explanatory figures. Publication tools do not run inference.
 

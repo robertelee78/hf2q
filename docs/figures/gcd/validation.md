@@ -119,9 +119,7 @@ PDF creation timestamps can change the output hash on a later render.
 
 ## Remaining implementation work
 
-No Rust/Metal compilation, model load, fresh generation, live rejudging, or
-performance benchmark was run by the publication reviewers. The
-[companion review](../../gcd-in-hf2q-review.md) distinguishes source-addressed
-findings from remaining S19–S20 and E12–E15, partial checkpoint binding, and
-open discovery behavior. A completed paper revision is not proof that those
-paths are validated. The retained historical observations remain unchanged.
+This rendering validation did not run Rust/Metal compilation, model loading,
+fresh generation, live rejudging, or performance benchmarks. The article
+describes the scope of the runtime and measurement evidence separately.
+The retained historical observations remain unchanged.
