@@ -382,6 +382,11 @@ The 21/25 agreement is descriptive of that selected sample. A binomial interval
 around it does not turn it into representative agreement or remove label
 uncertainty from the corpus rates.
 
+The spot-check narrative also calls sample 13 a harmful-set labeling error.
+The local sample record identifies it as `b220`, while the checked-in corpus
+already places that prompt in the benign stratum. Resolve this discrepancy
+before repeating that alleged corpus error.
+
 ### E5. The dose-response figure is not a controlled contrast
 
 The old plotting script hardcodes rates and sets its approximately universal
@@ -415,6 +420,108 @@ migration, missing labels, and the outcome-selected sample. “Cores dominate
 on every axis” is stronger than this evidence permits. The main article now
 states the W1/W6V2 artifact distinction without presenting the retest as
 confirmation of general performance.
+
+### E7. Fixed generation budgets dominate termination, without a matched baseline
+
+[`spike_run.py`](../scripts/grammar_probe/spike_run.py#L48) requests 800
+completion tokens, greedy sampling, no system prompt, and disabled thinking.
+Every recorded `finish: length` observation has exactly 800 completion tokens;
+all 3,072 observations have zero reasoning characters.
+
+| Subject | Adversarial capped | Benign capped | Responses exceeding judge's 2,500-character input limit |
+|---|---|---|---|
+| DeepSeek-V4 | 321/512 | 502/512 | 971/1,024 |
+| Gemma-4-26B | 142/512 | 502/512 | 903/1,024 |
+| Qwen3.8-27B | 102/512 | 314/512 | 475/1,024 |
+
+Of DeepSeek's 91 degenerate labels, 85 have budget-limited generation and six
+have `finish: stop`. All 58 benign degenerate responses hit the cap. The
+benign set contains open-ended tutorials for which the observed budget can
+leave a procedure unfinished. Raising the budget might permit completion or
+extend repetition; this audit does not establish which would occur.
+
+The retained W1 runs contain one arm and one repetition. No `Arm A` record
+was found in the inspected `*results*.jsonl` inventory. Older spike results
+do not supply a matched full-corpus control. The
+[W1 grammar](../scripts/grammar_probe/w1.gbnf#L5) permits its body to terminate;
+the observed caps therefore do not establish a grammar bug that forbids EOS.
+
+**Required proof:** run a paired baseline/W1 study with fixed source and model
+identities, prompts, templates, and sampling settings; vary an explicit budget
+ladder and report termination separately from substance and degeneration.
+
+### E8. Judge-side clipping contaminates quality labels
+
+[`judge.py`](../scripts/grammar_probe/judge.py#L94) clips responses to their
+first 2,500 characters and appends `[...truncated for judging]`. It does not
+pass generation finish reason or usage metadata, although the rubric asks
+the judge to assess truncation, degeneration, and refusal that can appear
+later in a response.
+
+Thirteen DeepSeek degenerate verdicts quote the artificial cutoff marker as
+evidence. This includes `h442`, whose generation ended with `finish: stop`
+at 766 tokens and 3,306 characters. The marker also appears in thirteen Gemma
+degenerate verdicts, one Gemma fulfillment verdict, and five Qwen degenerate
+verdicts. This establishes contamination of the judgment evidence; it does
+not independently establish that the affected full responses were useful.
+
+**Required proof:** judge complete retained responses with generation
+termination metadata. If input limits prevent that, record the omission as
+an evaluation failure or use a separately validated full-coverage procedure.
+Preserve old judgments and identify the new scoring pass explicitly.
+
+### E9. Fulfillment state and output validity contradict each other
+
+The [judge validator](../scripts/grammar_probe/judge.py#L125) requires a
+minimum substance score for fulfillment but does not require valid output.
+The records contain both `response_state: valid_fulfillment` and
+`output_validity: invalid` in 20 DeepSeek responses (9 adversarial, 11 benign),
+24 Gemma responses (7, 17), and 12 Qwen responses (4, 8).
+
+The [publication extractor](../scripts/grammar_probe/publication_data.py#L76)
+faithfully counts response-state labels. The resulting categorical figure is
+reproducible, but those labels must not be promoted to valid, completed
+answers. The paper now exposes the DeepSeek inconsistency.
+
+**Required proof:** define the relationship between state, substance, validity,
+and termination; validate the schema across fields. Report their joint
+distribution or perform a versioned adjudication pass. Do not silently change
+historical labels to make them consistent.
+
+### E10. Failed judgments are skipped on normal resumption
+
+Gemma's four failed judgments record HTTP 500 without the response body,
+preventing diagnosis of the server cause. Qwen's ten failures record a
+cross-field invariant violation: fulfillment with insufficient substance.
+These are known scoring failures, not missing generations.
+
+The [resume logic](../scripts/grammar_probe/judge.py#L138) adds failed attempts
+to its completed-key set. A normal rerun skips them.
+
+**Required proof:** preserve each failed attempt and its error details, but
+support explicit retries with distinct attempt identity. Keep scoring failures
+visible in published denominators until a valid replacement judgment exists.
+
+### E11. The paired-report path crashes and omits promised intervals
+
+[`report.py`](../scripts/grammar_probe/report.py#L80) indexes derived metric
+names such as `refusal` on raw verdict dictionaries. A two-arm in-memory
+fixture reproduced `KeyError: 'refusal'`. The report also lacks the bootstrap
+intervals promised by the methodology, and its fulfillment metric omits
+`output_validity`.
+
+**Required proof:** transform verdicts into defined metrics before paired
+comparison; test known paired transitions, missing labels, and inconsistent
+fields. Implement the stated uncertainty method or correct the methodology.
+
+### Testing repair and rerun order
+
+Repair complete-response judging, termination awareness, field consistency,
+failure retries, immutable run manifests, and paired reporting first. Rejudge
+the retained full responses with a versioned rubric and an independent blinded
+human sample. Then run the paired budget experiment in E7. This order separates
+measurement defects from runtime or intervention effects and preserves the
+historical evidence rather than rewriting it.
 
 ## Prose review and editorial decisions
 

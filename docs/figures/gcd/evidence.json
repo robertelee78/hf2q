@@ -7,7 +7,10 @@
     "Model labels follow the campaign notes; they are not artifact identities.",
     "W1 observations do not measure the byte-distinct embedded W6V2 default or GLP composition.",
     "Strata are corpus labels, not an independent adjudication of prompt intent.",
-    "No models were loaded or generations rerun for this editorial review."
+    "No models were loaded or generations rerun for this editorial review.",
+    "The judging harness clips input at 2500 characters and does not pass generation finish metadata.",
+    "Response-state labels can contradict output_validity; original categories are preserved.",
+    "No matched full-corpus unconstrained baseline was found in the retained W1 records."
   ],
   "sources": {
     "scripts/grammar_probe/full_results_w1.jsonl": {
@@ -95,6 +98,16 @@
       "bytes": 8196,
       "tracked_at_review": true
     },
+    "scripts/grammar_probe/report.py": {
+      "sha256": "554fd927b4ae84c375d30e1bf1af7a388eceac89e366b8dbe3cf98d1aa2a34b3",
+      "bytes": 3333,
+      "tracked_at_review": true
+    },
+    "scripts/grammar_probe/METHODS.md": {
+      "sha256": "7d70ec137f6fdc4755cd2ef95f4773497f32ed83a5c41b12a7d19fd00b6601e9",
+      "bytes": 2813,
+      "tracked_at_review": true
+    },
     "scripts/grammar_probe/gate_full.py": {
       "sha256": "90c9cc9720b0298c04d40679e4893fd9e289bfbb13ed64360b5674162ba5c3e7",
       "bytes": 3152,
@@ -180,7 +193,19 @@
             "stop": 191,
             "length": 321
           },
-          "generation_errors": 0
+          "generation_errors": 0,
+          "judging_audit": {
+            "input_over_2500_characters": 463,
+            "length_completion_tokens": {
+              "800": 321
+            },
+            "degenerate_and_length": 27,
+            "fulfillment_with_invalid_output": 9,
+            "synthetic_cutoff_cited_by_state": {
+              "degenerate": 2
+            },
+            "judge_error_counts": {}
+          }
         },
         {
           "stratum": "benign",
@@ -199,7 +224,19 @@
             "length": 502,
             "stop": 10
           },
-          "generation_errors": 0
+          "generation_errors": 0,
+          "judging_audit": {
+            "input_over_2500_characters": 508,
+            "length_completion_tokens": {
+              "800": 502
+            },
+            "degenerate_and_length": 58,
+            "fulfillment_with_invalid_output": 11,
+            "synthetic_cutoff_cited_by_state": {
+              "degenerate": 11
+            },
+            "judge_error_counts": {}
+          }
         }
       ],
       "result_source": "scripts/grammar_probe/full_results_w1.jsonl",
@@ -237,7 +274,21 @@
             "stop": 370,
             "length": 142
           },
-          "generation_errors": 0
+          "generation_errors": 0,
+          "judging_audit": {
+            "input_over_2500_characters": 395,
+            "length_completion_tokens": {
+              "800": 142
+            },
+            "degenerate_and_length": 16,
+            "fulfillment_with_invalid_output": 7,
+            "synthetic_cutoff_cited_by_state": {
+              "degenerate": 3
+            },
+            "judge_error_counts": {
+              "HTTP Error 500: Internal Server Error": 1
+            }
+          }
         },
         {
           "stratum": "benign",
@@ -258,7 +309,22 @@
             "length": 502,
             "stop": 10
           },
-          "generation_errors": 0
+          "generation_errors": 0,
+          "judging_audit": {
+            "input_over_2500_characters": 508,
+            "length_completion_tokens": {
+              "800": 502
+            },
+            "degenerate_and_length": 66,
+            "fulfillment_with_invalid_output": 17,
+            "synthetic_cutoff_cited_by_state": {
+              "degenerate": 10,
+              "valid_fulfillment": 1
+            },
+            "judge_error_counts": {
+              "HTTP Error 500: Internal Server Error": 3
+            }
+          }
         }
       ],
       "result_source": "scripts/grammar_probe/spike_results_w1_gemma.jsonl",
@@ -295,7 +361,21 @@
             "stop": 410,
             "length": 102
           },
-          "generation_errors": 0
+          "generation_errors": 0,
+          "judging_audit": {
+            "input_over_2500_characters": 151,
+            "length_completion_tokens": {
+              "800": 102
+            },
+            "degenerate_and_length": 15,
+            "fulfillment_with_invalid_output": 4,
+            "synthetic_cutoff_cited_by_state": {
+              "degenerate": 1
+            },
+            "judge_error_counts": {
+              "cross-field invariant violated": 10
+            }
+          }
         },
         {
           "stratum": "benign",
@@ -315,7 +395,19 @@
             "stop": 198,
             "length": 314
           },
-          "generation_errors": 0
+          "generation_errors": 0,
+          "judging_audit": {
+            "input_over_2500_characters": 324,
+            "length_completion_tokens": {
+              "800": 314
+            },
+            "degenerate_and_length": 44,
+            "fulfillment_with_invalid_output": 8,
+            "synthetic_cutoff_cited_by_state": {
+              "degenerate": 4
+            },
+            "judge_error_counts": {}
+          }
         }
       ],
       "result_source": "scripts/grammar_probe/spike_results_w1_qwen38.jsonl",

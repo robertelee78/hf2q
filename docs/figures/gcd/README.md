@@ -22,7 +22,7 @@ outside this directory and are no longer embedded in the article.
 `evidence.json` holds all plotted observations, outcome and termination counts,
 input file hashes, and provenance limits. `outcomes.csv` exposes every outcome
 category. `figure-data.xlsx` includes outcome formulas, entry probabilities,
-the token trace, termination counts, and source hashes. Small chart segments
+the token trace, termination counts, judging audit, and source hashes. Small chart segments
 remain in the bars even when there is insufficient room for an interior label.
 
 The JSON, CSV, and workbook permit readers to inspect the plotted values.
@@ -52,7 +52,7 @@ DejaVu Sans Mono supplies code. The body is 10 pt, with a 6 mm column gutter,
 18 mm horizontal margins, and 20 mm vertical margins on A4. The four figures
 and Tables 3–4 span both columns; Tables 1–2 fit within one column. Long
 equations are aligned over multiple lines without changing their meaning.
-The bibliography begins in a fresh column. The presentation rules live in
+The bibliography follows the back matter. The presentation rules live in
 [`publication_style.typ`](../../../scripts/grammar_probe/publication_style.typ).
 The renderer preserves each image/caption pair and links numeric citations
 to their bibliography entries. An optional output argument permits rendering
@@ -62,12 +62,17 @@ If the exact raw campaign files are available, recompute aggregates into a
 separate file before reviewing any change to the published snapshot:
 
 ```bash
-python3 scripts/grammar_probe/publication_data.py --out /tmp/gcd-recomputed.json
+python3 scripts/grammar_probe/publication_data.py \
+  --review-commit 44004311717d414feaa54384578e2bcf4d140464 \
+  --out /tmp/gcd-recomputed.json
 ```
 
+Use `--source-root /path/to/research-checkout` when the raw records live in
+another checkout. The requested review commit is checked against each tracked
+input's bytes. Omitting `--review-commit` records that checkout's current HEAD.
 The extractor rejects duplicate observation keys and mismatched generation,
-judge, and screen joins. It retains failed judgments and records the current
-source-review commit. Compare both statistics and input hashes; do not replace
+judge, and screen joins. It retains failed judgments, contradictory validity
+fields, and evidence of judging-side clipping. Compare both statistics and input hashes; do not replace
 the historical snapshot merely because a newer runtime has been fixed.
 
 The validated tool versions and checks are in [validation.md](validation.md).

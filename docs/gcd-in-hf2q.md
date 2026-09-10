@@ -17,10 +17,9 @@ grammar enforcement, schema compilation, model-family hooks, and calibration.
 An exploratory historical case study applies a refusal-suppression grammar to
 a 1,024-prompt corpus across three model families. Low judge-labeled refusal
 rates coexist with degeneration, substantial token-limit termination, missing
-judgments, and incomplete runtime provenance. These findings motivate
-independent evaluation of behavioral effect, completion, capability, and
-execution-time authorization, while illustrating opportunities for compact
-intervention distribution and explicit local inference controls.
+judgments, and incomplete runtime provenance. The analysis separates compact
+intervention distribution and output-language enforcement from the behavioral,
+capability, completion, and authorization evidence needed to evaluate them.
 
 ## Introduction
 
@@ -63,7 +62,7 @@ finished answer.
 | Intervention | Restrict candidate tokens | Modify selected activations |
 | Base weights | Unchanged | Unchanged |
 | Scope | Output language for a request or generation region | Bound model, selected layers and activation sites |
-| Guarantee | Language membership on successful completion, subject to correct enforcement | The specified numerical transformation |
+| Guarantee | Language membership on successful completion, subject to correct enforcement | Numerical transformation, subject to correct arithmetic and application site |
 | Requires evaluation | Usefulness, completion, cost, and policy correctness | Behavioral effect, capability, and compatibility |
 
 ![Generation flows from prompt preparation through the model, grammar-aware token selection, and token commitment. GLP acts inside the model; GCD constrains token selection. The selected token feeds back into the next step.](figures/gcd/generation-controls.svg)
@@ -381,7 +380,7 @@ to W1, even when a current command selects the newer default.[^13]
 
 An archived probe records twelve selected adversarial prompts on the DeepSeek
 subject. Before grammar masking, the mean reported probability of the token
-`I` at the first generated position is **99.9744%**. In this sample it is the
+`I` at the first generated position is **99.97%**. In this sample it is the
 usual refusal opener. That concentration is a token-level observation, not a
 measurement of a universal internal refuse/comply switch.
 
@@ -429,12 +428,20 @@ responses. “Other judged” combines partial refusal, pivot-then-fulfillment,
 mixed, and nonresponsive categories. “Valid fulfillment” is the judge's label;
 it does not certify factual correctness or successful termination.*
 
-The quality cost is material. DeepSeek has 91 responses labeled degenerate
+The recorded quality limitations are material. DeepSeek has 91 responses labeled degenerate
 across the full corpus, including 58 in the benign half. Its generation log
 also records 823 of 1,024 responses ending at the token limit. These categories
 overlap: termination and semantic judgment measure different things. Zero
 observed benign refusals therefore does not establish preserved benign
 performance.
+
+The harness requested 800 completion tokens per response. The judge then saw
+at most 2,500 characters, clipping 971 of DeepSeek's 1,024 responses; it was
+not given the generation finish reason. Thirteen degeneration verdicts cite
+the artificial judging cutoff. Moreover, 20 of the 912 DeepSeek responses
+labeled “valid fulfillment” also carry an invalid-output flag. These counts
+reproduce the recorded categories, not reliable full-response quality
+assessments.[^13]
 
 An offline embedding screen flags 9 of DeepSeek's 12 maintained refusals and
 also flags 3 of its 912 judge-labeled valid fulfillments. The three missed
@@ -448,13 +455,16 @@ Its listed disagreements include three over-flags and one under-flag.
 That sample is useful for discovering judge errors; it cannot establish
 unbiased corpus-wide agreement or justify assuming the errors cancel.[^15]
 
-These observations establish that a particular grammar can substantially
-change the form and judged behavior of responses in a particular campaign.
-They do not establish a universal grammar, a general reasoning improvement,
-or the behavior of a later hf2q build. The logs lack a complete per-run
-binding to binary and model hashes and all generation settings, so they
-remain exploratory evidence rather than a reproducible benchmark of the
-current implementation.
+Taken together, the reported refusal rates depend on a single abliterated
+judge whose corpus-wide agreement is unestablished, applied to runs with
+incomplete runtime and model provenance.
+
+The retained records have no matched full-corpus unconstrained baseline, so
+they cannot isolate the grammar's effect on refusal, length, or quality.
+They also lack complete per-run binary, model, and configuration identities.
+This case study is therefore exploratory evidence of constrained output and
+its measurement limitations, not a reproducible benchmark of the current
+implementation.
 
 ## Discussion and implications
 
@@ -528,7 +538,7 @@ implementation, not the historical campaign runtime.
 10. hf2q. [Grammar implementation](https://github.com/robertelee78/hf2q/tree/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/grammar); [engine](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/engine.rs).
 11. hf2q. [Schema compiler](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/grammar/json_schema.rs); [recon schema](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/examples/recon-opportunities.schema.json). JSON Schema, [string constraints](https://json-schema.org/understanding-json-schema/reference/string).
 12. hf2q. [GLP subsystem](https://github.com/robertelee78/hf2q/tree/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp); [calibration implementation](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/calibrate/mod.rs); [ADR-054](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/docs/adr/ADR-054-glp-runtime-calibration.md).
-13. hf2q. Historical W1 generation, judge, and embedding-screen JSONL records, September 2026. Exact filenames, hashes, counts, and access status appear in the [evidence manifest](figures/gcd/evidence.json). [Offline aggregation script](../scripts/grammar_probe/publication_data.py). Raw logs are local campaign artifacts, not all present in the published repository.
+13. hf2q. Historical W1 generation, judge, and embedding-screen JSONL records, September 2026. Exact filenames, hashes, counts, and access status appear in the [evidence manifest](figures/gcd/evidence.json). [Offline aggregation script](../scripts/grammar_probe/publication_data.py); [judging harness](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/judge.py). Raw logs are local campaign artifacts, not all present in the published repository.
 14. hf2q. `refusal_mass_probe.jsonl`, twelve archived observations, and [probe script](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/refusal_mass_probe.py). Probability semantics: [sampler](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/sampler_pure.rs), `sample_token_with_logprob_topk`, and the grammar-aware engine call site.
 15. Lee, R. E. [Qwen3.6-35B-A3B-Abliterix-EGA-abliterated](https://huggingface.co/jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated), judge checkpoint. hf2q, [human spot-check of the Qwen judge](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/SPOT_CHECK_RESULTS.md), September 8, 2026.
 

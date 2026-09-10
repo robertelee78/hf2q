@@ -10,10 +10,10 @@ from collections import Counter
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
-PROBE = Path(__file__).resolve().parent
 DEFAULT_OUT = ROOT / "docs/figures/gcd/evidence.json"
 STUDIES = [
     ("DeepSeek-V4", "full_results_w1.jsonl", "full_verdicts_w1.jsonl", "full_gate_w1.jsonl"),
@@ -44,19 +44,25 @@ def keyed(rows):
     return out
 
 
-def aggregate():
+def aggregate(source_root=ROOT, review_commit=None):
     sources = {}
 
     def source(relative):
-        path = ROOT / relative
+        path = source_root / relative
         sources[relative] = {
             "sha256": digest(path),
             "bytes": path.stat().st_size,
             "tracked_at_review": subprocess.run(
-                ["git", "ls-files", "--error-unmatch", relative], cwd=ROOT,
+                ["git", "ls-files", "--error-unmatch", relative], cwd=source_root,
                 capture_output=True, check=False,
             ).returncode == 0,
         }
+        if review_commit and sources[relative]["tracked_at_review"]:
+            pinned = subprocess.check_output(
+                ["git", "show", f"{review_commit}:{relative}"], cwd=source_root,
+            )
+            if hashlib.sha256(pinned).hexdigest() != sources[relative]["sha256"]:
+                raise ValueError(f"Source differs from review commit: {relative}")
         return path
 
     studies = []
@@ -97,6 +103,28 @@ def aggregate():
                 ),
                 "finish_counts": dict(Counter(results[k].get("finish", "error") for k in keys)),
                 "generation_errors": sum("error" in results[k] for k in keys),
+                "judging_audit": {
+                    "input_over_2500_characters": sum(len(results[k]["content"]) > 2500 for k in keys),
+                    "length_completion_tokens": dict(sorted(Counter(
+                        str(results[k]["completion_tokens"]) for k in keys
+                        if results[k].get("finish") == "length"
+                    ).items())),
+                    "degenerate_and_length": sum(
+                        verdicts[k].get("response_state") == "degenerate"
+                        and results[k].get("finish") == "length" for k in keys
+                    ),
+                    "fulfillment_with_invalid_output": sum(
+                        verdicts[k].get("response_state") == "valid_fulfillment"
+                        and verdicts[k].get("output_validity") == "invalid" for k in keys
+                    ),
+                    "synthetic_cutoff_cited_by_state": dict(sorted(Counter(
+                        verdicts[k].get("response_state", "unjudged") for k in keys
+                        if "[...truncated for judging]" in verdicts[k].get("evidence", "")
+                    ).items())),
+                    "judge_error_counts": dict(sorted(Counter(
+                        verdicts[k]["judge_error"] for k in keys if "judge_error" in verdicts[k]
+                    ).items())),
+                },
             })
         studies.append({
             "model_label": label, "panels": panels,
@@ -117,6 +145,7 @@ def aggregate():
         "scripts/grammar_probe/prompts_512.tsv", "scripts/grammar_probe/w1.gbnf",
         "scripts/grammar_probe/w6v2.gbnf", "scripts/grammar_probe/refusal_mass_probe.py",
         "scripts/grammar_probe/spike_run.py", "scripts/grammar_probe/judge.py",
+        "scripts/grammar_probe/report.py", "scripts/grammar_probe/METHODS.md",
         "scripts/grammar_probe/gate_full.py", "scripts/grammar_probe/battery_gcd.py",
         "scripts/grammar_probe/SPOT_CHECK_RESULTS.md",
         "src/serve/api/grammar/gcd_w1.gbnf", "src/serve/api/handlers.rs",
@@ -127,8 +156,8 @@ def aggregate():
     ]:
         source(relative)
     return {
-        "review_source_commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "review_source_commit": review_commit or subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=source_root, text=True).strip(),
         "review_date": "2026-09-10",
         "provenance_limits": [
             "Historical logs do not bind each response to a binary SHA, model SHA or full sampler configuration.",
@@ -137,6 +166,9 @@ def aggregate():
             "W1 observations do not measure the byte-distinct embedded W6V2 default or GLP composition.",
             "Strata are corpus labels, not an independent adjudication of prompt intent.",
             "No models were loaded or generations rerun for this editorial review.",
+            "The judging harness clips input at 2500 characters and does not pass generation finish metadata.",
+            "Response-state labels can contradict output_validity; original categories are preserved.",
+            "No matched full-corpus unconstrained baseline was found in the retained W1 records.",
         ],
         "sources": sources, "studies": studies,
         "entry_probe": {"entries": entries,
@@ -147,16 +179,22 @@ def aggregate():
                     "held_true": sum(r.get("held") is True for r in battery),
                     "engaged_true": sum(r.get("engaged") is True for r in battery),
                     "engaged_false": sum(r.get("engaged") is False for r in battery)},
-        "embedded_matches_w6v2": (ROOT / "src/serve/api/grammar/gcd_w1.gbnf").read_bytes()
-            == (PROBE / "w6v2.gbnf").read_bytes(),
+        "embedded_matches_w6v2": (source_root / "src/serve/api/grammar/gcd_w1.gbnf").read_bytes()
+            == (source_root / "scripts/grammar_probe/w6v2.gbnf").read_bytes(),
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--source-root", type=Path, default=ROOT,
+                        help="Checkout containing the exact local campaign records")
+    parser.add_argument("--review-commit", help="Source-inspection commit, not the historical runtime")
     args = parser.parse_args()
-    data = aggregate()
+    if args.review_commit:
+        if not re.fullmatch(r"[0-9a-f]{40}", args.review_commit):
+            parser.error("--review-commit must be a full 40-character commit ID")
+    data = aggregate(args.source_root.resolve(), args.review_commit)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     print(f"Wrote {args.out}: 3 models, 6 panels, 12 entry probes; source hashes included")

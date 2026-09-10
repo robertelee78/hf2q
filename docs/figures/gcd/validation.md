@@ -11,7 +11,7 @@ findings as fixed or establish publication readiness.
 - An earlier prose/source inspection used
   `bdb632ff406b9c7d77fa315d7b507351b1bee9cd`. The audited Rust/Metal files,
   schemas, and grammar inputs are unchanged between these commits.
-- All 28 input-file hashes in `evidence.json` matched the inspected files.
+- All 30 input-file hashes in `evidence.json` matched the inspected files.
 - A fresh offline extraction to a separate temporary JSON reproduced the
   snapshot exactly, including counts, source hashes, and provenance fields.
 - The extractor joined 3,072 generation records to corresponding judge and
@@ -21,7 +21,8 @@ findings as fixed or establish publication readiness.
   outcome counts and termination counts separately sum to 512. Workbook
   fractions use the recorded numerator and denominator; unjudged records
   remain visible. Termination and judgment categories are not added together.
-- The twelve entry probabilities reproduce the reported 99.9744% mean. The
+- The twelve entry probabilities reproduce a mean of 99.9744%, displayed as
+  99.97% in the prose and figure. The
   sixteen-point trace retains exact selected-token spellings and probabilities.
 - The embedded grammar is byte-identical to W6V2 and differs from historical W1.
 
@@ -30,6 +31,10 @@ findings as fixed or establish publication readiness.
 - Both independent concept and source reviews were incorporated. The source
   reviewer confirmed S1–S18 and their distinctions between active defects,
   latent helpers, intended boundaries, and unmeasured hardware consequences.
+- The forensic harness review added E7–E11: the 800-token budget, judge-side
+  clipping, inconsistent validity fields, non-retried failed judgments, and
+  the broken paired-report path. Aggregate judging-audit fields and the
+  workbook preserve those findings without rewriting historical labels.
 - A Draft 7 JSON Schema validator accepted a recon object with refusal text in
   every required string field of the exact checked-in example. This tests the
   prose claim about the schema language, not hf2q's compiler implementation.
@@ -42,7 +47,7 @@ findings as fixed or establish publication readiness.
 - The two-column paper edition has six A4 pages, a full-width abstract, seven numbered
   main sections, three numbered equations, four table captions, and four
   figure captions. The expected reported rates and title/author metadata
-  remain present. All 24 citation links resolve to the references in the final
+  remain present. All 25 citation links resolve to the references in the final
   page's right column. All six pages and detailed views of the opening page,
   authorization equation, and references received independent visual review
   for clipping, gutter collisions, caption placement, and figure readability.
@@ -60,6 +65,12 @@ findings as fixed or establish publication readiness.
   including artifact selection, calibration, schemas, and current composition
   behavior. Its revised section's local links and CLI flag declarations were
   checked without loading a model.
+- The getting-started guide's optional section now uses a benign GCD example
+  and an explicitly matched model/GLP pair. The v0.1.20 CLI source lacks these
+  flags, so the examples state the source-build prerequisite. The paper does
+  not treat the pinned-prefix contrast as behavioral evidence; issue #192
+  remains open and its public comments report the failed forced-direction
+  evaluation in the reference stack.
 - `git diff --check` and `git diff --cached --check` pass. The article PDF is marked binary in the scoped
   documentation attributes file so Git does not mistake its long textual
   preamble and compressed payload for a source-code diff.
@@ -72,7 +83,9 @@ PyMuPDF 1.28.2; Pandoc 3.11; Typst 0.15.1.
 From the repository root:
 
 ```bash
-python3 scripts/grammar_probe/publication_data.py --out /tmp/gcd-recomputed.json
+python3 scripts/grammar_probe/publication_data.py \
+  --review-commit 44004311717d414feaa54384578e2bcf4d140464 \
+  --out /tmp/gcd-recomputed.json
 python3 scripts/grammar_probe/publication_figures.py
 python3 scripts/grammar_probe/publication_pdf.py
 git diff --check
@@ -86,11 +99,11 @@ hash because its creation timestamp changes.
 ## Artifact identity at validation
 
 - `docs/gcd-in-hf2q.md`
-  SHA-256: `89e26f4ff43da0af114b09853ae380a17545d69dc01c3345de2b8ed6fa327e04`
+  SHA-256: `e7b4174fc581d715841e7d7bd88173a4c6c8397354539b81b19bb928f5ef353e`
 - `docs/gcd-in-hf2q.pdf`
-  SHA-256: `c0d4c30a47cab6778272719845ec4b1d3d876e47a13124ec7f5052d832f460c6`
+  SHA-256: `062b3a3273875a4f735d5eb180e6526788f5baba7b58b7e115d6e9ad8c820a4a`
 - `docs/figures/gcd/evidence.json`
-  SHA-256: `090efc7c3deecd0366b806c49db8580462dfc38ed6ff0cb9169f8bcd89583430`
+  SHA-256: `3eab958f32452dfb6960f9491baf0b923a7a7865377648d3f952d35e39362650`
 
 ## Remaining implementation work
 

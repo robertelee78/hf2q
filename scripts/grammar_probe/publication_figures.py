@@ -125,7 +125,7 @@ def entry_trace():
     left.tick_params(axis="y", labelsize=8)
     left.set_xticks(range(12), [r["prompt_id"] for r in entries], rotation=55, fontsize=8)
     left.yaxis.set_major_formatter(PercentFormatter(1, decimals=2))
-    left.text(0.02, 0.13, f"Mean: {100 * probe['mean_probability_I']:.4f}%\nZoomed probability axis",
+    left.text(0.02, 0.13, f"Mean: {100 * probe['mean_probability_I']:.2f}%\nZoomed probability axis",
               transform=left.transAxes, fontsize=8, color=BLUE)
     trace = probe["h001_trace"]
     right.axvspan(-0.5, 10.5, color="#eeeeee", zorder=0)
@@ -219,6 +219,19 @@ def workbook():
         for panel in study["panels"]:
             for reason, count in panel["finish_counts"].items():
                 ws.append([study["model_label"], panel["stratum"], reason, count, study["result_source"]])
+    ws = wb.create_sheet("Judging audit")
+    ws.append(["Model label", "Stratum", "Input over 2500 characters",
+               "Degenerate and token-limited", "Fulfillment with invalid output",
+               "Token counts at limit", "Artificial cutoff cited by state", "Judge errors"])
+    for study in DATA["studies"]:
+        for panel in study["panels"]:
+            audit = panel["judging_audit"]
+            ws.append([study["model_label"], panel["stratum"],
+                       audit["input_over_2500_characters"], audit["degenerate_and_length"],
+                       audit["fulfillment_with_invalid_output"],
+                       json.dumps(audit["length_completion_tokens"], sort_keys=True),
+                       json.dumps(audit["synthetic_cutoff_cited_by_state"], sort_keys=True),
+                       json.dumps(audit["judge_error_counts"], sort_keys=True)])
     ws = wb.create_sheet("Sources")
     ws.append(["Path", "SHA-256", "Bytes", "Tracked at review"])
     for path, meta in DATA["sources"].items():

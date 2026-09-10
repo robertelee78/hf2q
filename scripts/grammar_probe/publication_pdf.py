@@ -101,16 +101,21 @@ def prepare(document):
         index += 1
     result.append(raw("]]"))
     in_sources = False
+    keep_back_matter = False
     while index < len(blocks):
         block = blocks[index]
         if block["t"] == "Header":
+            if keep_back_matter:
+                result.append(raw("]"))
+                keep_back_matter = False
             title = words(block["c"][2])
             block["c"][0] -= 1
             if title in BACK_MATTER:
+                if title in {"Acknowledgments", "Artifacts and reproducibility"}:
+                    result.append(raw("#block(breakable: false)["))
+                    keep_back_matter = True
                 if title == "Artifacts and reproducibility":
                     result.append(raw("#set par(justify: false, first-line-indent: 0pt)"))
-                if title == "References":
-                    result.append(raw("#colbreak(weak: true)"))
                 result.extend([raw("#heading(level: 1, numbering: none)["),
                                {"t": "Plain", "c": block["c"][2]}, raw("]")])
                 in_sources = title == "References"
