@@ -154,9 +154,9 @@ class GenerationBinding(unittest.TestCase):
 
     def test_baseline_rejects_active_controls_before_banana_canary(self):
         f = self.f
-        for active in ("glp", "grammar", "dwq_overlay"):
-            f.snapshot["active_controls"] = {"glp": {"active": False}, "grammar": {"active": False}, "dwq_overlay": False}
-            if active == "dwq_overlay": f.snapshot["active_controls"][active] = True
+        for active in ("glp", "grammar", "dwq_overlay", "vision_projector"):
+            f.snapshot["active_controls"] = {"glp": {"active": False}, "grammar": {"active": False}, "dwq_overlay": False, "vision_projector": False}
+            if active in ("dwq_overlay", "vision_projector"): f.snapshot["active_controls"][active] = True
             else: f.snapshot["active_controls"][active]["active"] = True
             f.attest()
             attempt = f.run("baseline_run.py", OUT=f.path("baseline.jsonl"))

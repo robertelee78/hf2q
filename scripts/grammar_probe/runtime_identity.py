@@ -32,12 +32,14 @@ def validate_identity(manifest, snapshot):
     for field in ("binary_sha256", "tokenizer_sha256", "template_sha256"):
         if not re.fullmatch(r"[0-9a-f]{64}", str(ident.get(field, ""))):
             raise ValueError(f"runtime identity lacks {field}")
-    for field in ("model_id", "engine_config", "tokenizer_sha256", "template_sha256", "sampling_defaults", "active_controls"):
+    for field in ("model_id", "engine_config", "admission", "tokenizer_sha256", "template_sha256", "sampling_defaults", "active_controls"):
         if field not in ident or ident[field] != snapshot.get(field):
             raise ValueError(f"runtime identity disagrees with live {field}")
     artifacts = ident.get("model_artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         raise ValueError("runtime identity lacks model artifact hashes")
+    if sum(artifact.get("role") == "model" for artifact in artifacts) != 1:
+        raise ValueError("runtime identity requires exactly one model artifact")
     for artifact in artifacts:
         if (not re.fullmatch(r"[0-9a-f]{64}", str(artifact.get("sha256", "")))
                 or type(artifact.get("bytes")) is not int or artifact["bytes"] <= 0
@@ -63,6 +65,8 @@ def fetch_runtime_identity(base_url, manifest_path=None):
 
 
 def require_unconstrained(identity):
+    if identity.get("active_controls", {}).get("vision_projector") is not False:
+        raise ValueError("paired baseline requires verified inactive vision projector")
     if identity.get("active_controls", {}).get("dwq_overlay") is not False:
         raise ValueError("paired baseline requires verified inactive DWQ overlay")
     for name in ("glp", "grammar"):

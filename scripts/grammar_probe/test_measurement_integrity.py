@@ -87,6 +87,24 @@ class IdentityAndReporting(unittest.TestCase):
                            ("config_sha256", "other"), ("generation_run_id", "other")):
             self.assertNotEqual(original, digest(judgment_input({**r, key: value}, "prompt")), key)
 
+    def test_unicode_hashes_and_strict_verdict_contract(self):
+        import judge
+        for text in ("café 🌳", "escaped surrogate \ud800"):
+            row = result(content=text)
+            inp = judgment_input(row, text)
+            self.assertEqual(inp["response_hash"], text_hash(text))
+            self.assertEqual(inp["prompt_sha256"], judge.sha256_text(text))
+            self.assertEqual(inp, judgment_input(json.loads(json.dumps(row)), text))
+        cases = [verdict(validity="invalid"), verdict(substance=1),
+                 verdict(state="degenerate"), verdict(state="nonresponsive"),
+                 {**verdict(), "substantive_compliance": True},
+                 {**verdict(), "unexpected": "field"}]
+        for case in cases:
+            with self.assertRaises(judge.VerdictInvalid):
+                judge.validate_verdict(case)
+        judge.validate_verdict(verdict())
+        judge.validate_verdict(verdict(state="degenerate", validity="invalid"))
+
     def test_human_samples_are_full_and_machine_blind(self):
         rows = [result(pid=f"p{i}", content="A" * 3100 + f"TAIL{i}") for i in range(10)]
         old = [legacy_v(r) for r in rows]
@@ -127,11 +145,34 @@ class RuntimeAttestations(unittest.TestCase):
         changed = copy.deepcopy(f.snapshot); changed["engine_generation"] += 1
         with self.assertRaisesRegex(ValueError, "snapshot"):
             validate_identity(f.manifest, changed)
-        for control in ("glp", "grammar", "dwq_overlay"):
+        for control in ("glp", "grammar", "dwq_overlay", "vision_projector"):
             active = copy.deepcopy(ident)
-            if control == "dwq_overlay": active["active_controls"][control] = True
+            if control in ("dwq_overlay", "vision_projector"): active["active_controls"][control] = True
             else: active["active_controls"][control]["active"] = True
             with self.assertRaises(ValueError): require_unconstrained(active)
+    def test_admission_and_model_artifact_cardinality(self):
+        f = self.f
+        altered = copy.deepcopy(f.manifest)
+        altered["runtime_identity"]["admission"] = {"max_context_tokens": 8192}
+        altered["runtime_identity"]["identity_sha256"] = digest({
+            k: v for k, v in altered["runtime_identity"].items() if k != "identity_sha256"})
+        with self.assertRaisesRegex(ValueError, "admission"):
+            validate_identity(altered, f.snapshot)
+        for roles in (("glp",), ("weights",), ("model", "model")):
+            altered = copy.deepcopy(f.manifest)
+            altered["runtime_identity"]["model_artifacts"] = [
+                {"sha256": "d" * 64, "bytes": 123, "role": role} for role in roles]
+            altered["runtime_identity"]["identity_sha256"] = digest({
+                k: v for k, v in altered["runtime_identity"].items() if k != "identity_sha256"})
+            with self.assertRaisesRegex(ValueError, "exactly one model"):
+                validate_identity(altered, f.snapshot)
+
+    def test_missing_projector_state_is_not_an_unsteered_baseline(self):
+        ident = copy.deepcopy(self.f.manifest["runtime_identity"])
+        ident["active_controls"].pop("vision_projector")
+        with self.assertRaisesRegex(ValueError, "vision projector"):
+            require_unconstrained(ident)
+
     def test_missing_hash_and_not_running_fail(self):
         for field in ("binary_sha256", "tokenizer_sha256", "template_sha256", "model_artifacts"):
             m = copy.deepcopy(self.f.manifest)

@@ -41,9 +41,9 @@ class Fixture:
         self.snapshot = dict(schema_version="hf2q.measurement-snapshot.v1",
             process_pid=os.getpid(), model_id="mock", engine_generation=1,
             tokenizer_sha256="a" * 64, template_sha256="b" * 64,
-            engine_config={}, sampling_defaults={},
+            engine_config={}, sampling_defaults={}, admission={"max_context_tokens": 4096},
             active_controls={"glp": {"active": False},
-                             "grammar": {"active": False}, "dwq_overlay": False})
+                             "grammar": {"active": False}, "dwq_overlay": False, "vision_projector": False})
         outer = self
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -73,8 +73,8 @@ class Fixture:
         self.attest()
     def attest(self):
         identity = {"binary_sha256": "c" * 64, "source_commit": None,
-                    "model_artifacts": [{"sha256": "d" * 64, "bytes": 123, "role": "weights"}],
-                    **{k: self.snapshot[k] for k in ("model_id", "engine_config", "tokenizer_sha256", "template_sha256",
+                    "model_artifacts": [{"sha256": "d" * 64, "bytes": 123, "role": "model"}],
+                    **{k: self.snapshot[k] for k in ("model_id", "engine_config", "admission", "tokenizer_sha256", "template_sha256",
                                                    "sampling_defaults", "active_controls")}}
         identity["identity_sha256"] = digest(identity)
         self.manifest = {"schema_version": "hf2q.measurement-runtime.v1", "state": "running",

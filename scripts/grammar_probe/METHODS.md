@@ -19,7 +19,7 @@ attested resident model. Source commit may be explicitly unknown; the harness
 never manufactures a binary-to-source relationship or historical identity.
 
 `baseline_run.py` generates paired BASE and W1 responses. BASE requires
-verified inactive default grammar, GLP and DWQ overlays. A literal reply cannot
+verified inactive default grammar, GLP, DWQ overlays and vision projector. A literal reply cannot
 prove these conditions; the runtime attestation supplies that evidence.
 Separate canaries check the grammar path and historical W1 opening. The W1
 file must match its historical SHA256, not the newer embedded default.

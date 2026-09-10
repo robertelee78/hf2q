@@ -238,7 +238,7 @@ def main():
                 "generation_run_id": run_id, "prompt_sha256": text_hash(prompt),
                 "latency_s": latency, "finish": r["choices"][0].get("finish_reason"),
                 "content": content,
-                "response_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                "response_sha256": text_hash(content),
                 "reasoning_chars": len(msg.get("reasoning_content") or ""),
                 "refusal_hit_count": len(hits), "refusal_matches": hits,
                 "prompt_tokens": r.get("usage", {}).get("prompt_tokens"),

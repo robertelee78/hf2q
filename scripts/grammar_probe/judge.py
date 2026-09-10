@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 
 from measurement import (artifact, digest, ensure_manifest, generation_inventory,
-                         generation_metadata, identity, judgment_input, read_jsonl)
+                         generation_metadata, identity, judgment_input, read_jsonl, text_hash)
 from runtime_identity import attested_model, fetch_runtime_identity, verify_unchanged
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8081")
@@ -110,7 +110,7 @@ class VerdictInvalid(JudgeError):
 
 
 def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+    return text_hash(text)
 
 
 def scoring_config(judge_model: str, runtime_identity=None) -> dict:
