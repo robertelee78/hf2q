@@ -610,6 +610,9 @@ jobs:
           cargo test --locked --bin hf2q --all-features gcd_schema_tests
           cargo test --locked --bin hf2q --all-features gcd_schema_locked_requires_gcd_schema_on_serve_and_chat
           cargo test --locked --bin hf2q --all-features measurement::tests
+          cargo test --locked --bin hf2q --all-features inference::glp::discovery::tests
+          cargo test --locked --bin hf2q --all-features inference::glp::compatibility::tests
+          cargo test --locked --bin hf2q --all-features inference::glp::reader::tests
           python3 -B -m unittest discover -s scripts/grammar_probe -p 'test*.py'
 
       # --- Blocking: activate() matrix matches the shipping contract ---
