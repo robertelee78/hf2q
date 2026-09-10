@@ -2837,7 +2837,25 @@ pub(crate) fn build_hub_api(cache_dir: &Path, _progress: bool) -> Result<HubApi,
     debug!(has_token = token.is_some(), "Auth token resolution");
 
     // Pin the official endpoint even when HF_ENDPOINT is set in the process.
+    // hf-hub 1.x builds its default reqwest client with no connect or overall
+    // timeout and retries transient (including timeout) errors up to 5 times,
+    // so an exact-revision metadata query on a stalled connection hangs the
+    // startup path indefinitely — and with it the manual-download local
+    // fallback, which only fires once the hub query returns an error. Bound
+    // the client (15s connect / 60s overall, matching the file-metadata
+    // client below) and cap retries so a stalled hub degrades to the local
+    // artifact instead of spinning forever. The User-Agent rides on the
+    // injected client because hf-hub applies its default headers only to the
+    // no-redirect client it builds itself.
+    let timed_hub_client = reqwest_hub::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(60))
+        .user_agent(concat!("hf2q/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(download_failed)?;
     let mut builder = hf_hub::HFClient::builder()
+        .client(timed_hub_client)
+        .retry_max_attempts(2)
         .endpoint(CANONICAL_HF_ENDPOINT)
         .cache_dir(cache_dir)
         .user_agent(concat!("hf2q/", env!("CARGO_PKG_VERSION")));

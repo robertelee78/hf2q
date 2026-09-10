@@ -85,6 +85,13 @@ bytemuck = "1.25"
 # hf2q's synchronous conversion pipeline while Xet runs its concurrent range
 # reconstruction on the library-owned runtime.
 hf-hub = { version = "=1.0.0", features = ["blocking"] }
+# hf-hub 1.0 links reqwest 0.13 while hf2q's own HTTP stack is reqwest 0.12
+# (two majors coexist in the lock). Injecting a bounded-timeout client into
+# the hf-hub builder requires constructing a Client from the *same* reqwest
+# instance hf-hub links, so alias 0.13 here purely for type identity. TLS
+# features are not repeated: the unified 0.13 build already carries whatever
+# hf-hub enables, and this alias only needs the builder surface.
+reqwest-hub = { package = "reqwest", version = "0.13", default-features = false }
 # hf-hub 1.0 publishes caret Xet edges. Pin the coherent family here as well
 # as in Cargo.lock so `cargo install` without --locked cannot select the
 # currently stable-toolchain-incompatible 1.6 family independently.
