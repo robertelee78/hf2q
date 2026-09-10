@@ -450,6 +450,54 @@ fn diagnostic_no_evict_from_headers(headers: &HeaderMap) -> Result<bool, Respons
     Ok(true)
 }
 
+/// ADR-053/057 + S7/S12: inject the serve-time GCD default grammar into a
+/// request that carries no explicit constraint.
+///
+/// S7: every supported explicit constraint surface suppresses the injection
+/// (`grammar`, `response_format`, `structured_outputs`, `json_schema`) —
+/// the request compiler treats them as mutually exclusive, so injecting
+/// over an explicit surface turned supported requests into 400s.
+///
+/// S12: GLP is orthogonal to grammar selection BY CONSTRUCTION — this
+/// function takes no steering parameter. The embedded W6V2 grammar is
+/// injected identically whether or not a GLP vector is bound; the W1/W6V2
+/// campaign evidence was measured on this grammar, and the previous
+/// think/anchor/free-body composition selected under `--gcd --glp` was a
+/// different, unmeasured grammar that confounded every steering A/B with a
+/// grammar change. Operators who want the think-then-answer composition
+/// pass it as an explicit request grammar, which also suppresses this
+/// injection.
+fn apply_gcd_default_injection(
+    gcd: bool,
+    gcd_schema_grammar: Option<&str>,
+    request: &mut super::schema::ChatCompletionRequest,
+) {
+    const GCD_GRAMMAR: &str = include_str!("grammar/gcd_w1.gbnf");
+    let explicit_constraint = request.grammar.is_some()
+        || request.response_format.is_some()
+        || request.structured_outputs.is_some()
+        || request.json_schema.is_some();
+    if gcd && !explicit_constraint {
+        eprintln!("[GCD] injecting grammar");
+        request.grammar = Some(GCD_GRAMMAR.to_owned());
+        // The W6V2 anchor must engage at token 0; a template think block
+        // before it would be outside the grammar's language (fail-closed).
+        // This is a property of the GCD grammar itself — required with and
+        // without GLP alike.
+        request.hf2q_enable_thinking = Some(false);
+    }
+    // ADR-057: `--gcd-schema` injects the startup-compiled schema grammar
+    // instead of W1. Typed output objects leave no slot for refusal prose
+    // (Vince Ovando's red-team pipeline pattern).
+    if gcd_schema_grammar.is_some() && !explicit_constraint && request.grammar.is_none() {
+        eprintln!("[GCD] injecting schema grammar");
+        request.grammar = gcd_schema_grammar.map(str::to_owned);
+        // The output must begin with the JSON object; a think block before
+        // token 0 of the object would violate the grammar.
+        request.hf2q_enable_thinking = Some(false);
+    }
+}
+
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -469,41 +517,18 @@ pub async fn chat_completions(
             // and cut refusals 38→29 on the hardest-slice Gemma retest vs W1).
             // Shipped via include_str! so it is the same file the campaign
             // measured, not a hand-copied approximation.
-            const GCD_GRAMMAR: &str = include_str!("grammar/gcd_w1.gbnf");
-            if state.config.gcd && request.grammar.is_none() && request.response_format.is_none() {
-                eprintln!("[GCD] injecting grammar");
-                // W1 (anchor + topic + automaton) for grammar-only; B14 for
-                // GLP composition (let reasoning run, then force answer).
-                let grammar = if state.config.glp_path.is_some() {
-                    "root ::= think answer\nthink ::= \"<think>\\n\" thinktail \"</think>\\n\\n\"\nthinktail ::= !</think>*\nanswer ::= \"Here is the technical breakdown.\\n\\n\" body\nbody ::= [^\\x00]*\n"
-                } else {
-                    GCD_GRAMMAR
-                };
-                request.grammar = Some(grammar.to_owned());
-                // B13/B14 grammars expect the answer to start with the
-                // anchor; disable the think block so the grammar engages
-                // at token 0.
-                request.hf2q_enable_thinking = Some(false);
-            }
-            // ADR-057: `--gcd-schema` injects the startup-compiled schema
-            // grammar instead of W1. Typed output objects leave no slot for
-            // refusal prose (Vince Ovando's red-team pipeline pattern).
-            if state.config.gcd_schema_grammar.is_some()
-                && request.grammar.is_none()
-                && request.response_format.is_none()
-            {
-                eprintln!("[GCD] injecting schema grammar");
-                request.grammar = state.config.gcd_schema_grammar.clone();
-                // The output must begin with the JSON object; a think block
-                // before token 0 of the object would violate the grammar.
-                request.hf2q_enable_thinking = Some(false);
-            }
+            apply_gcd_default_injection(
+                state.config.gcd,
+                state.config.gcd_schema_grammar.as_deref(),
+                &mut request,
+            );
             // ADR-056: with a constraint attached, undeclared request params
             // are potential silent constraint drops (the vLLM beam-search
             // FATAL class): reject loudly, naming every unknown key.
             let constrained = request.grammar.is_some()
                 || request.response_format.is_some()
-                || request.structured_outputs.is_some();
+                || request.structured_outputs.is_some()
+                || request.json_schema.is_some();
             if constrained && !request.extra.is_empty() {
                 let mut keys: Vec<&str> =
                     request.extra.keys().map(String::as_str).collect();
@@ -12978,5 +13003,109 @@ mod gcd_schema_tests {
             rt2.accept_bytes(populated) && rt2.is_terminally_accepted(),
             "tightened schema still admits the populated form"
         );
+    }
+}
+
+#[cfg(test)]
+mod gcd_glp_orthogonality_tests {
+    use super::apply_gcd_default_injection;
+    use crate::serve::api::schema::ChatCompletionRequest;
+
+    fn request() -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .expect("minimal request deserializes")
+    }
+
+    /// S12: `--gcd` injects the embedded W6V2 grammar byte-identically and
+    /// disables the template think block (the anchor must engage at token
+    /// 0). The injection function takes no steering parameter at all —
+    /// GLP cannot change grammar selection by construction. Zero-dose GLP
+    /// therefore preserves the GCD-only configuration exactly; the
+    /// logit-level equivalence of a zero-dose bind is proven by the
+    /// calibrate canary (zero-dose logit-identical) and the same-boot
+    /// steering gate's within-process noise floor of 0.
+    #[test]
+    fn gcd_injection_is_identical_regardless_of_steering() {
+        let mut req = request();
+        apply_gcd_default_injection(true, None, &mut req);
+        let injected = req.grammar.expect("--gcd injects the grammar");
+        let embedded = include_str!("grammar/gcd_w1.gbnf");
+        assert_eq!(
+            injected, embedded,
+            "--gcd must inject the embedded W6V2 grammar byte-identically"
+        );
+        assert_eq!(
+            req.hf2q_enable_thinking,
+            Some(false),
+            "the anchor requires token-0 engagement; thinking must be off"
+        );
+    }
+
+    /// S7: every supported explicit constraint surface suppresses the
+    /// default injection. Injecting over any of them produced a spurious
+    /// 400 from the request compiler's mutual-exclusion rules.
+    #[test]
+    fn every_explicit_constraint_surface_suppresses_default_injection() {
+        // grammar
+        let mut req = request();
+        req.grammar = Some("root ::= \"ok\"".into());
+        apply_gcd_default_injection(true, None, &mut req);
+        assert_eq!(req.grammar.as_deref(), Some("root ::= \"ok\""));
+        assert_eq!(req.hf2q_enable_thinking, None, "no injection side effects");
+
+        // json_schema
+        let mut req = request();
+        req.json_schema = Some(
+            serde_json::from_value(serde_json::json!({"type": "object"}))
+                .expect("json_schema shape"),
+        );
+        apply_gcd_default_injection(true, None, &mut req);
+        assert!(req.grammar.is_none(), "json_schema must suppress injection");
+
+        // structured_outputs
+        let mut req = request();
+        req.structured_outputs = Some(
+            serde_json::from_value(serde_json::json!({"grammar": "root ::= \"ok\""}))
+                .expect("structured_outputs shape"),
+        );
+        apply_gcd_default_injection(true, None, &mut req);
+        assert!(req.grammar.is_none(), "structured_outputs must suppress injection");
+
+        // response_format
+        let mut req = request();
+        req.response_format = Some(
+            serde_json::from_value(serde_json::json!({"type": "json_object"}))
+                .expect("response_format shape"),
+        );
+        apply_gcd_default_injection(true, None, &mut req);
+        assert!(req.grammar.is_none(), "response_format must suppress injection");
+    }
+
+    /// ADR-057: `--gcd-schema` injects the compiled schema grammar when the
+    /// request is unconstrained, and leaves explicit grammars untouched.
+    #[test]
+    fn schema_grammar_injects_only_when_unconstrained() {
+        let mut req = request();
+        apply_gcd_default_injection(false, Some("root ::= \"schema\""), &mut req);
+        assert_eq!(req.grammar.as_deref(), Some("root ::= \"schema\""));
+        assert_eq!(req.hf2q_enable_thinking, Some(false));
+
+        let mut req = request();
+        req.grammar = Some("root ::= \"explicit\"".into());
+        apply_gcd_default_injection(false, Some("root ::= \"schema\""), &mut req);
+        assert_eq!(req.grammar.as_deref(), Some("root ::= \"explicit\""));
+    }
+
+    /// With neither flag set, nothing is injected and the request passes
+    /// through untouched (GLP-only configuration).
+    #[test]
+    fn glp_only_configuration_injects_nothing() {
+        let mut req = request();
+        apply_gcd_default_injection(false, None, &mut req);
+        assert!(req.grammar.is_none());
+        assert_eq!(req.hf2q_enable_thinking, None);
     }
 }
