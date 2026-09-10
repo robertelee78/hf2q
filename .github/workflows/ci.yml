@@ -613,6 +613,7 @@ jobs:
           cargo test --locked --bin hf2q --all-features inference::glp::discovery::tests
           cargo test --locked --bin hf2q --all-features inference::glp::compatibility::tests
           cargo test --locked --bin hf2q --all-features inference::glp::source_identity::tests
+          cargo test --locked --bin hf2q --all-features calibrate::export_tests
           cargo test --locked --bin hf2q --all-features inference::glp::reader::tests
           python3 -B -m unittest discover -s scripts/grammar_probe -p 'test*.py'
 

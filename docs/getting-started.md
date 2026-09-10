@@ -322,7 +322,7 @@ stop the server and rerun the command from section 2 without either flag.
 These flags configure the server; adding them to a chat client attached to
 an existing endpoint does not reconfigure it.
 
-For schema defaults, calibration, and discovery limits, see the
+For mandatory schema controls, calibration, and artifact discovery, see the
 [README usage reference](https://github.com/robertelee78/hf2q#user-content-gcd-and-glp-serving-flags---gcd---glp).
 The [article](gcd-in-hf2q.md) and [paper PDF](gcd-in-hf2q.pdf) explain the
 mechanisms and evidence.

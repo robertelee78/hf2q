@@ -18,6 +18,28 @@ sampling defaults and active controls. The requested model must equal the
 attested resident model. Source commit may be explicitly unknown; the harness
 never manufactures a binary-to-source relationship or historical identity.
 
+For a new DeepSeek-V4 or Qwen3.5-family GGUF run, start the owned server in
+one terminal (use fresh output paths):
+
+```bash
+python3 -B scripts/grammar_probe/managed_runtime.py \
+  --binary /path/to/hf2q --model /path/to/model.gguf \
+  --manifest /path/to/run/runtime.json --port 18086
+```
+
+After it reports verified readiness, run generation from another terminal:
+
+```bash
+RUNTIME_MANIFEST=/path/to/run/runtime.json BASE_URL=http://127.0.0.1:18086 \
+  OUT=/path/to/run/paired.jsonl BUDGET_LADDER=800,1600 \
+  python3 -B scripts/grammar_probe/baseline_run.py
+```
+
+The launcher hashes its inputs, isolates hf2q operator configuration, and
+monitors the child, files and live snapshot. Ctrl-C stops only its owned
+server and marks the manifest stopped. Run one large model at a time; scoring
+uses a separately managed judge and `JUDGE_RUNTIME_MANIFEST`.
+
 `baseline_run.py` generates paired BASE and W1 responses. BASE requires
 verified inactive default grammar, GLP, DWQ overlays and vision projector. A literal reply cannot
 prove these conditions; the runtime attestation supplies that evidence.
@@ -99,7 +121,7 @@ are used for both.
 
 ## Offline validation
 
-Run `PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/grammar_probe/test_harness_repair.py`.
+Run `PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s scripts/grammar_probe -p 'test*.py'`.
 The suite uses synthetic data, temporary outputs and mock HTTP servers. It
 covers multi-budget/run joins, hashes, pass selection, missingness, immutable
 resumption, full human cases and runtime controls. It loads no model. Offline

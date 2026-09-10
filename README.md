@@ -974,10 +974,15 @@ grammar at startup and conflicts with `--gcd`. It constrains object structure
 and supported field values. Free-text strings can still contain refusal or
 incorrect content; `minLength` does not prevent either. See the
 [recon object example](examples/recon-opportunities.schema.json) and the
-paper's schema discussion. These server defaults are convenience controls,
-not authenticated authorization policies. Tool grammars take precedence over
-response grammars. Default injection defers to an explicit `grammar`,
-`response_format`, `json_schema`, or `structured_outputs` request.
+paper's schema discussion. Default injection defers to an explicit `grammar`,
+`response_format`, `json_schema`, or `structured_outputs` request; a selected
+tool grammar can take precedence over an unlocked response default.
+
+Add `--gcd-schema-locked` to make the server schema mandatory. Requests that
+replace or defer that grammar are rejected before streaming starts. Tool
+calls cannot replace the locked response schema; requests with tool definitions
+must use `tool_choice: "none"`. Authentication and per-principal authorization
+remain application responsibilities.
 
 **GLP artifacts and application.** A GLP file distributes steering directions
 and application metadata separately from the base checkpoint, avoiding another
@@ -988,13 +993,16 @@ Compatibility depends on the checkpoint, graph layers, activation site, mode,
 and strength. The inspected application paths are Qwen 3.5/3.6/3.8 and
 DeepSeek-V4. Binding checks the declared hook, layer range, and vector width.
 Qwen applies steering at the post-layer residual; DeepSeek applies the declared
-operation at the FFN writer before residual integration. Exact checkpoint
-compatibility remains an operator responsibility.
+operation at the FFN writer before residual integration. The reader checks
+declared direction hashes and checkpoint identity. Model-card ancestors do
+not identify the checkpoint being served; converted models use an output-bound
+conversion receipt when available. A declared revision that cannot be verified
+is rejected.
 
-`--glp <file.gguf>` loads a local artifact. Bare `--glp` attempts
-convention-based Hub discovery; it does not currently establish unique
-artifact selection or exact checkpoint compatibility. Use an explicitly
-verified local artifact. `--glp-alpha` overrides the artifact's
+`--glp <file.gguf>` loads a local artifact. Explicit Hub repositories and file
+URLs resolve to immutable revisions. Bare `--glp` uses convention-based Hub
+discovery and rejects ambiguous repositories or files; select an explicit
+artifact when discovery cannot choose uniquely. `--glp-alpha` overrides the artifact's
 `glp.alpha_default`, falling back to 1.0 when that metadata is absent.
 Strength needs validation for the actual checkpoint and application site.
 Reset inference state when comparing steered and unsteered computation,

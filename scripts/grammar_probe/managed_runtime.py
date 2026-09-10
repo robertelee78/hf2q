@@ -149,7 +149,7 @@ def child_environment(overrides):
         key, separator, value = entry.partition("=")
         if not separator or not key.startswith("HF2Q_"):
             raise ValueError("--env accepts an explicit HF2Q_NAME=value only")
-        if any(part in key.upper() for part in ("TOKEN", "SECRET", "PASSWORD", "API_KEY")):
+        if any(part in key.upper() for part in ("AUTH_TOKEN", "API_TOKEN", "SECRET", "PASSWORD", "API_KEY")):
             raise ValueError("credential variables cannot be recorded in measurement evidence")
         environment[key] = value
     return environment

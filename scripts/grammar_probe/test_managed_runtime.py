@@ -366,6 +366,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                                        "HF2Q_EXPERIMENT": "explicit"})
         with self.assertRaisesRegex(ValueError, "credential variables"):
             runtime.child_environment(["HF2Q_API_KEY=synthetic-secret"])
+        self.assertEqual(runtime.child_environment(["HF2Q_MAX_TOKENS=256"])["HF2Q_MAX_TOKENS"], "256")
 
 
 if __name__ == "__main__":
