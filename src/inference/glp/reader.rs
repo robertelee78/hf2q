@@ -6,7 +6,12 @@
 //!
 //! Gates enforced here (fatal = hard error, never a fallback):
 //! 1. `glp.mode` absent → `add`; present must be `add` or `project`.
-//! 2. `glp.hook_point` must be `residual_stream_post_layer`.
+//! 2. `glp.hook_point` must be a spec-recognized value; the loaded value is
+//!    stored on [`GlpVector`] and the family bind enforces that it matches
+//!    the site that family's forward graph actually steers (spec: "a reader
+//!    whose hook does not match must refuse the file rather than apply it
+//!    somewhere else" — the `*_pre_residual` and `residual_stream_post_layer`
+//!    hooks are different tensors and are NOT interchangeable).
 //! 3. `glp.spec_version` must be 1.
 //! 4. `direction.0` is invalid; `direction.N` applies at layer N.
 //! 5. All direction tensors: fp32, 1-D, identical width.
@@ -27,13 +32,47 @@ const MAX_ARRAY_ELEMENTS: u64 = 2_000_000;
 const MAX_ALIGNMENT: u64 = 1024 * 1024;
 const MAX_DIRECTION_BYTES: u64 = 64 * 1024 * 1024; // any plausible vector stack
 
-const HOOK_POINT_REQUIRED: &str = "residual_stream_post_layer";
-// The weightless 2026-09-04 correction: on DeepSeek-V4 the post-layer
-// residual is folded by the next layer's fused kernel, so the measured
-// hook is the FFN's pre-fold write. In hf2q's native graph the fold is
-// materialized by `dispatch_hc_post` before the next layer, so the two
-// labels name the same buffer. Accept both; the apply point is unchanged.
-const HOOK_POINT_ALIAS: &str = "ffn_out_pre_residual";
+/// Where a GLP projection is applied (spec/GLP.md "Recognised values").
+///
+/// These are different tensors, not synonyms: projecting a *writer* (one
+/// layer's new deposit) prevents that deposit while the component
+/// accumulated upstream sails through untouched — a weaker intervention by
+/// construction, at an alpha whose meaning differs (spec: at the residual,
+/// 1.0 removes the component exactly; at a writer, 1.0 removes that write's
+/// component). A vector is calibrated for one site; the family bind refuses
+/// a mismatch rather than applying it somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlpHookPoint {
+    /// The accumulated residual after the layer's writes are folded in
+    /// (llama.cpp `build_cvec()` site; the vLLM overlay's site).
+    ResidualStreamPostLayer,
+    /// The FFN/MoE write alone, before the (hyper-connection) residual fold
+    /// — the ds4 site: `ffn_out = moe + shared`, immediately before
+    /// `hc_post_one()`. hf2q's DeepSeek-V4 site.
+    FfnOutPreResidual,
+    /// The attention write alone, before the same fold. Recognized by the
+    /// spec; not implemented by any hf2q family — binding one is fatal.
+    AttnOutPreResidual,
+}
+
+impl GlpHookPoint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ResidualStreamPostLayer => "residual_stream_post_layer",
+            Self::FfnOutPreResidual => "ffn_out_pre_residual",
+            Self::AttnOutPreResidual => "attn_out_pre_residual",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "residual_stream_post_layer" => Some(Self::ResidualStreamPostLayer),
+            "ffn_out_pre_residual" => Some(Self::FfnOutPreResidual),
+            "attn_out_pre_residual" => Some(Self::AttnOutPreResidual),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlpMode {
@@ -69,6 +108,13 @@ impl From<std::io::Error> for GlpError {
 #[derive(Debug, Clone)]
 pub struct GlpVector {
     pub mode: GlpMode,
+    /// The declared apply site. The family bind must match it exactly.
+    pub hook_point: GlpHookPoint,
+    /// Where the direction was captured (`glp.derived_at`). Informational
+    /// per spec — it may legitimately differ from `hook_point` (the
+    /// published GLP-29 is derived at the residual and applied at the ds4
+    /// FFN writer) — but it is carried so provenance survives the load.
+    pub derived_at: Option<String>,
     pub alpha_default: f32,
     pub rank: u32,
     /// layer N (1-based per spec) → direction tensor (fp32, width = hidden).
@@ -263,22 +309,29 @@ impl GlpVector {
             Some(_) => return Err(GlpError::Malformed("glp.mode must be a string".into())),
         };
 
-        // Gate 2: hook point
-        match metadata.get("glp.hook_point") {
-            Some(MetaValue::Str(s)) if s == HOOK_POINT_REQUIRED => {}
-            Some(MetaValue::Str(s)) if s == HOOK_POINT_ALIAS => {}
-            Some(MetaValue::Str(s)) => {
-                return Err(GlpError::Conformance(format!(
-                    "glp.hook_point {s:?} names a hook this reader does not apply at"
-                )));
-            }
+        // Gate 2: hook point — must be a spec-recognized value. The value
+        // is stored; the family bind enforces the site match (a residual
+        // vector on the DeepSeek FFN-writer site, or a writer vector on the
+        // Qwen residual site, is refused there — not silently reapplied).
+        let hook_point = match metadata.get("glp.hook_point") {
+            Some(MetaValue::Str(s)) => GlpHookPoint::parse(s).ok_or_else(|| {
+                GlpError::Conformance(format!(
+                    "glp.hook_point {s:?} is not a spec-recognized hook \
+                     (recognized: residual_stream_post_layer, \
+                     ffn_out_pre_residual, attn_out_pre_residual)"
+                ))
+            })?,
             Some(_) => return Err(GlpError::Malformed("glp.hook_point must be a string".into())),
             None => {
                 return Err(GlpError::Conformance(
                     "glp.hook_point missing; refusing to guess the apply point".into(),
                 ));
             }
-        }
+        };
+        let derived_at = match metadata.get("glp.derived_at") {
+            Some(MetaValue::Str(s)) => Some(s.clone()),
+            _ => None,
+        };
 
         // Gate 3: spec version
         match metadata.get("glp.spec_version") {
@@ -351,7 +404,26 @@ impl GlpVector {
                     tensor.ggml_type
                 )));
             }
-            let w = tensor.dims[0] as usize;
+            // S11: all file-controlled arithmetic is checked. A malformed
+            // width or offset previously multiplied/added unchecked —
+            // overflow would panic a checked build or wrap past the budget
+            // check in release, producing an invalid slice.
+            let w_u64 = tensor.dims[0];
+            let byte_len = w_u64.checked_mul(4).ok_or_else(|| {
+                GlpError::Malformed(format!(
+                    "direction.{layer} width {w_u64} overflows the byte length"
+                ))
+            })?;
+            if byte_len > MAX_DIRECTION_BYTES {
+                return Err(GlpError::Malformed(format!(
+                    "direction.{layer} byte length {byte_len} exceeds budget"
+                )));
+            }
+            let w = usize::try_from(w_u64).map_err(|_| {
+                GlpError::Malformed(format!(
+                    "direction.{layer} width {w_u64} exceeds the address space"
+                ))
+            })?;
             match width {
                 None => width = Some(w),
                 Some(existing) if existing != w => {
@@ -361,14 +433,22 @@ impl GlpVector {
                 }
                 _ => {}
             }
-            let byte_len = (w as u64) * 4;
-            if byte_len > MAX_DIRECTION_BYTES {
-                return Err(GlpError::Malformed(format!(
-                    "direction.{layer} byte length {byte_len} exceeds budget"
-                )));
-            }
-            let start = data_offset as usize + tensor.offset as usize;
-            let end = start + byte_len as usize;
+            let tensor_offset = usize::try_from(tensor.offset).map_err(|_| {
+                GlpError::Malformed(format!(
+                    "direction.{layer} offset {} exceeds the address space",
+                    tensor.offset
+                ))
+            })?;
+            let start = (data_offset as usize).checked_add(tensor_offset).ok_or_else(|| {
+                GlpError::Malformed(format!(
+                    "direction.{layer} data start (offset {tensor_offset}) overflows"
+                ))
+            })?;
+            let end = start.checked_add(byte_len as usize).ok_or_else(|| {
+                GlpError::Malformed(format!(
+                    "direction.{layer} data end (start {start} + {byte_len}) overflows"
+                ))
+            })?;
             if end > bytes.len() {
                 return Err(GlpError::Malformed(format!(
                     "direction.{layer} data range exceeds file size"
@@ -392,6 +472,8 @@ impl GlpVector {
 
         Ok(Self {
             mode,
+            hook_point,
+            derived_at,
             alpha_default,
             rank,
             layers,
@@ -514,6 +596,38 @@ mod tests {
             GlpVector::from_bytes(&bytes),
             Err(GlpError::Conformance(_))
         ));
+    }
+
+    #[test]
+    fn all_spec_hook_points_are_recognized_and_stored() {
+        for (value, expected) in [
+            ("residual_stream_post_layer", GlpHookPoint::ResidualStreamPostLayer),
+            ("ffn_out_pre_residual", GlpHookPoint::FfnOutPreResidual),
+            ("attn_out_pre_residual", GlpHookPoint::AttnOutPreResidual),
+        ] {
+            let mut meta = base_meta();
+            meta[2] = ("glp.hook_point", MetaValue::Str(value.into()));
+            let bytes = build_gguf(&meta, &[("direction.3", vec![1.0])]);
+            let vector = GlpVector::from_bytes(&bytes).unwrap();
+            assert_eq!(vector.hook_point, expected, "hook {value} must parse");
+        }
+    }
+
+    #[test]
+    fn derived_at_is_carried_for_provenance() {
+        let mut meta = base_meta();
+        meta.push(("glp.derived_at", MetaValue::Str("residual_stream_post_layer".into())));
+        let bytes = build_gguf(&meta, &[("direction.3", vec![1.0])]);
+        let vector = GlpVector::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            vector.derived_at.as_deref(),
+            Some("residual_stream_post_layer")
+        );
+        // Absent derived_at means "same as hook_point" per spec; the field
+        // stays None and the bind does not depend on it.
+        let bytes = build_gguf(&base_meta(), &[("direction.3", vec![1.0])]);
+        let vector = GlpVector::from_bytes(&bytes).unwrap();
+        assert_eq!(vector.derived_at, None);
     }
 
     #[test]

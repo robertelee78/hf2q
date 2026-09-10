@@ -5,18 +5,18 @@
 //   row_m <- row_m - alpha * (row_m . d) * d / ‖d‖²
 //
 // where `d` is the GLP direction for the layer. The host passes ‖d‖² so
-// the kernel does not require a normalized vector. One thread per element;
-// the per-row dot is cooperatively reduced inside a threadgroup of 256,
-// then every thread applies the same scale-subtract to its own element.
-// (One threadgroup per row is NOT assumed: the grid is flat over M*N and
-// the threadgroup map may straddle rows; the reduction is therefore
-// restricted to the row-local segment via the row's own thread ids.)
+// the kernel does not require a normalized vector.
 //
-// NOTE: this kernel is correct when each threadgroup covers exactly one
-// full row (tg_size == n). The host must dispatch with
-// threads_per_threadgroup = n (hidden width), which for our families is
-// 2048 (Qwen) — the Metal maximum threadgroup size. Rows are processed
-// one per threadgroup.
+// Launch contract (do not violate — see the S1 fix history): the
+// reduction uses a fixed 256-lane threadgroup (`partial[256]`, stride-128
+// tree) and threadgroup id maps directly to the row. The host MUST
+// dispatch threads_per_threadgroup = 256 and grid = M * 256 (one
+// threadgroup per row). Columns are covered strided
+// (`col = tid; col < n; col += 256`), so any row width N is correct —
+// widths below 256 leave lanes idle with zero contribution; widths above
+// 256 are covered by the stride. A host that passes the row width as the
+// threadgroup size indexes `partial` out of bounds for N > 256 and
+// exceeds Metal's threadgroup limit for N > 1024.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -36,12 +36,12 @@ kernel void glp_project_f32(
     uint                         tg_size [[threads_per_threadgroup]],
     uint                         tg_id [[threadgroup_position_in_grid]]
 ) {
-    const uint row = tg_id;  // one threadgroup per row
+    const uint row = tg_id;  // one threadgroup per row (grid = m * 256)
     if (row >= params.m) {
         return;
     }
     device float* row_ptr = hidden + row * params.n;
-    // accumulate strided elements
+    // accumulate strided elements of THIS row
     float local_dot = 0.0f;
     for (uint col = tid_in_tg; col < params.n; col += tg_size) {
         local_dot += row_ptr[col] * direction[col];

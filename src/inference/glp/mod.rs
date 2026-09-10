@@ -26,4 +26,4 @@ pub use apply_gpu::{
 };
 pub use bind::BoundGlp;
 pub use discovery::{ResolvedGlp, auto_discover_glp, validate_glp_provenance};
-pub use reader::{GlpError, GlpMode, GlpVector};
+pub use reader::{GlpError, GlpHookPoint, GlpMode, GlpVector};
