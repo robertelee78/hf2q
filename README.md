@@ -656,10 +656,10 @@ stop suffix could invalidate otherwise accepted output.
 
 Release qualification covers every enabled text-generation GGUF architecture
 (`gemma4`, `qwen35`, `qwen35moe`, and `deepseek4`) with an exact-artifact r2c
-conformance receipt. This guarantees the protocol surface and grammar
-enforcement for any successfully loaded supported checkpoint; model-specific
-answer quality remains a property of the checkpoint. hf2q does not link to or
-invoke r2c—the r2c schemas are revision-bound release test vectors.
+conformance receipt. Each receipt establishes its recorded checks on the
+pinned qualification artifact and settings; it does not validate every
+supported checkpoint or establish model-specific answer quality. hf2q does
+not link to or invoke r2c—the r2c schemas are revision-bound release test vectors.
 
 The structural-tag implementation covers the pinned XGrammar format-node
 vocabulary, including tokenizer-bound token terminals and the exact relaxed
@@ -929,83 +929,106 @@ Optional flags:
 
 ### GCD and GLP serving flags (`--gcd`, `--glp`)
 
-Two opt-in `hf2q serve` flags change a stock model's behavior at inference
-time without modifying a single weight. Both are off by default; plain
-`hf2q serve` is unchanged, and the flags compose.
+Grammar-Constrained Decoding (GCD) restricts which tokens the decoder may
+select. GGUF Layer Projection (GLP) changes selected activations inside the
+model. Both are opt-in controls that leave the base weights unchanged. The
+[GCD and GLP article](docs/gcd-in-hf2q.md)
+([paper PDF](docs/gcd-in-hf2q.pdf)) explains their concepts, hf2q implementation,
+and implications for local inference and agent security.
+
+Runtime qualification is still in progress. The
+[implementation review](docs/gcd-in-hf2q-review.md) records the source defects
+and validation required for these controls; loading an artifact or passing a
+logit canary does not establish behavioral quality or interoperability.
 
 ```bash
-# Forced abliteration via the grammar stack:
+# Install the embedded refusal-suppression grammar as a server default:
 hf2q serve <model> --gcd
 
-# Bind a GLP steering vector (GGUF control vector):
+# Use a JSON schema as the default instead of the prose grammar:
+hf2q serve <model> --gcd-schema ./examples/recon-opportunities.schema.json
+
+# Bind a local GLP direction artifact for the selected checkpoint:
 hf2q serve <model> --glp ./vectors/refusal-direction.gguf
 
-# Auto-discover the vector bound to this model (weightless Hub convention):
+# Attempt convention-based Hub discovery; see selection limits below:
 hf2q serve <model> --glp
 
-# Dose override, and both flags together:
+# Override the artifact's default strength:
 hf2q serve <model> --glp ./vectors/refusal-direction.gguf --glp-alpha 0.8
+
+# Combine the controls; see the grammar-selection note below:
 hf2q serve <model> --gcd --glp ./vectors/refusal-direction.gguf
 ```
 
-**`--gcd` (Grammar-Constrained Decoding)** injects an embedded GBNF grammar
-into every chat request that does not already specify one, seating the model's
-distribution on task continuations so refusal becomes locally incoherent —
-forced abliteration with no weight edits. The grammar engages at token 0 (the
-think block is disabled). The measured grammar stack is three layers: a
-character-alphabet whitelist (ASCII printable plus 14 curated symbols,
-histogram-measured at ~97% coverage of legitimate non-ASCII use), a KMP
-refusal-lexicon exclusion automaton (case-insensitive DAF compiled to
-recursive GBNF rules, over the harvested three-lineage register cores), and an
-anchor + topic sentence that forces task engagement at token 0 while leaving
-the topic span free text, so the grammar needs no per-prompt specialization.
-The same grammar, zero modification, three stock refusal-trained families:
-DeepSeek-V4-Flash **2.3%**, Qwen3.8-27B **5.1%**, Gemma-4-26B **7.2%** refusal
-on the 512-prompt adversarial half — **0.0% on the benign half** for all three
-(87.3% judge-scored actionability on DeepSeek's adversarial half; layering the
-embeddings gate drops its residual refusal to **0.59%**)
-([`scripts/grammar_probe/FINDINGS.md`](scripts/grammar_probe/FINDINGS.md)).
-`--uncensor` is a hidden alias kept for backward compatibility.
+**GCD and schemas.** `--gcd` alone installs the embedded **W6V2** GBNF grammar
+as a request default and disables the thinking block when injecting it. Its
+fixed opening, topic span, character whitelist, and lexical blacklist exclude
+specified output forms. They do not establish factual correctness, task
+completion, or the absence of every possible refusal. The hidden `--uncensor`
+alias remains available. The paper's historical **W1** study uses a different
+grammar and reports truncation, degeneration, and missing judgments alongside
+refusal rates; those results do not certify the current default.
 
-**`--glp <vector.gguf>`** binds a GLP steering vector — a GGUF control vector
-in `project` or `add` mode — to the served model and applies it per layer to
-the post-layer residual stream at inference time (`h ← h − α(h·d̂)d̂` in project
-mode); base weights are never modified. The value is a local path or a Hub
-reference; bare `--glp` (no value) asks the resolver to auto-discover a vector
-bound to the served model under the weightless Hub convention (`*-GLP-*`
-artifacts) and fails closed on ambiguity or no match. `--glp-alpha <f>` overrides the steering
-dose (default: the vector's `glp.alpha_default`, else 1.0). The reader is
-fail-closed: conformance errors — unknown mode or hook point, unsupported spec
-version, wrong width, `direction.0` — abort startup rather than degrade. A
-bound vector is logged at boot:
-`[GLP] vector bound: layers=… width=… alpha=… mode=… path=…`.
-Derive a vector on-device with `hf2q calibrate <model.gguf>` (ADR-054) — the
-forced-capture pipeline runs prefill-only over the embedded contrastive corpus,
-exports a GLP-conformant GGUF, and proves it with a fail-closed canary pair
-(zero-dose logit-identical, live-dose shift) before the file is called
-calibrated. DeepSeek-V4 in v1.
+`--gcd-schema` compiles hf2q's supported JSON Schema subset into a default
+grammar at startup and conflicts with `--gcd`. It constrains object structure
+and supported field values. Free-text strings can still contain refusal or
+incorrect content; `minLength` does not prevent either. See the
+[recon object example](examples/recon-opportunities.schema.json) and the
+paper's schema discussion. These server defaults are convenience controls,
+not authenticated authorization policies. Tool grammars take precedence over
+response grammars. Current default injection checks `grammar` and
+`response_format`, but can conflict with explicit `json_schema` or
+`structured_outputs`; the review records this defect.
 
-**`--gcd-schema <schema.json>`** swaps the W1 prose grammar for a compiled
-JSON schema (ADR-057) — pipeline arm: typed output objects leave no structural
-slot for refusal prose. Compiled to GBNF at startup (fail-closed on invalid
-schema); an example red-team object shape with per-field design rationale is
-at [`examples/recon-opportunities.schema.json`](examples/recon-opportunities.schema.json).
+**GLP artifacts and application.** A GLP file distributes steering directions
+and application metadata separately from the base checkpoint, avoiding another
+full copy of modified weights. It modifies activations at inference time; it
+is not an arbitrary binary weight diff. The format distinguishes additive
+steering from projective steering (`h ← h − α(h·d̂)d̂` for a unit direction).
+Compatibility depends on the checkpoint, graph layers, activation site, mode,
+and strength. The inspected application paths are Qwen 3.5/3.6/3.8 and
+DeepSeek-V4; their hook, mode, and execution-path conformance findings remain
+open in the review.
 
-The serving-stack rule is **reject what you cannot honor**: with a constraint
-attached, unknown request parameters return HTTP 400, and hf2q has no
-beam-search surface, so the vLLM `use_beam_search` FATAL class (a silently
-dropped constraint) does not exist here. The serving surface is specified in
-[`docs/adr/ADR-053-glp-gcd-serving.md`](docs/adr/ADR-053-glp-gcd-serving.md),
-the alphabet presets in
-[`docs/adr/ADR-055-grammar-alphabet-presets.md`](docs/adr/ADR-055-grammar-alphabet-presets.md),
-and the 26-cell serving conformance battery in
-[`docs/adr/ADR-056-gcd-serving-conformance-battery.md`](docs/adr/ADR-056-gcd-serving-conformance-battery.md).
+`--glp <file.gguf>` loads a local artifact. Bare `--glp` attempts
+convention-based Hub discovery; it does not currently establish unique
+artifact selection or exact checkpoint compatibility. Use an explicitly
+verified local artifact. `--glp-alpha` overrides the artifact's
+`glp.alpha_default`, falling back to 1.0 when that metadata is absent.
+Strength needs validation for the actual checkpoint and application site.
+Reset inference state when comparing steered and unsteered computation,
+since existing KV or recurrent state can retain earlier steering effects.
 
-Attribution:
+**Combining the controls.** In the reviewed implementation, `--gcd --glp`
+selects a different default grammar from `--gcd` alone, including at zero
+steering strength. Do not interpret that comparison as changing only GLP.
+Controlled measurements must hold the actual grammar, model, prompts,
+sampling settings, and budget fixed. Default composition is one of the
+implementation findings awaiting correction.
 
-- GCD concept (both faces — tool-call authorization and forced abliteration): **Vince Ovando** (vince@cybersharkconsulting.com), https://tantalus.io/
-- GLP / weightless control vectors: **Matt Suiche** (m@msuiche.com), https://github.com/msuiche/weightless
-- hf2q is the first inference-engine-native implementation.
+**Calibration.** `hf2q calibrate <model.gguf>` currently uses DeepSeek-V4 and
+exports a normalized harmful-versus-harmless prompt direction. It also probes
+pinned response prefixes and runs zero-dose and live-dose logit canaries.
+These are candidate derivation and plumbing checks; held-out behavioral and
+capability validation is separate, and the review identifies export metadata
+and layer-mapping defects to resolve.
+
+The corresponding `hf2q chat` flags configure a server that chat starts;
+they do not reconfigure an existing endpoint selected with `--url` or discovery.
+The serving decisions and current validation status are recorded in
+[ADR-053](docs/adr/ADR-053-glp-gcd-serving.md),
+[ADR-054](docs/adr/ADR-054-glp-runtime-calibration.md),
+[ADR-055](docs/adr/ADR-055-grammar-alphabet-presets.md),
+[ADR-056](docs/adr/ADR-056-gcd-serving-conformance-battery.md), and
+[ADR-057](docs/adr/ADR-057-gcd-schema-arm.md).
+The conformance battery is partially implemented; a planned cell inventory
+is not a completed validation result.
+
+Vince Ovando contributed the generation-time authorization framing and GCD
+collaboration. Matt Suiche contributed GLP and
+[weightless](https://weightless.msuiche.com/). The paper cites the earlier GCD
+and activation-steering research on which these concepts build.
 
 ## Architecture
 
@@ -1153,9 +1176,13 @@ catalog + smoke prompt before any forward-pass code lands.
 - `docs/adr/ADR-040-continuous-batching-reopen.md` — full-context slot scheduling.
 - `docs/adr/ADR-053-glp-gcd-serving.md` — GLP runtime steering and the `--gcd`
   serving surface (attribution, decision, shipping gates).
+- [GCD and GLP article](docs/gcd-in-hf2q.md) — concepts, hf2q implementation,
+  historical evidence, and implications; [paper PDF](docs/gcd-in-hf2q.pdf).
+- [GCD and GLP implementation review](docs/gcd-in-hf2q-review.md) — source
+  findings and evidence required before publication.
 - `docs/adr/ADR-055-grammar-alphabet-presets.md` — grammar alphabet channel presets.
-- `docs/adr/ADR-056-gcd-serving-conformance-battery.md` — the 26-cell GCD
-  serving-stack conformance battery.
+- `docs/adr/ADR-056-gcd-serving-conformance-battery.md` — the partially
+  implemented GCD serving-stack conformance battery.
 - `docs/ADR-*.md` — architectural decisions, rationale, failed spikes, and verification status.
 
 ## License
