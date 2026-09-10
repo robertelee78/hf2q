@@ -49,20 +49,24 @@ def aggregate(source_root=ROOT, review_commit=None):
 
     def source(relative):
         path = source_root / relative
+        revision = review_commit or "HEAD"
+        tracked = subprocess.run(
+            ["git", "cat-file", "-e", f"{revision}:{relative}"], cwd=source_root,
+            capture_output=True, check=False,
+        ).returncode == 0
+        data = (subprocess.check_output(
+            ["git", "show", f"{revision}:{relative}"], cwd=source_root,
+        ) if tracked else path.read_bytes())
+        # Observation rows are read below from local files. Verify them against
+        # their pinned versions; source-only inputs are hashed from Git so a
+        # later repair cannot be mislabeled as historical code.
+        if tracked and relative.endswith(".jsonl") and path.read_bytes() != data:
+            raise ValueError(f"Observation differs from review commit: {relative}")
         sources[relative] = {
-            "sha256": digest(path),
-            "bytes": path.stat().st_size,
-            "tracked_at_review": subprocess.run(
-                ["git", "ls-files", "--error-unmatch", relative], cwd=source_root,
-                capture_output=True, check=False,
-            ).returncode == 0,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
+            "tracked_at_review": tracked,
         }
-        if review_commit and sources[relative]["tracked_at_review"]:
-            pinned = subprocess.check_output(
-                ["git", "show", f"{review_commit}:{relative}"], cwd=source_root,
-            )
-            if hashlib.sha256(pinned).hexdigest() != sources[relative]["sha256"]:
-                raise ValueError(f"Source differs from review commit: {relative}")
         return path
 
     studies = []
@@ -179,8 +183,8 @@ def aggregate(source_root=ROOT, review_commit=None):
                     "held_true": sum(r.get("held") is True for r in battery),
                     "engaged_true": sum(r.get("engaged") is True for r in battery),
                     "engaged_false": sum(r.get("engaged") is False for r in battery)},
-        "embedded_matches_w6v2": (source_root / "src/serve/api/grammar/gcd_w1.gbnf").read_bytes()
-            == (source_root / "scripts/grammar_probe/w6v2.gbnf").read_bytes(),
+        "embedded_matches_w6v2": sources["src/serve/api/grammar/gcd_w1.gbnf"]["sha256"]
+            == sources["scripts/grammar_probe/w6v2.gbnf"]["sha256"],
     }
 
 

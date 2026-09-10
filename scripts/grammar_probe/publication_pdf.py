@@ -136,10 +136,11 @@ def prepare(document):
             table = blocks[index + 1]
             number = int(re.match(r"Table (\d+)", words(block)).group(1))
             widths = {1: [.2, .4, .4], 2: [.25, .35, .4],
-                      3: [.24, .34, .42], 4: [.22, .25, .13, .27, .13]}[number]
+                      3: [.24, .34, .42], 4: [.22, .25, .13, .27, .13],
+                      5: [.18, .28, .25, .29]}[number]
             for column, width in zip(table["c"][2], widths, strict=True):
                 column[1] = {"t": "ColWidth", "c": width}
-            wide = "true" if number in {3, 4} else "false"
+            wide = "true" if number in {3, 4, 5} else "false"
             result.extend([raw("#paper-table(["), table, raw("], ["),
                            caption(block), raw(f"], wide: {wide})")])
             index += 2

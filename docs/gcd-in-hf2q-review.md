@@ -8,11 +8,11 @@ behavioral capability as interchangeable. The revision separates them and
 replaces the original figures with source-grounded diagrams and reproducible
 charts.
 
-Publication remains conditional on resolving the implementation findings below
-and incorporating their validation evidence. The article should not become a
-bug report, but its publication cannot certify behavior that the implementation
-does not provide. Correcting code also does not retrospectively validate the
-historical campaign.
+The article now incorporates the later implementation repairs and recorded
+measurements with explicit scope. Remaining implementation and evaluation
+findings are tracked here rather than expanded into the article's narrative.
+Correcting code does not retrospectively validate historical measurements or
+establish untested authorization paths.
 
 This review covers the complete original prose, all three embedded figures,
 the additional `gcd-gate.png` asset, the plotting code, historical measurement
@@ -21,6 +21,150 @@ records, and relevant Rust/Metal source. The initial source snapshot is
 `44004311717d414feaa54384578e2bcf4d140464`. The audited implementation files
 were unchanged between these commits. No runtime code was changed by the
 publication review.
+
+## Final pass: updated implementation and evidence
+
+This pass inspects `294907cd655ee81eedb8d8b9ea30ab80ade483bb`. The article now
+uses that snapshot for its implementation account, while the historical W1
+manifest remains bound to the earlier audit. The separate
+[follow-up manifest](figures/gcd/followup-evidence.json) reproduces the new
+aggregate claims without publishing raw prompt or response text.
+
+### Repairs credited
+
+| Findings | Current source-review status |
+|---|---|
+| S1–S3, S5–S7, S9–S16 | Addressed in source: launch geometry, greedy steering, explicit hooks/modes, cache identity, input validation, metadata and graph-layer mapping, and default-grammar composition. This does not substitute for every requested serving/hardware proof. |
+| S4 | Derivation and apply-site metadata corrected. The site-transferred candidate was evaluated, with no observed refusal reduction on the tested panel. It remains a candidate, not a validated behavioral direction. |
+| S8 | Hook, shape, and layer binding improved. Exact checkpoint identity is still an operator responsibility; a model-name warning does not establish artifact compatibility. |
+| S17–S18 | Explicit remote-reference resolution and ambiguous automatic discovery remain open. |
+| E1 | Final battery attempt passes 17 named checks; earlier attempts and incomplete run identity remain visible. This does not close the whole conformance inventory. |
+| E7 | Configurable generation budgets and manifests implemented; downstream joins still collapse budget cells (E12). No replacement paired full-corpus experiment was found. |
+| E8–E9 | Complete judge input and cross-field validation implemented and mock-tested. Historical labels are unchanged; no completed v2 rejudging artifacts were found. |
+| E10 | Failed-attempt retries implemented; resume and identity gaps remain (E13). |
+| E11 | The paired metric-key crash is repaired and prompt-clustered bootstrap implemented. Reporting still needs E12. |
+
+All 13 supplied offline/mock tests pass. Additional in-memory probes reproduce
+budget collapse, acceptance of a mismatched response hash, ignored scoring-pass
+selection, and shortening of the human-review input. No models were loaded or
+Rust/Metal builds run by the publication reviewers.
+
+### Interpretation of the new records
+
+The three `*.truncation-report.json` artifacts are cross-tabs of unchanged
+historical judgments. DeepSeek's 823 capped responses include 733 old
+`valid_fulfillment` labels, 85 degenerate labels, and five other labels.
+Nineteen of those 733 also carry an invalid-output flag. Neither 733 nor the
+714 with aligned fields is a new full-response validity measurement.
+
+The GLP panel has 240 matched generation/verdict records: unsteered baseline
+and four strengths, with 32 adversarial and 16 benign prompts per arm.
+Maintained refusals are 28, 28, 28, 29, and 29 of 32. Benign fulfillment labels
+are 4, 3, 3, 2, and 3 of 16, while 14–15 benign responses per arm exhaust the
+256-token budget. The paper reports no observed refusal reduction and does
+not adopt the summary's stronger claims of preserved capability, behavioral
+inertness, failed site transfer as an identified cause, or no latency cost.
+Six panel texts overlap the calibration corpus. The reflection at alpha two
+is a mathematical fact, not a causal explanation established by these counts.
+
+The battery file contains four consecutive 17-cell attempts. The final
+attempt, rows 52–68, has 17 passes and no failures or skips; the preceding
+attempts have 14, 15, and 16 passes. Final bias cells record tokenizer-resolved
+ID 279 and nonempty bias maps. Most cells explicitly attach W1, and the runner
+trusts the operator-supplied control endpoint. The pass record does not prove
+that endpoint is unsteered or uses a matching model, nor bind the run to the
+current binary, grammar, model, and request identities.
+
+### S19. Locked-schema injection is mistaken for a caller override — P1
+
+The [handler](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/src/serve/api/handlers.rs#L547)
+injects the server schema into `request.grammar`, then checks for an explicit
+constraint override. An ordinary request with `--gcd-schema-locked` is rejected
+by that check. The positive helper test uses the opposite order and misses the
+actual request-preparation sequence.
+
+**Required proof:** check caller overrides before injection and exercise the
+actual handler sequence. An ordinary request must reach constrained generation;
+caller overrides must be rejected before generation.
+
+### S20. Locked-schema policy does not cover required/named tool paths — P1
+
+[Request compilation](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/src/serve/api/grammar/request.rs#L815)
+discards the response constraint for required or named tools, and the
+[selection path](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/src/serve/api/handlers.rs#L4672)
+prioritizes tool grammar. Correcting S19 alone does not make a response schema
+mandatory across these output paths.
+
+**Required proof:** reject incompatible tool requests in locked mode or define
+and enforce their policy separately, with unary and streaming tests. The paper
+retains its trusted-state and tool-precedence discussion and does not present
+the new locked mode as validated.
+
+### E12. Reporting joins lose budget, content, and scoring identity
+
+[report.py](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/report.py#L136)
+keys observations by arm, prompt, and repetition, omitting budget/run identity.
+Two budget cells collapse to one, and a verdict with a mismatched response hash
+is accepted. The documented `PASS` selector is ignored in favor of the most
+frequent configuration. Known termination is counted only for judged responses;
+generation errors are excluded before reporting.
+
+**Required proof:** preserve all experiment dimensions, reject ambiguous or
+mismatched joins, honor explicit pass selection, and compute generation facts
+from the complete generation inventory independently of judgment availability.
+Use deterministic fixtures for each failure, including errors and missing labels.
+
+### E13. Resume records do not bind the complete judgment input
+
+The [judgment key](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/judge.py#L293)
+omits prompt text, termination metadata, budget, and generation-run identity;
+judge identity is a model alias. The [rejudge path](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/rejudge.py#L237)
+does not compare resumed inputs/configuration with the existing manifest.
+Transition helpers also omit arm/pass identity.
+
+**Required proof:** bind complete judgment inputs and available artifact
+identities, validate the existing manifest on resume, and reject incompatible
+or ambiguous passes. Unknown historical identities must remain unknown.
+
+### E14. The proposed human-review export still shortens responses
+
+The [human sample](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/rejudge.py#L129)
+contains only the first 1,200 characters and displays candidate verdicts.
+Randomizing pass names does not make this independent full-response labeling.
+A distinguishing response tail was absent in the reproduced fixture.
+
+**Required proof:** provide full responses and obtain independent labels before
+showing machine judgments. Separate a corpus-representative validation sample
+from a disagreement-enriched diagnostic sample and report their selection rules.
+
+### E15. Configuration manifests are not complete runtime bindings
+
+The [baseline manifest](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/baseline_run.py#L132)
+uses a model alias, optional operator-declared server identity, and a template
+label. Its canary detects the W1 opening but cannot establish absence of every
+grammar or GLP intervention. The GLP panel adds useful artifact hashes, but
+still lacks a binary-to-source binding and exact judge artifact identity.
+
+**Required proof:** record and verify the effective configuration and exact
+artifacts at the runtime boundary. Do not infer an unsteered baseline from
+one response shape or relabel present-day hashes as historical provenance.
+
+### Remaining handoff before replacing measurements
+
+Repair S19–S20 in the runtime lane and E12–E15 in the harness lane. Then use
+versioned full-response rejudging and independent human validation to reassess
+retained responses. Run fresh matched baseline/W1 and GLP comparisons only
+after their runtime paths and observation identities are validated. Preserve
+all historical attempts; measure quality and missingness without targeting a
+preferred refusal rate. The article's scoped claims can be reviewed now, but
+these outstanding paths must not be presented as publication-validated features.
+
+## Original audit findings (historical source snapshot)
+
+The original S1–S18 and E1–E11 findings below refer to source snapshot
+`44004311717d414feaa54384578e2bcf4d140464`. Consult the status table above before
+treating a past defect as still present. Source links in this historical
+section are pinned to that revision where the referenced file was tracked.
 
 ## Source defects for the implementation owner
 
@@ -32,8 +176,8 @@ as reproduced unless explicitly stated.
 
 ### S1. Qwen GLP projection uses an incompatible threadgroup size — P1
 
-The [Qwen dispatcher](../src/inference/glp/apply_gpu.rs#L145) uses hidden width
-`h` as the threadgroup size. The [Metal kernel](../src/inference/glp/shaders/glp_project.metal#L50)
+The [Qwen dispatcher](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/apply_gpu.rs#L145) uses hidden width
+`h` as the threadgroup size. The [Metal kernel](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/shaders/glp_project.metal#L50)
 allocates `partial[256]`, indexes it with the thread ID, and uses a fixed
 256-lane reduction. For `h > 256`, threads index outside that array if the
 launch succeeds; sufficiently large groups can exceed device limits as well.
@@ -47,9 +191,9 @@ actual hardware error or numerical corruption was not reproduced here.
 
 ### S2. Qwen greedy decode omits the GLP intervention — P1
 
-[Greedy eligibility](../src/serve/api/engine_qwen35.rs#L1228) depends on request
+[Greedy eligibility](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/engine_qwen35.rs#L1228) depends on request
 sampling parameters and has no bound-GLP exclusion. An eligible request calls
-`forward_gpu_greedy`; its [post-FFN path](../src/inference/models/qwen35/forward_gpu.rs#L7365)
+`forward_gpu_greedy`; its [post-FFN path](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/models/qwen35/forward_gpu.rs#L7365)
 finishes the layer without the GLP hook present in the separate full-logits
 path. Thus GLP can affect prefill but cease to apply during greedy decoding.
 
@@ -60,10 +204,10 @@ omission confirmed; its real-model behavioral magnitude is unmeasured.
 
 ### S3. Hook identity is discarded and incompatible sites are aliases — P1
 
-The [reader](../src/inference/glp/reader.rs#L30) accepts
+The [reader](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/reader.rs#L30) accepts
 `residual_stream_post_layer` and `ffn_out_pre_residual` as aliases, but the
 loaded `GlpVector` does not retain either identity. DeepSeek's
-[application](../src/inference/models/deepseek4/ffn_forward.rs#L565) modifies
+[application](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/models/deepseek4/ffn_forward.rs#L565) modifies
 `ffn_output` before the hyper-connection fold. Qwen modifies the complete
 post-layer residual. These operations do not become equivalent because both
 accept the same metadata string.
@@ -75,9 +219,9 @@ use the current declared contract, not an older prose description.
 
 ### S4. Calibration misdescribes derivation versus application — P1
 
-[Calibration](../src/calibrate/mod.rs#L195) derives its exported direction
+[Calibration](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/calibrate/mod.rs#L195) derives its exported direction
 from stream 0 of the complete post-layer hyper-connection capture, then
-[describes](../src/calibrate/mod.rs#L335) both the derivation and apply hook as
+[describes](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/calibrate/mod.rs#L335) both the derivation and apply hook as
 post-layer residual. Actual DeepSeek application is at the FFN writer before
 the fold.
 
@@ -101,7 +245,7 @@ Do not “fix” this by relabeling old artifacts as if they were derived elsewh
 
 The reader accepts `add`, and absent `glp.mode` defaults to additive semantics.
 DeepSeek nevertheless calls the projection-only
-[`apply_layer_gpu_in_session`](../src/inference/models/deepseek4/ffn_forward.rs#L586)
+[`apply_layer_gpu_in_session`](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/models/deepseek4/ffn_forward.rs#L586)
 without passing the operation mode. An additive artifact is silently interpreted
 as a projection.
 
@@ -111,7 +255,7 @@ A file-format parser test alone does not exercise this failure.
 
 ### S6. Qwen persistent prefix-cache identity omits GLP — P1
 
-[`build_lcp_key_for_qwen35`](../src/serve/api/engine_qwen35.rs#L1609) constructs
+[`build_lcp_key_for_qwen35`](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/engine_qwen35.rs#L1609) constructs
 identity from base-model provenance and template and sets `params_hash=0`.
 It omits steering content, hook, mode, layer mapping, and strength. The disk
 sidecar uses that identity. Restarting with the same base model and cache
@@ -125,10 +269,10 @@ collision is source-confirmed; resulting real-model divergence was not measured.
 
 ### S7. GCD default injection conflicts with explicit request surfaces — P1
 
-The [handler's default-injection checks](../src/serve/api/handlers.rs#L473)
+The [handler's default-injection checks](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/handlers.rs#L473)
 look only for `grammar` and `response_format`. They ignore supported
 `json_schema` and `structured_outputs` surfaces. The
-[request compiler](../src/serve/api/grammar/request.rs#L724) subsequently rejects
+[request compiler](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/grammar/request.rs#L724) subsequently rejects
 the resulting simultaneous constraints. A supported explicit request can
 become HTTP 400 merely because the server has a GCD default.
 
@@ -151,21 +295,21 @@ unsupported hook/mode combinations, and incompatible model bindings before
 serving. Document any deliberate compatibility relaxation. Loading a file
 successfully is not proof that its intervention executes.
 
-Sources: [Qwen loader](../src/serve/api/engine_qwen35.rs#L365),
-[DeepSeek loader](../src/serve/api/engine_deepseek4.rs#L746), and
-[device binding](../src/inference/glp/bind.rs).
+Sources: [Qwen loader](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/engine_qwen35.rs#L365),
+[DeepSeek loader](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/engine_deepseek4.rs#L746), and
+[device binding](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/bind.rs).
 
-The [discovery provenance check](../src/inference/glp/discovery.rs#L265)
+The [discovery provenance check](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/discovery.rs#L265)
 also compares only a nonempty base-model name, permits absent names, and
 does not compare the checkpoint revision or model bytes. Automatic discovery
 therefore does not repair the missing checkpoint binding.
 
 ### S9. Additive vector magnitude changes during binding — P2
 
-[`BoundGlp::bind`](../src/inference/glp/bind.rs#L37) normalizes directions for
+[`BoundGlp::bind`](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/bind.rs#L37) normalizes directions for
 both modes. The Qwen additive path consequently receives a unit vector,
 implementing `h + alpha * v / norm(v)` rather than the additive arithmetic
-`h + alpha * v` in the [CPU reference](../src/inference/glp/apply.rs#L41).
+`h + alpha * v` in the [CPU reference](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/apply.rs#L41).
 
 **Required proof:** preserve additive magnitude; normalize only where the
 operation requires it. Test a non-unit vector through binding and GPU
@@ -179,11 +323,11 @@ into NaNs. This can contaminate the model computation.
 
 **Required proof:** reject non-finite elements, invalid norms, and invalid
 arithmetic before GPU upload. Test NaN, positive/negative infinity, zero, and
-large finite directions. Source: [binding](../src/inference/glp/bind.rs#L46).
+large finite directions. Source: [binding](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/bind.rs#L46).
 
 ### S11. Malformed GLP dimensions and offsets use unchecked arithmetic — P2
 
-The [reader](../src/inference/glp/reader.rs#L364) multiplies a file-controlled
+The [reader](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/reader.rs#L364) multiplies a file-controlled
 width by four before checking its size budget, then adds offsets without
 checked arithmetic. Overflow can panic in a checked build; wrapping can defeat
 intended bounds checks or produce a later invalid slice in an unchecked build.
@@ -194,7 +338,7 @@ unsafe validation arithmetic, not a demonstrated memory-execution exploit.
 
 ### S12. Combining GCD and GLP silently changes the grammar — P1
 
-At [handler injection](../src/serve/api/handlers.rs#L477), a bound GLP path
+At [handler injection](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/handlers.rs#L477), a bound GLP path
 selects a think/anchor/free-body grammar instead of embedded W6V2, even at
 zero dose. The handler also forces `hf2q_enable_thinking=false`.
 
@@ -208,7 +352,7 @@ being varied.
 
 The currently unused mHC helpers pass `rows * hc` as a thread count to
 `encode_with_args`, which uses Metal `dispatch_threads`. The
-[shader](../src/inference/glp/shaders/glp_project_mhc.metal#L29) interprets the
+[shader](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/shaders/glp_project_mhc.metal#L29) interprets the
 threadgroup ID as one row/stream and reduces 256 lanes. For one row and four
 streams, the helper launches four threads, not four full groups. This leaves
 reduction entries unwritten and does not cover every stream.
@@ -220,19 +364,19 @@ stream. Different direction norms therefore receive incorrect scaling.
 normalization, and GPU comparisons across rows and streams. These helpers
 have no current production callsites; do not characterize this finding as an
 observed defect in the active DeepSeek FFN path. Sources:
-[dispatch](../src/inference/glp/apply_gpu.rs#L191) and
-[normalization use](../src/inference/glp/shaders/glp_project_mhc.metal#L54).
+[dispatch](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/apply_gpu.rs#L191) and
+[normalization use](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/shaders/glp_project_mhc.metal#L54).
 
 ### S14. External GLP directions are applied one graph layer early — P1
 
 The public [GLP reader contract](https://github.com/msuiche/weightless/blob/main/spec/GLP.md#reader-conformance)
 requires `direction.N` to apply at actual zero-based graph layer `N`, with
-`direction.0` rejected. Both [DeepSeek](../src/inference/models/deepseek4/ffn_forward.rs#L567)
-and [Qwen](../src/inference/models/qwen35/forward_gpu.rs#L5691) instead look up
+`direction.0` rejected. Both [DeepSeek](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/models/deepseek4/ffn_forward.rs#L567)
+and [Qwen](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/models/qwen35/forward_gpu.rs#L5691) instead look up
 the current graph index plus one. An external `direction.N` therefore steers
 graph layer `N-1`.
 
-The [calibration exporter](../src/calibrate/mod.rs#L370) adds the matching
+The [calibration exporter](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/calibrate/mod.rs#L370) adds the matching
 offset. Its self-export/import path can consequently pass a canary while
 interchanging directions incorrectly with another conforming runtime.
 
@@ -244,7 +388,7 @@ mapping mismatch is source-confirmed; no real-model probe was run here.
 
 ### S15. Calibration writes the wrong derivation metadata key — P2
 
-The [exporter](../src/calibrate/mod.rs#L342) writes `glp.derive_at`; the public
+The [exporter](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/calibrate/mod.rs#L342) writes `glp.derive_at`; the public
 [GLP specification](https://github.com/msuiche/weightless/blob/main/spec/GLP.md)
 defines `glp.derived_at`. A conforming consumer can ignore the unknown key and
 interpret the absent recognized field as derivation at the apply hook. This
@@ -256,7 +400,7 @@ including a deliberate derivation/apply mismatch.
 
 ### S16. Exported layer-list metadata has the wrong type — P2
 
-The [exporter](../src/calibrate/mod.rs#L361) writes
+The [exporter](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/calibrate/mod.rs#L361) writes
 `glp.layer_ids_zero_based` as `Bool(false)`. The public
 [GLP specification](https://github.com/msuiche/weightless/blob/main/spec/GLP.md)
 defines a comma-separated string of actual graph layer IDs, redundant with
@@ -268,12 +412,12 @@ external-format conformance check rather than relying solely on hf2q's reader.
 
 ### S17. Explicit GLP Hub references are treated as local paths — P2
 
-The [CLI documentation](../src/cli.rs#L1336) advertises a local path or Hub
-reference. [Startup resolution](../src/serve/mod.rs#L4997) handles only the
+The [CLI documentation](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/cli.rs#L1336) advertises a local path or Hub
+reference. [Startup resolution](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/mod.rs#L4997) handles only the
 `auto` sentinel specially and passes every other value through as a path.
-The [Qwen](../src/serve/api/engine_qwen35.rs#L368) and
-[DeepSeek](../src/serve/api/engine_deepseek4.rs#L748) loaders call
-[`GlpVector::load`](../src/inference/glp/reader.rs#L245), which reads the local
+The [Qwen](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/engine_qwen35.rs#L368) and
+[DeepSeek](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/api/engine_deepseek4.rs#L748) loaders call
+[`GlpVector::load`](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/reader.rs#L245), which reads the local
 filesystem. Supplying an explicit remote reference therefore does not invoke
 the advertised retrieval path. The README now describes local paths accurately.
 
@@ -284,9 +428,9 @@ retrieval. Model inference is not needed to verify artifact resolution.
 
 ### S18. Automatic GLP discovery does not reject ambiguous matches — P2
 
-[Repository candidates](../src/inference/glp/discovery.rs#L151) are tried in
-order; discovery [returns the first accepted candidate](../src/inference/glp/discovery.rs#L226).
-Within a repository, [file selection](../src/inference/glp/discovery.rs#L253)
+[Repository candidates](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/discovery.rs#L151) are tried in
+order; discovery [returns the first accepted candidate](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/discovery.rs#L226).
+Within a repository, [file selection](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/inference/glp/discovery.rs#L253)
 uses the first `.gguf` sibling. Neither step establishes that the eligible
 artifact is unique. Selection can depend on inventory order, contrary to the
 former README's claim that ambiguity is rejected.
@@ -423,7 +567,7 @@ confirmation of general performance.
 
 ### E7. Fixed generation budgets dominate termination, without a matched baseline
 
-[`spike_run.py`](../scripts/grammar_probe/spike_run.py#L48) requests 800
+[`spike_run.py`](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/spike_run.py#L48) requests 800
 completion tokens, greedy sampling, no system prompt, and disabled thinking.
 Every recorded `finish: length` observation has exactly 800 completion tokens;
 all 3,072 observations have zero reasoning characters.
@@ -443,7 +587,7 @@ extend repetition; this audit does not establish which would occur.
 The retained W1 runs contain one arm and one repetition. No `Arm A` record
 was found in the inspected `*results*.jsonl` inventory. Older spike results
 do not supply a matched full-corpus control. The
-[W1 grammar](../scripts/grammar_probe/w1.gbnf#L5) permits its body to terminate;
+[W1 grammar](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/w1.gbnf#L5) permits its body to terminate;
 the observed caps therefore do not establish a grammar bug that forbids EOS.
 
 **Required proof:** run a paired baseline/W1 study with fixed source and model
@@ -452,7 +596,7 @@ ladder and report termination separately from substance and degeneration.
 
 ### E8. Judge-side clipping contaminates quality labels
 
-[`judge.py`](../scripts/grammar_probe/judge.py#L94) clips responses to their
+[`judge.py`](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/judge.py#L94) clips responses to their
 first 2,500 characters and appends `[...truncated for judging]`. It does not
 pass generation finish reason or usage metadata, although the rubric asks
 the judge to assess truncation, degeneration, and refusal that can appear
@@ -472,7 +616,7 @@ Preserve old judgments and identify the new scoring pass explicitly.
 
 ### E9. Fulfillment state and output validity contradict each other
 
-The [judge validator](../scripts/grammar_probe/judge.py#L125) requires a
+The [judge validator](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/judge.py#L125) requires a
 minimum substance score for fulfillment but does not require valid output.
 The records contain both `response_state: valid_fulfillment` and
 `output_validity: invalid` in 20 DeepSeek responses (9 adversarial, 11 benign),
@@ -495,7 +639,7 @@ preventing diagnosis of the server cause. Qwen's ten failures record a
 cross-field invariant violation: fulfillment with insufficient substance.
 These are known scoring failures, not missing generations.
 
-The [resume logic](../scripts/grammar_probe/judge.py#L138) adds failed attempts
+The [resume logic](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/judge.py#L138) adds failed attempts
 to its completed-key set. A normal rerun skips them.
 
 **Required proof:** preserve each failed attempt and its error details, but
@@ -504,7 +648,7 @@ visible in published denominators until a valid replacement judgment exists.
 
 ### E11. The paired-report path crashes and omits promised intervals
 
-[`report.py`](../scripts/grammar_probe/report.py#L80) indexes derived metric
+[`report.py`](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/report.py#L80) indexes derived metric
 names such as `refusal` on raw verdict dictionaries. A two-arm in-memory
 fixture reproduced `KeyError: 'refusal'`. The report also lacks the bootstrap
 intervals promised by the methodology, and its fulfillment metric omits

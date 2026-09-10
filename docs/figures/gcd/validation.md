@@ -1,118 +1,125 @@
 # Publication artifact validation
 
-Validated September 10, 2026. These checks cover the article, source review,
-historical-data arithmetic, and rendering. They do not certify the runtime
-findings as fixed or establish publication readiness.
+Final editorial pass: September 10, 2026. This record covers the article,
+figures, source review, archived measurements, and rendering. It does not
+certify unresolved runtime or measurement paths as validated.
 
 ## Source and evidence
 
-- The article and aggregate snapshot identify hf2q source commit
-  `44004311717d414feaa54384578e2bcf4d140464`.
-- An earlier prose/source inspection used
-  `bdb632ff406b9c7d77fa315d7b507351b1bee9cd`. The audited Rust/Metal files,
-  schemas, and grammar inputs are unchanged between these commits.
-- All 30 input-file hashes in `evidence.json` matched the inspected files.
-- A fresh offline extraction to a separate temporary JSON reproduced the
-  snapshot exactly, including counts, source hashes, and provenance fields.
-- The extractor joined 3,072 generation records to corresponding judge and
-  embedding-screen records, rejecting duplicate or mismatched observation
-  keys. All six model/stratum panels contain 512 observations.
-- All 29 outcome rows in the CSV match the JSON and workbook. Every panel's
-  outcome counts and termination counts separately sum to 512. Workbook
-  fractions use the recorded numerator and denominator; unjudged records
-  remain visible. Termination and judgment categories are not added together.
-- The twelve entry probabilities reproduce a mean of 99.9744%, displayed as
-  99.97% in the prose and figure. The
-  sixteen-point trace retains exact selected-token spellings and probabilities.
-- The embedded grammar is byte-identical to W6V2 and differs from historical W1.
+- The current implementation account is bound to
+  `294907cd655ee81eedb8d8b9ea30ab80ade483bb`. Current source references use that
+  revision; historical judge/probe references retain their original snapshot.
+- `evidence.json` remains byte-identical to the prior historical audit. Its
+  source snapshot is `44004311717d414feaa54384578e2bcf4d140464` and its 30 input
+  hashes and 3,072 observations are unchanged.
+- Fresh extraction reproduces that historical JSON exactly after reading
+  source-only inputs from the pinned Git revision. Local tracked observation
+  files must match that revision; later source repairs are not mislabeled as
+  historical code.
+- `followup-evidence.json` separately hashes 59 inputs and recomputes all
+  three historical termination/state/validity cross-tabs, 240 later GLP
+  generation/verdict pairs, calibration-text overlap, and battery attempts.
+  A second extraction reproduces this JSON exactly.
+- DeepSeek's 823 historical capped responses comprise 733 fulfillment labels,
+  85 degenerate labels, and five other labels; 19 of those 733 fulfillment
+  labels also carry an invalid-output flag. The paper does not present these
+  cross-tabs as a new judging pass.
+- The five GLP arms reproduce adversarial maintained-refusal counts of
+  28, 28, 28, 29, and 29 of 32. Benign fulfillment labels are 4, 3, 3, 2, and
+  3 of 16; benign token-limit terminations are 14, 15, 14, 15, and 15.
+  Six panel texts overlap the calibration corpus. All 240 responses fit
+  below that run's 2,500-character judge-input limit.
+- The battery contains 68 rows in four 17-cell attempts, with 14, 15, 16,
+  and 17 passes respectively. The final attempt has no failures or skips.
+  Its incomplete run identity and narrow assertions remain explicit.
+- All 29 historical CSV outcome rows remain unchanged. The workbook has
+  12 sheets, including separate GLP counts/transitions, termination cross-tabs,
+  battery attempts, and follow-up source hashes. GLP count and termination
+  cells were checked against the JSON, independently of prose tables.
 
-## Prose and rendering
+## Implementation and measurement review
 
-- The case-study opening describes the recorded grammar-conditioned responses
-  without claiming an isolated causal effect.
-- Both independent concept and source reviews were incorporated. The source
-  reviewer confirmed S1–S18 and their distinctions between active defects,
-  latent helpers, intended boundaries, and unmeasured hardware consequences.
-- The forensic harness review added E7–E11: the 800-token budget, judge-side
-  clipping, inconsistent validity fields, non-retried failed judgments, and
-  the broken paired-report path. Aggregate judging-audit fields and the
-  workbook preserve those findings without rewriting historical labels.
-- A Draft 7 JSON Schema validator accepted a recon object with refusal text in
-  every required string field of the exact checked-in example. This tests the
-  prose claim about the schema language, not hf2q's compiler implementation.
-- All four SVG files parse and all four PNG files decode. The figures were
-  visually inspected individually and at their final PDF scale.
-- SVG trailing whitespace and CSV line endings were normalized for Git.
-  Parsed SVG geometry/text and CSV values were unchanged. The updated exporter
-  reproduced all four SVGs, all four PNGs, and the CSV byte-for-byte in a
-  separate temporary directory.
-- The two-column paper edition has six A4 pages, a full-width abstract, seven numbered
-  main sections, three numbered equations, four table captions, and four
-  figure captions. The expected reported rates and title/author metadata
-  remain present. All 25 citation links resolve to the references in the final
-  page's right column. All six pages and detailed views of the opening page,
-  authorization equation, and references received independent visual review
-  for clipping, gutter collisions, caption placement, and figure readability.
-- Private research is credited only in general terms. Publication text,
-  supporting artifacts, and PDF text and links were checked for private
-  repository identifiers, record filenames, and commit IDs. The judge is
-  identified as the author's prior Qwen3.6 checkpoint, with its model-card
-  link separate from the human spot-check evidence.
+Independent source, concept, and harness reviews were incorporated. The
+source review credits the landed hook/mode, graph-layer, dispatch, greedy-path,
+cache-identity, and grammar-composition repairs. It identifies the remaining
+checkpoint/discovery limitations and two new locked-schema path defects.
+
+All 13 supplied offline/mock harness tests passed; historical artifacts were
+unchanged by those tests. Additional in-memory probes reproduced reporting
+budget collapse, acceptance of a wrong response hash, ignored pass selection,
+and shortened human-review input. The companion review records those findings
+without changing the runtime, harness, or original measurements.
+
+The paper distinguishes repaired full-response dispatch and cross-field
+validation from a completed replacement scoring pass. It does not claim
+preserved benign capability, a causal reflection effect, exhaustive battery
+conformance, or a latency improvement from the new observations.
+
+## Prose, figures, and PDF
+
+- Seven A4 pages, with a full-width title and abstract, seven main sections,
+  three numbered equations, five captioned tables, four captioned figures,
+  and 17 references. All 31 numeric citation links target the references on
+  the final page.
+- Every page received independent visual review. The final opening,
+  implementation, GLP-result, and reference pages were also inspected after
+  the last wording changes. No material clipping, gutter collision, or
+  unreadable table/figure text was found.
+- All four SVGs parse and all PNGs decode. Figure 1 now calls an accepting
+  state structural completion; Figure 4 identifies historical judgment
+  labels. Geometry and entry-probe figures retain their prior meaning.
+- The twelve-prompt mean remains 99.97% in prose and Figure 3; exact raw
+  probabilities remain in the historical snapshot and workbook.
 - Extracted PDF text has no replacement glyphs or words outside page bounds.
-  Figure labels use vector paths and are covered by visual inspection.
-- Local Markdown file targets resolve, including the source-line references
-  in the review. This does not claim that all local evidence is public, or
-  that every external URL will remain available.
-- The README's GCD/GLP guidance was reconciled with the paper and source,
-  including artifact selection, calibration, schemas, and current composition
-  behavior. Its revised section's local links and CLI flag declarations were
-  checked without loading a model.
-- The getting-started guide's optional section now uses a benign GCD example
-  and an explicitly matched model/GLP pair. The v0.1.20 CLI source lacks these
-  flags, so the examples state the source-build prerequisite. The paper does
-  not treat the pinned-prefix contrast as behavioral evidence; issue #192
-  remains open and its public comments report the failed forced-direction
-  evaluation in the reference stack.
-- `git diff --check` and `git diff --cached --check` pass. The article PDF is marked binary in the scoped
-  documentation attributes file so Git does not mistake its long textual
-  preamble and compressed payload for a source-code diff.
+- Twenty-two local file links in the article, companion review, figure guide,
+  and getting-started guide resolve. Historical source links in the companion
+  review were pinned instead of pointing old line numbers into repaired code.
+- Private research is credited only broadly. Publication text, figure sources,
+  JSON, workbook cells, and PDF text/links were checked for private repository
+  identifiers and record filenames, and for the author's terminology preference.
+- README and getting-started guidance now describe the corrected default
+  grammar composition. Source-build and exact-checkpoint caveats remain.
+- Tracked and staged diffs pass Git whitespace checks. The PDF remains scoped
+  as binary in the documentation attributes file.
 
 ## Tools and reproduction
 
-Python 3.13.12; Matplotlib 3.11.1; openpyxl 3.1.5; jsonschema 4.26.0;
-PyMuPDF 1.28.2; Pandoc 3.11; Typst 0.15.1.
-
-From the repository root:
+Python 3.13.12; Matplotlib 3.11.1; openpyxl 3.1.5; PyMuPDF 1.28.2;
+Pandoc 3.11; Typst 0.15.1.
 
 ```bash
 python3 scripts/grammar_probe/publication_data.py \
+  --source-root /path/to/research-checkout \
   --review-commit 44004311717d414feaa54384578e2bcf4d140464 \
-  --out /tmp/gcd-recomputed.json
+  --out /tmp/gcd-historical-recomputed.json
+python3 scripts/grammar_probe/publication_followup.py \
+  --source-root /path/to/research-checkout \
+  --out /tmp/gcd-followup-recomputed.json
 python3 scripts/grammar_probe/publication_figures.py
 python3 scripts/grammar_probe/publication_pdf.py
 git diff --check
 ```
 
-The aggregation command requires the exact raw local records; figure and PDF
-rendering use the included aggregate snapshot. See [README.md](README.md) for
-file roles and dependency requirements. A new PDF render can differ in file
-hash because its creation timestamp changes.
+The extractors require the exact raw historical records. Figure and PDF
+rendering use the included snapshots and require no model or judge service.
+PDF creation timestamps can change the output hash on a later render.
 
 ## Artifact identity at validation
 
 - `docs/gcd-in-hf2q.md`
-  SHA-256: `21459bfbe3549e884bfe73d6d45a03d10c5317f2b161755783906a9f6d4e80e3`
+  SHA-256: `a5caef5464b05e2563c4cca1e2dfa509d20b66234be7ee18591e0cba5b3bfc3b`
 - `docs/gcd-in-hf2q.pdf`
-  SHA-256: `80a4f9bf15a21e90a66b365c7ce7b170ad34a4834faa56f3f57a78f9f86f4a77`
+  SHA-256: `4082a0d318876c81770cb55891cebba7a53c256dab2794407739140d6384e70b`
 - `docs/figures/gcd/evidence.json`
   SHA-256: `3eab958f32452dfb6960f9491baf0b923a7a7865377648d3f952d35e39362650`
+- `docs/figures/gcd/followup-evidence.json`
+  SHA-256: `99a0951f84e47a68ad5a142b98203264f9f86ca585d206736c7175beae1e4448`
 
 ## Remaining implementation work
 
-No runtime source was changed by this review. No Rust/Metal compilation,
-model loading, fresh generation, serving conformance, real-model cache test,
-or performance measurement was run. Those remain with the implementation
-owner, together with corrected harnesses and source-bound replacement results.
-The [publication review](../../gcd-in-hf2q-review.md) gives the exact findings
-and required evidence. Code fixes cannot remove limitations intrinsic to
-historical records.
+No Rust/Metal compilation, model load, fresh generation, live rejudging, or
+performance benchmark was run by the publication reviewers. The
+[companion review](../../gcd-in-hf2q-review.md) distinguishes source-addressed
+findings from remaining S19–S20 and E12–E15, partial checkpoint binding, and
+open discovery behavior. A completed paper revision is not proof that those
+paths are validated. The retained historical observations remain unchanged.

@@ -315,9 +315,9 @@ comes from the artifact's `glp.alpha_default`, or 1.0 when absent. A successful
 load does not prove useful steering. Connect with the same `hf2q chat --url`
 command after the server is ready.
 
-The current `--gcd --glp` combination selects a different default grammar
-from `--gcd` alone. Hold the actual grammar fixed when comparing steering,
-and reset inference state between configurations. To return to the baseline,
+`--gcd --glp` uses the same default grammar as `--gcd` alone. Hold the actual
+grammar fixed when comparing steering, and reset inference state between
+configurations. To return to the baseline,
 stop the server and rerun the command from section 2 without either flag.
 These flags configure the server; adding them to a chat client attached to
 an existing endpoint does not reconfigure it.

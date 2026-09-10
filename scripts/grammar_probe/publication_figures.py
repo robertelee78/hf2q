@@ -20,6 +20,7 @@ from openpyxl.styles import Font, PatternFill
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "docs/figures/gcd"
 DATA = json.loads((OUT / "evidence.json").read_text())
+FOLLOWUP = json.loads((OUT / "followup-evidence.json").read_text())
 INK, BLUE, GREY, RED = "#222222", "#236b8e", "#737373", "#b24a3b"
 plt.rcParams.update({
     "font.family": "DejaVu Sans", "font.size": 10,
@@ -75,7 +76,7 @@ def pipeline():
     arrow(ax, (2.55, 3.1), (3.5, 4.35), BLUE)
     arrow(ax, (7.15, 3.1), (7.15, 4.35), BLUE)
     ax.text(0.1, 1.3, "Completion", fontsize=11, weight="bold")
-    ax.text(0.1, 0.93, "Accepting state → complete output → application validation / authorization", fontsize=9)
+    ax.text(0.1, 0.93, "Accepting state → structural completion → application validation / authorization", fontsize=9)
     ax.text(0.1, 0.56, "Incomplete state or failure → error; streamed prefixes cannot be retracted", fontsize=9)
     ax.text(0.1, 0.12, "Conceptual placement. Activation sites and supported paths are model-family specific.",
             fontsize=8, color=GREY)
@@ -150,9 +151,9 @@ def entry_trace():
 def outcomes():
     fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.65), sharex=True)
     groups = [
-        ("Valid fulfillment", "#236b8e", ["valid_fulfillment"]),
+        ("Fulfillment label", "#236b8e", ["valid_fulfillment"]),
         ("Maintained refusal", "#b24a3b", ["maintained_refusal"]),
-        ("Degenerate", "#939393", ["degenerate"]),
+        ("Degenerate label", "#939393", ["degenerate"]),
         ("Other judged", "#c8c8c8", ["nonresponsive", "mixed", "partial_then_refuse", "pivot_then_fulfill"]),
         ("Unjudged", "#ffffff", ["unjudged"]),
     ]
@@ -168,7 +169,7 @@ def outcomes():
                         linewidth=0.7, hatch="////" if label == "Unjudged" else None)
                 if n >= 50:
                     ax.text(start + n / 2, i, str(n), ha="center", va="center",
-                            color="white" if label in {"Valid fulfillment", "Maintained refusal"} else INK,
+                            color="white" if label in {"Fulfillment label", "Maintained refusal"} else INK,
                             fontsize=8)
                 start += n
             assert start == 512
@@ -236,9 +237,39 @@ def workbook():
     ws.append(["Path", "SHA-256", "Bytes", "Tracked at review"])
     for path, meta in DATA["sources"].items():
         ws.append([path, meta["sha256"], meta["bytes"], meta["tracked_at_review"]])
+    ws = wb.create_sheet("Termination cross-tabs")
+    ws.append(["Model label", "Finish", "Historical state", "Historical validity", "Count"])
+    for study in FOLLOWUP["historical_cross_tabs"]:
+        for row in study["termination_state_validity"]:
+            ws.append([study["model_label"], row["finish"], row["state"], row["validity"], row["count"]])
+    ws = wb.create_sheet("GLP panel")
+    ws.append(["Arm", "Stratum", "N", "Maintained refusal", "Fulfillment label",
+               "Degenerate label", "Token limited", "Judge errors", "Request errors"])
+    for arm in FOLLOWUP["glp_panel"]["arms"]:
+        for panel in arm["panels"]:
+            counts = panel["states"]
+            ws.append([arm["arm"], panel["stratum"], panel["n"],
+                       counts.get("maintained_refusal", 0), counts.get("valid_fulfillment", 0),
+                       counts.get("degenerate", 0), panel["finish"].get("length", 0),
+                       panel["judge_errors"], panel["request_errors"]])
+    ws = wb.create_sheet("GLP paired transitions")
+    ws.append(["Arm", "Stratum", "Baseline label", "Arm label", "Count"])
+    for arm in FOLLOWUP["glp_panel"]["arms"]:
+        for panel in arm["panels"]:
+            for row in panel["transitions_from_baseline"]:
+                ws.append([arm["arm"], panel["stratum"], row["from"], row["to"], row["count"]])
+    ws = wb.create_sheet("Battery attempts")
+    ws.append(["Attempt", "Rows", "Passed", "Failed", "Skipped", "First timestamp", "Last timestamp"])
+    for row in FOLLOWUP["battery_v2"]["attempts"]:
+        ws.append([row[k] for k in ["attempt", "rows", "passed", "failed", "skipped", "first_timestamp", "last_timestamp"]])
+    ws = wb.create_sheet("Follow-up sources")
+    ws.append(["Path", "SHA-256", "Bytes", "Identity"])
+    for path, meta in FOLLOWUP["sources"].items():
+        ws.append([path, meta["sha256"], meta["bytes"], meta["identity"]])
     ws = wb.create_sheet("Read me")
-    ws.append(["Scope", "Historical aggregates; no fresh inference measurements"])
-    ws.append(["Source review commit", DATA["review_source_commit"]])
+    ws.append(["Scope", "Historical W1 aggregates and later recorded GLP/battery observations; no inference rerun by publication tools"])
+    ws.append(["Historical source review commit", DATA["review_source_commit"]])
+    ws.append(["Current source review commit", FOLLOWUP["review_source_commit"]])
     for note in DATA["provenance_limits"]:
         ws.append(["Limitation", note])
     ws.append(["Concept figures", "Generation loop and GLP projection are explanatory, not empirical"])
