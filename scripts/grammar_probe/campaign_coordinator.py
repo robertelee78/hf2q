@@ -82,9 +82,9 @@ def stop_owned(child):
             child.kill()
             child.wait(timeout=10)
 
-def stop_recorded_server(expected, timeout=60):
+def stop_recorded_server(expected, timeout=60, require_listener=True):
     require_process(expected)
-    if listener_pids(expected["port"]) != {expected["pid"]}:
+    if require_listener and listener_pids(expected["port"]) != {expected["pid"]}:
         raise ValueError("old server listener identity changed")
     os.kill(expected["pid"], signal.SIGTERM)
     deadline = time.monotonic() + timeout
@@ -92,7 +92,7 @@ def stop_recorded_server(expected, timeout=60):
         if time.monotonic() > deadline:
             raise ValueError("old server did not stop gracefully; manual review required")
         time.sleep(1)
-    if listener_pids(expected["port"]):
+    if require_listener and listener_pids(expected["port"]):
         raise ValueError("another listener replaced the old server")
 
 def source_identity(build):
@@ -110,8 +110,19 @@ class Coordinator:
         self.output.mkdir(parents=True, exist_ok=True)
         self.state = {"schema_version": 1, "phase": "starting", "completed_commands": []}
         self.judge = None
+        self.judge_server = None
         self.judge_log = None
         self.active_child = None
+
+    def remember_judge_server(self, manifest):
+        """Retain verified ownership before a crashed launcher can orphan it."""
+        pid = manifest.get("process_pid")
+        if self.judge_server:
+            if pid != self.judge_server["pid"]:
+                raise ValueError("managed judge process identity changed")
+            return
+        if pid and self.judge and descendants_include(pid, self.judge.pid):
+            self.judge_server = process_identity(pid)
 
     def status(self, phase, **fields):
         self.state.update(phase=phase, updated=time.time(), **fields)
@@ -185,6 +196,7 @@ class Coordinator:
             guard_host(owned_roots=[self.judge.pid])
             if Path(judge["manifest"]).exists():
                 manifest = json.loads(Path(judge["manifest"]).read_text())
+                self.remember_judge_server(manifest)
                 if manifest.get("state") == "running":
                     break
                 if manifest.get("state") in ("invalid", "stopped"):
@@ -194,6 +206,9 @@ class Coordinator:
             raise ValueError("managed judge did not become ready")
         if listener_pids(judge["port"]) != {manifest["process_pid"]}:
             raise ValueError("judge listener is not the managed child")
+        if self.judge_server is None:
+            raise ValueError("managed judge ancestry was not verified")
+        require_process(self.judge_server)
         self.status("judging", judge_identity_sha256=manifest["runtime_identity"]["identity_sha256"])
         env = {"BASE_URL": f"http://127.0.0.1:{judge['port']}",
                "JUDGE_RUNTIME_MANIFEST": judge["manifest"], "JUDGE_MODEL": manifest["runtime_identity"]["model_id"]}
@@ -205,19 +220,28 @@ class Coordinator:
         self.status("commands_complete")
 
     def cleanup(self):
-        stop_owned(self.active_child)
-        judge_server = None
-        if self.judge is not None:
-            manifest_path = Path(self.config["judge"]["manifest"])
-            if manifest_path.exists():
-                pid = json.loads(manifest_path.read_text()).get("process_pid")
-                if pid and descendants_include(pid, self.judge.pid):
-                    judge_server = process_identity(pid)
-        stop_owned(self.judge)
-        if judge_server and require_process(judge_server, allow_exited=True):
-            stop_recorded_server({**judge_server, "port": self.config["judge"]["port"]})
+        errors = []
+        def attempt(action):
+            try:
+                action()
+            except Exception as error:
+                errors.append(error)
+        attempt(lambda: stop_owned(self.active_child))
+        if self.judge is not None and self.judge_server is None:
+            try:
+                manifest = json.loads(Path(self.config["judge"]["manifest"]).read_text())
+                self.remember_judge_server(manifest)
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass  # Damaged diagnostics must not prevent owned-child cleanup.
+        attempt(lambda: stop_owned(self.judge))
+        def stop_remembered_server():
+            if self.judge_server and require_process(self.judge_server, allow_exited=True):
+                stop_recorded_server(self.judge_server, require_listener=False)
+        attempt(stop_remembered_server)
         if self.judge_log:
-            self.judge_log.close()
+            attempt(self.judge_log.close)
+        if errors:
+            raise RuntimeError("owned-process cleanup failed: " + "; ".join(map(str, errors))) from errors[0]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

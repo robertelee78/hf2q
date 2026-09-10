@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import campaign_coordinator as cc
 
@@ -46,6 +46,41 @@ class CampaignCoordinator(unittest.TestCase):
             self.assertIsNone(unrelated.poll())
         finally:
             cc.stop_owned(owned); cc.stop_owned(unrelated)
+
+    def test_cleanup_retains_owned_server_after_launcher_crashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "runtime.json"
+            coordinator = cc.Coordinator({"output_dir": tmp, "judge": {"manifest": str(manifest), "port": 8081}})
+            coordinator.judge = Mock(pid=123)
+            identity = {"pid": 456, "lstart": "original", "command": "owned hf2q serve"}
+            with patch.object(cc, "descendants_include", return_value=True), patch.object(cc, "process_identity", return_value=identity):
+                coordinator.remember_judge_server({"state": "running", "process_pid": 456})
+            # The launcher has exited, the server is reparented, and its diagnostic
+            # file is gone. Cleanup must use the identity verified while owned.
+            coordinator.judge.poll.return_value = 1
+            with patch.object(cc, "descendants_include", return_value=False), patch.object(cc, "process_identity", return_value=identity), patch.object(cc, "stop_owned") as stop, patch.object(cc, "stop_recorded_server") as server_stop:
+                coordinator.cleanup()
+            stop.assert_any_call(coordinator.judge)
+            server_stop.assert_called_once_with(identity, require_listener=False)
+
+    def test_damaged_manifest_never_prevents_owned_launcher_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = cc.Coordinator({"output_dir": tmp, "judge": {"manifest": str(Path(tmp) / "runtime.json"), "port": 8081}})
+            coordinator.judge = Mock(pid=123)
+            for read in ({"return_value": "broken JSON"}, {"side_effect": PermissionError("unreadable")}):
+                with self.subTest(read=read), patch.object(Path, "read_text", **read), patch.object(cc, "stop_owned") as stop:
+                    coordinator.cleanup()
+                    stop.assert_any_call(coordinator.judge)
+
+    def test_cached_server_pid_reuse_is_not_signaled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = cc.Coordinator({"output_dir": tmp})
+            coordinator.judge_server = {"pid": 456, "lstart": "original", "command": "owned hf2q serve"}
+            changed = {**coordinator.judge_server, "lstart": "replacement"}
+            with patch.object(cc, "process_identity", return_value=changed), patch.object(cc, "stop_owned"), patch.object(cc, "stop_recorded_server") as server_stop:
+                with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                    coordinator.cleanup()
+                server_stop.assert_not_called()
 
     def test_child_failure_prevents_completion_and_records_log(self):
         with tempfile.TemporaryDirectory() as tmp:
