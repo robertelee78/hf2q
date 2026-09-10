@@ -349,7 +349,7 @@ pub fn write_envelope(path: &Path, header: &EnvelopeHeader, body: &[u8]) -> io::
         .map_err(|e| io::Error::other(format!("serialize EnvelopeHeader: {e}")))?;
     let pad = (8 - (header_json.len() % 8)) % 8;
     let mut header_bytes = header_json;
-    header_bytes.extend(std::iter::repeat(b' ').take(pad));
+    header_bytes.extend(std::iter::repeat_n(b' ', pad));
 
     // Atomic publication: write to <path>.tmp.<pid>, then rename.
     let tmp_name = match path.file_name().and_then(|s| s.to_str()) {
