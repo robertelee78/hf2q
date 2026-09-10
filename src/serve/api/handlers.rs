@@ -498,6 +498,33 @@ fn apply_gcd_default_injection(
     }
 }
 
+/// ADR-057 lockdown mode (`--gcd-schema-locked`): the schema grammar is
+/// mandatory policy, not a serve-time default. Unlocked, an explicit
+/// constraint surface simply suppresses the default injection; locked, the
+/// same surface is an override attempt against a control and is rejected
+/// 400 naming the surface (the Tantalus lesson: server-side defaults that
+/// are controls must be non-overridable). Returns the offending surface
+/// name for the rejection message, or `None` when the request is allowed.
+fn gcd_schema_lockdown_violation(
+    gcd_schema_locked: bool,
+    request: &super::schema::ChatCompletionRequest,
+) -> Option<&'static str> {
+    if !gcd_schema_locked {
+        return None;
+    }
+    if request.grammar.is_some() {
+        Some("grammar")
+    } else if request.response_format.is_some() {
+        Some("response_format")
+    } else if request.structured_outputs.is_some() {
+        Some("structured_outputs")
+    } else if request.json_schema.is_some() {
+        Some("json_schema")
+    } else {
+        None
+    }
+}
+
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -522,6 +549,28 @@ pub async fn chat_completions(
                 state.config.gcd_schema_grammar.as_deref(),
                 &mut request,
             );
+            // ADR-057 lockdown mode: with `--gcd-schema-locked` the schema
+            // grammar is mandatory policy — an explicit constraint surface
+            // is an override attempt, not a default to defer to. Rejected
+            // before the undeclared-params check so the lockdown reason is
+            // never masked by a secondary validation failure.
+            if let Some(surface) =
+                gcd_schema_lockdown_violation(state.config.gcd_schema_locked, &request)
+            {
+                state
+                    .metrics
+                    .requests_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return ApiError::invalid_request(
+                    format!(
+                        "--gcd-schema-locked: the schema grammar is mandatory policy on this \
+                         server; the request's explicit `{surface}` constraint would override \
+                         the locked policy and was rejected",
+                    ),
+                    Some(surface.into()),
+                )
+                .into_response();
+            }
             // ADR-056: with a constraint attached, undeclared request params
             // are potential silent constraint drops (the vLLM beam-search
             // FATAL class): reject loudly, naming every unknown key.
@@ -13107,5 +13156,130 @@ mod gcd_glp_orthogonality_tests {
         apply_gcd_default_injection(false, None, &mut req);
         assert!(req.grammar.is_none());
         assert_eq!(req.hf2q_enable_thinking, None);
+    }
+}
+
+// ============================================================================
+// ADR-057 lockdown mode (`--gcd-schema-locked`) battery cells.
+//
+// Locked, the schema grammar is mandatory policy: every explicit constraint
+// surface (S7's list) is an override attempt against a control and is
+// rejected 400 naming the surface, rather than silently suppressing the
+// injection as it does unlocked. Handler-level HTTP tests would need a full
+// AppState + loaded engine, so these exercise the two pure decision
+// functions the handler composes — `gcd_schema_lockdown_violation` (the
+// 400 gate) and `apply_gcd_default_injection` (the injection) — which is
+// the same unit-test posture as `gcd_glp_orthogonality_tests`.
+
+#[cfg(test)]
+mod gcd_schema_lockdown_tests {
+    use super::{apply_gcd_default_injection, gcd_schema_lockdown_violation};
+    use crate::serve::api::schema::ChatCompletionRequest;
+
+    fn request() -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .expect("minimal request deserializes")
+    }
+
+    /// Locked, each explicit constraint surface is rejected and named —
+    /// the message the handler renders must identify both the locked
+    /// policy (`--gcd-schema-locked`) and the offending surface, so the
+    /// surface identity is the decision function's contract.
+    #[test]
+    fn locked_rejects_every_explicit_constraint_surface_naming_it() {
+        // grammar
+        let mut req = request();
+        req.grammar = Some("root ::= \"caller\"".into());
+        assert_eq!(
+            gcd_schema_lockdown_violation(true, &req),
+            Some("grammar"),
+            "locked server must reject an explicit grammar, naming the surface"
+        );
+
+        // json_schema
+        let mut req = request();
+        req.json_schema = Some(
+            serde_json::from_value(serde_json::json!({"type": "object"}))
+                .expect("json_schema shape"),
+        );
+        assert_eq!(gcd_schema_lockdown_violation(true, &req), Some("json_schema"));
+
+        // structured_outputs
+        let mut req = request();
+        req.structured_outputs = Some(
+            serde_json::from_value(serde_json::json!({"grammar": "root ::= \"ok\""}))
+                .expect("structured_outputs shape"),
+        );
+        assert_eq!(
+            gcd_schema_lockdown_violation(true, &req),
+            Some("structured_outputs")
+        );
+
+        // response_format
+        let mut req = request();
+        req.response_format = Some(
+            serde_json::from_value(serde_json::json!({"type": "json_object"}))
+                .expect("response_format shape"),
+        );
+        assert_eq!(
+            gcd_schema_lockdown_violation(true, &req),
+            Some("response_format")
+        );
+    }
+
+    /// With several surfaces present the rejection names exactly one,
+    /// deterministically (the handler's 400 message is stable).
+    #[test]
+    fn locked_names_a_single_deterministic_surface_when_several_are_present() {
+        let mut req = request();
+        req.grammar = Some("root ::= \"caller\"".into());
+        req.response_format = Some(
+            serde_json::from_value(serde_json::json!({"type": "json_object"}))
+                .expect("response_format shape"),
+        );
+        assert_eq!(gcd_schema_lockdown_violation(true, &req), Some("grammar"));
+    }
+
+    /// Locked + unconstrained request: no violation, and the schema grammar
+    /// is still injected with thinking disabled — lockdown changes who may
+    /// supply the constraint, not the injection itself.
+    #[test]
+    fn locked_admits_unconstrained_requests_and_still_injects_the_schema() {
+        let mut req = request();
+        assert_eq!(
+            gcd_schema_lockdown_violation(true, &req),
+            None,
+            "an unconstrained request does not override the locked policy"
+        );
+        apply_gcd_default_injection(false, Some("root ::= \"schema\""), &mut req);
+        assert_eq!(req.grammar.as_deref(), Some("root ::= \"schema\""));
+        assert_eq!(
+            req.hf2q_enable_thinking,
+            Some(false),
+            "the JSON object must engage at token 0; thinking must be off"
+        );
+    }
+
+    /// Unlocked + explicit grammar: byte-for-byte the pre-lockdown
+    /// behavior — no rejection, no injection, no side effects.
+    #[test]
+    fn unlocked_defers_to_explicit_grammar_unchanged() {
+        let mut req = request();
+        req.grammar = Some("root ::= \"caller\"".into());
+        assert_eq!(
+            gcd_schema_lockdown_violation(false, &req),
+            None,
+            "unlocked servers keep deferring to explicit surfaces"
+        );
+        apply_gcd_default_injection(false, Some("root ::= \"schema\""), &mut req);
+        assert_eq!(
+            req.grammar.as_deref(),
+            Some("root ::= \"caller\""),
+            "unlocked behavior unchanged: no injection over an explicit surface"
+        );
+        assert_eq!(req.hf2q_enable_thinking, None, "no injection side effects");
     }
 }
