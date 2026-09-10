@@ -5711,6 +5711,51 @@ pub fn apply_sdpa_with_kv_cache(
             return Ok(out_uploaded);
         }
 
+        // ── Sub-16 kv boundary on the TQ layout (slot.k None) ──
+        //
+        // Crash fix (found serving a --gcd battery probe): while the
+        // running kv length is below 16, NO path handles the production TQ
+        // layout — new_path needs a fresh seq_len >= 16; the vec paths
+        // need the legacy slot.k/v layout; resume_path needs
+        // kv_seq_len >= 16. Incremental prefill advances short prompts in
+        // small chunks (measured: seq_len=7, cur_len=8, kv_seq_len=15), so
+        // every chunk before the boundary fell into the F32 fallback,
+        // which is legacy-layout-only and panicked on `slot.k is None`.
+        // The fallback's "seq_len is always >= 16 in production" claim is
+        // false for any client whose templated prompt starts below 16
+        // tokens.
+        //
+        // The TQ direct-prefill helper handles exactly this region: query
+        // counts 1..=32 with cur_len + seq_len == kv_seq_len, against the
+        // TQ-active slot. kv_seq_len < 16 implies seq_len <= 15, inside
+        // the helper's bound; once kv crosses 16 the resume path takes
+        // over (its TQ branch uses the same helper for small chunks and
+        // the tiled dense bridge beyond).
+        if head_dim == 256
+            && kv_seq_len < 16
+            && slot.k.is_none()
+            && slot.tq.is_some()
+            && seq_len <= QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES
+        {
+            let out_uploaded = apply_tq_prefill_seq_major_resume_direct_for_slot(
+                device,
+                registry,
+                slot,
+                q_seq_major,
+                seq_len,
+                cur_len as u32,
+                kv_seq_len,
+                max_seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                slot_id,
+            )?;
+            let new_len = kv_seq_len;
+            slot.current_len[slot_id.0 as usize] = new_len;
+            return Ok(out_uploaded);
+        }
+
         // ── ADR-034 task #89 Step 3a (2026-05-21): vec_small_path ──
         //
         // For small-seq-len verify forwards (DFlash K+1 = 2..8, K=N MTP
