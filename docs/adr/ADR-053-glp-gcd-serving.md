@@ -142,7 +142,9 @@ operand — the `--mmproj` shape.
 
 The automatic resolver searches only the public `msuiche` namespace for the
 exact `<base>-abliterated-cyber-GLP-<N>` convention, including the published
-optional `-L<first>-<last>-a<dose>` suffix. It uses the model GGUF already
+optional `-residual` site qualifier and `-L<first>-<last>-a<dose>` suffix.
+These labels identify candidates; the file's metadata controls the hook and
+dose. Same-checkpoint site variants require explicit selection. It uses the model GGUF already
 selected by serving, not a second model download. Searches exceeding
 100 returned repositories fail as incomplete. Multiple matching repositories
 or multiple GGUF files require explicit selection; ordering and coverage do

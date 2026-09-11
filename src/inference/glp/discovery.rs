@@ -192,9 +192,9 @@ fn unique_discovery_repo(search: &str, found: Vec<String>) -> Result<String> {
     }
 }
 
-/// Weightless repositories use GLP-<coverage>, optionally followed by the
-/// published -L<first>-<last>-a<dose> suffix. Coverage is a count, and the
-/// layer/dose suffix is identity text, not authorization to override metadata.
+/// Weightless repositories use GLP-<coverage>, optionally qualified by the
+/// published -residual site label and -L<first>-<last>-a<dose> suffix. These
+/// labels identify candidates; they never override the file's hook or dose.
 fn weightless_artifact_suffix(tail: &str) -> bool {
     fn integer(value: &str) -> Option<u32> {
         (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
@@ -205,6 +205,9 @@ fn weightless_artifact_suffix(tail: &str) -> bool {
         Some((coverage, suffix)) => (coverage, Some(suffix)),
         None => (tail, None),
     };
+    // Match the published qualifier exactly. Treating arbitrary text as a
+    // site label could admit a different artifact as the only candidate.
+    let coverage = coverage.strip_suffix("-residual").unwrap_or(coverage);
     if !integer(coverage).is_some_and(|coverage| coverage > 0) {
         return false;
     }

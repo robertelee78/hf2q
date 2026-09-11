@@ -209,8 +209,51 @@ fn published_repository_and_alternate_same_base_are_ambiguous() {
 }
 
 #[test]
+fn published_residual_repository_is_a_candidate_without_admitting_near_matches() {
+    let search = "DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-";
+    let residual = "msuiche/DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-42-residual-L1-42-a1.5";
+    let near_matches = [
+        "other/DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-42-residual-L1-42-a1.5",
+        "msuiche/DeepSeek-V4-Flash-0731X-abliterated-cyber-GLP-42-residual-L1-42-a1.5",
+        "msuiche/DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-42-residualx-L1-42-a1.5",
+    ];
+    for near_match in near_matches {
+        assert!(unique_discovery_repo(search, vec![near_match.into()]).is_err());
+        assert_eq!(
+            unique_discovery_repo(search, vec![near_match.into(), residual.into()]).unwrap(),
+            residual
+        );
+    }
+}
+
+#[test]
+fn published_same_checkpoint_site_variants_are_ambiguous_in_either_order() {
+    let search = "DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-";
+    let original = "msuiche/DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-29";
+    let residual = "msuiche/DeepSeek-V4-Flash-0731-abliterated-cyber-GLP-42-residual-L1-42-a1.5";
+    for repos in [
+        vec![original.into(), residual.into()],
+        vec![residual.into(), original.into()],
+    ] {
+        let error = unique_discovery_repo(search, repos)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous GLP repositories"), "{error}");
+        assert!(error.contains(original), "{error}");
+        assert!(error.contains(residual), "{error}");
+    }
+}
+
+#[test]
 fn only_recognized_layer_and_dose_suffixes_are_candidates() {
-    for tail in ["29", "29-L10-38-a4", "29-L10-38-a0.25", "29-L10-38-a0"] {
+    for tail in [
+        "29",
+        "29-L10-38-a4",
+        "29-L10-38-a0.25",
+        "29-L10-38-a0",
+        "42-residual",
+        "42-residual-L1-42-a1.5",
+    ] {
         assert!(weightless_artifact_suffix(tail), "{tail}");
     }
     for tail in [
@@ -222,6 +265,13 @@ fn only_recognized_layer_and_dose_suffixes_are_candidates() {
         "29-L10-38-a-1",
         "29-L10-38-a1.2.3",
         "29-L10-38-a4-extra",
+        "42-residualx-L1-42-a1.5",
+        "42-xresidual-L1-42-a1.5",
+        "42-residual-residual-L1-42-a1.5",
+        "42-residual-L0-42-a1.5",
+        "42-residual-L42-1-a1.5",
+        "42-residual-L1-42-aNaN",
+        "42-residual-L1-42-a1.5-extra",
     ] {
         assert!(!weightless_artifact_suffix(tail), "{tail}");
     }
