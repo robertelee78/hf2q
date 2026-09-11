@@ -153,6 +153,13 @@ Hub repository IDs and canonical tree/blob/resolve URLs use the shared HF
 reference parser. A returned inventory must name an immutable commit, and
 the chosen file is downloaded at that commit rather than a mutable branch.
 
+The file's `glp.hook_point` must match the implemented apply site.
+`glp.derived_at` is optional string provenance: absence means the same site,
+and arbitrary descriptive labels remain valid. A non-string value is a load
+error. A declared derivation site differing from the apply hook produces an
+explicit warning to validate the transfer and its dose; it does not select a
+different hook or by itself refuse the file.
+
 A GLP's declared base repository/name and HF commit are checked against the
 served checkpoint before binding in both family loaders. For hf2q conversions,
 the existing adjacent schema-v3 receipt supplies the actual source repository

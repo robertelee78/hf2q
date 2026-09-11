@@ -330,7 +330,12 @@ impl GlpVector {
         };
         let derived_at = match metadata.get("glp.derived_at") {
             Some(MetaValue::Str(s)) => Some(s.clone()),
-            _ => None,
+            Some(_) => {
+                return Err(GlpError::Malformed(
+                    "glp.derived_at must be a string".into(),
+                ))
+            }
+            None => None,
         };
 
         // Gate 3: spec version
@@ -489,6 +494,17 @@ impl GlpVector {
             }
         }
 
+        if let Some(site) = derived_at
+            .as_deref()
+            .filter(|site| *site != hook_point.as_str())
+        {
+            tracing::warn!(
+                derived_at = site,
+                hook_point = hook_point.as_str(),
+                "GLP direction was derived at a different site from its apply hook; validate this site transfer and its dose"
+            );
+        }
+
         Ok(Self {
             mode,
             hook_point,
@@ -508,6 +524,8 @@ impl GlpVector {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    include!("reader_metadata_tests.rs");
 
     /// Minimal GGUF v3 writer for fixtures.
     fn build_gguf(
