@@ -25,10 +25,9 @@ behavior require distinct evidence.
 
 ## Introduction
 
-Running a model locally gives us control over the weights, the inference
-runtime, and the applications that use its output. It does not automatically
-give us a reliable way to change the model's behavior or constrain an agent's
-actions. Those are distinct problems, and they call for distinct controls.
+Local execution gives operators control over weights, inference, and
+applications. Changing model behavior and constraining an agent's actions
+still require distinct controls.
 
 Two techniques make that distinction useful in practice. **Grammar-constrained
 decoding (GCD)** restricts the continuations a model can generate.
@@ -38,12 +37,10 @@ operate with the original model weights unchanged. GCD defines an allowed
 output language; GLP changes part of the computation that produces the
 next-token scores.[^1][^2][^3]
 
-hf2q brings these controls into a Rust inference stack for local models on
-Apple Silicon. This article explains the concepts, connects them to the
-implementation, and examines what they mean for local model operators and
-security practitioners. Refusal reduction is one case study. Structured
-output, explicit action boundaries, and the ability to distribute an
-intervention separately from a model are the broader implications.
+hf2q brings these controls to local inference on Apple Silicon. This article
+connects their mechanisms to the implementation and a refusal-control case
+study, with implications for structured output, authorization, and intervention
+distribution.
 
 ## Two controls, two responsibilities
 
@@ -178,10 +175,9 @@ the control means.
 
 ## GLP: distribute the intervention separately
 
-A familiar way to distribute an altered model is to start with the original
-weights, make changes, and publish another complete checkpoint. The behavioral
-change may be compact even though the download duplicates almost all of the
-original model.
+A familiar way to distribute an altered model is to edit the original weights
+and publish another complete checkpoint. A compact behavioral change can
+therefore require downloading almost all of the original model again.
 
 GLP separates those things. A compatible runtime loads the original model and
 a much smaller artifact containing steering directions and the information
@@ -191,9 +187,14 @@ the model runs; it is not a binary diff applied to the stored weight tensors.
 With fresh inference state, disabling the intervention restores unsteered
 computation on the original weights. Existing KV or recurrent state can retain
 the effects of earlier steering and must be reset for that comparison.[^3]
-For scale, Suiche reports equal refusal rates in his cyber-suite comparison
-using a 478 KB GLP artifact and a 157 GB redistributed checkpoint. This is
-his study's comparison, not an hf2q measurement.[^3]
+
+GLP names a format, not a single file or a universal vector. Weightless
+publishes checkpoint-specific artifacts under `msuiche/` on Hugging Face,
+including multiple interventions for the same checkpoint. Their sizes vary
+with layer coverage and activation width: kilobytes or megabytes of directions
+can accompany gigabytes of base weights. GLP-29 for DeepSeek-V4-Flash-0731
+is one example; that checkpoint also has a distinct residual-site GLP-42.
+Compatibility and behavioral claims belong to the selected artifact.[^3]
 
 Matt Suiche's [weightless project](https://weightless.msuiche.com/) develops
 and distributes this approach. Its GLP format builds on the GGUF control-vector
@@ -260,8 +261,8 @@ but loadability does not establish behavioral transfer. The specification
 recommends revalidation below approximately Q4; this is an expectation based
 on quantization effects, not a measured cross-quantization guarantee.[^3]
 
-Suiche's September 4 correction provides a concrete transfer example.
-The shipped DeepSeek GLP-29 direction was derived from the folded post-layer
+Suiche's September 4 correction provides a historical transfer example.
+The DeepSeek-V4-Flash-0731 GLP-29 artifact was derived from the folded post-layer
 residual but applied to the pending FFN write before the hyper-connection
 fold. The relabeled artifact records both sites:
 `glp.derived_at=residual_stream_post_layer` and
@@ -271,7 +272,15 @@ of residual-site superiority: under the reported DeepSeek conditions, the
 FFN writer was more effective than the true residual, which outperformed
 the attention writer. This ordering is specific to that experiment. The
 physical hook must be recorded and checked against execution and
-measurement; the format alone cannot establish it.[^7]
+measurement. Current consumers must follow each artifact's `glp.hook_point`,
+rather than generalizing this FFN site to GLP as a whole.[^7]
+
+Weightless also publishes **Captain Vector**, a GLP production utility. It
+derives directions from contrasting prompt sets, filters layers using held-out
+separation against a shuffled-label null, and exports GLP GGUF files. Its
+validator checks files without loading base weights. Artifact validation and
+activation separation do not establish behavioral effectiveness; that requires
+evaluation on the intended checkpoint and serving configuration.[^18]
 
 Suiche's privately shared research also informed this article's treatment of
 activation steering and experimental validation. hf2q's implementation and
@@ -388,7 +397,9 @@ intervention, and its persistent prefix-cache identity includes steering
 configuration. DeepSeek dispatches the declared operation at the FFN writer.
 These are explicit model-family contracts, not interchangeable graph sites.
 Explicit local files and Hub references share validation; automatic discovery
-rejects ambiguous candidates. Declared direction hashes are checked before
+rejects ambiguous candidates, including different-site variants for one
+checkpoint. Malformed capture-site metadata is rejected, and declared site
+transfers produce a warning. Declared direction hashes are checked before
 normalization. Checkpoint declarations use available source provenance, with unverifiable
 declared revisions rejected. For converted models, the source receipt is
 checked against the selected output's size and hash; model-card ancestry
@@ -591,39 +602,32 @@ on GLP or a measured latency advantage.
 
 ## Discussion and implications
 
-**Smaller behavioral artifacts change distribution.** Operators can retain a
-shared base model and manage a separate steering artifact. That can reduce
-redundant storage and downloads and make an intervention easier to inspect,
-version, and disable. Compatibility still includes the actual checkpoint and
-runtime behavior; a small artifact is not automatically a portable one.
+**Smaller behavioral artifacts change distribution.** A separate steering
+artifact reduces redundant storage and downloads and can be inspected,
+versioned, and disabled independently. Portability still depends on checkpoint
+and runtime compatibility.
 
-**Explicit constraints separate authority from model preference.** A model
-need not prefer the authorized action for a correctly enforced action grammar
-to exclude unauthorized alternatives. This is especially useful for agents
-that consume untrusted documents or tool results. The application still owns
-the permitted action set and the execution boundary.
+**Explicit constraints separate authority from model preference.** A correctly
+enforced action grammar excludes unauthorized alternatives even when a model
+prefers them after consuming untrusted documents or tool results. The
+application owns the permitted action set and execution boundary.
 
-**Structure makes some failures easier to detect.** A missing required field,
-unrecognized action, or out-of-enumeration destination can be rejected
-mechanically. A plausible but unsupported finding still requires evidence.
-For a coding agent, testing the tool selection, arguments, tool-result
-continuation, and final result matters more than observing valid JSON alone.
+**Structure makes some failures easier to detect.** Missing fields or
+out-of-enumeration values permit mechanical rejection; plausible findings
+still require evidence. Coding agents need tests of tool selection, arguments,
+tool-result continuation, and task completion alongside JSON validity.
 
-**Reduced refusal and improved capability require different evidence.** An
-operator may want a model that engages with legitimate malware analysis or
-other difficult security work. That motivation does not imply that every
-refusal is undesirable, every non-refusal is useful, or steering improves
-reasoning. Measure engagement, accuracy, completion, and application outcomes
-separately.
+**Reduced refusal and improved capability require different evidence.**
+Engagement with legitimate malware analysis or other difficult security work
+does not establish useful answers or improved reasoning. Measure engagement,
+accuracy, completion, and application outcomes separately.
 
-**The controls need independent and combined validation.** A useful evaluation
-holds the model artifact, prompts, sampling settings, and budget constant,
-then compares baseline, GCD, GLP, and their combination. The GCD-only and
-combined arms use the same grammar; the GLP-only and combined arms use the
-same vector, application sites, and strength. Record truncation and errors
-alongside quality, and measure latency, throughput, and cache reuse on the
-actual serving path. Grammar soundness, steering correctness, and task
-success are separate obligations.
+**The controls need independent and combined validation.** Compare baseline,
+GCD, GLP, and their combination with identical model artifacts, prompts,
+sampling settings, and budgets. Hold the grammar constant across GCD arms,
+and the vector, sites, and strength across GLP arms. Record truncation and
+errors alongside quality; measure latency, throughput, and cache reuse on
+the actual serving path.
 
 hf2q makes both controls inspectable in a local inference stack. Their
 practical value depends on specifying the activation and output-language
@@ -642,7 +646,7 @@ Matt Suiche.
 ## Artifacts and reproducibility
 
 The current implementation account uses hf2q commit
-`92afc4a317c90ea527033228e0492f392778e412`. The historical W1 audit retains
+`8aaa6b1679420cb38f23d7edb068a5e7ff9375fd`. The historical W1 audit retains
 source snapshot `44004311717d414feaa54384578e2bcf4d140464`. Neither source
 inspection identifies a historical runtime by itself. The
 [follow-up evidence manifest](figures/gcd/followup-evidence.json) separates
@@ -657,23 +661,24 @@ recomputes those aggregates without publishing prompt or response text.
 
 1. Geng, S., Josifoski, M., Peyrard, M., and West, R. [Grammar-Constrained Decoding for Structured NLP Tasks without Finetuning](https://aclanthology.org/2023.emnlp-main.674/). EMNLP, 2023.
 2. Ovando, V. *Constitutive Authorization at the Decoding Boundary: Grammar-Constrained Decoding as a Positive, Generation-Time Security Control for LLM Agents*. Supplied manuscript `gcd.pdf`, draft June 26, 2026, §§3–4, 6, 8. [Project DOI](https://doi.org/10.17605/OSF.IO/S9GU6); [companion soundness argument](https://github.com/cybersharkvin/gcd-authz/blob/main/docs/proof.md). The reviewed PDF is the supplied version; identity with the current DOI download is not asserted.
-3. Suiche, M. [GLP — GGUF Layer Projection: format and apply path](https://github.com/msuiche/weightless/blob/3fbaa80592aba9aaaed03118d34b7d4c8afb74d4/spec/GLP.md); [weightless](https://weightless.msuiche.com/). Specification revision `3fbaa80592ab`; accessed September 10, 2026.
+3. Suiche, M. [GLP — GGUF Layer Projection: format and apply path](https://github.com/msuiche/weightless/blob/3481e30eba9d4c85b8f3bdaf9bd074ad7fe28f87/spec/GLP.md); [weightless artifact catalog](https://weightless.msuiche.com/#files). Specification revision `3481e30eba9d`; accessed September 11, 2026.
 4. Dong, Y., et al. [XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models](https://arxiv.org/abs/2411.15100). 2024.
 5. Park, K., Wang, J., Berg-Kirkpatrick, T., Polikarpova, N., and D'Antoni, L. [Grammar-Aligned Decoding](https://arxiv.org/abs/2405.21047). NeurIPS, 2024.
 6. Arditi, A., et al. [Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717). 2024.
 7. Suiche, M. [Sticky Refusals, Free Speculative Decoding, and the Invisible Quantisation Cliff](https://www.msuiche.com/posts/autoresearch-sticky-refusals-free-speculative-decoding-and-the-invisible-quantisation-cliff/), September 3, 2026; September 4 hook-site correction.
 8. Suiche, M. Unpublished research on activation steering, privately shared with Robert E. Lee, 2026.
-9. hf2q. [Reviewed source tree](https://github.com/robertelee78/hf2q/tree/92afc4a317c90ea527033228e0492f392778e412/src); [CLI](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/src/cli.rs); [request policy](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/src/serve/api/gcd_policy.rs).
-10. hf2q. [Grammar implementation](https://github.com/robertelee78/hf2q/tree/92afc4a317c90ea527033228e0492f392778e412/src/serve/api/grammar); [engine](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/src/serve/api/engine.rs).
-11. hf2q. [Schema compiler](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/src/serve/api/grammar/json_schema.rs); [recon schema](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/examples/recon-opportunities.schema.json). JSON Schema, [string constraints](https://json-schema.org/understanding-json-schema/reference/string).
-12. hf2q. [GLP subsystem](https://github.com/robertelee78/hf2q/tree/92afc4a317c90ea527033228e0492f392778e412/src/inference/glp); [calibration implementation](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/src/calibrate/mod.rs); [ADR-054](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/docs/adr/ADR-054-glp-runtime-calibration.md).
+9. hf2q. [Reviewed source tree](https://github.com/robertelee78/hf2q/tree/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src); [CLI](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/cli.rs); [request policy](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/serve/api/gcd_policy.rs).
+10. hf2q. [Grammar implementation](https://github.com/robertelee78/hf2q/tree/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/serve/api/grammar); [engine](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/serve/api/engine.rs).
+11. hf2q. [Schema compiler](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/serve/api/grammar/json_schema.rs); [recon schema](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/examples/recon-opportunities.schema.json). JSON Schema, [string constraints](https://json-schema.org/understanding-json-schema/reference/string).
+12. hf2q. [GLP subsystem](https://github.com/robertelee78/hf2q/tree/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/inference/glp); [calibration implementation](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/calibrate/mod.rs); [ADR-054](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/docs/adr/ADR-054-glp-runtime-calibration.md).
 13. hf2q. Historical W1 generation, judge, and embedding-screen JSONL records, September 2026. Exact filenames, hashes, counts, and access status appear in the [evidence manifest](figures/gcd/evidence.json). [Offline aggregation script](../scripts/grammar_probe/publication_data.py); [judging harness](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/judge.py). Raw logs are local campaign artifacts, not all present in the published repository.
 14. hf2q. `refusal_mass_probe.jsonl`, twelve archived observations, and [probe script](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/refusal_mass_probe.py). Probability semantics: [sampler](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/sampler_pure.rs), `sample_token_with_logprob_topk`, and the grammar-aware engine call site.
 15. Lee, R. E. [Qwen3.6-35B-A3B-Abliterix-EGA-abliterated](https://huggingface.co/jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated), judge checkpoint. hf2q, [human spot-check of the Qwen judge](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/SPOT_CHECK_RESULTS.md), September 8, 2026.
 
 
 16. hf2q. [September 10 GLP panel records and judge driver](https://github.com/robertelee78/hf2q/tree/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/gate34); [operational battery](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/battery_gcd_v2.jsonl); [historical termination report](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/full_results_w1.truncation-report.json). Recomputed counts and source identities: [follow-up manifest](figures/gcd/followup-evidence.json).
-17. hf2q. [Revised measurement methods](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/scripts/grammar_probe/METHODS.md); [judge](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/scripts/grammar_probe/judge.py), [rejudge](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/scripts/grammar_probe/rejudge.py), [report](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/scripts/grammar_probe/report.py), and [offline/mock tests](https://github.com/robertelee78/hf2q/blob/92afc4a317c90ea527033228e0492f392778e412/scripts/grammar_probe/test_harness_repair.py).
+17. hf2q. [Revised measurement methods](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/scripts/grammar_probe/METHODS.md); [judge](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/scripts/grammar_probe/judge.py), [rejudge](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/scripts/grammar_probe/rejudge.py), [report](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/scripts/grammar_probe/report.py), and [offline/mock tests](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/scripts/grammar_probe/test_harness_repair.py).
+18. Suiche, M. [Captain Vector: GLP production and validation utility](https://github.com/msuiche/weightless/tree/3481e30eba9d4c85b8f3bdaf9bd074ad7fe28f87/tools/captain-vector). Revision `3481e30eba9d`; accessed September 11, 2026.
 
 [^1]: Geng et al., *Grammar-Constrained Decoding for Structured NLP Tasks without Finetuning* (2023), Source 1.
 [^2]: Ovando, supplied June 26, 2026 manuscript, §§3–4, 6, 8, and companion proof; Source 2.
@@ -693,3 +698,4 @@ recomputes those aggregates without publishing prompt or response text.
 
 [^16]: September 10 GLP panel, final battery attempt, and historical termination cross-tabs; Source 16.
 [^17]: Revised measurement harness and focused offline/mock validation; Source 17.
+[^18]: Public Captain Vector README and implementation at the cited revision; Source 18.

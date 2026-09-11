@@ -303,7 +303,9 @@ and tool grammars can change which grammar is effective.
 ### Load a GLP artifact
 
 Stop the previous server first. Substitute an exact model checkpoint and a
-local steering artifact validated for that checkpoint and application site:
+local steering artifact validated for that checkpoint and application site.
+GLP files are checkpoint-specific, and one checkpoint can have several
+interventions with different layer coverage, sites, and strengths:
 
 ```bash
 hf2q serve /path/to/exact-model.gguf --glp /path/to/matching.glp.gguf

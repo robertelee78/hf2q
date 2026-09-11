@@ -987,7 +987,10 @@ remain application responsibilities.
 **GLP artifacts and application.** A GLP file distributes steering directions
 and application metadata separately from the base checkpoint, avoiding another
 full copy of modified weights. It modifies activations at inference time; it
-is not an arbitrary binary weight diff. The format distinguishes additive
+is not an arbitrary binary weight diff. Weightless publishes multiple
+checkpoint-specific GLP artifacts, including variants for different sites on
+the same checkpoint; GLP-29 is one example, not the format's only artifact.
+The format distinguishes additive
 steering from projective steering (`h ← h − α(h·d̂)d̂` for a unit direction).
 Compatibility depends on the checkpoint, graph layers, activation site, mode,
 and strength. The inspected application paths are Qwen 3.5/3.6/3.8 and
