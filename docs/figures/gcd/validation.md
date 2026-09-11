@@ -5,7 +5,7 @@ figures, source inspection, archived measurements, and PDF rendering.
 
 ## Source and evidence
 
-The implementation account is bound to `8aaa6b1679420cb38f23d7edb068a5e7ff9375fd`. This source identity
+The implementation account is bound to `1bf0c82f10369a0714ea72ed20d979d7c387ffde`. This source identity
 is separate from the binary identities in experimental records.
 The historical W1 snapshot remains
 `44004311717d414feaa54384578e2bcf4d140464`; the follow-up extractor retains
@@ -41,7 +41,10 @@ discovery ambiguity checks, rejects non-string `glp.derived_at` metadata,
 and warns about declared capture/apply-site transfers. Focused locked Rust
 checks passed all 16 discovery tests and all 15 reader tests, with no failures
 or ignored tests. These exercise discovery and file-reader behavior without
-loading a model.
+loading a model. A subsequent wording-only update corrects calibration
+help to preserve graph-layer IDs and removes the misleading use of GLP-29
+as a single layer name. It changes no runtime arithmetic. The PDF renderer
+was exercised with the added table and updated numbering.
 
 The focused Python suite exercises complete-response judging, versioned
 passes, hash-checked joins, separate run/budget conditions, independent human
@@ -59,18 +62,25 @@ rewritten.
 
 ## Prose, figures, and PDF
 
-- Seven A4 pages with two columns, a full-width title and abstract, seven
-  main sections, three numbered equations, five tables, four figures, and
-  18 references. All 35 numeric citation links resolve to the bibliography.
+- Eight A4 pages with two columns, a full-width title and abstract, seven
+  main sections, three numbered equations, six tables, four figures, and
+  20 references. All 41 numeric citation links resolve to the bibliography.
 - The September 11 pass distinguishes the GLP format from checkpoint-specific
   artifacts, including different-site variants for one checkpoint. Size is
   described generically rather than through a single historical comparison.
   Captain Vector is described as the producer and validator implemented at
   public Weightless revision `3481e30eba9d4c85b8f3bdaf9bd074ad7fe28f87`;
   proposed inspection, conversion, and baking commands are not claimed.
+- The operation/delivery follow-up adds a four-cell comparison of additive
+  and projective activation hooks versus parameter representations. The
+  affine-writer identities, whole-residual conditions, expert-sum linearity,
+  and conditional constant-feature approximation were independently reviewed.
+  The LoRA and massive-activation sources are cited; private coordinate
+  measurements are not presented as public evidence.
 - Every page was visually reviewed. No material clipping, gutter collision,
-  or unreadable figure/table text was found. Bibliography spacing keeps the
-  final reference on page seven without reducing the reference font size.
+  or unreadable figure/table text was found. The expanded GLP account adds one page without reducing body, table, or
+  bibliography font sizes. The final page holds artifact provenance and
+  references.
 - Four SVGs parse and all accompanying PNGs decode. The control diagram
   describes structural acceptance; the outcome figure identifies historical
   judge labels. The geometry figure is explicitly illustrative.
@@ -114,9 +124,9 @@ PDF creation timestamps can change the output hash on a later render.
 ## Artifact identity at validation
 
 - `docs/gcd-in-hf2q.md`
-  SHA-256: `8d3e7db3535e50ad06318dd73cb8518c0cd3f00745865664e907cc712c0c0d08`
+  SHA-256: `f8444037059ab7993b3dccaeb1724433f262dc6850337e3c69f28023550e8431`
 - `docs/gcd-in-hf2q.pdf`
-  SHA-256: `392146144761e78095b9b83cba3b8183065cb24a1f586cadd3c880d58490cf35`
+  SHA-256: `c3ad1ba90f91584ec8b348c031a34b52e352a969e693f71e975dbb7db696a919`
 - `docs/figures/gcd/evidence.json`
   SHA-256: `3eab958f32452dfb6960f9491baf0b923a7a7865377648d3f952d35e39362650`
 - `docs/figures/gcd/followup-evidence.json`
