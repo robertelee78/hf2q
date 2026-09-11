@@ -1143,8 +1143,8 @@ pub struct CalibrateArgs {
     #[arg(long, value_name = "OUT_GGUF", default_value = "calibrated.glp.gguf")]
     pub out: PathBuf,
 
-    /// Capture layer (0-based; exported as direction.{layer+1} per the
-    /// GLP 1-based convention). Default 29 — the published GLP-29 layer.
+    /// Capture graph layer (0-based index, excluding layer 0).
+    /// Export uses direction.N for the same graph layer N. Default: 29.
     #[arg(long, default_value_t = 29)]
     pub layer: usize,
 

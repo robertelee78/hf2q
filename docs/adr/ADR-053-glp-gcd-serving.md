@@ -98,7 +98,8 @@ operand — the `--mmproj` shape.
     direction slice, per-stream norms, never the flattened sum) is
     implemented in the (currently unused) mHC helpers with GPU-vs-CPU
     reference proofs; the production DeepSeek path steers the writer with
-    the dense projection.
+    the two-dimensional activation helper, which dispatches additive or
+    projective mode.
   - Qwen prefix-cache identity includes the full steering configuration
     (raw direction bytes, hook, mode, dose) — two differently-steered
     servers can no longer address each other's saved KV.
