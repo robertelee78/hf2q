@@ -1,11 +1,11 @@
 # Publication artifact validation
 
-Final editorial pass: September 10, 2026. This record covers the article,
+Final editorial pass: September 11, 2026. This record covers the article,
 figures, source inspection, archived measurements, and PDF rendering.
 
 ## Source and evidence
 
-The implementation account is bound to `92afc4a317c90ea527033228e0492f392778e412`. This source identity
+The implementation account is bound to `8aaa6b1679420cb38f23d7edb068a5e7ff9375fd`. This source identity
 is separate from the binary identities in experimental records.
 The historical W1 snapshot remains
 `44004311717d414feaa54384578e2bcf4d140464`; the follow-up extractor retains
@@ -36,6 +36,12 @@ Source review verified the operation/hook, graph-layer, greedy-path,
 cache-identity, and default-grammar corrections. The final pass also repairs
 locked-schema policy composition, GLP artifact selection and checkpoint
 binding, calibration export provenance, and measurement record integrity.
+The September 11 source update includes published residual-site variants in
+discovery ambiguity checks, rejects non-string `glp.derived_at` metadata,
+and warns about declared capture/apply-site transfers. Focused locked Rust
+checks passed all 16 discovery tests and all 15 reader tests, with no failures
+or ignored tests. These exercise discovery and file-reader behavior without
+loading a model.
 
 The focused Python suite exercises complete-response judging, versioned
 passes, hash-checked joins, separate run/budget conditions, independent human
@@ -47,16 +53,21 @@ recorded on the associated pull request; this document does not substitute
 for those results.
 
 Offline and mocked checks do not constitute real-model validation of the new
-paths. The existing DeepSeek campaign retains its original generation harness
-and configuration; subsequent managed judging produces a separate scoring
-pass. No completed replacement pass is included in this article. Historical
-observations and unknown historical identities have not been rewritten.
+paths. No completed replacement scoring pass is included in this article.
+Historical observations and unknown historical identities have not been
+rewritten.
 
 ## Prose, figures, and PDF
 
 - Seven A4 pages with two columns, a full-width title and abstract, seven
   main sections, three numbered equations, five tables, four figures, and
-  17 references. All 34 numeric citation links resolve to the bibliography.
+  18 references. All 35 numeric citation links resolve to the bibliography.
+- The September 11 pass distinguishes the GLP format from checkpoint-specific
+  artifacts, including different-site variants for one checkpoint. Size is
+  described generically rather than through a single historical comparison.
+  Captain Vector is described as the producer and validator implemented at
+  public Weightless revision `3481e30eba9d4c85b8f3bdaf9bd074ad7fe28f87`;
+  proposed inspection, conversion, and baking commands are not claimed.
 - Every page was visually reviewed. No material clipping, gutter collision,
   or unreadable figure/table text was found. Bibliography spacing keeps the
   final reference on page seven without reducing the reference font size.
@@ -103,9 +114,9 @@ PDF creation timestamps can change the output hash on a later render.
 ## Artifact identity at validation
 
 - `docs/gcd-in-hf2q.md`
-  SHA-256: `5fbbf29149e17b39f70b688da725204784c6299d3e94ac2a359612c343df4980`
+  SHA-256: `8d3e7db3535e50ad06318dd73cb8518c0cd3f00745865664e907cc712c0c0d08`
 - `docs/gcd-in-hf2q.pdf`
-  SHA-256: `1d69547e57d1b0c8612a6a7ca1ba86e0a90d4dbb66b960bf341bd80b47689eed`
+  SHA-256: `392146144761e78095b9b83cba3b8183065cb24a1f586cadd3c880d58490cf35`
 - `docs/figures/gcd/evidence.json`
   SHA-256: `3eab958f32452dfb6960f9491baf0b923a7a7865377648d3f952d35e39362650`
 - `docs/figures/gcd/followup-evidence.json`
