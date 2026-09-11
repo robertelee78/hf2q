@@ -227,13 +227,6 @@ It must not be baked into projective direction tensors: scaling a raw
 direction by $s$ scales $(h^\top d)d$ by $s^2$, whereas a consumer that
 normalizes the direction, as hf2q does, erases that baked-in scale.[^3]
 
-The connection to weight editing is exact in a limited case: if the intervened
-activation is $h=Wx$, the same operation can be written as a rank-at-most-one
-update $\Delta W=-\alpha\hat d(\hat d^\top W)$. This follows by substituting
-$Wx$ into the projection equation. Applying a direction to a complete residual
-state need not be equivalent to editing any one matrix. GLP packages the
-intervention; it does not encode arbitrary checkpoint differences.
-
 ![In a two-dimensional geometric example, the original activation points partly along the steering direction. Strength one removes that component; strength two reflects it. The perpendicular component remains unchanged.](figures/gcd/glp-projection.svg)
 
 *Figure 2. Projective GLP at one activation site. This is a geometric
@@ -246,6 +239,61 @@ activations mediated refusal in the models they studied. That provides a
 mechanistic basis for interventions of this kind. It does not establish one
 universal direction, nor prove that removing refusal improves reasoning or
 preserves every capability.[^6]
+
+### Operation and delivery are separate axes
+
+Additive versus projective describes the **operation**. Applying it directly
+to activations versus representing it through model parameters describes
+**delivery**. Parameter updates can be merged into weights (baking) or loaded
+as unmerged adapters. These axes are independent of the
+dense-versus-mixture-of-experts (MoE) distinction.
+
+*Table 3. Steering operation and delivery. Exactness refers to the stated local computation, subject to numerical precision; behavioral effectiveness requires separate evaluation.*
+
+| Operation | Runtime activation intervention | Parameter representation or baking |
+|---|---|---|
+| Additive | Add a fixed vector at the declared site; possible in dense and MoE models | Exact through a matching writable bias; a bias-free LoRA cannot supply a nonzero constant shift for arbitrary inputs |
+| Projective | Remove or rescale a directional component at the declared site; possible in dense and MoE models | Exact at a matching linear writer through a rank-at-most-one update; whole-residual equivalence needs additional conditions |
+
+**Runtime.** Both operations can act on an exposed residual activation
+regardless of whether dense or routed expert blocks produced its contributions.
+The arithmetic does not require editing each expert. Integration still depends
+on the architecture's actual tensors and execution order: hf2q's Qwen residual
+hook and DeepSeek FFN-writer hook are distinct contracts. Neither exact
+addition nor exact projection guarantees the intended behavior.[^12]
+
+**Parameter representation.** Write $P_\alpha=I-\alpha\hat d\hat d^\top$.
+For an affine writer $h=Wx+b$, applying $P_\alpha$ is exactly represented by
+$W'=P_\alpha W$ and $b'=P_\alpha b$. The matrix change
+$\Delta W=-\alpha\hat d(\hat d^\top W)$ has rank at most one, so it admits
+a low-rank adapter (LoRA) representation. A constant addition $h'=h+v$
+instead corresponds to $b'=b+v$ when an editable bias exists at that exact
+site. A bias-free LoRA supplies $\Delta W x$; it cannot equal nonzero $v$
+for arbitrary $x$, as $x=0$ demonstrates.[^19]
+
+A nearly constant feature can support an approximation: if $a^\top x\approx c$
+for nonzero $c$, then $\Delta W=va^\top/c$ gives $\Delta W x\approx v$.
+This depends on constancy at the adapter's input, not merely a large activation
+outlier. Massive activations have been observed in dense models and Mixtral;
+their existence does not establish a universal additive-to-LoRA conversion
+or a dense-only boundary.[^20]
+
+**Whole-residual equivalence is a stronger claim.** For $h=r+Wx$, changing
+only $W$ leaves $r$ untouched, whereas runtime projection also transforms $r$.
+Arditi et al.'s equivalence proof covers unit-strength removal of one direction
+with all preceding residual writers already orthogonalized, including
+embeddings and relevant biases. It does not establish equivalence for arbitrary
+layer-specific directions, selected hooks, or strengths.[^6]
+
+The local linear identity also applies to expert writers: a common
+$P_\alpha$ distributes over a weighted expert sum when routing is preserved
+and every contributing writer, including shared branches, is covered. MoE
+can increase the editing and adapter-support burden; it does not
+invalidate the identity. Quantized weight merging can introduce additional rounding error in
+either architecture. Weightless currently documents its LoRA fold for dense
+models and its GLP runtime path for MoE; that is a supported delivery scope,
+not a mathematical prohibition. hf2q's implementation discussed here loads
+runtime GLP artifacts; it does not provide GLP-to-LoRA baking.[^3][^12]
 
 ### Compatibility is more than a model name
 
@@ -310,7 +358,7 @@ The source map below separates selected public controls from their implementatio
 It identifies code present in the reviewed source, rather than certifying
 every combination or inheriting another engine's results.[^9]
 
-*Table 3. Selected control surfaces and corresponding hf2q implementation paths.*
+*Table 4. Selected control surfaces and corresponding hf2q implementation paths.*
 
 | Surface | Role | Source |
 |---|---|---|
@@ -490,7 +538,7 @@ column means **maintained refusal**; partial refusals and other outcomes remain
 separate. Failed judgments are excluded from the percentage denominator and
 shown explicitly.[^13]
 
-*Table 4. Historical W1 maintained-refusal rates. Percentage denominators exclude
+*Table 5. Historical W1 maintained-refusal rates. Percentage denominators exclude
 failed judgments, which are reported separately.*
 
 | Campaign subject | Maintained refusal, adversarial | Unjudged, adversarial | Maintained refusal, benign | Unjudged, benign |
@@ -567,7 +615,7 @@ intervention. Each arm used temperature zero, disabled thinking, no GCD,
 and a 256-token budget. There was one generation per prompt and arm; the
 baseline loaded no steering artifact.[^16]
 
-*Table 5. GLP panel counts. Each arm contains the same 32 adversarial and
+*Table 6. GLP panel counts. Each arm contains the same 32 adversarial and
 16 benign prompts. Fulfillment and refusal columns are semantic-judge labels;
 the final column is measured generation termination.*
 
@@ -646,7 +694,7 @@ Matt Suiche.
 ## Artifacts and reproducibility
 
 The current implementation account uses hf2q commit
-`8aaa6b1679420cb38f23d7edb068a5e7ff9375fd`. The historical W1 audit retains
+`1bf0c82f10369a0714ea72ed20d979d7c387ffde`. The historical W1 audit retains
 source snapshot `44004311717d414feaa54384578e2bcf4d140464`. Neither source
 inspection identifies a historical runtime by itself. The
 [follow-up evidence manifest](figures/gcd/followup-evidence.json) separates
@@ -667,18 +715,20 @@ recomputes those aggregates without publishing prompt or response text.
 6. Arditi, A., et al. [Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717). 2024.
 7. Suiche, M. [Sticky Refusals, Free Speculative Decoding, and the Invisible Quantisation Cliff](https://www.msuiche.com/posts/autoresearch-sticky-refusals-free-speculative-decoding-and-the-invisible-quantisation-cliff/), September 3, 2026; September 4 hook-site correction.
 8. Suiche, M. Unpublished research on activation steering, privately shared with Robert E. Lee, 2026.
-9. hf2q. [Reviewed source tree](https://github.com/robertelee78/hf2q/tree/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src); [CLI](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/cli.rs); [request policy](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/serve/api/gcd_policy.rs).
-10. hf2q. [Grammar implementation](https://github.com/robertelee78/hf2q/tree/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/serve/api/grammar); [engine](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/serve/api/engine.rs).
-11. hf2q. [Schema compiler](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/serve/api/grammar/json_schema.rs); [recon schema](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/examples/recon-opportunities.schema.json). JSON Schema, [string constraints](https://json-schema.org/understanding-json-schema/reference/string).
-12. hf2q. [GLP subsystem](https://github.com/robertelee78/hf2q/tree/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/inference/glp); [calibration implementation](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/src/calibrate/mod.rs); [ADR-054](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/docs/adr/ADR-054-glp-runtime-calibration.md).
+9. hf2q. [Reviewed source tree](https://github.com/robertelee78/hf2q/tree/1bf0c82f10369a0714ea72ed20d979d7c387ffde/src); [CLI](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/src/cli.rs); [request policy](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/src/serve/api/gcd_policy.rs).
+10. hf2q. [Grammar implementation](https://github.com/robertelee78/hf2q/tree/1bf0c82f10369a0714ea72ed20d979d7c387ffde/src/serve/api/grammar); [engine](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/src/serve/api/engine.rs).
+11. hf2q. [Schema compiler](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/src/serve/api/grammar/json_schema.rs); [recon schema](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/examples/recon-opportunities.schema.json). JSON Schema, [string constraints](https://json-schema.org/understanding-json-schema/reference/string).
+12. hf2q. [GLP subsystem](https://github.com/robertelee78/hf2q/tree/1bf0c82f10369a0714ea72ed20d979d7c387ffde/src/inference/glp); [calibration implementation](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/src/calibrate/mod.rs); [ADR-054](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/docs/adr/ADR-054-glp-runtime-calibration.md).
 13. hf2q. Historical W1 generation, judge, and embedding-screen JSONL records, September 2026. Exact filenames, hashes, counts, and access status appear in the [evidence manifest](figures/gcd/evidence.json). [Offline aggregation script](../scripts/grammar_probe/publication_data.py); [judging harness](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/judge.py). Raw logs are local campaign artifacts, not all present in the published repository.
 14. hf2q. `refusal_mass_probe.jsonl`, twelve archived observations, and [probe script](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/refusal_mass_probe.py). Probability semantics: [sampler](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/src/serve/sampler_pure.rs), `sample_token_with_logprob_topk`, and the grammar-aware engine call site.
 15. Lee, R. E. [Qwen3.6-35B-A3B-Abliterix-EGA-abliterated](https://huggingface.co/jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated), judge checkpoint. hf2q, [human spot-check of the Qwen judge](https://github.com/robertelee78/hf2q/blob/44004311717d414feaa54384578e2bcf4d140464/scripts/grammar_probe/SPOT_CHECK_RESULTS.md), September 8, 2026.
 
 
 16. hf2q. [September 10 GLP panel records and judge driver](https://github.com/robertelee78/hf2q/tree/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/gate34); [operational battery](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/battery_gcd_v2.jsonl); [historical termination report](https://github.com/robertelee78/hf2q/blob/294907cd655ee81eedb8d8b9ea30ab80ade483bb/scripts/grammar_probe/full_results_w1.truncation-report.json). Recomputed counts and source identities: [follow-up manifest](figures/gcd/followup-evidence.json).
-17. hf2q. [Revised measurement methods](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/scripts/grammar_probe/METHODS.md); [judge](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/scripts/grammar_probe/judge.py), [rejudge](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/scripts/grammar_probe/rejudge.py), [report](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/scripts/grammar_probe/report.py), and [offline/mock tests](https://github.com/robertelee78/hf2q/blob/8aaa6b1679420cb38f23d7edb068a5e7ff9375fd/scripts/grammar_probe/test_harness_repair.py).
+17. hf2q. [Revised measurement methods](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/scripts/grammar_probe/METHODS.md); [judge](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/scripts/grammar_probe/judge.py), [rejudge](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/scripts/grammar_probe/rejudge.py), [report](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/scripts/grammar_probe/report.py), and [offline/mock tests](https://github.com/robertelee78/hf2q/blob/1bf0c82f10369a0714ea72ed20d979d7c387ffde/scripts/grammar_probe/test_harness_repair.py).
 18. Suiche, M. [Captain Vector: GLP production and validation utility](https://github.com/msuiche/weightless/tree/3481e30eba9d4c85b8f3bdaf9bd074ad7fe28f87/tools/captain-vector). Revision `3481e30eba9d`; accessed September 11, 2026.
+19. Hu, E. J., et al. [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685v2). 2021.
+20. Sun, M., Chen, X., Kolter, J. Z., and Liu, Z. [Massive Activations in Large Language Models](https://arxiv.org/abs/2402.17762v2). COLM, 2024.
 
 [^1]: Geng et al., *Grammar-Constrained Decoding for Structured NLP Tasks without Finetuning* (2023), Source 1.
 [^2]: Ovando, supplied June 26, 2026 manuscript, §§3–4, 6, 8, and companion proof; Source 2.
@@ -699,3 +749,5 @@ recomputes those aggregates without publishing prompt or response text.
 [^16]: September 10 GLP panel, final battery attempt, and historical termination cross-tabs; Source 16.
 [^17]: Revised measurement harness and focused offline/mock validation; Source 17.
 [^18]: Public Captain Vector README and implementation at the cited revision; Source 18.
+[^19]: Hu et al., LoRA parameterization; the affine-writer identities follow by substitution, Source 19.
+[^20]: Sun et al., massive activations in dense models and Mixtral, Sections 2–3; the constant-feature approximation follows by substitution, Source 20.

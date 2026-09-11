@@ -992,6 +992,10 @@ checkpoint-specific GLP artifacts, including variants for different sites on
 the same checkpoint; GLP-29 is one example, not the format's only artifact.
 The format distinguishes additive
 steering from projective steering (`h ← h − α(h·d̂)d̂` for a unit direction).
+That operation choice is separate from activation hooks versus parameter
+updates: either operation can run on dense or MoE activations at a supported
+site. Exact parameter equivalence depends on the writer, biases, and residual
+paths. hf2q applies GLP at runtime; it does not bake GLP into weights or LoRA.
 Compatibility depends on the checkpoint, graph layers, activation site, mode,
 and strength. The inspected application paths are Qwen 3.5/3.6/3.8 and
 DeepSeek-V4. Binding checks the declared hook, layer range, and vector width.
