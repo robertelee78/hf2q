@@ -3361,6 +3361,9 @@ pub struct LoadOptions {
     pub kv_persist_budget_bytes: u64,
     pub glp_path: Option<PathBuf>,
     pub glp_alpha: Option<f32>,
+    /// ADR-059: optional KV-cache graft artifact (GGUF `graft.*` bank),
+    /// loaded + bind-validated at model load. Explicit file only.
+    pub kv_graft_path: Option<PathBuf>,
 }
 
 impl LoadedModel {
@@ -16825,6 +16828,11 @@ struct Qwen35KvGuard<'a> {
 
 impl<'a> Qwen35KvGuard<'a> {
     fn take(model: &'a mut super::engine_qwen35::Qwen35LoadedModel) -> Result<Self> {
+        // ADR-059 fail-closed gate: the SlotAware streaming loop drives
+        // prefill/decode positions directly; a bound graft shifts all of
+        // them. Refuse by name until the graft-aware position wiring
+        // lands — never serve ungrafted under a graft flag.
+        super::engine_qwen35::ensure_graft_serving_supported(model)?;
         let kv = model.persistent_kv_cache.take().ok_or_else(|| {
             anyhow::anyhow!(
                 "capability_unsupported: ADR-040 Phase F M1 — persistent_kv_cache is None \
@@ -34575,6 +34583,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a)");
         let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b)");
@@ -34828,6 +34837,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         // Fixed prompt set (the same prompts the N=4 parity + interleave
         // tests use, so golden ↔ parity are directly comparable).
@@ -34891,6 +34901,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -34938,6 +34949,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         // Two DISTINCT prompts so cross-slot contamination is visible.
         let p0: Vec<u32> = vec![1u32, 2, 3, 4, 5];
@@ -35153,6 +35165,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -35215,6 +35228,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -35509,6 +35523,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_tokens = 16usize;
@@ -35756,6 +35771,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_tokens = 16usize;
@@ -36023,6 +36039,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // Four distinct greedy prompts.
@@ -36127,6 +36144,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let eager_prompt = vec![42u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize];
         let resumed_prompt = vec![43u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize * 2 + 1];
@@ -36261,6 +36279,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // IDENTICAL prompt in all four slots. Serial ref at the LONGEST budget so
@@ -36394,6 +36413,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // Eight distinct greedy prompts (the N=4 set + four more distinct ones).
@@ -36556,6 +36576,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt = vec![1u32, 2, 3];
         let params = SamplingParams {
@@ -36596,6 +36617,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt = vec![1u32, 2, 3];
         let params = SamplingParams {
@@ -36671,6 +36693,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // Eight distinct greedy prompts (same shape as the gemma4 N=8 gate).
@@ -36785,6 +36808,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         let prompt_len: usize = std::env::var("HF2Q_S019_PROMPT_LEN")
@@ -36917,6 +36941,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // N=1 mechanism gate: a single 70-token prompt exercising the full
@@ -37054,6 +37079,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let lens = [26u32, 40, 13, 55, 70, 19, 33, 48];
         let mk = |i: u32, l: u32| -> Vec<u32> {
@@ -37178,6 +37204,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         // Every request is at or above the conservative tiny-prefill boundary,
         // so this test continues to prove that the eligible multi-seq path
@@ -37312,6 +37339,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         // A len configurable via HF2Q_BISECT_ALEN (default 2 → B offset 2 ≡2 mod4).
         // B len via HF2Q_BISECT_BLEN (default 10). Use larger to hit tensor-mm (>64).
@@ -37472,6 +37500,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         // HF2Q_BENCH_TOKENS = decode length per stream (default 128).
         let bench_tokens: usize = std::env::var("HF2Q_BENCH_TOKENS")
@@ -37823,6 +37852,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // Same prompt, divergent max_tokens (5 / 50 / 200) so slots finish
@@ -37927,6 +37957,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_decode = 1usize; // first-token prefill logits only
@@ -38279,6 +38310,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a, H2)");
         let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b, H2)");
@@ -43198,6 +43230,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded =
             LoadedModel::load(&opts).expect("H21: LoadedModel::load must succeed for Gemma 4 GGUF");
@@ -43266,6 +43299,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded = LoadedModel::load(&opts).expect("H22: load Gemma 4 GGUF");
         let mut g = match loaded {
@@ -43342,6 +43376,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded = LoadedModel::load(&opts).expect("H23: load Gemma 4 GGUF");
         let g = match loaded {
@@ -43410,6 +43445,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded = LoadedModel::load(&opts).expect("H24: load Gemma 4 GGUF");
         let engine =

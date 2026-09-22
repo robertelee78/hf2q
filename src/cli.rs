@@ -1108,6 +1108,16 @@ pub struct ChatArgs {
     #[arg(long, requires = "glp")]
     pub glp_alpha: Option<f32>,
 
+    /// ADR-059: bind a KV-cache graft (GGUF `graft.*` bank) on the
+    /// chat-owned server this session spawns. Forwarded to `serve`; same
+    /// scope note as --gcd. Explicit file only (no auto-discovery).
+    #[arg(
+        long,
+        value_name = "KV_GRAFT_GGUF",
+        value_hint = clap::ValueHint::FilePath
+    )]
+    pub kv_graft: Option<PathBuf>,
+
     /// Logical context limit (tokens) for every conversation slot on the
     /// chat-owned server this session spawns. Forwarded to `serve --ctx`;
     /// serve-time property like --gcd. A value above the model's declared
@@ -1361,6 +1371,26 @@ pub struct ServeArgs {
     /// in the direction norm, so alpha is never folded into the file.
     #[arg(long, requires = "glp")]
     pub glp_alpha: Option<f32>,
+
+    /// ADR-059: bind a KV-cache graft (GGUF `graft.*` bank) to the served
+    /// model. The bank's per-layer K/V rows are spliced into every
+    /// full-attention layer's cache as fabricated history at positions
+    /// 0..n_slots; base weights are never modified and unbinding restores
+    /// the baseline on fresh state. Explicit file only — no Hub
+    /// auto-discovery (a bank is checkpoint-, RoPE-, and quant-lane
+    /// bound; discovery cannot safely choose among variants). Reader
+    /// conformance, checkpoint identity, site/layer coverage, GQA
+    /// geometry, or RoPE-identity errors abort startup. v1 site:
+    /// `full_attn_kv` (Qwen3.5/3.6/3.8 full-attention layers; other
+    /// architectures refuse the bind with a named error).
+    ///
+    /// Graft concept credit: phantom-kv (lordx64).
+    #[arg(
+        long,
+        value_name = "KV_GRAFT_GGUF",
+        value_hint = clap::ValueHint::FilePath
+    )]
+    pub kv_graft: Option<PathBuf>,
 
     /// ADR-053: enable GCD (Grammar-Constrained Decoding) — forced
     /// abliteration via the grammar stack, proven on DeepSeek-V4 (W1 arm:
@@ -1794,6 +1824,44 @@ mod tests {
             panic!("expected chat");
         };
         assert!(chat.gcd_schema_locked);
+    }
+
+    /// ADR-059: `--kv-graft` takes an explicit file on both `serve` and
+    /// `chat` — no bare form, no auto-discovery (a bank is checkpoint-,
+    /// RoPE-, and quant-lane bound; discovery cannot safely choose).
+    #[test]
+    fn kv_graft_parses_on_serve_and_chat_and_requires_a_value() {
+        for subcommand in ["serve", "chat"] {
+            let cli = Cli::parse_from(["hf2q", subcommand, "model.gguf", "--kv-graft", "/tmp/graft.gguf"]);
+            match cli.command {
+                Command::Serve(serve) => {
+                    assert_eq!(
+                        serve.kv_graft.as_deref(),
+                        Some(std::path::Path::new("/tmp/graft.gguf"))
+                    );
+                }
+                Command::Chat(chat) => {
+                    assert_eq!(
+                        chat.kv_graft.as_deref(),
+                        Some(std::path::Path::new("/tmp/graft.gguf"))
+                    );
+                }
+                other => panic!("expected {subcommand}, got {other:?}"),
+            }
+            // Bare `--kv-graft` (no value) is a parse error — unlike
+            // `--glp`, there is no auto-discovery form.
+            assert!(
+                Cli::try_parse_from(["hf2q", subcommand, "model.gguf", "--kv-graft"]).is_err(),
+                "bare --kv-graft must not parse on {subcommand}"
+            );
+            // Default is absent.
+            let cli = Cli::parse_from(["hf2q", subcommand, "model.gguf"]);
+            match cli.command {
+                Command::Serve(serve) => assert!(serve.kv_graft.is_none()),
+                Command::Chat(chat) => assert!(chat.kv_graft.is_none()),
+                other => panic!("expected {subcommand}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

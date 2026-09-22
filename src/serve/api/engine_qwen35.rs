@@ -391,6 +391,46 @@ impl Qwen35LoadedModel {
             model.glp = Some(bound);
         }
 
+        // ADR-059: bind a KV-cache graft when the operator supplied one.
+        // Fail-closed: reader conformance, checkpoint identity, site
+        // coverage, GQA geometry, or RoPE-identity errors abort the serve
+        // load rather than silently serving ungrafted. The bank is
+        // host-side until spliced at slot admission; the identity hash
+        // participates in LCP cache keys from this build on.
+        if let Some(graft_path) = opts.kv_graft_path.as_ref() {
+            let (bank, compatibility) = crate::inference::graft::validate_graft_for_model(
+                graft_path,
+                model_path,
+                &gguf,
+            )
+            .with_context(|| format!("KV graft bind: {}", graft_path.display()))?;
+            if compatibility != crate::inference::glp::Compatibility::Checkpoint {
+                tracing::warn!(
+                    ?compatibility,
+                    "KV graft does not declare a verified checkpoint revision; \
+                     behavior requires validation"
+                );
+            }
+            let bound = crate::inference::graft::BoundGraft::bind(bank);
+            tracing::info!(
+                layers = bound.bank.layers.len(),
+                n_slots = bound.bank.n_slots,
+                n_kv_heads = bound.bank.n_kv_heads,
+                head_dim = bound.bank.head_dim,
+                kind = ?bound.bank.kind,
+                site = bound.bank.hook_point.as_str(),
+                rope_theta = bound.bank.rope_theta,
+                rotary_dim = bound.bank.rotary_dim,
+                identity_hash = bound.identity_hash,
+                path = %graft_path.display(),
+                "KV graft bound to Qwen35 (spliced at slot admission; \
+                 grafted serving is gated until the request-path position \
+                 wiring lands — grafted requests fail closed with a named \
+                 error, never silently ungrafted)"
+            );
+            model.kv_graft = Some(bound);
+        }
+
         if let Some(context) = effective_context {
             model.cfg.max_position_embeddings = context;
         }
@@ -1651,7 +1691,10 @@ fn build_lcp_key_for_qwen35(
         source_sha256,
         &chat_template_hash,
     );
-    let params_hash = glp_steering_params_hash(qwen.model.glp.as_ref());
+    let params_hash = steering_and_graft_params_hash(
+        qwen.model.glp.as_ref(),
+        qwen.model.kv_graft.as_ref().map(|g| &g.bank),
+    );
     crate::serve::kv_persist::lcp_registry::LcpKey {
         model_fingerprint: fp,
         tenant_id: String::new(),
@@ -1685,6 +1728,25 @@ fn glp_steering_params_hash(glp: Option<&crate::inference::glp::BoundGlp>) -> u6
             }
         }
     }
+    let digest = h.finalize();
+    u64::from_le_bytes(digest[..8].try_into().expect("sha256 prefix"))
+}
+
+/// ADR-059: combined activation-affecting identity — GLP steering AND
+/// the KV graft. A grafted server's saved KV must never be addressed by
+/// an ungrafted or differently-grafted one, exactly as S6 established
+/// for steering; the graft contributes its own section so either
+/// configuration change rebuilds the key. Unconfigured engines hash the
+/// same "none/none" pair and keep the v1 key shape.
+fn steering_and_graft_params_hash(
+    glp: Option<&crate::inference::glp::BoundGlp>,
+    graft: Option<&crate::inference::graft::GraftBank>,
+) -> u64 {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"steering=v1");
+    h.update(&glp_steering_params_hash(glp).to_le_bytes());
+    h.update(&crate::inference::graft::graft_params_hash(graft).to_le_bytes());
     let digest = h.finalize();
     u64::from_le_bytes(digest[..8].try_into().expect("sha256 prefix"))
 }
@@ -2909,6 +2971,25 @@ fn generate_qwen35_once_ordinary(
 /// grammar-constrained, logprob, or biased request is routed to the ordinary
 /// decoder. A future sampler lane can broaden `is_greedy_eligible` only after
 /// it proves that proposal and target distributions are identical.
+/// ADR-059 fail-closed request gate. A bound graft changes what cache
+/// bytes mean — fabricated history at positions `0..n_slots` shifts every
+/// subsequent position and every cursor↔token-count equivalence. Until
+/// the request-path position wiring lands (serial-cache admission,
+/// prompt-cache/LCP restore semantics, capacity-growth re-splice, decode
+/// position bases), a grafted engine refuses requests BY NAME rather
+/// than serving ungrafted — the `glp.mode` fail-closed discipline
+/// applied to serving. Ungrafted engines pass unchanged.
+pub(super) fn ensure_graft_serving_supported(qwen: &Qwen35LoadedModel) -> Result<()> {
+    anyhow::ensure!(
+        qwen.model.kv_graft.is_none(),
+        "KV graft bound but grafted serving is not enabled in this build \
+         (ADR-059 request-path wiring pending: position offsets, serial \
+         cache admission, prompt-cache/LCP restore semantics); refusing \
+         rather than serving ungrafted"
+    );
+    Ok(())
+}
+
 pub(super) fn generate_qwen35_once(
     qwen: &mut Qwen35LoadedModel,
     prompt_tokens: &[u32],
@@ -2918,6 +2999,7 @@ pub(super) fn generate_qwen35_once(
 ) -> Result<GenerationResult> {
     use super::qwen35_speculation::{self, QwenSpeculationDecision};
 
+    ensure_graft_serving_supported(qwen)?;
     let mut decision = qwen.speculation.decide(
         prompt_tokens,
         is_serial_mtp_exact_eligible(params),
@@ -3159,6 +3241,7 @@ pub fn generate_qwen35_once_slot_aware(
     kv_cache: &mut HybridKvCache,
     slot_id: SlotId,
 ) -> Result<GenerationResult> {
+    ensure_graft_serving_supported(qwen)?;
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "generate_qwen35_once_slot_aware: empty prompt_tokens"
@@ -6943,6 +7026,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
     if soft_tokens.is_empty() {
         return generate_qwen35_once(qwen, prompt_tokens, params, registration, supervisor);
     }
+    ensure_graft_serving_supported(qwen)?;
 
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
@@ -8737,6 +8821,7 @@ pub(super) fn embed_qwen35(
     prompt_tokens: &[u32],
     supervisor: &EngineSupervisor,
 ) -> Result<Vec<f32>> {
+    ensure_graft_serving_supported(qwen)?;
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "embed_qwen35: empty prompt_tokens"
@@ -8875,6 +8960,7 @@ pub fn embed_qwen35_slot_aware(
     kv_cache: &mut HybridKvCache,
     slot_id: SlotId,
 ) -> Result<Vec<f32>> {
+    ensure_graft_serving_supported(qwen)?;
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "embed_qwen35_slot_aware: empty prompt_tokens"
@@ -10631,6 +10717,7 @@ mod tests {
             dwq_overlay_path: None,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
         };
@@ -11224,5 +11311,48 @@ mod glp_cache_identity_tests {
         let none = glp_steering_params_hash(None);
         assert_eq!(none, glp_steering_params_hash(None));
         assert_ne!(none, glp_steering_params_hash(Some(&a)));
+    }
+
+    /// ADR-059 S6 extension: the combined LCP identity must separate
+    /// saved activations across graft configurations — a grafted
+    /// server's KV is never addressable by an ungrafted or
+    /// differently-grafted one, on top of the GLP separation above.
+    #[test]
+    fn graft_configuration_is_part_of_lcp_identity() {
+        use crate::inference::graft::bind::test_bank;
+
+        let glp = bound(
+            GlpHookPoint::ResidualStreamPostLayer,
+            GlpMode::Project,
+            1.0,
+            BTreeMap::from([(3u32, vec![0.5f32, -0.5])]),
+        );
+        let graft_a = test_bank(3, 2, 8, &[3, 7]);
+        let graft_a2 = test_bank(3, 2, 8, &[3, 7]);
+        let graft_other = test_bank(4, 2, 8, &[3, 7]);
+
+        // Same configurations → same key.
+        assert_eq!(
+            steering_and_graft_params_hash(Some(&glp), Some(&graft_a)),
+            steering_and_graft_params_hash(Some(&glp), Some(&graft_a2))
+        );
+
+        // Adding a graft to a steered engine rebuilds the key.
+        assert_ne!(
+            steering_and_graft_params_hash(Some(&glp), None),
+            steering_and_graft_params_hash(Some(&glp), Some(&graft_a))
+        );
+
+        // Changing the graft rebuilds the key.
+        assert_ne!(
+            steering_and_graft_params_hash(Some(&glp), Some(&graft_a)),
+            steering_and_graft_params_hash(Some(&glp), Some(&graft_other))
+        );
+
+        // Unconfigured is stable and distinct from every configured form.
+        let bare = steering_and_graft_params_hash(None, None);
+        assert_eq!(bare, steering_and_graft_params_hash(None, None));
+        assert_ne!(bare, steering_and_graft_params_hash(None, Some(&graft_a)));
+        assert_ne!(bare, steering_and_graft_params_hash(Some(&glp), None));
     }
 }
