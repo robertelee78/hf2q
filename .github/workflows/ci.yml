@@ -616,7 +616,9 @@ jobs:
             inference::glp::compatibility::tests \
             inference::glp::source_identity::tests \
             calibrate::export_tests \
-            inference::glp::reader::tests; do
+            inference::glp::reader::tests \
+            inference::graft::reader::tests \
+            inference::graft::compatibility::tests; do
             if ! cargo test --locked --bin hf2q --all-features "$contract"; then
               contract_failures=1
             fi
