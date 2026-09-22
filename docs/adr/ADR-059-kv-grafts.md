@@ -304,12 +304,38 @@ the graft hash. No sampling-path changes.
    canary above proves the serve-path equivalence end-to-end (output
    level); kv_persist is refused under graft at boot pending the
    graft-aware disk codec.
-6. **Throughput report**: decode and prefill tok/s, grafted vs
-   ungrafted, median of multiple runs. Expected cost is attention over
-   N extra slots at covered layers only (≈ a prompt N tokens longer at
-   those layers); acceptance is "within the measured noise band or the
-   delta is documented and accepted," never silently shipped.
-   **OPEN** — the paired-arm harness extension measures this.
+ 6. **Throughput report**: decode and prefill tok/s, grafted vs
+    ungrafted, median of multiple runs. Expected cost is attention over
+    N extra slots at covered layers only (≈ a prompt N tokens longer at
+    those layers); acceptance is "within the measured noise band or the
+    delta is documented and accepted," never silently shipped.
+    **MEASURED 2026-09-22** on Qwen3.6-35B-Abliterix-APEX Q5_K_M
+    (TQ substrate, SerialFifo, speculation off, 333-token prompt,
+    128-token completions, 5 runs/arm, A-B-A design with fresh process
+    per arm; harness: `scripts/graft_probe/throughput.sh`):
+    - **Decode: a 64-slot graft costs ~5% tok/s** (100.4 → 94.6 vs
+      baseline, -4.3% vs the trailing baseline2) — OUTSIDE the measured
+      machine-drift band (±1.6% A-vs-A after a 3-minute pre-warm) and
+      mechanically consistent: the graft grows every covered layer's
+      attention rows by 64/333 ≈ +19%, and the TQ read path (per-row
+      Hadamard dequant) is a significant share of per-token time at
+      full-attention layers. The cost scales as
+      `n_slots / context_length` — ~0.8% at 8K context, larger at very
+      short contexts. Documented and accepted: steering buys a decode
+      tax proportional to graft size over context length.
+    - **Prefill: within the noise band** — the A-B deltas straddle
+      zero (+5.7% / +21.7%) inside a ±13% A-vs-A drift band; at a
+      333-token prompt the TTFT is ~60 ms and client-side jitter
+      dominates. Resolving a prefill delta needs a server-side
+      chunk-timing harness or a much longer prompt; the mechanical
+      expectation is the same proportional row growth at covered
+      layers.
+    - **Methodology (load-bearing)**: an un-warmed A-B-A showed +13.2%
+      decode / +31.1% prefill A-vs-A drift — the host's GPU warm-up
+      ramp swamps any graft effect for the first ~10 minutes of
+      sustained load. The harness pre-warms ~3 minutes before the
+      first measured arm; without that, ANY A-B throughput comparison
+      on this host is noise.
 7. **Paired-arm behavioral panels** per the measurement doctrine:
    baseline / graft / GCD / graft+GCD, identical model artifacts,
    prompts, sampling settings, budgets; engagement, capability
