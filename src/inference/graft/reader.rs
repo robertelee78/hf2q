@@ -298,9 +298,13 @@ fn parse_gguf(
     }
     let tensor_count = reader.u64()?;
     let metadata_count = reader.u64()?;
-    if tensor_count == 0 || tensor_count > MAX_TENSORS {
+    // Zero tensors is a VALID graft file: the zero-slot canary artifact
+    // (graft.n_slots=0) carries no K/V tensors by definition. The
+    // graft-specific gates below reject emptiness that matters
+    // (n_slots>0 with no tensors). Only the upper bound is fatal here.
+    if tensor_count > MAX_TENSORS {
         return Err(GraftError::Malformed(format!(
-            "tensor count {tensor_count} outside 1..={MAX_TENSORS}"
+            "tensor count {tensor_count} outside 0..={MAX_TENSORS}"
         )));
     }
     if metadata_count == 0 || metadata_count > MAX_METADATA {
@@ -1026,9 +1030,10 @@ mod tests {
         let mut meta = base_meta();
         meta.retain(|(k, _)| *k != "graft.n_slots");
         meta.push(("graft.n_slots", MetaValue::U32(0)));
-        // No tensors: the GGUF writer requires >= 1 tensor, so emit an
-        // unrelated one (the reader ignores non-graft names).
-        let bytes = build_gguf(&meta, &[("token_embd.weight", vec![1], vec![0.0])]);
+        // No tensors at all: the canary artifact is a legitimately
+        // zero-tensor GGUF (the generic GGUF guard allows it; the
+        // graft gates above define what emptiness means).
+        let bytes = build_gguf(&meta, &[]);
         let bank = GraftBank::from_bytes(&bytes).unwrap();
         assert_eq!(bank.n_slots, 0);
         assert!(bank.layers.is_empty());
