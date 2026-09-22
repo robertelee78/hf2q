@@ -5018,26 +5018,13 @@ pub fn cmd_serve(
         // variants). Reader conformance and bind validation run at model
         // load and abort startup on any error.
         engine_config.kv_graft_path = args.kv_graft.clone();
-        // ADR-059: a bound graft forces the SerialFifo scheduler. The
-        // serial unary + streaming paths are graft-wired (splice at
-        // admission, position offsets, graft-aware snapshots); the
-        // SlotAware continuous-batching graft wiring is the named
-        // follow-up and its loop refuses grafts fail-closed. This is a
-        // mode selection the operator sees at boot — never a silent
-        // ungrafted fallback.
-        if engine_config.kv_graft_path.is_some()
-            && engine_config.engine_mode
-                != crate::serve::api::engine::EngineMode::SerialFifo
-        {
-            tracing::info!(
-                prior = ?engine_config.engine_mode,
-                "KV graft bound: forcing SerialFifo scheduler (graft-aware \
-                 continuous batching is the ADR-059 follow-up); grafted \
-                 serving runs on the serial path"
-            );
-            engine_config.engine_mode =
-                crate::serve::api::engine::EngineMode::SerialFifo;
-        }
+        // ADR-059: grafted serving runs on BOTH engine paths — serial
+        // (unary + text streaming) and SlotAware continuous batching
+        // (splice at cold admission, graft-shifted RoPE positions,
+        // graft-aware slot anchors, MTP suppressed). The unwired surfaces
+        // (vision/extension generation, embeddings) refuse grafts by name
+        // at their own request gates. No scheduler forcing: the operator's
+        // mode selection stands.
 
         state.register_engine_config_for_path(&resolved.gguf_path, engine_config.clone())?;
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for

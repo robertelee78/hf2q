@@ -16828,11 +16828,11 @@ struct Qwen35KvGuard<'a> {
 
 impl<'a> Qwen35KvGuard<'a> {
     fn take(model: &'a mut super::engine_qwen35::Qwen35LoadedModel) -> Result<Self> {
-        // ADR-059 fail-closed gate: the SlotAware streaming loop drives
-        // prefill/decode positions directly; a bound graft shifts all of
-        // them. Refuse by name until the graft-aware position wiring
-        // lands — never serve ungrafted under a graft flag.
-        super::engine_qwen35::ensure_graft_serving_supported(model)?;
+        // ADR-059: the SlotAware loop is graft-wired (splice at cold
+        // admission in `Qwen35PrefillState::begin`, graft-shifted RoPE
+        // positions, graft-aware slot anchors, MTP suppressed). Warmup is
+        // cache-priming only and embeds/extension requests refuse grafts
+        // by name inside their own paths.
         let kv = model.persistent_kv_cache.take().ok_or_else(|| {
             anyhow::anyhow!(
                 "capability_unsupported: ADR-040 Phase F M1 — persistent_kv_cache is None \
@@ -17009,6 +17009,7 @@ fn validate_qwen35_generation_request(
     prompt_tokens: usize,
     max_tokens: usize,
     max_seq_len: usize,
+    graft_len: usize,
 ) -> Result<Qwen35ValidatedRequestShape> {
     anyhow::ensure!(
         prompt_tokens > 0,
@@ -17022,8 +17023,12 @@ fn validate_qwen35_generation_request(
         .context("invalid_request: Qwen35 prompt token count exceeds u32")?;
     let max_tokens_u32 =
         u32::try_from(max_tokens).context("invalid_request: Qwen35 max_tokens exceeds u32")?;
+    // ADR-059: a bound graft occupies physical positions 0..graft_len of
+    // every covered full-attention layer; the per-request capacity must
+    // cover those rows too.
     let need_seq = prompt_tokens
-        .checked_add(max_tokens)
+        .checked_add(graft_len)
+        .and_then(|tokens| tokens.checked_add(max_tokens))
         .and_then(|tokens| tokens.checked_add(64))
         .context("invalid_request: Qwen35 prompt + completion capacity overflow")?;
     anyhow::ensure!(
@@ -18530,10 +18535,35 @@ fn admit_qwen35_slot(
         .as_ref()
         .expect("kv Some during Qwen35 admission")
         .max_seq_len as usize;
+    // ADR-059: the bound graft (if any) shifts every physical position and
+    // adds graft_len rows per covered full-attention layer.
+    let graft = guard
+        .model
+        .model
+        .kv_graft
+        .as_ref();
+    let graft_len = graft
+        .map(|bound| bound.bank.n_slots as usize)
+        .unwrap_or(0);
+    // ADR-059 fail-closed: extension (vision soft-token / deepstack)
+    // prefill is not graft-wired. Refuse by name before validation or
+    // scheduling — never serve ungrafted under a graft flag.
+    if graft.is_some() && vision.is_some() {
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!(
+                "KV graft bound but Qwen35 vision/extension generation is not \
+                 graft-wired (ADR-059); refusing rather than serving ungrafted"
+            )),
+            false,
+        );
+        return None;
+    }
     let request_shape = match validate_qwen35_generation_request(
         prompt_tokens.len(),
         params.max_tokens,
         max_seq_len,
+        graft_len,
     ) {
         Ok(shape) => shape,
         Err(error) => {
@@ -18607,7 +18637,11 @@ fn admit_qwen35_slot(
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
+        // ADR-059: the graft adds graft_len physical rows on every covered
+        // full-attention layer — exactly graft_len tokens' worth of KV
+        // bytes (complete site coverage) — so the byte estimate covers it.
         u64::from(request_shape.prompt_tokens)
+            .saturating_add(u64::try_from(graft_len).unwrap_or(u64::MAX))
             .saturating_add(u64::from(request_shape.max_tokens))
             .saturating_mul(kv_bytes_per_token)
     };
@@ -18750,7 +18784,54 @@ fn admit_qwen35_slot(
             checkpoint_bytes = anchor.kv.total_bytes(),
             "Qwen35 slot-local prompt-boundary cache hit"
         );
-        let spec_candidate = anchor.spec.clone();
+        // ADR-059: the anchor's boundary is the physical cursor
+        // (graft rows + prompt rows). After the rewind the graft rows sit
+        // intact below it (append-only contract); the region tag can only
+        // be absent if a reset happened, and a reset clears the anchor —
+        // so a missing tag here is an invariant failure. Fail closed
+        // rather than serving ungrafted.
+        if graft_len > 0 {
+            match guard
+                .kv
+                .as_ref()
+                .expect("kv Some after Qwen anchor restore")
+                .graft_region_for_slot(handle.slot_id)
+            {
+                Ok(marked) if marked as usize == graft_len => {}
+                other => {
+                    let _ = other;
+                    reply = match reset_qwen35_slot_for_reply(
+                        guard,
+                        scheduler,
+                        handle,
+                        kv_bytes_per_token,
+                        reply,
+                    ) {
+                        Ok(reply) => reply,
+                        Err(fatal) => return Some(fatal),
+                    };
+                    retained_tokens[slot_idx].clear_all();
+                    prompt_anchors[slot_idx] = None;
+                    scheduler.release(handle);
+                    finish_qwen35_operator_request(handle, "failed");
+                    slot_fire_done(
+                        reply,
+                        Err(anyhow::anyhow!(
+                            "Qwen35 anchor restore for slot {} left the graft region \
+                             unmarked (expected {graft_len}); refusing rather than \
+                             serving ungrafted",
+                            handle.slot_id.0
+                        )),
+                        false,
+                    );
+                    return None;
+                }
+            }
+        }
+        // ADR-059: speculative prefix boundaries carry MTP state that never
+        // saw the graft; suppress reuse under a bound graft.
+        let spec_candidate =
+            if graft.is_none() { anchor.spec.clone() } else { None };
         let cached_spec = spec_candidate.clone().filter(|spec| {
             spec.token_count == cached_tokens
                 && guard
@@ -18780,7 +18861,13 @@ fn admit_qwen35_slot(
         (cached_logits, cached_spec)
     } else {
         let slot_idx = handle.slot_id.0 as usize;
-        let spec_candidate = retained_tokens[slot_idx].spec.clone();
+        // ADR-059: speculative prefix boundaries carry MTP state that never
+        // saw the graft; suppress reuse under a bound graft.
+        let spec_candidate = if graft.is_none() {
+            retained_tokens[slot_idx].spec.clone()
+        } else {
+            None
+        };
         let live_spec = spec_candidate.clone().filter(|spec| {
             spec.token_count == cached_tokens
                 && guard
@@ -18807,11 +18894,27 @@ fn admit_qwen35_slot(
     // Record an explicit policy decision at SlotAware admission. Exact
     // speculation is enabled only after bounded prefill captures any required
     // MTP state; unsupported semantics stay on ordinary target decode.
-    let slot_mtp_decision = super::qwen35_speculation::classify_request(
+    let mut slot_mtp_decision = super::qwen35_speculation::classify_request(
         guard.model.speculation.policy(),
         super::engine_qwen35::is_qwen_server_speculation_exact_eligible(&params),
         cached_tokens == prompt_tokens.len() && cached_spec_candidate.is_none(),
     );
+    // ADR-059: the MTP cache is a separate slot arena that never receives
+    // the graft; under a bound graft its target logits would verify drafts
+    // against the ungrafted distribution. Skip speculation (an
+    // optimization, never a semantic path) and serve through ordinary
+    // grafted decode.
+    if graft.is_some() && slot_mtp_decision == super::qwen35_speculation::QwenSpeculationDecision::Eligible
+    {
+        tracing::info!(
+            target: "hf2q::serve::api::engine_qwen35::graft",
+            slot = handle.slot_id.0,
+            "KV graft bound: skipping SlotAware MTP (spec-decode cache is not \
+             graft-wired); serving via ordinary grafted decode"
+        );
+        slot_mtp_decision =
+            super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable;
+    }
     if slot_mtp_decision != super::qwen35_speculation::QwenSpeculationDecision::Eligible {
         super::qwen35_speculation::record_fallback(slot_mtp_decision);
     }
@@ -18836,6 +18939,7 @@ fn admit_qwen35_slot(
         cached_spec,
         vision,
         guard.model.hidden_size,
+        graft,
     ) {
         Ok(state) => state,
         Err(error) => {
@@ -44583,7 +44687,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
 
     #[test]
     fn qwen_zero_completion_stream_is_rejected_before_sse_admission() {
-        let error = validate_qwen35_generation_request(8, 0, 262_144)
+        let error = validate_qwen35_generation_request(8, 0, 262_144, 0)
             .expect_err("zero-token generation must fail at the engine boundary");
         let (events, mut received_events) = mpsc::channel(2);
         let (admission, received_admission) = oneshot::channel();
@@ -44675,17 +44779,32 @@ mod qwen35_bounded_prefill_watchdog_tests {
             (8, u32::MAX as usize + 1, "exceeds u32"),
             (262_080, 1, "exceeding the per-slot limit"),
         ] {
-            let error = validate_qwen35_generation_request(prompt, completion, 262_144)
+            let error = validate_qwen35_generation_request(prompt, completion, 262_144, 0)
                 .expect_err("invalid scheduler shape must fail before admission");
             assert!(
                 format!("{error:#}").contains(expected),
                 "unexpected validation error: {error:#}"
             );
         }
-        let shape = validate_qwen35_generation_request(87_972, 64, 262_144)
+        let shape = validate_qwen35_generation_request(87_972, 64, 262_144, 0)
             .expect("watchdog fixture fits the full logical context");
         assert_eq!(shape.prompt_tokens, 87_972);
         assert_eq!(shape.max_tokens, 64);
+    }
+
+    #[test]
+    fn qwen_request_shape_counts_graft_rows_against_capacity() {
+        // ADR-059: the graft occupies physical positions 0..graft_len of
+        // every covered full-attention layer; a request that fits ungrafted
+        // must fail when the graft rows push it past the per-slot limit.
+        validate_qwen35_generation_request(262_070, 1, 262_144, 0)
+            .expect("fits ungrafted (262_070 + 1 + 64 <= 262_144)");
+        let error = validate_qwen35_generation_request(262_070, 1, 262_144, 16)
+            .expect_err("graft rows must count against per-request capacity");
+        assert!(
+            format!("{error:#}").contains("exceeding the per-slot limit"),
+            "capacity error, got: {error:#}"
+        );
     }
 
     #[test]
