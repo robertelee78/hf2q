@@ -2889,6 +2889,12 @@ impl HybridKvCache {
                 *c = 0;
             }
         }
+        // 1.5 ADR-059 — release the per-slot graft region tag with the
+        // cursor (the region's rows become unobservable exactly like any
+        // other stale rows; a fresh request re-splices at admission).
+        if let Some(g) = self.graft_len.get_mut(slot_idx) {
+            *g = 0;
+        }
         // 2. mtp_slot (optional) — reset per-slot current_len cursor.
         if let Some(fa) = self.mtp_slot.as_mut() {
             if let Some(c) = fa.current_len.get_mut(slot_idx) {
