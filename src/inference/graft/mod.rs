@@ -25,8 +25,10 @@
 //! tagging, and cache-identity integration live with the family serve
 //! paths per the site contracts.
 
+pub mod bind;
 pub mod compatibility;
 pub mod reader;
 
+pub use bind::{graft_params_hash, BoundGraft};
 pub use compatibility::{validate_graft_bank_for_model, validate_graft_for_model, GraftModelShape};
 pub use reader::{GraftBank, GraftError, GraftHookPoint, GraftKind, GraftLayerKv, GraftMode};

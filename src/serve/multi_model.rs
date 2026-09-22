@@ -133,6 +133,9 @@ pub struct EngineConfig {
     pub glp_reference: Option<PathBuf>,
     /// ADR-053: steering dose override, applied with `glp_reference`.
     pub glp_alpha: Option<f32>,
+    /// ADR-059: optional KV-cache graft artifact path (loaded at
+    /// model-load; explicit file only, no discovery).
+    pub kv_graft_path: Option<PathBuf>,
     /// When `true`, run `Engine::warmup()` on a temporary tokio runtime
     /// before returning.  The hot-swap orchestrator and the existing
     /// `cmd_serve` startup both pass `true` so the returned engine is
@@ -224,6 +227,9 @@ pub struct EngineConfigIdentity {
     /// of request grammars. Store float bits to retain an exact Eq identity.
     pub glp_active: bool,
     pub glp_alpha_bits: Option<u32>,
+    /// ADR-059: a bound graft changes what the engine's cache bytes mean;
+    /// grafted and ungrafted engines are different configurations.
+    pub kv_graft_active: bool,
 }
 
 impl Default for EngineConfigIdentity {
@@ -248,6 +254,7 @@ impl From<&EngineConfig> for EngineConfigIdentity {
             dwq_overlay: config.dwq_overlay_path.is_some(),
             glp_active: config.glp_reference.is_some(),
             glp_alpha_bits: config.glp_alpha.map(f32::to_bits),
+            kv_graft_active: config.kv_graft_path.is_some(),
         }
     }
 }

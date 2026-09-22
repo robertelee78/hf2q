@@ -978,6 +978,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         kv_persist_budget_bytes: 0,
         glp_path: None,
         glp_alpha: None,
+        kv_graft_path: None,
     };
     let load_start = std::time::Instant::now();
     let loaded =
@@ -2945,6 +2946,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         kv_persist_budget_bytes: 0,
         glp_path: None,
         glp_alpha: None,
+        kv_graft_path: None,
     };
     let load_start = std::time::Instant::now();
     let loaded = Qwen35LoadedModel::load(&load_opts).context("Qwen35LoadedModel::load")?;
@@ -3919,6 +3921,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         dwq_overlay_path: config.dwq_overlay_path.clone(),
         glp_path,
         glp_alpha: config.glp_alpha,
+        kv_graft_path: config.kv_graft_path.clone(),
         // Serve persistence is one typed plan: the Qwen family uses the same
         // root and disk ceiling as the generic block-prefix store.
         kv_persist_dir: config.kv_persist_dir.clone(),
@@ -4457,6 +4460,7 @@ pub fn cmd_serve(
         dwq_overlay_path: None,
         glp_reference: None,
         glp_alpha: None,
+        kv_graft_path: None,
         engine_mode,
         requested_context,
         kv_cache_budget_bytes,
@@ -5062,6 +5066,12 @@ pub fn cmd_serve(
             )
             .map_err(anyhow::Error::new)?;
         }
+        // ADR-059: the graft modifier is an explicit local file only — no
+        // resolver, no Hub discovery (a bank is checkpoint-, RoPE-, and
+        // quant-lane bound; discovery cannot safely choose among
+        // variants). Reader conformance and bind validation run at model
+        // load and abort startup on any error.
+        engine_config.kv_graft_path = args.kv_graft.clone();
 
         state.register_engine_config_for_path(&resolved.gguf_path, engine_config.clone())?;
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
@@ -7370,6 +7380,7 @@ mod tests {
             warmup_synchronously: false,
             glp_reference: None,
             glp_alpha: None,
+            kv_graft_path: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7415,6 +7426,7 @@ mod tests {
             warmup_synchronously: false,
             glp_reference: None,
             glp_alpha: None,
+            kv_graft_path: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7463,6 +7475,7 @@ mod tests {
             warmup_synchronously: false,
             glp_reference: None,
             glp_alpha: None,
+            kv_graft_path: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7521,6 +7534,7 @@ mod tests {
             warmup_synchronously: false,
             glp_reference: None,
             glp_alpha: None,
+            kv_graft_path: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7554,6 +7568,7 @@ mod tests {
             warmup_synchronously: false,
             glp_reference: None,
             glp_alpha: None,
+            kv_graft_path: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7587,6 +7602,7 @@ mod tests {
             warmup_synchronously: false,
             glp_reference: None,
             glp_alpha: None,
+            kv_graft_path: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7625,6 +7641,7 @@ mod tests {
             warmup_synchronously: false,
             glp_reference: None,
             glp_alpha: None,
+            kv_graft_path: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
@@ -7677,6 +7694,7 @@ mod tests {
                 kv_persist_budget_bytes: 0,
                 glp_reference: None,
                 glp_alpha: None,
+                kv_graft_path: None,
             };
             let result = super::load_engine(tmp.path(), &cfg);
             assert!(
