@@ -71,10 +71,22 @@ impl<'scope> SourceTeacherSessionV1<'scope> {
             _scope: scope,
         };
         preflight_source_teacher_state(&teacher, &cache.cache, 0)?;
+        // The teacher graph dispatches the same FA-bridge kernel families
+        // as the production qwen35 graph: `flash_attn_prefill_*` for
+        // prefill rows and `flash_attn_vec` for cached decode. The base
+        // `KernelRegistry::new()` seeds only the `steel_attention_*`
+        // source aliases — the entry-point names are registered by these
+        // family `register()` calls (mirroring `ensure_gpu_cache_primed`,
+        // forward_gpu.rs). Without them the first full-attention layer
+        // fails with `KernelNotFound: flash_attn_prefill_bf16_d256`. The
+        // text-only teacher needs no vision residual shader.
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+        mlx_native::ops::flash_attn_vec::register(&mut registry);
         Ok(Self {
             teacher,
             cache,
-            registry: KernelRegistry::new(),
+            registry,
             next_position: 0,
             poisoned: false,
             _scope: scope,
