@@ -2249,6 +2249,44 @@ impl HybridKvCache {
         Ok(n_slots)
     }
 
+    /// ADR-059 — re-establish the graft region tag on a cache whose graft
+    /// rows arrived via snapshot restore instead of a live splice (the
+    /// capacity-growth path allocates a fresh cache — tag zeroed — and
+    /// `restore_partial` brings the rows but not the tag). The rows must
+    /// already be present: every full-attn cursor must cover `n_slots`.
+    /// Never writes bytes; refuses a double mark.
+    pub fn mark_graft_region_for_slot(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        n_slots: u32,
+    ) -> Result<()> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "mark_graft_region_for_slot: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(n_slots > 0, "mark_graft_region_for_slot: n_slots must be > 0");
+        anyhow::ensure!(
+            self.graft_len[slot_idx] == 0,
+            "mark_graft_region_for_slot: slot {} already carries a graft region",
+            slot.0
+        );
+        for (rank, full) in self.full_attn.iter().enumerate() {
+            anyhow::ensure!(
+                full.current_len[slot_idx] >= n_slots,
+                "mark_graft_region_for_slot: full_attn[{rank}] cursor {} for slot {} \
+                 does not cover the restored graft region ({n_slots}) — the snapshot \
+                 restore must precede the mark",
+                full.current_len[slot_idx],
+                slot.0
+            );
+        }
+        self.graft_len[slot_idx] = n_slots;
+        Ok(())
+    }
+
     /// ADR-040 Phase B4d (2026-05-30) — per-slot variant of
     /// [`Self::truncate_mtp_to`].  Decrements only the MTP slot's
     /// `current_len[slot.0]`; sibling slots' MTP cursors are
@@ -12362,6 +12400,54 @@ mod tests {
             let view = k.as_slice::<f32>().unwrap();
             let dst = elem(1, 0, 0, 8, 16);
             assert_eq!(&view[dst..dst + 8], &kv.k[0..8]);
+        }
+
+        /// ADR-059 round trip: a graft-aware snapshot (graft rows + prompt
+        /// prefix) restored into a FRESH cache (the capacity-growth shape)
+        /// plus `mark_graft_region_for_slot` must reproduce the graft
+        /// region, the graft-aware cursor, and the truncate floor.
+        #[test]
+        fn snapshot_restore_round_trip_is_graft_aware() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut source =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 1, false).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+            let n = source.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            assert_eq!(n, 3);
+            // Simulate a 5-token prompt prefill on top of the graft.
+            source.append_for_seq(SlotId(0), 5).unwrap();
+            let snapshot = source.snapshot_prefix(&device, 3 + 5).unwrap();
+
+            // Fresh cache (capacity-growth replacement): no splice, no tag.
+            let mut fresh =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 1, false).expect("kv");
+            fresh.restore_partial(&snapshot, 3 + 5).unwrap();
+            assert_eq!(fresh.sequence_len_for_slot(SlotId(0)).unwrap(), 8);
+            assert_eq!(fresh.graft_region_for_slot(SlotId(0)).unwrap(), 0);
+            fresh
+                .mark_graft_region_for_slot(SlotId(0), 3)
+                .expect("mark after restore");
+            assert_eq!(fresh.graft_region_for_slot(SlotId(0)).unwrap(), 3);
+
+            // The restored graft rows are byte-equal to the bank. Bank
+            // layout is position-major [n_slots, heads, dim]: position 1,
+            // head 0 lives at k[1*heads*dim .. ] = k[16..24].
+            let kv = &graft.layers[&3];
+            let k = fresh.full_attn[0].k.as_ref().unwrap();
+            let view = k.as_slice::<f32>().unwrap();
+            let dst = elem(0, 0, 1, 8, 16);
+            assert_eq!(&view[dst..dst + 8], &kv.k[16..24]);
+
+            // The truncate floor is live again on the restored cache.
+            fresh.truncate_full_attn_to_for_slot(SlotId(0), 0).unwrap();
+            assert_eq!(fresh.sequence_len_for_slot(SlotId(0)).unwrap(), 3);
+
+            // A mark without covering cursors is refused (rows missing).
+            let mut bare =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 1, false).expect("kv");
+            assert!(bare.mark_graft_region_for_slot(SlotId(0), 3).is_err());
         }
     }
 }
