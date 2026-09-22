@@ -148,6 +148,29 @@ pub fn validate_graft_bank_for_model(bank: &GraftBank, model: &GraftModelShape) 
                 .join(", ")
         );
     }
+    // Complete site coverage: the bank must carry rows for EVERY
+    // full-attention layer. Partial coverage would splice graft rows at
+    // positions 0..N on some layers and nothing on others — per-layer
+    // cursor divergence on a cache whose production invariant is
+    // homogeneous cursors, plus per-layer position semantics that the
+    // v1 splice_prefix contract does not define. Dose-by-layer-subset is
+    // a spec-v2 question, not a silent option.
+    let missing: Vec<String> = model
+        .full_attn_layers
+        .iter()
+        .filter(|l| !bank.layers.contains_key(l))
+        .map(|l| l.to_string())
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "graft bind: bank does not cover full-attention layer(s) [{}] on {} \
+             — the full_attn_kv site requires complete coverage of every \
+             full-attention layer (partial-coverage banks are not a defined \
+             v1 artifact)",
+            missing.join(", "),
+            model.arch
+        );
+    }
     if bank.n_kv_heads != model.n_kv_heads as usize {
         bail!(
             "graft bind: bank n_kv_heads {} does not match model {}",

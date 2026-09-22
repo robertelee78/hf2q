@@ -231,7 +231,7 @@ fn structurally_matching_bank_binds() {
     let gguf = GgufFile::open(&path).unwrap();
     let shape = GraftModelShape::from_gguf(&gguf).unwrap();
     let bank_path = tmp_path("bank_ok");
-    write_bank(&bank_path, &matching_bank_meta(), &[3, 7], 2, 4, 256);
+    write_bank(&bank_path, &matching_bank_meta(), &[3, 7, 11], 2, 4, 256);
     let bank = GraftBank::load(&bank_path).unwrap();
     validate_graft_bank_for_model(&bank, &shape).unwrap();
     std::fs::remove_file(&path).ok();
@@ -287,13 +287,30 @@ fn geometry_and_rope_mismatches_are_each_fatal() {
     ];
     for (label, meta, heads, head_dim, needle) in cases {
         let bank_path = tmp_path("bank_bad");
-        write_bank(&bank_path, &meta, &[3, 7], 2, heads, head_dim);
+        write_bank(&bank_path, &meta, &[3, 7, 11], 2, heads, head_dim);
         let bank = GraftBank::load(&bank_path).unwrap();
         let err = validate_graft_bank_for_model(&bank, &shape).unwrap_err();
         assert!(err.to_string().contains(needle), "{label}: {err}");
         std::fs::remove_file(&bank_path).ok();
     }
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn partial_coverage_bank_is_fatal() {
+    let path = tmp_path("shape");
+    write_fixture_gguf(&path, &qwen35_model_meta(), &[]);
+    let gguf = GgufFile::open(&path).unwrap();
+    let shape = GraftModelShape::from_gguf(&gguf).unwrap();
+    // Covers [3,7] but the model's full-attention set is [3,7,11].
+    let bank_path = tmp_path("bank_partial");
+    write_bank(&bank_path, &matching_bank_meta(), &[3, 7], 2, 4, 256);
+    let bank = GraftBank::load(&bank_path).unwrap();
+    let err = validate_graft_bank_for_model(&bank, &shape).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("does not cover full-attention layer(s) [11]"), "{message}");
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&bank_path).ok();
 }
 
 #[test]
@@ -325,7 +342,7 @@ fn loader_boundary_validates_identity_and_structure_together() {
     let mut meta = matching_bank_meta();
     meta.push(("general.base_model.0.name", Meta::Str("Qwen3.5-27B")));
     let named_path = tmp_path("bank_named");
-    write_bank(&named_path, &meta, &[3, 7], 2, 4, 256);
+    write_bank(&named_path, &meta, &[3, 7, 11], 2, 4, 256);
     let (_bank, compatibility) =
         validate_graft_for_model(&named_path, &model_path, &model).unwrap();
     assert_eq!(compatibility, Compatibility::Named);
@@ -334,7 +351,7 @@ fn loader_boundary_validates_identity_and_structure_together() {
     let mut meta = matching_bank_meta();
     meta.push(("general.base_model.0.name", Meta::Str("Some-Unrelated-Model")));
     let mismatch_path = tmp_path("bank_mismatch");
-    write_bank(&mismatch_path, &meta, &[3, 7], 2, 4, 256);
+    write_bank(&mismatch_path, &meta, &[3, 7, 11], 2, 4, 256);
     let err = validate_graft_for_model(&mismatch_path, &model_path, &model).unwrap_err();
     assert!(err.to_string().contains("base model mismatch"), "{err}");
 
