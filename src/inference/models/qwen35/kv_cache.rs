@@ -909,6 +909,12 @@ pub struct HybridKvCache {
     /// `pub` for symmetry with `n_seqs` / `max_seq_len` (read-only state
     /// derived from constructor inputs).
     pub tq_kv_active: bool,
+    /// ADR-059 — the device handle this cache's buffers live on (a cheap
+    /// `Clone` of the shared device/queue Arc). Stored at allocation so
+    /// cache-side operations that must dispatch Metal work without a
+    /// caller-supplied device — the TQ graft splice's encode pass — can
+    /// do so; every buffer here is already on this device.
+    pub device: MlxDevice,
     /// Capture storage may remain allocated between agentic turns, but the
     /// capture kernels must run only while this flag is set. Keeping activity
     /// separate from allocation avoids re-creating hundreds of megabytes of
@@ -1882,6 +1888,7 @@ impl HybridKvCache {
             conv_channels,
             per_layer_slot,
             tq_kv_active,
+            device: device.clone(),
             la_capture_active_tokens: None,
             graft_len: vec![0; n_seqs as usize],
         })
@@ -2167,9 +2174,14 @@ impl HybridKvCache {
     ///   bind; re-asserted so a splice can never create per-layer cursor
     ///   divergence — cursors are homogeneous across full-attn slots by
     ///   production invariant).
-    /// - TQ-active caches are refused with a named error until the TQ
-    ///   encode splice ships (staged sub-increment; never a silent F32
-    ///   fallback — the `glp.mode` discipline applied to cache media).
+    /// - Substrate dispatch: an F32 control path (`tq_kv_active=false`)
+    ///   writes the bank rows directly into the F32 K/V backing; a
+    ///   TQ-active production cache ENCODES the bank rows through the
+    ///   same hadamard-quantize kernel prefill uses
+    ///   ([`Self::splice_graft_tq_rows`]) so graft rows and prefill rows
+    ///   are quantized identically in this process — never a silent F32
+    ///   fallback on a TQ cache (the `glp.mode` discipline applied to
+    ///   cache media).
     /// - The MTP drafter slot is deliberately NOT spliced: speculative
     ///   proposals are verified against the (grafted) target logits, so
     ///   an ungrafted drafter affects proposal quality only, never
@@ -2220,14 +2232,113 @@ impl HybridKvCache {
                 full.current_len[slot_idx]
             );
         }
+        if self.tq_kv_active {
+            self.splice_graft_tq_rows(slot, bank, n_slots)?;
+        } else {
+            let n_seqs_us = self.n_seqs as usize;
+            let max_len_us = self.max_seq_len as usize;
+            for (graph_layer, slot_of) in self.per_layer_slot.iter().enumerate() {
+                let LayerSlot::Full(rank) = slot_of else {
+                    continue;
+                };
+                let layer_kv = bank.layers.get(&(graph_layer as u32)).ok_or_else(|| {
+                    anyhow!(
+                        "splice_graft_for_slot: bank does not cover full-attention \
+                         layer {graph_layer} (complete site coverage required; the \
+                         bind should have rejected this bank)"
+                    )
+                })?;
+                let full = &mut self.full_attn[*rank as usize];
+                let k = full.k.as_mut().ok_or_else(|| {
+                    anyhow!(
+                        "splice_graft_for_slot: layer {graph_layer} K buffer missing \
+                         on an F32 control-path cache (tq_kv_active=false requires \
+                         the F32 backing)"
+                    )
+                })?;
+                splice_rows_into_buffer(
+                    k,
+                    &layer_kv.k,
+                    slot_idx,
+                    n_slots,
+                    bank.n_kv_heads,
+                    bank.head_dim,
+                    max_len_us,
+                    n_seqs_us,
+                    graph_layer,
+                    "K",
+                )?;
+                let v = full.v.as_mut().ok_or_else(|| {
+                    anyhow!(
+                        "splice_graft_for_slot: layer {graph_layer} V buffer missing \
+                         on an F32 control-path cache (tq_kv_active=false requires \
+                         the F32 backing)"
+                    )
+                })?;
+                splice_rows_into_buffer(
+                    v,
+                    &layer_kv.v,
+                    slot_idx,
+                    n_slots,
+                    bank.n_kv_heads,
+                    bank.head_dim,
+                    max_len_us,
+                    n_seqs_us,
+                    graph_layer,
+                    "V",
+                )?;
+                full.current_len[slot_idx] = n_slots;
+            }
+        }
+        self.graft_len[slot_idx] = n_slots;
+        Ok(n_slots)
+    }
+
+    /// ADR-059 TQ substrate — encode a graft bank's F32 rows into one
+    /// slot's TQ packed/norm buffers through the production encoder
+    /// (`encode_seq_tokens_to_tq_for_slot` →
+    /// `dispatch_hadamard_quantize_kv_hb_seq`): the identical codebook-bits
+    /// resolution, norm scheme, and kernel prefill uses, so graft rows and
+    /// prefill rows quantize identically in this process. The bank's
+    /// position-major `[n_slots, n_kv_heads, head_dim]` rows are the same
+    /// token-major layout the encoder consumes; rows are uploaded once and
+    /// encoded at `write_pos_start = 0` (the graft occupies positions
+    /// `0..n_slots`).
+    ///
+    /// The encoder + registry are splice-local: the hadamard kernel is
+    /// base-registered, and a cold admission (the only splice site) is
+    /// about to run a full prefill that dwarfs one pipeline compile.
+    fn splice_graft_tq_rows(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        bank: &crate::inference::graft::GraftBank,
+        n_slots: u32,
+    ) -> Result<()> {
+        let slot_idx = slot.0 as usize;
         anyhow::ensure!(
-            !self.tq_kv_active,
-            "splice_graft_for_slot: TQ-active caches are not yet graft-spliced \
-             (ADR-059 TQ encode path is a staged sub-increment); refusing \
-             rather than falling back to F32"
+            bank.head_dim == 256 || bank.head_dim == 512,
+            "splice_graft_for_slot: TQ-active graft requires head_dim 256 or 512 \
+             (got {}); the hadamard quantize kernel encodes no other dim — use \
+             the F32 control path (HF2Q_TQ_KV=0) for this fixture",
+            bank.head_dim
         );
-        let n_seqs_us = self.n_seqs as usize;
-        let max_len_us = self.max_seq_len as usize;
+        // Codebook bits: the same env resolution as the production write
+        // path (`write_kv_with_optional_tq_encode`) — graft rows must
+        // quantize under the SAME codebook as this process's prefill rows.
+        let codebook_bits = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+        let cb_bits = if matches!(codebook_bits, 5 | 6 | 8) {
+            codebook_bits
+        } else {
+            8
+        };
+        let heads = bank.n_kv_heads as u32;
+        let head_dim = bank.head_dim as u32;
+        let rows = n_slots as usize * heads as usize * head_dim as usize;
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = self
+            .device
+            .command_encoder()
+            .context("graft TQ splice: command encoder")?;
         for (graph_layer, slot_of) in self.per_layer_slot.iter().enumerate() {
             let LayerSlot::Full(rank) = slot_of else {
                 continue;
@@ -2239,49 +2350,81 @@ impl HybridKvCache {
                      bind should have rejected this bank)"
                 )
             })?;
+            anyhow::ensure!(
+                layer_kv.k.len() == rows && layer_kv.v.len() == rows,
+                "splice_graft_for_slot: layer {graph_layer} bank row count mismatch \
+                 (k={}, v={}, expected {rows})",
+                layer_kv.k.len(),
+                layer_kv.v.len()
+            );
+            let upload = |values: &[f32],
+                          label: &'static str|
+             -> Result<mlx_native::MlxBuffer> {
+                let mut buf = self
+                    .device
+                    .alloc_buffer(
+                        rows * std::mem::size_of::<f32>(),
+                        mlx_native::DType::F32,
+                        vec![n_slots as usize, heads as usize, head_dim as usize],
+                    )
+                    .with_context(|| {
+                        format!("graft TQ splice {label} upload (layer {graph_layer})")
+                    })?;
+                buf.as_mut_slice::<f32>()
+                    .with_context(|| format!("graft TQ splice {label} upload mapping"))?
+                    .copy_from_slice(values);
+                Ok(buf)
+            };
+            let k_buf = upload(&layer_kv.k, "K")?;
+            let v_buf = upload(&layer_kv.v, "V")?;
             let full = &mut self.full_attn[*rank as usize];
-            let k = full.k.as_mut().ok_or_else(|| {
-                anyhow!(
-                    "splice_graft_for_slot: layer {graph_layer} K buffer missing \
-                     (TQ-active caches are refused above; the F32 path requires \
-                     the F32 backing)"
-                )
-            })?;
-            splice_rows_into_buffer(
-                k,
-                &layer_kv.k,
-                slot_idx,
+            anyhow::ensure!(
+                full.tq.is_some(),
+                "splice_graft_for_slot: layer {graph_layer} TQ buffers missing on a \
+                 tq_kv_active cache (allocation invariant violated)"
+            );
+            full.encode_seq_tokens_to_tq_for_slot(
+                &k_buf,
+                true,
                 n_slots,
-                bank.n_kv_heads,
-                bank.head_dim,
-                max_len_us,
-                n_seqs_us,
-                graph_layer,
-                "K",
-            )?;
-            let v = full.v.as_mut().ok_or_else(|| {
-                anyhow!(
-                    "splice_graft_for_slot: layer {graph_layer} V buffer missing \
-                     (TQ-active caches are refused above; the F32 path requires \
-                     the F32 backing)"
-                )
-            })?;
-            splice_rows_into_buffer(
-                v,
-                &layer_kv.v,
-                slot_idx,
+                heads,
+                head_dim,
+                self.max_seq_len,
+                0,
+                0,
+                false,
+                1.0,
+                cb_bits,
+                slot,
+                &mut encoder,
+                &mut registry,
+                &self.device,
+            )
+            .with_context(|| format!("graft TQ encode K (layer {graph_layer})"))?;
+            full.encode_seq_tokens_to_tq_for_slot(
+                &v_buf,
+                false,
                 n_slots,
-                bank.n_kv_heads,
-                bank.head_dim,
-                max_len_us,
-                n_seqs_us,
-                graph_layer,
-                "V",
-            )?;
+                heads,
+                head_dim,
+                self.max_seq_len,
+                0,
+                0,
+                false,
+                1.0,
+                cb_bits,
+                slot,
+                &mut encoder,
+                &mut registry,
+                &self.device,
+            )
+            .with_context(|| format!("graft TQ encode V (layer {graph_layer})"))?;
             full.current_len[slot_idx] = n_slots;
         }
-        self.graft_len[slot_idx] = n_slots;
-        Ok(n_slots)
+        encoder
+            .commit_and_wait()
+            .context("graft TQ splice: commit and wait")?;
+        Ok(())
     }
 
     /// ADR-059 — re-establish the graft region tag on a cache whose graft
@@ -12337,18 +12480,122 @@ mod tests {
             assert!(err.to_string().contains("not fresh"));
         }
 
+        /// ADR-059 TQ substrate: the splice encodes bank rows through the
+        /// PRODUCTION encoder — the packed/norm bytes a graft splice
+        /// writes must be byte-identical to encoding the same rows as a
+        /// prefill chunk via `encode_seq_tokens_to_tq_for_slot` directly
+        /// (same kernel, same codebook bits, same write positions). This
+        /// is the contract that makes graft rows indistinguishable from
+        /// prefill rows to the TQ read side.
         #[test]
-        fn splice_on_tq_active_cache_refuses_with_named_error() {
+        fn splice_on_tq_active_cache_encodes_through_production_path() {
             let _gpu = crate::inference::hf2q_gpu_test_lock();
             let Some(device) = device() else { return };
             let cfg = graft_cfg(256);
             let mut cache =
                 HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
             let graft = bank(3, 2, 256, &[3, 7]);
+            let n = cache
+                .splice_graft_for_slot(SlotId(1), &graft)
+                .expect("TQ-active splice encodes through the production path");
+            assert_eq!(n, 3);
+            assert_eq!(cache.graft_region_for_slot(SlotId(1)).unwrap(), 3);
+            assert_eq!(cache.graft_region_for_slot(SlotId(0)).unwrap(), 0);
+            for full in cache.full_attn.iter() {
+                assert_eq!(full.current_len[1], 3, "grafted slot cursor");
+                assert_eq!(full.current_len[0], 0, "peer slot untouched");
+            }
+
+            // Reference: encode the SAME bank rows as a prefill chunk at
+            // write_pos 0 on a peer cache, via the production entry point.
+            let mut reference =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
+            let layer_kv = &graft.layers[&3];
+            let rows = 3usize * 2 * 256;
+            let upload = |values: &[f32]| {
+                let mut buf = device
+                    .alloc_buffer(rows * 4, mlx_native::DType::F32, vec![3usize, 2, 256])
+                    .expect("upload");
+                buf.as_mut_slice::<f32>().unwrap().copy_from_slice(values);
+                buf
+            };
+            let k_buf = upload(&layer_kv.k);
+            let v_buf = upload(&layer_kv.v);
+            let mut registry = mlx_native::KernelRegistry::new();
+            let mut encoder = device.command_encoder().expect("encoder");
+            let slot = &mut reference.full_attn[0];
+            slot.encode_seq_tokens_to_tq_for_slot(
+                &k_buf, true, 3, 2, 256, 16, 0, 0, false, 1.0, 8, SlotId(1),
+                &mut encoder, &mut registry, &device,
+            )
+            .expect("reference K encode");
+            slot.encode_seq_tokens_to_tq_for_slot(
+                &v_buf, false, 3, 2, 256, 16, 0, 0, false, 1.0, 8, SlotId(1),
+                &mut encoder, &mut registry, &device,
+            )
+            .expect("reference V encode");
+            encoder.commit_and_wait().expect("reference commit");
+
+            // Byte-identical packed + norm bytes on the grafted layer.
+            let grafted = cache.full_attn[0].tq.as_ref().expect("grafted TQ buffers");
+            let expect = reference.full_attn[0].tq.as_ref().expect("reference TQ buffers");
+            let per_slot_packed = 2usize * 16 * 256;
+            for (label, got, want) in [
+                (
+                    "K packed",
+                    grafted.k_packed.as_slice::<u8>().unwrap(),
+                    expect.k_packed.as_slice::<u8>().unwrap(),
+                ),
+                (
+                    "V packed",
+                    grafted.v_packed.as_slice::<u8>().unwrap(),
+                    expect.v_packed.as_slice::<u8>().unwrap(),
+                ),
+            ] {
+                let got_region = &got[per_slot_packed..2 * per_slot_packed];
+                let want_region = &want[per_slot_packed..2 * per_slot_packed];
+                assert_eq!(
+                    got_region, want_region,
+                    "{label}: graft splice must match the production encode byte-for-byte"
+                );
+            }
+            let per_slot_norms = 2usize * 16 * expect.norms_per_pos as usize;
+            for (label, got, want) in [
+                (
+                    "K norms",
+                    grafted.k_norms.as_slice::<f32>().unwrap(),
+                    expect.k_norms.as_slice::<f32>().unwrap(),
+                ),
+                (
+                    "V norms",
+                    grafted.v_norms.as_slice::<f32>().unwrap(),
+                    expect.v_norms.as_slice::<f32>().unwrap(),
+                ),
+            ] {
+                let got_region = &got[per_slot_norms..2 * per_slot_norms];
+                let want_region = &want[per_slot_norms..2 * per_slot_norms];
+                assert_eq!(
+                    got_region, want_region,
+                    "{label}: graft splice must match the production encode value-for-value"
+                );
+            }
+        }
+
+        /// ADR-059 TQ substrate: a non-256/512 head_dim bank on a TQ-active
+        /// cache refuses by name (the hadamard kernel encodes no other dim;
+        /// the F32 control path is the fixture substrate).
+        #[test]
+        fn splice_on_tq_active_cache_refuses_non_production_head_dim() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
             let err = cache
                 .splice_graft_for_slot(SlotId(0), &graft)
                 .unwrap_err();
-            assert!(err.to_string().contains("TQ-active"));
+            assert!(err.to_string().contains("head_dim 256 or 512"));
         }
 
         #[test]
