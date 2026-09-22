@@ -2427,6 +2427,130 @@ impl HybridKvCache {
         Ok(())
     }
 
+    /// ADR-059 gate-7 derivation support — extract positions `0..n_slots`
+    /// of every full-attention layer's F32 K/V for one slot as graft-bank
+    /// rows (position-major `[n_slots, n_kv_heads, head_dim]`, the bank
+    /// container layout). This is the self-donor primitive: a bank derived
+    /// from the model's OWN prefill of a donor prompt — phantom-kv's v1
+    /// `prefill_kv` arm through hf2q's own stack, so the bank is produced
+    /// by the same kernels (RoPE, layout) that will read it back.
+    ///
+    /// Contract (fail-closed):
+    /// - F32 control path only (`tq_kv_active=false` — derivation runs
+    ///   with `HF2Q_TQ_KV=0`); a TQ-active cache refuses by name.
+    /// - The slot must be clean (`graft_len == 0`) — never derive from a
+    ///   grafted cache.
+    /// - Every full-attention cursor must cover `n_slots` (the donor
+    ///   prefill was at least that long).
+    /// - Returns `(graph_layer, k_rows, v_rows)` per covered layer, in
+    ///   graph-layer order — exactly the layers a complete-coverage bank
+    ///   must carry.
+    pub fn extract_full_attn_rows_for_graft(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        n_slots: u32,
+    ) -> Result<Vec<(u32, Vec<f32>, Vec<f32>)>> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "extract_full_attn_rows_for_graft: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(n_slots > 0, "extract_full_attn_rows_for_graft: n_slots must be > 0");
+        anyhow::ensure!(
+            !self.tq_kv_active,
+            "extract_full_attn_rows_for_graft: TQ-active caches refuse derivation \
+             (run the donor prefill on the F32 control path, HF2Q_TQ_KV=0)"
+        );
+        anyhow::ensure!(
+            self.graft_len[slot_idx] == 0,
+            "extract_full_attn_rows_for_graft: slot {} carries a graft; never derive \
+             from a grafted cache",
+            slot.0
+        );
+        let shape = self
+            .full_attn
+            .first()
+            .and_then(|full| full.k.as_ref())
+            .map(|k| k.shape().to_vec())
+            .ok_or_else(|| {
+                anyhow!(
+                    "extract_full_attn_rows_for_graft: no F32 K backing on the first \
+                     full-attention layer (F32 control path required)"
+                )
+            })?;
+        anyhow::ensure!(
+            shape.len() == 4,
+            "extract_full_attn_rows_for_graft: unexpected K buffer rank {:?}",
+            shape
+        );
+        let heads = shape[1];
+        let max_len = shape[2];
+        let head_dim = shape[3];
+        anyhow::ensure!(
+            (heads as u64) * (head_dim as u64) > 0,
+            "extract_full_attn_rows_for_graft: degenerate head geometry"
+        );
+
+        let mut out = Vec::new();
+        for (graph_layer, slot_of) in self.per_layer_slot.iter().enumerate() {
+            let LayerSlot::Full(rank) = slot_of else {
+                continue;
+            };
+            let full = &self.full_attn[*rank as usize];
+            anyhow::ensure!(
+                full.current_len[slot_idx] >= n_slots,
+                "extract_full_attn_rows_for_graft: layer {graph_layer} cursor {} does \
+                 not cover n_slots={n_slots}; the donor prefill was too short",
+                full.current_len[slot_idx]
+            );
+            let extract = |buf: &MlxBuffer,
+                           side: &'static str|
+             -> Result<Vec<f32>> {
+                let src = buf.as_slice::<f32>().with_context(|| {
+                    format!("extract_full_attn_rows_for_graft: {side} readback (layer {graph_layer})")
+                })?;
+                let mut rows = vec![0f32; n_slots as usize * heads * head_dim];
+                for position in 0..n_slots as usize {
+                    for head in 0..heads {
+                        // Cache layout [n_seqs, heads, max_seq_len,
+                        // head_dim]; bank layout [n_slots, heads,
+                        // head_dim] (position-major).
+                        let src_base =
+                            ((slot_idx * heads + head) * max_len + position) * head_dim;
+                        let dst_base = (position * heads + head) * head_dim;
+                        rows[dst_base..dst_base + head_dim]
+                            .copy_from_slice(&src[src_base..src_base + head_dim]);
+                    }
+                }
+                Ok(rows)
+            };
+            let k = full.k.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "extract_full_attn_rows_for_graft: layer {graph_layer} K backing \
+                     missing (F32 control path required)"
+                )
+            })?;
+            let v = full.v.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "extract_full_attn_rows_for_graft: layer {graph_layer} V backing \
+                     missing (F32 control path required)"
+                )
+            })?;
+            out.push((
+                graph_layer as u32,
+                extract(k, "K")?,
+                extract(v, "V")?,
+            ));
+        }
+        anyhow::ensure!(
+            !out.is_empty(),
+            "extract_full_attn_rows_for_graft: cache has no full-attention layers"
+        );
+        Ok(out)
+    }
+
     /// ADR-059 — re-establish the graft region tag on a cache whose graft
     /// rows arrived via snapshot restore instead of a live splice (the
     /// capacity-growth path allocates a fresh cache — tag zeroed — and
@@ -12736,6 +12860,93 @@ mod tests {
             let mut bare =
                 HybridKvCache::new_with_options(&cfg, &device, 16, 1, false).expect("kv");
             assert!(bare.mark_graft_region_for_slot(SlotId(0), 3).is_err());
+        }
+
+        /// ADR-059 gate-7 derivation: extract_full_attn_rows_for_graft is
+        /// the splice's inverse — write known bank rows into a slot's F32
+        /// buffers via the splice's own row writer (no region tag: a
+        /// plain donor prefill), extract them back, and the rows must be
+        /// byte-identical (the cache-layout transpose is exact in both
+        /// directions). A tagged (grafted) slot refuses derivation by
+        /// name.
+        #[test]
+        fn graft_row_extraction_is_the_splice_inverse() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+
+            // Plain donor prefill: the splice's row writer places the
+            // bank rows at positions 0..3 WITHOUT the graft machinery
+            // (no tag), then a cursor advance makes them readable.
+            for (graph_layer, slot_of) in cache.per_layer_slot.iter().enumerate() {
+                let LayerSlot::Full(rank) = slot_of else { continue };
+                let layer_kv = &graft.layers[&(graph_layer as u32)];
+                let full = &mut cache.full_attn[*rank as usize];
+                super::splice_rows_into_buffer(
+                    full.k.as_mut().unwrap(),
+                    &layer_kv.k,
+                    1,
+                    3,
+                    2,
+                    8,
+                    16,
+                    2,
+                    graph_layer,
+                    "K",
+                )
+                .unwrap();
+                super::splice_rows_into_buffer(
+                    full.v.as_mut().unwrap(),
+                    &layer_kv.v,
+                    1,
+                    3,
+                    2,
+                    8,
+                    16,
+                    2,
+                    graph_layer,
+                    "V",
+                )
+                .unwrap();
+                full.current_len[1] = 3;
+            }
+            let rows = cache
+                .extract_full_attn_rows_for_graft(SlotId(1), 3)
+                .expect("extract");
+            let layers: Vec<u32> = rows.iter().map(|(l, _, _)| *l).collect();
+            assert_eq!(layers, vec![3, 7], "graph-layer order, complete coverage");
+            for (layer, k, v) in rows {
+                let bank_kv = &graft.layers[&layer];
+                assert_eq!(k, bank_kv.k, "layer {layer} K rows byte-identical");
+                assert_eq!(v, bank_kv.v, "layer {layer} V rows byte-identical");
+            }
+
+            // A tagged (grafted) slot refuses derivation by name.
+            cache.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            let err = cache
+                .extract_full_attn_rows_for_graft(SlotId(0), 3)
+                .unwrap_err();
+            assert!(err.to_string().contains("never derive from a grafted cache"));
+
+            // A cursor that does not cover n_slots refuses by name.
+            cache.reset_for_slot(SlotId(0)).unwrap();
+            cache.advance_cursors_for_test(SlotId(0), 2).unwrap();
+            let err = cache
+                .extract_full_attn_rows_for_graft(SlotId(0), 3)
+                .unwrap_err();
+            assert!(err.to_string().contains("donor prefill was too short"));
+
+            // A TQ-active cache refuses derivation by name.
+            let mut tq =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
+            tq.advance_cursors_for_test(SlotId(0), 5).unwrap();
+            let err = tq
+                .extract_full_attn_rows_for_graft(SlotId(0), 3)
+                .unwrap_err();
+            assert!(err.to_string().contains("HF2Q_TQ_KV=0"));
         }
 
         /// ADR-059 SlotAware anchor semantics: `snapshot_slot_anchor`
