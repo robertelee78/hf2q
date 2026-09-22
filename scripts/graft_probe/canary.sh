@@ -6,7 +6,7 @@
 #
 #   A baseline      — no graft
 #   B zero-slot     — --kv-graft zero-slot canary (n_slots=0, no tensors)
-#   C live          — --kv-graft live bank (8 slots, every full-attn layer)
+#   C live          — --kv-graft live bank (64 slots, every full-attn layer)
 #   D disable-fresh — no graft, fresh process (baseline restore)
 #
 # Verdicts:
@@ -21,26 +21,30 @@
 #                                     named refusal (ADR-059); the F32
 #                                     control path is the canary
 #                                     substrate, identical across arms.
-#   --scheduler fifo-serial         — a bound graft forces SerialFifo;
-#                                     running EVERY arm serial keeps the
-#                                     engine path identical (SlotAware
-#                                     vs Serial batching changes greedy
-#                                     numerics).
+#   --scheduler $SCHEDULER          — identical engine path per campaign
+#                                     (SlotAware vs Serial batching
+#                                     changes greedy numerics, so arms
+#                                     never mix schedulers). Both engine
+#                                     paths are graft-wired: run one
+#                                     campaign per scheduler.
+#                                     HF2Q_CANARY_SCHEDULER selects:
+#                                     fifo-serial (default) or
+#                                     inflight-batched (SlotAware).
 #   HF2Q_QWEN_SPECULATION=off       — a bound graft skips native MTP;
 #                                     disabling it everywhere keeps the
 #                                     decode path identical.
-#   --default-thinking-token-budget 0 — an active default thinking
-#                                     budget is rejected under
-#                                     SerialFifo; zero disables it
+#   --default-thinking-token-budget 0 — zero disables the default budget
 #                                     (thinking stays on, unbudgeted)
 #                                     identically across arms.
 #
 # Usage:
 #   bash scripts/graft_probe/canary.sh [MODEL_GGUF] [PORT]
+#   HF2Q_CANARY_SCHEDULER=inflight-batched bash scripts/graft_probe/canary.sh
 set -euo pipefail
 
 MODEL="${1:-/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf}"
 PORT="${2:-8391}"
+SCHEDULER="${HF2Q_CANARY_SCHEDULER:-fifo-serial}"
 BIN="$(cd "$(dirname "$0")/../.." && pwd)/target/release/hf2q"
 WORK="$(mktemp -d /tmp/hf2q-graft-canary.XXXXXX)"
 PROMPT='In one sentence: what is the capital of France?'
@@ -92,7 +96,7 @@ run_arm() {
     local log="$WORK/serve-$name.log"
     echo "── arm $name: booting serve on :$PORT"
     HF2Q_TQ_KV=0 HF2Q_QWEN_SPECULATION=off "$BIN" serve "$MODEL" \
-        --port "$PORT" --quiet --scheduler fifo-serial \
+        --port "$PORT" --quiet --scheduler "$SCHEDULER" \
         --default-thinking-token-budget 0 "$@" >"$log" 2>&1 &
     CANARY_PID=$!
 
@@ -165,15 +169,16 @@ verdict_live=$([[ "$A" != "$C" ]] && echo PASS || echo FAIL)
 verdict_disable=$([[ "$A" == "$D" ]] && echo PASS || echo FAIL)
 
 git_rev="$(git -C "$(dirname "$0")/../.." rev-parse HEAD 2>/dev/null || echo unknown)"
-python3 - "$WORK" "$git_rev" "$MODEL" "$verdict_zero" "$verdict_live" "$verdict_disable" <<'PY'
+python3 - "$WORK" "$git_rev" "$MODEL" "$SCHEDULER" "$verdict_zero" "$verdict_live" "$verdict_disable" <<'PY'
 import hashlib, json, os, sys
-work, git_rev, model, v_zero, v_live, v_disable = sys.argv[1:7]
+work, git_rev, model, scheduler, v_zero, v_live, v_disable = sys.argv[1:8]
 def sha(p):
     with open(p, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
 manifest = {
     "canary": "adr-059-gates-4-5",
     "git_rev": git_rev,
+    "scheduler": scheduler,
     "model": model,
     "model_sha256": sha(model) if os.path.exists(model) else None,
     "artifacts": {
@@ -197,6 +202,7 @@ print("manifest: %s" % path)
 PY
 
 echo
+echo "scheduler: $SCHEDULER"
 echo "gate 4a (zero-slot no-op):     $verdict_zero"
 echo "gate 4b (live graft shifts):   $verdict_live"
 echo "gate 5  (disable restores):    $verdict_disable"

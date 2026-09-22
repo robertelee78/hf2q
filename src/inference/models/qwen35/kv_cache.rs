@@ -2112,6 +2112,41 @@ impl HybridKvCache {
         Ok(self.graft_len[slot_idx])
     }
 
+    /// ADR-059 test support: advance one slot's full-attention cursors by
+    /// `rows` without a forward pass — simulating retained prefix rows
+    /// above a spliced graft for admission-path tests (the serve loop only
+    /// ever advances cursors through real prefill).
+    #[cfg(test)]
+    pub fn advance_cursors_for_test(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        rows: u32,
+    ) -> Result<()> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "advance_cursors_for_test: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        for (rank, full) in self.full_attn.iter_mut().enumerate() {
+            let cursor = full
+                .current_len
+                .get_mut(slot_idx)
+                .ok_or_else(|| anyhow!("advance_cursors_for_test: full_attn[{rank}] cursor missing"))?;
+            *cursor = cursor
+                .checked_add(rows)
+                .ok_or_else(|| anyhow!("advance_cursors_for_test: cursor overflow"))?;
+            anyhow::ensure!(
+                *cursor <= self.max_seq_len,
+                "advance_cursors_for_test: cursor {} exceeds max_seq_len={}",
+                *cursor,
+                self.max_seq_len
+            );
+        }
+        Ok(())
+    }
+
     /// ADR-059 — splice a graft bank into one physical slot's
     /// full-attention caches as fabricated history at positions
     /// `0..n_slots` (the `full_attn_kv` site). Returns the graft length:
@@ -12454,6 +12489,62 @@ mod tests {
             let mut bare =
                 HybridKvCache::new_with_options(&cfg, &device, 16, 1, false).expect("kv");
             assert!(bare.mark_graft_region_for_slot(SlotId(0), 3).is_err());
+        }
+
+        /// ADR-059 SlotAware anchor semantics: `snapshot_slot_anchor`
+        /// captures the PHYSICAL boundary (graft rows + prompt rows) and
+        /// `restore_slot_anchor` rewinds to it without copying bytes — the
+        /// graft rows below the boundary survive by the append-only
+        /// contract and the region tag stays marked (only a reset clears
+        /// it, and a reset clears the anchor too).
+        #[test]
+        fn slot_anchor_round_trip_is_graft_aware() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 1, false).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+            cache.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            // Prompt prefill on top of the graft, then the anchor at the
+            // physical boundary 3 + 5 = 8.
+            cache.append_for_seq(SlotId(0), 5).unwrap();
+            let anchor = cache
+                .snapshot_slot_anchor(SlotId(0), 3 + 5)
+                .expect("graft-aware anchor capture");
+
+            // Decode drift above the boundary, then a continuation request
+            // rewinds to the anchor.
+            cache.append_for_seq(SlotId(0), 3).unwrap();
+            assert_eq!(cache.sequence_len_for_slot(SlotId(0)).unwrap(), 11);
+            cache
+                .restore_slot_anchor(SlotId(0), &anchor)
+                .expect("graft-aware anchor restore");
+            assert_eq!(
+                cache.sequence_len_for_slot(SlotId(0)).unwrap(),
+                8,
+                "cursor rewinds to the physical boundary graft_len + prompt"
+            );
+            assert_eq!(
+                cache.graft_region_for_slot(SlotId(0)).unwrap(),
+                3,
+                "the region tag survives the anchor rewind"
+            );
+
+            // The graft rows are still the bank's bytes (append-only rows
+            // below the boundary were never touched).
+            let kv = &graft.layers[&3];
+            let k = cache.full_attn[0].k.as_ref().unwrap();
+            let view = k.as_slice::<f32>().unwrap();
+            let dst = elem(0, 0, 2, 8, 16);
+            assert_eq!(&view[dst..dst + 8], &kv.k[32..40]);
+
+            // A reset (cold admission of an unrelated request) drops the
+            // rows and the tag; a stale anchor restore would rewind cursors
+            // over missing rows — the serve layer prevents this by clearing
+            // anchors on reset; here the tag loss is the observable.
+            cache.reset_for_slot(SlotId(0)).unwrap();
+            assert_eq!(cache.graft_region_for_slot(SlotId(0)).unwrap(), 0);
         }
     }
 }

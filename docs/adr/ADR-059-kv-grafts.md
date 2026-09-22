@@ -253,21 +253,37 @@ the graft hash. No sampling-path changes.
    identity test).
 4. **Canaries 1–4** above, on hardware, per family that ships.
    **MEASURED 2026-09-22 on Qwen3.6-35B-Abliterix-APEX Q5_K_M**
-   (qwen35moe, F32 control path `HF2Q_TQ_KV=0`, SerialFifo scheduler,
+   (qwen35moe, F32 control path `HF2Q_TQ_KV=0`,
    `HF2Q_QWEN_SPECULATION=off`, thinking unbudgeted — all arms
    configuration-matched per the doctrine; harness:
-   `scripts/graft_probe/canary.sh`):
-   - zero-slot canary (n_slots=0, no tensors): output **byte-identical**
-     to the ungrafted baseline — the plumbing is a no-op when absent.
-   - live bank (64 slots, every full-attention layer, deterministic
-     synthetic rows, scale 8.0): output **diverges** from baseline —
-     the splice is read by attention and shifts the forward pass
-     (participation proven; behavioral quality is the paired-arm
-     panel's job, not the canary's). Dose note: 8 slots at scale 0.5
-     left greedy argmax unchanged — small synthetic doses can be
-     invisible under greedy decoding; the canary uses the measured
-     guaranteed-shift dose.
-   - disable with a fresh process: output **identical** to baseline.
+   `scripts/graft_probe/canary.sh`, one campaign per scheduler):
+   - **SerialFifo campaign** (`--scheduler fifo-serial`): zero-slot
+     canary (n_slots=0, no tensors) output **byte-identical** to the
+     ungrafted baseline — the plumbing is a no-op when absent; live bank
+     (64 slots, every full-attention layer, deterministic synthetic
+     rows, scale 8.0) output **diverges** from baseline — the splice is
+     read by attention and shifts the forward pass (participation
+     proven; behavioral quality is the paired-arm panel's job, not the
+     canary's); disable with a fresh process output **identical** to
+     baseline. Dose note: 8 slots at scale 0.5 left greedy argmax
+     unchanged — small synthetic doses can be invisible under greedy
+     decoding; the canary uses the measured guaranteed-shift dose.
+   - **SlotAware campaign** (`--scheduler inflight-batched`, after the
+     continuous-batching graft wiring): **ALL PASS** — zero-slot
+     byte-identical, live bank diverges (with the same degenerate
+     prefix as the serial live arm — the splice effect is consistent
+     across engine paths), disable restores. The SlotAware wiring:
+     splice at cold admission in `Qwen35PrefillState::begin`, warm-path
+     graft-region invariant (a reset clears anchors, so a warm
+     admission with a missing region tag is an invariant failure that
+     refuses by name), graft-shifted RoPE positions (prefill chunks and
+     `decode_position_base`), graft-aware slot anchors (the anchor
+     boundary is the PHYSICAL cursor — graft rows + prompt rows — and
+     the append-only contract keeps the rows intact across
+     capture/restore), per-request capacity and KV-byte accounting that
+     counts the graft rows, and MTP/spec-prefix suppression (the MTP
+     arena never sees the graft). Vision/extension generation and
+     embeddings still refuse grafts by name at their own gates.
    Remaining for this gate: the same canary on the TQ-active path
    (staged splice) and on additional families as their splices ship.
 5. **Position-offset equivalence**: ungrafted engine vs grafted engine
