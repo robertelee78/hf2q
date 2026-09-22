@@ -241,27 +241,55 @@ the graft hash. No sampling-path changes.
 
 1. **Reader conformance**: spec clauses; malformed metadata, ambiguous
    shapes, unknown mode/kind/hook, hash mismatch, non-covered-layer
-   tensors — all fatal, all tested.
+   tensors — all fatal, all tested. **DONE** (23 tests).
 2. **Bind validation matrix**: layer indices vs site coverage,
    n_kv_heads, head_dim, dtype, RoPE keys vs model config, checkpoint
-   identity (receipt-bound), TQ encode compatibility.
+   identity (receipt-bound), TQ encode compatibility. **DONE** (9
+   tests; complete-coverage contract).
 3. **Cache-identity separation**: grafted ≠ clean ≠ differently-grafted
-   keys; cross-slot isolation under multi-seq (ADR-040 slots).
+   keys; cross-slot isolation under multi-seq (ADR-040 slots). **DONE**
+   (splice primitive 11 tests incl. byte-level row verification,
+   slot isolation, graft-aware snapshot/restore round trip; LCP
+   identity test).
 4. **Canaries 1–4** above, on hardware, per family that ships.
+   **MEASURED 2026-09-22 on Qwen3.6-35B-Abliterix-APEX Q5_K_M**
+   (qwen35moe, F32 control path `HF2Q_TQ_KV=0`, SerialFifo scheduler,
+   `HF2Q_QWEN_SPECULATION=off`, thinking unbudgeted — all arms
+   configuration-matched per the doctrine; harness:
+   `scripts/graft_probe/canary.sh`):
+   - zero-slot canary (n_slots=0, no tensors): output **byte-identical**
+     to the ungrafted baseline — the plumbing is a no-op when absent.
+   - live bank (64 slots, every full-attention layer, deterministic
+     synthetic rows, scale 8.0): output **diverges** from baseline —
+     the splice is read by attention and shifts the forward pass
+     (participation proven; behavioral quality is the paired-arm
+     panel's job, not the canary's). Dose note: 8 slots at scale 0.5
+     left greedy argmax unchanged — small synthetic doses can be
+     invisible under greedy decoding; the canary uses the measured
+     guaranteed-shift dose.
+   - disable with a fresh process: output **identical** to baseline.
+   Remaining for this gate: the same canary on the TQ-active path
+   (staged splice) and on additional families as their splices ship.
 5. **Position-offset equivalence**: ungrafted engine vs grafted engine
    with `n_slots=0` — bit-identical logits across prefill and decode,
-   including spec-decode and kv_persist round-trips.
-6. **Throughput report**: decode and prefill tok/s, grafted vs ungrafted,
-   median of multiple runs. Expected cost is attention over N extra slots
-   at covered layers only (≈ a prompt N tokens longer at those layers);
-   acceptance is "within the measured noise band or the delta is
-   documented and accepted," never silently shipped.
+   including spec-decode and kv_persist round-trips. The zero-slot
+   canary above proves the serve-path equivalence end-to-end (output
+   level); kv_persist is refused under graft at boot pending the
+   graft-aware disk codec.
+6. **Throughput report**: decode and prefill tok/s, grafted vs
+   ungrafted, median of multiple runs. Expected cost is attention over
+   N extra slots at covered layers only (≈ a prompt N tokens longer at
+   those layers); acceptance is "within the measured noise band or the
+   delta is documented and accepted," never silently shipped.
+   **OPEN** — the paired-arm harness extension measures this.
 7. **Paired-arm behavioral panels** per the measurement doctrine:
    baseline / graft / GCD / graft+GCD, identical model artifacts,
    prompts, sampling settings, budgets; engagement, capability
    (GSM8K-class spot check — phantom measured a real cost here),
    completion, truncation, and KL reported separately. A null result is
-   recorded honestly and closes the gate.
+   recorded honestly and closes the gate. **OPEN** — requires a
+   phantom-kv-derived bank (the synthetic canary bank proves
+   participation, not behavior).
 
 ## Evidence behind the design
 
