@@ -336,14 +336,47 @@ the graft hash. No sampling-path changes.
       sustained load. The harness pre-warms ~3 minutes before the
       first measured arm; without that, ANY A-B throughput comparison
       on this host is noise.
-7. **Paired-arm behavioral panels** per the measurement doctrine:
-   baseline / graft / GCD / graft+GCD, identical model artifacts,
-   prompts, sampling settings, budgets; engagement, capability
-   (GSM8K-class spot check — phantom measured a real cost here),
-   completion, truncation, and KL reported separately. A null result is
-   recorded honestly and closes the gate. **OPEN** — requires a
-   phantom-kv-derived bank (the synthetic canary bank proves
-   participation, not behavior).
+ 7. **Paired-arm behavioral panels** per the measurement doctrine:
+    baseline / graft / GCD / graft+GCD, identical model artifacts,
+    prompts, sampling settings, budgets; engagement, capability
+    (GSM8K-class spot check — phantom measured a real cost here),
+    completion, truncation, and KL reported separately. A null result is
+    recorded honestly and closes the gate.
+    **MEASURED 2026-09-22** on Qwen3.6-35B-Abliterix-APEX Q5_K_M with a
+    64-slot SELF-DONOR bank (derived through hf2q's own donor prefill —
+    `HF2Q_GRAFT_DERIVE` + `wrap_bank.py`, checkpoint-bound, proven to
+    bind `Named` and shift the token stream in the output-level
+    canary); harness `scripts/graft_probe/panel.sh` (TQ substrate,
+    SerialFifo, speculation off, thinking off per request, temperature
+    0, 15 GSM8K-class + 12 engagement probes per arm):
+    - **Capability: no measurable graft cost** — baseline 9/15 vs
+      graft 11/15; the ±2-item difference is ~1σ at n=15 (noise band
+      ≈ ±1.9 items). Phantom's v3 TRAINED arm measured a real cost
+      (45/75 → 27/75 on their stack); this v1-style donor bank shows
+      none at this dose.
+    - **Engagement: null** — safety refusals 0/3 in EVERY arm (the
+      de-aligned Abliterix fine-tune's refusals are not restored by a
+      generic compliance donor — an honest null for the strongest
+      phantom-style claim); verbosity (373 vs 377 mean words) and
+      concise-compliance (1/3 vs 1/3) unchanged.
+    - **GCD arms**: the schema contract structurally constrains output
+      (median 11–13 completion tokens, zero truncations — the grammar
+      closes every response); capability under schema 7/15 (baseline)
+      and 6/15 (graft) — the grammar's own cost, within noise of the
+      plain arms' pairwise differences.
+    - **Verdict: NULL behavioral result at this dose, recorded
+      honestly.** The graft demonstrably shifts the token stream
+      (output-level canary) but moves no behavioral metric on this
+      probe set — consistent with phantom's own finding that the v1
+      prefill_kv arm is their weakest (their engagement results needed
+      the v3 trained banks). Closing the gate on the null; a TRAINED
+      bank (phantom v3-style optimization against a target objective)
+      is the named follow-up if behavioral steering is wanted.
+    - **Harness lesson (recorded for reruns)**: the first campaign ran
+      unbudgeted thinking and the model spent the whole 512-token
+      budget in reasoning on complex probes — empty content, vacuous
+      metrics. The panel sends `hf2q_enable_thinking: false` per
+      request; the falsifier run's manifest is preserved.
 
 ## Evidence behind the design
 
