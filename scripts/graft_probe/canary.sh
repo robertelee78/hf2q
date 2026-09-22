@@ -17,10 +17,14 @@
 # Configuration matching across arms (measurement doctrine: the ONLY
 # difference between arms is the graft):
 #
-#   HF2Q_TQ_KV=0                    — the TQ-active splice is a staged,
-#                                     named refusal (ADR-059); the F32
-#                                     control path is the canary
-#                                     substrate, identical across arms.
+#   HF2Q_TQ_KV=$TQ_KV               — one campaign per KV substrate: the
+#                                     F32 control path (0) and the
+#                                     production TQ path (1, default
+#                                     serving substrate; the graft splice
+#                                     encodes bank rows through the same
+#                                     hadamard kernel prefill uses).
+#                                     HF2Q_CANARY_TQ_KV selects (default
+#                                     0). Arms never mix substrates.
 #   --scheduler $SCHEDULER          — identical engine path per campaign
 #                                     (SlotAware vs Serial batching
 #                                     changes greedy numerics, so arms
@@ -45,6 +49,7 @@ set -euo pipefail
 MODEL="${1:-/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf}"
 PORT="${2:-8391}"
 SCHEDULER="${HF2Q_CANARY_SCHEDULER:-fifo-serial}"
+TQ_KV="${HF2Q_CANARY_TQ_KV:-0}"
 BIN="$(cd "$(dirname "$0")/../.." && pwd)/target/release/hf2q"
 WORK="$(mktemp -d /tmp/hf2q-graft-canary.XXXXXX)"
 PROMPT='In one sentence: what is the capital of France?'
@@ -95,7 +100,7 @@ run_arm() {
     shift
     local log="$WORK/serve-$name.log"
     echo "── arm $name: booting serve on :$PORT"
-    HF2Q_TQ_KV=0 HF2Q_QWEN_SPECULATION=off "$BIN" serve "$MODEL" \
+    HF2Q_TQ_KV="$TQ_KV" HF2Q_QWEN_SPECULATION=off "$BIN" serve "$MODEL" \
         --port "$PORT" --quiet --scheduler "$SCHEDULER" \
         --default-thinking-token-budget 0 "$@" >"$log" 2>&1 &
     CANARY_PID=$!
@@ -169,9 +174,9 @@ verdict_live=$([[ "$A" != "$C" ]] && echo PASS || echo FAIL)
 verdict_disable=$([[ "$A" == "$D" ]] && echo PASS || echo FAIL)
 
 git_rev="$(git -C "$(dirname "$0")/../.." rev-parse HEAD 2>/dev/null || echo unknown)"
-python3 - "$WORK" "$git_rev" "$MODEL" "$SCHEDULER" "$verdict_zero" "$verdict_live" "$verdict_disable" <<'PY'
+python3 - "$WORK" "$git_rev" "$MODEL" "$SCHEDULER" "$TQ_KV" "$verdict_zero" "$verdict_live" "$verdict_disable" <<'PY'
 import hashlib, json, os, sys
-work, git_rev, model, scheduler, v_zero, v_live, v_disable = sys.argv[1:8]
+work, git_rev, model, scheduler, tq_kv, v_zero, v_live, v_disable = sys.argv[1:9]
 def sha(p):
     with open(p, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -179,6 +184,7 @@ manifest = {
     "canary": "adr-059-gates-4-5",
     "git_rev": git_rev,
     "scheduler": scheduler,
+    "tq_kv": tq_kv,
     "model": model,
     "model_sha256": sha(model) if os.path.exists(model) else None,
     "artifacts": {
@@ -202,7 +208,7 @@ print("manifest: %s" % path)
 PY
 
 echo
-echo "scheduler: $SCHEDULER"
+echo "scheduler: $SCHEDULER  tq_kv: $TQ_KV"
 echo "gate 4a (zero-slot no-op):     $verdict_zero"
 echo "gate 4b (live graft shifts):   $verdict_live"
 echo "gate 5  (disable restores):    $verdict_disable"

@@ -197,9 +197,12 @@ graft is bound.
   (documented, enforced — the slot is rebuilt, not patched). Fresh-state
   disable restores the ungrafted baseline bit-for-bit (gate 4).
 - **TQ interaction**: if a slot is TQ-active, graft K/V pass through the
-  same `hadamard_quantize_kv` encode path once at bind (device-resident,
-  encoded into the slot's TQ buffers). Binding fails closed if
-  codebook_bits/head_dim are unsupported for the encode.
+  same `hadamard_quantize_kv` encode path once at splice (device-resident,
+  encoded into the slot's TQ buffers with the same codebook-bits
+  resolution as this process's prefill rows — byte-identical to encoding
+  the bank rows as a prefill chunk, enforced by test). The splice refuses
+  by name if head_dim is not 256/512 (the kernel encodes no other dim);
+  the F32 control path (`HF2Q_TQ_KV=0`) is the fixture substrate.
 
 ### 5. Determinism
 
@@ -282,10 +285,19 @@ the graft hash. No sampling-path changes.
      the append-only contract keeps the rows intact across
      capture/restore), per-request capacity and KV-byte accounting that
      counts the graft rows, and MTP/spec-prefix suppression (the MTP
-     arena never sees the graft). Vision/extension generation and
-     embeddings still refuse grafts by name at their own gates.
-   Remaining for this gate: the same canary on the TQ-active path
-   (staged splice) and on additional families as their splices ship.
+      arena never sees the graft). Vision/extension generation and
+      embeddings still refuse grafts by name at their own gates.
+    - **TQ-substrate campaigns** (`HF2Q_TQ_KV=1`, the production KV
+      substrate; the graft splice encodes bank rows through the same
+      hadamard kernel prefill uses — byte-identical to a prefill-chunk
+      encode of the same rows, enforced by test): the full campaign
+      matrix {SerialFifo, SlotAware} × {F32, TQ} is **ALL PASS**
+      (zero-slot byte-identical, live bank diverges, disable restores,
+      in every combo). The zero-slot no-op on TQ also proves the
+      splice's substrate dispatch is a true no-op when absent. Each
+      campaign's manifest records its `scheduler` + `tq_kv` fields.
+    Remaining for this gate: the same canary on additional families as
+    their splices ship.
 5. **Position-offset equivalence**: ungrafted engine vs grafted engine
    with `n_slots=0` — bit-identical logits across prefill and decode,
    including spec-decode and kv_persist round-trips. The zero-slot
