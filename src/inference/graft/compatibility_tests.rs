@@ -83,10 +83,16 @@ fn qwen35_model_meta() -> Vec<(&'static str, Meta)> {
 }
 
 fn tmp_path(tag: &str) -> std::path::PathBuf {
+    // Unique per call: `line!()` here would expand to THIS line for every
+    // caller (a same-file race between parallel tests — surfaced as a
+    // truncated-GGUF parse flake). An atomic counter guarantees distinct
+    // fixture paths.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::env::temp_dir().join(format!(
         "graft_compat_{tag}_{}_{}.gguf",
         std::process::id(),
-        line!()
+        n
     ))
 }
 

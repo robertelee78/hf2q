@@ -7809,14 +7809,6 @@ pub(super) fn generate_stream_qwen35_once_extended(
         };
     }
 
-    // ADR-059 fail-closed gate: the streaming path's position/cache
-    // wiring is the follow-up increment; a bound graft refuses stream
-    // requests by name rather than serving ungrafted.
-    if let Err(error) = ensure_graft_serving_supported(qwen) {
-        send!(GenerationEvent::Error(format!("{error:#}")));
-        return Ok(SerialStreamEnd::TerminalSent);
-    }
-
     if prompt_tokens.is_empty() {
         send!(GenerationEvent::Error(
             "generate_stream_qwen35_once: empty prompt_tokens".into()
@@ -7855,6 +7847,17 @@ pub(super) fn generate_stream_qwen35_once_extended(
         }
     }
 
+    // ADR-059 fail-closed gate: TEXT streaming serves grafted requests
+    // (graft wiring below); extension (vision soft-token / deepstack)
+    // streaming is not graft-wired and refuses by name rather than
+    // serving ungrafted.
+    if has_extension {
+        if let Err(error) = ensure_graft_serving_supported(qwen) {
+            send!(GenerationEvent::Error(format!("{error:#}")));
+            return Ok(SerialStreamEnd::TerminalSent);
+        }
+    }
+
     let cache_alloc_start = Instant::now();
     let device = match MlxDevice::new() {
         Ok(d) => d,
@@ -7885,6 +7888,17 @@ pub(super) fn generate_stream_qwen35_once_extended(
     // Idempotent + cheap on hot path; warn-logs + swallows persistence
     // failures so the request still proceeds.
     qwen.hydrate_lcp_registry_from_disk(&kv_cache, &device);
+
+    // ADR-059: the graft region length for this engine (0 = ungrafted).
+    // Text streaming shifts every position, snapshot/restore boundary,
+    // and the decode base by it; the splice happens at cold-cache
+    // admission below (restores bring the graft rows back instead).
+    let graft_len: usize = qwen
+        .model
+        .kv_graft
+        .as_ref()
+        .map(|g| g.n_slots() as usize)
+        .unwrap_or(0);
 
     let pre_dispatches = mlx_native::dispatch_count();
     let pre_syncs = mlx_native::sync_count();
@@ -7952,8 +7966,19 @@ pub(super) fn generate_stream_qwen35_once_extended(
             ) {
                 let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
                 let restore_start = Instant::now();
-                if let Err(e) = kv_cache.restore_partial(snapshot, prefix.k) {
+                // ADR-059: graft-aware boundary — the snapshot's first
+                // `graft_len` physical positions are graft rows.
+                if let Err(e) = kv_cache.restore_partial(snapshot, graft_len + prefix.k) {
                     return Err(e).context("Qwen35 SerialFifo streaming LCP checkpoint restore");
+                }
+                if graft_len > 0
+                    && kv_cache.graft_region_for_slot(SlotId(0)).unwrap_or(0) == 0
+                {
+                    if let Err(e) =
+                        kv_cache.mark_graft_region_for_slot(SlotId(0), graft_len as u32)
+                    {
+                        return Err(e).context("re-mark graft region after streaming LCP restore");
+                    }
                 }
                 let restore_ms = restore_start.elapsed().as_micros() as f64 / 1000.0;
                 lcp_resume_start = prefix.k;
@@ -7981,6 +8006,21 @@ pub(super) fn generate_stream_qwen35_once_extended(
         kv_cache.reset();
     }
 
+    // ADR-059: splice the graft into a fresh/reset cache before prefill
+    // (cold path only — restores above bring the graft rows back inside
+    // their snapshot bytes; a splice into a restored cache is a
+    // double-splice error by contract).
+    if graft_len > 0 && !prompt_cache_hit && lcp_resume_start == 0 {
+        let bound = qwen
+            .model
+            .kv_graft
+            .as_ref()
+            .expect("graft_len > 0 implies a bound graft");
+        if let Err(e) = kv_cache.splice_graft_for_slot(SlotId(0), &bound.bank) {
+            return Err(e).context("KV graft splice at streaming cold-cache admission");
+        }
+    }
+
     let prefill_start = Instant::now();
     let mut next_token: u32;
     if prompt_cache_hit {
@@ -7988,8 +8028,15 @@ pub(super) fn generate_stream_qwen35_once_extended(
             .prompt_cache
             .snapshot()
             .expect("try_match Some implies snapshot Some");
-        if let Err(e) = kv_cache.restore_partial(snap, prompt_len) {
+        // ADR-059: graft-aware boundary — the snapshot carries the graft
+        // rows in its first `graft_len` physical positions.
+        if let Err(e) = kv_cache.restore_partial(snap, graft_len + prompt_len) {
             return Err(e).context("Qwen35 SerialFifo streaming prompt-cache restore");
+        }
+        if graft_len > 0 && kv_cache.graft_region_for_slot(SlotId(0)).unwrap_or(0) == 0 {
+            if let Err(e) = kv_cache.mark_graft_region_for_slot(SlotId(0), graft_len as u32) {
+                return Err(e).context("re-mark graft region after streaming prompt-cache restore");
+            }
         }
         next_token = qwen.prompt_cache.first_decoded_token();
         tracing::debug!(
@@ -8003,7 +8050,9 @@ pub(super) fn generate_stream_qwen35_once_extended(
         let positions_slice: &[i32] = match positions_flat {
             Some(p) => p,
             None => {
-                positions_owned = prefill_positions_for(prompt_len);
+                // ADR-059: cold text prefill — positions shift by the
+                // graft region (graft at 0..graft_len, prompt after).
+                positions_owned = prefill_positions_from(graft_len, prompt_len);
                 &positions_owned
             }
         };
@@ -8065,7 +8114,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
             for axis in 0..4 {
                 for token in 0..suffix_len {
-                    suffix_positions[axis * suffix_len + token] = (lcp_resume_start + token) as i32;
+                    suffix_positions[axis * suffix_len + token] = (graft_len + lcp_resume_start + token) as i32;
                 }
             }
             match supervised_gpu_call(supervisor, "qwen35_serial_stream_prefill", || {
@@ -8103,7 +8152,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut prefix_positions = vec![0i32; 4 * prefix_len];
             for axis in 0..4 {
                 for token in 0..prefix_len {
-                    prefix_positions[axis * prefix_len + token] = (lcp_resume_start + token) as i32;
+                    prefix_positions[axis * prefix_len + token] = (graft_len + lcp_resume_start + token) as i32;
                 }
             }
             if let Err(error) =
@@ -8134,7 +8183,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut tail_positions = vec![0i32; 4 * tail_len];
             for axis in 0..4 {
                 for token in 0..tail_len {
-                    tail_positions[axis * tail_len + token] = (recovery_anchor + token) as i32;
+                    tail_positions[axis * tail_len + token] = (graft_len + recovery_anchor + token) as i32;
                 }
             }
             eprintln!(
@@ -8175,7 +8224,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 let mut chunk_positions = vec![0i32; 4 * chunk_seq_len];
                 for axis in 0..4 {
                     for t in 0..chunk_seq_len {
-                        chunk_positions[axis * chunk_seq_len + t] = (k_start + t) as i32;
+                        chunk_positions[axis * chunk_seq_len + t] = (graft_len + k_start + t) as i32;
                     }
                 }
                 let res =
@@ -8227,7 +8276,9 @@ pub(super) fn generate_stream_qwen35_once_extended(
                     && !superseded_by_recovery_anchor
                     && !mid_store_disabled
                 {
-                    match kv_cache.snapshot_prefix(&device, k_end) {
+                    // ADR-059: graft-aware boundary — snapshot the
+                    // graft rows plus the prompt prefix.
+                    match kv_cache.snapshot_prefix(&device, graft_len + k_end) {
                         Ok(snap) => {
                             let chunk_key = build_lcp_key_for_qwen35_chunk(qwen, params, k_end);
                             let linear_capacity = kv_cache
@@ -8280,7 +8331,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 let mut tail_positions = vec![0i32; 4 * tail_len];
                 for axis in 0..4 {
                     for token in 0..tail_len {
-                        tail_positions[axis * tail_len + token] = (recovery_anchor + token) as i32;
+                        tail_positions[axis * tail_len + token] = (graft_len + recovery_anchor + token) as i32;
                     }
                 }
                 eprintln!(
@@ -8306,7 +8357,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
             for axis in 0..4 {
                 for t in 0..suffix_len {
-                    suffix_positions[axis * suffix_len + t] = (lcp_resume_start + t) as i32;
+                    suffix_positions[axis * suffix_len + t] = (graft_len + lcp_resume_start + t) as i32;
                 }
             }
             eprintln!(
@@ -8363,7 +8414,9 @@ pub(super) fn generate_stream_qwen35_once_extended(
         // image embeddings. Generic extension callers without that digest
         // remain ineligible.
         if is_greedy && prompt_cache_eligible {
-            match kv_cache.snapshot_prefix(&device, prompt_len) {
+            // ADR-059: graft-aware boundary — the replay snapshot
+            // carries the graft rows in its first graft_len positions.
+            match kv_cache.snapshot_prefix(&device, graft_len + prompt_len) {
                 Ok(snap) => {
                     qwen.prompt_cache
                         .update(prompt_tokens.to_vec(), snap, next_token, params)
@@ -8414,7 +8467,8 @@ pub(super) fn generate_stream_qwen35_once_extended(
             }
             max_t.saturating_add(1)
         }
-        None => prompt_len as i32,
+        // ADR-059: text decode base shifts by the graft region.
+        None => (graft_len + prompt_len) as i32,
     };
 
     // ── Splitter wiring (Reasoning + ToolCall) ────────────────────
