@@ -2866,6 +2866,91 @@ fn max_trailing_tag_prefix_len(text: &str) -> usize {
     max
 }
 
+/// ADR-059 gate-7 self-donor derivation dump (HF2Q_GRAFT_DERIVE=
+/// `<out_prefix>:<n_slots>`): write the extracted per-layer K/V rows
+/// plus a metadata sidecar that `scripts/graft_probe/wrap_bank.py`
+/// wraps into a `graft.*` GGUF. The sidecar carries the checkpoint
+/// identity exactly as the bind's `CheckpointIdentity` trust boundary
+/// resolves it, plus every model key the container requires, so the
+/// wrapped bank is checkpoint-bound to the artifact it was derived
+/// from.
+fn derive_and_dump_graft_rows(
+    spec: &str,
+    model_path: &std::path::Path,
+    gguf: &mlx_native::gguf::GgufFile,
+    kv_cache: &crate::inference::models::qwen35::kv_cache::HybridKvCache,
+) -> Result<()> {
+    let (prefix, n_slots) = spec
+        .rsplit_once(':')
+        .context("HF2Q_GRAFT_DERIVE must be <out_prefix>:<n_slots>")?;
+    let n_slots: u32 = n_slots
+        .parse()
+        .with_context(|| format!("HF2Q_GRAFT_DERIVE: n_slots must be u32 (got {n_slots:?})"))?;
+    anyhow::ensure!(
+        !prefix.is_empty(),
+        "HF2Q_GRAFT_DERIVE: empty output prefix"
+    );
+    let rows = kv_cache
+        .extract_full_attn_rows_for_graft(crate::serve::multi_seq_kv::SlotId(0), n_slots)
+        .context("HF2Q_GRAFT_DERIVE: extract donor rows")?;
+
+    let identity = crate::inference::glp::CheckpointIdentity::for_model_path(model_path, gguf)?;
+    let arch = gguf
+        .metadata_string("general.architecture")
+        .context("HF2Q_GRAFT_DERIVE: model GGUF missing general.architecture")?;
+    let meta_u32 = |key: &str| -> Result<u32> {
+        gguf.metadata_u32(key)
+            .with_context(|| format!("HF2Q_GRAFT_DERIVE: model GGUF missing {key}"))
+    };
+    let meta_f32 = |key: &str| -> Result<f32> {
+        gguf.metadata_f32(key)
+            .with_context(|| format!("HF2Q_GRAFT_DERIVE: model GGUF missing {key}"))
+    };
+    let layers: Vec<u32> = rows.iter().map(|(l, _, _)| *l).collect();
+    let sidecar = serde_json::json!({
+        "derivation": "hf2q-self-donor-v1",
+        "model_path": model_path.display().to_string(),
+        "arch": arch,
+        "block_count": meta_u32(&format!("{arch}.block_count"))?,
+        "full_attention_interval": meta_u32(&format!("{arch}.full_attention_interval"))?,
+        "n_kv_heads": meta_u32(&format!("{arch}.attention.head_count_kv"))?,
+        "head_dim": meta_u32(&format!("{arch}.attention.key_length"))?,
+        "rope_theta": meta_f32(&format!("{arch}.rope.freq_base"))?,
+        "rotary_dim": meta_u32(&format!("{arch}.rope.dimension_count"))?,
+        "n_slots": n_slots,
+        "layers": layers,
+        "identity": {
+            "name": identity.name,
+            "organization": identity.organization,
+            "repository": identity.repository,
+            "revision": identity.revision,
+        },
+    });
+    let meta_path = format!("{prefix}.meta.json");
+    std::fs::write(
+        &meta_path,
+        serde_json::to_vec_pretty(&sidecar).context("HF2Q_GRAFT_DERIVE: serialize sidecar")?,
+    )
+    .with_context(|| format!("HF2Q_GRAFT_DERIVE: write {meta_path}"))?;
+    for (layer, k, v) in rows {
+        let k_path = format!("{prefix}.layer{layer}.k.f32");
+        let v_path = format!("{prefix}.layer{layer}.v.f32");
+        let bytes = |values: &[f32]| unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4)
+        };
+        std::fs::write(&k_path, bytes(&k))
+            .with_context(|| format!("HF2Q_GRAFT_DERIVE: write {k_path}"))?;
+        std::fs::write(&v_path, bytes(&v))
+            .with_context(|| format!("HF2Q_GRAFT_DERIVE: write {v_path}"))?;
+    }
+    eprintln!(
+        "HF2Q_GRAFT_DERIVE: wrote {} layer dumps + {meta_path} (n_slots={n_slots}); \
+         wrap with scripts/graft_probe/wrap_bank.py",
+        layers.len()
+    );
+    Ok(())
+}
+
 fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile) -> Result<()> {
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
@@ -3512,6 +3597,20 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             last_logits.len()
         );
         eprintln!("  top-3: {:?}", &indexed[..3.min(indexed.len())]);
+        return Ok(());
+    }
+
+    // ADR-059 gate-7 self-donor derivation: after the donor prompt's
+    // prefill, extract positions 0..n_slots of every full-attention
+    // layer's K/V and dump them for graft.*.gguf wrapping
+    // (scripts/graft_probe/wrap_bank.py). The bank is derived through
+    // hf2q's own forward (the same kernels that will read it back) —
+    // phantom-kv's v1 prefill_kv arm without the external HF stack.
+    // Env: HF2Q_GRAFT_DERIVE=<out_prefix>:<n_slots> (e.g.
+    // /tmp/apex-bank:64). Requires the F32 control path (HF2Q_TQ_KV=0,
+    // the CLI default) and a donor prompt at least n_slots tokens long.
+    if let Some(spec) = std::env::var("HF2Q_GRAFT_DERIVE").ok() {
+        derive_and_dump_graft_rows(&spec, model_path, &gguf, &kv_cache)?;
         return Ok(());
     }
 
