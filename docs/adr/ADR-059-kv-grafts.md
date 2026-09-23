@@ -1,10 +1,20 @@
-# ADR-059: KV-cache grafts — context-space steering artifacts (`--kv-graft`)
+# ADR-059: KV-cache grafts — runtime unalignment artifacts (`--kv-graft`)
 
-- **Status:** Proposed — design recorded 2026-09-22; implementation gated
-  behind the flags and gates below. No default behavior changes. This ADR
-  is the hypothesis + design step of the Kata; every behavioral claim below
-  is phantom-kv's measurement on their stack, not an hf2q result, until the
-  paired-arm gates run here.
+- **Status:** Revised 2026-09-23 — **the product success criterion reads
+  YES on the core claim.** A trained K/V bank, served by hf2q as a
+  graft file on the unmodified Qwen3.5-4B (Q4_K_M), removes 83% of
+  refusals on the phantom-kv harmful scoreboard (46/60 → 8/60) with the
+  harmless suite fully preserved (0/20 both arms) — no weight edits,
+  byte-identical base artifact, reversible by unbinding. The reference
+  result is CONFIRMED in its own stack through the ported pipeline
+  (46/60 → 4/60 on bf16); the 8-vs-4 gap is the bf16-trained-bank-on-
+  Q4-weights parity cost. Open honesty items: the capability cost is
+  not yet measured on the hf2q side (the reference measured GSM8K
+  45/75 → 27/75 under their trained bank — a real cost to expect);
+  family generality (the site matrix beyond qwen35 `full_attn_kv`) is
+  the declared expansion; the residual-refusal count is conservative
+  (the lexical judge flags late-window phrases on substantively
+  engaging answers).
 - **Date:** 2026-09-22
 - **Related:** ADR-053 (GLP serving surface — the artifact/binding pattern
   this mirrors), ADR-054 (GLP calibration and its measured null result),
@@ -29,23 +39,99 @@
 
 ## Problem
 
-The intervention taxonomy has two shipped surfaces: **selection** (GCD —
-masks logits at sampling) and **computation** (GLP — modifies activations
-mid-forward). Missing: **context** — what the model conditions on.
+**The product: unalign a model without touching its weights.**
 
-Two facts motivate a second intervention class now:
+A vanilla aligned model refuses a class of requests. The established
+remedy is a weight-level unalignment fine-tune (abliterix-class) —
+permanent, per-artifact, requires training and shipping a new model
+file. The product goal of this ADR is the same outcome as a RUNTIME
+artifact: a small, checkpoint-bound file that, when bound to the
+serving process, shifts the forward-path probabilities so the model
+answers questions it would otherwise refuse. No weight edits, no
+fine-tune, instant rollback (unbind + fresh state restores the
+baseline on byte-identical weights).
 
-1. ADR-054's measured null result: the calibrated `d_disp` direction at
-   the FFN-writer site is behaviorally inert on the 48-prompt panel
-   (28→28→28→29→29 across the dose ladder). The site-transfer warning in
-   spec/GLP.md was confirmed. A structurally different mechanism is
-   warranted, not another dose.
-2. phantom-kv's mechanism is architecturally unlike GLP: no per-token
-   hook, no 1-D direction assumption, nothing projected out of any
-   activation. Steering is **attention-gated** — the model's own attention
-   decides how strongly to weight the graft, per head, per token. Unload
-   the graft and (with fresh inference state) the baseline is restored on
-   byte-identical weights.
+**Success criterion (binary, the only scoreboard):** on a stock
+aligned model with measured refusal headroom, a bound graft
+measurably reduces refusal on a fixed probe set, at an acceptable
+capability cost. Refusal rate drops = the feature works. Refusal
+rate unchanged = it does not, whatever the plumbing proves.
+
+The supporting architecture argument (why this mechanism class):
+the intervention taxonomy has two shipped surfaces — **selection**
+(GCD — masks logits at sampling) and **computation** (GLP — modifies
+activations mid-forward, and measured behaviorally inert in
+ADR-054). Missing: **context** — what the model conditions on.
+phantom-kv's mechanism is architecturally unlike GLP: no per-token
+hook, no 1-D direction assumption. Steering is **attention-gated** —
+the model's own attention decides how strongly to weight the graft,
+per head, per token. That is the mechanism by which the refusal
+probabilities are meant to move.
+
+**Measured so far (hf2q, honest record):**
+
+- The MECHANISM is proven end-to-end: bound banks splice into every
+  full-attention layer on both engine paths and both KV substrates,
+  demonstrably shift the token stream (participation canaries), and
+  restore the baseline exactly when unbound. Zero-slot grafts are
+  byte-identical no-ops. Cost: ~5% decode tok/s at 64 slots on a
+  333-token context, scaling as `n_slots / context_length`.
+- The DONOR-bank class is FALSIFIED for behavioral transfer: banks
+  derived from the model's own prefill of a donor TEXT (its state of
+  READING a compliance/style request) produced zero behavioral
+  movement at any dose — 0/12 style transfer at 64/128/256 slots on
+  Qwen3.5-4B (2026-09-23, isolated dose-response, pre-registered
+  metrics), and 0/3 refusal restoration on the already-unaligned
+  APEX 35B at 64 slots (2026-09-22 panel). Reading about complying is
+  not complying: the K/V of a user-turn request does not carry the
+  assistant-side compliance state.
+- phantom-kv's measured record (their stack, Qwen3-4B): TRAINED banks
+  moved refusals 25/60 → 5/60 at KL 0.015 — the product outcome
+  exists in their pipeline, at a real capability cost (GSM8K 45/75 →
+  27/75). Their donor/v1 prefill banks were correspondingly weak.
+  Their training objective is the product objective: CE on harmful
+  (compliance) + KL anchor to base on harmless (capability
+  preservation).
+
+**The reformulated path to YES — MEASURED, and it reads YES:**
+
+The reference pipeline (phantom-kv), ported to the hybrid architecture
+(`scripts/graft_probe/phantom_port.py`; their donor text, suites,
+judge, run format, three-role objective ce 50% / sup 25% / kl 25%,
+their hyperparameters — 400 steps, AdamW 1e-3, sup_margin 3.0, L2
+anchor 1e-2 — with exactly one seam adapted: the bank covers the 8
+full-attention layers and every cache splice lands at indices
+{3, 7, …, 31}, matching hf2q's serve-time splice semantics):
+
+1. **Base run** (their stack, HF bf16): 46/60 harmful refusals,
+   0/20 harmless — more headroom than their Qwen3-4B (25/60).
+2. **v1 donor run**: 43/60 — the donor bank flips only 3 (its real
+   job is the data generator: 3 genuine compliant completions for the
+   `ce` targets, plus 13 base-complies; the 46 recorded refusals are
+   the `sup` targets; 20 harmless completions are the `kl` anchor).
+3. **Training**: sup loss 2.14 → 0.00 (every recorded refusal driven
+   below the margin), ce 0.59 → 0.29, kl 0.039, anchor drift 1.6e-2.
+4. **Reference confirmation** (their stack, bf16): **46/60 → 4/60
+   refusals, harmless 0/20 unchanged** — their demonstrated result
+   class, reproduced on hybrid Qwen3.5.
+5. **PRODUCT** (hf2q serving the trained bank as a `graft.*` GGUF on
+   the unmodified Q4_K_M artifact, TQ substrate, SerialFifo):
+   **46/60 → 8/60 refusals, harmless 0/20 unchanged.** The trained
+   effect survives quantized weights, mlx-native kernels, and the TQ
+   KV substrate. Compliance is genuine (substantive, coherent direct
+   answers — verified by content inspection, not just the lexical
+   judge). The 8-vs-4 gap vs the bf16 stack is the bank-precision
+   parity cost; serving an F16 conversion is the named tightening if
+   8 is not acceptable.
+
+The falsified path that got here (kept as evidence): donated banks —
+both user-turn reading state and assistant-ack multi-shot state — are
+behaviorally inert at every dose (0/12 style transfer at 64/128/256
+slots; refusal unchanged under the ack donor), and K/V amplification
+of donor rows is a bludgeon (V×4 suppresses the refusal register by
+degrading generation into template word salad — content-verified
+dead). The bank must be TRAINED against the refusal objective; the
+reference trainer is the proven way to produce it.
 
 ## Splice-site reality (the load-bearing constraint)
 
