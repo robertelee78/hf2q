@@ -61,6 +61,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prefix", required=True, help="derivation dump prefix")
     parser.add_argument("--out", required=True, help="output graft GGUF path")
+    parser.add_argument(
+        "--scale-k", type=float, default=1.0,
+        help="multiply K rows by this factor (attention-pull axis)")
+    parser.add_argument(
+        "--scale-v", type=float, default=1.0,
+        help="multiply V rows by this factor (injected-content axis)")
     args = parser.parse_args()
 
     prefix = Path(args.prefix)
@@ -72,6 +78,12 @@ def main() -> int:
     if n_slots <= 0:
         print("refusing to wrap a zero-slot derivation (use the canary builder for that)", file=sys.stderr)
         return 2
+
+    def scale_rows(payload: bytes, factor: float) -> bytes:
+        if factor == 1.0:
+            return payload
+        values = struct.unpack("<%df" % (len(payload) // 4), payload)
+        return struct.pack("<%df" % len(values), *(v * factor for v in values))
 
     metadata = [
         kv_string("graft.mode", "splice_prefix"),
@@ -108,6 +120,8 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 2
+            factor = args.scale_k if side == "k" else args.scale_v
+            payload = scale_rows(payload, factor)
             tensors.append(
                 (f"graft.{side}.{layer}", [n_slots, heads, head_dim], payload)
             )
