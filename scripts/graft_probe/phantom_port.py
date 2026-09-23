@@ -65,24 +65,105 @@ from phantom_kv.train.softprompt import (  # noqa: E402
 )
 from safetensors.torch import load_file as safetensors_load_file  # noqa: E402
 
-MODEL_ID = "/opt/hf2q/models/sources/Qwen3.5-4B"
 SUITES = Path("/opt/phantom-kv/data/suites")
 DONOR_SOURCE = "/opt/phantom-kv/data/grafts/v1_prefill.json"
-ART = Path("/tmp/phantom-port")
-GGUF_IDENTITY_NAME = "Qwen3.5-4B"
-# hf2q-side model facts (from the served GGUF's metadata; the bind
-# validates the bank against these).
-GGUF_FACTS = {
-    "rope_theta": 1e7,
-    "rotary_dim": 64,
-    "n_kv_heads": 4,
-    "head_dim": 256,
-    "layers": [3, 7, 11, 15, 19, 23, 27, 31],
+
+# Multi-model registry. "template" selects the donor-render adapter:
+#   "split"  — phantom's generic chat-template prefix/suffix split
+#              (works when the template renders turns append-only).
+#   "gemma4" — hand-shaped render for Gemma-4's loop-based template
+#              (its re-rendering defeats the generic split): turns are
+#              <|turn>role\n...<turn|>\n, the system block is native,
+#              the generation header is <|turn>model\n plus a closed
+#              thought channel, and the eot is <turn|> (token 106).
+MODELS = {
+    "qwen35-4b": {
+        "path": "/opt/hf2q/models/sources/Qwen3.5-4B",
+        "eot_token": "<|im_end|>",
+        "template": "split",
+        "art": "/opt/hf2q/artifacts/grafts/qwen35-4b",
+        "gguf_identity_name": "Qwen3.5-4B",
+        "gguf_facts": {
+            "rope_theta": 1e7, "rotary_dim": 64, "n_kv_heads": 4,
+            "head_dim": 256, "layers": [3, 7, 11, 15, 19, 23, 27, 31],
+        },
+    },
+    "gemma4-26b": {
+        "path": "/opt/hf2q/models/sources/gemma-4-26B-A4B-it",
+        "eot_token": "<turn|>",
+        "template": "gemma4",
+        "art": "/opt/hf2q/artifacts/grafts/gemma4-26b",
+        "gguf_identity_name": "Gemma-4-26B-A4B-It",
+        "gguf_facts": None,  # filled from the model config at to-gguf time
+    },
 }
+DEFAULT_MODEL = "qwen35-4b"
+
+
+def model_facts(key: str) -> dict:
+    return MODELS[key]
+
+
+def shape_prefill_for(key: str, tokenizer, system: str, ack: str) -> str:
+    kind = MODELS[key]["template"]
+    if kind == "split":
+        return shape_prefill(tokenizer, system, ack)
+    if kind == "gemma4":
+        return (
+            "<bos><|turn>system\n" + system.strip() + "<turn|>\n"
+            "<|turn>model\n" + ack.strip() + "<turn|>\n"
+        )
+    raise ValueError(f"unknown template adapter {kind!r}")
+
+
+def user_turn_suffix_for(key: str, tokenizer, prompt: str) -> str:
+    kind = MODELS[key]["template"]
+    if kind == "split":
+        return user_turn_suffix(tokenizer, prompt)
+    if kind == "gemma4":
+        return (
+            "<|turn>user\n" + prompt.strip() + "<turn|>\n"
+            "<|turn>model\n<|channel>thought\n<channel|>"
+        )
+    raise ValueError(f"unknown template adapter {kind!r}")
+
+
+def chat_prompt_for(key: str, tokenizer, prompt: str) -> str:
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+
+def eot_id_for(key: str, tokenizer) -> int:
+    return tokenizer.convert_tokens_to_ids(MODELS[key]["eot_token"])
+
+
+def tokenize_row_for(key: str, tokenizer, row: dict, eot_id: int) -> dict:
+    """Their _tokenize_row, parameterized on the model's suffix/eot."""
+    prompt_ids = tokenizer(
+        user_turn_suffix_for(key, tokenizer, row["prompt"]),
+        add_special_tokens=False,
+    )["input_ids"]
+    completion_ids = tokenizer(row["completion"], add_special_tokens=False)["input_ids"]
+    if row["role"] in ("ce", "sup"):
+        completion_ids = completion_ids + [eot_id]
+    labels = [-100] * len(prompt_ids) + completion_ids
+    return {"ids": prompt_ids + completion_ids, "labels": labels, "start": len(prompt_ids)}
 
 
 def full_attention_indices(config) -> list[int]:
-    return [i for i, t in enumerate(config.layer_types) if t == "full_attention"]
+    types = getattr(config, "layer_types", None)
+    if types is None:
+        types = getattr(getattr(config, "text_config", None), "layer_types", None)
+    if types is None:
+        raise ValueError("config exposes no layer_types (directly or via text_config)")
+    return [i for i, t in enumerate(types) if t == "full_attention"]
 
 
 def load_suite(name: str) -> list[dict]:
@@ -149,12 +230,10 @@ def load_graft_hybrid(path: str, config, device: str, dtype) -> GraftHybrid:
 # ── Scoreboard runs (their runner semantics, hybrid cache) ─────────────
 
 
-def generate_completion(model, tokenizer, device, prompt, max_new_tokens, graft):
+def generate_completion(model, tokenizer, device, prompt, max_new_tokens, graft, model_key):
     if graft is None:
-        from phantom_kv.eval.runner import chat_prompt
-
         prompt_tensor = tokenizer(
-            chat_prompt(tokenizer, prompt), return_tensors="pt"
+            chat_prompt_for(model_key, tokenizer, prompt), return_tensors="pt"
         ).input_ids.to(device)
         with torch.no_grad():
             out = model.generate(
@@ -165,7 +244,7 @@ def generate_completion(model, tokenizer, device, prompt, max_new_tokens, graft)
             )
     else:
         prompt_tensor = tokenizer(
-            user_turn_suffix(tokenizer, prompt),
+            user_turn_suffix_for(model_key, tokenizer, prompt),
             return_tensors="pt", add_special_tokens=False,
         ).input_ids.to(device)
         mask = torch.ones(
@@ -184,7 +263,7 @@ def generate_completion(model, tokenizer, device, prompt, max_new_tokens, graft)
     return tokenizer.decode(new_ids, skip_special_tokens=True)
 
 
-def run_scoreboard(model, tokenizer, device, config, graft, graft_label, out_path,
+def run_scoreboard(model, tokenizer, device, config, graft, graft_label, out_path, model_key,
                    harmful="harmful_seed", harmless="harmless_seed", max_new_tokens=128):
     started = time.perf_counter()
     results = {}
@@ -192,7 +271,7 @@ def run_scoreboard(model, tokenizer, device, config, graft, graft_label, out_pat
         rows = []
         for item in load_suite(suite):
             text = generate_completion(
-                model, tokenizer, device, item["prompt"], max_new_tokens, graft
+                model, tokenizer, device, item["prompt"], max_new_tokens, graft, model_key
             )
             rows.append({
                 "id": item["id"],
@@ -206,7 +285,7 @@ def run_scoreboard(model, tokenizer, device, config, graft, graft_label, out_pat
         print(f"[run] {graft_label} {name}: {refusals}/{len(rows)} refusals")
         results[name] = rows
     report = {
-        "env": {"model_id": MODEL_ID, "device": str(device)},
+        "env": {"model_id": MODELS[model_key]["path"], "device": str(device)},
         "graft": None if graft is None else {
             "path": str(graft.path),
             "kind": graft.meta["kind"],
@@ -227,12 +306,13 @@ def run_scoreboard(model, tokenizer, device, config, graft, graft_label, out_pat
 
 
 def cmd_v1_build(args):
-    model, tokenizer, info = load_model(MODEL_ID)
+    key = args.model
+    model, tokenizer, info = load_model(MODELS[key]["path"])
     device = info["device"]
     config = model.config
     full_idx = full_attention_indices(config)
     system, ack = load_prefill_source(DONOR_SOURCE)
-    prefill_text = shape_prefill(tokenizer, system, ack)
+    prefill_text = shape_prefill_for(key, tokenizer, system, ack)
     ids = tokenizer(
         prefill_text, return_tensors="pt", add_special_tokens=False
     ).input_ids.to(device)
@@ -248,10 +328,10 @@ def cmd_v1_build(args):
         args.out, k.float().cpu(), v.float().cpu(),
         {
             "kind": GRAFT_KIND,
-            "model_id": MODEL_ID,
+            "model_id": MODELS[key]["path"],
             "n_layers": len(full_idx),
             "n_slots": n_slots,
-            "n_kv_heads": config.num_key_value_heads,
+            "n_kv_heads": k.shape[2],
             "head_dim": k.shape[-1],
             "dtype": "fp32",
             "source_sha256_12": __import__("hashlib").sha256(
@@ -342,12 +422,13 @@ def load_graft_hybrid_raw(path):
 
 
 def cmd_train(args):
-    model, tokenizer, info = load_model(MODEL_ID)
+    key = args.model
+    model, tokenizer, info = load_model(MODELS[key]["path"])
     model.requires_grad_(False)
     device = info["device"]
     config = model.config
     full_idx = full_attention_indices(config)
-    eot_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    eot_id = eot_id_for(key, tokenizer)
     pdtype = model.get_input_embeddings().weight.dtype
 
     params = DirectKVParamsHybrid(args.warm_graft, device, config)
@@ -373,7 +454,7 @@ def cmd_train(args):
         if line.strip():
             row = json.loads(line)
             groups.setdefault(row["role"], []).append(row)
-    seqs = {role: [_tokenize_row(tokenizer, row, eot_id) for row in rows]
+    seqs = {role: [tokenize_row_for(key, tokenizer, row, eot_id) for row in rows]
             for role, rows in groups.items()}
     print(f"[train] KL base log-probs precompute ({len(seqs['kl'])} rows)...")
     base_lp = _base_logprobs(model, seqs["kl"], device)
@@ -392,7 +473,7 @@ def cmd_train(args):
     log_path = Path(args.out_dir) / "train.log"
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     with open(log_path, "a") as log:
-        log.write(f"# model={MODEL_ID} targets={args.targets} warm={args.warm_graft}"
+        log.write(f"# model={MODELS[key]['path']} targets={args.targets} warm={args.warm_graft}"
                   f" seed={args.seed} steps={args.steps} lr={args.lr}"
                   f" micro_batch={args.micro_batch} arm=kv-hybrid\n")
         for step in range(1, args.steps + 1):
@@ -451,7 +532,7 @@ def cmd_train(args):
         "k": params.k.detach().cpu(),
         "v": params.v.detach().cpu(),
         "meta": {
-            "model_id": MODEL_ID, "graft_kind": DIRECTKV_KIND, "arm": "kv-hybrid",
+            "model_id": MODELS[key]["path"], "graft_kind": DIRECTKV_KIND, "arm": "kv-hybrid",
             "seed": args.seed, "steps": args.steps, "lr": args.lr,
             "micro_batch": args.micro_batch, "sup_margin": args.sup_margin,
             "anchor": args.anchor, "n_slots": params.n_slots,
@@ -473,7 +554,7 @@ def cmd_compile(args):
         args.out, k.to(torch.bfloat16), v.to(torch.bfloat16),
         {
             "kind": DIRECTKV_KIND,
-            "model_id": MODEL_ID,
+            "model_id": ckpt["meta"]["model_id"],
             "n_layers": k.shape[0],
             "n_slots": meta["n_slots"],
             "n_kv_heads": k.shape[2],
@@ -496,13 +577,35 @@ def cmd_compile(args):
 def cmd_to_gguf(args):
     import struct
 
+    key = args.model
+    facts = MODELS[key]["gguf_facts"]
+    if facts is None:
+        # Derive from the HF config: full-attn layer indices + the
+        # GLOBAL (full-attention) geometry + rope theta.
+        import json as _json
+        cfg = _json.load(open(MODELS[key]["path"] + "/config.json"))
+        text = cfg.get("text_config", cfg)
+        layer_types = text["layer_types"]
+        layers = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+        facts = {
+            "rope_theta": text.get("rope_theta_global", text.get("rope_theta", 1e6)),
+            "rotary_dim": int(text.get("rope_local_base_freq", 0) and 0) or text.get(
+                "rope_embedding_head_dim", text.get("head_dim", 256)),
+            "n_kv_heads": text.get("num_global_key_value_heads", text.get("num_key_value_heads")),
+            "head_dim": text.get("global_head_dim", text.get("head_dim")),
+            "layers": layers,
+        }
+        MODELS[key]["gguf_facts"] = facts
     graft = load_graft_hybrid_raw(args.bank)
     k = graft["k"].float()
     v = graft["v"].float()
     meta = graft["meta"]
     n_slots, heads, head_dim = k.shape[1], k.shape[2], k.shape[3]
-    layers = GGUF_FACTS["layers"]
-    assert k.shape[0] == len(layers), f"bank layers {k.shape[0]} != GGUF full-attn {len(layers)}"
+    layers = facts["layers"]
+    assert k.shape[0] == len(layers), f"bank layers {k.shape[0]} != full-attn {len(layers)}"
+    assert heads == facts["n_kv_heads"] and head_dim == facts["head_dim"], (
+        f"bank geometry {heads}x{head_dim} != model {facts['n_kv_heads']}x{facts['head_dim']}"
+    )
 
     def kv_string(key, value):
         return (struct.pack("<Q", len(key)) + key.encode() + struct.pack("<I", 8)
@@ -523,12 +626,12 @@ def cmd_to_gguf(args):
         kv_string("graft.hook_point", "full_attn_kv"),
         kv_string("graft.kind", "direct_kv"),
         kv_u32("graft.n_slots", n_slots),
-        kv_f32("graft.rope_theta", GGUF_FACTS["rope_theta"]),
-        kv_u32("graft.rotary_dim", GGUF_FACTS["rotary_dim"]),
+        kv_f32("graft.rope_theta", float(facts["rope_theta"])),
+        kv_u32("graft.rotary_dim", int(facts["rotary_dim"])),
         kv_u32("graft.position_base", 0),
         kv_bool("graft.mrope_interleaved", True),
         kv_string("graft.quant_lane", "f32"),
-        kv_string("general.base_model.0.name", GGUF_IDENTITY_NAME),
+        kv_string("general.base_model.0.name", MODELS[key]["gguf_identity_name"]),
     ]
     tensors = []
     for j, layer in enumerate(layers):
@@ -564,24 +667,24 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("base-run")
-    p.add_argument("--out", default=str(ART / "run_base.json"))
+    p.add_argument("--out", default=None)
 
     p = sub.add_parser("v1-build")
-    p.add_argument("--out", default=str(ART / "v1_prefill_kv.bin"))
+    p.add_argument("--out", default=None)
 
     p = sub.add_parser("v1-run")
-    p.add_argument("--bank", default=str(ART / "v1_prefill_kv.bin"))
-    p.add_argument("--out", default=str(ART / "run_v1.json"))
+    p.add_argument("--bank", default=None)
+    p.add_argument("--out", default=None)
 
     p = sub.add_parser("distill")
-    p.add_argument("--base-run", default=str(ART / "run_base.json"))
-    p.add_argument("--v1-run", default=str(ART / "run_v1.json"))
-    p.add_argument("--out", default=str(ART / "targets.jsonl"))
+    p.add_argument("--base-run", default=None)
+    p.add_argument("--v1-run", default=None)
+    p.add_argument("--out", default=None)
 
     p = sub.add_parser("train")
-    p.add_argument("--targets", default=str(ART / "targets.jsonl"))
-    p.add_argument("--warm-graft", default=str(ART / "v1_prefill_kv.bin"))
-    p.add_argument("--out-dir", default=str(ART / "train"))
+    p.add_argument("--targets", default=None)
+    p.add_argument("--warm-graft", default=None)
+    p.add_argument("--out-dir", default=None)
     p.add_argument("--steps", type=int, default=400)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--micro-batch", type=int, default=8)
@@ -590,31 +693,49 @@ def main():
     p.add_argument("--anchor", type=float, default=1e-2)
 
     p = sub.add_parser("compile")
-    p.add_argument("--ckpt", default=str(ART / "train" / "ckpt_final.pt"))
-    p.add_argument("--out", default=str(ART / "trained_kv.bin"))
+    p.add_argument("--ckpt", default=None)
+    p.add_argument("--out", default=None)
 
     p = sub.add_parser("eval")
-    p.add_argument("--bank", default=str(ART / "trained_kv.bin"))
-    p.add_argument("--out", default=str(ART / "run_trained.json"))
+    p.add_argument("--bank", default=None)
+    p.add_argument("--out", default=None)
 
     p = sub.add_parser("to-gguf")
-    p.add_argument("--bank", default=str(ART / "trained_kv.bin"))
-    p.add_argument("--out", default="/tmp/q35-4b-trained.graft.gguf")
+    p.add_argument("--bank", default=None)
+    p.add_argument("--out", default=None)
 
+    for name, subp in sub.choices.items():
+        subp.add_argument("--model", default=DEFAULT_MODEL, choices=sorted(MODELS))
     args = parser.parse_args()
+    ART = Path(MODELS[args.model]["art"])
     ART.mkdir(parents=True, exist_ok=True)
+    args.art = ART
+    D = {
+        "base-run": {"out": "run_base.json"},
+        "v1-build": {"out": "v1_prefill_kv.bin"},
+        "v1-run": {"bank": "v1_prefill_kv.bin", "out": "run_v1.json"},
+        "distill": {"base_run": "run_base.json", "v1_run": "run_v1.json", "out": "targets.jsonl"},
+        "train": {"targets": "targets.jsonl", "warm_graft": "v1_prefill_kv.bin",
+                  "out_dir": "train"},
+        "compile": {"ckpt": "train/ckpt_final.pt", "out": "trained_kv.bin"},
+        "eval": {"bank": "trained_kv.bin", "out": "run_trained.json"},
+        "to-gguf": {"bank": "trained_kv.bin", "out": "trained.graft.gguf"},
+    }
+    for field, default in D.get(args.cmd, {}).items():
+        if getattr(args, field) is None:
+            setattr(args, field, str(ART / default))
 
     if args.cmd == "base-run":
-        model, tokenizer, info = load_model(MODEL_ID)
+        model, tokenizer, info = load_model(MODELS[args.model]["path"])
         run_scoreboard(model, tokenizer, info["device"], model.config,
-                       None, "base", args.out)
+                       None, "base", args.out, args.model)
     elif args.cmd == "v1-build":
         cmd_v1_build(args)
     elif args.cmd == "v1-run":
-        model, tokenizer, info = load_model(MODEL_ID)
+        model, tokenizer, info = load_model(MODELS[args.model]["path"])
         graft = load_graft_hybrid(args.bank, model.config, info["device"], model.dtype)
         run_scoreboard(model, tokenizer, info["device"], model.config,
-                       graft, "v1", args.out)
+                       graft, "v1", args.out, args.model)
     elif args.cmd == "distill":
         cmd_distill(args)
     elif args.cmd == "train":
@@ -622,10 +743,10 @@ def main():
     elif args.cmd == "compile":
         cmd_compile(args)
     elif args.cmd == "eval":
-        model, tokenizer, info = load_model(MODEL_ID)
+        model, tokenizer, info = load_model(MODELS[args.model]["path"])
         graft = load_graft_hybrid(args.bank, model.config, info["device"], model.dtype)
         run_scoreboard(model, tokenizer, info["device"], model.config,
-                       graft, "trained", args.out)
+                       graft, "trained", args.out, args.model)
     elif args.cmd == "to-gguf":
         cmd_to_gguf(args)
 
