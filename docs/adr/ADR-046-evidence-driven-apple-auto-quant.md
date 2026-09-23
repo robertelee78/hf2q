@@ -3,8 +3,13 @@
 - Status: Accepted; measured-selector foundation implemented, artifact
   generation and CLI activation remain gated by the phases below
 - Date: 2026-08-18
-- Updated: 2026-08-21 — the current release boundary pins exact published
-  `mlx-native = 0.11.1`, including direct execution of packed Q5_K/Q6_K
+- Updated: 2026-09-23 — audited current affine conversion, loading, graph
+  coverage and kernel contracts against published `mlx-native = 0.15.1`;
+  added the Phase C restart contract, work packages, blockers, acceptance
+  evidence and first experiment. Phase C remains unimplemented; this update
+  adds no runtime or performance claim.
+- Previous update: 2026-08-21 — the then-current release boundary pinned exact
+  published `mlx-native = 0.11.1`, including direct execution of packed Q5_K/Q6_K
   embedding rows; the first official source-teacher gate below remains
   historical evidence from exact `0.10.16`. The backend-independent
   exact-teacher target storage and model-free allocation binding cannot invoke
@@ -46,6 +51,34 @@ compatibility helpers stay `cfg(test)` rather than crossing the release
 boundary or acquiring warning allowances.
 
 ## Context
+
+### 2026-09-23 full-model affine source audit
+
+The [current support and implementation research](../research/mlx-affine-support-2026-09-23.md)
+binds hf2q `c6cce82088b368c7e66a89a2284ed57ff08e4125` and published
+`mlx-native 0.15.1` (`f92eb020c4d3f821700e648fbce15d6cf75c2cc6`) to pinned
+Apple MLX/MLX-LM sources. It confirms that hf2q has no production affine
+converter or complete affine model consumer. The old safetensors writer was
+removed; the remaining overlay is not Phase C completion.
+
+The audit also identifies source-level blockers requiring focused reproduction
+and proof: legacy Gemma MoE overlay routing differs between batched prefill and
+decode; overlay bytes are absent from current persistent-cache fingerprints;
+and generic native loading/dispatch does not join metadata dtype, logical shape
+and buffer validation into one checked artifact contract. These are source
+findings, not hardware-reproduced failures in that investigation.
+
+The user's motivation is improved Apple-Silicon inference efficiency on both
+the conversion and execution sides. Phase C therefore starts with independent
+storage/numerical fixtures and representative packed QMV/QMM measurements,
+then a complete Qwen3.8 dense text slice. Text-only scope must be explicit;
+other families, MoE, MTP and vision retain their separate qualification gates.
+Ordinary affine RTN remains the first producer; DWQ training remains outside
+this program. Compact metadata, complete graph routing, exact bundle/cache
+identity and matched quality/performance evidence are required before affine
+can become a preferred candidate. No speedup is inferred from its format name.
+
+### Existing conversion and selection surfaces
 
 hf2q has three surfaces that have been called "auto" but do not form one
 production-optimal quantization system:
@@ -90,8 +123,9 @@ complete production format:
   expands packed codes to bytes and floating values to F32;
 - `src/serve/forward_mlx_shared.rs` repacks those codes and dispatches only
   4-bit/group-32 affine weights through the overlay route;
-- the overlay is read as one complete file and covers only selected dense
-  linear slots;
+- the overlay is read as one complete file and covers selected dense linear
+  slots plus legacy MoE routes, with incomplete and inconsistent graph coverage
+  documented in the 2026-09-23 audit above;
 - there is no current Rust DWQ trainer or full-model MLX-affine converter.
 
 The then-exact `mlx-native = 0.10.11` dependency had affine packed-weight kernels
@@ -124,6 +158,17 @@ the 4-bit candidate decoding faster than its 2-bit candidate, reinforcing that
 lower bit width is not an inference-performance proof.
 
 ## Terminology and separations
+
+GGUF is a container for tensors and model metadata. Its tensor encodings
+determine the packed bytes and reconstruction arithmetic that kernels must
+consume; the container alone does not determine inference performance.
+Safetensors is another container, and MLX affine is an encoding commonly stored
+inside it. In this stack, `mlx-native` dispatches its own Rust/Metal kernels;
+it is not a binding that automatically inherits Apple MLX's operators or
+optimizations. Sharing Apple Silicon, Metal or unified memory does not make
+different encoding/kernel/graph combinations equally efficient. The pinned
+[source audit](../research/mlx-affine-support-2026-09-23.md) separates these
+contracts and their current coverage.
 
 hf2q treats the following as different architectural axes:
 
@@ -432,13 +477,17 @@ kernel-route, fallback, and rejection data. hf2q must consume and extend those
 generic facilities instead of growing a second private affine runtime around
 the legacy overlay.
 
-Those facilities are not yet one complete fast ABI. The generic packed-weight
+Those facilities are not yet one complete fast ABI. This remains true at the
+audited published `0.15.1`. The generic packed-weight
 route has row-wise SIMD for supported 4/8-bit decode layouts, a scalar 6-bit
 fallback, and packed 4/6-bit embedding gather, but no specialized packed
 prompt-QMM/width-N route. The older `qmm_affine` family has a separate
-unpacked-U8/F32 contract plus a narrow packed 4-bit variant. The published
-capability response proves executability and exposes fallback routing; it does
-not turn a fallback into a performance claim. Upstream MLX supporting a bit
+unpacked-U8/F32 contract plus a narrow packed 4-bit/group-32/F32-metadata QMM
+variant outside the general capability API. The general capability contract
+assumes BF16 scale/bias metadata but does not yet express that dtype in its
+request; Phase C must validate it explicitly at both loading and dispatch.
+The published capability response proves executability and exposes fallback
+routing; it does not turn a fallback into a performance claim. Upstream MLX supporting a bit
 width or group size likewise does not make that tuple fast—or even executable—
 in the pinned Rust runtime. Phase C must converge these paths around one packed
 artifact contract and report fallbacks rather than hiding them.
@@ -515,19 +564,283 @@ This phase changes no conversion format and makes no new speed claim.
 
 ### Phase C — production MLX-affine artifact and runtime
 
-- In hf2q, replace the legacy overlay with a manifest-driven full-model graph
-  route and produce indexed, sharded artifacts without whole-model residency.
-- Extend the generic mlx-native packed-weight loader/capability API where a
-  required regime is absent, and eliminate packed-code expansion/repacking in
-  every required execution route.
-- Support and benchmark the exact 4/6/8-bit group-size matrix exposed by
-  mlx-native; implement and publish native kernel work where a required shape
-  or regime is absent, then pin that release in hf2q.
-- Prove full Qwen3.8 conversion, load, deterministic generation, tools, cache,
-  vision where applicable, memory bound, and all workload regimes.
+**Restart status, 2026-09-23: planned; no full-model producer, consumer or
+affine performance gate has passed.** Existing native primitives and the legacy
+overlay are reusable research material, not completion of any work package
+below. The [source audit](../research/mlx-affine-support-2026-09-23.md) contains
+the detailed family/kernel matrix, pinned source references and rejected
+assumptions. This section is the implementation contract; the audit records
+why it is needed. Its proposed stages A–G correspond to C.0–C.6 below and do
+not rename the other phases of this ADR.
 
-Two-bit is not implied by this phase. It requires an explicit storage/kernel
-capability and must independently beat eligible candidates.
+#### C objective and scope
+
+Deliver Rust-owned source-to-affine conversion and native packed inference
+that can improve measured Apple-Silicon inference at the required quality and
+memory budget. Distinguish four milestones: bundle compatibility, correct
+execution, complete product behavior, and demonstrated efficiency. Completing
+one does not establish the others.
+
+The first full-model target is **Qwen3.8 dense text**, including its hybrid
+attention/DeltaNet graph, embeddings, output head, norms and recurrent state.
+"Dense" distinguishes this model from MoE; it does not mean its attention is
+uniform or that all weights should be quantized. The initial efficient kernel
+target is packed affine **4-bit/group-64 with explicitly typed compact
+metadata**. F16 and BF16 metadata are different contracts. Keeping a tensor
+dense or at a higher precision is a valid, recorded policy choice.
+
+Qualify further 4/6/8-bit profiles and groups 32/64/128 by operation, shape,
+dtype, family and execution regime. A tuple being callable through a scalar
+fallback is not proof that it is fast. Initial subset support must be named
+accurately; upstream affine also has 2/3/5-bit encodings. Those widths,
+MXFP/NVFP formats, new families, MoE, MTP and vision are not implied by the
+first slice. Reject unqualified requests explicitly. A text-only conversion
+must be intentional and identified in the artifact, never silently discard
+requested modalities or auxiliary graphs.
+
+Start with ordinary affine RTN. This work requires no DWQ trainer and does not
+activate Dynamic allocation or `--quant auto`. Phase D and Phase E retain
+their own gates. Source input may be an exact modified checkpoint; no stock
+checkpoint substitution is permitted.
+
+#### C artifact and execution contract
+
+The following contracts must be implemented together; proposed type/module
+names here describe responsibilities, not APIs that already exist.
+
+1. **One logical model graph, explicit storage variants.** Both GGUF and
+   affine admission produce the family logical tensor catalog. Matrix views
+   distinguish dense, GGML and packed affine storage without fake GGML types,
+   F32 sentinels or optional fields whose interpretation changes by caller.
+   Model-family transforms and graph routing remain in hf2q. Validated packed
+   views, low-level loading and model-independent kernels remain in mlx-native.
+2. **Versioned packed descriptor and resolved route.** Bind mode/version,
+   logical dimensions, physical packed dimensions, row strides, bits/group,
+   code/scale/bias dtypes and byte extents, expert dimensions/strides, tied
+   aliases and numerical contract. Resolve operation, M/N/K, activation
+   dtype/layout, device, kernel and fallback from that validated descriptor.
+   The capability API and actual dispatch must use the same decision.
+3. **Standard bundle plus hf2q evidence.** Write MLX-compatible safetensors
+   with `config.json`, standard quantization defaults/per-module overrides,
+   and `model.safetensors.index.json` when sharded. Use the pinned upstream
+   module naming/layout contract; quantization overrides identify modules,
+   not their `.weight` tensor suffixes. Keep richer hf2q policy, provenance,
+   capability and completion receipts separately and verify agreement with
+   standard fields. Include required tokenizer, template, generation/EOS and
+   applicable processor assets in bundle identity. Affine `.biases` are group
+   reconstruction metadata; a linear layer's `.bias` is a separate tensor.
+4. **Exact bytes and shape checks.** Logical `[N,K]` weights are not physical
+   `[N,K*bits/32]` U32 storage; scale/bias geometry is `[N,K/group]` for a
+   supported divisible layout. Six-bit codes cross byte/word boundaries and
+   are not four codes padded into each U32. Validate divisibility, all extents,
+   ranks, strides, checked arithmetic and effective module policy before GPU
+   allocation. Generalize expert rank-3 dimensions explicitly. Unsupported
+   tails/layouts fail closed until a defined representation is implemented.
+5. **Metadata and arithmetic are explicit.** Preserve declared F16/BF16/F32
+   scale/bias types or record an intentional conversion as a new execution
+   candidate. Never interpret one dtype's bytes as another. The current native
+   general route assumes BF16 metadata, while its separate packed b4/g32 QMM
+   consumes F32 metadata. F32 activation/output support does not establish
+   F32 metadata support. Preserve the native D7 BF16-materialization decision
+   unless a separately documented numerical amendment is proven; local
+   algebraic equivalence does not imply bitwise equivalence to MLX.
+6. **Bounded conversion and loading.** Plan tensor components and offsets from
+   headers; operate on row/group ranges. Generate packed codes directly with
+   bounded staging, without a whole-model U8/F32 unpack/repack cycle. Keep each
+   safetensors component whole within one shard; a matrix's weight/scales/
+   biases may occupy different shards. An oversized component gets a shard
+   large enough for it and is streamed internally. Bound transient memory
+   independently of both shard size and the largest expert tensor. Mapping or
+   copying alone does not prove a memory bound; measure total live residency.
+7. **Complete publication and identity.** Write to a staging bundle, validate
+   its catalog/index/components/sidecars, hash content, sync and complete with
+   an explicit atomic/no-replace protocol. Failed or interrupted conversion
+   must not be admitted as complete. Bind the full bundle, effective policy,
+   graph transforms, tokenizer/template and activation-affecting settings into
+   model and persistent-cache identity. Replacing bytes at the same path must
+   invalidate old state. Imported upstream bundles need independent admission
+   and content-derived identity even when they have no hf2q conversion receipt.
+
+Input classification precedes quantization: dense source is eligible for RTN;
+already-affine source uses validated direct import or an explicitly supported
+lossless repack; other prequantized sources require an explicit policy or
+rejection. No silent dequantize/requantize route and no downloaded quantized
+model counts as hf2q conversion. Do not reuse the GGUF converter's intentional
+F32→F16→F32 parity round-trip for affine. Source precision, chosen metadata
+precision and every cast belong in the recipe and quality evidence.
+
+Layout planning must distinguish raw Hugging Face source from an already
+sanitized MLX bundle. Qwen Conv1D axes, conditional norm shifts, recurrent
+parameters, tensor prefixes, tied heads and expert layouts need family-owned
+fixtures proving each transform happens exactly once. GGUF BakeOps, reversed
+GGUF dimensions and MLX sanitization are not interchangeable. The first
+producer must reopen in the pinned external loader without a private repair
+script. External MLX is a test oracle only; it is never a production subprocess.
+
+#### C source map and blockers to reproduce
+
+The following findings are source-level observations at the audit identities,
+not reproduced hardware failures. Recheck current source before fixing them.
+
+| Existing seam | Required work and proof |
+| --- | --- |
+| `src/convert/quant_selector.rs`, `src/cli.rs`, `src/backends/mod.rs` | There is no production affine output route. Separate container, encoding and recipe; add an indexed writer and truthful operator/help/receipt behavior. Do not squeeze a three-component affine tensor into the GGML quantizer return type. |
+| `src/convert/source_reader.rs`, `orchestrator.rs`, `receipt.rs`, `arch/bake.rs` | Reuse source discovery and verified provenance, add bounded ranges and bundle receipts, and isolate format-specific casts/transforms. Source-byte collection alone is not authenticated provenance. |
+| `src/core/mlx_safetensors_loader.rs`, `src/serve/forward_mlx_shared.rs` | The legacy reader expands 4/8-bit codes and F32 metadata; the overlay route repacks and supports b4/g32. Replace the production dependency on expansion with typed packed views. Do not grow a second runtime around this overlay. |
+| Gemma overlay loader and ordinary/batched/width-N forward paths | Affine expert fields are populated alongside retained GGML weights, but batched prefill and ordinary decode/serial prefill/width-N select different representations. Reproduce with a deliberately distinguishable tiny fixture; reject the inconsistent overlay or make every admitted route use the same weights. No claim of model-level failure is made yet. |
+| Qwen `model.rs`, `gpu_ffn.rs`, `gpu_delta_net.rs`, `native_projection.rs`, embedding/output/MTP paths | Native Qwen rejects key affine overlays and several paths dispatch by GGML/dense storage. Inventory every required role, replace bypasses with typed routing, and prove decode, prefill and width-N share one physical artifact. Legacy MoE handling does not qualify the current native graph. |
+| `src/serve/multi_model.rs`, engine and persistent LCP identities | Overlay presence is a boolean and its bytes are not bound into the audited persistent fingerprints. Add content/policy/graph identity; test restart, replaced artifact, changed template and incompatible prefix. This audit did not demonstrate a live cache leak. |
+| Native `weight.rs` | The generic loader is unused by hf2q; it expects a standalone quantization config, globs shards, and does not enforce the standard index and complete typed triplet contract. Validate header/index membership, duplicate/orphan tensors, logical shape and metadata dtypes before bounded upload. Reject malformed numbers before narrowing (for example bits=260 must not become 4). |
+| Native `affine_capability.rs`, `ops/quantized_matmul.rs`, `ops/qmm_affine.rs` | Unify metadata-aware capability/dispatch and the separate packed QMM contract. General 6-bit is scalar; prompt/width-N do not have a general specialized packed QMM. Benchmark actual routes and disclose fallbacks. |
+| Native embedding and expert operations/shaders | Validate activation/component sizes, IDs, expert geometry, offsets and alignment; use checked address arithmetic through host and shader. Invalid expert IDs must not leave stale `_into` output. Prove large expert offsets beyond 4 GiB cannot wrap in 32-bit calculations. |
+| `src/core/provenance/tensor_execution/verify.rs`, measured-auto candidate receipts | Affine schema vocabulary exists but physical execution admission rejects affine and overlays. Implement verifier-derived source→stored→loaded→executed lineage only after the artifact and graph are real; receipt strings alone are insufficient. |
+
+This work can live in focused affine policy/producer modules under
+`src/quantize/`, a planner/driver beside the current converter, an indexed
+writer under `src/backends/`, and common artifact-admission adapters above
+family loading. Exact extraction boundaries should follow the implementation;
+avoid expanding the already large legacy loader/forward files unnecessarily.
+
+#### C work packages and exit gates
+
+All rows are **open** at this amendment. Owners are repository responsibilities,
+not assignments to a particular agent. Completing a substep must update this
+table with exact proof; a successfully compiled stub does not close a row.
+
+| Step | Owner and deliverable | Required exit evidence |
+| --- | --- | --- |
+| C.0 — storage and numerical fixtures | Both repos: checked descriptors, declared arithmetic contract, independent source/packed fixtures and focused reproductions of existing validation/overlay findings | Codes/scales/biases independently checked; signed/constant/zero groups, dtype edges and 6-bit boundaries covered; malformed shape/dtype/ID/extent rejects deterministically; inconsistent admitted overlay routes corrected or rejected. |
+| C.1 — efficiency spike | mlx-native: representative b4/g64 compact-metadata QMV and tiled QMM, with a shape inventory from the exact target model | Numerical gate first; matched M=1, small-M and prompt measurements against current GGUF kernels and pinned MLX; GPU and wall-time evidence. Document crossover, fallback, metadata traffic and failure results. Reformulate if no useful opportunity appears. |
+| C.2 — published native ABI | mlx-native: bounded loader/views, metadata-aware capabilities, required embeddings/head and unified resolved routes, checked expert/address contracts | No-skip native fixture and shape/regime tests; benchmark receipts; published revision, then exact hf2q Cargo/lock pin. Unsupported tuples reject before model allocation. An ignored local patch cannot close this gate. |
+| C.3 — Rust affine producer | hf2q: explicit RTN policy, family layout plan, chunked quantization, indexed writer and complete bundle receipt | Independent upstream reopen and tensor/component agreement; deterministic output; malformed/interrupted-bundle tests; measured staging bound even for components larger than the budget. No whole-model expansion or automatic F16 intermediate. |
+| C.4 — first complete graph/product slice | hf2q: Qwen3.8 dense text artifact admission, shared hybrid graph, local/managed resolution, info, generate and serve | Source-quality and same-affine external parity; all required graph/regime transitions; full tool conversation, unary/SSE, semantic TTFT, prefix reuse, cancellation/retry, restart invalidation and conversation isolation. Explicit unsupported-feature errors. |
+| C.5 — profile/family expansion | Both repos: measured 4/6/8-bit and group32/64/128 coverage, mixed policies and separately qualified family/expert/adjunct routes | Per-profile capability and benchmark matrix; expert gate/up/down, skew and large offsets; shape tails and tied/untied heads. MoE, MTP and vision each need mapping, artifact and serving proof before advertising support. No blanket Cartesian-product support claim. |
+| C.6 — measured candidate admission | hf2q: affine physical lineage, source-quality receipts and matched product benchmark integrated into the existing candidate boundary | Verifier-derived complete lineage; exact artifacts pass all required quality/service levels and memory bounds; record winning and losing candidates. Feed Phase E only after its independent activation requirements pass. |
+
+C.0/C.1 use tiny independent fixtures and need not wait for a full converter.
+C.3 can prove output against an external reference before hf2q serving opens.
+C.2's native publication/pin must precede any landed hf2q runtime dependency on
+new native behavior. C.4 joins the producer and consumer on one exact artifact;
+partial graph coverage must not become a supported serve option. Later native
+extensions repeat the publish/pin/prove sequence. Do not read the table as
+requiring all future families to land in the first vertical slice.
+
+An illustrative future interface is
+`hf2q convert SOURCE --format mlx --quant affine --bits 4 --group-size 64`.
+**It is not implemented or final CLI syntax.** Resolve the typed format/recipe
+domains and per-module policy representation before exposing flags; update
+managed artifact identity, help, info and operator docs in the same slice.
+
+#### C validation and efficiency acceptance
+
+Use three separate comparisons: hf2q versus pinned MLX on the **same affine
+artifact** to test execution; affine versus hf2q GGUF from the **same source**
+to test product value; and recipes at fixed encoding/group/dtype when testing
+an algorithm. GGUF and affine generally encode different reconstructed values.
+Equal nominal bit width is neither identical weights nor matched quality.
+
+Effective storage includes both scale and bias. With d-bit metadata it is
+`bits + 2*d/group` bits/weight before container/alignment overhead. Thus b4/g32
+with F32 metadata is 6 BPW, b4/g64 with 16-bit metadata is 4.5 BPW, and b6/g64
+is 6.5 BPW. A Q4_K block is also 4.5 BPW; a mixed Q4_K_M model is not uniformly
+that rate. Count actual tensor bytes, protected dense weights, aliases and
+resident copies. These calculations explain potential savings, not speedups.
+
+Before running gates, freeze quality tolerances, workload service levels,
+staging/residency budgets and the intended primary ranking regime. Reuse the
+ADR's versioned evidence profiles; if a threshold is missing, define it before
+examining candidate results. No target speedup percentage has been measured
+or accepted by this amendment.
+
+Required proof includes:
+
+- **Independent numerics:** freeze tiny tensors/artifacts and the upstream
+  generator revision; compare codes, scales and biases separately. Pin whether
+  CPU or Metal RTN semantics are promised and investigate their edge cases.
+  Upstream signed endpoint-scale/rounding is not equivalent to the existing
+  positive-scale/min-bias QDQ initializer. Test nonfinite handling explicitly.
+  A local packed-versus-local-unpacked comparison cannot catch shared errors.
+- **Dispatch boundaries:** exercise every accepted profile/dtype, M=1,
+  widths such as 2/4/8, both sides of QMV/QMM crossovers, prompt sizes and tails.
+  Include embeddings, vocabulary head, large FFN matrices and, when admitted,
+  expert gate/up/down with skew. Initialize `_into` outputs with nonzero data
+  and test invalid IDs/offsets and large addresses. Record resolved routes.
+- **Artifact failure paths:** test standard config and overrides, triplets
+  across shards, duplicates/orphans/missing tensors, unsafe shard paths, byte
+  extents/overflow, source layout variants, ties, unsupported modes and
+  interrupted publication. A present directory or a readable header is not
+  complete artifact admission.
+- **Quality and graph equivalence:** source-teacher KL, top-1, fixed-horizon
+  trajectory and required behavioral gates remain separate from same-affine
+  runtime parity. Compare serial/batched/chunked/resumed prefill, ordinary
+  decode and width-N on one artifact. Passing JSON syntax while selecting the
+  wrong tool or arguments fails the agentic gate.
+- **Serving and caches:** run a realistic multi-turn coding/tool conversation;
+  report correct tool-result continuation, unary/SSE output, first semantic
+  streamed token, cached-token counts and continuation parity. Exercise cache
+  restart, policy/artifact/template replacement and concurrent conversation
+  isolation. Disabling prefix reuse does not satisfy compatibility.
+- **Efficiency:** after warmup, collect at least five measured runs, medians
+  and dispersion. Record conversion time/peak staging/output bytes; cold/warm
+  load and peak residency; cold/cached semantic TTFT; prefill/decode rates;
+  width-N aggregate throughput and per-request latency; long-context memory;
+  actual fallback/cast routes; matched reference results. Preserve exact source,
+  artifact, prompts/token streams, sampling/context/batch, scheduler/cache,
+  toolchain, hardware/OS and process-residency identities. Separate GPU timing
+  from wall time. Energy claims require an energy measurement.
+
+Run native Metal gates on an appropriate Apple host, with nonzero executed
+case counts and explicit failure/skip accounting. Host-only unit passes or a
+test binary compiling zero Apple cases cannot qualify a GPU path. Check live
+release coordination before builds/model loads; run large candidate and
+reference models serially and clean up test servers. Preserve useful failed
+spikes separately with their measured conclusion; do not ship a failed
+experiment or relax quality thresholds to manufacture a win.
+
+#### C next session: first concrete action and handoff ledger
+
+1. Run `ak status`; recall `decisions`, `evidence` and `coordination`, including
+   `hf2q/release/status`, `hf2q/release/driver` and the release protocol. The
+   audit's memory write was refused by the active-WAL safety guard; an absent
+   key is not proof the host is idle. Do not bypass that guard. Read this
+   section and the pinned research report before relying on recalled claims.
+2. Inspect both repos' status, current main, Cargo/lock pins, native published
+   source, existing user work, listeners and available memory. Recheck the
+   audit findings against those identities. Use isolated worktrees, one writer
+   each, with one owner integrating schema/ABI and dependency changes.
+3. Begin **C.0** with a small independent b4/g64 fixture in F16 and BF16
+   metadata, plus 6-bit boundary and malformed-metadata fixtures. Trace it
+   through current native admission/dispatch and reproduce dtype/shape
+   behavior. Lock the numerical contract before optimizing. Do not load a
+   full model to answer this first question.
+4. Extract target matrix dimensions from source headers and predeclare the
+   **C.1** benchmark settings/tolerances. Measure the current route, then the
+   smallest packed compact-metadata QMV/QMM change. Decide from that evidence
+   whether to proceed or reformulate. Do not start by writing a DWQ trainer,
+   broad family port or user-facing auto selector.
+5. After focused tests, run the applicable locked repository checks and native
+   hardware gate. At hf2q integration, required checks include
+   `cargo check --locked --all-targets --all-features`,
+   `cargo build --release --locked` and applicable `cargo test --locked`
+   coverage. These commands are future implementation gates; they were not
+   executed as part of this documentation-only audit.
+
+For each completed or failed C step, append a concise dated evidence entry to
+this ADR (or a linked checked-in experiment record) and update the table's
+status. Record repository SHAs, published native version, source/model/artifact
+hashes, commands, executed/skipped counts, hardware/settings, measured result,
+remaining blockers and the **single next action**. Keep large artifacts and
+raw profiles outside Git; reference portable hashed receipts. Persist validated
+decisions to the live memory ledger only after proof and verify read-back.
+The ADR and source-bound records must remain sufficient to resume when memory
+is unavailable.
+
+**Current handoff evidence:** source audit and documentation only. No Phase C
+implementation, Rust/Metal test execution, full-model conversion or performance
+result is claimed. The immediate next action is C.0's independent packed
+fixture and metadata/shape contract, followed by C.1's representative kernel
+measurement. Affine becomes preferred only if C.6 and the existing selection
+gates demonstrate the required quality/efficiency tradeoff.
 
 ### Phase D — calibration producers
 
