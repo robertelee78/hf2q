@@ -29,7 +29,7 @@ Metal kernels we own end-to-end.
 | **License** | Apache-2.0 OR MIT (dual); third-party attribution in [`NOTICE`](NOTICE) |
 | **Rust** | 1.89+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
-| **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
+| **Output formats** | GGUF; full-model MLX-affine safetensors output is planned under [ADR-046](docs/adr/ADR-046-evidence-driven-apple-auto-quant.md). |
 | **Status** | This checkout describes the hf2q 0.1.21 release line and resolves published, checksum-pinned `mlx-native 0.11.2`. Treat 0.1.21 as a release candidate until the `v0.1.21` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
@@ -1140,7 +1140,7 @@ ADR-029 (Gemma 4 decode), ADR-028 (peer-parity baseline), ADR-030
 ```
 src/
 ├── arch/          single source of truth for per-arch conformance
-├── backends/      GGUF + mlx-lm safetensors writers
+├── backends/      streaming GGUF writer
 ├── calibrate/     DWQ training, autograd, imatrix
 ├── inference/     per-arch forward graphs, spec-decode, vision
 ├── input/         HF config + safetensors loaders, HF Hub download
