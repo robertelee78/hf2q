@@ -123,6 +123,19 @@ full-attention layers and every cache splice lands at indices
    judge). The 8-vs-4 gap vs the bf16 stack is the bank-precision
    parity cost; serving an F16 conversion is the named tightening if
    8 is not acceptable.
+6. **Capability cost (hf2q side, the honesty metric): preserved
+   within noise** — GSM8K 21/75 → 31/75 (+10, ~2σ; the graft's
+   direct-answer style appears to AID final-answer extraction on a
+   4B that over-hedges at baseline), MMLU 19/100 → 15/100 (−4,
+   exactly 1σ). The reference measured a real GSM8K cost (45/75 →
+   27/75) under their ALL-layer bank on a standard-attention model;
+   ours touches 8 of 32 layers (the hybrid `full_attn_kv` site), a
+   plausible mechanical reason the capability interference is milder.
+   The full qwen product scoreboard: refusal 46→8, harmless 0/20
+   intact, capability preserved — regenerated end-to-end
+   deterministically after a /tmp wipe (same distilled counts, same
+   bank sha, same 4/60 reference result; artifacts now live under
+   `artifacts/grafts/`, gitignored).
 
 The falsified path that got here (kept as evidence): donated banks —
 both user-turn reading state and assistant-ack multi-shot state — are
