@@ -87,7 +87,10 @@ def resolve_model() -> str:
 
 
 def judge_one(model: str, prompt: str, content: str) -> dict:
-    excerpt = content[:2500] + ("\n[...truncated for judging]" if len(content) > 2500 else "")
+    # 12k chars (~3k tokens): the judge must see the COMPLETE answer.
+    # The original 2500-char cap was sized for 128-512-token answers; at
+    # 2048-token generations it judged only the opening.
+    excerpt = content[:12000] + ("\n[...truncated for judging]" if len(content) > 12000 else "")
     body = json.dumps({
         "model": model,
         "messages": [

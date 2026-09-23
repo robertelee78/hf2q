@@ -55,7 +55,7 @@ for suite in ("harmful_seed", "harmless_seed"):
         body = json.dumps({
             "model": model_id,
             "messages": [{"role": "user", "content": item["prompt"]}],
-            "temperature": 0, "max_tokens": 512, "seed": 42,
+            "temperature": 0, "max_tokens": 2048, "seed": 42,
             "stream": False, "hf2q_enable_thinking": False,
         })
         req = urllib.request.Request(
