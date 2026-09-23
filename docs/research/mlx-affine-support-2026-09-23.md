@@ -10,6 +10,8 @@ Governing decision: [ADR-046](../adr/ADR-046-evidence-driven-apple-auto-quant.md
 
 The objective is **better measured Apple Silicon inference at acceptable model quality and memory use**, with conversion owned by hf2q and execution owned by Rust/`mlx-native`. Merely accepting an MLX directory would meet a compatibility milestone, not this objective.
 
+The original GGUF-versus-MLX comparison mixes several layers. **GGUF is a container** for tensors and model metadata; its tensor codecs specify packed layouts and reconstruction arithmetic. **Safetensors is another container; MLX affine is an encoding**, usually represented by related weight/scale/bias tensors in that container. Apple MLX is an execution framework, and MLX-LM supplies model/conversion code. In this repository, **`mlx-native` is a Rust/Metal compute library with its own shaders and dispatch**, not a binding through which hf2q automatically uses Apple's MLX implementation. Metal and unified memory are shared hardware facilities; they do not guarantee identical operators, routing, numerical behavior or performance. [N-library] [N-matmul] [N-matmul-shader]
+
 Affine can create useful optimization opportunities: simpler group arithmetic, efficient packed QMV/QMM kernels, precision policies that retain quality at lower effective storage, and direct execution of compatible artifacts. It does not automatically outperform GGUF. The current GGUF path already uses Metal and unified memory, and has optimized matrix and expert kernels that the general affine path lacks.
 
 Recommended direction:
@@ -458,6 +460,7 @@ hf2q, native and upstream source links below pin exact audited commits, so later
 [H-q4k]: https://github.com/robertelee78/hf2q/blob/c6cce82088b368c7e66a89a2284ed57ff08e4125/src/quantize/ggml_quants/q4_k.rs#L41
 [H-q6k]: https://github.com/robertelee78/hf2q/blob/c6cce82088b368c7e66a89a2284ed57ff08e4125/src/quantize/ggml_quants/q6_k.rs#L33
 [H-q8]: https://github.com/robertelee78/hf2q/blob/c6cce82088b368c7e66a89a2284ed57ff08e4125/src/quantize/ggml_quants/q8_0.rs
+[N-library]: https://github.com/robertelee78/mlx-native/blob/f92eb020c4d3f821700e648fbce15d6cf75c2cc6/src/lib.rs#L1
 [N-capability]: https://github.com/robertelee78/mlx-native/blob/f92eb020c4d3f821700e648fbce15d6cf75c2cc6/src/affine_capability.rs#L149
 [N-matmul]: https://github.com/robertelee78/mlx-native/blob/f92eb020c4d3f821700e648fbce15d6cf75c2cc6/src/ops/quantized_matmul.rs#L96
 [N-matmul-shader]: https://github.com/robertelee78/mlx-native/blob/f92eb020c4d3f821700e648fbce15d6cf75c2cc6/src/shaders/quantized_matmul.metal#L44

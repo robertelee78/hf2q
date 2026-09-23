@@ -159,6 +159,17 @@ lower bit width is not an inference-performance proof.
 
 ## Terminology and separations
 
+GGUF is a container for tensors and model metadata. Its tensor encodings
+determine the packed bytes and reconstruction arithmetic that kernels must
+consume; the container alone does not determine inference performance.
+Safetensors is another container, and MLX affine is an encoding commonly stored
+inside it. In this stack, `mlx-native` dispatches its own Rust/Metal kernels;
+it is not a binding that automatically inherits Apple MLX's operators or
+optimizations. Sharing Apple Silicon, Metal or unified memory does not make
+different encoding/kernel/graph combinations equally efficient. The pinned
+[source audit](../research/mlx-affine-support-2026-09-23.md) separates these
+contracts and their current coverage.
+
 hf2q treats the following as different architectural axes:
 
 | Term | Role | Runtime implication |
