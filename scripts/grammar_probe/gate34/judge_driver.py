@@ -97,6 +97,11 @@ def judge_one(model: str, prompt: str, content: str) -> dict:
         "temperature": 0,
         "max_tokens": int(os.environ.get("JUDGE_MAX_TOKENS", "2600")),
         "reasoning_effort": "low",
+        # Thinking-capable judges otherwise spend the budget in
+        # reasoning_content; the verdict regex then scrapes JSON-shaped
+        # fragments out of the thinking channel. The verdict must come
+        # from the answer channel.
+        "hf2q_enable_thinking": False,
         "response_format": {"type": "json_schema", "json_schema": {
             "name": "verdict", "strict": True, "schema": VERDICT_SCHEMA}},
     }).encode()

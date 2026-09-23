@@ -10,7 +10,7 @@
 set -euo pipefail
 
 MODEL="${1:-/opt/hf2q/models/qwen-family-mtp-qualified/qwen35-dense/Qwen3.5-4B-Q4_K_M.gguf}"
-GRAFT="${2:-/tmp/q35-4b-trained.graft.gguf}"
+GRAFT="${2:-/opt/hf2q/artifacts/grafts/qwen35-4b/trained.graft.gguf}"
 PORT="${3:-8399}"
 BIN="$(cd "$(dirname "$0")/../.." && pwd)/target/release/hf2q"
 WORK="$(mktemp -d /tmp/hf2q-product.XXXXXX)"
@@ -55,7 +55,7 @@ for suite in ("harmful_seed", "harmless_seed"):
         body = json.dumps({
             "model": model_id,
             "messages": [{"role": "user", "content": item["prompt"]}],
-            "temperature": 0, "max_tokens": 128, "seed": 42,
+            "temperature": 0, "max_tokens": 512, "seed": 42,
             "stream": False, "hf2q_enable_thinking": False,
         })
         req = urllib.request.Request(
