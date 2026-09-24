@@ -32,7 +32,9 @@ Usage: python3 phantom_port.py <subcommand> [options]
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import random
 import sys
 import time
@@ -472,11 +474,60 @@ def cmd_train(args):
     roles, weights = zip(*ROLE_WEIGHTS.items())
     log_path = Path(args.out_dir) / "train.log"
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+
+    # Resumable training: the shared host jetsams big runs; a kill must
+    # cost <= ckpt_every steps, not the whole run. Fail-closed: a
+    # resume.pt from a DIFFERENT run configuration is refused by name.
+    run_config = {
+        "model": MODELS[key]["path"],
+        "targets_sha256": hashlib.sha256(Path(args.targets).read_bytes()).hexdigest(),
+        "warm_graft": str(Path(args.warm_graft).resolve()),
+        "steps": args.steps, "lr": args.lr, "micro_batch": args.micro_batch,
+        "seed": args.seed, "sup_margin": args.sup_margin, "anchor": args.anchor,
+        "n_slots": int(params.n_slots),
+    }
+    resume_path = Path(args.out_dir) / "resume.pt"
+
+    def save_resume(step):
+        payload = {
+            "step": step,
+            "k": params.k.detach().cpu(),
+            "v": params.v.detach().cpu(),
+            "opt": opt.state_dict(),
+            "rng": rng.getstate(),
+            "queues": queues,
+            "losses": losses,
+            "config": run_config,
+        }
+        tmp = resume_path.with_suffix(".pt.tmp")
+        torch.save(payload, tmp)
+        os.replace(tmp, resume_path)
+
+    start_step = 0
+    if resume_path.exists():
+        ck = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if ck.get("config") != run_config:
+            raise SystemExit(
+                "[train] resume.pt belongs to a DIFFERENT run (config "
+                f"mismatch: {ck.get('config')} != {run_config}); refusing "
+                "to resume — delete resume.pt to start fresh"
+            )
+        with torch.no_grad():
+            params.k.copy_(ck["k"].to(device))
+            params.v.copy_(ck["v"].to(device))
+        opt.load_state_dict(ck["opt"])
+        rng.setstate(ck["rng"])
+        queues.update(ck["queues"])
+        for role_name, values in ck["losses"].items():
+            losses[role_name] = values
+        start_step = ck["step"]
+        print(f"[train] RESUMED from step {start_step}/{args.steps}", flush=True)
+
     with open(log_path, "a") as log:
         log.write(f"# model={MODELS[key]['path']} targets={args.targets} warm={args.warm_graft}"
                   f" seed={args.seed} steps={args.steps} lr={args.lr}"
                   f" micro_batch={args.micro_batch} arm=kv-hybrid\n")
-        for step in range(1, args.steps + 1):
+        for step in range(start_step + 1, args.steps + 1):
             role = rng.choices(roles, weights=weights)[0]
             idx = take(role, args.micro_batch)
             rows = [seqs[role][i] for i in idx]
@@ -521,11 +572,14 @@ def cmd_train(args):
             value = core.item()
             losses[role].append(value)
             losses["anchor"].append(anchor_loss.item())
-            if step % 10 == 0 or step == 1:
+            if (step % 10 == 0 or step == 1 or step == start_step + 1
+                    or args.steps <= 20 or step % args.ckpt_every == 0):
                 line = f"step={step} role={role} loss={value:.4f} anchor={anchor_loss.item():.3e}"
                 log.write(line + "\n")
                 log.flush()
-                print(f"[train] {line}")
+                print(f"[train] {line}", flush=True)
+            if step % args.ckpt_every == 0 or step == args.steps:
+                save_resume(step)
 
     ckpt = Path(args.out_dir) / "ckpt_final.pt"
     torch.save({
@@ -542,7 +596,8 @@ def cmd_train(args):
                        for r, v in losses.items()},
         },
     }, ckpt)
-    print(f"[train] wrote {ckpt}")
+    resume_path.unlink(missing_ok=True)
+    print(f"[train] wrote {ckpt} (resume.pt cleared)")
 
 
 def cmd_compile(args):
@@ -849,6 +904,8 @@ def main():
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--sup-margin", type=float, default=3.0)
     p.add_argument("--anchor", type=float, default=1e-2)
+    p.add_argument("--ckpt-every", type=int, default=10,
+                   help="save resume.pt every N steps (kills cost <= N steps)")
 
     p = sub.add_parser("compile")
     p.add_argument("--ckpt", default=None)
