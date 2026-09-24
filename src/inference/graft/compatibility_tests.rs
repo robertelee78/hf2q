@@ -9,6 +9,11 @@ enum Meta {
     F32(f32),
     Bool(bool),
     Str(&'static str),
+    /// GGUF array of bools (type 9, elem type 7).
+    BoolArr(Vec<bool>),
+    /// GGUF array of i32 (type 9, elem type 5) — the gemma4
+    /// head_count_kv convention.
+    I32Arr(Vec<i32>),
 }
 
 fn write_fixture_gguf(
@@ -42,6 +47,22 @@ fn write_fixture_gguf(
                 out.write_all(&8u32.to_le_bytes()).unwrap();
                 out.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
                 out.write_all(s.as_bytes()).unwrap();
+            }
+            Meta::BoolArr(values) => {
+                out.write_all(&9u32.to_le_bytes()).unwrap();
+                out.write_all(&7u32.to_le_bytes()).unwrap(); // bool elems
+                out.write_all(&(values.len() as u64).to_le_bytes()).unwrap();
+                for v in values {
+                    out.write_all(&[*v as u8]).unwrap();
+                }
+            }
+            Meta::I32Arr(values) => {
+                out.write_all(&9u32.to_le_bytes()).unwrap();
+                out.write_all(&5u32.to_le_bytes()).unwrap(); // i32 elems
+                out.write_all(&(values.len() as u64).to_le_bytes()).unwrap();
+                for v in values {
+                    out.write_all(&v.to_le_bytes()).unwrap();
+                }
             }
         }
     }
@@ -165,6 +186,22 @@ fn write_bank(
                 out.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
                 out.write_all(s.as_bytes()).unwrap();
             }
+            Meta::BoolArr(values) => {
+                out.write_all(&9u32.to_le_bytes()).unwrap();
+                out.write_all(&7u32.to_le_bytes()).unwrap(); // bool elems
+                out.write_all(&(values.len() as u64).to_le_bytes()).unwrap();
+                for v in values {
+                    out.write_all(&[*v as u8]).unwrap();
+                }
+            }
+            Meta::I32Arr(values) => {
+                out.write_all(&9u32.to_le_bytes()).unwrap();
+                out.write_all(&5u32.to_le_bytes()).unwrap(); // i32 elems
+                out.write_all(&(values.len() as u64).to_le_bytes()).unwrap();
+                for v in values {
+                    out.write_all(&v.to_le_bytes()).unwrap();
+                }
+            }
         }
     }
     let mut offset = 0u64;
@@ -187,6 +224,106 @@ fn write_bank(
         }
     }
     std::fs::write(path, out).expect("write bank gguf");
+}
+
+fn gemma4_model_meta() -> Vec<(&'static str, Meta)> {
+    // The gemma-4-26B-A4B shape: 30 layers, sliding pattern with full
+    // layers at {5, 11, 17, 23, 29}, sliding kv=8 (dim 256), full kv=2
+    // (dim 512), global rope 1e6 / 512.
+    let mut pattern = vec![true; 30];
+    for i in (5..30).step_by(6) {
+        pattern[i] = false;
+    }
+    let mut head_count_kv = vec![8i32; 30];
+    for i in (5..30).step_by(6) {
+        head_count_kv[i] = 2;
+    }
+    vec![
+        ("general.architecture", Meta::Str("gemma4")),
+        ("general.name", Meta::Str("Gemma-4-26B-A4B-It")),
+        ("gemma4.block_count", Meta::U32(30)),
+        ("gemma4.attention.sliding_window_pattern", Meta::BoolArr(pattern)),
+        ("gemma4.attention.head_count_kv", Meta::I32Arr(head_count_kv)),
+        ("gemma4.attention.key_length", Meta::U32(512)),
+        ("gemma4.rope.freq_base", Meta::F32(1e6)),
+        ("gemma4.rope.dimension_count", Meta::U32(512)),
+    ]
+}
+
+fn gemma4_bank_meta() -> Vec<(&'static str, Meta)> {
+    vec![
+        ("graft.mode", Meta::Str("splice_prefix")),
+        ("graft.spec_version", Meta::U32(1)),
+        ("graft.hook_point", Meta::Str("full_attn_kv")),
+        ("graft.kind", Meta::Str("direct_kv")),
+        ("graft.n_slots", Meta::U32(2)),
+        ("graft.rope_theta", Meta::F32(1e6)),
+        ("graft.rotary_dim", Meta::U32(512)),
+        // Gemma-4 is standard RoPE — NOT IMROPE interleaved.
+        ("graft.mrope_interleaved", Meta::Bool(false)),
+    ]
+}
+
+#[test]
+fn gemma4_shape_extracts_full_attention_layers() {
+    let path = tmp_path("gemma4_shape");
+    write_fixture_gguf(&path, &gemma4_model_meta(), &[]);
+    let gguf = GgufFile::open(&path).unwrap();
+    let shape = GraftModelShape::from_gguf(&gguf).unwrap();
+    assert_eq!(shape.arch, "gemma4");
+    assert_eq!(shape.full_attn_layers, vec![5, 11, 17, 23, 29]);
+    assert_eq!(shape.n_kv_heads, 2, "the FULL-layer kv count, not sliding's 8");
+    assert_eq!(shape.head_dim, 512);
+    assert!((shape.rope_theta - 1e6).abs() < 1.0);
+    assert_eq!(shape.rotary_dim, 512);
+    assert!(!shape.mrope_interleaved, "gemma4 is standard rope");
+}
+
+#[test]
+fn gemma4_bank_binds_with_complete_coverage() {
+    let model_path = tmp_path("gemma4_model");
+    write_fixture_gguf(&model_path, &gemma4_model_meta(), &[]);
+    let model = GgufFile::open(&model_path).unwrap();
+    let shape = GraftModelShape::from_gguf(&model).unwrap();
+    let bank_path = tmp_path("gemma4_bank_ok");
+    write_bank(&bank_path, &gemma4_bank_meta(), &[5, 11, 17, 23, 29], 2, 2, 512);
+    let bank = GraftBank::load(&bank_path).unwrap();
+    validate_graft_bank_for_model(&bank, &shape).unwrap();
+}
+
+#[test]
+fn gemma4_bank_refuses_partial_coverage_and_geometry() {
+    let model_path = tmp_path("gemma4_model_bad");
+    write_fixture_gguf(&model_path, &gemma4_model_meta(), &[]);
+    let model = GgufFile::open(&model_path).unwrap();
+    let shape = GraftModelShape::from_gguf(&model).unwrap();
+
+    // Partial coverage (missing layer 29).
+    let bank_path = tmp_path("gemma4_bank_partial");
+    write_bank(&bank_path, &gemma4_bank_meta(), &[5, 11, 17, 23], 2, 2, 512);
+    let bank = GraftBank::load(&bank_path).unwrap();
+    let err = validate_graft_bank_for_model(&bank, &shape).unwrap_err();
+    assert!(err.to_string().contains("complete coverage"));
+
+    // Wrong geometry: qwen-style 4 heads x 256.
+    let bank_path = tmp_path("gemma4_bank_geom");
+    write_bank(&bank_path, &gemma4_bank_meta(), &[5, 11, 17, 23, 29], 2, 4, 256);
+    let bank = GraftBank::load(&bank_path).unwrap();
+    let err = validate_graft_bank_for_model(&bank, &shape).unwrap_err();
+    assert!(err.to_string().contains("n_kv_heads"));
+
+    // IMROPE flag mismatch: a qwen-convention bank on gemma4.
+    let mut bad_meta = gemma4_bank_meta();
+    for (k, v) in bad_meta.iter_mut() {
+        if *k == "graft.mrope_interleaved" {
+            *v = Meta::Bool(true);
+        }
+    }
+    let bank_path = tmp_path("gemma4_bank_mrope");
+    write_bank(&bank_path, &bad_meta, &[5, 11, 17, 23, 29], 2, 2, 512);
+    let bank = GraftBank::load(&bank_path).unwrap();
+    let err = validate_graft_bank_for_model(&bank, &shape).unwrap_err();
+    assert!(err.to_string().contains("mrope_interleaved"));
 }
 
 #[test]
@@ -220,9 +357,11 @@ fn all_linear_model_refuses_the_site() {
 
 #[test]
 fn unsupported_architecture_is_refused_with_a_named_error() {
+    // gemma4 gained a bind arm (ADR-059 family-generality); this test
+    // now uses a genuinely unsupported family.
     let mut meta = qwen35_model_meta();
-    meta[0] = ("general.architecture", Meta::Str("gemma4"));
-    let path = tmp_path("gemma4");
+    meta[0] = ("general.architecture", Meta::Str("llama"));
+    let path = tmp_path("llama-unsupported");
     write_fixture_gguf(&path, &meta, &[]);
     let gguf = GgufFile::open(&path).unwrap();
     let err = GraftModelShape::from_gguf(&gguf).unwrap_err();
