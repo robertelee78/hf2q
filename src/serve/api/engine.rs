@@ -3724,6 +3724,49 @@ impl GemmaLoadedModel {
         // `LoadInfo`. The free-text format was incompatible with
         // `journalctl -u hf2q | jq` cross-arch filtering.
 
+        // ADR-059 — bind a KV graft when the operator supplied one.
+        // Validation (checkpoint identity + the full_attn_kv site shape
+        // for gemma4) runs here and aborts startup on any error; a
+        // bound graft is honored by the graft-wired serving paths and
+        // refused BY NAME by the paths that are not yet wired — never a
+        // silent ungrafted serve (the --kv-graft flag previously flowed
+        // only to the qwen35 loader and was silently ignored here).
+        let mut kv_graft = None;
+        if let Some(graft_path) = opts.kv_graft_path.as_ref() {
+            anyhow::ensure!(
+                opts.kv_persist_dir.is_none(),
+                "KV graft + typed persistent-KV is not supported in this build \
+                 (ADR-059: disk snapshots exclude the graft region; the \
+                 graft-aware disk codec lands after the in-memory path \
+                 proves out); refusing to start with both --kv-graft and \
+                 --kv-persist"
+            );
+            let (bank, compatibility) =
+                crate::inference::graft::validate_graft_for_model(
+                    graft_path,
+                    model_path,
+                    &gguf,
+                )
+                .with_context(|| format!("KV graft bind: {}", graft_path.display()))?;
+            if compatibility != crate::inference::glp::Compatibility::Checkpoint {
+                tracing::warn!(
+                    "KV graft does not declare a verified checkpoint revision; \
+                     behavior requires validation (compatibility={compatibility:?})"
+                );
+            }
+            let bound = crate::inference::graft::BoundGraft::bind(bank);
+            tracing::info!(
+                target: "hf2q::serve::api::engine::graft",
+                path = %graft_path.display(),
+                n_slots = bound.bank.n_slots,
+                layers = ?bound.bank.layers.keys().collect::<Vec<_>>(),
+                "KV graft bound to Gemma4 (splice: gemma4 hybrid KV leg; \
+                 graft-wired paths honor it, unwired paths refuse by name)"
+            );
+            kv_graft = Some(bound);
+        }
+        weights.kv_graft = kv_graft;
+
         Ok(Self {
             weights,
             ctx,
@@ -11685,6 +11728,20 @@ fn run_slot_aware_gemma4(
     kv_bytes_per_token: u64,
     supervisor: EngineSupervisor,
 ) {
+    // ADR-059 fail-closed loop gate: the SlotAware loop is not yet
+    // graft-wired (admission splice, graft_len position offsets,
+    // graft-aware anchors are the landing increments). A bound graft
+    // refuses every request BY NAME rather than serving ungrafted —
+    // the Qwen35KvGuard pre-wiring pattern.
+    if let Err(error) = ensure_gemma4_graft_serving_supported(&model) {
+        tracing::error!("Gemma4 SlotAware loop cannot start: {error:#}");
+        drain_with_startup_error(
+            rx,
+            "KV graft bound but the Gemma4 SlotAware loop is not graft-wired \
+             (ADR-059); refusing rather than serving ungrafted",
+        );
+        return;
+    }
     let mut guard = match Gemma4KvGuard::take(&mut model) {
         Ok(g) => g,
         Err(e) => {
@@ -24385,6 +24442,24 @@ fn generate_once_with_soft_tokens(
 ///   first per A2b §6.1.23 iter-1.5 cfa-finding-F5).
 /// - `iter-B4c-kernel-iter-2` typed `CapabilityUnsupported` on the
 ///   kernel-forward step (the load-bearing pin until iter-2 lands).
+/// ADR-059 fail-closed request gate for gemma4 paths that are NOT yet
+/// graft-wired. A bound graft shifts every position by `n_slots` and
+/// changes what the KV bytes mean; an unwired path refuses requests BY
+/// NAME rather than serving ungrafted under a graft flag (the
+/// `glp.mode` discipline applied to serving). Ungrafted models pass
+/// unchanged. The graft-wired paths (landing increment by increment)
+/// stop calling this gate.
+fn ensure_gemma4_graft_serving_supported(loaded: &GemmaLoadedModel) -> Result<()> {
+    anyhow::ensure!(
+        loaded.weights.kv_graft.is_none(),
+        "KV graft bound but this Gemma4 serving path is not graft-wired yet \
+         (ADR-059 gemma4 engine wiring pending: admission splice, position \
+         offsets, graft-aware snapshots); refusing rather than serving \
+         ungrafted"
+    );
+    Ok(())
+}
+
 fn generate_gemma4_once_slot_aware(
     loaded: &mut GemmaLoadedModel,
     prompt_tokens: &[u32],
@@ -24432,6 +24507,7 @@ fn generate_gemma4_once_slot_aware(
     >,
     slot_id: SlotId,
 ) -> Result<GenerationResult> {
+    ensure_gemma4_graft_serving_supported(loaded)?;
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "generate_gemma4_once_slot_aware: empty prompt_tokens"
@@ -25076,6 +25152,13 @@ fn generate_stream_gemma4_once_slot_aware(
                 return;
             }
         };
+    }
+
+    // ADR-059 fail-closed: this path is not graft-wired yet; a bound
+    // graft refuses BY NAME rather than serving ungrafted.
+    if let Err(error) = ensure_gemma4_graft_serving_supported(loaded) {
+        send!(super::sse::GenerationEvent::Error(format!("{error:#}")));
+        return;
     }
 
     if prompt_tokens.is_empty() {
@@ -26265,6 +26348,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
     >,
     slot_id: SlotId,
 ) -> Result<GenerationResult> {
+    ensure_gemma4_graft_serving_supported(loaded)?;
     // Empty soft-token slice → identity over the text-only slot-aware
     // path.  Mirrors the non-slot-aware sibling `generate_once_with_soft_tokens`
     // shape (which itself reduces to `generate_once` when soft-tokens
