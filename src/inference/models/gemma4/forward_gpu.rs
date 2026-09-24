@@ -29,7 +29,7 @@ use crate::serve::layer_ctx::LayerCtx;
 use mlx_native::ops::flash_attn_vec_tq::FlashAttnVecTqParams;
 
 impl MlxModelWeights {
-    /// Encode two disjoint layer chunks in parallel using the global encoder
+/// Encode two disjoint layer chunks in parallel using the global encoder
     /// worker (ADR-031 Phase B, Path D).
     ///
     /// The worker creates a fresh `GraphSession` from `exec`, encodes `range_a`
@@ -2937,7 +2937,7 @@ mod g4_cfa3_tests {
         seed: &mut u32,
         device: &MlxDevice,
     ) -> MlxModelWeights {
-        // embed_weight: [vocab, hidden] F32 with small random values.
+// embed_weight: [vocab, hidden] F32 with small random values.
         let embed_data = mk_rand_g4(seed, vocab * hidden, 0.01);
         let embed_weight = MlxQWeight {
             buffer: alloc_f32_g4(&embed_data, device),
@@ -3009,7 +3009,8 @@ mod g4_cfa3_tests {
         };
 
         MlxModelWeights {
-            embed_weight,
+            kv_graft: None,
+embed_weight,
             layers,
             final_norm,
             lm_head: None,
@@ -3369,7 +3370,8 @@ mod g4_cfa3_tests {
         };
 
         let model = MlxModelWeights {
-            embed_weight,
+            kv_graft: None,
+embed_weight,
             layers: vec![sliding_layer, global_layer],
             final_norm,
             lm_head: None,
