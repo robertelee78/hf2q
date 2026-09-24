@@ -23310,6 +23310,7 @@ fn generate_once_with_soft_tokens(
     registration: Option<&super::registry::ModelRegistration>,
     supervisor: &EngineSupervisor,
 ) -> Result<GenerationResult> {
+    ensure_gemma4_graft_serving_supported(loaded)?;
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "generate_once: empty prompt_tokens"
@@ -28383,6 +28384,7 @@ fn generate_stream_once(
     cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
     supervisor: &EngineSupervisor,
 ) -> SerialStreamResult {
+    ensure_gemma4_graft_serving_supported(loaded)?;
     use super::sse::{DeltaKind, GenerationEvent, StreamStats};
 
     // W-A2.2: streaming origin captures the per-emit sequence into a
