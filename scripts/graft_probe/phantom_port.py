@@ -83,6 +83,7 @@ MODELS = {
         "path": "/opt/hf2q/models/sources/Qwen3.5-4B",
         "eot_token": "<|im_end|>",
         "template": "split",
+        "mrope_interleaved": True,
         "art": "/opt/hf2q/artifacts/grafts/qwen35-4b",
         "gguf_identity_name": "Qwen3.5-4B",
         "gguf_facts": {
@@ -90,10 +91,20 @@ MODELS = {
             "head_dim": 256, "layers": [3, 7, 11, 15, 19, 23, 27, 31],
         },
     },
+    "qwen36-35b": {
+        "path": "/opt/hf2q/models/sources/Qwen3.6-35B-A3B",
+        "eot_token": "<|im_end|>",
+        "template": "split",
+        "mrope_interleaved": True,
+        "art": "/opt/hf2q/artifacts/grafts/qwen36-35b",
+        "gguf_identity_name": "Qwen3.6-35B-A3B",
+        "gguf_facts": None,  # filled from the model config at to-gguf time
+    },
     "gemma4-26b": {
         "path": "/opt/hf2q/models/sources/gemma-4-26B-A4B-it",
         "eot_token": "<turn|>",
         "template": "gemma4",
+        "mrope_interleaved": False,
         "art": "/opt/hf2q/artifacts/grafts/gemma4-26b",
         "gguf_identity_name": "Gemma-4-26B-A4B-It",
         "gguf_facts": None,  # filled from the model config at to-gguf time
@@ -684,7 +695,7 @@ def cmd_to_gguf(args):
         kv_f32("graft.rope_theta", float(facts["rope_theta"])),
         kv_u32("graft.rotary_dim", int(facts["rotary_dim"])),
         kv_u32("graft.position_base", 0),
-        kv_bool("graft.mrope_interleaved", True),
+        kv_bool("graft.mrope_interleaved", MODELS[key]["mrope_interleaved"]),
         kv_string("graft.quant_lane", "f32"),
         kv_string("general.base_model.0.name", MODELS[key]["gguf_identity_name"]),
     ]

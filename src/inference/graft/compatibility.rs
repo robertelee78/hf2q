@@ -25,7 +25,7 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use mlx_native::gguf::GgufFile;
+use mlx_native::gguf::{GgufFile, MetadataValue};
 
 use crate::inference::glp::{CheckpointIdentity, Compatibility};
 
@@ -91,6 +91,95 @@ impl GraftModelShape {
                     // Qwen3.5-family convention: IMROPE interleaved mode is
                     // always on (GGML_ROPE_TYPE_IMROPE; no metadata key).
                     mrope_interleaved: true,
+                    arch,
+                    full_attn_layers,
+                })
+            }
+            "gemma4" => {
+                let required_u32 = |key: &str| -> Result<u32> {
+                    gguf.metadata_u32(key).with_context(|| {
+                        format!("graft bind: model GGUF missing required key '{key}'")
+                    })
+                };
+                let block_count = required_u32("gemma4.block_count")?;
+                // Layer types: `sliding_window_pattern` is a per-layer
+                // bool array, True = sliding, False = full (the
+                // serve/config.rs convention). Fallback when absent:
+                // every 6th layer is full (the default pattern).
+                let full_attn_layers: Vec<u32> = match gguf
+                    .metadata("gemma4.attention.sliding_window_pattern")
+                {
+                    Some(MetadataValue::Array(arr)) => {
+                        let pattern: Vec<bool> = arr
+                            .iter()
+                            .filter_map(|v| match v {
+                                MetadataValue::Bool(b) => Some(*b),
+                                _ => None,
+                            })
+                            .collect();
+                        anyhow::ensure!(
+                            pattern.len() == block_count as usize,
+                            "graft bind: gemma4.attention.sliding_window_pattern length {} \
+                             != block_count {}",
+                            pattern.len(),
+                            block_count
+                        );
+                        (0..block_count)
+                            .filter(|i| !pattern[*i as usize])
+                            .collect()
+                    }
+                    _ => (0..block_count).filter(|i| (i + 1) % 6 == 0).collect(),
+                };
+                anyhow::ensure!(
+                    !full_attn_layers.is_empty(),
+                    "graft bind: gemma4 model exposes no full-attention layers; the \
+                     full_attn_kv site has no cache medium on this model"
+                );
+                // Per-layer KV head counts (i32 array, one per layer).
+                // The site geometry is the FULL-attention layers' count —
+                // same derivation as serve/config.rs (the first full
+                // layer's value); sliding layers use a different head
+                // count AND head dim and are not part of this site.
+                let head_count_kv: Vec<u32> = match gguf
+                    .metadata("gemma4.attention.head_count_kv")
+                {
+                    Some(MetadataValue::Array(arr)) => {
+                        arr.iter().filter_map(|v| v.as_u32()).collect()
+                    }
+                    Some(other) => bail!(
+                        "graft bind: gemma4.attention.head_count_kv has unexpected \
+                         type {:?}",
+                        std::mem::discriminant(other)
+                    ),
+                    None => bail!("graft bind: gemma4.attention.head_count_kv missing"),
+                };
+                anyhow::ensure!(
+                    head_count_kv.len() == block_count as usize,
+                    "graft bind: gemma4.attention.head_count_kv length {} != block_count {}",
+                    head_count_kv.len(),
+                    block_count
+                );
+                let first_full = full_attn_layers[0] as usize;
+                let n_kv_heads = head_count_kv[first_full];
+                anyhow::ensure!(
+                    n_kv_heads > 0,
+                    "graft bind: gemma4 full-attention layer {} reports 0 KV heads",
+                    first_full
+                );
+                Ok(Self {
+                    n_kv_heads,
+                    // Global (full-attention) geometry — NOT the _swa
+                    // variants, which describe sliding layers.
+                    head_dim: required_u32("gemma4.attention.key_length")?,
+                    rope_theta: gguf
+                        .metadata_f32("gemma4.rope.freq_base")
+                        .with_context(|| {
+                            "graft bind: model GGUF missing 'gemma4.rope.freq_base'"
+                        })?,
+                    rotary_dim: required_u32("gemma4.rope.dimension_count")?,
+                    // Gemma-4 uses standard RoPE; IMROPE interleaving is
+                    // a Qwen3.5-family convention.
+                    mrope_interleaved: false,
                     arch,
                     full_attn_layers,
                 })
