@@ -1439,6 +1439,164 @@ pub fn splice_graft_into_hybrid_kv_for_slot(
 }
 
 
+
+/// ADR-059 — single-seq sibling of
+/// [`splice_graft_into_hybrid_kv_for_slot`] for the SERIAL path's
+/// model-held `Vec<HybridKvBuffers>` (no `n_seqs` axis; the batched
+/// kernels address it correctly with an all-zero slot-id buffer).
+/// Same fail-closed contract; returns the graft length (the position
+/// offset the serial path must apply to every subsequent write/read).
+pub fn splice_graft_into_hybrid_kv_single_seq(
+    buffers: &mut [HybridKvBuffers],
+    bank: &crate::inference::graft::GraftBank,
+    device: &MlxDevice,
+) -> Result<u32> {
+    use crate::inference::graft::GraftHookPoint;
+    anyhow::ensure!(
+        !buffers.is_empty(),
+        "gemma4 graft splice (single-seq): no KV buffers allocated"
+    );
+    anyhow::ensure!(
+        bank.hook_point == GraftHookPoint::FullAttnKv,
+        "gemma4 graft splice (single-seq): site {:?} is not implemented",
+        bank.hook_point.as_str()
+    );
+    let n_slots = bank.n_slots;
+    if n_slots == 0 {
+        return Ok(0);
+    }
+    let full_layers: Vec<usize> = buffers
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !b.is_sliding)
+        .map(|(i, _)| i)
+        .collect();
+    anyhow::ensure!(
+        !full_layers.is_empty(),
+        "gemma4 graft splice (single-seq): no full-attention layers"
+    );
+    let missing: Vec<String> = full_layers
+        .iter()
+        .filter(|l| !bank.layers.contains_key(&(**l as u32)))
+        .map(|l| l.to_string())
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "gemma4 graft splice (single-seq): bank does not cover \
+         full-attention layer(s) [{}]",
+        missing.join(", ")
+    );
+    let sliding_offenders: Vec<String> = bank
+        .layers
+        .keys()
+        .filter(|l| buffers.get(**l as usize).is_some_and(|b| b.is_sliding))
+        .map(|l| l.to_string())
+        .collect();
+    anyhow::ensure!(
+        sliding_offenders.is_empty(),
+        "gemma4 graft splice (single-seq): bank covers sliding layer(s) \
+         [{}] — the full_attn_kv site never splices sliding layers",
+        sliding_offenders.join(", ")
+    );
+    let probe = &buffers[full_layers[0]];
+    let k_shape = probe.k.shape().to_vec();
+    anyhow::ensure!(
+        k_shape.len() == 3,
+        "gemma4 graft splice (single-seq): unexpected K buffer rank {:?}",
+        k_shape
+    );
+    let nkv = k_shape[0];
+    let cap = k_shape[1];
+    let hd = k_shape[2];
+    anyhow::ensure!(
+        bank.n_kv_heads == nkv && bank.head_dim == hd,
+        "gemma4 graft splice (single-seq): bank geometry {}x{} != buffer {}x{}",
+        bank.n_kv_heads,
+        bank.head_dim,
+        nkv,
+        hd
+    );
+    anyhow::ensure!(
+        n_slots as usize <= cap,
+        "gemma4 graft splice (single-seq): n_slots={n_slots} exceeds capacity={cap}"
+    );
+    anyhow::ensure!(
+        probe.v_packed.dtype() == DType::U8,
+        "gemma4 graft splice (single-seq): the HF2Q_FULL_F16_KV=1 variant \
+         is not graft-spliced; the Hadamard encoder requires the TQ lane"
+    );
+    let tq_scale_factor_d512: f32 = match std::env::var("HF2Q_SCALE_FORMULA").as_deref() {
+        Ok("sqrt256") => 16.0,
+        Ok("sqrt512") => 512.0_f32.sqrt(),
+        _ => 1.0,
+    };
+    let tq_codebook_bits =
+        crate::serve::api::tq_packed_descriptor::effective_gemma_tq_codebook_bits();
+
+    let rows = n_slots as usize * nkv * hd;
+    let upload = |values: &[f32], label: &str| -> Result<MlxBuffer> {
+        let mut buf = device
+            .alloc_buffer(rows * 4, DType::F32, vec![n_slots as usize, nkv, hd])
+            .with_context(|| format!("gemma4 graft splice (single-seq) {label} upload"))?;
+        buf.as_mut_slice::<f32>()
+            .with_context(|| format!("gemma4 graft splice (single-seq) {label} mapping"))?
+            .copy_from_slice(values);
+        Ok(buf)
+    };
+    let mut encoder = device
+        .command_encoder()
+        .context("gemma4 graft splice (single-seq): encoder")?;
+    let mut registry = mlx_native::KernelRegistry::new();
+    // All-zero slot ids: the batched kernels apply slot_id*stride = 0,
+    // addressing the single-seq [nkv, cap, hd] layout correctly.
+    let mut slot_ids = device
+        .alloc_buffer(n_slots as usize * 4, DType::U32, vec![n_slots as usize])
+        .context("gemma4 graft splice (single-seq) slot_ids alloc")?;
+    slot_ids
+        .as_mut_slice::<u32>()
+        .context("gemma4 graft splice (single-seq) slot_ids mapping")?
+        .fill(0);
+    let mut positions = device
+        .alloc_buffer(n_slots as usize * 4, DType::U32, vec![n_slots as usize])
+        .context("gemma4 graft splice (single-seq) positions alloc")?;
+    positions
+        .as_mut_slice::<u32>()
+        .context("gemma4 graft splice (single-seq) positions mapping")?
+        .copy_from_slice(&(0..n_slots).collect::<Vec<u32>>());
+
+    for layer_idx in &full_layers {
+        let layer_kv = bank
+            .layers
+            .get(&(*layer_idx as u32))
+            .expect("coverage checked above");
+        anyhow::ensure!(
+            layer_kv.k.len() == rows && layer_kv.v.len() == rows,
+            "gemma4 graft splice (single-seq): layer {layer_idx} row mismatch"
+        );
+        let k_src = upload(&layer_kv.k, "K")?;
+        let v_src = upload(&layer_kv.v, "V")?;
+        let buf = &mut buffers[*layer_idx];
+        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16_batched(
+            &mut encoder, &mut registry, device.metal_device(),
+            &k_src, &buf.k, &slot_ids, &positions,
+            n_slots, nkv as u32, hd as u32, cap as u32, false,
+        )
+        .with_context(|| format!("gemma4 graft splice (single-seq) K L{layer_idx}"))?;
+        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
+            &mut encoder, &mut registry, device.metal_device(),
+            &v_src, &buf.v_packed, &buf.v_norms, &slot_ids, &positions,
+            n_slots, nkv as u32, hd as u32, cap as u32, false,
+            tq_scale_factor_d512, tq_codebook_bits,
+        )
+        .with_context(|| format!("gemma4 graft splice (single-seq) V L{layer_idx}"))?;
+    }
+    encoder
+        .commit_and_wait()
+        .context("gemma4 graft splice (single-seq): commit")?;
+    Ok(n_slots)
+}
+
+
 /// Prompt-boundary checkpoint for one Gemma agent slot.
 ///
 /// Full-attention rows are append-only, so decoding after the prompt cannot
@@ -3378,6 +3536,54 @@ mod tests {
                 grafted_norms.iter().take(6).any(|x| *x != 0.0),
                 "grafted slot V norms written (D=512 -> 2/pos)"
             );
+        }
+
+
+        #[test]
+        fn splice_single_seq_writes_k_v_and_refuses_sliding() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(dev) = device() else { return };
+            // Single-seq buffers: full 2x512 + sliding 8x256.
+            let full = alloc_hybrid_kv_for_layer(&dev, 0, 2, 512, 16, false)
+                .expect("full alloc");
+            let sliding = alloc_hybrid_kv_for_layer(&dev, 1, 8, 256, 16, true)
+                .expect("sliding alloc");
+            let mut bufs = vec![full, sliding];
+
+            let graft = bank(3, 2, 512, &[0]);
+            let n = splice_graft_into_hybrid_kv_single_seq(&mut bufs, &graft, &dev)
+                .expect("single-seq splice");
+            assert_eq!(n, 3);
+
+            // K lane: F16 at head 0, position 0 of the full layer.
+            let k = bufs[0].k.as_slice::<u16>().expect("k readback");
+            let base = 0; // head 0, pos 0: elements 0..512
+            assert_eq!(k[base], 0x0000, "f16(0.0)");
+            assert_eq!(k[base + 1], 0x3400, "f16(0.25)");
+            assert_eq!(k[base + 2], 0x3800, "f16(0.5)");
+            // V lane: packed written.
+            let v = bufs[0].v_packed.as_slice::<u8>().expect("v readback");
+            assert!(v[..2 * 16 * 512].iter().any(|b| *b != 0), "V packed written");
+            // Sliding layer untouched (its buffers stay zero).
+            let sv = bufs[1].v_packed.as_slice::<u8>().expect("sliding v");
+            assert!(sv.iter().all(|b| *b == 0), "sliding layer untouched");
+
+            // Sliding coverage refused.
+            let mut graft2 = bank(3, 2, 512, &[0]);
+            let n2 = 3 * 8 * 256;
+            graft2.layers.insert(
+                1,
+                crate::inference::graft::GraftLayerKv {
+                    k: (0..n2).map(|i| i as f32).collect(),
+                    v: (0..n2).map(|i| i as f32).collect(),
+                },
+            );
+            let full = alloc_hybrid_kv_for_layer(&dev, 0, 2, 512, 16, false).unwrap();
+            let sliding = alloc_hybrid_kv_for_layer(&dev, 1, 8, 256, 16, true).unwrap();
+            let mut bufs2 = vec![full, sliding];
+            let err = splice_graft_into_hybrid_kv_single_seq(&mut bufs2, &graft2, &dev)
+                .unwrap_err();
+            assert!(err.to_string().contains("never splices sliding"));
         }
 
         #[test]
