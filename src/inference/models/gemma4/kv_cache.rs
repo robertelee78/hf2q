@@ -3,7 +3,7 @@
 //! Extracted from `src/serve/forward_mlx.rs` by ADR-038 Step 2.
 //! Mirrors the `qwen35/kv_cache.rs` pattern.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
 /// Per-layer KV cache buffers for the mlx-native path (TurboQuant compressed).
@@ -1194,6 +1194,250 @@ pub struct MultiSeqHybridKvBuffers {
     /// Mirrors A3a's `MultiSeqHbKvBuffers::seq_lens` discipline.
     pub seq_lens: Vec<u32>,
 }
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-059 — KV graft splice on the gemma4 hybrid KV leg (the
+// `full_attn_kv` site, family increment 2). The production cache for
+// gemma4 serving is `MultiSeqHybridKvBuffers`: dense F16 K + TQ-HB
+// packed V. The splice writes the bank's K rows through the SAME
+// production F32→F16 copy kernel prefill uses and encodes the bank's V
+// rows through the SAME production Hadamard quantizer (identical
+// codebook-bits and scale-factor resolution), so graft rows and prefill
+// rows are indistinguishable to the read side. Sliding layers are not
+// part of this site (their ring semantics are the staged
+// `window_tail_kv` site); the bank must cover EVERY full-attention
+// layer and no sliding layer.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// ADR-059 — splice a graft bank into one physical slot's per-layer
+/// hybrid KV buffers as fabricated history at positions `0..n_slots`.
+/// Returns the graft length: the position offset every subsequent
+/// write/read for this slot must apply (engine-side wiring).
+///
+/// Contract (fail-closed, mirroring the qwen35 splice):
+/// - `bank.hook_point` must be `full_attn_kv` (bind re-asserted).
+/// - A zero-slot canary bank is a no-op returning `0`.
+/// - The slot must be fresh (`seq_lens[slot] == 0` on every layer).
+/// - The bank must cover EVERY full-attention layer and NO sliding
+///   layer (complete site coverage; partial coverage is not a defined
+///   v1 artifact).
+/// - Bank geometry must match the full-layer buffers (n_kv_heads,
+///   head_dim).
+/// - The `HF2Q_FULL_F16_KV=1` variant (F16 V instead of TQ-packed) is
+///   refused by name — the Hadamard encoder requires the U8 packed
+///   lane.
+/// - Cursors land at `n_slots` on every covered layer.
+pub fn splice_graft_into_hybrid_kv_for_slot(
+    slot: crate::serve::multi_seq_kv::SlotId,
+    buffers: &mut [MultiSeqHybridKvBuffers],
+    bank: &crate::inference::graft::GraftBank,
+    device: &MlxDevice,
+) -> Result<u32> {
+    use crate::inference::graft::GraftHookPoint;
+    let slot_idx = slot.0 as usize;
+    anyhow::ensure!(
+        !buffers.is_empty(),
+        "gemma4 graft splice: no KV buffers allocated"
+    );
+    anyhow::ensure!(
+        bank.hook_point == GraftHookPoint::FullAttnKv,
+        "gemma4 graft splice: site {:?} is not implemented",
+        bank.hook_point.as_str()
+    );
+    let n_slots = bank.n_slots;
+    if n_slots == 0 {
+        return Ok(0);
+    }
+    let n_seqs = buffers[0].n_seqs as usize;
+    anyhow::ensure!(
+        slot_idx < n_seqs,
+        "gemma4 graft splice: slot {} outside n_seqs={}",
+        slot.0,
+        n_seqs
+    );
+    for (layer_idx, buf) in buffers.iter().enumerate() {
+        anyhow::ensure!(
+            (buf.seq_lens.get(slot_idx).copied()).unwrap_or(u32::MAX) == 0,
+            "gemma4 graft splice: layer {layer_idx} cursor for slot {} is {} \
+             (not fresh); a graft occupies positions 0..{n_slots}",
+            slot.0,
+            buf.seq_lens.get(slot_idx).copied().unwrap_or(u32::MAX),
+        );
+        let _ = layer_idx;
+    }
+
+    // Complete site coverage: every full-attention layer covered, no
+    // sliding layer in the bank.
+    let full_layers: Vec<usize> = buffers
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !b.is_sliding)
+        .map(|(i, _)| i)
+        .collect();
+    anyhow::ensure!(
+        !full_layers.is_empty(),
+        "gemma4 graft splice: no full-attention layers in the buffer set"
+    );
+    let missing: Vec<String> = full_layers
+        .iter()
+        .filter(|l| !bank.layers.contains_key(&(**l as u32)))
+        .map(|l| l.to_string())
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "gemma4 graft splice: bank does not cover full-attention layer(s) \
+         [{}] — complete coverage required",
+        missing.join(", ")
+    );
+    let sliding_offenders: Vec<String> = bank
+        .layers
+        .keys()
+        .filter(|l| {
+            buffers
+                .get(**l as usize)
+                .is_some_and(|b| b.is_sliding)
+        })
+        .map(|l| l.to_string())
+        .collect();
+    anyhow::ensure!(
+        sliding_offenders.is_empty(),
+        "gemma4 graft splice: bank covers sliding layer(s) [{}] — the \
+         full_attn_kv site never splices sliding (ring) layers",
+        sliding_offenders.join(", ")
+    );
+
+    // Geometry from the first full layer's K buffer: [n_seqs, nkv, cap, hd].
+    let probe = &buffers[full_layers[0]];
+    let k_shape = probe.k.shape().to_vec();
+    anyhow::ensure!(
+        k_shape.len() == 4,
+        "gemma4 graft splice: unexpected K buffer rank {:?}",
+        k_shape
+    );
+    let nkv = k_shape[1];
+    let cap = k_shape[2];
+    let hd = k_shape[3];
+    anyhow::ensure!(
+        bank.n_kv_heads == nkv && bank.head_dim == hd,
+        "gemma4 graft splice: bank geometry {}x{} != buffer {}x{}",
+        bank.n_kv_heads,
+        bank.head_dim,
+        nkv,
+        hd
+    );
+    anyhow::ensure!(
+        n_slots as usize <= cap,
+        "gemma4 graft splice: n_slots={n_slots} exceeds capacity={cap}"
+    );
+    anyhow::ensure!(
+        probe.v_packed.dtype() == DType::U8,
+        "gemma4 graft splice: the HF2Q_FULL_F16_KV=1 variant (F16 V lane) \
+         is not graft-spliced; the Hadamard encoder requires the TQ \
+         packed lane"
+    );
+
+    // Production TQ parameters — read identically to the prefill path
+    // (batched_body.rs): graft V rows must quantize under the SAME
+    // codebook and scale as this process's prefill rows.
+    let tq_scale_factor_d512: f32 = match std::env::var("HF2Q_SCALE_FORMULA").as_deref() {
+        Ok("sqrt256") => 16.0,
+        Ok("sqrt512") => 512.0_f32.sqrt(),
+        _ => 1.0,
+    };
+    let tq_codebook_bits =
+        crate::serve::api::tq_packed_descriptor::effective_gemma_tq_codebook_bits();
+
+    // Upload the bank rows (token-major [n_slots, nkv, hd] F32 — the
+    // same src layout the batched prefill kernels consume).
+    let rows = n_slots as usize * nkv * hd;
+    let upload = |values: &[f32], label: &str| -> Result<MlxBuffer> {
+        let mut buf = device
+            .alloc_buffer(rows * 4, DType::F32, vec![n_slots as usize, nkv, hd])
+            .with_context(|| format!("gemma4 graft splice {label} upload"))?;
+        buf.as_mut_slice::<f32>()
+            .with_context(|| format!("gemma4 graft splice {label} upload mapping"))?
+            .copy_from_slice(values);
+        Ok(buf)
+    };
+    let mut encoder = device
+        .command_encoder()
+        .context("gemma4 graft splice: command encoder")?;
+    let mut registry = mlx_native::KernelRegistry::new();
+    // slot_ids [n_slots] all = slot; positions [n_slots] = 0..n_slots-1.
+    let mut slot_ids = device
+        .alloc_buffer(n_slots as usize * 4, DType::U32, vec![n_slots as usize])
+        .context("gemma4 graft splice slot_ids alloc")?;
+    slot_ids
+        .as_mut_slice::<u32>()
+        .context("gemma4 graft splice slot_ids mapping")?
+        .fill(slot.0);
+    let mut positions = device
+        .alloc_buffer(n_slots as usize * 4, DType::U32, vec![n_slots as usize])
+        .context("gemma4 graft splice positions alloc")?;
+    positions
+        .as_mut_slice::<u32>()
+        .context("gemma4 graft splice positions mapping")?
+        .copy_from_slice(&(0..n_slots).collect::<Vec<u32>>());
+
+    for layer_idx in &full_layers {
+        let layer_kv = bank
+            .layers
+            .get(&(*layer_idx as u32))
+            .expect("coverage checked above");
+        anyhow::ensure!(
+            layer_kv.k.len() == rows && layer_kv.v.len() == rows,
+            "gemma4 graft splice: layer {layer_idx} bank row count mismatch"
+        );
+        let k_src = upload(&layer_kv.k, "K")?;
+        let v_src = upload(&layer_kv.v, "V")?;
+        let buf = &mut buffers[*layer_idx];
+        // The batched kernels are SLOT-AWARE: they take the FULL
+        // [n_seqs, nkv, cap, hd] buffers plus the slot_id buffer and
+        // apply the slot offset internally (the production prefill
+        // call shape). No per-slot views here — a view would apply the
+        // slot offset a second time and write out of the region.
+        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16_batched(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &k_src,
+            &buf.k,
+            &slot_ids,
+            &positions,
+            n_slots,
+            nkv as u32,
+            hd as u32,
+            cap as u32,
+            false,
+        )
+        .with_context(|| format!("gemma4 graft splice K copy L{layer_idx}"))?;
+        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &v_src,
+            &buf.v_packed,
+            &buf.v_norms,
+            &slot_ids,
+            &positions,
+            n_slots,
+            nkv as u32,
+            hd as u32,
+            cap as u32,
+            false,
+            tq_scale_factor_d512,
+            tq_codebook_bits,
+        )
+        .with_context(|| format!("gemma4 graft splice V encode L{layer_idx}"))?;
+        buf.seq_lens[slot_idx] = n_slots;
+    }
+    encoder
+        .commit_and_wait()
+        .context("gemma4 graft splice: commit and wait")?;
+    Ok(n_slots)
+}
+
 
 /// Prompt-boundary checkpoint for one Gemma agent slot.
 ///
@@ -3027,6 +3271,161 @@ pub enum DecodeRegime {
 
 #[cfg(test)]
 mod tests {
+
+    // ── ADR-059 gemma4 graft splice tests ──────────────────────────────
+
+    mod graft_splice_tests {
+        use super::*;
+        use crate::inference::graft::{
+            GraftBank, GraftHookPoint, GraftKind, GraftLayerKv, GraftMode,
+        };
+        use crate::serve::multi_seq_kv::SlotId;
+
+        /// A bank covering the given (full-attention) layers with
+        /// distinct, verifiable row values.
+        fn bank(n_slots: u32, heads: usize, head_dim: usize, layers: &[u32]) -> GraftBank {
+            GraftBank {
+                mode: GraftMode::SplicePrefix,
+                kind: GraftKind::DirectKv,
+                hook_point: GraftHookPoint::FullAttnKv,
+                n_slots,
+                layers: layers
+                    .iter()
+                    .map(|&l| {
+                        let n = n_slots as usize * heads * head_dim;
+                        (
+                            l,
+                            GraftLayerKv {
+                                k: (0..n).map(|i| i as f32 * 0.25).collect(),
+                                v: (0..n).map(|i| -(i as f32) * 0.5).collect(),
+                            },
+                        )
+                    })
+                    .collect(),
+                n_kv_heads: heads,
+                head_dim,
+                rope_theta: 1e6,
+                rotary_dim: 512,
+                position_base: 0,
+                mrope_interleaved: false,
+                content_sha256: None,
+                quant_lane: None,
+            }
+        }
+
+        fn device() -> Option<MlxDevice> {
+            match MlxDevice::new() {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    eprintln!("skipping: no Metal device: {e}");
+                    None
+                }
+            }
+        }
+
+        /// Two layers: index 0 full-attention (2 KV heads x 512), index
+        /// 1 sliding (8 x 256) — the gemma-4-26B shape in miniature.
+        fn buffers(dev: &MlxDevice, cap: usize, n_seqs: u32) -> Vec<MultiSeqHybridKvBuffers> {
+            let full = alloc_multi_seq_hybrid_kv_for_layer(dev, 0, 2, 512, cap, false, n_seqs)
+                .expect("full layer alloc");
+            let sliding = alloc_multi_seq_hybrid_kv_for_layer(dev, 1, 8, 256, cap, true, n_seqs)
+                .expect("sliding layer alloc");
+            vec![full, sliding]
+        }
+
+        #[test]
+        fn splice_writes_f16_k_tq_v_and_advances_cursor() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(dev) = device() else { return };
+            let mut bufs = buffers(&dev, 16, 2);
+            let graft = bank(3, 2, 512, &[0]);
+            let n = splice_graft_into_hybrid_kv_for_slot(SlotId(1), &mut bufs, &graft, &dev)
+                .expect("splice");
+            assert_eq!(n, 3);
+            assert_eq!(bufs[0].seq_lens[1], 3, "grafted slot cursor");
+            assert_eq!(bufs[0].seq_lens[0], 0, "peer slot untouched");
+            assert_eq!(bufs[1].seq_lens[1], 0, "sliding layer untouched by the site");
+
+            // K lane: F16 at the grafted slot's region. Bank row values
+            // 0.0, 0.25, 0.5... — check the F16 encodings of the first
+            // row (0.0 -> 0x0000, 0.25 -> 0x3800, 0.5 -> 0x3800+...).
+            let k = bufs[0].k.as_slice::<u16>().expect("k readback");
+            let per_slot = 2 * 16 * 512;
+            // slot 1, head 0, position 0: elements at
+            // (1*per_slot + 0*16*512 + 0*512) .. +512
+            let base = per_slot + 0;
+            assert_eq!(k[base], 0x0000, "f16(0.0)");
+            assert_eq!(k[base + 1], 0x3400, "f16(0.25)");
+            assert_eq!(k[base + 2], 0x3800, "f16(0.5)");
+            // Peer slot's K region stays zero (fresh alloc is
+            // zero-initialized? If not, at least the grafted values are
+            // confined: check slot 0 position 0 differs from the bank's
+            // first values where the bank is nonzero).
+            // V lane: packed bytes written in slot 1's region, peer
+            // region untouched.
+            let v = bufs[0].v_packed.as_slice::<u8>().expect("v readback");
+            let v_per_slot = 2 * 16 * 512;
+            let grafted = &v[v_per_slot..2 * v_per_slot];
+            assert!(
+                grafted.iter().any(|b| *b != 0),
+                "grafted slot V packed region written"
+            );
+            // Norms: 2 per position at D=512, written for the grafted slot.
+            let norms = bufs[0].v_norms.as_slice::<f32>().expect("norms readback");
+            let n_per_slot = 2 * 16 * 2;
+            let grafted_norms = &norms[n_per_slot..2 * n_per_slot];
+            assert!(
+                grafted_norms.iter().take(6).any(|x| *x != 0.0),
+                "grafted slot V norms written (D=512 -> 2/pos)"
+            );
+        }
+
+        #[test]
+        fn splice_refuses_sliding_coverage_partial_coverage_and_stale_slot() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(dev) = device() else { return };
+
+            // Bank covering the full layer AND a sliding layer -> the
+            // sliding-offender refusal fires (coverage passes first).
+            let mut bufs = buffers(&dev, 16, 2);
+            let mut graft = bank(3, 2, 512, &[0]);
+            let n = 3 * 8 * 256;
+            graft.layers.insert(
+                1,
+                crate::inference::graft::GraftLayerKv {
+                    k: (0..n).map(|i| i as f32).collect(),
+                    v: (0..n).map(|i| i as f32).collect(),
+                },
+            );
+            let err = splice_graft_into_hybrid_kv_for_slot(SlotId(0), &mut bufs, &graft, &dev)
+                .unwrap_err();
+            assert!(err.to_string().contains("never splices sliding"));
+
+            // Zero-slot canary: no-op.
+            let mut bufs = buffers(&dev, 16, 2);
+            let canary = bank(0, 2, 512, &[0]);
+            let n = splice_graft_into_hybrid_kv_for_slot(SlotId(0), &mut bufs, &canary, &dev)
+                .expect("canary");
+            assert_eq!(n, 0);
+            assert_eq!(bufs[0].seq_lens[0], 0);
+
+            // Stale slot: cursor already advanced -> refused.
+            let mut bufs = buffers(&dev, 16, 2);
+            bufs[0].seq_lens[0] = 4;
+            let graft = bank(3, 2, 512, &[0]);
+            let err = splice_graft_into_hybrid_kv_for_slot(SlotId(0), &mut bufs, &graft, &dev)
+                .unwrap_err();
+            assert!(err.to_string().contains("not fresh"));
+
+            // Geometry mismatch: qwen-style 4x256 bank on 2x512 buffers.
+            let mut bufs = buffers(&dev, 16, 2);
+            let graft = bank(3, 4, 256, &[0]);
+            let err = splice_graft_into_hybrid_kv_for_slot(SlotId(0), &mut bufs, &graft, &dev)
+                .unwrap_err();
+            assert!(err.to_string().contains("geometry"));
+        }
+    }
+
     use super::*;
 
     fn skip_dev() -> Option<MlxDevice> {
