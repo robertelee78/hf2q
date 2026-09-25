@@ -169,7 +169,7 @@ across the site matrix:
 
 | Site | Where it lands | Families that expose it | v1 rollout |
 |---|---|---|---|
-| `full_attn_kv` | Reserved leading slots of full-attention layers (global, append-only) | Qwen3.5/3.6/3.8 (1-in-4 layers), Gemma-4 (Full layers), — any layer with full attention over past K/V | **Ships in v1.** No eviction, no ring, no hot-path kernel change. |
+| `full_attn_kv` | Reserved leading slots of full-attention layers (global, append-only) | Qwen3.5/3.6/3.8 (1-in-4 layers), Gemma-4 (Full layers), — any layer with full attention over past K/V | **Qwen3.5/3.6/3.8: shipped in v1** (serving live on both engine paths, both KV substrates; hardware-canary matrix ALL PASS). **Gemma-4: landing incrementally (2026-09-24/25)** — bind arm ✅ (full-attn layers from `sliding_window_pattern`, per-layer KV-head array, standard-RoPE enforcement), both splice primitives ✅ (F16 K via the production copy kernel + TQ-HB V via the production Hadamard quantizer on the hybrid KV leg; multi-seq + single-seq), boot bind + fail-closed gates on every serving entry ✅ (including the fix that `--kv-graft` on gemma4 was previously SILENTLY IGNORED — the flag only flowed to the qwen35 loader). **Open: the position-offset wiring** (3b serial, 3c SlotAware — splice at admission, `graft_len` offsets incl. sliding-window arithmetic, graft-aware cache identity), then the gates come off. |
 | `window_tail_kv` | Sliding-window layers: graft rides the window tail and is re-injected as the window slides (phantom §6.11 refresh semantics — their measured mitigation) | Gemma-4 (Sliding layers) | Staged site 2. The trained receptive field of a sliding layer excludes old positions, so a stable prefix graft is invisible there by the model's own attention pattern; tail-riding is the correct placement. |
 | `compressed_kv` | DeepSeek-V4 compressor output region (post-`attn_compressor_kv` space) | DeepSeek-V4 | Staged site 3. Positions `0..N` are merged into compressor state immediately, so a raw prefix splice is meaningless; a graft must be *derived in compressed space* (gradients through the frozen compressor — phantom's pipeline can in principle). No derivation tooling exists yet. |
 | `recurrent_state` | DeltaNet conv/recurrent state buffers | Qwen3.5/3.6/3.8 (3-in-4 layers) | Staged site 4. These layers have no K/V at all — the graft medium is recurrent state, a different tensor geometry and derivation. This is the site that lifts Qwen coverage from 25% toward full. |
@@ -302,6 +302,50 @@ graft is bound.
   the bank rows as a prefill chunk, enforced by test). The splice refuses
   by name if head_dim is not 256/512 (the kernel encodes no other dim);
   the F32 control path (`HF2Q_TQ_KV=0`) is the fixture substrate.
+
+### gemma4 wiring record (2026-09-24/25, the family increments)
+
+The second family lands in the established order — reader/bind (family
+conformance), splice primitive, boot bind, engine wiring — with every
+unwired path fail-closed by name:
+
+1. **Bind arm** (`b77c28a8`): `GraftModelShape::from_gguf` handles
+   `gemma4` — full-attn layers from `gemma4.attention.sliding_window_pattern`
+   (True=sliding, False=full; every-6th fallback), site geometry from the
+   per-layer `head_count_kv` i32 array (the FULL layers' count — gemma-4-26B:
+   {5,11,17,23,29} at 2 KV heads × 512; sliding layers 8×256 are not the
+   site), global rope 1e6/512, and **standard RoPE enforced**
+   (`mrope_interleaved=false`) so a qwen-convention bank on gemma4 (or
+   vice versa) is refused by name.
+2. **Splice primitives** (`78c3ddb2`, `d2e30c34`): gemma4's production
+   cache is the hybrid KV leg — dense F16 K + TQ-HB packed V
+   (`MultiSeqHybridKvBuffers` multi-seq; `HybridKvBuffers` single-seq).
+   Both primitives write K through the SAME production F32→F16 batched
+   copy kernel and encode V through the SAME production Hadamard
+   quantizer with identical codebook/scale resolution — graft rows and
+   prefill rows are indistinguishable to the read side. Contract
+   mirrors qwen35 (fresh-slot, complete full-layer coverage, sliding
+   layers refused by name, F16-KV variant refused). **Lesson
+   (test-caught):** the gemma4 batched KV kernels are SLOT-AWARE (full
+   buffer + slot-id buffer, offset in-kernel) — per-slot views
+   double-address; the qwen35 view pattern does not transfer.
+3. **Boot bind + fail-closed gates** (`2c8371f8`, `79765c39`):
+   `MlxModelWeights.kv_graft` + the load-time bind (kv_persist mutual
+   refusal, honest Named+ warn) + named refusals on EVERY serving entry
+   (serial unary/streaming, SlotAware unary/soft-token/streaming, the
+   SlotAware loop). **The fix this forced:** `--kv-graft` on gemma4 was
+   previously SILENTLY IGNORED (the flag flowed only to the qwen35
+   loader) — the exact failure mode this ADR forbids; the gap was
+   caught when the SerialFifo path initially escaped the gates.
+4. **Open (3b/3c):** the position-offset wiring — splice at cold
+   admission on both paths, `graft_len` offsets across gemma4's
+   position arithmetic (full layers absolute; sliding layers ring
+   `seq_pos % window`), graft-aware prompt-cache/LCP identity (the
+   qwen35 `steering_and_graft_params_hash` pattern) — then the gates
+   come off and the family scoreboard runs (train via the resumable
+   trainer → to-gguf → serve on the local unsloth GGUF; the
+   reference-stack prerequisites are already green: gradient flow
+   PASS, base 39/60, v1 donor 31/60).
 
 ### 5. Determinism
 
