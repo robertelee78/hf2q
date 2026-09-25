@@ -41,6 +41,8 @@ pub(crate) struct OwnedServeFlags {
     pub ctx: Option<u32>,
     pub gcd_schema: Option<std::path::PathBuf>,
     pub gcd_schema_locked: bool,
+    /// ADR-059 — KV-cache graft artifact forwarded to the spawned server.
+    pub kv_graft: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -132,6 +134,7 @@ async fn resolve_local(
             ctx: args.ctx,
             gcd_schema: args.gcd_schema.clone(),
             gcd_schema_locked: args.gcd_schema_locked,
+            kv_graft: args.kv_graft.clone(),
         },
     )
     .context("start hf2q serve")?;
@@ -311,6 +314,9 @@ fn append_owned_server_args(
     }
     if flags.gcd_schema_locked {
         command.arg("--gcd-schema-locked");
+    }
+    if let Some(kv_graft) = &flags.kv_graft {
+        command.arg("--kv-graft").arg(kv_graft);
     }
 }
 
@@ -713,6 +719,7 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--gcd"));
         assert!(!args.iter().any(|a| a == "--glp"));
         assert!(!args.iter().any(|a| a == "--gcd-schema-locked"));
+        assert!(!args.iter().any(|a| a == "--kv-graft"));
     }
 
     #[cfg(unix)]
@@ -730,6 +737,7 @@ mod tests {
                 ctx: Some(65536),
                 gcd_schema: Some(std::path::PathBuf::from("/tmp/schema.json")),
                 gcd_schema_locked: true,
+                kv_graft: Some(std::path::PathBuf::from("/tmp/graft.gguf")),
             },
             42,
             43,
@@ -750,6 +758,9 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--gcd-schema", "/tmp/schema.json"]));
         assert!(args.iter().any(|a| a == "--gcd-schema-locked"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--kv-graft", "/tmp/graft.gguf"]));
     }
 
     #[cfg(unix)]

@@ -72,6 +72,77 @@ the first generated token and at subsequent generation steps. The diagram
 shows conceptual placement, not a claim that every model family has identical
 activation sites or execution paths.*
 
+## Four surfaces, one taxonomy
+
+The two controls above sit at two points of one pipeline. Two further
+interventions complete the taxonomy — each at a different point, each with
+a different guarantee, and each with costs the others do not have.[^21]
+
+**Selection (GCD).** The model computes its honest logits; the grammar
+prunes the candidate set and renormalizes. The model's preferences are
+untouched — certain candidates are simply not allowed to win. The
+guarantee is language membership, and only that: nothing about truth,
+quality, or task completion. The cost is that suppressed preferences
+leak as degeneration and budget exhaustion — the W1 campaign's 823/1024
+token-limit truncations are that cost, measured.
+
+**Computation (GLP).** Activations are altered mid-forward-pass, so the
+logits themselves come out different — upstream of selection, downstream
+of nothing. The arithmetic is exact; nothing behavioral is guaranteed.
+The cost is fragility: site, direction, and strength must all be right
+or nothing moves — the α-sweep panel's null result is that cost,
+measured — and every steered layer pays the projection on every token
+whether or not it helps.
+
+**Context (KV grafts).** Weights and activations at the current position
+are untouched; history is fabricated. Per-layer key/value rows are
+spliced into the attention cache, and every subsequent attention step
+reads them as if the model had already "been there" — the softmax simply
+picks up extra terms. A well-placed graft steers the residual stream the
+way a document in context would, except there is no document: a
+hand-crafted soft prompt, activation-space context injection.[^22] The
+guarantee is none behavioral, but the failure mode is soft: influence is
+attention-gated, weighted per head and per token, rather than forced on
+every hidden state. The costs, measured by phantom-kv on their stack:
+the graft fades under accumulated context (half-life ≈ 2–4k tokens),
+can tax capability (GSM8K 45/75 → 27/75 under their v3 arm), and
+reaches only layers that attend over K/V — on Qwen3.5's hybrid stack
+that is the 1-in-4 full-attention layers; the DeltaNet majority has no
+K/V to splice and needs a different medium.[^22] hf2q's implementation
+status: the container, bind, splice, and serial serving paths are
+implemented, and the participation canaries pass on hardware (a
+zero-slot graft is byte-identical to the ungrafted baseline; a live
+bank shifts the output; unbinding restores the baseline) — behavioral
+panels with a derived bank remain open.[^23]
+
+**Choice (a discriminative decision head).** Generation stops
+altogether. A bidirectional encoder reads the state plus typed
+questions — choice among enumerated options, rubric score, P(true) —
+and scores every authorized option in one forward pass: zero output
+tokens, no decode loop, no sampling. Where a grammar constrains what a
+generative model *may emit*, the head replaces emission with selection:
+it picks, it does not write. The chosen option is inside the authorized
+set by construction when the option set and the grammar compile from
+the same policy specification, and the confidence is a measured
+property of the checkpoint (reported calibration error), not an
+assumption. Abstention below a threshold is a first-class result. The
+costs: it only chooses among enumerated options — it produces no
+content; its calibration holds on the measured distribution, not
+universally; and the choice is only as trustworthy as the policy that
+compiled the option set. hf2q's implementation of this surface is a
+design record; port parity fixtures and calibration reporting are
+defined as shipping gates.[^24]
+
+The four compose. Steering (computation, context) aligns the model's
+*preference* with policy — probabilistic, unguaranteed. Grammar
+(selection) draws the *boundary* — guaranteed, but it fights the model
+when preference disagrees. The head (choice) *chooses* inside the
+boundary — calibrated, with an abstention path. Graft and grammar
+together are the pairing that motivates the taxonomy: the graft makes
+the allowed language the natural one; the grammar makes everything else
+ungenerable. Each claim in that sentence is a paired-arm measurement
+the harness must produce before it is believed.[^23]
+
 ## GCD: make the output language explicit
 
 A grammar defines a set of strings. A JSON grammar might permit well-formed
@@ -751,3 +822,7 @@ recomputes those aggregates without publishing prompt or response text.
 [^18]: Public Captain Vector README and implementation at the cited revision; Source 18.
 [^19]: Hu et al., LoRA parameterization; the affine-writer identities follow by substitution, Source 19.
 [^20]: Sun et al., massive activations in dense models and Mixtral, Sections 2–3; the constant-feature approximation follows by substitution, Source 20.
+[^21]: The four-surface framing and the hf2q implementation records are ADR-059 (KV grafts) and ADR-060 (decision head) in this repository; the graft concept and its measured costs are phantom-kv's (Source 22), and the typed-decisions pattern is Laya's (Source 24).
+[^22]: phantom-kv (lordx64): the graft technique, container, training pipeline, and the persistence, capability, and classifier-recall measurements cited here (their §§6.9–6.11), on their stack (Qwen3-4B dense, MPS/bf16). hf2q implements an independent Rust reader/splice; their numbers are their evidence, not hf2q's.
+[^23]: hf2q graft canary manifest, 2026-09-22, Qwen3.6-35B-Abliterix-APEX Q5_K_M: zero-slot byte-identity, live-bank divergence, disable-restore, configuration-matched arms. Harness: `scripts/graft_probe/canary.sh`. Participation is proven; behavioral effect is not — that requires a phantom-kv-derived bank and the paired-arm protocol.
+[^24]: Laya — Convai Innovations: the typed-decisions concept, weights, RLCD training, and calibration. laya-mlx (mizorewww): the MLX port whose 63/63 × FP32/FP16 parity fixtures are ADR-060's shipping gate. hf2q's decision head is a design record with defined gates, not a shipped surface.

@@ -1018,6 +1018,7 @@ impl Qwen35Model {
             output_norm,
             mtp: None,
             glp: None,
+            kv_graft: None,
             #[cfg(test)]
             loaded_candidate_identity: None,
         })

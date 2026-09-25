@@ -391,6 +391,54 @@ impl Qwen35LoadedModel {
             model.glp = Some(bound);
         }
 
+        // ADR-059: bind a KV-cache graft when the operator supplied one.
+        // Fail-closed: reader conformance, checkpoint identity, site
+        // coverage, GQA geometry, or RoPE-identity errors abort the serve
+        // load rather than silently serving ungrafted. The bank is
+        // host-side until spliced at slot admission; the identity hash
+        // participates in LCP cache keys from this build on.
+        if let Some(graft_path) = opts.kv_graft_path.as_ref() {
+            anyhow::ensure!(
+                opts.kv_persist_dir.is_none(),
+                "KV graft + typed persistent-KV is not supported in this build \
+                 (ADR-059: disk snapshots exclude the graft region; the \
+                 graft-aware disk codec lands after the in-memory path \
+                 proves out); refusing to start with both --kv-graft and \
+                 --kv-persist"
+            );
+            let (bank, compatibility) = crate::inference::graft::validate_graft_for_model(
+                graft_path,
+                model_path,
+                &gguf,
+            )
+            .with_context(|| format!("KV graft bind: {}", graft_path.display()))?;
+            if compatibility != crate::inference::glp::Compatibility::Checkpoint {
+                tracing::warn!(
+                    ?compatibility,
+                    "KV graft does not declare a verified checkpoint revision; \
+                     behavior requires validation"
+                );
+            }
+            let bound = crate::inference::graft::BoundGraft::bind(bank);
+            tracing::info!(
+                layers = bound.bank.layers.len(),
+                n_slots = bound.bank.n_slots,
+                n_kv_heads = bound.bank.n_kv_heads,
+                head_dim = bound.bank.head_dim,
+                kind = ?bound.bank.kind,
+                site = bound.bank.hook_point.as_str(),
+                rope_theta = bound.bank.rope_theta,
+                rotary_dim = bound.bank.rotary_dim,
+                identity_hash = bound.identity_hash,
+                path = %graft_path.display(),
+                "KV graft bound to Qwen35 (spliced at slot admission; \
+                 grafted serving is gated until the request-path position \
+                 wiring lands — grafted requests fail closed with a named \
+                 error, never silently ungrafted)"
+            );
+            model.kv_graft = Some(bound);
+        }
+
         if let Some(context) = effective_context {
             model.cfg.max_position_embeddings = context;
         }
@@ -1406,7 +1454,15 @@ fn requested_kv_cache_capacity(
     prompt_len: usize,
     max_tokens: usize,
 ) -> usize {
-    (prompt_len + max_tokens + 64)
+    // ADR-059: a bound graft occupies physical positions 0..n_slots —
+    // the capacity must cover it on top of the request budget.
+    let graft = qwen
+        .model
+        .kv_graft
+        .as_ref()
+        .map(|g| g.n_slots() as usize)
+        .unwrap_or(0);
+    (prompt_len + max_tokens + 64 + graft)
         .max(128)
         .min(qwen.model.cfg.max_position_embeddings as usize)
 }
@@ -1651,7 +1707,10 @@ fn build_lcp_key_for_qwen35(
         source_sha256,
         &chat_template_hash,
     );
-    let params_hash = glp_steering_params_hash(qwen.model.glp.as_ref());
+    let params_hash = steering_and_graft_params_hash(
+        qwen.model.glp.as_ref(),
+        qwen.model.kv_graft.as_ref().map(|g| &g.bank),
+    );
     crate::serve::kv_persist::lcp_registry::LcpKey {
         model_fingerprint: fp,
         tenant_id: String::new(),
@@ -1685,6 +1744,25 @@ fn glp_steering_params_hash(glp: Option<&crate::inference::glp::BoundGlp>) -> u6
             }
         }
     }
+    let digest = h.finalize();
+    u64::from_le_bytes(digest[..8].try_into().expect("sha256 prefix"))
+}
+
+/// ADR-059: combined activation-affecting identity — GLP steering AND
+/// the KV graft. A grafted server's saved KV must never be addressed by
+/// an ungrafted or differently-grafted one, exactly as S6 established
+/// for steering; the graft contributes its own section so either
+/// configuration change rebuilds the key. Unconfigured engines hash the
+/// same "none/none" pair and keep the v1 key shape.
+fn steering_and_graft_params_hash(
+    glp: Option<&crate::inference::glp::BoundGlp>,
+    graft: Option<&crate::inference::graft::GraftBank>,
+) -> u64 {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"steering=v1");
+    h.update(&glp_steering_params_hash(glp).to_le_bytes());
+    h.update(&crate::inference::graft::graft_params_hash(graft).to_le_bytes());
     let digest = h.finalize();
     u64::from_le_bytes(digest[..8].try_into().expect("sha256 prefix"))
 }
@@ -1850,9 +1928,18 @@ fn store_qwen35_latest_turn_checkpoint(
     capture_index: Option<usize>,
 ) {
     let snapshot_started = Instant::now();
+    // ADR-059: graft-aware boundary — the snapshot's first `graft_len`
+    // physical positions are graft rows and must survive the round trip.
+    // Token slicing (`prompt_tokens[..anchor]`) stays token-based.
+    let graft_len = qwen
+        .model
+        .kv_graft
+        .as_ref()
+        .map(|g| g.n_slots() as usize)
+        .unwrap_or(0);
     let snapshot_result = match capture_index {
-        Some(index) => kv_cache.snapshot_prefix_from_capture(device, anchor, index),
-        None => kv_cache.snapshot_prefix(device, anchor),
+        Some(index) => kv_cache.snapshot_prefix_from_capture(device, graft_len + anchor, index),
+        None => kv_cache.snapshot_prefix(device, graft_len + anchor),
     };
     match snapshot_result {
         Ok(snapshot) => {
@@ -2037,6 +2124,18 @@ fn generate_qwen35_once_ordinary(
     // cfg-subdir is empty.
     qwen.hydrate_lcp_registry_from_disk(&kv_cache, &device);
 
+    // ADR-059: the graft region length for this engine (0 = ungrafted).
+    // Computed once; every position computation, snapshot/restore
+    // boundary, and the decode base below shift by it. The physical
+    // splice happens after the cold-miss reset (below) — restores bring
+    // the graft rows back inside their snapshot bytes.
+    let graft_len: usize = qwen
+        .model
+        .kv_graft
+        .as_ref()
+        .map(|g| g.n_slots() as usize)
+        .unwrap_or(0);
+
     // ── Prompt-cache fast-path ────────────────────────────────────
     let prompt_cache_hit = qwen.prompt_cache.try_match(prompt_tokens, params).is_some();
 
@@ -2144,9 +2243,21 @@ fn generate_qwen35_once_ordinary(
             ) {
                 let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
                 let restore_start = Instant::now();
+                // ADR-059: graft-aware boundary — the snapshot's first
+                // `graft_len` physical positions are graft rows; the
+                // cursor must land at graft_len + prefix.k.
                 kv_cache
-                    .restore_partial(snapshot, prefix.k)
+                    .restore_partial(snapshot, graft_len + prefix.k)
                     .context("qwen35 lcp_registry restore_partial")?;
+                // A capacity-growth replacement cache lost its region
+                // tag; the restored rows re-establish it.
+                if graft_len > 0
+                    && kv_cache.graft_region_for_slot(SlotId(0)).unwrap_or(0) == 0
+                {
+                    kv_cache
+                        .mark_graft_region_for_slot(SlotId(0), graft_len as u32)
+                        .context("re-mark graft region after LCP restore")?;
+                }
                 let restore_ms = restore_start.elapsed().as_micros() as f64 / 1000.0;
                 lcp_resume_start = prefix.k;
                 let checkpoint = if chunk_pos == 0 {
@@ -2173,6 +2284,22 @@ fn generate_qwen35_once_ordinary(
         kv_cache.reset();
     }
 
+    // ADR-059: splice the graft into a fresh/reset cache before prefill.
+    // Restores (prompt-cache hit / LCP resume above) bring the graft
+    // rows back inside their snapshot bytes and set the graft-aware
+    // cursor; the splice runs ONLY on the cold path (a splice into a
+    // restored cache would be a double-splice error by contract).
+    if graft_len > 0 && !prompt_cache_hit && lcp_resume_start == 0 {
+        let bound = qwen
+            .model
+            .kv_graft
+            .as_ref()
+            .expect("graft_len > 0 implies a bound graft");
+        kv_cache
+            .splice_graft_for_slot(SlotId(0), &bound.bank)
+            .context("KV graft splice at cold-cache admission")?;
+    }
+
     let prefill_start = Instant::now();
     let mut next_token: u32;
     if prompt_cache_hit {
@@ -2181,9 +2308,18 @@ fn generate_qwen35_once_ordinary(
             .prompt_cache
             .snapshot()
             .expect("try_match returned Some implies snapshot Some");
+        // ADR-059: graft-aware boundary — the snapshot carries the graft
+        // rows in its first `graft_len` physical positions.
         kv_cache
-            .restore_partial(snap, prompt_len)
+            .restore_partial(snap, graft_len + prompt_len)
             .context("prompt_cache restore_partial")?;
+        // A capacity-growth replacement cache lost its region tag; the
+        // restored rows re-establish it.
+        if graft_len > 0 && kv_cache.graft_region_for_slot(SlotId(0)).unwrap_or(0) == 0 {
+            kv_cache
+                .mark_graft_region_for_slot(SlotId(0), graft_len as u32)
+                .context("re-mark graft region after prompt-cache restore")?;
+        }
         next_token = qwen.prompt_cache.first_decoded_token();
         tracing::debug!(
             "qwen35 prompt_cache: HIT — {} tokens; prefill skipped",
@@ -2283,7 +2419,7 @@ fn generate_qwen35_once_ordinary(
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
             for axis in 0..4 {
                 for token in 0..suffix_len {
-                    suffix_positions[axis * suffix_len + token] = (lcp_resume_start + token) as i32;
+                    suffix_positions[axis * suffix_len + token] = (graft_len + lcp_resume_start + token) as i32;
                 }
             }
             let position_build_ms = position_build_start.elapsed().as_secs_f64() * 1000.0;
@@ -2338,7 +2474,7 @@ fn generate_qwen35_once_ordinary(
             let mut prefix_positions = vec![0i32; 4 * prefix_len];
             for axis in 0..4 {
                 for token in 0..prefix_len {
-                    prefix_positions[axis * prefix_len + token] = (lcp_resume_start + token) as i32;
+                    prefix_positions[axis * prefix_len + token] = (graft_len + lcp_resume_start + token) as i32;
                 }
             }
             supervised_gpu_call(supervisor, "qwen35_serial_prefill", || {
@@ -2367,7 +2503,7 @@ fn generate_qwen35_once_ordinary(
             let mut tail_positions = vec![0i32; 4 * tail_len];
             for axis in 0..4 {
                 for token in 0..tail_len {
-                    tail_positions[axis * tail_len + token] = (recovery_anchor + token) as i32;
+                    tail_positions[axis * tail_len + token] = (graft_len + recovery_anchor + token) as i32;
                 }
             }
             eprintln!(
@@ -2430,7 +2566,7 @@ fn generate_qwen35_once_ordinary(
                 let mut chunk_positions = vec![0i32; 4 * chunk_seq_len];
                 for axis in 0..4 {
                     for t in 0..chunk_seq_len {
-                        chunk_positions[axis * chunk_seq_len + t] = (k_start + t) as i32;
+                        chunk_positions[axis * chunk_seq_len + t] = (graft_len + k_start + t) as i32;
                     }
                 }
                 let logits = supervised_gpu_call(
@@ -2495,7 +2631,9 @@ fn generate_qwen35_once_ordinary(
                     && !superseded_by_recovery_anchor
                     && !mid_store_disabled
                 {
-                    match kv_cache.snapshot_prefix(&device, k_end) {
+                    // ADR-059: graft-aware boundary — snapshot the
+                    // graft rows plus the prompt prefix.
+                    match kv_cache.snapshot_prefix(&device, graft_len + k_end) {
                         Ok(snap) => {
                             let chunk_key = build_lcp_key_for_qwen35_chunk(qwen, params, k_end);
                             let linear_capacity = kv_cache
@@ -2548,7 +2686,7 @@ fn generate_qwen35_once_ordinary(
                 let mut tail_positions = vec![0i32; 4 * tail_len];
                 for axis in 0..4 {
                     for token in 0..tail_len {
-                        tail_positions[axis * tail_len + token] = (recovery_anchor + token) as i32;
+                        tail_positions[axis * tail_len + token] = (graft_len + recovery_anchor + token) as i32;
                     }
                 }
                 eprintln!(
@@ -2585,7 +2723,7 @@ fn generate_qwen35_once_ordinary(
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
             for axis in 0..4 {
                 for t in 0..suffix_len {
-                    suffix_positions[axis * suffix_len + t] = (lcp_resume_start + t) as i32;
+                    suffix_positions[axis * suffix_len + t] = (graft_len + lcp_resume_start + t) as i32;
                 }
             }
             eprintln!(
@@ -2604,7 +2742,9 @@ fn generate_qwen35_once_ordinary(
                     .context("Qwen35Model::forward_gpu_last_logits (LCP resume suffix)")
             })?
         } else {
-            let positions = prefill_positions_for(prompt_len);
+            // ADR-059: cold monolithic prefill — positions shift by the
+            // graft region (graft at 0..graft_len, prompt at graft_len..).
+            let positions = prefill_positions_from(graft_len, prompt_len);
             supervised_gpu_call(supervisor, "qwen35_serial_prefill", || {
                 qwen.model
                     .forward_gpu_last_logits(prompt_tokens, &positions, &mut kv_cache, SlotId(0))
@@ -2675,7 +2815,9 @@ fn generate_qwen35_once_ordinary(
         if is_greedy {
             // Snapshot 1: prompt_cache (full-equality replay, Phase E.b).
             let prompt_snapshot_start = Instant::now();
-            match kv_cache.snapshot_prefix(&device, prompt_len) {
+            // ADR-059: graft-aware boundary — the replay snapshot
+            // carries the graft rows in its first graft_len positions.
+            match kv_cache.snapshot_prefix(&device, graft_len + prompt_len) {
                 Ok(snap) => {
                     let snapshot_bytes = snap.total_bytes();
                     qwen.prompt_cache
@@ -2734,7 +2876,8 @@ fn generate_qwen35_once_ordinary(
         qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
     } else {
         for step in 1..max_tokens {
-            let pos = (prompt_len + step - 1) as i32;
+            // ADR-059: decode positions shift by the graft region.
+            let pos = (graft_len + prompt_len + step - 1) as i32;
             // Bound check on the KV cache.  The alloc helper sized
             // `max_seq` to cover the full request; if the iter overshoots
             // (e.g. caller stretched max_tokens between the alloc and
@@ -2909,6 +3052,26 @@ fn generate_qwen35_once_ordinary(
 /// grammar-constrained, logprob, or biased request is routed to the ordinary
 /// decoder. A future sampler lane can broaden `is_greedy_eligible` only after
 /// it proves that proposal and target distributions are identical.
+/// ADR-059 fail-closed request gate for the paths that are NOT
+/// graft-wired: vision/soft-token/deepstack generation (unary and
+/// slot-aware), embeddings, and the legacy N=1 slot-aware unary
+/// reference. The grafted paths — serial unary, serial text streaming,
+/// and the SlotAware continuous-batching loop (splice at cold
+/// admission, graft-shifted RoPE positions, graft-aware anchors) — do
+/// not call this. A bound graft changes what cache bytes mean; an
+/// unwired path refuses requests BY NAME rather than serving
+/// ungrafted — the `glp.mode` fail-closed discipline applied to
+/// serving. Ungrafted engines pass unchanged.
+pub(super) fn ensure_graft_serving_supported(qwen: &Qwen35LoadedModel) -> Result<()> {
+    anyhow::ensure!(
+        qwen.model.kv_graft.is_none(),
+        "KV graft bound but grafted serving is not enabled in this build \
+         (ADR-059 request-path wiring pending: position offsets, serial \
+         cache admission, prompt-cache/LCP restore semantics); refusing \
+         rather than serving ungrafted"
+    );
+    Ok(())
+}
 pub(super) fn generate_qwen35_once(
     qwen: &mut Qwen35LoadedModel,
     prompt_tokens: &[u32],
@@ -2924,6 +3087,19 @@ pub(super) fn generate_qwen35_once(
         qwen.model.mtp.is_some(),
         qwen.prompt_cache.try_match(prompt_tokens, params).is_some(),
     );
+
+    // ADR-059: native MTP runs on its own internal fresh cache — under a
+    // bound graft its target logits would verify drafts against the
+    // ungrafted distribution. Skip speculation (an optimization, never a
+    // semantic path) and serve through the ordinary grafted decode.
+    if qwen.model.kv_graft.is_some() && decision == QwenSpeculationDecision::Eligible {
+        tracing::info!(
+            target: "hf2q::serve::api::engine_qwen35::graft",
+            "KV graft bound: skipping native MTP (spec-decode cache is not \
+             graft-wired); serving via ordinary grafted decode"
+        );
+        decision = QwenSpeculationDecision::RuntimeUnavailable;
+    }
 
     if decision == QwenSpeculationDecision::Eligible {
         match generate_qwen35_once_mtp(qwen, prompt_tokens, params, registration) {
@@ -3159,6 +3335,7 @@ pub fn generate_qwen35_once_slot_aware(
     kv_cache: &mut HybridKvCache,
     slot_id: SlotId,
 ) -> Result<GenerationResult> {
+    ensure_graft_serving_supported(qwen)?;
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "generate_qwen35_once_slot_aware: empty prompt_tokens"
@@ -3711,6 +3888,10 @@ pub(crate) struct Qwen35PrefillState {
     params: SamplingParams,
     cached_tokens: usize,
     next_token_index: usize,
+    /// ADR-059: physical positions `0..graft_len` hold the spliced graft
+    /// bank for this slot; every RoPE position and every physical cursor
+    /// in this prefill is offset by it. Zero = ungrafted.
+    graft_len: usize,
     cached_prefill_logits: Option<Vec<f32>>,
     stable_prompt_prefix_tokens: Option<usize>,
     vision: Option<Qwen35VisionPrefillData>,
@@ -3764,6 +3945,7 @@ impl Qwen35PrefillState {
         cached_spec: Option<Qwen35SpecPrefixBoundary>,
         vision: Option<Qwen35VisionPrefillData>,
         hidden_size: usize,
+        graft: Option<&crate::inference::graft::BoundGraft>,
     ) -> Result<Self> {
         anyhow::ensure!(
             !prompt_tokens.is_empty(),
@@ -3786,6 +3968,14 @@ impl Qwen35PrefillState {
             (cached_tokens == prompt_len) == cached_prefill_logits.is_some(),
             "Qwen35PrefillState::begin: a full-prompt cache hit requires prompt-boundary logits, and partial/cold prefill must not supply them"
         );
+        // ADR-059: extension (vision soft-token / deepstack) prefill is not
+        // graft-wired; the admission path refuses it by name before here,
+        // and this re-check keeps `begin` self-contained for any caller.
+        anyhow::ensure!(
+            vision.is_none() || graft.is_none(),
+            "KV graft bound but Qwen35 vision prefill is not graft-wired \
+             (ADR-059); refusing rather than serving ungrafted"
+        );
         if let Some(spec) = cached_spec.as_ref() {
             anyhow::ensure!(
                 spec.token_count == cached_tokens,
@@ -3800,18 +3990,24 @@ impl Qwen35PrefillState {
                 .validate_speculative_cursors_for_slot(slot_id, cached_tokens)
                 .context("Qwen cached speculative boundary cursor equality")?;
         }
+        // ADR-059: a bound graft occupies physical positions 0..n_slots of
+        // every covered full-attention layer, so the per-request capacity
+        // must cover it too.
+        let graft_len = graft.map(|bound| bound.bank.n_slots as usize).unwrap_or(0);
         let max_tokens = params.max_tokens.max(1);
         let need_seq = prompt_len
-            .checked_add(max_tokens)
+            .checked_add(graft_len)
+            .and_then(|tokens| tokens.checked_add(max_tokens))
             .and_then(|tokens| tokens.checked_add(64))
             .context("Qwen35PrefillState::begin: prompt + completion capacity overflow")?;
         anyhow::ensure!(
             need_seq <= kv_cache.max_seq_len as usize,
-            "Qwen35PrefillState::begin: per-request need_seq={} exceeds persistent cache max_seq_len={} (slot={} prompt_len={} max_tokens={})",
+            "Qwen35PrefillState::begin: per-request need_seq={} exceeds persistent cache max_seq_len={} (slot={} prompt_len={} graft_len={} max_tokens={})",
             need_seq,
             kv_cache.max_seq_len,
             slot_id.0,
             prompt_len,
+            graft_len,
             max_tokens,
         );
 
@@ -3830,9 +4026,38 @@ impl Qwen35PrefillState {
             kv_cache
                 .reset_for_slot(slot_id)
                 .context("ADR-040 full-context slots: Qwen35 cold reset_for_slot at entry")?;
+            // ADR-059: splice the graft into the freshly reset slot before
+            // the first prefill chunk — fabricated history at physical
+            // positions 0..n_slots, cursor lands at graft_len. Warm paths
+            // (anchor restore / retained prefix) already carry the rows.
+            if let Some(bound) = graft {
+                kv_cache
+                    .splice_graft_for_slot(slot_id, &bound.bank)
+                    .context("Qwen35 SlotAware cold-admission KV graft splice")?;
+            }
+        } else {
+            // ADR-059 warm-path invariant: the graft rows must already be
+            // present below the retained cursor (append-only rows survive
+            // anchor restore and live-prefix reuse; only `reset_for_slot`
+            // drops them, and a reset clears the retained prefix/anchor so
+            // this branch is unreachable without them). Fail closed if the
+            // region tag is missing rather than serving ungrafted.
+            if graft_len > 0 {
+                let marked = kv_cache
+                    .graft_region_for_slot(slot_id)
+                    .context("Qwen35 warm-admission graft region read")?;
+                anyhow::ensure!(
+                    marked as usize == graft_len,
+                    "Qwen35 warm admission for slot {} found graft region {} != \
+                     bank n_slots {graft_len}; the graft rows are not provably \
+                     intact — refusing rather than serving ungrafted",
+                    slot_id.0,
+                    marked
+                );
+            }
         }
         kv_cache
-            .validate_sequence_len_for_slot(slot_id, cached_tokens)
+            .validate_sequence_len_for_slot(slot_id, graft_len + cached_tokens)
             .context("Qwen35PrefillState::begin: validate cache/ledger boundary")?;
 
         let stable_prompt_prefix_tokens = params
@@ -3845,6 +4070,7 @@ impl Qwen35PrefillState {
             params,
             cached_tokens,
             next_token_index: cached_tokens,
+            graft_len,
             cached_prefill_logits,
             stable_prompt_prefix_tokens,
             vision,
@@ -3878,7 +4104,10 @@ impl Qwen35PrefillState {
                 "Qwen35PrefillState::advance requires a non-zero chunk"
             );
             kv_cache
-                .validate_sequence_len_for_slot(self.slot_id, self.next_token_index)
+                .validate_sequence_len_for_slot(
+                    self.slot_id,
+                    self.graft_len + self.next_token_index,
+                )
                 .context("validate Qwen35 slot cursors before bounded prefill")?;
             let end = qwen35_next_prefill_end(
                 self.next_token_index,
@@ -3897,16 +4126,26 @@ impl Qwen35PrefillState {
                 .as_ref()
                 .map(|vision| vision.chunk(self.next_token_index, end, qwen.hidden_size))
                 .transpose()?;
+            // ADR-059: the graft occupies physical positions 0..graft_len, so
+            // every RoPE position in the chunk shifts by graft_len. Vision
+            // chunks never reach here under a graft (refused at admission).
             let positions = vision_chunk
                 .as_ref()
                 .and_then(|vision| vision.positions_flat.clone())
-                .unwrap_or_else(|| prefill_positions_from(self.next_token_index, chunk.len()));
+                .unwrap_or_else(|| {
+                    prefill_positions_from(self.graft_len + self.next_token_index, chunk.len())
+                });
             let chunk_started = Instant::now();
             let lease =
                 supervisor.arm("Qwen35 bounded prefill", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
             let mtp_prefill = (self.cached_tokens == 0 || self.mtp_pending_hidden.is_some())
                 && !self.speculation_unavailable
                 && self.vision.is_none()
+                // ADR-059: the MTP cache is a separate slot arena that never
+                // receives the graft; under a bound graft its target logits
+                // would verify drafts against the ungrafted distribution.
+                // Skip the catch-up (an optimization, never a semantic path).
+                && qwen.model.kv_graft.is_none()
                 && qwen.speculation.policy()
                     == super::qwen35_speculation::QwenSpeculationPolicy::Auto
                 && is_qwen_server_speculation_exact_eligible(&self.params)
@@ -4043,7 +4282,7 @@ impl Qwen35PrefillState {
             let logits = forward
                 .context("Qwen35Model::forward_gpu_last_logits (slot-aware bounded prefill)")?;
             kv_cache
-                .validate_sequence_len_for_slot(self.slot_id, end)
+                .validate_sequence_len_for_slot(self.slot_id, self.graft_len + end)
                 .context("validate Qwen35 slot cursors after bounded prefill")?;
             tracing::info!(
                 slot = self.slot_id.0,
@@ -4066,8 +4305,12 @@ impl Qwen35PrefillState {
                         });
                 Some(Qwen35StablePromptCheckpoint {
                     prompt_tokens: self.prompt_tokens[..end].to_vec(),
+                    // ADR-059: the anchor's boundary is the PHYSICAL cursor
+                    // (graft rows + prompt rows). `restore_slot_anchor`
+                    // rewinds to exactly this cursor and the graft rows
+                    // below it are intact by the append-only contract.
                     kv: kv_cache
-                        .snapshot_slot_anchor(self.slot_id, end)
+                        .snapshot_slot_anchor(self.slot_id, self.graft_len + end)
                         .context("capture Qwen35 stable prompt boundary")?,
                     prefill_logits: logits.clone(),
                     vision_fingerprint: self.params.vision_fingerprint,
@@ -4088,11 +4331,13 @@ impl Qwen35PrefillState {
         }
 
         let prefill_duration = self.prefill_started.elapsed();
+        // ADR-059: decode positions continue after graft rows + prompt rows.
+        // (Vision never reaches here under a graft — refused at admission.)
         let decode_position_base = self
             .vision
             .as_ref()
             .map(|vision| vision.decode_position_base(self.prompt_tokens.len()))
-            .unwrap_or(self.prompt_tokens.len());
+            .unwrap_or(self.graft_len + self.prompt_tokens.len());
         let mtp_hidden = mtp_hidden.or_else(|| self.mtp_pending_hidden.take());
         let state = Qwen35DecodeState::from_prefill_logits(
             qwen,
@@ -6943,6 +7188,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
     if soft_tokens.is_empty() {
         return generate_qwen35_once(qwen, prompt_tokens, params, registration, supervisor);
     }
+    ensure_graft_serving_supported(qwen)?;
 
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
@@ -7207,6 +7453,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     if soft_tokens.is_empty() && deepstack.is_none() && positions_flat.is_none() {
         return generate_qwen35_once(qwen, prompt_tokens, params, registration, supervisor);
     }
+    ensure_graft_serving_supported(qwen)?;
 
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
@@ -7670,6 +7917,17 @@ pub(super) fn generate_stream_qwen35_once_extended(
         }
     }
 
+    // ADR-059 fail-closed gate: TEXT streaming serves grafted requests
+    // (graft wiring below); extension (vision soft-token / deepstack)
+    // streaming is not graft-wired and refuses by name rather than
+    // serving ungrafted.
+    if has_extension {
+        if let Err(error) = ensure_graft_serving_supported(qwen) {
+            send!(GenerationEvent::Error(format!("{error:#}")));
+            return Ok(SerialStreamEnd::TerminalSent);
+        }
+    }
+
     let cache_alloc_start = Instant::now();
     let device = match MlxDevice::new() {
         Ok(d) => d,
@@ -7700,6 +7958,17 @@ pub(super) fn generate_stream_qwen35_once_extended(
     // Idempotent + cheap on hot path; warn-logs + swallows persistence
     // failures so the request still proceeds.
     qwen.hydrate_lcp_registry_from_disk(&kv_cache, &device);
+
+    // ADR-059: the graft region length for this engine (0 = ungrafted).
+    // Text streaming shifts every position, snapshot/restore boundary,
+    // and the decode base by it; the splice happens at cold-cache
+    // admission below (restores bring the graft rows back instead).
+    let graft_len: usize = qwen
+        .model
+        .kv_graft
+        .as_ref()
+        .map(|g| g.n_slots() as usize)
+        .unwrap_or(0);
 
     let pre_dispatches = mlx_native::dispatch_count();
     let pre_syncs = mlx_native::sync_count();
@@ -7767,8 +8036,19 @@ pub(super) fn generate_stream_qwen35_once_extended(
             ) {
                 let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
                 let restore_start = Instant::now();
-                if let Err(e) = kv_cache.restore_partial(snapshot, prefix.k) {
+                // ADR-059: graft-aware boundary — the snapshot's first
+                // `graft_len` physical positions are graft rows.
+                if let Err(e) = kv_cache.restore_partial(snapshot, graft_len + prefix.k) {
                     return Err(e).context("Qwen35 SerialFifo streaming LCP checkpoint restore");
+                }
+                if graft_len > 0
+                    && kv_cache.graft_region_for_slot(SlotId(0)).unwrap_or(0) == 0
+                {
+                    if let Err(e) =
+                        kv_cache.mark_graft_region_for_slot(SlotId(0), graft_len as u32)
+                    {
+                        return Err(e).context("re-mark graft region after streaming LCP restore");
+                    }
                 }
                 let restore_ms = restore_start.elapsed().as_micros() as f64 / 1000.0;
                 lcp_resume_start = prefix.k;
@@ -7796,6 +8076,21 @@ pub(super) fn generate_stream_qwen35_once_extended(
         kv_cache.reset();
     }
 
+    // ADR-059: splice the graft into a fresh/reset cache before prefill
+    // (cold path only — restores above bring the graft rows back inside
+    // their snapshot bytes; a splice into a restored cache is a
+    // double-splice error by contract).
+    if graft_len > 0 && !prompt_cache_hit && lcp_resume_start == 0 {
+        let bound = qwen
+            .model
+            .kv_graft
+            .as_ref()
+            .expect("graft_len > 0 implies a bound graft");
+        if let Err(e) = kv_cache.splice_graft_for_slot(SlotId(0), &bound.bank) {
+            return Err(e).context("KV graft splice at streaming cold-cache admission");
+        }
+    }
+
     let prefill_start = Instant::now();
     let mut next_token: u32;
     if prompt_cache_hit {
@@ -7803,8 +8098,15 @@ pub(super) fn generate_stream_qwen35_once_extended(
             .prompt_cache
             .snapshot()
             .expect("try_match Some implies snapshot Some");
-        if let Err(e) = kv_cache.restore_partial(snap, prompt_len) {
+        // ADR-059: graft-aware boundary — the snapshot carries the graft
+        // rows in its first `graft_len` physical positions.
+        if let Err(e) = kv_cache.restore_partial(snap, graft_len + prompt_len) {
             return Err(e).context("Qwen35 SerialFifo streaming prompt-cache restore");
+        }
+        if graft_len > 0 && kv_cache.graft_region_for_slot(SlotId(0)).unwrap_or(0) == 0 {
+            if let Err(e) = kv_cache.mark_graft_region_for_slot(SlotId(0), graft_len as u32) {
+                return Err(e).context("re-mark graft region after streaming prompt-cache restore");
+            }
         }
         next_token = qwen.prompt_cache.first_decoded_token();
         tracing::debug!(
@@ -7818,7 +8120,9 @@ pub(super) fn generate_stream_qwen35_once_extended(
         let positions_slice: &[i32] = match positions_flat {
             Some(p) => p,
             None => {
-                positions_owned = prefill_positions_for(prompt_len);
+                // ADR-059: cold text prefill — positions shift by the
+                // graft region (graft at 0..graft_len, prompt after).
+                positions_owned = prefill_positions_from(graft_len, prompt_len);
                 &positions_owned
             }
         };
@@ -7880,7 +8184,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
             for axis in 0..4 {
                 for token in 0..suffix_len {
-                    suffix_positions[axis * suffix_len + token] = (lcp_resume_start + token) as i32;
+                    suffix_positions[axis * suffix_len + token] = (graft_len + lcp_resume_start + token) as i32;
                 }
             }
             match supervised_gpu_call(supervisor, "qwen35_serial_stream_prefill", || {
@@ -7918,7 +8222,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut prefix_positions = vec![0i32; 4 * prefix_len];
             for axis in 0..4 {
                 for token in 0..prefix_len {
-                    prefix_positions[axis * prefix_len + token] = (lcp_resume_start + token) as i32;
+                    prefix_positions[axis * prefix_len + token] = (graft_len + lcp_resume_start + token) as i32;
                 }
             }
             if let Err(error) =
@@ -7949,7 +8253,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut tail_positions = vec![0i32; 4 * tail_len];
             for axis in 0..4 {
                 for token in 0..tail_len {
-                    tail_positions[axis * tail_len + token] = (recovery_anchor + token) as i32;
+                    tail_positions[axis * tail_len + token] = (graft_len + recovery_anchor + token) as i32;
                 }
             }
             eprintln!(
@@ -7990,7 +8294,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 let mut chunk_positions = vec![0i32; 4 * chunk_seq_len];
                 for axis in 0..4 {
                     for t in 0..chunk_seq_len {
-                        chunk_positions[axis * chunk_seq_len + t] = (k_start + t) as i32;
+                        chunk_positions[axis * chunk_seq_len + t] = (graft_len + k_start + t) as i32;
                     }
                 }
                 let res =
@@ -8042,7 +8346,9 @@ pub(super) fn generate_stream_qwen35_once_extended(
                     && !superseded_by_recovery_anchor
                     && !mid_store_disabled
                 {
-                    match kv_cache.snapshot_prefix(&device, k_end) {
+                    // ADR-059: graft-aware boundary — snapshot the
+                    // graft rows plus the prompt prefix.
+                    match kv_cache.snapshot_prefix(&device, graft_len + k_end) {
                         Ok(snap) => {
                             let chunk_key = build_lcp_key_for_qwen35_chunk(qwen, params, k_end);
                             let linear_capacity = kv_cache
@@ -8095,7 +8401,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 let mut tail_positions = vec![0i32; 4 * tail_len];
                 for axis in 0..4 {
                     for token in 0..tail_len {
-                        tail_positions[axis * tail_len + token] = (recovery_anchor + token) as i32;
+                        tail_positions[axis * tail_len + token] = (graft_len + recovery_anchor + token) as i32;
                     }
                 }
                 eprintln!(
@@ -8121,7 +8427,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
             for axis in 0..4 {
                 for t in 0..suffix_len {
-                    suffix_positions[axis * suffix_len + t] = (lcp_resume_start + t) as i32;
+                    suffix_positions[axis * suffix_len + t] = (graft_len + lcp_resume_start + t) as i32;
                 }
             }
             eprintln!(
@@ -8178,7 +8484,9 @@ pub(super) fn generate_stream_qwen35_once_extended(
         // image embeddings. Generic extension callers without that digest
         // remain ineligible.
         if is_greedy && prompt_cache_eligible {
-            match kv_cache.snapshot_prefix(&device, prompt_len) {
+            // ADR-059: graft-aware boundary — the replay snapshot
+            // carries the graft rows in its first graft_len positions.
+            match kv_cache.snapshot_prefix(&device, graft_len + prompt_len) {
                 Ok(snap) => {
                     qwen.prompt_cache
                         .update(prompt_tokens.to_vec(), snap, next_token, params)
@@ -8229,7 +8537,8 @@ pub(super) fn generate_stream_qwen35_once_extended(
             }
             max_t.saturating_add(1)
         }
-        None => prompt_len as i32,
+        // ADR-059: text decode base shifts by the graft region.
+        None => (graft_len + prompt_len) as i32,
     };
 
     // ── Splitter wiring (Reasoning + ToolCall) ────────────────────
@@ -8737,6 +9046,7 @@ pub(super) fn embed_qwen35(
     prompt_tokens: &[u32],
     supervisor: &EngineSupervisor,
 ) -> Result<Vec<f32>> {
+    ensure_graft_serving_supported(qwen)?;
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "embed_qwen35: empty prompt_tokens"
@@ -8875,6 +9185,7 @@ pub fn embed_qwen35_slot_aware(
     kv_cache: &mut HybridKvCache,
     slot_id: SlotId,
 ) -> Result<Vec<f32>> {
+    ensure_graft_serving_supported(qwen)?;
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "embed_qwen35_slot_aware: empty prompt_tokens"
@@ -9065,6 +9376,7 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
             slot_id,
         );
     }
+    ensure_graft_serving_supported(qwen)?;
 
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
@@ -9949,6 +10261,203 @@ mod tests {
         ));
     }
 
+    /// ADR-059 SlotAware admission: a complete-coverage bank for the
+    /// {3} full-attn set of `moe_cfg_40layer_for_cache_test` (4 layers,
+    /// interval 4 → only layer 3 is full-attention; 2 KV heads, dim 16).
+    fn slotaware_graft_bound(n_slots: u32) -> crate::inference::graft::BoundGraft {
+        use crate::inference::graft::{
+            BoundGraft, GraftHookPoint, GraftKind, GraftLayerKv, GraftMode,
+        };
+        let heads = 2usize;
+        let head_dim = 16usize;
+        let n = n_slots as usize * heads * head_dim;
+        BoundGraft::bind(crate::inference::graft::GraftBank {
+            mode: GraftMode::SplicePrefix,
+            kind: GraftKind::DirectKv,
+            hook_point: GraftHookPoint::FullAttnKv,
+            n_slots,
+            layers: [(
+                3u32,
+                GraftLayerKv {
+                    k: (0..n).map(|i| i as f32 * 0.25).collect(),
+                    v: (0..n).map(|i| -(i as f32) * 0.5).collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            n_kv_heads: heads,
+            head_dim,
+            rope_theta: 1e7,
+            rotary_dim: 64,
+            position_base: 0,
+            mrope_interleaved: true,
+            content_sha256: None,
+            quant_lane: None,
+        })
+    }
+
+    #[test]
+    fn slotaware_cold_admission_splices_graft_and_shifts_cursor() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = moe_cfg_40layer_for_cache_test();
+        let mut kv = HybridKvCache::new(&cfg, &device, 128, 1).expect("kv");
+        let bound = slotaware_graft_bound(4);
+
+        let state = Qwen35PrefillState::begin(
+            vec![7, 8, 9],
+            greedy_params(),
+            None,
+            &mut kv,
+            SlotId(0),
+            0,
+            None,
+            None,
+            None,
+            cfg.hidden_size as usize,
+            Some(&bound),
+        )
+        .expect("cold grafted admission");
+        assert_eq!(state.graft_len, 4);
+        assert_eq!(
+            kv.sequence_len_for_slot(SlotId(0)).expect("cursor"),
+            4,
+            "the splice occupies physical positions 0..4 and the cursor lands at graft_len"
+        );
+        assert_eq!(kv.graft_region_for_slot(SlotId(0)).unwrap(), 4);
+    }
+
+    #[test]
+    fn slotaware_warm_admission_requires_intact_graft_region() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = moe_cfg_40layer_for_cache_test();
+        let mut kv = HybridKvCache::new(&cfg, &device, 128, 1).expect("kv");
+        let bound = slotaware_graft_bound(4);
+
+        // Establish the grafted prefix exactly as a live retained prefix
+        // would: cold admission (splice) then a warm continuation whose
+        // cached_tokens > 0 must find the region intact.
+        Qwen35PrefillState::begin(
+            vec![7, 8],
+            greedy_params(),
+            None,
+            &mut kv,
+            SlotId(0),
+            0,
+            None,
+            None,
+            None,
+            cfg.hidden_size as usize,
+            Some(&bound),
+        )
+        .expect("cold grafted admission");
+        // Simulate the retained rows: splice leaves the cursor at 4; a
+        // retained-prefix continuation with cached_tokens=2 expects the
+        // physical cursor at graft_len + 2.
+        kv.advance_cursors_for_test(SlotId(0), 2).expect("advance");
+        Qwen35PrefillState::begin(
+            vec![7, 8, 9],
+            greedy_params(),
+            None,
+            &mut kv,
+            SlotId(0),
+            2,
+            None,
+            None,
+            None,
+            cfg.hidden_size as usize,
+            Some(&bound),
+        )
+        .expect("warm admission with intact graft region");
+
+        // A reset drops the graft rows and the tag; a warm continuation
+        // must refuse by name rather than serve ungrafted.
+        kv.reset_for_slot(SlotId(0)).expect("reset");
+        kv.advance_cursors_for_test(SlotId(0), 2).expect("advance");
+        let error = Qwen35PrefillState::begin(
+            vec![7, 8, 9],
+            greedy_params(),
+            None,
+            &mut kv,
+            SlotId(0),
+            2,
+            None,
+            None,
+            None,
+            cfg.hidden_size as usize,
+            Some(&bound),
+        )
+        .map(|_| ())
+        .expect_err("warm admission after reset must fail closed");
+        assert!(
+            format!("{error:#}").contains("graft rows are not provably intact"),
+            "named graft-region failure, got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn slotaware_graft_capacity_includes_graft_rows() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = moe_cfg_40layer_for_cache_test();
+        // max_seq_len 8: a 4-row graft + 3 prompt tokens + 1 max_token + 64
+        // slack cannot fit — the graft rows must be part of the capacity
+        // check, not just the prompt's.
+        let mut kv = HybridKvCache::new(&cfg, &device, 8, 1).expect("kv");
+        let bound = slotaware_graft_bound(4);
+        let error = Qwen35PrefillState::begin(
+            vec![7, 8, 9],
+            greedy_params(),
+            None,
+            &mut kv,
+            SlotId(0),
+            0,
+            None,
+            None,
+            None,
+            cfg.hidden_size as usize,
+            Some(&bound),
+        )
+        .map(|_| ())
+        .expect_err("graft rows must count against per-request capacity");
+        assert!(
+            format!("{error:#}").contains("need_seq=87 exceeds"),
+            "capacity error naming graft_len, got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn slotaware_graft_refuses_vision_prefill() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = moe_cfg_40layer_for_cache_test();
+        let mut kv = HybridKvCache::new(&cfg, &device, 128, 1).expect("kv");
+        let bound = slotaware_graft_bound(4);
+        // A minimal vision prefill data (validated only after the graft
+        // re-check inside begin; any non-None vision triggers it).
+        let vision = Qwen35VisionPrefillData::new(vec![], None, Some(vec![0i32; 4]));
+        let error = Qwen35PrefillState::begin(
+            vec![7],
+            greedy_params(),
+            None,
+            &mut kv,
+            SlotId(0),
+            0,
+            None,
+            None,
+            Some(vision),
+            cfg.hidden_size as usize,
+            Some(&bound),
+        )
+        .map(|_| ())
+        .expect_err("vision prefill under a graft must refuse by name");
+        assert!(
+            format!("{error:#}").contains("vision prefill is not graft-wired"),
+            "named vision refusal, got: {error:#}"
+        );
+    }
+
     #[test]
     fn recovery_capture_plan_is_limited_to_short_non_chunked_suffixes() {
         assert_eq!(
@@ -10337,6 +10846,7 @@ mod tests {
             None,
             None,
             cfg.hidden_size as usize,
+            None,
         ) {
             Ok(_) => panic!("missing-root grammar must fail before bounded prefill"),
             Err(error) => error,
@@ -10631,6 +11141,7 @@ mod tests {
             dwq_overlay_path: None,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
         };
@@ -11224,5 +11735,48 @@ mod glp_cache_identity_tests {
         let none = glp_steering_params_hash(None);
         assert_eq!(none, glp_steering_params_hash(None));
         assert_ne!(none, glp_steering_params_hash(Some(&a)));
+    }
+
+    /// ADR-059 S6 extension: the combined LCP identity must separate
+    /// saved activations across graft configurations — a grafted
+    /// server's KV is never addressable by an ungrafted or
+    /// differently-grafted one, on top of the GLP separation above.
+    #[test]
+    fn graft_configuration_is_part_of_lcp_identity() {
+        use crate::inference::graft::bind::test_bank;
+
+        let glp = bound(
+            GlpHookPoint::ResidualStreamPostLayer,
+            GlpMode::Project,
+            1.0,
+            BTreeMap::from([(3u32, vec![0.5f32, -0.5])]),
+        );
+        let graft_a = test_bank(3, 2, 8, &[3, 7]);
+        let graft_a2 = test_bank(3, 2, 8, &[3, 7]);
+        let graft_other = test_bank(4, 2, 8, &[3, 7]);
+
+        // Same configurations → same key.
+        assert_eq!(
+            steering_and_graft_params_hash(Some(&glp), Some(&graft_a)),
+            steering_and_graft_params_hash(Some(&glp), Some(&graft_a2))
+        );
+
+        // Adding a graft to a steered engine rebuilds the key.
+        assert_ne!(
+            steering_and_graft_params_hash(Some(&glp), None),
+            steering_and_graft_params_hash(Some(&glp), Some(&graft_a))
+        );
+
+        // Changing the graft rebuilds the key.
+        assert_ne!(
+            steering_and_graft_params_hash(Some(&glp), Some(&graft_a)),
+            steering_and_graft_params_hash(Some(&glp), Some(&graft_other))
+        );
+
+        // Unconfigured is stable and distinct from every configured form.
+        let bare = steering_and_graft_params_hash(None, None);
+        assert_eq!(bare, steering_and_graft_params_hash(None, None));
+        assert_ne!(bare, steering_and_graft_params_hash(None, Some(&graft_a)));
+        assert_ne!(bare, steering_and_graft_params_hash(Some(&glp), None));
     }
 }

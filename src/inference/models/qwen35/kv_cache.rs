@@ -909,11 +909,26 @@ pub struct HybridKvCache {
     /// `pub` for symmetry with `n_seqs` / `max_seq_len` (read-only state
     /// derived from constructor inputs).
     pub tq_kv_active: bool,
+    /// ADR-059 — the device handle this cache's buffers live on (a cheap
+    /// `Clone` of the shared device/queue Arc). Stored at allocation so
+    /// cache-side operations that must dispatch Metal work without a
+    /// caller-supplied device — the TQ graft splice's encode pass — can
+    /// do so; every buffer here is already on this device.
+    pub device: MlxDevice,
     /// Capture storage may remain allocated between agentic turns, but the
     /// capture kernels must run only while this flag is set. Keeping activity
     /// separate from allocation avoids re-creating hundreds of megabytes of
     /// per-position DeltaNet buffers on every short cached continuation.
     la_capture_active_tokens: Option<u32>,
+    /// ADR-059 — per-slot graft region length. Positions
+    /// `0..graft_len[slot]` of every full-attention layer are fabricated
+    /// history spliced by [`Self::splice_graft_for_slot`]; `0` = no graft.
+    /// The region is immutable reserved state: truncation floors at it
+    /// ([`Self::truncate_full_attn_to_for_slot`]), fork copies it with the
+    /// slot (`fork_seq`), and dropping the slot releases it (`drop_seq`).
+    /// It is never conversational history — the engine excludes it from
+    /// `retained_prefix` and transcript reconstruction.
+    pub graft_len: Vec<u32>,
 }
 
 /// Resolved slot index for a given model layer.
@@ -1873,7 +1888,9 @@ impl HybridKvCache {
             conv_channels,
             per_layer_slot,
             tq_kv_active,
+            device: device.clone(),
             la_capture_active_tokens: None,
+            graft_len: vec![0; n_seqs as usize],
         })
     }
 
@@ -2061,6 +2078,11 @@ impl HybridKvCache {
                 n_seqs,
             ));
         }
+        // ADR-059: the graft region is immutable reserved state — a
+        // truncate may lower the cursor to the region boundary but never
+        // into it. Ungrafted slots have floor 0 (behavior unchanged).
+        let graft_floor = self.graft_len.get(slot.0 as usize).copied().unwrap_or(0);
+        let new_len = new_len.max(graft_floor);
         for slot_data in self.full_attn.iter_mut() {
             // Defensive shape guard: if a sibling layer disagrees with
             // the canonical n_seqs it's a multi-layer invariant
@@ -2072,6 +2094,498 @@ impl HybridKvCache {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// ADR-059 — graft region length for one physical slot (`0` =
+    /// ungrafted). The region occupies cache positions `0..len` of every
+    /// full-attention layer and is never truncated, compacted, or served
+    /// as conversational history.
+    ///
+    /// Staged primitive per the `multi_seq_kv.rs` iter-1 pattern: tested
+    /// here, glued into the live serve path by the `--kv-graft` engine
+    /// wiring increment.
+    pub fn graft_region_for_slot(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<u32> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "graft_region_for_slot: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        Ok(self.graft_len[slot_idx])
+    }
+
+    /// ADR-059 test support: advance one slot's full-attention cursors by
+    /// `rows` without a forward pass — simulating retained prefix rows
+    /// above a spliced graft for admission-path tests (the serve loop only
+    /// ever advances cursors through real prefill).
+    #[cfg(test)]
+    pub fn advance_cursors_for_test(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        rows: u32,
+    ) -> Result<()> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "advance_cursors_for_test: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        for (rank, full) in self.full_attn.iter_mut().enumerate() {
+            let cursor = full
+                .current_len
+                .get_mut(slot_idx)
+                .ok_or_else(|| anyhow!("advance_cursors_for_test: full_attn[{rank}] cursor missing"))?;
+            *cursor = cursor
+                .checked_add(rows)
+                .ok_or_else(|| anyhow!("advance_cursors_for_test: cursor overflow"))?;
+            anyhow::ensure!(
+                *cursor <= self.max_seq_len,
+                "advance_cursors_for_test: cursor {} exceeds max_seq_len={}",
+                *cursor,
+                self.max_seq_len
+            );
+        }
+        Ok(())
+    }
+
+    /// ADR-059 — splice a graft bank into one physical slot's
+    /// full-attention caches as fabricated history at positions
+    /// `0..n_slots` (the `full_attn_kv` site). Returns the graft length:
+    /// the position offset every subsequent write/read for this slot must
+    /// apply (engine-side wiring; this method owns the cache bytes, the
+    /// cursors, and the region tag only).
+    ///
+    /// Contract (fail-closed, no fallbacks):
+    /// - `bank.hook_point` must be `full_attn_kv` (bind validated the
+    ///   site against the model; re-asserted here).
+    /// - A zero-slot canary bank is a no-op returning `0` — the plumbing
+    ///   canary for the bit-exact no-op gate.
+    /// - The slot must be fresh (every full-attn cursor 0) and ungrafted.
+    ///   Changing or re-applying a graft mid-session requires dropping
+    ///   the slot first: existing KV state retains steering effects
+    ///   (ADR-059 reset semantics).
+    /// - The bank must cover EVERY full-attention layer (validated at
+    ///   bind; re-asserted so a splice can never create per-layer cursor
+    ///   divergence — cursors are homogeneous across full-attn slots by
+    ///   production invariant).
+    /// - Substrate dispatch: an F32 control path (`tq_kv_active=false`)
+    ///   writes the bank rows directly into the F32 K/V backing; a
+    ///   TQ-active production cache ENCODES the bank rows through the
+    ///   same hadamard-quantize kernel prefill uses
+    ///   ([`Self::splice_graft_tq_rows`]) so graft rows and prefill rows
+    ///   are quantized identically in this process — never a silent F32
+    ///   fallback on a TQ cache (the `glp.mode` discipline applied to
+    ///   cache media).
+    /// - The MTP drafter slot is deliberately NOT spliced: speculative
+    ///   proposals are verified against the (grafted) target logits, so
+    ///   an ungrafted drafter affects proposal quality only, never
+    ///   accepted output.
+    ///
+    /// Staged primitive per the `multi_seq_kv.rs` iter-1 pattern: tested
+    /// here, glued into the live serve path by the `--kv-graft` engine
+    /// wiring increment.
+    pub fn splice_graft_for_slot(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        bank: &crate::inference::graft::GraftBank,
+    ) -> Result<u32> {
+        use crate::inference::graft::GraftHookPoint;
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "splice_graft_for_slot: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            bank.hook_point == GraftHookPoint::FullAttnKv,
+            "splice_graft_for_slot: site {:?} is not implemented",
+            bank.hook_point.as_str()
+        );
+        let n_slots = bank.n_slots;
+        if n_slots == 0 {
+            return Ok(0);
+        }
+        anyhow::ensure!(
+            self.graft_len[slot_idx] == 0,
+            "splice_graft_for_slot: slot {} already carries a graft; drop the \
+             slot before re-splicing (ADR-059 reset semantics)",
+            slot.0
+        );
+        anyhow::ensure!(
+            n_slots <= self.max_seq_len,
+            "splice_graft_for_slot: n_slots={n_slots} exceeds max_seq_len={}",
+            self.max_seq_len
+        );
+        for (rank, full) in self.full_attn.iter().enumerate() {
+            anyhow::ensure!(
+                full.current_len[slot_idx] == 0,
+                "splice_graft_for_slot: full_attn[{rank}] cursor for slot {} is {} \
+                 (not fresh); a graft occupies positions 0..{n_slots}",
+                slot.0,
+                full.current_len[slot_idx]
+            );
+        }
+        if self.tq_kv_active {
+            self.splice_graft_tq_rows(slot, bank, n_slots)?;
+        } else {
+            let n_seqs_us = self.n_seqs as usize;
+            let max_len_us = self.max_seq_len as usize;
+            for (graph_layer, slot_of) in self.per_layer_slot.iter().enumerate() {
+                let LayerSlot::Full(rank) = slot_of else {
+                    continue;
+                };
+                let layer_kv = bank.layers.get(&(graph_layer as u32)).ok_or_else(|| {
+                    anyhow!(
+                        "splice_graft_for_slot: bank does not cover full-attention \
+                         layer {graph_layer} (complete site coverage required; the \
+                         bind should have rejected this bank)"
+                    )
+                })?;
+                let full = &mut self.full_attn[*rank as usize];
+                let k = full.k.as_mut().ok_or_else(|| {
+                    anyhow!(
+                        "splice_graft_for_slot: layer {graph_layer} K buffer missing \
+                         on an F32 control-path cache (tq_kv_active=false requires \
+                         the F32 backing)"
+                    )
+                })?;
+                splice_rows_into_buffer(
+                    k,
+                    &layer_kv.k,
+                    slot_idx,
+                    n_slots,
+                    bank.n_kv_heads,
+                    bank.head_dim,
+                    max_len_us,
+                    n_seqs_us,
+                    graph_layer,
+                    "K",
+                )?;
+                let v = full.v.as_mut().ok_or_else(|| {
+                    anyhow!(
+                        "splice_graft_for_slot: layer {graph_layer} V buffer missing \
+                         on an F32 control-path cache (tq_kv_active=false requires \
+                         the F32 backing)"
+                    )
+                })?;
+                splice_rows_into_buffer(
+                    v,
+                    &layer_kv.v,
+                    slot_idx,
+                    n_slots,
+                    bank.n_kv_heads,
+                    bank.head_dim,
+                    max_len_us,
+                    n_seqs_us,
+                    graph_layer,
+                    "V",
+                )?;
+                full.current_len[slot_idx] = n_slots;
+            }
+        }
+        self.graft_len[slot_idx] = n_slots;
+        Ok(n_slots)
+    }
+
+    /// ADR-059 TQ substrate — encode a graft bank's F32 rows into one
+    /// slot's TQ packed/norm buffers through the production encoder
+    /// (`encode_seq_tokens_to_tq_for_slot` →
+    /// `dispatch_hadamard_quantize_kv_hb_seq`): the identical codebook-bits
+    /// resolution, norm scheme, and kernel prefill uses, so graft rows and
+    /// prefill rows quantize identically in this process. The bank's
+    /// position-major `[n_slots, n_kv_heads, head_dim]` rows are the same
+    /// token-major layout the encoder consumes; rows are uploaded once and
+    /// encoded at `write_pos_start = 0` (the graft occupies positions
+    /// `0..n_slots`).
+    ///
+    /// The encoder + registry are splice-local: the hadamard kernel is
+    /// base-registered, and a cold admission (the only splice site) is
+    /// about to run a full prefill that dwarfs one pipeline compile.
+    fn splice_graft_tq_rows(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        bank: &crate::inference::graft::GraftBank,
+        n_slots: u32,
+    ) -> Result<()> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            bank.head_dim == 256 || bank.head_dim == 512,
+            "splice_graft_for_slot: TQ-active graft requires head_dim 256 or 512 \
+             (got {}); the hadamard quantize kernel encodes no other dim — use \
+             the F32 control path (HF2Q_TQ_KV=0) for this fixture",
+            bank.head_dim
+        );
+        // Codebook bits: the same env resolution as the production write
+        // path (`write_kv_with_optional_tq_encode`) — graft rows must
+        // quantize under the SAME codebook as this process's prefill rows.
+        let codebook_bits = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+        let cb_bits = if matches!(codebook_bits, 5 | 6 | 8) {
+            codebook_bits
+        } else {
+            8
+        };
+        let heads = bank.n_kv_heads as u32;
+        let head_dim = bank.head_dim as u32;
+        let rows = n_slots as usize * heads as usize * head_dim as usize;
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = self
+            .device
+            .command_encoder()
+            .context("graft TQ splice: command encoder")?;
+        for (graph_layer, slot_of) in self.per_layer_slot.iter().enumerate() {
+            let LayerSlot::Full(rank) = slot_of else {
+                continue;
+            };
+            let layer_kv = bank.layers.get(&(graph_layer as u32)).ok_or_else(|| {
+                anyhow!(
+                    "splice_graft_for_slot: bank does not cover full-attention \
+                     layer {graph_layer} (complete site coverage required; the \
+                     bind should have rejected this bank)"
+                )
+            })?;
+            anyhow::ensure!(
+                layer_kv.k.len() == rows && layer_kv.v.len() == rows,
+                "splice_graft_for_slot: layer {graph_layer} bank row count mismatch \
+                 (k={}, v={}, expected {rows})",
+                layer_kv.k.len(),
+                layer_kv.v.len()
+            );
+            let upload = |values: &[f32],
+                          label: &'static str|
+             -> Result<mlx_native::MlxBuffer> {
+                let mut buf = self
+                    .device
+                    .alloc_buffer(
+                        rows * std::mem::size_of::<f32>(),
+                        mlx_native::DType::F32,
+                        vec![n_slots as usize, heads as usize, head_dim as usize],
+                    )
+                    .with_context(|| {
+                        format!("graft TQ splice {label} upload (layer {graph_layer})")
+                    })?;
+                buf.as_mut_slice::<f32>()
+                    .with_context(|| format!("graft TQ splice {label} upload mapping"))?
+                    .copy_from_slice(values);
+                Ok(buf)
+            };
+            let k_buf = upload(&layer_kv.k, "K")?;
+            let v_buf = upload(&layer_kv.v, "V")?;
+            let full = &mut self.full_attn[*rank as usize];
+            anyhow::ensure!(
+                full.tq.is_some(),
+                "splice_graft_for_slot: layer {graph_layer} TQ buffers missing on a \
+                 tq_kv_active cache (allocation invariant violated)"
+            );
+            full.encode_seq_tokens_to_tq_for_slot(
+                &k_buf,
+                true,
+                n_slots,
+                heads,
+                head_dim,
+                self.max_seq_len,
+                0,
+                0,
+                false,
+                1.0,
+                cb_bits,
+                slot,
+                &mut encoder,
+                &mut registry,
+                &self.device,
+            )
+            .with_context(|| format!("graft TQ encode K (layer {graph_layer})"))?;
+            full.encode_seq_tokens_to_tq_for_slot(
+                &v_buf,
+                false,
+                n_slots,
+                heads,
+                head_dim,
+                self.max_seq_len,
+                0,
+                0,
+                false,
+                1.0,
+                cb_bits,
+                slot,
+                &mut encoder,
+                &mut registry,
+                &self.device,
+            )
+            .with_context(|| format!("graft TQ encode V (layer {graph_layer})"))?;
+            full.current_len[slot_idx] = n_slots;
+        }
+        encoder
+            .commit_and_wait()
+            .context("graft TQ splice: commit and wait")?;
+        Ok(())
+    }
+
+    /// ADR-059 gate-7 derivation support — extract positions `0..n_slots`
+    /// of every full-attention layer's F32 K/V for one slot as graft-bank
+    /// rows (position-major `[n_slots, n_kv_heads, head_dim]`, the bank
+    /// container layout). This is the self-donor primitive: a bank derived
+    /// from the model's OWN prefill of a donor prompt — phantom-kv's v1
+    /// `prefill_kv` arm through hf2q's own stack, so the bank is produced
+    /// by the same kernels (RoPE, layout) that will read it back.
+    ///
+    /// Contract (fail-closed):
+    /// - F32 control path only (`tq_kv_active=false` — derivation runs
+    ///   with `HF2Q_TQ_KV=0`); a TQ-active cache refuses by name.
+    /// - The slot must be clean (`graft_len == 0`) — never derive from a
+    ///   grafted cache.
+    /// - Every full-attention cursor must cover `n_slots` (the donor
+    ///   prefill was at least that long).
+    /// - Returns `(graph_layer, k_rows, v_rows)` per covered layer, in
+    ///   graph-layer order — exactly the layers a complete-coverage bank
+    ///   must carry.
+    pub fn extract_full_attn_rows_for_graft(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        n_slots: u32,
+    ) -> Result<Vec<(u32, Vec<f32>, Vec<f32>)>> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "extract_full_attn_rows_for_graft: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(n_slots > 0, "extract_full_attn_rows_for_graft: n_slots must be > 0");
+        anyhow::ensure!(
+            !self.tq_kv_active,
+            "extract_full_attn_rows_for_graft: TQ-active caches refuse derivation \
+             (run the donor prefill on the F32 control path, HF2Q_TQ_KV=0)"
+        );
+        anyhow::ensure!(
+            self.graft_len[slot_idx] == 0,
+            "extract_full_attn_rows_for_graft: slot {} carries a graft; never derive \
+             from a grafted cache",
+            slot.0
+        );
+        let shape = self
+            .full_attn
+            .first()
+            .and_then(|full| full.k.as_ref())
+            .map(|k| k.shape().to_vec())
+            .ok_or_else(|| {
+                anyhow!(
+                    "extract_full_attn_rows_for_graft: no F32 K backing on the first \
+                     full-attention layer (F32 control path required)"
+                )
+            })?;
+        anyhow::ensure!(
+            shape.len() == 4,
+            "extract_full_attn_rows_for_graft: unexpected K buffer rank {:?}",
+            shape
+        );
+        let heads = shape[1];
+        let max_len = shape[2];
+        let head_dim = shape[3];
+        anyhow::ensure!(
+            (heads as u64) * (head_dim as u64) > 0,
+            "extract_full_attn_rows_for_graft: degenerate head geometry"
+        );
+
+        let mut out = Vec::new();
+        for (graph_layer, slot_of) in self.per_layer_slot.iter().enumerate() {
+            let LayerSlot::Full(rank) = slot_of else {
+                continue;
+            };
+            let full = &self.full_attn[*rank as usize];
+            anyhow::ensure!(
+                full.current_len[slot_idx] >= n_slots,
+                "extract_full_attn_rows_for_graft: layer {graph_layer} cursor {} does \
+                 not cover n_slots={n_slots}; the donor prefill was too short",
+                full.current_len[slot_idx]
+            );
+            let extract = |buf: &MlxBuffer,
+                           side: &'static str|
+             -> Result<Vec<f32>> {
+                let src = buf.as_slice::<f32>().with_context(|| {
+                    format!("extract_full_attn_rows_for_graft: {side} readback (layer {graph_layer})")
+                })?;
+                let mut rows = vec![0f32; n_slots as usize * heads * head_dim];
+                for position in 0..n_slots as usize {
+                    for head in 0..heads {
+                        // Cache layout [n_seqs, heads, max_seq_len,
+                        // head_dim]; bank layout [n_slots, heads,
+                        // head_dim] (position-major).
+                        let src_base =
+                            ((slot_idx * heads + head) * max_len + position) * head_dim;
+                        let dst_base = (position * heads + head) * head_dim;
+                        rows[dst_base..dst_base + head_dim]
+                            .copy_from_slice(&src[src_base..src_base + head_dim]);
+                    }
+                }
+                Ok(rows)
+            };
+            let k = full.k.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "extract_full_attn_rows_for_graft: layer {graph_layer} K backing \
+                     missing (F32 control path required)"
+                )
+            })?;
+            let v = full.v.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "extract_full_attn_rows_for_graft: layer {graph_layer} V backing \
+                     missing (F32 control path required)"
+                )
+            })?;
+            out.push((
+                graph_layer as u32,
+                extract(k, "K")?,
+                extract(v, "V")?,
+            ));
+        }
+        anyhow::ensure!(
+            !out.is_empty(),
+            "extract_full_attn_rows_for_graft: cache has no full-attention layers"
+        );
+        Ok(out)
+    }
+
+    /// ADR-059 — re-establish the graft region tag on a cache whose graft
+    /// rows arrived via snapshot restore instead of a live splice (the
+    /// capacity-growth path allocates a fresh cache — tag zeroed — and
+    /// `restore_partial` brings the rows but not the tag). The rows must
+    /// already be present: every full-attn cursor must cover `n_slots`.
+    /// Never writes bytes; refuses a double mark.
+    pub fn mark_graft_region_for_slot(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        n_slots: u32,
+    ) -> Result<()> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "mark_graft_region_for_slot: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(n_slots > 0, "mark_graft_region_for_slot: n_slots must be > 0");
+        anyhow::ensure!(
+            self.graft_len[slot_idx] == 0,
+            "mark_graft_region_for_slot: slot {} already carries a graft region",
+            slot.0
+        );
+        for (rank, full) in self.full_attn.iter().enumerate() {
+            anyhow::ensure!(
+                full.current_len[slot_idx] >= n_slots,
+                "mark_graft_region_for_slot: full_attn[{rank}] cursor {} for slot {} \
+                 does not cover the restored graft region ({n_slots}) — the snapshot \
+                 restore must precede the mark",
+                full.current_len[slot_idx],
+                slot.0
+            );
+        }
+        self.graft_len[slot_idx] = n_slots;
         Ok(())
     }
 
@@ -2677,6 +3191,12 @@ impl HybridKvCache {
                 *c = 0;
             }
         }
+        // 1.5 ADR-059 — release the per-slot graft region tag with the
+        // cursor (the region's rows become unobservable exactly like any
+        // other stale rows; a fresh request re-splices at admission).
+        if let Some(g) = self.graft_len.get_mut(slot_idx) {
+            *g = 0;
+        }
         // 2. mtp_slot (optional) — reset per-slot current_len cursor.
         if let Some(fa) = self.mtp_slot.as_mut() {
             if let Some(c) = fa.current_len.get_mut(slot_idx) {
@@ -2800,6 +3320,13 @@ impl HybridKvCache {
             for c in slot.current_len.iter_mut() {
                 *c = 0;
             }
+        }
+        // ADR-059: reset re-establishes freshly-constructed state — the
+        // graft region tag is released with the cursors (re-splice to
+        // re-graft; the graft bytes below the old cursor become
+        // unobservable exactly like any other stale rows).
+        for g in self.graft_len.iter_mut() {
+            *g = 0;
         }
         if let Some(slot) = self.mtp_slot.as_mut() {
             for c in slot.current_len.iter_mut() {
@@ -4045,6 +4572,61 @@ pub fn full_attn_slot_f32_bytes(cfg: &Qwen35Config, max_seq_len: u32, n_seqs: u3
 // cfa-finding-F5 is preserved across all four methods.
 // ──────────────────────────────────────────────────────────────────────────
 
+/// ADR-059 — write one graft bank side's rows into a full-attention
+/// slot buffer for one physical slot.
+///
+/// Bank rows are `[n_slots, n_kv_heads, head_dim]` (position-major); the
+/// cache buffer is `[n_seqs, n_kv_heads, max_seq_len, head_dim]`
+/// (head-major with the position axis innermost). Element destination
+/// for (slot `s`, head `h`, position `p`) is
+/// `((s * n_kv_heads + h) * max_seq_len + p) * head_dim`.
+///
+/// Geometry is re-asserted at the buffer level (the bind already checked
+/// it against the model GGUF): the buffer's per-position element count
+/// must equal the bank's `n_kv_heads * head_dim`, and the row length
+/// must be exactly `n_slots` positions.
+fn splice_rows_into_buffer(
+    buffer: &mut MlxBuffer,
+    rows: &[f32],
+    slot_idx: usize,
+    n_slots: u32,
+    bank_heads: usize,
+    bank_head_dim: usize,
+    max_seq_len: usize,
+    n_seqs: usize,
+    graph_layer: usize,
+    side: &str,
+) -> Result<()> {
+    let per_pos = buffer.element_count() / (n_seqs * max_seq_len);
+    anyhow::ensure!(
+        per_pos == bank_heads * bank_head_dim,
+        "splice_graft_for_slot: layer {graph_layer} {side} geometry mismatch: \
+         buffer holds {per_pos} elements per position, bank holds \
+         {}x{}={}",
+        bank_heads,
+        bank_head_dim,
+        bank_heads * bank_head_dim
+    );
+    anyhow::ensure!(
+        rows.len() == n_slots as usize * per_pos,
+        "splice_graft_for_slot: layer {graph_layer} {side} row length {} != \
+         n_slots({n_slots}) x {per_pos}",
+        rows.len()
+    );
+    let cache = buffer
+        .as_mut_slice::<f32>()
+        .with_context(|| format!("splice_graft_for_slot: layer {graph_layer} {side}"))?;
+    for p in 0..n_slots as usize {
+        for h in 0..bank_heads {
+            let src_start = p * per_pos + h * bank_head_dim;
+            let src = &rows[src_start..src_start + bank_head_dim];
+            let dst = ((slot_idx * bank_heads + h) * max_seq_len + p) * bank_head_dim;
+            cache[dst..dst + bank_head_dim].copy_from_slice(src);
+        }
+    }
+    Ok(())
+}
+
 impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
     fn layout(&self) -> crate::serve::multi_seq_kv::MultiSeqLayout {
         crate::serve::multi_seq_kv::MultiSeqLayout::SeparateSlots
@@ -4169,6 +4751,9 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         if let Some(ref mut mtp) = self.mtp_slot {
             mtp.current_len[slot.0 as usize] = 0;
         }
+        // ADR-059: dropping a slot releases its graft region — the next
+        // request on this slot is ungrafted until an explicit re-splice.
+        self.graft_len[slot.0 as usize] = 0;
         Ok(())
     }
 
@@ -4330,6 +4915,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
             // Cursor copy AFTER buffer copy.
             slot.current_len[dst_idx] = cur_src;
         }
+        // ADR-059: the graft region is part of the slot's state — a fork
+        // of a grafted conversation carries its graft (the byte copy
+        // above already copied the region's rows within cur_src).
+        self.graft_len[dst_idx] = self.graft_len[src_idx];
 
         // (2) MTP slot (same shape as full-attn; cursor + buffers).
         if let Some(ref mut mtp) = self.mtp_slot {
@@ -11843,6 +12432,577 @@ mod tests {
                     .all(|&byte| byte == 14)
             );
             assert!(linear.pp_flipped[peer.0 as usize], "peer parity changed");
+        }
+    }
+
+    /// ADR-059 — graft splice contract tests (F32 path; the TQ encode
+    /// splice is a staged sub-increment and refuses with a named error).
+    mod graft_splice_tests {
+        use super::*;
+        use crate::inference::graft::{
+            GraftBank, GraftHookPoint, GraftKind, GraftLayerKv, GraftMode,
+        };
+        use crate::serve::multi_seq_kv::{MultiSeqKvCache, SlotId};
+
+        /// 8 layers, full-attention interval 4 → full-attn layers {3, 7};
+        /// 2 KV heads, configurable head_dim; no MTP.
+        fn graft_cfg(head_dim: u32) -> Qwen35Config {
+            let mut cfg = moe_cfg_40layer();
+            cfg.num_hidden_layers = 8;
+            cfg.layer_types = default_layer_types(8, 4);
+            cfg.num_key_value_heads = 2;
+            cfg.head_dim = head_dim;
+            cfg.mtp_num_hidden_layers = 0;
+            cfg
+        }
+
+        /// A complete-coverage bank for the {3, 7} full-attn set with
+        /// distinct, verifiable row values.
+        fn bank(n_slots: u32, heads: usize, head_dim: usize, layers: &[u32]) -> GraftBank {
+            GraftBank {
+                mode: GraftMode::SplicePrefix,
+                kind: GraftKind::DirectKv,
+                hook_point: GraftHookPoint::FullAttnKv,
+                n_slots,
+                layers: layers
+                    .iter()
+                    .map(|&l| {
+                        let n = n_slots as usize * heads * head_dim;
+                        (
+                            l,
+                            GraftLayerKv {
+                                k: (0..n).map(|i| i as f32 * 0.25).collect(),
+                                v: (0..n).map(|i| -(i as f32) * 0.5).collect(),
+                            },
+                        )
+                    })
+                    .collect(),
+                n_kv_heads: heads,
+                head_dim,
+                rope_theta: 1e7,
+                rotary_dim: 64,
+                position_base: 0,
+                mrope_interleaved: true,
+                content_sha256: None,
+                quant_lane: None,
+            }
+        }
+
+        fn device() -> Option<MlxDevice> {
+            match MlxDevice::new() {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    eprintln!("skipping: no Metal device: {e}");
+                    None
+                }
+            }
+        }
+
+        /// Expected cache element index for (slot, head, position) in the
+        /// `[n_seqs, heads, max_seq_len, head_dim]` layout.
+        fn elem(slot: usize, head: usize, pos: usize, head_dim: usize, max_len: usize) -> usize {
+            ((slot * 2 + head) * max_len + pos) * head_dim
+        }
+
+        #[test]
+        fn splice_writes_rows_advances_cursors_and_isolates_slots() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            // Sentinel pattern in every full-attn K buffer so untouched
+            // regions are observable (full-attn storage is otherwise
+            // uninitialized).
+            for slot in cache.full_attn.iter_mut() {
+                let k = slot.k.as_mut().unwrap();
+                for v in k.as_mut_slice::<f32>().unwrap().iter_mut() {
+                    *v = -999.0;
+                }
+            }
+            let graft = bank(3, 2, 8, &[3, 7]);
+            let offset = cache
+                .splice_graft_for_slot(SlotId(1), &graft)
+                .expect("splice");
+            assert_eq!(offset, 3);
+            assert_eq!(cache.graft_region_for_slot(SlotId(1)).unwrap(), 3);
+            assert_eq!(cache.graft_region_for_slot(SlotId(0)).unwrap(), 0);
+            for full in cache.full_attn.iter() {
+                assert_eq!(full.current_len[1], 3, "grafted slot cursor");
+                assert_eq!(full.current_len[0], 0, "peer slot untouched");
+            }
+            // Row bytes: layer 3 → rank 0, layer 7 → rank 1.
+            for (rank, layer) in [(0usize, 3u32), (1, 7)] {
+                let kv = &graft.layers[&layer];
+                let k = cache.full_attn[rank].k.as_ref().unwrap();
+                let view = k.as_slice::<f32>().unwrap();
+                for p in 0..3usize {
+                    for h in 0..2usize {
+                        let dst = elem(1, h, p, 8, 16);
+                        let src = (p * 2 + h) * 8;
+                        assert_eq!(
+                            &view[dst..dst + 8],
+                            &kv.k[src..src + 8],
+                            "layer {layer} head {h} pos {p}"
+                        );
+                    }
+                }
+                // Beyond the graft region the sentinel survives.
+                let beyond = elem(1, 0, 3, 8, 16);
+                assert!(view[beyond..beyond + 8].iter().all(|&v| v == -999.0));
+                // The peer slot's region is entirely sentinel.
+                let peer = elem(0, 0, 0, 8, 16);
+                assert!(view[peer..peer + 8].iter().all(|&v| v == -999.0));
+            }
+        }
+
+        #[test]
+        fn splice_canary_is_a_no_op() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            let canary = bank(0, 2, 8, &[3, 7]);
+            assert_eq!(
+                cache.splice_graft_for_slot(SlotId(0), &canary).unwrap(),
+                0
+            );
+            assert_eq!(cache.graft_region_for_slot(SlotId(0)).unwrap(), 0);
+            for full in cache.full_attn.iter() {
+                assert_eq!(full.current_len[0], 0);
+            }
+        }
+
+        #[test]
+        fn double_splice_is_fatal() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+            cache.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            let err = cache
+                .splice_graft_for_slot(SlotId(0), &graft)
+                .unwrap_err();
+            assert!(err.to_string().contains("already carries a graft"));
+        }
+
+        #[test]
+        fn splice_into_non_fresh_slot_is_fatal() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            cache.append_for_seq(SlotId(0), 4).unwrap();
+            let graft = bank(3, 2, 8, &[3, 7]);
+            let err = cache
+                .splice_graft_for_slot(SlotId(0), &graft)
+                .unwrap_err();
+            assert!(err.to_string().contains("not fresh"));
+        }
+
+        /// ADR-059 TQ substrate: the splice encodes bank rows through the
+        /// PRODUCTION encoder — the packed/norm bytes a graft splice
+        /// writes must be byte-identical to encoding the same rows as a
+        /// prefill chunk via `encode_seq_tokens_to_tq_for_slot` directly
+        /// (same kernel, same codebook bits, same write positions). This
+        /// is the contract that makes graft rows indistinguishable from
+        /// prefill rows to the TQ read side.
+        #[test]
+        fn splice_on_tq_active_cache_encodes_through_production_path() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(256);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
+            let graft = bank(3, 2, 256, &[3, 7]);
+            let n = cache
+                .splice_graft_for_slot(SlotId(1), &graft)
+                .expect("TQ-active splice encodes through the production path");
+            assert_eq!(n, 3);
+            assert_eq!(cache.graft_region_for_slot(SlotId(1)).unwrap(), 3);
+            assert_eq!(cache.graft_region_for_slot(SlotId(0)).unwrap(), 0);
+            for full in cache.full_attn.iter() {
+                assert_eq!(full.current_len[1], 3, "grafted slot cursor");
+                assert_eq!(full.current_len[0], 0, "peer slot untouched");
+            }
+
+            // Reference: encode the SAME bank rows as a prefill chunk at
+            // write_pos 0 on a peer cache, via the production entry point.
+            let mut reference =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
+            let layer_kv = &graft.layers[&3];
+            let rows = 3usize * 2 * 256;
+            let upload = |values: &[f32]| {
+                let mut buf = device
+                    .alloc_buffer(rows * 4, mlx_native::DType::F32, vec![3usize, 2, 256])
+                    .expect("upload");
+                buf.as_mut_slice::<f32>().unwrap().copy_from_slice(values);
+                buf
+            };
+            let k_buf = upload(&layer_kv.k);
+            let v_buf = upload(&layer_kv.v);
+            let mut registry = mlx_native::KernelRegistry::new();
+            let mut encoder = device.command_encoder().expect("encoder");
+            let slot = &mut reference.full_attn[0];
+            slot.encode_seq_tokens_to_tq_for_slot(
+                &k_buf, true, 3, 2, 256, 16, 0, 0, false, 1.0, 8, SlotId(1),
+                &mut encoder, &mut registry, &device,
+            )
+            .expect("reference K encode");
+            slot.encode_seq_tokens_to_tq_for_slot(
+                &v_buf, false, 3, 2, 256, 16, 0, 0, false, 1.0, 8, SlotId(1),
+                &mut encoder, &mut registry, &device,
+            )
+            .expect("reference V encode");
+            encoder.commit_and_wait().expect("reference commit");
+
+            // Byte-identical packed + norm bytes on the grafted layer.
+            let grafted = cache.full_attn[0].tq.as_ref().expect("grafted TQ buffers");
+            let expect = reference.full_attn[0].tq.as_ref().expect("reference TQ buffers");
+            let per_slot_packed = 2usize * 16 * 256;
+            for (label, got, want) in [
+                (
+                    "K packed",
+                    grafted.k_packed.as_slice::<u8>().unwrap(),
+                    expect.k_packed.as_slice::<u8>().unwrap(),
+                ),
+                (
+                    "V packed",
+                    grafted.v_packed.as_slice::<u8>().unwrap(),
+                    expect.v_packed.as_slice::<u8>().unwrap(),
+                ),
+            ] {
+                let got_region = &got[per_slot_packed..2 * per_slot_packed];
+                let want_region = &want[per_slot_packed..2 * per_slot_packed];
+                assert_eq!(
+                    got_region, want_region,
+                    "{label}: graft splice must match the production encode byte-for-byte"
+                );
+            }
+            let per_slot_norms = 2usize * 16 * expect.norms_per_pos as usize;
+            for (label, got, want) in [
+                (
+                    "K norms",
+                    grafted.k_norms.as_slice::<f32>().unwrap(),
+                    expect.k_norms.as_slice::<f32>().unwrap(),
+                ),
+                (
+                    "V norms",
+                    grafted.v_norms.as_slice::<f32>().unwrap(),
+                    expect.v_norms.as_slice::<f32>().unwrap(),
+                ),
+            ] {
+                let got_region = &got[per_slot_norms..2 * per_slot_norms];
+                let want_region = &want[per_slot_norms..2 * per_slot_norms];
+                assert_eq!(
+                    got_region, want_region,
+                    "{label}: graft splice must match the production encode value-for-value"
+                );
+            }
+        }
+
+        /// ADR-059 TQ substrate: a non-256/512 head_dim bank on a TQ-active
+        /// cache refuses by name (the hadamard kernel encodes no other dim;
+        /// the F32 control path is the fixture substrate).
+        #[test]
+        fn splice_on_tq_active_cache_refuses_non_production_head_dim() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+            let err = cache
+                .splice_graft_for_slot(SlotId(0), &graft)
+                .unwrap_err();
+            assert!(err.to_string().contains("head_dim 256 or 512"));
+        }
+
+        #[test]
+        fn truncate_floors_at_graft_region() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+            cache.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            cache.append_for_seq(SlotId(0), 5).unwrap();
+            assert_eq!(cache.sequence_len_for_slot(SlotId(0)).unwrap(), 8);
+            // A truncate below the graft floor clamps at the region.
+            cache.truncate_full_attn_to_for_slot(SlotId(0), 1).unwrap();
+            assert_eq!(cache.sequence_len_for_slot(SlotId(0)).unwrap(), 3);
+            // Truncate only lowers; re-grow, then truncate above the
+            // floor behaves as before.
+            cache.append_for_seq(SlotId(0), 5).unwrap();
+            cache.truncate_full_attn_to_for_slot(SlotId(0), 6).unwrap();
+            assert_eq!(cache.sequence_len_for_slot(SlotId(0)).unwrap(), 6);
+            // Ungrafted slots keep the legacy floor of 0.
+            cache.append_for_seq(SlotId(1), 4).unwrap();
+            cache.truncate_full_attn_to_for_slot(SlotId(1), 0).unwrap();
+            assert_eq!(cache.sequence_len_for_slot(SlotId(1)).unwrap(), 0);
+        }
+
+        #[test]
+        fn splice_geometry_mismatch_is_fatal() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            // Bank claims 3 KV heads; the cache holds 2.
+            let graft = bank(3, 3, 8, &[3, 7]);
+            let err = cache
+                .splice_graft_for_slot(SlotId(0), &graft)
+                .unwrap_err();
+            assert!(err.to_string().contains("geometry mismatch"));
+        }
+
+        #[test]
+        fn splice_partial_coverage_is_fatal_as_defense_in_depth() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            // Covers layer 3 only; the cache's full-attn set is {3, 7}.
+            let graft = bank(3, 2, 8, &[3]);
+            let err = cache
+                .splice_graft_for_slot(SlotId(0), &graft)
+                .unwrap_err();
+            assert!(err.to_string().contains("does not cover full-attention layer 7"));
+        }
+
+        #[test]
+        fn drop_seq_releases_the_graft_region() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+            cache.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            cache.drop_seq(SlotId(0)).unwrap();
+            assert_eq!(cache.graft_region_for_slot(SlotId(0)).unwrap(), 0);
+            assert_eq!(cache.sequence_len_for_slot(SlotId(0)).unwrap(), 0);
+            // The released slot accepts a fresh splice.
+            cache.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            assert_eq!(cache.graft_region_for_slot(SlotId(0)).unwrap(), 3);
+        }
+
+        #[test]
+        fn fork_seq_carries_the_graft_region() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+            cache.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            cache.fork_seq(SlotId(0), SlotId(1)).unwrap();
+            assert_eq!(cache.graft_region_for_slot(SlotId(1)).unwrap(), 3);
+            assert_eq!(cache.sequence_len_for_slot(SlotId(1)).unwrap(), 3);
+            // The forked graft rows are byte-equal at the destination.
+            let kv = &graft.layers[&3];
+            let k = cache.full_attn[0].k.as_ref().unwrap();
+            let view = k.as_slice::<f32>().unwrap();
+            let dst = elem(1, 0, 0, 8, 16);
+            assert_eq!(&view[dst..dst + 8], &kv.k[0..8]);
+        }
+
+        /// ADR-059 round trip: a graft-aware snapshot (graft rows + prompt
+        /// prefix) restored into a FRESH cache (the capacity-growth shape)
+        /// plus `mark_graft_region_for_slot` must reproduce the graft
+        /// region, the graft-aware cursor, and the truncate floor.
+        #[test]
+        fn snapshot_restore_round_trip_is_graft_aware() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut source =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 1, false).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+            let n = source.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            assert_eq!(n, 3);
+            // Simulate a 5-token prompt prefill on top of the graft.
+            source.append_for_seq(SlotId(0), 5).unwrap();
+            let snapshot = source.snapshot_prefix(&device, 3 + 5).unwrap();
+
+            // Fresh cache (capacity-growth replacement): no splice, no tag.
+            let mut fresh =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 1, false).expect("kv");
+            fresh.restore_partial(&snapshot, 3 + 5).unwrap();
+            assert_eq!(fresh.sequence_len_for_slot(SlotId(0)).unwrap(), 8);
+            assert_eq!(fresh.graft_region_for_slot(SlotId(0)).unwrap(), 0);
+            fresh
+                .mark_graft_region_for_slot(SlotId(0), 3)
+                .expect("mark after restore");
+            assert_eq!(fresh.graft_region_for_slot(SlotId(0)).unwrap(), 3);
+
+            // The restored graft rows are byte-equal to the bank. Bank
+            // layout is position-major [n_slots, heads, dim]: position 1,
+            // head 0 lives at k[1*heads*dim .. ] = k[16..24].
+            let kv = &graft.layers[&3];
+            let k = fresh.full_attn[0].k.as_ref().unwrap();
+            let view = k.as_slice::<f32>().unwrap();
+            let dst = elem(0, 0, 1, 8, 16);
+            assert_eq!(&view[dst..dst + 8], &kv.k[16..24]);
+
+            // The truncate floor is live again on the restored cache.
+            fresh.truncate_full_attn_to_for_slot(SlotId(0), 0).unwrap();
+            assert_eq!(fresh.sequence_len_for_slot(SlotId(0)).unwrap(), 3);
+
+            // A mark without covering cursors is refused (rows missing).
+            let mut bare =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 1, false).expect("kv");
+            assert!(bare.mark_graft_region_for_slot(SlotId(0), 3).is_err());
+        }
+
+        /// ADR-059 gate-7 derivation: extract_full_attn_rows_for_graft is
+        /// the splice's inverse — write known bank rows into a slot's F32
+        /// buffers via the splice's own row writer (no region tag: a
+        /// plain donor prefill), extract them back, and the rows must be
+        /// byte-identical (the cache-layout transpose is exact in both
+        /// directions). A tagged (grafted) slot refuses derivation by
+        /// name.
+        #[test]
+        fn graft_row_extraction_is_the_splice_inverse() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+
+            // Plain donor prefill: the splice's row writer places the
+            // bank rows at positions 0..3 WITHOUT the graft machinery
+            // (no tag), then a cursor advance makes them readable.
+            for (graph_layer, slot_of) in cache.per_layer_slot.iter().enumerate() {
+                let LayerSlot::Full(rank) = slot_of else { continue };
+                let layer_kv = &graft.layers[&(graph_layer as u32)];
+                let full = &mut cache.full_attn[*rank as usize];
+                super::splice_rows_into_buffer(
+                    full.k.as_mut().unwrap(),
+                    &layer_kv.k,
+                    1,
+                    3,
+                    2,
+                    8,
+                    16,
+                    2,
+                    graph_layer,
+                    "K",
+                )
+                .unwrap();
+                super::splice_rows_into_buffer(
+                    full.v.as_mut().unwrap(),
+                    &layer_kv.v,
+                    1,
+                    3,
+                    2,
+                    8,
+                    16,
+                    2,
+                    graph_layer,
+                    "V",
+                )
+                .unwrap();
+                full.current_len[1] = 3;
+            }
+            let rows = cache
+                .extract_full_attn_rows_for_graft(SlotId(1), 3)
+                .expect("extract");
+            let layers: Vec<u32> = rows.iter().map(|(l, _, _)| *l).collect();
+            assert_eq!(layers, vec![3, 7], "graph-layer order, complete coverage");
+            for (layer, k, v) in rows {
+                let bank_kv = &graft.layers[&layer];
+                assert_eq!(k, bank_kv.k, "layer {layer} K rows byte-identical");
+                assert_eq!(v, bank_kv.v, "layer {layer} V rows byte-identical");
+            }
+
+            // A tagged (grafted) slot refuses derivation by name.
+            cache.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            let err = cache
+                .extract_full_attn_rows_for_graft(SlotId(0), 3)
+                .unwrap_err();
+            assert!(err.to_string().contains("never derive from a grafted cache"));
+
+            // A cursor that does not cover n_slots refuses by name.
+            cache.reset_for_slot(SlotId(0)).unwrap();
+            cache.advance_cursors_for_test(SlotId(0), 2).unwrap();
+            let err = cache
+                .extract_full_attn_rows_for_graft(SlotId(0), 3)
+                .unwrap_err();
+            assert!(err.to_string().contains("donor prefill was too short"));
+
+            // A TQ-active cache refuses derivation by name.
+            let mut tq =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
+            tq.advance_cursors_for_test(SlotId(0), 5).unwrap();
+            let err = tq
+                .extract_full_attn_rows_for_graft(SlotId(0), 3)
+                .unwrap_err();
+            assert!(err.to_string().contains("HF2Q_TQ_KV=0"));
+        }
+
+        /// ADR-059 SlotAware anchor semantics: `snapshot_slot_anchor`
+        /// captures the PHYSICAL boundary (graft rows + prompt rows) and
+        /// `restore_slot_anchor` rewinds to it without copying bytes — the
+        /// graft rows below the boundary survive by the append-only
+        /// contract and the region tag stays marked (only a reset clears
+        /// it, and a reset clears the anchor too).
+        #[test]
+        fn slot_anchor_round_trip_is_graft_aware() {
+            let _gpu = crate::inference::hf2q_gpu_test_lock();
+            let Some(device) = device() else { return };
+            let cfg = graft_cfg(8);
+            let mut cache =
+                HybridKvCache::new_with_options(&cfg, &device, 16, 1, false).expect("kv");
+            let graft = bank(3, 2, 8, &[3, 7]);
+            cache.splice_graft_for_slot(SlotId(0), &graft).unwrap();
+            // Prompt prefill on top of the graft, then the anchor at the
+            // physical boundary 3 + 5 = 8.
+            cache.append_for_seq(SlotId(0), 5).unwrap();
+            let anchor = cache
+                .snapshot_slot_anchor(SlotId(0), 3 + 5)
+                .expect("graft-aware anchor capture");
+
+            // Decode drift above the boundary, then a continuation request
+            // rewinds to the anchor.
+            cache.append_for_seq(SlotId(0), 3).unwrap();
+            assert_eq!(cache.sequence_len_for_slot(SlotId(0)).unwrap(), 11);
+            cache
+                .restore_slot_anchor(SlotId(0), &anchor)
+                .expect("graft-aware anchor restore");
+            assert_eq!(
+                cache.sequence_len_for_slot(SlotId(0)).unwrap(),
+                8,
+                "cursor rewinds to the physical boundary graft_len + prompt"
+            );
+            assert_eq!(
+                cache.graft_region_for_slot(SlotId(0)).unwrap(),
+                3,
+                "the region tag survives the anchor rewind"
+            );
+
+            // The graft rows are still the bank's bytes (append-only rows
+            // below the boundary were never touched).
+            let kv = &graft.layers[&3];
+            let k = cache.full_attn[0].k.as_ref().unwrap();
+            let view = k.as_slice::<f32>().unwrap();
+            let dst = elem(0, 0, 2, 8, 16);
+            assert_eq!(&view[dst..dst + 8], &kv.k[32..40]);
+
+            // A reset (cold admission of an unrelated request) drops the
+            // rows and the tag; a stale anchor restore would rewind cursors
+            // over missing rows — the serve layer prevents this by clearing
+            // anchors on reset; here the tag loss is the observable.
+            cache.reset_for_slot(SlotId(0)).unwrap();
+            assert_eq!(cache.graft_region_for_slot(SlotId(0)).unwrap(), 0);
         }
     }
 }

@@ -15,6 +15,9 @@ pub mod vision;
 /// ADR-053 — GLP (GGUF Layer Projection) runtime steering.
 pub mod glp;
 
+/// ADR-059 — KV-cache grafts (context-space steering artifacts).
+pub mod graft;
+
 /// ADR-005 iter-230 A2 — crate-wide serialization lock for GPU-executing
 /// tests.
 ///

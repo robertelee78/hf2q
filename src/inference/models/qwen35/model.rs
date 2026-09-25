@@ -165,6 +165,12 @@ pub struct Qwen35Model {
     /// layer-loop tail (the `hidden = ffn_out` assignment point). Off
     /// unless `--glp`/`--gcd` bound one at serve time.
     pub glp: Option<crate::inference::glp::BoundGlp>,
+    /// ADR-059: optional KV-cache graft. When bound, the bank is spliced
+    /// into a fresh slot's full-attention caches at admission
+    /// (`HybridKvCache::splice_graft_for_slot`) as fabricated history at
+    /// positions `0..n_slots`; the request path applies the resulting
+    /// position offset. Off unless `--kv-graft` bound one at serve time.
+    pub kv_graft: Option<crate::inference::graft::BoundGraft>,
     /// Present only on the evidence-bearing copied-load path. Ordinary Qwen
     /// loading remains behaviorally unchanged until it opts into that path.
     #[cfg(test)]
@@ -220,6 +226,7 @@ impl Qwen35Model {
             output_norm: vec![1.0f32; h],
             mtp: None,
             glp: None,
+            kv_graft: None,
             #[cfg(test)]
             loaded_candidate_identity: None,
             cfg,
@@ -466,6 +473,7 @@ impl Qwen35Model {
             output_norm,
             mtp,
             glp: None,
+            kv_graft: None,
             #[cfg(test)]
             loaded_candidate_identity: None,
         })
