@@ -1171,6 +1171,8 @@ catalog + smoke prompt before any forward-pass code lands.
 
 ## Documentation index
 
+- `docs/RELEASING.md` — the release checklist: crate, GitHub Release, and
+  hf2q.us, with the definition of a finished release.
 - `docs/getting-started.md` — canonical first-run path: verified Qwen3.8
   pair, foreground serve, chat and vision proof, OpenCode, full Agentic Kit,
   and the local research stack.
