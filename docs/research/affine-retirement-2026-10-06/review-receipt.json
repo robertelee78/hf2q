@@ -1,0 +1,28 @@
+{
+  "schema": "hf2q.affine-retirement-planning-review.v1",
+  "source_commit": "cca6425860c1fb770c6223c2bbdfa5d2d769dc70",
+  "provider_id": "opencode",
+  "model_id": "glm-5.3",
+  "session_id": "ses_eeb031921ffe1thJKJyxTRsjVY",
+  "initial_plan_sha256": "37be22dde8cb8d7c9621ca5ecc7b90679ce8d6b9be76c6b5a2e0fd30f51a0fe8",
+  "final_reviewed_plan_sha256": "b159b9b63f387b5fa0dc55d22daa13f9e2ba71911aed4af4d96998c084c47e09",
+  "final_verdict": "READY WITH NONBLOCKING NOTES",
+  "closed_findings": [
+    "B1",
+    "B2",
+    "B3",
+    "B4"
+  ],
+  "remaining_execution_note": "R4 must sweep active docs for max_median_kl, median KL, ppl_ratio_dwq46, ppl_ratio_dwq48 and claims using the retired ADR-012 threshold values; preserve unrelated current family quality gates and marked history.",
+  "source_verification_tool_results": 33,
+  "final_review_tool_results": 6,
+  "model_identity_verification": "OpenCode read-only session-message query found only providerID=opencode/modelID=glm-5.3 for assistant messages.",
+  "scope": "Planning and static inventory only. No product changes, builds, model runs, commits, publication or tracker changes.",
+  "artifacts": {
+    "docs/research/mlx-affine-retirement-plan-2026-10-06.md": "b159b9b63f387b5fa0dc55d22daa13f9e2ba71911aed4af4d96998c084c47e09",
+    "docs/research/affine-retirement-2026-10-06/measure.py": "9a49d96d425d1396b249d863dd2ea5f665d2c9aec44f8319ba76e42b5c36c5ac",
+    "docs/research/affine-retirement-2026-10-06/inventory.json": "91877c510f14509cd1f6c5ba18eee37015e061ca5596a09334d70e47e0679e48",
+    "docs/research/affine-retirement-2026-10-06/glm53-review-initial.md": "a9b4a4312cbad11f447e7aa315592451b38e23d23feee4e81eeba9f4038981c1",
+    "docs/research/affine-retirement-2026-10-06/glm53-review-final.md": "b41848fa2a1aed5a9e7fe02cbf3c226c083b6c250a29d2eb9081e435f57ebd85"
+  }
+}

@@ -1,0 +1,773 @@
+{
+  "absent_retired_producers": {
+    "src/backends/safetensors_out.rs": true,
+    "src/calibrate/dwq_loop.rs": true,
+    "src/calibrate/imatrix_xvalidate.rs": true,
+    "src/quantize/dwq_activation.rs": true,
+    "tests/safetensors_mlx_lm_round_trip.rs": true
+  },
+  "commit": "cca6425860c1fb770c6223c2bbdfa5d2d769dc70",
+  "keyword_discovery_only": {
+    "affine_src": {
+      "file_count": 35,
+      "files": [
+        "src/cli.rs",
+        "src/convert/quant_selector.rs",
+        "src/core/mlx_safetensors_loader.rs",
+        "src/core/mod.rs",
+        "src/core/provenance/tensor_execution/types.rs",
+        "src/core/provenance/tensor_execution/verify.rs",
+        "src/inference/models/bert/bert_gpu.rs",
+        "src/inference/models/gemma4/forward_gpu.rs",
+        "src/inference/models/gemma4/gpu_full_attn.rs",
+        "src/inference/models/gemma4/model.rs",
+        "src/inference/models/gemma4/native_matrix_tests.rs",
+        "src/inference/models/gemma4/native_storage.rs",
+        "src/inference/models/gemma4/profile.rs",
+        "src/inference/models/qwen35/execution_config.rs",
+        "src/inference/models/qwen35/forward_gpu.rs",
+        "src/inference/models/qwen35/gpu_ffn.rs",
+        "src/inference/models/qwen35/gpu_full_attn.rs",
+        "src/inference/models/qwen35/model.rs",
+        "src/inference/models/qwen35/mtp.rs",
+        "src/inference/models/qwen35/mtp_tests.rs",
+        "src/inference/models/qwen35/mtp_weights_load.rs",
+        "src/inference/models/qwen35/weight_loader.rs",
+        "src/inference/spec_decode/eagle3/drafter_gpu.rs",
+        "src/inference/vision/vit.rs",
+        "src/inference/vision/vit_gpu.rs",
+        "src/intelligence/measured_auto_quant.rs",
+        "src/intelligence/measured_auto_quant/tests.rs",
+        "src/intelligence/measured_auto_quant/types.rs",
+        "src/serve/api/engine.rs",
+        "src/serve/api/engine_qwen35.rs",
+        "src/serve/forward_mlx_shared.rs",
+        "src/serve/forward_prefill_batched.rs",
+        "src/serve/multi_model.rs",
+        "src/serve/native_matrix_storage.rs",
+        "src/serve/native_projection.rs"
+      ]
+    },
+    "dwq_arch": {
+      "file_count": 5,
+      "files": [
+        "src/arch/catalog.rs",
+        "src/arch/conformance.rs",
+        "src/arch/entries/qwen35moe.rs",
+        "src/arch/registry.rs",
+        "src/arch/smoke.rs"
+      ]
+    },
+    "overlay_scripts": {
+      "file_count": 7,
+      "files": [
+        "scripts/adr020_ac7_boundary_validate.sh",
+        "scripts/grammar_probe/harness_test_support.py",
+        "scripts/grammar_probe/managed_runtime.py",
+        "scripts/grammar_probe/runtime_identity.py",
+        "scripts/grammar_probe/test_judgment_pipeline.py",
+        "scripts/grammar_probe/test_managed_runtime.py",
+        "scripts/grammar_probe/test_measurement_integrity.py"
+      ]
+    },
+    "overlay_src": {
+      "file_count": 28,
+      "files": [
+        "src/cli.rs",
+        "src/convert/tensor_lineage/receipt.rs",
+        "src/core/mlx_safetensors_loader.rs",
+        "src/core/provenance/tensor_execution/tests.rs",
+        "src/core/provenance/tensor_execution/types.rs",
+        "src/core/provenance/tensor_execution/verify.rs",
+        "src/inference/models/gemma4/model.rs",
+        "src/inference/models/qwen35/execution_config.rs",
+        "src/inference/models/qwen35/execution_evidence.rs",
+        "src/inference/models/qwen35/gpu_ffn.rs",
+        "src/inference/models/qwen35/model.rs",
+        "src/inference/models/qwen35/source_precision/upload/teacher_model/tests.rs",
+        "src/inference/models/qwen35/weight_loader.rs",
+        "src/intelligence/dynamic_allocator/producer/bindings.rs",
+        "src/intelligence/dynamic_allocator/producer/tests.rs",
+        "src/intelligence/dynamic_allocator/solver.rs",
+        "src/intelligence/dynamic_allocator/tests.rs",
+        "src/quantize/imatrix/forward.rs",
+        "src/serve/api/control.rs",
+        "src/serve/api/engine.rs",
+        "src/serve/api/engine_gemma4_tiny_prefill_tests.rs",
+        "src/serve/api/engine_qwen35.rs",
+        "src/serve/api/measurement.rs",
+        "src/serve/api/state.rs",
+        "src/serve/forward_mlx_shared.rs",
+        "src/serve/kv_persist/loader_wrapper.rs",
+        "src/serve/mod.rs",
+        "src/serve/multi_model.rs"
+      ]
+    }
+  },
+  "measurement": "selected nonoverlapping physical source spans; incomplete removal footprint",
+  "schema": "hf2q.affine-retirement-inventory.v1",
+  "selected_item_totals": {
+    "preserve-and-relocate": {
+      "per_file": {
+        "src/core/mlx_safetensors_loader.rs": 151
+      },
+      "physical_lines": 151
+    },
+    "retire": {
+      "per_file": {
+        "src/core/mlx_safetensors_loader.rs": 1189,
+        "src/inference/models/gemma4/model.rs": 326,
+        "src/inference/models/qwen35/gpu_ffn.rs": 10,
+        "src/inference/models/qwen35/model.rs": 587,
+        "src/serve/forward_mlx_shared.rs": 778
+      },
+      "physical_lines": 2890
+    },
+    "retire-arch-scaffold": {
+      "per_file": {
+        "src/arch/conformance.rs": 48,
+        "src/arch/registry.rs": 17
+      },
+      "physical_lines": 65
+    }
+  },
+  "selected_items": [
+    {
+      "anchor": "pub struct MlxQuantConfig {",
+      "disposition": "retire",
+      "end": 62,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 13,
+      "start": 50
+    },
+    {
+      "anchor": "impl MlxQuantConfig {",
+      "disposition": "retire",
+      "end": 128,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 65,
+      "start": 64
+    },
+    {
+      "anchor": "pub struct MlxAffineLinear {",
+      "disposition": "retire",
+      "end": 146,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 9,
+      "start": 138
+    },
+    {
+      "anchor": "impl MlxAffineLinear {",
+      "disposition": "retire",
+      "end": 381,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 234,
+      "start": 148
+    },
+    {
+      "anchor": "pub struct RoundTripDrift {",
+      "disposition": "retire",
+      "end": 413,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 13,
+      "start": 401
+    },
+    {
+      "anchor": "pub fn unpack_u32_packed(bytes: &[u8], n_u32: usize, bits: u32) -> Result<Vec<u8>> {",
+      "disposition": "retire",
+      "end": 445,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 26,
+      "start": 420
+    },
+    {
+      "anchor": "pub fn pack_u32_codes(codes: &[u8], bits: u32) -> Result<Vec<u8>> {",
+      "disposition": "retire",
+      "end": 552,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 31,
+      "start": 522
+    },
+    {
+      "anchor": "pub fn write_floats_from_f32(values: &[f32], dtype: Dtype) -> Result<Vec<u8>> {",
+      "disposition": "retire",
+      "end": 572,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 16,
+      "start": 557
+    },
+    {
+      "anchor": "pub struct MlxAffineLinearBytes {",
+      "disposition": "retire",
+      "end": 587,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 9,
+      "start": 579
+    },
+    {
+      "anchor": "impl MlxAffineLinearBytes {",
+      "disposition": "retire",
+      "end": 658,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 25,
+      "start": 634
+    },
+    {
+      "anchor": "impl MlxAffineLinear {",
+      "disposition": "retire",
+      "end": 632,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 44,
+      "start": 589
+    },
+    {
+      "anchor": "pub fn read_floats_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {",
+      "disposition": "preserve-and-relocate",
+      "end": 508,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 59,
+      "start": 450
+    },
+    {
+      "anchor": "pub fn discover_shards(model_dir: &Path) -> Result<BTreeMap<String, PathBuf>> {",
+      "disposition": "preserve-and-relocate",
+      "end": 700,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 36,
+      "start": 665
+    },
+    {
+      "anchor": "fn pack_u32(codes: &[u8], bits: u32) -> Vec<u8> {",
+      "disposition": "retire",
+      "end": 713,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 3,
+      "start": 711
+    },
+    {
+      "anchor": "fn unpack_u32_packed_round_trip_4bit() {",
+      "disposition": "retire",
+      "end": 724,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 9,
+      "start": 716
+    },
+    {
+      "anchor": "fn unpack_u32_packed_round_trip_8bit() {",
+      "disposition": "retire",
+      "end": 733,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 7,
+      "start": 727
+    },
+    {
+      "anchor": "fn unpack_u32_low_bits_are_lowest_index() {",
+      "disposition": "retire",
+      "end": 751,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 16,
+      "start": 736
+    },
+    {
+      "anchor": "fn read_floats_to_f32_handles_all_three_dtypes() {",
+      "disposition": "preserve-and-relocate",
+      "end": 781,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 28,
+      "start": 754
+    },
+    {
+      "anchor": "fn mlx_affine_linear_round_trip_synthetic() {",
+      "disposition": "retire",
+      "end": 836,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 53,
+      "start": 784
+    },
+    {
+      "anchor": "fn mlx_affine_linear_handles_bf16_scales() {",
+      "disposition": "retire",
+      "end": 884,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 46,
+      "start": 839
+    },
+    {
+      "anchor": "fn mlx_affine_linear_rejects_dtype_mismatch() {",
+      "disposition": "retire",
+      "end": 909,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 23,
+      "start": 887
+    },
+    {
+      "anchor": "fn mlx_quant_config_parses_global_keys() {",
+      "disposition": "retire",
+      "end": 939,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 28,
+      "start": 912
+    },
+    {
+      "anchor": "fn mlx_quant_config_parses_per_path_overrides() {",
+      "disposition": "retire",
+      "end": 971,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 30,
+      "start": 942
+    },
+    {
+      "anchor": "fn mlx_quant_config_returns_none_for_unquantized_model() {",
+      "disposition": "retire",
+      "end": 987,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 14,
+      "start": 974
+    },
+    {
+      "anchor": "fn discover_shards_handles_index_json() {",
+      "disposition": "preserve-and-relocate",
+      "end": 1010,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 21,
+      "start": 990
+    },
+    {
+      "anchor": "fn discover_shards_handles_single_file() {",
+      "disposition": "preserve-and-relocate",
+      "end": 1019,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 7,
+      "start": 1013
+    },
+    {
+      "anchor": "fn writer_round_trips_with_reader_f32_scales() {",
+      "disposition": "retire",
+      "end": 1072,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 46,
+      "start": 1027
+    },
+    {
+      "anchor": "fn writer_round_trips_with_reader_bf16_scales() {",
+      "disposition": "retire",
+      "end": 1116,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 38,
+      "start": 1079
+    },
+    {
+      "anchor": "fn writer_pack_convention_matches_canonical_fixture() {",
+      "disposition": "retire",
+      "end": 1132,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 10,
+      "start": 1123
+    },
+    {
+      "anchor": "fn writer_rejects_out_of_range_codes() {",
+      "disposition": "retire",
+      "end": 1144,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 7,
+      "start": 1138
+    },
+    {
+      "anchor": "fn writer_multi_linear_save_load() {",
+      "disposition": "retire",
+      "end": 1227,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 76,
+      "start": 1152
+    },
+    {
+      "anchor": "fn loader_output_is_qmm_affine_compatible() {",
+      "disposition": "retire",
+      "end": 1359,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 124,
+      "start": 1236
+    },
+    {
+      "anchor": "fn make_synthetic_linear(",
+      "disposition": "retire",
+      "end": 1395,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 28,
+      "start": 1368
+    },
+    {
+      "anchor": "fn round_trip_drift_zero_signal_is_zero_drift() {",
+      "disposition": "retire",
+      "end": 1413,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 16,
+      "start": 1398
+    },
+    {
+      "anchor": "fn round_trip_drift_q4_0_already_idempotent() {",
+      "disposition": "retire",
+      "end": 1458,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 43,
+      "start": 1416
+    },
+    {
+      "anchor": "fn round_trip_drift_increases_with_bias_magnitude() {",
+      "disposition": "retire",
+      "end": 1507,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 47,
+      "start": 1461
+    },
+    {
+      "anchor": "fn round_trip_drift_rejects_misaligned_k() {",
+      "disposition": "retire",
+      "end": 1519,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 10,
+      "start": 1510
+    },
+    {
+      "anchor": "fn round_trip_drift_per_element_metrics_are_consistent() {",
+      "disposition": "retire",
+      "end": 1551,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 30,
+      "start": 1522
+    },
+    {
+      "anchor": "pub struct MlxAffineExtra {",
+      "disposition": "retire",
+      "end": 49,
+      "path": "src/serve/forward_mlx_shared.rs",
+      "physical_lines": 10,
+      "start": 40
+    },
+    {
+      "anchor": "pub struct MlxAffineMoeStack {",
+      "disposition": "retire",
+      "end": 256,
+      "path": "src/serve/forward_mlx_shared.rs",
+      "physical_lines": 18,
+      "start": 239
+    },
+    {
+      "anchor": "pub fn from_mlx_affine_linear(device: &MlxDevice, linear: &MlxAffineLinear) -> Result<Self> {",
+      "disposition": "retire",
+      "end": 224,
+      "path": "src/serve/forward_mlx_shared.rs",
+      "physical_lines": 92,
+      "start": 133
+    },
+    {
+      "anchor": "pub enum DwqOverlayRole {",
+      "disposition": "retire",
+      "end": 655,
+      "path": "src/serve/forward_mlx_shared.rs",
+      "physical_lines": 14,
+      "start": 642
+    },
+    {
+      "anchor": "pub fn parse_dwq_overlay_metadata(",
+      "disposition": "retire",
+      "end": 686,
+      "path": "src/serve/forward_mlx_shared.rs",
+      "physical_lines": 26,
+      "start": 661
+    },
+    {
+      "anchor": "pub fn parse_dwq_overlay_role(role: &str) -> DwqOverlayRole {",
+      "disposition": "retire",
+      "end": 707,
+      "path": "src/serve/forward_mlx_shared.rs",
+      "physical_lines": 19,
+      "start": 689
+    },
+    {
+      "anchor": "pub enum MoeBaseRole {",
+      "disposition": "retire",
+      "end": 720,
+      "path": "src/serve/forward_mlx_shared.rs",
+      "physical_lines": 6,
+      "start": 715
+    },
+    {
+      "anchor": "pub fn parse_dwq_moe_expert_role(role: &str) -> Option<(MoeBaseRole, usize)> {",
+      "disposition": "retire",
+      "end": 741,
+      "path": "src/serve/forward_mlx_shared.rs",
+      "physical_lines": 17,
+      "start": 725
+    },
+    {
+      "anchor": "mod ac5_iter_b_affine_qweight_roundtrip {",
+      "disposition": "retire",
+      "end": 1876,
+      "path": "src/serve/forward_mlx_shared.rs",
+      "physical_lines": 576,
+      "start": 1301
+    },
+    {
+      "anchor": "pub fn apply_dwq_overlay(",
+      "disposition": "retire",
+      "end": 1773,
+      "path": "src/inference/models/gemma4/model.rs",
+      "physical_lines": 326,
+      "start": 1448
+    },
+    {
+      "anchor": "pub fn apply_dwq_overlay(",
+      "disposition": "retire",
+      "end": 956,
+      "path": "src/inference/models/qwen35/model.rs",
+      "physical_lines": 428,
+      "start": 529
+    },
+    {
+      "anchor": "enum AttnRole {",
+      "disposition": "retire",
+      "end": 968,
+      "path": "src/inference/models/qwen35/model.rs",
+      "physical_lines": 6,
+      "start": 963
+    },
+    {
+      "anchor": "enum DenseFfnRole {",
+      "disposition": "retire",
+      "end": 979,
+      "path": "src/inference/models/qwen35/model.rs",
+      "physical_lines": 5,
+      "start": 975
+    },
+    {
+      "anchor": "fn dwq_to_native_q4_0_f32(",
+      "disposition": "retire",
+      "end": 1049,
+      "path": "src/inference/models/qwen35/model.rs",
+      "physical_lines": 49,
+      "start": 1001
+    },
+    {
+      "anchor": "fn overwrite_dense_ffn_q4_0_linear(",
+      "disposition": "retire",
+      "end": 1131,
+      "path": "src/inference/models/qwen35/model.rs",
+      "physical_lines": 56,
+      "start": 1076
+    },
+    {
+      "anchor": "fn overwrite_full_attn_f32_linear(",
+      "disposition": "retire",
+      "end": 1190,
+      "path": "src/inference/models/qwen35/model.rs",
+      "physical_lines": 43,
+      "start": 1148
+    },
+    {
+      "anchor": "pub fn attach_affine_overlay(",
+      "disposition": "retire",
+      "end": 509,
+      "path": "src/inference/models/qwen35/gpu_ffn.rs",
+      "physical_lines": 10,
+      "start": 500
+    },
+    {
+      "anchor": "pub struct QualityThresholds {",
+      "disposition": "retire-arch-scaffold",
+      "end": 30,
+      "path": "src/arch/registry.rs",
+      "physical_lines": 8,
+      "start": 23
+    },
+    {
+      "anchor": "impl QualityThresholds {",
+      "disposition": "retire-arch-scaffold",
+      "end": 40,
+      "path": "src/arch/registry.rs",
+      "physical_lines": 9,
+      "start": 32
+    },
+    {
+      "anchor": "pub struct QualityReport {",
+      "disposition": "retire-arch-scaffold",
+      "end": 37,
+      "path": "src/arch/conformance.rs",
+      "physical_lines": 8,
+      "start": 30
+    },
+    {
+      "anchor": "impl QualityReport {",
+      "disposition": "retire-arch-scaffold",
+      "end": 78,
+      "path": "src/arch/conformance.rs",
+      "physical_lines": 40,
+      "start": 39
+    }
+  ],
+  "unmeasured": [
+    "compiled bytes",
+    "clean build seconds",
+    "startup seconds",
+    "resident bytes",
+    "prefill tokens/second",
+    "decode tokens/second",
+    "time to first token"
+  ],
+  "whole_file_context": [
+    {
+      "ignore_attributes": 0,
+      "path": "src/core/mlx_safetensors_loader.rs",
+      "physical_lines": 1552,
+      "sha256": "041ff957d8e09165a6afd06035da04f0a36597ef20dc310117c90149fc5e4724",
+      "test_attributes": 23
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "src/serve/forward_mlx_shared.rs",
+      "physical_lines": 1876,
+      "sha256": "56ffe77c823cb4b5019fe5b4735ac31fd5c17d98c698e95b324c23dc6d54aa59",
+      "test_attributes": 16
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "src/inference/models/qwen35/model.rs",
+      "physical_lines": 2260,
+      "sha256": "3aa64ddb7704bbf009c4003f32fa21a56c5ade41c397499dd3d6b91d0b0c1f78",
+      "test_attributes": 25
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "src/inference/models/gemma4/model.rs",
+      "physical_lines": 2117,
+      "sha256": "fcf2ef1b91e328b243e594906f864f914a5c97a6875824fec48816398b24af3c",
+      "test_attributes": 3
+    },
+    {
+      "ignore_attributes": 8,
+      "path": "tests/peer_parity_gates.rs",
+      "physical_lines": 1710,
+      "sha256": "b353ab32dbfd1faa6b5e26567cad213fb197955008fad22b2a63111b33aeedf7",
+      "test_attributes": 21
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "tests/common/mlx_lm_runner.rs",
+      "physical_lines": 353,
+      "sha256": "c794a3588d7f995fcd3c2c95ff0c7d862e02995a7f512e18946ae0c6ff68ff8c",
+      "test_attributes": 3
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "scripts/adr020_ac7_boundary_validate.sh",
+      "physical_lines": 294,
+      "sha256": "ae8dea85018ff8d037922d68befe98ecb12a1381945a82005f796ef29d750861",
+      "test_attributes": 0
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "scripts/adr020_ac8_validate.sh",
+      "physical_lines": 185,
+      "sha256": "d8f30922158e975aa6998789f5f66922d613109bf5644d0ba95e2418d6e6c40f",
+      "test_attributes": 0
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "scripts/adr020_fetch_wikitext_calibration_jsonl.sh",
+      "physical_lines": 294,
+      "sha256": "83fa72086ade26197bda683ec53eae918e30efc624dac5780c4aff60fda671de",
+      "test_attributes": 0
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "scripts/p11_re_emit_dwq.sh",
+      "physical_lines": 178,
+      "sha256": "006bc7e7c4a0f7afbc0a1949735eb7d4caffc533c4df1e8841d04c5f080ebc60",
+      "test_attributes": 0
+    },
+    {
+      "ignore_attributes": 1,
+      "path": "docs/calibrator-onboarding.md",
+      "physical_lines": 484,
+      "sha256": "c7e7b296e4fb1e9b9d24f8ac3decde3fb0dc7de14190198d2678f82c901ce3b7",
+      "test_attributes": 0
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "docs/converting-qwen35.md",
+      "physical_lines": 425,
+      "sha256": "fe58e3a2bb97403ca4d9f91464d52ae2faf558ffb4a5a678526f39d14e71598e",
+      "test_attributes": 0
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "docs/adr/ADR-046-evidence-driven-apple-auto-quant.md",
+      "physical_lines": 1957,
+      "sha256": "64788c902ff6768b848d1dc3a643047d0f25790bb04f7b05dd6d9c44de7b2a9a",
+      "test_attributes": 0
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "docs/research/mlx-affine-support-2026-09-23.md",
+      "physical_lines": 490,
+      "sha256": "7733d8914d9369f691ed94039ebd3104e074c38e024501d37ad57eaee8cfc9f6",
+      "test_attributes": 0
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "scripts/peer_parity_run.sh",
+      "physical_lines": 180,
+      "sha256": "5a229c01fdaf59f339b8aa65ed616b85ee032b3222643226ae215c69d5281923",
+      "test_attributes": 0
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "tests/common/llama_cpp_runner.rs",
+      "physical_lines": 513,
+      "sha256": "7c63daeb216b203c7d2137382d3de99c0408f2ffadca64cf8636bc94c88afb3b",
+      "test_attributes": 9
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "tests/common/metrics.rs",
+      "physical_lines": 100,
+      "sha256": "7e97bca34078aa8a76647f01dfdaae921723e979f70267cecc49c7ced24f9c5b",
+      "test_attributes": 3
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "tests/common/env_lock.rs",
+      "physical_lines": 96,
+      "sha256": "b9df1fee2e172a01b8375e9bbf6361a982ac4aedbc6e2e590e3e73af8574b596",
+      "test_attributes": 0
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "tests/quality_thresholds.rs",
+      "physical_lines": 82,
+      "sha256": "4d5678734c342930607fc95861c08fc9c9fe1d71adc6d4805d40ca6ac976fa8e",
+      "test_attributes": 4
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "src/arch/conformance.rs",
+      "physical_lines": 510,
+      "sha256": "7173be2dec32283e142110b7eb3040fe53e206651e6868a09a7e43a840219f82",
+      "test_attributes": 19
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "src/arch/registry.rs",
+      "physical_lines": 480,
+      "sha256": "07a568de8818d6d010eaf705e14aa4689ad6f79c550958d9f54c4084409fb27c",
+      "test_attributes": 10
+    },
+    {
+      "ignore_attributes": 0,
+      "path": "src/arch/smoke.rs",
+      "physical_lines": 1367,
+      "sha256": "c99d5f94259bb2abcb1a523605e1acd3c037cf659d1d5caad6ed3dadfa64f071",
+      "test_attributes": 24
+    }
+  ]
+}
