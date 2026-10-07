@@ -1,0 +1,30 @@
+{
+ "schema": "hf2q.adr-review-receipt.v1",
+ "adr": "docs/adr/ADR-061-release-checklist.md",
+ "provider_id": "opencode",
+ "model_id": "glm-5.3",
+ "sessions": {
+  "initial_draft": "ses_ee7fd228dffe9zmNkoan4t3NG1",
+  "final": "ses_ee7b6156dffeitUtf0J1SwhKIY"
+ },
+ "initial_draft_verdict": "accept with edits (3 blockers); draft subsequently replaced by owner direction",
+ "final_verdict": "SIGN-OFF WITH NOTES",
+ "final_notes_applied": [
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10
+ ],
+ "scope": "Read-only document review; no builds, model runs, or tracker changes by the reviewer.",
+ "artifacts": {
+  "glm53-review-initial-draft.md": "8a4d10bcbc09dc37dce2a171ce3920ebb13c9cbba53911be4075fa2b48f0af65",
+  "glm53-review-final.md": "1531bde382788d957f7181e92abf538011c4ffdbed2e3e844bb2e550b00a5ae7",
+  "hf2qus-automation-branch-review.md": "4446556e8e361b021c16021e3ac545774400c59923ea8c70ec5aa659dd87f331"
+ }
+}

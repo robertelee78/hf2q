@@ -1,6 +1,8 @@
 # ADR-061: Release checklist: crate, website, and real use
 
 - **Status**: accepted (owner approval in session, 2026-10-07); not yet implemented
+- **Reviews**: GLM-5.3 via OpenCode, 2026-10-07: SIGN-OFF WITH NOTES, all ten
+  notes applied; record in `docs/research/adr061-review-2026-10-07/`
 - **Date**: 2026-10-07
 - **Deciders**: Robert E. Lee (product owner)
 - **Tags**: release, crates.io, hf2q.us, qualification
@@ -13,8 +15,8 @@ described in RFC 2119.
 ## Context
 
 A release from this repository has three places users get hf2q from:
-the GitHub Release, crates.io, and hf2q.us (which `hf2q update` and the
-`install.sh` one-liner read). v0.1.21 reached only the first. The crate
+the GitHub Release, crates.io, and hf2q.us (which serves the stable record `hf2q update` reads and redirects
+the `install.sh` one-liner to the versioned GitHub release asset). v0.1.21 reached only the first. The crate
 upload was rejected for size (12.28 MiB against the 10 MiB cap) and
 nobody updated hf2q.us, so `hf2q update` could not see the release for 26
 days. Separately, the GLP and GCD features in v0.1.21 were never used the
@@ -30,8 +32,9 @@ every time.
 
 Every release MUST follow it. It has three steps:
 
-1. **Check the crate fits.** Run `cargo package --locked` and confirm the
-   `.crate` is under 10 MiB.
+1. **Bump and check the crate fits.** Set the new version in `Cargo.toml`
+   and refresh `Cargo.lock` on main, then run `cargo package --locked` and
+   confirm `target/package/hf2q-<version>.crate` is under 10 MiB.
 2. **Release.** Dispatch `release.yml` as today. It tags, publishes the
    GitHub Release, and publishes the crate. If any step fails, the release
    MUST NOT be un-drafted by hand; fix and re-run.
@@ -39,7 +42,9 @@ Every release MUST follow it. It has three steps:
    for the new version and deploy.
 
 A release is done when a machine on the previous version runs
-`hf2q update` and gets the new one, and `cargo install hf2q` installs it.
+`hf2q update` and gets the new one, `cargo install hf2q` installs it, and a
+fresh `$HOME` install via `curl -fsSL https://hf2q.us/install.sh | sh`
+followed by `hf2q --version` reports the new version.
 
 QE (D2) is not a step of this checklist. A release never waits on it.
 
@@ -68,7 +73,7 @@ bug escapes:
   with `curl`; the stream ends with `[DONE]`.
 - **J5 Convert.** Convert a Hugging Face model to Q4_K_M, serve it, and check
   that it answers sensibly, not just that it emits tokens.
-- **J6 GCD.** `--gcd`, `--gcd-schema` with the example schema, and
+- **J6 GCD.** `--gcd`, `--gcd-schema` with `examples/recon-opportunities.schema.json`, and
   `--gcd-schema-locked`, through `hf2q chat` and `curl`.
 - **J7 GLP.** `--glp` with an artifact that matches the model, with and
   without `--glp-alpha`, then back to baseline.
@@ -83,13 +88,28 @@ ADR corrections.
 
 GLP and GCD shipped in v0.1.21 without ever being used the way a user would
 use them, so they get a dedicated deep ad hoc pass now, beyond J6 and J7. It MUST exercise every GLP and GCD path the guide and README document:
-`--gcd`, `--gcd-schema`, `--gcd-schema-locked`, `--glp` with a path, `--glp`
-bare auto-discovery, `--glp-alpha`, `--gcd --glp` together, `hf2q calibrate`,
+`--gcd` (including its hidden `--uncensor` alias), `--gcd-schema`,
+`--gcd-schema-locked`, `--glp` with a local path, `--glp` with an explicit Hub
+repository or `huggingface.co` file URL, `--glp` bare auto-discovery, `--glp-alpha`, `--gcd --glp` together, `hf2q calibrate`,
 and switching back to baseline. Each is run through `hf2q chat`, the API, and
-OpenCode where it applies, on every model family the docs claim, checking
-that outputs actually change the way the docs say, that ordinary chat and
-tool calling still work while the feature is on, that bad inputs fail with a
-clear message, and that the documentation matches what really happens.
+OpenCode where it applies, on every model family the docs claim for it
+(Qwen 3.5/3.6/3.8 and DeepSeek-V4 for GLP application, DeepSeek-V4 only for
+`hf2q calibrate`), checking that outputs actually change the way the docs
+say; that ordinary chat and tool calling still work while the feature is on,
+except under `--gcd-schema-locked`, where requests that replace or defer the
+schema are rejected before streaming and requests with tool definitions must
+use `tool_choice: "none"`; that unlocked defaults defer to an explicit
+`grammar`, `response_format`, `json_schema`, or `structured_outputs` request;
+that bad inputs fail with a clear message; and that the documentation matches
+what really happens.
+
+Matching GLP artifacts come from `hf2q calibrate --out <file>` (DeepSeek-V4
+only) or a published checkpoint-matching artifact. A bind refusal for a
+mismatched checkpoint, site, or width and a bare-`--glp` ambiguity rejection
+are documented typed failures, not QE findings. GCD and GLP flags on
+`hf2q chat` take effect only when chat starts its own server; on a chat
+attached with `--url` they do not reconfigure the endpoint, and that is
+documented behavior.
 
 ### D3. Fix the decode hard-lock before the next release
 
@@ -103,7 +123,11 @@ release on all three channels and is the first run of the checklist.
 
 ### D5. ADR-058 status correction
 
-ADR-058 says v0.1.22 shipped; it has not. Correct the status line.
+ADR-058's status line says the tier work is "implemented (v0.1.22)"; v0.1.22
+has not shipped. Replace the status line with: "Accepted — implemented on
+main, first ships in v0.1.22: host preflight in the qualification workflow,
+fast-path tier guard in publish, exact-SHA CI check relaxed to accept
+`workflow_dispatch` runs."
 
 ## Consequences
 
