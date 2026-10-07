@@ -1,8 +1,10 @@
 # ADR-058: Release tiers and the full-gate machine contract
 
-- **Status:** Accepted — implemented (v0.1.22): host preflight in the
-  qualification workflow, fast-path tier guard in publish, exact-SHA CI
-  check relaxed to accept `workflow_dispatch` runs.
+- **Status:** Accepted — implemented on main, first ships in v0.1.22: host
+  preflight in the qualification workflow, fast-path tier guard in publish,
+  exact-SHA CI check relaxed to accept `workflow_dispatch` runs.
+- **Updated:** 2026-10-07 — status corrected per ADR-061 D5; v0.1.22 had not
+  shipped when the earlier line was written.
 - **Date:** 2026-09-10
 - **Related:** ADR-056 (conformance battery), the `release.yml` and
   `cache-lifecycle.yml` workflows, `scripts/release_gate_preflight.sh`
