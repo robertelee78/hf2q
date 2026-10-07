@@ -1,5 +1,9 @@
 # hf2q contributor and agent guide
 
+The key words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY in this document are
+to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/info/rfc2119/).
+Unmarked sentences are descriptive or advisory.
+
 ## Project identity
 
 hf2q is a Rust CLI for converting Hugging Face model weights into GGUF,
@@ -67,39 +71,39 @@ platform-private memory, for anything another agent might need:
   blocked by gate runs (identity checks assert main *ancestry*, not tip);
   compile-quiet applies only during model-gate windows; gate models are
   pinned via repo Actions variables (`<FAMILY>_MODEL_PATH`/`_SHA256`);
-  never delete under `/opt/hf2q/models/` — it is release-gate
-  infrastructure.
+  an agent MUST NOT delete anything under `/opt/hf2q/models/`; it is
+  release-gate infrastructure.
 
 Use Ruflo routing or swarms only when work has genuinely independent lanes and
-the added coordination is useful. Never allow two writers in one worktree.
+the added coordination is useful. Two writers MUST NOT share one worktree.
 One integration owner reconciles manifests, lockfiles, ADRs, and final commits.
 Machine-managed Claude/Codex dual-host guidance belongs in machine-scoped
-configuration and must not be copied into this checked-in file.
+configuration and MUST NOT be copied into this checked-in file.
 
 ## Non-negotiable product boundaries
 
-- hf2q owns conversion and quantization. Production code must not shell out
+- hf2q owns conversion and quantization. Production code MUST NOT shell out
   to Python, the peer engine, mlx-lm, vendor converters, or another
   quantization tool as an implementation or fallback. ("The peer" is the
   pinned upstream GGUF engine used only as a benchmark/parity baseline —
   see `NOTICE` and `data/llama_cpp_pin.txt`.)
-- hf2q owns inference. Production serving and generation must run through the
+- hf2q owns inference. Production serving and generation MUST run through the
   Rust and `mlx-native` paths, not an external inference process.
-- Downloads are the narrow exception. Rust code may use `hf-hub`, and
-  operator or fixture scripts may use Hugging Face tooling, `curl`, or `wget`
-  to retrieve source weights or test data. Retrieval must not outsource
+- Downloads are the narrow exception. Rust code MAY use `hf-hub`, and
+  operator or fixture scripts MAY use Hugging Face tooling, `curl`, or `wget`
+  to retrieve source weights or test data. Retrieval MUST NOT outsource
   conversion, quantization, or inference.
-- Benchmark and parity harnesses may execute external reference programs when
-  the comparison explicitly requires them. Those programs must never become
+- Benchmark and parity harnesses MAY execute external reference programs when
+  the comparison explicitly requires them. Those programs MUST NOT become
   runtime dependencies.
-- Do not download a pre-quantized model to satisfy a conversion request.
-  Given Hugging Face source weights, `hf2q convert` must produce the requested
-  quantized artifact itself.
-- Model-family behavior is explicit. Never silently route an unsupported
+- An agent MUST NOT download a pre-quantized model to satisfy a conversion
+  request. Given Hugging Face source weights, `hf2q convert` MUST produce the
+  requested quantized artifact itself.
+- Model-family behavior is explicit. An agent MUST NOT silently route an unsupported
   architecture through an approximately compatible loader, tokenizer,
   template, cache, or forward graph.
 - Large weights, GGUFs, caches, profiles, and generated artifacts are local
-  data. Never commit them.
+  data and MUST NOT be committed.
 
 ## Agentic serving contract
 
@@ -110,7 +114,7 @@ clients, so correctness is broader than producing one completion:
 - Support tool definitions, assistant tool calls, tool-result messages, and
   the model family's native tool-call encoding.
 - Reuse the unchanged prompt prefix and its KV state across turns. A normal
-  follow-up must not recompute the full conversation.
+  follow-up MUST NOT recompute the full conversation.
 - Invalidate or rebuild cache state safely when the prefix, template, model,
   or inference configuration is incompatible. Never leak state between
   conversations.
@@ -128,8 +132,8 @@ continuation, valid unary/SSE output, and prefix reuse. For performance work,
 report cached-token counts, prefill/decode rates, time to first token, model
 quality, exact prompt/settings, and the matched reference result.
 
-On a 128 GiB host, never co-reside hf2q and peer instances of a roughly
-90 GiB DeepSeek artifact. Verify memory and listeners before each load, run one
+On a 128 GiB host, hf2q and peer instances of a roughly 90 GiB DeepSeek
+artifact MUST NOT be co-resident. Verify memory and listeners before each load, run one
 full-model runtime at a time, and unload it before starting the reference.
 
 ## Source layout
@@ -205,7 +209,7 @@ cargo run --locked -- doctor
 CI treats `cargo check`, the release build, hosted-safe tests, and the unsafe
 experiment activation matrix as blocking. Clippy and whole-tree rustfmt are
 currently informational because the legacy tree has existing debt. Keep edited
-code rustfmt-compatible, but do not reformat unrelated files.
+code rustfmt-compatible, but MUST NOT reformat unrelated files.
 
 Metal execution, real-model generation, and parity/performance checks require
 an appropriate Apple Silicon host and local model artifacts. Unit tests alone
@@ -221,24 +225,46 @@ do not prove a model-serving change.
 - Verify output parity or the documented quality threshold before accepting a
   speedup. Structurally valid JSON with the wrong tool or arguments is a fail.
 - Preserve failed experiments in their isolated branch or worktree when they
-  contain useful evidence; do not land them on `main`.
+  contain useful evidence; they MUST NOT land on `main`.
 - Do not publish performance claims that cannot be reproduced from a
   checked-in script or documented command.
 
 ## Code and git hygiene
 
-- Preserve unrelated user changes in a dirty worktree.
-- Do not add secrets, credentials, `.env` files, local paths, model artifacts,
-  generated machine configuration, or memory databases.
-- Validate paths and untrusted API input at boundaries.
-- Avoid growing legacy files beyond roughly 500 lines; extract a focused
+- Unrelated user changes in a dirty worktree MUST be preserved.
+- Secrets, credentials, `.env` files, local paths, model artifacts, generated
+  machine configuration, and memory databases MUST NOT be added.
+- Paths and untrusted API input MUST be validated at boundaries.
+- Legacy files SHOULD NOT grow beyond roughly 500 lines; extract a focused
   module when practical.
-- Use focused conventional commits such as `feat(scope): ...`,
+- Commits SHOULD be focused conventional commits such as `feat(scope): ...`,
   `fix(scope): ...`, `perf(scope): ...`, and `test(scope): ...`.
-- Do not add `Co-Authored-By` trailers unless the repository explicitly
+- `Co-Authored-By` trailers MUST NOT be added unless the repository explicitly
   authorizes them.
-- Do not commit, push, merge, release, delete worktrees, or discard changes
-  unless the user has authorized that action.
+- An agent MUST NOT commit, push, merge, release, delete worktrees, or discard
+  changes unless the user has authorized that action.
 
 `main` is the integration branch. A local passing commit is not a published
-release, and an unpushed commit must be described as local.
+release, and an unpushed commit MUST be described as local.
+
+### Worktree discipline
+
+- The primary checkout at `/opt/hf2q` MUST stay on `main`. An agent MUST NOT
+  check out another branch there. The primary checkout hosts
+  `/opt/hf2q/models` and is the path the canonical launcher scripts and the
+  self-hosted release gates execute from, so a topic branch parked there would
+  run unreviewed code.
+- Every change MUST be made in its own worktree under `/opt/hf2q-worktrees/`
+  on a topic branch cut from current `main`, with one writer per worktree.
+- A finished change MUST be committed on its topic branch, pushed, reviewed
+  as the change warrants, and merged to `main`.
+- The primary checkout MUST only be updated by fast-forwarding `main`.
+- After `main` has been fast-forwarded past the merge, the owner of the
+  worktree SHOULD remove it and its local topic branch.
+- Files that a tool generates into a checkout, such as a rewritten
+  `CLAUDE.md` or `AGENTS.md`, `.claude/`, `.claude-flow/`, or `.agentic-qe/`,
+  MUST NOT be committed. An agent that finds the primary checkout dirty with
+  such files MUST restore them from `HEAD` instead of carrying them into a
+  change.
+- Rust builds in worktrees MAY share one target directory through
+  `CARGO_TARGET_DIR`, but two worktrees MUST NOT build into it concurrently.
