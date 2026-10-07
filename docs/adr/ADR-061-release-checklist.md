@@ -28,34 +28,29 @@ every time.
 
 ### D1. `docs/RELEASING.md` is the release checklist
 
-Every release MUST follow steps 2 to 4. Step 1 is the owner's call per
-release.
+Every release MUST follow it. It has three steps:
 
-1. **QE pass, when the owner asks for one.** An agent runs the QE playbook
-   (D2) against the release candidate and records the results in
-   `docs/qe/<version>.md`. Anything that breaks is fixed before releasing,
-   or the owner writes down why it can wait. The owner MAY skip this step
-   for a release.
-2. **Check the crate fits.** Run `cargo package --locked` and confirm the
+1. **Check the crate fits.** Run `cargo package --locked` and confirm the
    `.crate` is under 10 MiB.
-3. **Release.** Dispatch `release.yml` as today. It tags, publishes the
+2. **Release.** Dispatch `release.yml` as today. It tags, publishes the
    GitHub Release, and publishes the crate. If any step fails, the release
    MUST NOT be un-drafted by hand; fix and re-run.
-4. **Update the website.** In hf2q.us, follow `docs/release-activation.md`
+3. **Update the website.** In hf2q.us, follow `docs/release-activation.md`
    for the new version and deploy.
 
 A release is done when a machine on the previous version runs
 `hf2q update` and gets the new one, and `cargo install hf2q` installs it.
 
-### D2. QE playbook: the product used as a user would
+QE (D2) is not a step of this checklist. A release never waits on it.
 
-`docs/qe-playbook.md` is a hands-on, ad hoc QE process that agents run on
-demand when the owner asks, for a release candidate or at any other time. The
-agent drives the real binary on an Apple Silicon machine the way a person
-would. The playbook MUST be written so an agent can follow it from a single
-request such as "run the QE pass on this build". It MUST NOT be turned into a CI gate,
-a workflow step, or a parsed artifact; CI stays simple and fast. Its output
-is a short written record: what was run, with which binary and model files,
+### D2. Ad hoc QE playbook: the product used as a user would
+
+`docs/qe-playbook.md` is a hands-on QE process that agents run ad hoc, when
+the owner asks, against whatever build the owner names. It is not a release
+step and MUST NOT become a CI gate, a workflow step, or a required check; CI
+stays simple and fast. The playbook MUST be written so an agent can follow it
+from a single request such as "run the QE pass on this build". Its output is
+a short written record: what was run, with which binary and model files,
 what happened, and anything that felt wrong even if it did not fail.
 
 The playbook covers at least these journeys, and grows whenever a user-facing
@@ -83,12 +78,11 @@ bug escapes:
 - **J9 Vision.** One image turn through `hf2q chat` and one through the API
   using the guide's red-image check.
 
-Problems found during QE MAY lead to research and ADR corrections before the
-release proceeds.
+Problems found during QE are filed as issues and MAY lead to research and
+ADR corrections.
 
 GLP and GCD shipped in v0.1.21 without ever being used the way a user would
-use them, so before v0.1.22 they get a dedicated deep hands-on pass beyond J6
-and J7. It MUST exercise every GLP and GCD path the guide and README document:
+use them, so they get a dedicated deep ad hoc pass now, beyond J6 and J7. It MUST exercise every GLP and GCD path the guide and README document:
 `--gcd`, `--gcd-schema`, `--gcd-schema-locked`, `--glp` with a path, `--glp`
 bare auto-discovery, `--glp-alpha`, `--gcd --glp` together, `hf2q calibrate`,
 and switching back to baseline. Each is run through `hf2q chat`, the API, and
@@ -100,7 +94,7 @@ clear message, and that the documentation matches what really happens.
 ### D3. Fix the decode hard-lock before the next release
 
 Reproduce it on the 0.1.21 binary, find the cause, fix it on main, and
-confirm the J2 chat session in the QE playbook no longer locks.
+confirm a long `hf2q chat` session no longer locks.
 
 ### D4. 0.1.21 stays off crates.io
 
@@ -113,9 +107,11 @@ ADR-058 says v0.1.22 shipped; it has not. Correct the status line.
 
 ## Consequences
 
-- Every release gets a real hands-on QE pass and the website step that was
-  previously forgotten.
-- No new workflows, jobs, or CI gates. QE stays outside CI by design.
+- Every release gets the crate and website steps that were previously
+  forgotten.
+- Agents can run a thorough hands-on QE pass whenever the owner asks.
+- No new workflows, jobs, or CI gates. QE is ad hoc and outside both CI and
+  the release checklist by design.
 
 ## Links
 
