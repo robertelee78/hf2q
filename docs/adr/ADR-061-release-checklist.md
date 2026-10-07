@@ -28,11 +28,14 @@ every time.
 
 ### D1. `docs/RELEASING.md` is the release checklist
 
-Every release MUST follow it. It has four parts:
+Every release MUST follow steps 2 to 4. Step 1 is the owner's call per
+release.
 
-1. **QE pass.** Run the QE playbook (D2) against the release candidate and
-   record the results in `docs/qe/<version>.md`. Anything that breaks is
-   fixed before releasing, or the owner writes down why it can wait.
+1. **QE pass, when the owner asks for one.** An agent runs the QE playbook
+   (D2) against the release candidate and records the results in
+   `docs/qe/<version>.md`. Anything that breaks is fixed before releasing,
+   or the owner writes down why it can wait. The owner MAY skip this step
+   for a release.
 2. **Check the crate fits.** Run `cargo package --locked` and confirm the
    `.crate` is under 10 MiB.
 3. **Release.** Dispatch `release.yml` as today. It tags, publishes the
@@ -46,9 +49,11 @@ A release is done when a machine on the previous version runs
 
 ### D2. QE playbook: the product used as a user would
 
-`docs/qe-playbook.md` is a hands-on, ad hoc QE process. A person, or an agent
-driving the real binary the way a person would, runs it on an Apple Silicon
-machine against the release candidate. It MUST NOT be turned into a CI gate,
+`docs/qe-playbook.md` is a hands-on, ad hoc QE process that agents run on
+demand when the owner asks, for a release candidate or at any other time. The
+agent drives the real binary on an Apple Silicon machine the way a person
+would. The playbook MUST be written so an agent can follow it from a single
+request such as "run the QE pass on this build". It MUST NOT be turned into a CI gate,
 a workflow step, or a parsed artifact; CI stays simple and fast. Its output
 is a short written record: what was run, with which binary and model files,
 what happened, and anything that felt wrong even if it did not fail.
