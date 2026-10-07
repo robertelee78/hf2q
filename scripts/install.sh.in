@@ -112,7 +112,11 @@ main() {
     || fail 'downloaded SHA-256 does not match the immutable release'
 
   if [ "${HF2Q_INSTALL_TEST_MODE:-0}" != 1 ]; then
-    [ "$(/usr/bin/lipo -archs "$candidate" 2>/dev/null)" = arm64 ] \
+    # Read the Mach-O header directly: thin 64-bit, CPU arm64, subtype ALL,
+    # MH_EXECUTE. /usr/bin/lipo is an Xcode developer-tools shim that fails
+    # on Macs without accepted developer tools, so it must not be required.
+    mach_header=$(/usr/bin/od -An -tx1 -N16 "$candidate" | /usr/bin/tr -d ' \n')
+    [ "$mach_header" = cffaedfe0c0000010000000002000000 ] \
       || fail 'release is not an exact thin Apple-Silicon executable'
     /usr/bin/codesign --verify --strict --all-architectures --verbose=2 \
       "$candidate" >/dev/null 2>&1 \

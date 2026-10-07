@@ -33,8 +33,20 @@ expected_record=$(printf '{"kind":"hf2q.standalone-release","schema_version":1,"
 [[ $(cat "$release_record") == "$expected_record" ]]
 [[ $(stat -f '%Lp' "$release_record") == 444 ]]
 # shellcheck disable=SC2016
-grep -Fq '[ "$(/usr/bin/lipo -archs "$candidate" 2>/dev/null)" = arm64 ]' \
-  "$TEMPLATE"
+# The architecture check reads the Mach-O header with base-macOS tools; the
+# Xcode-shim /usr/bin/lipo fails on Macs without accepted developer tools.
+header_expr='$(/usr/bin/od -An -tx1 -N16 "$candidate" | /usr/bin/tr -d '"'"' \n'"'"')'
+grep -Fq "mach_header=$header_expr" "$TEMPLATE"
+grep -Fq '[ "$mach_header" = cffaedfe0c0000010000000002000000 ]' "$TEMPLATE"
+if grep -Fq '/usr/bin/lipo -' "$TEMPLATE"; then
+  echo 'installer must not depend on the Xcode lipo shim' >&2
+  exit 1
+fi
+mach_header_of() {
+  /usr/bin/od -An -tx1 -N16 "$1" | /usr/bin/tr -d ' \n'
+}
+[[ $(mach_header_of "$HF2Q_BIN") == cffaedfe0c0000010000000002000000 ]]
+[[ $(mach_header_of /bin/ls) != cffaedfe0c0000010000000002000000 ]]
 grep -Fq '/usr/sbin/sysctl -n hw.optional.arm64' "$TEMPLATE"
 grep -Fq "[ \"\$macos_major\" -ge 14 ]" "$TEMPLATE"
 # shellcheck disable=SC2016

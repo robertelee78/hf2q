@@ -31,7 +31,6 @@ const RECORD_TIMEOUT: Duration = Duration::from_secs(60);
 const ASSET_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_SIGNING_INFO_BYTES: usize = 64 * 1024;
 const MAX_VERSION_OUTPUT_BYTES: usize = 256;
-const MAX_ARCHITECTURE_OUTPUT_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -355,31 +354,27 @@ fn verify_apple_release(
     }
 }
 
+/// Mach-O header of a thin 64-bit arm64 (subtype ALL) `MH_EXECUTE` image.
+/// Read directly instead of running `/usr/bin/lipo`, which is an Xcode
+/// developer-tools shim that fails on Macs without accepted developer tools.
+const THIN_ARM64_EXECUTE_HEADER: [u8; 16] = [
+    0xcf, 0xfa, 0xed, 0xfe, // MH_MAGIC_64, little-endian
+    0x0c, 0x00, 0x00, 0x01, // CPU_TYPE_ARM64
+    0x00, 0x00, 0x00, 0x00, // CPU_SUBTYPE_ARM64_ALL
+    0x02, 0x00, 0x00, 0x00, // MH_EXECUTE
+];
+
 #[cfg(target_os = "macos")]
 fn verify_thin_arm64(path: &Path) -> Result<(), StandaloneError> {
-    let output = Command::new("/usr/bin/lipo")
-        .arg("-archs")
-        .arg(path)
-        .output()
+    let mut header = [0_u8; 16];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
         .map_err(|error| StandaloneError::io("inspect candidate architecture", error))?;
-    if !output.status.success()
-        || output.stdout.len() > MAX_ARCHITECTURE_OUTPUT_BYTES
-        || output.stderr.len() > MAX_ARCHITECTURE_OUTPUT_BYTES
-        || !output.stderr.is_empty()
-        || parse_thin_arm64(&output.stdout).is_err()
-    {
-        return Err(StandaloneError::Trust(
-            "candidate is not an exact thin Apple-Silicon executable",
-        ));
-    }
-    Ok(())
+    parse_thin_arm64(&header)
 }
 
-fn parse_thin_arm64(output: &[u8]) -> Result<(), StandaloneError> {
-    let text = std::str::from_utf8(output)
-        .map_err(|_| StandaloneError::Trust("candidate architecture was not UTF-8"))?;
-    let mut architectures = text.split_ascii_whitespace();
-    if architectures.next() != Some("arm64") || architectures.next().is_some() {
+fn parse_thin_arm64(header: &[u8]) -> Result<(), StandaloneError> {
+    if header.get(..THIN_ARM64_EXECUTE_HEADER.len()) != Some(&THIN_ARM64_EXECUTE_HEADER[..]) {
         return Err(StandaloneError::Trust(
             "candidate is not an exact thin Apple-Silicon executable",
         ));
@@ -566,12 +561,24 @@ mod tests {
 
     #[test]
     fn standalone_candidate_architecture_is_exactly_thin_arm64() {
-        parse_thin_arm64(b"arm64\n").expect("thin arm64");
-        assert!(parse_thin_arm64(b"x86_64\n").is_err());
-        assert!(parse_thin_arm64(b"arm64 x86_64\n").is_err());
-        assert!(parse_thin_arm64(b"arm64e\n").is_err());
-        assert!(parse_thin_arm64(b"").is_err());
-        assert!(parse_thin_arm64(b"arm64\xff").is_err());
+        let thin = THIN_ARM64_EXECUTE_HEADER;
+        parse_thin_arm64(&thin).expect("thin arm64 executable");
+        let mut longer = thin.to_vec();
+        longer.extend_from_slice(&[0x19, 0x00, 0x00, 0x00]);
+        parse_thin_arm64(&longer).expect("header prefix of a larger image");
+        // Universal (fat) image.
+        assert!(parse_thin_arm64(&[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2, 1, 0, 0, 7, 0, 0, 0, 3]).is_err());
+        let mut x86 = thin;
+        x86[4..8].copy_from_slice(&[0x07, 0x00, 0x00, 0x01]);
+        assert!(parse_thin_arm64(&x86).is_err());
+        let mut arm64e = thin;
+        arm64e[8] = 0x02;
+        assert!(parse_thin_arm64(&arm64e).is_err());
+        let mut dylib = thin;
+        dylib[12] = 0x06;
+        assert!(parse_thin_arm64(&dylib).is_err());
+        assert!(parse_thin_arm64(&thin[..15]).is_err());
+        assert!(parse_thin_arm64(&[]).is_err());
     }
 
     #[test]
