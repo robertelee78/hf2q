@@ -28,10 +28,13 @@ described in RFC 2119.
    configuration:
 
    ```bash
-   export QE=$(mktemp -d /tmp/hf2q-qe.XXXXXX)
+   export QE=$(mktemp -d /private/tmp/hf2q-qe.XXXXXX)
    export QE_HOME=$QE/home; mkdir -p "$QE_HOME"
    # run hf2q with HOME="$QE_HOME" unless a journey says otherwise
    ```
+
+   Use `/private/tmp`, not `/tmp`: `/tmp` is a symlink and `hf2q setup`
+   refuses a home path that contains one.
 
    Model files MAY be reused from the owner's managed directory
    (`~/.local/share/hf2q/models/`) by passing their absolute path.
@@ -124,11 +127,13 @@ answer.
 
 ### J5 Convert
 
-Convert a small Hugging Face source model and use it:
+Convert a small Hugging Face source model from a supported family and use
+it (plain `qwen3` is not a supported conversion architecture; Qwen3.5 is).
+The 2B model converts in about a minute and also produces an mmproj:
 
 ```bash
-HOME=$QE_HOME hf2q convert Qwen/Qwen3-0.6B --quant q4_k_m --output $QE/qwen3-0.6b-q4km.gguf
-HOME=$QE_HOME hf2q serve $QE/qwen3-0.6b-q4km.gguf
+HOME=$QE_HOME hf2q convert Qwen/Qwen3.5-2B --quant q4_k_m --output $QE/qwen35-2b-q4km.gguf
+HOME=$QE_HOME hf2q serve $QE/qwen35-2b-q4km.gguf
 ```
 
 Ask three plain factual questions in `hf2q chat` (capital of France, 12 x 12,
@@ -155,9 +160,18 @@ rejections happen with a clear message; nothing hangs.
 
 ### J7 GLP
 
-Needs an artifact that matches the served checkpoint (see the GLP/GCD deep
-pass for sources). Serve with `--glp <artifact>`, chat; then with
-`--glp-alpha 0.5`; then without `--glp`.
+Needs an artifact that matches the served checkpoint exactly. No GLP
+artifact is published for the guide's abliterated SFT checkpoint, so use the
+stock model and its published artifact:
+
+```bash
+HOME=$QE_HOME hf2q serve Qwen/Qwen3.8-27B:Q4_K_M --glp msuiche/Qwen3.8-27B-abliterated-cyber-GLP-49
+```
+
+If no stock Q4_K_M is available, convert one first with `hf2q convert
+Qwen/Qwen3.8-27B --quant q4_k_m`. Chat with it; restart with `--glp-alpha 0.5`;
+then restart without `--glp`. A bind refusal against the abliterated SFT
+checkpoint is expected behavior, not a finding.
 
 Pass: loads or fails with the documented typed error; outputs change when
 steering is on; returning to baseline restores baseline behavior.
@@ -173,8 +187,9 @@ Pass: each step does what it says; config and model data survive uninstall.
 
 ### J9 Vision
 
-Run the red-image check from `docs/getting-started.md` section 5, then send
-the same image through `hf2q chat` if it supports attachments.
+Run the red-image check from `docs/getting-started.md` section 5 against the
+served guide pair. `hf2q chat` has no image or attachment input, so vision is
+exercised through the API only; record that gap in the record.
 
 Pass: the reply says red.
 
