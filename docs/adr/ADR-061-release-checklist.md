@@ -86,6 +86,17 @@ bug escapes:
 Problems found during QE MAY lead to research and ADR corrections before the
 release proceeds.
 
+GLP and GCD shipped in v0.1.21 without ever being used the way a user would
+use them, so before v0.1.22 they get a dedicated deep hands-on pass beyond J6
+and J7. It MUST exercise every GLP and GCD path the guide and README document:
+`--gcd`, `--gcd-schema`, `--gcd-schema-locked`, `--glp` with a path, `--glp`
+bare auto-discovery, `--glp-alpha`, `--gcd --glp` together, `hf2q calibrate`,
+and switching back to baseline. Each is run through `hf2q chat`, the API, and
+OpenCode where it applies, on every model family the docs claim, checking
+that outputs actually change the way the docs say, that ordinary chat and
+tool calling still work while the feature is on, that bad inputs fail with a
+clear message, and that the documentation matches what really happens.
+
 ### D3. Fix the decode hard-lock before the next release
 
 Reproduce it on the 0.1.21 binary, find the cause, fix it on main, and
