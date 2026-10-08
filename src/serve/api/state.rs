@@ -1151,6 +1151,17 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    /// Cause of the first dead engine in the pool, if any. Readiness and
+    /// the request gate use this to report an explicit, terminal failure
+    /// instead of the transient warmup state.
+    pub fn engine_failure(&self) -> Option<String> {
+        self.pool.try_read().ok().and_then(|pool| {
+            pool.snapshot_engines()
+                .into_iter()
+                .find_map(|loaded| loaded.engine.failure_detail())
+        })
+    }
+
     /// Allocate the next request counter value.
     pub fn next_request_seq(&self) -> u64 {
         self.request_counter.fetch_add(1, Ordering::Relaxed)

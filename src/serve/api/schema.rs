@@ -286,6 +286,20 @@ impl ApiError {
         e
     }
 
+    /// The inference engine thread died (panic or unexpected exit) (HTTP
+    /// 503). Terminal for this process: the message tells the operator to
+    /// restart `hf2q serve`, and no `Retry-After` is sent because retrying
+    /// against the same process cannot succeed.
+    pub fn engine_failed(message: impl Into<String>) -> Self {
+        Self::bare(
+            StatusCode::SERVICE_UNAVAILABLE,
+            message.into(),
+            "server_error",
+            Some("engine_failed"),
+            None,
+        )
+    }
+
     /// Generation error (HTTP 500) — Metal failure, decoder panic caught, etc.
     pub fn generation_error(detail: impl Into<String>) -> Self {
         Self::bare(
@@ -498,7 +512,7 @@ pub struct HealthResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReadyzResponse {
     pub ready: bool,
-    pub detail: &'static str,
+    pub detail: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1941,7 +1955,7 @@ mod tests {
     fn test_readyz_response_serialization() {
         let resp = ReadyzResponse {
             ready: false,
-            detail: "warming up",
+            detail: "warming up".into(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["ready"], false);

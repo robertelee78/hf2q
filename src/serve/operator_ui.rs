@@ -41,6 +41,10 @@ const STRUCTURED_PROGRESS_MESSAGES: &[&str] = &[
 static EVENT_SINK: Mutex<Option<SyncSender<Event>>> = Mutex::new(None);
 static EVENT_SINK_STOPPING: AtomicBool = AtomicBool::new(false);
 static STARTUP_LOG_SINK: Mutex<Option<StartupLogBuffer>> = Mutex::new(None);
+/// Sticky engine-failure reason. Dashboard events are best-effort
+/// `try_send`, so a full queue could drop the one event that matters; the
+/// render loop also polls this slot so the failure is always shown.
+static ENGINE_FAILURE: Mutex<Option<String>> = Mutex::new(None);
 
 struct StartupLogBuffer {
     lines: VecDeque<String>,
@@ -493,6 +497,9 @@ pub(crate) fn request_finished(family: &'static str, id: u64, outcome: &'static 
 }
 
 pub(crate) fn engine_unhealthy(reason: String) {
+    if let Ok(mut failure) = ENGINE_FAILURE.lock() {
+        failure.get_or_insert_with(|| reason.clone());
+    }
     let _ = publish(Event::Unhealthy(reason));
 }
 
@@ -557,6 +564,15 @@ fn render_loop(
             if !apply_event(&mut state, event) {
                 running = false;
                 break;
+            }
+        }
+        if state.unhealthy.is_none() {
+            let sticky = ENGINE_FAILURE
+                .lock()
+                .ok()
+                .and_then(|failure| failure.clone());
+            if let Some(reason) = sticky {
+                apply_event(&mut state, Event::Unhealthy(reason));
             }
         }
         let now = Instant::now();
@@ -657,7 +673,30 @@ fn apply_event(state: &mut DashboardState, event: Event) -> bool {
                 request.finished_at = Some(Instant::now());
             }
         }
-        Event::Unhealthy(reason) => state.unhealthy = Some(reason),
+        Event::Unhealthy(reason) => {
+            if state.unhealthy.is_some() {
+                return true;
+            }
+            // The worker is gone: no further progress events will arrive for
+            // in-flight rows, so mark them failed instead of leaving a frozen
+            // prefill/decode line, and record a lifecycle event line.
+            let now = Instant::now();
+            for request in state.requests.values_mut() {
+                if matches!(
+                    request.phase,
+                    Phase::Queued | Phase::Prefill | Phase::Decode
+                ) {
+                    request.phase = Phase::Failed;
+                    request.finished_at = Some(now);
+                }
+            }
+            let line = console::strip_ansi_codes(&reason).trim().to_owned();
+            state.logs.push_back(format!("ERROR engine failed: {line}"));
+            while state.logs.len() > MAX_LOG_LINES {
+                state.logs.pop_front();
+            }
+            state.unhealthy = Some(reason);
+        }
         Event::HttpReady => state.http_ready = true,
         Event::Log(line) => {
             let line = console::strip_ansi_codes(&line).trim().to_owned();
@@ -857,6 +896,63 @@ mod tests {
             state.unhealthy.as_deref(),
             Some("engine_unhealthy: restart required")
         );
+    }
+
+    #[test]
+    fn engine_failure_replaces_frozen_progress_with_failed_rows_and_event_line() {
+        let mut state = DashboardState {
+            model: "test".into(),
+            family: "qwen35".into(),
+            endpoint: "http://127.0.0.1:8081".into(),
+            max_slots: 4,
+            started: Instant::now(),
+            requests: BTreeMap::new(),
+            logs: VecDeque::new(),
+            unhealthy: None,
+            http_ready: true,
+        };
+        let key = RequestKey {
+            family: "qwen35",
+            id: 3,
+        };
+        apply_event(
+            &mut state,
+            Event::Started {
+                key,
+                slot: Some(0),
+                mode: "slot-stream",
+                prompt_tokens: 1_000,
+                max_tokens: 64,
+            },
+        );
+        apply_event(
+            &mut state,
+            Event::PrefillProgress {
+                key,
+                processed_tokens: 500,
+                work_tokens: 1_000,
+                tokens_per_second: 100.0,
+            },
+        );
+        let reason = "engine_failed: the inference engine stopped (engine thread panicked at x.rs:1: boom); restart `hf2q serve` to recover";
+        assert!(apply_event(&mut state, Event::Unhealthy(reason.into())));
+
+        let request = state.requests.get(&key).expect("row retained briefly");
+        assert_eq!(request.phase, Phase::Failed);
+        assert!(request.finished_at.is_some());
+        let row = render_request(request, 160);
+        assert!(row.contains("failed"), "{row}");
+        assert!(!row.contains("ETA"), "{row}");
+        assert_eq!(state.unhealthy.as_deref(), Some(reason));
+        assert!(state
+            .logs
+            .back()
+            .is_some_and(|line| line.starts_with("ERROR engine failed:") && line.contains("boom")));
+
+        // A repeated failure event does not duplicate the event line.
+        let logs = state.logs.len();
+        assert!(apply_event(&mut state, Event::Unhealthy(reason.into())));
+        assert_eq!(state.logs.len(), logs);
     }
 
     #[test]

@@ -1761,6 +1761,11 @@ where
     // the readiness flag.  The 503 here is the same `not_ready` that
     // `/readyz` would return; clients should respect `Retry-After: 1`.
     if !state.is_ready_for_gen() {
+        if let Some(cause) = state.engine_failure() {
+            return Err(
+                ApiError::engine_failed(engine::engine_failed_message(&cause)).into_response(),
+            );
+        }
         return Err(ApiError::not_ready().into_response());
     }
     if req.max_completion_tokens.or(req.max_tokens) == Some(0) {
@@ -1808,11 +1813,8 @@ where
     let loaded_engine = resolved_engine.loaded_engine;
     let model_lease = resolved_engine.model_lease;
     let engine: &Engine = &loaded_engine.engine;
-    if !engine.is_worker_healthy() {
-        return Err(
-            ApiError::engine_unhealthy(engine::ENGINE_UNHEALTHY_MESSAGE.to_string())
-                .into_response(),
-        );
+    if let Some(cause) = engine.failure_detail() {
+        return Err(ApiError::engine_failed(engine::engine_failed_message(&cause)).into_response());
     }
     // --- Multimodal content pipeline (Phase 2c — Decision #1, iter-99) ---
     // Scan messages for `image_url` content parts; if any are present,
@@ -7648,6 +7650,9 @@ fn common_engine_error_response(state: Option<&AppState>, msg: &str) -> Option<R
         let (needed, budget) = parse_slot_budget_exceeded(msg);
         return Some(ApiError::slot_budget_exceeded(needed, budget).into_response());
     }
+    if msg.contains(engine::ENGINE_FAILED_SENTINEL) {
+        return Some(ApiError::engine_failed(msg.to_string()).into_response());
+    }
     if msg.contains(engine::ENGINE_UNHEALTHY_SENTINEL) {
         return Some(ApiError::engine_unhealthy(msg.to_string()).into_response());
     }
@@ -8778,7 +8783,18 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             StatusCode::OK,
             Json(ReadyzResponse {
                 ready: true,
-                detail: "ready",
+                detail: "ready".into(),
+            }),
+        )
+            .into_response()
+    } else if let Some(cause) = state.engine_failure() {
+        // Terminal: never report "warming up" for a dead engine, and omit
+        // Retry-After because only a process restart recovers.
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadyzResponse {
+                ready: false,
+                detail: format!("engine failed: {cause}"),
             }),
         )
             .into_response()
@@ -8787,7 +8803,7 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ReadyzResponse {
                 ready: false,
-                detail: "warming up",
+                detail: "warming up".into(),
             }),
         )
             .into_response();
@@ -10851,9 +10867,18 @@ mod readiness_guard_tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "arch={arch:?}"
             );
+            assert!(
+                ready_response.headers().get(RETRY_AFTER).is_none(),
+                "a dead engine is terminal; Retry-After would invite futile retries (arch={arch:?})"
+            );
+            let ready_body = axum::body::to_bytes(ready_response.into_body(), usize::MAX)
+                .await
+                .expect("read readyz body");
+            let ready_json: serde_json::Value =
+                serde_json::from_slice(&ready_body).expect("readyz JSON");
+            assert_eq!(ready_json["ready"], false, "arch={arch:?}");
             assert_eq!(
-                ready_response.headers().get(RETRY_AFTER),
-                Some(&axum::http::HeaderValue::from_static("1")),
+                ready_json["detail"], "engine failed: inference worker stopped",
                 "arch={arch:?}"
             );
 
@@ -10880,7 +10905,7 @@ mod readiness_guard_tests {
     }
 
     #[tokio::test]
-    async fn engine_dying_during_resolution_maps_to_engine_unhealthy_503() {
+    async fn engine_dying_during_resolution_maps_to_engine_failed_503() {
         let state = AppState::new(ServerConfig::default());
         assert!(state.is_ready_for_gen(), "empty pool starts globally ready");
         let engine = engine::make_synthetic_engine_for_test(engine::LoadedArch::Qwen35);
@@ -10911,10 +10936,159 @@ mod readiness_guard_tests {
             Ok(_) => panic!("resolver-returned dead engine must reject generation"),
         };
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers().get(RETRY_AFTER),
-            Some(&axum::http::HeaderValue::from_static("1"))
+        assert!(response.headers().get(RETRY_AFTER).is_none());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read error body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("error JSON");
+        assert_eq!(json["error"]["code"], "engine_failed", "{json}");
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        serde_json::from_slice(&body).expect("response JSON")
+    }
+
+    /// Issue #250: an engine-thread panic must surface as an explicit,
+    /// terminal failure — the in-flight stream ends with an error naming the
+    /// failure, `/readyz` reports `engine failed: <panic>` (never "warming
+    /// up"), and new requests get a 503 `engine_failed` telling the operator
+    /// to restart `hf2q serve`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_thread_panic_fails_stream_readiness_and_requests_visibly() {
+        let (engine, panic_trigger) =
+            engine::make_synthetic_engine_that_panics(engine::LoadedArch::Gemma);
+        let state = AppState::new(ServerConfig::default());
+        state
+            .pool
+            .write()
+            .expect("lock pool")
+            .admit_for_test("panic-model", QuantType::Q4_K_M, 1_024, engine.clone())
+            .expect("admit panicking synthetic engine");
+        assert!(state.is_ready_for_gen(), "engine starts healthy");
+
+        // In-flight streaming request: one delta, then the worker panics.
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
+        engine
+            .generate_stream(
+                vec![1, 2, 3],
+                SamplingParams::default(),
+                events_tx,
+                None,
+                vec![],
+            )
+            .await
+            .expect("stream admitted before the panic");
+        let mut events = engine.supervise_stream_events(events_rx);
+        let mut terminal = None;
+        while let Some(event) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("pending stream must terminate, not hang")
+        {
+            match event {
+                super::super::sse::GenerationEvent::Delta { .. } => {
+                    // The request is in flight; now kill the engine thread.
+                    let _ = panic_trigger.send(());
+                }
+                other => {
+                    terminal = Some(other);
+                    break;
+                }
+            }
+        }
+        match terminal {
+            Some(super::super::sse::GenerationEvent::Error(message)) => {
+                assert!(
+                    message.starts_with(engine::ENGINE_FAILED_SENTINEL),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(engine::SYNTHETIC_ENGINE_PANIC_MESSAGE),
+                    "{message}"
+                );
+                assert!(message.contains("restart `hf2q serve`"), "{message}");
+            }
+            other => panic!("stream must end with an engine_failed Error, got {other:?}"),
+        }
+
+        // Readiness is an explicit failure state carrying the panic message.
+        assert!(!state.is_ready_for_gen());
+        let ready = readyz(State(state.clone())).await.into_response();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(ready.headers().get(RETRY_AFTER).is_none());
+        let ready = json_body(ready).await;
+        assert_eq!(ready["ready"], false);
+        let detail = ready["detail"].as_str().expect("detail string");
+        assert!(detail.starts_with("engine failed: "), "{detail}");
+        assert!(
+            detail.contains(engine::SYNTHETIC_ENGINE_PANIC_MESSAGE),
+            "{detail}"
         );
+        assert!(!detail.contains("warming up"), "{detail}");
+
+        // New requests get a distinct terminal 503, not `not_ready`.
+        let resolver = |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
+            unreachable!("a failed engine must be rejected before resolution")
+        };
+        let response = match prepare_chat_generation_core(
+            &state,
+            &minimal_chat_request("panic-model"),
+            None,
+            resolver,
+        )
+        .await
+        {
+            Err(response) => response,
+            Ok(_) => panic!("failed engine must reject generation"),
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(RETRY_AFTER).is_none());
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "engine_failed", "{body}");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains("the inference engine stopped"),
+            "{message}"
+        );
+        assert!(message.contains("restart `hf2q serve`"), "{message}");
+        assert!(
+            message.contains(engine::SYNTHETIC_ENGINE_PANIC_MESSAGE),
+            "{message}"
+        );
+        assert!(!message.contains("warming up"), "{message}");
+    }
+
+    /// A queued unary request whose worker dies before replying is finished
+    /// with the engine_failed error (mapped to HTTP 503), never left hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_unary_request_finishes_with_engine_failed_on_panic() {
+        let (engine, _panic_trigger) =
+            engine::make_synthetic_engine_that_panics(engine::LoadedArch::Qwen35);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.generate(vec![1, 2, 3], SamplingParams::default()),
+        )
+        .await
+        .expect("pending unary request must terminate, not hang")
+        .expect_err("a panicking worker cannot produce a result");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(engine::ENGINE_FAILED_SENTINEL),
+            "{message}"
+        );
+        assert!(
+            message.contains(engine::SYNTHETIC_ENGINE_PANIC_MESSAGE),
+            "{message}"
+        );
+        let state = AppState::new(ServerConfig::default());
+        let response = common_engine_error_response(Some(&state), &message)
+            .expect("engine_failed has an HTTP mapping");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json_body(response).await["error"]["code"], "engine_failed");
+        assert!(engine.failure_detail().is_some());
     }
 }
 

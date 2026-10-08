@@ -9,6 +9,45 @@ use super::wire::{ChatRequest, MaxTokensSource, Model, ModelList, RequestOptions
 
 const MAX_AUXILIARY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Server error codes / SSE sentinels meaning the inference engine is dead
+/// and only restarting `hf2q serve` recovers.
+pub(super) const ENGINE_STOPPED_CODES: &[&str] = &["engine_failed", "engine_unhealthy"];
+
+/// The message `hf2q chat` prints when the server's engine has stopped.
+pub(super) fn engine_stopped_error(detail: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the server's inference engine stopped; restart `hf2q serve` to recover \
+         (server detail: {})",
+        compact(detail)
+    )
+}
+
+/// Describe a non-success chat response. A dead server engine gets restart
+/// guidance instead of the raw HTTP status line.
+fn chat_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    match engine_stopped_detail(body) {
+        Some(detail) => engine_stopped_error(&detail),
+        None => anyhow::anyhow!("chat endpoint returned HTTP {status}: {}", compact(body)),
+    }
+}
+
+/// Extract the server message when an OpenAI error body carries an
+/// engine-stopped code.
+fn engine_stopped_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = value.pointer("/error/code")?.as_str()?;
+    if !ENGINE_STOPPED_CODES.contains(&code) {
+        return None;
+    }
+    Some(
+        value
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(code)
+            .to_owned(),
+    )
+}
+
 pub(crate) struct ChatClient {
     http: reqwest::Client,
     endpoint: Endpoint,
@@ -119,7 +158,7 @@ impl ChatClient {
         let status = response.status();
         if !status.is_success() {
             let detail = read_text_bounded(response, "chat error response").await?;
-            bail!("chat endpoint returned HTTP {status}: {}", compact(&detail));
+            return Err(chat_http_error(status, &detail));
         }
 
         let mut decoder = SseDecoder::default();
@@ -432,6 +471,31 @@ mod tests {
             assert!(client.transcript.messages().is_empty());
             let _ = stop.send(());
         }
+    }
+
+    #[test]
+    fn engine_failed_503_prints_restart_guidance() {
+        let body = "{\"error\":{\"message\":\"engine_failed: the inference engine stopped (engine thread panicked: boom); restart `hf2q serve` to recover\",\"type\":\"server_error\",\"code\":\"engine_failed\"}}";
+        let message = format!(
+            "{:#}",
+            chat_http_error(reqwest::StatusCode::SERVICE_UNAVAILABLE, body)
+        );
+        assert!(
+            message.contains("the server's inference engine stopped; restart `hf2q serve`"),
+            "{message}"
+        );
+        assert!(message.contains("boom"), "{message}");
+
+        let not_ready = "{\"error\":{\"message\":\"Model is still warming up; please retry shortly.\",\"code\":\"not_ready\"}}";
+        let message = format!(
+            "{:#}",
+            chat_http_error(reqwest::StatusCode::SERVICE_UNAVAILABLE, not_ready)
+        );
+        assert!(
+            message.starts_with("chat endpoint returned HTTP 503"),
+            "{message}"
+        );
+        assert!(!message.contains("inference engine stopped"), "{message}");
     }
 
     #[tokio::test]
