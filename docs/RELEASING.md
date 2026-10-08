@@ -36,14 +36,11 @@ version:
 
 ```bash
 gh workflow run release.yml -f commit_sha=<sha> -f version=X.Y.Z
-# fast tier, only when src/inference/** and src/serve/api/grammar/** are
-# unchanged since the previous tag (ADR-058):
-#   add -f skip_qualification=true
 ```
 
-A full-tier release runs the qualification gate on this machine; start from a
-freshly rebooted, otherwise idle host (`scripts/release_gate_preflight.sh`
-says so if you forget).
+The self-hosted model qualification job is off by default and runs only if
+the owner asks for it (`-f skip_qualification=false`). QE is ad hoc
+(ADR-061 D2); it never gates a release.
 
 The workflow tags, builds, signs, notarizes, publishes the crate, verifies
 the crate bytes, and only then makes the GitHub Release public. If any step
