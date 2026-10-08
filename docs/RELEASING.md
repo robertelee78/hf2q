@@ -19,6 +19,8 @@ On a topic branch from current `main`:
 # Edit the version line in the [package] section of Cargo.toml, e.g. 0.1.22
 cargo update --workspace --offline   # refresh the hf2q entry in Cargo.lock
 # Move the [Unreleased] notes in CHANGELOG.md under a new [0.1.22] heading
+# Update the release line in docs/shipping-contract.md and the README status row
+# (scripts/test_shipping_contract.sh checks it)
 cargo package --locked --allow-dirty --no-verify
 ls -l target/package/hf2q-0.1.22.crate   # MUST be under 10 MiB
 ```

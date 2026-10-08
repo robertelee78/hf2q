@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.22] — 2026-10-08
+
+### Fixed
+
+- Fix the decode hard-lock on Qwen 3.5/3.6 (qwen35 and qwen35moe): a first
+  prompt under 16 tokens (for example "hi") panicked the engine thread on the
+  TQ cache layout, after which the server reported "warming up" forever.
+- Report a dead inference engine as a terminal failure: `/readyz` and HTTP 503
+  `engine_failed` say the engine stopped and the server must be restarted,
+  the operator screen shows it, and `hf2q chat` explains it, instead of
+  "warming up" forever.
+- Compile tool and response JSON schemas with length or count bounds above
+  2000 exactly instead of rejecting the whole request; OpenCode with MCP tools
+  that declare `maxLength: 4096` works again. Combining tools past the grammar
+  size limit returns HTTP 400 instead of crashing.
+- The `install.sh` one-liner and `hf2q update` no longer need Xcode developer
+  tools: the architecture check reads the Mach-O header instead of calling the
+  `lipo` shim, which failed on Macs without accepted developer tools.
+- Shell completions install only under the user's home; hf2q no longer writes,
+  registers, or removes files in Homebrew directories, so uninstalling one
+  installation cannot delete another installation's completion.
+- `--glp` resolves Hugging Face repository and file-URL references (0.1.21
+  treated them as local paths), and binds checkpoint identity explicitly.
+- Bound the hf-hub client so exact-revision queries cannot hang startup.
+- The crate package fits under the crates.io 10 MiB upload cap.
+- Upgrade rustls for RUSTSEC-2026-0285.
+
+### Added
+
+- `hf2q chat`: `/max-tokens N` sets the reply length for the session, `/status`
+  shows the current limit and its source, and a reply cut by the limit says so.
+- `--gcd-schema-locked` makes the server schema mandatory (ADR-057 lockdown).
+- Model download progress shows "estimating", "buffering", or "stalled" with a
+  smoothed, bounded ETA instead of looking hung and printing absurd ETAs.
+- `docs/RELEASING.md` (release checklist) and `docs/qe-playbook.md` (ad hoc,
+  hands-on QE).
+
+### Changed
+
+- The release workflow's model qualification job is opt-in; QE is ad hoc and
+  never gates a release (ADR-061).
+
 ## [0.1.21] — 2026-09-03
 
 ### Added
