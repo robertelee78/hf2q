@@ -563,6 +563,9 @@ fn compact_download_status(estimate: &TransferEstimate) -> String {
         }
         (TransferState::Buffering, _, None) => format!("buffering {idle}"),
         (TransferState::Stalled, _, _) => format!("stalled {idle}"),
+        (TransferState::Estimating, Some(rate), _) => {
+            format!("{}/s ETA estimating", human_bytes(rate))
+        }
         _ => "estimating".to_owned(),
     };
     if let Some(received) = estimate.host_received_bytes {

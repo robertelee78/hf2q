@@ -42,6 +42,24 @@ const WARMUP: Duration = Duration::from_secs(10);
 const SAMPLE_SPACING: Duration = Duration::from_secs(1);
 /// ETAs are capped here; a longer estimate renders as "more than 24h".
 pub(crate) const MAX_ETA_SECONDS: u64 = 24 * 60 * 60;
+/// An ETA number is withheld ("estimating") until the transfer has run at
+/// least this long ...
+const ETA_MIN_ELAPSED: Duration = Duration::from_secs(30);
+/// ... has written at least this fraction of the payload, or has run for
+/// [`ETA_SLOW_ELAPSED`] (so very slow transfers still get an estimate) ...
+const ETA_MIN_FRACTION: f64 = 0.03;
+const ETA_SLOW_ELAPSED: Duration = Duration::from_secs(120);
+/// ... and the last [`STABILITY_SAMPLES`] window rates, taken at least
+/// [`STABILITY_SPACING`] apart while bytes were being written, agree within
+/// [`STABILITY_TOLERANCE`] (max/min). Xet ramps concurrency up during a
+/// download, so an accelerating transfer keeps showing "estimating" rather
+/// than an ETA that is several times too long (#249 field test).
+const STABILITY_SAMPLES: usize = 4;
+const STABILITY_SPACING: Duration = Duration::from_secs(10);
+const STABILITY_TOLERANCE: f64 = 1.5;
+/// Once shown, the ETA may change by at most a factor of two per this
+/// interval (after counting down elapsed time).
+const ETA_DOUBLING_INTERVAL: Duration = Duration::from_secs(5);
 /// Host receive rate at or above this counts as network activity.
 const NETWORK_ACTIVE_FLOOR: f64 = 256.0 * 1024.0;
 /// Time constant for the host receive rate.
@@ -101,6 +119,10 @@ pub(crate) struct TransferEstimator {
     host_credited: u64,
     host_last: Option<(Duration, u64)>,
     host_rate: Option<f64>,
+    stability_rates: VecDeque<f64>,
+    last_stability_sample: Option<Duration>,
+    eta_ready: bool,
+    shown_eta: Option<(Duration, f64)>,
 }
 
 impl TransferEstimator {
@@ -143,6 +165,7 @@ impl TransferEstimator {
         // the absurd ETA this estimator exists to prevent.
         if warm && !idle_for_a_while {
             if let Some(window_rate) = self.window_rate(now) {
+                self.record_stability_sample(now, window_rate);
                 self.smoothed_rate = Some(match (self.smoothed_rate, self.last_rate_update) {
                     (Some(rate), Some(updated)) => {
                         let dt = now.saturating_sub(updated).as_secs_f64();
@@ -164,6 +187,9 @@ impl TransferEstimator {
         let rate = self
             .smoothed_rate
             .filter(|rate| rate.is_finite() && *rate >= 1.0);
+        if !self.eta_ready && rate.is_some() && self.rate_is_stable(now, completed, total) {
+            self.eta_ready = true;
+        }
         let state = if complete {
             TransferState::Transferring
         } else if idle_for_a_while {
@@ -172,22 +198,23 @@ impl TransferEstimator {
             } else {
                 TransferState::Stalled
             }
-        } else if rate.is_none() {
+        } else if !self.eta_ready {
             TransferState::Estimating
         } else {
             TransferState::Transferring
         };
-        let eta_seconds = match state {
-            TransferState::Estimating | TransferState::Stalled => None,
-            TransferState::Transferring | TransferState::Buffering => rate.map(|rate| {
-                let remaining = total.saturating_sub(completed) as f64;
-                let eta = (remaining / rate).ceil();
-                if eta.is_finite() {
-                    (eta as u64).min(MAX_ETA_SECONDS)
-                } else {
-                    MAX_ETA_SECONDS
-                }
-            }),
+        let eta_seconds = if complete {
+            rate.map(|_| 0)
+        } else {
+            match state {
+                TransferState::Estimating | TransferState::Stalled => None,
+                TransferState::Transferring | TransferState::Buffering if self.eta_ready => rate
+                    .map(|rate| {
+                        let remaining = total.saturating_sub(completed) as f64;
+                        self.bounded_eta(now, remaining / rate)
+                    }),
+                TransferState::Transferring | TransferState::Buffering => None,
+            }
         };
 
         TransferEstimate {
@@ -200,6 +227,61 @@ impl TransferEstimator {
                 .host_rate
                 .map(|rate| rate.round().clamp(0.0, u64::MAX as f64) as u64),
         }
+    }
+
+    fn record_stability_sample(&mut self, now: Duration, window_rate: f64) {
+        let due = self
+            .last_stability_sample
+            .is_none_or(|at| now.saturating_sub(at) >= STABILITY_SPACING);
+        if !due {
+            return;
+        }
+        self.last_stability_sample = Some(now);
+        self.stability_rates.push_back(window_rate);
+        while self.stability_rates.len() > STABILITY_SAMPLES {
+            self.stability_rates.pop_front();
+        }
+    }
+
+    fn rate_is_stable(&self, now: Duration, completed: u64, total: u64) -> bool {
+        let long_enough = now >= ETA_MIN_ELAPSED;
+        let enough_bytes = total > 0 && completed as f64 >= total as f64 * ETA_MIN_FRACTION;
+        let slow_but_long = now >= ETA_SLOW_ELAPSED;
+        if !long_enough || !(enough_bytes || slow_but_long) {
+            return false;
+        }
+        if self.stability_rates.len() < STABILITY_SAMPLES {
+            return false;
+        }
+        let (min, max) = self
+            .stability_rates
+            .iter()
+            .fold((f64::INFINITY, 0.0_f64), |(lo, hi), rate| {
+                (lo.min(*rate), hi.max(*rate))
+            });
+        min > 0.0 && max / min <= STABILITY_TOLERANCE
+    }
+
+    /// Count the previously shown ETA down by elapsed time and limit how far
+    /// the new estimate may move from it, then cap it.
+    fn bounded_eta(&mut self, now: Duration, raw: f64) -> u64 {
+        let raw = if raw.is_finite() {
+            raw.max(0.0)
+        } else {
+            MAX_ETA_SECONDS as f64
+        };
+        let shown = match self.shown_eta {
+            Some((at, previous)) => {
+                let dt = now.saturating_sub(at).as_secs_f64();
+                let expected = (previous - dt).max(1.0);
+                let factor = 2_f64.powf(dt / ETA_DOUBLING_INTERVAL.as_secs_f64());
+                raw.clamp(expected / factor, expected * factor)
+            }
+            None => raw,
+        }
+        .min(MAX_ETA_SECONDS as f64);
+        self.shown_eta = Some((now, shown));
+        shown.ceil() as u64
     }
 
     fn record_sample(&mut self, now: Duration, completed: u64) {
@@ -379,11 +461,95 @@ mod tests {
             .filter(|(t, _)| *t >= 90.0 && *t < 232.0 && (*t * 10.0) as u64 % 100 == 0)
             .filter_map(|(_, estimate)| estimate.eta_seconds)
             .collect();
-        assert!(sampled.len() >= 10, "{sampled:?}");
+        assert!(sampled.len() >= 5, "{sampled:?}");
         for pair in sampled.windows(2) {
             let (low, high) = (pair[0].min(pair[1]).max(1), pair[0].max(pair[1]));
             assert!(high <= low * 3, "ETA swung {pair:?} in {sampled:?}");
         }
+    }
+
+    /// Field test of the first #249 fix (23.3 GiB APEX-Q5_K_M, empty cache,
+    /// finished in 256 s): it printed "ETA 1h 29m" at 1% and "31m 27s" at
+    /// ~114 s. Seconds since start -> displayed (written) bytes.
+    fn field_test_schedule() -> Vec<(f64, u64)> {
+        vec![
+            (0.0, 0),
+            (7.0, 138 * MIB),
+            (14.0, 267 * MIB),
+            (28.0, 1_638 * MIB),
+            (114.0, 2_161 * MIB),
+            (171.0, 4_915 * MIB),
+            (228.0, 9_922 * MIB),
+            (256.0, 23_880 * MIB),
+        ]
+    }
+
+    #[test]
+    fn field_test_sequence_withholds_eta_until_stable_and_never_overshoots() {
+        let total = 23_880 * MIB;
+        let finished_at = 256.0;
+        let schedule = field_test_schedule();
+        for host_rate in [None, Some(200 * MIB)] {
+            let trace = replay(&schedule, total, 260.0, host_rate);
+            for (t, estimate) in &trace {
+                assert!(estimate.wire_valid(), "t={t} {estimate:?}");
+                let written = written_at(&schedule, *t);
+                let Some(eta) = estimate.eta_seconds else {
+                    continue;
+                };
+                if *t >= finished_at {
+                    continue;
+                }
+                assert!(
+                    *t >= ETA_MIN_ELAPSED.as_secs_f64()
+                        && written as f64 >= total as f64 * ETA_MIN_FRACTION,
+                    "ETA {eta}s shown before the stability rule at t={t}"
+                );
+                let true_remaining = finished_at - t;
+                assert!(
+                    eta as f64 <= 3.0 * true_remaining.max(1.0),
+                    "t={t}: ETA {eta}s vs true remaining {true_remaining}s"
+                );
+            }
+            // The two values the field test complained about are gone.
+            for t in [7.5, 114.5] {
+                let (_, estimate) = trace.iter().find(|(at, _)| (*at - t).abs() < 0.05).unwrap();
+                assert_eq!(estimate.eta_seconds, None, "t={t} {estimate:?}");
+            }
+            let (_, done) = trace.last().unwrap();
+            assert_eq!(done.eta_seconds, Some(0));
+        }
+    }
+
+    #[test]
+    fn shown_eta_moves_by_a_bounded_factor_per_update() {
+        let total = 20 * GIB;
+        let mut estimator = TransferEstimator::new();
+        let mut previous: Option<(f64, u64)> = None;
+        for step in 0..=3000_u64 {
+            let t = step as f64 / 10.0;
+            // 100 MiB/s steady, then the source suddenly drops to 10 MiB/s.
+            let written = if t <= 100.0 {
+                100.0 * MIB as f64 * t
+            } else {
+                100.0 * MIB as f64 * 100.0 + 10.0 * MIB as f64 * (t - 100.0)
+            } as u64;
+            let estimate = estimator.observe(secs(t), written, total, None);
+            if let Some(eta) = estimate.eta_seconds {
+                if let Some((at, before)) = previous {
+                    let dt = t - at;
+                    let expected = (before as f64 - dt).max(1.0);
+                    let factor = 2_f64.powf(dt / ETA_DOUBLING_INTERVAL.as_secs_f64());
+                    assert!(
+                        eta as f64 <= expected * factor + 1.0
+                            && eta as f64 + 1.0 >= expected / factor,
+                        "t={t}: {before}s -> {eta}s"
+                    );
+                }
+                previous = Some((t, eta));
+            }
+        }
+        assert!(previous.is_some());
     }
 
     #[test]
@@ -419,20 +585,20 @@ mod tests {
         let mut estimator = TransferEstimator::new();
         let mut host_total = 0_u64;
         let mut last = TransferEstimate::default();
-        for step in 0..=600_u64 {
+        for step in 0..=900_u64 {
             let t = step as f64 / 10.0;
-            // 100 MiB/s for 30 s, then nothing at all (written or network).
-            let moving = t <= 30.0;
+            // 100 MiB/s for 60 s, then nothing at all (written or network).
+            let moving = t <= 60.0;
             if moving {
                 host_total = (100.0 * MIB as f64 * t) as u64;
             }
-            let written = (100.0 * MIB as f64 * t.min(30.0)) as u64;
+            let written = (100.0 * MIB as f64 * t.min(60.0)) as u64;
             last = estimator.observe(secs(t), written, total, Some(host_total));
-            if (20.0..30.0).contains(&t) {
+            if (50.0..60.0).contains(&t) {
                 assert_eq!(last.state, TransferState::Transferring, "t={t} {last:?}");
                 assert!(last.eta_seconds.is_some());
             }
-            if t > 30.0 && t < 44.9 {
+            if t > 60.0 && t < 74.9 {
                 assert_ne!(last.state, TransferState::Stalled, "t={t} {last:?}");
             }
         }
@@ -462,9 +628,8 @@ mod tests {
         for step in 0..=1200_u64 {
             let t = step as f64 / 10.0;
             let estimate = estimator.observe(secs(t), (rate as f64 * t) as u64, total, None);
-            if t < 9.9 {
+            if t < ETA_MIN_ELAPSED.as_secs_f64() {
                 assert_eq!(estimate.state, TransferState::Estimating, "t={t}");
-                assert_eq!(estimate.bytes_per_second, None);
                 assert_eq!(estimate.eta_seconds, None);
             }
             if t >= 100.0 {
@@ -484,7 +649,7 @@ mod tests {
         let total = 25 * GIB;
         let mut estimator = TransferEstimator::new();
         let mut estimate = TransferEstimate::default();
-        for step in 0..=1200_u64 {
+        for step in 0..=2400_u64 {
             let t = step as f64 / 10.0;
             // 1 KiB/s for a 25 GiB file would be ~830 years.
             estimate = estimator.observe(secs(t), (1024.0 * t) as u64, total, None);

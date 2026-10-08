@@ -527,7 +527,10 @@ pub(crate) fn download_status_text(estimate: &TransferEstimate) -> String {
     });
     let idle = format_duration(Duration::from_millis(estimate.idle_ms));
     let mut status = match estimate.state {
-        TransferState::Estimating => "rate estimating, ETA estimating".to_owned(),
+        TransferState::Estimating => match rate {
+            Some(rate) => format!("{rate} so far, ETA estimating"),
+            None => "rate estimating, ETA estimating".to_owned(),
+        },
         TransferState::Transferring => match (rate, eta) {
             (Some(rate), Some(eta)) => format!("{rate}, {eta}"),
             _ => "rate estimating, ETA estimating".to_owned(),
@@ -643,6 +646,16 @@ mod tests {
     fn hosted_download_states_render_honestly_and_bounded() {
         let estimating = hosted(TransferEstimate::default()).render();
         assert!(estimating.contains("ETA estimating"), "{estimating}");
+        let early = hosted(TransferEstimate {
+            bytes_per_second: Some(4 * 1024 * 1024),
+            ..TransferEstimate::default()
+        });
+        assert!(early.wire_valid());
+        let early = early.render();
+        assert!(
+            early.contains("4.0 MiB/s so far, ETA estimating"),
+            "{early}"
+        );
 
         let buffering = hosted(TransferEstimate {
             state: TransferState::Buffering,

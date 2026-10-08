@@ -909,9 +909,13 @@ flat period `nettop` reported about 10 GB received while the display and the
 
 hf2q now computes rate, ETA, and state itself (`src/input/transfer_estimate.rs`)
 from written bytes: a 60-second byte-weighted window rate smoothed by a
-10-second time-constant EWMA, frozen while written bytes are idle; `estimating`
-until 10 s after the first written byte; ETAs capped at 24 hours ("more than
-24h"). After 15 s without written progress the state is `buffering` when the
+10-second time-constant EWMA, frozen while written bytes are idle. No ETA number
+is shown (`estimating`) until the transfer has run 30 s, written 3% of the
+payload (or run 120 s), and the last four window rates taken 10 s apart agree
+within 1.5x; once shown, the ETA may change by at most 2x per 5 s after counting
+down, and is capped at 24 hours ("more than 24h"). A field test of the first
+version (23.3 GiB in 256 s) printed 1h 29m and 31m 27s early; replayed through
+this rule, Xet's accelerating ramp keeps it at `estimating` instead. After 15 s without written progress the state is `buffering` when the
 host network is receiving and `stalled` when it is not (or when no counter is
 available); stalled shows no ETA. The only received-bytes signal hf2q can reach
 is the host-wide non-loopback interface counter, shown as "host network rx" and
