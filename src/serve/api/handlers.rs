@@ -4086,19 +4086,18 @@ fn process_multimodal_content(
                 let cfg = crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT
                     .clone()
                     .with_normalization(mmproj.config.image_mean, mmproj.config.image_std);
-                let preprocessed = crate::inference::vision::preprocess::preprocess_gemma4v(
-                    &bytes, &cfg,
-                )
-                .map_err(|e| {
-                    ApiError::invalid_request(
-                        format!(
+                let preprocessed =
+                    crate::inference::vision::preprocess::preprocess_gemma4v(&bytes, &cfg)
+                        .map_err(|e| {
+                            ApiError::invalid_request(
+                                format!(
                             "messages[{}].content[{}].image_url gemma4v preprocess failed: {}",
                             mi, pi, e
                         ),
-                        Some(format!("messages[{}].content[{}]", mi, pi)),
-                    )
-                    .into_response()
-                })?;
+                                Some(format!("messages[{}].content[{}]", mi, pi)),
+                            )
+                            .into_response()
+                        })?;
                 out.push(VisionInput::Gemma4v(Gemma4vPreprocessedImage {
                     patches: preprocessed.patches,
                     pos_x: preprocessed.pos_x,

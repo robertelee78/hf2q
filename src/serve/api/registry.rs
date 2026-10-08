@@ -4394,7 +4394,10 @@ mod tests {
         assert_eq!(find_for_architecture("gemma4").unwrap().family, "gemma4");
         assert_eq!(find_for_architecture("qwen35").unwrap().family, "qwen35");
         assert_eq!(find_for_architecture("qwen35moe").unwrap().family, "qwen35");
-        assert_eq!(find_for_architecture("deepseek4").unwrap().family, "deepseek4");
+        assert_eq!(
+            find_for_architecture("deepseek4").unwrap().family,
+            "deepseek4"
+        );
         assert!(find_for_architecture("llama").is_none());
     }
 

@@ -327,7 +327,10 @@ pub fn preprocess_gemma4v(
     if cfg.n_merge == 0 {
         return Err(anyhow!("gemma4v: n_merge must be > 0"));
     }
-    if cfg.std.iter().any(|value| !value.is_finite() || *value <= 0.0)
+    if cfg
+        .std
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
         || cfg.mean.iter().any(|value| !value.is_finite())
     {
         return Err(anyhow!(
@@ -1397,21 +1400,26 @@ mod tests {
         // must land at -1, not -3 (the bug that made blue read as white).
         let png = encode_solid_png(256, 256, [0, 0, 255]);
         let out = preprocess_gemma4v(&png, &GEMMA4V_PREPROCESS_DEFAULT).unwrap();
-        let p2 = (GEMMA4V_PREPROCESS_DEFAULT.patch_size * GEMMA4V_PREPROCESS_DEFAULT.patch_size) as usize;
+        let p2 = (GEMMA4V_PREPROCESS_DEFAULT.patch_size * GEMMA4V_PREPROCESS_DEFAULT.patch_size)
+            as usize;
         assert!((out.patches[0] - -1.0).abs() < 1e-6, "red channel");
         assert!((out.patches[p2] - -1.0).abs() < 1e-6, "green channel");
         assert!((out.patches[2 * p2] - 1.0).abs() < 1e-6, "blue channel");
 
         // A projector carrying mean = std = 0.5 reproduces the historical
         // `4x - 3` mapping exactly.
-        let legacy = GEMMA4V_PREPROCESS_DEFAULT.clone().with_normalization([0.5; 3], [0.5; 3]);
+        let legacy = GEMMA4V_PREPROCESS_DEFAULT
+            .clone()
+            .with_normalization([0.5; 3], [0.5; 3]);
         let png_mid = encode_solid_png(256, 256, [128, 128, 128]);
         let out_legacy = preprocess_gemma4v(&png_mid, &legacy).unwrap();
         let expect = (128.0_f32 / 255.0) * 4.0 - 3.0;
         assert!((out_legacy.patches[0] - expect).abs() < 1e-5);
 
         // Invalid normalization fails closed instead of producing NaNs.
-        let bad = GEMMA4V_PREPROCESS_DEFAULT.clone().with_normalization([0.0; 3], [0.0; 3]);
+        let bad = GEMMA4V_PREPROCESS_DEFAULT
+            .clone()
+            .with_normalization([0.0; 3], [0.0; 3]);
         assert!(preprocess_gemma4v(&png_mid, &bad).is_err());
     }
 

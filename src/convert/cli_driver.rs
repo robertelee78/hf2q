@@ -548,11 +548,15 @@ pub(super) fn plan_projector_output_bytes_for_source(
         ConvertError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })?;
     match paired::projector_emitter(detect_arch(&config)?)? {
-        paired::ProjectorEmitter::NativeVit => Ok(crate::models::vit::planned_vision_tower_output_bytes(
-            hf_dir,
-            remote_source.as_ref().map(RemoteConversionSource::source_sha256),
-            pair_generation,
-        )?),
+        paired::ProjectorEmitter::NativeVit => {
+            Ok(crate::models::vit::planned_vision_tower_output_bytes(
+                hf_dir,
+                remote_source
+                    .as_ref()
+                    .map(RemoteConversionSource::source_sha256),
+                pair_generation,
+            )?)
+        }
         paired::ProjectorEmitter::GemmaMapper => Ok(run_convert_internal(
             ConvertArgs {
                 hf_dir: hf_dir.to_path_buf(),
