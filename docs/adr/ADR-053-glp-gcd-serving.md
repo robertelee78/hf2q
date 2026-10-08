@@ -11,6 +11,11 @@
   a calibrated GLP vector is a candidate direction, not a validated
   derivation (see ADR-054 behavioral gates 3–4).
 - **Date:** 2026-09-04
+- **Updated:** 2026-10-08 — `--glp`/`--glp-alpha` are now server-wide policy,
+  resolved for every model the server loads, not only the `--model` given at
+  startup. Before this, `hf2q chat --model X --glp V` (which starts serve with
+  no startup model and activates X afterwards) silently served X unsteered.
+  See "GLP applies to every load" below.
 - **Related:** ADR-052 (grammar semantics), ADR-050 (serve preflight),
   ADR-051 (model resolution), ADR-042 (DeepSeek serving), ADR-017
   (per-family status)
@@ -110,6 +115,38 @@ operand — the `--mmproj` shape.
 - `hf2q info --glp <ref>` performs reader-conformance preflight without
   tensor residency. `hf2q serve list` and `/v1/models` MAY show the bound
   GLP on the model row (like the vision projector row linkage today).
+
+## GLP applies to every load (2026-10-08)
+
+`hf2q serve --glp REF [--glp-alpha A]` is steering policy for the whole
+server. The reference and dose live in the template every model load uses, and
+`load_engine` resolves REF against the exact model file being loaded. That
+covers the startup model, a model activated later (the path `hf2q chat
+--model` uses), a model named by a request, and a reload after eviction. A
+resolution is cached per reference and model, so a reload does not consult the
+Hub again.
+
+The load MUST fail when REF cannot be used for that model; it MUST NOT fall
+back to unsteered serving:
+
+- Only `qwen35`, `qwen35moe`, and `deepseek4` engines bind GLP. Loading any
+  other architecture on a `--glp` server is refused with that reason, because
+  its engine would otherwise ignore the vector.
+- A reference that cannot be resolved or does not match the model's checkpoint
+  fails that load. Over HTTP the public diagnostic names the server's GLP
+  vector as the cause; the full reason, which can contain URLs and paths, stays
+  in the server log.
+
+With a startup `--model`, serve still checks REF before loading weights, so a
+bad reference fails fast.
+
+**Root cause of the defect this replaces.** GLP shipped (75b1f840) resolving
+REF only inside serve's startup `--model` branch, while the template for later
+loads carried `glp_path: None`. Chat forwarding (f6b95da4) assumed serve
+applied the flag to whatever model chat activated, and its tests checked only
+that `--glp` appeared on the child's command line. Found in the ADR-061 #237
+hands-on pass: `/hf2q/v1/runtime` reported `glp_active: false` for a
+chat-started server whose command line carried `--glp`.
 
 ## Non-goals
 

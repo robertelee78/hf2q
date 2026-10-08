@@ -3851,6 +3851,20 @@ pub fn pool_key_for_path(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+impl multi_model::EngineConfig {
+    /// Apply `hf2q serve`'s steering flags to the template every load uses.
+    ///
+    /// ADR-053: `--glp` and `--glp-alpha` are server-wide policy. They belong
+    /// to the template so the startup model, a model activated later (as
+    /// `hf2q chat --model` does), and a reload after eviction all resolve the
+    /// same reference in [`load_engine`].
+    fn with_serve_steering(mut self, args: &cli::ServeArgs) -> Self {
+        self.glp_reference = args.glp.clone();
+        self.glp_alpha = args.glp_alpha;
+        self
+    }
+}
+
 pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<api::engine::Engine> {
     anyhow::ensure!(path.exists(), "Model not found: {}", path.display());
     // Header-only parse surfaces bad magic + populates the diagnostic
@@ -3865,7 +3879,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     // the Qwen35 variant returns HTTP 501 with an operator-actionable
     // message (Wedge-3 deferred follow-up wires the live forward
     // pass).  See `LoadedModel::load` for the dispatch surface.
-    let (resolved_context, model_id_uses_filename_fallback) = {
+    let (resolved_context, model_id_uses_filename_fallback, glp_path) = {
         let gguf = mlx_native::gguf::GgufFile::open(path)
             .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
         let model_id_uses_filename_fallback = gguf.metadata_string("general.name").is_none();
@@ -3884,7 +3898,14 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             arch = %arch,
             "Validated GGUF header"
         );
-        (resolved, model_id_uses_filename_fallback)
+        // ADR-053: `--glp` is server-wide policy, so it is resolved here for
+        // the exact model being loaded, on every load path.
+        let glp_path = config
+            .glp_reference
+            .as_deref()
+            .map(|reference| crate::inference::glp::resolve_glp_for_load(reference, path, &arch))
+            .transpose()?;
+        (resolved, model_id_uses_filename_fallback, glp_path)
     };
 
     let load_opts = api::engine::LoadOptions {
@@ -3894,7 +3915,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         // ADR-020 AC#5 Iter D — propagated from `cmd_serve`'s
         // `args.dwq_overlay` via `multi_model::EngineConfig`.
         dwq_overlay_path: config.dwq_overlay_path.clone(),
-        glp_path: config.glp_path.clone(),
+        glp_path,
         glp_alpha: config.glp_alpha,
         // Serve persistence is one typed plan: the Qwen family uses the same
         // root and disk ceiling as the generic block-prefix store.
@@ -4402,14 +4423,15 @@ pub fn cmd_serve(
         warmup_synchronously: true,
         kv_metrics_sink: Some(dynamic_kv_metrics_sink),
         dwq_overlay_path: None,
-        glp_path: None,
+        glp_reference: None,
         glp_alpha: None,
         engine_mode,
         requested_context,
         kv_cache_budget_bytes,
         kv_persist_dir: kv_persist_dir.clone(),
         kv_persist_budget_bytes,
-    });
+    }
+    .with_serve_steering(&args));
 
     let mut automatic_mmproj = false;
     let human_startup_progress = !args.quiet && matches!(log_format, cli::LogFormat::Text);
@@ -4992,22 +5014,22 @@ pub fn cmd_serve(
         engine_config.tokenizer_path = args.tokenizer.clone();
         engine_config.config_path = args.config.clone();
         engine_config.dwq_overlay_path = args.dwq_overlay.clone();
-        // Resolve the modifier against the model artifact already selected by
-        // the serving pipeline; never download or select the model a second time.
-        engine_config.glp_path = args
-            .glp
-            .as_ref()
-            .map(|reference| {
-                crate::inference::glp::resolve_glp(
-                    reference,
-                    &resolved.gguf_path,
-                    &crate::progress::ProgressReporter::new(),
-                )
-                .map(|artifact| artifact.path)
-            })
-            .transpose()
-            .context("resolve GLP modifier")?;
-        engine_config.glp_alpha = args.glp_alpha;
+        // Check the GLP modifier against the startup model before loading its
+        // weights, so a bad reference fails fast. This is the same resolver
+        // every load uses, and it caches the result for that load.
+        if let Some(reference) = args.glp.as_deref() {
+            let architecture = mlx_native::gguf::GgufFile::open(&resolved.gguf_path)
+                .map_err(|error| anyhow::anyhow!("GGUF header parse failed: {error}"))?
+                .metadata_string("general.architecture")
+                .map(str::to_string)
+                .unwrap_or_default();
+            crate::inference::glp::resolve_glp_for_load(
+                reference,
+                &resolved.gguf_path,
+                &architecture,
+            )
+            .map_err(anyhow::Error::new)?;
+        }
 
         state.register_engine_config_for_path(&resolved.gguf_path, engine_config.clone())?;
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
@@ -7115,6 +7137,36 @@ mod tests {
     }
 
     #[test]
+    fn serve_glp_flags_reach_the_template_for_every_later_load() {
+        use clap::Parser;
+        let cli = cli::Cli::try_parse_from([
+            "hf2q",
+            "serve",
+            "--glp",
+            "msuiche/Example-GLP",
+            "--glp-alpha",
+            "2",
+        ])
+        .unwrap();
+        let cli::Command::Serve(args) = cli.command else {
+            panic!("expected serve");
+        };
+        let template = crate::serve::multi_model::EngineConfig::default().with_serve_steering(&args);
+        assert_eq!(
+            template.glp_reference.as_deref(),
+            Some(std::path::Path::new("msuiche/Example-GLP"))
+        );
+        assert_eq!(template.glp_alpha, Some(2.0));
+
+        let cli = cli::Cli::try_parse_from(["hf2q", "serve"]).unwrap();
+        let cli::Command::Serve(args) = cli.command else {
+            panic!("expected serve");
+        };
+        let plain = crate::serve::multi_model::EngineConfig::default().with_serve_steering(&args);
+        assert!(plain.glp_reference.is_none() && plain.glp_alpha.is_none());
+    }
+
+    #[test]
     fn cmd_serve_banner_emits_on_tty() {
         let info = synthetic_serve_banner_info();
         let mut buf = Vec::new();
@@ -7284,7 +7336,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
-            glp_path: None,
+            glp_reference: None,
             glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
@@ -7329,7 +7381,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
-            glp_path: None,
+            glp_reference: None,
             glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
@@ -7377,7 +7429,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
-            glp_path: None,
+            glp_reference: None,
             glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
@@ -7435,7 +7487,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
-            glp_path: None,
+            glp_reference: None,
             glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
@@ -7468,7 +7520,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
-            glp_path: None,
+            glp_reference: None,
             glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
@@ -7501,7 +7553,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
-            glp_path: None,
+            glp_reference: None,
             glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
@@ -7539,7 +7591,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
-            glp_path: None,
+            glp_reference: None,
             glp_alpha: None,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
@@ -7591,7 +7643,7 @@ mod tests {
                 kv_cache_budget_bytes: None,
                 kv_persist_dir: None,
                 kv_persist_budget_bytes: 0,
-                glp_path: None,
+                glp_reference: None,
                 glp_alpha: None,
             };
             let result = super::load_engine(tmp.path(), &cfg);

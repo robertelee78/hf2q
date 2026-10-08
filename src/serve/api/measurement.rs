@@ -149,7 +149,7 @@ mod tests {
         use crate::serve::multi_model::{EngineConfig, EngineConfigIdentity};
         let mut config = EngineConfig::default();
         let plain = EngineConfigIdentity::from(&config);
-        config.glp_path = Some("private-vector.gguf".into());
+        config.glp_reference = Some("private-vector.gguf".into());
         config.glp_alpha = Some(0.0);
         let zero_dose = EngineConfigIdentity::from(&config);
         assert_ne!(plain, zero_dose);

@@ -521,7 +521,7 @@ mod tests {
                 warmup_synchronously: false,
                 kv_metrics_sink: None,
                 dwq_overlay_path: None,
-                glp_path: None,
+                glp_reference: None,
                 glp_alpha: None,
                 // ADR-040 Phase C iter-4 (C4) — test fixture uses
                 // SerialFifo (ADR-005 byte-equivalent path).

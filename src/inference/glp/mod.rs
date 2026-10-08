@@ -28,5 +28,7 @@ pub use apply_gpu::{
 };
 pub use bind::BoundGlp;
 pub use compatibility::{validate_glp_for_model, CheckpointIdentity, Compatibility};
-pub use discovery::{resolve_glp, ResolvedGlp};
+pub use discovery::{
+    resolve_glp, resolve_glp_for_load, GlpLoadError, ResolvedGlp, GLP_SERVING_ARCHITECTURES,
+};
 pub use reader::{GlpError, GlpHookPoint, GlpMode, GlpVector};

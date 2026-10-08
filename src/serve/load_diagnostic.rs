@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use crate::inference::glp::GlpLoadError;
 use crate::serve::multi_model::HotSwapError;
 
 const MAX_PUBLIC_TENSOR_NAME_BYTES: usize = 160;
@@ -52,6 +53,9 @@ impl std::error::Error for MissingGgufTensor {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicLoadDiagnostic {
     MissingRequiredTensor(String),
+    /// ADR-053: the server's `--glp` vector cannot be used with this model.
+    GlpUnsupportedArchitecture(String),
+    GlpUnusable,
     LoaderRejected,
     FileMetadataUnavailable,
 }
@@ -62,6 +66,17 @@ impl fmt::Display for PublicLoadDiagnostic {
             Self::MissingRequiredTensor(tensor) => write!(
                 formatter,
                 "selected GGUF is missing required tensor '{tensor}'"
+            ),
+            Self::GlpUnsupportedArchitecture(architecture) => write!(
+                formatter,
+                "this server applies a GLP steering vector (--glp), and `{architecture}` models \
+                 do not support GLP; serve this model from a server started without --glp"
+            ),
+            Self::GlpUnusable => write!(
+                formatter,
+                "this server's GLP steering vector (--glp) cannot be applied to the selected \
+                 model, for example because it was made for a different checkpoint; inspect \
+                 server diagnostics"
             ),
             Self::LoaderRejected => write!(
                 formatter,
@@ -79,12 +94,33 @@ pub(crate) fn public_hotswap_diagnostic(error: &HotSwapError) -> PublicLoadDiagn
     match error {
         HotSwapError::LoaderFailed(error) => error
             .chain()
-            .find_map(|cause| cause.downcast_ref::<MissingGgufTensor>())
-            .and_then(MissingGgufTensor::public_tensor)
-            .map(|tensor| PublicLoadDiagnostic::MissingRequiredTensor(tensor.to_owned()))
+            .find_map(|cause| cause.downcast_ref::<GlpLoadError>())
+            .map(public_glp_diagnostic)
+            .or_else(|| {
+                error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<MissingGgufTensor>())
+                    .and_then(MissingGgufTensor::public_tensor)
+                    .map(|tensor| PublicLoadDiagnostic::MissingRequiredTensor(tensor.to_owned()))
+            })
             .unwrap_or(PublicLoadDiagnostic::LoaderRejected),
         HotSwapError::FileSize { .. } => PublicLoadDiagnostic::FileMetadataUnavailable,
         HotSwapError::PoolRefused(_) => PublicLoadDiagnostic::LoaderRejected,
+    }
+}
+
+fn public_glp_diagnostic(error: &GlpLoadError) -> PublicLoadDiagnostic {
+    match error {
+        GlpLoadError::UnsupportedArchitecture { architecture, .. }
+            if !architecture.is_empty()
+                && architecture.len() <= 64
+                && architecture
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) =>
+        {
+            PublicLoadDiagnostic::GlpUnsupportedArchitecture(architecture.clone())
+        }
+        _ => PublicLoadDiagnostic::GlpUnusable,
     }
 }
 
@@ -102,6 +138,46 @@ pub(crate) fn private_hotswap_diagnostic(error: &HotSwapError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glp_refusals_are_named_without_leaking_references_or_paths() {
+        let unusable = HotSwapError::LoaderFailed(
+            anyhow::Error::new(GlpLoadError::Unusable(anyhow::anyhow!(
+                "GLP base repository mismatch: https://huggingface.co/private/vector?token=hf_secret"
+            )))
+            .context("/private/operator/model.gguf"),
+        );
+        let public = public_hotswap_diagnostic(&unusable);
+        assert_eq!(public, PublicLoadDiagnostic::GlpUnusable);
+        let text = public.to_string();
+        assert!(text.contains("GLP steering vector (--glp)"), "{text}");
+        assert!(!text.contains("hf_secret") && !text.contains("/private/"), "{text}");
+        assert!(private_hotswap_diagnostic(&unusable).contains("repository mismatch"));
+
+        let unsupported = HotSwapError::LoaderFailed(anyhow::Error::new(
+            GlpLoadError::UnsupportedArchitecture {
+                architecture: "gemma4".into(),
+                model_path: "/private/operator/gemma.gguf".into(),
+            },
+        ));
+        let public = public_hotswap_diagnostic(&unsupported);
+        assert_eq!(
+            public,
+            PublicLoadDiagnostic::GlpUnsupportedArchitecture("gemma4".into())
+        );
+        assert!(!public.to_string().contains("/private/"));
+
+        let hostile = HotSwapError::LoaderFailed(anyhow::Error::new(
+            GlpLoadError::UnsupportedArchitecture {
+                architecture: "gemma4\n/private/x".into(),
+                model_path: "/m.gguf".into(),
+            },
+        ));
+        assert_eq!(
+            public_hotswap_diagnostic(&hostile),
+            PublicLoadDiagnostic::GlpUnusable
+        );
+    }
 
     #[test]
     fn typed_missing_tensor_is_actionable_but_arbitrary_context_is_redacted() {
