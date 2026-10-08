@@ -2121,7 +2121,11 @@ fn fixed_width_decimal_range(low: &str, high: &str) -> String {
         let low_spans = low_suffix == zero_suffix;
         let high_spans = high_suffix == nine_suffix;
         let middle_low = if low_spans { low_digit } else { low_digit + 1 };
-        let middle_high = if high_spans { high_digit } else { high_digit - 1 };
+        let middle_high = if high_spans {
+            high_digit
+        } else {
+            high_digit - 1
+        };
         if !low_spans {
             alternatives.push(format!(
                 "{} {}",
@@ -4794,7 +4798,14 @@ mod tests {
             assert!(gbnf.len() < 16 * 1024, "{schema}: {} bytes", gbnf.len());
         }
         let positive = schemas[0];
-        for accepted in ["1", "9", "10", "120000", "9007199254740991", "9007199254740990"] {
+        for accepted in [
+            "1",
+            "9",
+            "10",
+            "120000",
+            "9007199254740991",
+            "9007199254740990",
+        ] {
             let mut candidate = runtime(positive);
             assert!(candidate.accept_bytes(accepted.as_bytes()), "{accepted}");
             assert!(candidate.is_accepted(), "{accepted}");
@@ -4824,13 +4835,28 @@ mod tests {
     #[test]
     fn integer_ranges_match_every_value_near_digit_boundaries() {
         // Exhaustive check of the boundary-folding logic on small ranges.
-        for (low, high) in [(0, 0), (0, 9), (0, 10), (1, 99), (10, 99), (0, 100), (7, 1000), (99, 1001), (100, 199), (190, 1099)] {
+        for (low, high) in [
+            (0, 0),
+            (0, 9),
+            (0, 10),
+            (1, 99),
+            (10, 99),
+            (0, 100),
+            (7, 1000),
+            (99, 1001),
+            (100, 199),
+            (190, 1099),
+        ] {
             let schema = format!(r#"{{"type":"integer","minimum":{low},"maximum":{high}}}"#);
             for value in 0..=1200i64 {
                 let mut candidate = runtime(&schema);
                 let text = value.to_string();
                 let accepted = candidate.accept_bytes(text.as_bytes()) && candidate.is_accepted();
-                assert_eq!(accepted, (low..=high).contains(&value), "[{low},{high}] {value}");
+                assert_eq!(
+                    accepted,
+                    (low..=high).contains(&value),
+                    "[{low},{high}] {value}"
+                );
             }
         }
     }
