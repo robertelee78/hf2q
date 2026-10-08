@@ -11584,9 +11584,25 @@ fn validate_serial_prefill_family(family: &str, prompt_tokens: usize) -> Result<
     };
     anyhow::ensure!(
         prompt_tokens <= limit,
-        "capability_unsupported: {family} SerialFifo prompt has {prompt_tokens} tokens, exceeding the {limit}-token bounded Metal transaction limit; use --scheduler inflight-batched"
+        "{SERIAL_PROMPT_LIMIT_SENTINEL}: {}",
+        serial_prompt_limit_message(prompt_tokens, limit)
     );
     Ok(())
+}
+
+/// Sentinel the handlers match to answer an over-limit `fifo-serial` prompt
+/// with HTTP 400 `prompt_exceeds_scheduler_limit`. The request, not the
+/// server, is what cannot be served under the operator's chosen scheduler,
+/// so retrying it unchanged can never succeed.
+pub const SERIAL_PROMPT_LIMIT_SENTINEL: &str = "serial_prompt_limit";
+
+pub(crate) fn serial_prompt_limit_message(prompt_tokens: usize, limit: usize) -> String {
+    format!(
+        "The prompt has {prompt_tokens} tokens, but this server runs the fifo-serial \
+         scheduler, which prefills at most {limit} tokens per request. Restart \
+         `hf2q serve` with `--scheduler inflight-batched` (the default) to serve \
+         longer prompts."
+    )
 }
 
 enum SerialStreamDisposition {
@@ -44750,7 +44766,9 @@ mod qwen35_bounded_prefill_watchdog_tests {
             validate_serial_prefill_family(family, limit).expect("bounded request");
             let error = validate_serial_prefill_family(family, limit + 1)
                 .expect_err("unbounded SerialFifo transaction must fail closed");
-            assert!(format!("{error:#}").contains("inflight-batched"));
+            let error = format!("{error:#}");
+            assert!(error.starts_with(SERIAL_PROMPT_LIMIT_SENTINEL), "{error}");
+            assert!(error.contains("inflight-batched"), "{error}");
         }
         validate_serial_prefill_family("DeepSeek4", usize::MAX)
             .expect("DeepSeek has inner resumable transaction leases");

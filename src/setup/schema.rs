@@ -70,6 +70,18 @@ pub(crate) enum ConfiguredScheduler {
     InflightBatched,
 }
 
+/// Scheduler the guide profile records, and the scheduler `serve` uses when
+/// neither the CLI nor `config.toml` names one. A fresh install must serve
+/// long agent prompts, which only the resumable inflight-batched prefill can.
+pub(crate) const GUIDE_SCHEDULER: ConfiguredScheduler = ConfiguredScheduler::InflightBatched;
+
+/// Active-slot count paired with [`GUIDE_SCHEDULER`], and the inflight
+/// default whenever no slot count is configured. Idle slots reserve their
+/// full-attention KV lazily; agent harnesses send side requests (titles,
+/// summaries, sub-agents) alongside the main turn, so they run concurrently
+/// instead of queueing.
+pub(crate) const GUIDE_MAX_SLOTS: u32 = 4;
+
 impl ConfiguredScheduler {
     pub(crate) const fn as_cli(self) -> crate::cli::SchedulerArg {
         match self {
@@ -125,8 +137,8 @@ impl OperatorConfigV2 {
         let mut serve = ServeDefaultsV2 {
             host: "127.0.0.1".to_owned(),
             port: 8081,
-            scheduler: ConfiguredScheduler::InflightBatched,
-            max_slots: 1,
+            scheduler: GUIDE_SCHEDULER,
+            max_slots: GUIDE_MAX_SLOTS,
             ctx: None,
             kv_cache_budget: None,
             kv_persist_budget: None,

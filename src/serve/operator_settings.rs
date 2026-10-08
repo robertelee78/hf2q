@@ -9,11 +9,11 @@ use std::path::Path;
 use mlx_native::gguf::GgufFile;
 
 use crate::cli;
-use crate::setup::ServeDefaultsV2;
+use crate::setup::{ServeDefaultsV2, GUIDE_MAX_SLOTS, GUIDE_SCHEDULER};
 
 use super::api::engine::EngineMode;
 
-pub(crate) const DEFAULT_MAX_SLOTS_UNDER_INFLIGHT: u32 = 4;
+pub(crate) const DEFAULT_MAX_SLOTS_UNDER_INFLIGHT: u32 = GUIDE_MAX_SLOTS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingOrigin {
@@ -145,10 +145,14 @@ pub(crate) fn resolve_scheduler(
     planning: &cli::ServePlanningArgs,
     defaults: Option<&ServeDefaultsV2>,
 ) -> Result<EngineMode, String> {
+    // CLI > config.toml > the guide profile. Without any of them, `serve`
+    // runs exactly what `hf2q setup --accept-defaults` would have recorded,
+    // so an unconfigured server handles long agent prompts.
     let scheduler = planning
         .scheduler
-        .or_else(|| defaults.map(|defaults| defaults.scheduler.as_cli()));
-    if matches!(scheduler, None | Some(cli::SchedulerArg::FifoSerial)) {
+        .or_else(|| defaults.map(|defaults| defaults.scheduler.as_cli()))
+        .unwrap_or(GUIDE_SCHEDULER.as_cli());
+    if scheduler == cli::SchedulerArg::FifoSerial {
         if planning.max_slots.is_some_and(|max_slots| max_slots != 1) {
             return Err(
                 "--max-slots greater than 1 requires `--scheduler inflight-batched` or an inflight-batched setup config"
@@ -457,6 +461,34 @@ mod tests {
                 .unwrap();
         assert_eq!(persist_budget.bytes, Some(32 * (1u64 << 30)));
         assert_eq!(persist_budget.origin, Some(SettingOrigin::Cli));
+    }
+
+    #[test]
+    fn unconfigured_serve_uses_the_guide_scheduler_and_slots() {
+        let planning = |max_slots| cli::ServePlanningArgs {
+            ctx: None,
+            scheduler: None,
+            max_slots,
+            kv_cache_budget: None,
+            kv_persist_path: None,
+            kv_persist_budget: None,
+        };
+        // No CLI flag and no config.toml: exactly what `hf2q setup
+        // --accept-defaults` records, never the prompt-capped FIFO mode.
+        assert_eq!(
+            resolve_scheduler(&planning(None), None).unwrap(),
+            EngineMode::SlotAware { max_slots: 4 }
+        );
+        let guide = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
+        assert_eq!(
+            resolve_scheduler(&planning(None), None).unwrap(),
+            resolve_scheduler(&planning(None), Some(&guide.serve)).unwrap()
+        );
+        // A bare `--max-slots` now selects the default inflight scheduler.
+        assert_eq!(
+            resolve_scheduler(&planning(Some(2)), None).unwrap(),
+            EngineMode::SlotAware { max_slots: 2 }
+        );
     }
 
     #[test]

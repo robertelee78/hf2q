@@ -7,7 +7,7 @@ fn operator_config_v2_is_canonical_strict_and_uses_the_guide_defaults() {
     assert_eq!(config.serve.host, "127.0.0.1");
     assert_eq!(config.serve.port, 8081);
     assert_eq!(config.serve.scheduler, ConfiguredScheduler::InflightBatched);
-    assert_eq!(config.serve.max_slots, 1);
+    assert_eq!(config.serve.max_slots, 4);
     assert_eq!(config.serve.ctx, None);
     assert_eq!(config.serve.kv_cache_budget, None);
     assert_eq!(config.serve.kv_persist_budget, None);
@@ -26,7 +26,7 @@ fn operator_config_v2_is_canonical_strict_and_uses_the_guide_defaults() {
         text.replace("schema_version = 2", "schema_version = 3"),
         text.replace("package = \"hf2q\"", "package = \"other\""),
         text.replace("port = 8081", "port = 0"),
-        text.replace("max_slots = 1", "max_slots = 0"),
+        text.replace("max_slots = 4", "max_slots = 0"),
         text.replace("host = \"127.0.0.1\"", "host = \"example.com\""),
         format!("{text}unknown = true\n"),
     ] {

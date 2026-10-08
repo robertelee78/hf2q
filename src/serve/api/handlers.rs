@@ -7687,6 +7687,9 @@ fn common_engine_error_response(state: Option<&AppState>, msg: &str) -> Option<R
     if msg.contains("invalid_request:") {
         return Some(ApiError::invalid_request(msg.to_string(), None).into_response());
     }
+    if let Some((_, detail)) = msg.split_once(&format!("{}: ", engine::SERIAL_PROMPT_LIMIT_SENTINEL)) {
+        return Some(ApiError::prompt_exceeds_scheduler_limit(detail.to_string()).into_response());
+    }
     if msg.contains("capability_unsupported:") {
         return Some(ApiError::capability_unsupported(msg).into_response());
     }
@@ -7720,6 +7723,23 @@ mod qwen_engine_wire_error_tests {
             "slot-aware prefill: invalid_request: max_tokens exceeds u32",
             StatusCode::BAD_REQUEST,
             None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn over_limit_fifo_serial_prompt_is_a_client_error_not_a_501() {
+        // Harnesses retry 5xx; an over-limit prompt can never succeed on a
+        // fifo-serial server, so it must be a 4xx that names the fix.
+        let message = format!(
+            "{}: {}",
+            engine::SERIAL_PROMPT_LIMIT_SENTINEL,
+            engine::serial_prompt_limit_message(7453, 2048)
+        );
+        assert_wire_class(
+            &message,
+            StatusCode::BAD_REQUEST,
+            Some("prompt_exceeds_scheduler_limit"),
         )
         .await;
     }

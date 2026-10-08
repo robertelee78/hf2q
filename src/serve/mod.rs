@@ -8930,7 +8930,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             configured,
-            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 1 }
+            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 4 }
         );
 
         let cli_override = crate::serve::operator_settings::resolve_scheduler(
