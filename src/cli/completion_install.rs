@@ -6,12 +6,15 @@
 //! registration script current for each supported auto-installed shell:
 //! - **bash**: `…/bash-completion/completions/hf2q`, which bash-completion's lazy
 //!   `_comp_load` sources on the first `hf2q<TAB>` — in the current shell.
-//! - **zsh**: `_hf2q` in a site-functions dir, which `compinit` autoloads at the
-//!   next shell start (zsh has no lazy first-tab loader). A release binary writes
-//!   both (a) a safe, standard Homebrew `site-functions` candidate when present
-//!   and (b) the per-user `~/.local/share/zsh/site-functions`. The preferred-
-//!   shell startup bootstrap adds the per-user directory to `$fpath`, initializes
-//!   `compinit` when needed, and registers `_hf2q` in each new interactive shell.
+//! - **zsh**: `_hf2q` in the per-user
+//!   `${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions`, which `compinit`
+//!   autoloads at the next shell start (zsh has no lazy first-tab loader). The
+//!   preferred-shell startup bootstrap adds that directory to `$fpath`,
+//!   initializes `compinit` when needed, and registers `_hf2q` in each new
+//!   interactive shell. hf2q never writes into a machine-wide directory such as
+//!   a Homebrew or `/usr/local` `site-functions` tree: those are shared by every
+//!   account on the host, so one installation's uninstall would break another's
+//!   completion (issue #246).
 //! - **Fish**: `hf2q.fish` in Fish's official per-user autoload directory,
 //!   `${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions`. Fish discovers the
 //!   command-named file without an rc edit.
@@ -32,9 +35,10 @@
 //!
 //! Boundary: hf2q is pre-alpha and runs on the trusted bare host under the
 //! operator's own account (ADR-041). Writing into the operator's own
-//! `~/.local/share`, `~/.config`, a writable Homebrew/distro site-functions dir,
-//! or hf2q's bounded managed block in the preferred shell's startup file is
-//! in-posture. A hostile `HOME` or XDG directory owner is outside ADR-041's
+//! `~/.local/share`, `~/.config`, or hf2q's bounded managed block in the
+//! preferred shell's startup file is in-posture. Machine-wide shared directories
+//! are never automatic destinations, and the ownership receipt only registers
+//! and removes paths inside the operator's `$HOME`. A hostile `HOME` or XDG directory owner is outside ADR-041's
 //! accepted trusted-host threat model. The residual in scope is an ordinary
 //! permission, race, or I/O failure, contained by ownership markers, atomic
 //! replacement, and the best-effort failure boundary described above.
@@ -538,12 +542,13 @@ fn protect_zsh_registration(
     Ok(protected.into_bytes())
 }
 
-/// Explicit override for the zsh completions drop dir. Point it at a dir
-/// already on your `$fpath` — e.g. Homebrew's
-/// `/opt/homebrew/share/zsh/site-functions` — to make `_hf2q` directly
-/// discoverable by `compinit`. Unlike automatic discovery, this explicit
-/// override is honored by unproven binaries too, which lets tests, package
-/// maintainers, and developers use an isolated directory safely.
+/// Explicit override for the zsh completions drop dir. Point it at a per-user
+/// dir already on your `$fpath` to make `_hf2q` directly discoverable by
+/// `compinit`. Unlike automatic discovery, this explicit override is honored by
+/// unproven binaries too, which lets tests, package maintainers, and developers
+/// use an isolated directory safely. A destination outside `$HOME` is written
+/// on request but never recorded in the ownership receipt, so uninstall never
+/// removes it.
 const ZSH_DIR_VAR: &str = "HF2Q_ZSH_COMPLETIONS_DIR";
 
 /// Explicit override for the Fish completions drop dir. Fish autoloads
@@ -785,7 +790,7 @@ pub fn reconcile(raw_args: &[OsString]) {
         // Reconcile every resolved directory independently.
         let mut v = Vec::new();
         for shell in [&BASH, &ZSH, &FISH] {
-            let dirs = completions_dirs(shell, allow_automatic);
+            let dirs = completions_dirs(shell, allow_automatic, &process_env);
             if dirs.is_empty() {
                 let outcome = if !allow_automatic {
                     Outcome::PolicySkip(shell.explicit_dir_var)
@@ -1152,16 +1157,26 @@ fn commit_adoption_backup(
     Ok(slot)
 }
 
+/// Environment lookup used by destination resolution. Production passes
+/// [`process_env`]; tests pass an isolated map so they can resolve against a
+/// temporary `HOME` without mutating the process environment.
+type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+
+/// The process environment, treating an empty value as unset.
+fn process_env(key: &str) -> Option<OsString> {
+    std::env::var_os(key).and_then(non_empty)
+}
+
 /// The completions drop dir(s) for `shell`, in loader priority order. Bash and
-/// Fish have exactly one per-user directory; zsh has one or more (see
-/// [`zsh_target_dirs`]). Empty means either no release destination was
+/// Fish have exactly one per-user directory; so does zsh (see
+/// [`zsh_target_dirs_with_automatic_locations`]). Empty means either no release destination was
 /// resolvable or an unproven binary intentionally received no explicit target;
 /// [`reconcile`] records those cases distinctly.
-fn completions_dirs(shell: &Shell, allow_automatic: bool) -> Vec<PathBuf> {
+fn completions_dirs(shell: &Shell, allow_automatic: bool, env: EnvLookup<'_>) -> Vec<PathBuf> {
     match shell.name {
-        "bash" => bash_target_dirs_with_automatic_user(allow_automatic),
-        "zsh" => zsh_target_dirs_with_automatic_locations(allow_automatic),
-        "fish" => fish_target_dirs_with_automatic_user(allow_automatic),
+        "bash" => bash_target_dirs_with_automatic_user(allow_automatic, env),
+        "zsh" => zsh_target_dirs_with_automatic_locations(allow_automatic, env),
+        "fish" => fish_target_dirs_with_automatic_user(allow_automatic, env),
         _ => Vec::new(),
     }
 }
@@ -1169,14 +1184,15 @@ fn completions_dirs(shell: &Shell, allow_automatic: bool) -> Vec<PathBuf> {
 /// Debug/test binaries may write bash completion only when the caller exports
 /// the completion-specific destination. This prevents a local debug run from
 /// replacing a release registration in the operator's normal XDG/HOME tree.
-fn bash_target_dirs_with_automatic_user(allow_automatic_user: bool) -> Vec<PathBuf> {
-    let explicit = std::env::var_os("BASH_COMPLETION_USER_DIR")
-        .and_then(non_empty)
-        .is_some();
+fn bash_target_dirs_with_automatic_user(
+    allow_automatic_user: bool,
+    env: EnvLookup<'_>,
+) -> Vec<PathBuf> {
+    let explicit = env("BASH_COMPLETION_USER_DIR").is_some();
     if !explicit && !allow_automatic_user {
         return Vec::new();
     }
-    user_completions_dir().into_iter().collect()
+    user_completions_dir(env).into_iter().collect()
 }
 
 /// Resolve the bash-completion user completions directory, mirroring
@@ -1186,14 +1202,14 @@ fn bash_target_dirs_with_automatic_user(allow_automatic_user: bool) -> Vec<PathB
 /// Only hf2q's own (exported) environment is visible here; a shell-local
 /// `BASH_COMPLETION_USER_DIR` not exported to this child is invisible — the
 /// guarantee is scoped to the default or exported environment.
-fn user_completions_dir() -> Option<PathBuf> {
-    let base = if let Some(d) = std::env::var_os("BASH_COMPLETION_USER_DIR").and_then(non_empty) {
+fn user_completions_dir(env: EnvLookup<'_>) -> Option<PathBuf> {
+    let base = if let Some(d) = env("BASH_COMPLETION_USER_DIR") {
         PathBuf::from(d)
     } else {
-        let data_home = if let Some(x) = std::env::var_os("XDG_DATA_HOME").and_then(non_empty) {
+        let data_home = if let Some(x) = env("XDG_DATA_HOME") {
             PathBuf::from(x)
         } else {
-            let home = std::env::var_os("HOME").and_then(non_empty)?;
+            let home = env("HOME")?;
             PathBuf::from(home).join(".local/share")
         };
         data_home.join("bash-completion")
@@ -1201,56 +1217,44 @@ fn user_completions_dir() -> Option<PathBuf> {
     Some(base.join("completions"))
 }
 
-/// Resolve the zsh completion drop dir(s). zsh has
-/// no default per-user completion dir, so:
+/// Resolve the zsh completion drop dir. zsh has no default per-user
+/// completion dir, so:
 /// - `$HF2Q_ZSH_COMPLETIONS_DIR` if exported ⇒ **exactly that dir** — the
 ///   operator's explicit choice (point it at any `$fpath` dir);
-/// - otherwise, for release builds, **the additive set**
-///   `[safe Homebrew dir?, XDG dir?]`:
-///   1. a Homebrew `site-functions` dir that already exists and is
-///      safe to write (owned by our euid, owner-writable, not group/world-
-///      writable) — the macOS zero-config candidate (see
-///      [`safe_on_fpath_zsh_dir`]);
-///   2. `${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions` —
-///      the HOME-isolated per-user dir. The preferred-shell startup bootstrap
-///      adds it to `$fpath` and initializes `compinit` when needed.
+/// - otherwise, for release builds,
+///   `${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions` — the
+///   HOME-isolated per-user dir. The preferred-shell startup bootstrap adds it
+///   to `$fpath` and initializes `compinit` when needed.
 ///
-/// Writing **both** in an owned release install is deliberate: hf2q never
-/// *abandons* the XDG dir, so an operator who already put it on their `$fpath`
-/// keeps receiving updates there
-/// (no regression), while the Homebrew dir adds zero-config for everyone else.
-/// A stray `_hf2q` in a dir that turns out not to be on `$fpath` is inert, so the
-/// additive write is never worse than the XDG-only status quo — and hf2q does not
-/// (and cannot cheaply) *prove* `$fpath` membership without spawning the
-/// operator's shell, which it declines to do on every startup. Unproven
-/// binaries intentionally skip **all** automatic destinations.
+/// Machine-wide `site-functions` directories (Homebrew's `/opt/homebrew` or
+/// `/usr/local` trees, distro paths) are deliberately never automatic
+/// destinations: they are shared by every account on the host, so a second
+/// installation would register and later delete a file the first still relies
+/// on (issue #246). Unproven binaries intentionally skip **all** automatic
+/// destinations.
 /// Policy-parametric core used to pin owned and unowned behavior in tests.
-fn zsh_target_dirs_with_automatic_locations(allow_automatic_locations: bool) -> Vec<PathBuf> {
-    if let Some(d) = std::env::var_os(ZSH_DIR_VAR).and_then(non_empty) {
+fn zsh_target_dirs_with_automatic_locations(
+    allow_automatic_locations: bool,
+    env: EnvLookup<'_>,
+) -> Vec<PathBuf> {
+    if let Some(d) = env(ZSH_DIR_VAR) {
         return vec![PathBuf::from(d)];
     }
     if !allow_automatic_locations {
         return Vec::new();
     }
-    let mut dirs = Vec::new();
-    if let Some(hb) = safe_on_fpath_zsh_dir(homebrew_site_functions_candidates()) {
-        dirs.push(hb);
-    }
-    if let Some(xdg) = xdg_zsh_site_functions() {
-        dirs.push(xdg);
-    }
-    dirs
+    xdg_zsh_site_functions(env).into_iter().collect()
 }
 
 /// The HOME-isolated per-user zsh fallback dir:
 /// `${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions`. Not on zsh's
 /// default `$fpath`; the managed startup block adds it. `None` only if both
 /// `XDG_DATA_HOME` and `HOME` are unset/empty.
-fn xdg_zsh_site_functions() -> Option<PathBuf> {
-    let data_home = if let Some(x) = std::env::var_os("XDG_DATA_HOME").and_then(non_empty) {
+fn xdg_zsh_site_functions(env: EnvLookup<'_>) -> Option<PathBuf> {
+    let data_home = if let Some(x) = env("XDG_DATA_HOME") {
         PathBuf::from(x)
     } else {
-        PathBuf::from(std::env::var_os("HOME").and_then(non_empty)?).join(".local/share")
+        PathBuf::from(env("HOME")?).join(".local/share")
     };
     Some(data_home.join("zsh/site-functions"))
 }
@@ -1262,26 +1266,20 @@ fn xdg_zsh_site_functions() -> Option<PathBuf> {
 fn preferred_zsh_startup_registration() -> Option<(PathBuf, String)> {
     let desired = render_registration(&ZSH).ok()?;
     let binding = registration_binding_line(&desired, &ZSH)?.to_owned();
-    if let Some(explicit) = std::env::var_os(ZSH_DIR_VAR).and_then(non_empty) {
+    if let Some(explicit) = process_env(ZSH_DIR_VAR) {
         let dir = PathBuf::from(explicit);
         return is_exact_regular_registration(&dir.join(ZSH.file), &desired)
             .then_some((dir, binding));
     }
 
-    let xdg = xdg_zsh_site_functions();
-    let homebrew = safe_on_fpath_zsh_dir(homebrew_site_functions_candidates());
-    for dir in [xdg.as_ref(), homebrew.as_ref()].into_iter().flatten() {
-        if is_exact_regular_registration(&dir.join(ZSH.file), &desired) {
-            return Some((dir.clone(), binding));
-        }
-    }
-    None
+    let dir = xdg_zsh_site_functions(&process_env)?;
+    is_exact_regular_registration(&dir.join(ZSH.file), &desired).then_some((dir, binding))
 }
 
 fn startup_bash_registration() -> Option<(PathBuf, String)> {
     let desired = render_registration(&BASH).ok()?;
     let binding = registration_binding_line(&desired, &BASH)?.to_owned();
-    let path = user_completions_dir()?.join(BASH.file);
+    let path = user_completions_dir(&process_env)?.join(BASH.file);
     is_exact_regular_registration(&path, &desired).then_some((path, binding))
 }
 
@@ -1290,96 +1288,29 @@ fn startup_bash_registration() -> Option<(PathBuf, String)> {
 /// installs use `${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions`, while
 /// unproven binaries decline to discover an implicit live destination.
 /// Policy-parametric core used to pin owned and unowned behavior in tests.
-fn fish_target_dirs_with_automatic_user(allow_automatic_user: bool) -> Vec<PathBuf> {
-    if let Some(dir) = std::env::var_os(FISH_DIR_VAR).and_then(non_empty) {
+fn fish_target_dirs_with_automatic_user(
+    allow_automatic_user: bool,
+    env: EnvLookup<'_>,
+) -> Vec<PathBuf> {
+    if let Some(dir) = env(FISH_DIR_VAR) {
         return vec![PathBuf::from(dir)];
     }
     if !allow_automatic_user {
         return Vec::new();
     }
-    fish_user_completions_dir().into_iter().collect()
+    fish_user_completions_dir(env).into_iter().collect()
 }
 
 /// Fish's official per-user command-completion directory:
 /// `${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions`. `None` only when both
 /// `XDG_CONFIG_HOME` and `HOME` are unset or empty.
-fn fish_user_completions_dir() -> Option<PathBuf> {
-    let config_home = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").and_then(non_empty) {
+fn fish_user_completions_dir(env: EnvLookup<'_>) -> Option<PathBuf> {
+    let config_home = if let Some(xdg) = env("XDG_CONFIG_HOME") {
         PathBuf::from(xdg)
     } else {
-        PathBuf::from(std::env::var_os("HOME").and_then(non_empty)?).join(".config")
+        PathBuf::from(env("HOME")?).join(".config")
     };
     Some(config_home.join("fish/completions"))
-}
-
-/// Candidate Homebrew `site-functions` directories, most-specific first. Each is
-/// placed on `$fpath` by `brew shellenv` on a standard install, so it is a
-/// discoverable drop target for zero-config completion. `$HOMEBREW_PREFIX`
-/// (exported by `brew shellenv`, so inherited by an hf2q launched from the
-/// operator's shell) wins; the two canonical prefixes — `/opt/homebrew` (Apple
-/// Silicon) and `/usr/local` (Intel) — are the fallback probe set.
-fn homebrew_site_functions_candidates() -> Vec<PathBuf> {
-    let mut v = Vec::new();
-    if let Some(p) = std::env::var_os("HOMEBREW_PREFIX").and_then(non_empty) {
-        v.push(PathBuf::from(p).join("share/zsh/site-functions"));
-    }
-    v.push(PathBuf::from("/opt/homebrew/share/zsh/site-functions"));
-    v.push(PathBuf::from("/usr/local/share/zsh/site-functions"));
-    v
-}
-
-/// The first candidate dir that already exists as a **real directory owned by our
-/// effective uid, owner-writable, and not group- or world-writable** — the safety
-/// gate that lets hf2q auto-write into an on-`$fpath` Homebrew dir without a
-/// cross-user clobber hazard. Rationale for each rejection:
-/// - **running as root** (`euid == 0`, e.g. under `sudo`): a root-owned
-///   `/usr/local/...` would otherwise pass the ownership gate and hf2q would write
-///   a *machine-wide* completion — never auto-install system files; root uses its
-///   own HOME's XDG dir like any account;
-/// - **not a real dir** (missing, a file, or a symlink): `symlink_metadata` +
-///   `is_dir()` rejects symlinks too, so we never write *through* an operator- or
-///   attacker-managed link;
-/// - **owned by another uid** (e.g. root-owned `/usr/local/...`): not ours to
-///   manage — fall through to the per-user XDG dir instead;
-/// - **group/world-writable**: a slot another account can write is exactly the
-///   cross-install/cross-user hazard the original design avoided;
-/// - **not owner-writable/searchable** (e.g. a `0555` dir we own): the later
-///   write would fail, so reject it up front and let the always-written XDG dir
-///   carry completion instead.
-///
-/// Mode bits are the gate, not a full access oracle — ACLs, read-only mounts, and
-/// file flags can still deny a write the bits permit. TOCTOU between this lstat
-/// and the later write is not hardened; it remains an explicit open obligation,
-/// not an ADR-041 containment claim or accepted deferral. The always-written XDG
-/// dir is only a functional backstop when the Homebrew write fails. Returns
-/// `None` if nothing qualifies.
-fn safe_on_fpath_zsh_dir(candidates: Vec<PathBuf>) -> Option<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    // SAFETY: `geteuid` always succeeds, is reentrant, and touches no memory.
-    let euid = unsafe { libc::geteuid() };
-    if euid == 0 {
-        return None; // never auto-install a system-wide completion (sudo/root)
-    }
-    for dir in candidates {
-        let Ok(meta) = std::fs::symlink_metadata(&dir) else {
-            continue; // missing or unstattable
-        };
-        if !meta.file_type().is_dir() {
-            continue; // a file or symlink — never write through it
-        }
-        if meta.uid() != euid {
-            continue; // someone else's dir (e.g. root) — not ours to manage
-        }
-        let mode = meta.mode();
-        if mode & 0o022 != 0 {
-            continue; // group- or world-writable — cross-user clobber hazard
-        }
-        if mode & 0o300 != 0o300 {
-            continue; // owner lacks write+search — the write would fail; use XDG
-        }
-        return Some(dir);
-    }
-    None
 }
 
 /// Render the dynamic-completion registration script for THIS binary + `shell`,

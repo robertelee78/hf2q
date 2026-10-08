@@ -49,8 +49,14 @@ managed-model preference is provided by hf2q's dynamic adapters.
 ## Managed locations
 
 - Bash: `${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}/completions/hf2q`.
-- Zsh: `${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_hf2q`, plus a safe current-user-owned Homebrew `site-functions` directory when one exists.
+- Zsh: `${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_hf2q`; the managed startup block adds this directory to `$fpath`.
 - Fish: `${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/hf2q.fish`.
+
+Completion is installed per user only. hf2q never writes, registers, or
+removes files in machine-wide directories such as Homebrew's
+`/opt/homebrew/share/zsh/site-functions` or `/usr/local/share/...`: those are
+shared by every account and installation on the host, so one uninstall could
+break another installation's completion.
 
 For a preferred Bash or Zsh login shell, hf2q adds one bounded block between
 `# >>> hf2q managed completion >>>` and
@@ -74,7 +80,9 @@ preserved.
 
 A private ownership receipt under
 `${XDG_STATE_HOME:-$HOME/.local/state}/hf2q/completion-ownership-v1.json`
-binds the exact registration bytes and startup blocks. `hf2q uninstall --yes`
+binds the exact registration bytes and startup blocks. It records only paths
+inside `$HOME`; an entry outside `$HOME` left by an older hf2q release is
+skipped untouched during cleanup and pruned on the next refresh. `hf2q uninstall --yes`
 and standalone rollback remove only receipt-bound, unchanged artifacts. A file
 or block edited after installation is preserved and reported. Update and
 rollback invoke the newly active binary once so completion never remains pinned
