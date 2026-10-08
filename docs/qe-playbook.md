@@ -165,15 +165,16 @@ artifact is published for the guide's abliterated SFT checkpoint, so use the
 stock model and its published artifact:
 
 ```bash
-HOME=$QE_HOME hf2q serve Qwen/Qwen3.8-27B:Q4_K_M \
+HOME=$QE_HOME HF_TOKEN=$(cat ~/.cache/huggingface/token) hf2q serve Qwen/Qwen3.8-27B:Q4_K_M \
   --glp https://huggingface.co/msuiche/Qwen3.8-27B-abliterated-cyber-GLP-49/resolve/main/Qwen3.8-27B-abliterated-cyber-GLP-49-L10-58-a1.gguf
 ```
 
 That repository holds two vectors, so the bare repository name and bare
 `--glp` both stop with an "ambiguous GLP files" error by design; name one file
 by its full Hub URL. The repository is gated: accept its license on Hugging
-Face and run `hf auth login` first, or startup fails with "Authentication
-failed".
+Face and run `hf auth login` in your normal shell first. hf2q looks for the
+saved token under `$HOME`, which `HOME=$QE_HOME` hides, so pass it in with
+`HF_TOKEN` as above; without it, startup fails with "Authentication failed".
 
 If no stock Q4_K_M is available, convert one first with `hf2q convert
 Qwen/Qwen3.8-27B --quant q4_k_m`. Chat with it; restart with `--glp-alpha 0.5`;
