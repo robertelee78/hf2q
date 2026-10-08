@@ -137,7 +137,8 @@ hf2q setup --accept-defaults
 ```
 
 The canonical Qwen3.8 guide profile records Q4_K_M conversion, localhost port
-8081, and inflight-batched serving with one active slot. Interactive setup can
+8081, and inflight-batched serving with four active slots, the same scheduler and slot
+count a plain `hf2q serve` uses with no config. Interactive setup can
 change those choices for another workload or model family. Explicit command
 flags still win, and existing scheduler
 environment overrides retain their precedence. Use the global
