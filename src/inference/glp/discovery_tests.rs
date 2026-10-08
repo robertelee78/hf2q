@@ -313,3 +313,33 @@ fn transport_failure_is_fatal_without_selecting_cached_or_other_files() {
     .unwrap_err();
     assert!(error.to_string().contains("offline"));
 }
+
+#[test]
+fn load_resolution_refuses_architectures_that_would_ignore_glp() {
+    // A family whose engine never reads the vector must fail the load rather
+    // than serve unsteered. The refusal comes before any file or Hub access.
+    let error = resolve_glp_for_load(
+        Path::new("msuiche/Example-GLP"),
+        Path::new("/nonexistent/gemma.gguf"),
+        "gemma4",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("not supported for `gemma4`"), "{error}");
+    for architecture in GLP_SERVING_ARCHITECTURES {
+        assert!(error.contains(architecture), "{error}");
+    }
+}
+
+#[test]
+fn load_resolution_fails_closed_for_a_supported_architecture() {
+    // A supported family with an unusable reference fails the load with the
+    // reference named, instead of loading the model unsteered.
+    let model = tempfile::NamedTempFile::new().unwrap();
+    let error = resolve_glp_for_load(Path::new("/missing/vector.gguf"), model.path(), "qwen35")
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("/missing/vector.gguf"),
+        "{error:#}"
+    );
+}

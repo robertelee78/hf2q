@@ -125,9 +125,13 @@ pub struct EngineConfig {
     /// surface (Decision #19): when full, handlers see `queue_full` and
     /// map to 429 + Retry-After.
     pub queue_capacity: usize,
-    /// ADR-053: optional GLP steering vector path (loaded at model-load).
-    pub glp_path: Option<PathBuf>,
-    /// ADR-053: steering dose override.
+    /// ADR-053: the operator's GLP reference (local file, `owner/repo`,
+    /// Hub file URL, or `auto`). It is server-wide steering policy: every
+    /// model this server loads resolves it against that exact model inside
+    /// [`crate::serve::load_engine`], and a model that cannot bind it fails to
+    /// load. It is never resolved only for the startup model.
+    pub glp_reference: Option<PathBuf>,
+    /// ADR-053: steering dose override, applied with `glp_reference`.
     pub glp_alpha: Option<f32>,
     /// When `true`, run `Engine::warmup()` on a temporary tokio runtime
     /// before returning.  The hot-swap orchestrator and the existing
@@ -242,7 +246,7 @@ impl From<&EngineConfig> for EngineConfigIdentity {
             explicit_tokenizer: config.tokenizer_path.is_some(),
             explicit_config: config.config_path.is_some(),
             dwq_overlay: config.dwq_overlay_path.is_some(),
-            glp_active: config.glp_path.is_some(),
+            glp_active: config.glp_reference.is_some(),
             glp_alpha_bits: config.glp_alpha.map(f32::to_bits),
         }
     }

@@ -25,6 +25,101 @@ pub struct ResolvedGlp {
     pub source_filename: Option<String>,
 }
 
+/// Model architectures whose serving engines bind a GLP vector. Any other
+/// architecture would silently ignore the vector, so loading one with GLP
+/// requested is refused instead.
+pub const GLP_SERVING_ARCHITECTURES: &[&str] = &["qwen35", "qwen35moe", "deepseek4"];
+
+type LoadResolutionKey = (PathBuf, PathBuf);
+
+fn load_resolutions(
+) -> &'static std::sync::Mutex<std::collections::HashMap<LoadResolutionKey, PathBuf>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<LoadResolutionKey, PathBuf>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Why a model could not load with the server's GLP reference. Load paths
+/// keep this type in the error chain so serving can report a GLP refusal as
+/// such instead of an anonymous loader failure.
+#[derive(Debug)]
+pub enum GlpLoadError {
+    /// The model's engine does not bind GLP vectors.
+    UnsupportedArchitecture {
+        architecture: String,
+        model_path: PathBuf,
+    },
+    /// The reference could not be resolved or does not fit this model.
+    Unusable(anyhow::Error),
+}
+
+impl std::fmt::Display for GlpLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedArchitecture {
+                architecture,
+                model_path,
+            } => write!(
+                formatter,
+                "GLP steering is not supported for `{architecture}` models ({}); \
+                 it is available for {}. Start the server without --glp to serve this model",
+                model_path.display(),
+                GLP_SERVING_ARCHITECTURES.join(", ")
+            ),
+            Self::Unusable(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for GlpLoadError {}
+
+/// Resolve the server-wide GLP reference for one model as it loads.
+///
+/// `hf2q serve --glp` is steering policy for every model the server loads,
+/// whether it was named at startup, activated later (as `hf2q chat --model`
+/// does), or reloaded after eviction. Every load calls this with the exact
+/// model file, so no load path can skip GLP. A reference that cannot be
+/// resolved or bound for this model fails the load; it never falls back to
+/// unsteered serving. Successful resolutions are cached per reference and
+/// model so a reload does not consult the Hub again.
+pub fn resolve_glp_for_load(
+    reference: &Path,
+    model_path: &Path,
+    architecture: &str,
+) -> std::result::Result<PathBuf, GlpLoadError> {
+    if !GLP_SERVING_ARCHITECTURES.contains(&architecture) {
+        return Err(GlpLoadError::UnsupportedArchitecture {
+            architecture: architecture.to_string(),
+            model_path: model_path.to_path_buf(),
+        });
+    }
+    resolve_cached(reference, model_path).map_err(GlpLoadError::Unusable)
+}
+
+fn resolve_cached(reference: &Path, model_path: &Path) -> Result<PathBuf> {
+    let model_key = std::fs::canonicalize(model_path)
+        .with_context(|| format!("canonicalize model {} for GLP", model_path.display()))?;
+    let key = (reference.to_path_buf(), model_key);
+    if let Some(path) = load_resolutions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("GLP resolution cache poisoned"))?
+        .get(&key)
+        .filter(|path| path.is_file())
+        .cloned()
+    {
+        return Ok(path);
+    }
+    let resolved = resolve_glp(reference, model_path, &ProgressReporter::new())
+        .with_context(|| format!("resolve GLP modifier {}", reference.display()))?
+        .path;
+    load_resolutions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("GLP resolution cache poisoned"))?
+        .insert(key, resolved.clone());
+    Ok(resolved)
+}
+
 /// The model path is the file already selected by the serving resolver.
 /// Repository IDs and Hugging Face tree/blob/resolve URLs use the canonical
 /// parser, including embedded revisions and nested filenames.

@@ -104,10 +104,6 @@ pub struct ServerConfig {
     /// that does not already specify a grammar. The grammar forces the answer
     /// to land directly (no think block). Concept: Vince Ovando (tantalus.io).
     pub gcd: bool,
-    /// ADR-053: GLP steering vector path. When Some, the GCD grammar
-    /// uses the B14 shape (let GLP reasoning run, force answer) instead of
-    /// the anchor shape (force frame + answer). GLP concept: Matt Suiche.
-    pub glp_path: Option<PathBuf>,
     /// ADR-057: schema-constrained GCD. When Some, holds the GBNF compiled
     /// from the operator's JSON schema at startup (fail-closed compile) and
     /// injected as the serve-time default constraint in place of the W1
@@ -139,7 +135,6 @@ impl Default for ServerConfig {
             default_thinking_token_budget: None,
             default_tool_thinking_token_budget: None,
             gcd: false,
-            glp_path: None,
             gcd_schema_grammar: None,
             gcd_schema_locked: false,
         }
@@ -858,7 +853,7 @@ impl AppState {
             kv_metrics_sink: Some(Arc::clone(&kv_spill_counters)
                 as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
             dwq_overlay_path: None,
-            glp_path: None,
+            glp_reference: None,
             glp_alpha: None,
             engine_mode: super::engine::EngineMode::SerialFifo,
             requested_context: None,
@@ -934,7 +929,7 @@ impl AppState {
             kv_metrics_sink: Some(Arc::clone(&kv_spill_counters_test)
                 as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
             dwq_overlay_path: None,
-            glp_path: None,
+            glp_reference: None,
             glp_alpha: None,
             engine_mode: super::engine::EngineMode::SerialFifo,
             requested_context: None,
@@ -1377,6 +1372,26 @@ mod tests {
         // (Prometheus convention; absent counter ⇒ no histogram).
         let counters = KvSpillCounters::new();
         assert_eq!(counters.snapshot_lcp(), (0, 0));
+    }
+
+    #[test]
+    fn glp_policy_reaches_models_loaded_after_startup() {
+        // `hf2q chat --model X --glp V` starts `hf2q serve --glp V` with no
+        // startup model and activates X afterwards. That load, and any other
+        // model loaded later, must carry the server's GLP policy; before this
+        // test it got the template's `None` and served unsteered.
+        let mut base = AppState::new(ServerConfig::default()).engine_config_template;
+        base.glp_reference = Some("msuiche/Example-GLP".into());
+        base.glp_alpha = Some(2.0);
+        let state =
+            AppState::new(ServerConfig::default()).with_engine_config_template(base.clone());
+        let activated_later = tempfile::NamedTempFile::new().unwrap();
+        let config = state
+            .engine_config_for_path(activated_later.path())
+            .unwrap();
+        assert_eq!(config.glp_reference, base.glp_reference);
+        assert_eq!(config.glp_alpha, Some(2.0));
+        assert!(crate::serve::multi_model::EngineConfigIdentity::from(&config).glp_active);
     }
 
     #[test]
