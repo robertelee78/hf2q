@@ -4083,9 +4083,11 @@ fn process_multimodal_content(
             }
             ArchProfile::Gemma4Siglip => {
                 // Variable-resolution patches + per-patch 2D pos arrays.
-                let cfg = &crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT;
+                let cfg = crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT
+                    .clone()
+                    .with_normalization(mmproj.config.image_mean, mmproj.config.image_std);
                 let preprocessed = crate::inference::vision::preprocess::preprocess_gemma4v(
-                    &bytes, cfg,
+                    &bytes, &cfg,
                 )
                 .map_err(|e| {
                     ApiError::invalid_request(

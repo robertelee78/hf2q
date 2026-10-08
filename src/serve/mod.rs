@@ -1226,8 +1226,10 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             .with_context(|| format!("--image: load {}", image_path.display()))?;
         let preprocessed_input = match mmproj.arch {
             crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip => {
-                let cfg = &crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT;
-                let pp = crate::inference::vision::preprocess::preprocess_gemma4v(&bytes, cfg)
+                let cfg = crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT
+                    .clone()
+                    .with_normalization(mmproj.config.image_mean, mmproj.config.image_std);
+                let pp = crate::inference::vision::preprocess::preprocess_gemma4v(&bytes, &cfg)
                     .with_context(|| {
                         format!("--image: gemma4v preprocess {}", image_path.display())
                     })?;
