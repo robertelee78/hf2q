@@ -1067,7 +1067,10 @@ pub struct ChatArgs {
     #[arg(long)]
     pub top_p: Option<f32>,
 
-    /// Maximum completion tokens. Omitted unless explicitly set.
+    /// Maximum completion tokens. Omitted unless explicitly set, in which
+    /// case the server default (512) applies. Change it during a session with
+    /// `/max-tokens N` (`/max-tokens default` omits it again); `/status` shows
+    /// the current limit.
     #[arg(long)]
     pub max_tokens: Option<usize>,
 

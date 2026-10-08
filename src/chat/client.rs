@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 use super::endpoint::Endpoint;
 use super::sse::{CompletedResponse, SseDecoder, StreamUpdate};
 use super::transcript::Transcript;
-use super::wire::{ChatRequest, Model, ModelList, RequestOptions, ThinkingMode};
+use super::wire::{ChatRequest, MaxTokensSource, Model, ModelList, RequestOptions, ThinkingMode};
 
 const MAX_AUXILIARY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -15,6 +15,7 @@ pub(crate) struct ChatClient {
     model: String,
     transcript: Transcript,
     options: RequestOptions,
+    max_tokens_source: MaxTokensSource,
     auth_token: Option<String>,
     hf2q_non_evicting: bool,
 }
@@ -31,12 +32,18 @@ impl ChatClient {
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .context("build diagnostic chat HTTP client")?;
+        let max_tokens_source = if options.max_tokens.is_some() {
+            MaxTokensSource::Flag
+        } else {
+            MaxTokensSource::ServerDefault
+        };
         Ok(Self {
             http,
             endpoint,
             model,
             transcript: Transcript::new(system),
             options,
+            max_tokens_source,
             auth_token,
             hf2q_non_evicting: false,
         })
@@ -56,6 +63,24 @@ impl ChatClient {
 
     pub(crate) fn set_thinking(&mut self, mode: ThinkingMode) {
         self.options.thinking = mode;
+    }
+
+    pub(crate) fn max_tokens(&self) -> Option<usize> {
+        self.options.max_tokens
+    }
+
+    pub(crate) fn max_tokens_source(&self) -> MaxTokensSource {
+        self.max_tokens_source
+    }
+
+    /// `None` returns to omitting the field so the server default applies.
+    pub(crate) fn set_max_tokens(&mut self, max_tokens: Option<usize>) {
+        self.options.max_tokens = max_tokens;
+        self.max_tokens_source = if max_tokens.is_some() {
+            MaxTokensSource::Command
+        } else {
+            MaxTokensSource::ServerDefault
+        };
     }
 
     pub(crate) fn set_hf2q_non_evicting(&mut self, enabled: bool) {
@@ -353,6 +378,37 @@ mod tests {
                 "stream_options": {"include_usage": true}
             })
         );
+        drop(requests);
+        let _ = stop.send(());
+    }
+
+    #[tokio::test]
+    async fn network_max_tokens_command_value_is_sent_and_default_omits_it() {
+        let recorded = Recorded(Arc::new(Mutex::new(Vec::new())));
+        let router = Router::new()
+            .route("/v1/chat/completions", post(successful_chat))
+            .with_state(recorded.clone());
+        let (endpoint, stop) = serve(router).await;
+        let options = RequestOptions {
+            max_tokens: Some(256),
+            ..RequestOptions::default()
+        };
+        let mut client = ChatClient::new(endpoint, "model-a".into(), None, options, None).unwrap();
+        assert_eq!(client.max_tokens_source(), MaxTokensSource::Flag);
+
+        client.set_max_tokens(Some(8192));
+        assert_eq!(client.max_tokens(), Some(8192));
+        assert_eq!(client.max_tokens_source(), MaxTokensSource::Command);
+        client.send_turn("first", |_| Ok(())).await.unwrap();
+
+        client.set_max_tokens(None);
+        assert_eq!(client.max_tokens_source(), MaxTokensSource::ServerDefault);
+        client.send_turn("second", |_| Ok(())).await.unwrap();
+
+        let requests = recorded.0.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["max_tokens"], 8192);
+        assert!(requests[1].get("max_tokens").is_none());
         drop(requests);
         let _ = stop.send(());
     }

@@ -71,6 +71,28 @@ impl ThinkingMode {
     }
 }
 
+/// Where the session's `max_tokens` value came from, for `/status`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MaxTokensSource {
+    /// Field omitted; the server applies its own default.
+    #[default]
+    ServerDefault,
+    /// Set by the `--max-tokens` flag.
+    Flag,
+    /// Set by a `/max-tokens` command during the session.
+    Command,
+}
+
+impl MaxTokensSource {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::ServerDefault => "server default (512 when omitted)",
+            Self::Flag => "--max-tokens flag",
+            Self::Command => "/max-tokens command",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestOptions {
     pub temperature: Option<f32>,
