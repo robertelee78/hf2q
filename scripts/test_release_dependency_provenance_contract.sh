@@ -263,9 +263,11 @@ awk '
   }
 ' "$RELEASE_WORKFLOW" || \
   fail "release packed-source bash syntax gate omits dependency provenance scripts"
+# The packed crate excludes .github/, so this contract runs from the full
+# checkout in ci.yml rather than inside the packed-source smoke step.
 grep -qF 'bash scripts/test_release_dependency_provenance_contract.sh' \
-  "$RELEASE_WORKFLOW" || \
-  fail "release packed-source gate does not execute the dependency provenance contract"
+  "$ROOT_DIR/.github/workflows/ci.yml" || \
+  fail "CI does not execute the dependency provenance contract"
 
 operational_version_files=(
   "$RELEASE_WORKFLOW"
