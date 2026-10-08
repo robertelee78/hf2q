@@ -704,15 +704,18 @@ fn plan_remote_native_product_bytes(
         crate::convert::cli_driver::plan_standard_text_output_bytes(
             hf_dir,
             *ftype,
-            reference,
+            reference.clone(),
             source_sha256.to_owned(),
             projector_planned,
         )?
     };
     let projector = if projector_planned {
-        crate::models::vit::planned_vision_tower_output_bytes(
+        // Family-dispatched: Gemma 4 is sized by its own mapper, not the
+        // Qwen-shaped ViT planner.
+        crate::convert::cli_driver::plan_projector_output_bytes(
             hf_dir,
-            Some(source_sha256),
+            reference,
+            source_sha256.to_owned(),
             (!projector_only).then_some("00000000-0000-0000-0000-000000000000"),
         )?
     } else {

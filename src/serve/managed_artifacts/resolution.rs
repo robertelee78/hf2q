@@ -553,6 +553,9 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
         bail!("no compatible hosted artifact matches selector {:?}; available exact filenames: {available}. {}",
             spec.requested_selector().unwrap_or(""), warnings.join("; "));
     }
+    // A multimodal projector that cannot be planned must never fail the load:
+    // text serving goes ahead and vision degrades with a visible warning.
+    let mut native_text_only = false;
     let (native_fallback_quant, native_product_bytes) = if loose.is_none() && selected.is_none() {
         let source_reference =
             HfModelReference::parse(&catalog.repository, Some(catalog.revision.as_str()))?;
@@ -571,14 +574,21 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
         }
         catalog.source_weight_bytes = Some(source_plan.total_weight_bytes);
         catalog.source_uncached_weight_bytes = Some(source_plan.uncached_weight_bytes);
+        let projector_unplannable = std::cell::RefCell::new(None::<String>);
         let (quant, bytes) = select_native_quant_from_exact_plans(
             spec.quant,
             recommended,
             hardware.available_memory_bytes,
             pool_budget_bytes,
-            |quant| plan_native_quant_products(&prepared, quant),
+            |quant| plan_native_quant_products(&prepared, quant, &projector_unplannable),
             &mut warnings,
         )?;
+        if let Some(error) = projector_unplannable.into_inner() {
+            warnings.push(format!(
+                "multimodal projector cannot be planned for this model; serving text-only: {error}"
+            ));
+            native_text_only = true;
+        }
         (quant, Some(bytes))
     } else {
         (spec.quant.unwrap_or(recommended), None)
@@ -1056,13 +1066,17 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
         prepared_projector = projector_plan;
         (candidate, !text_destination_exact)
     } else {
-        native_convert_with_progress(
+        let (candidate, prepared_here, converted_text_only) = native_convert_with_progress(
             &catalog,
             native_fallback_quant,
             explicit_output,
             native_product_bytes,
+            native_text_only,
+            &mut warnings,
             progress,
-        )?
+        )?;
+        suppress_automatic_projector |= converted_text_only;
+        (candidate, prepared_here)
     };
     let (prepared, local_suppress_projector) =
         prepare_selected_local_decision(candidate, None, &mut warnings)?;
@@ -1106,6 +1120,7 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
 fn plan_native_quant_products(
     prepared: &crate::input::hf_download::PreparedNativePlanningSource,
     quant: QuantType,
+    projector_unplannable: &std::cell::RefCell<Option<String>>,
 ) -> Result<u64> {
     let ftype = crate::quantize::ggml_quants::GgufFtype::try_from(quant.gguf_file_type())
         .map_err(|_| anyhow!("unsupported native quant plan for {quant}"))?;
@@ -1113,23 +1128,35 @@ fn plan_native_quant_products(
     let reference =
         HfModelReference::parse(&source_plan.repository, Some(source_plan.revision.as_str()))?
             .resolve(&source_plan.revision)?;
+    // Plan the projector first and through the family-dispatched sizer. If it
+    // cannot be planned, record why and plan a text-only product: missing or
+    // unsupported vision must never block text serving.
+    let projector = if source_plan.requires_projector {
+        match crate::convert::cli_driver::plan_projector_output_bytes(
+            prepared.path(),
+            reference.clone(),
+            prepared.source_bundle_sha256().to_owned(),
+            Some("00000000-0000-0000-0000-000000000000"),
+        ) {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                projector_unplannable
+                    .borrow_mut()
+                    .get_or_insert_with(|| error.to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
     let text = crate::convert::cli_driver::plan_standard_text_output_bytes(
         prepared.path(),
         ftype,
         reference,
         prepared.source_bundle_sha256().to_owned(),
-        source_plan.requires_projector,
+        projector.is_some(),
     )?;
-    let projector = if source_plan.requires_projector {
-        crate::models::vit::planned_vision_tower_output_bytes(
-            prepared.path(),
-            Some(prepared.source_bundle_sha256()),
-            Some("00000000-0000-0000-0000-000000000000"),
-        )?
-    } else {
-        0
-    };
-    text.checked_add(projector)
+    text.checked_add(projector.unwrap_or(0))
         .context("native text plus projector product size overflowed u64")
 }
 
@@ -2198,23 +2225,32 @@ pub(super) fn native_convert(
     exact_product_bytes: Option<u64>,
 ) -> Result<Candidate> {
     let mut silent = |_| {};
+    let mut warnings = Vec::new();
     native_convert_with_progress(
         catalog,
         quant,
         explicit_output,
         exact_product_bytes,
+        false,
+        &mut warnings,
         &mut silent,
     )
-    .map(|(candidate, _)| candidate)
+    .map(|(candidate, _, _)| candidate)
 }
 
+/// Returns `(candidate, prepared_here, text_only)`. `text_only` is true when the
+/// conversion deliberately omitted the multimodal projector, either because it
+/// could not be planned (`text_only` requested) or because a paired conversion
+/// failed and was retried without vision. Vision never blocks text serving.
 pub(super) fn native_convert_with_progress(
     catalog: &HubGgufCatalog,
     quant: QuantType,
     explicit_output: Option<&Path>,
     exact_product_bytes: Option<u64>,
+    text_only: bool,
+    warnings: &mut Vec<String>,
     progress: &mut StartupProgress<'_>,
-) -> Result<(Candidate, bool)> {
+) -> Result<(Candidate, bool, bool)> {
     let default = default_convert_output(
         &managed_model_root()?,
         &catalog.repository,
@@ -2244,7 +2280,7 @@ pub(super) fn native_convert_with_progress(
             );
         }
         verify_candidate(&authority)?;
-        return Ok((authority, false));
+        return Ok((authority, false, false));
     }
     progress(StartupEvent::NativeConversion {
         repository: catalog.repository.clone(),
@@ -2263,7 +2299,7 @@ pub(super) fn native_convert_with_progress(
             source_plan.total_weight_bytes,
             source_plan.output_upper_bound_bytes,
             source_plan.requires_projector,
-            false,
+            text_only,
             false,
         )
     });
@@ -2272,8 +2308,10 @@ pub(super) fn native_convert_with_progress(
         &output,
         planned_product_bytes,
     )?;
-    let child_output =
-        Command::new(std::env::current_exe().context("resolve current hf2q executable")?)
+    let executable = std::env::current_exe().context("resolve current hf2q executable")?;
+    let run_child = |omit_projector: bool| -> Result<std::process::Output> {
+        let mut command = Command::new(&executable);
+        command
             .arg("--terminal-graphics")
             .arg("off")
             .arg("convert")
@@ -2284,12 +2322,15 @@ pub(super) fn native_convert_with_progress(
             .arg(quant.as_str().to_ascii_lowercase())
             .arg("--output")
             .arg(&output)
-            .arg("--no-clobber")
-            .output()
-            .context("launch native hf2q conversion")?;
-    if !child_output.status.success() {
+            .arg("--no-clobber");
+        if omit_projector {
+            command.arg("--text-only");
+        }
+        command.output().context("launch native hf2q conversion")
+    };
+    let failure = |child_output: &std::process::Output| -> anyhow::Error {
         let detail = bounded_child_stderr(&child_output.stderr);
-        bail!(
+        anyhow!(
             "native hf2q conversion failed with {}{}",
             child_output.status,
             if detail.is_empty() {
@@ -2297,7 +2338,26 @@ pub(super) fn native_convert_with_progress(
             } else {
                 format!(": {detail}")
             }
-        );
+        )
+    };
+    let omit_projector = text_only || !source_plan.requires_projector;
+    let mut converted_text_only = text_only && source_plan.requires_projector;
+    let child_output = run_child(omit_projector && source_plan.requires_projector)?;
+    if !child_output.status.success() {
+        if omit_projector {
+            return Err(failure(&child_output));
+        }
+        // The paired (text + projector) conversion failed. Vision must not
+        // block text serving: retry once without the projector, loudly.
+        let paired_error = failure(&child_output);
+        warnings.push(format!(
+            "multimodal projector conversion failed; serving text-only: {paired_error}"
+        ));
+        let retry = run_child(true)?;
+        if !retry.status.success() {
+            return Err(failure(&retry));
+        }
+        converted_text_only = true;
     }
     let authority =
         conversion_authority(&output)?.context("native conversion emitted no valid receipt")?;
@@ -2308,7 +2368,7 @@ pub(super) fn native_convert_with_progress(
         bail!("native conversion receipt does not match the requested repository/revision/quant");
     }
     verify_candidate(&authority)?;
-    Ok((authority, true))
+    Ok((authority, true, converted_text_only))
 }
 
 fn bounded_child_stderr(bytes: &[u8]) -> String {

@@ -518,6 +518,66 @@ pub(crate) fn plan_standard_text_output_bytes(
     Ok(outcome.planned_output_bytes)
 }
 
+/// Plan the exact multimodal-projector output size for a remote source.
+///
+/// The projector size estimate must dispatch on the same family mapping the
+/// paired converter uses (`paired::projector_emitter`): Qwen projectors are
+/// sized by the native ViT planner, and Gemma 4 projectors by dry-running the
+/// real Gemma mapper. Before this, every planner called the Qwen-shaped ViT
+/// sizer for every family, so a Gemma 4 `vision_config` (no `image_size`, a
+/// fixed learned position table) aborted `hf2q serve` and `hf2q convert`
+/// before the family-correct converter ever ran.
+pub(crate) fn plan_projector_output_bytes(
+    hf_dir: &Path,
+    reference: crate::input::hf_reference::ResolvedHfModelReference,
+    source_sha256: String,
+    pair_generation: Option<&str>,
+) -> Result<u64, ConvertError> {
+    let remote_source = RemoteConversionSource::from_planning_identity(reference, source_sha256)?;
+    plan_projector_output_bytes_for_source(hf_dir, Some(remote_source), pair_generation)
+}
+
+/// Family-dispatched projector size plan for an already-identified source.
+pub(super) fn plan_projector_output_bytes_for_source(
+    hf_dir: &Path,
+    remote_source: Option<RemoteConversionSource>,
+    pair_generation: Option<&str>,
+) -> Result<u64, ConvertError> {
+    let config_bytes = std::fs::read(hf_dir.join("config.json")).map_err(ConvertError::Io)?;
+    let config: serde_json::Value = serde_json::from_slice(&config_bytes).map_err(|error| {
+        ConvertError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    match paired::projector_emitter(detect_arch(&config)?)? {
+        paired::ProjectorEmitter::NativeVit => Ok(crate::models::vit::planned_vision_tower_output_bytes(
+            hf_dir,
+            remote_source.as_ref().map(RemoteConversionSource::source_sha256),
+            pair_generation,
+        )?),
+        paired::ProjectorEmitter::GemmaMapper => Ok(run_convert_internal(
+            ConvertArgs {
+                hf_dir: hf_dir.to_path_buf(),
+                selector: QuantSelector::Standard(GgufFtype::MostlyF16),
+                output: hf_dir.join("unused-projector-planning-output.gguf"),
+                no_clobber: true,
+                dry_run: true,
+                imatrix: None,
+                imatrix_corpus: None,
+                imatrix_out: None,
+                imatrix_n_ctx: None,
+                mode: ConvertMode::ProjectorOnly,
+                remote_source,
+            },
+            None,
+            PairBinding {
+                projector_sha256: None,
+                generation: pair_generation,
+            },
+            false,
+        )?
+        .planned_output_bytes),
+    }
+}
+
 pub(crate) fn recover_conversion_publication(output: &Path) -> Result<(), ConvertError> {
     let parent = output
         .parent()
