@@ -2114,22 +2114,34 @@ fn fixed_width_decimal_range(low: &str, high: &str) -> String {
         let high_suffix = &high_tail[1..];
         let zero_suffix = "0".repeat(suffix_len);
         let nine_suffix = "9".repeat(suffix_len);
-        alternatives.push(format!(
-            "{} {}",
-            decimal_digit_range(low_digit, low_digit),
-            fixed_width_decimal_range(low_suffix, &nine_suffix)
-        ));
-        if low_digit + 1 < high_digit {
+        // A boundary digit whose suffix already spans every value joins the
+        // free middle range instead of recursing. Without this, a 0..9 suffix
+        // recursed on both sides at every digit and the grammar doubled per
+        // digit (about 2^16 copies for a 16-digit bound such as 2^53).
+        let low_spans = low_suffix == zero_suffix;
+        let high_spans = high_suffix == nine_suffix;
+        let middle_low = if low_spans { low_digit } else { low_digit + 1 };
+        let middle_high = if high_spans { high_digit } else { high_digit - 1 };
+        if !low_spans {
             alternatives.push(format!(
-                "{} [0-9]{{{suffix_len}}}",
-                decimal_digit_range(low_digit + 1, high_digit - 1)
+                "{} {}",
+                decimal_digit_range(low_digit, low_digit),
+                fixed_width_decimal_range(low_suffix, &nine_suffix)
             ));
         }
-        alternatives.push(format!(
-            "{} {}",
-            decimal_digit_range(high_digit, high_digit),
-            fixed_width_decimal_range(&zero_suffix, high_suffix)
-        ));
+        if middle_low <= middle_high {
+            alternatives.push(format!(
+                "{} [0-9]{{{suffix_len}}}",
+                decimal_digit_range(middle_low, middle_high)
+            ));
+        }
+        if !high_spans {
+            alternatives.push(format!(
+                "{} {}",
+                decimal_digit_range(high_digit, high_digit),
+                fixed_width_decimal_range(&zero_suffix, high_suffix)
+            ));
+        }
     }
 
     let body = if alternatives.len() == 1 {
@@ -4763,6 +4775,63 @@ mod tests {
                 !candidate.accept_bytes(rejected.as_bytes()) || !candidate.is_accepted(),
                 "{rejected}"
             );
+        }
+    }
+
+    #[test]
+    fn javascript_safe_integer_bounds_compile_small_and_exact() {
+        // OpenCode's bash and read tools declare these bounds. They used to
+        // compile to megabytes of grammar and push tool requests past the
+        // 4 MiB grammar limit (#269).
+        let schemas = [
+            r#"{"type":"integer","minimum":-9007199254740991,"exclusiveMinimum":0,"maximum":9007199254740991}"#,
+            r#"{"type":"integer","minimum":0,"maximum":9007199254740991}"#,
+            r#"{"type":"integer","minimum":-9007199254740991,"maximum":9007199254740991}"#,
+        ];
+        for schema in schemas {
+            let value: Value = serde_json::from_str(schema).unwrap();
+            let gbnf = schema_to_gbnf(&value).expect("compile safe-integer range");
+            assert!(gbnf.len() < 16 * 1024, "{schema}: {} bytes", gbnf.len());
+        }
+        let positive = schemas[0];
+        for accepted in ["1", "9", "10", "120000", "9007199254740991", "9007199254740990"] {
+            let mut candidate = runtime(positive);
+            assert!(candidate.accept_bytes(accepted.as_bytes()), "{accepted}");
+            assert!(candidate.is_accepted(), "{accepted}");
+        }
+        for rejected in ["0", "-1", "9007199254740992", "9999999999999999", "01"] {
+            let mut candidate = runtime(positive);
+            assert!(
+                !candidate.accept_bytes(rejected.as_bytes()) || !candidate.is_accepted(),
+                "{rejected}"
+            );
+        }
+        let signed = schemas[2];
+        for accepted in ["-9007199254740991", "-1", "0", "42", "9007199254740991"] {
+            let mut candidate = runtime(signed);
+            assert!(candidate.accept_bytes(accepted.as_bytes()), "{accepted}");
+            assert!(candidate.is_accepted(), "{accepted}");
+        }
+        for rejected in ["-9007199254740992", "9007199254740992", "-0"] {
+            let mut candidate = runtime(signed);
+            assert!(
+                !candidate.accept_bytes(rejected.as_bytes()) || !candidate.is_accepted(),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_ranges_match_every_value_near_digit_boundaries() {
+        // Exhaustive check of the boundary-folding logic on small ranges.
+        for (low, high) in [(0, 0), (0, 9), (0, 10), (1, 99), (10, 99), (0, 100), (7, 1000), (99, 1001), (100, 199), (190, 1099)] {
+            let schema = format!(r#"{{"type":"integer","minimum":{low},"maximum":{high}}}"#);
+            for value in 0..=1200i64 {
+                let mut candidate = runtime(&schema);
+                let text = value.to_string();
+                let accepted = candidate.accept_bytes(text.as_bytes()) && candidate.is_accepted();
+                assert_eq!(accepted, (low..=high).contains(&value), "[{low},{high}] {value}");
+            }
         }
     }
 
