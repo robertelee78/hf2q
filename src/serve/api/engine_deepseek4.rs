@@ -739,7 +739,7 @@ impl Deepseek4LoadedModel {
             .unwrap_or(1);
         let model =
             Deepseek4Model::load_from_gguf(&gguf).context("load native DeepSeek-V4 model")?;
-        eprintln!("[GLP-DEBUG] Deepseek4LoadedModel::load_with_context entered; opts.glp_path={:?}", opts.glp_path);
+        tracing::debug!(glp_path = ?opts.glp_path, "DeepSeek-V4 model loaded; binding GLP if requested");
 
         // ADR-053: bind a GLP steering vector when the operator supplied one.
         // Fail-closed at load; never serve unsteered when a vector was asked for.
