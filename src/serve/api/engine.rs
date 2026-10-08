@@ -11591,7 +11591,7 @@ fn validate_serial_prefill_family(family: &str, prompt_tokens: usize) -> Result<
 }
 
 /// Sentinel the handlers match to answer an over-limit `fifo-serial` prompt
-/// with HTTP 400 `prompt_exceeds_scheduler_limit`. The request, not the
+/// with HTTP 400 `prompt_exceeds_server_limit`. The request, not the
 /// server, is what cannot be served under the operator's chosen scheduler,
 /// so retrying it unchanged can never succeed.
 pub const SERIAL_PROMPT_LIMIT_SENTINEL: &str = "serial_prompt_limit";

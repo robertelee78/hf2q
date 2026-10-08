@@ -124,12 +124,12 @@ impl ApiError {
     /// Prompt longer than the fifo-serial scheduler can prefill (HTTP 400).
     /// Raised only when the operator explicitly selected fifo-serial; the
     /// default inflight-batched scheduler prefills in resumable chunks.
-    pub fn prompt_exceeds_scheduler_limit(message: impl Into<String>) -> Self {
+    pub fn prompt_exceeds_server_limit(message: impl Into<String>) -> Self {
         Self::bare(
             StatusCode::BAD_REQUEST,
             message,
             "invalid_request_error",
-            Some("prompt_exceeds_scheduler_limit"),
+            Some("prompt_exceeds_server_limit"),
             Some("messages".into()),
         )
     }
