@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.23] — 2026-10-08
+
+### Fixed
+
+- `hf2q serve` of a Gemma 4 repository (for example
+  `jenerallee78/gemma-4-26B-A4B-it-ara-abliterated`) no longer fails with
+  "vision_config.image_size missing" before download: projector sizing now
+  follows the model family.
+- Vision never blocks a serve: when a model's projector cannot be planned or
+  converted, hf2q warns and serves the model text-only instead of failing.
+- Tool calls work for fine-tunes whose display name does not contain the
+  family name: the tool-call format is chosen from the GGUF
+  `general.architecture`, so a renamed Gemma 4 fine-tune can call tools and
+  run OpenCode.
+- Gemma 4 vision normalizes pixels with the projector's own mean and std,
+  matching llama.cpp on the same GGUF and projector; images were previously
+  shifted and described wrongly.
+- Integer range grammars grow linearly with the number of digits instead of
+  doubling per digit, so stock OpenCode tool schemas compile again.
+- `--glp` steers every model the server loads, including a model chosen with
+  `hf2q chat --model`, which 0.1.22 served unsteered.
+- DeepSeek-V4 logs the GLP load step at debug level instead of printing to
+  stderr.
+
 ## [0.1.22] — 2026-10-08
 
 ### Fixed
