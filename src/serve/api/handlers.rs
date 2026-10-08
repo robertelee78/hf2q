@@ -5008,7 +5008,7 @@ fn compile_tool_grammar_with_registration(
     let combined_gbnf = if deepseek_multi {
         combine_deepseek4_function_grammars(fn_gbnfs, auto_lazy, parallel)
     } else if fn_gbnfs.len() == 1 {
-        fn_gbnfs.into_iter().next().unwrap()
+        Ok(fn_gbnfs.into_iter().next().unwrap())
     } else {
         let separator = if auto_lazy {
             reg.auto_lazy_multi_fn_inter_call()
@@ -5016,6 +5016,15 @@ fn compile_tool_grammar_with_registration(
             reg.parallel_call_separator()
         };
         combine_function_grammars(fn_gbnfs, parallel, separator)
+    };
+    let combined_gbnf = match combined_gbnf {
+        Ok(gbnf) => gbnf,
+        Err(e) => {
+            return Err(
+                ApiError::grammar_error(format!("tool call GBNF combine failed: {}", e))
+                    .into_response(),
+            );
+        }
     };
 
     match grammar::parser::parse(&combined_gbnf) {
@@ -6518,7 +6527,7 @@ fn combine_function_grammars(
     gbnfs: Vec<String>,
     parallel: bool,
     separator_literal: &str,
-) -> String {
+) -> std::result::Result<String, grammar::ParseError> {
     use grammar::parser::parse;
     use grammar::serialize::{rename_rules, serialize};
 
@@ -6594,7 +6603,15 @@ fn combine_function_grammars(
     // produces output that doesn't re-parse, we want the failure to surface
     // immediately at this assertion rather than at the caller's parse site
     // (where the error message would lose the combiner-internal context).
+    //
+    // Resource-limit failures are not invariant violations: large but valid
+    // per-function grammars (issue #251 bounds) can expand past the raw
+    // byte limit once serialized. Those return a typed error (HTTP 400 at
+    // the caller) instead of panicking the request.
     if let Err(e) = parse(&combined) {
+        if e.message.contains("resource limit") {
+            return Err(e);
+        }
         panic!(
             "combine_function_grammars: combined output failed to re-parse — \
              this is an AST combiner invariant violation: {}\n\
@@ -6603,7 +6620,7 @@ fn combine_function_grammars(
         );
     }
 
-    combined
+    Ok(combined)
 }
 
 /// Combine multiple DeepSeek invoke grammars under one official DSML outer
@@ -6613,7 +6630,7 @@ fn combine_deepseek4_function_grammars(
     gbnfs: Vec<String>,
     auto_lazy: bool,
     parallel: bool,
-) -> String {
+) -> std::result::Result<String, grammar::ParseError> {
     use grammar::parser::parse;
     use grammar::serialize::{rename_rules, serialize};
 
@@ -6648,9 +6665,14 @@ fn combine_deepseek4_function_grammars(
         combined.push_str(&serialize(&renamed));
     }
     if let Err(error) = parse(&combined) {
+        // See combine_function_grammars: resource exhaustion is a request
+        // error, not a combiner invariant violation.
+        if error.message.contains("resource limit") {
+            return Err(error);
+        }
         panic!("combine_deepseek4_function_grammars produced invalid grammar: {error}\n{combined}");
     }
-    combined
+    Ok(combined)
 }
 
 // ---------------------------------------------------------------------------
@@ -6723,7 +6745,8 @@ mod combine_function_grammars_tests {
         // Wave 2.7 W-η Q-B: legacy multi-tool combine test exercises the
         // wave-2.6 single-call alternation behaviour (parallel=false).
         let combined =
-            combine_function_grammars(vec![gbnf_for_tool_a(), gbnf_for_tool_b()], false, "");
+            combine_function_grammars(vec![gbnf_for_tool_a(), gbnf_for_tool_b()], false, "")
+                .expect("combine");
 
         // 1. Round-trip through the parser must succeed (the combiner already
         //    asserts this, but we duplicate the check at the test boundary).
@@ -6769,7 +6792,8 @@ mod combine_function_grammars_tests {
     /// and whose runtime accepts the same outputs as the un-combined source.
     #[test]
     fn single_tool_combine_roundtrip() {
-        let combined = combine_function_grammars(vec![gbnf_for_tool_a()], false, "");
+        let combined =
+            combine_function_grammars(vec![gbnf_for_tool_a()], false, "").expect("combine");
         let g = parse(&combined).expect("combined re-parses");
 
         assert!(
@@ -6868,7 +6892,8 @@ mod combine_function_grammars_tests {
         let gbnf_a = "root ::= \"A\" [^<\\\\]+\n".to_string();
         let gbnf_b = "root ::= \"B\" [^<\\\\]+\n".to_string();
 
-        let combined = combine_function_grammars(vec![gbnf_a.clone(), gbnf_b.clone()], false, "");
+        let combined = combine_function_grammars(vec![gbnf_a.clone(), gbnf_b.clone()], false, "")
+            .expect("combine");
 
         // Re-parse must succeed.
         parse(&combined).expect("combined grammar must re-parse");
@@ -6941,7 +6966,7 @@ mod combine_function_grammars_tests {
         )
         .to_string();
 
-        let combined = combine_function_grammars(vec![gbnf_a, gbnf_b], false, "");
+        let combined = combine_function_grammars(vec![gbnf_a, gbnf_b], false, "").expect("combine");
 
         // Round-trip: combined re-parses cleanly.
         let g = parse(&combined).expect("combined re-parses");
@@ -6998,7 +7023,7 @@ mod combine_function_grammars_tests {
         // fn-1: q is a number (must be digits).
         let gbnf_b = concat!("root ::= \"B\" qval\n", "qval ::= [0-9]+\n",).to_string();
 
-        let combined = combine_function_grammars(vec![gbnf_a, gbnf_b], false, "");
+        let combined = combine_function_grammars(vec![gbnf_a, gbnf_b], false, "").expect("combine");
         parse(&combined).expect("combined re-parses");
 
         // fn-0 string-shape ACCEPTED.
@@ -7046,7 +7071,7 @@ mod combine_function_grammars_tests {
     #[test]
     fn combine_single_function_yields_only_root_alternative() {
         let src = "root ::= \"X\" [a-z]+\n".to_string();
-        let combined = combine_function_grammars(vec![src.clone()], false, "");
+        let combined = combine_function_grammars(vec![src.clone()], false, "").expect("combine");
         let g = parse(&combined).expect("combined re-parses");
 
         // The combined grammar's `root` rule body should be exactly a
@@ -7104,7 +7129,8 @@ mod combine_function_grammars_tests {
             vec![gbnf_for_tool_a(), gbnf_for_tool_b()],
             /* parallel */ true,
             /* separator */ "",
-        );
+        )
+        .expect("combine");
 
         let g = parse(&combined).expect("parallel multi-tool combined re-parses");
         // Both function roots and the synthetic `alt` rule must exist.
@@ -7164,7 +7190,8 @@ mod combine_function_grammars_tests {
             vec![gbnf_for_tool_a(), gbnf_for_tool_b()],
             /* parallel */ true,
             /* separator */ "\n",
-        );
+        )
+        .expect("combine");
 
         let g = parse(&combined).expect("Qwen-separator combined re-parses");
         assert!(g.rule_id("fn-0-root").is_some());
@@ -13126,3 +13153,7 @@ mod gcd_schema_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "handlers_tool_bounds_tests.rs"]
+mod tool_bounds_tests;

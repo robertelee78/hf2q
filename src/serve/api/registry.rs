@@ -2080,7 +2080,7 @@ fn gemma4_value_gbnf(
                     body,
                     gbnf_literal("<|\"|>")
                 )),
-                None => match bounded_string_body(obj, "gemma4-str-char") {
+                None => match bounded_string_body(obj, "gemma4-str-char", rules) {
                     Some(body) => Ok(format!(
                         "{} {} {}",
                         gbnf_literal("<|\"|>"),
@@ -2271,7 +2271,7 @@ fn gemma4_nested_value_rule(
                         body,
                         gbnf_literal("<|\"|>")
                     )),
-                    None => match bounded_string_body(obj, "gemma4-str-char") {
+                    None => match bounded_string_body(obj, "gemma4-str-char", rules) {
                         Some(body) => Ok(format!(
                             "{} {} {}",
                             gbnf_literal("<|\"|>"),
@@ -2448,7 +2448,13 @@ fn gemma4_nested_array(
     let max = obj.get("maxItems").and_then(serde_json::Value::as_u64);
     match obj.get("items") {
         None if min == 0 && max.is_none() => Ok("gemma4-json-arr".to_string()),
-        None => Ok(bounded_array_body("gemma4-json-val", r#"",""#, min, max)),
+        None => Ok(bounded_array_body(
+            "gemma4-json-val",
+            r#"",""#,
+            min,
+            max,
+            rules,
+        )),
         Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Bool(_)) => {
             let item_rule = gemma4_nested_value_rule(
                 fn_name,
@@ -2458,7 +2464,7 @@ fn gemma4_nested_array(
                 rule_counter,
                 depth + 1,
             )?;
-            Ok(bounded_array_body(&item_rule, r#"",""#, min, max))
+            Ok(bounded_array_body(&item_rule, r#"",""#, min, max, rules))
         }
         Some(serde_json::Value::Array(_)) => Err(EmitterError::UnsupportedSchemaFeature {
             fn_name: fn_name.to_string(),
@@ -3326,7 +3332,7 @@ fn deepseek4_value_variants(
             crate::serve::api::grammar::regex_gbnf::Surface::DeepSeekRawString,
         )? {
             Some(body) => body,
-            None => bounded_string_body(object, "dsml-string-char")
+            None => bounded_string_body(object, "dsml-string-char", rules)
                 .unwrap_or_else(|| "dsml-string-val".to_string()),
         };
         return Ok(vec![(true, value)]);
@@ -3704,7 +3710,7 @@ fn qwen35_value_rule(
                 crate::serve::api::grammar::regex_gbnf::Surface::QwenRawString,
             )? {
                 Some(body) => Ok(body),
-                None => Ok(bounded_string_body(obj, "qwen35-str-char")
+                None => Ok(bounded_string_body(obj, "qwen35-str-char", rules)
                     .unwrap_or_else(|| "qwen35-str-val".to_string())),
             }
         }
@@ -3801,54 +3807,56 @@ fn compile_integer_assertion(
         })
 }
 
-fn bounded_repeat(atom: &str, min: u64, max: Option<u64>) -> String {
-    match max {
-        Some(upper) if upper == min => format!("{atom}{{{min}}}"),
-        Some(upper) => format!("{atom}{{{min},{upper}}}"),
-        None if min == 0 => format!("{atom}*"),
-        None if min == 1 => format!("{atom}+"),
-        None => format!("{atom}{{{min},}}"),
+/// Exact `atom{min,max}` as one named symbol, registering the composed
+/// rules in `rules` (issue #251: bounds above the parser's per-operator
+/// limit are split into exact segments; see `grammar::repetition`).
+fn bounded_repeat(
+    atom: &str,
+    min: u64,
+    max: Option<u64>,
+    rules: &mut Vec<(String, String)>,
+) -> String {
+    let repetition = crate::serve::api::grammar::repetition::exact_repetition(atom, min, max);
+    for (name, body) in repetition.rules {
+        // Names are content-addressed, so an existing name has this body.
+        if !rules.iter().any(|(existing, _)| *existing == name) {
+            rules.push((name, body));
+        }
     }
+    repetition.expr
 }
 
 fn bounded_string_body(
     object: &serde_json::Map<String, serde_json::Value>,
     atom: &str,
+    rules: &mut Vec<(String, String)>,
 ) -> Option<String> {
     let min = object
         .get("minLength")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let max = object.get("maxLength").and_then(serde_json::Value::as_u64);
-    (min > 0 || max.is_some()).then(|| bounded_repeat(atom, min, max))
+    (min > 0 || max.is_some()).then(|| bounded_repeat(atom, min, max, rules))
 }
 
-fn bounded_array_body(item: &str, comma: &str, min: u64, max: Option<u64>) -> String {
+fn bounded_array_body(
+    item: &str,
+    comma: &str,
+    min: u64,
+    max: Option<u64>,
+    rules: &mut Vec<(String, String)>,
+) -> String {
     if max == Some(0) {
         return r#""[" "]""#.to_string();
     }
-    let comma_item = format!("( {comma} {item} )");
+    let item = bounded_repeat(item, 1, Some(1), rules);
+    let comma_item = format!("{comma} {item}");
     let sequence = if min == 0 {
-        match max {
-            None => format!("( {item} {comma_item}* )?"),
-            Some(upper) => format!("( {item} {comma_item}{{0,{}}} )?", upper - 1),
-        }
+        let tail = bounded_repeat(&comma_item, 0, max.map(|upper| upper - 1), rules);
+        format!("( {item} {tail} )?")
     } else {
-        let required_tail = min - 1;
-        let suffix = match max {
-            None if required_tail == 0 => format!(" {comma_item}*"),
-            None => format!(" {comma_item}{{{required_tail}}} {comma_item}*"),
-            Some(upper) if upper == min && required_tail == 0 => String::new(),
-            Some(upper) if upper == min => format!(" {comma_item}{{{required_tail}}}"),
-            Some(upper) if required_tail == 0 => {
-                format!(" {comma_item}{{0,{}}}", upper - min)
-            }
-            Some(upper) => format!(
-                " {comma_item}{{{required_tail}}} {comma_item}{{0,{}}}",
-                upper - min
-            ),
-        };
-        format!("{item}{suffix}")
+        let tail = bounded_repeat(&comma_item, min - 1, max.map(|upper| upper - 1), rules);
+        format!("{item} {tail}")
     };
     format!(r#""[" {sequence} "]""#)
 }
@@ -4021,7 +4029,7 @@ fn qwen35_nested_value_rule(
                         body,
                         gbnf_literal("\"")
                     )),
-                    None => match bounded_string_body(obj, "qwen35-json-char") {
+                    None => match bounded_string_body(obj, "qwen35-json-char", rules) {
                         Some(body) => Ok(format!(
                             "{} {} {}",
                             gbnf_literal("\""),
@@ -4212,6 +4220,7 @@ fn qwen35_nested_array(
             "qwen35-json-comma",
             min,
             max,
+            rules,
         )),
         Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Bool(_)) => {
             let item_rule = qwen35_nested_value_rule(
@@ -4227,6 +4236,7 @@ fn qwen35_nested_array(
                 "qwen35-json-comma",
                 min,
                 max,
+                rules,
             ))
         }
         Some(serde_json::Value::Array(_)) => Err(EmitterError::UnsupportedSchemaFeature {

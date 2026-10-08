@@ -2,7 +2,7 @@
 
 **Status:** Implemented
 **Date:** 2026-09-03
-**Updated:** 2026-09-03
+**Updated:** 2026-10-07
 **Implemented by:** PR #184, merge commit `719366328cfac4a7bb72c602802ccfd8b2de13c0`
 **Supersedes:** the closed grammar-subset plan in ADR-005 Decision #6
 **Related:** ADR-005, ADR-017, ADR-042, ADR-044, RFC 2119
@@ -288,7 +288,10 @@ Untrusted constraints MUST be bounded before runtime. Initial limits are:
 - unordered required properties: 12 per object (Stage 6 requires nine);
 - choices/enumerants/structural-tag structures: 1,024;
 - total choice/enumerant literal bytes: 1 MiB;
-- repetition bound: 2,000;
+- repetition bound: 2,000 per emitted GBNF `{m,n}` operator (the parser
+  limit); JSON Schema length/count keywords (`minLength`, `maxLength`,
+  `minItems`, `maxItems`, `minProperties`, `maxProperties`) up to 65,536,
+  composed exactly from segments (see the 2026-10-07 note below);
 - runtime active stacks: 32,768 (the measured peak for the supported twelve-key
   reverse-order boundary; the 16,384 hypothesis rejected it at its seventh
   object member);
@@ -298,6 +301,34 @@ Untrusted constraints MUST be bounded before runtime. Initial limits are:
 Exceeding a limit MUST return a deterministic typed error. Limits MAY be
 tightened from measured spike data, but MUST NOT be raised without adversarial
 compile/runtime evidence.
+
+**2026-10-07 (issue #251).** The 2,000 schema-bound cap rejected real
+OpenCode/MCP tool schemas (`argv` items with `maxLength: 4096`) and failed
+the whole chat request with HTTP 400. The cap was the parser's
+per-operator repetition limit leaking into the schema surface, not a
+semantic limit. `src/serve/api/grammar/repetition.rs` now emits every
+schema length/count bound as an exact composition in which each operator
+applies to one bare symbol and never exceeds 1,024: with segment `S = 64`
+and a shared block `B ::= x{S}`, `x{m}` is `B{m/S} x{m mod S}` and
+`x{0,k}` (`k > S`) is `L(k) ::= x{0,S-1} | B L(k-S)`. The alternatives
+accept the disjoint length ranges `0..=S-1` and `S..=k`, so the language is
+identical and the grammar is unambiguous. Both the response-schema compiler
+and the Gemma/Qwen/DeepSeek native tool emitters use it. The schema-level
+ceiling is 65,536 (`MAX_SCHEMA_REPETITION_BOUND`); larger bounds fail with a
+pointer-qualified error. The counted any-order object grammar
+(`minProperties`/`maxProperties` beside declared `properties`) keeps its
+2,000 bound because it recurses once per entry count. Exceeding the
+combined multi-tool grammar byte limit is now a typed HTTP 400 rather than
+a combiner panic.
+
+Adversarial evidence (release build, M-series host, model-free):
+`maxLength: 65536` compiles to 1,178 rules / 5,847 elements in 13 ms and
+accepts a 65,536-character value in 64 ms with a peak of 5 active stacks
+(65,537 rejected); `minLength = maxLength = 65536` is 27 rules / 1,247
+elements. Forty tools, each with two 4,096 length bounds and a 4,096
+`maxItems`, and three tools with the same fields at 65,536, compile for
+every native family. Sixty such tools exceed the 4 MiB combined-grammar
+byte limit for Qwen 3.5/3.6 and fail closed with HTTP 400.
 
 ### 7. Test and provenance contract
 

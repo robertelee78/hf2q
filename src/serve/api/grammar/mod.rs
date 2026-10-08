@@ -20,6 +20,7 @@ pub mod lark;
 pub mod mask;
 pub mod parser;
 pub mod regex_gbnf;
+pub(crate) mod repetition;
 pub mod request;
 pub mod sampler;
 pub mod serialize;

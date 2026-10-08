@@ -37,11 +37,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde_json::Value;
 
 use super::regex_gbnf::{regex_to_gbnf_body, regex_to_gbnf_full_match, Surface};
+use super::repetition::{exact_repetition, MAX_SCHEMA_REPETITION_BOUND};
 
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_LOCAL_REFS: usize = 1024;
 const MAX_ENUM_VALUES: usize = 1024;
 const MAX_LITERAL_BYTES: usize = 1024 * 1024;
+/// Entry-count ceiling for the counted any-order object grammar
+/// (`minProperties`/`maxProperties` beside declared `properties`), whose
+/// construction is one recursion level and at least one rule per count.
+const MAX_COUNTED_OBJECT_BOUND: u64 = 2000;
 const MAX_INTEGER_MAGNITUDE: i64 = 9_999_999_999_999_999;
 const SUPPORTED_SCHEMA_KEYWORDS: &[&str] = &[
     "$schema",
@@ -927,11 +932,7 @@ impl Converter {
                         return Ok(self.uninhabited_rule(path));
                     }
                     self.add_primitive("char");
-                    let repetition = match max {
-                        Some(upper) if upper == min => format!("char{{{min}}}"),
-                        Some(upper) => format!("char{{{min},{upper}}}"),
-                        None => format!("char{{{min},}}"),
-                    };
+                    let repetition = self.repetition("char", min, max);
                     return Ok(format!(r#""\"" {} "\"" space"#, repetition));
                 }
                 self.add_primitive("string");
@@ -966,6 +967,12 @@ impl Converter {
                 message: format!("unsupported type '{}'", other),
             }),
         }
+    }
+
+    /// Exact `atom{min,max}` as a single named symbol (see
+    /// [`exact_repetition`]).
+    fn repetition(&mut self, atom: &str, min: u64, max: Option<u64>) -> String {
+        repetition_rule(&mut self.rules, atom, min, max)
     }
 
     fn uninhabited_rule(&mut self, path: &str) -> String {
@@ -1144,7 +1151,7 @@ impl Converter {
                 }
                 return Ok(format!(
                     r#""{{" space {} "}}" space"#,
-                    repeated_sequence(&name, min_properties, max_properties)
+                    repeated_sequence(&mut self.rules, &name, min_properties, max_properties)
                 ));
             }
             // No explicit properties — accept any object.
@@ -1286,7 +1293,8 @@ impl Converter {
             }
             let item_name = format!("{slug}-relaxed-item");
             self.rules.insert(item_name.clone(), item_rules.join(" | "));
-            let inner = repeated_sequence(&item_name, effective_min, max_properties);
+            let inner =
+                repeated_sequence(&mut self.rules, &item_name, effective_min, max_properties);
             return Ok(format!(r#""{{" space {} "}}" space"#, inner));
         }
 
@@ -1330,6 +1338,20 @@ impl Converter {
             }
             if effective_min == 0 && effective_max == Some(0) {
                 return Ok(r#""{" space "}" space"#.into());
+            }
+            // The counted any-order grammar recurses once per entry count;
+            // keep its pre-#251 bound so large counts fail closed instead
+            // of deepening that recursion toward the 8192-rule budget.
+            if effective_min > MAX_COUNTED_OBJECT_BOUND
+                || effective_max.is_some_and(|maximum| maximum > MAX_COUNTED_OBJECT_BOUND)
+            {
+                return Err(schema_error(
+                    path,
+                    format!(
+                        "minProperties/maxProperties above {MAX_COUNTED_OBJECT_BOUND} \
+                         with declared properties is not exactly representable"
+                    ),
+                ));
             }
             let req_full = if required_keys.is_empty() {
                 0
@@ -1867,7 +1889,7 @@ impl Converter {
                 Ok(self.uninhabited_rule(path))
             };
         }
-        let body = repeated_sequence(&item_rule, min, max);
+        let body = repeated_sequence(&mut self.rules, &item_rule, min, max);
         Ok(format!(r#""[" space {} "]" space"#, body))
     }
 
@@ -1918,14 +1940,14 @@ impl Converter {
                 let min_tail = min.saturating_sub(prefix_len);
                 let max_tail = max.map(|upper| upper.saturating_sub(prefix_len));
                 if tail_allowed {
-                    let tail = repeated_sequence(&tail_rule, min_tail, max_tail);
+                    let tail = repeated_sequence(&mut self.rules, &tail_rule, min_tail, max_tail);
                     let combined = match (fixed.is_empty(), tail.is_empty()) {
                         (true, _) => tail,
                         (_, true) => fixed,
                         _ if min_tail == 0 => format!(
                             "{} ( \",\" space {} )?",
                             fixed,
-                            repeated_sequence(&tail_rule, 1, max_tail)
+                            repeated_sequence(&mut self.rules, &tail_rule, 1, max_tail)
                         ),
                         _ => format!("{} \",\" space {}", fixed, tail),
                     };
@@ -1996,32 +2018,64 @@ fn empty_expression() -> String {
     "\"\"".to_string()
 }
 
-fn repeated_sequence(item: &str, min: u64, max: Option<u64>) -> String {
+/// Comma-separated `item` sequence with between `min` and `max` entries.
+///
+/// Counts are composed through [`exact_repetition`], so bounds above the
+/// parser's per-operator repetition limit are represented exactly and every
+/// repetition operator applies to a single named symbol.
+fn repeated_sequence(
+    rules: &mut BTreeMap<String, String>,
+    item: &str,
+    min: u64,
+    max: Option<u64>,
+) -> String {
     if max == Some(0) {
         return empty_expression();
     }
-    let comma_item = format!("( \",\" space {item} )");
+    let item = intern_rule(rules, item);
+    let comma_item = format!(r#""," space {item}"#);
     if min == 0 {
-        return match max {
-            None => format!("( {item} {comma_item}* )?"),
-            Some(upper) => format!("( {item} {comma_item}{{0,{}}} )?", upper - 1),
-        };
+        let tail = repetition_rule(rules, &comma_item, 0, max.map(|upper| upper - 1));
+        return format!("( {item} {tail} )?");
     }
-    let required_tail = min - 1;
-    let suffix = match max {
-        None if required_tail == 0 => format!(" {comma_item}*"),
-        None => format!(" {comma_item}{{{required_tail}}} {comma_item}*"),
-        Some(upper) if upper == min && required_tail == 0 => String::new(),
-        Some(upper) if upper == min => format!(" {comma_item}{{{required_tail}}}"),
-        Some(upper) if required_tail == 0 => {
-            format!(" {comma_item}{{0,{}}}", upper - min)
-        }
-        Some(upper) => format!(
-            " {comma_item}{{{required_tail}}} {comma_item}{{0,{}}}",
-            upper - min
-        ),
-    };
-    format!("{item}{suffix}")
+    let tail = repetition_rule(rules, &comma_item, min - 1, max.map(|upper| upper - 1));
+    format!("{item} {tail}")
+}
+
+/// Register an [`exact_repetition`] composition and return its symbol.
+fn repetition_rule(
+    rules: &mut BTreeMap<String, String>,
+    atom: &str,
+    min: u64,
+    max: Option<u64>,
+) -> String {
+    let repetition = exact_repetition(atom, min, max);
+    for (name, body) in repetition.rules {
+        rules.entry(name).or_insert(body);
+    }
+    repetition.expr
+}
+
+/// Return `expression` as a single symbol, hoisting a compound expression
+/// into a content-addressed rule.
+fn intern_rule(rules: &mut BTreeMap<String, String>, expression: &str) -> String {
+    let bare = !expression.is_empty()
+        && expression
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    if bare {
+        return expression.to_string();
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in expression.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let name = format!("item-{hash:016x}");
+    rules
+        .entry(name.clone())
+        .or_insert_with(|| expression.to_string());
+    name
 }
 
 fn decimal_digit_range(low: u8, high: u8) -> String {
@@ -2652,10 +2706,13 @@ fn validate_schema_node(schema: &Value, path: &str, depth: usize) -> Result<(), 
                     "bound must be a nonnegative integer",
                 )
             })?;
-            if bound > 2000 {
+            if bound > MAX_SCHEMA_REPETITION_BOUND {
                 return Err(schema_error(
                     &format!("{path}/{keyword}"),
-                    "bound exceeds repetition limit 2000",
+                    format!(
+                        "bound {bound} exceeds the supported repetition ceiling \
+                         {MAX_SCHEMA_REPETITION_BOUND}"
+                    ),
                 ));
             }
         }
@@ -3496,6 +3553,10 @@ fn complement_discriminator(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "json_schema_bounds_tests.rs"]
+mod bounds_tests;
 
 #[cfg(test)]
 mod tests {
