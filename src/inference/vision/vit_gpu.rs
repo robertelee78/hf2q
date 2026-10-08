@@ -8952,14 +8952,14 @@ mod tests {
             Path::new("/opt/hf2q/tests/fixtures/vision/four_dots_in_corners_128x128.png");
         let img_bytes = std::fs::read(img_path).expect("read four-dots fixture");
 
-        let pre = crate::inference::vision::preprocess::preprocess_gemma4v(
-            &img_bytes,
-            &crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT,
-        )
-        .expect("preprocess");
-
         let gguf = GgufFile::open(mmproj_path).expect("open mmproj");
         let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let pre_cfg = crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT
+            .clone()
+            .with_normalization(cfg.image_mean, cfg.image_std);
+        let pre = crate::inference::vision::preprocess::preprocess_gemma4v(&img_bytes, &pre_cfg)
+            .expect("preprocess");
+
         let device = MlxDevice::new().expect("device");
         let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load mmproj");
 
