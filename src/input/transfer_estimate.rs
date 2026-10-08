@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 /// No written-byte advance for this long is reported as idle (buffering when
 /// the host network is busy, stalled when it is quiet).
 pub(crate) const IDLE_AFTER: Duration = Duration::from_secs(15);
-/// Byte-weighted rate window. Observed Xet bursts are 10-40 s apart, so a
+/// Byte-weighted rate window. Observed Xet bursts are up to ~60 s apart, so a
 /// window this long always spans at least one burst while transferring.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Time constant of the EWMA applied on top of the window rate.
