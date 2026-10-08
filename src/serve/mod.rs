@@ -4353,7 +4353,6 @@ pub fn cmd_serve(
         default_thinking_token_budget: behavior.thinking_token_budget,
         default_tool_thinking_token_budget: behavior.tool_thinking_token_budget,
         gcd: args.gcd,
-        glp_path: args.glp.clone(),
         // ADR-057: schema-constrained GCD. Compile the operator's JSON schema
         // to GBNF at startup; any load/parse/compile error aborts startup
         // (fail-closed, same posture as the GLP reader).

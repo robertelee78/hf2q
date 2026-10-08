@@ -104,10 +104,6 @@ pub struct ServerConfig {
     /// that does not already specify a grammar. The grammar forces the answer
     /// to land directly (no think block). Concept: Vince Ovando (tantalus.io).
     pub gcd: bool,
-    /// ADR-053: GLP steering vector path. When Some, the GCD grammar
-    /// uses the B14 shape (let GLP reasoning run, force answer) instead of
-    /// the anchor shape (force frame + answer). GLP concept: Matt Suiche.
-    pub glp_path: Option<PathBuf>,
     /// ADR-057: schema-constrained GCD. When Some, holds the GBNF compiled
     /// from the operator's JSON schema at startup (fail-closed compile) and
     /// injected as the serve-time default constraint in place of the W1
@@ -139,7 +135,6 @@ impl Default for ServerConfig {
             default_thinking_token_budget: None,
             default_tool_thinking_token_budget: None,
             gcd: false,
-            glp_path: None,
             gcd_schema_grammar: None,
             gcd_schema_locked: false,
         }
