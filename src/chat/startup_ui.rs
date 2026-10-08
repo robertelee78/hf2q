@@ -11,11 +11,13 @@ use anyhow::Result;
 use console::Style;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
+use crate::input::transfer_estimate::{TransferEstimate, TransferState, MAX_ETA_SECONDS};
 use crate::serve::startup_progress::{
     format_duration, human_bytes, render_verified_ready, terminal_safe_text as clean, StartupEvent,
 };
 
 const COPPER_256: u8 = 166;
+const PLAIN_DOWNLOAD_HEARTBEAT: Duration = Duration::from_secs(10);
 
 pub(crate) fn interactive_startup_enabled(output_is_tty: bool) -> bool {
     interactive_startup_enabled_for(
@@ -43,6 +45,7 @@ pub(crate) struct StartupUi<'a, W: Write> {
     started: std::time::Instant,
     last_download_line_percent: Option<u64>,
     last_download_line_at: Option<std::time::Instant>,
+    last_download_line_state: Option<TransferState>,
 }
 
 impl<'a, W: Write> StartupUi<'a, W> {
@@ -67,6 +70,7 @@ impl<'a, W: Write> StartupUi<'a, W> {
             started: std::time::Instant::now(),
             last_download_line_percent: None,
             last_download_line_at: None,
+            last_download_line_state: None,
         }
     }
 
@@ -82,6 +86,7 @@ impl<'a, W: Write> StartupUi<'a, W> {
             started: std::time::Instant::now(),
             last_download_line_percent: None,
             last_download_line_at: None,
+            last_download_line_state: None,
         }
     }
 
@@ -130,6 +135,7 @@ impl<'a, W: Write> StartupUi<'a, W> {
             if let StartupEvent::HostedDownloadProgress {
                 completed_bytes,
                 total_bytes,
+                estimate,
                 ..
             } = &event
             {
@@ -138,17 +144,28 @@ impl<'a, W: Write> StartupUi<'a, W> {
                 let advanced_milestone = self
                     .last_download_line_percent
                     .is_none_or(|previous| percent >= previous.saturating_add(5));
-                let heartbeat_due = self
-                    .last_download_line_at
-                    .is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(30));
-                if percent < 100 && !advanced_milestone && !heartbeat_due {
+                // A short heartbeat keeps bounded line output visibly alive
+                // through Xet's flat written-byte periods (#249).
+                let heartbeat_due = self.last_download_line_at.is_none_or(|previous| {
+                    now.duration_since(previous) >= PLAIN_DOWNLOAD_HEARTBEAT
+                });
+                let state_changed = self
+                    .last_download_line_state
+                    .is_some_and(|previous| previous != estimate.state);
+                let finished = percent >= 100
+                    && self
+                        .last_download_line_percent
+                        .is_none_or(|previous| previous < 100);
+                if !finished && !advanced_milestone && !heartbeat_due && !state_changed {
                     return Ok(());
                 }
                 self.last_download_line_percent = Some(percent);
                 self.last_download_line_at = Some(now);
+                self.last_download_line_state = Some(estimate.state);
             } else {
                 self.last_download_line_percent = None;
                 self.last_download_line_at = None;
+                self.last_download_line_state = None;
             }
             writeln!(self.output, "{}", event.render())?;
             self.output.flush()?;
@@ -286,11 +303,13 @@ impl<'a, W: Write> StartupUi<'a, W> {
                 filename,
                 completed_bytes,
                 total_bytes,
+                estimate,
                 ..
             } => {
                 bar.set_length(total_bytes);
                 bar.set_position(completed_bytes);
-                bar.set_style(bytes_style(self.use_color));
+                bar.set_style(download_style(self.use_color));
+                bar.set_prefix(compact_download_status(&estimate));
                 bar.set_message(format!("Downloading `{}`", clean(&filename)));
             }
             StartupEvent::ProjectorPrepare { filename, bytes } => {
@@ -481,6 +500,7 @@ impl<W: Write> Drop for StartupUi<'_, W> {
 
 fn reset_spinner(bar: &ProgressBar, use_color: bool, message: impl Into<String>) {
     bar.reset();
+    bar.set_prefix("");
     bar.set_style(spinner_style(use_color));
     bar.set_message(message.into());
 }
@@ -504,6 +524,54 @@ fn bytes_style(use_color: bool) -> ProgressStyle {
     .expect("static startup byte template")
     .progress_chars("━╸─")
     .tick_strings(&["▹▹▹▹▹", "▸▹▹▹▹", "▹▸▹▹▹", "▹▹▸▹▹", "▹▹▹▸▹", "▹▹▹▹▸"])
+}
+
+/// Hosted downloads render hf2q's smoothed status in `{prefix}` instead of
+/// indicatif's `{bytes_per_sec}`/`{eta}`, whose short-window estimator swings
+/// wildly on Xet's bursty written-byte stream (#249). The spinner keeps
+/// ticking, so the row never looks frozen.
+fn download_style(use_color: bool) -> ProgressStyle {
+    ProgressStyle::with_template(if use_color {
+        "  {spinner:.yellow} {msg:.36} {wide_bar:.blue/dim} {bytes:>9}/{total_bytes:<9} {percent:>3}% {prefix}"
+    } else {
+        "  {spinner} {msg:.36} {wide_bar} {bytes:>9}/{total_bytes:<9} {percent:>3}% {prefix}"
+    })
+    .expect("static startup download template")
+    .progress_chars("━╸─")
+    .tick_strings(&["▹▹▹▹▹", "▸▹▹▹▹", "▹▸▹▹▹", "▹▹▸▹▹", "▹▹▹▸▹", "▹▹▹▹▸"])
+}
+
+fn compact_download_status(estimate: &TransferEstimate) -> String {
+    let eta = |eta: u64| {
+        if eta >= MAX_ETA_SECONDS {
+            ">24h".to_owned()
+        } else {
+            format_duration(Duration::from_secs(eta))
+        }
+    };
+    let idle = format_duration(Duration::from_millis(estimate.idle_ms));
+    let mut status = match (
+        estimate.state,
+        estimate.bytes_per_second,
+        estimate.eta_seconds,
+    ) {
+        (TransferState::Transferring, Some(rate), Some(remaining)) => {
+            format!("{}/s ETA {}", human_bytes(rate), eta(remaining))
+        }
+        (TransferState::Buffering, _, Some(remaining)) => {
+            format!("buffering {idle} ETA ~{}", eta(remaining))
+        }
+        (TransferState::Buffering, _, None) => format!("buffering {idle}"),
+        (TransferState::Stalled, _, _) => format!("stalled {idle}"),
+        (TransferState::Estimating, Some(rate), _) => {
+            format!("{}/s ETA estimating", human_bytes(rate))
+        }
+        _ => "estimating".to_owned(),
+    };
+    if let Some(received) = estimate.host_received_bytes {
+        status.push_str(&format!(" • host rx {}", human_bytes(received)));
+    }
+    status
 }
 
 #[derive(Clone, Copy)]
@@ -647,8 +715,13 @@ mod tests {
                     filename: "model-q4_k_m.gguf".into(),
                     completed_bytes: completed,
                     total_bytes: 100,
-                    bytes_per_second: Some(10),
                     elapsed_ms: completed * 100,
+                    estimate: TransferEstimate {
+                        state: TransferState::Transferring,
+                        bytes_per_second: Some(10),
+                        eta_seconds: Some((100 - completed) / 10),
+                        ..TransferEstimate::default()
+                    },
                 })
                 .unwrap();
             }
@@ -664,6 +737,45 @@ mod tests {
         assert!(rendered.contains("100%"), "{rendered}");
         assert!(rendered.contains("ETA"), "{rendered}");
         assert!(rendered.lines().count() <= 23, "{rendered}");
+    }
+
+    #[test]
+    fn plain_download_announces_buffering_and_stall_transitions() {
+        let mut output = Vec::new();
+        {
+            let mut ui = StartupUi::new(&mut output, false, StartupOutput::Stdout);
+            let mut send = |state, idle_ms, eta_seconds| {
+                ui.event(StartupEvent::HostedDownloadProgress {
+                    filename: "model.gguf".into(),
+                    completed_bytes: 10,
+                    total_bytes: 100,
+                    elapsed_ms: 1,
+                    estimate: TransferEstimate {
+                        state,
+                        bytes_per_second: Some(1),
+                        eta_seconds,
+                        idle_ms,
+                        ..TransferEstimate::default()
+                    },
+                })
+                .unwrap();
+            };
+            send(TransferState::Transferring, 0, Some(90));
+            send(TransferState::Transferring, 1_000, Some(90));
+            send(TransferState::Buffering, 16_000, Some(90));
+            send(TransferState::Buffering, 17_000, Some(90));
+            send(TransferState::Stalled, 18_000, None);
+        }
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(rendered.lines().count(), 3, "{rendered}");
+        assert!(
+            rendered.contains("buffering: nothing written for 16s"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("stalled: no progress for 18s"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -683,8 +795,14 @@ mod tests {
             filename: "model-q4_k_m.gguf".into(),
             completed_bytes: 5 * 1024 * 1024,
             total_bytes: 10 * 1024 * 1024,
-            bytes_per_second: Some(5 * 1024 * 1024),
             elapsed_ms: 1_000,
+            estimate: TransferEstimate {
+                state: TransferState::Transferring,
+                bytes_per_second: Some(5 * 1024 * 1024),
+                eta_seconds: Some(1),
+                host_received_bytes: Some(7 * 1024 * 1024),
+                ..TransferEstimate::default()
+            },
         })
         .unwrap();
 
@@ -694,8 +812,8 @@ mod tests {
         assert!(rendered.contains("model-q4_k_m.gguf"), "{rendered}");
         assert!(rendered.contains("5.00 MiB/10.00 MiB"), "{rendered}");
         assert!(rendered.contains("50%"), "{rendered}");
-        assert!(rendered.contains("/s"), "{rendered}");
-        assert!(rendered.contains("ETA"), "{rendered}");
+        assert!(rendered.contains("5.0 MiB/s ETA 1s"), "{rendered}");
+        assert!(rendered.contains("host rx 7.0 MiB"), "{rendered}");
         drop(ui);
         assert!(output.is_empty());
     }

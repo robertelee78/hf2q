@@ -225,7 +225,7 @@ pub(super) fn download_projector_with_progress(
                 filename: filename.clone(),
                 completed_bytes: update.completed_bytes,
                 total_bytes: update.total_bytes,
-                bytes_per_second: update.bytes_per_second,
+                estimate: update.estimate,
                 elapsed_ms: update.elapsed_ms,
             });
         },

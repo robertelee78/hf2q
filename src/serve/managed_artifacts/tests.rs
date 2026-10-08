@@ -863,8 +863,13 @@ fn fresh_hosted_projector_snapshot_is_retained_from_its_exact_blob() {
                 filename: "mmproj-model-f16.gguf".into(),
                 completed_bytes: projector_bytes.len() as u64,
                 total_bytes: projector_bytes.len() as u64,
-                bytes_per_second: Some(projector_bytes.len() as u64),
                 elapsed_ms: 1_000,
+                estimate: crate::input::transfer_estimate::TransferEstimate {
+                    state: crate::input::transfer_estimate::TransferState::Transferring,
+                    bytes_per_second: Some(projector_bytes.len() as u64),
+                    eta_seconds: Some(0),
+                    ..Default::default()
+                },
             });
             Ok(snapshot.clone())
         },

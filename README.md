@@ -341,7 +341,12 @@ output carries the same facts as bounded stable lines, without ANSI or a live
 dashboard. On Apple Silicon systems with at least 64 GiB unified memory, hf2q
 uses Xet's upstream high-performance preset unless the operator explicitly sets
 `HF_XET_HIGH_PERFORMANCE` or `HF_XET_HP`; smaller systems keep Xet's adaptive
-defaults.
+defaults. The preset buffers up to 16 GiB plus 2 GiB per file of fetched chunks
+(about 10 GB peak RSS measured); `HF_XET_HIGH_PERFORMANCE=0` keeps the adaptive
+buffers (about 3 GB) at roughly 10% longer download time. Xet writes chunks only
+after reconstructing them, so written bytes advance in bursts; the progress line
+shows a smoothed rate, a bounded ETA, `buffering` with host network receive
+activity during those gaps, and `stalled` when nothing moves for 15 seconds.
 
 New managed paths are readable:
 `~/.local/share/hf2q/models/<owner>/<repository>/<revision>/<artifact>`.

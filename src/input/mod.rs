@@ -13,6 +13,7 @@ pub mod hf_download;
 pub mod hf_reference;
 pub mod integrity;
 pub mod safetensors;
+pub(crate) mod transfer_estimate;
 
 #[cfg(test)]
 mod hf_download_plan_tests;

@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::input::transfer_estimate::{TransferEstimate, TransferState, MAX_ETA_SECONDS};
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StartupOrigin {
@@ -123,10 +125,15 @@ pub(crate) enum StartupEvent {
     },
     HostedDownloadProgress {
         filename: String,
+        /// Bytes hf-hub reports as written. Native Xet buffers concurrently
+        /// fetched chunk ranges and reports them only once reconstructed, so
+        /// this advances in bursts while the network stays busy (#249).
         completed_bytes: u64,
         total_bytes: u64,
-        bytes_per_second: Option<u64>,
         elapsed_ms: u64,
+        /// Smoothed rate, bounded ETA, and buffering/stalled state.
+        #[serde(default)]
+        estimate: TransferEstimate,
     },
     ProjectorPrepare {
         filename: String,
@@ -207,13 +214,13 @@ impl StartupEvent {
                 filename,
                 completed_bytes,
                 total_bytes,
-                bytes_per_second,
+                estimate,
                 ..
             } => {
                 valid_filename(filename)
                     && *total_bytes > 0
                     && *completed_bytes <= *total_bytes
-                    && bytes_per_second.is_none_or(|rate| rate > 0)
+                    && estimate.wire_valid()
             }
             Self::NativeConversion { repository, quant } => {
                 valid_repository(repository) && valid_quant(quant)
@@ -333,31 +340,17 @@ impl StartupEvent {
                 filename,
                 completed_bytes,
                 total_bytes,
-                bytes_per_second,
-                elapsed_ms,
+                estimate,
+                ..
             } => {
                 let percent = completed_bytes.saturating_mul(100) / total_bytes;
-                let measured_rate = if *elapsed_ms == 0 {
-                    0
-                } else {
-                    ((*completed_bytes as u128).saturating_mul(1_000) / u128::from(*elapsed_ms))
-                        .min(u128::from(u64::MAX)) as u64
-                };
-                let rate = bytes_per_second.unwrap_or(measured_rate);
-                let remaining = total_bytes.saturating_sub(*completed_bytes);
-                let eta = if rate > 0 {
-                    format_duration(Duration::from_secs_f64(remaining as f64 / rate as f64))
-                } else {
-                    "unknown".to_owned()
-                };
                 format!(
-                    "download: {} {}/{} ({}%, {}/s, ETA {})",
+                    "download: {} {}/{} written ({}%, {})",
                     clean(filename),
                     human_bytes(*completed_bytes),
                     human_bytes(*total_bytes),
                     percent.min(100),
-                    human_bytes(rate),
-                    eta
+                    download_status_text(estimate)
                 )
             }
             Self::ProjectorPrepare { filename, bytes } => format!(
@@ -518,6 +511,50 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Human status for a hosted download: smoothed rate and bounded ETA, or an
+/// explicit estimating/buffering/stalled state, plus the host-network activity
+/// indicator when one is available. Never prints an unbounded ETA.
+pub(crate) fn download_status_text(estimate: &TransferEstimate) -> String {
+    let rate = estimate
+        .bytes_per_second
+        .map(|rate| format!("{}/s", human_bytes(rate)));
+    let eta = estimate.eta_seconds.map(|eta| {
+        if eta >= MAX_ETA_SECONDS {
+            "ETA more than 24h".to_owned()
+        } else {
+            format!("ETA {}", format_duration(Duration::from_secs(eta)))
+        }
+    });
+    let idle = format_duration(Duration::from_millis(estimate.idle_ms));
+    let mut status = match estimate.state {
+        TransferState::Estimating => match rate {
+            Some(rate) => format!("{rate} so far, ETA estimating"),
+            None => "rate estimating, ETA estimating".to_owned(),
+        },
+        TransferState::Transferring => match (rate, eta) {
+            (Some(rate), Some(eta)) => format!("{rate}, {eta}"),
+            _ => "rate estimating, ETA estimating".to_owned(),
+        },
+        TransferState::Buffering => {
+            let mut text = format!(
+                "buffering: nothing written for {idle} while the network is busy; Xet writes chunks after reconstruction"
+            );
+            if let (Some(rate), Some(eta)) = (rate, eta) {
+                text.push_str(&format!("; avg {rate}, {eta}"));
+            }
+            text
+        }
+        TransferState::Stalled => format!("stalled: no progress for {idle}"),
+    };
+    if let Some(received) = estimate.host_received_bytes {
+        status.push_str(&format!("; host network rx {}", human_bytes(received)));
+        if let Some(rate) = estimate.host_receive_bytes_per_second {
+            status.push_str(&format!(" at {}/s", human_bytes(rate)));
+        }
+    }
+    status
+}
+
 fn format_millis(milliseconds: u64) -> String {
     format_duration(Duration::from_millis(milliseconds))
 }
@@ -578,22 +615,87 @@ mod tests {
         assert!(rendered.contains("ETA 5s"));
     }
 
-    #[test]
-    fn hosted_download_progress_includes_bytes_percent_rate_and_eta() {
-        let event = StartupEvent::HostedDownloadProgress {
+    fn hosted(estimate: TransferEstimate) -> StartupEvent {
+        StartupEvent::HostedDownloadProgress {
             filename: "model-q4_k_m.gguf".into(),
             completed_bytes: 5 * 1024 * 1024 * 1024,
             total_bytes: 10 * 1024 * 1024 * 1024,
-            bytes_per_second: Some(1024 * 1024 * 1024),
             elapsed_ms: 5_000,
-        };
+            estimate,
+        }
+    }
+
+    #[test]
+    fn hosted_download_progress_includes_bytes_percent_rate_and_eta() {
+        let event = hosted(TransferEstimate {
+            state: TransferState::Transferring,
+            bytes_per_second: Some(1024 * 1024 * 1024),
+            eta_seconds: Some(5),
+            ..TransferEstimate::default()
+        });
         assert!(event.wire_valid());
         let rendered = event.render();
         assert!(rendered.contains("model-q4_k_m.gguf"));
-        assert!(rendered.contains("5.0 GiB/10.0 GiB"));
+        assert!(rendered.contains("5.0 GiB/10.0 GiB written"));
         assert!(rendered.contains("50%"));
         assert!(rendered.contains("1.0 GiB/s"));
         assert!(rendered.contains("ETA 5s"));
+    }
+
+    #[test]
+    fn hosted_download_states_render_honestly_and_bounded() {
+        let estimating = hosted(TransferEstimate::default()).render();
+        assert!(estimating.contains("ETA estimating"), "{estimating}");
+        let early = hosted(TransferEstimate {
+            bytes_per_second: Some(4 * 1024 * 1024),
+            ..TransferEstimate::default()
+        });
+        assert!(early.wire_valid());
+        let early = early.render();
+        assert!(
+            early.contains("4.0 MiB/s so far, ETA estimating"),
+            "{early}"
+        );
+
+        let buffering = hosted(TransferEstimate {
+            state: TransferState::Buffering,
+            bytes_per_second: Some(100 * 1024 * 1024),
+            eta_seconds: Some(50),
+            idle_ms: 36_000,
+            host_received_bytes: Some(9 * 1024 * 1024 * 1024),
+            host_receive_bytes_per_second: Some(300 * 1024 * 1024),
+        });
+        assert!(buffering.wire_valid());
+        let buffering = buffering.render();
+        assert!(buffering.contains("buffering"), "{buffering}");
+        assert!(buffering.contains("36s"), "{buffering}");
+        assert!(
+            buffering.contains("host network rx 9.0 GiB at 300.0 MiB/s"),
+            "{buffering}"
+        );
+
+        let stalled = hosted(TransferEstimate {
+            state: TransferState::Stalled,
+            bytes_per_second: Some(100 * 1024 * 1024),
+            idle_ms: 45_000,
+            ..TransferEstimate::default()
+        })
+        .render();
+        assert!(
+            stalled.contains("stalled: no progress for 45s"),
+            "{stalled}"
+        );
+        assert!(!stalled.contains("ETA"), "{stalled}");
+
+        let slow = hosted(TransferEstimate {
+            state: TransferState::Transferring,
+            bytes_per_second: Some(1),
+            eta_seconds: Some(MAX_ETA_SECONDS),
+            ..TransferEstimate::default()
+        })
+        .render();
+        assert!(slow.contains("ETA more than 24h"), "{slow}");
+        assert!(!slow.contains("years"), "{slow}");
     }
 
     #[test]
@@ -625,16 +727,29 @@ mod tests {
             filename: "model.gguf".into(),
             completed_bytes: 2,
             total_bytes: 1,
-            bytes_per_second: Some(1),
             elapsed_ms: 1,
+            estimate: TransferEstimate::default(),
         }
         .wire_valid());
         assert!(!StartupEvent::HostedDownloadProgress {
             filename: "../model.gguf".into(),
             completed_bytes: 1,
             total_bytes: 2,
-            bytes_per_second: Some(1),
             elapsed_ms: 1,
+            estimate: TransferEstimate::default(),
+        }
+        .wire_valid());
+        assert!(!StartupEvent::HostedDownloadProgress {
+            filename: "model.gguf".into(),
+            completed_bytes: 1,
+            total_bytes: 2,
+            elapsed_ms: 1,
+            estimate: TransferEstimate {
+                state: TransferState::Stalled,
+                bytes_per_second: Some(1),
+                eta_seconds: Some(1),
+                ..TransferEstimate::default()
+            },
         }
         .wire_valid());
     }
