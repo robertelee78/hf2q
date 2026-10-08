@@ -200,7 +200,7 @@ async fn run_session(
     )?;
     writeln!(
         output,
-        "commands: /new /model [id] /thinking auto|on|off /status /detach /quit"
+        "commands: /new /model [id] /thinking auto|on|off /max-tokens [n|default] /status /detach /quit"
     )?;
 
     interactive_loop(
@@ -315,6 +315,10 @@ async fn interactive_loop(
         {
             Ok(response) => {
                 renderer.complete(&response)?;
+                if let Some(note) = length_limit_note(&response.finish_reason, client.max_tokens())
+                {
+                    writeln!(output, "{note}")?;
+                }
                 if let Some(control) = control {
                     control.write_runtime_status(auth_token, output).await?;
                 }
@@ -373,6 +377,7 @@ async fn handle_command(
                 client.thinking().as_str(),
                 lifecycle
             )?;
+            writeln!(output, "{}", describe_max_tokens(client))?;
             if let Some(control) = control {
                 control.write_runtime_status(auth_token, output).await?;
             }
@@ -389,6 +394,17 @@ async fn handle_command(
             }
             client.set_thinking(mode);
             writeln!(output, "thinking={}", mode.as_str())?;
+            Ok(false)
+        }
+        "/max-tokens" => {
+            match parse_max_tokens_command(words.next(), words.next().is_some()) {
+                MaxTokensCommand::Show => writeln!(output, "{}", describe_max_tokens(client))?,
+                MaxTokensCommand::Set(value) => {
+                    client.set_max_tokens(value);
+                    writeln!(output, "{}", describe_max_tokens(client))?;
+                }
+                MaxTokensCommand::Invalid(message) => writeln!(output, "{message}")?,
+            }
             Ok(false)
         }
         "/model" => {
@@ -445,6 +461,69 @@ async fn handle_command(
     }
 }
 
+/// Upper bound accepted by `/max-tokens`; larger values are almost certainly
+/// typos and would only be clamped or rejected by the server.
+const MAX_TOKENS_COMMAND_LIMIT: usize = 1_000_000;
+
+const MAX_TOKENS_USAGE: &str = "usage: /max-tokens [n|default] (n from 1 to 1000000)";
+
+#[derive(Debug, PartialEq, Eq)]
+enum MaxTokensCommand {
+    /// Bare `/max-tokens`: print the current value.
+    Show,
+    /// `Some(n)` sends `max_tokens = n`; `None` (`default`) omits the field.
+    Set(Option<usize>),
+    /// Rejected input; state is unchanged.
+    Invalid(String),
+}
+
+fn parse_max_tokens_command(argument: Option<&str>, extra: bool) -> MaxTokensCommand {
+    if extra {
+        return MaxTokensCommand::Invalid(MAX_TOKENS_USAGE.to_owned());
+    }
+    let Some(argument) = argument else {
+        return MaxTokensCommand::Show;
+    };
+    if argument == "default" {
+        return MaxTokensCommand::Set(None);
+    }
+    match argument.parse::<usize>() {
+        Ok(value) if (1..=MAX_TOKENS_COMMAND_LIMIT).contains(&value) => {
+            MaxTokensCommand::Set(Some(value))
+        }
+        Ok(_) => MaxTokensCommand::Invalid(format!(
+            "invalid max tokens {argument}: must be from 1 to {MAX_TOKENS_COMMAND_LIMIT}; {MAX_TOKENS_USAGE}"
+        )),
+        Err(_) => MaxTokensCommand::Invalid(format!(
+            "invalid max tokens {}: not a number; {MAX_TOKENS_USAGE}",
+            terminal_safe(argument)
+        )),
+    }
+}
+
+fn describe_max_tokens(client: &ChatClient) -> String {
+    format_max_tokens(client.max_tokens(), client.max_tokens_source())
+}
+
+fn format_max_tokens(max_tokens: Option<usize>, source: wire::MaxTokensSource) -> String {
+    match max_tokens {
+        Some(value) => format!("max_tokens={value} ({})", source.describe()),
+        None => format!("max_tokens=omitted ({})", source.describe()),
+    }
+}
+
+fn length_limit_note(finish_reason: &str, max_tokens: Option<usize>) -> Option<String> {
+    if finish_reason != "length" {
+        return None;
+    }
+    Some(match max_tokens {
+        Some(limit) => {
+            format!("reply stopped at the {limit}-token limit; raise it with /max-tokens <n>")
+        }
+        None => "reply stopped at the server limit; raise it with /max-tokens <n>".to_owned(),
+    })
+}
+
 fn pick_model(
     models: &[Model],
     input: &mut impl BufRead,
@@ -494,6 +573,81 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn max_tokens_command_parses_valid_bare_default_and_invalid_values() {
+        assert_eq!(
+            parse_max_tokens_command(None, false),
+            MaxTokensCommand::Show
+        );
+        assert_eq!(
+            parse_max_tokens_command(Some("4096"), false),
+            MaxTokensCommand::Set(Some(4096))
+        );
+        assert_eq!(
+            parse_max_tokens_command(Some("1"), false),
+            MaxTokensCommand::Set(Some(1))
+        );
+        assert_eq!(
+            parse_max_tokens_command(Some("1000000"), false),
+            MaxTokensCommand::Set(Some(1_000_000))
+        );
+        assert_eq!(
+            parse_max_tokens_command(Some("default"), false),
+            MaxTokensCommand::Set(None)
+        );
+        for bad in [
+            "0",
+            "1000001",
+            "abc",
+            "-5",
+            "12k",
+            "99999999999999999999999",
+        ] {
+            match parse_max_tokens_command(Some(bad), false) {
+                MaxTokensCommand::Invalid(message) => {
+                    assert!(message.contains("invalid max tokens"), "{bad}: {message}");
+                    assert!(message.contains("usage: /max-tokens"), "{bad}: {message}");
+                }
+                other => panic!("{bad} must be rejected, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            parse_max_tokens_command(Some("10"), true),
+            MaxTokensCommand::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn max_tokens_status_names_value_and_source() {
+        use wire::MaxTokensSource;
+        assert_eq!(
+            format_max_tokens(None, MaxTokensSource::ServerDefault),
+            "max_tokens=omitted (server default (512 when omitted))"
+        );
+        assert_eq!(
+            format_max_tokens(Some(2048), MaxTokensSource::Flag),
+            "max_tokens=2048 (--max-tokens flag)"
+        );
+        assert_eq!(
+            format_max_tokens(Some(8192), MaxTokensSource::Command),
+            "max_tokens=8192 (/max-tokens command)"
+        );
+    }
+
+    #[test]
+    fn length_finish_prints_limit_note_only_for_length() {
+        assert_eq!(length_limit_note("stop", Some(512)), None);
+        assert_eq!(length_limit_note("tool_calls", None), None);
+        assert_eq!(
+            length_limit_note("length", Some(512)).as_deref(),
+            Some("reply stopped at the 512-token limit; raise it with /max-tokens <n>")
+        );
+        assert_eq!(
+            length_limit_note("length", None).as_deref(),
+            Some("reply stopped at the server limit; raise it with /max-tokens <n>")
+        );
+    }
 
     #[test]
     fn picker_marks_loaded_models_and_returns_numbered_choice() {

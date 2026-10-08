@@ -96,8 +96,12 @@ and serve defaults as direct `hf2q serve`.
 - `/new` clears the in-memory transcript.
 - `/model` selects another advertised model and begins a new transcript.
 - `/thinking auto|on|off` controls the existing hf2q thinking override.
-- `/status` prints the current endpoint, model, session, and available pool
-  status.
+- `/max-tokens N` sets `max_tokens` for subsequent requests (1 to 1000000);
+  `/max-tokens` alone prints the current value and `/max-tokens default`
+  omits the field again so the server default (512) applies. A reply that
+  ends with `finish_reason=length` prints a note naming the limit.
+- `/status` prints the current endpoint, model, session, `max_tokens` limit
+  and its source, and available pool status.
 - `/detach` relinquishes ownership of a server started by this chat.
 - `/quit` exits.
 
