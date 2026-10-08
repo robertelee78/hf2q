@@ -148,6 +148,16 @@ impl SseDecoder {
             .finish_reason
             .context("chat stream ended without a finish reason")?;
         if finish_reason == "error" {
+            // The server streams the error text as content before the
+            // finish chunk; recognise a dead engine so the user is told to
+            // restart the server instead of seeing an opaque failure.
+            if let Some(start) = super::client::ENGINE_STOPPED_CODES
+                .iter()
+                .filter_map(|code| self.content.find(&format!("{code}:")))
+                .min()
+            {
+                return Err(super::client::engine_stopped_error(&self.content[start..]));
+            }
             bail!("server ended generation with finish_reason=error");
         }
         let mut tool_calls = Vec::with_capacity(self.tools.len());
@@ -249,6 +259,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("finish_reason=error"));
+    }
+
+    #[test]
+    fn engine_failed_stream_error_tells_the_user_to_restart_serve() {
+        let mut failed = SseDecoder::default();
+        failed
+            .push(concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial \"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"engine_failed: the inference engine stopped (engine thread panicked: boom)\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ).as_bytes())
+            .unwrap();
+        let message = failed.finish().unwrap_err().to_string();
+        assert!(
+            message.contains("the server's inference engine stopped; restart `hf2q serve`"),
+            "{message}"
+        );
+        assert!(message.contains("boom"), "{message}");
+        assert!(!message.contains("partial"), "{message}");
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub(super) fn draw(state: &DashboardState) {
     ));
     if let Some(reason) = state.unhealthy.as_deref() {
         frame.push_str(&format!(
-            "\x1b[31m● unhealthy — restart required\x1b[0m  {}  ·  up {}\n",
+            "\x1b[31m● engine stopped — restart `hf2q serve`\x1b[0m  {}  ·  up {}\n",
             terminal_safe_text(&state.endpoint),
             format_duration(state.started.elapsed())
         ));

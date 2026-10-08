@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 
-use super::engine_supervisor::EngineSupervisor;
+use super::engine_supervisor::{spawn_supervised_worker, EngineSupervisor};
 
 const SLOT_AWARE_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 // The preserved Gemma cold-prefill baseline is roughly 388 seconds for
@@ -1816,6 +1816,90 @@ pub(crate) fn make_synthetic_engine_aggregate_stream_pressure(arch: LoadedArch) 
             })),
         }),
     }
+}
+
+#[cfg(test)]
+pub(crate) const SYNTHETIC_ENGINE_PANIC_MESSAGE: &str = "synthetic engine-thread panic for test";
+
+/// Synthetic SlotAware engine whose worker thread panics mid-request
+/// (issue #250). The worker runs under the production
+/// [`spawn_supervised_worker`] wrapper, so the panic exercises the real
+/// failure path: a streaming request is admitted, receives one content
+/// delta, then the thread panics once the returned trigger fires (so the
+/// panic lands mid-stream, after SSE admission); a unary request panics
+/// before replying.
+#[cfg(test)]
+pub(crate) fn make_synthetic_engine_that_panics(
+    arch: LoadedArch,
+) -> (Engine, std::sync::mpsc::Sender<()>) {
+    let (tx, mut rx) = mpsc::channel::<Request>(8);
+    let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<()>();
+    let supervisor = EngineSupervisor::new();
+    let handle = spawn_supervised_worker(
+        "hf2q-engine-panic-test",
+        supervisor.clone(),
+        move |_supervisor| {
+            while let Some(req) = rx.blocking_recv() {
+                match req {
+                    Request::GenerateStream {
+                        events, admission, ..
+                    } => {
+                        if let Some(admission) = admission {
+                            let _ = admission.send(Ok(()));
+                        }
+                        let _ = events.blocking_send(super::sse::GenerationEvent::Delta {
+                            kind: super::sse::DeltaKind::Content,
+                            text: "partial".into(),
+                        });
+                        let _ = trigger_rx.recv();
+                        panic!("{SYNTHETIC_ENGINE_PANIC_MESSAGE}");
+                    }
+                    Request::Generate { .. } => panic!("{SYNTHETIC_ENGINE_PANIC_MESSAGE}"),
+                    Request::Shutdown => break,
+                    _ => {}
+                }
+            }
+        },
+    )
+    .expect("spawn panicking test worker");
+
+    let engine = Engine {
+        inner: Arc::new(EngineInner {
+            tx,
+            supervisor,
+            worker_handle: Mutex::new(Some(handle)),
+            info: synthetic_load_info("panic-test-model"),
+            arch,
+            model_id: "panic-test-model".into(),
+            context_length: Some(4_096),
+            quant_type: None,
+            hidden_size: 0,
+            vocab_size: 0,
+            eos_token_ids: vec![],
+            tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
+            chat_template: Arc::new(String::new()),
+            registration: None,
+            vision_consumer_contract: None,
+            token_bytes: std::sync::OnceLock::new(),
+            kv_spill_descriptor: None,
+            tq_packed_descriptor: None,
+            mode: EngineMode::SlotAware { max_slots: 4 },
+            max_slots: 4,
+            per_slot_kv_budget_bytes: 0,
+            kv_bytes_per_token_cached: 0,
+            kv_fixed_bytes_per_slot_cached: 0,
+            scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
+                policy: SchedulerPolicy::InflightBatched,
+                in_flight_slots: 0,
+                queue_capacity: 8,
+                admitted_total: 0,
+                rejected_429_total: 0,
+                rejected_unsatisfiable_total: 0,
+                completed_total: 0,
+            })),
+        }),
+    };
+    (engine, trigger_tx)
 }
 
 /// **ADR-040 §6.1.18 iter-A5d** — synthetic `Engine` for the iter-A5d
@@ -4401,10 +4485,10 @@ impl Engine {
         let worker_kv_bytes_per_token = initial_kv_bytes_per_token_cached;
         let worker_kv_fixed_bytes_per_slot = initial_kv_fixed_bytes_per_slot_cached;
         let supervisor = EngineSupervisor::new();
-        let worker_supervisor = supervisor.clone();
-        let worker_handle = std::thread::Builder::new()
-            .name("hf2q-engine".into())
-            .spawn(move || {
+        let worker_handle = spawn_supervised_worker(
+            "hf2q-engine",
+            supervisor.clone(),
+            move |worker_supervisor| {
                 worker_run(
                     loaded,
                     rx,
@@ -4417,8 +4501,9 @@ impl Engine {
                     worker_kv_fixed_bytes_per_slot,
                     worker_supervisor,
                 )
-            })
-            .expect("spawn hf2q-engine thread");
+            },
+        )
+        .expect("spawn hf2q-engine thread");
 
         Engine {
             inner: Arc::new(EngineInner {
@@ -4984,10 +5069,10 @@ impl Engine {
         let worker_kv_bytes_per_token = initial_kv_bytes_per_token_cached;
         let worker_kv_fixed_bytes_per_slot = initial_kv_fixed_bytes_per_slot_cached;
         let supervisor = EngineSupervisor::new();
-        let worker_supervisor = supervisor.clone();
-        let worker_handle = std::thread::Builder::new()
-            .name("hf2q-engine-slotaware".into())
-            .spawn(move || {
+        let worker_handle = spawn_supervised_worker(
+            "hf2q-engine-slotaware",
+            supervisor.clone(),
+            move |worker_supervisor| {
                 worker_run(
                     loaded,
                     rx,
@@ -5000,8 +5085,9 @@ impl Engine {
                     worker_kv_fixed_bytes_per_slot,
                     worker_supervisor,
                 )
-            })
-            .expect("spawn hf2q-engine-slotaware thread");
+            },
+        )
+        .expect("spawn hf2q-engine-slotaware thread");
 
         Engine {
             inner: Arc::new(EngineInner {
@@ -5056,6 +5142,21 @@ impl Engine {
     /// request on the same command queue.
     pub fn is_worker_healthy(&self) -> bool {
         self.inner.supervisor.is_healthy() && !self.inner.tx.is_closed()
+    }
+
+    /// Short cause of a dead engine for readiness reporting, or `None`
+    /// while the worker is healthy. A worker that exited without a recorded
+    /// cause still reports a failure rather than looking like warmup.
+    pub fn failure_detail(&self) -> Option<String> {
+        if self.is_worker_healthy() {
+            return None;
+        }
+        Some(
+            self.inner
+                .supervisor
+                .failure_summary()
+                .unwrap_or_else(|| "inference worker stopped".to_string()),
+        )
     }
 
     fn ensure_worker_healthy(&self) -> Result<()> {
@@ -5857,6 +5958,19 @@ pub const ENGINE_UNHEALTHY_SENTINEL: &str = "engine_unhealthy";
 pub const ENGINE_UNHEALTHY_MESSAGE: &str =
     "engine_unhealthy: inference worker stopped; retry after model/process recovery";
 pub const QWEN35_NOT_IMPLEMENTED_SENTINEL: &str = "qwen35_not_implemented";
+
+/// Sentinel for an engine whose worker thread died (panic or unexpected
+/// exit). Distinct from `not_ready` (warmup) — the process must restart.
+pub const ENGINE_FAILED_SENTINEL: &str = "engine_failed";
+
+/// Operator-facing message for a dead engine; carried by in-flight SSE error
+/// events and by the HTTP 503 `engine_failed` body.
+pub fn engine_failed_message(cause: &str) -> String {
+    format!(
+        "{ENGINE_FAILED_SENTINEL}: the inference engine stopped ({cause}); \
+         the server must be restarted — restart `hf2q serve` to recover"
+    )
+}
 
 /// Operator-facing message body emitted on the 501 path.  Names both
 /// the working CLI alternative (`hf2q generate`) AND the function that

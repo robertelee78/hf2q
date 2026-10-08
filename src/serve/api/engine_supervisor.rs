@@ -4,8 +4,12 @@
 //! owns the receiver while blocked inside Objective-C. The supervisor lives
 //! outside that worker and makes transaction expiry one-way and observable.
 
+use std::any::Any;
+use std::cell::RefCell;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, Once, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -27,6 +31,9 @@ struct EngineSupervisorInner {
     next_epoch: AtomicU64,
     armed: Mutex<Option<ArmedTransaction>>,
     reason: Mutex<Option<String>>,
+    /// Short operator-facing cause (panic message, expired transaction)
+    /// reported by `/readyz` as `engine failed: <summary>`.
+    summary: Mutex<Option<String>>,
     health_tx: watch::Sender<bool>,
 }
 
@@ -57,6 +64,7 @@ impl EngineSupervisor {
             next_epoch: AtomicU64::new(1),
             armed: Mutex::new(None),
             reason: Mutex::new(None),
+            summary: Mutex::new(None),
             health_tx,
         });
         if let Err(error) = start(Arc::downgrade(&inner)) {
@@ -96,6 +104,23 @@ impl EngineSupervisor {
             .ok()
             .and_then(|reason| reason.clone())
             .unwrap_or_else(|| super::engine::ENGINE_UNHEALTHY_MESSAGE.to_string())
+    }
+
+    /// Short cause of a poisoned engine, if one was recorded.
+    pub(super) fn failure_summary(&self) -> Option<String> {
+        self.inner
+            .summary
+            .lock()
+            .ok()
+            .and_then(|summary| summary.clone())
+    }
+
+    /// Mark the engine permanently failed because its worker thread
+    /// panicked. One-way, like transaction expiry; the first recorded cause
+    /// wins. (A worker that exits without panicking closes its request
+    /// receiver, which `Engine::failure_detail` reports on its own.)
+    pub(super) fn fail_worker(&self, summary: &str) {
+        self.inner.fail(summary.to_string());
     }
 
     pub(super) async fn wait_unhealthy(&self) {
@@ -140,6 +165,15 @@ impl EngineSupervisor {
                     }
                     event = source.recv() => {
                         let Some(event) = event else {
+                            // The worker dropped this stream without a
+                            // terminal event. If that happened because the
+                            // engine died, say so instead of letting the
+                            // SSE layer report an anonymous closed channel.
+                            if !supervisor.is_healthy() {
+                                let _ = guarded_tx
+                                    .send(GenerationEvent::Error(supervisor.unhealthy_message()))
+                                    .await;
+                            }
                             return;
                         };
                         let terminal = matches!(
@@ -326,6 +360,12 @@ impl EngineSupervisorInner {
             if let Ok(mut reason) = self.reason.lock() {
                 *reason = Some(message.clone());
             }
+            if let Ok(mut summary) = self.summary.lock() {
+                *summary = Some(format!(
+                    "worker transaction {} (epoch {}) exceeded its deadline",
+                    expired.kind, expired.epoch
+                ));
+            }
             crate::serve::operator_ui::engine_unhealthy(message.clone());
             tracing::error!(
                 transaction = expired.kind,
@@ -335,6 +375,96 @@ impl EngineSupervisorInner {
             self.health_tx.send_replace(false);
         }
     }
+
+    fn fail(&self, summary: String) {
+        if self
+            .health
+            .compare_exchange(HEALTHY, POISONED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let message = super::engine::engine_failed_message(&summary);
+            if let Ok(mut reason) = self.reason.lock() {
+                *reason = Some(message.clone());
+            }
+            if let Ok(mut slot) = self.summary.lock() {
+                *slot = Some(summary.clone());
+            }
+            crate::serve::operator_ui::engine_unhealthy(message);
+            tracing::error!(cause = %summary, "inference engine thread failed; restart hf2q serve");
+            self.health_tx.send_replace(false);
+        }
+    }
+}
+
+thread_local! {
+    /// Supervisor of the engine worker running on this thread, consulted by
+    /// the process panic hook.
+    static WORKER_SUPERVISOR: RefCell<Option<EngineSupervisor>> = const { RefCell::new(None) };
+}
+
+static PANIC_HOOK: Once = Once::new();
+
+/// Chain a process panic hook that poisons the panicking engine worker's
+/// supervisor *before* unwinding drops its channels. Pending streams then
+/// observe the failure (not an anonymous closed channel) and readiness flips
+/// to an explicit failure state. Panics on other threads are untouched.
+fn install_worker_panic_hook() {
+    PANIC_HOOK.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let supervisor = WORKER_SUPERVISOR
+                .try_with(|slot| slot.try_borrow().ok().and_then(|slot| slot.clone()))
+                .ok()
+                .flatten();
+            if let Some(supervisor) = supervisor {
+                let location = info
+                    .location()
+                    .map(|location| format!(" at {}:{}", location.file(), location.line()))
+                    .unwrap_or_default();
+                supervisor.fail_worker(&format!(
+                    "engine thread panicked{location}: {}",
+                    panic_payload_message(info.payload())
+                ));
+            }
+            previous(info);
+        }));
+    });
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Spawn the one model worker thread under `supervisor`. A panic anywhere in
+/// `body` permanently fails the engine with the panic message; the panic is
+/// contained to this thread so shutdown joins never re-raise it.
+pub(super) fn spawn_supervised_worker(
+    name: &str,
+    supervisor: EngineSupervisor,
+    body: impl FnOnce(EngineSupervisor) + Send + 'static,
+) -> std::io::Result<JoinHandle<()>> {
+    install_worker_panic_hook();
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            WORKER_SUPERVISOR.with(|slot| *slot.borrow_mut() = Some(supervisor.clone()));
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| body(supervisor.clone())));
+            WORKER_SUPERVISOR.with(|slot| slot.borrow_mut().take());
+            if let Err(payload) = outcome {
+                // Normally already recorded by the hook; this covers a hook
+                // replaced by another component after installation.
+                supervisor.fail_worker(&format!(
+                    "engine thread panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                ));
+            }
+        })
 }
 
 #[cfg(test)]
