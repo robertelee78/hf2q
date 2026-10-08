@@ -216,9 +216,19 @@ fn public_watchdog_fixture_consumers_share_the_canonical_digests() {
     let cancellation = include_str!("../../../scripts/test_qwen36_prefill_cancellation.sh");
     let deepseek_overlap = include_str!("../../../scripts/test_deepseek4_interactive_overlap.sh");
     let release_gate = include_str!("../../../scripts/run_agentic_cache_release_gate.sh");
-    let model_qualification_workflow =
-        include_str!("../../../.github/workflows/cache-lifecycle.yml");
-    let release_workflow = include_str!("../../../.github/workflows/release.yml");
+    // `.github/` is excluded from the published crate (Cargo.toml `exclude`),
+    // so the workflow files are read at run time from the source checkout and
+    // these two checks are skipped when the test runs from a packaged crate.
+    let workflow = |name: &str| {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".github/workflows")
+                .join(name),
+        )
+        .ok()
+    };
+    let model_qualification_workflow = workflow("cache-lifecycle.yml");
+    let release_workflow = workflow("release.yml");
 
     for (name, script) in [
         ("watchdog", watchdog),
@@ -235,14 +245,18 @@ fn public_watchdog_fixture_consumers_share_the_canonical_digests() {
             "{name} must reject the historical key-sorted fixture digest"
         );
     }
-    assert!(
-        model_qualification_workflow.contains("scripts/run_agentic_cache_release_gate.sh"),
-        "model qualification workflow must invoke the gate that owns the fixture digest"
-    );
-    assert!(
-        !release_workflow.contains(REQUEST_SHA256),
-        "release workflow must not own model-qualification fixture digests"
-    );
+    if let Some(model_qualification_workflow) = model_qualification_workflow {
+        assert!(
+            model_qualification_workflow.contains("scripts/run_agentic_cache_release_gate.sh"),
+            "model qualification workflow must invoke the gate that owns the fixture digest"
+        );
+    }
+    if let Some(release_workflow) = release_workflow {
+        assert!(
+            !release_workflow.contains(REQUEST_SHA256),
+            "release workflow must not own model-qualification fixture digests"
+        );
+    }
     for (name, script) in [("watchdog", watchdog), ("cancellation", cancellation)] {
         assert!(
             script.contains(RUNTIME_REQUEST_SHA256),
