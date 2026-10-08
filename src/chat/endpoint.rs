@@ -814,8 +814,13 @@ mod tests {
             filename: "model-q4_k_m.gguf".into(),
             completed_bytes: 25,
             total_bytes: 100,
-            bytes_per_second: Some(10),
             elapsed_ms: 2_500,
+            estimate: crate::input::transfer_estimate::TransferEstimate {
+                state: crate::input::transfer_estimate::TransferState::Transferring,
+                bytes_per_second: Some(10),
+                eta_seconds: Some(8),
+                ..Default::default()
+            },
         };
         let mut frame = crate::serve::CHAT_STARTUP_PROGRESS_PREFIX.to_vec();
         frame.extend(serde_json::to_vec(&expected).unwrap());

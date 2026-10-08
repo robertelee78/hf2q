@@ -52,6 +52,7 @@ use tracing::{debug, info};
 
 use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
 use crate::input::hf_reference::{HfModelReference, HfReferenceError, ResolvedHfModelReference};
+use crate::input::transfer_estimate::{HostNetworkCounter, TransferEstimate, TransferEstimator};
 use crate::progress::{HubDownloadObserver, HubDownloadSnapshot, ProgressReporter};
 
 pub(crate) type HubRepo = hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>;
@@ -1499,13 +1500,17 @@ pub fn download_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, Download
 }
 
 /// Foreground-safe progress from one hosted Hub payload transfer.
+///
+/// `completed_bytes` are bytes hf-hub reports as written. Rate, ETA, and the
+/// buffering/stalled state come from hf2q's [`TransferEstimator`], not from
+/// Xet's raw 10-second completion rate (issue #249).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HubTransferProgress {
     pub completed_bytes: u64,
     pub total_bytes: u64,
-    pub bytes_per_second: Option<u64>,
     pub elapsed_ms: u64,
     pub complete: bool,
+    pub(crate) estimate: TransferEstimate,
 }
 
 /// Download a hosted text artifact while keeping terminal ownership with the
@@ -1670,9 +1675,9 @@ fn download_hub_artifact_observed(
     std::thread::scope(|scope| {
         let transfer =
             scope.spawn(|| download_hub_artifact(artifact, expected_role, Some(handler)));
-        let mut last_sequence = 0;
+        let mut publisher = HubTransferPublisher::new(started);
         loop {
-            publish_hub_transfer_progress(&observer, started, &mut last_sequence, progress);
+            publisher.poll(&observer, progress);
             if transfer.is_finished() {
                 break;
             }
@@ -1681,32 +1686,95 @@ fn download_hub_artifact_observed(
         let result = transfer.join().map_err(|_| DownloadError::DownloadFailed {
             reason: "native Hugging Face download worker panicked".to_owned(),
         })?;
-        publish_hub_transfer_progress(&observer, started, &mut last_sequence, progress);
+        publisher.poll(&observer, progress);
         result
     })
 }
 
-fn publish_hub_transfer_progress(
-    observer: &HubDownloadObserver,
+/// Foreground coalescer: turns observer snapshots into smoothed progress.
+///
+/// It republishes at least once per second even when hf-hub sends nothing,
+/// so idle/stalled timers and the host-network activity indicator stay live.
+struct HubTransferPublisher {
     started: Instant,
-    last_sequence: &mut u64,
-    progress: &mut dyn FnMut(HubTransferProgress),
-) {
-    let snapshot = observer.snapshot();
-    if snapshot.sequence == 0 || snapshot.sequence == *last_sequence || snapshot.total_bytes == 0 {
-        return;
-    }
-    *last_sequence = snapshot.sequence;
-    progress(hub_transfer_progress(snapshot, started.elapsed()));
+    last_sequence: u64,
+    last_published: Option<Instant>,
+    estimator: TransferEstimator,
+    host_network: Option<HostNetworkCounter>,
+    host_sampled: Option<(Instant, Option<u64>)>,
 }
 
-fn hub_transfer_progress(snapshot: HubDownloadSnapshot, elapsed: Duration) -> HubTransferProgress {
+impl HubTransferPublisher {
+    const REPUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+    const HOST_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            last_sequence: 0,
+            last_published: None,
+            estimator: TransferEstimator::new(),
+            host_network: None,
+            host_sampled: None,
+        }
+    }
+
+    fn host_received_total(&mut self, now: Instant) -> Option<u64> {
+        if let Some((at, total)) = self.host_sampled {
+            if now.duration_since(at) < Self::HOST_SAMPLE_INTERVAL {
+                return total;
+            }
+        }
+        let total = self
+            .host_network
+            .get_or_insert_with(HostNetworkCounter::new)
+            .total_received();
+        self.host_sampled = Some((now, total));
+        total
+    }
+
+    fn poll(
+        &mut self,
+        observer: &HubDownloadObserver,
+        progress: &mut dyn FnMut(HubTransferProgress),
+    ) {
+        let snapshot = observer.snapshot();
+        if snapshot.sequence == 0 || snapshot.total_bytes == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let changed = snapshot.sequence != self.last_sequence;
+        let republish_due = self
+            .last_published
+            .is_none_or(|at| now.duration_since(at) >= Self::REPUBLISH_INTERVAL);
+        let host_total = self.host_received_total(now);
+        let elapsed = now.duration_since(self.started);
+        let estimate = self.estimator.observe(
+            elapsed,
+            snapshot.completed_bytes,
+            snapshot.total_bytes,
+            host_total,
+        );
+        if !changed && !republish_due && !snapshot.complete {
+            return;
+        }
+        self.last_sequence = snapshot.sequence;
+        self.last_published = Some(now);
+        progress(hub_transfer_progress(snapshot, elapsed, estimate));
+    }
+}
+
+fn hub_transfer_progress(
+    snapshot: HubDownloadSnapshot,
+    elapsed: Duration,
+    estimate: TransferEstimate,
+) -> HubTransferProgress {
     HubTransferProgress {
         completed_bytes: snapshot.completed_bytes.min(snapshot.total_bytes),
         total_bytes: snapshot.total_bytes,
-        bytes_per_second: snapshot.bytes_per_second,
         elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
         complete: snapshot.complete,
+        estimate,
     }
 }
 

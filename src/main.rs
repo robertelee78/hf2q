@@ -71,6 +71,14 @@ fn should_auto_enable_xet_high_performance(
         && !alias_is_explicit
 }
 
+/// Memory note (issue #249): the preset sets a 16 GiB base plus 2 GiB per file
+/// reconstruction buffer and is applied after `HF_XET_RECONSTRUCTION_*`
+/// environment overrides, so those cannot shrink it. Fetched chunks wait in
+/// that buffer until reconstructed, which is why RSS reached ~12 GB and written
+/// bytes arrive in bursts. `HF_XET_HIGH_PERFORMANCE=0` is the supported bound
+/// (adaptive 2 GiB + 512 MiB per file, 8 GiB cap). The default stays per the
+/// ADR-051 A/B; progress handles the bursts in `input::transfer_estimate`.
+///
 /// Select the single native-Xet resource policy before any library-owned
 /// runtime or background worker exists. `xet-runtime` snapshots these variables
 /// when it lazily constructs the first session; mutating them later would be

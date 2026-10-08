@@ -880,3 +880,42 @@ and emitted semantic SSE content plus one usage event and `[DONE]`. SIGINT
 drained the worker and removed the listener cleanly. This is candidate-branch
 evidence; the protected exact-artifact workflow remains release publication
 authority.
+
+### Amendment: bursty native-Xet progress (issue #249, 2026-10-07)
+
+A cold `hf2q serve jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated`
+(23.3 GiB Q5_K_M) showed the download line flat for up to a minute, then
+jumping, with ETAs from 8h 32m (and over 2,000 years) down to 37 s. During one
+flat period `nettop` reported about 10 GB received while the display and the
+`.incomplete` blob showed 2.8-4 GB and RSS was about 12 GB. Source tracing:
+
+- `hf-hub` 1.0 `xet.rs` `spawn_download_progress_poller` forwards only
+  `GroupProgressReport::total_bytes_completed` (reconstructed, written bytes)
+  and `total_bytes_completion_rate` every 100 ms. Xet 1.5.3 tracks network
+  `total_transfer_bytes_completed` per fetched xorb block, but `hf-hub` drops
+  it and keeps the download group and session crate-private, so hf2q cannot
+  reach per-process received bytes without forking.
+- Xet's completion rate is a 10-second sliding window
+  (`HF_XET_DATA_PROGRESS_UPDATE_SPEED_SAMPLING_WINDOW`). It decays toward zero
+  whenever written bytes pause, which produced the absurd ETAs.
+- The RSS is the accepted high-performance preset above: 16 GiB base plus
+  2 GiB per file reconstruction buffer and 1 GiB minimum fetches. Because
+  `XetConfig::new` applies the preset after environment overrides,
+  `HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_*` cannot reduce it while the preset
+  is on. The supported bound is `HF_XET_HIGH_PERFORMANCE=0` (adaptive: 2 GiB
+  plus 512 MiB per file, 8 GiB cap; measured median peak RSS 3.3 GB versus
+  10.2 GB at about 10% more wall time). The default policy is unchanged by this
+  amendment.
+
+hf2q now computes rate, ETA, and state itself (`src/input/transfer_estimate.rs`)
+from written bytes: a 60-second byte-weighted window rate smoothed by a
+10-second time-constant EWMA, frozen while written bytes are idle; `estimating`
+until 10 s after the first written byte; ETAs capped at 24 hours ("more than
+24h"). After 15 s without written progress the state is `buffering` when the
+host network is receiving and `stalled` when it is not (or when no counter is
+available); stalled shows no ETA. The only received-bytes signal hf2q can reach
+is the host-wide non-loopback interface counter, shown as "host network rx" and
+never used for percentage or ETA. The foreground poller republishes at least
+once per second, the interactive row renders hf2q's status instead of
+indicatif's `{bytes_per_sec}`/`{eta}`, and plain output adds a 10-second
+heartbeat plus a line on every state change.
