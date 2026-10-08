@@ -4431,7 +4431,12 @@ impl Engine {
             kv_spill_active,
         ));
 
-        let registration = super::registry::find_for(&model_id);
+        // The GGUF architecture is authoritative; display names vary by
+        // fine-tune, so name matching is only the fallback.
+        let registration = gguf
+            .metadata_string("general.architecture")
+            .and_then(super::registry::find_for_architecture)
+            .or_else(|| super::registry::find_for(&model_id));
         if let Some(ref r) = registration {
             tracing::info!(
                 family = r.family,
@@ -5018,7 +5023,12 @@ impl Engine {
             kv_spill_active,
         ));
 
-        let registration = super::registry::find_for(&model_id);
+        // The GGUF architecture is authoritative; display names vary by
+        // fine-tune, so name matching is only the fallback.
+        let registration = gguf
+            .metadata_string("general.architecture")
+            .and_then(super::registry::find_for_architecture)
+            .or_else(|| super::registry::find_for(&model_id));
         if let Some(ref r) = registration {
             tracing::info!(
                 family = r.family,

@@ -494,6 +494,21 @@ pub fn find_for(model_id: &str) -> Option<ModelRegistration> {
     None
 }
 
+/// Resolve the registration for a loaded model from its GGUF
+/// `general.architecture`, which is authoritative. Display names vary with
+/// every fine-tune (for example "Gemma 4 26B A4B It Ara Abliterated" contains
+/// neither `gemma-4` nor `gemma4`), so name matching via [`find_for`] is only a
+/// fallback for models whose architecture is not a registered family.
+pub fn find_for_architecture(architecture: &str) -> Option<ModelRegistration> {
+    let family = match architecture {
+        "qwen35" | "qwen35moe" => "qwen35",
+        "qwen3vl" | "qwen3_vl" | "qwen3vlmoe" => "qwen3vl",
+        other => other,
+    };
+    let guard = reg().read().unwrap();
+    guard.iter().find(|r| r.family == family).cloned()
+}
+
 /// List all registered model families. Useful for `/v1/models` extension
 /// fields + debug diagnostics.
 pub fn list_families() -> Vec<String> {
@@ -4372,6 +4387,23 @@ const _COMPILE_REFERENCES: fn() -> HashMap<String, ModelRegistration> = || HashM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_resolves_from_the_gguf_architecture_not_the_display_name() {
+        // A fine-tune's display name need not contain any family substring.
+        assert!(find_for("Gemma 4 26B A4B It Ara Abliterated").is_none());
+        assert_eq!(find_for_architecture("gemma4").unwrap().family, "gemma4");
+        assert_eq!(find_for_architecture("qwen35").unwrap().family, "qwen35");
+        assert_eq!(find_for_architecture("qwen35moe").unwrap().family, "qwen35");
+        assert_eq!(
+            find_for_architecture("deepseek4").unwrap().family,
+            "deepseek4"
+        );
+        for arch in ["qwen3vl", "qwen3_vl", "qwen3vlmoe"] {
+            assert_eq!(find_for_architecture(arch).unwrap().family, "qwen3vl");
+        }
+        assert!(find_for_architecture("llama").is_none());
+    }
 
     // ---- ADR-005 iter-230 B — forced-open seeding (AC-B1/AC-B2) ----
 

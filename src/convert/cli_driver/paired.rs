@@ -14,7 +14,7 @@ use super::{
     detect_arch, run_convert_internal, ConvertArgs, ConvertError, ConvertMode, PairBinding,
 };
 use crate::convert::quant_selector::QuantSelector;
-use crate::convert::receipt::{receipt_path, ConversionReceipt, RemoteConversionSource};
+use crate::convert::receipt::{receipt_path, ConversionReceipt};
 use crate::convert::tensor_lineage::tensor_conversion_receipt_path;
 use crate::convert::HfModelSource;
 use crate::core::paired_artifact::{
@@ -26,7 +26,7 @@ use crate::models::vit::VisionConfig;
 use crate::quantize::ggml_quants::{is_vision_tensor_pattern, ArchName, GgufFtype};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectorEmitter {
+pub(super) enum ProjectorEmitter {
     NativeVit,
     GemmaMapper,
 }
@@ -101,7 +101,7 @@ pub(super) fn run(mut args: ConvertArgs) -> Result<(), ConvertError> {
     run_pair(args, projector_output)
 }
 
-fn projector_emitter(arch: ArchName) -> Result<ProjectorEmitter, ConvertError> {
+pub(super) fn projector_emitter(arch: ArchName) -> Result<ProjectorEmitter, ConvertError> {
     match arch {
         ArchName::Qwen35 | ArchName::Qwen35MoeFull | ArchName::Qwen3VlText => {
             Ok(ProjectorEmitter::NativeVit)
@@ -323,11 +323,9 @@ fn preflight_pair_plan(
     staged_text: &Path,
     destination: &Path,
 ) -> Result<(), ConvertError> {
-    let planned_projector = crate::models::vit::planned_vision_tower_output_bytes(
+    let planned_projector = super::plan_projector_output_bytes_for_source(
         &args.hf_dir,
-        args.remote_source
-            .as_ref()
-            .map(RemoteConversionSource::source_sha256),
+        args.remote_source.clone(),
         Some(generation),
     )?;
     let placeholder_projector_sha = "0".repeat(64);

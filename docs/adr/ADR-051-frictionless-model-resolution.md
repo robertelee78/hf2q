@@ -10,6 +10,10 @@
 - **Updated:** 2026-09-08 — preserve the selected text path and retained inode
   during automatic projector preparation; validation recorded in
   `../research/gemma4-chat-activation-rca-2026-09-08.md`.
+- **Updated:** 2026-10-08 — native serve-from-repo sizes projectors per family
+  and never fails on vision; tool registration follows the GGUF architecture;
+  Gemma 4 image normalization follows the projector. See the 2026-10-08
+  amendment.
 - **Date:** 2026-08-23; native-Xet transfer amendment 2026-08-26; observable
   transfer/cache-link amendment 2026-08-26; qualified-host Xet policy accepted
   2026-08-27; Git-metadata redirect and canonical Qwen admission corrections
@@ -74,6 +78,43 @@ This ADR changes that product policy without weakening ADR-047's authority
 checks.
 
 ## Decision
+
+### 2026-10-08 amendment: vision never blocks a native serve
+
+Found while serving `jenerallee78/gemma-4-26B-A4B-it-ara-abliterated` (issue
+#260). Four defects, each fixed at its source:
+
+1. **Projector sizing is family-dispatched.** The native serve planner, the
+   paired converter's preflight, and the convert-with-download planner each
+   called the Qwen-shaped native ViT sizer for every multimodal source. A Gemma
+   4 `vision_config` (no `image_size`; a fixed learned position table, so it must
+   not be derived from `position_embedding_size`) aborted the load before the
+   family converter ran. All three now share
+   `convert::cli_driver::plan_projector_output_bytes`, which dispatches on the
+   same mapping as the paired converter: the ViT sizer for Qwen, a dry run of
+   the Gemma mapper for Gemma 4.
+2. **Vision degrades instead of failing.** A projector that cannot be planned
+   yields a text-only product plan, and a paired native conversion that fails is
+   retried without the projector. Both paths MUST add a visible "serving
+   text-only" warning; they MUST NOT fail the text load.
+3. **Tool registration follows the GGUF architecture.** The engine resolves its
+   per-family registration from `general.architecture`, falling back to display
+   name matching. Fine-tune names (for example "Gemma 4 26B A4B It Ara
+   Abliterated") need not contain a family substring, and the old name-only
+   lookup refused every tools request for them.
+4. **Gemma 4 image normalization follows the projector.** `preprocess_gemma4v`
+   hard-coded `4x − 3`, which assumes `image_mean = image_std = 0.5`. hf2q's
+   converter writes mean 0 / std 1, so dark channels reached the vision tower at
+   −3 instead of −1 (a solid blue image read as white; in thinking mode the
+   image read as text). Pixels now map `2·((x − mean)/std) − 1` from the loaded
+   projector, matching the reference's normalize step plus the gemma4v
+   `(2, −1)` scale-bias, and still yield `4x − 3` for older 0.5/0.5 files.
+
+Validated end to end on the release build: conversion to Q8_0 plus projector,
+text, a native tool call, eight solid colors (including back-to-back requests
+and thinking mode), a split-color image and a four-corner-dots image matching
+llama.cpp on the same GGUF and projector, and a real OpenCode session that ran
+its `read` tool.
 
 ### 2026-09-08 amendment: projector discovery preserves text activation authority
 

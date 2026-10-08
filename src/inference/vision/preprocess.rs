@@ -214,6 +214,24 @@ pub struct Gemma4vPreprocessConfig {
     /// images are downscaled (preserving aspect ratio) until the
     /// post-pool grid fits.
     pub token_max: u32,
+    /// Per-channel normalization from the projector's
+    /// `clip.vision.image_mean` / `clip.vision.image_std`. Pixels are mapped
+    /// `x ∈ [0, 1] → 2·((x − mean)/std) − 1`, the reference's normalize step
+    /// followed by the gemma4v graph's `(2, −1)` scale-bias. hf2q's converter
+    /// writes mean 0 / std 1 (→ `2x − 1`, range [−1, +1]); an older projector
+    /// carrying mean = std = 0.5 yields the historical `4x − 3`.
+    pub mean: [f32; 3],
+    /// See [`Gemma4vPreprocessConfig::mean`].
+    pub std: [f32; 3],
+}
+
+impl Gemma4vPreprocessConfig {
+    /// Use the normalization recorded in the loaded projector.
+    pub fn with_normalization(mut self, mean: [f32; 3], std: [f32; 3]) -> Self {
+        self.mean = mean;
+        self.std = std;
+        self
+    }
 }
 
 /// Default gemma4v config — locked to the peer's reference values so
@@ -223,6 +241,8 @@ pub const GEMMA4V_PREPROCESS_DEFAULT: Gemma4vPreprocessConfig = Gemma4vPreproces
     n_merge: 3,
     token_min: 252,
     token_max: 280,
+    mean: [0.0, 0.0, 0.0],
+    std: [1.0, 1.0, 1.0],
 };
 
 /// Output of `preprocess_gemma4v` — a variable-resolution patch tensor
@@ -306,6 +326,18 @@ pub fn preprocess_gemma4v(
     }
     if cfg.n_merge == 0 {
         return Err(anyhow!("gemma4v: n_merge must be > 0"));
+    }
+    if cfg
+        .std
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+        || cfg.mean.iter().any(|value| !value.is_finite())
+    {
+        return Err(anyhow!(
+            "gemma4v: projector image_mean/image_std must be finite with std > 0 (got mean {:?}, std {:?})",
+            cfg.mean,
+            cfg.std
+        ));
     }
     if cfg.token_max == 0 {
         return Err(anyhow!("gemma4v: token_max must be > 0"));
@@ -405,11 +437,11 @@ pub fn preprocess_gemma4v(
                     #[allow(clippy::erasing_op, clippy::identity_op)]
                     {
                         patches[row_base + 0 * p2 + pos_in_plane] =
-                            (pix[0] as f32 / 255.0) * 4.0 - 3.0;
+                            2.0 * ((pix[0] as f32 / 255.0 - cfg.mean[0]) / cfg.std[0]) - 1.0;
                         patches[row_base + 1 * p2 + pos_in_plane] =
-                            (pix[1] as f32 / 255.0) * 4.0 - 3.0;
+                            2.0 * ((pix[1] as f32 / 255.0 - cfg.mean[1]) / cfg.std[1]) - 1.0;
                         patches[row_base + 2 * p2 + pos_in_plane] =
-                            (pix[2] as f32 / 255.0) * 4.0 - 3.0;
+                            2.0 * ((pix[2] as f32 / 255.0 - cfg.mean[2]) / cfg.std[2]) - 1.0;
                     }
                 }
             }
@@ -1304,13 +1336,12 @@ mod tests {
     }
 
     #[test]
-    fn gemma4v_preprocess_pixel_scaling_4x_minus_3() {
-        // ADR-005 Phase 2c iter-125 (W56): expected values updated from the
-        // old single-step `2x − 1` algebra (which produced range [-1, +1])
-        // to the peer's byte-faithful two-step chain folded as `4x − 3`
-        // (range [-3, +1]). Solid black (0) → 4*0 - 3 = -3.0. Solid white
-        // (255) → 4*1 - 3 = +1.0. Mid-gray (128) → 4*(128/255) - 3 ≈ -0.992.
-        for (rgb, expect) in [([0u8, 0, 0], -3.0_f32), ([255, 255, 255], 1.0)] {
+    fn gemma4v_preprocess_pixel_scaling_follows_projector_normalization() {
+        // With the projector's mean 0 / std 1 (hf2q's converter and the
+        // current reference), pixels map `2x − 1`: black → -1, white → +1.
+        // The old hard-coded `4x − 3` assumed mean = std = 0.5 and pushed dark
+        // channels to -3, outside the range the vision tower was trained on.
+        for (rgb, expect) in [([0u8, 0, 0], -1.0_f32), ([255, 255, 255], 1.0)] {
             let png = encode_solid_png(256, 256, rgb);
             let out = preprocess_gemma4v(&png, &GEMMA4V_PREPROCESS_DEFAULT).unwrap();
             // Spot-check a handful of positions across the patch tensor.
@@ -1325,12 +1356,11 @@ mod tests {
                 );
             }
         }
-        // Mid-gray center: 4 * (128/255) - 3 = 0.5098... - 2.0 - ... actually
-        // 128/255 ≈ 0.50196, *4 = 2.00784, -3 = -0.99216.
+        // Mid-gray center: 2 * (128/255) - 1 ≈ 0.00392.
         let png_mid = encode_solid_png(256, 256, [128, 128, 128]);
         let out_mid = preprocess_gemma4v(&png_mid, &GEMMA4V_PREPROCESS_DEFAULT).unwrap();
         let v = out_mid.patches[0];
-        let expect_mid = (128.0_f32 / 255.0) * 4.0 - 3.0; // ≈ -0.99216
+        let expect_mid = (128.0_f32 / 255.0) * 2.0 - 1.0; // mean 0 / std 1 ⇒ 2x − 1
         assert!(
             (v - expect_mid).abs() < 1e-3,
             "mid-gray got {v}, expected ≈ {expect_mid}"
@@ -1338,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn gemma4v_preprocess_pixel_range_in_minus_three_plus_one() {
+    fn gemma4v_preprocess_pixel_range_in_minus_one_plus_one() {
         // ADR-005 Phase 2c iter-125 (W56): expected range updated from
         // [-1, +1] (old one-step `2x − 1`) to [-3, +1] (the peer's
         // byte-faithful
@@ -1358,9 +1388,39 @@ mod tests {
         let max_v = out.patches.iter().cloned().fold(f32::MIN, f32::max);
         let min_v = out.patches.iter().cloned().fold(f32::MAX, f32::min);
         assert!(
-            min_v >= -3.0 - 1e-6 && max_v <= 1.0 + 1e-6,
+            min_v >= -1.0 - 1e-6 && max_v <= 1.0 + 1e-6,
             "range out of bounds: [{min_v}, {max_v}]"
         );
+    }
+
+    #[test]
+    fn gemma4v_normalization_follows_the_projector_mean_and_std() {
+        // hf2q's converter (and the current reference) write mean 0 / std 1:
+        // the vision tower must see [-1, +1]. A blue pixel's dark channels
+        // must land at -1, not -3 (the bug that made blue read as white).
+        let png = encode_solid_png(256, 256, [0, 0, 255]);
+        let out = preprocess_gemma4v(&png, &GEMMA4V_PREPROCESS_DEFAULT).unwrap();
+        let p2 = (GEMMA4V_PREPROCESS_DEFAULT.patch_size * GEMMA4V_PREPROCESS_DEFAULT.patch_size)
+            as usize;
+        assert!((out.patches[0] - -1.0).abs() < 1e-6, "red channel");
+        assert!((out.patches[p2] - -1.0).abs() < 1e-6, "green channel");
+        assert!((out.patches[2 * p2] - 1.0).abs() < 1e-6, "blue channel");
+
+        // A projector carrying mean = std = 0.5 reproduces the historical
+        // `4x - 3` mapping exactly.
+        let legacy = GEMMA4V_PREPROCESS_DEFAULT
+            .clone()
+            .with_normalization([0.5; 3], [0.5; 3]);
+        let png_mid = encode_solid_png(256, 256, [128, 128, 128]);
+        let out_legacy = preprocess_gemma4v(&png_mid, &legacy).unwrap();
+        let expect = (128.0_f32 / 255.0) * 4.0 - 3.0;
+        assert!((out_legacy.patches[0] - expect).abs() < 1e-5);
+
+        // Invalid normalization fails closed instead of producing NaNs.
+        let bad = GEMMA4V_PREPROCESS_DEFAULT
+            .clone()
+            .with_normalization([0.0; 3], [0.0; 3]);
+        assert!(preprocess_gemma4v(&png_mid, &bad).is_err());
     }
 
     #[test]
@@ -1551,6 +1611,7 @@ mod tests {
             n_merge: 3,
             token_min: 300,
             token_max: 100,
+            ..GEMMA4V_PREPROCESS_DEFAULT
         };
         let err = preprocess_gemma4v(&png, &cfg).unwrap_err();
         assert!(format!("{err}").contains("token_min"));
