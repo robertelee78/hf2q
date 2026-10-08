@@ -17,7 +17,7 @@ settings and expectations whatever model family it serves (Qwen3.5/3.6/3.8,
 Gemma 4, DeepSeek-V4), and its default is functional, never a broken mode.
 
 A read-only audit of main @ be17e2fe (issue #278) and hands-on QE of
-Gemma 4 GCD found that the user experience depended on the family, on whether
+Gemma 4 found that the user experience depended on the family, on whether
 `hf2q setup` had run, and on the scheduler:
 
 - A serve with no flags and no `config.toml` ran `fifo-serial`, whose
@@ -32,7 +32,8 @@ Gemma 4 GCD found that the user experience depended on the family, on whether
   variables. The default port was 8080, 8081, or 8082 depending on the path.
 - Client mistakes and unservable requests surfaced as 500/501 on some
   families and 400 on others (DeepSeek-V4 embeddings always 500; per-family
-  prompt caps as 501; #256 `--gcd-schema` at `max_tokens` as 500; a Qwen
+  prompt caps as 501; a JSON-schema response cut by `max_tokens` as 500
+  (#256); a Qwen
   `tool_choice=required` under `fifo-serial` as a 400 about a field the client
   never sent).
 - `--max-slots` above 8 aborted startup unless an environment variable lifted
@@ -105,18 +106,12 @@ Raising the bound requires a hands-on qualification at the new width. Docs and
   including Gemma 4. The tool-thinking budget has one meaning on every family.
 - Server defaults MUST never cause a 4xx; on `fifo-serial` only an explicit
   client budget is rejected, identically on every family.
-- Under `--gcd`, a request asking for thinking MUST be rejected with 400; the
-  resolved thinking setting is always written into the template inputs.
 
 ### Verification
 Each decision is verified by hand on Qwen3.8, DeepSeek-V4, and Gemma 4 through
 the HTTP API, `hf2q chat`, and OpenCode, and recorded in `docs/qe/`. No new
 unit tests, CI jobs, or release gates are added (owner direction 2026-10-08);
 existing tests are updated only where a change breaks them.
-
-### Out of scope
-#255 (`--gcd` with tools under `auto`), #276 (GLP), and #277 (KV grafts) are
-tracked separately on the v0.1.24 milestone.
 
 ## Consequences
 
@@ -132,7 +127,7 @@ tracked separately on the v0.1.24 milestone.
 - Operators lose persistent `config.toml` overrides for the three retired
   keys (CLI flags remain).
 - Some previously accepted requests now get a 400 (contradictory reasoning
-  controls, thinking requests under `--gcd`, reasoning on non-thinking
+  controls, reasoning on non-thinking
   templates), matching OpenAI behavior.
 - DeepSeek-V4's cold required-tool latency must be re-checked against
   ADR-042's 60-second ceiling with the 512-token budget.
@@ -151,10 +146,10 @@ tracked separately on the v0.1.24 milestone.
 - ADR-042 (DeepSeek-V4): recovery-anchor persistence, reasoning tiers,
   retired 8-token tool budget.
 - ADR-044 (Qwen speculation and budgets): shared enforcer, fifo-serial rule.
-- ADR-052 §5 and ADR-057: `length` finish for budget-exhausted grammars.
+- ADR-052 §5: `length` finish for budget-exhausted grammars.
 - ADR-027 and ADR-017: encoder session default, per-family persistence status.
 
 ## Links
 - Issue #278 (consistency audit), #256, milestone v0.1.24
 - ADR-005 (API contract, historical), ADR-017, ADR-027, ADR-040, ADR-042,
-  ADR-044, ADR-045, ADR-050, ADR-052, ADR-057, ADR-061
+  ADR-044, ADR-045, ADR-050, ADR-052, ADR-061
