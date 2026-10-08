@@ -502,6 +502,7 @@ pub fn find_for(model_id: &str) -> Option<ModelRegistration> {
 pub fn find_for_architecture(architecture: &str) -> Option<ModelRegistration> {
     let family = match architecture {
         "qwen35" | "qwen35moe" => "qwen35",
+        "qwen3vl" | "qwen3_vl" | "qwen3vlmoe" => "qwen3vl",
         other => other,
     };
     let guard = reg().read().unwrap();
@@ -4398,6 +4399,9 @@ mod tests {
             find_for_architecture("deepseek4").unwrap().family,
             "deepseek4"
         );
+        for arch in ["qwen3vl", "qwen3_vl", "qwen3vlmoe"] {
+            assert_eq!(find_for_architecture(arch).unwrap().family, "qwen3vl");
+        }
         assert!(find_for_architecture("llama").is_none());
     }
 
