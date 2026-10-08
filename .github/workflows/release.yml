@@ -202,10 +202,12 @@ jobs:
             bash scripts/test_r2c_structured_output_receipt_contract.sh
             bash scripts/test_cache_lifecycle_evidence_contract.sh
             bash scripts/test_frictionless_diagnostics_contract.sh
-            bash scripts/test_release_dependency_provenance_contract.sh
+            # test_release_dependency_provenance_contract.sh and
+            # test_standalone_release_signing_contract.sh assert workflow
+            # wiring under .github/, which the published crate excludes; CI
+            # runs both from the full checkout on every push.
             HF2Q_BIN="$package_root/target/debug/hf2q" \
               scripts/test_standalone_installer.sh
-            scripts/test_standalone_release_signing_contract.sh
           )
           install_root="$RUNNER_TEMP/hf2q-install"
           cargo install \
