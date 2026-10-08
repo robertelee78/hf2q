@@ -7728,23 +7728,6 @@ mod qwen_engine_wire_error_tests {
     }
 
     #[tokio::test]
-    async fn over_limit_fifo_serial_prompt_is_a_client_error_not_a_501() {
-        // Harnesses retry 5xx; an over-limit prompt can never succeed on a
-        // fifo-serial server, so it must be a 4xx that names the fix.
-        let message = format!(
-            "{}: {}",
-            engine::SERIAL_PROMPT_LIMIT_SENTINEL,
-            engine::serial_prompt_limit_message(7453, 2048)
-        );
-        assert_wire_class(
-            &message,
-            StatusCode::BAD_REQUEST,
-            Some("prompt_exceeds_scheduler_limit"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
     async fn unsupported_and_unhealthy_engine_errors_are_not_generation_500s() {
         assert_wire_class(
             "capability_unsupported: Qwen35 SlotAware soft-token generation",

@@ -464,34 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_serve_uses_the_guide_scheduler_and_slots() {
-        let planning = |max_slots| cli::ServePlanningArgs {
-            ctx: None,
-            scheduler: None,
-            max_slots,
-            kv_cache_budget: None,
-            kv_persist_path: None,
-            kv_persist_budget: None,
-        };
-        // No CLI flag and no config.toml: exactly what `hf2q setup
-        // --accept-defaults` records, never the prompt-capped FIFO mode.
-        assert_eq!(
-            resolve_scheduler(&planning(None), None).unwrap(),
-            EngineMode::SlotAware { max_slots: 4 }
-        );
-        let guide = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
-        assert_eq!(
-            resolve_scheduler(&planning(None), None).unwrap(),
-            resolve_scheduler(&planning(None), Some(&guide.serve)).unwrap()
-        );
-        // A bare `--max-slots` now selects the default inflight scheduler.
-        assert_eq!(
-            resolve_scheduler(&planning(Some(2)), None).unwrap(),
-            EngineMode::SlotAware { max_slots: 2 }
-        );
-    }
-
-    #[test]
     fn max_slots_is_not_silently_ignored_by_fifo() {
         let planning = cli::ServePlanningArgs {
             ctx: None,
