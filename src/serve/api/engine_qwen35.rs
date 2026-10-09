@@ -41,6 +41,7 @@ use super::engine::{
     LoadOptions, SamplingParams, SerialStreamEnd, SerialStreamResult, SoftTokenData,
     TokenLogprobRecord, ToolCallPolicy,
 };
+use super::engine_error::EngineRequestError;
 use super::engine_supervisor::EngineSupervisor;
 
 const QWEN35_WORKER_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -3178,17 +3179,22 @@ pub fn generate_qwen35_once_slot_aware(
     // is `prompt_len + max_tokens + 64`.
     let need_seq = prompt_len + max_tokens + 64;
     if need_seq > kv_cache.max_seq_len as usize {
-        return Err(anyhow::anyhow!(
-            "generate_qwen35_once_slot_aware: per-request need_seq={} exceeds \
-             persistent cache max_seq_len={} (slot={} prompt_len={} max_tokens={}). \
-             ADR-040 iter-C2d-cont-kernel iter-1 sizes the persistent cache to \
-             cfg.max_position_embeddings; reduce max_tokens or use a shorter prompt.",
+        // ADR-062 D2: a context overflow is the typed 400
+        // `context_length_exceeded` (the OpenCode compaction code), not a
+        // generic 500.
+        return Err(EngineRequestError::context_overflow(
+            kv_cache.max_seq_len as usize,
             need_seq,
-            kv_cache.max_seq_len,
-            slot_id.0,
-            prompt_len,
-            max_tokens
-        ));
+            format!(
+                "generate_qwen35_once_slot_aware: per-request need_seq={need_seq} exceeds \
+                 persistent cache max_seq_len={} (slot={} prompt_len={prompt_len} \
+                 max_tokens={max_tokens}). ADR-040 iter-C2d-cont-kernel iter-1 sizes the \
+                 persistent cache to cfg.max_position_embeddings; reduce max_tokens or \
+                 use a shorter prompt.",
+                kv_cache.max_seq_len, slot_id.0
+            ),
+        )
+        .into_anyhow());
     }
 
     let is_greedy = is_greedy_eligible(params);
@@ -6206,8 +6212,10 @@ impl Qwen35DecodeState {
 /// # Errors emitted on the SSE channel
 /// - `slot_id.0 >= kv_cache.n_seqs` → `Error("capability_unsupported:
 ///   ADR-040 iter-C2d-cont-kernel iter-2 — SlotOutOfRange ...")`.
-/// - `need_seq > kv_cache.max_seq_len` → `Error("capability_unsupported:
-///   ADR-040 iter-C2d-cont-kernel iter-2 — per-request need_seq ...")`.
+/// - `need_seq > kv_cache.max_seq_len` → `Error("context overflow: ADR-040
+///   iter-C2d-cont-kernel iter-2 — per-request need_seq ...")` (ADR-062 D2:
+///   the admission-time check is the typed 400 `context_length_exceeded`
+///   before SSE; this in-loop event is defense-in-depth).
 /// - `has_extension == true` → `Error("capability_unsupported:
 ///   ADR-040 iter-C2d-cont-kernel iter-2 — vision-augmented streaming
 ///   slot-aware port is iter-C2d-cont-kernel-iter-4 ...")`.
@@ -6290,13 +6298,19 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
     let max_tokens = params.max_tokens.max(1);
     let need_seq = prompt_len + max_tokens + 64;
     if need_seq > kv_cache.max_seq_len as usize {
+        // ADR-062 D2: a context overflow is a length rejection (400
+        // `context_length_exceeded`, enforced typed at admission before
+        // SSE), never a `capability_unsupported` 501. This in-loop check is
+        // defense-in-depth for an admission that already validated the
+        // same bound; it terminates the stream with the engine detail.
         send!(GenerationEvent::Error(format!(
-            "capability_unsupported: ADR-040 iter-C2d-cont-kernel iter-2 — \
-             per-request need_seq={} exceeds persistent cache \
-             max_seq_len={} (slot={} prompt_len={} max_tokens={}). \
-             Persistent cache is sized to cfg.max_position_embeddings; \
-             reduce max_tokens or use a shorter prompt.",
-            need_seq, kv_cache.max_seq_len, slot_id.0, prompt_len, max_tokens
+            "context overflow: ADR-040 iter-C2d-cont-kernel iter-2 — \
+             per-request need_seq={need_seq} exceeds persistent cache \
+             max_seq_len={} (slot={} prompt_len={prompt_len} \
+             max_tokens={max_tokens}). Persistent cache is sized to \
+             cfg.max_position_embeddings; reduce max_tokens or use a \
+             shorter prompt.",
+            kv_cache.max_seq_len, slot_id.0
         )));
         return;
     }
@@ -8894,16 +8908,20 @@ pub fn embed_qwen35_slot_aware(
     // used by the non-slot-aware `embed_qwen35` path.
     let need_seq = prompt_len + 64;
     if need_seq > kv_cache.max_seq_len as usize {
-        return Err(anyhow::anyhow!(
-            "embed_qwen35_slot_aware: per-request need_seq={} exceeds \
-             persistent cache max_seq_len={} (slot={} prompt_len={}). \
-             ADR-040 iter-C2d-cont-kernel iter-3 sizes the persistent \
-             cache to cfg.max_position_embeddings; use a shorter prompt.",
+        // ADR-062 D2: a capacity rejection is the typed 400
+        // `context_length_exceeded`, not a generic 500.
+        return Err(EngineRequestError::context_overflow(
+            kv_cache.max_seq_len as usize,
             need_seq,
-            kv_cache.max_seq_len,
-            slot_id.0,
-            prompt_len
-        ));
+            format!(
+                "embed_qwen35_slot_aware: per-request need_seq={need_seq} exceeds \
+                 persistent cache max_seq_len={} (slot={} prompt_len={prompt_len}). \
+                 ADR-040 iter-C2d-cont-kernel iter-3 sizes the persistent cache to \
+                 cfg.max_position_embeddings; use a shorter prompt.",
+                kv_cache.max_seq_len, slot_id.0
+            ),
+        )
+        .into_anyhow());
     }
 
     // Per-slot reset at entry — the persistent cache may carry stale
@@ -9085,18 +9103,21 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
     // is `prompt_len + max_tokens + 64`. Same shape as iter-1.
     let need_seq = prompt_len + max_tokens + 64;
     if need_seq > kv_cache.max_seq_len as usize {
-        return Err(anyhow::anyhow!(
-            "generate_qwen35_once_with_soft_tokens_slot_aware: per-request \
-             need_seq={} exceeds persistent cache max_seq_len={} (slot={} \
-             prompt_len={} max_tokens={}). ADR-040 iter-C2d-cont-kernel iter-4 \
-             sizes the persistent cache to cfg.max_position_embeddings; reduce \
-             max_tokens or use a shorter prompt.",
+        // ADR-062 D2: a context overflow is the typed 400
+        // `context_length_exceeded`, not a generic 500.
+        return Err(EngineRequestError::context_overflow(
+            kv_cache.max_seq_len as usize,
             need_seq,
-            kv_cache.max_seq_len,
-            slot_id.0,
-            prompt_len,
-            max_tokens
-        ));
+            format!(
+                "generate_qwen35_once_with_soft_tokens_slot_aware: per-request \
+                 need_seq={need_seq} exceeds persistent cache max_seq_len={} (slot={} \
+                 prompt_len={prompt_len} max_tokens={max_tokens}). ADR-040 \
+                 iter-C2d-cont-kernel iter-4 sizes the persistent cache to \
+                 cfg.max_position_embeddings; reduce max_tokens or use a shorter prompt.",
+                kv_cache.max_seq_len, slot_id.0
+            ),
+        )
+        .into_anyhow());
     }
 
     let is_greedy = is_greedy_eligible(params);
@@ -9405,19 +9426,21 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
     let max_tokens = params.max_tokens.max(1);
     let need_seq = prompt_len + max_tokens + 64;
     if need_seq > kv_cache.max_seq_len as usize {
-        return Err(anyhow::anyhow!(
-            "generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware: \
-             per-request need_seq={} exceeds persistent cache max_seq_len={} \
-             (slot={} prompt_len={} max_tokens={}). ADR-040 iter-C2d-cont-\
-             kernel iter-4 sizes the persistent cache to \
-             cfg.max_position_embeddings; reduce max_tokens or use a shorter \
-             prompt.",
+        // ADR-062 D2: a context overflow is the typed 400
+        // `context_length_exceeded`, not a generic 500.
+        return Err(EngineRequestError::context_overflow(
+            kv_cache.max_seq_len as usize,
             need_seq,
-            kv_cache.max_seq_len,
-            slot_id.0,
-            prompt_len,
-            max_tokens
-        ));
+            format!(
+                "generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware: \
+                 per-request need_seq={need_seq} exceeds persistent cache max_seq_len={} \
+                 (slot={} prompt_len={prompt_len} max_tokens={max_tokens}). ADR-040 \
+                 iter-C2d-cont-kernel iter-4 sizes the persistent cache to \
+                 cfg.max_position_embeddings; reduce max_tokens or use a shorter prompt.",
+                kv_cache.max_seq_len, slot_id.0
+            ),
+        )
+        .into_anyhow());
     }
 
     let is_greedy = is_greedy_eligible(params);

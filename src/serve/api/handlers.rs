@@ -28,6 +28,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::engine::{self, Engine, SamplingParams};
+use super::engine_error::EngineRequestError;
 use super::grammar;
 use super::lifecycle::ModelLease;
 #[cfg(test)]
@@ -669,7 +670,7 @@ async fn chat_completions_with_prepared(
             // surfaced with iter-10a's multimodal failure ("forward
             // step 0 (multimodal)" hid the real underlying error).
             let msg = format!("{e:#}");
-            if let Some(response) = common_engine_error_response(Some(&state), &msg) {
+            if let Some(response) = common_engine_error_response(Some(&state), &e) {
                 return response;
             }
             // ADR-005 Phase 4 reopen iter-215 Wedge-2: Qwen3.5/3.6 SERVE-side
@@ -2893,7 +2894,7 @@ async fn chat_completions_stream(
         .await
     {
         let msg = format!("{e:#}");
-        if let Some(response) = common_engine_error_response(Some(&state), &msg) {
+        if let Some(response) = common_engine_error_response(Some(&state), &e) {
             return response;
         }
         tracing::error!(error = %msg, "chat_completions_stream enqueue failed");
@@ -7680,14 +7681,60 @@ fn parse_slot_budget_exceeded(msg: &str) -> (u64, u64) {
     )
 }
 
-/// Map the engine's stable typed prefixes to their OpenAI wire classes.
+/// Map a typed [`EngineRequestError`] classification to the `ApiError`
+/// catalog (ADR-062 D2). The engine attaches the classification as the
+/// root cause of the `anyhow::Error` it delivers here; classification is
+/// by type, never by substring sentinel.
+fn engine_request_error_response(error: &EngineRequestError) -> super::schema::ApiError {
+    match error {
+        EngineRequestError::PromptTooLong {
+            prompt_tokens,
+            limit,
+        } => super::schema::ApiError::prompt_exceeds_server_limit(
+            engine::serial_prompt_limit_message(*prompt_tokens, *limit),
+        ),
+        EngineRequestError::ContextOverflow {
+            context_limit,
+            needed,
+            ..
+        } => super::schema::ApiError::context_length_exceeded(*context_limit, *needed),
+        EngineRequestError::EmbeddingsUnsupported { family } => {
+            super::schema::ApiError::embeddings_unsupported(family)
+        }
+        EngineRequestError::UnsupportedCapability { .. } => {
+            super::schema::ApiError::capability_unsupported_message(error.to_string())
+        }
+        EngineRequestError::InvalidRequest { .. } => {
+            super::schema::ApiError::invalid_request(error.to_string(), None)
+        }
+    }
+}
+
+/// Map the engine's request rejections to their OpenAI wire classes.
 ///
 /// Both unary generation and pre-SSE admission pass through this helper so
 /// an engine-boundary validation failure cannot silently drift from 400 to
 /// 500 depending on `stream`. Runtime faults intentionally return `None` and
 /// remain `generation_error` at the caller.
-fn common_engine_error_response(state: Option<&AppState>, msg: &str) -> Option<Response> {
+///
+/// ADR-062 D2: the engine's typed classification (`EngineRequestError`,
+/// carried as the `anyhow` root cause) is mapped first; the substring
+/// sentinels below are the interim fallback for engine paths not yet
+/// converted (invariant-violation defense labels, admission 429/400
+/// sentinels, and the engine health codes), and they keep their existing
+/// wire classes.
+fn common_engine_error_response(
+    state: Option<&AppState>,
+    error: &anyhow::Error,
+) -> Option<Response> {
     use std::sync::atomic::Ordering;
+
+    for cause in error.chain() {
+        if let Some(typed) = cause.downcast_ref::<EngineRequestError>() {
+            return Some(engine_request_error_response(typed).into_response());
+        }
+    }
+    let msg = format!("{error:#}");
 
     if msg.contains("queue_full") {
         if let Some(state) = state {
@@ -7706,11 +7753,11 @@ fn common_engine_error_response(state: Option<&AppState>, msg: &str) -> Option<R
     // documents precedence). The numeric extractor is shared — both
     // Display shapes carry needed_bytes=/budget_bytes= pairs.
     if msg.contains("kv_budget_unsatisfiable") {
-        let (needed, budget) = parse_slot_budget_exceeded(msg);
+        let (needed, budget) = parse_slot_budget_exceeded(&msg);
         return Some(ApiError::kv_budget_unsatisfiable(needed, budget).into_response());
     }
     if msg.contains("slot_budget_exceeded") {
-        let (needed, budget) = parse_slot_budget_exceeded(msg);
+        let (needed, budget) = parse_slot_budget_exceeded(&msg);
         return Some(ApiError::slot_budget_exceeded(needed, budget).into_response());
     }
     if msg.contains(engine::ENGINE_FAILED_SENTINEL) {
@@ -7726,7 +7773,7 @@ fn common_engine_error_response(state: Option<&AppState>, msg: &str) -> Option<R
         return Some(ApiError::prompt_exceeds_server_limit(detail.to_string()).into_response());
     }
     if msg.contains("capability_unsupported:") {
-        return Some(ApiError::capability_unsupported(msg).into_response());
+        return Some(ApiError::capability_unsupported(&msg).into_response());
     }
     None
 }
@@ -7739,7 +7786,11 @@ mod qwen_engine_wire_error_tests {
 
     async fn assert_wire_class(message: &str, status: StatusCode, code: Option<&str>) {
         let state = AppState::new(ServerConfig::default());
-        let response = common_engine_error_response(Some(&state), message)
+        // ADR-062 D2: the classifier takes the `anyhow::Error` (typed root
+        // first, then the interim substring fallback). These fixtures pin
+        // the fallback path with a plain sentinel-prefixed string error.
+        let error = anyhow::anyhow!(message.to_owned());
+        let response = common_engine_error_response(Some(&state), &error)
             .expect("stable engine prefix must have an HTTP mapping");
         assert_eq!(response.status(), status);
         let body = to_bytes(response.into_body(), usize::MAX)
@@ -7780,7 +7831,11 @@ mod qwen_engine_wire_error_tests {
         )
         .await;
         let state = AppState::new(ServerConfig::default());
-        assert!(common_engine_error_response(Some(&state), "ordinary graph error").is_none());
+        assert!(common_engine_error_response(
+            Some(&state),
+            &anyhow::anyhow!("ordinary graph error")
+        )
+        .is_none());
     }
 }
 
@@ -8257,7 +8312,7 @@ async fn chat_model_embeddings(
             Ok(v) => v,
             Err(e) => {
                 let msg = format!("{e:#}");
-                if let Some(response) = common_engine_error_response(None, &msg) {
+                if let Some(response) = common_engine_error_response(None, &e) {
                     return response;
                 }
                 // Iter-215 Wedge-2: Qwen3.5/3.6 embed sentinel → 501.
@@ -11150,7 +11205,7 @@ mod readiness_guard_tests {
             "{message}"
         );
         let state = AppState::new(ServerConfig::default());
-        let response = common_engine_error_response(Some(&state), &message)
+        let response = common_engine_error_response(Some(&state), &error)
             .expect("engine_failed has an HTTP mapping");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json_body(response).await["error"]["code"], "engine_failed");

@@ -32,7 +32,7 @@ family's graph, cache, or scheduler contract by approximation.
 | Qwen3.8-27B (`qwen35`) | Supported; an ordinary conversion of a multimodal source automatically publishes the bound text GGUF and F16 projector pair | The Qwen35 surface above, including the qualified SlotAware paired-vision, exact-speculation, and long-context decode paths | `hf2q generate` is text-only; paired vision uses `hf2q serve --mmproj` through `scripts/serve_qwen38_opencode.sh`. The text and projector provenance/digests must match. |
 | Legacy Qwen 3 MoE (`qwen3moe`) | Supported | None | Conversion-only. It is not silently routed through the `qwen35moe` runtime. |
 | Standalone Qwen3-VL dense (`qwen3vl` / `qwen3_vl`) | Supported | None | CLI generation and server startup fail closed before loading weights pending the ADR-041 engine seam. Qwen3-VL MoE conversion/runtime is unsupported. This is distinct from the qualified Qwen3.8 text/projector pair. |
-| DeepSeek-V4 (`deepseek4`) | Supported | CLI generation and OpenAI-compatible chat, SSE, tools, embeddings, and retained-prefix reuse | Uses the DeepSeek-V4 graph and compressed-cache contract only. |
+| DeepSeek-V4 (`deepseek4`) | Supported | CLI generation and OpenAI-compatible chat, SSE, tools, and retained-prefix reuse | Uses the DeepSeek-V4 graph and compressed-cache contract only. No embedding path: `/v1/embeddings` against a DeepSeek-V4 serve returns 400 `embeddings_unsupported` (ADR-062 D2) until an embedding path lands. |
 | BERT / Nomic-BERT (`bert`, `nomic-bert`) | Supported | OpenAI-compatible `/v1/embeddings` when loaded with `--embedding-model` | Embeddings-only; no chat generation. |
 | Llama 3 / MiniMax M2.7 (`llama`, `minimax_m2`) | Supported | None | Conversion-only; no native generation or serving graph. |
 

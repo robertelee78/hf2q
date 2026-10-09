@@ -37,6 +37,7 @@ use crate::serve::load_info::{
 
 use self::progress::RequestProgress;
 use super::engine::LoadOptions;
+use super::engine_error::EngineRequestError;
 use super::engine_supervisor::EngineSupervisor;
 
 const INITIAL_CACHE_LENGTH: usize = 131_072;
@@ -1056,12 +1057,20 @@ impl Deepseek4LoadedModel {
             prompt_tokens.len() >= self.model.cfg.sliding_window as usize,
             "DeepSeek-V4 resumable prefill requires at least one native window"
         );
-        anyhow::ensure!(
-            prompt_tokens.len() <= self.context_limit(),
-            "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
-            prompt_tokens.len(),
-            self.context_limit()
-        );
+        if prompt_tokens.len() > self.context_limit() {
+            // ADR-062 D2: a prompt over the serving context is the typed 400
+            // `context_length_exceeded`, not a generic 500.
+            return Err(EngineRequestError::context_overflow(
+                self.context_limit(),
+                prompt_tokens.len(),
+                format!(
+                    "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
+                    prompt_tokens.len(),
+                    self.context_limit()
+                ),
+            )
+            .into_anyhow());
+        }
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
         progress.cache_reset_diagnostic(
@@ -1100,12 +1109,20 @@ impl Deepseek4LoadedModel {
         progress: &mut RequestProgress,
     ) -> Result<Deepseek4ResumablePrefill> {
         anyhow::ensure!(!prompt_tokens.is_empty(), "DeepSeek-V4 prompt is empty");
-        anyhow::ensure!(
-            prompt_tokens.len() <= self.context_limit(),
-            "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
-            prompt_tokens.len(),
-            self.context_limit()
-        );
+        if prompt_tokens.len() > self.context_limit() {
+            // ADR-062 D2: a prompt over the serving context is the typed 400
+            // `context_length_exceeded`, not a generic 500.
+            return Err(EngineRequestError::context_overflow(
+                self.context_limit(),
+                prompt_tokens.len(),
+                format!(
+                    "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
+                    prompt_tokens.len(),
+                    self.context_limit()
+                ),
+            )
+            .into_anyhow());
+        }
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
         let cache_poisoned = self.cache.is_poisoned();
@@ -1373,12 +1390,20 @@ impl Deepseek4LoadedModel {
         supervisor: &EngineSupervisor,
     ) -> Result<(MlxBuffer, usize)> {
         anyhow::ensure!(!prompt_tokens.is_empty(), "DeepSeek-V4 prompt is empty");
-        anyhow::ensure!(
-            prompt_tokens.len() <= self.context_limit(),
-            "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
-            prompt_tokens.len(),
-            self.context_limit()
-        );
+        if prompt_tokens.len() > self.context_limit() {
+            // ADR-062 D2: a prompt over the serving context is the typed 400
+            // `context_length_exceeded`, not a generic 500.
+            return Err(EngineRequestError::context_overflow(
+                self.context_limit(),
+                prompt_tokens.len(),
+                format!(
+                    "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
+                    prompt_tokens.len(),
+                    self.context_limit()
+                ),
+            )
+            .into_anyhow());
+        }
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
 

@@ -41,6 +41,7 @@ use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 
+use super::engine_error::EngineRequestError;
 use super::engine_supervisor::{spawn_supervised_worker, EngineSupervisor};
 
 const SLOT_AWARE_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -9166,9 +9167,13 @@ fn run_slot_aware_deepseek4(
                     }
                 },
                 Request::Embed { reply, .. } => {
-                    let _ = reply.send(Err(anyhow::anyhow!(
-                        "DeepSeek-V4 embeddings are not supported"
-                    )));
+                    // ADR-062 D2: a family with no embedding path is a
+                    // client mistake (400 `embeddings_unsupported`), not a
+                    // server fault — never a generic 500.
+                    let _ = reply.send(Err(EngineRequestError::EmbeddingsUnsupported {
+                        family: "DeepSeek-V4",
+                    }
+                    .into_anyhow()));
                 }
                 Request::GenerateWithSoftTokens { reply, .. } => {
                     let _ = reply.send(Err(anyhow::anyhow!(
@@ -9556,9 +9561,10 @@ fn prepare_deepseek4_slot(
         _ => {
             fire_deepseek4_error(
                 reply,
-                anyhow::anyhow!(
-                    "invalid_request: DeepSeek-V4 SlotAware requires a nonempty prompt fitting u32"
-                ),
+                EngineRequestError::invalid_request(
+                    "DeepSeek-V4 SlotAware requires a nonempty prompt fitting u32",
+                )
+                .into_anyhow(),
             );
             return None;
         }
@@ -9568,9 +9574,10 @@ fn prepare_deepseek4_slot(
         _ => {
             fire_deepseek4_error(
                 reply,
-                anyhow::anyhow!(
-                    "invalid_request: DeepSeek-V4 SlotAware requires max_tokens in 1..=u32::MAX"
-                ),
+                EngineRequestError::invalid_request(
+                    "DeepSeek-V4 SlotAware requires max_tokens in 1..=u32::MAX",
+                )
+                .into_anyhow(),
             );
             return None;
         }
@@ -9581,11 +9588,19 @@ fn prepare_deepseek4_slot(
     let needed_positions = match prompt_tokens.len().checked_add(params.max_tokens) {
         Some(value) if value <= context_limit => value,
         _ => {
+            // ADR-062 D2: prompt + max_tokens over the model context is
+            // the typed 400 `context_length_exceeded` on DeepSeek-V4 too.
             fire_deepseek4_error(
                 reply,
-                anyhow::anyhow!(
-                    "invalid_request: DeepSeek-V4 prompt + completion exceeds per-slot context {context_limit}"
-                ),
+                EngineRequestError::context_overflow(
+                    context_limit,
+                    prompt_tokens.len().saturating_add(params.max_tokens),
+                    format!(
+                        "DeepSeek-V4 prompt + completion exceeds per-slot context \
+                         {context_limit}"
+                    ),
+                )
+                .into_anyhow(),
             );
             return None;
         }
@@ -11243,12 +11258,16 @@ fn run_slot_aware_qwen3vl_unsupported(mut rx: mpsc::Receiver<Request>) {
     while let Some(req) = rx.blocking_recv() {
         match req {
             Request::Generate { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL text-LM \
-                     has no SlotAware batched-decode path (M1 targets are gemma4 + \
-                     qwen35moe per ADR-040 §0.5). Use --scheduler serial-fifo for \
-                     this model."
-                )));
+                // ADR-062 D2: genuinely unimplemented capability — 501
+                // `capability_unsupported` via the typed classification.
+                let _ = reply.send(Err(EngineRequestError::UnsupportedCapability {
+                    message: "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL \
+                         text-LM has no SlotAware batched-decode path (M1 targets \
+                         are gemma4 + qwen35moe per ADR-040 §0.5). Use --scheduler \
+                         serial-fifo for this model."
+                        .to_owned(),
+                }
+                .into_anyhow()));
             }
             Request::GenerateStream {
                 events, admission, ..
@@ -11256,28 +11275,35 @@ fn run_slot_aware_qwen3vl_unsupported(mut rx: mpsc::Receiver<Request>) {
                 reject_stream_before_sse(
                     events,
                     admission,
-                    anyhow::anyhow!(
-                        "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL text-LM \
-                     has no SlotAware batched-decode path (M1 targets are gemma4 + \
-                     qwen35moe per ADR-040 §0.5). Use --scheduler serial-fifo for \
-                     this model."
-                    ),
+                    EngineRequestError::UnsupportedCapability {
+                        message: "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL \
+                             text-LM has no SlotAware batched-decode path (M1 targets \
+                             are gemma4 + qwen35moe per ADR-040 §0.5). Use --scheduler \
+                             serial-fifo for this model."
+                            .to_owned(),
+                    }
+                    .into_anyhow(),
                 );
             }
             Request::Warmup { reply } => {
                 let _ = reply.send(Ok(()));
             }
             Request::Embed { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL Embed \
-                     under SlotAware not wired; use serial-fifo."
-                )));
+                let _ = reply.send(Err(EngineRequestError::UnsupportedCapability {
+                    message: "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL \
+                         Embed under SlotAware not wired; use serial-fifo."
+                        .to_owned(),
+                }
+                .into_anyhow()));
             }
             Request::GenerateWithSoftTokens { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL \
-                     GenerateWithSoftTokens under SlotAware not wired; use serial-fifo."
-                )));
+                let _ = reply.send(Err(EngineRequestError::UnsupportedCapability {
+                    message: "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL \
+                         GenerateWithSoftTokens under SlotAware not wired; use \
+                         serial-fifo."
+                        .to_owned(),
+                }
+                .into_anyhow()));
             }
             Request::Shutdown => break,
             // Snapshot/restore worker requests are SerialFifo-only control
@@ -11594,11 +11620,17 @@ fn validate_serial_prefill_family(family: &str, prompt_tokens: usize) -> Result<
         "DeepSeek4" => return Ok(()),
         other => anyhow::bail!("unsupported SerialFifo model family {other}"),
     };
-    anyhow::ensure!(
-        prompt_tokens <= limit,
-        "{SERIAL_PROMPT_LIMIT_SENTINEL}: {}",
-        serial_prompt_limit_message(prompt_tokens, limit)
-    );
+    // ADR-062 D2: the D0 `serial_prompt_limit` sentinel is absorbed into
+    // the typed classification (the `Display` body still carries the
+    // sentinel prefix so the interim handler substring fallback and
+    // operator greps keep working).
+    if prompt_tokens > limit {
+        return Err(EngineRequestError::PromptTooLong {
+            prompt_tokens,
+            limit,
+        }
+        .into_anyhow());
+    }
     Ok(())
 }
 
@@ -13194,9 +13226,10 @@ fn admit_gemma4_slot(
         // byte-equivalence for the degenerate `max_tokens == 0` request.
         slot_fire_done(
             reply,
-            Err(anyhow::anyhow!(
-                "invalid_request: max_tokens must be greater than zero"
-            )),
+            Err(
+                EngineRequestError::invalid_request("max_tokens must be greater than zero")
+                    .into_anyhow(),
+            ),
             false,
         );
         return None;
@@ -14473,9 +14506,10 @@ fn admit_gemma4_slots_batched(
                 // via the legacy non-slot path rather than drop the request.
                 None => slot_fire_done(
                     reply,
-                    Err(anyhow::anyhow!(
-                        "invalid_request: max_tokens must be greater than zero"
-                    )),
+                    Err(EngineRequestError::invalid_request(
+                        "max_tokens must be greater than zero",
+                    )
+                    .into_anyhow()),
                     false,
                 ),
             },
@@ -17074,10 +17108,21 @@ fn qwen35_prefill_transaction_tokens(requested_tokens: u32) -> usize {
 const QWEN35_SLOT_INLINE_PROMPT_LIMIT: usize = QWEN35_SLOT_PREFILL_CHUNK_TOKENS as usize;
 
 fn validate_qwen35_inline_prompt(surface: &str, prompt_tokens: usize) -> Result<()> {
-    anyhow::ensure!(
-        prompt_tokens <= QWEN35_SLOT_INLINE_PROMPT_LIMIT,
-        "capability_unsupported: Qwen35 SlotAware {surface} prompt has {prompt_tokens} tokens; inline GPU routes are bounded to {QWEN35_SLOT_INLINE_PROMPT_LIMIT} until resumable prefill lands"
-    );
+    // ADR-062 D2: a server-side single-transaction cap is a length
+    // rejection — typed 400 `context_length_exceeded`, never a 501
+    // `capability_unsupported`.
+    if prompt_tokens > QWEN35_SLOT_INLINE_PROMPT_LIMIT {
+        return Err(EngineRequestError::context_overflow(
+            QWEN35_SLOT_INLINE_PROMPT_LIMIT,
+            prompt_tokens,
+            format!(
+                "Qwen35 SlotAware {surface} prompt has {prompt_tokens} tokens; \
+                 inline GPU routes are bounded to {QWEN35_SLOT_INLINE_PROMPT_LIMIT} \
+                 until resumable prefill lands"
+            ),
+        )
+        .into_anyhow());
+    }
     Ok(())
 }
 
@@ -17101,21 +17146,42 @@ struct Gemma4ValidatedRequestShape {
 }
 
 fn validate_gemma4_embed_request(prompt_tokens: usize, max_seq_len: usize) -> Result<u32> {
-    anyhow::ensure!(
-        prompt_tokens > 0,
-        "invalid_request: Gemma4 SlotAware embedding requires at least one prompt token"
-    );
-    let prompt_tokens_u32 = u32::try_from(prompt_tokens)
-        .context("invalid_request: Gemma4 embedding token count exceeds u32")?;
-    anyhow::ensure!(
-        prompt_tokens <= max_seq_len,
-        "invalid_request: Gemma4 embedding needs {prompt_tokens} sequence positions, exceeding the per-slot limit {max_seq_len}"
-    );
-    anyhow::ensure!(
-        prompt_tokens <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize,
-        "capability_unsupported: Gemma4 SlotAware embedding is limited to one {}-token transaction until embedding prefill is scheduler-resumable",
-        GEMMA4_SLOT_PREFILL_CHUNK_TOKENS
-    );
+    if prompt_tokens == 0 {
+        return Err(EngineRequestError::invalid_request(
+            "Gemma4 SlotAware embedding requires at least one prompt token",
+        )
+        .into_anyhow());
+    }
+    let prompt_tokens_u32 = u32::try_from(prompt_tokens).map_err(|_| {
+        EngineRequestError::invalid_request("Gemma4 embedding token count exceeds u32")
+            .into_anyhow()
+    })?;
+    // ADR-062 D2: length/capacity rejections are typed 400
+    // `context_length_exceeded` — never a generic `invalid_request` 500
+    // drift and never a 501 `capability_unsupported`.
+    if prompt_tokens > max_seq_len {
+        return Err(EngineRequestError::context_overflow(
+            max_seq_len,
+            prompt_tokens,
+            format!(
+                "Gemma4 embedding needs {prompt_tokens} sequence positions, exceeding \
+                 the per-slot limit {max_seq_len}"
+            ),
+        )
+        .into_anyhow());
+    }
+    if prompt_tokens > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize {
+        return Err(EngineRequestError::context_overflow(
+            GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize,
+            prompt_tokens,
+            format!(
+                "Gemma4 SlotAware embedding is limited to one \
+                 {GEMMA4_SLOT_PREFILL_CHUNK_TOKENS}-token transaction until embedding \
+                 prefill is scheduler-resumable"
+            ),
+        )
+        .into_anyhow());
+    }
     Ok(prompt_tokens_u32)
 }
 
@@ -17124,25 +17190,42 @@ fn validate_gemma4_generation_request(
     max_tokens: usize,
     max_seq_len: usize,
 ) -> Result<Gemma4ValidatedRequestShape> {
-    anyhow::ensure!(
-        prompt_tokens > 0,
-        "invalid_request: Gemma4 SlotAware generation requires at least one prompt token"
-    );
-    anyhow::ensure!(
-        max_tokens > 0,
-        "invalid_request: Gemma4 SlotAware generation requires max_tokens > 0"
-    );
-    let prompt_tokens_u32 = u32::try_from(prompt_tokens)
-        .context("invalid_request: Gemma4 prompt token count exceeds u32")?;
-    let max_tokens_u32 =
-        u32::try_from(max_tokens).context("invalid_request: Gemma4 max_tokens exceeds u32")?;
-    let needed = prompt_tokens
-        .checked_add(max_tokens)
-        .context("invalid_request: Gemma4 prompt + completion capacity overflow")?;
-    anyhow::ensure!(
-        needed <= max_seq_len,
-        "invalid_request: Gemma4 request needs {needed} sequence positions, exceeding the per-slot limit {max_seq_len}"
-    );
+    if prompt_tokens == 0 {
+        return Err(EngineRequestError::invalid_request(
+            "Gemma4 SlotAware generation requires at least one prompt token",
+        )
+        .into_anyhow());
+    }
+    if max_tokens == 0 {
+        return Err(EngineRequestError::invalid_request(
+            "Gemma4 SlotAware generation requires max_tokens > 0",
+        )
+        .into_anyhow());
+    }
+    let prompt_tokens_u32 = u32::try_from(prompt_tokens).map_err(|_| {
+        EngineRequestError::invalid_request("Gemma4 prompt token count exceeds u32").into_anyhow()
+    })?;
+    let max_tokens_u32 = u32::try_from(max_tokens).map_err(|_| {
+        EngineRequestError::invalid_request("Gemma4 max_tokens exceeds u32").into_anyhow()
+    })?;
+    let needed = prompt_tokens.checked_add(max_tokens).ok_or_else(|| {
+        EngineRequestError::invalid_request("Gemma4 prompt + completion capacity overflow")
+            .into_anyhow()
+    })?;
+    if needed > max_seq_len {
+        // ADR-062 D2: context overflow is the typed 400
+        // `context_length_exceeded` (the OpenCode compaction code) on
+        // every family and path.
+        return Err(EngineRequestError::context_overflow(
+            max_seq_len,
+            needed,
+            format!(
+                "Gemma4 request needs {needed} sequence positions, exceeding the \
+                 per-slot limit {max_seq_len}"
+            ),
+        )
+        .into_anyhow());
+    }
     Ok(Gemma4ValidatedRequestShape {
         prompt_tokens: prompt_tokens_u32,
         max_tokens: max_tokens_u32,
@@ -17154,26 +17237,45 @@ fn validate_qwen35_generation_request(
     max_tokens: usize,
     max_seq_len: usize,
 ) -> Result<Qwen35ValidatedRequestShape> {
-    anyhow::ensure!(
-        prompt_tokens > 0,
-        "invalid_request: Qwen35 SlotAware generation requires at least one prompt token"
-    );
-    anyhow::ensure!(
-        max_tokens > 0,
-        "invalid_request: Qwen35 SlotAware generation requires max_tokens > 0"
-    );
-    let prompt_tokens_u32 = u32::try_from(prompt_tokens)
-        .context("invalid_request: Qwen35 prompt token count exceeds u32")?;
-    let max_tokens_u32 =
-        u32::try_from(max_tokens).context("invalid_request: Qwen35 max_tokens exceeds u32")?;
+    if prompt_tokens == 0 {
+        return Err(EngineRequestError::invalid_request(
+            "Qwen35 SlotAware generation requires at least one prompt token",
+        )
+        .into_anyhow());
+    }
+    if max_tokens == 0 {
+        return Err(EngineRequestError::invalid_request(
+            "Qwen35 SlotAware generation requires max_tokens > 0",
+        )
+        .into_anyhow());
+    }
+    let prompt_tokens_u32 = u32::try_from(prompt_tokens).map_err(|_| {
+        EngineRequestError::invalid_request("Qwen35 prompt token count exceeds u32").into_anyhow()
+    })?;
+    let max_tokens_u32 = u32::try_from(max_tokens).map_err(|_| {
+        EngineRequestError::invalid_request("Qwen35 max_tokens exceeds u32").into_anyhow()
+    })?;
     let need_seq = prompt_tokens
         .checked_add(max_tokens)
         .and_then(|tokens| tokens.checked_add(64))
-        .context("invalid_request: Qwen35 prompt + completion capacity overflow")?;
-    anyhow::ensure!(
-        need_seq <= max_seq_len,
-        "invalid_request: Qwen35 request needs {need_seq} sequence positions including safety slack, exceeding the per-slot limit {max_seq_len}"
-    );
+        .ok_or_else(|| {
+            EngineRequestError::invalid_request("Qwen35 prompt + completion capacity overflow")
+                .into_anyhow()
+        })?;
+    if need_seq > max_seq_len {
+        // ADR-062 D2: context overflow is the typed 400
+        // `context_length_exceeded` (the OpenCode compaction code) on
+        // every family and path — never a generic 500 or a 501.
+        return Err(EngineRequestError::context_overflow(
+            max_seq_len,
+            need_seq,
+            format!(
+                "Qwen35 request needs {need_seq} sequence positions including safety \
+                 slack, exceeding the per-slot limit {max_seq_len}"
+            ),
+        )
+        .into_anyhow());
+    }
     Ok(Qwen35ValidatedRequestShape {
         prompt_tokens: prompt_tokens_u32,
         max_tokens: max_tokens_u32,
@@ -21564,9 +21666,10 @@ fn worker_run(
                     LoadedModel::Qwen3VlText(_) => {
                         crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err()
                     }
-                    LoadedModel::Deepseek4(_) => Err(anyhow::anyhow!(
-                        "embeddings are not supported by the DeepSeek-V4 generative runtime"
-                    )),
+                    LoadedModel::Deepseek4(_) => Err(EngineRequestError::EmbeddingsUnsupported {
+                        family: "DeepSeek-V4",
+                    }
+                    .into_anyhow()),
                 };
                 let result = match result {
                     Err(error) if is_worker_fatal(&supervisor, &error) => {
@@ -42934,7 +43037,14 @@ mod gemma4_bounded_prefill_tests {
         );
         let too_long = validate_gemma4_embed_request(4_097, 262_144)
             .expect_err("multi-transaction embed must fail closed");
-        assert!(format!("{too_long:#}").contains("capability_unsupported"));
+        // ADR-062 D2: the embed transaction cap is a length rejection —
+        // the typed `ContextOverflow` classification (400
+        // `context_length_exceeded` at the handler), never a 501
+        // `capability_unsupported`.
+        assert!(matches!(
+            too_long.downcast_ref::<EngineRequestError>(),
+            Some(EngineRequestError::ContextOverflow { .. })
+        ));
         assert!(validate_gemma4_embed_request(101, 100).is_err());
         assert!(validate_gemma4_embed_request(usize::MAX, usize::MAX).is_err());
 
@@ -44692,7 +44802,14 @@ mod qwen35_bounded_prefill_watchdog_tests {
         let error = validate_qwen35_inline_prompt("embedding", QWEN35_SLOT_INLINE_PROMPT_LIMIT + 1)
             .expect_err("over-limit inline prompt must fail closed");
         let message = format!("{error:#}");
-        assert!(message.contains("capability_unsupported"));
+        // ADR-062 D2: the inline prompt cap is a length rejection — the
+        // typed `ContextOverflow` classification (400
+        // `context_length_exceeded` at the handler), never a 501
+        // `capability_unsupported`.
+        assert!(matches!(
+            error.downcast_ref::<EngineRequestError>(),
+            Some(EngineRequestError::ContextOverflow { .. })
+        ));
         assert!(message.contains("inline GPU routes are bounded"));
     }
 

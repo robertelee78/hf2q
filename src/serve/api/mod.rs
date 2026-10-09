@@ -31,6 +31,7 @@ pub mod control;
 pub mod embedding_pool;
 pub mod engine;
 pub mod engine_deepseek4;
+pub mod engine_error;
 pub mod engine_qwen35;
 pub mod engine_qwen3vl;
 mod engine_supervisor;

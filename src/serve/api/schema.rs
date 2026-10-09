@@ -134,6 +134,28 @@ impl ApiError {
         )
     }
 
+    /// The loaded model family has no embedding path at all (HTTP 400).
+    ///
+    /// ADR-062 D2: `/v1/embeddings` against a generative family with no
+    /// embedding runtime (DeepSeek-V4 today) is a client mistake, not a
+    /// server fault — the model can never produce embeddings, so a 500 only
+    /// makes harnesses retry a request that can never succeed. The request
+    /// itself is well-formed; use a family with an embedding path or serve a
+    /// dedicated `--embedding-model`.
+    pub fn embeddings_unsupported(family: &str) -> Self {
+        Self::bare(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "The loaded '{family}' model has no embedding support. \
+                 /v1/embeddings requires a family with an embedding path or a \
+                 dedicated `--embedding-model`."
+            ),
+            "invalid_request_error",
+            Some("embeddings_unsupported"),
+            Some("model".into()),
+        )
+    }
+
     /// Queue full (HTTP 429) — serialized FIFO queue at hard cap.
     ///
     /// **ADR-005 Phase 2 Decision #2** — serialized FIFO queue under
