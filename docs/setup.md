@@ -85,18 +85,16 @@ host = "127.0.0.1"
 port = 8081
 scheduler = "inflight_batched"
 max_slots = 4
-repetition_penalty = 1.05
-thinking_token_budget = 2048
-tool_thinking_token_budget = 512
 ```
 
-The three profile keys are present when serving is optimized for long agent
-and tool-use prompts (the default answer); answering no omits them. They are
-the qualified agentic-coding profile: `hf2q serve` passes them through typed
-server configuration when a request omits the matching field. Explicit serve
-flags override them; the old `HF2Q_DEFAULT_*` environment bridge has been
-removed. Configs written before the profile keys existed keep loading
-unchanged.
+Setup writes no behavior profile keys (ADR-062 D1): the retired
+`repetition_penalty`, `thinking_token_budget`, and
+`tool_thinking_token_budget` keys are no longer carried, and a config that
+still has them parses with a warning and is ignored. Serving behavior
+defaults come from the per-family built-in profile (Qwen 1.05 / 2048 / 512,
+Gemma 4 1.05 with no thinking budgets, DeepSeek-V4 1.0 with a 512-token
+tool-thinking budget); the explicit `hf2q serve --default-*` flags override
+the built-ins, and an explicit request value always wins.
 
 Setup intentionally omits logical context and both KV budgets when accepting
 defaults. That lets each model use the maximum context declared by its own

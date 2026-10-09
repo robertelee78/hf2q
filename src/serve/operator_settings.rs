@@ -1,8 +1,10 @@
 //! Shared resolution for the operator controls used by `serve` and `info`.
 //!
 //! This module is deliberately free of process-environment reads. The public
-//! operator contract is CLI > `config.toml` > built-in/model default, and the
-//! same functions drive both static preview and the eventual model load.
+//! operator contract is CLI > the loaded family's built-in profile
+//! (ADR-062 D1); the former `[serve]` behavior keys are retired (parse warns
+//! and ignores), and the same functions drive both static preview and the
+//! eventual model load.
 
 use std::path::Path;
 
@@ -57,11 +59,67 @@ pub(crate) struct ResolvedKvBudget {
     pub(crate) origin: Option<SettingOrigin>,
 }
 
+/// Explicit CLI `--default-*` serving-behavior layer resolved at startup.
+///
+/// Every field stays `None` until the operator passes the matching flag. The
+/// family built-in layer ([`family_serve_profile`]) is applied per loaded
+/// engine at request time (ADR-062 D1), so a serve with no startup model
+/// resolves the same values once its engine loads.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ResolvedServeBehavior {
+    pub(crate) repetition_penalty: Option<f32>,
+    pub(crate) thinking_token_budget: Option<u32>,
+    pub(crate) tool_thinking_token_budget: Option<u32>,
+}
+
+/// Per-family built-in serving profile (ADR-062 D1). One table states every
+/// key per family — an absent key is a decision, not an omission. The values
+/// are the ones each canonical launcher already passes, so a plain
+/// `hf2q serve` reproduces launcher-qualified behavior with no `HF2Q_*`
+/// ritual, and the built-ins move with the binary when a family is
+/// re-qualified.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FamilyServeProfile {
     pub(crate) repetition_penalty: f32,
     pub(crate) thinking_token_budget: Option<u32>,
     pub(crate) tool_thinking_token_budget: Option<u32>,
+}
+
+/// The built-in serving values for a loaded family. The `qwen35` registration
+/// covers the `qwen35` and `qwen35moe` GGUF architectures.
+pub(crate) fn family_serve_profile(family: Option<&str>) -> FamilyServeProfile {
+    match family {
+        // serve_qwen36_opencode.sh: loop mitigation plus bounded native
+        // reasoning for fresh turns and tool-result continuations.
+        Some("qwen35") => FamilyServeProfile {
+            repetition_penalty: 1.05,
+            thinking_token_budget: Some(2_048),
+            tool_thinking_token_budget: Some(512),
+        },
+        // serve_gemma4_opencode.sh: loop mitigation only. The Gemma 4
+        // template has no thinking channel, so there are no thinking
+        // budgets (an absent key is a decision).
+        Some("gemma4") => FamilyServeProfile {
+            repetition_penalty: 1.05,
+            thinking_token_budget: None,
+            tool_thinking_token_budget: None,
+        },
+        // serve_deepseek4_opencode.sh values with the owner's 2026-10-08
+        // retirement of its 8-token budget (ADR-062 D1/D5): no repetition
+        // penalty (1.05 distorted constrained tool strings), a 512-token
+        // tool-thinking budget, and no base thinking budget.
+        Some("deepseek4") => FamilyServeProfile {
+            repetition_penalty: 1.0,
+            thinking_token_budget: None,
+            tool_thinking_token_budget: Some(512),
+        },
+        // qwen3vl and unregistered families keep the neutral values.
+        _ => FamilyServeProfile {
+            repetition_penalty: 1.0,
+            thinking_token_budget: None,
+            tool_thinking_token_budget: None,
+        },
+    }
 }
 
 pub(crate) fn requested_context(
@@ -277,33 +335,25 @@ pub(crate) fn validate_kv_persist_plan(
     Ok(())
 }
 
+/// Resolve the CLI behavior layer. Request-time precedence is
+/// request field > these CLI values > [`family_serve_profile`] (ADR-062 D1);
+/// the former `[serve]` behavior keys are retired (parse warns and ignores).
 pub(crate) fn resolve_serve_behavior(
     cli: &cli::ServeBehaviorArgs,
-    defaults: Option<&ServeDefaultsV2>,
 ) -> Result<ResolvedServeBehavior, String> {
-    let repetition_penalty = cli
-        .default_repetition_penalty
-        .or_else(|| {
-            defaults.and_then(|defaults| defaults.repetition_penalty.map(|value| value as f32))
-        })
-        .unwrap_or(1.0);
-    if !repetition_penalty.is_finite() || repetition_penalty <= 0.0 {
-        return Err("--default-repetition-penalty must be a finite positive number".to_owned());
+    if let Some(repetition_penalty) = cli.default_repetition_penalty {
+        if !repetition_penalty.is_finite() || repetition_penalty <= 0.0 {
+            return Err("--default-repetition-penalty must be a finite positive number".to_owned());
+        }
     }
     // Preserve an explicit zero through the typed configuration. Qwen's
     // policy treats a zero base as disabled and, importantly, a zero tool
     // override as "do not derive a continuation budget from the base".
     // Collapsing zero to `None` here would lose that distinction.
-    let thinking_token_budget = cli
-        .default_thinking_token_budget
-        .or_else(|| defaults.and_then(|defaults| defaults.thinking_token_budget));
-    let tool_thinking_token_budget = cli
-        .default_tool_thinking_token_budget
-        .or_else(|| defaults.and_then(|defaults| defaults.tool_thinking_token_budget));
     Ok(ResolvedServeBehavior {
-        repetition_penalty,
-        thinking_token_budget,
-        tool_thinking_token_budget,
+        repetition_penalty: cli.default_repetition_penalty,
+        thinking_token_budget: cli.default_thinking_token_budget,
+        tool_thinking_token_budget: cli.default_tool_thinking_token_budget,
     })
 }
 
@@ -409,43 +459,33 @@ mod tests {
     }
 
     #[test]
-    fn behavior_cli_overrides_config_and_zero_disables_optional_budgets() {
-        let config = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
-        let resolved = resolve_serve_behavior(
-            &cli::ServeBehaviorArgs {
-                default_repetition_penalty: Some(1.1),
-                default_thinking_token_budget: Some(0),
-                default_tool_thinking_token_budget: Some(64),
-            },
-            Some(&config.serve),
-        )
+    fn behavior_cli_overrides_the_family_builtin_and_zero_disables_optional_budgets() {
+        let resolved = resolve_serve_behavior(&cli::ServeBehaviorArgs {
+            default_repetition_penalty: Some(1.1),
+            default_thinking_token_budget: Some(0),
+            default_tool_thinking_token_budget: Some(64),
+        })
         .unwrap();
-        assert_eq!(resolved.repetition_penalty, 1.1);
+        assert_eq!(resolved.repetition_penalty, Some(1.1));
         assert_eq!(resolved.thinking_token_budget, Some(0));
         assert_eq!(resolved.tool_thinking_token_budget, Some(64));
 
-        let zero_tool = resolve_serve_behavior(
-            &cli::ServeBehaviorArgs {
-                default_repetition_penalty: None,
-                default_thinking_token_budget: None,
-                default_tool_thinking_token_budget: Some(0),
-            },
-            Some(&config.serve),
-        )
+        let zero_tool = resolve_serve_behavior(&cli::ServeBehaviorArgs {
+            default_repetition_penalty: None,
+            default_thinking_token_budget: None,
+            default_tool_thinking_token_budget: Some(0),
+        })
         .unwrap();
         assert_eq!(zero_tool.tool_thinking_token_budget, Some(0));
     }
 
     #[test]
     fn behavior_rejects_invalid_repetition_penalty() {
-        let error = resolve_serve_behavior(
-            &cli::ServeBehaviorArgs {
-                default_repetition_penalty: Some(f32::NAN),
-                default_thinking_token_budget: None,
-                default_tool_thinking_token_budget: None,
-            },
-            None,
-        )
+        let error = resolve_serve_behavior(&cli::ServeBehaviorArgs {
+            default_repetition_penalty: Some(f32::NAN),
+            default_thinking_token_budget: None,
+            default_tool_thinking_token_budget: None,
+        })
         .unwrap_err();
         assert!(error.contains("finite positive"), "{error}");
     }

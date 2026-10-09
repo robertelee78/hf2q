@@ -149,6 +149,17 @@ existing tests are updated only where a change breaks them.
   is clean. The rest of D2 (embeddings 400, `capability_unsupported` →
   400, typed engine error classification, the context-overflow compaction
   code) and D1/D3/D4/D5 are not started.
+- **D1's built-in profiles half** (#288) is implemented on
+  `fix/serve-builtin-profiles` (worktree `builtin-profiles`, cut from
+  `main` @ d17e959b): the per-family built-in table
+  (`src/serve/operator_settings.rs::family_serve_profile`) is applied per
+  loaded engine at request time, the retired `[serve]` behavior keys warn
+  and are ignored on parse, setup no longer writes them, and Gemma 4's
+  cross-slot admission (25 ms coalesce) is the built-in default with the
+  `HF2Q_*` names kept as overrides until the launcher cleanup (#289).
+  The `hf2q info` / `/hf2q/v1/runtime` per-value origin reporting and the
+  launcher simplification remain #289; hands-on verification per
+  Verification above is pending.
 - **Integration order:** merge D0 first (the shared scheduler constant and
   error path); commit the #256 piece on `fix/grammar-length-finish` and
   merge it second; D2's remainder re-cuts from `main` after both (it

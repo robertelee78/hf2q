@@ -62,18 +62,19 @@ rerank logic.
 
 ## Qwen reasoning and decode
 
-The three request-omission defaults are no longer environment variables:
+The three request-omission defaults are no longer environment variables, and
+their `[serve]` config keys are retired (ADR-062 D1: parse warns and ignores;
+setup no longer writes them):
 
-| CLI | `config.toml` | Built-in | Effect |
-|---|---|---|---|
-| `--default-repetition-penalty` | `[serve] repetition_penalty` | `1.0` | Server default only when the request omits `repetition_penalty`; explicit requests win. |
-| `--default-thinking-token-budget` | `[serve] thinking_token_budget` | unset | Qwen reasoning ceiling when the request omits it; `0` disables the configured default. |
-| `--default-tool-thinking-token-budget` | `[serve] tool_thinking_token_budget` | unset | First tool-continuation/required-tool ceiling; `0` disables the continuation override. |
+| CLI | Family built-in (ADR-062 D1) | Effect |
+|---|---|---|
+| `--default-repetition-penalty` | Qwen/Gemma 4 `1.05`, DeepSeek-V4 `1.0` | Server default only when the request omits `repetition_penalty`; explicit requests win. |
+| `--default-thinking-token-budget` | Qwen `2048`, others unset | Thinking ceiling when the request omits it; `0` disables the configured default. |
+| `--default-tool-thinking-token-budget` | Qwen/DeepSeek-V4 `512`, others unset | First tool-continuation/required-tool ceiling; `0` disables the continuation override. |
 
-CLI wins over setup config, which wins over the built-in. `hf2q setup` writes
-the qualified agentic profile (`1.05`, `2048`, `512`) when the operator chooses
-long agent/tool serving. The former `HF2Q_DEFAULT_*` readers and process bridge
-were removed because they were both poor UX and initialization-order unsafe.
+CLI wins over the loaded family's built-in. The former `HF2Q_DEFAULT_*`
+readers and process bridge were removed because they were both poor UX and
+initialization-order unsafe.
 
 The remaining Qwen rows are technical routing escape hatches. ADR-050's
 inventory marks speculation and process-global decode routing for typed backend

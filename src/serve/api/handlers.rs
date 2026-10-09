@@ -2123,6 +2123,17 @@ where
         req.logprobs.unwrap_or(false),
         explicit_thinking_budget,
     );
+    // ADR-062 D1 — the per-family built-in serving profile. The loaded
+    // engine's registration is the authoritative family, so the built-in
+    // layer applies per loaded model (mirroring how GLP templates resolve
+    // per load); a serve with no startup model resolves it here, once its
+    // engine loads. Request-time precedence: request field > CLI
+    // `--default-*` (state.config) > the family built-in below.
+    let builtin_serve_profile = crate::serve::operator_settings::family_serve_profile(
+        engine
+            .registration()
+            .map(|registration| registration.family),
+    );
     let chain_state = qwen_tool_chain_state(&messages_for_render);
     if qwen_thinking_mode {
         if let Some((tool, repeats)) = repeated_tool_result_signature(&messages_for_render, 3) {
@@ -2135,8 +2146,14 @@ where
     }
     let qwen_defaults = if explicit_thinking_budget.is_none() && qwen_thinking_mode {
         QwenThinkingDefaults::from_config(
-            state.config.default_thinking_token_budget,
-            state.config.default_tool_thinking_token_budget,
+            state
+                .config
+                .default_thinking_token_budget
+                .or(builtin_serve_profile.thinking_token_budget),
+            state
+                .config
+                .default_tool_thinking_token_budget
+                .or(builtin_serve_profile.tool_thinking_token_budget),
         )
     } else {
         QwenThinkingDefaults::default()
@@ -2163,7 +2180,12 @@ where
     })?;
     let qwen_required_tool_thinking_mode = qwen_resolution.required_tool_mode;
     let deepseek_default_thinking_budget = if deepseek_required_tool_thinking_mode {
-        enabled_default_thinking_budget(state.config.default_tool_thinking_token_budget)
+        enabled_default_thinking_budget(
+            state
+                .config
+                .default_tool_thinking_token_budget
+                .or(builtin_serve_profile.tool_thinking_token_budget),
+        )
     } else {
         None
     };
@@ -2371,7 +2393,8 @@ where
         top_k: req.top_k.map(|v| v as usize).unwrap_or(0),
         repetition_penalty: req
             .repetition_penalty
-            .unwrap_or(state.config.default_repetition_penalty),
+            .or(state.config.default_repetition_penalty)
+            .unwrap_or(builtin_serve_profile.repetition_penalty),
         max_tokens,
         stop_strings,
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),

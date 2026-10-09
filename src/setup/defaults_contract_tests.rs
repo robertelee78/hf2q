@@ -11,11 +11,6 @@ fn operator_config_v2_is_canonical_strict_and_uses_the_guide_defaults() {
     assert_eq!(config.serve.ctx, None);
     assert_eq!(config.serve.kv_cache_budget, None);
     assert_eq!(config.serve.kv_persist_budget, None);
-    // The guide journey answers the agentic-serving question with its
-    // default yes, so the qualified profile is part of the default config.
-    assert_eq!(config.serve.repetition_penalty, Some(1.05));
-    assert_eq!(config.serve.thinking_token_budget, Some(2048));
-    assert_eq!(config.serve.tool_thinking_token_budget, Some(512));
 
     let bytes = config.to_canonical_bytes().expect("canonical config");
     assert_eq!(bytes, include_bytes!("testdata/config_v2.toml"));
@@ -36,43 +31,41 @@ fn operator_config_v2_is_canonical_strict_and_uses_the_guide_defaults() {
 
 #[test]
 fn operator_config_v2_rejects_incoherent_fifo_slots_and_invalid_quant() {
-    assert!(OperatorConfigV2::new(
-        ConvertDefaultsV2 {
-            quant: "not-a-quant".to_owned(),
-        },
-        ServeDefaultsV2 {
-            host: "127.0.0.1".to_owned(),
-            port: 8081,
-            scheduler: ConfiguredScheduler::InflightBatched,
-            max_slots: 1,
-            ctx: None,
-            kv_cache_budget: None,
-            kv_persist_budget: None,
-            repetition_penalty: None,
-            thinking_token_budget: None,
-            tool_thinking_token_budget: None,
-        },
-    )
-    .is_err());
+    assert!(
+        OperatorConfigV2::new(
+            ConvertDefaultsV2 {
+                quant: "not-a-quant".to_owned(),
+            },
+            ServeDefaultsV2 {
+                host: "127.0.0.1".to_owned(),
+                port: 8081,
+                scheduler: ConfiguredScheduler::InflightBatched,
+                max_slots: 1,
+                ctx: None,
+                kv_cache_budget: None,
+                kv_persist_budget: None,
+            },
+        )
+        .is_err()
+    );
 
-    assert!(OperatorConfigV2::new(
-        ConvertDefaultsV2 {
-            quant: "q4_k_m".to_owned(),
-        },
-        ServeDefaultsV2 {
-            host: "127.0.0.1".to_owned(),
-            port: 8081,
-            scheduler: ConfiguredScheduler::FifoSerial,
-            max_slots: 2,
-            ctx: None,
-            kv_cache_budget: None,
-            kv_persist_budget: None,
-            repetition_penalty: None,
-            thinking_token_budget: None,
-            tool_thinking_token_budget: None,
-        },
-    )
-    .is_err());
+    assert!(
+        OperatorConfigV2::new(
+            ConvertDefaultsV2 {
+                quant: "q4_k_m".to_owned(),
+            },
+            ServeDefaultsV2 {
+                host: "127.0.0.1".to_owned(),
+                port: 8081,
+                scheduler: ConfiguredScheduler::FifoSerial,
+                max_slots: 2,
+                ctx: None,
+                kv_cache_budget: None,
+                kv_persist_budget: None,
+            },
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -91,10 +84,11 @@ fn absent_operator_config_preserves_existing_command_behavior_without_claiming_r
 }
 
 #[test]
-fn v2_config_without_agentic_profile_keys_still_parses() {
-    // Configs written before the profile keys existed keep loading; the
-    // optional profile fields default to absent and serve then uses the
-    // built-in behavioral defaults.
+fn v2_config_with_or_without_retired_profile_keys_parses() {
+    // Configs written before the profile keys existed keep loading, and a
+    // config carrying the retired `[serve]` behavior keys (ADR-062 D1)
+    // also parses — the keys warn and are ignored, so serve resolves the
+    // per-family built-in values instead.
     let legacy = br#"kind = "hf2q.config"
 schema_version = 2
 package = "hf2q"
@@ -113,9 +107,25 @@ max_slots = 4
     assert_eq!(config.serve.ctx, None);
     assert_eq!(config.serve.kv_cache_budget, None);
     assert_eq!(config.serve.kv_persist_budget, None);
-    assert_eq!(config.serve.repetition_penalty, None);
-    assert_eq!(config.serve.thinking_token_budget, None);
-    assert_eq!(config.serve.tool_thinking_token_budget, None);
+
+    let retired = br#"kind = "hf2q.config"
+schema_version = 2
+package = "hf2q"
+
+[convert]
+quant = "q4_k_m"
+
+[serve]
+host = "127.0.0.1"
+port = 8081
+scheduler = "inflight_batched"
+max_slots = 4
+repetition_penalty = 1.05
+thinking_token_budget = 2048
+tool_thinking_token_budget = 512
+"#;
+    let config = OperatorConfigV2::parse(retired).expect("retired keys parse and are ignored");
+    assert_eq!(config, OperatorConfigV2::parse(legacy).unwrap());
 }
 
 #[test]

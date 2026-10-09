@@ -6199,6 +6199,17 @@ struct TickOutcome {
 /// may lower it, but may not raise it without watchdog/fairness evidence.
 const GEMMA4_SLOT_PREFILL_CHUNK_TOKENS: u32 = 4_096;
 
+/// ADR-062 D1 — the qualified Gemma 4 cross-slot admission default: ON.
+/// `HF2Q_CROSS_SLOT_ADMIT` remains an explicit override ("1" on, any other
+/// value off) until the launcher cleanup (story #289).
+const GEMMA4_CROSS_SLOT_ADMIT_DEFAULT: bool = true;
+
+/// ADR-062 D1 — the qualified Gemma 4 admission coalescing window (25 ms):
+/// when every slot is idle, wait at most this long for peer agent requests so
+/// their suffixes can share one transformer-body pass. Active decode is never
+/// delayed. `HF2Q_ADMIT_COALESCE_US` remains an explicit override.
+const GEMMA4_CROSS_SLOT_ADMIT_COALESCE: Duration = Duration::from_millis(25);
+
 fn gemma4_admission_budget(all_slots_idle: bool, free_slots: usize) -> usize {
     if all_slots_idle {
         free_slots
@@ -11623,11 +11634,18 @@ fn run_slot_aware_gemma4(
 
     // ADR-040 iter-G(a) — cross-slot BATCHED admit gate. When on, the admit
     // phase collects greedy text requests for free slots and prefills them in
-    // ONE multi-seq forward (the TTFT lever). Opt-in (HF2Q_CROSS_SLOT_ADMIT=1)
-    // + capability-gated (hybrid-KV regime, scaffold present, no BF16-xlen
-    // verify cache). When off OR unsupported, the admit phase is BYTE-UNCHANGED
-    // (the original one-request-per-slot loop). Stable across the worker's life.
-    let cross_slot_admit = std::env::var("HF2Q_CROSS_SLOT_ADMIT").as_deref() == Ok("1")
+    // ONE multi-seq forward (the TTFT lever). Capability-gated (hybrid-KV
+    // regime, scaffold present, no BF16-xlen verify cache). When off OR
+    // unsupported, the admit phase is BYTE-UNCHANGED (the original
+    // one-request-per-slot loop). Stable across the worker's life.
+    // ADR-062 D1: the qualified Gemma 4 values are the built-in default —
+    // admit ON with a 25 ms coalesce window. HF2Q_CROSS_SLOT_ADMIT ("1" on,
+    // any other value off) and HF2Q_ADMIT_COALESCE_US remain explicit
+    // overrides until the launcher cleanup (story #289).
+    let cross_slot_admit = std::env::var("HF2Q_CROSS_SLOT_ADMIT")
+        .ok()
+        .map(|value| value == "1")
+        .unwrap_or(GEMMA4_CROSS_SLOT_ADMIT_DEFAULT)
         && guard.hybrid.is_some()
         && crate::debug::INVESTIGATION_ENV.hybrid_kv
         && std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1");
@@ -11635,7 +11653,7 @@ fn run_slot_aware_gemma4(
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(|micros| Duration::from_micros(micros.min(100_000)))
-        .unwrap_or_default();
+        .unwrap_or(GEMMA4_CROSS_SLOT_ADMIT_COALESCE);
 
     // ADR-040 production profiling — zero the buckets at worker entry so the
     // worker-exit dump reflects THIS worker's lifetime, not leftover state.
@@ -37241,10 +37259,12 @@ assistant:
             ..Default::default()
         };
         let measure = |on: bool| -> f64 {
+            // ADR-062 D1: unset now means the built-in ON default, so the
+            // OFF leg must set the explicit override instead of removing it.
             if on {
                 std::env::set_var("HF2Q_CROSS_SLOT_ADMIT", "1");
             } else {
-                std::env::remove_var("HF2Q_CROSS_SLOT_ADMIT");
+                std::env::set_var("HF2Q_CROSS_SLOT_ADMIT", "0");
             }
             let loaded = LoadedModel::load(&load_opts).expect("load ttft");
             let engine =
@@ -37282,7 +37302,9 @@ assistant:
             "[iter-G(a) TTFT] 8 concurrent (max_tokens=1): batched-ON {t_on:.0} ms vs sequential-OFF {t_off:.0} ms — speedup {:.2}x",
             t_off / t_on.max(0.001),
         );
-        std::env::remove_var("HF2Q_CROSS_SLOT_ADMIT");
+        // Leave the explicit OFF override in place so later tests in this
+        // process do not silently run the new built-in ON default.
+        std::env::set_var("HF2Q_CROSS_SLOT_ADMIT", "0");
     }
 
     /// ADR-040 iter-G(a) DIAGNOSTIC — bisect the offset-mod-4 isolation bug.

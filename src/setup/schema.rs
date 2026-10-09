@@ -23,14 +23,12 @@ pub(crate) struct ConvertDefaultsV2 {
     pub(crate) quant: String,
 }
 
-/// Qualified agentic-coding serving profile (OpenCode acceptance host,
-/// 2026-08-21). Persisted by `hf2q setup` when the operator optimizes for
-/// long agent and tool-use prompts; applied by `hf2q serve` after explicit
-/// CLI behavior flags and before built-in defaults.
-pub(crate) const AGENTIC_PROFILE_REPETITION_PENALTY: f64 = 1.05;
-pub(crate) const AGENTIC_PROFILE_THINKING_BUDGET: u32 = 2048;
-pub(crate) const AGENTIC_PROFILE_TOOL_THINKING_BUDGET: u32 = 512;
-
+/// ADR-062 D1 (2026-10-08): `hf2q setup` no longer writes behavior profile
+/// keys. The former `[serve]` `repetition_penalty`, `thinking_token_budget`,
+/// and `tool_thinking_token_budget` keys are retired — parse warns and
+/// ignores them, and the per-family built-in table in
+/// `src/serve/operator_settings.rs` (plus the CLI `--default-*` flags) is the
+/// operator surface for those values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServeDefaultsV2 {
@@ -50,17 +48,6 @@ pub(crate) struct ServeDefaultsV2 {
     /// such as `32GiB` are accepted; omission/zero means no explicit ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kv_persist_budget: Option<String>,
-    /// Server-wide repetition penalty for clients that omit the field.
-    /// `None` leaves the built-in default (1.0 = off).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) repetition_penalty: Option<f64>,
-    /// Default Qwen thinking budget. `None` leaves thinking unbounded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) thinking_token_budget: Option<u32>,
-    /// Tool-continuation thinking budget override. `None` leaves the adaptive
-    /// derivation from `thinking_token_budget`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) tool_thinking_token_budget: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,7 +121,7 @@ impl OperatorConfigV2 {
     }
 
     pub(crate) fn guide_defaults() -> Result<Self, SetupError> {
-        let mut serve = ServeDefaultsV2 {
+        let serve = ServeDefaultsV2 {
             host: "127.0.0.1".to_owned(),
             port: 8081,
             scheduler: GUIDE_SCHEDULER,
@@ -142,14 +129,7 @@ impl OperatorConfigV2 {
             ctx: None,
             kv_cache_budget: None,
             kv_persist_budget: None,
-            repetition_penalty: None,
-            thinking_token_budget: None,
-            tool_thinking_token_budget: None,
         };
-        // The guide journey optimizes for long agent and tool-use prompts
-        // (the default setup answer), so the qualified profile is part of
-        // the default configuration rather than an environment ritual.
-        serve.apply_agentic_profile();
         Self::new(
             ConvertDefaultsV2 {
                 quant: "q4_k_m".to_owned(),
@@ -166,9 +146,13 @@ impl OperatorConfigV2 {
         }
         let text = std::str::from_utf8(bytes)
             .map_err(|_| SetupError::InvalidConfig("config.toml is not UTF-8".to_owned()))?;
-        reject_unsupported_schema(text)?;
-        let config: Self = toml::from_str(text)
+        let document: toml::Value = toml::from_str(text)
             .map_err(|error| SetupError::InvalidConfig(format!("invalid TOML: {error}")))?;
+        reject_unsupported_schema(&document)?;
+        let document = retire_serve_behavior_keys(document);
+        let config: Self = document
+            .try_into()
+            .map_err(|error| SetupError::InvalidConfig(format!("invalid config.toml: {error}")))?;
         config.validate()?;
         Ok(config)
     }
@@ -220,22 +204,6 @@ impl ConvertDefaultsV2 {
 }
 
 impl ServeDefaultsV2 {
-    /// Persist the qualified agentic-coding profile. Called when the
-    /// operator answers yes to "Optimize serving for long agent and
-    /// tool-use prompts?" (the default answer), so a plain `hf2q serve`
-    /// picks up the same behavior the canonical OpenCode launchers request.
-    pub(crate) fn apply_agentic_profile(&mut self) {
-        self.repetition_penalty = Some(AGENTIC_PROFILE_REPETITION_PENALTY);
-        self.thinking_token_budget = Some(AGENTIC_PROFILE_THINKING_BUDGET);
-        self.tool_thinking_token_budget = Some(AGENTIC_PROFILE_TOOL_THINKING_BUDGET);
-    }
-
-    pub(crate) fn clear_agentic_profile(&mut self) {
-        self.repetition_penalty = None;
-        self.thinking_token_budget = None;
-        self.tool_thinking_token_budget = None;
-    }
-
     fn validate(&self) -> Result<(), SetupError> {
         if !matches!(self.host.as_str(), "127.0.0.1" | "0.0.0.0") {
             return Err(SetupError::InvalidConfig(
@@ -274,20 +242,42 @@ impl ServeDefaultsV2 {
                 SetupError::InvalidConfig(format!("serve.kv_persist_budget is invalid: {error}"))
             })?;
         }
-        if let Some(penalty) = self.repetition_penalty {
-            if !penalty.is_finite() || penalty <= 0.0 {
-                return Err(SetupError::InvalidConfig(
-                    "serve.repetition_penalty must be a finite positive number".to_owned(),
-                ));
-            }
-        }
         Ok(())
     }
 }
 
-fn reject_unsupported_schema(text: &str) -> Result<(), SetupError> {
-    let document: toml::Value = toml::from_str(text)
-        .map_err(|error| SetupError::InvalidConfig(format!("invalid TOML: {error}")))?;
+/// ADR-062 D1: the former `[serve]` behavior profile keys are retired. A
+/// config carrying them still parses — each retired key warns (naming its
+/// CLI flag) and is ignored, so serving uses the per-family built-in values
+/// unless the CLI `--default-*` flag overrides them.
+fn retire_serve_behavior_keys(mut document: toml::Value) -> toml::Value {
+    const RETIRED_SERVE_KEYS: [(&str, &str); 3] = [
+        ("repetition_penalty", "--default-repetition-penalty"),
+        ("thinking_token_budget", "--default-thinking-token-budget"),
+        (
+            "tool_thinking_token_budget",
+            "--default-tool-thinking-token-budget",
+        ),
+    ];
+    let Some(serve) = document
+        .get_mut("serve")
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return document;
+    };
+    for (key, flag) in RETIRED_SERVE_KEYS {
+        if let Some(value) = serve.remove(key) {
+            eprintln!(
+                "warning: config.toml `serve.{key} = {value}` is retired and ignored \
+                 (ADR-062 D1); serving uses the family built-in, and \
+                 `hf2q serve {flag}` remains the explicit override"
+            );
+        }
+    }
+    document
+}
+
+fn reject_unsupported_schema(document: &toml::Value) -> Result<(), SetupError> {
     let table = document.as_table().ok_or_else(|| {
         SetupError::InvalidConfig("config.toml must contain a TOML table".to_owned())
     })?;
