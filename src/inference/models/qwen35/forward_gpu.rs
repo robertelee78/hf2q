@@ -5686,10 +5686,13 @@ impl Qwen35Model {
             // layer's FFN (either the fused fold from the FFN command buffer,
             // or `residual_add_gpu` output); the GLP spec's hook point is
             // `residual_stream_post_layer`, applied per layer at exactly this
-            // assignment. Per-layer dispatch; off unless a vector is bound,
-            // and the bind refuses any vector whose `glp.hook_point` is not
-            // this site. Spec layer mapping: `direction.N` applies at layer
-            // N (0-based graph layer), no offset.
+            // assignment. Per-layer dispatch; off unless a vector is bound.
+            // ADR-053 dual hook sites: the bind accepts the family site set
+            // (both spec sites); the serve load refuses a vector whose bound
+            // site this forward graph does not apply — the writer-site arm
+            // lands with #296 — rather than silently reapplying it at this
+            // different tensor. Spec layer mapping: `direction.N` applies at
+            // layer N (0-based graph layer), no offset.
             if let Some(glp) = self.glp.as_ref() {
                 if let Some(direction) = glp.direction_for(layer_idx as u32) {
                     crate::inference::glp::apply_layer_gpu(

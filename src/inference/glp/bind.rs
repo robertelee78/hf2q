@@ -22,13 +22,19 @@ pub struct BoundGlp {
 impl BoundGlp {
     /// Bind a loaded vector to the device for one model family.
     ///
-    /// `family_hook` is the site that family's forward graph actually
-    /// steers (DeepSeek-V4: the FFN writer pre-fold; Qwen: the post-layer
-    /// residual). Per spec/GLP.md, a vector is calibrated for one site and
-    /// "a reader whose hook does not match must refuse the file rather than
-    /// apply it somewhere else" — the hooks are different tensors, not
-    /// synonyms, so a mismatch is fatal here instead of a silent
-    /// reinterpretation at the apply point.
+    /// `family_hooks` is the set of spec hook sites that family supports
+    /// (ADR-053 dual hook sites: both the Qwen and DeepSeek engines pass
+    /// `[residual_stream_post_layer, ffn_out_pre_residual]`). Per
+    /// spec/GLP.md, a vector is calibrated for one site and "a reader whose
+    /// hook does not match must refuse the file rather than apply it
+    /// somewhere else" — the hooks are different tensors, not synonyms, so
+    /// a vector whose `glp.hook_point` is outside the family's supported
+    /// set is fatal here (naming the supported sites) instead of a silent
+    /// reinterpretation at the apply point. `attn_out_pre_residual` is
+    /// refused globally: spec-recognized, no hf2q family implements it.
+    /// Binding a site does not by itself prove the family's forward graph
+    /// applies it — an engine with no apply arm for a bound site fails its
+    /// load by name rather than serving silently unsteered.
     ///
     /// Alpha precedence: request/CLI override > the file's
     /// `glp.alpha_default`.
@@ -36,7 +42,7 @@ impl BoundGlp {
         vector: GlpVector,
         alpha_override: Option<f32>,
         device: &MlxDevice,
-        family_hook: GlpHookPoint,
+        family_hooks: &[GlpHookPoint],
         model_num_layers: u32,
         model_hidden: u32,
     ) -> Result<Self, GlpError> {
@@ -63,22 +69,30 @@ impl BoundGlp {
                 vector.width
             )));
         }
-        if vector.hook_point != family_hook {
-            return Err(GlpError::Conformance(format!(
-                "GLP vector declares glp.hook_point={} but this model family \
-                 applies at {} (derived_at={}); refusing per spec — the hooks \
-                 are different tensors and are not interchangeable",
-                vector.hook_point.as_str(),
-                family_hook.as_str(),
-                vector.derived_at.as_deref().unwrap_or("<undeclared>")
-            )));
-        }
-        if family_hook == GlpHookPoint::AttnOutPreResidual {
+        // Global refusal first: spec-recognized, no hf2q family implements
+        // this site — fatal even if a family set declared it, so the file
+        // cannot be silently applied at another site.
+        if vector.hook_point == GlpHookPoint::AttnOutPreResidual {
             return Err(GlpError::Conformance(
                 "glp.hook_point attn_out_pre_residual is spec-recognized but \
                  no hf2q family implements that site; refusing"
                     .into(),
             ));
+        }
+        if !family_hooks.contains(&vector.hook_point) {
+            let supported_sites = family_hooks
+                .iter()
+                .map(|hook| hook.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(GlpError::Conformance(format!(
+                "GLP vector declares glp.hook_point={} but this model family \
+                 supports hook sites [{supported_sites}] (derived_at={}); \
+                 refusing per spec — the hooks are different tensors and are \
+                 not interchangeable",
+                vector.hook_point.as_str(),
+                vector.derived_at.as_deref().unwrap_or("<undeclared>")
+            )));
         }
         let alpha = alpha_override.unwrap_or(vector.alpha_default);
         if !alpha.is_finite() || alpha < 0.0 {
@@ -176,23 +190,25 @@ mod tests {
     }
 
     /// Spec: "a reader whose hook does not match must refuse the file rather
-    /// than apply it somewhere else." A residual-site vector handed to the
-    /// DeepSeek FFN-writer bind (or the reverse) is fatal, never a silent
-    /// reinterpretation at the wrong tensor.
+    /// than apply it somewhere else." A vector whose declared site is
+    /// outside the family's supported site set (a residual-site vector
+    /// handed to a writer-site-only family, or the reverse) is fatal, never
+    /// a silent reinterpretation at the wrong tensor — the error names the
+    /// family's supported sites.
     #[test]
-    fn family_hook_mismatch_is_fatal() {
+    fn family_hook_outside_supported_set_is_fatal() {
         let device = MlxDevice::new().expect("MlxDevice");
         let residual_vector = test_vector(GlpMode::Project, GlpHookPoint::ResidualStreamPostLayer);
         let err = match BoundGlp::bind(
             residual_vector,
             None,
             &device,
-            GlpHookPoint::FfnOutPreResidual,
+            &[GlpHookPoint::FfnOutPreResidual],
             43,
             2,
         ) {
             Err(err) => err,
-            Ok(_) => panic!("hook mismatch must be fatal, bound anyway"),
+            Ok(_) => panic!("hook outside the family set must be fatal, bound anyway"),
         };
         match err {
             GlpError::Conformance(message) => {
@@ -208,7 +224,7 @@ mod tests {
                 writer_vector,
                 None,
                 &device,
-                GlpHookPoint::ResidualStreamPostLayer,
+                &[GlpHookPoint::ResidualStreamPostLayer],
                 43,
                 2
             ),
@@ -218,27 +234,42 @@ mod tests {
 
     /// The published GLP-29 structure: hook_point=ffn_out_pre_residual,
     /// derived_at=residual_stream_post_layer — the declared site transfer
-    /// is legal and must bind on the matching family.
+    /// is legal and must bind on a family whose supported set contains the
+    /// hook (the engine shape: both spec sites).
     #[test]
     fn declared_site_transfer_binds_on_matching_family() {
         let device = MlxDevice::new().expect("MlxDevice");
         let mut vector = test_vector(GlpMode::Project, GlpHookPoint::FfnOutPreResidual);
         vector.derived_at = Some("residual_stream_post_layer".into());
-        let bound = BoundGlp::bind(vector, None, &device, GlpHookPoint::FfnOutPreResidual, 43, 2)
-            .expect("matching hook must bind");
+        let bound = BoundGlp::bind(
+            vector,
+            None,
+            &device,
+            &[GlpHookPoint::ResidualStreamPostLayer, GlpHookPoint::FfnOutPreResidual],
+            43,
+            2,
+        )
+        .expect("hook inside the family set must bind");
         assert_eq!(bound.alpha, 1.0);
         assert!(bound.direction_for(3).is_some());
     }
 
     /// attn_out_pre_residual is spec-recognized but no hf2q family
-    /// implements it; binding one is fatal even when the declaration
-    /// matches, so the file cannot be silently applied at another site.
+    /// implements it; binding one is fatal even when the family set
+    /// declares it, so the file cannot be silently applied at another site.
     #[test]
     fn unimplemented_hook_site_is_fatal_even_when_declared() {
         let device = MlxDevice::new().expect("MlxDevice");
         let vector = test_vector(GlpMode::Project, GlpHookPoint::AttnOutPreResidual);
         assert!(matches!(
-            BoundGlp::bind(vector, None, &device, GlpHookPoint::AttnOutPreResidual, 43, 2),
+            BoundGlp::bind(
+                vector,
+                None,
+                &device,
+                &[GlpHookPoint::AttnOutPreResidual],
+                43,
+                2
+            ),
             Err(GlpError::Conformance(_))
         ));
     }
@@ -252,8 +283,15 @@ mod tests {
         let device = MlxDevice::new().expect("MlxDevice");
 
         let project = test_vector(GlpMode::Project, GlpHookPoint::FfnOutPreResidual);
-        let bound = BoundGlp::bind(project, None, &device, GlpHookPoint::FfnOutPreResidual, 43, 2)
-            .expect("bind project");
+        let bound = BoundGlp::bind(
+            project,
+            None,
+            &device,
+            &[GlpHookPoint::FfnOutPreResidual],
+            43,
+            2,
+        )
+        .expect("bind project");
         let normalized: Vec<f32> = bound
             .direction_for(3)
             .unwrap()
@@ -264,8 +302,15 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-4, "project direction must be unit-norm, got {norm}");
 
         let add = test_vector(GlpMode::Add, GlpHookPoint::ResidualStreamPostLayer);
-        let bound = BoundGlp::bind(add, None, &device, GlpHookPoint::ResidualStreamPostLayer, 43, 2)
-            .expect("bind add");
+        let bound = BoundGlp::bind(
+            add,
+            None,
+            &device,
+            &[GlpHookPoint::ResidualStreamPostLayer],
+            43,
+            2,
+        )
+        .expect("bind add");
         let raw: Vec<f32> = bound
             .direction_for(3)
             .unwrap()

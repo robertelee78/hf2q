@@ -754,11 +754,31 @@ impl Deepseek4LoadedModel {
                 vector,
                 opts.glp_alpha,
                 &device,
-                crate::inference::glp::GlpHookPoint::FfnOutPreResidual,
+                // ADR-053 dual hook sites: DeepSeek-V4 binds the family's
+                // supported site set (both spec sites).
+                &[
+                    crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer,
+                    crate::inference::glp::GlpHookPoint::FfnOutPreResidual,
+                ],
                 model.cfg.num_hidden_layers,
                 model.cfg.hidden_size,
             )
                 .with_context(|| format!("GLP bind: {}", glp_path.display()))?;
+            // The bind accepts the family site set, but this engine's forward
+            // graph currently applies only the FFN-writer site — the
+            // post-layer residual apply arm lands with #297. Fail the load
+            // by name rather than silently reinterpreting a residual-site
+            // vector at the FFN-writer tensor or serving it unsteered.
+            if bound.vector.hook_point
+                != crate::inference::glp::GlpHookPoint::FfnOutPreResidual
+            {
+                anyhow::bail!(
+                    "GLP apply site not yet implemented for hook {} on \
+                     deepseek4 — lands with #297 (DeepSeek post-layer apply); \
+                     refusing to serve a bound vector with no apply path",
+                    bound.vector.hook_point.as_str()
+                );
+            }
             eprintln!(
                 "[GLP] vector bound: layers={} width={} alpha={} mode={:?} hook={} derived_at={} path={}",
                 bound.vector.layers.len(),
