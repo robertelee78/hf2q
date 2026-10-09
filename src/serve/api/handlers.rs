@@ -765,8 +765,19 @@ async fn chat_completions_with_prepared(
         tool_argument_wire_kinds.as_deref(),
     );
 
+    // A call cut by `max_tokens` is an ordinary truncation: the response
+    // finishes with "length" and carries only the calls that completed
+    // (ADR-062 D2, #256). Every other constrained failure is a server fault.
+    let length_cut = result.finish_reason == "length";
+    if length_cut && extracted.constrained_parse_failure.is_some() {
+        tracing::info!("tool call cut by max_tokens; dropping the incomplete call");
+    }
     // A4: promote Constrained parse failure to 500.
-    if let Some(failed_body) = extracted.constrained_parse_failure {
+    if let Some(failed_body) = extracted
+        .constrained_parse_failure
+        .clone()
+        .filter(|_| !length_cut)
+    {
         tracing::error!(
             body = %failed_body,
             "tool_call_parse_failure: Constrained tool_choice but model emitted unparseable body"
@@ -781,7 +792,7 @@ async fn chat_completions_with_prepared(
     // streaming companion in finalize_streaming_tool_state.
     if let Some(resp) = defensive_no_call_under_constrained(
         tool_call_policy,
-        extracted.tool_calls.is_empty(),
+        extracted.tool_calls.is_empty() && !length_cut,
         result.finish_reason,
         result.completion_tokens,
         result.text.len(),
@@ -790,12 +801,26 @@ async fn chat_completions_with_prepared(
     }
 
     let (message_content, message_tool_calls, effective_finish_reason) =
-        if extracted.tool_calls.is_empty() {
+        if extracted.tool_calls.is_empty() && length_cut && tool_call_policy.enforces_body_grammar() {
+            // Cut before any call completed: keep the text that preceded it.
+            (
+                tool_turn_message_content(extracted.content),
+                None,
+                "length".to_string(),
+            )
+        } else if extracted.tool_calls.is_empty() {
             // No tool calls: preserve original text and finish_reason.
             (
                 Some(MessageContent::Text(result.text)),
                 None,
                 result.finish_reason.to_string(),
+            )
+        } else if length_cut {
+            // Calls completed before the cut: return them, reporting the cut.
+            (
+                tool_turn_message_content(extracted.content),
+                Some(extracted.tool_calls),
+                "length".to_string(),
             )
         } else {
             // Tool calls found: content is whatever remained outside the markers
@@ -1095,9 +1120,19 @@ fn extract_tool_calls_from_text_with_wire_kinds(
             match tail_ev {
                 registry::ToolCallEvent::Content(t) => content.push_str(&t),
                 registry::ToolCallEvent::ToolCallText(t) => {
-                    // Mid-call truncation: emit residual as content.
-                    let prefix = reg.tool_open.unwrap_or("");
-                    content.push_str(&format!("{prefix}{t}"));
+                    if policy.enforces_body_grammar() {
+                        // A call cut by `max_tokens` under a body grammar is
+                        // dropped, never surfaced as content or as a partial
+                        // call; the response finishes with "length".
+                        tracing::info!(
+                            residual_len = t.len(),
+                            "tool call cut by max_tokens under a body grammar; dropped"
+                        );
+                    } else {
+                        // Mid-call truncation: emit residual as content.
+                        let prefix = reg.tool_open.unwrap_or("");
+                        content.push_str(&format!("{prefix}{t}"));
+                    }
                 }
                 registry::ToolCallEvent::ToolCallOpen | registry::ToolCallEvent::ToolCallClose => {}
             }

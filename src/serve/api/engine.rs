@@ -660,9 +660,9 @@ pub(super) fn accept_grammar_token(
 }
 
 /// Refuse to report a successful completion while an active output
-/// constraint is dead or incomplete. An AUTO tool grammar is the sole
-/// optional case: if its trigger never appeared, ordinary assistant text is
-/// a valid outcome. Once triggered, AUTO is as strict as every other grammar.
+/// constraint is dead or incomplete. An AUTO tool grammar whose trigger never
+/// appeared is optional, and a live grammar cut by `max_tokens` is an
+/// ordinary `length` finish. Otherwise AUTO is as strict as every grammar.
 pub(super) fn validate_grammar_terminal(
     runtime: Option<&super::grammar::GrammarRuntime>,
     kind: GrammarKind,
@@ -672,6 +672,13 @@ pub(super) fn validate_grammar_terminal(
         return Ok(());
     };
     if kind == GrammarKind::ToolCallBodyAuto && runtime.is_awaiting_trigger() {
+        return Ok(());
+    }
+    // Running out of `max_tokens` before a live grammar completes is an
+    // ordinary truncation, reported as `finish_reason: "length"` with the
+    // partial text (OpenAI and the peer behave the same). It is never a
+    // server fault (ADR-062 D2, #256). A dead grammar still is.
+    if cause == "length" && !runtime.is_dead() {
         return Ok(());
     }
     anyhow::ensure!(
@@ -6372,7 +6379,9 @@ impl SlotStreamRouter {
         &mut self,
         events: &mpsc::Sender<super::sse::GenerationEvent>,
         completion_tokens: usize,
+        finish_reason: &str,
     ) -> Result<Option<&'static str>, ()> {
+        let length_cut = finish_reason == "length";
         let sink = EventSink::new(events);
         if let Some(splitter) = self.reasoning.as_mut() {
             if let Some((slot, tail)) = splitter.finish() {
@@ -6404,8 +6413,11 @@ impl SlotStreamRouter {
             self.accumulated_text_len,
             &sink,
             Some(&mut self.saw_answer_event),
+            length_cut,
         ) {
-            FinalizeStreamingAction::Continue => Ok(self.saw_tool_call.then_some("tool_calls")),
+            FinalizeStreamingAction::Continue => {
+                Ok((self.saw_tool_call && !length_cut).then_some("tool_calls"))
+            }
             FinalizeStreamingAction::ClientDropped | FinalizeStreamingAction::ErrorEmitted => {
                 Err(())
             }
@@ -11086,7 +11098,7 @@ fn slot_fire_done(reply: SlotReply, gr: Result<GenerationResult>, client_dropped
                     }
                     if let Some(router) = router.as_mut() {
                         let had_answer_event = router.saw_answer_event();
-                        match router.finish(&events, r.completion_tokens) {
+                        match router.finish(&events, r.completion_tokens, r.finish_reason) {
                             Ok(Some(finish_reason)) => r.finish_reason = finish_reason,
                             Ok(None) => {}
                             Err(()) => return,
@@ -26817,6 +26829,7 @@ fn finalize_streaming_tool_state(
     accumulated_text_len: usize,
     events: &EventSink<'_>,
     mut answer_emitted: Option<&mut bool>,
+    length_cut: bool,
 ) -> FinalizeStreamingAction {
     use super::sse::{DeltaKind, GenerationEvent};
 
@@ -26849,6 +26862,16 @@ fn finalize_streaming_tool_state(
                             *answer_emitted = true;
                         }
                     }
+                }
+                super::registry::ToolCallEvent::ToolCallText(t) if length_cut => {
+                    // A call cut by `max_tokens` is an ordinary truncation
+                    // under every tool policy: drop the residual and finish
+                    // with "length" (ADR-062 D2, #256). Partial tool markup
+                    // is never surfaced as content or as a partial call.
+                    tracing::info!(
+                        residual_len = t.len(),
+                        "streaming tool call cut by max_tokens; dropped"
+                    );
                 }
                 super::registry::ToolCallEvent::ToolCallText(t) => {
                     if body_grammar_active {
@@ -26919,7 +26942,7 @@ fn finalize_streaming_tool_state(
     // OneOrMoreCalls; a no-call run is a regression. AutoLazyGrammar
     // explicitly permits no-call (the whole point of lazy grammar is
     // preamble freedom + optional emission).
-    if policy_constrained && !saw_tool_call {
+    if policy_constrained && !saw_tool_call && !length_cut {
         tracing::error!(
             completion_tokens = completion_tokens,
             text_len = accumulated_text_len,
@@ -29314,6 +29337,7 @@ fn generate_stream_once(
         accumulated_text.len(),
         events,
         None,
+        finish_reason == "length",
     ) {
         FinalizeStreamingAction::Continue => {}
         FinalizeStreamingAction::ClientDropped => {
@@ -29334,7 +29358,7 @@ fn generate_stream_once(
     // https://platform.openai.com/docs/guides/function-calling — when the
     // model invokes a tool, finish_reason becomes "tool_calls" rather than
     // "stop"/"length". This overrides EOS-driven "stop" set above.
-    if saw_tool_call {
+    if saw_tool_call && finish_reason != "length" {
         finish_reason = "tool_calls";
     }
 
@@ -30178,10 +30202,12 @@ mod tests {
         let mut incomplete = crate::serve::api::grammar::GrammarRuntime::new(grammar.clone(), root)
             .expect("runtime");
         assert!(incomplete.accept_bytes(b"a"));
+        validate_grammar_terminal(Some(&incomplete), GrammarKind::ResponseFormat, "length")
+            .expect("a live grammar cut by max_tokens is an ordinary length finish");
         assert!(validate_grammar_terminal(
             Some(&incomplete),
             GrammarKind::ResponseFormat,
-            "length"
+            "stop"
         )
         .is_err());
 
@@ -40333,6 +40359,7 @@ mod finalize_streaming_tool_state_tests {
             0,
             &EventSink::new(&tx),
             None,
+            false,
         );
 
         assert_eq!(action, FinalizeStreamingAction::ClientDropped);
@@ -40373,6 +40400,7 @@ mod finalize_streaming_tool_state_tests {
             /* accumulated_text_len */ 18,
             &EventSink::new(&tx),
             None,
+            false,
         );
 
         assert_eq!(
@@ -40434,6 +40462,7 @@ mod finalize_streaming_tool_state_tests {
             /* accumulated_text_len */ 0,
             &EventSink::new(&tx),
             None,
+            false,
         );
 
         assert_eq!(
@@ -40481,6 +40510,7 @@ mod finalize_streaming_tool_state_tests {
             /* accumulated_text_len */ 18,
             &EventSink::new(&tx),
             None,
+            false,
         );
         assert_eq!(
             action,
@@ -40524,6 +40554,7 @@ mod finalize_streaming_tool_state_tests {
             0,
             &EventSink::new(&tx),
             None,
+            false,
         );
         assert_eq!(action, FinalizeStreamingAction::Continue);
         drop(tx);
@@ -40570,6 +40601,7 @@ mod finalize_streaming_tool_state_tests {
             /* accumulated_text_len */ 18,
             &EventSink::new(&tx),
             None,
+            false,
         );
 
         assert_eq!(
@@ -40644,6 +40676,7 @@ mod finalize_streaming_tool_state_tests {
             0,
             &EventSink::new(&tx),
             None,
+            false,
         );
         assert_eq!(
             action,
@@ -40690,6 +40723,7 @@ mod finalize_streaming_tool_state_tests {
             18,
             &EventSink::new(&tx),
             None,
+            false,
         );
         assert_eq!(action, FinalizeStreamingAction::Continue);
         drop(tx);
@@ -57017,7 +57051,7 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
 
             router.emit(&events, wire).expect("slot stream emit");
             let finish_override = router
-                .finish(&events, 8)
+                .finish(&events, 8, "stop")
                 .expect("slot stream finalize");
             assert_eq!(finish_override, Some("tool_calls"));
             assert!(
@@ -57073,7 +57107,7 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
             )
             .expect("route forced-open Qwen tool call");
         assert_eq!(
-            router.finish(&events, 16).expect("finalize stream"),
+            router.finish(&events, 16, "stop").expect("finalize stream"),
             Some("tool_calls")
         );
         assert!(router.saw_reasoning_event());
@@ -57112,7 +57146,7 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
             !router.saw_answer_event(),
             "marker splitters should still be holding the short tail"
         );
-        assert_eq!(router.finish(&events, 1).unwrap(), None);
+        assert_eq!(router.finish(&events, 1, "stop").unwrap(), None);
         assert!(router.saw_answer_event());
         drop(events);
 
