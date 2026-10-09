@@ -980,6 +980,16 @@ pub trait KvSpiller<E>: Send + Sync {
         engine: &Arc<LoadedEngine<E>>,
     ) -> RestoreOutcome;
 
+    /// ADR-062 D4 (2026-10-08) — does this spiller have a real
+    /// per-family hook for `(repo, quant)`? The manager corrects
+    /// `EngineConfigIdentity::kv_persist_enabled` with this after a
+    /// successful load, so `/hf2q/v1/runtime` reports what each
+    /// loaded engine actually does, not the config flag. Default
+    /// `false` (the noop spiller persists nothing).
+    fn family_persist_active(&self, _repo: &str, _quant: QuantType) -> bool {
+        false
+    }
+
     /// ADR-017 Closure iter-7 (2026-05-04) — called AFTER the manager
     /// has dropped its `Arc<LoadedEngine<E>>` from the engines map
     /// (post-evict). The impl may release any per-family resources
@@ -1595,7 +1605,17 @@ impl<E> HotSwapManager<E> {
             bytes_resident,
             loaded_at: SystemTime::now(),
             generation: self.allocate_generation(),
-            config_identity: EngineConfigIdentity::from(config),
+            config_identity: {
+                let mut identity = EngineConfigIdentity::from(config);
+                // ADR-062 D4 — report what this engine does, not the
+                // config: kv-persist is enabled only when a real
+                // per-family hook matched at load.
+                identity.kv_persist_enabled = identity.kv_persist_enabled
+                    && self
+                        .spiller
+                        .family_persist_active(repo, quant);
+                identity
+            },
         });
         let handle = LoadedHandle {
             repo_id: k.clone(),
@@ -1711,7 +1731,17 @@ impl<E> HotSwapManager<E> {
             bytes_resident,
             loaded_at: SystemTime::now(),
             generation: self.allocate_generation(),
-            config_identity: EngineConfigIdentity::from(config),
+            config_identity: {
+                let mut identity = EngineConfigIdentity::from(config);
+                // ADR-062 D4 — report what this engine does, not the
+                // config: kv-persist is enabled only when a real
+                // per-family hook matched at load.
+                identity.kv_persist_enabled = identity.kv_persist_enabled
+                    && self
+                        .spiller
+                        .family_persist_active(repo, quant);
+                identity
+            },
         });
 
         // Admit to the pool.  May evict LRU entries; we drop the
