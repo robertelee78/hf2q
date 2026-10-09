@@ -1156,6 +1156,22 @@ pub enum OverflowPolicy {
     Summarize,
 }
 
+/// Nested reasoning-control aliases (ADR-062 D5): `reasoning.effort`,
+/// `reasoning.enabled`, and `reasoning.max_tokens`. Accepted on every family
+/// and resolved through the same one effort table as the top-level
+/// `reasoning_effort`, `hf2q_enable_thinking`, and `thinking_token_budget`
+/// fields; contradictory combinations are a 400, matching OpenAI behavior.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningAliases {
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+}
+
 /// Request body for `POST /v1/chat/completions` — the full Phase 2a surface
 /// (Tiers 1+2+3+4 per Decision #22).
 #[derive(Debug, Clone, Deserialize)]
@@ -1210,17 +1226,24 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
-    /// DeepSeek-V4 reasoning budget. Accepted at the OpenAI-compatible
-    /// top level so clients need not know hf2q's `chat_template_kwargs`
-    /// extension. Native values are `low`, `high`, and `max`; the top-level
-    /// stock-client sentinel `none` is normalized to the `low` baseline.
+    /// OpenAI reasoning-effort control, accepted on every family through one
+    /// effort table (ADR-062 D5): `none`/`minimal` turn thinking off; `low`
+    /// carries a 512-token thinking budget; `medium` 2048; `high` 8192;
+    /// `xhigh`/`max` no ceiling; DeepSeek-V4's native tiers are mapped from
+    /// the same table with `medium` -> `high`.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Nested reasoning-control aliases (ADR-062 D5): `reasoning.effort`,
+    /// `reasoning.enabled`, and `reasoning.max_tokens` resolve through the
+    /// same one effort table as their top-level counterparts.
+    #[serde(default)]
+    pub reasoning: Option<ReasoningAliases>,
     /// Optional per-request cap on tokens emitted while the model remains in
     /// its reasoning span. When reached, reasoning-capable families force
     /// their tokenizer-derived close sequence and continue with the remaining
     /// completion budget so callers receive an answer rather than a truncated
-    /// reasoning-only response. Compatible with vLLM's extension name.
+    /// reasoning-only response. Compatible with vLLM's extension name, and
+    /// accepted on every family (ADR-062 D5).
     #[serde(default)]
     pub thinking_token_budget: Option<usize>,
     #[serde(default)]

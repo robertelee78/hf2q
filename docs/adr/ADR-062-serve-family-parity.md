@@ -180,6 +180,27 @@ existing tests are updated only where a change breaks them.
   cross-slot/coalesce removals ride on #288's built-in profiles, which
   landed first as #314; hands-on verification per Verification above is
   pending.
+- **D5** is implemented on `fix/serve-reasoning-controls` (worktree
+  `reasoning-controls`, cut from `main` @ 64a2344f, uncommitted at handoff):
+  one effort table (`src/serve/api/reasoning_controls.rs`) accepts
+  `reasoning_effort`, the new `reasoning.{effort,enabled,max_tokens}`
+  aliases, and `thinking_token_budget` on every family (none/minimal off;
+  low 512; medium 2048; high 8192; xhigh/max no ceiling; DeepSeek-V4 tiers
+  mapped with `medium` -> `high`, and `medium`/`xhigh` also accepted as
+  native `chat_template_kwargs.reasoning_effort` aliases); one shared budget
+  enforcer (`resolve_thinking_budget_policy`) covers every family on
+  `inflight-batched`, including Gemma 4, whose no-thinking-channel family
+  now rejects every reasoning control with one 400 instead of
+  accepting-and-ignoring it; server defaults never cause a 4xx (under
+  `fifo-serial` they are dropped with a warning; only an explicit client
+  budget is a 400, identically on every family — the finding-3
+  auto-injection defect); `reasoning_effort` `medium` maps to DeepSeek's
+  native `high` tier (stock OpenCode works on every family), and `none` now
+  turns thinking off instead of normalizing to DeepSeek's `low`.
+  `cargo check --locked --all-targets --all-features` is clean and the
+  focused suites pass; hands-on verification per Verification above (all
+  three families through the HTTP API, `hf2q chat`, and OpenCode) is
+  pending.
 - **Integration order:** merge D0 first (the shared scheduler constant and
   error path); commit the #256 piece on `fix/grammar-length-finish` and
   merge it second; D2's remainder re-cuts from `main` after both (it
