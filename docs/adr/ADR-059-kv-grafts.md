@@ -13,8 +13,10 @@
   45/75 → 27/75 under their trained bank — a real cost to expect);
   family generality (the site matrix beyond qwen35 `full_attn_kv`) is
   the declared expansion; the residual-refusal count is conservative
-  (the lexical judge flags late-window phrases on substantively
-  engaging answers).
+(the lexical judge flags late-window phrases on substantively
+   engaging answers). 2026-10-08: the `compressed_kv` site is proposed
+   (see its section below); the per-section dates inside are the current
+   record — the revision stamp above lags them by design.
 - **Date:** 2026-09-22
 - **Related:** ADR-053 (GLP serving surface — the artifact/binding pattern
   this mirrors), ADR-054 (GLP calibration and its measured null result),
@@ -171,7 +173,7 @@ across the site matrix:
 |---|---|---|---|
 | `full_attn_kv` | Reserved leading slots of full-attention layers (global, append-only) | Qwen3.5/3.6/3.8 (1-in-4 layers), Gemma-4 (Full layers), — any layer with full attention over past K/V | **Qwen3.5/3.6/3.8: shipped in v1** (serving live on both engine paths, both KV substrates; hardware-canary matrix ALL PASS). **Gemma-4: landing incrementally (2026-09-24/25)** — bind arm ✅ (full-attn layers from `sliding_window_pattern`, per-layer KV-head array, standard-RoPE enforcement), both splice primitives ✅ (F16 K via the production copy kernel + TQ-HB V via the production Hadamard quantizer on the hybrid KV leg; multi-seq + single-seq), boot bind + fail-closed gates on every serving entry ✅ (including the fix that `--kv-graft` on gemma4 was previously SILENTLY IGNORED — the flag only flowed to the qwen35 loader). **Open: the position-offset wiring** (3b serial, 3c SlotAware — splice at admission, `graft_len` offsets incl. sliding-window arithmetic, graft-aware cache identity), then the gates come off. |
 | `window_tail_kv` | Sliding-window layers: graft rides the window tail and is re-injected as the window slides (phantom §6.11 refresh semantics — their measured mitigation) | Gemma-4 (Sliding layers) | Staged site 2. The trained receptive field of a sliding layer excludes old positions, so a stable prefix graft is invisible there by the model's own attention pattern; tail-riding is the correct placement. |
-| `compressed_kv` | DeepSeek-V4 compressor output region (post-`attn_compressor_kv` space) | DeepSeek-V4 | Staged site 3. Positions `0..N` are merged into compressor state immediately, so a raw prefix splice is meaningless; a graft must be *derived in compressed space* (gradients through the frozen compressor — phantom's pipeline can in principle). No derivation tooling exists yet. |
+| `compressed_kv` | DeepSeek-V4 compressor output region (post-`attn_compressor_kv` space) | DeepSeek-V4 | Staged site 3. Positions `0..N` are merged into compressor state immediately, so a raw prefix splice is meaningless; a graft must be *derived in compressed space* (gradients through the frozen compressor — phantom's pipeline can in principle). No derivation tooling exists yet. **Proposed (2026-10-08)**: the consumer-side splice contract is specified in the `compressed_kv` section below — fabricated compressed rows at reserved leading positions; the producer side is blocked on the phantom-kv restore. |
 | `recurrent_state` | DeltaNet conv/recurrent state buffers | Qwen3.5/3.6/3.8 (3-in-4 layers) | Staged site 4. These layers have no K/V at all — the graft medium is recurrent state, a different tensor geometry and derivation. This is the site that lifts Qwen coverage from 25% toward full. |
 
 The Qwen v1 coverage limitation (graft touches full-attn layers only) is
@@ -346,6 +348,69 @@ unwired path fail-closed by name:
    trainer → to-gguf → serve on the local unsloth GGUF; the
    reference-stack prerequisites are already green: gradient flow
    PASS, base 39/60, v1 donor 31/60).
+
+### DeepSeek-V4 `compressed_kv` (2026-10-08 — proposed, staged; owner
+direction: the graft concept must work on all served families)
+
+DeepSeek-V4 is the third family. There is no raw K/V prefix to splice:
+each layer's `attention_kv` is one BF16 allocation of window rows +
+compressed rows; `window_kv` is a 128-token circular window;
+`compressed_kv` (`[context_length/ratio, head_dim]`, append-only) holds
+the merged compressed history beyond the window; the compressor's
+recurrent states (`main_kv_state`/`main_score_state`, indexer twins)
+maintain the running pools. Positions beyond the window exist only as
+compressed rows — so the graft lands as **fabricated compressed rows**
+at reserved leading positions of the compressed region.
+
+**Consumer side (hf2q — buildable and hands-on testable now, no phantom
+needed):**
+
+1. Splice contract (extends the `graft.*` keys for
+   `hook_point=compressed_kv`): per-covered-layer fabricated compressed
+   rows; layer coverage is exactly `compress_ratios[layer] != 0` (a bank
+   naming a ratio-0 layer is fatal — those layers have no compressed
+   region); `graft.compress_ratios` — an i32 array parallel to the
+   model's per-layer `compress_ratios`, validated equal on every covered
+   layer (the gemma4 per-layer-array precedent); RoPE keys validated for
+   checkpoint identity only — compressed rows are merged, positionless
+   state, so `graft.position_base` does not apply at this site — plus
+   checkpoint identity via the existing `CheckpointIdentity` reuse;
+   `n_slots`, `content_sha256` (same rule).
+2. Bind validation vs the geometry: covered layers, head_dim, dtype
+   (encode through the same BF16 path prefill rows use), ratio match, and
+   `n_slots` ≤ the compressed region's capacity (`context_length/ratio`
+   rows) minus the real history the conversation needs — the same
+   per-request capacity accounting that counts graft rows.
+3. Splice + cache discipline: reserve leading compressed rows, offset
+   later compressed-row writes by `n_slots`, window/compressed boundary
+   arithmetic, graft-aware cache identity + snapshot exclusion (the
+   qwen35 patterns), fail-closed by name on every serving entry until
+   wired. The compressor's recurrent pools (`main_kv_state`/
+   `main_score_state`, indexer twins) track real rows only — fabricated
+   rows are reserved storage the recurrence never reads, updates, or
+   merges (the intended invariant, enforced at wiring).
+4. Canaries with a synthetic bank (`canary.sh` style): zero-slot
+   byte-identical, live bank diverges, disable-restore bit-for-bit, KL
+   reported — the mechanism proof on DeepSeek, hands-on. The consumer
+   checklist includes verifying `--kv-graft` actually reaches the
+   deepseek4 loader — the gemma4 silent-ignore class this ADR already
+   caught once.
+
+**Producer side (phantom-kv — blocked on the `/opt/phantom-kv` restore,
+an owner action that also unblocks the Gemma 4 trained-bank scoreboard
+and the requalification banks):** extend
+`scripts/graft_probe/phantom_port.py` to DeepSeek's compressed attention
+— donor/fabricated text through the frozen compressor to derive
+candidate banks in compressed space (prefill_kv/softprompt class), and
+the trainer extended with gradients through the frozen compressor (the
+v3 trained objective). The Qwen donor-bank falsification predicts the
+trained bank is the only class worth scoring.
+
+**Honest status line until the producer side lands:** mechanism working
+and canary-tested; behavioral effect pending the derivation toolchain.
+**Staged escalation** if compressed-site coverage proves insufficient:
+`window_tail_kv` on DeepSeek's own 128-token circular window (the Gemma
+sliding-layer semantics).
 
 ### 5. Determinism
 

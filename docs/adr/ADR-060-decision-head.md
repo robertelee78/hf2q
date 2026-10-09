@@ -210,9 +210,11 @@ claims).
    load; every exported tensor checked against its source (the
    prepare-hub discipline).
 2. **Parity**: the laya-mlx 63/63 validation questions × FP32 and FP16
-   (378/378 comparisons), checked-in hash-identified fixtures; selected
-   answer agreement and 4-decimal probability agreement. Zero tolerance
-   on selected-label disagreement.
+   (378/378 comparisons — 63 questions × 2 precisions × 3 compared
+   outputs per its harness; re-verify the decomposition from the
+   laya-mlx fixtures when implementation opens), checked-in
+   hash-identified fixtures; selected answer agreement and 4-decimal
+   probability agreement. Zero tolerance on selected-label disagreement.
 3. **Tokenizer contract**: cls/sep/mask handling, option truncation
    boundaries, state serialization (text vs JSON vs conversation list).
 4. **`/decide` surface tests**: schema validation (typed errors),
@@ -259,3 +261,10 @@ claims).
 - **Ed25519**: spec'd, envelope reserved, dependency decision flagged to
   the owner (§8).
 - **Router/shortlist/multilingual**: deferred (Non-goals).
+- **Serving-surface shape (checkpoint loading)**: deferred — how a laya
+  checkpoint is loaded (`hf2q serve <laya-model>` standalone, a
+  `--decide-model`-class flag, or co-loaded with a generative model) is
+  decided and recorded here before the serve path opens; §9's contention
+  gate assumes one of these and the decision precedes implementation.
+  Scheduling/slot behavior re-derives from `main` at implementation time
+  (ADR-062 D0/D3 change the scheduler defaults and slot validation).
