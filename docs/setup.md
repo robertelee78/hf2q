@@ -19,7 +19,8 @@ shell, `RLIMIT_NOFILE`, and containing-volume capacity. It then asks for:
 
 - the default `hf2q convert --quant` selector;
 - whether serving should favor long agent/tool prompts or short direct use;
-- the maximum simultaneous active requests for inflight serving;
+- the maximum simultaneous active requests for inflight serving (accepted
+  range 1-8 on every family);
 - localhost-only or LAN binding; and
 - the default API port; and
 - an optional persistent-KV disk ceiling.
@@ -149,6 +150,11 @@ penalty, and thinking-default precedence is:
 1. explicit CLI arguments;
 2. setup config; and
 3. the pre-setup safe built-ins or, for context, the model GGUF maximum.
+
+Active slots are family-independent: every family accepts 1-8, the default is
+4, and a value above 8 fails the CLI, config load, and the setup prompt with
+the accepted range because raising the bound requires a hands-on
+qualification at the new width.
 
 The public serving plan does not fall back to hidden `HF2Q_*` variables.
 `HF2Q_AUTH_TOKEN` remains the intentional secret-injection exception and is

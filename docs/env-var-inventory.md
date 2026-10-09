@@ -11,8 +11,9 @@ Regenerate the table with:
 bash scripts/audit_hf2q_env_surface.sh
 ```
 
-The snapshot contains **356 distinct names** after the ADR-050 removals.
-The pre-change audit contained 363. Dispositions mean:
+The snapshot contains **353 distinct names** after the ADR-050 removals and
+the ADR-062 D3 slot-gate removals. The pre-change audit contained 363.
+Dispositions mean:
 
 - `appropriate-env`: environment is an intentional boundary for a secret,
   XDG-like location, or shell/package integration.
@@ -36,6 +37,15 @@ path. Their supported replacements are typed CLI/config fields. The late
 process mutation behind `generate --kv-bits` was replaced with a typed
 in-process override; its legacy environment input remains development-only.
 
+## Completed in ADR-062 D3 (2026-10-08)
+
+The `HF2Q_MAX_BATCHED_SLOTS`, `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS`, and
+`HF2Q_SPEC_DECODE_ALLOW_OVERSIZED` production readers and their rows are
+removed: slot capacity is a validated operator setting (`--max-slots`
+accepts 1-8 on every family, checked at the CLI, config load, and the setup
+prompt; raising the bound requires a hands-on qualification at the new
+width). No `src/` occurrence of the three names remains.
+
 ## Remaining promotion queue
 
 The inventory deliberately identifies follow-up work without smuggling it into
@@ -46,10 +56,9 @@ this release:
    persistence config. Serve activation/path and the on-disk budget are typed,
    complete, and fail-loud in this release.
 2. Promote the multi-model pool byte ceiling to typed config.
-3. Replace hidden batching ceilings and cross-slot collection controls with
-   qualified scheduler/admission policy. Ordinary operators should not need
-   `HF2Q_MAX_BATCHED_SLOTS`, its legacy spec-decode alias, or launcher-only
-   admission variables.
+3. Replace hidden cross-slot collection controls with qualified
+   scheduler/admission policy. Ordinary operators should not need
+   launcher-only admission variables.
 4. Make required family policies—TQ KV, hybrid KV, encoder sessions, terminal-K
    batching, qualified LM-head routing, and proven batched serving—qualified
    typed defaults. Keep only explicitly unsafe diagnostic opt-outs.
@@ -264,7 +273,6 @@ this release:
 | `HF2Q_LMHEAD_Q8` | `documented-escape` | 9 |
 | `HF2Q_LMHEAD_RERANK` | `development-only` | 8 |
 | `HF2Q_LOAD_TIMING` | `development-only` | 5 |
-| `HF2Q_MAX_BATCHED_SLOTS` | `promote-or-internalize` | 12 |
 | `HF2Q_MAX_SLOTS` | `removed-guard` | 1 |
 | `HF2Q_METAL_CAPTURE` | `development-only` | 5 |
 | `HF2Q_METAL_CAPTURE_LAYERS` | `development-only` | 3 |
@@ -371,14 +379,12 @@ this release:
 | `HF2Q_SKIP_V_NORM` | `development-only` | 2 |
 | `HF2Q_SKIP_WEIGHTED_SUM` | `development-only` | 2 |
 | `HF2Q_SPEC_DECODE` | `development-only` | 54 |
-| `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED` | `development-only` | 14 |
 | `HF2Q_SPEC_DECODE_K` | `development-only` | 16 |
 | `HF2Q_SPEC_DECODE_K1` | `development-only` | 10 |
 | `HF2Q_SPEC_DECODE_K1_NO_AMORT` | `development-only` | 3 |
 | `HF2Q_SPEC_DECODE_K1_TRACE` | `development-only` | 2 |
 | `HF2Q_SPEC_DECODE_K1_TWO_CALLS` | `development-only` | 2 |
 | `HF2Q_SPEC_DECODE_KN_HIDDEN_ROW_CAP` | `development-only` | 3 |
-| `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` | `promote-or-internalize` | 18 |
 | `HF2Q_SPEC_DFLASH` | `development-only` | 30 |
 | `HF2Q_SPEC_DFLASH_BLOCK_SIZE` | `development-only` | 1 |
 | `HF2Q_SPEC_DFLASH_PHASE` | `development-only` | 1 |

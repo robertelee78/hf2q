@@ -32,12 +32,12 @@
 //!    `MultiSeqHbKvBuffers::reset_for_slot` at line 687+ in the Gemma 4
 //!    file — cursor-only reset; K/V byte preservation discipline).
 //!
-//! The **threshold gate** lives in `serve::api::engine::Engine::
-//! spawn_with_mode` and returns `EngineSpawnError::
-//! SpecDecodeMaxSlotsAboveBatchedThreshold` when `max_slots > 4` AND
-//! `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED != 1`. This protects operators
-//! from the published spec-decode inflection-point regression while
-//! letting the API contract land.
+//! Slot capacity is a validated operator setting (ADR-062 D3,
+//! 2026-10-08): the CLI, config load, and the setup prompt accept
+//! 1-`MAX_SUPPORTED_SLOTS` on every family before any spawn. The
+//! spec-decode drafter path itself remains unwired; when it lands it
+//! must carry its own slot gate per the published inflection-point
+//! regression (ADR-040 A4 dossier).
 //!
 //! Per the §6.1.53 closure: iter-A4 iter-1 ships the API + the gate;
 //! `iter-A4-cont-moe-validation` (Qwen3.6-A3B A/B at N=1,2,4,8),
@@ -343,8 +343,8 @@ impl DrafterKvCache {
 // are structurally unreachable).
 //
 // Per the §6.1.53 dossier closure: the API contract IS settled here;
-// production activation gating lives in `Engine::spawn_with_mode` via
-// the `SpecDecodeMaxSlotsAboveBatchedThreshold` typed error variant.
+// production activation of the drafter remains unwired (ADR-040
+// §6.1.55-F5; slot capacity itself is validated per ADR-062 D3).
 // ──────────────────────────────────────────────────────────────────────────
 
 /// **ADR-040 Phase A4 iter-1 (2026-05-30)** — multi-seq variant of
@@ -364,11 +364,9 @@ impl DrafterKvCache {
 /// untouched.
 ///
 /// **Per the §6.1.53 dossier**: the API contract is settled (vLLM/P-EAGLE
-/// per-slot pattern); production activation is gated by
-/// `Engine::spawn_with_mode`'s threshold check
-/// (`SpecDecodeMaxSlotsAboveBatchedThreshold` when `max_slots > 4`).
-/// This type can be safely constructed in test contexts and at
-/// operator-opted-in spawn time.
+/// per-slot pattern); production activation of the drafter remains
+/// unwired (ADR-040 §6.1.55-F5). This type can be safely constructed in
+/// test contexts.
 pub struct MultiSeqDrafterKvCache {
     /// Number of physical slots — the outermost axis on K + V.
     /// Set at construction via [`alloc_multi_seq_drafter_kv_for_layer`];
@@ -805,11 +803,8 @@ fn drafter_copy_buffer_slot_region(
 // [`MultiSeqDrafterKvCache`] (post-A4 batched spec-decode opt-in)
 // based on the engine mode discriminator.  Today the SlotAware-side
 // arm is structurally wired but NEVER engaged at runtime — the
-// `Engine::spawn_with_mode` SlotAware arm's threshold gate from iter-1
-// (§6.1.54) rejects `max_slots > 4` unless
-// `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1` is set; once the operator opts
-// in OR an empirical inflection-point measurement lands a tunable
-// threshold above 1, this dispatcher is the routing seam the worker
+// drafter path itself remains unwired (ADR-040 §6.1.55-F5); when a
+// drafter lands, this dispatcher is the routing seam the worker
 // arm will call.
 //
 // **Pure variant + routing helper** — no kernel writes.  The
@@ -831,10 +826,9 @@ fn drafter_copy_buffer_slot_region(
 ///   degenerate case where the multi-seq path would carry the same
 ///   byte count anyway; H230 pins the byte equivalence).
 /// - [`Self::MultiSeq`] — post-A4 multi-seq cache.  Selected on
-///   `EngineMode::SlotAware { max_slots: N>1 }` AFTER the threshold
-///   gate at `Engine::spawn_with_mode` either accepts the value OR the
-///   operator has set `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1` for the
-///   documented-regression regime.
+///   `EngineMode::SlotAware { max_slots: N>1 }`, which the shared
+///   CLI/config/setup slot-range validation (ADR-062 D3) has already
+///   accepted before spawn.
 ///
 /// **iter-A4-cont-drafter-dispatcher-kernel (deferred)**: the
 /// kernel-level routing through `tree_attention` per-slot byte
@@ -890,10 +884,9 @@ impl DrafterKvCacheVariant {
 /// - `max_slots > 1` ⇒ pick `DrafterKvCacheVariant::MultiSeq` — the
 ///   per-slot cursor + buffer routing seam.
 ///
-/// The companion [`Engine::spawn_with_mode`] threshold gate at
-/// `engine.rs::SpecDecodeMaxSlotsAboveBatchedThreshold` enforces the
-/// safe-zone policy; this helper is reached ONLY when the gate
-/// already accepted the `max_slots` value.
+/// Slot capacity is validated before spawn by the shared
+/// CLI/config/setup authority (ADR-062 D3); this helper is reached
+/// only with an accepted `max_slots` value.
 ///
 /// # Cross-references
 ///

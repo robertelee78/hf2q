@@ -102,7 +102,10 @@ pub(super) fn resolve_preferences<R: BufRead, W: Write>(
             return Ok(PreferenceResolution::Cancelled);
         };
         if !answer.is_empty() {
-            selected.serve.max_slots = parse_positive_u32("active request count", &answer)?;
+            let max_slots = parse_positive_u32("active request count", &answer)?;
+            crate::serve::operator_settings::validate_max_slots(max_slots)
+                .map_err(SetupError::Input)?;
+            selected.serve.max_slots = max_slots;
         }
     }
 
