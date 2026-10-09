@@ -187,15 +187,6 @@ fn execute<P: HostProbe, R: BufRead, W: Write>(
             .as_deref()
             .unwrap_or("no explicit ceiling")
     )?;
-    if let (Some(penalty), Some(budget)) = (
-        config.serve.repetition_penalty,
-        config.serve.thinking_token_budget,
-    ) {
-        writeln!(
-            output,
-            "Agentic serving profile: repetition penalty {penalty}, thinking budget {budget} tokens."
-        )?;
-    }
     if config.serve.host == "0.0.0.0" {
         writeln!(
             output,

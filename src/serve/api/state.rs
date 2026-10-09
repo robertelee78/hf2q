@@ -91,12 +91,15 @@ pub struct ServerConfig {
     /// system_fingerprint`. Defaults to `None`; production can set to
     /// `"hf2q-<short-git-sha>-mlx-native"`.
     pub system_fingerprint: Option<String>,
-    /// Server-wide sampling default used only when a request omits
-    /// `repetition_penalty`.
-    pub default_repetition_penalty: f32,
-    /// Default Qwen reasoning budget used only when a request omits it.
+    /// CLI `--default-repetition-penalty` layer only. `None` defers to the
+    /// loaded family's built-in profile (ADR-062 D1), resolved per request
+    /// once the serving engine is known.
+    pub default_repetition_penalty: Option<f32>,
+    /// CLI `--default-thinking-token-budget` layer only. `None` defers to
+    /// the loaded family's built-in profile (ADR-062 D1).
     pub default_thinking_token_budget: Option<u32>,
-    /// Default continuation/required-tool reasoning budget.
+    /// CLI `--default-tool-thinking-token-budget` layer only. `None` defers
+    /// to the loaded family's built-in profile (ADR-062 D1).
     pub default_tool_thinking_token_budget: Option<u32>,
 
     // --- GCD / Grammar-Constrained Decoding (ADR-053) ---
@@ -131,7 +134,7 @@ impl Default for ServerConfig {
             default_overflow_policy: OverflowPolicy::Summarize,
             cache_dir: default_cache_dir(),
             system_fingerprint: None,
-            default_repetition_penalty: 1.0,
+            default_repetition_penalty: None,
             default_thinking_token_budget: None,
             default_tool_thinking_token_budget: None,
             gcd: false,

@@ -1482,24 +1482,28 @@ pub struct ServePlanningArgs {
 }
 
 /// Typed server defaults used only when an API request omits the matching
-/// field. These replace the former process-environment bridge.
+/// field. These replace the former process-environment bridge; the former
+/// `[serve]` behavior keys are retired (ADR-062 D1), so the built-in layer
+/// these flags override is the per-family profile.
 #[derive(clap::Args, Debug, Clone)]
 pub struct ServeBehaviorArgs {
-    /// Default repetition penalty for requests that omit it. Overrides
-    /// `[serve] repetition_penalty`; `1.0` disables the penalty, and an
-    /// explicit request value always wins.
+    /// Default repetition penalty for requests that omit it. Overrides the
+    /// loaded family's built-in (Qwen/Gemma 1.05, DeepSeek 1.0 per
+    /// ADR-062 D1); `1.0` disables the penalty, and an explicit request
+    /// value always wins.
     #[arg(long, value_name = "FLOAT")]
     pub default_repetition_penalty: Option<f32>,
 
-    /// Default Qwen thinking-token budget. Overrides
-    /// `[serve] thinking_token_budget`; `0` disables the default, and an
-    /// explicit request value always wins.
+    /// Default thinking-token budget. Overrides the loaded family's
+    /// built-in (Qwen 2048 per ADR-062 D1); `0` disables the default, and
+    /// an explicit request value always wins.
     #[arg(long, value_name = "TOKENS")]
     pub default_thinking_token_budget: Option<u32>,
 
     /// Default tool-continuation/required-tool thinking-token budget.
-    /// Overrides `[serve] tool_thinking_token_budget`; `0` disables the
-    /// continuation override, and an explicit request value always wins.
+    /// Overrides the loaded family's built-in (Qwen/DeepSeek 512 per
+    /// ADR-062 D1); `0` disables the continuation override, and an explicit
+    /// request value always wins.
     #[arg(long, value_name = "TOKENS")]
     pub default_tool_thinking_token_budget: Option<u32>,
 }

@@ -10,6 +10,3 @@ host = "127.0.0.1"
 port = 8081
 scheduler = "inflight_batched"
 max_slots = 4
-repetition_penalty = 1.05
-thinking_token_budget = 2048
-tool_thinking_token_budget = 512

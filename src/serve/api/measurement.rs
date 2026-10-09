@@ -90,6 +90,14 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
         }
     };
     drop(cache);
+    // ADR-062 D1 — report the effective per-loaded-family sampling
+    // defaults (CLI `--default-*` > the family built-in), not just the CLI
+    // layer captured at startup.
+    let builtin_serve_profile = crate::serve::operator_settings::family_serve_profile(
+        engine
+            .registration()
+            .map(|registration| registration.family),
+    );
     canonical(json!({
         "schema_version": "hf2q.measurement-snapshot.v1",
         "process_pid": std::process::id(),
@@ -108,9 +116,18 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
             "request_timeout_seconds": state.config.request_timeout_seconds,
         },
         "sampling_defaults": {
-            "repetition_penalty": state.config.default_repetition_penalty,
-            "thinking_token_budget": state.config.default_thinking_token_budget,
-            "tool_thinking_token_budget": state.config.default_tool_thinking_token_budget,
+            "repetition_penalty": state
+                .config
+                .default_repetition_penalty
+                .unwrap_or(builtin_serve_profile.repetition_penalty),
+            "thinking_token_budget": state
+                .config
+                .default_thinking_token_budget
+                .or(builtin_serve_profile.thinking_token_budget),
+            "tool_thinking_token_budget": state
+                .config
+                .default_tool_thinking_token_budget
+                .or(builtin_serve_profile.tool_thinking_token_budget),
             "overflow_policy": format!("{:?}", state.config.default_overflow_policy),
         },
         "active_controls": {

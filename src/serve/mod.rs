@@ -4325,7 +4325,7 @@ pub fn cmd_serve(
     .map_err(anyhow::Error::msg)?;
     let kv_persist_budget_bytes = kv_persist_budget.bytes.unwrap_or(0);
     let kv_persist_dir = args.planning.kv_persist_path.clone();
-    let behavior = operator_settings::resolve_serve_behavior(&args.behavior, operator_defaults)
+    let behavior = operator_settings::resolve_serve_behavior(&args.behavior)
         .map_err(anyhow::Error::msg)?;
     tracing::info!(
         engine_mode = ?engine_mode,
