@@ -29,7 +29,7 @@ a rerun. EOF or interrupted input cancels successfully without changing the
 configuration.
 
 The canonical Qwen3.8 guide defaults are Q4_K_M conversion, localhost port
-8081, the inflight-batched scheduler with one active slot, and the qualified
+8081, the inflight-batched scheduler with four active slots, and the qualified
 agentic serving profile (see the config keys below). On a fresh
 config, automation can record those values without prompting; on a rerun the
 same flag accepts the current values. Operators using another family should
@@ -47,7 +47,7 @@ hf2q setup \
   --serve-host 127.0.0.1 \
   --serve-port 8081 \
   --serve-scheduler inflight-batched \
-  --serve-max-slots 1 \
+  --serve-max-slots 4 \
   --serve-kv-persist-budget 32GiB
 ```
 
@@ -83,7 +83,7 @@ quant = "q4_k_m"
 host = "127.0.0.1"
 port = 8081
 scheduler = "inflight_batched"
-max_slots = 1
+max_slots = 4
 repetition_penalty = 1.05
 thinking_token_budget = 2048
 tool_thinking_token_budget = 512

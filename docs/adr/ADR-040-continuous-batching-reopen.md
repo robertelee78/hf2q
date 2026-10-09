@@ -2,6 +2,8 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
+> **Amendment 2026-10-08 (ADR-062 D0):** the production default is no longer `EngineMode::SerialFifo`. With no `--scheduler` and no `config.toml`, serve uses `inflight-batched` with 4 slots, the same scheduler and slot count `hf2q setup` records (one shared constant, `GUIDE_MAX_SLOTS`). `fifo-serial` remains an explicit compatibility mode; an over-limit prompt under it returns HTTP 400 `prompt_exceeds_server_limit`. Statements below that the default stays SerialFifo describe the pre-amendment state.
+
 - **Status**: 🟢 **FULL-CONTEXT THREE-FAMILY WORKLOAD SERVED (2026-08-08)** — every configured agent slot receives the complete logical model context; aggregate physical KV is governed by one shared high-water budget. Gemma 4, Qwen 3.6, and DeepSeek-V4 passed real four-agent OpenCode gates with native templates, tools, SSE, tool-result continuation, and retained prefix state. The historical 2026-07-01 8×32K result remains below as provenance for the fused batching work.
 >   - **Operator surface corrected (2026-08-23).** [ADR-050](ADR-050-operator-context-and-static-info.md)
 >     names these independent axes `--ctx`, `--max-slots`, and

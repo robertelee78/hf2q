@@ -121,6 +121,19 @@ impl ApiError {
         )
     }
 
+    /// Prompt longer than the fifo-serial scheduler can prefill (HTTP 400).
+    /// Raised only when the operator explicitly selected fifo-serial; the
+    /// default inflight-batched scheduler prefills in resumable chunks.
+    pub fn prompt_exceeds_server_limit(message: impl Into<String>) -> Self {
+        Self::bare(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            Some("prompt_exceeds_server_limit"),
+            Some("messages".into()),
+        )
+    }
+
     /// Queue full (HTTP 429) — serialized FIFO queue at hard cap.
     ///
     /// **ADR-005 Phase 2 Decision #2** — serialized FIFO queue under

@@ -12,7 +12,9 @@ use crate::cli::SetupArgs;
 
 use self::host::{HostObservation, HostProbe, LiveHostProbe};
 use self::policy::{resolve_preferences, PreferenceResolution};
-pub(crate) use self::schema::{OperatorConfigV2, ServeDefaultsV2};
+pub(crate) use self::schema::{
+    OperatorConfigV2, ServeDefaultsV2, GUIDE_MAX_SLOTS, GUIDE_SCHEDULER,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigPurgePlan {

@@ -7687,6 +7687,9 @@ fn common_engine_error_response(state: Option<&AppState>, msg: &str) -> Option<R
     if msg.contains("invalid_request:") {
         return Some(ApiError::invalid_request(msg.to_string(), None).into_response());
     }
+    if let Some((_, detail)) = msg.split_once(&format!("{}: ", engine::SERIAL_PROMPT_LIMIT_SENTINEL)) {
+        return Some(ApiError::prompt_exceeds_server_limit(detail.to_string()).into_response());
+    }
     if msg.contains("capability_unsupported:") {
         return Some(ApiError::capability_unsupported(msg).into_response());
     }

@@ -306,7 +306,7 @@ fn fresh_and_repeated_noninteractive_setup_are_idempotent() {
     assert!(output.contains("No model was downloaded"));
     assert!(output.contains("q4_k_m"));
     assert!(output.contains("127.0.0.1:8081"));
-    assert!(output.contains("inflight_batched (max slots 1)"));
+    assert!(output.contains("inflight_batched (max slots 4)"));
     let before = fs::read(root.join("config.toml")).unwrap();
     assert_eq!(before, include_bytes!("testdata/config_v2.toml"));
     let metadata = fs::metadata(root.join("config.toml")).unwrap();

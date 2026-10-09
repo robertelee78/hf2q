@@ -287,7 +287,8 @@ production consumers:
 - `serve.max_slots`.
 
 The guide-proven recommendation is `q4_k_m`, `127.0.0.1:8081`, and
-`inflight_batched` with one active slot. Interactive setup explains and may
+`inflight_batched` with four active slots (amended 2026-10-08, ADR-062 D0).
+Interactive setup explains and may
 change each value. Setup observes hardware and storage to inform the operator,
 but does not persist a hardware snapshot or claim that a model-free probe can
 derive a safe model size.
