@@ -45,6 +45,7 @@ pub mod middleware;
 mod measurement;
 pub mod qwen35_speculation;
 mod qwen_thinking_policy;
+mod reasoning_controls;
 pub mod registry;
 pub mod router;
 pub mod schema;

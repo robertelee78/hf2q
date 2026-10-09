@@ -29772,10 +29772,15 @@ pub(crate) fn render_deepseek_v4_prompt_with_serialized_tools(
         .unwrap_or("low")
     {
         "low" => ReasoningEffort::Low,
-        "high" => ReasoningEffort::High,
-        "max" => ReasoningEffort::Max,
+        // ADR-062 D5: the one effort table's aliases land here too —
+        // `medium` maps onto the native `high` tier (DeepSeek-V4 has no
+        // native medium) and `xhigh` onto `max`.
+        "medium" | "high" => ReasoningEffort::High,
+        "xhigh" | "max" => ReasoningEffort::Max,
         other => {
-            anyhow::bail!("DeepSeek-V4 reasoning_effort must be low, high, or max; got {other:?}")
+            anyhow::bail!(
+                "DeepSeek-V4 reasoning_effort must be low, medium, high, xhigh, or max; got {other:?}"
+            )
         }
     };
 

@@ -32,10 +32,17 @@ use super::engine_error::EngineRequestError;
 use super::grammar;
 use super::lifecycle::ModelLease;
 #[cfg(test)]
-use super::qwen_thinking_policy::{adaptive_qwen_default_thinking_budget, QwenToolChainState};
 use super::qwen_thinking_policy::{
-    constrained_thinking_budget_conflicts, effective_qwen_thinking_budget, qwen_thinking_mode,
-    qwen_tool_chain_state, resolve_qwen_thinking_policy, QwenThinkingDefaults,
+    adaptive_qwen_default_thinking_budget, effective_qwen_thinking_budget, QwenToolChainState,
+};
+use super::qwen_thinking_policy::{
+    constrained_thinking_budget_conflicts, qwen_thinking_mode, qwen_tool_chain_state,
+};
+#[cfg(test)]
+use super::reasoning_controls::enabled_default_thinking_budget;
+use super::reasoning_controls::{
+    reasoning_channel_for, reasoning_controls_from_request, resolve_thinking_budget_policy,
+    ReasoningChannel,
 };
 use super::registry;
 use super::schema::{
@@ -1310,10 +1317,6 @@ fn deepseek_required_tool_thinking_eligible(
         && explicit_thinking_budget.is_none()
 }
 
-fn enabled_default_thinking_budget(value: Option<u32>) -> Option<usize> {
-    value.and_then(|value| (value > 0).then_some(value as usize))
-}
-
 fn repeated_tool_result_signature(
     messages: &[ChatMessage],
     threshold: usize,
@@ -1709,14 +1712,22 @@ mod qwen_thinking_budget_tests {
     }
 }
 
-fn resolve_api_enable_thinking(request_override: Option<bool>, template: &str) -> bool {
-    request_override.unwrap_or_else(|| crate::serve::template_supports_enable_thinking(template))
+/// Compose the pre-render thinking mode: an explicit reasoning control or
+/// thinking override wins; otherwise the loaded template's probed
+/// capability is the stock-client default (ADR-062 D5 keeps this the one
+/// composition point — the caller probes the template once and shares the
+/// result with the reasoning-channel resolution).
+fn resolve_api_enable_thinking(
+    request_override: Option<bool>,
+    template_supports_thinking: bool,
+) -> bool {
+    request_override.unwrap_or(template_supports_thinking)
 }
 
 fn resolve_api_template_kwargs(
     registration: Option<&registry::ModelRegistration>,
     request_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
-    reasoning_effort: Option<&str>,
+    deepseek_reasoning_effort: Option<&'static str>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut resolved = request_kwargs.cloned().unwrap_or_default();
     if registration.is_some_and(|candidate| candidate.family == "qwen35") {
@@ -1725,17 +1736,15 @@ fn resolve_api_template_kwargs(
             .or_insert(serde_json::Value::Bool(true));
     }
     if registration.is_some_and(|candidate| candidate.family == "deepseek4") {
-        if let Some(effort) = reasoning_effort {
-            // Stock OpenCode sends `none` when no reasoning variant is
-            // selected. DeepSeek's native lowest tier is `low`, which adds no
-            // effort-specific instruction, so normalize only that top-level
-            // client sentinel at the compatibility boundary. An explicit
+        if let Some(tier) = deepseek_reasoning_effort {
+            // ADR-062 D5: the one effort table maps every level onto
+            // DeepSeek-V4's native tiers (`medium` -> `high`; `none`/`minimal`
+            // turn thinking off upstream, so they carry no tier). An explicit
             // chat_template_kwargs value retains precedence and remains
-            // subject to the native low/high/max validator.
-            let effort = if effort == "none" { "low" } else { effort };
+            // subject to the native tier validator.
             resolved
                 .entry("reasoning_effort")
-                .or_insert_with(|| serde_json::Value::String(effort.to_owned()));
+                .or_insert_with(|| serde_json::Value::String(tier.to_owned()));
         }
     }
     (!resolved.is_empty()).then_some(resolved)
@@ -2000,13 +2009,49 @@ where
     {
         return Err(ApiError::invalid_request(error.message, Some(error.param)).into_response());
     }
+    // ADR-062 D5 — reasoning controls parse once, before the render, and
+    // behave identically on every family: the top-level `reasoning_effort`
+    // and `thinking_token_budget` fields merge with their
+    // `reasoning.{effort,enabled,max_tokens}` aliases through one effort
+    // table (none/minimal off; low 512; medium 2048; high 8192; xhigh/max
+    // no ceiling; DeepSeek native tiers mapped with medium -> high).
+    // Contradictory combinations are a 400, and a family whose template has
+    // no thinking channel rejects every reasoning control instead of
+    // accepting-and-ignoring it.
+    let reasoning_controls = reasoning_controls_from_request(req).map_err(|error| {
+        ApiError::invalid_request(error.message, Some(error.param.into())).into_response()
+    })?;
+    let template_supports_thinking =
+        crate::serve::template_supports_enable_thinking(engine.chat_template());
+    let reasoning_channel =
+        reasoning_channel_for(engine.registration(), template_supports_thinking);
+    if reasoning_channel == ReasoningChannel::None && reasoning_controls.d5_control_present() {
+        // `none`/`minimal` means thinking OFF — trivially satisfied on a
+        // family with no thinking channel, so it is an accepted no-op
+        // (stock OpenCode sends `reasoning_effort: "none"` unconditionally;
+        // 400ing it would break every stock request on Gemma 4). Any
+        // positive effort level, `enabled`, or an explicit budget is a
+        // control the family can never satisfy and stays a 400
+        // (ADR-062 D5 bullet 4).
+        if !reasoning_controls.requested_thinking_off() {
+            let param = reasoning_controls.first_d5_param();
+            return Err(ApiError::invalid_request(
+                format!("{param} requires a model with a thinking channel"),
+                Some(param.into()),
+            )
+            .into_response());
+        }
+    }
     // A stock OpenAI-compatible client cannot be expected to know an hf2q
-    // extension. An explicit request override still wins; when it is absent,
-    // derive the native default from the loaded chat template using the same
-    // render-and-diff capability probe as the CLI. Non-reasoning templates
-    // remain off, while thinking-capable templates keep their intended mode.
-    let enable_thinking =
-        resolve_api_enable_thinking(req.hf2q_enable_thinking, engine.chat_template());
+    // extension. An explicit reasoning control or thinking override still
+    // wins; when none is present, derive the native default from the loaded
+    // chat template using the same render-and-diff capability probe as the
+    // CLI. Non-reasoning templates remain off, while thinking-capable
+    // templates keep their intended mode.
+    let enable_thinking = resolve_api_enable_thinking(
+        reasoning_controls.thinking_enabled_override(),
+        template_supports_thinking,
+    );
     // ADR-005 iter-229 Decision 4: extra Jinja context vars (e.g.
     // preserve_thinking) ride the whole render path; reserved-key
     // validation happens inside the renderer and maps to 400.
@@ -2018,7 +2063,7 @@ where
     let resolved_template_kwargs = resolve_api_template_kwargs(
         engine.registration(),
         req.chat_template_kwargs.as_ref(),
-        req.reasoning_effort.as_deref(),
+        reasoning_controls.deepseek_reasoning_effort_tier(),
     );
     let template_kwargs = resolved_template_kwargs.as_ref();
     let (prompt_tokens, _prompt_len, summarized_messages, summary_tokens) =
@@ -2108,21 +2153,11 @@ where
         .max_completion_tokens
         .or(req.max_tokens)
         .unwrap_or(SamplingParams::default().max_tokens);
-    let explicit_thinking_budget = req.thinking_token_budget;
     let constrained_tool_choice = matches!(
         &tool_choice,
         super::schema::ToolChoiceValue::Required | super::schema::ToolChoiceValue::Function(_)
     );
     let qwen_thinking_mode = qwen_thinking_mode(engine.registration(), reasoning_forced_open);
-    let deepseek_required_tool_thinking_mode = deepseek_required_tool_thinking_eligible(
-        engine.registration(),
-        reasoning_forced_open,
-        constrained_tool_choice,
-        req_tools.map_or(0, |tools| tools.len()),
-        effective_parallel_tool_calls(req.parallel_tool_calls),
-        req.logprobs.unwrap_or(false),
-        explicit_thinking_budget,
-    );
     // ADR-062 D1 — the per-family built-in serving profile. The loaded
     // engine's registration is the authoritative family, so the built-in
     // layer applies per loaded model (mirroring how GLP templates resolve
@@ -2144,28 +2179,41 @@ where
             );
         }
     }
-    let qwen_defaults = if explicit_thinking_budget.is_none() && qwen_thinking_mode {
-        QwenThinkingDefaults::from_config(
-            state
-                .config
-                .default_thinking_token_budget
-                .or(builtin_serve_profile.thinking_token_budget),
-            state
-                .config
-                .default_tool_thinking_token_budget
-                .or(builtin_serve_profile.tool_thinking_token_budget),
-        )
-    } else {
-        QwenThinkingDefaults::default()
-    };
-    let qwen_resolution = resolve_qwen_thinking_policy(
+    // DeepSeek-V4's auto-derived required-tool thinking budget stays narrowly
+    // scoped (thinking forced open, one tool, no parallel calls, no
+    // logprobs) and never stacks with a client budget number; an explicit
+    // client budget flows through the shared enforcer below instead.
+    let deepseek_required_tool_eligible = deepseek_required_tool_thinking_eligible(
         engine.registration(),
         reasoning_forced_open,
+        constrained_tool_choice,
+        req_tools.map_or(0, |tools| tools.len()),
+        effective_parallel_tool_calls(req.parallel_tool_calls),
+        req.logprobs.unwrap_or(false),
+        reasoning_controls.budget,
+    );
+    // ADR-062 D5 — one shared budget enforcer covers every family on
+    // inflight-batched, including Gemma 4; on fifo-serial only an explicit
+    // client budget is rejected, identically on every family, and a
+    // server-side default budget is dropped with a warning, never a 4xx
+    // (issue #278 findings 3 and 10).
+    let budget_resolution = resolve_thinking_budget_policy(
+        engine.registration(),
+        reasoning_channel,
+        &reasoning_controls,
+        reasoning_forced_open,
         &tool_choice,
-        explicit_thinking_budget,
         max_tokens,
         chain_state,
-        qwen_defaults,
+        state
+            .config
+            .default_thinking_token_budget
+            .or(builtin_serve_profile.thinking_token_budget),
+        state
+            .config
+            .default_tool_thinking_token_budget
+            .or(builtin_serve_profile.tool_thinking_token_budget),
+        deepseek_required_tool_eligible,
         matches!(engine.mode(), engine::EngineMode::SlotAware { .. }),
         |text| {
             engine
@@ -2178,125 +2226,34 @@ where
     .map_err(|error| {
         ApiError::invalid_request(error.message, Some(error.param.into())).into_response()
     })?;
-    let qwen_required_tool_thinking_mode = qwen_resolution.required_tool_mode;
-    let deepseek_default_thinking_budget = if deepseek_required_tool_thinking_mode {
-        enabled_default_thinking_budget(
-            state
-                .config
-                .default_tool_thinking_token_budget
-                .or(builtin_serve_profile.tool_thinking_token_budget),
-        )
-    } else {
-        None
-    };
-    if !qwen_thinking_mode && explicit_thinking_budget == Some(0) {
-        return Err(ApiError::invalid_request(
-            "thinking_token_budget must be greater than zero",
-            Some("thinking_token_budget".into()),
-        )
-        .into_response());
+    if let Some((budget, reason)) = budget_resolution.dropped_budget {
+        tracing::warn!(
+            budget,
+            reason,
+            "thinking budget dropped instead of enforced (ADR-062 D5: a server-side budget never fails a request)"
+        );
     }
-    let configured_thinking_budget = (!qwen_thinking_mode)
-        .then_some(explicit_thinking_budget.or(deepseek_default_thinking_budget))
-        .flatten();
     if qwen_thinking_mode {
         tracing::info!(
             tool_continuation = chain_state.is_tool_continuation,
             tool_cycles_since_user = chain_state.tool_cycles_since_user,
-            explicit_thinking_budget,
-            effective_default_thinking_budget = qwen_resolution.default_budget,
-            effective_thinking_budget = qwen_resolution.effective_budget,
-            required_tool_mode = qwen_resolution.required_tool_mode,
+            explicit_thinking_budget = reasoning_controls.budget,
+            effective_thinking_budget = budget_resolution.thinking_budget,
+            required_tool_mode = budget_resolution.qwen_required_tool_mode,
             "Qwen thinking budget policy resolved"
         );
     }
-    if deepseek_required_tool_thinking_mode {
+    if budget_resolution.deepseek_required_tool_mode {
         tracing::info!(
-            effective_default_thinking_budget = deepseek_default_thinking_budget,
+            effective_thinking_budget = budget_resolution.thinking_budget,
             "DeepSeek-V4 required-tool thinking budget policy resolved"
         );
     }
-    let (thinking_token_budget, reasoning_end_tokens, reasoning_close_tokens) =
-        if qwen_thinking_mode {
-            (
-                qwen_resolution.effective_budget,
-                qwen_resolution.end_tokens,
-                qwen_resolution.close_tokens,
-            )
-        } else if let Some(budget) = configured_thinking_budget {
-            let Some(registration) = engine.registration() else {
-                return Err(ApiError::invalid_request(
-                    "thinking_token_budget requires a registered reasoning-capable model",
-                    Some("thinking_token_budget".into()),
-                )
-                .into_response());
-            };
-            let qwen_budget = registration.family == "qwen35" && reasoning_forced_open;
-            let deepseek_budget = registration.family == "deepseek4"
-                && deepseek_required_tool_thinking_mode
-                && explicit_thinking_budget.is_none();
-            if !qwen_budget && !deepseek_budget {
-                return Err(ApiError::invalid_request(
-                    "thinking_token_budget currently requires Qwen thinking mode",
-                    Some("thinking_token_budget".into()),
-                )
-                .into_response());
-            }
-            if !matches!(engine.mode(), engine::EngineMode::SlotAware { .. }) {
-                return Err(ApiError::invalid_request(
-                    "thinking_token_budget requires an inflight-batched scheduler",
-                    Some("thinking_token_budget".into()),
-                )
-                .into_response());
-            }
-            let close = registration.reasoning_close.ok_or_else(|| {
-                ApiError::invalid_request(
-                    "thinking_token_budget requires a registered reasoning close marker",
-                    Some("thinking_token_budget".into()),
-                )
-                .into_response()
-            })?;
-            let transition = close.to_string();
-            let encode = |text: &str| {
-                engine
-                    .tokenizer()
-                    .encode(text, false)
-                    .map(|encoding| std::sync::Arc::new(encoding.get_ids().to_vec()))
-                    .map_err(|error| {
-                        ApiError::invalid_request(
-                            format!("failed to tokenize reasoning boundary: {error}"),
-                            Some("thinking_token_budget".into()),
-                        )
-                        .into_response()
-                    })
-            };
-            let end_tokens = encode(&transition)?;
-            let close_tokens = encode(close)?;
-            if end_tokens.is_empty() || close_tokens.is_empty() {
-                return Err(ApiError::invalid_request(
-                    "reasoning boundary tokenized to an empty sequence",
-                    Some("thinking_token_budget".into()),
-                )
-                .into_response());
-            }
-            let effective_budget = effective_qwen_thinking_budget(
-                Some(budget),
-                explicit_thinking_budget.is_some(),
-                max_tokens,
-                end_tokens.len(),
-            )
-            .map_err(|message| {
-                ApiError::invalid_request(message, Some("thinking_token_budget".into()))
-                    .into_response()
-            })?;
-            if let Some(effective_budget) = effective_budget {
-                (Some(effective_budget), Some(end_tokens), Some(close_tokens))
-            } else {
-                (None, None, None)
-            }
-        } else {
-            (None, None, None)
-        };
+    let thinking_token_budget = budget_resolution.thinking_budget;
+    let reasoning_end_tokens = budget_resolution.reasoning_end_tokens;
+    let reasoning_close_tokens = budget_resolution.reasoning_close_tokens;
+    let qwen_required_tool_thinking_mode = budget_resolution.qwen_required_tool_mode;
+    let deepseek_required_tool_thinking_mode = budget_resolution.deepseek_required_tool_mode;
     let stop_strings = req.stop.clone().map(|s| s.into_vec()).unwrap_or_default();
     // Translate request logit_bias (HashMap<String, f32>) → HashMap<u32, f32>.
     // OpenAI keys are stringified token ids; we accept any string that parses
@@ -5157,6 +5114,7 @@ mod compile_tool_grammar_precondition_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            reasoning: None,
             thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
@@ -10820,6 +10778,7 @@ mod readiness_guard_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            reasoning: None,
             thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
@@ -10940,6 +10899,7 @@ mod readiness_guard_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            reasoning: None,
             thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
@@ -11390,6 +11350,7 @@ mod pool_error_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            reasoning: None,
             thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
@@ -11484,6 +11445,7 @@ mod iter215_qwen35_chat_501_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            reasoning: None,
             thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
@@ -12434,6 +12396,7 @@ mod a5d_handler_429_tests {
             top_p: None,
             seed: None,
             reasoning_effort: None,
+            reasoning: None,
             thinking_token_budget: None,
             frequency_penalty: None,
             presence_penalty: None,
@@ -12925,7 +12888,10 @@ mod iter230_b_probe_tests {
 
 #[cfg(test)]
 mod api_thinking_default_tests {
-    use super::super::schema::{ChatMessage, MessageContent, ToolCall, ToolCallFunction};
+    use super::super::reasoning_controls::{reasoning_controls_from_request, EffortLevel};
+    use super::super::schema::{
+        ChatCompletionRequest, ChatMessage, MessageContent, ToolCall, ToolCallFunction,
+    };
     use super::{engine, registry, resolve_api_enable_thinking, resolve_api_template_kwargs};
 
     fn message(role: &str, content: &str) -> ChatMessage {
@@ -12941,9 +12907,13 @@ mod api_thinking_default_tests {
 
     #[test]
     fn stock_client_uses_thinking_capable_template_default() {
+        // ADR-062 D5: the caller probes the template once and shares the
+        // result with the reasoning-channel resolution.
         assert!(resolve_api_enable_thinking(
             None,
-            crate::core::chat_templates::QWEN3_CHATML,
+            crate::serve::template_supports_enable_thinking(
+                crate::core::chat_templates::QWEN3_CHATML
+            ),
         ));
     }
 
@@ -12951,20 +12921,16 @@ mod api_thinking_default_tests {
     fn stock_client_keeps_non_reasoning_template_off() {
         assert!(!resolve_api_enable_thinking(
             None,
-            "{{ messages }}{% if add_generation_prompt %}assistant:{% endif %}",
+            crate::serve::template_supports_enable_thinking(
+                "{{ messages }}{% if add_generation_prompt %}assistant:{% endif %}",
+            ),
         ));
     }
 
     #[test]
     fn explicit_request_override_wins_over_template_default() {
-        assert!(!resolve_api_enable_thinking(
-            Some(false),
-            crate::core::chat_templates::QWEN3_CHATML,
-        ));
-        assert!(resolve_api_enable_thinking(
-            Some(true),
-            "{{ messages }}{% if add_generation_prompt %}assistant:{% endif %}",
-        ));
+        assert!(!resolve_api_enable_thinking(Some(false), true));
+        assert!(resolve_api_enable_thinking(Some(true), false));
     }
 
     #[test]
@@ -13085,15 +13051,57 @@ mod api_thinking_default_tests {
     }
 
     #[test]
-    fn deepseek_normalizes_stock_client_none_reasoning_effort_to_low() {
+    fn deepseek_maps_stock_client_effort_levels_through_the_one_table() {
+        // ADR-062 D5: the stock-client `none` sentinel (OpenCode sends it
+        // when no reasoning variant is selected) now means "thinking off"
+        // through the one effort table instead of being normalized to
+        // DeepSeek's native `low` tier, and `medium` maps to the native
+        // `high` tier because DeepSeek-V4 has no native medium.
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none"
+        }))
+        .unwrap();
+        let controls = reasoning_controls_from_request(&request).unwrap();
+        assert_eq!(controls.effort, Some(EffortLevel::Off));
+        assert_eq!(controls.thinking_enabled_override(), Some(false));
+        assert_eq!(controls.deepseek_reasoning_effort_tier(), None);
         let registration = registry::find_for("deepseek-v4-flash")
             .or_else(|| registry::find_for("deepseek4"))
             .expect("DeepSeek-V4 registration");
-        let resolved = resolve_api_template_kwargs(Some(&registration), None, Some("none"))
-            .expect("stock-client sentinel must produce template kwargs");
+        assert!(
+            resolve_api_template_kwargs(
+                Some(&registration),
+                None,
+                controls.deepseek_reasoning_effort_tier()
+            )
+            .is_none(),
+            "thinking off carries no reasoning_effort tier kwarg"
+        );
+
+        let medium: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "medium"
+        }))
+        .unwrap();
+        let medium_controls = reasoning_controls_from_request(&medium).unwrap();
+        assert_eq!(medium_controls.effort, Some(EffortLevel::Medium));
+        assert_eq!(medium_controls.thinking_enabled_override(), Some(true));
+        assert_eq!(
+            medium_controls.deepseek_reasoning_effort_tier(),
+            Some("high")
+        );
+        let resolved = resolve_api_template_kwargs(
+            Some(&registration),
+            None,
+            medium_controls.deepseek_reasoning_effort_tier(),
+        )
+        .expect("a ladder level must produce template kwargs");
         assert_eq!(
             resolved.get("reasoning_effort"),
-            Some(&serde_json::Value::String("low".into()))
+            Some(&serde_json::Value::String("high".into()))
         );
     }
 

@@ -3,7 +3,10 @@
 //! Qwen templates can seed a hidden reasoning span before generation. A
 //! required or named tool grammar intentionally waits for the reasoning-close
 //! marker, so constrained calls need a bounded close and useful capacity after
-//! it. This module owns that composition as one testable policy unit.
+//! it. This module owns that composition as one testable policy unit; it is
+//! the Qwen branch of the shared ADR-062 D5 budget enforcer
+//! (`super::reasoning_controls::resolve_thinking_budget_policy`), which
+//! every family flows through identically.
 
 use std::sync::Arc;
 
@@ -104,6 +107,18 @@ impl QwenThinkingDefaults {
     }
 }
 
+/// A thinking budget the request asked for by number (ADR-062 D5):
+/// `strict` when the client sent the number itself (`thinking_token_budget`
+/// or `reasoning.max_tokens`), so it must fit within `max_tokens` or the
+/// request is a 400; `false` when the one effort table derived it from a
+/// level or the server supplied a default, so the server clamps it into
+/// the remaining window instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RequestedThinkingBudget {
+    pub(super) tokens: usize,
+    pub(super) strict: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct QwenThinkingResolution {
     pub(super) default_budget: Option<usize>,
@@ -111,6 +126,11 @@ pub(super) struct QwenThinkingResolution {
     pub(super) end_tokens: Option<Arc<Vec<u32>>>,
     pub(super) close_tokens: Option<Arc<Vec<u32>>>,
     pub(super) required_tool_mode: bool,
+    /// A budget that was resolved but not enforced, with its short reason
+    /// (see `super::reasoning_controls`): a server-side or effort-derived
+    /// budget is dropped with a warning instead of failing the request
+    /// (ADR-062 D5 bullet 3).
+    pub(super) dropped_budget: Option<(usize, &'static str)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,14 +147,16 @@ pub(super) fn qwen_thinking_mode(
         && registration.is_some_and(|registration| registration.family == "qwen35")
 }
 
-/// Resolve the complete Qwen reasoning-close policy consumed by the handler.
-/// Tests call this same unit with the real Qwen registration and both
-/// constrained tool-choice variants; the handler supplies the live tokenizer.
+/// Resolve the complete Qwen reasoning-close policy consumed by the shared
+/// ADR-062 D5 budget enforcer. Tests call this same unit with the real Qwen
+/// registration and both constrained tool-choice variants; the enforcer
+/// supplies the live tokenizer.
 pub(super) fn resolve_qwen_thinking_policy<F>(
     registration: Option<&registry::ModelRegistration>,
     reasoning_forced_open: bool,
     tool_choice: &ToolChoiceValue,
-    explicit_budget: Option<usize>,
+    requested_budget: Option<RequestedThinkingBudget>,
+    budget_param: &'static str,
     max_tokens: usize,
     chain: QwenToolChainState,
     defaults: QwenThinkingDefaults,
@@ -147,10 +169,13 @@ where
     if !qwen_thinking_mode(registration, reasoning_forced_open) {
         return Ok(QwenThinkingResolution::default());
     }
-    if explicit_budget == Some(0) {
+    if requested_budget
+        .as_ref()
+        .is_some_and(|budget| budget.tokens == 0)
+    {
         return Err(ThinkingPolicyError {
-            message: "thinking_token_budget must be greater than zero".into(),
-            param: "thinking_token_budget",
+            message: format!("{budget_param} must be greater than zero"),
+            param: budget_param,
         });
     }
 
@@ -158,7 +183,7 @@ where
         tool_choice,
         ToolChoiceValue::Required | ToolChoiceValue::Function(_)
     );
-    let default_budget = if explicit_budget.is_none() {
+    let default_budget = if requested_budget.is_none() {
         qwen_default_thinking_budget_for_mode(
             defaults.base,
             defaults.continuation_override,
@@ -169,7 +194,10 @@ where
     } else {
         None
     };
-    let Some(configured_budget) = explicit_budget.or(default_budget) else {
+    let Some(configured_budget) = requested_budget
+        .map(|budget| budget.tokens)
+        .or(default_budget)
+    else {
         return Ok(QwenThinkingResolution {
             default_budget,
             required_tool_mode,
@@ -177,31 +205,49 @@ where
         });
     };
     if !slot_aware {
-        return Err(ThinkingPolicyError {
-            message: "thinking_token_budget requires an inflight-batched scheduler".into(),
-            param: "thinking_token_budget",
+        if requested_budget
+            .as_ref()
+            .is_some_and(|budget| budget.strict)
+        {
+            return Err(ThinkingPolicyError {
+                message: format!("{budget_param} requires an inflight-batched scheduler"),
+                param: budget_param,
+            });
+        }
+        // ADR-062 D5 bullet 3: a server-default or effort-derived budget
+        // under fifo-serial is dropped (warned by the caller), never a 4xx;
+        // only an explicit client budget is rejected, identically on every
+        // family.
+        return Ok(QwenThinkingResolution {
+            default_budget,
+            required_tool_mode,
+            dropped_budget: Some((
+                configured_budget,
+                super::reasoning_controls::DROPPED_FIFO_SERIAL,
+            )),
+            ..QwenThinkingResolution::default()
         });
     }
 
     let close = registration
         .and_then(|registration| registration.reasoning_close)
         .ok_or_else(|| ThinkingPolicyError {
-            message: "thinking_token_budget requires a registered reasoning close marker".into(),
-            param: "thinking_token_budget",
+            message: format!("{budget_param} requires a registered reasoning close marker"),
+            param: budget_param,
         })?;
     let transition = format!("\nI need to answer now.{close}");
     let end_tokens = encode(&transition).map_err(|error| ThinkingPolicyError {
         message: format!("failed to tokenize reasoning boundary: {error}"),
-        param: "thinking_token_budget",
+        param: budget_param,
     })?;
     let close_tokens = encode(close).map_err(|error| ThinkingPolicyError {
         message: format!("failed to tokenize reasoning boundary: {error}"),
-        param: "thinking_token_budget",
+        param: budget_param,
     })?;
     if end_tokens.is_empty() || close_tokens.is_empty() {
         return Err(ThinkingPolicyError {
             message: "reasoning boundary tokenized to an empty sequence".into(),
-            param: "thinking_token_budget",
+            param: budget_param,
         });
     }
     if !end_tokens.ends_with(close_tokens.as_slice()) {
@@ -209,7 +255,7 @@ where
             message:
                 "forced reasoning transition must end with the standalone close-token sequence"
                     .into(),
-            param: "thinking_token_budget",
+            param: budget_param,
         });
     }
 
@@ -220,21 +266,40 @@ where
     };
     let effective_budget = effective_qwen_thinking_budget_with_reserve(
         Some(configured_budget),
-        explicit_budget.is_some(),
+        requested_budget
+            .as_ref()
+            .is_some_and(|budget| budget.strict),
         max_tokens,
         end_tokens.len(),
         answer_reserve_tokens,
     )
     .map_err(|message| ThinkingPolicyError {
         message,
-        param: "thinking_token_budget",
+        param: budget_param,
     })?;
     if required_tool_mode && effective_budget.is_none() {
-        return Err(ThinkingPolicyError {
-            message: format!(
-                "max_tokens ({max_tokens}) is too small for the Qwen reasoning transition and required tool call"
-            ),
-            param: "max_tokens",
+        if requested_budget
+            .as_ref()
+            .is_some_and(|budget| budget.strict)
+        {
+            return Err(ThinkingPolicyError {
+                message: format!(
+                    "max_tokens ({max_tokens}) is too small for the Qwen reasoning transition and required tool call"
+                ),
+                param: "max_tokens",
+            });
+        }
+        // ADR-062 D5 bullet 3: the server-side required-tool budget is
+        // dropped with a warning when max_tokens leaves no room, never a
+        // 4xx (issue #278 finding 3).
+        return Ok(QwenThinkingResolution {
+            default_budget,
+            required_tool_mode,
+            dropped_budget: Some((
+                configured_budget,
+                super::reasoning_controls::DROPPED_NO_ROOM,
+            )),
+            ..QwenThinkingResolution::default()
         });
     }
 
@@ -244,6 +309,7 @@ where
         end_tokens: effective_budget.map(|_| end_tokens),
         close_tokens: effective_budget.map(|_| close_tokens),
         required_tool_mode,
+        dropped_budget: None,
     })
 }
 
@@ -344,6 +410,7 @@ mod tests {
                     true,
                     &tool_choice,
                     None,
+                    "thinking_token_budget",
                     128,
                     QwenToolChainState::default(),
                     defaults,
@@ -378,13 +445,14 @@ mod tests {
     }
 
     #[test]
-    fn preserves_ordinary_opt_out_and_rejects_tiny_required_window() {
+    fn preserves_ordinary_opt_out_and_drops_tiny_required_window() {
         let registration = registry::find_for("Qwen3.8").expect("Qwen registration");
         let ordinary = resolve_qwen_thinking_policy(
             Some(&registration),
             true,
             &ToolChoiceValue::Auto,
             None,
+            "thinking_token_budget",
             128,
             QwenToolChainState::default(),
             QwenThinkingDefaults::from_config(Some(0), Some(0)),
@@ -392,22 +460,37 @@ mod tests {
             qwen_test_encode,
         )
         .unwrap();
-        assert_eq!(ordinary, QwenThinkingResolution::default());
+        assert_eq!(
+            ordinary,
+            QwenThinkingResolution {
+                required_tool_mode: false,
+                ..QwenThinkingResolution::default()
+            }
+        );
 
-        let error = resolve_qwen_thinking_policy(
+        // ADR-062 D5 bullet 3 (issue #278 finding 3): the server-side
+        // required-tool budget is dropped with a warning when max_tokens
+        // leaves no room for the transition and the answer reserve, never a
+        // 4xx.
+        let tiny = resolve_qwen_thinking_policy(
             Some(&registration),
             true,
             &ToolChoiceValue::Required,
             None,
+            "thinking_token_budget",
             16,
             QwenToolChainState::default(),
             QwenThinkingDefaults::default(),
             true,
             qwen_test_encode,
         )
-        .unwrap_err();
-        assert_eq!(error.param, "max_tokens");
-        assert!(error.message.contains("too small"));
+        .unwrap();
+        assert!(tiny.required_tool_mode);
+        assert_eq!(tiny.effective_budget, None);
+        assert_eq!(
+            tiny.dropped_budget,
+            Some((16, super::super::reasoning_controls::DROPPED_NO_ROOM))
+        );
     }
 
     #[test]
@@ -417,7 +500,11 @@ mod tests {
             Some(&registration),
             true,
             &ToolChoiceValue::Required,
-            Some(56),
+            Some(RequestedThinkingBudget {
+                tokens: 56,
+                strict: true,
+            }),
+            "thinking_token_budget",
             128,
             QwenToolChainState::default(),
             QwenThinkingDefaults::default(),
@@ -431,7 +518,11 @@ mod tests {
             Some(&registration),
             true,
             &ToolChoiceValue::Required,
-            Some(57),
+            Some(RequestedThinkingBudget {
+                tokens: 57,
+                strict: true,
+            }),
+            "thinking_token_budget",
             128,
             QwenToolChainState::default(),
             QwenThinkingDefaults::default(),
@@ -451,6 +542,7 @@ mod tests {
             true,
             &ToolChoiceValue::Required,
             None,
+            "thinking_token_budget",
             128,
             QwenToolChainState::default(),
             QwenThinkingDefaults::default(),
