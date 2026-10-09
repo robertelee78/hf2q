@@ -257,6 +257,8 @@ impl ServeDefaultsV2 {
                 "serve.max_slots must be 1 for fifo_serial".to_owned(),
             ));
         }
+        crate::serve::operator_settings::validate_max_slots(self.max_slots)
+            .map_err(|error| SetupError::InvalidConfig(format!("serve.{error}")))?;
         if self.ctx == Some(0) {
             return Err(SetupError::InvalidConfig(
                 "serve.ctx must be positive; omit it to use the GGUF maximum".to_owned(),

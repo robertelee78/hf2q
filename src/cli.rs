@@ -305,7 +305,8 @@ pub struct SetupArgs {
     #[arg(long, value_enum, value_name = "POLICY")]
     pub serve_scheduler: Option<SchedulerArg>,
 
-    /// Default active-request slots for inflight-batched serving.
+    /// Default active-request slots for inflight-batched serving. Accepted
+    /// range 1-8 on every family; the default is 4.
     #[arg(long, value_name = "N")]
     pub serve_max_slots: Option<u32>,
 
@@ -1456,6 +1457,9 @@ pub struct ServePlanningArgs {
     /// Maximum concurrent active conversations under `inflight-batched`.
     /// Overrides `[serve] max_slots`. “Maximum” means slots are admitted on
     /// demand; this does not divide the context available to each slot.
+    /// The default is 4 under inflight-batched and the accepted range is 1-8
+    /// on every family; a value above 8 is rejected because raising the bound
+    /// requires a hands-on qualification at the new width.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub max_slots: Option<u32>,
 

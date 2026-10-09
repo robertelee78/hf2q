@@ -128,13 +128,11 @@ fn inspect(
     validate_family_context_floor(&gguf, context).map_err(anyhow::Error::msg)?;
     let engine_mode = operator_settings::resolve_scheduler(&args.planning, operator_defaults)
         .map_err(anyhow::Error::msg)?;
-    let scheduler_support = match engine_mode {
-        EngineMode::SerialFifo => Ok("ready"),
-        EngineMode::SlotAware { max_slots } => {
-            super::api::engine::Engine::validate_slot_aware_capacity(max_slots)
-                .map(|()| "ready")
-                .map_err(|error| error.to_string())
-        }
+    // ADR-062 D3: `resolve_scheduler` above is the 1-MAX_SUPPORTED_SLOTS
+    // authority for the CLI and config, so a resolved mode is ready on
+    // every family.
+    let scheduler_support: Result<&str, String> = match engine_mode {
+        EngineMode::SerialFifo | EngineMode::SlotAware { .. } => Ok("ready"),
     };
     let kv_budget = operator_settings::resolve_kv_cache_budget(
         args.planning.kv_cache_budget.as_deref(),

@@ -15,6 +15,12 @@ use super::api::engine::EngineMode;
 
 pub(crate) const DEFAULT_MAX_SLOTS_UNDER_INFLIGHT: u32 = GUIDE_MAX_SLOTS;
 
+/// ADR-062 D3 (2026-10-08) — the slot count `--max-slots`, `[serve] max_slots`,
+/// and the `hf2q setup` prompt accept on every family. Raising the bound
+/// requires a hands-on qualification at the new width; it is not lifted by an
+/// environment variable.
+pub(crate) const MAX_SUPPORTED_SLOTS: u32 = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingOrigin {
     Cli,
@@ -166,12 +172,28 @@ pub(crate) fn resolve_scheduler(
         .max_slots
         .or_else(|| defaults.map(|defaults| defaults.max_slots))
         .unwrap_or(DEFAULT_MAX_SLOTS_UNDER_INFLIGHT);
-    if max_slots == 0 {
+    validate_max_slots(max_slots)?;
+    Ok(EngineMode::SlotAware { max_slots })
+}
+
+/// ADR-062 D3 (2026-10-08) — one slot-range authority shared by the CLI, the
+/// `config.toml` load, and the `hf2q setup` prompt. Every family accepts
+/// 1-[`MAX_SUPPORTED_SLOTS`]; the check is family-independent.
+pub(crate) fn validate_max_slots(max_slots: u32) -> Result<(), String> {
+    if max_slots > MAX_SUPPORTED_SLOTS {
         return Err(format!(
-            "max concurrent slots must be positive; omit `max_slots` to use the inflight default of {DEFAULT_MAX_SLOTS_UNDER_INFLIGHT}"
+            "max_slots {max_slots} exceeds the supported maximum of {MAX_SUPPORTED_SLOTS}; \
+             the accepted range is 1-{MAX_SUPPORTED_SLOTS}, and raising the bound requires \
+             a hands-on qualification at the new width"
         ));
     }
-    Ok(EngineMode::SlotAware { max_slots })
+    if max_slots == 0 {
+        return Err(format!(
+            "max_slots must be in 1-{MAX_SUPPORTED_SLOTS}; omit `max_slots` to use the \
+             inflight default of {DEFAULT_MAX_SLOTS_UNDER_INFLIGHT}"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn resolve_kv_cache_budget(

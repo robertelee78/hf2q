@@ -140,8 +140,9 @@ The canonical Qwen3.8 guide profile records Q4_K_M conversion, localhost port
 8081, and inflight-batched serving with four active slots, the same scheduler and slot
 count a plain `hf2q serve` uses with no config. Interactive setup can
 change those choices for another workload or model family. Explicit command
-flags still win, and existing scheduler
-environment overrides retain their precedence. Use the global
+flags still win. The active-slot count accepts 1-8 on every family (default
+4); a value above 8 is rejected because raising the bound requires a
+hands-on qualification at the new width. Use the global
 `--state-root /absolute/path` option for a custom config root and pass the same
 option to later convert or serve commands. See [`docs/setup.md`](docs/setup.md)
 for the exact prompts, schema, precedence, filesystem, and failure contract.
@@ -256,7 +257,8 @@ payloads, initialize Metal, or claim a successful runtime warmup; scratch and
 allocator overhead remain outside the static estimate.
 
 `--ctx` is a logical token cap for **each** conversation slot. It is never
-divided by `--max-slots`. `--kv-cache-budget` is different: it is one shared
+divided by `--max-slots`. `--max-slots` defaults to 4 under `inflight-batched`
+and accepts 1-8 on every family. `--kv-cache-budget` is different: it is one shared
 physical-residency ceiling used for admission as active slots retain KV state.
 Thus `--ctx 262144 --max-slots 4` advertises 262,144 tokens to every slot, while
 `--kv-cache-budget 8GiB` limits their aggregate physical growth.
