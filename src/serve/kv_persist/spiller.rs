@@ -972,6 +972,17 @@ where
             let _ = r.unregister(repo, quant);
         }
     }
+
+    /// ADR-062 D4 (2026-10-08) — honest per-family persistence
+    /// state: a real family hook is registered for `(repo, quant)`.
+    /// Mirrors the `unregister_family` key shape.
+    fn family_persist_active(&self, repo: &str, quant: QuantType) -> bool {
+        let g = self
+            .registrations
+            .read()
+            .expect("BlockPrefixCacheSpiller::registrations RwLock poisoned");
+        g.contains_key(&(repo.to_string(), quant.as_str()))
+    }
 }
 
 /// Parse the layer rank from a `payload_kind` string of the form
