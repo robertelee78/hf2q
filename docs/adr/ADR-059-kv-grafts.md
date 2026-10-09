@@ -20,8 +20,9 @@
   this mirrors), ADR-054 (GLP calibration and its measured null result),
   ADR-027 (TQ KV quantization — the graft encode path), ADR-040 (multi-seq
   slots), ADR-042 (DeepSeek-V4 compressed attention), ADR-013 (Qwen3.5
-  hybrid stack), ADR-017 (per-family status), ADR-060 (decision head — the
-  other half of this brief)
+  hybrid stack),   ADR-017 (per-family status), ADR-060 (decision head — the
+  other half of this brief; the record is parked on branch
+  `docs/adr-060-decision-head`, not carried on this branch)
 
 ## Attribution
 
