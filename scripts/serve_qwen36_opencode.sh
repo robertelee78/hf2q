@@ -47,11 +47,15 @@
 #                           explicitly submits a carried FFN before entering
 #                           its legacy sibling encoder path, preserving exact
 #                           agentic output at K=8 while reducing short cached
-#                           continuation latency.
-#   HF2Q_FFN_TERMINAL_K_BATCH=8
-#                           Drains the session every eight layers. The matched
-#                           three-turn gate is 4/4 exact at K=8; larger values
-#                           are not promoted by this launcher.
+#                           continuation latency. This is a mlx-native opt-in
+#                           (default off), so the launcher keeps setting it
+#                           explicitly (ADR-062 D1 keeps only variables that
+#                           gate genuinely non-default behavior).
+#   FFN terminal K batch    Drains the shared encoder session every eight
+#                           layers by built-in default (K=8; the matched
+#                           three-turn gate is 4/4 exact at K=8). Larger
+#                           values are not promoted by this launcher; no
+#                           HF2Q_FFN_TERMINAL_K_BATCH variable is needed.
 #   --overflow-policy reject
 #                           opencode manages its own compaction; the
 #                           server must 400 on overflow (OpenAI semantics)
@@ -61,9 +65,11 @@
 #                           Four independent agent sessions make progress and
 #                           retain separate exact ChatML prefixes. Every slot
 #                           advertises the full model context; no ctx/N math.
-#   HF2Q_TQ_KV=1           TQ K/V stays active for every agent slot. The
-#                           packed/norm buffers carry an outer slot axis and
-#                           zero-copy Metal views select the active agent.
+#   TQ-active K/V           Built-in default for every agent slot (opt out
+#                           with HF2Q_TQ_KV=0): the packed/norm buffers carry
+#                           an outer slot axis and zero-copy Metal views
+#                           select the active agent. No launcher variable is
+#                           required.
 #   --kv-cache-budget       Shared physical high-water across the full-context
 #                           slots. MAX_SLOTS=8 is the np8-like setting.
 #
@@ -193,7 +199,5 @@ HF2Q_SERVE_ARGS+=(
 )
 
 exec env \
-    HF2Q_TQ_KV=1 \
     HF2Q_ENCODER_SESSION=1 \
-    HF2Q_FFN_TERMINAL_K_BATCH=8 \
     "$HF2Q_BIN" "${HF2Q_SERVE_ARGS[@]}"

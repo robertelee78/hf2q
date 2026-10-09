@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use super::engine::Engine;
 use super::state::{AppState, ServerConfig};
 use crate::serve::multi_model::LoadedEngine;
+use crate::serve::operator_settings::SettingOrigin;
 
 #[derive(Default)]
 pub(super) struct FingerprintCache(Mutex<BTreeMap<u64, (String, String)>>);
@@ -35,6 +36,23 @@ fn canonical(value: Value) -> Value {
         }
         Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
         other => other,
+    }
+}
+
+/// ADR-062 D1 — origin of one effective sampling default for the runtime
+/// snapshot: `"cli"` when the CLI flag supplied it, `"builtin"` when the
+/// family built-in profile did, or `"request-default"` when no server-side
+/// value exists (the request supplies or derives it). The former `[serve]`
+/// behavior keys are retired, so no `"config"` origin occurs.
+fn sampling_origin(
+    cli_value: Option<u32>,
+    cli_origin: Option<SettingOrigin>,
+    builtin_value: Option<u32>,
+) -> &'static str {
+    match cli_value {
+        Some(_) => cli_origin.map(|origin| origin.as_wire_str()).unwrap_or("cli"),
+        None if builtin_value.is_some() => "builtin",
+        None => "request-default",
     }
 }
 
@@ -129,6 +147,25 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
                 .default_tool_thinking_token_budget
                 .or(builtin_serve_profile.tool_thinking_token_budget),
             "overflow_policy": format!("{:?}", state.config.default_overflow_policy),
+        },
+        // ADR-062 D1 — origin of each effective sampling default above
+        // ("cli" | "builtin" | "request-default"): the CLI layer when a
+        // flag supplied the value, otherwise the family built-in profile.
+        "sampling_default_origins": {
+            "repetition_penalty": state
+                .config
+                .default_repetition_penalty_origin
+                .as_wire_str(),
+            "thinking_token_budget": sampling_origin(
+                state.config.default_thinking_token_budget,
+                state.config.default_thinking_token_budget_origin,
+                builtin_serve_profile.thinking_token_budget,
+            ),
+            "tool_thinking_token_budget": sampling_origin(
+                state.config.default_tool_thinking_token_budget,
+                state.config.default_tool_thinking_token_budget_origin,
+                builtin_serve_profile.tool_thinking_token_budget,
+            ),
         },
         "active_controls": {
             "glp": {"active": loaded.config_identity.glp_active,

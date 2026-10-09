@@ -172,6 +172,17 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
     let stats = manager.pool_stats();
     let engines = manager.snapshot_engines();
     let measurement_snapshot = super::measurement::snapshot(&state, &engines);
+    // ADR-062 D1 — each effective serve value with its origin ("cli" |
+    // "config" | "builtin"). Under `fifo-serial` the slot count is
+    // structural (1), so no slot origin is reported.
+    let (scheduler_mode, max_slots, max_slots_origin) = match state.config.engine_mode {
+        crate::serve::api::engine::EngineMode::SerialFifo => ("serial_fifo", None, None),
+        crate::serve::api::engine::EngineMode::SlotAware { max_slots } => (
+            "slot_aware",
+            Some(max_slots),
+            Some(state.config.max_slots_origin.as_wire_str()),
+        ),
+    };
     let resident = manager
         .snapshot_engines()
         .into_iter()
@@ -190,6 +201,14 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
         Json(serde_json::json!({
             "schema_version": HF2Q_RUNTIME_SCHEMA,
             "backend": "mlx-native",
+            "serve": {
+                "scheduler_mode": scheduler_mode,
+                "scheduler_origin": state.config.scheduler_origin.as_wire_str(),
+                "max_slots": max_slots,
+                "max_slots_origin": max_slots_origin,
+                "port": state.config.port,
+                "port_origin": state.config.port_origin.as_wire_str(),
+            },
             "measurement_snapshot": measurement_snapshot,
             "capabilities": {
                 "model_activation": HF2Q_ACTIVATION_SCHEMA,

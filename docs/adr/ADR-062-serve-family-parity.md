@@ -160,6 +160,26 @@ existing tests are updated only where a change breaks them.
   The `hf2q info` / `/hf2q/v1/runtime` per-value origin reporting and the
   launcher simplification remain #289; hands-on verification per
   Verification above is pending.
+- **D1's launchers/port/reporting half** (#289) is implemented on
+  `fix/serve-launchers-reporting` (worktree `launchers-reporting`, cut
+  from `main` @ 4002580a, rebased onto the #314 merge of the built-in
+  profiles, uncommitted at handoff): the canonical launchers set only
+  `HF2Q_*` variables that gate genuinely non-default behavior (Qwen's
+  encoder session, Qwen3.8's K-quant width routing; `HF2Q_TQ_KV`,
+  `HF2Q_FFN_TERMINAL_K_BATCH`, Gemma's LCP-resume, cross-slot-admit and
+  coalesce defaults are dropped, and the inert `HF2Q_KV_LCP_LONG_RESUME`
+  is gone); the built-in port is 8081 on every path (CLI/config fallback,
+  `ServerConfig` default, Gemma launcher, README); `hf2q info` reports
+  the effective scheduler/slot values and sampling defaults with
+  per-value origins; `/hf2q/v1/runtime` reports the serve block
+  (scheduler, slots, port, origins) and the measurement snapshot's
+  `sampling_default_origins`. The DeepSeek launcher's tool-thinking flag
+  moved to the D1 value (512). The origin reporting layers on #314's
+  design: `family_serve_profile` stays the value authority and the
+  former behavior keys keep no Config origin. The Gemma
+  cross-slot/coalesce removals ride on #288's built-in profiles, which
+  landed first as #314; hands-on verification per Verification above is
+  pending.
 - **Integration order:** merge D0 first (the shared scheduler constant and
   error path); commit the #256 piece on `fix/grammar-length-finish` and
   merge it second; D2's remainder re-cuts from `main` after both (it

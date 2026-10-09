@@ -3,24 +3,32 @@
 # Gemma 4 Ara 26B APEX GGUF, tuned for opencode agentic coding.
 #
 # Verified 2026-08-03 on M5 Max (docs/adr/diary/ADR-017-persistent-block-prefix-cache.md
-# "gemma-hybrid-lcp" + long-resume addenda):
+# "gemma-hybrid-lcp" addenda):
 #
-#   HF2Q_KV_LCP_RESUME=1    LCP partial-prefill resume. Default-on under the
-#                           production hybrid regime post-"gemma-hybrid-lcp";
-#                           kept explicit for discoverability/older binaries.
-#   HF2Q_KV_LCP_LONG_RESUME=1
-#                           Extends LCP to prompts > sliding_window (1024) —
-#                           sliding layers allocate LINEAR buffers + the
-#                           hybrid SDPA kernel applies bounded chronological
-#                           staging (byte-identity-gated vs a cold request
-#                           through the same production graph
-#                           in tests/lcp_partial_prefill_byte_identity.rs::
-#                           gemma_hybrid_long_resume_byte_identity).
+#   LCP partial-prefill resume
+#                           Built-in default-on under the production hybrid
+#                           regime post-"gemma-hybrid-lcp" (opt out with
+#                           HF2Q_KV_LCP_RESUME=0); the launcher no longer
+#                           sets it (ADR-062 D1: launchers need no HF2Q_*
+#                           variables for qualified behavior).
+#   HF2Q_KV_LCP_LONG_RESUME
+#                           Dropped: it only takes effect on fifo-serial
+#                           (inert on this launcher's inflight-batched
+#                           scheduler; ADR-062 D1).
 #   HF2Q_KV_LCP_RESUME_CAPACITY=8g
 #                           Registry budget for short or branched-prefix
-#                           snapshots. The normal fifo-serial continuation
-#                           reuses Gemma's already-resident dense+hybrid KV in
-#                           place and does not duplicate a long live prefix.
+#                           snapshots, still load-bearing on the default
+#                           inflight-batched scheduler: the engine's
+#                           built-in budget is available-memory-derived
+#                           (≈5 GiB on a fresh 128 GB host), and 8 GiB is
+#                           this launcher's qualified capacity. Set
+#                           LCP_CAPACITY= to override.
+#   Cross-slot admission   Built-in Gemma 4 default: an idle slot group waits
+#                           up to 25 ms for peer agent requests so their
+#                           appended suffixes share one transformer-body pass
+#                           (active decode is never delayed). HF2Q_CROSS_SLOT_ADMIT=0
+#                           and HF2Q_ADMIT_COALESCE_US remain explicit engine
+#                           overrides; no launcher variable is required.
 #   --mmproj                Gemma 4 vision tower (optional; enables image
 #                           parts in chat completions). Delete the flag for
 #                           a text-only server.
@@ -33,11 +41,6 @@
 #                           neither context nor KV capacity is divided by N.
 #   --kv-cache-budget       Shared physical high-water across full-context
 #                           slots. MAX_SLOTS=8 is the np8-like setting.
-#   HF2Q_ADMIT_COALESCE_US=25000
-#                           When every slot is idle, wait at most 25 ms for
-#                           peer agent requests so their appended suffixes can
-#                           share one transformer-body pass. Active decode is
-#                           never delayed for collection.
 #   --default-repetition-penalty 1.05
 #                           Loop mitigation (2026-08-03), same knob as
 #                           serve_qwen36_opencode.sh — opencode cannot send
@@ -103,7 +106,7 @@ source "$SCRIPT_DIR/hf2q_process_guard.sh"
 MODEL="${MODEL:-/opt/hf2q/models/gemma4/gemma4-ara-2pass-APEX-Q5_K_M.gguf}"
 MMPROJ="${MMPROJ:-/opt/hf2q/models/gemma4/mmproj-gemma4-f16.gguf}"
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8082}"
+PORT="${PORT:-8081}"
 LCP_CAPACITY="${LCP_CAPACITY:-8g}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
@@ -168,11 +171,7 @@ fi
 # 2026-08-03). Branch the exec instead of relying on the expansion.
 if [[ -f "$MMPROJ" ]]; then
     exec env \
-        HF2Q_KV_LCP_RESUME=1 \
-        HF2Q_KV_LCP_LONG_RESUME=1 \
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
-        HF2Q_CROSS_SLOT_ADMIT=1 \
-        HF2Q_ADMIT_COALESCE_US="${ADMIT_COALESCE_US:-25000}" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
@@ -187,11 +186,7 @@ if [[ -f "$MMPROJ" ]]; then
             --default-repetition-penalty "${REP_PENALTY:-1.05}"
 else
     exec env \
-        HF2Q_KV_LCP_RESUME=1 \
-        HF2Q_KV_LCP_LONG_RESUME=1 \
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
-        HF2Q_CROSS_SLOT_ADMIT=1 \
-        HF2Q_ADMIT_COALESCE_US="${ADMIT_COALESCE_US:-25000}" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \

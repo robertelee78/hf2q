@@ -20,10 +20,14 @@
 #                           not prevent client-side action loops. Operators may
 #                           set REP_PENALTY only for a measured workload;
 #                           non-default request values still win.
-#   --default-tool-thinking-token-budget 8
+#   --default-tool-thinking-token-budget 512
 #                           Bounds forced-open reasoning for the narrow
 #                           single-tool required/named-tool path before the
-#                           constrained DSML tool call. Set
+#                           constrained DSML tool call. 512 is the owner's
+#                           ADR-062 D1/D5 value (the 8-token budget was
+#                           retired 2026-10-08 and is also the family
+#                           built-in), so the flag is an explicit operator
+#                           knob at the qualified value. Set
 #                           REQUIRED_TOOL_THINKING_TOKEN_BUDGET=0 to disable
 #                           the operator default; explicit request budgets are
 #                           not accepted for DeepSeek-V4.
@@ -79,7 +83,7 @@ HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-8589934592}" # 8 GiB shared
-REQUIRED_TOOL_THINKING_TOKEN_BUDGET="${REQUIRED_TOOL_THINKING_TOKEN_BUDGET:-8}"
+REQUIRED_TOOL_THINKING_TOKEN_BUDGET="${REQUIRED_TOOL_THINKING_TOKEN_BUDGET:-512}"
 
 # Keep the wrapper's context override identical to the real hf2q flag. The
 # qualified launcher defaults to 262144, while direct `hf2q serve` omits

@@ -10,7 +10,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # single/cached-turn TTFT strict while giving that peer-bound batch a small
 # thermal/jitter margin.
 exec env \
-  BASE_URL="${BASE_URL:-http://127.0.0.1:8082}" \
+  BASE_URL="${BASE_URL:-http://127.0.0.1:8081}" \
   MODEL="${MODEL:-Gemma4 Ara 2pass Baseline}" \
   MAX_TOKENS="${MAX_TOKENS:-512}" \
   MAX_CACHED_RESPONSE_MS="${MAX_CACHED_RESPONSE_MS:-16000}" \
