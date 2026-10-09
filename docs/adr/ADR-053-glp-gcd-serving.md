@@ -80,7 +80,8 @@ operand — the `--mmproj` shape.
 - Hook points are family-specific and enforced at bind (2026-09-10
   correction, per spec/GLP.md's recognized-values table — the hooks are
   different tensors and NOT interchangeable, and a reader whose hook does
-  not match must refuse the file):
+  not match must refuse the file; superseded 2026-10-08 by the
+  supported-site-set rule — see Dual hook sites below):
   - **Qwen:** `residual_stream_post_layer` — the complete post-layer
     residual (`hidden + residual` after the FFN fold), applied on every
     execution path including greedy decode (the greedy path previously
@@ -148,6 +149,70 @@ that `--glp` appeared on the child's command line. Found in the ADR-061 #237
 hands-on pass: `/hf2q/v1/runtime` reported `glp_active: false` for a
 chat-started server whose command line carried `--glp`.
 
+## Dual hook sites (2026-10-08 — proposed extension, not yet implemented)
+
+Operator goal (issue #276 remaining scope): every GLP family binds **both**
+spec hook sites — `residual_stream_post_layer` and `ffn_out_pre_residual`.
+The forcing case: the published DeepSeek-V4-Flash-0731 GLP-42 **residual**
+vector is refused by hf2q on DeepSeek (bind accepts one family hook), and
+ADR-054's null result says the calibrated DeepSeek vector needs exactly
+that apply site.
+
+- **Bind accepts the family's supported site set.** `BoundGlp::bind` takes
+  `family_hooks: &[GlpHookPoint]` instead of one hook; a vector whose
+  `glp.hook_point` is outside the set is refused with an error naming the
+  family's supported sites. Both the Qwen and DeepSeek engines pass
+  `[residual_stream_post_layer, ffn_out_pre_residual]`.
+  `attn_out_pre_residual` stays refused globally (spec-recognized, no
+  family implements).
+- **Qwen writer-site apply** (`ffn_out_pre_residual`): steer `ffn_out`
+  out-of-session (`apply_layer_gpu`, the same buffer lineage and queue
+  ordering the working post-layer hook already uses) with
+  `add_residual=None` at every fold site, then an explicit
+  `residual_add_gpu` for every arm (all arms route through the explicit
+  add when steering at the writer). Off by default: with no vector, every
+  fold site passes `Some(residual)` exactly as today — byte-identical when
+  unsteered.
+- **DeepSeek post-layer apply** (`residual_stream_post_layer`): in the
+  same per-layer FFN encode closure, after `dispatch_hc_post`, a barrier
+  between the writer and the state, then `apply_layer_gpu_mhc_in_session`
+  on `output_state` (`[rows, hc, hidden]`) — the validated, currently
+  unused mHC helper. **Project mode only** at this site (no add-mHC kernel
+  exists): bind refuses `(deepseek, residual, add)` with a named error
+  rather than failing at runtime. Widths accepted at this site: `hidden`
+  (one shared direction steering every stream — what `hf2q calibrate`
+  exports) and `hc*hidden` (per-stream, the weightless mHC discipline);
+  writer-site vectors stay `hidden`-only (owner decisions 2026-10-08).
+- **Qwen writer-site verification**: no published writer-site vector
+  exists (issue #276 matrix), so a local synthetic test vector — a
+  throwaway operator script (not production code, not a committed runtime
+  dependency) writing a conformant GLP GGUF bound to the local Qwen
+  checkpoint's conversion-receipt identity, deterministic directions on a
+  few layers, `hook_point=ffn_out_pre_residual` — drives the bind +
+  dose-ladder (0 = identical, live = shifted) and confirms the shift lands
+  via the writer site (the FFN write alone), not the residual path.
+- **Unsupported-family consistency** (#271, already landed): `--glp` on a
+  family outside `GLP_SERVING_ARCHITECTURES` fails every load with one
+  message naming the supported families — hands-on verify only, fix if
+  inconsistent.
+- **Calibrate's export contract is untouched** (`hook_point=ffn_out_pre_residual`,
+  `derived_at=residual_stream_post_layer`): the capture/apply site fix and
+  calibrate beyond DeepSeek stay open per the owner's #276 decision.
+
+Verification is hands-on per owner direction (no new unit tests; one
+worktree at a time into the shared `CARGO_TARGET_DIR`; one full-model
+runtime at a time — the ~100 GiB DeepSeek artifact never co-resident with
+a peer; release coordination checked before every heavy load): release
+build; DeepSeek + the published GLP-42 residual vector binds and shifts a
+fixed probe vs. the unsteered baseline; GLP-29 (FFN-writer) still binds
+and steers on DeepSeek; Qwen + GLP-49 — the published residual-site vector
+`msuiche/Qwen3.8-27B-abliterated-cyber-GLP-49`, file
+`Qwen3.8-27B-abliterated-cyber-GLP-49-L10-58-a1.gguf` (docs/qe/glp-gcd
+2026-10-08) — still binds and steers; gemma4 + `--glp` refused with the
+consistent message; `--gcd --glp` combos on both families. ADR-054 gains the follow-through: with the
+residual-site apply existing, its null-result remedy (the calibrated
+vector applied at its capture site) becomes measurable.
+
 ## Non-goals
 
 - Serving a GLP file as the model operand is invalid (explicitly rejected
@@ -191,7 +256,9 @@ Hub repository IDs and canonical tree/blob/resolve URLs use the shared HF
 reference parser. A returned inventory must name an immutable commit, and
 the chosen file is downloaded at that commit rather than a mutable branch.
 
-The file's `glp.hook_point` must match the implemented apply site.
+The file's `glp.hook_point` must match the implemented apply site
+(2026-10-08: a site in the family's supported site set — see Dual hook
+sites below).
 `glp.derived_at` is optional string provenance: absence means the same site,
 and arbitrary descriptive labels remain valid. A non-string value is a load
 error. A declared derivation site differing from the apply hook produces an

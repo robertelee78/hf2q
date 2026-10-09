@@ -149,7 +149,11 @@ conformant reader (hf2q `--glp`, or the weightless hotfix path).
    vector must beat the no-GLP grammar-only control arm (B12-class) on
    refusal Δ with invalid at parity.
 4. Dose ladder sanity: α ∈ {0.5, 1.0, 1.5} report; the chosen default is
-   documented per family, not guessed.
+   documented per family, not guessed. (Gates 3–4 were measured
+   2026-09-10 on the re-scoped protocol recorded in the Status header —
+   the 48-prompt panel, dose ladder 0.5/1.0/2.0/4.0 — rather than the
+   original 512+512 / α∈{0.5,1.0,1.5} design above; the harness parameters
+   above are the pre-measurement design, kept for provenance.)
 5. Cross-checkpoint safety: refuse to apply a vector whose
    `general.base_model.0.version` does not match the loaded checkpoint.
 
@@ -195,4 +199,19 @@ conformant reader (hf2q `--glp`, or the weightless hotfix path).
    the cached form. Version-stamp + fail-closed on version mismatch (the
    `CompiledGrammar` v11 pattern). Both are parked until the GLP
    within-process canary is trustworthy (measurement discipline first).
+3. **Residual-site apply follow-up (2026-10-08, unblocked by ADR-053's
+   dual-site extension).** The gate-3/4 null result's named remedy —
+   application at the capture site — becomes measurable once ADR-053's
+   DeepSeek `residual_stream_post_layer` apply lands: re-run the same
+   48-prompt panel with the calibrated `d_disp` applied at the post-layer
+   residual (its capture site), at both accepted widths (`hidden` and
+   `hc*hidden`), before any capture-site fix to `calibrate` itself (the
+   owner's #276 open question). A second null result closes the
+   calibrated-vector line honestly; a shift re-opens the export-contract
+   question. The re-pointed artifact is a metadata rewrite of the existing
+   export (`glp.hook_point` → `residual_stream_post_layer`,
+   `glp.derived_at` unchanged; no new `calibrate` export option). The
+   `hc*hidden` arm tiles the `hidden`-width `d_disp` across streams first
+   (a width the mHC helper validates); a per-stream capture is the
+   escalation only if the tiled arm shifts.
 
