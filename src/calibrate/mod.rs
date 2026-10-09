@@ -250,7 +250,7 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
     let vector = GlpVector::load(&cfg.out)
         .map_err(|e| anyhow::anyhow!("re-read exported GLP for canary: {e}"))?;
 
-    model.glp = Some(BoundGlp::bind(vector.clone(), Some(0.0), &device, GlpHookPoint::FfnOutPreResidual, config.num_hidden_layers, config.hidden_size)
+    model.glp = Some(BoundGlp::bind(vector.clone(), Some(0.0), &device, &[GlpHookPoint::FfnOutPreResidual], config.num_hidden_layers, config.hidden_size)
         .map_err(|e| anyhow::anyhow!("bind zero-dose: {e}"))?);
     let zero_logits = probe_logits(&mut model, &probe)?;
     let zero_delta = max_abs_diff(&base_logits, &zero_logits);
@@ -260,7 +260,7 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
     );
     eprintln!("[calibrate] zero-dose canary: logits identical");
 
-    model.glp = Some(BoundGlp::bind(vector, None, &device, GlpHookPoint::FfnOutPreResidual, config.num_hidden_layers, config.hidden_size)
+    model.glp = Some(BoundGlp::bind(vector, None, &device, &[GlpHookPoint::FfnOutPreResidual], config.num_hidden_layers, config.hidden_size)
         .map_err(|e| anyhow::anyhow!("bind live vector: {e}"))?);
     if let Some(glp) = model.glp.as_ref() {
         eprintln!(
@@ -289,7 +289,7 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
         eprintln!("[calibrate] debug: layer-{} state shift with GLP bound: {d}", cfg.layer);
         // restore binding for the shift assertion below
         let vector = GlpVector::load(&cfg.out).map_err(|e| anyhow::anyhow!("re-read for rebind: {e}"))?;
-        model.glp = Some(BoundGlp::bind(vector, None, &device, GlpHookPoint::FfnOutPreResidual, config.num_hidden_layers, config.hidden_size).map_err(|e| anyhow::anyhow!("rebind: {e}"))?);
+        model.glp = Some(BoundGlp::bind(vector, None, &device, &[GlpHookPoint::FfnOutPreResidual], config.num_hidden_layers, config.hidden_size).map_err(|e| anyhow::anyhow!("rebind: {e}"))?);
     }
     anyhow::ensure!(
         live_delta > 1e-3,
@@ -361,7 +361,9 @@ fn write_glp_gguf(
     // hf2q's DeepSeek forward steers: ffn_output = moe + shared, before
     // dispatch_hc_post) — the same `glp.hook_point` the published GLP-29
     // declares and the ds4 reference reader implements. The serve-side bind
-    // refuses any vector whose hook_point is not exactly this site.
+    // accepts the DeepSeek family site set; calibrate binds its own output
+    // at exactly this site (a vector declaring any other site is refused
+    // there).
     w.write_metadata_kv(
         "glp.hook_point",
         &MetaValue::String("ffn_out_pre_residual".into()),
@@ -490,7 +492,7 @@ mod tests {
             vector,
             None,
             &device,
-            crate::inference::glp::GlpHookPoint::FfnOutPreResidual,
+            &[crate::inference::glp::GlpHookPoint::FfnOutPreResidual],
             43,
             3,
         )

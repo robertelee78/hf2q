@@ -40,7 +40,8 @@ const MAX_DIRECTION_BYTES: u64 = 64 * 1024 * 1024; // any plausible vector stack
 /// construction, at an alpha whose meaning differs (spec: at the residual,
 /// 1.0 removes the component exactly; at a writer, 1.0 removes that write's
 /// component). A vector is calibrated for one site; the family bind refuses
-/// a mismatch rather than applying it somewhere else.
+/// a site outside the family's supported site set rather than applying it
+/// somewhere else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlpHookPoint {
     /// The accumulated residual after the layer's writes are folded in
@@ -108,7 +109,8 @@ impl From<std::io::Error> for GlpError {
 #[derive(Debug, Clone)]
 pub struct GlpVector {
     pub mode: GlpMode,
-    /// The declared apply site. The family bind must match it exactly.
+    /// The declared apply site. The family bind accepts it only within the
+    /// family's supported site set.
     pub hook_point: GlpHookPoint,
     /// Where the direction was captured (`glp.derived_at`). Informational
     /// per spec — it may legitimately differ from `hook_point` (the

@@ -563,10 +563,12 @@ impl Deepseek4Model {
             // state. This is the spec's `ffn_out_pre_residual` site — the
             // same site the ds4 reference reader steers ("ffn_out = moe +
             // shared, immediately before hc_post_one()"), and the
-            // `glp.hook_point` the published GLP-29 declares. The bind
-            // enforces that a loaded vector declares exactly this hook; a
-            // `residual_stream_post_layer` vector is refused there rather
-            // than silently reapplied at this different tensor.
+            // `glp.hook_point` the published GLP-29 declares. ADR-053 dual
+            // hook sites: the bind accepts the family site set (both spec
+            // sites); the serve load refuses a vector whose bound site this
+            // forward graph does not apply — the post-layer residual arm
+            // lands with #297 — rather than silently reapplying a
+            // `residual_stream_post_layer` vector at this different tensor.
             //
             // History (2026-09-09 canary): an earlier arrangement steered
             // `ffn_output` AFTER `dispatch_hc_post` had already consumed it

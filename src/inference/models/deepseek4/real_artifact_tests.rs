@@ -108,7 +108,7 @@ fn same_boot_glp_steering_gate() {
         vector,
         Some(1.0),
         &device,
-        crate::inference::glp::GlpHookPoint::FfnOutPreResidual,
+        &[crate::inference::glp::GlpHookPoint::FfnOutPreResidual],
         model.cfg.num_hidden_layers,
         model.cfg.hidden_size,
     )
@@ -175,7 +175,7 @@ fn glp_layer_mapping_differential_probe() {
         vector,
         Some(1.0),
         &device,
-        crate::inference::glp::GlpHookPoint::FfnOutPreResidual,
+        &[crate::inference::glp::GlpHookPoint::FfnOutPreResidual],
         num_layers as u32,
         hidden as u32,
     )

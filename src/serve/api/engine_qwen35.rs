@@ -374,11 +374,33 @@ impl Qwen35LoadedModel {
                 vector,
                 opts.glp_alpha,
                 &device,
-                crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer,
+                // ADR-053 dual hook sites: this engine serves both qwen35 and
+                // qwen35moe and binds the family's supported site set (both
+                // spec sites).
+                &[
+                    crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer,
+                    crate::inference::glp::GlpHookPoint::FfnOutPreResidual,
+                ],
                 model.cfg.num_hidden_layers,
                 model.cfg.hidden_size,
             )
                 .with_context(|| format!("GLP bind: {}", glp_path.display()))?;
+            // The bind accepts the family site set, but this engine's forward
+            // graph currently applies only the post-layer residual site — the
+            // writer-site apply arm lands with #296. Fail the load by name
+            // rather than silently reinterpreting a writer-site vector at the
+            // residual tensor or serving it unsteered.
+            if bound.vector.hook_point
+                != crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer
+            {
+                anyhow::bail!(
+                    "GLP apply site not yet implemented for hook {} on this \
+                     engine's forward graph — lands with #296 (Qwen \
+                     writer-site apply); refusing to serve a bound vector with \
+                     no apply path",
+                    bound.vector.hook_point.as_str()
+                );
+            }
             tracing::info!(
                 layers = bound.vector.layers.len(),
                 width = bound.vector.width,
