@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.24] — 2026-10-09
+
+### Added
+
+- Per-family built-in serving profiles: the values each canonical launcher
+  uses now apply built-in, with or without a `config.toml` — Qwen
+  (1.05/2048/512), Gemma 4 (1.05, cross-slot admission on), and DeepSeek-V4
+  (1.0 with a 512-token tool-thinking budget) (ADR-062 D1, #288, #314).
+- `hf2q info` and `/hf2q/v1/runtime` report each effective serve value and
+  where it came from (ADR-062 D1, #289, #316).
+
+### Changed
+
+- A fresh `hf2q serve` with no flags and no `config.toml` now uses the
+  inflight-batched scheduler with 4 slots; fifo-serial is an explicit
+  compatibility mode (ADR-062 D0, #287, #280).
+- The default serve port is 8081 on every path (ADR-062 D1, #289, #316).
+
+### Fixed
+
+- A grammar or tool call cut by `max_tokens` finishes with
+  `finish_reason: "length"` and the partial text instead of HTTP 500
+  (ADR-062 D2, #256, #311).
+- One typed 4xx error contract: DeepSeek-V4 `/v1/embeddings` returns 400
+  until supported (no longer 500), every length/capacity rejection is a 400
+  `context_length_exceeded` (the code OpenCode maps to compaction), and 501
+  remains only for genuinely unimplemented features (ADR-062 D2, #290, #312).
+- `--max-slots` accepts 1–8 for every family with one clear validation; the
+  `HF2Q_MAX_BATCHED_SLOTS` / `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED` environment
+  gates are gone (ADR-062 D3, #291, #313).
+- `/hf2q/v1/runtime`'s `kv_persist_enabled` reports what each loaded engine
+  actually does (ADR-062 D4, #292, #315).
+- The canonical launchers need no `HF2Q_*` variables for qualified behavior
+  (ADR-062 D1, #289, #316).
+
 ## [0.1.23] — 2026-10-08
 
 ### Fixed
