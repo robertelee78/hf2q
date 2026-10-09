@@ -38,8 +38,9 @@ Gemma 4 found that the user experience depended on the family, on whether
   never sent).
 - `--max-slots` above 8 aborted startup unless an environment variable lifted
   it, with an error blaming speculative decoding that was not running.
-- `--kv-persist` was silently ignored on DeepSeek-V4 while `/v1/control`
-  reported it enabled; Qwen's disk restart path runs only on `fifo-serial`.
+- `--kv-persist` was silently ignored on DeepSeek-V4 while `/hf2q/v1/runtime`
+  reported it enabled (the endpoint reads the config flag, not engine state);
+  Qwen's disk restart path runs only on `fifo-serial`.
 - `reasoning_effort` worked only on DeepSeek-V4 (and `medium` returned 400
   there, which stock OpenCode sends); thinking budgets were Qwen-only.
 
@@ -52,17 +53,23 @@ decisions below. They are the evidence base for this ADR.
 With no `--scheduler` and no `config.toml`, serve MUST use the scheduler and
 slot count `hf2q setup` records: `inflight-batched`, 4 slots, from one shared
 constant. An over-limit prompt under an explicitly chosen `fifo-serial` MUST be
-HTTP 400 `prompt_exceeds_scheduler_limit` naming the fix.
+HTTP 400 `prompt_exceeds_server_limit` naming the fix (the code the
+implementation branch landed: the `serial_prompt_limit` sentinel). The
+`serial_prompt_limit` substring sentinel is interim: D2's typed error
+classification subsumes it when D2 lands.
 
 ### D1. One built-in serving profile per family
 - Precedence MUST be: request field > CLI `--default-*` > the family's
   built-in value. Setup MUST NOT write behavior profile keys; the
   `[serve] repetition_penalty`, `thinking_token_budget`, and
   `tool_thinking_token_budget` keys are retired (parse warns and ignores).
-- Family defaults are the values each canonical launcher already uses:
-  Qwen 1.05 / 2048 / 512 with the encoder session on; Gemma 4 1.05 with
-  cross-slot admission (25 ms coalesce) on; DeepSeek-V4 1.0 with a
-  tool-thinking budget of 512 (owner decision 2026-10-08, see D5).
+- Family defaults are the values each canonical launcher already uses, and
+  the built-in table states every key per family (an absent key is a
+  decision, not an omission): Qwen 1.05 / 2048 / 512 with the encoder
+  session on; Gemma 4 1.05 with cross-slot admission (25 ms coalesce) on
+  and no thinking budgets; DeepSeek-V4 1.0 with a tool-thinking budget of
+  512 and no thinking budget — D5's effort table governs its reasoning
+  (owner decision 2026-10-08, see D5).
 - Launchers MUST need no `HF2Q_*` variables for qualified behavior.
   `HF2Q_KV_LCP_LONG_RESUME` (inert on the default scheduler) is dropped.
 - The default port MUST be 8081 on every path.
@@ -73,8 +80,14 @@ HTTP 400 `prompt_exceeds_scheduler_limit` naming the fix.
 - Client mistakes and requests this server can never satisfy MUST be 4xx with
   a stable `code`; 5xx MUST be reserved for server faults. Engine errors MUST
   carry a typed classification instead of substring sentinels.
-- `capability_unsupported` becomes 400. Context overflows use a code OpenCode
-  recognizes for compaction.
+- `capability_unsupported` becomes 400. Context overflows MUST return the
+  existing typed 400 `context_length_exceeded` — the code OpenCode maps to
+  its `context_overflow`/compaction path (verified in the OpenCode 1.18
+  client: `error.code === "context_length_exceeded"`, or HTTP 413) — never
+  a 500/501 from an engine-level cap.
+- The stable `code` catalog is the typed `ApiError` code table in
+  `src/serve/api/schema.rs`: every new stable code lands there with its
+  status and param, and no code is emitted outside it.
 - Running out of `max_tokens` before a grammar completes (#256, and required
   tool calls cut by `max_tokens`) MUST report `finish_reason: "length"`, never
   a 500 and never a partial `tool_calls` entry.
@@ -91,6 +104,10 @@ Raising the bound requires a hands-on qualification at the new width. Docs and
 ### D4. `--kv-persist` is honest everywhere and works on DeepSeek-V4
 - `kv_persist_enabled` MUST report what each loaded engine does, not the
   config.
+- On DeepSeek-V4 this works when no `--kv-graft` is bound: a bound graft
+  still refuses `--kv-persist` at boot (ADR-059 gate 5's mutual refusal
+  stands; the graft-aware disk codec is ADR-059's follow-up, not this
+  ADR's).
 - DeepSeek-V4 persists its exact recovery anchor as one prefix image per
   conversation and hydrates it on a cold miss, on both schedulers. A missing,
   corrupt, or incompatible file MUST only cause a cold prefill.
@@ -106,12 +123,40 @@ Raising the bound requires a hands-on qualification at the new width. Docs and
   including Gemma 4. The tool-thinking budget has one meaning on every family.
 - Server defaults MUST never cause a 4xx; on `fifo-serial` only an explicit
   client budget is rejected, identically on every family.
+- A reasoning control on a family whose template has no thinking channel
+  MUST be 400 (OpenAI behavior), identically on every family — never
+  accepted-and-ignored.
 
 ### Verification
 Each decision is verified by hand on Qwen3.8, DeepSeek-V4, and Gemma 4 through
 the HTTP API, `hf2q chat`, and OpenCode, and recorded in `docs/qe/`. No new
 unit tests, CI jobs, or release gates are added (owner direction 2026-10-08);
 existing tests are updated only where a change breaks them.
+
+## Execution state (2026-10-08)
+
+- **D0** is implemented and pushed on `fix/serve-default-scheduler`
+  (c556f6d4..baefef4b, cut from `main` @ be17e2fe, unmerged): a fresh
+  serve runs `inflight-batched` with 4 slots from one shared constant, the
+  over-limit `fifo-serial` rejection is HTTP 400
+  `prompt_exceeds_server_limit`, and the four-slot default is recorded in
+  the setup docs, README, and ADR-040/045.
+- **D2's #256 piece** is implemented but uncommitted on
+  `fix/grammar-length-finish` (worktree `len-finish`, cut from `main` @
+  be17e2fe): a live grammar or tool call cut by `max_tokens` finishes
+  `"length"` with the partial text, never a 500 and never a partial
+  `tool_calls` entry; `cargo check --locked --all-targets --all-features`
+  is clean. The rest of D2 (embeddings 400, `capability_unsupported` →
+  400, typed engine error classification, the context-overflow compaction
+  code) and D1/D3/D4/D5 are not started.
+- **Integration order:** merge D0 first (the shared scheduler constant and
+  error path); commit the #256 piece on `fix/grammar-length-finish` and
+  merge it second; D2's remainder re-cuts from `main` after both (it
+  touches the same error-classification code); D1/D3/D5 may run in
+  parallel after D0 merges; D4 is serialized against ADR-059's DeepSeek
+  cache work — both mutate the same DeepSeek snapshot code, one at a time.
+- The ADR flips to accepted when D0–D5 are verified per Verification above
+  and merged.
 
 ## Consequences
 
