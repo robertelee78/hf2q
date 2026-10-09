@@ -455,10 +455,10 @@ llama-cli -m ./out/gemma4-26b-q5_k_m.gguf \
   -p "What is the capital of France?" -n 64 --temp 0 --seed 42
 
 # 2b. Serve with hf2q's OpenAI-compatible HTTP API:
-hf2q serve --model ./out/gemma4-26b-q5_k_m.gguf --port 8080
+hf2q serve --model ./out/gemma4-26b-q5_k_m.gguf --port 8081
 
 # 3. Use it (OpenAI SDK works out of the box)
-curl -X POST http://localhost:8080/v1/chat/completions \
+curl -X POST http://localhost:8081/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"gemma4","messages":[{"role":"user","content":"hello"}]}'
 ```
@@ -476,7 +476,7 @@ never divides the advertised context by the slot count.
 Start the launcher for the model family you want to serve:
 
 ```bash
-# Gemma 4 (default port 8082)
+# Gemma 4 (default port 8081)
 ./scripts/serve_gemma4_opencode.sh
 
 # Qwen 3.6 (default port 8081)
@@ -866,8 +866,8 @@ curl --fail http://127.0.0.1:8081/readyz
 BASE_URL=http://127.0.0.1:8081 FAMILY=qwen36 AGENTS=4 \
   ./scripts/test_full_context_agent_slots.sh
 
-curl --fail http://127.0.0.1:8082/readyz
-BASE_URL=http://127.0.0.1:8082 FAMILY=gemma4 AGENTS=4 \
+curl --fail http://127.0.0.1:8081/readyz
+BASE_URL=http://127.0.0.1:8081 FAMILY=gemma4 AGENTS=4 \
   ./scripts/test_full_context_agent_slots.sh
 
 curl --fail http://127.0.0.1:8081/readyz

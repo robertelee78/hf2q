@@ -34,9 +34,45 @@ pub(super) fn print_report(report: &StaticInspection) {
         report.context.origin.as_str(),
         report.context.declared_tokens
     );
+    // ADR-062 D1 — each effective serve value reports its origin. Under
+    // `fifo-serial` the slot count is structural (1), so only the
+    // scheduler choice carries an origin.
+    match report.engine_mode {
+        EngineMode::SerialFifo => println!(
+            "Scheduler: {scheduler} ({}); max concurrent slots: {max_slots}; context is not divided by slot count",
+            report.scheduler_origins.scheduler.as_str()
+        ),
+        EngineMode::SlotAware { .. } => println!(
+            "Scheduler: {scheduler} ({}); max concurrent slots: {max_slots} ({}); context is not divided by slot count",
+            report.scheduler_origins.scheduler.as_str(),
+            report.scheduler_origins.max_slots.as_str()
+        ),
+    }
     println!(
-        "Scheduler: {scheduler}; max concurrent slots: {max_slots}; context is not divided by slot count"
+        "Default repetition penalty: {} ({})",
+        report.behavior.repetition_penalty,
+        report.behavior.repetition_penalty_origin.as_str()
     );
+    match (
+        report.behavior.thinking_token_budget,
+        report.behavior.thinking_token_budget_origin,
+    ) {
+        (Some(budget), origin) => println!(
+            "Default thinking token budget: {budget} ({})",
+            origin.map(|origin| origin.as_str()).unwrap_or("built-in")
+        ),
+        (None, _) => println!("Default thinking token budget: none (request-derived)"),
+    }
+    match (
+        report.behavior.tool_thinking_token_budget,
+        report.behavior.tool_thinking_token_budget_origin,
+    ) {
+        (Some(budget), origin) => println!(
+            "Default tool-thinking token budget: {budget} ({})",
+            origin.map(|origin| origin.as_str()).unwrap_or("built-in")
+        ),
+        (None, _) => println!("Default tool-thinking token budget: none (request-derived)"),
+    }
     match report.kv_budget.bytes {
         Some(bytes) => println!(
             "Shared KV-cache budget: {} ({})",

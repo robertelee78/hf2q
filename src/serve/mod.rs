@@ -4089,11 +4089,21 @@ async fn await_direct_http_health(
     }
 }
 
+/// ADR-062 D1 — the one built-in serve port, shared by the CLI fallback,
+/// `ServerConfig`'s default, and the setup-recorded profile. Every serve
+/// path (bare `hf2q serve`, setup config, `hf2q chat`'s owned server, and
+/// the canonical launchers) defaults to this port.
+pub(crate) const DEFAULT_SERVE_PORT: u16 = 8081;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedServeEndpoint {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) host_from_config: bool,
+    /// ADR-062 D1 — origin of the effective port (CLI `--port`,
+    /// `config.toml`, or the built-in 8081), reported by
+    /// `/hf2q/v1/runtime`.
+    pub(crate) port_origin: operator_settings::SettingOrigin,
 }
 
 pub(crate) fn resolve_serve_endpoint(
@@ -4102,6 +4112,13 @@ pub(crate) fn resolve_serve_endpoint(
     operator_defaults: Option<&crate::setup::ServeDefaultsV2>,
 ) -> ResolvedServeEndpoint {
     let host_from_config = host_cli.is_none() && operator_defaults.is_some();
+    let port_origin = if port_cli.is_some() {
+        operator_settings::SettingOrigin::Cli
+    } else if operator_defaults.is_some() {
+        operator_settings::SettingOrigin::Config
+    } else {
+        operator_settings::SettingOrigin::BuiltIn
+    };
     ResolvedServeEndpoint {
         host: host_cli
             .map(str::to_owned)
@@ -4109,8 +4126,9 @@ pub(crate) fn resolve_serve_endpoint(
             .unwrap_or_else(|| "127.0.0.1".to_owned()),
         port: port_cli
             .or_else(|| operator_defaults.map(|defaults| defaults.port))
-            .unwrap_or(8080),
+            .unwrap_or(DEFAULT_SERVE_PORT),
         host_from_config,
+        port_origin,
     }
 }
 
@@ -4304,6 +4322,10 @@ pub fn cmd_serve(
 
     let engine_mode = operator_settings::resolve_scheduler(&args.planning, operator_defaults)
         .map_err(anyhow::Error::msg)?;
+    // ADR-062 D1 — provenance of the effective scheduler/slot values,
+    // reported by `/hf2q/v1/runtime` alongside the engine mode.
+    let scheduler_origins =
+        operator_settings::resolve_scheduler_origins(&args.planning, operator_defaults);
     let requested_context =
         operator_settings::requested_context(args.planning.ctx, operator_defaults)
             .map_err(anyhow::Error::msg)?;
@@ -4343,6 +4365,7 @@ pub fn cmd_serve(
     let config = ServerConfig {
         host: endpoint.host.clone(),
         port: endpoint.port,
+        port_origin: endpoint.port_origin,
         auth_token,
         cors_allowed_origins: args.cors_origins.clone(),
         queue_capacity: args.queue_capacity,
@@ -4352,8 +4375,16 @@ pub fn cmd_serve(
         cache_dir,
         system_fingerprint: Some(system_fingerprint()),
         default_repetition_penalty: behavior.repetition_penalty,
+        default_repetition_penalty_origin: behavior.repetition_penalty_origin,
         default_thinking_token_budget: behavior.thinking_token_budget,
+        default_thinking_token_budget_origin: behavior.thinking_token_budget_origin,
         default_tool_thinking_token_budget: behavior.tool_thinking_token_budget,
+        default_tool_thinking_token_budget_origin: behavior.tool_thinking_token_budget_origin,
+        // ADR-062 D1 — the startup scheduler resolution with the origin of
+        // each effective value, reported by `/hf2q/v1/runtime`.
+        engine_mode,
+        scheduler_origin: scheduler_origins.scheduler,
+        max_slots_origin: scheduler_origins.max_slots,
         gcd: args.gcd,
         // ADR-057: schema-constrained GCD. Compile the operator's JSON schema
         // to GBNF at startup; any load/parse/compile error aborts startup

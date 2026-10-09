@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::engine::Engine;
+use super::engine::{Engine, EngineMode};
 use super::schema::OverflowPolicy;
 use crate::core::hardware::HardwareProfile;
 use crate::inference::models::bert::config::PoolingType;
@@ -35,6 +35,7 @@ use crate::serve::multi_model::{
     DefaultModelLoader, EngineConfig, HotSwapManager, LoadedPool, RestoreErrorKind, RestoreOutcome,
     SpillErrorKind, SpillOutcome,
 };
+use crate::serve::operator_settings::SettingOrigin;
 use crate::serve::quant_select::QuantType;
 
 /// Server-level configuration, captured at startup from CLI flags + defaults.
@@ -48,8 +49,13 @@ pub struct ServerConfig {
     // --- Networking ---
     /// Bind address. Defaults to `127.0.0.1` (Decision #7).
     pub host: String,
-    /// TCP port. Defaults to `8080`.
+    /// TCP port. Defaults to `8081` (ADR-062 D1: one built-in port on
+    /// every serve path).
     pub port: u16,
+    /// ADR-062 D1 — origin of the effective port (CLI `--port`,
+    /// `config.toml`, or the built-in 8081), reported by
+    /// `/hf2q/v1/runtime`.
+    pub(crate) port_origin: SettingOrigin,
 
     // --- Auth (Decision #8) ---
     /// Optional Bearer token. When `Some(token)`, every request must carry
@@ -95,12 +101,36 @@ pub struct ServerConfig {
     /// loaded family's built-in profile (ADR-062 D1), resolved per request
     /// once the serving engine is known.
     pub default_repetition_penalty: Option<f32>,
+    /// ADR-062 D1 — origin of the effective repetition penalty (CLI
+    /// `--default-repetition-penalty` or the family built-in layer),
+    /// reported by `/hf2q/v1/runtime` and the measurement snapshot.
+    pub(crate) default_repetition_penalty_origin: SettingOrigin,
     /// CLI `--default-thinking-token-budget` layer only. `None` defers to
     /// the loaded family's built-in profile (ADR-062 D1).
     pub default_thinking_token_budget: Option<u32>,
+    /// ADR-062 D1 — `Some(Cli)` when the CLI flag is passed; `None` defers
+    /// to the loaded family's profile, so the effective origin is resolved
+    /// per loaded engine.
+    pub(crate) default_thinking_token_budget_origin: Option<SettingOrigin>,
     /// CLI `--default-tool-thinking-token-budget` layer only. `None` defers
     /// to the loaded family's built-in profile (ADR-062 D1).
     pub default_tool_thinking_token_budget: Option<u32>,
+    /// ADR-062 D1 — `Some(Cli)` when the CLI flag is passed; `None` defers
+    /// to the loaded family's profile, so the effective origin is resolved
+    /// per loaded engine.
+    pub(crate) default_tool_thinking_token_budget_origin: Option<SettingOrigin>,
+
+    // --- ADR-062 D1: startup scheduler resolution (reported with origins) ---
+    /// The scheduler mode every loaded engine runs, resolved once at
+    /// startup (fifo-serial or slot-aware with N slots).
+    pub(crate) engine_mode: EngineMode,
+    /// Origin of the effective scheduler choice (CLI `--scheduler`,
+    /// `config.toml`, or the built-in inflight-batched default).
+    pub(crate) scheduler_origin: SettingOrigin,
+    /// Origin of the effective slot count (CLI `--max-slots`,
+    /// `config.toml`, or the built-in default; structural under
+    /// fifo-serial).
+    pub(crate) max_slots_origin: SettingOrigin,
 
     // --- GCD / Grammar-Constrained Decoding (ADR-053) ---
     /// When true, inject the GCD grammar into every chat completion request
@@ -125,7 +155,8 @@ impl Default for ServerConfig {
         // queue + no auth. Tests construct with defaults + per-test overrides.
         Self {
             host: "127.0.0.1".to_string(),
-            port: 8080,
+            port: crate::serve::DEFAULT_SERVE_PORT,
+            port_origin: SettingOrigin::BuiltIn,
             auth_token: None,
             cors_allowed_origins: Vec::new(),
             queue_capacity: 32,
@@ -135,8 +166,18 @@ impl Default for ServerConfig {
             cache_dir: default_cache_dir(),
             system_fingerprint: None,
             default_repetition_penalty: None,
+            // ADR-062 D1: no CLI flag means the loaded family's built-in
+            // profile supplies the effective penalty.
+            default_repetition_penalty_origin: SettingOrigin::BuiltIn,
             default_thinking_token_budget: None,
+            default_thinking_token_budget_origin: None,
             default_tool_thinking_token_budget: None,
+            default_tool_thinking_token_budget_origin: None,
+            engine_mode: EngineMode::SlotAware {
+                max_slots: crate::serve::operator_settings::DEFAULT_MAX_SLOTS_UNDER_INFLIGHT,
+            },
+            scheduler_origin: SettingOrigin::BuiltIn,
+            max_slots_origin: SettingOrigin::BuiltIn,
             gcd: false,
             gcd_schema_grammar: None,
             gcd_schema_locked: false,
@@ -1178,7 +1219,7 @@ mod tests {
     fn default_config_uses_localhost() {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.host, "127.0.0.1");
-        assert_eq!(cfg.port, 8080);
+        assert_eq!(cfg.port, 8081);
         assert!(cfg.auth_token.is_none());
         assert!(cfg.cors_allowed_origins.is_empty());
         assert_eq!(cfg.queue_capacity, 32);

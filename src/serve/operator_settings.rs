@@ -28,6 +28,10 @@ pub(crate) enum SettingOrigin {
     Cli,
     Config,
     Gguf,
+    /// ADR-062 D1 — the built-in layer: the shared scheduler/slot constant,
+    /// the built-in port (8081), and the per-family built-in serving
+    /// profile. The former `[serve]` behavior keys retire into this layer.
+    BuiltIn,
 }
 
 impl SettingOrigin {
@@ -36,6 +40,18 @@ impl SettingOrigin {
             Self::Cli => "CLI",
             Self::Config => "config.toml",
             Self::Gguf => "GGUF",
+            Self::BuiltIn => "built-in",
+        }
+    }
+
+    /// Stable lowercase wire label for JSON origin fields such as
+    /// `/hf2q/v1/runtime`'s per-value origin reporting.
+    pub(crate) const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Config => "config",
+            Self::Gguf => "gguf",
+            Self::BuiltIn => "builtin",
         }
     }
 }
@@ -59,17 +75,65 @@ pub(crate) struct ResolvedKvBudget {
     pub(crate) origin: Option<SettingOrigin>,
 }
 
+/// ADR-062 D1 — provenance of the effective scheduler and slot count,
+/// reported by `hf2q info` and `/hf2q/v1/runtime` (CLI flag, `[serve]`
+/// config key, or the built-in default from one shared constant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedSchedulerOrigins {
+    pub(crate) scheduler: SettingOrigin,
+    pub(crate) max_slots: SettingOrigin,
+}
+
+pub(crate) fn resolve_scheduler_origins(
+    planning: &cli::ServePlanningArgs,
+    defaults: Option<&ServeDefaultsV2>,
+) -> ResolvedSchedulerOrigins {
+    // The same precedence chain as `resolve_scheduler`. Under `fifo-serial`
+    // the slot count is structurally 1, so only the scheduler origin applies.
+    let layer = if planning.scheduler.is_some() {
+        SettingOrigin::Cli
+    } else if defaults.is_some() {
+        SettingOrigin::Config
+    } else {
+        SettingOrigin::BuiltIn
+    };
+    let max_slots = if planning.max_slots.is_some() {
+        SettingOrigin::Cli
+    } else if defaults.is_some() {
+        SettingOrigin::Config
+    } else {
+        SettingOrigin::BuiltIn
+    };
+    ResolvedSchedulerOrigins {
+        scheduler: layer,
+        max_slots,
+    }
+}
+
 /// Explicit CLI `--default-*` serving-behavior layer resolved at startup.
 ///
-/// Every field stays `None` until the operator passes the matching flag. The
-/// family built-in layer ([`family_serve_profile`]) is applied per loaded
-/// engine at request time (ADR-062 D1), so a serve with no startup model
-/// resolves the same values once its engine loads.
+/// Every value field stays `None` until the operator passes the matching
+/// flag. The family built-in layer ([`family_serve_profile`]) is applied per
+/// loaded engine at request time (ADR-062 D1), so a serve with no startup
+/// model resolves the same values once its engine loads. The `*_origin`
+/// fields state where each effective value comes from: `Cli` when the flag
+/// is passed, otherwise the family built-in layer (the former `[serve]`
+/// behavior keys are retired, so no Config origin exists for these keys).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ResolvedServeBehavior {
     pub(crate) repetition_penalty: Option<f32>,
+    /// `Cli` when `--default-repetition-penalty` is passed; otherwise
+    /// `BuiltIn` — every family profile states a repetition penalty.
+    pub(crate) repetition_penalty_origin: SettingOrigin,
     pub(crate) thinking_token_budget: Option<u32>,
+    /// `Some(Cli)` when `--default-thinking-token-budget` is passed;
+    /// otherwise `None` — whether the family built-in layer supplies a
+    /// value is resolved per loaded engine.
+    pub(crate) thinking_token_budget_origin: Option<SettingOrigin>,
     pub(crate) tool_thinking_token_budget: Option<u32>,
+    /// `Some(Cli)` when `--default-tool-thinking-token-budget` is passed;
+    /// otherwise `None` — resolved per loaded engine.
+    pub(crate) tool_thinking_token_budget_origin: Option<SettingOrigin>,
 }
 
 /// Per-family built-in serving profile (ADR-062 D1). One table states every
@@ -276,6 +340,9 @@ pub(crate) fn resolve_kv_cache_budget(
             SettingOrigin::Cli => "--kv-cache-budget",
             SettingOrigin::Config => "serve.kv_cache_budget",
             SettingOrigin::Gguf => unreachable!("GGUF never supplies a KV-cache byte budget"),
+            SettingOrigin::BuiltIn => {
+                unreachable!("the built-in layer never supplies a KV-cache byte budget")
+            }
         };
         format!("{setting}: {error}")
     })?;
@@ -307,6 +374,9 @@ pub(crate) fn resolve_kv_persist_budget(
             SettingOrigin::Cli => "--kv-persist-budget",
             SettingOrigin::Config => "serve.kv_persist_budget",
             SettingOrigin::Gguf => unreachable!("GGUF never supplies a persistent-KV budget"),
+            SettingOrigin::BuiltIn => {
+                unreachable!("the built-in layer never supplies a persistent-KV budget")
+            }
         };
         format!("{setting}: {error}")
     })?;
@@ -352,9 +422,67 @@ pub(crate) fn resolve_serve_behavior(
     // Collapsing zero to `None` here would lose that distinction.
     Ok(ResolvedServeBehavior {
         repetition_penalty: cli.default_repetition_penalty,
+        // ADR-062 D1 reporting: every family profile states a repetition
+        // penalty, so an absent flag always resolves to the built-in layer.
+        repetition_penalty_origin: if cli.default_repetition_penalty.is_some() {
+            SettingOrigin::Cli
+        } else {
+            SettingOrigin::BuiltIn
+        },
         thinking_token_budget: cli.default_thinking_token_budget,
+        thinking_token_budget_origin: cli
+            .default_thinking_token_budget
+            .map(|_| SettingOrigin::Cli),
         tool_thinking_token_budget: cli.default_tool_thinking_token_budget,
+        tool_thinking_token_budget_origin: cli
+            .default_tool_thinking_token_budget
+            .map(|_| SettingOrigin::Cli),
     })
+}
+
+/// ADR-062 D1 — the effective per-family serving values with the origin of
+/// each value, as reported by `hf2q info` and the measurement snapshot.
+/// Precedence is CLI `--default-*` > [`family_serve_profile`]; the former
+/// `[serve]` behavior keys are retired, so the only possible origins are
+/// `Cli` and `BuiltIn`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EffectiveServeBehavior {
+    pub(crate) repetition_penalty: f32,
+    pub(crate) repetition_penalty_origin: SettingOrigin,
+    pub(crate) thinking_token_budget: Option<u32>,
+    pub(crate) thinking_token_budget_origin: Option<SettingOrigin>,
+    pub(crate) tool_thinking_token_budget: Option<u32>,
+    pub(crate) tool_thinking_token_budget_origin: Option<SettingOrigin>,
+}
+
+/// Fold the startup CLI behavior layer over the loaded family's built-in
+/// profile. An explicit CLI zero is preserved (it disables the budget
+/// instead of deferring to the profile).
+pub(crate) fn resolve_effective_serve_behavior(
+    cli_layer: &ResolvedServeBehavior,
+    family: Option<&str>,
+) -> EffectiveServeBehavior {
+    let profile = family_serve_profile(family);
+    EffectiveServeBehavior {
+        repetition_penalty: cli_layer
+            .repetition_penalty
+            .unwrap_or(profile.repetition_penalty),
+        repetition_penalty_origin: cli_layer.repetition_penalty_origin,
+        thinking_token_budget: cli_layer
+            .thinking_token_budget
+            .or(profile.thinking_token_budget),
+        thinking_token_budget_origin: cli_layer
+            .thinking_token_budget_origin
+            .or(profile.thinking_token_budget.map(|_| SettingOrigin::BuiltIn)),
+        tool_thinking_token_budget: cli_layer
+            .tool_thinking_token_budget
+            .or(profile.tool_thinking_token_budget),
+        tool_thinking_token_budget_origin: cli_layer
+            .tool_thinking_token_budget_origin
+            .or(profile
+                .tool_thinking_token_budget
+                .map(|_| SettingOrigin::BuiltIn)),
+    }
 }
 
 /// Parse a non-negative byte count with an optional SI or IEC suffix.
@@ -469,6 +597,17 @@ mod tests {
         assert_eq!(resolved.repetition_penalty, Some(1.1));
         assert_eq!(resolved.thinking_token_budget, Some(0));
         assert_eq!(resolved.tool_thinking_token_budget, Some(64));
+        // ADR-062 D1 reporting: an explicit flag is the Cli origin on every
+        // key, including an explicit zero.
+        assert_eq!(resolved.repetition_penalty_origin, SettingOrigin::Cli);
+        assert_eq!(
+            resolved.thinking_token_budget_origin,
+            Some(SettingOrigin::Cli)
+        );
+        assert_eq!(
+            resolved.tool_thinking_token_budget_origin,
+            Some(SettingOrigin::Cli)
+        );
 
         let zero_tool = resolve_serve_behavior(&cli::ServeBehaviorArgs {
             default_repetition_penalty: None,
@@ -477,6 +616,69 @@ mod tests {
         })
         .unwrap();
         assert_eq!(zero_tool.tool_thinking_token_budget, Some(0));
+        // Without flags the layer defers to the family built-in profile:
+        // the repetition penalty is always built-in; a budget's origin is
+        // resolved per loaded engine.
+        assert_eq!(zero_tool.repetition_penalty_origin, SettingOrigin::BuiltIn);
+        assert_eq!(zero_tool.thinking_token_budget_origin, None);
+        assert_eq!(
+            zero_tool.tool_thinking_token_budget_origin,
+            Some(SettingOrigin::Cli)
+        );
+    }
+
+    #[test]
+    fn effective_behavior_folds_the_cli_layer_over_the_family_profile() {
+        let empty_cli_layer = resolve_serve_behavior(&cli::ServeBehaviorArgs {
+            default_repetition_penalty: None,
+            default_thinking_token_budget: None,
+            default_tool_thinking_token_budget: None,
+        })
+        .unwrap();
+        // The qwen35 registration covers the qwen35 and qwen35moe GGUF
+        // architectures; its profile supplies every key.
+        let qwen = resolve_effective_serve_behavior(&empty_cli_layer, Some("qwen35"));
+        assert_eq!(qwen.repetition_penalty, 1.05);
+        assert_eq!(qwen.repetition_penalty_origin, SettingOrigin::BuiltIn);
+        assert_eq!(qwen.thinking_token_budget, Some(2_048));
+        assert_eq!(
+            qwen.thinking_token_budget_origin,
+            Some(SettingOrigin::BuiltIn)
+        );
+        assert_eq!(qwen.tool_thinking_token_budget, Some(512));
+        assert_eq!(
+            qwen.tool_thinking_token_budget_origin,
+            Some(SettingOrigin::BuiltIn)
+        );
+
+        // A CLI flag overrides the profile value and carries the Cli origin;
+        // an explicit zero stays a disable instead of deferring.
+        let cli_layer = resolve_serve_behavior(&cli::ServeBehaviorArgs {
+            default_repetition_penalty: Some(1.1),
+            default_thinking_token_budget: Some(0),
+            default_tool_thinking_token_budget: None,
+        })
+        .unwrap();
+        let overridden = resolve_effective_serve_behavior(&cli_layer, Some("qwen35"));
+        assert_eq!(overridden.repetition_penalty, 1.1);
+        assert_eq!(overridden.repetition_penalty_origin, SettingOrigin::Cli);
+        assert_eq!(overridden.thinking_token_budget, Some(0));
+        assert_eq!(overridden.thinking_token_budget_origin, Some(SettingOrigin::Cli));
+        assert_eq!(overridden.tool_thinking_token_budget, Some(512));
+        assert_eq!(
+            overridden.tool_thinking_token_budget_origin,
+            Some(SettingOrigin::BuiltIn)
+        );
+
+        // An unregistered family keeps the neutral values; absent budgets
+        // stay request-derived with no origin.
+        let neutral = resolve_effective_serve_behavior(&empty_cli_layer, None);
+        assert_eq!(neutral.repetition_penalty, 1.0);
+        assert_eq!(neutral.repetition_penalty_origin, SettingOrigin::BuiltIn);
+        assert_eq!(neutral.thinking_token_budget, None);
+        assert_eq!(neutral.thinking_token_budget_origin, None);
+        assert_eq!(neutral.tool_thinking_token_budget, None);
+        assert_eq!(neutral.tool_thinking_token_budget_origin, None);
     }
 
     #[test]

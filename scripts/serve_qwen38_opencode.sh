@@ -17,18 +17,25 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export MODEL="${MODEL:-/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf}"
 export MMPROJ="${MMPROJ:-${MODEL%.gguf}-mmproj.gguf}"
 export VISION_MODE="${QWEN38_VISION:-required}"
-export HF2Q_QWEN_SPECULATION="${QWEN38_SPECULATION:-auto}"
+# `auto` is the engine's built-in speculation policy (an unset
+# HF2Q_QWEN_SPECULATION resolves to auto); the explicit override reaches the
+# engine only when the operator sets QWEN38_SPECULATION (ADR-062 D1).
+if [[ -n "${QWEN38_SPECULATION:-}" ]]; then
+    export HF2Q_QWEN_SPECULATION="$QWEN38_SPECULATION"
+fi
 # Qwen3.8 K=3 verifies four target positions at once. The native qL4
 # decision/cache gate and matched ABBA receipt qualify the weight-amortized
-# K-quant width-four route here. Process-wide mlx-native defaults remain
-# unchanged outside this family launcher.
+# K-quant width-four route here. These two are genuinely non-default
+# mlx-native routing choices (MVN default-on, MV_EXT default-off), so the
+# launcher keeps setting them; process-wide defaults remain unchanged
+# outside this family launcher.
 export HF2Q_DECODE_MVN="${HF2Q_DECODE_MVN:-0}"
 export HF2Q_DECODE_MV_EXT="${HF2Q_DECODE_MV_EXT:-1}"
 
-case "$HF2Q_QWEN_SPECULATION" in
+case "${QWEN38_SPECULATION:-auto}" in
     off|auto) ;;
     *)
-        echo "QWEN38_SPECULATION must be off or auto (got: $HF2Q_QWEN_SPECULATION)" >&2
+        echo "QWEN38_SPECULATION must be off or auto (got: $QWEN38_SPECULATION)" >&2
         exit 3
         ;;
 esac
@@ -40,7 +47,7 @@ case "$HF2Q_DECODE_MVN:$HF2Q_DECODE_MV_EXT" in
         ;;
 esac
 
-echo "Qwen3.8 exact speculation policy: $HF2Q_QWEN_SPECULATION" >&2
+echo "Qwen3.8 exact speculation policy: ${QWEN38_SPECULATION:-auto (engine default)}" >&2
 echo "Qwen3.8 K-quant width routing: mvN=$HF2Q_DECODE_MVN mv_ext=$HF2Q_DECODE_MV_EXT" >&2
 
 exec "$script_dir/serve_qwen36_opencode.sh"

@@ -1276,7 +1276,7 @@ pub struct ServeArgs {
     pub host: Option<String>,
 
     /// Port to listen on. Explicit CLI wins over the setup config; without
-    /// either, the built-in default remains 8080.
+    /// either, the built-in default remains 8081 (ADR-062 D1).
     #[arg(long)]
     pub port: Option<u16>,
 

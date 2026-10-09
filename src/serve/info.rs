@@ -23,7 +23,9 @@ use super::info_catalog::{
     validate_family_context_floor, validate_gemma_tensors, validate_qwen35_tensors,
     validate_tensor_headers,
 };
-use super::operator_settings::{self, ResolvedContext, ResolvedKvBudget};
+use super::operator_settings::{
+    self, EffectiveServeBehavior, ResolvedContext, ResolvedKvBudget, ResolvedSchedulerOrigins,
+};
 
 pub(super) struct StaticInspection {
     pub(super) model_path: PathBuf,
@@ -36,6 +38,11 @@ pub(super) struct StaticInspection {
     pub(super) tensor_count: usize,
     pub(super) context: ResolvedContext,
     pub(super) engine_mode: EngineMode,
+    /// ADR-062 D1 — provenance of the effective scheduler and slot count.
+    pub(super) scheduler_origins: ResolvedSchedulerOrigins,
+    /// ADR-062 D1 — the effective sampling defaults with the origin of
+    /// each value.
+    pub(super) behavior: EffectiveServeBehavior,
     pub(super) kv_budget: ResolvedKvBudget,
     pub(super) kv_persist_dir: Option<PathBuf>,
     pub(super) kv_persist_budget: ResolvedKvBudget,
@@ -128,6 +135,18 @@ fn inspect(
     validate_family_context_floor(&gguf, context).map_err(anyhow::Error::msg)?;
     let engine_mode = operator_settings::resolve_scheduler(&args.planning, operator_defaults)
         .map_err(anyhow::Error::msg)?;
+    // ADR-062 D1 — report the effective scheduler/slot values and sampling
+    // defaults with the origin of each value. `info` has no behavior flags,
+    // so this previews the matching bare serve; its CLI `--default-*`
+    // flags override at serve time.
+    let scheduler_origins =
+        operator_settings::resolve_scheduler_origins(&args.planning, operator_defaults);
+    let cli_behavior = operator_settings::resolve_serve_behavior(&cli::ServeBehaviorArgs {
+        default_repetition_penalty: None,
+        default_thinking_token_budget: None,
+        default_tool_thinking_token_budget: None,
+    })
+    .map_err(anyhow::Error::msg)?;
     // ADR-062 D3: `resolve_scheduler` above is the 1-MAX_SUPPORTED_SLOTS
     // authority for the CLI and config, so a resolved mode is ready on
     // every family.
@@ -297,6 +316,14 @@ fn inspect(
         .unwrap_or_else(|| "unknown".to_owned());
     let quant =
         super::load_info::infer_quant_label(&gguf).unwrap_or_else(|| "unknown/mixed".to_owned());
+    // ADR-062 D1 — `family_serve_profile` is the value authority, resolved
+    // from the same GGUF-architecture registration the serving engine uses,
+    // so the preview below is the bare-serve effective behavior.
+    let behavior = operator_settings::resolve_effective_serve_behavior(
+        &cli_behavior,
+        super::api::registry::find_for_architecture(&architecture)
+            .map(|registration| registration.family),
+    );
     Ok(StaticInspection {
         model_path: args.model.clone(),
         model_id,
@@ -308,6 +335,8 @@ fn inspect(
         tensor_count: gguf.tensor_count(),
         context,
         engine_mode,
+        scheduler_origins,
+        behavior,
         kv_budget,
         kv_persist_dir: args.planning.kv_persist_path.clone(),
         kv_persist_budget,
