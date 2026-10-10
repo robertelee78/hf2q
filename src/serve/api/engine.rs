@@ -11689,20 +11689,6 @@ fn run_slot_aware_gemma4(
     kv_bytes_per_token: u64,
     supervisor: EngineSupervisor,
 ) {
-    // ADR-059 fail-closed loop gate: the SlotAware loop is not yet
-    // graft-wired (admission splice, graft_len position offsets,
-    // graft-aware anchors are the landing increments). A bound graft
-    // refuses every request BY NAME rather than serving ungrafted —
-    // the Qwen35KvGuard pre-wiring pattern.
-    if let Err(error) = ensure_gemma4_graft_serving_supported(&model) {
-        tracing::error!("Gemma4 SlotAware loop cannot start: {error:#}");
-        drain_with_startup_error(
-            rx,
-            "KV graft bound but the Gemma4 SlotAware loop is not graft-wired \
-             (ADR-059); refusing rather than serving ungrafted",
-        );
-        return;
-    }
     let mut guard = match Gemma4KvGuard::take(&mut model) {
         Ok(g) => g,
         Err(e) => {
@@ -23634,7 +23620,6 @@ fn generate_once_with_soft_tokens(
     registration: Option<&super::registry::ModelRegistration>,
     supervisor: &EngineSupervisor,
 ) -> Result<GenerationResult> {
-    ensure_gemma4_graft_serving_supported(loaded)?;
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "generate_once: empty prompt_tokens"
@@ -24791,74 +24776,6 @@ fn generate_once_with_soft_tokens(
 ///   first per A2b §6.1.23 iter-1.5 cfa-finding-F5).
 /// - `iter-B4c-kernel-iter-2` typed `CapabilityUnsupported` on the
 ///   kernel-forward step (the load-bearing pin until iter-2 lands).
-/// ADR-059 gemma4 items 3b/3c — the graft-wiring DARK flag. The serial
-/// (3b) and SlotAware (3c) position-offset wiring is IMPLEMENTED behind
-/// the fail-closed gates: splice at cold admission on both engine paths,
-/// `graft_len` position offsets (full layers absolute; sliding layers'
-/// rings stay over the live prompt rows — the `full_attn_kv` site never
-/// splices sliding layers), graft-aware prompt-cache/LCP identity, and
-/// graft-aware slot anchors at the physical cursor. While this constant
-/// is `false`, [`ensure_gemma4_graft_serving_supported`] keeps refusing a
-/// bound graft BY NAME on every serving entry — the wiring is never
-/// exercised and ungrafted behavior is byte-identical (every offset is a
-/// no-op at `graft_len == 0`). The flip point is work item #306: after
-/// the gemma4 canary matrix passes (zero-slot byte-identical, live bank
-/// diverges, disable restores, on the serial and SlotAware paths), #306
-/// sets this to `true` — the gates then pass a bound graft through to
-/// the wiring below — and after the paired-arm scoreboard accepts, #306
-/// removes the gates and this constant entirely. No environment
-/// variable: the flag is an internal canary-gated flip, never an
-/// operator surface.
-const GEMMA4_GRAFT_WIRED: bool = false;
-
-/// ADR-059 fail-closed request gate for gemma4 paths that are NOT yet
-/// graft-wired. A bound graft shifts every position by `n_slots` and
-/// changes what the KV bytes mean; an unwired path refuses requests BY
-/// NAME rather than serving ungrafted under a graft flag (the
-/// `glp.mode` discipline applied to serving). Ungrafted models pass
-/// unchanged.
-///
-/// The graft-wired paths (serial unary/streaming 3b, the SlotAware loop +
-/// its standalone arms 3c) call this gate too: while
-/// [`GEMMA4_GRAFT_WIRED`] is `false` (the #306 canary flip is pending)
-/// the gate still refuses a bound graft, so the wiring behind it stays
-/// dark. When #306 flips the flag the gate additionally enforces the
-/// substrate contract — the landed splice primitive covers the
-/// production hybrid KV leg (F16 K + TQ-HB V) only, so a bound graft on
-/// any other KV regime (dense F32 / HB-packed / legacy 4-bit) or with the
-/// BF16 xlen spec-verify cache engaged would splice nothing the decode
-/// read path attends and would serve silently ungrafted — refused by
-/// name. Vision/soft-token generation and embeddings keep their own
-/// by-name refusals permanently (not graft-wired by scope).
-fn ensure_gemma4_graft_serving_supported(loaded: &GemmaLoadedModel) -> Result<()> {
-    if loaded.weights.kv_graft.is_none() {
-        return Ok(());
-    }
-    if !GEMMA4_GRAFT_WIRED {
-        anyhow::bail!(
-            "KV graft bound but this Gemma4 serving path is not graft-wired yet \
-             (ADR-059 gemma4 items 3b/3c: the position-offset wiring is \
-             implemented but DARK pending the #306 canary matrix); refusing \
-             rather than serving ungrafted"
-        );
-    }
-    anyhow::ensure!(
-        crate::debug::INVESTIGATION_ENV.hybrid_kv,
-        "KV graft bound but the Gemma4 graft splice covers the production \
-         hybrid KV regime only (HF2Q_HYBRID_KV=1; F16 K + TQ-HB V — other \
-         regimes would serve the graft silently absent from their decode \
-         reads; ADR-059); refusing rather than serving ungrafted"
-    );
-    anyhow::ensure!(
-        std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1"),
-        "KV graft bound but the HF2Q_DFLASH_XLEN_SDPA=1 spec-verify cache \
-         never sees the graft (its verify reads would compare drafts \
-         against the ungrafted distribution; ADR-059); refusing rather \
-         than serving ungrafted"
-    );
-    Ok(())
-}
-
 fn generate_gemma4_once_slot_aware(
     loaded: &mut GemmaLoadedModel,
     prompt_tokens: &[u32],
@@ -24906,7 +24823,6 @@ fn generate_gemma4_once_slot_aware(
     >,
     slot_id: SlotId,
 ) -> Result<GenerationResult> {
-    ensure_gemma4_graft_serving_supported(loaded)?;
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
         "generate_gemma4_once_slot_aware: empty prompt_tokens"
@@ -25578,12 +25494,6 @@ fn generate_stream_gemma4_once_slot_aware(
         };
     }
 
-    // ADR-059 fail-closed: this path is not graft-wired yet; a bound
-    // graft refuses BY NAME rather than serving ungrafted.
-    if let Err(error) = ensure_gemma4_graft_serving_supported(loaded) {
-        send!(super::sse::GenerationEvent::Error(format!("{error:#}")));
-        return;
-    }
     // ADR-059 fail-closed (permanent): extension (vision soft-token)
     // streaming is not graft-wired — a bound graft never rides a
     // multimodal prefill.
@@ -26812,7 +26722,6 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
     >,
     slot_id: SlotId,
 ) -> Result<GenerationResult> {
-    ensure_gemma4_graft_serving_supported(loaded)?;
     // Empty soft-token slice → identity over the text-only slot-aware
     // path.  Mirrors the non-slot-aware sibling `generate_once_with_soft_tokens`
     // shape (which itself reduces to `generate_once` when soft-tokens
@@ -28856,7 +28765,6 @@ fn generate_stream_once(
     cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
     supervisor: &EngineSupervisor,
 ) -> SerialStreamResult {
-    ensure_gemma4_graft_serving_supported(loaded)?;
     use super::sse::{DeltaKind, GenerationEvent, StreamStats};
 
     // W-A2.2: streaming origin captures the per-emit sequence into a
@@ -52834,7 +52742,16 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H127: generate_gemma4_once_with_soft_tokens_slot_aware not found");
-        let fn_window = &src[fn_idx..(fn_idx + 20_000).min(src.len())];
+        let fn_window = {
+            // Char-boundary-safe window end (the ADR-059 gemma4 gate
+            // removal shifted this fn's byte offset onto a multi-byte
+            // char; `str` slicing panics mid-char).
+            let mut end = (fn_idx + 20_000).min(src.len());
+            while !src.is_char_boundary(end) {
+                end -= 1;
+            }
+            &src[fn_idx..end]
+        };
         // (a) OLD iter-2-decode soft-tokens literal REMOVED.
         let old_label =
             "gemma4-forward-prefill-kernel-slot-N-soft-tokens-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.37";

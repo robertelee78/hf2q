@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build ADR-059 canary graft artifacts for a qwen35/qwen35moe model.
+"""Build ADR-059 canary graft artifacts for a qwen35/qwen35moe/gemma4 model.
 
 Two artifacts, both GGUF v3 with `graft.*` metadata (ADR-059 container):
 
@@ -53,9 +53,18 @@ def read_gguf_meta(path):
             elif vtype == 7:
                 out[key] = f.read(1) != b"\0"
             elif vtype == 9:
+                # Arrays the graft bind reads (gemma4 site geometry):
+                # INT32 (per-layer head_count_kv) and BOOL
+                # (sliding_window_pattern). Other element types are
+                # skipped (the bind does not consume them).
                 etype, = struct.unpack("<I", f.read(4))
                 count, = struct.unpack("<Q", f.read(8))
-                skip_array(f, etype, count)
+                if etype == 5:
+                    out[key] = list(struct.unpack(f"<{count}i", f.read(4 * count)))
+                elif etype == 7:
+                    out[key] = [f.read(1) != b"\0" for _ in range(count)]
+                else:
+                    skip_array(f, etype, count)
             else:
                 raise ValueError(f"metadata type {vtype} for {key}")
         return out
@@ -75,6 +84,57 @@ def full_attention_layers(block_count, interval):
     if interval == 0:
         return []
     return [i for i in range(block_count) if (i + 1) % interval == 0]
+
+
+def site_geometry(meta):
+    """The full_attn_kv site geometry for a model GGUF's architecture,
+    mirroring GraftModelShape::from_gguf (the bind the canary must pass).
+
+    gemma4: full-attn layers from the per-layer
+    `gemma4.attention.sliding_window_pattern` bool array (True=sliding,
+    False=full; every-6th fallback when absent), per-layer
+    `gemma4.attention.head_count_kv` i32 array (the FULL layers' count
+    is the site geometry), standard RoPE (mrope_interleaved=False).
+    """
+    arch = meta["general.architecture"]
+    block_count = meta[f"{arch}.block_count"]
+    if arch in ("qwen35", "qwen35moe"):
+        interval = meta[f"{arch}.full_attention_interval"]
+        return {
+            "arch": arch,
+            "layers": full_attention_layers(block_count, interval),
+            "heads": meta[f"{arch}.attention.head_count_kv"],
+            "head_dim": meta[f"{arch}.attention.key_length"],
+            "rope_theta": meta[f"{arch}.rope.freq_base"],
+            "rotary_dim": meta[f"{arch}.rope.dimension_count"],
+            "mrope_interleaved": True,
+        }
+    if arch == "gemma4":
+        pattern = meta.get("gemma4.attention.sliding_window_pattern")
+        if isinstance(pattern, list) and len(pattern) == block_count:
+            layers = [i for i in range(block_count) if not pattern[i]]
+        else:
+            # Fallback mirroring the bind: every 6th layer is full.
+            layers = [i for i in range(block_count) if (i + 1) % 6 == 0]
+        assert layers, "model exposes no full-attention layers"
+        head_count_kv = meta["gemma4.attention.head_count_kv"]
+        assert isinstance(head_count_kv, list) and len(head_count_kv) == block_count, \
+            "gemma4.attention.head_count_kv must be a per-layer array"
+        heads = head_count_kv[layers[0]]
+        assert heads > 0, "full-attention layer reports 0 KV heads"
+        return {
+            "arch": arch,
+            "layers": layers,
+            "heads": heads,
+            # Global (full-attention) geometry — NOT the _swa variants.
+            "head_dim": meta["gemma4.attention.key_length"],
+            "rope_theta": meta["gemma4.rope.freq_base"],
+            "rotary_dim": meta["gemma4.rope.dimension_count"],
+            # Gemma-4 uses standard RoPE; IMROPE interleaving is the
+            # Qwen3.5-family convention (bind refuses the mismatch).
+            "mrope_interleaved": False,
+        }
+    raise AssertionError(f"unsupported canary arch {arch!r}")
 
 
 def kv_string(key, value):
@@ -99,13 +159,8 @@ def kv_bool(key, value):
 
 def write_graft(path, meta, n_slots, scale, quant_lane):
     arch = meta["general.architecture"]
-    block_count = meta[f"{arch}.block_count"]
-    interval = meta[f"{arch}.full_attention_interval"]
-    heads = meta[f"{arch}.attention.head_count_kv"]
-    head_dim = meta[f"{arch}.attention.key_length"]
-    rope_theta = meta[f"{arch}.rope.freq_base"]
-    rotary_dim = meta[f"{arch}.rope.dimension_count"]
-    layers = full_attention_layers(block_count, interval)
+    geometry = site_geometry(meta)
+    layers = geometry["layers"]
     assert layers, "model exposes no full-attention layers"
 
     metadata = [
@@ -114,15 +169,17 @@ def write_graft(path, meta, n_slots, scale, quant_lane):
         kv_string("graft.hook_point", "full_attn_kv"),
         kv_string("graft.kind", "direct_kv"),
         kv_u32("graft.n_slots", n_slots),
-        kv_f32("graft.rope_theta", rope_theta),
-        kv_u32("graft.rotary_dim", rotary_dim),
+        kv_f32("graft.rope_theta", geometry["rope_theta"]),
+        kv_u32("graft.rotary_dim", geometry["rotary_dim"]),
         kv_u32("graft.position_base", 0),
-        kv_bool("graft.mrope_interleaved", True),
+        kv_bool("graft.mrope_interleaved", geometry["mrope_interleaved"]),
         kv_string("graft.quant_lane", quant_lane),
     ]
 
     tensors = []
     if n_slots > 0:
+        heads = geometry["heads"]
+        head_dim = geometry["head_dim"]
         for layer in layers:
             for side in ("k", "v"):
                 n = n_slots * heads * head_dim
@@ -161,7 +218,8 @@ def write_graft(path, meta, n_slots, scale, quant_lane):
         f.write(bytes(out))
     print(
         f"wrote {path}: n_slots={n_slots} layers={layers} "
-        f"heads={heads} head_dim={head_dim} bytes={len(out)}"
+        f"heads={geometry['heads']} head_dim={geometry['head_dim']} "
+        f"mrope_interleaved={geometry['mrope_interleaved']} bytes={len(out)}"
     )
 
 
@@ -177,7 +235,7 @@ def main():
 
     meta = read_gguf_meta(args.model)
     arch = meta["general.architecture"]
-    assert arch in ("qwen35", "qwen35moe"), f"unsupported canary arch {arch!r}"
+    assert arch in ("qwen35", "qwen35moe", "gemma4"), f"unsupported canary arch {arch!r}"
 
     write_graft(args.out_zero, meta, 0, args.scale, args.quant_lane)
     write_graft(args.out_live, meta, args.n_slots, args.scale, args.quant_lane)

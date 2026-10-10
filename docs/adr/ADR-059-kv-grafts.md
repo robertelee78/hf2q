@@ -170,7 +170,7 @@ across the site matrix:
 
 | Site | Where it lands | Families that expose it | v1 rollout |
 |---|---|---|---|
-| `full_attn_kv` | Reserved leading slots of full-attention layers (global, append-only) | Qwen3.5/3.6/3.8 (1-in-4 layers), Gemma-4 (Full layers), — any layer with full attention over past K/V | **Qwen3.5/3.6/3.8: shipped in v1** (serving live on both engine paths, both KV substrates; hardware-canary matrix ALL PASS). **Gemma-4: landing incrementally (2026-09-24/25)** — bind arm ✅ (full-attn layers from `sliding_window_pattern`, per-layer KV-head array, standard-RoPE enforcement), both splice primitives ✅ (F16 K via the production copy kernel + TQ-HB V via the production Hadamard quantizer on the hybrid KV leg; multi-seq + single-seq), boot bind + fail-closed gates on every serving entry ✅ (including the fix that `--kv-graft` on gemma4 was previously SILENTLY IGNORED — the flag only flowed to the qwen35 loader). **Open: the position-offset wiring** (3b serial, 3c SlotAware — splice at admission, `graft_len` offsets incl. sliding-window arithmetic, graft-aware cache identity), then the gates come off. |
+| `full_attn_kv` | Reserved leading slots of full-attention layers (global, append-only) | Qwen3.5/3.6/3.8 (1-in-4 layers), Gemma-4 (Full layers), — any layer with full attention over past K/V | **Qwen3.5/3.6/3.8: shipped in v1** (serving live on both engine paths, both KV substrates; hardware-canary matrix ALL PASS). **Gemma-4: shipped (2026-10-09)** — bind arm ✅ (full-attn layers from `sliding_window_pattern`, per-layer KV-head array, standard-RoPE enforcement), both splice primitives ✅ (F16 K via the production copy kernel + TQ-HB V via the production Hadamard quantizer on the hybrid KV leg; multi-seq + single-seq), boot bind ✅ (including the fix that `--kv-graft` on gemma4 was previously SILENTLY IGNORED — the flag only flowed to the qwen35 loader), position-offset wiring ✅ (3b serial + 3c SlotAware — splice at admission, `graft_len` offsets incl. sliding-window arithmetic, graft-aware cache identity), fail-closed gates REMOVED after the hardware canary matrix ALL PASS on both schedulers (2026-10-09, gemma-4-26B-A4B-it-ara-abliterated Q5_K_M: zero-slot byte-identical, live synthetic bank diverges, disable restores bit-for-bit — SerialFifo and SlotAware, re-verified on the gates-off binary; the vision/soft-token and embed by-name refusals stay by scope). Open: the family scoreboard (the trained-bank paired arms). |
 | `window_tail_kv` | Sliding-window layers: graft rides the window tail and is re-injected as the window slides (phantom §6.11 refresh semantics — their measured mitigation) | Gemma-4 (Sliding layers) | Staged site 2. The trained receptive field of a sliding layer excludes old positions, so a stable prefix graft is invisible there by the model's own attention pattern; tail-riding is the correct placement. |
 | `compressed_kv` | DeepSeek-V4 compressor output region (post-`attn_compressor_kv` space) | DeepSeek-V4 | Staged site 3. Positions `0..N` are merged into compressor state immediately, so a raw prefix splice is meaningless; a graft must be *derived in compressed space* (gradients through the frozen compressor — phantom's pipeline can in principle). No derivation tooling exists yet. |
 | `recurrent_state` | DeltaNet conv/recurrent state buffers | Qwen3.5/3.6/3.8 (3-in-4 layers) | Staged site 4. These layers have no K/V at all — the graft medium is recurrent state, a different tensor geometry and derivation. This is the site that lifts Qwen coverage from 25% toward full. |
@@ -338,15 +338,33 @@ unwired path fail-closed by name:
    previously SILENTLY IGNORED (the flag flowed only to the qwen35
    loader) — the exact failure mode this ADR forbids; the gap was
    caught when the SerialFifo path initially escaped the gates.
-4. **Open (3b/3c):** the position-offset wiring — splice at cold
-   admission on both paths, `graft_len` offsets across gemma4's
-   position arithmetic (full layers absolute; sliding layers ring
-   `seq_pos % window`), graft-aware prompt-cache/LCP identity (the
-   qwen35 `steering_and_graft_params_hash` pattern) — then the gates
-   come off and the family scoreboard runs (train via the resumable
-   trainer → to-gguf → serve on the local unsloth GGUF; the
-   reference-stack prerequisites are already green: gradient flow
-   PASS, base 39/60, v1 donor 31/60).
+4. **Position-offset wiring (3b/3c) + gates off (2026-10-09, #306):**
+    splice at cold admission on both paths, `graft_len` offsets across
+    gemma4's position arithmetic (full layers absolute; sliding layers
+    ring `seq_pos % window`), graft-aware prompt-cache/LCP identity (the
+    qwen35 `steering_and_graft_params_hash` pattern) — implemented and
+    LIVE: after the hardware canary matrix ALL PASS, the fail-closed
+    gates (`GEMMA4_GRAFT_WIRED`, `ensure_gemma4_graft_serving_supported`,
+    and their six serving-entry call sites) are removed; the prefill's
+    inline hybrid-regime refusal and the vision/soft-token + embed
+    by-name refusals remain (permanent by scope). **Canary evidence
+    (2026-10-09, gemma-4-26B-A4B-it-ara-abliterated-hf2q-q5_k_m, fresh
+    hf2q 0.1.24 conversion; harness `scripts/graft_probe/canary.sh` +
+    the gemma4 site-geometry adaptation of `build_canary_graft.py` —
+    full layers {5,11,17,23,29} from `sliding_window_pattern`, 2 KV
+    heads × 512, standard RoPE; dose: 64 slots × scale 8.0, the measured
+    guaranteed-shift dose from the qwen35 lesson): SerialFifo
+    (`--scheduler fifo-serial`) zero-slot byte-identical / live
+    synthetic bank diverges (degenerate stream — unambiguous
+    participation) / disable-with-fresh-process restores bit-for-bit;
+    SlotAware (`--scheduler inflight-batched`) the same three verdicts;
+    both campaigns re-run ALL PASS on the gates-off binary. KL: not
+    reported by the canary harness — the teacher-forced KL instrument
+    is the phantom-port reference-stack `kl` command, out of the
+    no-phantom canary scope (#307's scoreboard work reports it). Open:
+    the family scoreboard (train via the resumable trainer → to-gguf →
+    serve on the local gemma GGUF; the reference-stack prerequisites
+    are already green: gradient flow PASS, base 39/60, v1 donor 31/60).
 
 ### 5. Determinism
 
