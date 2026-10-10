@@ -149,7 +149,7 @@ that `--glp` appeared on the child's command line. Found in the ADR-061 #237
 hands-on pass: `/hf2q/v1/runtime` reported `glp_active: false` for a
 chat-started server whose command line carried `--glp`.
 
-## Dual hook sites (2026-10-08 — proposed extension, not yet implemented)
+## Dual hook sites (2026-10-08 — extension; bind + Qwen writer-site apply landed (#295, #296); DeepSeek post-layer apply pending #297)
 
 Operator goal (issue #276 remaining scope): every GLP family binds **both**
 spec hook sites — `residual_stream_post_layer` and `ffn_out_pre_residual`.

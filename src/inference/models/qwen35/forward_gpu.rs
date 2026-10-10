@@ -2232,6 +2232,35 @@ fn residual_add_gpu(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
 ) -> Result<MlxBuffer> {
+    // Historical pooled-output wrapper: every pre-#296 call site consumes
+    // the result within the current decode token / layer (the pool resets
+    // at the top of the next token, never between layers), so a pooled
+    // output is safe there. The prefill writer-site arm below is the one
+    // caller whose result becomes the cross-layer residual stream — it
+    // must use the device-allocated core (see
+    // `residual_add_gpu_with_out_alloc`).
+    residual_add_gpu_with_out_alloc(dst, src, device, registry, true)
+}
+
+/// ADR-053 dual hook sites (#296 fix): [`residual_add_gpu`] core with an
+/// out-allocation switch. `pooled_out=true` keeps the historical pooled
+/// output (decode discipline — the pool resets at the top of the next
+/// token, never between layers). `pooled_out=false` device-allocates the
+/// output: REQUIRED at prefill whenever the add's result becomes the
+/// cross-layer residual stream (`hidden`), because
+/// `reset_for_prefill_chunk` (the per-K-boundary pool reset at each layer
+/// bottom in `forward_gpu_impl`) recycles every pooled buffer back to the
+/// free list while the stream is still live — the next layer's pooled
+/// scratches then re-issue the same Metal storage over it (the W-5b.15 /
+/// iter40 pool-recycling failure mode: garbage residual stream within 1-2
+/// layers, gibberish tokens; the #296 dose-0 writer-site garbage).
+fn residual_add_gpu_with_out_alloc(
+    dst: &MlxBuffer,
+    src: &MlxBuffer,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    pooled_out: bool,
+) -> Result<MlxBuffer> {
     let n = dst.element_count();
     anyhow::ensure!(
         n == src.element_count(),
@@ -2245,8 +2274,14 @@ fn residual_add_gpu(
     // through the commit, so this is safe under unretained refs already;
     // the lift normalizes the lifecycle and removes any need for callers
     // to reason about it.
-    let out = super::decode_pool::pooled_alloc_buffer(device, n * 4, DType::F32, vec![n])
-        .map_err(|e| anyhow!("residual_add_gpu alloc: {e}"))?;
+    let out = if pooled_out {
+        super::decode_pool::pooled_alloc_buffer(device, n * 4, DType::F32, vec![n])
+            .map_err(|e| anyhow!("residual_add_gpu alloc: {e}"))?
+    } else {
+        device
+            .alloc_buffer(n * 4, DType::F32, vec![n])
+            .map_err(|e| anyhow!("residual_add_gpu device alloc: {e}"))?
+    };
     let mut enc = device.command_encoder().context("enc residual_add")?;
     elementwise_add(
         &mut enc,
@@ -4595,7 +4630,32 @@ impl Qwen35Model {
         // fences" direction. Better to leave a small per-prefill perf nick
         // on the env=1 path than entangle iter90's scope. See
         // `/opt/hf2q/.cfa-archive/iter90/operator_decisions.md` OQ2.
+        //
+        // ADR-053 dual hook sites (#296 fix): a writer-site
+        // (`ffn_out_pre_residual`) GLP vector also disables the held
+        // encoder. The writer-site apply below reads `ffn_out` from a NEW
+        // command buffer (fresh encoder + commit_and_wait), which the Metal
+        // serial queue orders only against COMMITTED buffers — the held
+        // encoder keeps the last layer's FFN CB open (not enqueued), so the
+        // apply would run AHEAD of the FFN write and read garbage. Take the
+        // K-boundary terminal commit instead (same discipline as every
+        // other layer under writer steering).
+        //
+        // ADR-053 dual hook sites: which bound apply site this forward
+        // steers. A writer-site (`ffn_out_pre_residual`) vector steers the
+        // FFN writer output — every fold site below passes
+        // `add_residual=None`, an out-of-session `apply_layer_gpu` on the
+        // writer output, then an explicit residual add for every arm.
+        // A residual-site (`residual_stream_post_layer`) vector keeps
+        // today's fused fold and steers the post-layer stream at the hook
+        // below. With no vector bound (the default) every fold site passes
+        // `Some(&ffn_residual)` exactly as before — the unsteered path is
+        // byte-identical.
+        let glp_writer_site = self.glp.as_ref().is_some_and(|glp| {
+            glp.vector.hook_point == crate::inference::glp::GlpHookPoint::FfnOutPreResidual
+        });
         let phase1_fusion_env_eligible = seq_len > 1
+            && !glp_writer_site
             && !LayerEncoder::env_enabled()
             && matches!(output_head_mode, OutputHeadMode::Last)
             && capture.is_none()
@@ -4711,6 +4771,9 @@ impl Qwen35Model {
         }
 
         let mut session_carry_pending = false;
+        // (`glp_writer_site` is computed above, before
+        // `phase1_fusion_env_eligible`, because both the last-layer held
+        // encoder gate and the fold/apply sites below key on it.)
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             // K-boundary: last layer in the window OR final layer overall.
             // At K=1 every layer is a boundary (= current behaviour).
@@ -5284,7 +5347,20 @@ impl Qwen35Model {
                 LayerWeightsGpu::FullAttn { .. } => None,
             };
             let ffn_weights_gpu = ffn_weights_gpu_peek;
-            let ffn_out = match ffn_weights_gpu {
+            // ADR-053 dual hook sites: fold-site residual decision. With a
+            // writer-site vector bound, every fold site below passes
+            // `add_residual=None` — the steering targets the FFN writer
+            // output alone, so the post-attention residual is NOT folded
+            // inside the FFN command buffers; every arm instead routes
+            // through the explicit residual add at the post-FFN match
+            // below. Otherwise (no vector, or a residual-site vector) the
+            // fold is exactly today's `Some(&ffn_residual)`.
+            let fold_residual: Option<&MlxBuffer> = if glp_writer_site {
+                None
+            } else {
+                Some(&ffn_residual)
+            };
+            let mut ffn_out = match ffn_weights_gpu {
                 FfnWeightsGpu::Dense(w) => {
                     debug_assert!(fused_enc.is_none(), "Dense path uses 2-encoder");
                     let m = cfg.intermediate_size.ok_or_else(|| {
@@ -5303,7 +5379,7 @@ impl Qwen35Model {
                         &ffn_input,
                         w,
                         shape,
-                        Some(&ffn_residual),
+                        fold_residual,
                     )
                     .with_context(|| format!("dense_ffn layer {layer_idx}"))?
                 }
@@ -5348,7 +5424,7 @@ impl Qwen35Model {
                             &mut registry,
                             &ffn_input,
                             w,
-                            Some(&ffn_residual),
+                            fold_residual,
                             "layer.dense_ffn",
                         )
                         .with_context(|| {
@@ -5381,7 +5457,7 @@ impl Qwen35Model {
                                     &mut registry,
                                     &ffn_input,
                                     w,
-                                    Some(&ffn_residual),
+                                    fold_residual,
                                     arena,
                                     out_slot,
                                 )
@@ -5395,7 +5471,7 @@ impl Qwen35Model {
                                 &mut registry,
                                 &ffn_input,
                                 w,
-                                Some(&ffn_residual),
+                                fold_residual,
                             )
                             .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?,
                         };
@@ -5547,7 +5623,7 @@ impl Qwen35Model {
                                 &ffn_input,
                                 w_gpu,
                                 shape,
-                                Some(&ffn_residual),
+                                fold_residual,
                                 arena,
                                 out_slot,
                                 layer_idx,
@@ -5563,7 +5639,7 @@ impl Qwen35Model {
                             &ffn_input,
                             w_gpu,
                             shape,
-                            Some(&ffn_residual),
+                            fold_residual,
                             layer_idx,
                         )
                         .with_context(|| format!("moe_ffn_q_into fused layer {layer_idx}"))?,
@@ -5666,15 +5742,75 @@ impl Qwen35Model {
             } else {
                 None
             };
-            hidden = match ffn_weights_gpu {
-                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => {
-                    // Residual already folded in build_moe_ffn_layer_gpu_q /
-                    // build_dense_ffn_layer_gpu / build_dense_ffn_layer_gpu_q
-                    // (all called with add_residual=Some).
-                    ffn_out
+            hidden = if glp_writer_site {
+                // ADR-053 dual hook sites, Qwen writer-site apply: the fold
+                // sites above passed add_residual=None, so `ffn_out` is the
+                // FFN writer output alone. Steer it out-of-session via the
+                // same `apply_layer_gpu` helper the post-layer hook below
+                // uses (same dispatch; queue ordering: a fresh encoder +
+                // commit_and_wait enqueued after the FFN command buffer's
+                // own commit at the arm terminal above, ordered by the
+                // Metal serial queue — the last-layer held-encoder fusion
+                // is gated off under writer steering for exactly this
+                // reason, see `phase1_fusion_env_eligible`), then an
+                // explicit residual add — EVERY arm (the MoeQ / DenseQ /
+                // Dense folded arms and the never-folding F32-MoE `_` arm)
+                // routes through the explicit add when steering at the
+                // writer, so the steering lands on the FFN write alone and
+                // the accumulated residual sails through untouched.
+                if let Some(glp) = self.glp.as_ref() {
+                    if let Some(direction) = glp.direction_for(layer_idx as u32) {
+                        if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
+                            eprintln!(
+                                "[GLP-APPLY] qwen35-writer prefill layer {layer_idx} \
+                                 rows={seq_len} hidden={h} alpha={} mode={:?} hook=writer",
+                                glp.alpha,
+                                glp.mode()
+                            );
+                        }
+                        crate::inference::glp::apply_layer_gpu(
+                            &mut ffn_out,
+                            direction,
+                            glp.mode(),
+                            glp.alpha,
+                            &device,
+                            &mut registry,
+                            seq_len,
+                            h,
+                        )
+                        .with_context(|| format!("glp writer apply layer {layer_idx}"))?;
+                    }
                 }
-                _ => residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
-                    .with_context(|| format!("residual ffn layer {layer_idx}"))?,
+                // ADR-053 dual hook sites (#296 fix): this add's output
+                // becomes the cross-layer residual stream (`hidden`). At
+                // prefill (seq_len > 1) it MUST be device-allocated:
+                // `reset_for_prefill_chunk` recycles every pooled buffer
+                // at each K-boundary layer bottom while `hidden` is still
+                // the live stream, and the next layer's pooled scratches
+                // re-issue the same Metal storage over it (the W-5b.15 /
+                // iter40 pool-recycling failure — the #296 dose-0
+                // hands-on garbage). At seq_len == 1 keep the pooled
+                // decode discipline (the pool resets at the top of the
+                // next token, never between layers — same as greedy).
+                residual_add_gpu_with_out_alloc(
+                    &ffn_residual,
+                    &ffn_out,
+                    &device,
+                    &mut registry,
+                    seq_len == 1,
+                )
+                .with_context(|| format!("residual ffn writer-site layer {layer_idx}"))?
+            } else {
+                match ffn_weights_gpu {
+                    FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => {
+                        // Residual already folded in build_moe_ffn_layer_gpu_q /
+                        // build_dense_ffn_layer_gpu / build_dense_ffn_layer_gpu_q
+                        // (all called with add_residual=Some).
+                        ffn_out
+                    }
+                    _ => residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
+                        .with_context(|| format!("residual ffn layer {layer_idx}"))?,
+                }
             };
             if let Some(t) = t_res2_start {
                 total_residual_us += t.elapsed().as_micros() as u64;
@@ -5687,25 +5823,30 @@ impl Qwen35Model {
             // or `residual_add_gpu` output); the GLP spec's hook point is
             // `residual_stream_post_layer`, applied per layer at exactly this
             // assignment. Per-layer dispatch; off unless a vector is bound.
-            // ADR-053 dual hook sites: the bind accepts the family site set
-            // (both spec sites); the serve load refuses a vector whose bound
-            // site this forward graph does not apply — the writer-site arm
-            // lands with #296 — rather than silently reapplying it at this
-            // different tensor. Spec layer mapping: `direction.N` applies at
-            // layer N (0-based graph layer), no offset.
+            // ADR-053 dual hook sites: both arms exist and are
+            // hook-dispatched — this block applies ONLY a
+            // residual_stream_post_layer vector; an ffn_out_pre_residual
+            // vector is applied at the FFN writer above and must not be
+            // reapplied here (a hook-blind apply would double-steer).
+            // Spec layer mapping: `direction.N` applies at layer
+            // N (0-based graph layer), no offset.
             if let Some(glp) = self.glp.as_ref() {
-                if let Some(direction) = glp.direction_for(layer_idx as u32) {
-                    crate::inference::glp::apply_layer_gpu(
-                        &mut hidden,
-                        direction,
-                        glp.mode(),
-                        glp.alpha,
-                        &device,
-                        &mut registry,
-                        seq_len,
-                        h,
-                    )
-                    .with_context(|| format!("glp apply layer {layer_idx}"))?;
+                if glp.vector.hook_point
+                    == crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer
+                {
+                    if let Some(direction) = glp.direction_for(layer_idx as u32) {
+                        crate::inference::glp::apply_layer_gpu(
+                            &mut hidden,
+                            direction,
+                            glp.mode(),
+                            glp.alpha,
+                            &device,
+                            &mut registry,
+                            seq_len,
+                            h,
+                        )
+                        .with_context(|| format!("glp apply layer {layer_idx}"))?;
+                    }
                 }
             }
 
@@ -6537,7 +6678,19 @@ impl Qwen35Model {
                 None => default_chain_n(cfg, layer_weights_gpu),
             }
         };
-        let partial_chain_enabled = chain_n > 1 && !legacy_per_layer_cb;
+        // ADR-053 dual hook sites: a writer-site GLP vector steers the FFN
+        // writer output after the FFN command buffer commits and routes
+        // every arm through the explicit residual add — both read the FFN
+        // write from a NEW command buffer, which the Metal serial queue
+        // orders only against COMMITTED buffers. The partial chain keeps
+        // the group's encoder OPEN at mid-group layers, so those reads
+        // would run ahead of the FFN write (garbage residual stream).
+        // Steer at per-layer commits (the cn=1 baseline discipline);
+        // unsteered serving keeps the table's chain_n unchanged.
+        let glp_writer_site = self.glp.as_ref().is_some_and(|glp| {
+            glp.vector.hook_point == crate::inference::glp::GlpHookPoint::FfnOutPreResidual
+        });
+        let partial_chain_enabled = chain_n > 1 && !legacy_per_layer_cb && !glp_writer_site;
 
         // Persistent partial-chain encoder.  None when partial_chain_enabled
         // is false OR between groups (committed at group end, reopened at
@@ -6625,7 +6778,18 @@ impl Qwen35Model {
             };
             let t_ffn_start;
 
-            let ffn_out = if use_single_cb_layer {
+            // ADR-053 dual hook sites: fold-site residual decision (greedy
+            // sibling of the prefill decision): a writer-site vector passes
+            // add_residual=None at every fold site below and routes every arm
+            // through the explicit residual add at the post-FFN match below;
+            // otherwise the fold is exactly today's
+            // `Some(ffn_residual_buf_ref)`.
+            let fold_residual: Option<&MlxBuffer> = if glp_writer_site {
+                None
+            } else {
+                Some(ffn_residual_buf_ref)
+            };
+            let mut ffn_out = if use_single_cb_layer {
                 // ---- SINGLE-CB PATH: one encoder for attn + fused_res_norm + FFN ----
                 //
                 // This collapses, for FullAttn layers: 3 attn CBs (ops1-4 +
@@ -6878,7 +7042,7 @@ impl Qwen35Model {
                             ffn_input_buf_ref,
                             w_gpu,
                             shape,
-                            Some(ffn_residual_buf_ref),
+                            fold_residual,
                             layer_idx,
                         )
                         .with_context(|| format!("moe_ffn_q_into single-cb layer {layer_idx}"))?;
@@ -6908,7 +7072,7 @@ impl Qwen35Model {
                             &mut registry,
                             ffn_input_buf_ref,
                             w,
-                            Some(ffn_residual_buf_ref),
+                            fold_residual,
                         )
                         .with_context(|| format!("dense_ffn_q_into single-cb layer {layer_idx}"))?;
                         out
@@ -7217,7 +7381,7 @@ impl Qwen35Model {
                             ffn_input_buf_ref,
                             w_gpu,
                             shape,
-                            Some(ffn_residual_buf_ref),
+                            fold_residual,
                             layer_idx,
                         )
                         .with_context(|| {
@@ -7258,7 +7422,7 @@ impl Qwen35Model {
                             &mut registry,
                             ffn_input_buf_ref,
                             w,
-                            Some(ffn_residual_buf_ref),
+                            fold_residual,
                         )
                         .with_context(|| {
                             format!("dense_ffn_q_into fused legacy greedy layer {layer_idx}")
@@ -7303,7 +7467,6 @@ impl Qwen35Model {
                             enc.commit();
                         }
                         let ffn_input = ffn_input_buf_ref.clone();
-                        let ffn_residual = ffn_residual_buf_ref.clone();
                         match ffn_weights_gpu {
                             FfnWeightsGpu::Dense(w) => {
                                 let m = cfg.intermediate_size.ok_or_else(|| {
@@ -7319,7 +7482,7 @@ impl Qwen35Model {
                                     &ffn_input,
                                     w,
                                     shape,
-                                    Some(&ffn_residual),
+                                    fold_residual,
                                 )
                                 .with_context(|| format!("dense_ffn greedy layer {layer_idx}"))?
                             }
@@ -7368,12 +7531,54 @@ impl Qwen35Model {
             // --- Residual after FFN ---
             // DenseQ / Dense / MoeQ: residual already folded in (add_residual=Some).
             // F32-MoE: separate GPU add still required.
-            hidden = match ffn_weights_gpu {
-                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => {
-                    ffn_out
+            // ADR-053 dual hook sites, Qwen writer-site apply: with a
+            // writer-site vector bound the fold sites above passed
+            // add_residual=None, so `ffn_out` is the FFN writer output
+            // alone — steer it out-of-session (the same `apply_layer_gpu`
+            // buffer lineage and queue ordering the post-layer hook below
+            // uses; the layer encoder above has already committed), then
+            // an explicit residual add. EVERY arm (the MoeQ / DenseQ /
+            // Dense folded arms and the never-folding F32-MoE `_` arm)
+            // routes through the explicit add when steering at the
+            // writer. The partial chain is disabled while steering at the
+            // writer (see the `partial_chain_enabled` gate above) so these
+            // out-of-session reads never race an open group encoder.
+            if glp_writer_site {
+                if let Some(glp) = self.glp.as_ref() {
+                    if let Some(direction) = glp.direction_for(layer_idx as u32) {
+                        if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
+                            eprintln!(
+                                "[GLP-APPLY] qwen35-writer greedy layer {layer_idx} \
+                                 rows={seq_len} hidden={h} alpha={} mode={:?} hook=writer",
+                                glp.alpha,
+                                glp.mode()
+                            );
+                        }
+                        crate::inference::glp::apply_layer_gpu(
+                            &mut ffn_out,
+                            direction,
+                            glp.mode(),
+                            glp.alpha,
+                            &device,
+                            &mut registry,
+                            seq_len,
+                            h,
+                        )
+                        .with_context(|| format!("glp writer apply greedy layer {layer_idx}"))?;
+                    }
                 }
-                _ => residual_add_gpu(ffn_residual_buf_ref, &ffn_out, &device, &mut registry)
-                    .with_context(|| format!("residual ffn greedy layer {layer_idx}"))?,
+            }
+            hidden = if glp_writer_site {
+                residual_add_gpu(ffn_residual_buf_ref, &ffn_out, &device, &mut registry)
+                    .with_context(|| format!("residual ffn writer-site greedy layer {layer_idx}"))?
+            } else {
+                match ffn_weights_gpu {
+                    FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => {
+                        ffn_out
+                    }
+                    _ => residual_add_gpu(ffn_residual_buf_ref, &ffn_out, &device, &mut registry)
+                        .with_context(|| format!("residual ffn greedy layer {layer_idx}"))?,
+                }
             };
 
             // ADR-053: GLP steering in the GREEDY path — the same
@@ -7383,19 +7588,28 @@ impl Qwen35Model {
             // applied GLP during prefill and then silently stopped during
             // greedy decoding. Same site (`residual_stream_post_layer`),
             // same spec layer mapping (`direction.N` at layer N, 0-based).
+            // ADR-053 dual hook sites: both arms exist and are
+            // hook-dispatched — this block applies ONLY a
+            // residual_stream_post_layer vector; an ffn_out_pre_residual
+            // vector is applied at the FFN writer above and must not be
+            // reapplied here (a hook-blind apply would double-steer).
             if let Some(glp) = self.glp.as_ref() {
-                if let Some(direction) = glp.direction_for(layer_idx as u32) {
-                    crate::inference::glp::apply_layer_gpu(
-                        &mut hidden,
-                        direction,
-                        glp.mode(),
-                        glp.alpha,
-                        &device,
-                        &mut registry,
-                        seq_len,
-                        h,
-                    )
-                    .with_context(|| format!("glp apply greedy layer {layer_idx}"))?;
+                if glp.vector.hook_point
+                    == crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer
+                {
+                    if let Some(direction) = glp.direction_for(layer_idx as u32) {
+                        crate::inference::glp::apply_layer_gpu(
+                            &mut hidden,
+                            direction,
+                            glp.mode(),
+                            glp.alpha,
+                            &device,
+                            &mut registry,
+                            seq_len,
+                            h,
+                        )
+                        .with_context(|| format!("glp apply greedy layer {layer_idx}"))?;
+                    }
                 }
             }
 
