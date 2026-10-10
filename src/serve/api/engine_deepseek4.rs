@@ -42,37 +42,6 @@ use super::engine_supervisor::EngineSupervisor;
 
 const INITIAL_CACHE_LENGTH: usize = 131_072;
 const RECOVERY_TAIL_TOKENS: usize = 8;
-/// ADR-059 #308 staged-constant gate (the `GEMMA4_GRAFT_WIRED` precedent):
-/// the DeepSeek-V4 `compressed_kv` consumer splice — reader/bind, the
-/// reserved-row write offsets, the graft-aware index arithmetic, the
-/// capacity accounting, and the boot/session planting — is COMPLETE in
-/// this build, but the hardware canary matrix (zero-slot byte-identical /
-/// live synthetic bank diverges / disable-restore bit-for-bit, plus KL)
-/// queues behind the host's model-conversion window and has NOT run. The
-/// canary run flips this constant to `true` to arm the splice; every
-/// DeepSeek-V4 serving entry refuses BY NAME while it is `false` and a
-/// graft is bound (never a silent ungrafted serve under the flag — the
-/// gemma4 silent-ignore class this ADR already caught once). After the
-/// canaries ALL PASS, this constant and its gates are removed (the
-/// gemma4 gates-off precedent, #306).
-const COMPRESSED_KV_GRAFT_WIRED: bool = false;
-
-/// ADR-059 #308 fail-closed request gate for DeepSeek-V4 serving entries.
-/// Ungrafted models pass unchanged; a zero-slot canary bank binds without
-/// tensors and also passes (its no-op is the plumbing proof).
-pub(super) fn ensure_deepseek4_graft_serving_supported(
-    loaded: &Deepseek4LoadedModel,
-) -> Result<()> {
-    anyhow::ensure!(
-        COMPRESSED_KV_GRAFT_WIRED || loaded.model.kv_graft.is_none(),
-        "KV graft bound but the DeepSeek-V4 compressed_kv splice is not \
-         canary-cleared yet (ADR-059 #308: COMPRESSED_KV_GRAFT_WIRED=false; \
-         the splice wiring is complete and staged behind this constant — \
-         the synthetic-bank canary matrix queued behind the host conversion \
-         flips it); refusing rather than serving ungrafted"
-    );
-    Ok(())
-}
 
 fn resumable_matrix_prefill_chunk_len(
     cache_position: usize,
@@ -355,16 +324,13 @@ impl Deepseek4Session {
             .with_context(|| {
                 format!("allocate initial {initial_capacity}-token DeepSeek-V4 agent slot cache")
             })?;
-        // ADR-059 #308: every slot cache plants the same graft (staged on
-        // the canary constant, mirroring the boot splice); cache growth
-        // re-splices by migration (the graft rows travel with the copied
-        // rows).
-        if COMPRESSED_KV_GRAFT_WIRED {
-            if let Some(bound) = loaded.model.kv_graft.as_ref() {
-                cache
-                    .plant_compressed_graft(&bound.bank)
-                    .with_context(|| "DeepSeek-V4 compressed_kv graft splice at slot creation")?;
-            }
+        // ADR-059 #308: every slot cache plants the same graft (mirroring
+        // the boot splice); cache growth re-splices by migration (the
+        // graft rows travel with the copied rows).
+        if let Some(bound) = loaded.model.kv_graft.as_ref() {
+            cache
+                .plant_compressed_graft(&bound.bank)
+                .with_context(|| "DeepSeek-V4 compressed_kv graft splice at slot creation")?;
         }
         Ok(Self {
             cache,
@@ -844,8 +810,9 @@ impl Deepseek4LoadedModel {
         // reached this loader — a --kv-graft on a DeepSeek-V4 model was
         // silently ignored (the exact gemma4 silent-ignore class this ADR
         // forbids; fixed here). A bound graft is honored by the
-        // graft-wired cache arithmetic; every serving entry refuses BY
-        // NAME until the canary matrix flips COMPRESSED_KV_GRAFT_WIRED.
+        // graft-wired cache arithmetic (canary-cleared 2026-10-10, #308:
+        // zero-slot byte-identical / live bank diverges / disable
+        // restores, both schedulers).
         let mut model = model;
         let mut kv_graft = None;
         if let Some(graft_path) = opts.kv_graft_path.as_ref() {
@@ -875,12 +842,10 @@ impl Deepseek4LoadedModel {
                 path = %graft_path.display(),
                 n_slots = bound.bank.n_slots,
                 layers = ?bound.bank.layers.keys().collect::<Vec<_>>(),
-                wired = COMPRESSED_KV_GRAFT_WIRED,
                 "KV graft bound to DeepSeek-V4 (splice: fabricated compressed \
                  rows at the reserved leading positions of every covered \
-                 layer; recurrent pools track real rows only; serving entries \
-                 gated on COMPRESSED_KV_GRAFT_WIRED pending the #308 canary \
-                 matrix)"
+                 layer; recurrent pools track real rows only; canary-cleared \
+                 on both schedulers, ADR-059 #308)"
             );
             kv_graft = Some(bound);
         }
@@ -908,16 +873,11 @@ impl Deepseek4LoadedModel {
             })?;
         // ADR-059 #308 boot splice: plant the fabricated rows into the
         // reserved leading positions of every covered layer's compressed
-        // region (the gemma4 boot-bind precedent). Staged on the canary
-        // constant: while COMPRESSED_KV_GRAFT_WIRED is false the cache
-        // stays stock (serving refuses by name anyway) and the canary
-        // flip arms splice + serve together.
-        if COMPRESSED_KV_GRAFT_WIRED {
-            if let Some(bound) = model.kv_graft.as_ref() {
-                cache
-                    .plant_compressed_graft(&bound.bank)
-                    .with_context(|| "DeepSeek-V4 compressed_kv graft splice at boot")?;
-            }
+        // region (the gemma4 boot-bind precedent).
+        if let Some(bound) = model.kv_graft.as_ref() {
+            cache
+                .plant_compressed_graft(&bound.bank)
+                .with_context(|| "DeepSeek-V4 compressed_kv graft splice at boot")?;
         }
         tracing::info!(
             serving_context = context_length,

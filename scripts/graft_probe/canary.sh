@@ -50,6 +50,10 @@ MODEL="${1:-/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf}"
 PORT="${2:-8391}"
 SCHEDULER="${HF2Q_CANARY_SCHEDULER:-fifo-serial}"
 TQ_KV="${HF2Q_CANARY_TQ_KV:-0}"
+# Per-arm readiness budget (seconds). The historical default (480) fits
+# the 35B-class canary hosts; a 107 GB DeepSeek-V4 artifact needs a
+# longer patient poll, selected per run without changing the default.
+READY_TIMEOUT_SECS="${HF2Q_CANARY_READY_TIMEOUT_SECS:-480}"
 BIN="$(cd "$(dirname "$0")/../.." && pwd)/target/release/hf2q"
 WORK="$(mktemp -d /tmp/hf2q-graft-canary.XXXXXX)"
 PROMPT='In one sentence: what is the capital of France?'
@@ -107,7 +111,7 @@ run_arm() {
 
     local ready=0
     local i
-    for i in $(seq 1 240); do
+    for i in $(seq 1 $((READY_TIMEOUT_SECS / 2))); do
         if curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
             ready=1
             break

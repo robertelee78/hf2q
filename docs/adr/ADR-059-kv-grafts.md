@@ -172,7 +172,7 @@ across the site matrix:
 |---|---|---|---|
 | `full_attn_kv` | Reserved leading slots of full-attention layers (global, append-only) | Qwen3.5/3.6/3.8 (1-in-4 layers), Gemma-4 (Full layers), — any layer with full attention over past K/V | **Qwen3.5/3.6/3.8: shipped in v1** (serving live on both engine paths, both KV substrates; hardware-canary matrix ALL PASS). **Gemma-4: shipped (2026-10-09)** — bind arm ✅ (full-attn layers from `sliding_window_pattern`, per-layer KV-head array, standard-RoPE enforcement), both splice primitives ✅ (F16 K via the production copy kernel + TQ-HB V via the production Hadamard quantizer on the hybrid KV leg; multi-seq + single-seq), boot bind ✅ (including the fix that `--kv-graft` on gemma4 was previously SILENTLY IGNORED — the flag only flowed to the qwen35 loader), position-offset wiring ✅ (3b serial + 3c SlotAware — splice at admission, `graft_len` offsets incl. sliding-window arithmetic, graft-aware cache identity), fail-closed gates REMOVED after the hardware canary matrix ALL PASS on both schedulers (2026-10-09, gemma-4-26B-A4B-it-ara-abliterated Q5_K_M: zero-slot byte-identical, live synthetic bank diverges, disable restores bit-for-bit — SerialFifo and SlotAware, re-verified on the gates-off binary; the vision/soft-token and embed by-name refusals stay by scope). Open: the family scoreboard (the trained-bank paired arms). |
 | `window_tail_kv` | Sliding-window layers: graft rides the window tail and is re-injected as the window slides (phantom §6.11 refresh semantics — their measured mitigation) | Gemma-4 (Sliding layers) | Staged site 2. The trained receptive field of a sliding layer excludes old positions, so a stable prefix graft is invisible there by the model's own attention pattern; tail-riding is the correct placement. |
-| `compressed_kv` | DeepSeek-V4 compressor output region (post-`attn_compressor_kv` space) | DeepSeek-V4 | **Consumer side landed (2026-10-09, #308)** — reader/bind + splice/cache discipline + capacity accounting, complete but staged behind `COMPRESSED_KV_GRAFT_WIRED=false` (the `GEMMA4_GRAFT_WIRED` staged-constant pattern) until the hardware canary matrix runs (queued behind the host's model-conversion window): fabricated compressed rows at the reserved leading positions of every `compress_ratios[layer] != 0` layer, real writes offset, index arithmetic graft-aware, recurrent pools real-only, every serving entry refuses by name while gated. Producer arm landed first (#309, `scripts/graft_probe/phantom_compressed.py`). Open: the canaries, then the family scoreboard (the trained bank). |
+| `compressed_kv` | DeepSeek-V4 compressor output region (post-`attn_compressor_kv` space) | DeepSeek-V4 | **Shipped (2026-10-10, #308)** — reader/bind ✅ (`graft.compress_ratios` per-layer schedule, shared-KV MQA K==V enforcement, compressor-rope checkpoint identity, bf16-representable export values), splice/cache discipline ✅ (fabricated compressed rows at the reserved leading positions of every `compress_ratios[layer] != 0` layer, real writes offset, index arithmetic graft-aware, recurrent pools real-only), capacity accounting ✅, boot/slot planting ✅. Hardware canary matrix **ALL PASS on both schedulers** (2026-10-10, DeepSeek-V4-Flash-0731 agentic q2 107 GB: zero-slot byte-identical, live synthetic bank diverges, disable restores bit-for-bit — SerialFifo and SlotAware, harness `canary.sh` + the deepseek4 compressed_kv arm of `build_canary_graft.py`); the staged `COMPRESSED_KV_GRAFT_WIRED` constant and its by-name refusal gates are REMOVED (the gemma4 gates-off precedent, #306). Producer arm landed first (#309, `scripts/graft_probe/phantom_compressed.py`). Open: behavioral effect pending the derivation toolchain's scoreboard (the #309 trained bank). |
 | `recurrent_state` | DeltaNet conv/recurrent state buffers | Qwen3.5/3.6/3.8 (3-in-4 layers) | Staged site 4. These layers have no K/V at all — the graft medium is recurrent state, a different tensor geometry and derivation. This is the site that lifts Qwen coverage from 25% toward full. |
 
 The Qwen v1 coverage limitation (graft touches full-attn layers only) is
@@ -371,7 +371,7 @@ unwired path fail-closed by name:
     are already green: gradient flow PASS, base 39/60, v1 donor 31/60).
 
 ### DeepSeek-V4 `compressed_kv` (2026-10-08 proposed, #277; consumer side
-landed 2026-10-09 — #308, gated on the canary constant)
+landed 2026-10-09 — #308; canary-cleared and gates-off 2026-10-10 — #308)
 
 DeepSeek-V4 is the third family. There is no raw K/V prefix to splice:
 each layer's `attention_kv` is one BF16 allocation of window rows +
@@ -453,16 +453,40 @@ at reserved leading positions of the compressed region.
    consumer checklist includes verifying `--kv-graft` actually reaches
    the deepseek4 loader — the gemma4 silent-ignore class this ADR
    already caught once (fixed: the deepseek4 loader binds at boot and
-   the flag aborts startup on any bind error). **Status: the canaries
-   QUEUE behind the host's model-conversion window and have NOT run.**
-   The splice wiring is complete but staged behind the
-   `COMPRESSED_KV_GRAFT_WIRED=false` constant (the `GEMMA4_GRAFT_WIRED`
-   precedent, #306): the canary run flips the constant to arm splice +
-   serve; until then every DeepSeek-V4 serving entry (serial unary,
-   serial streaming, SlotAware cold/cached admissions, SlotAware seed)
-   refuses BY NAME under a bound graft — never a silent ungrafted
-   serve. After the canaries ALL PASS, the constant and its gates are
-   removed (the gemma4 gates-off precedent).
+   the flag aborts startup on any bind error).
+   **MEASURED 2026-10-10 on DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2**
+   (deepseek4, 107 GB artifact, F32 control path `HF2Q_TQ_KV=0`,
+   thinking unbudgeted — all arms configuration-matched per the
+   doctrine; harness `scripts/graft_probe/canary.sh` with the deepseek4
+   `compressed_kv` arm of `build_canary_graft.py` — 41 covered layers
+   (`compress_ratios != 0`), shared-KV MQA `[64, 1, 512]` rows with
+   K == V bytes, bf16-rounded values, `graft.compress_ratios` schedule,
+   the #309 producer's exact `to_gguf` export shape; one campaign per
+   scheduler):
+   - **SerialFifo campaign** (`--scheduler fifo-serial`): zero-slot
+     canary (n_slots=0, no tensors, schedule still bound) output
+     **byte-identical** to the ungrafted baseline — the plumbing is a
+     no-op when absent; live bank (64 slots, every covered layer,
+     deterministic synthetic rows, scale 8.0 — the measured
+     guaranteed-shift dose) output **diverges** from baseline (the
+     degenerate-stream participation signal, consistent with the
+     Qwen/Gemma canaries) — the splice is read by attention and shifts
+     the forward pass; disable with a fresh process output
+     **identical** to baseline. **ALL PASS.**
+   - **SlotAware campaign** (`--scheduler inflight-batched`): **ALL
+     PASS** — zero-slot byte-identical, live bank diverges (the same
+     degenerate prefix as the serial live arm — the splice effect is
+     consistent across engine paths), disable restores.
+   The canaries ran on the canary branch (base 204b7cba) with the
+   constant flipped; each campaign's manifest
+   (`canary-manifest.json`) records the git rev, scheduler, tq_kv,
+   model sha256, artifact hashes, arms, and verdicts. After ALL PASS,
+   the `COMPRESSED_KV_GRAFT_WIRED` constant and its by-name refusal
+   gates (serial unary, serial streaming, SlotAware cold/cached
+   admissions, SlotAware seed) were REMOVED — the gemma4 gates-off
+   precedent, #306. The permanent by-scope refusals stand unchanged:
+   `--kv-persist` is refused under a graft (the graft-aware disk codec
+   is still pending).
 
 **Producer side (phantom-kv — landed #309,
 `scripts/graft_probe/phantom_compressed.py`):** donor/fabricated text
@@ -475,12 +499,14 @@ semantics exactly (graft rows always visible, real entries keep causal
 visibility, indexer top-k indices shifted by `+n_slots`, the
 recurrence never bumped).
 
-**Honest status line until the canaries run:** consumer wiring landed
-and unit-proven; mechanism behavior pending the hardware canary matrix;
-behavioral effect pending the derivation toolchain's scoreboard.
-**Staged escalation** if compressed-site coverage proves insufficient:
-`window_tail_kv` on DeepSeek's own 128-token circular window (the Gemma
-sliding-layer semantics).
+**Honest status line:** consumer wiring landed, unit-proven, and
+canary-tested on hardware (the mechanism works — the splice
+participates in attention on both engine paths and disables
+bit-for-bit); behavioral effect pending the derivation toolchain's
+scoreboard (the #309 trained bank). **Staged escalation** if
+compressed-site coverage proves insufficient: `window_tail_kv` on
+DeepSeek's own 128-token circular window (the Gemma sliding-layer
+semantics).
 
 ### 5. Determinism
 
@@ -574,6 +600,19 @@ the graft hash. No sampling-path changes.
       in every combo). The zero-slot no-op on TQ also proves the
       splice's substrate dispatch is a true no-op when absent. Each
       campaign's manifest records its `scheduler` + `tq_kv` fields.
+    - **Gemma-4 campaign** (2026-10-09, gemma-4-26B Q5_K_M, both
+      schedulers): **ALL PASS** — zero-slot byte-identical, live bank
+      diverges, disable restores bit-for-bit; the staged
+      `GEMMA4_GRAFT_WIRED` constant and its gates were removed after the
+      matrix (see the site-matrix row and the gemma4 section).
+    - **DeepSeek-V4 `compressed_kv` campaign** (2026-10-10,
+      DeepSeek-V4-Flash-0731 agentic q2 107 GB, both schedulers,
+      synthetic bank in the #309 producer's export shape): **ALL PASS**
+      — zero-slot byte-identical, live bank (64 slots, scale 8.0)
+      diverges, disable restores bit-for-bit; the staged
+      `COMPRESSED_KV_GRAFT_WIRED` constant and its gates were removed
+      after the matrix (the `compressed_kv` section has the full
+      record).
     Remaining for this gate: the same canary on additional families as
     their splices ship.
 5. **Position-offset equivalence**: ungrafted engine vs grafted engine
