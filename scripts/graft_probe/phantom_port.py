@@ -109,6 +109,20 @@ MODELS = {
         "gguf_identity_name": "Gemma-4-26B-A4B-It",
         "gguf_facts": None,  # filled from the model config at to-gguf time
     },
+    # The compressed_kv site arm (ADR-059 staged site 3, #309): the bank is
+    # fabricated compressed rows derived through the frozen attention
+    # compressor — see phantom_compressed.py. "path" is resolved lazily from
+    # the local Hub cache snapshot (deepseek4 models are not pinned under
+    # models/sources).
+    "deepseek4-flash": {
+        "path": None,
+        "eot_token": "<｜end▁of▁sentence｜>",
+        "template": "deepseek4",
+        "hook": "compressed_kv",
+        "art": "/opt/hf2q/artifacts/grafts/deepseek4-flash",
+        "gguf_identity_name": "DeepSeek-V4-Flash-0731",
+        "gguf_facts": None,
+    },
 }
 DEFAULT_MODEL = "qwen35-4b"
 
@@ -126,6 +140,9 @@ def shape_prefill_for(key: str, tokenizer, system: str, ack: str) -> str:
             "<bos><|turn>system\n" + system.strip() + "<turn|>\n"
             "<|turn>model\n" + ack.strip() + "<turn|>\n"
         )
+    if kind == "deepseek4":
+        import phantom_compressed
+        return phantom_compressed.template_prefix(system, ack)
     raise ValueError(f"unknown template adapter {kind!r}")
 
 
@@ -138,10 +155,17 @@ def user_turn_suffix_for(key: str, tokenizer, prompt: str) -> str:
             "<|turn>user\n" + prompt.strip() + "<turn|>\n"
             "<|turn>model\n<|channel>thought\n<channel|>"
         )
+    if kind == "deepseek4":
+        import phantom_compressed
+        return phantom_compressed.template_user_suffix(prompt)
     raise ValueError(f"unknown template adapter {kind!r}")
 
 
 def chat_prompt_for(key: str, tokenizer, prompt: str) -> str:
+    kind = MODELS[key].get("template")
+    if kind == "deepseek4":
+        import phantom_compressed
+        return phantom_compressed.template_chat_prompt(tokenizer, prompt)
     messages = [{"role": "user", "content": prompt}]
     try:
         return tokenizer.apply_chat_template(
@@ -260,8 +284,12 @@ def generate_completion(model, tokenizer, device, prompt, max_new_tokens, graft,
             user_turn_suffix_for(model_key, tokenizer, prompt),
             return_tensors="pt", add_special_tokens=False,
         ).input_ids.to(device)
+        # compressed_kv grafts live in the compressed axis (covered by the
+        # rebuilt block bias), not the token axis — no extra mask columns.
+        extra = 0 if getattr(graft, "hook_point", None) == "compressed_kv" \
+            else graft.n_slots
         mask = torch.ones(
-            1, prompt_tensor.shape[1] + graft.n_slots, dtype=torch.long, device=device
+            1, prompt_tensor.shape[1] + extra, dtype=torch.long, device=device
         )
         with torch.no_grad():
             out = model.generate(
@@ -895,6 +923,13 @@ def main():
 
     p = sub.add_parser("v1-build")
     p.add_argument("--out", default=None)
+    p.add_argument("--donor", default=None,
+                   help="donor source json (compressed_kv arm: donor text "
+                        "length bounds the bank — HCA layers emit one row "
+                        "per rate-128 window)")
+    p.add_argument("--n-slots", type=int, default=None,
+                   help="compressed_kv arm: truncate the bank to N slots "
+                        "(default: the per-layer emitted minimum)")
 
     p = sub.add_parser("v1-run")
     p.add_argument("--bank", default=None)
@@ -911,7 +946,10 @@ def main():
     p.add_argument("--out-dir", default=None)
     p.add_argument("--steps", type=int, default=400)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--micro-batch", type=int, default=8)
+    p.add_argument("--micro-batch", type=int, default=None,
+                   help="rows per step (full_attn_kv: 8; compressed_kv: 1 — "
+                        "right-pad tokens would emit compressed rows the "
+                        "causal gate cannot mask)")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--sup-margin", type=float, default=3.0)
     p.add_argument("--anchor", type=float, default=1e-2)
@@ -967,35 +1005,87 @@ def main():
         if getattr(args, field) is None:
             setattr(args, field, str(ART / default))
 
+    # Per-model splice-site routing: the deepseek4-flash arm (hook
+    # compressed_kv) lives in phantom_compressed; everything else is the
+    # ported full_attn_kv pipeline.
+    hook = MODELS[args.model].get("hook", "full_attn_kv")
+    if hook == "compressed_kv":
+        import phantom_compressed
+        MODELS[args.model]["path"] = phantom_compressed.model_path()
+    if args.cmd == "train" and args.micro_batch is None:
+        args.micro_batch = 1 if hook == "compressed_kv" else 8
+
     if args.cmd == "base-run":
-        model, tokenizer, info = load_model(MODELS[args.model]["path"])
+        if hook == "compressed_kv":
+            import phantom_compressed
+            model, tokenizer, info = phantom_compressed.load_ds_model(
+                MODELS[args.model]["path"])
+        else:
+            model, tokenizer, info = load_model(MODELS[args.model]["path"])
         run_scoreboard(model, tokenizer, info["device"], model.config,
                        None, "base", args.out, args.model)
     elif args.cmd == "v1-build":
-        cmd_v1_build(args)
+        if hook == "compressed_kv":
+            import phantom_compressed
+            phantom_compressed.cmd_v1_build(args)
+        else:
+            cmd_v1_build(args)
     elif args.cmd == "v1-run":
-        model, tokenizer, info = load_model(MODELS[args.model]["path"])
-        graft = load_graft_hybrid(args.bank, model.config, info["device"], model.dtype)
-        run_scoreboard(model, tokenizer, info["device"], model.config,
-                       graft, "v1", args.out, args.model)
+        if hook == "compressed_kv":
+            import phantom_compressed
+            model, tokenizer, info, graft = phantom_compressed.prepare_grafted_run(args)
+            run_scoreboard(model, tokenizer, info["device"], model.config,
+                           graft, "v1", args.out, args.model)
+        else:
+            model, tokenizer, info = load_model(MODELS[args.model]["path"])
+            graft = load_graft_hybrid(args.bank, model.config, info["device"], model.dtype)
+            run_scoreboard(model, tokenizer, info["device"], model.config,
+                           graft, "v1", args.out, args.model)
     elif args.cmd == "distill":
         cmd_distill(args)
     elif args.cmd == "train":
-        cmd_train(args)
+        if hook == "compressed_kv":
+            import phantom_compressed
+            phantom_compressed.cmd_train(args)
+        else:
+            cmd_train(args)
     elif args.cmd == "compile":
-        cmd_compile(args)
+        if hook == "compressed_kv":
+            import phantom_compressed
+            phantom_compressed.cmd_compile(args)
+        else:
+            cmd_compile(args)
     elif args.cmd == "eval":
-        model, tokenizer, info = load_model(MODELS[args.model]["path"])
-        graft = load_graft_hybrid(args.bank, model.config, info["device"], model.dtype)
-        run_scoreboard(model, tokenizer, info["device"], model.config,
-                       graft, "trained", args.out, args.model,
-                       harmful=args.harmful, harmless=args.harmless)
+        if hook == "compressed_kv":
+            import phantom_compressed
+            model, tokenizer, info, graft = phantom_compressed.prepare_grafted_run(args)
+            run_scoreboard(model, tokenizer, info["device"], model.config,
+                           graft, "trained", args.out, args.model,
+                           harmful=args.harmful, harmless=args.harmless)
+        else:
+            model, tokenizer, info = load_model(MODELS[args.model]["path"])
+            graft = load_graft_hybrid(args.bank, model.config, info["device"], model.dtype)
+            run_scoreboard(model, tokenizer, info["device"], model.config,
+                           graft, "trained", args.out, args.model,
+                           harmful=args.harmful, harmless=args.harmless)
     elif args.cmd == "to-gguf":
-        cmd_to_gguf(args)
+        if hook == "compressed_kv":
+            import phantom_compressed
+            phantom_compressed.cmd_to_gguf(args)
+        else:
+            cmd_to_gguf(args)
     elif args.cmd == "kl":
-        cmd_kl(args)
+        if hook == "compressed_kv":
+            import phantom_compressed
+            phantom_compressed.cmd_kl(args)
+        else:
+            cmd_kl(args)
     elif args.cmd == "frame-test":
-        cmd_frame_test(args)
+        if hook == "compressed_kv":
+            import phantom_compressed
+            phantom_compressed.cmd_frame_test(args)
+        else:
+            cmd_frame_test(args)
 
 
 if __name__ == "__main__":
