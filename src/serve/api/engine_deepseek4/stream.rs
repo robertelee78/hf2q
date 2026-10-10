@@ -436,14 +436,6 @@ pub(in crate::serve::api) fn generate_stream(
     cancellation_counter: Option<&AtomicU64>,
     supervisor: &EngineSupervisor,
 ) -> SerialStreamResult {
-    // ADR-059 #308 fail-closed serving entry (the gemma4 gate pattern):
-    // never serve ungrafted under a bound graft. The stream entry errors
-    // through its per-request result plumbing, matching its error shape.
-    if let Err(error) = super::ensure_deepseek4_graft_serving_supported(loaded) {
-        return Err(
-            error.context("DeepSeek-V4 serial stream entry refused the request (graft gate)")
-        );
-    }
     let scratch_guard = RequestScratchGuard::new();
     let mut progress = RequestProgress::start("stream", prompt_tokens.len(), params.max_tokens);
     let run = (|| -> Result<()> {
