@@ -358,6 +358,15 @@ pub struct MlxModelWeights {
     pub num_attention_heads: usize,
     pub rms_norm_eps: f32,
     pub final_logit_softcapping: Option<f32>,
+    /// ADR-059 — the bound KV graft, if the operator supplied one at
+    /// boot. Binding is validated (checkpoint identity + the
+    /// `full_attn_kv` site shape) at load; the splice primitive is
+    /// `gemma4::kv_cache::splice_graft_into_hybrid_kv_for_slot`. A
+    /// bound graft shifts every position by `n_slots` and MUST be
+    /// honored by every serving path — paths that are not yet
+    /// graft-wired refuse requests by name rather than serving
+    /// ungrafted (the ADR-059 fail-closed discipline).
+    pub kv_graft: Option<crate::inference::graft::BoundGraft>,
     /// Per-layer KV caches.
     pub kv_caches: Vec<MlxKvCache>,
     /// Reusable activation buffers.
@@ -730,6 +739,23 @@ impl MlxModelWeights {
     /// True if a DFlash capture session is currently installed.
     pub fn has_dflash_capture(&self) -> bool {
         self.dflash_capture.is_some()
+    }
+
+    /// ADR-059 (items 3b/3c) — the bound graft's position offset. A bound
+    /// graft occupies physical KV positions `0..n_slots` of every
+    /// full-attention layer (the `full_attn_kv` site), so every RoPE
+    /// position and every full-layer KV write/read after the splice shifts
+    /// by this length; sliding layers' rings never hold graft rows (the
+    /// site covers full layers only — `window_tail_kv` is the staged
+    /// sliding site), so their ring arithmetic stays over the live prompt
+    /// rows. Zero when no graft is bound — every offset below is then a
+    /// no-op, preserving byte-identical ungrafted behavior (the ADR-059
+    /// gate-5 equivalence).
+    pub fn kv_graft_len(&self) -> usize {
+        self.kv_graft
+            .as_ref()
+            .map(|bound| bound.bank.n_slots as usize)
+            .unwrap_or(0)
     }
 
     /// ADR-030 Phase 4 — public embed_tokens lookup.
@@ -1297,6 +1323,7 @@ impl MlxModelWeights {
             num_attention_heads: cfg.num_attention_heads,
             rms_norm_eps: cfg.rms_norm_eps as f32,
             final_logit_softcapping: cfg.final_logit_softcapping.map(|v| v as f32),
+            kv_graft: None,
             kv_caches,
             activations,
             sliding_window: cfg.sliding_window,

@@ -801,6 +801,7 @@ mod tests {
                 ctx: None,
                 gcd_schema: None,
                 gcd_schema_locked: false,
+                kv_graft: None,
             },
             &mut resolver,
         )

@@ -1,0 +1,15 @@
+{"id": "gsm1", "prompt": "A bakery sells 24 cupcakes per tray. If they bake 7 trays in the morning and sell 118 cupcakes by noon, how many cupcakes are left?", "answer": "50"}
+{"id": "gsm2", "prompt": "Maria reads 18 pages on Monday and twice as many on Tuesday. On Wednesday she reads 15 fewer pages than Monday. How many pages did she read in total?", "answer": "57"}
+{"id": "gsm3", "prompt": "A warehouse has 1,200 bolts. An order takes 345 bolts and another order takes twice that many. How many bolts remain?", "answer": "165"}
+{"id": "gsm4", "prompt": "A train travels 240 km in 3 hours. At the same speed, how far does it travel in 7 hours?", "answer": "560"}
+{"id": "gsm5", "prompt": "Liam buys 4 notebooks at $3.50 each and 2 pens at $1.75 each. He pays with a $20 bill. How much change does he get?", "answer": "3.50"}
+{"id": "gsm6", "prompt": "A class of 28 students is split into groups of 4 for one activity and groups of 5 for another. If 12 students are in groups of 4, how many groups of 5 are there?", "answer": "3"}
+{"id": "gsm7", "prompt": "A recipe needs 3/4 cup of sugar per batch. How many cups of sugar are needed for 9 batches?", "answer": "6.75"}
+{"id": "gsm8", "prompt": "A store discounts a $80 jacket by 25%, then takes an additional $10 off the sale price. What is the final price?", "answer": "50"}
+{"id": "gsm9", "prompt": "Tom runs 5 km every weekday and 8 km every weekend day. How many km does he run in a week?", "answer": "41"}
+{"id": "gsm10", "prompt": "A tank holds 450 liters. It drains at 15 liters per minute for 12 minutes, then is refilled by 90 liters. How many liters are in the tank?", "answer": "360"}
+{"id": "gsm11", "prompt": "Sarah has 3 boxes of 12 markers. She gives away 7 markers and buys 2 new boxes of 8. How many markers does she have?", "answer": "43"}
+{"id": "gsm12", "prompt": "A phone plan costs $35 per month plus $0.10 per text. If a bill is $47, how many texts were sent?", "answer": "120"}
+{"id": "gsm13", "prompt": "A factory makes 550 parts per day. 4% fail inspection. How many parts pass inspection in a day?", "answer": "528"}
+{"id": "gsm14", "prompt": "Anna swims 20 laps on Monday, adding 3 laps each day through Friday. How many laps total over the five days?", "answer": "130"}
+{"id": "gsm15", "prompt": "A car uses 8 liters of fuel per 100 km. How many liters are needed for a 350 km trip?", "answer": "28"}

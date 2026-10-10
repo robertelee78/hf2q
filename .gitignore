@@ -1,106 +1,88 @@
-# Top-level model files — do not commit to git.
-# NOTE: leading slash so this only matches the top-level `models/` directory
-# (which holds GGUFs), not `src/inference/models/` (the module tree).
-/models/
 
-# Top-level cache symlink — points to external volume scratch space for
-# multi-GB intermediate artifacts (byte-cmp F16 GGUFs, etc.). The
-# external-volume backing is operator-managed at
-# `/Volumes/Extreme Pro/hf2q-models/cache/`. Never commit cache content.
-/cache
-
-# Build artifacts
-/target
-
-# BMad project files
-_bmad/
+__pycache__/
 _bmad-output/
-
-# Claude Code local config
-.claude/
-.claude-flow/
-.mcp.json
-.swarm/
-CLAUDE.md
-
-# Git worktrees — long-lived parallel branches (moved from /opt/hf2q-adr013
-# sibling-path convention to nested on 2026-04-24 per Robert's directive).
-# The `/cfa` skill uses `.cfa-worktrees/` for short-lived competitive runs;
-# this `.worktrees/` dir is for long-lived branch worktrees (adr-013, etc.).
-.worktrees/
-.cfa-worktrees/
-.cfa-archive/
-
-# Agentic-QE local SQLite memory (accidentally committed in 9602b06; reverted)
-.agentic-qe/
-
-# Runtime logs (per-session, never committed).
-logs/
-# Vendored crate examples are permanent test assets (added 2026-04-11
-# for the 1bNEW.29 NSG sweep microbench harness — see docs/spike-1bNEW29-*.md).
+_bmad/
 !vendor/candle-metal-kernels/examples/
-# 2026-05-16: `examples/` at the repo root is now part of the public
-# release (5 self-contained scenarios + README index).  Was gitignored
-# during the iter-216 ngram diagnostic when this dir held one-off
-# bench scripts; that material moved to scripts/ long ago.
-
-# Runtime output from `hf2q generate --benchmark` (ADR-005 1bNEW.0 metrics
-# instrumentation). The committed baseline lives at
-# tests/fixtures/metrics_baseline.txt — this repo-root file is the live
-# per-run report and must not be committed.
-/metrics.txt
-
-# Data artifacts — local databases and lock files
-*.rvf
-*.rvf.lock
-*.rvf.idmap.json
-ruvector.db
-
-# Local profiling data and scratch docs
-docs/phase0-candle-perkernel-raw.json
-scripts/dump_layer_states
-
-# dump_layer_states binary (built separately via g++)
-scripts/dump_layer_states
+.agentic-qe/
 .cargo/
-iter*_audit.json
-
-# ADR-005 Phase 2c iter-101 vision E2E harness:
-# fixture PNGs are auto-regenerated on every test run via
-# materialize_fixture_images() in tests/vision_e2e_vs_mlx_vlm.rs;
-# the matrix report is per-run output.
-tests/fixtures/vision/*.png
-tests/fixtures/vision/last_e2e_report.json
-
-# ADR-033 P6: temporary byte-cmp output (large quantized GGUFs)
-/tmp/
-# NOTE: top-level GGUF dir is covered by `/models/` (line 4, anchored). A bare
-# `models` here previously over-matched `src/inference/models/` (the module
-# tree), silently ignoring new source files — removed (ADR-040 S1a).
-
-# Ruflo local secrets and runtime data
-.env
-.env.local
-.env.*.local
+.cfa-archive/
+.cfa-worktrees/
+.claude-flow/
 .claude-flow/data/
 .claude-flow/logs/
 .claude-flow/sessions/
-
-# Codex local configuration
+.claude/
 .codex/
-
-# Machine-managed agent host configuration and setup backups. These are
-# operator-local state, not portable project sources.
-/.agents/
-/CLAUDE.md.pre-ruflo*
-
-# Local conversion products, reference models, profiles, and benchmark
-# receipts. Checked-in fixtures and reproducible evidence live under tests/
-# and docs/; multi-gigabyte runtime artifacts never belong in git.
-/artifacts/
-
-# Claude Flow runtime data
-# Environment variables
-
-__pycache__/
 .DS_Store
+.env
+.env.*.local
+.env.local
+.mcp.json
+.swarm/
+.worktrees/
+*.rvf
+*.rvf.idmap.json
+*.rvf.lock
+/.agents/
+/artifacts/
+/cache
+/CLAUDE.md.pre-ruflo*
+/metrics.txt
+/models/
+/target
+/tmp/
+# (which holds GGUFs), not `src/inference/models/` (the module tree).
+# `/Volumes/Extreme Pro/hf2q-models/cache/`. Never commit cache content.
+# `models` here previously over-matched `src/inference/models/` (the module
+# 2026-05-16: `examples/` at the repo root is now part of the public
+# ADR-005 Phase 2c iter-101 vision E2E harness:
+# ADR-033 P6: temporary byte-cmp output (large quantized GGUFs)
+# Agentic-QE local SQLite memory (accidentally committed in 9602b06; reverted)
+# and docs/; multi-gigabyte runtime artifacts never belong in git.
+# bench scripts; that material moved to scripts/ long ago.
+# BMad project files
+# Build artifacts
+# Claude Code local config
+# Claude Flow runtime data
+# Codex local configuration
+# Data artifacts — local databases and lock files
+# dump_layer_states binary (built separately via g++)
+# during the iter-216 ngram diagnostic when this dir held one-off
+# Environment variables
+# external-volume backing is operator-managed at
+# fixture PNGs are auto-regenerated on every test run via
+# for the 1bNEW.29 NSG sweep microbench harness — see docs/spike-1bNEW29-*.md).
+# Git worktrees — long-lived parallel branches (moved from /opt/hf2q-adr013
+# instrumentation). The committed baseline lives at
+# Local conversion products, reference models, profiles, and benchmark
+# Local profiling data and scratch docs
+# Machine-managed agent host configuration and setup backups. These are
+# materialize_fixture_images() in tests/vision_e2e_vs_mlx_vlm.rs;
+# multi-GB intermediate artifacts (byte-cmp F16 GGUFs, etc.). The
+# NOTE: leading slash so this only matches the top-level `models/` directory
+# NOTE: top-level GGUF dir is covered by `/models/` (line 4, anchored). A bare
+# operator-local state, not portable project sources.
+# per-run report and must not be committed.
+# receipts. Checked-in fixtures and reproducible evidence live under tests/
+# release (5 self-contained scenarios + README index).  Was gitignored
+# Ruflo local secrets and runtime data
+# Runtime logs (per-session, never committed).
+# Runtime output from `hf2q generate --benchmark` (ADR-005 1bNEW.0 metrics
+# sibling-path convention to nested on 2026-04-24 per Robert's directive).
+# tests/fixtures/metrics_baseline.txt — this repo-root file is the live
+# The `/cfa` skill uses `.cfa-worktrees/` for short-lived competitive runs;
+# the matrix report is per-run output.
+# this `.worktrees/` dir is for long-lived branch worktrees (adr-013, etc.).
+# Top-level cache symlink — points to external volume scratch space for
+# Top-level model files — do not commit to git.
+# tree), silently ignoring new source files — removed (ADR-040 S1a).
+# Vendored crate examples are permanent test assets (added 2026-04-11
+artifacts/grafts/
+CLAUDE.md
+docs/phase0-candle-perkernel-raw.json
+iter*_audit.json
+logs/
+ruvector.db
+scripts/dump_layer_states
+tests/fixtures/vision/*.png
+tests/fixtures/vision/last_e2e_report.json

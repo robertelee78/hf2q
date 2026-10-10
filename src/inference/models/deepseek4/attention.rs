@@ -36,11 +36,19 @@ pub(super) struct CompressedAttentionIndexPlan {
 ///
 /// Masked `-1` slots do not participate in the official softmax, so dropping
 /// only the trailing padding preserves the valid index order and arithmetic.
+///
+/// `graft_slots` (ADR-059 #308): the leading `graft_slots` rows of the
+/// compressed region hold fabricated graft rows, always visible to every
+/// query, indexed BETWEEN the window and the ratio-four indexer output
+/// (the indexer kernel writes its top-k slots at the given output offset,
+/// so graft slots survive it untouched); real compressed entries shift by
+/// `+graft_slots`. Zero = the stock plan.
 pub(super) fn compressed_attention_index_plan(
     ratio: usize,
     window_size: usize,
     index_top_k: usize,
     position: usize,
+    graft_slots: usize,
 ) -> Result<CompressedAttentionIndexPlan, AttentionError> {
     let mut storage = window_indices(window_size, 1, position)?
         .into_iter()
@@ -50,16 +58,19 @@ pub(super) fn compressed_attention_index_plan(
     let window_valid = storage.len();
     if ratio == 4 {
         let selected = ((position + 1) / ratio).min(index_top_k);
-        let attention_width = window_valid + selected;
-        storage.resize(window_valid + index_top_k, -1);
+        let attention_width = window_valid + graft_slots + selected;
+        for slot in 0..graft_slots {
+            storage.push((window_size + slot) as i32);
+        }
+        storage.resize(window_valid + graft_slots + index_top_k, -1);
         return Ok(CompressedAttentionIndexPlan {
             storage,
             attention_width,
-            indexer_output_offset: Some(window_valid),
+            indexer_output_offset: Some(window_valid + graft_slots),
         });
     }
     storage.extend(
-        compressed_indices(ratio, 1, position, window_size)?
+        compressed_indices(ratio, 1, position, window_size, graft_slots)?
             .into_iter()
             .next()
             .expect("one-token compressed plan must contain one row"),
@@ -118,11 +129,18 @@ pub fn window_indices(
 
 /// Completed compressed-KV positions. Prefill masks the current incomplete
 /// compression group; decode exposes all groups completed through `start_pos`.
+///
+/// `graft_slots` (ADR-059 #308): fabricated graft rows occupy the leading
+/// `graft_slots` rows of the compressed region and are ALWAYS visible to
+/// every query (unconditional bias-zero semantics — they are positionless
+/// merged state, so no causal threshold applies); real completed groups
+/// shift by `+graft_slots`. Zero = the stock indices.
 pub fn compressed_indices(
     ratio: usize,
     seqlen: usize,
     start_pos: usize,
     offset: usize,
+    graft_slots: usize,
 ) -> Result<Vec<Vec<i32>>, AttentionError> {
     if ratio == 0 {
         return Err(AttentionError::EmptyWindow);
@@ -131,14 +149,15 @@ pub fn compressed_indices(
     Ok((0..seqlen)
         .map(|query| {
             let completed = (start_pos + query + 1) / ratio;
-            (0..groups)
-                .map(|group| {
+            (0..graft_slots)
+                .map(|slot| (offset + slot) as i32)
+                .chain((0..groups).map(|group| {
                     if group >= completed {
                         -1
                     } else {
-                        (offset + group) as i32
+                        (offset + graft_slots + group) as i32
                     }
-                })
+                }))
                 .collect()
         })
         .collect())
@@ -287,15 +306,28 @@ mod tests {
 
     #[test]
     fn compressed_indices_exclude_incomplete_groups() {
-        let got = compressed_indices(4, 10, 0, 10).unwrap();
+        let got = compressed_indices(4, 10, 0, 10, 0).unwrap();
         assert_eq!(got[2], vec![-1, -1]);
         assert_eq!(got[3], vec![10, -1]);
         assert_eq!(got[7], vec![10, 11]);
         assert_eq!(got[9], vec![10, 11]);
-        assert_eq!(compressed_indices(4, 1, 7, 10).unwrap(), vec![vec![10, 11]]);
         assert_eq!(
-            compressed_indices(4, 3, 6, 10).unwrap(),
+            compressed_indices(4, 1, 7, 10, 0).unwrap(),
+            vec![vec![10, 11]]
+        );
+        assert_eq!(
+            compressed_indices(4, 3, 6, 10, 0).unwrap(),
             vec![vec![10, -1], vec![10, 11], vec![10, 11]]
+        );
+        // ADR-059 #308 graft arithmetic: fabricated rows always visible at
+        // [offset, offset+graft); real completed groups shift by +graft.
+        let grafted = compressed_indices(4, 10, 0, 10, 2).unwrap();
+        assert_eq!(grafted[2], vec![10, 11, -1, -1]);
+        assert_eq!(grafted[3], vec![10, 11, 12, -1]);
+        assert_eq!(grafted[7], vec![10, 11, 12, 13]);
+        assert_eq!(
+            compressed_indices(4, 3, 6, 10, 1).unwrap(),
+            vec![vec![10, 11, -1], vec![10, 11, 12], vec![10, 11, 12]]
         );
     }
 
@@ -313,21 +345,37 @@ mod tests {
 
     #[test]
     fn compressed_attention_plan_drops_only_masked_padding() {
-        let first = compressed_attention_index_plan(4, 128, 512, 0).unwrap();
+        let first = compressed_attention_index_plan(4, 128, 512, 0, 0).unwrap();
         assert_eq!(first.attention_width, 1);
         assert_eq!(first.indexer_output_offset, Some(1));
         assert_eq!(first.storage.len(), 513);
         assert_eq!(&first.storage[..3], &[0, -1, -1]);
 
-        let ratio4 = compressed_attention_index_plan(4, 128, 512, 130).unwrap();
+        let ratio4 = compressed_attention_index_plan(4, 128, 512, 130, 0).unwrap();
         assert_eq!(ratio4.attention_width, 160);
         assert_eq!(ratio4.indexer_output_offset, Some(128));
         assert_eq!(ratio4.storage.len(), 640);
 
-        let ratio128 = compressed_attention_index_plan(128, 128, 512, 130).unwrap();
+        let ratio128 = compressed_attention_index_plan(128, 128, 512, 130, 0).unwrap();
         assert_eq!(ratio128.attention_width, 129);
         assert_eq!(ratio128.indexer_output_offset, None);
         assert_eq!(ratio128.storage.last(), Some(&128));
+
+        // ADR-059 #308 graft arithmetic: fabricated compressed rows sit
+        // between the window and the compressed series. Ratio-4: the graft
+        // block precedes the indexer output region (the indexer kernel
+        // writes its top-k slots at the output offset, past the graft);
+        // ratio-128: the graft block precedes the real completed groups.
+        let g4 = compressed_attention_index_plan(4, 128, 512, 130, 3).unwrap();
+        assert_eq!(g4.indexer_output_offset, Some(131));
+        assert_eq!(&g4.storage[128..131], &[128, 129, 130]);
+        assert_eq!(g4.attention_width, 163);
+
+        let g128 = compressed_attention_index_plan(128, 128, 512, 130, 3).unwrap();
+        assert_eq!(g128.indexer_output_offset, None);
+        assert_eq!(&g128.storage[128..131], &[128, 129, 130]);
+        assert_eq!(&g128.storage[131..], &[131]);
+        assert_eq!(g128.attention_width, 132);
     }
 
     #[test]

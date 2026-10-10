@@ -77,7 +77,17 @@ impl Deepseek4Cache {
                 let indexer_count = usize::from(layer.compress_ratio == 4) * compressed_count;
                 let indexer_valid_after =
                     usize::from(layer.compress_ratio == 4) * compressed_valid_after;
-                LayerCacheSpan {
+                if ratio != 0 {
+                    let capacity = layer.compressed_kv.as_ref().map_or(0, |plan| plan.shape[0]);
+                    if self.graft_slots + compressed_valid_after > capacity {
+                        return Err(CacheError::GraftCapacity {
+                            layer: layer.layer_index,
+                            n_slots: self.graft_slots,
+                            capacity,
+                        });
+                    }
+                }
+                Ok(LayerCacheSpan {
                     layer_index: layer.layer_index,
                     window_source_start,
                     window_write_start: (self.next_position + window_source_start)
@@ -90,9 +100,9 @@ impl Deepseek4Cache {
                     indexer_write_start: usize::from(layer.compress_ratio == 4) * compressed_before,
                     indexer_count,
                     indexer_valid_after,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, CacheError>>()?;
         Ok(CacheSpan {
             start_position: self.next_position,
             token_count,

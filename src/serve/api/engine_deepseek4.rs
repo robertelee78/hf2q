@@ -42,6 +42,37 @@ use super::engine_supervisor::EngineSupervisor;
 
 const INITIAL_CACHE_LENGTH: usize = 131_072;
 const RECOVERY_TAIL_TOKENS: usize = 8;
+/// ADR-059 #308 staged-constant gate (the `GEMMA4_GRAFT_WIRED` precedent):
+/// the DeepSeek-V4 `compressed_kv` consumer splice — reader/bind, the
+/// reserved-row write offsets, the graft-aware index arithmetic, the
+/// capacity accounting, and the boot/session planting — is COMPLETE in
+/// this build, but the hardware canary matrix (zero-slot byte-identical /
+/// live synthetic bank diverges / disable-restore bit-for-bit, plus KL)
+/// queues behind the host's model-conversion window and has NOT run. The
+/// canary run flips this constant to `true` to arm the splice; every
+/// DeepSeek-V4 serving entry refuses BY NAME while it is `false` and a
+/// graft is bound (never a silent ungrafted serve under the flag — the
+/// gemma4 silent-ignore class this ADR already caught once). After the
+/// canaries ALL PASS, this constant and its gates are removed (the
+/// gemma4 gates-off precedent, #306).
+const COMPRESSED_KV_GRAFT_WIRED: bool = false;
+
+/// ADR-059 #308 fail-closed request gate for DeepSeek-V4 serving entries.
+/// Ungrafted models pass unchanged; a zero-slot canary bank binds without
+/// tensors and also passes (its no-op is the plumbing proof).
+pub(super) fn ensure_deepseek4_graft_serving_supported(
+    loaded: &Deepseek4LoadedModel,
+) -> Result<()> {
+    anyhow::ensure!(
+        COMPRESSED_KV_GRAFT_WIRED || loaded.model.kv_graft.is_none(),
+        "KV graft bound but the DeepSeek-V4 compressed_kv splice is not \
+         canary-cleared yet (ADR-059 #308: COMPRESSED_KV_GRAFT_WIRED=false; \
+         the splice wiring is complete and staged behind this constant — \
+         the synthetic-bank canary matrix queued behind the host conversion \
+         flips it); refusing rather than serving ungrafted"
+    );
+    Ok(())
+}
 
 fn resumable_matrix_prefill_chunk_len(
     cache_position: usize,
@@ -318,12 +349,23 @@ impl Deepseek4Session {
     /// slot count without making short turns pay 524K-shaped Metal strides.
     pub(super) fn new(loaded: &Deepseek4LoadedModel) -> Result<Self> {
         let initial_capacity = loaded.context_limit().min(INITIAL_CACHE_LENGTH);
-        let cache = loaded
+        let mut cache = loaded
             .model
             .allocate_logical_cache(initial_capacity)
             .with_context(|| {
                 format!("allocate initial {initial_capacity}-token DeepSeek-V4 agent slot cache")
             })?;
+        // ADR-059 #308: every slot cache plants the same graft (staged on
+        // the canary constant, mirroring the boot splice); cache growth
+        // re-splices by migration (the graft rows travel with the copied
+        // rows).
+        if COMPRESSED_KV_GRAFT_WIRED {
+            if let Some(bound) = loaded.model.kv_graft.as_ref() {
+                cache
+                    .plant_compressed_graft(&bound.bank)
+                    .with_context(|| "DeepSeek-V4 compressed_kv graft splice at slot creation")?;
+            }
+        }
         Ok(Self {
             cache,
             committed_tokens: Vec::new(),
@@ -795,6 +837,54 @@ impl Deepseek4LoadedModel {
         } else {
             model
         };
+        // ADR-059 #308 — bind a `compressed_kv` graft when the operator
+        // supplied one. The bind (checkpoint identity through the GLP
+        // trust boundary + the DeepSeek-V4 compressed-site shape) runs
+        // here and aborts startup on any error: the flag previously never
+        // reached this loader — a --kv-graft on a DeepSeek-V4 model was
+        // silently ignored (the exact gemma4 silent-ignore class this ADR
+        // forbids; fixed here). A bound graft is honored by the
+        // graft-wired cache arithmetic; every serving entry refuses BY
+        // NAME until the canary matrix flips COMPRESSED_KV_GRAFT_WIRED.
+        let mut model = model;
+        let mut kv_graft = None;
+        if let Some(graft_path) = opts.kv_graft_path.as_ref() {
+            anyhow::ensure!(
+                opts.kv_persist_dir.is_none(),
+                "KV graft + typed persistent-KV is not supported in this build \
+                 (ADR-059: disk snapshots exclude the graft region — the graft \
+                 re-splices from the bound artifact at hydrate; the graft-aware \
+                 disk codec lands after the in-memory path proves out); refusing \
+                 to start with both --kv-graft and --kv-persist"
+            );
+            let (bank, compatibility) = crate::inference::graft::validate_graft_for_model(
+                graft_path,
+                &opts.model_path,
+                &gguf,
+            )
+            .with_context(|| format!("KV graft bind: {}", graft_path.display()))?;
+            if compatibility != crate::inference::glp::Compatibility::Checkpoint {
+                tracing::warn!(
+                    "KV graft does not declare a verified checkpoint revision; \
+                     behavior requires validation (compatibility={compatibility:?})"
+                );
+            }
+            let bound = crate::inference::graft::BoundGraft::bind(bank);
+            tracing::info!(
+                target: "hf2q::serve::api::engine::graft",
+                path = %graft_path.display(),
+                n_slots = bound.bank.n_slots,
+                layers = ?bound.bank.layers.keys().collect::<Vec<_>>(),
+                wired = COMPRESSED_KV_GRAFT_WIRED,
+                "KV graft bound to DeepSeek-V4 (splice: fabricated compressed \
+                 rows at the reserved leading positions of every covered \
+                 layer; recurrent pools track real rows only; serving entries \
+                 gated on COMPRESSED_KV_GRAFT_WIRED pending the #308 canary \
+                 matrix)"
+            );
+            kv_graft = Some(bound);
+        }
+        model.kv_graft = kv_graft;
         tracing::info!(
             logical_weight_bytes = model.weights.resident_bytes(),
             file_backed_weight_bytes = model.weights.file_backed_bytes(),
@@ -811,11 +901,24 @@ impl Deepseek4LoadedModel {
             model.cfg.sliding_window
         );
         let initial_cache_length = context_length.min(INITIAL_CACHE_LENGTH);
-        let cache = model
+        let mut cache = model
             .allocate_cache(initial_cache_length)
             .with_context(|| {
                 format!("allocate initial {initial_cache_length}-token DeepSeek-V4 cache")
             })?;
+        // ADR-059 #308 boot splice: plant the fabricated rows into the
+        // reserved leading positions of every covered layer's compressed
+        // region (the gemma4 boot-bind precedent). Staged on the canary
+        // constant: while COMPRESSED_KV_GRAFT_WIRED is false the cache
+        // stays stock (serving refuses by name anyway) and the canary
+        // flip arms splice + serve together.
+        if COMPRESSED_KV_GRAFT_WIRED {
+            if let Some(bound) = model.kv_graft.as_ref() {
+                cache
+                    .plant_compressed_graft(&bound.bank)
+                    .with_context(|| "DeepSeek-V4 compressed_kv graft splice at boot")?;
+            }
+        }
         tracing::info!(
             serving_context = context_length,
             allocated_cache_context = initial_cache_length,
@@ -905,6 +1008,17 @@ impl Deepseek4LoadedModel {
             .unwrap_or(self.model.cfg.max_position_embeddings as usize)
     }
 
+    /// ADR-059 #308: the usable real-history context after the graft's
+    /// reserved compressed rows (`n_slots` rows of the binding layer's
+    /// region = `n_slots * ratio` tokens). Ungrafted: the plain context
+    /// limit. Requests that exceed this are refused at admission (the
+    /// typed context-length error); the cache's own plan bound
+    /// (`GraftCapacity`) remains the fail-closed enforcement.
+    fn graft_context_limit(&self) -> usize {
+        self.context_limit()
+            .saturating_sub(self.model.compressed_graft_token_footprint())
+    }
+
     pub(super) fn reset_live_cache(&mut self) -> Result<()> {
         self.cache
             .reset()
@@ -935,6 +1049,7 @@ impl Deepseek4LoadedModel {
             self.cache.capacity(),
             prompt_tokens,
             max_tokens,
+            self.model.compressed_graft_token_footprint(),
         );
         if target <= self.cache.capacity() {
             return Ok(false);
@@ -1077,16 +1192,16 @@ impl Deepseek4LoadedModel {
             prompt_tokens.len() >= self.model.cfg.sliding_window as usize,
             "DeepSeek-V4 resumable prefill requires at least one native window"
         );
-        if prompt_tokens.len() > self.context_limit() {
+        if prompt_tokens.len() > self.graft_context_limit() {
             // ADR-062 D2: a prompt over the serving context is the typed 400
             // `context_length_exceeded`, not a generic 500.
             return Err(EngineRequestError::context_overflow(
-                self.context_limit(),
+                self.graft_context_limit(),
                 prompt_tokens.len(),
                 format!(
                     "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
                     prompt_tokens.len(),
-                    self.context_limit()
+                    self.graft_context_limit()
                 ),
             )
             .into_anyhow());
@@ -1129,16 +1244,16 @@ impl Deepseek4LoadedModel {
         progress: &mut RequestProgress,
     ) -> Result<Deepseek4ResumablePrefill> {
         anyhow::ensure!(!prompt_tokens.is_empty(), "DeepSeek-V4 prompt is empty");
-        if prompt_tokens.len() > self.context_limit() {
+        if prompt_tokens.len() > self.graft_context_limit() {
             // ADR-062 D2: a prompt over the serving context is the typed 400
             // `context_length_exceeded`, not a generic 500.
             return Err(EngineRequestError::context_overflow(
-                self.context_limit(),
+                self.graft_context_limit(),
                 prompt_tokens.len(),
                 format!(
                     "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
                     prompt_tokens.len(),
-                    self.context_limit()
+                    self.graft_context_limit()
                 ),
             )
             .into_anyhow());
@@ -1410,16 +1525,16 @@ impl Deepseek4LoadedModel {
         supervisor: &EngineSupervisor,
     ) -> Result<(MlxBuffer, usize)> {
         anyhow::ensure!(!prompt_tokens.is_empty(), "DeepSeek-V4 prompt is empty");
-        if prompt_tokens.len() > self.context_limit() {
+        if prompt_tokens.len() > self.graft_context_limit() {
             // ADR-062 D2: a prompt over the serving context is the typed 400
             // `context_length_exceeded`, not a generic 500.
             return Err(EngineRequestError::context_overflow(
-                self.context_limit(),
+                self.graft_context_limit(),
                 prompt_tokens.len(),
                 format!(
                     "DeepSeek-V4 prompt has {} tokens, exceeding serving context {}",
                     prompt_tokens.len(),
-                    self.context_limit()
+                    self.graft_context_limit()
                 ),
             )
             .into_anyhow());
@@ -1599,9 +1714,17 @@ fn cache_capacity_for_request(
     current_capacity: usize,
     prompt_tokens: usize,
     max_tokens: usize,
+    graft_footprint: usize,
 ) -> usize {
+    // ADR-059 #308: the graft's reserved compressed rows are counted as
+    // capacity demand (the same accounting that counts graft rows at the
+    // cache-plan bound): `graft_slots` rows of the binding layer's
+    // compressed region are occupied, i.e. `graft_slots * ratio` tokens of
+    // real-history capacity, so the request's token demand grows by the
+    // footprint.
     let required = prompt_tokens
         .saturating_add(max_tokens.max(1).saturating_sub(1))
+        .saturating_add(graft_footprint)
         .min(serving_context);
     if required <= current_capacity {
         return current_capacity;
@@ -1836,16 +1959,22 @@ mod tests {
     #[test]
     fn advertised_context_does_not_eagerly_allocate_unused_kv() {
         assert_eq!(
-            cache_capacity_for_request(524_288, 131_072, 98_000, 8_192),
+            cache_capacity_for_request(524_288, 131_072, 98_000, 8_192, 0),
             131_072
         );
         assert_eq!(
-            cache_capacity_for_request(524_288, 131_072, 131_000, 8_192),
+            cache_capacity_for_request(524_288, 131_072, 131_000, 8_192, 0),
             262_144
         );
         assert_eq!(
-            cache_capacity_for_request(524_288, 262_144, 510_000, 32_768),
+            cache_capacity_for_request(524_288, 262_144, 510_000, 32_768, 0),
             524_288
+        );
+        // ADR-059 #308: the graft footprint counts as capacity demand
+        // (n_slots * binding ratio tokens of reserved compressed rows).
+        assert_eq!(
+            cache_capacity_for_request(524_288, 131_072, 131_000, 8_192, 8_192),
+            262_144
         );
     }
 

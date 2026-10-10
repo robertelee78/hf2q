@@ -3214,6 +3214,9 @@ pub struct LoadOptions {
     pub kv_persist_budget_bytes: u64,
     pub glp_path: Option<PathBuf>,
     pub glp_alpha: Option<f32>,
+    /// ADR-059: optional KV-cache graft artifact (GGUF `graft.*` bank),
+    /// loaded + bind-validated at model load. Explicit file only.
+    pub kv_graft_path: Option<PathBuf>,
 }
 
 impl LoadedModel {
@@ -3573,6 +3576,49 @@ impl GemmaLoadedModel {
         // structured fields at every CLI/SERVE entry that constructs a
         // `LoadInfo`. The free-text format was incompatible with
         // `journalctl -u hf2q | jq` cross-arch filtering.
+
+        // ADR-059 — bind a KV graft when the operator supplied one.
+        // Validation (checkpoint identity + the full_attn_kv site shape
+        // for gemma4) runs here and aborts startup on any error; a
+        // bound graft is honored by the graft-wired serving paths and
+        // refused BY NAME by the paths that are not yet wired — never a
+        // silent ungrafted serve (the --kv-graft flag previously flowed
+        // only to the qwen35 loader and was silently ignored here).
+        let mut kv_graft = None;
+        if let Some(graft_path) = opts.kv_graft_path.as_ref() {
+            anyhow::ensure!(
+                opts.kv_persist_dir.is_none(),
+                "KV graft + typed persistent-KV is not supported in this build \
+                 (ADR-059: disk snapshots exclude the graft region; the \
+                 graft-aware disk codec lands after the in-memory path \
+                 proves out); refusing to start with both --kv-graft and \
+                 --kv-persist"
+            );
+            let (bank, compatibility) =
+                crate::inference::graft::validate_graft_for_model(
+                    graft_path,
+                    model_path,
+                    &gguf,
+                )
+                .with_context(|| format!("KV graft bind: {}", graft_path.display()))?;
+            if compatibility != crate::inference::glp::Compatibility::Checkpoint {
+                tracing::warn!(
+                    "KV graft does not declare a verified checkpoint revision; \
+                     behavior requires validation (compatibility={compatibility:?})"
+                );
+            }
+            let bound = crate::inference::graft::BoundGraft::bind(bank);
+            tracing::info!(
+                target: "hf2q::serve::api::engine::graft",
+                path = %graft_path.display(),
+                n_slots = bound.bank.n_slots,
+                layers = ?bound.bank.layers.keys().collect::<Vec<_>>(),
+                "KV graft bound to Gemma4 (splice: gemma4 hybrid KV leg; \
+                 graft-wired paths honor it, unwired paths refuse by name)"
+            );
+            kv_graft = Some(bound);
+        }
+        weights.kv_graft = kv_graft;
 
         Ok(Self {
             weights,
@@ -6789,7 +6835,9 @@ impl Gemma4PrefillState {
                 match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
                     hybrid,
                     self.slot_id,
-                    plan.end,
+                    // ADR-059 (3c): the anchor boundary is the PHYSICAL
+                    // cursor — graft rows + prompt rows.
+                    guard.model.weights.kv_graft_len() + plan.end,
                 ) {
                     Ok(kv) => kv,
                     Err(error) => {
@@ -6905,6 +6953,11 @@ struct Gemma4DecodeState {
     prompt_len: usize,
     /// Exact prefix reused at admission. Zero denotes a cold prefill.
     cached_tokens: usize,
+    /// ADR-059 (3c): the bound graft's position offset for this slot —
+    /// physical positions `0..graft_len` hold the spliced bank; every decode
+    /// position below continues after graft rows + prompt rows. Zero =
+    /// ungrafted (the offsets are no-ops).
+    graft_len: usize,
     /// Number of token positions whose KV entries have been written. The
     /// generated token selected by the latest forward is not valid until it is
     /// fed through the next decode forward.
@@ -7135,6 +7188,29 @@ impl Gemma4DecodeState {
                     })?;
                 }
             }
+            // ADR-059 (3c): cold admission — after the entry reset, splice
+            // the bound graft into this slot's hybrid region (the ledger
+            // unifies at the physical graft boundary; the prefill continues
+            // at `graft_len`). Warm paths (anchor restore / live prefix)
+            // carry the graft rows below the cursor by the append-only
+            // contract.
+            if let Some(bound) = loaded.weights.kv_graft.as_ref() {
+                let device = loaded.ctx.device();
+                splice_gemma4_graft_at_admission(
+                    slot_id,
+                    &bound.bank,
+                    device,
+                    multi_seq_kv,
+                    multi_seq_kv_hybrid.as_mut().map(|value| value.as_mut_slice()),
+                    multi_seq_kv_dense.as_mut().map(|value| value.as_mut_slice()),
+                    multi_seq_kv_mlx.as_mut().map(|value| value.as_mut_slice()),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Gemma4DecodeState::prefill_seed: KV graft splice at slot admission: {e:#}"
+                    )
+                })?;
+            }
         }
 
         // An exact-image continuation restores KV whose image rows were
@@ -7224,7 +7300,9 @@ impl Gemma4DecodeState {
                         .as_deref()
                         .expect("stable Gemma boundary requires hybrid KV"),
                     slot_id,
-                    boundary,
+                    // ADR-059 (3c): the anchor boundary is the PHYSICAL
+                    // cursor — graft rows + prompt rows.
+                    loaded.weights.kv_graft_len() + boundary,
                 )?;
             let first_decode_token =
                 supervised_gemma4_gpu_call(supervisor, "gemma4_prefill_stable_cue", || {
@@ -7473,6 +7551,7 @@ impl Gemma4DecodeState {
             vision_fingerprint: params.vision_fingerprint,
             prompt_len: prompt_tokens.len(),
             cached_tokens,
+            graft_len: loaded.weights.kv_graft_len(),
             valid_tokens: prompt_tokens.len(),
             max_decode_tokens,
             sampler_params,
@@ -7551,7 +7630,10 @@ impl Gemma4DecodeState {
         >,
     ) -> Result<TickOutcome> {
         // KV write cursor for the token being fed (serial ref 9159).
-        let pos = self.prompt_len + self.generated_tokens.len() - 1;
+        // ADR-059 (3c): decode positions continue after graft rows + prompt
+        // rows (the sliding rings subtract the offset inside the model fn —
+        // they never hold graft rows).
+        let pos = self.graft_len + self.prompt_len + self.generated_tokens.len() - 1;
         let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
         let greedy_token = loaded.weights.forward_decode_slot_aware(
             self.next_token,
@@ -7723,7 +7805,9 @@ impl Gemma4DecodeState {
             &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
         >,
     ) -> Result<Vec<f32>> {
-        let pos = self.prompt_len + self.generated_tokens.len() - 1;
+        // ADR-059 (3c): decode positions continue after graft rows + prompt
+        // rows (the sliding rings subtract the offset inside the model fn).
+        let pos = self.graft_len + self.prompt_len + self.generated_tokens.len() - 1;
         let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
         loaded.weights.forward_decode_slot_aware_capture_hidden(
             self.next_token,
@@ -12862,10 +12946,28 @@ fn admit_gemma4_slot(
         .model
         .context_length
         .unwrap_or(guard.model.config.max_position_embeddings as usize);
+    // ADR-059 (3c): the bound graft (if any) shifts every physical position
+    // and adds graft_len rows per covered full-attention layer.
+    let graft_len = guard.model.weights.kv_graft_len();
+    // ADR-059 fail-closed: extension (vision soft-token) generation is not
+    // graft-wired. Refuse by name before validation or scheduling — never
+    // serve ungrafted under a graft flag.
+    if graft_len > 0 && !soft_token_data.is_empty() {
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!(
+                "KV graft bound but Gemma4 vision/soft-token generation is not \
+                 graft-wired (ADR-059); refusing rather than serving ungrafted"
+            )),
+            false,
+        );
+        return None;
+    }
     let shape = match validate_gemma4_generation_request(
         prompt_tokens.len(),
         params.max_tokens,
         max_seq_len,
+        graft_len,
     ) {
         Ok(shape) => shape,
         Err(error) => {
@@ -12910,7 +13012,12 @@ fn admit_gemma4_slot(
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
+        // ADR-059 (3c): the graft adds graft_len physical rows on every
+        // covered full-attention layer — exactly graft_len tokens' worth of
+        // KV bytes (complete site coverage) — so the per-request KV-byte
+        // estimate covers them.
         u64::from(shape.prompt_tokens)
+            .saturating_add(u64::try_from(graft_len).unwrap_or(u64::MAX))
             .saturating_add(u64::from(shape.max_tokens))
             .saturating_mul(kv_bytes_per_token)
     };
@@ -13060,6 +13167,38 @@ fn admit_gemma4_slot(
             Ok(reply) => reply,
             Err(fatal) => return Some(fatal),
         };
+        // ADR-059 (3c): cold admission — after the reset, splice the bound
+        // graft into this slot's hybrid region and unify the ledger at the
+        // physical graft boundary. The prefill continues at `graft_len`.
+        if let Some(bound) = guard.model.weights.kv_graft.as_ref() {
+            let device = guard.model.ctx.device();
+            if let Err(error) = splice_gemma4_graft_at_admission(
+                handle.slot_id,
+                &bound.bank,
+                device,
+                &mut guard.kv,
+                guard.hybrid.as_deref_mut(),
+                guard.dense.as_deref_mut(),
+                guard.mlx.as_deref_mut(),
+            ) {
+                let message = anyhow::anyhow!("{error:#}");
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[handle.slot_id.0 as usize].clear();
+                prompt_anchors[handle.slot_id.0 as usize] = None;
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(message), false);
+                return None;
+            }
+        }
     } else if selected_preference.is_some_and(|preference| preference.restore_prompt_anchor) {
         let restore_result = (|| -> Result<()> {
             let anchor = prompt_anchors[handle.slot_id.0 as usize]
@@ -13068,14 +13207,20 @@ fn admit_gemma4_slot(
             let hybrid = guard.hybrid.as_mut().ok_or_else(|| {
                 anyhow::anyhow!("Gemma prompt anchor requires the production hybrid KV cache")
             })?;
+            // ADR-059 (3c): the anchor's boundary is the PHYSICAL cursor —
+            // graft rows + prompt rows. The restore rewinds the ledger to
+            // exactly that cursor; the graft rows below it survive by the
+            // append-only contract (only a reset clears the anchor, and a
+            // reset clears the rows).
             crate::inference::models::gemma4::kv_cache::restore_gemma_hybrid_slot_anchor(
                 hybrid,
                 handle.slot_id,
                 &anchor.kv,
-                cached_tokens,
+                guard.model.weights.kv_graft_len() + cached_tokens,
             )?;
             anyhow::ensure!(
-                cached_tokens <= anchor.kv.prompt_len() && cached_tokens < prompt_tokens.len(),
+                guard.model.weights.kv_graft_len() + cached_tokens <= anchor.kv.prompt_len()
+                    && cached_tokens < prompt_tokens.len(),
                 "Gemma prompt anchor length {} incompatible with reusable prefix {} for request {}",
                 anchor.kv.prompt_len(),
                 cached_tokens,
@@ -13299,7 +13444,12 @@ fn admit_gemma4_slot(
     }
 
     let committed_anchor = if let Some(kv) = stable_anchor {
-        let boundary = kv.prompt_len();
+        // ADR-059 (3c): the anchor's stored boundary is the PHYSICAL cursor
+        // (graft rows + prompt rows); the token ledger slice subtracts the
+        // graft offset back to the token boundary.
+        let boundary = kv
+            .prompt_len()
+            .saturating_sub(guard.model.weights.kv_graft_len());
         Some(Gemma4PromptAnchor {
             prompt_tokens: prompt_tokens[..boundary].to_vec(),
             kv,
@@ -14200,6 +14350,9 @@ fn admit_gemma4_slots_batched(
         .model
         .context_length
         .unwrap_or(guard.model.config.max_position_embeddings as usize);
+    // ADR-059 (3c): the bound graft's rows count against every admitted
+    // request's per-slot capacity.
+    let graft_len = guard.model.weights.kv_graft_len();
     // 1. Reserve a physical slot for each request.
     let mut admitted: Vec<(SlotHandle, Vec<u32>, SamplingParams, SlotReply)> =
         Vec::with_capacity(requests.len());
@@ -14219,6 +14372,8 @@ fn admit_gemma4_slots_batched(
             prompt_tokens.len(),
             params.max_tokens,
             max_seq_len,
+            // ADR-059 (3c): the per-request capacity counts the graft rows.
+            graft_len,
         ) {
             Ok(shape) => shape,
             Err(error) => {
@@ -14229,7 +14384,11 @@ fn admit_gemma4_slots_batched(
         let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
             0
         } else {
+            // ADR-059 (3c): the graft rows count against the per-request
+            // KV-byte estimate (complete full-layer site coverage makes
+            // the estimate exact).
             u64::from(shape.prompt_tokens)
+                .saturating_add(u64::try_from(graft_len).unwrap_or(u64::MAX))
                 .saturating_add(u64::from(shape.max_tokens))
                 .saturating_mul(kv_bytes_per_token)
         };
@@ -14369,6 +14528,41 @@ fn admit_gemma4_slots_batched(
         prompt_anchors[handle.slot_id.0 as usize] = None;
     }
     clear_gemma4_self_mounts(guard.model);
+
+    // ADR-059 (3c): cold batched admission — after the per-slot resets,
+    // splice the bound graft into every admitted slot's hybrid region (the
+    // ledger unifies at the physical graft boundary; the multi-seq forward
+    // below scatters each prompt at `graft_len`). All-or-nothing on the
+    // splice like the forward itself.
+    if let Some(bound) = guard.model.weights.kv_graft.as_ref() {
+        let device = guard.model.ctx.device();
+        let splice_failure = admitted.iter().find_map(|(handle, _, _, _)| {
+            splice_gemma4_graft_at_admission(
+                handle.slot_id,
+                &bound.bank,
+                device,
+                &mut guard.kv,
+                guard.hybrid.as_deref_mut(),
+                guard.dense.as_deref_mut(),
+                guard.mlx.as_deref_mut(),
+            )
+            .err()
+            .map(|error| (*handle, error))
+        });
+        if let Some((_failed_handle, error)) = splice_failure {
+            let mut fatal = SlotAwareGpuFatal {
+                error,
+                kind: SlotAwareFatalKind::Invariant,
+                owned: Vec::with_capacity(admitted.len()),
+            };
+            fatal.extend_slots(
+                admitted
+                    .into_iter()
+                    .map(|(handle, _, _, reply)| (Some(handle), reply)),
+            );
+            return Some(fatal);
+        }
+    }
 
     ITER_GA_BATCHED_ADMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -14673,6 +14867,9 @@ fn admit_gemma4_slots_stable_batched(
         .model
         .context_length
         .unwrap_or(guard.model.config.max_position_embeddings as usize);
+    // ADR-059 (3c): the bound graft's rows count against every planned
+    // request's per-slot capacity.
+    let graft_len = guard.model.weights.kv_graft_len();
 
     // Plan against both installed and newly reserved slots. Without the
     // second bitmap, two similar conversations could select the same longest
@@ -14683,9 +14880,12 @@ fn admit_gemma4_slots_stable_batched(
         if reply.client_closed() {
             break;
         }
-        let Ok(shape) =
-            validate_gemma4_generation_request(prompt_tokens.len(), params.max_tokens, max_seq_len)
-        else {
+        let Ok(shape) = validate_gemma4_generation_request(
+            prompt_tokens.len(),
+            params.max_tokens,
+            max_seq_len,
+            graft_len,
+        ) else {
             break;
         };
         let Some(boundary) = params.stable_prompt_prefix_tokens else {
@@ -14752,7 +14952,10 @@ fn admit_gemma4_slots_stable_batched(
         let needed_bytes = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
             0
         } else {
+            // ADR-059 (3c): the graft rows count against the per-request
+            // KV-byte estimate (the cached slots carry them resident).
             u64::from(shape.prompt_tokens)
+                .saturating_add(u64::try_from(graft_len).unwrap_or(u64::MAX))
                 .saturating_add(u64::from(shape.max_tokens))
                 .saturating_mul(kv_bytes_per_token)
         };
@@ -14915,7 +15118,9 @@ fn admit_gemma4_slots_stable_batched(
                     hybrid,
                     handle.slot_id,
                     &anchor.kv,
-                    preference.cached_tokens,
+                    // ADR-059 (3c): the restore boundary is the PHYSICAL
+                    // cursor — graft rows + prompt rows.
+                    guard.model.weights.kv_graft_len() + preference.cached_tokens,
                 )?;
             }
             anyhow::ensure!(
@@ -15004,7 +15209,9 @@ fn admit_gemma4_slots_stable_batched(
                 crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
                     scaffold,
                     handle.slot_id,
-                    *boundary,
+                    // ADR-059 (3c): the anchor boundary is the PHYSICAL
+                    // cursor — graft rows + prompt rows.
+                    graft_len + *boundary,
                 )?;
             prompt_anchors[handle.slot_id.0 as usize] = Some(Gemma4PromptAnchor {
                 prompt_tokens: prompt[..*boundary].to_vec(),
@@ -15279,6 +15486,18 @@ fn embed_gemma4_inline(
         .model
         .context_length
         .unwrap_or(guard.model.config.max_position_embeddings as usize);
+    // ADR-059 fail-closed (permanent): embeddings are not graft-wired (a
+    // graft is decode-side attention state; a pooled embedding would be
+    // served graft-invisible — the silent-ungrafted class ADR-059
+    // forbids). Refuse by name BEFORE admission, mirroring the qwen35
+    // embed gate.
+    if guard.model.weights.kv_graft.is_some() {
+        let _ = reply.send(Err(anyhow::anyhow!(
+            "KV graft bound but Gemma4 embeddings are not graft-wired \
+             (ADR-059); refusing rather than serving ungrafted"
+        )));
+        return None;
+    }
     let prompt_tokens_u32 = match validate_gemma4_embed_request(prompt_tokens.len(), max_seq_len) {
         Ok(prompt_tokens) => prompt_tokens,
         Err(error) => {
@@ -15545,7 +15764,12 @@ fn decode_batch_gemma4(
                 slot_fire_done(reply, state.finish(registration), true);
                 continue;
             }
-            positions.push(state.prompt_len + state.generated_tokens.len() - 1);
+            // ADR-059 (3c): batched decode positions continue after graft
+            // rows + prompt rows (the sliding rings subtract the offset
+            // inside the batched decode body).
+            positions.push(
+                state.graft_len + state.prompt_len + state.generated_tokens.len() - 1,
+            );
             tokens.push(state.next_token);
             sids.push(handle.slot_id);
             captured.push((handle, slot_idx, state, reply));
@@ -16028,11 +16252,85 @@ fn clear_gemma4_self_mounts(g: &mut GemmaLoadedModel) {
     g.weights.leg_hb_encoded = None;
 }
 
+/// ADR-059 (3c) — cold-admission graft splice for one physical Gemma4
+/// slot: after the admission reset (cursor 0 on every regime), splice the
+/// bound bank into the hybrid scaffold's slot region as fabricated history
+/// at physical positions `0..n_slots` (the splice sets the hybrid ledger
+/// cursor), then unify EVERY regime's ledger cursor at the physical graft
+/// boundary — the HB/dense/mlx scaffolds never receive graft rows, but the
+/// engine's ledger is uniform across regimes (the cursor fns assert it),
+/// so they carry the same physical count. Returns the graft length.
+#[allow(clippy::type_complexity)]
+fn splice_gemma4_graft_at_admission(
+    slot_id: SlotId,
+    bank: &crate::inference::graft::GraftBank,
+    device: &mlx_native::MlxDevice,
+    multi_seq_kv: &mut [crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers],
+    multi_seq_kv_hybrid: Option<
+        &mut [crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers],
+    >,
+    multi_seq_kv_dense: Option<
+        &mut [crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers],
+    >,
+    multi_seq_kv_mlx: Option<&mut [crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache]>,
+) -> Result<usize> {
+    let graft_len = bank.n_slots as usize;
+    let slot_idx = slot_id.0 as usize;
+    if graft_len == 0 {
+        // A zero-slot canary bank is a no-op (the splice contract); the
+        // ledger stays at the reset boundary.
+        return Ok(0);
+    }
+    let hybrid = multi_seq_kv_hybrid.ok_or_else(|| {
+        anyhow::anyhow!(
+            "KV graft bound but the Gemma4 slot admission requires the production \
+             hybrid KV scaffold (HF2Q_HYBRID_KV=1; the graft splice primitive covers \
+             the hybrid F16-K + TQ-HB-V leg only — ADR-059); refusing rather than \
+             serving ungrafted"
+        )
+    })?;
+    let spliced = crate::inference::models::gemma4::kv_cache::splice_graft_into_hybrid_kv_for_slot(
+        slot_id,
+        hybrid,
+        bank,
+        device,
+    )
+    .map_err(|e| anyhow::anyhow!("KV graft splice at Gemma4 slot admission: {e}"))?;
+    anyhow::ensure!(
+        spliced as usize == graft_len,
+        "KV graft splice returned {spliced} != bank n_slots {graft_len}"
+    );
+    let graft_cursor = graft_len as u32;
+    for buffer in multi_seq_kv.iter_mut() {
+        buffer.seq_lens[slot_idx] = graft_cursor;
+    }
+    for buffer in hybrid.iter_mut() {
+        buffer.seq_lens[slot_idx] = graft_cursor;
+    }
+    if let Some(buffers) = multi_seq_kv_dense {
+        for buffer in buffers.iter_mut() {
+            buffer.seq_lens[slot_idx] = graft_cursor;
+        }
+    }
+    if let Some(buffers) = multi_seq_kv_mlx {
+        for buffer in buffers.iter_mut() {
+            buffer.seq_lens[slot_idx] = graft_cursor;
+        }
+    }
+    Ok(graft_len)
+}
+
 fn validate_gemma4_slot_cursor(
     guard: &Gemma4KvGuard<'_>,
     slot_id: SlotId,
     expected: usize,
 ) -> Result<()> {
+    // ADR-059 (3c): the callers' `expected` is the TOKEN count; the ledger
+    // cursor is the PHYSICAL cursor — graft rows + prompt rows (the anchor
+    // boundary contract). Shift here so every call site stays token-indexed.
+    let expected = expected
+        .checked_add(guard.model.weights.kv_graft_len())
+        .context("Gemma4 slot cursor exceeds u32")?;
     let expected = u32::try_from(expected).context("Gemma4 slot cursor exceeds u32")?;
     let slot_idx = slot_id.0 as usize;
     let validate = |regime: &str, layer: usize, seq_lens: &[u32]| -> Result<()> {
@@ -16076,6 +16374,11 @@ fn install_gemma4_slot_cursor(
     slot_id: SlotId,
     cursor: usize,
 ) -> Result<()> {
+    // ADR-059 (3c): install the PHYSICAL cursor (graft rows + prompt rows) —
+    // the callers' `cursor` is the token count.
+    let cursor = cursor
+        .checked_add(guard.model.weights.kv_graft_len())
+        .context("Gemma4 slot cursor exceeds u32")?;
     let cursor = u32::try_from(cursor).context("Gemma4 slot cursor exceeds u32")?;
     let slot_idx = slot_id.0 as usize;
     let validate = |regime: &str, layer: usize, seq_lens: &[u32]| -> Result<()> {
@@ -16184,6 +16487,11 @@ fn reset_gemma4_slot_for_reply(
 
 fn gemma4_live_slot_tokens(guard: &Gemma4KvGuard<'_>, slot_id: SlotId) -> usize {
     let slot_idx = slot_id.0 as usize;
+    // ADR-059 (3c): the returned count is the PHYSICAL row count — graft
+    // rows + prompt rows (the ledger cursors maintain the physical
+    // contract) — so the KV-byte accounting below charges the graft rows
+    // the slot physically holds. Callers comparing against TOKEN ledgers
+    // must add `guard.model.weights.kv_graft_len()` themselves.
     let mut live_tokens = guard
         .kv
         .iter()
@@ -16217,6 +16525,9 @@ fn gemma4_live_slot_tokens(guard: &Gemma4KvGuard<'_>, slot_id: SlotId) -> usize 
                 .unwrap_or(0) as usize,
         );
     }
+    // ADR-059 (3c): the ledger cursors already count graft + prompt rows
+    // (validate/install/commit maintain the physical contract), so the
+    // graft rows are included once here — never twice.
     live_tokens
 }
 
@@ -16232,10 +16543,14 @@ fn recover_gemma4_slot_after_cancellation(
 ) -> Result<()> {
     let live_tokens = gemma4_live_slot_tokens(guard, handle.slot_id);
     record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
+    // ADR-059 (3c): the live count is physical (graft + prompt rows); the
+    // retained ledger is token-indexed — compare and validate in token
+    // terms (validate re-adds the graft offset internally).
+    let live_token_count = live_tokens.saturating_sub(guard.model.weights.kv_graft_len());
     if preserve_unmodified_live_prefix
         && !retained_tokens.is_empty()
-        && live_tokens == retained_tokens.len()
-        && validate_gemma4_slot_cursor(guard, handle.slot_id, live_tokens).is_ok()
+        && live_token_count == retained_tokens.len()
+        && validate_gemma4_slot_cursor(guard, handle.slot_id, live_token_count).is_ok()
     {
         return Ok(());
     }
@@ -16253,7 +16568,9 @@ fn recover_gemma4_slot_after_cancellation(
                 hybrid,
                 handle.slot_id,
                 &anchor.kv,
-                anchor_tokens,
+                // ADR-059 (3c): the rollback restore boundary is the
+                // PHYSICAL cursor — graft rows + prompt rows.
+                guard.model.weights.kv_graft_len() + anchor_tokens,
             )?;
             install_gemma4_slot_cursor(guard, handle.slot_id, anchor_tokens)?;
             validate_gemma4_slot_cursor(guard, handle.slot_id, anchor_tokens)
@@ -16757,6 +17074,11 @@ struct Qwen35KvGuard<'a> {
 
 impl<'a> Qwen35KvGuard<'a> {
     fn take(model: &'a mut super::engine_qwen35::Qwen35LoadedModel) -> Result<Self> {
+        // ADR-059: the SlotAware loop is graft-wired (splice at cold
+        // admission in `Qwen35PrefillState::begin`, graft-shifted RoPE
+        // positions, graft-aware slot anchors, MTP suppressed). Warmup is
+        // cache-priming only and embeds/extension requests refuse grafts
+        // by name inside their own paths.
         let kv = model.persistent_kv_cache.take().ok_or_else(|| {
             anyhow::anyhow!(
                 "capability_unsupported: ADR-040 Phase F M1 — persistent_kv_cache is None \
@@ -16935,6 +17257,7 @@ fn validate_gemma4_generation_request(
     prompt_tokens: usize,
     max_tokens: usize,
     max_seq_len: usize,
+    graft_len: usize,
 ) -> Result<Gemma4ValidatedRequestShape> {
     if prompt_tokens == 0 {
         return Err(EngineRequestError::invalid_request(
@@ -16954,10 +17277,16 @@ fn validate_gemma4_generation_request(
     let max_tokens_u32 = u32::try_from(max_tokens).map_err(|_| {
         EngineRequestError::invalid_request("Gemma4 max_tokens exceeds u32").into_anyhow()
     })?;
-    let needed = prompt_tokens.checked_add(max_tokens).ok_or_else(|| {
-        EngineRequestError::invalid_request("Gemma4 prompt + completion capacity overflow")
-            .into_anyhow()
-    })?;
+    // ADR-059 (3c): a bound graft occupies physical positions `0..graft_len`
+    // of every covered full-attention layer; the per-request capacity must
+    // cover those rows too (the qwen35 request-shape pattern).
+    let needed = prompt_tokens
+        .checked_add(graft_len)
+        .and_then(|tokens| tokens.checked_add(max_tokens))
+        .ok_or_else(|| {
+            EngineRequestError::invalid_request("Gemma4 prompt + completion capacity overflow")
+                .into_anyhow()
+        })?;
     if needed > max_seq_len {
         // ADR-062 D2: context overflow is the typed 400
         // `context_length_exceeded` (the OpenCode compaction code) on
@@ -16982,6 +17311,7 @@ fn validate_qwen35_generation_request(
     prompt_tokens: usize,
     max_tokens: usize,
     max_seq_len: usize,
+    graft_len: usize,
 ) -> Result<Qwen35ValidatedRequestShape> {
     if prompt_tokens == 0 {
         return Err(EngineRequestError::invalid_request(
@@ -17001,8 +17331,12 @@ fn validate_qwen35_generation_request(
     let max_tokens_u32 = u32::try_from(max_tokens).map_err(|_| {
         EngineRequestError::invalid_request("Qwen35 max_tokens exceeds u32").into_anyhow()
     })?;
+    // ADR-059: a bound graft occupies physical positions 0..graft_len of
+    // every covered full-attention layer; the per-request capacity must
+    // cover those rows too.
     let need_seq = prompt_tokens
-        .checked_add(max_tokens)
+        .checked_add(graft_len)
+        .and_then(|tokens| tokens.checked_add(max_tokens))
         .and_then(|tokens| tokens.checked_add(64))
         .ok_or_else(|| {
             EngineRequestError::invalid_request("Qwen35 prompt + completion capacity overflow")
@@ -17917,7 +18251,9 @@ fn take_gemma4_request_rollback_anchor(
     match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
         hybrid,
         slot_id,
-        cached_tokens,
+        // ADR-059 (3c): the anchor boundary is the PHYSICAL cursor —
+        // graft rows + prompt rows (the qwen35 slot-anchor pattern).
+        guard.model.weights.kv_graft_len() + cached_tokens,
     ) {
         Ok(kv) => {
             let _ = prompt_anchor.take();
@@ -18522,10 +18858,35 @@ fn admit_qwen35_slot(
         .as_ref()
         .expect("kv Some during Qwen35 admission")
         .max_seq_len as usize;
+    // ADR-059: the bound graft (if any) shifts every physical position and
+    // adds graft_len rows per covered full-attention layer.
+    let graft = guard
+        .model
+        .model
+        .kv_graft
+        .as_ref();
+    let graft_len = graft
+        .map(|bound| bound.bank.n_slots as usize)
+        .unwrap_or(0);
+    // ADR-059 fail-closed: extension (vision soft-token / deepstack)
+    // prefill is not graft-wired. Refuse by name before validation or
+    // scheduling — never serve ungrafted under a graft flag.
+    if graft.is_some() && vision.is_some() {
+        slot_fire_done(
+            reply,
+            Err(anyhow::anyhow!(
+                "KV graft bound but Qwen35 vision/extension generation is not \
+                 graft-wired (ADR-059); refusing rather than serving ungrafted"
+            )),
+            false,
+        );
+        return None;
+    }
     let request_shape = match validate_qwen35_generation_request(
         prompt_tokens.len(),
         params.max_tokens,
         max_seq_len,
+        graft_len,
     ) {
         Ok(shape) => shape,
         Err(error) => {
@@ -18599,7 +18960,11 @@ fn admit_qwen35_slot(
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
+        // ADR-059: the graft adds graft_len physical rows on every covered
+        // full-attention layer — exactly graft_len tokens' worth of KV
+        // bytes (complete site coverage) — so the byte estimate covers it.
         u64::from(request_shape.prompt_tokens)
+            .saturating_add(u64::try_from(graft_len).unwrap_or(u64::MAX))
             .saturating_add(u64::from(request_shape.max_tokens))
             .saturating_mul(kv_bytes_per_token)
     };
@@ -18742,7 +19107,54 @@ fn admit_qwen35_slot(
             checkpoint_bytes = anchor.kv.total_bytes(),
             "Qwen35 slot-local prompt-boundary cache hit"
         );
-        let spec_candidate = anchor.spec.clone();
+        // ADR-059: the anchor's boundary is the physical cursor
+        // (graft rows + prompt rows). After the rewind the graft rows sit
+        // intact below it (append-only contract); the region tag can only
+        // be absent if a reset happened, and a reset clears the anchor —
+        // so a missing tag here is an invariant failure. Fail closed
+        // rather than serving ungrafted.
+        if graft_len > 0 {
+            match guard
+                .kv
+                .as_ref()
+                .expect("kv Some after Qwen anchor restore")
+                .graft_region_for_slot(handle.slot_id)
+            {
+                Ok(marked) if marked as usize == graft_len => {}
+                other => {
+                    let _ = other;
+                    reply = match reset_qwen35_slot_for_reply(
+                        guard,
+                        scheduler,
+                        handle,
+                        kv_bytes_per_token,
+                        reply,
+                    ) {
+                        Ok(reply) => reply,
+                        Err(fatal) => return Some(fatal),
+                    };
+                    retained_tokens[slot_idx].clear_all();
+                    prompt_anchors[slot_idx] = None;
+                    scheduler.release(handle);
+                    finish_qwen35_operator_request(handle, "failed");
+                    slot_fire_done(
+                        reply,
+                        Err(anyhow::anyhow!(
+                            "Qwen35 anchor restore for slot {} left the graft region \
+                             unmarked (expected {graft_len}); refusing rather than \
+                             serving ungrafted",
+                            handle.slot_id.0
+                        )),
+                        false,
+                    );
+                    return None;
+                }
+            }
+        }
+        // ADR-059: speculative prefix boundaries carry MTP state that never
+        // saw the graft; suppress reuse under a bound graft.
+        let spec_candidate =
+            if graft.is_none() { anchor.spec.clone() } else { None };
         let cached_spec = spec_candidate.clone().filter(|spec| {
             spec.token_count == cached_tokens
                 && guard
@@ -18772,7 +19184,13 @@ fn admit_qwen35_slot(
         (cached_logits, cached_spec)
     } else {
         let slot_idx = handle.slot_id.0 as usize;
-        let spec_candidate = retained_tokens[slot_idx].spec.clone();
+        // ADR-059: speculative prefix boundaries carry MTP state that never
+        // saw the graft; suppress reuse under a bound graft.
+        let spec_candidate = if graft.is_none() {
+            retained_tokens[slot_idx].spec.clone()
+        } else {
+            None
+        };
         let live_spec = spec_candidate.clone().filter(|spec| {
             spec.token_count == cached_tokens
                 && guard
@@ -18799,11 +19217,27 @@ fn admit_qwen35_slot(
     // Record an explicit policy decision at SlotAware admission. Exact
     // speculation is enabled only after bounded prefill captures any required
     // MTP state; unsupported semantics stay on ordinary target decode.
-    let slot_mtp_decision = super::qwen35_speculation::classify_request(
+    let mut slot_mtp_decision = super::qwen35_speculation::classify_request(
         guard.model.speculation.policy(),
         super::engine_qwen35::is_qwen_server_speculation_exact_eligible(&params),
         cached_tokens == prompt_tokens.len() && cached_spec_candidate.is_none(),
     );
+    // ADR-059: the MTP cache is a separate slot arena that never receives
+    // the graft; under a bound graft its target logits would verify drafts
+    // against the ungrafted distribution. Skip speculation (an
+    // optimization, never a semantic path) and serve through ordinary
+    // grafted decode.
+    if graft.is_some() && slot_mtp_decision == super::qwen35_speculation::QwenSpeculationDecision::Eligible
+    {
+        tracing::info!(
+            target: "hf2q::serve::api::engine_qwen35::graft",
+            slot = handle.slot_id.0,
+            "KV graft bound: skipping SlotAware MTP (spec-decode cache is not \
+             graft-wired); serving via ordinary grafted decode"
+        );
+        slot_mtp_decision =
+            super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable;
+    }
     if slot_mtp_decision != super::qwen35_speculation::QwenSpeculationDecision::Eligible {
         super::qwen35_speculation::record_fallback(slot_mtp_decision);
     }
@@ -18828,6 +19262,7 @@ fn admit_qwen35_slot(
         cached_spec,
         vision,
         guard.model.hidden_size,
+        graft,
     ) {
         Ok(state) => state,
         Err(error) => {
@@ -21395,6 +21830,15 @@ fn worker_run(
                 // worker is serial.
                 let family = loaded_model_family(&loaded);
                 let result = match &mut loaded {
+                    // ADR-059 fail-closed: embeddings are not graft-wired
+                    // (a graft is decode-side attention state; a pooled
+                    // embedding would be served graft-invisible — the exact
+                    // silent-ungrafted class ADR-059 forbids). Refuse by
+                    // name, mirroring the qwen35 embed gate.
+                    LoadedModel::Gemma(g) if g.weights.kv_graft.is_some() => Err(anyhow::anyhow!(
+                        "KV graft bound but Gemma4 embeddings are not graft-wired \
+                         (ADR-059); refusing rather than serving ungrafted"
+                    )),
                     LoadedModel::Gemma(g) => supervised_gemma4_gpu_call(
                         &supervisor,
                         "gemma4_serial_embed",
@@ -22703,12 +23147,20 @@ fn warmup_once(loaded: &mut GemmaLoadedModel, supervisor: &EngineSupervisor) -> 
             .weights
             .forward_prefill(&prompt, max_tokens, &mut loaded.ctx)
     })?;
-    // One decode step to exercise the decode kernel set.
+    // One decode step to exercise the decode kernel set. ADR-059: the
+    // decode position continues after graft rows + prompt rows (the
+    // prefill above spliced at cold-cache admission under a bound graft);
+    // the warmup's KV state is discarded below, but the primed kernel set
+    // must see the graft-shifted positions.
     let mut profiler = None;
+    let graft_len = loaded.weights.kv_graft_len();
     let _ = supervised_gemma4_gpu_call(supervisor, "gemma4_warmup_decode", || {
-        loaded
-            .weights
-            .forward_decode(last_token, prompt.len(), &mut loaded.ctx, &mut profiler)
+        loaded.weights.forward_decode(
+            last_token,
+            graft_len + prompt.len(),
+            &mut loaded.ctx,
+            &mut profiler,
+        )
     })?;
     // Discard the warmup's per-prefill cache state.  warmup runs with
     // `prompt_len=1, max_tokens=1` → `linear_capacity = 2` allocated for
@@ -22946,6 +23398,28 @@ fn build_gemma_lcp_payload(
     }
 }
 
+/// ADR-059 — gemma4's graft-aware activation-identity hash (the qwen35
+/// `steering_and_graft_params_hash` pattern applied to gemma4's cache
+/// identity). Gemma4 has no GLP steering surface, so the graft is the one
+/// activation-affecting dimension: a grafted server's saved KV must never
+/// be addressed by an ungrafted or differently-grafted one, exactly as
+/// S6/qwen35 established for steering. Ungrafted engines hash the stable
+/// `steering=v1/glp=none/graft=none` triple.
+fn gemma4_graft_aware_params_hash(loaded: &GemmaLoadedModel) -> u64 {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"steering=v1");
+    h.update(b"glp=none");
+    h.update(
+        &crate::inference::graft::graft_params_hash(loaded.weights.kv_graft.as_ref().map(
+            |bound| &bound.bank,
+        ))
+        .to_le_bytes(),
+    );
+    let digest = h.finalize();
+    u64::from_le_bytes(digest[..8].try_into().expect("sha256 prefix"))
+}
+
 fn build_lcp_key_for_request(
     loaded: &GemmaLoadedModel,
     _params: &SamplingParams,
@@ -22980,7 +23454,12 @@ fn build_lcp_key_for_request(
     crate::serve::kv_persist::lcp_registry::LcpKey {
         model_fingerprint: fp,
         tenant_id: String::new(),
-        params_hash: 0,
+        // ADR-059: graft-aware identity (the qwen35
+        // `steering_and_graft_params_hash` pattern) — a grafted prefix can
+        // never masquerade as a clean one, and differently-grafted servers
+        // never share saved KV. Same graft content ⇒ same key; any change
+        // to bank bytes / mode / hook / n_slots ⇒ different key.
+        params_hash: gemma4_graft_aware_params_hash(loaded),
     }
 }
 
@@ -23145,6 +23624,21 @@ fn generate_once_with_soft_tokens(
         !prompt_tokens.is_empty(),
         "generate_once: empty prompt_tokens"
     );
+    // ADR-059 (3b): the bound graft's position offset for this serial
+    // request — physical positions `0..graft_len` hold the spliced bank
+    // (the serial prefill body splices at cold-cache admission, inside
+    // `forward_prefill_with_soft_tokens_resume`), the rendered prompt
+    // starts at position `graft_len`, and the decode positions below
+    // continue after graft rows + prompt rows. Zero (unbound) ⇒ every
+    // offset is a no-op.
+    let graft_len = loaded.weights.kv_graft_len();
+    // Fail-closed: extension (vision soft-token / deepstack) generation is
+    // not graft-wired — a bound graft never rides a multimodal prefill.
+    anyhow::ensure!(
+        graft_len == 0 || soft_tokens.is_empty(),
+        "KV graft bound but Gemma4 vision/soft-token generation is not \
+         graft-wired (ADR-059); refusing rather than serving ungrafted"
+    );
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
 
@@ -23279,8 +23773,12 @@ fn generate_once_with_soft_tokens(
                         match prefix_opt {
                             None => None,
                             Some(prefix) => {
-                                // Aggregate capacity check.
-                                let new_linear = prompt_tokens.len() + params.max_tokens.max(1);
+                                // Aggregate capacity check. ADR-059: the
+                                // graft adds `graft_len` physical rows on
+                                // every full-attention layer, so the
+                                // restored prefix must cover them too.
+                                let new_linear =
+                                    graft_len + prompt_tokens.len() + params.max_tokens.max(1);
                                 let model_sw = loaded.weights.sliding_window.max(1);
                                 let agg_ok = prefix.linear_capacity >= new_linear
                                     && prefix.sliding_window == model_sw;
@@ -23789,7 +24287,11 @@ fn generate_once_with_soft_tokens(
         finish_reason = "stop";
     } else {
         for _ in 1..max_tokens {
-            let pos = prompt_len + generated_tokens.len() - 1;
+            // ADR-059 (3b): serial decode positions continue after the
+            // graft rows + prompt rows (the hybrid full-layer cursor
+            // reads graft + prompt + decode; sliding rings stay
+            // prompt-indexed inside the model fn).
+            let pos = graft_len + prompt_len + generated_tokens.len() - 1;
             let mut p = profiler.start_token();
             // forward_decode populates self.activations.logits as a
             // side-effect of its lm_head + softcap dispatch chain; the
@@ -24376,6 +24878,29 @@ fn generate_gemma4_once_slot_aware(
             })?;
         }
     }
+    // ADR-059 (3c): cold admission — after the entry resets, splice the
+    // bound graft into this slot's hybrid region (the ledger unifies at
+    // the physical graft boundary; the prefill below continues at
+    // `graft_len`, the decode loop after graft rows + prompt rows).
+    if let Some(bound) = loaded.weights.kv_graft.as_ref() {
+        let device = loaded.ctx.device();
+        splice_gemma4_graft_at_admission(
+            slot_id,
+            &bound.bank,
+            device,
+            multi_seq_kv,
+            multi_seq_kv_hybrid.as_mut().map(|value| value.as_mut_slice()),
+            multi_seq_kv_dense.as_mut().map(|value| value.as_mut_slice()),
+            multi_seq_kv_mlx.as_mut().map(|value| value.as_mut_slice()),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "generate_gemma4_once_slot_aware: KV graft splice at slot admission: {e:#}"
+            )
+        })?;
+    }
+    // ADR-059 (3c): the bound graft's position offset for this request.
+    let graft_len = loaded.weights.kv_graft_len();
 
     // ADR-040 iter-B4c-kernel iter-2A (2026-05-30) — kernel-forward
     // call lands.  Replaces iter-1's IIFE-wrapped typed
@@ -24617,7 +25142,9 @@ fn generate_gemma4_once_slot_aware(
         } else {
             generated_tokens.push(next_token);
             for _ in 1..max_decode_tokens {
-                let pos = prompt_tokens.len() + generated_tokens.len() - 1;
+                // ADR-059 (3c): decode positions continue after graft rows
+                // + prompt rows.
+                let pos = graft_len + prompt_tokens.len() + generated_tokens.len() - 1;
                 let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
                 let greedy_token = loaded.weights.forward_decode_slot_aware(
                     next_token,
@@ -24967,6 +25494,18 @@ fn generate_stream_gemma4_once_slot_aware(
         };
     }
 
+    // ADR-059 fail-closed (permanent): extension (vision soft-token)
+    // streaming is not graft-wired — a bound graft never rides a
+    // multimodal prefill.
+    if loaded.weights.kv_graft.is_some() && !soft_tokens.is_empty() {
+        send!(super::sse::GenerationEvent::Error(
+            "KV graft bound but Gemma4 vision/soft-token generation is not \
+             graft-wired (ADR-059); refusing rather than serving ungrafted"
+                .into(),
+        ));
+        return;
+    }
+
     if prompt_tokens.is_empty() {
         send!(super::sse::GenerationEvent::Error(
             "generate_stream_gemma4_once_slot_aware: empty prompt_tokens".into()
@@ -25054,6 +25593,29 @@ fn generate_stream_gemma4_once_slot_aware(
             }
         }
     }
+    // ADR-059 (3c): cold admission — after the entry resets, splice the
+    // bound graft into this slot's hybrid region (the ledger unifies at
+    // the physical graft boundary; the prefill below continues at
+    // `graft_len`, the decode loop after graft rows + prompt rows).
+    if let Some(bound) = loaded.weights.kv_graft.as_ref() {
+        let device = loaded.ctx.device();
+        if let Err(error) = splice_gemma4_graft_at_admission(
+            slot_id,
+            &bound.bank,
+            device,
+            multi_seq_kv,
+            multi_seq_kv_hybrid.as_mut().map(|value| value.as_mut_slice()),
+            multi_seq_kv_dense.as_mut().map(|value| value.as_mut_slice()),
+            multi_seq_kv_mlx.as_mut().map(|value| value.as_mut_slice()),
+        ) {
+            send!(super::sse::GenerationEvent::Error(format!(
+                "KV graft splice at slot admission: {error:#}"
+            )));
+            return;
+        }
+    }
+    // ADR-059 (3c): the bound graft's position offset for this request.
+    let graft_len = loaded.weights.kv_graft_len();
 
     // ADR-040 iter-B4c-kernel iter-3 — kernel-forward call mirroring
     // iter-2A/2B Generate-arm shape (engine.rs:7920-7966).  Calls
@@ -25510,9 +26072,11 @@ fn generate_stream_gemma4_once_slot_aware(
             } else if hit_stop_string(&decoded_running, &params.stop_strings) {
                 finish_reason = "stop";
             } else {
-                generated_tokens.push(next_token);
-                for _ in 1..max_decode_tokens {
-                    let pos = prompt_tokens.len() + generated_tokens.len() - 1;
+            generated_tokens.push(next_token);
+            for _ in 1..max_decode_tokens {
+                // ADR-059 (3c): decode positions continue after graft rows
+                // + prompt rows.
+                let pos = graft_len + prompt_tokens.len() + generated_tokens.len() - 1;
                     let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> =
                         None;
                     let r = loaded.weights.forward_decode_slot_aware(
@@ -25881,6 +26445,10 @@ fn embed_gemma4_slot_aware(
     //
     // Mirror of iter-1 Generate-arm + iter-3 GenerateStream-arm entry-
     // reset discipline.
+    //
+    // ADR-059: unreachable under a bound graft — the embed admission
+    // refuses grafts by name before this point (embeddings are not
+    // graft-wired).
     for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
         buf.reset_for_slot(slot_id).map_err(|e| {
             anyhow::anyhow!(
@@ -26181,6 +26749,16 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
             slot_id,
         );
     }
+
+    // ADR-059 fail-closed (permanent): extension (vision soft-token)
+    // generation is not graft-wired — a bound graft never rides a
+    // multimodal prefill. The text-only early-return above delegates to
+    // the graft-wired Generate arm.
+    anyhow::ensure!(
+        loaded.weights.kv_graft.is_none(),
+        "KV graft bound but Gemma4 vision/soft-token generation is not \
+         graft-wired (ADR-059); refusing rather than serving ungrafted"
+    );
 
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
@@ -28220,6 +28798,19 @@ fn generate_stream_once(
         ));
         return Ok(SerialStreamEnd::TerminalSent);
     }
+    // ADR-059 (3b): the serial streaming twin of the unary path's graft
+    // offset — the prefill body splices at cold-cache admission and the
+    // decode positions below continue after graft rows + prompt rows.
+    // Zero (unbound) ⇒ every offset is a no-op.
+    let graft_len = loaded.weights.kv_graft_len();
+    if graft_len > 0 && !soft_tokens.is_empty() {
+        send!(GenerationEvent::Error(
+            "KV graft bound but Gemma4 vision/soft-token generation is not \
+             graft-wired (ADR-059); refusing rather than serving ungrafted"
+                .into()
+        ));
+        return Ok(SerialStreamEnd::TerminalSent);
+    }
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
 
@@ -28363,7 +28954,13 @@ fn generate_stream_once(
                         match prefix_opt {
                             None => None,
                             Some(prefix) => {
-                                let new_linear = prompt_tokens.len() + params.max_tokens.max(1);
+                                // ADR-059 (3b): the graft adds `graft_len`
+                                // physical rows on every full-attention
+                                // layer — the restored prefix must cover
+                                // them too (the streaming twin of the
+                                // unary probe site).
+                                let new_linear =
+                                    graft_len + prompt_tokens.len() + params.max_tokens.max(1);
                                 let model_sw = loaded.weights.sliding_window.max(1);
                                 let agg_ok = prefix.linear_capacity >= new_linear
                                     && prefix.sliding_window == model_sw;
@@ -29019,7 +29616,9 @@ fn generate_stream_once(
 
     if !is_eos_first {
         for _ in 1..max_tokens {
-            let pos = prompt_len + completion_tokens - 1;
+            // ADR-059 (3b): streaming decode positions continue after
+            // graft rows + prompt rows.
+            let pos = graft_len + prompt_len + completion_tokens - 1;
             let mut p = profiler.start_token();
             let dec_result =
                 supervised_gemma4_gpu_call(supervisor, "gemma4_serial_stream_decode", || {
@@ -34595,6 +35194,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a)");
         let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b)");
@@ -34848,6 +35448,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         // Fixed prompt set (the same prompts the N=4 parity + interleave
         // tests use, so golden ↔ parity are directly comparable).
@@ -34911,6 +35512,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -34958,6 +35560,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         // Two DISTINCT prompts so cross-slot contamination is visible.
         let p0: Vec<u32> = vec![1u32, 2, 3, 4, 5];
@@ -35173,6 +35776,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -35235,6 +35839,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -35529,6 +36134,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_tokens = 16usize;
@@ -35776,6 +36382,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_tokens = 16usize;
@@ -36043,6 +36650,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // Four distinct greedy prompts.
@@ -36147,6 +36755,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let eager_prompt = vec![42u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize];
         let resumed_prompt = vec![43u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize * 2 + 1];
@@ -36281,6 +36890,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // IDENTICAL prompt in all four slots. Serial ref at the LONGEST budget so
@@ -36413,6 +37023,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // Eight distinct greedy prompts (the N=4 set + four more distinct ones).
@@ -36575,6 +37186,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt = vec![1u32, 2, 3];
         let params = SamplingParams {
@@ -36615,6 +37227,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt = vec![1u32, 2, 3];
         let params = SamplingParams {
@@ -36690,6 +37303,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // Eight distinct greedy prompts (same shape as the gemma4 N=8 gate).
@@ -36804,6 +37418,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         let prompt_len: usize = std::env::var("HF2Q_S019_PROMPT_LEN")
@@ -36936,6 +37551,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // N=1 mechanism gate: a single 70-token prompt exercising the full
@@ -37073,6 +37689,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let lens = [26u32, 40, 13, 55, 70, 19, 33, 48];
         let mk = |i: u32, l: u32| -> Vec<u32> {
@@ -37197,6 +37814,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         // Every request is at or above the conservative tiny-prefill boundary,
         // so this test continues to prove that the eligible multi-seq path
@@ -37335,6 +37953,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         // A len configurable via HF2Q_BISECT_ALEN (default 2 → B offset 2 ≡2 mod4).
         // B len via HF2Q_BISECT_BLEN (default 10). Use larger to hit tensor-mm (>64).
@@ -37495,6 +38114,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         // HF2Q_BENCH_TOKENS = decode length per stream (default 128).
         let bench_tokens: usize = std::env::var("HF2Q_BENCH_TOKENS")
@@ -37845,6 +38465,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
 
         // Same prompt, divergent max_tokens (5 / 50 / 200) so slots finish
@@ -37949,6 +38570,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_decode = 1usize; // first-token prefill logits only
@@ -38301,6 +38923,7 @@ assistant:
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a, H2)");
         let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b, H2)");
@@ -42597,13 +43220,13 @@ mod gemma4_bounded_prefill_tests {
             "one active-prefix dependency must not park unrelated collected work"
         );
 
-        assert!(validate_gemma4_generation_request(0, 1, 262_144).is_err());
-        assert!(validate_gemma4_generation_request(1, 0, 262_144).is_err());
-        assert!(validate_gemma4_generation_request(1, u32::MAX as usize + 1, usize::MAX).is_err());
-        assert!(validate_gemma4_generation_request(262_140, 5, 262_144).is_err());
-        assert!(validate_gemma4_generation_request(usize::MAX, 1, usize::MAX).is_err());
+        assert!(validate_gemma4_generation_request(0, 1, 262_144, 0).is_err());
+        assert!(validate_gemma4_generation_request(1, 0, 262_144, 0).is_err());
+        assert!(validate_gemma4_generation_request(1, u32::MAX as usize + 1, usize::MAX, 0).is_err());
+        assert!(validate_gemma4_generation_request(262_140, 5, 262_144, 0).is_err());
+        assert!(validate_gemma4_generation_request(usize::MAX, 1, usize::MAX, 0).is_err());
         assert_eq!(
-            validate_gemma4_generation_request(4_096, 64, 262_144).unwrap(),
+            validate_gemma4_generation_request(4_096, 64, 262_144, 0).unwrap(),
             Gemma4ValidatedRequestShape {
                 prompt_tokens: 4_096,
                 max_tokens: 64,
@@ -42921,6 +43544,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded =
             LoadedModel::load(&opts).expect("H21: LoadedModel::load must succeed for Gemma 4 GGUF");
@@ -42989,6 +43613,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded = LoadedModel::load(&opts).expect("H22: load Gemma 4 GGUF");
         let mut g = match loaded {
@@ -43065,6 +43690,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded = LoadedModel::load(&opts).expect("H23: load Gemma 4 GGUF");
         let g = match loaded {
@@ -43133,6 +43759,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             kv_persist_budget_bytes: 0,
             glp_path: None,
             glp_alpha: None,
+            kv_graft_path: None,
         };
         let loaded = LoadedModel::load(&opts).expect("H24: load Gemma 4 GGUF");
         let engine =
@@ -44277,7 +44904,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
 
     #[test]
     fn qwen_zero_completion_stream_is_rejected_before_sse_admission() {
-        let error = validate_qwen35_generation_request(8, 0, 262_144)
+        let error = validate_qwen35_generation_request(8, 0, 262_144, 0)
             .expect_err("zero-token generation must fail at the engine boundary");
         let (events, mut received_events) = mpsc::channel(2);
         let (admission, received_admission) = oneshot::channel();
@@ -44371,17 +44998,32 @@ mod qwen35_bounded_prefill_watchdog_tests {
             (8, u32::MAX as usize + 1, "exceeds u32"),
             (262_080, 1, "exceeding the per-slot limit"),
         ] {
-            let error = validate_qwen35_generation_request(prompt, completion, 262_144)
+            let error = validate_qwen35_generation_request(prompt, completion, 262_144, 0)
                 .expect_err("invalid scheduler shape must fail before admission");
             assert!(
                 format!("{error:#}").contains(expected),
                 "unexpected validation error: {error:#}"
             );
         }
-        let shape = validate_qwen35_generation_request(87_972, 64, 262_144)
+        let shape = validate_qwen35_generation_request(87_972, 64, 262_144, 0)
             .expect("watchdog fixture fits the full logical context");
         assert_eq!(shape.prompt_tokens, 87_972);
         assert_eq!(shape.max_tokens, 64);
+    }
+
+    #[test]
+    fn qwen_request_shape_counts_graft_rows_against_capacity() {
+        // ADR-059: the graft occupies physical positions 0..graft_len of
+        // every covered full-attention layer; a request that fits ungrafted
+        // must fail when the graft rows push it past the per-slot limit.
+        validate_qwen35_generation_request(262_070, 1, 262_144, 0)
+            .expect("fits ungrafted (262_070 + 1 + 64 <= 262_144)");
+        let error = validate_qwen35_generation_request(262_070, 1, 262_144, 16)
+            .expect_err("graft rows must count against per-request capacity");
+        assert!(
+            format!("{error:#}").contains("exceeding the per-slot limit"),
+            "capacity error, got: {error:#}"
+        );
     }
 
     #[test]
@@ -52105,7 +52747,16 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H127: generate_gemma4_once_with_soft_tokens_slot_aware not found");
-        let fn_window = &src[fn_idx..(fn_idx + 20_000).min(src.len())];
+        let fn_window = {
+            // Char-boundary-safe window end (the ADR-059 gemma4 gate
+            // removal shifted this fn's byte offset onto a multi-byte
+            // char; `str` slicing panics mid-char).
+            let mut end = (fn_idx + 20_000).min(src.len());
+            while !src.is_char_boundary(end) {
+                end -= 1;
+            }
+            &src[fn_idx..end]
+        };
         // (a) OLD iter-2-decode soft-tokens literal REMOVED.
         let old_label =
             "gemma4-forward-prefill-kernel-slot-N-soft-tokens-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.37";

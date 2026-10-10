@@ -509,6 +509,10 @@ impl MlxModelWeights {
         bufs: &BatchedDecodeBuffers,
         n: usize,
         positions_buf: &MlxBuffer,
+        // ADR-059 (3c): prompt-indexed positions twin for SLIDING rings
+        // under a bound graft (they never hold graft rows); `None` when
+        // ungrafted (rings then share `positions_buf` — byte-identical).
+        ring_positions_buf: Option<&MlxBuffer>,
         slot_id_buf: &MlxBuffer,
         slot_ids: &[SlotId],
         seq_positions: &[usize],
@@ -828,8 +832,26 @@ impl MlxModelWeights {
                 let gbuf = &multi_seq_kv_hybrid[layer_idx];
                 let gcap = gbuf.capacity;
                 let gring = gbuf.is_sliding;
+                // ADR-059 (3c): the callers' `seq_positions` are the PHYSICAL
+                // positions (graft rows + prompt rows + decode rows). FULL
+                // layers' hybrid rows include the graft (absolute addressing,
+                // reads cover graft + prompt); SLIDING rings never hold graft
+                // rows, so their write slots (`seq_pos % window`) and read
+                // counts stay over the live prompt/decode rows — the graft
+                // offset subtracted.
+                let graft_len = self.kv_graft_len();
+                let ring_pos_of = |i: usize| -> usize {
+                    seq_positions[i].saturating_sub(graft_len)
+                };
+                let kv_pos_of = |i: usize| -> usize {
+                    if gring {
+                        ring_pos_of(i)
+                    } else {
+                        seq_positions[i]
+                    }
+                };
                 let ksl_of = |i: usize| -> u32 {
-                    let sp = seq_positions[i];
+                    let sp = kv_pos_of(i);
                     if gring {
                         ((sp + 1).min(gcap)) as u32
                     } else {
@@ -892,25 +914,36 @@ impl MlxModelWeights {
                     if use_batched_kvenc {
                         // ONE barrier: norm-rope/V-norm wrote attn_k_normed / v_src;
                         // declare them as reads for the 2 batched encode dispatches.
+                        // ADR-059 (3c): sliding rings address their write slots
+                        // prompt-indexed (they never hold graft rows) — the
+                        // ring-positions twin; full layers keep the absolute
+                        // positions buffer.
+                        let kv_positions_buf: &MlxBuffer = if is_ring {
+                            ring_positions_buf.unwrap_or(positions_buf)
+                        } else {
+                            positions_buf
+                        };
                         session.barrier_between(
                             &[&bufs.attn_k_normed, v_src_buf],
                             &[&buf.k, &buf.v_packed, &buf.v_norms],
                         );
                         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16_batched(
                     session.encoder_mut(), reg, metal_dev,
-                    &bufs.attn_k_normed, &buf.k, slot_id_buf, positions_buf,
+                    &bufs.attn_k_normed, &buf.k, slot_id_buf, kv_positions_buf,
                     n as u32, nkv as u32, hd as u32, cap as u32, is_ring,
                 ).map_err(|e| anyhow::anyhow!("bf F16-K batched L{layer_idx}: {e}"))?;
                         mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
                     session.encoder_mut(), reg, metal_dev,
-                    v_src_buf, &buf.v_packed, &buf.v_norms, slot_id_buf, positions_buf,
+                    v_src_buf, &buf.v_packed, &buf.v_norms, slot_id_buf, kv_positions_buf,
                     n as u32, nkv as u32, hd as u32, cap as u32, is_ring,
                     tq_scale_factor_d512, tq_codebook_bits,
                 ).map_err(|e| anyhow::anyhow!("bf FWHT-V batched L{layer_idx}: {e}"))?;
                     } else {
                         for i in 0..n {
                             let slot = slot_ids[i].0 as u64;
-                            let seq_pos_i = seq_positions[i];
+                            // ADR-059 (3c): sliding rings address their write
+                            // slots prompt-indexed (no graft rows in the ring).
+                            let seq_pos_i = kv_pos_of(i);
                             let cache_pos: u32 = if is_ring {
                                 (seq_pos_i % cap) as u32
                             } else {
@@ -1012,7 +1045,15 @@ impl MlxModelWeights {
                         &bufs.sdpa_out,
                         &bufs.sdpa_tmp,
                         slot_id_buf,
-                        positions_buf,
+                        // ADR-059 (3c): sliding rings derive their per-query
+                        // read extents prompt-indexed (no graft rows in the
+                        // ring); full layers keep the absolute positions (the
+                        // graft rows participate in their reads).
+                        if is_ring {
+                            ring_positions_buf.unwrap_or(positions_buf)
+                        } else {
+                            positions_buf
+                        },
                         &p_hyb,
                     )
                     .map_err(|e| anyhow::anyhow!("batched flash L{layer_idx}: {e}"))?;
@@ -1062,7 +1103,10 @@ impl MlxModelWeights {
                     let tmp_stride = elems(&bufs.sdpa_tmp) / n;
                     for i in 0..n {
                         let slot = slot_ids[i].0 as u64;
-                        let seq_pos_i = seq_positions[i];
+                        // ADR-059 (3c): sliding rings address their write
+                        // slots and read extents prompt-indexed (no graft
+                        // rows in the ring).
+                        let seq_pos_i = kv_pos_of(i);
                         let buf = &multi_seq_kv_hybrid[layer_idx];
                         let cap = buf.capacity;
                         let is_ring = buf.is_sliding;
@@ -2254,6 +2298,30 @@ impl MlxModelWeights {
                 p[i] = sp as u32;
             }
         }
+        // ADR-059 (3c): sliding rings never hold graft rows, so their
+        // write slots and read counts are PROMPT-indexed (the physical
+        // position minus the graft offset) while the RoPE positions above
+        // stay absolute. Under a bound graft, build the ring-positions
+        // twin once per step for the sliding layers' batched KV encode
+        // and flash addressing; full layers keep the absolute buffer (the
+        // graft rows participate in their reads).
+        let graft_len = self.kv_graft_len();
+        let ring_positions_buf: Option<MlxBuffer> = if graft_len > 0 {
+            let mut buf = dev
+                .alloc_buffer(n * 4, DType::U32, vec![n])
+                .map_err(|e| anyhow::anyhow!("body_batched ring positions alloc: {e}"))?;
+            {
+                let p: &mut [u32] = buf
+                    .as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("body_batched ring positions write: {e}"))?;
+                for (i, &sp) in seq_positions.iter().enumerate() {
+                    p[i] = sp.saturating_sub(graft_len) as u32;
+                }
+            }
+            Some(buf)
+        } else {
+            None
+        };
         // Physical slot-id buffer [N] u32 — constant across layers; feeds the M4
         // batched flash kernel (it derives each query's KV base offset).
         let mut slot_id_buf = dev
@@ -2364,6 +2432,7 @@ impl MlxModelWeights {
                         &bufs,
                         n,
                         &positions_buf,
+                        ring_positions_buf.as_ref(),
                         &slot_id_buf,
                         slot_ids,
                         seq_positions,
@@ -2429,6 +2498,7 @@ impl MlxModelWeights {
                     &bufs,
                     n,
                     &positions_buf,
+                    ring_positions_buf.as_ref(),
                     &slot_id_buf,
                     slot_ids,
                     seq_positions,
