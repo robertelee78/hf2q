@@ -557,18 +557,28 @@ impl Deepseek4Model {
                 &invalid_status,
                 rows,
             )?;
-            // GLP steering at the DeepSeek-V4 hook: the FFN writer
-            // (`ffn_output = moe + shared`), AFTER the FFN writes it and
-            // BEFORE `dispatch_hc_post` folds it into the hyper-connection
-            // state. This is the spec's `ffn_out_pre_residual` site — the
-            // same site the ds4 reference reader steers ("ffn_out = moe +
-            // shared, immediately before hc_post_one()"), and the
-            // `glp.hook_point` the published GLP-29 declares. ADR-053 dual
-            // hook sites: the bind accepts the family site set (both spec
-            // sites); the serve load refuses a vector whose bound site this
-            // forward graph does not apply — the post-layer residual arm
-            // lands with #297 — rather than silently reapplying a
-            // `residual_stream_post_layer` vector at this different tensor.
+            // GLP steering at the DeepSeek-V4 hook sites — ADR-053 dual
+            // hook sites, hook-dispatched so the two arms sit side by side
+            // in this one closure (all DeepSeek forward paths — verifier
+            // prefill/one, decode cohort, layer0 — route through it):
+            //
+            // - `ffn_out_pre_residual` steers the FFN writer
+            //   (`ffn_output = moe + shared`), AFTER the FFN writes it and
+            //   BEFORE `dispatch_hc_post` folds it into the
+            //   hyper-connection state — the same site the ds4 reference
+            //   reader steers ("ffn_out = moe + shared, immediately before
+            //   hc_post_one()"), and the `glp.hook_point` the published
+            //   GLP-29 declares.
+            // - `residual_stream_post_layer` steers the complete post-layer
+            //   mHC state (`output_state`, `[rows, hc, hidden]`) AFTER
+            //   `dispatch_hc_post` folds it — project-mode only with
+            //   per-stream norms, via the mHC in-session helper (bind
+            //   refuses add mode at that site with a named error).
+            //
+            // The hooks are different tensors, not synonyms; the bind
+            // accepts the family site set and this dispatch applies each
+            // bound vector at its own site only — never silently reapplying
+            // a residual-site vector at the writer tensor or the reverse.
             //
             // History (2026-09-09 canary): an earlier arrangement steered
             // `ffn_output` AFTER `dispatch_hc_post` had already consumed it
@@ -590,30 +600,38 @@ impl Deepseek4Model {
                     // failing; only a differential layer-mapping probe
                     // finds it — ADR-053 gate 2).
                     if let Some(direction) = glp.direction_for(layer as u32) {
-                        if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
-                            eprintln!("[GLP-APPLY] layer {layer} rows={rows} hidden={hidden} alpha={} mode={:?}", glp.alpha, glp.mode());
+                        if glp.vector.hook_point
+                            == crate::inference::glp::GlpHookPoint::FfnOutPreResidual
+                        {
+                            if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
+                                eprintln!(
+                                    "[GLP-APPLY] layer {layer} rows={rows} hidden={hidden} alpha={} mode={:?}",
+                                    glp.alpha,
+                                    glp.mode()
+                                );
+                            }
+                            // Barrier discipline (measured 2026-09-09): the
+                            // kernel read-modify-writes ffn_output in place.
+                            // Declare that access pattern BEFORE dispatch so
+                            // the tracker's conflict check inserts a memory
+                            // barrier against the FFN's in-flight write of the
+                            // same buffer — without it Metal may run the
+                            // kernel against the not-yet-written buffer
+                            // (dot=0, writes zeros, then the FFN write lands:
+                            // deterministically zero net effect).
+                            session.barrier_between(&[&ffn_output], &[&ffn_output]);
+                            crate::inference::glp::apply_layer_gpu_in_session(
+                                session,
+                                registry,
+                                &ffn_output,
+                                direction,
+                                glp.mode(),
+                                glp.alpha,
+                                rows as u32,
+                                hidden as u32,
+                            )
+                            .with_context(|| format!("GLP FFN-writer encode layer {layer}"))?;
                         }
-                        // Barrier discipline (measured 2026-09-09): the
-                        // kernel read-modify-writes ffn_output in place.
-                        // Declare that access pattern BEFORE dispatch so
-                        // the tracker's conflict check inserts a memory
-                        // barrier against the FFN's in-flight write of the
-                        // same buffer — without it Metal may run the
-                        // kernel against the not-yet-written buffer
-                        // (dot=0, writes zeros, then the FFN write lands:
-                        // deterministically zero net effect).
-                        session.barrier_between(&[&ffn_output], &[&ffn_output]);
-                        crate::inference::glp::apply_layer_gpu_in_session(
-                            session,
-                            registry,
-                            &ffn_output,
-                            direction,
-                            glp.mode(),
-                            glp.alpha,
-                            rows as u32,
-                            hidden as u32,
-                        )
-                        .with_context(|| format!("GLP FFN-writer encode layer {layer}"))?;
                     }
                 }
             }
@@ -630,6 +648,51 @@ impl Deepseek4Model {
                 rows_u32,
                 hidden as u32,
             )?;
+            // GLP post-layer arm (`residual_stream_post_layer`, ADR-053
+            // dual hook sites): steer the complete post-layer mHC state
+            // AFTER `dispatch_hc_post` folds it. Bind guarantees project
+            // mode at this (family, hook) site, so the mHC helper's
+            // projection-only contract holds; its width check accepts both
+            // `hidden` (one shared direction steering every stream) and
+            // `hc*hidden` (per-stream) — bind enforces the same contract
+            // before upload.
+            if let Some(glp) = self.glp.as_ref() {
+                if glp.alpha != 0.0
+                    && glp.vector.hook_point
+                        == crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer
+                {
+                    if let Some(direction) = glp.direction_for(layer as u32) {
+                        if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
+                            eprintln!(
+                                "[GLP-APPLY] layer {layer} rows={rows} hc={hc} hidden={hidden} alpha={} mode=project (post-layer mHC)",
+                                glp.alpha
+                            );
+                        }
+                        // Barrier discipline, one level deeper than the
+                        // writer arm: the mHC kernel read-modify-writes
+                        // output_state in place. Declare that access pattern
+                        // BEFORE dispatch so the tracker's conflict check
+                        // inserts a memory barrier between the fold's
+                        // in-flight write of the same buffer and this
+                        // read-modify-write — without it the kernel can race
+                        // the fold exactly like the 2026-09-09 writer-arm
+                        // canary (steering a not-yet-written buffer:
+                        // measured no-op).
+                        session.barrier_between(&[&output_state], &[&output_state]);
+                        crate::inference::glp::apply_layer_gpu_mhc_in_session(
+                            session,
+                            registry,
+                            &output_state,
+                            direction,
+                            glp.alpha,
+                            rows as u32,
+                            hc as u32,
+                            hidden as u32,
+                        )
+                        .with_context(|| format!("GLP post-layer residual encode layer {layer}"))?;
+                    }
+                }
+            }
             Ok(())
         };
         let inspect_status = shared_session.is_none() && in_flight.is_none();
@@ -638,13 +701,15 @@ impl Deepseek4Model {
         }
         if let Some(session) = shared_session {
             encode(session)?;
-            // GLP steering is encoded inside the closure, between the FFN
-            // write and dispatch_hc_post (see above). The earlier
-            // arrangement — a separate encode here, after the fold — steered
-            // an already-consumed buffer: a measured no-op (logit shift
-            // exactly 0.000000, calibrate canary 2026-09-09). The 2026-09-04
-            // in-session fix moved the write into the session but left it
-            // after the fold; this is the same lesson one level deeper.
+            // GLP steering is encoded inside the closure — the writer arm
+            // between the FFN write and dispatch_hc_post, the post-layer
+            // arm after the fold, both behind barriers (see above). The
+            // earlier arrangement — a separate encode here, after the fold —
+            // steered an already-consumed buffer: a measured no-op (logit
+            // shift exactly 0.000000, calibrate canary 2026-09-09). The
+            // 2026-09-04 in-session fix moved the write into the session but
+            // left it after the fold; this is the same lesson one level
+            // deeper.
         } else {
             let local_executor = GraphExecutor::new(device.clone());
             let mut session = local_executor

@@ -698,11 +698,13 @@ mod projection_reference_tests {
 mod mhc_reference_tests {
     use super::*;
 
-    /// S13 required proof: the mHC helpers (currently unused in production
-    /// — validated before any future use) must match a CPU reference across
-    /// rows and streams, with per-stream directions whose norms DIFFER (the
-    /// case the old stream-0-norm-for-every-stream code mis-scaled) and
-    /// with the shared-direction form.
+    /// S13 required proof: the mHC helpers (the out-of-session pair is
+    /// validated ahead of use; the in-session variant is the production
+    /// DeepSeek post-layer residual arm — ADR-053 dual hook sites, #297)
+    /// must match a CPU reference across rows and streams, with per-stream
+    /// directions whose norms DIFFER (the case the old
+    /// stream-0-norm-for-every-stream code mis-scaled) and with the
+    /// shared-direction form.
     #[test]
     fn mhc_projection_matches_cpu_reference_across_rows_and_streams() {
         let device = MlxDevice::new().expect("MlxDevice");

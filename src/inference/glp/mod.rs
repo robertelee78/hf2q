@@ -26,7 +26,7 @@ pub use apply::{apply_layer_add, apply_layer_project};
 pub use apply_gpu::{
     apply_layer_gpu, apply_layer_gpu_in_session, apply_layer_gpu_mhc, apply_layer_gpu_mhc_in_session,
 };
-pub use bind::BoundGlp;
+pub use bind::{BoundGlp, GlpResidualSite};
 pub use compatibility::{validate_glp_for_model, CheckpointIdentity, Compatibility};
 pub use discovery::{
     resolve_glp, resolve_glp_for_load, GlpLoadError, ResolvedGlp, GLP_SERVING_ARCHITECTURES,

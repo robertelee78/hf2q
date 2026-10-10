@@ -119,7 +119,10 @@ pub struct GlpVector {
     pub derived_at: Option<String>,
     pub alpha_default: f32,
     pub rank: u32,
-    /// Graph layer N → direction tensor (fp32, width = hidden); N >= 1.
+    /// Graph layer N → direction tensor (fp32, uniform width across
+    /// layers); N >= 1. The accepted widths are per (family, hook site) —
+    /// enforced at bind, not here (the DeepSeek post-layer residual site
+    /// additionally accepts `hc*hidden` per-stream directions).
     pub layers: BTreeMap<u32, Vec<f32>>,
     pub width: usize,
     pub content_sha256: Option<String>,
