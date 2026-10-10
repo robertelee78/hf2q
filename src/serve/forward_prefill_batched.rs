@@ -2413,7 +2413,12 @@ impl MlxModelWeights {
                                 let slot_layer_kv = &ms.slot_views_hybrid[seq_idx][layer_idx];
                                 let seq_offset = ms.seq_offsets[seq_idx];
                                 let seq_len_i = ms.seq_lens[seq_idx];
-                                let start_i = ms.start_positions[seq_idx];
+                                // ADR-059 (3c): the FULL-layer write position is
+                                // absolute — the slot's graft rows occupy
+                                // `0..graft_len` (the engine spliced them at
+                                // slot admission), so the live suffix continues
+                                // at `graft_len + start_i`.
+                                let start_i = graft_len + ms.start_positions[seq_idx];
                                 anyhow::ensure!(
                                     start_i + seq_len_i <= cap,
                                     "multi-seq live global KV overflow L{layer_idx}: start={start_i} len={seq_len_i} cap={cap}"
@@ -2640,7 +2645,16 @@ impl MlxModelWeights {
                                         &full_layer_kv.v_packed,
                                         &full_layer_kv.v_norms,
                                         &pf_positions,
-                                        (start_i + chunk_end) as u32,
+                                        // ADR-059 (3c): the full-layer live read
+                                        // extent covers the slot's graft rows
+                                        // (`0..graft_len`) plus the prompt prefix
+                                        // and this chunk — the graft participates
+                                        // in live prefill attention, and the
+                                        // causal mask by absolute position
+                                        // (`pf_positions`, graft-shifted) stays
+                                        // exact because row index == absolute
+                                        // position for full layers.
+                                        (graft_len + start_i + chunk_end) as u32,
                                         cap as u32,
                                         1u32,
                                         0u32,
@@ -5018,6 +5032,13 @@ impl MlxModelWeights {
                                 let hb_is_ring = dst.is_sliding;
                                 let o_i = ms.seq_offsets[si] as u32;
                                 let l_i = ms.seq_lens[si] as u32;
+                                // ADR-059 (3c): the slot's graft rows occupy
+                                // `0..graft_len` of the FULL-layer slot views
+                                // (the engine spliced them at slot admission),
+                                // so the scatter's destination starts at
+                                // `graft_len` there; sliding rings stay
+                                // prompt-indexed (they never hold graft rows).
+                                let hb_dst_start = if hb_is_ring { 0 } else { graft_len as u32 };
                                 s.barrier_between(
                                     &[&pf_k_normed, &pf_v_normed],
                                     &[&dst.k, &dst.v_packed, &dst.v_norms],
@@ -5027,7 +5048,7 @@ impl MlxModelWeights {
                                     &pf_k_normed,
                                     &dst.k,
                                     nkv as u32, hd as u32,
-                                    hb_cap, /*dst_seq_pos_start*/ 0, l_i, /*src_tok_offset*/ o_i,
+                                    hb_cap, /*dst_seq_pos_start*/ hb_dst_start, l_i, /*src_tok_offset*/ o_i,
                                 ).map_err(|e| anyhow::anyhow!("multi-seq hybrid F16 K L{layer_idx} seq{si}: {e}"))?;
                                 if dst.v_packed.dtype() == mlx_native::DType::F16 {
                                     mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
@@ -5035,7 +5056,7 @@ impl MlxModelWeights {
                                         &pf_v_normed,
                                         &dst.v_packed,
                                         nkv as u32, hd as u32,
-                                        hb_cap, 0, l_i, o_i,
+                                        hb_cap, hb_dst_start, l_i, o_i,
                                     ).map_err(|e| anyhow::anyhow!("multi-seq hybrid F16 V L{layer_idx} seq{si}: {e}"))?;
                                 } else {
                                     mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
@@ -5044,7 +5065,7 @@ impl MlxModelWeights {
                                         &dst.v_packed,
                                         &dst.v_norms,
                                         nkv as u32, hd as u32,
-                                        hb_cap, 0, l_i, o_i,
+                                        hb_cap, hb_dst_start, l_i, o_i,
                                         hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
                                     ).map_err(|e| anyhow::anyhow!("multi-seq hybrid V FWHT quant L{layer_idx} seq{si}: {e}"))?;
                                 }

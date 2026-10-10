@@ -3777,7 +3777,9 @@ impl MlxModelWeights {
             for (offset, &input_token) in suffix.iter().enumerate() {
                 next_token = Some(self.forward_decode_slot_aware(
                     input_token,
-                    cached_tokens + offset,
+                    // ADR-059 (3c): the tiny-suffix replay position is the
+                    // PHYSICAL position — graft rows + prompt rows.
+                    self.kv_graft_len() + cached_tokens + offset,
                     gpu,
                     &mut profile,
                     slot_id,
@@ -5302,15 +5304,29 @@ impl MlxModelWeights {
     /// write_pos=seq_pos). `forward_decode` then increments, so kv_info sees
     /// `write_pos=seq_pos`, `seq_len=min(seq_pos+1, cap)` — identical to the
     /// single-seq path. SerialFifo never calls this (slot-aware-only).
+    ///
+    /// ADR-059 (3c): the caller's `seq_pos` is the PHYSICAL position (graft
+    /// rows + prompt rows + decode rows). FULL layers' cursor mirrors it
+    /// exactly (their hybrid rows include the graft); SLIDING rings never
+    /// hold graft rows, so their cursor stays over the live prompt/decode
+    /// rows — the offset subtracted here — keeping the ring's write slot
+    /// (`seq_pos % capacity`) and read count (`min(seq_pos+1, capacity)`)
+    /// exact over the written slots.
     fn set_per_slot_kv_cursor(&mut self, seq_pos: usize) -> Vec<(usize, usize)> {
         let priors: Vec<(usize, usize)> = self
             .kv_caches
             .iter()
             .map(|c| (c.write_pos, c.seq_len))
             .collect();
+        let graft_len = self.kv_graft_len();
         for c in self.kv_caches.iter_mut() {
-            c.write_pos = seq_pos;
-            c.seq_len = seq_pos.min(c.capacity);
+            let pos = if c.is_sliding {
+                seq_pos.saturating_sub(graft_len)
+            } else {
+                seq_pos
+            };
+            c.write_pos = pos;
+            c.seq_len = pos.min(c.capacity);
         }
         priors
     }
