@@ -741,6 +741,23 @@ impl MlxModelWeights {
         self.dflash_capture.is_some()
     }
 
+    /// ADR-059 (items 3b/3c) — the bound graft's position offset. A bound
+    /// graft occupies physical KV positions `0..n_slots` of every
+    /// full-attention layer (the `full_attn_kv` site), so every RoPE
+    /// position and every full-layer KV write/read after the splice shifts
+    /// by this length; sliding layers' rings never hold graft rows (the
+    /// site covers full layers only — `window_tail_kv` is the staged
+    /// sliding site), so their ring arithmetic stays over the live prompt
+    /// rows. Zero when no graft is bound — every offset below is then a
+    /// no-op, preserving byte-identical ungrafted behavior (the ADR-059
+    /// gate-5 equivalence).
+    pub fn kv_graft_len(&self) -> usize {
+        self.kv_graft
+            .as_ref()
+            .map(|bound| bound.bank.n_slots as usize)
+            .unwrap_or(0)
+    }
+
     /// ADR-030 Phase 4 — public embed_tokens lookup.
     ///
     /// Mirrors the gather+scale embedding inside `forward_prefill_batched`

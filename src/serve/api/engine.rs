@@ -21564,6 +21564,15 @@ fn worker_run(
                 // worker is serial.
                 let family = loaded_model_family(&loaded);
                 let result = match &mut loaded {
+                    // ADR-059 fail-closed: embeddings are not graft-wired
+                    // (a graft is decode-side attention state; a pooled
+                    // embedding would be served graft-invisible — the exact
+                    // silent-ungrafted class ADR-059 forbids). Refuse by
+                    // name, mirroring the qwen35 embed gate.
+                    LoadedModel::Gemma(g) if g.weights.kv_graft.is_some() => Err(anyhow::anyhow!(
+                        "KV graft bound but Gemma4 embeddings are not graft-wired \
+                         (ADR-059); refusing rather than serving ungrafted"
+                    )),
                     LoadedModel::Gemma(g) => supervised_gemma4_gpu_call(
                         &supervisor,
                         "gemma4_serial_embed",
@@ -22872,12 +22881,20 @@ fn warmup_once(loaded: &mut GemmaLoadedModel, supervisor: &EngineSupervisor) -> 
             .weights
             .forward_prefill(&prompt, max_tokens, &mut loaded.ctx)
     })?;
-    // One decode step to exercise the decode kernel set.
+    // One decode step to exercise the decode kernel set. ADR-059: the
+    // decode position continues after graft rows + prompt rows (the
+    // prefill above spliced at cold-cache admission under a bound graft);
+    // the warmup's KV state is discarded below, but the primed kernel set
+    // must see the graft-shifted positions.
     let mut profiler = None;
+    let graft_len = loaded.weights.kv_graft_len();
     let _ = supervised_gemma4_gpu_call(supervisor, "gemma4_warmup_decode", || {
-        loaded
-            .weights
-            .forward_decode(last_token, prompt.len(), &mut loaded.ctx, &mut profiler)
+        loaded.weights.forward_decode(
+            last_token,
+            graft_len + prompt.len(),
+            &mut loaded.ctx,
+            &mut profiler,
+        )
     })?;
     // Discard the warmup's per-prefill cache state.  warmup runs with
     // `prompt_len=1, max_tokens=1` → `linear_capacity = 2` allocated for
@@ -23115,6 +23132,28 @@ fn build_gemma_lcp_payload(
     }
 }
 
+/// ADR-059 — gemma4's graft-aware activation-identity hash (the qwen35
+/// `steering_and_graft_params_hash` pattern applied to gemma4's cache
+/// identity). Gemma4 has no GLP steering surface, so the graft is the one
+/// activation-affecting dimension: a grafted server's saved KV must never
+/// be addressed by an ungrafted or differently-grafted one, exactly as
+/// S6/qwen35 established for steering. Ungrafted engines hash the stable
+/// `steering=v1/glp=none/graft=none` triple.
+fn gemma4_graft_aware_params_hash(loaded: &GemmaLoadedModel) -> u64 {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"steering=v1");
+    h.update(b"glp=none");
+    h.update(
+        &crate::inference::graft::graft_params_hash(loaded.weights.kv_graft.as_ref().map(
+            |bound| &bound.bank,
+        ))
+        .to_le_bytes(),
+    );
+    let digest = h.finalize();
+    u64::from_le_bytes(digest[..8].try_into().expect("sha256 prefix"))
+}
+
 fn build_lcp_key_for_request(
     loaded: &GemmaLoadedModel,
     _params: &SamplingParams,
@@ -23149,7 +23188,12 @@ fn build_lcp_key_for_request(
     crate::serve::kv_persist::lcp_registry::LcpKey {
         model_fingerprint: fp,
         tenant_id: String::new(),
-        params_hash: 0,
+        // ADR-059: graft-aware identity (the qwen35
+        // `steering_and_graft_params_hash` pattern) — a grafted prefix can
+        // never masquerade as a clean one, and differently-grafted servers
+        // never share saved KV. Same graft content ⇒ same key; any change
+        // to bank bytes / mode / hook / n_slots ⇒ different key.
+        params_hash: gemma4_graft_aware_params_hash(loaded),
     }
 }
 
@@ -23315,6 +23359,21 @@ fn generate_once_with_soft_tokens(
         !prompt_tokens.is_empty(),
         "generate_once: empty prompt_tokens"
     );
+    // ADR-059 (3b): the bound graft's position offset for this serial
+    // request — physical positions `0..graft_len` hold the spliced bank
+    // (the serial prefill body splices at cold-cache admission, inside
+    // `forward_prefill_with_soft_tokens_resume`), the rendered prompt
+    // starts at position `graft_len`, and the decode positions below
+    // continue after graft rows + prompt rows. Zero (unbound) ⇒ every
+    // offset is a no-op.
+    let graft_len = loaded.weights.kv_graft_len();
+    // Fail-closed: extension (vision soft-token / deepstack) generation is
+    // not graft-wired — a bound graft never rides a multimodal prefill.
+    anyhow::ensure!(
+        graft_len == 0 || soft_tokens.is_empty(),
+        "KV graft bound but Gemma4 vision/soft-token generation is not \
+         graft-wired (ADR-059); refusing rather than serving ungrafted"
+    );
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
 
@@ -23449,8 +23508,12 @@ fn generate_once_with_soft_tokens(
                         match prefix_opt {
                             None => None,
                             Some(prefix) => {
-                                // Aggregate capacity check.
-                                let new_linear = prompt_tokens.len() + params.max_tokens.max(1);
+                                // Aggregate capacity check. ADR-059: the
+                                // graft adds `graft_len` physical rows on
+                                // every full-attention layer, so the
+                                // restored prefix must cover them too.
+                                let new_linear =
+                                    graft_len + prompt_tokens.len() + params.max_tokens.max(1);
                                 let model_sw = loaded.weights.sliding_window.max(1);
                                 let agg_ok = prefix.linear_capacity >= new_linear
                                     && prefix.sliding_window == model_sw;
@@ -23959,7 +24022,11 @@ fn generate_once_with_soft_tokens(
         finish_reason = "stop";
     } else {
         for _ in 1..max_tokens {
-            let pos = prompt_len + generated_tokens.len() - 1;
+            // ADR-059 (3b): serial decode positions continue after the
+            // graft rows + prompt rows (the hybrid full-layer cursor
+            // reads graft + prompt + decode; sliding rings stay
+            // prompt-indexed inside the model fn).
+            let pos = graft_len + prompt_len + generated_tokens.len() - 1;
             let mut p = profiler.start_token();
             // forward_decode populates self.activations.logits as a
             // side-effect of its lm_head + softcap dispatch chain; the
@@ -24444,20 +24511,70 @@ fn generate_once_with_soft_tokens(
 ///   first per A2b §6.1.23 iter-1.5 cfa-finding-F5).
 /// - `iter-B4c-kernel-iter-2` typed `CapabilityUnsupported` on the
 ///   kernel-forward step (the load-bearing pin until iter-2 lands).
+/// ADR-059 gemma4 items 3b/3c — the graft-wiring DARK flag. The serial
+/// (3b) and SlotAware (3c) position-offset wiring is IMPLEMENTED behind
+/// the fail-closed gates: splice at cold admission on both engine paths,
+/// `graft_len` position offsets (full layers absolute; sliding layers'
+/// rings stay over the live prompt rows — the `full_attn_kv` site never
+/// splices sliding layers), graft-aware prompt-cache/LCP identity, and
+/// graft-aware slot anchors at the physical cursor. While this constant
+/// is `false`, [`ensure_gemma4_graft_serving_supported`] keeps refusing a
+/// bound graft BY NAME on every serving entry — the wiring is never
+/// exercised and ungrafted behavior is byte-identical (every offset is a
+/// no-op at `graft_len == 0`). The flip point is work item #306: after
+/// the gemma4 canary matrix passes (zero-slot byte-identical, live bank
+/// diverges, disable restores, on the serial and SlotAware paths), #306
+/// sets this to `true` — the gates then pass a bound graft through to
+/// the wiring below — and after the paired-arm scoreboard accepts, #306
+/// removes the gates and this constant entirely. No environment
+/// variable: the flag is an internal canary-gated flip, never an
+/// operator surface.
+const GEMMA4_GRAFT_WIRED: bool = false;
+
 /// ADR-059 fail-closed request gate for gemma4 paths that are NOT yet
 /// graft-wired. A bound graft shifts every position by `n_slots` and
 /// changes what the KV bytes mean; an unwired path refuses requests BY
 /// NAME rather than serving ungrafted under a graft flag (the
 /// `glp.mode` discipline applied to serving). Ungrafted models pass
-/// unchanged. The graft-wired paths (landing increment by increment)
-/// stop calling this gate.
+/// unchanged.
+///
+/// The graft-wired paths (serial unary/streaming 3b, the SlotAware loop +
+/// its standalone arms 3c) call this gate too: while
+/// [`GEMMA4_GRAFT_WIRED`] is `false` (the #306 canary flip is pending)
+/// the gate still refuses a bound graft, so the wiring behind it stays
+/// dark. When #306 flips the flag the gate additionally enforces the
+/// substrate contract — the landed splice primitive covers the
+/// production hybrid KV leg (F16 K + TQ-HB V) only, so a bound graft on
+/// any other KV regime (dense F32 / HB-packed / legacy 4-bit) or with the
+/// BF16 xlen spec-verify cache engaged would splice nothing the decode
+/// read path attends and would serve silently ungrafted — refused by
+/// name. Vision/soft-token generation and embeddings keep their own
+/// by-name refusals permanently (not graft-wired by scope).
 fn ensure_gemma4_graft_serving_supported(loaded: &GemmaLoadedModel) -> Result<()> {
+    if loaded.weights.kv_graft.is_none() {
+        return Ok(());
+    }
+    if !GEMMA4_GRAFT_WIRED {
+        anyhow::bail!(
+            "KV graft bound but this Gemma4 serving path is not graft-wired yet \
+             (ADR-059 gemma4 items 3b/3c: the position-offset wiring is \
+             implemented but DARK pending the #306 canary matrix); refusing \
+             rather than serving ungrafted"
+        );
+    }
     anyhow::ensure!(
-        loaded.weights.kv_graft.is_none(),
-        "KV graft bound but this Gemma4 serving path is not graft-wired yet \
-         (ADR-059 gemma4 engine wiring pending: admission splice, position \
-         offsets, graft-aware snapshots); refusing rather than serving \
-         ungrafted"
+        crate::debug::INVESTIGATION_ENV.hybrid_kv,
+        "KV graft bound but the Gemma4 graft splice covers the production \
+         hybrid KV regime only (HF2Q_HYBRID_KV=1; F16 K + TQ-HB V — other \
+         regimes would serve the graft silently absent from their decode \
+         reads; ADR-059); refusing rather than serving ungrafted"
+    );
+    anyhow::ensure!(
+        std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1"),
+        "KV graft bound but the HF2Q_DFLASH_XLEN_SDPA=1 spec-verify cache \
+         never sees the graft (its verify reads would compare drafts \
+         against the ungrafted distribution; ADR-059); refusing rather \
+         than serving ungrafted"
     );
     Ok(())
 }
@@ -28418,6 +28535,19 @@ fn generate_stream_once(
         ));
         return Ok(SerialStreamEnd::TerminalSent);
     }
+    // ADR-059 (3b): the serial streaming twin of the unary path's graft
+    // offset — the prefill body splices at cold-cache admission and the
+    // decode positions below continue after graft rows + prompt rows.
+    // Zero (unbound) ⇒ every offset is a no-op.
+    let graft_len = loaded.weights.kv_graft_len();
+    if graft_len > 0 && !soft_tokens.is_empty() {
+        send!(GenerationEvent::Error(
+            "KV graft bound but Gemma4 vision/soft-token generation is not \
+             graft-wired (ADR-059); refusing rather than serving ungrafted"
+                .into()
+        ));
+        return Ok(SerialStreamEnd::TerminalSent);
+    }
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
 
@@ -28561,7 +28691,13 @@ fn generate_stream_once(
                         match prefix_opt {
                             None => None,
                             Some(prefix) => {
-                                let new_linear = prompt_tokens.len() + params.max_tokens.max(1);
+                                // ADR-059 (3b): the graft adds `graft_len`
+                                // physical rows on every full-attention
+                                // layer — the restored prefix must cover
+                                // them too (the streaming twin of the
+                                // unary probe site).
+                                let new_linear =
+                                    graft_len + prompt_tokens.len() + params.max_tokens.max(1);
                                 let model_sw = loaded.weights.sliding_window.max(1);
                                 let agg_ok = prefix.linear_capacity >= new_linear
                                     && prefix.sliding_window == model_sw;
@@ -29217,7 +29353,9 @@ fn generate_stream_once(
 
     if !is_eos_first {
         for _ in 1..max_tokens {
-            let pos = prompt_len + completion_tokens - 1;
+            // ADR-059 (3b): streaming decode positions continue after
+            // graft rows + prompt rows.
+            let pos = graft_len + prompt_len + completion_tokens - 1;
             let mut p = profiler.start_token();
             let dec_result =
                 supervised_gemma4_gpu_call(supervisor, "gemma4_serial_stream_decode", || {

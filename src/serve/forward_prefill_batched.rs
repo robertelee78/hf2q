@@ -518,6 +518,26 @@ impl MlxModelWeights {
             !live_prefix_resume || self.dflash_capture.is_none(),
             "batched live resume cannot share speculative capture state"
         );
+        // ADR-059 (3b/3c) — the bound graft's position offset for the
+        // batched route. `start_pos` (single-seq) / `ms.start_positions`
+        // (multi-seq) stay PROMPT-indexed caller values; this body shifts
+        // them by `graft_len` where the position arithmetic requires the
+        // absolute (virtual) position — the RoPE positions, the FULL-layer
+        // hybrid KV writes, the kv_caches FULL-layer cursor, and the
+        // linear capacity plan. Sliding rings and the dense
+        // prefill-attention leg stay prompt-indexed (they never hold
+        // graft rows — the `full_attn_kv` site covers full layers only).
+        // Zero (unbound) ⇒ every offset is a no-op.
+        let graft_len = self.kv_graft_len();
+        if graft_len > 0 {
+            anyhow::ensure!(
+                INVESTIGATION_ENV.hybrid_kv,
+                "KV graft bound but the Gemma4 batched prefill requires the \
+                 production hybrid KV regime (HF2Q_HYBRID_KV=1; the graft \
+                 splice primitive covers the hybrid F16-K + TQ-HB-V leg \
+                 only — ADR-059); refusing rather than serving ungrafted"
+            );
+        }
 
         // Metal-1 — programmatic GPU capture.  Gated on
         // HF2Q_METAL_CAPTURE=path.gputrace.  Requires process env
@@ -763,7 +783,11 @@ impl MlxModelWeights {
                 .ok_or_else(|| anyhow::anyhow!("batched prompt position overflow"))?
         };
         let capacity_plan = crate::serve::forward_prefill::gemma_kv_capacity_plan(
-            prompt_end,
+            // ADR-059: the graft adds `graft_len` physical rows on every
+            // full-attention layer (the prompt continues at `graft_len`),
+            // so the linear capacity requirement covers it. Sliding rings
+            // stay `sw` (they never hold graft rows).
+            prompt_end + graft_len,
             max_decode_tokens,
             sw,
             kv_lcp_long_resume,
@@ -935,6 +959,44 @@ impl MlxModelWeights {
                         );
                     }
                     self.hybrid_kv = Some(hybrid_vec);
+                }
+                // ADR-059 (3b) — SERIAL cold-admission splice on the
+                // batched route: a fresh (non-resumed, non-mounted,
+                // start_pos == 0) SerialFifo batched prefill splices the
+                // bank into the single-seq hybrid buffers before the KV
+                // copy (the prompt continues at `graft_len`). Live-resume
+                // carries the graft rows inside the leftover; slot-aware
+                // mounts were spliced by the engine at slot admission
+                // (3c); `start_pos > 0` is the spec-decode append surface
+                // (refused under graft by the engine gates).
+                if graft_len > 0
+                    && !live_prefix_resume
+                    && !slot_aware_mount
+                    && start_pos == 0
+                {
+                    let bound = self
+                        .kv_graft
+                        .as_ref()
+                        .expect("graft_len > 0 implies a bound graft");
+                    let buffers = self
+                        .hybrid_kv
+                        .as_mut()
+                        .expect("hybrid regime validated above allocates hybrid_kv");
+                    let spliced =
+                        crate::inference::models::gemma4::kv_cache::splice_graft_into_hybrid_kv_single_seq(
+                            buffers,
+                            &bound.bank,
+                            dev,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "KV graft splice at batched cold-cache admission: {e}"
+                            )
+                        })?;
+                    anyhow::ensure!(
+                        spliced as usize == graft_len,
+                        "KV graft splice returned {spliced} != bank n_slots {graft_len}"
+                    );
                 }
             } else if self.leg_hb_encoded.is_none() {
                 eprintln!(
@@ -1223,6 +1285,11 @@ impl MlxModelWeights {
             // ADR-028 iter-137 Path A Phase 2 GPU step 2/7 — append-mode positions.
             // start_pos=0 (production default callers): identical to pre-iter-137.
             // start_pos>0 (future verify_batched callers): append at offset.
+            // ADR-059: these are the RoPE positions — the graft shifts every
+            // sequence's absolute position by `graft_len` (the prompt starts
+            // at position `graft_len`); the KV write/cursor arithmetic below
+            // applies the shift per layer-type instead (full layers absolute,
+            // sliding rings prompt-indexed).
             if let Some(ref ms) = self.multi_seq_prefill {
                 // ADR-040 iter-G(a) delta 1 — per-seq RoPE position RESET. The
                 // T-token stream is N concatenated prompts; each seq's RoPE
@@ -1234,14 +1301,14 @@ impl MlxModelWeights {
                 let mut g = 0usize;
                 for (seq_idx, &l) in ms.seq_lens.iter().enumerate() {
                     for local in 0..l {
-                        p[g] = (ms.start_positions[seq_idx] + local) as u32;
+                        p[g] = (graft_len + ms.start_positions[seq_idx] + local) as u32;
                         g += 1;
                     }
                 }
                 debug_assert_eq!(g, seq_len, "multi-seq positions: Σ seq_lens != seq_len");
             } else {
                 for (i, slot) in p[..seq_len].iter_mut().enumerate() {
-                    *slot = (start_pos + i) as u32;
+                    *slot = (graft_len + start_pos + i) as u32;
                 }
             }
         }
@@ -2907,6 +2974,12 @@ impl MlxModelWeights {
                         // chunks below and commit each chunk only after its
                         // attention has consumed a chronological linear view.
                         if !is_ring {
+                            // ADR-059 (3b): the FULL-layer live write position
+                            // is absolute — the single-seq hybrid buffer's
+                            // graft rows occupy `0..graft_len` (the splice at
+                            // cold admission), so the live suffix continues
+                            // at `graft_len + start_pos`.
+                            let live_full_start = graft_len + start_pos;
                             s.barrier_between(
                                 &[&pf_k_normed, &pf_v_normed],
                                 &[&layer_kv.k, &layer_kv.v_packed, &layer_kv.v_norms],
@@ -2920,7 +2993,7 @@ impl MlxModelWeights {
                                 nkv as u32,
                                 hd as u32,
                                 cap as u32,
-                                start_pos as u32,
+                                live_full_start as u32,
                                 seq_len as u32,
                                 0,
                             )
@@ -2935,7 +3008,7 @@ impl MlxModelWeights {
                                 nkv as u32,
                                 hd as u32,
                                 cap as u32,
-                                start_pos as u32,
+                                live_full_start as u32,
                                 seq_len as u32,
                                 0,
                             )
@@ -2951,7 +3024,7 @@ impl MlxModelWeights {
                                 nkv as u32,
                                 hd as u32,
                                 cap as u32,
-                                start_pos as u32,
+                                live_full_start as u32,
                                 seq_len as u32,
                                 0,
                                 false,
@@ -3155,7 +3228,15 @@ impl MlxModelWeights {
                                     &layer_kv.v_packed,
                                     &layer_kv.v_norms,
                                     &pf_positions,
-                                    (start_pos + chunk_end) as u32,
+                                    // ADR-059 (3b): the full-layer live read
+                                    // extent covers the graft rows
+                                    // (`0..graft_len`) plus the prompt prefix
+                                    // and this chunk — the graft participates
+                                    // in live prefill attention (row index ==
+                                    // absolute position for full layers, so
+                                    // the `pf_positions` causal mask stays
+                                    // exact).
+                                    (graft_len + start_pos + chunk_end) as u32,
                                     cap as u32,
                                     1u32,
                                     0u32,
@@ -4976,6 +5057,17 @@ impl MlxModelWeights {
                         } else if let Some(ref hybrid_kv) = self.hybrid_kv {
                             let hb_cap = hybrid_kv[layer_idx].capacity as u32;
                             let hb_is_ring = hybrid_kv[layer_idx].is_sliding;
+                            // ADR-059 (3b): the hybrid FULL-layer write
+                            // destination continues after the graft rows
+                            // (`0..graft_len` were spliced at cold-cache
+                            // admission); sliding rings keep the
+                            // prompt-indexed `dst_seq_pos_start` the dense
+                            // copy uses (they never hold graft rows).
+                            let hb_dst_seq_pos_start = if hb_is_ring {
+                                dst_seq_pos_start
+                            } else {
+                                dst_seq_pos_start + graft_len as u32
+                            };
                             s.barrier_between(
                                 &[&pf_k_normed, &pf_v_normed],
                                 &[
@@ -4993,7 +5085,7 @@ impl MlxModelWeights {
                                 nkv as u32,
                                 hd as u32,
                                 hb_cap,
-                                dst_seq_pos_start,
+                                hb_dst_seq_pos_start,
                                 n_copy as u32,
                                 src_tok_offset,
                             )
@@ -5010,7 +5102,7 @@ impl MlxModelWeights {
                                     &pf_v_normed,
                                     &hybrid_kv[layer_idx].v_packed,
                                     nkv as u32, hd as u32,
-                                    hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
+                                    hb_cap, hb_dst_seq_pos_start, n_copy as u32, src_tok_offset,
                                 ).map_err(|e| anyhow::anyhow!("batched hybrid F16 V L{layer_idx}: {e}"))?;
                             } else {
                                 // BUG-coherence fix (supersedes Phase 10e.5 iter-351):
@@ -5026,7 +5118,7 @@ impl MlxModelWeights {
                                     &hybrid_kv[layer_idx].v_packed,
                                     &hybrid_kv[layer_idx].v_norms,
                                     nkv as u32, hd as u32,
-                                    hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
+                                    hb_cap, hb_dst_seq_pos_start, n_copy as u32, src_tok_offset,
                                     hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
                                 ).map_err(|e| anyhow::anyhow!("batched hybrid V FWHT quant L{layer_idx}: {e}"))?;
                             }
@@ -5811,6 +5903,10 @@ impl MlxModelWeights {
             // cache state. The K/V data at slots [0, start_pos) is
             // preserved (the kernel writes only at slots produced by
             // pf_positions, which iter-137 also offset by start_pos).
+            // ADR-059: the kv_caches cursor mirrors the hybrid leg — FULL
+            // layers' cursor continues after graft rows + prompt rows
+            // (absolute); sliding rings stay prompt-indexed (they never
+            // hold graft rows).
             let new_write_pos = self
                 .multi_seq_prefill
                 .as_ref()
@@ -5821,7 +5917,12 @@ impl MlxModelWeights {
                         .map(|(start, len)| start + len)
                         .max()
                         .unwrap_or(start_pos + seq_len)
-                });
+                })
+                + if self.kv_caches[layer_idx].is_sliding {
+                    0
+                } else {
+                    graft_len
+                };
             self.kv_caches[layer_idx].write_pos = new_write_pos;
             self.kv_caches[layer_idx].seq_len =
                 new_write_pos.min(self.kv_caches[layer_idx].capacity);
@@ -6722,8 +6823,12 @@ impl MlxModelWeights {
         // 2031). +4096 under long-resume keeps typical turn
         // growth admissible; only the snapshot over-allocates,
         // the per-request live buffers stay exact.
-        let snap_cap =
-            sw.max(seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 });
+        let snap_cap = sw
+            .max(seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 })
+            // ADR-059: FULL-layer hybrid rows are graft + prompt — the
+            // snapshot boundary and capacity cover them; sliding rings
+            // carry prompt-only rows.
+            .max(graft_len + seq_len);
         let dense_snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>> =
             if lcp_snapshots_on {
                 let mut snap: Vec<std::sync::Arc<DenseKvBuffers>> = Vec::with_capacity(num_layers);
@@ -6829,6 +6934,11 @@ impl MlxModelWeights {
                             .map_err(|e| {
                                 anyhow::anyhow!("lcp hybrid snapshot V norms alloc: {e}")
                             })?;
+                        // ADR-059: the graft-aware boundary — FULL layers
+                        // snapshot the graft rows plus the prompt rows; sliding
+                        // rings snapshot their prompt-only rows.
+                        let graft_aware_rows =
+                            if live_layer.is_sliding { seq_len } else { graft_len + seq_len };
                         let copy_prefix = |src: &MlxBuffer,
                                            dst: &mut MlxBuffer,
                                            elem: usize,
@@ -6841,7 +6951,7 @@ impl MlxModelWeights {
                             let d: &mut [u8] = dst.as_mut_slice().map_err(|e| {
                                 anyhow::anyhow!("lcp hybrid snapshot {what} dst: {e}")
                             })?;
-                            let copy_len = seq_len * inner * elem;
+                            let copy_len = graft_aware_rows * inner * elem;
                             let src_stride = live_cap_dim * inner * elem;
                             let dst_stride = snap_cap * inner * elem;
                             for h in 0..nkv_dim {
