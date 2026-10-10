@@ -4877,10 +4877,6 @@ pub fn cmd_serve(
         //    `Gemma4DenseSpill` once the GGUF metadata extraction
         //    + EngineHandle construction lands.
         if let Some(model_arg) = default_model_arg.as_deref() {
-            let stub = Arc::new(StubGemma4Spill);
-            let stub_for_spiller: Arc<Mutex<dyn crate::serve::kv_persist::KvCacheSpill>> =
-                Arc::new(Mutex::new(StubGemma4Spill));
-            let stub_for_registry: Arc<dyn crate::serve::kv_persist::EngineBindable> = stub.clone();
             // Keys must match the artifact that the pre-warm path will
             // admit so spill and lifecycle lookup cannot alias distinct
             // quantizations under a convenient default.
@@ -4892,6 +4888,45 @@ pub fn cmd_serve(
                     state.hardware.as_ref(),
                 ))?
             };
+            // ADR-062 D4 — DeepSeek-V4 registers its own family hook so
+            // `KvSpiller::family_persist_active` reports the family
+            // honestly: the anchor-image persistor is wired engine-side
+            // (driven from the shared prefill/commit seams through
+            // `LoadOptions::kv_persist_dir`), and the registered hook
+            // mirrors the stub's Skipped block semantics because the
+            // conversation-shaped anchor image does not fit the
+            // `(layer, range)` block contract. Non-DeepSeek models keep
+            // the ADR-017 stub + factory registration below.
+            let operator_arch = if Path::new(model_arg).exists() {
+                mlx_native::gguf::GgufFile::open(Path::new(model_arg))
+                    .ok()
+                    .and_then(|gguf| {
+                        gguf.metadata_string("general.architecture").map(|s| s.to_string())
+                    })
+            } else {
+                None
+            };
+            if operator_arch.as_deref() == Some("deepseek4") {
+                use crate::serve::kv_persist::families::deepseek4_anchor::Deepseek4AnchorSpill;
+                let hook = Arc::new(Deepseek4AnchorSpill);
+                let hook_for_spiller: Arc<Mutex<dyn crate::serve::kv_persist::KvCacheSpill>> =
+                    Arc::new(Mutex::new(Deepseek4AnchorSpill));
+                let hook_for_registry: Arc<dyn crate::serve::kv_persist::EngineBindable> =
+                    hook.clone();
+                spiller.register_family(pool_repo.clone(), pool_quant, hook_for_spiller);
+                registry.register(pool_repo.clone(), pool_quant, hook_for_registry);
+                tracing::info!(
+                    repo = %pool_repo,
+                    quant = %pool_quant.as_str(),
+                    "ADR-062 D4: registered Deepseek4AnchorSpill for operator --model \
+                     (recovery-anchor persistence is wired engine-side; the block \
+                     contract stays Skipped by design)"
+                );
+            } else {
+            let stub = Arc::new(StubGemma4Spill);
+            let stub_for_spiller: Arc<Mutex<dyn crate::serve::kv_persist::KvCacheSpill>> =
+                Arc::new(Mutex::new(StubGemma4Spill));
+            let stub_for_registry: Arc<dyn crate::serve::kv_persist::EngineBindable> = stub.clone();
             spiller.register_family(pool_repo.clone(), pool_quant, stub_for_spiller);
             registry.register(pool_repo.clone(), pool_quant, stub_for_registry);
             tracing::info!(
@@ -5033,6 +5068,7 @@ pub fn cmd_serve(
                  (lazy real-hook construction at first engine load); HF2Q_TQ_KV \
                  selects TQ-active mode at startup"
             );
+            }
         }
 
         // 8. LoaderWrapper — decorates DefaultModelLoader. The

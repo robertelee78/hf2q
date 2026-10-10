@@ -18,6 +18,7 @@ pub(super) use slots::{
 pub(super) use stream::generate_stream;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -31,6 +32,7 @@ use crate::inference::models::deepseek4::{
     release_prefill_scratch, tokenizer as deepseek_tokenizer, Deepseek4Model,
     TransientScratchStats, MIN_MATRIX_APPEND_TOKENS,
 };
+use crate::serve::kv_persist::families::deepseek4_anchor::Deepseek4DiskPersistor;
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape, TokenizerSource,
 };
@@ -271,6 +273,11 @@ pub struct Deepseek4LoadedModel {
     pending_turn_anchor_tokens: Vec<u32>,
     keep_turn_anchor_on_success: bool,
     request_anchor_transaction_active: bool,
+    /// ADR-062 D4 — disk persistor for the recovery-anchor prefix
+    /// images (one per conversation). `Some` iff the typed
+    /// `--kv-persist` path was set at load. Shared with every agent
+    /// slot session so both schedulers persist and hydrate.
+    disk_persistor: Option<Arc<Deepseek4DiskPersistor>>,
     /// Full-logical-context agent sessions provisioned only for SlotAware.
     slot_sessions: Option<Vec<Deepseek4Session>>,
 }
@@ -288,6 +295,9 @@ pub(super) struct Deepseek4Session {
     pending_turn_anchor_tokens: Vec<u32>,
     keep_turn_anchor_on_success: bool,
     request_anchor_transaction_active: bool,
+    /// ADR-062 D4 — cloned from the loaded model so a slot's committed
+    /// anchor persists from the session state on SlotAware.
+    disk_persistor: Option<Arc<Deepseek4DiskPersistor>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,6 +352,7 @@ impl Deepseek4Session {
             pending_turn_anchor_tokens: Vec::new(),
             keep_turn_anchor_on_success: false,
             request_anchor_transaction_active: false,
+            disk_persistor: loaded.disk_persistor.clone(),
         })
     }
 
@@ -527,15 +538,29 @@ impl Deepseek4Session {
             return;
         }
         self.request_anchor_transaction_active = false;
+        let mut promoted_new_anchor = false;
         if let Some(anchor) = self.pending_turn_anchor.take() {
             self.turn_anchor = Some(anchor);
             self.turn_anchor_tokens = std::mem::take(&mut self.pending_turn_anchor_tokens);
+            promoted_new_anchor = true;
         } else if !self.keep_turn_anchor_on_success {
             self.turn_anchor = None;
             self.turn_anchor_tokens.clear();
         }
         self.pending_turn_anchor_tokens.clear();
         self.keep_turn_anchor_on_success = false;
+        // ADR-062 D4 — write the promoted anchor through to disk (one
+        // prefix image per conversation). A retained anchor was already
+        // persisted at its own promotion, so only a NEW anchor writes.
+        if promoted_new_anchor {
+            if let (Some(persistor), Some(anchor)) =
+                (self.disk_persistor.as_ref(), self.turn_anchor.as_ref())
+            {
+                if !self.turn_anchor_tokens.is_empty() {
+                    persistor.capture_and_submit(&self.cache, anchor, &self.turn_anchor_tokens);
+                }
+            }
+        }
     }
 
     /// Swap this slot into the single model execution surface. The staging
@@ -885,6 +910,26 @@ impl Deepseek4LoadedModel {
             "DeepSeek-V4 cache admitted with demand-grown capacity"
         );
 
+        // ADR-062 D4 — construct the recovery-anchor disk persistor when
+        // the typed `--kv-persist` path is set. A bound graft already
+        // refused above (ADR-059 gate 5), so images are only written
+        // ungrafted. Construction failure (unusable directory) fails the
+        // load with a clear message instead of silently serving without
+        // persistence; per-FILE problems later only warn and fall back to
+        // a cold prefill.
+        let disk_persistor = match opts.kv_persist_dir.as_ref() {
+            Some(cache_dir) => Some(Arc::new(
+                Deepseek4DiskPersistor::new(
+                    cache_dir,
+                    &model.cfg,
+                    quant_type.as_deref(),
+                    opts.kv_persist_budget_bytes,
+                )
+                .context("DeepSeek-V4 --kv-persist: recovery-anchor persistence unavailable")?,
+            )),
+            None => None,
+        };
+
         Ok(Self {
             model,
             cache,
@@ -906,6 +951,7 @@ impl Deepseek4LoadedModel {
             pending_turn_anchor_tokens: Vec::new(),
             keep_turn_anchor_on_success: false,
             request_anchor_transaction_active: false,
+            disk_persistor,
             slot_sessions: None,
         })
     }
@@ -1059,15 +1105,124 @@ impl Deepseek4LoadedModel {
             return;
         }
         self.request_anchor_transaction_active = false;
+        let mut promoted_new_anchor = false;
         if let Some(anchor) = self.pending_turn_anchor.take() {
             self.turn_anchor = Some(anchor);
             self.turn_anchor_tokens = std::mem::take(&mut self.pending_turn_anchor_tokens);
+            promoted_new_anchor = true;
         } else if !self.keep_turn_anchor_on_success {
             self.turn_anchor = None;
             self.turn_anchor_tokens.clear();
         }
         self.pending_turn_anchor_tokens.clear();
         self.keep_turn_anchor_on_success = false;
+        // ADR-062 D4 — write the promoted anchor through to disk (one
+        // prefix image per conversation, SerialFifo surface). A retained
+        // anchor was already persisted at its own promotion.
+        if promoted_new_anchor {
+            if let (Some(persistor), Some(anchor)) =
+                (self.disk_persistor.as_ref(), self.turn_anchor.as_ref())
+            {
+                if !self.turn_anchor_tokens.is_empty() {
+                    persistor.capture_and_submit(&self.cache, anchor, &self.turn_anchor_tokens);
+                }
+            }
+        }
+    }
+
+    /// Whether the live surface already offers an in-memory reusable
+    /// prefix (exact live ledger or the committed recovery anchor) for
+    /// this prompt — the gate that keeps ADR-062 D4 hydration strictly a
+    /// cold-miss recovery path.
+    fn has_in_memory_prefix_reuse(&self, prompt_tokens: &[u32]) -> bool {
+        let live = !self.committed_tokens.is_empty()
+            && !self.cache.is_poisoned()
+            && self.cache.position() == self.committed_tokens.len()
+            && prompt_tokens.starts_with(&self.committed_tokens);
+        let anchor = self.turn_anchor.as_ref().is_some_and(|anchor| {
+            anchor.position() == self.turn_anchor_tokens.len()
+                && !self.turn_anchor_tokens.is_empty()
+                && prompt_tokens.len() > self.turn_anchor_tokens.len()
+                && prompt_tokens.starts_with(&self.turn_anchor_tokens)
+        });
+        live || anchor
+    }
+
+    /// ADR-062 D4 — hydrate a persisted recovery-anchor image on a cold
+    /// miss. Replaces the live surface (cache, token ledger, recovery
+    /// anchor) with the image's exact state so the ordinary prefix-reuse
+    /// machinery resumes the conversation and prefills only the suffix.
+    /// Returns `false` (leaving a cold prefill) when no image matches,
+    /// the file is missing, corrupt, or incompatible, or the image's
+    /// context exceeds this run's serving context — warn, never fatal.
+    fn try_hydrate_persisted_anchor(&mut self, prompt_tokens: &[u32]) -> bool {
+        let Some(persistor) = self.disk_persistor.clone() else {
+            return false;
+        };
+        let Some((key_hex, image_tokens)) = persistor.find_hydratable(prompt_tokens) else {
+            return false;
+        };
+        let started = Instant::now();
+        let bytes = match persistor.read_image(&key_hex) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "hf2q::serve::api::engine_deepseek4::persist",
+                    key = %key_hex,
+                    error = %format!("{error:#}"),
+                    "ADR-062 D4: persisted anchor image read failed; cold prefill"
+                );
+                return false;
+            }
+        };
+        let device = self.model.ctx.device().clone();
+        let hydration = match Deepseek4Cache::hydrate_anchor_image(&bytes, &self.model.cfg, &device)
+        {
+            Ok(hydration) => hydration,
+            Err(error) => {
+                // Corrupt files are removed so the next start does not
+                // retry them; an intact but incompatible image (shape or
+                // context drift) is kept for a matching future process.
+                let remove_file = matches!(
+                    error,
+                    crate::inference::models::deepseek4::cache::CacheError::AnchorImageCorrupt {
+                        ..
+                    }
+                );
+                persistor.note_failed_hydrate(&key_hex, &format!("{error}"), remove_file);
+                return false;
+            }
+        };
+        if hydration.cache.capacity() > self.context_limit() {
+            tracing::warn!(
+                target: "hf2q::serve::api::engine_deepseek4::persist",
+                key = %key_hex,
+                image_context = hydration.cache.capacity(),
+                serving_context = self.context_limit(),
+                "ADR-062 D4: persisted anchor image exceeds this run's serving context; cold prefill"
+            );
+            return false;
+        }
+        let hydrated_tokens = hydration.tokens.len();
+        self.cache = hydration.cache;
+        self.committed_tokens = hydration.tokens.clone();
+        self.live_logits = None;
+        self.turn_anchor = Some(hydration.snapshot);
+        self.turn_anchor_tokens = hydration.tokens;
+        self.pending_turn_anchor = None;
+        self.pending_turn_anchor_tokens.clear();
+        self.keep_turn_anchor_on_success = false;
+        self.request_anchor_transaction_active = false;
+        tracing::info!(
+            target: "hf2q::serve::api::engine_deepseek4::persist",
+            key = %key_hex,
+            hydrated_tokens = hydrated_tokens,
+            image_tokens,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "ADR-062 D4: cold miss hydrated from persisted recovery-anchor image"
+        );
+        true
     }
 
     pub(super) fn recover_after_cancellation(&mut self) -> Result<()> {
@@ -1165,6 +1320,16 @@ impl Deepseek4LoadedModel {
                 ),
             )
             .into_anyhow());
+        }
+        // ADR-062 D4 — a true cold miss (no in-memory reuse on this
+        // surface) first tries the persisted recovery-anchor image. On a
+        // hit the hydrated state turns this into an ordinary cached
+        // resume; on a miss (no image / missing / corrupt / incompatible)
+        // the cold prefill below runs unchanged.
+        if self.disk_persistor.is_some() && !self.has_in_memory_prefix_reuse(prompt_tokens) {
+            if self.try_hydrate_persisted_anchor(prompt_tokens) {
+                return self.begin_resumable_cached_prefill(prompt_tokens, max_tokens, progress);
+            }
         }
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
@@ -1498,6 +1663,14 @@ impl Deepseek4LoadedModel {
                 ),
             )
             .into_anyhow());
+        }
+        // ADR-062 D4 — cold-miss hydration: when this surface holds no
+        // reusable prefix, try the persisted recovery-anchor image before
+        // resetting. A hit feeds the ordinary reuse selection below
+        // (the hydrated ledger is an exact live prefix); a miss is
+        // warn-only and the reset/cold path runs unchanged.
+        if self.disk_persistor.is_some() && !self.has_in_memory_prefix_reuse(prompt_tokens) {
+            self.try_hydrate_persisted_anchor(prompt_tokens);
         }
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;

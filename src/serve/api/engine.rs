@@ -9564,7 +9564,13 @@ fn seed_deepseek4_single(
             params,
             is_stream,
         )
-        .map(|state| (Deepseek4SlotWork::Prefill(state), 0_u32))
+        .map(|state| {
+            // ADR-062 D4: a cold begin may have hydrated a persisted
+            // recovery-anchor image (delegating to the cached plan), so
+            // report the plan's cached tokens instead of a hardcoded 0.
+            let initial_cached_tokens = state.initial_cached_tokens() as u32;
+            (Deepseek4SlotWork::Prefill(state), initial_cached_tokens)
+        })
     } else if resumable_cached {
         super::engine_deepseek4::Deepseek4PrefillState::begin_cached(
             model,

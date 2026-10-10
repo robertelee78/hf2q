@@ -10,7 +10,9 @@ use super::cache_buffers::{
 };
 use super::Deepseek4Config;
 
+mod anchor_image;
 mod prefill;
+pub use anchor_image::{AnchorImageHeader, AnchorImageHydration};
 pub use prefill::{CacheSpan, LayerCacheSpan};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,6 +208,10 @@ pub enum CacheError {
     },
     #[error("layer {layer} {kind:?} cache growth buffer shape or dtype does not match")]
     MigrationBufferMismatch { layer: usize, kind: CacheKind },
+    #[error("DeepSeek-V4 recovery-anchor image is corrupt: {reason}")]
+    AnchorImageCorrupt { reason: &'static str },
+    #[error("DeepSeek-V4 recovery-anchor image is incompatible with this model: {reason}")]
+    AnchorImageIncompatible { reason: &'static str },
 }
 
 pub struct LayerCache {
