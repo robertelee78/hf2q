@@ -36,6 +36,17 @@
 //!    `graft.position_base` (u32, default 0) and
 //!    `graft.mrope_interleaved` (bool, default false) carry the family
 //!    flags the bind checks.
+//! 8. Site keys (ADR-059 `compressed_kv`, #308): `graft.compress_ratios`
+//!    — an i32/u32 array parallel to the model's per-layer compression
+//!    schedule — is REQUIRED at the `compressed_kv` site (fabricated
+//!    compressed rows are meaningless without the schedule they splice
+//!    into) and FORBIDDEN at every other site. The `compressed_kv` site
+//!    is shared-KV MQA: bank `n_kv_heads` must be 1 and `graft.k.<layer>`
+//!    must equal `graft.v.<layer>` byte-for-byte. Compressed rows are
+//!    merged, positionless state, so `graft.position_base` does not
+//!    apply (a declared non-zero value is fatal) and no family RoPE flag
+//!    applies (`graft.mrope_interleaved=true` is fatal); the RoPE keys
+//!    are validated at bind for CHECKPOINT IDENTITY only.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -69,8 +80,10 @@ pub enum GraftHookPoint {
     /// re-injected as the window slides. Staged site 2 (Gemma-4
     /// Sliding layers) — not implemented; loading is fatal.
     WindowTailKv,
-    /// DeepSeek-V4 compressor output region. Staged site 3 — not
-    /// implemented; loading is fatal.
+    /// DeepSeek-V4 compressor output region (fabricated compressed rows at
+    /// the reserved leading positions of every `compress_ratios[layer] != 0`
+    /// layer's compressed region; the compressor recurrence tracks real
+    /// rows only). Implemented per ADR-059/#308 — DeepSeek-V4 only.
     CompressedKv,
     /// DeltaNet conv/recurrent state buffers. Staged site 4 (the site
     /// that lifts Qwen hybrid coverage beyond full-attn layers) — not
@@ -99,7 +112,7 @@ impl GraftHookPoint {
     }
 
     fn implemented(self) -> bool {
-        matches!(self, Self::FullAttnKv)
+        matches!(self, Self::FullAttnKv | Self::CompressedKv)
     }
 }
 
@@ -185,6 +198,12 @@ pub struct GraftBank {
     pub rotary_dim: u32,
     pub position_base: u32,
     pub mrope_interleaved: bool,
+    /// The `compressed_kv` site's per-layer compression schedule
+    /// (`graft.compress_ratios`), parallel to the model's per-layer
+    /// `compress_ratios`. Required at that site; `None` at every other
+    /// site (the key is fatal there). Validated equal on every covered
+    /// layer at bind (the gemma4 per-layer-array precedent).
+    pub compress_ratios: Option<Vec<u32>>,
     pub content_sha256: Option<String>,
     /// Quantization lane the bank was derived against (e.g. `bf16`,
     /// `Q4_K_M`). Informational; cross-lane loads warn at bind.
@@ -196,6 +215,12 @@ enum MetaValue {
     F32(f32),
     Bool(bool),
     Str(String),
+    /// GGUF array of uint32 (type 9, element type 4) — the canonical
+    /// schedule-array encoding this repo's own writer emits
+    /// (`backends/gguf/types.rs`).
+    U32Array(Vec<u32>),
+    /// GGUF array of int32 (type 9, element type 5).
+    I32Array(Vec<i32>),
 }
 
 struct Reader<'a> {
@@ -259,22 +284,40 @@ fn read_meta_value(reader: &mut Reader, value_type: u32) -> Result<MetaValue, Gr
     }
 }
 
-fn read_string_or_skip_array(reader: &mut Reader, value_type: u32) -> Result<(), GraftError> {
-    if value_type == 9 {
-        // array: element type + count + elements
-        let elem_type = reader.u32()?;
-        let count = reader.u64()?;
-        if count > MAX_ARRAY_ELEMENTS {
-            return Err(GraftError::Malformed(format!(
-                "array element count {count} exceeds budget"
-            )));
+/// Read one metadata array. Integer element types are captured (the
+/// `graft.compress_ratios` schedule array); every other element type is
+/// consumed and skipped.
+fn read_meta_array(
+    reader: &mut Reader,
+    elem_type: u32,
+    count: u64,
+) -> Result<Option<MetaValue>, GraftError> {
+    if count > MAX_ARRAY_ELEMENTS {
+        return Err(GraftError::Malformed(format!(
+            "array element count {count} exceeds budget"
+        )));
+    }
+    match elem_type {
+        4 => {
+            let mut values = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                values.push(reader.u32()?);
+            }
+            Ok(Some(MetaValue::U32Array(values)))
         }
-        for _ in 0..count {
-            read_meta_value(reader, elem_type)?;
+        5 => {
+            let mut values = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                values.push(reader.i32()?);
+            }
+            Ok(Some(MetaValue::I32Array(values)))
         }
-        Ok(())
-    } else {
-        read_meta_value(reader, value_type).map(|_| ())
+        _ => {
+            for _ in 0..count {
+                read_meta_value(reader, elem_type)?;
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -318,7 +361,11 @@ fn parse_gguf(
         let key = reader.string()?;
         let value_type = reader.u32()?;
         if value_type == 9 {
-            read_string_or_skip_array(&mut reader, value_type)?;
+            let elem_type = reader.u32()?;
+            let count = reader.u64()?;
+            if let Some(value) = read_meta_array(&mut reader, elem_type, count)? {
+                metadata.insert(key, value);
+            }
             continue;
         }
         let value = read_meta_value(&mut reader, value_type)?;
@@ -430,7 +477,7 @@ impl GraftBank {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, GraftError> {
-        let (metadata, tensors, data_offset) = parse_gguf(bytes)?;
+        let (mut metadata, tensors, data_offset) = parse_gguf(bytes)?;
 
         // Gate 1: mode — REQUIRED (a graft is cache-integrity state; a
         // missing operation is refused, not defaulted — deliberate
@@ -587,6 +634,81 @@ impl GraftBank {
             None => false,
         };
 
+        // Gate 8 (site keys, ADR-059 compressed_kv / #308):
+        // `graft.compress_ratios` — the per-layer compression schedule
+        // parallel to the model's own array. Required at the
+        // `compressed_kv` site (fabricated compressed rows are
+        // meaningless without the schedule they splice into); forbidden
+        // at every other site (a site-specific key never travels).
+        let compress_ratios = match metadata.remove("graft.compress_ratios") {
+            Some(MetaValue::U32Array(values)) => Some(values),
+            Some(MetaValue::I32Array(values)) => {
+                if let Some(negative) = values.iter().find(|value| **value < 0) {
+                    return Err(GraftError::Malformed(format!(
+                        "graft.compress_ratios contains a negative entry {negative}; \
+                         compression ratios are non-negative"
+                    )));
+                }
+                Some(values.into_iter().map(|value| value as u32).collect())
+            }
+            Some(_) => {
+                return Err(GraftError::Malformed(
+                    "graft.compress_ratios must be an i32/u32 array".into(),
+                ))
+            }
+            None => None,
+        };
+        match (hook_point, compress_ratios.as_ref()) {
+            (GraftHookPoint::CompressedKv, None) => {
+                return Err(GraftError::Conformance(
+                    "graft.compress_ratios missing; the compressed_kv site requires \
+                     the per-layer compression schedule parallel to the model's \
+                     (a fabricated compressed row is meaningless without the \
+                     schedule it splices into)"
+                        .into(),
+                ));
+            }
+            (GraftHookPoint::CompressedKv, Some(values)) if values.is_empty() => {
+                return Err(GraftError::Malformed(
+                    "graft.compress_ratios is empty; the schedule is parallel to the \
+                     model's per-layer array"
+                        .into(),
+                ));
+            }
+            (GraftHookPoint::CompressedKv, _) => {}
+            (_, Some(_)) => {
+                return Err(GraftError::Conformance(format!(
+                    "graft.compress_ratios is a compressed_kv-site key and is not \
+                     valid at the {:?} site",
+                    hook_point.as_str()
+                )));
+            }
+            (_, None) => {}
+        }
+        // Compressed rows are merged, positionless state (the site's own
+        // ADR-059 contract): positions exist only in the window/raw token
+        // series, so `graft.position_base` does not apply at this site and
+        // no family RoPE flag does either — the RoPE keys above are
+        // checkpoint identity only, validated at bind.
+        if hook_point == GraftHookPoint::CompressedKv {
+            if position_base != 0 {
+                return Err(GraftError::Conformance(
+                    "graft.position_base does not apply at the compressed_kv site: \
+                     compressed rows are merged, positionless state (positions \
+                     exist only in the window/raw token series)"
+                        .into(),
+                ));
+            }
+            if mrope_interleaved {
+                return Err(GraftError::Conformance(
+                    "graft.mrope_interleaved=true does not apply at the \
+                     compressed_kv site: no family RoPE flag applies to merged \
+                     compressed state (the RoPE keys are checkpoint identity only)"
+                        .into(),
+                ));
+            }
+        }
+
         let content_sha256 = match metadata.get("graft.content_sha256") {
             Some(MetaValue::Str(s))
                 if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) =>
@@ -724,7 +846,26 @@ impl GraftBank {
                     "no graft.k.<layer>/graft.v.<layer> tensors found; not a graft bank".into(),
                 ));
             }
+            // The compressed_kv site is shared-KV MQA (one KV head; the
+            // compressed region is a single K==V series — the #309
+            // producer contract).
+            if hook_point == GraftHookPoint::CompressedKv
+                && n_kv_heads.unwrap_or(0) != 1
+            {
+                return Err(GraftError::Conformance(format!(
+                    "graft n_kv_heads {} must be 1 at the compressed_kv site — \
+                     DeepSeek-V4's compressed region is shared-KV MQA (one K==V series)",
+                    n_kv_heads.unwrap_or(0)
+                )));
+            }
             for (layer, (k, v)) in &layers {
+                if hook_point == GraftHookPoint::CompressedKv && k != v {
+                    return Err(GraftError::Conformance(format!(
+                        "layer {layer}: graft.k != graft.v — the compressed_kv site \
+                         is shared-KV MQA (K == V rows); a divergent pair is a \
+                         wrong-site bank"
+                    )));
+                }
                 match (k, v) {
                     (Some(_), Some(_)) => {}
                     (Some(_), None) => {
@@ -788,6 +929,7 @@ impl GraftBank {
             rotary_dim,
             position_base,
             mrope_interleaved,
+            compress_ratios,
             content_sha256,
             quant_lane,
         })
@@ -830,6 +972,12 @@ mod tests {
                     out.write_all(&8u32.to_le_bytes()).unwrap();
                     out.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
                     out.write_all(s.as_bytes()).unwrap();
+                }
+                // The fixture writer does not emit array metadata; the
+                // #309 producer's array bytes are covered by the
+                // compatibility fixtures (which write their own GGUF).
+                MetaValue::U32Array(_) | MetaValue::I32Array(_) => {
+                    unreachable!("fixture writer never emits array metadata")
                 }
             }
         }
@@ -952,7 +1100,9 @@ mod tests {
 
     #[test]
     fn staged_sites_are_recognized_but_fatal() {
-        for site in ["window_tail_kv", "compressed_kv", "recurrent_state"] {
+        // `compressed_kv` shipped (ADR-059/#308, DeepSeek-V4); the staged
+        // fatal set is the remaining sites.
+        for site in ["window_tail_kv", "recurrent_state"] {
             let mut meta = base_meta();
             meta[2] = ("graft.hook_point", MetaValue::Str(site.into()));
             let bytes = build_gguf(&meta, &bank_tensors());

@@ -12483,6 +12483,7 @@ mod tests {
                 rotary_dim: 64,
                 position_base: 0,
                 mrope_interleaved: true,
+                compress_ratios: None,
                 content_sha256: None,
                 quant_lane: None,
             }

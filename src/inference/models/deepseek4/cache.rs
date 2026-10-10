@@ -173,6 +173,30 @@ pub enum CacheError {
         snapshot_position: usize,
         source_position: usize,
     },
+    #[error(
+        "DeepSeek-V4 graft layer coverage disagrees with the compression schedule at layer {layer}"
+    )]
+    GraftLayerCoverage { layer: usize },
+    #[error("DeepSeek-V4 layer {layer} graft row shape disagrees with the compressed region")]
+    GraftRowShape { layer: usize },
+    #[error(
+        "DeepSeek-V4 layer {layer} compressed region cannot hold {n_slots} graft rows \
+         (capacity {capacity} rows — the graft reserves leading rows the real history \
+         must not overwrite)"
+    )]
+    GraftCapacity {
+        layer: usize,
+        n_slots: usize,
+        capacity: usize,
+    },
+    #[error("DeepSeek-V4 layer {layer} graft re-plant disagrees with the live region length")]
+    GraftConflict { layer: usize },
+    #[error("failed to splice layer {layer} graft rows into the compressed region: {source}")]
+    GraftSplice {
+        layer: usize,
+        #[source]
+        source: MlxError,
+    },
     #[error("failed to copy layer {layer} {kind:?} during cache growth: {source}")]
     MigrationCopy {
         layer: usize,
@@ -202,6 +226,16 @@ pub struct Deepseek4Cache {
     pub(super) next_position: usize,
     poisoned: bool,
     resident_bytes: u64,
+    /// ADR-059 `compressed_kv` graft region length (#308): the leading
+    /// `graft_slots` rows of every covered layer's compressed region hold
+    /// fabricated graft rows (reserved storage). Zero = ungrafted (every
+    /// graft-aware arithmetic below is a no-op). Real compressed-row
+    /// writes are offset by this length; the compressor's recurrent pools
+    /// (`main_kv_state`/`main_score_state`, indexer twins) track REAL rows
+    /// only — fabricated rows are reserved storage the recurrence never
+    /// reads, updates, or merges (the splice writes only compressed rows
+    /// and never touches a state buffer).
+    graft_slots: usize,
     _device: MlxDevice,
 }
 
@@ -474,6 +508,7 @@ impl Deepseek4Cache {
             next_position: 0,
             poisoned: false,
             resident_bytes: actual,
+            graft_slots: 0,
             _device: device,
         };
         cache.reset()?;
@@ -482,6 +517,108 @@ impl Deepseek4Cache {
 
     pub fn layers(&self) -> &[LayerCache] {
         &self.layers
+    }
+
+    /// ADR-059 `compressed_kv` graft region length (#308): the leading
+    /// compressed rows reserved for fabricated graft rows. Zero =
+    /// ungrafted.
+    pub fn graft_slots(&self) -> usize {
+        self.graft_slots
+    }
+
+    /// Splice a `compressed_kv` graft bank into this cache's compressed
+    /// regions (ADR-059 #308, the boot/session splice). The bank's rows
+    /// encode through the same BF16 storage every real
+    /// prefill-compressed row uses (the values were validated
+    /// bf16-representable at bind, so the encode is lossless), land at
+    /// the reserved LEADING rows `[0, n_slots)` of every covered layer's
+    /// compressed region, and set the region length that offsets all
+    /// later real compressed-row writes.
+    ///
+    /// Cache-discipline invariants enforced here:
+    /// - coverage is exactly the model's schedule (`ratio != 0` layers
+    ///   carry rows; a tensor at a ratio-0 layer is fatal — those layers
+    ///   own no compressed region);
+    /// - `n_slots` fits every covered layer's compressed capacity;
+    /// - the compressor's recurrent pools track REAL rows only: this
+    ///   splice writes exclusively `compressed_kv` rows and never reads,
+    ///   writes, or merges a `main_kv_state`/`main_score_state`/indexer
+    ///   state buffer — fabricated rows are reserved storage the
+    ///   recurrence never sees (the write offset keeps real rows out of
+    ///   `[0, n_slots)`, so no future compressor write can touch them).
+    ///
+    /// Zero-slot banks plant nothing and leave the cache ungrafted (the
+    /// canary no-op). Reset does NOT clear the planted rows: compressed
+    /// rows are append-only reserved storage whose visibility is
+    /// index-driven, and `reset` clears the cursor and recurrent pools
+    /// only.
+    pub fn plant_compressed_graft(
+        &mut self,
+        bank: &crate::inference::graft::GraftBank,
+    ) -> Result<(), CacheError> {
+        if bank.hook_point != crate::inference::graft::GraftHookPoint::CompressedKv {
+            return Err(CacheError::GraftLayerCoverage { layer: 0 });
+        }
+        let n_slots = bank.n_slots as usize;
+        if n_slots == 0 {
+            if self.graft_slots != 0 {
+                return Err(CacheError::GraftConflict { layer: 0 });
+            }
+            return Ok(());
+        }
+        let head_dim = bank.head_dim;
+        for (index, layer) in self.layers.iter_mut().enumerate() {
+            let plan = &self.plan.layers[index];
+            let Some(cache) = layer.compressed_kv.as_mut() else {
+                // ratio == 0: no compressed region. A bank tensor here is
+                // fatal (validated at bind; re-enforced at the splice).
+                if bank.layers.contains_key(&(index as u32)) {
+                    return Err(CacheError::GraftLayerCoverage { layer: index });
+                }
+                continue;
+            };
+            let capacity = cache.shape()[0];
+            let kv = bank
+                .layers
+                .get(&(index as u32))
+                .ok_or(CacheError::GraftLayerCoverage { layer: index })?;
+            // Shared-KV MQA: the compressed region is one K==V series;
+            // the reader enforced k == v, so the K rows are the rows.
+            let rows = &kv.k;
+            if rows.len() != n_slots * head_dim
+                || plan
+                    .compressed_kv
+                    .as_ref()
+                    .is_none_or(|p| p.shape[1] != head_dim)
+            {
+                return Err(CacheError::GraftRowShape { layer: index });
+            }
+            if n_slots > capacity {
+                return Err(CacheError::GraftCapacity {
+                    layer: index,
+                    n_slots,
+                    capacity,
+                });
+            }
+            if self.graft_slots != 0 && self.graft_slots != n_slots {
+                return Err(CacheError::GraftConflict { layer: index });
+            }
+            let bytes = cache
+                .as_mut_slice::<u8>()
+                .map_err(|source| CacheError::GraftSplice {
+                    layer: index,
+                    source,
+                })?;
+            let row_bytes = head_dim * DType::BF16.size_of();
+            for (row, values) in rows.chunks_exact(head_dim).take(n_slots).enumerate() {
+                let destination = &mut bytes[row * row_bytes..(row + 1) * row_bytes];
+                for (out, value) in destination.chunks_exact_mut(2).zip(values) {
+                    out.copy_from_slice(&f32_to_bf16_bits(*value).to_le_bytes());
+                }
+            }
+        }
+        self.graft_slots = n_slots;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -550,11 +687,18 @@ impl Deepseek4Cache {
         {
             let layer_plan = &source.plan.layers[layer_index];
             let window_rows = source.next_position.min(source_layer.window_kv.shape()[0]);
-            let compressed_rows = if layer_plan.compress_ratio == 0 {
+            // Real compressed rows follow the graft region: the copy spans
+            // the reserved leading graft rows plus the real rows so the
+            // planted region travels with the cache (the graft is
+            // re-spliced by migration, never re-derived). The indexer twin
+            // carries real rows only (no graft rows exist in the indexer
+            // series).
+            let real_compressed_rows = if layer_plan.compress_ratio == 0 {
                 0
             } else {
                 source.next_position / layer_plan.compress_ratio as usize
             };
+            let compressed_rows = source.graft_slots + real_compressed_rows;
             copy_buffer_valid_rows(
                 &source_layer.window_kv,
                 &mut destination_layer.window_kv,
@@ -573,7 +717,7 @@ impl Deepseek4Cache {
                 source_layer.indexer_kv.as_ref(),
                 destination_layer.indexer_kv.as_mut(),
                 if layer_plan.compress_ratio == 4 {
-                    compressed_rows
+                    real_compressed_rows
                 } else {
                     0
                 },
@@ -608,6 +752,10 @@ impl Deepseek4Cache {
 
         self.next_position = source.next_position;
         self.poisoned = false;
+        // The graft region traveled with the copied rows; adopt its length
+        // so the destination's write offsets and capacity bounds stay
+        // graft-aware.
+        self.graft_slots = source.graft_slots;
         if let Some(snapshot) = snapshot {
             snapshot.plan = self.plan.clone();
         }
@@ -770,6 +918,23 @@ impl Deepseek4Cache {
                 let window_valid_after = tokens_after.min(window_capacity);
                 let (compressed_write_slot, compressed_valid_after) =
                     completed_group_step(tokens_after, layer.compress_ratio);
+                // ADR-059 #308 graft capacity bound: the graft reserves the
+                // leading compressed rows, so the real-row span
+                // `[graft_slots, graft_slots + valid)` must fit the region
+                // before this step's write may land. The graft therefore
+                // consumes `graft_slots * ratio` tokens of usable context
+                // on every covered layer (the binding layer is the max
+                // ratio).
+                if layer.compress_ratio != 0 {
+                    let capacity = layer.compressed_kv.as_ref().map_or(0, |plan| plan.shape[0]);
+                    if self.graft_slots.saturating_add(compressed_valid_after) > capacity {
+                        return Err(CacheError::GraftCapacity {
+                            layer: layer.layer_index,
+                            n_slots: self.graft_slots,
+                            capacity,
+                        });
+                    }
+                }
                 let indexer_write_slot = (layer.compress_ratio == 4)
                     .then_some(compressed_write_slot)
                     .flatten();
@@ -778,7 +943,7 @@ impl Deepseek4Cache {
                 } else {
                     0
                 };
-                LayerCacheStep {
+                Ok(LayerCacheStep {
                     layer_index: layer.layer_index,
                     window_write_slot: position % window_capacity,
                     window_start_position: tokens_after - window_valid_after,
@@ -787,9 +952,9 @@ impl Deepseek4Cache {
                     compressed_valid_after,
                     indexer_write_slot,
                     indexer_valid_after,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, CacheError>>()?;
         Ok(CacheStep { position, layers })
     }
 
@@ -840,6 +1005,11 @@ impl Deepseek4Cache {
     /// Reset logical visibility and all recurrent compressor state. KV rows
     /// remain validity-bounded, but pooling state participates in future
     /// writes and therefore must be restored exactly between requests.
+    /// ADR-059 #308: the graft region is NOT cleared — fabricated
+    /// compressed rows are reserved storage whose visibility is
+    /// index-driven (unconditional), and real writes are offset past
+    /// them, so reset restores the ungrafted-cursor semantics exactly
+    /// while the graft keeps steering.
     pub fn reset(&mut self) -> Result<(), CacheError> {
         for (layer_index, layer) in self.layers.iter_mut().enumerate() {
             fill_state(
@@ -1231,6 +1401,15 @@ fn copy_optional_buffer_valid_rows(
         (None, None) if valid_rows == 0 => Ok(()),
         _ => Err(CacheError::MigrationBufferMismatch { layer, kind }),
     }
+}
+
+/// Round-to-nearest-even bf16 encoding of an f32, as a bit pattern —
+/// the storage conversion every real prefill-compressed row performs.
+/// A value that is already bf16-representable encodes to itself.
+fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let rounded = bits + 0x7FFF + ((bits >> 16) & 1);
+    (rounded >> 16) as u16
 }
 
 fn copy_optional_buffer_prefix(

@@ -168,6 +168,14 @@ impl Deepseek4Model {
         if head_dim <= self.cfg.rope_head_dim as usize {
             bail!("DeepSeek-V4 compressed KV needs non-RoPE dimensions");
         }
+        // ADR-059 #308: the leading `graft` compressed rows hold fabricated
+        // graft rows (reserved storage). Every real compressed-row write is
+        // offset past them; the read-side index arithmetic below exposes
+        // them unconditionally (positionless merged state) and shifts the
+        // real entries by `+graft`. The compressor recurrence (state pools)
+        // runs on the real token series untouched — it never reads the
+        // cache rows, so the pools track real rows only by construction.
+        let graft = cache.graft_slots();
         let cache_step = prefill_span
             .is_none()
             .then(|| {
@@ -268,7 +276,10 @@ impl Deepseek4Model {
         let raw_prefix_len =
             usize::from(use_matrix_prefill && start_position > 0) * window_capacity;
         let compact_raw_kv_len = raw_prefix_len + rows;
-        let compact_prefill_kv_len = compact_raw_kv_len + valid_compressed;
+        // The compact compressed span holds graft rows then real rows, so
+        // the compact KV length spans both (`compressed_len` in the prefill
+        // flash adapters derives from this).
+        let compact_prefill_kv_len = compact_raw_kv_len + graft + valid_compressed;
         let compressed_attention_offset = if use_matrix_prefill {
             compact_raw_kv_len
         } else {
@@ -341,16 +352,21 @@ impl Deepseek4Model {
                 } else {
                     window_indices(window_capacity, rows, start_position)?
                 };
+                // ADR-059 #308: fabricated graft rows index BETWEEN the
+                // window and the compressed series (ratio 128) or the
+                // ratio-4 indexer output region (the indexer kernel writes
+                // its top-k slots at `indexer_output_offset`, past the
+                // graft block, so the graft indices survive it).
                 let tail_width = if ratio == 4 {
                     self.cfg.index_top_k as usize
                 } else {
-                    valid_compressed
+                    graft + valid_compressed
                 };
                 let raw_index_width = window
                     .first()
                     .map(Vec::len)
                     .context("DeepSeek-V4 append window index row missing")?;
-                let width = raw_index_width + tail_width;
+                let width = raw_index_width + graft + tail_width;
                 let mut storage = vec![-1_i32; rows * width];
                 let compressed = (ratio == 128)
                     .then(|| {
@@ -359,22 +375,33 @@ impl Deepseek4Model {
                             rows,
                             start_position,
                             compressed_attention_offset,
+                            graft,
                         )
                     })
                     .transpose()?;
                 for query in 0..rows {
-                    storage[query * width..query * width + raw_index_width]
-                        .copy_from_slice(&window[query]);
+                    let row = &mut storage[query * width..(query + 1) * width];
+                    row[..raw_index_width].copy_from_slice(&window[query]);
+                    if ratio == 4 {
+                        // The ratio-4 tail is the indexer output region
+                        // (filled by the lightning indexer kernel): the
+                        // graft block is planted here, ahead of it.
+                        for slot in 0..graft {
+                            row[raw_index_width + slot] =
+                                (compressed_attention_offset + slot) as i32;
+                        }
+                    }
+                    // ratio-128: `compressed_indices` already emits the
+                    // graft block then the shifted real completed groups.
                     if let Some(compressed) = compressed.as_ref() {
-                        storage[query * width + raw_index_width..(query + 1) * width]
-                            .copy_from_slice(&compressed[query]);
+                        row[raw_index_width + graft..].copy_from_slice(&compressed[query]);
                     }
                 }
                 (
                     storage,
                     width,
                     width,
-                    (ratio == 4).then_some(raw_index_width),
+                    (ratio == 4).then_some(raw_index_width + graft),
                 )
             } else {
                 let plan = compressed_attention_index_plan(
@@ -382,6 +409,7 @@ impl Deepseek4Model {
                     window_capacity,
                     self.cfg.index_top_k as usize,
                     start_position,
+                    graft,
                 )?;
                 let storage_stride = plan.storage.len();
                 (
@@ -557,10 +585,16 @@ impl Deepseek4Model {
                 ratio,
                 rows,
                 start_position,
+                // ADR-059 #308: real compressed rows land AFTER the
+                // reserved graft region (physical slot = graft + real
+                // slot); the compressor's recurrent pools still run on the
+                // real token series (start_position above) — fabricated
+                // rows never enter the recurrence.
                 layer_span
                     .map(|span| span.compressed_write_start)
                     .or_else(|| layer_step.and_then(|step| step.compressed_write_slot))
-                    .unwrap_or(0),
+                    .unwrap_or(0)
+                    + graft,
                 compressed_count,
                 layer_cache,
                 &core.attn_norm,
@@ -581,13 +615,21 @@ impl Deepseek4Model {
                     &self.cfg,
                     rows,
                     start_position,
+                    // ADR-059 #308: the indexer TWIN carries real rows
+                    // only (the graft bank has no indexer rows), so its
+                    // write start stays in the real series — but the
+                    // physical MAIN-series indices the indexer emits must
+                    // address real rows PAST the graft region: the
+                    // attention offset shifts by +graft (the emitted
+                    // physical index then gathers compressed_kv[graft +
+                    // selected], the real row `selected`).
                     layer_span
                         .map(|span| span.indexer_write_start)
                         .or_else(|| layer_step.and_then(|step| step.indexer_write_slot))
                         .unwrap_or(0),
                     compressed_count,
                     valid_compressed,
-                    compressed_attention_offset,
+                    compressed_attention_offset + graft,
                     layer_cache,
                     &core.attn_norm,
                     &core.q_a_norm,

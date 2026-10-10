@@ -3466,6 +3466,7 @@ mod tests {
                 rotary_dim: 512,
                 position_base: 0,
                 mrope_interleaved: false,
+                compress_ratios: None,
                 content_sha256: None,
                 quant_lane: None,
             }

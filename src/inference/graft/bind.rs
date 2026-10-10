@@ -58,6 +58,19 @@ pub fn graft_params_hash(graft: Option<&GraftBank>) -> u64 {
             h.update(&bank.rotary_dim.to_le_bytes());
             h.update(&bank.position_base.to_le_bytes());
             h.update([bank.mrope_interleaved as u8]);
+            // The compressed_kv site's schedule array (None at every
+            // other site) — a bank with a different schedule is a
+            // different splice and must never share a cache identity.
+            match &bank.compress_ratios {
+                None => h.update(&0u8.to_le_bytes()),
+                Some(ratios) => {
+                    h.update(&1u8.to_le_bytes());
+                    h.update(&(ratios.len() as u32).to_le_bytes());
+                    for ratio in ratios {
+                        h.update(&ratio.to_le_bytes());
+                    }
+                }
+            }
             for (layer, kv) in &bank.layers {
                 h.update(&layer.to_le_bytes());
                 for value in kv.k.iter().chain(kv.v.iter()) {
@@ -120,6 +133,7 @@ pub(crate) fn test_bank(
         rotary_dim: 64,
         position_base: 0,
         mrope_interleaved: true,
+        compress_ratios: None,
         content_sha256: None,
         quant_lane: None,
     }

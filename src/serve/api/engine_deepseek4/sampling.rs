@@ -206,6 +206,9 @@ pub(in crate::serve::api) fn generate_once(
     registration: Option<&ModelRegistration>,
     supervisor: &EngineSupervisor,
 ) -> Result<GenerationResult> {
+    // ADR-059 #308 fail-closed serving entry (the gemma4 gate pattern):
+    // never serve ungrafted under a bound graft.
+    super::ensure_deepseek4_graft_serving_supported(loaded)?;
     let scratch_guard = RequestScratchGuard::new();
     let mut progress = RequestProgress::start("unary", prompt_tokens.len(), params.max_tokens);
     let prefill_started = Instant::now();
@@ -224,7 +227,7 @@ pub(in crate::serve::api) fn generate_once(
     let max_tokens = decode_token_limit(
         params.max_tokens,
         prompt_tokens.len(),
-        loaded.context_limit(),
+        loaded.graft_context_limit(),
     );
     let decode_started = Instant::now();
     progress.start_decode();

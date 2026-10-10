@@ -30,5 +30,8 @@ pub mod compatibility;
 pub mod reader;
 
 pub use bind::{graft_params_hash, BoundGraft};
-pub use compatibility::{validate_graft_bank_for_model, validate_graft_for_model, GraftModelShape};
+pub use compatibility::{
+    validate_compressed_kv_bank_for_model, validate_graft_bank_for_model, validate_graft_for_model,
+    CompressedKvShape, GraftModelShape,
+};
 pub use reader::{GraftBank, GraftError, GraftHookPoint, GraftKind, GraftLayerKv, GraftMode};

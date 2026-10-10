@@ -1384,9 +1384,12 @@ pub struct ServeArgs {
     /// auto-discovery (a bank is checkpoint-, RoPE-, and quant-lane
     /// bound; discovery cannot safely choose among variants). Reader
     /// conformance, checkpoint identity, site/layer coverage, GQA
-    /// geometry, or RoPE-identity errors abort startup. v1 site:
-    /// `full_attn_kv` (Qwen3.5/3.6/3.8 full-attention layers; other
-    /// architectures refuse the bind with a named error).
+    /// geometry, or RoPE-identity errors abort startup. Sites:
+    /// `full_attn_kv` (Qwen3.5/3.6/3.8 full-attention layers; Gemma-4
+    /// Full layers) and `compressed_kv` (DeepSeek-V4 fabricated
+    /// compressed rows at the reserved leading positions of every
+    /// covered layer — ADR-059 #308, gated on the canary constant);
+    /// other architectures refuse the bind with a named error.
     ///
     /// Graft concept credit: phantom-kv (lordx64).
     #[arg(

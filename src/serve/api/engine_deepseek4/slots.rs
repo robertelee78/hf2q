@@ -94,6 +94,9 @@ impl Deepseek4PrefillState {
         params: SamplingParams,
         stream: bool,
     ) -> Result<Self> {
+        // ADR-059 #308 fail-closed SlotAware serving entry (the gemma4
+        // gate pattern): never serve ungrafted under a bound graft.
+        super::ensure_deepseek4_graft_serving_supported(loaded)?;
         let scratch_guard = RequestScratchGuard::new();
         let request_started = Instant::now();
         let mut progress = RequestProgress::start(
@@ -128,6 +131,9 @@ impl Deepseek4PrefillState {
         params: SamplingParams,
         stream: bool,
     ) -> Result<Self> {
+        // ADR-059 #308 fail-closed SlotAware serving entry (the gemma4
+        // gate pattern): never serve ungrafted under a bound graft.
+        super::ensure_deepseek4_graft_serving_supported(loaded)?;
         let scratch_guard = RequestScratchGuard::new();
         let request_started = Instant::now();
         let mut progress = RequestProgress::start(
@@ -466,6 +472,9 @@ impl Deepseek4SlotState {
         cancelled: impl Fn() -> bool,
         supervisor: &EngineSupervisor,
     ) -> Result<Self> {
+        // ADR-059 #308 fail-closed SlotAware serving entry (the gemma4
+        // gate pattern): never serve ungrafted under a bound graft.
+        super::ensure_deepseek4_graft_serving_supported(loaded)?;
         let scratch_guard = RequestScratchGuard::new();
         let request_started = Instant::now();
         let mut progress = RequestProgress::start(
@@ -517,7 +526,7 @@ impl Deepseek4SlotState {
         let max_tokens = decode_token_limit(
             params.max_tokens,
             prompt_tokens.len(),
-            loaded.context_limit(),
+            loaded.graft_context_limit(),
         );
         let sampler = sampler_config(&params);
         let runtime = grammar_runtime(&params, registration)?;
