@@ -112,7 +112,9 @@ Raising the bound requires a hands-on qualification at the new width. Docs and
   conversation and hydrates it on a cold miss, on both schedulers. A missing,
   corrupt, or incompatible file MUST only cause a cold prefill.
 - If that cannot land in the release, `--kv-persist` on DeepSeek-V4 MUST fail
-  at startup with a clear message instead of being ignored.
+  at startup with a clear message instead of being ignored. (Resolved
+  2026-10-10: the persistence landed, so this fallback is moot — it remains
+  the rule for any future family where the hook cannot ship.)
 
 ### D5. Reasoning controls behave the same on every family
 - `reasoning_effort`, its `reasoning.{effort,enabled,max_tokens}` aliases, and
@@ -201,6 +203,50 @@ existing tests are updated only where a change breaks them.
   focused suites pass; hands-on verification per Verification above (all
   three families through the HTTP API, `hf2q chat`, and OpenCode) is
   pending.
+- **D4's DeepSeek-V4 half** (#293) is implemented on
+  `fix/serve-ds-kv-persist` (worktree `ds-kv-persist`, cut from `main` @
+  204b7cba, uncommitted at handoff): `Deepseek4LoadedModel` constructs a
+  `Deepseek4DiskPersistor`
+  (`src/serve/kv_persist/families/deepseek4_anchor.rs`) from the typed
+  `--kv-persist` path at load — an unusable persistence directory fails
+  startup with a clear message instead of silently serving unpersisted.
+  Every promoted turn anchor (loaded surface AND each SlotAware agent
+  session — the shared commit seam) writes ONE prefix image per
+  conversation to
+  `<kv-persist>/ds4-<fingerprint>/<key>.dsimg`: the anchor snapshot's
+  circular-window rows and recurrent compressor pools plus the
+  append-only compressed/indexer rows valid at the anchor position (the
+  exact state the in-memory RecoveryAnchor resume path relies on the
+  live cache holding), with the rendered token ledger and a SHA-256
+  checksum (codec:
+  `inference::models::deepseek4::cache::anchor_image`). A conversation's
+  newer anchor supersedes its strictly shorter prefix images, and the
+  typed byte budget evicts oldest-mtime images. On a cold miss
+  (`prefill_suffix` and `begin_resumable_cold_prefill`, when the surface
+  holds no reusable prefix) the longest image whose token ledger is an
+  EXACT proper prefix of the rendered prompt is hydrated into the live
+  surface (cache + ledger + recovery anchor), so the ordinary reuse
+  machinery prefills only the suffix — SerialFifo directly and SlotAware
+  via the cold→cached delegation (`seed_deepseek4_single` reports the
+  hydrated plan's cached tokens). A missing, corrupt (checksum), or
+  incompatible (shape/context drift, graft rows) file only warns and
+  falls back to a cold prefill; corrupt files are best-effort deleted.
+  A bound `--kv-graft` still refuses `--kv-persist` at boot (ADR-059
+  gate 5, unchanged and re-verified), and the codec refuses graft rows
+  in both directions as a backstop. `cmd_serve` registers
+  `Deepseek4AnchorSpill` for a DeepSeek-V4 `--model` so #292's
+  `family_persist_active` reports the family honestly (the block
+  contract stays Skipped by design — the anchor image is
+  conversation-shaped, not block-shaped). `cargo check --locked
+  --all-targets --all-features` is clean; the focused suites pass
+  (`kv_persist` 231, `deepseek4` 134, `persist` 249); the codec's
+  serialize→hydrate round trip (window/compressed/indexer/states
+  byte-exact, checksum corruption, schedule drift, graft-header
+  refusal) was verified on the real Metal path with a throwaway test
+  removed before handoff per the no-new-tests direction. Hands-on
+  restart-resume verification per Verification above (both schedulers,
+  cached-token counts, on the local 107 GiB artifact) is pending — the
+  orchestrator runs those gates after this implementation.
 - **Integration order:** merge D0 first (the shared scheduler constant and
   error path); commit the #256 piece on `fix/grammar-length-finish` and
   merge it second; D2's remainder re-cuts from `main` after both (it

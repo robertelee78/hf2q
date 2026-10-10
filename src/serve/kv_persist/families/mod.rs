@@ -32,6 +32,20 @@
 //!   - **Iter 3**: linear-attn slot bytes (with swap_parity hint).
 //!   - **Iter 4**: MTP slot bytes.
 //!   - **Iter 5**: `Qwen35DiskPersistor` write-through to disk.
+//! - [`deepseek4_anchor`] (ADR-062 D4, 2026-10-10) — DeepSeek-V4's
+//!   recovery-anchor prefix image: ONE image per conversation holding
+//!   the exact turn-anchor state (circular window rows, recurrent
+//!   compressor pools, and the append-only compressed/indexer rows
+//!   below the anchor) plus its rendered token ledger. The disk
+//!   lifecycle (`Deepseek4DiskPersistor`) lives here; the byte codec
+//!   lives beside the cache it serializes
+//!   (`inference::models::deepseek4::cache::anchor_image`). It does
+//!   NOT use the spiller's `(layer, range)` block contract (the
+//!   DeepSeek window+compressed+recurrent layout is conversation-
+//!   shaped, not block-shaped): the engine's shared prefill/commit
+//!   seams drive persistence on both schedulers, and the registered
+//!   `Deepseek4AnchorSpill` hook exists so
+//!   `KvSpiller::family_persist_active` reports the family honestly.
 //! - [`tq_packed`] (B-tq.1, this iter 2026-05-05) — TurboQuant-packed
 //!   K/V codec.  Provides `payload_kind = "tq_packed_v1"` envelope
 //!   serialization at codec_version=1 frozen with deterministic round-
@@ -47,6 +61,7 @@
 //! (`pre_evict` reads / `post_admit` writes) share a single
 //! registration across the engine's lifetime.
 
+pub mod deepseek4_anchor;
 pub mod gemma4_dense;
 pub mod qwen35_disk_persistor;
 pub mod qwen35_hybrid_persistor;
