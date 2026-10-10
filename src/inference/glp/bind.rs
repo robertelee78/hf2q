@@ -11,6 +11,22 @@ use mlx_native::{DType, MlxBuffer, MlxDevice};
 use super::reader::{GlpHookPoint, GlpMode, GlpVector};
 use super::GlpError;
 
+/// The post-layer residual site's steering state (ADR-053 dual hook sites).
+///
+/// `Dense` is one `[rows, hidden]` stream (Qwen). `MhcStreams` is the
+/// DeepSeek-V4 hyper-connection fold — a `[rows, hc, hidden]` state whose
+/// `residual_stream_post_layer` site is steered by the mHC kernel:
+/// project-mode only (no add-mHC kernel exists) with directions of width
+/// `hidden` (one shared direction steering every stream — what
+/// `hf2q calibrate` exports) or `hc*hidden` (per-stream, the weightless
+/// mHC discipline). Every other site, on every family, steers a dense
+/// `[rows, hidden]` buffer and stays `hidden`-width.
+#[derive(Clone, Copy, Debug)]
+pub enum GlpResidualSite {
+    Dense,
+    MhcStreams { hc: u32 },
+}
+
 /// A GLP vector bound to a device (directions uploaded once at serve start).
 pub struct BoundGlp {
     pub vector: GlpVector,
@@ -38,17 +54,27 @@ impl BoundGlp {
     ///
     /// Alpha precedence: request/CLI override > the file's
     /// `glp.alpha_default`.
-    pub fn bind(
+    ///
+    /// `residual_site` declares the state this family's
+    /// `residual_stream_post_layer` site steers (ADR-053 dual hook
+    /// sites). `Dense` accepts `hidden`-width directions only and puts
+    /// no further mode constraint on any site; `MhcStreams` additionally
+    /// accepts `hc*hidden` per-stream directions at that site and
+    /// refuses `add` mode there with a named error — the mHC kernel
+    /// implements the per-stream projection only, so refusing at bind
+    /// beats failing (or silently no-oping) at runtime.
+    pub fn bind_for_family(
         vector: GlpVector,
         alpha_override: Option<f32>,
         device: &MlxDevice,
         family_hooks: &[GlpHookPoint],
         model_num_layers: u32,
         model_hidden: u32,
+        residual_site: GlpResidualSite,
     ) -> Result<Self, GlpError> {
         // S8: model compatibility is enforced BEFORE serving. A vector
         // naming layers the model does not have would be silently unused;
-        // a direction whose width differs from the model's hidden size
+        // a direction whose width differs from the site's steering slice
         // would read outside its buffer at apply time (the Qwen dispatcher
         // had no width check). Loading a file successfully is not proof
         // that its intervention executes.
@@ -61,12 +87,29 @@ impl BoundGlp {
                 )));
             }
         }
-        if vector.width != model_hidden as usize {
+        // ADR-053 dual hook sites: every site steers row slices of the
+        // model's hidden width, so `hidden` is always accepted. The
+        // DeepSeek post-layer residual site steers an mHC `[rows, hc,
+        // hidden]` state and additionally accepts `hc*hidden` per-stream
+        // directions (the weightless mHC discipline); writer-site vectors
+        // stay `hidden`-only.
+        let per_stream_width = match (residual_site, vector.hook_point) {
+            (GlpResidualSite::MhcStreams { hc }, GlpHookPoint::ResidualStreamPostLayer) => {
+                Some(hc as usize * model_hidden as usize)
+            }
+            _ => None,
+        };
+        if vector.width != model_hidden as usize && Some(vector.width) != per_stream_width {
+            let accepted = match per_stream_width {
+                Some(hc_hidden) => format!("hidden={model_hidden} or hc*hidden={hc_hidden}"),
+                None => format!("hidden={model_hidden}"),
+            };
             return Err(GlpError::Conformance(format!(
-                "GLP direction width {} != model hidden size {model_hidden}; \
-                 a mismatched width reads outside the direction buffer at \
-                 apply time — refusing",
-                vector.width
+                "GLP direction width {} is not accepted at hook {} on this \
+                 family (accepted widths: {accepted}); a mismatched width \
+                 reads outside the direction buffer at apply time — refusing",
+                vector.width,
+                vector.hook_point.as_str()
             )));
         }
         // Global refusal first: spec-recognized, no hf2q family implements
@@ -93,6 +136,23 @@ impl BoundGlp {
                 vector.hook_point.as_str(),
                 vector.derived_at.as_deref().unwrap_or("<undeclared>")
             )));
+        }
+        // ADR-053 dual hook sites: the DeepSeek post-layer residual site
+        // is project-mode-only — the mHC helpers implement the per-stream
+        // projection kernel and no add-mHC kernel exists. Refuse the
+        // (deepseek, residual, add) combination with a named error here
+        // rather than failing (or silently no-oping) at runtime.
+        if matches!(residual_site, GlpResidualSite::MhcStreams { .. })
+            && vector.hook_point == GlpHookPoint::ResidualStreamPostLayer
+            && vector.mode == GlpMode::Add
+        {
+            return Err(GlpError::Conformance(
+                "glp.mode add is not implemented at hook \
+                 residual_stream_post_layer on deepseek4: the post-layer mHC \
+                 state is steered project-mode only (no add-mHC kernel \
+                 exists); refusing at bind rather than failing at runtime"
+                    .into(),
+            ));
         }
         let alpha = alpha_override.unwrap_or(vector.alpha_default);
         if !alpha.is_finite() || alpha < 0.0 {
@@ -155,6 +215,31 @@ impl BoundGlp {
             device_directions.insert(*layer, buffer);
         }
         Ok(Self { vector, alpha, device_directions })
+    }
+
+    /// Family bind with the dense residual-site contract: the
+    /// `residual_stream_post_layer` site steers a `[rows, hidden]` stream,
+    /// so every site accepts `hidden`-width directions only and carries no
+    /// extra mode constraint. The behavior every family had before the
+    /// ADR-053 dual hook sites extension; families whose residual site
+    /// steers mHC state (DeepSeek-V4) call [`Self::bind_for_family`].
+    pub fn bind(
+        vector: GlpVector,
+        alpha_override: Option<f32>,
+        device: &MlxDevice,
+        family_hooks: &[GlpHookPoint],
+        model_num_layers: u32,
+        model_hidden: u32,
+    ) -> Result<Self, GlpError> {
+        Self::bind_for_family(
+            vector,
+            alpha_override,
+            device,
+            family_hooks,
+            model_num_layers,
+            model_hidden,
+            GlpResidualSite::Dense,
+        )
     }
 
     pub fn mode(&self) -> GlpMode {
