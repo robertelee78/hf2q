@@ -30,8 +30,15 @@ run_arm() {
     shift
     local log="$WORK/serve-$arm.log"
     echo "── arm $arm: booting on :$PORT"
+    # Scheduler: the family default (ADR-062 D0) unless the operator overrides
+    # via HF2Q_PRODUCT_SCHEDULER (e.g. fifo-serial for the qwen-era campaigns).
+    # NOTE: gemma4 + fifo-sequential requests hit a resumable-prefill capacity
+    # 500 (issue <TBD>: cached dense_kvs capacity < required on the 2nd request);
+    # the canonical product config is the default scheduler.
+    local sched_args=()
+    [[ -n "${HF2Q_PRODUCT_SCHEDULER:-}" ]] && sched_args+=(--scheduler "$HF2Q_PRODUCT_SCHEDULER")
     HF2Q_TQ_KV=1 HF2Q_QWEN_SPECULATION=off "$BIN" serve "$MODEL" \
-        --port "$PORT" --quiet --scheduler fifo-serial \
+        --port "$PORT" --quiet "${sched_args[@]+"${sched_args[@]}"}" \
         --default-thinking-token-budget 0 ${1:+--kv-graft "$1"} >"$log" 2>&1 &
     SRV_PID=$!
     local i
