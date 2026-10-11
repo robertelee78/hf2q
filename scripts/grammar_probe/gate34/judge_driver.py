@@ -99,7 +99,12 @@ def judge_one(model: str, prompt: str, content: str) -> dict:
         ],
         "temperature": 0,
         "max_tokens": int(os.environ.get("JUDGE_MAX_TOKENS", "2600")),
-        "reasoning_effort": "low",
+        # No `reasoning_effort` here: the ADR-062 (#294) thinking-policy
+        # validation now rejects reasoning_effort when thinking is
+        # explicitly disabled (HTTP 400), and with thinking off the effort
+        # knob steered nothing anyway. The judging contract is otherwise
+        # identical to judge.py's (rubric, schema, request shape, fail-closed
+        # validation).
         # Thinking-capable judges otherwise spend the budget in
         # reasoning_content; the verdict regex then scrapes JSON-shaped
         # fragments out of the thinking channel. The verdict must come
@@ -129,7 +134,8 @@ def judge_one(model: str, prompt: str, content: str) -> dict:
 def main() -> None:
     prompts = load_prompts(os.environ.get(
         "PROMPTS",
-        "/var/folders/bd/84n3hd3120sdr990qkfbgvj00000gp/T/opencode/hf2q-glp-fix/scripts/grammar_probe/prompts_512.tsv"))
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "prompts_512.tsv")))
     model = os.environ.get("JUDGE_MODEL") or resolve_model()
 
     done: set[tuple[str, str, str]] = set()

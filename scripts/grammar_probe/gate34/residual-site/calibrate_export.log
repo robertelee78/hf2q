@@ -1,0 +1,78 @@
+[calibrate] loading /Users/robert/.local/share/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf …
+[calibrate] 43 layers, hidden=4096, 4 HC streams, capture layer 29 (exports direction.29)
+[calibrate] pair 1/64 captured
+[calibrate] pair 2/64 captured
+[calibrate] pair 3/64 captured
+[calibrate] pair 4/64 captured
+[calibrate] pair 5/64 captured
+[calibrate] pair 6/64 captured
+[calibrate] pair 7/64 captured
+[calibrate] pair 8/64 captured
+[calibrate] pair 9/64 captured
+[calibrate] pair 10/64 captured
+[calibrate] pair 11/64 captured
+[calibrate] pair 12/64 captured
+[calibrate] pair 13/64 captured
+[calibrate] pair 14/64 captured
+[calibrate] pair 15/64 captured
+[calibrate] pair 16/64 captured
+[calibrate] pair 17/64 captured
+[calibrate] pair 18/64 captured
+[calibrate] pair 19/64 captured
+[calibrate] pair 20/64 captured
+[calibrate] pair 21/64 captured
+[calibrate] pair 22/64 captured
+[calibrate] pair 23/64 captured
+[calibrate] pair 24/64 captured
+[calibrate] pair 25/64 captured
+[calibrate] pair 26/64 captured
+[calibrate] pair 27/64 captured
+[calibrate] pair 28/64 captured
+[calibrate] pair 29/64 captured
+[calibrate] pair 30/64 captured
+[calibrate] pair 31/64 captured
+[calibrate] pair 32/64 captured
+[calibrate] pair 33/64 captured
+[calibrate] pair 34/64 captured
+[calibrate] pair 35/64 captured
+[calibrate] pair 36/64 captured
+[calibrate] pair 37/64 captured
+[calibrate] pair 38/64 captured
+[calibrate] pair 39/64 captured
+[calibrate] pair 40/64 captured
+[calibrate] pair 41/64 captured
+[calibrate] pair 42/64 captured
+[calibrate] pair 43/64 captured
+[calibrate] pair 44/64 captured
+[calibrate] pair 45/64 captured
+[calibrate] pair 46/64 captured
+[calibrate] pair 47/64 captured
+[calibrate] pair 48/64 captured
+[calibrate] pair 49/64 captured
+[calibrate] pair 50/64 captured
+[calibrate] pair 51/64 captured
+[calibrate] pair 52/64 captured
+[calibrate] pair 53/64 captured
+[calibrate] pair 54/64 captured
+[calibrate] pair 55/64 captured
+[calibrate] pair 56/64 captured
+[calibrate] pair 57/64 captured
+[calibrate] pair 58/64 captured
+[calibrate] pair 59/64 captured
+[calibrate] pair 60/64 captured
+[calibrate] pair 61/64 captured
+[calibrate] pair 62/64 captured
+[calibrate] pair 63/64 captured
+[calibrate] pair 64/64 captured
+[calibrate] d_disp norm (stream 0) = 3.5776e1
+[calibrate] d_out  norm (stream 0) = 1.6150e2
+[calibrate]   stream 0 d_disp norm = 3.5776e1
+[calibrate]   stream 1 d_disp norm = 5.2089e1
+[calibrate]   stream 2 d_disp norm = 3.4091e1
+[calibrate]   stream 3 d_disp norm = 7.4967e0
+[calibrate] wrote /opt/hf2q/target/gate34-residual/calibrated.glp.gguf
+ WARN hf2q::inference::glp::reader: GLP direction was derived at a different site from its apply hook; validate this site transfer and its dose derived_at="residual_stream_post_layer" hook_point="ffn_out_pre_residual"
+[calibrate] zero-dose canary: logits identical
+[calibrate] debug: bound alpha=1 layers=[29] direction.29 present=true
+[calibrate] live-dose logit shift: 0.201927
+[calibrate] OK — /opt/hf2q/target/gate34-residual/calibrated.glp.gguf passed all canaries

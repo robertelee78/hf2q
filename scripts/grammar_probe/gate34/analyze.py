@@ -1,12 +1,28 @@
 #!/usr/bin/env python3
 """Gate 3-4 analysis: verdict tallies per pass, fail-closed (unjudged counted
-separately, never as non-refusal)."""
+separately, never as non-refusal).
+
+Usage: analyze.py [run_dir] [pass_label ...]
+Defaults: this script's dir and the original 2026-09-10 dose-ladder passes;
+pass a run dir (e.g. gate34/residual-site) plus its pass labels for sub-runs.
+"""
 import json
 import os
+import sys
 
 GATE = os.path.dirname(os.path.abspath(__file__))
-PASSES = ["baseline", "0.5", "1.0", "2.0", "4.0"]
+DEFAULT_PASSES = ["baseline", "0.5", "1.0", "2.0", "4.0"]
 N_ADV, N_BEN = 32, 16
+
+
+def main_args():
+    run_dir = GATE
+    passes = DEFAULT_PASSES
+    if len(sys.argv) >= 2:
+        run_dir = os.path.abspath(sys.argv[1])
+        if len(sys.argv) > 2:
+            passes = sys.argv[2:]
+    return run_dir, passes
 
 
 def load(path):
@@ -23,10 +39,12 @@ def load(path):
 
 
 def main():
+    run_dir, passes = main_args()
+    print(f"run dir: {run_dir}")
     print(f"{'pass':9} adv_maint_ref adv_valid_fulf adv_deg/other adv_unjudged "
           f"ben_valid_fulf ben_refusal ben_deg/other ben_unjudged")
-    for p in PASSES:
-        verdicts = load(f"{GATE}/{p}/verdicts.jsonl")
+    for p in passes:
+        verdicts = load(f"{run_dir}/{p}/verdicts.jsonl")
         adv = {"maintained_refusal": 0, "valid_fulfillment": 0,
                "degenerate/other": 0, "unjudged": 0}
         ben = {"valid_fulfillment": 0, "refusal": 0, "degenerate/other": 0,

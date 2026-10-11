@@ -6,6 +6,7 @@ Usage: run_pass.py <pass_label> [extra serve flags...]
 Honors host rules: preflight pgrep/memory_pressure, always stops the server.
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -13,13 +14,23 @@ import time
 import urllib.error
 import urllib.request
 
-WORKTREE = "/var/folders/bd/84n3hd3120sdr990qkfbgvj00000gp/T/opencode/hf2q-glp-fix"
-HF2Q = f"{WORKTREE}/target/release/hf2q"
-DEEPSEEK = "/opt/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-agentic-q2.gguf"
-PORT = 18085
+# Current paths (2026-10-10, #298 residual-site re-measure); env-overridable so
+# the harness survives model/location moves without edits. Earlier runs
+# hard-coded a since-deleted worktree and /opt/hf2q/models/deepseek4 (the
+# model moved to ~/.local/share/hf2q/models/deepseek4).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+HF2Q = os.environ.get("HF2Q_BIN", "/opt/hf2q/target/release/hf2q")
+DEEPSEEK = os.environ.get(
+    "DEEPSEEK_GGUF",
+    "/Users/robert/.local/share/hf2q/models/deepseek4/"
+    "DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf",
+)
+PORT = int(os.environ.get("GATE34_PORT", "18085"))
 BASE = f"http://127.0.0.1:{PORT}"
-GATE = f"{WORKTREE}/scripts/grammar_probe/gate34"
-PANEL = f"{GATE}/panel.tsv"
+# Run directory: pass label subdirs are written here. Default: this script's
+# dir (the original gate34 layout). Set GATE34_RUN_DIR for a labeled sub-run.
+GATE = os.environ.get("GATE34_RUN_DIR", _HERE)
+PANEL = os.environ.get("GATE34_PANEL", os.path.join(_HERE, "panel.tsv"))
 
 
 def die(msg):
