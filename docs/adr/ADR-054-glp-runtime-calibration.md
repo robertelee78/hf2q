@@ -25,6 +25,17 @@
   apply site (the FFN writer) or application at the capture site (the
   post-layer residual). Artifacts: `scripts/grammar_probe/gate34/`
   (per-pass results/verdicts/meta, identity manifest, summary).
+   **Follow-up item 3 (2026-10-10, #298): the capture-site application is
+   now measured too — a second null.** The calibrated `d_disp` applied at
+   its capture site (`residual_stream_post_layer`, both `hidden` and tiled
+   `hc*hidden` widths, alpha 1.0, same 48-prompt panel and APEX judge,
+   144/144 judged, 0 judge errors) does not reduce refusals (adversarial
+   maintained 28 → 30 → 30; valid fulfillments 3 → 1) with benign
+   capability intact (0 refusals in every arm). Two sites × both widths ×
+   null: the calibrated `d_disp` stream-0 direction is behaviorally inert
+   as a refusal suppressor on this panel at both its capture and apply
+   sites; the calibrated-vector line closes honestly (see Deferred
+   follow-ups item 3 and `scripts/grammar_probe/gate34/residual-site/`).
 - **Date:** 2026-09-04 (revised 2026-09-09: forced-capture design replaces
   generation-based capture — teacher-forced pinned prefixes, prefill-only
   forward passes, targeted decision positions; capture cost collapses from
@@ -214,4 +225,30 @@ conformant reader (hf2q `--glp`, or the weightless hotfix path).
    `hc*hidden` arm tiles the `hidden`-width `d_disp` across streams first
    (a width the mHC helper validates); a per-stream capture is the
    escalation only if the tiled arm shifts.
+    **MEASURED (2026-10-10, #298): second null — the calibrated-vector line
+    closes honestly.** Fresh calibrate export on the current local DeepSeek
+    artifact (43 layers, hidden=4096, 4 HC streams, layer 29 →
+    `direction.29`; live-dose canary shift 0.201927, zero-dose identical),
+    hook rewritten to `residual_stream_post_layer` (metadata-only; direction
+    tensors byte-identical so `glp.content_sha256` stays valid), plus the
+    tiled arm (dims 4096 → 16384, stream-0 vector ×4, content hash
+    recomputed over the tiled bytes). Same 48-prompt panel (panel.tsv and
+    prompts_512.tsv byte-identical to the 2026-09-10 run), temperature 0,
+    thinking off, alpha 1.0, APEX judge, 144/144 judged, 0 judge errors:
+    adversarial maintained refusals 28 (baseline) → 30 (hidden) → 30
+    (hc*hidden) — flat to marginally UP (h007, h027 flipped
+    valid_fulfillment → maintained_refusal; adversarial valid fulfillments
+    3 → 1); benign capability intact (0 refusals in every arm, the only
+    benign label flip is the known 256-token truncation artifact). The
+    vector is output-live at the capture site (42/48 generations differ
+    from baseline) but behaviorally inert as a refusal suppressor, at both
+    sites and both widths. The tiled arm equals the hidden arm exactly
+    (48/48 generations and verdicts identical — the mHC per-stream
+    normalization makes tiled copies the same steering; the arm's value is
+    the per-stream width plumbing proof: bound at width=16384, hook
+    `residual_stream_post_layer`, and steered correctly on a live serve);
+    it does not shift, so the per-stream-capture escalation is not
+    indicated. Artifacts: `scripts/grammar_probe/gate34/residual-site/`
+    (per-pass results/verdicts/meta/logs, summary, identity manifest) +
+    the committed rewrite/tile tool `gate34/rewrite_glp_hook.py`.
 

@@ -1,0 +1,7 @@
+82fbb520d552df1f535a1f7f78e04813cdd2f05e083c2168b2096daca0b5c6a7  /opt/hf2q/target/release/hf2q
+21add0e6f88627c9e6be4965ba8220d116a45e3a62fbdc38ffbf5d703734ed17  /opt/hf2q/target/gate34-residual/calibrated.glp.gguf
+ea938df6e0935199426af19b36e06eac460a7242b63390aefce35db0a39cb815  /opt/hf2q/target/gate34-residual/residual-hidden.glp.gguf
+2e07fb3c58b8560ecc126b1a7fc233b26bffe0312cfc5ef90782dc6696c3869b  /opt/hf2q/target/gate34-residual/residual-hc-tiled.glp.gguf
+50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6  /Users/robert/.local/share/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf
+fb3303ea251fa05e7bc470070d692d91aed9c726d86718782226bd2629bd0611  scripts/grammar_probe/prompts_512.tsv
+c492720666f8a0fdb02be3985dfc17b02711f1dee7b9a8ba1afaced55871c7d0  scripts/grammar_probe/gate34/panel.tsv
