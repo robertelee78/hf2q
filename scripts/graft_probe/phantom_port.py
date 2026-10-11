@@ -684,7 +684,8 @@ def cmd_to_gguf(args):
         facts = {
             "rope_theta": text.get("rope_theta_global", text.get("rope_theta", 1e6)),
             "rotary_dim": int(text.get("rope_local_base_freq", 0) and 0) or text.get(
-                "rope_embedding_head_dim", text.get("head_dim", 256)),
+                "rope_embedding_head_dim", text.get(
+                    "global_head_dim", text.get("head_dim", 256))),
             "n_kv_heads": text.get("num_global_key_value_heads", text.get("num_key_value_heads")),
             "head_dim": text.get("global_head_dim", text.get("head_dim")),
             "layers": layers,
