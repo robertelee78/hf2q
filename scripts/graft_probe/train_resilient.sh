@@ -17,7 +17,10 @@ set -u
 MODEL_KEY="${1:?usage: train_resilient.sh <model-key> [max-attempts]}"
 MAX_ATTEMPTS="${2:-50}"
 PY=/opt/phantom-kv/.venv/bin/python
-PORT=scripts/graft_probe/phantom_port.py
+# Location-independent: run the phantom_port.py beside this script (a
+# worktree run must not fall back to the primary checkout's registry —
+# lane keys added on a branch exist only there).
+PORT="$(cd "$(dirname "$0")" && pwd)/phantom_port.py"
 ART=/opt/hf2q/artifacts/grafts/$MODEL_KEY
 
 mkdir -p "$ART/train"
@@ -48,7 +51,7 @@ if [ ! -f "$ART/train/ckpt_final.pt" ]; then
     exit 1
 fi
 
-cd /opt/hf2q || exit 1
+cd "$(dirname "$PORT")/../.." || exit 1
 "$PY" "$PORT" compile --model="$MODEL_KEY" \
     && "$PY" "$PORT" eval --model="$MODEL_KEY" \
     && "$PY" "$PORT" to-gguf --model="$MODEL_KEY" \

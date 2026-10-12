@@ -100,6 +100,22 @@ MODELS = {
         "gguf_identity_name": "Qwen3.6-35B-A3B",
         "gguf_facts": None,  # filled from the model config at to-gguf time
     },
+    # The #310 requalification row for the 35B flagship family. The
+    # previously staged /opt/hf2q/models/sources/Qwen3.6-35B-A3B turned
+    # out to be the Abliterix-EGA ABLITERATED variant (0/60 base
+    # refusals — no refusal headroom; the deterministic trainer
+    # crash-loops with an empty `sup` pool on it, measured 2026-10-11).
+    # The comparable flagship row runs on the stock
+    # Qwen/Qwen3.6-35B-A3B staged beside it.
+    "qwen36-35b-stock": {
+        "path": "/opt/hf2q/models/sources/Qwen3.6-35B-A3B-stock",
+        "eot_token": "<|im_end|>",
+        "template": "split",
+        "mrope_interleaved": True,
+        "art": "/opt/hf2q/artifacts/grafts/qwen36-35b-stock",
+        "gguf_identity_name": "Qwen3.6-35B-A3B",
+        "gguf_facts": None,  # filled from the model config at to-gguf time
+    },
     "gemma4-26b": {
         "path": "/opt/hf2q/models/sources/gemma-4-26B-A4B-it",
         "eot_token": "<turn|>",
