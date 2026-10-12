@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.25] — 2026-10-12
+
+### Added
+
+- The KV-cache graft surface is live on every served family — Gemma 4
+  (the trained-bank product scoreboard: harmful refusals 36/60 → 1/60 with
+  the harmless suite fully preserved, on the unmodified stock artifact) and
+  DeepSeek-V4's compressed_kv site (the reader/bind/splice plus the hardware
+  canary matrix ALL PASS on both schedulers; the behavioral scoreboard is
+  pending the reference training, which needs ≥320 GB of memory — see Known
+  issues) (ADR-059, #303-#310).
+- Per-family GLP apply arms: Qwen's `ffn_out_pre_residual` writer site and
+  DeepSeek-V4's `residual_stream_post_layer` post-layer site (project-mode
+  mHC, both widths), with bind accepting each family's supported site set
+  (ADR-053, #295-#297).
+- `hf2q calibrate`-measured GLP re-measurement at the capture site
+  (ADR-054 follow-up: a second null, honestly recorded — the calibrated
+  vector stays a candidate, not a validated derivation) (#298).
+- The requalification scoreboard: StrongREJECT two-judge plus a 256-prompt
+  harmful suite and capability checks on Gemma 4 (60.9% → 26.9% ensemble
+  refusals, capability preserved), Qwen 4B (63.6% → 25.3%, capability
+  preserved — the reference's GSM8K cost did not reproduce at this
+  site/dose), and the Qwen 35B flagship row (67.5% → 18.5%, capability
+  preserved) (#310).
+
+### Fixed
+
+- DeepSeek-V4 `--kv-persist` now works: the exact recovery anchor persists
+  as one prefix image per conversation and hydrates on a cold miss on both
+  schedulers (a restart resumes in seconds; corrupt or missing files only
+  cause a cold prefill; no cross-conversation leaks) (ADR-062 D4, #293).
+- Reasoning controls behave the same on every family: one effort table
+  (none/minimal off, low 512, medium 2048, high 8192, xhigh/max unbounded;
+  DeepSeek medium→high), the `reasoning.{effort,enabled,max_tokens}`
+  aliases, one shared budget enforcer including Gemma 4, server defaults
+  that never cause a 4xx, and `none` as an accepted no-op everywhere
+  (ADR-062 D5, #294).
+
+### Known issues
+
+- The DeepSeek-V4 compressed_kv graft's behavioral scoreboard is pending:
+  the phantom-kv reference training needs ≥320 GB of unified memory (the
+  FP8 checkpoint dequantizes to ~310 GB bf16) or a CUDA/FP8 host; the
+  mechanism, canaries, and toolchain are landed and verified (#309, moves
+  to v0.1.26).
+- Gemma 4 under an explicit `--scheduler fifo-serial` returns HTTP 500 on
+  the second sequential request (a resumable-prefill capacity check) — the
+  default scheduler is unaffected; filed as #325.
+
 ## [0.1.24] — 2026-10-09
 
 ### Added
