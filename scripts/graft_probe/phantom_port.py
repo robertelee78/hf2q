@@ -113,7 +113,12 @@ MODELS = {
         "template": "split",
         "mrope_interleaved": True,
         "art": "/opt/hf2q/artifacts/grafts/qwen36-35b-stock",
-        "gguf_identity_name": "Qwen3.6-35B-A3B",
+        # The stock re-staging converts as "Qwen3.6 35B A3B Stock" (the
+        # serve artifact's general.name; the suffix distinguishes it from
+        # the abliterated staging). The graft's base-model assertion must
+        # match THAT identity, not the abliterated lane's, or the serve
+        # graft bind aborts: GLP base model mismatch (measured 2026-10-12).
+        "gguf_identity_name": "Qwen3.6-35B-A3B-Stock",
         "gguf_facts": None,  # filled from the model config at to-gguf time
     },
     "gemma4-26b": {
@@ -691,19 +696,33 @@ def cmd_to_gguf(args):
     facts = MODELS[key]["gguf_facts"]
     if facts is None:
         # Derive from the HF config: full-attn layer indices + the
-        # GLOBAL (full-attention) geometry + rope theta.
+        # GLOBAL (full-attention) geometry + rope theta. The rope facts
+        # mirror the canonical hf2q converter derivation
+        # (src/convert/arch/qwen35moe_full.rs): rope.freq_base reads
+        # rope_parameters.rope_theta first (Qwen 3.5+ nests the rope
+        # dict there), and rope.dimension_count =
+        # int(rope_dim * partial_rotary_factor) with rope_dim = head_dim.
+        # The bank's RoPE identity must match what the converter wrote or
+        # the serve --kv-graft bind aborts (measured 2026-10-12: theta
+        # 1e6-vs-1e7 and rotary 256-vs-64 on the qwen36-35b-stock lane).
         import json as _json
         cfg = _json.load(open(MODELS[key]["path"] + "/config.json"))
         text = cfg.get("text_config", cfg)
         layer_types = text["layer_types"]
         layers = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+        rope = text.get("rope_parameters") or {}
+        head_dim = text.get("global_head_dim", text.get("head_dim"))
+        partial = text.get("partial_rotary_factor", rope.get("partial_rotary_factor"))
         facts = {
-            "rope_theta": text.get("rope_theta_global", text.get("rope_theta", 1e6)),
-            "rotary_dim": int(text.get("rope_local_base_freq", 0) and 0) or text.get(
-                "rope_embedding_head_dim", text.get(
-                    "global_head_dim", text.get("head_dim", 256))),
+            "rope_theta": text.get(
+                "rope_theta_global",
+                rope.get("rope_theta", text.get("rope_theta", 1e6))),
+            "rotary_dim": (int(head_dim * partial) if partial is not None else
+                           int(text.get("rope_local_base_freq", 0) and 0) or text.get(
+                               "rope_embedding_head_dim", text.get(
+                                   "global_head_dim", text.get("head_dim", 256)))),
             "n_kv_heads": text.get("num_global_key_value_heads", text.get("num_key_value_heads")),
-            "head_dim": text.get("global_head_dim", text.get("head_dim")),
+            "head_dim": head_dim,
             "layers": layers,
         }
         MODELS[key]["gguf_facts"] = facts
