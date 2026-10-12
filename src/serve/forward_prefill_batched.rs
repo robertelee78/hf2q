@@ -6794,8 +6794,11 @@ impl MlxModelWeights {
         // bytes from shapes BEFORE the snapshot alloc+memcpy; skip when
         // the entry cannot fit the registry budget (97K-token dual-leg
         // ≈ 64 GB → swap-storm, measured live 2026-08-03).
-        let snap_cap_est =
-            sw.max(seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 });
+        let snap_cap_est = sw.max(
+            crate::serve::forward_prefill::gemma_flash_attn_vec_capacity(
+                seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 },
+            ),
+        );
         let lcp_est_bytes: u64 = {
             let dense: u64 = self
                 .layers
@@ -6844,12 +6847,29 @@ impl MlxModelWeights {
         // 2031). +4096 under long-resume keeps typical turn
         // growth admissible; only the snapshot over-allocates,
         // the per-request live buffers stay exact.
+        //
+        // Issue #325 (2026-10-12): the linear terms round through
+        // the final 32-row `flash_attn_vec` tile (the non-batched
+        // sibling at forward_prefill.rs ~line 3138 already did).
+        // The resume consumer demands the TILE-ROUNDED capacity
+        // (`gemma_kv_capacity_plan(...).required_linear`), so an
+        // unrounded snap_cap admits an entry that fails the resume
+        // check by pure rounding drift: first request 24 prompt
+        // tokens + 2048 max_tokens cached dense_kvs at 2072, the
+        // second sequential fifo-serial request required 2080 →
+        // `forward_prefill resume: cached dense_kvs[layer=5]
+        // capacity 2072 < required 2080` → HTTP 500.  Both the
+        // dense and hybrid snapshot legs share this snap_cap.
         let snap_cap = sw
-            .max(seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 })
+            .max(
+                crate::serve::forward_prefill::gemma_flash_attn_vec_capacity(
+                    seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 },
+                ),
+            )
             // ADR-059: FULL-layer hybrid rows are graft + prompt — the
             // snapshot boundary and capacity cover them; sliding rings
             // carry prompt-only rows.
-            .max(graft_len + seq_len);
+            .max(crate::serve::forward_prefill::gemma_flash_attn_vec_capacity(graft_len + seq_len));
         let dense_snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>> =
             if lcp_snapshots_on {
                 let mut snap: Vec<std::sync::Arc<DenseKvBuffers>> = Vec::with_capacity(num_layers);

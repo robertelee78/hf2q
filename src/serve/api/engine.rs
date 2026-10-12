@@ -23783,9 +23783,36 @@ fn generate_once_with_soft_tokens(
                                 // graft adds `graft_len` physical rows on
                                 // every full-attention layer, so the
                                 // restored prefix must cover them too.
-                                let new_linear =
-                                    graft_len + prompt_tokens.len() + params.max_tokens.max(1);
+                                //
+                                // Issue #325 (2026-10-12): the linear
+                                // requirement must round through the
+                                // final 32-row `flash_attn_vec` tile —
+                                // the SAME formula forward_prefill's
+                                // resume branch demands
+                                // (`gemma_kv_capacity_plan(...).required_linear`).
+                                // The prior unrounded `graft + prompt +
+                                // max_tokens` admitted registry entries
+                                // whose capacity satisfied the unrounded
+                                // value but not the tile-rounded one
+                                // (batched-route snapshots sized snap_cap
+                                // without tile rounding: cached 2072 <
+                                // required 2080 → second sequential
+                                // fifo-serial request 500'd).  A failed
+                                // check here degrades to fresh prefill
+                                // below — never a 500 from a cache hit.
                                 let model_sw = loaded.weights.sliding_window.max(1);
+                                let lr_long = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+                                    && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                                    && (crate::debug::INVESTIGATION_ENV.use_dense
+                                        || crate::debug::INVESTIGATION_ENV.hybrid_kv);
+                                let new_linear =
+                                    crate::serve::forward_prefill::gemma_kv_capacity_plan(
+                                        graft_len + prompt_tokens.len(),
+                                        params.max_tokens.max(1),
+                                        model_sw,
+                                        lr_long,
+                                    )
+                                    .required_linear;
                                 let agg_ok = prefix.linear_capacity >= new_linear
                                     && prefix.sliding_window == model_sw;
                                 // Codex audit MED issue #2: per-layer
@@ -23833,11 +23860,11 @@ fn generate_once_with_soft_tokens(
                                     // "gemma-hybrid-lcp": long-resume admits
                                     // dense OR production hybrid (kernel
                                     // mask_type=2 verified for both legs).
-                                    let lr_long = crate::debug::INVESTIGATION_ENV
-                                        .kv_lcp_long_resume
-                                        && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                                        && (crate::debug::INVESTIGATION_ENV.use_dense
-                                            || crate::debug::INVESTIGATION_ENV.hybrid_kv);
+                                    // Issue #325: `lr_long` + the tile-rounded
+                                    // `new_linear` are computed above the
+                                    // aggregate check; `model_sw.max(new_linear)`
+                                    // now equals the alloc formula's
+                                    // `required_sliding` exactly.
                                     prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
                                         let layer = &loaded.weights.layers[li];
                                         let layer_is_ring = matches!(
@@ -28965,9 +28992,28 @@ fn generate_stream_once(
                                 // layer — the restored prefix must cover
                                 // them too (the streaming twin of the
                                 // unary probe site).
-                                let new_linear =
-                                    graft_len + prompt_tokens.len() + params.max_tokens.max(1);
+                                //
+                                // Issue #325 (2026-10-12): tile-rounded
+                                // linear requirement via the SAME
+                                // `gemma_kv_capacity_plan` formula the
+                                // resume consumer demands (the unary
+                                // probe site's comment documents the
+                                // unrounded-admission failure); a failed
+                                // check degrades to fresh prefill below,
+                                // never a 500 from a cache hit.
                                 let model_sw = loaded.weights.sliding_window.max(1);
+                                let lr_long = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+                                    && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                                    && (crate::debug::INVESTIGATION_ENV.use_dense
+                                        || crate::debug::INVESTIGATION_ENV.hybrid_kv);
+                                let new_linear =
+                                    crate::serve::forward_prefill::gemma_kv_capacity_plan(
+                                        graft_len + prompt_tokens.len(),
+                                        params.max_tokens.max(1),
+                                        model_sw,
+                                        lr_long,
+                                    )
+                                    .required_linear;
                                 let agg_ok = prefix.linear_capacity >= new_linear
                                     && prefix.sliding_window == model_sw;
                                 // Per-layer cap + is_sliding check (same
@@ -29007,11 +29053,11 @@ fn generate_stream_once(
                                     // "gemma-hybrid-lcp": long-resume admits
                                     // dense OR production hybrid (kernel
                                     // mask_type=2 verified for both legs).
-                                    let lr_long = crate::debug::INVESTIGATION_ENV
-                                        .kv_lcp_long_resume
-                                        && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                                        && (crate::debug::INVESTIGATION_ENV.use_dense
-                                            || crate::debug::INVESTIGATION_ENV.hybrid_kv);
+                                    // Issue #325: `lr_long` + the tile-rounded
+                                    // `new_linear` are computed above the
+                                    // aggregate check; `model_sw.max(new_linear)`
+                                    // now equals the alloc formula's
+                                    // `required_sliding` exactly.
                                     prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
                                         let layer = &loaded.weights.layers[li];
                                         let layer_is_ring = matches!(
