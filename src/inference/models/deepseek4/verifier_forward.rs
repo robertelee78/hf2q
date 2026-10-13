@@ -34,6 +34,33 @@ struct CooperativePrefillLayout {
 
 static STAGE_PROFILE_CAPTURED: AtomicBool = AtomicBool::new(false);
 
+/// Which spec site one ADR-054 calibration prefill captures at (#300).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrefillCaptureSite {
+    /// The post-layer complete HC state `[hc, hidden]` at the committed
+    /// position (the original ADR-054 capture arm).
+    ResidualHcState,
+    /// The FFN writer row `[hidden]` (`ffn_output = moe + shared`)
+    /// immediately before the `dispatch_hc_post` fold — the exact tensor
+    /// the `ffn_out_pre_residual` steering mutates, so a writer-site
+    /// capture is capture-at-the-apply-site by construction.
+    FfnWriterPreResidual,
+}
+
+/// One calibration capture request threaded through the single-layer
+/// prefill path: read the named site at `layer` (last sequence position)
+/// into `out` after the layer's session commits.
+pub(crate) struct PrefillCapture<'a> {
+    pub layer: usize,
+    pub site: PrefillCaptureSite,
+    pub out: &'a mut Vec<f32>,
+    /// Filled by the FFN path (an Arc clone of the writer buffer, taken
+    /// while the original binding is alive) when `site` is the FFN writer;
+    /// read host-side after the session commits, before any pool
+    /// recycling this layer.
+    pub writer_buffer: Option<MlxBuffer>,
+}
+
 pub(super) fn publish_state_after_gate<State>(
     state: &mut State,
     commit_gate: impl FnOnce() -> Result<()>,
@@ -289,7 +316,47 @@ impl Deepseek4Model {
         cache: &mut Deepseek4Cache,
         layer: usize,
     ) -> Result<Vec<f32>> {
-        anyhow::ensure!(!token_ids.is_empty(), "DeepSeek-V4 calibration prompt is empty");
+        self.forward_verifier_prefill_capture_at(
+            token_ids,
+            cache,
+            layer,
+            PrefillCaptureSite::ResidualHcState,
+        )
+    }
+
+    /// ADR-054 per-family calibration (#300): prefill with calibration
+    /// capture at the FFN writer — returns the `[hidden]` (f32) FFN-writer
+    /// row (`ffn_output = moe + shared`, the exact tensor the
+    /// `ffn_out_pre_residual` steering mutates, read immediately before
+    /// the `dispatch_hc_post` fold) at the last sequence position for one
+    /// target layer. Same discipline as the residual capture: forced
+    /// single-layer path, fresh per-prompt cache, cursor unpublished on
+    /// success, cache poisoned on error.
+    pub fn forward_verifier_prefill_capture_ffn_writer(
+        &mut self,
+        token_ids: &[u32],
+        cache: &mut Deepseek4Cache,
+        layer: usize,
+    ) -> Result<Vec<f32>> {
+        self.forward_verifier_prefill_capture_at(
+            token_ids,
+            cache,
+            layer,
+            PrefillCaptureSite::FfnWriterPreResidual,
+        )
+    }
+
+    fn forward_verifier_prefill_capture_at(
+        &mut self,
+        token_ids: &[u32],
+        cache: &mut Deepseek4Cache,
+        layer: usize,
+        site: PrefillCaptureSite,
+    ) -> Result<Vec<f32>> {
+        anyhow::ensure!(
+            !token_ids.is_empty(),
+            "DeepSeek-V4 calibration prompt is empty"
+        );
         anyhow::ensure!(
             layer < self.cfg.num_hidden_layers as usize,
             "calibration capture layer {layer} out of range (num_layers={})",
@@ -303,8 +370,12 @@ impl Deepseek4Model {
             token_ids,
             cache,
             &span,
-            Some(layer),
-            Some(&mut captured),
+            Some(PrefillCapture {
+                layer,
+                site,
+                out: &mut captured,
+                writer_buffer: None,
+            }),
         );
         match result {
             Ok(_state) => {
@@ -412,7 +483,7 @@ impl Deepseek4Model {
         if profile_stages {
             mlx_native::kernel_profile::reset();
         }
-        let result = self.forward_verifier_prefill_uncommitted(token_ids, cache, &span, None, None);
+        let result = self.forward_verifier_prefill_uncommitted(token_ids, cache, &span, None);
         if profile_stages {
             eprintln!(
                 "DeepSeek-V4 compressed prefill GPU stages at position {} for {} rows:",
@@ -680,6 +751,10 @@ impl Deepseek4Model {
                         Some(&mut session),
                         Some(reusable_states[layer % reusable_states.len()].clone()),
                         id_mm_scratch.as_mut(),
+                        // Cooperative cohort prefill never carries a
+                        // calibration capture (capture is single-sequence,
+                        // fresh-cache-per-prompt by contract).
+                        None,
                     )?;
                     session.finish().with_context(|| {
                         format!("execute DeepSeek-V4 cooperative prefill layer-{layer} FFN")
@@ -725,8 +800,7 @@ impl Deepseek4Model {
         token_ids: &[u32],
         cache: &mut Deepseek4Cache,
         span: &CacheSpan,
-        capture_layer: Option<usize>,
-        mut capture_out: Option<&mut Vec<f32>>,
+        mut capture: Option<PrefillCapture<'_>>,
     ) -> Result<MlxBuffer> {
         let layers = self.cfg.num_hidden_layers as usize;
         let executor = GraphExecutor::new(self.ctx.device().clone());
@@ -738,11 +812,15 @@ impl Deepseek4Model {
         // session; the graph reorder pass requires complete buffer-range
         // metadata that the GLP kernel does not declare. Disable reorder
         // when a vector is bound — correctness over the reorder optimization.
-        let graph_reorder = if self.glp.is_some() { false } else { graph_reorder_enabled()? };
+        let graph_reorder = if self.glp.is_some() {
+            false
+        } else {
+            graph_reorder_enabled()?
+        };
         let graph_layers_per_command_buffer = graph_layers_per_command_buffer(
             layers,
             graph_reorder,
-            profile_timing || dump_intermediates || capture_layer.is_some(),
+            profile_timing || dump_intermediates || capture.is_some(),
         )?;
         if graph_layers_per_command_buffer > 1 {
             anyhow::ensure!(
@@ -817,6 +895,10 @@ impl Deepseek4Model {
                             id_mm_scratch.as_mut(),
                             &mut session,
                             &mut completion,
+                            // Calibration capture forces the single-layer
+                            // path above, so the multi-layer graph never
+                            // carries a writer capture.
+                            None,
                         );
                         if layer_result.is_ok() && layer + 1 < end {
                             session.barrier();
@@ -856,6 +938,20 @@ impl Deepseek4Model {
                     executor.begin()
                 }
                 .with_context(|| format!("begin DeepSeek-V4 prefill layer {layer}"))?;
+                // ADR-054 per-family calibration (#300): at the target
+                // layer, a writer-site capture needs the FFN writer buffer
+                // handed back for a host read after this session commits —
+                // thread the slot into the FFN encode. The borrow ends when
+                // the encode returns; the capture read below re-borrows.
+                let writer_slot = match capture.as_mut() {
+                    Some(cap)
+                        if cap.layer == layer
+                            && cap.site == PrefillCaptureSite::FfnWriterPreResidual =>
+                    {
+                        Some(&mut cap.writer_buffer)
+                    }
+                    _ => None,
+                };
                 let next_state = self.encode_verifier_layer_prefill(
                     token_ids,
                     layer,
@@ -866,6 +962,7 @@ impl Deepseek4Model {
                     id_mm_scratch.as_mut(),
                     &mut session,
                     &mut completion,
+                    writer_slot,
                 )?;
                 if graph_reorder {
                     let (reordered, barriers) = session
@@ -891,28 +988,56 @@ impl Deepseek4Model {
                         .with_context(|| format!("execute DeepSeek-V4 prefill layer {layer}"))?;
                 }
                 completion.validate_moe_statuses()?;
-                // ADR-054 calibration capture: read the post-layer complete
-                // HC state at the last sequence position (the committed
-                // state), host-side f32. Runs only in the forced single-layer
-                // path (capture forces single-layer above, same as dumps).
-                if let (Some(cl), Some(out)) = (capture_layer, capture_out.as_deref_mut()) {
-                    if cl == layer {
-                        let last = self
-                            .last_token_state(&next_state)
-                            .context("view DeepSeek-V4 calibration capture state")?;
-                        let data: &[f32] = last
-                            .as_logical_slice()
-                            .map_err(|e| anyhow::anyhow!("calibration capture read: {e}"))?;
-                        let elements =
-                            self.cfg.hyper_connection_count as usize * self.cfg.hidden_size as usize;
-                        anyhow::ensure!(
-                            data.len() >= elements,
-                            "calibration capture: last-token state has {} f32, expected {}",
-                            data.len(),
-                            elements
-                        );
-                        out.clear();
-                        out.extend_from_slice(&data[..elements]);
+                // ADR-054 calibration capture: read the requested site at
+                // the last sequence position (the committed state),
+                // host-side f32. Runs only in the forced single-layer path
+                // (capture forces single-layer above, same as dumps), after
+                // this layer's session has committed and before the
+                // per-layer pool recycle below.
+                if let Some(cap) = capture.as_mut() {
+                    if cap.layer == layer {
+                        match cap.site {
+                            PrefillCaptureSite::ResidualHcState => {
+                                let last = self
+                                    .last_token_state(&next_state)
+                                    .context("view DeepSeek-V4 calibration capture state")?;
+                                let data: &[f32] = last.as_logical_slice().map_err(|e| {
+                                    anyhow::anyhow!("calibration capture read: {e}")
+                                })?;
+                                let elements = self.cfg.hyper_connection_count as usize
+                                    * self.cfg.hidden_size as usize;
+                                anyhow::ensure!(
+                                    data.len() >= elements,
+                                    "calibration capture: last-token state has {} f32, expected {}",
+                                    data.len(),
+                                    elements
+                                );
+                                cap.out.clear();
+                                cap.out.extend_from_slice(&data[..elements]);
+                            }
+                            PrefillCaptureSite::FfnWriterPreResidual => {
+                                let buffer = cap
+                                    .writer_buffer
+                                    .as_ref()
+                                    .context("DeepSeek-V4 FFN-writer capture buffer was not produced at the target layer")?;
+                                let data: &[f32] = buffer
+                                    .as_logical_slice()
+                                    .map_err(|e| anyhow::anyhow!("FFN-writer capture read: {e}"))?;
+                                let hidden = self.cfg.hidden_size as usize;
+                                let rows = token_ids.len();
+                                anyhow::ensure!(
+                                    data.len() >= rows * hidden,
+                                    "FFN-writer capture: buffer has {} f32, expected {} x {}",
+                                    data.len(),
+                                    rows,
+                                    hidden
+                                );
+                                let last_row = (rows - 1) * hidden;
+                                cap.out.clear();
+                                cap.out
+                                    .extend_from_slice(&data[last_row..last_row + hidden]);
+                            }
+                        }
                     }
                 }
                 self.dump_verifier_layer_state(
@@ -941,6 +1066,7 @@ impl Deepseek4Model {
         state.context("DeepSeek-V4 prefill encoded zero layers")
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_verifier_layer_prefill(
         &mut self,
         token_ids: &[u32],
@@ -952,6 +1078,7 @@ impl Deepseek4Model {
         id_mm_scratch: Option<&mut [IdMmScratch; 2]>,
         session: &mut GraphSession<'_>,
         completion: &mut SubmissionChain,
+        writer_capture: Option<&mut Option<MlxBuffer>>,
     ) -> Result<MlxBuffer> {
         let dump_attention = std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_some();
         let attention_session = (!dump_attention).then_some(&mut *session);
@@ -1014,6 +1141,7 @@ impl Deepseek4Model {
             Some(session),
             Some(output_state),
             id_mm_scratch,
+            writer_capture,
         )
         .with_context(|| format!("encode DeepSeek-V4 prefill layer-{layer} FFN"))
     }

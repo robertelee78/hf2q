@@ -1028,13 +1028,24 @@ W6V2 grammar when no explicit request constraint is supplied. Controlled
 measurements must still hold the actual grammar, model, prompts, sampling
 settings, and budget fixed while varying steering.
 
-**Calibration.** `hf2q calibrate <model.gguf>` currently uses DeepSeek-V4 and
-exports a normalized harmful-versus-harmless prompt direction. Its metadata
-identifies derivation from the post-layer residual and application at the FFN
-writer. Pinned-prefix diagnostics and zero-dose/live-dose logit canaries remain
-separate from behavioral validation. The later tested dose ladder showed no
-refusal reduction under its recorded conditions; truncation limits the
-capability assessment.
+**Calibration.** `hf2q calibrate <model.gguf>` works for every served GLP family —
+qwen35, qwen35moe, and deepseek4, the same family set as `--glp` serving; gemma4
+has no GLP family and is refused at both surfaces. It exports a normalized
+harmful-versus-harmless prompt direction plus a sidecar report (per-stream
+distill norms, the per-family refusal register, and the canary numbers). The
+apply and capture sites are explicit dials: `--hook-point {writer|residual}`
+sets the export's `glp.hook_point` and `--capture-site {writer|residual}` sets
+where the direction is derived (`glp.derived_at`), defaulting to the family's
+published pair — deepseek4 keeps the GLP-29-declared pair (applied at the FFN
+writer, derived at the post-layer residual); qwen defaults to same-site
+capture/apply at the post-layer residual. A per-family register report (fixed
+refusal probes, greedy, family chat template) measures the model's refusal
+openings and supplies the pinned-refusal-prefix default. Pinned-prefix
+diagnostics and zero-dose/live-dose logit canaries remain separate from
+behavioral validation. The tested dose ladders showed no refusal reduction
+under their recorded conditions; the site options are plumbing, not
+effectiveness claims, and the same-site measurement ladder
+(ADR-054's deferred follow-up 4) owns that question.
 
 The corresponding `hf2q chat` flags configure a server that chat starts;
 they do not reconfigure an existing endpoint selected with `--url` or discovery.

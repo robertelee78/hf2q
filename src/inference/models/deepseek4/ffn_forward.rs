@@ -82,10 +82,20 @@ impl Deepseek4Model {
             shared_session,
             None,
             None,
+            None,
         )
     }
 
     /// Run one verifier FFN layer for a complete prompt in layer-major order.
+    ///
+    /// `writer_capture` (#300, ADR-054 per-family calibration): when
+    /// `Some`, an Arc clone of the FFN writer buffer (`ffn_output = moe +
+    /// shared`, the exact tensor the `ffn_out_pre_residual` steering
+    /// mutates immediately before `dispatch_hc_post`) is placed into the
+    /// slot after this layer's encode, for a host-side read after the
+    /// caller's session commits. `None` on every existing path — the
+    /// buffer is handed back only for a writer-site calibration capture.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_ffn_rows(
         &mut self,
         state: &MlxBuffer,
@@ -95,6 +105,7 @@ impl Deepseek4Model {
         shared_session: Option<&mut GraphSession<'_>>,
         reusable_output_state: Option<MlxBuffer>,
         mut id_mm_scratch: Option<&mut [IdMmScratch; 2]>,
+        writer_capture: Option<&mut Option<MlxBuffer>>,
     ) -> Result<MlxBuffer> {
         if layer >= self.cfg.num_hidden_layers as usize {
             bail!(
@@ -721,6 +732,18 @@ impl Deepseek4Model {
                 in_flight,
                 format!("execute DeepSeek-V4 layer {layer} FFN"),
             )?;
+        }
+        // ADR-054 per-family calibration (#300): hand the FFN writer buffer
+        // back for a writer-site capture — an Arc clone taken while the
+        // original binding is still alive, read host-side by the caller
+        // after its session commits and before any pool recycling this
+        // layer. `dispatch_hc_post` only reads `ffn_output`, so the buffer
+        // still holds the writer values then. Off (`None`) on every
+        // existing path.
+        if let Some(slot) = writer_capture {
+            if slot.is_none() {
+                *slot = Some(ffn_output.clone());
+            }
         }
         if inspect_status && invalid_status.as_logical_slice::<u32>()?[0] != 0 {
             bail!("DeepSeek-V4 layer {layer} MoE kernels rejected invalid routing data");

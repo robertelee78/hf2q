@@ -610,9 +610,15 @@ fn render_chat_template(
 ///   tool-call detection path.
 /// - `tojson` filter — common HF template helper.
 /// - `raise_exception(msg)` function — Qwen3.6 guard for missing user query
-///   (we always supply a user message, so this code path is unreachable; we
-///   log a warning and continue rather than aborting template rendering).
-fn render_jinja_template(
+///   (we always supply a user message, so this code path is unreachable in
+///   practice; we log a warning and continue rather than aborting template
+///   rendering).
+///
+/// `pub(crate)`: also the family chat-template surface for `hf2q calibrate`'s
+/// register probes (ADR-054 step 6, #300) — the probes render through the
+/// SAME template runtime as serving so the measured register is the
+/// deployment register.
+pub(crate) fn render_jinja_template(
     template_str: &str,
     user_prompt: &str,
     enable_thinking: Option<bool>,

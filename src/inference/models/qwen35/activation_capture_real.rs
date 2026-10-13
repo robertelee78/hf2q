@@ -273,6 +273,7 @@ mod tests {
     use super::*;
     use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
     use crate::ir::DType;
+    use crate::serve::multi_seq_kv::SlotId;
 
     /// GPU-eligible tiny hybrid Qwen3.5 dense config (mirrors
     /// `forward_gpu::tests::tiny_hybrid_cfg`): `hidden_size = 64`
@@ -480,7 +481,7 @@ mod tests {
     fn not_ready_shim_returns_not_ready_error() {
         let mut cap = RealActivationCapture::not_ready();
         let err = cap.run_calibration_prompt(&[1, 2, 3]).unwrap_err();
-        let s = format!("{}", err);
+        let s = format!("{err}");
         assert!(
             s.contains("not_ready") || s.contains("NotReady") || s.contains("explicit"),
             "error must indicate the not-ready shim, got: {s}"
@@ -504,8 +505,67 @@ mod tests {
             layer: 7,
             reason: "attn_qkv shape mismatch".into(),
         };
-        let s = format!("{}", err);
+        let s = format!("{err}");
         assert!(s.contains("layer 7"));
         assert!(s.contains("attn_qkv shape mismatch"));
+    }
+
+    /// ADR-054 per-family calibration (#300 W9): the cheap single-layer
+    /// residual capture (`forward_gpu_capture_residual_layer` — last row
+    /// only, head skipped) is parity-pinned against the reference
+    /// whole-buffer `LayerActivations::layer_outputs` capture at the same
+    /// layer/position, so the cheap path cannot drift from the reference
+    /// capture. Distinct per-token embeddings make a wrong-row read
+    /// detectable (the zero-weight layers leave the residual stream equal
+    /// to the embedding, so both paths read the same live buffer).
+    #[test]
+    fn residual_layer_capture_parity_with_layer_activations_tail() {
+        let cfg = tiny_dense_cfg();
+        let mut model = Qwen35Model::empty_from_cfg(cfg.clone());
+        let hidden = cfg.hidden_size as usize;
+        let vocab = cfg.vocab_size as usize;
+        // Distinct embeddings: token i's row = (i + 1) * 0.01 * (1 + j/hidden).
+        for i in 0..vocab {
+            for j in 0..hidden {
+                model.token_embd[i * hidden + j] =
+                    ((i + 1) as f32) * 0.01 * (1.0 + j as f32 / hidden as f32);
+            }
+        }
+        let tokens: Vec<u32> = vec![0, 1, 2];
+        let seq_len = tokens.len();
+
+        // Reference: the whole-buffer per-layer capture.
+        let acts = match run_calibration_prompt_gpu(&model, &tokens) {
+            Ok(acts) => acts,
+            Err(err) if format!("{err}").contains("No Metal GPU device found") => {
+                eprintln!("skipping GPU-backed capture parity test: {err}");
+                return;
+            }
+            Err(err) => panic!("reference capture: {err:#}"),
+        };
+        let device = MlxDevice::new().expect("MlxDevice (reference capture succeeded)");
+
+        for layer in 0..cfg.num_hidden_layers as usize {
+            // Axis-major text positions (same builder as the reference).
+            let mut positions = Vec::with_capacity(4 * seq_len);
+            for _ in 0..4 {
+                for i in 0..seq_len {
+                    positions.push(i as i32);
+                }
+            }
+            let mut kv = HybridKvCache::new(&model.cfg, &device, seq_len as u32, 1)
+                .expect("HybridKvCache for capture parity");
+            let row = model
+                .forward_gpu_capture_residual_layer(&tokens, &positions, &mut kv, layer, SlotId(0))
+                .unwrap_or_else(|err| panic!("capture layer {layer}: {err:#}"));
+            assert_eq!(row.len(), hidden, "capture row width at layer {layer}");
+            let expected = &acts.layer_outputs[layer][(seq_len - 1) * hidden..seq_len * hidden];
+            for (index, (a, b)) in row.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "layer {layer} element {index}: capture {a} vs reference {b}"
+                );
+            }
+        }
     }
 }
