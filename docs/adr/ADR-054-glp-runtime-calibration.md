@@ -35,7 +35,22 @@
    null: the calibrated `d_disp` stream-0 direction is behaviorally inert
    as a refusal suppressor on this panel at both its capture and apply
    sites; the calibrated-vector line closes honestly (see Deferred
-   follow-ups item 3 and `scripts/grammar_probe/gate34/residual-site/`).
+       follow-ups item 3 and `scripts/grammar_probe/gate34/residual-site/`).
+   **Per-family calibration + the same-site measurement ladder (2026-10-12,
+   #300).** `hf2q calibrate` generalizes to every served GLP family
+   (qwen35, qwen35moe, deepseek4) behind a per-family capture abstraction
+   (`src/calibrate/family.rs`); gemma4 is refused, consistent with the
+   serve-side `--glp` family set. The capture/apply site question is
+   resolved as a measurement, not a default: the two nulls (writer-site
+   apply 2026-09-10; capture-site apply 2026-10-10) falsify both cross-site
+   transfer AND apply-at-capture-site for the OBLITERATUS prompt-class
+   `d_disp`; the follow-up ladder (dose at the residual site →
+   capture-at-apply-site → multi-layer coverage → refusal-axis probe set →
+   behavior-labeled contrast, pre-registered shift bar ≥4 adversarial
+   flips with benign intact) measures the survivors in cost order. No site
+   pair becomes an export default except the measured winner; an all-null
+   ladder closes the calibrated-vector line honestly. Qwen has no measured
+   null: its gate battery is a first measurement.
 - **Date:** 2026-09-04 (revised 2026-09-09: forced-capture design replaces
   generation-based capture — teacher-forced pinned prefixes, prefill-only
   forward passes, targeted decision positions; capture cost collapses from
@@ -104,10 +119,27 @@ produces a spec-conformant GLP file plus a lexical register report:
    Model-card ancestors never become the vector's target checkpoint. Re-read
    the export through checkpoint compatibility validation before the canary;
    offline export tests cover a finetune whose ancestor differs from its source.
-6. **Register report.** A 6-prompt lexical canary (uniform refusal probes)
-   records the model's top refusal openings → the lexicon for the grammar
-   exclusion automaton, replacing the hand-written list. (This doubles as the
-   source of the pinned refusal prefix in step 1.)
+ 6. **Register report.** A 6-prompt lexical canary (uniform refusal probes)
+    records the model's top refusal openings → the lexicon for the grammar
+    exclusion automaton, replacing the hand-written list. (This doubles as the
+    source of the pinned refusal prefix in step 1.)
+
+**Per-family capture (2026-10-12, #300).** The pipeline steps
+1–6 are family-agnostic; the family adapter supplies: the capture
+read arms (deepseek4: post-layer complete HC state `[hc, hidden]`
+and the FFN writer `[rows, hidden]` pre-`dispatch_hc_post`; qwen35/
+qwen35moe: the post-layer residual `hidden` at the layer-loop tail,
+parity-pinned against the reference per-layer activation capture),
+the tokenizer, the canary bind contract (the family's supported hook
+set + residual-site shape), the register report (per-family refusal
+openers, replacing the hardcoded prefixes), and the family's GGUF
+facts (layers/hidden/hc, default layer, default export site pair).
+The adapter declares only the sites its forward path can actually
+read; a site is never silently routed through another family's
+capture. The register report (step 6) is implemented with the
+per-family work: 6–8 uniform refusal probes, greedy, family chat
+template, first-sentence openings — the source of the d_out pinned
+refusal prefix and the grammar lexicon, a report rather than a gate.
 
 **Gate-2 outcome (2026-09-09, weightless side, Qwen3.6-35B bf16):** the
 forced-capture direction does not suppress at scale — 0/8 held-out delivery,
@@ -248,7 +280,21 @@ conformant reader (hf2q `--glp`, or the weightless hotfix path).
     the per-stream width plumbing proof: bound at width=16384, hook
     `residual_stream_post_layer`, and steered correctly on a live serve);
     it does not shift, so the per-stream-capture escalation is not
-    indicated. Artifacts: `scripts/grammar_probe/gate34/residual-site/`
-    (per-pass results/verdicts/meta/logs, summary, identity manifest) +
-    the committed rewrite/tile tool `gate34/rewrite_glp_hook.py`.
+     indicated. Artifacts: `scripts/grammar_probe/gate34/residual-site/`
+     (per-pass results/verdicts/meta/logs, summary, identity manifest) +
+     the committed rewrite/tile tool `gate34/rewrite_glp_hook.py`.
+4. **The same-site measurement ladder (2026-10-12, #300).** The
+   honest follow-up to the two measured nulls: (1) residual-site dose
+   ladder 2/4/8 on the existing #298 artifact (zero new code);
+   (2) capture-at-the-apply-site (the FFN-writer read arm) with the same
+   probe set, exported `hook=writer, derived=writer`; (3) multi-layer
+   span export at the surviving site/dose; (4) matched refusal-axis
+   probe set; (5) behavior-labeled contrast (the gate-2 natural-class
+   protocol, ~100 judge-labeled rollouts). Pre-registered shift bar:
+   ≥4 adversarial maintained-refusal → valid-fulfillment flips on the
+   fixed 48-prompt panel, benign intact, no degeneration growth;
+   ≤2 flips = null (#298 within-run noise ±2). A shift re-opens the
+   export default with the measured winner; all-null closes the line.
+   Artifacts land under `scripts/grammar_probe/gate34/ladder/`.
+
 

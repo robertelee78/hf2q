@@ -385,6 +385,8 @@ fn run(cli: Cli) -> Result<(), AppError> {
             refusal_prefix: args.refusal_prefix,
             compliance_prefix: args.compliance_prefix,
             alpha: args.alpha,
+            hook_point: args.hook_point.map(|site| site.as_hook_point()),
+            capture_site: args.capture_site.map(|site| site.as_capture_site()),
         })
         .map_err(AppError::Conversion),
         Command::Serve(args) => {

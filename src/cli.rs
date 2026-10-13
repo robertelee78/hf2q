@@ -158,7 +158,8 @@ pub enum Command {
     /// ADR-054: derive a GLP steering direction on-device via forced capture
     /// (teacher-forced pinned prefixes, prefill-only; difference-of-means),
     /// export a GLP-conformant GGUF, and prove it with the canary pair
-    /// (zero-dose no-op, live-dose logit shift). DeepSeek-V4 only in v1.
+    /// (zero-dose no-op, live-dose logit shift). Every served GLP family
+    /// (qwen35, qwen35moe, deepseek4) per #300; gemma4 is refused.
     Calibrate(CalibrateArgs),
 
     /// Serve a GGUF model via OpenAI-compatible HTTP API
@@ -1146,10 +1147,15 @@ pub struct ChatArgs {
     pub gcd_schema_locked: bool,
 }
 
-/// ADR-054: `hf2q calibrate <model.gguf>` — derive a GLP direction on-device.
+/// ADR-054: `hf2q calibrate <model.gguf>` — derive a GLP direction on-device
+/// for any served GLP family (qwen35, qwen35moe, deepseek4 — the same family
+/// set as `--glp` serving; gemma4 has no GLP family by owner decision and is
+/// refused, consistently with the serve-side refusal).
 #[derive(Debug, clap::Args)]
 pub struct CalibrateArgs {
-    /// Local DeepSeek-V4 GGUF path (v1: DeepSeek4 architecture only).
+    /// Local model GGUF. Supported families: qwen35, qwen35moe, deepseek4
+    /// (the serve-side `--glp` family set); anything else — including
+    /// gemma4 — is refused fail-closed before any weight load.
     #[arg(value_name = "MODEL_GGUF", value_hint = clap::ValueHint::FilePath)]
     pub model: PathBuf,
 
@@ -1157,19 +1163,23 @@ pub struct CalibrateArgs {
     #[arg(long, value_name = "OUT_GGUF", default_value = "calibrated.glp.gguf")]
     pub out: PathBuf,
 
-    /// Capture graph layer (0-based index, excluding layer 0).
-    /// Export uses direction.N for the same graph layer N. Default: 29.
-    #[arg(long, default_value_t = 29)]
-    pub layer: usize,
+    /// Capture graph layer (0-based index, >= 1 — layer 0 cannot be
+    /// steered). Export uses direction.N for the same graph layer N.
+    /// Default: the family default (deepseek4: 29; qwen35/qwen35moe: the
+    /// published GLP-49 span midpoint, clamped to the model's layers).
+    #[arg(long)]
+    pub layer: Option<usize>,
 
     /// Contrastive pairs to capture from the embedded 64+64 corpus slice.
     #[arg(long, default_value_t = 64)]
     pub pairs: usize,
 
-    /// Pinned refusal prefix (the forced-refusal arm). Default: the
-    /// universal opener from the refusal register.
-    #[arg(long, default_value = "I cannot")]
-    pub refusal_prefix: String,
+    /// Pinned refusal prefix (the forced-refusal arm). Default: the modal
+    /// refusal opener measured by the register report (per-family; the
+    /// hardcoded DeepSeek-measured `I cannot` default was replaced by the
+    /// measurement in #300).
+    #[arg(long)]
+    pub refusal_prefix: Option<String>,
 
     /// Pinned compliance prefix (the forced-compliance arm). Default: the
     /// measured W1 anchor.
@@ -1180,6 +1190,48 @@ pub struct CalibrateArgs {
     /// serve time with --glp-alpha).
     #[arg(long, default_value_t = 1.0)]
     pub alpha: f32,
+
+    /// Export apply site (the file's glp.hook_point): `writer`
+    /// (ffn_out_pre_residual) or `residual` (residual_stream_post_layer).
+    /// Default: the family's published site (deepseek4: writer; qwen:
+    /// residual). Plumbing, not an effectiveness claim — behavioral
+    /// validity stays with ADR-054's gates.
+    #[arg(long, value_enum)]
+    pub hook_point: Option<CalibrateSiteArg>,
+
+    /// Capture site (the file's glp.derived_at): `writer` or `residual`.
+    /// Default: the family's default capture site (deepseek4: residual —
+    /// the GLP-29-declared pair; qwen: residual — same-site capture/apply
+    /// by default). A cross-site pair remains expressible and exports its
+    /// honest derived_at.
+    #[arg(long, value_enum)]
+    pub capture_site: Option<CalibrateSiteArg>,
+}
+
+/// CLI spelling of the spec hook/capture sites for `hf2q calibrate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CalibrateSiteArg {
+    /// `ffn_out_pre_residual` — the FFN writer output, pre-fold.
+    #[value(name = "writer")]
+    Writer,
+    /// `residual_stream_post_layer` — the complete post-layer residual.
+    #[value(name = "residual")]
+    Residual,
+}
+
+impl CalibrateSiteArg {
+    /// Map to the capture-site enum (`src/calibrate/family.rs`).
+    pub fn as_capture_site(self) -> crate::calibrate::CaptureSite {
+        match self {
+            Self::Writer => crate::calibrate::CaptureSite::FfnOutPreResidual,
+            Self::Residual => crate::calibrate::CaptureSite::ResidualStreamPostLayer,
+        }
+    }
+
+    /// Map to the hook-point enum (`GlpHookPoint`).
+    pub fn as_hook_point(self) -> crate::inference::glp::GlpHookPoint {
+        self.as_capture_site().as_hook_point()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

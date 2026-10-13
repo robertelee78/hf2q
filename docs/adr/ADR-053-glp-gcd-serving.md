@@ -195,9 +195,23 @@ that apply site.
   family outside `GLP_SERVING_ARCHITECTURES` fails every load with one
   message naming the supported families — hands-on verify only, fix if
   inconsistent.
-- **Calibrate's export contract is untouched** (`hook_point=ffn_out_pre_residual`,
-  `derived_at=residual_stream_post_layer`): the capture/apply site fix and
-  calibrate beyond DeepSeek stay open per the owner's #276 decision.
+- **Calibrate's export contract is now site-selectable and per-family
+  (2026-10-12, #300 — supersedes the pre-design 'untouched' boundary).**
+  `hf2q calibrate` accepts `--hook-point {writer|residual}` (the export's
+  `glp.hook_point`) and `--capture-site` (default: the family's
+  `default_derived_at` — deepseek4 keeps the residual_stream_post_layer
+  capture, qwen defaults to its hook point — same-site capture/apply by
+  default; a cross-site pair remains
+  expressible and is exported with its honest `glp.derived_at`, per
+  spec). Per-family defaults: deepseek4 keeps the GLP-29-declared pair
+  (`ffn_out_pre_residual` / `residual_stream_post_layer`) until ADR-054's
+  same-site ladder lands a measured winner; qwen35/qwen35moe default to
+  `residual_stream_post_layer` same-site (the family's published site
+  class). Calibrate covers exactly the serve-side GLP family set
+  (qwen35, qwen35moe, deepseek4); gemma4 is refused consistently with
+  `--glp` serving. The site options are plumbing, not effectiveness
+  claims: behavioral validity remains ADR-054's gates (the null record
+  and the ladder own that question).
 
 Verification is hands-on per owner direction (no new unit tests; one
 worktree at a time into the shared `CARGO_TARGET_DIR`; one full-model

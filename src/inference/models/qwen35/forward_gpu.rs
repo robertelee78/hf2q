@@ -279,6 +279,19 @@ enum OutputHeadMode {
     },
 }
 
+/// One ADR-054 per-family calibration capture request (#300): read the
+/// complete post-layer residual `hidden` (the exact tensor the
+/// `residual_stream_post_layer` steering mutates at the layer-loop tail)
+/// at `layer`, last sequence position, host-side f32. Prefill-only,
+/// single-layer (NOT the whole-tree `LayerActivations` download — one
+/// `[hidden]` row per pass); the output head is skipped
+/// (`OutputHeadMode::EmbedLast`). Parity-pinned against
+/// `LayerActivations::layer_outputs` at the same layer/position.
+struct ResidualLayerCapture<'a> {
+    layer: usize,
+    out: &'a mut Vec<f32>,
+}
+
 /// Pre-allocated decode buffers for `forward_gpu_greedy` (seq_len == 1).
 ///
 /// All buffers have fixed shape `[1, hidden_size]` for single-token decode.
@@ -2695,6 +2708,7 @@ impl Qwen35Model {
             None,
             None,
             slot_id,
+            None,
         )
     }
 
@@ -2736,6 +2750,7 @@ impl Qwen35Model {
             None,
             None,
             slot_id,
+            None,
         )
     }
 
@@ -2766,6 +2781,7 @@ impl Qwen35Model {
             Some(&mut nextn_hidden_out),
             None,
             slot_id,
+            None,
         )?;
         let hidden = nextn_hidden_out.ok_or_else(|| {
             anyhow!("forward_gpu_last_logits_with_hidden: nextn hidden buffer was not captured")
@@ -2832,6 +2848,7 @@ impl Qwen35Model {
             None,
             None,
             slot_id,
+            None,
         )?;
         topk_slot.ok_or_else(|| {
             anyhow!(
@@ -2902,6 +2919,7 @@ impl Qwen35Model {
             None,
             None,
             slot_id,
+            None,
         )
     }
 
@@ -2973,6 +2991,7 @@ impl Qwen35Model {
             None,
             None,
             slot_id,
+            None,
         )
     }
 
@@ -3032,6 +3051,7 @@ impl Qwen35Model {
             None,
             None,
             slot_id,
+            None,
         )?;
         let h = self.cfg.hidden_size as usize;
         anyhow::ensure!(
@@ -3082,6 +3102,7 @@ impl Qwen35Model {
             None,
             None,
             slot_id,
+            None,
         )?;
         let hidden = hidden_out
             .ok_or_else(|| anyhow!("forward_gpu_with_hidden: hidden buffer was not captured"))?;
@@ -3114,6 +3135,7 @@ impl Qwen35Model {
             Some(&mut nextn_hidden_out),
             None,
             slot_id,
+            None,
         )?;
         let hidden = nextn_hidden_out.ok_or_else(|| {
             anyhow!("forward_gpu_with_nextn_hidden: nextn hidden buffer was not captured")
@@ -3152,6 +3174,7 @@ impl Qwen35Model {
             Some(&mut nextn_hidden_out),
             Some(&mut logits_buffer_out),
             slot_id,
+            None,
         )?;
         debug_assert!(
             downloaded.is_empty(),
@@ -3280,6 +3303,7 @@ impl Qwen35Model {
             // routes `slot_id` verbatim through the capture path
             // (was hard-coded SlotId(0) per B4a deferral).
             slot_id,
+            None,
         )?;
         let hidden = hidden_out.ok_or_else(|| {
             anyhow!("forward_gpu_with_hidden_dflash: hidden buffer was not captured")
@@ -3851,7 +3875,57 @@ impl Qwen35Model {
             // tooling and stays at slot 0 (no multi-slot calibration
             // workflow today).
             SlotId(0),
+            None,
         )
+    }
+
+    /// ADR-054 per-family calibration capture (#300): prefill-only capture
+    /// of the complete post-layer residual `hidden` (the exact tensor the
+    /// `residual_stream_post_layer` steering mutates at the layer-loop
+    /// tail) at `layer`, last sequence position, as a host-side f32
+    /// `[hidden]` row. The output head is skipped (`EmbedLast` — final
+    /// RMSNorm only, no lm_head projection). One fresh cache per prompt is
+    /// the caller's contract (the calibration-pipeline discipline).
+    /// Parity-pinned against `LayerActivations::layer_outputs` at the same
+    /// layer/position so this cheap single-row path cannot drift from the
+    /// reference per-layer capture.
+    pub fn forward_gpu_capture_residual_layer(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        layer: usize,
+        slot_id: SlotId,
+    ) -> Result<Vec<f32>> {
+        anyhow::ensure!(
+            layer < self.cfg.num_hidden_layers as usize,
+            "Qwen calibration capture layer {layer} out of range (num_layers={})",
+            self.cfg.num_hidden_layers
+        );
+        let mut captured = Vec::new();
+        let _ = self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            None,
+            None,
+            OutputHeadMode::EmbedLast,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            slot_id,
+            Some(ResidualLayerCapture {
+                layer,
+                out: &mut captured,
+            }),
+        )?;
+        anyhow::ensure!(
+            !captured.is_empty(),
+            "Qwen calibration residual capture did not fire (target layer never reached?)"
+        );
+        Ok(captured)
     }
 
     fn forward_gpu_impl(
@@ -3879,6 +3953,11 @@ impl Qwen35Model {
         // variants gated to SlotId(0) for B4a) gets the same fail-loud
         // SlotOutOfRange diagnostic.
         slot_id: SlotId,
+        // ADR-054 per-family calibration (#300): optional single-layer
+        // post-layer residual capture at the layer-loop tail. `None` on
+        // every existing path — the read arm is gated on the target layer
+        // and off otherwise.
+        mut residual_capture: Option<ResidualLayerCapture<'_>>,
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
@@ -5847,6 +5926,35 @@ impl Qwen35Model {
                         )
                         .with_context(|| format!("glp apply layer {layer_idx}"))?;
                     }
+                }
+            }
+
+            // ----------------------------------------------------------
+            // ADR-054 per-family calibration capture (#300): read the
+            // complete post-layer residual — the exact tensor the
+            // `residual_stream_post_layer` steering block above mutates —
+            // at the target layer, LAST sequence position, host-side f32.
+            // Single layer, prefill discipline (fresh cache per prompt is
+            // the caller's contract); the same loop point the reference
+            // `LayerActivations::layer_outputs` capture downloads at
+            // below, but only the last row and only at the target layer
+            // (the cheap capture path — parity-pinned against the
+            // reference by test). Off unless a capture was threaded in.
+            if let Some(cap) = residual_capture.as_mut() {
+                if cap.layer == layer_idx as usize {
+                    let byte_offset = ((seq_len as u64 - 1) * h as u64) * 4;
+                    let last_row = hidden.slice_view(byte_offset, h as usize);
+                    let row = download_f32(&last_row).with_context(|| {
+                        format!("calibration residual capture layer {layer_idx}")
+                    })?;
+                    anyhow::ensure!(
+                        row.len() == h as usize,
+                        "calibration residual capture: last row has {} f32, expected {}",
+                        row.len(),
+                        h
+                    );
+                    cap.out.clear();
+                    cap.out.extend_from_slice(&row);
                 }
             }
 
