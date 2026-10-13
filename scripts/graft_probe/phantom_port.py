@@ -130,6 +130,20 @@ MODELS = {
         "gguf_identity_name": "Gemma-4-26B-A4B-It",
         "gguf_facts": None,  # filled from the model config at to-gguf time
     },
+    # The vanilla upstream Qwen3.8-27B lane (the triple-combo QE request,
+    # 2026-10-13): the stock Qwen/Qwen3.8-27B source, staged to
+    # models/sources; the trained bank binds the hf2q-converted stock
+    # artifact (receipt identity: the upstream Qwen/Qwen3.8-27B repo —
+    # the same checkpoint the published GLP-49 vector declares).
+    "qwen38-27b": {
+        "path": "/opt/hf2q/models/sources/Qwen3.8-27B",
+        "eot_token": "<|im_end|>",
+        "template": "split",
+        "mrope_interleaved": True,
+        "art": "/opt/hf2q/artifacts/grafts/qwen38-27b",
+        "gguf_identity_name": "Qwen3.8-27B",
+        "gguf_facts": None,
+    },
     # The compressed_kv site arm (ADR-059 staged site 3, #309): the bank is
     # fabricated compressed rows derived through the frozen attention
     # compressor — see phantom_compressed.py. "path" is resolved lazily from
