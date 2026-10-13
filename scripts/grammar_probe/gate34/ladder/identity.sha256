@@ -1,0 +1,12 @@
+ab54a86382c72e2d2f9eb1edc8ff24e3f8940a45480082cd702cc10f655da69e  /opt/hf2q/target/release/hf2q
+50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6  /Users/robert/.local/share/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf
+1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a  /Users/robert/.local/share/hf2q/models/qwen3.8/qwen38-abliterated-sft-hf2q-q4_k_m.gguf
+dceaca41a16c490ec745f6470e26b9b9d3585615542db863f10ddcae30618881  /Users/robert/.local/share/hf2q/models/qwen36-35b-stock-requal/Qwen3.6-35B-A3B-stock-hf2q-q4_k_m.gguf
+5c913456cfc976f0169711ed190355759acb54f857afd674f54415d0809d2703  /Users/robert/.local/share/hf2q/models/gemma4-stock/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf
+f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25  /opt/hf2q/models/sources/Qwen3.6-35B-A3B/gguf/APEX-Q5_K_M.gguf
+ea938df6e0935199426af19b36e06eac460a7242b63390aefce35db0a39cb815  /opt/hf2q/target/gate34-residual/residual-hidden.glp.gguf
+3fadb5829c3d92b8f6ad7d45d71457f760ea3ce2044644192a77920806913417  /opt/hf2q/target/gate34-ladder/writer-writer.glp.gguf
+48b0e369cc53a49d6d1a3e3d0655d0ffbf67d8ffa6ab48cae5fe0ff50d4f665a  /opt/hf2q/target/gate34-ladder/qwen38-residual.glp.gguf
+3d218fe49a769f2721a98f6af9a76c13fa64f66790d78f3378ef948acbd8a33d  /opt/hf2q/target/gate34-ladder/qwen36moe-residual.glp.gguf
+c492720666f8a0fdb02be3985dfc17b02711f1dee7b9a8ba1afaced55871c7d0  scripts/grammar_probe/gate34/panel.tsv
+fb3303ea251fa05e7bc470070d692d91aed9c726d86718782226bd2629bd0611  scripts/grammar_probe/prompts_512.tsv

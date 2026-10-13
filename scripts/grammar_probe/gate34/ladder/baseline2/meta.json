@@ -1,0 +1,21 @@
+{
+  "pass": "baseline2",
+  "serve_flags": [
+    "serve",
+    "--model",
+    "/Users/robert/.local/share/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf",
+    "--port",
+    "18085"
+  ],
+  "model_id": "DeepSeek V4 Flash 0731",
+  "mem_free_pct_preflight": 88,
+  "t_start": 1791863086.399372,
+  "t_models_ready": 1791863096.422529,
+  "t_gen_ready": 1791863096.7865112,
+  "t_end": 1791863379.7926028,
+  "load_wall_s": 10.4,
+  "panel_wall_s": 283.0,
+  "total_wall_s": 293.4,
+  "panel_rows": 48,
+  "request_errors": 0
+}
