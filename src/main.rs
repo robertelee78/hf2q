@@ -750,6 +750,8 @@ fn cmd_convert(
     // survives any future plumbing change that bypasses clap.
     let input = classify_convert_input(args.hf_dir, args.repo, args.revision.as_deref())
         .map_err(|error| AppError::Input(anyhow::anyhow!("{error}")))?;
+    let source_ref = args.source_ref.clone();
+    require_local_source_ref_positional(source_ref.as_deref(), &input)?;
     let operand_quant = match &input {
         ConvertInput::Local(_) => None,
         ConvertInput::Remote { operand_quant, .. } => operand_quant.as_deref(),
@@ -896,6 +898,10 @@ fn cmd_convert(
             RemoteConversionSource::from_verified(resolved, &hf_dir, &verified)
                 .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?,
         );
+    }
+
+    if let Some(ref_spec) = source_ref.as_deref() {
+        remote_source = Some(prepare_hub_verified_local_source(ref_spec, &hf_dir)?);
     }
 
     let output = match remote_source.as_ref() {
@@ -1131,6 +1137,74 @@ fn classify_convert_input(
             })
         }
     }
+}
+
+/// `--source-ref` applies only to a local source directory positional. A
+/// remote positional (or `--repo`) already resolves and verifies its own Hub
+/// identity, so a `--source-ref` beside one is refused with a clear message
+/// instead of ambiguously overriding the downloaded identity.
+fn require_local_source_ref_positional(
+    source_ref: Option<&str>,
+    input: &ConvertInput,
+) -> Result<(), AppError> {
+    if let Some(ref_spec) = source_ref {
+        if !matches!(input, ConvertInput::Local(_)) {
+            return Err(AppError::Input(anyhow::anyhow!(
+                "convert: --source-ref {ref_spec} requires a local source directory positional; \
+                 a remote positional or --repo reference resolves and verifies its own Hub identity"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a `--source-ref` reference to one exact immutable commit. An
+/// exact 40-hex revision seals offline; a bare repo or a branch/tag resolves
+/// through the same Hub repository lookup the remote conversion path uses
+/// (including the pinned default revision), so the receipt identity is the
+/// repository's current commit, never a moving branch name.
+fn resolve_source_ref_reference(
+    reference: crate::input::hf_reference::HfModelReference,
+) -> Result<crate::input::hf_reference::ResolvedHfModelReference, AppError> {
+    let requested = reference.requested_revision().map(str::to_owned);
+    match requested.as_deref() {
+        Some(revision)
+            if revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            reference
+                .resolve(revision)
+                .map_err(|error| AppError::Input(anyhow::anyhow!("{error}")))
+        }
+        _ => crate::input::hf_download::resolve_model_reference(reference)
+            .map_err(|error| AppError::Conversion(anyhow::anyhow!("{error}")))
+            .map(|resolved| resolved.reference().clone()),
+    }
+}
+
+/// Build the hub-verified remote source identity for a `--source-ref` local
+/// conversion (#337). Resolve `<repo>`/`<repo>@<revision>` to one immutable
+/// commit, fetch the Hub's file listing for that commit through the same
+/// hub client the remote download path uses, and verify every local source
+/// file's bytes against the Hub-declared identity (sizes, LFS SHA-256, Git
+/// blob SHA-1 — the same verification class as a remote download). A
+/// mismatch or missing file is a typed refusal: no partial identity and no
+/// receipt. On success the returned source feeds the standard receipt path
+/// unchanged, so the receipt matches a remote conversion of the same source.
+fn prepare_hub_verified_local_source(
+    ref_spec: &str,
+    hf_dir: &std::path::Path,
+) -> Result<crate::convert::RemoteConversionSource, AppError> {
+    let reference = crate::input::hf_reference::parse_source_ref(ref_spec)
+        .map_err(|error| AppError::Input(anyhow::anyhow!("{error}")))?;
+    let resolved = resolve_source_ref_reference(reference)?;
+    let verified = crate::input::integrity::verify_remote_conversion_source(
+        resolved.repo_id(),
+        resolved.revision(),
+        hf_dir,
+    )
+    .map_err(|error| AppError::Conversion(anyhow::anyhow!("{error}")))?;
+    crate::convert::RemoteConversionSource::from_verified(resolved, hf_dir, &verified)
+        .map_err(|error| AppError::Conversion(anyhow::anyhow!("{error}")))
 }
 
 #[cfg(test)]
@@ -1682,6 +1756,63 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn source_ref_spellings_parse_to_bounded_references() {
+        let bare = crate::input::hf_reference::parse_source_ref("org/model").unwrap();
+        assert_eq!(bare.repo_id(), "org/model");
+        assert_eq!(bare.requested_revision(), None);
+
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let pinned =
+            crate::input::hf_reference::parse_source_ref(&format!("org/model@{revision}")).unwrap();
+        assert_eq!(pinned.repo_id(), "org/model");
+        assert_eq!(pinned.requested_revision(), Some(revision));
+
+        let branch = crate::input::hf_reference::parse_source_ref("org/model@main").unwrap();
+        assert_eq!(branch.repo_id(), "org/model");
+        assert_eq!(branch.requested_revision(), Some("main"));
+
+        for hostile in ["org/model@", "org/model@ma@in", "@model"] {
+            assert!(
+                crate::input::hf_reference::parse_source_ref(hostile).is_err(),
+                "{hostile:?} must not parse as a --source-ref spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn local_source_ref_exact_revision_resolves_without_network_resolution() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let resolved = resolve_source_ref_reference(
+            crate::input::hf_reference::parse_source_ref(&format!("org/model@{revision}")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved.repo_id(), "org/model");
+        assert_eq!(resolved.revision(), revision);
+        assert_eq!(resolved.canonical_url(), "https://huggingface.co/org/model");
+        assert_eq!(resolved.filename(), None);
+    }
+
+    #[test]
+    fn local_source_ref_requires_a_local_positional_source() {
+        let local = ConvertInput::Local(PathBuf::from("./models/example"));
+        require_local_source_ref_positional(None, &local).unwrap();
+        require_local_source_ref_positional(Some("org/model"), &local).unwrap();
+
+        let remote = ConvertInput::Remote {
+            reference: crate::input::hf_reference::HfModelReference::parse("org/model", None)
+                .unwrap(),
+            operand_quant: None,
+        };
+        let error = require_local_source_ref_positional(Some("org/model"), &remote)
+            .err()
+            .expect("a remote positional must be refused with a clear message");
+        let message = error.to_string();
+        assert!(message.contains("--source-ref"), "{message}");
+        assert!(message.contains("local source directory"), "{message}");
+        assert!(message.contains("org/model"), "{message}");
+    }
 
     #[test]
     fn convert_source_classifier_preserves_explicit_local_paths() {

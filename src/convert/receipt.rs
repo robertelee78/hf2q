@@ -436,6 +436,197 @@ mod tests {
         assert_eq!(source.source_sha256.len(), 64);
     }
 
+    /// #337: a `--source-ref` local conversion must produce a receipt that is
+    /// shape-equivalent to a remote conversion's receipt for the same source,
+    /// so GLP and graft binder verification consumes it unchanged. The Hub
+    /// metadata fetch (`fetch_repo_shard_metadata`) is mocked by a fixture
+    /// listing — the same offline seam hermetic receipt tests use.
+    #[test]
+    fn local_source_ref_receipt_is_shape_equivalent_to_remote_conversion_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+        let weight_sha = compute_file_sha256(&dir.path().join("model.safetensors")).unwrap();
+        let config_git_sha =
+            crate::core::integrity::compute_git_blob_sha1(&dir.path().join("config.json"), 2)
+                .unwrap();
+        let revision = "a".repeat(40);
+        let hub_listing = || {
+            vec![
+                crate::core::integrity::ShardIntegrity {
+                    filename: "config.json".into(),
+                    bytes: 2,
+                    sha256: None,
+                    hf_etag: config_git_sha.clone(),
+                    is_lfs: false,
+                },
+                crate::core::integrity::ShardIntegrity {
+                    filename: "model.safetensors".into(),
+                    bytes: 7,
+                    sha256: Some(weight_sha.clone()),
+                    hf_etag: weight_sha.clone(),
+                    is_lfs: true,
+                },
+            ]
+        };
+
+        // Remote flow (main.rs after download): the downloader's manifest for
+        // the same source feeds verify_conversion_manifest, then the shared
+        // RemoteConversionSource constructor.
+        let remote_resolved =
+            crate::input::hf_reference::HfModelReference::parse("org/model", Some(&revision))
+                .unwrap()
+                .resolve(&revision)
+                .unwrap();
+        let remote_verified = crate::input::integrity::verify_conversion_manifest(
+            remote_resolved.repo_id(),
+            remote_resolved.revision(),
+            dir.path(),
+            hub_listing(),
+        )
+        .unwrap();
+        let remote_source = RemoteConversionSource::from_verified(
+            remote_resolved.clone(),
+            dir.path(),
+            &remote_verified,
+        )
+        .unwrap();
+
+        // Local `--source-ref` flow: the flag spelling resolves offline to
+        // the same immutable commit, and the verification half of
+        // verify_remote_conversion_source (verify_conversion_manifest) checks
+        // the local bytes against the same mocked Hub listing.
+        let local_resolved = crate::resolve_source_ref_reference(
+            crate::input::hf_reference::parse_source_ref(&format!("org/model@{revision}")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(local_resolved.repo_id(), remote_resolved.repo_id());
+        assert_eq!(local_resolved.revision(), remote_resolved.revision());
+        assert_eq!(
+            local_resolved.canonical_url(),
+            remote_resolved.canonical_url()
+        );
+        let local_verified = crate::input::integrity::verify_conversion_manifest(
+            local_resolved.repo_id(),
+            local_resolved.revision(),
+            dir.path(),
+            hub_listing(),
+        )
+        .unwrap();
+        let local_source =
+            RemoteConversionSource::from_verified(local_resolved, dir.path(), &local_verified)
+                .unwrap();
+
+        // Both identities feed the standard receipt path unchanged.
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut receipts = Vec::new();
+        for (root, source) in [
+            (first.path(), &remote_source),
+            (second.path(), &local_source),
+        ] {
+            let output = root.join("model.gguf");
+            fs::write(&output, b"GGUFfixture").unwrap();
+            let prepared = prepare_success_receipt(
+                &output,
+                &output,
+                source,
+                &"d".repeat(40),
+                "q4_k_m",
+                0,
+                PeakChunkBoundReceipt::default(),
+            )
+            .unwrap();
+            let path = promote_success_receipt(prepared, false).unwrap();
+            receipts.push(
+                serde_json::from_slice::<ConversionReceipt>(&fs::read(path).unwrap()).unwrap(),
+            );
+        }
+        let remote_receipt = &receipts[0];
+        let local_receipt = &receipts[1];
+        assert_eq!(
+            remote_receipt.schema_version,
+            CONVERSION_RECEIPT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            local_receipt.schema_version,
+            CONVERSION_RECEIPT_SCHEMA_VERSION
+        );
+        assert_eq!(local_receipt.source.repository_id, "org/model");
+        assert_eq!(local_receipt.source.revision, revision);
+        assert_eq!(remote_receipt.source.files, local_receipt.source.files);
+        assert_eq!(
+            remote_receipt.source.bundle_sha256,
+            local_receipt.source.bundle_sha256
+        );
+
+        // Byte-equivalent shape: the two JSON documents are identical after
+        // normalizing the one field that legitimately differs between any two
+        // conversions of the same source — the destination output path. Same
+        // keys, same schema version, and the same original reference (both
+        // flows record the repository spelling), identity, bundle, files,
+        // converter, and output evidence.
+        let mut remote_value = serde_json::to_value(remote_receipt).unwrap();
+        let local_value = serde_json::to_value(local_receipt).unwrap();
+        assert_eq!(
+            remote_value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            local_value.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            remote_value["source"]["original_reference"],
+            local_value["source"]["original_reference"]
+        );
+        assert_ne!(
+            remote_value["output"]["path"],
+            local_value["output"]["path"]
+        );
+        remote_value["output"]["path"] = local_value["output"]["path"].clone();
+        assert_eq!(remote_value, local_value);
+    }
+
+    /// #337: a local source file whose bytes do not match the Hub-declared
+    /// identity is a typed refusal — no partial identity, no receipt.
+    #[test]
+    fn local_source_ref_verification_refuses_mismatched_bytes_without_partial_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+        let config_git_sha =
+            crate::core::integrity::compute_git_blob_sha1(&dir.path().join("config.json"), 2)
+                .unwrap();
+        let hostile_listing = vec![
+            crate::core::integrity::ShardIntegrity {
+                filename: "config.json".into(),
+                bytes: 2,
+                sha256: None,
+                hf_etag: config_git_sha,
+                is_lfs: false,
+            },
+            crate::core::integrity::ShardIntegrity {
+                filename: "model.safetensors".into(),
+                bytes: 7,
+                sha256: Some("f".repeat(64)),
+                hf_etag: "f".repeat(64),
+                is_lfs: true,
+            },
+        ];
+        let error = crate::input::integrity::verify_conversion_manifest(
+            "org/model",
+            &"a".repeat(40),
+            dir.path(),
+            hostile_listing,
+        )
+        .err()
+        .expect("mismatched local bytes must fail closed");
+        assert!(
+            matches!(
+                error,
+                crate::core::integrity::IntegrityError::ShardMismatch { .. }
+            ),
+            "unexpected refusal: {error}"
+        );
+    }
+
     #[test]
     fn receipt_path_appends_suffix() {
         assert_eq!(

@@ -410,7 +410,12 @@ explicit local path or a canonical Hub repository ID/URL. Remote conversion
 uses hf2q's in-process `hf-hub` client, resolves a branch or tag to one exact
 commit before transferring files, verifies the exact index-selected source
 inventory, and writes a schema-v3 conversion receipt. It never invokes Python,
-`hf`, or `huggingface-cli`.
+`hf`, or `huggingface-cli`. A local source directory can declare
+`--source-ref <repo>[@<revision>]`: hf2q resolves the revision to one immutable
+commit, fetches the Hub's file listing for that commit, verifies every local
+source file against the declared identity, and writes the same receipt as a
+remote conversion of the same source; a mismatched or missing file is
+refused.
 
 At serve time, Qwen3.5/Qwen3.6 reads its tokenizer and chat template from
 the GGUF metadata; a sibling `config.json` or `tokenizer.json` is not required
@@ -447,6 +452,17 @@ hf2q convert --repo google/gemma-4-26b-a4b-it \
 # To convert an existing local checkout, use an existing path or make the
 # local intent explicit with ./, ../, or an absolute path.
 hf2q convert ./models/google-gemma-4-26b-a4b-it \
+  --quant q5_k_m \
+  -o ./out/gemma4-26b-q5_k_m.gguf
+
+# A local checkout can carry remote provenance: --source-ref pins the Hub
+# identity (the @<commit> suffix is optional; a bare <repo> uses the
+# repository's current default revision). hf2q verifies every local file
+# against the Hub's listing for that commit and writes the same schema-v3
+# receipt as a remote conversion, so GLP and graft binders accept the
+# artifact without a re-download.
+hf2q convert ./models/google-gemma-4-26b-a4b-it \
+  --source-ref google/gemma-4-26b-a4b-it \
   --quant q5_k_m \
   -o ./out/gemma4-26b-q5_k_m.gguf
 
