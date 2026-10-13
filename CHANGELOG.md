@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.26] — 2026-10-12
+
+### Added
+
+- `hf2q calibrate` works on every served model family — Qwen 3.5/3.6/3.8
+  joins DeepSeek-V4, each with its own capture arms, register report
+  (measured refusal openers replace hardcoded defaults), and family
+  defaults; a new `--hook-point`/`--capture-site` surface selects the
+  capture and apply sites (the family's default is same-site
+  capture/apply; cross-site pairs stay expressible). The measured outcome
+  is recorded honestly: the dose/site measurement ladder ran to its
+  pre-registered bar and the calibrated vectors remain behaviorally inert
+  on every family (the all-null record — a calibrated vector stays a
+  candidate, not a validated derivation) (ADR-054/ADR-053, #300).
+
+### Fixed
+
+- Gemma 4 under an explicit `--scheduler fifo-serial` no longer returns
+  HTTP 500 on the second sequential request — the resumable-prefill
+  capacity is now tile-rounded like its sibling path, and any residual
+  capacity mismatch degrades to a cold prefill with a warning instead of
+  a server error (#325).
+
 ## [0.1.25] — 2026-10-12
 
 ### Added
