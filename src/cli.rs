@@ -447,7 +447,7 @@ pub struct ConvertCliArgs {
     #[arg(
         long,
         requires = "hf_dir",
-        conflicts_with = "repo",
+        conflicts_with_all = ["repo", "source_ref"],
         value_name = "HF_REPO"
     )]
     pub source_repo: Option<String>,
@@ -456,10 +456,27 @@ pub struct ConvertCliArgs {
     #[arg(
         long,
         requires = "source_repo",
-        conflicts_with = "repo",
+        conflicts_with_all = ["repo", "source_ref"],
         value_name = "REVISION"
     )]
     pub source_revision: Option<String>,
+
+    /// Hub identity for a local positional `<hf_dir>` source directory,
+    /// spelled `<repo>` or `<repo>@<revision>`. hf2q resolves the revision to
+    /// one exact immutable commit (a bare `<repo>` uses the repository's
+    /// current default revision), fetches the Hub's file listing for that
+    /// commit, and verifies every local source file's bytes against the
+    /// Hub-declared identity before conversion; the receipt then matches a
+    /// remote conversion of the same source. A mismatched or missing file
+    /// is refused without a receipt. Invalid for remote positionals or
+    /// `--repo`.
+    #[arg(
+        long,
+        requires = "hf_dir",
+        conflicts_with_all = ["repo", "source_repo", "source_revision"],
+        value_name = "HF_REPO[@REVISION]"
+    )]
+    pub source_ref: Option<String>,
 
     /// File-type to quantize to. Accepts:
     ///   - Standard GGUF ftypes: `f32`, `f16`, `bf16`, `q4_0`,
@@ -2348,6 +2365,79 @@ mod tests {
             args.revision.as_deref(),
             Some("7872f01b1d1fe23eabc4c98b48bffcef5a386062")
         );
+    }
+
+    #[test]
+    fn convert_source_ref_is_bound_to_a_local_positional_source() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let cli = Cli::parse_from([
+            "hf2q",
+            "convert",
+            "./models/example",
+            "--source-ref",
+            &format!("org/model@{revision}"),
+            "--quant",
+            "q4_k_m",
+            "-o",
+            "/tmp/example.gguf",
+        ]);
+        let Command::Convert(args) = cli.command else {
+            panic!("expected Convert");
+        };
+        assert_eq!(args.hf_dir, Some(PathBuf::from("./models/example")));
+        assert_eq!(
+            args.source_ref.as_deref(),
+            Some(format!("org/model@{revision}").as_str())
+        );
+        assert!(args.source_repo.is_none());
+
+        let cli = Cli::try_parse_from([
+            "hf2q",
+            "convert",
+            "./models/example",
+            "--source-ref",
+            "org/model",
+        ])
+        .expect("a bare repository spelling pins the current default revision");
+        let Command::Convert(args) = cli.command else {
+            panic!("expected Convert");
+        };
+        assert_eq!(args.source_ref.as_deref(), Some("org/model"));
+
+        for hostile in [
+            vec![
+                "hf2q",
+                "convert",
+                "--repo",
+                "org/model",
+                "--source-ref",
+                "other/model",
+            ],
+            vec![
+                "hf2q",
+                "convert",
+                "./models/example",
+                "--source-ref",
+                "org/model",
+                "--source-repo",
+                "other/model",
+            ],
+            vec![
+                "hf2q",
+                "convert",
+                "./models/example",
+                "--source-ref",
+                "org/model",
+                "--source-revision",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+            vec!["hf2q", "convert", "--source-ref", "org/model"],
+        ] {
+            assert!(
+                Cli::try_parse_from(hostile.clone()).is_err(),
+                "{hostile:?} must be refused at parse time"
+            );
+        }
     }
 
     #[test]

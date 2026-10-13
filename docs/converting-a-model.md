@@ -98,6 +98,28 @@ hf2q convert ./models/example \
   --output models/example-q4_k_m.gguf
 ```
 
+`--source-ref <repo>[@<revision>]` is the single-flag spelling. hf2q resolves
+the revision to one immutable commit — a bare `<repo>` uses the repository's
+current default revision exactly like a remote conversion without
+`--revision` — fetches the Hub's file listing for that commit through the
+same hub client a remote download uses, and verifies every local source
+file's bytes against the declared size and SHA identity. A mismatched or
+missing file is a typed refusal: no partial identity and no receipt. On
+success the conversion writes the same schema-v3 receipt as a remote
+conversion of the same source, so GLP and graft binder verification consumes
+it unchanged:
+
+```bash
+hf2q convert ./models/example \
+  --source-ref owner/repository@0123456789abcdef0123456789abcdef01234567 \
+  --quant q4_k_m \
+  --output models/example-q4_k_m.gguf
+```
+
+Both `--source-ref` and the `--source-repo`/`--source-revision` pair are
+mutually exclusive with remote positionals and `--repo`; a remote reference
+resolves and verifies its own Hub identity.
+
 ## Native Hub download and integrity
 
 Remote conversion uses the standard `hf-hub` cache and token discovery:

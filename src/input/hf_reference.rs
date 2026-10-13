@@ -151,6 +151,27 @@ impl HfModelReference {
     }
 }
 
+/// Parse the `--source-ref` spelling `<repo>` or `<repo>@<revision>` into a
+/// bounded model reference whose revision may still be a branch or tag.
+///
+/// `@` is not a valid character in either a repository ID or a Hub revision
+/// (see [`validate_repo_id`] and [`normalize_revision`]), so the split is
+/// unambiguous. A bare `<repo>` leaves the revision unset; the caller
+/// resolves it to the repository's current default revision exactly like a
+/// remote conversion without `--revision`.
+pub fn parse_source_ref(input: &str) -> Result<HfModelReference, HfReferenceError> {
+    let (repo, revision) = match input.rsplit_once('@') {
+        Some((repo, revision)) if !revision.is_empty() => (repo, Some(revision)),
+        Some(_) => {
+            return Err(HfReferenceError::InvalidRevision {
+                revision: input.to_owned(),
+            });
+        }
+        None => (input, None),
+    };
+    HfModelReference::parse(repo, revision)
+}
+
 impl ResolvedHfModelReference {
     pub fn original(&self) -> &str {
         &self.original
