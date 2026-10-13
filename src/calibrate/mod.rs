@@ -242,10 +242,15 @@ pub fn cmd_calibrate(cfg: CalibrateConfig) -> Result<()> {
     }
 
     let hidden = facts.hidden as usize;
-    let hc = facts.hc.map(|k| k as usize).unwrap_or(1);
+    // The capture's stream count is per-SITE, not per-family: the DeepSeek
+    // post-layer residual is the complete mHC state ([hc, hidden]), while
+    // every family's FFN-writer site (and the Qwen residual) is a single
+    // dense [hidden] row. The arm sums, the per-stream sidecar norms, and
+    // the fail-closed capture-shape check all consume the capture's shape.
+    let hc = facts.capture_streams(capture_site);
     eprintln!(
         "[calibrate] family {} — {} layers, hidden={}, {} HC streams; capture layer {} \
-         (exports direction.{}); capture site {}, hook point {}",
+         (exports direction.{}); capture site {} ({hc} capture stream(s)), hook point {}",
         facts.family,
         facts.num_layers,
         hidden,
