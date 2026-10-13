@@ -116,6 +116,21 @@ pub struct FamilyFacts {
 }
 
 impl FamilyFacts {
+    /// The capture's stream count at `site`: the post-layer residual is the
+    /// family's complete state (deepseek4: `[hc, hidden]` mHC; qwen: dense),
+    /// while the FFN-writer site is a single dense `[hidden]` row for every
+    /// family — the writer buffer has no per-stream structure pre-fold.
+    /// `ArmSums` and the fail-closed capture-shape check consume exactly
+    /// this per-site shape, never the family's residual-stream count.
+    pub fn capture_streams(&self, site: CaptureSite) -> usize {
+        match site {
+            CaptureSite::ResidualStreamPostLayer => {
+                self.hc.map(|k| k as usize).unwrap_or(1)
+            }
+            CaptureSite::FfnOutPreResidual => 1,
+        }
+    }
+
     /// Fail-closed site support check naming the implemented sites.
     pub fn ensure_capture_site(&self, site: CaptureSite) -> Result<()> {
         if self.capture_sites.contains(&site) {

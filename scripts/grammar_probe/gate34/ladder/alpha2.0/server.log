@@ -1,0 +1,8 @@
+warning: config.toml `serve.repetition_penalty = 1.05` is retired and ignored (ADR-062 D1); serving uses the family built-in, and `hf2q serve --default-repetition-penalty` remains the explicit override
+warning: config.toml `serve.thinking_token_budget = 2048` is retired and ignored (ADR-062 D1); serving uses the family built-in, and `hf2q serve --default-thinking-token-budget` remains the explicit override
+warning: config.toml `serve.tool_thinking_token_budget = 512` is retired and ignored (ADR-062 D1); serving uses the family built-in, and `hf2q serve --default-tool-thinking-token-budget` remains the explicit override
+Preparing /Users/robert/.local/share/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf
+load: loading local Q2_K GGUF `DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf` (100.1 GiB) into Metal and warming kernels
+[GLP] vector bound: layers=1 width=4096 alpha=2 mode=Project hook=residual_stream_post_layer derived_at=residual_stream_post_layer path=/opt/hf2q/target/gate34-residual/residual-hidden.glp.gguf
+load: text model load and warmup complete in 2s
+listen: model prepared; listener bound at http://127.0.0.1:18085; starting HTTP service

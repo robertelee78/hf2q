@@ -1,0 +1,25 @@
+{
+  "pass": "a2.0",
+  "serve_flags": [
+    "serve",
+    "--model",
+    "/Users/robert/.local/share/hf2q/models/qwen3.8/qwen38-abliterated-sft-hf2q-q4_k_m.gguf",
+    "--port",
+    "18085",
+    "--glp",
+    "/opt/hf2q/target/gate34-ladder/qwen38-residual.glp.gguf",
+    "--glp-alpha",
+    "2.0"
+  ],
+  "model_id": "Qwen3.8 27B Abliterated SFT",
+  "mem_free_pct_preflight": 90,
+  "t_start": 1791865349.204493,
+  "t_models_ready": 1791865369.2231371,
+  "t_gen_ready": 1791865370.3589828,
+  "t_end": 1791865835.993388,
+  "load_wall_s": 21.2,
+  "panel_wall_s": 465.6,
+  "total_wall_s": 486.8,
+  "panel_rows": 48,
+  "request_errors": 0
+}

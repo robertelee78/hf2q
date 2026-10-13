@@ -1,0 +1,23 @@
+{
+  "pass": "a1.0",
+  "serve_flags": [
+    "serve",
+    "--model",
+    "/Users/robert/.local/share/hf2q/models/qwen36-35b-stock-requal/Qwen3.6-35B-A3B-stock-hf2q-q4_k_m.gguf",
+    "--port",
+    "18085",
+    "--glp",
+    "/opt/hf2q/target/gate34-ladder/qwen36moe-residual.glp.gguf"
+  ],
+  "model_id": "Qwen3.6 35B A3B Stock",
+  "mem_free_pct_preflight": 90,
+  "t_start": 1791866078.549203,
+  "t_models_ready": 1791866088.5680041,
+  "t_gen_ready": 1791866089.06319,
+  "t_end": 1791866169.361876,
+  "load_wall_s": 10.5,
+  "panel_wall_s": 80.3,
+  "total_wall_s": 90.8,
+  "panel_rows": 48,
+  "request_errors": 0
+}

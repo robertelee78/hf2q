@@ -1,0 +1,25 @@
+{
+  "pass": "alpha2.0",
+  "serve_flags": [
+    "serve",
+    "--model",
+    "/Users/robert/.local/share/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf",
+    "--port",
+    "18085",
+    "--glp",
+    "/opt/hf2q/target/gate34-residual/residual-hidden.glp.gguf",
+    "--glp-alpha",
+    "2.0"
+  ],
+  "model_id": "DeepSeek V4 Flash 0731",
+  "mem_free_pct_preflight": 88,
+  "t_start": 1791860143.069304,
+  "t_models_ready": 1791860193.1216471,
+  "t_gen_ready": 1791860193.489759,
+  "t_end": 1791860468.501434,
+  "load_wall_s": 50.4,
+  "panel_wall_s": 275.0,
+  "total_wall_s": 325.4,
+  "panel_rows": 48,
+  "request_errors": 0
+}
