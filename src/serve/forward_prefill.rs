@@ -48,7 +48,7 @@ pub(crate) const GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS: usize = 32;
 /// the final complete tile rather than merely through the logical extent.
 pub(crate) const GEMMA_FLASH_ATTN_VEC_KV_TILE: usize = 32;
 
-fn gemma_flash_attn_vec_capacity(logical_tokens: usize) -> usize {
+pub(crate) fn gemma_flash_attn_vec_capacity(logical_tokens: usize) -> usize {
     logical_tokens.div_ceil(GEMMA_FLASH_ATTN_VEC_KV_TILE) * GEMMA_FLASH_ATTN_VEC_KV_TILE
 }
 
@@ -580,12 +580,13 @@ impl MlxModelWeights {
     ///   * Per-layer `dense_kvs[layer].capacity >= required_capacity`
     ///     where the global requirement rounds `seq_len + max_decode_tokens`
     ///     through the final 32-row `flash_attn_vec` tile,
-    ///     `sliding_window` for sliding (caller checks; this function
-    ///     defensively bails on violation rather than silently
-    ///     corrupting state).
+    ///     `sliding_window` for sliding (caller checks; on violation this
+    ///     function DEGRADES to a cold prefill with a warning for the
+    ///     non-slot-aware path — issue #325: a cache hit must never 500 —
+    ///     while the slot-aware consume-gate keeps its pinned hard error).
     ///   * Per-layer `Arc::strong_count(&dense_kvs[layer]) == 1`
-    ///     (caller's `take_prefix` semantics ensure this; defensive
-    ///     bail on violation).
+    ///     (caller's `take_prefix` semantics ensure this; a non-exclusive
+    ///     Arc degrades to a cold prefill on the non-slot-aware path).
     ///   * Every soft-token range is wholly in the appended suffix. Cached
     ///     image rows are represented by the restored KV and are not
     ///     injected again.
@@ -596,10 +597,14 @@ impl MlxModelWeights {
     /// error set, restored mode adds:
     ///   * `restored_lcp = Some(k)` but `self.dense_kvs.is_none()`.
     ///   * `restored_lcp = Some(k)` with `k == 0` or `k >= seq_len`.
-    ///   * Per-layer `Arc` not exclusive (`Arc::try_unwrap` failed).
-    ///   * Per-layer cached capacity < required.
     ///   * `restored_lcp = Some(k)` with a soft-token range starting before
     ///     `k`.
+    ///
+    /// Issue #325 (2026-10-12): a cached mount that fails the per-layer
+    /// capacity / is_sliding / exclusivity validation on the NON-slot-aware
+    /// path no longer errors — it degrades to a cold prefill with a
+    /// `tracing::warn!` (the in-body `forward_prefill resume: ...` bails
+    /// remain as defense-in-depth for the slot-aware consume-gate).
     pub fn forward_prefill_with_soft_tokens_resume(
         &mut self,
         prompt_tokens: &[u32],
@@ -675,6 +680,85 @@ impl MlxModelWeights {
             }
         }
         let hs = self.hidden_size;
+        // ADR-017 Phase E.a iter-3 — long-resume env chain, hoisted above
+        // the resume-mount safety net so both read sites share one value
+        // (previously defined just before the cursor reset below).
+        let kv_lcp_long_resume = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+            && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+            && (crate::debug::INVESTIGATION_ENV.use_dense
+                || crate::debug::INVESTIGATION_ENV.hybrid_kv);
+        // Issue #325 (2026-10-12) — resume-mount safety net.  A cached
+        // `dense_kvs` mount installed by the engine's LCP resume probe is
+        // OPPORTUNISTIC state, not a contract: when any per-layer check
+        // against THIS request's capacity plan fails (len mismatch,
+        // capacity < the tile-rounded requirement, is_sliding mismatch,
+        // or a non-exclusive Arc), degrade to a cold prefill with a
+        // warning instead of surfacing a 500.  This mirrors the
+        // SerialFifo leftover discipline on the `restored_lcp = None`
+        // branch (line ~936: "a stale mount from a PREVIOUS request is
+        // opportunistic state, not a contract").  Measured failure this
+        // closes: gemma4 fifo-serial second sequential request — the
+        // batched-route LCP snapshot sized `snap_cap` WITHOUT the
+        // 32-row flash_attn_vec tile rounding (cached 2072) while the
+        // resume branch demands the rounded capacity (required 2080) →
+        // `forward_prefill resume: cached dense_kvs[layer=5] capacity
+        // 2072 < required 2080` → HTTP 500.
+        //
+        // `slot_aware = true` mounts are EXCLUDED: those are multi-seq
+        // scaffold slot views owned by the caller, and the iter-2D
+        // consume-gate contract pins their failure mode.
+        //
+        // The degrade must happen BEFORE the `kv_caches` cursor reset
+        // below takes the resume branch (write_pos = k): once the loop
+        // skips re-encoding `[0..k)`, fresh buffers would attend over
+        // zero rows.  Shadowing `restored_lcp` to `None` here makes the
+        // entire downstream (cursor reset, fresh dense alloc, hybrid
+        // leftover drop/rebuild, graft splice) take the cold path.
+        let restored_lcp = match restored_lcp {
+            Some(k) if !slot_aware => {
+                let resume_plan = gemma_kv_capacity_plan(
+                    seq_len + graft_len,
+                    max_decode_tokens,
+                    self.sliding_window,
+                    kv_lcp_long_resume,
+                );
+                let mount_ok = self
+                    .dense_kvs
+                    .as_ref()
+                    .map(|cached| {
+                        cached.len() == self.layers.len()
+                            && cached.iter().zip(self.layers.iter()).all(|(arc, layer)| {
+                                let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                                let required_cap = if layer_is_ring {
+                                    resume_plan.required_sliding
+                                } else {
+                                    resume_plan.required_linear
+                                };
+                                arc.capacity >= required_cap
+                                    && arc.is_sliding == layer_is_ring
+                                    && std::sync::Arc::strong_count(arc) == 1
+                            })
+                    })
+                    .unwrap_or(false);
+                if mount_ok {
+                    restored_lcp
+                } else {
+                    tracing::warn!(
+                        "forward_prefill resume: cached dense_kvs mount fails the \
+                         capacity/regime check for this request (k_resume={}, seq_len={}, \
+                         max_decode_tokens={}, sliding_window={}) — degrading to cold prefill \
+                         (issue #325: never a 500 from a cache hit)",
+                        k,
+                        seq_len,
+                        max_decode_tokens,
+                        self.sliding_window
+                    );
+                    self.dense_kvs = None;
+                    None
+                }
+            }
+            other => other,
+        };
         // Validate soft-token ranges + embedding sizes upfront so we
         // fail before the (expensive) prefill loop starts.
         for (i, st) in soft_tokens.iter().enumerate() {
@@ -766,10 +850,9 @@ impl MlxModelWeights {
         // `k` tokens have already been written) and `seq_len =
         // min(k, sliding_window)` (the kernel's "valid populated
         // slots" count, capped by the ring capacity).
-        let kv_lcp_long_resume = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
-            && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-            && (crate::debug::INVESTIGATION_ENV.use_dense
-                || crate::debug::INVESTIGATION_ENV.hybrid_kv);
+        //
+        // `kv_lcp_long_resume` is defined above the Issue #325
+        // resume-mount safety net (before the soft-token validation).
         match restored_lcp {
             None => {
                 // ADR-059: a bound graft occupies physical positions
@@ -6559,6 +6642,30 @@ mod lcp_cursor_tests {
         assert_eq!(plan.allocation_linear, 15_008);
         assert_eq!(plan.required_sliding, 1_024);
         assert_eq!(plan.allocation_sliding, 1_024);
+    }
+
+    /// Issue #325 (2026-10-12) — the resume-side capacity requirement is
+    /// TILE-ROUNDED, so every cached/snapshot capacity that must satisfy it
+    /// (batched-route LCP `snap_cap`, engine probe `new_linear`) has to be
+    /// sized through `gemma_flash_attn_vec_capacity` too.  The exact repro
+    /// geometry: first request 24 prompt tokens + 2048 max_tokens produced
+    /// an unrounded snapshot capacity of 2072, and the second sequential
+    /// fifo-serial request demanded 2080 → 500.  2072 is NOT a valid
+    /// admission anywhere on this surface.
+    #[test]
+    fn issue_325_resume_requirement_is_tile_rounded_not_logical_extent() {
+        let plan = gemma_kv_capacity_plan(24, 2_048, 1_024, false);
+        assert_eq!(plan.required_linear, 2_080);
+        assert_eq!(plan.allocation_linear, 2_080);
+        assert_eq!(plan.required_sliding, 1_024);
+        // The unrounded logical extent that previously satisfied the
+        // engine probe must fail the rounded requirement.
+        assert!(2_072 < plan.required_linear);
+        // A snapshot sized through the tile helper admits the SAME
+        // geometry on the next sequential request.
+        let snap_cap = 1_024.max(gemma_flash_attn_vec_capacity(24 + 2_048));
+        assert!(snap_cap >= gemma_kv_capacity_plan(24, 2_048, 1_024, false).required_linear);
+        assert!(snap_cap >= gemma_kv_capacity_plan(20, 2_048, 1_024, false).required_linear);
     }
 
     #[test]
