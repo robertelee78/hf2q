@@ -280,6 +280,12 @@ mod tests {
     /// handed to a writer-site-only family, or the reverse) is fatal, never
     /// a silent reinterpretation at the wrong tensor — the error names the
     /// family's supported sites.
+    ///
+    /// #299 (2026-10-13) — the gemma4 engine's bind shape is exercised
+    /// here too: gemma4 passes exactly `[residual_stream_post_layer]`
+    /// (the writer site has no gemma apply arm), so a residual-site dense
+    /// vector binds and a writer-site vector is refused naming residual
+    /// as the supported site.
     #[test]
     fn family_hook_outside_supported_set_is_fatal() {
         let device = MlxDevice::new().expect("MlxDevice");
@@ -311,10 +317,47 @@ mod tests {
                 &device,
                 &[GlpHookPoint::ResidualStreamPostLayer],
                 43,
-                2
+                2,
             ),
             Err(GlpError::Conformance(_))
         ));
+
+        // The gemma4 engine contract (#299): the residual-only family set
+        // BINDS a residual-site dense vector (the published gemma4 GLP-27
+        // shape: project mode, width == hidden — the dense residual
+        // contract) and refuses a writer-site vector by name listing
+        // residual as the supported site.
+        let gemma_residual = test_vector(GlpMode::Project, GlpHookPoint::ResidualStreamPostLayer);
+        let bound = BoundGlp::bind(
+            gemma_residual,
+            None,
+            &device,
+            &[GlpHookPoint::ResidualStreamPostLayer],
+            30,
+            2,
+        )
+        .expect("residual vector must bind on the gemma4 family set");
+        assert_eq!(bound.alpha, 1.0);
+        assert!(bound.direction_for(3).is_some());
+        let gemma_writer = test_vector(GlpMode::Project, GlpHookPoint::FfnOutPreResidual);
+        let err = match BoundGlp::bind(
+            gemma_writer,
+            None,
+            &device,
+            &[GlpHookPoint::ResidualStreamPostLayer],
+            30,
+            2,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("writer site must be fatal on the gemma4 family set"),
+        };
+        match err {
+            GlpError::Conformance(message) => {
+                assert!(message.contains("ffn_out_pre_residual"), "{message}");
+                assert!(message.contains("residual_stream_post_layer"), "{message}");
+            }
+            other => panic!("expected conformance failure, got {other:?}"),
+        }
     }
 
     /// The published GLP-29 structure: hook_point=ffn_out_pre_residual,

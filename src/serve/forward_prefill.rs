@@ -2824,6 +2824,64 @@ impl MlxModelWeights {
                     )
                     .map_err(|e| anyhow::anyhow!("prefill end-layer L{layer_idx} T{tok_i}: {e}"))?;
 
+                    // ADR-053 dual hook sites (#299, 2026-10-13): the
+                    // gemma4 `residual_stream_post_layer` GLP arm, linear
+                    // prefill. This token's row of `hidden` is the
+                    // COMPLETE post-layer residual stream after the fused
+                    // end-of-layer write above (rows=1 per token; the
+                    // projection is row-wise, so per-(token, layer)
+                    // steering here equals steering the [T, hidden]
+                    // stream of the batched prefill at its own end-of-
+                    // layer site). This one site covers every entry that
+                    // routes through the linear body: `forward_prefill`,
+                    // `forward_prefill_with_soft_tokens` (+ vision/soft
+                    // tokens), the `_resume` LCP resume, the cold-admission
+                    // tiny fallback, `forward_embed_last`, and the
+                    // slot-aware/HB prefill delegations. In-session encode.
+                    // Unsteered: byte-identical. Dose-0: bit-exact.
+                    // `direction.N` applies at graph layer N, no offset.
+                    if let Some(glp) = self.glp.as_ref() {
+                        if glp.alpha != 0.0
+                            && glp.vector.hook_point
+                                == crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer
+                        {
+                            if let Some(direction) = glp.direction_for(layer_idx as u32) {
+                                if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
+                                    eprintln!(
+                                        "[GLP-APPLY] gemma4-residual linear prefill \
+                                         layer {layer_idx} T{tok_i} rows=1 hidden={hs} \
+                                         alpha={} mode={:?}",
+                                        glp.alpha,
+                                        glp.mode()
+                                    );
+                                }
+                                // Read-modify-write of `hidden` in place:
+                                // declare the hazard so the tracker
+                                // barriers against the end-of-layer write
+                                // (the 2026-09-09 DeepSeek race lesson).
+                                s.barrier_between(
+                                    &[&self.activations.hidden],
+                                    &[&self.activations.hidden],
+                                );
+                                crate::inference::glp::apply_layer_gpu_in_session(
+                                    &mut s,
+                                    reg,
+                                    &self.activations.hidden,
+                                    direction,
+                                    glp.mode(),
+                                    glp.alpha,
+                                    1,
+                                    hs as u32,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "GLP residual apply prefill L{layer_idx} T{tok_i}: {e}"
+                                    )
+                                })?;
+                            }
+                        }
+                    }
+
                     if dump_here {
                         s.finish()
                             .map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;

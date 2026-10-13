@@ -236,11 +236,12 @@ fn site_pair_round_trips_on_every_family_hook_set() {
 }
 
 /// #300 W9 — the dispatch matrix: qwen35/qwen35moe/deepseek4 dispatch;
-/// gemma4 and unknown architectures are refused with the family set
-/// named (the serve-side `--glp` refusal set — no drift between the two
-/// surfaces).
+/// gemma4 (serves `--glp` since #299 but has no calibrate capture adapter)
+/// and unknown architectures are refused with the adapter set named and
+/// the honest serve-vs-calibrate split stated (the surfaces are no longer
+/// one set).
 #[test]
-fn calibrate_dispatch_matrix_matches_the_serve_side_glp_family_set() {
+fn calibrate_dispatch_matrix_names_the_capture_adapter_families() {
     use super::family::{family_kind_for_architecture, FamilyKind};
 
     assert_eq!(
@@ -260,11 +261,11 @@ fn calibrate_dispatch_matrix_matches_the_serve_side_glp_family_set() {
         let message = format!("{error:#}");
         assert!(
             message.contains("qwen35, qwen35moe, deepseek4"),
-            "refusal names the supported family set: {message}"
+            "refusal names the capture-adapter family set: {message}"
         );
         assert!(
             message.contains("gemma4"),
-            "refusal names the gemma4 exclusion: {message}"
+            "refusal names the gemma4 serve/calibrate split: {message}"
         );
     }
 }

@@ -5,10 +5,13 @@
 //! differ — capture read arms, tokenizer, forward plumbing, the canary bind
 //! contract, and the lexical register.
 //!
-//! The family set is exactly the serve-side GLP family set
-//! (`GLP_SERVING_ARCHITECTURES`): an operator who can serve a model with
-//! `--glp` can calibrate it, and one who cannot (gemma4 — no GLP family by
-//! owner decision) is refused at both surfaces for the same stated reason.
+//! The calibrate family set is the set of families with a capture adapter
+//! here. Since #299 (2026-10-13) that is NO LONGER identical to the
+//! serve-side GLP family set: gemma4 now serves `--glp`
+//! (`residual_stream_post_layer` apply arm) but has no calibrate capture
+//! adapter, so it is refused HERE only — an operator can steer a gemma4
+//! model with a published or externally calibrated vector, and calibrate
+//! names the implemented adapters when it refuses.
 
 use anyhow::{bail, Result};
 use mlx_native::gguf::GgufFile;
@@ -199,19 +202,22 @@ pub enum FamilyKind {
     Qwen35,
 }
 
-/// Pure architecture → adapter dispatch, fail-closed. The family set is
-/// exactly `GLP_SERVING_ARCHITECTURES` (the serve-side `--glp` refusal
-/// set), so calibrate support and serving support cannot drift apart.
+/// Pure architecture → adapter dispatch, fail-closed. The implemented
+/// adapters cover qwen35/qwen35moe/deepseek4; gemma4 serves `--glp` since
+/// #299 but has no calibrate capture adapter, so it is refused HERE only
+/// (the serve-side refusal set is `GLP_SERVING_ARCHITECTURES` — a superset
+/// since gemma4 joined it; the two surfaces can no longer be described as
+/// one set, and this message names the honest split).
 pub fn family_kind_for_architecture(architecture: &str) -> Result<FamilyKind> {
     match architecture {
         "deepseek4" => Ok(FamilyKind::Deepseek4),
         "qwen35" | "qwen35moe" => Ok(FamilyKind::Qwen35),
         other => bail!(
             "hf2q calibrate is not supported for `{other}` models; it is \
-             available for {} — the same family set as `--glp` serving \
-             (gemma4 has no GLP family by owner decision and is refused at \
-             both surfaces)",
-            crate::inference::glp::GLP_SERVING_ARCHITECTURES.join(", ")
+             available for qwen35, qwen35moe, deepseek4 — the families with \
+             capture adapters (gemma4 serves --glp since #299 but has no \
+             calibrate capture adapter yet; it is refused here only, not at \
+             serve time)",
         ),
     }
 }

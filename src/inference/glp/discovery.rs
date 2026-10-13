@@ -27,8 +27,12 @@ pub struct ResolvedGlp {
 
 /// Model architectures whose serving engines bind a GLP vector. Any other
 /// architecture would silently ignore the vector, so loading one with GLP
-/// requested is refused instead.
-pub const GLP_SERVING_ARCHITECTURES: &[&str] = &["qwen35", "qwen35moe", "deepseek4"];
+/// requested is refused instead. gemma4 (ADR-053 dual hook sites, #299,
+/// 2026-10-13) binds the `residual_stream_post_layer` site only — its engine
+/// passes that single-site family set at bind, so a writer-site
+/// (`ffn_out_pre_residual`) vector is refused by name on gemma4 even though
+/// the architecture itself is servable with `--glp`.
+pub const GLP_SERVING_ARCHITECTURES: &[&str] = &["qwen35", "qwen35moe", "deepseek4", "gemma4"];
 
 type LoadResolutionKey = (PathBuf, PathBuf);
 

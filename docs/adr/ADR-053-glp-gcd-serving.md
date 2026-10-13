@@ -16,6 +16,11 @@
   startup. Before this, `hf2q chat --model X --glp V` (which starts serve with
   no startup model and activates X afterwards) silently served X unsteered.
   See "GLP applies to every load" below.
+- **Updated:** 2026-10-13 — gemma4 joins the GLP family set with a
+  `residual_stream_post_layer` apply arm on every gemma4 execution path
+  (#299 reopened scope; the 2026-10-09 gemma Won't-do is superseded by the
+  owner's take-back — Matt published a Gemma 4 vector). See "Gemma 4 joins
+  the GLP family set" below.
 - **Related:** ADR-052 (grammar semantics), ADR-050 (serve preflight),
   ADR-051 (model resolution), ADR-042 (DeepSeek serving), ADR-017
   (per-family status)
@@ -130,9 +135,11 @@ Hub again.
 The load MUST fail when REF cannot be used for that model; it MUST NOT fall
 back to unsteered serving:
 
-- Only `qwen35`, `qwen35moe`, and `deepseek4` engines bind GLP. Loading any
-  other architecture on a `--glp` server is refused with that reason, because
-  its engine would otherwise ignore the vector.
+- Only the `qwen35`, `qwen35moe`, `deepseek4`, and `gemma4` engines bind
+  GLP (gemma4 since #299, 2026-10-13 — see "Gemma 4 joins the GLP family
+  set" below). Loading any other architecture on a `--glp` server is
+  refused with that reason, because its engine would otherwise ignore the
+  vector.
 - A reference that cannot be resolved or does not match the model's checkpoint
   fails that load. Over HTTP the public diagnostic names the server's GLP
   vector as the cause; the full reason, which can contain URLs and paths, stays
@@ -149,7 +156,7 @@ that `--glp` appeared on the child's command line. Found in the ADR-061 #237
 hands-on pass: `/hf2q/v1/runtime` reported `glp_active: false` for a
 chat-started server whose command line carried `--glp`.
 
-## Dual hook sites (2026-10-08 — extension; landed: bind #295, Qwen writer-site apply #296, DeepSeek post-layer apply #297)
+## Dual hook sites (2026-10-08 — extension; landed: bind #295, Qwen writer-site apply #296, DeepSeek post-layer apply #297; gemma4 residual apply #299, 2026-10-13)
 
 Operator goal (issue #276 remaining scope): every GLP family binds **both**
 spec hook sites — `residual_stream_post_layer` and `ffn_out_pre_residual`.
@@ -212,6 +219,13 @@ that apply site.
   `--glp` serving. The site options are plumbing, not effectiveness
   claims: behavioral validity remains ADR-054's gates (the null record
   and the ladder own that question).
+  **2026-10-13 correction (#299):** the "exactly the serve-side family
+  set" identity no longer holds — gemma4 now serves `--glp` but has no
+  calibrate capture adapter, so calibrate refuses gemma4 at its own
+  surface only, naming the implemented adapters (qwen35, qwen35moe,
+  deepseek4) and the honest serve/calibrate split. A gemma4 capture
+  adapter remains future work; until it exists, gemma4 consumes
+  published or externally calibrated vectors only.
 
 Verification is hands-on per owner direction (no new unit tests; one
 worktree at a time into the shared `CARGO_TARGET_DIR`; one full-model
@@ -222,10 +236,108 @@ fixed probe vs. the unsteered baseline; GLP-29 (FFN-writer) still binds
 and steers on DeepSeek; Qwen + GLP-49 — the published residual-site vector
 `msuiche/Qwen3.8-27B-abliterated-cyber-GLP-49`, file
 `Qwen3.8-27B-abliterated-cyber-GLP-49-L10-58-a1.gguf` (docs/qe/glp-gcd
-2026-10-08) — still binds and steers; gemma4 + `--glp` refused with the
-consistent message; `--gcd --glp` combos on both families. ADR-054 gains the follow-through: with the
+2026-10-08) — still binds and steers; `--gcd --glp` combos on both
+families. ADR-054 gains the follow-through: with the
 residual-site apply existing, its null-result remedy (the calibrated
 vector applied at its capture site) becomes measurable.
+**gemma4 gates (#299, 2026-10-13 — the reopened scope):** gemma4 + the
+published GLP-27 residual vector (below) binds on the google-converted
+Gemma-4-26B-A4B-it GGUF and passes the dose ladder — dose 0 byte-exact
+vs. the unsteered baseline, live dose (alpha 0.5) shifting a fixed probe
+— plus `--gcd --glp` combos; a writer-site vector on gemma4 is refused by
+name listing `residual_stream_post_layer`.
+
+## Gemma 4 joins the GLP family set (2026-10-13 — #299)
+
+The 2026-10-09 Won't-do record for this story ("no GLP file exists from
+Matt for Gemma") is **superseded by the owner's take-back**: Matt
+(msuiche) published a Gemma 4 vector —
+`msuiche/gemma-4-26B-A4B-it-abliterated-GLP-27-L3-29-a0.5`
+(`glp.hook_point=residual_stream_post_layer`, same-site `derived_at`,
+project mode, `alpha_default` 0.5, rank-1 orthonormal per-layer
+directions, layers 3–29 zero-based of 30, width 2816, base
+`google/gemma-4-26B-A4B-it` @ `4d7ae498…`, held-out-vs-shuffled
+validation ratio ≥ 5× per its metadata). The Qwen3-VL half of the
+original story stays ruled out per the 2026-10-09 decision; the reopened
+scope is gemma4 only.
+
+- **Registration.** gemma4 joins `GLP_SERVING_ARCHITECTURES`
+  (`src/inference/glp/discovery.rs`); the #271 server-wide gate passes
+  gemma4 through, and the boot refusal's available-families list gains
+  it automatically (the message is built from the same constant).
+- **Bind site set.** The gemma4 engine passes
+  `family_hooks = [residual_stream_post_layer]` — the dense residual
+  contract. The writer site (`ffn_out_pre_residual`) is NOT implemented
+  for gemma4 (no apply arm exists at the gemma FFN writer); a
+  writer-site vector is refused at bind by name, listing residual as the
+  supported site (the #295 contract). `attn_out_pre_residual` stays
+  globally refused.
+- **The apply arm — one hook site, four anchor points, every execution
+  path.** The gemma4 post-layer residual stream is the buffer the fused
+  end-of-layer (norm + residual add + per-layer scalar) writes; the hook
+  is anchored immediately after that write on each of the four
+  per-layer bodies:
+  1. `encode_one_layer` (`src/inference/models/gemma4/gpu_full_attn.rs`)
+     — the single-token decode body shared by the serial decode loop,
+     the parallel-encode worker, `forward_decode_capture_hidden`, and
+     the slot-aware decode entries;
+  2. `encode_one_layer_batched`
+     (`src/inference/models/gemma4/batched_body.rs`) — the `[N, hidden]`
+     batched decode body (`forward_decode_body_batched` /
+     `decode_batch_gemma4`);
+  3. `forward_prefill_with_soft_tokens_resume`
+     (`src/serve/forward_prefill.rs`) — the linear per-(token, layer)
+     prefill body; every entry that routes through it is covered
+     (forward_prefill, soft-token/vision prefill, LCP resume, the
+     cold-admission tiny fallback, `forward_embed_last`, and the
+     slot-aware/HB prefill delegations);
+  4. `forward_prefill_batched_inner`
+     (`src/serve/forward_prefill_batched.rs`) — the batched prefill
+     body covering all `forward_prefill_batched*` entries including
+     multi-seq and live-resume (the T-stream steers every seq's rows —
+     the site is per-token) and the dflash verify forward (it routes
+     through `forward_prefill_batched`).
+  All four anchors sit AFTER the whole end-of-layer variant block (the
+  fused iter-367/iter-208 kernels and the split decompositions all write
+  the same buffer), are encoded in-session ahead of the session's
+  commit, and dispatch `apply_layer_gpu_in_session` (the same dense
+  in-session helper the DeepSeek arms use) behind an explicit
+  read-modify-write barrier (`barrier_between(&[hidden], &[hidden])`) —
+  the measured 2026-09-09 lesson: without the declared hazard the
+  projection can race the end-of-layer write and deterministically
+  no-op. The projection is row-wise, so the rows=1 per-(token, layer)
+  linear-prefill arm and the rows=N arms are the same math.
+- **Identity mechanism.** Unsteered (`glp: None`, the default): no
+  branch, no barrier, no dispatch — byte-identical to the unsteered
+  graph on every path. Dose-0 (`alpha == 0`): the dispatch is skipped
+  entirely — bit-exact. Layers outside the vector's set (0–2 for
+  GLP-27) are untouched. Spec layer mapping is the flat rule:
+  `direction.N` applies at graph layer N.
+- **Paths with no GLP surface (enumerated, with reasons).**
+  `forward_decode_kernel_profile` is reachable only from the CLI
+  generate diagnostic mode, which never binds a vector (the generate
+  path constructs loads with no GLP reference); the tree-verify
+  forwards (`forward_tree_verify_gpu*`) and
+  `forward_decode_verify_serial` have production callers only through
+  the dflash orchestrator, whose verify routes through
+  `forward_prefill_batched` (covered) — their direct callers are tests;
+  the parity/quality harness builds its own unsteered instance. None of
+  these can serve a bound vector silently unsteered.
+- **Cache identity.** gemma4's LCP identity
+  (`gemma4_steering_and_graft_params_hash`) now includes the bound GLP
+  through the SAME `glp_steering_params_hash` implementation as qwen35
+  (raw direction bytes, hook, mode, dose): a steered server's saved KV
+  is never addressed by an unsteered or differently-steered one. The
+  unconfigured key value changes once across this change (the literal
+  `glp=none` bytes are now hashed through the shared helper) — a
+  one-time cold miss for in-process LCP entries, safe direction. Known
+  limitation, unchanged from the qwen35 posture: the typed
+  `--kv-persist` disk namespace is keyed by model fingerprint, not
+  steering; a steered server's disk snapshots can be hydrated by a
+  differently-configured server of the same artifact. That is a
+  pre-existing family-wide posture, recorded here for the follow-up.
+- **Calibrate.** gemma4 is refused at `hf2q calibrate` (no capture
+  adapter — see the 2026-10-13 correction above), not at serve time.
 
 ## Non-goals
 

@@ -3620,6 +3620,51 @@ impl GemmaLoadedModel {
         }
         weights.kv_graft = kv_graft;
 
+        // ADR-053 dual hook sites (#299, 2026-10-13): bind a GLP steering
+        // vector when the operator supplied one. Fail-closed at load; never
+        // serve unsteered when a vector was asked for. gemma4 binds the
+        // family's supported site set — `residual_stream_post_layer` ONLY:
+        // the writer site (`ffn_out_pre_residual`) is NOT implemented for
+        // gemma4 (no apply arm exists at the gemma FFN writer), so a
+        // writer-site vector is refused HERE by name, listing residual as
+        // the supported site (the #295 bind contract). The residual arm
+        // itself exists on every gemma4 execution path (linear prefill,
+        // batched prefill + multi-seq, scalar decode incl. slot-aware and
+        // parallel encode, batched decode body), so no interim load
+        // refusal remains for the implemented site.
+        if let Some(glp_path) = opts.glp_path.as_ref() {
+            let device = ctx.device().clone();
+            crate::inference::glp::validate_glp_for_model(glp_path, model_path, &gguf)
+                .context("GLP checkpoint compatibility")?;
+            let vector = crate::inference::glp::GlpVector::load(glp_path)
+                .with_context(|| format!("GLP load: {}", glp_path.display()))?;
+            let bound = crate::inference::glp::BoundGlp::bind(
+                vector,
+                opts.glp_alpha,
+                &device,
+                // ADR-053 dual hook sites, gemma4 scope: the residual site
+                // only — the gemma4 engine has no `ffn_out_pre_residual`
+                // apply arm, and bind refuses that hook by name here
+                // instead of letting the engine silently ignore it.
+                &[crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer],
+                config.num_hidden_layers as u32,
+                config.hidden_size as u32,
+            )
+            .with_context(|| format!("GLP bind: {}", glp_path.display()))?;
+            tracing::info!(
+                layers = bound.vector.layers.len(),
+                width = bound.vector.width,
+                alpha = bound.alpha,
+                mode = ?bound.mode(),
+                hook = bound.vector.hook_point.as_str(),
+                derived_at = bound.vector.derived_at.as_deref().unwrap_or("<same as hook>"),
+                path = %glp_path.display(),
+                "GLP vector bound to Gemma4 (residual_stream_post_layer; every \
+                 forward path applies it)"
+            );
+            weights.glp = Some(bound);
+        }
+
         Ok(Self {
             weights,
             ctx,
@@ -23404,18 +23449,30 @@ fn build_gemma_lcp_payload(
     }
 }
 
-/// ADR-059 — gemma4's graft-aware activation-identity hash (the qwen35
-/// `steering_and_graft_params_hash` pattern applied to gemma4's cache
-/// identity). Gemma4 has no GLP steering surface, so the graft is the one
-/// activation-affecting dimension: a grafted server's saved KV must never
-/// be addressed by an ungrafted or differently-grafted one, exactly as
-/// S6/qwen35 established for steering. Ungrafted engines hash the stable
-/// `steering=v1/glp=none/graft=none` triple.
-fn gemma4_graft_aware_params_hash(loaded: &GemmaLoadedModel) -> u64 {
+/// ADR-059/#299 — gemma4's steering-and-graft-aware activation-identity
+/// hash (the qwen35 `steering_and_graft_params_hash` pattern applied to
+/// gemma4's cache identity). Since #299 (2026-10-13) gemma4 binds GLP
+/// vectors, so steering is a second activation-affecting dimension beside
+/// the graft: a steered server's saved KV must never be addressed by an
+/// unsteered or differently-steered one, exactly as S6/qwen35 established.
+/// The GLP section is the SAME `glp_steering_params_hash` implementation
+/// the qwen35 engine uses (raw direction bytes, hook, mode, dose), so the
+/// two engines cannot drift on what counts as "differently steered".
+/// Unsteered + ungrafted engines hash the stable
+/// `steering=v1/glp=none/graft=none` triple — the literal `glp=none`
+/// bytes the pre-#299 inline form embedded are now hashed through the
+/// shared helper instead, so the unconfigured key VALUE changes once
+/// across this commit (a one-time cold miss for in-process LCP entries;
+/// the LcpRegistry is per-loaded-model and never outlives the process —
+/// safe direction, and any steered server was unreachable before #299).
+fn gemma4_steering_and_graft_params_hash(loaded: &GemmaLoadedModel) -> u64 {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     h.update(b"steering=v1");
-    h.update(b"glp=none");
+    h.update(
+        &super::engine_qwen35::glp_steering_params_hash(loaded.weights.glp.as_ref())
+            .to_le_bytes(),
+    );
     h.update(
         &crate::inference::graft::graft_params_hash(loaded.weights.kv_graft.as_ref().map(
             |bound| &bound.bank,
@@ -23460,12 +23517,13 @@ fn build_lcp_key_for_request(
     crate::serve::kv_persist::lcp_registry::LcpKey {
         model_fingerprint: fp,
         tenant_id: String::new(),
-        // ADR-059: graft-aware identity (the qwen35
-        // `steering_and_graft_params_hash` pattern) — a grafted prefix can
-        // never masquerade as a clean one, and differently-grafted servers
-        // never share saved KV. Same graft content ⇒ same key; any change
-        // to bank bytes / mode / hook / n_slots ⇒ different key.
-        params_hash: gemma4_graft_aware_params_hash(loaded),
+        // ADR-059/#299: steering-and-graft-aware identity (the qwen35
+        // `steering_and_graft_params_hash` pattern) — a steered or grafted
+        // prefix can never masquerade as a clean one, and differently-
+        // steered/grafted servers never share saved KV. Same content ⇒
+        // same key; any change to vector/bank bytes, mode, hook, or dose ⇒
+        // different key.
+        params_hash: gemma4_steering_and_graft_params_hash(loaded),
     }
 }
 

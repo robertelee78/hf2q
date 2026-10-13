@@ -318,17 +318,31 @@ fn transport_failure_is_fatal_without_selecting_cached_or_other_files() {
 fn load_resolution_refuses_architectures_that_would_ignore_glp() {
     // A family whose engine never reads the vector must fail the load rather
     // than serve unsteered. The refusal comes before any file or Hub access.
+    // (#299, 2026-10-13: gemma4 left this refused set — it joined
+    // GLP_SERVING_ARCHITECTURES with the residual_stream_post_layer arm —
+    // so the refused example is an architecture with no engine at all.)
     let error = resolve_glp_for_load(
         Path::new("msuiche/Example-GLP"),
-        Path::new("/nonexistent/gemma.gguf"),
-        "gemma4",
+        Path::new("/nonexistent/llama3.gguf"),
+        "llama3",
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("not supported for `gemma4`"), "{error}");
+    assert!(error.contains("not supported for `llama3`"), "{error}");
     for architecture in GLP_SERVING_ARCHITECTURES {
         assert!(error.contains(architecture), "{error}");
     }
+    // The dispatch matrix's gemma4 case: the gate passes gemma4 through and
+    // the load then fails CLOSED on the unusable reference (never silently
+    // unsteered) — the same contract the qwen35 case below proves.
+    let model = tempfile::NamedTempFile::new().unwrap();
+    let gemma_error =
+        resolve_glp_for_load(Path::new("/missing/vector.gguf"), model.path(), "gemma4")
+            .unwrap_err();
+    assert!(
+        format!("{gemma_error:#}").contains("/missing/vector.gguf"),
+        "{gemma_error:#}"
+    );
 }
 
 #[test]
