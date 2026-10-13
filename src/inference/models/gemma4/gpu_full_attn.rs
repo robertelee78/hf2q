@@ -2997,6 +2997,66 @@ impl MlxModelWeights {
             }
         }
 
+        // ADR-053 dual hook sites (#299, 2026-10-13): the gemma4
+        // `residual_stream_post_layer` GLP arm. `hidden` here holds the
+        // COMPLETE post-layer residual stream after every end-of-layer
+        // variant above (the fused iter-367/iter-208 kernels and the split
+        // 3-dispatch decomposition all write it; the site is therefore
+        // anchored AFTER the whole `skip_end_of_layer` block, not inside
+        // any one arm). This is the decode body shared by every
+        // single-token gemma4 path — the serial loop, the
+        // parallel-encode worker (`encode_parallel_layers_chunked` calls
+        // this same fn), `forward_decode_capture_hidden`, and the
+        // slot-aware decode entries — so one hook covers them all.
+        // In-session encode (the caller's session owns the commit), rows=1.
+        // Hook-dispatched exactly once per layer: only a
+        // `residual_stream_post_layer` vector applies here (the gemma4
+        // bind set refuses the writer site by name), never re-applied at
+        // any other tensor. Unsteered (`glp: None`) — no branch, no
+        // barrier, no dispatch: byte-identical. Dose-0 (`alpha == 0`)
+        // skips the dispatch entirely: bit-exact. Spec layer mapping:
+        // `direction.N` applies at layer N (0-based), no offset.
+        if let Some(glp) = self.glp.as_ref() {
+            if glp.alpha != 0.0
+                && glp.vector.hook_point
+                    == crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer
+            {
+                if let Some(direction) = glp.direction_for(layer_idx as u32) {
+                    if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
+                        eprintln!(
+                            "[GLP-APPLY] gemma4-residual decode layer {layer_idx} \
+                             rows=1 hidden={hs} alpha={} mode={:?}",
+                            glp.alpha,
+                            glp.mode()
+                        );
+                    }
+                    // Barrier discipline (the measured 2026-09-09 DeepSeek
+                    // lesson): the projection kernel read-modify-writes
+                    // `hidden` in place. Declare that access pattern BEFORE
+                    // dispatch so the conflict tracker inserts a memory
+                    // barrier against the end-of-layer kernel's in-flight
+                    // write of the same buffer — without it the projection
+                    // can race the write (steer a not-yet-written buffer:
+                    // deterministically wrong, the silent-unsteered class
+                    // ADR-053 forbids).
+                    session
+                        .barrier_between(&[&self.activations.hidden], &[&self.activations.hidden]);
+                    crate::inference::glp::apply_layer_gpu_in_session(
+                        session,
+                        reg,
+                        &self.activations.hidden,
+                        direction,
+                        glp.mode(),
+                        glp.alpha,
+                        1,
+                        hs as u32,
+                    )
+                    .map_err(|e| anyhow::anyhow!("GLP residual apply decode L{layer_idx}: {e}"))?;
+                    *total_dispatches += 1;
+                }
+            }
+        }
+
         if let Some(ref mut p) = profile {
             // All layer ops in single session — attribute everything to S1
             p.s1_dispatches[layer_idx] = *total_dispatches;

@@ -158,8 +158,9 @@ pub enum Command {
     /// ADR-054: derive a GLP steering direction on-device via forced capture
     /// (teacher-forced pinned prefixes, prefill-only; difference-of-means),
     /// export a GLP-conformant GGUF, and prove it with the canary pair
-    /// (zero-dose no-op, live-dose logit shift). Every served GLP family
-    /// (qwen35, qwen35moe, deepseek4) per #300; gemma4 is refused.
+    /// (zero-dose no-op, live-dose logit shift). Families with capture
+    /// adapters (qwen35, qwen35moe, deepseek4) per #300; gemma4 serves
+    /// `--glp` since #299 but has no calibrate adapter and is refused here.
     Calibrate(CalibrateArgs),
 
     /// Serve a GGUF model via OpenAI-compatible HTTP API
@@ -1148,14 +1149,15 @@ pub struct ChatArgs {
 }
 
 /// ADR-054: `hf2q calibrate <model.gguf>` — derive a GLP direction on-device
-/// for any served GLP family (qwen35, qwen35moe, deepseek4 — the same family
-/// set as `--glp` serving; gemma4 has no GLP family by owner decision and is
-/// refused, consistently with the serve-side refusal).
+/// for a family with a calibrate capture adapter (qwen35, qwen35moe,
+/// deepseek4). Since #299 gemma4 serves `--glp` but has no calibrate
+/// capture adapter, so it is refused here only — not at serve time.
 #[derive(Debug, clap::Args)]
 pub struct CalibrateArgs {
     /// Local model GGUF. Supported families: qwen35, qwen35moe, deepseek4
-    /// (the serve-side `--glp` family set); anything else — including
-    /// gemma4 — is refused fail-closed before any weight load.
+    /// (the families with capture adapters); anything else — including
+    /// gemma4, which serves `--glp` since #299 — is refused fail-closed
+    /// before any weight load.
     #[arg(value_name = "MODEL_GGUF", value_hint = clap::ValueHint::FilePath)]
     pub model: PathBuf,
 

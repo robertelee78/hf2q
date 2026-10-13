@@ -367,6 +367,17 @@ pub struct MlxModelWeights {
     /// graft-wired refuse requests by name rather than serving
     /// ungrafted (the ADR-059 fail-closed discipline).
     pub kv_graft: Option<crate::inference::graft::BoundGraft>,
+    /// ADR-053 dual hook sites (#299, 2026-10-13): optional GLP runtime
+    /// steering. When bound, each steered layer's complete post-layer
+    /// residual stream (`hidden` after the fused end-of-layer norm+add+
+    /// scalar) is projected/additively shifted in place at the
+    /// `residual_stream_post_layer` hook. Bound by the serve engine after
+    /// `MlxModelWeights::load_from_gguf` (family site set:
+    /// `[residual_stream_post_layer]` — the writer site is NOT implemented
+    /// for gemma4 and is refused by name at bind). `None` (the default) is
+    /// byte-identical to the unsteered graph; a bound vector with
+    /// `alpha == 0` skips every dispatch (dose-0 is bit-exact).
+    pub glp: Option<crate::inference::glp::BoundGlp>,
     /// Per-layer KV caches.
     pub kv_caches: Vec<MlxKvCache>,
     /// Reusable activation buffers.
@@ -1324,6 +1335,7 @@ impl MlxModelWeights {
             rms_norm_eps: cfg.rms_norm_eps as f32,
             final_logit_softcapping: cfg.final_logit_softcapping.map(|v| v as f32),
             kv_graft: None,
+            glp: None,
             kv_caches,
             activations,
             sliding_window: cfg.sliding_window,

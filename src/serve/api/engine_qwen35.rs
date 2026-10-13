@@ -1737,7 +1737,12 @@ fn build_lcp_key_for_qwen35(
 /// point, operation mode, dose (alpha), and the raw per-layer direction
 /// bytes in layer order. Raw (pre-normalization) bytes are hashed so the
 /// identity tracks the vector FILE, not the derived upload.
-fn glp_steering_params_hash(glp: Option<&crate::inference::glp::BoundGlp>) -> u64 {
+///
+/// `pub(crate)` since #299: the gemma4 engine's cache identity
+/// (`gemma4_steering_and_graft_params_hash`) hashes the same fields through
+/// this one implementation — two engines must never drift on what counts
+/// as "differently steered".
+pub(crate) fn glp_steering_params_hash(glp: Option<&crate::inference::glp::BoundGlp>) -> u64 {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     match glp {

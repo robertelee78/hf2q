@@ -1005,10 +1005,12 @@ updates: either operation can run on dense or MoE activations at a supported
 site. Exact parameter equivalence depends on the writer, biases, and residual
 paths. hf2q applies GLP at runtime; it does not bake GLP into weights or LoRA.
 Compatibility depends on the checkpoint, graph layers, activation site, mode,
-and strength. The inspected application paths are Qwen 3.5/3.6/3.8 and
-DeepSeek-V4. Binding checks the declared hook, layer range, and vector width.
-Qwen applies steering at the post-layer residual; DeepSeek applies the declared
-operation at the FFN writer before residual integration. The reader checks
+and strength. The inspected application paths are Qwen 3.5/3.6/3.8,
+DeepSeek-V4, and Gemma 4. Binding checks the declared hook, layer range, and
+vector width. Qwen applies steering at the post-layer residual; DeepSeek
+applies the declared operation at the FFN writer before residual integration;
+Gemma 4 applies steering at the post-layer residual only (a writer-site
+vector is refused by name on Gemma 4). The reader checks
 declared direction hashes and checkpoint identity. Model-card ancestors do
 not identify the checkpoint being served; converted models use an output-bound
 conversion receipt when available. A declared revision that cannot be verified
@@ -1028,9 +1030,11 @@ W6V2 grammar when no explicit request constraint is supplied. Controlled
 measurements must still hold the actual grammar, model, prompts, sampling
 settings, and budget fixed while varying steering.
 
-**Calibration.** `hf2q calibrate <model.gguf>` works for every served GLP family —
-qwen35, qwen35moe, and deepseek4, the same family set as `--glp` serving; gemma4
-has no GLP family and is refused at both surfaces. It exports a normalized
+**Calibration.** `hf2q calibrate <model.gguf>` works for the families with
+calibrate capture adapters — qwen35, qwen35moe, and deepseek4. Since the
+gemma4 GLP reopen (#299), gemma4 *serves* `--glp` (post-layer residual) but
+has no calibrate capture adapter, so it is refused at calibrate only, not at
+serve time. It exports a normalized
 harmful-versus-harmless prompt direction plus a sidecar report (per-stream
 distill norms, the per-family refusal register, and the canary numbers). The
 apply and capture sites are explicit dials: `--hook-point {writer|residual}`

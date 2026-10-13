@@ -5822,6 +5822,65 @@ impl MlxModelWeights {
                     );
                 }
 
+                // ADR-053 dual hook sites (#299, 2026-10-13): the gemma4
+                // `residual_stream_post_layer` GLP arm, batched prefill.
+                // `pf_hidden` holds the COMPLETE post-layer residual
+                // stream for all `seq_len` rows after the fused
+                // end-of-layer write above, BEFORE the layer-boundary
+                // commit below (the projection must be encoded into the
+                // same session the commit flushes, so the Metal serial
+                // queue orders it ahead of the next layer's reads — the
+                // 2026-09-09 DeepSeek lesson: steering a buffer after the
+                // consumer already read it is a measured no-op). One site
+                // covers every batched-prefill entry: `forward_prefill_batched`,
+                // `_slot_mounted`, `_live_resume{,_slot_mounted}`,
+                // `_multi_seq{,_live}` (all wrap this inner body; the
+                // multi-seq T-stream steers every seq's rows — the site
+                // is per-token, not per-sequence), and the dflash
+                // `forward_decode_verify_batched` (it routes through
+                // `forward_prefill_batched`). The per-layer dump/capture
+                // hooks below CPU-read `pf_hidden` only under
+                // `sync_per_layer`, which forces a finish AFTER this
+                // encode — they observe steered state. Unsteered:
+                // byte-identical. Dose-0: bit-exact. `direction.N`
+                // applies at graph layer N, no offset.
+                if let Some(glp) = self.glp.as_ref() {
+                    if glp.alpha != 0.0
+                        && glp.vector.hook_point
+                            == crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer
+                    {
+                        if let Some(direction) = glp.direction_for(layer_idx as u32) {
+                            if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
+                                eprintln!(
+                                    "[GLP-APPLY] gemma4-residual batched prefill layer {layer_idx} \
+                                     rows={seq_len} hidden={hs} alpha={} mode={:?}",
+                                    glp.alpha,
+                                    glp.mode()
+                                );
+                            }
+                            // Read-modify-write of `pf_hidden` in place:
+                            // declare the hazard so the tracker barriers
+                            // against the end-of-layer write.
+                            s.barrier_between(&[&pf_hidden], &[&pf_hidden]);
+                            crate::inference::glp::apply_layer_gpu_in_session(
+                                &mut s,
+                                reg,
+                                &pf_hidden,
+                                direction,
+                                glp.mode(),
+                                glp.alpha,
+                                seq_len as u32,
+                                hs as u32,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "GLP residual apply batched prefill L{layer_idx}: {e}"
+                                )
+                            })?;
+                        }
+                    }
+                }
+
                 // Layer-boundary commit.  In production, we use `s.commit()`
                 // (no wait) so the GPU runs this layer while the CPU encodes
                 // the next — closes the ~2-3 ms per-layer GPU-idle burst that

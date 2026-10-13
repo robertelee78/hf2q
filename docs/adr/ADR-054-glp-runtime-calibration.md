@@ -40,7 +40,12 @@
    #300).** `hf2q calibrate` generalizes to every served GLP family
    (qwen35, qwen35moe, deepseek4) behind a per-family capture abstraction
    (`src/calibrate/family.rs`); gemma4 is refused, consistent with the
-   serve-side `--glp` family set. The capture/apply site question is
+   serve-side `--glp` family set. *(2026-10-13 correction, #299: gemma4
+   now serves `--glp` — ADR-053 "Gemma 4 joins the GLP family set" — so
+   the "consistent with the serve-side family set" identity no longer
+   holds; gemma4 is refused at calibrate only because it has no capture
+   adapter, not because it has no GLP family.)* The capture/apply site
+   question is
    resolved as a measurement, not a default: the two nulls (writer-site
    apply 2026-09-10; capture-site apply 2026-10-10) falsify both cross-site
    transfer AND apply-at-capture-site for the OBLITERATUS prompt-class

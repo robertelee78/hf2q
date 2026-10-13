@@ -2233,6 +2233,54 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("batched end-of-layer L{layer_idx}: {e}"))?;
         }
+
+        // ADR-053 dual hook sites (#299, 2026-10-13): the gemma4
+        // `residual_stream_post_layer` GLP arm, batched body. `bufs.hidden`
+        // holds the COMPLETE post-layer residual stream for all N rows
+        // after both end-of-layer variants above (fused default + the
+        // unfused 2-dispatch path), so the hook is anchored after the
+        // whole variant block. The projection is row-wise, so steering
+        // the [N, hidden] stream here is identical to steering each
+        // slot's row through the scalar decode arm. In-session encode
+        // (the caller's session owns the commit). Unsteered: no branch,
+        // no barrier, byte-identical. Dose-0: no dispatch, bit-exact.
+        // `direction.N` applies at graph layer N, no offset.
+        if let Some(glp) = self.glp.as_ref() {
+            if glp.alpha != 0.0
+                && glp.vector.hook_point
+                    == crate::inference::glp::GlpHookPoint::ResidualStreamPostLayer
+            {
+                if let Some(direction) = glp.direction_for(layer_idx as u32) {
+                    if std::env::var_os("HF2Q_GLP_DEBUG").is_some() {
+                        eprintln!(
+                            "[GLP-APPLY] gemma4-residual batched decode layer {layer_idx} \
+                             rows={nu} hidden={hs} alpha={} mode={:?}",
+                            glp.alpha,
+                            glp.mode()
+                        );
+                    }
+                    // Read-modify-write of `bufs.hidden` in place: declare
+                    // the hazard before dispatch so the tracker barriers
+                    // against the end-of-layer write (the 2026-09-09
+                    // DeepSeek race lesson).
+                    session.barrier_between(&[&bufs.hidden], &[&bufs.hidden]);
+                    crate::inference::glp::apply_layer_gpu_in_session(
+                        session,
+                        reg,
+                        &bufs.hidden,
+                        direction,
+                        glp.mode(),
+                        glp.alpha,
+                        nu,
+                        hs as u32,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("GLP residual apply batched decode L{layer_idx}: {e}")
+                    })?;
+                }
+            }
+        }
+
         // catsplit: post-FF norm2 + end-of-layer norm+scale (fused or unfused).
         cat_boundary(session, exec, catsplit::Cat::RmsNorm)?;
 

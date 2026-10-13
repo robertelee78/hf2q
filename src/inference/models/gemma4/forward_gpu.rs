@@ -3010,6 +3010,7 @@ mod g4_cfa3_tests {
 
         MlxModelWeights {
             kv_graft: None,
+            glp: None,
 embed_weight,
             layers,
             final_norm,
@@ -3371,6 +3372,7 @@ embed_weight,
 
         let model = MlxModelWeights {
             kv_graft: None,
+            glp: None,
 embed_weight,
             layers: vec![sliding_layer, global_layer],
             final_norm,
