@@ -592,4 +592,3 @@ echo
 echo "OpenCode web stack installed and verified."
 echo "Re-check at any time with: $SELF_CMD --status"
 echo "Restart OpenCode, then use /search or: web_search, web_fetch, web_crawl, web_extract."
-echo "Ruflo aliases are also present: WebSearch, WebFetch, WebCrawl, WebExtract."

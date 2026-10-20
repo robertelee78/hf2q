@@ -8,13 +8,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$test_root/node_modules/@opencode-ai/plugin"
-printf '%s\n' \
-    '{"type":"module","exports":"./index.js"}' \
-    > "$test_root/node_modules/@opencode-ai/plugin/package.json"
-printf '%s\n' \
-    'export const tool = {};' \
-    > "$test_root/node_modules/@opencode-ai/plugin/index.js"
 cp "$repo_root/scripts/opencode-web-stack/web-search-fetch.js" \
     "$test_root/web-search-fetch.mjs"
 
@@ -23,6 +16,12 @@ cp "$repo_root/scripts/opencode-web-stack/web-search-fetch.js" \
 # shellcheck disable=SC2016
 node --input-type=module -e '
 const mod = await import(`file://${process.argv[1]}`);
+if (mod.default?.id !== "web-search-fetch") {
+  throw new Error("default export must carry id for the OpenCode 2.x plugin API");
+}
+if (typeof mod.default.setup !== "function") {
+  throw new Error("default export must carry setup for the OpenCode 2.x plugin API");
+}
 const compact = mod.normalizeJsonCssSchema({heading: "h1"});
 const keyed = mod.normalizeJsonCssSchema({
   name: "Example",

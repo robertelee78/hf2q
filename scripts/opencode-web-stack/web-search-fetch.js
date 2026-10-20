@@ -11,14 +11,16 @@
  *   web_crawl   — bounded multi-page crawl with domain/relevance filters
  *   web_extract — structured CSS or semantic extraction from one URL
  *
- * Permission defaults are injected via the config hook so these tools do not
- * prompt. The built-in fetch-only `webfetch` is removed from the catalog so a
- * search request cannot degrade into guessed URLs; the replacement `web_fetch`
- * retains and expands that capability. Bash, files, tasks, skills, and MCP
- * tools remain untouched.
+ * OpenCode 2.x plugin API: `export default {id, setup}` with tools registered
+ * through `ctx.tool.transform`. The built-in fetch-only `webfetch` is removed
+ * from the catalog so a search request cannot degrade into guessed URLs; the
+ * replacement `web_fetch` retains and expands that capability. OpenCode 2.x
+ * allows tool use by default, so no permission entries are needed. Bash,
+ * files, tasks, skills, and MCP tools remain untouched.
+ *
+ * Executors thread OpenCode's session cancellation `signal` into every
+ * backend request alongside the per-call timeout.
  */
-
-import { tool } from "@opencode-ai/plugin";
 
 const SEARXNG = process.env.OPENCODE_SEARXNG_URL || "http://127.0.0.1:8888";
 const FETCH = process.env.OPENCODE_FETCH_URL || "http://127.0.0.1:11235";
@@ -85,7 +87,7 @@ const QUERY_STOP_WORDS = new Set([
   "wrote",
 ]);
 
-const BETTER_ENGINES = {
+const ENGINE_MAP = {
   general: "bing,google,duckduckgo,mojeek",
   academic: "arxiv,google scholar,semantic scholar,pubmed,crossref,openalex",
   tech: "github,stackoverflow,mdn,docker hub,arch linux wiki,gentoo",
@@ -171,12 +173,18 @@ export function filterRelevantResults(query, results) {
   });
 }
 
-async function postJSON(url, body, timeoutMs) {
+// Combine a per-call timeout with the session's cancellation signal.
+function withTimeout(timeoutMs, signal) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([timeout, signal]) : timeout;
+}
+
+async function postJSON(url, body, timeoutMs, signal) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: withTimeout(timeoutMs, signal),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
   return res.json();
@@ -213,11 +221,11 @@ function mayUseDiscoveryFallback(args) {
   return !args.engines && (!args.category || args.category === "general") && !args.time_range;
 }
 
-export async function searchExecute(args) {
+export async function searchExecute(args, signal) {
   const pages = Math.min(Math.max(Math.trunc(args.pages ?? 2), 1), 3);
   const excerpt = Math.min(Math.max(Math.trunc(args.excerpt_chars ?? 4000), 500), 8000);
   try {
-    const engines = args.engines || BETTER_ENGINES[args.category] || BETTER_ENGINES.general;
+    const engines = args.engines || ENGINE_MAP[args.category] || ENGINE_MAP.general;
     let data;
     let primaryError;
     try {
@@ -225,7 +233,7 @@ export async function searchExecute(args) {
         time_range: args.time_range,
         engines,
         language: args.language,
-      });
+      }, signal);
     } catch (error) {
       primaryError = error;
       data = { results: [], unresponsive_engines: [] };
@@ -248,6 +256,7 @@ export async function searchExecute(args) {
             max_results: pages,
           },
           FETCH_TIMEOUT_MS,
+          signal,
         );
         if (fallback.ok) {
           const fallbackCandidates = dedupByUrl(fallback.results || []).filter(
@@ -295,7 +304,7 @@ export async function searchExecute(args) {
             mode: "static",
             max_chars: excerpt,
             public_only: true,
-          });
+          }, signal);
           const body = page.ok ? clip(page.markdown, excerpt) : `(page read failed: ${page.error})`;
           return `## Source ${index + 1}: ${result.title}${date}\n${result.url} [${engines}]\n\nSearch excerpt: ${searchEvidence}\n\n${body}`;
         } catch (error) {
@@ -309,11 +318,11 @@ export async function searchExecute(args) {
   }
 }
 
-async function fetchExecute(args) {
+async function fetchExecute(args, signal) {
   try {
     assertHttpUrl(args.url);
     const maxChars = Math.min(Math.max(Math.trunc(args.max_chars ?? 12000), 500), 40000);
-    const page = await fetchPage(args.url, { ...args, max_chars: maxChars });
+    const page = await fetchPage(args.url, { ...args, max_chars: maxChars }, signal);
     if (!page.ok) return `WEB_FETCH_FAILED for ${args.url}: ${page.error || "empty content"}`;
     const head = `# ${page.title || page.url}\n${page.url}  (via ${page.via}${page.truncated ? ", truncated" : ""})\n\n`;
     return head + (page.markdown || "(no text content extracted)");
@@ -322,7 +331,7 @@ async function fetchExecute(args) {
   }
 }
 
-async function crawlExecute(args) {
+async function crawlExecute(args, signal) {
   try {
     assertHttpUrl(args.url);
     const maxDepth = Math.min(Math.max(Math.trunc(args.max_depth ?? 2), 1), 5);
@@ -341,6 +350,7 @@ async function crawlExecute(args) {
         max_chars: maxChars,
       },
       FETCH_TIMEOUT_MS,
+      signal,
     );
     if (!result.ok) return `WEB_CRAWL_FAILED for ${args.url}: ${result.error || "crawl failed"}`;
     const pages = (result.pages || []).map(
@@ -390,7 +400,7 @@ export function normalizeJsonCssSchema(schema) {
   return schema;
 }
 
-async function extractExecute(args) {
+async function extractExecute(args, signal) {
   try {
     assertHttpUrl(args.url);
     let schema;
@@ -415,6 +425,7 @@ async function extractExecute(args) {
         max_chars: Math.min(Math.max(Math.trunc(args.max_chars ?? 40000), 500), 100000),
       },
       FETCH_TIMEOUT_MS,
+      signal,
     );
     if (!result.ok) return `WEB_EXTRACT_FAILED for ${args.url}: ${result.error || "extraction failed"}`;
     return `# Web extraction: ${args.url}\n\n${
@@ -425,20 +436,20 @@ async function extractExecute(args) {
   }
 }
 
-export async function searx(query, opts = {}) {
+export async function searx(query, opts = {}, signal) {
   const params = new URLSearchParams({ q: query, format: "json" });
   if (opts.categories) params.set("categories", opts.categories);
   if (opts.engines) params.set("engines", opts.engines);
   if (opts.time_range) params.set("time_range", opts.time_range);
   if (opts.language) params.set("language", opts.language);
   const res = await fetch(`${SEARXNG}/search?${params}`, {
-    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+    signal: withTimeout(SEARCH_TIMEOUT_MS, signal),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} from SearXNG`);
   return res.json();
 }
 
-async function fetchPage(url, opts = {}) {
+async function fetchPage(url, opts = {}, signal) {
   return postJSON(
     `${FETCH}/fetch`,
     {
@@ -449,215 +460,147 @@ async function fetchPage(url, opts = {}) {
       public_only: opts.public_only ?? false,
     },
     FETCH_TIMEOUT_MS,
+    signal,
   );
 }
 
-/** @type {import("@opencode-ai/plugin").Plugin} */
-export default async function webSearchFetch() {
-  return {
-    config(cfg) {
-      cfg.tools = {
-        ...(cfg.tools || {}),
-        webfetch: false,
-      };
-      cfg.permission = {
-        web_search: "allow",
-        web_fetch: "allow",
-        web_crawl: "allow",
-        web_extract: "allow",
-        WebSearch: "allow",
-        WebFetch: "allow",
-        WebCrawl: "allow",
-        WebExtract: "allow",
-        ...(cfg.permission || {}),
-        webfetch: "deny",
-      };
+const SEARCH_INPUT = {
+  type: "object",
+  properties: {
+    query: { type: "string", description: "The search or research query" },
+    category: {
+      type: "string",
+      enum: Object.keys(ENGINE_MAP),
+      description: "Engine set: general, academic, tech, news, or wikidata",
     },
+    engines: {
+      type: "string",
+      description: "Explicit comma-separated engine list (overrides category)",
+    },
+    language: { type: "string", description: "Search language code, e.g. 'en'" },
+    pages: { type: "number", description: "Top pages to read in parallel (default 2, max 3)" },
+    time_range: {
+      type: "string",
+      enum: ["day", "week", "month", "year"],
+      description: "Optional recency window",
+    },
+    excerpt_chars: {
+      type: "number",
+      description: "Content characters per page (default 4000, range 500-8000)",
+    },
+  },
+  required: ["query"],
+  additionalProperties: false,
+};
 
-    tool: {
-      web_search: tool({
+const FETCH_INPUT = {
+  type: "object",
+  properties: {
+    url: { type: "string", description: "Exact URL from the user or web_search" },
+    mode: {
+      type: "string",
+      enum: ["auto", "static", "browser", "stealth"],
+      description: "Fetch strategy (default: auto)",
+    },
+    css_selector: {
+      type: "string",
+      description: "Optional CSS selector, such as 'article' or '.docs-content'",
+    },
+    max_chars: {
+      type: "number",
+      description: "Maximum markdown characters (default 12000, range 500-40000)",
+    },
+  },
+  required: ["url"],
+  additionalProperties: false,
+};
+
+const CRAWL_INPUT = {
+  type: "object",
+  properties: {
+    url: { type: "string", description: "Exact starting URL from the user or web_search" },
+    max_depth: { type: "number", description: "Link depth (default 2, max 5)" },
+    max_pages: { type: "number", description: "Page limit (default 6, max 20)" },
+    allowed_domains: { type: "string", description: "Optional comma-separated domain allowlist" },
+    blocked_domains: { type: "string", description: "Optional comma-separated domain blocklist" },
+    include_external: { type: "boolean", description: "Follow external links (default false)" },
+    query: { type: "string", description: "Optional semantic relevance query" },
+    max_chars: { type: "number", description: "Characters retained per page (default 6000)" },
+  },
+  required: ["url"],
+  additionalProperties: false,
+};
+
+const EXTRACT_INPUT = {
+  type: "object",
+  properties: {
+    url: { type: "string", description: "Exact URL from the user or web_search" },
+    strategy: {
+      type: "string",
+      enum: ["json_css", "cosine"],
+      description: "Extraction strategy; defaults to json_css",
+    },
+    schema_json: {
+      type: "string",
+      description: "Required for json_css: put the JSON-CSS schema string here, never in query",
+    },
+    query: {
+      type: "string",
+      description: "Only for cosine: semantic filter text; never put JSON schema here",
+    },
+    max_chars: { type: "number", description: "Maximum extracted characters" },
+  },
+  required: ["url"],
+  additionalProperties: false,
+};
+
+export default {
+  id: "web-search-fetch",
+  async setup(ctx) {
+    await ctx.tool.transform((editor) => {
+      // Remove the built-in fetch-only `webfetch` so a search request cannot
+      // degrade into guessed URLs; `web_fetch` replaces and expands it.
+      editor.remove("webfetch");
+
+      editor.add({
+        name: "web_search",
         description:
           "Canonical front door for every request to search, research, find, look up, or get current web information. " +
           "Searches via local SearXNG, rejects irrelevant result sets, uses one bounded fixed-provider discovery cascade when needed, " +
           "then reads the top public pages through the guarded static path with route and engine provenance. " +
           "Always call this before web_fetch; never guess a URL. One call should normally complete the research.",
-        args: {
-          query: tool.schema.string().describe("The search or research query"),
-          category: tool.schema
-            .enum(Object.keys(BETTER_ENGINES))
-            .optional()
-            .describe("Engine set: general, academic, tech, news, or wikidata"),
-          engines: tool.schema
-            .string()
-            .optional()
-            .describe("Explicit comma-separated engine list (overrides category)"),
-          language: tool.schema
-            .string()
-            .optional()
-            .describe("Search language code, e.g. 'en'"),
-          pages: tool.schema.number().optional().describe("Top pages to read in parallel (default 2, max 3)"),
-          time_range: tool.schema
-            .enum(["day", "week", "month", "year"])
-            .optional()
-            .describe("Optional recency window"),
-          excerpt_chars: tool.schema
-            .number()
-            .optional()
-            .describe("Content characters per page (default 4000, range 500-8000)"),
-        },
-        execute: searchExecute,
-      }),
+        input: SEARCH_INPUT,
+        execute: async (input, context) => ({ content: await searchExecute(input, context.signal) }),
+      });
 
-      web_fetch: tool({
+      editor.add({
+        name: "web_fetch",
         description:
           "Fetch one URL supplied by the user or returned by web_search. Never invent or guess a URL. " +
           "Returns clean LLM-ready markdown via local Crawl4AI. " +
           "mode='auto' (default) uses static, then Chromium, then a Cloudflare-aware stealth browser only when needed.",
-        args: {
-          url: tool.schema.string().describe("Exact URL from the user or web_search"),
-          mode: tool.schema
-            .enum(["auto", "static", "browser", "stealth"])
-            .optional()
-            .describe("Fetch strategy (default: auto)"),
-          css_selector: tool.schema
-            .string()
-            .optional()
-            .describe("Optional CSS selector, such as 'article' or '.docs-content'"),
-          max_chars: tool.schema
-            .number()
-            .optional()
-            .describe("Maximum markdown characters (default 12000, range 500-40000)"),
-        },
-        execute: fetchExecute,
-      }),
+        input: FETCH_INPUT,
+        execute: async (input, context) => ({ content: await fetchExecute(input, context.signal) }),
+      });
 
-      web_crawl: tool({
+      editor.add({
+        name: "web_crawl",
         description:
           "Crawl multiple pages starting at one exact URL. Use after web_search when a task needs a bounded section of a site, " +
           "not for one-page reading. Supports domain and relevance filters and returns clean markdown from each page.",
-        args: {
-          url: tool.schema.string().describe("Exact starting URL from the user or web_search"),
-          max_depth: tool.schema.number().optional().describe("Link depth (default 2, max 5)"),
-          max_pages: tool.schema.number().optional().describe("Page limit (default 6, max 20)"),
-          allowed_domains: tool.schema.string().optional().describe("Optional comma-separated domain whitelist"),
-          blocked_domains: tool.schema.string().optional().describe("Optional comma-separated domain blocklist"),
-          include_external: tool.schema.boolean().optional().describe("Follow external links (default false)"),
-          query: tool.schema.string().optional().describe("Optional semantic relevance query"),
-          max_chars: tool.schema.number().optional().describe("Characters retained per page (default 6000)"),
-        },
-        execute: crawlExecute,
-      }),
+        input: CRAWL_INPUT,
+        execute: async (input, context) => ({ content: await crawlExecute(input, context.signal) }),
+      });
 
-      web_extract: tool({
+      editor.add({
+        name: "web_extract",
         description:
           "Extract structured data from one exact URL. Use json_css with schema_json, for example " +
           "{\"baseSelector\":\"body\",\"fields\":[{\"name\":\"heading\",\"selector\":\"h1\",\"type\":\"text\"}]}; " +
           "or use cosine with a semantic query.",
-        args: {
-          url: tool.schema.string().describe("Exact URL from the user or web_search"),
-          strategy: tool.schema.enum(["json_css", "cosine"]).optional().describe("Extraction strategy; defaults to json_css"),
-          schema_json: tool.schema
-            .string()
-            .optional()
-            .describe("Required for json_css: put the JSON-CSS schema string here, never in query"),
-          query: tool.schema
-            .string()
-            .optional()
-            .describe("Only for cosine: semantic filter text; never put JSON schema here"),
-          max_chars: tool.schema.number().optional().describe("Maximum extracted characters"),
-        },
-        execute: extractExecute,
-      }),
-
-      WebSearch: tool({
-        description:
-          "Alias of web_search. Canonical front door for every request to search, research, find, look up, or get " +
-          "current web information. Uses local SearXNG, relevance validation, a bounded fixed-provider discovery cascade, " +
-          "and guarded public page reads with provenance. Always call this before WebFetch; never guess a URL.",
-        args: {
-          query: tool.schema.string().describe("The search or research query"),
-          category: tool.schema
-            .enum(Object.keys(BETTER_ENGINES))
-            .optional()
-            .describe("Engine set: general, academic, tech, news, or wikidata"),
-          engines: tool.schema
-            .string()
-            .optional()
-            .describe("Explicit comma-separated engine list (overrides category)"),
-          language: tool.schema
-            .string()
-            .optional()
-            .describe("Search language code, e.g. 'en'"),
-          pages: tool.schema.number().optional().describe("Top pages to read in parallel (default 2, max 3)"),
-          time_range: tool.schema
-            .enum(["day", "week", "month", "year"])
-            .optional()
-            .describe("Optional recency window"),
-          excerpt_chars: tool.schema
-            .number()
-            .optional()
-            .describe("Content characters per page (default 4000, range 500-8000)"),
-        },
-        execute: searchExecute,
-      }),
-
-      WebFetch: tool({
-        description:
-          "Alias of web_fetch. Fetch one URL supplied by the user or returned by WebSearch. Never invent or guess a URL. " +
-          "Returns clean LLM-ready markdown via the local fetch stack. mode='auto' (default) uses static, then " +
-          "Chromium, then a Cloudflare-aware stealth browser only when needed.",
-        args: {
-          url: tool.schema.string().describe("Exact URL from the user or WebSearch"),
-          mode: tool.schema
-            .enum(["auto", "static", "browser", "stealth"])
-            .optional()
-            .describe("Fetch strategy (default: auto)"),
-          css_selector: tool.schema
-            .string()
-            .optional()
-            .describe("Optional CSS selector, such as 'article' or '.docs-content'"),
-          max_chars: tool.schema
-            .number()
-            .optional()
-            .describe("Maximum markdown characters (default 12000, range 500-40000)"),
-        },
-        execute: fetchExecute,
-      }),
-
-      WebCrawl: tool({
-        description: "Alias of web_crawl for Ruflo workflows. Bounded multi-page crawl from one exact URL.",
-        args: {
-          url: tool.schema.string().describe("Exact starting URL from the user or WebSearch"),
-          max_depth: tool.schema.number().optional().describe("Link depth (default 2, max 5)"),
-          max_pages: tool.schema.number().optional().describe("Page limit (default 6, max 20)"),
-          allowed_domains: tool.schema.string().optional().describe("Optional comma-separated domain whitelist"),
-          blocked_domains: tool.schema.string().optional().describe("Optional comma-separated domain blocklist"),
-          include_external: tool.schema.boolean().optional().describe("Follow external links (default false)"),
-          query: tool.schema.string().optional().describe("Optional semantic relevance query"),
-          max_chars: tool.schema.number().optional().describe("Characters retained per page (default 6000)"),
-        },
-        execute: crawlExecute,
-      }),
-
-      WebExtract: tool({
-        description:
-          "Alias of web_extract for Ruflo workflows. Structured or semantic extraction from one exact URL. " +
-          "For json_css, pass schema_json with baseSelector and a fields array.",
-        args: {
-          url: tool.schema.string().describe("Exact URL from the user or WebSearch"),
-          strategy: tool.schema.enum(["json_css", "cosine"]).optional().describe("Extraction strategy; defaults to json_css"),
-          schema_json: tool.schema
-            .string()
-            .optional()
-            .describe("Required for json_css: put the JSON-CSS schema string here, never in query"),
-          query: tool.schema
-            .string()
-            .optional()
-            .describe("Only for cosine: semantic filter text; never put JSON schema here"),
-          max_chars: tool.schema.number().optional().describe("Maximum extracted characters"),
-        },
-        execute: extractExecute,
-      }),
-    },
-  };
-}
+        input: EXTRACT_INPUT,
+        execute: async (input, context) => ({ content: await extractExecute(input, context.signal) }),
+      });
+    });
+  },
+};
