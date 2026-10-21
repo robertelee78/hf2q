@@ -88,7 +88,7 @@ const QUERY_STOP_WORDS = new Set([
 ]);
 
 const ENGINE_MAP = {
-  general: "bing,google,duckduckgo,mojeek",
+  general: "bing,google,duckduckgo web,mojeek",
   academic: "arxiv,google scholar,semantic scholar,pubmed,crossref,openalex",
   tech: "github,stackoverflow,mdn,docker hub,arch linux wiki,gentoo",
   news: "google,duckduckgo,mastodon hashtags",

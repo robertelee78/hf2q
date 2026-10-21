@@ -89,7 +89,7 @@ HOME="$test_home" PATH="$fake_bin:$PATH" FAKE_FALLBACK_OK=1 \
 grep -Fq "fixed-provider discovery fallback: 1 results via brave-search-fallback/guarded-static" "$test_root/status-fallback"
 jq -e '.query == "who wrote unicornscan" and .max_results == 3' \
     "$test_home/fallback.request.json" >/dev/null
-grep -Fq "engines=bing,google,duckduckgo,mojeek" "$test_home/curl.calls"
+grep -Fq "engines=bing,google,duckduckgo web,mojeek" "$test_home/curl.calls"
 grep -Fq "status: healthy" "$test_root/status-fallback"
 if HOME="$test_home" PATH="$fake_bin:$PATH" FAKE_FALLBACK_OK=2 \
     "$installer" --status >"$test_root/status-substring" 2>&1; then

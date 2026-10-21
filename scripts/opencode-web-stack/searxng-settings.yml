@@ -161,6 +161,10 @@ engines:
     inactive: false
   - name: duckduckgo
     weight: 1.3
+    disabled: true
+    inactive: false
+  - name: duckduckgo web
+    weight: 1.3
     disabled: false
     inactive: false
   - name: yahoo

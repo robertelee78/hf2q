@@ -44,7 +44,7 @@ LAUNCH_DIR="$HOME/Library/LaunchAgents"
 SEARX_PLIST="$LAUNCH_DIR/com.opencode.searxng.plist"
 FETCH_PLIST="$LAUNCH_DIR/com.opencode.crawl4ai.plist"
 USER_DOMAIN="gui/$(id -u)"
-GENERAL_SEARCH_ENGINES="bing,google,duckduckgo,mojeek"
+GENERAL_SEARCH_ENGINES="bing,google,duckduckgo web,mojeek"
 # `$needle` belongs to jq and must remain literal here.
 # shellcheck disable=SC2016
 FALLBACK_RESULT_FILTER='
