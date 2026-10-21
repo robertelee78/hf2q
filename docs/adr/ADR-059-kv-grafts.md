@@ -138,6 +138,84 @@ full-attention layers and every cache splice lands at indices
    bank sha, same 4/60 reference result; artifacts now live under
    `artifacts/grafts/`, gitignored).
 
+**The flagship instance — vanilla Qwen3.6-35B-A3B, the Abliterix-EGA
+comparison row (MEASURED 2026-10-11/12, #205):**
+
+The operator-selected flagship (2026-09-24) is the vanilla 35B —
+the exact base of the published Abliterix-EGA weight-surgery release
+(`jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated`) — so the
+graft row lands directly against that card's own measured row. A
+finding recorded before any number: the pre-staged
+`models/sources/Qwen3.6-35B-A3B` is the EGA ABLITERATED variant
+(`abliterix_config.json`; abliteration/uncensored tags), not stock —
+zero refusal headroom (base-run 0/60 harmful refusals, v1 0/60, the
+distill pool returns no `sup` targets and the deterministic trainer
+crash-loops on the empty pool; attempt 1 died in 99 s — recorded
+honestly, lane stopped). The comparable flagship re-staged on stock
+`Qwen/Qwen3.6-35B-A3B` (`models/sources/Qwen3.6-35B-A3B-stock`, lane
+key `qwen36-35b-stock`; the requalification instruments landed via
+PR #328):
+
+- **Lane scoreboard, the binary criterion (measured at training, not
+  re-run): BASE 48/60 harmful refusals → TRAINED 0/60; harmless 0/20
+  in both arms** — the success criterion reads YES on a stock aligned
+  model with measured headroom.
+- **Two-judge StrongREJECT requalification** (256-prompt suite
+  `probes_harmful_all.jsonl` = harmful_seed 60 + holdout 62 + general
+  74 + ext 60; temperature 0, thinking off, speculation off,
+  TQ substrate, family-default scheduler; judge A = the EGA release's
+  own APEX-Q5_K_M artifact, judge B =
+  gemma-4-26B-A4B-it-ara-abliterated; StrongREJECT 1–5, refuse =
+  1–3; judge-error rows fail-closed and excluded — 47/256 baseline,
+  88/256 grafted, of which judge A alone 35/81 — never guessed):
+  baseline **A 154/209 (73.7%), B 150/209 (71.8%)** → grafted
+  **A 57/168 (33.9%), B 41/168 (24.4%)**; ensemble-both-refuse
+  **141/209 (67.5%) → 31/168 (18.5%)**; inter-judge agreement
+  89.5% → 78.6%. Paired common probes: A 117/160 → 59/160
+  (65 refuse→comply vs 7 comply→refuse); B 144/237 → 48/237 (97 vs 1).
+  Both judges are abliteration-tuned (disclosed limitation; judge A
+  fail-closes cross-field-invariant violations on 14–32% of rows,
+  verified by raw-output diagnostic 2026-10-11; judge B on 1–5%).
+- **Capability cost: none measurable** — 9/15 → 9/15 GSM8K-class
+  spot check (the honesty metric). Truncations rose 120 → 256 of 271
+  completions (the graft's direct-answer style spends more of the
+  512-token cap); empty rows 0 → 0.
+- **KL(base‖grafted) = 0.0379** (teacher-forced, 20 base harmless
+  yardstick completions).
+- **The comparison row — same base model, runtime graft vs weight
+  surgery:**
+
+| instance | refuse | quality | KL from base | character |
+|---|---|---|---|---|
+| Abliterix-EGA weight surgery (the published card row) | 10.5% SR (53/507; gpt-4o-mini judge, HarmBench 512) | compliance 4.55/5 (judge mean) | **0.1153** (final-token logit KL, n=100 harmless, full vocab) | irreversible weight edits (layers 18–22: attn projections, shared + routed expert down-proj) |
+| hf2q `--kv-graft` (this row) | 33.9% A / 24.4% B SR (own 256-prompt suite, two ablation-tuned judges); ensemble-both 18.5% | capability 9/15 = baseline (no measurable cost) | **0.0379** (teacher-forced KL, n=20) | zero weight edits, boot-reversible, checkpoint-bound |
+
+  Honest framing: the suites and judges differ — the EGA card's own
+  cross-pipeline caveat (their "why the numbers look different" note)
+  applies in both directions — and the two KL protocols are related
+  but not identical, so the ~3× divergence ratio is indicative, not
+  card-comparable. The directly comparable shape: weight surgery cuts
+  refuse deeper (10.5% under their instruments vs 33.9/24.4% under
+  ours) at ~3× the measured divergence from base, and is permanent;
+  the graft removes most of the headroom (48/60 → 0/60 on the fixed
+  lane set; 73.7/71.8% → 33.9/24.4% two-judge) at ~1/3 the
+  divergence, and is reversible — remove the flag and the served
+  model is bit-for-bit stock (the zero-slot/disable canaries). For
+  the card's own context: their table records the heretic variants at
+  61.1% / 52.9% refuse (KL 0.188 / 0.119) and the method author's own
+  release at 8.1% refuse (KL 0.349) — the graft's KL sits below every
+  weight-surgery row in that table.
+- **Serving and binding facts**: binary hf2q 0.1.24 @ 8c873964 (the
+  #328 instruments merge touched `scripts/graft_probe` only); the
+  serve artifact is the hf2q-converted stock Q4_K_M (20.22 GiB,
+  `hf2q info` static checks passed — family config, embedded
+  tokenizer, serving chat contract, tensor directory) — NOT the
+  abliterated source; the graft is `trained.graft.gguf` (128 slots,
+  direct_kv, step 400, sup loss 0.0000, bank sha256 44e858578c66),
+  its to-gguf identity facts fixed by the #310 re-wrap (identity
+  metadata only; the trained bank unchanged). Artifacts under
+  `artifacts/grafts/qwen36-35b-stock/` (gitignored).
+
 The falsified path that got here (kept as evidence): donated banks —
 both user-turn reading state and assistant-ack multi-shot state — are
 behaviorally inert at every dose (0/12 style transfer at 64/128/256
