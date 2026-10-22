@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.27] — 2026-10-22
+
+### Added
+
+- GLP apply support for Gemma 4 — the `residual_stream_post_layer`
+  apply arm (the family's second hook site), so GLP steering applies on
+  Gemma 4 at the post-layer residual site (ADR-053, #299).
+- `hf2q convert --source-ref` records hub-verified receipts for
+  local-source conversions, pinning the exact upstream revision a
+  local source directory was verified against (#337).
+- The Qwen3.8-27B vanilla graft lane is registered (the triple-combo
+  QE prerequisite), and the ADR-059 flagship record is landed: the
+  trained KV-graft scoreboard on stock Qwen3.6-35B-A3B — lane
+  48/60 → 0/60 refusals (harmless 0/20 intact), two-judge StrongREJECT
+  73.7%/71.8% → 33.9%/24.4% at unchanged capability (9/15 → 9/15),
+  teacher-forced KL 0.038 vs the published weight-surgery row's 0.115
+  (Abliterix-EGA) — runtime unalignment at ~1/3 the divergence,
+  boot-reversible, zero weight edits (#205, #336).
+
+### Fixed
+
+- Dependency advisories cleared: rustls 0.23.46,
+  rustls-webpki 0.103.16, webpki-root-certs and webpki-roots 1.0.10
+  (RUSTSEC-2026-0346..0349, 0381..0383) (#345).
+- The OpenCode web-search stack: the `web-search-fetch` plugin is
+  ported to the OpenCode 2.x plugin API (the built-in fetch-only
+  `webfetch` is removed outright rather than denied), general searches
+  route via duckduckgo web to dodge the JS-endpoint CAPTCHA, and the
+  getting-started contract asserts the new markers (#342, #343, #345).
+
+
 ## [0.1.26] — 2026-10-12
 
 ### Added
