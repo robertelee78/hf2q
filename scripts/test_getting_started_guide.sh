@@ -151,10 +151,12 @@ do
 done
 require_literal "$assets/searxng-settings.yml" '__SEARXNG_SECRET__'
 reject_literal "$assets/searxng-settings.yml" 'bce60a2c2f73acf96d64eac04a6591d04'
-require_literal "$assets/web-search-fetch.js" 'webfetch: false'
-require_literal "$assets/web-search-fetch.js" 'webfetch: "deny"'
+# The 2.x plugin port (#342) replaced the 1.x config disables
+# (`cfg.tools.webfetch: false` + `cfg.permission.webfetch: "deny"`) with a
+# single stronger mechanism — the tool-removal call in ctx.tool.transform.
+require_literal "$assets/web-search-fetch.js" 'editor.remove("webfetch")'
 require_literal "$assets/web-search-fetch.js" 'normalizeJsonCssSchema'
-require_literal "$assets/web-search-fetch.js" 'bing,google,duckduckgo,mojeek'
+require_literal "$assets/web-search-fetch.js" 'bing,google,duckduckgo web,mojeek'
 require_literal "$assets/web-search-fetch.js" 'public_only: true'
 require_literal "$assets/web-search-fetch.js" '/search-fallback'
 require_literal "$assets/web-search-fetch.js" 'resultsLookRelevant'
