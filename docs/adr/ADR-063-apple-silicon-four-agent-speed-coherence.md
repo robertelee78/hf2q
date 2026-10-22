@@ -1,0 +1,522 @@
+# ADR-063: Apple Silicon four-agent GGUF speed and coherence
+
+- **Status:** Proposed; research and skeptic revision complete, implementation designs require approval.
+- **Date:** 2026-10-22
+- **Updated:** 2026-10-22 — narrowed release scope after Claude critique and operator hardware/model/QE requirements.
+- **Deciders:** Robert E. Lee (product owner)
+- **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
+- Stable source ID: ADR-063
+- Audited baseline: hf2q `5d1ffe7f1c5cf4ba5ffca452ec4bde738231beef` / v0.1.27.
+- Research cutoff: 2026-10-22; [research evidence and sources](../research/apple-silicon-speed-parity-2026-10-22.md).
+
+## Context
+
+### Intent and authority
+
+The product goal is leadership in GGUF inference on Apple Silicon. The primary outcome is four concurrently active agentic coding slots on the operator M5 Max with 128 GB RAM, with coherence/tool correctness at least as good as peers and performance at least competitive, preferably faster. Current primary implementations and October releases determine the experiment shortlist; old ADRs supply constraints and failed evidence, not an automatic implementation queue.
+
+This proposal consolidates the strongest ideas from ADR-010/011/016/019/034/037/039/040/042/044/049 and newer October work. It does not silently supersede their accepted safety contracts. The release target is v0.1.28; the prior milestone-6 producer scope moves to v0.1.29. All new stories begin in Backlog; creating a project does not approve a technical design or claim an experiment passed. Do not duplicate existing managed issues; source corrections must reconcile their existing bindings. A feature story is accepted only on its own observable contract; cross-family milestones do not establish universal coverage.
+
+The primary comparison is four simultaneously runnable agent slots with at least six tool rounds each; one-slot controls and mixed prefill/decode populations 3+1, 2+2 and 1+3 are required. Stock current hf2q, experimental hf2q from that baseline, and latest llama.cpp are mandatory arms, frozen for each experiment. Same-artifact peers use hf2q-produced GGUFs. MLX/native-format comparisons are separate quality-qualified arms. The mandatory hardware is M5 Max with 128 GB RAM; other Apple generations are future separate strata. Linux/CUDA runtime support is outside scope. Ideas may originate anywhere but win only through owned Rust/Metal GGUF measurements on this host. Primary artifacts are vanilla Qwen3.6-35B-A3B MoE, vanilla Qwen3.8-27B dense and DeepSeek-V4; Gemma is a secondary regression lane. Four slots do not mean four Macs. Quality gates and sampling transformations cannot be relaxed to manufacture a speed win.
+
+## Decision
+
+### Global acceptance and exclusions
+
+The program MUST preserve Rust-owned conversion, quantization and inference, OpenAI unary/SSE and native tool semantics, exact supported cache/verification invariants, conversation isolation and operator resource ceilings. It MUST bind comparisons to source, registry dependencies, binaries, model/draft hashes, exact input/settings, hardware and raw receipts. No 90GiB peer/hf2q co-residency on the 128GiB host; consult release coordination before heavy work and stop every test server.
+
+The program MUST NOT revive falsified router-only precision fixes, reimplement already shipped tiled/block-skip attention, presume HASS/Hydra stacked gains, introduce approximate recurrent or nonprefix reuse into exact serving, use Python/vendor production conversion, substitute prequantized targets, or equate one-slot headline throughput with four-agent success. ANE encoder offload, distributed Macs and custom training are excluded from this delivery; they may reopen only with a separate current evidence-backed design. The July BaseRT paper is historical context; October 22 BaseRT 0.4.0 and current peer kernels are the recency baseline.
+
+Conditional work means its deciding experiment must record implement, falsify, or successor-design with evidence. It is never permission to land a stub or promise an unmeasured speedup. Experiment receipts and implementation candidates use merge delivery; Q4 alone closes the v0.1.28 product release boundary; Q2 certifies the harness and Q3 independently proves the measured effects. A required runtime change needs a published native revision and clean registry-resolving proof. The final qualification depends on the actual winning subset, declared before candidate acceptance; it need not wait for unrelated or falsified hypotheses.
+
+
+## F. Evidence and current peers
+
+### F1. Freeze October 2026 peer, target and hardware identities
+
+Outcome: A reproducible manifest freezes current stock hf2q, experimental hf2q and latest llama.cpp, with separately labeled historical and Apple-specific comparators.
+
+Requirement: The program MUST deliver a reproducible manifest freezes current stock hf2q, experimental hf2q and latest llama.cpp, with separately labeled historical and Apple-specific comparators.
+
+Acceptance:
+
+- Explain and resolve the three observed peer identities without silently changing the accepted product pin or modifying /opt/llama.cpp.
+
+- Freeze source/build/binary hashes, target and draft artifact hashes, native registry pin, hardware/OS/Metal versions, templates and rendered tokens; all compared releases must exist by 2026-10-22.
+
+- Include current llama.cpp and screen BaseRT 0.4.0, MLX 0.32.4/current main and Kapitsa for supported four-slot tool semantics; unsupported or unavailable arms are reported, never invented.
+
+- Use identical hf2q-produced GGUFs for same-artifact lanes; native-format comparisons require separately labeled quantization and independent quality evidence.
+
+- Resolve latest upstream llama.cpp at the beginning of each campaign and freeze it through that campaign; the historical pin is provenance, not a substitute for the latest-peer primary arm.
+
+- Primary artifacts are official vanilla Qwen3.6-35B-A3B MoE, vanilla Qwen3.8-27B dense, and DeepSeek-V4 on the operator M5 Max with 128 GB RAM; Gemma is a secondary regression lane. Freeze exact HF revisions and hf2q conversion provenance, not an abliterated substitute.
+
+- The default peer executable is absent and its build-info metadata is stale b9278/5306f4b3b; build an isolated current peer and verify its own --version plus binary hash. Source HEAD alone is not executable identity.
+
+- The historical e15384a5 peer hash is unavailable locally and upstream; preserve historical receipts but propose a reachable validated replacement through the governing pin workflow.
+
+- Declare peer matched-settings and peer-best-documented configurations. The mandatory latest-peer performance arm uses peer-best valid settings; speculation cannot be silently disabled to handicap it. Retain MTP tensors in the shared GGUF if any arm uses them and pin separate drafter weights.
+
+
+Validation: Validate an immutable comparison manifest against source, binary version output, hashes and capability probes; no model load before coordination and memory preflight.
+
+Predecessors: none.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+### F2. Establish the four-agent coding quality and latency scoreboard
+
+Outcome: Four genuinely concurrent agent conversations have reproducible quality, fairness and speed baselines.
+
+Requirement: The program MUST deliver four genuinely concurrent agent conversations have reproducible quality, fairness and speed baselines.
+
+Acceptance:
+
+- Use one-slot diagnostic controls and four simultaneously runnable client slots with at least six tool rounds each, independent conversations, simultaneous cold starts, staggered arrivals, warm append turns, divergent edits, equality hits, cancellation/retry and request-order permutations.
+
+- Freeze independent tool-name/argument and coding-task correctness oracles; unary/SSE, reasoning completion, tool-result continuation and isolation must pass. Peer wording need not match.
+
+- Report semantic TTFT p50/p95/max per slot, maximum semantic SSE gap, four-agent makespan, successful-task goodput, new/cached tokens, prefill/decode rates, queue/restore/draft/verify time, peak RSS and thermal state.
+
+- Use warmup and at least five balanced paired blocks, then a predeclared 95% confidence-interval half-width target of 2.5 percentage points for the primary effect, with a maximum of 20 blocks per primary comparison; unresolved results are inconclusive, never a win.
+
+- Measure mixed prefill/decode populations 3+1, 2+2 and 1+3, plus pure four-prefill and four-decode controls; trace active/runnable slots and actual physical cohort membership. Overlapping queued HTTP requests alone do not prove concurrency.
+
+- The mandatory primary arms are stock current hf2q, experiment from the same baseline, and latest llama.cpp, frozen per run; other engines and the historical peer are separately labeled secondary comparisons.
+
+- Stage the primary matrix on the same M5 Max/128 GB host: Qwen3.6 MoE, vanilla Qwen3.8-27B dense, then DeepSeek-V4. Each needs N1 controls and N4 coding/tool proof. Use representative primary workloads first; expand only where needed to decide a candidate.
+
+- Canonical transcript replay supplies identical rendered inputs for controlled timing and fairness; record the exact cache priming/reset policy and its cost, and never claim natural prefix reuse from a forced transcript. A separate own-output continuation lane scores real coding/tool success, natural reuse and task-level completion from the same initial tasks; its differing token streams are not token-matched timing evidence.
+
+- Greedy is the internal exactness lane. Capture and freeze actual production-client sampling for the primary agentic quality lane; do not assume clients use temperature zero.
+
+- Define scheduler-specific phase labels for Qwen and DeepSeek; stagger long tool-result prefills to hold 3+1, 2+2 and 1+3 populations over measured intervals and report time-weighted observed composition.
+
+- Extend test_full_context_agent_slots.sh, bench_qwen36_agentic_cache.sh, qwen38_speculation_ab.sh and test_agentic_cache_lifecycle.sh where their contracts apply; add only the missing task oracles, phase tracing and independent three-arm receipts.
+
+- Before every campaign read release coordination and reject host contention. Freeze thermal/cooldown protocol in the harness: at least 60 seconds between engines, Nominal thermal start and sustained Fair-or-better sampling; wait longer if needed. Never overlap full-model runtimes.
+
+
+Validation: Run the checked-in certified harness sequentially against frozen engines with balanced crossover ordering; verify real runnable-slot traces, raw responses, result scoring, cleanup and receipt identities.
+
+Predecessors: F1, Q5.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+### F3. Reconcile ADR execution status and invalidated scientific claims
+
+Outcome: The governing ADRs describe current code and distinguish falsified hypotheses from remaining plans.
+
+Requirement: The program MUST deliver the governing ADRs describe current code and distinguish falsified hypotheses from remaining plans.
+
+Acceptance:
+
+- Correct ADR-010 router-only work as invalidated by its own F64 evidence; reconcile ADR-011 integrated tiled/block-skip paths and ADR-019 implemented phases and current published native pin.
+
+- Correct HASS chronology/attribution/EAGLE-2 evidence and Hydra architecture in ADR-037/039; remove unsupported compounded speed and checkpoint-compatibility assumptions.
+
+- Update ADR-049 for logical/physical graft coordinates, DeepSeek persistence, family component validity and current source anchors; keep research decisions Proposed until approved.
+
+- Add Updated stamps and concrete source citations; preserve historical failed experiment evidence and reconcile any existing managed source bindings rather than duplicate their work.
+
+
+Validation: Run the ADR inspector, compare each corrected claim with named code/paper passages, and reconcile affected existing awa sources.
+
+Predecessors: none.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+## C. Exact agentic state reuse
+
+### C1. Specify atomic multi-anchor state and component validity
+
+Outcome: A cross-family exact checkpoint contract handles lineage, mutable windows, grafts and publication without stale reuse.
+
+Requirement: The program MUST deliver a cross-family exact checkpoint contract handles lineage, mutable windows, grafts and publication without stale reuse.
+
+Acceptance:
+
+- Distinguish logical token lengths, physical cursors and graft identity; validate FULL, SWA, recurrent and compressed/indexer sidecars according to family rules.
+
+- Define committed versus pending state, preflight-all-then-mutate restore, descendant invalidation before divergent writes, hard reset after restore failure, and session/model/template/config identity.
+
+- Account K committed plus one pending payload in reclaimable owned bytes; retained hidden rows cannot pin chunk-sized parent buffers. Define in-memory versus disk-promotion policy.
+
+- Specify A-to-B-to-C rewind/diverge/old-C rejection, cancellation, graft replant, cross-conversation isolation and idle-byte conservation oracles before implementation.
+
+- Cancellation never publishes pending anchors; prune descendants invalidated by executed writes and preserve only physically valid committed ancestors. Failed prefill/rollback cannot resurrect overwritten rows.
+
+
+Validation: Review HLD/LLD and run boundary state-machine regressions with synthetic state and real family layout invariants.
+
+Predecessors: F3, Q5.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+### C2. Implement and qualify Qwen multi-depth prompt reuse
+
+Outcome: Qwen3.6 and Qwen3.8 reuse the deepest valid earlier turn after agent context edits.
+
+Requirement: The program MUST deliver Qwen3.6 and Qwen3.8 reuse the deepest valid earlier turn after agent context edits.
+
+Acceptance:
+
+- Implement bounded slot-local anchors with pending publication, atomic restore, lineage pruning, saved-logit equality hits, right-sized payloads and owned-byte telemetry.
+
+- Prove cold-versus-resumed exactness on both Qwen artifacts with graft absent/present/identity change, speculation off/auto, cancellation, failed restore and four concurrent clients.
+
+- Divergent-turn semantic TTFT improves over cold while append-only tasks, memory bounds and ongoing decoder latency stay within frozen acceptance limits.
+
+- Primary Qwen3.8 evidence uses the vanilla official 27B dense model; grafted/abliterated variants remain separate compatibility arms. Family parity obligations for future Gemma/DeepSeek implementations remain explicit successors, not a universal multi-anchor shipping claim.
+
+
+Validation: Run four-slot divergent-edit state/lifecycle gates and paired F2 scoreboard with allocation accounting.
+
+Predecessors: C1, F2.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+### C5. Remove measured warm-request frontend overhead exactly
+
+Outcome: Warm four-agent requests spend less time in rendering/tokenization/lookup without changing token identities.
+
+Requirement: The program MUST deliver warm four-agent requests spend less time in rendering/tokenization/lookup without changing token identities.
+
+Acceptance:
+
+- Measure primary and stable-prefix rendering/tokenization separately from affinity wait, restore, suffix prefill and first semantic output.
+
+- Only implement a reuse or acceleration path if the profile shows material headroom; account for BPE merges across boundaries, special tokens, template changes and vision expansion.
+
+- Compare exact tokens with the authoritative tokenizer across randomized boundary edits and full agent transcripts; a CUDA GraphTok result is not Metal speed evidence.
+
+- Open an acceleration implementation only if frontend work exceeds 10% of measured warm semantic TTFT and an exact path has credible end-to-end headroom; otherwise close the deciding experiment with evidence.
+
+
+Validation: Profile F2 warm turns, compare full-token oracle with proposed CPU/incremental/Metal path, and record pass/falsification and paired end-to-end timing.
+
+Predecessors: F2.
+
+Priority: Medium. Conditional hypothesis; require deciding evidence before implementation.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+## S. Four-slot scheduling and shared forwards
+
+### S1. Prove mixed cooperative prefill cannot corrupt decoders
+
+Outcome: DeepSeek cooperative cohort commit and poison are isolated from simultaneously decoding nonmembers.
+
+Requirement: The program MUST deliver deepSeek cooperative cohort commit and poison are isolated from simultaneously decoding nonmembers.
+
+Acceptance:
+
+- Enumerate every target cache, circular window, compressor/indexer sidecar, ledger and publisher mutation.
+
+- Exercise success, late failure, poison and cancellation during a mixed step; nonmember state and subsequent outputs must equal independent execution.
+
+- If isolation fails, retain the bypass and record a bounded successor scheduler design; removing the bypass alone is not a deliverable.
+
+- This is a DeepSeek-specific bounded coherence experiment; follow-on mixed policy is a successor after the deciding result. MAX_COOPERATIVE_PREFILL_ROWS is 2048, defined at src/inference/models/deepseek4/verifier_forward.rs:26 and consumed at src/serve/api/engine.rs:9859; prior 4096-row OOM evidence prohibits speculative cap expansion.
+
+
+Validation: Run adversarial transaction tests and a real-artifact cohort-prefill plus active-decode oracle.
+
+Predecessors: F2, Q5.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+### S3. Share target forwards across four active slots where profitable
+
+Outcome: Four-slot serving amortizes target weight reads through real physical batching rather than independent batch-one loops.
+
+Requirement: The program MUST deliver four-slot serving amortizes target weight reads through real physical batching rather than independent batch-one loops.
+
+Acceptance:
+
+- Profile live tensor row dimensions, dispatch counts and weight reads for Qwen dense/MoE, Gemma and DeepSeek under F2; distinguish existing batching from gaps.
+
+- Implement missing profitable shared-forward paths with slot-indexed recurrent/KV state and heterogeneous prompt/verify/decode lengths; preserve ordinary fallback for unsupported exact semantics.
+
+- Compare ordinary physical batch-four, independently scheduled requests and speculative row cohorts; require improved goodput/makespan with unchanged per-slot quality and fairness.
+
+- Use ADR-040 historical N4 Gemma 0.75x-to-0.81x peer throughput and non-amortized attention as falsifiable leads, not current measurements. Confirm which batching/attention fixes already landed before creating another kernel.
+
+
+Validation: Capture kernel/row traces and run four-slot independent-versus-shared target and end-to-end comparisons, including cancel/EOS and partial cohort failures.
+
+Predecessors: F2, Q1, Q5.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+## D. Current pretrained speculation
+
+### D1. Qualify existing warm-turn speculation and close measured boundary gaps
+
+Outcome: Existing warm-turn MTP/history behavior is proven at four slots and only demonstrated profitable boundary gaps are extended.
+
+Requirement: The program MUST deliver existing warm-turn MTP/history behavior is proven at four slots and only demonstrated profitable boundary gaps are extended.
+
+Acceptance:
+
+- Current warm append with valid speculative metadata already works. PromptCacheHit only excludes full equality without a reusable speculative boundary; inspect src/serve/api/engine.rs:19240-19290 and src/serve/api/engine_qwen35.rs:4004-4234 before changing behavior.
+
+- Pass full acceptance, partial rejection, zero acceptance, EOS, cancellation, graft restore and eight subsequent ordinary target decisions.
+
+- Qualify exact represented API semantics at four slots and disable measured losing proposals; sampling support requires correct distributional acceptance, not equal-seed anecdotes.
+
+- Bound grafts intentionally disable MTP because the draft arena lacks graft state; retain this fallback unless a separately approved exact graft-aware transaction proves correctness. No greenfield cached-speculation feature is assumed missing.
+
+
+Validation: Extend current exact speculation and cache lifecycle gates; compare F2 warm tool rounds off versus auto.
+
+Predecessors: C1, F2, Q1, Q5.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+### D2. Compare current pretrained DFlash2 and DSpark on exact targets
+
+Outcome: A dated, reproducible experiment selects or rejects current pretrained draft architectures for four-agent Apple serving.
+
+Requirement: The program MUST deliver a dated, reproducible experiment selects or rejects current pretrained draft architectures for four-agent Apple serving.
+
+Acceptance:
+
+- Compare native MTP/history, official DFlash2, September Red Hat DSpark and available current peer support; freeze target/draft metadata, tokenizer and weights.
+
+- Include abliterated/grafted target compatibility, long contexts, nonrepetitive code, tool calls, memory and accepted emitted tokens per total draft/verify/recovery cost.
+
+- Choose by four-slot task completion and quality, not acceptance length or single-slot headlines; document unavailable arms and negative results without forcing a winner.
+
+- This is a deciding reference experiment, not a committed native port. Native drafter/tree work is successor scope only if actual four-slot quality, memory and net cost beat current MTP/history; primary vanilla Qwen3.8 is the compatible dense target.
+
+
+Validation: Run isolated reference qualification and four-slot matched trials; validate independent sequential target decisions and model schema before proposing a native port.
+
+Predecessors: F2, Q1, Q5.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+## K. Apple Silicon kernels and ownership
+
+### K1. Tune October small-row quantized verifier and decode dispatch
+
+Outcome: Actual four-slot and verifier shapes use profitable Apple GPU kernels without precision regressions.
+
+Requirement: The program MUST deliver actual four-slot and verifier shapes use profitable Apple GPU kernels without precision regressions.
+
+Acceptance:
+
+- Prioritize actual GGUF Q4_K/Q5_K/Q6_K verifier widths 4-8 and ordinary physical batch-four, retaining widths 1/2 as controls; expand to 16/32/64 only when live cohort traces justify them. October MLX NVFP4/MXFP4/MXFP8 gains are design evidence, not K-quant results.
+
+- Compare existing mvN/mul_mv_ext/TensorOps/split-K candidates with F32 partial accumulation where required; merged upstream bf16 gains are not proof for K-quants.
+
+- Prove logit/routing and transaction invariants, then require F2 end-to-end improvement; selection must be hardware/shape-aware rather than one global override.
+
+- Any mlx-native change must be published as a reproducible registry revision and pinned in Cargo.toml/Cargo.lock before hf2q acceptance. Account for this separate release critical path; a local path override is never acceptance evidence.
+
+
+Validation: Run frozen shape microbenchmarks, independent sequential/logit oracles, four-slot row traces and paired F2 trials.
+
+Predecessors: F2, Q1, Q5.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+## Q. Coherence and final acceptance
+
+### Q1. Separate internal numerical invariance from peer task quality
+
+Outcome: A diagnostic oracle detects batching/reuse/state divergence without requiring universal peer text identity.
+
+Requirement: The program MUST deliver a diagnostic oracle detects batching/reuse/state divergence without requiring universal peer text identity.
+
+Acceptance:
+
+- Compare internal cold/resume, batch-one/batch-four, chunk size, request order and sequential/speculative paths; locate first norm/QKV/RoPE/attention/residual/MoE divergence with frozen intermediates.
+
+- Record routing margins, expert IDs, logit error and task outputs; no routing smoothing, tie-threshold change or approximate recurrent replay may masquerade as an exactness fix.
+
+- Use independent correctness fixtures for peer coherence; sampled quality margins and trial counts are frozen before candidate runs.
+
+
+Validation: Run source-bound intermediate and transaction comparisons with deliberate stale-state/incorrect-routing negative controls plus the F2 task oracle.
+
+Predecessors: F2.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+### Q2. QE-certify the comparison harness with adversarial controls
+
+Outcome: The experiment harness rejects false quality or speed wins and measures actual slot progress.
+
+Requirement: The program MUST deliver the experiment harness rejects false quality or speed wins and measures actual slot progress.
+
+Acceptance:
+
+- Fail deliberately serialized four-client service, role-only SSE, missing semantic output, wrong tool arguments, stale lineage, cross-slot leakage, silent truncation and altered output budgets.
+
+- Use injected known delays/speedups and corrupted receipts to prove timer direction, metric units, cache accounting, binary/model identity, result scoring and cleanup; no implementation-mirroring tests.
+
+- Prove active slot/phase counts and physical cohort membership rather than merely overlapping HTTP lifetimes; distinguish one-slot controls, mixed 3+1/2+2/1+3 populations and pure four-prefill/four-decode phases.
+
+- Check critical-path and failure-path coverage with Agentic-QE or equivalent independent evidence. A MetaHarness audit may assess harness quality, but scores cannot substitute for real artifact tests.
+
+
+Validation: Run deterministic fake-server/receipt negative controls, then verify instrumentation against actual server traces and fail-closed artifact identity checks.
+
+Predecessors: F2.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+### Q3. Independently prove gains over stock hf2q and latest llama.cpp
+
+Outcome: A QE-owned three-arm comparison quantifies the experimental gain and the remaining peer gap without quality loss.
+
+Requirement: The program MUST deliver a QE-owned three-arm comparison quantifies the experimental gain and the remaining peer gap without quality loss.
+
+Acceptance:
+
+- Freeze three primary arms at run start: current unmodified hf2q, experimental hf2q based on that exact baseline, and latest upstream llama.cpp; retain immutable source/binary identities for all runs.
+
+- Use balanced interleaved three-arm crossover blocks, warmup and stock controls; target a predeclared 95% effect-interval half-width <=2.5 percentage points, minimum five and maximum twenty blocks. An unresolved interval means inconclusive, not faster.
+
+- Report experiment-versus-stock and experiment-versus-latest-peer effects separately for one-slot controls and primary four-slot agentic workloads, including mixed 3+1/2+2/1+3 and pure-phase controls.
+
+- Cluster uncertainty by independent run/conversation, not individual tokens; report quality/task completion, makespan, successful-task goodput, per-slot p95/max semantic TTFT and SSE gaps, memory and thermal validity.
+
+- An independent reviewer must reproduce from checked-in commands and raw receipts; faster incorrect tasks, serial scheduling, mismatched settings, changed artifacts or cherry-picked trials fail.
+
+- A separate named QE session/host from the candidate implementer executes Q3 and records its identity; freeze the certified harness commit and metric definitions before candidate implementation/evaluation.
+
+- Use latest llama.cpp peer-best as the mandatory peer arm and retain a separately labeled matched-settings diagnostic. Peer quality failures are recorded; a missing, failed or silently disqualified peer cannot yield a speed victory by default.
+
+
+Validation: Independent QE executes the certified harness against frozen stock/experiment/latest-peer binaries and publishes paired effect sizes, confidence intervals, rejected trials and verdict.
+
+Predecessors: F2, Q1, Q2, Q5.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+### Q4. Accept and release a faster coherent four-agent Apple configuration
+
+Outcome: The published hf2q configuration meets peer coherence and demonstrates competitive or superior four-agent performance.
+
+Requirement: The program MUST deliver the published hf2q configuration meets peer coherence and demonstrates competitive or superior four-agent performance.
+
+Acceptance:
+
+- All deterministic task/tool/isolation gates pass and predeclared stochastic noninferiority holds against eligible current peers.
+
+- Per primary artifact, competitive means four-agent goodput/makespan within frozen nonregression margins of latest llama.cpp peer-best. A faster verdict requires at least 5% lower makespan or 5% higher successful-task goodput with paired uncertainty excluding a tie; report both stock improvement and peer gap.
+
+- No accepted result worsens frozen p95 TTFT or maximum semantic-gap fairness ceilings; single-slot or microkernel speed alone cannot satisfy this story.
+
+- Choose only winning qualified branches, re-run exact combined configuration gates, publish required native pins, and retain commands/receipts for exact release artifacts. Excluded/falsified experiments need a recorded disposition, not forced implementation.
+
+- Record separate stock-to-experiment and experiment-to-latest-llama.cpp verdicts; report native-format peer competition separately from the mandatory same-GGUF peer verdict.
+
+- Latest llama.cpp must complete the declared workload for a valid performance verdict; peer task failures are explicit quality findings, never grounds for dropping the comparator and claiming a win against nothing.
+
+- Give separate verdicts for vanilla Qwen3.6 MoE, vanilla Qwen3.8-27B dense and DeepSeek-V4 on M5 Max/128 GB. Do not pool native-format peers or a favorable model into a universal GGUF superiority claim.
+
+- Before final candidate acceptance, record the exact winning candidate work keys and immutable commits, add them as required Q4 predecessors in the source/extraction/awa graph, and obtain independent verdicts for their combined configuration. A prose-only winning subset cannot bypass candidate gates.
+
+Validation: Independent review of the combined candidate and raw F2 receipts, followed by exact-artifact release verification on the target Apple host.
+
+Predecessors: F3, Q1, Q2, Q3, Q5.
+
+Priority: High. Core scope.
+
+Delivery boundary: Published v0.1.28 release containing the independently accepted configuration.
+
+### Q5. QE-prove four-slot memory safety on M5 Max 128 GB
+
+Outcome: Every accepted configuration fits the operator host with reserved system headroom and no out-of-memory experiment.
+
+Requirement: The program MUST deliver every accepted configuration fits the operator host with reserved system headroom and no out-of-memory experiment.
+
+Acceptance:
+
+- Before loading, admit model residency, four-slot KV/recurrent state, anchor committed+pending bytes, drafter state and peak in-flight scratch against one disjoint unified-memory ledger; avoid double-counting shared CPU/Metal pages.
+
+- Cap experiment memory at the stricter existing family ceiling and physical memory minus at least 12 GiB system reserve; subtract observed competing nonreclaimable use. Treat 116 GiB as an upper bound on a 128 GiB host, never a promise of availability.
+
+- Run stock, experimental hf2q and peer sequentially, unloading and verifying listeners/process/memory recovery before each load. Never co-reside DeepSeek runtimes or add a drafter/cohort that exceeds the measured budget.
+
+- QE uses synthetic allocation/admission negative controls and bounded real four-slot stress with the largest declared tool-result/context cases; stop on memory pressure, abnormal footprint growth or projected breach before OOM.
+
+- Record logical budgets, OS footprint/pressure, Metal residency, transient high-water, swap/compression deltas and cleanup. Reject a candidate that fits only by silently reducing matched context, task size or output budget.
+
+
+Validation: Independent QE reviews byte ownership and admission arithmetic, runs fail-closed budget controls, then conducts bounded M5 Max real-artifact memory stress without deliberately provoking OOM.
+
+Predecessors: F1.
+
+Priority: High. Core scope.
+
+Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
+
+## Coverage and sequencing
+
+F1 precedes F2; F2 is the source-bound baseline for every measured lane. F3 precedes C1 because the checkpoint contract must reflect current graft and persistence behavior. Q5 memory admission precedes risky model experiments and retained-state expansion. Qwen implementation C2 follows C1 and F2. Gemma/DeepSeek multi-anchor implementation, mixed-policy production work, queue-aware admission, new native block drafters/lattice trees, NAX attention and scratch-wait changes are successor candidates after the primary deciding measurements, not promised v0.1.28 features. S1 and D2 record deciding evidence before successor designs. Q1 is a correctness dependency for shared target batching, speculation and numerical kernels. Different edits to a shared file require merge coordination, not invented product dependencies.
+
+All acceptance, exclusions, failed-path requirements and the winning-subset release rule above are material source obligations and must be represented in the awa extraction coverage. Numerical or API-semantic failures stop promotion. A negative experiment is valuable measured evidence, not a shipped feature; no performance estimate in the research report is an acceptance receipt.
+
+## Consequences
+
+### Positive
+
+The program concentrates on same-GGUF wins for four real coding agents on M5 Max/128 GB. Quality, memory safety and peer-best performance become independent, auditable gates. Invalidated experiments and already-shipped work stop consuming the implementation queue.
+
+### Negative
+
+Three primary artifacts and sequential runtime isolation make real-model evidence expensive. Kernel wins can require a separately published mlx-native revision. Statistical uncertainty may yield an inconclusive outcome instead of a release superiority claim.
+
+### Neutral
+
+The ADR is Proposed and all extracted work starts in Backlog. Creation of the v0.1.28 project is not implementation approval. Historical pin/source drift is repaired by F1/F3 through existing authority, never silently by benchmark configuration.
+
+## Successor watchlist (not committed v0.1.28 implementation scope)
+
+Gemma and DeepSeek multi-depth anchor implementations; production mixed-prefill policy after S1; queue-aware locality after traces; a native DFlash2/DSpark port after D2; lattice trees at a global four-slot row budget; NAX attention; scratch-lifetime synchronization removal; output/LSE shared-segment attention. Each needs its own measured deciding result, memory budget and approved design. ANE conversion/offload, approximate recurrent/nonprefix replay and custom-training-first plans remain excluded.
+
+## Links
+
+- [Research and primary sources](../research/apple-silicon-speed-parity-2026-10-22.md)
+- [Claude critique and dispositions](../research/apple-silicon-speed-parity-2026-10-22-critic.md)
+- [ADR-049: agentic state reuse](ADR-049-agentic-state-reuse-and-mixed-cooperative-prefill.md)
+- [ADR-040: batching](ADR-040-continuous-batching-reopen.md)
+- [ADR-042: DeepSeek-V4](ADR-042-deepseek-v4-flash-rust-native.md)
+- [ADR-044: Qwen3.8](ADR-044-qwen38-native.md)
+- [ADR-059: graft coordinates](ADR-059-kv-grafts.md)
+- [ADR-062: serving parity and persistence](ADR-062-serve-family-parity.md)
+- [ADR-019: encoder ownership history](ADR-019-mlx-native-encoder-architecture.md)
+
+This ADR consolidates research and prospective work; it does not supersede accepted family-specific safety contracts. F3 reconciles historical ADR drift in the same work that updates those sources and their trackers.
