@@ -9,6 +9,10 @@ Source: hf2q implementation at main 5b385d4ff580cc2c9cc70cdb425809b0c64dff63 and
 The subsequent [host metric availability finding](adr063-q5-metric-availability-2026-10-23.md)
 observes incomplete unprivileged cross-UID coverage. Competition remains Unknown;
 the finding neither changes this admission contract nor approves runtime execution.
+The independently reviewed [DeepSeek full-capacity calculation](adr063-q5-deepseek-feasibility-2026-10-23.md)
+also rejects current ownership under the proposed recommendation-based GPU bound.
+That is a policy rejection, not proof of a hard hardware limit; its resolution
+requires a separately reviewed design before execution.
 
 For complete conservative peak process ownership B, physical RAM P, reserve R>=12,884,901,888bytes, fresh aggregate competing-use bound C, optional independently scoped family ceiling F, require checked `B+C+R<=P` and, when applicable, `B<=F`. Also require GPU resource working-set bound G<=W under the explicit device policy below. Never add B, process footprint and Metal bytes together; they overlap. Record logical workload bytes, unique owned capacity, observed process footprint, mapped-file residency observations, and Metal resource/residency diagnostics as separate axes.
 
