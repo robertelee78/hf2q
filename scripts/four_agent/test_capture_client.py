@@ -127,7 +127,11 @@ state.joinpath('client.pid').write_text(str(os.getpid()))
         subprocess.run([sys.executable, str(Path(__file__).with_name("capture_client.py")),
                         "--client", str(client), "--config", str(config), "--output", str(output)],
                        input="driver context must not enter the captured prompt", text=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=True)
+                       # The outer CLI includes version probing (itself bounded at 15s),
+                       # two interpreter starts and owned-process/server cleanup. Allow
+                       # hosted runners time for those stages; stdin isolation is
+                       # asserted from the child's actual read, not elapsed time.
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=True)
         self.assertEqual((output / "state/stdin.txt").read_text(), "")
 
     def test_programmatic_config_has_no_fabricated_raw_file_digest(self):
