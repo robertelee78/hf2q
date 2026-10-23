@@ -1,6 +1,6 @@
 # ADR-063 Q5 memory qualification — corrected design v2
 
-Status: proposed; no runtime approval. Author q5-design-agent. This replaces the v1 proposal, incorporates the [independent review record](adr063-q5-memory-design-review-2026-10-23.md), and retains the [family ceiling inventory](adr063-q5-family-ceilings-2026-10-23.md). Independent reviewer/product acceptance remains the integration owner's recorded decision; this author cannot close it.
+Status: the operator approved the model-free ledger first slice on 2026-10-23; full runtime qualification remains unapproved. Author q5-design-agent. This replaces the v1 proposal, incorporates the [independent review record](adr063-q5-memory-design-review-2026-10-23.md), and retains the [family ceiling inventory](adr063-q5-family-ceilings-2026-10-23.md). The [slice implementation record](adr063-q5-ledger-slice1-2026-10-23.md) describes its actual scope and controls. Full Q5 acceptance remains separate; this design author cannot close it.
 
 Source: hf2q implementation at main 5b385d4ff580cc2c9cc70cdb425809b0c64dff63 and the unchanged runtime implementation in design lineage `94550a85` / `28079a0b`; native f92eb020c4d3f821700e648fbce15d6cf75c2cc6, published 0.15.1. Source inspection only: no builds, model loads, source writes or GitHub writes. F1 remains a predecessor to qualification. Qwen3.8/DeepSeek first priority, all four remain required winners in the separate Q3/Q4 speed program.
 

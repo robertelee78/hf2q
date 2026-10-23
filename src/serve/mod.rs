@@ -30,6 +30,8 @@ pub(crate) mod load_diagnostic;
 pub mod load_info;
 pub(crate) mod managed_artifacts;
 #[allow(dead_code)]
+pub(crate) mod memory_ledger;
+#[allow(dead_code)]
 pub mod multi_model;
 // ADR-040 Phase A iter-1 scaffolding — MultiSeqKvCache trait + types.
 // Production callsite activation gated on Phase A iter-2+ per-model impls.
