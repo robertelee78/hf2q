@@ -39,6 +39,18 @@ Source-directory download metadata records these candidate HF revisions:
 | Gemma 4 26B | `4d7ae4984b7db7de8f8457170b3f1a419ee76d52` | Same limitation; select the explicit official artifact and quantization before comparison. |
 | DeepSeek-V4 | Not established in this inventory | Resolve official source, local availability and conversion provenance before admitting the lane. |
 
+### Official source metadata verification (2026-10-23)
+
+Read-only HTTPS requests to the Hugging Face model revision API resolved each exact revision above to its official repository. Local `config.json` Git-blob hashes (`SHA1("blob " + byte_length + NUL + bytes)`) match the API's blob IDs:
+
+| Repository | Config Git blob | Expected safetensors shards / bytes | Local inventory |
+| --- | --- | --- | --- |
+| `Qwen/Qwen3.8-27B` | `706cebd746c4b6f2b1d1f892630867acfdfd3df8` | 18 / 55,563,006,776 | All present, lengths match |
+| `Qwen/Qwen3.6-35B-A3B` | `9c2aacf8e27267fadb4f6bf8209e7f3c26f5dd66` | 26 / 71,903,776,776 | All present, lengths match |
+| `google/gemma-4-26B-A4B-it` | `f42adcca257bb0865c506947671e7d0af52ac9c4` | 2 / 51,612,009,916 | All present, lengths match |
+
+Reproduce metadata lookup with `https://huggingface.co/api/models/OWNER/REPO/revision/REVISION?blobs=true`, using the exact repository/revision pairs in this table and the preceding table. Compare returned `id`/`sha`, the `config.json` sibling's `blobId`, and every safetensors sibling's expected size against local file metadata. These checks read only configuration bytes and file lengths; **no weight-content hash sweep ran**. Correct lengths do not establish correct weight bytes. Full source integrity, tokenizer/template identities and reproducible hf2q conversion remain required. No new model was downloaded.
+
 The canonical launcher defaults are operator entry points, not automatic campaign identities. In particular, the Qwen3.8 default names an abliterated SFT artifact; it cannot substitute for the required vanilla target. The other default filenames similarly do not prove source revision or conversion settings. A directory-name or download-metadata hit is never promoted to a model hash.
 
 ## Native and model responsibilities
