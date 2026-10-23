@@ -1,11 +1,50 @@
 # ADR-049: Agentic state reuse (multi-anchor) and Mixed-phase cooperative prefill
 
-- Status: Proposed
-- Date: 2026-08-22
-- Updated: 2026-08-22 (rev 3, merged) — executor-audit corrections incorporated (payload-ownership rule for `pending_target_hidden` parent-allocation retention; per-model budgets + K-excludes-pending semantics; full-store invalidation on reset/poison/failed-restore; preflight-all-then-mutate restore contract; A.5 rewritten around the LIVE slot-aware MTP/target transactional rollback while H38 still pins `rollback_la_to`; B.0 publisher corrected to `publish_prefill_cohort_after_gate`; registry wording narrowed). Robert's framings integrated: the cross-family benefit directive governs ALL lanes (Lane A parity phases + Lane B §B.2 generalization + future families at bring-up), and every non-committed item is framed as FALSIFIED-with-evidence or OPEN HYPOTHESIS with a named deciding spike — never silently parked scope. Rebased onto `242882e8`.
+- **Status**: Proposed
+- **Date**: 2026-08-22
+- **Updated**: 2026-10-23 (ADR-063 F3 source audit; prior revision 2026-08-22, rev 3, merged) — executor-audit corrections incorporated (payload-ownership rule for `pending_target_hidden` parent-allocation retention; per-model budgets + K-excludes-pending semantics; full-store invalidation on reset/poison/failed-restore; preflight-all-then-mutate restore contract; A.5 rewritten around the LIVE slot-aware MTP/target transactional rollback while H38 still pins `rollback_la_to`; B.0 publisher corrected to `publish_prefill_cohort_after_gate`; registry wording narrowed). Robert's framings integrated: the cross-family benefit directive governs ALL lanes (Lane A parity phases + Lane B §B.2 generalization + future families at bring-up), and every non-committed item is framed as FALSIFIED-with-evidence or OPEN HYPOTHESIS with a named deciding spike — never silently parked scope. Rebased onto `242882e8`.
 - Owners: hf2q serving engine (execution: the active qwen35/qwen38 serving-lane session; plan authored by the FreeToken research session)
-- Code pins: hf2q `242882e8` (= origin/main at this revision), mlx-native `0.11.2`. Anchors were authored at `815bd48d`; every correction-touched anchor was re-verified at `242882e8`. Re-verify anchors after any pull before editing.
+- Historical code pins: hf2q `242882e8` (= origin/main at this revision), mlx-native `0.11.2`. Anchors were authored at `815bd48d`; every correction-touched anchor was re-verified at `242882e8`. Re-verify anchors after any pull before editing.
 - Provenance: full paper+code study of FreeToken (arXiv 2608.16157, "FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution") mapped onto hf2q/mlx-native by a nine-agent research swarm, then adversarially reviewed by two independent external models (Kimi K3 via opencode; gpt-5.6-sol via codex, 516k-token source-grounded review). Both reviews' MUST-FIX items are incorporated; the gpt-5.6-sol review found and this ADR closes a stale-KV lineage coherence bug in the original draft (§A.2).
+
+## Current source and validity boundary (2026-10-23)
+
+This remains Proposed. The old line numbers and August measurements below
+belong to hf2q `242882e8` / native 0.11.2, not current release evidence.
+Current audit uses hf2q `5b385d4f` and published native 0.15.1; source symbols
+and dispositions are recorded in the [F3 evidence table](../research/adr063-f3-source-audit-2026-10-23.md).
+The multi-anchor store is a new policy, not proof that any family lacks reuse
+or persistence today. Mixed cooperative scheduling remains a hypothesis; the
+current DeepSeek cooperative row ceiling is **2,048**, not a proposed 4,096.
+
+**Logical and physical coordinates are distinct.** Rendered/committed token
+ledgers and cache-match lengths describe logical conversation tokens. A bound
+graft inserts physical KV positions before those tokens: Qwen's
+`Qwen35PrefillState::graft_len` offsets RoPE and physical cursors. Matching,
+equality, ancestor ordering, capacity and restore preflight must explicitly
+translate coordinates using the bound graft identity/offset. Do not compare a
+logical token count directly with a physical cursor, or serialize the graft as
+ordinary conversation tokens. The A.2 lineage rule still applies after that
+translation; graft replacement invalidates incompatible anchors.
+
+**DeepSeek persistence already exists.** `Deepseek4DiskPersistor` and
+`Deepseek4Cache::serialize_anchor_image` persist recovery-anchor images, wired
+through shared session seams for both schedulers (ADR-062). They include window,
+compressor, compressed/indexer state and the exact rendered ledger; they are not
+Qwen recurrent snapshots. Current DeepSeek loading explicitly rejects combined
+`--kv-graft` and `--kv-persist` until graft-aware image hydration is implemented.
+A multi-anchor design must preserve that rejection, not imply the combination
+already works.
+
+**Family validity is typed, not structural equivalence.** A Qwen anchor includes
+hybrid attention/DeltaNet state and MTP/target bookkeeping where enabled. Gemma's
+full/sliding attention state has no Qwen DeltaNet payload. DeepSeek needs its
+window/compression/indexer and anchor ledger invariants. An apparently similar
+wrapper does not permit sharing payloads or restore code. Each family's preflight
+must validate artifact/cache configuration, rendered prefix, template/config
+identity, slot generation, lineage, graft binding and required sidecars before
+mutation. Reset/poison/failed restore invalidates the whole affected store.
+Publication of pending state still waits for successful request commit.
 
 ## Context
 
@@ -74,7 +113,7 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 2. After any restore, consumers must re-validate that target AND MTP cursors both equal the anchor's `token_count` — the coherence marker documented on `Qwen35SpecPrefixBoundary` itself (engine_qwen35.rs:3401-3402).
 3. A decode-time anchor (not in this ADR's scope) may only snapshot after accept/rollback settles — never from optimistic post-verify state; any capture sharing the LA arena must extract its rows before `clear_la_capture`/re-arm. The arena's true size is ≈1.96 GiB at the 32-token SerialFifo window (30 layers × 67 MiB), 4× the stale in-code comment — Lane A does NOT use this arena (boundary capture reads live state) and MUST NOT replicate it per slot.
 
-**A.6 — Family parity (REQUIRED phases per the scope directive, same invariants):** gemma4 (`Gemma4PromptAnchor` is structurally identical; retire serial-path `live_prefix_tokens` special-casing where subsumed), then deepseek4 (its two-anchor pending/committed pair generalizes to the store; wire `Deepseek4CacheSnapshot::resident_bytes()` — currently zero callers — into the same accounting). The ADR does not reach Implemented until every supported serving family carries the anchor store.
+**A.6 — Family parity (REQUIRED phases per the scope directive, same invariants):** gemma4 (use its own attention/cache validity contract; retire serial-path `live_prefix_tokens` special-casing where subsumed), then deepseek4 (its two-anchor pending/committed pair generalizes to the store; wire `Deepseek4CacheSnapshot::resident_bytes()` — currently zero callers — into the same accounting). The ADR does not reach Implemented until every supported serving family carries the anchor store.
 
 **A.7 — Open hypotheses: the spikes that decide them** (not "deferred" — each is a live question whose data collection is already scheduled or cheap):
 - *Cross-slot / restart-surviving registry tier*. Hypothesis: foreign-slot landings and restart warm-up are frequent enough on the real workload to justify a shared CoW prefix store. Deciding data: A.8 telemetry — slot-affinity foreign-landing counts and restart-cold counts over production use. If confirmed → its own ADR (needs a slot-parameterized `restore_partial` — the current one is copy-owning and rewrites every sequence cursor, kv_cache.rs:3435, :3493 — plus an ownership answer to the `b44b92ed` tenant-isolation pin; FreeToken's donate-not-copy/CoW/dual-currency eviction is that ADR's design vocabulary). Meanwhile the SerialFifo `LcpRegistry` + disk hydrate remains the restart-hydrate tier.

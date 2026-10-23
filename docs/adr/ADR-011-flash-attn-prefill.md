@@ -1,5 +1,26 @@
 # ADR-011: Flash-Attention-Style Tiled Prefill Kernel (hf2q Gate A Speed-to-Peer)
 
+**Updated:** 2026-10-23 (ADR-063 F3 source audit).
+
+## Current implementation boundary
+
+The original proposal and measurements below describe the April starting point.
+Tiled prefill and block skipping are **already implemented**, rather than new
+ADR-063 work: `src/serve/forward_prefill_batched.rs` invokes the native D256
+and D512 f16/bf16 block-aware dispatchers, plus resume variants. In mlx-native
+0.15.1, `src/ops/flash_attn_prefill.rs`, `flash_attn_prefill_d512.rs`, and
+`flash_attn_prefill_blk.rs` own dispatch and tile classification; their Metal
+shaders own kernel arithmetic. Classification 0 skips a KV tile, 2 skips its
+mask addition, and 1 keeps the masked path. Availability is shape/path specific;
+this does not assert every family uses every variant.
+
+Execution status: partially implemented with historical gates below; remaining
+optimization hypotheses stay Proposed. Audit current dispatch and masks before
+proposing another tiled/block-skip implementation. NAX or other replacement
+kernels require a separate measured spike in mlx-native and family-specific
+integration/quality gates in hf2q. The old 21× gap is not a current baseline.
+
+
 **Status:** Proposed (2026-04-17). Supersedes the "Gate A speed-to-peer is Run-scope" disposition in ADR-005's Closeout Amendment.
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-005 (Inference Server, Gate A), ADR-006 (mlx-native destination), ADR-008 (candle divorce)

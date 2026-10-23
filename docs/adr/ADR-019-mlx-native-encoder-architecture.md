@@ -1,12 +1,38 @@
 # ADR-019: mlx-native Encoder Architecture — Per-Stage Fence Design (D3 PRIMARY, D4 deferred-pending-Phase-0a-microprototype)
 
+**Updated:** 2026-10-23 (ADR-063 F3 source audit).
+
+## Current implementation boundary
+
+The original D3/D4 performance choice remains Proposed. It is not a greenfield
+encoder rewrite: native `EncoderSession` and `MlxDevice::encoder_session`
+already exist, and hf2q `src/inference/models/qwen35/forward_gpu.rs` constructs
+sessions and borrows them through `encoder_stage::LayerEncoder` when
+`HF2Q_ENCODER_SESSION=1` and `seq_len > 1`; the session mode is opt-in.
+Output-head fusion is present in `apply_output_head_gpu_into`; the arena DN
+path in `gpu_delta_net.rs` consolidates ops1–3 plus QKV split at
+`fence_or_commit("layer.gdn.stage_a")`. This does not mean every non-arena
+path has the same consolidation. Existing phase/fusion and
+synchronous scratch-lifetime boundaries must be audited individually, not
+removed merely because an asynchronous API exists.
+
+The Objective-C lifetime correction is present in published mlx-native 0.15.1:
+`src/encoder.rs` creates/rotates command buffers and creates compute encoders
+inside local autorelease pools while retaining owned handles. hf2q pins
+`mlx-native = "=0.15.1"` in Cargo.toml/Cargo.lock. The August publication-pending
+statement below is historical and no longer the dependency state. Publication
+proves dependency availability, not the remaining D3/D4 performance hypothesis
+or a four-model end-to-end win. Further native changes require native publication,
+then hf2q pin/lock updates and clean-artifact gates.
+
+
 **Status:** Proposed v1.1 (post-Codex Phase-2b review, 2026-05-03). D3 is the PRIMARY architectural target subject to Phase 0a evidence-based gates (xctrace residual attribution + D4 microprototype falsification). D2 (CPU dispatch_apply) REJECTED. D4 (MLX-style watermark) DEFERRED until Phase 0a.2 microprototype evidence; if D4 microprototype beats D3-projection on FA-path slice, ADR-019 is rewritten with D4 as primary.
 
 **Current status addendum (2026-08-08):** the original D3/D4 performance
 decision remains historical/proposed. The pool-less-worker Objective-C
 lifetime correction in [the 2026-08-08 addendum](#2026-08-08--pool-less-worker-command-buffer-lifetime-correction)
-is accepted architecture, pending publication of the corrected `mlx-native`
-patch and clean-artifact release gates. Earlier local dependency-spike trials
+is accepted architecture. At the date of that addendum it awaited publication
+and clean-artifact release gates; see the current implementation boundary above. Earlier local dependency-spike trials
 are causal evidence, not registry release authority.
 
 
