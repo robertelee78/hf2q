@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope and F1/F3 execution entry; downstream implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-10-23 — operator approved program scope and F1/F3 execution entry after skeptic review; normalized peer terminology.
+- **Updated:** 2026-10-23 — operator approved program scope/F1/F3 entry, required wins for all four models, and clarified dual-repository ownership and publication.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
 - Stable source ID: ADR-063
@@ -13,11 +13,11 @@
 
 ### Intent and authority
 
-The product goal is leadership in GGUF inference on Apple Silicon. The primary outcome is four concurrently active agentic coding slots on the operator M5 Max with 128 GB RAM, with coherence/tool correctness at least as good as peers and performance at least competitive, preferably faster. Current primary implementations and October releases determine the experiment shortlist; old ADRs supply constraints and failed evidence, not an automatic implementation queue.
+The product goal is leadership in GGUF inference on Apple Silicon. The primary outcome is four concurrently active agentic coding slots on the operator M5 Max with 128 GB RAM, with coherence/tool correctness at least as good as peers and proven four-agent speed wins for each of Qwen3.8, DeepSeek-V4, Qwen3.6 and Gemma 4. Qwen3.8 and DeepSeek-V4 have first priority; Qwen3.6 and Gemma 4 follow. Current primary implementations and October releases determine the experiment shortlist; old ADRs supply constraints and failed evidence, not an automatic implementation queue.
 
 This proposal consolidates the strongest ideas from ADR-010/011/016/019/034/037/039/040/042/044/049 and newer October work. It does not silently supersede their accepted safety contracts. The release target is v0.1.28; the prior milestone-6 producer scope moves to v0.1.29. The operator approved this program scope and the F1/F3 execution entry on 2026-10-23 after the recorded skeptic review. F1/F3 may become Ready after their approval is recorded; all other stories remain Backlog pending their own design approval and predecessor evidence. Creating a project does not claim an experiment passed. Do not duplicate existing managed issues; source corrections must reconcile their existing bindings. A feature story is accepted only on its own observable contract; cross-family milestones do not establish universal coverage.
 
-The primary comparison is four simultaneously runnable agent slots with at least six tool rounds each; one-slot controls and mixed prefill/decode populations 3+1, 2+2 and 1+3 are required. Stock current hf2q, experimental hf2q from that baseline, and latest peer are mandatory arms, frozen for each experiment. Same-artifact peers use hf2q-produced GGUFs. MLX/native-format comparisons are separate quality-qualified arms. The mandatory hardware is M5 Max with 128 GB RAM; other Apple generations are future separate strata. Linux/CUDA runtime support is outside scope. Ideas may originate anywhere but win only through owned Rust/Metal GGUF measurements on this host. Top-tier artifacts are vanilla Qwen3.8-27B dense and DeepSeek-V4. Qwen3.6-35B-A3B MoE and Gemma 4 are the second tier; prioritize the top-tier speed work while retaining explicit second-tier regression evidence. Four slots do not mean four Macs. Quality gates and sampling transformations cannot be relaxed to manufacture a speed win.
+The primary comparison is four simultaneously runnable agent slots with at least six tool rounds each; one-slot controls and mixed prefill/decode populations 3+1, 2+2 and 1+3 are required. Stock current hf2q, experimental hf2q from that baseline, and latest peer are mandatory arms, frozen for each experiment. Same-artifact peers use hf2q-produced GGUFs. MLX/native-format comparisons are separate quality-qualified arms. The mandatory hardware is M5 Max with 128 GB RAM; other Apple generations are future separate strata. Linux/CUDA runtime support is outside scope. Ideas may originate anywhere but win only through owned Rust/Metal GGUF measurements on this host. Top-tier artifacts are vanilla Qwen3.8-27B dense and DeepSeek-V4. Qwen3.6-35B-A3B MoE and Gemma 4 are the second tier; prioritize the top-tier speed work, then prove speed wins for the second tier as well. Four slots do not mean four Macs. Quality gates and sampling transformations cannot be relaxed to manufacture a speed win.
 
 ## Decision
 
@@ -29,6 +29,28 @@ The program MUST NOT revive falsified router-only precision fixes, reimplement a
 
 Conditional work means its deciding experiment must record implement, falsify, or successor-design with evidence. It is never permission to land a stub or promise an unmeasured speedup. Experiment receipts and implementation candidates use merge delivery; Q4 alone closes the v0.1.28 product release boundary; Q2 certifies the harness and Q3 independently proves the measured effects. A required runtime change needs a published native revision and clean registry-resolving proof. The final qualification depends on the actual winning subset, declared before candidate acceptance; it need not wait for unrelated or falsified hypotheses.
 
+
+## Repository ownership and publication
+
+This is one performance program spanning two owned repositories. Every Metal compute kernel and its Rust dispatcher belongs in `mlx-native` (`src/ops/`, `src/shaders/`); hf2q consumes that public API. `mlx-native` also owns buffer/resource safety, operation capability routing, graph/encoder submission mechanisms and primitive parity/microbenchmarks. hf2q owns conversion and quantization policy, model-family graphs, request scheduling, cache/anchor/cohort policy, tool semantics and model/workload acceptance. A family-shaped native primitive still needs an explicit reusable operation contract; model behavior does not move into the kernel library.
+
+For every winning change that modifies `mlx-native`, record separate immutable native and hf2q commits and PRs. Complete native correctness/performance review and merge, publish a new native version through its release workflow, verify the crates.io archive checksum and downloaded-archive tests, then pin that exact registry version/checksum in hf2q `Cargo.toml`/`Cargo.lock` and its dependency-provenance verifier. Rebuild hf2q from a clean registry-resolving tree and qualify the combined configuration. A local path patch is spike evidence only.
+
+Q4 MUST publish both updated packages when native changes are included: the required `mlx-native` crate/version/tag first, followed by the qualified hf2q v0.1.28 crate and signed/notarized standalone release artifacts. Verify public package/asset bytes, dependency provenance and clean installs through each repository's existing release gates. Native publication alone does not deliver the hf2q integration; hf2q publication against an unpublished native revision is forbidden. If the winning subset does not change native code, explicitly record the already-published native version and verify it rather than inventing a native release.
+
+Keep this document's existing work keys as the program's acceptance ledger. For any native implementation, link a separately scoped `mlx-native` issue/PR with its primitive contract and tests to the owning story before implementation. Do not duplicate kernels or turn hf2q tickets into permission to edit native policy without a contract. Native implementation delivery is merged and published native code; the hf2q story's own boundary additionally requires pinned integration and its declared end-to-end evidence. One integration owner reconciles the exact combined configuration.
+
+### Source map for the ownership split
+
+Source inspected on 2026-10-23: hf2q baseline `5d1ffe7f1c5cf4ba5ffca452ec4bde738231beef`, mlx-native `f92eb02` (published version 0.15.1). Revalidate symbols at each candidate commit; this map is navigation, not performance proof.
+
+| Concern | hf2q consumer/policy | mlx-native mechanism and evidence |
+| --- | --- | --- |
+| Dense and expert projections | `src/inference/models/qwen35/gpu_delta_net.rs`, `execution_dispatch/evidence.rs`, `src/inference/expert_dispatch.rs` | `src/ops/quantized_matmul_ggml.rs`, `quantized_matmul_id_ggml.rs`, matching `src/shaders/`; GGML routing and resolved-dispatch trace tests |
+| Physical batching | `src/inference/models/gemma4/batched_body.rs`, family forward graphs and serve scheduler | Existing `quantized_matmul_ggml_broadcast_batched_mm` and perm021 broadcast APIs; do not assume shared-weight batching is absent |
+| DeepSeek transactions | `src/inference/models/deepseek4/verifier_forward.rs`, family cache/sidecar state and engine cohort commit | `src/ops/deepseek_sparse_attention.rs`, shader and primitive parity/benchmark tests; encoder/fence contracts |
+| Resource/command lifetime | Family-owned cache objects, graph construction and request admission | `src/device.rs`, `buffer.rs`, `encoder.rs`, `encoder_session.rs`, `graph.rs`; command-buffer/autorelease and session lifecycle tests |
+| Publication | `.github/workflows/release.yml`, `scripts/verify_release_dependency_provenance.sh` | Native `.github/workflows/release.yml`: exact source/archive tests, registry byte verification and downloaded-crate tests |
 
 ## F. Evidence and current peers
 
@@ -42,7 +64,7 @@ Acceptance:
 
 - Explain and resolve the three observed peer identities without silently changing the accepted product pin or modifying /opt/llama.cpp.
 
-- Freeze source/build/binary hashes, target and draft artifact hashes, native registry pin, hardware/OS/Metal versions, templates and rendered tokens; all compared releases must exist by 2026-10-22.
+- Freeze source/build/binary hashes, target and draft artifact hashes, native registry pin, hardware/OS/Metal versions, templates and rendered tokens; date the research screening to 2026-10-22, but resolve the mandatory latest-peer runtime revision at campaign start rather than freezing it to the research cutoff.
 
 - Include current peer and screen BaseRT 0.4.0, MLX 0.32.4/current main and Kapitsa for supported four-slot tool semantics; unsupported or unavailable arms are reported, never invented.
 
@@ -58,6 +80,8 @@ Acceptance:
 
 - Declare peer matched-settings and peer-best-documented configurations. The mandatory latest-peer performance arm uses peer-best valid settings; speculation cannot be silently disabled to handicap it. Retain MTP tensors in the shared GGUF if any arm uses them and pin separate drafter weights.
 
+
+Repository ownership: hf2q owns the campaign identity manifest; record both repository commits, the published mlx-native version/checksum, downstream hf2q binary/package identity and native release receipts. Do not alter kernels or release either package in this inventory task.
 
 Validation: Validate an immutable comparison manifest against source, binary version output, hashes and capability probes; no model load before coordination and memory preflight.
 
@@ -100,6 +124,8 @@ Acceptance:
 - Before every campaign read release coordination and reject host contention. Freeze thermal/cooldown protocol in the harness: at least 60 seconds between engines, Nominal thermal start and sustained Fair-or-better sampling; wait longer if needed. Never overlap full-model runtimes.
 
 
+Repository ownership: hf2q owns clients, workload/task oracles, request/phase instrumentation and end-to-end receipts. Consume mlx-native dispatch/timing counters; add any missing family-neutral trace mechanism in a separately tested and published native change.
+
 Validation: Run the checked-in certified harness sequentially against frozen engines with balanced crossover ordering; verify real runnable-slot traces, raw responses, result scoring, cleanup and receipt identities.
 
 Predecessors: F1, Q5.
@@ -124,6 +150,8 @@ Acceptance:
 
 - Add Updated stamps and concrete source citations; preserve historical failed experiment evidence and reconcile any existing managed source bindings rather than duplicate their work.
 
+
+Repository ownership: hf2q owns the named ADR corrections and managed source reconciliation. Verify native implementation claims against mlx-native source and published version; do not implement kernels or silently rewrite native release history.
 
 Validation: Run the ADR inspector, compare each corrected claim with named code/paper passages, and reconcile affected existing awa sources.
 
@@ -154,6 +182,8 @@ Acceptance:
 - Cancellation never publishes pending anchors; prune descendants invalidated by executed writes and preserve only physically valid committed ancestors. Failed prefill/rollback cannot resurrect overwritten rows.
 
 
+Repository ownership: hf2q owns anchor identity, lineage, component validity, publication and rollback policy. mlx-native owns any required buffer-view, copy, fence or allocation primitive contract; track native API gaps separately.
+
 Validation: Review HLD/LLD and run boundary state-machine regressions with synthetic state and real family layout invariants.
 
 Predecessors: F3, Q5.
@@ -179,6 +209,8 @@ Acceptance:
 - Primary Qwen3.8 evidence uses the vanilla official 27B dense model; grafted/abliterated variants remain separate compatibility arms. Family parity obligations for future Gemma/DeepSeek implementations remain explicit successors, not a universal multi-anchor shipping claim.
 
 
+Repository ownership: hf2q owns Qwen model/cache integration and anchor selection; consume published mlx-native operations. Any required state-copy or storage primitive is implemented and parity-tested in mlx-native before a pinned hf2q integration.
+
 Validation: Run four-slot divergent-edit state/lifecycle gates and paired F2 scoreboard with allocation accounting.
 
 Predecessors: C1, F2.
@@ -203,6 +235,8 @@ Acceptance:
 
 - Open an acceleration implementation only if frontend work exceeds 10% of measured warm semantic TTFT and an exact path has credible end-to-end headroom; otherwise close the deciding experiment with evidence.
 
+
+Repository ownership: hf2q owns rendering/tokenization/lookup and request-level profiling. A demonstrated GPU primitive belongs in mlx-native; tokenizer and template semantics remain in hf2q.
 
 Validation: Profile F2 warm turns, compare full-token oracle with proposed CPU/incremental/Metal path, and record pass/falsification and paired end-to-end timing.
 
@@ -231,6 +265,8 @@ Acceptance:
 - This is a DeepSeek-specific bounded coherence experiment; follow-on mixed policy is a successor after the deciding result. MAX_COOPERATIVE_PREFILL_ROWS is 2048, defined at src/inference/models/deepseek4/verifier_forward.rs:26 and consumed at src/serve/api/engine.rs:9859; prior 4096-row OOM evidence prohibits speculative cap expansion.
 
 
+Repository ownership: hf2q owns DeepSeek cohort membership, cache mutation transactions, poison/cancel handling and nonmember isolation. mlx-native owns any missing execution/fence primitive and its synchronization tests; a native mechanism does not define serving cohort policy.
+
 Validation: Run adversarial transaction tests and a real-artifact cohort-prefill plus active-decode oracle.
 
 Predecessors: F2, Q5.
@@ -255,6 +291,8 @@ Acceptance:
 
 - Use ADR-040 historical N4 Gemma 0.75x-to-0.81x peer throughput and non-amortized attention as falsifiable leads, not current measurements. Confirm which batching/attention fixes already landed before creating another kernel.
 
+
+Repository ownership: hf2q owns physical cohort construction, slot-indexed model graphs and heterogeneous phase scheduling. mlx-native owns batched matmul/attention kernels, dispatchers, shared-weight buffer layouts and primitive parity. Profile existing native broadcast batching before proposing new kernels; integrate only a published API.
 
 Validation: Capture kernel/row traces and run four-slot independent-versus-shared target and end-to-end comparisons, including cancel/EOS and partial cohort failures.
 
@@ -283,6 +321,8 @@ Acceptance:
 - Bound grafts intentionally disable MTP because the draft arena lacks graft state; retain this fallback unless a separately approved exact graft-aware transaction proves correctness. No greenfield cached-speculation feature is assumed missing.
 
 
+Repository ownership: hf2q owns warm-turn speculative state, proposal/acceptance policy and tool/client qualification. mlx-native owns draft/verify compute primitives and dispatch correctness; preserve native numerical contracts and published-pin sequencing.
+
 Validation: Extend current exact speculation and cache lifecycle gates; compare F2 warm tool rounds off versus auto.
 
 Predecessors: C1, F2, Q1, Q5.
@@ -307,6 +347,8 @@ Acceptance:
 
 - This is a deciding reference experiment, not a committed native port. Native drafter/tree work is successor scope only if actual four-slot quality, memory and net cost beat current MTP/history; primary vanilla Qwen3.8 is the compatible dense target.
 
+
+Repository ownership: hf2q owns isolated reference qualification, target/draft compatibility and four-agent cost/quality decisions. No native port is promised; any winning successor separates hf2q model/policy integration from mlx-native primitive/kernel implementation.
 
 Validation: Run isolated reference qualification and four-slot matched trials; validate independent sequential target decisions and model schema before proposing a native port.
 
@@ -335,6 +377,8 @@ Acceptance:
 - Any mlx-native change must be published as a reproducible registry revision and pinned in Cargo.toml/Cargo.lock before hf2q acceptance. Account for this separate release critical path; a local path override is never acceptance evidence.
 
 
+Repository ownership: mlx-native owns all kernel and dispatcher changes, hardware/shape capability routing, buffers and primitive parity/microbenchmarks. hf2q owns live-shape capture, public API integration, dependency pins and F2 end-to-end acceptance. Link a native implementation issue/PR; publish and verify the native crate before pinned hf2q qualification. No compute kernels are implemented in hf2q.
+
 Validation: Run frozen shape microbenchmarks, independent sequential/logit oracles, four-slot row traces and paired F2 trials.
 
 Predecessors: F2, Q1, Q5.
@@ -360,6 +404,8 @@ Acceptance:
 - Use independent correctness fixtures for peer coherence; sampled quality margins and trial counts are frozen before candidate runs.
 
 
+Repository ownership: hf2q owns family state/logit/routing and task-quality oracles. mlx-native owns operation-level numerical parity, batched-versus-sequential primitive tests and low-level trace support. A passing kernel test alone does not establish model/task coherence.
+
 Validation: Run source-bound intermediate and transaction comparisons with deliberate stale-state/incorrect-routing negative controls plus the F2 task oracle.
 
 Predecessors: F2.
@@ -384,6 +430,8 @@ Acceptance:
 
 - Check critical-path and failure-path coverage with Agentic-QE or equivalent independent evidence. A MetaHarness audit may assess harness quality, but scores cannot substitute for real artifact tests.
 
+
+Repository ownership: Independent QE qualifies hf2q campaign clients, scoring, concurrency and receipt validation. Native instrumentation and its failure controls remain mlx-native API/test work, consumed at an exact published revision.
 
 Validation: Run deterministic fake-server/receipt negative controls, then verify instrumentation against actual server traces and fail-closed artifact identity checks.
 
@@ -416,6 +464,8 @@ Acceptance:
 - Use latest peer in its best valid configuration as the mandatory peer arm and retain a separately labeled matched-settings diagnostic. Peer quality failures are recorded; a missing, failed or silently disqualified peer cannot yield a speed victory by default.
 
 
+Repository ownership: Independent QE executes source-bound hf2q-versus-stock-versus-peer campaigns, recording both native and hf2q identities. Native microbenchmarks are diagnostic evidence, not substitutes for all four model-level speed wins.
+
 Validation: Independent QE executes the certified harness against frozen stock/experiment/latest-peer binaries and publishes paired effect sizes, confidence intervals, rejected trials and verdict.
 
 Predecessors: F2, Q1, Q2, Q5.
@@ -426,15 +476,15 @@ Delivery boundary: Measured evidence or qualified implementation merged to main 
 
 ### Q4. Accept and release a faster coherent four-agent Apple configuration
 
-Outcome: The published hf2q configuration meets peer coherence and demonstrates competitive or superior four-agent performance.
+Outcome: The published hf2q configuration meets peer coherence and demonstrates a proven four-agent speed win for each of the four required model lanes.
 
-Requirement: The program MUST deliver the published hf2q configuration meets peer coherence and demonstrates competitive or superior four-agent performance.
+Requirement: The program MUST deliver peer coherence and a proven four-agent speed win for each of Qwen3.8, DeepSeek-V4, Qwen3.6 and Gemma 4, with the declared fairness and memory gates intact.
 
 Acceptance:
 
 - All deterministic task/tool/isolation gates pass and predeclared stochastic noninferiority holds against eligible current peers.
 
-- Per primary artifact, competitive means four-agent goodput/makespan within frozen nonregression margins of latest peer in its best valid configuration. A faster verdict requires at least 5% lower makespan or 5% higher successful-task goodput with paired uncertainty excluding a tie; report both stock improvement and peer gap.
+- For each required artifact (Qwen3.8, DeepSeek-V4, Qwen3.6 and Gemma 4), require at least 5% lower four-agent makespan or 5% higher successful-task goodput than the latest peer in its best valid configuration, with paired uncertainty excluding a tie. Report both stock improvement and peer gap. Competitive/parity or inconclusive results are intermediate evidence and cannot satisfy final release acceptance.
 
 - No accepted result worsens frozen p95 TTFT or maximum semantic-gap fairness ceilings; single-slot or microkernel speed alone cannot satisfy this story.
 
@@ -444,9 +494,11 @@ Acceptance:
 
 - Latest peer must complete the declared workload for a valid performance verdict; peer task failures are explicit quality findings, never grounds for dropping the comparator and claiming a win against nothing.
 
-- Give separate verdicts for vanilla Qwen3.6 MoE, vanilla Qwen3.8-27B dense and DeepSeek-V4 on M5 Max/128 GB. Do not pool native-format peers or a favorable model into a universal GGUF superiority claim.
+- Give separate passing speed/quality/fairness verdicts for vanilla Qwen3.8-27B dense, DeepSeek-V4, vanilla Qwen3.6 MoE and Gemma 4 on M5 Max/128 GB, in that priority order. Require all four wins; do not pool results or use a favorable model to hide another lane failure. Bind every claim to exact artifacts and workloads rather than universal untested superiority.
 
 - Before final candidate acceptance, record the exact winning candidate work keys and immutable commits, add them as required Q4 predecessors in the source/extraction/awa graph, and obtain independent verdicts for their combined configuration. A prose-only winning subset cannot bypass candidate gates.
+
+Repository ownership: The integration owner coordinates two release chains: merge/publish/verify mlx-native updates first, pin and clean-build hf2q, then qualify and publish the hf2q crate plus signed standalone artifacts. Record both package versions/checksums, immutable source commits, native PRs and all four independent model verdicts.
 
 Validation: Independent review of the combined candidate and raw F2 receipts, followed by exact-artifact release verification on the target Apple host.
 
@@ -475,6 +527,8 @@ Acceptance:
 - Record logical budgets, OS footprint/pressure, Metal residency, transient high-water, swap/compression deltas and cleanup. Reject a candidate that fits only by silently reducing matched context, task size or output budget.
 
 
+Repository ownership: hf2q owns family/request admission policy and a disjoint whole-process memory ledger. mlx-native owns allocation/view/residency/scratch lifetime guarantees and low-level counters. Review both sides so shared unified-memory pages are not double-counted; any native fix requires separate parity and publication evidence.
+
 Validation: Independent QE reviews byte ownership and admission arithmetic, runs fail-closed budget controls, then conducts bounded M5 Max real-artifact memory stress without deliberately provoking OOM.
 
 Predecessors: F1.
@@ -491,7 +545,7 @@ All acceptance, exclusions, failed-path requirements and the winning-subset rele
 
 ## Execution entry (approved 2026-10-23)
 
-The operator authorized merging the corrected planning PR and making F1 (#356) and F3 (#358) Ready. The operator subsequently prioritized Qwen3.8 and DeepSeek-V4, with Qwen3.6 and Gemma 4 the next tier. Separate per-artifact M5 Max/128 GB results and independent QE remain required. The recorded skeptic review supplies the technical review of the program; this entry does not approve a later runtime design.
+The operator authorized merging the corrected planning PR and making F1 (#356) and F3 (#358) Ready. The operator subsequently prioritized Qwen3.8 and DeepSeek-V4, with Qwen3.6 and Gemma 4 the next tier, and required proven speed wins for all four. Separate per-artifact M5 Max/128 GB results and independent QE remain required. The recorded skeptic review supplies the technical review of the program; this entry does not approve a later runtime design.
 
 - F1 starts by reading coordination, inventorying source/build/binary identities and existing model/conversion receipts without model loads, then designs a versioned immutable comparison manifest and fail-closed validator. Resolve current peer source at campaign start in an isolated checkout. Preserve the product pin until its governing replacement review. Missing artifacts, conversion provenance or capabilities are explicit unresolved inputs, never invented evidence. Deliver the validated manifest, capability dispositions and reproducible commands through a reviewed merge.
 - F3 starts with the named ADR/source/paper audit. Produce a claim-to-evidence table for ADR-010/011/019/037/039/049, preserve failed experiments, correct only supported claims, run the ADR inspector and reconcile existing source-bound issue keys. Deliver reviewed documentation and verified tracking through a merge; do not change runtime behavior under F3.
