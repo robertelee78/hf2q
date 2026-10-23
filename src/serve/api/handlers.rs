@@ -3217,16 +3217,23 @@ fn render_and_tokenize_for_overflow(
         enable_thinking,
         template_kwargs,
     )?;
-    let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(error = %e, "tokenization failed");
-            return Err(ApiError::internal_error().into_response());
-        }
-    };
-    let tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let tokens = tokenize_http_prompt(engine.tokenizer(), &rendered)?;
     let n = tokens.len();
     Ok((tokens, n))
+}
+
+/// Tokenize the fully rendered HTTP prompt; chat templates already own BOS/EOS.
+fn tokenize_http_prompt(
+    tokenizer: &tokenizers::Tokenizer,
+    rendered: &str,
+) -> Result<Vec<u32>, Response> {
+    tokenizer
+        .encode(rendered, false)
+        .map(|encoding| encoding.get_ids().to_vec())
+        .map_err(|error| {
+            tracing::warn!(error = %error, "tokenization failed");
+            ApiError::internal_error().into_response()
+        })
 }
 
 /// Render the chat template or map the failure to the 400 an external
@@ -13282,3 +13289,7 @@ mod gcd_schema_tests {
 #[cfg(test)]
 #[path = "handlers_tool_bounds_tests.rs"]
 mod tool_bounds_tests;
+
+#[cfg(test)]
+#[path = "handlers_four_agent_input_tests.rs"]
+mod four_agent_input_capture;
