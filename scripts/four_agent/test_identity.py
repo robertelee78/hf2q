@@ -2,6 +2,8 @@
 import copy
 import hashlib
 import json
+import io
+import tarfile
 from pathlib import Path
 import tempfile
 import unittest
@@ -22,9 +24,21 @@ class IdentityContracts(unittest.TestCase):
         data = (self.root / "fixture").read_bytes()
         f = {"path": "fixture", "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         self.file = f
-        native = {"source_commit": digest("native")[:40], "version": "0.15.1",
+        native_commit = digest("native")[:40]
+        archive = self.root / "native.crate"
+        with tarfile.open(archive, "w:gz") as tar:
+            contents = {".cargo_vcs_info.json": json.dumps({"git": {"sha1": native_commit}}),
+                        "Cargo.toml": '[package]\nname="mlx-native"\nversion="0.15.1"\n'}
+            for name, content in contents.items():
+                data = content.encode()
+                info = tarfile.TarInfo("mlx-native-0.15.1/" + name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        crate = {"path": "native.crate", "bytes": archive.stat().st_size,
+                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}
+        native = {"source_commit": native_commit, "version": "0.15.1",
                   "source": "registry+https://github.com/rust-lang/crates.io-index",
-                  "checksum": f["sha256"], "crate": f}
+                  "checksum": crate["sha256"], "crate": crate}
         stock = digest("stock")[:40]
         engines = {arm: {"source_commit": digest(arm)[:40], "binary": f,
                          "version_output": arm + " fixture version", "build_receipt": f,
@@ -83,6 +97,14 @@ class IdentityContracts(unittest.TestCase):
     def test_local_native_patch_is_not_release_identity(self):
         self.manifest["engines"]["experiment"]["native"]["source"] = "path"
         self.reject("not the registry")
+
+    def test_native_source_must_match_downloaded_package(self):
+        self.manifest["engines"]["experiment"]["native"]["source_commit"] = digest("other source")[:40]
+        self.reject("archive source differs")
+
+    def test_native_version_must_match_downloaded_package(self):
+        self.manifest["engines"]["experiment"]["native"]["version"] = "0.15.2"
+        self.reject("invalid native archive metadata")
 
     def test_missing_fourth_model_rejects(self):
         del self.manifest["models"]["gemma4"]

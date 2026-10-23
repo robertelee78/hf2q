@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import re
 import sys
+import tarfile
+import tomllib
 
 SCHEMA = "hf2q.four-agent-identities.v1"
 MODELS = {"qwen38", "deepseek4", "qwen36", "gemma4"}
@@ -56,6 +58,28 @@ def file_identity(value, label, root):
     return value["sha256"]
 
 
+
+def native_archive(pin, label, root):
+    path = Path(pin["crate"]["path"])
+    if not path.is_absolute():
+        path = root / path
+    prefix = "mlx-native-" + pin["version"] + "/"
+    with tarfile.open(path, "r:gz") as archive:
+        def member(name):
+            entries = [entry for entry in archive if entry.name == prefix + name]
+            require(len(entries) == 1 and entries[0].isfile() and entries[0].size <= 1024 * 1024,
+                    label + ": missing, duplicate or invalid native archive metadata")
+            with archive.extractfile(entries[0]) as stream:
+                return stream.read().decode("utf-8")
+        vcs = json.loads(member(".cargo_vcs_info.json"))
+        git = vcs.get("git", {})
+        require(git.get("sha1") == pin["source_commit"] and not git.get("dirty", False),
+                label + ": native archive source differs or is dirty")
+        package = tomllib.loads(member("Cargo.toml")).get("package", {})
+        require(package.get("name") == "mlx-native" and package.get("version") == pin["version"],
+                label + ": native archive package/version differs")
+
+
 def exact_keys(value, expected, label):
     require(isinstance(value, dict) and set(value) == expected,
             f"{label}: requires exactly {sorted(expected)}")
@@ -98,6 +122,7 @@ def validate(manifest, root):
             sha(pin.get("checksum"), name + " native checksum")
             require(file_identity(pin.get("crate"), name + " native crate", root) == pin["checksum"],
                     name + ": native archive disagrees with locked checksum")
+            native_archive(pin, name, root)
             file_identity(engine.get("dependency_provenance_receipt"), name + " dependency proof", root)
     require(engines["experiment"].get("baseline_commit") == engines["stock"]["source_commit"],
             "experiment does not declare the exact stock baseline")
@@ -157,7 +182,7 @@ def main():
     try:
         result = validate(load(args.manifest), args.manifest.resolve().parent)
         print(json.dumps(result, sort_keys=True, allow_nan=False))
-    except (ValueError, TypeError, KeyError, OSError) as exc:
+    except (ValueError, TypeError, KeyError, OSError, tarfile.TarError) as exc:
         print("identity validation failed: " + str(exc), file=sys.stderr)
         return 2
     return 0

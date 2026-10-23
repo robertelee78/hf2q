@@ -57,4 +57,4 @@ A winning native change must be reviewed, merged, published and archive-verified
 
 No runtime, conversion, model hashing sweep, Metal test, performance campaign or package publication ran during this checkpoint. F1 remains incomplete.
 
-Validation update: `python3 -m unittest discover -s scripts/four_agent -p 'test_*.py' -v` passes 14 synthetic identity controls. These test changed bytes, missing files/models, baseline/peer/native mismatches and omitted configuration evidence; they do not complete the F1 campaign freeze.
+Validation update: `python3 -m unittest discover -s scripts/four_agent -p 'test_*.py' -v` passes 16 synthetic identity controls. These test changed bytes, missing files/models, baseline/peer/native archive/source/version mismatches and omitted configuration evidence; they do not complete the F1 campaign freeze.
