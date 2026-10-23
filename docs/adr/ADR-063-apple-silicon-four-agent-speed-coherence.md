@@ -1,8 +1,8 @@
 # ADR-063: Apple Silicon four-agent GGUF speed and coherence
 
-- **Status:** Proposed; research and skeptic revision complete, implementation designs require approval.
+- **Status:** Accepted program scope and F1/F3 execution entry; downstream implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-10-22 — narrowed release scope after Claude critique and operator hardware/model/QE requirements.
+- **Updated:** 2026-10-23 — operator approved program scope and F1/F3 execution entry after skeptic review; normalized peer terminology.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
 - Stable source ID: ADR-063
@@ -15,9 +15,9 @@
 
 The product goal is leadership in GGUF inference on Apple Silicon. The primary outcome is four concurrently active agentic coding slots on the operator M5 Max with 128 GB RAM, with coherence/tool correctness at least as good as peers and performance at least competitive, preferably faster. Current primary implementations and October releases determine the experiment shortlist; old ADRs supply constraints and failed evidence, not an automatic implementation queue.
 
-This proposal consolidates the strongest ideas from ADR-010/011/016/019/034/037/039/040/042/044/049 and newer October work. It does not silently supersede their accepted safety contracts. The release target is v0.1.28; the prior milestone-6 producer scope moves to v0.1.29. All new stories begin in Backlog; creating a project does not approve a technical design or claim an experiment passed. Do not duplicate existing managed issues; source corrections must reconcile their existing bindings. A feature story is accepted only on its own observable contract; cross-family milestones do not establish universal coverage.
+This proposal consolidates the strongest ideas from ADR-010/011/016/019/034/037/039/040/042/044/049 and newer October work. It does not silently supersede their accepted safety contracts. The release target is v0.1.28; the prior milestone-6 producer scope moves to v0.1.29. The operator approved this program scope and the F1/F3 execution entry on 2026-10-23 after the recorded skeptic review. F1/F3 may become Ready after their approval is recorded; all other stories remain Backlog pending their own design approval and predecessor evidence. Creating a project does not claim an experiment passed. Do not duplicate existing managed issues; source corrections must reconcile their existing bindings. A feature story is accepted only on its own observable contract; cross-family milestones do not establish universal coverage.
 
-The primary comparison is four simultaneously runnable agent slots with at least six tool rounds each; one-slot controls and mixed prefill/decode populations 3+1, 2+2 and 1+3 are required. Stock current hf2q, experimental hf2q from that baseline, and latest llama.cpp are mandatory arms, frozen for each experiment. Same-artifact peers use hf2q-produced GGUFs. MLX/native-format comparisons are separate quality-qualified arms. The mandatory hardware is M5 Max with 128 GB RAM; other Apple generations are future separate strata. Linux/CUDA runtime support is outside scope. Ideas may originate anywhere but win only through owned Rust/Metal GGUF measurements on this host. Primary artifacts are vanilla Qwen3.6-35B-A3B MoE, vanilla Qwen3.8-27B dense and DeepSeek-V4; Gemma is a secondary regression lane. Four slots do not mean four Macs. Quality gates and sampling transformations cannot be relaxed to manufacture a speed win.
+The primary comparison is four simultaneously runnable agent slots with at least six tool rounds each; one-slot controls and mixed prefill/decode populations 3+1, 2+2 and 1+3 are required. Stock current hf2q, experimental hf2q from that baseline, and latest peer are mandatory arms, frozen for each experiment. Same-artifact peers use hf2q-produced GGUFs. MLX/native-format comparisons are separate quality-qualified arms. The mandatory hardware is M5 Max with 128 GB RAM; other Apple generations are future separate strata. Linux/CUDA runtime support is outside scope. Ideas may originate anywhere but win only through owned Rust/Metal GGUF measurements on this host. Top-tier artifacts are vanilla Qwen3.8-27B dense and DeepSeek-V4. Qwen3.6-35B-A3B MoE and Gemma 4 are the second tier; prioritize the top-tier speed work while retaining explicit second-tier regression evidence. Four slots do not mean four Macs. Quality gates and sampling transformations cannot be relaxed to manufacture a speed win.
 
 ## Decision
 
@@ -34,9 +34,9 @@ Conditional work means its deciding experiment must record implement, falsify, o
 
 ### F1. Freeze October 2026 peer, target and hardware identities
 
-Outcome: A reproducible manifest freezes current stock hf2q, experimental hf2q and latest llama.cpp, with separately labeled historical and Apple-specific comparators.
+Outcome: A reproducible manifest freezes current stock hf2q, experimental hf2q and latest peer, with separately labeled historical and Apple-specific comparators.
 
-Requirement: The program MUST deliver a reproducible manifest freezes current stock hf2q, experimental hf2q and latest llama.cpp, with separately labeled historical and Apple-specific comparators.
+Requirement: The program MUST deliver a reproducible manifest freezes current stock hf2q, experimental hf2q and latest peer, with separately labeled historical and Apple-specific comparators.
 
 Acceptance:
 
@@ -44,13 +44,13 @@ Acceptance:
 
 - Freeze source/build/binary hashes, target and draft artifact hashes, native registry pin, hardware/OS/Metal versions, templates and rendered tokens; all compared releases must exist by 2026-10-22.
 
-- Include current llama.cpp and screen BaseRT 0.4.0, MLX 0.32.4/current main and Kapitsa for supported four-slot tool semantics; unsupported or unavailable arms are reported, never invented.
+- Include current peer and screen BaseRT 0.4.0, MLX 0.32.4/current main and Kapitsa for supported four-slot tool semantics; unsupported or unavailable arms are reported, never invented.
 
 - Use identical hf2q-produced GGUFs for same-artifact lanes; native-format comparisons require separately labeled quantization and independent quality evidence.
 
-- Resolve latest upstream llama.cpp at the beginning of each campaign and freeze it through that campaign; the historical pin is provenance, not a substitute for the latest-peer primary arm.
+- Resolve latest upstream peer at the beginning of each campaign and freeze it through that campaign; the historical pin is provenance, not a substitute for the latest-peer primary arm.
 
-- Primary artifacts are official vanilla Qwen3.6-35B-A3B MoE, vanilla Qwen3.8-27B dense, and DeepSeek-V4 on the operator M5 Max with 128 GB RAM; Gemma is a secondary regression lane. Freeze exact HF revisions and hf2q conversion provenance, not an abliterated substitute.
+- Freeze official vanilla Qwen3.8-27B dense and DeepSeek-V4 as top-tier targets on the operator M5 Max with 128 GB RAM; Qwen3.6-35B-A3B MoE and Gemma 4 are second-tier targets with explicit artifact identities and regression coverage. Freeze exact HF revisions and hf2q conversion provenance, not an abliterated substitute.
 
 - The default peer executable is absent and its build-info metadata is stale b9278/5306f4b3b; build an isolated current peer and verify its own --version plus binary hash. Source HEAD alone is not executable identity.
 
@@ -85,9 +85,9 @@ Acceptance:
 
 - Measure mixed prefill/decode populations 3+1, 2+2 and 1+3, plus pure four-prefill and four-decode controls; trace active/runnable slots and actual physical cohort membership. Overlapping queued HTTP requests alone do not prove concurrency.
 
-- The mandatory primary arms are stock current hf2q, experiment from the same baseline, and latest llama.cpp, frozen per run; other engines and the historical peer are separately labeled secondary comparisons.
+- The mandatory primary arms are stock current hf2q, experiment from the same baseline, and latest peer, frozen per run; other engines and the historical peer are separately labeled secondary comparisons.
 
-- Stage the primary matrix on the same M5 Max/128 GB host: Qwen3.6 MoE, vanilla Qwen3.8-27B dense, then DeepSeek-V4. Each needs N1 controls and N4 coding/tool proof. Use representative primary workloads first; expand only where needed to decide a candidate.
+- Stage the matrix on the same M5 Max/128 GB host: vanilla Qwen3.8-27B dense, then DeepSeek-V4, then second-tier Qwen3.6 MoE and Gemma 4. Each needs N1 controls and N4 coding/tool proof. Use representative primary workloads first; expand only where needed to decide a candidate.
 
 - Canonical transcript replay supplies identical rendered inputs for controlled timing and fairness; record the exact cache priming/reset policy and its cost, and never claim natural prefix reuse from a forced transcript. A separate own-output continuation lane scores real coding/tool success, natural reuse and task-level completion from the same initial tasks; its differing token streams are not token-matched timing evidence.
 
@@ -393,7 +393,7 @@ Priority: High. Core scope.
 
 Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
 
-### Q3. Independently prove gains over stock hf2q and latest llama.cpp
+### Q3. Independently prove gains over stock hf2q and latest peer
 
 Outcome: A QE-owned three-arm comparison quantifies the experimental gain and the remaining peer gap without quality loss.
 
@@ -401,7 +401,7 @@ Requirement: The program MUST deliver a QE-owned three-arm comparison quantifies
 
 Acceptance:
 
-- Freeze three primary arms at run start: current unmodified hf2q, experimental hf2q based on that exact baseline, and latest upstream llama.cpp; retain immutable source/binary identities for all runs.
+- Freeze three primary arms at run start: current unmodified hf2q, experimental hf2q based on that exact baseline, and latest upstream peer; retain immutable source/binary identities for all runs.
 
 - Use balanced interleaved three-arm crossover blocks, warmup and stock controls; target a predeclared 95% effect-interval half-width <=2.5 percentage points, minimum five and maximum twenty blocks. An unresolved interval means inconclusive, not faster.
 
@@ -413,7 +413,7 @@ Acceptance:
 
 - A separate named QE session/host from the candidate implementer executes Q3 and records its identity; freeze the certified harness commit and metric definitions before candidate implementation/evaluation.
 
-- Use latest llama.cpp peer-best as the mandatory peer arm and retain a separately labeled matched-settings diagnostic. Peer quality failures are recorded; a missing, failed or silently disqualified peer cannot yield a speed victory by default.
+- Use latest peer in its best valid configuration as the mandatory peer arm and retain a separately labeled matched-settings diagnostic. Peer quality failures are recorded; a missing, failed or silently disqualified peer cannot yield a speed victory by default.
 
 
 Validation: Independent QE executes the certified harness against frozen stock/experiment/latest-peer binaries and publishes paired effect sizes, confidence intervals, rejected trials and verdict.
@@ -434,15 +434,15 @@ Acceptance:
 
 - All deterministic task/tool/isolation gates pass and predeclared stochastic noninferiority holds against eligible current peers.
 
-- Per primary artifact, competitive means four-agent goodput/makespan within frozen nonregression margins of latest llama.cpp peer-best. A faster verdict requires at least 5% lower makespan or 5% higher successful-task goodput with paired uncertainty excluding a tie; report both stock improvement and peer gap.
+- Per primary artifact, competitive means four-agent goodput/makespan within frozen nonregression margins of latest peer in its best valid configuration. A faster verdict requires at least 5% lower makespan or 5% higher successful-task goodput with paired uncertainty excluding a tie; report both stock improvement and peer gap.
 
 - No accepted result worsens frozen p95 TTFT or maximum semantic-gap fairness ceilings; single-slot or microkernel speed alone cannot satisfy this story.
 
 - Choose only winning qualified branches, re-run exact combined configuration gates, publish required native pins, and retain commands/receipts for exact release artifacts. Excluded/falsified experiments need a recorded disposition, not forced implementation.
 
-- Record separate stock-to-experiment and experiment-to-latest-llama.cpp verdicts; report native-format peer competition separately from the mandatory same-GGUF peer verdict.
+- Record separate stock-to-experiment and experiment-to-latest-peer verdicts; report native-format peer competition separately from the mandatory same-GGUF peer verdict.
 
-- Latest llama.cpp must complete the declared workload for a valid performance verdict; peer task failures are explicit quality findings, never grounds for dropping the comparator and claiming a win against nothing.
+- Latest peer must complete the declared workload for a valid performance verdict; peer task failures are explicit quality findings, never grounds for dropping the comparator and claiming a win against nothing.
 
 - Give separate verdicts for vanilla Qwen3.6 MoE, vanilla Qwen3.8-27B dense and DeepSeek-V4 on M5 Max/128 GB. Do not pool native-format peers or a favorable model into a universal GGUF superiority claim.
 
@@ -489,6 +489,15 @@ F1 precedes F2; F2 is the source-bound baseline for every measured lane. F3 prec
 
 All acceptance, exclusions, failed-path requirements and the winning-subset release rule above are material source obligations and must be represented in the awa extraction coverage. Numerical or API-semantic failures stop promotion. A negative experiment is valuable measured evidence, not a shipped feature; no performance estimate in the research report is an acceptance receipt.
 
+## Execution entry (approved 2026-10-23)
+
+The operator authorized merging the corrected planning PR and making F1 (#356) and F3 (#358) Ready. The operator subsequently prioritized Qwen3.8 and DeepSeek-V4, with Qwen3.6 and Gemma 4 the next tier. Separate per-artifact M5 Max/128 GB results and independent QE remain required. The recorded skeptic review supplies the technical review of the program; this entry does not approve a later runtime design.
+
+- F1 starts by reading coordination, inventorying source/build/binary identities and existing model/conversion receipts without model loads, then designs a versioned immutable comparison manifest and fail-closed validator. Resolve current peer source at campaign start in an isolated checkout. Preserve the product pin until its governing replacement review. Missing artifacts, conversion provenance or capabilities are explicit unresolved inputs, never invented evidence. Deliver the validated manifest, capability dispositions and reproducible commands through a reviewed merge.
+- F3 starts with the named ADR/source/paper audit. Produce a claim-to-evidence table for ADR-010/011/019/037/039/049, preserve failed experiments, correct only supported claims, run the ADR inspector and reconcile existing source-bound issue keys. Deliver reviewed documentation and verified tracking through a merge; do not change runtime behavior under F3.
+- After F1 delivery, Q5 is the next design/qualification gate; F2 waits for both F1 and Q5. F3 can proceed independently of F1. Q5 needs an independently reviewed memory ledger and bounded stress plan before model execution. No runtime candidate begins before the certified harness and applicable state/numerical contracts are frozen.
+- Each execution session claims exactly one Ready story through an awa attempt before editing, uses its own topic worktree, and reads release coordination before heavy host work. Candidate implementers and independent QE have separate identities and receipts. Only the release driver dispatches shared model gates.
+
 ## Consequences
 
 ### Positive
@@ -497,11 +506,11 @@ The program concentrates on same-GGUF wins for four real coding agents on M5 Max
 
 ### Negative
 
-Three primary artifacts and sequential runtime isolation make real-model evidence expensive. Kernel wins can require a separately published mlx-native revision. Statistical uncertainty may yield an inconclusive outcome instead of a release superiority claim.
+Four artifact lanes and sequential runtime isolation make real-model evidence expensive. Kernel wins can require a separately published mlx-native revision. Statistical uncertainty may yield an inconclusive outcome instead of a release superiority claim.
 
 ### Neutral
 
-The ADR is Proposed and all extracted work starts in Backlog. Creation of the v0.1.28 project is not implementation approval. Historical pin/source drift is repaired by F1/F3 through existing authority, never silently by benchmark configuration.
+The program scope and F1/F3 execution entry are Accepted. Downstream implementation designs remain unapproved; acceptance of this program is not acceptance of implementation or performance claims. Historical pin/source drift is repaired by F1/F3 through existing authority, never silently by benchmark configuration.
 
 ## Successor watchlist (not committed v0.1.28 implementation scope)
 
