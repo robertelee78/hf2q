@@ -43,3 +43,22 @@ The operator explicitly approved the scoped prerequisite, replying “1) yes. 2)
 Independent reviewer q5-review-agent inspected the schema, extractor, preparation ordering and GCD paths at design commit `75709d78`; no blocking design defect was found. That technical verdict is not product approval.
 
 A possible later comparison disposition is to freeze clean source-built current main after approved prerequisites but before performance candidate work, then derive the experiment from that exact baseline with identical instrumentation and native pins. Retain the signed published v0.1.27 as separately labeled historical evidence, including its compatibility failure. This needs explicit source/acceptance review of the cumulative change from the audited baseline, plus a new campaign manifest; it is not adopted by this proposal. A failed stock task or zero goodput cannot supply a speedup denominator.
+
+## Scoped implementation validation
+
+The production fix and focused controls are in `03b75fb3630c6dd6c1e5570f83b7a05acb8f017c`.
+Seven strict-hint schema/HTTP controls, all eleven GCD policy tests and the
+existing closed tool-wire test pass with locked dependencies. The `tool_strict`
+filter is included in blocking CI.
+
+The clean-source offline capture passes 32 cases: cold plus six canonical tool
+rounds and the captured real OpenCode initial request for each of the four
+families. Every tool-bearing case checks omitted/false/null normalized tool
+serialization, production-rendered prompt bytes and HTTP token IDs for equality.
+Raw requests remain unchanged. The receipt explicitly records no model inference,
+no payload-hash verification in this helper, and no runtime qualification.
+Reproduce with the existing `four_agent_frozen_inputs` helper and a private
+`HF2Q_FROZEN_INPUT_CONFIG`, as described in `scripts/four_agent/README.md`.
+Independent f3-audit-agent code review found no blocking defect. These controls
+prove ingress compatibility and offline normalization, not generated tool quality,
+prefix reuse or speed.
