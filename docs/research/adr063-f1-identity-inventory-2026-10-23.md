@@ -95,6 +95,14 @@ The native converter verified source bytes and emitted a schema-v3 receipt ident
 
 MTP was retained. The converter prints a legacy warning that stable peers lack a Qwen MTP loader. That warning is not a current-peer capability result: at frozen peer commit `4231b23`, `src/models/qwen35.cpp` and `src/models/qwen35moe.cpp` contain explicit next-token tensor loading, and `common/speculative.cpp` contains Qwen MTP handling. Do not strip MTP to satisfy the old warning; probe exact-artifact compatibility after Q5 admission. Conversion and subsequent hashes ran sequentially with no co-resident inference model and no observed memory-pressure breach.
 
+### Client wire capture and settings contract (2026-10-23)
+
+Installed OpenCode reports v2.1.1, independently of the earlier tool-inventory version. Its currently configured local Qwen3.8 SFT provider/model was copied into an isolated profile with routing/credentials replaced by a synthetic localhost stub. The original configuration was not changed and no inference model ran. Both an initial capture and a reproduction using `scripts/four_agent/capture_client.py` observed a separate tool-free title request followed by the actual agent request: 12 tools, streaming enabled, `max_completion_tokens=8192`, and omitted temperature/top-p/top-k/seed/penalty fields. This is not capability evidence for the vanilla target; target-specific configurations still need capture.
+
+The source-bound effective settings and matched/peer-best distinction are documented in `scripts/four_agent/SETTINGS.md`. hf2q's request handler resolves the observed omitted sampling controls to greedy temperature 0, top-p 1 and top-k 0, while the current peer has different defaults. Qwen repetition-history handling also differs across the two sources; equal penalty numbers are not enough to declare a matched distribution. No production setting is silently changed to manufacture agreement or speed.
+
+Validation: the real OpenCode client completed the synthetic localhost exchange twice; an in-checkout output directory was rejected before creation. Two additional subprocess/HTTP boundary controls prove that source credentials/plugins/unrelated providers and secret environment variables do not reach the isolated profile, and that a timed-out owned client is reaped without a success receipt. The complete focused suite now passes 18 tests. These are harness controls, not a real-model or four-agent result.
+
 ## Remaining F1 work and failure path
 
 1. Use the operator-authorized direct coordination path: inspect live Actions jobs and local processes/listeners/memory before every heavy operation. The earlier memory-tool trust-anchor failure is historical context; the operator disabled that tooling, and it must not block or be invoked for subsequent work.
