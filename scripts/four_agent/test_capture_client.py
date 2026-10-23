@@ -119,6 +119,17 @@ state.joinpath('client.pid').write_text(str(os.getpid()))
                     capture("must-not-execute", source, output)
                 self.assertFalse(output.exists())
 
+    def test_cli_does_not_forward_driver_stdin_to_client(self):
+        client = self.client("state.joinpath('stdin.txt').write_text(sys.stdin.read())\n" + WIRE_CLIENT)
+        config = self.root / "source.json"
+        config.write_text(json.dumps(self.source))
+        output = self.root / "closed-stdin"
+        subprocess.run([sys.executable, str(Path(__file__).with_name("capture_client.py")),
+                        "--client", str(client), "--config", str(config), "--output", str(output)],
+                       input="driver context must not enter the captured prompt", text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=True)
+        self.assertEqual((output / "state/stdin.txt").read_text(), "")
+
     def test_programmatic_config_has_no_fabricated_raw_file_digest(self):
         result = capture(self.client(WIRE_CLIENT), self.source, self.root / "programmatic", timeout=5)
         self.assertIsNone(result["source_config_file_sha256"])

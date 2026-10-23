@@ -272,7 +272,7 @@ def capture(client, source, output, model=None, timeout=90, *, source_bytes=None
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             server_started = True
-            version_process = subprocess.Popen([client, "--version"], cwd=cwd, env=env,
+            version_process = subprocess.Popen([client, "--version"], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True, umask=0o077)
             try:
                 version, _ = version_process.communicate(timeout=15)
@@ -284,7 +284,7 @@ def capture(client, source, output, model=None, timeout=90, *, source_bytes=None
                        "Reply with CAPTURED. Do not call tools."]
             descriptor = os.open(output / "client.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "w") as log:
-                process = subprocess.Popen(command, cwd=cwd, env=env, stdout=log,
+                process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=log,
                     stderr=subprocess.STDOUT, start_new_session=True, umask=0o077)
                 code = process.wait(timeout=timeout)
         finally:
