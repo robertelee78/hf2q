@@ -6,6 +6,10 @@ Source: hf2q implementation at main 5b385d4ff580cc2c9cc70cdb425809b0c64dff63 and
 
 ## 1. Admission contract and quantities
 
+The subsequent [host metric availability finding](adr063-q5-metric-availability-2026-10-23.md)
+observes incomplete unprivileged cross-UID coverage. Competition remains Unknown;
+the finding neither changes this admission contract nor approves runtime execution.
+
 For complete conservative peak process ownership B, physical RAM P, reserve R>=12,884,901,888bytes, fresh aggregate competing-use bound C, optional independently scoped family ceiling F, require checked `B+C+R<=P` and, when applicable, `B<=F`. Also require GPU resource working-set bound G<=W under the explicit device policy below. Never add B, process footprint and Metal bytes together; they overlap. Record logical workload bytes, unique owned capacity, observed process footprint, mapped-file residency observations, and Metal resource/residency diagnostics as separate axes.
 
 F is 116 GiB=124,554,051,584 bytes for DeepSeek (ADR042:267-275; ADR049:106). No additional whole-process F was found for Qwen3.8/Qwen3.6/Gemma4 in the revision-bound source inventory; encode `NoneWithInventory`, not `Unknown`. Their unconditional cap isP-R-C. DeepSeek cap ismin(F,P-R-C). A128 GiB host yields116GiB only at minimum reserve and zero competitors. KV budgets, model-pool budget and projector/LCP budgets remain independent component constraints, not F. Unknown required category, unknown relevant ceiling inventory, overflow, missing OS observations, changed environment or unsupported shape rejects before allocation.
