@@ -87,6 +87,14 @@ All 18 vanilla Qwen3.8 source-weight shards were additionally hashed against the
 
 The operator disabled the memory-tool workflow. From that point, coordination uses current GitHub Actions/PR evidence plus direct host process, listener and memory checks; do not invoke the disabled tooling as a prerequisite. Before the sequential hashes, no local model/runtime/compiler process or test-model listener was observed, GitHub showed hosted CI only, and memory pressure was low. Recheck before each heavy action. Runtime experiments still require Q5 and the applicable independent-QE gates.
 
+### Fresh Qwen3.6 provenance (2026-10-23)
+
+The stock hf2q 0.1.27 signed executable completed a new conversion from existing official `Qwen/Qwen3.6-35B-A3B` source revision `995ad96eacd98c81ed38be0c5b274b04031597b0`, using `--source-repo`, `--source-revision`, `--quant q4_k_m`, `--text-only` and an isolated state root. The original receipt-less artifact remains untouched. No source or prequantized artifact was downloaded.
+
+The native converter verified source bytes and emitted a schema-v3 receipt identifying converter commit `5d1ffe7f1c5cf4ba5ffca452ec4bde738231beef`. Independent post-conversion file hashing matches the receipt: 21,712,410,208 bytes, SHA-256 `815a22cab21649948352c0eea6e9be0d9d15606e2024d86e7bdb71fb9df08220`. Static `info` with four inflight-batched slots passes without initializing Metal. This is the Qwen3.6 campaign candidate; final runtime/capability/quality qualification remains open.
+
+MTP was retained. The converter prints a legacy warning that stable peers lack a Qwen MTP loader. That warning is not a current-peer capability result: at frozen peer commit `4231b23`, `src/models/qwen35.cpp` and `src/models/qwen35moe.cpp` contain explicit next-token tensor loading, and `common/speculative.cpp` contains Qwen MTP handling. Do not strip MTP to satisfy the old warning; probe exact-artifact compatibility after Q5 admission. Conversion and subsequent hashes ran sequentially with no co-resident inference model and no observed memory-pressure breach.
+
 ## Remaining F1 work and failure path
 
 1. Use the operator-authorized direct coordination path: inspect live Actions jobs and local processes/listeners/memory before every heavy operation. The earlier memory-tool trust-anchor failure is historical context; the operator disabled that tooling, and it must not block or be invoked for subsequent work.
