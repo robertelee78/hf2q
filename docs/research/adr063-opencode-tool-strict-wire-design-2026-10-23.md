@@ -1,12 +1,14 @@
 # OpenCode non-strict function-tool wire compatibility
 
-Status: proposed prerequisite design, implementation approval pending. Work context: ADR-063 F1 (#356) real-client inventory finding. No production code changes, runtime qualification or performance claims are included in this design.
+Status: proposed prerequisite design, implementation approval pending. Work context: ADR-063 F1 (#356) real-client inventory finding and F2 (#357) production-client ingress prerequisite. No work phase is advanced by this proposal. No production code changes, runtime qualification or performance claims are included in this design.
 
 ## Observed failure
 
 At runtime source `c173c9a854ec0a15e0f70abc769a825e377846d9`, the unmodified OpenCode v2.1.1 agent requests for all four intended model profiles contain twelve function tools, each with `strict:false`. The offline renderer's shared `ChatCompletionRequest` parse fails with unknown field `strict`. `ToolFunction` in `src/serve/api/schema.rs` declares only name, description and parameters under `deny_unknown_fields`. The production `chat_completions` handler takes the same typed JSON extractor and maps a rejection to invalid-request output before model preparation. This establishes a source/schema incompatibility; a full-model HTTP run was not performed.
 
 The synthetic coding fixture omitted the field and therefore did not cover this client request. Preserve both its successful token captures and the separate failed actual-client capture with their qualification limits. No request field may be stripped from recorded wire evidence to manufacture a pass.
+
+The F1 merge `f097077ab9625d07413950eaefd9326770ffb2aa` leaves this schema and extraction behavior unchanged. This proposal does not reopen F1's accepted inventory boundary or claim that its synthetic fixtures prove production-client success.
 
 ## Proposed behavior
 
@@ -20,6 +22,8 @@ Keep the public `ToolFunction` fields and serialization shape unchanged. Replace
 
 This is hf2q HTTP/schema policy. It needs no native API, kernel, dependency update or package publication by itself. No fallback process or external inference component is introduced.
 
+The official function-calling guide was checked on 2026-10-23: Chat Completions defaults to non-strict mode. This proposal is limited to that endpoint; it does not infer identical defaults for the Responses API. Null acceptance is the proposed nullable wire policy, with explicit tests, rather than a claim that strict schema enforcement exists here.
+
 ## Required controls
 
 1. Parse full chat requests for absent, false and null; assert the same normalized tool definitions and unchanged parameters/description. Retain a representative twelve-tool, text-only request shape without private paths or credentials.
@@ -28,8 +32,14 @@ This is hf2q HTTP/schema policy. It needs no native API, kernel, dependency upda
 4. In the reviewed offline capture helper, parse the unmodified captured client requests for all four profiles. Check false/null versus omitted prompt bytes and token IDs with each family's effective template and HTTP tokenizer. Capture receipts remain clean-source and exact-binary bound.
 5. Run the relevant locked schema, handler and GCD contracts. The failure fixture must fail before the fix; a passing test that merely tests a substitute parser does not establish production acceptance.
 
+Include a twelve-tool request with a late `strict:true` entry, duplicate field rejection, and preservation of the original raw request. A valid model-free request reaching an unavailable-engine response proves only that it passed the production extractor. It must not be reported as successful generation.
+
 Independent review must assess the immutable production delta and its controls. Real multi-turn tool execution, unary/SSE generation, prefix reuse and four-slot quality/performance remain mandatory under Q5/F2 before claiming serving or speed qualification. No model load is authorized by this design.
 
 ## Approval and delivery
 
 ADR-063 approved F1 inventory/audit entry while requiring separate implementation designs. The integration owner has asked the operator to approve this newly discovered prerequisite change; execution waits for that answer. Keep this design linked to the F1 capability finding and record the chosen story/acceptance boundary before code edits. Do not relabel a patched stock executable as the published v0.1.27 baseline: any shared baseline compatibility adaptation needs an explicit, independently reviewed comparison disposition and source identity.
+
+Independent reviewer q5-review-agent inspected the schema, extractor, preparation ordering and GCD paths at design commit `75709d78`; no blocking design defect was found. That technical verdict is not product approval.
+
+A possible later comparison disposition is to freeze clean source-built current main after approved prerequisites but before performance candidate work, then derive the experiment from that exact baseline with identical instrumentation and native pins. Retain the signed published v0.1.27 as separately labeled historical evidence, including its compatibility failure. This needs explicit source/acceptance review of the cumulative change from the audited baseline, plus a new campaign manifest; it is not adopted by this proposal. A failed stock task or zero goodput cannot supply a speedup denominator.
