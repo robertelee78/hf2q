@@ -224,7 +224,8 @@ fn four_agent_frozen_inputs() {
                     .all(|key| supported.contains(&key.as_str())),
                 "unsupported request control; capture refuses rather than ignoring it"
             );
-            let req: ChatCompletionRequest = serde_json::from_value(case.request).unwrap();
+            let raw_request = case.request;
+            let req: ChatCompletionRequest = serde_json::from_value(raw_request.clone()).unwrap();
             assert!(!req.messages.is_empty());
             assert_ne!(req.max_completion_tokens.or(req.max_tokens), Some(0));
             assert!(
@@ -280,6 +281,43 @@ fn four_agent_frozen_inputs() {
             )
             .unwrap();
             let tokens = super::tokenize_http_prompt(&tokenizer, &rendered).unwrap();
+            // Exercise the actual deserializer, renderer and HTTP tokenizer for
+            // each configured family, without changing the captured raw wire.
+            let mut strict_hint_parity_checked = false;
+            if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                let normalized = serde_json::to_value(&req.tools).unwrap();
+                for hint in [None, Some(json!(false)), Some(serde_json::Value::Null)] {
+                    let mut variant = raw_request.clone();
+                    for tool in variant["tools"].as_array_mut().unwrap() {
+                        let function = tool["function"].as_object_mut().unwrap();
+                        function.remove("strict");
+                        if let Some(value) = &hint {
+                            function.insert("strict".into(), value.clone());
+                        }
+                    }
+                    let variant: ChatCompletionRequest = serde_json::from_value(variant).unwrap();
+                    assert_eq!(serde_json::to_value(&variant.tools).unwrap(), normalized);
+                    let variant_tools = if matches!(choice, ToolChoiceValue::None) {
+                        None
+                    } else {
+                        variant.tools.as_deref()
+                    };
+                    let variant_rendered = super::render_chat_prompt_or_400(
+                        template,
+                        &variant.messages,
+                        variant_tools,
+                        thinking,
+                        kwargs.as_ref(),
+                    )
+                    .unwrap();
+                    assert_eq!(variant_rendered.as_bytes(), rendered.as_bytes());
+                    assert_eq!(
+                        super::tokenize_http_prompt(&tokenizer, &variant_rendered).unwrap(),
+                        tokens
+                    );
+                }
+                strict_hint_parity_checked = true;
+            }
             assert!(
                 tokens.len() < model.context_tokens,
                 "capture refuses inputs requiring overflow rewriting"
@@ -301,7 +339,8 @@ fn four_agent_frozen_inputs() {
                 "declared_model_sha256":model.declared_model_sha256,"request_file_sha256":digest(&request_bytes),
                 "template_sha256":digest(template.as_bytes()),"chat_template_source":template_source,"context_tokens":model.context_tokens,"tokenizer_sha256":digest(tokenizer_json.as_bytes()),
                 "rendered_sha256":digest(rendered.as_bytes()),"tokens_sha256":digest(&token_json),
-                "token_count":tokens.len(),"enable_thinking":thinking,"resolved_template_kwargs":kwargs}));
+                "token_count":tokens.len(),"enable_thinking":thinking,"resolved_template_kwargs":kwargs,
+                "tool_strict_nonstrict_prompt_token_parity_checked":strict_hint_parity_checked}));
         }
     }
     let receipt = json!({"schema":"hf2q.offline-rendered-inputs.v1","model_inference_performed":false,

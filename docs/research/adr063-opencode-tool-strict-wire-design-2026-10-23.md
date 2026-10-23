@@ -1,6 +1,6 @@
 # OpenCode non-strict function-tool wire compatibility
 
-Status: proposed prerequisite design, implementation approval pending. Work context: ADR-063 F1 (#356) real-client inventory finding and F2 (#357) production-client ingress prerequisite. No work phase is advanced by this proposal. No production code changes, runtime qualification or performance claims are included in this design.
+Status: scoped implementation approved by the operator on 2026-10-23; implementation and validation tracked in PR #375. Work context: ADR-063 F1 (#356) real-client inventory finding and F2 (#357) production-client ingress prerequisite. This prerequisite does not advance the full F2 scoreboard phase or establish runtime/performance qualification.
 
 ## Observed failure
 
@@ -38,7 +38,7 @@ Independent review must assess the immutable production delta and its controls. 
 
 ## Approval and delivery
 
-ADR-063 approved F1 inventory/audit entry while requiring separate implementation designs. The integration owner has asked the operator to approve this newly discovered prerequisite change; execution waits for that answer. Keep this design linked to the F1 capability finding and record the chosen story/acceptance boundary before code edits. Do not relabel a patched stock executable as the published v0.1.27 baseline: any shared baseline compatibility adaptation needs an explicit, independently reviewed comparison disposition and source identity.
+The operator explicitly approved the scoped prerequisite, replying “1) yes. 2) yes.” Approval is [recorded on F2](https://github.com/robertelee78/hf2q/issues/357#issuecomment-6376208325); F2's full design, runtime predecessors and acceptance remain unchanged. Do not relabel a patched stock executable as the published v0.1.27 baseline: any shared baseline compatibility adaptation needs an explicit, independently reviewed comparison disposition and source identity.
 
 Independent reviewer q5-review-agent inspected the schema, extractor, preparation ordering and GCD paths at design commit `75709d78`; no blocking design defect was found. That technical verdict is not product approval.
 
