@@ -122,6 +122,10 @@ def validate(manifest, root):
         nonempty(engine.get("version_output"), name + " executable version output")
         file_identity(engine.get("binary"), name + " binary", root)
         file_identity(engine.get("build_receipt"), name + " build receipt", root)
+        dependencies = engine.get("runtime_dependencies")
+        require(isinstance(dependencies, list), name + ": explicit runtime dependency list required")
+        for index, dependency in enumerate(dependencies):
+            file_identity(dependency, name + " runtime dependency " + str(index), root)
         if name != "latest_peer":
             pin = engine.get("native", {})
             require(isinstance(pin, dict), name + ": missing native identity")
@@ -147,6 +151,21 @@ def validate(manifest, root):
     require(binary_hashes["stock"] != binary_hashes["experiment"]
             or engines["experiment"].get("identity_mode") == "stock_control",
             "identical hf2q binaries require explicit stock_control identity_mode")
+    evidence_files = manifest.get("evidence_files")
+    require(isinstance(evidence_files, list), "explicit supporting evidence list required")
+    for index, evidence in enumerate(evidence_files):
+        file_identity(evidence, "supporting evidence " + str(index), root)
+    comparators = manifest.get("comparators")
+    exact_keys(comparators, {"historical", "basert", "kapitsa", "mlx_release", "mlx_main", "mlx_lm"},
+               "supplemental comparators")
+    for name, comparator in comparators.items():
+        require(isinstance(comparator, dict), name + ": missing comparator disposition")
+        for field in ("identity", "status", "format_route", "qualification_limit"):
+            nonempty(comparator.get(field), name + " " + field)
+        receipts = comparator.get("evidence_files")
+        require(isinstance(receipts, list) and receipts, name + ": comparator evidence required")
+        for index, receipt in enumerate(receipts):
+            file_identity(receipt, name + " comparator evidence " + str(index), root)
     models = manifest.get("models")
     exact_keys(models, MODELS, "models")
     model_hashes = set()
@@ -187,6 +206,7 @@ def validate(manifest, root):
     # This is intentionally not a scientific certification or a live admission.
     return {"schema": SCHEMA, "campaign_id": manifest["campaign_id"],
             "offline_file_identities_verified": True, "campaign_qualified": False,
+            "validator_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "manifest_canonical_sha256": hashlib.sha256(json.dumps(manifest, sort_keys=True,
                 separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest(),
             "file_observations": observations,

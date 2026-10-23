@@ -13,10 +13,10 @@ The manifest uses schema `hf2q.four-agent-identities.v1` and these required fiel
 
 | Object | Required fields |
 | --- | --- |
-| Root | `schema`, `campaign_id`, timezone-qualified `frozen_at`, `coordination_ref`, `hardware`, `engines`, `models` |
+| Root | `schema`, `campaign_id`, timezone-qualified `frozen_at`, `coordination_ref`, `hardware`, `engines`, `models`, explicit `evidence_files` list and `comparators` |
 | Hardware | `chip` = `Apple M5 Max`, `physical_bytes` = 137438953472, `os_version`, `os_build`, `metal_version`, `compiler_version` |
 | Engines | Exactly `stock`, `experiment`, `latest_peer` |
-| Every engine | 40-character `source_commit`, captured executable `version_output`, `binary` file identity, `build_receipt` file identity |
+| Every engine | 40-character `source_commit`, captured executable `version_output`, `binary` file identity, `build_receipt` file identity, explicit `runtime_dependencies` list of file identities |
 | Stock and experiment | `native` object and `dependency_provenance_receipt` file identity |
 | Native | 40-character `source_commit`, published `version`, registry `source` = `registry+https://github.com/rust-lang/crates.io-index`, locked `checksum`, downloaded `crate` file identity matching that checksum |
 | Experiment | `baseline_commit` equal to stock `source_commit`; explicit `identity_mode: stock_control` if its executable bytes equal stock |
@@ -39,3 +39,7 @@ The four GGUF digests must be distinct. Each model's tokenizer, template and ren
 `rendered_tokens` binds the same aggregate `hf2q.offline-rendered-inputs.v1` receipt for all four models. The validator joins its declared model, effective template and tokenizer hashes to the frozen files, checks each prompt/token sidecar hash, token count and context bound, and requires clean source provenance. DeepSeek must identify its native encoding; other families use GGUF metadata templates. The receipt records implementation, configuration and capture-binary hashes. Those provenance fields still require independent source/build review. Successful validation returns both the canonical manifest digest and checked file observations; the CLI also returns the exact raw manifest-file digest.
 
 The ignored Rust offline capture test shares HTTP tokenization without adding BOS/EOS postprocessor tokens and selects the effective serving template. It accepts a restricted text/tool request subset and rejects unsupported controls and context overflow. It does not load model weights or prove API admission, tool execution or generation quality. Build it from a clean committed tree with `GIT_COMMIT_SHA` set to that commit; retain the exact capture binary and configuration. The checked-in canonical coding requests are synthetic renderer fixtures, not completed coding tasks.
+
+Supporting `evidence_files` are rehashed directly, including help output, frozen build inputs and settings registries. Each engine must declare `runtime_dependencies` explicitly; an empty list requires independent build/linkage review establishing no separately distributed non-system runtime files. A build receipt listing dylib hashes does not substitute for this directly checked list. Platform frameworks remain bound through OS/build identity and explicit linkage review.
+
+`comparators` contains exactly `historical`, `basert`, `kapitsa`, `mlx_release`, `mlx_main`, and `mlx_lm`. Every entry declares nonempty `identity`, `status`, `format_route`, `qualification_limit`, and a nonempty list of directly hashed `evidence_files`. These are explicit inventory dispositions, not inherited runtime capability. Settings contents and completeness still require independent source review. The receipt records the validator's own source SHA-256 so a historical result can be tied to the exact checks it ran.

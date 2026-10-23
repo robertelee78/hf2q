@@ -47,7 +47,7 @@ class IdentityContracts(unittest.TestCase):
         self.make_file = make_file
         stock = digest("stock")[:40]
         engines = {arm: {"source_commit": digest(arm)[:40], "binary": make_file(arm + ".bin", arm + " executable fixture"),
-                         "version_output": arm + " fixture version", "build_receipt": f,
+                         "version_output": arm + " fixture version", "build_receipt": f, "runtime_dependencies": [],
                          "dependency_provenance_receipt": f, "native": native} for arm in ARMS}
         engines["stock"]["source_commit"] = stock
         engines["experiment"]["baseline_commit"] = stock
@@ -86,10 +86,35 @@ class IdentityContracts(unittest.TestCase):
                                                   "os_version": "fixture", "os_build": "fixture",
                                                   "metal_version": "fixture", "compiler_version": "fixture"},
                                      "engines": engines, "models": models})
+        self.manifest["evidence_files"] = [f]
+        self.manifest["comparators"] = {name: {"identity": name + " fixture",
+            "status": "source_inspected", "format_route": "fixture only",
+            "qualification_limit": "no runtime proof", "evidence_files": [f]}
+            for name in ("historical", "basert", "kapitsa", "mlx_release", "mlx_main", "mlx_lm")}
 
     def reject(self, message):
         with self.assertRaisesRegex(ValueError, message):
             validate(self.manifest, self.root)
+
+    def test_runtime_dependency_bytes_are_checked(self):
+        dependency = self.make_file("runtime.dylib", "runtime fixture")
+        self.manifest["engines"]["latest_peer"]["runtime_dependencies"] = [dependency]
+        (self.root / "runtime.dylib").write_text("changed runtime fixture")
+        self.reject("runtime dependency")
+
+    def test_missing_runtime_dependency_inventory_rejects(self):
+        del self.manifest["engines"]["latest_peer"]["runtime_dependencies"]
+        self.reject("explicit runtime dependency")
+
+    def test_supporting_evidence_bytes_are_checked(self):
+        proof = self.make_file("help.txt", "capabilities fixture")
+        self.manifest["evidence_files"] = [proof]
+        (self.root / "help.txt").write_text("changed capabilities")
+        self.reject("supporting evidence")
+
+    def test_supplemental_comparator_disposition_is_required(self):
+        del self.manifest["comparators"]["kapitsa"]
+        self.reject("supplemental comparators")
 
     def test_hashes_are_not_a_campaign_verdict(self):
         result = validate(self.manifest, self.root)
