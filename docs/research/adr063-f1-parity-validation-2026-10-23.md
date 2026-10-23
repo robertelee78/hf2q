@@ -17,7 +17,7 @@ The original checker and complete negative-control results remain archived. Orig
 
 ## Declared dependency failure and explicit compatibility variant
 
-Unmodified reference source `36e36e63a54fc8f85b95e9c499a022b597e478dd` was first exercised under its declared Transformers 4.57.6 dependency. Gemma conversion failed because that tokenizer API expects a mapping while the frozen model supplies `extra_special_tokens` as a list. Preserve this as a failed probe. The model config declares `transformers_version: 5.5.0.dev0`; a separate Transformers 5.5.0 environment completed conversion. Torch 2.11.0 and NumPy 2.2.6 remain fixed. Full dependency locks and commands are retained for both environments.
+Unmodified reference source `36e36e63a54fc8f85b95e9c499a022b597e478dd` was first exercised under its declared Transformers 4.57.6 dependency. Gemma conversion failed because that tokenizer API expects a mapping while the frozen model supplies `extra_special_tokens` as a list. Preserve this as a failed probe. The model config declares `transformers_version: 5.5.0.dev0`; a separate Transformers 5.5.0 environment completed conversion. Torch 2.11.0 and NumPy 2.2.6 remain fixed. Full dependency locks and commands are retained for both environments; the [compatible reference lock](adr063-reference-gemma55-environment.lock) is checked in for reproduction.
 
 No upstream source or original environment was silently patched. The compatibility environment is a named reference experiment; it does not establish that the declared upstream environment supports the model. Production conversion remains owned Rust hf2q.
 
@@ -46,3 +46,8 @@ Official Gemma source revision `4d7ae4984b7db7de8f8457170b3f1a419ee76d52`; owned
 All **658** tensors have matching names, shapes, types and payload bytes: 392 F32, 192 Q4_K, 32 Q5_0, 14 Q6_K and 28 Q8_0. All three deciding reference/compare commands exited 0. This result is explicitly tensor-level; whole-file digests and their equality are recorded separately. It does not silently equate metadata compatibility, tokenization, loading, quality or execution across architectures.
 
 Together with 48 unchanged codec fixture files and 24 verified owned fixture cells, this validates the proposed replacement at the stated boundaries. The legacy real-model fixture cell that skipped is still a skip and contributes no proof. Keep the product pin unchanged until the governing adoption review and any wider required checks complete. Qwen/DeepSeek/Gemma runtime and all-four speed verdicts remain separate obligations.
+
+
+The existing frozen campaign Gemma artifact (SHA-256 `bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53`) also matches all 658 reference tensor payloads. Its conversion history was preserved; this check does not swap the campaign artifact.
+
+Whole-file bytes differ between fresh owned and reference outputs. The typed metadata audit finds no differing shared model-math or tokenizer values/types. Differences are three descriptive identity fields (`general.name`, `general.finetune`, `general.size_label`), the KV count, and two additional owned provenance keys (`hf2q.producer_version`, `hf2q.source_sha256`). That is documented metadata variation, not a claim of whole-file identity or runtime compatibility. Full parity receipt SHA-256: `82ea2e6aa982d862905c73a1fa615d88b4aeccd06e97115f947e5dbc0c1a7c74`.

@@ -157,3 +157,10 @@ The same review found driver stdin contamination in the bound client requests. B
 Fresh stdin-closed captures now reproduce the four intended profiles with one clean synthetic user message each, 12 tools and output cap 8192. The previous four `client-reviewed` captures each contained the driver script marker and are explicitly superseded; raw bytes and the original inventory manifest remain preserved. These new captures still contain `strict:false`, so no production-render or interoperability pass is claimed. They must replace the old wire bindings in the next immutable inventory revision.
 
 The refreshed peer's isolated quantizer/generator validation produced 48 unchanged fixture files, and owned Rust tests verified their 24 input/expected cells. The additional real-model cell skipped because its input fixtures were absent; its `ok` test status is not parity evidence. The pin proposal records this exact boundary and the remaining real-model qualification obligation.
+
+
+### Final validation preparation
+
+Inventory v3 validates 279 direct file observations with 41 Python identity/capture controls. Runtime dependencies, supporting help/build inputs, historical and Apple comparator dispositions, clean wire requests, per-family source findings and finite peer candidate argv are bound explicitly. These are source/inventory facts, not performance evidence.
+
+The [real-model parity record](adr063-f1-parity-validation-2026-10-23.md) adds a completed Gemma boundary: all 658 reference/owned tensor payloads match under the existing F16 staging contract, and the actual frozen campaign Gemma artifact matches those reference tensors too. Six real GGUF negative/positive controls close structural false-success paths in the checker. Failed dependency/precision probes remain preserved and the product pin is unchanged. This evidence must be bound into the successor immutable manifest and independently reviewed before F1 acceptance.

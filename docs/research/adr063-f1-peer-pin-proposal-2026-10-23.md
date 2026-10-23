@@ -1,7 +1,8 @@
 # ADR-063 F1: proposed reachable peer-pin replacement
 
-Draft for review, 2026-10-23. No product pin, fixture, checkout, code, or GitHub
-state changed by this investigation. No build or model load performed.
+Draft for review, 2026-10-23. The initial investigation was read-only; later
+sections record isolated builds and CPU conversion/parity probes. No product pin,
+tracked fixture or shared checkout changed, and no inference runtime ran.
 
 ## Proposed decision
 
@@ -152,7 +153,7 @@ fixture regeneration.
 
 Reachable source and isolated server identity: observed. Historical pin
 unrebuildable: already recorded source-bound research. New pin approved: no.
-Quantizer/fixture evidence is updated below; full real-model conversion parity remains incomplete. Four-family agentic runtime and
+Quantizer/fixture evidence is updated below; the Gemma real-model conversion boundary is now validated below; wider adoption gates remain open. Four-family agentic runtime and
 performance qualification: not run here. Proposal does not advance those states.
 
 
@@ -167,3 +168,12 @@ For fixture validation, copied the existing `gen.c` and generation script into a
 The locked owned quantizer byte-comparison run verified all 24 fixture cells. Its broad test-name filter additionally returned a legacy real-model test as `ok` after that test printed a missing-fixture skip. Report it as **24 verified fixture cells and one skipped real-model cell**, not 25 independent parity passes. Full real-model conversion/cached-reference qualification under step C remains open; no skip may satisfy that obligation. No product pin is adopted and no four-family runtime claim follows.
 
 The private comparison receipt freezes source, generator/library identities, every generated digest, exact byte comparisons, quantizer/help behavior and the owned-test log. Receipt SHA-256: `ffb28ed8503e77d4eed3f611a864716000683684e1819fcf11bf911a08f1d4a9`.
+
+
+## Real-model validation update
+
+The [full parity record](adr063-f1-parity-validation-2026-10-23.md) closes the deciding Gemma Q4_K_M conversion/tensor comparison: all 658 nonempty tensor entries have equal names, shapes, types and payload bytes under the existing canonical F16 staging contract. The frozen campaign Gemma artifact independently matches those 658 reference tensors too. Shared typed model-math/tokenizer metadata matches; descriptive/provenance metadata differs explicitly. This is not whole-file byte identity or a universal model-serving claim.
+
+The declared reference dependency environment failed and is retained; a separately frozen Gemma-compatible Transformers 5.5.0 variant completed the probe. The unmatched F32-input experiment is a recorded failure, not an accepted codec regression or an excuse to loosen zero-byte acceptance. The checker now rejects structural/empty false positives, verified by six real GGUF controls. No legacy skipped test contributes proof.
+
+Candidate source/build identity, 48 codec fixture files, 24 owned codec cells and this real-model boundary now support the proposed reachable replacement. Pin adoption still requires its separate review and any applicable wider conversion/runtime gates; the inventory task leaves the product pin unchanged.
