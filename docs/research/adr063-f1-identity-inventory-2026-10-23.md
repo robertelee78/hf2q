@@ -13,10 +13,10 @@
 | Local mlx-native | `f92eb020c4d3f821700e648fbce15d6cf75c2cc6`, 0.15.1 | Clean native checkout; release target agrees. |
 | hf2q native dependency | exact `=0.15.1` registry requirement | `Cargo.toml`, `Cargo.lock`, and `scripts/verify_release_dependency_provenance.sh` agree. |
 | Downloaded native crate | SHA-256 `76ce4c8d5773c72554a98020aadd330e566792dd27f843451ac5dd567bb6b5dd` | The public crates.io archive was downloaded and hashed; digest matches Cargo.lock and native GitHub release asset metadata. No build/test was run in this inventory. |
-| Published stock hf2q crate | release asset digest `98aa74c97c268286c29ee25643a562025b8480e1837d270f5778f71e0d760985` | GitHub metadata only; downloading and independently checking the stock archive/binary remains required for the campaign. |
+| Downloaded stock hf2q crate | SHA-256 `98aa74c97c268286c29ee25643a562025b8480e1837d270f5778f71e0d760985` | Downloaded crates.io archive digest matches release metadata. Embedded VCS commit matches stock main; packaged Cargo.toml pins native =0.15.1 and packaged Cargo.lock matches the verified native checksum. Binary identity remains separate. |
 | Published stock standalone | release asset digest `1ab3ac7570d8afbda97781542d8da3cd5c8f212964668223e30f496680b32d65` | GitHub metadata only; not a locally executed binary identity. |
 
-Sources: [native v0.15.1 release](https://github.com/robertelee78/mlx-native/releases/tag/v0.15.1), [hf2q v0.1.27 release](https://github.com/robertelee78/hf2q/releases/tag/v0.1.27). Public archive verification used `curl --fail --location` against the crates.io static archive endpoint followed by `shasum -a 256`; compare the result with the locked registry checksum before accepting it.
+Sources: [native v0.15.1 release](https://github.com/robertelee78/mlx-native/releases/tag/v0.15.1), [hf2q v0.1.27 release](https://github.com/robertelee78/hf2q/releases/tag/v0.1.27). Both native and hf2q public archive verification used `curl --fail --location` against the crates.io static archive endpoint followed by `shasum -a 256`; compare the result with the locked registry checksum before accepting it.
 
 ## Peer identities remain distinct
 
@@ -59,14 +59,34 @@ The native crate already exposes shared-weight batched GGML matrix APIs, dense/e
 
 A winning native change must be reviewed, merged, published and archive-verified first; hf2q then pins the exact registry version/checksum and qualifies its clean build. Final delivery additionally publishes the hf2q crate and signed standalone artifacts. Both repositories' release workflows are required evidence, not interchangeable milestones.
 
+## Existing managed artifact verification (2026-10-23)
+
+After the operator identified the managed model directory, read-only inventory found reusable converted artifacts. No replacement download or conversion was needed for these three candidates. Sequential SHA-256 reads of each complete GGUF matched its adjacent schema-v3 conversion receipt and byte length:
+
+| Candidate | Bytes | Verified GGUF SHA-256 | Receipt converter commit / quantization |
+| --- | --- | --- | --- |
+| Vanilla Qwen3.8-27B | 16,810,714,976 | `cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7` | `9c42dc1fc19b4dbe94c63c6c4bfef7f990c8f856` / Q4_K_M |
+| Official Gemma 4 26B A4B IT | 16,796,018,144 | `bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53` | `2c5931c3ddbcc141de40fe40e24dae3af9177321` / Q4_K_M |
+| DeepSeek-V4-Flash-0731 | 107,431,343,264 | `50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6` | `64a2344f2b519955e7bc7a13b48c450a7caa2901` / deepseek4-agentic-q2 |
+
+Receipts bind the official source revisions listed above; DeepSeek's full revision is `7872f01b1d1fe23eabc4c98b48bffcef5a386062`, also resolved independently through the official HF API. These are verified file/receipt bindings, not independent proof of every historical conversion operation or model quality.
+
+The signed stock v0.1.27 standalone was downloaded from its release. Its SHA-256 is `1ab3ac7570d8afbda97781542d8da3cd5c8f212964668223e30f496680b32d65`, strict codesign verification passes, and execution of `--version` reports `hf2q 0.1.27`. Static `info` with an isolated state root, inflight-batched scheduling and four slots passes on the Qwen3.8 candidate: 866 tensors, 49 metadata entries, embedded tokenizer/template and required directory/shape checks. No tensor decoding/upload or Metal initialization occurred. Its full-context static estimate is 52.56 GiB model plus four-slot KV before scratch/allocator overhead; this is not Q5 memory admission.
+
+Directory-only GGUF inspection finds one next-token layer in both existing Qwen3.8 and stock Qwen3.6 candidates, including explicit next-token projection/norm tensors. The DeepSeek candidate has no next-token metadata or explicit MTP/DSpark tensor names; its conversion receipt says 4,705 DSpark tensors were excluded from the base GGUF. F1/D2 must qualify compatible separate draft artifacts or record the unavailable arm; do not silently handicap or invent peer capabilities. The existing stock Qwen3.6 artifact lacks an adjacent conversion receipt in the inspected directory, so its provenance needs recovery or a reproducible conversion before campaign acceptance.
+
+All 18 vanilla Qwen3.8 source-weight shards were additionally hashed against the official pinned revision's LFS SHA-256 identities and matched. This strengthens that source's earlier size-only inventory. Other source-weight content verification and complete tokenizer/template receipt review remain open.
+
+The operator disabled the memory-tool workflow. From that point, coordination uses current GitHub Actions/PR evidence plus direct host process, listener and memory checks; do not invoke the disabled tooling as a prerequisite. Before the sequential hashes, no local model/runtime/compiler process or test-model listener was observed, GitHub showed hosted CI only, and memory pressure was low. Recheck before each heavy action. Runtime experiments still require Q5 and the applicable independent-QE gates.
+
 ## Remaining F1 work and failure path
 
-1. Restore a valid release-coordination read before any host-heavy build, hash sweep or model load. The native memory MCP currently returns `policy-ledger-anchor-missing`; do not establish a trust anchor or bypass integrity checks without determining whether this is a legitimate legacy ledger.
+1. Use the operator-authorized direct coordination path: inspect live Actions jobs and local processes/listeners/memory before every heavy operation. The earlier memory-tool trust-anchor failure is historical context; the operator disabled that tooling, and it must not block or be invoked for subsequent work.
 2. Choose and authenticate all four exact source/artifact identities, prove source shard integrity and hf2q conversion provenance, retain MTP tensors where needed, and freeze templates/rendered tokens and production sampling.
 3. Populate the versioned comparison manifest. The initial offline validator and negative controls now live in `scripts/four_agent/`; they require all four models and three arms, actual file hashes, native registry/archive agreement and explicit matched/peer-best settings. Its success deliberately leaves `campaign_qualified` false; receipt semantics and live binding remain separate gates. Bind both repository/source and registry identities, binary version/hash, model/draft hashes, hardware/software/Metal, exact settings and matched/peer-best capabilities. Missing fields must reject campaign admission rather than inherit launcher defaults.
 4. Build/identify the isolated current peer after coordination preflight, screen the dated alternative comparators, and record unavailable capabilities explicitly. Do not mutate the existing peer checkout or silently replace the product pin.
 5. Independently verify frozen stock and experimental binaries and all public package bytes; freeze the manifest at campaign start. Real model loads additionally require Q5 admission and the applicable qualification gates.
 
-No runtime, conversion, model hashing sweep, Metal test, performance campaign or package publication ran during this checkpoint. F1 remains incomplete.
+No inference runtime, new conversion, Metal test, performance campaign or package publication ran during this checkpoint. Read-only model/source hashing and static GGUF inspection are documented above. F1 remains incomplete.
 
 Validation update: `python3 -m unittest discover -s scripts/four_agent -p 'test_*.py' -v` passes 16 synthetic identity controls. These test changed bytes, missing files/models, baseline/peer/native archive/source/version mismatches and omitted configuration evidence; they do not complete the F1 campaign freeze.
