@@ -628,6 +628,9 @@ jobs:
           if ! python3 -B -m unittest discover -s scripts/grammar_probe -p 'test*.py'; then
             contract_failures=1
           fi
+          if ! python3 -B -m unittest discover -s scripts/four_agent -p 'test_*.py'; then
+            contract_failures=1
+          fi
           exit "$contract_failures"
 
       # --- Blocking: activate() matrix matches the shipping contract ---

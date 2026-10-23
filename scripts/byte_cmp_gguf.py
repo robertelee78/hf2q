@@ -21,8 +21,13 @@ b = gguf.GGUFReader(candidate_path, "r")
 by_name_a = {t.name: t for t in a.tensors}
 by_name_b = {t.name: t for t in b.tensors}
 
+if not by_name_a or not by_name_b:
+    print("[ERR] both inputs must contain tensor data", file=sys.stderr)
+    sys.exit(1)
+
 missing_in_b = set(by_name_a) - set(by_name_b)
 missing_in_a = set(by_name_b) - set(by_name_a)
+structural_errors = bool(missing_in_b or missing_in_a)
 if missing_in_b:
     print(f"[ERR] {len(missing_in_b)} tensors missing in candidate: {sorted(missing_in_b)[:5]}")
 if missing_in_a:
@@ -38,6 +43,11 @@ for name in sorted(by_name_a):
     ta, tb = by_name_a[name], by_name_b[name]
     if ta.tensor_type != tb.tensor_type:
         print(f"[TYPE-MISMATCH] {name}: canonical={ta.tensor_type.name} vs candidate={tb.tensor_type.name}")
+        structural_errors = True
+        continue
+    if not np.array_equal(ta.shape, tb.shape):
+        print(f"[SHAPE-MISMATCH] {name}: canonical={ta.shape} vs candidate={tb.shape}")
+        structural_errors = True
         continue
     tname = ta.tensor_type.name
     per_type_total[tname] = per_type_total.get(tname, 0) + 1
@@ -66,6 +76,10 @@ if mismatches:
     print(f"\n=== {len(mismatches)} MISMATCHED TENSORS (first 20) ===")
     for name, tname, nb, nd, fd, pct in mismatches[:20]:
         print(f"  {name:50s} {tname:8s} bytes={nb:>10}  diffs={nd:>8}  first_off={fd:>10}  pct={pct:.4f}%")
+    sys.exit(1)
+
+if structural_errors:
+    print("[ERR] tensor names, types or shapes differ", file=sys.stderr)
     sys.exit(1)
 
 total = sum(per_type_total.values())
