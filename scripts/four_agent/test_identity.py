@@ -57,7 +57,7 @@ class IdentityContracts(unittest.TestCase):
         rendered = {"schema": "hf2q.offline-rendered-inputs.v1", "model_inference_performed": False,
                     "runtime_qualified": False, "observations": [], "gcd_enabled": False, "overflow_policy_applied": False,
                     "source_commit": digest("render source")[:40], "source_worktree_clean": True}
-        for field in ("capture_config_sha256", "capture_recipe_source_sha256", "http_handler_source_sha256", "renderer_source_sha256", "capture_binary_sha256"):
+        for field in ("capture_config_sha256", "capture_recipe_source_sha256", "http_handler_source_sha256", "renderer_source_sha256", "deepseek_loader_source_sha256", "capture_binary_sha256"):
             rendered[field] = digest(field)
         for family in MODELS:
             model_file = make_file(family + ".gguf", family + " synthetic weights")
@@ -68,7 +68,7 @@ class IdentityContracts(unittest.TestCase):
             rendered["observations"].append({"model": family, "case": "cold", "declared_model_sha256": model_file["sha256"],
                 "template_sha256": template["sha256"], "tokenizer_sha256": tokenizer["sha256"],
                 "tokens_sha256": token_file["sha256"], "rendered_sha256": prompt_file["sha256"],
-                "token_count": 3, "context_tokens": 100,
+                "token_count": 3, "context_tokens": 100, "request_file_sha256": f["sha256"],
                 "chat_template_source": "native_encoding" if family == "deepseek4" else "gguf_metadata"})
             bindings = {arm: {"model_sha256": model_file["sha256"], "drafts": [], "matched_settings": f,
                 "capability_receipt": f, "resolved_production_sampling": f} for arm in ARMS}
@@ -77,6 +77,15 @@ class IdentityContracts(unittest.TestCase):
                 "variant": "vanilla", "quantization": "synthetic", "gguf": model_file,
                 "tokenizer": tokenizer, "template": template, "production_sampling": f,
                 "conversion_receipt": f, "source_integrity_receipt": f, "arms": bindings}
+        for family in MODELS:
+            cold = next(row for row in rendered["observations"] if row["model"] == family)
+            for index in range(1, 7):
+                row = copy.deepcopy(cold)
+                row["case"] = "tool_round_" + str(index)
+                make_file(family + "-" + row["case"] + ".tokens.json", "[1,2,3]")
+                prompt = make_file(family + "-" + row["case"] + ".prompt.txt", family + row["case"])
+                row["rendered_sha256"] = prompt["sha256"]
+                rendered["observations"].append(row)
         render_file = make_file("render-receipt.json", json.dumps(rendered))
         for model in models.values():
             model["rendered_tokens"] = render_file
@@ -200,6 +209,14 @@ class IdentityContracts(unittest.TestCase):
     def test_wrong_render_model_binding_rejects_even_with_fresh_receipt_hash(self):
         self.mutate_render_receipt(lambda r: r["observations"][0].update(declared_model_sha256=digest("other model")))
         self.reject("model differs")
+
+    def test_incomplete_canonical_tool_rounds_reject(self):
+        self.mutate_render_receipt(lambda r: r["observations"].pop())
+        self.reject("six tool rounds")
+
+    def test_unbound_rendered_request_file_rejects(self):
+        self.mutate_render_receipt(lambda r: r["observations"][0].update(request_file_sha256=digest("unbound")))
+        self.reject("request file not bound")
 
     def test_wrong_render_template_binding_rejects(self):
         self.mutate_render_receipt(lambda r: r["observations"][0].update(template_sha256=digest("other template")))

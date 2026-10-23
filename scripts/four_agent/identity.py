@@ -202,7 +202,7 @@ def validate(manifest, root):
         file_identity(bindings["latest_peer"].get("peer_best_settings"), family + " peer-best", root)
     require(len({m["rendered_tokens"]["sha256"] for m in models.values()}) == 1,
             "all four models must bind one coherent rendered-input receipt")
-    _validate_render_receipts(models, root, file_identity)
+    _validate_render_receipts(models, root, file_identity, {f["sha256"] for f in evidence_files})
     # This is intentionally not a scientific certification or a live admission.
     return {"schema": SCHEMA, "campaign_id": manifest["campaign_id"],
             "offline_file_identities_verified": True, "campaign_qualified": False,
@@ -216,7 +216,7 @@ def validate(manifest, root):
 
 
 
-def _validate_render_receipts(models, root, check_file):
+def _validate_render_receipts(models, root, check_file, request_hashes):
     for family, model in models.items():
         path = Path(model["rendered_tokens"]["path"])
         if not path.is_absolute():
@@ -231,7 +231,7 @@ def _validate_render_receipts(models, root, check_file):
         sha(receipt.get("source_commit"), family + " render source commit", 40)
         require(receipt.get("source_worktree_clean") is True, family + ": render source tree was not clean")
         for field in ("capture_config_sha256", "capture_recipe_source_sha256", "http_handler_source_sha256",
-                      "renderer_source_sha256", "capture_binary_sha256"):
+                      "renderer_source_sha256", "deepseek_loader_source_sha256", "capture_binary_sha256"):
             sha(receipt.get(field), family + " " + field)
         rows = receipt.get("observations")
         require(isinstance(rows, list) and rows and all(isinstance(row, dict) for row in rows),
@@ -246,6 +246,9 @@ def _validate_render_receipts(models, root, check_file):
             require(isinstance(case, str) and re.fullmatch(r"[A-Za-z0-9_-]+", case)
                     and case not in seen, family + ": invalid/duplicate rendered case")
             seen.add(case)
+            sha(row.get("request_file_sha256"), family + " request file")
+            require(row["request_file_sha256"] in request_hashes,
+                    family + ": rendered request file not bound by supporting evidence")
             require(row.get("declared_model_sha256") == model["gguf"]["sha256"],
                     family + ": rendered receipt model differs from verified GGUF")
             for field in ("template", "tokenizer"):
@@ -265,6 +268,8 @@ def _validate_render_receipts(models, root, check_file):
                     family + ": invalid rendered token IDs")
             require(type(row.get("token_count")) is int and row["token_count"] == len(tokens) and type(row.get("context_tokens")) is int
                     and 0 < len(tokens) < row["context_tokens"], family + ": rendered context/count mismatch")
+        required_cases = {"cold"} | {"tool_round_" + str(i) for i in range(1, 7)}
+        require(required_cases <= seen, family + ": cold plus six tool rounds required")
 
 
 def parse_manifest(raw):
