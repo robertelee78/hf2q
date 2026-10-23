@@ -26,6 +26,14 @@ Sources: [native v0.15.1 release](https://github.com/robertelee78/mlx-native/rel
 
 The October 22 research screening cutoff must not silently turn the historical/local source into the current-peer runtime arm. The revised ADR distinguishes these clocks.
 
+### Isolated current-peer executable (2026-10-23)
+
+An isolated shallow checkout at `4231b23dc2c46661d01157aac5245bdcf03ce4b1` now has a successfully built server; the existing peer checkout and accepted product pin remain unchanged. Configuration: `cmake -S . -B build-adr063 -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON`; build: `cmake --build build-adr063 --target llama-server -j 6`. CMake detected the Metal backend and ggml 0.27.0. SDK: 27.0; compiler: AppleClang 21.0.0.21000334, Darwin arm64.
+
+Executable SHA-256: `98ee8ebf20710ff9b1752b0a4807031b454e927e6aabbaf9e256205927178695`. Its own `--version` reports `0.7.0-dev (build 1, commit 4231b23)`. The build number is 1 because this is a shallow checkout; identify it by the immutable source and binary hashes, not by treating that count as an upstream release number. The local build receipt additionally freezes CMakeCache bytes, dynamic linkage and 25 built runtime-library file hashes. Later campaign admission must recheck those files, not only the main executable.
+
+The executable's `--help` advertises `draft-mtp`, `draft-dflash`, `draft-dspark`, explicit server slot count, continuous batching, prefix-cache reuse and a slots-monitoring endpoint. This is an executable capability inventory, not a successful model-level compatibility or speed result. Freeze matched-settings and peer-best configurations only after exact-artifact probes. No model was loaded and no peer test/performance suite ran in this build.
+
 ## Hardware and target inventory
 
 Observed hardware is Apple M5 Max, 137,438,953,472 physical bytes (128 GiB), macOS 27.2 build 26B5112a. `sysctl` and `sw_vers` supplied these values. Metal/compiler identity, live pressure, competing use, thermals and a disjoint runtime memory budget remain campaign inputs; no model was loaded.
