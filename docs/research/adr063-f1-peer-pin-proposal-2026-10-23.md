@@ -7,7 +7,7 @@ state changed by this investigation. No build or model load performed.
 
 Replace the unrebuildable repository parity/quantization pin
 `e15384a5cb092b080c2a01c0b9e3f8635079d6df` with reachable campaign source
-`4231b23dc2c46661d01157aac5245bdcf03ce4b1` **only after the compatibility
+`36e36e63a54fc8f85b95e9c499a022b597e478dd` **only after the compatibility
 validation and review below**. Until then the latter is a proposed pin and an
 identity-verified campaign executable, not a qualified repository parity oracle
 or a demonstrated four-family runtime.
@@ -17,7 +17,7 @@ start and frozen through that campaign (ADR-063 F1). Adopting this fixed pin doe
 not entitle future campaigns to call it latest. Neither pin authorizes replacing
 hf2q conversion, quantization or production inference with an external runtime.
 
-## Current source and receipts
+## Initial source and receipts (preserved observations)
 
 - the product pin file named in `NOTICE`: old full SHA above. `NOTICE:5–10` identifies the
   upstream project, attribution/license, benchmark/parity role and pin location.
@@ -152,5 +152,18 @@ fixture regeneration.
 
 Reachable source and isolated server identity: observed. Historical pin
 unrebuildable: already recorded source-bound research. New pin approved: no.
-Quantizer/fixture equivalence: not run here. Four-family agentic runtime and
+Quantizer/fixture evidence is updated below; full real-model conversion parity remains incomplete. Four-family agentic runtime and
 performance qualification: not run here. Proposal does not advance those states.
+
+
+## Refreshed candidate and isolated codec validation
+
+The initial 4231b23 executable above remains preserved. A later explicit upstream resolution selected `36e36e63a54fc8f85b95e9c499a022b597e478dd`; this is now the proposed replacement candidate. Its isolated server build/version identity is recorded in the F1 inventory. The shared checkout and product pin remain unchanged.
+
+The candidate quantizer target also builds successfully. Its executable SHA-256 is `7e754481bdd1147506aaa28c87679c048b33788851d3cf3543d70a6bc3398ea2`. The help probe prints its usage and exits 1; that exit is recorded as help behavior, not mistaken for a successful quantization run.
+
+For fixture validation, copied the existing `gen.c` and generation script into an isolated artifact directory, then compiled with the same C11/O2/NEON-enabled reference libraries and explicit candidate include/library/rpath locations. No tracked fixture or source script was rewritten, and no shared-checkout symlink/default was used. The generator's linked libraries point at the new isolated build. It generated all 48 input/expected files: 12 types, two importance variants, with input seed 1 and importance seed 2. There were no missing or skipped cells. Every generated file is byte-identical to its preserved tracked counterpart, including IQ4_XS omitted by the legacy README's 11-type count. This establishes the checked small-codec fixture boundary, not model-level equivalence.
+
+The locked owned quantizer byte-comparison run verified all 24 fixture cells. Its broad test-name filter additionally returned a legacy real-model test as `ok` after that test printed a missing-fixture skip. Report it as **24 verified fixture cells and one skipped real-model cell**, not 25 independent parity passes. Full real-model conversion/cached-reference qualification under step C remains open; no skip may satisfy that obligation. No product pin is adopted and no four-family runtime claim follows.
+
+The private comparison receipt freezes source, generator/library identities, every generated digest, exact byte comparisons, quantizer/help behavior and the owned-test log. Receipt SHA-256: `ffb28ed8503e77d4eed3f611a864716000683684e1819fcf11bf911a08f1d4a9`.
