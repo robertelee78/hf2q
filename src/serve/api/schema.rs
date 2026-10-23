@@ -801,8 +801,7 @@ pub struct Tool {
 }
 
 /// Function definition within a tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolFunction {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -811,6 +810,35 @@ pub struct ToolFunction {
     /// to GBNF via the ported `json-schema-to-grammar` (Decision #6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for ToolFunction {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireFunction {
+            name: String,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            parameters: Option<serde_json::Value>,
+            #[serde(default)]
+            strict: Option<bool>,
+        }
+
+        let wire = WireFunction::deserialize(deserializer)?;
+        if wire.strict == Some(true) {
+            return Err(D::Error::custom(
+                "unsupported strict tool mode: tools[].function.strict=true",
+            ));
+        }
+        // Non-strict hints are wire compatibility only, not template or GCD inputs.
+        Ok(Self {
+            name: wire.name,
+            description: wire.description,
+            parameters: wire.parameters,
+        })
+    }
 }
 
 /// Stop sequence: OpenAI supports either a single string or array of strings.
@@ -1680,6 +1708,10 @@ pub struct EmbeddingUsage {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "schema_tool_strict_tests.rs"]
+mod tool_strict_tests;
 
 #[cfg(test)]
 mod tests {

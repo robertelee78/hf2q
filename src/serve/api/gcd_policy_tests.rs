@@ -361,3 +361,60 @@ async fn router_keeps_unlocked_request_overrides_for_unary_and_sse() {
         }
     }
 }
+
+#[tokio::test]
+async fn router_tool_strict_nonstrict_hints_reach_readiness_without_enabling_gcd() {
+    for stream in [false, true] {
+        for strict in [None, Some(json!(false)), Some(Value::Null)] {
+            let mut definition = tool();
+            if let Some(value) = strict {
+                definition["function"]["strict"] = value;
+            }
+            let extra = json!({"tools": [definition]});
+            for config in [
+                ServerConfig::default(),
+                ServerConfig {
+                    gcd: true,
+                    ..ServerConfig::default()
+                },
+                schema_config(false),
+            ] {
+                let (status, body) = routed_request(config, extra.clone(), stream).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+                assert_eq!(body["error"]["code"], "not_ready", "{body}");
+            }
+            // Non-strict hints cannot bypass the existing locked tool policy.
+            let (status, body) = routed_request(schema_config(true), extra.clone(), stream).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["param"], "tools", "{body}");
+            let mut allowed = extra;
+            allowed["tool_choice"] = json!("none");
+            let (status, body) = routed_request(schema_config(true), allowed, stream).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(body["error"]["code"], "not_ready", "{body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn router_tool_strict_true_and_wrong_types_reject_before_readiness_or_sse() {
+    for stream in [false, true] {
+        for strict in [json!(true), json!("false"), json!(0), json!({}), json!([])] {
+            let mut definition = tool();
+            definition["function"]["strict"] = strict.clone();
+            for config in [ServerConfig::default(), schema_config(true)] {
+                let (status, body) =
+                    routed_request(config, json!({"tools": [definition.clone()]}), stream).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+                assert_eq!(body["error"]["param"], "body", "{body}");
+                if strict == json!(true) {
+                    assert!(body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("unsupported strict tool mode"));
+                }
+            }
+        }
+    }
+}
