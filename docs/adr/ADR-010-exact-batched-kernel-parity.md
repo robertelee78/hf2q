@@ -1,5 +1,20 @@
 # ADR-010: Exact Batched-Kernel Parity with llama.cpp
 
+**Updated:** 2026-10-23 (ADR-063 F3 source audit).
+
+## Current interpretation
+
+The dated experiments below remain historical evidence, not a current speed or
+release baseline. The F64 reconciliation invalidated a **router-only precision
+fix**: changing router accumulation cannot repair already-different router
+inputs. Exactness work must first locate divergence through attention, norms,
+and residuals on matched source/artifacts. Input-relative error and an absolute
+logit gap are different quantities; their magnitudes cannot be compared directly.
+Tie-aware routing or logit smoothing changes model semantics and cannot satisfy
+an exact-parity acceptance gate. ADR-063 requires fresh quality and performance
+proof before adopting any optimization; this ADR supplies no four-model win.
+
+
 **Status:** Parity line **Deferred**. Speed line **Shipping** via lm_head Q8+rerank as the new default strategy (see "lm_head Q8 + Rerank" section below).
 **Date:** 2026-04-16
 **Decision Makers:** Robert, Claude
@@ -67,13 +82,13 @@ Per-layer and per-stage bisection at (sliding_wrap, pos 34) in batched mode narr
    - hf2q picks expert 95 at rank 7; llama picks expert 61. Seven of eight top-K picks match; one swap is enough.
    - That one expert swap drives the 5.5% divergence in the MoE weighted sum; post-FF norm and layer_scalar carry it to 2.9% at L6's l_out, which then propagates.
 
-### Defensible framing
+### Historical framing — invalidated by the F64 reconciliation below
 
 Current evidence shows the remaining long-sequence batched parity gap is driven by **router matmul numerical differences crossing MoE top-K thresholds** at a small number of early tokens — not by attention kernels and not by an "intrinsic" implementation gap. Exact batched parity therefore requires **tighter router-logit agreement than the current owned router matmul provides**. hf2q's top-K selection already breaks true ties deterministically (lower expert_id on strict tie), and llama's is implementation-defined (`std::sort` unstable), so a stable-tiebreak change in hf2q is not the fix — the logits themselves need to agree more tightly than the current ~1e-4 floor allows under 0.0001 expert-gap conditions.
 
-### In scope
+### Historical proposed scope — router-only implementation withdrawn
 
-1. **Router matmul exactness (FIRST concrete implementation target).**
+1. **Router matmul exactness (former target; INVALIDATED, not execution-ready).**
    - Port ggml's router projection reduction order into a dedicated `router_matmul` kernel in mlx-native, used only at the `ffn_gate_inp` call site.
    - Small surface: input `[hs=2816]` × weight `[num_experts=128, hs]` → logits `[num_experts]` per token. The weight is already quantized — the alignment is about reduction/accumulation order over the K dimension, not the full qmatmul framework.
    - Replicate llama's `build_lora_mm(ffn_gate_inp, tmp)` behavior precisely, including the preceding `ggml_mul(ctx0, tmp, ffn_gate_inp_s)` scaling.
@@ -86,7 +101,7 @@ Current evidence shows the remaining long-sequence batched parity gap is driven 
 3. **Sub-stage boundary instrumentation (already landed).**
    - The `HF2Q_BATCHED_DUMP="layer,tok"` and `HF2Q_BATCHED_LAYER_SCAN="tok"` env vars in `forward_prefill_batched.rs` plus the extended `dump_layer_states` tool cover all sub-stages we need. Kept as the standing diagnostic for this ADR.
 
-### Explicitly out of scope (for now)
+### Historical exclusions — re-evaluate against upstream-input evidence
 
 - **Flash-attention-vec bit-exact replication.** Evidence shows attention is not the seam in batched mode — SDPA output is within 5.5e-4 of llama's. Deferred unless a future layer-scan reveals an attention-specific jump after the router fix.
 - **Direct ggml integration of whole framework.** Violates ADR-008. Only reconsider if router-matmul alignment doesn't close the gap and layer-scan reveals distributed sub-1e-4 noise accumulation.
@@ -160,14 +175,14 @@ this ADR's router-matmul line was closed. Summary:
 - 2026-04-16: **Router matmul exactness (option 2) INVALIDATED by F64 reconciliation.** Python F64 reference matmul reconstruction at (L6, pos 34) shows:
   - hf2q's router matmul already matches Python F64 to rel_rms 1.25e-7 (kernel is F64-precise given its inputs).
   - llama's router matmul matches Python F64 to rel_rms 1.30e-4 (slightly less precise than hf2q's, per its own inputs).
-  - Even with pure F64 matmul, hf2q's expert selection still picks e95 over e61 because its **input** (`pf_residual`) differs from llama's `attn_out` by 1.66e-4 — and that input drift is below the 0.0001 true logit gap between experts 61 and 95.
+  - Even with pure F64 matmul, hf2q's expert selection still picks e95 over e61 because its **input** (`pf_residual`) differs from llama's `attn_out` by 1.66e-4 — the input-relative error must not be equated to the absolute logit gap between experts 61 and 95.
   - Top-K truly cannot be stabilized by matmul precision alone on this token. The router is the messenger, not the source.
 
-**Reframe:** the precision floor is the end-to-end attention+norm+residual chain, which delivers L6's MLP/MoE input with ~1.6e-4 drift under batched F32. That is below the MoE's 1e-4 top-K logit gap for this token, so the gate flips. Closing this would require either:
+**Reframe:** the precision floor is the end-to-end attention+norm+residual chain, which delivers L6's MLP/MoE input with ~1.6e-4 drift under batched F32. The observed routing flip depends on propagated logit errors; comparing that input-relative error directly with an absolute top-K logit gap is invalid. Closing this would require either:
   1. Pervasive kernel alignment across the whole pre-MoE chain at the ~1e-5 level (a substantially wider engineering effort than a single targeted kernel).
   2. Structural mitigation at the MoE gate itself (e.g., tie-aware routing, logit smoothing) — not what Gemma4 specifies.
 
-For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is **localized, understood, and out of scope**: exact batched parity would require broader pre-MoE chain alignment than the current product goal justifies. That is a scope decision for this phase, not a universal claim — a future effort with different priorities could take up (1) or (2) and close more of the gap.
+For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is **localized, understood, and out of scope**: exact batched parity would require broader pre-MoE chain alignment than the current product goal justifies. That is a scope decision for this phase, not a universal claim — a future exact-parity effort can pursue (1). Option (2) would require a separate model-semantics decision and cannot count as exact parity.
 
 - 2026-05-09 (iter-59..62 re-investigation): Operator-flagged "speed gap problem we have with gemma" prompted re-bench at HEAD on `gemma4-ara-2pass-APEX-Q5_K_M.gguf` (Q6_K dominant per hf2q load banner, 19.16 GiB):
   - **User-default (per-token) measured peer gap is much larger than ADR-022 documented**: 65 tok/s @pp128 / 67 tok/s @pp512 / 67 tok/s @pp1024 vs llama-bench 1715 / 2576 / 1884 → **0.026×–0.038× = ~27-38× slower**, not 0.40×. The 0.40× number was qwen35, never gemma.

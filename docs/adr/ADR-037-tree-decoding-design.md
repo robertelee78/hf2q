@@ -1,8 +1,27 @@
 # ADR-037 — EAGLE-3 with dynamic tree port (max coherence + perf)
 
-- **Status**: 🚧 **IN PROGRESS** — Phases E1 + E3 + E4 + E5 + E6 (drafter side + Qwen35 verifier dispatcher + per-layer + full-layer + Q4_0 production + **multi-layer chain + HF2Q_SPEC_EAGLE3 serve flag**) SHIPPED at hf2q `6f7a9b80`. EAGLE-3 inference path is now production-usable end-to-end behind opt-in env flag pending drafter training (E2). Original CFA #3 closure note retained → **309/309 ADR-037 tests PASS single-threaded** (303 baseline + 6 new full-layer ACs). Three /cfa dual-mode sessions shipped Phase E6 closure: session #1 codex won 361/343 on adversarial bug catch (Claude's modulo-by-zero panic class); session #2 claude won 92/74 on test rigor (codex's no-op T5 alias + scale=0.0 zero-weights identity-path tests); **session #3 claude won 92/63 (29-pt margin) on test rigor and pool-discipline** (codex reproduced 2 prior-CFA defect classes: params buffers via `device.alloc_buffer` breaking AC-6 byte-identity determinism + AC-5 1e-3 hybrid-oracle tolerance unreachable with BF16-cast — codex measured 3.979e-2 drift confirming spec underestimated BF16 slop; claude declared both spec deviations openly, codex's own cross-review JUSTIFIED both). Remaining: multi-layer model integration + HF2Q_SPEC_EAGLE3 env flag wiring, E2 drafter training (multi-week H100 compute), E7 empirical validation, E8 final closure.
+**Updated:** 2026-10-23 (ADR-063 F3 source audit).
 
-> **HASS / Hydra is IN-SCOPE as Phase E9 — not deferred.** Per operator 2026-05-22: *"HASS/Hydra ← need this as part of our goal though, after eagle-3, we should never put off hard work, I've said this many times"*. Sequencing: EAGLE-3 closes first (E1-E8), then HASS/Hydra ships as Phase E9 on top of the same Qwen35 tree-verify infrastructure. The ensemble of EAGLE-3 + HASS gives us **two empirically-validated drafter families** to pick from at serve time (HF2Q_SPEC_DRAFTER={eagle3|hass}), maximizing coverage across workloads. See Phase E9 row + new §10 "HASS/Hydra plan" for design.
+## Current interpretation and research correction
+
+The phase table below records historical implementation and test receipts; it
+is not current model qualification. The shipped multi-layer integration and
+`HF2Q_SPEC_EAGLE3` wiring are not remaining greenfield tasks. E2 checkpoint
+qualification, E7 matched end-to-end measurement, and closure evidence remain
+separate obligations. ADR-063 controls current release scheduling.
+
+[EAGLE-2 (Li et al., June 2024)](https://arxiv.org/abs/2406.16858)
+introduces confidence-guided dynamic draft trees. hf2q's best-first tree builder
+is an implementation to inspect and test, not proof of published performance.
+[EAGLE-3 (Li et al., March 2025)](https://arxiv.org/abs/2503.01840)
+uses direct token prediction and multi-layer target features. It postdates HASS;
+HASS therefore cannot be an extension of EAGLE-3. §10 corrects the earlier
+HASS/Hydra conflation. Neither is a qualified second drafter family in hf2q.
+
+
+- **Status**: 🚧 **IN PROGRESS** — Phases E1 + E3 + E4 + E5 + E6 (drafter side + Qwen35 verifier dispatcher + per-layer + full-layer + Q4_0 production + **multi-layer chain + HF2Q_SPEC_EAGLE3 serve flag**) SHIPPED at hf2q `6f7a9b80`. EAGLE-3 inference path is now production-usable end-to-end behind opt-in env flag pending drafter training (E2). Original CFA #3 closure note retained → **309/309 ADR-037 tests PASS single-threaded** (303 baseline + 6 new full-layer ACs). Three /cfa dual-mode sessions shipped Phase E6 closure: session #1 codex won 361/343 on adversarial bug catch (Claude's modulo-by-zero panic class); session #2 claude won 92/74 on test rigor (codex's no-op T5 alias + scale=0.0 zero-weights identity-path tests); **session #3 claude won 92/63 (29-pt margin) on test rigor and pool-discipline** (codex reproduced 2 prior-CFA defect classes: params buffers via `device.alloc_buffer` breaking AC-6 byte-identity determinism + AC-5 1e-3 hybrid-oracle tolerance unreachable with BF16-cast — codex measured 3.979e-2 drift confirming spec underestimated BF16 slop; claude declared both spec deviations openly, codex's own cross-review JUSTIFIED both). Remaining: E2 drafter training/checkpoint qualification (multi-week H100 compute), E7 empirical validation, E8 final closure.
+
+> **HASS / Hydra is IN-SCOPE as Phase E9 — not deferred.** Per operator 2026-05-22: *"HASS/Hydra ← need this as part of our goal though, after eagle-3, we should never put off hard work, I've said this many times"*. Sequencing: EAGLE-3 closes first (E1-E8), then HASS/Hydra ships as Phase E9 on top of the same Qwen35 tree-verify infrastructure. The historical goal was to evaluate a second drafter family; this does not establish that HASS is implemented, compatible, or empirically validated in hf2q. See Phase E9 row + new §10 "HASS/Hydra plan" for design.
 - **Date**: 2026-05-22 (HEAD v2 `9690fc69`; mlx-native `3ea809f` Phase E1 closure)
 - **Supersedes**: nothing
 - **Author note**: v1 (earlier in this conversation) recommended Medusa-first because it was "simpler to implement". Operator pushed back: *"why do you focus on simple instead of correct for max coherence and perf? ... it literally takes longer to do the wrong things many times, then eventually the right thing ... better to just do the right thing 1st"*. v2 commits to the empirically-best published architecture from the start.
@@ -23,7 +42,7 @@
 | E3b — eagle3 drafter weights schema + loader | ✅ SHIPPED | hf2q `3b78d2bc` | `Eagle3DrafterConfig` (7 architectural gates) + `Eagle3Weights` strict manifest loader with synthetic safetensors validation. 26/26 unit tests PASS: config validation, manifest structure (12 invariant tests), conditional tensor gates (5 gates × validation), 5 safetensors load-path tests using synthetic in-memory blobs. |
 | E3 codex /cfa gate | ✅ PASSED | hf2q `6936473d` | Codex re-review confirms **0 Critical + 0 Major** remaining. Fixed: checked_mul overflow guards, vLLM d2t/t2d name normalization, `has_own_embed_tokens` config gate, defensive `cfg.validate()` at loader entry, stale mod.rs doc. Added 4 negative-path validation tests proving each fix fires. |
 | **Phase E3 totals** | ✅ **CLOSED** | hf2q `6936473d` | **45/45** unit tests PASS (15 E3a + 26 E3b + 4 codex-fix validations). |
-| E4a — dynamic tree expansion algo | ✅ SHIPPED | hf2q `8601772f` | EAGLE-2 GLOBAL best-first expansion via pending-candidate heap (codex caught batch-commit Critical → fixed). `Drafter` trait + `TreeContextView` carrying tokens/parents slices so GPU drafter can walk parent chain. `ExpandedTree` with f64 cum_log_probs (codex caught f32 underflow risk → fixed). `build_tree_mask` returns Result<Vec<f32>> with checked overflow (codex caught raw arithmetic → fixed). 21/21 tests PASS including explicit global-best-first proof (grandchild of A beats sibling of A when A's subtree has globally higher cum). |
+| E4a — dynamic tree expansion algo | ✅ SHIPPED | hf2q `8601772f` | Confidence-guided global best-first implementation (inspired by EAGLE-2) via pending-candidate heap (codex caught batch-commit Critical → fixed). `Drafter` trait + `TreeContextView` carrying tokens/parents slices so GPU drafter can walk parent chain. `ExpandedTree` with f64 cum_log_probs (codex caught f32 underflow risk → fixed). `build_tree_mask` returns Result<Vec<f32>> with checked overflow (codex caught raw arithmetic → fixed). 21/21 tests PASS including explicit global-best-first proof (grandchild of A beats sibling of A when A's subtree has globally higher cum). |
 | E4b.1 — GPU upload pipeline | ✅ SHIPPED | hf2q `3304a0fc` | `Eagle3DrafterTensors` with `Option<MlxBuffer>` for gated optional weights + BF16-as-F32 cast for RMSNorm weights (ADR-030 iter-106 pattern). Codex caught 2 Minor (gpu_resident_bytes overcounted CPU-resident vec; missing post-upload dtype tripwires) → fixed. 6/6 tests PASS. |
 | E4b.2 — FC projection forward | ✅ SHIPPED | hf2q `87a7b1b2` | `dispatch_eagle3_fc` wrapping `apply_linear_projection_f32`. CPU parity at seq=4 (BF16 GEMM) + seq=1 (GEMV decode path) within 5e-2 tolerance using BF16-quantized weights in CPU reference. Codex caught 1 Critical (input dtype was only debug_assert) + 3 Major (silent as-u32 truncation × 2 + unchecked multiply) → fixed. 5/5 tests PASS. Codex re-review: Critical 0 + Major 0. |
 | E4b.3 — input_layernorm + hidden_norm + concat | ✅ SHIPPED | hf2q `07f5c0fb` | Three forward primitives wrapping `dispatch_rms_norm` + `dispatch_feature_concat_f32`. CPU parity for both norms within 1e-3 tolerance. Sentinel-value test proves concat layout matches vLLM `torch.cat([embeds, hidden_states], dim=-1)`. Codex caught 3 Critical (3× byte-multiply overflows + missing weight-length validation) + 1 Major (zero seq_len) + 1 Minor (dim as f32 precision above 2^24) → all fixed. 7/7 tests PASS. Codex re-review: Critical 0 + Major 0. |
@@ -58,39 +77,50 @@
 | E2 — EAGLE-3 drafter training | ⏳ TODO | — | Multi-week H100 compute |
 | E7 — 3-rep paired empirical validation | ⏳ TODO | — | Target: ≥1.3× on 2K natural + ≥1.5× on long code-gen (blocked on E2 trained weights) |
 | E8 — codex /cfa final + ADR-034 update + merge | ⏳ TODO | — | EAGLE-3 closure |
-| **E9 — HASS / Hydra drafter family (IN-SCOPE; not deferred)** | 📋 SCOPED → ADR-039 | hf2q `73cec4ee` | Dedicated ADR landed 2026-05-23: see [`docs/adr/ADR-039-hass-hydra-speculative-decoding.md`](./ADR-039-hass-hydra-speculative-decoding.md) for full design (sequential Hydra heads + HASS feature/token consistency losses, joint training, reuse of ADR-037/038 verifier infrastructure, ~2200 Rust LOC inference + ~1500-3000 LOC training, 10-phase H1-H10 sequencing, 6 acceptance criteria). This ADR-037 row tracks dependency closure (E1-E8); empirical results land in ADR-039 H9-H10. |
+| **E9 — HASS / Hydra research** | Proposed; corrected by §10 | Historical scope `73cec4ee` | ADR-039 is a research proposal. Former ensemble/schema, joint-loss, LOC and H1–H10 estimates are withdrawn; artifact compatibility and a replacement design require deciding spikes before execution. |
 
 ## 0. The right thing first
 
-The metric is **max coherence + max perf at long context**. Picking the architecture by ease-of-implementation lands at a local minimum we'd have to throw away. Compare published numbers and architectural properties:
+The metric is **max coherence + max perf at long context**. Picking the architecture by ease-of-implementation lands at a local minimum we'd have to throw away. The following historical comparison motivated the choice; unmatched paper ratios and qualitative coherence rankings are not current decision evidence:
 
 | Approach | Speedup vs base | Drafter | Tree topology | Coherence at long ctx |
 |---|---:|---|---|---|
 | Medusa (Cai 2024) | 1.5-2.5× | N parallel heads from frozen target last hidden | Fixed | Lower (single hidden, no per-depth conditioning) |
 | EAGLE-1 (Li 2024a) | 2.5-3.0× | 1-layer drafter from target last hidden | Fixed | Medium |
-| EAGLE-2 (Li 2024b) | 3.0-3.5× | EAGLE-1 + dynamic tree | Dynamic | Higher |
-| **EAGLE-3 (Li 2024c)** | **4.06×** | **1-layer drafter from multi-layer hidden + dynamic tree** | **Dynamic** | **Highest** |
-| HASS / Hydra (2024) | 3.5× | Multiple parallel transformer drafters | Static or dynamic | Medium-high |
+| EAGLE-2 (Li et al., 2024) | Paper-specific; not comparable here | EAGLE-1 + dynamic tree | Dynamic | Requires matched evaluation |
+| **EAGLE-3 (Li et al., 2025)** | Paper-specific; not a hf2q baseline | **Drafter from multi-layer hidden + dynamic tree** | **Dynamic** | Requires matched evaluation |
+| HASS / Hydra (distinct 2024 methods) | No common comparable ratio | HASS: training harmonization; Hydra: dependent draft heads | Method-specific | Unqualified in hf2q |
 | Lookahead / REST | 1.5-2.0× | Training-free n-gram or retrieval | Static | Low |
 
-**EAGLE-3 + dynamic tree** is the published SOTA for autoregressive draft-based speculative decoding. The training recipe is published; the vLLM implementation is open-source MIT-licensed reference. Committing directly.
+**Historical choice:** pursue EAGLE-3 with dynamic trees. Neither a paper ranking nor an available reference implementation establishes the fastest qualified path for hf2q; current selection requires matched measurements.
 
-## 1. Why EAGLE-3 closes the long-context regression specifically
+## 1. Long-context benefit hypothesis and deciding measurement
 
-Per ADR-034 root-cause profiling at HEAD `1fb53d58`:
+Per ADR-034 root-cause profiling at historical HEAD `1fb53d58`:
 - Drafter accept-rate collapses from 82% (short) → 60% (2K natural) — `-22pp`
 - Per-round verifier kernel cost grows only `+7%`
-- MTP head conditions on ONE hidden state — underconditioned at long context
+- The MTP head conditions on one hidden state; underconditioning was the
+  working explanation, not a proof that a different drafter closes the gap.
 
-EAGLE-3 addresses this on every axis:
+EAGLE-3's multi-layer feature fusion, autoregressive drafting and training-time
+test motivate a **hypothesis** that a compatible checkpoint could improve
+acceptance enough to offset draft and verification cost at long context.
+Confidence-guided dynamic trees are another candidate lever. Neither the
+architecture nor its training recipe guarantees that outcome for hf2q.
 
-1. **Multi-layer hidden state aggregation**: drafter consumes hidden states from MULTIPLE target layers (not just the last). At long context, where information about long-range structure is distributed across layers, the drafter has more signal to condition on. Empirically: EAGLE-3 paper Table 5 shows accept rate stays ≥0.78 even at 4K+ tokens.
+The former citation claiming Table 5 proves acceptance ≥0.78 at 4K+ was wrong.
+[EAGLE-3 v3, §4.4/Table 5](https://arxiv.org/html/2503.01840v3) reports
+throughput improvements across batch sizes, not that context-length acceptance
+result. It supplies no closure evidence for the recorded local 82%→60% failure.
 
-2. **Dedicated drafter LM**: 1-layer transformer that maintains its OWN context across draft steps. Unlike Medusa's frozen-hidden-state parallel heads (which can't update predictions based on earlier draft tokens), EAGLE-3's drafter generates progressively-conditioned drafts — token at depth-3 conditions on draft tokens at depths 1, 2.
-
-3. **Dynamic tree (from EAGLE-2 lineage)**: instead of fixed N×D, expand candidates by confidence. Budget that would be wasted on low-confidence branches is reallocated to high-confidence ones. Critical for long-context where confidence distribution is skewed.
-
-4. **Trained alignment**: EAGLE-3 training recipe explicitly aligns drafter+verifier on long-context corpora. Generic Medusa heads (Hugging Face pre-trained) won't have this property.
+**Deciding measurement:** qualify an exact target/drafter artifact pair, then
+compare ordinary decoding, the existing MTP path and EAGLE-3 on the same short,
+2K and longer natural/code prompts, sampling settings and host conditions.
+Record acceptance by depth/context, draft and verify wall time, prefill/decode
+rates, semantic TTFT, memory and output/tool quality over alternating paired
+runs. Require the applicable ADR-063 quality and speed gates before claiming
+that the long-context regression is closed. Custom training remains subject to
+ADR-063's explicit decision gates; this hypothesis creates no training approval.
 
 ## 2. Peer references
 
@@ -227,7 +257,7 @@ Per the operator's directive: skipping straight to EAGLE-3 saves ~3000 LOC of Me
 | Training compute not available for Phase E2 | Sub-iter: validate on smaller Qwen3 target with published EAGLE-3 checkpoint to derisk; production ship blocked on training. Note: per operator directive "MULTI-WEEK EFFORTS ARE IN SCOPE" — training time IS in budget. |
 | Tree-attention kernel diverges from F32 single-token decode | Scope claim to accept-walk consistency only (same as ADR-030 §3.2 CAVEAT). Phase E1 includes parity at tree=1 (= chain = pass-through to flash_attn_vec). |
 | Dynamic tree-walk has bugs causing coherence collapse | Phase E5 synthetic test against Python reference; codex /cfa Critical 0 gate |
-| EAGLE-3 paper's 4.06× doesn't transfer to Qwen 3.6 27B | Acceptance gate is 1.3-1.5× (NOT 4.06×) — we set a conservative floor that still beats current MTP 0.85× long-context regression. Even if EAGLE-3 only delivers ½ its paper claim on Qwen, it still recovers the regression. |
+| Published EAGLE-3 gains do not transfer to the chosen target | The historical 1.3–1.5× gate still requires matched local quality and performance evidence; no fraction of a paper ratio proves a local win. |
 | MoE 35B-A3B compatibility | Initial port targets dense Qwen 3.6 27B. MoE port deferred to follow-up ADR (per scope discipline). |
 | LOC budget overruns | Per-phase commits + codex /cfa per phase catch drift; each phase is independently shippable. |
 
@@ -235,7 +265,7 @@ Per the operator's directive: skipping straight to EAGLE-3 saves ~3000 LOC of Me
 
 - Medusa port (~3000 LOC throwaway — see §2 last paragraph)
 - EAGLE-1 port (EAGLE-3 supersets it on every metric)
-- Static tree (EAGLE-2 dynamic tree is strictly better per published numbers)
+- Static tree (historically rejected in favor of confidence-guided expansion; published results do not prove universal superiority)
 - MoE 35B-A3B variant (follow-up ADR after E9)
 - Lookahead / REST / n-gram (lower ceiling than EAGLE-3)
 - Hand-rolled training without published recipe (would waste weeks)
@@ -257,63 +287,51 @@ This is the smallest unit that derisks the rest of the port. If tree-attention k
 - `feedback_long_context_bench_methodology_2026_05_22` memory — pinned fixture methodology
 - vLLM peer code: `/opt/vllm/vllm/v1/spec_decode/{eagle.py, llm_base_proposer.py, model_executor/models/llama_eagle3.py}`
 - llama.cpp peer code: `/opt/llama.cpp/common/speculative.cpp`
-- EAGLE-3 paper (Li et al. 2024c) — for training recipe + architecture details
+- EAGLE-3 paper (Li et al. 2025) — for training recipe + architecture details
 
 ## 10. HASS / Hydra plan (Phase E9 — IN-SCOPE; not deferred)
 
-### 10.1 Why HASS + why now
+### 10.1 Corrected research boundary (2026-10-23)
 
-Per operator 2026-05-22: *"HASS/Hydra ← need this as part of our goal though"* + *"never put off hard work"*. HASS has a 3.5× published ceiling vs EAGLE-3's 4.06×, BUT:
+The May operator request to investigate HASS/Hydra remains recorded above.
+The former parallel-transformer ensemble design and its LOC estimates were
+based on a misidentification and are withdrawn, not implemented milestones.
 
-- HASS uses **multiple parallel transformer drafters** (vs EAGLE-3's single drafter). Each drafter sees a different snapshot of target hidden states + draft tokens, giving the verifier multiple candidate sequences per round.
-- The two architectures are **not redundant**: HASS's ensemble can outperform EAGLE-3 on workloads where the verifier's accept distribution is heavy-tailed and dynamic tree budget is misallocated by a single drafter's confidence signal.
-- Both ship to the same Qwen35 tree-verify infrastructure (the per-layer block + dispatcher from E6 is the foundation). Marginal LOC for HASS ≈ parallel-drafter forward orchestration + HASS-specific training recipe + serve flag wiring — meaningful but bounded.
+[HASS, Zhang et al.](https://arxiv.org/abs/2408.15766) is a training method
+for an EAGLE-style autoregressive drafter: objective distillation and alignment
+of training context with recursive inference. It is not an ensemble of four
+transformers, and Hydra is not its earlier name. [Hydra, Ankner et al.](https://arxiv.org/abs/2402.05109)
+is a separate sequentially dependent draft-head method in the Medusa setting.
+Paper-level speed ratios have different targets and evaluation conditions and
+cannot select a hf2q workload winner or predict compounded gains.
 
-The empirically-optimal answer at production is **"both drafter families, picked per workload"**, not "the one with the higher paper number".
+### 10.2 Replacement E9 deciding spikes — Proposed
 
-### 10.2 HASS architecture (peer reference)
+1. Pin an official checkpoint, target revision, license, tokenizer, tensor
+   schema, hidden-feature interface, and training/inference recipe. Prove
+   compatibility independently for each intended hf2q family; do not assume
+   an EAGLE-3 loader accepts HASS or Hydra weights.
+2. Specify the drafter graph and verifier/cache/rollback requirements from
+   that artifact. Native primitives/kernels belong in mlx-native; loaders,
+   model graphs and serving policy belong in hf2q.
+3. Establish exact verification semantics and matched quality before paired
+   end-to-end measurements against ordinary decoding and qualified EAGLE-3.
+   Measure draft/verify cost, acceptance, TTFT and semantic streaming behavior.
 
-Reference repos: `https://github.com/HArmonizedSS/HASS` (Hydra is an earlier name in the lineage). Architecture (from paper + repo):
-
-- **N parallel drafters** (typically N=4 for HASS-Vicuna). Each is a 1-layer transformer.
-- Drafter `i` consumes target hidden states from layer subset `L_i` (overlapping across drafters → diversity). EAGLE-3 uses a single drafter with multi-layer concatenated hidden; HASS distributes layer assignment across drafters.
-- Each drafter generates its own candidate sequence of length `D` (depth). Tree topology can be either: (a) **static** — each drafter contributes a depth-D chain → N×D candidates, or (b) **dynamic** — best-first expansion across the union of all drafter outputs.
-- Verifier accepts the longest matching prefix across the N parallel drafter outputs in one tree-verify pass.
-
-### 10.3 Phase E9 sub-phase plan
-
-| Sub-phase | Goal | Estimated LOC |
-|---|---|---|
-| E9.1 | HASS drafter weights schema + manifest loader (extends `Eagle3Weights`); N×1-layer-transformer struct | 500 |
-| E9.2 | Parallel-drafter forward orchestrator: runs N drafters in parallel encoders, fuses outputs into a single ExpandedTree | 600 |
-| E9.3 | HASS-specific training recipe + drafter training (multi-week H100 compute, parallels E2) | external |
-| E9.4 | Serve-layer `HF2Q_SPEC_DRAFTER={eagle3\|hass}` flag wiring | 200 |
-| E9.5 | Empirical 3-rep paired validation: HASS vs EAGLE-3 vs base on pinned long-context fixtures; pick per-workload defaults | external |
-| E9.6 | Codex /cfa final + ADR-037 update + merge | external |
-
-### 10.4 Reuse opportunities (why this is bounded)
-
-- Qwen35 tree-verify dispatcher (E6 SHIPPED) — unchanged
-- Qwen35 per-layer tree-verify block (E6 SHIPPED) — unchanged
-- Tree-walk-accept algorithm (E5a SHIPPED) — unchanged
-- DrafterKvCache (E5b SHIPPED) — N caches, one per drafter
-- Dynamic-tree best-first expansion (E4a SHIPPED) — extends to multi-drafter union
-- mlx-native dk128 tree_attention kernel — unchanged
-- Eagle3HiddenCollector — extended (HASS needs per-drafter layer-subset assignment, but the collection plumbing is the same)
-
-### 10.5 HASS-vs-EAGLE-3 decision matrix (per-workload defaults to be empirically validated in E9.5)
-
-Hypothesis to test: HASS wins on long-context heterogeneous workloads (chat, RAG with mixed retrieval); EAGLE-3 wins on homogeneous workloads (code-gen, single-domain). Tested in E9.5.
+These are research gates, not execution approval or a new training commitment.
+ADR-063 excludes custom training from its current release work pending its
+explicit decision gates. Existing verifier code is a candidate reuse surface,
+not evidence that either distinct drafter needs zero verifier changes.
 
 ## 11. Decision
 
-**Approved scope**: implement EAGLE-3 with dynamic tree decoding in 8 phases (E1-E8), then HASS / Hydra as Phase E9 per §10. No Medusa fallback, no incremental "stepping stones". Commit to the architecture that delivers max coherence + perf from phase 1.
+**Historical approved scope (May 2026)**: implement EAGLE-3 with dynamic tree decoding in 8 phases (E1-E8), then HASS / Hydra as Phase E9 per §10. No Medusa fallback, no incremental "stepping stones". Commit to the architecture that delivers max coherence + perf from phase 1.
 
 **First-action next iteration**: Phase E1.1 — `mlx-native/src/shaders/tree_attention.metal` skeleton + tree=1 parity test. (SHIPPED.)
 
 **Acceptance for ADR-037 closure (EAGLE-3 portion)**: Phase E7 empirical validation shows EAGLE-3 ≥1.3× base on pinned 2K natural prompt + ≥1.5× on long code-gen, AND Phase E8 codex /cfa final clean.
 
-**Acceptance for full mission closure**: Phase E9.5 empirical validation establishes per-workload winner between HASS and EAGLE-3, AND E9.6 codex /cfa final clean, AND HF2Q_SPEC_DRAFTER serve flag ships.
+**Historical full-mission intent**: evaluate HASS/Hydra after EAGLE-3. The old E9.5/E9.6 ensemble plan is withdrawn by §10; replacement design remains Proposed and does not change ADR-063 release gates.
 
 ## 12. 2026-08-08 release-gate correction: concurrent encoder ordering
 
