@@ -592,6 +592,11 @@ impl Deepseek4Session {
 }
 
 impl Deepseek4LoadedModel {
+    /// Authoritative text prompt encoder selection, usable without a model load.
+    pub(crate) fn serving_chat_template() -> &'static str {
+        crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731
+    }
+
     pub(super) fn commit_generated_tokens_cohort(
         &mut self,
         token_ids: [u32; 4],
@@ -939,7 +944,7 @@ impl Deepseek4LoadedModel {
             quant_type,
             tokenizer,
             // Routes the shared renderer through the stateful native encoder.
-            chat_template: crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731.to_string(),
+            chat_template: Self::serving_chat_template().to_string(),
             eos_token_ids: vec![eos],
             load_duration: started.elapsed(),
             provenance,

@@ -32,7 +32,7 @@ def nonempty(value, label):
     require(isinstance(value, str) and bool(value.strip()), f"{label}: missing text")
 
 
-def file_identity(value, label, root):
+def _file_identity(value, label, root):
     require(isinstance(value, dict), f"{label}: missing file identity")
     sha(value.get("sha256"), label)
     nonempty(value.get("path"), label + " path")
@@ -86,6 +86,17 @@ def exact_keys(value, expected, label):
 
 
 def validate(manifest, root):
+    observations = []
+
+    def file_identity(value, label, checked_root):
+        actual = _file_identity(value, label, checked_root)
+        path = Path(value["path"])
+        if not path.is_absolute():
+            path = checked_root / path
+        observations.append({"label": label, "path": str(path.resolve()),
+                             "bytes": value["bytes"], "sha256": actual})
+        return actual
+
     require(isinstance(manifest, dict) and manifest.get("schema") == SCHEMA,
             "unsupported identity schema")
     for field in ("campaign_id", "frozen_at", "coordination_ref"):
@@ -130,8 +141,15 @@ def validate(manifest, root):
     require(peer.get("resolved_upstream_commit") == peer["source_commit"],
             "latest-peer upstream resolution differs from built source")
     file_identity(peer.get("upstream_resolution_receipt"), "latest-peer resolution receipt", root)
+    binary_hashes = {arm: engine["binary"]["sha256"] for arm, engine in engines.items()}
+    require(binary_hashes["latest_peer"] not in (binary_hashes["stock"], binary_hashes["experiment"]),
+            "latest-peer executable must differ from hf2q")
+    require(binary_hashes["stock"] != binary_hashes["experiment"]
+            or engines["experiment"].get("identity_mode") == "stock_control",
+            "identical hf2q binaries require explicit stock_control identity_mode")
     models = manifest.get("models")
     exact_keys(models, MODELS, "models")
+    model_hashes = set()
     for family, model in models.items():
         require(isinstance(model, dict), family + ": missing model")
         for field in ("hf_repository", "quantization"):
@@ -139,31 +157,97 @@ def validate(manifest, root):
         require(model.get("variant") == "vanilla", family + ": vanilla artifact required")
         sha(model.get("hf_revision"), family + " HF revision", 40)
         model_sha = file_identity(model.get("gguf"), family + " GGUF", root)
+        require(model_sha not in model_hashes, "different models must have distinct GGUF identities")
+        model_hashes.add(model_sha)
         file_identity(model.get("conversion_receipt"), family + " conversion receipt", root)
         file_identity(model.get("source_integrity_receipt"), family + " source integrity receipt", root)
         for field in ("tokenizer", "template", "rendered_tokens", "production_sampling"):
             file_identity(model.get(field), family + " " + field, root)
+        role_hashes = [model[field]["sha256"] for field in ("gguf", "tokenizer", "template", "rendered_tokens")]
+        require(len(set(role_hashes)) == len(role_hashes), family + ": GGUF/tokenizer/template/render receipt must be distinct files")
         bindings = model.get("arms")
         exact_keys(bindings, ARMS, family + " arms")
         for arm, binding in bindings.items():
+            required_binding = {"model_sha256", "matched_settings", "capability_receipt", "drafts", "resolved_production_sampling"}
+            if arm == "latest_peer":
+                required_binding.add("peer_best_settings")
+            exact_keys(binding, required_binding, family + " " + arm + " binding")
             require(isinstance(binding, dict) and binding.get("model_sha256") == model_sha,
                     family + " " + arm + ": same-GGUF identity mismatch")
-            for field in ("matched_settings", "capability_receipt"):
+            for field in ("matched_settings", "capability_receipt", "resolved_production_sampling"):
                 file_identity(binding.get(field), family + " " + arm + " " + field, root)
             drafts = binding.get("drafts")
             require(isinstance(drafts, list), family + " " + arm + ": explicit draft list required")
             for draft in drafts:
                 file_identity(draft, family + " " + arm + " draft", root)
         file_identity(bindings["latest_peer"].get("peer_best_settings"), family + " peer-best", root)
+    require(len({m["rendered_tokens"]["sha256"] for m in models.values()}) == 1,
+            "all four models must bind one coherent rendered-input receipt")
+    _validate_render_receipts(models, root, file_identity)
     # This is intentionally not a scientific certification or a live admission.
     return {"schema": SCHEMA, "campaign_id": manifest["campaign_id"],
             "offline_file_identities_verified": True, "campaign_qualified": False,
+            "manifest_canonical_sha256": hashlib.sha256(json.dumps(manifest, sort_keys=True,
+                separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest(),
+            "file_observations": observations,
             "remaining_gates": ["source/build/provenance receipt review", "latest-peer resolution review",
                                 "live runtime attestation", "memory/thermal/coordination admission",
                                 "capability and four-slot QE", "paired four-model speed verdicts"]}
 
 
-def load(path):
+
+def _validate_render_receipts(models, root, check_file):
+    for family, model in models.items():
+        path = Path(model["rendered_tokens"]["path"])
+        if not path.is_absolute():
+            path = root / path
+        receipt = load(path)
+        require(isinstance(receipt, dict) and receipt.get("schema") == "hf2q.offline-rendered-inputs.v1",
+                family + ": unsupported rendered-input receipt")
+        require(receipt.get("model_inference_performed") is False and receipt.get("runtime_qualified") is False,
+                family + ": invalid offline render qualification flags")
+        require(receipt.get("gcd_enabled") is False and receipt.get("overflow_policy_applied") is False,
+                family + ": unsupported render policy")
+        sha(receipt.get("source_commit"), family + " render source commit", 40)
+        require(receipt.get("source_worktree_clean") is True, family + ": render source tree was not clean")
+        for field in ("capture_config_sha256", "capture_recipe_source_sha256", "http_handler_source_sha256",
+                      "renderer_source_sha256", "capture_binary_sha256"):
+            sha(receipt.get(field), family + " " + field)
+        rows = receipt.get("observations")
+        require(isinstance(rows, list) and rows and all(isinstance(row, dict) for row in rows),
+                family + ": missing rendered observations")
+        require({row.get("model") for row in rows} == MODELS,
+                family + ": rendered receipt requires all four models")
+        seen = set()
+        for row in rows:
+            if row.get("model") != family:
+                continue
+            case = row.get("case")
+            require(isinstance(case, str) and re.fullmatch(r"[A-Za-z0-9_-]+", case)
+                    and case not in seen, family + ": invalid/duplicate rendered case")
+            seen.add(case)
+            require(row.get("declared_model_sha256") == model["gguf"]["sha256"],
+                    family + ": rendered receipt model differs from verified GGUF")
+            for field in ("template", "tokenizer"):
+                require(row.get(field + "_sha256") == model[field]["sha256"],
+                        family + ": rendered " + field + " differs from frozen identity")
+            expected_source = "native_encoding" if family == "deepseek4" else "gguf_metadata"
+            require(row.get("chat_template_source") == expected_source,
+                    family + ": wrong serving template selection")
+            for suffix, field in (("tokens.json", "tokens_sha256"), ("prompt.txt", "rendered_sha256")):
+                sidecar = path.parent / (family + "-" + case + "." + suffix)
+                sha(row.get(field), family + " rendered sidecar")
+                require(sidecar.is_file(), family + ": rendered sidecar unavailable")
+                check_file({"path": str(sidecar), "bytes": sidecar.stat().st_size,
+                            "sha256": row[field]}, family + " " + case + " " + suffix, root)
+            tokens = load(path.parent / (family + "-" + case + ".tokens.json"))
+            require(isinstance(tokens, list) and tokens and all(type(t) is int and 0 <= t < 2**32 for t in tokens),
+                    family + ": invalid rendered token IDs")
+            require(type(row.get("token_count")) is int and row["token_count"] == len(tokens) and type(row.get("context_tokens")) is int
+                    and 0 < len(tokens) < row["context_tokens"], family + ": rendered context/count mismatch")
+
+
+def parse_manifest(raw):
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -172,7 +256,11 @@ def load(path):
         return result
     def reject_constant(value):
         raise ValueError("nonfinite JSON: " + value)
-    return json.loads(path.read_text(), object_pairs_hook=unique, parse_constant=reject_constant)
+    return json.loads(raw, object_pairs_hook=unique, parse_constant=reject_constant)
+
+
+def load(path):
+    return parse_manifest(path.read_bytes())
 
 
 def main():
@@ -180,7 +268,9 @@ def main():
     parser.add_argument("manifest", type=Path)
     args = parser.parse_args()
     try:
-        result = validate(load(args.manifest), args.manifest.resolve().parent)
+        raw = args.manifest.read_bytes()
+        result = validate(parse_manifest(raw), args.manifest.resolve().parent)
+        result["manifest_file_sha256"] = hashlib.sha256(raw).hexdigest()
         print(json.dumps(result, sort_keys=True, allow_nan=False))
     except (ValueError, TypeError, KeyError, OSError, tarfile.TarError) as exc:
         print("identity validation failed: " + str(exc), file=sys.stderr)
