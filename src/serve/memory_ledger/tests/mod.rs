@@ -1,3 +1,6 @@
+use super::categories::{Category, Owner};
+use super::limits::Ceiling;
+use super::ownership::{Event, HandleId, ReservationId, RootId};
 use super::*;
 
 const GIB: u64 = 1 << 30;

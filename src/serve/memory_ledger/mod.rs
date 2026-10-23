@@ -3,13 +3,13 @@
 //! No caller of this module may treat a projection as runtime admission. It
 //! observes neither allocations nor OS metrics, and has no serving hook.
 
-mod categories;
-mod limits;
-mod ownership;
+pub mod categories;
+pub mod limits;
+pub mod ownership;
 
-pub use categories::{Category, CategoryKey, Entry, Family, FrozenShape, Inventory, Owner};
-pub use limits::{Ceiling, DeclaredBytes, Limits, Projection};
-pub use ownership::{Event, HandleId, Ownership, ReservationId, RootId, Transition};
+pub use categories::{CategoryKey, Entry, Family, FrozenShape, Inventory};
+pub use limits::{DeclaredBytes, Limits, Projection};
+pub use ownership::{Ownership, Transition};
 
 use serde::{Deserialize, Serialize};
 
