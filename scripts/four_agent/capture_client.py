@@ -181,7 +181,7 @@ def request_kind(body):
 
 def capture(client, source, output, model=None, timeout=90, *, source_bytes=None, cleanup_grace=1.0):
     selected, provider_name, model_name, provider = selected_profile(source, model)
-    if source_bytes is not None and parse_config(source_bytes) != source:
+    if source_bytes is not None and canonical(parse_config(source_bytes)) != canonical(source):
         raise ValueError("source bytes do not match parsed configuration")
     output = outside_checkout(output)
     output.mkdir(parents=True, exist_ok=False, mode=0o700)

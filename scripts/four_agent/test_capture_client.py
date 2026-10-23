@@ -129,6 +129,20 @@ state.joinpath('client.pid').write_text(str(os.getpid()))
             capture("must-not-execute", self.source, self.root / "bad-bytes", source_bytes=b'{}')
         with self.assertRaisesRegex(ValueError, "duplicate"):
             parse_config(b'{"model":"first","model":"second"}')
+        # Python equality conflates distinct JSON number/bool representations.
+        for index, changed in enumerate(("number", "boolean")):
+            source = copy.deepcopy(self.source)
+            raw = copy.deepcopy(source)
+            if changed == "number":
+                raw["providers"]["hf2q"]["models"]["fixture"]["cost"]["input"] = 0.0
+            else:
+                source["plugins"], raw["plugins"] = [1], [True]
+            self.assertEqual(source, raw)
+            output = self.root / f"different-json-{index}"
+            with self.assertRaisesRegex(ValueError, "source bytes"):
+                capture("must-not-execute", source, output,
+                        source_bytes=json.dumps(raw).encode())
+            self.assertFalse(output.exists())
 
     def test_output_inside_any_checkout_is_rejected(self):
         for marker_directory in (True, False):
