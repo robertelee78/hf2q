@@ -27,3 +27,10 @@ The original full reviewer outputs are retained in private campaign evidence. Th
 
 - q5-review-agent source review: `38661a14391846c78628e4b23399c2760dd2b22135c14ed74000dad36c5ab080`
 - Opus review of design94550a85: `88a164c4fe6a565e30fb80403f21d29ff6b668c9b643eadc41288356eb2c4d80`
+
+
+## Independent v2 review
+
+`q5-review-agent` reviewed exact candidate `734910d3781e3798c63b76360a6c955acf743998` against published native source. The pure ledger slice was judged concrete enough for product approval, while full qualification remained closed. Three corrections were required before the integration slice: charge completed-but-owner-retained command buffers until final ownership release (including raw exported handles), include external harness memory in competition accounting, and gate post-kill cleanup on external observations rather than a final report from a dead target. The proposal now includes those corrections; no implementation or runtime approval follows from the review.
+
+Raw v2 review SHA-256: `4d43b57a386592ff5edc53a4f680712bb1089da6b79d2664d4174810287a9e09`.
