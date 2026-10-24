@@ -1,0 +1,11 @@
+Physical Memory: 128 pages 2.0 MB
+├─ Anonymous: 16 pages 0.0 MB  ░░░░░░░░░░░░░░░░░░░░ 0.00%
+├─ Cached files: 20 pages 0.0 MB  ░░░░░░░░░░░░░░░░░░░░ 0.00%
+├─ Compressor: 3 pages 0.0 MB  ░░░░░░░░░░░░░░░░░░░░ 0.00%
+├─ Free: 50 pages 0.0 MB  ░░░░░░░░░░░░░░░░░░░░ 0.00%
+├─ Wired: 15 pages 0.0 MB  ░░░░░░░░░░░░░░░░░░░░ 0.00%
+├─ Static carveouts: 3 pages 0.0 MB  ░░░░░░░░░░░░░░░░░░░░ 0.00%
+└─ Unaccounted: 21 pages 0.0 MB  ░░░░░░░░░░░░░░░░░░░░ 0.00%
+
+Swap: 0 pages 0.0 MB
+└─ Swapped data: 0 pages 0.0 MB
