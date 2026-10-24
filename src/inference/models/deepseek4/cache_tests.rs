@@ -9,6 +9,8 @@ use super::Deepseek4Config;
 
 #[path = "cache_tests/warmup_capacity.rs"]
 mod warmup_capacity;
+#[path = "cache_tests/encoder_parity.rs"]
+mod encoder_parity;
 
 fn config(ratios: Vec<u32>) -> Deepseek4Config {
     let layers = ratios.len() as u32;

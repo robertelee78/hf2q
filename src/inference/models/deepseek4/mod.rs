@@ -14,6 +14,8 @@ mod compressed_attention;
 mod compressed_attention_common;
 mod compressed_attention_indexer;
 mod compressed_attention_main;
+mod compressor_tail;
+mod cache_window_write;
 mod compressed_attention_weights;
 pub mod compressor;
 pub mod config;

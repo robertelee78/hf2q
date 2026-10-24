@@ -3,22 +3,19 @@
 use anyhow::{Context, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::deepseek_activation_quant::dispatch_deepseek_hadamard_mxfp4_bf16;
-use mlx_native::ops::deepseek_compressor::{
-    dispatch_deepseek_compressor, DeepSeekCompressorParams,
-};
 use mlx_native::ops::deepseek_indexer::{
     deepseek_indexer_topk_scratch_elements, dispatch_deepseek_indexer_into_mma,
     DeepSeekIndexerParams, DEEPSEEK_INDEXER_TOP_K,
 };
 use mlx_native::ops::deepseek_tail_rope::{
-    dispatch_deepseek_tail_rope_bf16, dispatch_deepseek_tail_rope_f32_to_bf16,
+    dispatch_deepseek_tail_rope_f32_to_bf16,
     DeepSeekTailRopeParams,
 };
 use mlx_native::ops::elementwise::scalar_mul_f32;
-use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::cache::LayerCache;
+use super::compressor_tail::{encode_indexer_tail, CompressorTail};
 use super::compressed_attention_weights::IndexerWeightsRef;
 use super::forward_support::{alloc, raw_matmul};
 use super::Deepseek4Config;
@@ -238,88 +235,12 @@ pub(super) fn encode_ratio_four_indexer(
         rows * heads,
         1.0 / ((dim * heads) as f32).sqrt(),
     )?;
-    session.barrier_between(
-        &[
-            &arena.compressor_kv,
-            &arena.compressor_score,
-            weights.compressor.ape,
-            weights.compressor.norm,
-            kv_state,
-            score_state,
-        ],
-        &[kv_state, score_state, &arena.compressor_output],
-    );
-    dispatch_deepseek_compressor(
-        session.encoder_mut(),
-        registry,
-        device,
-        &arena.compressor_kv,
-        &arena.compressor_score,
-        weights.compressor.ape,
-        weights.compressor.norm,
-        kv_state,
-        score_state,
-        &arena.compressor_output,
-        &arena.compressor_output,
-        &DeepSeekCompressorParams {
-            batch: 1,
-            seq_len: rows as u32,
-            start_pos: position as u32,
-            ratio: 4,
-            head_dim: dim as u32,
-            cache_len: cache_capacity.max(1) as u32,
-            epsilon: cfg.rms_norm_eps,
-            write_cache: 0,
-        },
-    )?;
-    if compressed_output_count > 0 {
-        let rope_input =
-            arena
-                .compressor_output
-                .with_shape(vec![1, compressed_output_count, 1, dim])?;
-        session.barrier_between(
-            &[&rope_input, compressed_positions, frequencies],
-            &[&arena.compressor_rope],
-        );
-        dispatch_deepseek_tail_rope_bf16(
-            session.encoder_mut(),
-            registry,
-            device,
-            &rope_input,
-            compressed_positions,
-            frequencies,
-            &arena.compressor_rope,
-            &DeepSeekTailRopeParams {
-                batch: 1,
-                seq_len: compressed_output_count as u32,
-                heads: 1,
-                head_dim: dim as u32,
-                rope_dim: cfg.rope_head_dim,
-                inverse: 0,
-            },
-        )?;
-        session.barrier_between(&[&arena.compressor_rope], &[&arena.compressor_rope]);
-        dispatch_deepseek_hadamard_mxfp4_bf16(
-            session.encoder_mut(),
-            registry,
-            device,
-            &arena.compressor_rope,
-            compressed_output_count as u32,
-        )?;
-        session.barrier_between(&[&arena.compressor_rope], &[cache]);
-        dispatch_kv_cache_copy(
-            session.encoder_mut(),
-            registry,
-            device.metal_device(),
-            &arena.compressor_rope,
-            cache,
-            compressed_write_start as u32,
-            dim as u32,
-            compressed_output_count as u32,
-            cache_capacity as u32,
-            false,
-        )?;
-    }
+    encode_indexer_tail(session, registry, device, cfg, rows, position,
+        compressed_write_start, compressed_output_count, cache, cache_capacity, kv_state, score_state,
+        &CompressorTail { kv: &arena.compressor_kv, score: &arena.compressor_score,
+            output: &arena.compressor_output, rope: &arena.compressor_rope,
+            ape: weights.compressor.ape, norm: weights.compressor.norm },
+        compressed_positions, frequencies)?;
 
     let valid = valid_compressed;
     if valid > 0 {
