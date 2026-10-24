@@ -7,6 +7,9 @@ use super::verifier_forward::{
 };
 use super::Deepseek4Config;
 
+#[path = "cache_tests/warmup_capacity.rs"]
+mod warmup_capacity;
+
 fn config(ratios: Vec<u32>) -> Deepseek4Config {
     let layers = ratios.len() as u32;
     Deepseek4Config {
