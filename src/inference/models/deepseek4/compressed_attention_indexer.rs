@@ -4,21 +4,23 @@ use anyhow::{Context, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::deepseek_activation_quant::dispatch_deepseek_hadamard_mxfp4_bf16;
 use mlx_native::ops::deepseek_indexer::{
-    deepseek_indexer_topk_scratch_elements, dispatch_deepseek_indexer_into_mma,
-    DeepSeekIndexerParams, DEEPSEEK_INDEXER_TOP_K,
+    dispatch_deepseek_indexer_into_mma, DeepSeekIndexerParams, DEEPSEEK_INDEXER_TOP_K,
 };
 use mlx_native::ops::deepseek_tail_rope::{
     dispatch_deepseek_tail_rope_f32_to_bf16,
     DeepSeekTailRopeParams,
 };
 use mlx_native::ops::elementwise::scalar_mul_f32;
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::cache::LayerCache;
 use super::compressor_tail::{encode_indexer_tail, CompressorTail};
 use super::compressed_attention_weights::IndexerWeightsRef;
-use super::forward_support::{alloc, raw_matmul};
+use super::forward_support::raw_matmul;
 use super::Deepseek4Config;
+
+pub(super) mod plan;
+use plan::RatioFourIndexerPlan;
 
 pub(super) struct RatioFourIndexerArena {
     query_f32: MlxBuffer,
@@ -41,69 +43,20 @@ impl RatioFourIndexerArena {
         compressed_output_count: usize,
         valid_compressed: usize,
     ) -> Result<Self> {
-        let heads = cfg.index_num_heads as usize;
-        let dim = cfg.index_head_dim as usize;
-        let projected = 2 * dim;
+        let [query_f32, query_bf16, weights, scaled_weights, compressor_kv, compressor_score, compressor_output, compressor_rope, score_scratch, topk_scratch] =
+            RatioFourIndexerPlan::new(cfg, rows, compressed_output_count, valid_compressed)?
+                .into_buffers();
         Ok(Self {
-            query_f32: alloc(
-                device,
-                DType::F32,
-                vec![1, rows, heads, dim],
-                "index query f32",
-            )?,
-            query_bf16: alloc(
-                device,
-                DType::BF16,
-                vec![1, rows, heads, dim],
-                "index query bf16",
-            )?,
-            weights: alloc(device, DType::F32, vec![1, rows, heads], "index weights")?,
-            scaled_weights: alloc(
-                device,
-                DType::F32,
-                vec![1, rows, heads],
-                "scaled index weights",
-            )?,
-            compressor_kv: alloc(
-                device,
-                DType::F32,
-                vec![1, rows, projected],
-                "index compressor KV",
-            )?,
-            compressor_score: alloc(
-                device,
-                DType::F32,
-                vec![1, rows, projected],
-                "index compressor score",
-            )?,
-            compressor_output: alloc(
-                device,
-                DType::BF16,
-                vec![1, compressed_output_count.max(1), dim],
-                "index compressor output",
-            )?,
-            compressor_rope: alloc(
-                device,
-                DType::BF16,
-                vec![1, compressed_output_count.max(1), 1, dim],
-                "index compressor rotated output",
-            )?,
-            score_scratch: alloc(
-                device,
-                DType::F32,
-                vec![1, rows, valid_compressed.max(1)],
-                "index score scratch",
-            )?,
-            topk_scratch: {
-                let elements =
-                    deepseek_indexer_topk_scratch_elements(1, rows, valid_compressed.max(1))?;
-                alloc(
-                    device,
-                    DType::I32,
-                    vec![1, rows, elements / rows],
-                    "index top-k scratch",
-                )?
-            },
+            query_f32: query_f32.allocate(device)?,
+            query_bf16: query_bf16.allocate(device)?,
+            weights: weights.allocate(device)?,
+            scaled_weights: scaled_weights.allocate(device)?,
+            compressor_kv: compressor_kv.allocate(device)?,
+            compressor_score: compressor_score.allocate(device)?,
+            compressor_output: compressor_output.allocate(device)?,
+            compressor_rope: compressor_rope.allocate(device)?,
+            score_scratch: score_scratch.allocate(device)?,
+            topk_scratch: topk_scratch.allocate(device)?,
         })
     }
 }
