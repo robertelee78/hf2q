@@ -40,11 +40,14 @@ and local loading to each implemented runtime's admission callback. The bounded
 network reader checks format and extents; it does not define kernel support.
 
 mlx-native owns GGUF storage loading, Metal buffers, operation capabilities,
-kernels, and command submission. The locked published 0.15.1 dependency supplies
+kernels, and command submission. The locked published 0.15.2 dependency supplies
 native BF16 dense matmul and F32/F16/BF16 expert-ID matmul. hf2q's shared dense
 and expert dispatchers select those operations from actual tensor storage.
 Block-quantized tensors retain their quantized routes. No publisher label is
-translated into an invented tensor type.
+translated into an invented tensor type. Native 0.15.2 also retains mapped-file
+backing through independent Metal resource owners; the [dated adoption
+record](research/adr063-native-0152-registry-adoption-2026-10-24.md) binds its
+published identity and narrow validation scope.
 
 Gemma's `native_matrix`, `native_storage`, and shared mapped-storage helpers
 admit and retain original embedding/head, projection, router, and expert bytes.

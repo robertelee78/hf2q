@@ -101,8 +101,15 @@ Gemma's header preflight and loader share gather/dense/expert capability checks.
 Existing F32/F16/BF16 scalar-state and scalar-expert support remains explicit;
 elementwise norm/scaling state may be converted to F32 and is outside the
 ordinary matrix inventory. Explicitly selected affine overlays retain their
-separate contract. The published dependency stays at 0.15.1, without local Cargo
-patches or an unpublished revision.
+separate contract. At this audit, the published dependency stayed at 0.15.1,
+without local Cargo patches or an unpublished revision.
+
+**2026-10-24 dependency adoption:** current source pins published 0.15.2 for
+the mapped-buffer backing lifetime correction. The [registry adoption
+record](../research/adr063-native-0152-registry-adoption-2026-10-24.md) binds the
+new archive/source identity. The earlier 0.15.1 kernel/capability observations
+remain dated evidence; this pin change does not claim they were rerun, or
+qualify full model memory, serving or speed.
 
 The strict native argmax ABI also requires an actual U32 parameter allocation.
 The earlier F32 allocation with U32-written bits was an hf2q contract error,
