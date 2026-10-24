@@ -33,7 +33,10 @@
 //! See ADR-013 P21 Stage 1 for full rationale.
 
 use anyhow::{anyhow, Result};
-use mlx_native::{DType, MlxBuffer, MlxDevice};
+use mlx_native::{MlxBuffer, MlxDevice};
+
+pub(crate) mod plan;
+use plan::FaPrefillPlan;
 
 /// Caller-owned scratch arena for the FA prefill bridge (ops1-4 + ops6-7)
 /// across all FA layers in a single prefill.
@@ -88,6 +91,7 @@ impl FaPrefillArena {
     /// - Any dimension is zero (`seq_capacity`, `n_heads`, `n_kv_heads`, or
     ///   `head_dim` equals 0).
     /// - `n_heads % n_kv_heads != 0` (GQA divisibility violated).
+    /// - Shape, byte-count, or aggregate requested-payload arithmetic overflows.
     /// - Any `device.alloc_buffer` call fails (out of GPU memory).
     pub fn new(
         device: &MlxDevice,
@@ -96,59 +100,15 @@ impl FaPrefillArena {
         n_kv_heads: u32,
         head_dim: u32,
     ) -> Result<Self> {
-        if seq_capacity == 0 || n_heads == 0 || n_kv_heads == 0 || head_dim == 0 {
-            return Err(anyhow!(
-                "FaPrefillArena::new: zero dim \
-                 seq_capacity={} n_heads={} n_kv_heads={} head_dim={}",
-                seq_capacity,
-                n_heads,
-                n_kv_heads,
-                head_dim
-            ));
-        }
-        if n_heads % n_kv_heads != 0 {
-            return Err(anyhow!(
-                "FaPrefillArena::new: n_heads ({}) must be divisible by n_kv_heads ({})",
-                n_heads,
-                n_kv_heads
-            ));
-        }
-
-        let seq = seq_capacity as usize;
-        let nh = n_heads as usize;
-        let nkv = n_kv_heads as usize;
-        let d = head_dim as usize;
-
-        // Element counts match exactly what apply_flash_attn_prefill_seq_major
-        // currently allocates at lines 1046-1049 of gpu_full_attn.rs.
-        let q_elems = seq * nh * d;
-        let k_elems = seq * nkv * d;
-        let v_elems = seq * nkv * d; // v_elems == k_elems
-        let out_elems = seq * nh * d; // out_elems == q_elems
-
-        // Each field's byte_len = element_count * 2 (BF16 = 2 bytes/element).
-        // Shapes match A.2 verbatim.
-        let q_bf16_seq = device
-            .alloc_buffer(q_elems * 2, DType::BF16, vec![seq, nh, d])
-            .map_err(|e| anyhow!("FaPrefillArena::new alloc q_bf16_seq: {e}"))?;
-        let q_bf16_hm = device
-            .alloc_buffer(q_elems * 2, DType::BF16, vec![1, nh, seq, d])
-            .map_err(|e| anyhow!("FaPrefillArena::new alloc q_bf16_hm: {e}"))?;
-        let k_bf16_seq = device
-            .alloc_buffer(k_elems * 2, DType::BF16, vec![seq, nkv, d])
-            .map_err(|e| anyhow!("FaPrefillArena::new alloc k_bf16_seq: {e}"))?;
-        let k_bf16_hm = device
-            .alloc_buffer(k_elems * 2, DType::BF16, vec![1, nkv, seq, d])
-            .map_err(|e| anyhow!("FaPrefillArena::new alloc k_bf16_hm: {e}"))?;
-        let v_bf16_seq = device
-            .alloc_buffer(v_elems * 2, DType::BF16, vec![seq, nkv, d])
-            .map_err(|e| anyhow!("FaPrefillArena::new alloc v_bf16_seq: {e}"))?;
-        let v_bf16_hm = device
-            .alloc_buffer(v_elems * 2, DType::BF16, vec![1, nkv, seq, d])
-            .map_err(|e| anyhow!("FaPrefillArena::new alloc v_bf16_hm: {e}"))?;
-        let out_bf16_hm = device
-            .alloc_buffer(out_elems * 2, DType::BF16, vec![1, nh, seq, d])
-            .map_err(|e| anyhow!("FaPrefillArena::new alloc out_bf16_hm: {e}"))?;
+        let [q_bf16_seq, q_bf16_hm, k_bf16_seq, k_bf16_hm, v_bf16_seq, v_bf16_hm, out_bf16_hm] =
+            FaPrefillPlan::new(seq_capacity, n_heads, n_kv_heads, head_dim)?.into_buffers();
+        let q_bf16_seq = q_bf16_seq.allocate(device)?;
+        let q_bf16_hm = q_bf16_hm.allocate(device)?;
+        let k_bf16_seq = k_bf16_seq.allocate(device)?;
+        let k_bf16_hm = k_bf16_hm.allocate(device)?;
+        let v_bf16_seq = v_bf16_seq.allocate(device)?;
+        let v_bf16_hm = v_bf16_hm.allocate(device)?;
+        let out_bf16_hm = out_bf16_hm.allocate(device)?;
 
         Ok(Self {
             q_bf16_seq,
