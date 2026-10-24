@@ -6,13 +6,11 @@ use mlx_native::ops::deepseek_activation_quant::dispatch_deepseek_hadamard_mxfp4
 use mlx_native::ops::deepseek_indexer::{
     dispatch_deepseek_indexer_into_mma, DeepSeekIndexerParams, DEEPSEEK_INDEXER_TOP_K,
 };
-use mlx_native::ops::deepseek_tail_rope::{
-    dispatch_deepseek_tail_rope_f32_to_bf16,
-    DeepSeekTailRopeParams,
-};
+use mlx_native::ops::deepseek_tail_rope::DeepSeekTailRopeParams;
 use mlx_native::ops::elementwise::scalar_mul_f32;
 use mlx_native::{KernelRegistry, MlxBuffer, MlxDevice};
 
+use super::prefill_annotations;
 use super::cache::LayerCache;
 use super::compressor_tail::{encode_indexer_tail, CompressorTail};
 use super::compressed_attention_weights::IndexerWeightsRef;
@@ -152,9 +150,8 @@ pub(super) fn encode_ratio_four_indexer(
         hidden,
         "index compressor gate",
     )?;
-    session.barrier_between(&[&arena.query_f32], &[&arena.query_bf16]);
-    dispatch_deepseek_tail_rope_f32_to_bf16(
-        session.encoder_mut(),
+    prefill_annotations::indexer_query_rope(
+        session,
         registry,
         device,
         &arena.query_f32,

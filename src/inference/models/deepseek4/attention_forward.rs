@@ -1,4 +1,5 @@
 //! Exact one-token uncompressed DeepSeek-V4 attention layers.
+use super::prefill_annotations;
 use super::attention::{append_prefill_window_indices, window_indices};
 use super::attention_weights::AttentionWeightsRef;
 use super::cache::{CacheSpan, Deepseek4Cache};
@@ -384,8 +385,8 @@ impl Deepseek4Model {
                 )?;
             }
 
-            session.barrier_between(&[&state_flat], &[&state_norm]);
-            session.rms_norm_no_scale_f32(
+            prefill_annotations::rms_norm_no_scale_f32(
+                session,
                 registry,
                 device.metal_device(),
                 &state_flat,
@@ -430,8 +431,8 @@ impl Deepseek4Model {
                 rows_u32,
                 hidden as u32,
             )?;
-            session.barrier_between(&[&attn_input, attn_norm_weight], &[&attn_norm]);
-            session.rms_norm(
+            prefill_annotations::rms_norm(
+                session,
                 registry,
                 device.metal_device(),
                 &attn_input,
@@ -465,8 +466,8 @@ impl Deepseek4Model {
                 hidden,
                 "shared KV",
             )?;
-            session.barrier_between(&[&q_a, q_a_norm_weight], &[&q_a_norm]);
-            session.rms_norm(
+            prefill_annotations::rms_norm(
+                session,
                 registry,
                 device.metal_device(),
                 &q_a,
@@ -488,8 +489,8 @@ impl Deepseek4Model {
                 q_rank,
                 "query B",
             )?;
-            session.barrier_between(&[&q], &[&q_norm]);
-            session.rms_norm_no_scale_f32(
+            prefill_annotations::rms_norm_no_scale_f32(
+                session,
                 registry,
                 device.metal_device(),
                 &q,
@@ -498,8 +499,8 @@ impl Deepseek4Model {
                 (rows * heads) as u32,
                 head_dim as u32,
             )?;
-            session.barrier_between(&[&kv, kv_norm_weight], &[&kv_norm]);
-            session.rms_norm(
+            prefill_annotations::rms_norm(
+                session,
                 registry,
                 device.metal_device(),
                 &kv,

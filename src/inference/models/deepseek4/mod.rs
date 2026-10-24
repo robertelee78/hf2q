@@ -27,6 +27,7 @@ pub mod hyper_connection;
 pub mod model;
 mod output_forward;
 mod prefill_flash_attention;
+mod prefill_annotations;
 pub mod residency;
 pub mod rope;
 pub mod routing;
