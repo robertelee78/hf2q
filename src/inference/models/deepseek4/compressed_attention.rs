@@ -557,25 +557,10 @@ impl Deepseek4Model {
             if let Some(prefix) = raw_prefix.as_ref() {
                 window_write_inputs.push(prefix);
             }
-            session.barrier_between(&window_write_inputs, &[&layer_cache.window_kv]);
-            dispatch_kv_cache_copy(
-                session.encoder_mut(),
-                registry,
-                device.metal_device(),
-                window_cache_input,
-                &layer_cache.window_kv,
-                u32::try_from(
-                    layer_span
-                        .map(|span| span.window_write_start)
-                        .or_else(|| layer_step.map(|step| step.window_write_slot))
-                        .context("DeepSeek-V4 compressed window write slot is missing")?,
-                )
-                .context("DeepSeek-V4 compressed window write slot exceeds u32")?,
-                head_dim as u32,
-                u32::try_from(window_write_count)
-                    .context("DeepSeek-V4 compressed window write count exceeds u32")?,
-                window_capacity as u32,
-                true,
+            super::cache_window_write::encode_window_write(
+                session, registry, &device, layer_cache, window_cache_input,
+                &window_write_inputs, layer_span, layer_step,
+                window_write_count, window_capacity, head_dim,
             )?;
             encode_main_compressor(
                 session,
