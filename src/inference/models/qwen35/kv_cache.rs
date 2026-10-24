@@ -50,6 +50,10 @@ use super::gqa_q2_policy::use_gqa_q2_tq_sdpa;
 use super::{Qwen35Config, Qwen35LayerKind};
 
 mod source_teacher;
+mod allocation_plan;
+use allocation_plan::{
+    ensure_capture_with, CaptureAllocationPlan, CaptureRole, ExistingCapture, HybridCacheAllocationPlan,
+};
 
 pub(super) use source_teacher::{
     plan_qwen35_base_text_cache, prepare_qwen35_base_text_cache, PreparedQwen35BaseTextCacheV1,
@@ -1820,64 +1824,32 @@ impl HybridKvCache {
         tq_kv_active: bool,
         include_mtp: bool,
     ) -> Result<Self> {
-        if max_seq_len == 0 {
-            return Err(anyhow!("HybridKvCache: max_seq_len must be > 0"));
-        }
-        if n_seqs == 0 {
-            return Err(anyhow!("HybridKvCache: n_seqs must be > 0"));
-        }
-
-        let conv_channels = conv_channels_for(cfg);
-        let k_minus1 = cfg.linear_conv_kernel_dim.saturating_sub(1).max(1);
-
+        let plan =
+            HybridCacheAllocationPlan::new(cfg, max_seq_len, n_seqs, tq_kv_active, include_mtp)?;
+        let allocated = plan.allocate_with(|root| root.allocate(device))?;
+        let conv_channels = plan.conv_channels;
         let mut full_attn = Vec::new();
         let mut linear_attn = Vec::new();
         let mut per_layer_slot = Vec::with_capacity(cfg.layer_types.len());
-
-        for (layer_idx, kind) in cfg.layer_types.iter().enumerate() {
-            match kind {
-                Qwen35LayerKind::FullAttention => {
-                    let rank = full_attn.len() as u32;
-                    per_layer_slot.push(LayerSlot::Full(rank));
-                    let mut slot =
-                        alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs, tq_kv_active)
-                            .with_context(|| format!("alloc full-attn slot (layer {layer_idx})"))?;
-                    if tq_kv_active {
-                        slot.tq = Some(
-                            alloc_tq_full_attn_buffers(cfg, device, max_seq_len, n_seqs)
-                                .with_context(|| {
-                                    format!("alloc tq full-attn buffers (layer {layer_idx})")
-                                })?,
-                        );
+        let mut mtp_slot = None;
+        for (slot_plan, roots) in plan.slots.iter().zip(allocated) {
+            match slot_plan.slot {
+                LayerSlot::Full(_) => {
+                    let slot =
+                        full_attn_slot_from_roots(roots, n_seqs, tq_kv_active, slot_plan.norms);
+                    if slot_plan.mtp {
+                        mtp_slot = Some(slot);
+                    } else {
+                        per_layer_slot.push(slot_plan.slot);
+                        full_attn.push(slot);
                     }
-                    full_attn.push(slot);
                 }
-                Qwen35LayerKind::LinearAttention => {
-                    let rank = linear_attn.len() as u32;
-                    per_layer_slot.push(LayerSlot::Linear(rank));
-                    linear_attn.push(
-                        alloc_linear_attn_slot(cfg, device, conv_channels, k_minus1, n_seqs)
-                            .with_context(|| {
-                                format!("alloc linear-attn slot (layer {layer_idx})")
-                            })?,
-                    );
+                LayerSlot::Linear(_) => {
+                    per_layer_slot.push(slot_plan.slot);
+                    linear_attn.push(linear_attn_slot_from_roots(roots, n_seqs));
                 }
             }
         }
-
-        let mtp_slot = if include_mtp && cfg.mtp_num_hidden_layers > 0 {
-            let mut slot = alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs, tq_kv_active)
-                .context("alloc MTP full-attn slot")?;
-            if tq_kv_active {
-                slot.tq = Some(
-                    alloc_tq_full_attn_buffers(cfg, device, max_seq_len, n_seqs)
-                        .context("alloc tq full-attn buffers (MTP slot)")?,
-                );
-            }
-            Some(slot)
-        } else {
-            None
-        };
 
         Ok(HybridKvCache {
             full_attn,
@@ -2650,78 +2622,39 @@ impl HybridKvCache {
         device: &MlxDevice,
         n_tokens_max: u32,
     ) -> Result<()> {
-        if n_tokens_max == 0 {
-            return Err(anyhow!("ensure_la_capture: n_tokens_max must be > 0"));
-        }
-        // Fail closed if allocation below is interrupted. The retained
-        // buffers remain valid storage, but no forward may select capture
-        // kernels until every linear-attention slot is ready.
-        self.la_capture_active_tokens = None;
-        let d_k = cfg.linear_key_head_dim as usize;
-        let d_v = cfg.linear_value_head_dim as usize;
-        let n_v_heads = cfg.linear_num_value_heads as usize;
-        let n_seqs = self.n_seqs as usize;
-        let state_elems = d_k * d_v * n_v_heads * n_seqs;
-        let capture_elems = state_elems * (n_tokens_max as usize);
-        let shape = vec![d_k, d_v, n_v_heads, n_tokens_max as usize, n_seqs];
-
-        // ADR-034 task #90 Step 4c (2026-05-21) — also allocate the
-        // companion conv1d state capture buffer. Layout per the
-        // mlx-native `dispatch_ssm_conv_with_capture` kernel contract
-        // (commit 92e322b): [n_seqs, n_tokens_max, K-1, channels] F32
-        // with channels innermost.
-        let conv_channels = conv_channels_for(cfg) as usize;
-        let k_minus1 = (cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
-        let conv_state_elems = conv_channels * k_minus1 * n_seqs;
-        let conv_capture_elems = (n_seqs) * (n_tokens_max as usize) * k_minus1 * conv_channels;
-        let conv_shape = vec![n_seqs, n_tokens_max as usize, k_minus1, conv_channels];
-
-        for slot in self.linear_attn.iter_mut() {
-            // Recurrent capture: an existing larger allocation is also valid.
-            // Kernel indexing derives its token capacity from the buffer shape,
-            // while callers only write the requested suffix length.
-            if let Some(buf) = slot.capture_states.as_ref() {
-                if (n_seqs == 1 && buf.element_count() >= capture_elems)
-                    || buf.element_count() == capture_elems
-                {
-                    // continue to conv check
-                } else {
-                    let cap_buf = device
-                        .alloc_buffer(capture_elems * 4, DType::F32, shape.clone())
-                        .map_err(|e| anyhow!("alloc capture_states: {e}"))?;
-                    slot.capture_states = Some(cap_buf);
-                }
-            } else {
-                let cap_buf = device
-                    .alloc_buffer(capture_elems * 4, DType::F32, shape.clone())
-                    .map_err(|e| anyhow!("alloc capture_states: {e}"))?;
-                slot.capture_states = Some(cap_buf);
+        let n_seqs = self.n_seqs;
+        let slots = &mut self.linear_attn;
+        ensure_capture_with(&mut self.la_capture_active_tokens, n_tokens_max, || {
+            // Snapshot full backing extents before any new root allocation.
+            // Positive requests are already inactive if metadata/planning fails.
+            let mut existing = Vec::new();
+            existing
+                .try_reserve_exact(slots.len())
+                .context("capture metadata reservation failed")?;
+            for slot in slots.iter() {
+                existing.push([
+                    slot.capture_states
+                        .as_ref()
+                        .map(ExistingCapture::from_buffer)
+                        .transpose()?,
+                    slot.conv_capture_states
+                        .as_ref()
+                        .map(ExistingCapture::from_buffer)
+                        .transpose()?,
+                ]);
             }
-            // Conv capture (Step 4c): same grow-only semantics.
-            if let Some(buf) = slot.conv_capture_states.as_ref() {
-                if (n_seqs == 1 && buf.element_count() >= conv_capture_elems)
-                    || buf.element_count() == conv_capture_elems
-                {
-                    continue;
-                }
-            }
-            let conv_cap_buf = device
-                .alloc_buffer(conv_capture_elems * 4, DType::F32, conv_shape.clone())
-                .map_err(|e| anyhow!("alloc conv_capture_states: {e}"))?;
-            // Sanity: conv_state_elems must equal one per-token slice
-            // of the capture buffer (defensive — wiring contract for
-            // rollback_la_to).
-            debug_assert_eq!(
-                conv_state_elems,
-                conv_capture_elems / (n_tokens_max as usize),
-                "ensure_la_capture: conv per-token elems ({}) must equal conv_state_elems ({})",
-                conv_capture_elems / (n_tokens_max as usize),
-                conv_state_elems,
-            );
-            slot.conv_capture_states = Some(conv_cap_buf);
-        }
-        self.la_capture_active_tokens = Some(n_tokens_max);
-        Ok(())
+            let plan = CaptureAllocationPlan::new(cfg, n_seqs, n_tokens_max, &existing)?;
+            plan.apply_with(
+                |root| root.allocate(device),
+                |index, role, buffer| {
+                    let slot = &mut slots[index];
+                    match role {
+                        CaptureRole::Recurrent => slot.capture_states = Some(buffer),
+                        CaptureRole::Conv => slot.conv_capture_states = Some(buffer),
+                    }
+                },
+            )
+        })
     }
 
     /// End a bounded capture operation while retaining its grow-only storage.
@@ -3028,7 +2961,7 @@ impl HybridKvCache {
             // Re-index from capture [K-1, channels] (channels innermost)
             // to active conv_state [channels, K-1] (K-1 innermost).
             let conv_shape = slot_data.conv_state.shape().to_vec();
-            // conv_state shape per alloc_linear_attn_slot: [channels, K-1, n_seqs]
+            // conv_state shape per the allocation plan: [channels, K-1, n_seqs]
             if conv_shape.len() < 2 {
                 return Err(anyhow!(
                     "rollback_la_to: linear_attn[{}].conv_state shape too short: {:?}",
@@ -4161,138 +4094,55 @@ pub fn conv_channels_for(cfg: &Qwen35Config) -> u32 {
         + cfg.linear_num_value_heads * cfg.linear_value_head_dim
 }
 
-fn alloc_full_attn_slot(
-    cfg: &Qwen35Config,
-    device: &MlxDevice,
-    max_seq_len: u32,
+fn full_attn_slot_from_roots(
+    roots: Vec<MlxBuffer>,
     n_seqs: u32,
-    tq_kv_active: bool,
-) -> Result<FullAttnKvSlot> {
-    // ADR-027 Phase B iter-34 (sub-sub-iter 23c-β.5) — the LOAD-BEARING
-    // memory-savings switch.
-    //
-    // When tq_kv_active=true, the slot's F32 K/V backing is dropped
-    // (k=None, v=None). The SDPA read path for production qwen35
-    // (head_dim=256) is fully covered by the TQ-only chain:
-    //   * Decode: dispatch_decode_sdpa_with_optional_tq (iter-15) reads
-    //     slot.tq directly; F32 fallback is unreachable when head_dim
-    //     ∈ {256, 512} AND slot.tq.is_some().
-    //   * Prefill RESUME: apply_flash_attn_prefill_seq_major_resume_via_tq_cache
-    //     (iter-33) dequants slot.tq → temp F32 (unrotated, head-major),
-    //     dispatches the same dense resume kernel against the temp
-    //     buffers. iter-33 NRMSE 0.003 vs F32 baseline confirms parity.
-    //   * Prefill FRESH (cur_len=0, fast path): reads k_seq_major directly
-    //     (the just-computed chunk K/V), not from the cache; cache-write
-    //     side is gated below to skip the F32 write (write_kv_with_optional_tq_encode).
-    //
-    // Memory savings at qwen36 35B-A3B-APEX 8K shape: 33.55 MB F32 K+V
-    // per slot dropped → 8.52 MB TQ packed+norms only = 3.94×.
-    // Regression-pin: full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_*.
-    if tq_kv_active {
-        return Ok(FullAttnKvSlot {
-            k: None,
-            v: None,
-            current_len: vec![0; n_seqs as usize],
-            // tq is populated by HybridKvCache::new_with_options' subsequent
-            // alloc_tq_full_attn_buffers call (separate from this fn's
-            // F32 alloc; see new_with_options for the wiring).
-            tq: None,
-        });
-    }
-
-    // Conventional F32 control path (`HF2Q_TQ_KV=0`).
-    // Layout: [n_seqs, n_kv_heads, max_seq_len, head_dim] — matches SDPA kernel's
-    // expected K/V layout: [batch, n_kv_heads, kv_seq_len, head_dim] (head_dim innermost).
-    // kv_capacity = max_seq_len; kv_seq_len = current_len at forward time.
-    let elems = (n_seqs as usize)
-        * (cfg.num_key_value_heads as usize)
-        * (max_seq_len as usize)
-        * (cfg.head_dim as usize);
-    let bytes = elems * 4;
-    let shape = vec![
-        n_seqs as usize,
-        cfg.num_key_value_heads as usize,
-        max_seq_len as usize,
-        cfg.head_dim as usize,
-    ];
-    // SAFETY: full-attention reads are bounded by `current_len`, which is
-    // advanced only after the producer writes the corresponding positions.
-    let k = unsafe { device.alloc_buffer_for_overwrite(bytes, DType::F32, shape.clone()) }
-        .map_err(|e| anyhow!("alloc full-attn K: {e}"))?;
-    // SAFETY: same cursor-before-read invariant as K.
-    let v = unsafe { device.alloc_buffer_for_overwrite(bytes, DType::F32, shape) }
-        .map_err(|e| anyhow!("alloc full-attn V: {e}"))?;
-
-    Ok(FullAttnKvSlot {
-        k: Some(k),
-        v: Some(v),
+    tq: bool,
+    norms: u32,
+) -> FullAttnKvSlot {
+    let (k, v, tq) = if tq {
+        (None, None, Some(tq_full_attn_from_roots(roots, norms)))
+    } else {
+        debug_assert_eq!(roots.len(), 2);
+        let mut roots = roots.into_iter();
+        (
+            Some(roots.next().expect("planned K")),
+            Some(roots.next().expect("planned V")),
+            None,
+        )
+    };
+    FullAttnKvSlot {
+        k,
+        v,
+        tq,
         current_len: vec![0; n_seqs as usize],
-        // ADR-027 Phase B iter-8: tq is None on the legacy F32 path.
-        // Set by `HybridKvCache::new_with_options` when tq_kv_active=true.
-        tq: None,
-    })
+    }
 }
 
-fn alloc_linear_attn_slot(
-    cfg: &Qwen35Config,
-    device: &MlxDevice,
-    conv_channels: u32,
-    k_minus1: u32,
-    n_seqs: u32,
-) -> Result<LinearAttnStateSlot> {
-    // Conv state ping-pong: [conv_channels, K-1, n_seqs] — kernel native layout.
-    // The ssm_conv kernel expects state[i, c, s] at offset
-    // s*(K-1)*channels + c*(K-1) + i, which corresponds to column-major
-    // [channels, K-1] per sequence — i.e. channels-major with K-1 stride-1.
-    // Storing in this layout avoids per-token CPU transpose + upload/download.
-    let conv_elems = (conv_channels as usize) * (k_minus1 as usize) * (n_seqs as usize);
-    let conv_shape = vec![conv_channels as usize, k_minus1 as usize, n_seqs as usize];
-    let conv_state = device
-        .alloc_buffer(conv_elems * 4, DType::F32, conv_shape.clone())
-        .map_err(|e| anyhow!("alloc conv_state: {e}"))?;
-    // Scratch buffer for ping-pong: ssm_conv writes new state here; caller
-    // swaps conv_state ↔ conv_state_scratch after each decode step.
-    let conv_state_scratch = device
-        .alloc_buffer(conv_elems * 4, DType::F32, conv_shape)
-        .map_err(|e| anyhow!("alloc conv_state_scratch: {e}"))?;
-
-    // Recurrent state: [D_k, D_v, num_v_heads, n_seqs] — d_k innermost (matches
-    // mlx-native's gated_delta_net kernel layout).
-    let rec_elems = (cfg.linear_key_head_dim as usize)
-        * (cfg.linear_value_head_dim as usize)
-        * (cfg.linear_num_value_heads as usize)
-        * (n_seqs as usize);
-    let rec_shape = vec![
-        cfg.linear_key_head_dim as usize,
-        cfg.linear_value_head_dim as usize,
-        cfg.linear_num_value_heads as usize,
-        n_seqs as usize,
-    ];
-    let recurrent = device
-        .alloc_buffer(rec_elems * 4, DType::F32, rec_shape.clone())
-        .map_err(|e| anyhow!("alloc recurrent: {e}"))?;
-    // Scratch buffer for ping-pong: same shape, zero-initialized.
-    // GDN kernel writes here; after each decode step the caller swaps
-    // `recurrent` and `recurrent_scratch`, making the new output the
-    // new current state without any CPU copy.
-    let recurrent_scratch = device
-        .alloc_buffer(rec_elems * 4, DType::F32, rec_shape)
-        .map_err(|e| anyhow!("alloc recurrent_scratch: {e}"))?;
-
-    Ok(LinearAttnStateSlot {
-        conv_state,
-        conv_state_scratch,
-        recurrent,
-        recurrent_scratch,
-        // ADR-034 task #90 Step 2 (2026-05-21) — recurrent capture
-        // buffer. Step 4c adds the companion conv_capture_states field.
-        // Both lazy-allocate via `HybridKvCache::ensure_la_capture`.
+fn linear_attn_slot_from_roots(roots: Vec<MlxBuffer>, n_seqs: u32) -> LinearAttnStateSlot {
+    debug_assert_eq!(roots.len(), 4);
+    let mut roots = roots.into_iter();
+    LinearAttnStateSlot {
+        conv_state: roots.next().expect("planned conv"),
+        conv_state_scratch: roots.next().expect("planned conv scratch"),
+        recurrent: roots.next().expect("planned recurrent"),
+        recurrent_scratch: roots.next().expect("planned recurrent scratch"),
         capture_states: None,
         conv_capture_states: None,
-        // ADR-040 M-QWEN — per-slot ping-pong parity, all canonical
-        // (false = named fields are current) at alloc.
         pp_flipped: vec![false; n_seqs as usize],
-    })
+    }
+}
+
+fn tq_full_attn_from_roots(roots: Vec<MlxBuffer>, norms_per_pos: u32) -> TqFullAttnKvBuffers {
+    debug_assert_eq!(roots.len(), 4);
+    let mut roots = roots.into_iter();
+    TqFullAttnKvBuffers {
+        k_packed: roots.next().expect("planned TQ K packed"),
+        k_norms: roots.next().expect("planned TQ K norms"),
+        v_packed: roots.next().expect("planned TQ V packed"),
+        v_norms: roots.next().expect("planned TQ V norms"),
+        norms_per_pos,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -4415,68 +4265,9 @@ pub fn alloc_tq_full_attn_buffers(
     max_seq_len: u32,
     n_seqs: u32,
 ) -> Result<TqFullAttnKvBuffers> {
-    if max_seq_len == 0 {
-        return Err(anyhow!(
-            "alloc_tq_full_attn_buffers: max_seq_len must be > 0"
-        ));
-    }
-    if n_seqs == 0 {
-        return Err(anyhow!("alloc_tq_full_attn_buffers: n_seqs must be > 0"));
-    }
-
-    let n_kv_heads = cfg.num_key_value_heads as usize;
-    let head_dim = cfg.head_dim;
-    let norms_per_pos = tq_norms_per_pos_for(head_dim);
-
-    // Packed: [n_seqs, n_kv_heads, max_seq_len, head_dim] U8.
-    // 1 byte per element (8-bit Lloyd-Max index).
-    let packed_elems =
-        (n_seqs as usize) * n_kv_heads * (max_seq_len as usize) * (head_dim as usize);
-    let packed_bytes = packed_elems; // U8 → 1 byte/elem
-    let packed_shape = vec![
-        n_seqs as usize,
-        n_kv_heads,
-        max_seq_len as usize,
-        head_dim as usize,
-    ];
-
-    // Norms: [n_seqs, n_kv_heads, max_seq_len, norms_per_pos] F32.
-    // norms_per_pos=1 collapses to a 3-D view at the kernel level,
-    // but we keep the 4-D shape on the buffer so cfg-shape validation
-    // is unambiguous (every dim is explicit).
-    let norms_elems =
-        (n_seqs as usize) * n_kv_heads * (max_seq_len as usize) * (norms_per_pos as usize);
-    let norms_bytes = norms_elems * std::mem::size_of::<f32>();
-    let norms_shape = vec![
-        n_seqs as usize,
-        n_kv_heads,
-        max_seq_len as usize,
-        norms_per_pos as usize,
-    ];
-
-    // SAFETY: all TQ attention readers are bounded by the owning slot's
-    // `current_len`; encoder writes packed values and norms before advancing
-    // that cursor.
-    let k_packed =
-        unsafe { device.alloc_buffer_for_overwrite(packed_bytes, DType::U8, packed_shape.clone()) }
-            .map_err(|e| anyhow!("alloc TQ full-attn K packed: {e}"))?;
-    let k_norms =
-        unsafe { device.alloc_buffer_for_overwrite(norms_bytes, DType::F32, norms_shape.clone()) }
-            .map_err(|e| anyhow!("alloc TQ full-attn K norms: {e}"))?;
-    let v_packed =
-        unsafe { device.alloc_buffer_for_overwrite(packed_bytes, DType::U8, packed_shape) }
-            .map_err(|e| anyhow!("alloc TQ full-attn V packed: {e}"))?;
-    let v_norms =
-        unsafe { device.alloc_buffer_for_overwrite(norms_bytes, DType::F32, norms_shape) }
-            .map_err(|e| anyhow!("alloc TQ full-attn V norms: {e}"))?;
-
-    Ok(TqFullAttnKvBuffers {
-        k_packed,
-        k_norms,
-        v_packed,
-        v_norms,
-        norms_per_pos,
-    })
+    let (roots, norms) = allocation_plan::tq_roots(cfg, max_seq_len, n_seqs)?;
+    let buffers = allocation_plan::allocate_roots_with(&roots, |root| root.allocate(device))?;
+    Ok(tq_full_attn_from_roots(buffers, norms))
 }
 
 /// Total bytes the TQ-active full-attn slot occupies (sum of all 4
@@ -4507,7 +4298,7 @@ impl std::fmt::Debug for TqFullAttnKvBuffers {
 }
 
 /// Compute the F32 K+V byte count for one full-attn slot at the given
-/// shape.  Matches the existing `alloc_full_attn_slot` formula.  Used
+/// shape.  Matches the production F32 allocation-plan formula.  Used
 /// by the iter-7 parity test to assert the TQ savings ratio.
 pub fn full_attn_slot_f32_bytes(cfg: &Qwen35Config, max_seq_len: u32, n_seqs: u32) -> usize {
     let elems = (n_seqs as usize)
@@ -5006,7 +4797,7 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         // n_seqs outermost).  For copy_within purposes the AXIS ordering
         // doesn't matter — only that n_seqs is the OUTERMOST axis so
         // each slot's region is contiguous.  All four base buffers have
-        // n_seqs as outermost per `alloc_linear_attn_slot` at
+        // n_seqs as outermost per the production LA allocation plan at
         // `kv_cache.rs:2575-2632`.
         for slot in self.linear_attn.iter_mut() {
             // recurrent + recurrent_scratch.
