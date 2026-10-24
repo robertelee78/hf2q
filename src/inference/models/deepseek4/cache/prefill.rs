@@ -1,6 +1,6 @@
 //! Atomic bounded prompt transactions for the DeepSeek-V4 cache.
 
-use super::{CacheError, Deepseek4Cache};
+use super::{CacheError, Deepseek4Cache, Deepseek4CachePlan};
 
 /// Physical writes and final visibility for one prompt transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,32 +34,32 @@ pub struct CacheSpan {
 /// modules, so cohort publication remains validate-all then infallible.
 pub(in crate::inference::models::deepseek4) struct PrefillCommitTicket(usize);
 
-impl Deepseek4Cache {
-    /// Plan one layer-major prompt transaction without publishing logical
-    /// visibility. Raw attention reads the transaction's compact KV source,
-    /// while the live circular cache retains only its final physical window.
-    pub fn plan_prefill(&self, token_count: usize) -> Result<CacheSpan, CacheError> {
-        if self.is_poisoned() {
-            return Err(CacheError::Poisoned);
-        }
+impl Deepseek4CachePlan {
+    /// Pure physical write/visibility descriptor used by the live cache path.
+    /// Uses the same validated plan and graft-count assumptions as the live cache.
+    /// This does not allocate storage or establish encoder/runtime acceptance.
+    pub(in crate::inference::models::deepseek4) fn plan_prefill_at(
+        &self,
+        start_position: usize,
+        token_count: usize,
+        graft_slots: usize,
+    ) -> Result<CacheSpan, CacheError> {
         if token_count == 0 {
             return Err(CacheError::EmptyPrefill);
         }
-        let end = self
-            .next_position
+        let end = start_position
             .checked_add(token_count)
             .ok_or(CacheError::ContextBound {
                 requested: usize::MAX,
-                maximum: self.plan.context_length,
+                maximum: self.context_length,
             })?;
-        if end > self.plan.context_length {
+        if end > self.context_length {
             return Err(CacheError::ContextBound {
                 requested: end,
-                maximum: self.plan.context_length,
+                maximum: self.context_length,
             });
         }
         let layers = self
-            .plan
             .layers
             .iter()
             .map(|layer| {
@@ -70,7 +70,7 @@ impl Deepseek4Cache {
                 let compressed_before = if ratio == 0 {
                     0
                 } else {
-                    self.next_position / ratio
+                    start_position / ratio
                 };
                 let compressed_valid_after = if ratio == 0 { 0 } else { end / ratio };
                 let compressed_count = compressed_valid_after - compressed_before;
@@ -79,10 +79,10 @@ impl Deepseek4Cache {
                     usize::from(layer.compress_ratio == 4) * compressed_valid_after;
                 if ratio != 0 {
                     let capacity = layer.compressed_kv.as_ref().map_or(0, |plan| plan.shape[0]);
-                    if self.graft_slots + compressed_valid_after > capacity {
+                    if graft_slots + compressed_valid_after > capacity {
                         return Err(CacheError::GraftCapacity {
                             layer: layer.layer_index,
-                            n_slots: self.graft_slots,
+                            n_slots: graft_slots,
                             capacity,
                         });
                     }
@@ -90,8 +90,7 @@ impl Deepseek4Cache {
                 Ok(LayerCacheSpan {
                     layer_index: layer.layer_index,
                     window_source_start,
-                    window_write_start: (self.next_position + window_source_start)
-                        % window_capacity,
+                    window_write_start: (start_position + window_source_start) % window_capacity,
                     window_write_count,
                     window_valid_after: end.min(window_capacity),
                     compressed_write_start: compressed_before,
@@ -104,10 +103,23 @@ impl Deepseek4Cache {
             })
             .collect::<Result<Vec<_>, CacheError>>()?;
         Ok(CacheSpan {
-            start_position: self.next_position,
+            start_position,
             token_count,
             layers,
         })
+    }
+}
+
+impl Deepseek4Cache {
+    /// Plan one layer-major prompt transaction without publishing logical
+    /// visibility. Raw attention reads the transaction's compact KV source,
+    /// while the live circular cache retains only its final physical window.
+    pub fn plan_prefill(&self, token_count: usize) -> Result<CacheSpan, CacheError> {
+        if self.is_poisoned() {
+            return Err(CacheError::Poisoned);
+        }
+        self.plan
+            .plan_prefill_at(self.next_position, token_count, self.graft_slots)
     }
 
     /// Backward-compatible strict start-zero planner used by callers that
