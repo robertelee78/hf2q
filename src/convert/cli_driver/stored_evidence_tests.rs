@@ -608,7 +608,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                     .collect::<std::collections::BTreeSet<_>>();
                 assert_eq!(observed_bindings, expected_bindings);
                 for (index, observation) in session.encoded_dispatches().iter().enumerate() {
-                    assert_eq!(observation.trace.mlx_native_version, "0.15.2");
+                    assert_eq!(observation.trace.mlx_native_version, "0.15.3");
                     assert_eq!(
                         observation.trace.request.workload,
                         if index < 16 {
@@ -665,6 +665,12 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                 assert!(
                     incomplete.seal_encoded_dispatches().is_err(),
                     "an encoded catalog missing decode coverage must fail closed"
+                );
+                println!(
+                    "HF_NATIVE_STORED_EVIDENCE_GPU_COMPLETE variant={} native_version={} trace_count={}",
+                    output_name,
+                    encoded_catalog.observations()[0].trace.mlx_native_version,
+                    encoded_catalog.observations().len()
                 );
             }
         }

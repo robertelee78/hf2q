@@ -111,6 +111,11 @@ new archive/source identity. The earlier 0.15.1 kernel/capability observations
 remain dated evidence; this pin change does not claim they were rerun, or
 qualify full model memory, serving or speed.
 
+**2026-10-25 dependency succession:** current source pins published 0.15.3;
+see its separate [registry adoption record](../research/adr063-native-0153-registry-adoption-2026-10-25.md).
+The dated 0.15.1 audit and 0.15.2 backing-safety evidence above remain unchanged.
+The successor pin does not select new APIs or establish model speed or admission.
+
 The strict native argmax ABI also requires an actual U32 parameter allocation.
 The earlier F32 allocation with U32-written bits was an hf2q contract error,
 exposed by backend dtype validation. Nested warmup errors retain their source
