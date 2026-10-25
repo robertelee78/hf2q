@@ -40,6 +40,8 @@
 //! a grafted cache and hydration refuses an image that records graft
 //! rows.
 
+mod serialize;
+
 use mlx_native::MlxDevice;
 use sha2::{Digest, Sha256};
 
@@ -172,126 +174,7 @@ impl Deepseek4Cache {
                 reason: "cache carries bound graft rows",
             });
         }
-        let position = anchor.position();
-        let mut out = Vec::with_capacity(ANCHOR_IMAGE_HEADER_LEN + tokens.len() * 4 + 1024);
-        out.extend_from_slice(&ANCHOR_IMAGE_MAGIC);
-        out.extend_from_slice(&ANCHOR_IMAGE_CODEC_VERSION.to_le_bytes());
-        out.extend_from_slice(&(position as u32).to_le_bytes());
-        out.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.plan.layers.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.plan.context_length as u32).to_le_bytes());
-        out.extend_from_slice(&0_u32.to_le_bytes());
-        out.extend_from_slice(&(0_u64).to_le_bytes()); // reserved image length
-        for &token in tokens {
-            out.extend_from_slice(&token.to_le_bytes());
-        }
-        for (layer_index, layer) in self.layers.iter().enumerate() {
-            let layer_plan = &self.plan.layers[layer_index];
-            let anchor_layer = anchor
-                .layers
-                .get(layer_index)
-                .ok_or(CacheError::SnapshotLayerCount {
-                    expected: self.plan.layers.len(),
-                    actual: anchor.layers.len(),
-                })?;
-            let window_rows = position.min(layer_plan.window_kv.shape[0]);
-            let window_bytes = row_bytes(layer_plan.window_kv.shape[1], window_rows)?;
-            let compressed_rows = if layer_plan.compress_ratio == 0 {
-                0
-            } else {
-                position / layer_plan.compress_ratio as usize
-            };
-            let compressed_bytes = match (&layer.compressed_kv, layer_plan.compressed_kv.as_ref())
-            {
-                (Some(buffer), Some(plan)) => {
-                    let bytes = row_bytes(plan.shape[1], compressed_rows)?;
-                    if compressed_rows > buffer.shape()[0] || bytes > buffer.data_byte_len() {
-                        return Err(CacheError::AnchorImageCorrupt {
-                            reason: "compressed rows exceed live region",
-                        });
-                    }
-                    bytes
-                }
-                (None, None) => 0,
-                _ => return Err(CacheError::SnapshotBufferMismatch { layer: layer_index, kind: CacheKind::CompressedKv }),
-            };
-            let indexer_rows = usize::from(layer_plan.compress_ratio == 4) * (position / 4);
-            let indexer_bytes = match (&layer.indexer_kv, layer_plan.indexer_kv.as_ref()) {
-                (Some(buffer), Some(plan)) => {
-                    let bytes = row_bytes(plan.shape[1], indexer_rows)?;
-                    if indexer_rows > buffer.shape()[0] || bytes > buffer.data_byte_len() {
-                        return Err(CacheError::AnchorImageCorrupt {
-                            reason: "indexer rows exceed live region",
-                        });
-                    }
-                    bytes
-                }
-                (None, None) => 0,
-                _ => return Err(CacheError::SnapshotBufferMismatch { layer: layer_index, kind: CacheKind::IndexerKv }),
-            };
-            let state_len = |buffer: Option<&mlx_native::MlxBuffer>| -> u64 {
-                buffer.map_or(0, |buffer| buffer.data_byte_len() as u64)
-            };
-            let main_kv_state_bytes = state_len(anchor_layer.main_kv_state.as_ref());
-            let main_score_state_bytes = state_len(anchor_layer.main_score_state.as_ref());
-            let indexer_kv_state_bytes = state_len(anchor_layer.indexer_kv_state.as_ref());
-            let indexer_score_state_bytes = state_len(anchor_layer.indexer_score_state.as_ref());
-            out.extend_from_slice(&(layer_plan.layer_index as u32).to_le_bytes());
-            out.extend_from_slice(&layer_plan.compress_ratio.to_le_bytes());
-            out.extend_from_slice(&(window_bytes as u64).to_le_bytes());
-            out.extend_from_slice(&(compressed_bytes as u64).to_le_bytes());
-            out.extend_from_slice(&(indexer_bytes as u64).to_le_bytes());
-            out.extend_from_slice(&main_kv_state_bytes.to_le_bytes());
-            out.extend_from_slice(&main_score_state_bytes.to_le_bytes());
-            out.extend_from_slice(&indexer_kv_state_bytes.to_le_bytes());
-            out.extend_from_slice(&indexer_score_state_bytes.to_le_bytes());
-            if window_bytes > 0 {
-                let source = anchor_layer
-                    .window_kv
-                    .as_slice::<u8>()
-                    .map_err(|source| CacheError::SnapshotCopy { layer: layer_index, kind: CacheKind::WindowKv, source })?;
-                out.extend_from_slice(&source[..window_bytes]);
-            }
-            if compressed_bytes > 0 {
-                let source = layer
-                    .compressed_kv
-                    .as_ref()
-                    .expect("compressed presence validated above")
-                    .as_slice::<u8>()
-                    .map_err(|source| CacheError::SnapshotCopy { layer: layer_index, kind: CacheKind::CompressedKv, source })?;
-                out.extend_from_slice(&source[..compressed_bytes]);
-            }
-            if indexer_bytes > 0 {
-                let source = layer
-                    .indexer_kv
-                    .as_ref()
-                    .expect("indexer presence validated above")
-                    .as_slice::<u8>()
-                    .map_err(|source| CacheError::SnapshotCopy { layer: layer_index, kind: CacheKind::IndexerKv, source })?;
-                out.extend_from_slice(&source[..indexer_bytes]);
-            }
-            for (buffer, kind) in [
-                (anchor_layer.main_kv_state.as_ref(), CacheKind::MainKvState),
-                (anchor_layer.main_score_state.as_ref(), CacheKind::MainScoreState),
-                (anchor_layer.indexer_kv_state.as_ref(), CacheKind::IndexerKvState),
-                (anchor_layer.indexer_score_state.as_ref(), CacheKind::IndexerScoreState),
-            ] {
-                if let Some(buffer) = buffer {
-                    let source = buffer
-                        .as_slice::<u8>()
-                        .map_err(|source| CacheError::SnapshotCopy { layer: layer_index, kind, source })?;
-                    out.extend_from_slice(source);
-                }
-            }
-        }
-        // Patch the reserved image-length slot with the real total
-        // BEFORE hashing — the checksum covers every byte including it.
-        let total = (out.len() + ANCHOR_IMAGE_CHECKSUM_LEN) as u64;
-        out[32..40].copy_from_slice(&total.to_le_bytes());
-        let checksum: [u8; 32] = Sha256::digest(&out).into();
-        out.extend_from_slice(&checksum);
-        debug_assert_eq!(out.len() as u64, total);
-        Ok(out)
+        serialize::serialize(self, anchor, tokens)
     }
 
     /// Rebuild `(cache, snapshot, tokens)` from a persisted anchor-image

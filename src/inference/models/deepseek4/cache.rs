@@ -213,6 +213,8 @@ pub enum CacheError {
     AnchorImageCorrupt { reason: &'static str },
     #[error("DeepSeek-V4 recovery-anchor image is incompatible with this model: {reason}")]
     AnchorImageIncompatible { reason: &'static str },
+    #[error("DeepSeek-V4 anchor image capacity failure ({requested} bytes): {reason}")]
+    AnchorImageCapacity { reason: &'static str, requested: usize },
 }
 
 pub struct LayerCache {
