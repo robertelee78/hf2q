@@ -613,6 +613,7 @@ jobs:
             gcd_schema_tests \
             gcd_schema_locked_requires_gcd_schema_on_serve_and_chat \
             measurement::tests \
+            prefix_post_oracle_tests::prefix_acceptance \
             serve::memory_ledger \
             inference::glp::discovery::tests \
             inference::glp::compatibility::tests \
