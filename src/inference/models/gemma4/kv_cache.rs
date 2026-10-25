@@ -3,6 +3,10 @@
 //! Extracted from `src/serve/forward_mlx.rs` by ADR-038 Step 2.
 //! Mirrors the `qwen35/kv_cache.rs` pattern.
 
+#[path = "cache_scaffold_plan.rs"]
+pub(crate) mod cache_scaffold_plan;
+use cache_scaffold_plan::{Modes, Phase, SlotPlan};
+
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
@@ -221,30 +225,6 @@ pub struct MultiSeqHbKvBuffers {
     pub seq_lens: Vec<u32>,
 }
 
-/// Allocate persistent multi-slot KV storage without committing every page of
-/// a full-context logical stride at server startup.
-///
-/// Sliding-window rings stay on the ordinary zeroed, residency-managed path:
-/// they are small and may wrap over previously written positions. Full
-/// attention is cursor-masked; every position below the cursor is written
-/// before attention can read it, so untouched tail pages are not observable.
-fn alloc_multi_seq_kv_storage(
-    dev: &MlxDevice,
-    byte_len: usize,
-    dtype: DType,
-    shape: Vec<usize>,
-    is_ring: bool,
-) -> mlx_native::Result<MlxBuffer> {
-    if is_ring {
-        dev.alloc_buffer(byte_len, dtype, shape)
-    } else {
-        // SAFETY: every full-attention reader is bounded by the per-slot
-        // cursor, which advances only after the producer writes that position.
-        // Reset paths lower the cursor and never expose the unwritten tail.
-        unsafe { dev.alloc_buffer_for_overwrite(byte_len, dtype, shape) }
-    }
-}
-
 /// ADR-040 Phase A3a iter-3 — unified [`MultiSeqHbKvBuffers`] allocator.
 ///
 /// **Why this helper exists** (dossier H8):
@@ -282,60 +262,46 @@ pub fn alloc_hb_kv_for_layer(
     is_ring: bool,
     n_seqs: u32,
 ) -> Result<MultiSeqHbKvBuffers> {
-    if n_seqs == 0 {
-        return Err(anyhow!(
-            "alloc_hb_kv_for_layer L{layer_idx}: n_seqs must be > 0"
-        ));
-    }
-    if nkv == 0 || hd == 0 || cap == 0 {
-        return Err(anyhow!(
-            "alloc_hb_kv_for_layer L{layer_idx}: nkv/hd/cap must be > 0 \
-             (got nkv={nkv}, hd={hd}, cap={cap})"
-        ));
-    }
-    let norms_per_pos = (hd / 256).max(1);
-    let n = n_seqs as usize;
-
-    // Packed: [n_seqs, nkv, cap, hd] U8 (1 byte/elem).  Outer n_seqs
-    // matches Qwen35 `alloc_tq_full_attn_buffers` convention
-    // (`kv_cache.rs:2421-2426`), keeping per-slot byte offsets
-    // contiguous and addressable as `slot.0 * (nkv*cap*hd)` for the
-    // kernel-dispatcher slot-offset work in Phase B4c.
-    let packed_bytes = n * nkv * cap * hd; // U8 → 1 byte/elem
-    let packed_shape = vec![n, nkv, cap, hd];
-
-    // Norms: [n_seqs, nkv, cap, norms_per_pos] F32.  norms_per_pos=1
-    // (D=256) collapses to an effective 3-D `[n, nkv, cap]` at the
-    // kernel level (consistent with the legacy 3-D `vec![nkv, cap]`
-    // form when n_seqs=1 + norms_per_pos=1); we keep the 4-D shape
-    // here so cfg-shape validation is unambiguous (every dim is
-    // explicit, matching the Qwen35 norms-shape pin at
-    // `kv_cache.rs:2437-2442`).
-    let norms_elems = n * nkv * cap * norms_per_pos;
-    let norms_bytes = norms_elems * std::mem::size_of::<f32>();
-    let norms_shape = vec![n, nkv, cap, norms_per_pos];
-
-    let k_packed =
-        alloc_multi_seq_kv_storage(dev, packed_bytes, DType::U8, packed_shape.clone(), is_ring)
-            .map_err(|e| anyhow!("hb_kv L{layer_idx} K packed: {e}"))?;
-    let k_norms =
-        alloc_multi_seq_kv_storage(dev, norms_bytes, DType::F32, norms_shape.clone(), is_ring)
-            .map_err(|e| anyhow!("hb_kv L{layer_idx} K norms: {e}"))?;
-    let v_packed = alloc_multi_seq_kv_storage(dev, packed_bytes, DType::U8, packed_shape, is_ring)
-        .map_err(|e| anyhow!("hb_kv L{layer_idx} V packed: {e}"))?;
-    let v_norms = alloc_multi_seq_kv_storage(dev, norms_bytes, DType::F32, norms_shape, is_ring)
-        .map_err(|e| anyhow!("hb_kv L{layer_idx} V norms: {e}"))?;
-
-    Ok(MultiSeqHbKvBuffers {
+    let plan = SlotPlan::new(
+        Phase::Hb,
+        layer_idx,
+        nkv,
+        hd,
+        cap,
+        is_ring,
         n_seqs,
+        Modes::plain(DType::F32),
+        None,
+    )?;
+    alloc_hb_kv_for_layer_from_plan(dev, &plan)
+}
+
+pub(crate) fn alloc_hb_kv_for_layer_from_plan(
+    dev: &MlxDevice,
+    plan: &SlotPlan,
+) -> Result<MultiSeqHbKvBuffers> {
+    anyhow::ensure!(
+        plan.phase == Phase::Hb,
+        "Gemma scaffold allocator phase mismatch"
+    );
+    let mut buffers = plan
+        .allocate_with(|descriptor| descriptor.allocate(dev))?
+        .into_iter();
+    let k_packed = buffers.next().expect("planned K packed");
+    let k_norms = buffers.next().expect("planned K norms");
+    let v_packed = buffers.next().expect("planned V packed");
+    let v_norms = buffers.next().expect("planned V norms");
+    debug_assert!(buffers.next().is_none());
+    Ok(MultiSeqHbKvBuffers {
         k_packed,
         k_norms,
         v_packed,
         v_norms,
-        capacity: cap,
-        is_sliding: is_ring,
-        norms_per_pos,
-        seq_lens: vec![0u32; n],
+        n_seqs: plan.nseq,
+        capacity: plan.cap,
+        is_sliding: plan.ring,
+        norms_per_pos: plan.norms,
+        seq_lens: vec![0; plan.nseq as usize],
     })
 }
 
@@ -383,7 +349,7 @@ pub fn layer_type_to_alloc_params(
 /// The multi-seq (`SlotAware`) KV scaffold reserves a `max_slots × capacity`
 /// virtual buffer per layer. Every slot receives the model's complete logical
 /// context capacity. Untouched full-attention pages are left uncommitted by
-/// [`alloc_multi_seq_kv_storage`], so logical addressability no longer implies
+/// the shared scaffold descriptor allocator, so logical addressability no longer implies
 /// eager physical residency. Aggregate physical KV use is governed by the
 /// serving admission policy, not by silently shrinking each slot.
 ///
@@ -1915,118 +1881,54 @@ pub fn alloc_multi_seq_hybrid_kv_for_layer(
     is_ring: bool,
     n_seqs: u32,
 ) -> Result<MultiSeqHybridKvBuffers> {
-    if n_seqs == 0 {
-        return Err(anyhow!(
-            "alloc_multi_seq_hybrid_kv_for_layer L{layer_idx}: n_seqs must be > 0"
-        ));
-    }
-    if nkv == 0 || hd == 0 || cap == 0 {
-        return Err(anyhow!(
-            "alloc_multi_seq_hybrid_kv_for_layer L{layer_idx}: nkv/hd/cap must be \
-             > 0 (got nkv={nkv}, hd={hd}, cap={cap})"
-        ));
-    }
-    let norms_per_pos = (hd / 256).max(1);
-    let n = n_seqs as usize;
+    let plan = SlotPlan::new(
+        Phase::Hybrid,
+        layer_idx,
+        nkv,
+        hd,
+        cap,
+        is_ring,
+        n_seqs,
+        Modes::hybrid_invocation(),
+        None,
+    )?;
+    alloc_multi_seq_hybrid_kv_for_layer_from_plan(dev, &plan)
+}
 
-    // F16 K: `[n_seqs, nkv, cap, hd]`, 2 bytes/elem.  n_seqs is
-    // OUTERMOST so per-slot byte offset = `slot.0 * (nkv*cap*hd*2)`
-    // is a contiguous slab Phase B4c can address via
-    // `MlxBuffer::slice_view`.
-    let k_elems = n * nkv * cap * hd;
-    let k_bytes = k_elems * 2;
-    let k = alloc_multi_seq_kv_storage(dev, k_bytes, DType::F16, vec![n, nkv, cap, hd], is_ring)
-        .map_err(|e| anyhow!("multi-seq hybrid F16 K L{layer_idx}: {e}"))?;
-
-    // V: honour `HF2Q_FULL_F16_KV` exactly like the legacy allocator
-    // — when set, V is F16 (2 bytes/elem) and v_norms is a 4-byte
-    // dummy.  Otherwise legacy TQ-HB packed U8 + F32 per-position
-    // norms.  The env-read is at alloc-time so the lift inherits
-    // the legacy allocator's behaviour byte-for-byte at n_seqs=1.
-    let full_f16_v = std::env::var("HF2Q_FULL_F16_KV")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
-        .unwrap_or(false);
-    let (v_packed, v_norms) = if full_f16_v {
-        let v_elems = n * nkv * cap * hd;
-        let v_bytes = v_elems * 2;
-        let v_f16 =
-            alloc_multi_seq_kv_storage(dev, v_bytes, DType::F16, vec![n, nkv, cap, hd], is_ring)
-                .map_err(|e| anyhow!("multi-seq hybrid F16 V L{layer_idx}: {e}"))?;
-        // Dummy norms buffer — same 4-byte shape as the legacy
-        // allocator emits when full_f16_v is set; kernel's
-        // v_is_f16 function constant skips the read entirely.  The
-        // dummy is shared across slots (no per-slot dimension)
-        // because it carries no data; a per-slot dummy would just
-        // waste 4*(N-1) bytes for zero kernel benefit.
-        let v_norms_dummy = dev
-            .alloc_buffer(4, DType::F32, vec![1])
-            .map_err(|e| anyhow!("multi-seq hybrid V norms (dummy) L{layer_idx}: {e}"))?;
-        (v_f16, v_norms_dummy)
-    } else {
-        let v_packed_elems = n * nkv * cap * hd;
-        let v_packed_bytes = v_packed_elems; // U8 = 1 byte/elem
-        let v_p = alloc_multi_seq_kv_storage(
-            dev,
-            v_packed_bytes,
-            DType::U8,
-            vec![n, nkv, cap, hd],
-            is_ring,
+pub(crate) fn alloc_multi_seq_hybrid_kv_for_layer_from_plan(
+    dev: &MlxDevice,
+    plan: &SlotPlan,
+) -> Result<MultiSeqHybridKvBuffers> {
+    anyhow::ensure!(
+        plan.phase == Phase::Hybrid,
+        "Gemma scaffold allocator phase mismatch"
+    );
+    let mut buffers = plan
+        .allocate_with(|descriptor| descriptor.allocate(dev))?
+        .into_iter();
+    let k = buffers.next().expect("planned K");
+    let v_packed = buffers.next().expect("planned V");
+    let v_norms = buffers.next().expect("planned V norms");
+    let (bf16_xlen_k, bf16_xlen_v) = if plan.xlen {
+        (
+            Some(buffers.next().expect("planned xlen K")),
+            Some(buffers.next().expect("planned xlen V")),
         )
-        .map_err(|e| anyhow!("multi-seq hybrid V packed L{layer_idx}: {e}"))?;
-        let v_norms_elems = n * nkv * cap * norms_per_pos;
-        let v_norms_bytes = v_norms_elems * std::mem::size_of::<f32>();
-        let v_n = alloc_multi_seq_kv_storage(
-            dev,
-            v_norms_bytes,
-            DType::F32,
-            vec![n, nkv, cap, norms_per_pos],
-            is_ring,
-        )
-        .map_err(|e| anyhow!("multi-seq hybrid V norms L{layer_idx}: {e}"))?;
-        (v_p, v_n)
-    };
-
-    // Optional BF16 xlen K/V — ADR-030 iter-96.  Lazy at alloc-time
-    // mirrors the legacy allocator's behaviour.  ~110 MB/slot at
-    // production Gemma 4 shapes when the env gate is OFF, so
-    // None-by-default matters even more at N>1.
-    let xlen_mode = std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1");
-    let (bf16_xlen_k, bf16_xlen_v) = if xlen_mode {
-        let xlen_elems = n * nkv * cap * hd;
-        let xlen_bytes = xlen_elems * 2;
-        let bk = alloc_multi_seq_kv_storage(
-            dev,
-            xlen_bytes,
-            DType::BF16,
-            vec![n, nkv, cap, hd],
-            is_ring,
-        )
-        .map_err(|e| anyhow!("multi-seq hybrid bf16 xlen K L{layer_idx}: {e}"))?;
-        let bv = alloc_multi_seq_kv_storage(
-            dev,
-            xlen_bytes,
-            DType::BF16,
-            vec![n, nkv, cap, hd],
-            is_ring,
-        )
-        .map_err(|e| anyhow!("multi-seq hybrid bf16 xlen V L{layer_idx}: {e}"))?;
-        (Some(bk), Some(bv))
     } else {
         (None, None)
     };
-
+    debug_assert!(buffers.next().is_none());
     Ok(MultiSeqHybridKvBuffers {
-        n_seqs,
         k,
         v_packed,
         v_norms,
-        capacity: cap,
-        is_sliding: is_ring,
-        norms_per_pos,
         bf16_xlen_k,
         bf16_xlen_v,
-        seq_lens: vec![0u32; n],
+        n_seqs: plan.nseq,
+        capacity: plan.cap,
+        is_sliding: plan.ring,
+        norms_per_pos: plan.norms,
+        seq_lens: vec![0; plan.nseq as usize],
     })
 }
 
@@ -2420,44 +2322,42 @@ pub fn alloc_multi_seq_dense_kv_for_layer(
     dtype: DType,
     n_seqs: u32,
 ) -> Result<MultiSeqDenseKvBuffers> {
-    if n_seqs == 0 {
-        return Err(anyhow!(
-            "alloc_multi_seq_dense_kv_for_layer L{layer_idx}: n_seqs must be > 0"
-        ));
-    }
-    if nkv == 0 || hd == 0 || cap == 0 {
-        return Err(anyhow!(
-            "alloc_multi_seq_dense_kv_for_layer L{layer_idx}: nkv/hd/cap must be \
-             > 0 (got nkv={nkv}, hd={hd}, cap={cap})"
-        ));
-    }
-    let n = n_seqs as usize;
-    let elem_bytes = dtype.size_of();
-
-    // Dense K: `[n_seqs, nkv, cap, hd]`.  n_seqs is OUTERMOST so
-    // per-slot byte offset = `slot.0 * (nkv*cap*hd*elem_bytes)` is a
-    // contiguous slab Phase B4c can address via `MlxBuffer::slice_view`.
-    let k_elems = n * nkv * cap * hd;
-    let k_bytes = k_elems * elem_bytes;
-    let k = alloc_multi_seq_kv_storage(dev, k_bytes, dtype, vec![n, nkv, cap, hd], is_ring)
-        .map_err(|e| anyhow!("multi-seq dense K L{layer_idx}: {e}"))?;
-
-    // Dense V: same shape + dtype as K (ADR-017 Phase E.a iter-3.5a
-    // invariant — both buffers in the legacy DenseKvBuffers share
-    // dtype).
-    let v_elems = n * nkv * cap * hd;
-    let v_bytes = v_elems * elem_bytes;
-    let v = alloc_multi_seq_kv_storage(dev, v_bytes, dtype, vec![n, nkv, cap, hd], is_ring)
-        .map_err(|e| anyhow!("multi-seq dense V L{layer_idx}: {e}"))?;
-
-    Ok(MultiSeqDenseKvBuffers {
+    let plan = SlotPlan::new(
+        Phase::Dense,
+        layer_idx,
+        nkv,
+        hd,
+        cap,
+        is_ring,
         n_seqs,
+        Modes::plain(dtype),
+        None,
+    )?;
+    alloc_multi_seq_dense_kv_for_layer_from_plan(dev, &plan)
+}
+
+pub(crate) fn alloc_multi_seq_dense_kv_for_layer_from_plan(
+    dev: &MlxDevice,
+    plan: &SlotPlan,
+) -> Result<MultiSeqDenseKvBuffers> {
+    anyhow::ensure!(
+        plan.phase == Phase::Dense,
+        "Gemma scaffold allocator phase mismatch"
+    );
+    let mut buffers = plan
+        .allocate_with(|descriptor| descriptor.allocate(dev))?
+        .into_iter();
+    let k = buffers.next().expect("planned K");
+    let v = buffers.next().expect("planned V");
+    debug_assert!(buffers.next().is_none());
+    Ok(MultiSeqDenseKvBuffers {
         k,
         v,
-        capacity: cap,
-        is_sliding: is_ring,
-        dtype,
-        seq_lens: vec![0u32; n],
+        n_seqs: plan.nseq,
+        capacity: plan.cap,
+        is_sliding: plan.ring,
+        dtype: plan.dense_dtype,
+        seq_lens: vec![0; plan.nseq as usize],
     })
 }
 
@@ -2820,87 +2720,46 @@ pub fn alloc_multi_seq_mlx_kv_for_layer(
     norms_per_pos: usize,
     n_seqs: u32,
 ) -> Result<MultiSeqMlxKvCache> {
-    if n_seqs == 0 {
-        return Err(anyhow!(
-            "alloc_multi_seq_mlx_kv_for_layer L{layer_idx}: n_seqs must be > 0"
-        ));
-    }
-    if nkv == 0 || hd == 0 || cap == 0 || norms_per_pos == 0 {
-        return Err(anyhow!(
-            "alloc_multi_seq_mlx_kv_for_layer L{layer_idx}: nkv/hd/cap/norms_per_pos \
-             must be > 0 (got nkv={nkv}, hd={hd}, cap={cap}, norms_per_pos={norms_per_pos})"
-        ));
-    }
-    if hd % 2 != 0 {
-        return Err(anyhow!(
-            "alloc_multi_seq_mlx_kv_for_layer L{layer_idx}: hd must be even for 4-bit \
-             nibble-packed K/V (hd/2 stride; got hd={hd})"
-        ));
-    }
-    let n = n_seqs as usize;
-
-    // K packed: `[n_seqs, nkv, cap, hd/2]` U8 (4-bit nibble-packed).
-    // n_seqs OUTERMOST so per-slot byte offset = `slot.0 * (nkv*cap*(hd/2))`
-    // is a contiguous slab Phase B4c can address via `MlxBuffer::slice_view`.
-    let hd_half = hd / 2;
-    let k_packed_elems = n * nkv * cap * hd_half;
-    let k_packed_bytes = k_packed_elems; // U8 = 1 byte/elem.
-    let k_packed = alloc_multi_seq_kv_storage(
-        dev,
-        k_packed_bytes,
-        DType::U8,
-        vec![n, nkv, cap, hd_half],
+    let plan = SlotPlan::new(
+        Phase::Nibble,
+        layer_idx,
+        nkv,
+        hd,
+        cap,
         is_ring,
-    )
-    .map_err(|e| anyhow!("multi-seq MLX K packed L{layer_idx}: {e}"))?;
-
-    // K norms: shape switches on norms_per_pos per the legacy formula
-    // at `gemma4/model.rs:1280-1283`.  Dtype F32 = 4 bytes/elem.
-    let k_norms_elems = n * nkv * cap * norms_per_pos;
-    let k_norms_bytes = k_norms_elems * 4;
-    let k_norms_shape: Vec<usize> = if norms_per_pos == 1 {
-        vec![n, nkv, cap]
-    } else {
-        vec![n, nkv, cap, norms_per_pos]
-    };
-    let k_norms =
-        alloc_multi_seq_kv_storage(dev, k_norms_bytes, DType::F32, k_norms_shape, is_ring)
-            .map_err(|e| anyhow!("multi-seq MLX K norms L{layer_idx}: {e}"))?;
-
-    // V packed: same shape + dtype as K packed.
-    let v_packed_elems = n * nkv * cap * hd_half;
-    let v_packed_bytes = v_packed_elems;
-    let v_packed = alloc_multi_seq_kv_storage(
-        dev,
-        v_packed_bytes,
-        DType::U8,
-        vec![n, nkv, cap, hd_half],
-        is_ring,
-    )
-    .map_err(|e| anyhow!("multi-seq MLX V packed L{layer_idx}: {e}"))?;
-
-    // V norms: same shape + dtype as K norms.
-    let v_norms_elems = n * nkv * cap * norms_per_pos;
-    let v_norms_bytes = v_norms_elems * 4;
-    let v_norms_shape: Vec<usize> = if norms_per_pos == 1 {
-        vec![n, nkv, cap]
-    } else {
-        vec![n, nkv, cap, norms_per_pos]
-    };
-    let v_norms =
-        alloc_multi_seq_kv_storage(dev, v_norms_bytes, DType::F32, v_norms_shape, is_ring)
-            .map_err(|e| anyhow!("multi-seq MLX V norms L{layer_idx}: {e}"))?;
-
-    Ok(MultiSeqMlxKvCache {
         n_seqs,
+        Modes::plain(DType::F32),
+        Some(norms_per_pos),
+    )?;
+    alloc_multi_seq_mlx_kv_for_layer_from_plan(dev, &plan)
+}
+
+pub(crate) fn alloc_multi_seq_mlx_kv_for_layer_from_plan(
+    dev: &MlxDevice,
+    plan: &SlotPlan,
+) -> Result<MultiSeqMlxKvCache> {
+    anyhow::ensure!(
+        plan.phase == Phase::Nibble,
+        "Gemma scaffold allocator phase mismatch"
+    );
+    let mut buffers = plan
+        .allocate_with(|descriptor| descriptor.allocate(dev))?
+        .into_iter();
+    let k_packed = buffers.next().expect("planned K packed");
+    let k_norms = buffers.next().expect("planned K norms");
+    let v_packed = buffers.next().expect("planned V packed");
+    let v_norms = buffers.next().expect("planned V norms");
+    debug_assert!(buffers.next().is_none());
+    Ok(MultiSeqMlxKvCache {
         k_packed,
         k_norms,
         v_packed,
         v_norms,
-        capacity: cap,
-        is_sliding: is_ring,
-        norms_per_pos,
-        seq_lens: vec![0u32; n],
+        n_seqs: plan.nseq,
+        capacity: plan.cap,
+        is_sliding: plan.ring,
+        norms_per_pos: plan.norms,
+        seq_lens: vec![0; plan.nseq as usize],
     })
 }
 

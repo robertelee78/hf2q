@@ -3798,214 +3798,98 @@ impl GemmaLoadedModel {
     /// this fn's entry (defense-in-depth diagnostic).
     pub fn provision_multi_seq_kv_for_slot_aware(&mut self, max_slots: u32) -> Result<()> {
         use crate::inference::models::gemma4::kv_cache::{
-            alloc_hb_kv_for_layer, alloc_multi_seq_dense_kv_for_layer,
-            alloc_multi_seq_hybrid_kv_for_layer, alloc_multi_seq_mlx_kv_for_layer,
-            layer_type_to_alloc_params_per_slot,
+            alloc_hb_kv_for_layer_from_plan, alloc_multi_seq_dense_kv_for_layer_from_plan,
+            alloc_multi_seq_hybrid_kv_for_layer_from_plan,
+            alloc_multi_seq_mlx_kv_for_layer_from_plan,
+            cache_scaffold_plan::{Modes, Phase, ScaffoldPlan},
+            MultiSeqDenseKvBuffers, MultiSeqHbKvBuffers, MultiSeqHybridKvBuffers,
+            MultiSeqMlxKvCache,
         };
-        use crate::serve::config::LayerType;
-
-        if max_slots == 0 {
-            anyhow::bail!(
-                "ADR-040 C2c: provision_multi_seq_kv_for_slot_aware called with \
-                 max_slots == 0; spawn_with_mode invariant is max_slots >= 1 \
-                 (EngineMode::SlotAware variant enforces this at the API \
-                 boundary — caller violated)"
-            );
+        // Preserve the max_slots diagnostic before resolving invocation flags.
+        anyhow::ensure!(max_slots > 0, "ADR-040 C2c: provision_multi_seq_kv_for_slot_aware called with max_slots == 0; spawn_with_mode invariant is max_slots >= 1 (EngineMode::SlotAware variant enforces this at the API boundary — caller violated)");
+        // Pure complete-plan preflight precedes any allocation/publication.
+        // Invocation modes require the existing stable process environment.
+        let plan = ScaffoldPlan::new(
+            &self.config,
+            self.weights.layers.len(),
+            max_slots,
+            Modes::invocation(),
+        )?;
+        let _requested_payload_and_roots = (plan.bytes, plan.roots);
+        let device = self.ctx.device().clone();
+        enum Allocated {
+            Hb(MultiSeqHbKvBuffers),
+            Hybrid(MultiSeqHybridKvBuffers),
+            Dense(MultiSeqDenseKvBuffers),
+            Nibble(MultiSeqMlxKvCache),
         }
-        let dev = self.ctx.device();
-        let num_layers = self.weights.layers.len();
-
-        // ── Phase 1: HB-encoded scaffold (C2c §6.1.21 — UNCHANGED) ───
-        //
-        // Always provisioned per H94: the opt-out (HF2Q_HYBRID_KV=0)
-        // dispatch-fork branch in `forward_prefill_with_soft_tokens_
-        // slot_aware` (iter-2A) routes through this scaffold; iter-2A-
-        // cont kernel-dispatch refactor consumes this field directly.
-        let mut multi_seq: Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers> =
-            Vec::with_capacity(num_layers);
-        for i in 0..num_layers {
-            let hd = self.config.head_dim_for_layer(i);
-            let nkv = self.config.num_kv_heads_for_layer(i);
-            let is_full = self.config.is_full_attention(i);
-            let layer_type = if is_full {
-                LayerType::Full
-            } else {
-                LayerType::Sliding
-            };
-            let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
-                layer_type,
-                self.config.sliding_window,
-                self.config.max_position_embeddings,
-                max_slots as usize,
-            );
-            let buf = alloc_hb_kv_for_layer(dev, i, nkv, hd, capacity, is_ring, max_slots)
-                .with_context(|| {
-                    format!(
-                        "ADR-040 C2c: alloc_hb_kv_for_layer L{i} failed for \
-                         max_slots={max_slots} (nkv={nkv}, hd={hd}, cap={capacity}, \
-                         is_ring={is_ring})"
-                    )
-                })?;
-            multi_seq.push(buf);
-        }
-        self.multi_seq_kv = Some(multi_seq);
-
-        // ── Phase 2: Hybrid F16-K + TQ-HB-V scaffold (iter-C2c-cont) ──
-        //
-        // Provisioned IFF the production-default KV regime is engaged.
-        // `INVESTIGATION_ENV.hybrid_kv` is a LazyLock read once at
-        // process start; matches the env-read discipline at the iter-2A
-        // dispatch fork in `forward_prefill.rs:2562` and the legacy
-        // alloc site at `forward_prefill.rs:842`. If the env is opted
-        // out, we leave `multi_seq_kv_hybrid = None` (H92 negative-arm
-        // pin) — the HB-encoded scaffold above is the only live one.
-        if crate::debug::INVESTIGATION_ENV.hybrid_kv {
-            let mut multi_seq_hybrid: Vec<
-                crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers,
-            > = Vec::with_capacity(num_layers);
-            for i in 0..num_layers {
-                let hd = self.config.head_dim_for_layer(i);
-                let nkv = self.config.num_kv_heads_for_layer(i);
-                let is_full = self.config.is_full_attention(i);
-                let layer_type = if is_full {
-                    LayerType::Full
-                } else {
-                    LayerType::Sliding
-                };
-                let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
-                    layer_type,
-                    self.config.sliding_window,
-                    self.config.max_position_embeddings,
-                    max_slots as usize,
-                );
-                let buf = alloc_multi_seq_hybrid_kv_for_layer(
-                    dev, i, nkv, hd, capacity, is_ring, max_slots,
-                )
-                .with_context(|| {
-                    format!(
-                        "ADR-040 iter-C2c-cont: alloc_multi_seq_hybrid_kv_for_layer \
-                         L{i} failed for max_slots={max_slots} (nkv={nkv}, hd={hd}, \
-                         cap={capacity}, is_ring={is_ring}) — production-default \
-                         hybrid F16-K + TQ-HB-V regime per H10 falsification §6.1.11"
-                    )
-                })?;
-                multi_seq_hybrid.push(buf);
-            }
-            self.multi_seq_kv_hybrid = Some(multi_seq_hybrid);
-        }
-        // else: HF2Q_HYBRID_KV=0 → leave multi_seq_kv_hybrid = None
-        // (constructor default).  iter-2A dispatch fork's hybrid_kv
-        // branch is unreachable in this configuration — the opt-out
-        // HB-encoded branch handles the request via multi_seq_kv.
-
-        // ── Phase 3: Dense F32 KV scaffold (iter-C2c-cont-cont, §6.1.46) ──
-        //
-        // Provisioned IFF the dense F32 env regime is engaged.
-        // `INVESTIGATION_ENV.use_dense` is a LazyLock read once at
-        // process start; matches the env-read discipline at the
-        // iter-2D dispatch fork in `forward_prefill.rs` + the legacy
-        // alloc site at `forward_prefill.rs:621-622`.  If the env is
-        // off, we leave `multi_seq_kv_dense = None` (H188 negative-arm
-        // pin) — the iter-2D dispatch-fork branch is unreachable.
-        //
-        // Dtype choice mirrors the legacy site: F16 when HF2Q_F16_KV=1,
-        // F32 otherwise (the LCP path's KV dtype invariant per ADR-017
-        // Phase E.a iter-3.5a).
-        if crate::debug::INVESTIGATION_ENV.use_dense {
-            let kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
-                mlx_native::DType::F16
-            } else {
-                mlx_native::DType::F32
-            };
-            let mut multi_seq_dense: Vec<
-                crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers,
-            > = Vec::with_capacity(num_layers);
-            for i in 0..num_layers {
-                let hd = self.config.head_dim_for_layer(i);
-                let nkv = self.config.num_kv_heads_for_layer(i);
-                let is_full = self.config.is_full_attention(i);
-                let layer_type = if is_full {
-                    LayerType::Full
-                } else {
-                    LayerType::Sliding
-                };
-                let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
-                    layer_type,
-                    self.config.sliding_window,
-                    self.config.max_position_embeddings,
-                    max_slots as usize,
-                );
-                let buf = alloc_multi_seq_dense_kv_for_layer(
-                    dev, i, nkv, hd, capacity, is_ring, kv_dtype, max_slots,
-                )
-                .with_context(|| {
-                    format!(
-                        "ADR-040 iter-C2c-cont-cont: alloc_multi_seq_dense_kv_for_layer \
-                         L{i} failed for max_slots={max_slots} (nkv={nkv}, hd={hd}, \
-                         cap={capacity}, is_ring={is_ring}, dtype={:?}) — \
-                         HF2Q_USE_DENSE=1 opt-in pre-default surface per §6.1.46",
-                        kv_dtype,
-                    )
-                })?;
-                multi_seq_dense.push(buf);
-            }
-            self.multi_seq_kv_dense = Some(multi_seq_dense);
-        }
-        // else: HF2Q_USE_DENSE=0 → leave multi_seq_kv_dense = None.
-
-        // ── Phase 4: Legacy 4-bit MlxKvCache scaffold (iter-C2c-cont-cont, §6.1.46) ──
-        //
-        // Provisioned IFF HF2Q_TQ_CODEBOOK_BITS=4 is engaged.  Mirror
-        // of Phase 1's env-read discipline applied to the cb_bits gate.
-        // `norms_per_pos = (hd / 256).max(1)` matches the legacy alloc
-        // site at `gemma4/model.rs:1273`.
-        let cb_bits_provision =
-            crate::serve::api::tq_packed_descriptor::effective_gemma_tq_codebook_bits();
-        if cb_bits_provision == 0 {
-            let mut multi_seq_mlx: Vec<
-                crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache,
-            > = Vec::with_capacity(num_layers);
-            for i in 0..num_layers {
-                let hd = self.config.head_dim_for_layer(i);
-                let nkv = self.config.num_kv_heads_for_layer(i);
-                let is_full = self.config.is_full_attention(i);
-                let layer_type = if is_full {
-                    LayerType::Full
-                } else {
-                    LayerType::Sliding
-                };
-                let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
-                    layer_type,
-                    self.config.sliding_window,
-                    self.config.max_position_embeddings,
-                    max_slots as usize,
-                );
-                let norms_per_pos = (hd / 256).max(1);
-                let buf = alloc_multi_seq_mlx_kv_for_layer(
-                    dev,
-                    i,
-                    nkv,
-                    hd,
-                    capacity,
-                    is_ring,
-                    norms_per_pos,
-                    max_slots,
-                )
-                .with_context(|| {
-                    format!(
-                        "ADR-040 iter-C2c-cont-cont: alloc_multi_seq_mlx_kv_for_layer \
-                         L{i} failed for max_slots={max_slots} (nkv={nkv}, hd={hd}, \
-                         cap={capacity}, is_ring={is_ring}, norms_per_pos={norms_per_pos}) \
-                         — HF2Q_TQ_CODEBOOK_BITS=4 opt-in pre-default surface per §6.1.46"
-                    )
-                })?;
-                multi_seq_mlx.push(buf);
-            }
-            self.multi_seq_kv_mlx = Some(multi_seq_mlx);
-        }
-        // else: HF2Q_TQ_CODEBOOK_BITS != "4" → leave multi_seq_kv_mlx = None.
-
-        Ok(())
+        plan.execute(
+            |slot| {
+                Ok(match slot.phase {
+                    Phase::Hb => Allocated::Hb(alloc_hb_kv_for_layer_from_plan(&device, slot)?),
+                    Phase::Hybrid => Allocated::Hybrid(
+                        alloc_multi_seq_hybrid_kv_for_layer_from_plan(&device, slot)?,
+                    ),
+                    Phase::Dense => Allocated::Dense(alloc_multi_seq_dense_kv_for_layer_from_plan(
+                        &device, slot,
+                    )?),
+                    Phase::Nibble => Allocated::Nibble(alloc_multi_seq_mlx_kv_for_layer_from_plan(
+                        &device, slot,
+                    )?),
+                })
+            },
+            |phase, values| {
+                // Publish only a fully allocated phase. Disabled phases never
+                // enter this closure, retaining any previously installed field.
+                match phase {
+                    Phase::Hb => {
+                        self.multi_seq_kv = Some(
+                            values
+                                .into_iter()
+                                .map(|v| match v {
+                                    Allocated::Hb(value) => value,
+                                    _ => unreachable!("HB plan phase"),
+                                })
+                                .collect(),
+                        )
+                    }
+                    Phase::Hybrid => {
+                        self.multi_seq_kv_hybrid = Some(
+                            values
+                                .into_iter()
+                                .map(|v| match v {
+                                    Allocated::Hybrid(value) => value,
+                                    _ => unreachable!("hybrid plan phase"),
+                                })
+                                .collect(),
+                        )
+                    }
+                    Phase::Dense => {
+                        self.multi_seq_kv_dense = Some(
+                            values
+                                .into_iter()
+                                .map(|v| match v {
+                                    Allocated::Dense(value) => value,
+                                    _ => unreachable!("dense plan phase"),
+                                })
+                                .collect(),
+                        )
+                    }
+                    Phase::Nibble => {
+                        self.multi_seq_kv_mlx = Some(
+                            values
+                                .into_iter()
+                                .map(|v| match v {
+                                    Allocated::Nibble(value) => value,
+                                    _ => unreachable!("nibble plan phase"),
+                                })
+                                .collect(),
+                        )
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 }
 
