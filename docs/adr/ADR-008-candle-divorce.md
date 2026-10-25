@@ -592,3 +592,7 @@ Cargo.toml               — remove all candle deps and features
 - **GGUF writing** — hf2q's `convert` command writes GGUF via its own backend (`src/backends/gguf.rs`), which doesn't use candle. No change needed.
 - **Prefill optimization** — prefill is per-token in the mlx-native path. Batched prefill is a separate optimization.
 - **Performance parity with llama.cpp** — this ADR removes candle. Closing the remaining speed gap is separate engineering work.
+
+### 2026-10-25: published native 0.15.4 dependency successor
+
+The exact registry pin advances to 0.15.4 after clean-merge/public-archive identity and bounded public controls were independently accepted. The [dated adoption record](../research/adr063-native-0154-registry-adoption-2026-10-25.md) separates native publication evidence from fresh linked downstream validation and integration gates. Earlier audits and 0.15.2/0.15.3 measurements retain their original identities; this pin does not install the optional root authority or qualify model performance/admission.

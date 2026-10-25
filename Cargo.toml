@@ -170,8 +170,8 @@ thiserror = "2"
 # evidence reads, typed resolved-dispatch traces, exact Q4_K inference, and
 # direct packed Q5_K/Q6_K embedding gathers and deterministic lowest-index
 # argmax tie handling, native BF16 GGUF/dense/expert execution, and sticky
-# expert-ID validation use the published mlx-native 0.15.3 contract.
-mlx-native = "=0.15.3"
+# expert-ID validation use the published mlx-native 0.15.4 contract.
+mlx-native = "=0.15.4"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
