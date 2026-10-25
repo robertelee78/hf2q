@@ -1964,3 +1964,7 @@ transformation's name.
 Full production auto quantization is not claimed by Phase A. The remaining
 work is measurable engineering—artifact ownership, kernel routing,
 calibration, and real-model evidence—not an unresolved conceptual dependency.
+
+### 2026-10-25: published native 0.15.4 dependency successor
+
+The exact registry pin advances to 0.15.4 after clean-merge/public-archive identity and bounded public controls were independently accepted. The [dated adoption record](../research/adr063-native-0154-registry-adoption-2026-10-25.md) separates native publication evidence from fresh linked downstream validation and integration gates. Earlier audits and 0.15.2/0.15.3 measurements retain their original identities; this pin does not install the optional root authority or qualify model performance/admission.
