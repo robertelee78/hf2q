@@ -17,6 +17,7 @@ use mlx_native::ops::deepseek_moe_routing::{
 };
 use mlx_native::{DType, GraphExecutor, IdMmScratch, MlxBuffer, MM_ID_ROUTING_THRESHOLD};
 
+use super::prefill_annotations;
 use super::forward_support::{
     alloc, alloc_host_input, alloc_persistent, expert_matmul, expert_matmul_pair, raw_matmul,
     rms_params, ExpertMatmulRoute,
@@ -267,8 +268,8 @@ impl Deepseek4Model {
 
         let registry = &mut self.ctx.registry;
         let mut encode = |session: &mut GraphSession<'_>| -> Result<()> {
-            session.barrier_between(&[&state_flat], &[&state_norm]);
-            session.rms_norm_no_scale_f32(
+            prefill_annotations::rms_norm_no_scale_f32(
+                session,
                 registry,
                 device.metal_device(),
                 &state_flat,
@@ -313,8 +314,8 @@ impl Deepseek4Model {
                 rows_u32,
                 hidden as u32,
             )?;
-            session.barrier_between(&[&ffn_input, ffn_norm_weight], &[&ffn_norm]);
-            session.rms_norm(
+            prefill_annotations::rms_norm(
+                session,
                 registry,
                 device.metal_device(),
                 &ffn_input,

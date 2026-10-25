@@ -12,6 +12,7 @@ use mlx_native::ops::deepseek_tail_rope::{
 use mlx_native::ops::elementwise::dispatch_cast_bf16_to_f32_with_encoder;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
+use super::prefill_annotations;
 use super::attention_weights::AttentionWeightsRef;
 use super::forward_support::{
     alloc, grouped_output_a, grouped_output_a_batched, raw_matmul, rms_params,
@@ -197,8 +198,8 @@ pub(super) fn encode_compressed_attention_prelude(
     let q_rank = cfg.q_lora_rank as usize;
     let rows_u32 = rows as u32;
     let state_flat = state.with_shape(vec![rows, hc_hidden])?;
-    session.barrier_between(&[&state_flat], &[&arena.state_norm]);
-    session.rms_norm_no_scale_f32(
+    prefill_annotations::rms_norm_no_scale_f32(
+        session,
         registry,
         device.metal_device(),
         &state_flat,
@@ -246,8 +247,8 @@ pub(super) fn encode_compressed_attention_prelude(
         rows_u32,
         hidden as u32,
     )?;
-    session.barrier_between(&[&arena.attn_input, weights.attn_norm], &[&arena.attn_norm]);
-    session.rms_norm(
+    prefill_annotations::rms_norm(
+        session,
         registry,
         device.metal_device(),
         &arena.attn_input,
@@ -281,8 +282,8 @@ pub(super) fn encode_compressed_attention_prelude(
         hidden,
         "compressed shared KV",
     )?;
-    session.barrier_between(&[&arena.q_a, weights.q_a_norm], &[&arena.q_a_norm]);
-    session.rms_norm(
+    prefill_annotations::rms_norm(
+        session,
         registry,
         device.metal_device(),
         &arena.q_a,
@@ -304,8 +305,8 @@ pub(super) fn encode_compressed_attention_prelude(
         q_rank,
         "compressed query B",
     )?;
-    session.barrier_between(&[&arena.q], &[&arena.q_norm]);
-    session.rms_norm_no_scale_f32(
+    prefill_annotations::rms_norm_no_scale_f32(
+        session,
         registry,
         device.metal_device(),
         &arena.q,
@@ -314,8 +315,8 @@ pub(super) fn encode_compressed_attention_prelude(
         (rows * heads) as u32,
         head_dim as u32,
     )?;
-    session.barrier_between(&[&arena.kv, weights.kv_norm], &[&arena.kv_norm]);
-    session.rms_norm(
+    prefill_annotations::rms_norm(
+        session,
         registry,
         device.metal_device(),
         &arena.kv,
