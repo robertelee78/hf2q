@@ -303,6 +303,7 @@ an explicit acknowledgment: `HF2Q_UNSAFE_EXPERIMENTS=1`.
 
 | Var | Unsafe-ack | Purpose |
 |---|---|---|
+| `HF2Q_QWEN_POOL_GROWTH_PROFILE=adr063-24g-v1` | **required** | Optional fixed Qwen native scratch-pool creation quota; default legacy unchanged. Requested invalid/unacknowledged/unsupported startup fails rather than serving uncapped. Text/tools only, 1–4 SlotAware slots, one worker/generation. Sticky refusal prevents ordinary replay/reuse. This is an enforcing domain policy, not whole-memory/model/performance admission; see operator-env-vars.md. |
 | `HF2Q_LMHEAD_RERANK=0` | **required** | Measure raw Q8 argmax cost. Reintroduces the rare near-tiebreak flip (observed as mid-decode `<pad>` emission). |
 | `HF2Q_CHUNK_SCAN_PREFILL=1` | **required** | Wave 5b iter 5 opt-in: route Qwen3.6 prefills at `seq_len > 64` through the mlx-native chunk-parallel delta-rule pipeline (`mlx_native::ops::chunk_gated_delta_rule::dispatch_chunk_gated_delta_rule_fwd`). This is a performance experiment distinct from the production autoregressive path. Decode parity ±5% (AC 5468) and walk-bar parity at pp4096+ (W-5b.3) are required before this experimental kernel can become Category 1. |
 
