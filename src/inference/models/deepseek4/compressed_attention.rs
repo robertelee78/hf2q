@@ -16,10 +16,6 @@ use mlx_native::ops::deepseek_tail_rope::{
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy;
 use mlx_native::{DType, GraphExecutor, MlxBuffer, MlxDevice};
 
-use super::attention::{
-    append_prefill_window_indices, compressed_attention_index_plan, compressed_indices,
-    window_indices,
-};
 use super::cache::{CacheSpan, Deepseek4Cache};
 use super::compressed_attention_common::{
     encode_compressed_attention_epilogue, encode_compressed_attention_prelude,
@@ -240,6 +236,19 @@ impl Deepseek4Model {
             .map(|span| span.compressed_valid_after)
             .or_else(|| layer_step.map(|step| step.compressed_valid_after))
             .unwrap_or(0);
+        let layout = super::compressed_attention_indexer::layout::prepare_layout(
+            ratio, rows, start_position, graft, window_capacity, valid_compressed,
+            self.cfg.index_top_k as usize, prefill_span.is_some(),
+        )?;
+        let selection = (ratio == 4).then(|| {
+            super::compressed_attention_indexer::selection::SelectionRequest::new(
+                &self.cfg, rows, start_position, valid_compressed,
+                layout.compressed_attention_offset.checked_add(graft)
+                    .context("DeepSeek-V4 indexer offset overflow")?,
+                layout.storage_stride,
+                layout.indexer_output_offset.context("ratio-four output offset missing")?,
+            )
+        }).transpose()?;
         let core = CompressedAttentionCoreArena::new(&device, &self.cfg, rows)?;
         let main_compressor =
             MainCompressorArena::new(&device, &self.cfg, ratio, rows, compressed_count)?;
@@ -250,7 +259,7 @@ impl Deepseek4Model {
                     &self.cfg,
                     rows,
                     compressed_count,
-                    valid_compressed,
+                    selection.as_ref().context("ratio-four selection missing")?,
                 )
             })
             .transpose()?;
@@ -273,18 +282,9 @@ impl Deepseek4Model {
             "compressed sparse attention",
         )?;
         let physical_kv_len = window_capacity + compressed_capacity;
-        let raw_prefix_len =
-            usize::from(use_matrix_prefill && start_position > 0) * window_capacity;
-        let compact_raw_kv_len = raw_prefix_len + rows;
-        // The compact compressed span holds graft rows then real rows, so
-        // the compact KV length spans both (`compressed_len` in the prefill
-        // flash adapters derives from this).
-        let compact_prefill_kv_len = compact_raw_kv_len + graft + valid_compressed;
-        let compressed_attention_offset = if use_matrix_prefill {
-            compact_raw_kv_len
-        } else {
-            window_capacity
-        };
+        let raw_prefix_len = layout.raw_prefix_len;
+        let compact_raw_kv_len = layout.compact_raw_kv_len;
+        let compact_prefill_kv_len = layout.compact_prefill_kv_len;
         let raw_prefix = (raw_prefix_len > 0)
             .then(|| {
                 alloc(
@@ -345,80 +345,9 @@ impl Deepseek4Model {
             .as_logical_mut_slice::<f32>()?
             .copy_from_slice(&frequencies);
 
-        let (index_storage, storage_stride, attention_width, indexer_output_offset) =
-            if prefill_span.is_some() {
-                let window = if raw_prefix_len > 0 {
-                    append_prefill_window_indices(window_capacity, rows, start_position)?
-                } else {
-                    window_indices(window_capacity, rows, start_position)?
-                };
-                // ADR-059 #308: fabricated graft rows index BETWEEN the
-                // window and the compressed series (ratio 128) or the
-                // ratio-4 indexer output region (the indexer kernel writes
-                // its top-k slots at `indexer_output_offset`, past the
-                // graft block, so the graft indices survive it).
-                let tail_width = if ratio == 4 {
-                    self.cfg.index_top_k as usize
-                } else {
-                    graft + valid_compressed
-                };
-                let raw_index_width = window
-                    .first()
-                    .map(Vec::len)
-                    .context("DeepSeek-V4 append window index row missing")?;
-                let width = raw_index_width + graft + tail_width;
-                let mut storage = vec![-1_i32; rows * width];
-                let compressed = (ratio == 128)
-                    .then(|| {
-                        compressed_indices(
-                            ratio as usize,
-                            rows,
-                            start_position,
-                            compressed_attention_offset,
-                            graft,
-                        )
-                    })
-                    .transpose()?;
-                for query in 0..rows {
-                    let row = &mut storage[query * width..(query + 1) * width];
-                    row[..raw_index_width].copy_from_slice(&window[query]);
-                    if ratio == 4 {
-                        // The ratio-4 tail is the indexer output region
-                        // (filled by the lightning indexer kernel): the
-                        // graft block is planted here, ahead of it.
-                        for slot in 0..graft {
-                            row[raw_index_width + slot] =
-                                (compressed_attention_offset + slot) as i32;
-                        }
-                    }
-                    // ratio-128: `compressed_indices` already emits the
-                    // graft block then the shifted real completed groups.
-                    if let Some(compressed) = compressed.as_ref() {
-                        row[raw_index_width + graft..].copy_from_slice(&compressed[query]);
-                    }
-                }
-                (
-                    storage,
-                    width,
-                    width,
-                    (ratio == 4).then_some(raw_index_width + graft),
-                )
-            } else {
-                let plan = compressed_attention_index_plan(
-                    ratio as usize,
-                    window_capacity,
-                    self.cfg.index_top_k as usize,
-                    start_position,
-                    graft,
-                )?;
-                let storage_stride = plan.storage.len();
-                (
-                    plan.storage,
-                    storage_stride,
-                    plan.attention_width,
-                    plan.indexer_output_offset,
-                )
-            };
+        let super::compressed_attention_indexer::layout::AttentionLayout {
+            index_storage, storage_stride, attention_width, indexer_output_offset, ..
+        } = layout;
         let mut indices = alloc_host_input(
             &device,
             DType::I32,
@@ -588,7 +517,7 @@ impl Deepseek4Model {
                 &weights.compressor,
                 &main_compressor,
             )?;
-            if let (Some(indexer_weights), Some(indexer_arena), Some(indexer_output_offset)) = (
+            if let (Some(indexer_weights), Some(indexer_arena), Some(_indexer_output_offset)) = (
                 weights.indexer.as_ref(),
                 indexer.as_ref(),
                 indexer_output_offset,
@@ -613,8 +542,7 @@ impl Deepseek4Model {
                         .or_else(|| layer_step.and_then(|step| step.indexer_write_slot))
                         .unwrap_or(0),
                     compressed_count,
-                    valid_compressed,
-                    compressed_attention_offset + graft,
+                    selection.as_ref().context("ratio-four selection missing")?,
                     layer_cache,
                     &core.attn_norm,
                     &core.q_a_norm,
@@ -624,8 +552,6 @@ impl Deepseek4Model {
                     indexer_weights,
                     indexer_arena,
                     &indices,
-                    storage_stride,
-                    indexer_output_offset,
                 )?;
             }
             if profile_stages {

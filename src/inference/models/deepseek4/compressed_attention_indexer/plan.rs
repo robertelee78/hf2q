@@ -1,7 +1,7 @@
 //! Checked requested payload for one existing ratio-four indexer arena.
 //! Pool bucket bytes are a separate projection, never total physical memory.
+use super::selection::SelectionRequest;
 use anyhow::{ensure, Context, Result};
-use mlx_native::ops::deepseek_indexer::deepseek_indexer_topk_scratch_elements;
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
 use super::super::forward_support::alloc;
@@ -44,8 +44,14 @@ impl IndexerBufferPlan {
     }
 
     pub(crate) fn allocate(self, device: &MlxDevice) -> Result<MlxBuffer> {
+        self.allocate_with(|dtype, shape, label| alloc(device, dtype, shape, label))
+    }
+    pub(crate) fn allocate_with<T>(
+        self,
+        allocate: impl FnOnce(DType, Vec<usize>, &'static str) -> Result<T>,
+    ) -> Result<T> {
         debug_assert!(self.requested_bytes <= self.pooled_bucket_bytes);
-        alloc(device, self.dtype, self.shape, self.label)
+        allocate(self.dtype, self.shape, self.label)
     }
 }
 
@@ -70,13 +76,13 @@ fn totals(buffers: &[IndexerBufferPlan]) -> Result<(usize, usize)> {
 }
 
 impl RatioFourIndexerPlan {
-    /// Pure shapes for the original constructor arguments; no context/chunk
-    /// admission policy or new model dimension ceiling is imposed here.
+    /// Checked shapes for the actual immutable selection request; no context
+    /// admission policy or smaller transaction is introduced.
     pub(crate) fn new(
         cfg: &Deepseek4Config,
         rows: usize,
         compressed_output_count: usize,
-        valid_compressed: usize,
+        selection: &SelectionRequest,
     ) -> Result<Self> {
         let heads = cfg.index_num_heads as usize;
         let dim = cfg.index_head_dim as usize;
@@ -88,13 +94,13 @@ impl RatioFourIndexerPlan {
             .checked_mul(2)
             .context("DeepSeek-V4 indexer projected width overflow")?;
         let output_rows = compressed_output_count.max(1);
-        let valid = valid_compressed.max(1);
-        // Reuse the dispatch's native checked top-k workspace formula.
-        let elements = deepseek_indexer_topk_scratch_elements(1, rows, valid)?;
         ensure!(
-            elements % rows == 0,
-            "DeepSeek-V4 indexer top-k row stride is not integral"
+            selection.params.query_len as usize == rows
+                && selection.params.heads as usize == heads
+                && selection.params.head_dim as usize == dim,
+            "DeepSeek-V4 indexer plan/request geometry mismatch"
         );
+        let [score, topk] = workspace_buffers(selection)?;
         let buffers = [
             IndexerBufferPlan::new(DType::F32, vec![1, rows, heads, dim], "index query f32")?,
             IndexerBufferPlan::new(DType::BF16, vec![1, rows, heads, dim], "index query bf16")?,
@@ -116,12 +122,8 @@ impl RatioFourIndexerPlan {
                 vec![1, output_rows, 1, dim],
                 "index compressor rotated output",
             )?,
-            IndexerBufferPlan::new(DType::F32, vec![1, rows, valid], "index score scratch")?,
-            IndexerBufferPlan::new(
-                DType::I32,
-                vec![1, rows, elements / rows],
-                "index top-k scratch",
-            )?,
+            score,
+            topk,
         ];
         let (requested_bytes, pooled_bucket_bytes) = totals(&buffers)?;
         Ok(Self {
@@ -131,8 +133,31 @@ impl RatioFourIndexerPlan {
         })
     }
 
-    pub(crate) fn into_buffers(self) -> [IndexerBufferPlan; 10] {
+    pub(crate) fn allocate_with<T>(
+        self,
+        mut allocate: impl FnMut(IndexerBufferPlan) -> Result<T>,
+    ) -> Result<[T; 10]> {
         debug_assert!(self.requested_bytes <= self.pooled_bucket_bytes);
-        self.buffers
+        let [a, b, c, d, e, f, g, h, i, j] = self.buffers;
+        Ok([
+            allocate(a)?,
+            allocate(b)?,
+            allocate(c)?,
+            allocate(d)?,
+            allocate(e)?,
+            allocate(f)?,
+            allocate(g)?,
+            allocate(h)?,
+            allocate(i)?,
+            allocate(j)?,
+        ])
     }
+}
+
+pub(crate) fn workspace_buffers(request: &SelectionRequest) -> Result<[IndexerBufferPlan; 2]> {
+    let (score, topk) = request.workspace_shapes()?;
+    Ok([
+        IndexerBufferPlan::new(DType::F32, score, "index score scratch")?,
+        IndexerBufferPlan::new(DType::I32, topk, "index top-k scratch")?,
+    ])
 }

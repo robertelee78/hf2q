@@ -3,22 +3,24 @@
 use anyhow::{Context, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::deepseek_activation_quant::dispatch_deepseek_hadamard_mxfp4_bf16;
-use mlx_native::ops::deepseek_indexer::{
-    dispatch_deepseek_indexer_into_mma, DeepSeekIndexerParams, DEEPSEEK_INDEXER_TOP_K,
-};
 use mlx_native::ops::deepseek_tail_rope::DeepSeekTailRopeParams;
 use mlx_native::ops::elementwise::scalar_mul_f32;
 use mlx_native::{KernelRegistry, MlxBuffer, MlxDevice};
 
-use super::prefill_annotations;
 use super::cache::LayerCache;
-use super::compressor_tail::{encode_indexer_tail, CompressorTail};
 use super::compressed_attention_weights::IndexerWeightsRef;
+use super::compressor_tail::{encode_indexer_tail, CompressorTail};
 use super::forward_support::raw_matmul;
+use super::prefill_annotations;
 use super::Deepseek4Config;
 
+pub(super) mod layout;
 pub(super) mod plan;
+pub(super) mod selection;
+#[cfg(test)]
+mod selection_tests;
 use plan::RatioFourIndexerPlan;
+use selection::{encode_selection, SelectionRequest};
 
 pub(super) struct RatioFourIndexerArena {
     query_f32: MlxBuffer,
@@ -39,22 +41,22 @@ impl RatioFourIndexerArena {
         cfg: &Deepseek4Config,
         rows: usize,
         compressed_output_count: usize,
-        valid_compressed: usize,
+        selection: &SelectionRequest,
     ) -> Result<Self> {
         let [query_f32, query_bf16, weights, scaled_weights, compressor_kv, compressor_score, compressor_output, compressor_rope, score_scratch, topk_scratch] =
-            RatioFourIndexerPlan::new(cfg, rows, compressed_output_count, valid_compressed)?
-                .into_buffers();
+            RatioFourIndexerPlan::new(cfg, rows, compressed_output_count, selection)?
+                .allocate_with(|buffer| buffer.allocate(device))?;
         Ok(Self {
-            query_f32: query_f32.allocate(device)?,
-            query_bf16: query_bf16.allocate(device)?,
-            weights: weights.allocate(device)?,
-            scaled_weights: scaled_weights.allocate(device)?,
-            compressor_kv: compressor_kv.allocate(device)?,
-            compressor_score: compressor_score.allocate(device)?,
-            compressor_output: compressor_output.allocate(device)?,
-            compressor_rope: compressor_rope.allocate(device)?,
-            score_scratch: score_scratch.allocate(device)?,
-            topk_scratch: topk_scratch.allocate(device)?,
+            query_f32,
+            query_bf16,
+            weights,
+            scaled_weights,
+            compressor_kv,
+            compressor_score,
+            compressor_output,
+            compressor_rope,
+            score_scratch,
+            topk_scratch,
         })
     }
 }
@@ -69,8 +71,7 @@ pub(super) fn encode_ratio_four_indexer(
     position: usize,
     compressed_write_start: usize,
     compressed_output_count: usize,
-    valid_compressed: usize,
-    attention_kv_offset: usize,
+    selection: &SelectionRequest,
     layer_cache: &LayerCache,
     attn_norm: &MlxBuffer,
     query_rank: &MlxBuffer,
@@ -80,8 +81,6 @@ pub(super) fn encode_ratio_four_indexer(
     weights: &IndexerWeightsRef<'_>,
     arena: &RatioFourIndexerArena,
     output_indices: &MlxBuffer,
-    output_row_stride: usize,
-    output_column_offset: usize,
 ) -> Result<()> {
     let hidden = cfg.hidden_size as usize;
     let q_rank = cfg.q_lora_rank as usize;
@@ -185,51 +184,42 @@ pub(super) fn encode_ratio_four_indexer(
         rows * heads,
         1.0 / ((dim * heads) as f32).sqrt(),
     )?;
-    encode_indexer_tail(session, registry, device, cfg, rows, position,
-        compressed_write_start, compressed_output_count, cache, cache_capacity, kv_state, score_state,
-        &CompressorTail { kv: &arena.compressor_kv, score: &arena.compressor_score,
-            output: &arena.compressor_output, rope: &arena.compressor_rope,
-            ape: weights.compressor.ape, norm: weights.compressor.norm },
-        compressed_positions, frequencies)?;
+    encode_indexer_tail(
+        session,
+        registry,
+        device,
+        cfg,
+        rows,
+        position,
+        compressed_write_start,
+        compressed_output_count,
+        cache,
+        cache_capacity,
+        kv_state,
+        score_state,
+        &CompressorTail {
+            kv: &arena.compressor_kv,
+            score: &arena.compressor_score,
+            output: &arena.compressor_output,
+            rope: &arena.compressor_rope,
+            ape: weights.compressor.ape,
+            norm: weights.compressor.norm,
+        },
+        compressed_positions,
+        frequencies,
+    )?;
 
-    let valid = valid_compressed;
-    if valid > 0 {
-        let cache_view = cache
-            .slice_view(0, valid * dim)
-            .with_shape(vec![1, valid, dim])?;
-        let scratch = arena
-            .score_scratch
-            .slice_view(0, rows * valid)
-            .with_shape(vec![1, rows, valid])?;
-        session.barrier_between(
-            &[&arena.query_bf16, &cache_view, &arena.scaled_weights],
-            &[&scratch, output_indices],
-        );
-        dispatch_deepseek_indexer_into_mma(
-            session.encoder_mut(),
-            registry,
-            device,
-            &arena.query_bf16,
-            &cache_view,
-            &arena.scaled_weights,
-            &scratch,
-            &arena.topk_scratch,
-            output_indices,
-            output_row_stride,
-            output_column_offset,
-            &DeepSeekIndexerParams {
-                batch: 1,
-                query_len: rows as u32,
-                kv_len: valid as u32,
-                start_pos: position as u32,
-                ratio: 4,
-                heads: heads as u32,
-                head_dim: dim as u32,
-                top_k: DEEPSEEK_INDEXER_TOP_K as u32,
-                offset: i32::try_from(attention_kv_offset)
-                    .context("DeepSeek-V4 indexer attention offset exceeds i32")?,
-            },
-        )?;
-    }
+    encode_selection(
+        session,
+        registry,
+        device,
+        selection,
+        &arena.query_bf16,
+        cache,
+        &arena.scaled_weights,
+        &arena.score_scratch,
+        &arena.topk_scratch,
+        output_indices,
+    )?;
     Ok(())
 }
