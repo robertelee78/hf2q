@@ -62,9 +62,9 @@ dependencies = [
 
 [[package]]
 name = "mlx-native"
-version = "0.15.2"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e09c782f1b774876674d04c15f03fae2f81b58dfe6401aba87153dcbe9d3a3a4"
+checksum = "edd1820a5e05694d8567b23159bcec950e117f863f7438eda8d6c143b615d54c"
 LOCK
 
 jq -n --arg workspace_root "$package_root" \
@@ -77,12 +77,12 @@ jq -n --arg workspace_root "$package_root" \
         dependencies:[{
           name:"mlx-native",
           source:"registry+https://github.com/rust-lang/crates.io-index",
-          req:"=0.15.2"
+          req:"=0.15.3"
         }]
       },
       {
         name:"mlx-native",
-        version:"0.15.2",
+        version:"0.15.3",
         source:"registry+https://github.com/rust-lang/crates.io-index",
         dependencies:[]
       }
@@ -97,7 +97,7 @@ bash "$VERIFIER" verify "$evidence" "$package_root/Cargo.lock"
 
 wrong_checksum="$scratch/wrong-checksum"
 cp -R "$evidence" "$wrong_checksum"
-awk '{gsub(/e09c782f1b774876674d04c15f03fae2f81b58dfe6401aba87153dcbe9d3a3a4/, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}1' \
+awk '{gsub(/edd1820a5e05694d8567b23159bcec950e117f863f7438eda8d6c143b615d54c/, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}1' \
   "$wrong_checksum/Cargo.lock" > "$wrong_checksum/Cargo.lock.tmp"
 mv "$wrong_checksum/Cargo.lock.tmp" "$wrong_checksum/Cargo.lock"
 expect_failure "verifier accepted a substituted mlx-native checksum" \

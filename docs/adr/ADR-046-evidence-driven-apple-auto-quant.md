@@ -13,6 +13,10 @@
   record](../research/adr063-native-0152-registry-adoption-2026-10-24.md).
   The 0.15.1 capability/affine audit below remains bound to its original source;
   no selector, Phase C, real-model, memory-admission or speed claim is added.
+- Dependency succession, 2026-10-25: current source pins published `mlx-native = 0.15.3`;
+  see the separate [registry adoption record](../research/adr063-native-0153-registry-adoption-2026-10-25.md).
+  Prior 0.15.1 audit and 0.15.2 adoption evidence retain their original identities.
+  No new selector/API adoption, Phase C, model speed or admission is implied.
 - Previous update: 2026-08-21 — the then-current release boundary pinned exact
   published `mlx-native = 0.11.1`, including direct execution of packed Q5_K/Q6_K
   embedding rows; the first official source-teacher gate below remains
