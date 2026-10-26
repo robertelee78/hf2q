@@ -56809,6 +56809,8 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
                 .expect("H222: spawn_inner_with_slot_aware sibling not found")
             + "    fn spawn_inner_with_slot_aware".len();
         let body = &src[body_start..body_end];
+        let dispatch = body.find("match mode {\n").expect("H222: mode dispatch table");
+        let body = &body[dispatch..];
         let serial_fifo_idx = body
             .find("EngineMode::SerialFifo")
             .expect("H222: SerialFifo arm not found in spawn_with_mode");
@@ -57088,6 +57090,8 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
                 .find("    fn spawn_inner_with_slot_aware")
                 .expect("H239: spawn_inner_with_slot_aware sibling not found");
         let body = &engine_src[body_start..body_end];
+        let dispatch = body.find("match mode {\n").expect("H239: mode dispatch table");
+        let body = &body[dispatch..];
         let serial_fifo_idx = body
             .find("EngineMode::SerialFifo")
             .expect("H239: SerialFifo arm not found");
