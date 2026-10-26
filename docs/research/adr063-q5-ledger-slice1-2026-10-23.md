@@ -18,10 +18,17 @@ Declared bounds require provenance and a formula revision; declared zero
 requires a reason and configuration evidence.
 
 Arithmetic uses checked byte counts. Shared Metal bytes are a subset of owned
-bytes, charged once on the host axis. Host ownership plus competition plus at
-least 12 GiB reserve must fit physical RAM; family ceilings and Metal working-set
-policy apply independently. DeepSeek cannot omit or exceed its existing 116 GiB
-ceiling. Explicit absence of an additional family ceiling differs from Unknown.
+bytes, charged once on the host axis. The current ADR063 dedicated-host policy
+replaces historical12GiB reserve/116GiB DeepSeek ceiling. The updated declared
+packet requires positive observation-age and in-flight-overshoot byte allowances,
+positive maximum observation-age/stop-latency times and nonempty evidence
+provenance. These numbers are caller claims, not calibrated observer evidence.
+Owned+competition+reaction must fit physical RAM. Competition is a nonnegative
+caller-declared aggregate; no cached-files-credit/refund field exists. Explicit
+absence of a source-justified family ceiling differs from Unknown; no family
+ceiling is invented from its name. MetalPolicy distinguishes explicitly selected
+Enforced policy from RecommendationOnly (recorded, not enforced as hardware cap),
+NoneWithInventory and Unknown. Unknown/missing provenance rejects.
 Artifact, workload and transition identities plus the complete expected shape
 must match; a caller cannot pass a smaller shape as the same frozen packet.
 
@@ -34,6 +41,8 @@ pure `&mut` state simulation, not a production global allocator or GPU callback.
 
 Receipts are serialization-only objects with fixed scope
 `caller_declared_model_free_projection_only` and `runtime_qualified=false`.
+Updated limit wire shape uses receipt schema `hf2q.memory-projection.v2`; old
+`reserve`/`working_set` fields are rejected, not silently reinterpreted.
 The trace peak is checked against aggregate declared capacity; there is no
 per-category root matching or external attestation. A caller can invent complete
 Bound claims and obtain a declared toy projection. That never proves the claims,
@@ -43,7 +52,7 @@ source-backed bounds supply evidence.
 
 ## Validation and remaining work
 
-`cargo test --locked --bin hf2q serve::memory_ledger` passes 19 model-free
+Historical first-slice `cargo test --locked --bin hf2q serve::memory_ledger` passed 19 model-free
 controls. They cover closed imports, boot and thread owners, anchor/persistence
 overlap, unknown and missing evidence, frozen shape/identity changes, arithmetic
 overflow and independent caps, retained parents after completion, four contending
@@ -58,3 +67,16 @@ scratch/transition functions, calibrated complete competition observations,
 external watchdog proof, actual runtime admission wiring and bounded real-model
 qualification remain required. The known process-observation gap and DeepSeek
 full-capacity policy rejection are not resolved by this library.
+
+## Available-RAM declared-policy followup (2026-10-26)
+
+Source candidate only; author has not built/run tests. Updated pure controls cover
+positive reaction/provenance, checked competition underflow/overflow, optional
+DeepSeek family inventory, explicit Metal recommendation versus selected policy,
+and rejected generic cached-file refund. Root must run the focused filter and
+regressions before acceptance. Old19-pass receipt remains historical. No runtime
+adapter, OS trust, freshness verification, global allocator/native enforcement or
+watchdog is added. A future trusted adapter must bind actual observation sources,
+coverage and age, observed stop latency/allocation overshoot, matching operating
+policy and family inventory before production admission; this module cannot
+certify those inputs or authorize a model load.
