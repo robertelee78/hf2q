@@ -43945,6 +43945,9 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
                 .expect("H28: spawn_inner_with_slot_aware sibling not found")
             + "    fn spawn_inner_with_slot_aware".len();
         let body = &src[body_start..body_end];
+        // Ignore preceding startup-validation matches: this is the dispatch.
+        let dispatch = body.find("match mode {\n").expect("H28: mode dispatch table");
+        let body = &body[dispatch..];
         let serial_fifo_idx = body
             .find("EngineMode::SerialFifo")
             .expect("H28: SerialFifo arm not found in spawn_with_mode");
@@ -50019,89 +50022,28 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
         );
     }
 
-    /// **H92 (skip-mode + runtime when MLX available)** — provisioning
-    /// honours `INVESTIGATION_ENV.hybrid_kv`:
-    /// - Source-grep: the body of
-    ///   `provision_multi_seq_kv_for_slot_aware` contains an
-    ///   `INVESTIGATION_ENV.hybrid_kv` gate around the
-    ///   `alloc_multi_seq_hybrid_kv_for_layer` call site.
-    /// - Source-grep: the `multi_seq_kv` (HB) scaffold is provisioned
-    ///   UNCONDITIONALLY (no env gate around `alloc_hb_kv_for_layer`).
-    /// - Source-grep: the `multi_seq_kv_hybrid` field is assigned
-    ///   `Some(_)` ONLY inside the env gate.
-    ///
-    /// Reasoning: the actual runtime semantic (Some/None per env) is
-    /// what we want to pin, but we can't construct a real
-    /// `GemmaLoadedModel` without loading a Gemma 4 GGUF (out of scope
-    /// per the CLAUDE.md "do not oom us" rule). The source-grep pin
-    /// catches the lexical structure that produces the runtime
-    /// semantic.
+    /// H92: production consumes checked descriptors and typed phase dispatch.
+    /// Runtime Hybrid ON/OFF, HB, disabled-field and failure semantics are
+    /// independently exercised by cache_scaffold_plan_tests.
     #[test]
     fn h92_hybrid_provisioning_gated_on_investigation_env_hybrid_kv() {
         let src = include_str!("engine.rs");
-        let fn_marker = "pub fn provision_multi_seq_kv_for_slot_aware(";
-        let fn_idx = src
-            .find(fn_marker)
-            .expect("H92: provision_multi_seq_kv_for_slot_aware not found");
-        // The fn body is large after iter-C2c-cont (~150 LOC); window
-        // to 12k chars to cover docstring + body.
-        let body_window = &src[fn_idx..(fn_idx + 12_000).min(src.len())];
-        // The hybrid allocator IS called.
-        assert!(
-            body_window.contains("alloc_multi_seq_hybrid_kv_for_layer("),
-            "H92 FALSIFIED: provision_multi_seq_kv_for_slot_aware body \
-             does NOT call `alloc_multi_seq_hybrid_kv_for_layer`. \
-             iter-C2c-cont production-default scaffold (per H10 \
-             falsification §6.1.11) is NOT provisioned."
-        );
-        // The hybrid allocator call is gated on INVESTIGATION_ENV.hybrid_kv.
-        let env_gate_marker = "INVESTIGATION_ENV.hybrid_kv";
-        let env_gate_idx = body_window.find(env_gate_marker).expect(
-            "H92 FALSIFIED: provision_multi_seq_kv_for_slot_aware body does \
-             NOT contain `INVESTIGATION_ENV.hybrid_kv` — the hybrid \
-             provisioning is unconditional (BREAKING H95: HF2Q_HYBRID_KV=0 \
-             must not allocate the hybrid scaffold).",
-        );
-        let alloc_idx = body_window
-            .find("alloc_multi_seq_hybrid_kv_for_layer(")
-            .expect("H92: alloc call present (asserted above)");
-        assert!(
-            env_gate_idx < alloc_idx,
-            "H92 FALSIFIED: `INVESTIGATION_ENV.hybrid_kv` does NOT \
-             lexically precede `alloc_multi_seq_hybrid_kv_for_layer` \
-             call. The env gate must wrap the alloc — without lexical \
-             ordering, the alloc is not gated and HF2Q_HYBRID_KV=0 \
-             would still allocate hybrid bytes."
-        );
-        // The HB allocator IS called UNCONDITIONALLY (not inside the
-        // env gate). Source-order check: HB alloc comes BEFORE the env
-        // gate in the fn body (Phase 1 always; Phase 2 conditional).
-        let hb_alloc_idx = body_window
-            .find("alloc_hb_kv_for_layer(")
-            .expect("H92: alloc_hb_kv_for_layer call present in fn body");
-        assert!(
-            hb_alloc_idx < env_gate_idx,
-            "H92 FALSIFIED: `alloc_hb_kv_for_layer` does NOT lexically \
-             precede `INVESTIGATION_ENV.hybrid_kv` env gate. C2c HB \
-             provisioning must be UNCONDITIONAL (H94 preserved); \
-             accidentally moving it inside the env gate would break \
-             the HF2Q_HYBRID_KV=0 path."
-        );
-        // The `multi_seq_kv_hybrid = Some(_)` assignment is inside the
-        // env-gated branch (positive: assignment present at all).
-        assert!(
-            body_window.contains("self.multi_seq_kv_hybrid = Some("),
-            "H92 FALSIFIED: provision_multi_seq_kv_for_slot_aware body \
-             does NOT assign `self.multi_seq_kv_hybrid = Some(_)`. The \
-             new field is never populated — iter-C2c-cont effectively \
-             unimplemented."
-        );
-        // Defense-in-depth: the C2c HB assignment is unchanged.
-        assert!(
-            body_window.contains("self.multi_seq_kv = Some("),
-            "H92 FALSIFIED: C2c assignment `self.multi_seq_kv = Some(_)` \
-             removed — H94 broken."
-        );
+        let start = src.find("pub fn provision_multi_seq_kv_for_slot_aware(")
+            .expect("H92: Gemma provisioning method");
+        let end = src[start..].find("impl LoadInfoBuilder for GemmaLoadedModel")
+            .expect("H92: provisioning impl boundary") + start;
+        let body = &src[start..end];
+        for marker in ["ScaffoldPlan::new(", "Modes::invocation()", "plan.execute(",
+            "Phase::Hb => Allocated::Hb(alloc_hb_kv_for_layer_from_plan(&device, slot)",
+            "Phase::Hybrid => Allocated::Hybrid(",
+            "alloc_multi_seq_hybrid_kv_for_layer_from_plan(&device, slot)",
+            "self.multi_seq_kv = Some(", "self.multi_seq_kv_hybrid = Some("] {
+            assert!(body.contains(marker), "H92: planned allocator/publication missing {marker}");
+        }
+        let plan = include_str!("../../inference/models/gemma4/cache_scaffold_plan.rs");
+        assert!(plan.contains("hybrid: env.hybrid_kv"), "H92: actual Hybrid mode binding");
+        assert!(plan.contains("(Phase::Hb, true)"), "H92: unconditional HB");
+        assert!(plan.contains("(Phase::Hybrid, modes.hybrid)"), "H92: captured Hybrid mode");
     }
 
     /// **H93 (compile pin + Display contract)** — NEW typed-error
@@ -56833,6 +56775,8 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
                 .expect("H222: spawn_inner_with_slot_aware sibling not found")
             + "    fn spawn_inner_with_slot_aware".len();
         let body = &src[body_start..body_end];
+        let dispatch = body.find("match mode {\n").expect("H222: mode dispatch table");
+        let body = &body[dispatch..];
         let serial_fifo_idx = body
             .find("EngineMode::SerialFifo")
             .expect("H222: SerialFifo arm not found in spawn_with_mode");
@@ -57112,6 +57056,8 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
                 .find("    fn spawn_inner_with_slot_aware")
                 .expect("H239: spawn_inner_with_slot_aware sibling not found");
         let body = &engine_src[body_start..body_end];
+        let dispatch = body.find("match mode {\n").expect("H239: mode dispatch table");
+        let body = &body[dispatch..];
         let serial_fifo_idx = body
             .find("EngineMode::SerialFifo")
             .expect("H239: SerialFifo arm not found");
