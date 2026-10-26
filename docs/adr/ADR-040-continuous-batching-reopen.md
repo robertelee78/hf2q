@@ -2051,3 +2051,37 @@ unchanged; no default promotion, full Q5 completion or performance claim follows
 Independent retained-evidence review verified all 464 artifact hashes, the
 executed source and binary bindings, the single completion, and clean process
 reaping. It accepted only this component scope.
+
+### 2026-10-26: Gemma cold cohorts preserve retained-prefix preference
+
+The retained Gemma four-agent coding diagnostic failed its first tool-result
+followups: each reported cached_tokens=0. The separate two-wire production
+metadata replay (no inference) reproduced all four agents' actual counts:
+initial P=465/S=458; followup P=514/S=514, with the entire prior S458 an exact
+prefix of P514. The failed run remains failed. A missing strict generation cue
+therefore does not establish that this conversation is cold. For this native
+Gemma template, the tool-response branch may append no generation cue.
+
+Cold cohort admission MUST inspect the actual request-aware idle slot/anchor
+preference before any reset or GPU submission. When any lane has reusable KV,
+the cohort defers in its original order to existing single-slot admission,
+which selects/restores that state. Truly cold or divergent cohorts remain
+batchable; existing tiny-prefill and aggregate4096-row/checked-overflow guards
+remain. No thinking/template/sampling/context/workload change is introduced.
+This applies equally to unary/SSE requests; transport is not a cold-cache hint.
+
+The new model-free controls use production affinity and admission-plan seams to
+exercise four458-token anchors extended to514-token cue-less requests, true cold
+and divergent histories, mixed cold/warm FIFO fallback and existing bounds.
+Author has not run them. These controls do not prove real Hybrid snapshot
+restore, output quality or full-prefix reuse; root owns compilation/runtime gates.
+
+The existing seven-wire Gemma oracle remains unchanged and intentionally rejects
+S=P. This narrow fix does not claim its full-prefix contract is met. A separate
+family-specific design must establish when a cue-less full input P is stable
+across the next actual render and how to capture it safely: current split-cue
+prefill requires0<boundary<P, so merely allowing equality would enter an empty
+cue forward. Retaining an earlier S458 anchor may avoid a full reset, but is not
+proof that every later complete P boundary is reused. Future family-explicit
+boundary/capture proof and actual seven-wire replay remain required; no generic
+oracle relaxation or forced enable_thinking is authorized by this change.
