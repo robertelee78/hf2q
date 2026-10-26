@@ -56,7 +56,13 @@ def approval(args):
         require(packet.get("profile") == PROFILE, "operating packet identity")
     require(packet.get("base_url") == args.base_url and packet.get("model") == args.model and
             packet.get("server_pid") == args.server_pid, "server identity drift")
-    require(set(packet.get("preflight", {})) == (preflight(PREFLIGHT) if n4 else PREFLIGHT) and
+    keys = preflight(PREFLIGHT) if n4 else PREFLIGHT
+    require(args.engine_kind == "hf2q" or n4, "peer adapter is N4-only")
+    require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
+    if args.engine_kind == "peer":
+        from qwen_n4_peer import preflight as peer_preflight
+        keys = peer_preflight(keys)
+    require(set(packet.get("preflight", {})) == keys and
             all(v is True for v in packet["preflight"].values()), "preflight unknown")
     require(packet.get("sandbox_proof_sha256") == args.sandbox_proof_sha256,
             "sandbox proof binding")
@@ -70,6 +76,8 @@ def approval(args):
     if n4:
         source_paths += [Path(__file__).with_name(n) for n in
                          ("qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py")]
+    if args.engine_kind == "peer":
+        source_paths += [Path(__file__).with_name(n) for n in ("qwen_n4_peer.py", "test_qwen_n4_peer.py")]
     require(packet.get("sources") == {p.name: child.digest(p) for p in source_paths}, "client source drift")
     require(packet.get("approved") is True, "explicit internal operating approval absent")
     proof = child.validate_proof(args.sandbox_proof, args.sandbox_proof_sha256)
@@ -90,7 +98,7 @@ def request_timeout(_signum, _frame):
     raise TimeoutError("absolute request deadline")
 
 
-def exchange(base, request, output, turn, seen, deadline=900):
+def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"):
     raw_request = wire(request)
     (output / "request.json").write_bytes(raw_request)
     endpoint = urlsplit(base)
@@ -132,9 +140,9 @@ def exchange(base, request, output, turn, seen, deadline=900):
                     total += len(block)
                     require(total <= RAW_LIMIT, "response wire32MiB envelope")
                     chunks.append(block)
-                message, call, stats = unary(b"".join(chunks), request["model"], turn, seen)
+                message, call, stats = unary(b"".join(chunks), request["model"], turn, seen, engine_kind)
             else:
-                parser = SSE(request["model"], turn, seen)
+                parser = SSE(request["model"], turn, seen, engine_kind)
                 frame, pending = [], bytearray()
                 while True:
                     require(time.monotonic() - started <= deadline and not INTERRUPTED, "request deadline")
@@ -194,6 +202,7 @@ def main():
     parser.add_argument("--diagnostic-slots", type=int, choices=(1, 4), default=1)
     for name in ("agent-id", "run-id", "barrier-dir", "barrier-token"):
         parser.add_argument("--" + name)
+    parser.add_argument("--engine-kind", choices=("hf2q", "peer"), default="hf2q")
     args = parser.parse_args()
     os.umask(0o077)
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -211,6 +220,7 @@ def main():
     tools = None
     try:
         packet = approval(args)
+        summary["engine_kind"] = args.engine_kind
         save(output / "approval-copy.json", packet)
         require(Path(args.cargo).is_absolute() and Path(args.cargo).is_file(), "verified absolute cargo")
         require(Path(args.sandbox_exec).is_absolute(), "verified absolute sandbox executable")
@@ -253,7 +263,7 @@ def main():
             turn_output = output / f"turn-{turn}"
             turn_output.mkdir(mode=0o700)
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
-                                               deadline=min(900, 7200 - (time.monotonic() - started)))
+                                               deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind)
             summary["turns"].append(receipt)
             messages.append(message)
             if call is not None:

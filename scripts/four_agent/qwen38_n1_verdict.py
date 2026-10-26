@@ -71,7 +71,11 @@ def wire(request):
     return result
 
 
-def usage(value, turn):
+def usage(value, turn, engine_kind="hf2q"):
+    require(engine_kind in ("hf2q", "peer"), "engine kind")
+    if engine_kind == "peer":
+        from qwen_n4_peer import usage as peer_usage
+        return peer_usage(value, turn)
     require(isinstance(value, dict), "missing usage")
     prompt = integer(value.get("prompt_tokens"), "prompt tokens", 262144)
     completion = integer(value.get("completion_tokens"), "completion tokens", 8192)
@@ -118,7 +122,7 @@ def assistant(message, finish, turn, seen_ids):
     return cid, name, args
 
 
-def unary(raw, model, turn, seen):
+def unary(raw, model, turn, seen, engine_kind="hf2q"):
     obj = loads(raw)
     require(isinstance(obj, dict) and "error" not in obj, "API error")
     require(obj.get("model") == model and isinstance(obj.get("id"), str), "response identity")
@@ -127,12 +131,13 @@ def unary(raw, model, turn, seen):
             "choice count/index")
     message = choices[0].get("message")
     call = assistant(message, choices[0].get("finish_reason"), turn, seen)
-    return message, call, usage(obj.get("usage"), turn)
+    return message, call, usage(obj.get("usage"), turn, engine_kind)
 
 
 class SSE:
     """Consume every complete SSE data frame, including usage and terminal marker."""
-    def __init__(self, model, turn, seen):
+    def __init__(self, model, turn, seen, engine_kind="hf2q"):
+        self.engine_kind = engine_kind
         self.model, self.turn, self.seen = model, turn, seen
         self.identity = None
         self.message = {"role": "assistant", "content": "", "reasoning_content": ""}
@@ -160,7 +165,7 @@ class SSE:
         require(isinstance(choices, list), "SSE choices")
         if not choices:
             require(self.finish is not None and self.stats is None, "misordered usage")
-            self.stats = usage(obj.get("usage"), self.turn)
+            self.stats = usage(obj.get("usage"), self.turn, self.engine_kind)
             return False
         require(self.finish is None and len(choices) == 1 and choices[0].get("index") == 0,
                 "duplicate/postfinish choice")
@@ -193,7 +198,7 @@ class SSE:
             self.finish = choice["finish_reason"]
         if obj.get("usage") is not None:
             require(self.finish is not None and self.stats is None, "usage before/duplicate finish")
-            self.stats = usage(obj["usage"], self.turn)
+            self.stats = usage(obj["usage"], self.turn, self.engine_kind)
         return semantic
 
     def result(self):
