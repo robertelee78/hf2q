@@ -13,13 +13,15 @@ import time
 
 from qwen38_n1_verdict import Invalid, WORKFLOW, loads, require, qualify
 import qwen38_n1_process as child
+import coding_family as family_contract
 
 AGENTS = tuple(f"agent-{i}" for i in range(4))
 PROFILE = "adr063-qwen-n4-live-v1"
 WORKLOAD_ID = "adr063-qwen-n4-parse-port-v1"
 MODULES = ("qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_verdict.py",
            "qwen38_n1_process.py", "test_qwen38_n1_verdict.py",
-           "qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py")
+           "qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py",
+           "coding_family.py", "test_coding_family.py")
 INTERRUPTED = False
 
 
@@ -38,14 +40,15 @@ def preflight(base):
         "pool_profile_selection_verified"}
 
 
-def validate_preflight(value, base):
-    require(isinstance(value, dict) and set(value) == preflight(base) and
+def validate_preflight(value, base, family="qwen"):
+    require(isinstance(value, dict) and set(value) == family_contract.preflight(preflight(base), family) and
             all(v is True for v in value.values()), "four-slot actual pool selection/preflight")
 
 
-def validate_agent_binding(packet, agent, run, server_pid, barrier, token, output):
-    require(packet.get("schema") == "hf2q.qwen-n4-agent-approval.v1" and
-            packet.get("profile") == PROFILE and packet.get("diagnostic_slots") == 4,
+def validate_agent_binding(packet, agent, run, server_pid, barrier, token, output, family="qwen"):
+    family_contract.validate_binding(packet, family, 4)
+    require(packet.get("schema") == family_contract.schema(family, "agent-approval", 4) and
+            packet.get("profile") == family_contract.profile(family, 4) and packet.get("diagnostic_slots") == 4,
             "N4 approval cannot claim slots1")
     identity(agent, run)
     expected = {"agent_id": agent, "run_id": run, "server_pid": server_pid,
@@ -124,14 +127,15 @@ def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approv
             "release_sha256": child.digest(release), "wait_seconds": time.monotonic() - started}
 
 
-def aggregate(results, exits, cleanup, pid, run):
+def aggregate(results, exits, cleanup, pid, run, family="qwen"):
     require(set(results) == set(exits) == set(cleanup) == set(AGENTS), "missing agent result")
     initial = set()
     for agent in AGENTS:
         result = results[agent]
+        require(result.get("family", "qwen") == family, "mixed diagnostic family result")
         require(exits[agent] == 0 and cleanup[agent] is True and result.get("cleanup") is True,
                 "client exit/cleanup unknown")
-        require(result.get("schema") == "hf2q.qwen-n4-agent-result.v1" and result.get("profile") == PROFILE
+        require(result.get("schema") == family_contract.schema(family, "agent-result", 4) and result.get("profile") == family_contract.profile(family, 4)
                 and result.get("agent_id") == agent and result.get("run_id") == run
                 and result.get("server_pid") == pid and result.get("diagnostic_slots") == 4,
                 "aggregate agent/server identity")
@@ -171,6 +175,7 @@ def main():
                  "sandbox-proof-sha256", "approval", "approval-sha256"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--server-pid", type=int, required=True)
+    parser.add_argument("--family", choices=family_contract.FAMILIES, default="qwen")
     args = parser.parse_args()
     from qwen38_n1_smoke import new_output, PREFLIGHT
     os.umask(0o077)
@@ -180,7 +185,8 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, stop)
     output = new_output(args.output)
-    summary = {"schema": "hf2q.qwen-n4-coordinator-result.v1", "profile": PROFILE,
+    summary = {"schema": family_contract.schema(args.family, "coordinator-result", 4),
+               "profile": family_contract.profile(args.family, 4), "family": args.family,
                "status": "Pending", "server_pid": args.server_pid, "diagnostic_slots": 4,
                "cleanup": False, "runtime_qualified": False, "model_qualified": False,
                "full_prefix_reuse": "PendingPostOracle", "server_owned_by_outer_supervisor": True}
@@ -190,8 +196,9 @@ def main():
     try:
         require(child.digest(args.approval) == args.approval_sha256, "coordinator approval hash")
         packet = loads(Path(args.approval).read_bytes())
-        require(packet.get("schema") == "hf2q.qwen-n4-coordinator-approval.v1" and
-                packet.get("profile") == PROFILE and packet.get("approved") is True, "N4 approval")
+        require(packet.get("schema") == family_contract.schema(args.family, "coordinator-approval", 4) and
+                packet.get("profile") == family_contract.profile(args.family, 4) and packet.get("approved") is True, "N4 approval")
+        family_contract.validate_binding(packet, args.family, 4)
         require(packet.get("server_pid") == args.server_pid and packet.get("base_url") == args.base_url
                 and packet.get("model") == args.model, "single server binding")
         module_dir = Path(__file__).resolve().parent
@@ -202,14 +209,16 @@ def main():
         identity(AGENTS[0], run)
         require(isinstance(token, str) and re.fullmatch(r"[a-f0-9]{32}", token), "barrier nonce")
         template = packet.get("agent_template", {})
-        validate_preflight(template.get("preflight"), PREFLIGHT)
+        validate_preflight(template.get("preflight"), PREFLIGHT, args.family)
         summary["run_id"] = run
         barrier = output / "barrier"
         barrier.mkdir(mode=0o700)
         for agent in AGENTS:
             require(not INTERRUPTED, "interrupted before any further client launch")
             path = output / agent
-            binding = {**template, "schema": "hf2q.qwen-n4-agent-approval.v1", "profile": PROFILE,
+            binding = {**template, "schema": family_contract.schema(args.family, "agent-approval", 4),
+                       "profile": family_contract.profile(args.family, 4), "family": args.family,
+                       "family_controls": packet.get("family_controls"),
                        "diagnostic_slots": 4, "agent_id": agent, "run_id": run,
                        "barrier_dir": str(barrier), "barrier_token": token, "agent_output": str(path),
                        "initial_identity_sha256": hashlib.sha256(identity(agent, run).encode()).hexdigest(),
@@ -222,7 +231,7 @@ def main():
                         "sandbox_proof_sha256", "server_pid"):
                 command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
             command += ["--output", str(path), "--approval", str(approval_path), "--approval-sha256",
-                        child.digest(approval_path), "--diagnostic-slots", "4", "--agent-id", agent,
+                        child.digest(approval_path), "--diagnostic-slots", "4", "--family", args.family, "--agent-id", agent,
                         "--run-id", run, "--barrier-dir", str(barrier), "--barrier-token", token]
             stdout, stderr = [(output / f"{agent}.{name}").open("xb") for name in ("stdout", "stderr")]
             streams += [stdout, stderr]
@@ -276,7 +285,7 @@ def main():
             stream.close()
         if summary["status"] != "Failed":
             try:
-                summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run)
+                summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.family)
             except BaseException as exc:
                 summary["status"], summary["error"] = "Failed", str(exc)
         summary.update(agents=results, exits=exits, client_cleanup=receipts,

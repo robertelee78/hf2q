@@ -14,6 +14,7 @@ from qwen38_n1_verdict import (FIXTURE_SHA, PROFILE, RAW_LIMIT, WORKFLOW, Invali
                               loads, qualify, require, unary, wire)
 from qwen38_n1_tools import Tools
 import qwen38_n1_process as child
+import coding_family as family_contract
 
 PREFLIGHT = {"source_binary_bound", "model_identity_bound", "ctx262144_slots1_verified",
              "auto_tq8_text_only_verified", "profile24g_ack_verified",
@@ -50,13 +51,14 @@ def approval(args):
     if n4:
         from qwen_n4_live_smoke import preflight, validate_agent_binding
         validate_agent_binding(packet, args.agent_id, args.run_id, args.server_pid,
-                               args.barrier_dir, args.barrier_token, args.output)
+                               args.barrier_dir, args.barrier_token, args.output, args.family)
     else:
-        require(packet.get("schema") == "hf2q.qwen38-n1-client-approval.v2", "approval schema")
-        require(packet.get("profile") == PROFILE, "operating packet identity")
+        require(packet.get("schema") == family_contract.schema(args.family, "approval", 1), "approval schema")
+        require(packet.get("profile") == family_contract.profile(args.family, 1), "operating packet identity")
+    family_contract.validate_binding(packet, args.family, args.diagnostic_slots)
     require(packet.get("base_url") == args.base_url and packet.get("model") == args.model and
             packet.get("server_pid") == args.server_pid, "server identity drift")
-    require(set(packet.get("preflight", {})) == (preflight(PREFLIGHT) if n4 else PREFLIGHT) and
+    require(set(packet.get("preflight", {})) == family_contract.preflight(preflight(PREFLIGHT) if n4 else PREFLIGHT, args.family) and
             all(v is True for v in packet["preflight"].values()), "preflight unknown")
     require(packet.get("sandbox_proof_sha256") == args.sandbox_proof_sha256,
             "sandbox proof binding")
@@ -66,7 +68,8 @@ def approval(args):
             hashlib.sha256(WORKFLOW.encode()).hexdigest(), "new N1 workload identity")
     source_paths = [Path(__file__).with_name(n) for n in (
         "qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_process.py",
-        "qwen38_n1_verdict.py", "test_qwen38_n1_verdict.py")]
+        "qwen38_n1_verdict.py", "test_qwen38_n1_verdict.py",
+        "coding_family.py", "test_coding_family.py")]
     if n4:
         source_paths += [Path(__file__).with_name(n) for n in
                          ("qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py")]
@@ -194,23 +197,27 @@ def main():
     parser.add_argument("--diagnostic-slots", type=int, choices=(1, 4), default=1)
     for name in ("agent-id", "run-id", "barrier-dir", "barrier-token"):
         parser.add_argument("--" + name)
+    parser.add_argument("--family", choices=family_contract.FAMILIES, default="qwen")
     args = parser.parse_args()
     os.umask(0o077)
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
     output = new_output(args.output)
-    summary = {"schema": "hf2q.qwen38-n1-client-result.v2", "profile": PROFILE,
+    summary = {"schema": family_contract.schema(args.family, "result", 1),
+               "profile": family_contract.profile(args.family, 1), "family": args.family,
                "status": "Pending", "cleanup": False, "model_qualified": False,
                "turns": [], "tools": [], "independent_patch_review_required": True}
     n4 = args.diagnostic_slots == 4
     if n4:
         from qwen_n4_live_smoke import PROFILE as n4_profile
-        summary.update(schema="hf2q.qwen-n4-agent-result.v1", profile=n4_profile,
+        summary.update(schema=family_contract.schema(args.family, "agent-result", 4),
+                       profile=family_contract.profile(args.family, 4),
                        agent_id=args.agent_id, run_id=args.run_id, server_pid=args.server_pid,
                        diagnostic_slots=4, full_prefix_reuse="PendingPostOracle", barrier={"status": "Pending"})
     tools = None
     try:
         packet = approval(args)
+        if args.family == "deepseek4": summary["family_controls"] = packet["family_controls"]
         save(output / "approval-copy.json", packet)
         require(Path(args.cargo).is_absolute() and Path(args.cargo).is_file(), "verified absolute cargo")
         require(Path(args.sandbox_exec).is_absolute(), "verified absolute sandbox executable")
@@ -248,6 +255,7 @@ def main():
             request = {"model": args.model, "messages": messages, "tools": schemas,
                        "tool_choice": "auto", "max_completion_tokens": 8192,
                        "logprobs": False, "hf2q_overflow_policy": "reject", "stream": turn % 2 == 1}
+            family_contract.request_controls(request, args.family)
             if request["stream"]:
                 request["stream_options"] = {"include_usage": True}
             turn_output = output / f"turn-{turn}"
@@ -270,6 +278,7 @@ def main():
                                     tools.source_hash, final_hash)
         summary["final_source_sha256"] = final_hash
         summary["workflow_sha256"] = hashlib.sha256(WORKFLOW.encode()).hexdigest()
+        summary["full_prefix_reuse"] = "PendingPostOracle"
         summary["runtime_qualified"] = False
     except BaseException as exc:
         summary["status"] = "Failed"
