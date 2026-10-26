@@ -54,7 +54,7 @@ def loads(raw):
 
 
 def wire(request, family="qwen"):
-    require(family in ("qwen", "deepseek4"), "unsupported request family")
+    require(family in ("qwen", "deepseek4", "gemma4"), "unsupported request family")
     require(request.get("max_completion_tokens") == 8192, "output allowance drift")
     require(request.get("tool_choice") == "auto", "tool choice drift")
     require(request.get("logprobs") is False and "response_format" not in request,
@@ -62,9 +62,12 @@ def wire(request, family="qwen"):
     for key in ("top_p", "top_k", "min_p", "seed",
                 "frequency_penalty", "presence_penalty", "repetition_penalty"):
         require(key not in request, f"captured omission changed: {key}")
-    if family == "qwen":
+    if family in ("qwen", "gemma4"):
         require("temperature" not in request, "captured omission changed: temperature")
-        require("reasoning_effort" not in request, "Qwen reasoning control drift")
+        require("reasoning_effort" not in request, "family reasoning control drift")
+        if family == "gemma4":
+            require(all(k not in request for k in ("chat_template_kwargs", "thinking_budget",
+                    "thinking_token_budget", "hf2q_enable_thinking")), "Gemma default reasoning drift")
     else:
         require(type(request.get("temperature")) in (int, float) and
                 request["temperature"] == 0, "DeepSeek greedy temperature required")

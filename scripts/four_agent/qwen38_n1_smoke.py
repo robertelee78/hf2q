@@ -238,7 +238,7 @@ def main():
     try:
         packet = approval(args)
         summary["engine_kind"] = args.engine_kind
-        if args.family == "deepseek4": summary["family_controls"] = packet["family_controls"]
+        if args.family in ("deepseek4", "gemma4"): summary["family_controls"] = packet["family_controls"]
         save(output / "approval-copy.json", packet)
         require(Path(args.cargo).is_absolute() and Path(args.cargo).is_file(), "verified absolute cargo")
         require(Path(args.sandbox_exec).is_absolute(), "verified absolute sandbox executable")
