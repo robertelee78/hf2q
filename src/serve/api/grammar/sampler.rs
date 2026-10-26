@@ -358,6 +358,10 @@ pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8)
 const MAX_ACTIVE_STACKS: usize = 32_768;
 
 pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) -> bool {
+    advance_stack_guarded(grammar,stack,new_stacks,None,super::dsml_lexical::Scan::default())
+}
+fn advance_stack_guarded(grammar:&Grammar,stack:Stack,new_stacks:&mut Stacks,
+    guard:Option<&super::dsml_lexical::Guard>,scan:super::dsml_lexical::Scan)->bool {
     let mut todo: Vec<Stack> = Vec::new();
     todo.push(stack);
     // `seen` dedups across our BFS frontier.
@@ -388,6 +392,7 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) -
         match elem.ty {
             GretType::RuleRef => {
                 let rule_id = elem.value;
+                if guard.is_some_and(|g| !g.allows_rule(rule_id,scan)) {continue;}
                 let target_rule = match grammar.rules.get(rule_id as usize) {
                     Some(r) => r,
                     None => continue,
@@ -466,7 +471,7 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) -
 // ---------------------------------------------------------------------------
 
 /// Feeds one character to one stack, producing zero or more successor stacks.
-fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut Stacks) -> bool {
+fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut Stacks, guard: Option<&super::dsml_lexical::Guard>, scan: super::dsml_lexical::Scan) -> bool {
     if stack.is_empty() {
         return true;
     }
@@ -488,6 +493,7 @@ fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut 
         return true;
     }
 
+    if guard.is_some_and(|g| !g.allows(grammar,top,chr,scan)) { return true; }
     let (matched, after) = match_char(grammar, top, chr);
     if matched {
         let mut new_stack: Stack = stack[..stack.len() - 1].to_vec();
@@ -497,16 +503,20 @@ fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut 
                 new_stack.push(after);
             }
         }
-        return advance_stack(grammar, new_stack, new_stacks);
+        return advance_stack_guarded(grammar, new_stack, new_stacks,guard,scan.advance(chr));
     }
     true
 }
 
 /// Accept one character against the current stack set, returning the new set.
 pub fn accept_char(grammar: &Grammar, stacks: &Stacks, chr: u32) -> Stacks {
+    accept_char_guarded(grammar,stacks,chr,None,super::dsml_lexical::Scan::default())
+}
+fn accept_char_guarded(grammar: &Grammar, stacks: &Stacks, chr: u32,
+    guard: Option<&super::dsml_lexical::Guard>,scan: super::dsml_lexical::Scan) -> Stacks {
     let mut new_stacks: Stacks = Vec::with_capacity(stacks.len());
     for stack in stacks {
-        if !accept_chr_into(grammar, stack, chr, &mut new_stacks) {
+        if !accept_chr_into(grammar, stack, chr, &mut new_stacks, guard, scan) {
             return Vec::new();
         }
     }
@@ -529,6 +539,8 @@ pub(super) fn reject_candidates(
     stacks: &Stacks,
     candidates: &[GrammarCandidate],
     code_points: &[u32],
+    guard: Option<&super::dsml_lexical::Guard>,
+    scans: Option<&[super::dsml_lexical::Scan]>,
 ) -> Vec<GrammarCandidate> {
     if candidates.is_empty() {
         return Vec::new();
@@ -537,12 +549,12 @@ pub(super) fn reject_candidates(
         return candidates.to_vec();
     }
 
-    let mut rejects = reject_candidates_for_stack(grammar, &stacks[0], candidates, code_points);
+    let mut rejects = reject_candidates_for_stack(grammar, &stacks[0], candidates, code_points, guard, scans);
     for stack in &stacks[1..] {
         if rejects.is_empty() {
             break;
         }
-        rejects = reject_candidates_for_stack(grammar, stack, &rejects, code_points);
+        rejects = reject_candidates_for_stack(grammar, stack, &rejects, code_points, guard, scans);
     }
     rejects
 }
@@ -556,6 +568,8 @@ fn reject_candidates_for_stack(
     stack: &Stack,
     candidates: &[GrammarCandidate],
     code_points: &[u32],
+    guard: Option<&super::dsml_lexical::Guard>,
+    scans: Option<&[super::dsml_lexical::Scan]>,
 ) -> Vec<GrammarCandidate> {
     if candidates.is_empty() {
         return Vec::new();
@@ -615,7 +629,9 @@ fn reject_candidates_for_stack(
             rejects.push(candidate);
             continue;
         };
-        if match_char(grammar, top, chr).0 {
+        let prohibited = guard.is_some_and(|g| scans.and_then(|v|v.get(candidate.cursor))
+            .is_none_or(|&scan| !g.allows(grammar,top,chr,scan)));
+        if !prohibited && match_char(grammar, top, chr).0 {
             next_candidates.push(GrammarCandidate {
                 cursor: candidate.cursor + 1,
                 ..candidate
@@ -638,18 +654,34 @@ fn reject_candidates_for_stack(
             stack_after.push(after);
         }
     }
-    let mut next_stacks = Vec::new();
-    if !advance_stack(grammar, stack_after, &mut next_stacks) {
-        rejects.extend(next_candidates);
-        return rejects;
+    // Preserve the ordinary grammar walk without a grouping allocation.
+    if guard.is_none() {
+        let mut next_stacks=Vec::new();
+        if !advance_stack(grammar,stack_after,&mut next_stacks){rejects.extend(next_candidates);return rejects;}
+        let mut deeper=reject_candidates(grammar,&next_stacks,&next_candidates,code_points,None,None);
+        for c in &mut deeper {c.cursor=c.cursor.saturating_sub(1);}
+        rejects.extend(deeper);return rejects;
     }
-
-    let mut deeper_rejects =
-        reject_candidates(grammar, &next_stacks, &next_candidates, code_points);
-    for candidate in &mut deeper_rejects {
-        candidate.cursor = candidate.cursor.saturating_sub(1);
+    // RAW_END is branch-local and depends on the scan AFTER this scalar.
+    // Partition matched candidates before epsilon expansion; scanner states
+    // are bounded by marker-prefix x escape parity, not conversation length.
+    let mut groups=std::collections::HashMap::<super::dsml_lexical::Scan,Vec<GrammarCandidate>>::new();
+    for candidate in next_candidates {
+        let consumed=candidate.cursor-1;
+        let Some(before)=scans.and_then(|v|v.get(consumed)).copied() else {
+            rejects.push(GrammarCandidate{cursor:consumed,..candidate});continue;
+        };
+        groups.entry(before.advance(code_points[consumed])).or_default().push(candidate);
     }
-    rejects.extend(deeper_rejects);
+    for (after_scan,group) in groups {
+        let mut next_stacks=Vec::new();
+        if !advance_stack_guarded(grammar,stack_after.clone(),&mut next_stacks,guard,after_scan){
+            rejects.extend(group.into_iter().map(|c|GrammarCandidate{cursor:c.cursor-1,..c}));continue;
+        }
+        let mut deeper=reject_candidates(grammar,&next_stacks,&group,code_points,guard,scans);
+        for candidate in &mut deeper {candidate.cursor=candidate.cursor.saturating_sub(1);}
+        rejects.extend(deeper);
+    }
     rejects
 }
 
@@ -702,6 +734,8 @@ pub struct GrammarRuntime {
     pub grammar: Arc<Grammar>,
     pub stacks: Stacks,
     pub partial_utf8: PartialUtf8,
+    pub(super) dsml_guard: Option<Arc<super::dsml_lexical::Guard>>,
+    pub(super) dsml_scan: super::dsml_lexical::Scan,
     /// Trigger gate.  When `true`, `accept_bytes`/`is_dead`/`is_accepted`
     /// all short-circuit so the runtime is functionally suspended.  Flipped
     /// false either explicitly by [`GrammarRuntime::trigger`] (e.g. when
@@ -729,6 +763,7 @@ impl GrammarRuntime {
     /// Initialize runtime from a parsed grammar and a start rule, seeding
     /// `stacks` from the start rule's alternatives.
     pub fn new(grammar: Grammar, start_rule_id: u32) -> Option<Self> {
+        let dsml_guard = super::dsml_lexical::Guard::from_grammar(&grammar).ok()?.map(Arc::new);
         let start_rule = grammar.rules.get(start_rule_id as usize)?;
         if start_rule.is_empty() {
             return None;
@@ -744,7 +779,8 @@ impl GrammarRuntime {
                 }
             }
             let mut advanced: Stacks = Vec::new();
-            if !advance_stack(&grammar, stack, &mut advanced) {
+            if !advance_stack_guarded(&grammar,stack,&mut advanced,dsml_guard.as_deref(),
+                super::dsml_lexical::Scan::default()) {
                 return None;
             }
             for s in advanced {
@@ -774,6 +810,7 @@ impl GrammarRuntime {
             }
         }
         Some(Self {
+            dsml_guard, dsml_scan: super::dsml_lexical::Scan::default(),
             grammar: Arc::new(grammar),
             stacks,
             partial_utf8: PartialUtf8::default(),
@@ -875,6 +912,9 @@ impl GrammarRuntime {
     /// unused next-token forward; engines that continue rely on the existing
     /// grammar-driven exhaustion check.
     pub fn trigger(&mut self) {
+        // Already-active duplicate router triggers must not erase a partial
+        // delimiter. A fresh suspended stream has consumed no grammar data.
+        if self.awaiting_trigger { self.dsml_scan = super::dsml_lexical::Scan::default(); }
         self.awaiting_trigger = false;
         self.lazy_trigger_tail.clear();
         if let Some(lazy) = self.public_lazy.as_mut() {
@@ -1013,7 +1053,10 @@ impl GrammarRuntime {
     /// Feed one Unicode code point. Returns `true` if any stacks remain
     /// after the feed (i.e. the grammar still has a valid continuation).
     pub fn accept_char(&mut self, chr: u32) -> bool {
-        self.stacks = accept_char(&self.grammar, &self.stacks, chr);
+        if let Some(guard) = &self.dsml_guard {
+            self.stacks=accept_char_guarded(&self.grammar,&self.stacks,chr,Some(guard.as_ref()),self.dsml_scan);
+            self.dsml_scan=self.dsml_scan.advance(chr);
+        } else { self.stacks = accept_char(&self.grammar, &self.stacks, chr); }
         !self.stacks.is_empty()
     }
 
@@ -1071,7 +1114,8 @@ impl GrammarRuntime {
                     if at(&self.grammar, after).is_some_and(|next| !is_end_of_sequence(next)) {
                         stack_after.push(after);
                     }
-                    if !advance_stack(&self.grammar, stack_after, &mut stacks_new) {
+                    if !advance_stack_guarded(&self.grammar, stack_after, &mut stacks_new,
+                        self.dsml_guard.as_deref(),self.dsml_scan.through(&code_points)) {
                         self.stacks.clear();
                         return false;
                     }
@@ -1080,8 +1124,11 @@ impl GrammarRuntime {
             }
 
             let mut current_stacks = vec![stack.clone()];
+            let mut scan=self.dsml_scan;
             for &chr in &code_points {
-                current_stacks = accept_char(&self.grammar, &current_stacks, chr);
+                current_stacks = accept_char_guarded(&self.grammar, &current_stacks, chr,
+                    self.dsml_guard.as_deref(),scan);
+                if self.dsml_guard.is_some(){scan=scan.advance(chr);}
                 if current_stacks.is_empty() {
                     break;
                 }
@@ -1097,6 +1144,9 @@ impl GrammarRuntime {
             }
         }
         self.stacks = stacks_new;
+        if self.dsml_guard.is_some() {
+            self.dsml_scan=self.dsml_scan.through(&code_points);
+        }
         self.partial_utf8 = partial_utf8;
         !self.stacks.is_empty()
     }

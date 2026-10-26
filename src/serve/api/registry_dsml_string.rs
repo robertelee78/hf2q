@@ -1,153 +1,67 @@
 //! DSML raw values may contain code angle brackets, but never their close tag.
-//! Prefix-state DFA composed with an optional Unicode-character length counter.
+//! Exact bounded repetition plus a private terminal-scoped runtime delimiter guard.
+#[cfg(test)]
 use super::gbnf_literal;
 
 pub(super) const CLOSE: &str = "</｜DSML｜parameter>";
-// Same output limits as grammar/parser.rs, not a new schema/admission ceiling.
-const MAX_BYTES: usize = 4 * 1024 * 1024;
-const MAX_RULES: usize = 262_144;
-
-fn next_prefix(marker: &[char], state: usize, ch: char) -> usize {
-    let mut prefix = marker[..state].to_vec();
-    prefix.push(ch);
-    (0..=marker.len())
-        .rev()
-        .find(|&n| n <= prefix.len() && prefix[prefix.len() - n..] == marker[..n])
-        .unwrap()
-}
-
-fn state_name(prefix: &str, count: usize, matched: usize, escape: bool) -> String {
-    format!("{prefix}-{count}-{matched}-{}", usize::from(escape))
-}
-
-/// No complete delimiter can be consumed as data, even across a backslash pair.
-/// Every transition consumes exactly ONE Unicode scalar, preserving length bounds.
-/// A trailing backslash remains invalid, as on the previous DSML string surface.
+/// Character-count composition stays in the established exact repetition
+/// compiler. The private runtime guard excludes only COMPLETE raw sentinels
+/// consumed by these reserved DATA terminals; structural closing stays legal.
 pub(super) fn emit(
     rules: &mut Vec<(String, String)>,
-    prefix: &str,
+    _prefix: &str,
     min: u64,
     max: Option<u64>,
 ) -> Result<String, String> {
-    emit_inner(rules, prefix, min, max, false)
+    validate_bounds(min, max)?;
+    use crate::serve::api::grammar::dsml_lexical::{END_BODY, END_NAME, RAW_BODY, RAW_NAME};
+    insert(rules, RAW_NAME, RAW_BODY)?;
+    insert(rules, END_NAME, END_BODY)?;
+    Ok(format!(
+        "{} {END_NAME}",
+        super::bounded_repeat(RAW_NAME, min, max, rules)
+    ))
 }
-
 pub(super) fn emit_json(
     rules: &mut Vec<(String, String)>,
-    prefix: &str,
+    _prefix: &str,
     min: u64,
     max: Option<u64>,
 ) -> Result<String, String> {
-    emit_inner(rules, prefix, min, max, true)
+    validate_bounds(min, max)?;
+    use crate::serve::api::grammar::dsml_lexical::{JSON_BODY, JSON_NAME};
+    insert(rules, JSON_NAME, JSON_BODY)?;
+    insert(
+        rules,
+        "dsml-data-json-char",
+        r#"dsml-data-json-raw | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})"#,
+    )?;
+    Ok(super::bounded_repeat(
+        "dsml-data-json-char",
+        min,
+        max,
+        rules,
+    ))
 }
-
-fn emit_inner(
-    rules: &mut Vec<(String, String)>,
-    prefix: &str,
-    min: u64,
-    max: Option<u64>,
-    json: bool,
-) -> Result<String, String> {
+fn validate_bounds(min: u64, max: Option<u64>) -> Result<(), String> {
+    let cap = crate::serve::api::grammar::repetition::MAX_SCHEMA_REPETITION_BOUND;
     if max.is_some_and(|n| n < min) {
         return Err("DeepSeek minLength exceeds maxLength".into());
     }
-    let marker: Vec<_> = CLOSE.chars().collect();
-    let limit = usize::try_from(max.unwrap_or(min))
-        .map_err(|_| "DeepSeek string length exceeds grammar resource limits")?;
-    let states = limit
-        .checked_add(1)
-        .and_then(|n| n.checked_mul(marker.len()))
-        .and_then(|n| n.checked_mul(if json { 1 } else { 2 }))
-        .ok_or("DeepSeek string state count overflow")?;
-    if states
-        .checked_add(rules.len())
-        .is_none_or(|n| n > MAX_RULES)
-    {
-        return Err(
-            "DeepSeek delimiter/length grammar exceeds existing rule resource limit".into(),
-        );
+    if min > cap || max.is_some_and(|n| n > cap) {
+        return Err("DeepSeek length exceeds existing schema resource limit".into());
     }
-    let mut alphabet = marker.clone();
-    alphabet.push('\\');
-    alphabet.sort_unstable();
-    alphabet.dedup();
-    let excluded = alphabet
-        .iter()
-        .map(|ch| match ch {
-            '\\' => "\\\\".to_string(),
-            _ => ch.to_string(),
-        })
-        .collect::<String>();
-    let mut bytes = rules
-        .iter()
-        .try_fold(0usize, |n, (name, body)| {
-            n.checked_add(name.len() + body.len() + 6)
-        })
-        .ok_or("DeepSeek grammar byte count overflow")?;
-    for count in 0..=limit {
-        for matched in 0..marker.len() {
-            for escape in [false, true].into_iter().filter(|&escape| !json || !escape) {
-                let mut alternatives = Vec::new();
-                if !escape && count as u64 >= min {
-                    alternatives.push("\"\"".to_string());
-                }
-                if max.is_none_or(|n| (count as u64) < n) {
-                    let next_count = (count + 1).min(limit);
-                    for &ch in &alphabet {
-                        if json && ch == '\\' {
-                            continue;
-                        }
-                        let next = next_prefix(&marker, matched, ch);
-                        if next == marker.len() {
-                            continue;
-                        }
-                        let next_escape = !escape && ch == '\\';
-                        alternatives.push(format!(
-                            "{} {}",
-                            gbnf_literal(&ch.to_string()),
-                            state_name(prefix, next_count, next, next_escape)
-                        ));
-                    }
-                    // Every other scalar resets the delimiter prefix. Escaped
-                    // control characters were forbidden by the old surface.
-                    let controls = if json {
-                        r#""\x00-\x1F"#
-                    } else if escape {
-                        r#"\x00-\x1F"#
-                    } else {
-                        ""
-                    };
-                    alternatives.push(format!(
-                        "[^{excluded}{controls}] {}",
-                        state_name(prefix, next_count, 0, false)
-                    ));
-                    if json {
-                        alternatives.push(format!(
-                            r#"[\\] (["\\/bfnrt] | "u" [0-9a-fA-F]{{4}}) {}"#,
-                            state_name(prefix, next_count, 0, false)
-                        ));
-                    }
-                }
-                let body = if alternatives.is_empty() {
-                    "[^\\U00000000-\\U0010FFFF]".to_string()
-                } else {
-                    alternatives.join(" | ")
-                };
-                let name = state_name(prefix, count, matched, escape);
-                bytes = bytes
-                    .checked_add(name.len() + body.len() + 6)
-                    .ok_or("DeepSeek grammar byte count overflow")?;
-                if bytes > MAX_BYTES {
-                    return Err(
-                        "DeepSeek delimiter/length grammar exceeds existing byte resource limit"
-                            .into(),
-                    );
-                }
-                rules.push((name, body));
-            }
+    Ok(())
+}
+fn insert(rules: &mut Vec<(String, String)>, name: &str, body: &str) -> Result<(), String> {
+    if let Some((_, existing)) = rules.iter().find(|(n, _)| n == name) {
+        if existing != body {
+            return Err("DSML reserved data rule collision".into());
         }
+    } else {
+        rules.push((name.into(), body.into()));
     }
-    Ok(state_name(prefix, 0, 0, false))
+    Ok(())
 }
 
 /// Sufficient lexical proof for an unchanged compiled pattern/format body.
