@@ -50,6 +50,9 @@
 //!     grammar must mirror the wrapper's own quoting convention (Gemma uses
 //!     `<|"|>` string markers; Qwen XML wraps raw values).
 
+#[path = "registry_dsml_string.rs"]
+mod dsml_string;
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -3287,11 +3290,12 @@ fn deepseek4_value_variants(
     if schema == &serde_json::Value::Bool(false) {
         return Ok(vec![(false, r#"[^\U00000000-\U0010FFFF]"#.to_string())]);
     }
+    let unsupported = |feature: String| EmitterError::UnsupportedSchemaFeature {
+        fn_name: fn_name.to_string(), param_path: path.to_string(), feature,
+    };
     let Some(object) = schema.as_object() else {
-        return Ok(vec![
-            (true, "dsml-string-val".to_string()),
-            (false, "qwen35-json-val".to_string()),
-        ]);
+        return Ok(vec![(true, "dsml-string-val".into()), (false,
+            nested_value_rule(fn_name, path, schema, rules, rule_counter, 1, NestedSurface::DeepSeek)?)]);
     };
     for keyword in ["anyOf", "oneOf"] {
         if let Some(branches) = object.get(keyword).and_then(serde_json::Value::as_array) {
@@ -3308,12 +3312,22 @@ fn deepseek4_value_variants(
             return Ok(variants);
         }
     }
-    if let Some(values) = object.get("enum").and_then(serde_json::Value::as_array) {
+    let constant;
+    let values = if let Some(value) = object.get("const") {
+        constant = vec![value.clone()];
+        Some(&constant)
+    } else { object.get("enum").and_then(serde_json::Value::as_array) };
+    if let Some(values) = values {
         let mut string_values = Vec::new();
         let mut json_values = Vec::new();
         for value in values {
             match value {
-                serde_json::Value::String(value) => string_values.push(gbnf_literal(value)),
+                serde_json::Value::String(value) => {
+                    if value.contains(dsml_string::CLOSE) {
+                        return Err(unsupported("DeepSeek literal contains reserved parameter close delimiter".into()));
+                    }
+                    string_values.push(gbnf_literal(value));
+                }
                 serde_json::Value::Number(_)
                 | serde_json::Value::Bool(_)
                 | serde_json::Value::Null
@@ -3326,6 +3340,9 @@ fn deepseek4_value_variants(
                             feature: format!("enum serialize: {error}"),
                         }
                     })?;
+                    if serialized.contains(dsml_string::CLOSE) {
+                        return Err(unsupported("DeepSeek JSON literal contains reserved parameter close delimiter".into()));
+                    }
                     json_values.push(gbnf_literal(&serialized));
                 }
             }
@@ -3340,22 +3357,31 @@ fn deepseek4_value_variants(
         return Ok(variants);
     }
     if object.get("type").and_then(serde_json::Value::as_str) == Some("string") {
-        let value = match compile_string_assertion(
-            fn_name,
-            path,
-            object,
-            crate::serve::api::grammar::regex_gbnf::Surface::DeepSeekRawString,
-        )? {
-            Some(body) => body,
-            None => bounded_string_body(object, "dsml-string-char", rules)
-                .unwrap_or_else(|| "dsml-string-val".to_string()),
+        if object.contains_key("pattern") || object.contains_key("format") {
+            let body = compile_string_assertion(fn_name, path, object,
+                crate::serve::api::grammar::regex_gbnf::Surface::DeepSeekRawString)?
+                .ok_or_else(|| unsupported("DeepSeek pattern/format has no compiled body".into()))?;
+            if !dsml_string::alphabet_excludes_close(&body) {
+                return Err(unsupported("DeepSeek pattern/format alphabet cannot exclude parameter delimiter; unsupported".into()));
+            }
+            return Ok(vec![(true, body)]);
+        }
+        let bound = |key: &str| -> Result<Option<u64>, EmitterError> {
+            object.get(key).map(|n| n.as_u64().ok_or_else(|| unsupported(format!("invalid {key}")))).transpose()
+        };
+        let min = bound("minLength")?.unwrap_or(0);
+        let max = bound("maxLength")?;
+        let value = if min == 0 && max.is_none() {
+            "dsml-string-val".to_string()
+        } else {
+            *rule_counter = rule_counter.checked_add(1)
+                .ok_or_else(|| unsupported("DeepSeek string rule counter overflow".into()))?;
+            dsml_string::emit(rules, &format!("dsml-bounded-{rule_counter}"), min, max)
+                .map_err(unsupported)?
         };
         return Ok(vec![(true, value)]);
     }
-    Ok(vec![(
-        false,
-        qwen35_nested_value_rule(fn_name, path, schema, rules, rule_counter, 1)?,
-    )])
+    Ok(vec![(false, nested_value_rule(fn_name, path, schema, rules, rule_counter, 1, NestedSurface::DeepSeek)?)])
 }
 
 /// Emit DeepSeek-V4's native DSML tool-call syntax. The outer marker pair
@@ -3404,18 +3430,18 @@ fn deepseek4_tool_call_gbnf(
             "qwen35-json-val".into(),
             r#"qwen35-json-str | qwen35-num-val | qwen35-bool-val | qwen35-null-val | qwen35-json-obj | qwen35-json-arr"#.into(),
         ),
-        (
-            "dsml-string-char".into(),
-            // String-valued DSML parameters carry raw tool arguments, so
-            // source code and shell syntax must be able to contain `<`.
-            // The following literal close-tag rule still delimits the value;
-            // GrammarRuntime retains both branches while a `<` prefix is
-            // ambiguous. Excluding every `<` forced coding calls such as
-            // `fmt::Formatter<'_>` to close at `fmt::Formatter`.
-            r#"[^\\] | [\\] [^\x00-\x1F]"#.into(),
-        ),
-        ("dsml-string-val".into(), "dsml-string-char*".into()),
     ];
+    let safe_string = dsml_string::emit(&mut rules, "dsml-safe", 0, None)
+        .map_err(|feature| EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(), param_path: "/".to_string(), feature,
+        })?;
+    rules.push(("dsml-string-val".into(), safe_string));
+    let safe_json = dsml_string::emit_json(&mut rules, "dsml-json-safe", 0, None)
+        .map_err(|feature| EmitterError::UnsupportedSchemaFeature { fn_name:fn_name.into(), param_path:"/".into(), feature })?;
+    let json_string = format!("{} {} {}", gbnf_literal("\""), safe_json, gbnf_literal("\""));
+    rules.iter_mut().find(|(name, _)| name == "qwen35-json-str").unwrap().1 = json_string;
+    rules.push(("dsml-json-key-char".into(), r#"[^"\\<\x00-\x1F] | [\\] (["\\/bfnrt] | "u" [0-9a-fA-F]{4})"#.into()));
+
 
     let newline = gbnf_literal("\n");
     let parameter_close = gbnf_literal("</｜DSML｜parameter>");
@@ -3909,13 +3935,24 @@ fn bounded_array_body(
 /// `minimum`, `minItems`, `format`, …) are IGNORED, mirroring
 /// json_schema.rs's deferred-feature list.
 ///
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NestedSurface { Qwen, DeepSeek }
+
 fn qwen35_nested_value_rule(
+    fn_name: &str, path: &str, schema: &serde_json::Value,
+    rules: &mut Vec<(String, String)>, rule_counter: &mut u32, depth: usize,
+) -> Result<String, EmitterError> {
+    nested_value_rule(fn_name, path, schema, rules, rule_counter, depth, NestedSurface::Qwen)
+}
+
+fn nested_value_rule(
     fn_name: &str,
     path: &str,
     schema: &serde_json::Value,
     rules: &mut Vec<(String, String)>,
     rule_counter: &mut u32,
     depth: usize,
+    surface: NestedSurface,
 ) -> Result<String, EmitterError> {
     if depth > MAX_NESTED_DEPTH {
         return Err(EmitterError::UnsupportedSchemaFeature {
@@ -3971,13 +4008,14 @@ fn qwen35_nested_value_rule(
             }
             let mut alts: Vec<String> = Vec::with_capacity(subs.len());
             for (i, s) in subs.iter().enumerate() {
-                alts.push(qwen35_nested_value_rule(
+                alts.push(nested_value_rule(
                     fn_name,
                     &format!("{}/{}/{}", path, comb, i),
                     s,
                     rules,
                     rule_counter,
                     depth + 1,
+                    surface,
                 )?);
             }
             return Ok(format!("( {} )", alts.join(" | ")));
@@ -3986,7 +4024,12 @@ fn qwen35_nested_value_rule(
 
     // enum → literal alternation of every JSON-serialized value (compact
     // tojson form; strings keep their JSON quotes).
-    if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
+    let constant;
+    let choices = if surface == NestedSurface::DeepSeek && obj.contains_key("const") {
+        constant = vec![obj["const"].clone()];
+        Some(&constant)
+    } else { obj.get("enum").and_then(serde_json::Value::as_array) };
+    if let Some(values) = choices {
         if values.is_empty() {
             return Ok(r#"[^\U00000000-\U0010FFFF]"#.to_string());
         }
@@ -3998,6 +4041,12 @@ fn qwen35_nested_value_rule(
                     param_path: path.to_string(),
                     feature: format!("enum serialize: {}", e),
                 })?;
+            if surface == NestedSurface::DeepSeek && text.contains(dsml_string::CLOSE) {
+                return Err(EmitterError::UnsupportedSchemaFeature {
+                    fn_name: fn_name.into(), param_path: path.into(),
+                    feature: "DeepSeek nested literal contains reserved parameter close delimiter".into(),
+                });
+            }
             alts.push(gbnf_literal(&text));
         }
         return Ok(format!("( {} )", alts.join(" | ")));
@@ -4018,19 +4067,43 @@ fn qwen35_nested_value_rule(
                 };
                 let mut stub = serde_json::Map::new();
                 stub.insert("type".into(), serde_json::Value::String(tstr.into()));
-                alts.push(qwen35_nested_value_rule(
+                alts.push(nested_value_rule(
                     fn_name,
                     &format!("{}/type/{}", path, i),
                     &serde_json::Value::Object(stub),
                     rules,
                     rule_counter,
                     depth + 1,
+                    surface,
                 )?);
             }
             Ok(format!("( {} )", alts.join(" | ")))
         }
         Some(serde_json::Value::String(t)) => match t.as_str() {
             "string" => {
+                if surface == NestedSurface::DeepSeek {
+                    if obj.contains_key("pattern") || obj.contains_key("format") {
+                        let body = compile_string_assertion(fn_name, path, obj,
+                            crate::serve::api::grammar::regex_gbnf::Surface::QwenJsonString)?
+                            .ok_or_else(|| EmitterError::UnsupportedSchemaFeature {
+                                fn_name:fn_name.into(), param_path:path.into(), feature:"DeepSeek pattern/format has no compiled body".into() })?;
+                        if !dsml_string::alphabet_excludes_close(&body) {
+                            return Err(EmitterError::UnsupportedSchemaFeature {
+                                fn_name:fn_name.into(), param_path:path.into(), feature:"DeepSeek nested pattern/format alphabet cannot exclude parameter delimiter".into(),
+                            });
+                        }
+                        return Ok(format!("{} {} {}", gbnf_literal("\""), body, gbnf_literal("\"")));
+                    }
+                    let bound = |key: &str| obj.get(key).map(|n| n.as_u64().ok_or_else(||
+                        EmitterError::UnsupportedSchemaFeature { fn_name:fn_name.into(), param_path:path.into(), feature:format!("invalid {key}") })).transpose();
+                    *rule_counter = rule_counter.checked_add(1).ok_or_else(|| EmitterError::UnsupportedSchemaFeature {
+                        fn_name:fn_name.into(), param_path:path.into(), feature:"DeepSeek rule counter overflow".into(),
+                    })?;
+                    let body = dsml_string::emit_json(rules, &format!("dsml-json-bounded-{rule_counter}"),
+                        bound("minLength")?.unwrap_or(0), bound("maxLength")?)
+                        .map_err(|feature| EmitterError::UnsupportedSchemaFeature { fn_name:fn_name.into(), param_path:path.into(), feature })?;
+                    return Ok(format!("{} {} {}", gbnf_literal("\""), body, gbnf_literal("\"")));
+                }
                 // iter-231c: `pattern` constrains the JSON string content.
                 match compile_string_assertion(
                     fn_name,
@@ -4060,8 +4133,8 @@ fn qwen35_nested_value_rule(
             "number" => Ok("qwen35-num-val".to_string()),
             "boolean" => Ok("qwen35-bool-val".to_string()),
             "null" => Ok("qwen35-null-val".to_string()),
-            "object" => qwen35_nested_object(fn_name, path, obj, rules, rule_counter, depth),
-            "array" => qwen35_nested_array(fn_name, path, obj, rules, rule_counter, depth),
+            "object" => qwen35_nested_object(fn_name, path, obj, rules, rule_counter, depth, surface),
+            "array" => qwen35_nested_array(fn_name, path, obj, rules, rule_counter, depth, surface),
             other => Err(EmitterError::UnsupportedSchemaFeature {
                 fn_name: fn_name.to_string(),
                 param_path: path.to_string(),
@@ -4085,6 +4158,7 @@ fn qwen35_nested_object(
     rules: &mut Vec<(String, String)>,
     rule_counter: &mut u32,
     depth: usize,
+    surface: NestedSurface,
 ) -> Result<String, EmitterError> {
     let properties = obj.get("properties").and_then(|p| p.as_object());
     let additional_closed = matches!(
@@ -4100,13 +4174,14 @@ fn qwen35_nested_object(
                 return Ok(r#""{" "}""#.to_string());
             }
             if additional_schema.is_some_and(serde_json::Value::is_object) {
-                let value = qwen35_nested_value_rule(
+                let value = nested_value_rule(
                     fn_name,
                     &format!("{path}/additionalProperties"),
                     additional_schema.expect("present"),
                     rules,
                     rule_counter,
                     depth + 1,
+                    surface,
                 )?;
                 return Ok(format!(
                     r#""{{" ( "}}" | qwen35-json-str qwen35-json-colon {value} ( qwen35-json-comma qwen35-json-str qwen35-json-colon {value} )* "}}" )"#
@@ -4141,13 +4216,19 @@ fn qwen35_nested_object(
     let mut sorted_keys: Vec<&String> = props.keys().collect();
     sorted_keys.sort();
     for key in sorted_keys {
-        let val_body = qwen35_nested_value_rule(
+        if surface == NestedSurface::DeepSeek && key.contains(dsml_string::CLOSE) {
+            return Err(EmitterError::UnsupportedSchemaFeature {
+                fn_name:fn_name.into(), param_path:path.into(), feature:"DeepSeek property name contains reserved close delimiter".into(),
+            });
+        }
+        let val_body = nested_value_rule(
             fn_name,
             &format!("{}/properties/{}", path, key),
             &props[key],
             rules,
             rule_counter,
             depth + 1,
+            surface,
         )?;
         *rule_counter += 1;
         let kv_name = format!("q35n-{}-kv", *rule_counter);
@@ -4171,11 +4252,12 @@ fn qwen35_nested_object(
         None
     } else {
         let names = props.keys().cloned().collect::<Vec<_>>();
-        let key_body = crate::serve::api::grammar::json_schema::json_string_excluding_gbnf(
+        let key_body = crate::serve::api::grammar::json_schema::json_string_excluding_gbnf_with_raw_lt_policy(
             &names,
-            "qwen35-json-char",
+            if surface == NestedSurface::DeepSeek { "dsml-json-key-char" } else { "qwen35-json-char" },
             true,
             true,
+            surface == NestedSurface::DeepSeek,
         )
         .map_err(|feature| EmitterError::UnsupportedSchemaFeature {
             fn_name: fn_name.to_string(),
@@ -4183,13 +4265,14 @@ fn qwen35_nested_object(
             feature,
         })?;
         let value_body = match additional_schema {
-            Some(schema) => qwen35_nested_value_rule(
+            Some(schema) => nested_value_rule(
                 fn_name,
                 &format!("{path}/additionalProperties"),
                 schema,
                 rules,
                 rule_counter,
                 depth + 1,
+                surface,
             )?,
             None => "qwen35-json-val".to_string(),
         };
@@ -4222,6 +4305,7 @@ fn qwen35_nested_array(
     rules: &mut Vec<(String, String)>,
     rule_counter: &mut u32,
     depth: usize,
+    surface: NestedSurface,
 ) -> Result<String, EmitterError> {
     let min = obj
         .get("minItems")
@@ -4238,13 +4322,14 @@ fn qwen35_nested_array(
             rules,
         )),
         Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Bool(_)) => {
-            let item_rule = qwen35_nested_value_rule(
+            let item_rule = nested_value_rule(
                 fn_name,
                 &format!("{}/items", path),
                 obj.get("items").expect("items checked above"),
                 rules,
                 rule_counter,
                 depth + 1,
+                surface,
             )?;
             Ok(bounded_array_body(
                 &item_rule,

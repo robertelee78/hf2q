@@ -316,6 +316,15 @@ pub(crate) fn json_string_excluding_gbnf(
     allow_escaped_slash: bool,
     allow_raw_del: bool,
 ) -> Result<String, String> {
+    json_string_excluding_gbnf_with_raw_lt_policy(excluded, char_rule, allow_escaped_slash, allow_raw_del, false)
+}
+
+/// DSML keys may spell angle brackets via JSON escapes, but raw '<' cannot
+/// begin a protocol terminator. Existing JSON callers retain their old policy.
+pub(crate) fn json_string_excluding_gbnf_with_raw_lt_policy(
+    excluded: &[String], char_rule: &str, allow_escaped_slash: bool,
+    allow_raw_del: bool, forbid_raw_lt: bool,
+) -> Result<String, String> {
     let mut trie = JsonKeyTrie::default();
     let mut total_characters = 0usize;
     for name in excluded {
@@ -338,7 +347,7 @@ pub(crate) fn json_string_excluding_gbnf(
         }
         node.terminal = true;
     }
-    let body = json_key_trie_body(&trie, char_rule, allow_escaped_slash, allow_raw_del);
+    let body = json_key_trie_body(&trie, char_rule, allow_escaped_slash, allow_raw_del, forbid_raw_lt);
     Ok(format!(r#""\"" {body} "\"""#))
 }
 
@@ -347,6 +356,7 @@ fn json_key_trie_body(
     char_rule: &str,
     allow_slash: bool,
     allow_raw_del: bool,
+    forbid_raw_lt: bool,
 ) -> String {
     let mut alternatives = Vec::new();
     if !node.terminal {
@@ -355,22 +365,23 @@ fn json_key_trie_body(
     for (character, child) in &node.children {
         alternatives.push(format!(
             "{} {}",
-            json_character_encoding(*character, allow_slash, allow_raw_del),
-            json_key_trie_body(child, char_rule, allow_slash, allow_raw_del)
+            json_character_encoding(*character, allow_slash, allow_raw_del, forbid_raw_lt),
+            json_key_trie_body(child, char_rule, allow_slash, allow_raw_del, forbid_raw_lt)
         ));
     }
     alternatives.push(format!(
         "{} {char_rule}*",
-        json_character_except(node.children.keys().copied(), allow_slash, allow_raw_del,)
+        json_character_except(node.children.keys().copied(), allow_slash, allow_raw_del, forbid_raw_lt)
     ));
     format!("( {} )", alternatives.join(" | "))
 }
 
-fn json_character_encoding(character: char, allow_slash: bool, allow_raw_del: bool) -> String {
+fn json_character_encoding(character: char, allow_slash: bool, allow_raw_del: bool, forbid_raw_lt: bool) -> String {
     let mut alternatives = Vec::new();
     if character >= ' '
         && character != '"'
         && character != '\\'
+        && (!forbid_raw_lt || character != '<')
         && (allow_raw_del || character != '\u{7f}')
     {
         alternatives.push(format_literal(&character.to_string()));
@@ -418,6 +429,7 @@ fn json_character_except(
     excluded: impl Iterator<Item = char>,
     allow_slash: bool,
     allow_raw_del: bool,
+    forbid_raw_lt: bool,
 ) -> String {
     let excluded: HashSet<char> = excluded.collect();
     let mut raw = if allow_raw_del {
@@ -425,6 +437,7 @@ fn json_character_except(
     } else {
         String::from(r#"[^"\\\x7F\x00-\x1F"#)
     };
+    if forbid_raw_lt { raw.push('<'); }
     for character in &excluded {
         if *character >= ' '
             && *character != '"'
