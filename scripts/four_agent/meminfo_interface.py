@@ -126,3 +126,75 @@ def parse_interface(csv_text, stdout_text, capacity, page_bytes):
             'csv_accounted_subtotal': subtotal, 'unknown_residual_bytes': residual,
             'occupied': capacity - selected['free'], 'summary_pages': summary,
             'unknown_residual_fully_charged': True}
+
+
+def retryable_single_page_overcount(csv_text, stdout_text, capacity, page_bytes):
+    """Recognize one rejected observation; NEVER return physical/admission values.
+
+    Only a complete same-invocation CSV/text witness of subtotal=P+one page
+    with an explicit -1-page root qualifies for a bounded fresh observation.
+    This does not establish causality/atomicity, excuse low Free or pressure,
+    or make the rejected reading admissible. parse_interface stays strict.
+    The caller owns raw preservation, retry/deadline bounds and all guards.
+    """
+    if (type(capacity) is not int or type(page_bytes) is not int
+            or min(capacity, page_bytes) <= 0 or capacity % page_bytes):
+        return False
+    negative = re.compile(r'└─ Unaccounted:\s+-1 pages\s+-0\.0 MB'
+                          r'\s+░{20}\s+-0\.00%')
+    lines = stdout_text.splitlines()
+    matches = [i for i, line in enumerate(lines) if negative.fullmatch(line)]
+    if len(matches) != 1:
+        return False
+    # Normalize ONLY for shape/category corroboration, never for admission.
+    lines[matches[0]] = '└─ Unaccounted: 1 pages 0.0 MB  ' + '░' * 20 + ' 0.00%'
+    try:
+        selected = parse_csv(csv_text)
+        summary = parse_summary('\n'.join(lines))
+    except Invalid:
+        return False
+    pages = summary['category_pages']
+    return (selected['total'] == capacity + page_bytes
+            and summary['header_pages'] * page_bytes == capacity
+            and pages.get('Unaccounted') == 1
+            and all(pages[name] * page_bytes == selected[key]
+                    for name, key in NAMES.items())
+            and sum(pages[name] for name in NAMES) == summary['header_pages'] + 1)
+
+
+def retryable_correlated_overcount(csv_text, stdout_text, capacity, page_bytes):
+    """Boolean eligibility for bounded fresh observation, never physical credit.
+
+    Require all six exact CSV/text categories, independent physical header,
+    complete root tree and a negative N-page root explaining exactly CSV-P.
+    No magnitude cap is an admission rule: every such reading stays INVALID.
+    Rounded MB/percent values are shape checks, not accounting operands.
+    """
+    if (type(capacity) is not int or type(page_bytes) is not int
+            or min(capacity, page_bytes) <= 0 or capacity % page_bytes):
+        return False
+    negative = re.compile(rf'└─ Unaccounted:\s+-(?P<pages>{INTEGER}) pages'
+                          rf'\s+-{INTEGER}\.[0-9] MB\s+░{{20}}\s+-[0-9]+\.[0-9]{{2}}%')
+    lines = stdout_text.splitlines()
+    matches = [(i, negative.fullmatch(line)) for i, line in enumerate(lines)
+               if negative.fullmatch(line)]
+    if len(matches) != 1:
+        return False
+    index, match = matches[0]
+    excess_pages = page_count(match)
+    if excess_pages <= 0:
+        return False
+    # Only reuse strict summary shape validation; never feed this to admission.
+    lines[index] = f'└─ Unaccounted: {match["pages"]} pages 0.0 MB  ' + '░' * 20 + ' 0.00%'
+    try:
+        selected = parse_csv(csv_text)
+        summary = parse_summary('\n'.join(lines))
+    except Invalid:
+        return False
+    pages = summary['category_pages']
+    return (selected['total'] == capacity + excess_pages * page_bytes
+            and summary['header_pages'] * page_bytes == capacity
+            and pages.get('Unaccounted') == excess_pages
+            and all(pages[name] * page_bytes == selected[key]
+                    for name, key in NAMES.items())
+            and sum(pages[name] for name in NAMES) == summary['header_pages'] + excess_pages)
