@@ -1,3 +1,6 @@
+#[path = "../../build_native_pin.rs"]
+mod native_pin_contract;
+
 use super::*;
 use crate::convert::tensor_lineage::MAX_STORED_TENSOR_CONVERSION_RECEIPT_BYTES;
 use crate::core::integrity::{compute_git_blob_sha1, ShardIntegrity};
@@ -608,7 +611,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                     .collect::<std::collections::BTreeSet<_>>();
                 assert_eq!(observed_bindings, expected_bindings);
                 for (index, observation) in session.encoded_dispatches().iter().enumerate() {
-                    assert_eq!(observation.trace.mlx_native_version, "0.15.4");
+                    assert_eq!(observation.trace.mlx_native_version, env!("HF2Q_MLX_NATIVE_VERSION"));
                     assert_eq!(
                         observation.trace.request.workload,
                         if index < 16 {

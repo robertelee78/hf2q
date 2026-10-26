@@ -21,7 +21,7 @@ use super::execution_observation::{
     ExecutedTensorObservation, LoadedTensorCodec, VerifiedExecutedTensorCatalog,
 };
 
-const MLX_NATIVE_TRACE_VERSION: &str = "0.15.4";
+const MLX_NATIVE_TRACE_VERSION: &str = env!("HF2Q_MLX_NATIVE_VERSION");
 
 pub(crate) struct VerifiedEncodedDispatchCatalog {
     executed_catalog_sha256: String,
