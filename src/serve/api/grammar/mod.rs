@@ -15,6 +15,7 @@
 //! `<[*]>` for any non-EOG token and sorted, deduplicated `!<[id,...]>` for a
 //! bounded exclusion set; neither form expands across the model vocabulary.
 
+pub(super) mod dsml_lexical;
 pub mod json_schema;
 pub mod lark;
 pub mod mask;
@@ -83,3 +84,6 @@ pub(crate) mod test_fixtures {
             .unwrap_or_else(|| panic!("unknown peer grammar fixture: {name}"))
     }
 }
+
+#[cfg(test)]
+mod dsml_lexical_tests;
