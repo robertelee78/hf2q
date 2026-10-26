@@ -1,10 +1,9 @@
 # Qwen owning-worker pool census — source candidate
 
-**Compilation intentionally pending** the root-owned publication/verification of
-mlx-native0.15.5 containing PR59/fa087c40 PoolMemorySnapshot, followed by an exact
-HF registry pin. Cargo remains0.15.4 here; no ignored local path patch is used.
-This source candidate must not land as a compilable integration before that pin.
-No model or hardware validation is claimed. Existing N4 benchmark/client freezes
+Compilation and focused contracts pass against published registry mlx-native
+0.15.5, pinned exactly in Cargo.toml and Cargo.lock. No local path patch is used.
+Actual owning-worker serving validation remains pending; no model-memory or
+performance qualification is claimed. Existing N4 benchmark/client freezes
 are untouched.
 
 `HF2Q_WORKER_POOL_CENSUS=1` opts into read-only diagnostic publication. Default OFF,
