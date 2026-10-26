@@ -158,3 +158,17 @@ weights/caches, native convenience scratch, IdMm, MTP, CPU/driver metadata and
 external competition remain separate. A later smaller/larger named policy is
 a new reviewed packet; the program does not resize this one automatically.
 Real-model execution remains separately gated on a complete memory packet.
+
+### Experimental Gemma full-input checkpoint
+
+`HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1` plus `HF2Q_UNSAFE_EXPERIMENTS=1`
+selects the default-OFF Gemma Hybrid/TQ8 SlotAware1–4 stage. Invalid or
+unacknowledged intent refuses startup; it does not silently return a weaker
+prefix contract. The stage binds the exact token identity of a cue-less
+text/tool-result input, captures at the completed full input without another
+forward/sample, and enforces a1536MiB process requested-CPU-anchor quota across
+ALL Hybrid snapshot constructors and in-flight partial captures. Payloads drop
+before reservation refund. The quota includes projected token-ledger/metadata
+bytes; allocator/OS overhead and other CPU owners are outside this domain.
+This is not a physical admission cap or default promotion. Real-GGUF controls
+and new family-explicit seven-wire semantics remain unqualified until measured.

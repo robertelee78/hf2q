@@ -4348,6 +4348,8 @@ pub fn cmd_serve(
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
 
+    crate::debug::investigation_env::gemma_full_input::selected()
+        .map_err(|error| anyhow::anyhow!(error))?;
     let mut args = args;
     let mut repository_spec = None;
     if let Some(target) = args.target.take() {

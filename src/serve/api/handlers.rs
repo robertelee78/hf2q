@@ -2087,6 +2087,7 @@ where
     // the cue and accept the boundary only when it is a strict token prefix of
     // the actual prompt. Overflow rewrites that used a different message list
     // fail this check and therefore stay cold.
+    let mut gemma_full_input_checkpoint = None;
     let stable_prompt_prefix_tokens = if matches!(
         engine.info().arch_family,
         crate::serve::load_info::ArchFamily::Gemma4 | crate::serve::load_info::ArchFamily::Qwen35
@@ -2107,6 +2108,20 @@ where
             }
         };
         let stable_tokens = stable_encoding.get_ids();
+        gemma_full_input_checkpoint = match super::engine::gemma_full_input::request_tag(
+            matches!(engine.info().arch_family, crate::serve::load_info::ArchFamily::Gemma4),
+            messages_for_render.last().is_some_and(|message| message.role == "tool")
+                && messages_for_render.iter().all(|message| message.content.as_ref()
+                    .is_none_or(|content| content.image_urls().is_empty())),
+            &prompt_tokens,
+            stable_tokens,
+        ) {
+            Ok(tag) => tag,
+            Err(error) => {
+                tracing::warn!(%error, "Gemma full-input checkpoint intent refused");
+                return Err(ApiError::internal_error().into_response());
+            }
+        };
         (!stable_tokens.is_empty()
             && stable_tokens.len() < prompt_tokens.len()
             && prompt_tokens.starts_with(stable_tokens))
@@ -2373,6 +2388,7 @@ where
         reasoning_end_tokens,
         reasoning_close_tokens,
         stable_prompt_prefix_tokens,
+        gemma_full_input_checkpoint,
         vision_fingerprint,
     };
     // Vision soft-token expansion (Phase 2c Task #17 / iter-99).  When

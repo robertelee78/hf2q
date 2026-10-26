@@ -6,6 +6,8 @@
 #[path = "cache_scaffold_plan.rs"]
 pub(crate) mod cache_scaffold_plan;
 use cache_scaffold_plan::{Modes, Phase, SlotPlan};
+#[path = "anchor_budget.rs"]
+mod anchor_budget;
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
@@ -1573,6 +1575,8 @@ pub fn splice_graft_into_hybrid_kv_single_seq(
 pub struct GemmaHybridSlotAnchor {
     prompt_len: usize,
     layers: Vec<Option<GemmaHybridSlidingLayerAnchor>>,
+    // Declared LAST: every payload Vec drops before requested bytes refund.
+    _reservation: Option<anchor_budget::Reservation>,
 }
 
 struct GemmaHybridSlidingLayerAnchor {
@@ -1624,7 +1628,14 @@ fn gemma4_copy_slot_region_out(
     );
     let per_slot = bytes.len() / n_seqs;
     let start = slot_idx * per_slot;
-    Ok(bytes[start..start + per_slot].to_vec())
+    if crate::debug::investigation_env::gemma_full_input::selected().map_err(|e| anyhow!(e))? {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(per_slot).map_err(|e| anyhow!("{name}: CPU anchor allocation: {e}"))?;
+        copy.extend_from_slice(&bytes[start..start + per_slot]);
+        Ok(copy)
+    } else {
+        Ok(bytes[start..start + per_slot].to_vec())
+    }
 }
 
 fn gemma4_copy_slot_region_in(
@@ -1668,6 +1679,9 @@ pub fn snapshot_gemma_hybrid_slot_anchor(
         prompt_len > 0,
         "Gemma slot anchor requires a non-empty prompt"
     );
+    // Reserve every planned payload/token-ledger/metadata byte before copies.
+    // Local declaration order also drops partial layers before this lease.
+    let reservation = anchor_budget::reserve(scaffold, slot.0 as usize, prompt_len)?;
     let mut layers = Vec::with_capacity(scaffold.len());
     for (layer_idx, buf) in scaffold.iter().enumerate() {
         let slot_idx = slot.0 as usize;
@@ -1735,7 +1749,7 @@ pub fn snapshot_gemma_hybrid_slot_anchor(
             bf16_xlen_v,
         }));
     }
-    Ok(GemmaHybridSlotAnchor { prompt_len, layers })
+    Ok(GemmaHybridSlotAnchor { prompt_len, layers, _reservation: reservation })
 }
 
 /// Restore one idle slot to a captured prompt boundary.
