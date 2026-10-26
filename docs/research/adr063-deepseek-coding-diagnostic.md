@@ -3,7 +3,9 @@
 Source-only candidate from main553dc7e26481ea23ce7073d1d4b99f2eac7e1667.
 No imports, tests, builds, models, HTTP or GPU execution by source author. This
 is a test-client family arm, never production model routing or a cache fallback.
-Qwen remains default. The separate unmerged peer adapter is NOT stacked here.
+Qwen remains default. This topic now composes with merged peer adapter PR394/main98fdffa1.
+Supported arms are Qwen HF, Qwen N4 peer, and DeepSeek HF N1/N4;
+DeepSeek peer and every N1 peer selection refuse before output/HTTP/tool work.
 
 `qwen38_n1_smoke.py --family deepseek4 --diagnostic-slots 1` selects N1;
 `qwen_n4_live_smoke.py --family deepseek4` coordinates N4. Historical filenames
@@ -70,3 +72,14 @@ model has run under this adapter yet. The greedy/max-reasoning diagnostic lane
 is explicit; a captured production-client settings lane remains a separate F2
 obligation. Exact family-native prefix replay and real memory/quality evidence
 remain pending.
+
+
+Merge composition preserves independent selectors: --family defaults qwen and
+--engine-kind defaults hf2q. Family selects schema/native controls; engine
+selects HF versus source-bound peer readiness/usage semantics. All N4 source
+bindings now include the full eleven shared/family/peer modules and tests;
+N1 includes its seven actual shared/family modules. New approvals must use the
+combined exact hashes. No old source freeze is reused. A pure actual-selector
+control covers supported combinations and rejects DeepSeek-peer before work.
+Source integration is uncommitted pending root review/tests/merge completion;
+no source author test, import, server or model execution occurred.

@@ -3,6 +3,13 @@ from qwen38_n1_verdict import require
 FAMILIES = ('qwen', 'deepseek4')
 
 
+def validate_selection(family, engine_kind, slots):
+    require(family in FAMILIES and engine_kind in ('hf2q', 'peer') and slots in (1, 4),
+            'unsupported diagnostic selection')
+    require(engine_kind != 'peer' or (family == 'qwen' and slots == 4),
+            'only Qwen N4 peer is supported; DeepSeek peer has no qualified adapter')
+
+
 def profile(family, slots):
     require(family in FAMILIES and slots in (1, 4), 'unsupported diagnostic family/slots')
     if family == 'qwen':

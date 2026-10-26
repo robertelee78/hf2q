@@ -1,7 +1,7 @@
 """Pure controls of the actual-used family binding and request seams."""
 import copy
 import unittest
-from coding_family import preflight, profile, schema, validate_binding, request_controls
+from coding_family import preflight, profile, schema, validate_binding, request_controls, validate_selection
 from qwen38_n1_verdict import Invalid
 from qwen38_n1_smoke import PREFLIGHT
 from qwen_n4_live_smoke import preflight as n4_preflight, validate_preflight
@@ -15,6 +15,24 @@ def controls(slots):
 
 
 class FamilyControls(unittest.TestCase):
+    def test_only_supported_engine_family_selections_can_reach_work(self):
+        for family, engine, slots in [('qwen', 'hf2q', 1), ('qwen', 'hf2q', 4),
+                                      ('qwen', 'peer', 4), ('deepseek4', 'hf2q', 1),
+                                      ('deepseek4', 'hf2q', 4)]:
+            validate_selection(family, engine, slots)
+        for family, engine, slots in [('deepseek4', 'peer', 1), ('deepseek4', 'peer', 4),
+                                      ('qwen', 'peer', 1), ('gemma4', 'hf2q', 4)]:
+            with self.assertRaises(Invalid): validate_selection(family, engine, slots)
+    def test_actual_preflight_composes_family_and_engine_without_forging(self):
+        from qwen_n4_peer import preflight as peer_preflight
+        qwen_peer = peer_preflight(n4_preflight(PREFLIGHT))
+        validate_preflight({k: True for k in qwen_peer}, PREFLIGHT, 'peer', 'qwen')
+        ds_hf = preflight(n4_preflight(PREFLIGHT), 'deepseek4')
+        validate_preflight({k: True for k in ds_hf}, PREFLIGHT, 'hf2q', 'deepseek4')
+        with self.assertRaises(Invalid):
+            validate_preflight({k: True for k in qwen_peer}, PREFLIGHT, 'peer', 'deepseek4')
+        with self.assertRaises(Invalid):
+            validate_preflight({k: True for k in qwen_peer}, PREFLIGHT, 'hf2q', 'deepseek4')
     def test_qwen_default_contract_and_request_are_unchanged(self):
         self.assertEqual(profile('qwen', 1), 'adr063-qwen38-n1-live-v2')
         self.assertEqual(profile('qwen', 4), 'adr063-qwen-n4-live-v1')
@@ -30,9 +48,9 @@ class FamilyControls(unittest.TestCase):
         self.assertNotIn('auto_tq8_text_only_verified', keys)
         self.assertNotIn('pool_profile_selection_verified', keys)
         self.assertIn('deepseek4_native_cache_bound', keys)
-        validate_preflight({k: True for k in keys}, PREFLIGHT, 'deepseek4')
+        validate_preflight({k: True for k in keys}, PREFLIGHT, family='deepseek4')
         with self.assertRaises(Invalid):
-            validate_preflight({k: True for k in n4_preflight(PREFLIGHT)}, PREFLIGHT, 'deepseek4')
+            validate_preflight({k: True for k in n4_preflight(PREFLIGHT)}, PREFLIGHT, family='deepseek4')
     def test_actual_ds_binding_rejects_missing_mixed_or_divided_family(self):
         p = {'family': 'deepseek4', 'family_controls': controls(4)}
         validate_binding(p, 'deepseek4', 4)

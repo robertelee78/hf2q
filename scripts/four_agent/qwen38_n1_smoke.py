@@ -51,14 +51,20 @@ def approval(args):
     if n4:
         from qwen_n4_live_smoke import preflight, validate_agent_binding
         validate_agent_binding(packet, args.agent_id, args.run_id, args.server_pid,
-                               args.barrier_dir, args.barrier_token, args.output, args.family)
+                               args.barrier_dir, args.barrier_token, args.output, args.family, args.engine_kind)
     else:
         require(packet.get("schema") == family_contract.schema(args.family, "approval", 1), "approval schema")
         require(packet.get("profile") == family_contract.profile(args.family, 1), "operating packet identity")
+    family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
+    require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
     family_contract.validate_binding(packet, args.family, args.diagnostic_slots)
     require(packet.get("base_url") == args.base_url and packet.get("model") == args.model and
             packet.get("server_pid") == args.server_pid, "server identity drift")
-    require(set(packet.get("preflight", {})) == family_contract.preflight(preflight(PREFLIGHT) if n4 else PREFLIGHT, args.family) and
+    keys = family_contract.preflight(preflight(PREFLIGHT) if n4 else PREFLIGHT, args.family)
+    if args.engine_kind == "peer":
+        from qwen_n4_peer import preflight as peer_preflight
+        keys = peer_preflight(keys)
+    require(set(packet.get("preflight", {})) == keys and
             all(v is True for v in packet["preflight"].values()), "preflight unknown")
     require(packet.get("sandbox_proof_sha256") == args.sandbox_proof_sha256,
             "sandbox proof binding")
@@ -72,7 +78,8 @@ def approval(args):
         "coding_family.py", "test_coding_family.py")]
     if n4:
         source_paths += [Path(__file__).with_name(n) for n in
-                         ("qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py")]
+                         ("qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py",
+                          "qwen_n4_peer.py", "test_qwen_n4_peer.py")]
     require(packet.get("sources") == {p.name: child.digest(p) for p in source_paths}, "client source drift")
     require(packet.get("approved") is True, "explicit internal operating approval absent")
     proof = child.validate_proof(args.sandbox_proof, args.sandbox_proof_sha256)
@@ -93,7 +100,7 @@ def request_timeout(_signum, _frame):
     raise TimeoutError("absolute request deadline")
 
 
-def exchange(base, request, output, turn, seen, deadline=900):
+def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"):
     raw_request = wire(request)
     (output / "request.json").write_bytes(raw_request)
     endpoint = urlsplit(base)
@@ -135,9 +142,9 @@ def exchange(base, request, output, turn, seen, deadline=900):
                     total += len(block)
                     require(total <= RAW_LIMIT, "response wire32MiB envelope")
                     chunks.append(block)
-                message, call, stats = unary(b"".join(chunks), request["model"], turn, seen)
+                message, call, stats = unary(b"".join(chunks), request["model"], turn, seen, engine_kind)
             else:
-                parser = SSE(request["model"], turn, seen)
+                parser = SSE(request["model"], turn, seen, engine_kind)
                 frame, pending = [], bytearray()
                 while True:
                     require(time.monotonic() - started <= deadline and not INTERRUPTED, "request deadline")
@@ -198,7 +205,9 @@ def main():
     for name in ("agent-id", "run-id", "barrier-dir", "barrier-token"):
         parser.add_argument("--" + name)
     parser.add_argument("--family", choices=family_contract.FAMILIES, default="qwen")
+    parser.add_argument("--engine-kind", choices=("hf2q", "peer"), default="hf2q")
     args = parser.parse_args()
+    family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
     os.umask(0o077)
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
@@ -217,6 +226,7 @@ def main():
     tools = None
     try:
         packet = approval(args)
+        summary["engine_kind"] = args.engine_kind
         if args.family == "deepseek4": summary["family_controls"] = packet["family_controls"]
         save(output / "approval-copy.json", packet)
         require(Path(args.cargo).is_absolute() and Path(args.cargo).is_file(), "verified absolute cargo")
@@ -261,7 +271,7 @@ def main():
             turn_output = output / f"turn-{turn}"
             turn_output.mkdir(mode=0o700)
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
-                                               deadline=min(900, 7200 - (time.monotonic() - started)))
+                                               deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind)
             summary["turns"].append(receipt)
             messages.append(message)
             if call is not None:
