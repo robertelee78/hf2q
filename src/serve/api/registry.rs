@@ -8271,3 +8271,10 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(super) fn dsml_string_for_test(rules:&mut Vec<(String,String)>,min:u64,max:Option<u64>,json:bool)->Result<String,String>{
+    if json {dsml_string::emit_json(rules,"control",min,max)}else{dsml_string::emit(rules,"control",min,max)}
+}
+#[cfg(test)]
+pub(super) fn gbnf_literal_for_test(value:&str)->String{gbnf_literal(value)}

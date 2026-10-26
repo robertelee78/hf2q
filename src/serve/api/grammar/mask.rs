@@ -307,7 +307,11 @@ pub fn mask_invalid_tokens_with_eog(
         });
     }
 
-    let rejects = reject_candidates(&grammar.grammar, &grammar.stacks, &candidates, &code_points);
+    let scans = grammar.dsml_guard.as_ref().map(|_| {
+        super::dsml_lexical::Guard::scans(grammar.dsml_scan,&candidates,&code_points)
+    });
+    let rejects = reject_candidates(&grammar.grammar, &grammar.stacks, &candidates, &code_points,
+        grammar.dsml_guard.as_deref(),scans.as_deref());
     for reject in rejects {
         if logits[reject.index].is_finite() {
             logits[reject.index] = f32::NEG_INFINITY;
