@@ -6239,6 +6239,9 @@ fn gemma4_cross_batch_eligible(
         && has_stable_boundary == require_stable_boundary
 }
 
+#[path = "engine_gemma_cold_batch.rs"]
+mod gemma_cold_batch;
+
 fn gemma4_batch_rows_within_transaction_limit<I>(rows: I) -> bool
 where
     I: IntoIterator<Item = usize>,
@@ -14269,22 +14272,24 @@ fn admit_gemma4_slots_batched(
     supervisor: &EngineSupervisor,
     requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>,
 ) -> Option<SlotAwareGpuFatal> {
-    // The family watchdog bound applies to the complete Metal transaction,
-    // not independently to every lane. Direct/internal callers that hand us
-    // a larger aggregate are routed through the bounded single-slot state
-    // machine instead of constructing a 16K-32K multi-sequence forward.
-    let transaction_too_large = !gemma4_batch_rows_within_transaction_limit(
-        requests.iter().map(|(prompt, _, _)| prompt.len()),
-    );
-    let has_tiny_prefill = requests.iter().any(|(prompt, _, _)| {
-        !crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
-            prompt.len(),
-            false,
+    // A missing generation cue does not imply a cold conversation. The
+    // Gemma tool-response template can render S == P while this request
+    // still extends a retained slot/anchor. Never reset that state in the
+    // cold cohort; the existing single-slot path selects/restores it.
+    let plan = gemma_cold_batch::plan(requests.iter().map(|(prompt, params, _)| {
+        let cached = preferred_gemma4_slot_for_request(
+            retained_tokens,
+            prompt_anchors,
+            slots,
+            prompt,
+            params.vision_fingerprint,
         )
-    });
-    if transaction_too_large || has_tiny_prefill {
+        .map_or(0, |preference| preference.cached_tokens);
+        (prompt.len(), cached)
+    }));
+    if plan.requires_slot_admission() {
         #[cfg(test)]
-        if has_tiny_prefill {
+        if plan.has_tiny_prefill {
             GEMMA4_TINY_PREFILL_BATCH_FALLBACK_COUNT
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
