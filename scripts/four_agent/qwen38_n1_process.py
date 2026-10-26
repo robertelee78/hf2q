@@ -1,4 +1,5 @@
 """Bounded owned-tool process supervision. No execution on import."""
+import errno
 import hashlib
 import json
 import os
@@ -129,7 +130,7 @@ def tree(rows, leader, known):
 
 def stop_group(process, known):
     """Metrics never gate killing the owned PG or bounded reap; uncertainty stays failure."""
-    result = {"actions": [], "errors": [], "reaped": False, "verified": False}
+    result = {"actions": [], "errors": [], "warnings": [], "reaped": False, "verified": False}
 
     def observe():
         rows = None
@@ -152,6 +153,15 @@ def stop_group(process, known):
             result["actions"].append({"pgid": process.pid, "signal": sig.name})
         except ProcessLookupError:
             pass
+        except PermissionError as exc:
+            if exc.errno == errno.EPERM:
+                # A completed child can disappear between inventory and signaling.
+                # This diagnostic is resolved ONLY by successful reap + final empty inventory.
+                result["warnings"].append({"operation": "killpg", "errno": exc.errno,
+                                           "pgid": process.pid, "signal": sig.name,
+                                           "error": str(exc), "resolved": False})
+            else:
+                result["errors"].append(f"killpg: {exc}")
         except BaseException as exc:
             result["errors"].append(f"killpg: {exc}")
         # Escaped PIDs may be signaled only with the earlier observed identity intact.
@@ -187,7 +197,11 @@ def stop_group(process, known):
     except BaseException as exc:
         result["errors"].append(f"bounded reap: {exc}")
     _, live = observe()
+    result["final_observation"] = {"available": live is not None,
+                                   "live_owned_pids": sorted(live) if live is not None else None}
     result["verified"] = live == set() and result["reaped"] and not result["errors"]
+    for warning in result["warnings"]:
+        warning["resolved"] = result["verified"]
     return result
 
 
