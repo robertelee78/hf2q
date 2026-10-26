@@ -171,8 +171,8 @@ thiserror = "2"
 # direct packed Q5_K/Q6_K embedding gathers and deterministic lowest-index
 # argmax tie handling, native BF16 GGUF/dense/expert execution, and sticky
 # expert-ID validation and optional deduplicated pool checkpoints use the
-# published mlx-native 0.15.5 contract.
-mlx-native = "=0.15.5"
+# published mlx-native 0.15.6 contract.
+mlx-native = "=0.15.6"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
@@ -295,6 +295,8 @@ futures-util = "0.3"
 resvg = { version = "=0.47.0", default-features = false }
 
 [build-dependencies]
+# Same locked parser/features as the runtime manifest reader; build-time pin identity.
+toml = { version = "=1.1.4", default-features = false, features = ["parse", "display", "serde"] }
 # ADR-051 compiles the exact hf2q.us SVG into deterministic native-protocol
 # and ANSI raster assets. Keeping resvg out of the runtime path avoids adding
 # logo rendering latency to every interactive hf2q invocation. The logo has
