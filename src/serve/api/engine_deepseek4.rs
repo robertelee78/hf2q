@@ -7,6 +7,7 @@
 
 mod progress;
 mod sampling;
+mod slot_provision;
 mod slots;
 mod stream;
 
@@ -342,7 +343,12 @@ impl Deepseek4Session {
                 .plant_compressed_graft(&bound.bank)
                 .with_context(|| "DeepSeek-V4 compressed_kv graft splice at slot creation")?;
         }
-        Ok(Self {
+        Ok(Self::from_empty_cache(loaded, cache))
+    }
+
+    /// Move an independently owned cache; no tensor payload is cloned.
+    fn from_empty_cache(loaded: &Deepseek4LoadedModel, cache: Deepseek4Cache) -> Self {
+        Self {
             cache,
             committed_tokens: Vec::new(),
             live_logits: None,
@@ -353,7 +359,7 @@ impl Deepseek4Session {
             keep_turn_anchor_on_success: false,
             request_anchor_transaction_active: false,
             disk_persistor: loaded.disk_persistor.clone(),
-        })
+        }
     }
 
     pub(super) fn committed_tokens(&self) -> &[u32] {
@@ -991,21 +997,7 @@ impl Deepseek4LoadedModel {
     }
 
     pub(super) fn provision_slot_sessions(&mut self, max_slots: u32) -> Result<()> {
-        anyhow::ensure!(max_slots > 0, "DeepSeek-V4 max_slots must be nonzero");
-        let mut sessions = Vec::with_capacity(max_slots as usize);
-        for slot in 0..max_slots {
-            sessions.push(
-                Deepseek4Session::new(self)
-                    .with_context(|| format!("reserve DeepSeek-V4 logical slot {slot}"))?,
-            );
-        }
-        tracing::info!(
-            max_slots,
-            logical_context_per_slot = self.context_limit(),
-            "DeepSeek-V4 full-context agent slots reserved"
-        );
-        self.slot_sessions = Some(sessions);
-        Ok(())
+        slot_provision::provision(self, max_slots)
     }
 
     pub(super) fn take_slot_sessions(&mut self) -> Result<Vec<Deepseek4Session>> {
