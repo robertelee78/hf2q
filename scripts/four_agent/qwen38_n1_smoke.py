@@ -100,8 +100,19 @@ def request_timeout(_signum, _frame):
     raise TimeoutError("absolute request deadline")
 
 
-def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"):
-    raw_request = wire(request)
+def build_request(model, messages, schemas, turn, family="qwen"):
+    """Actual shared request construction, before the exchange wire boundary."""
+    request = {"model": model, "messages": messages, "tools": schemas,
+               "tool_choice": "auto", "max_completion_tokens": 8192,
+               "logprobs": False, "hf2q_overflow_policy": "reject", "stream": turn % 2 == 1}
+    family_contract.request_controls(request, family)
+    if request["stream"]:
+        request["stream_options"] = {"include_usage": True}
+    return request
+
+
+def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen"):
+    raw_request = wire(request, family)
     (output / "request.json").write_bytes(raw_request)
     endpoint = urlsplit(base)
     require(endpoint.scheme == "http" and endpoint.hostname == "127.0.0.1" and endpoint.port and
@@ -262,16 +273,11 @@ def main():
         for turn in range(7):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
             os.kill(args.server_pid, 0)
-            request = {"model": args.model, "messages": messages, "tools": schemas,
-                       "tool_choice": "auto", "max_completion_tokens": 8192,
-                       "logprobs": False, "hf2q_overflow_policy": "reject", "stream": turn % 2 == 1}
-            family_contract.request_controls(request, args.family)
-            if request["stream"]:
-                request["stream_options"] = {"include_usage": True}
+            request = build_request(args.model, messages, schemas, turn, args.family)
             turn_output = output / f"turn-{turn}"
             turn_output.mkdir(mode=0o700)
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
-                                               deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind)
+                                               deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind, family=args.family)
             summary["turns"].append(receipt)
             messages.append(message)
             if call is not None:

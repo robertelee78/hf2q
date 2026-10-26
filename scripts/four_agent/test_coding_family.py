@@ -1,9 +1,14 @@
 """Pure controls of the actual-used family binding and request seams."""
 import copy
 import unittest
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 from coding_family import preflight, profile, schema, validate_binding, request_controls, validate_selection
 from qwen38_n1_verdict import Invalid
-from qwen38_n1_smoke import PREFLIGHT
+from qwen38_n1_smoke import PREFLIGHT, build_request, exchange
+from qwen38_n1_verdict import wire
 from qwen_n4_live_smoke import preflight as n4_preflight, validate_preflight
 
 
@@ -79,5 +84,55 @@ class FamilyControls(unittest.TestCase):
         self.assertNotEqual(schema('qwen', 'agent-result', 4), schema('deepseek4', 'agent-result', 4))
         with self.assertRaises(Invalid): profile('approximately-deepseek', 4)
         with self.assertRaises(Invalid): request_controls({}, 'gemma4')
+
+
+    def test_actual_builder_then_exchange_wire_accepts_both_families_all_turns(self):
+        schemas = [{"type": "function", "function": {"name": name, "strict": False}}
+                   for name in ("read_file", "write_file", "run_tests")]
+        messages = [{"role": "user", "content": "actual coding task"}]
+        for family in ("qwen", "deepseek4"):
+            for turn in range(7):
+                with self.subTest(family=family, turn=turn), tempfile.TemporaryDirectory() as tmp:
+                    request = build_request("actual-model", messages, schemas, turn, family)
+                    # Reach the real exchange's wire validation/archive boundary.
+                    # Constructor sentinel prevents any socket/HTTP execution.
+                    with patch("qwen38_n1_smoke.http.client.HTTPConnection",
+                               side_effect=RuntimeError("validated-before-HTTP")):
+                        with self.assertRaisesRegex(RuntimeError, "validated-before-HTTP"):
+                            exchange("http://127.0.0.1:18240/v1", request, Path(tmp),
+                                     turn, set(), family=family)
+                    observed = json.loads((Path(tmp) / "request.json").read_bytes())
+                    self.assertEqual(observed, request)
+                    self.assertEqual(observed["messages"], messages)
+                    self.assertEqual(observed["tools"], schemas)
+                    self.assertEqual(observed["max_completion_tokens"], 8192)
+                    self.assertEqual(observed["stream"], turn % 2 == 1)
+                    if family == "deepseek4":
+                        qwen = build_request("actual-model", messages, schemas, turn, "qwen")
+                        self.assertEqual({k: v for k, v in observed.items()
+                                          if k not in ("temperature", "reasoning_effort")}, qwen)
+                        self.assertEqual(observed["temperature"], 0)
+                        self.assertEqual(observed["reasoning_effort"], "max")
+                    else:
+                        self.assertNotIn("temperature", observed)
+                        self.assertNotIn("reasoning_effort", observed)
+
+    def test_actual_ds_builder_rejects_wrong_family_missing_or_changed_controls(self):
+        schemas = [{"function": {"name": n, "strict": False}}
+                   for n in ("read_file", "write_file", "run_tests")]
+        request = build_request("DS", [], schemas, 0, "deepseek4")
+        with self.assertRaises(Invalid): wire(request)  # Default Qwen stays strict.
+        for key in ("temperature", "reasoning_effort"):
+            bad = dict(request)
+            del bad[key]
+            with self.subTest(missing=key), self.assertRaises(Invalid):
+                wire(bad, "deepseek4")
+        for key, value in (("temperature", True), ("temperature", 0.5),
+                           ("reasoning_effort", "none"), ("seed", 0),
+                           ("repetition_penalty", 1.05), ("chat_template_kwargs", {}),
+                           ("thinking_budget", 512), ("max_completion_tokens", 128)):
+            with self.subTest(changed=key), self.assertRaises(Invalid):
+                wire({**request, key: value}, "deepseek4")
+        with self.assertRaises(Invalid): wire(request, "approximately-deepseek")
 
 if __name__ == '__main__': unittest.main()

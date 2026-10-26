@@ -53,14 +53,24 @@ def loads(raw):
                       parse_constant=lambda x: (_ for _ in ()).throw(Invalid(x)))
 
 
-def wire(request):
+def wire(request, family="qwen"):
+    require(family in ("qwen", "deepseek4"), "unsupported request family")
     require(request.get("max_completion_tokens") == 8192, "output allowance drift")
     require(request.get("tool_choice") == "auto", "tool choice drift")
     require(request.get("logprobs") is False and "response_format" not in request,
             "constraint settings drift")
-    for key in ("temperature", "top_p", "top_k", "min_p", "seed",
+    for key in ("top_p", "top_k", "min_p", "seed",
                 "frequency_penalty", "presence_penalty", "repetition_penalty"):
         require(key not in request, f"captured omission changed: {key}")
+    if family == "qwen":
+        require("temperature" not in request, "captured omission changed: temperature")
+        require("reasoning_effort" not in request, "Qwen reasoning control drift")
+    else:
+        require(type(request.get("temperature")) in (int, float) and
+                request["temperature"] == 0, "DeepSeek greedy temperature required")
+        require(request.get("reasoning_effort") == "max", "DeepSeek max reasoning required")
+        require("chat_template_kwargs" not in request and "thinking_budget" not in request,
+                "DeepSeek must use native reasoning controls")
     require(request.get("hf2q_overflow_policy") == "reject", "overflow policy drift")
     require(len(request.get("tools", [])) == 3, "tool schema count drift")
     require({t["function"]["name"] for t in request["tools"]} == TOOLS, "tool names")

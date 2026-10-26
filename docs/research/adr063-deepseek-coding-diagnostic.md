@@ -83,3 +83,20 @@ combined exact hashes. No old source freeze is reused. A pure actual-selector
 control covers supported combinations and rejects DeepSeek-peer before work.
 Source integration is uncommitted pending root review/tests/merge completion;
 no source author test, import, server or model execution occurred.
+
+
+## Family-specific request validation repair
+
+The first actual DeepSeek N1 attempt reached successful server warmup but its
+client failed before any HTTP generation: the shared wire validator still
+required Qwen's omitted temperature after the DeepSeek builder added explicit0.
+That attempt remains failed; no tool, prefix or model-quality result is claimed.
+The corrected production-used diagnostic builder is shared by the live loop and
+controls. Exchange passes explicit family to wire validation: Qwen keeps omitted
+sampling, while DeepSeek requires temperature0/max reasoning and rejects Qwen
+Jinja/thinking kwargs. Other request fields/output allowance/tool semantics are
+unchanged. New pure regressions exercise actual builder then exchange validation
+and archived request bytes before a constructor sentinel prevents HTTP, across
+all seven turns for both families; missing/mutated/mixed-family controls reject.
+Author has not imported or executed these controls; root owns validation and any
+new prospective packet. This repair does not rescore the failed attempt.
