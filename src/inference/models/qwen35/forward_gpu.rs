@@ -3559,6 +3559,7 @@ impl Qwen35Model {
     /// this model. Performs the same one-time weight upload that
     /// `forward_gpu_impl` does on its first call.
     pub fn ensure_gpu_cache_primed(&self) -> Result<()> {
+        let pool_operation = super::decode_pool::profile::Operation::enter(self as *const _ as usize)?;
         let self_ptr = self as *const _ as *const ();
         #[cfg(test)]
         let loaded_candidate_identity =
@@ -3572,7 +3573,9 @@ impl Qwen35Model {
                 .as_ref()
                 .map_or(true, |cache| !gpu_cache_matches_model(cache, self))
             {
+                super::decode_pool::profile::before_device_creation(self as *const _ as usize)?;
                 let device = MlxDevice::new().context("ensure_gpu_cache_primed: MlxDevice::new")?;
+                super::decode_pool::profile::bind(self as *const _ as usize, &device)?;
                 let mut registry = KernelRegistry::new();
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
                 // Register flash_attn_vec for decode-path SDPA instead of the
@@ -3774,7 +3777,9 @@ impl Qwen35Model {
                 });
             }
             Ok(())
-        })
+        })?;
+        pool_operation.complete()?;
+        Ok(())
     }
 
     /// Run a closure with mutable access to the verifier's cached GPU
@@ -3790,7 +3795,8 @@ impl Qwen35Model {
         &self,
         f: impl FnOnce(&MlxDevice, &mut KernelRegistry) -> Result<R>,
     ) -> Result<R> {
-        GPU_CACHE.with(|cell| -> Result<R> {
+        let pool_operation = super::decode_pool::profile::Operation::enter(self as *const _ as usize)?;
+        let result = GPU_CACHE.with(|cell| -> Result<R> {
             let mut guard = cell.borrow_mut();
             let cache = guard
                 .as_mut()
@@ -3800,7 +3806,9 @@ impl Qwen35Model {
                 "with_gpu_cache_mut: GPU_CACHE belongs to a different Qwen35Model"
             );
             f(&cache.device, &mut cache.registry)
-        })
+        })?;
+        pool_operation.complete()?;
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -3959,6 +3967,12 @@ impl Qwen35Model {
         // and off otherwise.
         mut residual_capture: Option<ResidualLayerCapture<'_>>,
     ) -> Result<Vec<f32>> {
+        let pool_operation = super::decode_pool::profile::Operation::enter(self as *const _ as usize)?;
+        super::decode_pool::profile::reject_unsupported(
+            capture.is_some() || residual_capture.is_some() || !soft_tokens.is_empty()
+                || deepstack.is_some() || matches!(output_head_mode, OutputHeadMode::EmbedLast),
+        )?;
+        if super::decode_pool::profile::selected() { self.ensure_gpu_cache_primed()?; }
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
         }
@@ -4025,7 +4039,9 @@ impl Qwen35Model {
         // pool-allocated `MlxBuffer` is locally bound inside this function's
         // call tree and out-of-scope by the time we return, so the next
         // call's reset moves them all to the free list as expected.
-        super::decode_pool::reset_decode_pool();
+        // Previous forward has returned: pooled temporaries have no future
+        // accesses; durable nextn parents/rings are direct, not pool-issued.
+        super::decode_pool::checked_reset_decode_pool()?;
         let seq_len = tokens.len() as u32;
         // ---- ADR-019 Phase 2 iter91 Worker B (H2 production CB-count probe) ----
         //
@@ -6144,7 +6160,12 @@ impl Qwen35Model {
                 && last_layer_held_enc.is_none()
                 && super::execution_dispatch::dense_q_arena_reset_enabled()
             {
-                super::decode_pool::reset_for_prefill_chunk();
+                // Both requirements: successful K drain AND last access to
+                // issued scratch. Outer FA/DN/FFN arenas/params, positions,
+                // residual ring and durable returned parents are DIRECT roots.
+                // Pooled DN attn_out is consumed by this layer's FFN; surviving
+                // hold clones only Drop after this point, never read/replay.
+                super::decode_pool::checked_reset_for_prefill_chunk()?;
             }
 
             // ADR-019 Phase 2 iter92 — drain attn_out hold-vec at K-boundary.
@@ -6412,6 +6433,7 @@ impl Qwen35Model {
                 seq_len,
             );
         }
+        pool_operation.complete()?;
         Ok(logits)
     }
 
@@ -6447,6 +6469,8 @@ impl Qwen35Model {
         // :5380 + :5716) now receive `slot_id` verbatim.
         slot_id: SlotId,
     ) -> Result<u32> {
+        let pool_operation = super::decode_pool::profile::Operation::enter(self as *const _ as usize)?;
+        if super::decode_pool::profile::selected() { self.ensure_gpu_cache_primed()?; }
         debug_assert_eq!(
             tokens.len(),
             1,
@@ -6462,7 +6486,9 @@ impl Qwen35Model {
         // function exit, and this reset moves the pool's ARC clones back to
         // the free list for the next token's reuse.  Closes the ADR-012
         // §Optimize / Task #15 MoE dwq46 0.90× decode parity gap.
-        super::decode_pool::reset_decode_pool();
+        // Prior call drained and returned; its pooled positions/scratch have
+        // no future use. Persistent DecodeBuffers are direct device roots.
+        super::decode_pool::checked_reset_decode_pool()?;
         let seq_len = tokens.len() as u32;
         let expected_pos_len = 4 * seq_len as usize;
         if positions_flat.len() != expected_pos_len {
@@ -6491,7 +6517,9 @@ impl Qwen35Model {
                 .as_ref()
                 .map_or(true, |cache| !gpu_cache_matches_model(cache, self))
             {
+                super::decode_pool::profile::before_device_creation(self as *const _ as usize)?;
                 let device = MlxDevice::new().context("forward_gpu_greedy: MlxDevice::new")?;
+                super::decode_pool::profile::bind(self as *const _ as usize, &device)?;
                 let mut registry = KernelRegistry::new();
                 // Wave 5b.10: register flash_attn_prefill kernel family for
                 // the Qwen3.5 FA prefill path (replaces legacy `sdpa`).
@@ -7825,6 +7853,7 @@ impl Qwen35Model {
         // Profile mode is slow because labeled async commits become syncs.
         print_and_reset_cb_profile("forward_gpu_greedy");
 
+        pool_operation.complete()?;
         Ok(token_id)
     }
 

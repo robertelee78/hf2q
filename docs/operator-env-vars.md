@@ -136,3 +136,25 @@ on the locked gates at 1.31–1.67× of its throughput across Gemma 4
 and Qwen 3.6 APEX-Q5_K_M (see "Default behavior" at top for per-regime
 numbers).  Q8+rerank is the production lm_head strategy; F16 remains
 available via `HF2Q_LMHEAD_Q8=0`.
+
+### Experimental Qwen scratch-pool creation profile
+
+`HF2Q_QWEN_POOL_GROWTH_PROFILE=adr063-24g-v1` requires
+`HF2Q_UNSAFE_EXPERIMENTS=1`. Unset leaves the legacy path unchanged. Unknown
+values or a missing acknowledgment refuse requested startup; there is no
+uncapped fallback. This Category-3 profile supports the audited native
+DenseQ/MoeQ Qwen SlotAware text/tool route with one worker and one generation,
+1–4 slots. Unsupported vision/embedding/diagnostic request paths explicitly
+error under this profile; canonical projector loading is unchanged.
+
+The fixed enforcing policy is 24GiB aggregate successful bucket creation,
+16,384 roots, 32,768 constructor attempts, rank8 and batch1, with 35 exact
+power-of-two buckets1..16GiB. Free reuse consumes no new creation credit;
+reset, clear, errors and teardown never refund successful creation history.
+Failure is sticky and stops selected replay/reuse; recovery requires a new
+process, not automatic retries or a larger cap. These are operating ceilings,
+not measured requirements or a whole-memory admission decision. Direct arenas,
+weights/caches, native convenience scratch, IdMm, MTP, CPU/driver metadata and
+external competition remain separate. A later smaller/larger named policy is
+a new reviewed packet; the program does not resize this one automatically.
+Real-model execution remains separately gated on a complete memory packet.

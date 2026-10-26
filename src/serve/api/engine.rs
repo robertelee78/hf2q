@@ -936,6 +936,8 @@ impl Default for EngineMode {
 /// silent fallback to SerialFifo).
 #[derive(Debug, thiserror::Error)]
 pub enum EngineSpawnError {
+    #[error("Qwen pool profile startup refused: {cause}")]
+    QwenPoolProfile { cause: String },
     /// The requested [`EngineMode`] variant requires runtime support that
     /// has not yet landed. Carries the iter that introduced the surface
     /// (`iter_landed`, e.g. `"C2b"` for the worker-refactor commit) and
@@ -4027,14 +4029,29 @@ impl LoadInfoBuilder for LoadedModel {
 // ---------------------------------------------------------------------------
 
 impl Engine {
+    /// Last owning-worker pool observation. No native census on caller thread.
+    pub fn worker_pool_census(&self) -> serde_json::Value {
+        self.inner.supervisor.pool_census_json(matches!(
+            self.inner.info.arch_family,
+            crate::serve::load_info::ArchFamily::Qwen35
+        ))
+    }
+
     /// Spawn the worker thread and return a handle. The `queue_capacity` sets
     /// the mpsc channel buffer; when full, handlers receive a `queue_full`
     /// error and map it to 429 + Retry-After (Decision #19).
+    ///
+    /// # Panics
+    /// If a Qwen pool profile is requested (including invalid/unacknowledged
+    /// intent): use the fallible `spawn_with_mode` SlotAware API instead.
     pub fn spawn(
         loaded: LoadedModel,
         queue_capacity: usize,
         kv_cache_budget_bytes: Option<u64>,
     ) -> Self {
+        // Must precede even channel/metadata/thread creation. The normal
+        // fallible entry rejects unsupported profile/mode combinations first.
+        crate::inference::models::qwen35::decode_pool::profile::assert_direct_spawn_legacy();
         let (tx, rx) = mpsc::channel::<Request>(queue_capacity.max(1));
 
         // Iter-215 Wedge-2: accessor methods replace flat-struct field
@@ -4320,6 +4337,20 @@ impl Engine {
         kv_cache_budget_bytes: Option<u64>,
         mode: EngineMode,
     ) -> std::result::Result<Self, EngineSpawnError> {
+        if crate::inference::models::qwen35::decode_pool::profile::selected() {
+            use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights};
+            let native = match &loaded {
+                LoadedModel::Qwen35(q) => !q.model.layers.is_empty() && q.model.layers.iter().all(|layer| {
+                    matches!(layer, Qwen35LayerWeights::NativeFullAttn { .. } | Qwen35LayerWeights::NativeLinearAttn { .. })
+                        && matches!(layer.ffn(), Qwen35FfnWeights::DenseQ(_) | Qwen35FfnWeights::MoeQ(_))
+                }),
+                _ => false,
+            };
+            crate::inference::models::qwen35::decode_pool::profile::prepare(
+                matches!(&loaded, LoadedModel::Qwen35(_)),
+                match mode { EngineMode::SlotAware { max_slots } => Some(max_slots), _ => None }, native,
+            ).map_err(|e| EngineSpawnError::QwenPoolProfile { cause: e.to_string() })?;
+        }
         match mode {
             EngineMode::SerialFifo => {
                 // Delegate to the byte-equivalence entry point and then
@@ -11438,6 +11469,7 @@ fn fail_stop_slotaware_worker(
     installed: Vec<(SlotHandle, SlotReply)>,
     buffered: Vec<Request>,
 ) {
+    crate::inference::models::qwen35::decode_pool::profile::quarantine();
     let detail = format!("{:#}", fatal.error);
     let cause = match fatal.kind {
         SlotAwareFatalKind::Gpu => "fatal Metal command-buffer failure",
@@ -17070,7 +17102,7 @@ enum Qwen35WorkerFatalKind {
 }
 
 pub(super) fn is_fatal_command_buffer_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
+    crate::inference::models::qwen35::decode_pool::profile::unhealthy() || error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<mlx_native::MlxError>(),
             Some(mlx_native::MlxError::CommandBufferError(_))
@@ -17400,6 +17432,9 @@ fn qwen35_operator_request_id(handle: SlotHandle) -> u64 {
 }
 
 fn finish_qwen35_operator_request(handle: SlotHandle, outcome: &'static str) {
+    if outcome != "complete" {
+        super::engine_supervisor::qwen_pool_request_observation(handle.slot_id.0 as usize, handle.generation, outcome);
+    }
     crate::serve::operator_ui::request_finished(
         "qwen35",
         qwen35_operator_request_id(handle),
@@ -18235,6 +18270,13 @@ fn run_slot_aware_qwen35(
             return;
         }
     };
+    if let Err(error) = crate::inference::models::qwen35::decode_pool::profile::register_worker(
+        &guard.model.model as *const _ as usize,
+    ) {
+        supervisor.poison_now("qwen-pool-profile-startup");
+        drain_with_startup_error(rx, &format!("Qwen pool profile startup: {error}"));
+        return;
+    }
     let n_slots = guard.kv.as_ref().expect("kv Some at entry").n_seqs as usize;
     let prefill_chunk_tokens = qwen35_slot_prefill_chunk_tokens(n_slots);
     scheduler.set_prefill_chunk_tokens(prefill_chunk_tokens);
@@ -19717,6 +19759,8 @@ fn finish_qwen35_prefill(
         scheduler.release(handle);
         finish_qwen35_operator_request(handle, "complete");
         let result = state.finish(guard.model, registration);
+        super::engine_supervisor::qwen_pool_request_observation(handle.slot_id.0 as usize, handle.generation,
+            if result.is_ok() { "completed_post_drain" } else { "failed" });
         if let Ok(generation) = result.as_ref() {
             log_qwen35_slot_decode_complete(generation, &reply, false);
             prompt_caches[slot_idx].store(&prompt_tokens, &params, generation);
@@ -20046,6 +20090,8 @@ fn decode_batch_qwen35(
                 (prompt.to_vec(), params.clone())
             };
             let gr = state.finish(guard.model, registration);
+            super::engine_supervisor::qwen_pool_request_observation(handle.slot_id.0 as usize, handle.generation,
+                if !client_dropped && gr.is_ok() { "completed_post_drain" } else { "failed" });
             if let Ok(result) = gr.as_ref() {
                 log_qwen35_slot_decode_complete(result, &reply, client_dropped);
                 if !client_dropped {

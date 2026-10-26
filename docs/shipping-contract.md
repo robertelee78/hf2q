@@ -303,6 +303,7 @@ an explicit acknowledgment: `HF2Q_UNSAFE_EXPERIMENTS=1`.
 
 | Var | Unsafe-ack | Purpose |
 |---|---|---|
+| `HF2Q_QWEN_POOL_GROWTH_PROFILE=adr063-24g-v1` | **required** | Optional fixed Qwen native scratch-pool creation quota; default legacy unchanged. Requested invalid/unacknowledged/unsupported startup fails rather than serving uncapped. Text/tools only, 1–4 SlotAware slots, one worker/generation. Sticky refusal prevents ordinary replay/reuse. This is an enforcing domain policy, not whole-memory/model/performance admission; see operator-env-vars.md. |
 | `HF2Q_LMHEAD_RERANK=0` | **required** | Measure raw Q8 argmax cost. Reintroduces the rare near-tiebreak flip (observed as mid-decode `<pad>` emission). |
 | `HF2Q_CHUNK_SCAN_PREFILL=1` | **required** | Wave 5b iter 5 opt-in: route Qwen3.6 prefills at `seq_len > 64` through the mlx-native chunk-parallel delta-rule pipeline (`mlx_native::ops::chunk_gated_delta_rule::dispatch_chunk_gated_delta_rule_fwd`). This is a performance experiment distinct from the production autoregressive path. Decode parity ±5% (AC 5468) and walk-bar parity at pp4096+ (W-5b.3) are required before this experimental kernel can become Category 1. |
 
@@ -345,6 +346,7 @@ compatibility writers, and replay remain test-only or unavailable.
 
 | Var | Notes |
 |---|---|
+| `HF2Q_WORKER_POOL_CENSUS=1` | Opt-in read-only Qwen owning-worker pool census at successful request completion. Default OFF; no allocator hooks/new waits/resets. HTTP reads last immutable record with age/exclusions; physical residency/external owners/lifetime high-water unavailable. |
 | `HF2Q_PREFILL_DUMP`, `HF2Q_BATCHED_DUMP`, `HF2Q_BATCHED_LAYER_SCAN`, `HF2Q_DUMP_LAYERS`, `HF2Q_DUMP_BOUNDARY`, `HF2Q_DUMP_ALL_CACHE`, `HF2Q_DUMP_LAYER_DETAIL`, `HF2Q_DUMP_NORM_WEIGHT`, `HF2Q_DUMP_DIR` | Hidden-state / cache dumps; output-only, cannot affect decode. |
 | `HF2Q_DUMP_RENDERED_PROMPT`, `HF2Q_DUMP_PROMPT_TOKENS` | Prompt-path diagnostics. |
 | `HF2Q_MLX_TIMING`, `HF2Q_SPLIT_TIMING`, `HF2Q_MLX_KERNEL_PROFILE`, `HF2Q_MLX_PROFILE` | Timing / kernel-attribution diagnostics. |

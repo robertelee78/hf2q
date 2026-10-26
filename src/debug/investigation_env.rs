@@ -31,6 +31,8 @@
 //! When adding a new investigation env var, wire it here and register
 //! its classification in `docs/shipping-contract.md`.
 
+pub mod qwen_pool_profile;
+
 use std::env;
 use std::sync::{LazyLock, OnceLock};
 
@@ -72,6 +74,9 @@ pub static INVESTIGATION_ENV: LazyLock<InvestigationEnv> =
 /// the refusal to the operator.
 #[derive(Debug, Clone)]
 pub struct InvestigationEnv {
+    /// Read-only worker pool census after successful request drain; default OFF.
+    /// Does not change allocation, reset, GPU submission or failure policy.
+    pub worker_pool_census: bool,
     // ========================================================================
     // Category 4 — ack-required (known to risk correctness or reliability).
     // These fields hold the EFFECTIVE value: `true` only when the env var
@@ -758,6 +763,10 @@ pub struct InvestigationEnv {
     /// need to recheck the ack.
     #[allow(dead_code)]
     pub unsafe_experiments_acked: bool,
+    /// Optional Category-3 intent; refusal is a startup error, never fallback.
+    pub qwen_pool_profile: qwen_pool_profile::QwenPoolProfile,
+    /// Read-once exclusions for the selected serve path's NoFutureUse proof.
+    pub qwen_pool_diagnostic_conflict: bool,
 
     /// Raw (pre-gate) intents for ack-required toggles. Private; used
     /// only by [`activate`] to print REFUSED lines when the user set a
@@ -819,6 +828,7 @@ impl InvestigationEnv {
         let ack = env_eq_one("HF2Q_UNSAFE_EXPERIMENTS");
 
         Self {
+            worker_pool_census: env_eq_one("HF2Q_WORKER_POOL_CENSUS"),
             // Ack-required — effective value is raw AND ack.
             f16_kv: raw.f16_kv && ack,
             // ADR-028 iter-344: batched_prefill DECOUPLED from ack.
@@ -964,6 +974,12 @@ impl InvestigationEnv {
                 .unwrap_or(512),
 
             unsafe_experiments_acked: ack,
+            qwen_pool_diagnostic_conflict: ["HF2Q_MTP_PROFILE", "HF2Q_DUMP_LAYER_N",
+                "HF2Q_DUMP_LAYER_ACTIVATIONS", "HF2Q_DUMP_LAYER", "MLX_METAL_CAPTURE"]
+                .iter().any(|name| env::var_os(name).is_some_and(|v| !matches!(v.to_str(), Some("") | Some("0"))))
+                || qwen_pool_profile::split_profile_conflict(env::var("HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS").ok().as_deref()),
+            qwen_pool_profile: qwen_pool_profile::QwenPoolProfile::from_os(
+                env::var_os("HF2Q_QWEN_POOL_GROWTH_PROFILE").as_deref(), ack),
             raw,
         }
     }
@@ -1064,6 +1080,10 @@ impl InvestigationEnv {
     /// - **DIAGNOSTICS:** read-only / timing toggles — listed for
     ///   visibility, no behavioral implication.
     pub fn activate(&self, json_output: bool) {
+        if let Some(summary) = self.qwen_pool_profile.summary() {
+            if json_output { eprintln!("{}", serde_json::json!({"level":"warn", "message":summary})); }
+            else { eprintln!("hf2q: {summary}"); }
+        }
         // Active ack-required (user set toggle AND ack was present).
         let mut active_unsafe: Vec<(&str, &str)> = Vec::new();
         if self.f16_kv {

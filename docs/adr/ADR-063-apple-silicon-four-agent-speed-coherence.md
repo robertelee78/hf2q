@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope and F1/F3 execution entry; downstream implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-10-23 — operator approved program scope/F1/F3 entry, required wins for all four models, and clarified dual-repository ownership and publication.
+- **Updated:** 2026-10-25 — operator confirmed the host is dedicated to this work, authorized all available system RAM, and required one hf2q process at a time; scope and all-four speed/quality requirements remain unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
 - Stable source ID: ADR-063
@@ -510,17 +510,17 @@ Delivery boundary: Published v0.1.28 release containing the independently accept
 
 ### Q5. QE-prove four-slot memory safety on M5 Max 128 GB
 
-Outcome: Every accepted configuration fits the operator host with reserved system headroom and no out-of-memory experiment.
+Outcome: Every accepted configuration fits the operator host with measured system headroom and no out-of-memory experiment.
 
-Requirement: The program MUST deliver every accepted configuration fits the operator host with reserved system headroom and no out-of-memory experiment.
+Requirement: The program MUST deliver every accepted configuration fits the operator host with measured system headroom and no out-of-memory experiment.
 
 Acceptance:
 
 - Before loading, admit model residency, four-slot KV/recurrent state, anchor committed+pending bytes, drafter state and peak in-flight scratch against one disjoint unified-memory ledger; avoid double-counting shared CPU/Metal pages.
 
-- Cap experiment memory at the stricter existing family ceiling and physical memory minus at least 12 GiB system reserve; subtract observed competing nonreclaimable use. Treat 116 GiB as an upper bound on a 128 GiB host, never a promise of availability.
+- Use the dedicated host's available system RAM as authorized by the operator, replacing the earlier fixed 12 GiB reservation and 116 GiB cap. Subtract observed competing nonreclaimable use and explicitly budget observation/stop latency plus maximum in-flight allocation overshoot. Freeze the available-RAM policy, measured reaction margin and any source-justified family limit before loading and obey those limits; apply the same resource policy to comparison arms and stop on a projected breach. Physical capacity remains the hard upper bound, never a promise of availability. A reclaimable-file-cache working estimate is not unique physical-ownership evidence and MUST NOT silently refund a live allocation.
 
-- Run stock, experimental hf2q and peer sequentially, unloading and verifying listeners/process/memory recovery before each load. Never co-reside DeepSeek runtimes or add a drafter/cohort that exceeds the measured budget.
+- Run stock, experimental hf2q and peer sequentially, unloading and verifying listeners/process/memory recovery before each load. Never co-reside DeepSeek runtimes or add a drafter/cohort that exceeds the measured budget. Keep exactly one hf2q process at a time, including metadata commands; those commands must finish before the server starts.
 
 - QE uses synthetic allocation/admission negative controls and bounded real four-slot stress with the largest declared tool-result/context cases; stop on memory pressure, abnormal footprint growth or projected breach before OOM.
 
@@ -551,6 +551,10 @@ The operator authorized merging the corrected planning PR and making F1 (#356) a
 - F3 starts with the named ADR/source/paper audit. Produce a claim-to-evidence table for ADR-010/011/019/037/039/049, preserve failed experiments, correct only supported claims, run the ADR inspector and reconcile existing source-bound issue keys. Deliver reviewed documentation and verified tracking through a merge; do not change runtime behavior under F3.
 - After F1 delivery, Q5 is the next design/qualification gate; F2 waits for both F1 and Q5. F3 can proceed independently of F1. Q5 needs an independently reviewed memory ledger and bounded stress plan before model execution. No runtime candidate begins before the certified harness and applicable state/numerical contracts are frozen.
 - Each execution session claims exactly one Ready story through an awa attempt before editing, uses its own topic worktree, and reads release coordination before heavy host work. Candidate implementers and independent QE have separate identities and receipts. Only the release driver dispatches shared model gates.
+
+### Dedicated-host resource policy (operator update, 2026-10-25)
+
+The operator confirmed that this laptop is dedicated to the program and authorized using all RAM available to the system, with one hf2q process at a time. This updates Q5's resource policy; it does not accept a model configuration, waive the disjoint-ledger or bounded stress proof, reduce matched context/output/task budgets, or establish any speed win. A chosen reaction margin must be tied to observed stop latency and allocation overshoot rather than retained as an unexplained fixed reservation.
 
 ## Consequences
 
