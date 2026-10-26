@@ -269,3 +269,127 @@ ordinary lanes; exact supported dense graph modes; existing primitive versus nat
 extension disposition; numerical thresholds; cache commit/failure boundary; and a
 source-closed peak packet. These are concrete decisions for this design, not a new
 universal preflight framework or permission to change workload to obtain a win.
+
+## All-family and heterogeneous-phase audit addendum
+
+Source audit at design commit `f8741fab0536e728522eb22243ba04f592344518`
+(base graph remains98fdffa1). This addendum is a concrete disposition plan, not
+approval or completion of S3. Source describes capability; F2 traces must show
+actual selection, row widths and cost before choosing an optimization.
+
+| Family | Actual existing shared path | Missing disposition / smallest next step |
+|---|---|---|
+| Dense Q38 | scheduler handle loop, no cross-slot target graph | Implement the reviewed projection/state split only after ordinary/AUTO occupancy measurement supports it; keep this note's pending-state and failure contracts. |
+| Q36 MoE | same per-slot Qwen driver; `gpu_ffn.rs::build_moe_ffn_layer_gpu_q_into` accepts token rows and `dispatch_moe_id_routed` selects affine or GGML expert operation | Reuse shared attention/DeltaNet seams, but separately pack independent normalized lane rows for router/top-k, expert gate/up/down and shared expert; preserve original lane-major row-to-expert mapping, top-k weights and reduction order. No dense-FFN substitution. |
+| Gemma4 | `engine.rs::decode_batch_gemma4` gathers tokens, SlotIds and per-lane positions then calls `weights.forward_decode_body_batched`; Hybrid versus FullTq follows the same provisioned regime, missing Hybrid errors | Profile body/head shared projections versus per-slot attention first. Do not add a second batched body merely to claim S3 coverage. Extend only a measured gap with independent-versus-existing-batched controls. |
+| DeepSeek4 | `plan_deepseek4_decode_cohort` and `try_decode_batch_deepseek4_cohort`; cooperative prefill packs sequence-local attention outputs for shared row-local FFN/MoE | Measure cohort selection coverage and retained serial work. Decode currently requires exactly four warm, unary, open-client, installed-compatible handles and no active cold prefill. SSE, ragged2/3 and mixed phases are real selection gaps, not proof of missing native matmul. |
+
+### Q36 expert-specific contract
+
+The existing Qwen MoE helper already has row-oriented input/output and a routed
+expert API; this is evidence for an hf2q assembly candidate, not proof its current
+scratch/layout can safely accept an arbitrary cohort. Check `seq_len*top_k`
+with actual expert count and vocabulary/configuration before allocation. Router,
+IDs and mixture weights remain separate per row; pack/unpack must preserve exact
+row ordering through expert permutation and shared-expert addition. Use the
+existing native `quantized_matmul_id_ggml_pooled[_with_policy]` or paired/slotted
+forms only where their actual contracts fit supplied scratch. Four independent
+rows are neither four experts nor temporal verification rows. The seq_len>=32
+fused expert route in HF must not be forced for M4; preserve capability routing.
+
+Decisive tiny controls use distinct expert choices and mixtures per lane, repeated
+experts, ties, noncontiguous slots and permutation reversal, with unchanged serial
+MoE as reference and independent small routed-sum oracle. Bind affine/DWQ versus
+legacy GGML configuration; either explicitly support each exact route or refuse
+before writes. Missing expert permutation/layout/reduction functionality belongs
+in native with a separate issue/publication/pin; no HF kernel or approximate
+fallback. MoE scratch/IdMm old+new and row-count bucket transitions enter Q5.
+
+### Gemma: do not regress an existing batch implementation
+
+`batched_body.rs` accepts slot_ids and seq_positions, builds position/slot buffers,
+and derives separate graft-relative ring positions where needed. Preserve absolute
+RoPE versus ring/cache indexing; a common position across lanes is incorrect.
+The serve caller increments per-lane cache ledgers after successful batched body;
+its error/recovery, cancelled lanes and fused/separate head routes must be traced
+as a transaction, not replaced by Qwen pending-parity rules. No DeltaNet parity
+exists to transplant here. Test Hybrid/FullTq capability selection against actual
+provisioned scaffolds, ragged positions and sliding-ring wrap, and check untouched
+slots and returned per-row logits. Source mode selection must never silently use
+FullTq when default Hybrid was requested but absent.
+
+A measured shared-weight gap can use native existing dense/quantized operations
+and broadcast batching where layout supports it. Attention remains per-sequence
+unless an actual batched API carries the heterogeneous slot/ring/length inputs.
+Before proposing any new kernel, record body/head dispatch dimensions and actual
+native entrypoints for the selected artifact. The existing body itself is the
+primary control; a new implementation must beat that, not an invented serial-only
+Gemma baseline.
+
+### DeepSeek: narrow eligibility before mixed policy
+
+`plan_deepseek4_decode_cohort` sorts handles, verifies installed generations,
+requires warm decode, unary replies, clients open, no active cold prefills and
+`decode_cohort_compatible_with` for caches. The run path prepares every lane each
+tick; terminal/error lanes break lockstep and sampled peers commit through the
+existing exact serial path. Changing width or allowing SSE requires a new checked
+cohort descriptor and per-lane reply/token publication; it is not removing the
+eligibility conditional. Preserve one token's sample/commit accounting when a
+lane reaches EOS or errors, and source-audit when serial fallback is still
+pre-write/exact versus post-state mutation.
+
+`verifier_forward.rs::forward_verifier_prefill_cohort_with_commit_gate` already
+accepts separate token batches and mutable caches. It performs sequence-local
+attention/cache updates, packs rows for shared FFN/MoE, and publishes logical
+cursors after all GPU transactions and the commit gate. If work was submitted
+and errors, cache poison is explicit. This is the closest existing heterogeneous
+row assembly precedent, but is NOT automatically safe to combine with unrelated
+decoders. DeepSeek S1 mixed-cohort/nonmember isolation remains its own proof gate;
+keep the existing bypass until success, late failure, poison and cancellation
+prove nonmember state and subsequent outputs equal independent execution.
+
+Small first S3 measurement: classify warm-unary4 cohort rate, missed SSE/ragged
+cohorts and attention-versus-shared-FFN costs. If eligibility loss dominates,
+propose exact ragged/SSE assembly before a new math kernel. Preserve compressor,
+indexer, circular raw window, ledgers and ownership of every cache root. Tiled
+indexer selection is already shipped; do not count it as newly missing shared
+work or apply Qwen TQ state rules to DeepSeek.
+
+### Heterogeneous admission and fairness
+
+Introduce no universal flat row batch. A prospective `TargetLaneDescriptor` needs
+family/config/device generation, full SlotHandle, phase (ordinary/prefill/verify),
+absolute positions and row span, writable cache/state ranges, dependency/commit
+group and reply/cancel owner. The family planner decides which exact combinations
+are supported. Homogeneous ordinary dense decode is the initial implementation
+subset. Mixed phases retain existing scheduling when no proved family graph can
+express them; refusal occurs before mutation, with original FIFO/admission and
+decode fairness preserved. Never delay an eligible decoder indefinitely waiting
+for width4 or convert useful AUTO speculation into ordinary rows to fill a batch.
+
+Any later heterogeneous cohort uses an explicit total row/work budget and
+per-lane transaction boundaries. A prompt's2048-row span must not receive one
+turn of service as though equivalent to one decode token. Retain scheduler
+reservation/output/context limits and verify maximum waiting time, semantic TTFT,
+prefix reuse, cancellation and finished-lane release against the independent
+schedule. Record row maps and nonmember canaries; no queue-depth statistic alone
+proves physical batching or fairness. The current scheduler policy is the control,
+not an opportunity to change workload or sampling.
+
+### Dependency and execution disposition
+
+HF owns family cohort eligibility, packed-row assembly, graph-state transactions,
+reply/sampling and scheduling fairness. Native owns dense/expert matmul, attention,
+copy/layout primitives, dispatch capability and device synchronization guarantees.
+Existing native APIs are candidates only after checked dtype/stride/alias/input
+contracts are matched; absent functionality gets a separate native issue, tiny
+oracle, published release and clean HF pin. The0.15.5 pool snapshot is observation
+only and adds no shared-target primitive.
+
+Before implementation selection, produce one compact per-family disposition
+record: actual selected row histogram/cost; existing entrypoint; missing assembly
+or primitive; exact numerical/quality oracle; source peak delta; and either a
+reviewed candidate or measured no-benefit/not-selected result. No all-family
+implementation is promised by the dense first slice. S3 remains Designing; F2,
+Q1 and Q5 execution gates are not bypassed, and only measured matched goodput/
+makespan/fairness can establish an accepted improvement.
