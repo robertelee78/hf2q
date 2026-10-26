@@ -332,3 +332,35 @@ fn deepseek_safe_compiled_pattern_and_format_alphabets_preserve_constraints() {
         false
     ));
 }
+
+#[test]
+fn deepseek_bounded_data_guard_survives_actual_three_tool_combiner() {
+    for n in [4096, 65_536] {
+        let schema=serde_json::json!({"type":"string","minLength":n,"maxLength":n});
+        assert!(compiled_accepts_wire(schema.clone(),&"a".repeat(n),false,true));
+        assert!(!compiled_accepts_wire(schema.clone(),&"a".repeat(n-1),false,true));
+        assert!(!compiled_accepts_wire(schema,&"a".repeat(n+1),false,true));
+    }
+    let pair=serde_json::json!({"type":"string","minLength":2,"maxLength":2});
+    assert!(compiled_accepts_wire(pair.clone(),r"\x",false,true));
+    assert!(compiled_accepts_wire(pair,"😀é",false,true));
+    assert!(!compiled_accepts_wire(serde_json::json!({"type":"string","maxLength":1}),r"\x",false,true));
+    assert!(!compiled_accepts_wire(serde_json::json!({"type":"string","maxLength":64}),
+        "x</｜DSML｜parameter>y",false,true));
+}
+
+#[test]
+fn deepseek_literal_trailing_backslash_survives_other_raw_tool_and_union() {
+    // The real three-tool request always includes generic raw write_file
+    // content. A literal branch must not inherit that other branch's escape
+    // completion constraint. PR402's literal emitter allowed these values.
+    let value="x\\";
+    for schema in [
+        serde_json::json!({"type":"string","const":value}),
+        serde_json::json!({"type":"string","enum":[value]}),
+        serde_json::json!({"anyOf":[{"type":"string","const":value},{"type":"string","maxLength":8}]}),
+    ] {
+        assert!(compiled_accepts_wire(schema,value,false,true),
+            "literal escape ending must not inherit another raw branch's end guard");
+    }
+}

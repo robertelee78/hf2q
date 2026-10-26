@@ -2085,3 +2085,7 @@ cue forward. Retaining an earlier S458 anchor may avoid a full reset, but is not
 proof that every later complete P boundary is reused. Future family-explicit
 boundary/capture proof and actual seven-wire replay remain required; no generic
 oracle relaxation or forced enable_thinking is authorized by this change.
+
+The subsequent [four-agent serving proof](../research/adr063-gemma-full-input-four-agent-proof.md)
+verified full-input reuse for all four fixed coding conversations. It does not
+promote the experiment or establish a speed win.
