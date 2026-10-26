@@ -249,3 +249,6 @@ fn gemma4_exact_prefix_post_oracle() {
         .write_all(serde_json::to_string_pretty(&output).unwrap().as_bytes())
         .unwrap();
 }
+
+#[path = "handlers_gemma_prefix_failure_tests.rs"]
+mod partial_failure;

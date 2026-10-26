@@ -43,3 +43,25 @@ Outputcreate_new0600 outside Git records actual config/evidence/source hashes,
 row token hashes and observed cached counts. PassedExactGemmaSevenWireReplay is
 not model quality, performance, physical KV proof or full Q5 acceptance. Preserve
 failure raw artifacts; no tolerance/threshold retrofit or template fallback.
+
+
+## Separate partial-failure analyzer
+
+`gemma_prefix_post_oracle_tests::partial_failure::gemma4_two_wire_prefix_failure_analyzer`
+is ignored and metadata-only, selected with `HF2Q_GEMMA_PREFIX_FAILURE_ANALYZER_CONFIG`.
+It reuses the same closed Config/BoundFile inputs but requires exactly TWO wires
+and an actually FailedOrHeld/cleanup-proved controller, not protocol success.
+For this separate analyzer only, each turns[].receipt may bind a real JSON
+receipt/response or raw SSE response when the client failed before publishing
+its receipt; exactly one actual usage record is required. Raw DONE count is
+reported rather than claimed as full SSE protocol qualification.
+
+It runs the production renderer/tokenizer and reports P/S lengths, strictness,
+S==P, LCP of prior S against current P, exact prior-prefix relationship and actual
+cached/usage counts, plus bound readiness/source/binary and raw hashes.
+The output is permanently AnalyzedGemmaPrefixFailure/NotQualified/seven_wire_pass=false.
+It neither invokes accept_prefix nor weakens the existing three pure controls
+or strict seven-wire replay. The failed real run remains failed. This analyzer
+can decide whether a tool-response prompt with S==P still retains the prior
+strict stable prefix, before investigating cold-batch routing independently.
+No execution or real-model proof is asserted by adding this source.
