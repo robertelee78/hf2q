@@ -87,7 +87,7 @@ impl Receipt {
             return Err(Error::Ownership("trace peak exceeds inventory projection"));
         }
         Ok(Self {
-            schema: "hf2q.memory-projection.v1",
+            schema: "hf2q.memory-projection.v2",
             evidence_scope: "caller_declared_model_free_projection_only",
             runtime_qualified: false,
             identity: expected.identity.clone(),

@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use super::{Error, Family};
 
-pub const MIN_RESERVE: u64 = 12 * (1 << 30);
-
 /// owned includes shared Metal bytes exactly once. metal is a subset, not an
 /// additional host charge; CPU-only buffers have metal=0.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,16 +60,72 @@ impl Ceiling {
     }
 }
 
+/// Prospective, caller-declared reaction packet. Times and byte allowances must
+/// come from the frozen source/observer/stop evidence; this type attests none.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reaction {
+    pub observation_age_bytes: u64,
+    pub inflight_overshoot_bytes: u64,
+    pub maximum_observation_age_ns: u64,
+    pub maximum_stop_latency_ns: u64,
+    pub provenance: String,
+}
+impl Reaction {
+    fn bytes(&self) -> Result<u64, Error> {
+        if self.observation_age_bytes == 0
+            || self.inflight_overshoot_bytes == 0
+            || self.maximum_observation_age_ns == 0
+            || self.maximum_stop_latency_ns == 0
+            || self.provenance.trim().is_empty()
+        {
+            return Err(Error::Unknown(
+                "positive reaction/overshoot packet and provenance required".into(),
+            ));
+        }
+        self.observation_age_bytes
+            .checked_add(self.inflight_overshoot_bytes)
+            .ok_or(Error::Overflow)
+    }
+}
+
+/// A recommendation is recorded separately and never enforced as a hardware cap.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum MetalPolicy {
+    Enforced { bytes: u64, provenance: String },
+    RecommendationOnly { bytes: u64, provenance: String },
+    NoneWithInventory { provenance: String },
+    Unknown { reason: String },
+}
+impl MetalPolicy {
+    fn cap(&self) -> Result<Option<u64>, Error> {
+        match self {
+            Self::Enforced { bytes, provenance } if !provenance.trim().is_empty() => {
+                Ok(Some(*bytes))
+            }
+            Self::RecommendationOnly { provenance, .. }
+            | Self::NoneWithInventory { provenance }
+                if !provenance.trim().is_empty() =>
+            {
+                Ok(None)
+            }
+            Self::Unknown { reason } => Err(Error::Unknown(reason.clone())),
+            _ => Err(Error::Unknown("Metal policy provenance required".into())),
+        }
+    }
+}
+
 /// Declared inputs only. A Bound competitor value does not attest enumeration,
 /// freshness, privilege, metric semantics or real physical availability.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     pub physical: Ceiling,
-    pub reserve: u64,
+    pub reaction: Reaction,
     pub competition: Ceiling,
     pub family: Ceiling,
-    pub working_set: Ceiling,
+    pub metal_policy: MetalPolicy,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -79,30 +133,22 @@ pub struct Projection {
     pub bytes: DeclaredBytes,
     pub host_cap_after_competition: u64,
     pub family_cap: Option<u64>,
-    pub working_set_cap: u64,
+    pub working_set_cap: Option<u64>,
+    pub reaction_bytes: u64,
 }
 
 impl Limits {
     pub fn require_family(&self, family: Family) -> Result<(), Error> {
-        let bound = self.family.bound(true)?;
-        if family == Family::Deepseek4 {
-            match bound {
-                Some(cap) if cap <= 116 * (1 << 30) => {}
-                _ => {
-                    return Err(Error::Unknown(
-                        "DeepSeek requires its existing <=116 GiB family ceiling".into(),
-                    ))
-                }
-            }
-        }
+        // Every family follows the same explicit source-inventory rule. No
+        // historical DeepSeek 116 GiB ceiling is invented by this module.
+        let _ = family;
+        self.family.bound(true)?;
         Ok(())
     }
 
     pub fn project(&self, bytes: DeclaredBytes) -> Result<Projection, Error> {
         bytes.validate()?;
-        if self.reserve < MIN_RESERVE {
-            return Err(Error::Limit("system reserve below 12 GiB"));
-        }
+        let reaction = self.reaction.bytes()?;
         let physical = self
             .physical
             .bound(false)?
@@ -112,30 +158,28 @@ impl Limits {
             .bound(false)?
             .ok_or(Error::Unknown("competition".into()))?;
         let family = self.family.bound(true)?;
-        let working_set = self
-            .working_set
-            .bound(false)?
-            .ok_or(Error::Unknown("working set".into()))?;
+        let working_set = self.metal_policy.cap()?;
         let charged = bytes
             .owned
             .checked_add(competition)
             .ok_or(Error::Overflow)?
-            .checked_add(self.reserve)
+            .checked_add(reaction)
             .ok_or(Error::Overflow)?;
         if charged > physical {
-            return Err(Error::Limit("host including reserve and competition"));
+            return Err(Error::Limit("host including reaction and competition"));
         }
         if family.is_some_and(|cap| bytes.owned > cap) {
             return Err(Error::Limit("family process ceiling"));
         }
-        if bytes.metal > working_set {
+        if working_set.is_some_and(|cap| bytes.metal > cap) {
             return Err(Error::Limit("declared Metal working-set policy"));
         }
         Ok(Projection {
             bytes,
-            host_cap_after_competition: physical - self.reserve - competition,
+            host_cap_after_competition: physical - reaction - competition,
             family_cap: family,
             working_set_cap: working_set,
+            reaction_bytes: reaction,
         })
     }
 }
