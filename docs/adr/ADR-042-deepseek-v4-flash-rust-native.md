@@ -2571,3 +2571,106 @@ policy. A failed four-agent diagnostic retained two read calls on a turn;
 three-tool compiler/runtime control reproduced acceptance of those two parser
 invokes before the fix. No real-model validation or speed result follows from
 that negative control; the failed run remains failed.
+
+### 2026-10-26: compact bounded DSML data constraints (source proposal)
+
+The delimiter/length product introduced for DSML safety rejects existing tool
+schemas (`argv` item maxLength4096 and forty bounded tools) at the unchanged
+4MiB grammar limit. The existing issue251 regression also requires three tools
+at the65536 schema ceiling. Raising byte/rule/element limits, reducing argument
+bounds, permitting a delimiter in data, or rejecting ordinary code angle
+brackets is not the repair.
+
+The proposed replacement keeps the established exact bounded-repetition
+compiler for lengths and adds a private HF-generated DSML data-terminal
+constraint to `GrammarRuntime`. Reserved `hf2q_dsml_data_raw` and
+`hf2q_dsml_json_raw` terminal rules and the empty `hf2q_dsml_raw_end`
+predicate must have exact approved bodies. Generated
+function (`fn-N-`) and schema-variant (`variant-N-`) namespace chains preserve
+the constraint; a reserved suffix under an unknown rename, or a changed body,
+refuses runtime creation. Ordinary GBNF names and all other family emitters
+have no guard. This is explicitly private HF runtime semantics associated with
+reserved generated names, not a general GBNF syntax extension or an artifact
+that can be passed to an arbitrary GBNF consumer with identical enforcement.
+
+One stream-local scanner tracks the raw close-marker prefix and consecutive
+backslash parity. Only a data-terminal branch is denied when it would consume
+the final scalar of `</｜DSML｜parameter>`. The actual structural closing branch
+remains legal. Raw length counts every Unicode scalar, including both members
+of a backslash pair. Escaped raw controls remain invalid. A generic raw branch
+must traverse the private zero-width `hf2q_dsml_raw_end` predicate before it
+can finish; its AFTER-consumed scanner must not have a dangling backslash.
+Literal enum/const and safe compiled-pattern branches never use that predicate,
+so another generic raw tool cannot change their accepted literal language.
+Nested JSON retains its existing
+escape-unit and quoting semantics; a raw delimiter cannot occur inside its
+string data, while escaped Unicode spelling remains legal.
+
+Sampled token acceptance, byte/character acceptance, and the collective token
+mask use the same branch predicate and scanner. The mask computes immutable
+scanner states once per decoded candidate, so recursive grammar-stack cursor
+rollback cannot alter them. Epsilon expansion is partitioned by AFTER-consumed
+scanner state for guarded candidates; using one shared expansion for backslash
+and ordinary-character candidates would be incorrect. The non-DS walk keeps
+its original single expansion. Partial UTF8, clones and lazy-trigger body replay
+carry the same state. Repeated already-active trigger notifications cannot
+reset a partial delimiter. Non-DS runtimes keep no guard and allocate no extra
+candidate scanner arena. The existing grammar limits and scalar schema bounds
+are unchanged; no model/performance improvement is claimed from source.
+
+An unexecuted binary DFA-path factorization was rejected during source review:
+although compact as grammar text, speculative intermediate states could
+multiply live pushdown continuations before consuming input. It is preserved
+outside the landing diff and supplies no validation evidence. The terminal
+constraint avoids that construction and reuses the previously established
+bounded repetition stack shape. Actual validation must include the existing
+all-family4096/forty-tool/65536 regressions, old actual compiled DSML parallel
+call controls, and new real emitted-grammar mask/acceptance/Unicode/escape/
+namespace/boundary tests. This source proposal has not been compiled or
+executed by its author; realistic serving and full regression gates remain
+required before accepting a landed behavior change.
+
+The initial terminal-guard prototype's global dangling-backslash check was
+rejected by an actual compiled three-tool regression: a const/enum literal
+ending in backslash inherited an unrelated generic raw branch's constraint.
+That old run remains failed. The scoped empty predicate above is the revised
+source proposal; the decisive mixed literal/anyOf control and same-mask
+backslash-versus-ordinary exact-bound controls must pass before acceptance.
+
+The private DSML guard capability is character-terminal-only, matching the
+actual native DSML emitter. Any token-terminal element anywhere in a grammar
+carrying a reserved DSML guard refuses runtime creation, including unreachable
+rules. This fails closed rather than claiming that atomic token successors
+share the character-only epsilon-mask semantics. Ordinary token grammars with
+no DSML guard retain their existing behavior. Controls cover exact, negated,
+any-token and excluded-token-set forms both with and without the guard.
+
+Root validation of the scoped candidate passed17DSML-focused tests, all three
+existing tool-bound controls (including40tools×4096 and3tools×65536),25mask
+tests with one ignored hardware control,47sampler tests, and
+`cargo check --locked --all-targets --all-features`. The decisive old mixed
+literal control remains a retained actual failure; the same unchanged control
+passes the scoped revision. Initial module-path and test-only-unused-import
+build failures are retained separately. New focused modules were formatted;
+no unrelated legacy formatting was applied. These are component controls, not
+a real-model serving or performance verdict. The next required gate is the
+frozen four-agent DeepSeek coding/continuation/prefix test on a clean build.
+
+The private marker namespace uses underscores deliberately. The earlier
+hyphen-only prototype's unknown-namespace check could capture a valid Gemma
+property such as `dsml-data-raw` through `gemma4-kv-dsml-data-raw`, even without
+any DSML grammar. Both public schema property-name sanitizers map underscores
+to hyphens; neither can produce the new underscore-bearing markers. Native
+function names are emitted as literal wire text, not unmodified grammar-rule
+names. The new all-family control compiles required/auto multi-tool grammars
+with both old hyphen keys and private-looking underscore keys/function names,
+constructs actual runtimes, checks non-DS guard absence, and accepts valid
+single-call family wire bodies. Unknown renames of the unique private markers
+still refuse. This namespace repair changes no wire format, bounds or guard
+predicate; its new control remains unexecuted by the author.
+
+The final underscore-namespace composition, using published native0.15.6,
+passed18DSML-focused tests, all four tool-bound controls,25mask tests with
+one ignored control,47sampler tests, and the locked all-target/all-feature
+check. That includes the new all-family public-key/function-name runtime
+control. Real-model serving remains the next gate.
