@@ -1,4 +1,4 @@
-# ADR-063 Qwen3.8 N1 exact prefix post-oracle
+# ADR-063 Qwen3.8 exact prefix post-oracle
 
 Status: model-free replay helper; a passing real-run prefix receipt is separate
 acceptance evidence. This helper runs after the model has been unloaded. It is
@@ -24,6 +24,7 @@ source or local paths.
   "template": {"path": "/private/campaign/qwen38.template.jinja", "sha256": "RAW_FILE_SHA256"},
   "readiness": {"path": "/private/campaign/readiness.json", "sha256": "RAW_FILE_SHA256"},
   "template_source": "GgufEmbedded",
+  "server_slots": 1,
   "turns": [
     {
       "request": {"path": "/private/campaign/client/turn-0/request.json", "sha256": "RAW_FILE_SHA256"},
@@ -35,12 +36,15 @@ source or local paths.
 ```
 
 Replace every digest placeholder with a real lowercase SHA256 and supply exactly
-seven ordered turn entries, 0 through 6. The output must be a new absolute file
+seven ordered turn entries, 0 through 6. `server_slots` must be 1 or 4 and
+match the archived runtime; omission retains the original one-slot default.
+For four slots, replay each agent independently with its own seven requests,
+receipts and output path, bound to the common readiness archive. The output must be a new absolute file
 outside every Git checkout ancestor. It is created with private permissions only
 after all replay assertions pass.
 
 The archived readiness envelope is `{health, runtime, readyz, ...}` from the
-owned N1 supervisor. Its `runtime.measurement_snapshot` supplies the actual
+owned supervisor. Its `runtime.measurement_snapshot` supplies the actual
 loaded model ID, architecture and tokenizer/template semantic fingerprints.
 These differ from the raw-file digest domains: the tokenizer fingerprint hashes
 canonical JSON from `tokenizer.to_string(false)`; the template fingerprint hashes
@@ -48,7 +52,7 @@ canonical JSON containing the effective template text and its source name.
 Replay recomputes these production measurement domains and requires equality.
 
 Each archived client receipt must bind its turn, HTTP status, exact request
-bytes/digest and actual usage. The helper requires the N1 text-only three-tool
+bytes/digest and actual usage. The helper requires the image-free three-tool
 `auto` request shape, output budget 8192, context 262144 and overflow rejection.
 Schemas, resolved thinking enablement and template kwargs stay unchanged;
 `preserve_thinking` must remain true. Server-default grammar/GCD must be
