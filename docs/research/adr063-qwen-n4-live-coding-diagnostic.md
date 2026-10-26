@@ -139,3 +139,26 @@ per-agent semantic TTFT/cache evidence and all cleanup, without partial scoring.
 Documentation correction: actual core projector autoload is recorded above; frozen
 Python and prior raw receipts are unchanged. Launcher vision-off intent alone did
 not prove absence. This correction supplies no new comparative or speed result.
+
+## Prospective same-binary pool ON/OFF ablation
+
+N4 approvals now replace the inherited N1 `profile24g_ack_verified` with
+`pool_profile_selection_verified`. This is a verified explicit selection, not
+a claim24GiB quota is enabled for OFF. The N1 legacy approval contract is unchanged.
+Archived successful N4 records retain their original source/key and remain valid
+for that recorded ON run; do not rewrite or rescore them.
+
+Both future arms must use the same exact hf2q binary/source/registry/model and
+this same newly frozen client/workload. ON explicitly sets
+HF2Q_QWEN_POOL_GROWTH_PROFILE=adr063-24g-v1 and HF2Q_UNSAFE_EXPERIMENTS=1. OFF
+removes BOTH keys from the full launch environment, including inherited values;
+setting the profile string to `off` is not the supported Off parser contract.
+Record actual selection/environment and source-inferred binding honestly; no
+observed native quota counter is invented. The runtime model pool is distinct
+from the scratch allocation pool, so retain its existing one-model/slots checks.
+
+This is a narrow ON/OFF allocation-policy ablation, not the mandatory stock-release
+or latest-peer comparison and not an all-model speed verdict. No contexts, slots,
+AUTO/TQ/thinking/tools/projector/autoload or cleanup/watchdog policy changes accompany
+the switch. Dedicated-host live pressure/available-memory supervision remains
+root ownership. Any failed arm stays failed, with no reduced-work retry.

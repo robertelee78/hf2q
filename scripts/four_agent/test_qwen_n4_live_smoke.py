@@ -5,7 +5,7 @@ from pathlib import Path
 
 from qwen38_n1_verdict import Invalid, EXPECTED
 from qwen_n4_live_smoke import (AGENTS, PROFILE, aggregate, barrier_release, identity,
-                               preflight, validate_agent_binding, validate_ready, validate_release)
+                               preflight, validate_agent_binding, validate_ready, validate_release, validate_preflight)
 
 RUN = "n4_source_fixture_20261025"
 TOKEN = "a" * 32
@@ -51,6 +51,23 @@ class FourAgent(unittest.TestCase):
         self.assertIn("ctx262144_slots4_verified", value)
         self.assertIn("dedicated_host_live_pressure_availablememory", value)
         self.assertIn("other", value)
+
+    def test_n4_pool_selection_key_truthful_for_both_modes(self):
+        base = {"ctx262144_slots1_verified", "profile24g_ack_verified", "other"}
+        expected = preflight(base)
+        self.assertNotIn("profile24g_ack_verified", expected)
+        self.assertIn("pool_profile_selection_verified", expected)
+        validate_preflight(dict.fromkeys(expected, True), base)
+        old = dict.fromkeys((expected - {"pool_profile_selection_verified"}) |
+                            {"profile24g_ack_verified"}, True)
+        with self.assertRaises(Invalid):
+            validate_preflight(old, base)
+        with self.assertRaises(Invalid):
+            validate_preflight(dict.fromkeys(expected - {"pool_profile_selection_verified"}, True), base)
+        bad = dict.fromkeys(expected, True)
+        bad["pool_profile_selection_verified"] = False
+        with self.assertRaises(Invalid):
+            validate_preflight(bad, base)
 
     def test_actual_agent_approval_boundary(self):
         agent = AGENTS[0]

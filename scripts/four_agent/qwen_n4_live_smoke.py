@@ -32,8 +32,15 @@ def identity(agent, run):
 
 
 def preflight(base):
-    return (set(base) - {"ctx262144_slots1_verified", "cpu_owned_io_3g_tool2g_client128m"}) | {
-        "ctx262144_slots4_verified", "dedicated_host_live_pressure_availablememory"}
+    return (set(base) - {"ctx262144_slots1_verified", "cpu_owned_io_3g_tool2g_client128m",
+                         "profile24g_ack_verified"}) | {
+        "ctx262144_slots4_verified", "dedicated_host_live_pressure_availablememory",
+        "pool_profile_selection_verified"}
+
+
+def validate_preflight(value, base):
+    require(isinstance(value, dict) and set(value) == preflight(base) and
+            all(v is True for v in value.values()), "four-slot actual pool selection/preflight")
 
 
 def validate_agent_binding(packet, agent, run, server_pid, barrier, token, output):
@@ -195,8 +202,7 @@ def main():
         identity(AGENTS[0], run)
         require(isinstance(token, str) and re.fullmatch(r"[a-f0-9]{32}", token), "barrier nonce")
         template = packet.get("agent_template", {})
-        require(set(template.get("preflight", {})) == preflight(PREFLIGHT) and
-                all(v is True for v in template["preflight"].values()), "four-slot actual preflight")
+        validate_preflight(template.get("preflight"), PREFLIGHT)
         summary["run_id"] = run
         barrier = output / "barrier"
         barrier.mkdir(mode=0o700)
