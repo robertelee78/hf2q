@@ -3,8 +3,8 @@
 Source candidate originally based on f08a4f409cbe23502e8a002effaa480d612d3bf2,
 validated with the verified native0.15.4 dependency pin at14e2bb97. Independent
 source review, root compilation and tiny ownership controls passed. The source
-author performed no Cargo, test, model or device execution. Full-model validation
-remains a separate gate before this default serving change can merge.
+author performed no Cargo, test, model or device execution. The original draft required separate full-model validation; the scoped
+public0.15.5 real-model results are recorded below.
 
 Eligible SlotAware startup now stages one ordinary eager128 cache and n−1 normal
 lazy initial sessions, then swaps the original pristine loaded bootstrap into
@@ -97,6 +97,64 @@ reviewed fresh-process CPU-accessible Metal control then passed both one-slot
 and four-slot cases, all three full markers and exact1passed/0failed/0ignored
 result in0.08s. The source-derived historical requested envelope is761088B;
 maximum source-owned live payload485184B, with no GPU commands or model weights.
-Independent retained-evidence review accepted this narrow result. These checks
-do not prove full-model warmup, four-slot multi-turn serving, physical fit or
-speed. The PR remains draft pending those real-model gates and CI.
+Independent retained-evidence review accepted this narrow result. Those initial checks alone did not prove full-model serving, physical fit or
+speed. The following real-model evidence completes the scoped serving gates;
+whole-Q5 memory qualification and all-family performance remain separate.
+
+
+## Public0.15.5 real-model validation
+
+The executed clean source was2d7599907be92d17736bc205806907589e845306,
+binary SHA256111649ce1b0d635d0a1403f34004667e1ab61757ff203c68c513dcac912488c2.
+Cargo pinned public registry mlx-native0.15.5, archive checksum
+be6b17fcc030f03615f66873ba22e59aa29b5ae9ff30d6370cbdedf8649245e9.
+The model was DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf,
+107431343264B, SHA256
+50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6.
+Hardware: Apple M5 Max128GiB, macOS27.2 build26B5112a. Each packet ran one
+full-model process with262144 logical tokens per slot and four slots; every
+owned server/client group was reaped and empty before the next load.
+
+The combined candidate includes the separately landed DSML delimiter correction;
+that correctness fix is not attributed to bootstrap reuse. Independent source
+comparison binds the bootstrap/cache implementation in this PR to the actual
+executed candidate. Later main changes to diagnostics and the unwired declared
+ledger do not turn a newer source commit into an executed binary identity.
+
+- `deepseek390-n4-20261026T155503Z`:28 real assistant requests,24 actual tools,
+  four correct patches, and twelve raw Rust test outputs with two passing tests
+  each. Unary/SSE framing, one-call semantics, actual tool-result continuation,
+  cleanup and all four exact native eight-token-tail prefix replays passed
+  independent review. The prefix helper's configuration checks are composed
+  with actual launch/source evidence; they do not independently attest a binary.
+- The canonical cancellation child in
+  `deepseek390-cancel-growth-20261026T164811Z` passed independently: three
+  cancellations/recoveries, cached-token counts17490/17490/60607, stable counter
+  progression0→1→2→3, semantic peer output endingPEER_DONE, bounded transaction
+  overlap and verified cleanup. Its parent remains FAILED because its later
+  growth stage exhausted a32-token response allowance. No parent was rescored.
+- `deepseek390-growth-only-20261026T174508Z`:the repaired standalone growth gate
+  passed. It processed125513 prompt tokens, migrated125640 tokens from capacity
+  131072 to262144 in95.039ms, then reused125505/125619 tokens with1057.916ms
+  semantic TTFT. The final request reused125652/125672 tokens:exactly20 suffix
+  tokens, terminal sentinel, stop finish, and verified cleanup. Independent
+  review rehashed11256 retained artifacts with no mismatch.
+
+The growth harness preserves the actual assistant message including reasoning;
+content-only reconstruction had forced an older recovery checkpoint in the
+preceding failed packet. Its required-tool/continuation/short-tail allowances
+were1024/8192/1024. The cancellation harness used required-tool1024 and peer8192,
+with its original continuation/cancellation limits unchanged. These are genuine
+native requests, not scripted assistant output. Reproduction uses
+`scripts/test_deepseek4_cached_suffix.sh`,
+`scripts/test_deepseek4_long_context_cache.sh`, and the explicit DeepSeek client
+contract in `adr063-deepseek-coding-diagnostic.md`; freeze exact source, model,
+settings, monitoring policy and tool sandbox before executing.
+
+The other failed packets remain failed evidence. These separate successful
+scenarios establish scoped warmup, independent multi-turn slots, prefix reuse,
+cancellation/recovery and lossless growth. They do not establish simultaneous
+largest-context four-slot stress, a disjoint physical-memory upper, measured RSS
+saving, peer parity, an all-four speed win or completion of Q5. The900894720B
+saving above remains source-derived requested capacity, not measured physical
+release. No performance claim is made by this PR.
