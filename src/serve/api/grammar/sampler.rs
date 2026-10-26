@@ -760,6 +760,11 @@ pub struct GrammarRuntime {
 }
 
 impl GrammarRuntime {
+    #[cfg(test)]
+    pub(crate) fn has_dsml_guard_for_test(&self) -> bool {
+        self.dsml_guard.is_some()
+    }
+
     /// Initialize runtime from a parsed grammar and a start rule, seeding
     /// `stacks` from the start rule's alternatives.
     pub fn new(grammar: Grammar, start_rule_id: u32) -> Option<Self> {

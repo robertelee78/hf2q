@@ -33,11 +33,11 @@ pub(super) fn emit_json(
     insert(rules, JSON_NAME, JSON_BODY)?;
     insert(
         rules,
-        "dsml-data-json-char",
-        r#"dsml-data-json-raw | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})"#,
+        "hf2q_dsml_json_char",
+        r#"hf2q_dsml_json_raw | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})"#,
     )?;
     Ok(super::bounded_repeat(
-        "dsml-data-json-char",
+        "hf2q_dsml_json_char",
         min,
         max,
         rules,

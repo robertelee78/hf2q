@@ -24,9 +24,9 @@ const CLOSE: &[u32] = &[
     'r' as u32,
     '>' as u32,
 ];
-pub(crate) const RAW_NAME: &str = "dsml-data-raw";
-pub(crate) const JSON_NAME: &str = "dsml-data-json-raw";
-pub(crate) const END_NAME: &str = "dsml-data-raw-end";
+pub(crate) const RAW_NAME: &str = "hf2q_dsml_data_raw";
+pub(crate) const JSON_NAME: &str = "hf2q_dsml_json_raw";
+pub(crate) const END_NAME: &str = "hf2q_dsml_raw_end";
 pub(crate) const END_BODY: &str = "\"\"";
 pub(crate) const RAW_BODY: &str = ".";
 pub(crate) const JSON_BODY: &str = r#"[^"\\\x00-\x1F]"#;
@@ -77,9 +77,9 @@ fn kind(name: &str) -> Result<Option<&'static str>, ()> {
         local = tail;
     }
     // Private semantics must never silently vanish through an unknown rename.
-    if name.ends_with("-dsml-data-raw-end")
-        || name.ends_with("-dsml-data-raw")
-        || name.ends_with("-dsml-data-json-raw")
+    if name.ends_with("-hf2q_dsml_raw_end")
+        || name.ends_with("-hf2q_dsml_data_raw")
+        || name.ends_with("-hf2q_dsml_json_raw")
     {
         Err(())
     } else {

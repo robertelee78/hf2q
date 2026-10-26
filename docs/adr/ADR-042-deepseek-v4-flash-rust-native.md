@@ -2583,8 +2583,8 @@ brackets is not the repair.
 
 The proposed replacement keeps the established exact bounded-repetition
 compiler for lengths and adds a private HF-generated DSML data-terminal
-constraint to `GrammarRuntime`. Reserved `dsml-data-raw` and
-`dsml-data-json-raw` terminal rules and the empty `dsml-data-raw-end`
+constraint to `GrammarRuntime`. Reserved `hf2q_dsml_data_raw` and
+`hf2q_dsml_json_raw` terminal rules and the empty `hf2q_dsml_raw_end`
 predicate must have exact approved bodies. Generated
 function (`fn-N-`) and schema-variant (`variant-N-`) namespace chains preserve
 the constraint; a reserved suffix under an unknown rename, or a changed body,
@@ -2598,7 +2598,7 @@ backslash parity. Only a data-terminal branch is denied when it would consume
 the final scalar of `</｜DSML｜parameter>`. The actual structural closing branch
 remains legal. Raw length counts every Unicode scalar, including both members
 of a backslash pair. Escaped raw controls remain invalid. A generic raw branch
-must traverse the private zero-width `dsml-data-raw-end` predicate before it
+must traverse the private zero-width `hf2q_dsml_raw_end` predicate before it
 can finish; its AFTER-consumed scanner must not have a dangling backslash.
 Literal enum/const and safe compiled-pattern branches never use that predicate,
 so another generic raw tool cannot change their accepted literal language.
@@ -2655,3 +2655,22 @@ build failures are retained separately. New focused modules were formatted;
 no unrelated legacy formatting was applied. These are component controls, not
 a real-model serving or performance verdict. The next required gate is the
 frozen four-agent DeepSeek coding/continuation/prefix test on a clean build.
+
+The private marker namespace uses underscores deliberately. The earlier
+hyphen-only prototype's unknown-namespace check could capture a valid Gemma
+property such as `dsml-data-raw` through `gemma4-kv-dsml-data-raw`, even without
+any DSML grammar. Both public schema property-name sanitizers map underscores
+to hyphens; neither can produce the new underscore-bearing markers. Native
+function names are emitted as literal wire text, not unmodified grammar-rule
+names. The new all-family control compiles required/auto multi-tool grammars
+with both old hyphen keys and private-looking underscore keys/function names,
+constructs actual runtimes, checks non-DS guard absence, and accepts valid
+single-call family wire bodies. Unknown renames of the unique private markers
+still refuse. This namespace repair changes no wire format, bounds or guard
+predicate; its new control remains unexecuted by the author.
+
+The final underscore-namespace composition, using published native0.15.6,
+passed18DSML-focused tests, all four tool-bound controls,25mask tests with
+one ignored control,47sampler tests, and the locked all-target/all-feature
+check. That includes the new all-family public-key/function-name runtime
+control. Real-model serving remains the next gate.
