@@ -26,7 +26,7 @@ class FamilyControls(unittest.TestCase):
                                       ('deepseek4', 'hf2q', 4)]:
             validate_selection(family, engine, slots)
         for family, engine, slots in [('deepseek4', 'peer', 1), ('deepseek4', 'peer', 4),
-                                      ('qwen', 'peer', 1), ('gemma4', 'hf2q', 4)]:
+                                      ('qwen', 'peer', 1), ('gemma4', 'peer', 4)]:
             with self.assertRaises(Invalid): validate_selection(family, engine, slots)
     def test_actual_preflight_composes_family_and_engine_without_forging(self):
         from qwen_n4_peer import preflight as peer_preflight
@@ -83,14 +83,14 @@ class FamilyControls(unittest.TestCase):
     def test_family_schema_distinct_and_unsupported_family_refuses(self):
         self.assertNotEqual(schema('qwen', 'agent-result', 4), schema('deepseek4', 'agent-result', 4))
         with self.assertRaises(Invalid): profile('approximately-deepseek', 4)
-        with self.assertRaises(Invalid): request_controls({}, 'gemma4')
+        with self.assertRaises(Invalid): request_controls({}, 'unsupported-gemma')
 
 
     def test_actual_builder_then_exchange_wire_accepts_both_families_all_turns(self):
         schemas = [{"type": "function", "function": {"name": name, "strict": False}}
                    for name in ("read_file", "write_file", "run_tests")]
         messages = [{"role": "user", "content": "actual coding task"}]
-        for family in ("qwen", "deepseek4"):
+        for family in ("qwen", "deepseek4", "gemma4"):
             for turn in range(7):
                 with self.subTest(family=family, turn=turn), tempfile.TemporaryDirectory() as tmp:
                     request = build_request("actual-model", messages, schemas, turn, family)
@@ -135,5 +135,32 @@ class FamilyControls(unittest.TestCase):
             with self.subTest(changed=key), self.assertRaises(Invalid):
                 wire({**request, key: value}, "deepseek4")
         with self.assertRaises(Invalid): wire(request, "approximately-deepseek")
+
+    def test_gemma_actual_binding_and_wire_do_not_borrow_other_family_contracts(self):
+        selected = dict(cache_family='gemma4', context_per_slot=262144, slots=4,
+                        hybrid_kv=True, codebook_bits=8, lcp_capacity_bytes=8589934592,
+                        repetition_penalty=1.05, prefill_route='auto', graft=False,
+                        disk_persistence=False, glp=False, external_drafter=False)
+        packet = dict(family='gemma4', family_controls=selected)
+        validate_selection('gemma4', 'hf2q', 4)
+        validate_binding(packet, 'gemma4', 4)
+        keys = preflight(n4_preflight(PREFLIGHT), 'gemma4')
+        self.assertIn('gemma4_hybrid_cache_bound', keys)
+        self.assertNotIn('pool_profile_selection_verified', keys)
+        self.assertNotIn('deepseek4_native_cache_bound', keys)
+        validate_preflight({k: True for k in keys}, PREFLIGHT, family='gemma4')
+        for key, value in [('hybrid_kv', False), ('cache_family', 'qwen35'),
+                           ('slots', True), ('codebook_bits', 4), ('external_drafter', True)]:
+            with self.subTest(key=key), self.assertRaises(Invalid):
+                validate_binding(dict(packet, family_controls={**selected, key:value}), 'gemma4', 4)
+        schemas = [{"function":{"name":n,"strict":False}}
+                   for n in ('read_file','write_file','run_tests')]
+        req = build_request('Gemma', [], schemas, 0, 'gemma4')
+        wire(req, 'gemma4')
+        for key, value in [('reasoning_effort','max'), ('temperature',0),
+                           ('chat_template_kwargs',{}), ('hf2q_enable_thinking',False)]:
+            with self.subTest(wire_key=key), self.assertRaises(Invalid):
+                wire({**req,key:value}, 'gemma4')
+        with self.assertRaises(Invalid): validate_selection('gemma4','peer',4)
 
 if __name__ == '__main__': unittest.main()
