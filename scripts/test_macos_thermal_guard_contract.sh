@@ -195,21 +195,25 @@ host_contention_process_snapshot() {
   printf '100\t100\tbash\n'
   [[ "$state" == quiet ]] || printf '200\t200\tcargo\n'
 }
-sequence=(nominal nominal nominal nominal nominal)
-sequence_index=0
-thermal_read_state() {
-  read_sequence_state
-  SECONDS=$((SECONDS + 1))
-}
-thermal_wait_for_nominal "$tmp_dir/contention-reset-thermal.log" \
-  contention-reset 2 10 0 "$tmp_dir/contention-reset-host.log" 100
-# Bash's special SECONDS value includes real wall time. A loaded hosted runner
-# can therefore satisfy the final two-second quiet window on the fourth sample,
-# while a fast runner advances only through the test seam and needs five.
-contention_reset_samples=$(wc -l <"$tmp_dir/contention-reset-host.log")
-((contention_reset_samples >= 4 && contention_reset_samples <= 5))
-test "$(awk -F '\t' '$2 == "contended" { count++ } END { print count+0 }' \
-  "$tmp_dir/contention-reset-host.log")" = 1
+# Unsetting SECONDS removes Bash's wall-clock special behavior. Keep this
+# synthetic clock in a subshell so later process monitors retain the real one.
+(
+  unset SECONDS
+  SECONDS=0
+  sequence=(nominal nominal nominal nominal nominal)
+  sequence_index=0
+  thermal_read_state() {
+    read_sequence_state
+    SECONDS=$((SECONDS + 1))
+  }
+  thermal_wait_for_nominal "$tmp_dir/contention-reset-thermal.log" \
+    contention-reset 2 10 0 "$tmp_dir/contention-reset-host.log" 100
+  test "$(wc -l <"$tmp_dir/contention-reset-host.log" | tr -d '[:space:]')" = 5
+  test "$(awk -F '\t' '{print $2}' "$tmp_dir/contention-reset-host.log" | paste -sd, -)" \
+    = quiet,contended,quiet,quiet,quiet
+  test "$(awk -F '\t' '{print $2}' "$tmp_dir/contention-reset-thermal.log" | paste -sd, -)" \
+    = nominal,nominal,nominal,nominal,nominal
+)
 
 # Once measurement begins, the first contention sample invalidates the wave.
 contention_sequence=(quiet contended)
@@ -281,17 +285,22 @@ thermal_wait_for_nominal "$tmp_dir/wait.log" wait-test 0 5 0
 test "$(tail -1 "$tmp_dir/wait.log" | awk -F '\t' '{print $2}')" = nominal
 test "$(wc -l <"$tmp_dir/wait.log" | tr -d '[:space:]')" = 3
 
-# A non-Nominal transition resets the settle window. Advance Bash's monotonic
-# timer without sleeping so the contract proves a trailing continuous window.
-sequence=(nominal serious nominal nominal nominal)
-sequence_index=0
-thermal_read_state() {
-  read_sequence_state
-  SECONDS=$((SECONDS + 1))
-}
-thermal_wait_for_nominal "$tmp_dir/reset.log" reset-test 2 10 0
-test "$(wc -l <"$tmp_dir/reset.log" | tr -d '[:space:]')" = 5
-test "$(tail -1 "$tmp_dir/reset.log" | awk -F '\t' '{print $2}')" = nominal
+# A non-Nominal transition resets the settle window. Isolate the synthetic
+# counter from Bash's wall clock without changing production timing behavior.
+(
+  unset SECONDS
+  SECONDS=0
+  sequence=(nominal serious nominal nominal nominal)
+  sequence_index=0
+  thermal_read_state() {
+    read_sequence_state
+    SECONDS=$((SECONDS + 1))
+  }
+  thermal_wait_for_nominal "$tmp_dir/reset.log" reset-test 2 10 0
+  test "$(wc -l <"$tmp_dir/reset.log" | tr -d '[:space:]')" = 5
+  test "$(awk -F '\t' '{print $2}' "$tmp_dir/reset.log" | paste -sd, -)" \
+    = nominal,serious,nominal,nominal,nominal
+)
 
 # A host that never becomes Nominal must fail at the timeout.
 sequence=(serious)
