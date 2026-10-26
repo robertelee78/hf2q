@@ -1,5 +1,5 @@
 use super::categories::{Category, Owner};
-use super::limits::Ceiling;
+use super::limits::{Ceiling, MetalPolicy, Reaction};
 use super::ownership::{Event, HandleId, ReservationId, RootId};
 use super::*;
 
@@ -38,12 +38,20 @@ fn bound(bytes: u64) -> Ceiling {
 fn limits() -> Limits {
     Limits {
         physical: bound(128 * GIB),
-        reserve: 12 * GIB,
+        reaction: Reaction {
+            observation_age_bytes: GIB,
+            inflight_overshoot_bytes: GIB,
+            maximum_observation_age_ns: 1_000_000,
+            maximum_stop_latency_ns: 1_000_000,
+            provenance: "synthetic declared packet, not measured".into(),
+        },
         competition: bound(0),
         family: Ceiling::NoneWithInventory {
             provenance: "synthetic no extra ceiling".into(),
         },
-        working_set: bound(116 * GIB),
+        metal_policy: MetalPolicy::NoneWithInventory {
+            provenance: "synthetic no extra Metal policy".into(),
+        },
     }
 }
 
@@ -160,16 +168,18 @@ fn unknown_real_packet_rejects_for_each_family() {
 }
 
 #[test]
-fn deepseek_cannot_omit_or_raise_existing_family_ceiling() {
+fn deepseek_uses_explicit_family_inventory_not_historical_cap() {
     let frozen = shape(Family::Deepseek4);
     let inventory = empty_declared(frozen.clone());
     let ownership = Ownership::new(identity()).unwrap();
     let mut caps = limits();
-    assert!(Receipt::declared(&inventory, &frozen, &caps, &ownership).is_err());
-    caps.family = bound(117 * GIB);
-    assert!(Receipt::declared(&inventory, &frozen, &caps, &ownership).is_err());
-    caps.family = bound(116 * GIB);
     assert!(Receipt::declared(&inventory, &frozen, &caps, &ownership).is_ok());
+    caps.family = bound(117 * GIB);
+    assert!(Receipt::declared(&inventory, &frozen, &caps, &ownership).is_ok());
+    caps.family = Ceiling::Unknown {
+        reason: "family inventory absent".into(),
+    };
+    assert!(Receipt::declared(&inventory, &frozen, &caps, &ownership).is_err());
 }
 
 #[test]

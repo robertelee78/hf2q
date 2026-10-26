@@ -189,8 +189,11 @@ fn failed_transition_is_atomic_and_does_not_publish_partial_roots() {
 #[test]
 fn aggregate_competitors_and_phase_peak_cannot_be_hidden_by_final_release() {
     let mut caps = limits();
-    caps.competition = bound(3 * 4 * GIB); // each below 8 GiB, aggregate is not.
-    assert!(caps.project(bytes(105 * GIB)).is_err());
+    caps.competition = bound(4 * GIB);
+    assert!(caps.project(bytes(115 * GIB)).is_ok());
+    // Three individually fitting competitors must still be charged together.
+    caps.competition = bound(3 * 4 * GIB);
+    assert!(caps.project(bytes(115 * GIB)).is_err());
     let frozen = shape(Family::Gemma4);
     let mut inventory = empty_declared(frozen.clone());
     inventory
