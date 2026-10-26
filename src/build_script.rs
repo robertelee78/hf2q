@@ -5,6 +5,9 @@
 //! source trees deliberately receive no inferred commit and remote conversion
 //! fails closed instead of claiming a provenance identity it cannot prove.
 
+#[path = "build_native_pin.rs"]
+mod native_pin;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -111,6 +114,15 @@ fn main() {
         .find_map(|value| exact_git_sha(&value));
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(std::path::PathBuf::from);
     let out_dir = env::var_os("OUT_DIR").map(std::path::PathBuf::from);
+    let cargo_manifest = manifest_dir
+        .as_ref()
+        .expect("Cargo manifest directory")
+        .join("Cargo.toml");
+    println!("cargo:rerun-if-changed={}", cargo_manifest.display());
+    let manifest = fs::read_to_string(&cargo_manifest).expect("read canonical Cargo.toml");
+    let native_version = native_pin::exact_native_pin(&manifest)
+        .expect("exact canonical mlx-native pin required");
+    println!("cargo:rustc-env=HF2Q_MLX_NATIVE_VERSION={native_version}");
     compile_terminal_assets(
         manifest_dir
             .as_deref()
