@@ -31,6 +31,9 @@
 //! behavior (ADR-009 dense-KV, ADR-010 Q8 rerank, chat-template priority
 //! order) is preserved by construction.
 
+#[path = "engine_gemma_full_input.rs"]
+pub(crate) mod gemma_full_input;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -413,6 +416,7 @@ pub struct SamplingParams {
     /// This deliberately does not participate in `PromptCacheKey`: it
     /// describes prompt layout, not generation semantics.
     pub stable_prompt_prefix_tokens: Option<usize>,
+    pub(crate) gemma_full_input_checkpoint: Option<gemma_full_input::Checkpoint>,
 
     /// Digest of the authoritative vision embeddings and image-grid layout
     /// used to replace placeholder tokens in this request. `None` is the
@@ -452,6 +456,7 @@ impl Default for SamplingParams {
             reasoning_end_tokens: None,
             reasoning_close_tokens: None,
             stable_prompt_prefix_tokens: None,
+            gemma_full_input_checkpoint: None,
             vision_fingerprint: None,
         }
     }
@@ -938,6 +943,8 @@ impl Default for EngineMode {
 pub enum EngineSpawnError {
     #[error("Qwen pool profile startup refused: {cause}")]
     QwenPoolProfile { cause: String },
+    #[error("Gemma full-input checkpoint startup refused: {cause}")]
+    GemmaFullInputCheckpoint { cause: String },
     /// The requested [`EngineMode`] variant requires runtime support that
     /// has not yet landed. Carries the iter that introduced the surface
     /// (`iter_landed`, e.g. `"C2b"` for the worker-refactor commit) and
@@ -4049,6 +4056,8 @@ impl Engine {
         queue_capacity: usize,
         kv_cache_budget_bytes: Option<u64>,
     ) -> Self {
+        assert!(!crate::debug::investigation_env::gemma_full_input::selected().unwrap_or(true),
+            "Gemma full-input experiment requires fallible SlotAware spawn");
         // Must precede even channel/metadata/thread creation. The normal
         // fallible entry rejects unsupported profile/mode combinations first.
         crate::inference::models::qwen35::decode_pool::profile::assert_direct_spawn_legacy();
@@ -4337,6 +4346,15 @@ impl Engine {
         kv_cache_budget_bytes: Option<u64>,
         mode: EngineMode,
     ) -> std::result::Result<Self, EngineSpawnError> {
+        let full_input = crate::debug::investigation_env::gemma_full_input::selected()
+            .map_err(|e| EngineSpawnError::GemmaFullInputCheckpoint { cause: e.into() })?;
+        if full_input {
+            gemma_full_input::validate_startup(matches!(&loaded, LoadedModel::Gemma(_)),
+                match mode { EngineMode::SlotAware { max_slots } => Some(max_slots), _ => None },
+                crate::debug::INVESTIGATION_ENV.hybrid_kv,
+                crate::debug::INVESTIGATION_ENV.tq_codebook_bits)
+                .map_err(|e| EngineSpawnError::GemmaFullInputCheckpoint { cause: e.to_string() })?;
+        }
         if crate::inference::models::qwen35::decode_pool::profile::selected() {
             use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights};
             let native = match &loaded {
@@ -6260,7 +6278,7 @@ fn gemma4_cross_batch_candidate(request: &Request) -> Option<(Gemma4CrossBatchCl
             prompt_tokens,
             params,
             ..
-        } if gemma4_cross_batch_eligible(
+        } if params.gemma_full_input_checkpoint.is_none() && gemma4_cross_batch_eligible(
             prompt_tokens.len(),
             params.max_tokens,
             params.stable_prompt_prefix_tokens.is_some(),
@@ -6282,7 +6300,7 @@ fn gemma4_cross_batch_candidate(request: &Request) -> Option<(Gemma4CrossBatchCl
             params,
             soft_tokens,
             ..
-        } if gemma4_cross_batch_eligible(
+        } if params.gemma_full_input_checkpoint.is_none() && gemma4_cross_batch_eligible(
             prompt_tokens.len(),
             params.max_tokens,
             params.stable_prompt_prefix_tokens.is_some(),
@@ -6835,7 +6853,8 @@ impl Gemma4PrefillState {
             });
         }
 
-        if self.params.vision_fingerprint.is_some() && self.progress.stable_boundary.is_none() {
+        if (self.params.vision_fingerprint.is_some() || self.params.gemma_full_input_checkpoint.is_some())
+            && self.progress.stable_boundary.is_none() {
             let Some(hybrid) = guard.hybrid.as_ref() else {
                 return Err(Gemma4PrefillFailure {
                     rollback_anchor,
@@ -6844,17 +6863,20 @@ impl Gemma4PrefillState {
                     ),
                 });
             };
-            let kv =
-                match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
-                    hybrid,
-                    self.slot_id,
-                    self.prompt_tokens.len(),
-                ) {
+            let capture = if let Some(tag) = self.params.gemma_full_input_checkpoint.as_ref() {
+                gemma_full_input::capture(guard, self.slot_id, &self.prompt_tokens, tag)
+            } else {
+                crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                    hybrid, self.slot_id, self.prompt_tokens.len())
+            };
+            let kv = match capture {
                     Ok(kv) => kv,
                     Err(error) => {
                         return Err(Gemma4PrefillFailure {
                             rollback_anchor,
-                            error: error.context("capture exact-image Gemma prompt boundary"),
+                            error: error.context(if self.params.gemma_full_input_checkpoint.is_some() {
+                                "capture Gemma full-input checkpoint"
+                            } else { "capture exact-image Gemma prompt boundary" }),
                         });
                     }
                 };
@@ -12898,6 +12920,14 @@ fn admit_gemma4_slot(
     params: SamplingParams,
     mut reply: SlotReply,
 ) -> Option<SlotAwareGpuFatal> {
+    if let Some(tag) = params.gemma_full_input_checkpoint.as_ref() {
+        let check = tag.validate(&prompt_tokens).and_then(|_| {
+            anyhow::ensure!(guard.hybrid.is_some() && params.stable_prompt_prefix_tokens.is_none()
+                && params.vision_fingerprint.is_none(), "Gemma full-input checkpoint requires text Hybrid without split cue");
+            Ok(())
+        });
+        if let Err(error) = check { slot_fire_done(reply, Err(error), false); return None; }
+    }
     if reply.client_closed() {
         reply.record_client_cancellation();
         slot_fire_done(
@@ -13422,18 +13452,15 @@ fn admit_gemma4_slot(
             kv,
             vision_fingerprint: params.vision_fingerprint,
         })
-    } else if params.vision_fingerprint.is_some() {
-        let anchor = guard
-            .hybrid
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Gemma vision prompt cache requires hybrid KV"))
-            .and_then(|hybrid| {
-                crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
-                    hybrid,
-                    handle.slot_id,
-                    prompt_tokens.len(),
-                )
-            });
+    } else if params.vision_fingerprint.is_some() || params.gemma_full_input_checkpoint.is_some() {
+        let anchor = if let Some(tag) = params.gemma_full_input_checkpoint.as_ref() {
+            gemma_full_input::capture(guard, handle.slot_id, &prompt_tokens, tag)
+        } else {
+            guard.hybrid.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Gemma vision prompt cache requires hybrid KV"))
+                .and_then(|hybrid| crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                    hybrid, handle.slot_id, prompt_tokens.len()))
+        };
         match anchor {
             Ok(kv) => Some(Gemma4PromptAnchor {
                 prompt_tokens: prompt_tokens.clone(),
@@ -14282,7 +14309,8 @@ fn admit_gemma4_slots_batched(
             false,
         )
     });
-    if transaction_too_large || has_tiny_prefill {
+    if transaction_too_large || has_tiny_prefill
+        || requests.iter().any(|(_, params, _)| params.gemma_full_input_checkpoint.is_some()) {
         #[cfg(test)]
         if has_tiny_prefill {
             GEMMA4_TINY_PREFILL_BATCH_FALLBACK_COUNT
@@ -14812,6 +14840,12 @@ fn admit_gemma4_slots_stable_batched(
         }
         None
     };
+
+    // Full-input tags are never a split-cue batch or an empty cue forward.
+    if requests.iter().any(|(_, params, _)| params.gemma_full_input_checkpoint.is_some()) {
+        return fallback_single(guard, scheduler, slots, retained_tokens, prompt_anchors,
+            requests);
+    }
 
     // Both stable phases are multi-sequence Metal transactions. Conservatively
     // cap the sum of full rendered rows; their actual boundary/cue suffix sums
@@ -57581,3 +57615,7 @@ mod qwen38_slot_decode_telemetry_tests {
         assert!(decode.contains(decode_call));
     }
 }
+
+#[cfg(test)]
+#[path = "engine_gemma_full_input_tests.rs"]
+mod gemma_full_input_tests;
