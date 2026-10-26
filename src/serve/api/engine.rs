@@ -4029,6 +4029,14 @@ impl LoadInfoBuilder for LoadedModel {
 // ---------------------------------------------------------------------------
 
 impl Engine {
+    /// Last owning-worker pool observation. No native census on caller thread.
+    pub fn worker_pool_census(&self) -> serde_json::Value {
+        self.inner.supervisor.pool_census_json(matches!(
+            self.inner.info.arch_family,
+            crate::serve::load_info::ArchFamily::Qwen35
+        ))
+    }
+
     /// Spawn the worker thread and return a handle. The `queue_capacity` sets
     /// the mpsc channel buffer; when full, handlers receive a `queue_full`
     /// error and map it to 429 + Retry-After (Decision #19).
@@ -17424,6 +17432,9 @@ fn qwen35_operator_request_id(handle: SlotHandle) -> u64 {
 }
 
 fn finish_qwen35_operator_request(handle: SlotHandle, outcome: &'static str) {
+    if outcome != "complete" {
+        super::engine_supervisor::qwen_pool_request_observation(handle.slot_id.0 as usize, handle.generation, outcome);
+    }
     crate::serve::operator_ui::request_finished(
         "qwen35",
         qwen35_operator_request_id(handle),
@@ -19748,6 +19759,8 @@ fn finish_qwen35_prefill(
         scheduler.release(handle);
         finish_qwen35_operator_request(handle, "complete");
         let result = state.finish(guard.model, registration);
+        super::engine_supervisor::qwen_pool_request_observation(handle.slot_id.0 as usize, handle.generation,
+            if result.is_ok() { "completed_post_drain" } else { "failed" });
         if let Ok(generation) = result.as_ref() {
             log_qwen35_slot_decode_complete(generation, &reply, false);
             prompt_caches[slot_idx].store(&prompt_tokens, &params, generation);
@@ -20077,6 +20090,8 @@ fn decode_batch_qwen35(
                 (prompt.to_vec(), params.clone())
             };
             let gr = state.finish(guard.model, registration);
+            super::engine_supervisor::qwen_pool_request_observation(handle.slot_id.0 as usize, handle.generation,
+                if !client_dropped && gr.is_ok() { "completed_post_drain" } else { "failed" });
             if let Ok(result) = gr.as_ref() {
                 log_qwen35_slot_decode_complete(result, &reply, client_dropped);
                 if !client_dropped {
