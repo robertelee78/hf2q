@@ -142,3 +142,53 @@ for invalid in 0 -1 invalid 1.5 01; do
   fi
   test ! -e "$test_dir/invalid-peer.request.json"
 done
+
+# Exercise the long-cache gate's actual short-tail builder and validation.
+render_short_tail() (
+  local budget=$1
+  local output=$2
+  TARGET_PROMPT_TOKENS=127000
+  MIN_LONG_PROMPT_TOKENS=124000
+  MAX_LONG_PROMPT_TOKENS=130000
+  CALIBRATION_CHARS=1
+  MAX_GROWTH_TTFT_MS=1
+  MAX_CACHED_TTFT_MS=1
+  MAX_CACHED_RESPONSE_MS=1
+  CURL_CONNECT_TIMEOUT_SECONDS=1
+  CURL_MAX_TIME_SECONDS=1
+  MAX_TOKENS=1024
+  CONTINUATION_MAX_TOKENS=8192
+  SHORT_TAIL_SENTINEL=HF2Q_DEEPSEEK_SHORT_TAIL_OK
+  if [[ "$budget" == default ]]; then unset SHORT_TAIL_MAX_TOKENS; else SHORT_TAIL_MAX_TOKENS=$budget; fi
+  eval "$(awk '/^SHORT_TAIL_MAX_TOKENS=/{print; exit}' "$script_dir/test_deepseek4_long_context_cache.sh")"
+  eval "$(awk '/^for setting in TARGET_PROMPT_TOKENS /{copy=1} copy{print} copy && /^done$/{exit}' \
+    "$script_dir/test_deepseek4_long_context_cache.sh")"
+  eval "$(awk '/^make_short_tail_request\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' \
+    "$script_dir/test_deepseek4_long_context_cache.sh")"
+  make_short_tail_request "$test_dir/seed.request.json" "$test_dir/seed.response.json" "$output"
+)
+render_short_tail default "$test_dir/default-short-tail.request.json"
+render_short_tail 1024 "$test_dir/large-short-tail.request.json"
+jq -e '.max_tokens == 32 and .tool_choice == "auto"' "$test_dir/default-short-tail.request.json" >/dev/null
+jq -e '.max_tokens == 1024 and .tool_choice == "auto"' "$test_dir/large-short-tail.request.json" >/dev/null
+jq -S 'del(.max_tokens)' "$test_dir/default-short-tail.request.json" >"$test_dir/default-short-other.json"
+jq -S 'del(.max_tokens)' "$test_dir/large-short-tail.request.json" >"$test_dir/large-short-other.json"
+cmp "$test_dir/default-short-other.json" "$test_dir/large-short-other.json"
+for invalid in 0 -1 invalid 1.5 01; do
+  if render_short_tail "$invalid" "$test_dir/invalid-short-tail.request.json"; then
+    echo "short-tail budget accepted invalid value: $invalid" >&2
+    exit 1
+  fi
+  test ! -e "$test_dir/invalid-short-tail.request.json"
+done
+
+# The actual allocation must honor the owned packet TMPDIR on macOS, where
+# mktemp -t may choose a different directory despite TMPDIR.
+(
+  TMPDIR="$test_dir/owned-growth-tmp"
+  mkdir "$TMPDIR"
+  eval "$(awk '/^work_dir=\$\(mktemp /{print; exit}' "$script_dir/test_deepseek4_long_context_cache.sh")"
+  [[ -d "$work_dir" && "$work_dir" == "$TMPDIR"/hf2q-deepseek-long-cache.* ]]
+  [[ "$(cd "$(dirname "$work_dir")" && pwd -P)" == "$(cd "$TMPDIR" && pwd -P)" ]]
+  rmdir "$work_dir"
+)
