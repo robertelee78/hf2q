@@ -65,6 +65,7 @@ render_required_base() (
   PREFILL_CHUNKS_BEFORE_CANCEL=1
   CANCEL_SETTLE_SECONDS=1
   CANCEL_STABILITY_SECONDS=1
+  PEER_MAX_TOKENS=512
   if [[ "$budget" == default ]]; then unset MAX_TOKENS; else MAX_TOKENS=$budget; fi
   eval "$(awk '/^MAX_TOKENS=/{print; exit}' "$script_dir/test_deepseek4_cached_suffix.sh")"
   eval "$(awk '/^for setting in SERVER_PID /{copy=1} copy{print} copy && /^done$/{exit}' \
@@ -103,3 +104,41 @@ done
 )
 jq -e '.max_tokens == 128 and .tool_choice == "auto" and .stream == true' \
   "$test_dir/continuation.request.json" >/dev/null
+
+# The actual separate peer builder changes only its token allowance. Both cold
+# warmup and its SSE replay inherit that same request, without changing thinking.
+render_peer() (
+  local budget=$1
+  local output=$2
+  MODEL=fixture-model
+  SERVER_PID=1
+  CURL_CONNECT_TIMEOUT_SECONDS=1
+  CURL_MAX_TIME_SECONDS=1
+  PREFILL_CHUNKS_BEFORE_CANCEL=1
+  CANCEL_SETTLE_SECONDS=1
+  CANCEL_STABILITY_SECONDS=1
+  MAX_TOKENS=1024
+  if [[ "$budget" == default ]]; then unset PEER_MAX_TOKENS; else PEER_MAX_TOKENS=$budget; fi
+  eval "$(awk '/^PEER_MAX_TOKENS=/{print; exit}' "$script_dir/test_deepseek4_cached_suffix.sh")"
+  eval "$(awk '/^for setting in SERVER_PID /{copy=1} copy{print} copy && /^done$/{exit}' \
+    "$script_dir/test_deepseek4_cached_suffix.sh")"
+  eval "$(awk '/^build_peer_request\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' \
+    "$script_dir/test_deepseek4_cached_suffix.sh")"
+  build_peer_request "$output" fixture-peer
+)
+render_peer default "$test_dir/default-peer.request.json"
+render_peer 8192 "$test_dir/large-peer.request.json"
+jq -e '.max_tokens == 512 and .temperature == 0 and .stream == false' \
+  "$test_dir/default-peer.request.json" >/dev/null
+jq -e '.max_tokens == 8192 and .temperature == 0 and .stream == false' \
+  "$test_dir/large-peer.request.json" >/dev/null
+jq -S 'del(.max_tokens)' "$test_dir/default-peer.request.json" >"$test_dir/default-peer-other.json"
+jq -S 'del(.max_tokens)' "$test_dir/large-peer.request.json" >"$test_dir/large-peer-other.json"
+cmp "$test_dir/default-peer-other.json" "$test_dir/large-peer-other.json"
+for invalid in 0 -1 invalid 1.5 01; do
+  if render_peer "$invalid" "$test_dir/invalid-peer.request.json"; then
+    echo "peer budget accepted invalid value: $invalid" >&2
+    exit 1
+  fi
+  test ! -e "$test_dir/invalid-peer.request.json"
+done
