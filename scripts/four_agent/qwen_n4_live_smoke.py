@@ -38,8 +38,13 @@ def preflight(base):
         "pool_profile_selection_verified"}
 
 
-def validate_preflight(value, base):
-    require(isinstance(value, dict) and set(value) == preflight(base) and
+def validate_preflight(value, base, engine_kind="hf2q"):
+    keys = preflight(base)
+    if engine_kind == "peer":
+        from qwen_n4_peer import preflight as peer_preflight
+        keys = peer_preflight(keys)
+    require(engine_kind in ("hf2q", "peer"), "engine kind")
+    require(isinstance(value, dict) and set(value) == keys and
             all(v is True for v in value.values()), "four-slot actual pool selection/preflight")
 
 
@@ -124,11 +129,13 @@ def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approv
             "release_sha256": child.digest(release), "wait_seconds": time.monotonic() - started}
 
 
-def aggregate(results, exits, cleanup, pid, run):
+def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q"):
+    require(engine_kind in ("hf2q", "peer"), "engine kind")
     require(set(results) == set(exits) == set(cleanup) == set(AGENTS), "missing agent result")
     initial = set()
     for agent in AGENTS:
         result = results[agent]
+        require(result.get("engine_kind", "hf2q") == engine_kind, "mixed engine result")
         require(exits[agent] == 0 and cleanup[agent] is True and result.get("cleanup") is True,
                 "client exit/cleanup unknown")
         require(result.get("schema") == "hf2q.qwen-n4-agent-result.v1" and result.get("profile") == PROFILE
@@ -171,6 +178,7 @@ def main():
                  "sandbox-proof-sha256", "approval", "approval-sha256"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--server-pid", type=int, required=True)
+    parser.add_argument("--engine-kind", choices=("hf2q", "peer"), default="hf2q")
     args = parser.parse_args()
     from qwen38_n1_smoke import new_output, PREFLIGHT
     os.umask(0o077)
@@ -195,14 +203,20 @@ def main():
         require(packet.get("server_pid") == args.server_pid and packet.get("base_url") == args.base_url
                 and packet.get("model") == args.model, "single server binding")
         module_dir = Path(__file__).resolve().parent
-        sources = {name: child.digest(module_dir / name) for name in MODULES}
+        names = MODULES + (("qwen_n4_peer.py", "test_qwen_n4_peer.py") if args.engine_kind == "peer" else ())
+        sources = {name: child.digest(module_dir / name) for name in names}
+        require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
+        summary["engine_kind"] = args.engine_kind
+        if args.engine_kind == "peer":
+            from qwen_n4_peer import readiness
+            summary["peer_readiness"] = readiness(args.base_url, args.model, output)
         require(packet.get("sources") == sources, "N4 source freeze drift")
         require(packet.get("python_sha256") == child.digest(Path(sys.executable).resolve()), "Python binary")
         run, token = packet.get("run_id"), packet.get("barrier_token")
         identity(AGENTS[0], run)
         require(isinstance(token, str) and re.fullmatch(r"[a-f0-9]{32}", token), "barrier nonce")
         template = packet.get("agent_template", {})
-        validate_preflight(template.get("preflight"), PREFLIGHT)
+        validate_preflight(template.get("preflight"), PREFLIGHT, args.engine_kind)
         summary["run_id"] = run
         barrier = output / "barrier"
         barrier.mkdir(mode=0o700)
@@ -210,7 +224,7 @@ def main():
             require(not INTERRUPTED, "interrupted before any further client launch")
             path = output / agent
             binding = {**template, "schema": "hf2q.qwen-n4-agent-approval.v1", "profile": PROFILE,
-                       "diagnostic_slots": 4, "agent_id": agent, "run_id": run,
+                       "engine_kind": args.engine_kind, "diagnostic_slots": 4, "agent_id": agent, "run_id": run,
                        "barrier_dir": str(barrier), "barrier_token": token, "agent_output": str(path),
                        "initial_identity_sha256": hashlib.sha256(identity(agent, run).encode()).hexdigest(),
                        "sources": sources, "server_pid": args.server_pid, "base_url": args.base_url,
@@ -222,7 +236,7 @@ def main():
                         "sandbox_proof_sha256", "server_pid"):
                 command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
             command += ["--output", str(path), "--approval", str(approval_path), "--approval-sha256",
-                        child.digest(approval_path), "--diagnostic-slots", "4", "--agent-id", agent,
+                        child.digest(approval_path), "--diagnostic-slots", "4", "--engine-kind", args.engine_kind, "--agent-id", agent,
                         "--run-id", run, "--barrier-dir", str(barrier), "--barrier-token", token]
             stdout, stderr = [(output / f"{agent}.{name}").open("xb") for name in ("stdout", "stderr")]
             streams += [stdout, stderr]
@@ -276,7 +290,7 @@ def main():
             stream.close()
         if summary["status"] != "Failed":
             try:
-                summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run)
+                summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.engine_kind)
             except BaseException as exc:
                 summary["status"], summary["error"] = "Failed", str(exc)
         summary.update(agents=results, exits=exits, client_cleanup=receipts,
