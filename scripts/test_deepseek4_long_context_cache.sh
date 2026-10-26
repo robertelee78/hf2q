@@ -107,12 +107,13 @@ make_short_tail_request() {
   local output=$3
   jq -n --slurpfile base "$base" --slurpfile prior "$prior" \
     --arg sentinel "$SHORT_TAIL_SENTINEL" --argjson max_tokens "$SHORT_TAIL_MAX_TOKENS" '
-      $base[0]
+      ($prior[0].choices[0].message
+        | if .role == "assistant" and (.content | type) == "string"
+             and ((.tool_calls // []) | length) == 0
+          then . else error("short-tail prior must be a terminal assistant text message") end) as $assistant
+      | $base[0]
       | .messages += [
-          {
-            role: "assistant",
-            content: $prior[0].choices[0].message.content
-          },
+          $assistant,
           {
             role: "user",
             content: ("Reply exactly " + $sentinel + ".")

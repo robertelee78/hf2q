@@ -192,3 +192,41 @@ done
   [[ "$(cd "$(dirname "$work_dir")" && pwd -P)" == "$(cd "$TMPDIR" && pwd -P)" ]]
   rmdir "$work_dir"
 )
+
+# Preserve the ACTUAL assistant message, including optional native reasoning;
+# copying only content rewrites DeepSeek's retained thinking/tool prefix.
+(
+  SHORT_TAIL_SENTINEL=HF2Q_DEEPSEEK_SHORT_TAIL_OK
+  SHORT_TAIL_MAX_TOKENS=1024
+  eval "$(awk '/^make_short_tail_request\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' \
+    "$script_dir/test_deepseek4_long_context_cache.sh")"
+  for mode in present absent; do
+    jq --arg mode "$mode" '
+      .id = "response-only-metadata"
+      | .usage = {completion_tokens: 33}
+      | if $mode == "present"
+        then .choices[0].message.reasoning_content = "Actual reasoning with \"quotes\" and\nnewline."
+        else .choices[0].message |= del(.reasoning_content) end
+    ' "$test_dir/seed.response.json" >"$test_dir/$mode-prior.json"
+    make_short_tail_request "$test_dir/seed.request.json" "$test_dir/$mode-prior.json" \
+      "$test_dir/$mode-short-tail.request.json"
+    jq -e --slurpfile prior "$test_dir/$mode-prior.json" '
+      .messages[-2] == $prior[0].choices[0].message
+      and .messages[-2].role == "assistant"
+      and (has("id") | not) and (has("usage") | not) and (has("choices") | not)
+      and .max_tokens == 1024
+    ' "$test_dir/$mode-short-tail.request.json" >/dev/null
+  done
+  for mode in wrong-role tool-call null-content; do
+    jq --arg mode "$mode" '
+      if $mode == "wrong-role" then .choices[0].message.role = "user"
+      elif $mode == "tool-call" then .choices[0].message.tool_calls = [{id:"unexpected"}]
+      else .choices[0].message.content = null end
+    ' "$test_dir/seed.response.json" >"$test_dir/$mode-prior.json"
+    if make_short_tail_request "$test_dir/seed.request.json" "$test_dir/$mode-prior.json" \
+      "$test_dir/$mode-invalid-short.json"; then
+      echo "short-tail builder accepted invalid prior: $mode" >&2
+      exit 1
+    fi
+  done
+)
