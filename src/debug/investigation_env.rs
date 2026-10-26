@@ -32,6 +32,7 @@
 //! its classification in `docs/shipping-contract.md`.
 
 pub mod qwen_pool_profile;
+pub mod gemma_full_input;
 
 use std::env;
 use std::sync::{LazyLock, OnceLock};
@@ -765,6 +766,7 @@ pub struct InvestigationEnv {
     pub unsafe_experiments_acked: bool,
     /// Optional Category-3 intent; refusal is a startup error, never fallback.
     pub qwen_pool_profile: qwen_pool_profile::QwenPoolProfile,
+    pub gemma_full_input_checkpoint: gemma_full_input::Mode,
     /// Read-once exclusions for the selected serve path's NoFutureUse proof.
     pub qwen_pool_diagnostic_conflict: bool,
 
@@ -978,6 +980,8 @@ impl InvestigationEnv {
                 "HF2Q_DUMP_LAYER_ACTIVATIONS", "HF2Q_DUMP_LAYER", "MLX_METAL_CAPTURE"]
                 .iter().any(|name| env::var_os(name).is_some_and(|v| !matches!(v.to_str(), Some("") | Some("0"))))
                 || qwen_pool_profile::split_profile_conflict(env::var("HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS").ok().as_deref()),
+            gemma_full_input_checkpoint: gemma_full_input::Mode::from_os(
+                env::var_os("HF2Q_GEMMA_FULL_INPUT_CHECKPOINT").as_deref(), ack),
             qwen_pool_profile: qwen_pool_profile::QwenPoolProfile::from_os(
                 env::var_os("HF2Q_QWEN_POOL_GROWTH_PROFILE").as_deref(), ack),
             raw,
@@ -1080,6 +1084,10 @@ impl InvestigationEnv {
     /// - **DIAGNOSTICS:** read-only / timing toggles — listed for
     ///   visibility, no behavioral implication.
     pub fn activate(&self, json_output: bool) {
+        if let Some(summary) = self.gemma_full_input_checkpoint.summary() {
+            if json_output { eprintln!("{}", serde_json::json!({"level":"warn", "message":summary})); }
+            else { eprintln!("hf2q: {summary}"); }
+        }
         if let Some(summary) = self.qwen_pool_profile.summary() {
             if json_output { eprintln!("{}", serde_json::json!({"level":"warn", "message":summary})); }
             else { eprintln!("hf2q: {summary}"); }

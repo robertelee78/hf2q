@@ -654,6 +654,13 @@ jobs:
           fi
           echo "  OK"
 
+          echo "--- Gemma full-input checkpoint activation matrix ---"
+          HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1 ./target/release/hf2q --help > /dev/null 2>/tmp/gemma_checkpoint_refused.log
+          grep -q "REFUSED HF2Q_GEMMA_FULL_INPUT_CHECKPOINT" /tmp/gemma_checkpoint_refused.log
+          HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1 HF2Q_UNSAFE_EXPERIMENTS=1 ./target/release/hf2q --help > /dev/null 2>/tmp/gemma_checkpoint_active.log
+          grep -q "UNSAFE (ack-required, activated): HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1" /tmp/gemma_checkpoint_active.log
+          if grep -q REFUSED /tmp/gemma_checkpoint_active.log; then exit 1; fi
+
           echo "--- HF2Q_F16_KV=1 without ack must REFUSE ---"
           HF2Q_F16_KV=1 ./target/release/hf2q --help \
               > /dev/null 2>/tmp/stderr_refused.log

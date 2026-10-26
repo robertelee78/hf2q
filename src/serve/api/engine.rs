@@ -31,6 +31,9 @@
 //! behavior (ADR-009 dense-KV, ADR-010 Q8 rerank, chat-template priority
 //! order) is preserved by construction.
 
+#[path = "engine_gemma_full_input.rs"]
+pub(crate) mod gemma_full_input;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -413,6 +416,7 @@ pub struct SamplingParams {
     /// This deliberately does not participate in `PromptCacheKey`: it
     /// describes prompt layout, not generation semantics.
     pub stable_prompt_prefix_tokens: Option<usize>,
+    pub(crate) gemma_full_input_checkpoint: Option<gemma_full_input::Checkpoint>,
 
     /// Digest of the authoritative vision embeddings and image-grid layout
     /// used to replace placeholder tokens in this request. `None` is the
@@ -452,6 +456,7 @@ impl Default for SamplingParams {
             reasoning_end_tokens: None,
             reasoning_close_tokens: None,
             stable_prompt_prefix_tokens: None,
+            gemma_full_input_checkpoint: None,
             vision_fingerprint: None,
         }
     }
@@ -938,6 +943,8 @@ impl Default for EngineMode {
 pub enum EngineSpawnError {
     #[error("Qwen pool profile startup refused: {cause}")]
     QwenPoolProfile { cause: String },
+    #[error("Gemma full-input checkpoint startup refused: {cause}")]
+    GemmaFullInputCheckpoint { cause: String },
     /// The requested [`EngineMode`] variant requires runtime support that
     /// has not yet landed. Carries the iter that introduced the surface
     /// (`iter_landed`, e.g. `"C2b"` for the worker-refactor commit) and
@@ -4049,6 +4056,8 @@ impl Engine {
         queue_capacity: usize,
         kv_cache_budget_bytes: Option<u64>,
     ) -> Self {
+        assert!(!crate::debug::investigation_env::gemma_full_input::selected().unwrap_or(true),
+            "Gemma full-input experiment requires fallible SlotAware spawn");
         // Must precede even channel/metadata/thread creation. The normal
         // fallible entry rejects unsupported profile/mode combinations first.
         crate::inference::models::qwen35::decode_pool::profile::assert_direct_spawn_legacy();
@@ -4337,6 +4346,15 @@ impl Engine {
         kv_cache_budget_bytes: Option<u64>,
         mode: EngineMode,
     ) -> std::result::Result<Self, EngineSpawnError> {
+        let full_input = crate::debug::investigation_env::gemma_full_input::selected()
+            .map_err(|e| EngineSpawnError::GemmaFullInputCheckpoint { cause: e.into() })?;
+        if full_input {
+            gemma_full_input::validate_startup(matches!(&loaded, LoadedModel::Gemma(_)),
+                match mode { EngineMode::SlotAware { max_slots } => Some(max_slots), _ => None },
+                crate::debug::INVESTIGATION_ENV.hybrid_kv,
+                crate::debug::INVESTIGATION_ENV.tq_codebook_bits)
+                .map_err(|e| EngineSpawnError::GemmaFullInputCheckpoint { cause: e.to_string() })?;
+        }
         if crate::inference::models::qwen35::decode_pool::profile::selected() {
             use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights};
             let native = match &loaded {
@@ -6263,7 +6281,7 @@ fn gemma4_cross_batch_candidate(request: &Request) -> Option<(Gemma4CrossBatchCl
             prompt_tokens,
             params,
             ..
-        } if gemma4_cross_batch_eligible(
+        } if params.gemma_full_input_checkpoint.is_none() && gemma4_cross_batch_eligible(
             prompt_tokens.len(),
             params.max_tokens,
             params.stable_prompt_prefix_tokens.is_some(),
@@ -6285,7 +6303,7 @@ fn gemma4_cross_batch_candidate(request: &Request) -> Option<(Gemma4CrossBatchCl
             params,
             soft_tokens,
             ..
-        } if gemma4_cross_batch_eligible(
+        } if params.gemma_full_input_checkpoint.is_none() && gemma4_cross_batch_eligible(
             prompt_tokens.len(),
             params.max_tokens,
             params.stable_prompt_prefix_tokens.is_some(),
@@ -6838,7 +6856,8 @@ impl Gemma4PrefillState {
             });
         }
 
-        if self.params.vision_fingerprint.is_some() && self.progress.stable_boundary.is_none() {
+        if (self.params.vision_fingerprint.is_some() || self.params.gemma_full_input_checkpoint.is_some())
+            && self.progress.stable_boundary.is_none() {
             let Some(hybrid) = guard.hybrid.as_ref() else {
                 return Err(Gemma4PrefillFailure {
                     rollback_anchor,
@@ -6847,17 +6866,20 @@ impl Gemma4PrefillState {
                     ),
                 });
             };
-            let kv =
-                match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
-                    hybrid,
-                    self.slot_id,
-                    self.prompt_tokens.len(),
-                ) {
+            let capture = if let Some(tag) = self.params.gemma_full_input_checkpoint.as_ref() {
+                gemma_full_input::capture(guard, self.slot_id, &self.prompt_tokens, tag)
+            } else {
+                crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                    hybrid, self.slot_id, self.prompt_tokens.len())
+            };
+            let kv = match capture {
                     Ok(kv) => kv,
                     Err(error) => {
                         return Err(Gemma4PrefillFailure {
                             rollback_anchor,
-                            error: error.context("capture exact-image Gemma prompt boundary"),
+                            error: error.context(if self.params.gemma_full_input_checkpoint.is_some() {
+                                "capture Gemma full-input checkpoint"
+                            } else { "capture exact-image Gemma prompt boundary" }),
                         });
                     }
                 };
@@ -12901,6 +12923,14 @@ fn admit_gemma4_slot(
     params: SamplingParams,
     mut reply: SlotReply,
 ) -> Option<SlotAwareGpuFatal> {
+    if let Some(tag) = params.gemma_full_input_checkpoint.as_ref() {
+        let check = tag.validate(&prompt_tokens).and_then(|_| {
+            anyhow::ensure!(guard.hybrid.is_some() && params.stable_prompt_prefix_tokens.is_none()
+                && params.vision_fingerprint.is_none(), "Gemma full-input checkpoint requires text Hybrid without split cue");
+            Ok(())
+        });
+        if let Err(error) = check { slot_fire_done(reply, Err(error), false); return None; }
+    }
     if reply.client_closed() {
         reply.record_client_cancellation();
         slot_fire_done(
@@ -13425,18 +13455,15 @@ fn admit_gemma4_slot(
             kv,
             vision_fingerprint: params.vision_fingerprint,
         })
-    } else if params.vision_fingerprint.is_some() {
-        let anchor = guard
-            .hybrid
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Gemma vision prompt cache requires hybrid KV"))
-            .and_then(|hybrid| {
-                crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
-                    hybrid,
-                    handle.slot_id,
-                    prompt_tokens.len(),
-                )
-            });
+    } else if params.vision_fingerprint.is_some() || params.gemma_full_input_checkpoint.is_some() {
+        let anchor = if let Some(tag) = params.gemma_full_input_checkpoint.as_ref() {
+            gemma_full_input::capture(guard, handle.slot_id, &prompt_tokens, tag)
+        } else {
+            guard.hybrid.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Gemma vision prompt cache requires hybrid KV"))
+                .and_then(|hybrid| crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                    hybrid, handle.slot_id, prompt_tokens.len()))
+        };
         match anchor {
             Ok(kv) => Some(Gemma4PromptAnchor {
                 prompt_tokens: prompt_tokens.clone(),
@@ -14287,7 +14314,8 @@ fn admit_gemma4_slots_batched(
         .map_or(0, |preference| preference.cached_tokens);
         (prompt.len(), cached)
     }));
-    if plan.requires_slot_admission() {
+    if plan.requires_slot_admission()
+        || requests.iter().any(|(_, params, _)| params.gemma_full_input_checkpoint.is_some()) {
         #[cfg(test)]
         if plan.has_tiny_prefill {
             GEMMA4_TINY_PREFILL_BATCH_FALLBACK_COUNT
@@ -14817,6 +14845,12 @@ fn admit_gemma4_slots_stable_batched(
         }
         None
     };
+
+    // Full-input tags are never a split-cue batch or an empty cue forward.
+    if requests.iter().any(|(_, params, _)| params.gemma_full_input_checkpoint.is_some()) {
+        return fallback_single(guard, scheduler, slots, retained_tokens, prompt_anchors,
+            requests);
+    }
 
     // Both stable phases are multi-sequence Metal transactions. Conservatively
     // cap the sum of full rendered rows; their actual boundary/cue suffix sums
@@ -43945,6 +43979,9 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
                 .expect("H28: spawn_inner_with_slot_aware sibling not found")
             + "    fn spawn_inner_with_slot_aware".len();
         let body = &src[body_start..body_end];
+        // Ignore preceding startup-validation matches: this is the dispatch.
+        let dispatch = body.find("match mode {\n").expect("H28: mode dispatch table");
+        let body = &body[dispatch..];
         let serial_fifo_idx = body
             .find("EngineMode::SerialFifo")
             .expect("H28: SerialFifo arm not found in spawn_with_mode");
@@ -50019,89 +50056,28 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
         );
     }
 
-    /// **H92 (skip-mode + runtime when MLX available)** — provisioning
-    /// honours `INVESTIGATION_ENV.hybrid_kv`:
-    /// - Source-grep: the body of
-    ///   `provision_multi_seq_kv_for_slot_aware` contains an
-    ///   `INVESTIGATION_ENV.hybrid_kv` gate around the
-    ///   `alloc_multi_seq_hybrid_kv_for_layer` call site.
-    /// - Source-grep: the `multi_seq_kv` (HB) scaffold is provisioned
-    ///   UNCONDITIONALLY (no env gate around `alloc_hb_kv_for_layer`).
-    /// - Source-grep: the `multi_seq_kv_hybrid` field is assigned
-    ///   `Some(_)` ONLY inside the env gate.
-    ///
-    /// Reasoning: the actual runtime semantic (Some/None per env) is
-    /// what we want to pin, but we can't construct a real
-    /// `GemmaLoadedModel` without loading a Gemma 4 GGUF (out of scope
-    /// per the CLAUDE.md "do not oom us" rule). The source-grep pin
-    /// catches the lexical structure that produces the runtime
-    /// semantic.
+    /// H92: production consumes checked descriptors and typed phase dispatch.
+    /// Runtime Hybrid ON/OFF, HB, disabled-field and failure semantics are
+    /// independently exercised by cache_scaffold_plan_tests.
     #[test]
     fn h92_hybrid_provisioning_gated_on_investigation_env_hybrid_kv() {
         let src = include_str!("engine.rs");
-        let fn_marker = "pub fn provision_multi_seq_kv_for_slot_aware(";
-        let fn_idx = src
-            .find(fn_marker)
-            .expect("H92: provision_multi_seq_kv_for_slot_aware not found");
-        // The fn body is large after iter-C2c-cont (~150 LOC); window
-        // to 12k chars to cover docstring + body.
-        let body_window = &src[fn_idx..(fn_idx + 12_000).min(src.len())];
-        // The hybrid allocator IS called.
-        assert!(
-            body_window.contains("alloc_multi_seq_hybrid_kv_for_layer("),
-            "H92 FALSIFIED: provision_multi_seq_kv_for_slot_aware body \
-             does NOT call `alloc_multi_seq_hybrid_kv_for_layer`. \
-             iter-C2c-cont production-default scaffold (per H10 \
-             falsification §6.1.11) is NOT provisioned."
-        );
-        // The hybrid allocator call is gated on INVESTIGATION_ENV.hybrid_kv.
-        let env_gate_marker = "INVESTIGATION_ENV.hybrid_kv";
-        let env_gate_idx = body_window.find(env_gate_marker).expect(
-            "H92 FALSIFIED: provision_multi_seq_kv_for_slot_aware body does \
-             NOT contain `INVESTIGATION_ENV.hybrid_kv` — the hybrid \
-             provisioning is unconditional (BREAKING H95: HF2Q_HYBRID_KV=0 \
-             must not allocate the hybrid scaffold).",
-        );
-        let alloc_idx = body_window
-            .find("alloc_multi_seq_hybrid_kv_for_layer(")
-            .expect("H92: alloc call present (asserted above)");
-        assert!(
-            env_gate_idx < alloc_idx,
-            "H92 FALSIFIED: `INVESTIGATION_ENV.hybrid_kv` does NOT \
-             lexically precede `alloc_multi_seq_hybrid_kv_for_layer` \
-             call. The env gate must wrap the alloc — without lexical \
-             ordering, the alloc is not gated and HF2Q_HYBRID_KV=0 \
-             would still allocate hybrid bytes."
-        );
-        // The HB allocator IS called UNCONDITIONALLY (not inside the
-        // env gate). Source-order check: HB alloc comes BEFORE the env
-        // gate in the fn body (Phase 1 always; Phase 2 conditional).
-        let hb_alloc_idx = body_window
-            .find("alloc_hb_kv_for_layer(")
-            .expect("H92: alloc_hb_kv_for_layer call present in fn body");
-        assert!(
-            hb_alloc_idx < env_gate_idx,
-            "H92 FALSIFIED: `alloc_hb_kv_for_layer` does NOT lexically \
-             precede `INVESTIGATION_ENV.hybrid_kv` env gate. C2c HB \
-             provisioning must be UNCONDITIONAL (H94 preserved); \
-             accidentally moving it inside the env gate would break \
-             the HF2Q_HYBRID_KV=0 path."
-        );
-        // The `multi_seq_kv_hybrid = Some(_)` assignment is inside the
-        // env-gated branch (positive: assignment present at all).
-        assert!(
-            body_window.contains("self.multi_seq_kv_hybrid = Some("),
-            "H92 FALSIFIED: provision_multi_seq_kv_for_slot_aware body \
-             does NOT assign `self.multi_seq_kv_hybrid = Some(_)`. The \
-             new field is never populated — iter-C2c-cont effectively \
-             unimplemented."
-        );
-        // Defense-in-depth: the C2c HB assignment is unchanged.
-        assert!(
-            body_window.contains("self.multi_seq_kv = Some("),
-            "H92 FALSIFIED: C2c assignment `self.multi_seq_kv = Some(_)` \
-             removed — H94 broken."
-        );
+        let start = src.find("pub fn provision_multi_seq_kv_for_slot_aware(")
+            .expect("H92: Gemma provisioning method");
+        let end = src[start..].find("impl LoadInfoBuilder for GemmaLoadedModel")
+            .expect("H92: provisioning impl boundary") + start;
+        let body = &src[start..end];
+        for marker in ["ScaffoldPlan::new(", "Modes::invocation()", "plan.execute(",
+            "Phase::Hb => Allocated::Hb(alloc_hb_kv_for_layer_from_plan(&device, slot)",
+            "Phase::Hybrid => Allocated::Hybrid(",
+            "alloc_multi_seq_hybrid_kv_for_layer_from_plan(&device, slot)",
+            "self.multi_seq_kv = Some(", "self.multi_seq_kv_hybrid = Some("] {
+            assert!(body.contains(marker), "H92: planned allocator/publication missing {marker}");
+        }
+        let plan = include_str!("../../inference/models/gemma4/cache_scaffold_plan.rs");
+        assert!(plan.contains("hybrid: env.hybrid_kv"), "H92: actual Hybrid mode binding");
+        assert!(plan.contains("(Phase::Hb, true)"), "H92: unconditional HB");
+        assert!(plan.contains("(Phase::Hybrid, modes.hybrid)"), "H92: captured Hybrid mode");
     }
 
     /// **H93 (compile pin + Display contract)** — NEW typed-error
@@ -57586,3 +57562,7 @@ mod qwen38_slot_decode_telemetry_tests {
         assert!(decode.contains(decode_call));
     }
 }
+
+#[cfg(test)]
+#[path = "engine_gemma_full_input_tests.rs"]
+mod gemma_full_input_tests;

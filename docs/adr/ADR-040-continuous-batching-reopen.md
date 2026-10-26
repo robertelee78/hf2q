@@ -1933,6 +1933,125 @@ The shape of this work is structural Walk, not optimization. ADR-005's comparato
 
 **Per the mantra**: this ADR does not stub or todo-later. Each phase's iter-1 ships compiling scaffolding with tests; each subsequent iter implements one cohesive piece with regression pins. No shortcuts.
 
+### 2026-10-26: experimental Gemma full-input checkpoint source stage
+
+Native Gemma tool-result inputs can have render(false)==render(true), while
+remaining exact extensions of a prior input. Default behavior and the generic
+strict0<boundary<P contract remain unchanged. A separate default-OFF,
+ack-required `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1` stage carries an identity-bearing
+length/token-SHA tag only for that exact Gemma text/tool-input equality.
+The actual Hybrid substrate/input cursor is validated before full capture.
+It reuses the existing full-image checkpoint placements after completed input
+prefill/cursor commit, before publication, preserving the already computed
+first logits/sample. Resumable paths capture only finalReady. No empty cue
+forward, second sample, forced thinking, generic oracle relaxation or other
+family substitution is introduced.
+
+With the stage selected, all strict/image/rollback/full Hybrid anchor captures
+reserve their actual requested slot payload plus projected token-ledger/metadata
+bytes before constructing any copy, against1536MiB. Private anchor payloads
+remain non-Clone, and the reservation field drops after all Vec payload fields;
+partial-copy failure retains the reservation until those partial Vecs unwind.
+Default-OFF capture allocation policy remains unchanged. The selected Google
+sliding-only snapshot payload158105600B is independent of logical full context;
+full/global rows are append-only and not CPU-copied. Token identity vectors still
+scale with input length. Eight old/new N4 snapshots plus maximum token ledgers
+fit this requested-domain cap; unexpected extra generations/other geometries
+are refused before copying rather than counted as free. This leaves the other
+half of the existing3GiB CPU operating allowance for other owners, not a proof
+they fit. LCP8GiB GPU registry accounting is separate; no physical retirement or
+wholeQ5 claim follows.
+
+Source controls include exact tag/activation/quota decisions, an ignored bounded
+actual Shared-buffer CPU copy/restore/denial control (no GPU submission), and a
+separate ignored REAL-GGUF small-input logits/first-sample/ring-retry control.
+No control has been executed by the author. The latter loads real model weights
+and needs its own reviewed packet; "small input" is not a tiny model claim.
+Generic strict seven-wire oracles stay unchanged and the Gemma family-v2 full
+input acceptance contract must wait for actual semantic/quality/cache proofs.
+
+The staged REAL-GGUF control also invokes the actual resumable
+`finish_committed_transaction` Pending/Ready/failure paths: Pending retains the
+old rollback owner without capture or a publishable Ready state; final Ready
+contains exactly one successful checkpoint before exposing its seed; capture
+identity failure returns the latest rollback owner without a publishable state.
+Test-only thread-local attempt/success witnesses instrument the production
+capture seam. This is not a direct scheduler/HTTP admission or cancellation
+integration test: `admit_gemma4_slot` and outer recovery/publication still need
+actual serving proof. No such control is claimed executed in this source stage.
+
+
+#### 2026-10-26 staged component evidence (default OFF unchanged)
+
+The integration owner compiled frozen source V3 (base
+`dbda28efa40dda7fd506a7087b204861692d7913`, source-freeze SHA256
+`225c38f2f06f05667e7026f6b4374ac26b30f99ba7da93cb4873a8f03820e218`)
+and reported nine pure controls passing, plus
+`cargo check --locked --all-targets --all-features` passing. The executed
+uncommitted-stage test binary SHA256 was
+`19ac2a31348d9c2370ef7e0d6182b2cf95e05dfb4747506c6e8ba7822c401e0b`.
+This is a frozen-source component result, not a clean-commit/release claim.
+Within the retained campaign evidence root, provenance is bound by
+`gemma-full-input-cpu-v3-20261026T204214Z/binary-binding.json` and
+`gemma-full-input-real-control-20261026T204250Z/binary-binding.json`;
+their source archives retain the executed V3 files. This documentation-only
+update does not alter that historical source freeze.
+
+The exact ignored CPU control
+`inference::models::gemma4::kv_cache::anchor_budget::actual_cpu::gemma_anchor_cpu_copy_reservation_and_exact_retry_layout`
+passed with its completion marker: six real Shared-buffer roots, 30,880 requested
+Metal bytes, bounded CPU packet 262144 B, no GPU submission, restoration 7-to-6 and
+reservation release. The exact ignored real-GGUF control
+`serve::api::engine::gemma_full_input_tests::gemma_full_input_real_prefill_preserves_sample_and_exact_retry`
+then passed once on the cached Google Gemma artifact
+`bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53`.
+Its final marker explicitly reported unchanged first logits/sample,
+`exact_retry=true same_image=true sliding_bytes_equal=true actual_pending=true
+actual_ready=true failure_rollback=true`; exit 0 and owned-process cleanup were
+recorded. It used real weights, two logical full-capacity slots plus original
+loaded resources, a 1028-token input and actual GPU forwards. It was not a
+model-free or tiny-weight test.
+
+Portable component invocations, with the exact reviewed binary and (for the
+second command) GGUF supplied by the operator, are:
+
+```bash
+HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1 \
+  "$TEST_BINARY" --ignored --exact \
+  inference::models::gemma4::kv_cache::anchor_budget::actual_cpu::gemma_anchor_cpu_copy_reservation_and_exact_retry_layout \
+  --nocapture --test-threads=1
+HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1 \
+HF2Q_GEMMA_FULL_INPUT_TEST_GGUF="$GGUF" \
+  "$TEST_BINARY" --ignored --exact \
+  serve::api::engine::gemma_full_input_tests::gemma_full_input_real_prefill_preserves_sample_and_exact_retry \
+  --nocapture --test-threads=1
+```
+
+Actual execution additionally used the prospectively reviewed one-process
+memory/pressure/process-ledger watchdog and retained raw outputs. These commands
+identify the tests; they do not replace resource preflight/supervision.
+
+The earlier V2 actual attempt
+`gemma-full-input-real-control-20261026T202438Z` remains FAILED: exact logits
+differed between an independently cold-prefilled 1027-token cache plus scalar
+last-token decode and a restored 1028-token-prefill cache. Both selected token 14,
+but maximum absolute logit difference was 0.812623; this is not dismissed as
+trivial rounding or accepted parity. V3 keeps that cross-route comparison as an
+explicit non-acceptance diagnostic. Its deciding restore oracle instead uses
+the SAME P-prefill cache image and SAME scalar kernel before and after actual
+ring overwrite/restore, requiring every logit bit and token equal, plus
+byte-for-byte restored sliding payload and unchanged initialized other-slot
+fingerprints. The cross-route discrepancy remains unresolved separately.
+
+These results establish only the fixed component controls. Full direct
+`admit_gemma4_slot`/scheduler/HTTP publication and cancellation integration,
+actual seven-turn unary/SSE tool continuation and family-explicit full-input
+prefix proof remain unqualified. The generic strict seven-wire oracle is
+unchanged; no default promotion, full Q5 completion or performance claim follows.
+Independent retained-evidence review verified all 464 artifact hashes, the
+executed source and binary bindings, the single completion, and clean process
+reaping. It accepted only this component scope.
+
 ### 2026-10-26: Gemma cold cohorts preserve retained-prefix preference
 
 The retained Gemma four-agent coding diagnostic failed its first tool-result
