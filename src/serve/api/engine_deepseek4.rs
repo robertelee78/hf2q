@@ -44,7 +44,7 @@ use super::engine_error::EngineRequestError;
 use super::engine_supervisor::EngineSupervisor;
 
 const INITIAL_CACHE_LENGTH: usize = 131_072;
-const RECOVERY_TAIL_TOKENS: usize = 8;
+pub(super) const RECOVERY_TAIL_TOKENS: usize = 8;
 
 fn resumable_matrix_prefill_chunk_len(
     cache_position: usize,
