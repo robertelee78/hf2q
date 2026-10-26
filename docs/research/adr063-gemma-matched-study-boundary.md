@@ -140,3 +140,15 @@ fixed order, strict passive fields/clock, binding-only script changes, exact tes
 results, OFF anchor semantics, the all20/unload post gate and missing-binding
 refusal. Root must execute/review these and the six exporter controls after
 composition; this author performed only static source/AST inspection.
+
+V5 cleanup correction: the freshly Popen-owned session/PG receives TERM then
+bounded3s grace and KILL/bounded5s wait independently of process-inventory
+availability. Inventory failure remains an error and cannot qualify cleanup or
+advance the study; identity-verified escaped descendants are separate. A mocked
+production-used cleanup control exercises ps failure without real processes.
+
+Power source is observed with pinned /usr/bin/pmset -g batt alongside thermal
+state, within the same250ms total observation. Exact AC/Battery parser records
+raw output and binds every sample to the frozen initial source; Battery is not
+forbidden. Source change, unknown output or missing model-free capability proof
+stops the study. Ten authored master controls remain unexecuted by author.
