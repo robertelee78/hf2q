@@ -136,14 +136,15 @@ ledger do not turn a newer source commit into an executed binary identity.
 - `deepseek390-growth-only-20261026T174508Z`:the repaired standalone growth gate
   passed. It processed125513 prompt tokens, migrated125640 tokens from capacity
   131072 to262144 in95.039ms, then reused125505/125619 tokens with1057.916ms
-  semantic TTFT. The final request reused125652/125672 tokens:exactly20 suffix
+  reported TTFT. The final request reused125652/125672 tokens:exactly20 suffix
   tokens, terminal sentinel, stop finish, and verified cleanup. Independent
   review rehashed11256 retained artifacts with no mismatch.
 
 The growth harness preserves the actual assistant message including reasoning;
 content-only reconstruction had forced an older recovery checkpoint in the
 preceding failed packet. Its required-tool/continuation/short-tail allowances
-were1024/8192/1024. The cancellation harness used required-tool1024 and peer8192,
+were1024/8192/1024, with target127000/min124000/max130000 prompt tokens.
+The cancellation harness used required-tool1024 and peer8192,
 with its original continuation/cancellation limits unchanged. These are genuine
 native requests, not scripted assistant output. Reproduction uses
 `scripts/test_deepseek4_cached_suffix.sh`,
