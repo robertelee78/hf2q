@@ -71,6 +71,33 @@ refuses missing bindings, input drift, an existing once-marker or study output,
 unknown process ownership, power/thermal changes and incomplete quality/proof
 results. Its immutable plan admits no resume or replacement cohort.
 
+The following model-free command recomputes the frozen numerical calculation
+from retained cohort receipts and actual exported vectors. It does not rerun or
+independently qualify the tools, model or cleanup evidence:
+
+```sh
+PYTHONPATH=scripts/four_agent python3 - /absolute/path/to/gemma-matched-fixed20-study-v1 <<'PY'
+import json, sys
+from pathlib import Path
+from gemma_matched_stats import PLAN, analyze
+root = Path(sys.argv[1])
+runs, vectors = [], []
+for plan in PLAN:
+    index = plan["index"]
+    raw = root / f"cohort-{index:02d}" / "raw"
+    receipt = json.loads((raw / "receipt.json").read_text())
+    client = json.loads((raw / "client/summary.json").read_text())
+    runs.append({**plan,
+        "quality_verified": receipt["protocol_complete"] and receipt["final_verified"],
+        "cleanup_verified": receipt["cleanup_proved"],
+        "primary_sse_geomean_seconds": client["benchmark_metrics"]["primary_sse_geomean_seconds"],
+        "coordinator_wall_seconds": client["elapsed_seconds"]})
+    proof = root / "post" / f"neutral-{index:02d}" / "proof.json"
+    vectors.append(json.loads(proof.read_text())["vectors"])
+print(json.dumps(analyze(runs, vectors), indent=2))
+PY
+```
+
 Evidence packet: `gemma-matched-fixed20-packet-v1`; study:
 `gemma-matched-fixed20-study-v1`, beneath the ADR063 campaign evidence root.
 Raw machine paths, weights and generated data are not repository artifacts.
