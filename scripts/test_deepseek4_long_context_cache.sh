@@ -30,6 +30,7 @@ MAX_CACHED_RESPONSE_MS=${MAX_CACHED_RESPONSE_MS:-30000}
 CURL_CONNECT_TIMEOUT_SECONDS=${CURL_CONNECT_TIMEOUT_SECONDS:-5}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-600}
 MAX_TOKENS=${MAX_TOKENS:-128}
+SHORT_TAIL_MAX_TOKENS=${SHORT_TAIL_MAX_TOKENS:-32}
 # The long prompt itself fits the initial 131,072-token cache. Reserving this
 # continuation budget deliberately crosses that physical boundary so the gate
 # proves lossless cache growth rather than only same-capacity prefix reuse.
@@ -46,7 +47,7 @@ done
 for setting in TARGET_PROMPT_TOKENS MIN_LONG_PROMPT_TOKENS \
   MAX_LONG_PROMPT_TOKENS CALIBRATION_CHARS MAX_GROWTH_TTFT_MS \
   MAX_CACHED_TTFT_MS MAX_CACHED_RESPONSE_MS CURL_CONNECT_TIMEOUT_SECONDS \
-  CURL_MAX_TIME_SECONDS MAX_TOKENS CONTINUATION_MAX_TOKENS; do
+  CURL_MAX_TIME_SECONDS MAX_TOKENS CONTINUATION_MAX_TOKENS SHORT_TAIL_MAX_TOKENS; do
   value=${!setting}
   if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
     echo "$setting must be a positive integer (got: $value)" >&2
@@ -59,7 +60,7 @@ if (( MIN_LONG_PROMPT_TOKENS >= TARGET_PROMPT_TOKENS ||
   exit 2
 fi
 
-work_dir=$(mktemp -d -t hf2q-deepseek-long-cache.XXXXXX)
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/hf2q-deepseek-long-cache.XXXXXX")
 cleanup() {
   rm -rf "$work_dir"
 }
@@ -98,6 +99,29 @@ generate_context() {
       }
     }
   }' >"$output"
+}
+
+make_short_tail_request() {
+  local base=$1
+  local prior=$2
+  local output=$3
+  jq -n --slurpfile base "$base" --slurpfile prior "$prior" \
+    --arg sentinel "$SHORT_TAIL_SENTINEL" --argjson max_tokens "$SHORT_TAIL_MAX_TOKENS" '
+      ($prior[0].choices[0].message
+        | if .role == "assistant" and (.content | type) == "string"
+             and ((.tool_calls // []) | length) == 0
+          then . else error("short-tail prior must be a terminal assistant text message") end) as $assistant
+      | $base[0]
+      | .messages += [
+          $assistant,
+          {
+            role: "user",
+            content: ("Reply exactly " + $sentinel + ".")
+          }
+        ]
+      | .tool_choice = "auto"
+      | .max_tokens = $max_tokens
+    ' >"$output"
 }
 
 make_tool_request() {
@@ -278,22 +302,7 @@ fi
 # recovery checkpoint covers the final eight prompt tokens. This request must
 # therefore exercise a 9..32-token incremental segment before or across that
 # boundary instead of selecting an empty resumable-prefill chunk.
-jq -n --slurpfile base "$continuation_request" --slurpfile prior "$continuation_response" \
-  --arg sentinel "$SHORT_TAIL_SENTINEL" '
-    $base[0]
-    | .messages += [
-        {
-          role: "assistant",
-          content: $prior[0].choices[0].message.content
-        },
-        {
-          role: "user",
-          content: ("Reply exactly " + $sentinel + ".")
-        }
-      ]
-    | .tool_choice = "auto"
-    | .max_tokens = 32
-  ' >"$short_tail_request"
+make_short_tail_request "$continuation_request" "$continuation_response" "$short_tail_request"
 
 short_tail_started=$(epoch_ms)
 post_json "$short_tail_request" "$short_tail_response"

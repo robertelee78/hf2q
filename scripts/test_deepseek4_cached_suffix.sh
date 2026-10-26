@@ -20,6 +20,9 @@ OVERLAP_TOOL_RESULT_PATH=${OVERLAP_TOOL_RESULT_PATH:-$EXPECTED_PATH}
 CANCEL_TOOL_RESULT_PATH=${CANCEL_TOOL_RESULT_PATH:-$ROOT_DIR/docs/adr/ADR-042-deepseek-v4-flash-rust-native.md}
 CURL_CONNECT_TIMEOUT_SECONDS=${CURL_CONNECT_TIMEOUT_SECONDS:-5}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-180}
+# Required-tool reasoning plus wrapper/arguments; continuation budgets stay fixed.
+MAX_TOKENS=${MAX_TOKENS:-128}
+PEER_MAX_TOKENS=${PEER_MAX_TOKENS:-512}
 PREFILL_CHUNKS_BEFORE_CANCEL=${PREFILL_CHUNKS_BEFORE_CANCEL:-3}
 CANCEL_SETTLE_SECONDS=${CANCEL_SETTLE_SECONDS:-15}
 CANCEL_STABILITY_SECONDS=${CANCEL_STABILITY_SECONDS:-10}
@@ -38,7 +41,7 @@ for path in "$SERVER_LOG" "$EXPECTED_PATH" "$OVERLAP_TOOL_RESULT_PATH" \
   }
 done
 for setting in SERVER_PID CURL_CONNECT_TIMEOUT_SECONDS CURL_MAX_TIME_SECONDS \
-  PREFILL_CHUNKS_BEFORE_CANCEL CANCEL_SETTLE_SECONDS CANCEL_STABILITY_SECONDS; do
+  PREFILL_CHUNKS_BEFORE_CANCEL CANCEL_SETTLE_SECONDS CANCEL_STABILITY_SECONDS MAX_TOKENS PEER_MAX_TOKENS; do
   value=${!setting}
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     echo "$setting must be a positive integer (got: $value)" >&2
@@ -161,7 +164,8 @@ build_base_request() {
   local run_id=$2
   local expected=$3
   jq -n --rawfile repo "$ROOT_DIR/README.md" \
-    --arg model "$MODEL" --arg run_id "$run_id" --arg expected "$expected" '{
+    --arg model "$MODEL" --arg run_id "$run_id" --arg expected "$expected" \
+    --argjson max_tokens "$MAX_TOKENS" '{
       model: $model,
       messages: [
         {role: "system", content: "You are an agentic coding assistant. Use read_file before answering."},
@@ -174,9 +178,21 @@ build_base_request() {
       }}],
       tool_choice: "required",
       temperature: 0,
-      max_tokens: 128,
+      max_tokens: $max_tokens,
       stream: false
     }' >"$output"
+}
+
+build_peer_request() {
+  local output=$1
+  local run_id=$2
+  jq -n --arg model "$MODEL" --arg run_id "$run_id" --argjson max_tokens "$PEER_MAX_TOKENS" '{
+    model: $model,
+    messages: [{role: "user", content: ("Peer run " + $run_id + ". Write at least 400 tokens explaining why bounded GPU transactions preserve multi-request liveness. End with PEER_DONE.")}],
+    temperature: 0,
+    max_tokens: $max_tokens,
+    stream: false
+  }' >"$output"
 }
 
 build_continuation() {
@@ -193,6 +209,7 @@ build_continuation() {
           {role: "tool", tool_call_id: $prior[0].choices[0].message.tool_calls[0].id, content: ("Successful read_file result. File follows:\n" + $tool_result)}
         ]
       | .tool_choice = "auto"
+      | .max_tokens = 128
       | .stream = $stream
       | if $stream then .stream_options = {include_usage: true} else . end
     ' >"$output"
@@ -351,13 +368,7 @@ ready_before=$(curl --fail-with-body --silent --show-error "$BASE_URL/readyz" | 
 # Prime a separate long-output conversation first. The measured peer is the
 # cached replay, not the cold turn: cold work belongs to DeepSeek's bounded
 # cohort and is deliberately drained before unrelated warm admission.
-jq -n --arg model "$MODEL" --arg run_id "peer-$$-$(date +%s)" '{
-  model: $model,
-  messages: [{role: "user", content: ("Peer run " + $run_id + ". Write at least 400 tokens explaining why bounded GPU transactions preserve multi-request liveness. End with PEER_DONE.")}],
-  temperature: 0,
-  max_tokens: 512,
-  stream: false
-}' >"$peer_request"
+build_peer_request "$peer_request" "peer-$$-$(date +%s)"
 post_json "$peer_request" "$peer_warm_response"
 peer_warm_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$peer_warm_response")
 (( peer_warm_cached == 0 )) || {
