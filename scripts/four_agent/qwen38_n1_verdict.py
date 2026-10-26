@@ -69,7 +69,8 @@ def wire(request, family="qwen"):
         require(type(request.get("temperature")) in (int, float) and
                 request["temperature"] == 0, "DeepSeek greedy temperature required")
         require(request.get("reasoning_effort") == "max", "DeepSeek max reasoning required")
-        require("chat_template_kwargs" not in request and "thinking_budget" not in request,
+        require(all(key not in request for key in ("chat_template_kwargs", "thinking_budget",
+                    "thinking_token_budget", "hf2q_enable_thinking")),
                 "DeepSeek must use native reasoning controls")
     require(request.get("hf2q_overflow_policy") == "reject", "overflow policy drift")
     require(len(request.get("tools", [])) == 3, "tool schema count drift")

@@ -130,7 +130,8 @@ class FamilyControls(unittest.TestCase):
         for key, value in (("temperature", True), ("temperature", 0.5),
                            ("reasoning_effort", "none"), ("seed", 0),
                            ("repetition_penalty", 1.05), ("chat_template_kwargs", {}),
-                           ("thinking_budget", 512), ("max_completion_tokens", 128)):
+                           ("thinking_budget", 512), ("thinking_token_budget", 512),
+                           ("hf2q_enable_thinking", False), ("max_completion_tokens", 128)):
             with self.subTest(changed=key), self.assertRaises(Invalid):
                 wire({**request, key: value}, "deepseek4")
         with self.assertRaises(Invalid): wire(request, "approximately-deepseek")
