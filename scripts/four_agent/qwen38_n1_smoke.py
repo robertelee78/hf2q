@@ -14,6 +14,7 @@ from qwen38_n1_verdict import (FIXTURE_SHA, PROFILE, RAW_LIMIT, WORKFLOW, Invali
                               loads, qualify, require, unary, wire)
 from qwen38_n1_tools import Tools
 import qwen38_n1_process as child
+import coding_family as family_contract
 
 PREFLIGHT = {"source_binary_bound", "model_identity_bound", "ctx262144_slots1_verified",
              "auto_tq8_text_only_verified", "profile24g_ack_verified",
@@ -50,15 +51,16 @@ def approval(args):
     if n4:
         from qwen_n4_live_smoke import preflight, validate_agent_binding
         validate_agent_binding(packet, args.agent_id, args.run_id, args.server_pid,
-                               args.barrier_dir, args.barrier_token, args.output)
+                               args.barrier_dir, args.barrier_token, args.output, args.family, args.engine_kind)
     else:
-        require(packet.get("schema") == "hf2q.qwen38-n1-client-approval.v2", "approval schema")
-        require(packet.get("profile") == PROFILE, "operating packet identity")
+        require(packet.get("schema") == family_contract.schema(args.family, "approval", 1), "approval schema")
+        require(packet.get("profile") == family_contract.profile(args.family, 1), "operating packet identity")
+    family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
+    require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
+    family_contract.validate_binding(packet, args.family, args.diagnostic_slots)
     require(packet.get("base_url") == args.base_url and packet.get("model") == args.model and
             packet.get("server_pid") == args.server_pid, "server identity drift")
-    keys = preflight(PREFLIGHT) if n4 else PREFLIGHT
-    require(args.engine_kind == "hf2q" or n4, "peer adapter is N4-only")
-    require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
+    keys = family_contract.preflight(preflight(PREFLIGHT) if n4 else PREFLIGHT, args.family)
     if args.engine_kind == "peer":
         from qwen_n4_peer import preflight as peer_preflight
         keys = peer_preflight(keys)
@@ -72,12 +74,12 @@ def approval(args):
             hashlib.sha256(WORKFLOW.encode()).hexdigest(), "new N1 workload identity")
     source_paths = [Path(__file__).with_name(n) for n in (
         "qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_process.py",
-        "qwen38_n1_verdict.py", "test_qwen38_n1_verdict.py")]
+        "qwen38_n1_verdict.py", "test_qwen38_n1_verdict.py",
+        "coding_family.py", "test_coding_family.py")]
     if n4:
         source_paths += [Path(__file__).with_name(n) for n in
-                         ("qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py")]
-    if args.engine_kind == "peer":
-        source_paths += [Path(__file__).with_name(n) for n in ("qwen_n4_peer.py", "test_qwen_n4_peer.py")]
+                         ("qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py",
+                          "qwen_n4_peer.py", "test_qwen_n4_peer.py")]
     require(packet.get("sources") == {p.name: child.digest(p) for p in source_paths}, "client source drift")
     require(packet.get("approved") is True, "explicit internal operating approval absent")
     proof = child.validate_proof(args.sandbox_proof, args.sandbox_proof_sha256)
@@ -98,8 +100,19 @@ def request_timeout(_signum, _frame):
     raise TimeoutError("absolute request deadline")
 
 
-def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"):
-    raw_request = wire(request)
+def build_request(model, messages, schemas, turn, family="qwen"):
+    """Actual shared request construction, before the exchange wire boundary."""
+    request = {"model": model, "messages": messages, "tools": schemas,
+               "tool_choice": "auto", "max_completion_tokens": 8192,
+               "logprobs": False, "hf2q_overflow_policy": "reject", "stream": turn % 2 == 1}
+    family_contract.request_controls(request, family)
+    if request["stream"]:
+        request["stream_options"] = {"include_usage": True}
+    return request
+
+
+def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen"):
+    raw_request = wire(request, family)
     (output / "request.json").write_bytes(raw_request)
     endpoint = urlsplit(base)
     require(endpoint.scheme == "http" and endpoint.hostname == "127.0.0.1" and endpoint.port and
@@ -202,25 +215,30 @@ def main():
     parser.add_argument("--diagnostic-slots", type=int, choices=(1, 4), default=1)
     for name in ("agent-id", "run-id", "barrier-dir", "barrier-token"):
         parser.add_argument("--" + name)
+    parser.add_argument("--family", choices=family_contract.FAMILIES, default="qwen")
     parser.add_argument("--engine-kind", choices=("hf2q", "peer"), default="hf2q")
     args = parser.parse_args()
+    family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
     os.umask(0o077)
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
     output = new_output(args.output)
-    summary = {"schema": "hf2q.qwen38-n1-client-result.v2", "profile": PROFILE,
+    summary = {"schema": family_contract.schema(args.family, "result", 1),
+               "profile": family_contract.profile(args.family, 1), "family": args.family,
                "status": "Pending", "cleanup": False, "model_qualified": False,
                "turns": [], "tools": [], "independent_patch_review_required": True}
     n4 = args.diagnostic_slots == 4
     if n4:
         from qwen_n4_live_smoke import PROFILE as n4_profile
-        summary.update(schema="hf2q.qwen-n4-agent-result.v1", profile=n4_profile,
+        summary.update(schema=family_contract.schema(args.family, "agent-result", 4),
+                       profile=family_contract.profile(args.family, 4),
                        agent_id=args.agent_id, run_id=args.run_id, server_pid=args.server_pid,
                        diagnostic_slots=4, full_prefix_reuse="PendingPostOracle", barrier={"status": "Pending"})
     tools = None
     try:
         packet = approval(args)
         summary["engine_kind"] = args.engine_kind
+        if args.family == "deepseek4": summary["family_controls"] = packet["family_controls"]
         save(output / "approval-copy.json", packet)
         require(Path(args.cargo).is_absolute() and Path(args.cargo).is_file(), "verified absolute cargo")
         require(Path(args.sandbox_exec).is_absolute(), "verified absolute sandbox executable")
@@ -255,15 +273,11 @@ def main():
         for turn in range(7):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
             os.kill(args.server_pid, 0)
-            request = {"model": args.model, "messages": messages, "tools": schemas,
-                       "tool_choice": "auto", "max_completion_tokens": 8192,
-                       "logprobs": False, "hf2q_overflow_policy": "reject", "stream": turn % 2 == 1}
-            if request["stream"]:
-                request["stream_options"] = {"include_usage": True}
+            request = build_request(args.model, messages, schemas, turn, args.family)
             turn_output = output / f"turn-{turn}"
             turn_output.mkdir(mode=0o700)
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
-                                               deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind)
+                                               deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind, family=args.family)
             summary["turns"].append(receipt)
             messages.append(message)
             if call is not None:
@@ -280,6 +294,7 @@ def main():
                                     tools.source_hash, final_hash)
         summary["final_source_sha256"] = final_hash
         summary["workflow_sha256"] = hashlib.sha256(WORKFLOW.encode()).hexdigest()
+        summary["full_prefix_reuse"] = "PendingPostOracle"
         summary["runtime_qualified"] = False
     except BaseException as exc:
         summary["status"] = "Failed"
