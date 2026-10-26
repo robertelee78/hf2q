@@ -2532,3 +2532,42 @@ current readiness.
 | SSE tool + cache | Streaming response emitted role, indexed `tool_calls`, `finish_reason: "tool_calls"`, usage, and `[DONE]`; it reused 290 of the 298 rendered tool-prompt tokens |
 | Unsupported surfaces | DeepSeek-V4 embeddings and multimodal injections fail explicitly; no alternate family/runtime fallback is selected. Slot-aware text generation is supported with independent full-context sessions and shared physical KV admission. |
 | Full binary regression | 3,814 passed, 0 failed, and 44 ignored in 173.97 s after the matrix-prefill/cache-policy change |
+
+### DSML parameter boundary safety (2026-10-26)
+
+The native parser treats the first exact `</｜DSML｜parameter>` as the end of a
+parameter. A raw string grammar MUST reserve that entire sentinel: allowing it
+as argument data can make a nonparallel one-invoke grammar accept bytes parsed
+as two invokes. Ordinary `<` remains valid source text (`fmt::Formatter<'_>`,
+`Vec::<T>`, comparisons); banning every angle bracket is not the contract.
+
+DeepSeek raw strings now use a delimiter-prefix DFA, including backslash state;
+optional min/max lengths compose a Unicode-scalar counter rather than counting
+multi-character grammar chunks. Existing grammar resource limits bound the
+product; over-budget schemas explicitly refuse. Enum/const literal forms are
+accepted only without the reserved sentinel. DeepSeek nested/untyped JSON uses
+a DS-only JSON-string DFA with JSON escape semantics, including bounded string
+values, recursion, freeform values and object keys. The declared-key exclusion
+trie reserves raw `<` only on its wildcard key surface; JSON Unicode escapes
+still represent that decoded character. Ordinary code angle brackets remain
+valid in argument values. Existing question/todowrite schemas remain supported;
+their positive regression controls are preserved.
+
+Pattern/format-constrained DeepSeek raw and nested strings retain their compiled
+body unchanged when an analysis of its parsed terminal alphabet proves at least
+one character of the reserved sentinel cannot be emitted anywhere. This covers
+ordinary anchored ASCII identifiers and date formats without weakening their
+constraints. Bodies lacking that sufficient proof explicitly refuse until safe
+language intersection exists; they MUST NOT fall back to an unconstrained
+branch. This conservative pattern/format limitation is not an all-schema claim. Other
+model-family and ordinary JSON emitter policies are unchanged. Fixed coding
+tools, structured tools, safe literals and explicit parallel invokes retain
+separate correctness controls.
+
+The source change repairs the existing grammar/parse boundary contract; it does
+not change decoder architecture, prompt budgets or the default nonparallel
+policy. A failed four-agent diagnostic retained two read calls on a turn;
+`parallel_tool_calls` was already effectively false. A model-free actual
+three-tool compiler/runtime control reproduced acceptance of those two parser
+invokes before the fix. No real-model validation or speed result follows from
+that negative control; the failed run remains failed.
