@@ -13297,6 +13297,9 @@ mod four_agent_input_capture;
 #[cfg(test)]
 #[path = "handlers_prefix_post_oracle_tests.rs"]
 mod prefix_post_oracle_tests;
+#[cfg(test)]
+#[path = "handlers_deepseek_prefix_post_oracle_tests.rs"]
+mod deepseek_prefix_post_oracle_tests;
 
 #[cfg(test)]
 #[path = "handlers_deepseek_dsml_boundary_tests.rs"]

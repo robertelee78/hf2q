@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BoundFile {
+pub(super) struct BoundFile {
     path: PathBuf,
     sha256: String,
 }
@@ -36,10 +36,10 @@ fn default_server_slots() -> u32 {
     1
 }
 
-fn hash(bytes: &[u8]) -> String {
+pub(super) fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
-fn read(bound: &BoundFile) -> Vec<u8> {
+pub(super) fn read(bound: &BoundFile) -> Vec<u8> {
     assert!(
         bound.path.is_absolute(),
         "absolute frozen evidence path required"
@@ -76,12 +76,12 @@ fn canonical(value: Value) -> Value {
         other => other,
     }
 }
-fn semantic_hash(value: Value) -> String {
+pub(super) fn semantic_hash(value: Value) -> String {
     hash(canonical(value).to_string().as_bytes())
 }
 
 /// Actual acceptance seam: both archived replay and pure controls call this.
-fn accept_prefix(
+pub(super) fn accept_prefix(
     p: &[u32],
     s: &[u32],
     prior: Option<&[u32]>,
