@@ -51,8 +51,10 @@ Each archived client receipt must bind its turn, HTTP status, exact request
 bytes/digest and actual usage. The helper requires the N1 text-only three-tool
 `auto` request shape, output budget 8192, context 262144 and overflow rejection.
 Schemas, resolved thinking enablement and template kwargs stay unchanged;
-`preserve_thinking` must remain true. Server-default grammar/GCD and vision must
-be inactive. Those restrictions define this oracle's supported lane, not new
+`preserve_thinking` must remain true. Server-default grammar/GCD must be
+inactive. A projector may be loaded, but every replayed request must remain
+image-free; its loaded state is recorded. Those restrictions define this
+oracle's supported lane, not new
 universal serving policy.
 
 ## Exact predicate
@@ -113,3 +115,9 @@ patch acceptance remain separate obligations.
 ## Validation recorded for this change
 
 Locked test compilation and both new negative-control tests passed on Apple Silicon with published registry mlx-native0.15.4. Four existing Qwen prompt-history and reasoning-replay checks also passed. Only the new helper file was formatted; its focused tests were recompiled and passed afterward. No model, device or HTTP inference ran in these checks. Actual seven-wire replay remains PendingPostOracle.
+
+A real Qwen3.8 N1 run subsequently completed seven live turns and six real tool
+calls. Both negative controls and its exact seven-wire replay passed (three
+focused tests). The core auto-loaded the local projector; all requests were
+image-free, and that loaded state is recorded rather than substituted. This
+qualifies that run's full stable-prefix reuse, not four-agent fit or speed.

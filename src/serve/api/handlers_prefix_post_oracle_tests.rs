@@ -226,7 +226,7 @@ fn qwen38_n1_exact_prefix_post_oracle() {
         semantic_hash(json!({"source":config.template_source,"template":template}))
     );
     assert_eq!(snapshot["active_controls"]["grammar"]["active"], false);
-    assert_eq!(snapshot["active_controls"]["vision_projector"], false);
+    // A loaded projector does not affect image-free request tokenization.
     assert_eq!(readiness["health"]["context_length"], 262144);
     assert_eq!(
         readiness["runtime"]["serve"]["scheduler_mode"],
@@ -350,7 +350,7 @@ fn qwen38_n1_exact_prefix_post_oracle() {
         parent.ancestors().all(|p| !p.join(".git").exists()),
         "output outside every checkout required"
     );
-    let output = json!({"schema":"hf2q.qwen38-n1-prefix-post-oracle.v1","full_prefix_reuse":"PassedExactSevenWireReplay","model_inference_performed":false,"model_qualified":false,"config_sha256":hash(&config_bytes),"tokenizer_file_sha256":hash(&tokenizer_bytes),"template_file_sha256":hash(template.as_bytes()),"readiness_sha256":hash(&readiness_bytes),"oracle_source_sha256":hash(include_bytes!("handlers_prefix_post_oracle_tests.rs")),"handler_source_sha256":hash(include_bytes!("handlers.rs")),"renderer_source_sha256":hash(include_bytes!("engine.rs")),"measurement_source_sha256":hash(include_bytes!("measurement.rs")),"observations":observations});
+    let output = json!({"schema":"hf2q.qwen38-n1-prefix-post-oracle.v1","full_prefix_reuse":"PassedExactSevenWireReplay","model_inference_performed":false,"model_qualified":false,"runtime_vision_projector_loaded":snapshot["active_controls"]["vision_projector"],"config_sha256":hash(&config_bytes),"tokenizer_file_sha256":hash(&tokenizer_bytes),"template_file_sha256":hash(template.as_bytes()),"readiness_sha256":hash(&readiness_bytes),"oracle_source_sha256":hash(include_bytes!("handlers_prefix_post_oracle_tests.rs")),"handler_source_sha256":hash(include_bytes!("handlers.rs")),"renderer_source_sha256":hash(include_bytes!("engine.rs")),"measurement_source_sha256":hash(include_bytes!("measurement.rs")),"observations":observations});
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
