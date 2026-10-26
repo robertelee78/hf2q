@@ -1,7 +1,7 @@
 # Exact native DeepSeek post-unload prefix oracle
 
 Metadata-only validation helper; no engine, tensor, device or model allocation.
-Three pure native-selection/anchor controls plus one ignored archived-wire
+Four pure native-selection/anchor/build-identity controls plus one ignored archived-wire
 replay. The existing Qwen acceptance function and its negative controls are
 shared through test-only visibility; Qwen replay behavior is unchanged.
 Production change is only internal visibility of RECOVERY_TAIL_TOKENS=8.
@@ -43,3 +43,10 @@ Independent review also confirmed native encoder/reasoning code and the
 render/tokenize seams match the executed server source. This is not a speed
 comparison or full PR390/Q5 acceptance. Hosted CI runs the three pure controls;
 the real archived-wire replay remains opt-in and ignored without its private config.
+
+Follow-up validation passed four pure controls and four exact seven-wire N4
+replays with explicit source `2d7599907be92d17736bc205806907589e845306`
+and binary SHA256 `111649ce1b0d635d0a1403f34004667e1ab61757ff203c68c513dcac912488c2`.
+This composes with the independent real-launch, four-patch, tool and cleanup
+review; it does not qualify cancellation, physical growth, memory highwater
+or performance.

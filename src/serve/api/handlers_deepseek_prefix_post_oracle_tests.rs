@@ -23,8 +23,42 @@ struct Config {
     readiness: BoundFile,
     controller_receipt: BoundFile,
     server_build_receipt: BoundFile,
+    #[serde(default = "default_server_source_commit")]
+    expected_server_source_commit: String,
+    #[serde(default = "default_server_binary_sha256")]
+    expected_server_binary_sha256: String,
     turns: Vec<Turn>,
     output: PathBuf,
+}
+
+fn default_server_source_commit() -> String {
+    "68804c57b44d4139cfd264c4544bed072d0da13d".into()
+}
+fn default_server_binary_sha256() -> String {
+    "d88efd5c8e145b59de4c9b88093c3bfe77e7af34e21255e872146f118bceec13".into()
+}
+fn build_identity_matches(source: &str, binary: &str, build: &Value) -> bool {
+    let hex = |value: &str, len| {
+        value.len() == len && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    hex(source, 40) && hex(binary, 64)
+        && build["source_commit"] == source && build["binary_sha256"] == binary
+        && build["exit"] == 0 && build["source_clean"] == true
+}
+
+#[test]
+fn deepseek_prefix_build_identity_defaults_and_explicit_mismatches() {
+    let source = default_server_source_commit();
+    let binary = default_server_binary_sha256();
+    let mut build = json!({"source_commit":source,"binary_sha256":binary,"exit":0,"source_clean":true});
+    assert!(build_identity_matches(&source, &binary, &build));
+    assert!(!build_identity_matches(&source.to_uppercase(), &binary, &build));
+    assert!(!build_identity_matches(&source, "bad", &build));
+    build["source_commit"] = json!("2d7599907be92d17736bc205806907589e845306");
+    assert!(!build_identity_matches(&source, &binary, &build));
+    assert!(build_identity_matches(build["source_commit"].as_str().unwrap(), &binary, &build));
+    build["source_clean"] = json!(false);
+    assert!(!build_identity_matches(build["source_commit"].as_str().unwrap(), &binary, &build));
 }
 
 fn native_template(family: &str, source: &str, template: &str) -> Result<(), &'static str> {
@@ -187,16 +221,11 @@ fn deepseek_exact_native_prefix_post_oracle() {
     assert_eq!(controller["cleanup_proved"], true);
     let build_bytes = read(&config.server_build_receipt);
     let build: Value = serde_json::from_slice(&build_bytes).unwrap();
-    assert_eq!(
-        build["source_commit"],
-        "68804c57b44d4139cfd264c4544bed072d0da13d"
-    );
-    assert_eq!(build["exit"], 0);
-    assert_eq!(build["source_clean"], true);
-    assert_eq!(
-        build["binary_sha256"],
-        "d88efd5c8e145b59de4c9b88093c3bfe77e7af34e21255e872146f118bceec13"
-    );
+    assert!(build_identity_matches(
+        &config.expected_server_source_commit,
+        &config.expected_server_binary_sha256,
+        &build,
+    ), "expected clean server build identity mismatch");
     let registration = registry::find_for_architecture("deepseek4").unwrap();
     let mut prior: Option<Vec<u32>> = None;
     let mut observations = Vec::new();
@@ -285,7 +314,7 @@ fn deepseek_exact_native_prefix_post_oracle() {
     assert!(config.output.is_absolute());
     let parent = config.output.parent().unwrap().canonicalize().unwrap();
     assert!(parent.ancestors().all(|p| !p.join(".git").exists()));
-    let output = json!({"schema":"hf2q.deepseek4-prefix-post-oracle.v1","family":"deepseek4","server_slots":config.server_slots,"full_prefix_reuse":"PassedExactNativeSevenWireReplay","model_inference_performed":false,"model_qualified":false,"config_sha256":hash(&config_bytes),"tokenizer_sha256":hash(&tokenizer_bytes),"readiness_sha256":hash(&readiness_bytes),"controller_sha256":hash(&controller_bytes),"server_build_receipt_sha256":hash(&build_bytes),"oracle_source_sha256":hash(include_bytes!("handlers_deepseek_prefix_post_oracle_tests.rs")),"renderer_source_sha256":hash(include_bytes!("engine.rs")),"cache_source_sha256":hash(include_bytes!("engine_deepseek4.rs")),"native_encoder_source_sha256":hash(include_bytes!("../../core/deepseek_v4_encoding/mod.rs")),"observations":observations});
+    let output = json!({"schema":"hf2q.deepseek4-prefix-post-oracle.v1","family":"deepseek4","server_slots":config.server_slots,"full_prefix_reuse":"PassedExactNativeSevenWireReplay","model_inference_performed":false,"model_qualified":false,"config_sha256":hash(&config_bytes),"tokenizer_sha256":hash(&tokenizer_bytes),"readiness_sha256":hash(&readiness_bytes),"controller_sha256":hash(&controller_bytes),"server_build_receipt_sha256":hash(&build_bytes),"expected_server_source_commit":config.expected_server_source_commit,"expected_server_binary_sha256":config.expected_server_binary_sha256,"oracle_source_sha256":hash(include_bytes!("handlers_deepseek_prefix_post_oracle_tests.rs")),"renderer_source_sha256":hash(include_bytes!("engine.rs")),"cache_source_sha256":hash(include_bytes!("engine_deepseek4.rs")),"native_encoder_source_sha256":hash(include_bytes!("../../core/deepseek_v4_encoding/mod.rs")),"observations":observations});
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
