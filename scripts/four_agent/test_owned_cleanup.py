@@ -22,6 +22,7 @@ class CleanupTests(unittest.TestCase):
             return next(snapshots, final if final is not None else {})
         with patch.object(process, "process_snapshot", side_effect=inventory), \
              patch.object(process.os, "killpg", side_effect=signal_error), \
+             patch.object(process.os, "kill"), \
              patch.object(process.time, "monotonic", side_effect=lambda: next(clock)), \
              patch.object(process.time, "sleep"):
             return process.stop_group(child, {leader: "same-start"})
