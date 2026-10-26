@@ -47,8 +47,11 @@ Supporting `evidence_files` are rehashed directly, including help output, frozen
 Canonical render evidence must include `cold` and `tool_round_1` through `tool_round_6` for every family. Additional labeled cases are allowed. Each row's request-file digest must match a directly verified supporting evidence file; a token sidecar without its frozen input bytes is insufficient. The DeepSeek loader-source digest is required alongside the renderer/HTTP/capture source identities. This certifies file bindings only; real-client requests rejected by the schema remain an explicit separate capability failure.
 
 The strict physical parser continues to reject negative residuals. The separate
-`retryable_single_page_overcount` classifier recognizes only a fully corroborated
-CSV/text one-page overcount; it returns no accounting values or admission credit.
+`retryable_correlated_overcount` classifier recognizes only a fully corroborated
+CSV/text negative N-page root whose magnitude exactly matches the category subtotal
+above physical capacity. It returns no accounting values or admission credit; no
+overcount magnitude becomes admissible. The original single-page classifier remains
+available for compatibility with its narrower contract.
 An operator supervisor may preserve that rejected observation and request a fresh
 reading within its existing attempt/deadline limits. It must not retry a valid
 low-memory or pressure reading, and an interrupted campaign remains incomplete.
