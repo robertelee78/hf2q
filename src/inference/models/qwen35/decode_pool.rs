@@ -43,6 +43,8 @@
 //! lexical block, making the per-decode-token pattern safe by construction
 //! provided allocations stay inside `forward_gpu_greedy`'s call tree.
 
+pub mod profile;
+
 use std::cell::RefCell;
 
 use mlx_native::ops::quantized_matmul_id_ggml::IdMmScratch;
@@ -83,6 +85,7 @@ pub fn pooled_alloc_buffer(
     dtype: DType,
     shape: Vec<usize>,
 ) -> std::result::Result<MlxBuffer, mlx_native::MlxError> {
+    if let Some(result) = profile::alloc(device, byte_len, dtype, &shape) { return result; }
     DECODE_POOL.with(|cell| cell.borrow_mut().alloc(device, byte_len, dtype, shape))
 }
 
@@ -95,7 +98,15 @@ pub fn pooled_alloc_buffer(
 /// hole — the pool may re-issue the same Metal storage to a future
 /// allocation, causing aliasing.
 pub fn reset_decode_pool() {
+    // Legacy/test compatibility entry. Production uses the checked form.
+    if let Err(_error) = checked_reset_decode_pool() { profile::quarantine(); }
+}
+
+/// Caller guarantees no future issued-buffer access AND a successful drain.
+pub fn checked_reset_decode_pool() -> std::result::Result<(), mlx_native::MlxError> {
+    if let Some(result) = profile::reset() { return result; }
     DECODE_POOL.with(|cell| cell.borrow_mut().reset());
+    Ok(())
 }
 
 /// Reset the thread-local pool at a per-prefill-layer boundary.
@@ -133,19 +144,26 @@ pub fn reset_decode_pool() {
 /// gap so dense-Q `_into` can use the pool unconditionally and capture the
 /// W-5b.13 audit's projected ~30–40% allocation-churn savings.
 pub fn reset_for_prefill_chunk() {
-    DECODE_POOL.with(|cell| cell.borrow_mut().reset());
+    if let Err(_error) = checked_reset_for_prefill_chunk() { profile::quarantine(); }
+}
+
+/// Successful K drain plus no future accesses to issued scratch are required.
+pub fn checked_reset_for_prefill_chunk() -> std::result::Result<(), mlx_native::MlxError> {
+    checked_reset_decode_pool()
 }
 
 /// Diagnostic accessor: number of buffers currently in-use (alloc'd but
 /// not yet reset).  Surfaced for the `HF2Q_DECODE_PROFILE` instrumentation.
 #[allow(dead_code)]
 pub fn decode_pool_in_use_count() -> usize {
+    if let Some((issued, _)) = profile::counts() { return issued; }
     DECODE_POOL.with(|cell| cell.borrow().in_use_count())
 }
 
 /// Diagnostic accessor: number of buffers currently in the free list.
 #[allow(dead_code)]
 pub fn decode_pool_free_count() -> usize {
+    if let Some((_, free)) = profile::counts() { return free; }
     DECODE_POOL.with(|cell| cell.borrow().free_count())
 }
 

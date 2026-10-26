@@ -4261,6 +4261,10 @@ impl Qwen35PrefillState {
                                 (Ok(logits), None)
                             }
                             Err(error) => {
+                                // Pool failures stay sticky even when helpers stringify
+                                // them; NEVER replay ordinary target after quota/identity
+                                // refusal or an unknown MTP transaction failure.
+                                crate::inference::models::qwen35::decode_pool::profile::permit_replay()?;
                                 // The target forward completed, so recurrent
                                 // rollback is now defined. Restore this
                                 // chunk's entry boundary and replay only the
