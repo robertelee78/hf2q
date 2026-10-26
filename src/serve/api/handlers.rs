@@ -13304,3 +13304,7 @@ mod deepseek_prefix_post_oracle_tests;
 #[cfg(test)]
 #[path = "handlers_deepseek_dsml_boundary_tests.rs"]
 mod deepseek_dsml_boundary_tests;
+
+#[cfg(test)]
+#[path = "handlers_gemma_prefix_post_oracle_tests.rs"]
+mod gemma_prefix_post_oracle_tests;
