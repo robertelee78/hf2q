@@ -43,5 +43,6 @@ root validation; no broader Q5/model/speed claim.
 Root validation: four actual parser controls passed, followed by the real tiny
 conversion/typed-dispatch sealing test on Apple Silicon with public0.15.5.
 `cargo check --locked --all-targets --all-features` passed. Cargo.lock did not
-change because the identical TOML version/features were already locked. Packed
-archive validation remains pending; no whole-suite or speed claim follows.
+change because the identical TOML version/features were already locked. `cargo package --locked --offline` also passed, compiling the actual normalized
+packaged manifest and build script. This verifies normal package compilation,
+not the ignored package test targets. No whole-suite or speed claim follows.
