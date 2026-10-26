@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-for command in jq mktemp; do
+for command in jq mktemp awk cmp; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -50,3 +50,56 @@ if jq -e \
   echo "decode-cancel validator accepted a template-rewriting request" >&2
   exit 1
 fi
+
+
+# Exercise the actual required-tool builder and its real positive-integer guard,
+# without sourcing the live script's HTTP/process main.
+render_required_base() (
+  local budget=$1
+  local output=$2
+  ROOT_DIR=$(cd "$script_dir/.." && pwd)
+  MODEL=fixture-model
+  SERVER_PID=1
+  CURL_CONNECT_TIMEOUT_SECONDS=1
+  CURL_MAX_TIME_SECONDS=1
+  PREFILL_CHUNKS_BEFORE_CANCEL=1
+  CANCEL_SETTLE_SECONDS=1
+  CANCEL_STABILITY_SECONDS=1
+  if [[ "$budget" == default ]]; then unset MAX_TOKENS; else MAX_TOKENS=$budget; fi
+  eval "$(awk '/^MAX_TOKENS=/{print; exit}' "$script_dir/test_deepseek4_cached_suffix.sh")"
+  eval "$(awk '/^for setting in SERVER_PID /{copy=1} copy{print} copy && /^done$/{exit}' \
+    "$script_dir/test_deepseek4_cached_suffix.sh")"
+  eval "$(awk '/^build_base_request\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' \
+    "$script_dir/test_deepseek4_cached_suffix.sh")"
+  build_base_request "$output" fixture-run "$test_dir/fixture.rs"
+)
+render_required_base default "$test_dir/default-base.request.json"
+render_required_base 1024 "$test_dir/large-base.request.json"
+jq -e '.max_tokens == 128 and .tool_choice == "required" and .temperature == 0' \
+  "$test_dir/default-base.request.json" >/dev/null
+jq -e '.max_tokens == 1024 and .tool_choice == "required" and .temperature == 0' \
+  "$test_dir/large-base.request.json" >/dev/null
+jq -S 'del(.max_tokens)' "$test_dir/default-base.request.json" >"$test_dir/default-other.json"
+jq -S 'del(.max_tokens)' "$test_dir/large-base.request.json" >"$test_dir/large-other.json"
+cmp "$test_dir/default-other.json" "$test_dir/large-other.json"
+for invalid in 0 -1 invalid 1.5 01; do
+  if render_required_base "$invalid" "$test_dir/invalid-base.request.json"; then
+    echo "required-tool budget accepted invalid value: $invalid" >&2
+    exit 1
+  fi
+  test ! -e "$test_dir/invalid-base.request.json"
+done
+
+# Changing only the required base allowance must not inflate the existing
+# cancellation/semantic continuation allowance inherited from that base.
+(
+  eval "$(awk '/^build_continuation\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' \
+    "$script_dir/test_deepseek4_cached_suffix.sh")"
+  printf 'source fixture\n' >"$test_dir/tool-result.txt"
+  jq -n '{choices:[{message:{content:null,tool_calls:[{id:"call-fixture"}]}}]}' \
+    >"$test_dir/tool-prior.json"
+  build_continuation "$test_dir/large-base.request.json" "$test_dir/tool-prior.json" \
+    "$test_dir/tool-result.txt" "$test_dir/continuation.request.json" true
+)
+jq -e '.max_tokens == 128 and .tool_choice == "auto" and .stream == true' \
+  "$test_dir/continuation.request.json" >/dev/null
