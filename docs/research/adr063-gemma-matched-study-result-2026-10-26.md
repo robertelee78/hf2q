@@ -46,8 +46,10 @@ All paired production input vectors match exactly: ten OFF/ON pairs, four agents
 seven complete u32-token vectors each. There is no hash-only, edited-transcript
 or selected-turn surrogate for equality. After all model runtimes unloaded,
 20 neutral actual renderer exports and 40 ON family-specific seven-wire replays
-passed. OFF retained the original anchor; ON reused the complete prior input at
-each observed follow-up. The generic strict oracle is unchanged.
+passed. OFF retained its original strict anchor. ON covered the preceding
+accepted anchor on every edge: the initial strict anchor on turn 1, then full
+tool-input checkpoints on later turns, with no minus-one allowance. The generic
+strict oracle is unchanged.
 
 All 725 saved runtime/post thermal/power observations were Nominal0, low-power
 mode off and the frozen AC source, within the 250ms observation budget. Every
