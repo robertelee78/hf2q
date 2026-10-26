@@ -118,6 +118,7 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
     );
     canonical(json!({
         "schema_version": "hf2q.measurement-snapshot.v1",
+        "worker_pool_census": engine.worker_pool_census(),
         "process_pid": std::process::id(),
         "model_id": engine.model_id(),
         // Locator fingerprint only; the managed launcher separately hashes

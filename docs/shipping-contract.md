@@ -346,6 +346,7 @@ compatibility writers, and replay remain test-only or unavailable.
 
 | Var | Notes |
 |---|---|
+| `HF2Q_WORKER_POOL_CENSUS=1` | Opt-in read-only Qwen owning-worker pool census at successful request completion. Default OFF; no allocator hooks/new waits/resets. HTTP reads last immutable record with age/exclusions; physical residency/external owners/lifetime high-water unavailable. |
 | `HF2Q_PREFILL_DUMP`, `HF2Q_BATCHED_DUMP`, `HF2Q_BATCHED_LAYER_SCAN`, `HF2Q_DUMP_LAYERS`, `HF2Q_DUMP_BOUNDARY`, `HF2Q_DUMP_ALL_CACHE`, `HF2Q_DUMP_LAYER_DETAIL`, `HF2Q_DUMP_NORM_WEIGHT`, `HF2Q_DUMP_DIR` | Hidden-state / cache dumps; output-only, cannot affect decode. |
 | `HF2Q_DUMP_RENDERED_PROMPT`, `HF2Q_DUMP_PROMPT_TOKENS` | Prompt-path diagnostics. |
 | `HF2Q_MLX_TIMING`, `HF2Q_SPLIT_TIMING`, `HF2Q_MLX_KERNEL_PROFILE`, `HF2Q_MLX_PROFILE` | Timing / kernel-attribution diagnostics. |

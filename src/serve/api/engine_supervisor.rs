@@ -17,6 +17,9 @@ use tokio::sync::{mpsc, watch};
 
 use super::sse::GenerationEvent;
 
+#[path = "engine_supervisor/pool_census.rs"]
+mod pool_census;
+
 const HEALTHY: u8 = 0;
 const POISONED: u8 = 1;
 const MONITOR_INTERVAL: Duration = Duration::from_millis(10);
@@ -27,6 +30,7 @@ pub(super) struct EngineSupervisor {
 }
 
 struct EngineSupervisorInner {
+    pool_census: Mutex<pool_census::Store>,
     health: AtomicU8,
     next_epoch: AtomicU64,
     armed: Mutex<Option<ArmedTransaction>>,
@@ -60,6 +64,7 @@ impl EngineSupervisor {
     ) -> Self {
         let (health_tx, _health_rx) = watch::channel(true);
         let inner = Arc::new(EngineSupervisorInner {
+            pool_census: Mutex::new(pool_census::Store::default()),
             health: AtomicU8::new(HEALTHY),
             next_epoch: AtomicU64::new(1),
             armed: Mutex::new(None),
@@ -90,6 +95,18 @@ impl EngineSupervisor {
                 std::thread::sleep(MONITOR_INTERVAL);
             })
             .map(|_| ())
+    }
+
+    /// HTTP reads immutable numeric publication only, never native/TLS state.
+    pub(super) fn pool_census_json(&self, supported: bool) -> serde_json::Value {
+        if !crate::debug::INVESTIGATION_ENV.worker_pool_census {
+            return pool_census::unavailable("Disabled");
+        }
+        if !supported { return pool_census::unavailable("UnsupportedFamily"); }
+        match self.inner.pool_census.lock() {
+            Ok(store) => store.view(Instant::now(), self.is_healthy()),
+            Err(_) => pool_census::unavailable("PublicationLockUnavailable"),
+        }
     }
 
     pub(super) fn is_healthy(&self) -> bool {
@@ -402,6 +419,32 @@ thread_local! {
     static WORKER_SUPERVISOR: RefCell<Option<EngineSupervisor>> = const { RefCell::new(None) };
 }
 
+/// Called only at actual Qwen SlotAware request terminal paths on the owning worker.
+/// Success follows synchronous target/verifier terminal wait + CPU readback; this
+/// records pool owners, not global quiescence/no-future-use or physical residency.
+pub(super) fn qwen_pool_request_observation(slot: usize, generation: u64, outcome: &'static str) {
+    if !crate::debug::INVESTIGATION_ENV.worker_pool_census { return; }
+    let supervisor = WORKER_SUPERVISOR.try_with(|cell| cell.try_borrow().ok().and_then(|s| s.clone()))
+        .ok().flatten();
+    let Some(supervisor) = supervisor else { return; };
+    let owner = std::thread::current().id();
+    let registered = supervisor.inner.pool_census.lock().map(|store| store.owns(owner)).unwrap_or(false);
+    if !registered { return; }
+    if outcome != "completed_post_drain" || !supervisor.is_healthy() {
+        if let Ok(mut store) = supervisor.inner.pool_census.lock() {
+            store.invalidate(if outcome == "cancelled" { "RequestCancelledLastObservationNotCurrent" }
+                             else { "RequestFailedLastObservationNotCurrent" });
+        }
+        return;
+    }
+    // Capture on worker, outside publication mutex. Temporary metadata only.
+    let observed = crate::inference::models::qwen35::decode_pool::worker_memory_snapshot()
+        .map(|(mode, snapshot)| (mode, pool_census::project(snapshot)));
+    if let Ok(mut store) = supervisor.inner.pool_census.lock() {
+        store.record_result(owner, Instant::now(), slot, generation, observed);
+    };
+}
+
 static PANIC_HOOK: Once = Once::new();
 
 /// Chain a process panic hook that poisons the panicking engine worker's
@@ -454,6 +497,11 @@ pub(super) fn spawn_supervised_worker(
         .name(name.to_string())
         .spawn(move || {
             WORKER_SUPERVISOR.with(|slot| *slot.borrow_mut() = Some(supervisor.clone()));
+            if crate::debug::INVESTIGATION_ENV.worker_pool_census {
+                if let Ok(mut store) = supervisor.inner.pool_census.lock() {
+                    store.bind(std::thread::current().id());
+                }
+            }
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| body(supervisor.clone())));
             WORKER_SUPERVISOR.with(|slot| slot.borrow_mut().take());
             if let Err(payload) = outcome {

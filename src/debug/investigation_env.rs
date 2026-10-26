@@ -74,6 +74,9 @@ pub static INVESTIGATION_ENV: LazyLock<InvestigationEnv> =
 /// the refusal to the operator.
 #[derive(Debug, Clone)]
 pub struct InvestigationEnv {
+    /// Read-only worker pool census after successful request drain; default OFF.
+    /// Does not change allocation, reset, GPU submission or failure policy.
+    pub worker_pool_census: bool,
     // ========================================================================
     // Category 4 — ack-required (known to risk correctness or reliability).
     // These fields hold the EFFECTIVE value: `true` only when the env var
@@ -825,6 +828,7 @@ impl InvestigationEnv {
         let ack = env_eq_one("HF2Q_UNSAFE_EXPERIMENTS");
 
         Self {
+            worker_pool_census: env_eq_one("HF2Q_WORKER_POOL_CENSUS"),
             // Ack-required — effective value is raw AND ack.
             f16_kv: raw.f16_kv && ack,
             // ADR-028 iter-344: batched_prefill DECOUPLED from ack.

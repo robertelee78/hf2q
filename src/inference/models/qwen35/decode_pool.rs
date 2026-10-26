@@ -74,6 +74,18 @@ thread_local! {
     static MM_ID_SCRATCH_DOWN: RefCell<Option<IdMmScratch>> = const { RefCell::new(None) };
 }
 
+/// Owning-worker only. The serving publisher verifies its worker registration first.
+/// This does not reset, allocate Metal buffers, wait, or mutate profile health.
+pub(crate) fn worker_memory_snapshot() -> Result<(&'static str, mlx_native::PoolMemorySnapshot), String> {
+    if let Some(result) = profile::memory_snapshot_if_selected() {
+        return result.map(|snapshot| ("growth_limited", snapshot));
+    }
+    DECODE_POOL.try_with(|cell| {
+        let pool = cell.try_borrow().map_err(|_| "legacy pool borrow busy".to_string())?;
+        pool.memory_snapshot().map(|snapshot| ("legacy", snapshot)).map_err(|error| error.to_string())
+    }).map_err(|_| "legacy worker TLS unavailable".to_string()).and_then(|r| r)
+}
+
 /// Allocate from the thread-local decode pool.
 ///
 /// API-compatible with `MlxDevice::alloc_buffer` so call sites in the

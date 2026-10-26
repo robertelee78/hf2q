@@ -363,6 +363,17 @@ pub(super) fn counts() -> Option<(usize, usize)> {
         Some((w.issued, roots.saturating_sub(w.issued)))
     })
 }
+/// Read-only telemetry: never pass census failures through checked()/quarantine.
+pub(super) fn memory_snapshot_if_selected() -> Option<std::result::Result<mlx_native::PoolMemorySnapshot, String>> {
+    if !selected() { return None; }
+    Some(LOCAL.try_with(|cell| {
+        let local = cell.try_borrow().map_err(|_| "selected pool borrow busy".to_string())?;
+        let worker = local.as_ref().ok_or_else(|| "selected worker absent".to_string())?;
+        let pool = worker.pool.as_ref().ok_or_else(|| "selected pool unbound".to_string())?;
+        pool.memory_snapshot().map_err(|error| error.to_string())
+    }).map_err(|_| "selected worker TLS unavailable".to_string()).and_then(|r| r))
+}
+
 /// Unknown/early failure poisons selected operation, even after stringification.
 pub struct Operation {
     active: bool,
