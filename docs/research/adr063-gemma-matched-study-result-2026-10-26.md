@@ -117,6 +117,12 @@ uncommitted changes; six exporter controls passed. Its selected production
 renderer/checkpoint units equal the executed server source. It is not a timing
 runtime and executes only after final unload.
 
+Replay this historical packet with the archived helper or its exact `5415f2f6`
+source. Later integration onto main keeps the original source guards; a newly
+compiled helper with different source units must not silently qualify this
+recorded server. Current-integration pure checks and historical actual replay
+proofs are distinct evidence.
+
 No largest-context stress, cancellation acceptance, general physical-memory
 admission, all-model win, final peer comparison or default promotion follows
 from this component study. See the [study boundary](adr063-gemma-matched-study-boundary.md)
