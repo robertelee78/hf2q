@@ -44,7 +44,11 @@ use super::engine::{
 use super::engine_error::EngineRequestError;
 use super::engine_supervisor::EngineSupervisor;
 
-const QWEN35_WORKER_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
+#[path = "engine_qwen35/transaction_budget.rs"]
+mod transaction_budget;
+
+const QWEN35_WORKER_TRANSACTION_TIMEOUT: Duration =
+    transaction_budget::timeout(transaction_budget::Transaction::Decode);
 
 /// Canonical Qwen3 chat-template stop tokens.
 ///
@@ -4161,8 +4165,10 @@ impl Qwen35PrefillState {
                     prefill_positions_from(self.graft_len + self.next_token_index, chunk.len())
                 });
             let chunk_started = Instant::now();
-            let lease =
-                supervisor.arm("Qwen35 bounded prefill", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
+            let lease = supervisor.arm(
+                "Qwen35 bounded prefill",
+                transaction_budget::timeout(transaction_budget::Transaction::BoundedPrefill),
+            )?;
             let mtp_prefill = (self.cached_tokens == 0 || self.mtp_pending_hidden.is_some())
                 && !self.speculation_unavailable
                 && self.vision.is_none()
