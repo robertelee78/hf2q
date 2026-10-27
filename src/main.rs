@@ -8,6 +8,10 @@
 //!   2 = quality threshold exceeded
 //!   3 = input/validation error
 
+#[cfg(test)]
+#[path = "quality/adr063_invariance/mod.rs"]
+pub(crate) mod adr063_invariance;
+
 pub mod arch;
 pub mod backends;
 mod calibrate;

@@ -34,6 +34,10 @@
 #[path = "engine_gemma_full_input.rs"]
 pub(crate) mod gemma_full_input;
 
+#[cfg(test)]
+#[path = "engine/q1_qwen_cancel.rs"]
+pub(crate) mod q1_qwen_cancel;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19423,6 +19427,9 @@ fn advance_qwen35_prefill(
         max_chunk_tokens,
         supervisor,
     );
+    #[cfg(test)]
+    q1_qwen_cancel::after_actual_advance(advance.is_ok(), guard.kv.as_ref()
+        .and_then(|kv| kv.sequence_len_for_slot(handle.slot_id).ok()).map(|n| n as usize));
     match advance {
         Ok(super::engine_qwen35::Qwen35PrefillAdvance::Pending {
             state,

@@ -817,10 +817,17 @@ impl Deepseek4Model {
         } else {
             graph_reorder_enabled()?
         };
+        // Q1 diagnostic-only per-layer drain uses the existing calibration
+        // route; it must not be reported as the grouped serving route.
+        #[cfg(test)]
+        let q1_layer_capture = crate::adr063_invariance::family::enabled(
+            crate::adr063_invariance::receipt::Family::Deepseek4);
+        #[cfg(not(test))]
+        let q1_layer_capture = false;
         let graph_layers_per_command_buffer = graph_layers_per_command_buffer(
             layers,
             graph_reorder,
-            profile_timing || dump_intermediates || capture.is_some(),
+            profile_timing || dump_intermediates || capture.is_some() || q1_layer_capture,
         )?;
         if graph_layers_per_command_buffer > 1 {
             anyhow::ensure!(
@@ -988,6 +995,25 @@ impl Deepseek4Model {
                         .with_context(|| format!("execute DeepSeek-V4 prefill layer {layer}"))?;
                 }
                 completion.validate_moe_statuses()?;
+                #[cfg(test)]
+                crate::adr063_invariance::family::drained(
+                    crate::adr063_invariance::receipt::Family::Deepseek4,
+                    span.start_position as u64,
+                    layer as u32,
+                    crate::adr063_invariance::receipt::Stage::LayerOutput,
+                    &next_state,
+                    "DeepSeek single-layer session finish + MOE status checked",
+                ).map_err(anyhow::Error::msg)?;
+                #[cfg(test)]
+                crate::adr063_invariance::family::layer_drained(
+                    crate::adr063_invariance::receipt::Family::Deepseek4,
+                    span.start_position as u64, layer as u32,
+                    "DeepSeek single-layer session finish + MOE status checked",
+                ).map_err(anyhow::Error::msg)?;
+                #[cfg(test)]
+                crate::adr063_invariance::deepseek_cache::layer_after_drain(
+                    cache, &span.layers[layer], span.start_position, span.token_count,
+                ).map_err(anyhow::Error::msg)?;
                 // ADR-054 calibration capture: read the requested site at
                 // the last sequence position (the committed state),
                 // host-side f32. Runs only in the forced single-layer path
@@ -1080,6 +1106,10 @@ impl Deepseek4Model {
         completion: &mut SubmissionChain,
         writer_capture: Option<&mut Option<MlxBuffer>>,
     ) -> Result<MlxBuffer> {
+        #[cfg(test)]
+        crate::adr063_invariance::family::enter_layer(
+            crate::adr063_invariance::receipt::Family::Deepseek4,
+            span.start_position as u64, layer as u32);
         let dump_attention = std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_some();
         let attention_session = (!dump_attention).then_some(&mut *session);
         let attention = if layer == 0 {
