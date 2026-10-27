@@ -264,6 +264,15 @@ SHA256 `34dcafd0ec61a6c61d3007d81318d28ab28a458394e416153f73e406be29f93c`;
 projector catalogue basename `qwen38-projector-tensor-directory-v1.json`.
 Frozen historical records are unchanged.
 
+Stock/OFF does not borrow the opt-in quota. A separate dense-family retained-bin
+role enumeration bounds its selected pool at 13,706,993,664 bytes, rounded to
+13 GiB, under the same source catalogue, worker, reset and finite campaign
+assumptions. Independent root review accepted that scoped derivation. Because
+13 GiB is below the ON packet's 24 GiB cell and the other source owners are
+unchanged, the same conservative 104 GiB operating floor can cover either arm
+after final identity/settings review. This is source domination, not a measured
+stock high-water or physical-release claim.
+
 ## DeepSeek4: current bootstrap topology and finite remaining joins
 
 43layers, ratio schedule2uncompressed/21ratio4/20ratio128, hidden4096/HC4,
