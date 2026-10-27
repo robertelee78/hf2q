@@ -1,4 +1,6 @@
-//! Metadata-only largest allowed Qwen3.6 input fixture. No engine/device or HTTP.
+//! Metadata-only largest ADMITTED Qwen3.6 input fixture. No engine/device or HTTP.
+//! V1 P253952 was metadata-valid but runtime-rejected: Qwen requires 64 safety rows.
+//! This prospective correction preserves context/output and both production guards.
 use super::prefix_post_oracle_tests::{hash, semantic_hash};
 use super::*;
 use serde::Deserialize;
@@ -11,7 +13,18 @@ const MODEL_SHA: &str = "815a22cab21649948352c0eea6e9be0d9d15606e2024d86e7bdb71f
 const MODEL_BYTES: u64 = 21712410208;
 const CONTEXT: usize = 262144;
 const OUTPUT: usize = 8192;
-const TARGET: usize = CONTEXT - OUTPUT;
+// Both source-hash-bound guards: engine::validate_qwen35_generation_request and
+// engine_qwen35::Qwen35PrefillState::begin require P+graft+output+64 <= C.
+const QWEN_SEQUENCE_SLACK: usize = 64;
+const GRAFT: usize = 0;
+const TARGET: usize = CONTEXT - OUTPUT - QWEN_SEQUENCE_SLACK - GRAFT;
+fn admitted_input(prompt: usize) -> bool {
+    prompt
+        .checked_add(GRAFT)
+        .and_then(|n| n.checked_add(OUTPUT))
+        .and_then(|n| n.checked_add(QWEN_SEQUENCE_SLACK))
+        .is_some_and(|n| n <= CONTEXT)
+}
 const BODY_LIMIT: usize = 8 * 1024 * 1024;
 const UNIT: &str = " a";
 const DECL:&str="\n#[cfg(test)]\n#[path = \"handlers_qwen36_largest_prompt_tests.rs\"]\nmod qwen36_largest_prompt_tests;\n";
@@ -282,7 +295,13 @@ fn qwen36_largest_prompt_exports_four_exact_production_inputs() {
         assert!(shape(&decoded, agent, repetitions));
         let (rendered, ids, thinking) = render_ids(&decoded, template, &tokenizer);
         assert_eq!(ids.len(), TARGET);
-        assert_eq!(ids.len().checked_add(OUTPUT), Some(CONTEXT));
+        assert!(admitted_input(ids.len()));
+        assert_eq!(
+            ids.len()
+                .checked_add(OUTPUT)
+                .and_then(|n| n.checked_add(QWEN_SEQUENCE_SLACK)),
+            Some(CONTEXT)
+        );
         assert_eq!(
             ids,
             render_ids(&decoded, template, &tokenizer).1,
@@ -297,7 +316,7 @@ fn qwen36_largest_prompt_exports_four_exact_production_inputs() {
             "agent_id":format!("agent-{agent}"),"prompt_tokens":ids.len(),"marker":format!("CAPACITY_{agent}")}));
         records.push(json!({"agent":agent,"request_file":request_name,"request_sha256":hash(&bytes),"request_bytes":bytes.len(),
             "token_file":tokens_name,"token_file_sha256":hash(&token_bytes),"token_ids_sha256_le_u32":token_hash(&ids),
-            "prompt_tokens":ids.len(),"max_completion_tokens":OUTPUT,"context":CONTEXT,"repetitions":repetitions,
+            "prompt_tokens":ids.len(),"max_completion_tokens":OUTPUT,"context":CONTEXT,"qwen_sequence_slack":QWEN_SEQUENCE_SLACK,"graft_tokens":GRAFT,"repetitions":repetitions,
             "stream":agent%2==1,"tools":false,"thinking":thinking,"resolved_template_kwargs":{"preserve_thinking":true},"encode_add_special_tokens":false,
             "add_generation_prompt":true,"rendered_sha256":hash(rendered.as_bytes()),
             "render_prefix":rendered.chars().take(96).collect::<String>(),"bos_and_header_token_ids":&ids[..ids.len().min(24)]}));
@@ -319,7 +338,7 @@ fn qwen36_largest_prompt_exports_four_exact_production_inputs() {
         }
     }
     let manifest = json!({"schema":"hf2q.qwen36-largest-prompt-wires.v1","model":MODEL,
-        "context_tokens":CONTEXT,"wires":client_wires});
+        "context_tokens":CONTEXT,"qwen_sequence_slack":QWEN_SEQUENCE_SLACK,"prompt_tokens":TARGET,"max_completion_tokens":OUTPUT,"wires":client_wires});
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
     write_new(&c.output_root.join("manifest.json"), &manifest_bytes);
     let metadata = json!({"schema":"hf2q.qwen36-largest-prompt-metadata.v1","family":"qwen36","model":MODEL,"model_artifact_sha256":MODEL_SHA,"model_artifact_bytes":MODEL_BYTES,
@@ -329,14 +348,14 @@ fn qwen36_largest_prompt_exports_four_exact_production_inputs() {
         "config_sha256":hash(&config_bytes),"tokenizer_raw_sha256":hash(&tb),"template_raw_sha256":hash(&template_bytes),
         "tokenizer_semantic_sha256":semantic_hash(serde_json::from_str(&tokenizer.to_string(false).unwrap()).unwrap()),
         "template_semantic_sha256":semantic_hash(json!({"source":"GgufEmbedded","template":template})),
-        "context":CONTEXT,"prompt_tokens":TARGET,"max_completion_tokens":OUTPUT,"product_body_limit_bytes":BODY_LIMIT,
+        "case":"corrected_largest_admitted_input","qwen_sequence_slack":QWEN_SEQUENCE_SLACK,"graft_tokens":GRAFT,"prior_p253952_runtime_rejected":true,"context":CONTEXT,"prompt_tokens":TARGET,"max_completion_tokens":OUTPUT,"product_body_limit_bytes":BODY_LIMIT,
         "artifact_identity_basis":"declared cached F1 binding only; no GGUF payload opened by this metadata helper","model_inference_performed":false,"admission_qualified":false,"quality_qualified":false,"prefix_qualified":false,
         "cross_agent_lcps":lcps,"requests":records});
     write_new(
         &c.output_root.join("metadata.json"),
         &serde_json::to_vec_pretty(&metadata).unwrap(),
     );
-    println!("QWEN36_LARGEST_PROMPT_METADATA_COMPLETE agents=4 prompt_tokens=253952 max_completion_tokens=8192 model_inference=false admission=false");
+    println!("QWEN36_LARGEST_PROMPT_METADATA_COMPLETE agents=4 prompt_tokens=253888 max_completion_tokens=8192 safety_slack=64 model_inference=false admission=false");
 }
 #[test]
 fn qwen36_largest_prompt_config_is_exact_family_and_closed_schema() {
@@ -361,8 +380,17 @@ fn qwen36_largest_prompt_config_is_exact_family_and_closed_schema() {
 }
 #[test]
 fn qwen36_largest_prompt_request_preserves_exact_boundary_and_payload() {
-    assert_eq!(TARGET, 253952);
-    assert_eq!(TARGET.checked_add(OUTPUT), Some(CONTEXT));
+    assert_eq!(TARGET, 253888);
+    assert_eq!(
+        TARGET
+            .checked_add(OUTPUT)
+            .and_then(|n| n.checked_add(QWEN_SEQUENCE_SLACK)),
+        Some(CONTEXT)
+    );
+    assert!(admitted_input(TARGET));
+    assert!(!admitted_input(TARGET + 1));
+    assert!(!admitted_input(253952));
+    assert!(!admitted_input(usize::MAX));
     for agent in 0..4 {
         let v = wire(agent, 2);
         assert!(shape(&v, agent, 2));
