@@ -13332,3 +13332,7 @@ mod gemma_full_input_post_oracle_tests;
 #[cfg(test)]
 #[path = "handlers_gemma_matched_tokens_tests.rs"]
 mod gemma_matched_tokens_tests;
+
+#[cfg(test)]
+#[path = "handlers_qwen36_largest_prompt_tests.rs"]
+mod qwen36_largest_prompt_tests;
