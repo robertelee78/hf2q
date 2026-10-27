@@ -97,6 +97,13 @@ impl MlxModelWeights {
             .map_err(|e| anyhow::anyhow!("GPU pre-attn norm L{layer_idx}: {e}"))?;
         *total_dispatches += 1;
 
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture(
+            session, exec, seq_pos, layer_idx, &[
+                (crate::adr063_invariance::receipt::Stage::Norm, &self.activations.norm_out, vec![1, hs]),
+            ],
+        )?;
+
         // -- QKV projections (CONCURRENT: all read norm_out, write separate buffers) --
         // ONE barrier after norm (which wrote norm_out), then all 3 projections
         // dispatch without barriers between them — they share reads and have disjoint writes.
@@ -164,6 +171,14 @@ impl MlxModelWeights {
             session.track_dispatch(&[&self.activations.norm_out], &[&self.activations.attn_v]);
             *total_dispatches += 1;
         }
+
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture(
+            session, exec, seq_pos, layer_idx, &[
+                (crate::adr063_invariance::receipt::Stage::Query, &self.activations.attn_q, vec![1, nh, hd]),
+                (crate::adr063_invariance::receipt::Stage::Key, &self.activations.attn_k, vec![1, nkv, hd]),
+            ],
+        )?;
 
         // -- Fused per-head RMS norm + RoPE on Q and K (CONCURRENT) --
         let ff_gpu = if is_sliding {
@@ -393,6 +408,15 @@ impl MlxModelWeights {
                 eprintln!("[PRE_QUANT_DUMP] meta -> {mp}");
             }
         }
+
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture(
+            session, exec, seq_pos, layer_idx, &[
+                (crate::adr063_invariance::receipt::Stage::RopeQuery, &self.activations.attn_q_normed, vec![1, nh, hd]),
+                (crate::adr063_invariance::receipt::Stage::RopeKey, &self.activations.attn_k_normed, vec![1, nkv, hd]),
+                (crate::adr063_invariance::receipt::Stage::Value, v_src, vec![1, nkv, hd]),
+            ],
+        )?;
 
         // -- GPU KV cache update: Hadamard-quantize into TQ packed cache (ADR-007) --
         // HF2Q_SKIP_TQ_ENCODE=1: skip for timing bisection (output garbage).
@@ -2017,6 +2041,13 @@ impl MlxModelWeights {
             }
         }
 
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture(
+            session, exec, seq_pos, layer_idx, &[
+                (crate::adr063_invariance::receipt::Stage::Attention, &self.activations.sdpa_out, vec![1, nh, hd]),
+            ],
+        )?;
+
         // -- O-proj --
         // ADR-028 iter-211: SKIP_O_PROJ bisect.  Sequential
         // single qmatmul on critical path after SDPA.
@@ -2428,6 +2459,16 @@ impl MlxModelWeights {
             .map_err(|e| anyhow::anyhow!("fused MoE routing L{layer_idx}: {e}"))?;
             *total_dispatches += 1;
         }
+
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture(
+            session, exec, seq_pos, layer_idx, &[
+                (crate::adr063_invariance::receipt::Stage::FfnNorm, &self.activations.moe_norm_out, vec![1, hs]),
+                (crate::adr063_invariance::receipt::Stage::RouterLogits, &self.activations.moe_router_logits, vec![1, num_experts]),
+                (crate::adr063_invariance::receipt::Stage::RouterIds, &self.activations.moe_expert_ids, vec![1, top_k]),
+                (crate::adr063_invariance::receipt::Stage::RouterWeights, &self.activations.moe_routing_weights_gpu, vec![1, top_k]),
+            ],
+        )?;
 
         // ============================================================
         // MoE expert dispatches (was S4, now in same session)
@@ -3159,6 +3200,13 @@ impl MlxModelWeights {
             )?;
             // Re-start session for remaining layers
         }
+
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture(
+            session, exec, seq_pos, layer_idx, &[
+                (crate::adr063_invariance::receipt::Stage::LayerOutput, &self.activations.hidden, vec![1, hs]),
+            ],
+        )?;
 
         // Dual command buffer: commit buf0 after N layers, start buf1.
         // GPU begins executing buf0 immediately. CPU continues encoding

@@ -3028,6 +3028,19 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             .map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
         }
 
+        #[cfg(test)]
+        {
+            // Retain only; the caller's existing layer diagnostic boundary
+            // performs the checked drain AFTER this mutable encoder borrow
+            // ends. Calling that drain here would alias EncoderSession.
+            crate::adr063_invariance::qwen::retain_current("moe_router_logits", &logits_buf,
+                vec![seq, ne32 as usize]).map_err(anyhow::Error::msg)?;
+            crate::adr063_invariance::qwen::retain_current("moe_router_ids", &ids_buf,
+                vec![seq, topk]).map_err(anyhow::Error::msg)?;
+            crate::adr063_invariance::qwen::retain_current("moe_router_weights", &weights_buf,
+                vec![seq, topk]).map_err(anyhow::Error::msg)?;
+        }
+
         // NOTE: this `_into` variant does NOT commit.  The caller is
         // responsible for committing the encoder, allowing fusion with
         // upstream dispatches (e.g. `dispatch_fused_residual_norm_f32`).
@@ -3461,6 +3474,15 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
         }
     }
 
+    #[cfg(test)]
+    {
+        crate::adr063_invariance::qwen::retain_current("moe_router_logits", &arena.logits_buf,
+            vec![seq, ne32 as usize]).map_err(anyhow::Error::msg)?;
+        crate::adr063_invariance::qwen::retain_current("moe_router_ids", &arena.ids_buf,
+            vec![seq, topk]).map_err(anyhow::Error::msg)?;
+        crate::adr063_invariance::qwen::retain_current("moe_router_weights", &arena.weights_buf,
+            vec![seq, topk]).map_err(anyhow::Error::msg)?;
+    }
     Ok(out_slot.clone())
 }
 

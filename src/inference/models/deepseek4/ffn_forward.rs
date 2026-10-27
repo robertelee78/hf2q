@@ -380,6 +380,24 @@ impl Deepseek4Model {
                 &invalid_status,
                 rows,
             )?;
+            #[cfg(test)]
+            {
+                use crate::adr063_invariance::{family, receipt::{Family, Stage}};
+                // These layer-issued buffers are not recycled until the
+                // enclosing layer's terminal status-checked drain.
+                family::retain_current(Family::Deepseek4, Stage::FfnNorm, &ffn_norm)
+                    .map_err(anyhow::Error::msg)?;
+                family::retain_current(Family::Deepseek4, Stage::RouterLogits, &logits)
+                    .map_err(anyhow::Error::msg)?;
+                family::retain_current(Family::Deepseek4, Stage::RouterIds, &indices)
+                    .map_err(anyhow::Error::msg)?;
+                family::retain_current(Family::Deepseek4, Stage::RouterWeights, &route_weights)
+                    .map_err(anyhow::Error::msg)?;
+                if let Some(bias) = selection_bias {
+                    family::retain_current(Family::Deepseek4, Stage::RouterSelectionBias, bias)
+                        .map_err(anyhow::Error::msg)?;
+                }
+            }
             split_profile_stage(session, "DeepSeek-V4 FFN router")?;
             if use_paired_expert_prefill(
                 rows,
@@ -741,6 +759,11 @@ impl Deepseek4Model {
         // layer. `dispatch_hc_post` only reads `ffn_output`, so the buffer
         // still holds the writer values then. Off (`None`) on every
         // existing path.
+        #[cfg(test)]
+        crate::adr063_invariance::family::retain_current(
+            crate::adr063_invariance::receipt::Family::Deepseek4,
+            crate::adr063_invariance::receipt::Stage::FfnWriter, &ffn_output,
+        ).map_err(anyhow::Error::msg)?;
         if let Some(slot) = writer_capture {
             if slot.is_none() {
                 *slot = Some(ffn_output.clone());
