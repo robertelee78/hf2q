@@ -1,8 +1,8 @@
 # ADR-063: Apple Silicon four-agent GGUF speed and coherence
 
-- **Status:** Accepted program scope and F1/F3 execution entry; downstream implementation designs require separate approval.
+- **Status:** Accepted program scope, F1/F3 execution entry and the separately reviewed F2/Q1/Q2/C1 source implementation entry; other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-10-25 — operator confirmed the host is dedicated to this work, authorized all available system RAM, and required one hf2q process at a time; scope and all-four speed/quality requirements remain unchanged.
+- **Updated:** 2026-10-27 — separately reviewed F2/Q1/Q2/C1 designs may be implemented in parallel while Q5 continues; original hardware qualification, acceptance and delivery predecessors remain. The dedicated-host resource policy and all-four speed/quality requirements remain unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
 - Stable source ID: ADR-063
@@ -15,7 +15,7 @@
 
 The product goal is leadership in GGUF inference on Apple Silicon. The primary outcome is four concurrently active agentic coding slots on the operator M5 Max with 128 GB RAM, with coherence/tool correctness at least as good as peers and proven four-agent speed wins for each of Qwen3.8, DeepSeek-V4, Qwen3.6 and Gemma 4. Qwen3.8 and DeepSeek-V4 have first priority; Qwen3.6 and Gemma 4 follow. Current primary implementations and October releases determine the experiment shortlist; old ADRs supply constraints and failed evidence, not an automatic implementation queue.
 
-This proposal consolidates the strongest ideas from ADR-010/011/016/019/034/037/039/040/042/044/049 and newer October work. It does not silently supersede their accepted safety contracts. The release target is v0.1.28; the prior milestone-6 producer scope moves to v0.1.29. The operator approved this program scope and the F1/F3 execution entry on 2026-10-23 after the recorded skeptic review. F1/F3 may become Ready after their approval is recorded; all other stories remain Backlog pending their own design approval and predecessor evidence. Creating a project does not claim an experiment passed. Do not duplicate existing managed issues; source corrections must reconcile their existing bindings. A feature story is accepted only on its own observable contract; cross-family milestones do not establish universal coverage.
+This proposal consolidates the strongest ideas from ADR-010/011/016/019/034/037/039/040/042/044/049 and newer October work. It does not silently supersede their accepted safety contracts. The release target is v0.1.28; the prior milestone-6 producer scope moves to v0.1.29. The operator approved this program scope and the F1/F3 execution entry on 2026-10-23 after the recorded skeptic review. At that initial entry F1/F3 could become Ready after their approval was recorded; other stories required their own design approval and predecessor evidence. The later approved source-overlap entry below records the limited F2/Q1/Q2/C1 exception. Creating a project does not claim an experiment passed. Do not duplicate existing managed issues; source corrections must reconcile their existing bindings. A feature story is accepted only on its own observable contract; cross-family milestones do not establish universal coverage.
 
 The primary comparison is four simultaneously runnable agent slots with at least six tool rounds each; one-slot controls and mixed prefill/decode populations 3+1, 2+2 and 1+3 are required. Stock current hf2q, experimental hf2q from that baseline, and latest peer are mandatory arms, frozen for each experiment. Same-artifact peers use hf2q-produced GGUFs. MLX/native-format comparisons are separate quality-qualified arms. The mandatory hardware is M5 Max with 128 GB RAM; other Apple generations are future separate strata. Linux/CUDA runtime support is outside scope. Ideas may originate anywhere but win only through owned Rust/Metal GGUF measurements on this host. Top-tier artifacts are vanilla Qwen3.8-27B dense and DeepSeek-V4. Qwen3.6-35B-A3B MoE and Gemma 4 are the second tier; prioritize the top-tier speed work, then prove speed wins for the second tier as well. Four slots do not mean four Macs. Quality gates and sampling transformations cannot be relaxed to manufacture a speed win.
 
@@ -556,6 +556,14 @@ The operator authorized merging the corrected planning PR and making F1 (#356) a
 
 The operator confirmed that this laptop is dedicated to the program and authorized using all RAM available to the system, with one hf2q process at a time. This updates Q5's resource policy; it does not accept a model configuration, waive the disjoint-ledger or bounded stress proof, reduce matched context/output/task budgets, or establish any speed win. A chosen reaction margin must be tied to observed stop latency and allocation overshoot rather than retained as an unexplained fixed reservation.
 
+### Parallel source implementation (operator update, 2026-10-27)
+
+After separate design review, the operator explicitly authorized implementing source work in parallel for F2 (#357), Q1 (#367), Q2 (#368) and C1 (#359). Their reviewed execution plans are linked below. These source attempts may execute while Q5 remains unfinished. F2 source work may overlap Q5, C1 source work may overlap Q5, and Q1/Q2 source work may overlap F2; these execution-entry exceptions do not remove the original predecessors for hardware qualification, final acceptance or delivery. F1/F3 remain satisfied predecessors. The dependency declarations in each story above retain those final obligations.
+
+Each attempt has a separate topic worktree and writer. Shared-file integration and all heavy builds, tests and model/helper execution are scheduled by one integration owner. Only one hf2q instance may run at a time, including test/metadata helpers, and a peer model must be unloaded before loading hf2q or vice versa. Source implementation is not permission to activate an unqualified runtime candidate or expand retained-state memory without the applicable Q5, harness and correctness gates. A native API change must be independently validated, published and exactly pinned before its hf2q consumer is reproducibly delivered.
+
+The approved source designs are [F2](../research/adr063-f2-execution-plan.md), [Q1](../research/adr063-q1-execution-plan.md), [Q2](../research/adr063-q2-execution-plan.md) and [C1](../research/adr063-c1-execution-plan.md). Approval and parallel source authorship establish no quality, memory-admission, performance or task-completion result. Candidate authors and independent QE remain distinct. The existing four-family win requirement and all failed-path, confidence and release gates remain unchanged.
+
 ## Consequences
 
 ### Positive
@@ -568,7 +576,7 @@ Four artifact lanes and sequential runtime isolation make real-model evidence ex
 
 ### Neutral
 
-The program scope and F1/F3 execution entry are Accepted. Downstream implementation designs remain unapproved; acceptance of this program is not acceptance of implementation or performance claims. Historical pin/source drift is repaired by F1/F3 through existing authority, never silently by benchmark configuration.
+The program scope, F1/F3 execution entry and separately reviewed F2/Q1/Q2/C1 source implementation entry are Accepted. Other implementation designs require their own approval; acceptance of these entries is not acceptance of implementation or performance claims. Historical pin/source drift is repaired by F1/F3 through existing authority, never silently by benchmark configuration.
 
 ## Successor watchlist (not committed v0.1.28 implementation scope)
 
