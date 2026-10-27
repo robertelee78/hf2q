@@ -226,7 +226,7 @@ regex = "1"
 # multi-turn chat with `UnknownMethod: string has no method named split`.
 # Surfaced and fixed during ADR-005 Phase 2a iter-133 Iter A while
 # closing the Open WebUI multi-turn AC 2509 harness.
-minijinja = "2"
+minijinja = { version = "2", features = ["preserve_order"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 
 # tempfile is used at runtime by the convert pipeline (ADR-012 P9b two-pass
