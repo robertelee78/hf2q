@@ -13336,3 +13336,7 @@ mod gemma_matched_tokens_tests;
 #[cfg(test)]
 #[path = "handlers_qwen36_largest_prompt_tests.rs"]
 mod qwen36_largest_prompt_tests;
+
+#[cfg(test)]
+#[path = "handlers_capacity_fixture_source_tests.rs"]
+mod capacity_fixture_source_tests;
