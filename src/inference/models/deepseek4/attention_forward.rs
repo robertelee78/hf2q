@@ -277,6 +277,7 @@ impl Deepseek4Model {
                     groups,
                     heads * head_dim / groups,
                     o_rank,
+                    output_a_weight.ggml_type,
                 )
             })
             .transpose()?;
