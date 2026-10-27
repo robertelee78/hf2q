@@ -106,19 +106,32 @@ def request_timeout(_signum, _frame):
     raise TimeoutError("absolute request deadline")
 
 
-def build_request(model, messages, schemas, turn, family="qwen"):
+def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf2q"):
     """Actual shared request construction, before the exchange wire boundary."""
     request = {"model": model, "messages": messages, "tools": schemas,
                "tool_choice": "auto", "max_completion_tokens": 8192,
                "logprobs": False, "hf2q_overflow_policy": "reject", "stream": turn % 2 == 1}
     family_contract.request_controls(request, family)
+    require(engine_kind in ("hf2q", "peer"), "unknown request engine")
+    if engine_kind == "peer":
+        require(family == "qwen", "only Qwen peer transport is supported")
+        from qwen_n4_peer import request_controls as peer_request_controls
+        request = peer_request_controls(request)
     if request["stream"]:
         request["stream_options"] = {"include_usage": True}
     return request
 
 
 def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen"):
-    raw_request = wire(request, family)
+    if engine_kind == "peer":
+        require(family == "qwen" and "hf2q_overflow_policy" not in request,
+                "peer request must use native transport metadata")
+        # Validate the unchanged canonical envelope through the HF-only field,
+        # then serialize the actual native-peer wire without that field.
+        wire({**request, "hf2q_overflow_policy": "reject"}, family)
+        raw_request = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
+    else:
+        raw_request = wire(request, family)
     (output / "request.json").write_bytes(raw_request)
     endpoint = urlsplit(base)
     require(endpoint.scheme == "http" and endpoint.hostname == "127.0.0.1" and endpoint.port and
@@ -285,7 +298,7 @@ def main():
         for turn in range(7):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
             os.kill(args.server_pid, 0)
-            request = build_request(args.model, messages, schemas, turn, args.family)
+            request = build_request(args.model, messages, schemas, turn, args.family, args.engine_kind)
             turn_output = output / f"turn-{turn}"
             turn_output.mkdir(mode=0o700)
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
