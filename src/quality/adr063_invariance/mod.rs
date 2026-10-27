@@ -18,6 +18,7 @@ pub(crate) mod qwen;
 #[cfg(test)]
 mod qwen_actual;
 pub(crate) mod qwen_cache;
+pub(crate) mod qwen_continuation;
 #[cfg(test)]
 mod qwen_localizer;
 pub(crate) mod qwen_runner;

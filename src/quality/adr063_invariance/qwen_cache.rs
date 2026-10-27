@@ -282,7 +282,7 @@ mod quota_controls {
     use crate::inference::models::qwen35::{
         default_layer_types, Qwen35Config, Qwen35MoeConfig, Qwen35Variant,
     };
-    fn header_config(q38: bool) -> Qwen35Config {
+    pub(super) fn header_config(q38: bool) -> Qwen35Config {
         let (serialized_blocks, nextn, inner, kv, hidden, heads) = if q38 {
             (65, 1, 6144, 4, 5120, 24)
         } else {
@@ -380,4 +380,9 @@ mod quota_controls {
         assert!(head_spans(&[1, 4, 10, 256], 1, 4 * 10 * 256 - 1, 10).is_err());
         assert!(head_spans(&[1, 4, 10, 256], 1, 4 * 10 * 256, 11).is_err());
     }
+}
+
+#[cfg(test)]
+pub(crate) fn selected_header_fixture(q38: bool) -> crate::inference::models::qwen35::Qwen35Config {
+    quota_controls::header_config(q38)
 }
