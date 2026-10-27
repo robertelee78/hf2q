@@ -27,7 +27,6 @@ fn admitted_input(prompt: usize) -> bool {
 }
 const BODY_LIMIT: usize = 8 * 1024 * 1024;
 const UNIT: &str = " a";
-const DECL:&str="\n#[cfg(test)]\n#[path = \"handlers_qwen38_largest_prompt_tests.rs\"]\nmod qwen38_largest_prompt_tests;\n";
 const TOKENIZER: &str = "90ff2bcbb15ed3e13f779a72000af82fde72842c3a14f04ac0da415071e6fa4c";
 const TEMPLATE: &str = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 #[derive(Deserialize)]
@@ -233,9 +232,11 @@ fn write_new(path: &Path, bytes: &[u8]) {
     f.flush().unwrap();
 }
 fn source_units() -> Value {
-    let handlers = include_str!("handlers.rs")
-        .strip_suffix(DECL)
-        .expect("one exact appended cfg(test) declaration");
+    let handlers = super::capacity_fixture_source_tests::source_at_base(
+        include_str!("handlers.rs"),
+        "02424cbe589d41d26430ab9231cf2f7e5aea8b17bb9f4c6cec266cf66dfdc387",
+    )
+    .expect("exact frozen handlers body with known fixture declarations only");
     json!({"engine":hash(include_bytes!("engine.rs")),"qwen_engine":hash(include_bytes!("engine_qwen35.rs")),"handlers":hash(handlers.as_bytes()),
         "schema":hash(include_bytes!("schema.rs")),"registry":hash(include_bytes!("registry.rs")),
         "reasoning":hash(include_bytes!("reasoning_controls.rs")),"templates":hash(include_bytes!("../../core/chat_templates.rs")),
