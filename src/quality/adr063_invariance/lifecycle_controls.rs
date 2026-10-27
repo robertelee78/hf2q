@@ -1,5 +1,6 @@
 //! Actual lifecycle/offset boundary controls, isolated from numeric fixtures.
 use super::*;
+use crate::adr063_invariance::{capture, family, qwen};
 #[test]
 fn q1_family_tls_scope_cleans_up_on_panic() {
     let root = Root::new();
@@ -26,13 +27,13 @@ fn q1_family_tls_scope_cleans_up_on_panic() {
         },
     );
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = super::family::install(Family::Qwen38, store, targets).unwrap();
-        assert!(super::family::enabled(Family::Qwen38));
+        let _guard = family::install(Family::Qwen38, store, targets).unwrap();
+        assert!(family::enabled(Family::Qwen38));
         panic!("deliberate capture unwind");
     }));
     assert!(result.is_err());
-    assert!(!super::family::enabled(Family::Qwen38));
-    assert!(super::family::finish().is_err());
+    assert!(!family::enabled(Family::Qwen38));
+    assert!(family::finish().is_err());
 }
 
 #[test]
@@ -63,7 +64,7 @@ fn q1_actual_offset_view_capture_control() {
         1,
     )
     .unwrap();
-    super::capture::after_checked_drain(
+    capture::after_checked_drain(
         &mut store,
         coordinate,
         &view,
@@ -128,11 +129,11 @@ fn q1_qwen_tls_scope_cleans_up_on_panic() {
         },
     );
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = super::qwen::install(store, targets).unwrap();
-        assert!(super::qwen::enabled());
+        let _guard = qwen::install(store, targets).unwrap();
+        assert!(qwen::enabled());
         panic!("deliberate Qwen capture unwind");
     }));
     assert!(result.is_err());
-    assert!(!super::qwen::enabled());
-    assert!(super::qwen::finish().is_err());
+    assert!(!qwen::enabled());
+    assert!(qwen::finish().is_err());
 }
