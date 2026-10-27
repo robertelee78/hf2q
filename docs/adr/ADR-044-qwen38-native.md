@@ -722,3 +722,34 @@ paired path and requires the caller's expected digest, preventing a baked-in
 digest from silently drifting at the next artifact rotation. The model-free
 contract pins the paired path and release-gate digest, requires receipt use in
 both runners, and rejects any direct full-model `sha256_file` reread.
+
+### 2026-10-27: bounded prefill has a separate finite worker deadline
+
+The retained ADR063 Qwen3.8 four-slot largest-admitted-input attempt (four
+253,888-token prompts, 262,144 context per slot, 8,192 output allowance)
+failed when the engine supervisor expired `Qwen35 bounded prefill` epoch 429
+at the shared 30-second worker deadline. Reported committed cursors were
+221,184 / 219,136 / 217,088 / 217,088; preceding long-context chunks
+were approximately 22–25 seconds. Pressure stayed normal; minimum operating
+Free+CachedFiles was 49,763,303,424 bytes (46.346 GiB). It was not a
+memory-guard rejection. The evidence does not distinguish slow work from a
+GPU hang; a larger deadline remains an unproven fix until a new run completes.
+The attempt remains failed, not rescored as a capacity success.
+
+Bounded Qwen prefill now uses a finite 120-second worker lease. Decode,
+cohort/speculative verification and other existing 30-second worker leases
+retain their prior bound. This separates a context-dependent prefill
+transaction from short decode transactions; it changes neither chunk size,
+attention/context/output workload, sampling, cache publication, cancellation,
+nor the outer request/memory/process watchdog. An expired lease still
+permanently poisons readiness and cannot publish a successful transaction.
+
+Model-free controls compose the actual production budget selector with real
+EngineSupervisor arm/expiry/finish state, advancing its deadline without
+sleeping or racing a monitor: prefill is healthy after 31 seconds and finishes
+at 119 seconds, decode fails at 30 seconds, and prefill still fails permanently
+after 121 seconds. These controls are source-authored, not validation evidence.
+Root-owned focused/regression builds and a new source-bound largest-input
+attempt with matched prospective settings remain required. No model quality,
+full output writes, physical memory admission, Q5 completion or speed win
+follows from increasing this finite deadline.
