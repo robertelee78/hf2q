@@ -13332,3 +13332,19 @@ mod gemma_full_input_post_oracle_tests;
 #[cfg(test)]
 #[path = "handlers_gemma_matched_tokens_tests.rs"]
 mod gemma_matched_tokens_tests;
+
+#[cfg(test)]
+#[path = "handlers_qwen36_largest_prompt_tests.rs"]
+mod qwen36_largest_prompt_tests;
+
+#[cfg(test)]
+#[path = "handlers_capacity_fixture_source_tests.rs"]
+mod capacity_fixture_source_tests;
+
+#[cfg(test)]
+#[path = "handlers_qwen38_largest_prompt_tests.rs"]
+mod qwen38_largest_prompt_tests;
+
+#[cfg(test)]
+#[path = "handlers_tool_result_capacity_tokens_tests.rs"]
+mod tool_result_capacity_tokens_tests;
