@@ -2,9 +2,10 @@
 
 **Draft, 2026-10-27; no Q5 acceptance or new execution authority.** This joins
 existing source-derived payload cells and prospectively declared operating
-allowances. Qwen3.6 and Gemma have numeric operating packets below; Qwen3.8 and
-DeepSeek still have specifically identified source joins. An executed normal
-conversation or an available-RAM threshold does not fill those joins.
+allowances. Qwen3.6, Gemma and Qwen3.8 have named operating candidates;
+DeepSeek has a finite coarse source envelope that still needs case/phase and
+operating-margin refinement. A normal conversation or available-RAM threshold
+does not replace those source and qualification joins.
 
 Governing [ADR-063 Q5](../adr/ADR-063-apple-silicon-four-agent-speed-coherence.md)
 and the [qualification matrix](adr063-q5-final-qualification-matrix.md) retain
@@ -18,7 +19,7 @@ All arithmetic uses integer bytes; GiB=1073741824. The selected host has
 8192 output allowance, text-only requests, native family template/tokenizer and
 its supported modes. Largest source-admitted Qwen input is253888 with graft0:
 P+8192+64<=262144. Gemma requires P+8192<=262144, giving253952. Do not silently
-remove Qwen's64-row safety reserve or reduce output/context to fit.
+remove Qwen's64-token safety reserve or reduce output/context to fit.
 
 The operator's dedicated-host available-RAM policy supersedes earlier generic
 12GiB reserve and DS116GiB operating assumptions. The pure
@@ -120,13 +121,18 @@ already correct. This draft uses the exact sum51889721132B and operating total
 receipts are unchanged. This2000B transcription correction changes no source
 allocation, positive allowance,96GiB policy or historical outcome.
 
-The prospective largest-input packet uses96GiB available floor and96GiB
-RSS/footprint abort, with3GiB runtime available floor. These are selected
-operational guards, not source payload caps. Original coding173831 failed;
-original P253952 fixture was correctly HTTP400-rejected by64-row admission slack.
-Neither becomes a pass under correctedP253888. General capacity/quality/peer
-qualification remains in the matrix. Load staging is a separate phase maximum;
-retired source allocations are covered only by the declared G assumption.
+The largest-input packet used96GiB available floor/96GiB RSS-footprint abort
+and3GiB runtime available floor, selected operating guards rather than payload
+caps. `qwen36-largest-admitted-prompt-n4-20261027T124629Z` independently PASSED
+all four actual P=253888 requests with full 8192 allowance and 64-token safety slack:
+two unary/two SSE HTTP200, exact CAPACITY_i, stop, and all slots completing
+253888 prefill. Actual completions261/372/467/275 are natural early EOS, not8192
+highest-index writes. Client exit0 after2674.748s; owned server/client reaped,
+listener absent and scoped unloaded recovery observed. Original coding173831
+E0282 and original124030 P253952 immediateHTTP400 remain failures, unchanged.
+This is a scoped largest-admitted-prompt PASS, not coding quality, seven-wire
+prefix, tool-maximum, speed or every-arm qualification. Load staging remains a
+separate phase MAX; retirement stays in the explicit G assumption.
 
 ## Gemma4: numeric refined operating packet
 
@@ -234,9 +240,10 @@ values as F32; fused QKV views alias roots. Image-free requests do not execute
 vision forward, but the auto-loaded projector is not zero. Construction staging
 is bounded separately by3*largest tensor47185920=141557760B, joined by phase MAX
 rather than added to the full-cache/scratch peak. **The retained F1 identity has
-no mmproj identity.** Header metadata is not payload attestation: a fresh projector
-hash/stat and conversion-receipt comparison remain pending after the sole runtime
-unloads.
+no mmproj identity.** Header metadata alone was not payload attestation. A separate
+fresh `qwen38-projector-identity-v1.json` now binds927606944B to SHA256
+`288bacc24d88af65e9478d1491c61df6139ab9710727613c04f3863f5abac256`,
+matching the conversion receipt; this is new provenance, not a relabelled F1 claim.
 
 | Positive operating cell | GiB |
 |---|---:|
@@ -253,9 +260,11 @@ unloads.
 The rounded floor leaves1315390852B above the candidate. These are positive
 operating allowances, not measured universal OS maxima or a physical-page sum.
 Observed competition, pressure, footprint and reaction guards remain applicable.
-The104GiB floor is prospective. Independent source review accepted the scoped owner and arithmetic delta; actual qualification remains pending, together
-with projector identity; it does not validate earlier90/96GiB launches or admit
-a new run. The N1 proposal cannot substitute for this N4 packet. Actual stress,
+The104GiB floor is prospective. Independent source review accepted the scoped
+owner/arithmetic delta; actual qualification remains pending. This source record
+does not validate earlier90/96GiB launches or itself authorize a new run. The N1 proposal cannot substitute for this N4 packet. The new
+`qwen38-largest-admitted-prompt-n4-20261027T150727Z` attempt is IN PROGRESS,
+not PASS; it has no final quality/cleanup verdict yet. Actual stress,
 cleanup and comparator acceptance remain open; the pool experiment's measured
 <5%win remains a [negative acceptance result](adr063-qwen38-pool-ablation-negative-result.md).
 
@@ -273,7 +282,7 @@ unchanged, the same conservative 104 GiB operating floor can cover either arm
 after final identity/settings review. This is source domination, not a measured
 stock high-water or physical-release claim.
 
-## DeepSeek4: current bootstrap topology and finite remaining joins
+## DeepSeek4: finite source envelope, operating fit still unqualified
 
 43layers, ratio schedule2uncompressed/21ratio4/20ratio128, hidden4096/HC4,
 KVhead1/D512/indexD128, context262144; default prefill rows<=2048/group4,
@@ -281,76 +290,100 @@ B4decode2layers/CB. No graft/persistence/calibration/alternate profiling routes.
 Bootstrap reuse is eligible pristine startup, not removal of every fifth cache.
 See [bootstrap record](adr063-q5-deepseek-bootstrap-reuse-2026-10-25.md).
 
-| Current source-owned capacity / candidate bound | Bytes | Meaning |
-|---|---:|---|
-| Unique mapped file-page component plus independent F32 |107433539932|107426021376 +7518556; component, NOT complete segmented backing upper|
-| Conditional coarse requested-weight upper |107482377724|file107431343264 +1328*2*16384 +7518556; requires actual mapping planner/maxBufferLength assumptions|
-| Four full session caches plus128 placeholder |7304294400|4*A262144+A128; not old8205189120 five-large-cache topology|
-| Eight compact GPU anchors |142737408|Committed+pending four slots; copy payload, no append-only prefix duplication|
-| One old131072 growth source |919617536|Additional to final target cache, one serialized worker migration|
-| PREFILL data role-history overbound |10815930368|Conservative pre-query-tile geometric envelope; do not also add endpoint inventory|
-| Cooperative sequence-state history |268435456|Separate ordinary pool role history|
-| DECODE B4 role-history envelope |916832768|Full43layer/fourlane cycle; not one layer times22CBs|
+| Source-owned requested capacity / conservative bound | Bytes |
+|---|---:|
+| Successfully loaded mapped weights plus independent F32 |107482377724|
+| Four full session caches plus128 placeholder |7304294400|
+| Eight compact GPU anchors |142737408|
+| Ordinary GPU-data all-bin history, current query tiles |8936882176|
+| Cooperative sequence-state all-bin history |268435456|
+| Ordinary ungrouped host-input history |68211040|
+| Four-layer submission-input history |272844160|
+| B4decode history |916832768|
+| Additional dense-fallback tile-map all-bin overbound |32768|
+| Direct working/growth phase MAX plus returned head |953106576|
+| **Corrected coarse source envelope** |**126345754476 (117.668653350GiB)**|
 
-Cache formula `A(C)=6880*C+17842176`, giving A12818722816,
-A131072919617536,A2621441821392896. Swapping loaded/session surfaces aliases
-ownership roles, not additional cache roots. Eligible bootstrap saves900894720B.
-Ineligible fallback must use old topology. Scheduler8GiB is a shared accounting
-limit, not another8GiB allocation. Persistence-off proves image category zero
-only for that selected route; if enabled exact imageD1822444296 and3D5467332888
-plus index/dirty-I/O staging reopens the packet.
+Native `gguf/mod.rs::plan_mapped_tensor_ranges` sorts/merges whole tensors;
+a successful map cannot create more than the catalogue's1328 roots. An oversized
+single tensor fails; it is never split into arbitrarily many roots. HF propagates
+failure without an anonymous fallback. Therefore file107431343264 plus
+1328*2*16384 rounded-edge allowance plus7518556 independent F32 gives the weight
+upper above without inventing a numeric maxBufferLength. This is requested
+mapped capacity, not resident pages. Encoded mappings/file cache/views are not
+charged again. Largest sequential load staging3352476B is a separate CPU phase.
 
-The old2048/group4 endpoint4743790592B is a LOWER inventory, not an all-shape
-upper and not another cell above. Query tiles already saved939524096 rounded
-bytes there; do not subtract that again from a newer source estimate.
+Cache formula `A(C)=6880*C+17842176` gives A12818722816,
+A131072919617536,A2621441821392896. Four full sessions plus small bootstrap
+cost7304294400B; ineligible pristine reuse adds900894720B for old boot topology.
+Scheduler8GiB is shared accounting, not another8GiB payload. Persistence is OFF;
+otherwise exact imageD1822444296 and3D5467332888 plus I/O reopen the packet.
 
-**Remaining concrete source cells to finish before a numeric operating total:**
+The old61-role max-bucket sum5407965184 is refined for TWO current indexer
+workspace roles: each512MiB maximum becomes64MiB because actual native query
+workspace rows=min(R,256). Subtract939524096 from the max-bucket SUM, then
+apply the all-smaller-bin geometric factor2, yielding8936882176B; do not
+subtract an endpoint saving twice. Grouped CPU-filled input roles remain distinct
+through the entire four-layer captured group:2*4*34105520=272844160B; cooperative
+ungrouped inputs separately allow68211040B. The original61-role table excluded
+one dense-fallback U8 tile map. For valid_compressed0/graft0, KV<=R+128;
+R<=2048 gives<=8704 requested/16384 maximum bucket and<32768 all-bin bytes.
+The table conservatively adds32768, correcting the reviewed addendum's omission.
 
-1. Confirm whole-tensor native mapping plan/maxBufferLength and bounded segment
-   count using retained directory metadata. The coarse weight row above is
-   conditional; treating107433539932 as a complete upper is unsound. No full
-   model payload reread or another model load is necessary for this check.
-2. Finish SUBMISSION_INPUT_POOL all-shape bucket history at selected group4.
-   Endpoint88183616 is not a supremum; group43's872999568 is another profile.
-   CPU-filled inputs remain distinct through whole captured group. ordinary
-   GPU-only reset cannot recycle them early. Source seams: verifier_forward.rs
-   grouped capture and forward_support.rs alloc_host_input/begin/end scope.
-3. Join direct prefill state/embedding/combined output/IdMm with head returns,
-   old cache growth and compact anchors using stage MAX. Known direct roots:
-   reusable states268435456, embedding167780352, combined134217728,
-   IdMm4196352; B4FFNoutputs11272192/combined262144/embedding327696/
-   early sparse262144; four-row head2461840. Source-held decode commands<=22,
-   output head1; commands reference these same roots, not22payload copies.
-   Determine head return multiplicity through sampling/serve and exact CPU
-   index Vec capacities (logical max35651584), rather than label them opaque G.
-4. Account request-complete clear/refill across the finite28request campaign
-   and delayed external owners. Selected DS does NOT install the Qwen growth
-   facade. Checked drain plus destruction narrows source ownership but is not
-   physical release credit; declare positive bounded retirement/driver G and
-   stop/overshoot J with existing live guards. Source-owned graph dispatch/
-   binding metadata has finite call cardinality, not an unbounded GPU payload
-   copy. No universal per-Arc OS simulator is required.
-5. Freeze server CPU/owned-I/O/tools/client allowances and source-stage selection
-   for this DS packet, rather than transplant Qwen's known arrays or an old
-   12GiB policy. Actual DS diagnostic96GiB preload/124GiB RSS-footprint abort/
-   3GiB runtime floor describes operational supervision, not a complete B.
+Direct prefill/B4working586754752 joins one serialized old cache growth source
+919617536 by MAX, not sum. Returned head padding allows16 independent full
+four-row logit parents33095680B plus393360 active nonlogit scratch, total33489040;
+actual cohort rows often alias one parent. Growth/direct/head combined953106576B.
+This is a conservative selected owner census, not arbitrary external retention
+of forward results or a per-generated-token full-head multiplier.
 
-No conservative upper exceeding available memory proves hardware impossibility;
-no successful125k growth/N4coding run supplies the missing largest-endpoint
-upper. Existing [grammar/N4 evidence](adr063-deepseek-compact-dsml-grammar-2026-10-26.md)
-remains scoped to quality/prefix/cleanup. Native kernels and resource factories
-belong in mlx-native; selected transaction/worker/pool disposition and source
-ledger composition belong in HF. Both published dependencies and exact clean
-source/binary identities must be frozen for any changed execution packet.
+For comparison only, adding the previously used13.125GiB operating allowances
+would give140438615916B=130.793653350GiB,2999662444B above128GiB before external
+competition. Those allowances are NOT automatically adopted for every DS case.
+This rejects that loose composition for admission; it does not prove hardware
+impossibility or authorize smaller context/output/work. Exact frozen case/phase
+and per-bucket multiplicities can tighten the overcount without new math kernels.
+CPU indices (logical maximum35651584B; declared128MiB capacity envelope inside
+CPU cell), token ledgers, tools/client/I/O and positive driver-retirement/age/stop
+allowances still need the selected operating composition and independent review.
+
+Free+issued pool inventory is not lifetime creation or final physical retirement.
+`RequestScratchGuard` clears prefill after completion and both arenas on abort;
+container/residency removal does not prove all command/driver owners released.
+Positive G and the finite case's stop/recovery policy must cover this boundary.
+Existing [grammar/N4 evidence](adr063-deepseek-compact-dsml-grammar-2026-10-26.md)
+remains quality/prefix/cleanup evidence, not largest-context or physical-fit proof.
+
+Two separate **source-reviewed, unexecuted** memory spikes are proposed:
+
+- Rank A omits only unused group-major output-A input on the existing actual
+  Q8_0/R>native MM threshold8 strided route. Local requested saving268435456B
+  atR2048 or67108864B atR512; fallback allocation/permutation remains. No native
+  kernel, arithmetic, grouping or command-boundary change. Three pure controls
+  and one tiny old-Some/new-None actual control are authored, not executed.
+- Rank B changes internal gathered-query scratch tile256→64 through the same
+  adapter/kernels. At admitted ratio128 width2112/D512 gathered requested bytes
+  change553648128→138412032, rounding1GiB→256MiB; width640 changes160→40MiB.
+  More tile dispatches may cost latency. Two pure controls and one seven-case
+  ragged/offset/validity/BF16 control are authored, not executed.
+
+Neither local saving is measured whole-pool/physical reduction, a speed win,
+a fit guarantee or acceptance/default promotion. Actual compile/controls/model
+quality/stress/performance remain pending; no historical evidence is rescored.
+HF owns transaction/worker/ledger policy; kernels/resource factories remain in
+mlx-native. Changed execution packets require exact published pins and clean
+source/binary identities.
 
 ## Draft disposition and next finite actions
 
 Q36 stock61.451GiB and selected-pool75.451GiB, and Gemma95.531978GiB, are
 reviewable explained **operating** totals with positive declared overhead/reaction
 allowances. They are not synthetic admission results or physical-fit proof.
-Q38 and DS do not yet have a complete numeric disjoint selected-profile packet
-in the located source/evidence. Their exact remaining cells are above; runtime
-available-RAM policies cannot be substituted for them. Finish those cells,
+Q38 has an independently reviewed102.774946805GiB source operating candidate
+and104GiB available floor, with its largest case still running. DS has the finite
+117.668653350GiB coarse source envelope above; its case/phase/allowance refinement
+and physical-fit disposition remain open. Available-RAM thresholds cannot replace
+those joins. Finish the named gaps,
 reconcile each exact source/profile and retained failure, then apply the matrix's
 actual stress/recovery/quality gates. No model, build, test, probe or tracker
 operation was performed to prepare this document.
@@ -375,3 +408,9 @@ unchanged. The checked-in reports linked above carry public execution scope.
 | `adr063-q5-deepseek-live-validation-capacity-audit.md` | `5d73726cf273f9c2615db8f9550f94705051d7daf04fcc3f635b01de2463aacc` |
 | `adr063-q5-ds-finite-stage-gap-audit.md` | `b9e4d7fadce0c677cda7d2bcf1be5a7f2991f49cfe87b6ad6f1a7bc87f8be945` |
 | `adr063-q5-deepseek-pool-reuse-feasibility.md` | `66b0811b5e5d6077f06b20272b0ce6b5bdc18181b6449f1042e5f3ccde66a4dd` |
+| `adr063-qwen36-largest-admitted-prompt-actual-independent-review.md` | `55fd22a652ea63a7ff6a2c12ee918f64863d652acf2c830e1985640343b64494` |
+| `adr063-qwen36-largest-admitted-prompt-actual-independent-review.json` | `d965d5eca87b8732bad95919daa30c821c53f98ce6eed2a34ce896d51a1edd87` |
+| `adr063-q5-deepseek-finite-joins-addendum-v1.md` | `f8103fe355d23ff18d16b30081110ef88270b5227fa34696b8672da400c8f986` |
+| `adr063-q5-deepseek-finite-joins-independent-review.md` | `0f1460b7fc5a7f7d2224eb060d7df4765969c85f438e271612ccc64c97305aa2` |
+| `adr063-deepseek-q8-output-a-staging-independent-source-review-v1.md` | `a4d501bfb8701be02b6fb1c9cacd9fa86f80f0ec832d9736f5efe2987962d2da` |
+| `adr063-deepseek-smaller-gather-tile-independent-source-review-v1.md` | `72851700fbb2f9a104a388839066541f0aa0bb07de3c27ff49debf1a99c9fe3d` |

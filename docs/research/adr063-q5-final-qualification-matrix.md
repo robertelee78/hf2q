@@ -53,7 +53,7 @@ output. Gemma's reviewed case uses253952. Qwen35 generation admission and
 Qwen35PrefillState::begin require P + graft + max_tokens +64 <= cache capacity
 (`engine.rs::validate_qwen35_generation_request`, `engine_qwen35.rs:4023–4037`).
 Thus Qwen3.8/Qwen3.6 text-only ungrafted maximum is253888, preserving full
-C262144 and output8192 plus the existing64-row slack. DeepSeek must likewise
+C262144 and output8192 plus the existing 64-token slack. DeepSeek must likewise
 use its actual admission predicate; do not impose the Gemma number by analogy.
 The exact artifact's tokenizer/renderer must produce the family's source-admitted count. Metadata-only
 construction is not runtime stress; four merely configured slots are not four
@@ -88,16 +88,16 @@ require an affected-cell delta review, not relabeling old observations.
 | Family | Arm | Existing reusable evidence | Exact unresolved qualification |
 | --- | --- | --- | --- |
 | Qwen3.8 | source-built stock/control | Fixed20 pool study OFF cohorts, normal four-agent real coding/tool/cleanup receipts; exact source/config retained | Final stock identity; largest-context and largest-tool-result stress plus closed source/telemetry joins, or independently justified coverage by an identical/dominating accepted configuration |
-| Qwen3.8 | experiment | Pool ON coding cohorts; `qwen38-worker-census-20261026T141046Z` and `qwen38-n4-decode-profile-cb-20261026T233932Z` establish normal N4/tools, actual worker pool census and cleanup | Same largest cases; census excludes cache/direct/other TLS/physical high-water, so whole-process source union and missing telemetry still need joining; synchronous profile is diagnostic only |
+| Qwen3.8 | experiment | Pool ON coding cohorts; `qwen38-worker-census-20261026T141046Z` and `qwen38-n4-decode-profile-cb-20261026T233932Z` establish normal N4/tools, actual worker pool census and cleanup; new largest-admitted attempt150727 is IN PROGRESS, not PASS | Same largest cases; census excludes cache/direct/other TLS/physical high-water, so whole-process source union and missing telemetry still need joining; synchronous profile is diagnostic only |
 | Qwen3.8 | eligible peer | Existing source/build/hash-bound d854 GGUF peer and explicit Qwen adapter; no full accepted memory stress identified | Freeze eligible reference source/mode and dynamic-library identities; full four-context load/readiness, largest context/tool result, same resource policy/recovery and independent budget review |
-| Qwen3.6 | source-built stock/control | `qwen36-n4-20261026T173831Z` loaded correct model/full contexts and cleaned up, but generated E0282 and violated workflow | No quality PASS; failed partial run cannot close real stress. Complete source-admitted P253888 largest-context/tool-result memory cases and final source/ledger joins; coding/peer diagnosis remains a separate correctness gate |
+| Qwen3.6 | source-built stock/control | `qwen36-largest-admitted-prompt-n4-20261027T124629Z` independently PASSED all four P253888/full 8192-allowance requests and scoped unload recovery; older173831 coding E0282 remains FAILED | Largest-admitted input exposure is scoped PASS, not highest-index8192 writes, coding quality, tool-maximum or every-arm proof. Finish largest-tool-result, applicable decode/growth boundary/source joins and final stock identity; retain original124030 HTTP400 failure |
 | Qwen3.6 | experiment | Shared Qwen source plans and pool mechanisms, model-specific source geometry; normal run above is partial failure | Freeze actual experimental configuration (may share control bytes if no memory delta), qualify its largest cases and source/telemetry union; do not substitute dense-Q38 dimensions |
-| Qwen3.6 | eligible peer | d854 native qwen35moe source and binary; peer thinking-transport parity source prepared, current reference freshness recorded | Execute no model until exact peer-only reasoning metadata/manifest is frozen and pure-tested. Then actual four-slot same-artifact largest cases, budgets and recovery; no matched quality/runtime result exists yet |
+| Qwen3.6 | eligible peer | d854 native qwen35moe source and binary; peer thinking-transport parity source prepared, current reference freshness recorded | Metadata-only reserve sizing exists, not runtime qualification. Freeze the exact eligible peer reasoning/template/mode, close its own source envelope, then four-slot same-artifact largest cases and recovery; no matched peer quality/runtime result exists yet |
 | DeepSeek4 | source-built stock/control | Existing canonical cancellation/long-context receipts may cover their exact source/shape; compact image/cache plans are reusable source proof | Freeze current compatible stock identity; prior 125k growth/cancellation is not its largest source-admitted context case. Complete maximum-context/tool-result and source transition/CPU image/in-flight joins |
-| DeepSeek4 | experiment | `deepseek-new-grammar-n4-20261026T222718Z` normal 28 requests/24 real tools/cleanup; output-head diagnostic separately verified | Largest cases and remaining memory closure, including load/mapped ownership, bootstrap/session/cache growth, anchors/images, direct-head/command retention and frozen policy; no invented global physical cap or history-as-peak substitution |
+| DeepSeek4 | experiment | `deepseek-new-grammar-n4-20261026T222718Z` normal 28 requests/24 real tools/cleanup; output-head diagnostic separately verified | Largest cases and case/phase operating refinement: reviewed coarse source envelope126345754476B includes mapping/grouped inputs/current tiled history/direct-head/growth and the missing32KiB tile-map correction. Physical fit remains unqualified; no invented global cap or history-as-peak substitution |
 | DeepSeek4 | eligible peer | Native GGUF peer source capability is a candidate; absence of a DeepSeek client adapter is not proof the engine is unavailable | Confirm actual artifact/loader/template applicability and eligible mode; build bounded peer stress/receipt adapter, then four-slot largest cases and same-policy recovery. Do not route through Qwen metadata or assume an absent drafter |
 | Gemma4 | source-built stock/control | Fixed20 matched study OFF cohorts: normal N4 quality, tools, exact rendered input comparability and cleanup | Largest-context/tool-result stress and memory record. OFF has its original anchor semantics; no need to demand ON checkpoint proof of OFF |
-| Gemma4 | experiment | Fixed20 ON coding cohorts and family seven-wire replay PASS; bounded component/CPU/real-GGUF controls | `gemma-largest-prompt-n4-20261027T005710Z` **FAILED** 3600s deadline at 239616/253952 in all4 slots. Complete the largest case under a newly frozen prospective plan or implement a source-justified performance fix; preserve failed attempt, no rescore. Largest tool case still missing |
+| Gemma4 | experiment | Fixed20 ON coding cohorts and family seven-wire replay PASS; bounded component/CPU/real-GGUF controls | `gemma-largest-prompt-n4-20261027T005710Z` **FAILED** 3600s deadline at 239616/253952 in all four slots. Complete the largest case under a newly frozen prospective plan or implement a source-justified performance fix; preserve failed attempt, no rescore. Largest tool case still missing |
 | Gemma4 | eligible peer | Native GGUF peer source candidate; no accepted largest four-slot receipt identified | Freeze actual eligible same-artifact source/template/mode and memory envelope, four full contexts and largest context/tool cases; eligibility must be established, not guessed from enum lists |
 
 The d854 reference is not “latest best” merely because it is built. Read-only
@@ -107,6 +107,37 @@ implied. F1 resolves/fixes reference candidates; Q5 can qualify a finite
 source-derived envelope covering those candidates before F2 selection. It need
 not first run a performance selection that itself waits for Q5. A later selected
 mode outside that envelope reopens its affected memory cell.
+
+
+## New scoped Qwen3.6 largest-input result
+
+`qwen36-largest-admitted-prompt-n4-20261027T124629Z` independently passed its
+corrected four-slot largest-admitted input: source
+`2d7599907be92d17736bc205806907589e845306`, public mlx-native 0.15.5, binary SHA256
+`111649ce1b0d635d0a1403f34004667e1ab61757ff203c68c513dcac912488c2`.
+All four requests used exact actual-rendered P=253888, full 8192 allowed output,
+and the existing 64-token admission slack. Two unary/two SSE returned HTTP200,
+stop and exact CAPACITY_i; all four server slots reached253888. Completions
+261/372/467/275 show natural early EOS, not full 8192 decode/highest writes.
+Client exit0 after2674.748s; original77676 artifact entries independently hashed
+with zero mismatches, plus149 post-unload recovery files. Owned groups were
+reaped/empty, listener absent, scoped five-second operating recovery observed.
+
+Minimum sampled operating Free+CachedFiles67.878GiB and peak raw footprint
+37.258GiB stayed inside that packet's guards; these overlapping OS metrics do
+not certify unique physical pages or Metal high-water. Largest tool-result,
+coding E0282 recovery, seven-wire prefix and remaining arm obligations are open.
+The earlier124030 P253952 immediateHTTP400 failure is preserved, not rescored.
+Independent review basenames/digests are recorded in the
+[operating ledger](adr063-q5-selected-profile-operating-ledgers.md).
+
+Q38 `qwen38-largest-admitted-prompt-n4-20261027T150727Z` remains IN PROGRESS;
+no final pass or cleanup is inferred. DeepSeek's finite coarse source envelope
+is not yet an admitted operating packet. Two separate source-reviewed memory
+spikes are UNEXECUTED: omit unused Q8/R>8 output-A input staging (local256MiB
+atR2048/64MiB atR512), and shrink internal gather tile256→64 (admitted widest
+bucket1GiB→256MiB). Neither is a speed/whole-pool/physical-fit claim or a changed
+accepted mode; actual controls and real-model qualification remain pending.
 
 ## Reuse without overclaiming
 
@@ -193,7 +224,7 @@ name its accepted configuration and must not waive those gates.
 
 Root reported a subsequent Qwen3.6 P253952 fixture received four immediate
 HTTP400 capacity refusals (attempt ending124030); it did not prefill or prove
-a memory failure. Its raw evidence remains a failed attempt pending its own
-independent review. Correcting a prospective fixture to the existing P253888
-admission ceiling is not lowering context/output or removing the64-row guard;
+a memory failure. Its raw evidence remains a failed attempt. The separate
+corrected124629 case now has a scoped independent PASS. Correcting that fixture to the existing P253888
+admission ceiling is not lowering context/output or removing the64-token guard;
 it is correcting an invalid harness input. Do not rescore the failed fixture.
