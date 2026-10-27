@@ -70,8 +70,8 @@ pub fn run(
     }
     if trajectory == Trajectory::T2ActualCohort {
         let batches: Vec<&[u32]> = work.lanes.iter().map(|t| &t[..128]).collect();
-        let mut refs: Vec<_> = caches.iter_mut().collect();
         let before = caches.iter().map(|c| c.position()).collect();
+        let mut refs: Vec<_> = caches.iter_mut().collect();
         let states =
             model
                 .forward_verifier_prefill_cohort_with_commit_gate(&batches, &mut refs, || Ok(()))?;
