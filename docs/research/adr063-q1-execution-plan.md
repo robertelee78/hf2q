@@ -1,6 +1,8 @@
 # ADR063 Q1 execution HLD/LLD V2 — diagnostic oracle, design only
 
-2026-10-27. Read-only source/issue audit; no repository edits, tests/build/HF/Metal/models/probes or tracking. Governing ADR063 Q1 and OPEN issue367 read directly. Delivery is merged measured evidence or qualified implementation, not this private proposal. Blocked by F2#357; F2 itself waits F1/Q5. Existing user full-program authorization does not self-approve this downstream design or waive dependency/execution gates. Root may approve this reviewed routine plan inside existing operator full-program authority; no new generic user-permission ceremony is inferred. This author does not approve its own design or waive F2/Q5 execution gates.
+Design approval: [recorded review](https://github.com/robertelee78/hf2q/issues/367#issuecomment-6450297625). Original acceptance, predecessors and delivery gates remain in force; approval does not mark the task complete. The authoring notes below describe preparation history.
+
+2026-10-27. Read-only source/issue audit; no repository edits, tests/build/HF/Metal/models/probes or tracking. Governing ADR063 Q1 and OPEN issue367 read directly. Delivery is merged measured evidence or qualified implementation, not this design document. Blocked by F2#357; F2 itself waits F1/Q5. Existing user full-program authorization does not self-approve this downstream design or waive dependency/execution gates. Root may approve this reviewed routine plan inside existing operator full-program authority; no new generic user-permission ceremony is inferred. This author does not approve its own design or waive F2/Q5 execution gates.
 
 ## Exact contract
 

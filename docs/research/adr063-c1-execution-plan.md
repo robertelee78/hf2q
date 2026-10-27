@@ -1,5 +1,7 @@
 # C1 execution HLD/LLD V1 — exact anchor contract, not C2 implementation
 
+Design approval: [recorded review](https://github.com/robertelee78/hf2q/issues/359#issuecomment-6451204642). Original acceptance, predecessors and delivery gates remain in force; approval does not mark the task complete. The authoring notes below describe preparation history.
+
 Source design by f1-review-agent,2026-10-27. Read full issue[C1#359](https://github.com/robertelee78/hf2q/issues/359), ADR-063 §C1/C2 and ADR-049 current source audit. HFmainb0ecf434 and native85f3846 are parent-reported integrated baselines; final implementation manifest must bind exact clean source. F3#358 Done is a satisfied predecessor; Q5#371 remains open. Design can proceed now; final C1 delivery requires its predecessor and merged independently reviewed contract+boundary regression evidence. No implementation approval is implied, and no builds/tests/probes/metadata/model/HF/GitHub writes or repository edits were performed.
 
 ## HLD and deliberately small delivery

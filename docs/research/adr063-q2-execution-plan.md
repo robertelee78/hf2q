@@ -1,5 +1,7 @@
 # ADR063 Q2 / #368 execution HLD/LLD V3
 
+Design approval: [recorded review](https://github.com/robertelee78/hf2q/issues/368#issuecomment-6450298509). Original acceptance, predecessors and delivery gates remain in force; approval does not mark the task complete. The authoring notes below describe preparation history.
+
 Design only. V1 and V2 remain unchanged. This revision freezes the requested F2-compatible metric, statistics, parser semantics and trace choices; it is not self-approval, a hardware packet or Q2 completion. Source basis: ADR063 Q2 lines417–443, issue368, and the inspected a84e5c7b harness. No imports, tests, builds, HTTP, HF, model, Metal, probes, repository or tracker edits.
 
 ## Observable contract and ownership

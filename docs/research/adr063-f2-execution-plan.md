@@ -1,6 +1,8 @@
 # F2 execution HLD/LLD V3 — design only, blocked on Q5
 
-Author f1-review-agent;2026-10-27. Full issue [F2#357](https://github.com/robertelee78/hf2q/issues/357) read through read-only GitHub query, including all13 acceptance bullets and predecessorF1#356/Q5#371. Governing ADR-063 §F2, not existing small-PR counts, determines closure. This is an unapproved execution design, no campaign approval or claim four original tasks can close today. No builds/tests/HF/Metal/model/probes/repository/tracker/proof changes performed.
+Design approval: [recorded review](https://github.com/robertelee78/hf2q/issues/357#issuecomment-6450296657). Original acceptance, predecessors and delivery gates remain in force; approval does not mark the task complete. The authoring notes below describe preparation history.
+
+Author f1-review-agent;2026-10-27. Full issue [F2#357](https://github.com/robertelee78/hf2q/issues/357) read through read-only GitHub query, including all13 acceptance bullets and predecessorF1#356/Q5#371. Governing ADR-063 §F2, not existing small-PR counts, determines closure. This is a reviewed execution design, no campaign approval or claim four original tasks can close today. No builds/tests/HF/Metal/model/probes/repository/tracker/proof changes performed.
 
 ## HLD: reuse evidence without laundering scope
 
