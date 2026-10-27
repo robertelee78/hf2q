@@ -55,7 +55,7 @@ fn q1_qwen_actual_endpoint_trace() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let gguf = mlx_native::gguf::GgufFile::open(&packet.model).unwrap();
     assert_eq!(
-        gguf.metadata_str("general.architecture"),
+        gguf.metadata_string("general.architecture"),
         Some(match packet.workload.family {
             Family::Qwen38 => "qwen35",
             Family::Qwen36 => "qwen35moe",

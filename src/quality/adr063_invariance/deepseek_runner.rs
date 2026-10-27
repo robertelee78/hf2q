@@ -79,7 +79,7 @@ pub fn run(
                 "native packed cohort extent"
             );
             let per_lane = state.element_count() / 4;
-            for lane in 0..4 {
+            for lane in 0usize..4 {
                 let offset = lane
                     .checked_mul(per_lane)
                     .and_then(|n| n.checked_mul(state.dtype().size_of()))

@@ -128,13 +128,15 @@ pub(crate) fn run_loaded(
         None,
     )?;
     let mut scheduler = InflightBatchedScheduler::new(1, 1);
-    let admitted = scheduler.admit(AdmitRequest {
-        prompt_tokens: 128,
-        max_tokens: 8192,
-        kv_bytes_needed: 0,
-        prompt_kv_bytes: 0,
-        preferred_slot: None,
-    })?;
+    let admitted = scheduler
+        .admit(AdmitRequest {
+            prompt_tokens: 128,
+            max_tokens: 8192,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        })
+        .map_err(|error| anyhow::anyhow!("Q1 admission refused: {error:?}"))?;
     let handle = admitted.handle.context("Q1 slot was queued unexpectedly")?;
     let (send, receive) = oneshot::channel();
     let mut slots = vec![Some((
@@ -338,7 +340,7 @@ fn q1_qwen_actual_engine_cancel_restore_cache() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let gguf = mlx_native::gguf::GgufFile::open(&packet.model).unwrap();
     assert_eq!(
-        gguf.metadata_str("general.architecture"),
+        gguf.metadata_string("general.architecture"),
         Some(match packet.identity.family {
             Family::Qwen38 => "qwen35",
             Family::Qwen36 => "qwen35moe",
