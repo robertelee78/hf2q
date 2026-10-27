@@ -13340,3 +13340,7 @@ mod qwen36_largest_prompt_tests;
 #[cfg(test)]
 #[path = "handlers_capacity_fixture_source_tests.rs"]
 mod capacity_fixture_source_tests;
+
+#[cfg(test)]
+#[path = "handlers_qwen38_largest_prompt_tests.rs"]
+mod qwen38_largest_prompt_tests;
