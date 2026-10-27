@@ -1,13 +1,34 @@
 # Qwen dense shared target forward: HLD and LLD proposal
 
-Status: design for review, 2026-10-26. Source base
-`98fdffa1817fc7c11c1fb9c5a68ab36ef4d2dd1f`. No runtime code, execution,
-performance result, implementation approval, or Ready claim accompanies this note.
+Status: Designing, not approved for implementation. Original proposal dated
+2026-10-26, source base `98fdffa1817fc7c11c1fb9c5a68ab36ef4d2dd1f`.
+The diagnostic evidence update below supplies no runtime implementation,
+implementation approval or Ready claim.
 This proposal addresses issue #363 and [ADR-063](../adr/ADR-063-apple-silicon-four-agent-speed-coherence.md)
 §S3: amortize target weight reads through real physical batching, preserve exact
 ordinary fallback, and compare physical batch-four with independent and
 speculative cohorts. F2 provides the source-bound baseline; Q1 correctness and Q5
 memory remain execution gates. Designing is not implementation approval.
+
+## 2026-10-26 evidence update: first slice not selected
+
+The original ordinary-only candidate below is retained as a historical proposal,
+not implementation authority. The source-bound1,247-table AUTO diagnostic now
+makes that first-candidate selection **not justified for implementation**. Its
+ordinary head-only refinement is specifically not selected: correctly charged
+preceding seq1 heads total52.69ms, giving an optimistic four-lane saving no more
+than0.1145% of represented labeled GPU service. The overall8.42% target-head
+fraction mostly follows temporal multi-row work; the separate MTP shared head is
+17.06%. Dense FFN/GDN dominate the labeled categories.
+
+See the [exact profiling report](adr063-qwen38-gpu-profile-2026-10-26.md) for the
+print-before-head boundary correction, missing final head, unlabeled GPU work,
+profiling-induced synchronization, and absent ordinary-ready4 evidence. The
+head-only bound does not prove a universal limit on whole-body/mixed-cohort
+architectures. A future candidate must measure the already active temporal and
+cross-slot regimes before extending them. No replacement architecture, phase
+advance, throughput claim or implementation approval is introduced. S3 remains
+Designing and the existing F2/Q1/Q5 gates remain open.
 
 ## Observed gap and hypothesis
 
@@ -35,7 +56,8 @@ multi-axis positions, current full-attention cursors, linear-state parity and
 output destination. One model/device/queue/configuration generation is required.
 Do not use token-sequence length as the independent-lane dimension.
 
-First implementation candidate is dense Qwen ordinary one-token target work.
+Historical first implementation candidate (not selected after the evidence update)
+is dense Qwen ordinary one-token target work.
 Pending-output lanes advance using their existing CPU path; history/MTP proposals
 retain their existing target transaction. They cannot be coerced into ordinary
 mode to fill a cohort. A one-lane or unsupported exact capability returns to the
@@ -186,8 +208,10 @@ oracles distinguish recoverable known-lane errors from fail-stop cases.
 
 ## Native capability and routing
 
-Published0.15.4 and proposed0.15.5 census additions do not supply a Qwen cross-slot
-graph. Reuse existing native dense quantized matmul dispatch where its actual
+Current mlx-native0.15.6 is published and pinned; the earlier0.15.4/0.15.5
+version references are historical. Its published allocation/lifetime capabilities
+do not supply an hf2q Qwen cross-slot graph or establish an output-kernel speed
+change. The diagnostic above executed0.15.5, not0.15.6. Reuse existing native dense quantized matmul dispatch where its actual
 layout/dtype/codec contract matches. `mlx-native/src/ops/quantized_matmul_ggml.rs`
 uses `plan_dense_auto_route` from `src/ggml_capability.rs`; MM threshold8 means
 M4 is not automatically a matrix-matrix route. Existing Q5_K canonical routing,
@@ -383,8 +407,9 @@ reply/sampling and scheduling fairness. Native owns dense/expert matmul, attenti
 copy/layout primitives, dispatch capability and device synchronization guarantees.
 Existing native APIs are candidates only after checked dtype/stride/alias/input
 contracts are matched; absent functionality gets a separate native issue, tiny
-oracle, published release and clean HF pin. The0.15.5 pool snapshot is observation
-only and adds no shared-target primitive.
+oracle, published release and clean HF pin. The historical0.15.5 pool snapshot is observation
+only; current0.15.6 capabilities do not by themselves qualify a shared-target
+graph or whole-serving physical-memory admission.
 
 Before implementation selection, produce one compact per-family disposition
 record: actual selected row histogram/cost; existing entrypoint; missing assembly
