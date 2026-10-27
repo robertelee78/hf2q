@@ -264,6 +264,25 @@ impl EngineSupervisor {
         result
     }
 
+    /// Deterministic deadline controls use the real lease/expiry state machine,
+    /// without sleeping or racing the background monitor.
+    #[cfg(test)]
+    pub(super) fn without_monitor_for_test() -> Self {
+        Self::new_with_monitor_start(|_| Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn elapse_armed_for_test(&self, elapsed: Duration) {
+        let mut armed = self.inner.armed.lock().expect("supervisor lock");
+        let transaction = armed.as_mut().expect("armed transaction");
+        transaction.deadline = transaction
+            .deadline
+            .checked_sub(elapsed)
+            .expect("test deadline subtraction");
+        drop(armed);
+        self.inner.expire_if_due(Instant::now());
+    }
+
     #[cfg(test)]
     pub(super) fn force_expire_for_test(&self) {
         let mut armed = self.inner.armed.lock().expect("supervisor lock");
