@@ -88,7 +88,7 @@ require an affected-cell delta review, not relabeling old observations.
 | Family | Arm | Existing reusable evidence | Exact unresolved qualification |
 | --- | --- | --- | --- |
 | Qwen3.8 | source-built stock/control | Fixed20 pool study OFF cohorts, normal four-agent real coding/tool/cleanup receipts; exact source/config retained | Final stock identity; largest-context and largest-tool-result stress plus closed source/telemetry joins, or independently justified coverage by an identical/dominating accepted configuration |
-| Qwen3.8 | experiment | Pool ON coding cohorts; `qwen38-worker-census-20261026T141046Z` and `qwen38-n4-decode-profile-cb-20261026T233932Z` establish normal N4/tools, actual worker pool census and cleanup; new largest-admitted attempt150727 is IN PROGRESS, not PASS | Same largest cases; census excludes cache/direct/other TLS/physical high-water, so whole-process source union and missing telemetry still need joining; synchronous profile is diagnostic only |
+| Qwen3.8 | experiment | Pool ON coding cohorts; `qwen38-worker-census-20261026T141046Z` and `qwen38-n4-decode-profile-cb-20261026T233932Z` establish normal N4/tools, actual worker pool census and cleanup; largest-admitted attempt150727 FAILED the internal 30-second prefill lease near 217k–221k tokens, with normal memory pressure | Same largest cases; census excludes cache/direct/other TLS/physical high-water, so whole-process source union and missing telemetry still need joining; synchronous profile is diagnostic only |
 | Qwen3.8 | eligible peer | Existing source/build/hash-bound d854 GGUF peer and explicit Qwen adapter; no full accepted memory stress identified | Freeze eligible reference source/mode and dynamic-library identities; full four-context load/readiness, largest context/tool result, same resource policy/recovery and independent budget review |
 | Qwen3.6 | source-built stock/control | `qwen36-largest-admitted-prompt-n4-20261027T124629Z` independently PASSED all four P253888/full 8192-allowance requests and scoped unload recovery; older173831 coding E0282 remains FAILED | Largest-admitted input exposure is scoped PASS, not highest-index8192 writes, coding quality, tool-maximum or every-arm proof. Finish largest-tool-result, applicable decode/growth boundary/source joins and final stock identity; retain original124030 HTTP400 failure |
 | Qwen3.6 | experiment | Shared Qwen source plans and pool mechanisms, model-specific source geometry; normal run above is partial failure | Freeze actual experimental configuration (may share control bytes if no memory delta), qualify its largest cases and source/telemetry union; do not substitute dense-Q38 dimensions |
@@ -131,13 +131,18 @@ The earlier124030 P253952 immediateHTTP400 failure is preserved, not rescored.
 Independent review basenames/digests are recorded in the
 [operating ledger](adr063-q5-selected-profile-operating-ledgers.md).
 
-Q38 `qwen38-largest-admitted-prompt-n4-20261027T150727Z` remains IN PROGRESS;
-no final pass or cleanup is inferred. DeepSeek's finite coarse source envelope
-is not yet an admitted operating packet. Two separate source-reviewed memory
-spikes are UNEXECUTED: omit unused Q8/R>8 output-A input staging (local256MiB
+Q38 `qwen38-largest-admitted-prompt-n4-20261027T150727Z` FAILED the internal
+30-second bounded-prefill lease at epoch429. Last completed cursors were
+221184/219136/217088/217088; normal pressure and 46.346 GiB minimum operating
+available memory do not establish whether work was slow or the GPU hung.
+Owned process groups were reaped and post-unload operating recovery passed;
+the engine worker itself did not join gracefully. The proposed separate
+120-second prefill lease is not a demonstrated fix until a new run completes.
+DeepSeek's coarse source envelope remains unqualified. Two separate memory
+spikes have now passed five pure controls and two actual Metal tests (nine cases): omit unused Q8/R>8 output-A input staging (local256MiB
 atR2048/64MiB atR512), and shrink internal gather tile256→64 (admitted widest
 bucket1GiB→256MiB). Neither is a speed/whole-pool/physical-fit claim or a changed
-accepted mode; actual controls and real-model qualification remain pending.
+accepted mode; combined real-model qualification remains pending.
 
 ## Reuse without overclaiming
 

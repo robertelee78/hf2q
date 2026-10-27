@@ -263,8 +263,12 @@ Observed competition, pressure, footprint and reaction guards remain applicable.
 The104GiB floor is prospective. Independent source review accepted the scoped
 owner/arithmetic delta; actual qualification remains pending. This source record
 does not validate earlier90/96GiB launches or itself authorize a new run. The N1 proposal cannot substitute for this N4 packet. The new
-`qwen38-largest-admitted-prompt-n4-20261027T150727Z` attempt is IN PROGRESS,
-not PASS; it has no final quality/cleanup verdict yet. Actual stress,
+`qwen38-largest-admitted-prompt-n4-20261027T150727Z` attempt FAILED the internal 30-second prefill lease at epoch429, after
+221184/219136/217088/217088 committed tokens. Pressure stayed normal and
+minimum operating available memory was 46.346 GiB. Owned groups/listener
+cleanup and post-unload operating recovery passed; the worker join failed.
+Slow work versus a GPU hang remains unknown. A proposed 120-second prefill
+lease has no new real-model result yet. Actual stress,
 cleanup and comparator acceptance remain open; the pool experiment's measured
 <5%win remains a [negative acceptance result](adr063-qwen38-pool-ablation-negative-result.md).
 
@@ -354,21 +358,23 @@ Positive G and the finite case's stop/recovery policy must cover this boundary.
 Existing [grammar/N4 evidence](adr063-deepseek-compact-dsml-grammar-2026-10-26.md)
 remains quality/prefix/cleanup evidence, not largest-context or physical-fit proof.
 
-Two separate **source-reviewed, unexecuted** memory spikes are proposed:
+Two separate **source-reviewed, locally validated** memory spikes are proposed:
 
 - Rank A omits only unused group-major output-A input on the existing actual
   Q8_0/R>native MM threshold8 strided route. Local requested saving268435456B
   atR2048 or67108864B atR512; fallback allocation/permutation remains. No native
   kernel, arithmetic, grouping or command-boundary change. Three pure controls
-  and one tiny old-Some/new-None actual control are authored, not executed.
+  and one tiny old-Some/new-None actual control passed, including the small-row fallback.
 - Rank B changes internal gathered-query scratch tile256→64 through the same
   adapter/kernels. At admitted ratio128 width2112/D512 gathered requested bytes
   change553648128→138412032, rounding1GiB→256MiB; width640 changes160→40MiB.
   More tile dispatches may cost latency. Two pure controls and one seven-case
-  ragged/offset/validity/BF16 control are authored, not executed.
+  ragged/offset/validity/BF16 control passed.
 
 Neither local saving is measured whole-pool/physical reduction, a speed win,
-a fit guarantee or acceptance/default promotion. Actual compile/controls/model
+a fit guarantee or acceptance/default promotion. Locked compilation and all five
+pure controls passed. Two bounded Metal tests completed nine old/new cases with
+exact bits, validity flags and guards; process cleanup passed. Combined model
 quality/stress/performance remain pending; no historical evidence is rescored.
 HF owns transaction/worker/ledger policy; kernels/resource factories remain in
 mlx-native. Changed execution packets require exact published pins and clean
@@ -380,7 +386,7 @@ Q36 stock61.451GiB and selected-pool75.451GiB, and Gemma95.531978GiB, are
 reviewable explained **operating** totals with positive declared overhead/reaction
 allowances. They are not synthetic admission results or physical-fit proof.
 Q38 has an independently reviewed102.774946805GiB source operating candidate
-and104GiB available floor, with its largest case still running. DS has the finite
+and104GiB available floor; its largest case failed the internal worker deadline. DS has the finite
 117.668653350GiB coarse source envelope above; its case/phase/allowance refinement
 and physical-fit disposition remain open. Available-RAM thresholds cannot replace
 those joins. Finish the named gaps,
@@ -414,3 +420,5 @@ unchanged. The checked-in reports linked above carry public execution scope.
 | `adr063-q5-deepseek-finite-joins-independent-review.md` | `0f1460b7fc5a7f7d2224eb060d7df4765969c85f438e271612ccc64c97305aa2` |
 | `adr063-deepseek-q8-output-a-staging-independent-source-review-v1.md` | `a4d501bfb8701be02b6fb1c9cacd9fa86f80f0ec832d9736f5efe2987962d2da` |
 | `adr063-deepseek-smaller-gather-tile-independent-source-review-v1.md` | `72851700fbb2f9a104a388839066541f0aa0bb07de3c27ff49debf1a99c9fe3d` |
+| `adr063-qwen38-largest-admitted-prompt-failure-independent-review-v1.md` | `0bd25dcffa0d5973bb04140e43ae34d3bba373f070999a6d35a9cad7110851de` |
+| `adr063-deepseek-memory-spikes-actual-independent-review-v1.md` | `6fb69228b05141a39683378710dc3eb08b711a68b5bbe48d9f417c84e6583f9d` |
