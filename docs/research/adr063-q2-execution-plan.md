@@ -1,0 +1,87 @@
+# ADR063 Q2 / #368 execution HLD/LLD V3
+
+Design approval: [recorded review](https://github.com/robertelee78/hf2q/issues/368#issuecomment-6450298509). Original acceptance, predecessors and delivery gates remain in force; approval does not mark the task complete. The authoring notes below describe preparation history.
+
+Design only. V1 and V2 remain unchanged. This revision freezes the requested F2-compatible metric, statistics, parser semantics and trace choices; it is not self-approval, a hardware packet or Q2 completion. Source basis: ADR063 Q2 lines417–443, issue368, and the inspected a84e5c7b harness. No imports, tests, builds, HTTP, HF, model, Metal, probes, repository or tracker edits.
+
+## Observable contract and ownership
+
+Q2 independently certifies that the actual comparison harness rejects false quality/speed wins and proves real slot progress. Required failures remain serialized four-client service, role-only/missing semantic output, wrong tool arguments, stale lineage/cross-slot leakage, truncation/budget changes, incorrect timing/cache/identity/scoring and unverified cleanup. Active/runnable phase counts and actual physical operation membership must distinguish N1,3+1,2+2,1+3,pure four-prefill and four-decode. HTTP lifetime overlap is insufficient.
+
+Independent QE owns certification. HF owns clients, task oracles, scheduler/phase publication, receipts and analysis. Native owns family-neutral dispatch mechanisms; reuse published APIs and receipts, and publish/pin any genuinely missing primitive separately. No native rewrite or new kernel is presumed necessary. Agentic-QE or equivalent named independent QE evidence is acceptable; no Ruflo is used.
+
+Root may approve another agent's reviewed routine implementation/design within the operator-approved program. This does not require an automatic new user permission flow. The author cannot self-approve or substitute its own test count for independent acceptance. F2 is Q2's story predecessor; Q1 state/numerical and Q5 applicable execution bounds remain required inputs. Root retains tracking and execution ownership.
+
+## Fixed comparison and statistics contract
+
+The primary metric is **own-output four-successful-task makespan**, measured from the first declared cohort request release to completion of all four actual task results. It includes the actual tool/compiler work in that interval; loading, fixed warmup, reset/priming and cooldown are reported separately. A missing or incorrect task makes the comparison **ineligible**, not a fast partial success, zero-duration sample or a denominator adjustment. All failed attempts remain retained. Canonical replay is a distinct secondary matched-input timing/fairness lane and cannot claim natural reuse or own-output coding quality.
+
+Three arms are A=stock current HF, B=experiment from that exact baseline, C=latest valid-best peer. Freeze source, binaries, artifacts, family settings and candidate subset before evaluation. Missing/failed peer cannot produce a victory. Different own-output token streams are expected; their task-matched makespan is not token-matched throughput evidence. Secondary replay must prove exact rendered inputs, declared cache priming/reset and charged costs.
+
+Use exactly six independent paired blocks, with orders ABC,BCA,CAB,CBA,BAC,ACB. Each arm appears once in each block and twice in each position. No additional mandatory twenty-block campaign: six satisfies ADR minimum5/maximum20. No optional stopping, favorable subset, replacement block or extension within this campaign.
+
+For each block form paired log-makespan effects log(B/A) and log(B/C). For each contrast compute the mean log effect, sample standard deviation over the six block effects, and nominal two-sided95% Student-t interval with df5. Exponentiate interval endpoints, convert to percentage reduction and report half-width in percentage points. The fixed precision target is <=2.5pp; a miss is Inconclusive, not faster. Report both contrasts separately with nominal pointwise coverage; no simultaneous-coverage claim or fastest-arm selection. Cluster at independent block/run/conversation level, never individual generated tokens. A fixed known-data calculator control independently verifies direction, units, t5 interval, transformation and clustering.
+
+Any quality, provenance, guard, cleanup or comparability failure makes the fixed comparison ineligible; publish its raw trial, failure and pending later cases. Do not discard it to recover six successful blocks. A new prospective design/pilot gets a separate immutable ID; historical failures are not rescored. The existing Gemma fixed-seed block-bootstrap component result remains historical component evidence. It is not a validated implementation of this new paired-t primary metric, nor an all-family/peer win.
+
+## Preserve the actual semantic SSE policy
+
+The production parser in qwen38_n1_verdict.py:192–216 declares semantic progress for nonempty content OR nonempty tool function **name OR arguments**. Role-only and reasoning-only frames are not semantic. Preserve this exact behavior; do not change the parser to exclude a tool-name frame merely to make a test pass.
+
+A fake name-only event must therefore timestamp semantic TTFT at that event under the existing policy. It still cannot pass task/tool quality without complete valid arguments, ID, finish, usage and actual authorized tool execution. Missing/bad arguments or incomplete final tool response cause quality failure and make the comparison ineligible, regardless of its early semantic timestamp. This keeps the timing definition separate from semantic correctness. Record first-frame and first-reasoning times separately; unary responses have completion latency, not invented streaming TTFT.
+
+The explicit `hf2q.f2.semantic-timing.v3` metric schema uses the same accepted semantic-event predicate and preserves every monotonic event timestamp plus the validated completion boundary. `semantic_ttft_seconds` is send-to-first-semantic progress. `semantic_gap_inter_events_seconds` is the maximum interval between semantic events, null with an explicit NotApplicable disposition when fewer than two exist. `semantic_gap_end_to_end_seconds` is the maximum over send-to-first, all inter-semantic intervals and last-semantic-to-validated-completion, matching the selected F2 definition; retain `semantic_terminal_gap_seconds` separately. A stream with no semantic event fails, and role/reasoning chatter cannot reset these clocks. Every new receipt binds this V3 metric-schema definition. Historical raw metrics retain their original labels, definitions and qualification scope: they are not retrospectively redefined or rescored by V3. Independent certification must check all three boundary classes and distinguish the explicitly named inter-only metric from total semantic silence.
+
+## Bounded real trace contract
+
+Use at most **256MiB checked metadata** for each declared trace packet. This is a metadata allocation/recording cap, not a process physical bound or permission to omit records. Charge its live ownership and file-I/O effects in the Q5 operating profile. Check record count/byte products and admission before growing/appending; overflow or exhaustion is a trace failure, never truncation, overwrite, sampled omission or successful fallback. No tensor/activation payloads are captured.
+
+Publish from actual production scheduler, forward-submit and checked-drain seams, not a duplicate model in Python:
+
+- Scheduler events: sequence, monotonic time, run/source/model/process identity, request/conversation, slot ID+generation, phase, active/runnable state and blocked reason, committed/pending input bounds.
+- Forward events: operation/submission ID, actual ordered rowmap of slot/request/generation/phase/logical position, physical row count and native operation/shape or existing dispatch receipt reference.
+- Completion events: the matching submit ID, checked completion/failure, publication/progress bounds and ownership state. Do not call an encoded or merely inflight operation completed.
+
+Emit/queued, runnable, forward-selected, inflight, completed and blocked are distinct. Tool wait is not runnable decode. Temporal speculative rows for one slot are not four independent lanes. Known singleton physical rowmaps are VALID observations; neither F2 nor Q2 forces quad batching. Unknown physical membership, missing lineage, unmatched submit/drain, missing sequence or trace overflow fails the relevant certification criterion. Four runnable lanes plus known singleton kernels may qualify truthful membership measurement; one active conversation with three queued HTTP requests fails four-slot concurrency.
+
+The implementation LLD must identify the exact existing scheduler/submit/drain functions per family and bind source hashes. Reuse native encoded-dispatch receipts for shape identity rather than an unbounded all-kernel log. Peer trace fields require an explicit source/capability disposition: missing fields are Unknown, genuinely unused features can be NotApplicable with proof, neither is zero. Instrumentation policy/overhead must be frozen across comparable arms. No unmodified-latest-peer identity may be silently assigned to a patched runtime.
+
+## Frozen phase qualification window
+
+For each declared target population N1,3+1,2+2,1+3,4-prefill or4-decode:
+
+1. Start the scenario clock at the frozen arrival release. Observe actual scheduler events for at most30seconds.
+2. Use the **first** event establishing the intended admitted/runnable population, not the best later interval. Its fixed window is the following2seconds and must fit wholly within the30second observation period. No search for a later favorable window if the first fails.
+3. Time-weight actual population over all adjacent trace intervals. At least80% of that2second window must have the intended runnable phase composition. Unknown/uncovered intervals are not credited.
+4. Every admitted slot must make actual source-defined progress in that window: a new forward submission covering its own logical work, or a monotonically advanced committed cursor/output event. A submitted operation must eventually have a matching checked completion/publication before the case can qualify; that completion may occur after the2second measurement window. This does not introduce a2second GPU transaction deadline. A mere phase label, repeated inflight heartbeat, HTTP role event or queued status is not progress. Report selected/inflight/blocked durations separately.
+5. Retain actual physical rowmaps, including known singletons. Missing lineage/membership or a non-progressing admitted slot fails. Report time outside the intended mix and every failed case; do not alter arrival offsets/workload after observing failure.
+
+This rule may expose a family whose legitimate transaction latency exceeds the window or whose scheduler serializes progress. That is measured failure/inconclusive evidence, not permission to manufacture progress, reduce workload or waive the gate. Any prospective change to the qualification rule requires a new reviewed design; the selected V3 rule is not tuned after a failed attempt.
+
+## Reuse inventory and minimum new controls
+
+Reuse exact source-bound existing wire/family/sampling/tool/usage validators, sandbox/owned cleanup, real Rust compiler and positive test counts, model/binary/native identity validator, immutable raw responses and family-specific post-prefix helpers. Reported193 Python and16 capacity controls are component evidence, not an aggregate Q2 certificate. Bind actual functions/filter/count/log/source SHA before reuse. Existing actual capture may be reused if client executable/version/profile/settings remain identical; recapture only changed/unbound clients. Capacity token exports do not replace seven-wire quality or Q1 cache-state proof. DeepSeek live/recovery cached>P0 is legitimate in its family scope; do not introduce a universal P0 LCP guard.
+
+Add only these decisive integration groups, invoking the ACTUAL production parser, request builder, tool scorer, identity verifier, trace publisher/validator and analysis entry points:
+
+**A. Socket/timer controls.** A bounded loopback fake server—not a production inference fallback—emits known role/reasoning/name/argument/content timing and fragmented UTF8/SSE. Test known delay direction and unit conversion against independently retained server-event brackets. Name-only timestamps must follow existing policy but fail final quality without valid arguments. Role-only, missing semantic output, missing finish/DONE/usage and late response fail. No controller imports may launch processes on import.
+
+**B. Tool/identity/lineage corruptions.** Wrong name/path/target/arguments; forged “passed” text; valid exit0 with zero tests; changed read-only tests; unchanged broken patch; missing response; duplicate tool ID; cross-agent response/slot generation; stale model/template/tokenizer/native/binary binding; altered8192 allowance/context/overflow; stripped reasoning or whole tool result. Mutate one copied raw artifact and call the real verifier CLI. Include legitimate DS live/recovery cache accounting as a positive control. No mirrored parser or pre-filled pass booleans.
+
+**C. Actual trace population controls.** Known positive traces through real publication seams for each population and a known singleton physical operation. Reject serialized one-active-three-queued service despite four open HTTPs; stale/swapped generation, duplicate physical row, omitted progress/drain, phase mislabel, discontinuous sequence, Unknown membership and256MiB+1 overflow. Fake traces prove validator rejection only; named independent QE must compare at least the required actual server trace cases to real raw requests/submissions before certification.
+
+**D. Cleanup and stop integration.** Reuse existing metrics/ps failure, escaped PID identity, PID reuse and owned PG controls. Add a bounded actual owned child/loopback timeout or interruption case through the real controller path: marker-then-hang, unavailable metrics, child exit without cleanup, retained listener. TERM/KILL/reap must not depend on successful ps. Failure/Unknown cleanup prevents next engine; no arbitrary process signal. Raw failure receipts written before scoring, later cases Pending. Strict-invalid observer retries never retry a valid unfavorable reading.
+
+**E. Fixed analysis and selection controls.** Independent known makespans for null,10% gain and10% loss; six-block all-order labels; arm/unit/sign corruption; duplicate/missing block; NaN/Inf/zero; within-conversation replicated tokens must not narrow CI; failed quality/peer; unequal source/settings; late token-vector mismatch in replay; precision miss. Recompute paired-t df5 nominal95% interval independently. The actual analyzer must use all six eligible planned blocks or mark the comparison ineligible, never select good blocks, resize the plan or classify a missing peer as victory.
+
+Keep model-free pure artifact tests distinct from explicit fake-server/tool-process controls. No fake compiler success or production model response is used as correctness evidence. Suggested existing command after root approval is `python3 -m unittest discover -s scripts/four_agent -p 'test_*.py'`, with the actual new integration filters separately named. This is not an executed command or a promise that all existing tests are pure.
+
+## Independent certification and closure
+
+A separate named QE session reviews the approved implementation and executes the frozen controls. It signs a coverage matrix for every acceptance bullet with source/command/binary/artifact/run identity and PASS/FAIL/Inconclusive/Pending. It then checks required actual F2 family/engine trace artifacts and raw coding/tool/scoring/cleanup joins; existing receipts are reusable only with exact schema/source/profile and complete trace evidence. Missing peer adapters fail closed and remain missing, not a win.
+
+Q2 certification of these diagnostic oracles does **not** require a new full six-block four-family speed study. That measured scoreboard belongs to F2/Q3. It does require independent real-artifact trace verification: deterministic fake-server tests alone cannot prove real cohort publication. Do not retroactively certify earlier candidates or replace Q1 state/numerical proof with text token equality.
+
+The smallest source slice is the bounded trace seams/validator, client semantic-event timestamp capture, actual entry-point adversarial controls and fixed six-block analyzer/ledger. Existing oracles and process wrappers stay in use. Root may approve another agent's independently reviewed design to implement this within the existing program; no automatic user confirmation is needed. Model execution remains a separately concrete source-bound root packet after relevant Q5/F1/Q1 prerequisites and serialization.
+
+Q2 closes only after all required negative/positive controls, independent coverage review, required real trace joins and the frozen harness/evidence are merged. PR/test counts, one successful N4 coding gate, a capacity result or component speed win cannot substitute. Estimated source/control work is a few focused hours if F2 trace seams are already decided; actual family trace gaps may dominate and cannot be honestly promised closed today. No phase, issue, source proof or hardware state was changed by this design revision.
