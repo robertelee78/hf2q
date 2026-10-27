@@ -80,6 +80,12 @@ def approval(args):
         source_paths += [Path(__file__).with_name(n) for n in
                          ("qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py",
                           "qwen_n4_peer.py", "test_qwen_n4_peer.py")]
+    if getattr(args, "benchmark_profile", None) is not None:
+        from gemma_matched_profile import EXTRA_MODULES, validate_activation
+        validate_activation(args.benchmark_profile, packet, args.family, args.engine_kind, args.diagnostic_slots)
+        source_paths += [Path(__file__).with_name(n) for n in EXTRA_MODULES]
+    else:
+        require(packet.get("benchmark_profile") is None, "benchmark approval requires explicit CLI opt-in")
     require(packet.get("sources") == {p.name: child.digest(p) for p in source_paths}, "client source drift")
     require(packet.get("approved") is True, "explicit internal operating approval absent")
     proof = child.validate_proof(args.sandbox_proof, args.sandbox_proof_sha256)
@@ -217,6 +223,7 @@ def main():
         parser.add_argument("--" + name)
     parser.add_argument("--family", choices=family_contract.FAMILIES, default="qwen")
     parser.add_argument("--engine-kind", choices=("hf2q", "peer"), default="hf2q")
+    parser.add_argument("--benchmark-profile", choices=("gemma-matched-v1",))
     args = parser.parse_args()
     family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
     os.umask(0o077)
@@ -261,7 +268,12 @@ def main():
         schemas = initial["tools"]
         for tool in schemas:
             tool["function"]["strict"] = False
-        tools = Tools(output / "tools", args.cargo, args.sandbox_exec, packet["sdk_root"])
+        tool_class = Tools
+        if args.benchmark_profile is not None:
+            from gemma_matched_profile import BenchmarkTools
+            tool_class = BenchmarkTools
+            summary["benchmark_profile"] = args.benchmark_profile
+        tools = tool_class(output / "tools", args.cargo, args.sandbox_exec, packet["sdk_root"])
         seen = set()
         if n4:
             from qwen_n4_live_smoke import wait_barrier

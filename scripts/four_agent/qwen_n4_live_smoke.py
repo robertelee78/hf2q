@@ -186,6 +186,7 @@ def main():
     parser.add_argument("--server-pid", type=int, required=True)
     parser.add_argument("--family", choices=family_contract.FAMILIES, default="qwen")
     parser.add_argument("--engine-kind", choices=("hf2q", "peer"), default="hf2q")
+    parser.add_argument("--benchmark-profile", choices=("gemma-matched-v1",))
     args = parser.parse_args()
     family_contract.validate_selection(args.family, args.engine_kind, 4)
     from qwen38_n1_smoke import new_output, PREFLIGHT
@@ -214,6 +215,16 @@ def main():
                 and packet.get("model") == args.model, "single server binding")
         module_dir = Path(__file__).resolve().parent
         names = MODULES
+        if args.benchmark_profile is not None:
+            from gemma_matched_profile import EXTRA_MODULES, validate_activation
+            validate_activation(args.benchmark_profile, packet, args.family, args.engine_kind, 4)
+            validate_activation(args.benchmark_profile, packet.get("agent_template", {}), args.family, args.engine_kind, 4)
+            names += EXTRA_MODULES
+            summary["benchmark_profile"] = args.benchmark_profile
+        else:
+            require(packet.get("benchmark_profile") is None and
+                    packet.get("agent_template", {}).get("benchmark_profile") is None,
+                    "benchmark approval requires explicit CLI opt-in")
         sources = {name: child.digest(module_dir / name) for name in names}
         require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
         summary["engine_kind"] = args.engine_kind
@@ -250,6 +261,8 @@ def main():
             command += ["--output", str(path), "--approval", str(approval_path), "--approval-sha256",
                         child.digest(approval_path), "--diagnostic-slots", "4", "--family", args.family, "--engine-kind", args.engine_kind, "--agent-id", agent,
                         "--run-id", run, "--barrier-dir", str(barrier), "--barrier-token", token]
+            if args.benchmark_profile is not None:
+                command += ["--benchmark-profile", args.benchmark_profile]
             stdout, stderr = [(output / f"{agent}.{name}").open("xb") for name in ("stdout", "stderr")]
             streams += [stdout, stderr]
             require(not INTERRUPTED, "interrupted immediately before child launch")
@@ -308,6 +321,12 @@ def main():
         summary.update(agents=results, exits=exits, client_cleanup=receipts,
                        cleanup=len(cleanup) == 4 and all(cleanup.values()),
                        elapsed_seconds=time.monotonic() - started)
+        if args.benchmark_profile is not None and summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview":
+            try:
+                from gemma_matched_stats import cohort_score
+                summary["benchmark_metrics"] = cohort_score(results)
+            except BaseException as exc:
+                summary["status"], summary["error"] = "Failed", str(exc)
         (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview" else 1
 
