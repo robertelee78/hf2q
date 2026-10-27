@@ -1,5 +1,13 @@
 # Gemma matched speed-study client profile (source stage)
 
+Execution update, 2026-10-26: the fixed 20-cohort component study completed and
+passed independent review. See the [recorded result](adr063-gemma-matched-study-result-2026-10-26.md)
+for exact executed identities and scope. The source-stage discussion below
+preserves the prospective design; its pending author-only validation statements
+are historical. Current integration passed all 186 client controls, six neutral
+exporter controls, the locked all-target/all-feature check, and the full binary
+suite (5,425 passed, zero failed, 79 ignored).
+
 Governing contracts: [ADR-063](../adr/ADR-063-apple-silicon-four-agent-speed-coherence.md)
 and the experimental Gemma checkpoint section of [ADR-040](../adr/ADR-040-continuous-batching-reopen.md).
 

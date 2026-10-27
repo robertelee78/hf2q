@@ -1,5 +1,12 @@
 # Gemma matched study: neutral export and controller boundary (source proposal)
 
+Execution update, 2026-10-26: the reviewed bindings were completed, the sole-runtime
+fixed20 sequence and all 60 post-unload jobs passed, and independent review
+accepted the scoped component result. See the [result and reproduction command](adr063-gemma-matched-study-result-2026-10-26.md).
+The preparation stages below remain the source history, not additional pending
+execution requirements. Final peer, full memory acceptance and default promotion
+remain open.
+
 This is the next source-only boundary, not authority to load a model or execute
 a twenty-cohort study. The matched profile and statistics stay explicit opt-in;
 canonical client defaults and the strict generic/familyV2 prefix oracles are
