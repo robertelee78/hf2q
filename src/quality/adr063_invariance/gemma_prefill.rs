@@ -7,12 +7,22 @@ use super::{
 };
 use anyhow::{ensure, Result};
 use mlx_native::MlxBuffer;
+pub(crate) fn require_checked_terminal(active: bool, checked: bool) -> Result<()> {
+    ensure!(
+        !active || checked,
+        "Gemma Q1 capture refused: this branch did not return from a checked layer terminal"
+    );
+    Ok(())
+}
 pub fn after_layer(
+    checked_terminal: bool,
     position: usize,
     layer: usize,
     buffers: &[(Stage, &MlxBuffer, Vec<usize>)],
 ) -> Result<()> {
-    if !family::enabled(Family::Gemma4) {
+    let active = family::enabled(Family::Gemma4);
+    require_checked_terminal(active, checked_terminal)?;
+    if !active {
         return Ok(());
     }
     for (stage, buffer, shape) in buffers {
@@ -36,4 +46,15 @@ pub fn after_layer(
             .map_err(anyhow::Error::msg)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_controls {
+    use super::*;
+    #[test]
+    fn q1_gemma_prefill_capture_requires_owning_checked_terminal() {
+        assert!(require_checked_terminal(true, true).is_ok());
+        assert!(require_checked_terminal(true, false).is_err());
+        assert!(require_checked_terminal(false, false).is_ok());
+    }
 }

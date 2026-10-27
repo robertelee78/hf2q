@@ -264,6 +264,7 @@ fn q1_cancel_hook_cleanup_removes_unfired_action() {
 #[serde(deny_unknown_fields)]
 struct Packet {
     execution_approved: bool,
+    acquisition: crate::adr063_invariance::acquisition::Binding,
     model: PathBuf,
     output: PathBuf,
     identity: crate::adr063_invariance::receipt::Identity,
@@ -332,13 +333,22 @@ fn q1_qwen_actual_engine_cancel_restore_cache() {
         &after_root,
         packet.identity.clone(),
         "T6ActualEngineRecovered64".into(),
-        packet.expected_cache,
+        packet.expected_cache.clone(),
         packet.host_payload_limit,
         records,
     )
     .unwrap();
+    let acquisition_scope = crate::adr063_invariance::acquisition::Scope::begin(
+        &packet.acquisition,
+        &packet.identity,
+        &packet.workload,
+        &packet.model,
+        &packet.output,
+        &raw,
+    )
+    .unwrap();
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let gguf = mlx_native::gguf::GgufFile::open(&packet.model).unwrap();
+    let gguf = crate::adr063_invariance::acquisition::open_model(&packet.model).unwrap();
     assert_eq!(
         gguf.metadata_string("general.architecture"),
         Some(match packet.identity.family {
@@ -347,6 +357,22 @@ fn q1_qwen_actual_engine_cancel_restore_cache() {
             _ => unreachable!(),
         })
     );
+    let mut header_cfg = crate::inference::models::qwen35::Qwen35Config::from_gguf(&gguf).unwrap();
+    header_cfg.max_position_embeddings = packet.configured_context;
+    acquisition_scope
+        .check_config(
+            &packet.identity,
+            &crate::adr063_invariance::acquisition::ConfigRecipe {
+                family: packet.identity.family,
+                capacity: packet.configured_context as u64,
+                slots: 1,
+                output_allowance: 8192,
+                cache_mode: "QwenTQ8",
+                route: "owning-engine-cancel64",
+                actual_model_config_sha256: hash(format!("{:?}", &header_cfg).as_bytes()),
+            },
+        )
+        .unwrap();
     drop(gguf);
     let opts = LoadOptions {
         model_path: packet.model,
@@ -363,7 +389,53 @@ fn q1_qwen_actual_engine_cancel_restore_cache() {
     let LoadedModel::Qwen35(mut model) = loaded else {
         panic!("Qwen family fallback refused")
     };
+    acquisition_scope
+        .check_config(
+            &packet.identity,
+            &crate::adr063_invariance::acquisition::ConfigRecipe {
+                family: packet.identity.family,
+                capacity: packet.configured_context as u64,
+                slots: 1,
+                output_allowance: 8192,
+                cache_mode: "QwenTQ8",
+                route: "owning-engine-cancel64",
+                actual_model_config_sha256: hash(format!("{:?}", &model.model.cfg).as_bytes()),
+            },
+        )
+        .unwrap();
+    let mut canonical_cache = Vec::new();
+    for lane in 0..4 {
+        canonical_cache.extend(
+            qwen_cache::manifest(
+                &model.model.cfg,
+                packet.configured_context,
+                &format!("agent-{lane}"),
+                64,
+                0,
+            )
+            .unwrap(),
+        );
+    }
+    assert_eq!(
+        packet.expected_cache, canonical_cache,
+        "every active checkpoint cache role is mandatory"
+    );
     model.model.ensure_gpu_cache_primed().unwrap();
+    let observed = model
+        .model
+        .with_gpu_cache_mut(|device, _| {
+            acquisition_scope.observed(device, &model as *const _ as usize as u64, 3)
+        })
+        .unwrap();
+    let mut before_observed = observed.clone();
+    before_observed.output_root = before_root.clone();
+    let mut after_observed = observed;
+    after_observed.output_root = after_root.clone();
+    // Two checkpoints from ONE acquisition: exact recovery comparison is a
+    // within-run state check, never cross-trajectory model qualification.
+    before.bind_acquisition(before_observed).unwrap();
+    after.bind_acquisition(after_observed).unwrap();
+
     model.provision_multi_seq_kv_for_slot_aware(1).unwrap();
     let layers = model.model.cfg.num_hidden_layers;
     let mut receipts = Vec::new();
@@ -408,6 +480,7 @@ fn q1_qwen_actual_engine_cancel_restore_cache() {
             .reset_for_slot(SlotId(0))
             .unwrap();
     }
+    acquisition_scope.check_unchanged().unwrap();
     let left = before.finish().unwrap();
     let right = after.finish().unwrap();
     let policies = left
@@ -416,7 +489,7 @@ fn q1_qwen_actual_engine_cancel_restore_cache() {
         .iter()
         .map(|e| (e.at.stage, NumericPolicy::Exact))
         .collect();
-    let comparison = compare::compare(&before_root, &left, &after_root, &right, &policies);
+    let comparison = compare::compare_recovery(&before_root, &left, &after_root, &right, &policies);
     assert_eq!(
         comparison.disposition,
         Disposition::ExactEqual,

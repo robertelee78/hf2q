@@ -9,6 +9,27 @@ use std::{
     path::{Path, PathBuf},
 };
 pub const PAGE_BYTES: usize = 1024 * 1024;
+pub const METADATA_BYTES: u64 = 128 * 1024 * 1024;
+// Stream JSON directly; this quota is separate from captured tensor payload.
+struct MetadataWriter<W> {
+    inner: W,
+    used: u64,
+}
+impl<W: Write> Write for MetadataWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .used
+            .checked_add(bytes.len() as u64)
+            .filter(|&n| n <= METADATA_BYTES)
+            .ok_or_else(|| std::io::Error::other("Q1 metadata quota exceeded"))?;
+        self.inner.write_all(bytes)?;
+        self.used = next;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 pub fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -79,8 +100,10 @@ impl Store {
             record_limit,
             seen: BTreeSet::new(),
             trace: Trace {
-                schema: "hf2q.adr063.invariance.v1".into(),
+                schema: "hf2q.adr063.invariance.v2".into(),
+                comparison_key: (&identity).into(),
                 identity,
+                acquisition: None,
                 coverage: Coverage {
                     expected,
                     captured: Vec::new(),
@@ -90,6 +113,20 @@ impl Store {
                 },
             },
         })
+    }
+    pub fn bind_acquisition(
+        &mut self,
+        acquisition: super::acquisition::Acquisition,
+    ) -> Result<(), String> {
+        if self.trace.acquisition.is_some()
+            || !self.trace.coverage.captured.is_empty()
+            || acquisition.output_root != self.root
+            || acquisition.actual_binary_sha256 != self.trace.identity.binary_sha256
+        {
+            return Err("acquisition must bind exact store before first capture".into());
+        }
+        self.trace.acquisition = Some(acquisition);
+        Ok(())
     }
     pub fn fail(&mut self, why: impl Into<String>) {
         self.trace.coverage.errors.push(why.into());
@@ -214,14 +251,39 @@ impl Store {
         if self.seen.len() != self.trace.coverage.expected.len() {
             self.fail("incomplete required logical stage coverage");
         }
-        let data = serde_json::to_vec_pretty(&self.trace).map_err(|e| e.to_string())?;
         let mut f = OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
             .open(self.root.join("trace.json"))
             .map_err(|e| e.to_string())?;
-        f.write_all(&data).map_err(|e| e.to_string())?;
+        serde_json::to_writer(
+            &mut MetadataWriter {
+                inner: &mut f,
+                used: 0,
+            },
+            &self.trace,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(self.trace)
+    }
+}
+
+#[cfg(test)]
+mod metadata_controls {
+    use super::*;
+    #[test]
+    fn q1_metadata_writer_denies_before_exceeding_separate_quota() {
+        let mut writer = MetadataWriter {
+            inner: Vec::new(),
+            used: METADATA_BYTES - 2,
+        };
+        assert!(writer.write_all(b"abc").is_err());
+        assert!(writer.inner.is_empty());
+        assert_eq!(writer.used, METADATA_BYTES - 2);
+        writer.write_all(b"ab").unwrap();
+        assert_eq!(writer.used, METADATA_BYTES);
+        assert!(writer.write_all(b"c").is_err());
+        assert_eq!(writer.inner, b"ab");
     }
 }

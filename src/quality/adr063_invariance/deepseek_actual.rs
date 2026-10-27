@@ -17,6 +17,7 @@ use std::{
 #[serde(deny_unknown_fields)]
 struct Packet {
     execution_approved: bool,
+    acquisition: super::acquisition::Binding,
     model: PathBuf,
     output: PathBuf,
     identity: Identity,
@@ -49,19 +50,58 @@ fn q1_deepseek_actual_endpoint_trace() {
         "endpoint capture at most 1GiB host payload"
     );
     assert!(!super::family::enabled(Family::Deepseek4));
+    let acquisition_scope = super::acquisition::Scope::begin(
+        &packet.acquisition,
+        &packet.identity,
+        &packet.workload,
+        &packet.model,
+        &packet.output,
+        &raw,
+    )
+    .unwrap();
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let gguf =
-        mlx_native::gguf::GgufFile::open(&packet.model).expect("open explicitly bound artifact");
+        super::acquisition::open_model(&packet.model).expect("open explicitly bound artifact");
+    let header_cfg =
+        crate::inference::models::deepseek4::Deepseek4Config::from_gguf(&gguf).unwrap();
+    acquisition_scope
+        .check_config(
+            &packet.identity,
+            &super::acquisition::ConfigRecipe {
+                family: packet.identity.family,
+                capacity: packet.configured_capacity as u64,
+                slots: 1,
+                output_allowance: 0,
+                cache_mode: "DeepseekNative",
+                route: "endpoint",
+                actual_model_config_sha256: hash(format!("{:?}", &header_cfg).as_bytes()),
+            },
+        )
+        .unwrap();
     let mut model = crate::inference::models::deepseek4::Deepseek4Model::load_from_gguf(&gguf)
         .expect("actual DS model");
     assert_eq!(packet.workload.vocab_size, model.cfg.vocab_size);
+    acquisition_scope
+        .check_config(
+            &packet.identity,
+            &super::acquisition::ConfigRecipe {
+                family: packet.identity.family,
+                capacity: packet.configured_capacity as u64,
+                slots: 1,
+                output_allowance: 0,
+                cache_mode: "DeepseekNative",
+                route: "endpoint",
+                actual_model_config_sha256: hash(format!("{:?}", &model.cfg).as_bytes()),
+            },
+        )
+        .unwrap();
     let hc = model.cfg.hyper_connection_count as usize;
     let hidden = model.cfg.hidden_size as usize;
     let vocab = model.cfg.vocab_size as usize;
     let layer_count = model.cfg.num_hidden_layers;
     let mut expected = Vec::new();
-    for lane in 0..4 {
-        for position in 0..144 {
+    for position in 0..144 {
+        for lane in 0..4 {
             for (stage, shape) in [
                 (Stage::LayerOutput, vec![1, hc, hidden]),
                 (Stage::Logits, vec![1, vocab]),
@@ -74,15 +114,34 @@ fn q1_deepseek_actual_endpoint_trace() {
             }
         }
     }
+    expected.sort_by(|a, b| {
+        (a.at.logical_row_start, a.at.layer, a.at.stage, &a.at.agent).cmp(&(
+            b.at.logical_row_start,
+            b.at.layer,
+            b.at.stage,
+            &b.at.agent,
+        ))
+    });
     let mut store = Store::new(
         &packet.output,
-        packet.identity,
+        packet.identity.clone(),
         packet.trajectory.label().into(),
         expected,
         packet.requested_payload_limit,
         4 * 144 * 2,
     )
     .unwrap();
+    store
+        .bind_acquisition(
+            acquisition_scope
+                .observed(
+                    model.ctx.executor.device(),
+                    &model as *const _ as usize as u64,
+                    1,
+                )
+                .unwrap(),
+        )
+        .unwrap();
     let result = deepseek_runner::run(
         &mut model,
         &packet.workload,
@@ -124,6 +183,7 @@ fn q1_deepseek_actual_endpoint_trace() {
             panic!("Q1 actual diagnostic incomplete: {e:#}")
         }
     };
+    acquisition_scope.check_unchanged().unwrap();
     let trace = store.finish().unwrap();
     assert!(trace.coverage.errors.is_empty());
     let output = serde_json::json!({"schema":"hf2q.adr063.q1.endpoint-acquisition.v1","packet_sha256":hash(&raw),

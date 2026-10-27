@@ -24,12 +24,13 @@ fn blank(disposition: Disposition, reason: Option<String>) -> Comparison {
         nonfinite_elements: 0,
         reason,
         oracle_qualified: false,
+        runtime_acquisition_qualified: false,
         captured_extent_qualified: false,
     }
 }
 fn validate(trace: &Trace) -> Result<BTreeMap<Coordinate, &Tensor>, String> {
     trace.identity.validate()?;
-    if trace.schema != "hf2q.adr063.invariance.v1"
+    if trace.schema != "hf2q.adr063.invariance.v2"
         || !trace.coverage.errors.is_empty()
         || trace.coverage.expected.is_empty()
     {
@@ -113,22 +114,79 @@ pub fn compare(
     right: &Trace,
     policies: &BTreeMap<Stage, NumericPolicy>,
 ) -> Comparison {
-    if left.identity != right.identity {
+    compare_bound(left_root, left, right_root, right, policies, false)
+}
+/// Exact before/after recovery within one observed run. This is NOT a
+/// cross-trajectory acquisition and never qualifies that model-Q1 claim.
+pub fn compare_recovery(
+    left_root: &Path,
+    left: &Trace,
+    right_root: &Path,
+    right: &Trace,
+    policies: &BTreeMap<Stage, NumericPolicy>,
+) -> Comparison {
+    if left.coverage.trajectory != "T6Checkpoint64"
+        || right.coverage.trajectory != "T6ActualEngineRecovered64"
+        || left
+            .coverage
+            .expected
+            .iter()
+            .any(|e| e.at.logical_step != 64)
+        || policies
+            .values()
+            .any(|p| !matches!(p, NumericPolicy::Exact))
+    {
+        return blank(
+            Disposition::InvalidEvidence,
+            Some("invalid exact within-acquisition recovery purpose".into()),
+        );
+    }
+    compare_bound(left_root, left, right_root, right, policies, true)
+}
+fn compare_bound(
+    left_root: &Path,
+    left: &Trace,
+    right_root: &Path,
+    right: &Trace,
+    policies: &BTreeMap<Stage, NumericPolicy>,
+    recovery: bool,
+) -> Comparison {
+    if left_root == right_root
+        || left_root
+            .canonicalize()
+            .ok()
+            .zip(right_root.canonicalize().ok())
+            .is_some_and(|(l, r)| l == r)
+    {
+        return blank(
+            Disposition::InvalidEvidence,
+            Some("same acquisition root cannot establish cross-trajectory invariance".into()),
+        );
+    }
+    if left.comparison_key != right.comparison_key
+        || left.comparison_key != (&left.identity).into()
+        || right.comparison_key != (&right.identity).into()
+    {
         return blank(
             Disposition::IdentityMismatch,
             Some("source/model/config/token/device identity differs".into()),
         );
     }
+    let runtime_verified =
+        match super::acquisition::validate_pair_for(left_root, left, right_root, right, recovery) {
+            Ok(value) => value,
+            Err(error) => return blank(Disposition::InvalidEvidence, Some(error)),
+        };
     let mut out = blank(Disposition::ExactEqual, None);
+    out.runtime_acquisition_qualified = runtime_verified && !recovery;
     match compare_inner(left_root, left, right_root, right, policies, &mut out) {
         Ok(()) => out,
-        Err(error) => {
-            out.disposition = Disposition::InvalidEvidence;
-            out.reason = Some(error);
-            out.captured_extent_qualified = false;
-            out.oracle_qualified = false;
-            out
-        }
+        Err(error) => blank(
+            Disposition::InvalidEvidence,
+            Some(format!(
+                "comparison incomplete; partial accumulators discarded: {error}"
+            )),
+        ),
     }
 }
 fn compare_inner(
@@ -201,6 +259,8 @@ fn compare_inner(
                         out.first_difference = Some(Difference {
                             at: at.clone(),
                             logical_element: ((offset / width) + j) as u64,
+                            logical_index: logical_index(&lt.shape, (offset / width) + j)?,
+                            cache_token_row: cache_token_row(lt, (offset / width) + j)?,
                             left_bits: hex::encode(av),
                             right_bits: hex::encode(bv),
                         });
@@ -313,4 +373,57 @@ fn compare_inner(
         Disposition::ExactEqual | Disposition::WithinSourceQualifiedPolicy
     );
     Ok(())
+}
+
+fn logical_index(shape: &[usize], mut flat: usize) -> Result<Vec<u64>, String> {
+    let mut index = vec![0; shape.len()];
+    for (axis, &dim) in shape.iter().enumerate().rev() {
+        if dim == 0 {
+            return Err("zero logical axis".into());
+        }
+        index[axis] = (flat % dim) as u64;
+        flat /= dim;
+    }
+    if flat != 0 {
+        return Err("flat divergence outside tensor".into());
+    }
+    Ok(index)
+}
+fn cache_token_row(tensor: &Tensor, flat: usize) -> Result<Option<u64>, String> {
+    if matches!(
+        tensor.at.stage,
+        Stage::CacheKey
+            | Stage::CacheValue
+            | Stage::CacheKeyPacked
+            | Stage::CacheValuePacked
+            | Stage::CacheKeyNorm
+            | Stage::CacheValueNorm
+    ) && tensor.shape.len() == 2
+    {
+        Ok(Some(
+            tensor
+                .at
+                .logical_row_start
+                .checked_add((flat / tensor.shape[1]) as u64)
+                .ok_or("logical cache row overflow")?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod coordinate_controls {
+    use super::*;
+    #[test]
+    fn q1_divergence_beyond_first_page_preserves_token_head_and_element() {
+        let flat = super::super::store::PAGE_BYTES + 259;
+        assert_eq!(logical_index(&[8192, 256], flat).unwrap(), vec![4097, 3]);
+        assert!(logical_index(&[1, 256], 256).is_err());
+        // Head remains Coordinate.segment; row/column are logical tensor axes.
+        assert_eq!(
+            logical_index(&[144, 256], 143 * 256 + 255).unwrap(),
+            vec![143, 255]
+        );
+    }
 }

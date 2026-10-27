@@ -8,6 +8,7 @@ use super::{
 use mlx_native::MlxBuffer;
 use std::{cell::RefCell, collections::BTreeMap};
 struct Active {
+    scope_id: u64,
     store: Store,
     targets: BTreeMap<(u64, Option<usize>, String), CaptureTarget>,
     pending: Vec<(u64, Option<usize>, CaptureTarget, MlxBuffer)>,
@@ -15,10 +16,27 @@ struct Active {
 }
 thread_local! {static ACTIVE:RefCell<Option<Active>>=const {RefCell::new(None)};}
 /// Same-thread ownership only. Nested captures refuse before replacing state.
+/// Same-thread lease: unwinding removes all capture buffers/TLS state.
+static NEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[must_use]
+pub struct Scope {
+    id: u64,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl Drop for Scope {
+    fn drop(&mut self) {
+        ACTIVE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|a| a.scope_id == self.id) {
+                slot.take();
+            }
+        });
+    }
+}
 pub fn install(
     store: Store,
     targets: BTreeMap<(u64, Option<usize>, String), CaptureTarget>,
-) -> Result<(), String> {
+) -> Result<Scope, String> {
     if targets.is_empty() {
         return Err("empty Qwen capture selection".into());
     }
@@ -27,13 +45,24 @@ pub fn install(
         if slot.is_some() {
             return Err("nested Qwen diagnostic".into());
         }
+        let id = NEXT_SCOPE
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| v.checked_add(1),
+            )
+            .map_err(|_| "capture scope identity overflow")?;
         *slot = Some(Active {
+            scope_id: id,
             store,
             targets,
             pending: Vec::new(),
             failed: false,
         });
-        Ok(())
+        Ok(Scope {
+            id,
+            _same_thread: std::marker::PhantomData,
+        })
     })
 }
 pub fn enabled() -> bool {

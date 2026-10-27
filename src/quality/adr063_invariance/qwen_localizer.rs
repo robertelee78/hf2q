@@ -26,10 +26,13 @@ struct Target {
 #[serde(deny_unknown_fields)]
 struct Packet {
     execution_approved: bool,
+    acquisition: super::acquisition::Binding,
     identity: Identity,
     model: PathBuf,
     output: PathBuf,
     tokens: Vec<u32>,
+    workload: super::protocol::Workload,
+    agent: usize,
     configured_capacity: u32,
     expected: Vec<ExpectedTensor>,
     targets: Vec<Target>,
@@ -51,6 +54,19 @@ fn q1_qwen_actual_stage_localizer() {
     let packet: Packet = serde_json::from_slice(&raw).unwrap();
     assert!(packet.execution_approved);
     packet.identity.validate().unwrap();
+    packet.workload.validate().unwrap();
+    assert!(
+        packet.agent < 4
+            && packet.tokens.len() <= 144
+            && packet.tokens == packet.workload.lanes[packet.agent][..packet.tokens.len()]
+    );
+    assert!(
+        packet
+            .expected
+            .iter()
+            .all(|e| e.at.agent == format!("agent-{}", packet.agent)),
+        "localizer agent must match actual workload vector"
+    );
     assert!(matches!(
         packet.identity.family,
         Family::Qwen38 | Family::Qwen36
@@ -84,8 +100,17 @@ fn q1_qwen_actual_stage_localizer() {
         records,
     )
     .unwrap();
+    let acquisition_scope = super::acquisition::Scope::begin(
+        &packet.acquisition,
+        &packet.identity,
+        &packet.workload,
+        &packet.model,
+        &packet.output,
+        &raw,
+    )
+    .unwrap();
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let gguf = mlx_native::gguf::GgufFile::open(&packet.model).unwrap();
+    let gguf = super::acquisition::open_model(&packet.model).unwrap();
     assert_eq!(
         gguf.metadata_string("general.architecture"),
         Some(match packet.identity.family {
@@ -95,6 +120,21 @@ fn q1_qwen_actual_stage_localizer() {
         }),
         "exact selected architecture before load"
     );
+    let header_cfg = crate::inference::models::qwen35::Qwen35Config::from_gguf(&gguf).unwrap();
+    acquisition_scope
+        .check_config(
+            &packet.identity,
+            &super::acquisition::ConfigRecipe {
+                family: packet.identity.family,
+                capacity: packet.configured_capacity as u64,
+                slots: 1,
+                output_allowance: 0,
+                cache_mode: "QwenTQ8",
+                route: "stage-localizer",
+                actual_model_config_sha256: hash(format!("{:?}", &header_cfg).as_bytes()),
+            },
+        )
+        .unwrap();
     let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
     let model =
         crate::inference::models::qwen35::model::Qwen35Model::load_from_gguf(&gguf, &mut progress)
@@ -107,6 +147,20 @@ fn q1_qwen_actual_stage_localizer() {
         (Family::Qwen38, Qwen35Variant::Dense) | (Family::Qwen36, Qwen35Variant::Moe)
     ));
     assert!(packet.tokens.iter().all(|&t| t < model.cfg.vocab_size));
+    acquisition_scope
+        .check_config(
+            &packet.identity,
+            &super::acquisition::ConfigRecipe {
+                family: packet.identity.family,
+                capacity: packet.configured_capacity as u64,
+                slots: 1,
+                output_allowance: 0,
+                cache_mode: "QwenTQ8",
+                route: "stage-localizer",
+                actual_model_config_sha256: hash(format!("{:?}", &model.cfg).as_bytes()),
+            },
+        )
+        .unwrap();
     model.ensure_gpu_cache_primed().unwrap();
     let mut cache = model
         .with_gpu_cache_mut(|device, _| {
@@ -120,14 +174,21 @@ fn q1_qwen_actual_stage_localizer() {
     {
         store.missing_capability("Qwen native router kth+1 selection-domain score is not exposed as captured output; raw logits/selected IDs/weights are separate evidence");
     }
+    let observed = model
+        .with_gpu_cache_mut(|device, _| {
+            acquisition_scope.observed(device, &model as *const _ as usize as u64, 1)
+        })
+        .unwrap();
+    store.bind_acquisition(observed).unwrap();
     dump_bisect::reset_step();
-    qwen::install(store, targets).unwrap();
+    let _capture_scope = qwen::install(store, targets).unwrap();
     let result = model.forward_gpu(
         &packet.tokens,
         &positions_for_range(0, packet.tokens.len()),
         &mut cache,
         crate::serve::multi_seq_kv::SlotId(0),
     );
+    acquisition_scope.check_unchanged().unwrap();
     let trace = qwen::finish().unwrap();
     result.expect("actual Qwen localizer forward");
     assert!(

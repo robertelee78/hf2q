@@ -26,10 +26,13 @@ struct Target {
 #[serde(deny_unknown_fields)]
 struct Packet {
     execution_approved: bool,
+    acquisition: super::acquisition::Binding,
     identity: Identity,
     model: PathBuf,
     output: PathBuf,
     tokens: Vec<u32>,
+    workload: super::protocol::Workload,
+    agent: usize,
     configured_capacity: usize,
     expected: Vec<ExpectedTensor>,
     targets: Vec<Target>,
@@ -51,6 +54,19 @@ fn q1_deepseek_actual_stage_localizer() {
     assert!(packet.execution_approved);
     assert_eq!(packet.identity.family, Family::Deepseek4);
     packet.identity.validate().unwrap();
+    packet.workload.validate().unwrap();
+    assert!(
+        packet.agent < 4
+            && packet.tokens.len() <= 144
+            && packet.tokens == packet.workload.lanes[packet.agent][..packet.tokens.len()]
+    );
+    assert!(
+        packet
+            .expected
+            .iter()
+            .all(|e| e.at.agent == format!("agent-{}", packet.agent)),
+        "localizer agent must match actual workload vector"
+    );
     assert!(matches!(packet.tokens.len(), 64 | 128));
     assert!((144..=262144).contains(&packet.configured_capacity));
     assert!(!packet.rerun_id.trim().is_empty());
@@ -70,15 +86,40 @@ fn q1_deepseek_actual_stage_localizer() {
     let records = packet.expected.len();
     let mut store = Store::new(
         &packet.output,
-        packet.identity,
+        packet.identity.clone(),
         packet.rerun_id.clone(),
         packet.expected,
         packet.host_payload_limit,
         records,
     )
     .unwrap();
+    let acquisition_scope = super::acquisition::Scope::begin(
+        &packet.acquisition,
+        &packet.identity,
+        &packet.workload,
+        &packet.model,
+        &packet.output,
+        &raw,
+    )
+    .unwrap();
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let gguf = mlx_native::gguf::GgufFile::open(&packet.model).unwrap();
+    let gguf = super::acquisition::open_model(&packet.model).unwrap();
+    let header_cfg =
+        crate::inference::models::deepseek4::Deepseek4Config::from_gguf(&gguf).unwrap();
+    acquisition_scope
+        .check_config(
+            &packet.identity,
+            &super::acquisition::ConfigRecipe {
+                family: packet.identity.family,
+                capacity: packet.configured_capacity as u64,
+                slots: 1,
+                output_allowance: 0,
+                cache_mode: "DeepseekNative",
+                route: "stage-localizer",
+                actual_model_config_sha256: hash(format!("{:?}", &header_cfg).as_bytes()),
+            },
+        )
+        .unwrap();
     let mut model =
         crate::inference::models::deepseek4::Deepseek4Model::load_from_gguf(&gguf).unwrap();
     assert!(packet.tokens.iter().all(|&t| t < model.cfg.vocab_size));
@@ -91,9 +132,35 @@ fn q1_deepseek_actual_stage_localizer() {
     }) {
         store.missing_capability("DS score-routing transformed sqrtsoftplus+bias kth+1 GPU margin is not a published capture output; raw logits/bias/IDs/weights do not self-attest that margin");
     }
+    acquisition_scope
+        .check_config(
+            &packet.identity,
+            &super::acquisition::ConfigRecipe {
+                family: packet.identity.family,
+                capacity: packet.configured_capacity as u64,
+                slots: 1,
+                output_allowance: 0,
+                cache_mode: "DeepseekNative",
+                route: "stage-localizer",
+                actual_model_config_sha256: hash(format!("{:?}", &model.cfg).as_bytes()),
+            },
+        )
+        .unwrap();
+    store
+        .bind_acquisition(
+            acquisition_scope
+                .observed(
+                    model.ctx.executor.device(),
+                    &model as *const _ as usize as u64,
+                    1,
+                )
+                .unwrap(),
+        )
+        .unwrap();
     let mut cache = model.allocate_cache(packet.configured_capacity).unwrap();
-    family::install(Family::Deepseek4, store, targets).unwrap();
+    let _capture_scope = family::install(Family::Deepseek4, store, targets).unwrap();
     let result = model.forward_verifier_prefill(&packet.tokens, &mut cache);
+    acquisition_scope.check_unchanged().unwrap();
     let trace = family::finish().unwrap();
     result.expect("actual localizer transaction must complete");
     assert!(
