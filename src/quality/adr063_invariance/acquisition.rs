@@ -141,7 +141,7 @@ pub fn tokens_digest(work: &Workload) -> Result<String> {
 pub fn config_digest(recipe: &ConfigRecipe<'_>) -> Result<String> {
     Ok(hash(&serde_json::to_vec(recipe)?))
 }
-fn checked_file(binding: &FileBinding, max: u64) -> Result<Vec<u8>> {
+pub(crate) fn checked_file(binding: &FileBinding, max: u64) -> Result<Vec<u8>> {
     ensure!(
         binding.sha256.len() == 64 && binding.path.is_absolute(),
         "invalid external proof binding"
@@ -161,7 +161,7 @@ fn checked_file(binding: &FileBinding, max: u64) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
-fn full_content_receipt_has_model(bytes: &[u8], model_sha: &str) -> Result<()> {
+pub(crate) fn full_content_receipt_has_model(bytes: &[u8], model_sha: &str) -> Result<()> {
     fn has(value: &serde_json::Value, sha: &str) -> bool {
         match value {
             serde_json::Value::String(s) => s == sha,
@@ -177,7 +177,7 @@ fn full_content_receipt_has_model(bytes: &[u8], model_sha: &str) -> Result<()> {
     );
     Ok(())
 }
-fn executable_digest() -> Result<String> {
+pub(crate) fn executable_digest() -> Result<String> {
     let mut file = File::open(std::env::current_exe()?)?;
     let mut digest = Sha256::new();
     let mut page = [0u8; 65536];

@@ -68,3 +68,38 @@ numeric inconclusive, not learned tolerance or a false model pass.
 Source: `src/serve/api/engine/q1_qwen_cancel/continuation.rs` and
 `src/quality/adr063_invariance/qwen_continuation.rs`. This note records authored
 scope only; no actual continuation/model result has been obtained.
+
+## Prospective metadata preparation
+
+The ignored `prepare::q1_qwen_continuation_metadata_packet_prepare` child computes
+the actual parsed Qwen config Debug digest, the SAME continuation recipe digest,
+and canonical LE144-token vector digest without constructing a device, model,
+context or inference run. It parses the bound GGUF header via its checked file
+descriptor and `Qwen35Config::from_gguf`, applies effective context262144, checks
+explicit family/variant/vocabulary and exact embedded template, and retains raw
+hashes of bound tokenizer/template/vector/full-content-receipt files. It does
+not hash the large model payload or certify tokenizer semantic equivalence.
+
+Input is a closed private config selected by `HF2Q_Q1_QWEN_PREP_CONFIG`: model
+path/retained full SHA/file identity, four `{path,sha256}` bindings named
+`full_content_receipt`, `tokenizer`, `template`, `workload`, expected exporter
+source commit/binary SHA, and new absolute canonical output directory outside
+Git. The model file identity fields are device/inode/bytes and mtime/ctime with
+nanoseconds. The actual opened descriptor is checked before/after header use.
+Tokenizer input is bounded64MiB, receipt16MiB, template/vector/config1MiB each;
+selected header offset must be at most32MiB and output at most2MiB. Parser/heap
+metadata remains a separate external operating bound, not tensor admission.
+No tensor loader is called; ordinary buffered header reads are not a promise
+about zero OS read-ahead into adjacent pages.
+
+```sh
+cargo test --locked --bin hf2q q1_metadata_preparation
+HF2Q_Q1_QWEN_PREP_CONFIG=PRIVATE_CONFIG TEST_BINARY --exact serve::api::engine::q1_qwen_cancel::prepare::q1_qwen_continuation_metadata_packet_prepare --ignored --nocapture
+```
+
+Root supervises this metadata process only after source/build review and quiet
+host binding. `prepared.json` is prospective material: acquisition-attested,
+composition-reviewed, execution-approved and whole-Q1 flags are all false.
+Independent clean-build/artifact/config composition review and a separately
+approved model/resource packet remain mandatory before cold/recovery execution.
+No runtime model receipt may treat the metadata export as self-approval.

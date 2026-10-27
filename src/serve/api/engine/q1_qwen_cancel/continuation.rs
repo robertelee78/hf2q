@@ -153,7 +153,7 @@ struct Packet {
     snapshot_payload_limit: u64,
     continuation_payload_limit: u64,
 }
-fn recipe<'a>(
+pub(super) fn recipe<'a>(
     family: Family,
     capacity: u32,
     config_sha: String,

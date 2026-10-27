@@ -270,3 +270,6 @@ fn q1_qwen_actual_engine_cancel_restore_cache() {
 
 #[path = "q1_qwen_cancel/continuation.rs"]
 mod continuation;
+
+#[path = "q1_qwen_cancel/prepare.rs"]
+mod prepare;
