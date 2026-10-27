@@ -1,6 +1,9 @@
 use super::*;
 use crate::inference::models::qwen35::{default_layer_types, Qwen35MoeConfig, Qwen35Variant};
 
+#[path = "c1_anchor_layout_tests.rs"]
+mod c1_anchor_layout_tests;
+
 // Scalar-only F1 header fixtures, no private paths/weights/tokenizer data.
 // Q38: cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7
 // Q36: 815a22cab21649948352c0eea6e9be0d9d15606e2024d86e7bdb71fb9df08220

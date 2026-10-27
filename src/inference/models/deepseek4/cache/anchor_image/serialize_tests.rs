@@ -2,6 +2,9 @@ use super::*;
 use std::cell::Cell;
 use crate::inference::models::deepseek4::cache::CacheBufferPlan;
 
+#[path = "c1_anchor_layout_tests.rs"]
+mod c1_anchor_layout_tests;
+
 fn cache_plan(ratios: Vec<u32>, context: usize) -> Deepseek4CachePlan {
     let mut cfg = crate::inference::models::deepseek4::residency_tests::tiny_config();
     cfg.num_hidden_layers = ratios.len() as u32;
