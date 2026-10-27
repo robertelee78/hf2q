@@ -87,7 +87,7 @@ fn q1_gemma_actual_stage_localizer() {
     use crate::serve::api::engine::{LoadOptions, LoadedModel};
     let header = mlx_native::gguf::GgufFile::open(&packet.model).unwrap();
     assert_eq!(
-        header.metadata_str("general.architecture"),
+        header.metadata_string("general.architecture"),
         Some("gemma4"),
         "explicit Gemma4 architecture required"
     );
