@@ -99,4 +99,3 @@ Realistic closure: a focused contract+layout/state test component can be source-
 `src/serve/api/engine_deepseek4.rs` SHA256 `aa15a4ff96f7159827d18818c50016b739290b2008513ce5f50b4d64bfb1e4a5`
 
 `src/serve/api/engine_qwen35.rs` SHA256 `39eef94e81b911bd7f8b00a1d50e45ca955bcc3bd06cbe2c7eaedd9dd8888a3a`
-
