@@ -1,9 +1,19 @@
 //! Actual cache/image planners and emitter, without Metal allocation or hydration.
 use super::*;
 
+fn c1_cache_plan(ratios: Vec<u32>, context: usize) -> Deepseek4CachePlan {
+    let mut cfg = crate::inference::models::deepseek4::residency_tests::tiny_config();
+    cfg.num_hidden_layers = ratios.len() as u32;
+    cfg.compress_ratios = ratios;
+    // The shared tiny fixture caps context at128. This fixture deliberately
+    // exercises both sides of ratio128 with an explicitly legal256-token cap.
+    cfg.max_position_embeddings = 256;
+    Deepseek4CachePlan::for_context(&cfg, context).unwrap()
+}
+
 #[test]
 fn anchor_c1_deepseek_window_compressed_indexer_roles_and_native_tail_coordinates() {
-    let cache = cache_plan(vec![0, 4, 128], 256);
+    let cache = c1_cache_plan(vec![0, 4, 128], 256);
     for position in [1, 4, 127, 128, 129, 256] {
         let image = image_plan(&cache, position);
         for (layer, spec) in cache.layers.iter().enumerate() {
@@ -42,7 +52,7 @@ fn anchor_c1_deepseek_window_compressed_indexer_roles_and_native_tail_coordinate
 
 #[test]
 fn anchor_c1_deepseek_late_sidecar_refuses_before_source_read_or_destination_reserve() {
-    let plan = cache_plan(vec![0, 4, 128], 256);
+    let plan = c1_cache_plan(vec![0, 4, 128], 256);
     // Corrupt the final layer's score-state metadata after all earlier roles.
     no_image_on_bad_plan(&plan, 129, &vec![7; 129], 0, (3, 3), |l, r| {
         if l == 2 && r == 4 {
