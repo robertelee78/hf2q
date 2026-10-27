@@ -109,7 +109,8 @@ fn render_ids(
     template: &str,
     tokenizer: &tokenizers::Tokenizer,
 ) -> (String, Vec<u32>, bool) {
-    let req: super::schema::ChatCompletionRequest = serde_json::from_value(v.clone()).unwrap();
+    let req: crate::serve::api::schema::ChatCompletionRequest =
+        serde_json::from_value(v.clone()).unwrap();
     assert_eq!(req.messages.len(), 1);
     assert!(req.tools.is_none());
     let reg = registry::find_for_architecture("gemma4").unwrap();
