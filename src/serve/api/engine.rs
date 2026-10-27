@@ -3261,6 +3261,10 @@ impl LoadedModel {
             model_path.display()
         );
         // Header-only parse — cheap; no tensor read.
+        #[cfg(test)]
+        let gguf = crate::adr063_invariance::acquisition::open_model(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+        #[cfg(not(test))]
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         let arch = gguf
@@ -3366,6 +3370,10 @@ impl GemmaLoadedModel {
             resolve_tokenizer_path_optional(model_path, opts.tokenizer_path.as_deref());
 
         // Open GGUF (header + metadata only).
+        #[cfg(test)]
+        let gguf = crate::adr063_invariance::acquisition::open_model(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+        #[cfg(not(test))]
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         if load_timing {

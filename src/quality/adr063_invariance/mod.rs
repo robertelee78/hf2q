@@ -1,4 +1,5 @@
 //! ADR063 Q1 test-only diagnostic oracle. No production math or service policy.
+pub(crate) mod acquisition;
 pub(crate) mod capture;
 pub(crate) mod compare;
 #[cfg(test)]

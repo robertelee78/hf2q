@@ -25,10 +25,13 @@ struct Target {
 #[serde(deny_unknown_fields)]
 struct Packet {
     execution_approved: bool,
+    acquisition: super::acquisition::Binding,
     identity: Identity,
     model: PathBuf,
     output: PathBuf,
     tokens: Vec<u32>,
+    workload: super::protocol::Workload,
+    agent: usize,
     configured_context: u32,
     configured_output_allowance: usize,
     expected: Vec<ExpectedTensor>,
@@ -51,6 +54,19 @@ fn q1_gemma_actual_stage_localizer() {
     let packet: Packet = serde_json::from_slice(&raw).unwrap();
     assert!(packet.execution_approved);
     packet.identity.validate().unwrap();
+    packet.workload.validate().unwrap();
+    assert!(
+        packet.agent < 4
+            && packet.tokens.len() <= 144
+            && packet.tokens == packet.workload.lanes[packet.agent][..packet.tokens.len()]
+    );
+    assert!(
+        packet
+            .expected
+            .iter()
+            .all(|e| e.at.agent == format!("agent-{}", packet.agent)),
+        "localizer agent must match actual workload vector"
+    );
     assert_eq!(packet.identity.family, Family::Gemma4);
     assert_eq!(
         packet.tokens.len(),
@@ -75,22 +91,54 @@ fn q1_gemma_actual_stage_localizer() {
     let records = packet.expected.len();
     let mut store = Store::new(
         &packet.output,
-        packet.identity,
+        packet.identity.clone(),
         packet.rerun_id.clone(),
         packet.expected,
         packet.host_payload_limit,
         records,
     )
     .unwrap();
-    store.missing_capability("Gemma actual native post-softmax/renormalized selection kth+1 GPU score is not a captured public output; IDs/weights/raw logits are distinct evidence");
+    if targets.keys().any(|(_, _, stage)| {
+        matches!(
+            stage,
+            Stage::RouterLogits | Stage::RouterIds | Stage::RouterWeights
+        )
+    }) {
+        store.missing_capability("Gemma actual native post-softmax/renormalized selection kth+1 GPU score is not a captured public output; IDs/weights/raw logits are distinct evidence");
+    }
+    let acquisition_scope = super::acquisition::Scope::begin(
+        &packet.acquisition,
+        &packet.identity,
+        &packet.workload,
+        &packet.model,
+        &packet.output,
+        &raw,
+    )
+    .unwrap();
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     use crate::serve::api::engine::{LoadOptions, LoadedModel};
-    let header = mlx_native::gguf::GgufFile::open(&packet.model).unwrap();
+    let header = super::acquisition::open_model(&packet.model).unwrap();
     assert_eq!(
         header.metadata_string("general.architecture"),
         Some("gemma4"),
         "explicit Gemma4 architecture required"
     );
+    let mut header_cfg = crate::serve::config::Gemma4Config::from_gguf(&header).unwrap();
+    header_cfg.max_position_embeddings = packet.configured_context as usize;
+    acquisition_scope
+        .check_config(
+            &packet.identity,
+            &super::acquisition::ConfigRecipe {
+                family: packet.identity.family,
+                capacity: packet.configured_context as u64,
+                slots: 4,
+                output_allowance: 8192,
+                cache_mode: "GemmaHybrid",
+                route: "stage-localizer",
+                actual_model_config_sha256: hash(format!("{:?}", &header_cfg).as_bytes()),
+            },
+        )
+        .unwrap();
     drop(header);
     let options = LoadOptions {
         model_path: packet.model,
@@ -112,6 +160,31 @@ fn q1_gemma_actual_stage_localizer() {
         .tokens
         .iter()
         .all(|&t| (t as usize) < model.weights.vocab_size));
+    acquisition_scope
+        .check_config(
+            &packet.identity,
+            &super::acquisition::ConfigRecipe {
+                family: packet.identity.family,
+                capacity: packet.configured_context as u64,
+                slots: 4,
+                output_allowance: 8192,
+                cache_mode: "GemmaHybrid",
+                route: "stage-localizer",
+                actual_model_config_sha256: hash(format!("{:?}", &model.config).as_bytes()),
+            },
+        )
+        .unwrap();
+    store
+        .bind_acquisition(
+            acquisition_scope
+                .observed(
+                    model.ctx.executor.device(),
+                    &model as *const _ as usize as u64,
+                    3,
+                )
+                .unwrap(),
+        )
+        .unwrap();
     model
         .provision_multi_seq_kv_for_slot_aware(4)
         .expect("actual production four-slot scaffold");
@@ -119,7 +192,7 @@ fn q1_gemma_actual_stage_localizer() {
         model.multi_seq_kv_hybrid.is_some(),
         "selected production Hybrid scaffold required"
     );
-    family::install(Family::Gemma4, store, targets).unwrap();
+    let _capture_scope = family::install(Family::Gemma4, store, targets).unwrap();
     use crate::serve::multi_seq_kv::SlotId;
     let result = (|| -> anyhow::Result<()> {
         model.weights.forward_prefill_with_soft_tokens_slot_aware(
@@ -154,6 +227,7 @@ fn q1_gemma_actual_stage_localizer() {
         }
         Ok(())
     })();
+    acquisition_scope.check_unchanged().unwrap();
     let trace = family::finish().unwrap();
     result.expect("actual Gemma stage transaction");
     assert!(

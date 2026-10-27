@@ -80,9 +80,6 @@ pub struct Identity {
     pub template_sha256: String,
     pub config_sha256: String,
     pub token_vectors_sha256: String,
-    pub device_registry_id: u64,
-    pub queue_identity: u64,
-    pub model_generation: u64,
 }
 fn hex(s: &str, n: usize) -> bool {
     s.len() == n
@@ -104,9 +101,6 @@ impl Identity {
             .iter()
             .all(|s| hex(s, 64))
             || self.native_version != env!("HF2Q_MLX_NATIVE_VERSION")
-            || self.device_registry_id == 0
-            || self.queue_identity == 0
-            || self.model_generation == 0
         {
             return Err("invalid complete diagnostic identity".into());
         }
@@ -173,6 +167,8 @@ pub struct Coverage {
 pub struct Trace {
     pub schema: String,
     pub identity: Identity,
+    pub comparison_key: super::acquisition::ComparisonKey,
+    pub acquisition: Option<super::acquisition::Acquisition>,
     pub coverage: Coverage,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -222,6 +218,8 @@ pub enum Disposition {
 pub struct Difference {
     pub at: Coordinate,
     pub logical_element: u64,
+    pub logical_index: Vec<u64>,
+    pub cache_token_row: Option<u64>,
     pub left_bits: String,
     pub right_bits: String,
 }
@@ -239,5 +237,6 @@ pub struct Comparison {
     pub nonfinite_elements: u64,
     pub reason: Option<String>,
     pub oracle_qualified: bool,
+    pub runtime_acquisition_qualified: bool,
     pub captured_extent_qualified: bool,
 }

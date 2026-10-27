@@ -42,6 +42,7 @@ pub fn run(
         actual_route: "Qwen actual forward_gpu All + TQ8 independent serial slot0 caches".into(),
         positions_per_lane: vec![0; 4],
         checked_terminal_calls: 0,
+        observed_calls: vec![],
         restored_at: None,
         cancelled_at: None,
         accepted_draft_rows: None,
@@ -60,8 +61,16 @@ pub fn run(
         })?;
         let tokens = &work.lanes[lane];
         if matches!(trajectory, Trajectory::T1Resume64 | Trajectory::T3Chunk64) {
-            forward(model, lane, 0, &tokens[..64], &mut cache, &mut observe)?;
-            evidence.checked_terminal_calls += 1;
+            forward(
+                model,
+                lane,
+                0,
+                &tokens[..64],
+                &mut cache,
+                &mut evidence,
+                &mut observe,
+            )?;
+
             if trajectory == Trajectory::T1Resume64 {
                 let checkpoint =
                     model.with_gpu_cache_mut(|device, _| cache.snapshot_prefix(device, 64))?;
@@ -75,11 +84,25 @@ pub fn run(
                 );
                 evidence.restored_at = Some(64);
             }
-            forward(model, lane, 64, &tokens[64..128], &mut cache, &mut observe)?;
-            evidence.checked_terminal_calls += 1;
+            forward(
+                model,
+                lane,
+                64,
+                &tokens[64..128],
+                &mut cache,
+                &mut evidence,
+                &mut observe,
+            )?;
         } else {
-            forward(model, lane, 0, &tokens[..128], &mut cache, &mut observe)?;
-            evidence.checked_terminal_calls += 1;
+            forward(
+                model,
+                lane,
+                0,
+                &tokens[..128],
+                &mut cache,
+                &mut evidence,
+                &mut observe,
+            )?;
         }
         for position in 128..144 {
             forward(
@@ -88,9 +111,9 @@ pub fn run(
                 position,
                 &tokens[position..position + 1],
                 &mut cache,
+                &mut evidence,
                 &mut observe,
             )?;
-            evidence.checked_terminal_calls += 1;
         }
         evidence.positions_per_lane[lane] = cache.sequence_len_for_slot(SlotId(0))? as usize;
     }
@@ -103,12 +126,14 @@ fn forward(
     start: usize,
     tokens: &[u32],
     cache: &mut HybridKvCache,
+    evidence: &mut ExecutionEvidence,
     observe: &mut impl FnMut(usize, usize, &[f32], &HybridKvCache) -> Result<()>,
 ) -> Result<()> {
     ensure!(
         cache.sequence_len_for_slot(SlotId(0))? as usize == start,
         "Qwen forward starts at wrong logical position"
     );
+    let before = cache.sequence_len_for_slot(SlotId(0))? as usize;
     let positions = positions_for_range(i32::try_from(start)?, tokens.len());
     let logits = model.forward_gpu(tokens, &positions, cache, SlotId(0))?;
     let end = start
@@ -125,6 +150,13 @@ fn forward(
     ensure!(
         cache.sequence_len_for_slot(SlotId(0))? as usize == end,
         "Qwen terminal cursor mismatch"
+    );
+    evidence.record(
+        vec![lane],
+        vec![before],
+        tokens.len(),
+        vec![cache.sequence_len_for_slot(SlotId(0))? as usize],
+        true,
     );
     observe(lane, end, &logits, cache)
 }

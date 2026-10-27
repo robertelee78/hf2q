@@ -1870,6 +1870,8 @@ impl MlxModelWeights {
         let mut capture_active: bool = false;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            #[cfg(test)]
+            let mut q1_layer_terminal_checked = false;
             // Metal-1 — begin/end programmatic GPU capture around the
             // configured layer range (HF2Q_METAL_CAPTURE_LAYERS).
             if let Some(p) = capture_path.as_ref() {
@@ -5942,6 +5944,8 @@ impl MlxModelWeights {
                         s.finish()
                             .map_err(|e| anyhow::anyhow!("batched mlp finish L{layer_idx}: {e}"))?;
                     }
+                    #[cfg(test)]
+                    { q1_layer_terminal_checked = true; }
                     if std::env::var("HF2Q_PROFILE_LAYERS").is_ok() {
                         let kind = if is_sliding { "SW" } else { "GL" };
                         eprintln!(
@@ -5994,7 +5998,7 @@ impl MlxModelWeights {
             // hold graft rows).
             #[cfg(test)]
             crate::adr063_invariance::gemma_prefill::after_layer(
-                start_pos, layer_idx, &[
+                q1_layer_terminal_checked, start_pos, layer_idx, &[
                     (crate::adr063_invariance::receipt::Stage::Query, &pf_q, vec![seq_len, nh, hd]),
                     (crate::adr063_invariance::receipt::Stage::Key, &pf_k, vec![seq_len, nkv, hd]),
                     (crate::adr063_invariance::receipt::Stage::Value, &pf_v_normed, vec![seq_len, nkv, hd]),

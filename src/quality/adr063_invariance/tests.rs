@@ -1,10 +1,34 @@
 //! Host-only controls of the actual store/comparison boundary; no Metal device.
-use super::{compare::compare, receipt::*, store::Store};
+use super::{receipt::*, store::Store};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
+// Synthetic controls exercise the actual comparator but cannot qualify a model
+// acquisition. Actual helper traces never take this fixture-only path.
+fn compare(
+    left_root: &std::path::Path,
+    left: &Trace,
+    right_root: &std::path::Path,
+    right: &Trace,
+    policies: &BTreeMap<Stage, NumericPolicy>,
+) -> Comparison {
+    let mut l = left.clone();
+    let mut r = right.clone();
+    if l.acquisition.is_none() {
+        l.acquisition = Some(super::acquisition::synthetic(left_root, &l.identity));
+    }
+    if r.acquisition.is_none() {
+        r.acquisition = Some(super::acquisition::synthetic(right_root, &r.identity));
+    }
+    let result = super::compare::compare(left_root, &l, right_root, &r, policies);
+    assert!(
+        !result.runtime_acquisition_qualified,
+        "synthetic fixture cannot attest real model execution"
+    );
+    result
+}
 static NEXT: AtomicU64 = AtomicU64::new(0);
 fn identity() -> Identity {
     Identity {
@@ -18,9 +42,6 @@ fn identity() -> Identity {
         template_sha256: "f".repeat(64),
         config_sha256: "1".repeat(64),
         token_vectors_sha256: "2".repeat(64),
-        device_registry_id: 1,
-        queue_identity: 2,
-        model_generation: 3,
     }
 }
 fn at(stage: Stage) -> Coordinate {
@@ -228,6 +249,7 @@ fn q1_cohort_and_speculation_need_actual_execution_evidence() {
         actual_route: "four serial calls, not batched".into(),
         positions_per_lane: vec![144; 4],
         checked_terminal_calls: 16,
+        observed_calls: vec![],
         restored_at: None,
         cancelled_at: None,
         accepted_draft_rows: None,
@@ -241,7 +263,10 @@ fn q1_cohort_and_speculation_need_actual_execution_evidence() {
     evidence.rejected_draft_rows = Some(0);
     assert!(evidence.validate().is_err());
     evidence.rejected_draft_rows = Some(1);
-    assert!(evidence.validate().is_ok());
+    assert!(
+        evidence.validate().is_err(),
+        "declared proposal counts without actual call observations cannot qualify"
+    );
 }
 #[test]
 fn q1_last_row_slice_cannot_satisfy_full_expected_matrix() {
@@ -380,3 +405,6 @@ fn q1_float_bounds_are_predeclared_and_never_learned_from_candidate() {
         Disposition::InvalidEvidence
     );
 }
+
+#[path = "lifecycle_controls.rs"]
+mod lifecycle_controls;
