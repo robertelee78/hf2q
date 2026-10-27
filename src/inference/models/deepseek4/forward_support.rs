@@ -462,35 +462,62 @@ pub(super) fn grouped_output_a(
     Ok(())
 }
 
-pub(super) struct BatchedGroupedOutputArena {
-    input_group_major: MlxBuffer,
-    output_group_major: MlxBuffer,
+// Keep allocation and dispatch on exactly the same pre-existing native route.
+fn output_a_strided_q8(ggml_type: GgmlType, rows: usize) -> bool {
+    ggml_type == GgmlType::Q8_0 && rows > MM_ROUTING_THRESHOLD as usize
 }
 
-impl BatchedGroupedOutputArena {
-    pub(super) fn new(
-        device: &MlxDevice,
-        rows: usize,
-        groups: usize,
-        group_width: usize,
-        rank: usize,
-    ) -> Result<Self> {
-        Ok(Self {
-            input_group_major: alloc(
-                device,
-                DType::F32,
-                vec![groups, rows, group_width],
-                "batched output-A group-major input",
-            )?,
-            output_group_major: alloc(
-                device,
-                DType::F32,
-                vec![groups, rows, rank],
-                "batched output-A group-major output",
-            )?,
-        })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatchedGroupedOutputPlan {
+    rows: usize,
+    groups: usize,
+    group_width: usize,
+    rank: usize,
+    ggml_type: GgmlType,
+    input_bytes: usize,
+    output_bytes: usize,
+}
+impl BatchedGroupedOutputPlan {
+    fn new(rows:usize, groups:usize, group_width:usize, rank:usize, ggml_type:GgmlType)->Result<Self> {
+        anyhow::ensure!([rows,groups,group_width,rank].iter().all(|&n|n>0 && u32::try_from(n).is_ok()),
+            "DeepSeek-V4 output-A dimensions must be nonzero u32");
+        anyhow::ensure!(group_width % ggml_type.block_values() as usize == 0,
+            "DeepSeek-V4 output-A group width is not block aligned");
+        let bytes = |width:usize| rows.checked_mul(groups).and_then(|n|n.checked_mul(width))
+            .and_then(|n|n.checked_mul(4)).context("DeepSeek-V4 output-A scratch size overflow");
+        Ok(Self { rows,groups,group_width,rank,ggml_type,input_bytes:bytes(group_width)?,output_bytes:bytes(rank)? })
+    }
+    fn needs_input(self)->bool { !output_a_strided_q8(self.ggml_type,self.rows) }
+    fn allocate_with<T>(self, mut allocate:impl FnMut(Vec<usize>, &'static str)->Result<T>)->Result<(Option<T>,T)> {
+        let input=self.needs_input().then(||allocate(vec![self.groups,self.rows,self.group_width],
+            "batched output-A group-major input")).transpose()?;
+        let output=allocate(vec![self.groups,self.rows,self.rank],"batched output-A group-major output")?;
+        Ok((input,output))
+    }
+    fn matches(self, other:Self, has_input:bool)->Result<()> {
+        anyhow::ensure!(self==other,"DeepSeek-V4 output-A arena route/shape drift");
+        anyhow::ensure!(!self.needs_input() || has_input,"DeepSeek-V4 output-A fallback requires group-major input");
+        Ok(())
     }
 }
+
+pub(super) struct BatchedGroupedOutputArena {
+    plan: BatchedGroupedOutputPlan,
+    input_group_major: Option<MlxBuffer>,
+    output_group_major: MlxBuffer,
+}
+impl BatchedGroupedOutputArena {
+    pub(super) fn new(device:&MlxDevice, rows:usize, groups:usize, group_width:usize,
+        rank:usize, ggml_type:GgmlType)->Result<Self> {
+        let plan=BatchedGroupedOutputPlan::new(rows,groups,group_width,rank,ggml_type)?;
+        let (input_group_major,output_group_major)=plan.allocate_with(|shape,label|alloc(device,DType::F32,shape,label))?;
+        Ok(Self {plan,input_group_major,output_group_major})
+    }
+}
+
+#[cfg(test)]
+#[path = "output_a_staging_tests.rs"]
+mod output_a_staging_tests;
 
 /// Apply independently-quantized output-A groups with a true `m=rows`
 /// matrix dispatch. Q8_0 consumes token-major attention through explicit
@@ -510,6 +537,8 @@ pub(super) fn grouped_output_a_batched(
     heads: usize,
     head_dim: usize,
 ) -> Result<()> {
+    anyhow::ensure!(groups>0 && heads.checked_mul(head_dim).is_some_and(|width|width%groups==0),
+        "DeepSeek-V4 output-A heads/width must divide groups");
     let group_width = heads
         .checked_mul(head_dim)
         .and_then(|width| width.checked_div(groups))
@@ -535,7 +564,20 @@ pub(super) fn grouped_output_a_batched(
         .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
         .context("DeepSeek-V4 output-A row-byte overflow")?;
 
-    if weight.ggml_type == GgmlType::Q8_0 && rows > MM_ROUTING_THRESHOLD as usize {
+    let plan=BatchedGroupedOutputPlan::new(rows,groups,group_width,rank,weight.ggml_type)?;
+    arena.plan.matches(plan,arena.input_group_major.is_some())?;
+    anyhow::ensure!(input.dtype()==DType::F32 && input.element_count()==rows*groups*group_width
+        && output.dtype()==DType::F32 && output.element_count()==rows*groups*rank,
+        "DeepSeek-V4 output-A input/output shape drift");
+    anyhow::ensure!(arena.output_group_major.dtype()==DType::F32
+        && arena.output_group_major.data_byte_len()>=plan.output_bytes
+        && arena.output_group_major.shape()==[groups,rows,rank],"DeepSeek-V4 output-A arena output drift");
+    if let Some(input)=arena.input_group_major.as_ref() {
+        anyhow::ensure!(input.dtype()==DType::F32 && input.data_byte_len()>=plan.input_bytes
+            && input.shape()==[groups,rows,group_width],
+            "DeepSeek-V4 output-A arena input drift");
+    }
+    if output_a_strided_q8(weight.ggml_type,rows) {
         let input_row_bytes = groups
             .checked_mul(group_width)
             .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
@@ -569,21 +611,20 @@ pub(super) fn grouped_output_a_batched(
             )
             .context("encode strided native-batched DeepSeek-V4 Q8_0 output-A projection")?;
     } else {
-        session.barrier_between(&[input], &[&arena.input_group_major]);
+        let group_input=arena.input_group_major.as_ref().context("DeepSeek-V4 output-A fallback input missing")?;
+        session.barrier_between(&[input], &[group_input]);
         permute_021_f32(
             session.encoder_mut(),
             registry,
             device.metal_device(),
             input,
-            &arena.input_group_major,
+            group_input,
             rows,
             groups,
             group_width,
         )?;
         for group in 0..groups {
-            let input_view = arena
-                .input_group_major
-                .slice_view(
+            let input_view = group_input.slice_view(
                     u64::try_from(group * rows * group_width * DType::F32.size_of())
                         .context("DeepSeek-V4 batched output-A input offset exceeds u64")?,
                     rows * group_width,

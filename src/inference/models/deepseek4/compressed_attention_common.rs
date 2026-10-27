@@ -47,7 +47,7 @@ pub(super) struct CompressedAttentionCoreArena {
 }
 
 impl CompressedAttentionCoreArena {
-    pub(super) fn new(device: &MlxDevice, cfg: &Deepseek4Config, rows: usize) -> Result<Self> {
+    pub(super) fn new(device: &MlxDevice, cfg: &Deepseek4Config, rows: usize, output_a_type: mlx_native::ops::quantized_matmul_ggml::GgmlType) -> Result<Self> {
         let hidden = cfg.hidden_size as usize;
         let hc = cfg.hyper_connection_count as usize;
         let hc_hidden = hc * hidden;
@@ -172,6 +172,7 @@ impl CompressedAttentionCoreArena {
                         cfg.output_groups as usize,
                         heads * head_dim / cfg.output_groups as usize,
                         cfg.o_lora_rank as usize,
+                        output_a_type,
                     )
                 })
                 .transpose()?,

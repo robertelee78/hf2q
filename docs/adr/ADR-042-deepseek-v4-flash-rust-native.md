@@ -2674,3 +2674,26 @@ passed18DSML-focused tests, all four tool-bound controls,25mask tests with
 one ignored control,47sampler tests, and the locked all-target/all-feature
 check. That includes the new all-family public-key/function-name runtime
 control. Real-model serving remains the next gate.
+
+
+### Proposed: omit unused Q8 output-A input staging (2026-10-27)
+
+The selected Flash0731 catalogue has43 `attn_output_a.weight` Q8_0 matrices.
+Existing batched output-A dispatch at rows greater than the native matrix
+threshold reads token-major attention with explicit strides. Its group-major
+input allocation is unused on this route. The source candidate uses one shared
+route predicate for allocation and dispatch, omits only this input, and retains
+the output staging and the original permuted fallback for small rows/other
+storage. Route/shape drift and a missing required fallback input fail before
+encoding. No native kernel, arithmetic, command-buffer or scheduling change is
+proposed; the existing published mlx-native dependency remains unchanged.
+
+Derived requested-payload reduction is268435456B at2048rows (8groups,
+4096input width/group,F32),67108864B at512rows. These are local allocation
+savings, not measured whole-pool/resident reduction, fit or speed claims.
+The tiny ignored old-Some/new-None Q8 numeric control and pure route/refusal
+controls are authored but unexecuted. Independent source review, focused
+compilation/tests and supervised tiny Metal validation precede any real-model
+qualification. Default promotion, Q5 admission and performance acceptance are
+pending. Largest-context source ledger, positive runtime margins and retained
+failures are unaffected; no context/output/tool workload is reduced.
