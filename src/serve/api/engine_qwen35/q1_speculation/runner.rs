@@ -12,6 +12,11 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
 };
+// Exactly two acquisition::open_model calls in this direct-loader route:
+// runner header below, then Qwen35LoadedModel::load_with_context. The latter
+// passes its same verified &gguf to config and weight loading; no dispatcher open.
+const DIRECT_QWEN_REQUIRED_MODEL_OPENS: u64 = 2;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Prefixes {
@@ -204,12 +209,20 @@ fn run() -> Result<()> {
     )?;
     model.model.ensure_gpu_cache_primed()?;
     model.provision_multi_seq_kv_for_slot_aware(1)?;
+    let preparation_observed_model_opens = if packet.mode == Mode::Preparation {
+        Some(scope.check_preparation_loaded(DIRECT_QWEN_REQUIRED_MODEL_OPENS)?)
+    } else {
+        None
+    };
     let observed = if packet.mode == Mode::Preparation {
-        scope.check_preparation_loaded()?;
         None
     } else {
         Some(model.model.with_gpu_cache_mut(|device, _| {
-            scope.observed(device, &model as *const _ as usize as u64, 3)
+            scope.observed(
+                device,
+                &model as *const _ as usize as u64,
+                DIRECT_QWEN_REQUIRED_MODEL_OPENS,
+            )
         })?)
     };
     if let Some(f) = &frozen {
@@ -349,7 +362,7 @@ fn run() -> Result<()> {
         write(
             &packet.output,
             "preparation-only.json",
-            &serde_json::json!({"source_commit":packet.identity.source_commit,"binary_sha256":packet.identity.binary_sha256,"prefix_digest":packet.identity.token_vectors_sha256,"full144_digest_computed_after_generation":acquisition::tokens_digest(&prepared.workload)?,"frozen_file_sha256":hash(&std::fs::read(packet.output.join("frozen-workload.json"))?),"final_carry_is_metadata_not17th_input":true,"comparable_acquisition":false,"execution_approval_for_future_phases":false,"requires_independent_review":true}),
+            &serde_json::json!({"source_commit":packet.identity.source_commit,"binary_sha256":packet.identity.binary_sha256,"prefix_digest":packet.identity.token_vectors_sha256,"required_model_opens":DIRECT_QWEN_REQUIRED_MODEL_OPENS,"observed_model_opens":preparation_observed_model_opens.context("preparation descriptor observation absent")?,"full144_digest_computed_after_generation":acquisition::tokens_digest(&prepared.workload)?,"frozen_file_sha256":hash(&std::fs::read(packet.output.join("frozen-workload.json"))?),"final_carry_is_metadata_not17th_input":true,"comparable_acquisition":false,"execution_approval_for_future_phases":false,"requires_independent_review":true}),
         )?;
     }
     println!("Q1_QWEN_T5_PHASE_COMPLETE mode={:?} logical_lanes=4 explicit_MTP_selector=true forced_proposal={} whole_q1=false",packet.mode,packet.mode==Mode::ForcedProposal);

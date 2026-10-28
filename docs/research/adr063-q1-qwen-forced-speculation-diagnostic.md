@@ -74,3 +74,18 @@ end the diagnostic without publishing a successful store or continuing model
 work. External timeout, process cleanup and resource qualification remain the
 root supervisor's responsibility. The F2 target-verification role guards in a
 separate branch must be preserved when integrating the two verifier call sites.
+
+## Direct-loader descriptor-count correction
+
+The first root preparation attempt failed before forward execution because the
+preparation guard required three verified model opens. This explicit direct
+Qwen route performs exactly two: the runner's header open and the actual
+Qwen35LoadedModel::load_with_context open, whose verified GGUF is reused for
+configuration and weights. It does not traverse LoadedModel's dispatcher open.
+The failed packet remains retained; no generated lineage or numerical result
+was accepted. The source-bound positive requirement is now two for preparation
+and later observed acquisitions. Preparation records both required and actual
+counts; under-count or a zero required count still refuses. A new source/binary,
+reviewed composition and prospective attempt are required, with the original
+frozen prefixes unchanged. This corrects acquisition bookkeeping only, not model
+math, sampling, candidate selection or Q1 qualification.

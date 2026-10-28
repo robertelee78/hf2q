@@ -34,6 +34,14 @@ pub fn preparation_prefix_digest(
     Ok(hex::encode(h.finalize()))
 }
 
+fn checked_descriptor_count(observed: u64, required: u64) -> Result<u64> {
+    ensure!(
+        required > 0 && observed >= required,
+        "actual family loader did not consume required verified descriptors"
+    );
+    Ok(observed)
+}
+
 impl Scope {
     pub fn begin_preparation(
         binding: &Binding,
@@ -54,21 +62,17 @@ impl Scope {
         scope.acquisition.provenance = "WorkloadPreparationNotComparable".into();
         Ok(scope)
     }
-    pub fn check_preparation_loaded(&self) -> Result<()> {
+    pub fn check_preparation_loaded(&self, required_model_opens: u64) -> Result<u64> {
         ensure!(
             self.acquisition.provenance == "WorkloadPreparationNotComparable"
                 && self.config_checked.get(),
             "preparation-only guard required"
         );
         self.check_unchanged()?;
-        ACTIVE.with(|slot| -> Result<()> {
+        ACTIVE.with(|slot| -> Result<u64> {
             let slot = slot.borrow();
             let active = slot.as_ref().context("preparation disappeared")?;
-            ensure!(
-                active.opens >= 3,
-                "actual family loader did not consume verified descriptors"
-            );
-            Ok(())
+            checked_descriptor_count(active.opens, required_model_opens)
         })
     }
 }
@@ -76,6 +80,14 @@ impl Scope {
 #[cfg(test)]
 mod controls {
     use super::*;
+    #[test]
+    fn q1_preparation_descriptor_requirement_is_positive_and_preserves_actual_count() {
+        assert_eq!(checked_descriptor_count(2, 2).unwrap(), 2);
+        assert_eq!(checked_descriptor_count(3, 2).unwrap(), 3);
+        assert!(checked_descriptor_count(1, 2).is_err());
+        assert!(checked_descriptor_count(0, 2).is_err());
+        assert!(checked_descriptor_count(2, 0).is_err());
+    }
     #[test]
     fn q1_preparation_prefix_digest_is_distinct_bounded_and_family_specific() {
         let p = (0..4).map(|n| vec![n; 128]).collect::<Vec<_>>();
