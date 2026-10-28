@@ -26,3 +26,6 @@ pub(crate) mod receipt;
 pub(crate) mod store;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod continuation_artifact_compare;
