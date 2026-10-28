@@ -47,7 +47,7 @@ def save(path, value, raw=False):
 
 
 def quiet(service, binary):
-    result = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,lstart=,comm=,args="], capture_output=True, timeout=2, check=True)
+    result = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,lstart=,ucomm=,args="], capture_output=True, timeout=2, check=True)
     require(not result.stderr, "quiet inventory stderr")
     return quiet_inventory(result.stdout, service, binary)
 

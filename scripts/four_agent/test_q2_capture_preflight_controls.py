@@ -13,7 +13,7 @@ from test_q2_capture_packet_controls import positive
 BINARY = {"path": "/private/tmp/MOCK-opencode", "sha256": "a" * 64}
 SERVICE = {"pid": 36057, "ppid": 1, "start": "Mon Oct 20 10:00:00 2026",
            "argv": [BINARY["path"], "serve", "--service"], "binary": BINARY}
-RAW = b"36057 1 Mon Oct 20 10:00:00 2026 /private/tmp/MOCK-opencode /private/tmp/MOCK-opencode serve --service\n"
+RAW = b"36057 1 Mon Oct 20 10:00:00 2026 MOCK-opencode /private/tmp/MOCK-opencode serve --service\n"
 
 
 class CapturePreflightControls(unittest.TestCase):
@@ -30,10 +30,13 @@ class CapturePreflightControls(unittest.TestCase):
         changed = dict(SERVICE, binary={"path": BINARY["path"], "sha256": "b" * 64})
         with self.assertRaises(Invalid): quiet_inventory(RAW, changed, BINARY)
     def test_other_opencode_helper_or_disappeared_bound_service_refuses(self):
-        for raw in (RAW + b"36058 1 Mon Oct 20 10:00:00 2026 /usr/bin/opencode /usr/bin/opencode run\n",
-                    RAW + b"36059 1 Mon Oct 20 10:00:00 2026 /tmp/helper-binary /tmp/helper-binary\n", b""):
+        for raw in (RAW + b"36058 1 Mon Oct 20 10:00:00 2026 opencode /usr/bin/opencode run\n",
+                    RAW + b"36059 1 Mon Oct 20 10:00:00 2026 helper-binary /tmp/helper-binary\n", b""):
             with self.assertRaises(Invalid): quiet_inventory(raw, SERVICE, BINARY)
         with self.assertRaises(Invalid): quiet_inventory(RAW.replace(b"MOCK-opencode", b"opencode"), None, BINARY)
+    def test_command_name_recognizes_model_under_long_executable_path(self):
+        raw = RAW + b"36060 1 Mon Oct 20 10:00:00 2026 hf2q /Users/MOCK/very/long/model/bin/hf2q serve\n"
+        with self.assertRaises(Invalid): quiet_inventory(raw, SERVICE, BINARY)
     def test_actual_launch_prefix_requires_standalone_not_service(self):
         argv = ["/usr/bin/sandbox-exec", "-f", "/tmp/MOCK.sb", BINARY["path"], "run", "--standalone", "--format", "json"]
         self.assertEqual(standalone_capture_argv(argv, argv[0], argv[2], argv[3]), argv)

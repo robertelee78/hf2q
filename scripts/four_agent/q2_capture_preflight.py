@@ -25,12 +25,12 @@ def quiet_inventory(raw, service, binary):
         fields = line.strip().split(None, 8)
         require(len(fields) == 9 and fields[0].isdecimal() and fields[1].isdecimal(), "typed process inventory")
         pid, ppid = int(fields[0]), int(fields[1]); start = " ".join(fields[2:7])
-        name, args = Path(fields[7]).name, fields[8]
+        name, args = fields[7], fields[8]
         if service is not None and pid == service["pid"]:
             require(allowed is None and ppid == service["ppid"] and start == service["start"]
-                    and fields[7] == binary["path"] and args == " ".join(service["argv"]),
+                    and name == Path(binary["path"]).name and args == " ".join(service["argv"]),
                     "preexisting service PID/start/argv/binary drift")
-            allowed = {"pid": pid, "ppid": ppid, "start": start, "comm": fields[7], "args": args}
+            allowed = {"pid": pid, "ppid": ppid, "start": start, "ucomm": fields[7], "args": args}
             continue
         require(name not in {"hf2q", "llama-server", "llama-cli", "test-binary", "helper-binary", "cargo", "rustc", "clang", "clang++", "opencode"}
                 and not name.startswith(("hf2q-", "mlx_native-", "noalloc-size", "live-wired", "owned-overlap")),
