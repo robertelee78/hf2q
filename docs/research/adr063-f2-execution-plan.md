@@ -107,7 +107,9 @@ Trace distinct booleans/counts: active admitted slot; runnable_forward (can sche
 
 ### Bounded metadata and exact source seam/file plan
 
-Proposed minimal HF addition: focused src/serve/phase_trace.rs types+bounded collector and tests, optional source-bound run config; extend api/measurement.rs snapshot with enabled trace schema/config digest/sequence bounds/dropped count only. Existing measurement runtime snapshot remains path-free. Total retained trace metadata <=256MiB across BOTH server and client collectors for ONErun, checked capacity/sequence arithmetic and parent-owner accounting BEFORE allocation. Batch metadata writes0600 outsideGit; no tensor content/model bytes. Overflow, dropped event, sequence gap, missing submission/drain, unknown row identity, ambiguous slot lineage or exceeded bound invalidates comparison; stop capture safely without silently trimming. Runtime serving need not crash solely for recorder failure, but run is invalid and supervisor stops it. No unbounded vector or per-event hidden disk quota.
+The prospective capacity exception below follows the governing ADR subsection “Native command diagnostic metadata capacity”; it is not a model/primary performance acceptance or a rescore of the first failed actual trace.
+
+Proposed minimal HF addition: focused src/serve/phase_trace.rs types+bounded collector and tests, optional source-bound run config; extend api/measurement.rs snapshot with enabled trace schema/config digest/sequence bounds/dropped count only. Existing measurement runtime snapshot remains path-free. The legacy/default serialized trace ceiling remains256MiB across BOTH server and client collectors for ONErun, with checked capacity/sequence arithmetic and parent-owner accounting before growth or append. A separate prospective `metadata_budget_profile="native_command_capture_v2"` may raise only the combined serialized ceiling to2GiB when an explicit native observer is present and `diagnostic_case=true`; it does not activate inference or enlarge a legacy packet. The exact profile is bound in the header and independent expectation. Native event1,000,000/live metadata16MiB/bookkeeping1MiB ceilings and minimum combined client reservation128MiB remain unchanged. The native reservation is carved from server budget; no omission, compression, sampling, wrap or truncation is permitted. Batch metadata writes0600 outsideGit; no tensor content/model bytes. Overflow, dropped event, sequence gap, missing submission/drain, unknown row identity, ambiguous slot lineage or exceeded bound invalidates comparison; stop capture safely without silently trimming. Runtime serving need not crash solely for recorder failure, but run is invalid and supervisor stops it. No unbounded vector or per-event hidden disk quota.
 
 Publisher seams (actual implementation review must pin exact symbol/line hashes, no giant engine rewrite):
 
@@ -141,3 +143,63 @@ Freeze metric schema `hf2q.f2.semantic-timing.v3` with separately named fields a
 Report TTFT and inter-event-only gap alongside the required end-to-end gap, rather than changing semantics silently. Legacy fields/data are retained with their original schema/meaning and explicitly converted only when raw timestamps establish the new fields. Historical firstsemantic-only receipts cannot synthesize inter-event gaps; report Unavailable. No role-only/reasoning-only heartbeat resets any semantic gap, and invalid/incomplete final tool output still fails task quality despite any early name timestamp. This is a new clearly labeled metric schema, not a retrospective redefinition of old component results.
 
 No other V2 workload, primary makespan, fixed six-block statistics, quota, source publisher, peer observability, failure policy or routine-authority boundary changes. Source-only plan, no repository edit or execution.
+
+## Prospective V4 population clarification: forward demand
+
+The ready-only V3 publisher/validator remains historical and must not be
+silently reinterpreted. Its `runnable_forward` means ready to schedule a graph
+now. A healthy shared forward can spend more than400ms of a fixed2s window
+waiting for its own submitted work, so ready-only80% can reject continuously
+forward-demanding clients. This is a source-level counterexample, not a measured
+hardware duration or a retrospective change to any case.
+
+New controls MUST freeze `population_policy=forward_demand_v2` before activation.
+The target population is current admitted request/slot/generation/phase owners
+with an unfinished forward obligation and either source-proven ReadyNow or
+source-proven SubmittedOutstanding. The latter requires an actual native submit
+joined to the current source-bound operator/forward-input witness and owner;
+it ends at checked completion, cancellation, error or lineage invalidation.
+Every credited submitted interval must eventually have a healthy matching
+checked drain before qualification. Count an owner once across overlapping
+submissions. Phase changes and slot recycling terminate old credit.
+
+Keep `runnable_forward` truthful and report ready-only composition from the SAME
+window separately. SubmittedOutstanding is not GPU Running: the host
+submit-to-checked-return bracket can include queue wait or completed work not
+yet observed. Do not report it as GPU utilization. CPU graph preparation needs
+its own independently reviewed state if it matters; it cannot extend a submit
+bracket backward. Emit-only, HTTP/queue occupancy, unknown lineage/membership,
+old inflight heartbeats and tool/client/backpressure/terminal blocking cannot
+substitute for the required evidence. A GPU-dependency wait is eligible only
+through its actual current submission join. Unknown required facts fail closed.
+
+The FIRST qualifying demand instant opens the fixed2s window; the entire window
+must end by activation+30s. Keep >=80% time-weighted target composition, new
+source-bound progress for EVERY owner inside the window, and eventual healthy
+checked completion unchanged. No best-window search, optional extension,
+workload reduction, mode disabling or favorable retry. Publish the policy ID
+in the plan/trace/certificate identity. Legacy ready-only results remain legacy;
+no absent policy field may implicitly acquire V2 credit.
+
+Physical membership is still per ACTUAL submission: known singletons remain
+singletons, and temporal verifier rows are not independent owners. Unioning
+outstanding singleton commands cannot manufacture shared B4. This population
+clarification does not waive required operator witnesses/maps, raw command
+integrity, dropped/Unknown-event failures, timing calibration, task quality,
+all-family gates or full-model trace-capacity evidence.
+
+Before activation, actual-used controls must distinguish low ready coverage
+from healthy demand coverage across a >400ms four-owner submit/wait; preserve
+four singleton memberships; refuse missing/stale/unknown/failed-drain/old-
+heartbeat and emit-only evidence; terminate credit on cancellation, phase
+transition and recycle; retain first-window selection and progress rules.
+Source review/controls and independent verdict are required before a V2 case.
+
+
+### Prospective native command capture capacity evidence
+
+The single actual diagnostic `f2-qwen38-native-trace-operating90-20261028T010639Z` retained116,391,761 bytes/187,748 records against116,391,936 server JSONL bytes (111MiB after carving native16MiB+bookkeeping1MiB from128MiB). Runtime marked capture invalid on quota. It also failed strict lifecycle validation atseq26 (unchecked async owner Drop) and lost explicit scope after rotation atseq56; no final native status/footer survived. These are distinct failures, not a passing coding protocol or a reason to reinterpret missing counters as zero. The old packet, source and failure remain immutable.
+
+The new closed profile is a prospective finite operating choice, not an inferred wholecase event upper bound: missing final counters prevent that claim. At client128MiB, total2GiB leaves server1920MiB and at the unchanged maximum native reservation leaves1903MiB server JSONL. It does not guarantee the unchanged1,000,000 native event limit or2GiB file quota will contain every future workload. Exhaustion still invalidates the complete attempt without replacement. A runtime packet must explicitly charge the additional1.75GiB allowed serialized I/O/file-cache exposure over legacy256MiB, plus actual parsing/runtime ownership, under its operating guards; neither2GiB disk bytes nor requested metadata is whole physical RAM. Client semantic heap/event limits are unchanged.
+
+Rust config validation and the strict Python artifact entrypoint must reject unknown/null profiles, missing/non-diagnostic native observer, legacy256MiB+1, new2GiB+1, client<128MiB and enlarged native event/live-metadata limits. A declared header profile must match the independent frozen expectation. No source/event dropping or changed task/context/output/precision policy is part of this exception. Native ownership/fallback fixes still require exact public publication/pinning and independent actual evidence before another model trace.
