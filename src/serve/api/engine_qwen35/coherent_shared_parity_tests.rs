@@ -23,7 +23,7 @@ struct Packet {
 #[serde(deny_unknown_fields)]
 struct Workload { family: String, lanes: Vec<Vec<u32>>, vocab_size: usize }
 #[derive(Serialize, PartialEq, Eq, Clone)]
-struct Record { key: String, bytes: usize, sha256: String, shape: Vec<usize>, file: String, source_view_shape: Vec<usize>, source_parent_bytes: usize, encoding: String }
+struct Record { shared_arm: bool, key: String, bytes: usize, sha256: String, shape: Vec<usize>, file: String, source_view_shape: Vec<usize>, source_parent_bytes: usize, encoding: String }
 struct Artifacts {
     output: PathBuf, bytes: u64, records: Vec<Record>,
     reference: BTreeMap<String, Record>, mismatches: Vec<String>, shared: bool,
@@ -59,7 +59,7 @@ impl Artifacts {
         if let Some(skip) = self.audit_skip {
             if key.rsplit_once("/owner").and_then(|(_,i)|i.parse::<usize>().ok()) == Some(skip) {return Ok(());}
             let (_,suffix)=key.split_once('/').context("audit coordinate")?;
-            let reference=self.records.iter().rev().find(|r|r.key==format!("{}/{suffix}",self.audit_reference)).context("actual final shared reference")?;
+            let reference=self.records.iter().rev().find(|r|r.shared_arm==self.shared && r.key==format!("{}/{suffix}",self.audit_reference)).context("actual final shared reference")?;
             let mut hash=Sha256::new();let mut bytes=0usize;
             for chunk in chunks {hash.update(chunk);bytes+=chunk.len();}
             let digest=format!("{:x}",hash.finalize());
@@ -79,7 +79,7 @@ impl Artifacts {
             }
             hash.update(chunk); out.write_all(chunk)?;
         }
-        let record = Record { encoding:if float { "F32LE" } else if key.contains(".packed/") { "PackedFloatingCacheU8" } else { "Utf8SemanticJson" }.to_owned(), key: key.clone(), source_view_shape:shape.clone(), source_parent_bytes:bytes, shape, bytes, sha256: format!("{:x}", hash.finalize()), file };
+        let record = Record { shared_arm:self.shared, encoding:if float { "F32LE" } else if key.contains(".packed/") { "PackedFloatingCacheU8" } else { "Utf8SemanticJson" }.to_owned(), key: key.clone(), source_view_shape:shape.clone(), source_parent_bytes:bytes, shape, bytes, sha256: format!("{:x}", hash.finalize()), file };
         if (key.starts_with("tail/") || key.starts_with("next/")) && key.rsplit_once("/owner").and_then(|(_,i)| i.parse::<usize>().ok()).is_some_and(|i| !self.selected.contains(&i)) {
             let (_, suffix) = key.split_once('/').context("phase coordinate")?;
             let before = self.reference.get(&format!("pre/{suffix}")).context("untouched pre coordinate")?;
@@ -415,12 +415,24 @@ fn final_cpu_only_audit_uses_retained_next_reference_without_new_payload() {
     let mut a=Artifacts{output:tmp.path().to_owned(),bytes:0,records:vec![],reference:BTreeMap::new(),
         mismatches:vec![],shared:false,boundaries:BTreeMap::new(),incomparable:vec![],selected:vec![2,0],
         audit_skip:None,audit_reference:"next",audit_checks:vec![],injection:None};
+    // Exercise the actual pre -> next lifecycle for an untouched owner;
+    // writing next without pre must not be treated as an accepted reference.
+    a.save("pre/fa0/key.packed/owner1".into(),vec![2],vec![&[1,2]],false).unwrap();
     a.save("next/fa0/key.packed/owner1".into(),vec![2],vec![&[1,2]],false).unwrap();
+    a.shared=true; a.audit_skip=Some(2);
+    assert!(a.save("after_final_injection/fa0/key.packed/owner1".into(),vec![2],vec![&[1,2]],false).is_err(),
+        "scalar next reference cannot substitute for missing shared next");
+    assert!(a.audit_checks.is_empty());
+    a.audit_skip=None;
+    a.save("pre/fa0/key.packed/owner1".into(),vec![2],vec![&[1,2]],false).unwrap();
+    a.save("next/fa0/key.packed/owner1".into(),vec![2],vec![&[1,2]],false).unwrap();
+    let actual_shared_reference=a.records.last().unwrap().file.clone();
     let bytes=a.bytes;let records=a.records.len();
     a.audit_skip=Some(2);
     a.save("after_final_injection/fa0/key.packed/owner1".into(),vec![2],vec![&[1,2]],false).unwrap();
     assert_eq!((a.bytes,a.records.len()),(bytes,records));
     assert_eq!(a.audit_checks.len(),1);
+    assert_eq!(a.audit_checks[0]["retained_reference_file"],json!(actual_shared_reference));
     assert!(a.save("after_final_injection/fa0/key.packed/owner1".into(),vec![2],vec![&[1,3]],false).is_err());
     // The only excluded owner is the actual first row already mutated before
     // the final injected Err. No retained reference or uninitialized read.
