@@ -130,7 +130,10 @@ def child(command, root, env, output, maximum_seconds):
 
 class Stub(HTTPServer):
     # One bounded callback at a time: no unbounded handler-thread join.
-    allow_reuse_address = False
+    # Sequential family captures may inherit TIME_WAIT from a closed HTTP peer.
+    # SO_REUSEADDR permits that rebind; never share a live listener via SO_REUSEPORT.
+    allow_reuse_address = True
+    allow_reuse_port = False
 
 
 class Handler(BaseHTTPRequestHandler):

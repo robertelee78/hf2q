@@ -192,3 +192,13 @@ captures remain failed; no model/tool-quality claim is inferred from this fix.
 Current cleanup correctly signals only a still-live Popen root when fresh process
 metrics are unavailable; detached groups require fresh identity evidence and
 Unknown cleanup remains false. That root correction is preserved unchanged.
+
+
+Sequential capture stub binding correction: the retained actual capture-v6 completed
+the first DeepSeek scripted profile and owned cleanup, then failed the next
+family's loopback bind with EADDRINUSE. That whole capture remains failed. The
+prospective stub enables SO_REUSEADDR for closed-connection TIME_WAIT while
+explicitly disabling SO_REUSEPORT. A bounded actual loopback control exercises
+HTTP EOF, close/rebind on the same port and refusal while a live owner listens.
+This is capture transport infrastructure, not native-tool/model quality,
+effective-sampling or campaign-primary qualification. No failed result is rescored.
