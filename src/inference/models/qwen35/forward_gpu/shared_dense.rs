@@ -121,8 +121,8 @@ pub(crate) fn run(model:&Qwen35Model,cache:&mut HybridKvCache,invocation:&mut In
 
 }
 
-/// Final diagnostic-only injected Err after a real healthy row copy. Not a
-/// Metal command-buffer error and never enabled by production/default calls.
+// Final diagnostic-only injected Err after a real healthy row copy. Not a
+// Metal command-buffer error and never enabled by production/default calls.
 #[cfg(test)]
 thread_local! {
     static FIXTURE_INJECT: Cell<bool> = const { Cell::new(false) };
