@@ -6,6 +6,9 @@ use serde::Deserialize;
 use std::{collections::BTreeMap, fs::OpenOptions, io::Write,
     os::unix::fs::OpenOptionsExt, path::{Path, PathBuf}};
 
+#[derive(Deserialize, PartialEq)]
+enum BaselinePlan { Cold128, SharedEnginePending64 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Packet {
@@ -13,6 +16,8 @@ struct Packet {
     identity: Identity,
     prepared: FileBinding,
     cold: FileBinding,
+    baseline_plan: BaselinePlan,
+    matched_prefix64: Option<FileBinding>,
     recovered: FileBinding,
     before64: FileBinding,
     restored64: FileBinding,
@@ -61,13 +66,25 @@ fn run(packet: Packet) -> Result<()> {
     let (restored_root,restored) = load(&packet.restored64)?;
     let expected = qwen_continuation::expected(&cfg,262144)?;
     let checkpoint = qwen_continuation::checkpoint_expected(&cfg,262144)?;
-    manifest(&cold,&packet.identity,&expected,"T0Tail64To143")?;
+    manifest(&cold,&packet.identity,&expected,match packet.baseline_plan {
+        BaselinePlan::Cold128=>"T0Tail64To143",
+        BaselinePlan::SharedEnginePending64=>"T0ChunkMatched64Tail64To143",
+    })?;
     manifest(&recovered,&packet.identity,&expected,"T6Tail64To143")?;
     manifest(&before,&packet.identity,&checkpoint,"T6Checkpoint64")?;
     manifest(&restored,&packet.identity,&checkpoint,"T6ActualEngineRecovered64")?;
     let exact: BTreeMap<_,_> = checkpoint.iter().map(|e|(e.at.stage,NumericPolicy::Exact)).collect();
     let recovery = compare::compare_recovery(&before_root,&before,&restored_root,&restored,&exact);
     ensure!(recovery.disposition == Disposition::ExactEqual,"actual64 restore is not exact: {:?}",recovery.disposition);
+    let common_prefix64 = if packet.baseline_plan == BaselinePlan::SharedEnginePending64 {
+        let binding=packet.matched_prefix64.as_ref().context("required baseline64 checkpoint")?;
+        let (prefix_root,prefix)=load(binding)?;
+        manifest(&prefix,&packet.identity,&checkpoint,"T0ChunkMatchedCheckpoint64")?;
+        Some(compare::compare(&prefix_root,&prefix,&before_root,&before,&exact))
+    } else {
+        ensure!(packet.matched_prefix64.is_none(),"unexpected prefix64 for unmatched baseline");
+        None
+    };
     let unspecified = expected.iter().map(|e|(e.at.stage,NumericPolicy::Unspecified)).collect();
     let continuation = compare::compare(&cold_root,&cold,&recovered_root,&recovered,&unspecified);
     ensure!(!matches!(continuation.disposition,Disposition::InvalidEvidence |
@@ -77,11 +94,17 @@ fn run(packet: Packet) -> Result<()> {
     // invariant divergence, if any, is retained verbatim in the actual report.
     let report = serde_json::json!({"schema":"hf2q.q1.continuation-artifact-report.v1",
         "identity":packet.identity,"recovery64":recovery,"continuation":continuation,
+        "baseline_common_prefix64":common_prefix64,
+        "baseline_mode":if packet.baseline_plan==BaselinePlan::Cold128 {"Cold128"}else{"SharedEnginePending64"},
         "float_policy":"Unspecified","float_disposition":"ExplicitInconclusiveNumericPolicy",
         "logical_lanes":4,"physical_slots":1,"rows_per_lane":80,"row_scope":[64,144],
         "active_cache_boundaries":[128,144],"first64_logits_captured":false,
         "whole_q1_qualified":false,"performance_qualified":false,"physical_admission":false});
     output(&packet.output,&serde_json::to_vec_pretty(&report)?)?;
+    if let Some(prefix)=common_prefix64 {
+        ensure!(prefix.disposition==Disposition::ExactEqual,
+            "prefix64 not empirically matched; report retained, no rollback attribution");
+    }
     println!("Q1_CONTINUATION_ARTIFACT_COMPARE_COMPLETE lanes=4 rows=80 recovery64=exact float_policy=Unspecified whole_q1=false");
     Ok(())
 }
