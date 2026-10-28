@@ -365,30 +365,6 @@ pub(crate) fn scheduler(states: Vec<SlotState>, cause: &'static str) {
     publish("slots", json!({"cause":cause,"slots":states}));
 }
 
-/// Bind known physical rows only at an actual graph-submission seam. A family
-/// adapter lacking that seam MUST emit an unqualified observation instead.
-pub(crate) fn physical_submission(submission_id: u64, rows: &[PhysicalRow]) {
-    if rows.is_empty() || rows.len() > 256 {
-        if let Trace::Active(lock) = TRACE.get_or_init(initialize) {
-            if let Ok(mut r) = lock.lock() {
-                r.invalid = Some("physical row metadata bound exceeded".into());
-            }
-        }
-        return;
-    }
-    publish(
-        "submission",
-        json!({"submission_id":submission_id,"membership":"Known","rows":rows}),
-    );
-}
-
-pub(crate) fn checked_drain(submission_id: u64, success: bool) {
-    publish(
-        "drain",
-        json!({"submission_id":submission_id,"success":success}),
-    );
-}
-
 /// One owned worker must finalize the metadata stream. An unhealthy/panicking
 /// worker never produces a successful trace footer, even if its process exits.
 pub(crate) struct WorkerTrace<F: Fn() -> bool> {
