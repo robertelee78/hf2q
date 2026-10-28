@@ -199,6 +199,8 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("per_pos argmax read: {e}"))?;
                 idx[0]
             };
+            #[cfg(test)]
+            crate::adr063_invariance::gemma_ngram::argmax_row(pos,&self.activations.logits,argmax_val)?;
             argmaxes.push(argmax_val);
         }
 
@@ -398,6 +400,8 @@ impl MlxModelWeights {
             .take(n)
             .copied()
             .collect();
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_ngram::argmax_matrix(&logits_batched,&argmaxes)?;
         Ok(argmaxes)
     }
     /// Read the `[vocab_size]` F32 logits buffer that was produced by the

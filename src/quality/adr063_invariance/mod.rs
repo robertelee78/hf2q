@@ -51,3 +51,6 @@ mod deepseek_prepare;
 
 #[cfg(test)]
 mod gemma_greedy_prepare;
+
+#[cfg(test)]
+pub(crate) mod gemma_ngram;
