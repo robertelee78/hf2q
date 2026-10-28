@@ -16,7 +16,9 @@ fn preflight(p:&Packet)->Result<()> {
     p.identity.validate().map_err(anyhow::Error::msg)?;p.workload.validate().map_err(anyhow::Error::msg)?;
     ensure!(p.execution_approved && p.identity.family==Family::Gemma4 && p.workload.family==Family::Gemma4,
         "explicit approved Gemma packet/family required");
-    require_ordinary(p.trajectory)?;
+    if p.trajectory!=Trajectory::T2ActualCohort { require_ordinary(p.trajectory)?; }
+    else { ensure!(std::env::var("HF2Q_BATCHED_BODY").as_deref()!=Ok("0"),
+        "Gemma T2 selected body opt-out remains respected"); }
     ensure!(p.configured_context==262144 && p.configured_output_allowance==8192,
         "selected Gemma context/output profile required");
     ensure!(p.host_payload_limit>0 && p.host_payload_limit<=2*1024*1024*1024,
@@ -60,13 +62,17 @@ fn prefill(model:&mut GemmaLoadedModel,tokens:&[u32],lane:usize,cached:usize)->R
 }
 #[test]
 #[ignore="root supervised actual Gemma model; reviewed acquisition/resource packet required"]
-fn q1_gemma_actual_ordinary_endpoint_trace() {run().unwrap();}
-fn run()->Result<()> {
+fn q1_gemma_actual_ordinary_endpoint_trace() {run(false).unwrap();}
+#[test]
+#[ignore="root supervised actual Gemma packed cohort; reviewed resource/identity packet"]
+fn q1_gemma_actual_cohort_endpoint_trace() {run(true).unwrap();}
+fn run(cohort:bool)->Result<()> {
     ensure!(cfg!(target_endian="little"),"raw tensor encoding requires little endian");
     let path=std::env::var_os("HF2Q_Q1_GEMMA_ENDPOINT_PACKET").context("explicit Gemma endpoint packet")?;
     let mut raw=Vec::new();std::fs::File::open(path)?.take(1024*1024+1).read_to_end(&mut raw)?;
     ensure!(raw.len()<=1024*1024,"Gemma packet quota");
     let p:Packet=serde_json::from_slice(&raw)?;preflight(&p)?;
+    ensure!((p.trajectory==Trajectory::T2ActualCohort)==cohort,"actual test filter/trajectory mismatch");
     let scope=acquisition::Scope::begin(&p.acquisition,&p.identity,&p.workload,&p.model,&p.output,&raw)?;
     let header=acquisition::open_model(&p.model)?;
     ensure!(header.metadata_string("general.architecture")==Some("gemma4"),"no family fallback");
@@ -100,6 +106,26 @@ fn run()->Result<()> {
     let _capture=endpoint::install(store).map_err(anyhow::Error::msg)?;
     let order=if p.trajectory==Trajectory::T4ReverseOrder {[3,2,1,0]}else{[0,1,2,3]};
     let result=(||->Result<()> {
+        if p.trajectory==Trajectory::T2ActualCohort {
+            use crate::serve::api::engine::q1_gemma_cohort;
+            let layout=(0..4).map(|lane|(lane as u32,0,128,lane*128)).collect::<Vec<_>>();
+            endpoint::begin_packed(&layout).map_err(anyhow::Error::msg)?;
+            let seqs=(0..4).map(|lane|(p.workload.lanes[lane][..128].to_vec(),SlotId(lane as u32)))
+                .collect::<Vec<_>>();
+            q1_gemma_cohort::prefill(&mut model,&seqs)?;
+            endpoint::end_call().map_err(anyhow::Error::msg)?;
+            for lane in 0..4 {cache(&model,lane,128,false)?;}
+            let slots=[SlotId(0),SlotId(1),SlotId(2),SlotId(3)];
+            for position in 128..144 {
+                let tokens=p.workload.lanes.iter().map(|v|v[position]).collect::<Vec<_>>();
+                let logits=q1_gemma_cohort::decode(&mut model,&tokens,&slots,position)?;
+                for (lane,row) in logits.chunks_exact(cfg.vocab_size).enumerate() {
+                    endpoint::downloaded_logits(lane,position,row).map_err(anyhow::Error::msg)?;
+                }
+            }
+            for lane in 0..4 {cache(&model,lane,144,false)?;}
+            return Ok(());
+        }
         for lane in order {
             let tokens=&p.workload.lanes[lane];
             if matches!(p.trajectory,Trajectory::T1Resume64|Trajectory::T3Chunk64) {
@@ -129,7 +155,9 @@ fn run()->Result<()> {
     let trace=endpoint::finish().map_err(anyhow::Error::msg)?;result?;
     ensure!(trace.coverage.errors.is_empty(),"Gemma endpoint extent incomplete");
     let report=serde_json::json!({"schema":"hf2q.q1.gemma-ordinary-endpoint.v1","packet_sha256":hash(&raw),
-        "trajectory":p.trajectory,"logical_lanes":4,"physical_graph_membership":"per-request ordinary; not T2",
+        "trajectory":p.trajectory,"logical_lanes":4,"physical_graph_membership":if p.trajectory==Trajectory::T2ActualCohort {
+            "actual packed prefill512 rows with four128-owner spans; actual decode input4rows; operator-specific source geometry, not whole-kernel/F2 membership"
+        } else {"per-request ordinary; not T2"},
         "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,
         "planned_tensor_payload":bytes,"oracle_quality_qualified":false,"whole_q1_qualified":false,
         "float_policy":"Unspecified","diagnostic_head_scope":"same production scalar head applied to every actual prefill hidden row"});

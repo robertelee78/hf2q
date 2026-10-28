@@ -67,7 +67,7 @@ fn complete_active_cache_plan_has_every_head_and_distinct_actual_restore64() {
 fn endpoint_scope_cannot_relabel_packed_graph_or_omit_rows() {
     use std::sync::atomic::{AtomicU64,Ordering};
     static NEXT:AtomicU64=AtomicU64::new(0);
-    assert!(endpoint::head_rows(0,64,false).unwrap().is_none());
+    assert!(endpoint::head_rows(0,64,None).unwrap().is_none());
     let root=std::env::temp_dir().canonicalize().unwrap().join(format!("q1-gemma-head-{}-{}",
         std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
     let identity=Identity {family:Family::Gemma4,source_commit:"a".repeat(40),binary_sha256:"b".repeat(64),
@@ -79,12 +79,27 @@ fn endpoint_scope_cannot_relabel_packed_graph_or_omit_rows() {
     let store=Store::new(&root,identity,"HOST_ONLY_CONTROL".into(),expected,32768,1).unwrap();
     let scope=endpoint::install(store).unwrap();
     endpoint::begin_call(0,0,64).unwrap();
-    assert_eq!(endpoint::head_rows(0,64,false).unwrap().unwrap(),(0..64).collect::<Vec<_>>());
-    assert!(endpoint::head_rows(0,64,true).is_err());
-    assert!(endpoint::head_rows(64,64,false).is_err());
+    assert_eq!(endpoint::head_rows(0,64,None).unwrap().unwrap(),(0..64).collect::<Vec<_>>());
+    assert!(endpoint::head_rows(0,64,Some(vec![(0,0,128,0),(1,0,128,128),(2,0,128,256),(3,0,128,384)])).is_err());
+    assert!(endpoint::head_rows(64,64,None).is_err());
     assert!(endpoint::begin_call(1,0,64).is_err());
     assert!(endpoint::end_call().is_err());
     drop(scope);
-    assert!(endpoint::head_rows(0,64,false).unwrap().is_none());
+    assert!(endpoint::head_rows(0,64,None).unwrap().is_none());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn packed_head_owner_mapping_uses_actual_offsets_not_width_as_membership() {
+    let layout=vec![(0,0,128,0),(1,0,128,128),(2,0,128,256),(3,0,128,384)];
+    let owners=endpoint::packed_owners(&layout).unwrap();
+    assert_eq!(owners.len(),512);
+    assert_eq!(owners[127],(0,127));assert_eq!(owners[128],(1,0));
+    assert_eq!(owners[511],(3,127));
+    for (entry,value) in [(1,(1,0,128,127)),(2,(1,0,128,256)),(0,(0,1,128,0)),(3,(3,0,127,384))] {
+        let mut bad=layout.clone();bad[entry]=value;
+        assert!(endpoint::packed_owners(&bad).is_err());
+    }
+    // One temporal512-row request is not four independent128-row inputs.
+    assert!(endpoint::packed_owners(&[(0,0,512,0)]).is_err());
 }

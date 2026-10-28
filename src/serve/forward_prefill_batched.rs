@@ -6325,9 +6325,14 @@ impl MlxModelWeights {
         };
         #[cfg(test)]
         let q1_endpoint_rows = crate::adr063_invariance::gemma_endpoint::head_rows(
-            start_pos, seq_len, self.multi_seq_prefill.is_some()).map_err(anyhow::Error::msg)?;
+            start_pos, seq_len, self.multi_seq_prefill.as_ref().map(|ms|
+                ms.slot_ids.iter().zip(&ms.start_positions).zip(&ms.seq_lens).zip(&ms.seq_offsets)
+                    .map(|(((slot,start),len),offset)|(slot.0,*start,*len,*offset)).collect()))
+            .map_err(anyhow::Error::msg)?;
         #[cfg(test)]
         let q1_endpoint_all_rows = q1_endpoint_rows.is_some();
+        #[cfg(test)]
+        let original_head_rows = head_rows.clone();
         #[cfg(test)]
         let head_rows = q1_endpoint_rows.unwrap_or(head_rows);
         let mut ms_tokens: Vec<u32> = Vec::with_capacity(head_rows.len());
@@ -6492,7 +6497,11 @@ impl MlxModelWeights {
             crate::adr063_invariance::gemma_endpoint::logits(
                 head_row, &self.activations.logits, vocab_size).map_err(anyhow::Error::msg)?;
 
-            if capture_multi_seq_logits {
+            #[cfg(test)]
+            let publish_selected_head = !q1_endpoint_all_rows || original_head_rows.contains(&head_row);
+            #[cfg(not(test))]
+            let publish_selected_head = true;
+            if capture_multi_seq_logits && publish_selected_head {
                 let logits: &[f32] = self
                     .activations
                     .logits
@@ -6526,13 +6535,13 @@ impl MlxModelWeights {
             validate_batched_prefill_argmax(argmax_value, head_row)?;
             // first_token (the fn's return) is seq 0's token — single-seq
             // callers read it; multi-seq callers read out_first_tokens.
-            if ms_tokens.is_empty() {
+            if ms_tokens.is_empty() && publish_selected_head {
                 first_token = tok;
             }
             // Diagnostic visits every row; preserve the ordinary last-row result.
             #[cfg(test)]
-            if q1_endpoint_all_rows { first_token = tok; }
-            ms_tokens.push(tok);
+            if q1_endpoint_all_rows && !capture_multi_seq_logits { first_token = tok; }
+            if publish_selected_head { ms_tokens.push(tok); }
         }
         // iter-G(a): hand the per-seq first tokens back to the wrapper. No-op
         // in single-seq mode (multi_seq_prefill is None).

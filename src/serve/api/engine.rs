@@ -37,6 +37,9 @@ pub(crate) mod gemma_full_input;
 #[cfg(test)]
 #[path = "engine/q1_qwen_cancel.rs"]
 pub(crate) mod q1_qwen_cancel;
+#[cfg(test)]
+#[path = "engine/q1_gemma_cohort.rs"]
+pub(crate) mod q1_gemma_cohort;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};

@@ -8,6 +8,7 @@ pub enum Adapter {
     QwenOrdinary,
     DeepseekOrdinary,
     GemmaOrdinary,
+    GemmaPackedCohort,
     QwenOwningWorkerRecovery,
     QwenCoherentSpeculation,
     SourceRefusal,
@@ -47,6 +48,9 @@ pub fn cell(family: Family, trajectory: Trajectory) -> Cell {
         (Deepseek4, _) => (DeepseekOrdinary,
             "deepseek_runner actual forward; T6 real commit gate",
             "endpoint helper lacks full active cache extent and exact64 capture joins"),
+        (Gemma4, T2ActualCohort) => (GemmaPackedCohort,
+            "actual four-sequence packed prefill; production batched body and fused-or-batched head decode",
+            "authored source adapter; operator-specific row owners, actual execution/native witness pending"),
         (Gemma4, T0ColdSerial | T1Resume64 | T3Chunk64 | T4ReverseOrder | T7RepeatCold | T8RepeatCold) => (GemmaOrdinary,
             "gemma_actual production slot-aware Hybrid body; same scalar head for all actual rows",
             "authored diagnostic; actual execution, exact checkpoint and full cache coverage pending"),
@@ -69,6 +73,7 @@ pub fn ordinary_preflight(family: Family, trajectory: Trajectory) -> Result<(), 
         Adapter::SourceRefusal => Err(format!("SourceCapabilityRefusal: {}", cell(family, trajectory).gap)),
         Adapter::QwenCoherentSpeculation | Adapter::QwenOwningWorkerRecovery =>
             Err(format!("SeparateActualAdapterRequired: {}", cell(family, trajectory).scope)),
+        Adapter::GemmaPackedCohort => Err("SeparateActualAdapterRequired: Gemma packed cohort endpoint filter".into()),
         Adapter::Missing => Err(format!("LocalizationIncomplete: {}", cell(family, trajectory).gap)),
     }
 }
