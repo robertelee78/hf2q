@@ -29,6 +29,7 @@ struct Prefixes {
 struct Packet {
     execution_approved: bool,
     first_fork: Option<bool>,
+    target_layers: Option<bool>,
     mode: Mode,
     acquisition: Binding,
     identity: Identity,
@@ -104,9 +105,12 @@ fn write(root: &Path, name: &str, value: &serde_json::Value) -> Result<()> {
 fn q1_qwen_actual_t5_speculation_phase() {
     run().unwrap();
 }
-fn run() -> Result<()> { run_inner(false) }
-pub(super) fn run_first_fork() -> Result<()> { run_inner(true) }
-fn run_inner(first_fork: bool) -> Result<()> {
+fn run() -> Result<()> { run_inner(false,false) }
+pub(super) fn run_first_fork() -> Result<()> { run_inner(true,false) }
+#[test]
+#[ignore="explicit frozen first-fork target layer packet; actual model; root supervised"]
+fn q1_qwen_t5_target_layer_localizer_actual() {run_inner(true,true).unwrap();}
+fn run_inner(first_fork: bool,target_layers:bool) -> Result<()> {
     let mut raw = Vec::new();
     File::open(PathBuf::from(
         std::env::var_os("HF2Q_Q1_QWEN_T5_PACKET").context("explicit T5 packet")?,
@@ -118,6 +122,8 @@ fn run_inner(first_fork: bool) -> Result<()> {
     anyhow::ensure!(packet.execution_approved, "root execution approval missing");
     anyhow::ensure!(packet.first_fork == if first_fork {Some(true)} else {None},
         "explicit first-fork packet/test pairing; no old-entrypoint relabeling");
+    anyhow::ensure!(packet.target_layers==if target_layers {Some(true)}else{None},
+        "explicit target-layer packet/test pairing; no old capture relabeling");
     if first_fork {
         anyhow::ensure!(packet.mode != Mode::Preparation && packet.identity.family == Family::Qwen38 &&
             packet.identity.token_vectors_sha256 == "aeaec06b8c893e4b2445f993a66a250ff3af0b595f54c749b1bd6790073eafbc",
@@ -196,6 +202,8 @@ fn run_inner(first_fork: bool) -> Result<()> {
     } else {plan::paired_payload(&cfg, 262144)?};
     if first_fork {anyhow::ensure!(paired_bytes<=1024*1024*1024,
         "source first-fork pair exceeds1GiB before model/device load");}
+    if target_layers {anyhow::ensure!(paired_bytes.checked_add(2*crate::inference::models::qwen35::q1_target_layer_capture::ARM_BYTES)
+        ==Some(834_079_552),"selected two-arm layer evidence bound before model/device load");}
     drop(header);
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let options = LoadOptions {
@@ -305,6 +313,12 @@ fn run_inner(first_fork: bool) -> Result<()> {
     if first_fork { active.first_fork=Some(super::first_fork::make(&cfg,
         packet.mode==Mode::ForcedProposal,&make)?); }
     let _capture = install(active)?;
+    let target_layer_scope=if target_layers {
+        let frozen=frozen.as_ref().context("no new layer-localizer preparation")?;
+        Some(crate::inference::models::qwen35::q1_target_layer_capture::install(
+            make("target-layer-localizer",crate::inference::models::qwen35::q1_target_layer_capture::expected())?,
+            packet.mode==Mode::ForcedProposal,[frozen.workload.lanes[0][129],frozen.workload.lanes[0][130]])?)
+    }else{None};
     let mut zero_elements = Vec::new();
     let result = (|| -> Result<()> {
         for lane in 0..(if first_fork {1} else {4}) {
@@ -320,11 +334,17 @@ fn run_inner(first_fork: bool) -> Result<()> {
     let mut active = finish()?;
     scope.check_unchanged()?;
     let complete = if first_fork {super::first_fork::validate(&active)} else {validate_complete(&active)};
-    let failed = result
+    let mut failed = result
         .as_ref()
         .err()
         .or_else(|| complete.as_ref().err())
         .map(|e| format!("{e:#}"));
+    let target_layer_metadata=if let Some(scope)=target_layer_scope {
+        match scope.finish(failed.as_deref()) {
+            Ok(value)=>Some(value),
+            Err(error)=>{failed.get_or_insert_with(||format!("target-layer trace: {error:#}"));None}
+        }
+    }else{None};
     if let Some(error) = &failed {
         if let Some(s) = active.committed.as_mut() {
             s.fail(error.clone());
@@ -358,9 +378,24 @@ fn run_inner(first_fork: bool) -> Result<()> {
             "initial129_exact_comparison_pending":true,"float_policy":"Unspecified",
             "all4lane_execution":false,"rejected_tail_baseline_claim":false});
     }
+    if target_layers {
+        if let Some(metadata)=target_layer_metadata {
+            write(&packet.output,"target-layer-localizer-metadata.json",&metadata)?;
+        }
+        descriptor["status"]=serde_json::json!(if failed.is_some() {"FailedOrIncomplete"}
+            else {"CompleteTargetLayerDiagnosticNotQ1Qualified"});
+        descriptor["target_layer_localizer"]=serde_json::json!({"records":258,"row_positions":[129,130],
+            "payload_bytes":crate::inference::models::qwen35::q1_target_layer_capture::ARM_BYTES,
+            "paired_total_payload_bytes":834_079_552,"additional_checked_waits":0,
+            "native_operator_route":"UnknownNotObserved","whole_q1_qualified":false});
+    }
     write(&packet.output, "execution.json", &descriptor)?;
     if let Some(error) = failed {
         anyhow::bail!(error);
+    }
+    if target_layers {
+        println!("Q1_QWEN_T5_TARGET_LAYERS_COMPLETE mode={:?} logical_lanes=1 agent=0 cursor=131 checkpoints=258 float_policy=Unspecified whole_q1=false",packet.mode);
+        return Ok(());
     }
     if first_fork {
         println!("Q1_QWEN_T5_FIRST_FORK_COMPLETE mode={:?} logical_lanes=1 agent=0 cursor=131 float_policy=Unspecified whole_q1=false",packet.mode);

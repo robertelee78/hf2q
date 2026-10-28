@@ -848,8 +848,12 @@ pub(super) fn embed_tokens_gpu_into(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
     output: &mut MlxBuffer,
+    #[cfg(test)] q1_snapshots: Option<&mut super::q1_target_layer_capture::Forward>,
 ) -> Result<()> {
     ensure!(!tokens.is_empty(), "embedding tokens must not be empty");
+    #[cfg(test)]
+    anyhow::ensure!(q1_snapshots.is_none() || token_embd_native.is_some(),
+        "layer snapshots require the existing native embedding encoder");
     let hidden = hidden_size as usize;
     ensure!(hidden > 0, "embedding hidden_size must be positive");
     ensure!(
@@ -967,6 +971,8 @@ pub(super) fn embed_tokens_gpu_into(
                 .context("native Q8_0 embedding gather")?;
             }
             NativeEmbeddingRoute::F32 => {
+                #[cfg(test)]
+                anyhow::ensure!(q1_snapshots.is_none(),"CPU-upload embedding snapshot unsupported; no extra encoder");
                 let table = native
                     .buffer
                     .as_slice::<f32>()
@@ -975,6 +981,13 @@ pub(super) fn embed_tokens_gpu_into(
                 return upload_f32_into(&rows, output)
                     .context("upload selected native F32 embedding rows");
             }
+        }
+        #[cfg(test)]
+        if let Some(snapshots)=q1_snapshots {
+            snapshots.snapshot(&mut enc,output,0,crate::adr063_invariance::receipt::Stage::Input,
+                serde_json::json!({"source":"actual embedding gather before its original commit and any attention",
+                    "codec":format!("{:?}",native.info.ggml_dtype),"native_rows":native.info.rows,
+                    "native_columns":native.info.cols,"actual_token_rows":tokens.len()}))?;
         }
         // The consuming Qwen/MTP forward is submitted to the same Metal
         // command queue, so normal retained-reference command buffers need
@@ -1015,6 +1028,7 @@ fn embed_tokens_gpu(
     hidden_size: u32,
     device: &MlxDevice,
     registry: &mut KernelRegistry,
+    #[cfg(test)] q1_snapshots: Option<&mut super::q1_target_layer_capture::Forward>,
 ) -> Result<MlxBuffer> {
     let bytes = tokens
         .len()
@@ -1043,6 +1057,7 @@ fn embed_tokens_gpu(
         device,
         registry,
         &mut output,
+        #[cfg(test)] q1_snapshots,
     )?;
     Ok(output)
 }
@@ -1140,6 +1155,7 @@ fn embed_tokens_gpu_with_soft_tokens(
         hidden_size,
         device,
         registry,
+        #[cfg(test)] None,
     )?;
     let mut enc = device
         .command_encoder()
@@ -3424,6 +3440,7 @@ impl Qwen35Model {
             cfg.hidden_size,
             device,
             registry,
+            #[cfg(test)] None,
         )
     }
 
@@ -4171,6 +4188,19 @@ impl Qwen35Model {
         let mut registry = unsafe { &mut *registry_ref };
         let layer_weights_gpu = unsafe { &*layer_weights_gpu };
         let output_head = unsafe { &*output_head_ref };
+        #[cfg(test)]
+        let mut q1_target_layers = if super::q1_target_layer_capture::selected() {
+            super::q1_target_layer_capture::begin(
+            &device,cfg,tokens,positions_flat,slot_id.0 as usize,
+            matches!(output_head_mode,OutputHeadMode::All) && nextn_hidden_out.is_some(),
+            kv_cache.n_seqs==1 && capture.is_none() && hidden_out.is_none() && residual_capture.is_none()
+                && soft_tokens.is_empty() && deepstack.is_none() && self.glp.is_none()
+                && self.token_embd_native.is_some()
+                && !super::execution_dispatch::dense_q_split_profile_enabled()
+                && layer_weights_gpu.iter().all(|l|matches!(l,
+                    LayerWeightsGpu::FullAttn{ffn:FfnWeightsGpu::DenseQ(_),..} |
+                    LayerWeightsGpu::LinearAttn{ffn:FfnWeightsGpu::DenseQ(_),..})))?
+        }else{None};
 
         // ---- Step 1: embedding lookup → hidden ----
         //
@@ -4190,6 +4220,7 @@ impl Qwen35Model {
                 h,
                 &device,
                 &mut registry,
+                #[cfg(test)] q1_target_layers.as_mut(),
             )
             .context("embed_tokens_gpu")?
         } else {
@@ -4870,6 +4901,10 @@ impl Qwen35Model {
         // `phase1_fusion_env_eligible`, because both the last-layer held
         // encoder gate and the fold/apply sites below key on it.)
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
+            #[cfg(test)]
+            let q1_layer_before = if q1_target_layers.is_some() {
+                Some(q1_layer_metadata::state(kv_cache,layer_idx,slot_id)?)
+            } else {None};
             // K-boundary: last layer in the window OR final layer overall.
             // At K=1 every layer is a boundary (= current behaviour).
             let is_k_boundary = seq_len == 1
@@ -5374,6 +5409,13 @@ impl Qwen35Model {
                     eps,
                 )
                 .with_context(|| format!("dispatch_fused_residual_norm_f32 layer {layer_idx}"))?;
+                #[cfg(test)]
+                if let Some(snapshots)=q1_target_layers.as_mut() {
+                    snapshots.snapshot(enc.encoder(),&ffn_residual_buf,layer_idx,
+                        crate::adr063_invariance::receipt::Stage::Residual,
+                        q1_layer_metadata::layer(layer_gpu,kv_cache,layer_idx,slot_id,seq_len,cfg,
+                            q1_layer_before.as_ref().context("missing layer state")?)?)?;
+                }
                 if any_fused_eligible {
                     // Keep the encoder open; the DenseQ / MoeQ branch below
                     // will dispatch the FFN body into the same command buffer
@@ -5570,6 +5612,14 @@ impl Qwen35Model {
                             )
                             .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?,
                         };
+                        #[cfg(test)]
+                        if let Some(snapshots)=q1_target_layers.as_mut() {
+                            snapshots.snapshot(enc.encoder(),&out,layer_idx,
+                                crate::adr063_invariance::receipt::Stage::LayerOutput,
+                                serde_json::json!({"hf_ffn_branch":if seq_len>1 {"DenseQ into arena/ring"}else{"DenseQ into pooled"},
+                                    "actual_m":seq_len,"weights":q1_layer_metadata::ffn(w),
+                                    "after_state":q1_layer_metadata::state(kv_cache,layer_idx,slot_id)?}))?;
+                        }
                         if seq_len == 1 {
                             // Decode path (DROP_SITE per spec §1.1).
                             // commit_unlabeled preserves pre-iter90 enc.commit()
@@ -6400,6 +6450,10 @@ impl Qwen35Model {
                 t.elapsed().as_micros() as f64 / 1000.0
             );
         }
+        #[cfg(test)]
+        if let Some(snapshots)=q1_target_layers.take() {
+            snapshots.finish_after_checked_output_head()?;
+        }
         // ADR-019 Phase 2 iter92 — final drain of attn_out hold-vec.
         //
         // The output-head's terminal `commit_and_wait_labeled` (above)
@@ -6708,6 +6762,7 @@ impl Qwen35Model {
                 device,
                 &mut registry,
                 embed_buf_mut,
+                #[cfg(test)] None,
             )
             .context("embed exact row into greedy buffer")?;
             decode_bufs.embed_buf.clone()
@@ -8016,6 +8071,7 @@ impl Qwen35Model {
                 cfg.hidden_size,
                 device,
                 registry,
+                #[cfg(test)] None,
             )
             .context("forward_tree_verify_gpu: embed tree tokens")?;
             let tree_mask_buf =
@@ -12456,3 +12512,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "forward_gpu/q1_layer_metadata.rs"]
+mod q1_layer_metadata;
