@@ -32,3 +32,5 @@ mod tests;
 mod continuation_artifact_compare;
 #[cfg(test)]
 mod t5_artifact_compare;
+
+pub(crate) mod matrix;

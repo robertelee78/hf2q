@@ -9,7 +9,7 @@ use crate::inference::models::qwen35::{
     kv_cache::HybridKvCache, model::Qwen35Model, spec_decode::positions_for_range, Qwen35Variant,
 };
 use crate::serve::multi_seq_kv::SlotId;
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
 
 pub fn run(
     model: &Qwen35Model,
@@ -30,12 +30,7 @@ pub fn run(
         work.vocab_size == model.cfg.vocab_size && capacity >= 144,
         "Qwen diagnostic shape/config mismatch"
     );
-    match trajectory {
-        Trajectory::T2ActualCohort=>bail!("SourceCapabilityRefusal: ordinary Qwen decode_batch loops per handle; no shared four-lane target graph. Do not replace by concatenated independent sequences"),
-        Trajectory::T5GenuineSpeculation=>bail!("LocalizationIncomplete: genuine Qwen speculative accepted/rejected transaction adapter pending; no fabricated proposals"),
-        Trajectory::T6CancelRestore=>bail!("LocalizationIncomplete: owning-worker cancellation gate required; forward_gpu parity mutation is not a publication transaction"),
-        _=>{}
-    }
+    super::matrix::ordinary_preflight(work.family, trajectory).map_err(anyhow::Error::msg)?;
     model.ensure_gpu_cache_primed()?;
     let mut evidence = ExecutionEvidence {
         trajectory,
