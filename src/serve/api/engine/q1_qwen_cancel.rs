@@ -75,15 +75,41 @@ pub(crate) struct Evidence {
 }
 /// Source-owning caller supplies an already-loaded, freshly provisioned model.
 /// Callback can stream the complete active cache at both known boundaries.
+#[derive(serde::Serialize)]
+pub(crate) struct Prefix64Evidence {
+    pub source_route: &'static str,
+    pub checked_prefix: usize,
+    pub retained_cursor: usize,
+    pub scheduler_in_flight_after: u32,
+    pub cancellation_performed: bool,
+}
+enum BoundaryOutcome { Prefix(Prefix64Evidence), Recovered(Evidence) }
+
 pub(crate) fn run_loaded(
     model: &mut super::super::engine_qwen35::Qwen35LoadedModel,
-    prompt: &[u32],
-    mut params: SamplingParams,
-    mut observe: impl FnMut(
-        Phase,
-        &crate::inference::models::qwen35::kv_cache::HybridKvCache,
-    ) -> Result<()>,
+    prompt: &[u32], params: SamplingParams,
+    observe: impl FnMut(Phase,&crate::inference::models::qwen35::kv_cache::HybridKvCache)->Result<()>,
 ) -> Result<Evidence> {
+    match run_loaded_boundary(model,prompt,params,false,observe)? {
+        BoundaryOutcome::Recovered(value) => Ok(value),
+        BoundaryOutcome::Prefix(_) => anyhow::bail!("unexpected prefix-only outcome"),
+    }
+}
+pub(crate) fn run_loaded_prefix64(
+    model: &mut super::super::engine_qwen35::Qwen35LoadedModel,
+    prompt: &[u32], params: SamplingParams,
+    observe: impl FnMut(Phase,&crate::inference::models::qwen35::kv_cache::HybridKvCache)->Result<()>,
+) -> Result<Prefix64Evidence> {
+    match run_loaded_boundary(model,prompt,params,true,observe)? {
+        BoundaryOutcome::Prefix(value) => Ok(value),
+        BoundaryOutcome::Recovered(_) => anyhow::bail!("unexpected cancellation outcome"),
+    }
+}
+fn run_loaded_boundary(
+    model: &mut super::super::engine_qwen35::Qwen35LoadedModel,
+    prompt: &[u32], mut params: SamplingParams, keep_prefix64: bool,
+    mut observe: impl FnMut(Phase,&crate::inference::models::qwen35::kv_cache::HybridKvCache)->Result<()>,
+) -> Result<BoundaryOutcome> {
     anyhow::ensure!(
         prompt.len() == 128,
         "Q1 cancellation prompt must be exactly128 tokens"
@@ -186,6 +212,22 @@ pub(crate) fn run_loaded(
         "real first checked cursor"
     );
     observe(Phase::Checkpoint64, guard.kv.as_ref().unwrap())?;
+    if keep_prefix64 {
+        // Same actual first Pending64/head mode as cancellation control. No
+        // second forward, receiver cancellation injection or cache rollback.
+        drop(slots[0].take());
+        scheduler.release(handle);
+        let retained_cursor=guard.kv.as_ref().unwrap().sequence_len_for_slot(handle.slot_id)? as usize;
+        let in_flight=scheduler.stats().in_flight_slots;
+        anyhow::ensure!(retained_cursor==64 && in_flight==0 && supervisor.is_healthy(),
+            "prefix-only detach changed checked cache or reservation");
+        return Ok(BoundaryOutcome::Prefix(Prefix64Evidence {
+            source_route:"shared actual advance_qwen35_prefill first Pending64; no cancellation",
+            checked_prefix:64,retained_cursor,scheduler_in_flight_after:in_flight,
+            cancellation_performed:false,
+        }));
+    }
+
     // Drop the ACTUAL response receiver only after the next checked advance.
     let armed = arm(128, move || drop(receive))?;
     let second = advance_qwen35_prefill(
@@ -231,10 +273,10 @@ pub(crate) fn run_loaded(
     observe(Phase::Recovered64, guard.kv.as_ref().unwrap())?;
     let in_flight = scheduler.stats().in_flight_slots;
     anyhow::ensure!(in_flight == 0, "cancelled reservation not released");
-    Ok(Evidence{source_route:"advance_qwen35_prefill actual Ready/client_closed/recover_qwen35_slot_after_cancellation_for_reply",
+    Ok(BoundaryOutcome::Recovered(Evidence{source_route:"advance_qwen35_prefill actual Ready/client_closed/recover_qwen35_slot_after_cancellation_for_reply",
         slot:handle.slot_id.0,generation:handle.generation,checked_prefix:64,physical_tail_end_before_recovery:128,
         recovered_cursor:recovered,retained_tokens:retained[0].len(),client_closed_after_actual_advance:armed.fired.get(),
-        scheduler_in_flight_after:in_flight,supervisor_healthy:true,full_144_token_trajectory:false})
+        scheduler_in_flight_after:in_flight,supervisor_healthy:true,full_144_token_trajectory:false}))
 }
 #[test]
 fn q1_cancel_injection_requires_actual_success_and_fires_exactly_once() {
