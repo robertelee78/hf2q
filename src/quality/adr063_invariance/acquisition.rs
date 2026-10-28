@@ -218,6 +218,9 @@ impl Scope {
             identity.family == work.family && tokens_digest(work)? == identity.token_vectors_sha256,
             "actual workload digest/family mismatch"
         );
+        Self::begin_bound(binding,identity,model,output,packet)
+    }
+    fn begin_bound(binding:&Binding,identity:&Identity,model:&Path,output:&Path,packet:&[u8])->Result<Self>{
         let composition: Composition =
             serde_json::from_slice(&checked_file(&binding.composition, 1024 * 1024)?)?;
         let review: Review =
@@ -314,6 +317,7 @@ impl Scope {
         required_model_opens: u64,
     ) -> Result<Acquisition> {
         use mlx_native::metal::foreign_types::ForeignType;
+        ensure!(self.acquisition.provenance=="IndependentRootReviewedComposition","preparation cannot attest a comparable acquisition");
         ensure!(
             self.config_checked.get(),
             "actual config recipe was not checked"
@@ -455,3 +459,7 @@ pub(super) fn synthetic(root: &Path, identity: &Identity) -> Acquisition {
 #[cfg(test)]
 #[path = "acquisition_controls.rs"]
 mod controls;
+
+#[path="acquisition/preparation.rs"]
+mod preparation;
+pub(crate) use preparation::preparation_prefix_digest;
