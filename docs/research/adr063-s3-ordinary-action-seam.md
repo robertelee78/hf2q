@@ -57,3 +57,22 @@ and F2/Q1/Q5 requirements. No speculation flag, sampling setting, native pin,
 unsafe switch, pool policy, production GPU producer or acceptance criterion is
 changed here. Native kernels remain in mlx-native. This preparation is a narrow
 landing-path dependency, not an independently completed performance task.
+
+## Typed coherent target-result seam (subsequent source slice)
+
+The scalar warmup now prepares the prior target/MTP cursor pair and immutable
+slot/step/input/position fingerprint before its SAME target forward. A typed
+full-logits/post-output-RMSNorm row result then enters the SAME completion tail.
+Preparation owns the old verifier-hidden reference and is consumed at finish.
+The existing measured decision clock still starts after preparation and covers
+forward, catchup, canonical decision and commit. No shared producer is selected.
+
+Before any catchup/selection, the actual-used boundary validator refuses stale
+state/input, absent MTP, wrong output lengths/F32 dtype, missing/double target
+advance or prematurely advanced MTP. Target must be prior+1 while MTP remains
+prior. Five hosted controls exercise this exact validator without GPU buffers.
+The future shared caller must validate all cohort members first; scalar rollback
+here does not authorize shared replay/recovery. All original catchup/carry/
+semantic/sampler/cost/commit statements remain unchanged apart from their module
+path. Active-history continuation and the owning-worker shared collector are
+still the next required implementation, not claimed by this seam.
