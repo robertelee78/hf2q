@@ -57665,3 +57665,7 @@ mod qwen38_slot_decode_telemetry_tests {
 #[cfg(test)]
 #[path = "engine_gemma_full_input_tests.rs"]
 mod gemma_full_input_tests;
+
+#[cfg(test)]
+#[path = "engine_template_json_order_tests.rs"]
+mod template_json_order_tests;

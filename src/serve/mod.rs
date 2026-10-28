@@ -8515,7 +8515,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             out,
-            r#"{"arguments": {"todos": [{"content": "Inspect the environment", "status": "in_progress"}]}, "name": "todowrite"}"#
+            r#"{"name": "todowrite", "arguments": {"todos": [{"content": "Inspect the environment", "status": "in_progress"}]}}"#
         );
     }
 
