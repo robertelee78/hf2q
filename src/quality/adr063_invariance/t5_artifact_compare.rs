@@ -235,3 +235,6 @@ fn phase_gate_rejects_wrong_cursor_or_missing_decision() {
     let mut bad=good;bad["canonical_decisions"][1].as_array_mut().unwrap().pop();
     assert!(execution(&bad,true,&frozen,"bound").is_err());
 }
+
+#[path = "t5_artifact_compare/raw_controls.rs"]
+mod raw_controls;
