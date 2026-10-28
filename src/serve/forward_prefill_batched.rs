@@ -345,7 +345,7 @@ macro_rules! bucket_finish {
         $ns.fetch_add(dt_ns, Ordering::Relaxed);
         $cnt.fetch_add($inc, Ordering::Relaxed);
         $s = $exec
-            .begin()
+            .begin().map(crate::inference::native_observation::session)
             .map_err(|e| anyhow::anyhow!("bucket {} resume: {}", $ctx, e))?;
     }};
 }
@@ -510,6 +510,16 @@ impl MlxModelWeights {
         slot_aware_mount: bool,
         gpu: &mut GpuContext,
     ) -> Result<u32> {
+        let _native_input = if self.kv_graft_len() != 0 {
+            crate::inference::native_observation::input("gemma4.prefill.graft_unmapped",&[])
+        } else if let Some(ms) = &self.multi_seq_prefill {
+            crate::inference::native_observation::packed_input(
+                "gemma4.prefill.actual_concat_descriptor",prompt_tokens.len(),
+                &ms.slot_ids,&ms.start_positions,&ms.seq_lens,&ms.seq_offsets)
+        } else {
+            crate::inference::native_observation::single_input(
+                "gemma4.prefill.actual_single_input",start_pos,prompt_tokens.len())
+        };
         let seq_len = prompt_tokens.len();
         if seq_len == 0 {
             anyhow::bail!("forward_prefill_batched: empty prompt");
@@ -1532,7 +1542,7 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("alloc blk_global: {e}"))?;
 
             let mut s = exec
-                .begin()
+                .begin().map(crate::inference::native_observation::session)
                 .map_err(|e| anyhow::anyhow!("batched setup session: {e}"))?;
 
             // Wave P4.17 — each setup sub-step gets its own bucket timing
@@ -1650,7 +1660,7 @@ impl MlxModelWeights {
             // mask buffer is corrupted/aliased between build and use (lifetime
             // bug). DIVERGED here ⇒ the mask BUILD itself races.
             if std::env::var("HF2Q_S019_CKSUM").is_ok() {
-                if let Ok(s2) = exec.begin() {
+                if let Ok(s2) = exec.begin().map(crate::inference::native_observation::session) {
                     let _ = s2.finish();
                 }
                 if let Ok(sl) = sliding_mask.as_slice::<half::bf16>() {
@@ -1914,7 +1924,7 @@ impl MlxModelWeights {
             // Run under the 2x-contention repro: the FIRST layer whose checksum
             // diverges repeat-to-repeat is the racing op.
             if std::env::var("HF2Q_S019_CKSUM").is_ok() {
-                if let Ok(s) = exec.begin() {
+                if let Ok(s) = exec.begin().map(crate::inference::native_observation::session) {
                     let _ = s.finish();
                 }
                 if let Ok(h) = pf_hidden.as_slice() {
@@ -2060,11 +2070,11 @@ impl MlxModelWeights {
                 && std::env::var("HF2Q_PROFILE_MOE").is_err();
             {
                 let mut s = if graph_opt_prefill {
-                    exec.begin_recorded().map_err(|e| {
+                    exec.begin_recorded().map(crate::inference::native_observation::session).map_err(|e| {
                         anyhow::anyhow!("batched attn session (recorded) L{layer_idx}: {e}")
                     })?
                 } else {
-                    exec.begin()
+                    exec.begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("batched attn session L{layer_idx}: {e}"))?
                 };
 
@@ -2078,7 +2088,9 @@ impl MlxModelWeights {
                     &[&pf_hidden, &self.layers[layer_idx].norms.input_layernorm],
                     &[&pf_norm_out],
                 );
-                s.rms_norm(
+                crate::inference::native_observation::witness_rms_norm(
+                    &mut s,&pf_hidden,seq_len,hs,Some(layer_idx),|s| {
+                    s.rms_norm(
                     reg,
                     metal_dev,
                     &pf_hidden,
@@ -2088,7 +2100,8 @@ impl MlxModelWeights {
                     seq_len as u32,
                     hs as u32,
                 )
-                .map_err(|e| anyhow::anyhow!("batched pre-attn norm L{layer_idx}: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("batched pre-attn norm L{layer_idx}: {e}"))
+                })?;
                 if let Some(t0) = t0_pre_attn_norm {
                     bucket_finish!(
                         s,
@@ -2126,7 +2139,7 @@ impl MlxModelWeights {
                             "[BATCHED DUMP] post_input_norm_row (inline) [{hs}] f32 -> {path}"
                         );
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("dump norm restart L{layer_idx}: {e}"))?;
                     }
                 }
@@ -2147,7 +2160,7 @@ impl MlxModelWeights {
                         eprintln!("S019_NORM L{layer_idx:02} cks={cks:016x}");
                     }
                     s = exec
-                        .begin()
+                        .begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("s019 norm restart L{layer_idx}: {e}"))?;
                 }
 
@@ -2160,7 +2173,7 @@ impl MlxModelWeights {
                     })?;
                     let t0 = std::time::Instant::now();
                     s = exec
-                        .begin()
+                        .begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("MM-profile begin (qkv) L{layer_idx}: {e}"))?;
                     Some(t0)
                 } else {
@@ -2330,7 +2343,7 @@ impl MlxModelWeights {
                 // fused_head_norm_rope (head-RMSNorm threadgroup reduction / RoPE
                 // / FWHT). STABLE while attn-out diverges ⇒ KV-write or SDPA/o_proj.
                 if std::env::var("HF2Q_S019_CKSUM").is_ok() {
-                    if let Ok(s2) = exec.begin() {
+                    if let Ok(s2) = exec.begin().map(crate::inference::native_observation::session) {
                         let _ = s2.finish();
                     }
                     if let Ok(q) = pf_q_perm.as_slice::<half::bf16>() {
@@ -3401,7 +3414,7 @@ impl MlxModelWeights {
                             .map_err(|e| anyhow::anyhow!("noFA QK pre-finish L{layer_idx}: {e}"))?;
                         let t0 = std::time::Instant::now();
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("noFA QK begin L{layer_idx}: {e}"))?;
                         Some(t0)
                     } else {
@@ -3432,7 +3445,7 @@ impl MlxModelWeights {
                         PROFILE_B_NOFA_QK_NS.fetch_add(dt_ns, Ordering::Relaxed);
                         PROFILE_B_NOFA_QK_COUNT.fetch_add(1, Ordering::Relaxed);
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("noFA QK reopen L{layer_idx}: {e}"))?;
                     }
 
@@ -3445,7 +3458,7 @@ impl MlxModelWeights {
                         })?;
                         let t0 = std::time::Instant::now();
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("noFA SMS begin L{layer_idx}: {e}"))?;
                         Some(t0)
                     } else {
@@ -3480,7 +3493,7 @@ impl MlxModelWeights {
                         PROFILE_B_NOFA_SMS_NS.fetch_add(dt_ns, Ordering::Relaxed);
                         PROFILE_B_NOFA_SMS_COUNT.fetch_add(1, Ordering::Relaxed);
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("noFA SMS reopen L{layer_idx}: {e}"))?;
                     }
 
@@ -3493,7 +3506,7 @@ impl MlxModelWeights {
                         })?;
                         let t0 = std::time::Instant::now();
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("noFA Vtrans begin L{layer_idx}: {e}"))?;
                         Some(t0)
                     } else {
@@ -3519,7 +3532,7 @@ impl MlxModelWeights {
                         PROFILE_B_NOFA_VTRANS_NS.fetch_add(dt_ns, Ordering::Relaxed);
                         PROFILE_B_NOFA_VTRANS_COUNT.fetch_add(1, Ordering::Relaxed);
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("noFA Vtrans reopen L{layer_idx}: {e}"))?;
                     }
 
@@ -3532,7 +3545,7 @@ impl MlxModelWeights {
                             .map_err(|e| anyhow::anyhow!("noFA SV pre-finish L{layer_idx}: {e}"))?;
                         let t0 = std::time::Instant::now();
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("noFA SV begin L{layer_idx}: {e}"))?;
                         Some(t0)
                     } else {
@@ -3563,7 +3576,7 @@ impl MlxModelWeights {
                         PROFILE_B_NOFA_SV_NS.fetch_add(dt_ns, Ordering::Relaxed);
                         PROFILE_B_NOFA_SV_COUNT.fetch_add(1, Ordering::Relaxed);
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("noFA SV reopen L{layer_idx}: {e}"))?;
                     }
 
@@ -3575,7 +3588,7 @@ impl MlxModelWeights {
                         })?;
                         let t0 = std::time::Instant::now();
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("noFA perm begin L{layer_idx}: {e}"))?;
                         Some(t0)
                     } else {
@@ -3601,7 +3614,7 @@ impl MlxModelWeights {
                         PROFILE_B_NOFA_PERM_NS.fetch_add(dt_ns, Ordering::Relaxed);
                         PROFILE_B_NOFA_PERM_COUNT.fetch_add(1, Ordering::Relaxed);
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("noFA perm reopen L{layer_idx}: {e}"))?;
                     }
                 } else {
@@ -3620,7 +3633,7 @@ impl MlxModelWeights {
                         })?;
                         let t0 = std::time::Instant::now();
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("FA-profile begin L{layer_idx}: {e}"))?;
                         Some(t0)
                     } else {
@@ -3863,7 +3876,7 @@ impl MlxModelWeights {
                                         &bv_slice[bv_sp..bv_sp + 8],
                                     );
                                 }
-                                s = exec.begin().map_err(|e| {
+                                s = exec.begin().map(crate::inference::native_observation::session).map_err(|e| {
                                     anyhow::anyhow!("xlen debug post-dump reopen: {e}")
                                 })?;
                             }
@@ -3887,7 +3900,7 @@ impl MlxModelWeights {
                                 // K/V). STABLE while SDPA-out diverges ⇒ FA COMPUTE
                                 // kernel is the root; DIVERGED ⇒ cache write/cast.
                                 if std::env::var("HF2Q_S019_CKSUM").is_ok() {
-                                    if let Ok(s2) = exec.begin() {
+                                    if let Ok(s2) = exec.begin().map(crate::inference::native_observation::session) {
                                         let _ = s2.finish();
                                     }
                                     if let Ok(bk) = bf16_k.as_slice::<half::bf16>() {
@@ -3935,7 +3948,7 @@ impl MlxModelWeights {
                                 // STABLE while FA-out diverges ⇒ FA D256 COMPUTE is
                                 // the root; DIVERGED ⇒ KV-cache write (kv_cache_copy).
                                 if std::env::var("HF2Q_S019_CKSUM").is_ok() {
-                                    if let Ok(s2) = exec.begin() {
+                                    if let Ok(s2) = exec.begin().map(crate::inference::native_observation::session) {
                                         let _ = s2.finish();
                                     }
                                     let n = (seq_len * hd as usize).min(1 << 22);
@@ -4008,7 +4021,7 @@ impl MlxModelWeights {
                                         inf_count,
                                         max_abs,
                                     );
-                                    s = exec.begin().map_err(|e| {
+                                    s = exec.begin().map(crate::inference::native_observation::session).map_err(|e| {
                                         anyhow::anyhow!("xlen debug post-out reopen: {e}")
                                     })?;
                                 }
@@ -4139,7 +4152,7 @@ impl MlxModelWeights {
                                 // ⇒ upstream cast/blk-build races; all STABLE while
                                 // out_f16 diverges ⇒ FA D256 kernel COMPUTE is the root.
                                 if std::env::var("HF2Q_S019_CKSUM").is_ok() {
-                                    if let Ok(s2) = exec.begin() {
+                                    if let Ok(s2) = exec.begin().map(crate::inference::native_observation::session) {
                                         let _ = s2.finish();
                                     }
                                     macro_rules! ck16 {
@@ -4464,7 +4477,7 @@ impl MlxModelWeights {
                                         &bk_slice[fk_sp..fk_sp + 8],
                                     );
                                 }
-                                s = exec.begin().map_err(|e| {
+                                s = exec.begin().map(crate::inference::native_observation::session).map_err(|e| {
                                     anyhow::anyhow!("xlen debug D512 post-K-dump reopen: {e}")
                                 })?;
                             }
@@ -4512,7 +4525,7 @@ impl MlxModelWeights {
                                     nan_count,
                                     max_abs
                                 );
-                                s = exec.begin().map_err(|e| {
+                                s = exec.begin().map(crate::inference::native_observation::session).map_err(|e| {
                                     anyhow::anyhow!("xlen debug D512 BF16 reopen: {e}")
                                 })?;
                             }
@@ -4751,7 +4764,7 @@ impl MlxModelWeights {
                     })?;
                     let t0 = std::time::Instant::now();
                     s = exec
-                        .begin()
+                        .begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("MM-profile begin (O) L{layer_idx}: {e}"))?;
                     Some(t0)
                 } else {
@@ -4848,7 +4861,7 @@ impl MlxModelWeights {
                         eprintln!("S019_SDPAPERM L{layer_idx:02} cks={cks:016x}");
                     }
                     s = exec
-                        .begin()
+                        .begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("s019 attn restart L{layer_idx}: {e}"))?;
                 }
 
@@ -5282,7 +5295,7 @@ impl MlxModelWeights {
                     })?;
                     let t0 = std::time::Instant::now();
                     s = exec
-                        .begin()
+                        .begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("MM-profile begin (gur) L{layer_idx}: {e}"))?;
                     Some(t0)
                 } else {
@@ -5407,7 +5420,7 @@ impl MlxModelWeights {
                         anyhow::anyhow!("MM-profile pre-finish (mlp_dn) L{layer_idx}: {e}")
                     })?;
                     let t0 = std::time::Instant::now();
-                    s = exec.begin().map_err(|e| {
+                    s = exec.begin().map(crate::inference::native_observation::session).map_err(|e| {
                         anyhow::anyhow!("MM-profile begin (mlp_dn) L{layer_idx}: {e}")
                     })?;
                     Some(t0)
@@ -5476,7 +5489,7 @@ impl MlxModelWeights {
                     })?;
                     let t0 = std::time::Instant::now();
                     s = exec
-                        .begin()
+                        .begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("MoE-profile begin (gu) L{layer_idx}: {e}"))?;
                     Some(t0)
                 } else {
@@ -5587,7 +5600,7 @@ impl MlxModelWeights {
                         anyhow::anyhow!("MoE-post-profile pre-finish (swiglu) L{layer_idx}: {e}")
                     })?;
                     let t0 = std::time::Instant::now();
-                    s = exec.begin().map_err(|e| {
+                    s = exec.begin().map(crate::inference::native_observation::session).map_err(|e| {
                         anyhow::anyhow!("MoE-post-profile begin (swiglu) L{layer_idx}: {e}")
                     })?;
                     Some(t0)
@@ -5636,7 +5649,7 @@ impl MlxModelWeights {
                     })?;
                     let t0 = std::time::Instant::now();
                     s = exec
-                        .begin()
+                        .begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("MoE-profile begin (dn) L{layer_idx}: {e}"))?;
                     Some(t0)
                 } else {
@@ -6287,7 +6300,7 @@ impl MlxModelWeights {
         let mut first_token: u32 = 0;
         for &head_row in head_rows.iter() {
             let mut s = exec
-                .begin()
+                .begin().map(crate::inference::native_observation::session)
                 .map_err(|e| anyhow::anyhow!("batched head session: {e}"))?;
 
             // Copy last row of pf_hidden ([seq_len, hs]) into activations.hidden ([hs])

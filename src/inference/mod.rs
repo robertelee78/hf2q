@@ -9,6 +9,7 @@
 //! Populated by ADR-013 (Qwen3.5 / Qwen3.5-MoE).
 
 pub mod models;
+pub(crate) mod native_observation;
 pub mod spec_decode;
 pub mod vision;
 

@@ -733,6 +733,18 @@ impl FifoSchedulerAdapter {
         self.slot_generation
     }
 
+    fn trace_snapshot(&self, cause: &'static str) {
+        if !crate::serve::phase_trace::enabled() { return; }
+        let states = self.in_flight.iter().map(|slot| crate::serve::phase_trace::SlotState {
+            request_id:slot.request_id.0, slot_id:slot.handle.slot_id.0,
+            generation:slot.handle.generation,
+            phase:if slot.prefill_remaining.is_some() { "prefill" } else { "decode" },
+            active:true, forward_eligibility:None, runnable_forward:None, runnable_emit:None, inflight:None,
+            blocked:Some("EngineReadinessUnknown"),
+        }).collect();
+        crate::serve::phase_trace::scheduler(states, cause);
+    }
+
     /// Promote the next queued request into the in-flight slot. Caller
     /// guarantees `self.in_flight.is_none()` (asserted in debug builds).
     ///
@@ -784,6 +796,14 @@ impl FifoSchedulerAdapter {
         } else {
             Some(new_remaining)
         };
+        let committed_position = slot.prompt_tokens.saturating_sub(new_remaining);
+        self.trace_snapshot("fifo_committed_prefill");
+        if remaining > new_remaining && crate::serve::phase_trace::enabled() {
+            crate::serve::phase_trace::publish("progress", serde_json::json!({
+                "slot_id":handle.slot_id.0,"generation":handle.generation,
+                "source":"committed_prefill","tokens":remaining-new_remaining,
+                "committed_position":committed_position}));
+        }
     }
 
     /// Driver callback: report that the slot just emitted one decode
@@ -802,10 +822,18 @@ impl FifoSchedulerAdapter {
                 return;
             }
             slot.tokens_produced = slot.tokens_produced.saturating_add(1);
+            if crate::serve::phase_trace::enabled() {
+                crate::serve::phase_trace::publish("progress", serde_json::json!({
+                    "slot_id":handle.slot_id.0,"generation":handle.generation,
+                    "source":"generated_publication","tokens":1,
+                    "committed_position":slot.tokens_produced}));
+            }
             slot.tokens_produced >= slot.max_tokens
         };
         if should_release {
             self.release(handle);
+        } else {
+            self.trace_snapshot("fifo_committed_decode");
         }
     }
 }
@@ -896,10 +924,12 @@ impl Scheduler for FifoSchedulerAdapter {
                 max_tokens: req.max_tokens,
             }
         };
+        self.trace_snapshot("fifo_admission");
         Ok(public)
     }
 
     fn step(&mut self) -> Result<SchedulerStep, StepError> {
+        self.trace_snapshot("fifo_step");
         let Some(slot) = self.in_flight.as_ref() else {
             return Ok(SchedulerStep::Idle);
         };
@@ -928,6 +958,7 @@ impl Scheduler for FifoSchedulerAdapter {
         self.completed_total = self.completed_total.saturating_add(1);
         // Promote next queued if any.
         self.promote_one();
+        self.trace_snapshot("fifo_release_after_promotion");
     }
 
     fn stats(&self) -> SchedulerStats {
@@ -1350,6 +1381,108 @@ impl InflightBatchedScheduler {
         None
     }
 
+    /// Diagnostic snapshot AFTER scheduler mutations. Engine readiness remains
+    /// unknown here: a scheduler phase is not a runnable graph or GPU row map.
+    fn trace_snapshot(&self, cause: &'static str) {
+        if !crate::serve::phase_trace::enabled() { return; }
+        if self.in_flight.len() > 256 {
+            crate::serve::phase_trace::invalidate("slot metadata bound exceeded");
+            return;
+        }
+        let states = self.in_flight.iter().map(|slot| crate::serve::phase_trace::SlotState {
+            request_id:slot.request_id.0, slot_id:slot.handle.slot_id.0,
+            generation:slot.handle.generation,
+            phase:match slot.phase { SlotPhase::Prefilling { .. } => "prefill",
+                SlotPhase::Decoding { .. } => "decode" },
+            active:true, forward_eligibility:None, runnable_forward:None, runnable_emit:None, inflight:None,
+            blocked:Some("EngineReadinessUnknown"),
+        }).collect();
+        crate::serve::phase_trace::scheduler(states, cause);
+    }
+
+    /// Rejoin owning-worker work facts to CURRENT scheduler generations.
+    /// Absent facts stay Unknown; this is not native submitted-work evidence.
+    pub(crate) fn trace_work_states(&self, facts: Vec<crate::serve::phase_trace::WorkState>) {
+        if !crate::serve::phase_trace::enabled() { return; }
+        if facts.len() > 256 || facts.iter().enumerate().any(|(i,fact)| {
+            facts[..i].iter().any(|old| old.handle == fact.handle)
+                || !self.in_flight.iter().any(|slot| slot.handle == fact.handle)
+        }) {
+            crate::serve::phase_trace::invalidate("work facts have duplicate/stale owner");
+            return;
+        }
+        let states = self.in_flight.iter().map(|slot| {
+            let fact = facts.iter().find(|fact| fact.handle == slot.handle);
+            crate::serve::phase_trace::SlotState {
+                request_id:slot.request_id.0,slot_id:slot.handle.slot_id.0,
+                generation:slot.handle.generation,
+                phase:match slot.phase { SlotPhase::Prefilling { .. } => "prefill",
+                    SlotPhase::Decoding { .. } => "decode" },active:true,
+                forward_eligibility:fact.and_then(|f| f.forward_eligibility),
+                runnable_forward:fact.and_then(|f| f.runnable_forward),
+                runnable_emit:fact.and_then(|f| f.runnable_emit),
+                // Only actual native receipts can establish submitted outstanding work.
+                inflight:None,blocked:match fact { Some(f) => f.blocked,
+                    None => Some("EngineReadinessUnknown") },
+            }
+        }).collect();
+        crate::serve::phase_trace::scheduler(states,"owning_worker_work_state");
+    }
+
+    /// This boundary is a validated family transaction selection, NOT evidence
+    /// that its internal graphs share physical rows or have already submitted.
+    pub(crate) fn trace_transaction(&self, family: &'static str, operation: &'static str,
+        handles: &[SlotHandle]) -> crate::inference::native_observation::Invocation {
+        if !crate::serve::phase_trace::enabled() {
+            return crate::inference::native_observation::invocation(Vec::new());
+        }
+        if handles.len() > 256 {
+            crate::serve::phase_trace::invalidate("transaction metadata bound exceeded");
+            return crate::inference::native_observation::invocation(Vec::new());
+        }
+        let lanes: Vec<_> = handles.iter().map(|handle| {
+            let request = self.in_flight.iter().find(|s| s.handle == *handle)
+                .map(|s| s.request_id.0);
+            serde_json::json!({"request_id":request,"slot_id":handle.slot_id.0,
+                "generation":handle.generation})
+        }).collect();
+        crate::serve::phase_trace::publish("transaction", serde_json::json!({
+            "family":family,"operation":operation,"logical_lanes":lanes,
+            "physical_membership":"Unknown",
+            "reason":"exact native graph submit/drain and token-row hook required"}));
+        let owners: Vec<_> = handles.iter().filter_map(|handle| {
+            self.in_flight.iter().find(|slot| slot.handle == *handle).map(|slot| {
+                crate::serve::phase_trace::SlotState {
+                    request_id:slot.request_id.0,slot_id:handle.slot_id.0,generation:handle.generation,
+                    phase:match slot.phase { SlotPhase::Prefilling { .. } => "prefill",
+                        SlotPhase::Decoding { .. } => "decode" },active:true,
+                    forward_eligibility:None,runnable_forward:None,runnable_emit:None,inflight:None,blocked:None,
+                }
+            })
+        }).collect();
+        if owners.len() != handles.len() || handles.iter().enumerate()
+            .any(|(index,handle)| handles[..index].contains(handle)) {
+            crate::serve::phase_trace::invalidate("native invocation missing/duplicate owner");
+            return crate::inference::native_observation::invocation(Vec::new());
+        }
+        // The owning thread now enters a transaction: it cannot schedule
+        // another graph or emit another slot's buffered work during this call.
+        // SubmittedOutstanding is established separately by actual native CBs.
+        let busy = self.in_flight.iter().map(|slot| {
+            crate::serve::phase_trace::SlotState {
+                request_id:slot.request_id.0,slot_id:slot.handle.slot_id.0,
+                generation:slot.handle.generation,
+                phase:match slot.phase { SlotPhase::Prefilling { .. } => "prefill",
+                    SlotPhase::Decoding { .. } => "decode" },active:true,
+                forward_eligibility:crate::inference::native_observation::owner_forward_eligibility(slot.handle),
+                runnable_forward:Some(false),runnable_emit:Some(false),inflight:None,
+                blocked:Some("OwningWorkerTransaction"),
+            }
+        }).collect();
+        crate::serve::phase_trace::scheduler(busy,"owning_worker_enter_transaction");
+        crate::inference::native_observation::invocation(owners)
+    }
+
     /// Find the index of the first Prefilling slot (insertion / FIFO order).
     fn first_prefilling_idx(&self) -> Option<usize> {
         self.in_flight
@@ -1400,6 +1533,14 @@ impl InflightBatchedScheduler {
                 tokens_remaining: new_remaining,
             }
         };
+        let committed_position = slot.prompt_tokens.saturating_sub(new_remaining);
+        self.trace_snapshot("committed_prefill");
+        if tokens_remaining > new_remaining && crate::serve::phase_trace::enabled() {
+            crate::serve::phase_trace::publish("progress", serde_json::json!({
+                "slot_id":handle.slot_id.0,"generation":handle.generation,
+                "source":"committed_prefill","tokens":tokens_remaining-new_remaining,
+                "committed_position":committed_position}));
+        }
     }
 
     /// Move a still-prefilling request behind its prefilling peers.
@@ -1453,6 +1594,13 @@ impl InflightBatchedScheduler {
                 max_tokens,
             };
         }
+        if crate::serve::phase_trace::enabled() {
+            crate::serve::phase_trace::publish("progress", serde_json::json!({
+                "slot_id":handle.slot_id.0,"generation":handle.generation,
+                "source":"generated_publication","tokens":1,
+                "committed_position":new_produced}));
+        }
+        self.trace_snapshot("committed_decode");
     }
 
     /// Cancel a queued (not-yet-promoted) request. Returns `true` if
@@ -1621,6 +1769,7 @@ impl Scheduler for InflightBatchedScheduler {
                 budget_bytes: self.total_kv_budget_bytes,
             });
         };
+        self.trace_snapshot("admission");
         Ok(public)
     }
 
@@ -1630,6 +1779,7 @@ impl Scheduler for InflightBatchedScheduler {
         // `in_flight`; selection below uses first_prefilling_idx() so an
         // older mid-chunk Prefilling slot wins (iter-2.5 C3 fix).
         let _ = self.try_promote_one_queued();
+        self.trace_snapshot("step_after_promotion");
 
         // Priority 2: find FIRST Prefilling slot in FIFO order.
         let prefill_idx = self.first_prefilling_idx();
@@ -1684,6 +1834,7 @@ impl Scheduler for InflightBatchedScheduler {
         self.slot_generations[gen_idx] = self.slot_generations[gen_idx].saturating_add(1);
         self.slot_id_free_list.push(handle.slot_id);
         self.completed_total = self.completed_total.saturating_add(1);
+        self.trace_snapshot("release_after_generation_advance");
         // Promotion is the responsibility of step(); not done here to
         // avoid release-vs-step double-promotion races.
     }

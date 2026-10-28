@@ -878,7 +878,7 @@ pub(super) fn embed_tokens_gpu_into(
             .map_err(|e| anyhow!("map native embedding token IDs: {e}"))?
             .copy_from_slice(tokens);
         let mut enc = device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("native token embedding encoder")?;
         match NativeEmbeddingRoute::for_type(native.info.ggml_dtype)? {
             NativeEmbeddingRoute::Q2K => {
@@ -1142,7 +1142,7 @@ fn embed_tokens_gpu_with_soft_tokens(
         registry,
     )?;
     let mut enc = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("soft-token embedding overwrite encoder")?;
     for st in soft_tokens {
         ensure!(
@@ -1476,7 +1476,7 @@ fn encode_output_head_into_encoder(
     let mut enc = match caller_enc {
         Some(e) => e,
         None => device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("enc output_head.fused_norm_lm_head")?,
     };
 
@@ -1626,7 +1626,7 @@ fn apply_output_head_gpu_last_with_nextn_hidden(
     let mut enc = match caller_enc {
         Some(enc) => enc,
         None => device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("enc output_head.nextn_norm_last_lm_head")?,
     };
     if fused {
@@ -1889,7 +1889,7 @@ fn apply_output_norm_only_last(
         s[0] = eps;
         s[1] = hidden_size as f32;
     }
-    let mut enc = device.command_encoder().context("enc embed output norm")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc embed output norm")?;
     rms_norm::dispatch_rms_norm(
         &mut enc,
         registry,
@@ -2125,7 +2125,7 @@ fn apply_output_head_gpu_greedy_into(
     } else {
         // Standalone path (legacy / non-S4): open + terminal wait.
         let mut enc = device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("enc output_head.fused_norm_lm_argmax (greedy)")?;
         encode_into(
             &mut enc,
@@ -2177,7 +2177,7 @@ fn apply_output_head_gpu_greedy_legacy(
     // Centralized via `logits_buf_mut` (single unsafe site for the whole file).
     let logits_buf = logits_buf_mut(bufs);
 
-    let mut enc_norm = device.command_encoder().context("enc output_norm legacy")?;
+    let mut enc_norm = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc output_norm legacy")?;
     rms_norm::dispatch_rms_norm(
         &mut enc_norm,
         registry,
@@ -2192,7 +2192,7 @@ fn apply_output_head_gpu_greedy_legacy(
     .context("dispatch_rms_norm output legacy")?;
     enc_norm.commit_labeled("output_head.norm");
 
-    let mut enc_lm = device.command_encoder().context("enc lm_head legacy")?;
+    let mut enc_lm = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc lm_head legacy")?;
     apply_linear_projection_f32_into_with_ggml_type(
         &mut enc_lm,
         registry,
@@ -2208,7 +2208,7 @@ fn apply_output_head_gpu_greedy_legacy(
     .context("lm_head projection legacy")?;
     enc_lm.commit_labeled("output_head.lm_head_native");
 
-    let mut enc_argmax = device.command_encoder().context("enc argmax legacy")?;
+    let mut enc_argmax = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc argmax legacy")?;
     dispatch_argmax_f32(
         &mut enc_argmax,
         registry,
@@ -2295,7 +2295,7 @@ fn residual_add_gpu_with_out_alloc(
             .alloc_buffer(n * 4, DType::F32, vec![n])
             .map_err(|e| anyhow!("residual_add_gpu device alloc: {e}"))?
     };
-    let mut enc = device.command_encoder().context("enc residual_add")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc residual_add")?;
     elementwise_add(
         &mut enc,
         registry,
@@ -3501,7 +3501,7 @@ impl Qwen35Model {
             // Encode + commit lm_head only (no rms_norm — caller has
             // already applied drafter's own final_norm).
             let mut enc = device
-                .command_encoder()
+                .command_encoder().map(crate::inference::native_observation::encoder)
                 .context("per_position_argmax_from_normed_hidden: command_encoder")?;
             let logits_buf = apply_linear_projection_f32_with_ggml_type(
                 &mut enc,
@@ -3967,6 +3967,8 @@ impl Qwen35Model {
         // and off otherwise.
         mut residual_capture: Option<ResidualLayerCapture<'_>>,
     ) -> Result<Vec<f32>> {
+        let _native_input = crate::inference::native_observation::qwen_input(
+            "qwen35.forward.actual_tokens",slot_id.0,tokens.len(),positions_flat);
         let pool_operation = super::decode_pool::profile::Operation::enter(self as *const _ as usize)?;
         super::decode_pool::profile::reject_unsupported(
             capture.is_some() || residual_capture.is_some() || !soft_tokens.is_empty()
@@ -4546,7 +4548,7 @@ impl Qwen35Model {
             if seq_len > 1 && super::encoder_stage::LayerEncoder::env_enabled() {
                 Some(
                     device
-                        .encoder_session()
+                        .encoder_session().map(crate::inference::native_observation::optional_session)
                         .context("alloc layer_session for borrowed-session multi-stage chain")?
                         .expect(
                             "LayerEncoder::env_enabled() == true ⇒ \
@@ -5999,7 +6001,7 @@ impl Qwen35Model {
                     // bucket (residual_add_gpu commits its own
                     // encoder).
                     let mut ds_enc = device
-                        .command_encoder()
+                        .command_encoder().map(crate::inference::native_observation::encoder)
                         .with_context(|| format!("wedge4c5 deepstack encoder layer {layer_idx}"))?;
                     crate::inference::vision::image_token_residual_add
                         ::image_token_residual_add_gpu(
@@ -6469,6 +6471,8 @@ impl Qwen35Model {
         // :5380 + :5716) now receive `slot_id` verbatim.
         slot_id: SlotId,
     ) -> Result<u32> {
+        let _native_input = crate::inference::native_observation::qwen_input(
+            "qwen35.greedy.actual_tokens",slot_id.0,tokens.len(),positions_flat);
         let pool_operation = super::decode_pool::profile::Operation::enter(self as *const _ as usize)?;
         if super::decode_pool::profile::selected() { self.ensure_gpu_cache_primed()?; }
         debug_assert_eq!(
@@ -6950,7 +6954,7 @@ impl Qwen35Model {
                 // partial_chain_enabled is false this branch never fires;
                 // the per-layer device.command_encoder() path below runs.
                 if partial_chain_enabled && chain_enc.is_none() {
-                    chain_enc = Some(device.command_encoder().with_context(|| {
+                    chain_enc = Some(device.command_encoder().map(crate::inference::native_observation::encoder).with_context(|| {
                         format!("enc partial-chain group-start layer {layer_idx}")
                     })?);
                 }
@@ -6960,7 +6964,7 @@ impl Qwen35Model {
                 } else {
                     Some(
                         device
-                            .command_encoder()
+                            .command_encoder().map(crate::inference::native_observation::encoder)
                             .with_context(|| format!("enc single-cb layer {layer_idx}"))?,
                     )
                 };
@@ -7492,7 +7496,7 @@ impl Qwen35Model {
                             moe_intermediate_size: moe.moe_intermediate_size,
                             shared_intermediate_size: moe.shared_expert_intermediate_size,
                         };
-                        let mut enc = device.command_encoder().with_context(|| {
+                        let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).with_context(|| {
                             format!("enc fused_res_norm+moeq legacy greedy layer {layer_idx}")
                         })?;
                         dispatch_fused_residual_norm_f32(
@@ -7534,7 +7538,7 @@ impl Qwen35Model {
                         out
                     }
                     FfnWeightsGpu::DenseQ(w) => {
-                        let mut enc = device.command_encoder().with_context(|| {
+                        let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).with_context(|| {
                             format!("enc fused_res_norm+denseq legacy greedy layer {layer_idx}")
                         })?;
                         dispatch_fused_residual_norm_f32(
@@ -7581,7 +7585,7 @@ impl Qwen35Model {
                         // arm that fired under `HF2Q_DENSE_Q_LEGACY=1`) was
                         // removed alongside the env gate itself.
                         {
-                            let mut enc = device.command_encoder().with_context(|| {
+                            let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).with_context(|| {
                                 format!("enc fused_res_norm greedy layer {layer_idx}")
                             })?;
                             dispatch_fused_residual_norm_f32(
@@ -8066,7 +8070,7 @@ impl Qwen35Model {
                     anyhow!("forward_tree_verify_gpu: F32 V cache missing for layer {layer_idx}")
                 })?;
                 let enc = device
-                    .command_encoder()
+                    .command_encoder().map(crate::inference::native_observation::encoder)
                     .context("forward_tree_verify_gpu: command_encoder")?;
                 let ffn = match layer_gpu {
                     LayerWeightsGpu::FullAttn { ffn, .. } => ffn,

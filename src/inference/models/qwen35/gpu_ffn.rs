@@ -928,7 +928,7 @@ pub fn build_dense_ffn_layer_gpu(
         .map_err(|e| anyhow!("{e}"))?[0] = n_h;
 
     // Single encoder: gate+up projs (concurrent) → silu_mul → down proj [→ residual add].
-    let mut enc = device.command_encoder().context("enc dense swiglu")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc dense swiglu")?;
     // Ops 1+2: gate and up projections — concurrent (both read from x)
     let gate_buf = proj(
         &mut enc,
@@ -1067,7 +1067,7 @@ pub fn build_dense_ffn_layer_gpu_q(
     // FINAL outputs at prefill (seq_len > 1) per the W-5b.15 split.
     let h = weights.hidden_size;
     let seq_len = (x.element_count() / h as usize) as u32;
-    let mut enc = device.command_encoder().context("enc dense_q swiglu")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc dense_q swiglu")?;
     let out =
         build_dense_ffn_layer_gpu_q_into(&mut enc, device, registry, x, weights, add_residual)?;
     if seq_len == 1 {
@@ -1952,7 +1952,7 @@ pub fn build_dense_ffn_layer_gpu_q_split_profile(
         .commit_and_wait_labeled(&label)
         .context("commit dense_q split gate/up")?;
 
-    let mut silu_enc = device.command_encoder().context("enc dense_q split silu")?;
+    let mut silu_enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc dense_q split silu")?;
     dispatch_silu_mul(
         &mut silu_enc,
         registry,
@@ -1969,7 +1969,7 @@ pub fn build_dense_ffn_layer_gpu_q_split_profile(
         .commit_and_wait_labeled(&label)
         .context("commit dense_q split silu")?;
 
-    let mut down_enc = device.command_encoder().context("enc dense_q split down")?;
+    let mut down_enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc dense_q split down")?;
     quantized_matmul_ggml(
         &mut down_enc,
         registry,
@@ -1990,7 +1990,7 @@ pub fn build_dense_ffn_layer_gpu_q_split_profile(
             .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
             .map_err(|e| anyhow!("alloc dense_q split residual sum: {e}"))?;
         let mut residual_enc = device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("enc dense_q split residual")?;
         elementwise_add(
             &mut residual_enc,
@@ -2167,7 +2167,7 @@ pub fn build_moe_ffn_layer_gpu(
     let m_sh32 = shape.shared_intermediate_size;
 
     // ---- Step 1: router logits = router(x)  [seq, num_experts] ----
-    let mut enc = device.command_encoder().context("enc moe router")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc moe router")?;
     let logits_buf = proj(
         &mut enc,
         registry,
@@ -2213,7 +2213,7 @@ pub fn build_moe_ffn_layer_gpu(
 
         // We project all seq_len tokens then take row t.
         // gate_e: [seq, m_moe]
-        let mut enc = device.command_encoder().context("enc expert gate")?;
+        let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc expert gate")?;
         let gate_e_buf = proj(
             &mut enc,
             registry,
@@ -2226,7 +2226,7 @@ pub fn build_moe_ffn_layer_gpu(
         )?;
         enc.commit_and_wait().context("commit expert gate")?;
 
-        let mut enc = device.command_encoder().context("enc expert up")?;
+        let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc expert up")?;
         let up_e_buf = proj(
             &mut enc, registry, device, x, &up_buf_e, seq_len, h32, m_moe32,
         )?;
@@ -2243,7 +2243,7 @@ pub fn build_moe_ffn_layer_gpu(
         let hidden_buf_t = upload_f32(&hidden_t, device).context("upload hidden_t")?;
 
         // hidden_buf_t is [1, m_moe]; down_buf_e is [h, m_moe] → proj [1, h].
-        let mut enc = device.command_encoder().context("enc expert down")?;
+        let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc expert down")?;
         let y_e_buf = proj(
             &mut enc,
             registry,
@@ -2275,7 +2275,7 @@ pub fn build_moe_ffn_layer_gpu(
     // shared_gate_inp is [1, hidden_size] (one scalar per token after matmul).
 
     // Step 4: sh_logit = shared_gate_inp(x)  [seq, 1]
-    let mut enc = device.command_encoder().context("enc sh_gate_inp")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc sh_gate_inp")?;
     let sh_logit_buf = proj(
         &mut enc,
         registry,
@@ -2296,7 +2296,7 @@ pub fn build_moe_ffn_layer_gpu(
         .collect(); // length = seq_len
 
     // Step 6: a_s = shared_gate_proj(x)  [seq, m_sh]
-    let mut enc = device.command_encoder().context("enc sh_gate")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc sh_gate")?;
     let a_s_buf = proj(
         &mut enc,
         registry,
@@ -2310,7 +2310,7 @@ pub fn build_moe_ffn_layer_gpu(
     enc.commit_and_wait().context("commit sh_gate")?;
 
     // Step 7: b_s = shared_up_proj(x)  [seq, m_sh]
-    let mut enc = device.command_encoder().context("enc sh_up")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc sh_up")?;
     let b_s_buf = proj(
         &mut enc,
         registry,
@@ -2330,7 +2330,7 @@ pub fn build_moe_ffn_layer_gpu(
     let h_s_buf = upload_f32(&h_s_cpu, device).context("upload h_s")?;
 
     // Step 9: y_s = shared_down_proj(h_s)  [seq, h]
-    let mut enc = device.command_encoder().context("enc sh_down")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc sh_down")?;
     let y_s_buf = proj(
         &mut enc,
         registry,
@@ -2407,7 +2407,7 @@ pub fn build_moe_ffn_layer_gpu_q(
     add_residual: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
     // Backwards-compatible variant: create our own encoder, dispatch, commit.
-    let mut enc = device.command_encoder().context("enc moe_ffn_q")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc moe_ffn_q")?;
     let out = build_moe_ffn_layer_gpu_q_into(
         &mut enc,
         device,

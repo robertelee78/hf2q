@@ -767,7 +767,7 @@ impl Deepseek4Model {
         } else {
             let local_executor = GraphExecutor::new(device.clone());
             let mut session = local_executor
-                .begin()
+                .begin().map(crate::inference::native_observation::session)
                 .with_context(|| format!("begin DeepSeek-V4 layer {layer} attention"))?;
             encode(&mut session)?;
             finish_or_commit(

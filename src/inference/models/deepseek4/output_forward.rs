@@ -117,7 +117,7 @@ impl Deepseek4Model {
             rms_params(&device, self.cfg.rms_norm_eps, hidden, "output RMS params")?;
 
         let (executor, registry) = self.ctx.split();
-        let mut session = executor.begin().context("begin DeepSeek-V4 output head")?;
+        let mut session = executor.begin().map(crate::inference::native_observation::session).context("begin DeepSeek-V4 output head")?;
         session.barrier_between(&[&state_flat], &[&state_norm]);
         session.rms_norm_no_scale_f32(
             registry,
@@ -210,7 +210,7 @@ impl Deepseek4Model {
 
         let (executor, registry) = self.ctx.split();
         let mut session = executor
-            .begin()
+            .begin().map(crate::inference::native_observation::session)
             .context("begin DeepSeek-V4 greedy argmax")?;
         session.barrier_between(&[logits, &params], &[&out_index, &out_value]);
         dispatch_argmax_f32(

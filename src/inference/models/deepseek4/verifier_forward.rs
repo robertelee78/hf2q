@@ -620,6 +620,8 @@ impl Deepseek4Model {
                 let mut row_offset = 0_usize;
                 for sequence in 0..token_batches.len() {
                     let rows = rows_per_sequence[sequence];
+                    let _native_input = crate::inference::native_observation::sorted_prefill_lane_input(
+                        sequence,token_batches.len(),spans[sequence].start_position,rows);
                     let element_offset = row_offset
                         .checked_mul(row_elements)
                         .context("DeepSeek-V4 cooperative state offset overflow")?;
@@ -628,7 +630,7 @@ impl Deepseek4Model {
                         .context("DeepSeek-V4 cooperative state slice overflow")?;
                     begin_prefill_pool_layer();
                     let attention_result: Result<()> = (|| {
-                        let mut session = executor.begin().with_context(|| {
+                        let mut session = executor.begin().map(crate::inference::native_observation::session).with_context(|| {
                             format!(
                                 "begin DeepSeek-V4 cooperative prefill layer {layer} sequence {sequence} attention"
                             )
@@ -739,8 +741,11 @@ impl Deepseek4Model {
 
                 begin_prefill_pool_layer();
                 let ffn_result: Result<MlxBuffer> = (|| {
+                    let _native_input = crate::inference::native_observation::sorted_prefill_pack_input(
+                        total_rows,spans.iter().zip(&rows_per_sequence)
+                            .map(|(span,rows)| (span.start_position,*rows)));
                     let mut completion = SubmissionChain::with_capacity(0);
-                    let mut session = executor.begin_recorded().with_context(|| {
+                    let mut session = executor.begin_recorded().map(crate::inference::native_observation::session).with_context(|| {
                         format!("begin DeepSeek-V4 cooperative prefill layer {layer} FFN")
                     })?;
                     let next_state = self.forward_ffn_rows(
@@ -802,6 +807,8 @@ impl Deepseek4Model {
         span: &CacheSpan,
         mut capture: Option<PrefillCapture<'_>>,
     ) -> Result<MlxBuffer> {
+        let _native_input = crate::inference::native_observation::single_input(
+            "deepseek4.prefill.actual_cache_span",span.start_position,token_ids.len());
         let layers = self.cfg.num_hidden_layers as usize;
         let executor = GraphExecutor::new(self.ctx.device().clone());
         let profile_timing = std::env::var_os("HF2Q_DEEPSEEK_PREFILL_TIMING").is_some();
@@ -880,7 +887,7 @@ impl Deepseek4Model {
                 begin_prefill_submission_inputs();
                 let group_result: Result<()> = (|| {
                     let mut completion = SubmissionChain::with_capacity(0);
-                    let mut session = executor.begin_recorded().with_context(|| {
+                    let mut session = executor.begin_recorded().map(crate::inference::native_observation::session).with_context(|| {
                         format!("begin DeepSeek-V4 recorded prefill layers {start}..{end}")
                     })?;
                     for layer in start..end {
@@ -933,9 +940,9 @@ impl Deepseek4Model {
                 let mut completion = SubmissionChain::with_capacity(0);
                 let record_graph = (layer == 0 && graph_diag) || graph_reorder;
                 let mut session = if record_graph {
-                    executor.begin_recorded()
+                    executor.begin_recorded().map(crate::inference::native_observation::session)
                 } else {
-                    executor.begin()
+                    executor.begin().map(crate::inference::native_observation::session)
                 }
                 .with_context(|| format!("begin DeepSeek-V4 prefill layer {layer}"))?;
                 // ADR-054 per-family calibration (#300): at the target
@@ -1172,6 +1179,8 @@ impl Deepseek4Model {
         cache: &mut Deepseek4Cache,
         commit_gate: impl FnOnce() -> Result<()>,
     ) -> Result<MlxBuffer> {
+        let _native_input = crate::inference::native_observation::single_input(
+            "deepseek4.scalar_verifier",cache.position(),1);
         let position = cache.position();
         let result = self.forward_verifier_one_uncommitted(token_id, cache);
         match result {
@@ -1285,7 +1294,7 @@ impl Deepseek4Model {
             for start in (0..layers).step_by(layers_per_command_buffer) {
                 let end = (start + layers_per_command_buffer).min(layers);
                 let mut session = executor
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .with_context(|| format!("begin DeepSeek-V4 verifier layers {start}..{end}"))?;
                 for layer in start..end {
                     state = Some(self.encode_verifier_layer(

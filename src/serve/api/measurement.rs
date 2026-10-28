@@ -118,6 +118,7 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
     );
     canonical(json!({
         "schema_version": "hf2q.measurement-snapshot.v1",
+        "phase_trace": crate::serve::phase_trace::snapshot(),
         "worker_pool_census": engine.worker_pool_census(),
         "process_pid": std::process::id(),
         "model_id": engine.model_id(),

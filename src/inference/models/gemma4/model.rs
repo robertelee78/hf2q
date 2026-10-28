@@ -822,7 +822,7 @@ impl MlxModelWeights {
             .map_err(|e| anyhow::anyhow!("write embed token ids: {e}"))?
             .copy_from_slice(tokens);
         let mut session = exec
-            .begin()
+            .begin().map(crate::inference::native_observation::session)
             .map_err(|e| anyhow::anyhow!("begin embed session: {e}"))?;
         crate::inference::models::gemma4::native_matrix::encode_embedding(
             &mut session,
