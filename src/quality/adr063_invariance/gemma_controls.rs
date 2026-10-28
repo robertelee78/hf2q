@@ -52,6 +52,7 @@ fn complete_active_cache_plan_has_every_head_and_distinct_actual_restore64() {
     let t0=gemma_cache::expected(&cfg,&[0,1,2,3],&positions(Trajectory::T0ColdSerial)).unwrap();
     // 25 sliding*8 heads +5 global*2 heads; three actual cache roles.
     assert_eq!(t0.len(),4*2*(25*8+5*2)*3);
+    assert_eq!(positions(Trajectory::T6CancelRestore),positions(Trajectory::T1Resume64));
     let t1=gemma_cache::expected(&cfg,&[0,1,2,3],&positions(Trajectory::T1Resume64)).unwrap();
     assert_eq!(t1.len(),t0.len()*2);
     let coordinates=t1.iter().map(|e|e.at.clone()).collect::<std::collections::BTreeSet<_>>();
@@ -78,12 +79,18 @@ fn endpoint_scope_cannot_relabel_packed_graph_or_omit_rows() {
         scalar:Scalar::F16,shape:vec![1,64,256]}];
     let store=Store::new(&root,identity,"HOST_ONLY_CONTROL".into(),expected,32768,1).unwrap();
     let scope=endpoint::install(store).unwrap();
+    let pause=endpoint::pause_unpublished_tail().unwrap();
+    assert!(endpoint::head_rows(64,64,None).unwrap().is_none());
+    assert!(endpoint::begin_call(0,64,64).is_err());
+    assert!(endpoint::pause_unpublished_tail().is_err());
+    drop(pause);
     endpoint::begin_call(0,0,64).unwrap();
     assert_eq!(endpoint::head_rows(0,64,None).unwrap().unwrap(),(0..64).collect::<Vec<_>>());
     assert!(endpoint::head_rows(0,64,Some(vec![(0,0,128,0),(1,0,128,128),(2,0,128,256),(3,0,128,384)])).is_err());
     assert!(endpoint::head_rows(64,64,None).is_err());
     assert!(endpoint::begin_call(1,0,64).is_err());
     assert!(endpoint::end_call().is_err());
+    assert!(endpoint::pause_unpublished_tail().is_err());
     drop(scope);
     assert!(endpoint::head_rows(0,64,None).unwrap().is_none());
     std::fs::remove_dir_all(root).unwrap();
@@ -102,4 +109,18 @@ fn packed_head_owner_mapping_uses_actual_offsets_not_width_as_membership() {
     }
     // One temporal512-row request is not four independent128-row inputs.
     assert!(endpoint::packed_owners(&[(0,0,512,0)]).is_err());
+}
+
+#[test]
+fn actual_restore64_hash_gate_rejects_cursor_only_or_changed_bytes() {
+    let source=Tensor {at:gemma_cache::at(0,64,0,Stage::CacheValuePacked,0,false),
+        scalar:Scalar::U8,shape:vec![1,64,256],logical_bytes:16384,parent_identity:1,
+        parent_bytes:16384,parent_offset:0,submission_id:None,checked_drain:"HOST_CONTROL".into(),
+        file:"source.bin".into(),sha256:"a".repeat(64),pages:vec![]};
+    let mut restored=source.clone();restored.at.segment+=1000;restored.file="restored.bin".into();
+    assert_eq!(gemma_cache::require_restore64_exact(&[source.clone(),restored.clone()]).unwrap(),16384);
+    restored.sha256="b".repeat(64);
+    assert!(gemma_cache::require_restore64_exact(&[source.clone(),restored]).is_err());
+    assert!(gemma_cache::require_restore64_exact(&[source]).is_err());
+    assert!(gemma_cache::require_restore64_exact(&[]).is_err());
 }

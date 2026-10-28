@@ -7,6 +7,7 @@ thread_local! { static ACTIVE: RefCell<Option<Active>> = const { RefCell::new(No
 pub struct Scope;
 impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| { s.borrow_mut().take(); }); } }
 pub fn install(store: Store) -> Result<Scope, String> {
+    if PAUSED.with(|p|p.get()) {return Err("cannot install a canonical capture during unpublished pause".into());}
     ACTIVE.with(|s| { let mut s=s.borrow_mut();
         if s.is_some() { return Err("nested Gemma endpoint capture".into()); }
         *s=Some(Active { store,lane:0,start:0,rows:0,next:0,owners:None }); Ok(Scope)
@@ -81,4 +82,26 @@ pub fn downloaded_logits(lane:usize,position:usize,values:&[f32])->Result<(),Str
         agent:format!("agent-{lane}"),logical_row_start:position as u64,segment:0},Scalar::F32,
         vec![1,values.len()],values.as_ptr() as usize as u64,bytes.len() as u64,0,None,
         "actual Gemma batched body/head checked return; CPU downloaded row",&bytes))
+}
+
+thread_local! {static PAUSED:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};}
+/// Same-thread unpublished-tail lease. Does not submit, wait, alter a buffer,
+/// or relabel required canonical rows as captured.
+pub struct UnpublishedPause {
+    active:Option<Active>,
+    _same_thread:std::marker::PhantomData<std::rc::Rc<()>>,
+}
+pub fn pause_unpublished_tail()->Result<UnpublishedPause,String> {
+    end_call()?;
+    if PAUSED.with(|p|p.replace(true)) {return Err("nested unpublished capture pause".into());}
+    let active=ACTIVE.with(|s|s.borrow_mut().take());
+    if active.is_none() {PAUSED.with(|p|p.set(false));return Err("missing actual capture to pause".into());}
+    Ok(UnpublishedPause {active,_same_thread:std::marker::PhantomData})
+}
+impl Drop for UnpublishedPause {
+    fn drop(&mut self) {
+        ACTIVE.with(|s| {let mut s=s.borrow_mut();assert!(s.is_none(),"capture installed during unpublished pause");
+            *s=self.active.take();});
+        PAUSED.with(|p|p.set(false));
+    }
 }

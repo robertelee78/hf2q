@@ -57,3 +57,23 @@ pub fn after_checked_return(store:&mut Store,cfg:&Gemma4Config,
     }
     Ok(())
 }
+
+/// Actual captured full-content hashes, not cursor equality or float tolerance.
+/// Store has independently enforced the complete config-derived coordinates.
+pub fn require_restore64_exact(tensors:&[Tensor])->Result<u64,String> {
+    let before=tensors.iter().filter(|t|t.at.logical_step==64 && t.at.segment<1000).collect::<Vec<_>>();
+    let restored=tensors.iter().filter(|t|t.at.logical_step==64 && t.at.segment>=1000).collect::<Vec<_>>();
+    if before.is_empty() || before.len()!=restored.len() {return Err("Gemma exact64 paired extent missing".into());}
+    let mut total=0u64;
+    for source in before {
+        let mut at=source.at.clone();at.segment+=1000;
+        let matches=restored.iter().filter(|t|t.at==at).collect::<Vec<_>>();
+        if matches.len()!=1 {return Err("Gemma exact64 restore coordinate ambiguous/missing".into());}
+        let target=matches[0];
+        if source.scalar!=target.scalar || source.shape!=target.shape || source.logical_bytes==0
+            || source.logical_bytes!=target.logical_bytes || source.sha256!=target.sha256 {
+            return Err("Gemma restored active64 bytes differ".into());
+        }
+        total=total.checked_add(source.logical_bytes).ok_or("Gemma exact64 byte overflow")?;
+    }Ok(total)
+}

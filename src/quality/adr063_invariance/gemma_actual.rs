@@ -16,8 +16,8 @@ fn preflight(p:&Packet)->Result<()> {
     p.identity.validate().map_err(anyhow::Error::msg)?;p.workload.validate().map_err(anyhow::Error::msg)?;
     ensure!(p.execution_approved && p.identity.family==Family::Gemma4 && p.workload.family==Family::Gemma4,
         "explicit approved Gemma packet/family required");
-    if p.trajectory!=Trajectory::T2ActualCohort { require_ordinary(p.trajectory)?; }
-    else { ensure!(std::env::var("HF2Q_BATCHED_BODY").as_deref()!=Ok("0"),
+    if !matches!(p.trajectory,Trajectory::T2ActualCohort|Trajectory::T6CancelRestore) { require_ordinary(p.trajectory)?; }
+    else if p.trajectory==Trajectory::T2ActualCohort { ensure!(std::env::var("HF2Q_BATCHED_BODY").as_deref()!=Ok("0"),
         "Gemma T2 selected body opt-out remains respected"); }
     ensure!(p.configured_context==262144 && p.configured_output_allowance==8192,
         "selected Gemma context/output profile required");
@@ -38,8 +38,8 @@ fn recipe(cfg:&crate::serve::config::Gemma4Config)->acquisition::ConfigRecipe<'s
 }
 fn positions(t:Trajectory)->Vec<(usize,bool)> {
     let mut p=vec![(128,false),(144,false)];
-    if matches!(t,Trajectory::T1Resume64|Trajectory::T3Chunk64) {p.push((64,false));}
-    if t==Trajectory::T1Resume64 {p.push((64,true));}p
+    if matches!(t,Trajectory::T1Resume64|Trajectory::T3Chunk64|Trajectory::T6CancelRestore) {p.push((64,false));}
+    if matches!(t,Trajectory::T1Resume64|Trajectory::T6CancelRestore) {p.push((64,true));}p
 }
 fn cache(model:&GemmaLoadedModel,lane:usize,pos:usize,restored:bool)->Result<()> {
     endpoint::with_store(|s|gemma_cache::after_checked_return(s,&model.config,
@@ -58,21 +58,27 @@ fn prefill(model:&mut GemmaLoadedModel,tokens:&[u32],lane:usize,cached:usize)->R
             SlotId(lane as u32),hb,model.multi_seq_kv_hybrid.as_mut(),model.multi_seq_kv_dense.as_mut(),
             model.multi_seq_kv_mlx.as_mut(),cached)?;
     }
+    crate::serve::api::engine::q1_gemma_cohort::commit_after_checked_return(
+        model,SlotId(lane as u32),cached,tokens.len())?;
     endpoint::end_call().map_err(anyhow::Error::msg)
 }
 #[test]
 #[ignore="root supervised actual Gemma model; reviewed acquisition/resource packet required"]
-fn q1_gemma_actual_ordinary_endpoint_trace() {run(false).unwrap();}
+fn q1_gemma_actual_ordinary_endpoint_trace() {run(None).unwrap();}
 #[test]
 #[ignore="root supervised actual Gemma packed cohort; reviewed resource/identity packet"]
-fn q1_gemma_actual_cohort_endpoint_trace() {run(true).unwrap();}
-fn run(cohort:bool)->Result<()> {
+fn q1_gemma_actual_cohort_endpoint_trace() {run(Some(Trajectory::T2ActualCohort)).unwrap();}
+#[test]
+#[ignore="root supervised actual Gemma owning-worker cancellation and exact64 restore"]
+fn q1_gemma_actual_cancel_endpoint_trace() {run(Some(Trajectory::T6CancelRestore)).unwrap();}
+fn run(separate:Option<Trajectory>)->Result<()> {
     ensure!(cfg!(target_endian="little"),"raw tensor encoding requires little endian");
     let path=std::env::var_os("HF2Q_Q1_GEMMA_ENDPOINT_PACKET").context("explicit Gemma endpoint packet")?;
     let mut raw=Vec::new();std::fs::File::open(path)?.take(1024*1024+1).read_to_end(&mut raw)?;
     ensure!(raw.len()<=1024*1024,"Gemma packet quota");
     let p:Packet=serde_json::from_slice(&raw)?;preflight(&p)?;
-    ensure!((p.trajectory==Trajectory::T2ActualCohort)==cohort,"actual test filter/trajectory mismatch");
+    if let Some(t)=separate {ensure!(p.trajectory==t,"actual test filter/trajectory mismatch");}
+    else {require_ordinary(p.trajectory)?;}
     let scope=acquisition::Scope::begin(&p.acquisition,&p.identity,&p.workload,&p.model,&p.output,&raw)?;
     let header=acquisition::open_model(&p.model)?;
     ensure!(header.metadata_string("general.architecture")==Some("gemma4"),"no family fallback");
@@ -105,6 +111,7 @@ fn run(cohort:bool)->Result<()> {
         && model.multi_seq_kv_mlx.is_none(),"selected Hybrid only; other actual legs require explicit coverage");
     let _capture=endpoint::install(store).map_err(anyhow::Error::msg)?;
     let order=if p.trajectory==Trajectory::T4ReverseOrder {[3,2,1,0]}else{[0,1,2,3]};
+    let mut cancellation=Vec::new();
     let result=(||->Result<()> {
         if p.trajectory==Trajectory::T2ActualCohort {
             use crate::serve::api::engine::q1_gemma_cohort;
@@ -128,7 +135,15 @@ fn run(cohort:bool)->Result<()> {
         }
         for lane in order {
             let tokens=&p.workload.lanes[lane];
-            if matches!(p.trajectory,Trajectory::T1Resume64|Trajectory::T3Chunk64) {
+            if p.trajectory==Trajectory::T6CancelRestore {
+                endpoint::begin_call(lane,0,64).map_err(anyhow::Error::msg)?;
+                cancellation.push(crate::serve::api::engine::q1_gemma_cancel::run_loaded(
+                    &mut model,lane,&tokens[..128],|restored,hybrid| {
+                        endpoint::with_store(|store|gemma_cache::after_checked_return(
+                            store,&cfg,hybrid,lane,64,restored)).map_err(anyhow::Error::msg)
+                    })?);
+                prefill(&mut model,&tokens[..128],lane,64)?;
+            } else if matches!(p.trajectory,Trajectory::T1Resume64|Trajectory::T3Chunk64) {
                 prefill(&mut model,&tokens[..64],lane,0)?;cache(&model,lane,64,false)?;
                 if p.trajectory==Trajectory::T1Resume64 {
                     use crate::inference::models::gemma4::kv_cache::{snapshot_gemma_hybrid_slot_anchor,restore_gemma_hybrid_slot_anchor};
@@ -144,6 +159,8 @@ fn run(cohort:bool)->Result<()> {
                 model.weights.forward_decode_slot_aware(tokens[pos],pos,&mut model.ctx,&mut None,SlotId(lane as u32),
                     model.multi_seq_kv.as_mut().context("Gemma slot scaffold")?,model.multi_seq_kv_hybrid.as_mut(),
                     model.multi_seq_kv_dense.as_mut(),model.multi_seq_kv_mlx.as_mut())?;
+                crate::serve::api::engine::q1_gemma_cohort::commit_after_checked_return(
+                    &mut model,SlotId(lane as u32),pos,pos+1)?;
                 endpoint::logits(0,&model.weights.activations.logits,cfg.vocab_size).map_err(anyhow::Error::msg)?;
                 endpoint::end_call().map_err(anyhow::Error::msg)?;
             }
@@ -154,8 +171,11 @@ fn run(cohort:bool)->Result<()> {
     scope.check_unchanged()?;
     let trace=endpoint::finish().map_err(anyhow::Error::msg)?;result?;
     ensure!(trace.coverage.errors.is_empty(),"Gemma endpoint extent incomplete");
+    let exact64=if matches!(p.trajectory,Trajectory::T1Resume64|Trajectory::T6CancelRestore) {
+        Some(gemma_cache::require_restore64_exact(&trace.coverage.captured))
+    } else {None};
     let report=serde_json::json!({"schema":"hf2q.q1.gemma-ordinary-endpoint.v1","packet_sha256":hash(&raw),
-        "trajectory":p.trajectory,"logical_lanes":4,"physical_graph_membership":if p.trajectory==Trajectory::T2ActualCohort {
+        "trajectory":p.trajectory,"actual_cancellation":cancellation,"active64_exact_copy":exact64,"logical_lanes":4,"physical_graph_membership":if p.trajectory==Trajectory::T2ActualCohort {
             "actual packed prefill512 rows with four128-owner spans; actual decode input4rows; operator-specific source geometry, not whole-kernel/F2 membership"
         } else {"per-request ordinary; not T2"},
         "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,
@@ -163,6 +183,7 @@ fn run(cohort:bool)->Result<()> {
         "float_policy":"Unspecified","diagnostic_head_scope":"same production scalar head applied to every actual prefill hidden row"});
     let mut file=OpenOptions::new().create_new(true).write(true).mode(0o600).open(p.output.join("execution.json"))?;
     file.write_all(&serde_json::to_vec_pretty(&report)?)?;
+    if let Some(exact)=exact64 {exact.map_err(anyhow::Error::msg)?;}
     println!("Q1_GEMMA_ORDINARY_ENDPOINT_COMPLETE lanes=4 logits=144 whole_q1=false");Ok(())
 }
 #[cfg(test)]

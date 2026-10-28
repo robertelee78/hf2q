@@ -6,6 +6,13 @@ fn require_slots(slots:&[SlotId])->Result<()> {
         .collect::<std::collections::BTreeSet<_>>()==[0,1,2,3].into_iter().collect(),
         "four distinct actual Gemma slots required");Ok(())
 }
+/// Owning worker publishes persistent cursor only after a successful real
+/// slot-aware return; the weight primitive itself deliberately does not.
+pub(crate) fn commit_after_checked_return(model:&mut GemmaLoadedModel,slot:SlotId,
+    before:usize,end:usize)->Result<()> {
+    let mut guard=Gemma4KvGuard::take(model)?;
+    commit_gemma4_slot_cursor(&mut guard,slot,before,end)
+}
 pub(crate) fn prefill(model:&mut GemmaLoadedModel,seqs:&[(Vec<u32>,SlotId)]) -> Result<()> {
     anyhow::ensure!(seqs.len()==4 && seqs.iter().all(|(t,_)|t.len()==128),"frozen four128 Gemma inputs");
     require_slots(&seqs.iter().map(|(_,slot)|*slot).collect::<Vec<_>>())?;

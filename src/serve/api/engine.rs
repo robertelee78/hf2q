@@ -40,6 +40,9 @@ pub(crate) mod q1_qwen_cancel;
 #[cfg(test)]
 #[path = "engine/q1_gemma_cohort.rs"]
 pub(crate) mod q1_gemma_cohort;
+#[cfg(test)]
+#[path = "engine/q1_gemma_cancel.rs"]
+pub(crate) mod q1_gemma_cancel;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -13917,7 +13920,14 @@ fn advance_gemma4_prefill(
     let max_chunk_tokens = requested_tokens
         .min(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS)
         .max(1) as usize;
-    match state.advance(guard, registration, max_chunk_tokens, supervisor) {
+    let advance = state.advance(guard, registration, max_chunk_tokens, supervisor);
+    #[cfg(test)]
+    if let Err(error) = q1_gemma_cancel::after_actual_advance(advance.is_ok(),handle,
+        validate_gemma4_slot_cursor(guard,handle.slot_id,gemma4_live_slot_tokens(guard,handle.slot_id))
+            .ok().map(|_|gemma4_live_slot_tokens(guard,handle.slot_id))) {
+        return Some(SlotAwareGpuFatal::invariant_slot(handle,reply,error));
+    }
+    match advance {
         Ok(advance) => {
             if let Some(fatal) = install_gemma4_prefill_advance(
                 guard,
