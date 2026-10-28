@@ -4,6 +4,7 @@ No HTTP overlap, scheduler phase, temporal verifier row or inflight heartbeat is
 promoted into physical batching or runnable-forward evidence.
 """
 import json
+import f2_demand
 
 SCHEMA = "hf2q.f2.phase-trace.v1"
 TOTAL_LIMIT = 256 * 1024 * 1024
@@ -53,6 +54,7 @@ def validate_trace(records, expected_identity, scenario):
     size = 0
     header = None
     native = None
+    demand = f2_demand.Validator()
     for seq, record in enumerate(records):
         require(set(record) == {"schema", "seq", "at_ns", "kind", "payload"} and
                 record["schema"] == SCHEMA and type(record["seq"]) is int and record["seq"] == seq and
@@ -67,8 +69,13 @@ def validate_trace(records, expected_identity, scenario):
             base_keys = {"identity", "run_id", "server_budget_bytes", "client_budget_bytes", "clock",
                          "clock_id", "origin_monotonic_ns", "config_sha256"}
             native_keys = base_keys | {"native_observer", "server_jsonl_budget_bytes"}
-            require(kind == "header" and set(payload) in (base_keys, native_keys,
-                    native_keys | {"metadata_budget_profile"}) and
+            allowed_headers = (base_keys, native_keys, native_keys | {"metadata_budget_profile"})
+            if "forward_demand_policy" in payload:
+                f2_demand.validate_policy(payload, scenario)
+                allowed_headers += tuple(keys | {"forward_demand_policy"} for keys in allowed_headers[1:])
+            else:
+                require("forward_demand_policy" not in scenario, "missing declared demand policy")
+            require(kind == "header" and set(payload) in allowed_headers and
                     payload["identity"] == expected_identity and payload["run_id"] == scenario["run_id"] and
                     payload["clock"] == "CLOCK_MONOTONIC nanoseconds since origin" and
                     payload["clock_id"] == "CLOCK_MONOTONIC" and
@@ -93,7 +100,10 @@ def validate_trace(records, expected_identity, scenario):
                     len(payload["slots"]) <= 256, "complete bounded scheduler snapshot")
             current = {}
             for s in payload["slots"]:
-                require(set(s) in (SLOT_KEYS, SLOT_KEYS | {"forward_eligibility"}) and
+                slot_shapes = (SLOT_KEYS, SLOT_KEYS | {"forward_eligibility"})
+                if "forward_demand_policy" in header:
+                    slot_shapes = (SLOT_KEYS | {"forward_eligibility"} | f2_demand.SLOT_FIELDS,)
+                require(set(s) in slot_shapes and
                         (s.get("forward_eligibility") is None or type(s["forward_eligibility"]) is bool) and
                         all(natural(s[k]) for k in
                         ("request_id", "slot_id", "generation")) and s["active"] is True and
@@ -117,6 +127,7 @@ def validate_trace(records, expected_identity, scenario):
                 require(s["blocked"] is None or type(s["blocked"]) is str, "typed blocked reason")
                 current[key] = s
                 generations[s["slot_id"]] = s["generation"]
+            demand.snapshot(payload, header)
             latest = current
         elif kind == "submission":
             require(set(payload) == {"submission_id", "membership", "rows"} and
@@ -160,6 +171,8 @@ def validate_trace(records, expected_identity, scenario):
                     (previous_position is None or payload["committed_position"] - previous_position == payload["tokens"]),
                     "progress token/cursor mismatch")
             progress_positions[key] = payload["committed_position"]
+        elif kind == "diagnostic_quantum":
+            demand.quantum(payload, header, latest)
         elif kind == "transaction":
             # This is valuable source evidence, but NOT a native submit timestamp.
             require(set(payload) == {"family", "operation", "logical_lanes", "physical_membership", "reason"}
@@ -169,6 +182,7 @@ def validate_trace(records, expected_identity, scenario):
                 require(set(lane) == {"request_id", "slot_id", "generation"} and
                         lineage(lane) in latest and lane["request_id"] == latest[lineage(lane)]["request_id"],
                         "transaction has unknown logical owner")
+            demand.transaction(payload, header)
         elif kind in NATIVE_KINDS:
             require(native is not None, "native record without explicit diagnostic configuration")
             native.consume(record, latest)
@@ -178,6 +192,7 @@ def validate_trace(records, expected_identity, scenario):
                     "finalized nonoverflowing trace required")
         else:
             raise ValueError("unknown trace event")
+    demand.finish(header)
     require(records[-1]["kind"] == "end", "missing final trace: no truncation qualification")
     if native is not None:
         require(not submissions and not drained, "legacy CB-union rows cannot replace native operator witnesses")
@@ -198,7 +213,7 @@ def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
     require(composition in ((1, 0), (0, 1), (4, 0), (3, 1), (2, 2), (1, 3), (0, 4)) and
             natural(arrival_ns) and window_ns == 2_000_000_000 and deadline_ns == 30_000_000_000,
             "frozen population/window required")
-    require(population_policy in ("ready_now_v1", "forward_demand_v2"),
+    require(population_policy in ("ready_now_v1", "forward_demand_v2", f2_demand.POLICY),
             "externally frozen population policy required")
     native_report = None
     if "native_observer" in records[0]["payload"]:
@@ -215,8 +230,11 @@ def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
             elif record["kind"] in NATIVE_KINDS:
                 parser.consume(record, latest)
         native_report = parser.finish()
-    require(population_policy != "forward_demand_v2" or native_report is not None,
+    require(population_policy == "ready_now_v1" or native_report is not None,
             "forward demand requires actual native operator witnesses")
+    if population_policy == f2_demand.POLICY:
+        require(records[0]["payload"].get("forward_demand_policy") == f2_demand.CONFIG,
+                "queued demand must be frozen in actual trace configuration")
     snapshots = [r for r in records if r["kind"] == "slots"]
     def population(record, ready_only=False):
         slots = record["payload"]["slots"]
@@ -225,10 +243,15 @@ def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
         counts = [0,0]
         for slot in slots:
             ready = slot["runnable_forward"]
-            if population_policy == "forward_demand_v2" and slot.get("forward_eligibility") is not True:
+            if population_policy in ("forward_demand_v2", f2_demand.POLICY) and slot.get("forward_eligibility") is not True:
                 # Explicit closed/terminal/cancel/error or Unknown ends credit;
                 # ordinary transaction-busy false-readiness does not.
                 return None
+            if population_policy == f2_demand.POLICY and not ready_only:
+                if slot.get("forward_demand_state") not in f2_demand.ACTIVE:
+                    return None
+                counts[0 if slot["phase"] == "prefill" else 1] += 1
+                continue
             outstanding = False
             if population_policy == "forward_demand_v2" and not ready_only:
                 outstanding = any(item["end_ns"] <= record["at_ns"] < item["checked_return_ns"] and
@@ -295,8 +318,10 @@ def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
             "end_ns": end, "target_coverage_ns": coverage, "target_fraction": coverage / window_ns,
             "population_policy":population_policy,"ready_now_coverage_ns":ready_coverage,
             "ready_now_fraction":ready_coverage / window_ns,
-            "service_semantics":"host-known SubmittedOutstanding, never Running/utilization"
-                if population_policy == "forward_demand_v2" else "ready-now only",
+            "service_semantics":("input-ready queued/selected demand; executor availability separate; never Running"
+                if population_policy == f2_demand.POLICY else
+                "host-known SubmittedOutstanding, never Running/utilization"
+                if population_policy == "forward_demand_v2" else "ready-now only"),
             "slots_without_progress": [list(k) for k in sorted(admitted - progress)],
             "slots_without_required_forward_witness": [list(k) for k in sorted(
                 admitted - witness_progress)] if native_report is not None else None,

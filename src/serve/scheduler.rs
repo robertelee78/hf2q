@@ -1479,7 +1479,7 @@ impl InflightBatchedScheduler {
                 blocked:Some("OwningWorkerTransaction"),
             }
         }).collect();
-        crate::serve::phase_trace::scheduler(busy,"owning_worker_enter_transaction");
+        crate::serve::phase_trace::transaction_states(busy, handles);
         crate::inference::native_observation::invocation(owners)
     }
 
@@ -3797,3 +3797,6 @@ mod tests {
         assert_eq!(r.preferred_slot, None);
     }
 }
+
+#[cfg(test)]
+mod f2_demand_controls;

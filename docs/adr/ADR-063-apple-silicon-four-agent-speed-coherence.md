@@ -616,3 +616,32 @@ Gemma and DeepSeek multi-depth anchor implementations; production mixed-prefill 
 - [ADR-019: encoder ownership history](ADR-019-mlx-native-encoder-architecture.md)
 
 This ADR consolidates research and prospective work; it does not supersede accepted family-specific safety contracts. F3 reconciles historical ADR drift in the same work that updates those sources and their trackers.
+
+### Prospective queued-forward demand and bounded quantum diagnostic
+
+The full native0.15.9 trace `061436Z` is lifecycle/capacity-valid but its FIRST
+fixed2s window is Unqualified: all4 actual input-ready owners existed, but
+serialized720-row transactions serviced only slots0/1 during that window.
+Unknown admission snapshots did not fabricate readiness. This failed result
+MUST remain unchanged; a narrow input-RMS interval is not whole-forward GPU
+service or utilization.
+
+A separate explicit `forward_demand_policy` may select ONLY
+`population_policy="queued_forward_demand_v3"` with
+`qwen_prefill_chunk_tokens=128`, ONLY with a native diagnostic observer. Its
+actual Qwen owning-worker acknowledgement MUST precede admission. Header,
+config digest and independent expectation MUST bind the exact pair. Legacy
+absence, `ready_now_v1`, `forward_demand_v2`, production2048/4096 quanta and
+all finite v3 metadata ceilings remain unchanged.
+
+This new policy distinguishes actual input-ready queued/selected-forward
+DEMAND from executor availability: waiting slots do not own another slot's
+transaction, and unavailable executor remains runnable=false. Output-only,
+terminal, cancelled, stale and Unknown states MUST NOT be credited. Demand
+is never GPU Running, physical B4, full-body membership or progress. Keep the
+first fixed2s window/end by30s, >=80% target coverage, actual new per-owner
+progress/native witness and eventual healthy exact checked completion. A new
+128-quantum experiment MUST retain the full canonical4-client28HTTP/24-tool
+workload, context/output/sampling and all failure outcomes; no favourable
+window/search/rescore or quota expansion. Source controls do not establish
+chunking numerical parity, model quality, timing success or primary acceptance.
