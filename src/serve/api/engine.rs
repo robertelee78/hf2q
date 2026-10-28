@@ -34,6 +34,16 @@
 #[path = "engine_gemma_full_input.rs"]
 pub(crate) mod gemma_full_input;
 
+#[cfg(test)]
+#[path = "engine/q1_qwen_cancel.rs"]
+pub(crate) mod q1_qwen_cancel;
+#[cfg(test)]
+#[path = "engine/q1_gemma_cohort.rs"]
+pub(crate) mod q1_gemma_cohort;
+#[cfg(test)]
+#[path = "engine/q1_gemma_cancel.rs"]
+pub(crate) mod q1_gemma_cancel;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -3266,6 +3276,10 @@ impl LoadedModel {
             model_path.display()
         );
         // Header-only parse — cheap; no tensor read.
+        #[cfg(test)]
+        let gguf = crate::adr063_invariance::acquisition::open_model(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+        #[cfg(not(test))]
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         let arch = gguf
@@ -3371,6 +3385,10 @@ impl GemmaLoadedModel {
             resolve_tokenizer_path_optional(model_path, opts.tokenizer_path.as_deref());
 
         // Open GGUF (header + metadata only).
+        #[cfg(test)]
+        let gguf = crate::adr063_invariance::acquisition::open_model(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+        #[cfg(not(test))]
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         if load_timing {
@@ -13902,7 +13920,14 @@ fn advance_gemma4_prefill(
     let max_chunk_tokens = requested_tokens
         .min(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS)
         .max(1) as usize;
-    match state.advance(guard, registration, max_chunk_tokens, supervisor) {
+    let advance = state.advance(guard, registration, max_chunk_tokens, supervisor);
+    #[cfg(test)]
+    if let Err(error) = q1_gemma_cancel::after_actual_advance(advance.is_ok(),handle,
+        validate_gemma4_slot_cursor(guard,handle.slot_id,gemma4_live_slot_tokens(guard,handle.slot_id))
+            .ok().map(|_|gemma4_live_slot_tokens(guard,handle.slot_id))) {
+        return Some(SlotAwareGpuFatal::invariant_slot(handle,reply,error));
+    }
+    match advance {
         Ok(advance) => {
             if let Some(fatal) = install_gemma4_prefill_advance(
                 guard,
@@ -19510,6 +19535,9 @@ fn advance_qwen35_prefill(
         max_chunk_tokens,
         supervisor,
     );
+    #[cfg(test)]
+    q1_qwen_cancel::after_actual_advance(advance.is_ok(), guard.kv.as_ref()
+        .and_then(|kv| kv.sequence_len_for_slot(handle.slot_id).ok()).map(|n| n as usize));
     match advance {
         Ok(super::engine_qwen35::Qwen35PrefillAdvance::Pending {
             state,

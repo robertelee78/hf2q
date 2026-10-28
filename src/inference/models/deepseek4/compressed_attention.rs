@@ -732,6 +732,32 @@ impl Deepseek4Model {
                 format!("execute DeepSeek-V4 layer {layer} compressed attention"),
             )?;
         }
+        #[cfg(test)]
+        if crate::adr063_invariance::family::enabled(crate::adr063_invariance::receipt::Family::Deepseek4) {
+            use crate::adr063_invariance::{family, receipt::{Family, Stage}};
+            // All these layer-issued roots remain intact until the enclosing
+            // diagnostic per-layer finish, before pool recycling. Retain only;
+            // never read through the still-borrowed GraphSession here.
+            family::retain_current(Family::Deepseek4, Stage::Input, state)
+                .map_err(anyhow::Error::msg)?;
+            family::retain_current(Family::Deepseek4, Stage::Norm, &core.attn_norm)
+                .map_err(anyhow::Error::msg)?;
+            family::retain_current(Family::Deepseek4, Stage::Query, &core.q)
+                .map_err(anyhow::Error::msg)?;
+            family::retain_current(Family::Deepseek4, Stage::Key, &core.kv)
+                .map_err(anyhow::Error::msg)?;
+            let q1_ropequery = q_rope.with_shape(vec![rows, heads, head_dim])?;
+            family::retain_current(Family::Deepseek4, Stage::RopeQuery, &q1_ropequery)
+                .map_err(anyhow::Error::msg)?;
+            let q1_quantizedkv = kv_rope.with_shape(vec![rows, head_dim])?;
+            family::retain_current(Family::Deepseek4, Stage::QuantizedKv, &q1_quantizedkv)
+                .map_err(anyhow::Error::msg)?;
+            let q1_attention = attention.with_shape(vec![rows, heads, head_dim])?;
+            family::retain_current(Family::Deepseek4, Stage::Attention, &q1_attention)
+                .map_err(anyhow::Error::msg)?;
+            family::retain_current(Family::Deepseek4, Stage::Residual, &core.output_state)
+                .map_err(anyhow::Error::msg)?;
+        }
         if commit_cache {
             cache
                 .commit_step(

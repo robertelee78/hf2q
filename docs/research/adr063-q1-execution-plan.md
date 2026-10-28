@@ -125,3 +125,17 @@ Optimistic source engineering after root approval: comparator/capture adapters a
 Fastest legitimate path is root approval of this finite routine design after independent delta review; implement/prove the oracle positive/negative gates, run source-bounded family diagnostic matrix under applicable Q5 bounds, retain every backend finding, and merge the qualified diagnostic/evidence. F2 predecessor still governs final Q1 delivery; Q2 independently adversarially certifies the same harness. Neither is a demand to fix every backend finding before the diagnostic can exist. Four original story closures today cannot be guaranteed by a document, passing aggregate count or one coding case. Parallelize source/review, keep hardware single-owner.
 
 Remaining concrete decisions for root: exact adapter capture/parent-memory/time packets, per-axis source-supported capability dispositions and safe routing-injection seam, and any desired NEW numerical acceptance policy. Routine implementation can be root-approved inside existing user program authority; this author does not self-approve, invent tolerance, waive dependencies, or add a generic user-approval flow. No official-F32 reload, universal physical-memory theorem, new generic framework, or native publication is required unless a genuinely missing native operation/trace is introduced.
+
+### Packed cache encoding is not an integer-ID policy
+
+U8 `CacheKeyPacked`/`CacheValuePacked` store floating codebook indices. Under
+`Unspecified`, preserve full encoded-bit differences and report policy-inconclusive;
+those bytes supply no decoded-value metric. Explicit within-acquisition copy
+`Exact` remains byte-exact. `SourceQualified` refuses without an actual decoder
+and independently approved codebook policy. Generic U8 cache state and integer
+routing/token IDs remain exact. The prior comparator's blanket nonfloat branch
+could mislabel changed packed codes `DivergedExactInvariant`; retain those old
+reports and source identities unchanged. Any new analysis uses its own frozen
+algorithm/source and cannot rescore or qualify prior primary/task-quality claims.
+See `adr063-q1-gemma-artifact-comparison.md` for full original-audit-before-projection
+and exact64 gates; endpoint analysis is not a causal localization or whole-Q1 PASS.
