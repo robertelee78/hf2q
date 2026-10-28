@@ -7,6 +7,7 @@ import json
 
 SCHEMA = "hf2q.f2.phase-trace.v1"
 TOTAL_LIMIT = 256 * 1024 * 1024
+NATIVE_TOTAL_LIMIT = 2 * 1024 * 1024 * 1024
 EVENT_LIMIT = 64 * 1024
 SLOT_KEYS = {"request_id", "slot_id", "generation", "phase", "active",
              "runnable_forward", "runnable_emit", "inflight", "blocked"}
@@ -26,6 +27,19 @@ def natural(x):
 
 def lineage(slot):
     return slot["slot_id"], slot["generation"]
+
+
+def metadata_total_limit(header):
+    """Only the exact declared diagnostic profile can select a larger file quota."""
+    if "metadata_budget_profile" not in header:
+        return TOTAL_LIMIT
+    require(type(header["metadata_budget_profile"]) is str and
+            header["metadata_budget_profile"] == "native_command_capture_v2",
+            "unsupported metadata budget profile")
+    native = header.get("native_observer")
+    require(type(native) is dict and native.get("diagnostic_case") is True,
+            "native metadata profile requires explicit diagnostic observer")
+    return NATIVE_TOTAL_LIMIT
 
 
 def validate_trace(records, expected_identity, scenario):
@@ -50,17 +64,20 @@ def validate_trace(records, expected_identity, scenario):
         if seq == 0:
             base_keys = {"identity", "run_id", "server_budget_bytes", "client_budget_bytes", "clock",
                          "clock_id", "origin_monotonic_ns", "config_sha256"}
-            require(kind == "header" and set(payload) in (base_keys, base_keys | {
-                    "native_observer", "server_jsonl_budget_bytes"}) and
+            native_keys = base_keys | {"native_observer", "server_jsonl_budget_bytes"}
+            require(kind == "header" and set(payload) in (base_keys, native_keys,
+                    native_keys | {"metadata_budget_profile"}) and
                     payload["identity"] == expected_identity and payload["run_id"] == scenario["run_id"] and
                     payload["clock"] == "CLOCK_MONOTONIC nanoseconds since origin" and
                     payload["clock_id"] == "CLOCK_MONOTONIC" and
                     natural(payload["origin_monotonic_ns"]),
                     "bound trace header required")
             require(natural(payload["server_budget_bytes"]) and payload["server_budget_bytes"] > 0 and
-                    natural(payload["client_budget_bytes"]) and payload["client_budget_bytes"] > 0 and
-                    payload["server_budget_bytes"] + payload["client_budget_bytes"] <= TOTAL_LIMIT,
+                    natural(payload["client_budget_bytes"]) and payload["client_budget_bytes"] >= 128 * 1024 * 1024 and
+                    payload["server_budget_bytes"] + payload["client_budget_bytes"] <= metadata_total_limit(payload),
                     "combined server/client quota")
+            require(payload.get("metadata_budget_profile") == scenario.get("metadata_budget_profile"),
+                    "trace metadata budget profile drift")
             require(payload["config_sha256"] == scenario["config_sha256"], "trace configuration drift")
             header = payload
             if "native_observer" in payload:

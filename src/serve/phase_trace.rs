@@ -9,10 +9,10 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+mod metadata_budget;
 mod native;
 
 pub(crate) const SCHEMA: &str = "hf2q.f2.phase-trace.v1";
-const TOTAL_LIMIT: u64 = 256 * 1024 * 1024;
 const EVENT_LIMIT: usize = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -23,6 +23,8 @@ struct Config {
     run_id: String,
     server_budget_bytes: u64,
     client_budget_bytes: u64,
+    #[serde(default, deserialize_with = "metadata_budget::deserialize_optional")]
+    metadata_budget_profile: Option<metadata_budget::Profile>,
     #[serde(default)]
     native_observer: Option<native::Config>,
     #[serde(deserialize_with = "unique_identity")]
@@ -155,12 +157,18 @@ enum Trace {
 static TRACE: OnceLock<Trace> = OnceLock::new();
 
 fn validate_config(c: &Config) -> Result<(), String> {
+    let total_limit = metadata_budget::limit(
+        c.metadata_budget_profile,
+        c.native_observer
+            .as_ref()
+            .map(|native| native.diagnostic_case),
+    )?;
     if c.schema != SCHEMA
         || c.server_budget_bytes == 0
         || c.client_budget_bytes < 128 * 1024 * 1024
         || c.server_budget_bytes
             .checked_add(c.client_budget_bytes)
-            .filter(|n| *n <= TOTAL_LIMIT)
+            .filter(|n| *n <= total_limit)
             .is_none()
     {
         return Err("invalid combined server/client trace quota".into());
@@ -286,6 +294,9 @@ fn initialize() -> Trace {
             "server_budget_bytes":c.server_budget_bytes,"client_budget_bytes":c.client_budget_bytes,
             "clock":"CLOCK_MONOTONIC nanoseconds since origin","clock_id":"CLOCK_MONOTONIC","origin_monotonic_ns":recorder.origin_ns,
             "config_sha256":recorder.config_sha256});
+        if let Some(profile) = c.metadata_budget_profile {
+            header["metadata_budget_profile"] = json!(profile);
+        }
         if let Some(native) = c.native_observer {
             header["native_observer"] = json!(native);
             header["server_jsonl_budget_bytes"] = json!(recorder.budget);
@@ -437,6 +448,7 @@ mod tests {
             run_id: "fixture".into(),
             server_budget_bytes: u64::MAX,
             client_budget_bytes: 128 * 1024 * 1024,
+            metadata_budget_profile: None,
             native_observer: None,
             identity: BTreeMap::new(),
         };
