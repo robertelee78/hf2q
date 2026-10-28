@@ -79,3 +79,22 @@ fn same_root_or_nonce_remains_invalid_under_actual_core() {
     r.identity.source_commit="9".repeat(40);
     assert_eq!(compare::compare(&a.0,&l,&b.0,&r,&BTreeMap::new()).disposition,Disposition::IdentityMismatch);
 }
+
+#[cfg(target_os="macos")]
+#[test]
+fn original_system_tmp_review_binding_is_allowed_without_nested_aliases() {
+    use std::os::unix::fs::symlink;
+    let tmp=tempfile::Builder::new().prefix("q1-gemma-tmp-alias-")
+        .tempdir_in("/private/tmp").unwrap();
+    let root=tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("proof"),b"proof").unwrap();
+    let alias=Path::new("/tmp").join(root.file_name().unwrap());
+    let mut binding=FileBinding {path:alias.join("proof"),sha256:hash(b"proof")};
+    assert_eq!(bytes(&binding,1024).unwrap(),b"proof");
+    symlink(root.join("proof"),root.join("terminal-link")).unwrap();
+    binding.path=alias.join("terminal-link");assert!(bytes(&binding,1024).is_err());
+    std::fs::create_dir(root.join("actual")).unwrap();
+    std::fs::write(root.join("actual/proof"),b"proof").unwrap();
+    symlink(root.join("actual"),root.join("nested-link")).unwrap();
+    binding.path=alias.join("nested-link/proof");assert!(bytes(&binding,1024).is_err());
+}

@@ -19,7 +19,13 @@ struct Packet {
     prepared:FileBinding,workload:FileBinding,left:Case,right:Case,output:PathBuf,
 }
 fn bytes(b:&FileBinding,max:u64)->Result<Vec<u8>> {
-    ensure!(b.path.canonicalize()?==b.path,"canonical bound evidence");
+    let canonical=b.path.canonicalize()?;
+    // Preserve the immutable runtime packet's lexical /tmp review binding.
+    // Accept only the system alias itself, never an additional nested symlink.
+    let system_tmp=b.path.strip_prefix("/tmp").ok()
+        .map(|tail|Path::new("/private/tmp").join(tail));
+    ensure!(canonical==b.path || system_tmp.as_ref()==Some(&canonical),
+        "canonical evidence or exact system /tmp alias required");
     acquisition::checked_file(b,max)
 }
 fn value(b:&FileBinding)->Result<Value> {Ok(serde_json::from_slice(&bytes(b,2*1024*1024)?)?)}
