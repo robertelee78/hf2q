@@ -27,3 +27,6 @@ pub(crate) mod receipt;
 pub(crate) mod store;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod t5_artifact_compare;
