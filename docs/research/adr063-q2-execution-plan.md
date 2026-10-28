@@ -85,3 +85,21 @@ Q2 certification of these diagnostic oracles does **not** require a new full six
 The smallest source slice is the bounded trace seams/validator, client semantic-event timestamp capture, actual entry-point adversarial controls and fixed six-block analyzer/ledger. Existing oracles and process wrappers stay in use. Root may approve another agent's independently reviewed design to implement this within the existing program; no automatic user confirmation is needed. Model execution remains a separately concrete source-bound root packet after relevant Q5/F1/Q1 prerequisites and serialization.
 
 Q2 closes only after all required negative/positive controls, independent coverage review, required real trace joins and the frozen harness/evidence are merged. PR/test counts, one successful N4 coding gate, a capacity result or component speed win cannot substitute. Estimated source/control work is a few focused hours if F2 trace seams are already decided; actual family trace gaps may dominate and cannot be honestly promised closed today. No phase, issue, source proof or hardware state was changed by this design revision.
+
+## Prospective V4 population-policy join
+
+New phase controls and Q2 expected-plan/certificate identities freeze
+`forward_demand_v2` from ADR063 and the F2 V4 clarification. Keep ready-now,
+submitted-outstanding, emit, completed and blocked facts distinct. Use the same
+first fixed2s demand window, end<=30s, >=80% coverage and new per-owner progress
+with eventual healthy checked drain. Report ready-only occupancy from that same
+window rather than changing `runnable_forward` or calling a host submission
+bracket GPU Running time. An absent/legacy policy cannot qualify as V2.
+
+The earlier ready-only V3 wording remains historical; no old certificate/case
+is rescored. Actual source-bound native membership/lineage is required for
+outstanding-demand credit, and unioned singleton submissions remain singleton
+physical work. Missing required maps/unknown or dropped events, failed drains,
+quality/client/clock/trace gaps retain their existing failure disposition.
+The source validator and expected-plan join must pass the F2 V4 deciding
+controls before activation; this documentation alone qualifies no case.

@@ -109,6 +109,8 @@ Acceptance:
 
 - Measure mixed prefill/decode populations 3+1, 2+2 and 1+3, plus pure four-prefill and four-decode controls; trace active/runnable slots and actual physical cohort membership. Overlapping queued HTTP requests alone do not prove concurrency.
 
+  For prospective F2/Q2 phase controls, freeze `forward_demand_v2`: count a current admitted owner only when source-proven ready for forward work, or joined to its actual native submitted-outstanding forward obligation with eventual healthy checked completion. Report ready-now occupancy separately. Submit-to-checked-return is a host service bracket, not GPU Running time or utilization. HTTP overlap, unknown membership, emit-only readiness and repeated inflight heartbeats do not establish demand. Keep the first fixed two-second window, its end within thirty seconds, eighty-percent target coverage and new per-owner progress unchanged; do not rescore earlier ready-only cases under this policy. Physical membership remains the actual submitted owner set, including truthful singletons, rather than a union manufactured into B4.
+
 - The mandatory primary arms are stock current hf2q, experiment from the same baseline, and latest peer, frozen per run; other engines and the historical peer are separately labeled secondary comparisons.
 
 - Stage the matrix on the same M5 Max/128 GB host: vanilla Qwen3.8-27B dense, then DeepSeek-V4, then second-tier Qwen3.6 MoE and Gemma 4. Each needs N1 controls and N4 coding/tool proof. Use representative primary workloads first; expand only where needed to decide a candidate.
