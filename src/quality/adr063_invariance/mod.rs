@@ -41,3 +41,5 @@ pub(crate) mod gemma_cache;
 mod gemma_actual;
 
 pub(crate) mod qwen_checkpoint;
+#[cfg(test)]
+mod gemma_prepare;

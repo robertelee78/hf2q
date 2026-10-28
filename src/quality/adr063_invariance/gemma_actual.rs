@@ -31,7 +31,7 @@ pub(super) fn require_ordinary(t:Trajectory)->Result<()> {
         "LocalizationIncomplete: Gemma T2 physical graph, T5 producer, T6 owning cancellation require separate real adapters");
     Ok(())
 }
-fn recipe(cfg:&crate::serve::config::Gemma4Config)->acquisition::ConfigRecipe<'static> {
+pub(super) fn recipe(cfg:&crate::serve::config::Gemma4Config)->acquisition::ConfigRecipe<'static> {
     acquisition::ConfigRecipe {family:Family::Gemma4,capacity:262144,slots:4,output_allowance:8192,
         cache_mode:"GemmaHybrid-F16K-U8V-no-xlen",route:"gemma-ordinary-full-row-endpoints-v1",
         actual_model_config_sha256:hash(format!("{cfg:?}").as_bytes())}
