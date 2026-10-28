@@ -12,7 +12,7 @@ def fixture():
     identity = {name: "a" * (40 if name == "server_source" else 64) for name in
                 ("server_source", "server_binary_sha256", "native_checksum", "model_sha256",
                  "tokenizer_sha256", "template_sha256", "profile_sha256")}
-    identity["native_version"] = "0.15.7"
+    identity["native_version"] = "0.15.8"
     policy = {"schema": "hf2q.f2.forward-witness-policy.v1", "operator": "target_input_rms_norm",
               "input_sources": ["qwen35.greedy.actual_tokens"],
               "coverage": "each_admitted_lane_in_first_fixed_window",
@@ -32,7 +32,7 @@ def fixture():
     status = {"installed": True, "invalid": False, "events": 0, "unknown_scopes": 0,
               "event_limit": 1000, "metadata_reserved_bytes": 0, "metadata_limit_bytes": 1024**2,
               "dropped_events": 0, "unobserved_commits": 7, "capture_valid": True,
-              "comparison_qualified": False}
+              "comparison_qualified": False, "pending_commands": 0, "pending_command_limit": 1024}
     row = {"request_id": 5, "slot_id": 0, "generation": 7, "token_position": 123,
            "token_count": 1, "phase": "ordinary"}
     owner = {"request_id": 5, "slot_id": 0, "generation": 7, "phase": "decode", "active": True,
@@ -103,6 +103,25 @@ def packed_quad(records, scenario, source):
 
 
 class NativeControls(unittest.TestCase):
+    def test_missing_or_unretired_native_owners_cannot_qualify(self):
+        for kind in ("native_baseline", "native_arm_ack", "native_final"):
+            for change in ("missing", "pending", "limit", "bool"):
+                with self.subTest(kind=kind, change=change):
+                    records, identity, scenario = fixture()
+                    value = next(r["payload"] for r in records if r["kind"] == kind)
+                    if kind == "native_arm_ack":
+                        value = value["baseline"]
+                    if change == "missing":
+                        del value["pending_commands"]
+                    elif change == "pending":
+                        value["pending_commands"] = 1
+                    elif change == "limit":
+                        value["pending_command_limit"] = 0
+                    else:
+                        value["pending_commands"] = False
+                    with self.assertRaises(ValueError):
+                        trace.validate_trace(records, identity, scenario)
+
     def test_actual_packed_quad_is_operator_quad_not_full_body_claim(self):
         records, identity, scenario = fixture()
         packed_quad(records, scenario, "gemma4.decode.actual_token_slot_position_arrays")

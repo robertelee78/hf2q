@@ -80,7 +80,12 @@ pub(crate) fn arm() -> Result<ObservationStatus, &'static str> {
         return Err("native diagnostic requires installed observer and fresh process");
     }
     let baseline = mlx_native::submission_observer::submission_observation_status();
-    if baseline.invalid || baseline.dropped_events != 0 || baseline.unknown_scopes != 0 {
+    if baseline.invalid
+        || baseline.dropped_events != 0
+        || baseline.unknown_scopes != 0
+        || baseline.pending_commands != 0
+        || baseline.pending_command_limit != 1024
+    {
         return Err("invalid pre-arrival native baseline");
     }
     crate::serve::phase_trace::publish("native_baseline", serde_json::json!(baseline));
@@ -94,6 +99,9 @@ pub(crate) fn finish() -> ObservationStatus {
     ARMED.store(false, Ordering::Release);
     let status = mlx_native::submission_observer::submission_observation_status();
     crate::serve::phase_trace::publish("native_final", serde_json::json!(status));
+    if status.pending_commands != 0 || status.pending_command_limit != 1024 {
+        crate::serve::phase_trace::invalidate("native submitted command ownership not retired");
+    }
     status
 }
 
@@ -515,8 +523,13 @@ pub(crate) fn encoder(mut encoder: mlx_native::CommandEncoder) -> mlx_native::Co
         } else {
             next_id().unwrap_or(0)
         };
-        let current = current.or_else(|| auxiliary(epoch));
-        if encoder.enable_submission_observation(epoch).is_err() {
+        let rotation_scope = auxiliary(epoch);
+        let current = current.or(rotation_scope);
+        if encoder.enable_submission_observation(epoch).is_err()
+            || encoder
+                .set_observation_rotation_scope(rotation_scope)
+                .is_err()
+        {
             crate::serve::phase_trace::invalidate("native constructor observation refused");
         } else {
             encoder.set_observation_scope(current);
@@ -553,8 +566,13 @@ fn attach(encoder: &mut mlx_native::CommandEncoder) {
     } else {
         next_id().unwrap_or(0)
     };
-    let current = current.or_else(|| auxiliary(epoch));
-    if encoder.enable_submission_observation(epoch).is_err() {
+    let rotation_scope = auxiliary(epoch);
+    let current = current.or(rotation_scope);
+    if encoder.enable_submission_observation(epoch).is_err()
+        || encoder
+            .set_observation_rotation_scope(rotation_scope)
+            .is_err()
+    {
         crate::serve::phase_trace::invalidate("native session observation refused");
     } else {
         encoder.set_observation_scope(current);

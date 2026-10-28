@@ -11,7 +11,7 @@ EVENT = {"clock_id", "command_id", "invocation_epoch", "queue_identity", "device
          "tainted", "geometry", "submitted", "checked_status"}
 STATUS = {"installed", "invalid", "events", "unknown_scopes", "event_limit", "metadata_reserved_bytes",
           "metadata_limit_bytes", "dropped_events", "unobserved_commits", "capture_valid",
-          "comparison_qualified"}
+          "comparison_qualified", "pending_commands", "pending_command_limit"}
 SOURCES = {"qwen35.greedy.actual_tokens", "qwen35.forward.actual_tokens", "gemma4.scalar_forward",
            "gemma4.decode.actual_token_slot_position_arrays", "gemma4.prefill.actual_concat_descriptor",
            "gemma4.prefill.actual_single_input", "deepseek4.scalar_verifier",
@@ -86,6 +86,8 @@ class NativeTrace:
              value["unknown_scopes"] == 0, "invalid/dropped/unknown native observation")
         for name in STATUS - {"installed", "invalid", "capture_valid", "comparison_qualified"}:
             need(number(value[name]), "native counter type")
+        need(value["pending_commands"] == 0 and value["pending_command_limit"] == 1024,
+             "native pending command ownership not retired or limit changed")
         config = self.header["native_observer"]
         need(value["event_limit"] == config["event_limit"] and
              value["metadata_limit_bytes"] == config["metadata_limit_bytes"] and
@@ -106,6 +108,7 @@ class NativeTrace:
                  p["clock_id"] == "CLOCK_MONOTONIC" and p["worker_queue_checked"] is True and
                  p["quiescent"] is True and p["baseline"] == self.baseline and
                  p["scope"] == "one_fresh_phase_diagnostic", "actual owning-worker arm acknowledgement")
+            self.status(p["baseline"])
             self.ack = record
         elif kind == "scope_definition":
             need(self.ack is not None and set(p) == {"scope", "operation", "membership", "rows"},
