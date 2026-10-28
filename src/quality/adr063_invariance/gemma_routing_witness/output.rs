@@ -7,7 +7,7 @@ pub fn end_checked() -> Result<()> {
 pub(super) fn primitive_end_checked() -> Result<()> {
     checked("primitive-only single checked drain; no model or production return")
 }
-fn checked(boundary: &str) -> Result<()> {
+fn checked(boundary_label: &str) -> Result<()> {
     ACTIVE.with(|s|{let mut s=s.borrow_mut();let Some(a)=s.as_mut()else{return Ok(())};
     let Some(c)=a.call.as_ref()else{ensure!(!a.pending,"pending routing without invocation");return Ok(())};
     ensure!(c.seen.len()==c.rows.len()*LAYERS,"missing required producer layer/row");
@@ -23,7 +23,7 @@ fn checked(boundary: &str) -> Result<()> {
             "boundary_ids":ids,"status":status.as_logical_slice::<u32>()?,"selected_ids":selected,"selected_weights_f32_bits":weights.iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
             "native_boundary_valid":native_valid,"selected_copy_valid":selection_valid,
             "native_decode_error":boundary.as_ref().err().map(ToString::to_string),
-            "checked_boundary":boundary,"qualified":false}))?;
+            "checked_boundary":boundary_label,"native_boundary":boundary.as_ref().ok().map(|v|v.iter().map(project_boundary).collect::<Vec<_>>()),"qualified":false}))?;
         // Retain raw invalid status/bit patterns BEFORE refusing the case.
         ensure!(native_valid&&selection_valid,"invalid/N/A native boundary or actual selected copy");
         a.read+=1;
@@ -64,4 +64,14 @@ pub(super) fn selected_valid(
         && !selected.contains(&ids[1])
         && ids[1] < E as u32
         && scores[0] >= scores[1]
+}
+
+// Native diagnostic types intentionally need no serde dependency. Retain raw
+// score bits, including invalid/nonfinite patterns, without JSON float coercion.
+pub(super) fn project_boundary(value:&SelectionBoundary)->serde_json::Value {
+    match value {
+        SelectionBoundary::Scored{kth_id,kth_score,next_id,next_score}=>json!({"kind":"Scored","kth_id":kth_id,"kth_score_f32_bits":kth_score.to_bits(),"next_id":next_id,"next_score_f32_bits":next_score.to_bits()}),
+        SelectionBoundary::AllExpertsSelected{kth_id,kth_score}=>json!({"kind":"AllExpertsSelected","kth_id":kth_id,"kth_score_f32_bits":kth_score.to_bits()}),
+        SelectionBoundary::Invalid=>json!({"kind":"Invalid"}),
+    }
 }

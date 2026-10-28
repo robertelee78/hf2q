@@ -161,3 +161,11 @@ fn exact_namespace_spans_and_raw_selection_validation_are_actual_used_guards() {
         &[0.2, 0.1]
     ));
 }
+
+#[test]
+fn actual_native_boundary_projection_preserves_all_domains_without_native_serde() {
+    let scored=output::project_boundary(&SelectionBoundary::Scored{kth_id:7,kth_score:0.25,next_id:9,next_score:0.125});
+    assert_eq!(scored,json!({"kind":"Scored","kth_id":7,"kth_score_f32_bits":0.25f32.to_bits(),"next_id":9,"next_score_f32_bits":0.125f32.to_bits()}));
+    assert_eq!(output::project_boundary(&SelectionBoundary::AllExpertsSelected{kth_id:1,kth_score:f32::NAN}),json!({"kind":"AllExpertsSelected","kth_id":1,"kth_score_f32_bits":f32::NAN.to_bits()}));
+    assert_eq!(output::project_boundary(&SelectionBoundary::Invalid),json!({"kind":"Invalid"}));
+}
