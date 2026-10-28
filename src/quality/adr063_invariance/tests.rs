@@ -408,3 +408,6 @@ fn q1_float_bounds_are_predeclared_and_never_learned_from_candidate() {
 
 #[path = "lifecycle_controls.rs"]
 mod lifecycle_controls;
+
+#[path="packed_float_policy_controls.rs"]
+mod packed_float_policy_controls;

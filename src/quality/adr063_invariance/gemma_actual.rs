@@ -36,7 +36,7 @@ pub(super) fn recipe(cfg:&crate::serve::config::Gemma4Config)->acquisition::Conf
         cache_mode:"GemmaHybrid-F16K-U8V-no-xlen",route:"gemma-ordinary-full-row-endpoints-v1",
         actual_model_config_sha256:hash(format!("{cfg:?}").as_bytes())}
 }
-fn positions(t:Trajectory)->Vec<(usize,bool)> {
+pub(super) fn positions(t:Trajectory)->Vec<(usize,bool)> {
     let mut p=vec![(128,false),(144,false)];
     if matches!(t,Trajectory::T1Resume64|Trajectory::T3Chunk64|Trajectory::T6CancelRestore) {p.push((64,false));}
     if matches!(t,Trajectory::T1Resume64|Trajectory::T6CancelRestore) {p.push((64,true));}p

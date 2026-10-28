@@ -43,3 +43,6 @@ mod gemma_actual;
 pub(crate) mod qwen_checkpoint;
 #[cfg(test)]
 mod gemma_prepare;
+
+#[cfg(test)]
+mod gemma_artifact_compare;

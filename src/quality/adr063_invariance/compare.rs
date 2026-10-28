@@ -315,7 +315,19 @@ fn compare_inner(
             return Err("full payload hash/page count mismatch".into());
         }
         if !is_float(lt.scalar) {
-            exact_failed |= changed;
+            // Packed U8 K/V are floating codebook storage, not expert/token IDs.
+            // Encoded bytes remain exact for copy contracts, but they provide
+            // no decoded-value error metric or source-qualified tolerance.
+            if lt.scalar == Scalar::U8 && matches!(at.stage, Stage::CacheKeyPacked | Stage::CacheValuePacked) {
+                match policy {
+                    NumericPolicy::Exact => exact_failed |= changed,
+                    NumericPolicy::Unspecified => unknown = true,
+                    NumericPolicy::SourceQualified {..} => return Err(
+                        "packed floating codebook requires an actual decoder and qualified policy".into()),
+                }
+            } else {
+                exact_failed |= changed;
+            }
             continue;
         }
         match policy {
