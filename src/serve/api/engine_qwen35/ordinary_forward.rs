@@ -24,6 +24,11 @@ impl PreparedCoherentOrdinaryTarget {
 /// and its checked completion do. Do not substitute the pre-norm residual.
 pub(crate) struct CoherentOrdinaryTargetResult { logits: Vec<f32>, nextn_hidden: MlxBuffer }
 impl CoherentOrdinaryTargetResult {
+    #[cfg(test)]
+    pub(super) fn fixture_parts(&self) -> (&[f32], &MlxBuffer) {
+        (&self.logits, &self.nextn_hidden)
+    }
+
     pub(crate) fn from_actual_forward(logits: Vec<f32>, nextn_hidden: MlxBuffer) -> Self {
         Self { logits, nextn_hidden }
     }

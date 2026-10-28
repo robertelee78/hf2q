@@ -129,6 +129,8 @@ pub(super) fn encode(
             // Drain before the next singleton helper / packed consumer. This
             // deliberate diagnostic boundary is not a performance assertion.
             enc.commit_and_wait_labeled("s3.singleton_attention_row_copy")?;
+            #[cfg(test)]
+            fixture_after_checked_attention_copy(layer,i)?;
             map(
                 &mut maps,
                 Some(layer),

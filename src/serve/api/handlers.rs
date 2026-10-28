@@ -13348,3 +13348,14 @@ mod qwen38_largest_prompt_tests;
 #[cfg(test)]
 #[path = "handlers_tool_result_capacity_tokens_tests.rs"]
 mod tool_result_capacity_tokens_tests;
+
+/// Test-only access to the actual request tool-grammar compiler. No alternate
+/// grammar emitter or production request path is introduced.
+#[cfg(test)]
+pub(super) fn coherent_parity_tool_grammar(
+    req: &super::schema::ChatCompletionRequest,
+    registration: &registry::ModelRegistration,
+) -> Result<Option<grammar::Grammar>, String> {
+    compile_tool_grammar_for_request(req, &super::schema::ToolChoiceValue::Auto,
+        Some(registration), false).map_err(|_| "actual tool grammar compiler refused".to_owned())
+}

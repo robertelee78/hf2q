@@ -11560,3 +11560,7 @@ mod glp_cache_identity_tests {
         assert_ne!(bare, steering_and_graft_params_hash(Some(&glp), None));
     }
 }
+
+#[cfg(test)]
+#[path = "engine_qwen35/coherent_shared_parity_tests.rs"]
+mod coherent_shared_parity_tests;

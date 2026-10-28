@@ -42,6 +42,16 @@ impl CheckedScope {
     }
 }
 impl Drop for CheckedScope{fn drop(&mut self){CHECKED.with(|v|v.set(false));}}
+/// Test-only access to the SAME causal-command checks used by run(). Never
+/// nest this around run(): the shared producer installs its own scope.
+#[cfg(test)]
+pub(crate) fn checked_fixture<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _scope = CheckedScope::enter()?;
+    let result = f();
+    if result.is_err() { failed(); }
+    result
+}
+
 fn failed(){FAILED.with(|v|v.set(true));super::super::decode_pool::profile::quarantine();}
 /// Pure descriptor refusal. No target/cursor, proposal, RNG or GPU mutation.
 pub(crate) fn preflight(rows:&[Row],owners:&[Owner],n_seqs:u32,max:u32,vocab:u32)->Result<()> {
@@ -109,4 +119,42 @@ pub(crate) fn run(model:&Qwen35Model,cache:&mut HybridKvCache,invocation:&mut In
     #[test]fn retire_suffix_before_pool_reset_preserves_dedicated_roots(){let dedicated=std::rc::Rc::new(());let suffix=std::rc::Rc::new(());let mut roots=vec![dedicated.clone(),suffix.clone()];retire_row_scratch(&mut roots,1,||{assert_eq!(std::rc::Rc::strong_count(&suffix),1,"suffix dropped BEFORE reset");assert_eq!(std::rc::Rc::strong_count(&dedicated),2,"dedicated root retained");Ok(())}).unwrap();assert_eq!(roots.len(),1);}
     #[test]fn actual_invocation_failure_is_sticky_and_complete_cannot_reenter(){let mut i=Invocation::new();i.begin().unwrap();i.settle(false);assert!(i.is_failed_stop());assert!(i.begin().is_err());let mut j=Invocation::new();j.begin().unwrap();j.settle(true);assert!(j.completed());assert!(j.begin().is_err());}
 
+}
+
+/// Final diagnostic-only injected Err after a real healthy row copy. Not a
+/// Metal command-buffer error and never enabled by production/default calls.
+#[cfg(test)]
+thread_local! {
+    static FIXTURE_INJECT: Cell<bool> = const { Cell::new(false) };
+    static FIXTURE_INJECT_HIT: Cell<bool> = const { Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) fn fixture_arm_final_injection() -> Result<()> {
+    ensure!(!checked_active() && !FAILED.with(Cell::get), "final injection requires healthy idle scope");
+    FIXTURE_INJECT.with(|v| -> Result<()> {ensure!(!v.replace(true), "one final diagnostic injection");Ok(())})
+}
+#[cfg(test)]
+fn take_fixture_injection(armed: &Cell<bool>, layer:usize, row:usize) -> bool {
+    layer == 0 && row == 0 && armed.replace(false)
+}
+#[cfg(test)]
+fn fixture_after_checked_attention_copy(layer:usize,row:usize) -> Result<()> {
+    if FIXTURE_INJECT.with(|v|take_fixture_injection(v,layer,row)) {
+        FIXTURE_INJECT_HIT.with(|v|v.set(true));
+        anyhow::bail!("S3_FINAL_DIAGNOSTIC_INJECTION_AFTER_HEALTHY_CHECKED_ATTENTION_COPY");
+    }
+    Ok(())
+}
+#[cfg(test)]
+pub(crate) fn fixture_final_injection_observed() -> bool {FIXTURE_INJECT_HIT.with(Cell::get)}
+#[cfg(test)]
+mod injection_controls {
+    use super::*;
+    #[test]fn actual_injection_selector_is_one_shot_only_first_layer_first_row() {
+        let armed=Cell::new(true);
+        assert!(!take_fixture_injection(&armed,1,0));
+        assert!(!take_fixture_injection(&armed,0,1));
+        assert!(take_fixture_injection(&armed,0,0));
+        assert!(!take_fixture_injection(&armed,0,0));
+    }
 }
