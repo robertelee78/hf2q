@@ -64,7 +64,7 @@ def sandbox_profile(root, binary, port):
         '(allow file-map-executable)',
         f'(allow file-read* (literal "{binary}") (subpath "{root}"))',
         f'(allow file-write* (subpath "{root}") (literal "/dev/null"))',
-        f'(allow network-outbound (remote tcp "127.0.0.1:{port}"))',
+        f'(allow network-outbound (remote tcp "localhost:{port}"))',
         '(allow file-read* (literal "/private/etc/localtime") (literal "/private/etc/ssl/openssl.cnf"))',
     ]) + '\n'
 
