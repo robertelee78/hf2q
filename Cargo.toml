@@ -171,8 +171,8 @@ thiserror = "2"
 # direct packed Q5_K/Q6_K embedding gathers and deterministic lowest-index
 # argmax tie handling, native BF16 GGUF/dense/expert execution, and sticky
 # expert-ID validation and optional deduplicated pool checkpoints use the
-# published mlx-native 0.15.6 contract.
-mlx-native = "=0.15.6"
+# published mlx-native 0.15.7 contract (optional submission observer defaults off).
+mlx-native = "=0.15.7"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
