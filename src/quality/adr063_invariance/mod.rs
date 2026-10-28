@@ -48,3 +48,6 @@ mod gemma_prepare;
 mod gemma_artifact_compare;
 #[cfg(test)]
 mod deepseek_prepare;
+
+#[cfg(test)]
+mod gemma_greedy_prepare;

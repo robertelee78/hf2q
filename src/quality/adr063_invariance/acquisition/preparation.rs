@@ -6,13 +6,13 @@ pub fn preparation_prefix_digest(
     vocab: u32,
 ) -> Result<String> {
     ensure!(
-        matches!(family, Family::Qwen38 | Family::Qwen36)
+        matches!(family, Family::Qwen38 | Family::Qwen36 | Family::Gemma4)
             && vocab > 0
             && prompts.len() == 4
             && prompts
                 .iter()
                 .all(|p| p.len() == 128 && p.iter().all(|&id| id < vocab)),
-        "four exact128-token Qwen preparation prefixes required"
+        "four exact128-token selected-family preparation prefixes required"
     );
     ensure!(
         prompts
@@ -117,5 +117,21 @@ mod controls {
                 .collect(),
         };
         assert_ne!(q38, tokens_digest(&w).unwrap());
+    }
+}
+
+impl Scope {
+    /// Preparation-only runtime identity; cannot attest comparable acquisition.
+    pub fn observed_preparation(&self, device:&mlx_native::MlxDevice, model_instance:u64,
+        required_opens:u64)->Result<Acquisition> {
+        use mlx_native::metal::foreign_types::ForeignType;
+        let opens=self.check_preparation_loaded(required_opens)?;
+        let mut observed=self.acquisition.clone();
+        observed.observed_model_opens=opens;observed.required_model_opens=required_opens;
+        observed.device_registry_id=device.registry_id();
+        observed.queue_identity=device.metal_queue().as_ptr() as usize as u64;
+        observed.model_instance=model_instance;
+        ensure!(observed.device_registry_id>0 && observed.queue_identity>0 && model_instance>0,
+            "missing preparation runtime identity");Ok(observed)
     }
 }
