@@ -142,7 +142,7 @@ impl Deepseek4Model {
                         let mut next_states = Vec::with_capacity(4);
                         for lane in 0..4 {
                             let _native_input = crate::inference::native_observation::sorted_decode_lane_input(
-                                lane,positions[lane],1);
+                                lane,caches[lane].position(),1);
                             let attention = if layer == 0 {
                                 anyhow::ensure!(
                                     lane_states[lane].is_none(),

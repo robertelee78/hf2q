@@ -5149,6 +5149,7 @@ pub fn cmd_serve(
     // Filesystem-path passthrough uses the file stem as the pool's `repo`
     // key and the exact `general.file_type` as its quant identity.
     let mut startup_engine_for_banner: Option<api::engine::Engine> = None;
+    let mut startup_synchronous_warmup_completed = false;
     if let Some(model_arg) = default_model_arg.as_ref() {
         let mut cache_guard = state
             .cache
@@ -5290,6 +5291,10 @@ pub fn cmd_serve(
                 "locally discovered GGUF changed during runtime activation"
             );
         }
+        // This startup pool was created empty above and no HTTP listener is
+        // published yet. A successful synchronous load_engine return includes
+        // the actual worker Warmup reply; retain that fact for diagnostic arm.
+        startup_synchronous_warmup_completed = engine_config.warmup_synchronously;
         startup_engine_for_banner = Some(loaded_engine.engine.clone());
         drop(pool_guard);
         emit_startup_event(
@@ -5737,8 +5742,8 @@ pub fn cmd_serve(
 
     rt.block_on(async move {
         if let Some(nonce) = phase_trace::native_control_nonce() {
-            anyhow::ensure!(config.warmup_synchronously,
-                "phase-control requires synchronous startup warmup");
+            anyhow::ensure!(startup_synchronous_warmup_completed,
+                "phase-control requires completed synchronous startup warmup");
             anyhow::ensure!(state_for_warmup.mmproj.is_none(),
                 "phase-control multi-device projector coverage is unqualified");
             anyhow::ensure!(state_for_warmup.embedding_config.is_none(),
