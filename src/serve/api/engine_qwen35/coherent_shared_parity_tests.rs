@@ -29,6 +29,11 @@ struct Artifacts {
     reference: BTreeMap<String, Record>, mismatches: Vec<String>, shared: bool,
     boundaries: BTreeMap<String, Value>, incomparable: Vec<String>, selected: Vec<usize>, audit_skip: Option<usize>, audit_reference: &'static str, audit_checks: Vec<Value>, injection: Option<Value>,
 }
+fn require_retained_workload(w: &Workload) -> Result<()> {
+    anyhow::ensure!(w.family == "Qwen38" && w.vocab_size == 248320 && w.lanes.len() == 4
+        && w.lanes.iter().all(|l| l.len() == 144 && l.iter().all(|t| *t < 248320)), "retained four-lane workload");
+    Ok(())
+}
 fn sha(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 fn read_bound(path: &Path, expected: &str, cap: u64) -> Result<Vec<u8>> {
     anyhow::ensure!(path.is_absolute() && fs::metadata(path)?.len() <= cap, "bounded absolute input");
@@ -213,8 +218,7 @@ fn qwen38_real_auto_shared_target_preserves_mtp_tail_and_next_decision() -> Resu
     output_preflight(&p.output)?;
     anyhow::ensure!(p.model.is_absolute() && p.model.is_file() && p.workload_sha256 == WORKLOAD_SHA, "selected retained artifact/workload required; root acquisition proof remains separate");
     let workload: Workload = serde_json::from_slice(&read_bound(&p.workload, &p.workload_sha256, 1024*1024)?)?;
-    anyhow::ensure!(workload.family == "qwen38" && workload.vocab_size == 248320 && workload.lanes.len() == 4
-        && workload.lanes.iter().all(|l| l.len() == 144 && l.iter().all(|t| *t < 248320)), "retained four-lane workload");
+    require_retained_workload(&workload)?;
     let request_raw = read_bound(&p.request, &p.request_sha256, 1024*1024)?;
     let request_value: Value = serde_json::from_slice(&request_raw)?;
     anyhow::ensure!(request_value["temperature"].as_f64() == Some(0.0) && request_value["repetition_penalty"] == json!(1.05)
@@ -438,4 +442,12 @@ fn final_cpu_only_audit_uses_retained_next_reference_without_new_payload() {
     // the final injected Err. No retained reference or uninitialized read.
     a.save("after_final_injection/fa0/key.packed/owner2".into(),vec![2],vec![&[9,9]],false).unwrap();
     assert_eq!(a.audit_checks.len(),1);
+}
+
+#[test]
+fn actual_retained_workload_label_is_case_exact() {
+    let mut w=Workload{family:"Qwen38".into(),lanes:(0..4).map(|i|vec![i;144]).collect(),vocab_size:248320};
+    require_retained_workload(&w).unwrap();
+    w.family="qwen38".into();
+    assert!(require_retained_workload(&w).is_err());
 }
