@@ -982,7 +982,7 @@ pub(super) fn embed_tokens_gpu_into(
         // returned output remains live in the caller. Optional unretained
         // mode cannot let the local ID buffer drop before completion, so it
         // deliberately keeps the synchronous boundary.
-        if std::env::var("MLX_UNRETAINED_REFS").as_deref() == Ok("1") {
+        if shared_dense::checked_active() || std::env::var("MLX_UNRETAINED_REFS").as_deref() == Ok("1") {
             enc.commit_and_wait_labeled("qwen35.embedding.native")
                 .context("native embedding completion")?;
         } else {
@@ -12460,3 +12460,6 @@ mod tests {
         );
     }
 }
+
+// Internal ordinary-target graph; no serving caller or environment activation.
+pub(crate) mod shared_dense;
