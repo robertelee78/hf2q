@@ -77,6 +77,53 @@ class MetadataBudgetControls(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 trace.validate_trace(records, identity, scenario)
 
+    def test_v3_exact_8g_and_16million_are_separate_from_legacy_and_v2(self):
+        for profile, total, ceiling in ((None, 256 * 1024**2, 1_000_000),
+                (PROFILE, 2 * 1024**3, 1_000_000),
+                ("native_command_capture_v3", 8 * 1024**3, 16_000_000)):
+            records, identity, scenario = candidate(total)
+            header = records[0]["payload"]
+            if profile is None:
+                del header["metadata_budget_profile"]
+                del scenario["metadata_budget_profile"]
+            else:
+                header["metadata_budget_profile"] = profile
+                scenario["metadata_budget_profile"] = profile
+            header["native_observer"]["event_limit"] = ceiling
+            for record in records:
+                if record["kind"] in ("native_baseline", "native_final"):
+                    record["payload"]["event_limit"] = ceiling
+                elif record["kind"] == "native_arm_ack":
+                    record["payload"]["baseline"]["event_limit"] = ceiling
+            self.assertTrue(trace.validate_trace(records, identity, scenario)["qualified"])
+            header["native_observer"]["event_limit"] += 1
+            with self.assertRaises(ValueError):
+                trace.validate_trace(records, identity, scenario)
+            header["native_observer"]["event_limit"] = ceiling
+            header["server_budget_bytes"] += 1
+            header["server_jsonl_budget_bytes"] += 1
+            with self.assertRaises(ValueError):
+                trace.validate_trace(records, identity, scenario)
+
+    def test_v3_requires_external_profile_and_preserves_live_cap(self):
+        for change in ("external", "diagnostic", "live", "event_bool", "event_overflow"):
+            records, identity, scenario = candidate(8 * 1024**3)
+            header = records[0]["payload"]
+            header["metadata_budget_profile"] = "native_command_capture_v3"
+            scenario["metadata_budget_profile"] = "native_command_capture_v3"
+            if change == "external":
+                scenario["metadata_budget_profile"] = PROFILE
+            elif change == "diagnostic":
+                header["native_observer"]["diagnostic_case"] = False
+            elif change == "live":
+                header["native_observer"]["metadata_limit_bytes"] = 16 * 1024**2 + 1
+            elif change == "event_bool":
+                header["native_observer"]["event_limit"] = True
+            else:
+                header["native_observer"]["event_limit"] = 2**64
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                trace.validate_trace(records, identity, scenario)
+
 
 if __name__ == "__main__":
     unittest.main()

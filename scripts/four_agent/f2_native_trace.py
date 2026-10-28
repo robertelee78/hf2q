@@ -41,7 +41,13 @@ class NativeTrace:
         need(type(config) is dict and set(config) == {"event_limit", "metadata_limit_bytes",
              "diagnostic_case", "control_nonce", "witness_manifest"} and config["diagnostic_case"] is True,
              "closed separate native diagnostic configuration")
-        need(number(config["event_limit"]) and 0 < config["event_limit"] <= 1_000_000 and
+        profile = header.get("metadata_budget_profile")
+        need("metadata_budget_profile" not in header or
+             (type(profile) is str and profile in
+              ("native_command_capture_v2", "native_command_capture_v3")),
+             "closed native metadata profile")
+        event_ceiling = 16_000_000 if profile == "native_command_capture_v3" else 1_000_000
+        need(number(config["event_limit"]) and 0 < config["event_limit"] <= event_ceiling and
              number(config["metadata_limit_bytes"]) and 0 < config["metadata_limit_bytes"] <= 16 * 1024**2 and
              type(config["control_nonce"]) is str and 32 <= len(config["control_nonce"]) <= 128 and
              all(c.isascii() and (c.isalnum() or c in "_-") for c in config["control_nonce"]) and
