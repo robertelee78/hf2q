@@ -46,6 +46,8 @@ use super::engine_supervisor::EngineSupervisor;
 
 const QWEN35_WORKER_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub(crate) mod ordinary_action;
+
 /// Canonical Qwen3 chat-template stop tokens.
 ///
 /// Used by `Qwen35LoadedModel::load` (ADR-028 iter-267) to scan
@@ -5203,6 +5205,35 @@ impl Qwen35DecodeState {
         (work, work, rate)
     }
 
+    /// Read-only branch preparation. Never proposes, syncs a lookup, consumes
+    /// output/RNG/forced tokens, mutates grammar/cache, or changes AUTO costs.
+    fn next_decode_action(&self) -> ordinary_action::NextAction {
+        ordinary_action::classify(ordinary_action::Facts {
+            step: self.step,
+            max_tokens: self.max_tokens,
+            generated_tokens: self.generated_tokens.len(),
+            pending_outputs: self.pending_speculation_output.len(),
+            history_present: self.history_lookup.is_some(),
+            history_may_speculate: self.history_cost.may_speculate(),
+            mtp_present: self.mtp.is_some(),
+            mtp_may_speculate: self.mtp_cost.may_speculate(),
+            greedy_without_logprobs: self.is_greedy && !self.want_logprobs,
+        })
+    }
+
+    /// Future cohort collector preparation, not an activation or cache proof.
+    /// The current driver records this at trace level and still invokes the
+    /// original scalar producer; its existing generation/cancel guards remain.
+    pub(crate) fn ordinary_leaf_preview(
+        &self,
+        scheduled: crate::serve::scheduler::SlotHandle,
+        installed: crate::serve::scheduler::SlotHandle,
+        client_closed: bool,
+    ) -> ordinary_action::OwnerPreview {
+        ordinary_action::preview(self.next_decode_action(), self.slot_id,
+            scheduled, installed, client_closed)
+    }
+
     /// Advance this slot by exactly one decode token — mirror of the serial
     /// ref's `while` body engine_qwen35.rs:2410-2468 for ONE iteration.
     pub(super) fn decode_tick(
@@ -5215,21 +5246,21 @@ impl Qwen35DecodeState {
         // finish_reason == "length"`. The caller only ticks live slots, so
         // entry here implies finish_reason == "length"; enforce the step
         // bound so a slot at the bound finishes with finish_reason "length".
-        if self.step >= self.max_tokens {
-            return Ok(Qwen35TickOutcome {
-                fragment: String::new(),
-                is_reasoning: false,
-                finished: true,
-            });
-        }
-        if let Some(token) = take_pending_speculation_output(&mut self.pending_speculation_output) {
-            return self.commit_speculation_output(qwen, token);
-        }
-        if self.history_lookup.is_some() {
-            return self.decode_tick_history_lookup(qwen, kv_cache, supervisor);
-        }
-        if self.mtp.is_some() {
-            return self.decode_tick_mtp_k3(qwen, kv_cache, supervisor);
+        let action = self.next_decode_action();
+        match action.dispatch {
+            ordinary_action::Dispatch::Finished => return Ok(Qwen35TickOutcome {
+                fragment: String::new(), is_reasoning: false, finished: true,
+            }),
+            ordinary_action::Dispatch::EmitVerified => {
+                let token = take_pending_speculation_output(&mut self.pending_speculation_output)
+                    .expect("read-only action observed a nonempty verified queue");
+                return self.commit_speculation_output(qwen, token);
+            }
+            ordinary_action::Dispatch::History =>
+                return self.decode_tick_history_lookup(qwen, kv_cache, supervisor),
+            ordinary_action::Dispatch::Mtp =>
+                return self.decode_tick_mtp_k3(qwen, kv_cache, supervisor),
+            ordinary_action::Dispatch::Ordinary => {}
         }
         let ordinary_target_started = Instant::now();
         let pos = self.decode_position_base + self.step - 1;
@@ -5248,7 +5279,7 @@ impl Qwen35DecodeState {
                 "Qwen35 thinking token budget reached; forcing reasoning close and continuing answer"
             );
         }
-        let tok = if self.is_greedy && !self.want_logprobs {
+        let tok = if action.ordinary == ordinary_action::OrdinaryLeaf::GpuGreedy {
             let lease =
                 supervisor.arm("Qwen35 decode greedy", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
             let forward =

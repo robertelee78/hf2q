@@ -20084,6 +20084,12 @@ fn decode_batch_qwen35(
             continue;
         }
 
+        // Read-only preparation only: no cohort dispatch or changed scalar
+        // policy. Existing generation/cancel checks above remain authoritative.
+        let ordinary_leaf = state.ordinary_leaf_preview(handle, installed, reply.client_closed());
+        tracing::trace!(slot = handle.slot_id.0, generation = handle.generation,
+            ?ordinary_leaf, known_leaf = ?ordinary_leaf.known_leaf(),
+            "Qwen35 ordinary target preparation (scalar producer unchanged)");
         let _native_invocation = scheduler.trace_transaction("qwen35", "ordinary_or_temporal_mtp_decode", &[handle]);
         let qtick = match state.decode_tick(
             guard.model,
