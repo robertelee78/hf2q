@@ -1774,6 +1774,8 @@ mod tests {
             }),
         };
         let loaded = Qwen35LoadedModel {
+            shared_ordinary: false,
+            shared_ordinary_width_counts: [0;5],
             model: Qwen35Model::empty_from_cfg(cfg),
             tokenizer: tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             chat_template: "{{ messages }}".to_string(),

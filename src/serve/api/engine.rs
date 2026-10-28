@@ -943,6 +943,8 @@ impl Default for EngineMode {
 pub enum EngineSpawnError {
     #[error("Qwen pool profile startup refused: {cause}")]
     QwenPoolProfile { cause: String },
+    #[error("Qwen shared ordinary startup refused: {cause}")]
+    QwenSharedOrdinary { cause: String },
     #[error("Gemma full-input checkpoint startup refused: {cause}")]
     GemmaFullInputCheckpoint { cause: String },
     /// The requested [`EngineMode`] variant requires runtime support that
@@ -3273,6 +3275,11 @@ impl LoadedModel {
             .map(|s| s.to_string())
             .unwrap_or_default();
         Self::validate_architecture_for_load(&arch, model_path)?;
+        let shared_ordinary = crate::debug::INVESTIGATION_ENV.qwen_shared_ordinary
+            .validate().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(!shared_ordinary || arch=="qwen35",
+            "shared ordinary startup supports Qwen3.8 dense only, not another architecture");
+
         if let Some(contract) = crate::inference::gguf_contract::runtime_contract(&arch) {
             contract.validate_before_load(&gguf)?;
         }
@@ -4067,6 +4074,8 @@ impl Engine {
     ) -> Self {
         assert!(!crate::debug::investigation_env::gemma_full_input::selected().unwrap_or(true),
             "Gemma full-input experiment requires fallible SlotAware spawn");
+        assert!(!crate::debug::INVESTIGATION_ENV.qwen_shared_ordinary.validate().unwrap_or(true),
+            "Qwen shared ordinary requires fallible SlotAware spawn");
         // Must precede even channel/metadata/thread creation. The normal
         // fallible entry rejects unsupported profile/mode combinations first.
         crate::inference::models::qwen35::decode_pool::profile::assert_direct_spawn_legacy();
@@ -4363,6 +4372,12 @@ impl Engine {
                 crate::debug::INVESTIGATION_ENV.hybrid_kv,
                 crate::debug::INVESTIGATION_ENV.tq_codebook_bits)
                 .map_err(|e| EngineSpawnError::GemmaFullInputCheckpoint { cause: e.to_string() })?;
+        }
+        if crate::debug::INVESTIGATION_ENV.qwen_shared_ordinary.validate()
+            .map_err(|e|EngineSpawnError::QwenSharedOrdinary {cause:e.into()})? {
+            if !matches!((&loaded,mode),(LoadedModel::Qwen35(_),EngineMode::SlotAware {max_slots:1..=4})) {
+                return Err(EngineSpawnError::QwenSharedOrdinary {cause:"requires Q38 SlotAware1..4".into()});
+            }
         }
         if crate::inference::models::qwen35::decode_pool::profile::selected() {
             use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights};
@@ -20002,6 +20017,9 @@ fn embed_qwen35_inline(
     None
 }
 
+#[path = "engine/qwen_shared_ordinary.rs"]
+mod qwen_shared_ordinary;
+
 fn decode_batch_qwen35(
     guard: &mut Qwen35KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
@@ -20014,10 +20032,59 @@ fn decode_batch_qwen35(
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
 ) -> Option<Qwen35FatalFailure> {
-    for &handle in handles {
+    let mut shared = qwen_shared_ordinary::Batch::new();
+    for (index, &handle) in handles.iter().enumerate() {
+        if guard.model.shared_ordinary && !shared.contains(handle) {
+            if let Err(fatal) = shared.prepare_prefix(guard, slots, &handles[index..], scheduler, supervisor) {
+                return Some(fatal);
+            }
+        }
+        let staged = shared.take(handle);
+        let defer_cancel = staged.as_ref().is_some_and(|p| p.was_shared());
+        let taken = match take_qwen35_decode_slot(guard,scheduler,slots,retained_tokens,
+            prompt_anchors,handle,kv_bytes_per_token,defer_cancel) {
+            Ok(v)=>v,Err(fatal)=>{shared.quarantine();return Some(fatal);}
+        };
+        let Some((mut state,reply))=taken else {
+            if let Some(p)=staged { p.discard_for_cancel(); }
+            continue;
+        };
+        let ordinary_leaf=state.ordinary_leaf_preview(handle,handle,reply.client_closed());
+        tracing::trace!(slot=handle.slot_id.0,generation=handle.generation,
+            ?ordinary_leaf,known_leaf=?ordinary_leaf.known_leaf(),
+            "Qwen35 ordinary target preparation (scalar producer unchanged)");
+        let _native_invocation = scheduler.trace_transaction("qwen35", "ordinary_or_temporal_mtp_decode", &[handle]);
+        let outcome = match staged {
+            Some(p)=>p.execute(&mut state,guard.model,guard.kv.as_mut().expect("kv Some"),supervisor),
+            None=>state.decode_tick(guard.model,guard.kv.as_mut().expect("kv Some"),supervisor),
+        };
+        if defer_cancel && outcome.is_err() {
+            // Restore CPU reply ownership BEFORE existing worker fatal fanout.
+            // It will release each actual installed reservation exactly once.
+            slots[handle.slot_id.0 as usize]=Some((Qwen35SlotWork::Decode(state),reply,handle));
+            shared.quarantine();
+            let error=outcome.err().expect("checked Err");
+            let kind=if !supervisor.is_healthy()||is_fatal_command_buffer_error(&error) {
+                Qwen35WorkerFatalKind::Gpu
+            } else {Qwen35WorkerFatalKind::Invariant};
+            return Some(Qwen35FatalFailure {handle:None,reply:Qwen35FatalReply::None,error,kind});
+        }
+        if let Some(fatal)=finish_qwen35_decode_result(guard,scheduler,slots,retained_tokens,
+            prompt_caches,prompt_anchors,registration,handle,kv_bytes_per_token,supervisor,
+            state,reply,outcome,defer_cancel) {shared.quarantine();return Some(fatal);}
+    }
+    None
+}
+
+fn take_qwen35_decode_slot(
+    guard:&mut Qwen35KvGuard<'_>,scheduler:&mut InflightBatchedScheduler,
+    slots:&mut [Option<Qwen35Slot>],retained_tokens:&mut [Qwen35RetainedPrefix],
+    prompt_anchors:&mut [Option<Qwen35PromptAnchor>],handle:SlotHandle,
+    kv_bytes_per_token:u64,defer_cancel:bool,
+)->std::result::Result<Option<(super::engine_qwen35::Qwen35DecodeState,SlotReply)>,Qwen35FatalFailure> {
         let slot_idx = handle.slot_id.0 as usize;
         let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
-            return Some(Qwen35FatalFailure {
+            return Err(Qwen35FatalFailure {
                 handle: Some(handle),
                 reply: Qwen35FatalReply::None,
                 error: anyhow::anyhow!(
@@ -20030,7 +20097,7 @@ fn decode_batch_qwen35(
         };
         let (work, mut reply, installed) = slot;
         if installed != handle {
-            return Some(Qwen35FatalFailure {
+            return Err(Qwen35FatalFailure {
                 // The scheduler owns `handle`; `installed` is stale driver
                 // state. Release the scheduled reservation during fail-stop.
                 handle: Some(handle),
@@ -20041,10 +20108,10 @@ fn decode_batch_qwen35(
                 kind: Qwen35WorkerFatalKind::Invariant,
             });
         }
-        let mut state = match work {
+        let state = match work {
             Qwen35SlotWork::Decode(state) => state,
             Qwen35SlotWork::Prefill(_) => {
-                return Some(Qwen35FatalFailure {
+                return Err(Qwen35FatalFailure {
                     handle: Some(handle),
                     reply: Qwen35FatalReply::Slot(reply),
                     error: anyhow::anyhow!(
@@ -20057,7 +20124,7 @@ fn decode_batch_qwen35(
             }
         };
 
-        if reply.client_closed() {
+        if !defer_cancel && reply.client_closed() {
             reply.record_client_cancellation();
             reply = match recover_qwen35_slot_after_cancellation_for_reply(
                 guard,
@@ -20070,7 +20137,7 @@ fn decode_batch_qwen35(
                 reply,
             ) {
                 Ok(reply) => reply,
-                Err(fatal) => return Some(fatal),
+                Err(fatal) => return Err(fatal),
             };
             scheduler.release(handle);
             finish_qwen35_operator_request(handle, "cancelled");
@@ -20081,21 +20148,23 @@ fn decode_batch_qwen35(
                 )),
                 true,
             );
-            continue;
+            return Ok(None);
         }
 
-        // Read-only preparation only: no cohort dispatch or changed scalar
-        // policy. Existing generation/cancel checks above remain authoritative.
-        let ordinary_leaf = state.ordinary_leaf_preview(handle, installed, reply.client_closed());
-        tracing::trace!(slot = handle.slot_id.0, generation = handle.generation,
-            ?ordinary_leaf, known_leaf = ?ordinary_leaf.known_leaf(),
-            "Qwen35 ordinary target preparation (scalar producer unchanged)");
-        let _native_invocation = scheduler.trace_transaction("qwen35", "ordinary_or_temporal_mtp_decode", &[handle]);
-        let qtick = match state.decode_tick(
-            guard.model,
-            guard.kv.as_mut().expect("kv Some during loop"),
-            supervisor,
-        ) {
+        Ok(Some((state,reply)))
+}
+
+fn finish_qwen35_decode_result(
+    guard:&mut Qwen35KvGuard<'_>,scheduler:&mut InflightBatchedScheduler,
+    slots:&mut [Option<Qwen35Slot>],retained_tokens:&mut [Qwen35RetainedPrefix],
+    prompt_caches:&mut [PromptCache],prompt_anchors:&mut [Option<Qwen35PromptAnchor>],
+    registration:Option<&super::registry::ModelRegistration>,handle:SlotHandle,
+    kv_bytes_per_token:u64,supervisor:&EngineSupervisor,
+    mut state:super::engine_qwen35::Qwen35DecodeState,mut reply:SlotReply,
+    outcome:Result<super::engine_qwen35::Qwen35TickOutcome>,defer_cancel:bool,
+)->Option<Qwen35FatalFailure> {
+    let slot_idx=handle.slot_id.0 as usize;
+        let qtick = match outcome {
             Ok(t) => t,
             Err(e) => {
                 if !supervisor.is_healthy() {
@@ -20128,7 +20197,7 @@ fn decode_batch_qwen35(
                 prompt_anchors[slot_idx] = None;
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
-                continue;
+                return None;
             }
         };
         let tick = TickOutcome {
@@ -20150,7 +20219,8 @@ fn decode_batch_qwen35(
             answer_event_delivered,
         );
 
-        let client_dropped = slot_emit_token(&mut reply, &tick);
+        let client_dropped = slot_emit_token(&mut reply, &tick)
+            || (defer_cancel && reply.client_closed());
         if !client_dropped && reply.stream_saw_answer_event() && state.mark_first_answer_event() {
             tracing::info!(
                 slot = handle.slot_id.0,
@@ -20235,6 +20305,11 @@ fn decode_batch_qwen35(
                 if !client_dropped && gr.is_ok() { "completed_post_drain" } else { "failed" });
             if let Ok(result) = gr.as_ref() {
                 log_qwen35_slot_decode_complete(result, &reply, client_dropped);
+                if guard.model.shared_ordinary {
+                    tracing::info!(width_counts=?guard.model.shared_ordinary_width_counts,
+                        basis="index1=prepared scalar targets; index2..4=shared target groups; not task success",
+                        "Qwen shared ordinary cumulative target-width census");
+                }
                 if !client_dropped {
                     prompt_caches[slot_idx].store(&cache_prompt, &cache_params, result);
                 }
@@ -20251,7 +20326,6 @@ fn decode_batch_qwen35(
         } else {
             slots[slot_idx] = Some((Qwen35SlotWork::Decode(state), reply, handle));
         }
-    }
     None
 }
 
@@ -34707,6 +34781,8 @@ assistant:
         };
         let qwen_model = Qwen35Model::empty_from_cfg(cfg);
         let qwen_loaded = super::super::engine_qwen35::Qwen35LoadedModel {
+            shared_ordinary: false,
+            shared_ordinary_width_counts: [0;5],
             model: qwen_model,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             chat_template: "qwen-template".to_string(),

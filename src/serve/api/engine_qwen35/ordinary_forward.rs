@@ -142,6 +142,15 @@ impl Qwen35DecodeState {
         supervisor: &EngineSupervisor, prepared: PreparedCoherentOrdinaryTarget,
         target: CoherentOrdinaryTargetResult, ordinary_decision_started: Instant,
     ) -> Result<Qwen35TickOutcome> {
+        self.finish_coherent_ordinary_with_cost(qwen,kv_cache,supervisor,prepared,target,
+            super::ordinary_cost::OrdinaryCost::OriginalScalar(ordinary_decision_started))
+    }
+    pub(in crate::serve::api) fn finish_coherent_ordinary_with_cost(
+        &mut self,qwen:&mut Qwen35LoadedModel,kv_cache:&mut HybridKvCache,
+        supervisor:&EngineSupervisor,prepared:PreparedCoherentOrdinaryTarget,
+        target:CoherentOrdinaryTargetResult,cost:super::ordinary_cost::OrdinaryCost,
+    )->Result<Qwen35TickOutcome> {
+        let own_tail_started=Instant::now();
         let (next_token, next_pos, _) = prepared.input();
         let (prior_target, prior_mtp) = (prepared.prior_target, prepared.prior_mtp);
         let boundary = self.validate_coherent_ordinary_result(qwen, kv_cache, &prepared, &target);
@@ -265,7 +274,7 @@ impl Qwen35DecodeState {
                 );
             }
         };
-        let ordinary_decision_elapsed = ordinary_decision_started.elapsed();
+        let ordinary_decision_elapsed = cost.complete(own_tail_started);
         self.mtp_cost
             .observe_ordinary_target(ordinary_decision_elapsed);
         self.history_cost
