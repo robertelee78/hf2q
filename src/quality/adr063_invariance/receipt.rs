@@ -47,6 +47,11 @@ pub enum Stage {
     CacheMainScore,
     CacheIndexerState,
     CacheIndexerScore,
+    SpecVerifierLogits,
+    SpecVerifierHidden,
+    SpecOriginalDraftIds,
+    SpecForcedDraftIds,
+    SpecCanonicalIds,
     Logits,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

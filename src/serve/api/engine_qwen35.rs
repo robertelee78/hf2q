@@ -5790,6 +5790,9 @@ impl Qwen35DecodeState {
             );
         }
         let draft_elapsed = round_started.elapsed();
+        #[cfg(test)]
+        let drafts = q1_speculation::after_drafts(next_pos, prior_target_len, prior_mtp_len, drafts)?;
+
 
         let mut verify_input = Vec::with_capacity(VERIFY_ROWS);
         verify_input.push(next_token);
@@ -5899,6 +5902,8 @@ impl Qwen35DecodeState {
         }
         let catchup_elapsed = catchup_started.elapsed();
 
+        #[cfg(test)]
+        q1_speculation::verified_buffers(next_pos, &verify_logits, &verify_hidden)?;
         let verify_logits = match verify_logits.as_mut_slice::<f32>() {
             Ok(logits) => logits,
             Err(error) => {
@@ -5913,11 +5918,14 @@ impl Qwen35DecodeState {
         let mut semantic = Qwen35SpecSemanticState::from_decode(self);
         let plan = match plan_qwen35_verified_block(&drafts, |row| {
             let start = row * vocab;
-            semantic.select_and_observe(
+            let decision = semantic.select_and_observe(
                 qwen,
                 &self.params,
                 &mut verify_logits[start..start + vocab],
-            )
+            )?;
+            #[cfg(test)]
+            q1_speculation::canonical_decision(next_pos, row, decision.token, decision.terminal)?;
+            Ok(decision)
         }) {
             Ok(plan) => plan,
             Err(error) => {
@@ -5979,6 +5987,8 @@ impl Qwen35DecodeState {
             .as_mut()
             .expect("MTP state checked above")
             .verifier_hidden = carry_hidden;
+        #[cfg(test)]
+        q1_speculation::state_committed(next_pos, kv_cache, &plan)?;
         self.pending_speculation_output = plan.output;
         self.terminal_after_pending = plan.terminal_after_pending;
         super::qwen35_speculation::record_proposer_outcome(
@@ -6214,6 +6224,8 @@ impl Qwen35DecodeState {
             .expect("MTP state checked above")
             .verifier_hidden = carry_hidden;
 
+        #[cfg(test)]
+        q1_speculation::ordinary_buffers(next_pos, kv_cache, &logits)?;
         let mut semantic = Qwen35SpecSemanticState::from_decode(self);
         let decision = match semantic.select_and_observe(qwen, &self.params, &mut logits) {
             Ok(decision) => decision,
@@ -6228,6 +6240,8 @@ impl Qwen35DecodeState {
                 );
             }
         };
+        #[cfg(test)]
+        q1_speculation::ordinary_decision(next_pos, decision.token, decision.terminal)?;
         let ordinary_decision_elapsed = ordinary_decision_started.elapsed();
         self.mtp_cost
             .observe_ordinary_target(ordinary_decision_elapsed);
@@ -11831,3 +11845,7 @@ mod glp_cache_identity_tests {
         assert_ne!(bare, steering_and_graft_params_hash(Some(&glp), None));
     }
 }
+
+#[cfg(test)]
+#[path = "engine_qwen35/q1_speculation.rs"]
+mod q1_speculation;
