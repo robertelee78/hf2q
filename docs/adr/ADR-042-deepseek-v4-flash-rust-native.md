@@ -2674,3 +2674,22 @@ passed18DSML-focused tests, all four tool-bound controls,25mask tests with
 one ignored control,47sampler tests, and the locked all-target/all-feature
 check. That includes the new all-family public-key/function-name runtime
 control. Real-model serving remains the next gate.
+
+
+### Proposed: smaller internal sparse gather tile (2026-10-27)
+
+A separate source spike reduces only the existing gathered sparse-prefill query
+scratch tile from256to64. Logical transaction rows, four full262144contexts,
+8192output allowance, group4 scheduling, selected KV and attention indices,
+native kernels, sink and validity semantics remain unchanged. The private tile
+parameter exists only to compare old256/new64 through the same adapter body;
+there is no new operator flag or alternative model-family route.
+
+The widest ratio128 gather at width2176/D512 requests570425344B (1GiB pool
+bucket) before,142606336B (256MiB bucket) after. The admitted253952prompt has
+width<=2112 and the same bucket reduction768MiB. Ratio4width640 changes160MiB
+to40MiB requested. These are local scratch bounds, not measured whole-pool or
+physical fit. More tile dispatches may increase prefill latency; no speed/default
+promotion or Q5 acceptance is claimed. Independent source review, focused pure
+controls, tiny actualold/new bit/validity/offset parity and subsequent quality/
+performance evidence are pending. Historical results are not rescored.
