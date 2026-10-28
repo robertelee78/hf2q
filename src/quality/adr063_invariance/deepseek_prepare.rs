@@ -46,7 +46,7 @@ fn run()->Result<()> {
     let binary=c.expected_exporter_binary_sha256.as_deref().context("pending binary binding")?;
     ensure!(hex(source,40)&&hex(binary,64)&&option_env!("HF2Q_BUILD_GIT_SHA")==Some(source)
         &&acquisition::executable_digest()?==binary&&c.model.retained_full_sha256==MODEL_SHA,"actual prep source/binary/selected DS identity");
-    let mut retained:Vec<(&FileBinding,usize,Vec<u8>)>=Vec::new();
+    let mut retained:Vec<(&FileBinding,u64,Vec<u8>)>=Vec::new();
     for (b,cap) in [(&c.full_content_receipt,16*1024*1024),(&c.tokenizer,64*1024*1024),
         (&c.template,1024*1024),(&c.producer_execution,2*1024*1024),(&c.producer_helper_binding,2*1024*1024)] {
         retained.push((b,cap,acquisition::checked_file(b,cap)?));

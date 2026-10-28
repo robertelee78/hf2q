@@ -1,5 +1,6 @@
 //! Test-only nativeDS input replay; same HTTP normalization/render/tokenize seams.
 use super::*;
+use crate::serve::api::schema;
 use anyhow::{ensure,Result};
 pub(crate) fn replay(wire:&[u8],tokenizer:&tokenizers::Tokenizer,template:&str)->Result<(Vec<u32>,String)> {
     ensure!(template==crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731,"exact native DS template");
