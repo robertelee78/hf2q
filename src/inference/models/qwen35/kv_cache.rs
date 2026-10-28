@@ -51,6 +51,8 @@ use super::{Qwen35Config, Qwen35LayerKind};
 
 mod source_teacher;
 mod allocation_plan;
+#[cfg(test)]
+pub(crate) mod q1_capture_layout;
 use allocation_plan::{
     ensure_capture_with, CaptureAllocationPlan, CaptureRole, ExistingCapture, HybridCacheAllocationPlan,
 };
