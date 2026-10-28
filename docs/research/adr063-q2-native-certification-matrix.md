@@ -124,3 +124,41 @@ other client/helper/disappeared service; missing standalone; hashed rules-only
 recipe; fabricated resolved/qualified recipe refusal plus legacy-schema support.
 No source author process/client/test execution occurred. Root's prior composed
 288PASS applies only the earlier committed source, not this new pending delta.
+
+## Native standalone helper ownership (capture only)
+
+An actual standalone client may create a fresh detached helper process group.
+The mature coding tool wrapper intentionally forbids that and remains unchanged.
+`q2_native_process.py` is a dedicated metadata-capture adapter: record a typed
+PID/start/PG baseline BEFORE Popen; use only that fresh Popen root and actual
+PPID-descendant chains. Register fresh descendant identities before validating
+their new group. A detached group is admitted only when its leader is itself an
+observed fresh owned descendant, absent from all baseline PIDs/groups, and every
+current member is proven owned with matching start identity. Joining an old or
+unknown group, PID reuse or an unowned member refuses. Process names or a parent1
+orphan alone never prove ownership. Already registered descendants can remain
+known after reparenting; unseen reparented helpers remain Unknown, not adopted.
+
+Finite bounds:64owned nodes,8groups,1GiB aggregate observed RSS,4096queries,
+64MiB retained raw process-query bytes,4MiB per raw query and500ms query deadline.
+Existing120s client and256MiB writable-tree/8MiB stdout+stderr caps remain.
+Queries retain numeric ps stdout/stderr/exit/time/error records, no credentials.
+These are observed stop conditions, not kernel hard memory reservations.
+
+Cleanup signals previously proven detached child groups before the fresh root
+PG; unavailable metrics never skip those bounded kill/reap attempts. Never
+signal a foreign group: use only individually proven unchanged owned PID if it
+joined a rejected group. Current reuse/unowned-member evidence withholds unsafe
+group signals; failed metrics or unknown final identity/remaining group keeps
+cleanup unqualified. TERM3s/KILL5s and bounded root reap remain; every registered
+PG must actually be empty at final query. No old service is killed. A terminal
+CLI exit starts owned-helper cleanup, then bounded raw-pipe EOF draining; helper-
+held pipes cannot silently clip capture output or hang indefinitely.
+
+Authored controls: fresh detached registration/order; old/unowned/reused group
+refusal; mixed-owned group cannot authorize arbitrary signals; mocked metrics
+failure still signals only proven groups and stays unqualified; one explicit
+actual Python parent+setsid child under a fresh group, held until registration,
+then checked complete cleanup. Root runs this last control only after review;
+no source author processes/tests were executed. All earlier failed real-client
+capture receipts remain failed, not rescored by this source change.

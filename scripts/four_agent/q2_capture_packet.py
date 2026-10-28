@@ -14,7 +14,7 @@ from qwen38_n1_verdict import loads, require
 
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 SOURCE_CLOSURE = {"q2_capture_client.py", "q2_capture_packet.py", "q2_client_profile.py",
-                  "q2_certify.py", "q2_capture_preflight.py", "qwen38_n1_process.py", "qwen38_n1_verdict.py",
+                  "q2_certify.py", "q2_capture_preflight.py", "q2_native_process.py", "qwen38_n1_process.py", "qwen38_n1_verdict.py",
                   "qwen38_n1_tools.py", "qwen_n4_live_smoke.py", "coding_family.py", "f2_semantic.py"}
 KEYS = {"schema", "approved_capture_only", "source_files", "client_binary", "expected_version",
         "source_config", "sandbox_binary", "port", "profiles"}

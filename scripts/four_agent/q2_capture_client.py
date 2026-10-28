@@ -21,6 +21,7 @@ from q2_client_profile import (FAMILIES, capture_profile, encoded, projected_con
                                validate_capture_request)
 from qwen38_n1_verdict import loads, require
 import qwen38_n1_process as owned
+import q2_native_process as native_owned
 
 CLOCK = "CLOCK_MONOTONIC"
 BODY_LIMIT = 2 * 1024 * 1024
@@ -71,18 +72,22 @@ def sandbox_profile(root, binary, port):
 
 def child(command, root, env, output, maximum_seconds):
     require(not INTERRUPTED, "interrupted before actual owned Popen")
+    inventory = native_owned.Inventory(output)
+    baseline = inventory.query()
+    require(not INTERRUPTED, "interrupted after prelaunch native process baseline")
     process = subprocess.Popen(command, cwd=root, env=env, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-    known = {}; raw = {"stdout": bytearray(), "stderr": bytearray()}
+    ownership = None
+    raw = {"stdout": bytearray(), "stderr": bytearray()}
     receipt = {"argv": command, "f2_clock_id": CLOCK, "started_ns": clock(), "cleanup": None}
     selector = selectors.DefaultSelector(); started = time.monotonic()
     try:
+        ownership = native_owned.Ownership(baseline, process.pid)
         for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             os.set_blocking(stream.fileno(), False); selector.register(stream, selectors.EVENT_READ, name)
         while selector.get_map() or process.poll() is None:
             require(not INTERRUPTED and time.monotonic() - started < maximum_seconds, "owned client deadline/interruption")
-            rows = owned.process_snapshot(); pids = owned.tree(rows, process.pid, known)
-            known.update({p: rows[p][3] for p in pids if p in rows})
+            rows = inventory.query(); pids = ownership.observe(rows)
             require(sum(rows[p][2] for p in pids if p in rows) <= 1024 * 1024 * 1024, "capture client observed RSS1GiB")
             owned.directory_bytes(root, 256 * 1024 * 1024)
             for key, _ in selector.select(.05):
@@ -90,13 +95,24 @@ def child(command, root, env, output, maximum_seconds):
                 if data: raw[key.data].extend(data)
                 else: selector.unregister(key.fileobj)
                 require(sum(map(len, raw.values())) <= 8 * 1024 * 1024, "capture stdout/stderr quota")
+            if process.poll() is not None: break  # Terminal CLI; cleanup owns retained helper PGs.
         receipt["exit"] = process.wait(timeout=1)
     except BaseException as error:
         receipt["failure"] = repr(error)
     finally:
         # Metrics failures never gate signaling the freshly owned PG/reaping.
-        try: receipt["cleanup"] = owned.stop_group(process, known)
+        try: receipt["cleanup"] = native_owned.stop_owned(process, ownership if ownership is not None else native_owned.Ownership({}, process.pid), inventory)
         except BaseException as error: receipt["cleanup_error"] = repr(error)
+        try:
+            until = time.monotonic() + 2
+            while selector.get_map():
+                require(time.monotonic() < until, "post-cleanup stdout/stderr EOF unknown")
+                for key, _ in selector.select(.05):
+                    data = os.read(key.fileobj.fileno(), 8192)
+                    if data: raw[key.data].extend(data)
+                    else: selector.unregister(key.fileobj)
+                    require(sum(map(len, raw.values())) <= 8 * 1024 * 1024, "post-cleanup raw quota")
+        except BaseException as error: receipt["failure"] = receipt.get("failure") or repr(error)
         for name, data in raw.items(): save(output / (name + ".bin"), bytes(data), True)
         selector.close()
         for stream in (process.stdout, process.stderr): stream.close()
