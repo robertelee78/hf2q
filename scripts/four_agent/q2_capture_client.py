@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from q2_certify import BoundReader, digest
 from q2_capture_packet import validate_capture_approval
+from q2_capture_preflight import quiet_inventory, default_resolution, standalone_capture_argv
 from q2_client_profile import (FAMILIES, capture_profile, encoded, projected_config,
                                validate_capture_request)
 from qwen38_n1_verdict import loads, require
@@ -45,18 +46,10 @@ def save(path, value, raw=False):
     return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
 
 
-def quiet():
-    result = subprocess.run(["/bin/ps", "-axo", "pid=,comm="], capture_output=True, timeout=2, check=True)
-    require(len(result.stdout) <= 4 * 1024 * 1024, "quiet inventory envelope")
-    bad = []
-    for line in result.stdout.decode().splitlines():
-        pid, command = line.strip().split(None, 1)
-        name = Path(command).name
-        if (name in {"hf2q", "llama-server", "llama-cli", "test-binary", "helper-binary", "cargo", "rustc", "clang", "clang++", "opencode"}
-                or name.startswith(("hf2q-", "mlx_native-", "noalloc-size", "live-wired", "owned-overlap"))):
-            bad.append({"pid": int(pid), "command": command})
-    require(not bad, "known model/test/compiler/client worker already active")
-    return result.stdout
+def quiet(service, binary):
+    result = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,lstart=,comm=,args="], capture_output=True, timeout=2, check=True)
+    require(not result.stderr, "quiet inventory stderr")
+    return quiet_inventory(result.stdout, service, binary)
 
 
 def sandbox_profile(root, binary, port):
@@ -186,10 +179,8 @@ def main():
     parser.add_argument("--output", required=True); args = parser.parse_args()
     require(digest(args.approval) == args.approval_sha256, "external capture approval hash")
     reader = BoundReader(); approval = validate_capture_approval(loads(Path(args.approval).read_bytes()))
-    require(set(approval) == {"schema", "approved_capture_only", "source_files", "client_binary", "expected_version",
-            "source_config", "sandbox_binary", "port", "profiles"} and approval["schema"] == "hf2q.q2.client-capture-approval.v1"
-            and approval["approved_capture_only"] is True and set(approval["profiles"]) == FAMILIES,
-            "reviewed model-free capture only")
+    # The actual shared validator above owns the closed schema, including its
+    # single exact-service exception. Do not reapply an older duplicate schema.
     for name, sha in approval["source_files"].items():
         require(Path(name).name == name, "capture source basename")
         reader.path({"path": str(Path(__file__).resolve().with_name(name)), "sha256": sha})
@@ -207,21 +198,18 @@ def main():
     for signum in (signal.SIGINT, signal.SIGTERM): signal.signal(signum, interrupt)
     save(output / "approval.json", approval)
     result = {"schema": "hf2q.q2.client-capture-result.v1", "status": "Pending", "model_inference": False,
-              "campaign_primary_eligible": False, "profiles": {}, "client_binary": approval["client_binary"], "f2_clock_id": CLOCK}
+              "campaign_primary_eligible": False, "effective_sampling_qualified": False, "profiles": {}, "client_binary": approval["client_binary"], "f2_clock_id": CLOCK}
     try:
         for family in sorted(FAMILIES):
-            quiet(); root = output / family; root.mkdir(mode=0o700)
+            save(output / ("quiet-" + family + ".json"), quiet(approval.get("existing_client_service"), approval["client_binary"]))
+            root = output / family; root.mkdir(mode=0o700)
             fixture = root / "fixture"; fixture.mkdir(mode=0o700)
             for i in range(6): save(fixture / f"phase-{i}.txt", f"Q2_OWNED_CAPTURE_{i}\n".encode(), True)
             cfg = approval["profiles"][family]
             require(set(cfg) == {"model_id", "artifact_sha256", "effective_hf_defaults"}, "explicit derived profile bindings")
             defaults = reader.obj(cfg["effective_hf_defaults"])
             require(isinstance(cfg["artifact_sha256"], str) and re.fullmatch("[a-f0-9]{64}", cfg["artifact_sha256"]), "actual artifact identity")
-            require(defaults.get("schema") == "hf2q.q2.effective-hf-defaults.v1"
-                    and defaults.get("family") == family and isinstance(defaults.get("server_source"), str)
-                    and isinstance(defaults.get("source_files"), dict) and defaults["source_files"]
-                    and [x.get("phase") for x in defaults.get("per_phase", [])] == list(range(7)),
-                    "source-bound per-phase HF default receipt required, not invented from missing wire fields")
+            default_disposition = default_resolution(defaults, family, reader)
             effective, projection = projected_config(source, family, cfg["model_id"], f"http://127.0.0.1:{approval['port']}/v1")
             for name in ("home", "config/opencode", "data", "state", "cache", "version", "client"):
                 (root / name).mkdir(parents=True, mode=0o700)
@@ -238,8 +226,9 @@ def main():
                 require(version.decode().strip() == approval["expected_version"] and not state["all"] and not state["errors"],
                         "actual client binary/version or unexpected version HTTP")
                 require(not INTERRUPTED, "interrupted immediately before capture child")
-                _, receipt = child([str(sandbox), "-f", str(sb), str(binary), "run", "--standalone", "--format", "json",
-                    "--model", "hf2q/" + cfg["model_id"], "Diagnostic only: follow the provided read tool calls and then acknowledge completion. Do not call other tools."], root, env, root / "client", CLIENT_SECONDS)
+                capture_argv = [str(sandbox), "-f", str(sb), str(binary), "run", "--standalone", "--format", "json",
+                    "--model", "hf2q/" + cfg["model_id"], "Diagnostic only: follow the provided read tool calls and then acknowledge completion. Do not call other tools."]
+                _, receipt = child(standalone_capture_argv(capture_argv, sandbox, sb, binary), root, env, root / "client", CLIENT_SECONDS)
             finally:
                 server.shutdown(); server.server_close(); thread.join(timeout=3)
                 save(root / "capture-state.json", {k: v for k, v in state.items() if k not in {"lock", "root", "fixture"}})
@@ -247,9 +236,10 @@ def main():
             profile = capture_profile(state["phases"], cfg["model_id"])
             profile.update(projection=projection, client_version=version.decode().strip(), client_binary=approval["client_binary"],
                            artifact_sha256=cfg["artifact_sha256"], effective_hf_defaults=cfg["effective_hf_defaults"],
-                           effective_hf_defaults_value=defaults, cleanup=receipt["cleanup"])
+                           effective_hf_defaults_value=defaults, default_resolution_disposition=default_disposition,
+                           effective_sampling_qualified=False, cleanup=receipt["cleanup"])
             result["profiles"][family] = save(root / "profile.json", profile)
-        reader.verify(); quiet(); result["status"] = "CapturedControlsAwaitingIndependentReview"
+        reader.verify(); save(output / "quiet-final.json", quiet(approval.get("existing_client_service"), approval["client_binary"])); result["status"] = "CapturedControlsAwaitingIndependentReview"
     except BaseException as error: result.update(status="Failed", failure=repr(error))
     save(output / "receipt.json", result)
     hashes = {}

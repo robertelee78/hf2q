@@ -9,11 +9,12 @@ import os
 from pathlib import Path
 import re
 from q2_client_profile import FAMILIES
+from q2_capture_preflight import service_identity
 from qwen38_n1_verdict import loads, require
 
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 SOURCE_CLOSURE = {"q2_capture_client.py", "q2_capture_packet.py", "q2_client_profile.py",
-                  "q2_certify.py", "qwen38_n1_process.py", "qwen38_n1_verdict.py",
+                  "q2_certify.py", "q2_capture_preflight.py", "qwen38_n1_process.py", "qwen38_n1_verdict.py",
                   "qwen38_n1_tools.py", "qwen_n4_live_smoke.py", "coding_family.py", "f2_semantic.py"}
 KEYS = {"schema", "approved_capture_only", "source_files", "client_binary", "expected_version",
         "source_config", "sandbox_binary", "port", "profiles"}
@@ -27,7 +28,7 @@ def bound_shape(value):
 
 
 def validate_capture_approval(value):
-    require(type(value) is dict and set(value) == KEYS
+    require(type(value) is dict and set(value) in (KEYS, KEYS | {"existing_client_service"})
             and value["schema"] == "hf2q.q2.client-capture-approval.v1"
             and value["approved_capture_only"] is True, "explicit model-free capture approval")
     require(value["expected_version"] == "2.1.1", "exact native OpenCode2.1.1, not a wildcard/other client")
@@ -44,6 +45,7 @@ def validate_capture_approval(value):
                 and type(profile["model_id"]) is str and 0 < len(profile["model_id"]) < 200
                 and type(profile["artifact_sha256"]) is str and SHA.fullmatch(profile["artifact_sha256"]), "closed actual family/artifact identity")
         bound_shape(profile["effective_hf_defaults"])
+    service_identity(value.get("existing_client_service"), value["client_binary"])
     return value
 
 

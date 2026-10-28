@@ -80,3 +80,47 @@ compiler capability or the real population matrix; those are the next required
 root packets, not optional certification checkboxes. Q2 needs no mandatory
 full six-block speed study merely to certify a diagnostic harness; F2/Q3 retain
 that scoreboard requirement independently.
+
+## Execution preparation: existing standalone service and source recipe
+
+A metadata-only capture may coexist with ONE explicitly bound preexisting
+OpenCode service using the SAME hashed client executable. This is not a model,
+compiler, active foreground client or performance-quietness exception. Optional
+`existing_client_service` is one closed identity `{pid,ppid,start,argv,binary}`:
+parent must be1; argv exactly `[bound_binary_path,"serve","--service"]`; PID,
+start timestamp, command path and full argv must match the actual ps snapshot.
+All other OpenCode clients/services and all known HF/peer/test/build processes
+still refuse. Each pre-family and final snapshot/allowed identity is saved;
+PID reuse/changed args/missing service refuses, never silently widens the rule.
+The service is not signaled. New capture still uses its isolated HOME/config/
+cwd/sandbox and actual `run --standalone` argv, checked before client launch;
+it never delegates to the existing service. Private root binding contains the
+actual identity; no operator PID or path is prescribed by the checked-in fixture.
+
+Before unknown actual wire omissions are captured, a resolved per-phase server
+sampling receipt cannot honestly be required. The same BoundFile slot therefore
+also accepts the closed `hf2q.q2.hf-default-resolution-recipe.v1` object:
+`family`, exact40hex `server_source`, nonempty `source_files` map of absolute
+source evidence files to SHA256, `resolution_scope` exactly
+`source_rules_only_no_actual_request_or_server_resolution`,
+`effective_sampling_qualified:false`, `status:"PendingActualServerJoin"`.
+Each source file is actually hash-verified. No `per_phase`, temperature/seed or
+invented resolved values are accepted in that rules-only schema. Root binds
+retained clean-source default resolver/handler/family policy evidence; no model
+load is needed to hash source. Unknown family/source/hash/schema refuses.
+
+Existing `hf2q.q2.effective-hf-defaults.v1` receipts remain supported with source
+binding and seven explicit phase entries; they also cannot qualify a future
+capture's effective sampling without the actual request/server join. Profile
+and capture result always emit `effective_sampling_qualified:false` plus the
+recipe-vs-retained-receipt disposition. Native-chain audit and campaign certifier
+are unchanged and never upgrade these controls to model quality or primary.
+After capture, root must separately resolve ACTUAL request omissions through
+that exact source and verify effective server controls before qualification.
+
+Six additional authored controls call the actual quiet/standalone/default gate:
+exact service positive/raw logging; PID/start/parent/argv/binary mutation;
+other client/helper/disappeared service; missing standalone; hashed rules-only
+recipe; fabricated resolved/qualified recipe refusal plus legacy-schema support.
+No source author process/client/test execution occurred. Root's prior composed
+288PASS applies only the earlier committed source, not this new pending delta.
