@@ -9579,6 +9579,16 @@ object-form tool_call arguments intentionally change (that is fix F2).
    the prompt bytes; it also keeps substituted assistant arguments faithful to
    the request instead of silently sorting their keys. Templates remain free
    to apply an explicit ordering operation such as Gemma 4's `dictsort`.
+
+   The MiniJinja dependency MUST enable `preserve_order` as well as
+   serde_json. Otherwise its internal value map sorts keys during context
+   conversion, undoing this contract before `tojson` runs. The four retained
+   Qwen3.6 initial requests on 2026-10-27 reproduced 690 hf2q versus 687
+   reference tokens: identical tool values and 2875-byte prompt lengths, but
+   the first tool key differed at byte83. This establishes a prompt-byte
+   mismatch, not the cause of the observed coding failure. The repair must
+   preserve nested schema insertion order while explicit `dictsort` remains
+   effective; full multi-turn quality validation is required before landing.
 3. **Reasoning echo-back (F3).** Insert `reasoning_content` into the
    Jinja message object — assistant-role messages only, only when
    present (gate-1 #6). Non-assistant messages never gain the field
