@@ -34,7 +34,7 @@ The explicit `hf2q.f2.semantic-timing.v3` metric schema uses the same accepted s
 
 ## Bounded real trace contract
 
-Use at most **256MiB checked metadata** for each declared trace packet. This is a metadata allocation/recording cap, not a process physical bound or permission to omit records. Charge its live ownership and file-I/O effects in the Q5 operating profile. Check record count/byte products and admission before growing/appending; overflow or exhaustion is a trace failure, never truncation, overwrite, sampled omission or successful fallback. No tensor/activation payloads are captured.
+Legacy/default trace packets retain the **256MiB combined serialized server+client ceiling**. A separately declared `metadata_budget_profile="native_command_capture_v2"` may select a finite **2GiB combined serialized ceiling** only with native observer present and `diagnostic_case=true`, as specified by the governing ADR and F2 capacity subsection. Header and external expectation must bind that exact profile. Minimum client reservation128MiB and native event1,000,000/live metadata16MiB/bookkeeping1MiB caps stay unchanged. This is a serialized recording quota, not a heap/process/physical bound or permission to omit records. Charge its live ownership and file-I/O effects in the Q5 operating profile. Check record count/byte products and admission before growing/appending; overflow or exhaustion is a trace failure, never truncation, overwrite, sampled omission or successful fallback. No tensor/activation payloads are captured.
 
 Publish from actual production scheduler, forward-submit and checked-drain seams, not a duplicate model in Python:
 
@@ -68,7 +68,7 @@ Add only these decisive integration groups, invoking the ACTUAL production parse
 
 **B. Tool/identity/lineage corruptions.** Wrong name/path/target/arguments; forged “passed” text; valid exit0 with zero tests; changed read-only tests; unchanged broken patch; missing response; duplicate tool ID; cross-agent response/slot generation; stale model/template/tokenizer/native/binary binding; altered8192 allowance/context/overflow; stripped reasoning or whole tool result. Mutate one copied raw artifact and call the real verifier CLI. Include legitimate DS live/recovery cache accounting as a positive control. No mirrored parser or pre-filled pass booleans.
 
-**C. Actual trace population controls.** Known positive traces through real publication seams for each population and a known singleton physical operation. Reject serialized one-active-three-queued service despite four open HTTPs; stale/swapped generation, duplicate physical row, omitted progress/drain, phase mislabel, discontinuous sequence, Unknown membership and256MiB+1 overflow. Fake traces prove validator rejection only; named independent QE must compare at least the required actual server trace cases to real raw requests/submissions before certification.
+**C. Actual trace population controls.** Known positive traces through real publication seams for each population and a known singleton physical operation. Reject serialized one-active-three-queued service despite four open HTTPs; stale/swapped generation, duplicate physical row, omitted progress/drain, phase mislabel, discontinuous sequence, Unknown membership and legacy256MiB+1 overflow; the new native-only profile also requires2GiB+1/unsupported-profile/missing-native/non-diagnostic/client-under128MiB/native-cap-increase negatives through actual validator entrypoints. Fake traces prove validator rejection only; named independent QE must compare at least the required actual server trace cases to real raw requests/submissions before certification.
 
 **D. Cleanup and stop integration.** Reuse existing metrics/ps failure, escaped PID identity, PID reuse and owned PG controls. Add a bounded actual owned child/loopback timeout or interruption case through the real controller path: marker-then-hang, unavailable metrics, child exit without cleanup, retained listener. TERM/KILL/reap must not depend on successful ps. Failure/Unknown cleanup prevents next engine; no arbitrary process signal. Raw failure receipts written before scoring, later cases Pending. Strict-invalid observer retries never retry a valid unfavorable reading.
 
@@ -103,3 +103,8 @@ physical work. Missing required maps/unknown or dropped events, failed drains,
 quality/client/clock/trace gaps retain their existing failure disposition.
 The source validator and expected-plan join must pass the F2 V4 deciding
 controls before activation; this documentation alone qualifies no case.
+
+
+### Capacity exception does not certify an earlier failure
+
+The first actual native diagnostic `f2-qwen38-native-trace-operating90-20261028T010639Z` hit its111MiB server JSONL carve-out and had independent unchecked-owner and missing-rotation-scope failures before overflow. Its final native counters are Unknown. The prospective2GiB profile does not rescore that packet, authorize a narrower task, waive native lifecycle/Q2 adversarial/quality gates or qualify primary performance. Preserve all legacy overflow negatives and add small declared-bound fixtures; tests must not allocate multi-GiB payloads merely to test arithmetic. Instrumentation comparability, the source-bound complete trace, exact public native pin, operating I/O/RAM charges and independent QE remain separate requirements.
