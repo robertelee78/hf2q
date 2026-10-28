@@ -11,7 +11,7 @@ def trace_fixture(composition=(2, 2)):
                   else "decode", active=True, runnable_forward=True, runnable_emit=False,
                   inflight=False, blocked=None) for i in range(sum(composition))]
     events = [(0, "header", dict(identity={"test_identity": "independent-fixture"},
-               server_budget_bytes=1048576, client_budget_bytes=1048576,
+               server_budget_bytes=1048576, client_budget_bytes=128*1024*1024,
                clock="CLOCK_MONOTONIC nanoseconds since origin", clock_id="CLOCK_MONOTONIC", origin_monotonic_ns=1000,
                config_sha256="f"*64,run_id="q2_control")), (0, "slots", dict(cause="admitted", slots=slots))]
     for i, slot in enumerate(slots):
@@ -95,8 +95,8 @@ class ProductionContractControls(unittest.TestCase):
         with self.assertRaises(ValueError):self.validate(r)
 
     def test_metadata_quota_256m_plus_one_fails_without_allocating_payload(self):
-        r=trace_fixture();r[0]["payload"]["server_budget_bytes"]=256*1024*1024
-        r[0]["payload"]["client_budget_bytes"]=1
+        r=trace_fixture();r[0]["payload"]["server_budget_bytes"]=128*1024*1024+1
+        r[0]["payload"]["client_budget_bytes"]=128*1024*1024
         with self.assertRaises(ValueError):self.validate(r)
 
     def test_semantic_units_first_inter_terminal_and_unary(self):

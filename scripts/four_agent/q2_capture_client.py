@@ -15,6 +15,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from q2_certify import BoundReader, digest
+from q2_capture_packet import validate_capture_approval
 from q2_client_profile import (FAMILIES, capture_profile, encoded, projected_config,
                                validate_capture_request)
 from qwen38_n1_verdict import loads, require
@@ -184,7 +185,7 @@ def main():
     parser.add_argument("--approval", required=True); parser.add_argument("--approval-sha256", required=True)
     parser.add_argument("--output", required=True); args = parser.parse_args()
     require(digest(args.approval) == args.approval_sha256, "external capture approval hash")
-    reader = BoundReader(); approval = loads(Path(args.approval).read_bytes())
+    reader = BoundReader(); approval = validate_capture_approval(loads(Path(args.approval).read_bytes()))
     require(set(approval) == {"schema", "approved_capture_only", "source_files", "client_binary", "expected_version",
             "source_config", "sandbox_binary", "port", "profiles"} and approval["schema"] == "hf2q.q2.client-capture-approval.v1"
             and approval["approved_capture_only"] is True and set(approval["profiles"]) == FAMILIES,
