@@ -242,7 +242,7 @@ def main():
                 normalized_version = exact_client_version(version, approval["expected_version"])
                 require(not state["all"] and not state["errors"], "unexpected version HTTP")
                 require(not INTERRUPTED, "interrupted immediately before capture child")
-                capture_argv = [str(sandbox), "-f", str(sb), str(binary), "run", "--standalone", "--format", "json",
+                capture_argv = [str(sandbox), "-f", str(sb), str(binary), "run", "--standalone", "--print-logs", "--log-level", "debug", "--format", "json",
                     "--model", "hf2q/" + cfg["model_id"], "Diagnostic only: follow the provided read tool calls and then acknowledge completion. Do not call other tools."]
                 _, receipt = child(standalone_capture_argv(capture_argv, sandbox, sb, binary), root, env, root / "client", CLIENT_SECONDS)
             finally:
