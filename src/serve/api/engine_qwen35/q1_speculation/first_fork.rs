@@ -147,7 +147,7 @@ pub(super) fn finish(mut c: Captures, failure: Option<&str>) -> Result<serde_jso
     if let Some(s)=c.post_draft.take() {stores.push(("post-draft-discard129",s));}
     let mut result=serde_json::Map::new();
     for (name,mut store) in stores {
-        if let Some(error)=failure {store.fail(error.into());}
+        if let Some(error)=failure {store.fail(error);}
         let trace=store.finish().map_err(anyhow::Error::msg)?;
         result.insert(name.into(),serde_json::json!({"records":trace.coverage.captured.len(),
             "errors":trace.coverage.errors,"target_and_mtp_separate_by_layer":true}));
