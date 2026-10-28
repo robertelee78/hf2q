@@ -2,6 +2,12 @@ use super::*;
 /// Caller invokes ONLY after its existing successful checked production return.
 /// No native status inference, additional commit/wait or CPU score recomputation.
 pub fn end_checked() -> Result<()> {
+    checked("existing successful production return; no extra wait")
+}
+pub(super) fn primitive_end_checked() -> Result<()> {
+    checked("primitive-only single checked drain; no model or production return")
+}
+fn checked(boundary: &str) -> Result<()> {
     ACTIVE.with(|s|{let mut s=s.borrow_mut();let Some(a)=s.as_mut()else{return Ok(())};
     let Some(c)=a.call.as_ref()else{ensure!(!a.pending,"pending routing without invocation");return Ok(())};
     ensure!(c.seen.len()==c.rows.len()*LAYERS,"missing required producer layer/row");
@@ -17,7 +23,7 @@ pub fn end_checked() -> Result<()> {
             "boundary_ids":ids,"status":status.as_logical_slice::<u32>()?,"selected_ids":selected,"selected_weights_f32_bits":weights.iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
             "native_boundary_valid":native_valid,"selected_copy_valid":selection_valid,
             "native_decode_error":boundary.as_ref().err().map(ToString::to_string),
-            "checked_boundary":"existing successful production return; no extra wait","qualified":false}))?;
+            "checked_boundary":boundary,"qualified":false}))?;
         // Retain raw invalid status/bit patterns BEFORE refusing the case.
         ensure!(native_valid&&selection_valid,"invalid/N/A native boundary or actual selected copy");
         a.read+=1;

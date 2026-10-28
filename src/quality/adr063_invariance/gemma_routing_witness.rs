@@ -414,3 +414,6 @@ pub use output::{end_checked, finish};
 #[cfg(test)]
 #[path = "gemma_routing_witness_controls.rs"]
 mod controls;
+
+#[path = "gemma_routing_witness/gpu_control.rs"]
+mod gpu_control;

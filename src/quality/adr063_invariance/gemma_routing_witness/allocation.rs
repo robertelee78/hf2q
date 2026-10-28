@@ -1,4 +1,32 @@
 use super::*;
+pub(super) fn allocate_bank(device: &MlxDevice) -> Result<Bank> {
+    let make = |dtype, shape: Vec<usize>| {
+        device.alloc_buffer(shape.iter().product::<usize>() * 4, dtype, shape)
+    };
+    let bank = Bank {
+        scores: make(DType::F32, vec![ENTRY_CAP, 2])?,
+        ids: make(DType::U32, vec![ENTRY_CAP, 2])?,
+        status: make(DType::U32, vec![ENTRY_CAP])?,
+        selected: make(DType::U32, vec![ENTRY_CAP, K])?,
+        weights: make(DType::F32, vec![ENTRY_CAP, K])?,
+    };
+    let parent_bytes = [
+        &bank.scores,
+        &bank.ids,
+        &bank.status,
+        &bank.selected,
+        &bank.weights,
+    ]
+    .iter()
+    .try_fold(0usize, |n, b| n.checked_add(b.byte_len()))
+    .context("parent byte overflow")?;
+    ensure!(
+        parent_bytes as u64 == PAYLOAD_BYTES,
+        "actual routing bank parent capacities differ from pre-load budget"
+    );
+    Ok(bank)
+}
+
 pub fn install(
     device: &MlxDevice,
     root: &Path,
@@ -32,30 +60,7 @@ pub fn install(
         ensure!(s.borrow().is_none(), "nested routing bank");
         Ok::<_, anyhow::Error>(())
     })?;
-    let make = |dtype, shape: Vec<usize>| {
-        device.alloc_buffer(shape.iter().product::<usize>() * 4, dtype, shape)
-    };
-    let bank = Bank {
-        scores: make(DType::F32, vec![ENTRY_CAP, 2])?,
-        ids: make(DType::U32, vec![ENTRY_CAP, 2])?,
-        status: make(DType::U32, vec![ENTRY_CAP])?,
-        selected: make(DType::U32, vec![ENTRY_CAP, K])?,
-        weights: make(DType::F32, vec![ENTRY_CAP, K])?,
-    };
-    let parent_bytes = [
-        &bank.scores,
-        &bank.ids,
-        &bank.status,
-        &bank.selected,
-        &bank.weights,
-    ]
-    .iter()
-    .try_fold(0usize, |n, b| n.checked_add(b.byte_len()))
-    .context("parent byte overflow")?;
-    ensure!(
-        parent_bytes as u64 == PAYLOAD_BYTES,
-        "actual routing bank parent capacities differ from pre-load budget"
-    );
+    let bank = allocate_bank(device)?;
     let meta = OpenOptions::new()
         .write(true)
         .create_new(true)
