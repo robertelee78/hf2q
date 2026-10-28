@@ -56,6 +56,7 @@ def quiet(service, binary):
 def sandbox_profile(root, binary, port):
     # Empty HOME/config/cwd removes repository/user hooks. File reads cannot
     # reach old user configuration, credentials, plugins or Ruflo packages.
+    require(type(port) is int and 1024 <= port <= 65535, "owned stub port before sandbox rendering")
     for value in (str(root), str(binary)):
         require(not any(c in value for c in ('"', '\\', '\n')), "sandbox path quoting")
     return '\n'.join([
@@ -65,7 +66,12 @@ def sandbox_profile(root, binary, port):
         '(allow file-map-executable)',
         f'(allow file-read* (literal "{binary}") (subpath "{root}"))',
         f'(allow file-write* (subpath "{root}") (literal "/dev/null"))',
-        f'(allow network-outbound (remote tcp "localhost:{port}"))',
+        # --standalone starts its OWN loopback HTTP helper on port0. Both
+        # listener and client need loopback TCP, whose assigned port is not
+        # known when this inherited Seatbelt profile is compiled.
+        '(allow network-bind (local tcp "localhost:*"))',
+        '(allow network-inbound (local tcp "localhost:*"))',
+        '(allow network-outbound (remote tcp "localhost:*"))',
         '(allow file-read* (literal "/private/etc/localtime") (literal "/private/etc/ssl/openssl.cnf"))',
     ]) + '\n'
 

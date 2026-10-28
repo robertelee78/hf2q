@@ -162,3 +162,33 @@ actual Python parent+setsid child under a fresh group, held until registration,
 then checked complete cleanup. Root runs this last control only after review;
 no source author processes/tests were executed. All earlier failed real-client
 capture receipts remain failed, not rescored by this source change.
+
+## Standalone loopback helper bind: prospective source correction
+
+The retained model-free capture-v5 failed before any model request: native
+OpenCode2.1.1 spawned its own `serve --stdio --port 0`, which exited with
+“Failed to start server. Is port 0 in use?” and the parent reported standalone
+readiness failure. Its short complete stderr and verified owned group cleanup
+are retained. This does not prove port contention, identify a specific Seatbelt
+denial errno, or establish that a future sandbox adjustment will pass.
+
+The old profile allowed outbound TCP only to the fixed capture stub and granted
+no bind/inbound operation for the client's required private listener. The minimal
+prospective profile now permits bind/inbound/outbound TCP only on `localhost:*`:
+port0 selects an ephemeral helper port unknown before the inherited sandbox is
+compiled. The fixed stub port is validated1024..65535; no non-loopback network,
+UDP or broad network allowance is introduced. Existing isolated HOME/config/
+filesystem, actual --standalone argv and exact service identity remain. This is
+not a production serving/network setting or evidence of full sandbox confinement.
+Installed Apple Seatbelt policies separately model network-bind/local and
+network-inbound/local operations; previous fixed localhost outbound matcher was
+already accepted by actual sandbox compilation. New profile must be compiled
+and exercised in the root's bounded actual capture before a success claim.
+
+Three authored actual-builder controls check the complete expected loopback-only
+network rule set, invalid typed stub ports and path injection/filesystem rule
+preservation. They are not socket/Seatbelt execution proofs. All failed actual
+captures remain failed; no model/tool-quality claim is inferred from this fix.
+Current cleanup correctly signals only a still-live Popen root when fresh process
+metrics are unavailable; detached groups require fresh identity evidence and
+Unknown cleanup remains false. That root correction is preserved unchanged.
