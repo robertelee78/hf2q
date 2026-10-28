@@ -2544,9 +2544,9 @@ dependencies = [
 
 [[package]]
 name = "mlx-native"
-version = "0.15.8"
+version = "0.15.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ac4d45c9de8707f55cc0474e26f09720e3afa886b37c5617c41007353380fe7"
+checksum = "c7becc3c550f1a5e5467060db000a19d7a37c4961fbb3e1ad1a5e82ec18d41ba"
 dependencies = [
  "block",
  "bytemuck",
