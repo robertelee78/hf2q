@@ -96,7 +96,7 @@ fn run()->Result<()> {
     let payload=super::deepseek_actual::payload(&expected)?;ensure!(payload<=2*1024*1024*1024,"DS endpoint payload exceeds selected2GiB guard");
     let cache=crate::inference::models::deepseek4::cache::Deepseek4CachePlan::for_context(&cfg,262144)?;
     let workload_bytes=serde_json::to_vec_pretty(&workload)?;
-    let value=json!({"schema":"hf2q.q1.deepseek-endpoint-preparation.v1","family":Family::Deepseek4,
+    let mut value=json!({"schema":"hf2q.q1.deepseek-endpoint-preparation.v1","family":Family::Deepseek4,
         "exporter_source_commit":source,"exporter_binary_sha256":binary,"native_version":env!("HF2Q_MLX_NATIVE_VERSION"),
         "configured_context":262144,"output_allowance":8192,"logical_lanes":4,"physical_cache_owners_planned":4,
         "simultaneously_executing_lanes":1,"ordinary_ownership":"four retained caches, serial logical trajectories; not physical B4",
@@ -107,12 +107,14 @@ fn run()->Result<()> {
         "tokenizer_file_sha256":c.tokenizer.sha256,"template_file_sha256":c.template.sha256,"template_source":"NativeEncoding { name: \"DEEPSEEK_V4_FLASH_0731\" }",
         "actual_deepseek_config_debug":format!("{cfg:?}"),"actual_deepseek_config_debug_sha256":recipe.actual_model_config_sha256,
         "config_sha256":acquisition::config_digest(&recipe)?,"recipe":recipe,
-        "actual_cache_plan_debug":format!("{cache:?}"),"actual_cache_plan_debug_sha256":hash(format!("{cache:?}").as_bytes()),"producer_replays":observations,
+    });
+    let remaining=json!({"actual_cache_plan_debug":format!("{cache:?}"),"actual_cache_plan_debug_sha256":hash(format!("{cache:?}").as_bytes()),"producer_replays":observations,
         "payload_plan":{"max_endpoint_payload":payload,"four_fullC_cache_requested_bytes":cache.resident_bytes.checked_mul(4).context("four cache overflow")?,
             "metadata_store_ceiling":134217728,"physical_admission":false,"operating_budget_disposition":"125.6GB operating ledger remains unadmitted; no memory fit certificate"},
         "derivation":"first144 of four full actual Rust nativeDS request replays;128prompt+16forced diagnostics, not generated canonical quality",
         "model_loaded":false,"device_created":false,"inference_performed":false,"execution_approved":false,"composition_reviewed":false,
         "acquisition_attested":false,"tokenizer_semantic_attestation":false,"whole_q1_qualified":false});
+    value.as_object_mut().context("preparation object")?.extend(remaining.as_object().context("remaining preparation object")?.clone());
     let encoded=serde_json::to_vec_pretty(&value)?;ensure!(encoded.len()<=2*1024*1024,"metadata output bound");
     for (b,cap,old) in &retained {ensure!(acquisition::checked_file(b,*cap)?==*old,"retained input changed");}
     ensure!(FileIdentity::observed(&fd)?==before,"model descriptor changed");preflight(&c.output)?;
