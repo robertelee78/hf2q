@@ -54,6 +54,12 @@ pub(super) fn run_lane(
     prefix: &[u32],
     lane: usize,
 ) -> Result<usize> {
+    run_lane_until(model, mode, prefix, lane, 144)
+}
+pub(super) fn run_lane_until(
+    model: &mut Qwen35LoadedModel, mode: Mode, prefix: &[u32], lane: usize, end: usize,
+) -> Result<usize> {
+    anyhow::ensure!(end == 131 || end == 144, "explicit diagnostic end");
     anyhow::ensure!(
         prefix.len() == 128
             && model.speculation.policy()
@@ -118,7 +124,7 @@ pub(super) fn run_lane(
             .context("actual canonical seed absent")?,
         false,
     )?;
-    for input_position in 128..144 {
+    for input_position in 128..end {
         if mode == Mode::ForcedProposal && input_position == 129 {
             anyhow::ensure!(
                 state.pending_speculation_output.is_empty() && state.mtp_cost.may_speculate(),
@@ -177,7 +183,7 @@ pub(super) fn run_lane(
         .cache
         .as_ref()
         .unwrap()
-        .validate_speculative_cursors_for_slot(SlotId(0), 144)?;
+        .validate_speculative_cursors_for_slot(SlotId(0), end)?;
     anyhow::ensure!(
         !lease.cache.as_ref().unwrap().la_capture_active(),
         "capture should be inactive; storage retained/charged"

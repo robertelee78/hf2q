@@ -5789,6 +5789,8 @@ impl Qwen35DecodeState {
                 "Qwen SlotAware MTP K3 discard speculative draft cache",
             );
         }
+        #[cfg(test)]
+        q1_speculation::first_fork::after_draft_discard(next_pos, kv_cache)?;
         let draft_elapsed = round_started.elapsed();
         #[cfg(test)]
         let drafts = q1_speculation::after_drafts(next_pos, prior_target_len, prior_mtp_len, drafts)?;
@@ -5833,6 +5835,8 @@ impl Qwen35DecodeState {
                 return Err(error.context("Qwen SlotAware MTP K3 verify"));
             }
         };
+        #[cfg(test)]
+        q1_speculation::first_fork::verifier_pre_catchup(next_pos, &verify_logits, &verify_hidden)?;
         let verify_elapsed = verify_started.elapsed();
         let vocab = qwen.vocab_size;
         if verify_logits.element_count() != VERIFY_ROWS * vocab
@@ -6124,6 +6128,8 @@ impl Qwen35DecodeState {
                 );
             }
         };
+        #[cfg(test)]
+        q1_speculation::first_fork::ordinary_pre_catchup(next_pos, &logits, &nextn_hidden)?;
         let shared_embed = match qwen.model.embed_tokens_gpu(&[next_token]) {
             Ok(embed) => embed,
             Err(error) => {
@@ -6226,6 +6232,8 @@ impl Qwen35DecodeState {
 
         #[cfg(test)]
         q1_speculation::ordinary_buffers(next_pos, kv_cache, &logits)?;
+        #[cfg(test)]
+        q1_speculation::first_fork::ordinary_post_catchup(next_pos, &logits, &nextn_hidden)?;
         let mut semantic = Qwen35SpecSemanticState::from_decode(self);
         let decision = match semantic.select_and_observe(qwen, &self.params, &mut logits) {
             Ok(decision) => decision,

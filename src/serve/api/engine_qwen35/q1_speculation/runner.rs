@@ -28,6 +28,7 @@ struct Prefixes {
 #[serde(deny_unknown_fields)]
 struct Packet {
     execution_approved: bool,
+    first_fork: Option<bool>,
     mode: Mode,
     acquisition: Binding,
     identity: Identity,
@@ -103,7 +104,9 @@ fn write(root: &Path, name: &str, value: &serde_json::Value) -> Result<()> {
 fn q1_qwen_actual_t5_speculation_phase() {
     run().unwrap();
 }
-fn run() -> Result<()> {
+fn run() -> Result<()> { run_inner(false) }
+pub(super) fn run_first_fork() -> Result<()> { run_inner(true) }
+fn run_inner(first_fork: bool) -> Result<()> {
     let mut raw = Vec::new();
     File::open(PathBuf::from(
         std::env::var_os("HF2Q_Q1_QWEN_T5_PACKET").context("explicit T5 packet")?,
@@ -113,8 +116,18 @@ fn run() -> Result<()> {
     anyhow::ensure!(raw.len() <= 1024 * 1024, "packet bound");
     let packet: Packet = serde_json::from_slice(&raw)?;
     anyhow::ensure!(packet.execution_approved, "root execution approval missing");
+    anyhow::ensure!(packet.first_fork == if first_fork {Some(true)} else {None},
+        "explicit first-fork packet/test pairing; no old-entrypoint relabeling");
+    if first_fork {
+        anyhow::ensure!(packet.mode != Mode::Preparation && packet.identity.family == Family::Qwen38 &&
+            packet.identity.token_vectors_sha256 == "aeaec06b8c893e4b2445f993a66a250ff3af0b595f54c749b1bd6790073eafbc",
+            "only retained generated Q38 full144 workload; no input reselection");
+    }
     output_preflight(&packet.output)?;
     let input = read_bound(&packet.input)?;
+    if first_fork { anyhow::ensure!(hash(&input) ==
+        "0a4af3ac5d6dacc843536004a5d92be1353e4dd4f0c45cca63d776a6cc92b82b",
+        "exact retained successful preparation file"); }
     let (prefixes, frozen, vocab) = if packet.mode == Mode::Preparation {
         let p: Prefixes = serde_json::from_slice(&input)?;
         anyhow::ensure!(p.family == packet.identity.family, "family mismatch");
@@ -176,7 +189,13 @@ fn run() -> Result<()> {
             mode_label,
         ),
     )?;
-    let (committed_bytes, raw_bytes, paired_bytes) = plan::paired_payload(&cfg, 262144)?;
+    let (committed_bytes, raw_bytes, paired_bytes) = if first_fork {
+        (payload(&super::first_fork::committed(&cfg)?)?, payload(&super::first_fork::raw(&cfg))?,
+            super::first_fork::payload_plan(&cfg,false)?.checked_add(
+                super::first_fork::payload_plan(&cfg,true)?).context("first-fork pair overflow")?)
+    } else {plan::paired_payload(&cfg, 262144)?};
+    if first_fork {anyhow::ensure!(paired_bytes<=1024*1024*1024,
+        "source first-fork pair exceeds1GiB before model/device load");}
     drop(header);
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let options = LoadOptions {
@@ -265,14 +284,16 @@ fn run() -> Result<()> {
     let committed = if packet.mode == Mode::Preparation {
         None
     } else {
-        Some(make("committed", plan::committed(&cfg, 262144)?)?)
+        Some(make("committed", if first_fork {super::first_fork::committed(&cfg)?}
+            else {plan::committed(&cfg, 262144)?})?)
     };
     let raw_store = if packet.mode == Mode::ForcedProposal {
-        Some(make("raw-verifier", plan::raw(&cfg))?)
+        Some(make("raw-verifier", if first_fork {super::first_fork::raw(&cfg)}
+            else {plan::raw(&cfg)})?)
     } else {
         None
     };
-    let _capture = install(Active::new(
+    let mut active = Active::new(
         packet.mode,
         cfg.clone(),
         prefixes.clone(),
@@ -280,22 +301,25 @@ fn run() -> Result<()> {
         model.eos_token_ids.clone(),
         committed,
         raw_store,
-    ))?;
+    );
+    if first_fork { active.first_fork=Some(super::first_fork::make(&cfg,
+        packet.mode==Mode::ForcedProposal,&make)?); }
+    let _capture = install(active)?;
     let mut zero_elements = Vec::new();
     let result = (|| -> Result<()> {
-        for lane in 0..4 {
-            zero_elements.push(super::trajectory::run_lane(
-                &mut model,
-                packet.mode,
-                &prefixes[lane],
-                lane,
-            )?);
+        for lane in 0..(if first_fork {1} else {4}) {
+            let count = if first_fork {
+                super::trajectory::run_lane_until(&mut model,packet.mode,&prefixes[lane],lane,131)?
+            } else {
+                super::trajectory::run_lane(&mut model,packet.mode,&prefixes[lane],lane)?
+            };
+            zero_elements.push(count);
         }
         Ok(())
     })();
     let mut active = finish()?;
     scope.check_unchanged()?;
-    let complete = validate_complete(&active);
+    let complete = if first_fork {super::first_fork::validate(&active)} else {validate_complete(&active)};
     let failed = result
         .as_ref()
         .err()
@@ -309,6 +333,8 @@ fn run() -> Result<()> {
             s.fail(error.clone());
         }
     }
+    let first_fork_traces = active.first_fork.take().map(|c|
+        super::first_fork::finish(c,failed.as_deref())).transpose()?;
     let committed_trace = active
         .committed
         .take()
@@ -321,10 +347,24 @@ fn run() -> Result<()> {
         .map(Store::finish)
         .transpose()
         .map_err(anyhow::Error::msg)?;
-    let descriptor = serde_json::json!({"schema":"hf2q.q1.qwen-t5-phase.v1","mode":packet.mode,"packet_sha256":hash(&raw),"input_sha256":hash(&input),"status":if failed.is_some(){"FailedOrIncomplete"}else if packet.mode==Mode::Preparation{"CompleteWorkloadPreparationNotComparable"}else{"CompleteScopedAcquisition"},"error":failed,"actual_transitions":active.transitions,"ordinary_input_positions":active.ordinary_rows,"canonical_decisions":active.selected,"semantic_zero_elements_checked":zero_elements,"committed_payload_plan":committed_bytes,"raw_payload_plan":raw_bytes,"paired_payload_plan":paired_bytes,"committed_records":committed_trace.as_ref().map(|t|t.coverage.captured.len()),"raw_records":raw_trace.as_ref().map(|t|t.coverage.captured.len()),"explicit_selector":"actual private MTP-K3 after real ordinary warmup, bypasses history preference only","forced_proposals":packet.mode==Mode::ForcedProposal,"ordinary_AUTO_selection_qualified":false,"proposal_quality_qualified":false,"speed_qualified":false,"whole_q1_qualified":false});
+    let mut descriptor = serde_json::json!({"schema":"hf2q.q1.qwen-t5-phase.v1","mode":packet.mode,"packet_sha256":hash(&raw),"input_sha256":hash(&input),"status":if failed.is_some(){"FailedOrIncomplete"}else if packet.mode==Mode::Preparation{"CompleteWorkloadPreparationNotComparable"}else{"CompleteScopedAcquisition"},"error":failed,"actual_transitions":active.transitions,"ordinary_input_positions":active.ordinary_rows,"canonical_decisions":active.selected,"semantic_zero_elements_checked":zero_elements,"committed_payload_plan":committed_bytes,"raw_payload_plan":raw_bytes,"paired_payload_plan":paired_bytes,"committed_records":committed_trace.as_ref().map(|t|t.coverage.captured.len()),"raw_records":raw_trace.as_ref().map(|t|t.coverage.captured.len()),"explicit_selector":"actual private MTP-K3 after real ordinary warmup, bypasses history preference only","forced_proposals":packet.mode==Mode::ForcedProposal,"ordinary_AUTO_selection_qualified":false,"proposal_quality_qualified":false,"speed_qualified":false,"whole_q1_qualified":false});
+    if first_fork {
+        descriptor["status"]=serde_json::json!(if failed.is_some() {"FailedOrIncomplete"}
+            else {"CompleteFirstForkDiagnosticNotQ1Qualified"});
+        descriptor["first_fork"]=serde_json::json!({"logical_lanes_executed":1,
+            "logical_lane":0,"physical_slots":1,"committed_input_positions":[128,129,130],
+            "cache_boundaries":[129,131],"capture_stores":first_fork_traces,
+            "case_payload_plan":super::first_fork::payload_plan(&cfg,packet.mode==Mode::ForcedProposal)?,
+            "initial129_exact_comparison_pending":true,"float_policy":"Unspecified",
+            "all4lane_execution":false,"rejected_tail_baseline_claim":false});
+    }
     write(&packet.output, "execution.json", &descriptor)?;
     if let Some(error) = failed {
         anyhow::bail!(error);
+    }
+    if first_fork {
+        println!("Q1_QWEN_T5_FIRST_FORK_COMPLETE mode={:?} logical_lanes=1 agent=0 cursor=131 float_policy=Unspecified whole_q1=false",packet.mode);
+        return Ok(());
     }
     if packet.mode == Mode::Preparation {
         let mut lanes = Vec::new();

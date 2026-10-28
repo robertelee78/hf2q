@@ -58,6 +58,7 @@ pub(super) struct Active {
     pub transitions: Vec<Transition>,
     pub ordinary_rows: [Vec<usize>; 4],
     pending_logits: Option<Vec<f32>>,
+    first_fork: Option<first_fork::Captures>,
     canonical: Vec<Decision>,
 }
 impl Active {
@@ -85,6 +86,7 @@ impl Active {
             transitions: Vec::new(),
             ordinary_rows: std::array::from_fn(|_| Vec::new()),
             pending_logits: None,
+            first_fork: None,
             canonical: Vec::new(),
         }
     }
@@ -320,20 +322,25 @@ pub(super) fn verified_buffers(
                 && hidden.element_count() == 4 * a.cfg.hidden_size as usize,
             "raw verifier extent/scalar"
         );
+        first_fork::post_catchup(a, position, values, hidden)?;
+        let captured_rows = if a.first_fork.is_some() { 2 } else { 4 };
         let raw = a.raw.as_mut().context("raw store")?;
         for (stage, buffer, shape) in [
             (
                 Stage::SpecVerifierLogits,
                 values,
-                vec![4, a.cfg.vocab_size as usize],
+                vec![captured_rows, a.cfg.vocab_size as usize],
             ),
             (
                 Stage::SpecVerifierHidden,
                 hidden,
-                vec![4, a.cfg.hidden_size as usize],
+                vec![captured_rows, a.cfg.hidden_size as usize],
             ),
         ] {
-            let view = buffer.with_shape(shape.clone())?;
+            let elements = shape.iter().product();
+            let view = if a.first_fork.is_some() {
+                buffer.slice_view(0, elements).with_shape(shape.clone())?
+            } else { buffer.with_shape(shape.clone())? };
             capture::after_checked_drain(
                 raw,
                 plan::at(a.lane, 129, a.cfg.num_hidden_layers, stage),
@@ -455,3 +462,6 @@ fn accepted_rejected_transition(
         && cursor == 131
         && canonical == 2
 }
+
+#[path = "q1_speculation/first_fork.rs"]
+pub(super) mod first_fork;
