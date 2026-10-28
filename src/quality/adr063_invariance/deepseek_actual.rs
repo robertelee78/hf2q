@@ -22,12 +22,12 @@ fn boundaries(t:Trajectory)->Vec<(usize,bool)> {
     if matches!(t,Trajectory::T1Resume64|Trajectory::T3Chunk64){out.push((64,false));}
     if t==Trajectory::T1Resume64{out.push((64,true));}out
 }
-fn recipe(cfg:&Deepseek4Config)->super::acquisition::ConfigRecipe<'static> {
+pub(super) fn recipe(cfg:&Deepseek4Config)->super::acquisition::ConfigRecipe<'static> {
     super::acquisition::ConfigRecipe {family:Family::Deepseek4,capacity:262144,slots:4,output_allowance:8192,
         cache_mode:"DeepseekNative-BF16-ring/compressed-F32state",route:"deepseek-ordinary-fullcache-endpoints-v1",
         actual_model_config_sha256:hash(format!("{cfg:?}").as_bytes())}
 }
-fn expected(cfg:&Deepseek4Config,t:Trajectory)->Result<Vec<ExpectedTensor>> {
+pub(super) fn expected(cfg:&Deepseek4Config,t:Trajectory)->Result<Vec<ExpectedTensor>> {
     let mut out=cache_capture::expected(cfg,262144,&boundaries(t)).map_err(anyhow::Error::msg)?;
     for position in 0..144 {for lane in 0..4 {for (stage,shape) in [
         (Stage::LayerOutput,vec![1,cfg.hyper_connection_count as usize,cfg.hidden_size as usize]),
@@ -36,7 +36,7 @@ fn expected(cfg:&Deepseek4Config,t:Trajectory)->Result<Vec<ExpectedTensor>> {
     }}}
     Ok(out)
 }
-fn payload(expected:&[ExpectedTensor])->Result<u64> {
+pub(super) fn payload(expected:&[ExpectedTensor])->Result<u64> {
     expected.iter().try_fold(0u64,|sum,e|e.shape.iter().try_fold(e.scalar.bytes() as u64,
         |n,&d|n.checked_mul(d as u64)).and_then(|n|sum.checked_add(n))).context("DS payload overflow")
 }
