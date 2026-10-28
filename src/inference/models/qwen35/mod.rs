@@ -1058,3 +1058,6 @@ mod tests {
 pub(crate) mod admission;
 
 pub(crate) mod tensor_admission;
+
+#[cfg(test)]
+pub(crate) mod q1_target_layer_capture;

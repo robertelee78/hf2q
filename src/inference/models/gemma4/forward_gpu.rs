@@ -1121,6 +1121,20 @@ impl MlxModelWeights {
         // encode_parallel_layers_chunked for the parallel symmetry: there
         // we wait unconditionally, here we restore unconditionally.
         parallel_block_result?;
+        #[cfg(test)]
+        {
+            use crate::adr063_invariance::{family, receipt::{Family, Stage}};
+            family::drained(Family::Gemma4, seq_pos as u64, num_layers as u32,
+                Stage::LayerOutput, &self.activations.hidden,
+                "Gemma actual body/head session terminal finish checked")
+                .map_err(anyhow::Error::msg)?;
+            if !capture_hidden {
+                family::drained(Family::Gemma4, seq_pos as u64, num_layers as u32,
+                    Stage::Logits, &self.activations.logits,
+                    "Gemma actual head session terminal finish checked")
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
 
         // ADR-040 S1c: in body-capture mode the head was skipped inside the IIFE
         // above; the final hidden is live in `self.activations.hidden`. Return a
