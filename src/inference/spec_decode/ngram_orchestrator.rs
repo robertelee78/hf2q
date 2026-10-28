@@ -181,10 +181,14 @@ pub fn dispatch_ngram_generate(
     let max_decode_for_alloc = max_new_tokens;
 
     // ── Initial prompt prefill ─────────────────────────────────────
+    #[cfg(test)]
+    crate::adr063_invariance::gemma_ngram::routing_before_initial()?;
     let first_token = target
         .forward_prefill_batched(prompt_tokens, max_decode_for_alloc, 0, gpu)
         .map_err(|e| anyhow!("ngram: initial prefill: {e}"))?;
 
+    #[cfg(test)]
+    crate::adr063_invariance::gemma_ngram::initial(target,prompt_tokens,first_token)?;
     let mut output: Vec<u32> = prompt_tokens.to_vec();
     output.push(first_token);
 
@@ -225,6 +229,8 @@ pub fn dispatch_ngram_generate(
             None
         };
         let drafts = ngram_propose(&output, &cfg);
+        #[cfg(test)]
+        let drafts = crate::adr063_invariance::gemma_ngram::proposal(&output,&drafts,k)?.unwrap_or(drafts);
         if let Some(t) = t_propose {
             total_propose_ms += t.elapsed().as_secs_f64() * 1000.0;
         }
@@ -292,6 +298,8 @@ pub fn dispatch_ngram_generate(
         } else {
             None
         };
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_ngram::before_verify(&verify_prefix,start_pos)?;
         target
             .forward_prefill_batched(&verify_prefix, xlen_max_decode, start_pos, gpu)
             .map_err(|e| anyhow!("ngram: verify forward: {e}"))?;
@@ -299,6 +307,8 @@ pub fn dispatch_ngram_generate(
             total_verify_ms += t.elapsed().as_secs_f64() * 1000.0;
         }
 
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_ngram::after_verify(target)?;
         let captured = target
             .take_dflash_capture()
             .ok_or_else(|| anyhow!("ngram: verify capture vanished"))?;
@@ -349,6 +359,8 @@ pub fn dispatch_ngram_generate(
 
         // 4. Accept-prefix.
         let (accept_count, fallback) = accept_prefix_argmax(&drafts, &argmaxes);
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_ngram::decision(&drafts,&argmaxes,accept_count,fallback)?;
 
         // 5. Commit accepted drafts + fallback token.
         let drafts_len = drafts.len();
@@ -371,6 +383,8 @@ pub fn dispatch_ngram_generate(
             target.rollback_kv(n_rejected);
         }
 
+        #[cfg(test)]
+        if crate::adr063_invariance::gemma_ngram::after_rollback(target,&output,n_rejected)? {break;}
         if let Some(t) = t_round {
             total_round_ms += t.elapsed().as_secs_f64() * 1000.0;
         }

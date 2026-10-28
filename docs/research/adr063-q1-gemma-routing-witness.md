@@ -1,0 +1,11 @@
+# Gemma actual routing witness: prospective source component
+
+This explicit cfg(test) opt-in drives the same scalar or packed routing producer whose selected IDs and scaled weights feed the experts. The inactive path retains the original native entrypoint. It requires the verified published native 0.15.11 API and exact registry pin; this source handoff changes no dependency and is build-pending.
+
+The diagnostic records actual returned kernel/variant, softmax selection-domain kth/next scores and IDs before top-K renormalization and per-expert scaling, and stable copies of the actual selected IDs/final weights. Same-encoder copies precede scratch overwrite. CPU inspection occurs only after the existing successful checked production return, with no added submission or wait. A packed source descriptor does not turn separate scalar routing dispatches into physical B4.
+
+The pre-load bank admits 33,120 layer/row entries (four times initial128 + verifier132 + at most16 continuation, times30 layers): 2,782,080 actual GPU parent bytes, 64 MiB serialized metadata and 16 MiB CPU ledger allowance. Ordinary, unpublished cancellation, initial, verifier and continuation namespaces remain distinct. Explicit position/slot maps refuse duplicate, missing, ambiguous or out-of-range lineage. In-flight failures retain the owner until the fresh supervised process exits. Native Invalid/N/A and raw bit patterns are retained before refusal; no CPU softmax, decoded policy, guessed margin or tolerance is introduced.
+
+The bank shares the actual runtime acquisition and model/device/queue identities. Original trace and transaction/cancellation journals remain authoritative for input lineage. Coverage refusal and native capability are separate from numeric policy: Unspecified remains inconclusive. This source is not actual model parity, a complete Q1 matrix, performance evidence or physical admission. Native fixtures and all new host controls still require root-serialized validation after publication/pin and independent source review.
+
+Composition is main d0101e00 plus Q1/T5 249f76e9 and the separately accepted a1b22ffb norm-layout repair. Only new focused witness modules were formatted. No build, test, model, header, weight or runtime execution was performed by this author.

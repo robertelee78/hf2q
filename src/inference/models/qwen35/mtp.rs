@@ -209,6 +209,7 @@ impl MtpWeights {
             device,
             registry,
             &mut output,
+            #[cfg(test)] None,
         )
         .context("MTP dedicated native embedding gather")?;
         Ok(output)
