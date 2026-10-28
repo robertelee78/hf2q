@@ -2,10 +2,12 @@
 use serde::{Deserialize, Serialize};
 pub(super) const LEGACY_LIMIT: u64 = 256 * 1024 * 1024;
 pub(super) const NATIVE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+pub(super) const NATIVE_V3_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Profile {
     NativeCommandCaptureV2,
+    NativeCommandCaptureV3,
 }
 pub(super) fn deserialize_optional<'de, D: serde::Deserializer<'de>>(
     d: D,
@@ -13,6 +15,7 @@ pub(super) fn deserialize_optional<'de, D: serde::Deserializer<'de>>(
     let name = String::deserialize(d)?;
     match name.as_str() {
         "native_command_capture_v2" => Ok(Some(Profile::NativeCommandCaptureV2)),
+        "native_command_capture_v3" => Ok(Some(Profile::NativeCommandCaptureV3)),
         _ => Err(serde::de::Error::custom(
             "unsupported metadata budget profile",
         )),
@@ -27,9 +30,18 @@ pub(super) fn limit(
         Some(Profile::NativeCommandCaptureV2) if native_diagnostic == Some(true) => {
             Ok(NATIVE_LIMIT)
         }
+        Some(Profile::NativeCommandCaptureV3) if native_diagnostic == Some(true) => {
+            Ok(NATIVE_V3_LIMIT)
+        }
         Some(_) => Err(
             "native metadata budget profile requires an explicit native diagnostic observer".into(),
         ),
+    }
+}
+pub(super) fn event_limit(profile: Option<Profile>) -> u64 {
+    match profile {
+        Some(Profile::NativeCommandCaptureV3) => 16_000_000,
+        _ => 1_000_000,
     }
 }
 #[cfg(test)]
@@ -126,8 +138,45 @@ mod tests {
         }
     }
     #[test]
+    fn metadata_budget_v3_serialized_and_event_boundaries_are_explicit() {
+        for (profile, total, events) in [
+            (None, LEGACY_LIMIT, 1_000_000),
+            (
+                Some(Profile::NativeCommandCaptureV2),
+                NATIVE_LIMIT,
+                1_000_000,
+            ),
+            (
+                Some(Profile::NativeCommandCaptureV3),
+                NATIVE_V3_LIMIT,
+                16_000_000,
+            ),
+        ] {
+            let mut c = config(profile, true);
+            c.server_budget_bytes = total - c.client_budget_bytes;
+            c.native_observer.as_mut().unwrap().event_limit = events;
+            assert!(validate_config(&c).is_ok());
+            c.native_observer.as_mut().unwrap().event_limit += 1;
+            assert!(validate_config(&c).is_err());
+            c.native_observer.as_mut().unwrap().event_limit = events;
+            c.server_budget_bytes += 1;
+            assert!(validate_config(&c).is_err());
+            assert!(!c.output.exists());
+        }
+        let mut c = config(Some(Profile::NativeCommandCaptureV3), true);
+        c.native_observer.as_mut().unwrap().metadata_limit_bytes = 16 * 1024 * 1024;
+        assert!(validate_config(&c).is_ok());
+        c.native_observer.as_mut().unwrap().metadata_limit_bytes += 1;
+        assert!(validate_config(&c).is_err());
+        assert!(validate_config(&config(Some(Profile::NativeCommandCaptureV3), false)).is_err());
+        assert_eq!(
+            serde_json::to_value(Profile::NativeCommandCaptureV3).unwrap(),
+            json!("native_command_capture_v3")
+        );
+    }
+    #[test]
     fn metadata_budget_writer_checked_arithmetic_refuses_past_each_bound() {
-        for cap in [LEGACY_LIMIT, NATIVE_LIMIT] {
+        for cap in [LEGACY_LIMIT, NATIVE_LIMIT, NATIVE_V3_LIMIT] {
             assert_eq!(super::super::checked_charge(cap - 1, 0, cap), Some(cap));
             assert_eq!(super::super::checked_charge(cap, 0, cap), None);
         }
