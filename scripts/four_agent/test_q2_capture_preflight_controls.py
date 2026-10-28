@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from q2_capture_packet import validate_capture_approval
-from q2_capture_preflight import quiet_inventory, standalone_capture_argv, default_resolution
+from q2_capture_preflight import quiet_inventory, standalone_capture_argv, default_resolution, exact_client_version
 from q2_certify import BoundReader
 from qwen38_n1_verdict import Invalid
 from test_q2_capture_packet_controls import positive
@@ -42,6 +42,12 @@ class CapturePreflightControls(unittest.TestCase):
         self.assertEqual(standalone_capture_argv(argv, argv[0], argv[2], argv[3]), argv)
         for bad in (argv[:5] + argv[6:], argv[:4] + ["serve", "--service"]):
             with self.assertRaises(Invalid): standalone_capture_argv(bad, argv[0], argv[2], argv[3])
+    def test_actual_version_prefix_is_exact_not_a_wildcard(self):
+        for value in (b"2.1.1\n", b"opencode v2.1.1\n"):
+            self.assertEqual(exact_client_version(value, "2.1.1"), "2.1.1")
+        for value in (b"2.1.2\n", b"opencode v2.1.1-dev\n", b"prefix2.1.1suffix", b""):
+            with self.assertRaises(Invalid): exact_client_version(value, "2.1.1")
+        with self.assertRaises(Invalid): exact_client_version(b"2.1.2", "2.1.2")
     def recipe(self, source):
         return {"schema": "hf2q.q2.hf-default-resolution-recipe.v1", "family": "qwen38",
                 "server_source": "a" * 40, "source_files": {str(source): hashlib.sha256(source.read_bytes()).hexdigest()},

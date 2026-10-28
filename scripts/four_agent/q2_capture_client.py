@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from q2_certify import BoundReader, digest
 from q2_capture_packet import validate_capture_approval
-from q2_capture_preflight import quiet_inventory, default_resolution, standalone_capture_argv
+from q2_capture_preflight import quiet_inventory, default_resolution, standalone_capture_argv, exact_client_version
 from q2_client_profile import (FAMILIES, capture_profile, encoded, projected_config,
                                validate_capture_request)
 from qwen38_n1_verdict import loads, require
@@ -223,8 +223,8 @@ def main():
             thread = threading.Thread(target=server.serve_forever); thread.start()
             try:
                 version, _ = child([str(sandbox), "-f", str(sb), str(binary), "--version"], root, env, root / "version", 10)
-                require(version.decode().strip() == approval["expected_version"] and not state["all"] and not state["errors"],
-                        "actual client binary/version or unexpected version HTTP")
+                normalized_version = exact_client_version(version, approval["expected_version"])
+                require(not state["all"] and not state["errors"], "unexpected version HTTP")
                 require(not INTERRUPTED, "interrupted immediately before capture child")
                 capture_argv = [str(sandbox), "-f", str(sb), str(binary), "run", "--standalone", "--format", "json",
                     "--model", "hf2q/" + cfg["model_id"], "Diagnostic only: follow the provided read tool calls and then acknowledge completion. Do not call other tools."]
@@ -234,7 +234,7 @@ def main():
                 save(root / "capture-state.json", {k: v for k, v in state.items() if k not in {"lock", "root", "fixture"}})
             require(not thread.is_alive() and not state["errors"], "stub error or thread cleanup unknown")
             profile = capture_profile(state["phases"], cfg["model_id"])
-            profile.update(projection=projection, client_version=version.decode().strip(), client_binary=approval["client_binary"],
+            profile.update(projection=projection, client_version=normalized_version, client_binary=approval["client_binary"],
                            artifact_sha256=cfg["artifact_sha256"], effective_hf_defaults=cfg["effective_hf_defaults"],
                            effective_hf_defaults_value=defaults, default_resolution_disposition=default_disposition,
                            effective_sampling_qualified=False, cleanup=receipt["cleanup"])

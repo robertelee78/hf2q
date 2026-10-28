@@ -63,3 +63,10 @@ def default_resolution(value, family, reader):
             "recipe is rules-only, never fabricated resolved sampling")
     return {"kind": "source_default_resolution_recipe_only", "effective_sampling_qualified": False,
             "status": "PendingActualServerJoin"}
+
+
+def exact_client_version(raw, expected):
+    require(type(raw) is bytes and expected == "2.1.1", "bound native client version")
+    text = raw.decode("utf8", "strict").strip()
+    require(text in {expected, "opencode v" + expected}, "actual native client version changed")
+    return expected
