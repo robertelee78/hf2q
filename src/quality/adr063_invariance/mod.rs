@@ -30,3 +30,5 @@ mod tests;
 
 #[cfg(test)]
 mod continuation_artifact_compare;
+#[cfg(test)]
+mod t5_artifact_compare;
