@@ -27,6 +27,7 @@ fn catalogue_is_exactly_four_families_times_nine_without_false_unsupported() {
     }
     assert_eq!(cells.iter().filter(|c| c.adapter == Adapter::SourceRefusal).count(), 2);
     assert_eq!(cell(Family::Deepseek4, Trajectory::T5GenuineSpeculation).adapter, Adapter::Missing);
+    assert_eq!(cell(Family::Deepseek4, Trajectory::T6CancelRestore).adapter, Adapter::Missing);
     assert_eq!(cells.iter().filter(|c| c.family==Family::Gemma4 && c.adapter==Adapter::GemmaOrdinary).count(),6);
     assert_eq!(cell(Family::Gemma4,Trajectory::T2ActualCohort).adapter,Adapter::GemmaPackedCohort);
     assert_eq!(cell(Family::Gemma4,Trajectory::T6CancelRestore).adapter,Adapter::GemmaOwningWorkerRecovery);

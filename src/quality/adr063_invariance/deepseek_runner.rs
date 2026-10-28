@@ -21,6 +21,10 @@ fn require_deliberate_rejection<T>(result: Result<T>, gate_reached: bool) -> Res
     }
 }
 
+pub enum Observation<'a> {
+    Forward {lane:usize,end:usize,state:&'a MlxBuffer,logits:&'a MlxBuffer,cache:&'a Deepseek4Cache},
+    Restored64 {lane:usize,cache:&'a Deepseek4Cache},
+}
 /// Existing actual APIs only. Callback runs after their checked GPU drain and
 /// successful cursor publication, before any subsequent transaction can write.
 /// A caller must not run the per-layer localizer concurrently with this route.
@@ -29,7 +33,7 @@ pub fn run(
     work: &Workload,
     trajectory: Trajectory,
     capacity: usize,
-    mut observe: impl FnMut(usize, usize, &MlxBuffer, &MlxBuffer, &Deepseek4Cache) -> Result<()>,
+    mut observe: impl FnMut(Observation<'_>) -> Result<()>,
 ) -> Result<ExecutionEvidence> {
     work.validate().map_err(anyhow::Error::msg)?;
     ensure!(
@@ -166,11 +170,13 @@ pub fn run(
                             false,
                         );
                         evidence.cancelled_at = Some(64);
-                    } else {
-                        *cache = model.allocate_cache(capacity)?;
                     }
+                    // Snapshot deliberately omits append-only compressed/indexer
+                    // rows. Restore requires this same backing owner, not a new
+                    // cache with missing prefix rows.
                     cache.restore(&checkpoint)?;
                     ensure!(cache.position() == 64, "actual restore cursor");
+                    observe(Observation::Restored64 {lane,cache})?;
                     evidence.restored_at = Some(64);
                 }
                 let before = cache.position();
@@ -202,12 +208,12 @@ fn observe_state(
     position: usize,
     state: &MlxBuffer,
     cache: &Deepseek4Cache,
-    observe: &mut impl FnMut(usize, usize, &MlxBuffer, &MlxBuffer, &Deepseek4Cache) -> Result<()>,
+    observe: &mut impl FnMut(Observation<'_>) -> Result<()>,
 ) -> Result<()> {
     // Existing full-row native head. No argmax/sampling changes or last-row
     // shortcut: every state row returned by this actual transaction is scored.
     let logits = model.forward_logits(state)?;
-    observe(lane, position, state, &logits, cache)
+    observe(Observation::Forward {lane,end:position,state,logits:&logits,cache})
 }
 
 #[cfg(test)]
