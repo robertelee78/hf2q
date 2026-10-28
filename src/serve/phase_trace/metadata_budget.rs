@@ -79,6 +79,7 @@ mod tests {
             server_budget_bytes: 128 * 1024 * 1024,
             client_budget_bytes: 128 * 1024 * 1024,
             metadata_budget_profile: profile,
+            forward_demand_policy: None,
             native_observer: native_enabled.then(|| native::Config {
                 event_limit: 1000,
                 metadata_limit_bytes: 1024 * 1024,
@@ -95,6 +96,20 @@ mod tests {
             identity,
         }
     }
+    #[test]
+    fn queued_demand_actual_config_gate_is_diagnostic_qwen_only() {
+        let mut c = config(None, true);
+        c.forward_demand_policy = Some(serde_json::from_value(serde_json::json!({
+            "population_policy":"queued_forward_demand_v3","qwen_prefill_chunk_tokens":128
+        })).unwrap());
+        assert!(validate_config(&c).is_ok());
+        c.native_observer.as_mut().unwrap().witness_manifest.input_sources =
+            vec!["gemma4.scalar_forward".into()];
+        assert!(validate_config(&c).unwrap_err().contains("Qwen"));
+        c.native_observer = None;
+        assert!(validate_config(&c).unwrap_err().contains("diagnostic"));
+    }
+
     #[test]
     fn metadata_budget_legacy_exact_boundary_is_unchanged() {
         let mut c = config(None, false);

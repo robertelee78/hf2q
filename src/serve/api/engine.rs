@@ -18392,8 +18392,16 @@ fn run_slot_aware_qwen35(
         return;
     }
     let n_slots = guard.kv.as_ref().expect("kv Some at entry").n_seqs as usize;
-    let prefill_chunk_tokens = qwen35_slot_prefill_chunk_tokens(n_slots);
+    let prefill_chunk_tokens = match crate::serve::phase_trace::qwen_prefill_quantum(
+        qwen35_slot_prefill_chunk_tokens(n_slots)) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            drain_with_startup_error(rx, &format!("Qwen diagnostic quantum: {error}"));
+            return;
+        }
+    };
     scheduler.set_prefill_chunk_tokens(prefill_chunk_tokens);
+    crate::serve::phase_trace::qwen_quantum_installed(prefill_chunk_tokens);
     tracing::info!(
         n_slots,
         prefill_chunk_tokens,

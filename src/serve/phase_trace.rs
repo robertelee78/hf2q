@@ -1,4 +1,5 @@
-//! ADR-063 F2 bounded metadata observation. Never drives scheduling or admission.
+//! ADR-063 F2 bounded metadata observation. Default observation never schedules.
+//! An explicit diagnostic-only demand config selects its pre-admission quantum.
 //! Unknown execution/readiness is explicit and cannot qualify a measured mix.
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -10,6 +11,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 mod metadata_budget;
+mod demand;
 mod native;
 
 pub(crate) const SCHEMA: &str = "hf2q.f2.phase-trace.v1";
@@ -27,6 +29,8 @@ struct Config {
     metadata_budget_profile: Option<metadata_budget::Profile>,
     #[serde(default)]
     native_observer: Option<native::Config>,
+    #[serde(default, deserialize_with = "demand::deserialize_optional")]
+    forward_demand_policy: Option<demand::Config>,
     #[serde(deserialize_with = "unique_identity")]
     identity: BTreeMap<String, String>,
 }
@@ -104,6 +108,7 @@ struct Recorder {
     invalid: Option<String>,
     config_sha256: String,
     native_config: Option<native::Config>,
+    demand_config: Option<demand::Config>,
 }
 
 fn checked_charge(bytes: u64, length: usize, budget: u64) -> Option<u64> {
@@ -157,6 +162,13 @@ enum Trace {
 static TRACE: OnceLock<Trace> = OnceLock::new();
 
 fn validate_config(c: &Config) -> Result<(), String> {
+    if let Some(policy) = &c.forward_demand_policy {
+        policy.validate(c.native_observer.as_ref().map(|n| n.diagnostic_case))?;
+        if !c.native_observer.as_ref().is_some_and(|n| n.witness_manifest.input_sources.iter()
+            .all(|source| matches!(source.as_str(), "qwen35.forward.actual_tokens" | "qwen35.greedy.actual_tokens"))) {
+            return Err("queued-demand diagnostic requires Qwen actual-input witnesses".into());
+        }
+    }
     let total_limit = metadata_budget::limit(
         c.metadata_budget_profile,
         c.native_observer
@@ -292,11 +304,15 @@ fn initialize() -> Trace {
             invalid: None,
             config_sha256: hex::encode(Sha256::digest(&bytes)),
             native_config: c.native_observer.clone(),
+            demand_config: c.forward_demand_policy.clone(),
         };
         let mut header = json!({"identity":c.identity,"run_id":c.run_id,
             "server_budget_bytes":c.server_budget_bytes,"client_budget_bytes":c.client_budget_bytes,
             "clock":"CLOCK_MONOTONIC nanoseconds since origin","clock_id":"CLOCK_MONOTONIC","origin_monotonic_ns":recorder.origin_ns,
             "config_sha256":recorder.config_sha256});
+        if let Some(policy) = c.forward_demand_policy {
+            header["forward_demand_policy"] = json!(policy);
+        }
         if let Some(profile) = c.metadata_budget_profile {
             header["metadata_budget_profile"] = json!(profile);
         }
@@ -376,7 +392,59 @@ pub(crate) fn scheduler(states: Vec<SlotState>, cause: &'static str) {
         return;
     }
     crate::inference::native_observation::update_owners(&states);
-    publish("slots", json!({"cause":cause,"slots":states}));
+    publish_slot_states(states, cause, &[]);
+}
+
+/// Diagnostic selection happens before admission. No opt-in means no scheduler change.
+pub(crate) fn qwen_prefill_quantum(default: u32) -> Result<u32, String> {
+    let selected = match TRACE.get_or_init(initialize) {
+        Trace::Disabled => return Ok(default),
+        Trace::Invalid(error) => return Err(error.clone()),
+        Trace::Active(lock) => lock.lock().map_err(|_| "trace lock poisoned")?
+            .demand_config.clone(),
+    };
+    if let Some(policy) = selected {
+        Ok(policy.qwen_prefill_chunk_tokens)
+    } else {
+        Ok(default)
+    }
+}
+
+/// Called only AFTER the owning Qwen worker installs its actual setter.
+pub(crate) fn qwen_quantum_installed(tokens: u32) {
+    let selected = match TRACE.get() {
+        Some(Trace::Active(lock)) => lock.lock().ok().and_then(|r| r.demand_config.clone()),
+        _ => None,
+    };
+    if let Some(policy) = selected {
+        if tokens != policy.qwen_prefill_chunk_tokens {
+            invalidate("diagnostic quantum installation mismatch");
+            return;
+        }
+        publish("diagnostic_quantum", json!({"family":"qwen35",
+            "population_policy":policy.population_policy,
+            "qwen_prefill_chunk_tokens":tokens,"installed_before_admission":true}));
+    }
+}
+
+pub(crate) fn transaction_states(states: Vec<SlotState>, selected: &[crate::serve::scheduler::SlotHandle]) {
+    if states.len() > 256 {
+        invalidate("slot metadata bound exceeded");
+        return;
+    }
+    crate::inference::native_observation::update_owners(&states);
+    publish_slot_states(states, "owning_worker_enter_transaction", selected);
+}
+
+fn publish_slot_states(states: Vec<SlotState>, cause: &'static str,
+    selected: &[crate::serve::scheduler::SlotHandle]) {
+    let enabled = match TRACE.get() {
+        Some(Trace::Active(lock)) => lock.lock().ok().is_some_and(|r| r.demand_config.is_some()),
+        _ => false,
+    };
+    let slots = if enabled { demand::enrich(&states, cause, selected) }
+        else { json!(states) };
+    publish("slots", json!({"cause":cause,"slots":slots}));
 }
 
 /// One owned worker must finalize the metadata stream. An unhealthy/panicking
@@ -452,6 +520,7 @@ mod tests {
             server_budget_bytes: u64::MAX,
             client_budget_bytes: 128 * 1024 * 1024,
             metadata_budget_profile: None,
+            forward_demand_policy: None,
             native_observer: None,
             identity: BTreeMap::new(),
         };
@@ -495,6 +564,7 @@ mod tests {
             invalid: None,
             config_sha256: "0".repeat(64),
             native_config: None,
+            demand_config: None,
         };
         r.append(
             "progress",

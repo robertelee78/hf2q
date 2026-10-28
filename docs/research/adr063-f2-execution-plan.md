@@ -206,3 +206,44 @@ Rust config validation and the strict Python artifact entrypoint must reject unk
 
 
 Prospective native full-capture capacity follows ADR063's closed `native_command_capture_v3`:8GiB combined serialized ceiling and16,000,000 historical native events, explicit diagnostic only, published native0.15.9+exactpin/cleanbuild prerequisite. Legacy256MiB/1million and v2 2GiB/1million remain unchanged. Live16MiB/bookkeeping1MiB/pending1024/capture4096/client128MiB minima and zero-loss/checked/footer rules are unchanged. The actual0158 Qwen3.8 million-cap failure (2,524,480dropped) is retained and cannot be rescored. Declare and charge actual finite I/O plus guarded post-unload parser ownership; no fitted capacity, physical admission, workload reduction, primary performance or all-family completion is implied.
+
+## Prospective queued-demand/128 diagnostic (not a rescore)
+
+The complete native0.15.9 capture `061436Z` passed whole-trace validation but
+failed its first fixed window: input-ready population existed at3.606370s;
+slot0's720-row transaction held the worker for about1.85s, slot1 followed,
+and slots2/3 were first serviced after the2s window. Forty-three microseconds
+of ready coverage and no slots2/3 witnesses remain an Unqualified result.
+
+A NEW closed `forward_demand_policy` config binds
+`population_policy="queued_forward_demand_v3"` and
+`qwen_prefill_chunk_tokens=128`. It requires an explicit native diagnostic;
+absence preserves production Qwen multi-slot2048/single-slot4096 quanta and
+all `ready_now_v1`/`forward_demand_v2` semantics. The actual owning Qwen worker
+installs the existing scheduler setter before any admission and records its
+acknowledgement. Config bytes/hash and the header/independent expectation
+bind both selections. No environment fallback, dynamic tuning, other-family
+adapter or production-default promotion is implied.
+
+The new population counts actual input-ready queued demand and selected
+forward-pending demand, including waiting for the owning executor. It reports
+executor availability separately and preserves runnable=false while the worker
+is borrowed. Selected transaction owners are distinct from waiting slots;
+output-only, terminal/cancelled/stale and Unknown facts do not gain demand.
+Host pending work is never GPU Running, physical B4 or whole-forward evidence.
+A narrow RMS operator witness remains narrow. Existing policies do not acquire
+these new meanings. The FIRST qualifying target demand instant still opens the
+fixed2s window ending within30s; >=80% coverage, new progress and actual native
+forward witness for EVERY owner, and eventual healthy exact checked drains
+remain mandatory. Queued demand alone is not progress.
+
+The prospective128 case uses the SAME full canonical4-client28HTTP/24-tool
+workload, full context/output allowances and sampling. No later-window search,
+reduced prompt, prewarmed slots, dropped record, quota expansion or old-case
+rescore. Existing v3 finite byte/event/live limits and operating guards remain.
+Four720-token actual scheduler controls cover128 callbacks, round-robin yields,
+final80 tail, Mixed decode membership and stale generations; no synthetic
+elapsed-time control proves the2s target. Smaller chunking can change arithmetic
+routes/cache history: real coding/prefix and numerical trajectory review must
+precede any quality/performance acceptance. One fresh diagnostic may still fail;
+128 is a frozen experiment, not a measured latency guarantee or primary result.
