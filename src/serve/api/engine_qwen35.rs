@@ -4388,6 +4388,10 @@ impl Qwen35PrefillState {
         })
     }
 
+    pub(crate) fn f2_forward_ready(&self) -> bool {
+        self.next_token_index < self.prompt_tokens.len()
+    }
+
     pub(crate) fn operator_progress(&self) -> (usize, usize, f64) {
         let completed = self.next_token_index.saturating_sub(self.cached_tokens);
         let work = self.prompt_tokens.len().saturating_sub(self.cached_tokens);
@@ -4399,6 +4403,14 @@ impl Qwen35PrefillState {
                 .max(f64::EPSILON);
         (completed, work, rate)
     }
+}
+
+/// Branch predicate used by the metadata accessor and source-only controls.
+/// The actual decode_tick first checks the output limit, then its pending queue.
+pub(super) fn f2_qwen_decode_buffer_state(step: usize, max_tokens: usize,
+    pending_tokens: usize) -> (bool, bool) {
+    let live = step < max_tokens;
+    (live && pending_tokens == 0,live && pending_tokens != 0)
 }
 
 /// Hoisted per-slot decode state for a Qwen35 SlotAware request — the
@@ -5101,6 +5113,13 @@ impl Qwen35DecodeState {
         self.finish_reason != "length"
     }
 
+    /// Same branch order as decode_tick: pending verified outputs require no
+    /// forward. The second fact is pending token data, NOT semantic readiness.
+    pub(crate) fn f2_work_readiness(&self) -> (bool, bool) {
+        f2_qwen_decode_buffer_state(self.step,self.max_tokens,
+            self.pending_speculation_output.len())
+    }
+
     /// The decoded first-token text to stream when the slot finishes at
     /// seed. On first-token EOS this is empty (the serial ref pops + clears
     /// decoded_text); on a stop-string hit it is the stop-stripped prefix.
@@ -5458,12 +5477,15 @@ impl Qwen35DecodeState {
                 return Err(error.context("Qwen history verifier admission"));
             }
         };
-        let verified = qwen.model.forward_gpu_with_nextn_hidden_buffer(
-            &verify_input,
-            &verify_positions,
-            kv_cache,
-            self.slot_id,
-        );
+        let verified = {
+            let _native_role = crate::inference::native_observation::target_verify();
+            qwen.model.forward_gpu_with_nextn_hidden_buffer(
+                &verify_input,
+                &verify_positions,
+                kv_cache,
+                self.slot_id,
+            )
+        };
         let supervision = lease.finish();
         let (mut verify_logits, verify_hidden) = match (supervision, verified) {
             (Ok(()), Ok(value)) => value,
@@ -5805,12 +5827,15 @@ impl Qwen35DecodeState {
             }
         };
         let verify_started = Instant::now();
-        let verified = qwen.model.forward_gpu_with_nextn_hidden_buffer(
-            &verify_input,
-            &verify_positions,
-            kv_cache,
-            self.slot_id,
-        );
+        let verified = {
+            let _native_role = crate::inference::native_observation::target_verify();
+            qwen.model.forward_gpu_with_nextn_hidden_buffer(
+                &verify_input,
+                &verify_positions,
+                kv_cache,
+                self.slot_id,
+            )
+        };
         let verify_supervision = verify_lease.finish();
         let (mut verify_logits, verify_hidden) = match (verify_supervision, verified) {
             (Ok(()), Ok(value)) => value,

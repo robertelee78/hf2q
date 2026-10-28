@@ -165,8 +165,8 @@ impl<'sess> LayerEncoder<'sess> {
             Some(sess) => Ok(LayerEncoder::Sessioned(sess)),
             None => {
                 let enc = device
-                    .command_encoder()
-                    .context("LayerEncoder::from_session_or_plain: device.command_encoder()")?;
+                    .command_encoder().map(crate::inference::native_observation::encoder)
+                    .context("LayerEncoder::from_session_or_plain: device.command_encoder().map(crate::inference::native_observation::encoder)")?;
                 Ok(LayerEncoder::Plain(enc))
             }
         }

@@ -46,6 +46,7 @@ pub(crate) use info::print_early_rejection as print_info_early_rejection;
 // InflightBatchedScheduler signature stub. Production activation gated on
 // Phase B iter-3+ + Phase C iter-2 (Engine wiring).
 pub mod parity_quality;
+pub(crate) mod phase_trace;
 #[allow(dead_code)]
 #[allow(dead_code)]
 pub mod quant_select;
@@ -4348,6 +4349,8 @@ pub fn cmd_serve(
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
 
+    phase_trace::initialize_early().map_err(|error| anyhow::anyhow!(error))?;
+
     crate::debug::investigation_env::gemma_full_input::selected()
         .map_err(|error| anyhow::anyhow!(error))?;
     let mut args = args;
@@ -5146,6 +5149,7 @@ pub fn cmd_serve(
     // Filesystem-path passthrough uses the file stem as the pool's `repo`
     // key and the exact `general.file_type` as its quant identity.
     let mut startup_engine_for_banner: Option<api::engine::Engine> = None;
+    let mut startup_synchronous_warmup_completed = false;
     if let Some(model_arg) = default_model_arg.as_ref() {
         let mut cache_guard = state
             .cache
@@ -5287,6 +5291,10 @@ pub fn cmd_serve(
                 "locally discovered GGUF changed during runtime activation"
             );
         }
+        // This startup pool was created empty above and no HTTP listener is
+        // published yet. A successful synchronous load_engine return includes
+        // the actual worker Warmup reply; retain that fact for diagnostic arm.
+        startup_synchronous_warmup_completed = engine_config.warmup_synchronously;
         startup_engine_for_banner = Some(loaded_engine.engine.clone());
         drop(pool_guard);
         emit_startup_event(
@@ -5733,6 +5741,23 @@ pub fn cmd_serve(
     let operator_ui_mode = args.operator_ui;
 
     rt.block_on(async move {
+        if let Some(nonce) = phase_trace::native_control_nonce() {
+            anyhow::ensure!(startup_synchronous_warmup_completed,
+                "phase-control requires completed synchronous startup warmup");
+            anyhow::ensure!(state_for_warmup.mmproj.is_none(),
+                "phase-control multi-device projector coverage is unqualified");
+            anyhow::ensure!(state_for_warmup.embedding_config.is_none(),
+                "phase-control separate embedding-device coverage is unqualified");
+            let loaded_count = state_for_warmup.pool.read()
+                .map_err(|_| anyhow::anyhow!("phase-control model pool poisoned"))?
+                .pool_stats().loaded_count;
+            anyhow::ensure!(loaded_count == 1,
+                "phase-control requires exactly one preloaded engine");
+            let engine = startup_engine_for_banner.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("phase-control requires a preloaded engine"))?;
+            engine.arm_native_observation(nonce).await
+                .context("owning worker phase-control arm before listener publication")?;
+        }
         let bind = format!("{}:{}", config.host, config.port);
         let listener = match chat_owned_listener {
             Some(listener) => tokio::net::TcpListener::from_std(listener)

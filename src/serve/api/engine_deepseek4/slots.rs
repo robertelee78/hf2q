@@ -156,6 +156,11 @@ impl Deepseek4PrefillState {
         })
     }
 
+    /// Owning-worker metadata only; does not predict sampled decode tokens.
+    pub(crate) fn f2_forward_ready(&self) -> bool {
+        self.plan.cursor < self.prompt_tokens.len()
+    }
+
     pub(crate) fn initial_cached_tokens(&self) -> usize {
         self.plan.initial_cached_tokens()
     }

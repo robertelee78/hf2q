@@ -1609,7 +1609,7 @@ pub(crate) fn argmax_logits_gpu(
     params
         .as_mut_slice::<u32>()
         .map_err(|e| anyhow!("SpecDecode argmax params slice: {e}"))?[0] = vocab_size;
-    let mut enc = device.command_encoder().context("SpecDecode enc argmax")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("SpecDecode enc argmax")?;
     dispatch_argmax_f32(
         &mut enc,
         registry,

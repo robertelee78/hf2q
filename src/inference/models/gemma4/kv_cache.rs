@@ -1329,7 +1329,7 @@ pub fn splice_graft_into_hybrid_kv_for_slot(
         Ok(buf)
     };
     let mut encoder = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("gemma4 graft splice: command encoder")?;
     let mut registry = mlx_native::KernelRegistry::new();
     // slot_ids [n_slots] all = slot; positions [n_slots] = 0..n_slots-1.
@@ -1512,7 +1512,7 @@ pub fn splice_graft_into_hybrid_kv_single_seq(
         Ok(buf)
     };
     let mut encoder = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("gemma4 graft splice (single-seq): encoder")?;
     let mut registry = mlx_native::KernelRegistry::new();
     // All-zero slot ids: the batched kernels apply slot_id*stride = 0,

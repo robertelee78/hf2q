@@ -423,7 +423,7 @@ fn cat_boundary<'a>(
     // they persist across the boundary. Each finish is a full GPU sync, so all
     // prior writes are complete + host-visible before the next category begins.
     let fresh = exec
-        .begin()
+        .begin().map(crate::inference::native_observation::session)
         .map_err(|e| anyhow::anyhow!("catsplit re-begin: {e}"))?;
     let old = std::mem::replace(session, fresh);
     let ns = old
@@ -549,8 +549,9 @@ impl MlxModelWeights {
             &[&bufs.hidden, &self.layers[layer_idx].norms.input_layernorm],
             &[&bufs.norm_out],
         );
-        session
-            .rms_norm(
+        crate::inference::native_observation::witness_rms_norm(
+            session,&bufs.hidden,n,hs,Some(layer_idx),|session| {
+            session.rms_norm(
                 reg,
                 metal_dev,
                 &bufs.hidden,
@@ -560,7 +561,8 @@ impl MlxModelWeights {
                 nu,
                 hs as u32,
             )
-            .map_err(|e| anyhow::anyhow!("batched pre-attn norm L{layer_idx}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("batched pre-attn norm L{layer_idx}: {e}"))
+        })?;
         cat_boundary(session, exec, catsplit::Cat::RmsNorm)?;
 
         // -- QKV projections (BATCHED m=N): all read norm_out, write disjoint --
@@ -2315,6 +2317,9 @@ impl MlxModelWeights {
         head_out: &mut Option<BatchedHeadOut>,
         gpu: &mut GpuContext,
     ) -> Result<Vec<f32>> {
+        let _native_input = crate::inference::native_observation::ordered_input(
+            "gemma4.decode.actual_token_slot_position_arrays",tokens.len(),
+            slot_ids.iter().zip(seq_positions).map(|(slot,position)| (slot.0,*position,1)));
         let n = tokens.len();
         let hs = self.hidden_size;
         if n == 0 {
@@ -2392,7 +2397,7 @@ impl MlxModelWeights {
             .copy_from_slice(tokens);
 
         let mut s = exec
-            .begin()
+            .begin().map(crate::inference::native_observation::session)
             .map_err(|e| anyhow::anyhow!("body_batched session begin: {e}"))?;
 
         crate::inference::models::gemma4::native_matrix::encode_embedding(
@@ -2508,7 +2513,7 @@ impl MlxModelWeights {
                     break;
                 } else {
                     let fresh = exec
-                        .begin()
+                        .begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("body_batched chunk re-begin: {e}"))?;
                     let old = std::mem::replace(&mut s, fresh);
                     committed.push(old.commit());
@@ -2590,7 +2595,7 @@ impl MlxModelWeights {
                         eprintln!("S019_DECSLOT L{layer_idx:02} cks={c:016x}");
                     }
                     s = exec
-                        .begin()
+                        .begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("s019 dec restart L{layer_idx}: {e}"))?;
                 }
             }

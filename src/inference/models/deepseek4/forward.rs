@@ -32,7 +32,7 @@ impl Deepseek4Model {
         let tokens = token_ids.len();
         let (executor, registry) = self.ctx.split();
         let mut session = executor
-            .begin()
+            .begin().map(crate::inference::native_observation::session)
             .context("begin DeepSeek-V4 embedding graph")?;
         Self::encode_embedding_hyper_state(
             &mut session,
