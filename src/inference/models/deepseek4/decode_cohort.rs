@@ -135,12 +135,14 @@ impl Deepseek4Model {
             let encode_result = (|| -> Result<()> {
                 for start in (0..layers).step_by(LAYERS_PER_COMMAND_BUFFER) {
                     let end = (start + LAYERS_PER_COMMAND_BUFFER).min(layers);
-                    let mut session = executor.begin().with_context(|| {
+                    let mut session = executor.begin().map(crate::inference::native_observation::session).with_context(|| {
                         format!("begin DeepSeek-V4 B=4 decode layers {start}..{end}")
                     })?;
                     for layer in start..end {
                         let mut next_states = Vec::with_capacity(4);
                         for lane in 0..4 {
+                            let _native_input = crate::inference::native_observation::sorted_decode_lane_input(
+                                lane,caches[lane].position(),1);
                             let attention = if layer == 0 {
                                 anyhow::ensure!(
                                     lane_states[lane].is_none(),

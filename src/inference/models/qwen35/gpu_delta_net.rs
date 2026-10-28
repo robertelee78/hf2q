@@ -673,7 +673,9 @@ pub fn apply_pre_norm(
         s[0] = eps;
         s[1] = hidden_size as f32;
     }
-    rms_norm::dispatch_rms_norm(
+    crate::inference::native_observation::witness_command_rms_norm(
+        encoder,input,seq_len as usize,hidden_size as usize,|encoder| {
+        rms_norm::dispatch_rms_norm(
         encoder,
         registry,
         device.metal_device(),
@@ -684,7 +686,8 @@ pub fn apply_pre_norm(
         seq_len,
         hidden_size,
     )
-    .context("dispatch_rms_norm pre_norm")?;
+    .context("dispatch_rms_norm pre_norm")
+    })?;
     Ok(out)
 }
 
@@ -961,7 +964,7 @@ pub fn apply_ssm_conv(
     let (old_state_buf, new_state_buf, y, params_buf, conv_params) =
         prepare_ssm_conv_buffers(device, old_conv_state_km1_c, seq_len, qkv_channels, k_width)?;
 
-    let mut enc = device.command_encoder().context("enc ssm_conv")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc ssm_conv")?;
     dispatch_ssm_conv(
         &mut enc,
         registry,
@@ -1073,7 +1076,9 @@ pub fn apply_pre_norm_into(
         s[0] = eps;
         s[1] = hidden_size as f32;
     }
-    rms_norm::dispatch_rms_norm(
+    crate::inference::native_observation::witness_command_rms_norm(
+        encoder,input,seq_len as usize,hidden_size as usize,|encoder| {
+        rms_norm::dispatch_rms_norm(
         encoder,
         registry,
         device.metal_device(),
@@ -1084,7 +1089,8 @@ pub fn apply_pre_norm_into(
         seq_len,
         hidden_size,
     )
-    .context("dispatch_rms_norm pre_norm (arena)")?;
+    .context("dispatch_rms_norm pre_norm (arena)")
+    })?;
     Ok(())
 }
 
@@ -1393,7 +1399,7 @@ pub fn apply_gated_delta_net(
     let params_buf = build_gated_delta_net_params(device, params)
         .map_err(|e| anyhow!("build gdn params: {e}"))?;
 
-    let mut enc = device.command_encoder().context("enc gdn")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc gdn")?;
     dispatch_gated_delta_net(
         &mut enc,
         registry,
@@ -1706,7 +1712,7 @@ pub fn apply_gated_delta_net_chunk(
         crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkEncBuild,
     );
     let mut enc = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("enc apply_gated_delta_net_chunk")?;
 
     // Stage A0 (Wave 5b.20): GPU tiled-GQA broadcast
@@ -2099,7 +2105,7 @@ pub fn apply_gated_delta_net_chunk_with_arena(
         crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkEncBuild,
     );
     let mut enc = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("enc apply_gated_delta_net_chunk_with_arena")?;
 
     // Stage A0: GPU tiled-GQA broadcast into arena slots.
@@ -2655,7 +2661,7 @@ pub fn build_delta_net_layer(
         let k_gpu = qkv_conv.slice_view((q_sp * 4) as u64, k_sp);
         let v_gpu = qkv_conv.slice_view(((q_sp + k_sp) * 4) as u64, nv * dv);
 
-        let mut enc = device.command_encoder().context("enc ops1-9 decode")?;
+        let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc ops1-9 decode")?;
         // Op 1: pre_norm
         let x_norm = apply_pre_norm(
             &mut enc,
@@ -2944,7 +2950,7 @@ pub fn build_delta_net_layer(
             let _w5b8 = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::LayerOps1to3,
             );
-            let mut enc = device.command_encoder().context("enc ops1-3 prefill")?;
+            let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc ops1-3 prefill")?;
             let x_norm = apply_pre_norm(
                 &mut enc,
                 registry,
@@ -3087,7 +3093,7 @@ pub fn build_delta_net_layer(
             };
 
             let mut enc = device
-                .command_encoder()
+                .command_encoder().map(crate::inference::native_observation::encoder)
                 .context("enc qkv_split (W-5b.18) prefill")?;
             dispatch_qkv_split_f32(
                 &mut enc,
@@ -3172,7 +3178,7 @@ pub fn build_delta_net_layer(
                 let _w5b8 = super::wave5b8_profile::Section::start(
                     super::wave5b8_profile::SectionKind::LayerChunkPrep,
                 );
-                let mut enc = device.command_encoder().context("enc chunk-prep prefill")?;
+                let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc chunk-prep prefill")?;
                 let q_l2 = apply_l2_norm_per_head(
                     &mut enc,
                     registry,
@@ -3296,7 +3302,7 @@ pub fn build_delta_net_layer(
                 super::wave5b8_profile::SectionKind::LayerChunkOps8to9,
             );
             let mut enc = device
-                .command_encoder()
+                .command_encoder().map(crate::inference::native_observation::encoder)
                 .context("enc chunk ops8-9 prefill")?;
             dispatch_ssm_norm_gate(
                 &mut enc,
@@ -3331,7 +3337,7 @@ pub fn build_delta_net_layer(
             let _w5b8 = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::LayerAutoregOps5to9,
             );
-            let mut enc = device.command_encoder().context("enc ops5-9 prefill")?;
+            let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc ops5-9 prefill")?;
             let q_l2 = apply_l2_norm_per_head(
                 &mut enc,
                 registry,
@@ -3991,7 +3997,7 @@ pub fn build_delta_net_layer_with_arena(
                 super::wave5b8_profile::SectionKind::LayerChunkPrep,
             );
             let mut enc = device
-                .command_encoder()
+                .command_encoder().map(crate::inference::native_observation::encoder)
                 .context("enc chunk-prep prefill (arena)")?;
             apply_l2_norm_per_head_into(
                 &mut enc,
@@ -4145,7 +4151,7 @@ pub fn build_delta_net_layer_with_arena(
             super::wave5b8_profile::SectionKind::LayerChunkOps8to9,
         );
         let mut enc = device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("enc chunk ops8-9 prefill (arena)")?;
         dispatch_ssm_norm_gate(
             &mut enc,
@@ -4189,7 +4195,7 @@ pub fn build_delta_net_layer_with_arena(
             super::wave5b8_profile::SectionKind::LayerAutoregOps5to9,
         );
         let mut enc = device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("enc ops5-9 prefill (arena)")?;
         apply_l2_norm_per_head_into(
             &mut enc,

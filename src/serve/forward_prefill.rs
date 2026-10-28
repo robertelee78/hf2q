@@ -1677,7 +1677,7 @@ impl MlxModelWeights {
             // ===============================================================
             {
                 let mut s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("prefill session T{tok_i}: {e}"))?;
 
                 // --- 1. Embedding ---
@@ -1757,7 +1757,7 @@ impl MlxModelWeights {
                             hs,
                         )?;
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("prefill dump restart: {e}"))?;
                     }
 
@@ -1793,7 +1793,7 @@ impl MlxModelWeights {
                             hs,
                         )?;
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
@@ -1942,7 +1942,7 @@ impl MlxModelWeights {
                             nkv * hd,
                         )?;
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
@@ -2378,7 +2378,7 @@ impl MlxModelWeights {
                             }
                         }
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
@@ -2416,7 +2416,7 @@ impl MlxModelWeights {
                             hs,
                         )?;
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
@@ -2451,7 +2451,7 @@ impl MlxModelWeights {
                             hs,
                         )?;
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
@@ -2894,7 +2894,7 @@ impl MlxModelWeights {
                             hs,
                         )?;
                         s = exec
-                            .begin()
+                            .begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
                 }
@@ -3005,7 +3005,7 @@ impl MlxModelWeights {
                         eprintln!("[TQ_DUMP] meta L{li:02} -> {mp}");
                     }
                     s = exec
-                        .begin()
+                        .begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("tq_dump nonbatched re-begin: {e}"))?;
                 }
 

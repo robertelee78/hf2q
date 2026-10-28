@@ -304,7 +304,7 @@ pub fn append_kv_to_cache_without_attention(
         v_seq_major.element_count()
     );
 
-    let mut enc = device.command_encoder().context("enc MTP KV-only append")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc MTP KV-only append")?;
     write_kv_with_optional_tq_encode(
         &mut enc,
         registry,
@@ -2023,7 +2023,7 @@ pub fn apply_sdpa_causal_from_seq_major(
     let v_gpu = upload_f32(&v_hm, device)?;
 
     // Fresh encoder for SDPA dispatch.
-    let mut enc2 = device.command_encoder().context("new encoder for sdpa")?;
+    let mut enc2 = device.command_encoder().map(crate::inference::native_observation::encoder).context("new encoder for sdpa")?;
     let out_hm = apply_sdpa_causal(
         &mut enc2, registry, device, &q_gpu, &k_gpu, &v_gpu, seq_len, n_heads, n_kv_heads, head_dim,
     )?;
@@ -3108,7 +3108,7 @@ pub fn qwen35_tree_verify_attention_block(
 
     // ── STEP 8: dispatch_qwen35_tree_verify_attention ────────────────────
     let mut enc2 = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .map_err(|e| anyhow!("step 8: open encoder: {e}"))?;
 
     let scale = 1.0_f32 / (shape.head_dim as f32).sqrt();
@@ -3391,7 +3391,7 @@ pub fn qwen35_tree_verify_full_layer(
     // attn_out is host-coherent (prior encoder commit_and_wait'd); enc2
     // reads it from device memory — no upload needed under Apple unified memory.
     let mut enc2 = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("qwen35_tree_verify_full_layer: alloc enc2")?;
 
     // ── STEP D: post_attn_norm — RMSNorm(attn_out, weights.post_attn_norm) ──
@@ -3880,7 +3880,7 @@ pub fn qwen35_tree_verify_full_layer_q(
     // attn_out is host-coherent (prior encoder commit_and_wait'd); enc2
     // reads it from device memory — no upload needed under Apple unified memory.
     let mut enc2 = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("qwen35_tree_verify_full_layer_q: alloc enc2")?;
 
     // ── STEP D: post_attn_norm — RMSNorm(attn_out, weights.post_attn_norm) ──
@@ -4328,7 +4328,7 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
     // ── STEP C: Open fresh encoder for post_attn_norm only ───────────────
     // attn_out is host-coherent (prior encoder commit_and_wait'd).
     let mut enc2 = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("qwen35_tree_verify_full_layer_q_moe: alloc enc2")?;
 
     // ── STEP D: post_attn_norm — RMSNorm(attn_out, weights.post_attn_norm) ──
@@ -4485,7 +4485,7 @@ pub fn apply_flash_attn_prefill_seq_major(
         // safe — the next encoder's commit* cannot flush a stale
         // residency-rescission for buffers still referenced by this CB.
         let mut enc = device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("FA prefill bridge encoder")?;
         apply_flash_attn_prefill_seq_major_into(
             &mut enc,
@@ -4520,7 +4520,7 @@ pub fn apply_flash_attn_prefill_seq_major(
             // Sync: wait for the just-committed CB (and therefore the
             // kernel write to out_bf16_hm) to actually land.
             let mut sync_enc = device
-                .command_encoder()
+                .command_encoder().map(crate::inference::native_observation::encoder)
                 .context("FA bridge: dump sync encoder")?;
             sync_enc
                 .commit_and_wait()
@@ -4582,7 +4582,7 @@ pub fn apply_flash_attn_prefill_seq_major(
             .map_err(|e| anyhow!("alloc out_bf16_hm: {e}"))?;
 
         let mut enc = device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("FA prefill bridge encoder")?;
 
         // Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major.
@@ -4879,7 +4879,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
         .map_err(|e| anyhow!("alloc out_seq: {e}"))?;
 
     let mut enc = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("FA resume bridge encoder")?;
 
     // ── Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major ──
@@ -5057,7 +5057,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
     // tight head-major F32 temp buffers (unrotated domain — drops in as
     // a slot.k/v F32 replacement).
     let mut enc = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("apply_flash_attn_prefill_seq_major_resume_via_tq_cache: dequant encoder")?;
     let temp_k = slot
         .dequant_seq_to_temp_f32_unrotated_for_slot(
@@ -5255,7 +5255,7 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
         nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(kv_seq_len),
     };
     let mut encoder = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("direct TQ prefill encoder")?;
     mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_batched(
         &mut encoder,
@@ -5411,7 +5411,7 @@ pub fn apply_sdpa_with_kv_cache(
         // K/V source: [seq*n_kv_heads, head_dim] = [n_kv_heads, head_dim] for seq=1,
         //   which kv_cache_copy_seq_f32_dual treats as [n_tokens=1, n_heads, head_dim].
         let mut enc = device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("enc kv-cache+sdpa decode")?;
         if kv_write_tokens > 0 {
             // ADR-027 Phase B iter-15: F32 write + optional TQ encode.
@@ -5579,7 +5579,7 @@ pub fn apply_sdpa_with_kv_cache(
                 super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
             );
             let mut enc = device
-                .command_encoder()
+                .command_encoder().map(crate::inference::native_observation::encoder)
                 .context("enc kv_cache_copy_seq_dual prefill")?;
             // ADR-027 Phase B iter-15: F32 write + optional TQ encode
             // for prefill (multi-token via _seq dispatch).
@@ -5850,7 +5850,7 @@ pub fn apply_sdpa_with_kv_cache(
                 .map_err(|e| anyhow!("vec_small_path: alloc tmp: {e}"))?;
 
             let mut enc = device
-                .command_encoder()
+                .command_encoder().map(crate::inference::native_observation::encoder)
                 .context("vec_small_path: command_encoder")?;
             permute_021_f32(
                 &mut enc,
@@ -6049,7 +6049,7 @@ pub fn apply_sdpa_with_kv_cache(
                 do_causal: true,
             };
             let mut enc = device
-                .command_encoder()
+                .command_encoder().map(crate::inference::native_observation::encoder)
                 .context("enc sdpa kv-cache prefill")?;
             // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback prefill.
             // iter-34 invariant: head_dim-fallback prefill only fires
@@ -6967,7 +6967,7 @@ pub fn build_gated_attn_layer(
             let _w5b9_ops1to4 = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaOps1to4,
             );
-            let mut enc = device.command_encoder().context("enc ops1-4")?;
+            let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc ops1-4")?;
 
             // Op 1: pre-attention RMSNorm → x_norm
             let x_norm = apply_pre_attn_rms_norm(
@@ -7320,7 +7320,7 @@ pub fn build_gated_attn_layer(
                 slot_id,
             )?,
             None => {
-                let mut enc = device.command_encoder().context("enc op5")?;
+                let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc op5")?;
                 apply_sdpa_causal_from_seq_major(
                     &mut enc, registry, device, &q_rope, &k_rope, &v_flat, seq_len, n_heads,
                     n_kv_heads, head_dim,

@@ -1949,7 +1949,16 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
 }
 
 /// The request protocol the worker thread drains.
+#[cfg(test)]
+#[path = "engine/f2_native_control_tests.rs"]
+mod f2_native_control_tests;
+
+#[path = "engine/f2_work_state.rs"]
+mod f2_work_state;
+
 pub(super) enum Request {
+    /// Internal startup-only diagnostic control, never a public HTTP request.
+    ArmNativeObservation { nonce: String, reply: oneshot::Sender<Result<()>> },
     Warmup {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -5410,6 +5419,14 @@ impl Engine {
             }
         }
         self.await_worker_reply(reply_rx, "warmup").await?
+    }
+
+    pub(crate) async fn arm_native_observation(&self, nonce: String) -> Result<()> {
+        self.ensure_worker_healthy()?;
+        let (reply, receive) = oneshot::channel();
+        self.inner.tx.send(Request::ArmNativeObservation { nonce, reply }).await
+            .map_err(|_| anyhow::anyhow!(ENGINE_UNHEALTHY_MESSAGE))?;
+        self.await_worker_reply(receive, "arm_native_observation").await?
     }
 
     /// Enqueue a non-streaming generation. Returns `queue_full` if the FIFO
@@ -8944,6 +8961,16 @@ fn run_slot_aware_deepseek4(
                         );
                     }
                 }
+                Request::ArmNativeObservation { nonce, reply } => {
+                    let _ = &nonce;
+                    let quiescent = supervisor.is_healthy()
+                        && scheduler.stats().admitted_total == 0
+                        && slots.iter().all(Option::is_none) && pending.is_empty();
+                    let result = supervisor.run("f2_native_arm", SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, || {
+                        crate::inference::native_observation::arm_on_worker(model.model.ctx.device(), &nonce, quiescent)
+                    });
+                    let _ = reply.send(result);
+                },
                 Request::Warmup { reply } => match model.warmup(&supervisor) {
                     Ok(()) => {
                         let _ = reply.send(Ok(()));
@@ -9081,7 +9108,9 @@ fn run_slot_aware_deepseek4(
             continue 'worker;
         }
 
-        match scheduler.step() {
+        let step = scheduler.step();
+        f2_work_state::deepseek(&scheduler,&slots);
+        match step {
             Ok(SchedulerStep::Idle) => match rx.blocking_recv() {
                 Some(Request::Shutdown) => {
                     rx.close();
@@ -10007,6 +10036,9 @@ fn advance_deepseek4_prefill_quantum(
     }
 
     lanes.sort_by_key(|lane| lane.slot_index);
+    let _native_invocation = crate::serve::phase_trace::enabled().then(||
+        scheduler.trace_transaction("deepseek4","actual_sorted_cooperative_prefill_inputs",
+            &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>()));
     let slot_indices = lanes.iter().map(|lane| lane.slot_index).collect::<Vec<_>>();
     let token_batches = lanes
         .iter()
@@ -10163,6 +10195,7 @@ fn advance_deepseek4_prefill(
         ));
     };
 
+    let _native_invocation = scheduler.trace_transaction("deepseek4", "bounded_prefill", &[handle]);
     sessions[slot_index].swap_with_loaded(model);
     let result = state.advance(
         model,
@@ -10283,6 +10316,8 @@ fn try_decode_batch_deepseek4_cohort(
         });
     }
 
+    let _native_invocation = crate::serve::phase_trace::enabled().then(|| scheduler.trace_transaction("deepseek4", "independent_decode_lane_cohort",
+        &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>()));
     tracing::info!(
         target: "hf2q::serve::api::engine_deepseek4::progress",
         lanes = lanes.len(),
@@ -10624,6 +10659,8 @@ fn decode_batch_deepseek4(
                         break;
                     }
                 }
+                let _native_invocation = scheduler.trace_transaction(
+                    "deepseek4","actual_scalar_decode_input",&[handle]);
                 let tick_result = state.tick(model, registration, events, supervisor);
                 match tick_result {
                     Ok(()) => {
@@ -11099,6 +11136,10 @@ fn run_slot_aware_qwen3vl_unsupported(mut rx: mpsc::Receiver<Request>) {
                     .into_anyhow(),
                 );
             }
+            Request::ArmNativeObservation { nonce, reply } => {
+                let _ = &nonce;
+                let _ = reply.send(Err(anyhow::anyhow!("native phase-control arm unsupported on this worker")));
+            },
             Request::Warmup { reply } => {
                 let _ = reply.send(Ok(()));
             }
@@ -12111,6 +12152,16 @@ fn run_slot_aware_gemma4(
                             ));
                             publish(&scheduler, &scheduler_stats_snapshot);
                         }
+                        Request::ArmNativeObservation { nonce, reply } => {
+                            let _ = &nonce;
+                            let quiescent = supervisor.is_healthy()
+                                && scheduler.stats().admitted_total == 0
+                                && slots.iter().all(Option::is_none) && pending.is_empty();
+                            let result = supervisor.run("f2_native_arm", SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, || {
+                                crate::inference::native_observation::arm_on_worker(guard.model.ctx.device(), &nonce, quiescent)
+                            });
+                            let _ = reply.send(result);
+                        },
                         Request::Warmup { reply } => {
                             let result = warmup_once(&mut guard.model, &supervisor);
                             match result {
@@ -12536,6 +12587,16 @@ fn run_slot_aware_gemma4(
                         }
                         publish(&scheduler, &scheduler_stats_snapshot);
                     }
+                    Request::ArmNativeObservation { nonce, reply } => {
+                        let _ = &nonce;
+                        let quiescent = supervisor.is_healthy()
+                            && scheduler.stats().admitted_total == 0
+                            && slots.iter().all(Option::is_none) && pending.is_empty();
+                        let result = supervisor.run("f2_native_arm", SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, || {
+                            crate::inference::native_observation::arm_on_worker(guard.model.ctx.device(), &nonce, quiescent)
+                        });
+                        let _ = reply.send(result);
+                    },
                     Request::Warmup { reply } => {
                         let result = warmup_once(&mut guard.model, &supervisor);
                         if let Err(error) = result {
@@ -12655,6 +12716,7 @@ fn run_slot_aware_gemma4(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::SchedStep,
             _hp_sched.elapsed().as_nanos() as u64,
         );
+        f2_work_state::gemma(&scheduler,&slots);
         match step {
             SchedulerStep::Idle => {
                 // Inline prefill can complete at its seed and release the
@@ -13836,6 +13898,7 @@ fn advance_gemma4_prefill(
         return None;
     }
 
+    let _native_invocation = scheduler.trace_transaction("gemma4", "bounded_prefill", &[handle]);
     let max_chunk_tokens = requested_tokens
         .min(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS)
         .max(1) as usize;
@@ -14098,6 +14161,9 @@ fn advance_gemma4_prefill_quantum(
         }
     }
 
+    let _native_invocation = crate::serve::phase_trace::enabled().then(||
+        scheduler.trace_transaction("gemma4","actual_installed_prefill_inputs",
+            &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>()));
     let max_decode_tokens = lanes
         .iter()
         .map(|lane| lane.state.params.max_tokens.max(1))
@@ -15783,6 +15849,8 @@ fn decode_batch_gemma4(
         if captured.is_empty() {
             return None;
         }
+        let _native_invocation = crate::serve::phase_trace::enabled().then(|| scheduler.trace_transaction("gemma4", "selected_batched_body_inputs",
+            &captured.iter().map(|(handle, _, _, _)| *handle).collect::<Vec<_>>()));
         crate::inference::models::gemma4::batched_body::host_phases::add(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::GatherMisc,
             _hp_gather.elapsed().as_nanos() as u64,
@@ -15985,6 +16053,8 @@ fn decode_batch_gemma4(
                 slot_fire_done(reply, state.finish(registration), true);
                 continue;
             }
+            let _native_invocation = scheduler.trace_transaction(
+                "gemma4","actual_scalar_decode_input",&[handle]);
             match supervised_gemma4_gpu_call(supervisor, "gemma4_decode_body", || {
                 state.decode_tick_capture(
                     guard.model,
@@ -16921,6 +16991,10 @@ fn drain_with_startup_error(mut rx: mpsc::Receiver<Request>, why: &str) {
 fn fail_slotaware_buffered_request(request: Request, message: &str) {
     let error = || anyhow::anyhow!(message.to_string());
     match request {
+        Request::ArmNativeObservation { nonce, reply } => {
+            let _ = &nonce;
+            let _ = reply.send(Err(error()));
+        },
         Request::Warmup { reply } => {
             let _ = reply.send(Err(error()));
         }
@@ -17734,6 +17808,7 @@ fn qwen35_pending_disposition(
         | Request::Embed { .. }
         | Request::Warmup { .. } => true,
         Request::Shutdown
+        | Request::ArmNativeObservation { .. }
         | Request::KvSnapshot { .. }
         | Request::KvRestore { .. }
         | Request::TqPackedKvSnapshot { .. }
@@ -18522,6 +18597,16 @@ fn run_slot_aware_qwen35(
                     }
                     publish(&scheduler, &scheduler_stats_snapshot);
                 }
+                Request::ArmNativeObservation { nonce, reply } => {
+                    let _ = &nonce;
+                    let quiescent = supervisor.is_healthy()
+                        && scheduler.stats().admitted_total == 0
+                        && slots.iter().all(Option::is_none) && pending.is_empty();
+                    let result = supervisor.run("f2_native_arm", SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, || {
+                        guard.model.model.with_gpu_cache_mut(|device, _| crate::inference::native_observation::arm_on_worker(device, &nonce, quiescent))
+                    });
+                    let _ = reply.send(result);
+                },
                 Request::Warmup { reply } => {
                     let result = warmup_qwen35_once(guard.model, &supervisor);
                     if !supervisor.is_healthy()
@@ -18697,6 +18782,7 @@ fn run_slot_aware_qwen35(
                 break 'worker;
             }
         };
+        f2_work_state::qwen(&scheduler,&slots);
         match step {
             SchedulerStep::Idle => {
                 if shutdown_requested {
@@ -19415,6 +19501,7 @@ fn advance_qwen35_prefill(
         return None;
     }
 
+    let _native_invocation = scheduler.trace_transaction("qwen35", "bounded_prefill", &[handle]);
     let max_chunk_tokens = qwen35_prefill_transaction_tokens(requested_tokens);
     let advance = state.advance(
         guard.model,
@@ -19989,6 +20076,7 @@ fn decode_batch_qwen35(
             continue;
         }
 
+        let _native_invocation = scheduler.trace_transaction("qwen35", "ordinary_or_temporal_mtp_decode", &[handle]);
         let qtick = match state.decode_tick(
             guard.model,
             guard.kv.as_mut().expect("kv Some during loop"),
@@ -20165,6 +20253,9 @@ fn worker_run(
     kv_fixed_bytes_per_slot: u64,
     supervisor: EngineSupervisor,
 ) {
+    let phase_trace_supervisor = supervisor.clone();
+    let _phase_trace_worker = crate::serve::phase_trace::worker(
+        move || phase_trace_supervisor.is_healthy());
     tracing::info!(
         model = %loaded.model_id(),
         ?mode,
@@ -20281,6 +20372,10 @@ fn worker_run(
 
     while let Some(req) = rx.blocking_recv() {
         match req {
+            Request::ArmNativeObservation { nonce, reply } => {
+                let _ = &nonce;
+                let _ = reply.send(Err(anyhow::anyhow!("native phase-control arm unsupported on this worker")));
+            },
             Request::Warmup { reply } => {
                 let family = loaded_model_family(&loaded);
                 let result = match &mut loaded {
@@ -57570,3 +57665,7 @@ mod qwen38_slot_decode_telemetry_tests {
 #[cfg(test)]
 #[path = "engine_gemma_full_input_tests.rs"]
 mod gemma_full_input_tests;
+
+#[cfg(test)]
+#[path = "engine_template_json_order_tests.rs"]
+mod template_json_order_tests;

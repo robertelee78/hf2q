@@ -157,7 +157,7 @@ impl MlxModelWeights {
                 // ADR-031 Phase C profile: worker-side phase timings.
                 let pw_begin = profile_enabled.then(std::time::Instant::now);
                 let mut session_a = exec_static
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| format!("worker begin session_a: {e}"))?;
                 let pw_begin_us = pw_begin.map(|t| t.elapsed().as_micros());
                 let pw_encode = profile_enabled.then(std::time::Instant::now);
@@ -379,6 +379,8 @@ impl MlxModelWeights {
         profile: &mut Option<TokenProfile>,
         capture_hidden: bool,
     ) -> Result<u32> {
+        let _native_input = crate::inference::native_observation::single_input(
+            "gemma4.scalar_forward",seq_pos,1);
         let token_start = Instant::now();
         let hs = self.hidden_size;
         let num_layers = self.layers.len();
@@ -689,10 +691,10 @@ impl MlxModelWeights {
             let metal_dev = dev.metal_device();
             let use_graph_opt = INVESTIGATION_ENV.graph_opt;
             let mut s = if use_graph_opt {
-                exec.begin_recorded()
+                exec.begin_recorded().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("recorded session begin: {e}"))?
             } else {
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("single session begin: {e}"))?
             };
 
@@ -797,7 +799,7 @@ impl MlxModelWeights {
                     // the worker's chunk-A CB — commit-order serialization (INV-7).
                     let _enc = std::mem::replace(
                         &mut s,
-                        exec.begin()
+                        exec.begin().map(crate::inference::native_observation::session)
                             .map_err(|e| anyhow::anyhow!("parallel pre-commit begin: {e}"))?,
                     )
                     .commit();
@@ -932,7 +934,7 @@ impl MlxModelWeights {
                 );
                 // Start a new session for the head
                 s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("head session: {e}"))?;
             } else if group_stats_enabled {
                 s.dump_group_stats();
@@ -978,7 +980,7 @@ impl MlxModelWeights {
                 dumps::dump_f32(&self.activations.norm_out, hs, "pre_lmhead", None, seq_pos)?;
                 // Re-begin session for lm_head + argmax.
                 s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("dump boundary re-begin: {e}"))?;
             }
 
@@ -1469,7 +1471,7 @@ impl MlxModelWeights {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
             let mut s = exec
-                .begin()
+                .begin().map(crate::inference::native_observation::session)
                 .map_err(|e| anyhow::anyhow!("embed begin: {e}"))?;
             self.activations
                 .embedding_token_id
@@ -1519,7 +1521,7 @@ impl MlxModelWeights {
                 let metal_dev = dev.metal_device();
                 let t0 = Instant::now();
                 let mut s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("qkv begin L{layer_idx}: {e}"))?;
 
                 // pre-attn norm
@@ -1595,7 +1597,7 @@ impl MlxModelWeights {
                 let metal_dev = dev.metal_device();
                 let t0 = Instant::now();
                 let mut s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("norms begin L{layer_idx}: {e}"))?;
 
                 let ff_gpu = if is_sliding {
@@ -1701,7 +1703,7 @@ impl MlxModelWeights {
                 let metal_dev = dev.metal_device();
                 let t0 = Instant::now();
                 let mut s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("kv begin L{layer_idx}: {e}"))?;
 
                 let cache_pos_val = if kv_is_sliding {
@@ -1756,7 +1758,7 @@ impl MlxModelWeights {
                 let dev = exec.device();
                 let t0 = Instant::now();
                 let mut s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("sdpa begin L{layer_idx}: {e}"))?;
 
                 {
@@ -1818,7 +1820,7 @@ impl MlxModelWeights {
                 let dev = exec.device();
                 let t0 = Instant::now();
                 let mut s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("oproj begin L{layer_idx}: {e}"))?;
 
                 dispatch_qmatmul(
@@ -1850,7 +1852,7 @@ impl MlxModelWeights {
                 let metal_dev = dev.metal_device();
                 let t0 = Instant::now();
                 let mut s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("mlp begin L{layer_idx}: {e}"))?;
 
                 // Fused post-attn norm+add (needed to produce residual for MLP)
@@ -1961,7 +1963,7 @@ impl MlxModelWeights {
                 let metal_dev = dev.metal_device();
                 let t0 = Instant::now();
                 let mut s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("moe begin L{layer_idx}: {e}"))?;
 
                 // Post-FF norm 1
@@ -2131,7 +2133,7 @@ impl MlxModelWeights {
                 let metal_dev = dev.metal_device();
                 let t0 = Instant::now();
                 let mut s = exec
-                    .begin()
+                    .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("norms_end begin L{layer_idx}: {e}"))?;
 
                 // Fused post-FF norm2 + combine MLP+MoE
@@ -2181,7 +2183,7 @@ impl MlxModelWeights {
             let metal_dev = dev.metal_device();
             let t0 = Instant::now();
             let mut s = exec
-                .begin()
+                .begin().map(crate::inference::native_observation::session)
                 .map_err(|e| anyhow::anyhow!("head begin: {e}"))?;
 
             // Final RMS norm
@@ -2457,7 +2459,7 @@ impl MlxModelWeights {
             .alloc_buffer(hs_bytes, DType::F32, vec![tree_seq_len, h])
             .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc embed: {e}"))?;
         let mut embed_session = exec
-            .begin()
+            .begin().map(crate::inference::native_observation::session)
             .map_err(|e| anyhow!("forward_tree_verify_gpu: begin embed: {e}"))?;
         crate::inference::models::gemma4::native_matrix::encode_embedding(
             &mut embed_session,
@@ -2560,7 +2562,7 @@ impl MlxModelWeights {
                 },
                 intermediate_size: self.intermediate_size as u32,
             };
-            let enc = device.command_encoder().map_err(|e| {
+            let enc = device.command_encoder().map(crate::inference::native_observation::encoder).map_err(|e| {
                 anyhow!("forward_tree_verify_gpu: command_encoder layer {layer_idx}: {e}")
             })?;
             let (ref mut k_cache, ref mut v_cache) = kv_caches_f32[layer_idx];
@@ -2662,7 +2664,7 @@ impl MlxModelWeights {
 
         // Norm pass.
         let mut enc_head = device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc enc_head: {e}"))?;
         mlx_native::ops::rms_norm::dispatch_rms_norm(
             &mut enc_head,
@@ -2683,7 +2685,7 @@ impl MlxModelWeights {
             .context("forward_tree_verify_gpu: final norm commit")?;
         let lm_head = self.resolved_lm_head();
         let mut head_session = exec
-            .begin()
+            .begin().map(crate::inference::native_observation::session)
             .map_err(|e| anyhow!("forward_tree_verify_gpu: begin head session: {e}"))?;
         dispatch_qmatmul(
             &mut head_session,
@@ -2715,7 +2717,7 @@ impl MlxModelWeights {
                 p[1] = f32::from_bits(n_elems as u32);
             }
             let mut enc_sc = device
-                .command_encoder()
+                .command_encoder().map(crate::inference::native_observation::encoder)
                 .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc enc_sc: {e}"))?;
             mlx_native::ops::softcap::dispatch_softcap(
                 &mut enc_sc,

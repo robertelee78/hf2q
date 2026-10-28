@@ -99,7 +99,7 @@ impl MlxModelWeights {
 
             // Open session and run final_norm + lm_head + softcap + argmax.
             let mut s = exec
-                .begin()
+                .begin().map(crate::inference::native_observation::session)
                 .map_err(|e| anyhow::anyhow!("per_pos session begin: {e}"))?;
 
             // norm_out source: either final_norm(hidden) when caller
@@ -279,7 +279,7 @@ impl MlxModelWeights {
             .map_err(|e| anyhow::anyhow!("alloc logits_batched: {e}"))?;
 
         let mut s = exec
-            .begin()
+            .begin().map(crate::inference::native_observation::session)
             .map_err(|e| anyhow::anyhow!("batched argmax session begin: {e}"))?;
 
         // (a) ONE rms_norm or copy with rows=n

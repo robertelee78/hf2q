@@ -83,8 +83,9 @@ impl MlxModelWeights {
             ],
             &[&self.activations.norm_out],
         );
-        session
-            .rms_norm(
+        crate::inference::native_observation::witness_rms_norm(
+            session,&self.activations.hidden,1,hs,Some(layer_idx),|session| {
+            session.rms_norm(
                 reg,
                 metal_dev,
                 &self.activations.hidden,
@@ -94,7 +95,8 @@ impl MlxModelWeights {
                 1,
                 hs as u32,
             )
-            .map_err(|e| anyhow::anyhow!("GPU pre-attn norm L{layer_idx}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("GPU pre-attn norm L{layer_idx}: {e}"))
+        })?;
         *total_dispatches += 1;
 
         // -- QKV projections (CONCURRENT: all read norm_out, write separate buffers) --
@@ -305,7 +307,7 @@ impl MlxModelWeights {
         if INVESTIGATION_ENV.dump_pre_quant && layer_match && pos_match {
             std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("pre_quant dump re-begin: {e}"))?,
             )
             .finish()
@@ -711,7 +713,7 @@ impl MlxModelWeights {
             // Commit the encode command buffer.
             std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("HF2Q_DEBUG_TQ_RMS re-begin: {e}"))?,
             )
             .finish()
@@ -744,7 +746,7 @@ impl MlxModelWeights {
             // Re-dispatch probe for head=0 only using a fresh command buffer.
             let probe_kind = if kv_is_sliding { "sliding" } else { "global" };
             let mut sp = exec
-                .begin()
+                .begin().map(crate::inference::native_observation::session)
                 .map_err(|e| anyhow::anyhow!("HF2Q_DEBUG_TQ_RMS probe begin L{layer_idx}: {e}"))?;
             mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                 sp.encoder_mut(),
@@ -847,7 +849,7 @@ impl MlxModelWeights {
         if INVESTIGATION_ENV.dump_tq_state && layer_idx == 0 && kv_seq_len == 23 {
             std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("post_quant dump re-begin: {e}"))?,
             )
             .finish()
@@ -987,7 +989,7 @@ impl MlxModelWeights {
         if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
             std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("dump QKV re-begin L{layer_idx}: {e}"))?,
             )
             .finish()
@@ -1238,7 +1240,7 @@ impl MlxModelWeights {
             if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
                 std::mem::replace(
                     session,
-                    exec.begin()
+                    exec.begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("dump cache re-begin L{layer_idx}: {e}"))?,
                 )
                 .finish()
@@ -1882,7 +1884,7 @@ impl MlxModelWeights {
         if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
             std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("dump sdpa_out re-begin L{layer_idx}: {e}"))?,
             )
             .finish()
@@ -1910,7 +1912,7 @@ impl MlxModelWeights {
             if let Some(run_name) = dump_run_name {
                 std::mem::replace(
                     session,
-                    exec.begin()
+                    exec.begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("S2C re-begin step={s2c_step}: {e}"))?,
                 )
                 .finish()
@@ -2050,7 +2052,7 @@ impl MlxModelWeights {
         if std::env::var("HF2Q_PER_LAYER_PHASE_GPU_TIME").as_deref() == Ok("1") {
             let gpu_ns: u64 = std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("phase-attn begin L{layer_idx}: {e}"))?,
             )
             .finish_with_gpu_time()
@@ -2188,7 +2190,7 @@ impl MlxModelWeights {
             if dump_after_post_attn {
                 std::mem::replace(
                     session,
-                    exec.begin().map_err(|e| {
+                    exec.begin().map(crate::inference::native_observation::session).map_err(|e| {
                         anyhow::anyhow!("dump post-attn re-begin L{layer_idx}: {e}")
                     })?,
                 )
@@ -2280,7 +2282,7 @@ impl MlxModelWeights {
         if std::env::var("HF2Q_FFN_SPLIT").as_deref() == Ok("1") {
             let gpu_ns: u64 = std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("ffn-norms begin L{layer_idx}: {e}"))?,
             )
             .finish_with_gpu_time()
@@ -2716,7 +2718,7 @@ impl MlxModelWeights {
         if std::env::var("HF2Q_FFN_SPLIT").as_deref() == Ok("1") {
             let gpu_ns: u64 = std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("ffn-body begin L{layer_idx}: {e}"))?,
             )
             .finish_with_gpu_time()
@@ -3091,7 +3093,7 @@ impl MlxModelWeights {
                 // committed CB and runs it to completion.
                 let prev_session = std::mem::replace(
                     session,
-                    exec.begin()
+                    exec.begin().map(crate::inference::native_observation::session)
                         .map_err(|e| anyhow::anyhow!("split CB begin: {e}"))?,
                 );
                 let _committed_enc = prev_session.commit();
@@ -3118,7 +3120,7 @@ impl MlxModelWeights {
         if per_layer || phase_split || ffn_split {
             let gpu_ns: u64 = std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("per-layer-gpu-time begin L{layer_idx}: {e}"))?,
             )
             .finish_with_gpu_time()
@@ -3145,7 +3147,7 @@ impl MlxModelWeights {
         if dump_layers {
             std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("dump layer re-begin L{layer_idx}: {e}"))?,
             )
             .finish()
@@ -3176,7 +3178,7 @@ impl MlxModelWeights {
             let b0_barriers = session.barrier_count();
             let _b0_encoder = std::mem::replace(
                 session,
-                exec.begin()
+                exec.begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("dual-buffer begin: {e}"))?,
             )
             .commit(); // commit current buf → GPU starts async
@@ -3815,7 +3817,7 @@ pub fn gemma4_tree_verify_attention_block(
         }
     }
 
-    let mut enc2 = device.command_encoder().map_err(|e| {
+    let mut enc2 = device.command_encoder().map(crate::inference::native_observation::encoder).map_err(|e| {
         anyhow::anyhow!("gemma4_tree_verify_attention_block: step 6 open enc2: {e}")
     })?;
 
@@ -3987,7 +3989,7 @@ pub fn gemma4_tree_verify_full_layer_q(
     .context("gemma4_tree_verify_full_layer_q: attention block")?;
 
     let mut enc2 = device
-        .command_encoder()
+        .command_encoder().map(crate::inference::native_observation::encoder)
         .context("gemma4_tree_verify_full_layer_q: alloc enc2")?;
 
     let rms_params_bytes = 2 * std::mem::size_of::<f32>();

@@ -338,7 +338,7 @@ fn flush_gpu(device: &MlxDevice) -> Result<()> {
             .context("flush_gpu session.reset_for_next_stage")?;
         return Ok(());
     }
-    let mut enc = device.command_encoder().context("flush_gpu enc")?;
+    let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("flush_gpu enc")?;
     enc.commit_and_wait().context("flush_gpu commit_and_wait")?;
     Ok(())
 }

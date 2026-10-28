@@ -5,6 +5,10 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, LazyLock,
 };
+
+#[cfg(test)]
+#[path = "c1_anchor_budget_tests.rs"]
+mod c1_anchor_budget_tests;
 pub const LIMIT: usize = 1536 * 1024 * 1024;
 static QUOTA: LazyLock<Arc<Quota>> = LazyLock::new(|| {
     Arc::new(Quota {

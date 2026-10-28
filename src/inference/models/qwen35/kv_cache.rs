@@ -2309,7 +2309,7 @@ impl HybridKvCache {
         let mut registry = mlx_native::KernelRegistry::new();
         let mut encoder = self
             .device
-            .command_encoder()
+            .command_encoder().map(crate::inference::native_observation::encoder)
             .context("graft TQ splice: command encoder")?;
         for (graph_layer, slot_of) in self.per_layer_slot.iter().enumerate() {
             let LayerSlot::Full(rank) = slot_of else {

@@ -2500,6 +2500,7 @@ version = "2.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "805bfd7352166bae857ee569628b52bcd85a1cecf7810861ebceb1686b72b75d"
 dependencies = [
+ "indexmap",
  "memo-map",
  "serde",
 ]
@@ -2543,9 +2544,9 @@ dependencies = [
 
 [[package]]
 name = "mlx-native"
-version = "0.15.6"
+version = "0.15.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0927b25a60092797fdb15bf850e60c89269dca07461c929901081ab1209f65d"
+checksum = "2ac4d45c9de8707f55cc0474e26f09720e3afa886b37c5617c41007353380fe7"
 dependencies = [
  "block",
  "bytemuck",
@@ -4243,7 +4244,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

@@ -171,8 +171,8 @@ thiserror = "2"
 # direct packed Q5_K/Q6_K embedding gathers and deterministic lowest-index
 # argmax tie handling, native BF16 GGUF/dense/expert execution, and sticky
 # expert-ID validation and optional deduplicated pool checkpoints use the
-# published mlx-native 0.15.6 contract.
-mlx-native = "=0.15.6"
+# published mlx-native 0.15.8 contract (optional submission observer defaults off).
+mlx-native = "=0.15.8"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
@@ -226,7 +226,7 @@ regex = "1"
 # multi-turn chat with `UnknownMethod: string has no method named split`.
 # Surfaced and fixed during ADR-005 Phase 2a iter-133 Iter A while
 # closing the Open WebUI multi-turn AC 2509 harness.
-minijinja = "2"
+minijinja = { version = "2", features = ["preserve_order"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 
 # tempfile is used at runtime by the convert pipeline (ADR-012 P9b two-pass

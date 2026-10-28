@@ -15,6 +15,7 @@ from qwen38_n1_verdict import (FIXTURE_SHA, PROFILE, RAW_LIMIT, WORKFLOW, Invali
 from qwen38_n1_tools import Tools
 import qwen38_n1_process as child
 import coding_family as family_contract
+from f2_semantic import semantic_timing_v3, append_semantic_event, clock_ns, CLOCK_ID
 
 PREFLIGHT = {"source_binary_bound", "model_identity_bound", "ctx262144_slots1_verified",
              "auto_tq8_text_only_verified", "profile24g_ack_verified",
@@ -75,7 +76,7 @@ def approval(args):
     source_paths = [Path(__file__).with_name(n) for n in (
         "qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_process.py",
         "qwen38_n1_verdict.py", "test_qwen38_n1_verdict.py",
-        "coding_family.py", "test_coding_family.py")]
+        "coding_family.py", "test_coding_family.py", "f2_semantic.py")]
     if n4:
         source_paths += [Path(__file__).with_name(n) for n in
                          ("qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py",
@@ -138,6 +139,8 @@ def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"
             endpoint.path == "/v1" and not endpoint.query and not endpoint.fragment and
             endpoint.username is None, "only bound loopback /v1 endpoint allowed")
     connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=900)
+    started_ns = clock_ns()
+    semantic_events_ns = []
     started = time.monotonic()
     previous_alarm = signal.signal(signal.SIGALRM, request_timeout)
     previous_timer = signal.setitimer(signal.ITIMER_REAL, deadline)
@@ -204,6 +207,8 @@ def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"
                                 record["first_frame_seconds"] = elapsed
                             before = len(parser.message["reasoning_content"])
                             semantic = parser.feed(frame[0].decode("utf8", "strict"))
+                            if semantic:
+                                append_semantic_event(semantic_events_ns, clock_ns())
                             if semantic and record["semantic_ttft_seconds"] is None:
                                 record["semantic_ttft_seconds"] = elapsed
                             if len(parser.message["reasoning_content"]) > before and record["first_reasoning_seconds"] is None:
@@ -212,6 +217,13 @@ def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"
                 require(not frame and not pending, "incomplete SSE line/frame")
                 message, call, stats = parser.result()
                 require(record["semantic_ttft_seconds"] is not None, "no semantic SSE progress")
+        terminal_ns = clock_ns()
+        record["f2_clock_id"] = CLOCK_ID
+        record["semantic_timing_v3"] = semantic_timing_v3(
+            started_ns, semantic_events_ns, terminal_ns, request["stream"], True)
+        record["semantic_event_monotonic_ns"] = semantic_events_ns
+        record["send_monotonic_ns"] = started_ns
+        record["validated_terminal_monotonic_ns"] = terminal_ns
         record.update({"usage": stats, "elapsed_seconds": time.monotonic() - started,
                        "response_bytes": total, "response_sha256": child.digest(output / "response.bin")})
         save(output / "assembled-assistant.json", message)
@@ -318,6 +330,8 @@ def main():
         summary["status"] = qualify(summary["turns"], tools.receipts, True,
                                     tools.source_hash, final_hash)
         summary["final_source_sha256"] = final_hash
+        summary["f2_clock_id"] = CLOCK_ID
+        summary["task_completed_monotonic_ns"] = clock_ns()
         summary["workflow_sha256"] = hashlib.sha256(WORKFLOW.encode()).hexdigest()
         summary["full_prefix_reuse"] = "PendingPostOracle"
         summary["runtime_qualified"] = False

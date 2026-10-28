@@ -15,13 +15,15 @@ from qwen38_n1_verdict import Invalid, WORKFLOW, loads, require, qualify
 import qwen38_n1_process as child
 import coding_family as family_contract
 
+from f2_semantic import clock_ns, CLOCK_ID
+
 AGENTS = tuple(f"agent-{i}" for i in range(4))
 PROFILE = "adr063-qwen-n4-live-v1"
 WORKLOAD_ID = "adr063-qwen-n4-parse-port-v1"
 MODULES = ("qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_verdict.py",
            "qwen38_n1_process.py", "test_qwen38_n1_verdict.py",
            "qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py",
-           "coding_family.py", "test_coding_family.py", "qwen_n4_peer.py", "test_qwen_n4_peer.py")
+           "coding_family.py", "test_coding_family.py", "qwen_n4_peer.py", "test_qwen_n4_peer.py", "f2_semantic.py")
 INTERRUPTED = False
 
 
@@ -131,7 +133,9 @@ def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approv
     value = loads(release.read_bytes())
     validate_release(value, agent, run, pid, token, child.digest(ready_path))
     return {"status": "Released", "ready_sha256": child.digest(ready_path),
-            "release_sha256": child.digest(release), "wait_seconds": time.monotonic() - started}
+            "release_sha256": child.digest(release), "wait_seconds": time.monotonic() - started,
+            "release_monotonic_ns": value.get("release_monotonic_ns"),
+            "f2_clock_id": value.get("f2_clock_id")}
 
 
 def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen"):
@@ -285,9 +289,14 @@ def main():
             time.sleep(0.02)
         release = barrier_release(records, run, args.server_pid, token, hashes)
         require(not INTERRUPTED, "interrupted before shared release")
+        release["f2_clock_id"] = CLOCK_ID
+        release["release_monotonic_ns"] = clock_ns()
+        summary["f2_clock_id"] = CLOCK_ID
         save_new(barrier / "release.json", release)
+        summary["makespan_started_ns"] = release["release_monotonic_ns"]
         summary["barrier"] = {"status": "Released", "ready": records,
-                              "release_sha256": child.digest(barrier / "release.json")}
+                              "release_sha256": child.digest(barrier / "release.json"),
+                              "release_monotonic_ns": release["release_monotonic_ns"]}
         while any(process.poll() is None for process in processes.values()):
             require(not INTERRUPTED and time.monotonic() - started < 7320, "N4 deadline/interruption")
             os.kill(args.server_pid, 0)
@@ -318,6 +327,14 @@ def main():
                 summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.engine_kind, args.family)
             except BaseException as exc:
                 summary["status"], summary["error"] = "Failed", str(exc)
+        if summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview":
+            completed = [results[agent].get("task_completed_monotonic_ns") for agent in AGENTS]
+            if all(type(t) is int and t >= summary["makespan_started_ns"] for t in completed):
+                summary["makespan_finished_ns"] = max(completed)
+                summary["own_output_four_task_makespan_seconds"] = (
+                    summary["makespan_finished_ns"] - summary["makespan_started_ns"]) / 1e9
+            else:
+                summary["status"], summary["error"] = "Failed", "missing validated task completion clocks"
         summary.update(agents=results, exits=exits, client_cleanup=receipts,
                        cleanup=len(cleanup) == 4 and all(cleanup.values()),
                        elapsed_seconds=time.monotonic() - started)

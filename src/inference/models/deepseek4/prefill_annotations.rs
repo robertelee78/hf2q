@@ -19,7 +19,9 @@ pub(super) fn rms_norm(
     dim: u32,
 ) -> mlx_native::Result<()> {
     session.barrier_between(&[input, weight, params], &[output]);
-    session.rms_norm(registry, device, input, weight, output, params, rows, dim)
+    crate::inference::native_observation::witness_rms_norm(
+        session,input,rows as usize,dim as usize,None,|session|
+            session.rms_norm(registry,device,input,weight,output,params,rows,dim))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -34,7 +36,9 @@ pub(super) fn rms_norm_no_scale_f32(
     dim: u32,
 ) -> mlx_native::Result<()> {
     session.barrier_between(&[input, params], &[output]);
-    session.rms_norm_no_scale_f32(registry, device, input, output, params, rows, dim)
+    crate::inference::native_observation::witness_rms_norm(
+        session,input,rows as usize,dim as usize,None,|session|
+            session.rms_norm_no_scale_f32(registry,device,input,output,params,rows,dim))
 }
 
 #[allow(clippy::too_many_arguments)]

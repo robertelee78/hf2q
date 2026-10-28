@@ -9,6 +9,7 @@
 //! Populated by ADR-013 (Qwen3.5 / Qwen3.5-MoE).
 
 pub mod models;
+pub(crate) mod native_observation;
 pub mod spec_decode;
 pub mod vision;
 
@@ -17,6 +18,10 @@ pub mod glp;
 
 /// ADR-059 — KV-cache grafts (context-space steering artifacts).
 pub mod graft;
+
+// C1 is a contract oracle, not the C2 production multi-anchor implementation.
+#[cfg(test)]
+pub(crate) mod anchor_contract;
 
 /// ADR-005 iter-230 A2 — crate-wide serialization lock for GPU-executing
 /// tests.
