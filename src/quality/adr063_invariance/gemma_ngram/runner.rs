@@ -31,6 +31,11 @@ fn recipe(cfg:&crate::serve::config::Gemma4Config)->acquisition::ConfigRecipe<'s
         route:"gemma-ngram-injected-one-real-round-then-ordinary-v1",
         actual_model_config_sha256:crate::adr063_invariance::store::hash(format!("{cfg:?}").as_bytes())}
 }
+/// Narrow parent-only accessor; metadata export and runtime call SAME selector.
+pub(super) fn selected_recipe(cfg:&crate::serve::config::Gemma4Config,routing:bool)->acquisition::ConfigRecipe<'static> {
+    let mut r=recipe(cfg);
+    if routing {r.route="gemma-ngram-injected-native-routing1511-v1";}r
+}
 fn reviewed_workload(p:&Packet)->Result<Workload> {
     let raw=acquisition::checked_file(&p.greedy_workload,1024*1024)?;
     let work:Workload=serde_json::from_slice(&raw)?;work.validate().map_err(anyhow::Error::msg)?;
@@ -81,9 +86,7 @@ fn run()->Result<()> {
         cfg.sliding_window>=148 && cfg.vocab_size==262144 && cfg.num_attention_heads==16 &&
         cfg.num_key_value_heads==8 && cfg.num_global_key_value_heads==2 && cfg.head_dim==256 && cfg.global_head_dim==512 &&
         (0..30).all(|l|cfg.is_full_attention(l)==((l+1)%6==0)),"selected MoE geometry before model");
-    let selected_recipe=|cfg:&crate::serve::config::Gemma4Config| {let mut r=recipe(cfg);
-        if p.routing_witness.is_some(){r.route="gemma-ngram-injected-native-routing1511-v1";}r};
-    acquisition.check_config(&p.identity,&selected_recipe(&cfg))?;drop(header);
+    acquisition.check_config(&p.identity,&selected_recipe(&cfg,p.routing_witness.is_some()))?;drop(header);
     // Source maximum:16 snapshots (4 epochs×4 phases), each <=148×(3+8)×56320 plus norms,
     // plus <=84 full logits rows. This upper is conservative, not a physical-memory cap.
     let planned=planned_payload_upper();
@@ -95,11 +98,11 @@ fn run()->Result<()> {
     let opts=LoadOptions {model_path:p.model.clone(),tokenizer_path:None,config_path:None,dwq_overlay_path:None,
         kv_persist_dir:None,kv_persist_budget_bytes:0,glp_path:None,glp_alpha:None,kv_graft_path:None};
     let LoadedModel::Gemma(mut m)=LoadedModel::load_with_context(&opts,Some(262144))? else {anyhow::bail!("selected Gemma");};
-    acquisition.check_config(&p.identity,&selected_recipe(&m.config))?;
+    acquisition.check_config(&p.identity,&selected_recipe(&m.config,p.routing_witness.is_some()))?;
     ensure!(m.eos_token_ids==[1,106],"frozen actual EOS");
     let observed=acquisition.observed(m.ctx.executor.device(),&m as *const _ as usize as u64,3)?;
     let scope=Scope::install(&p.output,json!({"schema":"hf2q.q1.gemma-ngram-transaction.v1","identity":p.identity,
-        "acquisition":observed,"packet_sha256":crate::adr063_invariance::store::hash(&raw),"recipe":selected_recipe(&cfg),
+        "acquisition":observed,"packet_sha256":crate::adr063_invariance::store::hash(&raw),"recipe":selected_recipe(&cfg,p.routing_witness.is_some()),
         "greedy_workload":p.greedy_workload.sha256,"dataset_review":p.independent_dataset_review.sha256,
         "configured_context":262144,"configured_output_allowance":8192,"serial_owner_epochs":4,
         "not_mounted_slots":true,"physical_batch4_claim":false,"planned_payload_upper":planned}))?;

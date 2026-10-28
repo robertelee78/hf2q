@@ -12,6 +12,7 @@ struct Model {path:PathBuf,retained_full_sha256:String,file_identity:FileIdentit
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    #[serde(default)] routing_recipes:bool,
     model:Model,full_content_receipt:FileBinding,tokenizer:FileBinding,template:FileBinding,
     producer_metadata:FileBinding,producer_build_receipt:FileBinding,
     producer_export_receipt:FileBinding,producer_config:FileBinding,
@@ -58,6 +59,20 @@ fn planned(cfg:&crate::serve::config::Gemma4Config)->Result<Value> {
         "metadata_store_ceiling":134217728,"physical_admission":false,
         "operating_budget_disposition":"root must charge owned I/O/copies/model/fullC4scaffolds and positive margins separately"}))
 }
+fn routing_recipe_export(cfg:&crate::serve::config::Gemma4Config)->Result<Vec<Value>> {
+    let mut rows=Vec::new();
+    for routing in [false,true] {
+        for (adapter,recipe) in [
+            ("ordinary",super::gemma_actual::selected_recipe(cfg,routing)),
+            ("T5",super::gemma_ngram::configuration_recipe(cfg,routing)),
+        ] {
+            let digest=acquisition::config_digest(&recipe)?;
+            rows.push(serde_json::json!({"adapter":adapter,"routing_witness":routing,
+                "config_sha256":digest,"recipe":recipe}));
+        }
+    }
+    Ok(rows)
+}
 #[test]
 #[ignore="root-supervised header/retainedJSON only; no model/device"]
 fn q1_gemma_endpoint_metadata_prepare(){run().unwrap();}
@@ -66,6 +81,7 @@ fn run()->Result<()> {
     let mut raw=Vec::new();File::open(path)?.take(1024*1024+1).read_to_end(&mut raw)?;
     ensure!(raw.len()<=1024*1024,"bounded metadata config");let c:Config=serde_json::from_slice(&raw)?;
     output_preflight(&c.output)?;
+    if c.routing_recipes {ensure!(env!("HF2Q_MLX_NATIVE_VERSION")=="0.15.11","routing recipe metadata requires exact published1511 build");}
     ensure!(exact_hex(&c.expected_exporter_source_commit,40)&&exact_hex(&c.expected_exporter_binary_sha256,64)
         &&c.model.retained_full_sha256==MODEL_SHA,"exact selected source/binary/model bindings");
     let source=option_env!("HF2Q_BUILD_GIT_SHA").context("compiled source stamp")?;
@@ -127,12 +143,31 @@ fn run()->Result<()> {
         "device_created":false,"inference_performed":false,"tokenizer_semantic_attestation":false,
         "execution_approved":false,"composition_reviewed":false,"acquisition_attested":false,"whole_q1_qualified":false});
     let encoded=serde_json::to_vec_pretty(&value)?;ensure!(encoded.len()<=2*1024*1024,"metadata output bound");
+    // Additive file only; omitted/false flag preserves both old output bytes.
+    let routing_encoded=if c.routing_recipes {
+        let recipes=routing_recipe_export(&cfg)?;
+        let v=serde_json::json!({"schema":"hf2q.q1.gemma-routing-recipes-metadata.v1",
+            "exporter_source_commit":source,"exporter_binary_sha256":binary,
+            "native_version":env!("HF2Q_MLX_NATIVE_VERSION"),"config_input_sha256":hash(&raw),
+            "model_full_sha256_retained":MODEL_SHA,"model_file_identity":before,
+            "header_data_offset":gguf.tensor_data_offset(),"actual_gemma_config_debug":format!("{cfg:?}"),
+            "actual_gemma_config_debug_sha256":recipe.actual_model_config_sha256,
+            "tokenizer_file_sha256":c.tokenizer.sha256,"template_file_sha256":c.template.sha256,
+            "recipes":recipes,"runtime_dataset_binding":"SEPARATE independently reviewed842 greedy144 dataset; no dataset identity attested by recipe export",
+            "model_loaded":false,"device_created":false,"inference_performed":false,
+            "acquisition_attested":false,"execution_approved":false,"physical_admission":false,"whole_q1_qualified":false});
+        let encoded=serde_json::to_vec_pretty(&v)?;ensure!(encoded.len()<=128*1024,"bounded recipe metadata");Some(encoded)
+    }else{None};
     for ((b,n),old) in bindings.iter().zip(&bound) {ensure!(acquisition::checked_file(b,*n)?==*old,"bound input changed");}
     for (b,old) in c.producer_vectors.iter().zip(&vector_raw) {ensure!(acquisition::checked_file(b,4*1024*1024)?==*old,"producer vector changed");}
     ensure!(FileIdentity::observed(&fd)?==before,"model descriptor changed during metadata read");
     output_preflight(&c.output)?;std::fs::create_dir(&c.output)?;std::fs::set_permissions(&c.output,std::fs::Permissions::from_mode(0o700))?;
     for (name,bytes) in [("prepared.json",encoded),("workload.json",workload_bytes)] {
         OpenOptions::new().create_new(true).write(true).mode(0o600).open(c.output.join(name))?.write_all(&bytes)?;
+    }
+    if let Some(bytes)=routing_encoded {
+        OpenOptions::new().create_new(true).write(true).mode(0o600).open(c.output.join("routing-recipes.json"))?.write_all(&bytes)?;
+        println!("Q1_GEMMA_ROUTING_RECIPES_METADATA_PREPARED recipes=4 dataset_attested=false model=false device=false execution=false");
     }
     println!("Q1_GEMMA_ENDPOINT_METADATA_PREPARED lanes=4 tokens=144 device=false execution=false");Ok(())
 }

@@ -38,6 +38,11 @@ pub(super) fn recipe(cfg:&crate::serve::config::Gemma4Config)->acquisition::Conf
         cache_mode:"GemmaHybrid-F16K-U8V-no-xlen",route:"gemma-ordinary-full-row-endpoints-v1",
         actual_model_config_sha256:hash(format!("{cfg:?}").as_bytes())}
 }
+/// Same selected recipe used by actual acquisition checks and metadata export.
+pub(super) fn selected_recipe(cfg:&crate::serve::config::Gemma4Config,routing:bool)->acquisition::ConfigRecipe<'static> {
+    let mut r=recipe(cfg);
+    if routing {r.route="gemma-ordinary-full-row-endpoints-native-routing1511-v1";}r
+}
 pub(super) fn positions(t:Trajectory)->Vec<(usize,bool)> {
     let mut p=vec![(128,false),(144,false)];
     if matches!(t,Trajectory::T1Resume64|Trajectory::T3Chunk64|Trajectory::T6CancelRestore) {p.push((64,false));}
@@ -87,9 +92,7 @@ fn run(separate:Option<Trajectory>)->Result<()> {
     let mut cfg=crate::serve::config::Gemma4Config::from_gguf(&header)?;
     cfg.max_position_embeddings=p.configured_context as usize;
     ensure!(cfg.vocab_size==p.workload.vocab_size as usize,"Gemma actual vocabulary mismatch");
-    let selected_recipe=|cfg:&crate::serve::config::Gemma4Config| {let mut r=recipe(cfg);
-        if p.routing_witness.is_some(){r.route="gemma-ordinary-full-row-endpoints-native-routing1511-v1";}r};
-    scope.check_config(&p.identity,&selected_recipe(&cfg))?;drop(header);
+    scope.check_config(&p.identity,&selected_recipe(&cfg,p.routing_witness.is_some()))?;drop(header);
     let mut expected=gemma_cache::expected(&cfg,&[0,1,2,3],&positions(p.trajectory)).map_err(anyhow::Error::msg)?;
     for lane in 0..4 {for pos in 0..144 {expected.push(ExpectedTensor {at:Coordinate {
         logical_step:0,layer:u32::MAX,stage:Stage::Logits,agent:format!("agent-{lane}"),
@@ -110,7 +113,7 @@ fn run(separate:Option<Trajectory>)->Result<()> {
         dwq_overlay_path:None,kv_persist_dir:None,kv_persist_budget_bytes:0,glp_path:None,glp_alpha:None,kv_graft_path:None};
     let LoadedModel::Gemma(mut model)=LoadedModel::load_with_context(&options,Some(p.configured_context))?
         else {anyhow::bail!("explicit Gemma model required")};
-    scope.check_config(&p.identity,&selected_recipe(&model.config))?;
+    scope.check_config(&p.identity,&selected_recipe(&model.config,p.routing_witness.is_some()))?;
     let observed=scope.observed(model.ctx.executor.device(),&model as *const _ as usize as u64,3)?;
     store.bind_acquisition(observed.clone()).map_err(anyhow::Error::msg)?;
     model.provision_multi_seq_kv_for_slot_aware(4)?;

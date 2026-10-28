@@ -8,6 +8,11 @@ use crate::inference::models::gemma4::MlxModelWeights;
 #[path="gemma_ngram/runner.rs"]mod runner;
 #[cfg(test)]#[path="gemma_ngram/controls.rs"]mod controls;
 pub use journal::{PAYLOAD,METADATA};
+/// cfg(test)-only metadata visibility; no model/config/acquisition bypass.
+pub(super) fn configuration_recipe(cfg:&crate::serve::config::Gemma4Config,routing:bool)->crate::adr063_invariance::acquisition::ConfigRecipe<'static> {
+    runner::selected_recipe(cfg,routing)
+}
+
 fn require_selected_profile(hybrid:bool,dense:bool,allocation_bits:u32,effective_bits:u32,full_f16:bool)->Result<()> {
     ensure!(hybrid && !dense && allocation_bits==8 && effective_bits==8 && !full_f16,
         "T5 requires actual selected Hybrid/8bit/non-full-F16 before model load");Ok(())

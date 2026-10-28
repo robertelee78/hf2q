@@ -83,3 +83,41 @@ fn header_boundary_refuses_family_fallback_or_template_drift() {
     assert!(require_header(Some("gemma4"),Some("drift"),"exact").is_err());
     assert!(require_header(Some("gemma4"),None,"exact").is_err());
 }
+
+#[test]
+fn actual_runtime_recipe_selectors_export_old_and_routing_labels() {
+    let cfg=cfg();let rows=routing_recipe_export(&cfg).unwrap();assert_eq!(rows.len(),4);
+    for (i,(adapter,routing)) in [("ordinary",false),("T5",false),("ordinary",true),("T5",true)].into_iter().enumerate() {
+        let actual=if adapter=="ordinary" {super::super::gemma_actual::selected_recipe(&cfg,routing)}
+            else {super::super::gemma_ngram::configuration_recipe(&cfg,routing)};
+        assert_eq!(rows[i]["adapter"],adapter);assert_eq!(rows[i]["routing_witness"],routing);
+        assert_eq!(rows[i]["config_sha256"],acquisition::config_digest(&actual).unwrap());
+        assert_eq!(rows[i]["recipe"],serde_json::to_value(actual).unwrap());
+        assert_eq!(rows[i]["recipe"]["actual_model_config_sha256"],hash(format!("{cfg:?}").as_bytes()));
+    }
+    assert_eq!(rows[0]["recipe"],serde_json::to_value(super::super::gemma_actual::recipe(&cfg)).unwrap());
+    assert_eq!(rows[0]["recipe"]["route"],"gemma-ordinary-full-row-endpoints-v1");
+    assert_eq!(rows[1]["recipe"]["route"],"gemma-ngram-injected-one-real-round-then-ordinary-v1");
+    assert_eq!(rows[2]["recipe"]["route"],"gemma-ordinary-full-row-endpoints-native-routing1511-v1");
+    assert_eq!(rows[3]["recipe"]["route"],"gemma-ngram-injected-native-routing1511-v1");
+    for (old,new) in [(0,2),(1,3)] {
+        assert_ne!(rows[old]["config_sha256"],rows[new]["config_sha256"]);
+        let mut a=rows[old]["recipe"].clone();let mut b=rows[new]["recipe"].clone();
+        a.as_object_mut().unwrap().remove("route");b.as_object_mut().unwrap().remove("route");assert_eq!(a,b);
+    }
+}
+#[test]
+fn metadata_routing_optin_defaults_false_and_rejects_null_or_unknown() {
+    let bound=serde_json::json!({"path":"/private/tmp/x","sha256":"a".repeat(64)});
+    let mut value=serde_json::json!({"model":{"path":"/private/tmp/model","retained_full_sha256":MODEL_SHA,
+        "file_identity":{"device":1,"inode":2,"bytes":3,"mtime":4,"mtime_ns":5,"ctime":6,"ctime_ns":7}},
+        "full_content_receipt":bound,"tokenizer":bound,"template":bound,"producer_metadata":bound,
+        "producer_build_receipt":bound,"producer_export_receipt":bound,"producer_config":bound,
+        "producer_vectors":[bound,bound,bound,bound],"expected_exporter_source_commit":"b".repeat(40),
+        "expected_exporter_binary_sha256":"c".repeat(64),"output":"/private/tmp/new-q1-gemma"});
+    assert!(!serde_json::from_value::<Config>(value.clone()).unwrap().routing_recipes);
+    value["routing_recipes"]=serde_json::json!(true);assert!(serde_json::from_value::<Config>(value.clone()).unwrap().routing_recipes);
+    value["routing_recipes"]=serde_json::Value::Null;assert!(serde_json::from_value::<Config>(value.clone()).is_err());
+    value["routing_recipes"]=serde_json::json!(false);value["routing_recipe_fallback"]=serde_json::json!(true);
+    assert!(serde_json::from_value::<Config>(value).is_err());
+}
