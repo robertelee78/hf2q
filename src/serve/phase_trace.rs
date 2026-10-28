@@ -174,7 +174,10 @@ fn validate_config(c: &Config) -> Result<(), String> {
         return Err("invalid combined server/client trace quota".into());
     }
     if let Some(native) = &c.native_observer {
-        native.validate(c.server_budget_bytes)?;
+        native.validate(
+            c.server_budget_bytes,
+            metadata_budget::event_limit(c.metadata_budget_profile),
+        )?;
     }
     let keys = [
         "server_source",

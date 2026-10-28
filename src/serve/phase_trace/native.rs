@@ -57,7 +57,7 @@ impl Config {
     pub(super) fn reservation_bytes(&self) -> u64 {
         self.metadata_limit_bytes + BOOKKEEPING_BYTES
     }
-    pub(super) fn validate(&self, server: u64) -> Result<(), String> {
+    pub(super) fn validate(&self, server: u64, event_limit: u64) -> Result<(), String> {
         if !self.diagnostic_case
             || !self.witness_manifest.validate()
             || !(32..=128).contains(&self.control_nonce.len())
@@ -65,7 +65,7 @@ impl Config {
                 .control_nonce
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
-            || !(1..=1_000_000).contains(&self.event_limit)
+            || !(1..=event_limit).contains(&self.event_limit)
             || !(1..=16 * 1024 * 1024).contains(&self.metadata_limit_bytes)
             || self
                 .reservation_bytes()
@@ -172,17 +172,17 @@ mod tests {
                 batching_scope: "operator_only_full_body_unknown".into(),
             },
         };
-        assert!(config.validate(128 * 1024 * 1024).is_ok());
+        assert!(config.validate(128 * 1024 * 1024, 1_000_000).is_ok());
         assert_eq!(
             128 * 1024 * 1024 - config.reservation_bytes(),
             111 * 1024 * 1024
         );
-        assert!(config.validate(16 * 1024 * 1024).is_err());
+        assert!(config.validate(16 * 1024 * 1024, 1_000_000).is_err());
         assert!(Config {
             diagnostic_case: false,
             ..config
         }
-        .validate(128 * 1024 * 1024)
+        .validate(128 * 1024 * 1024, 1_000_000)
         .is_err());
     }
     #[test]

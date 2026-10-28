@@ -8,6 +8,7 @@ import json
 SCHEMA = "hf2q.f2.phase-trace.v1"
 TOTAL_LIMIT = 256 * 1024 * 1024
 NATIVE_TOTAL_LIMIT = 2 * 1024 * 1024 * 1024
+NATIVE_V3_TOTAL_LIMIT = 8 * 1024 * 1024 * 1024
 EVENT_LIMIT = 64 * 1024
 SLOT_KEYS = {"request_id", "slot_id", "generation", "phase", "active",
              "runnable_forward", "runnable_emit", "inflight", "blocked"}
@@ -34,12 +35,13 @@ def metadata_total_limit(header):
     if "metadata_budget_profile" not in header:
         return TOTAL_LIMIT
     require(type(header["metadata_budget_profile"]) is str and
-            header["metadata_budget_profile"] == "native_command_capture_v2",
+            header["metadata_budget_profile"] in ("native_command_capture_v2", "native_command_capture_v3"),
             "unsupported metadata budget profile")
     native = header.get("native_observer")
     require(type(native) is dict and native.get("diagnostic_case") is True,
             "native metadata profile requires explicit diagnostic observer")
-    return NATIVE_TOTAL_LIMIT
+    return (NATIVE_V3_TOTAL_LIMIT if header["metadata_budget_profile"] == "native_command_capture_v3"
+            else NATIVE_TOTAL_LIMIT)
 
 
 def validate_trace(records, expected_identity, scenario):
