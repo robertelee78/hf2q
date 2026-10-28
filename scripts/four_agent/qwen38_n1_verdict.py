@@ -136,7 +136,7 @@ def assistant(message, finish, turn, seen_ids):
     return cid, name, args
 
 
-def unary(raw, model, turn, seen, engine_kind="hf2q"):
+def unary(raw, model, turn, seen, engine_kind="hf2q", *, assistant_policy=None):
     obj = loads(raw)
     require(isinstance(obj, dict) and "error" not in obj, "API error")
     require(obj.get("model") == model and isinstance(obj.get("id"), str), "response identity")
@@ -144,14 +144,16 @@ def unary(raw, model, turn, seen, engine_kind="hf2q"):
     require(isinstance(choices, list) and len(choices) == 1 and choices[0].get("index") == 0,
             "choice count/index")
     message = choices[0].get("message")
-    call = assistant(message, choices[0].get("finish_reason"), turn, seen)
+    policy = assistant if assistant_policy is None else assistant_policy
+    call = policy(message, choices[0].get("finish_reason"), turn, seen)
     return message, call, usage(obj.get("usage"), turn, engine_kind)
 
 
 class SSE:
     """Consume every complete SSE data frame, including usage and terminal marker."""
-    def __init__(self, model, turn, seen, engine_kind="hf2q"):
+    def __init__(self, model, turn, seen, engine_kind="hf2q", *, assistant_policy=None):
         self.engine_kind = engine_kind
+        self.assistant_policy = assistant if assistant_policy is None else assistant_policy
         self.model, self.turn, self.seen = model, turn, seen
         self.identity = None
         self.message = {"role": "assistant", "content": "", "reasoning_content": ""}
@@ -219,7 +221,7 @@ class SSE:
         require(self.done, "missing DONE")
         if self.calls:
             self.message["tool_calls"] = [self.calls[0]]
-        call = assistant(self.message, self.finish, self.turn, self.seen)
+        call = self.assistant_policy(self.message, self.finish, self.turn, self.seen)
         return self.message, call, self.stats
 
 
