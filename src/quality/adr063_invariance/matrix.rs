@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum Adapter {
     QwenOrdinary,
     DeepseekOrdinary,
+    GemmaOrdinary,
     QwenOwningWorkerRecovery,
     QwenCoherentSpeculation,
     SourceRefusal,
@@ -46,6 +47,9 @@ pub fn cell(family: Family, trajectory: Trajectory) -> Cell {
         (Deepseek4, _) => (DeepseekOrdinary,
             "deepseek_runner actual forward; T6 real commit gate",
             "endpoint helper lacks full active cache extent and exact64 capture joins"),
+        (Gemma4, T0ColdSerial | T1Resume64 | T3Chunk64 | T4ReverseOrder | T7RepeatCold | T8RepeatCold) => (GemmaOrdinary,
+            "gemma_actual production slot-aware Hybrid body; same scalar head for all actual rows",
+            "authored diagnostic; actual execution, exact checkpoint and full cache coverage pending"),
         (Gemma4, _) => (Missing,
             "single-lane Gemma localizer is not a four-lane nine-trajectory runner",
             "actual family adapter/full-row logits/cache extents required; no blanket unsupported disposition"),
@@ -61,7 +65,7 @@ pub fn catalogue() -> Vec<Cell> {
 /// Real T5/T6 require the separate owning-worker APIs, not this generic graph.
 pub fn ordinary_preflight(family: Family, trajectory: Trajectory) -> Result<(), String> {
     match cell(family, trajectory).adapter {
-        Adapter::QwenOrdinary | Adapter::DeepseekOrdinary => Ok(()),
+        Adapter::QwenOrdinary | Adapter::DeepseekOrdinary | Adapter::GemmaOrdinary => Ok(()),
         Adapter::SourceRefusal => Err(format!("SourceCapabilityRefusal: {}", cell(family, trajectory).gap)),
         Adapter::QwenCoherentSpeculation | Adapter::QwenOwningWorkerRecovery =>
             Err(format!("SeparateActualAdapterRequired: {}", cell(family, trajectory).scope)),

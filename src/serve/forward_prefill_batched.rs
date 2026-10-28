@@ -6323,6 +6323,13 @@ impl MlxModelWeights {
                 .collect(),
             None => vec![seq_len - 1],
         };
+        #[cfg(test)]
+        let q1_endpoint_rows = crate::adr063_invariance::gemma_endpoint::head_rows(
+            start_pos, seq_len, self.multi_seq_prefill.is_some()).map_err(anyhow::Error::msg)?;
+        #[cfg(test)]
+        let q1_endpoint_all_rows = q1_endpoint_rows.is_some();
+        #[cfg(test)]
+        let head_rows = q1_endpoint_rows.unwrap_or(head_rows);
         let mut ms_tokens: Vec<u32> = Vec::with_capacity(head_rows.len());
         let mut ms_logits: Vec<Vec<f32>> = Vec::with_capacity(head_rows.len());
         let capture_multi_seq_logits = self.multi_seq_prefill.is_some();
@@ -6481,6 +6488,10 @@ impl MlxModelWeights {
             s.finish()
                 .map_err(|e| anyhow::anyhow!("batched head finish: {e}"))?;
 
+            #[cfg(test)]
+            crate::adr063_invariance::gemma_endpoint::logits(
+                head_row, &self.activations.logits, vocab_size).map_err(anyhow::Error::msg)?;
+
             if capture_multi_seq_logits {
                 let logits: &[f32] = self
                     .activations
@@ -6518,6 +6529,9 @@ impl MlxModelWeights {
             if ms_tokens.is_empty() {
                 first_token = tok;
             }
+            // Diagnostic visits every row; preserve the ordinary last-row result.
+            #[cfg(test)]
+            if q1_endpoint_all_rows { first_token = tok; }
             ms_tokens.push(tok);
         }
         // iter-G(a): hand the per-seq first tokens back to the wrapper. No-op

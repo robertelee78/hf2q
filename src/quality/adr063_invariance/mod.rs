@@ -34,3 +34,8 @@ mod continuation_artifact_compare;
 mod t5_artifact_compare;
 
 pub(crate) mod matrix;
+
+pub(crate) mod gemma_endpoint;
+pub(crate) mod gemma_cache;
+#[cfg(test)]
+mod gemma_actual;
