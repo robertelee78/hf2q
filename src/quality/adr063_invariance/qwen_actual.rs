@@ -89,6 +89,11 @@ fn q1_qwen_actual_endpoint_trace() {
             },
         )
         .unwrap();
+    let preplanned_cache = super::qwen_checkpoint::expected_cache(&header_cfg,
+        packet.workload.family,packet.trajectory,packet.configured_capacity,packet.mtp_positions).unwrap();
+    assert_eq!(packet.expected_cache,preplanned_cache,"complete cache roles must match header before model load");
+    let planned_payload = super::qwen_checkpoint::planned_payload(&preplanned_cache,
+        header_cfg.vocab_size as usize,packet.requested_payload_limit).unwrap();
     let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
     let model =
         crate::inference::models::qwen35::model::Qwen35Model::load_from_gguf(&gguf, &mut progress)
@@ -121,22 +126,9 @@ fn q1_qwen_actual_endpoint_trace() {
             });
         }
     }
-    let mut canonical_cache = Vec::new();
-    for (index, boundary) in [128, 144].into_iter().enumerate() {
-        assert!(packet.mtp_positions[index] <= boundary);
-        for lane in 0..4 {
-            canonical_cache.extend(
-                super::qwen_cache::manifest(
-                    &model.cfg,
-                    packet.configured_capacity,
-                    &format!("agent-{lane}"),
-                    boundary,
-                    packet.mtp_positions[index],
-                )
-                .unwrap(),
-            );
-        }
-    }
+    let canonical_cache = super::qwen_checkpoint::expected_cache(&model.cfg,
+        packet.workload.family,packet.trajectory,packet.configured_capacity,packet.mtp_positions).unwrap();
+    assert_eq!(canonical_cache,preplanned_cache,"loaded model cache plan differs from header admission");
     assert!(
         !canonical_cache.is_empty(),
         "complete active-cache manifest is mandatory"
@@ -190,7 +182,18 @@ fn q1_qwen_actual_endpoint_trace() {
         &packet.workload,
         packet.trajectory,
         packet.configured_capacity,
-        |lane, end, values, cache| {
+        |lane, end, observation, cache| {
+            let values = match observation {
+                qwen_runner::Observation::Forward(values) => values,
+                qwen_runner::Observation::Restored64 => {
+                    anyhow::ensure!(packet.workload.family==Family::Qwen36 &&
+                        packet.trajectory==Trajectory::T1Resume64 && end==64,"explicit Q36 actual restore scope");
+                    anyhow::ensure!(cache.mtp_slot.as_ref().map_or(0,|slot|slot.current_len[0])==0,
+                        "ordinary restore64 unexpectedly contains active MTP");
+                    super::qwen_cache::after_restored64(&mut store,cache,layer,&format!("agent-{lane}"))?;
+                    return Ok(());
+                }
+            };
             anyhow::ensure!(values.len() % vocab == 0, "Qwen actual download row layout");
             let count = values.len() / vocab;
             let start = end
@@ -203,13 +206,13 @@ fn q1_qwen_actual_endpoint_trace() {
                     "Qwen actual forward_gpu checked return/download; parent identity is host row, NOT Metal",bytes)
                     .map_err(anyhow::Error::msg)?;
             }
-            if matches!(end, 128 | 144) {
+            if matches!(end, 128 | 144) || (end==64 && super::qwen_checkpoint::captures64(packet.workload.family,packet.trajectory)) {
                 let actual_mtp = cache
                     .mtp_slot
                     .as_ref()
                     .map_or(0, |slot| slot.current_len[0] as usize);
                 anyhow::ensure!(
-                    actual_mtp == packet.mtp_positions[usize::from(end == 144)],
+                    actual_mtp == if end==64 {0} else {packet.mtp_positions[usize::from(end == 144)]},
                     "actual MTP cursor differs from frozen manifest; no skipped active prefix"
                 );
                 super::qwen_cache::after_checked_terminal(
@@ -234,8 +237,11 @@ fn q1_qwen_actual_endpoint_trace() {
     acquisition_scope.check_unchanged().unwrap();
     let trace = store.finish().unwrap();
     assert!(trace.coverage.errors.is_empty());
+    let exact64 = if packet.workload.family==Family::Qwen36 && packet.trajectory==Trajectory::T1Resume64 {
+        Some(super::qwen_checkpoint::require_restore64_exact(&trace.coverage.captured))
+    } else {None};
     let evidence = serde_json::json!({"schema":"hf2q.adr063.q1.endpoint-acquisition.v1","packet_sha256":hash(&raw),"execution":execution,
-        "trace_records":trace.coverage.captured.len(),"complete_active_cache_boundaries":[128,144],"mtp_positions":packet.mtp_positions,"internal_stage_localization":"NotEstablishedByEndpointTrace",
+        "trace_records":trace.coverage.captured.len(),"planned_tensor_payload_bytes":planned_payload,"qwen36_active64_captured":super::qwen_checkpoint::captures64(packet.workload.family,packet.trajectory),"qwen36_restore64_exact":exact64,"complete_active_cache_boundaries":[128,144],"mtp_positions":packet.mtp_positions,"internal_stage_localization":"NotEstablishedByEndpointTrace",
         "whole_q1_qualified":false,"identity_attestation":"RequiresIndependentLaunchBuildArtifactComposition"});
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -245,6 +251,7 @@ fn q1_qwen_actual_endpoint_trace() {
         .unwrap();
     file.write_all(&serde_json::to_vec_pretty(&evidence).unwrap())
         .unwrap();
+    if let Some(exact)=exact64 {exact.unwrap();}
     eprintln!(
         "Q1_QWEN_ENDPOINT_ACQUISITION_COMPLETE records={} whole_q1_qualified=false",
         trace.coverage.captured.len()

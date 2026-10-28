@@ -18,6 +18,13 @@ pub fn after_checked_terminal(
     agent: &str,
     boundary: usize,
 ) -> Result<()> {
+    capture_tagged(store, cache, layer_count, agent, boundary, 0)
+}
+/// Same complete active buffer reads after real CPU snapshot restore; no new wait.
+pub fn after_restored64(store: &mut Store, cache: &HybridKvCache, layer_count: u32, agent: &str) -> Result<()> {
+    capture_tagged(store, cache, layer_count, agent, 64, 1000)
+}
+fn capture_tagged(store: &mut Store, cache: &HybridKvCache, layer_count: u32, agent: &str, boundary: usize, segment_base: u32) -> Result<()> {
     ensure!(cache.n_seqs==1,"Q1 cache adapter currently requires independently owned serial caches; no cross-slot guess");
     ensure!(
         cache.sequence_len_for_slot(SlotId(0))? as usize == boundary,
@@ -35,6 +42,7 @@ pub fn after_checked_terminal(
                 boundary,
                 layer,
                 boundary,
+                segment_base,
             )?,
             LayerSlot::Linear(index) => {
                 let state = &cache.linear_attn[index as usize];
@@ -47,11 +55,12 @@ pub fn after_checked_terminal(
                 ] {
                     capture::after_checked_drain(
                         store,
-                        at(agent, boundary, layer, stage, 0),
+                        at(agent, boundary, layer, stage, segment_base),
                         buffer,
                         buffer.shape(),
                         None,
-                        "Qwen actual terminal + visible cursor + per-slot current ping-pong getter",
+                        if segment_base==0 {"Qwen actual terminal + visible cursor + per-slot current ping-pong getter"}
+                        else {"Qwen synchronous CPU restore; source prefix checked before snapshot; no new GPU submit"},
                     )
                     .map_err(anyhow::Error::msg)?;
                 }
@@ -63,7 +72,7 @@ pub fn after_checked_terminal(
         // ordinary forwards, and an unexecuted MTP capacity tail is not read.
         let valid = mtp.current_len[0] as usize;
         if valid > 0 {
-            full(store, mtp, agent, valid, layer_count, boundary)?;
+            full(store, mtp, agent, valid, layer_count, boundary, segment_base)?;
         }
     }
     Ok(())
@@ -75,6 +84,7 @@ fn full(
     valid: usize,
     layer: u32,
     observation_boundary: usize,
+    segment_base: u32,
 ) -> Result<()> {
     ensure!(
         slot.current_len.as_slice() == [valid as u32],
@@ -93,6 +103,7 @@ fn full(
                 layer,
                 stage,
                 observation_boundary,
+                segment_base,
             )?;
         }
     }
@@ -111,6 +122,7 @@ fn full(
                 layer,
                 stage,
                 observation_boundary,
+                segment_base,
             )?;
         }
     }
@@ -124,6 +136,7 @@ fn heads(
     layer: u32,
     stage: Stage,
     observation_boundary: usize,
+    segment_base: u32,
 ) -> Result<()> {
     let shape = buffer.shape();
     ensure!(
@@ -136,13 +149,15 @@ fn heads(
         buffer.data_byte_len(),
         valid,
     )? {
+        ensure!(segment_base==0 || span.head < 1000, "Qwen diagnostic checkpoint segment space");
         let view = buffer
             .slice_view(span.offset as u64, span.elements)
             .with_shape(span.shape)?;
         // One COMPLETE active matrix per head. No token row is omitted;
         // the first differing flat element can be decoded with its shape.
-        capture::after_checked_drain(store,at(agent,observation_boundary,layer,stage,span.head),&view,view.shape(),None,
-            "Qwen actual checked terminal; complete visible head matrix, excludes inactive capacity")
+        capture::after_checked_drain(store,at(agent,observation_boundary,layer,stage,span.head.checked_add(segment_base).context("Qwen capture segment overflow")?),&view,view.shape(),None,
+            if segment_base==0 {"Qwen actual checked terminal; complete visible head matrix, excludes inactive capacity"}
+            else {"Qwen synchronous CPU restore; complete active head; no new GPU submit"})
             .map_err(anyhow::Error::msg)?;
     }
     Ok(())

@@ -11,12 +11,14 @@ use crate::inference::models::qwen35::{
 use crate::serve::multi_seq_kv::SlotId;
 use anyhow::{ensure, Result};
 
+pub enum Observation<'a> { Forward(&'a [f32]), Restored64 }
+
 pub fn run(
     model: &Qwen35Model,
     work: &Workload,
     trajectory: Trajectory,
     capacity: u32,
-    mut observe: impl FnMut(usize, usize, &[f32], &HybridKvCache) -> Result<()>,
+    mut observe: impl FnMut(usize, usize, Observation<'_>, &HybridKvCache) -> Result<()>,
 ) -> Result<ExecutionEvidence> {
     work.validate().map_err(anyhow::Error::msg)?;
     ensure!(
@@ -78,6 +80,9 @@ pub fn run(
                     "Qwen actual restore cursor"
                 );
                 evidence.restored_at = Some(64);
+                if work.family == Family::Qwen36 {
+                    observe(lane, 64, Observation::Restored64, &cache)?;
+                }
             }
             forward(
                 model,
@@ -122,7 +127,7 @@ fn forward(
     tokens: &[u32],
     cache: &mut HybridKvCache,
     evidence: &mut ExecutionEvidence,
-    observe: &mut impl FnMut(usize, usize, &[f32], &HybridKvCache) -> Result<()>,
+    observe: &mut impl FnMut(usize, usize, Observation<'_>, &HybridKvCache) -> Result<()>,
 ) -> Result<()> {
     ensure!(
         cache.sequence_len_for_slot(SlotId(0))? as usize == start,
@@ -153,5 +158,5 @@ fn forward(
         vec![cache.sequence_len_for_slot(SlotId(0))? as usize],
         true,
     );
-    observe(lane, end, &logits, cache)
+    observe(lane, end, Observation::Forward(&logits), cache)
 }
