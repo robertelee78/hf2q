@@ -2707,3 +2707,37 @@ or model quality. Pure route/overflow/extent controls are also ported. All are
 UNRUN at this checkpoint. Root owns fresh compilation/hardware/full normal N4
 correctness/prefix and matched timing. No kernels, context/slots/output limits,
 positive allowance, physical credit or fit/performance acceptance changes.
+
+
+#### Fresh current-port adapter results (2026-10-29)
+
+Root compiled clean source `ab4aac489e784397351fc912f767b66238f9a3e8`
+against published registry `mlx-native 0.15.15` in release test profile. The
+DeepSeek filter passed 116 controls with 18 ignored. Binary SHA256 was
+`e1c9aa0848df62702fb478935b522e5ce60cc530132e11f8928b27022497043c`.
+Eight runner protocol controls passed before independent operating review.
+
+Each of the following exact filters then ran once in its own fresh, serial,
+root-supervised process on Apple M5 Max, with `--ignored --exact --nocapture
+--test-threads=1`:
+
+- `inference::models::deepseek4::forward_support::output_a_staging_tests::output_a_staging_actual_q8_old_some_new_none_bits_and_fallback_current_main_port`
+  passed: both R33 strided omission and R8 fallback cases completed, with five
+  ordered markers and checked full-output bit equality asserted by the source.
+  Child elapsed was 0.962s; terminal checks completed at 1.356s from spawn.
+- `inference::models::deepseek4::attention_workspace::gpu::actual_common_adapters_separate_vs_shared_direct_and_reorder_current_main_port`
+  passed: 12 common-adapter cases, two reuse rounds each, covered R1/R65 and
+  profile labels 0/4/128 in direct and recorded modes. The 24 recorded executions
+  reported 12–17 reordered operations and 9–13 barriers. Shared-parent identity,
+  separate live query norm, output bits, hostile-reuse guards and two invalid
+  workspace refusals were source assertions. Child elapsed was 1.165s; terminal
+  checks completed at 1.552s from spawn.
+
+Both children exited zero and were reaped with empty owned process groups and
+empty fixture directories. Neither loaded a model. The tests exported no raw
+output-bit arrays and installed no native allocation quota. The alias fixture's
+245111984-byte bound covers live named data plus reserve, not cumulative allocator
+history or physical retirement. These results establish component correctness;
+normal N4 model quality, tool continuation, prefix reuse and matched performance
+remain required before adoption. No physical-fit, speed or whole-Q5 acceptance
+is inferred, and gather remains unchanged.
