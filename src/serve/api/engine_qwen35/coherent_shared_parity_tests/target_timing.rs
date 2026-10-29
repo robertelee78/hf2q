@@ -1,6 +1,6 @@
 //! Producer-only teacher forcing; NOT complete AUTO/tail/performance acceptance.
 use super::*;
-use crate::inference::models::qwen35::{Qwen35Model,kv_cache::target_timing_requested_cache_bytes};
+use crate::inference::models::qwen35::{model::Qwen35Model,kv_cache::target_timing_requested_cache_bytes};
 use shared::target_timing_hooks;
 use std::time::Instant;
 use std::os::unix::fs::MetadataExt;
