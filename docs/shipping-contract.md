@@ -303,6 +303,7 @@ an explicit acknowledgment: `HF2Q_UNSAFE_EXPERIMENTS=1`.
 
 | Var | Unsafe-ack | Purpose |
 |---|---|---|
+| `HF2Q_DEEPSEEK_OWNER_PACKET=<absolute-json>` | **required** | Default-OFF selected DeepSeek owner-collector research intent, read once centrally before devices. Invalid/unacknowledged/nonregular/symlink packet input refuses; no fallback. Current FullCoalescedNoCopy preload remains rejected; runtime page observation unavailable until separately published/pinned native API. No physical-credit, fit, runtime admission or Q5 qualification authority. |
 | `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1` | **required** | Default-OFF Gemma Hybrid/TQ8 SlotAware1–4 full-input checkpoint source stage; exact token identity and1536MiB requested CPU anchor quota across all capture roles. Invalid/unsupported/unacknowledged startup refuses, no partial-prefix fallback. Not model/full-prefix/physical admission qualification. |
 | `HF2Q_QWEN_POOL_GROWTH_PROFILE=adr063-24g-v1` | **required** | Optional fixed Qwen native scratch-pool creation quota; default legacy unchanged. Requested invalid/unacknowledged/unsupported startup fails rather than serving uncapped. Text/tools only, 1–4 SlotAware slots, one worker/generation. Sticky refusal prevents ordinary replay/reuse. This is an enforcing domain policy, not whole-memory/model/performance admission; see operator-env-vars.md. |
 | `HF2Q_LMHEAD_RERANK=0` | **required** | Measure raw Q8 argmax cost. Reintroduces the rare near-tiebreak flip (observed as mid-decode `<pad>` emission). |

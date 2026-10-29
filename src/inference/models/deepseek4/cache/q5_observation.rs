@@ -1,5 +1,5 @@
 //! Borrowed actual field traversal. No buffer clones or private-field exports.
-use super::{Deepseek4Cache, Deepseek4CacheSnapshot};
+use super::{CacheBufferPlan, Deepseek4Cache, Deepseek4CacheSnapshot};
 use anyhow::{ensure, Result};
 use mlx_native::MlxBuffer;
 
@@ -11,16 +11,46 @@ impl Deepseek4Cache {
             "Q5 cache plan/layer drift"
         );
         for (index, layer) in self.layers.iter().enumerate() {
-            for (role, buffer) in [
-                ("attention_parent", Some(&layer.attention_kv)),
-                ("window_view", Some(&layer.window_kv)),
-                ("compressed_view", layer.compressed_kv.as_ref()),
-                ("indexer_kv", layer.indexer_kv.as_ref()),
-                ("main_kv_state", layer.main_kv_state.as_ref()),
-                ("main_score_state", layer.main_score_state.as_ref()),
-                ("indexer_kv_state", layer.indexer_kv_state.as_ref()),
-                ("indexer_score_state", layer.indexer_score_state.as_ref()),
+            let plan = &self.plan.layers[index];
+            for (role, expected, buffer) in [
+                (
+                    "attention_parent",
+                    Some(&plan.attention_kv),
+                    Some(&layer.attention_kv),
+                ),
+                ("window_view", Some(&plan.window_kv), Some(&layer.window_kv)),
+                (
+                    "compressed_view",
+                    plan.compressed_kv.as_ref(),
+                    layer.compressed_kv.as_ref(),
+                ),
+                (
+                    "indexer_kv",
+                    plan.indexer_kv.as_ref(),
+                    layer.indexer_kv.as_ref(),
+                ),
+                (
+                    "main_kv_state",
+                    plan.main_kv_state.as_ref(),
+                    layer.main_kv_state.as_ref(),
+                ),
+                (
+                    "main_score_state",
+                    plan.main_score_state.as_ref(),
+                    layer.main_score_state.as_ref(),
+                ),
+                (
+                    "indexer_kv_state",
+                    plan.indexer_kv_state.as_ref(),
+                    layer.indexer_kv_state.as_ref(),
+                ),
+                (
+                    "indexer_score_state",
+                    plan.indexer_score_state.as_ref(),
+                    layer.indexer_score_state.as_ref(),
+                ),
             ] {
+                require_field(expected, buffer)?;
                 visit(&format!("layer/{index}/{role}"), buffer)?;
             }
         }
@@ -34,19 +64,50 @@ impl Deepseek4CacheSnapshot {
             "Q5 anchor plan/layer drift"
         );
         for (index, layer) in self.layers.iter().enumerate() {
-            for (role, buffer) in [
-                ("window_copy", Some(&layer.window_kv)),
-                ("main_kv_state_copy", layer.main_kv_state.as_ref()),
-                ("main_score_state_copy", layer.main_score_state.as_ref()),
-                ("indexer_kv_state_copy", layer.indexer_kv_state.as_ref()),
+            let plan = &self.plan.layers[index];
+            for (role, expected, buffer) in [
+                ("window_copy", Some(&plan.window_kv), Some(&layer.window_kv)),
+                (
+                    "main_kv_state_copy",
+                    plan.main_kv_state.as_ref(),
+                    layer.main_kv_state.as_ref(),
+                ),
+                (
+                    "main_score_state_copy",
+                    plan.main_score_state.as_ref(),
+                    layer.main_score_state.as_ref(),
+                ),
+                (
+                    "indexer_kv_state_copy",
+                    plan.indexer_kv_state.as_ref(),
+                    layer.indexer_kv_state.as_ref(),
+                ),
                 (
                     "indexer_score_state_copy",
+                    plan.indexer_score_state.as_ref(),
                     layer.indexer_score_state.as_ref(),
                 ),
             ] {
+                require_field(expected, buffer)?;
                 visit(&format!("layer/{index}/{role}"), buffer)?;
             }
         }
         Ok(())
+    }
+}
+
+fn require_field(expected: Option<&CacheBufferPlan>, actual: Option<&MlxBuffer>) -> Result<()> {
+    match (expected, actual) {
+        (None, None) => Ok(()),
+        (Some(plan), Some(buffer)) => {
+            ensure!(
+                buffer.dtype() == plan.dtype
+                    && buffer.shape() == plan.shape.as_slice()
+                    && u64::try_from(buffer.data_byte_len())? == plan.bytes,
+                "Q5 actual cache/anchor field differs from source plan"
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!("Q5 cache/anchor Present/Absent differs from actual plan"),
     }
 }

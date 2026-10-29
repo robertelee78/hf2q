@@ -168,3 +168,255 @@ fn unpublished_page_observer_cannot_grant_runtime_support() {
         .require_runtime_support()
         .is_err());
 }
+
+#[test]
+fn actual_metadata_context_transfers_only_after_owner_scope_detaches() {
+    let scope = collector::HeaderScope::enter().unwrap();
+    let context = scope.handle();
+    assert!(context.attach().is_err());
+    drop(scope);
+    let counts = std::thread::spawn(move || {
+        let scope = context.attach().unwrap();
+        collector::owner_begin(0, 1, 7).unwrap();
+        collector::owner_finish(0, 1, 7).unwrap();
+        drop(scope);
+        context.summary().unwrap()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(counts, (0, 0, 0, false)); // metadata only; no native/FD observation
+}
+
+#[test]
+fn pending_or_failed_metadata_context_cannot_transfer_to_another_worker() {
+    let scope = collector::HeaderScope::enter().unwrap();
+    let context = scope.handle();
+    let id = collector::chain();
+    collector::command(id, 0, None);
+    drop(scope);
+    assert!(context.attach().is_err());
+    assert!(context.summary().is_err());
+}
+
+#[test]
+fn actual_none_entry_calls_original_constructor_without_context_or_file_open() {
+    let called = Cell::new(false);
+    let value = load_selected(None, Path::new("does-not-exist"), |prepared| {
+        assert!(prepared.is_none());
+        called.set(true);
+        Ok(17)
+    })
+    .unwrap();
+    assert!(called.get());
+    assert_eq!(value, 17);
+}
+
+#[test]
+fn actual_closed_packet_rejects_duplicate_cells_and_uppercase_planned_hash() {
+    let mut p = packet();
+    p.cells.insert(
+        "same_fd_header".into(),
+        packet::Cell::Planned {
+            evidence_sha256: "A".repeat(64),
+        },
+    );
+    assert!(p.validate().is_err());
+    let raw = serde_json::to_string(&packet()).unwrap();
+    let duplicate = raw.replacen(
+        "\"cells\":{",
+        "\"cells\":{\"same_fd_header\":{\"state\":\"Unknown\",\"reason\":\"duplicate\"},",
+        1,
+    );
+    assert_ne!(raw, duplicate);
+    assert!(serde_json::from_str::<Packet>(&duplicate).is_err());
+}
+
+#[test]
+fn actual_diagnostic_open_refuses_fifo_and_symlink_before_read() {
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: owned fresh test directory, live NUL-terminated CString.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    assert!(diagnostic_open(&fifo).is_err());
+    let regular = dir.path().join("regular");
+    std::fs::write(&regular, b"x").unwrap();
+    let link = dir.path().join("alias");
+    symlink(&regular, &link).unwrap();
+    assert!(diagnostic_open(&link).is_err());
+    assert!(diagnostic_open(&regular).is_ok());
+}
+
+#[test]
+fn actual_same_fd_tiny_header_records_source_but_never_calls_model_constructor() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let model = dir.path().join("header.gguf");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // no tensors, header-only control
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    let key = b"general.architecture";
+    let value = b"deepseek4";
+    bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(key);
+    bytes.extend_from_slice(&8u32.to_le_bytes()); // GGUF string metadata
+    bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(value);
+    bytes.resize(bytes.len().div_ceil(32) * 32, 0);
+    std::fs::write(&model, &bytes).unwrap();
+    let m = std::fs::metadata(&model).unwrap();
+    let mut p = packet();
+    p.file = packet::FileIdentity {
+        device: m.dev(),
+        inode: m.ino(),
+        bytes: m.len(),
+        mtime_seconds: m.mtime(),
+        mtime_nanoseconds: m.mtime_nsec(),
+        ctime_seconds: m.ctime(),
+        ctime_nanoseconds: m.ctime_nsec(),
+    };
+    let path = dir.path().join("packet.json");
+    std::fs::write(&path, serde_json::to_vec(&p).unwrap()).unwrap();
+    let called = Cell::new(false);
+    let error = load_selected(Some(&path), &model, |_| {
+        called.set(true);
+        Ok(())
+    })
+    .unwrap_err();
+    let report = format!("{error:#}");
+    assert!(report.contains("RejectedPreload"));
+    assert!(report.contains("(0, 0, 0, true)")); // actual retained FD, no native roots
+    assert!(report.contains("NotMinted"));
+    assert!(!called.get());
+}
+
+#[test]
+fn actual_scheduler_auto_release_cleanup_does_not_authorize_stale_work() {
+    use crate::serve::scheduler::{AdmitRequest, InflightBatchedScheduler, Scheduler};
+    let mut scheduler = InflightBatchedScheduler::new(8, 4);
+    let admitted = scheduler
+        .admit(AdmitRequest {
+            prompt_tokens: 1,
+            max_tokens: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let handle = admitted.handle.unwrap();
+    assert_eq!(scheduler.q5_request(handle).unwrap(), admitted.request_id.0);
+    assert!(scheduler.q5_require_auto_released(handle).is_err());
+    scheduler.advance_after_prefill(handle, 1);
+    scheduler.advance_after_decode(handle); // actual automatic generation bump
+    assert!(scheduler.q5_request(handle).is_err());
+    scheduler.q5_require_auto_released(handle).unwrap();
+    let next = scheduler
+        .admit(AdmitRequest {
+            prompt_tokens: 1,
+            max_tokens: 1,
+            preferred_slot: Some(handle.slot_id),
+            ..Default::default()
+        })
+        .unwrap()
+        .handle
+        .unwrap();
+    assert_eq!(next.slot_id, handle.slot_id);
+    assert!(scheduler.q5_require_auto_released(handle).is_err());
+    scheduler.release(next);
+    assert!(scheduler.q5_require_auto_released(handle).is_err()); // empty but gen+2
+}
+
+#[test]
+fn actual_completed_owner_witness_is_generation_specific_and_not_work_authority() {
+    let _scope = collector::HeaderScope::enter().unwrap();
+    assert!(collector::retained_cleanup_request(0, 4).is_err());
+}
+
+#[test]
+fn actual_logical_owner_group_refuses_duplicate_slots_and_requests() {
+    for keys in [
+        vec![(0, 0, 1), (1, 0, 2)],
+        vec![(0, 0, 1), (0, 1, 1)],
+        vec![],
+    ] {
+        let _scope = collector::HeaderScope::enter().unwrap();
+        assert!(collector::owner_begin_many(&keys).is_err());
+        assert!(collector::checked_health().is_err());
+    }
+}
+
+#[test]
+fn actual_completed_owner_witness_retains_zero_id_and_refuses_generation_drift() {
+    let _scope = collector::HeaderScope::enter().unwrap();
+    collector::owner_begin(0, 0, 4).unwrap();
+    collector::owner_finish(0, 0, 4).unwrap();
+    assert_eq!(collector::retained_cleanup_request(0, 4).unwrap(), 0);
+    assert!(collector::retained_cleanup_request(0, 5).is_err());
+    assert!(collector::retained_cleanup_request(0, 4).is_err()); // sticky, not a retry
+}
+
+#[test]
+fn actual_required_domain_registry_keeps_future_plans_out_of_observation_credit() {
+    for phase in [
+        Phase::Preload,
+        Phase::Load,
+        Phase::Provision,
+        Phase::Forward,
+        Phase::Drain,
+        Phase::Shutdown,
+    ] {
+        let domains = requirements::describe(phase);
+        assert!(domains.len() <= 32);
+        let keys = domains
+            .iter()
+            .map(|(key, _)| *key)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys.len(), domains.len());
+        assert!(keys.contains("native/whole_current_live_pending_scope"));
+        if matches!(phase, Phase::Provision | Phase::Forward | Phase::Drain) {
+            for owner in [
+                "loaded/current",
+                "retained_slot/0",
+                "retained_slot/1",
+                "retained_slot/2",
+                "retained_slot/3",
+            ] {
+                assert!(keys.contains(owner));
+            }
+            assert!(domains
+                .iter()
+                .all(|(_, proof)| !proof.contains("NotPlanned")));
+        }
+    }
+}
+
+#[test]
+fn actual_owner_finish_refuses_unjoined_pending_result_before_publication() {
+    let _scope = collector::HeaderScope::enter().unwrap();
+    collector::owner_begin(0, 0, 1).unwrap();
+    let id = collector::chain();
+    collector::command(id, 0, None);
+    assert!(collector::owner_finish(0, 0, 1).is_err());
+    collector::command(id, 0, Some(true));
+    assert!(collector::checked_chain(id, 1).is_err());
+    assert!(collector::owner_finish(0, 0, 1).is_err());
+}
+
+#[test]
+fn actual_all_results_aggregate_exceeds_old_event_cap_without_retaining_history() {
+    let scope = collector::HeaderScope::enter().unwrap();
+    for _ in 0..10_000 {
+        let id = collector::chain();
+        collector::command(id, 0, None);
+        collector::command(id, 0, Some(true));
+        collector::checked_chain(id, 1).unwrap();
+    }
+    assert_eq!(
+        scope.handle().summary().unwrap(),
+        (20_000, 10_000, 0, false)
+    );
+}

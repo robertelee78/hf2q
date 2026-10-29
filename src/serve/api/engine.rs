@@ -8709,6 +8709,14 @@ fn run_slot_aware_deepseek4(
     kv_bytes_per_token: u64,
     supervisor: EngineSupervisor,
 ) {
+    let _q5_worker = match super::engine_deepseek4::q5_observation::attach_worker(&model) {
+        Ok(scope) => scope,
+        Err(error) => {
+            tracing::error!("DeepSeek Q5 owning-worker attachment refused: {error:#}");
+            drain_with_startup_error(rx, "DeepSeek Q5 owning-worker context unavailable");
+            return;
+        }
+    };
     let decode_quantum = deepseek4_slot_decode_quantum();
     // DeepSeek's verifier owns an architecture-specific atomic matrix chunk
     // (normally 4K/2K/1K depending on cache shape). The worker reports exact
@@ -9524,22 +9532,42 @@ fn seed_deepseek4_wave(
 }
 
 fn reset_deepseek4_session_for_reply(
+    model: &super::engine_deepseek4::Deepseek4LoadedModel,
+    scheduler: &InflightBatchedScheduler,
     sessions: &mut [super::engine_deepseek4::Deepseek4Session],
     handle: SlotHandle,
     reply: SlotReply,
 ) -> std::result::Result<SlotReply, SlotAwareGpuFatal> {
-    match sessions[handle.slot_id.0 as usize].reset() {
+    let q5_owner = match super::engine_deepseek4::q5_observation::OwnerScope::begin_cleanup(scheduler, handle, model, sessions) {
+        Ok(scope) => scope,
+        Err(error) => return Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+    };
+    let result = sessions[handle.slot_id.0 as usize].reset();
+    if let Err(error) = q5_owner.finish(scheduler, model, sessions, result.is_ok()) {
+        return Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
+    }
+    match result {
         Ok(()) => Ok(reply),
         Err(error) => Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
     }
 }
 
 fn recover_cancelled_deepseek4_session_for_reply(
+    model: &super::engine_deepseek4::Deepseek4LoadedModel,
+    scheduler: &InflightBatchedScheduler,
     sessions: &mut [super::engine_deepseek4::Deepseek4Session],
     handle: SlotHandle,
     reply: SlotReply,
 ) -> std::result::Result<SlotReply, SlotAwareGpuFatal> {
-    match sessions[handle.slot_id.0 as usize].recover_after_cancellation() {
+    let q5_owner = match super::engine_deepseek4::q5_observation::OwnerScope::begin_cleanup(scheduler, handle, model, sessions) {
+        Ok(scope) => scope,
+        Err(error) => return Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+    };
+    let result = sessions[handle.slot_id.0 as usize].recover_after_cancellation();
+    if let Err(error) = q5_owner.finish(scheduler, model, sessions, result.is_ok()) {
+        return Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
+    }
+    match result {
         Ok(()) => Ok(reply),
         Err(error) => Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
     }
@@ -9623,10 +9651,9 @@ fn seed_deepseek4_single(
         })
     };
     sessions[slot_index].swap_with_loaded(model);
-    let result = result.and_then(|value| {
-        q5_owner.finish(scheduler, model, sessions)?;
-        Ok(value)
-    });
+    if let Err(error) = q5_owner.finish(scheduler, model, sessions, result.is_ok()) {
+        return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
+    }
     match result {
         Ok((work, initial_prefill_tokens)) => {
             if initial_prefill_tokens > 0 {
@@ -9646,9 +9673,9 @@ fn seed_deepseek4_single(
                 kv_bytes_per_token,
             );
             reply = match if client_closed {
-                recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+                recover_cancelled_deepseek4_session_for_reply(model, scheduler, sessions, handle, reply)
             } else {
-                reset_deepseek4_session_for_reply(sessions, handle, reply)
+                reset_deepseek4_session_for_reply(model, scheduler, sessions, handle, reply)
             } {
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
@@ -10046,6 +10073,16 @@ fn advance_deepseek4_prefill_quantum(
     }
 
     lanes.sort_by_key(|lane| lane.slot_index);
+    let q5_owner = match super::engine_deepseek4::q5_observation::OwnerScope::begin_iter(
+        scheduler, lanes.iter().map(|lane| lane.handle), model, sessions,
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            let handle = lanes[0].handle;
+            reinstall_deepseek4_cooperative_lanes(slots, lanes);
+            return (Some(SlotAwareGpuFatal::invariant_handle(handle, error)), false);
+        }
+    };
     let _native_invocation = crate::serve::phase_trace::enabled().then(||
         scheduler.trace_transaction("deepseek4","actual_sorted_cooperative_prefill_inputs",
             &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>()));
@@ -10060,6 +10097,11 @@ fn advance_deepseek4_prefill_quantum(
         &slot_indices,
         supervisor,
     );
+    if let Err(error) = q5_owner.finish(scheduler, model, sessions, execution.is_ok()) {
+        let handle = lanes[0].handle;
+        reinstall_deepseek4_cooperative_lanes(slots, lanes);
+        return (Some(SlotAwareGpuFatal::invariant_handle(handle, error)), false);
+    }
     let outputs = match execution {
         Ok(outputs) if outputs.len() == lanes.len() => outputs,
         Ok(outputs) => {
@@ -10138,7 +10180,7 @@ fn advance_deepseek4_prefill_quantum(
                 kv_bytes_per_token,
             );
             let reply = match recover_cancelled_deepseek4_session_for_reply(
-                sessions,
+                model, scheduler, sessions,
                 lane.handle,
                 lane.reply,
             ) {
@@ -10221,10 +10263,9 @@ fn advance_deepseek4_prefill(
         supervisor,
     );
     sessions[slot_index].swap_with_loaded(model);
-    let result = result.and_then(|value| {
-        q5_owner.finish(scheduler, model, sessions)?;
-        Ok(value)
-    });
+    if let Err(error) = q5_owner.finish(scheduler, model, sessions, result.is_ok()) {
+        return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
+    }
     match result {
         Ok(super::engine_deepseek4::Deepseek4PrefillAdvance::Pending {
             state,
@@ -10257,9 +10298,9 @@ fn advance_deepseek4_prefill(
                 kv_bytes_per_token,
             );
             reply = match if client_closed {
-                recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+                recover_cancelled_deepseek4_session_for_reply(model, scheduler, sessions, handle, reply)
             } else {
-                reset_deepseek4_session_for_reply(sessions, handle, reply)
+                reset_deepseek4_session_for_reply(model, scheduler, sessions, handle, reply)
             } {
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
@@ -10368,9 +10409,21 @@ fn try_decode_batch_deepseek4_cohort(
             for (lane_index, token) in tokens.into_iter().enumerate() {
                 let Some(token) = token else { continue };
                 let slot_index = lanes[lane_index].slot_index;
+                let handle = lanes[lane_index].handle;
+                let q5_owner = match super::engine_deepseek4::q5_observation::OwnerScope::begin(scheduler, handle, model, sessions) {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        reinstall_deepseek4_decode_cohort_lanes(slots, lanes);
+                        return Deepseek4DecodeCohortRun::Handled(Some(SlotAwareGpuFatal::invariant_handle(handle, error)));
+                    }
+                };
                 sessions[slot_index].swap_with_loaded(model);
                 let committed = model.commit_generated_token(token, supervisor);
                 sessions[slot_index].swap_with_loaded(model);
+                if let Err(error) = q5_owner.finish(scheduler, model, sessions, committed.is_ok()) {
+                    reinstall_deepseek4_decode_cohort_lanes(slots, lanes);
+                    return Deepseek4DecodeCohortRun::Handled(Some(SlotAwareGpuFatal::invariant_handle(handle, error)));
+                }
                 match committed {
                     Ok(logits) => lanes[lane_index].state.install_next_logits(logits),
                     Err(error) => lanes[lane_index].tick_error = Some(error),
@@ -10381,12 +10434,25 @@ fn try_decode_batch_deepseek4_cohort(
 
         let token_ids = tokens.map(Option::unwrap);
         let slot_indices = std::array::from_fn(|lane| lanes[lane].slot_index);
-        let logits = match model.commit_generated_tokens_cohort(
-            token_ids,
-            sessions,
-            slot_indices,
-            supervisor,
+        let q5_owner = match super::engine_deepseek4::q5_observation::OwnerScope::begin_iter(
+            scheduler, lanes.iter().map(|lane| lane.handle), model, sessions,
         ) {
+            Ok(scope) => scope,
+            Err(error) => {
+                let handle = lanes[0].handle;
+                reinstall_deepseek4_decode_cohort_lanes(slots, lanes);
+                return Deepseek4DecodeCohortRun::Handled(Some(SlotAwareGpuFatal::invariant_handle(handle, error)));
+            }
+        };
+        let committed = model.commit_generated_tokens_cohort(
+            token_ids, sessions, slot_indices, supervisor,
+        );
+        if let Err(error) = q5_owner.finish(scheduler, model, sessions, committed.is_ok()) {
+            let handle = lanes[0].handle;
+            reinstall_deepseek4_decode_cohort_lanes(slots, lanes);
+            return Deepseek4DecodeCohortRun::Handled(Some(SlotAwareGpuFatal::invariant_handle(handle, error)));
+        }
+        let logits = match committed {
             Ok(logits) => logits,
             Err(error) => {
                 let mut owned = lanes.into_iter();
@@ -10424,7 +10490,7 @@ fn try_decode_batch_deepseek4_cohort(
                 sessions[lane.slot_index].committed_tokens().len(),
                 kv_bytes_per_token,
             );
-            lane.reply = match reset_deepseek4_session_for_reply(sessions, lane.handle, lane.reply)
+            lane.reply = match reset_deepseek4_session_for_reply(model, scheduler, sessions, lane.handle, lane.reply)
             {
                 Ok(reply) => reply,
                 Err(mut fatal) => {
@@ -10501,7 +10567,7 @@ fn try_decode_batch_deepseek4_cohort(
                             kv_bytes_per_token,
                         );
                         if let Err(mut fatal) = recover_cancelled_deepseek4_session_for_reply(
-                            sessions,
+                            model, scheduler, sessions,
                             lane.handle,
                             lane.reply,
                         ) {
@@ -10514,7 +10580,7 @@ fn try_decode_batch_deepseek4_cohort(
                         continue;
                     }
                     lane.reply = match reset_deepseek4_session_for_reply(
-                        sessions,
+                        model, scheduler, sessions,
                         lane.handle,
                         lane.reply,
                     ) {
@@ -10616,7 +10682,7 @@ fn decode_batch_deepseek4(
                         kv_bytes_per_token,
                     );
                     if let Err(fatal) =
-                        recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+                        recover_cancelled_deepseek4_session_for_reply(model, scheduler, sessions, handle, reply)
                     {
                         return Some(fatal);
                     }
@@ -10648,7 +10714,7 @@ fn decode_batch_deepseek4(
                     kv_bytes_per_token,
                 );
                 if let Err(fatal) =
-                    recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+                    recover_cancelled_deepseek4_session_for_reply(model, scheduler, sessions, handle, reply)
                 {
                     return Some(fatal);
                 }
@@ -10665,6 +10731,10 @@ fn decode_batch_deepseek4(
         let mut tick_error = None;
         let mut client_closed = false;
         if !was_parked {
+            let q5_owner = match super::engine_deepseek4::q5_observation::OwnerScope::begin(scheduler, handle, model, sessions) {
+                Ok(scope) => scope,
+                Err(error) => return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+            };
             sessions[slot_index].swap_with_loaded(model);
             let effective_decode_quantum =
                 deepseek4_effective_decode_quantum(decode_quantum, cold_wave);
@@ -10696,6 +10766,9 @@ fn decode_batch_deepseek4(
                 }
             }
             sessions[slot_index].swap_with_loaded(model);
+            if let Err(error) = q5_owner.finish(scheduler, model, sessions, tick_error.is_none()) {
+                return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
+            }
         }
 
         if tick_error
@@ -10717,7 +10790,7 @@ fn decode_batch_deepseek4(
                 kv_bytes_per_token,
             );
             if let Err(fatal) =
-                recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+                recover_cancelled_deepseek4_session_for_reply(model, scheduler, sessions, handle, reply)
             {
                 return Some(fatal);
             }
@@ -10762,7 +10835,7 @@ fn decode_batch_deepseek4(
                 sessions[slot_index].committed_tokens().len(),
                 kv_bytes_per_token,
             );
-            reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+            reply = match reset_deepseek4_session_for_reply(model, scheduler, sessions, handle, reply) {
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
             };
@@ -10837,7 +10910,7 @@ fn decode_batch_deepseek4(
                                 kv_bytes_per_token,
                             );
                             if let Err(fatal) = recover_cancelled_deepseek4_session_for_reply(
-                                sessions, handle, reply,
+                                model, scheduler, sessions, handle, reply,
                             ) {
                                 return Some(fatal);
                             }
@@ -10846,7 +10919,7 @@ fn decode_batch_deepseek4(
                             *clock = clock.saturating_add(1);
                             continue;
                         }
-                        reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                        reply = match reset_deepseek4_session_for_reply(model, scheduler, sessions, handle, reply) {
                             Ok(reply) => reply,
                             Err(fatal) => return Some(fatal),
                         };

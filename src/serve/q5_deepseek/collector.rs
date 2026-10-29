@@ -2,10 +2,7 @@
 //! No cross-thread/global fallback or physical-release inference.
 use anyhow::{ensure, Context, Result};
 use mlx_native::{MlxBuffer, RootOriginSnapshot};
-use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeMap,
-};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Domain {
@@ -19,6 +16,8 @@ pub(crate) enum Domain {
 struct Root {
     bytes: usize,
     domain: Option<Domain>,
+    // FD dev/ino + registered file range + mapping file range, not addresses.
+    file_span: Option<(u64, u64, u64, u64, u64, u64)>,
 }
 #[derive(Debug)]
 struct Source {
@@ -30,21 +29,21 @@ struct Source {
 #[derive(Debug)]
 pub(super) struct Collector {
     roots: BTreeMap<usize, Root>,
+    // Actual model-held weight parents survive observational checkpoint reset.
+    weights: BTreeMap<usize, Root>,
     source: Option<Source>,
     events: u64,
     completed_results: u64,
     transient_observations: [(u64, u64); 4],
     pool_latest: [(usize, usize); 3],
-    pool_highwater: [usize; 3],
+    pool_observed_highwater: [usize; 3],
     upper: usize,
     poisoned: bool,
-    owner: Option<(u64, u32, u64)>,
+    owner: Option<Vec<(u64, u32, u64)>>,
+    completed_owners: [Option<(u64, u64)>; 4],
+    attached: Option<std::thread::ThreadId>,
     next_chain: u64,
     commands: BTreeMap<(u64, usize), Option<bool>>,
-}
-thread_local! {
-    static ACTIVE: RefCell<Option<Collector>> = const { RefCell::new(None) };
-    static REENTRY_FAILED: Cell<bool> = const { Cell::new(false) };
 }
 impl Collector {
     fn buffer(&mut self, domain: Option<Domain>, label: &str, buffer: &MlxBuffer) -> Result<()> {
@@ -92,7 +91,21 @@ impl Collector {
             // native live+pending residual coverage remain separate required cells.
             return Ok(());
         }
-        if let Some(root) = self.roots.get_mut(&id) {
+        if domain.is_none() {
+            if let Some(weight) = self.weights.get(&id) {
+                ensure!(
+                    weight.bytes == requested_bytes,
+                    "Q5 role/weight parent extent changed"
+                );
+                return Ok(()); // SAME actual native parent; not file-page dedup
+            }
+        }
+        let roots = if domain == Some(Domain::Weight) {
+            &mut self.weights
+        } else {
+            &mut self.roots
+        };
+        if let Some(root) = roots.get_mut(&id) {
             ensure!(
                 root.bytes == requested_bytes,
                 "Q5 native root changed requested extent"
@@ -105,12 +118,13 @@ impl Collector {
                 root.domain = Some(domain);
             }
         } else {
-            ensure!(self.roots.len() < self.upper, "Q5 root capacity exceeded");
-            self.roots.insert(
+            ensure!(roots.len() < self.upper, "Q5 root capacity exceeded");
+            roots.insert(
                 id,
                 Root {
                     bytes: requested_bytes,
                     domain,
+                    file_span: None,
                 },
             );
         }
@@ -118,252 +132,180 @@ impl Collector {
     }
 }
 
-/// Only the selected header entry can create this scope in production. It
-/// cannot admit a model; no runtime permit exists in this checkpoint.
-pub(super) struct HeaderScope;
-impl HeaderScope {
-    pub(super) fn enter() -> Result<Self> {
-        ACTIVE.with(|slot| {
-            let mut slot = slot.try_borrow_mut().context("Q5 collector reentry")?;
-            ensure!(slot.is_none(), "Q5 overlapping diagnostic owner");
-            REENTRY_FAILED.with(|flag| flag.set(false));
-            *slot = Some(Collector {
-                roots: BTreeMap::new(),
-                source: None,
-                events: 0,
-                completed_results: 0,
-                transient_observations: [(0, 0); 4],
-                pool_latest: [(0, 0); 3],
-                pool_highwater: [0; 3],
-                upper: 16_384,
-                poisoned: false,
-                owner: None,
-                next_chain: 1,
-                commands: BTreeMap::new(),
-            });
-            Ok(Self)
-        })
-    }
-}
-impl Drop for HeaderScope {
-    fn drop(&mut self) {
-        ACTIVE.with(|slot| {
-            slot.borrow_mut().take();
-        });
-    }
-}
-
-/// Default None performs no native query, allocation or metadata clone. The
-/// callback runs only AFTER pool RefCell borrows are released by its caller.
-pub(crate) fn allocation(domain: Domain, label: &str, buffer: &MlxBuffer) -> Result<()> {
-    ACTIVE.with(|slot| {
-        let Ok(mut slot) = slot.try_borrow_mut() else {
-            REENTRY_FAILED.with(|flag| flag.set(true));
-            return Ok(()); // existing checked boundary will fail after draining
-        };
-        let Some(c) = slot.as_mut() else {
-            return Ok(());
-        };
-        if c.buffer(Some(domain), label, buffer).is_err() {
-            c.poisoned = true;
-        }
-        // Never interrupt an in-progress pipeline and abandon already committed
-        // commands merely because metadata failed. Existing checked boundaries
-        // surface sticky health AFTER draining every own command Result.
-        Ok(())
-    })
-}
-
-/// A source-local identity, never a native command UUID or root-owner list.
-pub(crate) fn chain() -> u64 {
-    ACTIVE.with(|slot| {
-        let Ok(mut slot) = slot.try_borrow_mut() else {
-            REENTRY_FAILED.with(|flag| flag.set(true));
-            return 0;
-        };
-        let Some(c) = slot.as_mut() else {
-            return 0;
-        };
-        let id = c.next_chain;
-        match id.checked_add(1) {
-            Some(next) => c.next_chain = next,
-            None => c.poisoned = true,
-        }
-        id
-    })
-}
-
-/// Do not abandon committed work on metadata failure: poison, retain the real
-/// encoder in SubmissionChain, and surface the error AFTER all existing checks.
-pub(crate) fn command(chain: u64, index: usize, completed: Option<bool>) {
-    ACTIVE.with(|slot| {
-        let Ok(mut slot) = slot.try_borrow_mut() else {
-            REENTRY_FAILED.with(|flag| flag.set(true));
-            return;
-        };
-        let Some(c) = slot.as_mut() else {
-            return;
-        };
-        if chain == 0 {
-            c.poisoned = true;
-            return;
-        }
-        let Some(next) = c.events.checked_add(1) else {
-            c.poisoned = true;
-            return;
-        };
-        c.events = next;
-        match completed {
-            None => {
-                if c.commands.len() >= 256 || c.commands.insert((chain, index), None).is_some() {
-                    c.poisoned = true;
-                }
-            }
-            Some(ok) => match c.commands.get_mut(&(chain, index)) {
-                Some(value) if value.is_none() => {
-                    *value = Some(ok);
-                    if !ok {
-                        c.poisoned = true;
-                    }
-                }
-                _ => c.poisoned = true,
-            },
-        }
-        // Completed encoders are STILL retained by the chain. Keep their
-        // records; no byte refund/physical retirement follows from completion.
-    });
-}
-
-pub(crate) fn checked_chain(chain: u64, expected: usize) -> Result<()> {
-    ACTIVE.with(|slot| {
-        let mut slot = slot.try_borrow_mut().context("Q5 checked-chain reentry")?;
-        let Some(c) = slot.as_mut() else {
-            return Ok(());
-        };
-        ensure!(
-            !c.poisoned && chain != 0,
-            "Q5 submission observation poisoned"
-        );
-        let mut results = c.commands.range((chain, 0)..=(chain, usize::MAX));
-        let complete = expected <= 256
-            && (0..expected).all(|index| {
-                results
-                    .next()
-                    .is_some_and(|((_, actual), result)| *actual == index && *result == Some(true))
-            })
-            && results.next().is_none()
-            && !REENTRY_FAILED.with(Cell::get);
-        if !complete {
-            c.poisoned = true;
-            anyhow::bail!("Q5 own command Result missing/failed");
-        }
-        let count = c.commands.range((chain, 0)..=(chain, usize::MAX)).count();
-        c.completed_results = c
-            .completed_results
-            .checked_add(count as u64)
-            .context("Q5 all-Results aggregate overflow")?;
-        c.commands.retain(|(id, _), _| *id != chain);
-        // This discards ONLY completed metadata records. It is NOT resource
-        // retirement: encoders still belong to their actual SubmissionChain.
-        Ok(())
-    })
-}
+mod context;
+pub(crate) use context::{Handle, Scope};
+pub(super) type HeaderScope = Scope;
+use context::with_current;
 
 pub(crate) fn active() -> bool {
-    ACTIVE.with(|slot| slot.borrow().is_some())
+    context::active()
 }
 
+pub(crate) fn allocation(domain: Domain, label: &str, buffer: &MlxBuffer) -> Result<()> {
+    // Sticky only: never abandon already committed work on an observation error.
+    let _ = with_current(|c| c.buffer(Some(domain), label, buffer));
+    Ok(())
+}
+pub(crate) fn constructed(label: &str, buffer: &MlxBuffer) {
+    let _ = allocation(Domain::Persistent, label, buffer);
+}
 pub(crate) fn field(label: &str, buffer: Option<&MlxBuffer>) -> Result<()> {
-    ACTIVE.with(|slot| {
+    with_current(|c| {
         if let Some(buffer) = buffer {
-            let mut slot = slot.try_borrow_mut().context("Q5 role field reentry")?;
-            let Some(c) = slot.as_mut() else {
-                return Ok(());
-            };
-            // A role observation is NOT an allocator-domain assertion. A live
-            // logit can legitimately reference an allocation already observed.
-            let result = c.buffer(None, label, buffer);
-            if result.is_err() {
-                c.poisoned = true;
-            }
-            return result;
-        }
-        let mut slot = slot.try_borrow_mut().context("Q5 absent field reentry")?;
-        if let Some(c) = slot.as_mut() {
+            c.buffer(None, label, buffer)
+        } else {
             ensure!(!c.poisoned, "Q5 absent field health");
             c.events = c
                 .events
                 .checked_add(1)
                 .context("Q5 absent event overflow")?;
+            Ok(())
         }
+    })
+}
+pub(crate) fn chain() -> u64 {
+    let mut id = 0;
+    let _ = with_current(|c| {
+        id = c.next_chain;
+        c.next_chain = id.checked_add(1).context("Q5 source chain ID overflow")?;
+        Ok(())
+    });
+    id
+}
+pub(crate) fn command(chain: u64, index: usize, completed: Option<bool>) {
+    // Record even after another metadata failure; all real own GPU checks must
+    // still occur and actual SubmissionChain retains encoders through its drain.
+    let _ = with_current(|c| {
+        ensure!(chain != 0, "Q5 command has no source chain");
+        c.events = c
+            .events
+            .checked_add(1)
+            .context("Q5 command event overflow")?;
+        match completed {
+            None => {
+                ensure!(
+                    c.commands.len() < 256 && !c.commands.contains_key(&(chain, index)),
+                    "Q5 pending command capacity/duplicate"
+                );
+                c.commands.insert((chain, index), None);
+            }
+            Some(ok) => {
+                let result = c
+                    .commands
+                    .get_mut(&(chain, index))
+                    .context("Q5 unsolicited checked Result")?;
+                ensure!(result.is_none(), "Q5 duplicate checked Result");
+                *result = Some(ok);
+                if !ok {
+                    c.poisoned = true;
+                }
+            }
+        }
+        Ok(())
+    });
+}
+pub(crate) fn checked_chain(chain: u64, expected: usize) -> Result<()> {
+    with_current(|c| {
+        ensure!(
+            !c.poisoned && chain != 0,
+            "Q5 checked-chain health/identity"
+        );
+        let mut results = c.commands.range((chain, 0)..=(chain, usize::MAX));
+        ensure!(
+            expected <= 256
+                && (0..expected).all(|index| {
+                    results.next().is_some_and(|((_, actual), result)| {
+                        *actual == index && *result == Some(true)
+                    })
+                })
+                && results.next().is_none(),
+            "Q5 own command Result missing/failed"
+        );
+        c.completed_results = c
+            .completed_results
+            .checked_add(expected as u64)
+            .context("Q5 all-Results count overflow")?;
+        c.commands.retain(|(id, _), _| *id != chain);
+        // Metadata only. Actual completed encoders still belong to the chain.
         Ok(())
     })
 }
-
+pub(crate) fn checked_health() -> Result<()> {
+    with_current(|c| {
+        ensure!(
+            !c.poisoned,
+            "Q5 sticky observation failure after checked boundary"
+        );
+        Ok(())
+    })
+}
+#[cfg(test)]
 pub(crate) fn owner_begin(request: u64, slot_id: u32, generation: u64) -> Result<()> {
-    ACTIVE.with(|slot| {
-        let mut slot = slot.try_borrow_mut().context("Q5 owner callback reentry")?;
-        let Some(c) = slot.as_mut() else {
-            return Ok(());
-        };
-        if c.poisoned || c.owner.is_some() || slot_id >= 4 {
-            c.poisoned = true;
-            anyhow::bail!("Q5 overlapping/invalid owning transaction");
+    owner_begin_many(&[(request, slot_id, generation)])
+}
+pub(crate) fn owner_begin_many(keys: &[(u64, u32, u64)]) -> Result<()> {
+    with_current(|c| {
+        ensure!(
+            !c.poisoned
+                && c.owner.is_none()
+                && c.commands.is_empty()
+                && !keys.is_empty()
+                && keys.len() <= 4,
+            "Q5 overlapping/invalid owning transaction"
+        );
+        for (index, key) in keys.iter().enumerate() {
+            ensure!(
+                key.1 < 4
+                    && !keys[..index]
+                        .iter()
+                        .any(|prior| prior.0 == key.0 || prior.1 == key.1),
+                "Q5 duplicate/stale logical owner map"
+            );
         }
-        ensure!(c.commands.is_empty(), "Q5 prior unjoined pending commands");
-        // Reset only bounded observational census. All retained cache owners are
-        // revisited below. No native ownership charge, live counter or physical
-        // term is reset/refunded; native current-live coverage remains required.
-        c.roots.clear();
-        c.owner = Some((request, slot_id, generation)); // request zero is valid
+        c.roots.clear(); // observational checkpoint only; no native/live refund
+        c.owner = Some(keys.to_vec());
         Ok(())
     })
 }
+#[cfg(test)]
 pub(crate) fn owner_finish(request: u64, slot_id: u32, generation: u64) -> Result<()> {
-    ACTIVE.with(|slot| {
-        let mut slot = slot
-            .try_borrow_mut()
-            .context("Q5 owner completion reentry")?;
-        let Some(c) = slot.as_mut() else {
-            return Ok(());
-        };
-        if c.poisoned || c.owner != Some((request, slot_id, generation)) {
-            c.poisoned = true;
-            anyhow::bail!("Q5 stale request/generation or callback health failure");
+    owner_finish_many(&[(request, slot_id, generation)])
+}
+pub(crate) fn owner_finish_many(keys: &[(u64, u32, u64)]) -> Result<()> {
+    with_current(|c| {
+        ensure!(
+            !c.poisoned && c.commands.is_empty() && c.owner.as_deref() == Some(keys),
+            "Q5 stale request/generation or callback health"
+        );
+        for &(request, slot, generation) in keys {
+            c.completed_owners[slot as usize] = Some((request, generation));
         }
         c.owner = None;
         Ok(())
     })
 }
-
-pub(crate) fn checked_health() -> Result<()> {
-    ACTIVE.with(|slot| {
-        let slot = slot
-            .try_borrow()
-            .context("Q5 healthy checked boundary reentry")?;
-        ensure!(
-            !REENTRY_FAILED.with(Cell::get),
-            "Q5 callback reentry failed"
-        );
-        if let Some(c) = slot.as_ref() {
-            ensure!(
-                !c.poisoned,
-                "Q5 sticky metadata failure after checked boundary"
-            );
-        }
+pub(crate) fn retained_cleanup_request(slot: u32, generation: u64) -> Result<u64> {
+    let mut request = None;
+    with_current(|c| {
+        ensure!(!c.poisoned && slot < 4, "Q5 cleanup witness health/slot");
+        let prior =
+            c.completed_owners[slot as usize].context("Q5 no actual completed owner witness")?;
+        ensure!(prior.1 == generation, "Q5 stale terminal cleanup witness");
+        request = Some(prior.0);
         Ok(())
-    })
+    })?;
+    request.context("Q5 terminal cleanup lacks actual attached collector")
 }
-
+pub(crate) fn invalidate(reason: &'static str) -> Result<()> {
+    with_current(|_| anyhow::bail!("Q5 invalid observation/transaction: {reason}"))
+}
 pub(super) fn attach_source(
     file: &std::fs::File,
     expected: super::packet::FileIdentity,
     tensor_data_offset: u64,
 ) -> Result<()> {
     expected.matches(&file.metadata()?)?;
-    ACTIVE.with(|slot| {
-        let mut slot = slot.try_borrow_mut().context("Q5 source reentry")?;
-        let c = slot.as_mut().context("Q5 no owning source collector")?;
+    with_current(|c| {
         ensure!(c.source.is_none(), "Q5 duplicate/changed SameFD source");
         c.source = Some(Source {
             file: file.try_clone()?,
@@ -373,74 +315,87 @@ pub(super) fn attach_source(
         Ok(())
     })
 }
-
-/// Actual residency-loop output, joined to the retained real loader FD, not a
-/// second load/map. This CPU/map-only phase has no submitted forward commands;
-/// a mismatch refuses before the next tensor constructor.
 pub(crate) fn weight(
     gguf: &mlx_native::gguf::GgufFile,
     name: &str,
     buffer: &MlxBuffer,
 ) -> Result<()> {
-    ACTIVE.with(|slot| {
-        let mut slot = slot.try_borrow_mut().context("Q5 weight reentry")?;
-        let Some(c) = slot.as_mut() else { return Ok(()); };
-        let result = (|| -> Result<()> {
-            let source = c.source.as_ref().context("Q5 weight missing actual SameFD owner")?;
-            source.expected.matches(&source.file.metadata()?)?;
-            ensure!(source.tensor_data_offset == gguf.tensor_data_offset(), "Q5 loader tensor offset drift");
-            let info = gguf.tensor_info(name).context("Q5 actual tensor missing")?;
-            let logical = source.tensor_data_offset.checked_add(info.offset).context("Q5 file offset overflow")?;
-            ensure!(logical.checked_add(info.byte_len as u64).is_some_and(|end| end <= source.expected.bytes),
-                "Q5 actual tensor escapes SameFD extent");
-            let b = buffer.backing_snapshot()?;
-            match b.provenance {
-                mlx_native::BufferProvenance::NoCopy => {
-                    let n = b.no_copy.context("Q5 NoCopy missing actual mapping range")?;
-                    let within = n.registered_base_address.checked_sub(n.mapping_base_address).context("Q5 NoCopy range order")?;
-                    let registered = logical.checked_sub(b.view_byte_offset).context("Q5 registered file offset underflow")?;
-                    let mapping = registered.checked_sub(within as u64).context("Q5 mapping file offset underflow")?;
-                    ensure!(b.logical_bytes == info.byte_len && n.registered_bytes == b.metal_root_bytes
-                        && mapping.checked_add(n.mapping_bytes as u64).is_some_and(|end| end <= source.expected.bytes),
-                        "Q5 SameFD mapped tensor span mismatch");
-                }
-                mlx_native::BufferProvenance::Owned => { /* F32 expansion or explicit owned load; separate parent. */ }
-                _ => anyhow::bail!("Q5 Unknown weight provenance"),
-            }
-            source.expected.matches(&source.file.metadata()?)?;
-            c.buffer(Some(Domain::Weight), name, buffer)
-        })();
-        if result.is_err() { c.poisoned = true; }
-        // CPU/map-only residency load has no submitted forward commands.
-        // Refuse before the next tensor constructor rather than finish all load.
-        result
-    })
-}
-
-#[cfg(test)]
-pub(super) fn observed_root_totals() -> Result<(usize, usize)> {
-    ACTIVE.with(|slot| {
-        let slot = slot.try_borrow().context("Q5 test census borrow")?;
-        let c = slot
+    with_current(|c| {
+        let source = c
+            .source
             .as_ref()
-            .context("Q5 test census missing actual scope")?;
-        ensure!(!c.poisoned, "Q5 test census poisoned");
-        let total = c
-            .roots
-            .values()
-            .try_fold(0usize, |sum, root| sum.checked_add(root.bytes))
-            .context("Q5 test census overflow")?;
-        Ok((c.roots.len(), total))
+            .context("Q5 weight missing actual SameFD owner")?;
+        source.expected.matches(&source.file.metadata()?)?;
+        ensure!(
+            source.tensor_data_offset == gguf.tensor_data_offset(),
+            "Q5 loader tensor offset drift"
+        );
+        let info = gguf.tensor_info(name).context("Q5 actual tensor missing")?;
+        let logical = source
+            .tensor_data_offset
+            .checked_add(info.offset)
+            .context("Q5 file offset overflow")?;
+        ensure!(
+            logical
+                .checked_add(info.byte_len as u64)
+                .is_some_and(|end| end <= source.expected.bytes),
+            "Q5 tensor escapes SameFD extent"
+        );
+        let b = buffer.backing_snapshot()?;
+        let file_span = match b.provenance {
+            mlx_native::BufferProvenance::NoCopy => {
+                let n = b
+                    .no_copy
+                    .context("Q5 NoCopy missing actual mapping range")?;
+                let within = n
+                    .registered_base_address
+                    .checked_sub(n.mapping_base_address)
+                    .context("Q5 NoCopy range order")?;
+                let registered = logical
+                    .checked_sub(b.view_byte_offset)
+                    .context("Q5 registered offset underflow")?;
+                let mapping = registered
+                    .checked_sub(within as u64)
+                    .context("Q5 mapping offset underflow")?;
+                ensure!(
+                    b.logical_bytes == info.byte_len
+                        && n.registered_bytes == b.metal_root_bytes
+                        && mapping
+                            .checked_add(n.mapping_bytes as u64)
+                            .is_some_and(|end| end <= source.expected.bytes),
+                    "Q5 actual mapped span mismatch"
+                );
+                Some((
+                    source.expected.device,
+                    source.expected.inode,
+                    registered,
+                    n.registered_bytes as u64,
+                    mapping,
+                    n.mapping_bytes as u64,
+                ))
+            }
+            mlx_native::BufferProvenance::Owned => None,
+            _ => anyhow::bail!("Q5 Unknown weight provenance"),
+        };
+        source.expected.matches(&source.file.metadata()?)?;
+        c.buffer(Some(Domain::Weight), name, buffer)?;
+        if let RootOriginSnapshot::KnownNative { id, .. } = b.origin {
+            let root = c
+                .weights
+                .get_mut(&id)
+                .context("Q5 actual weight root census missing")?;
+            ensure!(
+                root.file_span.is_none() || root.file_span == file_span,
+                "Q5 one root changed actual SameFD span"
+            );
+            root.file_span = file_span;
+        }
+        Ok(())
     })
 }
-
 pub(crate) fn pools(snapshots: [mlx_native::PoolMemorySnapshot; 3]) -> Result<()> {
-    ACTIVE.with(|slot| {
-        let mut slot = slot.try_borrow_mut().context("Q5 pool callback reentry")?;
-        let Some(c) = slot.as_mut() else {
-            return Ok(());
-        };
-        ensure!(!c.poisoned, "Q5 pool callback poisoned");
+    with_current(|c| {
+        ensure!(!c.poisoned, "Q5 pool callback health");
         for (index, snapshot) in snapshots.into_iter().enumerate() {
             ensure!(
                 snapshot.retained.roots <= 16_384
@@ -450,19 +405,25 @@ pub(crate) fn pools(snapshots: [mlx_native::PoolMemorySnapshot; 3]) -> Result<()
                 "Q5 actual private-pool snapshot invalid"
             );
             c.pool_latest[index] = (snapshot.retained.roots, snapshot.retained.bytes);
-            c.pool_highwater[index] = c.pool_highwater[index].max(snapshot.retained.bytes);
+            c.pool_observed_highwater[index] =
+                c.pool_observed_highwater[index].max(snapshot.retained.bytes);
         }
-        // Three source-private pool values stay separate from cache-role roots,
-        // native outside-pool residual and physical/highwater Unknowns. Do not
-        // add overlapping free/issued/residency labels or infer a global union.
+        // Labels overlap; outside owners/physical/lifetime highwater unavailable.
         Ok(())
     })
 }
-
-/// Non-throwing constructor tap for native-error-typed cache helpers. Sticky
-/// failure is checked at the owning worker's existing terminal boundary.
-pub(crate) fn constructed(label: &str, buffer: &MlxBuffer) {
-    if allocation(Domain::Persistent, label, buffer).is_err() {
-        REENTRY_FAILED.with(|flag| flag.set(true));
-    }
+#[cfg(test)]
+pub(super) fn observed_root_totals() -> Result<(usize, usize)> {
+    let mut out = None;
+    with_current(|c| {
+        ensure!(!c.poisoned, "Q5 test census health");
+        let sum = c
+            .roots
+            .values()
+            .try_fold(0usize, |sum, r| sum.checked_add(r.bytes))
+            .context("Q5 test census overflow")?;
+        out = Some((c.roots.len(), sum));
+        Ok(())
+    })?;
+    out.context("Q5 test census missing scope")
 }

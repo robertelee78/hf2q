@@ -1429,6 +1429,16 @@ impl InflightBatchedScheduler {
         crate::serve::phase_trace::scheduler(states,"owning_worker_work_state");
     }
 
+    /// Only cleanup of a previously witnessed terminal owner may use this.
+    /// It grants NO forward/work authority and refuses a reused/occupied slot.
+    pub(crate) fn q5_require_auto_released(&self, handle: SlotHandle) -> anyhow::Result<()> {
+        let next = handle.generation.checked_add(1).ok_or_else(|| anyhow::anyhow!("Q5 generation overflow"))?;
+        anyhow::ensure!(!self.in_flight.iter().any(|slot| slot.handle.slot_id == handle.slot_id)
+            && self.slot_generations.get(handle.slot_id.0 as usize) == Some(&next),
+            "Q5 terminal cleanup is not the exact empty auto-released generation");
+        Ok(())
+    }
+
     /// This boundary is a validated family transaction selection, NOT evidence
     /// that its internal graphs share physical rows or have already submitted.
     /// Exact installed scheduler owner; request ID zero is valid. Diagnostic

@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::{fs::Metadata, os::unix::fs::MetadataExt};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Phase {
     Preload,
@@ -15,6 +16,7 @@ pub(super) enum Phase {
 
 /// A declared future cell cannot satisfy any observed-phase requirement.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(tag = "state", deny_unknown_fields)]
 pub(super) enum Cell {
     Planned { evidence_sha256: String },
@@ -22,6 +24,7 @@ pub(super) enum Cell {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub(super) struct FileIdentity {
     pub device: u64,
@@ -49,6 +52,7 @@ impl FileIdentity {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub(super) struct Packet {
     pub schema: String,
@@ -65,6 +69,7 @@ pub(super) struct Packet {
     pub weight_policy: String,
     pub collector_upper_bytes: u64,
     pub phase: Phase,
+    #[serde(deserialize_with = "closed_cells")]
     pub cells: std::collections::BTreeMap<String, Cell>,
 }
 impl Packet {
@@ -114,7 +119,9 @@ impl Packet {
             match self.cells.get(*key) {
                 Some(Cell::Planned { evidence_sha256 }) => ensure!(
                     evidence_sha256.len() == 64
-                        && evidence_sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+                        && evidence_sha256
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
                     "Q5 planned evidence hash malformed"
                 ),
                 Some(Cell::Unknown { reason }) => ensure!(
@@ -186,4 +193,31 @@ impl Packet {
             ],
         })
     }
+}
+
+fn closed_cells<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<std::collections::BTreeMap<String, Cell>, D::Error> {
+    struct Cells;
+    impl<'de> serde::de::Visitor<'de> for Cells {
+        type Value = std::collections::BTreeMap<String, Cell>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("at most eight unique preload required cells")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut cells = std::collections::BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, Cell>()? {
+                if cells.len() >= 8 || cells.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate/excess Q5 required cells",
+                    ));
+                }
+            }
+            Ok(cells)
+        }
+    }
+    deserializer.deserialize_map(Cells)
 }

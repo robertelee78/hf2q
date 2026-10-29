@@ -3,6 +3,7 @@
 pub(crate) mod collector;
 mod packet;
 mod page_observer;
+mod requirements;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -13,24 +14,30 @@ use mlx_native::gguf::GgufFile;
 use packet::{Packet, Phase};
 use std::{fs::File, io::Read, path::Path};
 
-const SELECTOR: &str = "HF2Q_DEEPSEEK_OWNER_PACKET";
+/// Private real-load carrier. No serde/external constructor or permit boolean.
+/// Present only after a future independently reviewed admission implementation.
+pub(crate) struct PreparedLoad {
+    pub(crate) header: GgufFile,
+    pub(crate) context: collector::Handle,
+}
+
 const MAX_PACKET: u64 = 65_536;
 
 /// Called before serve initializes phase observers, devices or warmups. A
 /// direct family loader repeats this check, so bypassing cmd_serve is unsafe
 /// neither accidentally nor through a malformed selector.
 pub(crate) fn validate_activation() -> Result<()> {
-    activation(
-        std::env::var_os(SELECTOR),
-        std::env::var_os("HF2Q_UNSAFE_EXPERIMENTS"),
-    )
+    selected().map(|_| ())
+}
+fn selected() -> Result<Option<&'static Path>> {
+    crate::debug::investigation_env::deepseek_owner_packet::selected().map_err(anyhow::Error::msg)
 }
 
 /// Run after local MODEL resolution but before listeners/workers/devices. The
 /// closed selected diagnostic does not auto-download or fall through to another
 /// family when its selected path is missing or mismatched.
 pub(crate) fn preflight_model(model: Option<&Path>) -> Result<()> {
-    if std::env::var_os(SELECTOR).is_some() {
+    if selected()?.is_some() {
         let model = model.context("Q5 packet requires an explicit local MODEL")?;
         return load(model, |_| {
             anyhow::bail!("Q5 entry unexpectedly lost selector")
@@ -39,18 +46,28 @@ pub(crate) fn preflight_model(model: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn activation(path: Option<std::ffi::OsString>, ack: Option<std::ffi::OsString>) -> Result<()> {
-    if let Some(path) = path {
-        ensure!(
-            !path.is_empty(),
-            "Q5 owner packet selector must not be empty"
-        );
-        ensure!(
-            ack.as_deref() == Some(std::ffi::OsStr::new("1")),
-            "Q5 owner packet requires HF2Q_UNSAFE_EXPERIMENTS=1"
-        );
-    }
-    Ok(())
+    crate::debug::investigation_env::deepseek_owner_packet::Mode::from_os(
+        path.as_deref(),
+        ack.as_deref() == Some(std::ffi::OsStr::new("1")),
+    )
+    .validate()
+    .map(|_| ())
+    .map_err(anyhow::Error::msg)
+}
+
+fn diagnostic_open(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "Q5 diagnostic input FD must be regular"
+    );
+    Ok(file)
 }
 
 /// The diagnostic branch opens the actual selected file ONCE and constructs
@@ -59,14 +76,21 @@ fn activation(path: Option<std::ffi::OsString>, ack: Option<std::ffi::OsString>)
 /// None invokes the original closure, preserving normal constructor behavior.
 pub(crate) fn load<T>(
     model: &Path,
-    normal: impl FnOnce(Option<GgufFile>) -> Result<T>,
+    normal: impl FnOnce(Option<PreparedLoad>) -> Result<T>,
 ) -> Result<T> {
-    validate_activation()?;
-    match std::env::var_os(SELECTOR) {
+    load_selected(selected()?, model, normal)
+}
+
+fn load_selected<T>(
+    selected: Option<&Path>,
+    model: &Path,
+    normal: impl FnOnce(Option<PreparedLoad>) -> Result<T>,
+) -> Result<T> {
+    match selected {
         None => normal(None),
         Some(path) => {
             let mut bytes = Vec::new();
-            File::open(path)?
+            diagnostic_open(path)?
                 .take(MAX_PACKET + 1)
                 .read_to_end(&mut bytes)?;
             ensure!(bytes.len() as u64 <= MAX_PACKET, "Q5 packet exceeds 64KiB");
@@ -79,11 +103,11 @@ pub(crate) fn load<T>(
 fn enter<T>(
     packet: &Packet,
     path: &Path,
-    _real_load: impl FnOnce(Option<GgufFile>) -> Result<T>,
+    _real_load: impl FnOnce(Option<PreparedLoad>) -> Result<T>,
 ) -> Result<T> {
     packet.validate()?;
     let _collector = collector::HeaderScope::enter()?;
-    let file = File::open(path).context("open Q5 actual readonly GGUF FD")?;
+    let file = diagnostic_open(path).context("open Q5 actual readonly regular GGUF FD")?;
     let before = file.metadata()?;
     ensure!(before.is_file(), "Q5 model FD is not a regular file");
     packet.file.matches(&before)?;
@@ -96,7 +120,11 @@ fn enter<T>(
     collector::attach_source(&file, packet.file, gguf.tensor_data_offset())?;
     // A future private permit may transfer THIS parsed header into _real_load.
     // The callback already accepts it; reopening a path is not required.
-    reject_preload(packet)
+    let observed_header_metadata = _collector.handle().summary()?;
+    let compiled_source = option_env!("HF2Q_BUILD_GIT_SHA").unwrap_or("Unknown");
+    let compiled_native_pin = env!("HF2Q_MLX_NATIVE_VERSION");
+    let pid = std::process::id();
+    reject_preload(packet).with_context(|| format!("Q5 same-FD header observation (events,checked_results,checkpoint_roots,retained_fd)={observed_header_metadata:?}; compiled_metadata_source={compiled_source}; compiled_native_pin={compiled_native_pin}; pid={pid}; declared_hashes_unverified; not runtime coverage"))
 }
 
 fn reject_preload<T>(packet: &Packet) -> Result<T> {
@@ -109,10 +137,11 @@ fn reject_preload<T>(packet: &Packet) -> Result<T> {
         .and_then(|v| v.checked_add(packet.collector_upper_bytes))
         .context("Q5 preload bound overflow")?;
     let missing = packet.requirements(Phase::Preload)?;
+    let root_domains = requirements::describe(Phase::Preload);
     use page_observer::PublishedPageObserver;
     let unavailable = page_observer::Unavailable
         .require_runtime_support()
         .err()
         .context("Q5 unavailable observer unexpectedly claimed support")?;
-    anyhow::bail!("Q5 RejectedPreload: retained_coalesced_upper_bytes={upper}; required={missing:?};         {unavailable}; external_identity_and_operating_review=Unverified;         private_permit=NotMinted; model_loaded=false; physical_credit=false")
+    anyhow::bail!("Q5 RejectedPreload: retained_coalesced_upper_bytes={upper}; required={missing:?}; root_domains={root_domains:?};         {unavailable}; external_identity_and_operating_review=Unverified;         private_permit=NotMinted; model_loaded=false; physical_credit=false")
 }

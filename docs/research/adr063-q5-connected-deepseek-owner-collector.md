@@ -116,3 +116,60 @@ helpers now feed the same non-throwing sticky constructor sink. No test-only
 allocation is classified as production. No native encoder, arithmetic, precision,
 copy order, cache policy or API fallback changes. Native kernels' internal roots
 remain outside this HF family callback scope and require native live coverage.
+
+B6 corrects load-thread to worker continuity: actual model owns ONE optional
+metadata-only handle (readonly source FD/counters, no MlxBuffer/Metal owner).
+The same parsed header and handle form a private real-load carrier. Normal
+constructor receives None. Selected SlotAware worker explicitly attaches that
+handle once; attachments are exclusive and attached guards are non-Send.
+Detached handles may move only with no pending source commands/owner transaction;
+error/unwind/pending prevents transfer. No new collector is created on worker
+entry and no global fallback exists. Metadata-only actual-helper controls cover
+exclusive attachment, cross-thread transfer and pending-transfer refusal.
+Runtime permit remains unimplemented/unavailable, so the carrier cannot yet be
+obtained from a caller packet; this source continuation does not admit a model.
+Actual cache/anchor visitor now checks every Present/Absent/dtype/shape/extent
+against its source plan before recording that field. No payload read is added.
+Weight root metadata retains SAME-FD registered+mapping file spans, not unsafe
+mapping addresses; these are not physical-page observations or FD inference.
+
+B7 forward-review closure: diagnostic inputs are opened readonly with
+O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC then fstat-validated regular BEFORE reading;
+normal None uses the original constructor/path open. The selector is read once
+through centralized InvestigationEnv, unsafe acknowledgment and shipping matrix.
+Planned evidence hashes are canonical lowercase; duplicate/excess cells refuse
+while deserializing. Actual hosted controls cover default None callback, valid
+96-byte SAMEFD GGUF-header refusal, FIFO/symlink inputs and closed parser. No
+hosted controls or model/native tests were run by this author.
+
+Owner finish refuses pending/unjoined commands and sticky metadata/reentry BEFORE
+publication. Actual helper controls cover that sequence and20,000 aggregate
+events without old per-case event capacity. The fixed checkpoint census excludes
+streamed transient observations; persistent actual weight parents/file spans are
+kept separately, with no lifetime/physical deduction. Phase-specific required
+root-domain catalog distinguishes independently reviewed preload bounds, actual
+owner/conservative native coverage, and fresh external OS evidence. Future Planned
+cells never satisfy those requirements or mint a permit.
+
+Worker source now joins seed, bounded/cooperative prefill, scalar/cohort decode
+and scalar fallback, plus existing reset/cancellation helper paths. Native/host
+failure after existing checks failstops the diagnostic; None preserves previous
+error policy. Logical groups2–4 are not physical GPU row/batch claims. Cleanup
+may see scheduler automatic max-token release before completion: only a prior
+actual completed-owner witness plus exact empty slot and successor generation
+can identify retained terminal cleanup; this grants NO forward authority and
+refuses occupied/reused/gen+2 slots. All SourceIDs remain in the model's same
+metadata handle, not a new collector/global fallback.
+
+ROLLING REMAINING COVERAGE (not yet accepted/implemented): complete warmup and
+provision lifecycle attachment; mounted swap snapshots and direct anchor promotion/
+late-delivery recovery paths; current per-role/cursor manifest and final bounded
+receipt; actual native early creation/live authority integration and exact
+source/native/device/process UUID bindings; certified whole-domain partition or
+full conservative rejection; source-frozen per-phase/callback/native capacity
+proof; CPU/channel/persist and OS/reaction cells; external projected-breach/cleanup
+proof. Root-domain registry names are requirements, not evidence of coverage.
+The current packet identity hashes remain declared/unverified and only the
+coalesced rejected preload schema is accepted syntactically. There is no positive
+runtime permit or physical credit authority. Public native0.15.14 is pending;
+provider remains explicitly Unavailable, no local Cargo patch or private HF Mach.

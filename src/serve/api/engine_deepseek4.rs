@@ -282,6 +282,8 @@ pub struct Deepseek4LoadedModel {
     disk_persistor: Option<Arc<Deepseek4DiskPersistor>>,
     /// Full-logical-context agent sessions provisioned only for SlotAware.
     slot_sessions: Option<Vec<Deepseek4Session>>,
+    // Metadata and the verified readonly FD only; no extra Metal/buffer owner.
+    q5_context: Option<crate::serve::q5_deepseek::collector::Handle>,
 }
 
 /// One retained DeepSeek-V4 agent context. The model/Metal execution state is
@@ -760,12 +762,16 @@ impl Deepseek4LoadedModel {
         })
     }
 
-    fn load_unobserved(opts: &LoadOptions, effective_context: Option<u32>, header: Option<GgufFile>) -> Result<Self> {
+    fn load_unobserved(
+        opts: &LoadOptions,
+        effective_context: Option<u32>,
+        header: Option<crate::serve::q5_deepseek::PreparedLoad>,
+    ) -> Result<Self> {
         let started = Instant::now();
-        let gguf = match header {
-            Some(header) => header,
-            None => GgufFile::open(&opts.model_path)
-                .map_err(|error| anyhow::anyhow!("GGUF open: {error}"))?,
+        let (gguf, q5_context) = match header {
+            Some(prepared) => (prepared.header, Some(prepared.context)),
+            None => (GgufFile::open(&opts.model_path)
+                .map_err(|error| anyhow::anyhow!("GGUF open: {error}"))?, None),
         };
         let tokenizer = if let Some(path) = opts.tokenizer_path.as_deref() {
             Tokenizer::from_file(path)
@@ -954,6 +960,7 @@ impl Deepseek4LoadedModel {
         Ok(Self {
             model,
             cache,
+            q5_context,
             model_id,
             model_path: opts.model_path.clone(),
             context_length: Some(context_length),
