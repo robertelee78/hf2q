@@ -29,9 +29,17 @@ fn info_rejects_removed_hugging_face_input_surfaces() {
 
 #[test]
 fn info_missing_model_is_a_static_preflight_rejection() {
+    let state = tempfile::tempdir().unwrap();
+    let root = state.path().canonicalize().unwrap();
     let assertion = Command::cargo_bin("hf2q")
         .unwrap()
-        .args(["info", "--model", "/definitely/not/a/model.gguf"])
+        .args([
+            "--state-root",
+            root.to_str().unwrap(),
+            "info",
+            "--model",
+            "/definitely/not/a/model.gguf",
+        ])
         .assert()
         .failure()
         .stdout(predicate::str::contains(

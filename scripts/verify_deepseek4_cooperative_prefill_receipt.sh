@@ -12,6 +12,11 @@ contention_measurement_log=${8:?contention measurement log is required}
 contention_settle_log=${9:?contention settle log is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Source-bound current identity; no independent stale receipt pin.
+RELEASE_NATIVE_IDENTITY=$(bash "$ROOT_DIR/scripts/verify_release_dependency_provenance.sh" identity)
+RELEASE_MLX_NATIVE_VERSION=$(jq -er .version <<<"$RELEASE_NATIVE_IDENTITY")
+RELEASE_MLX_NATIVE_CHECKSUM=$(jq -er .checksum <<<"$RELEASE_NATIVE_IDENTITY")
+readonly RELEASE_NATIVE_IDENTITY RELEASE_MLX_NATIVE_VERSION RELEASE_MLX_NATIVE_CHECKSUM
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
 
@@ -45,7 +50,7 @@ test "$(sha256_file "$contention_settle_log")" = \
   "$(jq -er .host_contention.settle.log_sha256 "$summary")"
 jq -s -e 'length == 1' "$summary" >/dev/null
 
-jq -e --slurpfile raw "$raw" \
+jq -e --arg mlx_native_version "$RELEASE_MLX_NATIVE_VERSION" --slurpfile raw "$raw" \
   --arg source_sha "$expected_source_sha" \
   --arg model_sha256 "$expected_model_sha" '
   def abs: if . < 0 then -. else . end;
@@ -85,7 +90,7 @@ jq -e --slurpfile raw "$raw" \
     and $raw_receipt.schema_version == 1
     and .schema_version == 2 and .status == "pass"
     and .source_sha == $source_sha and .model_sha256 == $model_sha256
-    and .mlx_native_version == "0.15.4"
+    and .mlx_native_version == $mlx_native_version
     and .artifact_bytes == 107431343168 and .layers == 43
     and .prefix_rows == 148 and .prefix_mod_128 == 20 and .prefix_mod_4 == 0
     and [.parity_shapes[] | [.sequences,.rows_per_lane,.aggregate_rows]]

@@ -8,6 +8,11 @@ set -euo pipefail
 # exact-transcription, and calibrated-host gates pass.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Source-bound current identity; no independent stale receipt pin.
+RELEASE_NATIVE_IDENTITY=$(bash "$ROOT_DIR/scripts/verify_release_dependency_provenance.sh" identity)
+RELEASE_MLX_NATIVE_VERSION=$(jq -er .version <<<"$RELEASE_NATIVE_IDENTITY")
+RELEASE_MLX_NATIVE_CHECKSUM=$(jq -er .checksum <<<"$RELEASE_NATIVE_IDENTITY")
+readonly RELEASE_NATIVE_IDENTITY RELEASE_MLX_NATIVE_VERSION RELEASE_MLX_NATIVE_CHECKSUM
 SCRIPT_DIR="$ROOT_DIR/scripts"
 HF2Q_BIN=${HF2Q_BIN:?HF2Q_BIN is required}
 HF2Q_COMMIT=${HF2Q_COMMIT:?HF2Q_COMMIT is required}
@@ -31,8 +36,8 @@ readonly SUSTAINED_WARMUP_CASES='warmup-a warmup-b warmup-c'
 readonly MIN_SUSTAINED_WARMUP_TOKENS=512
 readonly MAX_WARMUP_TO_MEASUREMENT_SECONDS=2
 readonly TRIAL_ORDER='hf2q reference reference hf2q'
-readonly EXPECTED_MLX_NATIVE_VERSION='0.15.4'
-readonly EXPECTED_MLX_NATIVE_CHECKSUM='359470da84f037916cd34534b56fc283fdd467c152a9813a85979c1d6e67f137'
+readonly EXPECTED_MLX_NATIVE_VERSION="$RELEASE_MLX_NATIVE_VERSION"
+readonly EXPECTED_MLX_NATIVE_CHECKSUM="$RELEASE_MLX_NATIVE_CHECKSUM"
 readonly QUALIFIED_MODEL_REPOSITORY='jenerallee78/Qwen3.8-27B-Abliterated-SFT'
 readonly QUALIFIED_MODEL_REVISION='0a72776892f98db49381fdf69f4b9982222ec9dc'
 readonly QUALIFIED_MODEL_FILE='gguf/qwen38-abliterated-sft-q5_k_m.gguf'

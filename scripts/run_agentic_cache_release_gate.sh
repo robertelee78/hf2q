@@ -27,6 +27,11 @@ QWEN38_MODEL_SHA256=${QWEN38_MODEL_SHA256:?QWEN38_MODEL_SHA256 is required}
 OUT_ROOT=${OUT_ROOT:-$(mktemp -d /var/tmp/hf2q-cache-release.XXXXXX)}
 HF2Q_MODEL_VERIFICATION_CACHE_DIR=${HF2Q_MODEL_VERIFICATION_CACHE_DIR:-$OUT_ROOT/model-verification-cache}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Source-bound current identity; no independent stale receipt pin.
+RELEASE_NATIVE_IDENTITY=$(bash "$script_dir/verify_release_dependency_provenance.sh" identity)
+RELEASE_MLX_NATIVE_VERSION=$(jq -er .version <<<"$RELEASE_NATIVE_IDENTITY")
+RELEASE_MLX_NATIVE_CHECKSUM=$(jq -er .checksum <<<"$RELEASE_NATIVE_IDENTITY")
+readonly RELEASE_NATIVE_IDENTITY RELEASE_MLX_NATIVE_VERSION RELEASE_MLX_NATIVE_CHECKSUM
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -690,7 +695,7 @@ jq -e '
 ' "$cooperative_raw" >/dev/null
 jq --arg source_sha "$EXPECTED_SHA" \
   --arg model_sha256 "$DEEPSEEK_MODEL_SHA256" \
-  --arg mlx_native_version "0.15.4" \
+  --arg mlx_native_version "$RELEASE_MLX_NATIVE_VERSION" \
   --arg raw_sha256 "$(sha256_file "$cooperative_raw")" \
   --arg test_log_sha256 "$(sha256_file "$cooperative_log")" \
   --arg measurement_log_sha256 "$(sha256_file "$cooperative_thermal_log")" \
@@ -1811,7 +1816,7 @@ jq -n \
   } end' > "$OUT_ROOT/manifest.json.tmp"
 mv "$OUT_ROOT/manifest.json.tmp" "$OUT_ROOT/manifest.json"
 shasum -a 256 "$OUT_ROOT/manifest.json" >"$OUT_ROOT/manifest.json.sha256"
-jq -e '
+jq --arg mlx_native_version "$RELEASE_MLX_NATIVE_VERSION" --arg mlx_native_checksum "$RELEASE_MLX_NATIVE_CHECKSUM" -e '
   (.power_event_snapshots_sha256 | test("^[0-9a-f]{64}$"))
   and .power_policy.guarded == true
   and .power_policy.cable_required == false
@@ -1851,10 +1856,10 @@ jq -e '
   and .dependency_provenance.build.cargo_target_checkout_disjoint == true
   and .dependency_provenance.build.rust_build_override_env_cleared == true
   and .dependency_provenance.dependency.name == "mlx-native"
-  and .dependency_provenance.dependency.version == "0.15.4"
+  and .dependency_provenance.dependency.version == $mlx_native_version
   and .dependency_provenance.dependency.source
     == "registry+https://github.com/rust-lang/crates.io-index"
   and .dependency_provenance.dependency.checksum
-    == "359470da84f037916cd34534b56fc283fdd467c152a9813a85979c1d6e67f137"
+    == $mlx_native_checksum
 ' "$OUT_ROOT/manifest.json" >/dev/null
 jq . "$OUT_ROOT/manifest.json"

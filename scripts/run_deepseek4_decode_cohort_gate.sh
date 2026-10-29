@@ -8,6 +8,11 @@ expected_source_sha=${4:?expected source SHA is required}
 expected_model_sha=${5:?expected model SHA-256 is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Source-bound current identity; no independent stale receipt pin.
+RELEASE_NATIVE_IDENTITY=$(bash "$ROOT_DIR/scripts/verify_release_dependency_provenance.sh" identity)
+RELEASE_MLX_NATIVE_VERSION=$(jq -er .version <<<"$RELEASE_NATIVE_IDENTITY")
+RELEASE_MLX_NATIVE_CHECKSUM=$(jq -er .checksum <<<"$RELEASE_NATIVE_IDENTITY")
+readonly RELEASE_NATIVE_IDENTITY RELEASE_MLX_NATIVE_VERSION RELEASE_MLX_NATIVE_CHECKSUM
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
 # shellcheck source=scripts/macos_memory_guard.sh
@@ -374,7 +379,7 @@ loaded_idle_memory_summary=$(memory_log_summary_json)
 memory_validate_warning_log "$memory_log" 5 0
 measurement_memory_summary=$(memory_log_summary_json)
 
-jq --arg source_sha "$expected_source_sha" \
+jq --arg mlx_native_version "$RELEASE_MLX_NATIVE_VERSION" --arg source_sha "$expected_source_sha" \
   --arg model_sha256 "$expected_model_sha" \
   --arg raw_sha256 "$(sha256_file "$raw")" \
   --arg test_log_sha256 "$(sha256_file "$test_log")" \
@@ -440,7 +445,7 @@ jq --arg source_sha "$expected_source_sha" \
   --argjson loaded_idle_memory "$loaded_idle_memory_summary" \
   --argjson measurement_memory "$measurement_memory_summary" '
   . + {schema_version:6,source_sha:$source_sha,model_sha256:$model_sha256,
-    mlx_native_version:"0.15.4",producer_exit_code:$producer_exit_code,
+    mlx_native_version:$mlx_native_version,producer_exit_code:$producer_exit_code,
     raw_sha256:$raw_sha256,test_log_sha256:$test_log_sha256,
     phase_evidence:{policy:"fsynced-run-bound-markers-v1",run_uuid:$run_uuid,
       producer_pid:$producer_pid,test_spawned_at:$test_spawned_at,

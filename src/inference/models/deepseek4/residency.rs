@@ -358,3 +358,8 @@ fn validate_loaded_buffer(
     }
     Ok(())
 }
+
+#[cfg(test)]
+pub(super) fn metadata_storage_valid(spec:&super::weights::TensorSpec,actual:GgmlType)->bool {
+    validate_storage_type(&spec.name,spec.role,actual).is_ok()
+}

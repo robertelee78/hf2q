@@ -37,6 +37,72 @@ package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' \
 [[ "$package_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || \
   fail "package version is not canonical stable SemVer"
 
+# Unlike the synthetic metadata below, this reads the CURRENT repository pair.
+# A future Cargo pin bump without the trusted verifier update must fail here.
+identity=$(bash "$VERIFIER" identity)
+dependency_version=$(jq -er .version <<<"$identity")
+dependency_requirement=$(jq -er .requirement <<<"$identity")
+dependency_checksum=$(jq -er .checksum <<<"$identity")
+[[ "$dependency_requirement" == "=$dependency_version" ]] || fail "non-exact current requirement"
+
+# Exercise the SAME identity entry against copied real source inputs; do not
+# edit the repository or accept caller-selected alternate paths in production.
+trusted="$scratch/trusted-source"
+mkdir -p "$trusted/scripts"
+cp "$VERIFIER" "$trusted/scripts/verify_release_dependency_provenance.sh"
+cp "$ROOT_DIR/Cargo.toml" "$ROOT_DIR/Cargo.lock" "$trusted/"
+bash "$trusted/scripts/verify_release_dependency_provenance.sh" identity > "$scratch/current-identity.json"
+cmp -s <(jq -S . <<<"$identity") <(jq -S . "$scratch/current-identity.json") || fail "actual source identity drift"
+awk '/^mlx-native = / {$0="mlx-native = \"=0.15.4\""}1' "$trusted/Cargo.toml" > "$trusted/Cargo.toml.tmp"
+mv "$trusted/Cargo.toml.tmp" "$trusted/Cargo.toml"
+expect_failure "identity accepted stale manifest despite current lock" \
+  "current source Cargo.toml differs from trusted release identity" \
+  bash "$trusted/scripts/verify_release_dependency_provenance.sh" identity
+cp "$ROOT_DIR/Cargo.toml" "$trusted/Cargo.toml"
+awk '
+  /^\[\[package\]\]/ { native=0 }
+  /^name = "mlx-native"/ { native=1 }
+  native && /^version = / { $0="version = \"0.15.4\"" }
+  native && /^checksum = / { $0="checksum = \"359470da84f037916cd34534b56fc283fdd467c152a9813a85979c1d6e67f137\"" }
+  { print }
+' "$trusted/Cargo.lock" > "$trusted/Cargo.lock.tmp"
+mv "$trusted/Cargo.lock.tmp" "$trusted/Cargo.lock"
+expect_failure "identity accepted historical native0.15.4 lock/checksum" \
+  "current source Cargo.lock differs from trusted release identity" \
+  bash "$trusted/scripts/verify_release_dependency_provenance.sh" identity
+cp "$ROOT_DIR/Cargo.lock" "$trusted/Cargo.lock"
+expect_failure "identity accepted an alternate caller source path" \
+  "identity takes no alternate source inputs" \
+  bash "$trusted/scripts/verify_release_dependency_provenance.sh" identity "$ROOT_DIR"
+
+# Cargo-normalized packed manifests use the dependency subtable; same exact pin.
+cat > "$trusted/Cargo.toml" <<NORMALIZED
+[package]
+name = "hf2q"
+version = "$package_version"
+[dependencies.mlx-native]
+version = "$dependency_requirement"
+NORMALIZED
+bash "$trusted/scripts/verify_release_dependency_provenance.sh" identity > "$scratch/normalized-identity.json"
+cmp -s <(jq -S . <<<"$identity") <(jq -S . "$scratch/normalized-identity.json") || fail "normalized manifest identity drift"
+printf '\npath = "/forbidden/local/native"\n' >> "$trusted/Cargo.toml"
+expect_failure "identity accepted a local dependency path with matching version" \
+  "current source Cargo.toml differs from trusted release identity" \
+  bash "$trusted/scripts/verify_release_dependency_provenance.sh" identity
+cp "$ROOT_DIR/Cargo.toml" "$trusted/Cargo.toml"
+cat >> "$trusted/Cargo.lock" <<DUPLICATE
+
+[[package]]
+name = "mlx-native"
+version = "$dependency_version"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "$dependency_checksum"
+DUPLICATE
+expect_failure "identity accepted duplicate native lock packages" \
+  "current source Cargo.lock differs from trusted release identity" \
+  bash "$trusted/scripts/verify_release_dependency_provenance.sh" identity
+cp "$ROOT_DIR/Cargo.lock" "$trusted/Cargo.lock"
+
 checkout="$scratch/checkout"
 package_root="$scratch/packed/hf2q-$package_version"
 cargo_home="$scratch/cargo-home"
@@ -50,24 +116,12 @@ cargo_home=$(cd "$cargo_home" && pwd -P)
 cargo_target=$(cd "$cargo_target" && pwd -P)
 crate_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
-cat > "$package_root/Cargo.lock" <<LOCK
-version = 4
-
-[[package]]
-name = "hf2q"
-version = "$package_version"
-dependencies = [
- "mlx-native",
-]
-
-[[package]]
-name = "mlx-native"
-version = "0.15.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "359470da84f037916cd34534b56fc283fdd467c152a9813a85979c1d6e67f137"
-LOCK
+# Positive capture uses the real current lock, not another stale miniature.
+cp "$ROOT_DIR/Cargo.lock" "$package_root/Cargo.lock"
 
 jq -n --arg workspace_root "$package_root" \
+  --arg dependency_version "$dependency_version" \
+  --arg dependency_requirement "$dependency_requirement" \
   --arg package_version "$package_version" '
   {
     packages: [
@@ -77,12 +131,12 @@ jq -n --arg workspace_root "$package_root" \
         dependencies:[{
           name:"mlx-native",
           source:"registry+https://github.com/rust-lang/crates.io-index",
-          req:"=0.15.4"
+          req:$dependency_requirement
         }]
       },
       {
         name:"mlx-native",
-        version:"0.15.4",
+        version:$dependency_version,
         source:"registry+https://github.com/rust-lang/crates.io-index",
         dependencies:[]
       }
@@ -97,7 +151,7 @@ bash "$VERIFIER" verify "$evidence" "$package_root/Cargo.lock"
 
 wrong_checksum="$scratch/wrong-checksum"
 cp -R "$evidence" "$wrong_checksum"
-awk '{gsub(/359470da84f037916cd34534b56fc283fdd467c152a9813a85979c1d6e67f137/, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}1' \
+awk -v expected="$dependency_checksum" '{gsub(expected, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}1' \
   "$wrong_checksum/Cargo.lock" > "$wrong_checksum/Cargo.lock.tmp"
 mv "$wrong_checksum/Cargo.lock.tmp" "$wrong_checksum/Cargo.lock"
 expect_failure "verifier accepted a substituted mlx-native checksum" \
