@@ -25,6 +25,18 @@ cargo package --locked --allow-dirty --no-verify
 ls -l target/package/hf2q-0.1.22.crate   # MUST be under 10 MiB
 ```
 
+When the published `mlx-native` pin changes, update the one reviewed identity
+in `scripts/verify_release_dependency_provenance.sh` together with Cargo.toml and
+Cargo.lock. Its `identity` entry checks both the actual manifest requirement and
+registry lock version/source/checksum; release/cache/cohort/matched-reference
+producers and validators consume that identity. Run
+`bash scripts/test_release_dependency_provenance_contract.sh` before release:
+it checks the real source inputs as well as synthetic refusal cases, so a
+self-consistent stale fixture cannot hide a missed pin update. Historical
+receipts remain bound to their original source; do not rewrite them for a new
+release. A failed release source must be corrected/reviewed/merged before a
+new explicitly authorized workflow attempt, never retried as the same source.
+
 If the crate is 10 MiB or larger, crates.io will reject it with HTTP 413.
 Trim it through `exclude` in `Cargo.toml` before going further.
 

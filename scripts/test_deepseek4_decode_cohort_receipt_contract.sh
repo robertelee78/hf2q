@@ -2,6 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Source-bound current identity; no independent stale receipt pin.
+RELEASE_NATIVE_IDENTITY=$(bash "$ROOT_DIR/scripts/verify_release_dependency_provenance.sh" identity)
+RELEASE_MLX_NATIVE_VERSION=$(jq -er .version <<<"$RELEASE_NATIVE_IDENTITY")
+RELEASE_MLX_NATIVE_CHECKSUM=$(jq -er .checksum <<<"$RELEASE_NATIVE_IDENTITY")
+readonly RELEASE_NATIVE_IDENTITY RELEASE_MLX_NATIVE_VERSION RELEASE_MLX_NATIVE_CHECKSUM
 VERIFY="$ROOT_DIR/scripts/verify_deepseek4_decode_cohort_receipt.sh"
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
@@ -209,7 +214,7 @@ write_summary() {
   local measurement_memory_json
   measurement_memory_json=$(memory_log_summary_json)
 
-  jq --arg source_sha "$source_sha" --arg model_sha256 "$model_sha" \
+  jq --arg mlx_native_version "$RELEASE_MLX_NATIVE_VERSION" --arg source_sha "$source_sha" --arg model_sha256 "$model_sha" \
     --arg raw_sha256 "$(sha256_file "$raw_path")" \
     --arg test_log_sha256 "$(sha256_file "$test_log_path")" \
     --arg phase_log_sha256 "$(sha256_file "$phase_path")" \
@@ -242,7 +247,7 @@ write_summary() {
     --argjson loaded_idle_memory_json "$loaded_idle_memory_json" \
     --argjson measurement_memory_json "$measurement_memory_json" '
     . + {schema_version:6,source_sha:$source_sha,model_sha256:$model_sha256,
-      mlx_native_version:"0.15.4",producer_exit_code:0,raw_sha256:$raw_sha256,
+      mlx_native_version:$mlx_native_version,producer_exit_code:0,raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,
       phase_evidence:{policy:"fsynced-run-bound-markers-v1",run_uuid:$run_uuid,
         producer_pid:$producer_pid,test_spawned_at:1940,log_sha256:$phase_log_sha256},
@@ -322,6 +327,7 @@ expect_reject() {
 }
 
 for mutation in \
+  '.mlx_native_version = "0.15.4"' \
   '.schema_version = 5' \
   '.benchmark.speedup = 1' \
   '.producer_exit_code = 1' \

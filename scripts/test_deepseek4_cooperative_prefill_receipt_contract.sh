@@ -2,6 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Source-bound current identity; no independent stale receipt pin.
+RELEASE_NATIVE_IDENTITY=$(bash "$ROOT_DIR/scripts/verify_release_dependency_provenance.sh" identity)
+RELEASE_MLX_NATIVE_VERSION=$(jq -er .version <<<"$RELEASE_NATIVE_IDENTITY")
+RELEASE_MLX_NATIVE_CHECKSUM=$(jq -er .checksum <<<"$RELEASE_NATIVE_IDENTITY")
+readonly RELEASE_NATIVE_IDENTITY RELEASE_MLX_NATIVE_VERSION RELEASE_MLX_NATIVE_CHECKSUM
 VERIFY="$ROOT_DIR/scripts/verify_deepseek4_cooperative_prefill_receipt.sh"
 SOURCE_SHA=0123456789abcdef0123456789abcdef01234567
 MODEL_SHA=936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d
@@ -97,7 +102,7 @@ write_summary() {
       END { print samples "\t" last-first "\t" non_nominal "\t" fair \
         "\t" over "\t" gaps }
     ' "$measurement_path")"
-  jq --arg source_sha "$SOURCE_SHA" --arg model_sha256 "$MODEL_SHA" \
+  jq --arg mlx_native_version "$RELEASE_MLX_NATIVE_VERSION" --arg source_sha "$SOURCE_SHA" --arg model_sha256 "$MODEL_SHA" \
     --arg raw_sha256 "$(sha256_file "$raw")" \
     --arg test_log_sha256 "$(sha256_file "$test_log")" \
     --arg measurement_log_sha256 "$(sha256_file "$measurement_path")" \
@@ -115,7 +120,7 @@ write_summary() {
       "$over_limit_measurement_samples" \
     --argjson telemetry_gaps "$telemetry_gaps" '
     . + {schema_version:2,source_sha:$source_sha,model_sha256:$model_sha256,
-      mlx_native_version:"0.15.4",raw_sha256:$raw_sha256,
+      mlx_native_version:$mlx_native_version,raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
       required_start_state:"nominal",maximum_measurement_state:"fair",
       measurement_log_sha256:$measurement_log_sha256,
@@ -151,6 +156,11 @@ expect_rejected() {
     exit 1
   fi
 }
+
+# Historical version is an intentional negative, never a rewritten old receipt.
+jq '.mlx_native_version = "0.15.4"' "$summary" >"$tmp_dir/old-native.json"
+expect_rejected old-native "$tmp_dir/old-native.json" "$raw" "$test_log" \
+  "$measurement" "$settle" "$SOURCE_SHA" "$MODEL_SHA"
 
 jq '.benchmark.speedup = 9' "$summary" >"$tmp_dir/bad-speedup.json"
 expect_rejected derived-speedup "$tmp_dir/bad-speedup.json" "$raw" "$test_log" \
