@@ -2,9 +2,10 @@
 
 Composed on af82f58a, including the corrected exact-family parity fixture,
 with the V2 retained-Delta source reviewed independently. Native PR73 merged
-as 55906d98; its 0.15.12 release is pending. Cargo still pins published1511:
-THIS SOURCE CANNOT COMPILE until root publishes/verifies/pins the new API.
-No path patch, version fabrication or runtime acceptance is provided.
+as 55906d98 and published 0.15.12. The registry checksum, source VCS identity,
+672 packed source files, tag and release assets were verified before this
+exact Cargo pin. No local Cargo patch is used. Compilation, focused host
+controls, real-model parity and measured serving wins remain pending.
 
 ## Narrow observable contract
 
