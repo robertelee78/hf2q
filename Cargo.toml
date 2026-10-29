@@ -1,6 +1,6 @@
 [package]
 name = "hf2q"
-version = "0.1.27"
+version = "0.1.28"
 edition = "2021"
 rust-version = "1.89.0"
 build = "src/build_script.rs"
@@ -171,8 +171,9 @@ thiserror = "2"
 # direct packed Q5_K/Q6_K embedding gathers and deterministic lowest-index
 # argmax tie handling, native BF16 GGUF/dense/expert execution, and sticky
 # expert-ID validation and optional deduplicated pool checkpoints use the
-# published mlx-native 0.15.14 contract (optional measurement observers default off).
-mlx-native = "=0.15.14"
+# published mlx-native 0.15.15 contract (optional measurement observers default off).
+# Bounded same-file metadata diagnostics share its production mapping planner.
+mlx-native = "=0.15.15"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).

@@ -67,3 +67,6 @@ mod real_artifact_tests;
 mod residency_tests;
 
 pub const ARCH_DEEPSEEK4: &str = "deepseek4";
+
+#[cfg(test)]
+mod bounded_map_ledger;

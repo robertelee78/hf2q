@@ -307,13 +307,13 @@ impl Deepseek4Config {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::backends::gguf::types::MetaValue;
     use crate::backends::gguf::writer::GgufWriter;
     use std::fs;
 
-    fn official_metadata() -> Vec<(String, MetaValue)> {
+    pub(crate) fn official_metadata() -> Vec<(String, MetaValue)> {
         let mut kv = vec![
             (
                 "general.architecture",
