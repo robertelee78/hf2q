@@ -116,6 +116,8 @@ pub fn reset_decode_pool() {
 
 /// Caller guarantees no future issued-buffer access AND a successful drain.
 pub fn checked_reset_decode_pool() -> std::result::Result<(), mlx_native::MlxError> {
+    super::forward_gpu::shared_dense::require_pool_reset_allowed()
+        .map_err(|e| mlx_native::MlxError::InvalidArgument(format!("pending shared group forbids reset: {e}")))?;
     if let Some(result) = profile::reset() { return result; }
     DECODE_POOL.with(|cell| cell.borrow_mut().reset());
     Ok(())

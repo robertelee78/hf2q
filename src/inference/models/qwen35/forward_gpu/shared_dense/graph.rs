@@ -43,10 +43,12 @@ pub(super) fn encode(
     for (layer, weights) in c.layer_weights.iter().enumerate() {
         let attention = dev.alloc_buffer(n * h * 4, DType::F32, vec![n, h])?;
         roots.push(attention.clone());
+        let layer_root_start=roots.len(); // Keep dedicated packed attention outside helper suffix.
+        retained::begin_layer(layer,matches!(weights,LayerWeightsGpu::LinearAttn{..}))?;
         // Each helper receives one physical row and its actual independent
         // cursor/cache slice. Never pass these rows as a temporal sequence.
         for (i, row) in rows.iter().enumerate() {
-            let row_root_start=roots.len();
+            retained::begin_row(i,row.handle.slot_id.0)?;
             #[cfg(test)]super::target_timing_hooks::context(layer,row.handle.slot_id.0)?;
             { // All row-local views/encoders die before the legacy reset.
             let _actual_row = native_rows(std::slice::from_ref(row));
@@ -127,29 +129,20 @@ pub(super) fn encode(
             roots.push(out.clone());
             let mut enc = dev.command_encoder().map(crate::inference::native_observation::encoder)?;
             enc.blit_copy_bytes(&out, 0, &attention, (i * h * 4) as u64, (h * 4) as u64)?;
-            // Drain before the next singleton helper / packed consumer. This
-            // deliberate diagnostic boundary is not a performance assertion.
-            #[cfg(test)]let clock=super::target_timing_hooks::start()?;
-            enc.commit_and_wait_labeled("s3.singleton_attention_row_copy")?;
-            #[cfg(test)]super::target_timing_hooks::checked("row-copy",&enc,clock,Some((layer,Some(row.handle.slot_id.0))))?;
-            retained::after_healthy_fence()?;
-            #[cfg(test)]
-            fixture_after_checked_attention_copy(layer,i)?;
+            // SAME-QUEUE submit once; keep exact encoder + all issued pool epochs
+            // until this layer's existing FFN checked terminal fence.
+            retained::submit_copy(enc)?;
             map(
                 &mut maps,
                 Some(layer),
                 "singleton_entire_attention_including_QKV_output",
                 std::slice::from_ref(row),
             );
-            drop(enc);
             drop(out);
             } // x/positions and every helper-local wrapper are out of scope.
-            // No future access: dedicated packed attention owns the checked
-            // copied row. Only the row's helper-root suffix is released. On an
-            // earlier Err this is never reached; caller retains quarantine.
-            retire_row_scratch(roots,row_root_start,||{
-                super::super::super::decode_pool::checked_reset_for_prefill_chunk().map_err(Into::into)
-            })?;
+            // No suffix truncation/reset here: Metal retain alone cannot stop
+            // a pool reset from reissuing these CPU-refilled parameter roots.
+
         }
         let norm = match weights {
             LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
@@ -188,18 +181,28 @@ pub(super) fn encode(
             build_dense_ffn_layer_gpu_q_into(&mut enc, dev, reg, &input, ffn, Some(&residual))?;
         roots.push(hidden.clone());
         #[cfg(test)]let clock=super::target_timing_hooks::start()?;
-        enc.commit_and_wait_labeled("s3.shared_postattn_RMS_dense_FFN")?;
-        #[cfg(test)]super::target_timing_hooks::checked("shared-FFN",&enc,clock,Some((layer,None)))?;
-        retained::after_healthy_fence()?;
+        let anchor=enc.commit_and_wait_labeled("s3.shared_postattn_RMS_dense_FFN").map_err(anyhow::Error::from);
+        #[cfg(test)]let anchor=anchor.and_then(|()|super::target_timing_hooks::checked("shared-FFN",&enc,clock,Some((layer,None))));
+        // Checks every exact retained CB even if anchor itself failed. No
+        // earlier success is inferred from the anchor or timestamp properties.
+        retained::after_layer_fence(anchor)?;
         drop(enc);
+        #[cfg(test)]for (i,_) in rows.iter().enumerate(){fixture_after_checked_attention_copy(layer,i)?;}
+        // All helpers/copies/FFN are healthy. First drop helper wrappers, then
+        // recycle issued roots ONCE. Input/residual/hidden locals are dedicated
+        // nonpool parents, so retain them across suffix retirement and reattach.
+        retire_row_scratch(roots,layer_root_start,||{
+            super::super::super::decode_pool::checked_reset_for_prefill_chunk().map_err(Into::into)
+        })?;
+        roots.extend([input.clone(),residual.clone(),hidden.clone()]);
+
         map(
             &mut maps,
             Some(layer),
             "packed_postattn_RMS_dense_FFN_residual",
             rows,
         );
-        // Every preceding helper and packed encoder has healthy completion.
-        super::super::super::decode_pool::checked_reset_for_prefill_chunk()?;
+        // Layer epoch was already retired/reset exactly once after all checks.
     }
     let (all, normed) = apply_output_head_gpu_with_nextn_hidden(
         dev,

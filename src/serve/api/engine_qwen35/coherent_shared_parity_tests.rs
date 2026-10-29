@@ -455,3 +455,5 @@ fn actual_retained_workload_label_is_case_exact() {
 
 #[path="coherent_shared_parity_tests/target_timing.rs"]
 mod target_timing;
+
+mod grouped_target_timing;

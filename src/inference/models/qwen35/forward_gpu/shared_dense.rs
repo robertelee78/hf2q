@@ -73,9 +73,12 @@ fn native_rows(rows:&[Row])->crate::inference::native_observation::Input {
 /// Proven GPU-only helper CB: retain exact encoder until the existing row fence.
 pub(crate) fn deferral_active()->bool{retained::active()}
 pub(crate) fn submit_retained(enc:mlx_native::CommandEncoder,label:&'static str)->Result<()> {retained::submit(enc,label)}
+/// Reject resets/truncations until the exact active group is fully checked.
+pub(crate) fn require_pool_reset_allowed()->Result<()> {retained::require_reset_allowed()}
 /// Only healthy checked copies may retire a row's temporary helper suffix.
 fn retire_row_scratch<T>(roots:&mut Vec<T>,start:usize,reset:impl FnOnce()->Result<()>)->Result<()> {
-    ensure!(start<=roots.len(),"row-root boundary invalid");roots.truncate(start);reset()
+    retained::require_reset_allowed()?;
+    ensure!(start<=roots.len(),"scratch-root boundary invalid");roots.truncate(start);reset()
 }
 /// Internal target producer. Known descriptor/config incompatibility refuses
 /// BEFORE mutation with Invocation fresh. Once operational work begins ANY
@@ -83,6 +86,7 @@ fn retire_row_scratch<T>(roots:&mut Vec<T>,start:usize,reset:impl FnOnce()->Resu
 /// The owning caller must preserve replies for its existing fatal fanout path.
 pub(crate) fn run(model:&Qwen35Model,cache:&mut HybridKvCache,invocation:&mut Invocation,rows:&[Row],owners:&[Owner])->Result<Output> {
     ensure!(invocation.state==State::Fresh,"one-shot failed/completed invocation cannot revive");
+    retained::require_width(rows.len())?;
     retained::require_retained_mode(mlx_native::command_buffer_uses_unretained_references())?;
     preflight(rows,owners,cache.n_seqs,cache.max_seq_len,model.cfg.vocab_size)?;
     ensure!(matches!(model.cfg.variant,super::super::Qwen35Variant::Dense)&&model.cfg.hidden_size==5120&&model.cfg.num_hidden_layers==64&&model.cfg.intermediate_size==Some(17408)&&model.glp.is_none()&&model.token_embd_native.is_some(),"selected native Q38 DenseQ unsteered model only");
@@ -99,7 +103,7 @@ pub(crate) fn run(model:&Qwen35Model,cache:&mut HybridKvCache,invocation:&mut In
     let result=(|| ->Result<Output> {
         let operation=super::super::decode_pool::profile::Operation::enter(model as *const _ as usize)?;
         let _checked=CheckedScope::enter()?;
-        let _retained=retained::GraphDeferralScope::enter()?;
+        let _retained=retained::GraphDeferralScope::enter(rows.len())?;
         model.ensure_gpu_cache_primed()?;
         let output=GPU_CACHE.with(|cell| ->Result<Output> {
             let mut borrowed=cell.try_borrow_mut().context("reentrant actual GPU cache")?;let c=borrowed.as_mut().context("unprimed actual cache")?;
