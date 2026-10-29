@@ -447,3 +447,6 @@ pub(crate) fn capture_native_for_tiny() -> Result<()> {
         Ok(())
     })
 }
+
+#[cfg(test)]
+mod provider_control;

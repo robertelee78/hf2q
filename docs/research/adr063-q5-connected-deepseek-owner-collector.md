@@ -257,7 +257,7 @@ OS calls are not interruptible and their total latency is NOT certified). At mos
 time, at most64*65536=4MiB virtual file range (typical16KiB pages gives1MiB); its
 PTE/driver/OS effects remain unqualified, with no physical credit. Source metadata
 FD clones are transient. File interval union uses at most16384 actual parent
-spans (<256KiB payload) and preserves FULL requested bytes separately; it does not
+spans (<=256KiB requested tuple payload) and preserves FULL requested bytes separately; it does not
 identify PFNs or deduplicate physical charge. Rounded spans outside EOF refuse
 coverage rather than infer a shared physical tail.
 
@@ -278,3 +278,27 @@ partition or conservative residual; certified fullresident CPU/channel/OS/reacti
 upper and external process/source/binary/workload bindings; actual low-memory
 reaction/cleanup qualification. A reclaim window remains a separately measured
 memory mechanism, never an assumed latency win. Current125.613GiB rejection stays.
+
+
+### Actual paired HF provider control (authored, UNRUN)
+
+The prior122root cache constructor control does NOT exercise NoCopy page queries.
+A separate ignored fresh-process control now creates a finite synthetic GGUF with
+one2MiB F32 tensor at offset64, readonly retainedFD and padded file<=2MiB+64KiB.
+The actual native coalesced mapped-set constructor/load feeds collector::weight;
+the control requires a KnownNative shared alias root, exact file intervals, a
+PartialNoCredit result with64 rawflags on each side, unchanged FULL requested
+charge, real authority requested/live accounting and unchanged raw dispatch/
+commit/sync counters. Sourceidentity, unaligned aliasoffset and real Owned load
+must refuse coverage or retain Unknown/full charge. The first data oracle occurs
+AFTER the paired query, not as prequery CPU faulting. No model or application
+GPU commands are dispatched. All owners remain alive through the last query.
+
+Pre-Device finite source ceiling is8MiB native requested bytes/four roots. Actual
+payload geometry predicts<=2MiB+64KiB mapped parent plus2MiB Owned parent, plus
+a transient2MiB Owned-load read, file, one<=4MiB aliasVA and1MiB metadata reserve:
+<16MiB named extents, not a process/PTE/driver/OS physical bound. Fixed native
+query count is3 (one paired positive plus one invalid-offset root query), with
+sourceidentity and Owned negatives refusing before query. Native query calls
+remain noninterruptible and metadata-only. The control is diagnostic, not a
+retirement/admission/performance claim; author did not execute it.
