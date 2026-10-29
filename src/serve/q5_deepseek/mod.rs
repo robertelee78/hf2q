@@ -1,5 +1,6 @@
 //! Connected ADR-063 selected DeepSeek diagnostic entry, default off.
-//! This first slice deliberately cannot mint a model-load permit.
+//! Legacy packets refuse; a private reviewed quantitative gate may authorize
+//! one capped operating attempt, never physical or Q5 qualification.
 pub(crate) mod collector;
 pub(crate) mod manifest;
 mod packet;
@@ -19,27 +20,15 @@ use packet::{Packet, Phase};
 use std::{fs::File, io::Read, path::Path};
 
 /// Private real-load carrier. No serde/external constructor or permit boolean.
-/// Present only after a future independently reviewed admission implementation.
+/// Present only after the private independently reviewed operating validator.
 pub(crate) struct PreparedLoad {
     header: GgufFile,
     context: collector::Handle,
 }
 
-// No constructor/serde exists. Only a future independent budget validator in
-// this private module may mint one; packet hashes/booleans cannot construct it.
-mod reviewed_budget {
-    pub(super) struct ReviewedSourceBudget {
-        creation: mlx_native::RootCreationLimits,
-        live: mlx_native::LiveRootLimits,
-    }
-    impl ReviewedSourceBudget {
-        pub(super) fn into_limits(
-            self,
-        ) -> (mlx_native::RootCreationLimits, mlx_native::LiveRootLimits) {
-            (self.creation, self.live)
-        }
-    }
-}
+mod reviewed_budget;
+pub(crate) mod operating_case;
+mod operating_os;
 use reviewed_budget::ReviewedSourceBudget;
 impl PreparedLoad {
     fn after_review(
@@ -78,6 +67,10 @@ pub(crate) fn preflight_model(model: Option<&Path>) -> Result<()> {
         let (gguf, _scope, startup) = observe_header(&packet, model)?;
         // Dry preflight never installs native authority or executes a real-load
         // callback, even when a later source-budget validator is implemented.
+        if packet.operating_case.is_some() {
+            reviewed_budget::dry_validate(&packet,&gguf,&startup)?;
+            return Ok(()); // No token, native installation or model callback.
+        }
         return reject_preload_with_startup(&packet, receipt::HeaderPlan::actual(&gguf), startup);
     }
     Ok(())
@@ -172,9 +165,14 @@ fn enter_with_profile<T>(
     let compiled_source = option_env!("HF2Q_BUILD_GIT_SHA").unwrap_or("Unknown");
     let compiled_native_pin = env!("HF2Q_MLX_NATIVE_VERSION");
     let pid = std::process::id();
-    let budget: ReviewedSourceBudget = reject_preload_with_startup(packet, receipt::HeaderPlan::actual(&gguf), startup).with_context(|| format!("Q5 same-FD header observation (events,checked_results,checkpoint_roots,retained_fd)={observed_header_metadata:?}; compiled_metadata_source={compiled_source}; compiled_native_pin={compiled_native_pin}; pid={pid}; declared_hashes_unverified; not runtime coverage"))?;
-    // Currently unreachable: reject_preload cannot construct ReviewedSourceBudget.
-    // If a real validator replaces it, this installs once BEFORE target Device.
+    let budget: ReviewedSourceBudget = if packet.operating_case.is_some() {
+        ensure!(profile.is_some(), "Q5 operating case requires actual typed load profile");
+        reviewed_budget::validate(packet,&gguf,&startup)?
+    } else {
+        reject_preload_with_startup(packet, receipt::HeaderPlan::actual(&gguf), startup).with_context(|| format!("Q5 same-FD header observation (events,checked_results,checkpoint_roots,retained_fd)={observed_header_metadata:?}; compiled_metadata_source={compiled_source}; compiled_native_pin={compiled_native_pin}; pid={pid}; declared_hashes_unverified; not runtime coverage"))?
+    };
+    // The selected operating validator authorizes one capped attempt, not success.
+    // Install exactly once BEFORE target Device; failure never retries/replays.
     let prepared = PreparedLoad::after_review(gguf, scope.handle(), budget)?;
     real_load(Some(prepared))
 }
@@ -268,4 +266,21 @@ pub(crate) fn actual_header_plan_control(header: &GgufFile) -> Result<(u32, u64)
         } => Ok((layers, one_cache_requested_bytes)),
         receipt::HeaderPlan::Unknown { reason } => anyhow::bail!(reason),
     }
+}
+
+/// Selected surrounding metadata reads use the SAME bounded parser. Normal
+/// loading retains its original parser and behavior; no device/mapping occurs.
+pub(crate) fn metadata_header(path:&Path)->Result<GgufFile>{
+    if selected()?.is_none(){return Ok(GgufFile::open(path)?);}
+    let result=(||{let packet=read_packet(selected()?.context("Q5 selected metadata source lost")?)?;
+        let file=diagnostic_open(path)?;packet.file.matches(&file.metadata()?)?;
+        let g=GgufFile::from_file_with_limits(file.try_clone()?,startup::limits())?;
+        packet.file.matches(&file.metadata()?)?;Ok(g)})();
+    if result.is_err(){operating_case::record_failure();}result
+}
+
+/// Dry preflight eligibility is never a direct native model-load authority.
+pub(crate) fn require_prepared_model_load()->Result<()>{
+    if selected()?.is_some(){ensure!(operating_case::is_active(),"Q5 direct model load requires the private operating carrier");collector::require_prepared_before_device()?;}
+    Ok(())
 }

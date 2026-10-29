@@ -1020,6 +1020,9 @@ pub enum EngineSpawnError {
     )]
     Deepseek4SlotAwareProvisionFailed { max_slots: u32, cause: String },
 
+    #[error("Q5 selected operating case refused: {cause}")]
+    Q5SelectedOperatingCase { cause:String },
+
     /// **ADR-040 Phase C iter-C2c-cont** — `EngineMode::SlotAware`
     /// spawn for Gemma 4 reached the SIBLING `MultiSeqHybridKvBuffers`
     /// scaffold provisioning step (the PRODUCTION-DEFAULT KV path per
@@ -3266,7 +3269,7 @@ impl LoadedModel {
             model_path.display()
         );
         // Header-only parse — cheap; no tensor read.
-        let gguf = mlx_native::gguf::GgufFile::open(model_path)
+        let gguf = crate::serve::q5_deepseek::metadata_header(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         let arch = gguf
             .metadata_string("general.architecture")
@@ -3371,7 +3374,7 @@ impl GemmaLoadedModel {
             resolve_tokenizer_path_optional(model_path, opts.tokenizer_path.as_deref());
 
         // Open GGUF (header + metadata only).
-        let gguf = mlx_native::gguf::GgufFile::open(model_path)
+        let gguf = crate::serve::q5_deepseek::metadata_header(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         if load_timing {
             tracing::info!(
@@ -4065,6 +4068,7 @@ impl Engine {
         queue_capacity: usize,
         kv_cache_budget_bytes: Option<u64>,
     ) -> Self {
+        assert!(!crate::serve::q5_deepseek::operating_case::is_active(),"Q5 selected case requires fallible SlotAware spawn");
         assert!(!crate::debug::investigation_env::gemma_full_input::selected().unwrap_or(true),
             "Gemma full-input experiment requires fallible SlotAware spawn");
         // Must precede even channel/metadata/thread creation. The normal
@@ -4201,7 +4205,7 @@ impl Engine {
             };
 
         let kv_spill_active = kv_spill_descriptor.is_some();
-        let gguf = mlx_native::gguf::GgufFile::open(loaded.model_path())
+        let gguf = crate::serve::q5_deepseek::metadata_header(loaded.model_path())
             .expect("re-open loaded GGUF for Engine load-info snapshot");
         let info = Arc::new(loaded.build_load_info(
             &gguf,
@@ -4355,6 +4359,8 @@ impl Engine {
         kv_cache_budget_bytes: Option<u64>,
         mode: EngineMode,
     ) -> std::result::Result<Self, EngineSpawnError> {
+        crate::serve::q5_deepseek::operating_case::spawn(queue_capacity,mode)
+            .map_err(|e|EngineSpawnError::Q5SelectedOperatingCase{cause:e.to_string()})?;
         let full_input = crate::debug::investigation_env::gemma_full_input::selected()
             .map_err(|e| EngineSpawnError::GemmaFullInputCheckpoint { cause: e.into() })?;
         if full_input {
@@ -4783,7 +4789,7 @@ impl Engine {
             };
 
         let kv_spill_active = kv_spill_descriptor.is_some();
-        let gguf = mlx_native::gguf::GgufFile::open(loaded.model_path())
+        let gguf = crate::serve::q5_deepseek::metadata_header(loaded.model_path())
             .expect("re-open loaded GGUF for SlotAware Engine load-info snapshot");
         let info = Arc::new(loaded.build_load_info(
             &gguf,
@@ -5444,6 +5450,7 @@ impl Engine {
             reply: reply_tx,
         };
         // Use `try_send` so we can distinguish queue-full from a closed worker.
+        validate_q5_enqueue(&req)?;
         match self.inner.tx.try_send(req) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -5543,6 +5550,7 @@ impl Engine {
             deepstack,
             positions_flat,
         };
+        validate_q5_enqueue(&req)?;
         match self.inner.tx.try_send(req) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => anyhow::bail!("queue_full"),
@@ -5575,6 +5583,7 @@ impl Engine {
             prompt_tokens,
             reply: reply_tx,
         };
+        validate_q5_enqueue(&req)?;
         match self.inner.tx.try_send(req) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -5632,6 +5641,7 @@ impl Engine {
             positions_flat,
             reply: reply_tx,
         };
+        validate_q5_enqueue(&req)?;
         match self.inner.tx.try_send(req) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -57806,3 +57816,15 @@ mod gemma_full_input_tests;
 #[cfg(test)]
 #[path = "engine_template_json_order_tests.rs"]
 mod template_json_order_tests;
+
+/// One shared pre-enqueue boundary; normal processes have no selected Runtime.
+fn validate_q5_enqueue(request:&Request)->Result<()>{
+ use crate::serve::q5_deepseek::operating_case as case;
+ match request {
+  Request::Generate{prompt_tokens,params,..}=>case::enqueue(prompt_tokens,params,false,false),
+  Request::GenerateStream{prompt_tokens,params,soft_tokens,deepstack,positions_flat,..}
+   |Request::GenerateWithSoftTokens{prompt_tokens,params,soft_tokens,deepstack,positions_flat,..}=>case::enqueue(prompt_tokens,params,!soft_tokens.is_empty()||deepstack.is_some()||positions_flat.is_some(),false),
+  Request::Embed{..}=>case::refuse_embedding(),
+  _=>Ok(()),
+ }
+}

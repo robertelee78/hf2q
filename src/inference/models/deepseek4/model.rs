@@ -66,6 +66,7 @@ impl Deepseek4Model {
     /// runnable model bundle. DSpark draft tensors are rejected by the exact
     /// verifier catalog and belong in their own artifact.
     pub fn load_from_gguf(gguf: &GgufFile) -> Result<Self> {
+        crate::serve::q5_deepseek::require_prepared_model_load()?;
         let cfg = Deepseek4Config::from_gguf(gguf).context("Deepseek4Config::from_gguf")?;
         let ctx = GpuContext::new()
             .map_err(|source| anyhow::anyhow!("DeepSeek-V4 Metal initialization: {source}"))?;

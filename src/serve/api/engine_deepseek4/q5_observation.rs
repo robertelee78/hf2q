@@ -239,6 +239,7 @@ pub(in crate::serve::api) fn provision(
     } else {
         Some(context.attach()?)
     };
+    crate::serve::q5_deepseek::operating_case::provision(max_slots)?;
     collector::lifecycle_begin(collector::Lifecycle::Provision)?;
     snapshot(model, model.slot_sessions.as_deref().unwrap_or(&[]))?;
     let result = super::slot_provision::provision(model, max_slots);

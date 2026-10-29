@@ -185,6 +185,7 @@ impl Deepseek4Model {
             hidden,
             "vocabulary projection",
         )?;
+        crate::serve::q5_deepseek::operating_case::before_submit()?;
         session
             .finish()
             .context("execute DeepSeek-V4 output head")?;
@@ -223,6 +224,7 @@ impl Deepseek4Model {
             &params,
             vocab_u32,
         )?;
+        crate::serve::q5_deepseek::operating_case::before_submit()?;
         session
             .finish()
             .context("execute DeepSeek-V4 greedy argmax")?;

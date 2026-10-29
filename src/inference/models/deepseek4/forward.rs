@@ -47,6 +47,7 @@ impl Deepseek4Model {
             hidden,
             hc,
         )?;
+        crate::serve::q5_deepseek::operating_case::before_submit()?;
         session
             .finish()
             .context("execute DeepSeek-V4 embedding graph")?;

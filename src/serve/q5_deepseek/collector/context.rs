@@ -57,6 +57,7 @@ pub(super) fn with_current(f: impl FnOnce(&mut Collector) -> Result<()>) -> Resu
     })();
     if result.is_err() {
         handle.0.failed.store(true, Ordering::Release);
+        crate::serve::q5_deepseek::operating_case::record_failure();
     }
     result
 }
@@ -202,6 +203,7 @@ struct TerminalReceipt<'a> {
     compiled_source: Option<&'static str>,
     compiled_native_pin: &'static str,
     process_uuid_authority: &'static str,
+    operating_attempt: Option<crate::serve::q5_deepseek::operating_case::Facts>,
     actual_load_profile: &'a Option<crate::serve::q5_deepseek::selected_profile::SelectedLoadProfile>,
     native_whole_live_pending: &'a super::native_domain::Snapshot,
     bounded_page_metadata_full_charge:
@@ -271,6 +273,7 @@ impl Handle {
                 compiled_source: option_env!("HF2Q_BUILD_GIT_SHA"),
                 compiled_native_pin: env!("HF2Q_MLX_NATIVE_VERSION"),
                 process_uuid_authority: "ExternalExactJoinRequired",
+                operating_attempt: crate::serve::q5_deepseek::operating_case::facts(),
                 actual_load_profile: &state.selected_load_profile,
                 native_whole_live_pending: &state.native_domain.latest,
                 bounded_page_metadata_full_charge: &state.page_observations,

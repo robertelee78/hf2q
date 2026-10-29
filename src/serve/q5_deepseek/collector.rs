@@ -262,16 +262,16 @@ pub(crate) fn checked_chain(chain: u64, expected: usize) -> Result<()> {
     })
 }
 pub(crate) fn checked_health() -> Result<()> {
-    with_current(|c| {
-        ensure!(
-            !c.poisoned,
-            "Q5 sticky observation failure after checked boundary"
-        );
+    let result=with_current(|c| {
+        ensure!(!c.poisoned,"Q5 sticky observation failure after checked boundary");
         native_domain::require_bound_health(&mut c.native_domain)?;
+        super::operating_case::health()?;
         if let Some(profile)=c.selected_load_profile { profile.require_current_routes()?; }
         Ok(())
-    })
+    });
+    if result.is_err(){super::operating_case::record_failure();}result
 }
+
 #[cfg(test)]
 pub(crate) fn owner_begin(request: u64, slot_id: u32, generation: u64) -> Result<()> {
     owner_begin_many(&[(request, slot_id, generation)])
@@ -463,14 +463,16 @@ pub(super) fn install_reviewed_native(
     budget: super::ReviewedSourceBudget,
 ) -> Result<()> {
     context.require_current_model(Some(context))?;
-    let (creation, live) = budget.into_limits();
-    with_current(|c| {
+    let (creation, live) = budget.into_limits()?;
+    let result=with_current(|c| {
         ensure!(!c.poisoned, "Q5 poisoned early authority installation");
         native_domain::install_reviewed(&mut c.native_domain, creation, live)
-    })
+    });
+    if result.is_err(){super::operating_case::record_failure();}result
 }
 /// Actual selected model seam, before weights. No TLS means original path.
 pub(crate) fn register_model_device(device: &mlx_native::MlxDevice) -> Result<()> {
+    super::operating_case::device(device)?;
     with_current(|c| {
         ensure!(!c.poisoned, "Q5 poisoned model device binding");
         if let Some(profile)=c.selected_load_profile { profile.require_current_routes()?; }
@@ -496,5 +498,15 @@ pub(crate) fn require_selected_load_options(opts:&crate::serve::api::engine::Loa
         ensure!(!c.poisoned,"Q5 actual options check health");
         let profile=c.selected_load_profile.context("Q5 actual load options were never bound")?;
         profile.require_actual_options(opts,context)
+    })
+}
+
+pub(super) fn require_prepared_before_device()->Result<()>{
+    ensure!(active(),"Q5 selected model load has no actual prepared context");
+    with_current(|c|{
+        ensure!(!c.poisoned && c.selected_load_profile.is_some(),"Q5 selected model profile missing/failed");
+        let source=c.source.as_ref().context("Q5 selected source FD missing")?;
+        source.expected.matches(&source.file.metadata()?)?;
+        c.native_domain.require_before_device()
     })
 }

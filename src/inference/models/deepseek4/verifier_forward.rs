@@ -726,6 +726,7 @@ impl Deepseek4Model {
                         // Encoding errors above drop an uncommitted command
                         // buffer. Once finish begins, cache writes may have
                         // reached Metal even if completion reports an error.
+                        crate::serve::q5_deepseek::operating_case::before_submit()?;
                         submitted_any = true;
                         session.finish().with_context(|| {
                             format!(
@@ -761,6 +762,7 @@ impl Deepseek4Model {
                         // fresh-cache-per-prompt by contract).
                         None,
                     )?;
+                    crate::serve::q5_deepseek::operating_case::before_submit()?;
                     session.finish().with_context(|| {
                         format!("execute DeepSeek-V4 cooperative prefill layer-{layer} FFN")
                     })?;
@@ -913,6 +915,7 @@ impl Deepseek4Model {
                         end_prefill_pool_layer();
                         state = Some(layer_result?);
                     }
+                    crate::serve::q5_deepseek::operating_case::before_submit()?;
                     let (reordered, barriers) =
                         session.finish_with_reorder().with_context(|| {
                             format!("reorder DeepSeek-V4 prefill layers {start}..{end}")
@@ -971,6 +974,7 @@ impl Deepseek4Model {
                     &mut completion,
                     writer_slot,
                 )?;
+                crate::serve::q5_deepseek::operating_case::before_submit()?;
                 if graph_reorder {
                     let (reordered, barriers) = session
                         .finish_with_reorder()
@@ -1306,6 +1310,7 @@ impl Deepseek4Model {
                         Some(&mut in_flight),
                     )?);
                 }
+                crate::serve::q5_deepseek::operating_case::before_submit()?;
                 in_flight.push((
                     format!("execute DeepSeek-V4 verifier layers {start}..{end}"),
                     session.commit(),

@@ -45,6 +45,15 @@ pub(super) fn finish_or_commit(
     in_flight: Option<&mut SubmissionChain>,
     label: String,
 ) -> Result<()> {
+    // A native quota denial may have been swallowed by an old optional fast
+    // path. Never submit another CB after selected health fails. Join EVERY
+    // already-owned Result before returning; the new session remains uncommitted.
+    if crate::serve::q5_deepseek::operating_case::is_active() {
+        if let Err(error)=crate::serve::q5_deepseek::collector::checked_health() {
+            if let Some(chain)=in_flight {let joined=drain(chain);return match joined{Ok(())=>Err(error),Err(join_error)=>Err(error.context(format!("Q5 prior-chain drain: {join_error:#}")))};}
+            return Err(error);
+        }
+    }
     if let Some(in_flight) = in_flight {
         in_flight.push((label, session.commit()));
         Ok(())

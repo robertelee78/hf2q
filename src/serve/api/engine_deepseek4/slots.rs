@@ -633,6 +633,7 @@ impl Deepseek4SlotState {
         )
         .map_err(|error| anyhow::anyhow!("decode DeepSeek-V4 token {token}: {error}"))?
         {
+            crate::serve::q5_deepseek::operating_case::decoded_bytes(self.decoded_running.len(),fragment.len())?;
             self.decoded_running.push_str(&fragment);
             if let Some(router) = self.stream_router.as_mut() {
                 let events = events.context("DeepSeek-V4 slot stream has no event channel")?;

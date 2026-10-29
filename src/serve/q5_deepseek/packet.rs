@@ -24,7 +24,7 @@ pub(super) enum Cell {
     Unknown { reason: String },
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub(super) struct FileIdentity {
@@ -57,6 +57,8 @@ impl FileIdentity {
 #[serde(deny_unknown_fields)]
 pub(super) struct Packet {
     pub schema: String,
+    #[serde(default)]
+    pub operating_case: Option<super::reviewed_budget::Case>,
     pub hf_source_sha256: String,
     pub native_package_sha256: String,
     pub binary_sha256: String,

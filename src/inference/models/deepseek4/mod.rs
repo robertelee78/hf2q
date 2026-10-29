@@ -69,3 +69,5 @@ mod residency_tests;
 pub const ARCH_DEEPSEEK4: &str = "deepseek4";
 
 pub(crate) use forward_support::q5_pool_snapshot;
+
+pub(crate) mod selected_budget_plan;

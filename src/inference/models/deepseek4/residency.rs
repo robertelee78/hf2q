@@ -287,7 +287,7 @@ impl Deepseek4Weights {
     }
 }
 
-fn validate_storage_type(
+pub(super) fn validate_storage_type(
     name: &str,
     role: TensorRole,
     actual: GgmlType,

@@ -70,6 +70,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(request_cancellation_layer))
         .layer(axum::middleware::from_fn(request_id_layer))
         .layer(cors)
+        .layer(axum::middleware::from_fn(crate::serve::q5_deepseek::operating_case::ingress))
         .with_state(state)
 }
 

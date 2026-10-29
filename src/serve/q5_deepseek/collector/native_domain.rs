@@ -89,6 +89,11 @@ impl NativeDomain {
             reason: "MissingPoisonedUncoveredOrNoLiveAuthority",
         });
     }
+    pub(super) fn require_before_device(&self)->anyhow::Result<()> {
+        anyhow::ensure!(!self.registered,"Q5 selected model device was already constructed");
+        let handle=self.handle.ok_or_else(||anyhow::anyhow!("Q5 unprepared direct model load"))?;
+        binding::validate_snapshots(&handle.snapshot()?,&handle.live_snapshot()?,true)
+    }
     pub(super) fn bind(&mut self, handle: mlx_native::RootAuthorityHandle) -> anyhow::Result<()> {
         anyhow::ensure!(self.handle.is_none(), "duplicate native authority binding");
         binding::validate_snapshots(&handle.snapshot()?, &handle.live_snapshot()?, true)?;

@@ -250,3 +250,22 @@ mod tests {
         assert!(check_origin(true).is_err());
     }
 }
+
+/// ByteLevel maps each character to one byte or keeps the original UTF8 bytes;
+/// from_utf8_lossy expands at most3x. Empty vocab entries normalize to this
+/// bounded ASCII family in the actual tokenizer. No token/String clone here.
+pub(super) fn decoded_token_bound(g:&GgufFile)->Result<u64>{
+ let mut max="[EMPTY_262143]".len() as u64;
+ for v in array(g,"tokenizer.ggml.tokens")? {let MetadataValue::String(s)=v else{anyhow::bail!("Q5 token is not UTF8 string")};max=max.max(s.len() as u64);}
+ max.checked_mul(3).context("Q5 decoded token byte overflow")
+}
+
+#[cfg(test)]mod decoded_bound_controls{
+ use super::*;
+ #[test]fn actual_borrowed_token_byte_bound_handles_empty_and_long_tokens(){
+  use crate::backends::gguf::{writer::GgufWriter,types::MetaValue};
+  let f=tempfile::NamedTempFile::new().unwrap();let mut w=GgufWriter::new(f.reopen().unwrap());
+  w.write_header(0,1).unwrap();w.write_metadata_kv("tokenizer.ggml.tokens",&MetaValue::ArrayString(vec![String::new(),"x".repeat(100)])).unwrap();w.pad_to_alignment().unwrap();w.finalize().unwrap();
+  let g=GgufFile::from_file_with_limits(f.reopen().unwrap(),limits()).unwrap();assert_eq!(decoded_token_bound(&g).unwrap(),300);
+ }
+}

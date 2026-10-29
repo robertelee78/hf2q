@@ -1354,6 +1354,7 @@ impl Deepseek4LoadedModel {
                 return self.begin_resumable_cached_prefill(prompt_tokens, max_tokens, progress);
             }
         }
+        crate::serve::q5_deepseek::operating_case::lengths(prompt_tokens.len(),max_tokens)?;
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
         progress.cache_reset_diagnostic(
@@ -1406,6 +1407,7 @@ impl Deepseek4LoadedModel {
             )
             .into_anyhow());
         }
+        crate::serve::q5_deepseek::operating_case::lengths(prompt_tokens.len(),max_tokens)?;
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
         let cache_poisoned = self.cache.is_poisoned();
@@ -1695,6 +1697,7 @@ impl Deepseek4LoadedModel {
         if self.disk_persistor.is_some() && !self.has_in_memory_prefix_reuse(prompt_tokens) {
             self.try_hydrate_persisted_anchor(prompt_tokens);
         }
+        crate::serve::q5_deepseek::operating_case::lengths(prompt_tokens.len(),max_tokens)?;
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
 

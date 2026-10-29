@@ -3979,6 +3979,7 @@ impl multi_model::EngineConfig {
 }
 
 pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<api::engine::Engine> {
+    let _q5_serve_case = q5_deepseek::operating_case::enter_serve(config.engine_mode,config.queue_capacity)?;
     anyhow::ensure!(path.exists(), "Model not found: {}", path.display());
     // Header-only parse surfaces bad magic + populates the diagnostic
     // log line.  Cheap (memory-mapped header, no tensor read).
@@ -3993,7 +3994,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     // message (Wedge-3 deferred follow-up wires the live forward
     // pass).  See `LoadedModel::load` for the dispatch surface.
     let (resolved_context, model_id_uses_filename_fallback, glp_path) = {
-        let gguf = mlx_native::gguf::GgufFile::open(path)
+        let gguf = q5_deepseek::metadata_header(path)
             .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
         let model_id_uses_filename_fallback = gguf.metadata_string("general.name").is_none();
         let arch = gguf

@@ -38,7 +38,7 @@ impl Mode {
     pub fn summary(&self) -> Option<&'static str> {
         match self {
             Self::Off => None,
-            Self::Selected(_) => Some("UNSAFE (ack-required, activated): HF2Q_DEEPSEEK_OWNER_PACKET; selected DeepSeek research collector; current preload is refused, no physical/admission authority"),
+            Self::Selected(_) => Some("UNSAFE (ack-required, activated): HF2Q_DEEPSEEK_OWNER_PACKET; selected DeepSeek research collector; default packet refuses preload; separately reviewed capped operating case required; no physical/Q5 qualification authority"),
             Self::Refused => Some("REFUSED HF2Q_DEEPSEEK_OWNER_PACKET: acknowledgment missing"),
             Self::Invalid => Some("REFUSED HF2Q_DEEPSEEK_OWNER_PACKET: invalid path"),
         }
