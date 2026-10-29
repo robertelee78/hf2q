@@ -305,7 +305,10 @@ fn check_serve_args(active: bool, args: &crate::cli::ServeArgs) -> Result<()> {
             && args.mmproj.is_none()
             && args.planning.kv_persist_path.is_none()
             && args.planning.kv_persist_budget.is_none()
-            && args.output.is_none(),
+            && args.output.is_none()
+            && !args.gcd
+            && args.gcd_schema.is_none()
+            && !args.gcd_schema_locked,
         "Q5 selected startup preparation option unsupported"
     );
     if let Some(target) = args.target.as_deref() {
@@ -375,7 +378,7 @@ mod early_serve_tests {
         let mut a = args();
         // Local missing path is NOT opened by this pure early boundary.
         super::check_serve_args(true, &a).unwrap();
-        for i in 0..9 {
+        for i in 0..12 {
             match i {
                 0 => a.tokenizer = Some("/missing/tokenizer".into()),
                 1 => a.config = Some("/missing/config".into()),
@@ -385,7 +388,10 @@ mod early_serve_tests {
                 5 => a.embedding_model = Some("/missing/embed".into()),
                 6 => a.mmproj = Some("/missing/projector".into()),
                 7 => a.planning.kv_persist_path = Some("/missing/persist".into()),
-                _ => a.target = Some("other/repository".into()),
+                8 => a.target = Some("other/repository".into()),
+                9 => a.gcd_schema = Some("/missing/schema.json".into()),
+                10 => a.gcd_schema_locked = true,
+                _ => a.gcd = true,
             }
             let side_effect = std::cell::Cell::new(false);
             let result = super::check_serve_args(true, &a).map(|_| side_effect.set(true));
