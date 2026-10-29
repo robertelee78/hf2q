@@ -1,12 +1,13 @@
 //! Exact one-token uncompressed DeepSeek-V4 attention layers.
-use super::prefill_annotations;
 use super::attention::{append_prefill_window_indices, window_indices};
 use super::attention_weights::AttentionWeightsRef;
+use super::attention_workspace::AttentionWorkspace;
 use super::cache::{CacheSpan, Deepseek4Cache};
 use super::forward_support::{
     alloc, alloc_host_input, grouped_output_a, grouped_output_a_batched, raw_matmul, rms_params,
     BatchedGroupedOutputArena,
 };
+use super::prefill_annotations;
 use super::prefill_flash_attention::{
     encode_deepseek_flash_prefill, encode_deepseek_sparse_flash_prefill, requires_gathered_prefill,
     DeepseekPrefillFlashArena, DeepseekSparsePrefillFlashArena,
@@ -198,12 +199,11 @@ impl Deepseek4Model {
 
         let device = self.ctx.device().clone();
         let state_flat = state.with_shape(vec![rows, hc_hidden])?;
-        let state_norm = alloc(
-            &device,
-            DType::F32,
-            vec![rows, hc_hidden],
-            "HC normalized state",
-        )?;
+        let AttentionWorkspace {
+            state_norm,
+            q,
+            attention_f32,
+        } = AttentionWorkspace::new(&device, rows, hc_hidden, heads, head_dim)?;
         let mixes = alloc(&device, DType::F32, vec![rows, mix_width], "HC mixes")?;
         let pre = alloc(&device, DType::F32, vec![rows, hc], "HC pre weights")?;
         let post = alloc(&device, DType::F32, vec![rows, hc], "HC post weights")?;
@@ -212,12 +212,7 @@ impl Deepseek4Model {
         let attn_norm = alloc(&device, DType::F32, vec![rows, hidden], "attention norm")?;
         let q_a = alloc(&device, DType::F32, vec![rows, q_rank], "query rank")?;
         let q_a_norm = alloc(&device, DType::F32, vec![rows, q_rank], "query rank norm")?;
-        let q = alloc(
-            &device,
-            DType::F32,
-            vec![rows, heads, head_dim],
-            "query heads",
-        )?;
+
         let q_norm = alloc(
             &device,
             DType::F32,
@@ -255,12 +250,7 @@ impl Deepseek4Model {
             vec![1, rows, heads, head_dim],
             "inverse-rotated attention",
         )?;
-        let attention_f32 = alloc(
-            &device,
-            DType::F32,
-            vec![rows, heads, head_dim],
-            "attention f32",
-        )?;
+
         let output_a = alloc(&device, DType::F32, vec![rows, output_a_width], "output A")?;
         let output_b = alloc(&device, DType::F32, vec![rows, hidden], "output B")?;
         let output_state = alloc(
@@ -277,6 +267,7 @@ impl Deepseek4Model {
                     groups,
                     heads * head_dim / groups,
                     o_rank,
+                    output_a_weight.ggml_type,
                 )
             })
             .transpose()?;

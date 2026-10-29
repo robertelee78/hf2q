@@ -2674,3 +2674,36 @@ passed18DSML-focused tests, all four tool-bound controls,25mask tests with
 one ignored control,47sampler tests, and the locked all-target/all-feature
 check. That includes the new all-family public-key/function-name runtime
 control. Real-model serving remains the next gate.
+
+### Current-main memory-span port: source only, pending fresh gates
+
+A separate topic from main7be re-ports two source-known changes, without importing
+old whole-envelope constants or measured acceptance. Output-A allocation and
+dispatch share the actual GGML Q8_0/R>native-MM threshold predicate. Only that
+strided route omits the unused group-major input; other codecs/row routes retain
+allocation and permutation. Actual weight type binds the constructor, and call
+route/shape mismatch refuses before encoding. AtR2048/H64/D512 the omitted F32
+input is268435456 requested bytes.
+
+HC normalized state, unnormalized query and post-attention F32 cast are sequential
+roles. One checked max(HC norm elements, query elements) parent supplies exact
+views, preserving larger HC geometry. Norm reads finish before query-B writes;
+query RMS reads q into separate q_norm before the epilogue cast overwrites q.
+Existing native read/write annotations and explicit GraphSession range barriers
+preserve WAR/WAW under recorded reordering. Query-norm, rotary query and other
+live state/attention parents remain distinct. SelectedR2048 separate640MiB becomes
+one256MiB parent,384MiB requested reduction, not a pool-history/physical refund.
+
+The main candidate retains gathered query tile256. Gather64's prior latency
+result was negative; its isolated experimental source is preserved outside this
+candidate and receives no requested-budget discount or adoption claim. Current
+compactKV/gather/mask and causal query/source row mapping are unchanged.
+
+Freshly named ignored current-main-port controls compare old-Some/new-None actual
+output-A producer (<1MiB), and old separate/new shared actual common HC/query/
+RoPE/epilogue adapters with hostile reuse, direct and recorded/reordered modes
+(245111984B<256MiB). The latter does not cover full compressor/indexer/attention
+or model quality. Pure route/overflow/extent controls are also ported. All are
+UNRUN at this checkpoint. Root owns fresh compilation/hardware/full normal N4
+correctness/prefix and matched timing. No kernels, context/slots/output limits,
+positive allowance, physical credit or fit/performance acceptance changes.

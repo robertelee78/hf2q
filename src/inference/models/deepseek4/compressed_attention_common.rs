@@ -1,6 +1,7 @@
 //! Shared one-token HC/QKV graph for compressed DeepSeek-V4 attention.
+use super::attention_workspace::AttentionWorkspace;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::deepseek_hyper_connection::{
     dispatch_hc_post, dispatch_hc_pre, dispatch_hc_split_sinkhorn,
@@ -12,12 +13,12 @@ use mlx_native::ops::deepseek_tail_rope::{
 use mlx_native::ops::elementwise::dispatch_cast_bf16_to_f32_with_encoder;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
-use super::prefill_annotations;
 use super::attention_weights::AttentionWeightsRef;
 use super::forward_support::{
     alloc, grouped_output_a, grouped_output_a_batched, raw_matmul, rms_params,
     BatchedGroupedOutputArena,
 };
+use super::prefill_annotations;
 use super::Deepseek4Config;
 
 pub(super) struct CompressedAttentionCoreArena {
@@ -47,7 +48,33 @@ pub(super) struct CompressedAttentionCoreArena {
 }
 
 impl CompressedAttentionCoreArena {
-    pub(super) fn new(device: &MlxDevice, cfg: &Deepseek4Config, rows: usize) -> Result<Self> {
+    pub(super) fn new(
+        device: &MlxDevice,
+        cfg: &Deepseek4Config,
+        rows: usize,
+        output_a_type: mlx_native::ops::quantized_matmul_ggml::GgmlType,
+    ) -> Result<Self> {
+        let workspace = AttentionWorkspace::new(
+            device,
+            rows,
+            cfg.hyper_connection_count as usize * cfg.hidden_size as usize,
+            cfg.num_attention_heads as usize,
+            cfg.head_dim as usize,
+        )?;
+        Self::with_workspace(device, cfg, rows, output_a_type, workspace)
+    }
+    pub(super) fn with_workspace(
+        device: &MlxDevice,
+        cfg: &Deepseek4Config,
+        rows: usize,
+        output_a_type: mlx_native::ops::quantized_matmul_ggml::GgmlType,
+        workspace: AttentionWorkspace,
+    ) -> Result<Self> {
+        let AttentionWorkspace {
+            state_norm,
+            q,
+            attention_f32,
+        } = workspace;
         let hidden = cfg.hidden_size as usize;
         let hc = cfg.hyper_connection_count as usize;
         let hc_hidden = hc * hidden;
@@ -56,13 +83,17 @@ impl CompressedAttentionCoreArena {
         let head_dim = cfg.head_dim as usize;
         let q_rank = cfg.q_lora_rank as usize;
         let output_width = cfg.output_groups as usize * cfg.o_lora_rank as usize;
+        ensure!(
+            state_norm.dtype() == DType::F32
+                && q.dtype() == DType::F32
+                && attention_f32.dtype() == DType::F32
+                && state_norm.shape() == [rows, hc_hidden]
+                && q.shape() == [rows, heads, head_dim]
+                && attention_f32.shape() == [rows, heads, head_dim],
+            "exact attention workspace roles"
+        );
         Ok(Self {
-            state_norm: alloc(
-                device,
-                DType::F32,
-                vec![rows, hc_hidden],
-                "compressed HC norm",
-            )?,
+            state_norm,
             mixes: alloc(
                 device,
                 DType::F32,
@@ -101,12 +132,7 @@ impl CompressedAttentionCoreArena {
                 vec![rows, q_rank],
                 "compressed query rank norm",
             )?,
-            q: alloc(
-                device,
-                DType::F32,
-                vec![rows, heads, head_dim],
-                "compressed query heads",
-            )?,
+            q,
             q_norm: alloc(
                 device,
                 DType::F32,
@@ -131,12 +157,7 @@ impl CompressedAttentionCoreArena {
                 vec![1, rows, heads, head_dim],
                 "compressed inverse attention",
             )?,
-            attention_f32: alloc(
-                device,
-                DType::F32,
-                vec![rows, heads, head_dim],
-                "compressed attention f32",
-            )?,
+            attention_f32,
             output_a: alloc(
                 device,
                 DType::F32,
@@ -172,6 +193,7 @@ impl CompressedAttentionCoreArena {
                         cfg.output_groups as usize,
                         heads * head_dim / cfg.output_groups as usize,
                         cfg.o_lora_rank as usize,
+                        output_a_type,
                     )
                 })
                 .transpose()?,
