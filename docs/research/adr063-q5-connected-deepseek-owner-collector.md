@@ -258,8 +258,8 @@ time, at most64*65536=4MiB virtual file range (typical16KiB pages gives1MiB); it
 PTE/driver/OS effects remain unqualified, with no physical credit. Source metadata
 FD clones are transient. File interval union uses at most16384 actual parent
 spans (<=256KiB requested tuple payload) and preserves FULL requested bytes separately; it does not
-identify PFNs or deduplicate physical charge. Rounded spans outside EOF refuse
-coverage rather than infer a shared physical tail.
+identify PFNs or deduplicate physical charge. Registered final-page padding is validated against the actual host-page-rounded
+logical mmap end; see the EOF-tail correction below. No physical tail is inferred.
 
 Actual whole-native requested/live capture requires the real early public handle.
 The connected context has a typed unavailable state by default; no process-global
@@ -302,3 +302,37 @@ query count is3 (one paired positive plus one invalid-offset root query), with
 sourceidentity and Owned negatives refusing before query. Native query calls
 remain noninterruptible and metadata-only. The control is diagnostic, not a
 retirement/admission/performance claim; author did not execute it.
+
+
+## Correct registered EOF-page coverage (source-only correction)
+
+A native NoCopy parent may legitimately register the page covering the end of an
+otherwise valid readonly mmap. The former coverage reducer incorrectly required
+that entire registered page interval to be file content within EOF. The corrected
+actual-used checked_spans gate preserves the full requested root charge: the
+logical mmap is nonempty and within the retained SAMEFD extent; actual source
+sysconf page geometry is recorded at the NoCopy callback; mapping/registered bases
+and registered length are page-aligned, registered start is within/after mapping
+start, root requested length equals registered length, and checked registered end
+cannot exceed the checked page-rounded mmap end. No arbitrary past-EOF span or
+assumed page size is accepted. All arithmetic/identity/capacity errors refuse.
+
+Output now explicitly separates mapped_logical_file_byte_union_bytes from
+registered_file_page_union_bytes. The latter can include the legitimate final
+covering page; it is never clipped and labeled as file bytes. Both are metadata
+unions, not PFNs/unique physical RAM or admission credit. Two bounded temporary
+16384tuple vectors require<=512KiB requested tuple payload in the reducer, not
+an allocator or process bound. FULL requested parent bytes remain unchanged.
+
+Pure actual-gate controls cover legitimate EOF tails, subset roots backed by a
+larger mapping, both interval unions, source identity, mapping-past-EOF, oversized
+tail, geometry/alignment/requested mismatch and overflow. A NEW ignored filter
+actual_coalesced_nocopy_eof_tail_keeps_full_requested_charge uses an exact64+2MiB
+file on the selected actual16KiB host. Native root requested2,113,536B is larger
+than file2,097,216B; its registered-page union remains2,113,536B while mapped file
+union is2,097,216B. Together with the real Owned negative root, full requested
+charge is4,210,688B. Both64page metadata queries remain entirely within EOF.
+No additional model/forward/GPU command, physical refund or admission is added.
+The old padded fixture/filter remains distinct and unchanged in geometry; its
+previous operating wrapper MUST NOT silently select this new fixture. Author
+performed no tests/build/probes/model/header/GPU execution for this correction.

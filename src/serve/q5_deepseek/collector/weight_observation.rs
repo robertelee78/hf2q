@@ -65,6 +65,24 @@ pub(crate) fn weight(
             mlx_native::BufferProvenance::Owned => None,
             _ => anyhow::bail!("Q5 Unknown weight provenance"),
         };
+        // SAFETY: fixed sysconf metadata query, no pointers or payload access.
+        let file_page_bytes = if file_span.is_some() {
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            let page = u64::try_from(page).context("Q5 actual host page unavailable")?;
+            ensure!(
+                (4096..=65536).contains(&page) && page.is_power_of_two(),
+                "Q5 unsupported actual host page"
+            );
+            let n = b.no_copy.context("Q5 NoCopy descriptor disappeared")?;
+            ensure!(
+                n.mapping_base_address as u64 % page == 0
+                    && n.registered_base_address as u64 % page == 0,
+                "Q5 actual NoCopy CPU base page alignment"
+            );
+            Some(page)
+        } else {
+            None
+        };
         source.expected.matches(&source.file.metadata()?)?;
         let observation_file = source.file.try_clone()?;
         let observation_identity = source.expected;
@@ -78,7 +96,20 @@ pub(crate) fn weight(
                 root.file_span.is_none() || root.file_span == file_span,
                 "Q5 one root changed actual SameFD span"
             );
+            ensure!(
+                root.file_page_bytes.is_none() || root.file_page_bytes == file_page_bytes,
+                "Q5 one root changed actual host page"
+            );
+            if let Some(span) = file_span {
+                super::coverage::checked_spans(
+                    observation_identity,
+                    file_page_bytes.context("Q5 missing actual page")?,
+                    root.bytes,
+                    span,
+                )?;
+            }
             root.file_span = file_span;
+            root.file_page_bytes = file_page_bytes;
             if !c.page_observations.contains_key(&id)
                 && c.page_observations.len() < page_observer::MAX_ROOT_QUERIES
             {

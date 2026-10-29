@@ -23,6 +23,8 @@ struct Root {
     domain: Option<Domain>,
     // FD dev/ino + registered file range + mapping file range, not addresses.
     file_span: Option<(u64, u64, u64, u64, u64, u64)>,
+    // Actual OS page geometry observed at the NoCopy callback, not assumed.
+    file_page_bytes: Option<u64>,
 }
 #[derive(Debug)]
 struct Source {
@@ -138,6 +140,7 @@ impl Collector {
                     bytes: requested_bytes,
                     domain,
                     file_span: None,
+                    file_page_bytes: None,
                 },
             );
         }

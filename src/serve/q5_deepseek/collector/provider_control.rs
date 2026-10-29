@@ -35,12 +35,30 @@ fn actual_provider_fixture_plan_is_finite_before_device() {
 #[test]
 #[ignore = "root-supervised fresh-process <=8MiB native roots; actual SameFD paired metadata, no model/commands"]
 fn actual_coalesced_nocopy_weight_joins_paired_samefd_page_provider() {
+    paired_provider(false);
+}
+#[test]
+#[ignore = "root-supervised NEW EOF-tail fixture/filter;16KiB host, no model/commands; old padded case unchanged"]
+fn actual_coalesced_nocopy_eof_tail_keeps_full_requested_charge() {
+    paired_provider(true);
+}
+fn paired_provider(eof_tail: bool) {
     use mlx_native::{
         LiveRootLimits, MlxDevice, NativeRootAuthority, RootCreationLimits, RootOriginSnapshot,
     };
+    let file_bytes = if eof_tail { DATA + 64 } else { FILE_BYTES };
+    if eof_tail {
+        // SAFETY: fixed OS page metadata only, before Device/native allocation.
+        assert_eq!(
+            unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
+            16384,
+            "selected actual host required; no skip"
+        );
+        assert_eq!(DATA + 16384 + DATA, 4_210_688);
+    }
     let header = fixture_header();
     assert_eq!(header.len(), 64);
-    assert!(FILE_BYTES + DATA <= NATIVE_CEILING); // BEFORE Device or native creation.
+    assert!(file_bytes + DATA <= NATIVE_CEILING); // BEFORE Device or native creation.
     let authority = NativeRootAuthority::install_early_with_live(
         RootCreationLimits {
             max_attempted_requested_bytes: NATIVE_CEILING,
@@ -63,7 +81,7 @@ fn actual_coalesced_nocopy_weight_joins_paired_samefd_page_provider() {
     let mut fixture = tempfile::NamedTempFile::new().unwrap();
     fixture.write_all(&header).unwrap();
     fixture.write_all(&1f32.to_le_bytes()).unwrap();
-    fixture.as_file().set_len(FILE_BYTES as u64).unwrap();
+    fixture.as_file().set_len(file_bytes as u64).unwrap();
     fixture.flush().unwrap();
     let fd = File::open(fixture.path()).unwrap();
     let stat = fd.metadata().unwrap();
@@ -97,7 +115,12 @@ fn actual_coalesced_nocopy_weight_joins_paired_samefd_page_provider() {
         } => (id, requested_bytes),
         other => panic!("actual known NoCopy root required: {other:?}"),
     };
-    assert!(requested <= FILE_BYTES && requested >= DATA);
+    if eof_tail {
+        assert_eq!(requested, DATA + 16384);
+        assert!(requested > file_bytes);
+    } else {
+        assert!(requested <= file_bytes && requested >= DATA);
+    }
     weight_observation::weight(&gguf, "w", &weight).unwrap();
     let mut raw = None;
     with_current(|c| {
@@ -158,6 +181,21 @@ fn actual_coalesced_nocopy_weight_joins_paired_samefd_page_provider() {
         Ok(())
     })
     .unwrap();
+    if eof_tail {
+        with_current(|c| {
+            let v = serde_json::to_value(coverage::actual(c)?)?;
+            assert_eq!(v["full_requested_bytes"], 4_210_688);
+            assert_eq!(
+                v["mapped_logical_file_byte_union_bytes"],
+                (DATA + 64) as u64
+            );
+            assert_eq!(v["registered_file_page_union_bytes"], requested as u64);
+            assert_eq!(v["physical_credit_bytes"], 0);
+            println!("Q5_HF_PROVIDER_EOF_COVERAGE {}", v);
+            Ok(())
+        })
+        .unwrap();
+    }
     capture_native_for_tiny().unwrap();
     identity.matches(&fd.metadata().unwrap()).unwrap();
     let after = (
