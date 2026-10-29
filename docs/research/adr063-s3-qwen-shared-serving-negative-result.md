@@ -15,6 +15,7 @@ dependency in both arms.
 | Initial baseline | `f6c4adce58e59558857bd2b190464428480fc3d3` | Original scalar | 115.544542 s | 3,518 |
 | First candidate | `a17f7fa122a30a0f319f4f6091a5358f4276ad3e` | Enabled | 129.192972 s | 3,609 |
 | Same candidate control | `a17f7fa122a30a0f319f4f6091a5358f4276ad3e` | Disabled | 126.623544 s | 3,554 |
+| Original-source bracket | `f6c4adce58e59558857bd2b190464428480fc3d3` | Original scalar | 124.261773 s | 3,589 |
 
 Each trial completed the unchanged canonical four-agent, seven-turn protocol.
 The candidate passed 28 HTTP requests, 24 real tools, four correct patches,
@@ -28,7 +29,9 @@ The candidate's observed makespan is 11.8123% above the initial baseline and
 observations, not qualified multiple-run medians. Final model-text differences
 follow differing compiler paths/timing text, so the extra completion tokens
 cannot be attributed to a numerical decoder difference from these runs.
-An original-source bracketing control remains pending.
+The original-source bracketing control also passed independent raw-quality
+and exact-prefix audits. Its 124.261773 s makespan reinforces the need for
+matched repeated observations; it does not turn the candidate into a win.
 
 The earlier checked-mode target microbenchmark improved its median by 3.3942%,
 but that result did not carry into the canonical serving observation. Recorded
@@ -43,7 +46,10 @@ and helper waits absent from the normal asynchronous scalar route. A bounded
 spike may retain the exact helper encoders after asynchronous submission, then
 check each command buffer after the existing healthy row/layer fence and before
 pool reuse. mlx-native 0.15.11 already exposes the necessary encoder lifetime
-and Result-bearing completion operations; no kernel change is implied.
+and Result-bearing completion operations. The spike additionally needs the
+actual captured reference-mode accessor introduced by mlx-native PR73 for
+0.15.12, rather than rereading an environment variable. No kernel change is
+implied.
 
 The spike must bound retained encoders and scratch, preserve every causal
 status check, retain uncertain roots on failure, and reject unsupported
