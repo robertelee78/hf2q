@@ -6,6 +6,7 @@ mod packet;
 mod page_observer;
 mod receipt;
 mod requirements;
+mod startup;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -31,14 +32,20 @@ mod reviewed_budget {
         live: mlx_native::LiveRootLimits,
     }
     impl ReviewedSourceBudget {
-        pub(super) fn into_limits(self) -> (mlx_native::RootCreationLimits, mlx_native::LiveRootLimits) {
+        pub(super) fn into_limits(
+            self,
+        ) -> (mlx_native::RootCreationLimits, mlx_native::LiveRootLimits) {
             (self.creation, self.live)
         }
     }
 }
 use reviewed_budget::ReviewedSourceBudget;
 impl PreparedLoad {
-    fn after_review(header: GgufFile, context: collector::Handle, budget: ReviewedSourceBudget) -> Result<Self> {
+    fn after_review(
+        header: GgufFile,
+        context: collector::Handle,
+        budget: ReviewedSourceBudget,
+    ) -> Result<Self> {
         collector::install_reviewed_native(&context, budget)?;
         Ok(Self { header, context })
     }
@@ -67,10 +74,10 @@ pub(crate) fn preflight_model(model: Option<&Path>) -> Result<()> {
         let model = model.context("Q5 packet requires an explicit local MODEL")?;
         let path = selected()?.context("Q5 preflight selector changed")?;
         let packet = read_packet(path)?;
-        let (gguf, _scope) = observe_header(&packet, model)?;
+        let (gguf, _scope, startup) = observe_header(&packet, model)?;
         // Dry preflight never installs native authority or executes a real-load
         // callback, even when a later source-budget validator is implemented.
-        return reject_preload(&packet, receipt::HeaderPlan::actual(&gguf));
+        return reject_preload_with_startup(&packet, receipt::HeaderPlan::actual(&gguf), startup);
     }
     Ok(())
 }
@@ -105,9 +112,14 @@ fn diagnostic_open(path: &Path) -> Result<File> {
 /// None invokes the original closure, preserving normal constructor behavior.
 pub(crate) fn load<T>(
     model: &Path,
+    external_tokenizer: bool,
     normal: impl FnOnce(Option<PreparedLoad>) -> Result<T>,
 ) -> Result<T> {
-    load_selected(selected()?, model, normal)
+    let selected = selected()?;
+    if selected.is_some() {
+        startup::check_origin(external_tokenizer)?;
+    }
+    load_selected(selected, model, normal)
 }
 
 fn load_selected<T>(
@@ -126,7 +138,9 @@ fn load_selected<T>(
 
 fn read_packet(path: &Path) -> Result<Packet> {
     let mut bytes = Vec::new();
-    diagnostic_open(path)?.take(MAX_PACKET + 1).read_to_end(&mut bytes)?;
+    diagnostic_open(path)?
+        .take(MAX_PACKET + 1)
+        .read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= MAX_PACKET, "Q5 packet exceeds 64KiB");
     serde_json::from_slice(&bytes).context("closed Q5 packet")
 }
@@ -136,36 +150,56 @@ fn enter<T>(
     path: &Path,
     real_load: impl FnOnce(Option<PreparedLoad>) -> Result<T>,
 ) -> Result<T> {
-    let (gguf, scope) = observe_header(packet, path)?;
+    let (gguf, scope, startup) = observe_header(packet, path)?;
     let observed_header_metadata = scope.handle().summary()?;
     let compiled_source = option_env!("HF2Q_BUILD_GIT_SHA").unwrap_or("Unknown");
     let compiled_native_pin = env!("HF2Q_MLX_NATIVE_VERSION");
     let pid = std::process::id();
-    let budget: ReviewedSourceBudget = reject_preload(packet, receipt::HeaderPlan::actual(&gguf)).with_context(|| format!("Q5 same-FD header observation (events,checked_results,checkpoint_roots,retained_fd)={observed_header_metadata:?}; compiled_metadata_source={compiled_source}; compiled_native_pin={compiled_native_pin}; pid={pid}; declared_hashes_unverified; not runtime coverage"))?;
+    let budget: ReviewedSourceBudget = reject_preload_with_startup(packet, receipt::HeaderPlan::actual(&gguf), startup).with_context(|| format!("Q5 same-FD header observation (events,checked_results,checkpoint_roots,retained_fd)={observed_header_metadata:?}; compiled_metadata_source={compiled_source}; compiled_native_pin={compiled_native_pin}; pid={pid}; declared_hashes_unverified; not runtime coverage"))?;
     // Currently unreachable: reject_preload cannot construct ReviewedSourceBudget.
     // If a real validator replaces it, this installs once BEFORE target Device.
     let prepared = PreparedLoad::after_review(gguf, scope.handle(), budget)?;
     real_load(Some(prepared))
 }
 
-fn observe_header(packet: &Packet, path: &Path) -> Result<(GgufFile, collector::HeaderScope)> {
+fn observe_header(
+    packet: &Packet,
+    path: &Path,
+) -> Result<(GgufFile, collector::HeaderScope, startup::Facts)> {
     packet.validate()?;
     let _collector = collector::HeaderScope::enter()?;
     let file = diagnostic_open(path).context("open Q5 actual readonly regular GGUF FD")?;
     let before = file.metadata()?;
     ensure!(before.is_file(), "Q5 model FD is not a regular file");
     packet.file.matches(&before)?;
-    let gguf = GgufFile::from_file(file.try_clone()?).context("Q5 same-FD header")?;
+    let gguf = GgufFile::from_file_with_limits(file.try_clone()?, startup::limits())
+        .context("Q5 bounded same-FD header")?;
     ensure!(
         gguf.metadata_string("general.architecture") == Some("deepseek4"),
         "Q5 selected DeepSeek architecture mismatch"
     );
     packet.file.matches(&file.metadata()?)?;
     collector::attach_source(&file, packet.file, gguf.tensor_data_offset())?;
-    Ok((gguf, _collector))
+    let startup = startup::inspect(&gguf)?;
+    Ok((gguf, _collector, startup))
 }
 
+#[cfg(test)]
 fn reject_preload<T>(packet: &Packet, actual_header_plan: receipt::HeaderPlan) -> Result<T> {
+    reject_preload_with_startup(
+        packet,
+        actual_header_plan,
+        startup::Facts::Unknown {
+            reason: "HostControlWithoutStartupHeader",
+        },
+    )
+}
+
+fn reject_preload_with_startup<T>(
+    packet: &Packet,
+    actual_header_plan: receipt::HeaderPlan,
+    startup: startup::Facts,
+) -> Result<T> {
     // Fixed retained coalesced envelope. No lower caller-provided estimate,
     // Available/Cached estimate or desired weight-window policy can replace it.
     let requested = 120_783_134_084_u64;
@@ -196,6 +230,7 @@ fn reject_preload<T>(packet: &Packet, actual_header_plan: receipt::HeaderPlan) -
         reference_authority: "CallerDeclared_Unverified_NoPermit",
         native_page_observer: "Public14Available_NoWholeDomainPermit",
         actual_header_plan,
+        startup,
         required_root_domains: root_domains,
     };
     let json =

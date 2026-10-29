@@ -359,3 +359,23 @@ only that binding type. The successful case above is the sole actual child
 invocation; no failed native runtime was retried or rescored. The prior padded
 fixture remains separate evidence. Neither tiny result establishes full-model
 ownership, physical fit, model quality, speed, or whole-Q5 qualification.
+
+### Selected startup source-work quotas (public15, unqualified until validation)
+
+The selected diagnostic's actual SAME readonly FD now uses the native bounded
+header reader: 64 MiB read and declared parser reservation, 4096 metadata entries,
+4096 tensors, 1 MiB/string, one million array elements, depth four. The normal
+unselected constructor still uses its original reader. Borrowed embedded
+DeepSeek tokenizer metadata is checked before the existing tokenizer clones:
+strict-config vocabulary equality, at most262144 tokens/524288 merges and32 MiB
+aggregate token+merge UTF-8, typed string arrays, merge separator, and optional
+integer token-type array with exact token count. No strings are truncated or
+replaced by these checks. The existing tokenizer algorithm is unchanged.
+
+The actual selected LoadOptions tokenizer override is explicitly refused before
+entry; dry header preflight cannot claim that option was joined. Missing strict
+config leaves an explicit Unknown startup envelope and still cannot mint a
+permit. Bounded preload receipts expose parser usage and borrowed input counts.
+These are declared source-work quotas, not tokenizer/BPE allocator peaks, CPU
+physical ownership, or a reduction of the retained3 GiB positive CPU cell. Tests
+are authored and unrun in this source checkpoint; no model or Device was used.

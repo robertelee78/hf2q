@@ -758,9 +758,11 @@ impl Deepseek4LoadedModel {
         opts: &LoadOptions,
         effective_context: Option<u32>,
     ) -> Result<Self> {
-        crate::serve::q5_deepseek::load(&opts.model_path, |header| {
-            Self::load_unobserved(opts, effective_context, header)
-        })
+        crate::serve::q5_deepseek::load(
+            &opts.model_path,
+            opts.tokenizer_path.is_some(),
+            |header| Self::load_unobserved(opts, effective_context, header),
+        )
     }
 
     fn load_unobserved(

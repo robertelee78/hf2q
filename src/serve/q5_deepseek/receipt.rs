@@ -47,6 +47,7 @@ pub(super) struct PreloadReceipt<'a> {
     pub reference_authority: &'static str,
     pub native_page_observer: &'static str,
     pub actual_header_plan: HeaderPlan,
+    pub startup: super::startup::Facts,
     pub required_root_domains: Vec<(&'static str, &'static str)>,
 }
 
