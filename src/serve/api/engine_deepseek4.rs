@@ -758,11 +758,9 @@ impl Deepseek4LoadedModel {
         opts: &LoadOptions,
         effective_context: Option<u32>,
     ) -> Result<Self> {
-        crate::serve::q5_deepseek::load(
-            &opts.model_path,
-            opts.tokenizer_path.is_some(),
-            |header| Self::load_unobserved(opts, effective_context, header),
-        )
+        crate::serve::q5_deepseek::load(opts, effective_context, |header| {
+            Self::load_unobserved(opts, effective_context, header)
+        })
     }
 
     fn load_unobserved(
@@ -779,6 +777,7 @@ impl Deepseek4LoadedModel {
             None => (GgufFile::open(&opts.model_path)
                 .map_err(|error| anyhow::anyhow!("GGUF open: {error}"))?, None),
         };
+        crate::serve::q5_deepseek::collector::require_selected_load_options(opts, effective_context)?;
         let tokenizer = if let Some(path) = opts.tokenizer_path.as_deref() {
             Tokenizer::from_file(path)
                 .map_err(|error| anyhow::anyhow!("load tokenizer {}: {error}", path.display()))?

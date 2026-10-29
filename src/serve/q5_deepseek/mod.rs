@@ -7,6 +7,7 @@ mod page_observer;
 mod receipt;
 mod requirements;
 mod startup;
+pub(crate) mod selected_profile;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -111,17 +112,22 @@ fn diagnostic_open(path: &Path) -> Result<File> {
 /// cannot execute without admission. No standalone map/load is performed.
 /// None invokes the original closure, preserving normal constructor behavior.
 pub(crate) fn load<T>(
-    model: &Path,
-    external_tokenizer: bool,
+    opts: &crate::serve::api::engine::LoadOptions,
+    effective_context: Option<u32>,
     normal: impl FnOnce(Option<PreparedLoad>) -> Result<T>,
 ) -> Result<T> {
-    let selected = selected()?;
-    if selected.is_some() {
-        startup::check_origin(external_tokenizer)?;
+    match selected()? {
+        None => normal(None), // Do not inspect options/env or change normal load.
+        Some(path) => {
+            startup::check_origin(opts.tokenizer_path.is_some())?;
+            let profile=selected_profile::SelectedLoadProfile::from_actual(opts,effective_context)?;
+            let packet=read_packet(path)?;
+            enter_with_profile(&packet,&opts.model_path,Some(profile),normal)
+        }
     }
-    load_selected(selected, model, normal)
 }
 
+#[cfg(test)]
 fn load_selected<T>(
     selected: Option<&Path>,
     model: &Path,
@@ -145,12 +151,23 @@ fn read_packet(path: &Path) -> Result<Packet> {
     serde_json::from_slice(&bytes).context("closed Q5 packet")
 }
 
+#[cfg(test)]
 fn enter<T>(
     packet: &Packet,
     path: &Path,
     real_load: impl FnOnce(Option<PreparedLoad>) -> Result<T>,
 ) -> Result<T> {
+    enter_with_profile(packet,path,None,real_load)
+}
+
+fn enter_with_profile<T>(
+    packet: &Packet,
+    path: &Path,
+    profile: Option<selected_profile::SelectedLoadProfile>,
+    real_load: impl FnOnce(Option<PreparedLoad>) -> Result<T>,
+) -> Result<T> {
     let (gguf, scope, startup) = observe_header(packet, path)?;
+    if let Some(profile)=profile { collector::bind_selected_load_profile(profile)?; }
     let observed_header_metadata = scope.handle().summary()?;
     let compiled_source = option_env!("HF2Q_BUILD_GIT_SHA").unwrap_or("Unknown");
     let compiled_native_pin = env!("HF2Q_MLX_NATIVE_VERSION");
@@ -231,6 +248,7 @@ fn reject_preload_with_startup<T>(
         native_page_observer: "Public14Available_NoWholeDomainPermit",
         actual_header_plan,
         startup,
+        actual_load_profile: collector::selected_load_profile()?,
         required_root_domains: root_domains,
     };
     let json =

@@ -40,6 +40,7 @@ pub(super) struct Collector {
     weights: BTreeMap<usize, Root>,
     source: Option<Source>,
     native_domain: native_domain::NativeDomain,
+    selected_load_profile: Option<super::selected_profile::SelectedLoadProfile>,
     page_observations: BTreeMap<usize, super::page_observer::RootObservation>,
     events: u64,
     completed_results: u64,
@@ -267,6 +268,7 @@ pub(crate) fn checked_health() -> Result<()> {
             "Q5 sticky observation failure after checked boundary"
         );
         native_domain::require_bound_health(&mut c.native_domain)?;
+        if let Some(profile)=c.selected_load_profile { profile.require_current_routes()?; }
         Ok(())
     })
 }
@@ -471,6 +473,28 @@ pub(super) fn install_reviewed_native(
 pub(crate) fn register_model_device(device: &mlx_native::MlxDevice) -> Result<()> {
     with_current(|c| {
         ensure!(!c.poisoned, "Q5 poisoned model device binding");
+        if let Some(profile)=c.selected_load_profile { profile.require_current_routes()?; }
         native_domain::register_model_device(&mut c.native_domain, device)
+    })
+}
+
+pub(super) fn bind_selected_load_profile(profile: super::selected_profile::SelectedLoadProfile) -> Result<()> {
+    ensure!(active(), "Q5 load profile requires actual attached collector");
+    with_current(|c| {
+        ensure!(!c.poisoned && c.source.is_some() && c.selected_load_profile.is_none(),
+            "Q5 duplicate/unbound selected load profile");
+        c.selected_load_profile=Some(profile);Ok(())
+    })
+}
+pub(super) fn selected_load_profile() -> Result<Option<super::selected_profile::SelectedLoadProfile>> {
+    let mut profile=None;
+    with_current(|c| { ensure!(!c.poisoned,"Q5 selected profile health");profile=c.selected_load_profile;Ok(()) })?;
+    Ok(profile)
+}
+pub(crate) fn require_selected_load_options(opts:&crate::serve::api::engine::LoadOptions,context:Option<u32>) -> Result<()> {
+    with_current(|c| {
+        ensure!(!c.poisoned,"Q5 actual options check health");
+        let profile=c.selected_load_profile.context("Q5 actual load options were never bound")?;
+        profile.require_actual_options(opts,context)
     })
 }

@@ -83,6 +83,11 @@ pub struct Deepseek4Weights {
     _device: MlxDevice,
 }
 
+/// Shared actual source predicate; preserves the existing default and env semantics.
+pub(crate) fn raw_weights_mapped() -> bool {
+    std::env::var("HF2Q_DEEPSEEK_MMAP_WEIGHTS").as_deref() != Ok("0")
+}
+
 impl Deepseek4Weights {
     /// Validate the complete verifier catalog, then load each tensor according
     /// to its runtime role. No allocation occurs before catalog and storage
@@ -106,7 +111,7 @@ impl Deepseek4Weights {
         let mut resident_bytes = 0_u64;
         let mut file_backed_bytes = 0_u64;
         let mut anonymous_bytes = 0_u64;
-        let map_raw_weights = std::env::var("HF2Q_DEEPSEEK_MMAP_WEIGHTS").as_deref() != Ok("0");
+        let map_raw_weights = raw_weights_mapped();
         let mapped_tensor_data = map_raw_weights
             .then(|| {
                 gguf.map_tensor_data(&device)
