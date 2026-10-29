@@ -302,7 +302,7 @@ fn hold_ingress_response(
     response: axum::response::Response,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> axum::response::Response {
-    use futures_util::StreamExt;
+    use futures::StreamExt;
     let (parts, body) = response.into_parts();
     let stream = body.into_data_stream().map(move |chunk| {
         let _ = &permit;
