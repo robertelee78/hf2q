@@ -6,7 +6,7 @@ use std::cell::RefCell;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Kind { Delta,Copy,Aux,Sdpa,Ops14,Ffn }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum PlainAsyncBoundary { Fence,Carry,Unlabeled,Sdpa,Ops14,Ffn }
+pub(crate) enum PlainAsyncBoundary { Fence,Carry,Unlabeled,Sdpa,Ops14 }
 struct Entry { enc:CommandEncoder,#[cfg(test)] kind:Kind,#[cfg(test)] layer:usize,#[cfg(test)] owner:Option<u32> }
 #[derive(Clone,Copy,Debug)]
 struct Epoch { layer:usize,width:usize,linear:bool,copies:usize,deltas:usize,aux:usize,sdpa:usize,ops14:usize,owner:Option<u32> }
