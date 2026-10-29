@@ -20,9 +20,17 @@ the release build, full all-feature tests, package hygiene and reference-policy
 checks. The full native test log has 215 successful summaries and 77 ignored
 entries; its 1,533 summed passing entries include nested child runs and are not
 a unique-test count. The separate tiny actual observer control passed with both
-aliases observed and all application GPU command counters unchanged. These are
+aliases observed; that fixture submitted no GPU commands. These are
 API and observation checks, not full-model qualification.
 
-Downstream validation is pending. This dependency adoption does not complete Q5;
-its connected owner accounting, physical operating policy and required workload
-qualification remain open.
+Downstream source `7db0c9cebc839de746cf2e208bbf33cc4812323f` passed locked
+all-target/all-feature checking (38.86s), the locked release build (50.63s),
+and 48 focused release-mode host controls: four native-pin contracts, four
+backing-observation controls, and 40 investigation-environment controls. Three
+ignored hardware controls were not executed in this adoption run. No model was
+loaded. Hosted CI remains a merge gate. The final note-only change corrects the
+native tiny fixture claim to no GPU submissions by source, without claiming
+an observed counter invariant.
+
+This dependency adoption does not complete Q5; its connected owner accounting,
+physical operating policy and required workload qualification remain open.
