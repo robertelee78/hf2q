@@ -92,5 +92,24 @@ cursors/parities, then diagnostic-only cursor/parity metadata changes without
 any descriptor/root mutation. An actual recurrent-buffer clone preserves origin
 without creating a root. Native dispatch/commit/sync counters must remain unchanged.
 This is allocation/traversal coverage only, not token-state/forward correctness or
-Q5 completeness. Native1513 public source verification is complete; root compilation and actual
-execution remain pending. V1 source freeze is preserved, not reinterpreted as containing this test.
+Q5 completeness. Native1513 public source verification and the focused root execution below are
+complete. Broader CI and selected full-model ownership/admission remain pending. V1 source freeze is preserved, not reinterpreted as containing this test.
+
+
+## Root validation with the published dependency
+
+Clean source2f6a4fc675e8e4aeabe60c449779748f2f277fe0 compiled in locked release-test
+mode against registry0.15.13 (checksum
+66d9f8bb0296ca7497ebe7834bc817b2a0326aa5755fdcc7660760ae2e442270).
+All677 files in the actual compiled registry directory matched the verified
+archive, including its package metadata. No local path patch was used.
+
+Three focused host controls passed. Both ignored fresh-process controls executed
+and passed: the actual same-FD mapped-weight/alias join and the actual F32/TQ/MTP/
+recurrent/cache-capture traversal. The latter observed exactly24 roots and
+1204480requested bytes. Both owned process groups were empty after execution;
+no model or forward was loaded. The locked all-target/all-feature check passed.
+These are backing/role observations only, with no physical-fit, residency,
+reclamation or selected full-loader coverage claim. Independent source review
+covers the actual factories and traversal; additional family/CPU/transient/OS
+roles and real largest-case gates remain necessary.
