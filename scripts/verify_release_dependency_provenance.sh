@@ -13,10 +13,10 @@ readonly EXPECTED_PACKAGE_VERSION
   exit 1
 }
 readonly EXPECTED_DEPENDENCY_NAME=mlx-native
-readonly EXPECTED_DEPENDENCY_VERSION=0.15.4
-readonly EXPECTED_DEPENDENCY_REQUIREMENT='=0.15.4'
+readonly EXPECTED_DEPENDENCY_VERSION=0.15.15
+readonly EXPECTED_DEPENDENCY_REQUIREMENT='=0.15.15'
 readonly EXPECTED_DEPENDENCY_SOURCE='registry+https://github.com/rust-lang/crates.io-index'
-readonly EXPECTED_DEPENDENCY_CHECKSUM=359470da84f037916cd34534b56fc283fdd467c152a9813a85979c1d6e67f137
+readonly EXPECTED_DEPENDENCY_CHECKSUM=bb508d36e311a24147e917282a8ccae0d47720f4a12ae678717df5d569c75e3c
 
 fail() {
   echo "release dependency provenance: $*" >&2
@@ -152,6 +152,43 @@ read_mlx_lock_identity() {
       printf "%d\t%s\t%s\t%s\n", matches, found_version, found_source, found_checksum
     }
   ' "$lock"
+}
+
+# Trusted current release identity, checked against the REAL source manifest/lock.
+# Fixed reviewed constants remain authoritative: this does not accept arbitrary
+# future versions, path dependencies or substituted checksums automatically.
+verify_source_identity() {
+  local matches version source checksum requirement_count requirement overrides
+  IFS=$'\t' read -r matches version source checksum < <(read_mlx_lock_identity "$SCRIPT_DIRECTORY/../Cargo.lock")
+  [[ "$matches" == 1 && "$version" == "$EXPECTED_DEPENDENCY_VERSION" \
+    && "$source" == "$EXPECTED_DEPENDENCY_SOURCE" \
+    && "$checksum" == "$EXPECTED_DEPENDENCY_CHECKSUM" ]] || \
+    fail "current source Cargo.lock differs from trusted release identity"
+  IFS=$'\t' read -r requirement_count requirement overrides < <(awk '
+    /^[[:space:]]*\[/ {
+      header = $0; sub(/^[[:space:]]*/, "", header); sub(/[[:space:]]*$/, "", header)
+      dependencies = (header == "[dependencies]")
+      native_table = (header == "[dependencies.mlx-native]")
+      if (index(header, "[patch") == 1 || header == "[replace]") overrides++
+    }
+    (dependencies && /^mlx-native = "/) || (native_table && /^version = "/) {
+      count++; value = $0; sub(/^[^"]*"/, "", value); sub(/".*/, "", value)
+    }
+    native_table && /^[[:space:]]*(path|git|registry|registry-index)[[:space:]]*=/ { overrides++ }
+    END { printf "%d\t%s\t%d\n", count, value, overrides }
+  ' "$PACKAGE_MANIFEST")
+  [[ "$requirement_count" == 1 && "$requirement" == "$EXPECTED_DEPENDENCY_REQUIREMENT" && "$overrides" == 0 ]] || \
+    fail "current source Cargo.toml differs from trusted release identity"
+}
+
+emit_source_identity() {
+  verify_source_identity
+  jq -n --arg name "$EXPECTED_DEPENDENCY_NAME" \
+    --arg version "$EXPECTED_DEPENDENCY_VERSION" \
+    --arg requirement "$EXPECTED_DEPENDENCY_REQUIREMENT" \
+    --arg source "$EXPECTED_DEPENDENCY_SOURCE" \
+    --arg checksum "$EXPECTED_DEPENDENCY_CHECKSUM" \
+    '{name:$name,version:$version,requirement:$requirement,source:$source,checksum:$checksum}'
 }
 
 verify_raw_semantics() {
@@ -368,6 +405,10 @@ verify_evidence() {
 
 mode=${1:-}
 case "$mode" in
+  identity)
+    [[ $# == 1 ]] || fail "identity takes no alternate source inputs"
+    emit_source_identity
+    ;;
   capture)
     shift
     capture_evidence "$@"
@@ -389,6 +430,6 @@ case "$mode" in
     verify_evidence "$@"
     ;;
   *)
-    fail "usage: $0 check-package-root PACKAGE_ROOT | check-build-root PACKAGE_ROOT CHECKOUT_ROOT CARGO_HOME CARGO_TARGET | check-build-env CARGO_HOME CARGO_TARGET | capture PACKAGE_ROOT METADATA_JSON EVIDENCE_DIR CHECKOUT_ROOT CARGO_HOME CARGO_TARGET true true CRATE_SHA256 | verify EVIDENCE_DIR [PACKED_CARGO_LOCK]"
+    fail "usage: $0 identity | check-package-root PACKAGE_ROOT | check-build-root PACKAGE_ROOT CHECKOUT_ROOT CARGO_HOME CARGO_TARGET | check-build-env CARGO_HOME CARGO_TARGET | capture PACKAGE_ROOT METADATA_JSON EVIDENCE_DIR CHECKOUT_ROOT CARGO_HOME CARGO_TARGET true true CRATE_SHA256 | verify EVIDENCE_DIR [PACKED_CARGO_LOCK]"
     ;;
 esac

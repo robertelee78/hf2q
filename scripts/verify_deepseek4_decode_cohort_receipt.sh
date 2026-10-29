@@ -18,6 +18,11 @@ setup_memory_log=${14:?loaded-setup memory log is required}
 loaded_idle_memory_log=${15:?loaded-idle memory log is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Source-bound current identity; no independent stale receipt pin.
+RELEASE_NATIVE_IDENTITY=$(bash "$ROOT_DIR/scripts/verify_release_dependency_provenance.sh" identity)
+RELEASE_MLX_NATIVE_VERSION=$(jq -er .version <<<"$RELEASE_NATIVE_IDENTITY")
+RELEASE_MLX_NATIVE_CHECKSUM=$(jq -er .checksum <<<"$RELEASE_NATIVE_IDENTITY")
+readonly RELEASE_NATIVE_IDENTITY RELEASE_MLX_NATIVE_VERSION RELEASE_MLX_NATIVE_CHECKSUM
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
 # shellcheck source=scripts/macos_memory_guard.sh
@@ -61,7 +66,7 @@ test "$(sha256_file "$loaded_idle_memory_log")" = \
   "$(jq -er .memory_pressure.loaded_idle.log_sha256 "$summary")"
 jq -s -e 'length == 1' "$summary" >/dev/null
 
-jq -e --slurpfile raw "$raw" \
+jq -e --arg mlx_native_version "$RELEASE_MLX_NATIVE_VERSION" --slurpfile raw "$raw" \
   --arg source_sha "$expected_source_sha" \
   --arg model_sha256 "$expected_model_sha" '
   def abs: if . < 0 then -. else . end;
@@ -114,7 +119,7 @@ jq -e --slurpfile raw "$raw" \
     and $receipt.schema_version == 3
     and .schema_version == 6 and .status == "pass"
     and .source_sha == $source_sha and .model_sha256 == $model_sha256
-    and .mlx_native_version == "0.15.4"
+    and .mlx_native_version == $mlx_native_version
     and .producer_exit_code == 0
     and .thermal_probe.implementation == "compiled-foundation-helper"
     and .thermal_probe.source_path == "scripts/macos_thermal_probe.swift"
