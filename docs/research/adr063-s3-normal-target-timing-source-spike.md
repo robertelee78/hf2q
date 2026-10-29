@@ -79,3 +79,60 @@ resource admission, suffix extent/vocabulary refusal, full-cold selected-prefix
 construction, and inactive/nested profiling scope restoration. All are unrun by
 the source author. Root must compile and run host controls, independently review
 packet/resource guards, then own any actual model invocation.
+
+
+## Completed actual diagnostic (2026-10-29 UTC)
+
+Clean release-test source `c739dc03aeebd6e5699ac852359d22313c3baa96`,
+binary SHA256 `87ce72c5b3f1cd08c285724c45635afaec6c8562764725a9898a829caf58e579`,
+and published native0.15.12 completed all24 samples and12 exact matched pairs.
+The reviewed external supervisor's fresh third attempt completed successfully
+in388.091375s with756 runtime observations and an empty owned process group.
+Four focused Rust controls,26 protocol mutation controls,46 actual monitor-helper
+controls and25 closed-stderr controls passed before this attempt.
+
+The actual frozen turn-five counts were[1955,1981,1955,1981]; selected owners3/0
+therefore used1981/1955 tokens, then their declared teacher-forced suffixes.
+Every1320-coordinate paired pre/post manifest, all260 capacity-root identities,
+full-logit/hidden exactness and untouched/MTP state checks passed. Independent
+metadata audit SHA256:
+`32853c922c3ad57de1eddcc97feebcea2bef433a7c56d27e5a49931793c29a4c`.
+Digest-only files do not permit an independent re-read of every float payload;
+finite/bit equality is the executed Rust producer check, with independently
+verified metadata, shapes, digests, binding and schedule reconstruction.
+
+All ten timed observations per arm gave N2 target medians266.5509165ms normal
+and353.623271ms retained shared: shared was32.6663% slower within this diagnostic.
+These cold-prepared target intervals are not serving per-token estimates,
+end-to-end makespans, a primary confidence-qualified comparison or a speed win.
+There were24 Nominal and52 Fair thermal observations, all within the unchanged
+runtime policy. No later nominal-only filtering is permitted.
+
+Shared per-target chosen-stage medians were:
+
+| Stage | Count | Host span sum (ms) | Known CB duration sum (ms) |
+| --- | ---: | ---: | ---: |
+| Row-copy check | 128 | 65.514463 | 0.3539675 |
+| Retained Delta terminal check | 96 | 0.0079795 | 17.8937455 |
+| Shared FFN check | 64 | 77.3297105 | 26.843613 |
+
+Host waits include queued upstream work. Subtracting known CB durations from
+host spans does not prove pure synchronization overhead; these duration sums
+are not interval unions, GPU Running or utilization. Unhooked stages and normal
+dropped-CB times remain Unknown. A narrowly bounded one-layer grouping experiment
+is justified for measurement, with scratch reset/reissue forbidden until every
+actual submitted CB has a healthy Result; no performance adoption is implied.
+
+Historical metadata digests matched before/after(777778entries,72910049930logical
+bytes). Fresh I/O was150583628B. Minimum Free20701118464B, peak RSS23535992832B,
+peak process footprint60239477072B and zero swap growth satisfied the declared
+operating guards. Process footprint is not unique physical memory or whole-fit
+proof. Whole S3, physical admission, full AUTO continuation, natural tool/coding
+quality, widths3/4 and error/cancellation gates remain open.
+
+The first attempt failed a stale observer sample before target observations.
+Its successor's actual Rust test completed, but its wrapper rejected the normal
+LCP information log; that wrapper receipt remains failed. The third attempt used
+a prospectively reviewed closed classifier for exactly one source-normal LCP
+line, rejecting all warnings and other stderr. Neither earlier receipt is
+rescored or promoted by this successful attempt.
