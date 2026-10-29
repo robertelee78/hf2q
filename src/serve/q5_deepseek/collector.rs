@@ -266,6 +266,7 @@ pub(crate) fn checked_health() -> Result<()> {
             !c.poisoned,
             "Q5 sticky observation failure after checked boundary"
         );
+        native_domain::require_bound_health(&mut c.native_domain)?;
         Ok(())
     })
 }
@@ -453,3 +454,23 @@ pub(crate) fn capture_native_for_tiny() -> Result<()> {
 
 #[cfg(test)]
 mod provider_control;
+
+/// Selected-only real native installation; caller holds the private review token.
+pub(super) fn install_reviewed_native(
+    context: &Handle,
+    budget: super::ReviewedSourceBudget,
+) -> Result<()> {
+    context.require_current_model(Some(context))?;
+    let (creation, live) = budget.into_limits();
+    with_current(|c| {
+        ensure!(!c.poisoned, "Q5 poisoned early authority installation");
+        native_domain::install_reviewed(&mut c.native_domain, creation, live)
+    })
+}
+/// Actual selected model seam, before weights. No TLS means original path.
+pub(crate) fn register_model_device(device: &mlx_native::MlxDevice) -> Result<()> {
+    with_current(|c| {
+        ensure!(!c.poisoned, "Q5 poisoned model device binding");
+        native_domain::register_model_device(&mut c.native_domain, device)
+    })
+}

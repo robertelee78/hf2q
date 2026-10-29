@@ -19,8 +19,32 @@ use std::{fs::File, io::Read, path::Path};
 /// Private real-load carrier. No serde/external constructor or permit boolean.
 /// Present only after a future independently reviewed admission implementation.
 pub(crate) struct PreparedLoad {
-    pub(crate) header: GgufFile,
-    pub(crate) context: collector::Handle,
+    header: GgufFile,
+    context: collector::Handle,
+}
+
+// No constructor/serde exists. Only a future independent budget validator in
+// this private module may mint one; packet hashes/booleans cannot construct it.
+mod reviewed_budget {
+    pub(super) struct ReviewedSourceBudget {
+        creation: mlx_native::RootCreationLimits,
+        live: mlx_native::LiveRootLimits,
+    }
+    impl ReviewedSourceBudget {
+        pub(super) fn into_limits(self) -> (mlx_native::RootCreationLimits, mlx_native::LiveRootLimits) {
+            (self.creation, self.live)
+        }
+    }
+}
+use reviewed_budget::ReviewedSourceBudget;
+impl PreparedLoad {
+    fn after_review(header: GgufFile, context: collector::Handle, budget: ReviewedSourceBudget) -> Result<Self> {
+        collector::install_reviewed_native(&context, budget)?;
+        Ok(Self { header, context })
+    }
+    pub(crate) fn into_parts(self) -> (GgufFile, collector::Handle) {
+        (self.header, self.context)
+    }
 }
 
 const MAX_PACKET: u64 = 65_536;
@@ -41,9 +65,12 @@ fn selected() -> Result<Option<&'static Path>> {
 pub(crate) fn preflight_model(model: Option<&Path>) -> Result<()> {
     if selected()?.is_some() {
         let model = model.context("Q5 packet requires an explicit local MODEL")?;
-        return load(model, |_| {
-            anyhow::bail!("Q5 entry unexpectedly lost selector")
-        });
+        let path = selected()?.context("Q5 preflight selector changed")?;
+        let packet = read_packet(path)?;
+        let (gguf, _scope) = observe_header(&packet, model)?;
+        // Dry preflight never installs native authority or executes a real-load
+        // callback, even when a later source-budget validator is implemented.
+        return reject_preload(&packet, receipt::HeaderPlan::actual(&gguf));
     }
     Ok(())
 }
@@ -91,22 +118,37 @@ fn load_selected<T>(
     match selected {
         None => normal(None),
         Some(path) => {
-            let mut bytes = Vec::new();
-            diagnostic_open(path)?
-                .take(MAX_PACKET + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(bytes.len() as u64 <= MAX_PACKET, "Q5 packet exceeds 64KiB");
-            let packet: Packet = serde_json::from_slice(&bytes).context("closed Q5 packet")?;
+            let packet = read_packet(path)?;
             enter(&packet, model, normal)
         }
     }
 }
 
+fn read_packet(path: &Path) -> Result<Packet> {
+    let mut bytes = Vec::new();
+    diagnostic_open(path)?.take(MAX_PACKET + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= MAX_PACKET, "Q5 packet exceeds 64KiB");
+    serde_json::from_slice(&bytes).context("closed Q5 packet")
+}
+
 fn enter<T>(
     packet: &Packet,
     path: &Path,
-    _real_load: impl FnOnce(Option<PreparedLoad>) -> Result<T>,
+    real_load: impl FnOnce(Option<PreparedLoad>) -> Result<T>,
 ) -> Result<T> {
+    let (gguf, scope) = observe_header(packet, path)?;
+    let observed_header_metadata = scope.handle().summary()?;
+    let compiled_source = option_env!("HF2Q_BUILD_GIT_SHA").unwrap_or("Unknown");
+    let compiled_native_pin = env!("HF2Q_MLX_NATIVE_VERSION");
+    let pid = std::process::id();
+    let budget: ReviewedSourceBudget = reject_preload(packet, receipt::HeaderPlan::actual(&gguf)).with_context(|| format!("Q5 same-FD header observation (events,checked_results,checkpoint_roots,retained_fd)={observed_header_metadata:?}; compiled_metadata_source={compiled_source}; compiled_native_pin={compiled_native_pin}; pid={pid}; declared_hashes_unverified; not runtime coverage"))?;
+    // Currently unreachable: reject_preload cannot construct ReviewedSourceBudget.
+    // If a real validator replaces it, this installs once BEFORE target Device.
+    let prepared = PreparedLoad::after_review(gguf, scope.handle(), budget)?;
+    real_load(Some(prepared))
+}
+
+fn observe_header(packet: &Packet, path: &Path) -> Result<(GgufFile, collector::HeaderScope)> {
     packet.validate()?;
     let _collector = collector::HeaderScope::enter()?;
     let file = diagnostic_open(path).context("open Q5 actual readonly regular GGUF FD")?;
@@ -120,13 +162,7 @@ fn enter<T>(
     );
     packet.file.matches(&file.metadata()?)?;
     collector::attach_source(&file, packet.file, gguf.tensor_data_offset())?;
-    // A future private permit may transfer THIS parsed header into _real_load.
-    // The callback already accepts it; reopening a path is not required.
-    let observed_header_metadata = _collector.handle().summary()?;
-    let compiled_source = option_env!("HF2Q_BUILD_GIT_SHA").unwrap_or("Unknown");
-    let compiled_native_pin = env!("HF2Q_MLX_NATIVE_VERSION");
-    let pid = std::process::id();
-    reject_preload(packet, receipt::HeaderPlan::actual(&gguf)).with_context(|| format!("Q5 same-FD header observation (events,checked_results,checkpoint_roots,retained_fd)={observed_header_metadata:?}; compiled_metadata_source={compiled_source}; compiled_native_pin={compiled_native_pin}; pid={pid}; declared_hashes_unverified; not runtime coverage"))
+    Ok((gguf, _collector))
 }
 
 fn reject_preload<T>(packet: &Packet, actual_header_plan: receipt::HeaderPlan) -> Result<T> {

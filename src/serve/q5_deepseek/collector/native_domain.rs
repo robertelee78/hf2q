@@ -29,6 +29,7 @@ pub(super) enum Snapshot {
 }
 pub(super) struct NativeDomain {
     handle: Option<mlx_native::RootAuthorityHandle>,
+    registered: bool,
     pub(super) latest: Snapshot,
 }
 impl std::fmt::Debug for NativeDomain {
@@ -40,6 +41,7 @@ impl Default for NativeDomain {
     fn default() -> Self {
         Self {
             handle: None,
+            registered: false,
             latest: Snapshot::Unavailable {
                 reason: "NoActualEarlyNativeHandleBound",
             },
@@ -55,14 +57,7 @@ impl NativeDomain {
                 .ok_or_else(|| anyhow::anyhow!("no bound handle"))?;
             let creation = handle.snapshot()?;
             let live = handle.live_snapshot()?;
-            anyhow::ensure!(
-                creation.covered
-                    && !creation.legacy_used
-                    && creation.unknown.is_none()
-                    && live.covered
-                    && live.unknown.is_none(),
-                "native whole requested-domain unknown"
-            );
+            binding::validate_snapshots(&creation, &live, false)?;
             let c = creation
                 .limits
                 .ok_or_else(|| anyhow::anyhow!("no creation ceiling"))?;
@@ -94,9 +89,9 @@ impl NativeDomain {
             reason: "MissingPoisonedUncoveredOrNoLiveAuthority",
         });
     }
-    #[cfg(test)]
     pub(super) fn bind(&mut self, handle: mlx_native::RootAuthorityHandle) -> anyhow::Result<()> {
         anyhow::ensure!(self.handle.is_none(), "duplicate native authority binding");
+        binding::validate_snapshots(&handle.snapshot()?, &handle.live_snapshot()?, true)?;
         self.handle = Some(handle);
         self.capture();
         Ok(())
@@ -106,3 +101,7 @@ impl NativeDomain {
 pub(crate) fn bind_actual_for_tiny(handle: mlx_native::RootAuthorityHandle) -> anyhow::Result<()> {
     super::with_current(|c| c.native_domain.bind(handle))
 }
+
+#[path = "native_domain/binding.rs"]
+mod binding;
+pub(super) use binding::{install_reviewed, register_model_device, require_bound_health};

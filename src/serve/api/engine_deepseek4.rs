@@ -770,7 +770,10 @@ impl Deepseek4LoadedModel {
     ) -> Result<Self> {
         let started = Instant::now();
         let (gguf, q5_context) = match header {
-            Some(prepared) => (prepared.header, Some(prepared.context)),
+            Some(prepared) => {
+                let (header, context) = prepared.into_parts();
+                (header, Some(context))
+            },
             None => (GgufFile::open(&opts.model_path)
                 .map_err(|error| anyhow::anyhow!("GGUF open: {error}"))?, None),
         };
