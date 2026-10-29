@@ -32,6 +32,7 @@
 //! its classification in `docs/shipping-contract.md`.
 
 pub mod qwen_pool_profile;
+pub mod qwen_shared_ordinary;
 pub mod gemma_full_input;
 
 use std::env;
@@ -766,6 +767,7 @@ pub struct InvestigationEnv {
     pub unsafe_experiments_acked: bool,
     /// Optional Category-3 intent; refusal is a startup error, never fallback.
     pub qwen_pool_profile: qwen_pool_profile::QwenPoolProfile,
+    pub qwen_shared_ordinary: qwen_shared_ordinary::Mode,
     pub gemma_full_input_checkpoint: gemma_full_input::Mode,
     /// Read-once exclusions for the selected serve path's NoFutureUse proof.
     pub qwen_pool_diagnostic_conflict: bool,
@@ -982,6 +984,8 @@ impl InvestigationEnv {
                 || qwen_pool_profile::split_profile_conflict(env::var("HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS").ok().as_deref()),
             gemma_full_input_checkpoint: gemma_full_input::Mode::from_os(
                 env::var_os("HF2Q_GEMMA_FULL_INPUT_CHECKPOINT").as_deref(), ack),
+            qwen_shared_ordinary: qwen_shared_ordinary::Mode::from_os(
+                env::var_os("HF2Q_QWEN_SHARED_ORDINARY").as_deref(), ack),
             qwen_pool_profile: qwen_pool_profile::QwenPoolProfile::from_os(
                 env::var_os("HF2Q_QWEN_POOL_GROWTH_PROFILE").as_deref(), ack),
             raw,
@@ -1085,6 +1089,10 @@ impl InvestigationEnv {
     ///   visibility, no behavioral implication.
     pub fn activate(&self, json_output: bool) {
         if let Some(summary) = self.gemma_full_input_checkpoint.summary() {
+            if json_output { eprintln!("{}", serde_json::json!({"level":"warn", "message":summary})); }
+            else { eprintln!("hf2q: {summary}"); }
+        }
+        if let Some(summary) = self.qwen_shared_ordinary.summary() {
             if json_output { eprintln!("{}", serde_json::json!({"level":"warn", "message":summary})); }
             else { eprintln!("hf2q: {summary}"); }
         }

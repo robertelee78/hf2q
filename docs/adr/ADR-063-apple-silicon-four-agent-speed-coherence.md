@@ -298,6 +298,17 @@ Repository ownership: hf2q owns physical cohort construction, slot-indexed model
 
 Validation: Capture kernel/row traces and run four-slot independent-versus-shared target and end-to-end comparisons, including cancel/EOS and partial cohort failures.
 
+The first Qwen3.8 partial shared-target serving experiment is unqualified.
+Its canonical four-agent trial took 129.192972 seconds against the initial
+115.544542-second baseline; the same candidate with sharing disabled took
+126.623544 seconds. These own-output trials have differing final tool-result
+inputs and completion counts, so they do not establish a fixed-token causal
+speed ratio. Only pairs were observed. Keep this implementation isolated.
+The next bounded hypothesis may defer helper completion waits to existing
+healthy row/layer fences, while checking every submitted command buffer before
+scratch retirement and preserving fail-stop, lifetime and quota guarantees.
+See [the measured experiment record](../research/adr063-s3-qwen-shared-serving-negative-result.md).
+
 Predecessors: F2, Q1, Q5.
 
 Priority: High. Core scope.

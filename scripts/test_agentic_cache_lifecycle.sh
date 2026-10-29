@@ -23,6 +23,18 @@ CURL_CONNECT_TIMEOUT_SECONDS=${CURL_CONNECT_TIMEOUT_SECONDS:-5}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-900}
 SEMANTIC_WAIT_SECONDS=${SEMANTIC_WAIT_SECONDS:-180}
 SIBLING_SETTLE_SECONDS=${SIBLING_SETTLE_SECONDS:-1}
+# Optional S3 extension; a dedicated externally guarded server is mandatory.
+SHARED_CANCELLATION=${SHARED_CANCELLATION:-0}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ "$SHARED_CANCELLATION" != 0 && "$SHARED_CANCELLATION" != 1 ]]; then
+  echo "SHARED_CANCELLATION must be0 or1" >&2; exit 2
+fi
+if [[ "$SHARED_CANCELLATION" == 1 ]]; then
+  [[ "${SHARED_LIFECYCLE_EXCLUSIVE:-}" == 1 && -f "${SERVER_LOG:-}" ]] || {
+    echo "shared lifecycle requires exclusive owned case and actual SERVER_LOG" >&2; exit 2;
+  }
+  command -v python3 >/dev/null
+fi
 
 for command in awk curl date jq rg sed; do
   command -v "$command" >/dev/null || {
@@ -68,7 +80,12 @@ summary="$OUT_DIR/summary.json"
 
 active_pid=""
 sibling_pid=""
+survivor_pid=""
 cleanup() {
+  if [[ -n "$survivor_pid" ]] && kill -0 "$survivor_pid" 2>/dev/null; then
+    kill -TERM "$survivor_pid" 2>/dev/null || true
+    wait "$survivor_pid" 2>/dev/null || true
+  fi
   if [[ -n "$active_pid" ]] && kill -0 "$active_pid" 2>/dev/null; then
     kill -TERM "$active_pid" 2>/dev/null || true
     wait "$active_pid" 2>/dev/null || true
@@ -221,6 +238,11 @@ jq -e -s '
   exit 2
 }
 
+shared_offset=0
+if [[ "$SHARED_CANCELLATION" == 1 ]]; then
+  shared_offset=$(wc -c <"$SERVER_LOG" | tr -d ' ')
+fi
+
 curl --fail-with-body --silent --show-error --no-buffer \
   --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
   --max-time "$CURL_MAX_TIME_SECONDS" \
@@ -261,6 +283,37 @@ if rg -q '^data: \[DONE\]$' "$active_stream"; then
   exit 1
 fi
 
+if [[ "$SHARED_CANCELLATION" == 1 ]]; then
+  # A second independent conversation must share an actual target with active.
+  # It retains the same tool surface and real default AUTO/sampler controls.
+  jq --arg run "$RUN_ID" '.messages = [
+    {role:"system",content:"You are a coding agent. Do not use tools in this response."},
+    {role:"user",content:("Independent survivor " + $run + ". Begin with SURVIVOR_STARTED, then explain Rust ownership in at least1200 words. End with SURVIVOR_COMPLETE.")}
+  ] | .max_tokens=2048' "$active_request" >"$OUT_DIR/survivor.request.json"
+  curl --fail-with-body --silent --show-error --no-buffer \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" --max-time "$CURL_MAX_TIME_SECONDS" \
+    -H 'Content-Type: application/json' --data-binary "@$OUT_DIR/survivor.request.json" \
+    "$BASE_URL/v1/chat/completions" >"$OUT_DIR/survivor.stream.sse" &
+  survivor_pid=$!
+  set +e
+  python3 "$SCRIPT_DIR/shared_cancel_witness.py" --log "$SERVER_LOG" --offset "$shared_offset" \
+    --active-pid "$active_pid" --survivor-pid "$survivor_pid" --seconds 180 \
+    --output "$OUT_DIR/shared-witness.json"
+  witness_status=$?
+  set -e
+  if (( witness_status != 0 )); then
+    echo "shared lifecycle INCONCLUSIVE: no certified live two-owner cohort (status=$witness_status)" >&2
+    exit "$witness_status"
+  fi
+  # Connection lifetime alone is insufficient: both semantic streams must still
+  # be nonterminal immediately before queue/cancel, or the case is inconclusive.
+  for stream in "$active_stream" "$OUT_DIR/survivor.stream.sse"; do
+    if rg -q '^data: \[DONE\]$' "$stream"; then
+      echo "shared lifecycle INCONCLUSIVE: a witnessed stream already completed" >&2; exit 3
+    fi
+  done
+fi
+
 post_json "$sibling_request" "$sibling_response" &
 sibling_pid=$!
 sleep "$SIBLING_SETTLE_SECONDS"
@@ -269,6 +322,20 @@ kill -0 "$sibling_pid" 2>/dev/null || {
   jq '{choice: .choices[0], usage, timing: .x_hf2q_timing}' "$sibling_response" >&2 || true
   exit 1
 }
+
+if [[ "$SHARED_CANCELLATION" == 1 ]]; then
+  kill -0 "$active_pid" 2>/dev/null && kill -0 "$survivor_pid" 2>/dev/null || {
+    echo "shared lifecycle INCONCLUSIVE: member exited before actual cancel" >&2; exit 3;
+  }
+  for stream in "$active_stream" "$OUT_DIR/survivor.stream.sse"; do
+    [[ $(wc -c <"$stream") -le 16777216 ]] || exit 1
+    if rg -q '^data: \[DONE\]$' "$stream"; then
+      echo "shared lifecycle INCONCLUSIVE: terminal member before actual cancel" >&2; exit 3
+    fi
+  done
+  python3 -c 'import json,time; print(json.dumps({"cancel_requested_monotonic_ns":time.monotonic_ns()}))' \
+    >"$OUT_DIR/cancel-boundary.json"
+fi
 
 # The exact retry is now submitted while the retained-prefix owner is active.
 # Cancelling that owner exercises rollback to the pre-request anchor.
@@ -282,6 +349,24 @@ if ! wait "$sibling_pid"; then
   exit 1
 fi
 sibling_pid=""
+
+if [[ "$SHARED_CANCELLATION" == 1 ]]; then
+  if ! wait "$survivor_pid"; then
+    echo "shared lifecycle failed: independent survivor transport" >&2; exit 1
+  fi
+  survivor_pid=""
+  sed -n 's/^data: //p' "$OUT_DIR/survivor.stream.sse" | \
+    sed '/^\[DONE\]$/d' | jq -e -s '
+      all(.[]; type == "object" and .error == null and
+        ((.choices[0].delta.tool_calls // []) | length) == 0) and
+      ([.[] | .choices[0].delta.content // ""] | join("") | startswith("SURVIVOR_STARTED")) and
+      ([.[] | select(.choices[0].finish_reason != null)] | length) == 1 and
+      any(.[]; .choices[0].finish_reason == "stop" or .choices[0].finish_reason == "length") and
+      ([.[] | select(.usage != null)] | length) == 1 and
+      any(.[]; (.usage.completion_tokens // 0) > 0)
+    ' >/dev/null || { echo "shared lifecycle failed: survivor SSE semantics/usage" >&2; exit 1; }
+  [[ $(rg -c '^data: \[DONE\]$' "$OUT_DIR/survivor.stream.sse") == 1 ]] || exit 1
+fi
 
 if rg -q '^data: \[DONE\]$' "$active_stream"; then
   echo "cache lifecycle gate failed: cancelled active stream emitted [DONE]" >&2
@@ -361,4 +446,17 @@ jq -n \
 mv "$summary.tmp" "$summary"
 
 jq . "$summary"
+if [[ "$SHARED_CANCELLATION" == 1 ]]; then
+  if rg -F -q -e SURVIVOR_STARTED -e SURVIVOR_COMPLETE "$isolation_response"; then
+    echo "shared lifecycle failed: survivor material leaked into isolation" >&2; exit 1
+  fi
+  jq --slurpfile witness "$OUT_DIR/shared-witness.json" '. + {
+    shared_lifecycle: {status:"pass", witness:$witness[0],
+      independent_survivor_completed:true, exclusive_case_required:true,
+      cancellation_surface:"client transport close after witnessed healthy shared target",
+      partial_cohort_cb_failure_tested:false, eos_injection_tested:false,
+      whole_body_b4:false}
+  }' "$summary" >"$summary.shared.tmp"
+  mv "$summary.shared.tmp" "$summary"
+fi
 echo "cache lifecycle artifacts: $OUT_DIR" >&2
