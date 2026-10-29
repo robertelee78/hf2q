@@ -47,6 +47,7 @@ pub(crate) use info::print_early_rejection as print_info_early_rejection;
 // Phase B iter-3+ + Phase C iter-2 (Engine wiring).
 pub mod parity_quality;
 pub(crate) mod phase_trace;
+pub(crate) mod q5_deepseek;
 #[allow(dead_code)]
 #[allow(dead_code)]
 pub mod quant_select;
@@ -4349,6 +4350,8 @@ pub fn cmd_serve(
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
 
+    q5_deepseek::validate_activation()?;
+
     phase_trace::initialize_early().map_err(|error| anyhow::anyhow!(error))?;
 
     crate::debug::investigation_env::gemma_full_input::selected()
@@ -4374,6 +4377,8 @@ pub fn cmd_serve(
     if repository_spec.is_none() && args.output.is_some() {
         anyhow::bail!("serve --output requires a repository MODEL operand");
     }
+
+    q5_deepseek::preflight_model(args.model.as_deref())?;
 
     let (mut chat_parent_lifeline, chat_owned_listener, mut chat_startup_progress) = match (
         args.chat_parent_lifeline_fd,

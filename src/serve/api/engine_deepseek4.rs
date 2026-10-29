@@ -754,6 +754,12 @@ impl Deepseek4LoadedModel {
         opts: &LoadOptions,
         effective_context: Option<u32>,
     ) -> Result<Self> {
+        crate::serve::q5_deepseek::load(&opts.model_path, || {
+            Self::load_unobserved(opts, effective_context)
+        })
+    }
+
+    fn load_unobserved(opts: &LoadOptions, effective_context: Option<u32>) -> Result<Self> {
         let started = Instant::now();
         let gguf = GgufFile::open(&opts.model_path)
             .map_err(|error| anyhow::anyhow!("GGUF open: {error}"))?;
