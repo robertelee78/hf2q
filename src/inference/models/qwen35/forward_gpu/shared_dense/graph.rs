@@ -17,6 +17,9 @@ pub(super) fn encode(
     roots: &mut Vec<MlxBuffer>,
 ) -> Result<Output> {
     let _actual_input = native_rows(rows);
+    #[cfg(test)]let three=super::target_timing_hooks::three_la_active();
+    #[cfg(not(test))]let three=false;
+    if three {require_three_la_pattern(&c.layer_weights)?;}
     let cfg = &model.cfg;
     let h = cfg.hidden_size as usize;
     let n = rows.len();
@@ -40,10 +43,13 @@ pub(super) fn encode(
         "packed_embedding_gather_not_weight_matmul",
         rows,
     );
+    let mut block_root_start=0;
+    let mut block_first=0;
     for (layer, weights) in c.layer_weights.iter().enumerate() {
+        if !three||layer%4==0||layer%4==3 {block_root_start=roots.len();block_first=layer;}
         let attention = dev.alloc_buffer(n * h * 4, DType::F32, vec![n, h])?;
         roots.push(attention.clone());
-        let layer_root_start=roots.len(); // Keep dedicated packed attention outside helper suffix.
+
         retained::begin_layer(layer,matches!(weights,LayerWeightsGpu::LinearAttn{..}))?;
         // Each helper receives one physical row and its actual independent
         // cursor/cache slice. Never pass these rows as a temporal sequence.
@@ -180,21 +186,24 @@ pub(super) fn encode(
         hidden =
             build_dense_ffn_layer_gpu_q_into(&mut enc, dev, reg, &input, ffn, Some(&residual))?;
         roots.push(hidden.clone());
-        #[cfg(test)]let clock=super::target_timing_hooks::start()?;
-        let anchor=enc.commit_and_wait_labeled("s3.shared_postattn_RMS_dense_FFN").map_err(anyhow::Error::from);
-        #[cfg(test)]let anchor=anchor.and_then(|()|super::target_timing_hooks::checked("shared-FFN",&enc,clock,Some((layer,None))));
-        // Checks every exact retained CB even if anchor itself failed. No
-        // earlier success is inferred from the anchor or timestamp properties.
-        retained::after_layer_fence(anchor)?;
-        drop(enc);
-        #[cfg(test)]for (i,_) in rows.iter().enumerate(){fixture_after_checked_attention_copy(layer,i)?;}
-        // All helpers/copies/FFN are healthy. First drop helper wrappers, then
-        // recycle issued roots ONCE. Input/residual/hidden locals are dedicated
-        // nonpool parents, so retain them across suffix retirement and reattach.
-        retire_row_scratch(roots,layer_root_start,||{
-            super::super::super::decode_pool::checked_reset_for_prefill_chunk().map_err(Into::into)
-        })?;
-        roots.extend([input.clone(),residual.clone(),hidden.clone()]);
+        if retained::intermediate()? {
+            // No reset, suffix retirement, or CPU parameter reissue between LA
+            // layers. Own the exact intermediate FFN before its single submit.
+            retained::submit_ffn(enc)?;
+        } else {
+            #[cfg(test)]let clock=super::target_timing_hooks::start()?;
+            let anchor=enc.commit_and_wait_labeled("s3.shared_postattn_RMS_dense_FFN").map_err(anyhow::Error::from);
+            #[cfg(test)]let anchor=anchor.and_then(|()|super::target_timing_hooks::checked("shared-FFN",&enc,clock,Some((layer,None))));
+            retained::after_layer_fence(anchor)?;
+            drop(enc);
+            #[cfg(test)]for checked_layer in block_first..=layer {for (i,_) in rows.iter().enumerate(){fixture_after_checked_attention_copy(checked_layer,i)?;}}
+            // Every block CB is healthy; final outputs are dedicated nonpool
+            // parents. Keep their local owners through helper suffix retirement.
+            retire_row_scratch(roots,block_root_start,||{
+                super::super::super::decode_pool::checked_reset_for_prefill_chunk().map_err(Into::into)
+            })?;
+            roots.extend([input.clone(),residual.clone(),hidden.clone()]);
+        }
 
         map(
             &mut maps,
@@ -238,4 +247,21 @@ pub(super) fn encode(
         maps,
         whole_body_b4: false,
     })
+}
+
+fn require_three_la_pattern(weights:&[LayerWeightsGpu])->Result<()> {
+    ensure!(weights.len()==64,"three LA requires actual64 layers");
+    for (layer,weight) in weights.iter().enumerate(){
+        ensure!(matches!(weight,LayerWeightsGpu::LinearAttn{..})==(layer%4<3),"actual three LA / FA pattern drift");
+    }Ok(())
+}
+
+#[cfg(test)]mod three_la_resource_controls {
+    #[test]fn finite_three_la_cold_bucket_bound_includes_all_optional_casts(){
+        let buckets:[(u64,u64);12]=[(4,3),(8,30),(16,6),(64,6),(256,24),(8192,18),(32768,30),(65536,12),(262144,9),(524288,12),(67108864,12),(134217728,6)];
+        assert_eq!(buckets.iter().map(|x|x.1).sum::<u64>(),168);
+        assert_eq!(buckets.iter().map(|x|x.0*x.1).sum::<u64>(),1_621_187_292);
+        assert_eq!(3*204_832u64,614_496);
+        assert!(1_621_187_292u64<24*1024*1024*1024);
+    }
 }

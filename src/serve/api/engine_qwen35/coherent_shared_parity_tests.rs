@@ -458,3 +458,6 @@ mod target_timing;
 
 #[path="coherent_shared_parity_tests/grouped_target_timing.rs"]
 mod grouped_target_timing;
+
+#[path="coherent_shared_parity_tests/three_la_target_timing.rs"]
+mod three_la_target_timing;

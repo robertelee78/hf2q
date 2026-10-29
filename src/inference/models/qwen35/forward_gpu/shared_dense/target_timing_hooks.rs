@@ -15,12 +15,13 @@ pub(crate) const GROUPED_PROFILE:&str="qwen38-n2-one-layer-checked-group-v1";
  pub completed_cb_gpu_duration_ns_truncated:Option<u64>,pub gpu_observation_boundary:&'static str,
  pub healthy_result:bool,pub sum_is_gpu_union:bool,
 }
-struct State{events:Vec<Event>,grouped:Option<Vec<GroupedEvent>>,context:(Option<usize>,Option<u32>)}
+pub(crate) const THREE_LA_PROFILE:&str="qwen38-n2-three-la-checked-group-v1";
+struct State{three_la:bool,events:Vec<Event>,grouped:Option<Vec<GroupedEvent>>,context:(Option<usize>,Option<u32>)}
 thread_local!{static STATE:RefCell<Option<State>>=const{RefCell::new(None)};}
 const CAP:usize=1024;
 pub(crate) struct Scope{armed:bool}
 impl Scope{
- pub(crate) fn enter()->Result<Self>{STATE.with(|s|->Result<()>{let mut s=s.try_borrow_mut().context("timing reentry")?;ensure!(s.is_none(),"nested timing");let mut events=Vec::new();events.try_reserve_exact(CAP)?;*s=Some(State{events,grouped:None,context:(None,None)});Ok(())})?;Ok(Self{armed:true})}
+ pub(crate) fn enter()->Result<Self>{STATE.with(|s|->Result<()>{let mut s=s.try_borrow_mut().context("timing reentry")?;ensure!(s.is_none(),"nested timing");let mut events=Vec::new();events.try_reserve_exact(CAP)?;*s=Some(State{three_la:false,events,grouped:None,context:(None,None)});Ok(())})?;Ok(Self{armed:true})}
  pub(crate) fn take(mut self)->Result<Vec<Event>>{let x=STATE.with(|s|s.try_borrow_mut().map_err(|_|anyhow::anyhow!("timing borrowed"))?.take().context("timing scope missing"))?;self.armed=false;ensure!(x.grouped.is_none(),"legacy take cannot consume grouped events");Ok(x.events)}
 }
 impl Drop for Scope{fn drop(&mut self){if self.armed{STATE.with(|s|{if let Ok(mut s)=s.try_borrow_mut(){s.take();}});}}}
@@ -34,11 +35,18 @@ impl GroupedScope {
  pub(crate) fn take(mut self)->Result<Vec<GroupedEvent>>{let x=STATE.with(|s|s.try_borrow_mut().map_err(|_|anyhow::anyhow!("grouped timing borrowed"))?.take().context("grouped timing missing"))?;
   self.scope.armed=false;ensure!(x.events.is_empty(),"legacy/grouped mixing refused");x.grouped.context("missing grouped stream")}
 }
+pub(crate) struct ThreeLaScope{scope:GroupedScope}
+impl ThreeLaScope {
+ pub(crate) fn enter()->Result<Self>{let scope=GroupedScope::enter()?;STATE.with(|s|->Result<()>{s.try_borrow_mut().context("three LA timing borrow")?.as_mut().context("missing timing")?.three_la=true;Ok(())})?;Ok(Self{scope})}
+ pub(crate) fn take(self)->Result<Vec<GroupedEvent>>{self.scope.take()}
+}
+pub(crate) fn three_la_active()->bool {STATE.with(|s|s.try_borrow().map(|s|s.as_ref().is_some_and(|s|s.three_la)).unwrap_or(false))}
 pub(crate) fn require_grouped_or_inactive()->Result<()>{STATE.with(|s|->Result<()>{
  let s=s.try_borrow().context("timing profile borrow")?;if let Some(s)=s.as_ref(){ensure!(s.grouped.is_some(),"one-layer group refuses legacy timing profile");}Ok(())})}
 fn grouped_boundary(stage:&str)->Result<(&'static str,&'static str)>{match stage{
  "shared-FFN"=>Ok(("ffn-anchor-checked","commit_and_wait_after_encoding_including_queued_upstream")),
  "retained-Delta-terminal-check"=>Ok(("retained-delta-checked","wait_until_completed_after_ffn_anchor")),
+ "retained-FFN-terminal-check"=>Ok(("retained-ffn-checked","wait_until_completed_after_ffn_anchor")),
  "row-copy"=>Ok(("retained-row-copy-checked","wait_until_completed_after_ffn_anchor")),
  _=>anyhow::bail!("unknown grouped timing stage"),}}
 pub(crate) fn context(layer:usize,owner:u32)->Result<()>{STATE.with(|s|->Result<()>{let mut s=s.try_borrow_mut().context("timing context reentry")?;if let Some(s)=s.as_mut(){s.context=(Some(layer),Some(owner));}Ok(())})}
@@ -49,8 +57,9 @@ pub(crate) fn checked(stage:&'static str,e:&mlx_native::CommandEncoder,start:Opt
  // Caller has ALREADY checked exact CB Result. No wait/recommit/raw escape.
  let gpu=e.completed_gpu_interval_ns();
  STATE.with(|s|->Result<()>{let mut s=s.try_borrow_mut().context("timing callback reentry")?;let s=s.as_mut().context("lost timing scope")?;let(layer,owner)=at.map_or(s.context,|(l,o)|(Some(l),o));
+ let three_la=s.three_la;
  if let Some(events)=s.grouped.as_mut(){ensure!(events.len()<CAP,"grouped timing cap");let(stage,host_boundary)=grouped_boundary(stage)?;
-  events.push(GroupedEvent{event_schema:"hf2q.s3.layer-group-cb-event.v2",timing_profile:GROUPED_PROFILE,event_ordinal:events.len(),
+  events.push(GroupedEvent{event_schema:if three_la{"hf2q.s3.three-la-cb-event.v3"}else{"hf2q.s3.layer-group-cb-event.v2"},timing_profile:if three_la{THREE_LA_PROFILE}else{GROUPED_PROFILE},event_ordinal:events.len(),
    stage,layer,owner,host_boundary,host_clock:"rust.std.time.Instant.duration",host_elapsed_ns:host,
    completed_cb_gpu_duration_ns_truncated:(gpu>0).then_some(gpu),gpu_observation_boundary:"after_own_healthy_Result",
    healthy_result:true,sum_is_gpu_union:false});
