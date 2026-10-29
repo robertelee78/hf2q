@@ -16,7 +16,7 @@ pub(crate) fn snapshot_begin(gpu_registry_id: u64) -> Result<()> {
             Lifecycle::Provision => "provision",
             Lifecycle::Warmup => "warmup",
         });
-        c.manifest = Some(super::manifest::CurrentManifest::new(
+        c.manifest = Some(super::super::manifest::CurrentManifest::new(
             c.manifest_sequence,
             gpu_registry_id,
             c.owner.as_deref().unwrap_or(&[]),
