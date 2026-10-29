@@ -12798,3 +12798,10 @@ mod tests {
         }
     }
 }
+
+/// Exact same production planner as constructor; requested bytes, not residency.
+#[cfg(test)]
+pub(crate) fn target_timing_requested_cache_bytes(cfg:&Qwen35Config)->Result<u64>{
+    let plan=HybridCacheAllocationPlan::new(cfg,262144,4,true,true)?;
+    u64::try_from(plan.total_bytes).context("timing cache requested bytes")
+}

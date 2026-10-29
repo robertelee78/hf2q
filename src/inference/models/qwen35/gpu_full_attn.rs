@@ -320,7 +320,9 @@ pub fn append_kv_to_cache_without_attention(
         slot_id,
     )
     .context("MTP KV-only canonical cache write")?;
-    enc.commit_labeled("mtp.kv_only_append");
+    if super::forward_gpu::shared_dense::checked_active() {
+        enc.commit_and_wait_labeled("mtp.kv_only_append").context("shared ordinary target causal command completion")?;
+    } else { enc.commit_labeled("mtp.kv_only_append"); }
     slot.current_len[slot_idx] = new_len;
     Ok(())
 }
@@ -4506,7 +4508,9 @@ pub fn apply_flash_attn_prefill_seq_major(
         // and also outlives this CB. No wrapper-local MlxBuffer drops occur,
         // so no deferred removeAllocation: is staged — iter58b race is
         // structurally unreachable (queen plan A.5 / ADR-013 P21 S1).
-        enc.commit_labeled("fa.prefill_bridge");
+        if super::forward_gpu::shared_dense::checked_active() {
+        enc.commit_and_wait_labeled("fa.prefill_bridge").context("shared ordinary target causal command completion")?;
+    } else { enc.commit_labeled("fa.prefill_bridge"); }
 
         // ── ITER-17 DIAGNOSTIC (HF2Q_DUMP_FA_BF16=1) ────────────────────
         // Dim=10 NaN bug investigation: dump arena.out_bf16_hm bytes
@@ -5093,7 +5097,9 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
     // and `temp_v` remain in this stack frame across the dense resume's
     // terminal commit+wait, satisfying the unretained-reference lifetime
     // contract as well.
-    enc.commit_labeled("layer.full_attn.tq_bridge_dequant");
+    if super::forward_gpu::shared_dense::checked_active() {
+        enc.commit_and_wait_labeled("layer.full_attn.tq_bridge_dequant").context("shared ordinary target causal command completion")?;
+    } else { enc.commit_labeled("layer.full_attn.tq_bridge_dequant"); }
 
     // Dispatch the same dense resume kernel against the tight temp
     // buffers. kv_capacity = kv_seq_len so the kernel's head-stride
@@ -5277,7 +5283,9 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
     // Everything after this point stays GPU-only. Queue ordering makes the
     // downstream gate/output projection consume `output` after attention;
     // a host wait here would serialize every full-attention layer.
-    encoder.commit_labeled("layer.full_attn.tq_direct_prefill");
+    if super::forward_gpu::shared_dense::checked_active() {
+        encoder.commit_and_wait_labeled("layer.full_attn.tq_direct_prefill").context("shared ordinary target causal command completion")?;
+    } else { encoder.commit_labeled("layer.full_attn.tq_direct_prefill"); }
     Ok(output)
 }
 
@@ -5544,7 +5552,20 @@ pub fn apply_sdpa_with_kv_cache(
             enc.commit_and_wait_labeled("source_teacher.layer.full_attn.sdpa_kv")
                 .context("complete source-teacher full-attention decode")?;
         } else {
-            enc.commit_labeled("layer.full_attn.sdpa_kv");
+            if super::forward_gpu::shared_dense::checked_active() {
+                use super::forward_gpu::shared_dense as shared;
+                if shared::defer_sdpa_aux(head_dim,slot.tq.is_some())? {
+                    if !super::dump_bisect::is_enabled(){shared::submit_sdpa_aux(enc)?;}
+                    else {
+                        enc.commit_and_wait_labeled("layer.full_attn.sdpa_kv")
+                            .context("complete SDPA before CPU dump")?;
+                        shared::complete_waited_aux(true)?;
+                    }
+                } else {
+                    enc.commit_and_wait_labeled("layer.full_attn.sdpa_kv")
+                        .context("shared ordinary target causal command completion")?;
+                }
+    } else { enc.commit_labeled("layer.full_attn.sdpa_kv"); }
         }
     } else {
         // Prefill path (seq > 1) or non-standard head_dim:
@@ -5608,7 +5629,9 @@ pub fn apply_sdpa_with_kv_cache(
                 enc.commit_and_wait_labeled("source_teacher.layer.full_attn.kv_cache_write")
                     .context("complete source-teacher KV prefill write")?;
             } else {
-                enc.commit_labeled("layer.full_attn.kv_cache_write");
+                if super::forward_gpu::shared_dense::checked_active() {
+        enc.commit_and_wait_labeled("layer.full_attn.kv_cache_write").context("shared ordinary target causal command completion")?;
+    } else { enc.commit_labeled("layer.full_attn.kv_cache_write"); }
             }
         }
 
@@ -7217,7 +7240,18 @@ pub fn build_gated_attn_layer(
                 enc.commit_and_wait_labeled("source_teacher.layer.full_attn.ops1-4")
                     .context("complete source-teacher full-attention ops1-4")?;
             } else if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
-                enc.commit_labeled("layer.full_attn.ops1-4");
+                if super::forward_gpu::shared_dense::checked_active() {
+                    use super::forward_gpu::shared_dense as shared;
+                    let selected=shared::select_ops14_aux(seq_len,head_dim,
+                        kv_cache_slot.as_ref().is_some_and(|slot|slot.tq.is_some()))?;
+                    if shared::may_defer_ops14_aux(selected,super::dump_bisect::is_enabled()) {
+                        shared::submit_ops14_aux(enc)?;
+                    } else {
+                        enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
+                            .context("shared ordinary target causal command completion")?;
+                        if selected {shared::complete_waited_ops14_aux()?;}
+                    }
+    } else { enc.commit_labeled("layer.full_attn.ops1-4"); }
             } else {
                 enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
                     .context("commit ops1-4 prefill")?;

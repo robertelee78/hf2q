@@ -1291,6 +1291,12 @@ impl InflightBatchedScheduler {
         id
     }
 
+    /// Actual admitted owner identity for a live exact-generation handle.
+    /// RequestId(0) is legitimate; stale/released generations return None.
+    pub(crate) fn admitted_request_id(&self, handle: SlotHandle) -> Option<RequestId> {
+        self.in_flight.iter().find(|slot|slot.handle==handle).map(|slot|slot.request_id)
+    }
+
     /// Test-only: read the current generation counter for a slot.
     pub fn slot_generation(&self, slot_id: SlotId) -> u64 {
         let idx = slot_id.0 as usize;
@@ -3800,3 +3806,14 @@ mod tests {
 
 #[cfg(test)]
 mod f2_demand_controls;
+
+#[cfg(test)]mod shared_ordinary_owner_controls {
+    use super::*;
+    #[test]fn actual_owner_zero_is_valid_and_stale_or_released_handle_refuses() {
+        let mut s=InflightBatchedScheduler::new(4,4);
+        let r=s.admit(AdmitRequest {prompt_tokens:1,max_tokens:2,..AdmitRequest::default()}).unwrap();
+        let h=r.handle.unwrap();assert_eq!(r.request_id.0,0);assert_eq!(s.admitted_request_id(h),Some(r.request_id));
+        assert_eq!(s.admitted_request_id(SlotHandle {generation:h.generation+1,..h}),None);
+        s.release(h);assert_eq!(s.admitted_request_id(h),None);
+    }
+}

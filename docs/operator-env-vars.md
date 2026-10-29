@@ -159,6 +159,25 @@ external competition remain separate. A later smaller/larger named policy is
 a new reviewed packet; the program does not resize this one automatically.
 Real-model execution remains separately gated on a complete memory packet.
 
+### Experimental Qwen shared ordinary targets
+
+`HF2Q_QWEN_SHARED_ORDINARY=1` requires `HF2Q_UNSAFE_EXPERIMENTS=1` and
+`HF2Q_QWEN_POOL_GROWTH_PROFILE=adr063-24g-v1`. Unset or `0` keeps ordinary
+scalar dispatch. Other values refuse requested startup. The selected model
+must have the supported Qwen3.8 dense geometry.
+
+The experiment collects 2–4 already-runnable compatible ordinary targets with
+four TQ8 slots and a 262,144-token capacity. It shares RMS, DenseQ FFN and the
+output head; attention remains per owner. It preserves AUTO, MTP catch-up,
+history continuation, repetition penalties and native tool grammar. Unsupported
+operations take their existing scalar path before shared mutation. An uncertain
+shared failure stops the worker and requires process recovery.
+
+Shared AUTO cost observations use measured target service divided among the
+actual owners plus each owner's own continuation work. Request latency and
+four-task makespan remain wall-clock measurements. This experimental switch
+has no production speed qualification until the matched serving gates pass.
+
 ### Experimental Gemma full-input checkpoint
 
 `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1` plus `HF2Q_UNSAFE_EXPERIMENTS=1`

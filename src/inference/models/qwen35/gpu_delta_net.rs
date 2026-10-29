@@ -2937,7 +2937,13 @@ pub fn build_delta_net_layer(
             enc.commit_and_wait_labeled("source_teacher.layer.delta_net.ops1-9")
                 .context("complete source-teacher Delta decode")?;
         } else {
-            enc.commit_labeled("layer.delta_net.ops1-9");
+            if super::forward_gpu::shared_dense::checked_active() {
+            if super::forward_gpu::shared_dense::deferral_active() {
+                super::forward_gpu::shared_dense::submit_retained(enc,"layer.delta_net.ops1-9")?;
+            } else {
+                enc.commit_and_wait_labeled("layer.delta_net.ops1-9").context("shared ordinary target causal command completion")?;
+            }
+        } else { enc.commit_labeled("layer.delta_net.ops1-9"); }
         }
         output
     } else {
@@ -3034,7 +3040,9 @@ pub fn build_delta_net_layer(
                 enc.commit_and_wait_labeled("source_teacher.layer.gdn.ops1-3")
                     .context("complete source-teacher Delta prefill ops1-3")?;
             } else {
-                enc.commit_labeled("layer.gdn.ops1-3");
+                if super::forward_gpu::shared_dense::checked_active() {
+            enc.commit_and_wait_labeled("layer.gdn.ops1-3").context("shared ordinary target causal command completion")?;
+        } else { enc.commit_labeled("layer.gdn.ops1-3"); }
             }
             (x_norm, qkv_conv, z)
         };
@@ -3111,7 +3119,9 @@ pub fn build_delta_net_layer(
                 enc.commit_and_wait_labeled("source_teacher.layer.gdn.qkv_split")
                     .context("complete source-teacher Delta QKV split")?;
             } else {
-                enc.commit_labeled("layer.gdn.qkv_split");
+                if super::forward_gpu::shared_dense::checked_active() {
+            enc.commit_and_wait_labeled("layer.gdn.qkv_split").context("shared ordinary target causal command completion")?;
+        } else { enc.commit_labeled("layer.gdn.qkv_split"); }
             }
             (q_gpu, k_gpu, v_gpu)
         };
@@ -3531,7 +3541,9 @@ pub fn build_delta_net_layer(
                 enc.commit_and_wait_labeled("source_teacher.layer.gdn.ops5-9")
                     .context("complete source-teacher Delta prefill ops5-9")?;
             } else {
-                enc.commit_labeled("layer.gdn.ops5-9");
+                if super::forward_gpu::shared_dense::checked_active() {
+            enc.commit_and_wait_labeled("layer.gdn.ops5-9").context("shared ordinary target causal command completion")?;
+        } else { enc.commit_labeled("layer.gdn.ops5-9"); }
             }
             output
         };
@@ -4362,7 +4374,9 @@ pub fn build_delta_net_layer_with_arena(
             z_channels,
             hidden_size,
         )?;
-        enc.commit_labeled("layer.gdn.ops5-9");
+        if super::forward_gpu::shared_dense::checked_active() {
+            enc.commit_and_wait_labeled("layer.gdn.ops5-9").context("shared ordinary target causal command completion")?;
+        } else { enc.commit_labeled("layer.gdn.ops5-9"); }
         output
     };
 
