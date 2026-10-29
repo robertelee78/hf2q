@@ -69,3 +69,7 @@ pub(crate) fn hf2q_gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 pub(crate) mod expert_dispatch;
 pub(crate) mod gguf_contract;
+
+// Pending native0.15.13 publication/pin. Diagnostic only; no serving activation.
+#[cfg(test)]
+pub mod backing_observation;
