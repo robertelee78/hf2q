@@ -6,6 +6,7 @@
 //! divergent/compacted transcripts reset.
 
 mod progress;
+pub(super) mod q5_observation;
 mod sampling;
 mod slot_provision;
 mod slots;
@@ -754,15 +755,18 @@ impl Deepseek4LoadedModel {
         opts: &LoadOptions,
         effective_context: Option<u32>,
     ) -> Result<Self> {
-        crate::serve::q5_deepseek::load(&opts.model_path, || {
-            Self::load_unobserved(opts, effective_context)
+        crate::serve::q5_deepseek::load(&opts.model_path, |header| {
+            Self::load_unobserved(opts, effective_context, header)
         })
     }
 
-    fn load_unobserved(opts: &LoadOptions, effective_context: Option<u32>) -> Result<Self> {
+    fn load_unobserved(opts: &LoadOptions, effective_context: Option<u32>, header: Option<GgufFile>) -> Result<Self> {
         let started = Instant::now();
-        let gguf = GgufFile::open(&opts.model_path)
-            .map_err(|error| anyhow::anyhow!("GGUF open: {error}"))?;
+        let gguf = match header {
+            Some(header) => header,
+            None => GgufFile::open(&opts.model_path)
+                .map_err(|error| anyhow::anyhow!("GGUF open: {error}"))?,
+        };
         let tokenizer = if let Some(path) = opts.tokenizer_path.as_deref() {
             Tokenizer::from_file(path)
                 .map_err(|error| anyhow::anyhow!("load tokenizer {}: {error}", path.display()))?

@@ -9569,6 +9569,12 @@ fn seed_deepseek4_single(
     let resumable_cold =
         cold_request && prompt_tokens.len() >= model.model.cfg.sliding_window as usize;
     let resumable_cached = reusable_prefix > 0 && reusable_prefix < prompt_tokens.len();
+    let q5_owner = match super::engine_deepseek4::q5_observation::OwnerScope::begin(
+        scheduler, handle, model, sessions,
+    ) {
+        Ok(scope) => scope,
+        Err(error) => return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+    };
     sessions[slot_index].swap_with_loaded(model);
     let is_stream = matches!(&reply, SlotReply::Stream { .. });
     let result = if resumable_cold {
@@ -9617,6 +9623,10 @@ fn seed_deepseek4_single(
         })
     };
     sessions[slot_index].swap_with_loaded(model);
+    let result = result.and_then(|value| {
+        q5_owner.finish(scheduler, model, sessions)?;
+        Ok(value)
+    });
     match result {
         Ok((work, initial_prefill_tokens)) => {
             if initial_prefill_tokens > 0 {
@@ -10195,6 +10205,12 @@ fn advance_deepseek4_prefill(
         ));
     };
 
+    let q5_owner = match super::engine_deepseek4::q5_observation::OwnerScope::begin(
+        scheduler, handle, model, sessions,
+    ) {
+        Ok(scope) => scope,
+        Err(error) => return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+    };
     let _native_invocation = scheduler.trace_transaction("deepseek4", "bounded_prefill", &[handle]);
     sessions[slot_index].swap_with_loaded(model);
     let result = state.advance(
@@ -10205,6 +10221,10 @@ fn advance_deepseek4_prefill(
         supervisor,
     );
     sessions[slot_index].swap_with_loaded(model);
+    let result = result.and_then(|value| {
+        q5_owner.finish(scheduler, model, sessions)?;
+        Ok(value)
+    });
     match result {
         Ok(super::engine_deepseek4::Deepseek4PrefillAdvance::Pending {
             state,

@@ -122,4 +122,4 @@ pub use crate::inference::models::deepseek4::cache::backing_roles::{
     deepseek_cache_roles,deepseek_anchor_roles,deepseek_provided_owner_roles,
     Presence,FieldRole,DeepseekCacheRoles,ProvidedDeepseekOwners,DeepseekProvidedOwnerRoles,
 };
-#[cfg(test)]mod deepseek_control;
+#[cfg(test)]pub(crate) mod deepseek_control;

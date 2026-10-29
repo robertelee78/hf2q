@@ -15,6 +15,8 @@ use super::Deepseek4Config;
 
 #[derive(Debug, Error)]
 pub enum WeightResidencyError {
+    #[error("DeepSeek Q5 actual residency observation failed: {0}")]
+    Observation(#[source] anyhow::Error),
     #[error(transparent)]
     Catalog(#[from] WeightCatalogError),
     #[error("tensor '{name}' with role {role:?} cannot use GGML storage {actual:?}")]
@@ -149,6 +151,8 @@ impl Deepseek4Weights {
                 }
             };
             validate_loaded_buffer(&spec.name, spec.role, info.byte_len, &buffer)?;
+            crate::serve::q5_deepseek::collector::weight(gguf, &spec.name, &buffer)
+                .map_err(WeightResidencyError::Observation)?;
             let bytes = u64::try_from(buffer.data_byte_len()).map_err(|_| {
                 WeightResidencyError::ByteOverflow {
                     name: spec.name.clone(),
@@ -182,6 +186,8 @@ impl Deepseek4Weights {
                 },
             );
         }
+        crate::serve::q5_deepseek::collector::checked_health()
+            .map_err(WeightResidencyError::Observation)?;
         Ok(Self {
             tensors,
             resident_bytes,

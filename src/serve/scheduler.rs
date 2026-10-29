@@ -1431,6 +1431,15 @@ impl InflightBatchedScheduler {
 
     /// This boundary is a validated family transaction selection, NOT evidence
     /// that its internal graphs share physical rows or have already submitted.
+    /// Exact installed scheduler owner; request ID zero is valid. Diagnostic
+    /// callers must not infer this identity from a session-vector index.
+    pub(crate) fn q5_request(&self, handle: SlotHandle) -> anyhow::Result<u64> {
+        let mut matches = self.in_flight.iter().filter(|slot| slot.handle == handle);
+        let request = matches.next().ok_or_else(|| anyhow::anyhow!("Q5 absent/stale scheduler handle"))?.request_id.0;
+        anyhow::ensure!(matches.next().is_none(), "Q5 duplicate installed scheduler handle");
+        Ok(request)
+    }
+
     pub(crate) fn trace_transaction(&self, family: &'static str, operation: &'static str,
         handles: &[SlotHandle]) -> crate::inference::native_observation::Invocation {
         if !crate::serve::phase_trace::enabled() {
