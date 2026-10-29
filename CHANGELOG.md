@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.28] — 2026-10-29
+
+### Fixed
+
+- Accept omitted, `false`, or `null` non-strict function-tool hints from OpenAI-compatible clients without changing the rendered prompt or weakening locked tool policy. Strict tools remain unsupported.
+- Preserve insertion order when rendering native tool JSON, including the `name`/`arguments` order used by model chat templates.
+- Preserve reusable Gemma 4 prefixes before cold batch admission. Correct DeepSeek DSML parameter boundaries and compile bounded tool grammars without collisions with public schema names.
+
+### Changed
+
+- Reduce DeepSeek ratio-four indexer scratch through the native tiled workspace plan, and reuse a pristine bootstrap cache for the first serving slot. These reduce requested allocation sizes; they do not establish whole-model physical fit or a serving speedup.
+- Derive native evidence-version metadata from the exact dependency pin.
+
+### Added
+
+- Explicit, bounded native command/phase tracing, queued-forward-demand diagnostics, and source-bound agentic trace auditing. These remain investigation tools, separate from performance qualification.
+- Default-off Gemma full-input checkpoint experiments with unsafe acknowledgement and a bounded anchor quota. The production prefix fix does not enable this experiment.
+- Native backing, requested-root and cache-owner observation controls for Qwen and DeepSeek. Observations do not authorize physical-memory credit or largest-profile admission.
+- Pin published `mlx-native 0.15.15` and add bounded same-file DeepSeek metadata/map diagnostics; these do not load a model or grant memory admission.
+
+
 ## [0.1.27] — 2026-10-22
 
 ### Added
