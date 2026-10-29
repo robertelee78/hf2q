@@ -1,7 +1,8 @@
 # DeepSeek actual cache/anchor ownership roles — diagnostic source candidate
 
-Branch cut mainD010, exact8-path accepted helper/public0.15.13 source2f6a4fc6
-composed by gitdiff and baseline frozen BEFORE family delta. Cargo remains exact
+Branch cut current main `63d0ba4c88db44dcf59675ee8a5c1c3e3fba1209`, which
+contains the merged generic/Qwen helper. The seven-file family delta preserves
+the independently reviewed source, with a test-name lint correction. Cargo remains exact
 public13 registry dependency; checksum66d9f8bb0296ca7497ebe7834bc817b2a0326aa5755fdcc7660760ae2e442270.
 No local patch, new native API/version, serving activation or model load.
 
@@ -57,7 +58,7 @@ including all pending command owners. CPU vectors, disk persistence/IO and OS
 partition remain outside native buffer metadata. Gemma's hybrid/cache variants are
 not a small interchangeable follow-on and are not claimed covered by this delta.
 
-## Authored controls (all UNRUN)
+## Controls and root validation
 
 One pure actual production planner control verifies a legal tiny geometry with
 three layers/ratios0,4,128, C256, window128, head512/index128; all other cache-relevant
@@ -88,7 +89,25 @@ Root must independently admit/control any actual run. Allocation authority bound
 56attempts/roots and exact6164480requested bytes, so unexpected roots/refills fail.
 
 This supplies source-complete cache/compact-anchor/selected loaded-session BUFFER
-field traversal, not full DeepSeek process ownership. Actual public13 compilation,
-host/tiny controls, selected model snapshots, verified file-to-owned weight joins,
+field traversal, not full DeepSeek process ownership. Selected model snapshots, verified file-to-owned weight joins,
 CPU/transient/OS disjoint ledger and full Q5 gates remain separate. No old result
 is rescored, and no physical admission or Q5 completion is inferred.
+
+Root validation on source `2c7fcab6068be1549f415653c8159e6eb0331fc0`:
+
+- Locked optimized test compilation passed with debug assertions disabled.
+- The pure planner control passed.
+- The isolated actual two-cache/four-anchor control passed in a fresh process;
+  all 56 roots and 6,164,480 requested bytes matched. The process group was reaped.
+  The control asserted unchanged native dispatch/commit/sync counters.
+- `cargo check --locked --all-targets --all-features` passed.
+
+Evidence is retained locally under campaign `adr063-preflight-20261023`:
+`hf-q5-deepseek-role-release-root-build-v2/build-receipt.json`,
+`hf-q5-deepseek-role-actual-controls-root-v1/receipt.json`, and
+`hf-q5-deepseek-role-check-all-v1.log`. Optimized test binary SHA256:
+`9c67c380270dfaf41fa2124afa1893aab83e881e815c318dac8a05d74633074d`.
+The initial compilation refused an uppercase test identifier; that failed build
+is retained and the corrected build above is the validation authority.
+No real model, serving behavior, performance, release credit or physical fit
+was validated by these controls. Product release build and hosted CI are separate.
