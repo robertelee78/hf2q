@@ -200,3 +200,40 @@ low-memory projected-breach child. Missing future domains remain Unknown/rejecte
 Warmup skip and feature/co-activation intent must ultimately be validated in the
 full preload packet BEFORE Device; current always-refused preload prevents a
 model being loaded merely to discover these unresolved requirements.
+
+
+## Consolidated source closure (unexecuted beyond B8)
+
+The connected source now records bounded current borrowed-field manifests with
+POSIX monotonic endpoints, exact actual cache positions/capacities/compression
+ratios, actual device identity, and request/slot/generation or lifecycle identity.
+Actual swap callbacks record explicitly partial mounted/unmounted pairs; an
+unbalanced mount cannot publish owner completion. Late delivery/anchor promotion
+and shutdown use the same originating context. The terminal record is emitted
+once before model drop and explicitly does not certify native lifetime, physical
+retirement, process UUID, or runtime admission. Full role snapshots and partial
+swap snapshots are distinct. A fixed 16 MiB serialization quota fails closed.
+No per-event Vec, buffer retention, new GPU waits, or replay is introduced.
+
+The same-FD preload receipt now projects the actual strict config and pure cache
+plan when available, otherwise a typed Unknown reason. It does not substitute
+that plan for actual allocation or lower the retained 125.613 GiB envelope.
+The callback accepting a private PreparedLoad remains unreachable: no positive
+permit is minted. Native page provider stays Unavailable in this Cargo13 tree;
+public14 verification elsewhere does not silently change this source pin.
+
+Remaining admission obligations are real integration dependencies, not additional
+observational helpers: a published/pinned provider plus actual early whole-native
+requested/live authority; reviewed source-domain partition or conservative full
+upper; exact source/binary/native/process/workload/operator joins; bounded CPU,
+OS/reaction and projected-breach/cleanup evidence; independently reviewed selected
+load/window policy. Current refusal is the connected safe outcome, not whole-Q5
+acceptance. The author ran no tests, builds, model, header helper or GPU command
+for this delta. Root must compile and run the authored actual-entry controls.
+
+Bootstrap source distinction: pristine reuse transfers the original cache into
+slot0 and leaves a C128 eager swap stub plus four normal caches total. The fallback
+can retain five normal caches. This source does not assume the reuse predicate or
+lower the five-cache conservative admission bound. A future tighter packet must
+prove reuse and reject before fallback allocation. File-backed requested bytes,
+file interval union and physical charge remain separate; no guessed deduplication.

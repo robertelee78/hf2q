@@ -4,7 +4,7 @@ use anyhow::{ensure, Context, Result};
 use mlx_native::{MlxBuffer, RootOriginSnapshot};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum Domain {
     Weight,
     Prefill,
@@ -17,7 +17,7 @@ pub(crate) enum Lifecycle {
     Provision,
     Warmup,
 }
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 struct Root {
     bytes: usize,
     domain: Option<Domain>,
@@ -41,12 +41,17 @@ pub(super) struct Collector {
     completed_results: u64,
     transient_observations: [(u64, u64); 4],
     pool_latest: [(usize, usize); 3],
+    pool_observations: u64,
     pool_observed_highwater: [usize; 3],
     upper: usize,
     poisoned: bool,
     owner: Option<Vec<(u64, u32, u64)>>,
     completed_owners: [Option<(u64, u64)>; 4],
     lifecycle: Option<Lifecycle>,
+    manifest_sequence: u64,
+    manifest: Option<super::manifest::CurrentManifest>,
+    mounted_pair: Option<super::manifest::CurrentManifest>,
+    mounted: bool,
     attached: Option<std::thread::ThreadId>,
     next_chain: u64,
     commands: BTreeMap<(u64, usize), Option<bool>>,
@@ -139,7 +144,11 @@ impl Collector {
 }
 
 mod context;
+mod observations;
 pub(crate) use context::{Handle, Scope};
+pub(crate) use observations::{
+    cache_state, mounted_begin, mounted_end, snapshot_begin, snapshot_end,
+};
 pub(super) type HeaderScope = Scope;
 use context::with_current;
 
@@ -158,17 +167,25 @@ pub(crate) fn constructed(label: &str, buffer: &MlxBuffer) {
 pub(crate) fn field(label: &str, buffer: Option<&MlxBuffer>) -> Result<()> {
     with_current(|c| {
         if let Some(buffer) = buffer {
-            c.buffer(None, label, buffer)
+            c.buffer(None, label, buffer)?;
         } else {
             ensure!(!c.poisoned, "Q5 absent field health");
             c.events = c
                 .events
                 .checked_add(1)
                 .context("Q5 absent event overflow")?;
-            Ok(())
         }
+        let manifest = match c.mounted_pair.as_mut() {
+            Some(pair) if pair.end_ns.is_none() => Some(pair),
+            _ => c.manifest.as_mut().filter(|m| m.end_ns.is_none()),
+        };
+        if let Some(manifest) = manifest {
+            manifest.field(label, buffer)?;
+        }
+        Ok(())
     })
 }
+
 pub(crate) fn chain() -> u64 {
     let mut id = 0;
     let _ = with_current(|c| {
@@ -270,6 +287,7 @@ pub(crate) fn owner_begin_many(keys: &[(u64, u32, u64)]) -> Result<()> {
             );
         }
         c.roots.clear(); // observational checkpoint only; no native/live refund
+        c.mounted = false;
         c.owner = Some(keys.to_vec());
         Ok(())
     })
@@ -281,7 +299,7 @@ pub(crate) fn owner_finish(request: u64, slot_id: u32, generation: u64) -> Resul
 pub(crate) fn owner_finish_many(keys: &[(u64, u32, u64)]) -> Result<()> {
     with_current(|c| {
         ensure!(
-            !c.poisoned && c.commands.is_empty() && c.owner.as_deref() == Some(keys),
+            !c.poisoned && !c.mounted && c.commands.is_empty() && c.owner.as_deref() == Some(keys),
             "Q5 stale request/generation or callback health"
         );
         for &(request, slot, generation) in keys {
@@ -403,6 +421,10 @@ pub(crate) fn weight(
 pub(crate) fn pools(snapshots: [mlx_native::PoolMemorySnapshot; 3]) -> Result<()> {
     with_current(|c| {
         ensure!(!c.poisoned, "Q5 pool callback health");
+        c.pool_observations = c
+            .pool_observations
+            .checked_add(1)
+            .context("Q5 pool observation counter overflow")?;
         for (index, snapshot) in snapshots.into_iter().enumerate() {
             ensure!(
                 snapshot.retained.roots <= 16_384

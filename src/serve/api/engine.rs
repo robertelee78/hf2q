@@ -9386,6 +9386,9 @@ fn run_slot_aware_deepseek4(
         }
     }
 
+    if let Err(error) = super::engine_deepseek4::q5_observation::terminal(&model, &sessions) {
+        tracing::error!("DeepSeek Q5 terminal receipt unavailable: {error:#}");
+    }
     tracing::info!(
         slots = sessions.len(),
         "DeepSeek-V4 full-context session worker exited"
@@ -10571,14 +10574,12 @@ fn try_decode_batch_deepseek4_cohort(
             Deepseek4DecodeOwnership::Finalize => match lane.state.finish(registration, None) {
                 Ok(completion) => {
                     let delivered = fire_deepseek4_completion(lane.reply, completion);
-                    if delivered {
-                        sessions[lane.slot_index].commit_request_anchor();
-                    } else {
-                        if let Err(error) = sessions[lane.slot_index].recover_after_cancellation() {
-                            let mut fatal = SlotAwareGpuFatal::invariant_handle(lane.handle, error);
-                            fatal.extend_slots(owned.map(|lane| (Some(lane.handle), lane.reply)));
-                            return Deepseek4DecodeCohortRun::Handled(Some(fatal));
-                        }
+                    if let Err(error) = super::engine_deepseek4::q5_observation::finalize_session(model,sessions,scheduler,lane.handle,delivered) {
+                        let mut fatal = SlotAwareGpuFatal::invariant_handle(lane.handle,error);
+                        fatal.extend_slots(owned.map(|lane|(Some(lane.handle),lane.reply)));
+                        return Deepseek4DecodeCohortRun::Handled(Some(fatal));
+                    }
+                    if !delivered {
                         record_retained_slot_kv(
                             scheduler,
                             lane.handle,
@@ -10920,12 +10921,10 @@ fn decode_batch_deepseek4(
                 match state.finish(registration, events) {
                     Ok(completion) => {
                         let delivered = fire_deepseek4_completion(reply, completion);
-                        if delivered {
-                            sessions[slot_index].commit_request_anchor();
-                        } else {
-                            if let Err(error) = sessions[slot_index].recover_after_cancellation() {
-                                return Some(SlotAwareGpuFatal::invariant_handle(handle, error));
-                            }
+                        if let Err(error) = super::engine_deepseek4::q5_observation::finalize_session(model,sessions,scheduler,handle,delivered) {
+                            return Some(SlotAwareGpuFatal::invariant_handle(handle,error));
+                        }
+                        if !delivered {
                             record_retained_slot_kv(
                                 scheduler,
                                 handle,

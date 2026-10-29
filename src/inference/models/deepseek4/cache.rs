@@ -11,6 +11,7 @@ use super::Deepseek4Config;
 
 mod anchor_image;
 mod q5_observation;
+pub(crate) use q5_observation::Q5CacheState;
 mod layer_allocation;
 pub(super) use layer_allocation::{allocate_layer_from_plan, initialize_layer_state};
 mod prefill;

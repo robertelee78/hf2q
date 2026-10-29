@@ -13,6 +13,7 @@ use std::{
 struct Shared {
     state: Mutex<Collector>,
     failed: AtomicBool,
+    emitted: AtomicBool,
 }
 #[derive(Clone)]
 pub(crate) struct Handle(Arc<Shared>);
@@ -70,17 +71,23 @@ impl Scope {
                 completed_results: 0,
                 transient_observations: [(0, 0); 4],
                 pool_latest: [(0, 0); 3],
+                pool_observations: 0,
                 pool_observed_highwater: [0; 3],
                 upper: 16_384,
                 poisoned: false,
                 owner: None,
                 completed_owners: [None; 4],
                 lifecycle: None,
+                manifest_sequence: 0,
+                manifest: None,
+                mounted_pair: None,
+                mounted: false,
                 attached: None,
                 next_chain: 1,
                 commands: BTreeMap::new(),
             }),
             failed: AtomicBool::new(false),
+            emitted: AtomicBool::new(false),
         }));
         handle.attach()
     }
@@ -178,5 +185,114 @@ impl Drop for Scope {
                 Err(_) => self.handle.0.failed.store(true, Ordering::Release),
             }
         });
+    }
+}
+
+#[derive(serde::Serialize)]
+struct TerminalReceipt<'a> {
+    schema: &'static str,
+    verdict: &'static str,
+    phase: &'static str,
+    runtime_qualified: bool,
+    physical_credit: bool,
+    pid: u32,
+    compiled_source: Option<&'static str>,
+    compiled_native_pin: &'static str,
+    process_uuid_authority: &'static str,
+    native_whole_live_pending: &'static str,
+    model_still_retained: bool,
+    source_fd_unchanged: Option<bool>,
+    observation_failed: bool,
+    unjoined_tracked_commands: usize,
+    open_owner: bool,
+    open_lifecycle: bool,
+    allocation_observation_events_not_creation: u64,
+    checked_results: u64,
+    transient_observations_not_unique_live_or_peak: &'a [(u64, u64); 4],
+    current_borrowed_role_manifest:
+        &'a Option<crate::serve::q5_deepseek::manifest::CurrentManifest>,
+    last_mounted_pair_partial: &'a Option<crate::serve::q5_deepseek::manifest::CurrentManifest>,
+    weight_parent_observations: &'a std::collections::BTreeMap<usize, super::Root>,
+    pools_current_retained_if_observed: Option<&'a [(usize, usize); 3]>,
+    pool_observed_highwater_not_lifetime: Option<&'a [usize; 3]>,
+    required_domains: Vec<(&'static str, &'static str)>,
+}
+impl Handle {
+    pub(crate) fn emit_terminal(&self) -> Result<()> {
+        ensure!(
+            !self.0.emitted.swap(true, Ordering::AcqRel),
+            "Q5 duplicate terminal receipt"
+        );
+        let bytes = {
+            let state = self
+                .0
+                .state
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("Q5 terminal state unavailable"))?;
+            let source_unchanged = state.source.as_ref().map(|source| {
+                source
+                    .file
+                    .metadata()
+                    .ok()
+                    .is_some_and(|m| source.expected.matches(&m).is_ok())
+            });
+            let failed = self.0.failed.load(Ordering::Acquire)
+                || state.poisoned
+                || source_unchanged != Some(true)
+                || state.mounted
+                || state
+                    .mounted_pair
+                    .as_ref()
+                    .is_some_and(|m| m.end_ns.is_none())
+                || state.owner.is_some()
+                || state.lifecycle.is_some()
+                || !state.commands.is_empty()
+                || state.manifest.as_ref().is_none_or(|m| m.end_ns.is_none());
+            let record = TerminalReceipt {
+                schema: "hf2q.q5.deepseek.collector-terminal.v1",
+                verdict: if failed {
+                    "StoppedIncomplete"
+                } else {
+                    "CapturedPartialAwaitingWholePolicy"
+                },
+                phase: "worker_exit_before_model_drop",
+                runtime_qualified: false,
+                physical_credit: false,
+                pid: std::process::id(),
+                compiled_source: option_env!("HF2Q_BUILD_GIT_SHA"),
+                compiled_native_pin: env!("HF2Q_MLX_NATIVE_VERSION"),
+                process_uuid_authority: "ExternalExactJoinRequired",
+                native_whole_live_pending: "Unavailable_NoSubstituteFromRoleObservations",
+                model_still_retained: true,
+                source_fd_unchanged: source_unchanged,
+                observation_failed: failed,
+                unjoined_tracked_commands: state.commands.len(),
+                open_owner: state.owner.is_some(),
+                open_lifecycle: state.lifecycle.is_some(),
+                allocation_observation_events_not_creation: state.events,
+                checked_results: state.completed_results,
+                transient_observations_not_unique_live_or_peak: &state.transient_observations,
+                current_borrowed_role_manifest: &state.manifest,
+                last_mounted_pair_partial: &state.mounted_pair,
+                weight_parent_observations: &state.weights,
+                pools_current_retained_if_observed: (state.pool_observations > 0)
+                    .then_some(&state.pool_latest),
+                pool_observed_highwater_not_lifetime: (state.pool_observations > 0)
+                    .then_some(&state.pool_observed_highwater),
+                required_domains: crate::serve::q5_deepseek::requirements::describe(
+                    crate::serve::q5_deepseek::packet::Phase::Shutdown,
+                ),
+            };
+            crate::serve::q5_deepseek::receipt::encode(
+                &record,
+                crate::serve::q5_deepseek::manifest::MAX_JSON_BYTES,
+            )?
+        }; // IO happens OUTSIDE all metadata/native locks.
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(b"Q5_DEEPSEEK_COLLECTOR_TERMINAL ")?;
+        stderr.write_all(&bytes)?;
+        stderr.write_all(b"\n")?;
+        Ok(())
     }
 }

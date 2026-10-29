@@ -111,3 +111,58 @@ fn require_field(expected: Option<&CacheBufferPlan>, actual: Option<&MlxBuffer>)
         _ => anyhow::bail!("Q5 cache/anchor Present/Absent differs from actual plan"),
     }
 }
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct Q5CacheState {
+    pub kind: &'static str,
+    pub capacity: usize,
+    pub position: usize,
+    pub planned_requested_bytes: u64,
+    pub poisoned: Option<bool>,
+    pub graft_slots: Option<usize>,
+    pub compression_ratios: Vec<u32>,
+}
+impl Deepseek4Cache {
+    pub(crate) fn q5_state(&self) -> Result<Q5CacheState> {
+        ensure!(
+            self.plan.layers.len() <= 64,
+            "Q5 selected layer metadata bound"
+        );
+        Ok(Q5CacheState {
+            kind: "primary",
+            capacity: self.plan.context_length,
+            position: self.next_position,
+            planned_requested_bytes: self.plan.resident_bytes,
+            poisoned: Some(self.poisoned),
+            graft_slots: Some(self.graft_slots),
+            compression_ratios: self
+                .plan
+                .layers
+                .iter()
+                .map(|layer| layer.compress_ratio)
+                .collect(),
+        })
+    }
+}
+impl Deepseek4CacheSnapshot {
+    pub(crate) fn q5_state(&self) -> Result<Q5CacheState> {
+        ensure!(
+            self.plan.layers.len() <= 64,
+            "Q5 selected anchor layer metadata bound"
+        );
+        Ok(Q5CacheState {
+            kind: "independent_compact_anchor",
+            capacity: self.plan.context_length,
+            position: self.next_position,
+            planned_requested_bytes: self.resident_bytes,
+            poisoned: None,
+            graft_slots: None,
+            compression_ratios: self
+                .plan
+                .layers
+                .iter()
+                .map(|layer| layer.compress_ratio)
+                .collect(),
+        })
+    }
+}

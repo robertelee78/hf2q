@@ -1,8 +1,10 @@
 //! Connected ADR-063 selected DeepSeek diagnostic entry, default off.
 //! This first slice deliberately cannot mint a model-load permit.
 pub(crate) mod collector;
+pub(crate) mod manifest;
 mod packet;
 mod page_observer;
+mod receipt;
 mod requirements;
 #[cfg(test)]
 mod tests;
@@ -124,10 +126,10 @@ fn enter<T>(
     let compiled_source = option_env!("HF2Q_BUILD_GIT_SHA").unwrap_or("Unknown");
     let compiled_native_pin = env!("HF2Q_MLX_NATIVE_VERSION");
     let pid = std::process::id();
-    reject_preload(packet).with_context(|| format!("Q5 same-FD header observation (events,checked_results,checkpoint_roots,retained_fd)={observed_header_metadata:?}; compiled_metadata_source={compiled_source}; compiled_native_pin={compiled_native_pin}; pid={pid}; declared_hashes_unverified; not runtime coverage"))
+    reject_preload(packet, receipt::HeaderPlan::actual(&gguf)).with_context(|| format!("Q5 same-FD header observation (events,checked_results,checkpoint_roots,retained_fd)={observed_header_metadata:?}; compiled_metadata_source={compiled_source}; compiled_native_pin={compiled_native_pin}; pid={pid}; declared_hashes_unverified; not runtime coverage"))
 }
 
-fn reject_preload<T>(packet: &Packet) -> Result<T> {
+fn reject_preload<T>(packet: &Packet, actual_header_plan: receipt::HeaderPlan) -> Result<T> {
     // Fixed retained coalesced envelope. No lower caller-provided estimate,
     // Available/Cached estimate or desired weight-window policy can replace it.
     let requested = 120_783_134_084_u64;
@@ -143,5 +145,26 @@ fn reject_preload<T>(packet: &Packet) -> Result<T> {
         .require_runtime_support()
         .err()
         .context("Q5 unavailable observer unexpectedly claimed support")?;
-    anyhow::bail!("Q5 RejectedPreload: retained_coalesced_upper_bytes={upper}; required={missing:?}; root_domains={root_domains:?};         {unavailable}; external_identity_and_operating_review=Unverified;         private_permit=NotMinted; model_loaded=false; physical_credit=false")
+    let record = receipt::PreloadReceipt {
+        schema: "hf2q.q5.deepseek.preload-receipt.v1",
+        verdict: "RejectedPreload",
+        model_loaded: false,
+        runtime_qualified: false,
+        physical_credit: false,
+        retained_coalesced_upper_bytes: upper,
+        source_native_binary_refs: [
+            &packet.hf_source_sha256,
+            &packet.native_package_sha256,
+            &packet.binary_sha256,
+        ],
+        reference_authority: "CallerDeclared_Unverified_NoPermit",
+        native_page_observer: "UnavailableUntilPublishedPin",
+        actual_header_plan,
+        required_root_domains: root_domains,
+    };
+    let json =
+        String::from_utf8(receipt::encode(&record, 65_536)?).context("Q5 receipt encoding")?;
+    anyhow::bail!(
+        "Q5 RejectedPreload: {json}; required={missing:?}; {unavailable}; private_permit=NotMinted"
+    )
 }

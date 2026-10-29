@@ -452,3 +452,24 @@ fn actual_lifecycle_cannot_overlap_request_or_publish_pending_results() {
     collector::command(id, 0, None);
     assert!(collector::lifecycle_finish(collector::Lifecycle::Warmup, true).is_err());
 }
+
+#[test]
+fn actual_bounded_receipt_refuses_overflow_and_manifest_is_write_once() {
+    assert_eq!(super::receipt::encode(&"x", 3).unwrap(), b"\"x\"");
+    assert!(super::receipt::encode(&"xx", 3).is_err());
+    let mut record = super::manifest::CurrentManifest::new(1, 1, &[(0, 0, 1)], None).unwrap();
+    record.field("actual.optional", None).unwrap();
+    assert!(record.field("actual.optional", None).is_err());
+    record.close().unwrap();
+    assert!(record.field("late", None).is_err());
+    assert!(record.close().is_err());
+}
+
+#[test]
+fn actual_unbalanced_swap_refuses_owner_publication() {
+    let _scope = collector::HeaderScope::enter().unwrap();
+    collector::owner_begin(0, 0, 1).unwrap();
+    collector::mounted_begin(1).unwrap();
+    collector::mounted_end().unwrap();
+    assert!(collector::owner_finish(0, 0, 1).is_err());
+}

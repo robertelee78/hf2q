@@ -597,6 +597,7 @@ impl Deepseek4Session {
             &mut self.request_anchor_transaction_active,
             &mut loaded.request_anchor_transaction_active,
         );
+        q5_observation::mounted_pair(self,loaded);
     }
 }
 
