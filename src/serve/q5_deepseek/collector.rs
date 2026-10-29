@@ -37,6 +37,8 @@ pub(super) struct Collector {
     // Actual model-held weight parents survive observational checkpoint reset.
     weights: BTreeMap<usize, Root>,
     source: Option<Source>,
+    native_domain: native_domain::NativeDomain,
+    page_observations: BTreeMap<usize, super::page_observer::RootObservation>,
     events: u64,
     completed_results: u64,
     transient_observations: [(u64, u64); 4],
@@ -144,6 +146,8 @@ impl Collector {
 }
 
 mod context;
+mod coverage;
+mod native_domain;
 mod observations;
 pub(crate) use context::{Handle, Scope};
 pub(crate) use observations::{
@@ -340,84 +344,9 @@ pub(super) fn attach_source(
         Ok(())
     })
 }
-pub(crate) fn weight(
-    gguf: &mlx_native::gguf::GgufFile,
-    name: &str,
-    buffer: &MlxBuffer,
-) -> Result<()> {
-    with_current(|c| {
-        let source = c
-            .source
-            .as_ref()
-            .context("Q5 weight missing actual SameFD owner")?;
-        source.expected.matches(&source.file.metadata()?)?;
-        ensure!(
-            source.tensor_data_offset == gguf.tensor_data_offset(),
-            "Q5 loader tensor offset drift"
-        );
-        let info = gguf.tensor_info(name).context("Q5 actual tensor missing")?;
-        let logical = source
-            .tensor_data_offset
-            .checked_add(info.offset)
-            .context("Q5 file offset overflow")?;
-        ensure!(
-            logical
-                .checked_add(info.byte_len as u64)
-                .is_some_and(|end| end <= source.expected.bytes),
-            "Q5 tensor escapes SameFD extent"
-        );
-        let b = buffer.backing_snapshot()?;
-        let file_span = match b.provenance {
-            mlx_native::BufferProvenance::NoCopy => {
-                let n = b
-                    .no_copy
-                    .context("Q5 NoCopy missing actual mapping range")?;
-                let within = n
-                    .registered_base_address
-                    .checked_sub(n.mapping_base_address)
-                    .context("Q5 NoCopy range order")?;
-                let registered = logical
-                    .checked_sub(b.view_byte_offset)
-                    .context("Q5 registered offset underflow")?;
-                let mapping = registered
-                    .checked_sub(within as u64)
-                    .context("Q5 mapping offset underflow")?;
-                ensure!(
-                    b.logical_bytes == info.byte_len
-                        && n.registered_bytes == b.metal_root_bytes
-                        && mapping
-                            .checked_add(n.mapping_bytes as u64)
-                            .is_some_and(|end| end <= source.expected.bytes),
-                    "Q5 actual mapped span mismatch"
-                );
-                Some((
-                    source.expected.device,
-                    source.expected.inode,
-                    registered,
-                    n.registered_bytes as u64,
-                    mapping,
-                    n.mapping_bytes as u64,
-                ))
-            }
-            mlx_native::BufferProvenance::Owned => None,
-            _ => anyhow::bail!("Q5 Unknown weight provenance"),
-        };
-        source.expected.matches(&source.file.metadata()?)?;
-        c.buffer(Some(Domain::Weight), name, buffer)?;
-        if let RootOriginSnapshot::KnownNative { id, .. } = b.origin {
-            let root = c
-                .weights
-                .get_mut(&id)
-                .context("Q5 actual weight root census missing")?;
-            ensure!(
-                root.file_span.is_none() || root.file_span == file_span,
-                "Q5 one root changed actual SameFD span"
-            );
-            root.file_span = file_span;
-        }
-        Ok(())
-    })
-}
+mod weight_observation;
+pub(crate) use weight_observation::weight;
+
 pub(crate) fn pools(snapshots: [mlx_native::PoolMemorySnapshot; 3]) -> Result<()> {
     with_current(|c| {
         ensure!(!c.poisoned, "Q5 pool callback health");
@@ -499,5 +428,22 @@ pub(crate) fn source_unchanged() -> Result<()> {
             .as_ref()
             .context("Q5 model observation has no actual SameFD owner")?;
         source.expected.matches(&source.file.metadata()?)
+    })
+}
+
+#[cfg(test)]
+pub(crate) use native_domain::bind_actual_for_tiny;
+#[cfg(test)]
+pub(crate) fn capture_native_for_tiny() -> Result<()> {
+    with_current(|c| {
+        c.native_domain.capture();
+        ensure!(
+            matches!(
+                c.native_domain.latest,
+                native_domain::Snapshot::CapturedRequestedNotPhysical { .. }
+            ),
+            "actual tiny native requested authority unavailable"
+        );
+        Ok(())
     })
 }

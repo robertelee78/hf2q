@@ -430,6 +430,27 @@ mod tests {
     }
 
     #[test]
+    fn actual_same_header_collector_projection_is_strict_and_plan_matches() {
+        let (_dir, header) = open_fixture(&official_metadata());
+        let actual = crate::serve::q5_deepseek::actual_header_plan_control(&header).unwrap();
+        let cfg = Deepseek4Config::from_gguf(&header).unwrap();
+        let expected = super::super::cache::Deepseek4CachePlan::for_context(&cfg, 262_144).unwrap();
+        assert_eq!(actual, (43, expected.resident_bytes));
+        let mut missing = official_metadata();
+        missing.retain(|(key, _)| key != "deepseek4.attention.key_length");
+        let (_dir, header) = open_fixture(&missing);
+        assert!(crate::serve::q5_deepseek::actual_header_plan_control(&header).is_err());
+        let mut invalid = official_metadata();
+        for (key, value) in &mut invalid {
+            if key == "deepseek4.block_count" {
+                *value = MetaValue::U32(65);
+            }
+        }
+        let (_dir, header) = open_fixture(&invalid);
+        assert!(crate::serve::q5_deepseek::actual_header_plan_control(&header).is_err());
+    }
+
+    #[test]
     fn parses_official_0731_contract() {
         let (_dir, gguf) = open_fixture(&official_metadata());
         let config = Deepseek4Config::from_gguf(&gguf).unwrap();

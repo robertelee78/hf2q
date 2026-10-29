@@ -158,7 +158,7 @@ fn reject_preload<T>(packet: &Packet, actual_header_plan: receipt::HeaderPlan) -
             &packet.binary_sha256,
         ],
         reference_authority: "CallerDeclared_Unverified_NoPermit",
-        native_page_observer: "UnavailableUntilPublishedPin",
+        native_page_observer: "Public14Available_NoWholeDomainPermit",
         actual_header_plan,
         required_root_domains: root_domains,
     };
@@ -167,4 +167,16 @@ fn reject_preload<T>(packet: &Packet, actual_header_plan: receipt::HeaderPlan) -
     anyhow::bail!(
         "Q5 RejectedPreload: {json}; required={missing:?}; {unavailable}; private_permit=NotMinted"
     )
+}
+
+#[cfg(test)]
+pub(crate) fn actual_header_plan_control(header: &GgufFile) -> Result<(u32, u64)> {
+    match receipt::HeaderPlan::actual(header) {
+        receipt::HeaderPlan::Parsed {
+            layers,
+            one_cache_requested_bytes,
+            ..
+        } => Ok((layers, one_cache_requested_bytes)),
+        receipt::HeaderPlan::Unknown { reason } => anyhow::bail!(reason),
+    }
 }

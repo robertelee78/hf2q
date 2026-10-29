@@ -67,6 +67,8 @@ impl Scope {
                 roots: BTreeMap::new(),
                 weights: BTreeMap::new(),
                 source: None,
+                native_domain: super::native_domain::NativeDomain::default(),
+                page_observations: BTreeMap::new(),
                 events: 0,
                 completed_results: 0,
                 transient_observations: [(0, 0); 4],
@@ -199,7 +201,10 @@ struct TerminalReceipt<'a> {
     compiled_source: Option<&'static str>,
     compiled_native_pin: &'static str,
     process_uuid_authority: &'static str,
-    native_whole_live_pending: &'static str,
+    native_whole_live_pending: &'a super::native_domain::Snapshot,
+    bounded_page_metadata_full_charge:
+        &'a BTreeMap<usize, crate::serve::q5_deepseek::page_observer::RootObservation>,
+    unqueried_roots_full_charge: usize,
     model_still_retained: bool,
     source_fd_unchanged: Option<bool>,
     observation_failed: bool,
@@ -212,6 +217,7 @@ struct TerminalReceipt<'a> {
     current_borrowed_role_manifest:
         &'a Option<crate::serve::q5_deepseek::manifest::CurrentManifest>,
     last_mounted_pair_partial: &'a Option<crate::serve::q5_deepseek::manifest::CurrentManifest>,
+    weight_source_coverage: super::coverage::Coverage,
     weight_parent_observations: &'a std::collections::BTreeMap<usize, super::Root>,
     pools_current_retained_if_observed: Option<&'a [(usize, usize); 3]>,
     pool_observed_highwater_not_lifetime: Option<&'a [usize; 3]>,
@@ -224,11 +230,12 @@ impl Handle {
             "Q5 duplicate terminal receipt"
         );
         let bytes = {
-            let state = self
+            let mut state = self
                 .0
                 .state
                 .try_lock()
                 .map_err(|_| anyhow::anyhow!("Q5 terminal state unavailable"))?;
+            state.native_domain.capture();
             let source_unchanged = state.source.as_ref().map(|source| {
                 source
                     .file
@@ -262,7 +269,12 @@ impl Handle {
                 compiled_source: option_env!("HF2Q_BUILD_GIT_SHA"),
                 compiled_native_pin: env!("HF2Q_MLX_NATIVE_VERSION"),
                 process_uuid_authority: "ExternalExactJoinRequired",
-                native_whole_live_pending: "Unavailable_NoSubstituteFromRoleObservations",
+                native_whole_live_pending: &state.native_domain.latest,
+                bounded_page_metadata_full_charge: &state.page_observations,
+                unqueried_roots_full_charge: state
+                    .weights
+                    .len()
+                    .saturating_sub(state.page_observations.len()),
                 model_still_retained: true,
                 source_fd_unchanged: source_unchanged,
                 observation_failed: failed,
@@ -274,6 +286,7 @@ impl Handle {
                 transient_observations_not_unique_live_or_peak: &state.transient_observations,
                 current_borrowed_role_manifest: &state.manifest,
                 last_mounted_pair_partial: &state.mounted_pair,
+                weight_source_coverage: super::coverage::actual(&state)?,
                 weight_parent_observations: &state.weights,
                 pools_current_retained_if_observed: (state.pool_observations > 0)
                     .then_some(&state.pool_latest),

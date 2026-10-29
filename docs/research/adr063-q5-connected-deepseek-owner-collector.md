@@ -237,3 +237,44 @@ can retain five normal caches. This source does not assume the reuse predicate o
 lower the five-cache conservative admission bound. A future tighter packet must
 prove reuse and reject before fallback allocation. File-backed requested bytes,
 file interval union and physical charge remain separate; no guessed deduplication.
+
+## Published14 bounded provider source slice (unexecuted)
+
+The published14 APIs now supply actual bounded NoCopy root page metadata in the
+real SameFD weight callback, paired with an ephemeral readonly mmap from the
+retained FD at the verified registered file offset. No raw descriptor address is
+mapped or dereferenced. Both observations retain full requested charge. At most
+four distinct roots are attempted, at most64 pages per query and250ms per native
+query; this is explicitly partial coverage, never whole-file absence. Native
+limits refuse stale/unknown/partial results. Owned roots, changedFD, overlap or
+query errors retain Unknown/full charge. All unqueried roots remain fully charged.
+The alias is dropped before returning; no persistent observer mapping is retained.
+RootID/requestedbytes/fileinterval association comes from actual source callbacks.
+
+Finite added work: at most8 native queries (2 seconds accepted query-time total;
+OS calls are not interruptible and their total latency is NOT certified). At most
+4*128*i32=2048 raw-disposition bytes, plus bounded record strings. One alias at a
+time, at most64*65536=4MiB virtual file range (typical16KiB pages gives1MiB); its
+PTE/driver/OS effects remain unqualified, with no physical credit. Source metadata
+FD clones are transient. File interval union uses at most16384 actual parent
+spans (<256KiB payload) and preserves FULL requested bytes separately; it does not
+identify PFNs or deduplicate physical charge. Rounded spans outside EOF refuse
+coverage rather than infer a shared physical tail.
+
+Actual whole-native requested/live capture requires the real early public handle.
+The connected context has a typed unavailable state by default; no process-global
+getter, borrowed root census or pool sum substitutes for that authority. The
+already finite ignored122root tiny control now installs the same requested/live
+ceilings, binds that real handle and checks an actual snapshot without GPU commands.
+Production cannot bind an invented early handle, so positive runtime admission is
+still refused. The real strict-header projection now has a hosted positive using
+the existing official0731 GGUF fixture and missing-field/layer-bound negatives.
+Pure tests exercise the actual page-result gate and actual file-union overflow /
+overlap handling. Author execution: none. No default loader/cache/math changes.
+
+Remaining connected positive dependencies: reviewed early creation-history/live
+limits and installation at the admitted pre-Device boundary; exact whole-domain
+partition or conservative residual; certified fullresident CPU/channel/OS/reaction
+upper and external process/source/binary/workload bindings; actual low-memory
+reaction/cleanup qualification. A reclaim window remains a separately measured
+memory mechanism, never an assumed latency win. Current125.613GiB rejection stays.

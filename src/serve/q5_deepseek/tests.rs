@@ -66,7 +66,14 @@ fn future_phase_never_borrows_preload_requirements() {
 fn planned_and_unknown_cannot_mint_permit_or_reduce_old_upper() {
     let mut p = packet();
     p.validate().unwrap();
-    let message = reject_preload::<()>(&p, receipt::HeaderPlan::Unknown { reason: "HostControlWithoutActualHeader" }).unwrap_err().to_string();
+    let message = reject_preload::<()>(
+        &p,
+        super::receipt::HeaderPlan::Unknown {
+            reason: "HostControlWithoutActualHeader",
+        },
+    )
+    .unwrap_err()
+    .to_string();
     assert!(message.contains("134877044100"));
     assert!(message.contains("private_permit=NotMinted"));
     p.cells.insert(
@@ -75,12 +82,23 @@ fn planned_and_unknown_cannot_mint_permit_or_reduce_old_upper() {
             reason: "stale actual observation".into(),
         },
     );
-    assert!(reject_preload::<()>(&p, receipt::HeaderPlan::Unknown { reason: "HostControlWithoutActualHeader" }).is_err());
+    assert!(reject_preload::<()>(
+        &p,
+        super::receipt::HeaderPlan::Unknown {
+            reason: "HostControlWithoutActualHeader"
+        }
+    )
+    .is_err());
     p.collector_upper_bytes = u64::MAX;
-    assert!(reject_preload::<()>(&p, receipt::HeaderPlan::Unknown { reason: "HostControlWithoutActualHeader" })
-        .unwrap_err()
-        .to_string()
-        .contains("overflow"));
+    assert!(reject_preload::<()>(
+        &p,
+        super::receipt::HeaderPlan::Unknown {
+            reason: "HostControlWithoutActualHeader"
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("overflow"));
 }
 
 #[test]

@@ -3,6 +3,7 @@ use super::{with_current, Lifecycle};
 use anyhow::{ensure, Context, Result};
 pub(crate) fn snapshot_begin(gpu_registry_id: u64) -> Result<()> {
     with_current(|c| {
+        c.native_domain.capture();
         ensure!(
             !c.poisoned && c.manifest.as_ref().is_none_or(|m| m.end_ns.is_some()),
             "Q5 snapshot overlap/health"

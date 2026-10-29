@@ -24,13 +24,19 @@ fn actual_five_retained_caches_eight_anchors_join_same_collector() {
     assert!(BYTES + ROOTS * 65536 + 1024 * 1024 < 32 * 1024 * 1024);
     let plan = Deepseek4CachePlan::for_context(&tiny_config(), 256).unwrap();
     assert_eq!(plan.resident_bytes, 1_083_392);
-    let authority = NativeRootAuthority::install_early(RootCreationLimits {
-        max_attempted_requested_bytes: BYTES,
-        max_root_attempts: ROOTS,
-        max_raw_constructor_attempts: ROOTS,
-        max_registered_devices: 1,
-        max_rope_cache_entries: 1,
-    })
+    let authority = NativeRootAuthority::install_early_with_live(
+        RootCreationLimits {
+            max_attempted_requested_bytes: BYTES,
+            max_root_attempts: ROOTS,
+            max_raw_constructor_attempts: ROOTS,
+            max_registered_devices: 1,
+            max_rope_cache_entries: 1,
+        },
+        mlx_native::LiveRootLimits {
+            max_live_and_pending_requested_bytes: BYTES,
+            max_live_and_pending_roots: ROOTS,
+        },
+    )
     .unwrap();
     let before = (
         mlx_native::dispatch_count(),
@@ -40,6 +46,7 @@ fn actual_five_retained_caches_eight_anchors_join_same_collector() {
     let device = MlxDevice::new().expect("actual Metal required; no skip");
     authority.register_device(&device).unwrap();
     let _scope = collector::HeaderScope::enter().unwrap();
+    collector::bind_actual_for_tiny(authority).unwrap();
     let caches = (0..5)
         .map(|_| Deepseek4Cache::allocate(&plan, device.clone()).unwrap())
         .collect::<Vec<_>>();
@@ -69,6 +76,7 @@ fn actual_five_retained_caches_eight_anchors_join_same_collector() {
         .unwrap();
     assert_eq!(collector::observed_root_totals().unwrap(), (ROOTS, BYTES)); // alias roles do not duplicate parents
 
+    collector::capture_native_for_tiny().unwrap();
     let snapshot = authority.snapshot().unwrap();
     assert_eq!(
         (
