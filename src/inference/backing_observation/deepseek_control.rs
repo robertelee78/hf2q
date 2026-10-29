@@ -29,7 +29,7 @@ fn role<'a>(r:&'a DeepseekCacheRoles,suffix:&str)->&'a RoleSnapshot {
     r.fields.iter().find(|f|f.field.ends_with(suffix)).unwrap().buffer.as_ref().unwrap()
 }
 #[test]
-fn actual_DS_plan_matches_finite_three_ratio_payload_ledger() {
+fn actual_ds_plan_matches_finite_three_ratio_payload_ledger() {
     let plan=Deepseek4CachePlan::for_context(&tiny_config(),256).unwrap();
     assert_eq!(plan.layers.iter().map(|l|l.resident_bytes).collect::<Vec<_>>(),vec![131072,294912,657408]);
     assert_eq!(plan.resident_bytes,1_083_392);
