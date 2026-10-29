@@ -12,6 +12,11 @@ pub(crate) enum Domain {
     SubmissionInput,
     Persistent,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lifecycle {
+    Provision,
+    Warmup,
+}
 #[derive(Debug)]
 struct Root {
     bytes: usize,
@@ -41,6 +46,7 @@ pub(super) struct Collector {
     poisoned: bool,
     owner: Option<Vec<(u64, u32, u64)>>,
     completed_owners: [Option<(u64, u64)>; 4],
+    lifecycle: Option<Lifecycle>,
     attached: Option<std::thread::ThreadId>,
     next_chain: u64,
     commands: BTreeMap<(u64, usize), Option<bool>>,
@@ -247,6 +253,7 @@ pub(crate) fn owner_begin_many(keys: &[(u64, u32, u64)]) -> Result<()> {
     with_current(|c| {
         ensure!(
             !c.poisoned
+                && c.lifecycle.is_none()
                 && c.owner.is_none()
                 && c.commands.is_empty()
                 && !keys.is_empty()
@@ -426,4 +433,49 @@ pub(super) fn observed_root_totals() -> Result<(usize, usize)> {
         Ok(())
     })?;
     out.context("Q5 test census missing scope")
+}
+
+pub(crate) fn lifecycle_begin(kind: Lifecycle) -> Result<()> {
+    with_current(|c| {
+        ensure!(
+            !c.poisoned && c.owner.is_none() && c.lifecycle.is_none() && c.commands.is_empty(),
+            "Q5 overlapping lifecycle/pending work"
+        );
+        c.roots.clear(); // observational only, never weights/live/physical refund
+        c.lifecycle = Some(kind);
+        Ok(())
+    })
+}
+pub(crate) fn lifecycle_finish(kind: Lifecycle, healthy: bool) -> Result<()> {
+    with_current(|c| {
+        ensure!(
+            healthy
+                && !c.poisoned
+                && c.owner.is_none()
+                && c.lifecycle == Some(kind)
+                && c.commands.is_empty(),
+            "Q5 lifecycle failed/unjoined"
+        );
+        c.lifecycle = None;
+        Ok(())
+    })
+}
+pub(crate) fn require_lifecycle(kind: Lifecycle) -> Result<()> {
+    with_current(|c| {
+        ensure!(
+            !c.poisoned && c.lifecycle == Some(kind),
+            "Q5 lifecycle authority missing"
+        );
+        Ok(())
+    })
+}
+
+pub(crate) fn source_unchanged() -> Result<()> {
+    with_current(|c| {
+        let source = c
+            .source
+            .as_ref()
+            .context("Q5 model observation has no actual SameFD owner")?;
+        source.expected.matches(&source.file.metadata()?)
+    })
 }

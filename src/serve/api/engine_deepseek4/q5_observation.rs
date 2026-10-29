@@ -5,11 +5,13 @@ use crate::serve::{
     q5_deepseek::collector,
     scheduler::{InflightBatchedScheduler, SlotHandle},
 };
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 
 pub(in crate::serve::api) struct OwnerScope {
     bound: Option<Vec<(SlotHandle, u64)>>,
     cleanup_only: bool,
+    origin: Option<collector::Handle>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl OwnerScope {
     pub(in crate::serve::api) fn begin(
@@ -34,6 +36,8 @@ impl OwnerScope {
             return Ok(Self {
                 bound: None,
                 cleanup_only: false,
+                origin: None,
+                _thread: std::marker::PhantomData,
             });
         }
         let handles = handles.take(5).collect::<Vec<_>>();
@@ -53,6 +57,8 @@ impl OwnerScope {
             return Ok(Self {
                 bound: None,
                 cleanup_only: false,
+                origin: None,
+                _thread: std::marker::PhantomData,
             });
         }
         ensure!(
@@ -79,6 +85,8 @@ impl OwnerScope {
         Ok(Self {
             bound: Some(bound),
             cleanup_only: false,
+            origin: model.q5_context.clone(),
+            _thread: std::marker::PhantomData,
         })
     }
     pub(in crate::serve::api) fn begin_cleanup(
@@ -92,6 +100,8 @@ impl OwnerScope {
             return Ok(Self {
                 bound: None,
                 cleanup_only: true,
+                origin: None,
+                _thread: std::marker::PhantomData,
             });
         }
         ensure!(
@@ -108,6 +118,8 @@ impl OwnerScope {
         Ok(Self {
             bound: Some(vec![(handle, request)]),
             cleanup_only: true,
+            origin: model.q5_context.clone(),
+            _thread: std::marker::PhantomData,
         })
     }
     pub(in crate::serve::api) fn finish(
@@ -118,6 +130,10 @@ impl OwnerScope {
         healthy: bool,
     ) -> Result<()> {
         if let Some(bound) = self.bound {
+            self.origin
+                .as_ref()
+                .context("Q5 operation lost origin context")?
+                .require_current_model(model.q5_context.as_ref())?;
             ensure!(collector::active(), "Q5 actual owning context disappeared");
             if !healthy {
                 return collector::invalidate("actual native/host operation failed");
@@ -142,6 +158,7 @@ impl OwnerScope {
 }
 
 fn snapshot(model: &Deepseek4LoadedModel, sessions: &[Deepseek4Session]) -> Result<()> {
+    collector::source_unchanged()?;
     collector::pools(crate::inference::models::deepseek4::q5_pool_snapshot()?)?;
     visit(
         "loaded",
@@ -199,4 +216,76 @@ fn cleanup_request(scheduler: &InflightBatchedScheduler, handle: SlotHandle) -> 
     }
     scheduler.q5_require_auto_released(handle)?;
     collector::retained_cleanup_request(handle.slot_id.0, handle.generation)
+}
+
+/// Stage all real caches while attached to SAME model metadata context. No
+/// native/physical allowance is deducted for bootstrap transfer or pool clearing.
+pub(in crate::serve::api) fn provision(
+    model: &mut Deepseek4LoadedModel,
+    max_slots: u32,
+) -> Result<()> {
+    let Some(context) = model.q5_context.clone() else {
+        return super::slot_provision::provision(model, max_slots);
+    };
+    ensure!(
+        max_slots == 4,
+        "Q5 selected provision requires four actual logical sessions"
+    );
+    let _attached = if context.is_current() {
+        None
+    } else {
+        Some(context.attach()?)
+    };
+    collector::lifecycle_begin(collector::Lifecycle::Provision)?;
+    snapshot(model, model.slot_sessions.as_deref().unwrap_or(&[]))?;
+    let result = super::slot_provision::provision(model, max_slots);
+    if result.is_ok() {
+        snapshot(model, model.slot_sessions.as_deref().unwrap_or(&[]))?;
+    }
+    let observed = collector::lifecycle_finish(collector::Lifecycle::Provision, result.is_ok());
+    combine_lifecycle(result, observed)
+}
+
+pub(in crate::serve::api) fn warmup(
+    model: &mut Deepseek4LoadedModel,
+    sessions: &[Deepseek4Session],
+    quiescent: bool,
+    supervisor: &crate::serve::api::engine_supervisor::EngineSupervisor,
+) -> Result<()> {
+    if model.q5_context.is_none() {
+        return model.warmup(supervisor);
+    }
+    ensure!(
+        quiescent
+            && sessions.len() == 4
+            && model
+                .q5_context
+                .as_ref()
+                .is_some_and(|context| context.is_current()),
+        "Q5 warmup not quiescent/model-bound"
+    );
+    ensure!(
+        std::env::var("HF2Q_DEEPSEEK_SKIP_WARMUP").as_deref() != Ok("1"),
+        "Q5 selected warmup cannot be skipped"
+    );
+    collector::lifecycle_begin(collector::Lifecycle::Warmup)?;
+    snapshot(model, sessions)?;
+    let result = model.warmup(supervisor);
+    if result.is_ok() {
+        snapshot(model, sessions)?;
+    }
+    let observed = collector::lifecycle_finish(collector::Lifecycle::Warmup, result.is_ok());
+    combine_lifecycle(result, observed)
+}
+
+fn combine_lifecycle(actual: Result<()>, observed: Result<()>) -> Result<()> {
+    match (actual, observed) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(actual), Err(observed)) => Err(actual).map_err(|error| {
+            error.context(format!(
+                "Q5 lifecycle observation also failed: {observed:#}"
+            ))
+        }),
+    }
 }

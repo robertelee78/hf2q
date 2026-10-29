@@ -75,6 +75,7 @@ impl Scope {
                 poisoned: false,
                 owner: None,
                 completed_owners: [None; 4],
+                lifecycle: None,
                 attached: None,
                 next_chain: 1,
                 commands: BTreeMap::new(),
@@ -88,6 +89,13 @@ impl Scope {
     }
 }
 impl Handle {
+    pub(crate) fn require_current_model(&self, model: Option<&Handle>) -> Result<()> {
+        ensure!(
+            model.is_some_and(|model| Arc::ptr_eq(&model.0, &self.0)) && self.is_current(),
+            "Q5 operation/model/originating worker context mismatch"
+        );
+        Ok(())
+    }
     pub(crate) fn is_current(&self) -> bool {
         ACTIVE.with(|slot| {
             slot.try_borrow().is_ok_and(|slot| {
@@ -110,6 +118,7 @@ impl Handle {
                     && !state.poisoned
                     && state.attached.is_none()
                     && state.owner.is_none()
+                    && state.lifecycle.is_none()
                     && state.commands.is_empty(),
                 "Q5 unsafe context transfer"
             );
@@ -157,7 +166,10 @@ impl Drop for Scope {
             *slot = None;
             match self.handle.0.state.try_lock() {
                 Ok(mut state) => {
-                    if state.owner.is_some() || !state.commands.is_empty() {
+                    if state.owner.is_some()
+                        || state.lifecycle.is_some()
+                        || !state.commands.is_empty()
+                    {
                         state.poisoned = true;
                         self.handle.0.failed.store(true, Ordering::Release);
                     }

@@ -989,6 +989,10 @@ impl Deepseek4LoadedModel {
     /// readiness poison/timeout authority was available, so a startup wedge
     /// could leave the server permanently warming with no bounded failure.
     pub(super) fn warmup(&mut self, supervisor: &EngineSupervisor) -> Result<()> {
+        if let Some(context) = &self.q5_context {
+            anyhow::ensure!(context.is_current(), "Q5 warmup model context not attached");
+            crate::serve::q5_deepseek::collector::require_lifecycle(crate::serve::q5_deepseek::collector::Lifecycle::Warmup)?;
+        }
         if std::env::var("HF2Q_DEEPSEEK_SKIP_WARMUP").as_deref() == Ok("1") {
             return Ok(());
         }
@@ -1014,7 +1018,7 @@ impl Deepseek4LoadedModel {
     }
 
     pub(super) fn provision_slot_sessions(&mut self, max_slots: u32) -> Result<()> {
-        slot_provision::provision(self, max_slots)
+        q5_observation::provision(self, max_slots)
     }
 
     pub(super) fn take_slot_sessions(&mut self) -> Result<Vec<Deepseek4Session>> {

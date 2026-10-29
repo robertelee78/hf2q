@@ -30,7 +30,7 @@ pub(super) fn describe(phase: Phase) -> Vec<(&'static str, &'static str)> {
                 ("load/cpu_staging_and_maximum_dirty_batch", proof),
             ]);
         }
-        Phase::Provision | Phase::Forward | Phase::Drain => {
+        Phase::Provision | Phase::Warmup | Phase::Forward | Phase::Drain => {
             out.extend([
                 ("weights/all_requested_parents_still_retained", proof),
                 ("weights/operating_working_set_and_inactive_residual", proof),
@@ -46,7 +46,7 @@ pub(super) fn describe(phase: Phase) -> Vec<(&'static str, &'static str)> {
     }
     if matches!(
         phase,
-        Phase::Preload | Phase::Provision | Phase::Forward | Phase::Drain
+        Phase::Preload | Phase::Provision | Phase::Warmup | Phase::Forward | Phase::Drain
     ) {
         for owner in [
             "loaded/current",
@@ -62,7 +62,10 @@ pub(super) fn describe(phase: Phase) -> Vec<(&'static str, &'static str)> {
             ("cache/live_logits_and_cursor_poison_graft_state", proof),
         ]);
     }
-    if matches!(phase, Phase::Preload | Phase::Forward | Phase::Drain) {
+    if matches!(
+        phase,
+        Phase::Preload | Phase::Warmup | Phase::Forward | Phase::Drain
+    ) {
         out.extend([
             ("tls/prefill_free_issued_residency_union", proof),
             ("tls/submission_input_free_issued_residency_union", proof),
@@ -74,6 +77,9 @@ pub(super) fn describe(phase: Phase) -> Vec<(&'static str, &'static str)> {
             ),
             ("commands/every_own_Result_and_moe_status", proof),
         ]);
+    }
+    if phase == Phase::Warmup {
+        out.push(("worker/bootstrap_warmup_no_request_id_no_admission", proof));
     }
     if phase != Phase::Preload {
         out.push(("native/creation_attempt_history_NOT_live_peak", proof));

@@ -50,6 +50,7 @@ fn future_phase_never_borrows_preload_requirements() {
     for phase in [
         Phase::Load,
         Phase::Provision,
+        Phase::Warmup,
         Phase::Forward,
         Phase::Drain,
         Phase::Shutdown,
@@ -365,6 +366,7 @@ fn actual_required_domain_registry_keeps_future_plans_out_of_observation_credit(
         Phase::Preload,
         Phase::Load,
         Phase::Provision,
+        Phase::Warmup,
         Phase::Forward,
         Phase::Drain,
         Phase::Shutdown,
@@ -419,4 +421,34 @@ fn actual_all_results_aggregate_exceeds_old_event_cap_without_retaining_history(
         scope.handle().summary().unwrap(),
         (20_000, 10_000, 0, false)
     );
+}
+
+#[test]
+fn actual_operation_context_rejects_another_model_even_with_identical_owner_keys() {
+    let first_scope = collector::HeaderScope::enter().unwrap();
+    let first = first_scope.handle();
+    drop(first_scope);
+    let second_scope = collector::HeaderScope::enter().unwrap();
+    let second = second_scope.handle();
+    collector::owner_begin(0, 0, 1).unwrap();
+    assert!(first.require_current_model(Some(&second)).is_err());
+    assert!(second.require_current_model(Some(&first)).is_err());
+    second.require_current_model(Some(&second)).unwrap();
+    collector::owner_finish(0, 0, 1).unwrap();
+}
+
+#[test]
+fn actual_lifecycle_cannot_overlap_request_or_publish_pending_results() {
+    {
+        let _scope = collector::HeaderScope::enter().unwrap();
+        collector::lifecycle_begin(collector::Lifecycle::Provision).unwrap();
+        collector::require_lifecycle(collector::Lifecycle::Provision).unwrap();
+        assert!(collector::owner_begin(0, 0, 1).is_err());
+        assert!(collector::lifecycle_finish(collector::Lifecycle::Provision, true).is_err());
+    }
+    let _scope = collector::HeaderScope::enter().unwrap();
+    collector::lifecycle_begin(collector::Lifecycle::Warmup).unwrap();
+    let id = collector::chain();
+    collector::command(id, 0, None);
+    assert!(collector::lifecycle_finish(collector::Lifecycle::Warmup, true).is_err());
 }

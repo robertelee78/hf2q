@@ -173,3 +173,30 @@ The current packet identity hashes remain declared/unverified and only the
 coalesced rejected preload schema is accepted syntactically. There is no positive
 runtime permit or physical credit authority. Public native0.15.14 is pending;
 provider remains explicitly Unavailable, no local Cargo patch or private HF Mach.
+
+B8 rolling source closure (provider still Unavailable): actual provision now
+attaches the SAME model metadata context on its constructor thread around the
+existing staging/transfer body; None calls original body directly. Actual worker
+warmup uses the attached SAME context, requires real quiescent pre-admission
+state, rejects selected skip-warmup and observes before/after the existing checked
+warmup. Provision/warmup lifecycle cannot overlap a request or close with pending
+metadata results. No encoder/math/copy/wait changes. Actual source FD metadata is
+checked again at every full model checkpoint. Warmup is a distinct required phase,
+with bootstrap actor and NO invented request ID. Native errors remain in the
+returned error chain alongside observation failure.
+
+Independent B7 feedback is incorporated: per-operation OwnerScope now retains its
+originating metadata handle, is non-Send, and finish verifies exact originating
+handle == actual model handle == current attached worker before closing. Hosted
+actual-helper cross-context/same-owner-keys negative is authored. These guards
+retain only metadata/FD, never buffers. This does not create positive permits.
+
+Remaining after B8: mounted swap/direct promotion/late-delivery observations;
+current role/cursor/CPU manifest and bounded final receipt; actual early native
+creation/live authority and public14 provider AFTER verified pin; exact process
+UUID/source/native/binary/feature/workload/operator binding and independent review;
+full per-phase source/capacity/partition/dirty-batch/CPU/OS/reaction proofs and
+low-memory projected-breach child. Missing future domains remain Unknown/rejected.
+Warmup skip and feature/co-activation intent must ultimately be validated in the
+full preload packet BEFORE Device; current always-refused preload prevents a
+model being loaded merely to discover these unresolved requirements.

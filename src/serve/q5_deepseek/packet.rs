@@ -9,6 +9,7 @@ pub(super) enum Phase {
     Preload,
     Load,
     Provision,
+    Warmup,
     Forward,
     Drain,
     Shutdown,
@@ -161,6 +162,15 @@ impl Packet {
                 "old_new_cache_overlap",
                 "current_committed_pending_anchors",
                 "native_live_coverage",
+            ],
+            Phase::Warmup => &[
+                "actual_bootstrap_loaded_cache",
+                "four_retained_idle_sessions",
+                "real_warmup_every_own_result",
+                "no_admitted_or_queued_work",
+                "native_whole_live_pending",
+                "fresh_os_reaction",
+                "same_fd_identity",
             ],
             Phase::Forward => &[
                 "actual_request_generation_membership",

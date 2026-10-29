@@ -8979,7 +8979,12 @@ fn run_slot_aware_deepseek4(
                     });
                     let _ = reply.send(result);
                 },
-                Request::Warmup { reply } => match model.warmup(&supervisor) {
+                Request::Warmup { reply } => match super::engine_deepseek4::q5_observation::warmup(
+                    &mut model, &sessions,
+                    supervisor.is_healthy() && scheduler.stats().admitted_total == 0
+                        && slots.iter().all(Option::is_none) && pending.is_empty(),
+                    &supervisor,
+                ) {
                     Ok(()) => {
                         let _ = reply.send(Ok(()));
                     }
@@ -9544,6 +9549,10 @@ fn reset_deepseek4_session_for_reply(
     };
     let result = sessions[handle.slot_id.0 as usize].reset();
     if let Err(error) = q5_owner.finish(scheduler, model, sessions, result.is_ok()) {
+        let error = match result {
+            Err(actual) => actual.context(format!("Q5 observation also failed: {error:#}")),
+            Ok(_) => error,
+        };
         return Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
     }
     match result {
@@ -9565,6 +9574,10 @@ fn recover_cancelled_deepseek4_session_for_reply(
     };
     let result = sessions[handle.slot_id.0 as usize].recover_after_cancellation();
     if let Err(error) = q5_owner.finish(scheduler, model, sessions, result.is_ok()) {
+        let error = match result {
+            Err(actual) => actual.context(format!("Q5 observation also failed: {error:#}")),
+            Ok(_) => error,
+        };
         return Err(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
     }
     match result {
@@ -9652,6 +9665,10 @@ fn seed_deepseek4_single(
     };
     sessions[slot_index].swap_with_loaded(model);
     if let Err(error) = q5_owner.finish(scheduler, model, sessions, result.is_ok()) {
+        let error = match result {
+            Err(actual) => actual.context(format!("Q5 observation also failed: {error:#}")),
+            Ok(_) => error,
+        };
         return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
     }
     match result {
@@ -10098,6 +10115,10 @@ fn advance_deepseek4_prefill_quantum(
         supervisor,
     );
     if let Err(error) = q5_owner.finish(scheduler, model, sessions, execution.is_ok()) {
+        let error = match execution {
+            Err(actual) => actual.context(format!("Q5 observation also failed: {error:#}")),
+            Ok(_) => error,
+        };
         let handle = lanes[0].handle;
         reinstall_deepseek4_cooperative_lanes(slots, lanes);
         return (Some(SlotAwareGpuFatal::invariant_handle(handle, error)), false);
@@ -10264,6 +10285,10 @@ fn advance_deepseek4_prefill(
     );
     sessions[slot_index].swap_with_loaded(model);
     if let Err(error) = q5_owner.finish(scheduler, model, sessions, result.is_ok()) {
+        let error = match result {
+            Err(actual) => actual.context(format!("Q5 observation also failed: {error:#}")),
+            Ok(_) => error,
+        };
         return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
     }
     match result {
@@ -10421,6 +10446,10 @@ fn try_decode_batch_deepseek4_cohort(
                 let committed = model.commit_generated_token(token, supervisor);
                 sessions[slot_index].swap_with_loaded(model);
                 if let Err(error) = q5_owner.finish(scheduler, model, sessions, committed.is_ok()) {
+                    let error = match committed {
+                        Err(actual) => actual.context(format!("Q5 observation also failed: {error:#}")),
+                        Ok(_) => error,
+                    };
                     reinstall_deepseek4_decode_cohort_lanes(slots, lanes);
                     return Deepseek4DecodeCohortRun::Handled(Some(SlotAwareGpuFatal::invariant_handle(handle, error)));
                 }
@@ -10448,6 +10477,10 @@ fn try_decode_batch_deepseek4_cohort(
             token_ids, sessions, slot_indices, supervisor,
         );
         if let Err(error) = q5_owner.finish(scheduler, model, sessions, committed.is_ok()) {
+            let error = match committed {
+                Err(actual) => actual.context(format!("Q5 observation also failed: {error:#}")),
+                Ok(_) => error,
+            };
             let handle = lanes[0].handle;
             reinstall_deepseek4_decode_cohort_lanes(slots, lanes);
             return Deepseek4DecodeCohortRun::Handled(Some(SlotAwareGpuFatal::invariant_handle(handle, error)));
@@ -10767,6 +10800,10 @@ fn decode_batch_deepseek4(
             }
             sessions[slot_index].swap_with_loaded(model);
             if let Err(error) = q5_owner.finish(scheduler, model, sessions, tick_error.is_none()) {
+                let error = match tick_error {
+                    Some(actual) => actual.context(format!("Q5 observation also failed: {error:#}")),
+                    None => error,
+                };
                 return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
             }
         }
