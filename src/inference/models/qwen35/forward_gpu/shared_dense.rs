@@ -73,6 +73,13 @@ fn native_rows(rows:&[Row])->crate::inference::native_observation::Input {
 /// Proven GPU-only helper CB: retain exact encoder until the existing row fence.
 pub(crate) fn deferral_active()->bool{retained::active()}
 pub(crate) fn submit_retained(enc:mlx_native::CommandEncoder,label:&'static str)->Result<()> {retained::submit(enc,label)}
+pub(crate) use retained::PlainAsyncBoundary;
+pub(crate) fn defer_plain_aux(boundary:PlainAsyncBoundary,label:&str)->Result<bool>{retained::select_aux(boundary,label)}
+pub(crate) fn submit_plain_aux(enc:mlx_native::CommandEncoder)->Result<()>{retained::submit_aux(enc)}
+
+pub(crate) fn defer_sdpa_aux(head_dim:u32,tq:bool)->Result<bool>{retained::select_sdpa(head_dim,tq)}
+pub(crate) fn submit_sdpa_aux(enc:mlx_native::CommandEncoder)->Result<()>{retained::submit_sdpa(enc)}
+
 /// Reject resets/truncations until the exact active group is fully checked.
 pub(crate) fn require_pool_reset_allowed()->Result<()> {retained::require_reset_allowed()}
 /// Only healthy checked copies may retire a row's temporary helper suffix.
@@ -170,3 +177,10 @@ mod injection_controls {
         assert!(!take_fixture_injection(&armed,0,0));
     }
 }
+
+pub(crate) fn select_ops14_aux(seq:u32,head:u32,tq:bool)->Result<bool>{retained::select_ops14(seq,head,tq)}
+pub(crate) fn may_defer_ops14_aux(selected:bool,dump_enabled:bool)->bool{retained::may_defer_ops14(selected,dump_enabled)}
+pub(crate) fn submit_ops14_aux(enc:mlx_native::CommandEncoder)->Result<()>{retained::submit_ops14(enc)}
+pub(crate) fn complete_waited_ops14_aux()->Result<()>{retained::completed_ops14()}
+
+pub(crate) fn complete_waited_aux(sdpa:bool)->Result<()>{retained::completed_aux(sdpa)}

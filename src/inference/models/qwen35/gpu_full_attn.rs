@@ -5553,7 +5553,18 @@ pub fn apply_sdpa_with_kv_cache(
                 .context("complete source-teacher full-attention decode")?;
         } else {
             if super::forward_gpu::shared_dense::checked_active() {
-        enc.commit_and_wait_labeled("layer.full_attn.sdpa_kv").context("shared ordinary target causal command completion")?;
+                use super::forward_gpu::shared_dense as shared;
+                if shared::defer_sdpa_aux(head_dim,slot.tq.is_some())? {
+                    if !super::dump_bisect::is_enabled(){shared::submit_sdpa_aux(enc)?;}
+                    else {
+                        enc.commit_and_wait_labeled("layer.full_attn.sdpa_kv")
+                            .context("complete SDPA before CPU dump")?;
+                        shared::complete_waited_aux(true)?;
+                    }
+                } else {
+                    enc.commit_and_wait_labeled("layer.full_attn.sdpa_kv")
+                        .context("shared ordinary target causal command completion")?;
+                }
     } else { enc.commit_labeled("layer.full_attn.sdpa_kv"); }
         }
     } else {
@@ -7230,7 +7241,16 @@ pub fn build_gated_attn_layer(
                     .context("complete source-teacher full-attention ops1-4")?;
             } else if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
                 if super::forward_gpu::shared_dense::checked_active() {
-        enc.commit_and_wait_labeled("layer.full_attn.ops1-4").context("shared ordinary target causal command completion")?;
+                    use super::forward_gpu::shared_dense as shared;
+                    let selected=shared::select_ops14_aux(seq_len,head_dim,
+                        kv_cache_slot.as_ref().is_some_and(|slot|slot.tq.is_some()))?;
+                    if shared::may_defer_ops14_aux(selected,super::dump_bisect::is_enabled()) {
+                        shared::submit_ops14_aux(enc)?;
+                    } else {
+                        enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
+                            .context("shared ordinary target causal command completion")?;
+                        if selected {shared::complete_waited_ops14_aux()?;}
+                    }
     } else { enc.commit_labeled("layer.full_attn.ops1-4"); }
             } else {
                 enc.commit_and_wait_labeled("layer.full_attn.ops1-4")

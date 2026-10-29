@@ -234,7 +234,15 @@ impl<'sess> LayerEncoder<'sess> {
     pub(super) fn fence_or_commit(self, label: &str) -> Result<()> {
         match self {
             LayerEncoder::Plain(mut enc) => {
-                if super::forward_gpu::shared_dense::checked_active() {return enc.commit_and_wait_labeled(label).map_err(Into::into);}
+                if super::forward_gpu::shared_dense::checked_active() {
+                    use super::forward_gpu::shared_dense as shared;
+                    if shared::defer_plain_aux(shared::PlainAsyncBoundary::Fence,label)? {
+                        if !super::dump_bisect::is_enabled(){return shared::submit_plain_aux(enc);}
+                        enc.commit_and_wait_labeled(label)?;
+                        return shared::complete_waited_aux(false);
+                    }
+                    return enc.commit_and_wait_labeled(label).map_err(Into::into);
+                }
                 enc.commit_labeled(label);
                 Ok(())
             }
@@ -294,7 +302,11 @@ impl<'sess> LayerEncoder<'sess> {
     pub(super) fn carry_into_next_stage(self, label: &str) -> Result<()> {
         match self {
             LayerEncoder::Plain(mut enc) => {
-                if super::forward_gpu::shared_dense::checked_active() {return enc.commit_and_wait_labeled(label).map_err(Into::into);}
+                if super::forward_gpu::shared_dense::checked_active() {
+                    use super::forward_gpu::shared_dense as shared;
+                    if shared::defer_plain_aux(shared::PlainAsyncBoundary::Carry,label)? {return shared::submit_plain_aux(enc);}
+                    return enc.commit_and_wait_labeled(label).map_err(Into::into);
+                }
                 // env=0 has no session to carry; preserve pre-iter91
                 // per-stage CB termination behavior byte-for-byte.
                 enc.commit_labeled(label);
@@ -365,7 +377,11 @@ impl<'sess> LayerEncoder<'sess> {
     pub(super) fn commit_unlabeled(self) -> Result<()> {
         match self {
             LayerEncoder::Plain(mut enc) => {
-                if super::forward_gpu::shared_dense::checked_active() {return enc.commit_and_wait_labeled("shared ordinary target layer encoder").map_err(Into::into);}
+                if super::forward_gpu::shared_dense::checked_active() {
+                    use super::forward_gpu::shared_dense as shared;
+                    if shared::defer_plain_aux(shared::PlainAsyncBoundary::Unlabeled,"")? {return shared::submit_plain_aux(enc);}
+                    return enc.commit_and_wait_labeled("shared ordinary target layer encoder").map_err(Into::into);
+                }
                 enc.commit();
                 Ok(())
             }
