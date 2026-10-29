@@ -116,3 +116,10 @@ fn join_offsets(root_in_mapping:usize,view_offset:u64,logical_bytes:usize,mappin
 #[cfg(test)] mod tests;
 
 #[cfg(test)] mod qwen_control;
+
+// DeepSeek owns its private compact-anchor field traversal; no Qwen fallback.
+pub use crate::inference::models::deepseek4::cache::backing_roles::{
+    deepseek_cache_roles,deepseek_anchor_roles,deepseek_provided_owner_roles,
+    Presence,FieldRole,DeepseekCacheRoles,ProvidedDeepseekOwners,DeepseekProvidedOwnerRoles,
+};
+#[cfg(test)]mod deepseek_control;

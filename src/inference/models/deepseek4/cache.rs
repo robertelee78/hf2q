@@ -1327,3 +1327,6 @@ fn copy_optional_buffer_prefix(
         _ => Err(CacheError::MigrationBufferMismatch { layer, kind }),
     }
 }
+
+#[cfg(test)]
+pub mod backing_roles;
