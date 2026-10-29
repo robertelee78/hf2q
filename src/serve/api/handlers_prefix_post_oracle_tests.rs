@@ -205,7 +205,12 @@ fn prefix_acceptance_rejects_unstable_cue_and_bad_usage() {
 fn qwen38_n1_exact_prefix_post_oracle() {
     let config_bytes =
         std::fs::read(std::env::var("HF2Q_PREFIX_POST_ORACLE_CONFIG").unwrap()).unwrap();
-    let config: Config = serde_json::from_slice(&config_bytes).unwrap();
+    replay_vectors(&config_bytes, true);
+}
+// Actual postoracle core, shared by the ignored target diagnostic. No write
+// when exporting vectors; every original evidence/render/cache check still runs.
+pub(super) fn replay_vectors(config_bytes:&[u8],write_output:bool)->Vec<Vec<u32>> {
+    let config: Config = serde_json::from_slice(config_bytes).unwrap();
     assert_eq!(config.turns.len(), 7, "all seven archived wires required");
     assert!(matches!(config.server_slots, 1 | 4), "supported slot count");
     assert_eq!(
@@ -247,6 +252,7 @@ fn qwen38_n1_exact_prefix_post_oracle() {
     let registration = registry::find_for_architecture("qwen35").unwrap();
     let mut previous_stable: Option<Vec<u32>> = None;
     let mut observations = Vec::new();
+    let mut full_vectors=Vec::new();
     let mut prior_tools = None;
     let mut prior_kwargs = None;
     let mut prior_thinking = None;
@@ -352,6 +358,7 @@ fn qwen38_n1_exact_prefix_post_oracle() {
         )
         .unwrap_or_else(|reason| panic!("turn {index}: {reason}"));
         observations.push(json!({"turn":index,"request_sha256":hash(&wire),"receipt_sha256":hash(&receipt_bytes),"prompt_tokens":p_tokens.len(),"stable_tokens":s_tokens.len(),"excluded_generation_cue_tokens":p_tokens.len()-s_tokens.len(),"prior_stable_tokens":previous_stable.as_ref().map(Vec::len),"cached_tokens":cached,"prompt_token_ids_sha256":hash(&serde_json::to_vec(&p_tokens).unwrap()),"stable_token_ids_sha256":hash(&serde_json::to_vec(&s_tokens).unwrap()),"rendered_sha256":hash(p.as_bytes()),"enable_thinking":thinking,"resolved_kwargs":kwargs}));
+        full_vectors.push(p_tokens);
         previous_stable = Some(s_tokens);
     }
     assert!(config.output.is_absolute());
@@ -361,6 +368,7 @@ fn qwen38_n1_exact_prefix_post_oracle() {
         "output outside every checkout required"
     );
     let output = json!({"schema":"hf2q.qwen38-n1-prefix-post-oracle.v1","full_prefix_reuse":"PassedExactSevenWireReplay","model_inference_performed":false,"model_qualified":false,"server_slots":config.server_slots,"runtime_vision_projector_loaded":snapshot["active_controls"]["vision_projector"],"config_sha256":hash(&config_bytes),"tokenizer_file_sha256":hash(&tokenizer_bytes),"template_file_sha256":hash(template.as_bytes()),"readiness_sha256":hash(&readiness_bytes),"oracle_source_sha256":hash(include_bytes!("handlers_prefix_post_oracle_tests.rs")),"handler_source_sha256":hash(include_bytes!("handlers.rs")),"renderer_source_sha256":hash(include_bytes!("engine.rs")),"measurement_source_sha256":hash(include_bytes!("measurement.rs")),"observations":observations});
+    if write_output {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
@@ -371,4 +379,6 @@ fn qwen38_n1_exact_prefix_post_oracle() {
     let mut file = options.open(&config.output).unwrap();
     file.write_all(serde_json::to_string_pretty(&output).unwrap().as_bytes())
         .unwrap();
+    }
+    full_vectors
 }

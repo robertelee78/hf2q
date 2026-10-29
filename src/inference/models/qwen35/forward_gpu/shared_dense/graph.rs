@@ -47,6 +47,7 @@ pub(super) fn encode(
         // cursor/cache slice. Never pass these rows as a temporal sequence.
         for (i, row) in rows.iter().enumerate() {
             let row_root_start=roots.len();
+            #[cfg(test)]super::target_timing_hooks::context(layer,row.handle.slot_id.0)?;
             { // All row-local views/encoders die before the legacy reset.
             let _actual_row = native_rows(std::slice::from_ref(row));
             let x = hidden
@@ -128,7 +129,9 @@ pub(super) fn encode(
             enc.blit_copy_bytes(&out, 0, &attention, (i * h * 4) as u64, (h * 4) as u64)?;
             // Drain before the next singleton helper / packed consumer. This
             // deliberate diagnostic boundary is not a performance assertion.
+            #[cfg(test)]let clock=super::target_timing_hooks::start()?;
             enc.commit_and_wait_labeled("s3.singleton_attention_row_copy")?;
+            #[cfg(test)]super::target_timing_hooks::checked("row-copy",&enc,clock,Some((layer,Some(row.handle.slot_id.0))))?;
             retained::after_healthy_fence()?;
             #[cfg(test)]
             fixture_after_checked_attention_copy(layer,i)?;
@@ -184,7 +187,9 @@ pub(super) fn encode(
         hidden =
             build_dense_ffn_layer_gpu_q_into(&mut enc, dev, reg, &input, ffn, Some(&residual))?;
         roots.push(hidden.clone());
+        #[cfg(test)]let clock=super::target_timing_hooks::start()?;
         enc.commit_and_wait_labeled("s3.shared_postattn_RMS_dense_FFN")?;
+        #[cfg(test)]super::target_timing_hooks::checked("shared-FFN",&enc,clock,Some((layer,None)))?;
         retained::after_healthy_fence()?;
         drop(enc);
         map(

@@ -13359,3 +13359,9 @@ pub(super) fn coherent_parity_tool_grammar(
     compile_tool_grammar_for_request(req, &super::schema::ToolChoiceValue::Auto,
         Some(registration), false).map_err(|_| "actual tool grammar compiler refused".to_owned())
 }
+
+// Engine-free shared exact prefix oracle; diagnostic-only, never production.
+#[cfg(test)]
+pub(super) fn target_timing_exact_vectors(raw:&[u8])->Vec<Vec<u32>> {
+    prefix_post_oracle_tests::replay_vectors(raw,false)
+}

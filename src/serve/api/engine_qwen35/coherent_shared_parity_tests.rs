@@ -25,7 +25,7 @@ struct Workload { family: String, lanes: Vec<Vec<u32>>, vocab_size: usize }
 #[derive(Serialize, PartialEq, Eq, Clone)]
 struct Record { shared_arm: bool, key: String, bytes: usize, sha256: String, shape: Vec<usize>, file: String, source_view_shape: Vec<usize>, source_parent_bytes: usize, encoding: String }
 struct Artifacts {
-    output: PathBuf, bytes: u64, records: Vec<Record>,
+    output: PathBuf, bytes: u64, raw_payload:bool, records: Vec<Record>,
     reference: BTreeMap<String, Record>, mismatches: Vec<String>, shared: bool,
     boundaries: BTreeMap<String, Value>, incomparable: Vec<String>, selected: Vec<usize>, audit_skip: Option<usize>, audit_reference: &'static str, audit_checks: Vec<Value>, injection: Option<Value>,
 }
@@ -74,17 +74,17 @@ impl Artifacts {
         }
         let bytes: usize = chunks.iter().map(|x| x.len()).sum();
         self.bytes = self.bytes.checked_add(bytes as u64).context("artifact byte overflow")?;
-        anyhow::ensure!(self.bytes <= PAYLOAD_LIMIT, "4GiB cumulative raw payload cap");
+        anyhow::ensure!(self.bytes <= if self.raw_payload{PAYLOAD_LIMIT}else{256*1024*1024*1024}, "bounded raw-or-digest scan cap");
         let file = format!("{:05}.bin", self.records.len());
-        let mut out = OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.output.join(&file))?;
+        let mut out = if self.raw_payload{Some(OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.output.join(&file))?)}else{None};
         let mut hash = Sha256::new();
         for chunk in chunks {
             if float {
                 anyhow::ensure!(chunk.len() % 4 == 0 && chunk.chunks_exact(4).all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite()), "nonfinite F32 {key}");
             }
-            hash.update(chunk); out.write_all(chunk)?;
+            hash.update(chunk); if let Some(out)=out.as_mut(){out.write_all(chunk)?;}
         }
-        let record = Record { shared_arm:self.shared, encoding:if float { "F32LE" } else if key.contains(".packed/") { "PackedFloatingCacheU8" } else { "Utf8SemanticJson" }.to_owned(), key: key.clone(), source_view_shape:shape.clone(), source_parent_bytes:bytes, shape, bytes, sha256: format!("{:x}", hash.finalize()), file };
+        let record = Record { shared_arm:self.shared, encoding:if float { "F32LE" } else if key.contains(".packed/") { "PackedFloatingCacheU8" } else { "Utf8SemanticJson" }.to_owned(), key: key.clone(), source_view_shape:shape.clone(), source_parent_bytes:bytes, shape, bytes, sha256: format!("{:x}", hash.finalize()), file:if self.raw_payload{file}else{String::new()} };
         if (key.starts_with("tail/") || key.starts_with("next/")) && key.rsplit_once("/owner").and_then(|(_,i)| i.parse::<usize>().ok()).is_some_and(|i| !self.selected.contains(&i)) {
             let (_, suffix) = key.split_once('/').context("phase coordinate")?;
             let before = self.reference.get(&format!("pre/{suffix}")).context("untouched pre coordinate")?;
@@ -94,6 +94,7 @@ impl Artifacts {
             let old = self.reference.get(&key).context("missing scalar coordinate")?;
             if (old.bytes, &old.shape, &old.sha256) != (record.bytes, &record.shape, &record.sha256) { self.mismatches.push(key); }
         } else if !self.shared { anyhow::ensure!(self.reference.insert(key, record.clone()).is_none(), "duplicate scalar coordinate"); }
+        anyhow::ensure!(self.raw_payload||self.records.len()<10000,"bounded digest record count");
         self.records.push(record); Ok(())
     }
     fn buffer(&mut self, key: String, b: &MlxBuffer) -> Result<()> {
@@ -249,7 +250,7 @@ fn qwen38_real_auto_shared_target_preserves_mtp_tail_and_next_decision() -> Resu
         grammar_kind:super::super::engine::GrammarKind::ToolCallBodyAuto,tool_call_policy:ToolCallPolicy::AutoLazyGrammar,
         parallel_tool_calls:request.parallel_tool_calls.unwrap_or(false),..SamplingParams::default() };
     fs::create_dir(&p.output)?; fs::set_permissions(&p.output, fs::Permissions::from_mode(0o700))?;
-    let mut artifacts = Artifacts {output:p.output,bytes:0,records:vec![],reference:BTreeMap::new(),mismatches:vec![],shared:false,boundaries:BTreeMap::new(),incomparable:vec![],selected:vec![],audit_skip:None,audit_reference:"next",audit_checks:vec![],injection:None};
+    let mut artifacts = Artifacts {output:p.output,bytes:0,raw_payload:true,records:vec![],reference:BTreeMap::new(),mismatches:vec![],shared:false,boundaries:BTreeMap::new(),incomparable:vec![],selected:vec![],audit_skip:None,audit_reference:"next",audit_checks:vec![],injection:None};
     let selected = ORDER[..p.width].to_vec();
     artifacts.selected = selected.clone();
     let supervisor = EngineSupervisor::new();
@@ -401,7 +402,7 @@ fn real_cold_leaf_refuses_absent_carry_and_lagging_mtp_before_target() {
 #[test]
 fn actual_artifact_entry_detects_packed_byte_change_and_untouched_mutation() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut a = Artifacts {output:tmp.path().to_owned(),bytes:0,records:vec![],reference:BTreeMap::new(),
+    let mut a = Artifacts {output:tmp.path().to_owned(),bytes:0,raw_payload:true,records:vec![],reference:BTreeMap::new(),
         mismatches:vec![],shared:false,boundaries:BTreeMap::new(),incomparable:vec![],selected:vec![2,0],audit_skip:None,audit_reference:"next",audit_checks:vec![],injection:None};
     a.save("pre/fa0/key.packed/owner1".into(),vec![2],vec![&[1,2]],false).unwrap();
     a.shared = true;
@@ -416,7 +417,7 @@ fn actual_artifact_entry_detects_packed_byte_change_and_untouched_mutation() {
 #[test]
 fn final_cpu_only_audit_uses_retained_next_reference_without_new_payload() {
     let tmp=tempfile::tempdir().unwrap();
-    let mut a=Artifacts{output:tmp.path().to_owned(),bytes:0,records:vec![],reference:BTreeMap::new(),
+    let mut a=Artifacts{output:tmp.path().to_owned(),bytes:0,raw_payload:true,records:vec![],reference:BTreeMap::new(),
         mismatches:vec![],shared:false,boundaries:BTreeMap::new(),incomparable:vec![],selected:vec![2,0],
         audit_skip:None,audit_reference:"next",audit_checks:vec![],injection:None};
     // Exercise the actual pre -> next lifecycle for an untouched owner;
@@ -451,3 +452,6 @@ fn actual_retained_workload_label_is_case_exact() {
     w.family="qwen38".into();
     assert!(require_retained_workload(&w).is_err());
 }
+
+#[path="coherent_shared_parity_tests/target_timing.rs"]
+mod target_timing;

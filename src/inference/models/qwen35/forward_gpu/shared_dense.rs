@@ -5,6 +5,7 @@ use crate::serve::scheduler::SlotHandle;
 use std::{cell::Cell,collections::BTreeSet};
 mod graph;
 mod retained;
+#[cfg(test)]pub(crate) mod target_timing_hooks;
 #[derive(Clone,Debug)]pub(crate) struct Row {pub request:u64,pub handle:SlotHandle,pub position:u32,pub token:u32}
 /// Supplied by the actual owning worker immediately before submission.
 /// `speculative` means an ACTIVE proposal/verifier, NOT an MTP continuation.

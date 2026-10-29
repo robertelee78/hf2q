@@ -116,7 +116,10 @@ pub(super) fn after_healthy_fence() -> Result<()> {
         let mut p = p.try_borrow_mut().context("reentrant retained fence")?;
         let q = p.as_mut().context("retained fence outside scope")?;
         release_after_checks(&mut q.encoders, |enc| {
-            enc.wait_until_completed().map_err(Into::into)
+            #[cfg(test)]let clock=super::target_timing_hooks::start()?;
+            enc.wait_until_completed()?;
+            #[cfg(test)]super::target_timing_hooks::checked("retained-Delta-terminal-check",enc,clock,None)?;
+            Ok(())
         })
         .context("earlier retained helper CB failed despite healthy fence")
     })
