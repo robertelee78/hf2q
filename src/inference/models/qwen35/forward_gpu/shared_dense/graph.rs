@@ -129,6 +129,7 @@ pub(super) fn encode(
             // Drain before the next singleton helper / packed consumer. This
             // deliberate diagnostic boundary is not a performance assertion.
             enc.commit_and_wait_labeled("s3.singleton_attention_row_copy")?;
+            retained::after_healthy_fence()?;
             #[cfg(test)]
             fixture_after_checked_attention_copy(layer,i)?;
             map(
@@ -184,6 +185,7 @@ pub(super) fn encode(
             build_dense_ffn_layer_gpu_q_into(&mut enc, dev, reg, &input, ffn, Some(&residual))?;
         roots.push(hidden.clone());
         enc.commit_and_wait_labeled("s3.shared_postattn_RMS_dense_FFN")?;
+        retained::after_healthy_fence()?;
         drop(enc);
         map(
             &mut maps,

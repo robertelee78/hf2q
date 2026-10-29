@@ -4,6 +4,7 @@ use super::*;
 use crate::serve::scheduler::SlotHandle;
 use std::{cell::Cell,collections::BTreeSet};
 mod graph;
+mod retained;
 #[derive(Clone,Debug)]pub(crate) struct Row {pub request:u64,pub handle:SlotHandle,pub position:u32,pub token:u32}
 /// Supplied by the actual owning worker immediately before submission.
 /// `speculative` means an ACTIVE proposal/verifier, NOT an MTP continuation.
@@ -68,6 +69,9 @@ pub(crate) fn preflight(rows:&[Row],owners:&[Owner],n_seqs:u32,max:u32,vocab:u32
 fn native_rows(rows:&[Row])->crate::inference::native_observation::Input {
     crate::inference::native_observation::ordered_input("qwen35.shared_ordinary.actual_tokens",rows.len(),rows.iter().map(|r|(r.handle.slot_id.0,r.position as usize,1)))
 }
+/// Proven GPU-only helper CB: retain exact encoder until the existing row fence.
+pub(crate) fn deferral_active()->bool{retained::active()}
+pub(crate) fn submit_retained(enc:mlx_native::CommandEncoder,label:&'static str)->Result<()> {retained::submit(enc,label)}
 /// Only healthy checked copies may retire a row's temporary helper suffix.
 fn retire_row_scratch<T>(roots:&mut Vec<T>,start:usize,reset:impl FnOnce()->Result<()>)->Result<()> {
     ensure!(start<=roots.len(),"row-root boundary invalid");roots.truncate(start);reset()
@@ -78,6 +82,7 @@ fn retire_row_scratch<T>(roots:&mut Vec<T>,start:usize,reset:impl FnOnce()->Resu
 /// The owning caller must preserve replies for its existing fatal fanout path.
 pub(crate) fn run(model:&Qwen35Model,cache:&mut HybridKvCache,invocation:&mut Invocation,rows:&[Row],owners:&[Owner])->Result<Output> {
     ensure!(invocation.state==State::Fresh,"one-shot failed/completed invocation cannot revive");
+    retained::require_retained_mode(mlx_native::command_buffer_uses_unretained_references())?;
     preflight(rows,owners,cache.n_seqs,cache.max_seq_len,model.cfg.vocab_size)?;
     ensure!(matches!(model.cfg.variant,super::super::Qwen35Variant::Dense)&&model.cfg.hidden_size==5120&&model.cfg.num_hidden_layers==64&&model.cfg.intermediate_size==Some(17408)&&model.glp.is_none()&&model.token_embd_native.is_some(),"selected native Q38 DenseQ unsteered model only");
     ensure!(cache.tq_kv_active&&!cache.la_capture_active(),"selected TQ8 ordinary operation; not active verifier capture");
@@ -93,6 +98,7 @@ pub(crate) fn run(model:&Qwen35Model,cache:&mut HybridKvCache,invocation:&mut In
     let result=(|| ->Result<Output> {
         let operation=super::super::decode_pool::profile::Operation::enter(model as *const _ as usize)?;
         let _checked=CheckedScope::enter()?;
+        let _retained=retained::GraphDeferralScope::enter()?;
         model.ensure_gpu_cache_primed()?;
         let output=GPU_CACHE.with(|cell| ->Result<Output> {
             let mut borrowed=cell.try_borrow_mut().context("reentrant actual GPU cache")?;let c=borrowed.as_mut().context("unprimed actual cache")?;
@@ -103,6 +109,7 @@ pub(crate) fn run(model:&Qwen35Model,cache:&mut HybridKvCache,invocation:&mut In
             if encoded.is_err(){std::mem::forget(roots);} // Unknown roots retained, no refund/replay.
             encoded
         })?;
+        retained::require_empty()?;
         operation.complete()?; // Required ON24 authority completion, never Drop-quarantine healthy work.
         Ok(output)
     })();

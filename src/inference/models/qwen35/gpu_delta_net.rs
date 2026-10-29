@@ -2938,7 +2938,11 @@ pub fn build_delta_net_layer(
                 .context("complete source-teacher Delta decode")?;
         } else {
             if super::forward_gpu::shared_dense::checked_active() {
-            enc.commit_and_wait_labeled("layer.delta_net.ops1-9").context("shared ordinary target causal command completion")?;
+            if super::forward_gpu::shared_dense::deferral_active() {
+                super::forward_gpu::shared_dense::submit_retained(enc,"layer.delta_net.ops1-9")?;
+            } else {
+                enc.commit_and_wait_labeled("layer.delta_net.ops1-9").context("shared ordinary target causal command completion")?;
+            }
         } else { enc.commit_labeled("layer.delta_net.ops1-9"); }
         }
         output
