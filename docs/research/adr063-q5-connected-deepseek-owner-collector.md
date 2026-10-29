@@ -336,3 +336,26 @@ No additional model/forward/GPU command, physical refund or admission is added.
 The old padded fixture/filter remains distinct and unchanged in geometry; its
 previous operating wrapper MUST NOT silently select this new fixture. Author
 performed no tests/build/probes/model/header/GPU execution for this correction.
+
+
+### Separate EOF-tail actual control
+
+Executed local source `6f0f2a07ecedd73c9415f64affdadd15e96de1a4`, immutable
+release test binary SHA256
+`9c563ed6b239fd2eda7e1baad421876d5bfd2646d4b0c2ca322c4238003da4cd`.
+The separately bound EOF-tail filter passed its actual native mapping/provider
+control: mapped file-byte union 2,097,216; registered page union 2,113,536; two
+roots charged the full 4,210,688 requested bytes, with zero physical credit.
+Both 64-page observation arrays were emitted, and dispatch/commit/sync counters
+remained zero. All 33 focused host controls and 18 wrapper controls passed before
+activation. Runtime 0.931397 seconds, terminal 1.329075 seconds; seven valid
+process samples, zero stderr, exit zero, reaped empty process group and removed
+fixture. Independent artifact review accepted the finite result. Evidence bundle:
+`hf-q5-eof-tail-provider-actual-v1`.
+
+An initial supervisor binding used a string where its authority expected a Path;
+it refused before case creation or child launch. The corrected new copy changed
+only that binding type. The successful case above is the sole actual child
+invocation; no failed native runtime was retried or rescored. The prior padded
+fixture remains separate evidence. Neither tiny result establishes full-model
+ownership, physical fit, model quality, speed, or whole-Q5 qualification.

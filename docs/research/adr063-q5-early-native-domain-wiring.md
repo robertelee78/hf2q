@@ -52,3 +52,27 @@ Compilation and all controls are root-owned and pending. This branch retains
 its seeded dependency state unchanged; no pin/publish/local patch is added.
 Full source-budget/actual bounded15 metadata/geometry/provenance/OS admission
 and whole-model lifecycle remain open gates.
+
+## Composed-source execution evidence (2026-10-29)
+
+Root combined the reviewed eight-path wiring with the independently reviewed
+EOF-tail correction at local source
+`2902c040ddb46ca032df56fb510ef174fb35eeb7`. Locked release test compilation
+passed in 1m14s; 37 focused host controls passed and four hardware controls were
+left ignored. Immutable binary SHA256:
+`2f894c8a4727f672452b25a99d8baebbab576f39898fed91721aa37076509079`.
+
+One separately supervised invocation of the new 64-byte binding test passed in
+0.929668 seconds (terminal checks 1.321956 seconds), with seven valid process
+samples. Its real early authority tracked one registered device and 64 requested
+bytes through worker-context transfer. Duplicate installation was refused and
+poisoned the context, as asserted by the executed test. Counter equality is an
+in-test assertion; raw counter values were not emitted. No model was loaded and
+no GPU command was submitted by this test. Child exit zero, reaped process group
+empty, empty temporary directory. Independent artifact audit accepted this
+finite result. Evidence bundle: `hf-q5-native-binding-actual-v1`.
+
+This does not mint the private source-budget token or qualify model admission.
+The production selected preload route still rejects; the real-model callback
+has not been activated or validated. No source-only future budget or lower
+memory charge is inferred from the tiny test.
