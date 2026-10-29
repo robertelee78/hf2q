@@ -93,8 +93,41 @@ fn validate(vocab: u32, tokens: &[MetadataValue], merges: &[MetadataValue]) -> R
     Ok(total)
 }
 
+fn bounded_config_work(header: &GgufFile) -> Result<bool> {
+    let Some(layers) = header.metadata_u32("deepseek4.block_count") else {
+        return Ok(false);
+    };
+    ensure!((1..=64).contains(&layers), "Q5 config layer work quota");
+    let Some(hidden) = header.metadata_u32("deepseek4.embedding_length") else {
+        return Ok(false);
+    };
+    ensure!(
+        hidden > 0 && hidden <= u32::MAX / 4,
+        "Q5 config hidden multiplication quota"
+    );
+    for key in [
+        "deepseek4.attention.compress_ratios",
+        "deepseek4.swiglu_clamp_exp",
+        "deepseek4.swiglu_clamp_shexp",
+    ] {
+        let Some(MetadataValue::Array(values)) = header.metadata(key) else {
+            return Ok(false);
+        };
+        ensure!(
+            values.len() == layers as usize,
+            "Q5 config array work quota: {key}"
+        );
+    }
+    Ok(true)
+}
+
 pub(super) fn inspect(header: &GgufFile) -> Result<Facts> {
     use crate::inference::models::deepseek4::Deepseek4Model;
+    if !bounded_config_work(header)? {
+        return Ok(Facts::Unknown {
+            reason: "ConfigWorkShapeUnavailable_NoTokenizerEnvelope",
+        });
+    }
     // Header-only refusal controls need not manufacture a valid model config.
     // Unknown is never an admission witness.
     let Ok(cfg) = Deepseek4Model::load_config_only(header) else {
@@ -145,6 +178,51 @@ pub(super) fn inspect(header: &GgufFile) -> Result<Facts> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn header_shape(layers: u32, hidden: u32, array_len: usize) -> GgufFile {
+        use crate::backends::gguf::{types::MetaValue, writer::GgufWriter};
+        use crate::quantize::ggml_quants::GgmlType;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let kv = [
+            ("deepseek4.block_count", MetaValue::U32(layers)),
+            ("deepseek4.embedding_length", MetaValue::U32(hidden)),
+            (
+                "deepseek4.attention.compress_ratios",
+                MetaValue::ArrayU32(vec![0; array_len]),
+            ),
+            (
+                "deepseek4.swiglu_clamp_exp",
+                MetaValue::ArrayF32(vec![10.0; array_len]),
+            ),
+            (
+                "deepseek4.swiglu_clamp_shexp",
+                MetaValue::ArrayF32(vec![10.0; array_len]),
+            ),
+        ];
+        let mut writer = GgufWriter::new(file.reopen().unwrap());
+        writer.write_header(1, kv.len() as u64).unwrap();
+        for (key, value) in kv {
+            writer.write_metadata_kv(key, &value).unwrap();
+        }
+        let tensor = writer
+            .reserve_tensor_info("unused", &[1], GgmlType::F32)
+            .unwrap();
+        writer.pad_to_alignment().unwrap();
+        writer
+            .stream_tensor_payload(tensor, &0f32.to_le_bytes())
+            .unwrap();
+        writer.finalize().unwrap();
+        GgufFile::from_file_with_limits(file.reopen().unwrap(), limits()).unwrap()
+    }
+    #[test]
+    fn actual_inspection_rejects_config_expansion_before_missing_config_fallback() {
+        for (layers, hidden, count) in [(65, 4096, 65), (1, u32::MAX, 1), (1, 4096, 2)] {
+            assert!(inspect(&header_shape(layers, hidden, count)).is_err());
+        }
+        assert!(matches!(
+            inspect(&header_shape(1, 4096, 1)).unwrap(),
+            Facts::Unknown { .. }
+        ));
+    }
     fn s(v: &str) -> MetadataValue {
         MetadataValue::String(v.into())
     }
