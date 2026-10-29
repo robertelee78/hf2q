@@ -80,3 +80,50 @@ installs a distinct GraphDeferralScope only inside actual run. Delta defers
 ONLY when both checked causal scope and graph deferral authority are active.
 Scalar checked_fixture retains its original immediate checked commit. Bounds
 remain one per fence/192 total; no increase masks the missing scalar fence.
+
+
+## Published-native six-trial serving decision (2026-10-29 UTC)
+
+Candidate `b9b0b6a6b36104fdf2ab1fcb4fcfb1055d05952b` used published
+native 0.15.12, release binary SHA256
+`c534de3fc928747ab23555f2a8dc3426b4b881624e266894f93d370170fea3cc`.
+Matched scalar baseline `f34d33791855b49edce11c828b8d5174bc3cea4c`
+used the same published dependency, binary SHA256
+`f4fccc3d9d8dcb43fccaf2c7f6d7f49710377efab61db8269de4c227d913ca1b`.
+Both used canonical four-agent coding inputs, C262144/N4/TQ8/AUTO/ON24,
+temperature 0, repetition penalty 1.05, 8192 maximum output tokens,
+and unchanged tool grammar/settings. Every run completed 28 HTTP requests,
+24 correct tool calls and four correct coding tasks. All four Rust prefix
+post-oracles passed for every run. Sampling streams are own-output continuations;
+their differing output token counts are not token-matched throughput evidence.
+
+The fixed crossover sequence and release-to-task-completion makespans were:
+
+| Arm | Trial | Seconds |
+| --- | --- | ---: |
+| Candidate | C1 | 127.815465 |
+| Scalar | A1 | 129.397703 |
+| Scalar | A2 | 125.817797 |
+| Candidate | C2 | 132.059172 |
+| Candidate | C3 | 130.011151 |
+| Scalar | A3 | 116.770954 |
+
+Candidate median 130.011151 seconds versus scalar median 125.817797 seconds
+is **3.332878% slower**. All six observations remain included. A separate
+C3 preflight held for Fair thermal state before any model load; the fresh
+replacement started Nominal under unchanged guards. Runtime Fair is permitted
+by the existing policy. This is a negative engineering decision, not a complete
+F2/Q3 confidence-qualified comparison or a whole S3 acceptance.
+
+The independently audited width-two diagnostic separately passed full
+output/nextn/cache bit parity on the actual selected inputs. It does not qualify
+widths three/four, serving cancellation, actual command-buffer errors, or speed.
+Final independent six-trial audit SHA256:
+`9c6d69b22b7c60f2ddbb4b540a9ea1ea0f6887c751138c6a7bbf91c3edb82bc9`.
+Durable decision: https://github.com/robertelee78/hf2q/issues/363#issuecomment-6486895390.
+
+**Stop adoption of this candidate as a performance change.** Retain this isolated
+branch as failed-experiment evidence. Do not retune AUTO cost thresholds to hide
+the regression. The next test compares actual normal unchecked and retained
+shared producers on identical cold-prepared state to identify the target/fence
+bottleneck; that diagnostic is not a replacement serving acceptance test.
