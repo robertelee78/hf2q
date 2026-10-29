@@ -3979,6 +3979,7 @@ impl multi_model::EngineConfig {
 }
 
 pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<api::engine::Engine> {
+    q5_deepseek::preflight_engine_config(config)?;
     let _q5_serve_case = q5_deepseek::operating_case::enter_serve(config.engine_mode,config.queue_capacity)?;
     anyhow::ensure!(path.exists(), "Model not found: {}", path.display());
     // Header-only parse surfaces bad magic + populates the diagnostic
@@ -4352,6 +4353,7 @@ pub fn cmd_serve(
     use api::state::ServerConfig;
 
     q5_deepseek::validate_activation()?;
+    q5_deepseek::preflight_serve_args(&args)?;
 
     phase_trace::initialize_early().map_err(|error| anyhow::anyhow!(error))?;
 
@@ -4586,6 +4588,7 @@ pub fn cmd_serve(
         kv_persist_budget_bytes,
     }
     .with_serve_steering(&args));
+    q5_deepseek::preflight_engine_config(&state.engine_config_template)?;
 
     let mut automatic_mmproj = false;
     let human_startup_progress = !args.quiet && matches!(log_format, cli::LogFormat::Text);
@@ -4677,7 +4680,8 @@ pub fn cmd_serve(
         }
     }
 
-    if repository_spec.is_none() && args.mmproj.is_none() {
+    if repository_spec.is_none() && args.mmproj.is_none()
+        && q5_deepseek::allows_automatic_projector()? {
         if let Some(model) = args.model.as_ref() {
             match managed_artifacts::resolve_local_path_projector(model) {
                 Ok(Some(projector)) => {

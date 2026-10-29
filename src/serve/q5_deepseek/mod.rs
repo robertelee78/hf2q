@@ -284,3 +284,115 @@ pub(crate) fn require_prepared_model_load()->Result<()>{
     if selected()?.is_some(){ensure!(operating_case::is_active(),"Q5 direct model load requires the private operating carrier");collector::require_prepared_before_device()?;}
     Ok(())
 }
+
+
+/// Must run before MODEL parsing/resolution or any persistence/projector work.
+pub(crate) fn preflight_serve_args(args: &crate::cli::ServeArgs) -> Result<()> {
+    check_serve_args(selected()?.is_some(), args)
+}
+fn check_serve_args(active: bool, args: &crate::cli::ServeArgs) -> Result<()> {
+    if !active {
+        return Ok(());
+    }
+    ensure!(
+        args.tokenizer.is_none()
+            && args.config.is_none()
+            && args.dwq_overlay.is_none()
+            && args.glp.is_none()
+            && args.glp_alpha.is_none()
+            && args.kv_graft.is_none()
+            && args.embedding_model.is_none()
+            && args.mmproj.is_none()
+            && args.planning.kv_persist_path.is_none()
+            && args.planning.kv_persist_budget.is_none()
+            && args.output.is_none(),
+        "Q5 selected startup preparation option unsupported"
+    );
+    if let Some(target) = args.target.as_deref() {
+        ensure!(
+            matches!(
+                crate::model_spec::parse_model_spec(target)?,
+                crate::model_spec::ModelSpec::Path(_)
+            ),
+            "Q5 selected startup requires local MODEL, not inventory/repository resolution"
+        );
+    } else {
+        let path = args
+            .model
+            .as_deref()
+            .context("Q5 selected startup requires explicit local MODEL")?;
+        ensure!(
+            !matches!(
+                crate::model_spec::parse_model_spec(&path.to_string_lossy())?,
+                crate::model_spec::ModelSpec::Repository(_) | crate::model_spec::ModelSpec::List
+            ),
+            "Q5 selected startup forbids repository/inventory resolution"
+        );
+    }
+    Ok(())
+}
+pub(crate) fn preflight_engine_config(
+    config: &crate::serve::multi_model::EngineConfig,
+) -> Result<()> {
+    if selected()?.is_none() {
+        return Ok(());
+    }
+    ensure!(
+        config.tokenizer_path.is_none()
+            && config.config_path.is_none()
+            && config.dwq_overlay_path.is_none()
+            && config.glp_reference.is_none()
+            && config.glp_alpha.is_none()
+            && config.kv_graft_path.is_none()
+            && config.kv_persist_dir.is_none()
+            && config.kv_persist_budget_bytes == 0,
+        "Q5 selected effective engine preparation options unsupported"
+    );
+    Ok(())
+}
+pub(crate) fn allows_automatic_projector() -> Result<bool> {
+    Ok(selected()?.is_none())
+}
+
+#[cfg(test)]
+mod early_serve_tests {
+    use clap::Parser;
+    fn args() -> crate::cli::ServeArgs {
+        let cli = crate::cli::Cli::try_parse_from([
+            "hf2q",
+            "serve",
+            "--model",
+            "/definitely-missing-q5/model.gguf",
+        ])
+        .unwrap();
+        match cli.command {
+            crate::cli::Command::Serve(args) => args,
+            _ => panic!("serve"),
+        }
+    }
+    #[test]
+    fn unsupported_preparation_refuses_before_missing_model_or_side_effects() {
+        let mut a = args();
+        // Local missing path is NOT opened by this pure early boundary.
+        super::check_serve_args(true, &a).unwrap();
+        for i in 0..9 {
+            match i {
+                0 => a.tokenizer = Some("/missing/tokenizer".into()),
+                1 => a.config = Some("/missing/config".into()),
+                2 => a.dwq_overlay = Some("/missing/dwq".into()),
+                3 => a.glp = Some("/missing/glp".into()),
+                4 => a.kv_graft = Some("/missing/graft".into()),
+                5 => a.embedding_model = Some("/missing/embed".into()),
+                6 => a.mmproj = Some("/missing/projector".into()),
+                7 => a.planning.kv_persist_path = Some("/missing/persist".into()),
+                _ => a.target = Some("other/repository".into()),
+            }
+            let side_effect = std::cell::Cell::new(false);
+            let result = super::check_serve_args(true, &a).map(|_| side_effect.set(true));
+            assert!(result.is_err());
+            assert!(!side_effect.get());
+            super::check_serve_args(false, &a).unwrap();
+            a = args();
+        }
+    }
+}

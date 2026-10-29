@@ -155,3 +155,17 @@ fn actual_review_window_and_closed_case_do_not_accept_a_serialized_permit() {
         .insert("permit".into(), serde_json::json!(true));
     assert!(serde_json::from_value::<Case>(v).is_err());
 }
+
+#[test]
+fn actual_cpu_floor_charges_four_decoded_outputs_and_active_ledgers() {
+    let mut p = policy();
+    p.cpu_bytes = 3 * 1024 * M;
+    p.max_decoded_bytes = p.cpu_bytes;
+    let mut host = os();
+    host.total = 128 * 1024 * M;
+    host.free = 120 * 1024 * M;
+    let error = numeric(p, limits(), minimum(), host, M).unwrap_err();
+    assert!(error.to_string().contains("four decoded strings"));
+    p.cpu_bytes = 13 * 1024 * M;
+    numeric(p, limits(), minimum(), host, M).unwrap();
+}

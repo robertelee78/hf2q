@@ -178,6 +178,39 @@ fn diagnostic_no_evict_conflict_response(plan: AdmissionPlan) -> Response {
     }
 }
 
+// Selected operating cases may use only the actual already-loaded engine.
+// This check precedes resolver callbacks as well as the generic auto-pipeline.
+fn selected_model_name_allowed(requested: &str, actual: &str) -> bool {
+    requested.trim().is_empty() || requested.trim() == actual
+}
+fn selected_request_model(
+    state: &AppState,
+    requested: &str,
+) -> std::result::Result<Option<String>, Response> {
+    if !crate::serve::q5_deepseek::operating_case::is_active() {
+        return Ok(None);
+    }
+    let pool = state
+        .pool
+        .read()
+        .map_err(|_| ApiError::not_ready().into_response())?;
+    let engines = pool.snapshot_engines();
+    // A selected startup has exactly one model. Refuse ambiguity, never select
+    // another pooled engine or resolve a repository alias from request input.
+    if engines.len() != 1 {
+        return Err(ApiError::not_ready().into_response());
+    }
+    let actual = engines[0].engine.model_id();
+    if !selected_model_name_allowed(requested, actual) {
+        return Err(ApiError::invalid_request(
+            "Q5 selected case requires the actual default engine model_id",
+            Some("model".into()),
+        )
+        .into_response());
+    }
+    Ok(Some(actual.to_string()))
+}
+
 async fn resolve_engine_for_request(
     state: &AppState,
     requested_model: &str,
@@ -186,11 +219,14 @@ async fn resolve_engine_for_request(
     // Shared only through resolution + lease acquisition. Generation never
     // holds this gate, so explicit switching can drain without deadlocking.
     let admission_guard = state.model_lifecycle.read_admission().await;
+    let selected_model = selected_request_model(state, requested_model)?;
     // 1. Resolve the lookup key.  Empty / whitespace req.model falls
     //    back to `state.default_model`; if both are empty / unset,
     //    that's a Decision #26 400.
     let trimmed = requested_model.trim();
-    let model_arg: String = if !trimmed.is_empty() {
+    let model_arg: String = if let Some(actual) = selected_model.as_ref() {
+        actual.clone()
+    } else if !trimmed.is_empty() {
         trimmed.to_string()
     } else if let Some(d) = state.default_model.as_deref() {
         d.to_string()
@@ -231,6 +267,9 @@ async fn resolve_engine_for_request(
         // Drop guard before touching auto-pipeline (which acquires
         // the cache mutex).
         drop(pool_guard);
+    }
+    if selected_model.is_some() {
+        return Err(ApiError::not_ready().into_response());
     }
 
     // 3. Run auto-pipeline resolution under the cache lock.  This is the
@@ -1854,7 +1893,8 @@ where
     // the `HotSwapManager` pool: cache hit → reused engine; cache miss
     // → auto-pipeline + admit + return.  Decision #26's 400 fires only
     // when the auto-pipeline cannot resolve the requested name.
-    let resolved_engine = resolver(state, req.model.clone()).await?;
+    let selected_model = selected_request_model(state, &req.model)?;
+    let resolved_engine = resolver(state, selected_model.unwrap_or_else(|| req.model.clone())).await?;
     let loaded_engine = resolved_engine.loaded_engine;
     let model_lease = resolved_engine.model_lease;
     let engine: &Engine = &loaded_engine.engine;
@@ -13348,3 +13388,16 @@ mod qwen38_largest_prompt_tests;
 #[cfg(test)]
 #[path = "handlers_tool_result_capacity_tokens_tests.rs"]
 mod tool_result_capacity_tokens_tests;
+
+#[cfg(test)]
+mod selected_resolver_boundary_tests {
+    #[test]
+    fn actual_default_id_or_unspecified_only_never_repository_autoload() {
+        for requested in ["", "  ", "actual-default", " actual-default "] {
+            assert!(super::selected_model_name_allowed(requested, "actual-default"));
+        }
+        for requested in ["other/model", "/other/model.gguf", "actual-default@q8", "other"] {
+            assert!(!super::selected_model_name_allowed(requested, "actual-default"));
+        }
+    }
+}

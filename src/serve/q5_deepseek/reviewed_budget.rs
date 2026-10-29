@@ -238,10 +238,16 @@ fn numeric(
     let cpu_wire = (l.queue_capacity as u64)
         .checked_mul(262144 * 4)
         .and_then(|x| x.checked_add(u64::from(p.max_http_inflight) * 8 * 1024 * 1024))
-        .context("Q5 queue/ingress bound overflow")?;
+        .and_then(|x| {
+            p.max_decoded_bytes
+                .checked_mul(4)
+                .and_then(|d| x.checked_add(d))
+        })
+        .and_then(|x| x.checked_add(4 * 262144 * 4))
+        .context("Q5 queue/ingress/active decoded and token ledger floor overflow")?;
     ensure!(
         p.cpu_bytes >= cpu_wire,
-        "Q5 CPU allowance below admitted raw prompt/ingress capacities"
+        "Q5 CPU allowance below necessary queue/ingress/four decoded strings/four active token ledgers"
     );
     let charged_native = if p.charge_creation_envelope {
         p.native_attempt_bytes

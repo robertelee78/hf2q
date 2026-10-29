@@ -135,3 +135,26 @@ those, independently review one actual numeric policy, then execute ONE guarded
 real sameFD load→provision→warmup→canonical coding→drain→footer case. A denial is
 a preserved failed case; MayRefuseAtCap is not permission below mandatory source
 capacity. Normal component quality/timing evidence proceeds separately.
+
+
+### V2 source boundary corrections
+
+The necessary CPU floor sums queued prompt ledgers, admitted 8 MiB ingress
+bodies, four simultaneously retained decoded strings at the declared per-slot
+ceiling, and four active C262144 token ledgers. This remains a necessary floor,
+not an allocator, tokenizer, grammar, or JSON heap upper bound. A 3 GiB CPU cell
+with a 3 GiB per-slot decoded ceiling is refused even on an otherwise empty host.
+All selected allowed GET and POST responses retain the same ingress permit
+through body disposal. Selected model resolution accepts only the actual sole
+loaded engine's model_id or an unspecified model, resolved to that ID before
+resolver callbacks. Multiple resident engines and alternate names refuse before
+auto-pipeline, download, or multimodal preparation. The unselected path retains
+its existing resolver and ingress behavior.
+
+Selected startup rejects unsupported tokenizer/config/DWQ/GLP/graft,
+embedding/projector, persistence, output-conversion and nonlocal repository or
+inventory arguments before model resolution or preparation side effects. The
+actual effective EngineConfig is checked before startup preparation and again
+at direct load_engine entry. Automatic projector discovery is outside this
+selected text-only case. Pool quant identity uses the existing selected bounded
+metadata reader; the unselected wrapper still calls its original native parser.

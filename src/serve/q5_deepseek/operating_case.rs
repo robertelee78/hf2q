@@ -271,30 +271,14 @@ pub(crate) async fn ingress(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use axum::{body::Body, http::StatusCode, response::IntoResponse};
-    use futures_util::StreamExt;
+    use axum::{http::StatusCode, response::IntoResponse};
     let Some(r) = ACTIVE.get() else {
         return next.run(req).await;
     };
     if r.failed.load(Ordering::Acquire) {
         return (StatusCode::SERVICE_UNAVAILABLE, "Q5 selected case failed").into_response();
     }
-    if req.method() != axum::http::Method::POST {
-        if req.method() == axum::http::Method::GET
-            && matches!(
-                req.uri().path(),
-                "/health" | "/readyz" | "/metrics" | "/hf2q/v1/runtime" | "/v1/models"
-            )
-        {
-            return next.run(req).await;
-        }
-        return (
-            StatusCode::BAD_REQUEST,
-            "Q5 selected case endpoint unsupported",
-        )
-            .into_response();
-    }
-    if req.uri().path() != "/v1/chat/completions" && req.uri().path() != "/shutdown" {
+    if !allowed_endpoint(req.method(), req.uri().path()) {
         return (
             StatusCode::BAD_REQUEST,
             "Q5 selected case endpoint unsupported",
@@ -312,12 +296,19 @@ pub(crate) async fn ingress(
         }
     };
     let response = next.run(req).await;
+    hold_ingress_response(response, permit)
+}
+fn hold_ingress_response(
+    response: axum::response::Response,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> axum::response::Response {
+    use futures_util::StreamExt;
     let (parts, body) = response.into_parts();
     let stream = body.into_data_stream().map(move |chunk| {
         let _ = &permit;
         chunk
     });
-    axum::response::Response::from_parts(parts, Body::from_stream(stream))
+    axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
 pub(crate) fn decoded_bytes(current: usize, next: usize) -> Result<()> {
@@ -372,4 +363,43 @@ pub(crate) fn before_submit() -> Result<()> {
         super::collector::checked_health()?;
     }
     Ok(())
+}
+
+fn allowed_endpoint(method: &axum::http::Method, path: &str) -> bool {
+    (method == axum::http::Method::GET
+        && matches!(
+            path,
+            "/health" | "/readyz" | "/metrics" | "/hf2q/v1/runtime" | "/v1/models"
+        ))
+        || (method == axum::http::Method::POST
+            && matches!(path, "/v1/chat/completions" | "/shutdown"))
+}
+#[cfg(test)]
+mod ingress_tests {
+    #[test]
+    fn allowed_get_and_post_responses_retain_the_same_capacity_until_drop() {
+        for (method, path) in [
+            (axum::http::Method::GET, "/metrics"),
+            (axum::http::Method::POST, "/v1/chat/completions"),
+        ] {
+            assert!(super::allowed_endpoint(&method, path));
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = semaphore.clone().try_acquire_owned().unwrap();
+            let response = super::hold_ingress_response(
+                axum::response::Response::new(axum::body::Body::from("retained")),
+                permit,
+            );
+            assert!(semaphore.clone().try_acquire_owned().is_err());
+            drop(response);
+            assert!(semaphore.try_acquire_owned().is_ok());
+        }
+        assert!(!super::allowed_endpoint(
+            &axum::http::Method::GET,
+            "/v1/chat/completions"
+        ));
+        assert!(!super::allowed_endpoint(
+            &axum::http::Method::POST,
+            "/v1/models"
+        ));
+    }
 }
