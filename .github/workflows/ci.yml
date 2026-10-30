@@ -195,6 +195,8 @@ jobs:
           cargo test --locked --test lcp_registry_unit --all-features
           cargo test --locked --bin hf2q --all-features operator_ui::tests::
           cargo test --locked --bin hf2q --all-features startup_progress
+          # ADR-063 C1 atomic multi-anchor contract (CPU-only, synthetic state).
+          cargo test --locked --bin hf2q --all-features anchor_c1
           # Pure capacity-fixture guards; real-model metadata exports stay ignored.
           cargo test --locked --bin hf2q --all-features serve::api::handlers::capacity_fixture_source_tests::
           cargo test --locked --bin hf2q --all-features serve::api::handlers::qwen36_largest_prompt_tests::
