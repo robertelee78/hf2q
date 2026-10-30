@@ -193,7 +193,7 @@ decode is available. A pass prints one line per scenario:
 
 ## Verdict
 
-**Isolation holds (2026-10-30, M5 Max 128 GB, source `7158e91e`).** S1
+**Isolation holds (2026-10-30, M5 Max 128 GB, code of commit `cda10718`).** S1
 closes on isolation evidence; the production bypass is retained. The
 successor below is a design only, not implemented by S1.
 
