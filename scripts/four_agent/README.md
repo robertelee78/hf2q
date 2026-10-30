@@ -196,7 +196,25 @@ Default `HF2Q_BIN` and `MODEL` values are repo-relative placeholders; override t
 - `CARGO`, `TOOLCHAIN`, `SANDBOX_PROOF`, `SANDBOX_PROOF_SHA256`: the client sandbox inputs used by the existing runners.
 - `CLIENT_APPROVAL_TEMPLATE`: the family's previous `client-approval.json`, with the same schema, profile, family, `family_controls` and `agent_template`.
 
-The supervisor fills in `server_pid`, `base_url`, `model`, `run_id`, `barrier_token`, `python_sha256` and the twelve client `sources` digests of the current checkout.
+The supervisor fills in `server_pid`, `base_url`, `model`, `run_id`, `barrier_token`, `python_sha256` and the fourteen client `sources` digests of the current checkout.
+
+### Peer arm cases (Q3/Q4)
+
+`q5_cases/peer-deepseek4.json`, `peer-gemma4.json`, `peer-qwen38.json` and `peer-qwen36.json` launch the peer server directly as the four-slot benchmark arm. They use the same GGUF and model id as the hf2q case, and run the client with `--engine-kind peer`. `peer-qwen36.json` reproduces the e86 Qwen3.6 peer run's argv exactly, except for the port.
+- The server argv is the Qwen3.6 peer run's argv (`peer-qwen36-e86-none-normal-n4-20261027T185853Z/server-launch-command.json`): 4 slots, 262144 tokens per slot, flash attention on, f16 K/V, no context shift, greedy sampling, no speculation, and the reviewed family template.
+- `PEER_BIN` defaults to the e86f5fd1 build. Readiness requires `/props` `build_info == PEER_BUILD_INFO`.
+- `family_peer.py` holds the DeepSeek-V4 and Gemma 4 adapters. It translates the canonical request into native peer fields and refuses every other field. It also checks `/props` template sha256, sampling and text-only settings. `test_q5_calibration.py` ties each case's flags to the adapter's `CONTROLS`.
+- **DeepSeek-V4 omits `--kv-unified`.** The peer's DSV4 cache always keeps one stream per sequence. Unified mode would size each stream to the whole 1048576-token pool, about 4× the KV memory (see the case notes).
+- `CLIENT_APPROVAL_TEMPLATE` must carry `engine_kind: "peer"`. For DeepSeek-V4 and Gemma 4 it must also carry `family_controls` equal to `family_peer.CONTROLS[family]` and the peer preflight keys from `family_peer.preflight`.
+- Run each peer case as its own calibration (no `--admission-receipt`), because the binary differs from the hf2q calibration.
+
+```sh
+HF2Q_Q5_MODEL=/abs/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/peer-deepseek4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/peer-deepseek4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/q5-peer-deepseek4-$(date -u +%Y%m%dT%H%M%SZ)"
+```
 
 ### Root commands
 

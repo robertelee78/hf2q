@@ -6,8 +6,8 @@ FAMILIES = ('qwen', 'deepseek4', 'gemma4')
 def validate_selection(family, engine_kind, slots):
     require(family in FAMILIES and engine_kind in ('hf2q', 'peer') and slots in (1, 4),
             'unsupported diagnostic selection')
-    require(engine_kind != 'peer' or (family == 'qwen' and slots == 4),
-            'only Qwen N4 peer is supported; DeepSeek/Gemma peer has no qualified adapter')
+    require(engine_kind != 'peer' or slots == 4,
+            'the peer arm is the four-slot coding workload only')
 
 
 def profile(family, slots):
@@ -45,6 +45,10 @@ def preflight(keys, family):
 def validate_binding(packet, family, slots):
     profile(family, slots)
     require(packet.get('family', 'qwen') == family, 'mixed diagnostic family')
+    if packet.get('engine_kind', 'hf2q') == 'peer' and family != 'qwen':
+        from family_peer import validate_controls
+        validate_controls(packet.get('family_controls'), family)
+        return
     if family == 'gemma4':
         controls = packet.get('family_controls')
         require(isinstance(controls, dict) and

@@ -23,10 +23,11 @@ class FamilyControls(unittest.TestCase):
     def test_only_supported_engine_family_selections_can_reach_work(self):
         for family, engine, slots in [('qwen', 'hf2q', 1), ('qwen', 'hf2q', 4),
                                       ('qwen', 'peer', 4), ('deepseek4', 'hf2q', 1),
-                                      ('deepseek4', 'hf2q', 4)]:
+                                      ('deepseek4', 'hf2q', 4), ('deepseek4', 'peer', 4),
+                                      ('gemma4', 'peer', 4)]:
             validate_selection(family, engine, slots)
-        for family, engine, slots in [('deepseek4', 'peer', 1), ('deepseek4', 'peer', 4),
-                                      ('qwen', 'peer', 1), ('gemma4', 'peer', 4)]:
+        for family, engine, slots in [('deepseek4', 'peer', 1), ('gemma4', 'peer', 1),
+                                      ('qwen', 'peer', 1), ('llama', 'peer', 4)]:
             with self.assertRaises(Invalid): validate_selection(family, engine, slots)
     def test_actual_preflight_composes_family_and_engine_without_forging(self):
         from qwen_n4_peer import preflight as peer_preflight
@@ -161,6 +162,6 @@ class FamilyControls(unittest.TestCase):
                            ('chat_template_kwargs',{}), ('hf2q_enable_thinking',False)]:
             with self.subTest(wire_key=key), self.assertRaises(Invalid):
                 wire({**req,key:value}, 'gemma4')
-        with self.assertRaises(Invalid): validate_selection('gemma4','peer',4)
+        with self.assertRaises(Invalid): validate_selection('gemma4','peer',1)
 
 if __name__ == '__main__': unittest.main()

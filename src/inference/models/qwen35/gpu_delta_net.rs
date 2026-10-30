@@ -337,15 +337,15 @@ fn slot_conv_capture_region(
 /// The `_capture_*` variants are produced separately by
 /// [`narrow_capture_states_to_slot`] / [`narrow_conv_capture_to_slot`]
 /// when the caller's K=N spec-decode arms are active.
-struct LaPingPongSlotView {
-    conv_state_in: MlxBuffer,
-    conv_state_out: MlxBuffer,
-    recurrent_in: MlxBuffer,
-    recurrent_out: MlxBuffer,
+pub(super) struct LaPingPongSlotView {
+    pub(super) conv_state_in: MlxBuffer,
+    pub(super) conv_state_out: MlxBuffer,
+    pub(super) recurrent_in: MlxBuffer,
+    pub(super) recurrent_out: MlxBuffer,
 }
 
 #[inline]
-fn narrow_la_ping_pong_to_slot(
+pub(super) fn narrow_la_ping_pong_to_slot(
     conv_state_in: &MlxBuffer,
     conv_state_out: &MlxBuffer,
     recurrent_in: &MlxBuffer,
@@ -439,7 +439,7 @@ fn narrow_conv_capture_to_slot(
 /// `slice_view` on the cache buffers BEFORE dispatch (not via the
 /// kernel's batched `n_seqs` axis). Centralized here so the audit
 /// surface is small and grep-stable for future iters.
-const FORWARD_DISPATCH_N_SEQS: u32 = 1;
+pub(super) const FORWARD_DISPATCH_N_SEQS: u32 = 1;
 
 /// Mirror of the per-layer `qkv_channels = 2 * n_k_heads * d_k +
 /// n_v_heads * d_v` formula used at every `build_delta_net_layer*`

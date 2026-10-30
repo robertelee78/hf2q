@@ -52,6 +52,10 @@ width). No `src/` occurrence of the three names remains.
 - `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the joint width, 2..8 with a default of 4. Widths 5–8 have no serving measurement.
 - `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` (`documented-escape`) is the Gemma 4 full-input checkpoint switch. Unset means on where the worker's substrate and quota plan allow it; `0` is the kill switch (also skips the slot-route warmup); `1` forces it and refuses startup otherwise. It no longer needs `HF2Q_UNSAFE_EXPERIMENTS`.
 - `HF2Q_GEMMA4_GGUF` (`development-only`) names the official Gemma 4 GGUF for the ignored real-artifact checkpoint/warmup tests.
+- `HF2Q_QWEN_JOINT_DECODE` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Qwen joint decode switch. Unset, it is on for dense artifacts (Qwen3.8) and off for MoE artifacts (Qwen3.6); `0`/`off`/`false` restores serial per-slot decode, including MTP K3 and history speculation, and `1` opts MoE artifacts in.
+- `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the Qwen joint width, 2..8 with a default of 4; the padded `mul_mv_ext` mode caps at 4.
+- `HF2Q_QWEN_JOINT_Q1_PROMPTS`, `HF2Q_QWEN_JOINT_Q1_OUT` and `HF2Q_QWEN_JOINT_Q1_STEPS` (`development-only`) drive the ignored Q1 Class B trace test.
+- `HF2Q_QWEN36_GGUF` and `HF2Q_QWEN38_GGUF` (`development-only`) select the official artifacts for the ignored Qwen joint decode hardware gates.
 
 These rows were added by hand. The rest of this snapshot was not regenerated.
 
@@ -346,12 +350,19 @@ this release:
 | `HF2Q_QWEN35_PREFILL_SWEEP_WARMUPS` | `development-only` | 2 |
 | `HF2Q_QWEN35_TOKENIZER` | `development-only` | 3 |
 | `HF2Q_QWEN36_AUTOREG` | `development-only` | 2 |
+| `HF2Q_QWEN36_GGUF` | `development-only` | 1 |
 | `HF2Q_QWEN36_WATCHDOG_FIXTURE_MODEL` | `development-only` | 2 |
 | `HF2Q_QWEN36_WATCHDOG_FIXTURE_OUTPUT` | `development-only` | 1 |
 | `HF2Q_QWEN36_WATCHDOG_SHORT_FIXTURE_OUTPUT` | `development-only` | 1 |
+| `HF2Q_QWEN38_GGUF` | `development-only` | 1 |
 | `HF2Q_QWEN3VL_E2E` | `development-only` | 1 |
 | `HF2Q_QWEN3VL_LM_LOAD` | `development-only` | 9 |
 | `HF2Q_QWEN_GQA_Q2` | `documented-escape` | 2 |
+| `HF2Q_QWEN_JOINT_DECODE` | `documented-escape` | 1 |
+| `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` | `development-only` | 1 |
+| `HF2Q_QWEN_JOINT_Q1_OUT` | `development-only` | 1 |
+| `HF2Q_QWEN_JOINT_Q1_PROMPTS` | `development-only` | 1 |
+| `HF2Q_QWEN_JOINT_Q1_STEPS` | `development-only` | 1 |
 | `HF2Q_QWEN_SPECULATION` | `promote-or-internalize` | 6 |
 | `HF2Q_QWEN_VISION_MMPROJ` | `development-only` | 3 |
 | `HF2Q_RERANK_PROFILE` | `development-only` | 5 |

@@ -6,6 +6,8 @@
 //! divergent/compacted transcripts reset.
 
 mod joint_decode;
+#[cfg(test)]
+mod mixed_step_tests;
 mod progress;
 mod sampling;
 mod slot_provision;

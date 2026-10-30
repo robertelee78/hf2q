@@ -141,6 +141,8 @@
             "{REPO}/scripts/four_agent/test_coding_family.py",
             "{REPO}/scripts/four_agent/qwen_n4_peer.py",
             "{REPO}/scripts/four_agent/test_qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/family_peer.py",
+            "{REPO}/scripts/four_agent/test_family_peer.py",
             "{REPO}/scripts/four_agent/f2_semantic.py"
           ]
         }

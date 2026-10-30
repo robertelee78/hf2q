@@ -143,6 +143,38 @@ pub(super) fn publish_prefill_cohort_after_gate(
     Ok(())
 }
 
+const COOPERATIVE_PRESUBMIT_FAILURE: &str =
+    "DeepSeek-V4 cooperative prefill failed before GPU submission";
+const COOPERATIVE_PARTIAL_FAILURE: &str =
+    "DeepSeek-V4 cooperative prefill partially executed; caches poisoned";
+
+/// Settle one executed cooperative prefill. A failure after any GPU
+/// submission poisons every cohort cache (and only those caches); a failure
+/// before submission leaves them untouched; success publishes every cursor
+/// only after the shared commit gate accepts.
+pub(super) fn settle_prefill_cohort<States>(
+    caches: &mut [&mut Deepseek4Cache],
+    spans: &[CacheSpan],
+    execution: (Result<States>, bool),
+    commit_gate: impl FnOnce() -> Result<()>,
+) -> Result<States> {
+    let (states, submitted_any) = execution;
+    let error = match states {
+        Ok(states) => {
+            publish_prefill_cohort_after_gate(caches, spans, commit_gate)?;
+            return Ok(states);
+        }
+        Err(error) => error,
+    };
+    if !submitted_any {
+        return Err(error.context(COOPERATIVE_PRESUBMIT_FAILURE));
+    }
+    for cache in caches.iter_mut() {
+        cache.poison();
+    }
+    Err(error.context(COOPERATIVE_PARTIAL_FAILURE))
+}
+
 #[cfg(test)]
 pub(super) fn plan_cooperative_prefill_layout(
     token_batches: &[&[u32]],
@@ -453,25 +485,9 @@ impl Deepseek4Model {
                     .context("plan DeepSeek-V4 cooperative prefill transaction")
             })
             .collect::<Result<Vec<_>>>()?;
-        let (states, submitted_any) =
+        let execution =
             self.forward_verifier_prefill_cohort_uncommitted(token_batches, caches, &spans, layout);
-        let states = match states {
-            Ok(states) => states,
-            Err(error) => {
-                if submitted_any {
-                    for cache in caches.iter_mut() {
-                        cache.poison();
-                    }
-                    return Err(error).context(
-                        "DeepSeek-V4 cooperative prefill partially executed; caches poisoned",
-                    );
-                }
-                return Err(error)
-                    .context("DeepSeek-V4 cooperative prefill failed before GPU submission");
-            }
-        };
-        publish_prefill_cohort_after_gate(caches, &spans, commit_gate)?;
-        Ok(states)
+        settle_prefill_cohort(caches, &spans, execution, commit_gate)
     }
 
     /// Immediate-commit wrapper for diagnostics and parity tests.
@@ -803,6 +819,8 @@ impl Deepseek4Model {
                 })();
                 end_prefill_pool_layer();
                 state = Some(ffn_result?);
+                #[cfg(test)]
+                super::cooperative_fault::check_after_layer(layer)?;
             }
             let state = state.context("DeepSeek-V4 cooperative prefill encoded zero layers")?;
             let mut outputs = Vec::with_capacity(rows_per_sequence.len());
