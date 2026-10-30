@@ -2674,3 +2674,134 @@ passed18DSML-focused tests, all four tool-bound controls,25mask tests with
 one ignored control,47sampler tests, and the locked all-target/all-feature
 check. That includes the new all-family public-key/function-name runtime
 control. Real-model serving remains the next gate.
+
+### Experimental current-port memory-span reduction
+
+A separate topic from main7be re-ports two source-known changes, without importing
+old whole-envelope constants or measured acceptance. Output-A allocation and
+dispatch share the actual GGML Q8_0/R>native-MM threshold predicate. Only that
+strided route omits the unused group-major input; other codecs/row routes retain
+allocation and permutation. Actual weight type binds the constructor, and call
+route/shape mismatch refuses before encoding. AtR2048/H64/D512 the omitted F32
+input is268435456 requested bytes.
+
+HC normalized state, unnormalized query and post-attention F32 cast are sequential
+roles. One checked max(HC norm elements, query elements) parent supplies exact
+views, preserving larger HC geometry. Norm reads finish before query-B writes;
+query RMS reads q into separate q_norm before the epilogue cast overwrites q.
+Existing native read/write annotations and explicit GraphSession range barriers
+preserve WAR/WAW under recorded reordering. Query-norm, rotary query and other
+live state/attention parents remain distinct. SelectedR2048 separate640MiB becomes
+one256MiB parent,384MiB requested reduction, not a pool-history/physical refund.
+
+The main candidate retains gathered query tile256. Gather64's prior latency
+result was negative; its isolated experimental source is preserved outside this
+candidate and receives no requested-budget discount or adoption claim. Current
+compactKV/gather/mask and causal query/source row mapping are unchanged.
+
+Freshly named ignored current-main-port controls compare old-Some/new-None actual
+output-A producer (<1MiB), and old separate/new shared actual common HC/query/
+RoPE/epilogue adapters with hostile reuse, direct and recorded/reordered modes
+(245111984B<256MiB). The latter does not cover full compressor/indexer/attention
+or model quality. Pure route/overflow/extent controls are also ported. All are
+UNRUN at this checkpoint. Root owns fresh compilation/hardware/full normal N4
+correctness/prefix and matched timing. No kernels, context/slots/output limits,
+positive allowance, physical credit or fit/performance acceptance changes.
+
+
+#### Fresh current-port adapter results (2026-10-29)
+
+Root compiled clean source `ab4aac489e784397351fc912f767b66238f9a3e8`
+against published registry `mlx-native 0.15.15` in release test profile. The
+DeepSeek filter passed 116 controls with 18 ignored. Binary SHA256 was
+`e1c9aa0848df62702fb478935b522e5ce60cc530132e11f8928b27022497043c`.
+Eight runner protocol controls passed before independent operating review.
+
+Each of the following exact filters then ran once in its own fresh, serial,
+root-supervised process on Apple M5 Max, with `--ignored --exact --nocapture
+--test-threads=1`:
+
+- `inference::models::deepseek4::forward_support::output_a_staging_tests::output_a_staging_actual_q8_old_some_new_none_bits_and_fallback_current_main_port`
+  passed: both R33 strided omission and R8 fallback cases completed, with five
+  ordered markers and checked full-output bit equality asserted by the source.
+  Child elapsed was 0.962s; terminal checks completed at 1.356s from spawn.
+- `inference::models::deepseek4::attention_workspace::gpu::actual_common_adapters_separate_vs_shared_direct_and_reorder_current_main_port`
+  passed: 12 common-adapter cases, two reuse rounds each, covered R1/R65 and
+  profile labels 0/4/128 in direct and recorded modes. The 24 recorded executions
+  reported 12–17 reordered operations and 9–13 barriers. Shared-parent identity,
+  separate live query norm, output bits, hostile-reuse guards and two invalid
+  workspace refusals were source assertions. Child elapsed was 1.165s; terminal
+  checks completed at 1.552s from spawn.
+
+Both children exited zero and were reaped with empty owned process groups and
+empty fixture directories. Neither loaded a model. The tests exported no raw
+output-bit arrays and installed no native allocation quota. The alias fixture's
+245111984-byte bound covers live named data plus reserve, not cumulative allocator
+history or physical retirement. These results establish component correctness;
+normal N4 model quality, tool continuation, prefix reuse and matched performance
+remain required before adoption. No physical-fit, speed or whole-Q5 acceptance
+is inferred, and gather remains unchanged.
+
+
+#### Matched normal N4 result: no speed acceptance (2026-10-29)
+
+The isolated candidate remains unaccepted as a speed path. Exact production
+source `f5b97f33b774dd86faee3086d6aad57fcb8db725` was compared with parent
+`fee4e0b8f76fa085085ea5479d3999533625ded0`, both clean release builds using
+public registry native 0.15.15, on Apple M5 Max / 128 GiB. The retained
+DeepSeek-V4-Flash-0731 hf2q-agentic-q2 artifact SHA256 was
+`50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6`.
+
+Both arms used C262144, four slots, an8192-token completion ceiling per request, temperature0,
+max reasoning, repetition1.0, required-tool thinking budget512 and adaptive
+prefill; no graft, disk persistence or GLP. The checked-in
+`scripts/serve_deepseek4_opencode.sh --ctx 262144` producer was bound with
+`MAX_SLOTS=4`, `KV_CACHE_BUDGET_BYTES=8589934592`, `REP_PENALTY=1.0` and
+`REQUIRED_TOOL_THINKING_TOKEN_BUDGET=512`. Four isolated clients used the
+DeepSeek adapter of `scripts/four_agent/qwen_n4_live_smoke.py` (the filename is
+historical), the exact frozen eleven-module client from source `20e5ad83c5e86d76617efa0a19a4e63a46c40347`,
+`--family deepseek4 --engine-kind hf2q`, and canonical request fixture SHA256
+`1643af68f5be6118ab2c83a386027564fcd9954ab284d1cc1fbcba544fe053ff`.
+Actual argv, approvals, source hashes and sampling wires remain in each receipt.
+The unchanged normal operating policy required90GiB Free+cached before load,
+3GiB Free+cached during runtime,124GiB process RSS and footprint ceilings,
+512MiB swap-growth and8GiB compressor-growth limits,500ms observation cadence
+and1s maximum gap; readiness/request/whole deadlines were600/900/7200s.
+Free+cached is a declared working estimate, not a unique physical-page partition
+or a whole-Q5 admission permit.
+
+After a separate quality pair, root froze C1,A1,A2,C2,C3,A3, three cases per arm,
+with no replacement-to-win. Every model ran alone, started at observed Nominal
+thermal state, and was unloaded with owned groups/listeners empty before four
+serial CPU-only native-prefix replays. The initial quality pair and retained
+execute-bit/nonce failures and thermal-held attempts are excluded from these primary medians.
+
+| Case | Task seconds | Prompt tokens | Completion tokens | Cached tokens | SSE semantic TTFT median (s) | Reported prefill median (tok/s) | Reported decode median (tok/s) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| C1 | 140.816168 | 39563 | 3759 | 33063 | 9.645916 | 62.6018 | 8.0505 |
+| A1 | 140.687131 | 39570 | 3760 | 33070 | 9.817843 | 59.5333 | 7.9012 |
+| A2 | 142.139824 | 39570 | 3866 | 33070 | 9.657879 | 60.8679 | 8.0484 |
+| C2 | 140.479786 | 39570 | 3810 | 33070 | 9.599800 | 66.2202 | 8.1296 |
+| C3 | 141.671560 | 39569 | 3853 | 33069 | 9.799875 | 63.1806 | 8.1654 |
+| A3 | 140.769857 | 39568 | 3711 | 33068 | 9.916217 | 61.4477 | 7.7773 |
+
+Candidate median was140.816168s (range140.479786–141.671560); parent median was
+140.769857s (range140.687131–142.139824). The candidate was0.0328987% slower by
+median and ranges overlap: **no speed win**. These are own-output trajectories;
+transcripts and token work differ. Each TTFT median uses12 real SSE semantic
+observations;16 unary turns have null TTFT, never zero. Rate columns summarize
+28 overlapping per-request server reports, not aggregate GPU throughput.
+
+Independent raw review verified168 requests,144 linked tool continuations,
+24 correct final Rust patches and72 actual Rust test stdout logs, plus168 exact
+prompt retokenizations and144 full prior native anchors with the8-token tail
+excluded. All six cleanup/monitor/identity checks passed. All sampled memory
+pressure levels were1; runtime thermal Fair observations occurred in A2, C2 and
+C3, so this is not a continuously Nominal run claim.
+
+The source reduction remains exactly640MiB at R2048 (256MiB unused output-A
+input plus384MiB shared scratch). This is requested payload per invocation,
+not measured unique physical memory, allocator-history retirement or a whole-case
+fit refund. Keep the code isolated until a separately proven memory-admission
+need warrants adoption; do not promote it as a fast path, rerun until a favorable
+sample, subtract gather64 savings, or infer whole-Q5/four-family acceptance.

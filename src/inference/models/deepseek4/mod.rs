@@ -8,6 +8,7 @@ pub mod attention;
 mod attention_entry;
 mod attention_forward;
 mod attention_weights;
+mod attention_workspace;
 pub mod cache;
 mod cache_buffers;
 mod compressed_attention;

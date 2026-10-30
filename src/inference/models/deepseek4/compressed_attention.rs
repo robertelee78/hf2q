@@ -249,7 +249,10 @@ impl Deepseek4Model {
                 layout.indexer_output_offset.context("ratio-four output offset missing")?,
             )
         }).transpose()?;
-        let core = CompressedAttentionCoreArena::new(&device, &self.cfg, rows)?;
+        let weights = CompressedAttentionWeightsRef::get(&self.weights, layer, ratio)?;
+        let core = CompressedAttentionCoreArena::new(
+            &device, &self.cfg, rows, weights.attention.output_a.ggml_type,
+        )?;
         let main_compressor =
             MainCompressorArena::new(&device, &self.cfg, ratio, rows, compressed_count)?;
         let indexer = (ratio == 4)
@@ -398,7 +401,6 @@ impl Deepseek4Model {
         let sparse_flash_decode = use_sparse_flash_decode
             .then(|| SparseFlashDecodeArena::new(&device, attention_width, head_dim))
             .transpose()?;
-        let weights = CompressedAttentionWeightsRef::get(&self.weights, layer, ratio)?;
 
         let registry = &mut self.ctx.registry;
         let mut encode = |session: &mut GraphSession<'_>| -> Result<()> {
