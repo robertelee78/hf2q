@@ -20,7 +20,7 @@ Phase 1 adds one layer-major forward per decode step over every eligible decodin
 
 Row-parallel work runs once with `m = B`. Work that touches a request's cache runs per row against that row's cache and position.
 
-The joint path must be **bit-identical to serial decode**. It became the default on 2026-10-30, after the official-artifact proof and the four-agent A/B passed on hardware. The default width is 4 rows; widths 5–8 need `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` and have no serving measurement. The B=4 cohort is kept only as the switch-off path (`HF2Q_DEEPSEEK_JOINT_DECODE=0`). It is a strict subset of the joint path, so it can be removed once the serial A/B arm is no longer needed.
+The joint path must be **bit-identical to serial decode**. It became the default on 2026-10-30, after the official-artifact proof and the four-agent A/B passed on hardware. The default width is 4 rows. Widths 5–8 need `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS`; they pass the official-artifact bitwise test but have no serving measurement. The B=4 cohort is kept only as the switch-off path (`HF2Q_DEEPSEEK_JOINT_DECODE=0`). It is a strict subset of the joint path, so it can be removed once the serial A/B arm is no longer needed.
 
 ## Data flow per layer (`joint_decode.rs`, `joint_decode_core.rs`)
 
@@ -101,7 +101,7 @@ Non-exact measurement arm: `HF2Q_DECODE_MV_EXT=1` routes Q8_0 `m = 2..8` to `mul
   - lanes stay inside their first window;
   - bitwise state, logits and cache every step;
   - checks that the artifact admits joint decode, width-1 and misaligned rejection, and a rejected commit gate poisoning only that step's rows.
-  - The 2026-10-30 pass covered the earlier four-lane version (widths 4/3/2/2). The eight-lane version has not yet run.
+  - Passed on 2026-10-30, first in the four-lane version (widths 4/3/2/2), then in this eight-lane version (59 s, source `fab4dc3b`).
 - `joint_decode_routes.rs` (host only): the official type set is admitted; a float output head, unproven block types and non-Q8_0 grouped output-A fall back to serial.
 - `engine/deepseek4_joint_decode.rs` (host only):
   - kill-switch parsing and default;
@@ -178,7 +178,7 @@ The existing `Mixed` step still runs the decode turn, then one prefill slice cap
 - **Grammar and tool calls:** sampling is unchanged per row, and streaming rows now receive their own events in joint mode. Interleaving token-by-token across rows does not mix any per-slot state.
 - **Exactness assumptions not yet hardware-proven:**
   - SwiGLU, MoE weighted reduce, hash/score routing and GLP steering are row-independent by construction. The independent review read these shaders in mlx-native 0.15.15 and the GLP apply kernels. GLP under joint decode has not been tested on hardware.
-  - widths 5–8 until the eight-lane official test runs.
+  - serving at widths 5–8 (the eight-lane bitwise test passes; no four-agent measurement exists above width 4).
 - **Decode scratch:** the high-water mark grows about B×. The A/B measured 197–401 MB at B=4 with roughly 0.8–2.3k-token prompts, against 62–95 MB serial. Ratio-4 indexer scratch grows further with context, and long-context (≥64k) peak memory is unmeasured. Most joint completions exceed the 256 MiB retained-scratch cap, so scratch is released and reallocated after the turn.
 - **Code duplication:** the per-row cores intentionally duplicate the one-token decode branch, so the serial reference stays untouched. Dedupe the two after promotion.
 
