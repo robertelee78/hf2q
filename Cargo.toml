@@ -308,7 +308,7 @@ base64 = "0.22"
 
 # ADR-045: rustc's deferred debuginfo stripping rewrites Mach-O images with
 # llvm-objcopy, which leaves the LINKEDIT string pool only four-byte aligned
-# (rust-lang/rust#157750; fixed in Rust 1.98.1). macOS 27 rejects such
+# (rust-lang/rust#157750; fixed in Rust 1.98.0). macOS 27 rejects such
 # proc-macro dylibs, and the standalone candidate rejects any misaligned
 # final binary. ld64 itself pointer-aligns the pool, so keep both the hf2q
 # binary and the build tools unstripped; the remaining optimized release

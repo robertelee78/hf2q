@@ -257,13 +257,18 @@ on `macos-26-arm64`) did not: `stroff=47997308`, four mod eight. The packed
 candidate correctly refused it before signing or publication. Local Rust
 1.94 release builds also produced four-mod-eight offsets. Rust's stripping
 path rewrites the image with llvm-objcopy, which does not pointer-align the
-string pool. The LLVM fix (llvm/llvm-project#203680) reached Rust in
-1.98.1, but the release toolchain stays pinned at 1.89. `Cargo.toml`
-therefore MUST also set `strip = "none"` in `[profile.release]`. The final
-binary then keeps ld64's pointer-aligned layout: a fresh local build had
-`stroff=46961448`, zero mod eight, and was about 1.45 MB larger (+2.7%) than
-the stripped build. Release builds already carry no debuginfo, so this keeps
-only the symbol table.
+string pool. The LLVM fix (llvm/llvm-project#203680, rust-lang/rust#158410)
+reached Rust in 1.98.0, but the release toolchain stays pinned at 1.89.
+`Cargo.toml` therefore MUST also set `strip = "none"` in `[profile.release]`.
+ld64 pads the pool to a pointer boundary deliberately. In a fresh local
+build the indirect-symbol table ended at four mod eight and the pool began
+at `stroff=46961448`, zero mod eight. Every unstripped build-tool dylib in
+the failing hosted run also passed. Unstripped output keeps the
+debug-map (STABS) entries that the strip previously removed. These include
+absolute build-host paths: randomized `/Users/runner/...` temporary paths
+for the hosted candidate. They are inert at runtime. The local unstripped
+binary was 54,544,744 bytes. That figure has no same-toolchain, same-target
+stripped baseline, so this ADR claims no exact size delta.
 
 Model-family quality, cache, and performance qualification is independent. It
 may consume the same signed candidate and remains required when a governing
