@@ -35,9 +35,9 @@
 #                           ceiling so the required call can complete.
 #   --default-tool-thinking-token-budget 512
 #                           Smaller default for tool-result continuations.
-#                           Deeper tool-result turns in one user tool chain
-#                           reduce this deterministically to a 256-token
-#                           floor. Explicit request budgets always win. Set
+#                           Every tool-result turn in one user tool chain
+#                           uses this same ceiling; chain depth does not
+#                           shrink it. Explicit request budgets always win. Set
 #                           TOOL_THINKING_TOKEN_BUDGET=0 to disable the
 #                           continuation default without disabling fresh-turn
 #                           thinking budgets.
