@@ -78,6 +78,10 @@
 #         reproduce the 2026-08-03 command-buffer OOM — diagnostic only)
 #     BATCHED=0 (this script)        disables both SerialFifo and slot-aware
 #                                    batched prefill for parity diagnostics
+#     FULL_INPUT_CHECKPOINT=0|1      (this script) forwards
+#                                    HF2Q_GEMMA_FULL_INPUT_CHECKPOINT; unset
+#                                    keeps the hf2q default (on where
+#                                    supported). 0 is the A/B kill switch.
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -165,6 +169,15 @@ if [[ "${BATCHED:-}" == "0" ]]; then
 elif [[ "${BATCHED:-}" == "1" ]]; then
     BATCHED_ENV=1
 fi
+FULL_INPUT_ENV=""
+case "${FULL_INPUT_CHECKPOINT:-}" in
+    "") ;;
+    0|1) FULL_INPUT_ENV="$FULL_INPUT_CHECKPOINT" ;;
+    *)
+        echo "FULL_INPUT_CHECKPOINT must be 0, 1 or unset" >&2
+        exit 2
+        ;;
+esac
 
 # macOS bash 3.2 + `set -u`: expanding an EMPTY array via "${MMARGS[@]}"
 # is an unbound-variable error (this killed the no-mmproj boot
@@ -173,6 +186,7 @@ if [[ -f "$MMPROJ" ]]; then
     exec env \
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
+        ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
@@ -188,6 +202,7 @@ else
     exec env \
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
+        ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \

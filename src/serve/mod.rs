@@ -4351,7 +4351,7 @@ pub fn cmd_serve(
 
     phase_trace::initialize_early().map_err(|error| anyhow::anyhow!(error))?;
 
-    crate::debug::investigation_env::gemma_full_input::selected()
+    crate::debug::investigation_env::gemma_full_input::validate()
         .map_err(|error| anyhow::anyhow!(error))?;
     let mut args = args;
     let mut repository_spec = None;

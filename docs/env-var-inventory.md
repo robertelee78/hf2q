@@ -50,8 +50,10 @@ width). No `src/` occurrence of the three names remains.
 
 - `HF2Q_DEEPSEEK_JOINT_DECODE` (`documented-escape`) is the DeepSeek-V4 joint decode kill switch. It is on by default; `0`/`off`/`false` restores serial per-slot decode.
 - `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the joint width, 2..8 with a default of 4. Widths 5–8 have no serving measurement.
+- `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` (`documented-escape`) is the Gemma 4 full-input checkpoint switch. Unset means on where the worker's substrate and quota plan allow it; `0` is the kill switch (also skips the slot-route warmup); `1` forces it and refuses startup otherwise. It no longer needs `HF2Q_UNSAFE_EXPERIMENTS`.
+- `HF2Q_GEMMA4_GGUF` (`development-only`) names the official Gemma 4 GGUF for the ignored real-artifact checkpoint/warmup tests.
 
-Both rows were added by hand. The rest of this snapshot was not regenerated.
+These rows were added by hand. The rest of this snapshot was not regenerated.
 
 ## Remaining promotion queue
 
@@ -240,6 +242,8 @@ this release:
 | `HF2Q_GEMMA4_31B_DRAFTER` | `development-only` | 5 |
 | `HF2Q_GEMMA4_31B_GGUF` | `development-only` | 8 |
 | `HF2Q_GEMMA4_EAGLE3_MIN_ACCEPT` | `development-only` | 2 |
+| `HF2Q_GEMMA4_GGUF` | `development-only` | 1 |
+| `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_N8_EXPECTED_KV_REGIME` | `development-only` | 3 |
 | `HF2Q_GEMMA_N8_PARITY_MAX_TOKENS` | `development-only` | 1 |
 | `HF2Q_GEMMA_N8_PARITY_ROUNDS` | `development-only` | 1 |

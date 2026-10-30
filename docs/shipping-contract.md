@@ -294,6 +294,7 @@ good operator UX merely because a release script exports it.
 | `HF2Q_DECODE_MVN` | `0`, `1` | Exact-tree Q4_K/Q6_K multi-column matvec routing. The global default is `1`; loading a Qwen3.8-identified model applies `0` at engine load (previously only via the canonical Qwen3.8 launcher) because its K=3 verifier is qualified on the weight-amortized width-four route. Explicit values always win. |
 | `HF2Q_DECODE_MV_EXT` | `0`, `1` | Weight-amortized multi-column matvec routing. The global default is `0`; loading a Qwen3.8-identified model applies `1` at engine load (previously only via the canonical Qwen3.8 launcher). K-quants route only at widths 4–8; legacy Q4_0/Q8_0 route at widths 2–8. Unlike the byte-exact default-on mvN route, `mul_mv_ext` is not bit-exact, so the default remains Qwen3.8-scoped. |
 | `HF2Q_QWEN_GQA_Q2` | `auto`/unset, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 long-context TQ-HB selector. Auto uses the bit-exact Q2 cooperative kernel only at KV length ≥8,192 and only for its hard D=256/GQA/no-mask geometry. Off is the supported escape hatch. On cannot bypass geometry checks. Invalid values fail safe to off. |
+| `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` | unset, `0`, `1` | Gemma 4 full-input checkpoint (ADR-063). Unset: on for Gemma Hybrid/TQ8 SlotAware 1–4 when the provisioned geometry holds two CPU anchor generations per slot inside the 1536 MiB quota; otherwise off without refusal. `0` is the kill switch. `1` forces it and refuses startup on an unsupported substrate. Other values refuse startup. Tool-result turns resume from the slot's checkpoint of the previous full input. See `docs/research/adr063-gemma-four-agent-reuse.md`. |
 | `HF2Q_BATCHED_PREFILL` | `0`/`false`/`off`, unset | Opt out of the default batched prefill path (Category 1) back to per-token `forward_prefill`. For parity diagnostics only — per-token is 14-45× slower than peer. Default-on since ADR-028 iter-344; decoupled from the `HF2Q_UNSAFE_EXPERIMENTS` ack at that iter. The remaining `sliding_wrap` long-sequence byte-parity gap is the operator-signed deferral (2026-04-16; see ADR-010), a coherence deferral — not a runtime error. |
 | `HF2Q_STREAMING_PHASE3` | `1`, unset | ADR-014 P7 iter-3 production wire-up. Routes all 4 Phase 3 quantize dispatch arms (K-quant codec direct / ImatrixAdaptive / StaticQuantizer / DwqK) and Phase 4.5 quality measurement through the streaming `LazyTensorMap` pipeline (`quantize_via_streaming_borrowed` + `measure_quality_streaming_lazy`). Output is byte-identical to the eager path — every wired arm has a per-arm byte-identity gate. Currently a TEST INTEGRATION channel, not a memory win (wedge clones bytes ~2× peak briefly); actual memory savings land when iter-3 wholesale surgery removes the upstream `materialize_all()` bridge. Default OFF; default behavior unchanged. |
 
@@ -306,7 +307,6 @@ an explicit acknowledgment: `HF2Q_UNSAFE_EXPERIMENTS=1`.
 
 | Var | Unsafe-ack | Purpose |
 |---|---|---|
-| `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1` | **required** | Default-OFF Gemma Hybrid/TQ8 SlotAware1–4 full-input checkpoint source stage; exact token identity and1536MiB requested CPU anchor quota across all capture roles. Invalid/unsupported/unacknowledged startup refuses, no partial-prefix fallback. Not model/full-prefix/physical admission qualification. |
 | `HF2Q_QWEN_POOL_GROWTH_PROFILE=adr063-24g-v1` | **required** | Optional fixed Qwen native scratch-pool creation quota; default legacy unchanged. Requested invalid/unacknowledged/unsupported startup fails rather than serving uncapped. Text/tools only, 1–4 SlotAware slots, one worker/generation. Sticky refusal prevents ordinary replay/reuse. This is an enforcing domain policy, not whole-memory/model/performance admission; see operator-env-vars.md. |
 | `HF2Q_LMHEAD_RERANK=0` | **required** | Measure raw Q8 argmax cost. Reintroduces the rare near-tiebreak flip (observed as mid-decode `<pad>` emission). |
 | `HF2Q_CHUNK_SCAN_PREFILL=1` | **required** | Wave 5b iter 5 opt-in: route Qwen3.6 prefills at `seq_len > 64` through the mlx-native chunk-parallel delta-rule pipeline (`mlx_native::ops::chunk_gated_delta_rule::dispatch_chunk_gated_delta_rule_fwd`). This is a performance experiment distinct from the production autoregressive path. Decode parity ±5% (AC 5468) and walk-bar parity at pp4096+ (W-5b.3) are required before this experimental kernel can become Category 1. |
@@ -636,16 +636,20 @@ These are deliberately not part of any category:
 - `scripts/fetch_wikitext2.sh` — full wikitext-2 corpus fetcher for the
   PPL gate (smoke fixture is committed; full corpus is gitignored).
 
-### Gemma full-input checkpoint experiment (2026-10-26)
+### Gemma full-input checkpoint (ADR-063, default on)
 
-`HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1` requires `HF2Q_UNSAFE_EXPERIMENTS=1`.
-It defaults OFF; invalid/unacknowledged intent is refused, never an uncapped
-fallback. Stage ON supports Gemma Hybrid/TQ8 SlotAware1–4 only. The internal
-full-input tag binds the actual nonempty cue-less tool-result token length and
-SHA256; it is not a public request override or a generic relaxed cue boundary.
-All Hybrid CPU anchor constructors (strict, image, rollback and full input) then
-reserve requested payload/token-ledger/metadata bytes before copying against a
-process1536MiB quota. Reservation lives through CPU payload destruction; this is
-not a physical-memory or whole-serving admission cap. Stage OFF keeps existing
-capture behavior and allocation policy. No default promotion, full seven-wire
-prefix qualification or model-speed claim follows from the source stage.
+The 2026-10-26 experiment is promoted to the Gemma 4 default; it no longer
+needs `HF2Q_UNSAFE_EXPERIMENTS=1`. A Gemma SlotAware worker activates it when
+the substrate is Hybrid/TQ8 with 1–4 slots and the provisioned geometry holds
+two CPU anchor generations per slot at the longest prompt ledger inside the
+1536 MiB requested-anchor quota. `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=0` disables
+it; `=1` forces it and refuses startup when it cannot activate. The internal
+tag binds the exact nonempty cue-less tool-result token length and SHA256; it
+is not a public request override or a generic relaxed cue boundary. On an
+active worker every Hybrid CPU anchor constructor (strict, image, rollback,
+full input) reserves its requested bytes first. A quota refusal of an
+anchor capture (any role) keeps the previous anchor and serves the request
+unchanged; each worker owns its quota. The route is Q1 Class B (transcripts
+differ from `=0`). An inactive worker keeps the previous capture and allocation
+policy. The quota is not a physical-memory or whole-serving admission cap.
+Gates and evidence: `docs/research/adr063-gemma-four-agent-reuse.md`.
