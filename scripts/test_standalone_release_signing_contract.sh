@@ -37,15 +37,23 @@ workflow_executes_unsigned_candidate() {
       <<<"$source"
 }
 
-release_build_tools_disable_strip() {
-  awk '
-    $0 == "[profile.release.build-override]" { capture = 1; next }
+profile_disables_strip() {
+  awk -v table="$1" '
+    $0 == table { capture = 1; next }
     capture && /^\[/ { exit }
     capture && /^[[:space:]]*strip[[:space:]]*=[[:space:]]*"none"[[:space:]]*$/ {
       found = 1
     }
     END { exit(found ? 0 : 1) }
   '
+}
+
+release_build_tools_disable_strip() {
+  profile_disables_strip "[profile.release.build-override]"
+}
+
+release_binary_disables_strip() {
+  profile_disables_strip "[profile.release]"
 }
 
 bash -n "$SIGN_SCRIPT"
@@ -68,6 +76,22 @@ strip = "debuginfo"
 EOF
 then
   fail "build-tool profile accepted the macOS 27-breaking strip mode"
+fi
+release_binary_disables_strip < "$CARGO_MANIFEST" ||
+  fail "release hf2q binary does not disable rustc debuginfo stripping"
+if release_binary_disables_strip <<'EOF'
+[profile.release.build-override]
+strip = "none"
+EOF
+then
+  fail "build-tool strip override was mistaken for the final binary profile"
+fi
+if release_binary_disables_strip <<'EOF'
+[profile.release]
+strip = "debuginfo"
+EOF
+then
+  fail "final binary profile accepted the misaligning strip mode"
 fi
 for required in \
   'assert_macho_string_pool_aligned()' \

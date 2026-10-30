@@ -250,6 +250,21 @@ Accordingly, `Cargo.toml` MUST set `strip = "none"` in its
 reject any generated dylib or final binary whose LINKEDIT string-pool offset
 is not eight-byte aligned.
 
+The build-override rule alone left the final binary's alignment incidental.
+v0.1.27's stripped binary happened to land on an eight-byte offset. The
+0.1.28 candidate (release run 40980178819, source `dca77a11`, rustc 1.89.0
+on `macos-26-arm64`) did not: `stroff=47997308`, four mod eight. The packed
+candidate correctly refused it before signing or publication. Local Rust
+1.94 release builds also produced four-mod-eight offsets. Rust's stripping
+path rewrites the image with llvm-objcopy, which does not pointer-align the
+string pool. The LLVM fix (llvm/llvm-project#203680) reached Rust in
+1.98.1, but the release toolchain stays pinned at 1.89. `Cargo.toml`
+therefore MUST also set `strip = "none"` in `[profile.release]`. The final
+binary then keeps ld64's pointer-aligned layout: a fresh local build had
+`stroff=46961448`, zero mod eight, and was about 1.45 MB larger (+2.7%) than
+the stripped build. Release builds already carry no debuginfo, so this keeps
+only the symbol table.
+
 Model-family quality, cache, and performance qualification is independent. It
 may consume the same signed candidate and remains required when a governing
 model or serving ADR calls for it, but it does not authorize the CLI artifact
