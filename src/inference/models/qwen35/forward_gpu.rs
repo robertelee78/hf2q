@@ -81,6 +81,11 @@ use mlx_native::ops::argmax::dispatch_argmax_f32;
 use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::rms_norm;
 
+/// Joint B-row decode shares this module's thread-local weight cache.
+#[path = "joint_decode.rs"]
+mod joint_decode;
+pub(crate) use joint_decode::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
+
 /// Large Qwen prefills are intentionally drained at every layer boundary.
 /// K>1 is a decode/short-row throughput optimization; on a substantial
 /// prompt it widens the asynchronous error-observation window after a Metal

@@ -1959,6 +1959,9 @@ mod f2_work_state;
 #[path = "engine/deepseek4_joint_decode.rs"]
 mod deepseek4_joint_decode;
 
+#[path = "engine/qwen35_joint_decode.rs"]
+mod qwen35_joint_decode;
+
 pub(super) enum Request {
     /// Internal startup-only diagnostic control, never a public HTTP request.
     ArmNativeObservation {
@@ -18636,6 +18639,7 @@ fn run_slot_aware_qwen35(
         .collect();
     let mut prompt_caches: Vec<PromptCache> = (0..n_slots).map(|_| PromptCache::new()).collect();
     let mut prompt_anchors: Vec<Option<Qwen35PromptAnchor>> = (0..n_slots).map(|_| None).collect();
+    let qwen_joint_decode = qwen35_joint_decode::qwen35_joint_decode_config(&guard.model.model);
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
@@ -19083,6 +19087,7 @@ fn run_slot_aware_qwen35(
                     registration.as_ref(),
                     &handles,
                     kv_bytes_per_token,
+                    qwen_joint_decode,
                     &supervisor,
                 ) {
                     fail_qwen35_worker_after_gpu_fatal(
@@ -19122,6 +19127,7 @@ fn run_slot_aware_qwen35(
                     registration.as_ref(),
                     &decode_handles,
                     kv_bytes_per_token,
+                    qwen_joint_decode,
                     &supervisor,
                 ) {
                     fail_qwen35_worker_after_gpu_fatal(
@@ -20235,6 +20241,7 @@ fn embed_qwen35_inline(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_batch_qwen35(
     guard: &mut Qwen35KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
@@ -20245,8 +20252,30 @@ fn decode_batch_qwen35(
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
+    joint_decode: Option<qwen35_joint_decode::Qwen35JointDecodeConfig>,
     supervisor: &EngineSupervisor,
 ) -> Option<Qwen35FatalFailure> {
+    let serial_handles = match qwen35_joint_decode::qwen35_joint_decode_turn_config(joint_decode) {
+        Some(config) => match qwen35_joint_decode::run_qwen35_joint_decode(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_caches,
+            prompt_anchors,
+            registration,
+            handles,
+            kv_bytes_per_token,
+            config,
+            supervisor,
+        ) {
+            qwen35_joint_decode::Qwen35JointRun::NotEligible => None,
+            qwen35_joint_decode::Qwen35JointRun::Ran { serial } => Some(serial),
+            qwen35_joint_decode::Qwen35JointRun::Fatal(fatal) => return Some(fatal),
+        },
+        None => None,
+    };
+    let handles = serial_handles.as_deref().unwrap_or(handles);
     for &handle in handles {
         let slot_idx = handle.slot_id.0 as usize;
         let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
@@ -20319,51 +20348,115 @@ fn decode_batch_qwen35(
 
         let _native_invocation =
             scheduler.trace_transaction("qwen35", "ordinary_or_temporal_mtp_decode", &[handle]);
-        let qtick = match state.decode_tick(
+        let tick = state.decode_tick(
             guard.model,
             guard.kv.as_mut().expect("kv Some during loop"),
             supervisor,
+        );
+        if let Some(fatal) = settle_qwen35_decode_lane(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_caches,
+            prompt_anchors,
+            registration,
+            handle,
+            reply,
+            state,
+            tick,
+            kv_bytes_per_token,
+            supervisor,
         ) {
-            Ok(t) => t,
-            Err(e) => {
-                if !supervisor.is_healthy() {
-                    return Some(Qwen35FatalFailure {
-                        handle: Some(handle),
-                        reply: Qwen35FatalReply::Slot(reply),
-                        error: e,
-                        kind: Qwen35WorkerFatalKind::Gpu,
-                    });
-                }
-                if is_fatal_command_buffer_error(&e) {
-                    return Some(Qwen35FatalFailure {
-                        handle: Some(handle),
-                        reply: Qwen35FatalReply::Slot(reply),
-                        error: e,
-                        kind: Qwen35WorkerFatalKind::Gpu,
-                    });
-                }
-                reply = match reset_qwen35_slot_for_reply(
-                    guard,
-                    scheduler,
-                    handle,
-                    kv_bytes_per_token,
-                    reply,
-                ) {
-                    Ok(reply) => reply,
-                    Err(fatal) => return Some(fatal),
-                };
-                retained_tokens[slot_idx].clear_all();
-                prompt_anchors[slot_idx] = None;
-                scheduler.release(handle);
-                slot_fire_done(reply, Err(e), false);
-                continue;
+            return Some(fatal);
+        }
+    }
+    None
+}
+
+/// Settle one Qwen decode lane after its tick (serial or joint): stream the
+/// fragment and progress, publish the retained prefix on completion, then
+/// finish, cancel-recover or reinstall the slot. A non-fatal tick error
+/// resets only this slot and fails only this request.
+#[allow(clippy::too_many_arguments)]
+fn settle_qwen35_decode_lane(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Qwen35RetainedPrefix],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    registration: Option<&super::registry::ModelRegistration>,
+    handle: SlotHandle,
+    mut reply: SlotReply,
+    mut state: super::engine_qwen35::Qwen35DecodeState,
+    tick: Result<super::engine_qwen35::Qwen35TickOutcome>,
+    kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
+) -> Option<Qwen35FatalFailure> {
+    let slot_idx = handle.slot_id.0 as usize;
+    let qtick = match tick {
+        Ok(t) => t,
+        Err(e) => {
+            if !supervisor.is_healthy() {
+                return Some(Qwen35FatalFailure {
+                    handle: Some(handle),
+                    reply: Qwen35FatalReply::Slot(reply),
+                    error: e,
+                    kind: Qwen35WorkerFatalKind::Gpu,
+                });
             }
-        };
-        let tick = TickOutcome {
-            fragment: qtick.fragment,
-            is_reasoning: qtick.is_reasoning,
-            finished: qtick.finished,
-        };
+            if is_fatal_command_buffer_error(&e) {
+                return Some(Qwen35FatalFailure {
+                    handle: Some(handle),
+                    reply: Qwen35FatalReply::Slot(reply),
+                    error: e,
+                    kind: Qwen35WorkerFatalKind::Gpu,
+                });
+            }
+            reply = match reset_qwen35_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
+            retained_tokens[slot_idx].clear_all();
+            prompt_anchors[slot_idx] = None;
+            scheduler.release(handle);
+            slot_fire_done(reply, Err(e), false);
+            return None;
+        }
+    };
+    let tick = TickOutcome {
+        fragment: qtick.fragment,
+        is_reasoning: qtick.is_reasoning,
+        finished: qtick.finished,
+    };
+    let (generated, max_tokens, decode_rate) = state.operator_progress();
+    let (thinking_tokens, thinking_budget, thinking_forced_closed, answer_event_delivered) =
+        state.operator_thinking_progress();
+    crate::serve::operator_ui::qwen_decode_progress(
+        qwen35_operator_request_id(handle),
+        generated,
+        max_tokens,
+        decode_rate,
+        thinking_tokens,
+        thinking_budget,
+        thinking_forced_closed,
+        answer_event_delivered,
+    );
+
+    let client_dropped = slot_emit_token(&mut reply, &tick);
+    if !client_dropped && reply.stream_saw_answer_event() && state.mark_first_answer_event() {
+        tracing::info!(
+            slot = handle.slot_id.0,
+            prompt_tokens = state.prompt_cache_identity().0.len(),
+            "Qwen35 first answer event delivered"
+        );
         let (generated, max_tokens, decode_rate) = state.operator_progress();
         let (thinking_tokens, thinking_budget, thinking_forced_closed, answer_event_delivered) =
             state.operator_thinking_progress();
@@ -20377,115 +20470,90 @@ fn decode_batch_qwen35(
             thinking_forced_closed,
             answer_event_delivered,
         );
-
-        let client_dropped = slot_emit_token(&mut reply, &tick);
-        if !client_dropped && reply.stream_saw_answer_event() && state.mark_first_answer_event() {
-            tracing::info!(
-                slot = handle.slot_id.0,
-                prompt_tokens = state.prompt_cache_identity().0.len(),
-                "Qwen35 first answer event delivered"
-            );
-            let (generated, max_tokens, decode_rate) = state.operator_progress();
-            let (thinking_tokens, thinking_budget, thinking_forced_closed, answer_event_delivered) =
-                state.operator_thinking_progress();
-            crate::serve::operator_ui::qwen_decode_progress(
-                qwen35_operator_request_id(handle),
-                generated,
-                max_tokens,
-                decode_rate,
-                thinking_tokens,
-                thinking_budget,
-                thinking_forced_closed,
-                answer_event_delivered,
-            );
-        }
-        if tick.finished && !client_dropped {
-            let valid_tokens = match guard
+    }
+    if tick.finished && !client_dropped {
+        let valid_tokens = match guard
+            .kv
+            .as_ref()
+            .expect("kv Some during loop")
+            .sequence_len_for_slot(handle.slot_id)
+        {
+            Ok(tokens) => tokens as usize,
+            Err(error) => {
+                return Some(Qwen35FatalFailure {
+                    handle: Some(handle),
+                    reply: Qwen35FatalReply::Slot(reply),
+                    error: anyhow::anyhow!("read Qwen decode-completion retained cursor: {error}"),
+                    kind: Qwen35WorkerFatalKind::Invariant,
+                });
+            }
+        };
+        retained_tokens[slot_idx].tokens = state.retained_prefix(valid_tokens);
+        retained_tokens[slot_idx].spec = state.spec_prefix_candidate(valid_tokens).filter(|spec| {
+            guard
                 .kv
                 .as_ref()
-                .expect("kv Some during loop")
-                .sequence_len_for_slot(handle.slot_id)
-            {
-                Ok(tokens) => tokens as usize,
-                Err(error) => {
-                    return Some(Qwen35FatalFailure {
-                        handle: Some(handle),
-                        reply: Qwen35FatalReply::Slot(reply),
-                        error: anyhow::anyhow!(
-                            "read Qwen decode-completion retained cursor: {error}"
-                        ),
-                        kind: Qwen35WorkerFatalKind::Invariant,
-                    });
-                }
-            };
-            retained_tokens[slot_idx].tokens = state.retained_prefix(valid_tokens);
-            retained_tokens[slot_idx].spec =
-                state.spec_prefix_candidate(valid_tokens).filter(|spec| {
-                    guard
-                        .kv
-                        .as_ref()
-                        .expect("kv Some during Qwen live-prefix publication")
-                        .validate_speculative_cursors_for_slot(handle.slot_id, spec.token_count)
-                        .is_ok()
-                });
-            record_retained_slot_kv(
+                .expect("kv Some during Qwen live-prefix publication")
+                .validate_speculative_cursors_for_slot(handle.slot_id, spec.token_count)
+                .is_ok()
+        });
+        record_retained_slot_kv(
+            scheduler,
+            handle,
+            retained_tokens[slot_idx].len(),
+            kv_bytes_per_token,
+        );
+    }
+    scheduler.advance_after_decode(handle);
+
+    if tick.finished || client_dropped {
+        if client_dropped {
+            reply = match recover_qwen35_slot_after_cancellation_for_reply(
+                guard,
                 scheduler,
                 handle,
-                retained_tokens[slot_idx].len(),
                 kv_bytes_per_token,
-            );
-        }
-        scheduler.advance_after_decode(handle);
-
-        if tick.finished || client_dropped {
-            if client_dropped {
-                reply = match recover_qwen35_slot_after_cancellation_for_reply(
-                    guard,
-                    scheduler,
-                    handle,
-                    kv_bytes_per_token,
-                    &mut retained_tokens[slot_idx],
-                    &mut prompt_anchors[slot_idx],
-                    false,
-                    reply,
-                ) {
-                    Ok(reply) => reply,
-                    Err(fatal) => return Some(fatal),
-                };
-            }
-            scheduler.release(handle);
-            let (cache_prompt, cache_params) = {
-                let (prompt, params) = state.prompt_cache_identity();
-                (prompt.to_vec(), params.clone())
+                &mut retained_tokens[slot_idx],
+                &mut prompt_anchors[slot_idx],
+                false,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
             };
-            let gr = state.finish(guard.model, registration);
-            super::engine_supervisor::qwen_pool_request_observation(
-                handle.slot_id.0 as usize,
-                handle.generation,
-                if !client_dropped && gr.is_ok() {
-                    "completed_post_drain"
-                } else {
-                    "failed"
-                },
-            );
-            if let Ok(result) = gr.as_ref() {
-                log_qwen35_slot_decode_complete(result, &reply, client_dropped);
-                if !client_dropped {
-                    prompt_caches[slot_idx].store(&cache_prompt, &cache_params, result);
-                }
-            }
-            finish_qwen35_operator_request(
-                handle,
-                if client_dropped {
-                    "cancelled"
-                } else {
-                    "complete"
-                },
-            );
-            slot_fire_done(reply, gr, client_dropped);
-        } else {
-            slots[slot_idx] = Some((Qwen35SlotWork::Decode(state), reply, handle));
         }
+        scheduler.release(handle);
+        let (cache_prompt, cache_params) = {
+            let (prompt, params) = state.prompt_cache_identity();
+            (prompt.to_vec(), params.clone())
+        };
+        let gr = state.finish(guard.model, registration);
+        super::engine_supervisor::qwen_pool_request_observation(
+            handle.slot_id.0 as usize,
+            handle.generation,
+            if !client_dropped && gr.is_ok() {
+                "completed_post_drain"
+            } else {
+                "failed"
+            },
+        );
+        if let Ok(result) = gr.as_ref() {
+            log_qwen35_slot_decode_complete(result, &reply, client_dropped);
+            if !client_dropped {
+                prompt_caches[slot_idx].store(&cache_prompt, &cache_params, result);
+            }
+        }
+        finish_qwen35_operator_request(
+            handle,
+            if client_dropped {
+                "cancelled"
+            } else {
+                "complete"
+            },
+        );
+        slot_fire_done(reply, gr, client_dropped);
+    } else {
+        slots[slot_idx] = Some((Qwen35SlotWork::Decode(state), reply, handle));
     }
     None
 }
