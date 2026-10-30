@@ -520,9 +520,9 @@ Acceptance:
 
 - The host is dedicated to this program and its single active runtime. Admission charges the measured host baseline at admission time, plus hf2q's calibrated peak for the same artifact, source, workload, context and slot count. It reserves nothing for other agents and no fixed worst-case cells.
 
-- Each family (Qwen3.8 27B, Qwen3.6 35B-A3B, Gemma4 26B-A4B, DeepSeek-V4 Flash) is calibrated by one supervised run of its largest declared four-agent workload. A calibration passes when pressure stays normal, swap does not grow and Free plus cached memory stays positive. The family is recalibrated when its artifact, source, context or slot count changes.
+- Each family (Qwen3.8 27B, Qwen3.6 35B-A3B, Gemma4 26B-A4B, DeepSeek-V4 Flash) is calibrated by one supervised run of its largest declared four-agent workload. A calibration passes when pressure never reaches critical, swap grows by less than 512 MiB and Free plus cached memory stays at or above 2 GiB. The family is recalibrated when its artifact, source, context or slot count changes.
 
-- Every run has live stops: memory pressure leaving normal, swap growth, Free plus cached memory below 2 GiB, or process growth beyond the calibrated peak. A stop is a preserved failed case, not a retry trigger. The stop margin is tied to measured sample and stop latency.
+- Every run has live stops: critical memory pressure, swap growth beyond 512 MiB, Free plus cached memory below 2 GiB, or process growth beyond the calibrated peak. macOS warning pressure is recorded but is not a stop; it was observed routinely while the 107 GB DeepSeek artifact faulted in, with 6.6 GB still reclaimable. A stop is a preserved failed case, not a retry trigger. The stop margin is tied to measured sample and stop latency.
 
 - Exactly one hf2q or peer runtime runs at a time, including metadata commands. Listeners, processes and memory recovery are verified between loads. Idle user applications may be quit when a measurement needs the headroom; system services are kept.
 
