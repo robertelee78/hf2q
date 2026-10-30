@@ -210,11 +210,14 @@ temporary directory outside the source checkout. That build uses a fresh,
 checkout-disjoint `CARGO_HOME` and target directory, clears Rust toolchain,
 compiler, documentation, flags, wrapper, target, and profile override
 variables, and rejects Cargo config anywhere in the packed root's ancestry.
-Release build scripts and proc macros MUST use the checked-in `strip = "none"`
-rule in `[profile.release.build-override]` so macOS 27 cannot reject Rust's
-otherwise misaligned stripped helper dylibs. The packed candidate MUST also
-prove that every generated dylib and the final hf2q Mach-O have a LINKEDIT
-string-pool offset aligned to eight bytes before any candidate is signed.
+Release build scripts, proc macros and the final hf2q binary MUST use the
+checked-in `strip = "none"` rules in `[profile.release.build-override]` and
+`[profile.release]`. Rust's deferred debuginfo stripping can leave the
+LINKEDIT string pool only four-byte aligned, which macOS 27 rejects for
+helper dylibs; ld64's unstripped output is pointer-aligned. The packed
+candidate MUST also prove that every generated dylib and the final hf2q
+Mach-O have a LINKEDIT string-pool offset aligned to eight bytes before any
+candidate is signed.
 Its dependency receipt binds the packed `Cargo.lock` and raw `cargo metadata`
 bytes, including the exact `mlx-native 0.11.2` crates.io source and checksum.
 The protected release workflow rehashes and revalidates those downloaded raw
