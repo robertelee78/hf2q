@@ -80,6 +80,27 @@ case "$FAKE_GH_SCENARIO" in
     fi
     printf '%s\n' "$expected"
     ;;
+  reread-lagging-404)
+    case "$state" in
+      missing)
+        echo '{"message":"Not Found","status":"404"}'
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+        ;;
+      created)
+        printf '%s\n' lagged >"$FAKE_GH_STATE"
+        echo '{"message":"Not Found","status":"404"}'
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+        ;;
+    esac
+    printf '%s\n' "$expected"
+    ;;
+  reread-persistent-404)
+    echo '{"message":"Not Found","status":"404"}'
+    echo 'gh: Not Found (HTTP 404)' >&2
+    exit 1
+    ;;
   reread-wrong)
     if [[ "$state" == missing ]]; then
       echo '{"message":"Not Found","status":"404"}'
@@ -112,6 +133,7 @@ run_case() {
     FAKE_GH_EXPECTED_SHA="$expected_sha" \
     FAKE_GH_CALLS="$case_dir/calls" \
     FAKE_GH_STATE="$case_dir/state" \
+    HF2Q_TAG_REREAD_DELAY_SECONDS=0 \
     "$HELPER" example/hf2q v0.1.7 "$expected_sha" \
     >"$case_dir/stdout" 2>"$case_dir/stderr" || rc=$?
 
@@ -179,6 +201,20 @@ run_case reread-failure fail
 grep -qF 'failed to re-read created tag v0.1.7' \
   "$scratch/reread-failure/stderr" || \
   fail "re-read API failure lacked a diagnostic"
+
+run_case reread-lagging-404 pass
+[[ "$(wc -l <"$scratch/reread-lagging-404/calls" | tr -d ' ')" -eq 4 ]] || \
+  fail "lagging re-read did not retry exactly once after the explicit 404"
+grep -qF "created and verified tag v0.1.7 at $expected_sha" \
+  "$scratch/reread-lagging-404/stdout" || \
+  fail "lagging re-read did not verify the created tag"
+
+run_case reread-persistent-404 fail
+[[ "$(wc -l <"$scratch/reread-persistent-404/calls" | tr -d ' ')" -eq 8 ]] || \
+  fail "persistent re-read 404 did not stop after the bounded attempts"
+grep -qF 'failed to re-read created tag v0.1.7' \
+  "$scratch/reread-persistent-404/stderr" || \
+  fail "persistent re-read 404 lacked a diagnostic"
 
 grep -qF 'bash scripts/ensure_github_release_tag.sh' "$RELEASE_WORKFLOW" || \
   fail "release workflow does not invoke the tested tag helper"
