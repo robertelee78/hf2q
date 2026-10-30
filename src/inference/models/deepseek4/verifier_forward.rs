@@ -12,6 +12,7 @@ use super::forward_support::{
     begin_prefill_submission_inputs, end_decode_pool_token, end_prefill_pool_layer,
     end_prefill_submission_inputs,
 };
+use super::row_matmul::RowMatmul;
 use super::submission::{drain, retained_reference_pipeline_enabled, SubmissionChain};
 use super::Deepseek4Model;
 
@@ -269,6 +270,25 @@ fn default_graph_layers_per_command_buffer(
     } else {
         1
     }
+}
+
+/// Retained decode layers per command buffer, shared by the one-token and
+/// joint decode graphs so both submit identical layer groupings.
+pub(super) fn decode_layers_per_command_buffer(layers: usize) -> Result<usize> {
+    let value = std::env::var("HF2Q_DEEPSEEK_LAYERS_PER_CB")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .context("HF2Q_DEEPSEEK_LAYERS_PER_CB must be a positive integer")
+        })
+        .transpose()?
+        .unwrap_or(2);
+    anyhow::ensure!(
+        (1..=layers).contains(&value),
+        "HF2Q_DEEPSEEK_LAYERS_PER_CB must be in 1..={layers}"
+    );
+    Ok(value)
 }
 
 impl Deepseek4Model {
@@ -620,8 +640,13 @@ impl Deepseek4Model {
                 let mut row_offset = 0_usize;
                 for sequence in 0..token_batches.len() {
                     let rows = rows_per_sequence[sequence];
-                    let _native_input = crate::inference::native_observation::sorted_prefill_lane_input(
-                        sequence,token_batches.len(),spans[sequence].start_position,rows);
+                    let _native_input =
+                        crate::inference::native_observation::sorted_prefill_lane_input(
+                            sequence,
+                            token_batches.len(),
+                            spans[sequence].start_position,
+                            rows,
+                        );
                     let element_offset = row_offset
                         .checked_mul(row_elements)
                         .context("DeepSeek-V4 cooperative state offset overflow")?;
@@ -741,13 +766,21 @@ impl Deepseek4Model {
 
                 begin_prefill_pool_layer();
                 let ffn_result: Result<MlxBuffer> = (|| {
-                    let _native_input = crate::inference::native_observation::sorted_prefill_pack_input(
-                        total_rows,spans.iter().zip(&rows_per_sequence)
-                            .map(|(span,rows)| (span.start_position,*rows)));
+                    let _native_input =
+                        crate::inference::native_observation::sorted_prefill_pack_input(
+                            total_rows,
+                            spans
+                                .iter()
+                                .zip(&rows_per_sequence)
+                                .map(|(span, rows)| (span.start_position, *rows)),
+                        );
                     let mut completion = SubmissionChain::with_capacity(0);
-                    let mut session = executor.begin_recorded().map(crate::inference::native_observation::session).with_context(|| {
-                        format!("begin DeepSeek-V4 cooperative prefill layer {layer} FFN")
-                    })?;
+                    let mut session = executor
+                        .begin_recorded()
+                        .map(crate::inference::native_observation::session)
+                        .with_context(|| {
+                            format!("begin DeepSeek-V4 cooperative prefill layer {layer} FFN")
+                        })?;
                     let next_state = self.forward_ffn_rows(
                         &combined_attention,
                         &combined_tokens,
@@ -760,6 +793,7 @@ impl Deepseek4Model {
                         // calibration capture (capture is single-sequence,
                         // fresh-cache-per-prompt by contract).
                         None,
+                        RowMatmul::Matrix,
                     )?;
                     session.finish().with_context(|| {
                         format!("execute DeepSeek-V4 cooperative prefill layer-{layer} FFN")
@@ -808,7 +842,10 @@ impl Deepseek4Model {
         mut capture: Option<PrefillCapture<'_>>,
     ) -> Result<MlxBuffer> {
         let _native_input = crate::inference::native_observation::single_input(
-            "deepseek4.prefill.actual_cache_span",span.start_position,token_ids.len());
+            "deepseek4.prefill.actual_cache_span",
+            span.start_position,
+            token_ids.len(),
+        );
         let layers = self.cfg.num_hidden_layers as usize;
         let executor = GraphExecutor::new(self.ctx.device().clone());
         let profile_timing = std::env::var_os("HF2Q_DEEPSEEK_PREFILL_TIMING").is_some();
@@ -887,9 +924,12 @@ impl Deepseek4Model {
                 begin_prefill_submission_inputs();
                 let group_result: Result<()> = (|| {
                     let mut completion = SubmissionChain::with_capacity(0);
-                    let mut session = executor.begin_recorded().map(crate::inference::native_observation::session).with_context(|| {
-                        format!("begin DeepSeek-V4 recorded prefill layers {start}..{end}")
-                    })?;
+                    let mut session = executor
+                        .begin_recorded()
+                        .map(crate::inference::native_observation::session)
+                        .with_context(|| {
+                            format!("begin DeepSeek-V4 recorded prefill layers {start}..{end}")
+                        })?;
                     for layer in start..end {
                         begin_prefill_pool_layer();
                         let layer_result = self.encode_verifier_layer_prefill(
@@ -940,9 +980,13 @@ impl Deepseek4Model {
                 let mut completion = SubmissionChain::with_capacity(0);
                 let record_graph = (layer == 0 && graph_diag) || graph_reorder;
                 let mut session = if record_graph {
-                    executor.begin_recorded().map(crate::inference::native_observation::session)
+                    executor
+                        .begin_recorded()
+                        .map(crate::inference::native_observation::session)
                 } else {
-                    executor.begin().map(crate::inference::native_observation::session)
+                    executor
+                        .begin()
+                        .map(crate::inference::native_observation::session)
                 }
                 .with_context(|| format!("begin DeepSeek-V4 prefill layer {layer}"))?;
                 // ADR-054 per-family calibration (#300): at the target
@@ -1149,6 +1193,7 @@ impl Deepseek4Model {
             Some(output_state),
             id_mm_scratch,
             writer_capture,
+            RowMatmul::Matrix,
         )
         .with_context(|| format!("encode DeepSeek-V4 prefill layer-{layer} FFN"))
     }
@@ -1180,7 +1225,10 @@ impl Deepseek4Model {
         commit_gate: impl FnOnce() -> Result<()>,
     ) -> Result<MlxBuffer> {
         let _native_input = crate::inference::native_observation::single_input(
-            "deepseek4.scalar_verifier",cache.position(),1);
+            "deepseek4.scalar_verifier",
+            cache.position(),
+            1,
+        );
         let position = cache.position();
         let result = self.forward_verifier_one_uncommitted(token_id, cache);
         match result {
@@ -1272,19 +1320,7 @@ impl Deepseek4Model {
         cache: &mut Deepseek4Cache,
     ) -> Result<MlxBuffer> {
         let layers = self.cfg.num_hidden_layers as usize;
-        let layers_per_command_buffer = std::env::var("HF2Q_DEEPSEEK_LAYERS_PER_CB")
-            .ok()
-            .map(|value| {
-                value
-                    .parse::<usize>()
-                    .context("HF2Q_DEEPSEEK_LAYERS_PER_CB must be a positive integer")
-            })
-            .transpose()?
-            .unwrap_or(2);
-        anyhow::ensure!(
-            (1..=layers).contains(&layers_per_command_buffer),
-            "HF2Q_DEEPSEEK_LAYERS_PER_CB must be in 1..={layers}"
-        );
+        let layers_per_command_buffer = decode_layers_per_command_buffer(layers)?;
 
         let executor = GraphExecutor::new(self.ctx.device().clone());
         let command_buffers = layers.div_ceil(layers_per_command_buffer);
@@ -1294,7 +1330,8 @@ impl Deepseek4Model {
             for start in (0..layers).step_by(layers_per_command_buffer) {
                 let end = (start + layers_per_command_buffer).min(layers);
                 let mut session = executor
-                    .begin().map(crate::inference::native_observation::session)
+                    .begin()
+                    .map(crate::inference::native_observation::session)
                     .with_context(|| format!("begin DeepSeek-V4 verifier layers {start}..{end}"))?;
                 for layer in start..end {
                     state = Some(self.encode_verifier_layer(

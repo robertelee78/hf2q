@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- DeepSeek-V4 four-agent decode now advances every eligible decoding slot (2–4 rows by default, unequal positions, streaming and unary) through one layer-major forward per token step instead of serial per-slot quanta. Row-parallel projections, FFN and output head dispatch once per step; cache-dependent attention stays per row. Each row is bitwise identical to serial decode on the official artifact. Joint decode engages only when every batched product of the loaded artifact uses a proven-exact storage type (Q8_0, Q2_K or Q3_K; float weights only where split per row; grouped output-A only as Q8_0); other artifacts keep serial decode and log the reason at worker start. On the four-agent C262144 coding workload (M5 Max, 4 runs per arm), median makespan fell 25.9% from 141.7 s to 105.0 s (1.35× throughput; geometric-mean time ratio 1.335×, 95% CI 1.258–1.417×), and per-request decode rose from 8.1 to 11.0 tok/s. `HF2Q_DEEPSEEK_JOINT_DECODE=0` restores the serial path. `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` (2–8) widens joint steps beyond 4; those widths have no serving measurement.
+
 ### Fixed
 
 - Keep the Qwen tool-continuation thinking ceiling (default 512) at every tool-chain depth. Halving it to a 256-token floor from the second tool result forced the reasoning close inside the first edit plan of an ordinary read/read/write coding workflow.

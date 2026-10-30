@@ -17,11 +17,12 @@ use mlx_native::ops::deepseek_moe_routing::{
 };
 use mlx_native::{DType, GraphExecutor, IdMmScratch, MlxBuffer, MM_ID_ROUTING_THRESHOLD};
 
-use super::prefill_annotations;
 use super::forward_support::{
-    alloc, alloc_host_input, alloc_persistent, expert_matmul, expert_matmul_pair, raw_matmul,
-    rms_params, ExpertMatmulRoute,
+    alloc, alloc_host_input, alloc_persistent, expert_matmul, expert_matmul_pair, rms_params,
+    ExpertMatmulRoute,
 };
+use super::prefill_annotations;
+use super::row_matmul::{row_matmul, RowMatmul};
 use super::submission::{finish_or_commit, SubmissionChain};
 use super::Deepseek4Model;
 
@@ -84,6 +85,7 @@ impl Deepseek4Model {
             None,
             None,
             None,
+            RowMatmul::Matrix,
         )
     }
 
@@ -96,6 +98,12 @@ impl Deepseek4Model {
     /// slot after this layer's encode, for a host-side read after the
     /// caller's session commits. `None` on every existing path — the
     /// buffer is handed back only for a writer-site calibration capture.
+    ///
+    /// `matmul` states what the rows are. `Matrix` rows are consecutive
+    /// tokens of one prompt; `IndependentRows` rows are unrelated decode
+    /// requests (joint decode), so every product keeps the per-row route the
+    /// one-token graph uses: routed experts always take the per-token `mv_id`
+    /// kernel and dense float weights apply one row at a time.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_ffn_rows(
         &mut self,
@@ -107,6 +115,7 @@ impl Deepseek4Model {
         reusable_output_state: Option<MlxBuffer>,
         mut id_mm_scratch: Option<&mut [IdMmScratch; 2]>,
         writer_capture: Option<&mut Option<MlxBuffer>>,
+        matmul: RowMatmul,
     ) -> Result<MlxBuffer> {
         if layer >= self.cfg.num_hidden_layers as usize {
             bail!(
@@ -260,7 +269,13 @@ impl Deepseek4Model {
                 .context("DeepSeek-V4 token ID exceeds signed routing range")?;
         }
         let rows_u32 = u32::try_from(rows).context("DeepSeek-V4 FFN rows exceed u32")?;
-        let routed_projection = if lookup.is_some() && rows == 1 {
+        let independent_rows = matmul == RowMatmul::IndependentRows;
+        let routed_projection = if independent_rows || (lookup.is_some() && rows == 1) {
+            ExpertMatmulRoute::ForceMv
+        } else {
+            ExpertMatmulRoute::Auto
+        };
+        let routed_down_projection = if independent_rows {
             ExpertMatmulRoute::ForceMv
         } else {
             ExpertMatmulRoute::Auto
@@ -278,7 +293,8 @@ impl Deepseek4Model {
                 rows_u32,
                 hc_hidden as u32,
             )?;
-            raw_matmul(
+            row_matmul(
+                matmul,
                 session,
                 registry,
                 &device,
@@ -326,7 +342,8 @@ impl Deepseek4Model {
                 hidden as u32,
             )?;
             split_profile_stage(session, "DeepSeek-V4 FFN hyper-connection prelude")?;
-            raw_matmul(
+            row_matmul(
+                matmul,
                 session,
                 registry,
                 &device,
@@ -451,7 +468,8 @@ impl Deepseek4Model {
                     "routed up",
                 )?;
             }
-            raw_matmul(
+            row_matmul(
+                matmul,
                 session,
                 registry,
                 &device,
@@ -463,7 +481,8 @@ impl Deepseek4Model {
                 hidden,
                 "shared gate",
             )?;
-            raw_matmul(
+            row_matmul(
+                matmul,
                 session,
                 registry,
                 &device,
@@ -535,12 +554,13 @@ impl Deepseek4Model {
                     experts,
                     hidden,
                     inter,
-                    ExpertMatmulRoute::Auto,
+                    routed_down_projection,
                     None,
                     "routed down",
                 )?;
             }
-            raw_matmul(
+            row_matmul(
+                matmul,
                 session,
                 registry,
                 &device,
@@ -725,7 +745,8 @@ impl Deepseek4Model {
         } else {
             let local_executor = GraphExecutor::new(device.clone());
             let mut session = local_executor
-                .begin().map(crate::inference::native_observation::session)
+                .begin()
+                .map(crate::inference::native_observation::session)
                 .with_context(|| format!("begin DeepSeek-V4 layer {layer} FFN"))?;
             encode(&mut session)?;
             finish_or_commit(
