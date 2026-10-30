@@ -154,6 +154,18 @@ For each family, `c5_frontend_summary.py` takes warm streamed requests: `stream=
 - **Falsified (expected):** the median share is ≤ 10% for every family. C5 then closes with the summary JSONs, the Q5 receipts and the paired client `semantic_ttft_seconds` (from `client/summary.json`) as a cross-check on `first_output_us`. No implementation follows.
 - **Material:** the median share is > 10% for some family. Open the implementation for that family only, starting with the span that dominates (expected: `tokenize_us` + `stable_tokenize_us`). Gate it with an oracle: token ids identical to a full `tokenizers` encode for every prefix/suffix split of each family template's rendered transcripts. Use `scripts/four_agent/fixtures/canonical-coding-requests.json` and the captured agent transcripts under `$E/client-capture*`. Cover randomized boundary edits, special tokens, template switches and image placeholders. Then require a paired end-to-end TTFT A/B against the gate-off binary.
 
+### Measured verdict (2026-10-30, M5 Max 128 GB): falsified
+
+Source `c4316b3f` with `HF2Q_FRONTEND_TIMING=1`, one four-agent coding run per family under the Q5 supervisor (every run `CalibrationPass`, protocol complete). Warm streamed requests, n = 12 per family:
+
+| family | frontend p50 | first output p50 | share p50 | share max | verdict |
+|---|---:|---:|---:|---:|---|
+| DeepSeek-V4 | 2.30 ms | 3.32 s | 0.074% | 0.122% | not material |
+| Qwen3.8 | 2.89 ms | 1.86 s | 0.156% | 0.297% | not material |
+| Gemma 4 | 1.94 ms | 1.26 s | 0.156% | 0.583% | not material |
+
+Every family is far below the 10% gate, so C5 closes on this falsification and no implementation follows. Receipts and summaries: `$E/c5-runs-v1/{deepseek4-20261030T155611Z,qwen38-20261030T155910Z,gemma4-20261030T160447Z}/{receipt.json,c5-summary.json}`. Qwen3.6 was not run; its frontend is the Qwen35 path measured for Qwen3.8. The timing spans stay as an opt-in diagnostic.
+
 ## Risks
 
 - The offline numbers use Python bindings over the same Rust libraries, on the same CPU. They are an estimate, not the served path, and the hardware run is what decides.
