@@ -353,6 +353,24 @@ python3 -B scripts/four_agent/quality_campaign.py \
 
 A floor-only family (for example DeepSeek-V4) omits the three `--reference-*` options.
 
+## Three-arm speed campaign (ADR-063 Q3)
+
+`q3_campaign.py` runs the per-family Q3 comparison: stock hf2q (`--stock-bin`, the released binary), experiment hf2q (`--experiment-bin`) and the peer's best valid configuration (`q5_cases/peer-<family>.json`). A labeled matched-settings peer diagnostic (`--peer-matched-case`) is optional. Every run is one `q5_calibration.py` runtime, run one at a time. The design, estimator, verdict rules and root commands are in [docs/research/adr063-q3-campaign.md](../../docs/research/adr063-q3-campaign.md).
+
+- **Identities.** Binaries (with the peer's sibling dylibs), model, peer `build_info`, argv input files, harness sources and commit, Python and host are frozen at start and re-checked before every run and against every receipt. Any change is a terminal `IdentityDrift`.
+- **Stages.** `n4` (primary, all four agents together), then the controls `n1`, `3+1`, `2+2` and `1+3`. Each stage runs one discarded warmup per arm per driver session, then Williams-ordered blocks: 5 to 20 blocks, stopping when every required makespan contrast has a 95% half-width ≤ 2.5 points.
+- **Verdict.** `verdict.json` holds `Win`, `Loss`, `Inconclusive`, `Unavailable`, `Failed` or `Pending`, with effects, CIs and reasons. `--verdict DIR` recomputes it with `--quality-verdict` (a Q1 paired manifest on the experiment binary) and `--patch-review`. `--rows DIR --evidence-root "$E"` prints F2 scoreboard rows.
+- **Halting and resume.** A peer that cannot load or runs out of memory becomes `Unavailable`, and the remaining blocks run without it. `--peer-unavailable-evidence` declares this up front. An experiment task failure ends the campaign as `Failed`. A run that did not start halts the campaign, and `--resume` retries it.
+- **Client phase plans.** The client takes `--phase-plan {1,3+1,2+2,1+3}`. `1` runs `agent-0` alone on the four-slot server. `K+M` releases K agents, then the remaining M once each of the K has its first decoded token: the first reasoning or semantic SSE frame of its first streamed turn, published as `barrier/<agent>.first-decode.json`. Without the option, the child argv, release record and summaries are byte-identical to earlier runs.
+
+| File | Role |
+| --- | --- |
+| `q3_campaign.py` | CLI and driver: plan, derived cases, schedule, runs, halts, resume, `--dry-run`, `--verdict`, `--rows` |
+| `q3_identity.py` | Frozen identities, launch checks, identity diff |
+| `q3_metrics.py` | Run outcome classification and per-run metrics from receipts |
+| `q3_stats.py` | Williams sequences, paired log-ratio estimator, stopping rule, family verdict |
+| `q3_report.py` | Stage effects, `verdict.json`, quality inputs, F2 rows |
+
 ## F2 scoreboard rendering
 
 `f2_scoreboard_render.py` renders [docs/research/adr063-f2-scoreboard.md](../../docs/research/adr063-f2-scoreboard.md) from the checked-in rows manifest `docs/research/adr063-f2-scoreboard-rows.json` (schema `hf2q.f2.scoreboard-rows.v1`) plus any `f2_scoreboard_cli.py` outputs. Only those fixed-six outputs can produce Qualified F2 primary results; manifest rows are Descriptive, NegativeResult or Failure receipts and cite `$E/...` receipt paths and extraction keys, never absolute local paths. `--verify` re-reads every Verified row from its receipt and refuses drift:

@@ -26,6 +26,42 @@ MODULES = ("qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_verdict.py",
            "coding_family.py", "test_coding_family.py", "qwen_n4_peer.py", "test_qwen_n4_peer.py",
            "family_peer.py", "test_family_peer.py", "f2_semantic.py")
 INTERRUPTED = False
+# ADR-063 Q3 controls (--phase-plan): agents in release cohorts on the same four-slot server.
+# "1" is the one-agent control; "K+M" releases K agents, then the remaining M once every one of
+# the first K has received its first decoded token. Absent, all four start together (pure phase,
+# the canonical workload), byte-identical to runs before phase plans existed.
+PHASE_PLANS = {"1": (1,), "3+1": (3, 1), "2+2": (2, 2), "1+3": (1, 3)}
+FIRST_DECODE_SCHEMA = "hf2q.n4-first-decode.v1"
+
+
+def phase_cohorts(plan):
+    """Agent ids per release cohort; None is the canonical single release of all four agents."""
+    if plan is None:
+        return (AGENTS,)
+    require(plan in PHASE_PLANS, "unknown phase plan")
+    cohorts, start = [], 0
+    for size in PHASE_PLANS[plan]:
+        cohorts.append(AGENTS[start:start + size])
+        start += size
+    return tuple(cohorts)
+
+
+def active_agents(plan):
+    return tuple(agent for cohort in phase_cohorts(plan) for agent in cohort)
+
+
+def agent_phase(plan, agent):
+    """The per-agent phase record ({"plan", "cohort"}), None for the canonical workload."""
+    if plan is None:
+        return None
+    for index, cohort in enumerate(phase_cohorts(plan), 1):
+        if agent in cohort:
+            return {"plan": plan, "cohort": index}
+    raise Invalid("agent outside the phase plan")
+
+
+def release_name(cohort):
+    return "release.json" if cohort == 1 else f"release-{cohort}.json"
 
 
 def identity(agent, run, instance=None):
@@ -99,10 +135,10 @@ def save_new(path, value):
         pending.unlink()
 
 
-def validate_ready(records, run, pid, token, instance=None):
-    require(set(records) == set(AGENTS), "all four independent agents required")
+def validate_ready(records, run, pid, token, instance=None, agents=AGENTS):
+    require(set(records) == set(agents), "all four independent agents required")
     outputs, hashes = set(), set()
-    for agent in AGENTS:
+    for agent in agents:
         record = records[agent]
         require(record.get("schema") == "hf2q.n4-agent-ready.v1" and record.get("agent_id") == agent
                 and record.get("run_id") == run and record.get("server_pid") == pid
@@ -113,29 +149,37 @@ def validate_ready(records, run, pid, token, instance=None):
                 re.fullmatch(r"[a-f0-9]{64}", record["initial_messages_sha256"]), "ready prompt fingerprint")
         outputs.add(record.get("output"))
         hashes.add(record["initial_messages_sha256"])
-    require(len(outputs) == 4 and None not in outputs and len(hashes) == 4, "shared agent output/prompt")
+    require(len(outputs) == len(agents) and None not in outputs and len(hashes) == len(agents),
+            "shared agent output/prompt")
 
 
-def barrier_release(records, run, pid, token, hashes, instance=None):
-    validate_ready(records, run, pid, token, instance)
-    require(set(hashes) == set(AGENTS), "missing ready hashes")
+def barrier_release(records, run, pid, token, hashes, instance=None, agents=AGENTS):
+    validate_ready(records, run, pid, token, instance, agents)
+    require(set(hashes) == set(agents), "missing ready hashes")
     return {"schema": "hf2q.n4-barrier-release.v1", "run_id": run, "server_pid": pid,
-            "barrier_token": token, "agents": list(AGENTS), "ready_sha256": hashes}
+            "barrier_token": token, "agents": list(agents), "ready_sha256": hashes}
 
 
-def validate_release(value, agent, run, pid, token, own_hash):
+def validate_release(value, agent, run, pid, token, own_hash, agents=AGENTS):
     require(value.get("schema") == "hf2q.n4-barrier-release.v1" and value.get("run_id") == run and
             value.get("server_pid") == pid and value.get("barrier_token") == token and
-            value.get("agents") == list(AGENTS), "stale/mismatched barrier release")
+            value.get("agents") == list(agents), "stale/mismatched barrier release")
     hashes = value.get("ready_sha256", {})
-    require(set(hashes) == set(AGENTS) and all(isinstance(v, str) and re.fullmatch(r"[a-f0-9]{64}", v)
+    require(set(hashes) == set(agents) and all(isinstance(v, str) and re.fullmatch(r"[a-f0-9]{64}", v)
                                                for v in hashes.values()), "incomplete release hashes")
     require(hashes[agent] == own_hash, "own ready changed")
 
 
-def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approval_hash, instance=None):
+def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approval_hash, instance=None, phase=None):
+    """`phase` is the agent's {"plan", "cohort"} under --phase-plan, None for the canonical release."""
     directory = Path(directory)
     require(directory.is_dir() and not directory.is_symlink(), "owned barrier directory")
+    agents, name, limit = AGENTS, "release.json", 120
+    if phase is not None:
+        require(agent_phase(phase["plan"], agent) == phase, "agent outside its phase cohort")
+        agents, name = active_agents(phase["plan"]), release_name(phase["cohort"])
+        if phase["cohort"] > 1:
+            limit = 7200  # a later cohort waits for the earlier cohort's first decoded tokens
     record = {"schema": "hf2q.n4-agent-ready.v1", "agent_id": agent, "run_id": run,
               "server_pid": pid, "barrier_token": token, "output": str(Path(output).resolve()),
               "identity_sha256": hashlib.sha256(identity(agent, run, instance).encode()).hexdigest(),
@@ -143,24 +187,53 @@ def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approv
     ready_path = directory / f"{agent}.ready.json"
     save_new(ready_path, record)
     started = time.monotonic()
-    release = directory / "release.json"
+    release = directory / name
     while not release.exists():
-        require(time.monotonic() - started < 120, "four-client barrier timeout")
+        require(time.monotonic() - started < limit, "four-client barrier timeout")
         time.sleep(0.02)
     value = loads(release.read_bytes())
-    validate_release(value, agent, run, pid, token, child.digest(ready_path))
+    validate_release(value, agent, run, pid, token, child.digest(ready_path), agents)
+    if phase is not None:
+        require(value.get("phase_plan") == phase["plan"] and value.get("cohort") == phase["cohort"],
+                "phase release mismatch")
     return {"status": "Released", "ready_sha256": child.digest(ready_path),
             "release_sha256": child.digest(release), "wait_seconds": time.monotonic() - started,
             "release_monotonic_ns": value.get("release_monotonic_ns"),
             "f2_clock_id": value.get("f2_clock_id")}
 
 
-def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen", instance_record=None):
-    """`instance_record` is the coordinator's {"id", "table_sha256"}; None for the canonical task."""
+def first_decode_marker(directory, agent, run, token, monotonic_ns):
+    """Published by an agent of a non-final cohort at its first decoded token (first streamed turn)."""
+    save_new(Path(directory) / f"{agent}.first-decode.json",
+             {"schema": FIRST_DECODE_SCHEMA, "agent_id": agent, "run_id": run, "barrier_token": token,
+              "f2_clock_id": CLOCK_ID, "first_decode_monotonic_ns": monotonic_ns})
+
+
+def phase_trigger(directory, agents, run, token):
+    """{agent: first-decode clock} once every agent in `agents` has published its marker, else None."""
+    found = {}
+    for agent in agents:
+        path = Path(directory) / f"{agent}.first-decode.json"
+        if not path.exists():
+            return None
+        value = loads(path.read_bytes())
+        require(value.get("schema") == FIRST_DECODE_SCHEMA and value.get("agent_id") == agent and
+                value.get("run_id") == run and value.get("barrier_token") == token and
+                value.get("f2_clock_id") == CLOCK_ID and type(value.get("first_decode_monotonic_ns")) is int,
+                "first-decode marker binding")
+        found[agent] = value["first_decode_monotonic_ns"]
+    return found
+
+
+def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen", instance_record=None,
+              phase_plan=None):
+    """`instance_record` is the coordinator's {"id", "table_sha256"}; None for the canonical task.
+    `phase_plan` selects the active agents and each agent's cohort; None is all four together."""
     family_contract.validate_selection(family, engine_kind, 4)
-    require(set(results) == set(exits) == set(cleanup) == set(AGENTS), "missing agent result")
+    agents = active_agents(phase_plan)
+    require(set(results) == set(exits) == set(cleanup) == set(agents), "missing agent result")
     initial = set()
-    for agent in AGENTS:
+    for agent in agents:
         result = results[agent]
         require(result.get("engine_kind", "hf2q") == engine_kind, "mixed engine result")
         require(result.get("family", "qwen") == family, "mixed diagnostic family result")
@@ -181,13 +254,14 @@ def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwe
         require(result.get("initial_identity_sha256") == hashlib.sha256(identity(agent, run, instance).encode()).hexdigest(),
                 "aggregate prompt identity")
         require(result.get("instance") == instance_record, "aggregate task instance")
+        require(result.get("phase") == agent_phase(phase_plan, agent), "aggregate phase cohort")
         require(result.get("final_source_sha256") == result.get("observed_final_source_sha256")
                 and isinstance(result.get("final_source_sha256"), str), "final fixture changed")
         require(qualify(result["turns"], result["tools"], result["cleanup"],
                         result["final_source_sha256"], result["observed_final_source_sha256"]) == result["status"],
                 "child protocol receipt contradiction")
         initial.add(result.get("initial_messages_sha256"))
-    require(len(initial) == 4 and None not in initial, "agent prompts not independent")
+    require(len(initial) == len(agents) and None not in initial, "agent prompts not independent")
     return "FourAgentProtocolCompleteAwaitingIndependentReview"
 
 
@@ -202,6 +276,25 @@ def descendants(rows, leader, known):
     known.update({p: rows[p][3] for p in owned if p in rows})
 
 
+def agent_command(args, module_dir, agent, path, approval_path, barrier, run, token):
+    """Exact child argv; phase options are appended only under --phase-plan."""
+    command = [sys.executable, "-E", "-s", "-B", str(module_dir / "qwen38_n1_smoke.py")]
+    for key in ("base_url", "model", "cargo", "toolchain", "sandbox_exec", "sandbox_proof",
+                "sandbox_proof_sha256", "server_pid"):
+        command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
+    command += ["--output", str(path), "--approval", str(approval_path), "--approval-sha256",
+                child.digest(approval_path), "--diagnostic-slots", "4", "--family", args.family, "--engine-kind", args.engine_kind, "--agent-id", agent,
+                "--run-id", run, "--barrier-dir", str(barrier), "--barrier-token", token]
+    if args.benchmark_profile is not None:
+        command += ["--benchmark-profile", args.benchmark_profile]
+    if args.instance is not None:
+        command += ["--instance", str(args.instance)]
+    phase = agent_phase(args.phase_plan, agent)
+    if phase is not None:
+        command += ["--phase-plan", phase["plan"], "--phase-cohort", str(phase["cohort"])]
+    return command
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("base-url", "model", "output", "cargo", "toolchain", "sandbox-exec", "sandbox-proof",
@@ -214,6 +307,9 @@ def main():
     parser.add_argument("--instance", type=int,
                         help="quality-campaign task instance (row of fixtures/coding-instances.json); "
                              "omit for the canonical parse_port workload")
+    parser.add_argument("--phase-plan", choices=sorted(PHASE_PLANS),
+                        help="ADR-063 Q3 control: '1' runs agent-0 alone; 'K+M' releases K agents, then the "
+                             "other M once each of the K has its first decoded token; omit for all four at once")
     args = parser.parse_args()
     family_contract.validate_selection(args.family, args.engine_kind, 4)
     from qwen38_n1_smoke import new_output, PREFLIGHT
@@ -231,6 +327,7 @@ def main():
                "full_prefix_reuse": "PendingPostOracle", "server_owned_by_outer_supervisor": True}
     processes, known, streams, receipts = {}, {}, [], {}
     results, exits, cleanup = {}, {}, {}
+    cohorts, agents = phase_cohorts(args.phase_plan), active_agents(args.phase_plan)
     started = time.monotonic()
     try:
         require(child.digest(args.approval) == args.approval_sha256, "coordinator approval hash")
@@ -258,6 +355,8 @@ def main():
             from coding_instances import MODULES as INSTANCE_MODULES
             names += INSTANCE_MODULES
             summary["instance"] = workload.record()
+        require(args.phase_plan is None or (workload is None and args.benchmark_profile is None),
+                "phase plans are controls of the canonical workload")
         sources = {name: child.digest(module_dir / name) for name in names}
         require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
         summary["engine_kind"] = args.engine_kind
@@ -272,9 +371,11 @@ def main():
         template = packet.get("agent_template", {})
         validate_preflight(template.get("preflight"), PREFLIGHT, args.engine_kind, args.family)
         summary["run_id"] = run
+        if args.phase_plan is not None:
+            summary["phase"] = {"plan": args.phase_plan, "cohorts": [list(c) for c in cohorts], "releases": []}
         barrier = output / "barrier"
         barrier.mkdir(mode=0o700)
-        for agent in AGENTS:
+        for agent in agents:
             require(not INTERRUPTED, "interrupted before any further client launch")
             path = output / agent
             binding = {**template, "schema": family_contract.schema(args.family, "agent-approval", 4),
@@ -287,17 +388,7 @@ def main():
                        "model": args.model, "approved": True, **({} if workload is None else workload.binding())}
             approval_path = output / f"{agent}.approval.json"
             save_new(approval_path, binding)
-            command = [sys.executable, "-E", "-s", "-B", str(module_dir / "qwen38_n1_smoke.py")]
-            for key in ("base_url", "model", "cargo", "toolchain", "sandbox_exec", "sandbox_proof",
-                        "sandbox_proof_sha256", "server_pid"):
-                command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
-            command += ["--output", str(path), "--approval", str(approval_path), "--approval-sha256",
-                        child.digest(approval_path), "--diagnostic-slots", "4", "--family", args.family, "--engine-kind", args.engine_kind, "--agent-id", agent,
-                        "--run-id", run, "--barrier-dir", str(barrier), "--barrier-token", token]
-            if args.benchmark_profile is not None:
-                command += ["--benchmark-profile", args.benchmark_profile]
-            if workload is not None:
-                command += ["--instance", str(args.instance)]
+            command = agent_command(args, module_dir, agent, path, approval_path, barrier, run, token)
             stdout, stderr = [(output / f"{agent}.{name}").open("xb") for name in ("stdout", "stderr")]
             streams += [stdout, stderr]
             require(not INTERRUPTED, "interrupted immediately before child launch")
@@ -307,7 +398,7 @@ def main():
             save_new(output / f"{agent}.command.json", {"argv": command, "pid": process.pid})
         records, hashes = {}, {}
         until = time.monotonic() + 120
-        while len(records) != 4:
+        while len(records) != len(agents):
             require(not INTERRUPTED and time.monotonic() < until, "N4 barrier deadline/interruption")
             for agent, process in processes.items():
                 require(process.poll() is None, "agent exited before shared release")
@@ -318,8 +409,10 @@ def main():
                             records[agent].get("approval_sha256") == child.digest(output / f"{agent}.approval.json"),
                             "ready output/approval mismatch")
             time.sleep(0.02)
-        release = barrier_release(records, run, args.server_pid, token, hashes, args.instance)
+        release = barrier_release(records, run, args.server_pid, token, hashes, args.instance, agents)
         require(not INTERRUPTED, "interrupted before shared release")
+        if args.phase_plan is not None:
+            release.update(phase_plan=args.phase_plan, cohort=1)
         release["f2_clock_id"] = CLOCK_ID
         release["release_monotonic_ns"] = clock_ns()
         summary["f2_clock_id"] = CLOCK_ID
@@ -328,6 +421,10 @@ def main():
         summary["barrier"] = {"status": "Released", "ready": records,
                               "release_sha256": child.digest(barrier / "release.json"),
                               "release_monotonic_ns": release["release_monotonic_ns"]}
+        if args.phase_plan is not None:
+            summary["phase"]["releases"].append({"cohort": 1, "release_monotonic_ns": release["release_monotonic_ns"],
+                                                 "trigger_first_decode_monotonic_ns": None})
+        next_cohort = 2
         while any(process.poll() is None for process in processes.values()):
             require(not INTERRUPTED and time.monotonic() - started < 7320, "N4 deadline/interruption")
             os.kill(args.server_pid, 0)
@@ -335,6 +432,19 @@ def main():
             for agent, process in processes.items():
                 descendants(rows, process.pid, known[agent])
                 require(process.poll() in (None, 0), "one agent failed; no partial success")
+            if next_cohort <= len(cohorts):
+                waiting_on = cohorts[next_cohort - 2]
+                trigger = phase_trigger(barrier, waiting_on, run, token)
+                if trigger is None:
+                    require(all(processes[a].poll() is None for a in waiting_on),
+                            "phase trigger agent exited before its first decoded token")
+                else:
+                    later = {**release, "cohort": next_cohort, "release_monotonic_ns": clock_ns()}
+                    save_new(barrier / release_name(next_cohort), later)
+                    summary["phase"]["releases"].append({"cohort": next_cohort,
+                                                         "release_monotonic_ns": later["release_monotonic_ns"],
+                                                         "trigger_first_decode_monotonic_ns": trigger})
+                    next_cohort += 1
             time.sleep(0.05)
     except BaseException as exc:
         summary["status"], summary["error"] = "Failed", f"{type(exc).__name__}: {exc}"
@@ -356,11 +466,11 @@ def main():
         if summary["status"] != "Failed":
             try:
                 summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.engine_kind, args.family,
-                                              summary.get("instance"))
+                                              summary.get("instance"), args.phase_plan)
             except BaseException as exc:
                 summary["status"], summary["error"] = "Failed", str(exc)
         if summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview":
-            completed = [results[agent].get("task_completed_monotonic_ns") for agent in AGENTS]
+            completed = [results[agent].get("task_completed_monotonic_ns") for agent in agents]
             if all(type(t) is int and t >= summary["makespan_started_ns"] for t in completed):
                 summary["makespan_finished_ns"] = max(completed)
                 summary["own_output_four_task_makespan_seconds"] = (
@@ -368,7 +478,7 @@ def main():
             else:
                 summary["status"], summary["error"] = "Failed", "missing validated task completion clocks"
         summary.update(agents=results, exits=exits, client_cleanup=receipts,
-                       cleanup=len(cleanup) == 4 and all(cleanup.values()),
+                       cleanup=len(cleanup) == len(agents) and all(cleanup.values()),
                        elapsed_seconds=time.monotonic() - started)
         if args.benchmark_profile is not None and summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview":
             try:

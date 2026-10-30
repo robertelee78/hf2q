@@ -144,7 +144,8 @@ def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf
     return request
 
 
-def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen"):
+def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen", on_first_token=None):
+    """`on_first_token(monotonic_ns)` runs once, at the first streamed reasoning or semantic token."""
     if engine_kind == "peer":
         from family_peer import canonical
         # Validate the unchanged canonical envelope (native fields must be the
@@ -231,7 +232,11 @@ def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"
                                 append_semantic_event(semantic_events_ns, clock_ns())
                             if semantic and record["semantic_ttft_seconds"] is None:
                                 record["semantic_ttft_seconds"] = elapsed
-                            if len(parser.message["reasoning_content"]) > before and record["first_reasoning_seconds"] is None:
+                            grew = len(parser.message["reasoning_content"]) > before
+                            if on_first_token is not None and (semantic or grew):
+                                on_first_token(clock_ns())
+                                on_first_token = None
+                            if grew and record["first_reasoning_seconds"] is None:
                                 record["first_reasoning_seconds"] = elapsed
                             frame = []
                 require(not frame and not pending, "incomplete SSE line/frame")
@@ -270,8 +275,17 @@ def main():
     parser.add_argument("--engine-kind", choices=("hf2q", "peer"), default="hf2q")
     parser.add_argument("--benchmark-profile", choices=("gemma-matched-v1",))
     parser.add_argument("--instance", type=int, help="N4 quality-campaign task instance (coding_instances.py)")
+    parser.add_argument("--phase-plan", help="Q3 phase plan from the four-agent coordinator (qwen_n4_live_smoke.py)")
+    parser.add_argument("--phase-cohort", type=int, help="this agent's release cohort under --phase-plan")
     args = parser.parse_args()
     family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
+    phase = None
+    if args.phase_plan is not None or args.phase_cohort is not None:
+        from qwen_n4_live_smoke import agent_phase
+        require(args.diagnostic_slots == 4 and args.instance is None and args.benchmark_profile is None,
+                "phase plans are four-agent controls of the canonical workload")
+        phase = {"plan": args.phase_plan, "cohort": args.phase_cohort}
+        require(agent_phase(args.phase_plan, args.agent_id) == phase, "agent outside its phase cohort")
     os.umask(0o077)
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
@@ -287,6 +301,8 @@ def main():
                        profile=family_contract.profile(args.family, 4),
                        agent_id=args.agent_id, run_id=args.run_id, server_pid=args.server_pid,
                        diagnostic_slots=4, full_prefix_reuse="PendingPostOracle", barrier={"status": "Pending"})
+        if phase is not None:
+            summary["phase"] = phase
     tools = None
     try:
         packet, workload = approval(args)
@@ -322,12 +338,17 @@ def main():
         files = {} if workload is None else {"immutable": workload.immutable, "initial": workload.initial}
         tools = tool_class(output / "tools", args.cargo, args.sandbox_exec, packet["sdk_root"], **files)
         seen = set()
+        first_decode = []
         if n4:
-            from qwen_n4_live_smoke import wait_barrier
+            from qwen_n4_live_smoke import first_decode_marker, phase_cohorts, wait_barrier
             save(output / "summary.json", summary)
             summary["barrier"] = wait_barrier(args.barrier_dir, args.agent_id, args.run_id,
                                                args.server_pid, args.barrier_token, output,
-                                               initial_hash, args.approval_sha256, args.instance)
+                                               initial_hash, args.approval_sha256, args.instance, phase)
+            if phase is not None and phase["cohort"] < len(phase_cohorts(phase["plan"])):
+                # A later cohort is released once this cohort has decoded its first token.
+                first_decode.append(lambda ns: first_decode_marker(args.barrier_dir, args.agent_id, args.run_id,
+                                                                   args.barrier_token, ns))
         started = time.monotonic()
         for turn in range(7):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
@@ -335,8 +356,10 @@ def main():
             request = build_request(args.model, messages, schemas, turn, args.family, args.engine_kind)
             turn_output = output / f"turn-{turn}"
             turn_output.mkdir(mode=0o700)
+            on_first_token = first_decode.pop() if first_decode and request["stream"] else None
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
-                                               deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind, family=args.family)
+                                               deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind, family=args.family,
+                                               on_first_token=on_first_token)
             summary["turns"].append(receipt)
             messages.append(message)
             if call is not None:
