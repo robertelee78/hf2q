@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope, F1/F3 execution entry and the separately reviewed F2/Q1/Q2/C1 source implementation entry; other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-10-30 — Q5 memory admission is measured-envelope, not worst-case charged; only a projected or observed out-of-memory condition blocks work, and DeepSeek-V4 S3 hardware runs may proceed under the supervised normal-run guard. Earlier 2026-10-27 parallel-source update unchanged.
+- **Updated:** 2026-10-30 — Q5 rewritten: admission per family from a calibrated run plus live out-of-memory stops on the dedicated laptop, replacing the worst-case charged ledger. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
 - Stable source ID: ADR-063
@@ -510,28 +510,30 @@ Priority: High. Core scope.
 
 Delivery boundary: Published v0.1.28 release containing the independently accepted configuration.
 
-### Q5. QE-prove four-slot memory safety on M5 Max 128 GB
+### Q5. Run four-slot configurations on the M5 Max 128 GB without exhausting memory
 
-Outcome: Every accepted configuration fits the operator host with measured system headroom and no out-of-memory experiment.
+Outcome: Every accepted configuration, per model family, runs its full four-agent workload on the dedicated laptop without running out of memory, and without reserving memory that nothing uses.
 
-Requirement: The program MUST deliver every accepted configuration fits the operator host with measured system headroom and no out-of-memory experiment.
+Requirement: The program MUST admit each family's four-slot configuration from measured behavior on this host and MUST stop any run before it exhausts memory.
 
 Acceptance:
 
-- Before loading, admit model residency, four-slot KV/recurrent state, anchor committed+pending bytes, drafter state and peak in-flight scratch against one disjoint unified-memory ledger; avoid double-counting shared CPU/Metal pages.
+- The host is dedicated to this program and its single active runtime. Admission charges the measured host baseline at admission time, plus hf2q's calibrated peak for the same artifact, source, workload, context and slot count. It reserves nothing for other agents and no fixed worst-case cells.
 
-- Use the dedicated host's available system RAM as authorized by the operator, replacing the earlier fixed 12 GiB reservation and 116 GiB cap. Subtract observed competing nonreclaimable use and explicitly budget observation/stop latency plus maximum in-flight allocation overshoot. Freeze the available-RAM policy, measured reaction margin and any source-justified family limit before loading and obey those limits; apply the same resource policy to comparison arms and stop on a projected breach. Physical capacity remains the hard upper bound, never a promise of availability. A reclaimable-file-cache working estimate is not unique physical-ownership evidence and MUST NOT silently refund a live allocation.
+- Each family (Qwen3.8 27B, Qwen3.6 35B-A3B, Gemma4 26B-A4B, DeepSeek-V4 Flash) is calibrated by one supervised run of its largest declared four-agent workload. A calibration passes when pressure stays normal, swap does not grow and Free plus cached memory stays positive. The family is recalibrated when its artifact, source, context or slot count changes.
 
-- Run stock, experimental hf2q and peer sequentially, unloading and verifying listeners/process/memory recovery before each load. Never co-reside DeepSeek runtimes or add a drafter/cohort that exceeds the measured budget. Keep exactly one hf2q process at a time, including metadata commands; those commands must finish before the server starts.
+- Every run has live stops: memory pressure leaving normal, swap growth, Free plus cached memory below 2 GiB, or process growth beyond the calibrated peak. A stop is a preserved failed case, not a retry trigger. The stop margin is tied to measured sample and stop latency.
 
-- QE uses synthetic allocation/admission negative controls and bounded real four-slot stress with the largest declared tool-result/context cases; stop on memory pressure, abnormal footprint growth or projected breach before OOM.
+- Exactly one hf2q or peer runtime runs at a time, including metadata commands. Listeners, processes and memory recovery are verified between loads. Idle user applications may be quit when a measurement needs the headroom; system services are kept.
 
-- Record logical budgets, OS footprint/pressure, Metal residency, transient high-water, swap/compression deltas and cleanup. Reject a candidate that fits only by silently reducing matched context, task size or output budget.
+- A configuration may not fit by silently reducing matched context, task size or output budget. Any reduction is an explicit operator decision.
+
+- Record the host baseline, calibrated peak, pressure, swap and compression deltas, minimum Free plus cached memory and cleanup for each family.
 
 
-Repository ownership: hf2q owns family/request admission policy and a disjoint whole-process memory ledger. mlx-native owns allocation/view/residency/scratch lifetime guarantees and low-level counters. Review both sides so shared unified-memory pages are not double-counted; any native fix requires separate parity and publication evidence.
+Repository ownership: hf2q owns the admission policy, calibration and live stops. mlx-native owns allocation and residency lifetime and the low-level counters the stops read.
 
-Validation: Independent QE reviews byte ownership and admission arithmetic, runs fail-closed budget controls, then conducts bounded M5 Max real-artifact memory stress without deliberately provoking OOM.
+Validation: An independent reviewer checks each family's calibration receipt and stop behavior, including one negative control that proves a stop fires before memory is exhausted.
 
 Predecessors: F1.
 
@@ -541,7 +543,7 @@ Delivery boundary: Measured evidence or qualified implementation merged to main 
 
 ## Coverage and sequencing
 
-F1 precedes F2; F2 is the source-bound baseline for every measured lane. F3 precedes C1 because the checkpoint contract must reflect current graft and persistence behavior. Q5 memory admission precedes risky model experiments and retained-state expansion. Qwen implementation C2 follows C1 and F2. Gemma/DeepSeek multi-anchor implementation, mixed-policy production work, queue-aware admission, new native block drafters/lattice trees, NAX attention and scratch-wait changes are successor candidates after the primary deciding measurements, not promised v0.1.28 features. S1 and D2 record deciding evidence before successor designs. Q1 is a correctness dependency for shared target batching, speculation and numerical kernels. Different edits to a shared file require merge coordination, not invented product dependencies.
+F1 precedes F2; F2 is the source-bound baseline for every measured lane. F3 precedes C1 because the checkpoint contract must reflect current graft and persistence behavior. A family's Q5 calibration precedes that family's hardware experiments and retained-state expansion; families do not wait on each other. Qwen implementation C2 follows C1 and F2. Gemma/DeepSeek multi-anchor implementation, mixed-policy production work, queue-aware admission, new native block drafters/lattice trees, NAX attention and scratch-wait changes are successor candidates after the primary deciding measurements, not promised v0.1.28 features. S1 and D2 record deciding evidence before successor designs. Q1 is a correctness dependency for shared target batching, speculation and numerical kernels. Different edits to a shared file require merge coordination, not invented product dependencies.
 
 All acceptance, exclusions, failed-path requirements and the winning-subset release rule above are material source obligations and must be represented in the awa extraction coverage. Numerical or API-semantic failures stop promotion. A negative experiment is valuable measured evidence, not a shipped feature; no performance estimate in the research report is an acceptance receipt.
 
@@ -566,51 +568,32 @@ Each attempt has a separate topic worktree and writer. Shared-file integration a
 
 The approved source designs are [F2](../research/adr063-f2-execution-plan.md), [Q1](../research/adr063-q1-execution-plan.md), [Q2](../research/adr063-q2-execution-plan.md) and [C1](../research/adr063-c1-execution-plan.md). Approval and parallel source authorship establish no quality, memory-admission, performance or task-completion result. Candidate authors and independent QE remain distinct. The existing four-family win requirement and all failed-path, confidence and release gates remain unchanged.
 
-### Measured-envelope memory admission (operator update, 2026-10-30)
+### Measured memory admission, per family (operator update, 2026-10-30)
 
-The operator stated that the entire host is dedicated to this program, that
-no other agent or workload competes for memory, and that work must not be
-blocked unless it would actually exhaust memory. This decision supersedes the
-conflicting parts of Q5's acceptance text. The fixed positive cells
-(competitor growth, tools, separate reaction, file-cache and retired-pool
-residuals) and the requirement that a worst-case charged ledger fit a
-Free+file working estimate before loading no longer gate admission.
+The operator restated that the laptop is dedicated to this program and that
+its work is the only significant memory user. Runs must not exhaust memory,
+and must not be blocked by reserves that nothing uses. Q5 above was
+rewritten accordingly. Admission now comes from each family's calibrated run
+plus live stops, not from a worst-case charged ledger.
 
-Evidence for the change. The reviewed worst-case operating case for the
-DeepSeek-V4 Flash q2 artifact (107.4 GB) charged 149,367,089,308 B against
-137,438,953,472 B of physical memory. The guarded attempt with the
-provenance-bound source `538e9ef3` binary therefore refused before Device on
-2026-10-30, and no host state could admit it. The same artifact had already run
-the four-agent C262144 coding workload six times on 2026-10-29. Every sample
-of every run reported normal memory pressure, swap use stayed flat at 0.020 GB,
-and Free plus cached memory never fell below 5.11 GB
-(`ds-current-port-balanced-series-analysis-v2/metrics.json`). The worst-case
-ledger thus refused a configuration that had repeatedly operated with measured
-headroom.
+The worst-case ledger could not admit even the configuration already
+exercised. For the DeepSeek-V4 Flash q2 artifact (107.4 GB), the reviewed
+worst-case operating case charged 149,367,089,308 B against 137,438,953,472 B
+of physical memory. The guarded attempt with the provenance-bound `538e9ef3`
+binary refused before Device on 2026-10-30. The same artifact had run the
+four-agent C262144 coding workload six times on 2026-10-29. Every sample
+reported normal pressure, swap stayed flat at 0.020 GB, and Free plus cached
+memory never fell below 5.11 GB
+(`ds-current-port-balanced-series-analysis-v2/metrics.json`).
 
-Admission and stops now work as follows:
-
-- **Admission.** A configuration is admitted from a calibrated run of the
-  same artifact, source, workload and slot count. That run must hold normal
-  pressure throughout, show no swap growth and leave positive Free plus
-  cached memory. The calibrated hf2q peak plus the host baseline measured at
-  admission must fit physical memory with a margin tied to measured stop
-  latency. The run is recalibrated when the artifact, source, context or slot
-  count changes.
-- **Live stops.** A run stops on any of: pressure leaving normal, swap
-  growth, Free plus cached memory below 2 GiB, or process growth beyond the
-  calibrated peak. One hf2q or peer runtime runs at a time.
-- **Allowances.** No allowance is reserved for other agents. Idle user
-  applications may be quit when a measurement needs the headroom; system
-  services are kept.
-- **Unchanged.** Matched context, task and output budgets may still not be
-  reduced to make a configuration fit. Any reduction must be an explicit
-  operator decision.
-
-DeepSeek-V4 batched-decode (S3) source and hardware work may proceed under
-this guard. Approval of the guard establishes no speed win or task
-completion. The source-candidate worst-case constructor at `538e9ef3`
-(draft #453) remains available as a diagnostic, not as the admission gate.
+Q5 gates each family separately. Once a family's calibration passes, that
+family's hardware work in F2, C1, S1, S3, D1, D2, K1 and Q3 may proceed; no
+family waits on another family's calibration. DeepSeek-V4 needs no
+exception, because its existing six-run evidence already meets the
+calibration conditions; a recalibration is still needed when its source
+changes. The worst-case constructor at `538e9ef3` (draft #453) remains a
+diagnostic, not the admission gate. This update establishes no speed win or
+task completion.
 
 ## Consequences
 
