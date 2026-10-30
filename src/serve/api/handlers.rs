@@ -1538,7 +1538,7 @@ mod qwen_thinking_budget_tests {
     }
 
     #[test]
-    fn tool_continuations_use_a_small_default_and_deeper_cycles_reach_a_floor() {
+    fn tool_continuations_keep_one_ceiling_at_every_chain_depth() {
         let mut messages = vec![
             message("user", None),
             tool_call_message(&["call-1"]),
@@ -1562,15 +1562,16 @@ mod qwen_thinking_budget_tests {
         assert_eq!(repeated.tool_cycles_since_user, 2);
         assert_eq!(
             adaptive_qwen_default_thinking_budget(Some(2_048), None, repeated),
-            Some(256)
+            Some(512)
         );
 
         messages.push(tool_call_message(&["call-3"]));
         messages.push(tool_result_message("call-3"));
-        let floor = qwen_tool_chain_state(&messages);
+        let deeper = qwen_tool_chain_state(&messages);
+        assert_eq!(deeper.tool_cycles_since_user, 3);
         assert_eq!(
-            adaptive_qwen_default_thinking_budget(Some(2_048), None, floor),
-            Some(256)
+            adaptive_qwen_default_thinking_budget(Some(2_048), None, deeper),
+            Some(512)
         );
     }
 
@@ -1617,7 +1618,7 @@ mod qwen_thinking_budget_tests {
         assert_eq!(second.tool_cycles_since_user, 2);
         assert_eq!(
             adaptive_qwen_default_thinking_budget(Some(2_048), None, second),
-            Some(256)
+            Some(512)
         );
     }
 

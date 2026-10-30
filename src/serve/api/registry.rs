@@ -1210,6 +1210,18 @@ pub fn qwen35_tool_argument_wire_kinds(
     Ok(ToolArgumentWireKinds { functions })
 }
 
+/// Text of one Qwen `<parameter=KEY>` value as the model wrote it.
+///
+/// The native template renders `<parameter=KEY>\nVALUE\n</parameter>`, so
+/// exactly one leading and one trailing newline are wrapper bytes and are
+/// removed when present. Every other byte — indentation, inner blank lines,
+/// and a file's own trailing newline (`...}\n\n</parameter>`) — is argument
+/// content. Unary and streaming parsers both decode through this helper.
+pub fn qwen35_parameter_value_text(between_tags: &str) -> &str {
+    let value = between_tags.strip_prefix('\n').unwrap_or(between_tags);
+    value.strip_suffix('\n').unwrap_or(value)
+}
+
 /// Decode one Qwen top-level parameter using the request's authoritative
 /// schema contract.  `None` keeps legacy direct callers compatible; `Some`
 /// fails closed for an unknown function/key instead of guessing a type.
@@ -1585,7 +1597,9 @@ fn gemma4_value_to_json(v: &str) -> serde_json::Value {
 
 /// Parse Qwen 3.5/3.6's `<function=NAME>\n<parameter=key>\nval\n</parameter>\n...\n</function>` body.
 ///
-/// Whitespace-tolerant; `<parameter=key>...</parameter>` blocks become args.
+/// Whitespace-tolerant between blocks; `<parameter=key>...</parameter>`
+/// blocks become args, with values decoded through
+/// [`qwen35_parameter_value_text`] so argument whitespace survives.
 fn parse_qwen35_tool_call(body: &str) -> Option<ParsedToolCall> {
     parse_qwen35_tool_call_with_wire_kinds(body, None)
 }
@@ -1628,7 +1642,7 @@ fn parse_qwen35_tool_call_with_wire_kinds(
             break;
         };
         let val_end = val_start + rel_close;
-        let val_raw = inner[val_start..val_end].trim();
+        let val_raw = qwen35_parameter_value_text(&inner[val_start..val_end]);
         let json_val = decode_qwen35_parameter_value(&name, &key, val_raw, wire_kinds)?;
         args.insert(key, json_val);
         cursor = val_end + "</parameter>".len();
@@ -5374,6 +5388,33 @@ mod tests {
         assert_eq!(v["count"], 42);
     }
 
+    /// Only the native template's one-newline wrapper is removed: the
+    /// captured ADR-063 `write_file` content keeps its trailing newline, and a
+    /// value starting with indentation keeps that indentation.
+    #[test]
+    fn parse_qwen35_keeps_captured_write_file_whitespace() {
+        let kinds = super::adr063_write_file_wire_kinds_for_test();
+        for content in [
+            super::ADR063_PEER_WRITE_FILE_CONTENT,
+            super::adr063_indented_write_file_content_for_test(),
+        ] {
+            let body = super::qwen35_native_write_file_body_for_test(content);
+            for wire_kinds in [Some(&kinds), None] {
+                let parsed = parse_tool_call_body_with_wire_kinds(&QWEN35, &body, wire_kinds)
+                    .expect("native write_file body parses");
+                assert_eq!(parsed.name, "write_file");
+                let args: serde_json::Value =
+                    serde_json::from_str(&parsed.arguments_json).expect("arguments JSON");
+                assert_eq!(
+                    args,
+                    serde_json::json!({"path": "src/ports.rs", "content": content})
+                );
+            }
+        }
+        assert_eq!(qwen35_parameter_value_text("\n\n"), "");
+        assert_eq!(qwen35_parameter_value_text("bare"), "bare");
+    }
+
     #[test]
     fn parse_qwen35_invalid_returns_none() {
         assert!(parse_tool_call_body(&QWEN35, "garbage").is_none());
@@ -8278,3 +8319,49 @@ pub(super) fn dsml_string_for_test(rules:&mut Vec<(String,String)>,min:u64,max:O
 }
 #[cfg(test)]
 pub(super) fn gbnf_literal_for_test(value:&str)->String{gbnf_literal(value)}
+
+/// Captured `write_file` content from the ADR-063 peer run
+/// `peer-qwen36-e86-none-normal-n4-20261027T185853Z`, agent-2 turn-2
+/// (response.bin sha256 c98c12d7b8232363…). It ends in the file's own
+/// newline; every hf2q `write_file` in the failed Qwen3.6 runs lost it to a
+/// whole-value `trim()`.
+#[cfg(test)]
+pub(super) const ADR063_PEER_WRITE_FILE_CONTENT: &str = "pub fn parse_port(s: &str) -> Result<u16, String> {\n    let port: u16 = s.parse().map_err(|_| format!(\"invalid port: {}\", s))?;\n    if port == 0 {\n        return Err(\"port cannot be zero\".to_string());\n    }\n    Ok(port)\n}\n";
+
+/// The captured content's indented interior, from `    let port` to the
+/// end: a value whose first byte is indentation.
+#[cfg(test)]
+pub(super) fn adr063_indented_write_file_content_for_test() -> &'static str {
+    let start = ADR063_PEER_WRITE_FILE_CONTENT
+        .find("    let port")
+        .expect("captured content has an indented line");
+    &ADR063_PEER_WRITE_FILE_CONTENT[start..]
+}
+
+/// Native Qwen template rendering of `write_file(path, content)`:
+/// `<parameter=KEY>\nVALUE\n</parameter>\n` per parameter.
+#[cfg(test)]
+pub(super) fn qwen35_native_write_file_body_for_test(content: &str) -> String {
+    format!(
+        "<function=write_file>\n<parameter=path>\nsrc/ports.rs\n</parameter>\n<parameter=content>\n{content}\n</parameter>\n</function>"
+    )
+}
+
+/// Wire kinds for the ADR-063 client's `write_file` schema.
+#[cfg(test)]
+pub(super) fn adr063_write_file_wire_kinds_for_test() -> ToolArgumentWireKinds {
+    qwen35_tool_argument_wire_kinds(&[super::schema::Tool {
+        tool_type: "function".to_string(),
+        function: super::schema::ToolFunction {
+            name: "write_file".to_string(),
+            description: Some("Operate on the isolated coding fixture.".to_string()),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                "required": ["path", "content"],
+                "additionalProperties": false
+            })),
+        },
+    }])
+    .expect("write_file wire kinds")
+}
