@@ -4484,6 +4484,22 @@ struct Qwen35SlotMtpState {
     verifier_hidden: MlxBuffer,
 }
 
+/// Entry state of one coherent ordinary decision (target forward + MTP
+/// catch-up over the same token). Shared by the serial warmup tick and the
+/// joint decode finalize step.
+pub(in crate::serve::api) struct Qwen35CoherentTarget {
+    next_token: u32,
+    next_pos: i32,
+    prior_target: u32,
+    prior_mtp: u32,
+    pending_hidden: MlxBuffer,
+    started: Instant,
+}
+
+#[path = "engine_qwen35/joint_decode.rs"]
+mod joint_decode;
+pub(in crate::serve::api) use joint_decode::Qwen35JointLane;
+
 const QWEN35_REPETITION_WINDOW: usize = 64;
 
 fn qwen35_prompt_sampling_history(prompt_tokens: &[u32]) -> Vec<u32> {
@@ -5235,19 +5251,8 @@ impl Qwen35DecodeState {
         let pos = self.decode_position_base + self.step - 1;
         let pos_i32 = pos as i32;
         let positions: Vec<i32> = vec![pos_i32; 4];
+        let forced_token = self.next_ordinary_forced_token();
         let last_input = &self.generated_tokens[self.generated_tokens.len() - 1..];
-        let forced_token = self
-            .thinking_budget
-            .as_mut()
-            .and_then(Qwen35ThinkingBudgetState::next_forced_token);
-        if forced_token.is_some_and(|(_, started)| started) {
-            tracing::warn!(
-                slot = self.slot_id.0,
-                budget = self.params.thinking_token_budget,
-                generated_tokens = self.generated_tokens.len(),
-                "Qwen35 thinking token budget reached; forcing reasoning close and continuing answer"
-            );
-        }
         let tok = if self.is_greedy && !self.want_logprobs {
             let lease =
                 supervisor.arm("Qwen35 decode greedy", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
@@ -5276,38 +5281,78 @@ impl Qwen35DecodeState {
                     self.step
                 )
             })?;
-            anyhow::ensure!(
-                logits.len() == qwen.vocab_size,
-                "qwen35 slot-aware decode logits len {} != vocab_size {}",
-                logits.len(),
-                qwen.vocab_size
-            );
-            let (token, logprob) = if let Some((token, _)) = forced_token {
-                // Forced (thinking-budget) tokens are not sampled: report the
-                // degenerate certain logprob with no alternatives.
-                let record = TokenLogprobRecord {
-                    token_id: token,
-                    logprob: 0.0,
-                    top: Vec::new(),
-                };
-                (token, self.want_logprobs.then_some(record))
-            } else {
-                let mut logits = logits;
-                sample_logits_qwen35_constrained(
-                    &mut logits,
-                    &self.params,
-                    &self.sampling_history,
-                    self.grammar_runtime.as_ref(),
-                    &qwen.eos_token_ids,
-                    self.want_logprobs,
-                )?
-            };
-            if let (Some(values), Some(logprob)) = (self.logprobs_vec.as_mut(), logprob) {
-                values.push(logprob);
-            }
-            token
+            self.select_ordinary_logits_token(qwen, logits, forced_token)?
         };
-        let ordinary_target_elapsed = ordinary_target_started.elapsed();
+        self.commit_ordinary_target_token(qwen, tok, ordinary_target_started.elapsed())
+    }
+
+    /// Thinking-budget forced token for the next ordinary target decision
+    /// (advances the budget's forced cursor), with the budget-reached log.
+    fn next_ordinary_forced_token(&mut self) -> Option<(u32, bool)> {
+        let forced_token = self
+            .thinking_budget
+            .as_mut()
+            .and_then(Qwen35ThinkingBudgetState::next_forced_token);
+        if forced_token.is_some_and(|(_, started)| started) {
+            tracing::warn!(
+                slot = self.slot_id.0,
+                budget = self.params.thinking_token_budget,
+                generated_tokens = self.generated_tokens.len(),
+                "Qwen35 thinking token budget reached; forcing reasoning close and continuing answer"
+            );
+        }
+        forced_token
+    }
+
+    /// Ordinary-target token from full logits: the forced token when the
+    /// thinking budget forces one, otherwise the constrained sampler.
+    fn select_ordinary_logits_token(
+        &mut self,
+        qwen: &Qwen35LoadedModel,
+        logits: Vec<f32>,
+        forced_token: Option<(u32, bool)>,
+    ) -> Result<u32> {
+        anyhow::ensure!(
+            logits.len() == qwen.vocab_size,
+            "qwen35 slot-aware decode logits len {} != vocab_size {}",
+            logits.len(),
+            qwen.vocab_size
+        );
+        let (token, logprob) = if let Some((token, _)) = forced_token {
+            // Forced (thinking-budget) tokens are not sampled: report the
+            // degenerate certain logprob with no alternatives.
+            let record = TokenLogprobRecord {
+                token_id: token,
+                logprob: 0.0,
+                top: Vec::new(),
+            };
+            (token, self.want_logprobs.then_some(record))
+        } else {
+            let mut logits = logits;
+            sample_logits_qwen35_constrained(
+                &mut logits,
+                &self.params,
+                &self.sampling_history,
+                self.grammar_runtime.as_ref(),
+                &qwen.eos_token_ids,
+                self.want_logprobs,
+            )?
+        };
+        if let (Some(values), Some(logprob)) = (self.logprobs_vec.as_mut(), logprob) {
+            values.push(logprob);
+        }
+        Ok(token)
+    }
+
+    /// Commit one ordinary-target decision: cost observation, grammar, EOS
+    /// and grammar-terminal stops, ledger, tool-call trigger, thinking
+    /// budget, stop strings, and the step bound.
+    fn commit_ordinary_target_token(
+        &mut self,
+        qwen: &Qwen35LoadedModel,
+        tok: u32,
+        ordinary_target_elapsed: Duration,
+    ) -> Result<Qwen35TickOutcome> {
         self.mtp_cost
             .observe_ordinary_target(ordinary_target_elapsed);
         self.history_cost
@@ -6079,29 +6124,14 @@ impl Qwen35DecodeState {
         kv_cache: &mut HybridKvCache,
         supervisor: &EngineSupervisor,
     ) -> Result<Qwen35TickOutcome> {
-        let next_token = *self
-            .generated_tokens
-            .last()
-            .context("Qwen SlotAware coherent ordinary decode needs a seed")?;
-        let next_pos = (self.decode_position_base + self.generated_tokens.len() - 1) as i32;
-        let prior_target = kv_cache.sequence_len_for_slot(self.slot_id)?;
-        let prior_mtp = mtp_cursor_for_slot(kv_cache, self.slot_id)?;
-        anyhow::ensure!(
-            prior_target == prior_mtp,
-            "Qwen coherent ordinary decode cursor mismatch (target={prior_target}, mtp={prior_mtp})"
-        );
-        let pending_hidden = self
-            .mtp
-            .as_ref()
-            .context("Qwen coherent ordinary decode missing MTP state")?
-            .verifier_hidden
-            .clone();
-        // Measure the complete target-equivalent decision transaction. The
-        // speculation controller compares this baseline against a full draft
-        // + verify + MTP catch-up + cache-commit round, so stopping the timer
-        // after the target forward alone would systematically underprice
-        // ordinary decode and disable a profitable proposer.
-        let ordinary_decision_started = Instant::now();
+        let target = self.coherent_ordinary_target(kv_cache)?;
+        let Qwen35CoherentTarget {
+            next_token,
+            next_pos,
+            prior_target,
+            prior_mtp,
+            ..
+        } = target;
         let lease = supervisor.arm(
             "Qwen35 coherent ordinary target",
             QWEN35_WORKER_TRANSACTION_TIMEOUT,
@@ -6122,7 +6152,7 @@ impl Qwen35DecodeState {
                 "Qwen coherent ordinary target supervision",
             );
         }
-        let (mut logits, nextn_hidden) = match forward {
+        let (logits, nextn_hidden) = match forward {
             Ok(value) => value,
             Err(error) => {
                 return rollback_slot_mtp_error(
@@ -6135,6 +6165,66 @@ impl Qwen35DecodeState {
                 );
             }
         };
+        self.finish_coherent_ordinary(qwen, kv_cache, supervisor, target, logits, nextn_hidden)
+    }
+
+    /// Entry state of one coherent ordinary decision (target + MTP catch-up):
+    /// the input token and position, the equal target/MTP entry cursors, and
+    /// the pending verifier hidden the catch-up consumes.
+    fn coherent_ordinary_target(&self, kv_cache: &HybridKvCache) -> Result<Qwen35CoherentTarget> {
+        let next_token = *self
+            .generated_tokens
+            .last()
+            .context("Qwen SlotAware coherent ordinary decode needs a seed")?;
+        let next_pos = (self.decode_position_base + self.generated_tokens.len() - 1) as i32;
+        let prior_target = kv_cache.sequence_len_for_slot(self.slot_id)?;
+        let prior_mtp = mtp_cursor_for_slot(kv_cache, self.slot_id)?;
+        anyhow::ensure!(
+            prior_target == prior_mtp,
+            "Qwen coherent ordinary decode cursor mismatch (target={prior_target}, mtp={prior_mtp})"
+        );
+        let pending_hidden = self
+            .mtp
+            .as_ref()
+            .context("Qwen coherent ordinary decode missing MTP state")?
+            .verifier_hidden
+            .clone();
+        Ok(Qwen35CoherentTarget {
+            next_token,
+            next_pos,
+            prior_target,
+            prior_mtp,
+            pending_hidden,
+            // Measure the complete target-equivalent decision transaction.
+            // The speculation controller compares this baseline against a
+            // full draft + verify + MTP catch-up + cache-commit round, so
+            // stopping the timer after the target forward alone would
+            // systematically underprice ordinary decode and disable a
+            // profitable proposer.
+            started: Instant::now(),
+        })
+    }
+
+    /// Everything after the coherent target forward: MTP catch-up over the
+    /// same token, cursor equality, carry hidden, the canonical decision,
+    /// cost observation and commit. Every failure rolls both cursors back.
+    fn finish_coherent_ordinary(
+        &mut self,
+        qwen: &Qwen35LoadedModel,
+        kv_cache: &mut HybridKvCache,
+        supervisor: &EngineSupervisor,
+        target: Qwen35CoherentTarget,
+        mut logits: Vec<f32>,
+        nextn_hidden: MlxBuffer,
+    ) -> Result<Qwen35TickOutcome> {
+        let Qwen35CoherentTarget {
+            next_token,
+            next_pos,
+            prior_target,
+            prior_mtp,
+            pending_hidden,
+            started: ordinary_decision_started,
+        } = target;
         let shared_embed = match qwen.model.embed_tokens_gpu(&[next_token]) {
             Ok(embed) => embed,
             Err(error) => {

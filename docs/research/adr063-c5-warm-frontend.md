@@ -1,6 +1,6 @@
 # ADR-063 C5: warm-request frontend overhead (#361)
 
-Status: deciding experiment prepared. The expected result is that the hypothesis is falsified. No acceleration path is implemented.
+Status: deciding experiment complete (2026-10-30). The hypothesis is falsified for all four families, so no acceleration path is implemented. The verdict was independently reviewed.
 
 ## Question and gate
 
@@ -156,15 +156,22 @@ For each family, `c5_frontend_summary.py` takes warm streamed requests: `stream=
 
 ### Measured verdict (2026-10-30, M5 Max 128 GB): falsified
 
-Source `c4316b3f` with `HF2Q_FRONTEND_TIMING=1`, one four-agent coding run per family under the Q5 supervisor (every run `CalibrationPass`, protocol complete). Warm streamed requests, n = 12 per family:
+Source `c4316b3f` with `HF2Q_FRONTEND_TIMING=1`, one four-agent coding run per family under the Q5 supervisor. Warm streamed requests:
 
-| family | frontend p50 | first output p50 | share p50 | share max | verdict |
-|---|---:|---:|---:|---:|---|
-| DeepSeek-V4 | 2.30 ms | 3.32 s | 0.074% | 0.122% | not material |
-| Qwen3.8 | 2.89 ms | 1.86 s | 0.156% | 0.297% | not material |
-| Gemma 4 | 1.94 ms | 1.26 s | 0.156% | 0.583% | not material |
+| family | n | frontend p50 | first output p50 | share p50 | share max | client semantic TTFT p50 (range) | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| DeepSeek-V4 | 12 | 2.30 ms | 3.32 s | 0.074% | 0.122% | 9.84 s (8.84–11.44) | not material |
+| Qwen3.8 | 12 | 2.89 ms | 1.86 s | 0.156% | 0.297% | 9.72 s (5.35–24.79) | not material |
+| Gemma 4 | 12 | 1.94 ms | 1.26 s | 0.156% | 0.583% | 1.54 s (0.64–2.82) | not material |
+| Qwen3.6 | 11 | 2.64 ms | 0.555 s | 0.475% | 1.04% | 1.68 s (1.32–7.07) | not material |
 
-Every family is far below the 10% gate, so C5 closes on this falsification and no implementation follows. Receipts and summaries: `$E/c5-runs-v1/{deepseek4-20261030T155611Z,qwen38-20261030T155910Z,gemma4-20261030T160447Z}/{receipt.json,c5-summary.json}`. Qwen3.6 was not run; its frontend is the Qwen35 path measured for Qwen3.8. The timing spans stay as an opt-in diagnostic.
+DeepSeek-V4, Qwen3.8 and Gemma 4 completed the protocol with `CalibrationPass`. The Qwen3.6 run ended `ClientFailed` on the known coding-task divergence (the model writes a non-compiling `parse` call; see #461 and the Q1 quality campaign). That failure happened after warm turns, and every dispatched request still logged its frontend line. So the Qwen3.6 frontend measurement is valid, but the run does not count as a calibration pass.
+
+Cross-check: the server's `first_output_us` is time to the first output event, including a reasoning token, so it is never later than the client's semantic TTFT. Each share therefore overstates the frontend fraction of semantic TTFT.
+
+Disposition per family: falsified for DeepSeek-V4, Qwen3.8, Gemma 4 and Qwen3.6. The worst share, 1.04% (Qwen3.6), is about a tenth of the 10% gate. No implementation follows, and the timing spans stay as an opt-in diagnostic. Receipts and summaries: `$E/c5-runs-v1/{deepseek4-20261030T155611Z,qwen38-20261030T155910Z,gemma4-20261030T160447Z,qwen36-20261030T172555Z}/{receipt.json,c5-summary.json}`.
+
+Separate from C5: time spent queued at the worker is a large part of the server's first-output time (median 718 ms on DeepSeek-V4, up to 1.87 s on Gemma 4). It belongs to the scheduler stories, not the frontend.
 
 ## Risks
 
