@@ -1,6 +1,6 @@
 # ADR-063 S3 — DeepSeek-V4 joint decode (phase 1)
 
-Status: implemented behind `HF2Q_DEEPSEEK_JOINT_DECODE`, default **off**. Not yet built, tested or measured on hardware.
+Status: **default on** since 2026-10-30. `HF2Q_DEEPSEEK_JOINT_DECODE=0` restores the serial path. Exactness and the four-agent A/B passed on hardware; see "Measured result".
 
 ## Problem
 
@@ -140,13 +140,13 @@ The existing `Mixed` step still runs the decode turn, then one prefill slice cap
 
 `HF2Q_DEEPSEEK_JOINT_DECODE`:
 
-- `1`, `on` or `true` enables the joint path;
-- `0`, `off` or `false`, or unset, keeps the serial path plus the B=4 cohort;
-- invalid values warn and fall back to the default (off).
+- `1`, `on` or `true`, or unset, uses the joint path (the default);
+- `0`, `off` or `false` keeps the serial path plus the B=4 cohort;
+- invalid values warn and fall back to the default (on).
 
 The value is read once per process. It is also forced off by `MLX_UNRETAINED_REFS`, `HF2Q_DEEPSEEK_DUMP_LAYER_DIR`, `HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR` and `HF2Q_DEEPSEEK_STAGE_PROFILE=1`. A startup log records `requested` and `available`; `DeepSeek-V4 joint decode engaged` logs once, and debug logs report each turn's width.
 
-**Promotion:** flip `DEEPSEEK4_JOINT_DECODE_DEFAULT` once the official-artifact test and the A/B below pass.
+**Promotion:** done on 2026-10-30 after the official-artifact test and the A/B below passed.
 
 ## Known risks
 
@@ -242,6 +242,21 @@ Run each arm on two workloads:
 - TTFT medians are not worse.
 
 Arm C bounds what the read-once kernel above would add.
+
+## Measured result (2026-10-30, M5 Max 128 GB)
+
+**Exactness.** `official_artifact_joint_decode_matches_serial_decode_bitwise` passed on the DS4-0731 q2 artifact (sha256 `50df7e3d…`): 140 steps over four lanes at unequal positions, with state, logits and cache bitwise equal to serial decode.
+
+**Four-agent C262144 coding workload.** One binary (source `a24f3f53`, sha256 `b5cd4c60…`), arms differing only in `HF2Q_DEEPSEEK_JOINT_DECODE`, order A B B A A B B A, each run under the Q5 calibration supervisor (`scripts/four_agent/q5_calibration.py`). Every run returned `CalibrationPass` and completed the four-agent protocol.
+
+| arm | runs | makespan median (range) | per-request decode median | completion tok/s over makespan |
+|---|---:|---|---:|---:|
+| A serial | 4 | 141.7 s (136.2–148.6) | 8.12 | 26.8 |
+| B joint | 4 | 105.0 s (104.2–111.5) | 10.98 | 35.7 |
+
+Makespan improved 33.5% (log-ratio Welch 95% CI 25.8–41.7%). The ranges do not overlap. Memory: every run kept free+cached at or above 3.29 GB, with no critical pressure.
+
+Not yet measured: the N=1 no-regression arm (joint never engages at N=1 by construction) and arm C. The exact multi-row Q8_0 kernel in mlx-native (`perf/q8-0-mv-multirow-exact`) measured 1.15–1.46× over per-row nr2 at M=4 in isolation; it reaches hf2q only after an mlx-native release.
 
 ## Changed files
 

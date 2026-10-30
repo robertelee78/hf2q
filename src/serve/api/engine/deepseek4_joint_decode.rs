@@ -26,10 +26,11 @@ use super::{
 /// Kill switch for A/B measurement: `1`/`on`/`true` selects joint decode,
 /// `0`/`off`/`false` keeps the serial quantum (and the exact B=4 cohort).
 const DEEPSEEK4_JOINT_DECODE_ENV: &str = "HF2Q_DEEPSEEK_JOINT_DECODE";
-/// Joint decode stays opt-in until the official-artifact bitwise proof
-/// (`official_artifact_joint_decode_matches_serial_decode_bitwise`) and the
-/// N=4 serving A/B have passed on hardware.
-const DEEPSEEK4_JOINT_DECODE_DEFAULT: bool = false;
+/// Joint decode is the default: it is bitwise equal to serial decode on the
+/// official artifact (`official_artifact_joint_decode_matches_serial_decode_bitwise`)
+/// and cut four-agent C262144 coding makespan by 33.5% (4 runs per arm,
+/// 2026-10-30; `docs/research/adr063-s3-ds4-joint-decode.md`).
+const DEEPSEEK4_JOINT_DECODE_DEFAULT: bool = true;
 
 fn parse_deepseek4_joint_decode(raw: Option<&str>) -> Result<bool, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
@@ -380,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_decode_switch_defaults_off_and_parses_explicit_arms() {
+    fn joint_decode_switch_defaults_on_and_parses_explicit_arms() {
         assert_eq!(
             parse_deepseek4_joint_decode(None),
             Ok(DEEPSEEK4_JOINT_DECODE_DEFAULT)
@@ -389,7 +390,7 @@ mod tests {
             parse_deepseek4_joint_decode(Some("  ")),
             Ok(DEEPSEEK4_JOINT_DECODE_DEFAULT)
         );
-        assert!(!DEEPSEEK4_JOINT_DECODE_DEFAULT);
+        assert!(DEEPSEEK4_JOINT_DECODE_DEFAULT);
         for raw in ["1", "on", "TRUE"] {
             assert_eq!(parse_deepseek4_joint_decode(Some(raw)), Ok(true));
         }

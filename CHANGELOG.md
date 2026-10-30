@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- Opt-in DeepSeek-V4 joint decode (`HF2Q_DEEPSEEK_JOINT_DECODE=1`): every eligible decoding slot (2–8 rows, unequal positions, streaming and unary) advances through one layer-major forward per token step, with row-parallel projections, FFN and output head dispatched once per step and cache-dependent attention per row. Each row is designed to be bitwise identical to serial decode; the default stays serial until the official-artifact exactness test and the four-agent A/B pass on hardware.
+- DeepSeek-V4 four-agent decode now advances every eligible decoding slot (2–8 rows, unequal positions, streaming and unary) through one layer-major forward per token step instead of serial per-slot quanta. Row-parallel projections, FFN and output head dispatch once per step; cache-dependent attention stays per row. Each row is bitwise identical to serial decode on the official artifact. On the four-agent C262144 coding workload (M5 Max, 4 runs per arm) median makespan fell from 141.7 s to 105.0 s (33.5% faster, 95% CI 25.8–41.7%) and per-request decode rose from 8.1 to 11.0 tok/s. `HF2Q_DEEPSEEK_JOINT_DECODE=0` restores the serial path.
 
 ## [0.1.28] — 2026-10-29
 
