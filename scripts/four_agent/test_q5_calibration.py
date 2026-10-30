@@ -366,6 +366,68 @@ class ArgvAndCases(unittest.TestCase):
                 self.assertIn(('measurement_snapshot.active_controls.vision_projector', 'false'), checks)
         self.assertEqual(len(ports), 4)
 
+    def test_checked_in_peer_cases_launch_the_matched_peer_arm(self):
+        import family_peer
+        from qwen_n4_live_smoke import MODULES
+        repo = HERE.parent.parent
+        hf_ports = {q5_case.build_plan(q5_case.loads((HERE / 'q5_cases' / f'{f}.json').read_bytes()),
+                                       {**self.builtins(), 'REPO': str(repo)}, self.required())['port']
+                    for f in ('qwen38', 'qwen36', 'gemma4', 'deepseek4')}
+        ports = set()
+        for family, client_family in (('deepseek4', 'deepseek4'), ('gemma4', 'gemma4'), ('qwen38', 'qwen'),
+                                      ('qwen36', 'qwen')):
+            hf_case = q5_case.loads((HERE / 'q5_cases' / f'{family}.json').read_bytes())
+            case = q5_case.loads((HERE / 'q5_cases' / f'peer-{family}.json').read_bytes())
+            self.assertEqual(case['family'], family)
+            self.assertEqual(case['variables']['MODEL'], hf_case['variables']['MODEL'], 'same GGUF as hf2q')
+            self.assertEqual(case['variables']['MODEL_ID'], hf_case['variables']['MODEL_ID'])
+            plan = q5_case.build_plan(case, {**self.builtins(), 'REPO': str(repo)}, self.required())
+            self.assertTrue(plan['complete'], family)
+            ports.add(plan['port'])
+            argv = plan['serve']['argv']
+            self.assertEqual(argv[0], plan['binary'])
+            self.assertEqual(Path(argv[0]).name, 'llama-server')
+
+            def flag(name):
+                return argv[argv.index(name) + 1]
+            self.assertEqual((flag('--parallel'), flag('--kv-unified-per-slot'), flag('--ctx-size')),
+                             ('4', '262144', '1048576'))
+            self.assertEqual((flag('--flash-attn'), flag('--cache-type-k'), flag('--cache-type-v')), ('on', 'f16', 'f16'))
+            self.assertEqual((flag('--model'), flag('--alias'), flag('--port')),
+                             (plan['artifact']['path'], plan['variables']['MODEL_ID'], str(plan['port'])))
+            self.assertIn('--no-context-shift', argv)
+            self.assertEqual(flag('--spec-type'), 'none')
+            self.assertEqual(Path(flag('--chat-template-file')).name, f'{family}.template.jinja')
+            if family in family_peer.CONTROLS:
+                controls = family_peer.CONTROLS[family]
+                self.assertEqual('--kv-unified' in argv, controls['kv_unified'], family)
+                self.assertEqual(float(flag('--repeat-penalty')), controls['repetition_penalty'])
+                self.assertEqual(flag('--reasoning'), controls['reasoning'])
+                self.assertEqual('--reasoning-preserve' in argv, controls['reasoning_preserve'])
+                self.assertEqual(argv.count('--reasoning-budget') and flag('--reasoning-budget'),
+                                 str(controls['reasoning_budget']) if 'reasoning_budget' in controls else 0)
+            else:
+                self.assertIn('--kv-unified', argv)
+                self.assertEqual((flag('--reasoning'), flag('--reasoning-budget'), flag('--repeat-penalty')),
+                                 ('on', '2048', '1.05'))
+            client = plan['client']['argv']
+            self.assertEqual((client[client.index('--family') + 1], client[client.index('--engine-kind') + 1]),
+                             (client_family, 'peer'))
+            sources = plan['client']['approval']['set']['sources']['sha256_of']
+            self.assertEqual({Path(s).name for s in sources}, set(MODULES))
+            checks = {(c['field'], json.dumps(c['equals'])) for c in plan['readiness']['checks']}
+            self.assertTrue({('total_slots', '4'), ('default_generation_settings.n_ctx', '262144'),
+                             ('modalities.vision', 'false'), ('build_info', '"b128-e86f5fd"')} <= checks)
+        self.assertEqual(len(ports), 4)
+        self.assertFalse(ports & hf_ports)
+
+    def test_hf2q_case_sources_match_the_client_source_freeze(self):
+        from qwen_n4_live_smoke import MODULES
+        for family in ('qwen38', 'qwen36', 'gemma4', 'deepseek4'):
+            case = q5_case.loads((HERE / 'q5_cases' / f'{family}.json').read_bytes())
+            sources = case['client']['approval']['set']['sources']['sha256_of']
+            self.assertEqual({Path(s).name for s in sources}, set(MODULES), family)
+
     def test_deepseek_case_uses_scoped_compressor_override(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'deepseek4.json').read_bytes())
         env = case['serve']['env']

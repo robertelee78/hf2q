@@ -181,7 +181,8 @@ def audit_agent(reader, agent, expected, name):
             require(wire(request, expected["family"]) == request_raw, "canonical wire/no silent truncation")
         else:
             # Same validation boundary as actual peer exchange, retaining native metadata.
-            wire({**request, "hf2q_overflow_policy": "reject"}, expected["family"])
+            from family_peer import canonical
+            wire(canonical(request, expected["family"]), expected["family"])
             require(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
                     == request_raw, "canonical native peer wire")
         if messages is None:
@@ -254,7 +255,7 @@ def certify_cohort(cohort_manifest_path, expected_plan):
     required_sources = {"q2_certify.py", "qwen38_n1_verdict.py", "qwen38_n1_smoke.py",
                         "qwen38_n1_tools.py", "qwen_n4_live_smoke.py", "coding_family.py", "f2_trace.py", "f2_semantic.py"}
     if expected_plan["engine_kind"] == "peer":
-        required_sources.add("qwen_n4_peer.py")
+        required_sources |= {"qwen_n4_peer.py", "family_peer.py"}
     require(required_sources <= set(expected_plan["source_files"]), "all actual audit/production sources bound")
     require(isinstance(expected_plan["trace_scenario"], dict) and expected_plan["trace_scenario"].get("run_id") == expected_plan["run_id"],
             "externally frozen actual trace population scenario")
@@ -281,9 +282,10 @@ def certify_cohort(cohort_manifest_path, expected_plan):
                     and not c.get("errors") for c in outer["cleanup"]), "raw server/client process cleanup")
     ready = reader.obj(manifest["readiness"])
     if expected_plan["engine_kind"] == "peer":
-        from qwen_n4_peer import validate_readiness
+        from family_peer import validate_readiness
         require(count == 4 and set(ready) == {"health", "props", "slots"}, "raw peer readiness envelope")
-        validate_readiness(ready["health"], ready["props"], ready["slots"], expected_plan["model"])
+        validate_readiness(ready["health"], ready["props"], ready["slots"], expected_plan["model"],
+                           expected_plan["family"])
     else:
         require(expected_plan["engine_kind"] == "hf2q", "closed engine family")
         require(ready["health"]["model"] == expected_plan["model"]
