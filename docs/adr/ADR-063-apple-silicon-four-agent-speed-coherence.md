@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope, F1/F3 execution entry and the separately reviewed F2/Q1/Q2/C1 source implementation entry; other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-10-30 — Q5 rewritten: admission per family from a calibrated run plus live out-of-memory stops on the dedicated laptop, replacing the worst-case charged ledger. Earlier 2026-10-27 parallel-source update unchanged.
+- **Updated:** 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
 - Stable source ID: ADR-063
@@ -27,7 +27,7 @@ The program MUST preserve Rust-owned conversion, quantization and inference, Ope
 
 The program MUST NOT revive falsified router-only precision fixes, reimplement already shipped tiled/block-skip attention, presume HASS/Hydra stacked gains, introduce approximate recurrent or nonprefix reuse into exact serving, use Python/vendor production conversion, substitute prequantized targets, or equate one-slot headline throughput with four-agent success. ANE encoder offload, distributed Macs and custom training are excluded from this delivery; they may reopen only with a separate current evidence-backed design. The July BaseRT paper is historical context; October 22 BaseRT 0.4.0 and current peer kernels are the recency baseline.
 
-Conditional work means its deciding experiment must record implement, falsify, or successor-design with evidence. It is never permission to land a stub or promise an unmeasured speedup. Experiment receipts and implementation candidates use merge delivery; Q4 alone closes the v0.1.28 product release boundary; Q2 certifies the harness and Q3 independently proves the measured effects. A required runtime change needs a published native revision and clean registry-resolving proof. The final qualification depends on the actual winning subset, declared before candidate acceptance; it need not wait for unrelated or falsified hypotheses.
+Conditional work means its deciding experiment must record implement, falsify, or successor-design with evidence. It is never permission to land a stub or promise an unmeasured speedup. Experiment receipts and implementation candidates use merge delivery; Q4 alone closes the product release boundary; Q2 certifies the harness and Q3 independently proves the measured effects. A required runtime change needs a published native revision and clean registry-resolving proof. The final qualification depends on the actual winning subset, declared before candidate acceptance; it need not wait for unrelated or falsified hypotheses.
 
 
 ## Repository ownership and publication
@@ -215,7 +215,7 @@ Repository ownership: hf2q owns Qwen model/cache integration and anchor selectio
 
 Validation: Run four-slot divergent-edit state/lifecycle gates and paired F2 scoreboard with allocation accounting.
 
-Predecessors: C1, F2.
+Predecessors: C1. Moved to v0.1.29 (operator decision, 2026-10-30).
 
 Priority: High. Core scope.
 
@@ -242,7 +242,7 @@ Repository ownership: hf2q owns rendering/tokenization/lookup and request-level 
 
 Validation: Profile F2 warm turns, compare full-token oracle with proposed CPU/incremental/Metal path, and record pass/falsification and paired end-to-end timing.
 
-Predecessors: F2.
+Predecessors: none.
 
 Priority: Medium. Conditional hypothesis; require deciding evidence before implementation.
 
@@ -271,7 +271,7 @@ Repository ownership: hf2q owns DeepSeek cohort membership, cache mutation trans
 
 Validation: Run adversarial transaction tests and a real-artifact cohort-prefill plus active-decode oracle.
 
-Predecessors: F2, Q5.
+Predecessors: Q5.
 
 Priority: High. Core scope.
 
@@ -298,7 +298,7 @@ Repository ownership: hf2q owns physical cohort construction, slot-indexed model
 
 Validation: Capture kernel/row traces and run four-slot independent-versus-shared target and end-to-end comparisons, including cancel/EOS and partial cohort failures.
 
-Predecessors: F2, Q1, Q5.
+Predecessors: Q5.
 
 Priority: High. Core scope.
 
@@ -327,7 +327,7 @@ Repository ownership: hf2q owns warm-turn speculative state, proposal/acceptance
 
 Validation: Extend current exact speculation and cache lifecycle gates; compare F2 warm tool rounds off versus auto.
 
-Predecessors: C1, F2, Q1, Q5.
+Predecessors: C1, Q5.
 
 Priority: High. Core scope.
 
@@ -354,7 +354,7 @@ Repository ownership: hf2q owns isolated reference qualification, target/draft c
 
 Validation: Run isolated reference qualification and four-slot matched trials; validate independent sequential target decisions and model schema before proposing a native port.
 
-Predecessors: F2, Q1, Q5.
+Predecessors: Q5.
 
 Priority: High. Core scope.
 
@@ -383,7 +383,7 @@ Repository ownership: mlx-native owns all kernel and dispatcher changes, hardwar
 
 Validation: Run frozen shape microbenchmarks, independent sequential/logit oracles, four-slot row traces and paired F2 trials.
 
-Predecessors: F2, Q1, Q5.
+Predecessors: Q5.
 
 Priority: High. Core scope.
 
@@ -410,7 +410,7 @@ Repository ownership: hf2q owns family state/logit/routing and task-quality orac
 
 Validation: Run source-bound intermediate and transaction comparisons with deliberate stale-state/incorrect-routing negative controls plus the F2 task oracle.
 
-Predecessors: F2.
+Predecessors: none.
 
 Priority: High. Core scope.
 
@@ -437,7 +437,7 @@ Repository ownership: Independent QE qualifies hf2q campaign clients, scoring, c
 
 Validation: Run deterministic fake-server/receipt negative controls, then verify instrumentation against actual server traces and fail-closed artifact identity checks.
 
-Predecessors: F2.
+Predecessors: none.
 
 Priority: High. Core scope.
 
@@ -463,14 +463,14 @@ Acceptance:
 
 - A separate named QE session/host from the candidate implementer executes Q3 and records its identity; freeze the certified harness commit and metric definitions before candidate implementation/evaluation.
 
-- Use latest peer in its best valid configuration as the mandatory peer arm and retain a separately labeled matched-settings diagnostic. Peer quality failures are recorded; a missing, failed or silently disqualified peer cannot yield a speed victory by default.
+- Use latest peer in its best valid configuration as the mandatory peer arm for each family that has a runnable peer on its declared workload, and retain a separately labeled matched-settings diagnostic. A family without a runnable peer arm is reported as unavailable with evidence. Peer quality failures are recorded; a missing, failed or silently disqualified peer cannot yield a speed victory by default.
 
 
 Repository ownership: Independent QE executes source-bound hf2q-versus-stock-versus-peer campaigns, recording both native and hf2q identities. Native microbenchmarks are diagnostic evidence, not substitutes for all four model-level speed wins.
 
 Validation: Independent QE executes the certified harness against frozen stock/experiment/latest-peer binaries and publishes paired effect sizes, confidence intervals, rejected trials and verdict.
 
-Predecessors: F2, Q1, Q2, Q5.
+Predecessors: Q2, Q5.
 
 Priority: High. Core scope.
 
@@ -486,7 +486,7 @@ Acceptance:
 
 - All deterministic task/tool/isolation gates pass and predeclared stochastic noninferiority holds against eligible current peers.
 
-- For each required artifact (Qwen3.8, DeepSeek-V4, Qwen3.6 and Gemma 4), require at least 5% lower four-agent makespan or 5% higher successful-task goodput than the latest peer in its best valid configuration, with paired uncertainty excluding a tie. Report both stock improvement and peer gap. Competitive/parity or inconclusive results are intermediate evidence and cannot satisfy final release acceptance.
+- For each required artifact (Qwen3.8, DeepSeek-V4, Qwen3.6 and Gemma 4) that has a runnable latest-peer arm on its declared workload, require at least 5% lower four-agent makespan or 5% higher successful-task goodput than that peer in its best valid configuration, with paired uncertainty excluding a tie. A family without a runnable peer arm is recorded as unavailable, and a family whose hf2q arm fails its task is recorded as failed; neither counts as a win. Report both stock improvement and peer gap. Competitive/parity or inconclusive results are intermediate evidence and cannot be reported as wins.
 
 - No accepted result worsens frozen p95 TTFT or maximum semantic-gap fairness ceilings; single-slot or microkernel speed alone cannot satisfy this story.
 
@@ -496,7 +496,7 @@ Acceptance:
 
 - Latest peer must complete the declared workload for a valid performance verdict; peer task failures are explicit quality findings, never grounds for dropping the comparator and claiming a win against nothing.
 
-- Give separate passing speed/quality/fairness verdicts for vanilla Qwen3.8-27B dense, DeepSeek-V4, vanilla Qwen3.6 MoE and Gemma 4 on M5 Max/128 GB, in that priority order. Require all four wins; do not pool results or use a favorable model to hide another lane failure. Bind every claim to exact artifacts and workloads rather than universal untested superiority.
+- Give separate speed/quality/fairness verdicts for vanilla Qwen3.8-27B dense, DeepSeek-V4, vanilla Qwen3.6 MoE and Gemma 4 on M5 Max/128 GB, in that priority order. Each family's verdict is a measured win, a measured loss, unavailable (no runnable peer) or failed (hf2q task failure), with evidence; do not pool results or use a favorable model to hide another lane's result. Bind every claim to exact artifacts and workloads rather than universal untested superiority.
 
 - Before final candidate acceptance, record the exact winning candidate work keys and immutable commits, add them as required Q4 predecessors in the source/extraction/awa graph, and obtain independent verdicts for their combined configuration. A prose-only winning subset cannot bypass candidate gates.
 
@@ -504,11 +504,11 @@ Repository ownership: The integration owner coordinates two release chains: merg
 
 Validation: Independent review of the combined candidate and raw F2 receipts, followed by exact-artifact release verification on the target Apple host.
 
-Predecessors: F3, Q1, Q2, Q3, Q5.
+Predecessors: F3, Q2, Q3, Q5.
 
 Priority: High. Core scope.
 
-Delivery boundary: Published v0.1.28 release containing the independently accepted configuration.
+Delivery boundary: Published hf2q release containing the independently accepted per-family configuration.
 
 ### Q5. Run four-slot configurations on the M5 Max 128 GB without exhausting memory
 
@@ -545,7 +545,7 @@ Delivery boundary: Measured evidence or qualified implementation merged to main 
 
 ## Coverage and sequencing
 
-F1 precedes F2; F2 is the source-bound baseline for every measured lane. F3 precedes C1 because the checkpoint contract must reflect current graft and persistence behavior. A family's Q5 calibration precedes that family's hardware experiments and retained-state expansion; families do not wait on each other. Qwen implementation C2 follows C1 and F2. Gemma/DeepSeek multi-anchor implementation, mixed-policy production work, queue-aware admission, new native block drafters/lattice trees, NAX attention and scratch-wait changes are successor candidates after the primary deciding measurements, not promised v0.1.28 features. S1 and D2 record deciding evidence before successor designs. Q1 is a correctness dependency for shared target batching, speculation and numerical kernels. Different edits to a shared file require merge coordination, not invented product dependencies.
+F1 precedes F2; F2 is the scoreboard that renders every measured lane, but since 2026-10-30 it no longer gates other stories. F3 precedes C1 because the checkpoint contract must reflect current graft and persistence behavior. A family's Q5 calibration precedes that family's hardware experiments and retained-state expansion; families do not wait on each other. Qwen implementation C2 follows C1 and moves to v0.1.29. Gemma/DeepSeek multi-anchor implementation, mixed-policy production work, queue-aware admission, new native block drafters/lattice trees, NAX attention and scratch-wait changes are successor candidates after the primary deciding measurements, not promised v0.1.28 features. S1 and D2 record deciding evidence before successor designs. Q1's numerical-invariance evidence informs shared target batching, speculation and numerical kernels, which must still prove exactness against their own serial reference. Different edits to a shared file require merge coordination, not invented product dependencies.
 
 All acceptance, exclusions, failed-path requirements and the winning-subset release rule above are material source obligations and must be represented in the awa extraction coverage. Numerical or API-semantic failures stop promotion. A negative experiment is valuable measured evidence, not a shipped feature; no performance estimate in the research report is an acceptance receipt.
 
@@ -596,6 +596,36 @@ calibration conditions; a recalibration is still needed when its source
 changes. The worst-case constructor at `538e9ef3` (draft #453) remains a
 diagnostic, not the admission gate. This update establishes no speed win or
 task completion.
+
+### Per-family closure and release scope (operator update, 2026-10-30)
+
+The operator decided three scope changes after the v0.1.28 package was
+published:
+
+- **Per-family evidence closes stories.** F2 and Q1 remain program stories but
+  are no longer closure gates for other stories. A story closes on per-family
+  hardware evidence that an independent reviewer accepts: an A/B against stock
+  hf2q on the same artifact, workload and binary family, the story's exactness
+  or isolation tests, a passing task-quality result and a passing Q5
+  calibration for that family. F2 renders those results on its scoreboard.
+  The full fixed-six, three-arm F2 campaign needs about 72 runs plus peer
+  adapters that do not exist for DeepSeek-V4 or Gemma 4; it would otherwise
+  have gated every story.
+- **Q3/Q4 accept per-family peer wins.** Each family receives a measured win,
+  a measured loss, unavailable (no runnable peer arm on its declared workload)
+  or failed (hf2q task failure) verdict with evidence. Only measured wins count
+  as wins; nothing is pooled or dropped. Q4 ships in the first hf2q release
+  that contains the accepted configuration.
+- **C2 moves to v0.1.29.** The four-agent workload has no divergent-turn
+  demand (24 of 24 follow-ups hit the exact prefix, about 76% cached), so
+  multi-depth Qwen reuse would show no measurable gain, while it requires
+  atomic restore of recurrent state that does not exist yet.
+
+Evidence at the time of the decision: DeepSeek-V4 joint decode (#458)
+reduced four-agent median makespan from 141.7 s to 105.0 s, bitwise equal to
+serial decode. Qwen3.6's hf2q arm fails its coding task on a near-tie in model
+output (#461). DeepSeek-V4 and Gemma 4 have no peer adapter. This update
+establishes no speed win by itself.
 
 ## Consequences
 
