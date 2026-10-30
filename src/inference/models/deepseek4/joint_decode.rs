@@ -43,16 +43,40 @@ use super::verifier_forward::decode_layers_per_command_buffer;
 use super::{Deepseek4Config, Deepseek4Model};
 
 /// Widest joint step whose dense products stay on the per-row matvec route.
+/// Serving caps the default width lower; see the scheduler's row cap.
 pub(crate) const MAX_JOINT_DECODE_ROWS: usize = MM_ROUTING_THRESHOLD as usize;
 
-/// Whether the process configuration admits joint decode. Diagnostic layer
-/// dumps and stage profiling change the one-token graph's submission shape,
-/// and unretained Metal references require the synchronous serial path.
-pub(crate) fn joint_decode_available() -> bool {
-    retained_reference_pipeline_enabled()
-        && std::env::var_os("HF2Q_DEEPSEEK_DUMP_LAYER_DIR").is_none()
-        && std::env::var_os("HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR").is_none()
-        && std::env::var("HF2Q_DEEPSEEK_STAGE_PROFILE").as_deref() != Ok("1")
+impl Deepseek4Model {
+    /// `None` when joint decode is admissible for this artifact and process,
+    /// otherwise the reason it must stay serial. Diagnostic layer dumps and
+    /// stage profiling change the one-token graph's submission shape,
+    /// unretained Metal references require the synchronous serial path,
+    /// `HF2Q_DECODE_MV_EXT=1` moves Q8_0 at 2..=8 rows onto the non-exact
+    /// `mul_mv_ext` kernel, and unproven matrix storage could make a row
+    /// depend on its batch peers.
+    pub(crate) fn joint_decode_unavailable_reason(&self) -> Option<String> {
+        if !retained_reference_pipeline_enabled() {
+            return Some("MLX_UNRETAINED_REFS requires the synchronous serial path".into());
+        }
+        for name in [
+            "HF2Q_DEEPSEEK_DUMP_LAYER_DIR",
+            "HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR",
+        ] {
+            if std::env::var_os(name).is_some() {
+                return Some(format!("{name} diagnostics require the serial graph"));
+            }
+        }
+        if std::env::var("HF2Q_DEEPSEEK_STAGE_PROFILE").as_deref() == Ok("1") {
+            return Some("HF2Q_DEEPSEEK_STAGE_PROFILE=1 requires the serial graph".into());
+        }
+        if std::env::var("HF2Q_DECODE_MV_EXT").as_deref() == Ok("1") {
+            return Some(
+                "HF2Q_DECODE_MV_EXT=1 routes Q8_0 at 2..=8 rows through non-exact mul_mv_ext"
+                    .into(),
+            );
+        }
+        self.joint_route_unproven.clone()
+    }
 }
 
 /// RoPE tables for both attention families, built once per joint step.
@@ -119,10 +143,9 @@ impl Deepseek4Model {
             "DeepSeek-V4 joint decode requires 2..={MAX_JOINT_DECODE_ROWS} aligned rows, got {rows} tokens for {} caches",
             caches.len()
         );
-        ensure!(
-            joint_decode_available(),
-            "DeepSeek-V4 joint decode requires retained command buffers and no layer diagnostics"
-        );
+        if let Some(reason) = self.joint_decode_unavailable_reason() {
+            anyhow::bail!("DeepSeek-V4 joint decode unavailable: {reason}");
+        }
         let steps = caches
             .iter()
             .map(|cache| {

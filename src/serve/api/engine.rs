@@ -8756,6 +8756,7 @@ fn run_slot_aware_deepseek4(
     supervisor: EngineSupervisor,
 ) {
     let decode_quantum = deepseek4_slot_decode_quantum();
+    let joint_decode_rows = deepseek4_joint_decode::deepseek4_joint_decode_rows(&model.model);
     // DeepSeek's verifier owns an architecture-specific atomic matrix chunk
     // (normally 4K/2K/1K depending on cache shape). The worker reports exact
     // consumed rows after each transaction; the generic 512-token cap would
@@ -9198,6 +9199,7 @@ fn run_slot_aware_deepseek4(
                     kv_bytes_per_token,
                     decode_quantum,
                     0,
+                    joint_decode_rows,
                     &supervisor,
                 ) {
                     fail_stop_deepseek4_worker(
@@ -9367,6 +9369,7 @@ fn run_slot_aware_deepseek4(
                     kv_bytes_per_token,
                     mixed_budget.decode_quantum,
                     active_cold_prefills,
+                    joint_decode_rows,
                     &supervisor,
                 ) {
                     fail_stop_deepseek4_worker(
@@ -10599,10 +10602,13 @@ fn decode_batch_deepseek4(
     kv_bytes_per_token: u64,
     decode_quantum: usize,
     active_cold_prefills: usize,
+    joint_decode_rows: Option<usize>,
     supervisor: &EngineSupervisor,
 ) -> Option<SlotAwareGpuFatal> {
     let cold_runnable_at_start = deepseek4_cold_runnable_work(slots);
-    let serial_handles = if deepseek4_joint_decode::deepseek4_joint_decode_enabled() {
+    let joint_decode_rows =
+        deepseek4_joint_decode::deepseek4_joint_decode_turn_rows(&model.model, joint_decode_rows);
+    let serial_handles = if let Some(max_rows) = joint_decode_rows {
         match deepseek4_joint_decode::run_deepseek4_joint_decode(
             model,
             sessions,
@@ -10614,6 +10620,7 @@ fn decode_batch_deepseek4(
             handles,
             kv_bytes_per_token,
             decode_quantum,
+            max_rows,
             cold_runnable_at_start,
             supervisor,
         ) {

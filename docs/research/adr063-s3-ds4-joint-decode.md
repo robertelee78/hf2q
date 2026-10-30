@@ -12,7 +12,7 @@ With four concurrent agents, each DeepSeek-V4 Flash request decodes at about 8.4
 
 ## Decision
 
-Phase 1 adds one layer-major forward per decode step over every eligible decoding slot (B = 2..8), with:
+Phase 1 adds one layer-major forward per decode step over every eligible decoding slot (B = 2..4 by default; up to 8 with `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS`), with:
 
 - unequal positions allowed;
 - streaming and unary slots mixed;
@@ -20,7 +20,7 @@ Phase 1 adds one layer-major forward per decode step over every eligible decodin
 
 Row-parallel work runs once with `m = B`. Work that touches a request's cache runs per row against that row's cache and position.
 
-The joint path must be **bit-identical to serial decode**. It is opt-in until the official-artifact proof and the four-agent A/B pass on hardware. The B=4 cohort stays in place as the joint-off baseline. Once joint decode is promoted, the cohort is redundant and should be removed: it is a strict subset of the joint path.
+The joint path must be **bit-identical to serial decode**. It became the default on 2026-10-30, after the official-artifact proof and the four-agent A/B passed on hardware. The default width is 4 rows; widths 5–8 need `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` and have no serving measurement. The B=4 cohort is kept only as the switch-off path (`HF2Q_DEEPSEEK_JOINT_DECODE=0`). It is a strict subset of the joint path, so it can be removed once the serial A/B arm is no longer needed.
 
 ## Data flow per layer (`joint_decode.rs`, `joint_decode_core.rs`)
 
@@ -71,14 +71,20 @@ Greedy tokens are then identical by construction.
 
 How the joint path holds the contract:
 
-- **Block-quantized products at `m ≤ MM_ROUTING_THRESHOLD (8)`** take the default GGUF matvec route. That route's per-row arithmetic does not depend on `m`. `MAX_JOINT_DECODE_ROWS = 8` enforces the bound, and `row_matmul` fails closed above it.
+- **Block-quantized products at `m ≤ MM_ROUTING_THRESHOLD (8)`** take the default GGUF matvec route. That route's per-row arithmetic does not depend on `m`. `MAX_JOINT_DECODE_ROWS = 8` is the model's hard bound, and `row_matmul` fails closed above it.
+- **Admission by storage type (fail closed).** At load, `joint_decode_routes::unproven_joint_route` lists every product joint decode issues with `m = B` and checks it against the proven set:
+  - Q8_0, Q2_K and Q3_K for row products, the output head and routed experts;
+  - F32/F16/BF16 only where `row_matmul` splits them per row (the router and every other prelude, epilogue or FFN product);
+  - grouped output-A only for Q8_0.
+
+  The output head goes through `raw_matmul` at `m = B` and is never split, so a float `output_hc_fn`/`output` keeps the artifact on serial decode. Any K-quant `mN` route, legacy quant, or grouped output-A other than Q8_0 does the same. `HF2Q_DECODE_MV_EXT=1` also disables joint decode. `Deepseek4Model::joint_decode_unavailable_reason` returns the reason, and both the worker and every joint transaction check it.
 - **Dense float weights** (the F32 router, any F32/F16/BF16 matrix) switch kernels at `m > 1`, so `RowMatmul::IndependentRows` applies them one row at a time.
 - **Routed experts** always use `ForceMv` (`quantized_matmul_id_ggml_mv`) in independent-rows mode. Grouped `mm_id` (`n_tokens > 32`) is not bit-identical.
 - **Grouped output-A** at `rows > 1` runs the same `nr2` kernel per group with `m = rows`. This is pinned by a GPU test.
-- **Row-independent kernels:** RMS norm (one threadgroup per row), HC split-Sinkhorn, `hc_pre`/`hc_post` (token = threadgroup row or simdgroup), tail RoPE (`positions[seq]`), MXFP8 and Hadamard (one threadgroup per row). This was checked by reading the mlx-native 0.15.15 shaders. SwiGLU and MoE reduce were not read.
+- **Row-independent kernels:** RMS norm (one threadgroup per row), HC split-Sinkhorn, `hc_pre`/`hc_post` (token = threadgroup row or simdgroup), tail RoPE (`positions[seq]`), MXFP8 and Hadamard (one threadgroup per row). These were checked by reading the mlx-native 0.15.15 shaders. The independent review read SwiGLU, MoE weighted reduce, hash/score routing and GLP, with the same per-row result.
 - **Prefill and serial decode** pass `RowMatmul::Matrix`, so their dispatches are unchanged.
 
-Non-exact measurement arm: `HF2Q_DECODE_MV_EXT=1` routes Q8_0 `m = 2..8` to `mul_mv_ext`, which reads the weights once but is not bit-identical. Use it only to estimate the read-once ceiling.
+Non-exact measurement arm: `HF2Q_DECODE_MV_EXT=1` routes Q8_0 `m = 2..8` to `mul_mv_ext`, which reads the weights once but is not bit-identical. Joint decode therefore refuses it and stays serial; that arm can no longer be measured through joint decode.
 
 ### Tests
 
@@ -90,22 +96,28 @@ Non-exact measurement arm: `HF2Q_DECODE_MV_EXT=1` routes Q8_0 `m = 2..8` to `mul
   - the dense-split predicate.
 - `cache_tests.rs::joint_decode_publication_advances_unequal_positions_together` (Metal allocation only): atomic publication at unequal positions; stale cursor and position-length mismatch poison every row.
 - `real_artifact_joint_decode_tests.rs::official_artifact_joint_decode_matches_serial_decode_bitwise` (`#[ignore]`, official GGUF):
-  - 140 steps over four lanes with prefixes 148/131/3/254 and ragged widths 4/3/2/2;
+  - 140 steps over eight lanes with prefixes 148/131/3/254/200/127/64/9 and ragged widths 8/4/3/5/2/6/7;
   - crosses ratio-4 and ratio-128 boundaries;
-  - one lane stays inside its first window;
+  - lanes stay inside their first window;
   - bitwise state, logits and cache every step;
-  - checks width-1 and misaligned rejection, and a rejected commit gate poisoning only that step's rows.
-- `engine/deepseek4_joint_decode.rs` (host only): kill-switch parsing and default; joint and serial partition (ragged eligibility, cap, duplicates, fewer than two rows).
+  - checks that the artifact admits joint decode, width-1 and misaligned rejection, and a rejected commit gate poisoning only that step's rows.
+  - The 2026-10-30 pass covered the earlier four-lane version (widths 4/3/2/2). The eight-lane version has not yet run.
+- `joint_decode_routes.rs` (host only): the official type set is admitted; a float output head, unproven block types and non-Q8_0 grouped output-A fall back to serial.
+- `engine/deepseek4_joint_decode.rs` (host only):
+  - kill-switch parsing and default;
+  - width parsing (default 4, explicit 2..8);
+  - a requested switch on an unproven artifact selects serial;
+  - joint and serial partition (ragged eligibility, cap, duplicates, fewer than two rows).
 
 ## Scheduler (`engine/deepseek4_joint_decode.rs`)
 
 ### Selection
 
-A scheduler `Decode` or `Mixed` turn calls `decode_batch_deepseek4`. With the switch on and `joint_decode_available()` true, the turn is partitioned:
+A scheduler `Decode` or `Mixed` turn calls `decode_batch_deepseek4`. When the worker resolved a joint width at start (switch on, artifact and configuration admissible), the turn is partitioned:
 
-- **Joint rows:** unique handles where the installed handle matches, the work is unfinished `Decode` (not parked), the client is still open, and `Deepseek4Session::joint_decode_ready()` holds: cursor equals the token ledger, live logits are present, and `plan_next_step()` succeeds (not poisoned, within capacity and graft bounds). Rows are sorted by slot and capped at 8.
+- **Joint rows:** unique handles where the installed handle matches, the work is unfinished `Decode` (not parked), the client is still open, and `Deepseek4Session::joint_decode_ready()` holds: cursor equals the token ledger, live logits are present, and `plan_next_step()` succeeds (not poisoned, within capacity and graft bounds). Rows are sorted by slot and capped at the worker's joint width (default 4).
 - **Fallback:** fewer than two eligible rows means the whole turn runs serially.
-- **Serial leftovers:** parked completions, closed or ineligible slots, and overflow beyond 8 run on the unchanged serial loop afterwards.
+- **Serial leftovers:** parked completions, closed or ineligible slots, and overflow beyond the width run on the unchanged serial loop afterwards.
 
 ### Turn
 
@@ -144,7 +156,18 @@ The existing `Mixed` step still runs the decode turn, then one prefill slice cap
 - `0`, `off` or `false` keeps the serial path plus the B=4 cohort;
 - invalid values warn and fall back to the default (on).
 
-The value is read once per process. It is also forced off by `MLX_UNRETAINED_REFS`, `HF2Q_DEEPSEEK_DUMP_LAYER_DIR`, `HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR` and `HF2Q_DEEPSEEK_STAGE_PROFILE=1`. A startup log records `requested` and `available`; `DeepSeek-V4 joint decode engaged` logs once, and debug logs report each turn's width.
+`HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` sets the joint width. The default is 4, and 2..8 are accepted. Widths 5–8 are covered only by the official-artifact bitwise test, not by any serving measurement. Invalid values warn and use 4.
+
+**When it is read.** Both variables are read once, when the DeepSeek-V4 worker starts (`deepseek4_joint_decode_rows`), which is after model load and before the first request. Each decode turn re-checks admissibility. A routing variable can change later, for example when loading a Qwen3.8 model sets `HF2Q_DECODE_MV_EXT=1`. If that happens, the turn runs serially and a single warning is logged; requests do not fail.
+
+**What keeps serial decode** even when requested:
+- `MLX_UNRETAINED_REFS`;
+- `HF2Q_DEEPSEEK_DUMP_LAYER_DIR` or `HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR`;
+- `HF2Q_DEEPSEEK_STAGE_PROFILE=1`;
+- `HF2Q_DECODE_MV_EXT=1`;
+- an artifact with unproven matrix storage.
+
+**Logs.** One `DeepSeek-V4 joint decode configuration` line at worker start records `requested`, `max_rows`, `selected` and the `unavailable` reason. `DeepSeek-V4 joint decode engaged` logs once, and debug logs report each turn's width.
 
 **Promotion:** done on 2026-10-30 after the official-artifact test and the A/B below passed.
 
@@ -154,10 +177,9 @@ The value is read once per process. It is also forced off by `MLX_UNRETAINED_REF
 - **Positions:** each row's position comes from its own `plan_next_step()`, not from the batch. `positions[r]` drives RoPE, the window slot, the compressor block position and indexer start. The official test runs at ragged positions.
 - **Grammar and tool calls:** sampling is unchanged per row, and streaming rows now receive their own events in joint mode. Interleaving token-by-token across rows does not mix any per-slot state.
 - **Exactness assumptions not yet hardware-proven:**
-  - SwiGLU, MoE weighted reduce and hash/score routing are row-independent (assumed; the shaders were not read);
-  - GLP steering with `rows = B` (row-wise apply assumed);
-  - an artifact whose shared expert uses K-quant `mN` routes (claimed exact by mlx-native).
-- **Decode scratch:** the high-water mark grows about B× (on the order of 150 MB at B=4; ratio-4 indexer scratch grows with context). It may exceed the 256 MiB retained-scratch cap and be reallocated each turn.
+  - SwiGLU, MoE weighted reduce, hash/score routing and GLP steering are row-independent by construction. The independent review read these shaders in mlx-native 0.15.15 and the GLP apply kernels. GLP under joint decode has not been tested on hardware.
+  - widths 5–8 until the eight-lane official test runs.
+- **Decode scratch:** the high-water mark grows about B×. The A/B measured 197–401 MB at B=4 with roughly 0.8–2.3k-token prompts, against 62–95 MB serial. Ratio-4 indexer scratch grows further with context, and long-context (≥64k) peak memory is unmeasured. Most joint completions exceed the 256 MiB retained-scratch cap, so scratch is released and reallocated after the turn.
 - **Code duplication:** the per-row cores intentionally duplicate the one-token decode branch, so the serial reference stays untouched. Dedupe the two after promotion.
 
 ## Reference: the peer's DSV4 multi-slot decode (read-only, HEAD 3c809f443, MIT, no code copied)
@@ -222,7 +244,7 @@ The root runs all builds and tests. The arms share one binary and differ only in
 |---|---|
 | A (baseline) | `HF2Q_DEEPSEEK_JOINT_DECODE` unset |
 | B (joint, exact) | `HF2Q_DEEPSEEK_JOINT_DECODE=1` |
-| C (diagnostic, non-exact) | `HF2Q_DEEPSEEK_JOINT_DECODE=1 HF2Q_DECODE_MV_EXT=1` |
+| C (diagnostic, non-exact) | `HF2Q_DEEPSEEK_JOINT_DECODE=1 HF2Q_DECODE_MV_EXT=1`. The exactness gate now keeps this configuration serial, so arm C is no longer runnable through joint decode. |
 
 Run each arm on two workloads:
 
@@ -241,7 +263,7 @@ Run each arm on two workloads:
 - arm B per-agent N=4 tok/s is above arm A beyond noise;
 - TTFT medians are not worse.
 
-Arm C bounds what the read-once kernel above would add.
+Arm C was meant to bound what the read-once kernel above would add. It is no longer available, because joint decode refuses `HF2Q_DECODE_MV_EXT=1`.
 
 ## Measured result (2026-10-30, M5 Max 128 GB)
 
@@ -254,15 +276,22 @@ Arm C bounds what the read-once kernel above would add.
 | A serial | 4 | 141.7 s (136.2–148.6) | 8.12 | 26.8 |
 | B joint | 4 | 105.0 s (104.2–111.5) | 10.98 | 35.7 |
 
-Makespan improved 33.5% (log-ratio Welch 95% CI 25.8–41.7%). The ranges do not overlap. Memory: every run kept free+cached at or above 3.29 GB, with no critical pressure.
+Median makespan fell 25.9% (141.7 s → 105.0 s), which is 1.35× throughput from the medians. Across runs, the geometric-mean time ratio is 1.335× (33.5%; log-ratio Welch 95% CI 25.8–41.7%). The ranges do not overlap. Memory: every run kept free+cached at or above 3.29 GB, with no critical pressure.
 
-Not yet measured: the N=1 no-regression arm (joint never engages at N=1 by construction) and arm C. The exact multi-row Q8_0 kernel in mlx-native (`perf/q8-0-mv-multirow-exact`) measured 1.15–1.46× over per-row nr2 at M=4 in isolation; it reaches hf2q only after an mlx-native release.
+Not yet measured:
+- the N=1 no-regression arm (joint never engages at N=1 by construction);
+- widths 5–8 in serving;
+- long-context peak memory.
+
+The exact multi-row Q8_0 kernel in mlx-native (`perf/q8-0-mv-multirow-exact`) measured 1.15–1.46× over per-row nr2 at M=4 in isolation. It reaches hf2q only after an mlx-native release.
 
 ## Changed files
 
 - `src/inference/models/deepseek4/row_matmul.rs` (new): row semantics, row views.
 - `src/inference/models/deepseek4/joint_decode.rs` (new): joint transaction and layer loop.
 - `src/inference/models/deepseek4/joint_decode_core.rs` (new): per-row cores.
+- `src/inference/models/deepseek4/joint_decode_routes.rs` (new): fail-closed admission by matrix storage type.
+- `model.rs`: records the route proof at load.
 - `src/inference/models/deepseek4/compressed_attention_common.rs`: prelude and epilogue take `RowMatmul`.
 - `compressed_attention.rs`: passes `Matrix`; exposes the sparse-decode helpers.
 - `ffn_forward.rs`: `forward_ffn_rows` takes `RowMatmul`; independent rows force `mv_id`.
@@ -272,8 +301,8 @@ Not yet measured: the N=1 no-regression arm (joint never engages at N=1 by const
 - Tests: `row_matmul_tests.rs` and `real_artifact_joint_decode_tests.rs` (new), `cache_tests.rs`, and `real_artifact_decode_cohort_tests.rs` (shared assertions).
 - `src/serve/api/engine_deepseek4/joint_decode.rs` (new): readiness and the joint commit.
 - `engine_deepseek4.rs`: module registration.
-- `src/serve/api/engine/deepseek4_joint_decode.rs` (new): switch, partition, turn.
-- `engine.rs`: routing and `settle_deepseek4_decode_lane` extraction.
+- `src/serve/api/engine/deepseek4_joint_decode.rs` (new): switch, width cap, partition, turn.
+- `engine.rs`: resolves the joint width at worker start, routing, and the `settle_deepseek4_decode_lane` extraction.
 - `CHANGELOG.md`.
 
 No oMLX code was copied. The designs borrowed are the layer-major B-row step, per-request attention, and decode-fairness interleaving.

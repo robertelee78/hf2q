@@ -10,15 +10,24 @@ use super::model::Deepseek4Model;
 use super::real_artifact_decode_cohort_tests::{assert_cache_exact, assert_exact_f32, read_f32};
 use super::real_artifact_tests::official_artifact;
 
-const LANES: usize = 4;
-/// Unequal prompt lengths: one lane inside its first sliding window, one a
+const LANES: usize = 8;
+/// Unequal prompt lengths: lanes inside their first sliding window, one a
 /// token short of a ratio-4 group, and lanes that cross ratio-4 and
 /// ratio-128 compression boundaries at different steps of the decode span.
-const PREFIX_ROWS: [usize; LANES] = [148, 131, 3, 254];
+const PREFIX_ROWS: [usize; LANES] = [148, 131, 3, 254, 200, 127, 64, 9];
 const DECODE_STEPS: usize = 140;
-/// Ragged step widths (B = 4, 3, 2, 2) so every lane advances at its own rate
-/// and joint rows never share a position by construction.
-const STEP_LANES: [&[usize]; 4] = [&[0, 1, 2, 3], &[0, 2, 3], &[1, 3], &[0, 2]];
+/// Ragged step widths (B = 8, 4, 3, 5, 2, 6, 7) cover every width the model
+/// admits, so every lane advances at its own rate and joint rows never share
+/// a position by construction.
+const STEP_LANES: [&[usize]; 7] = [
+    &[0, 1, 2, 3, 4, 5, 6, 7],
+    &[0, 1, 2, 3],
+    &[0, 2, 3],
+    &[1, 3, 4, 5, 7],
+    &[1, 3],
+    &[0, 2, 4, 5, 6, 7],
+    &[1, 2, 3, 4, 5, 6, 7],
+];
 
 fn prefix_tokens(lane: usize) -> Vec<u32> {
     (0..PREFIX_ROWS[lane])
@@ -61,6 +70,7 @@ fn official_artifact_joint_decode_matches_serial_decode_bitwise() {
         .unwrap_or_else(|error| panic!("load official artifact {}: {error:#}", path.display()));
     assert!(model.cfg.compress_ratios.contains(&4));
     assert!(model.cfg.compress_ratios.contains(&128));
+    assert_eq!(model.joint_decode_unavailable_reason(), None);
     assert!(LANES <= MAX_JOINT_DECODE_ROWS);
     let capacity = PREFIX_ROWS.iter().max().unwrap() + DECODE_STEPS + 1;
     let mut serial_caches = prefilled_caches(&mut model, capacity);

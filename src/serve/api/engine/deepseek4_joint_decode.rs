@@ -9,9 +9,9 @@
 //! budget still interleaves bounded prefill chunks between decode turns.
 
 use std::sync::atomic::Ordering;
-use std::sync::{LazyLock, Once};
+use std::sync::Once;
 
-use crate::inference::models::deepseek4::{joint_decode_available, MAX_JOINT_DECODE_ROWS};
+use crate::inference::models::deepseek4::{Deepseek4Model, MAX_JOINT_DECODE_ROWS};
 use crate::serve::api::engine_deepseek4::{
     Deepseek4LoadedModel, Deepseek4Session, Deepseek4SlotState,
 };
@@ -28,9 +28,13 @@ use super::{
 const DEEPSEEK4_JOINT_DECODE_ENV: &str = "HF2Q_DEEPSEEK_JOINT_DECODE";
 /// Joint decode is the default: it is bitwise equal to serial decode on the
 /// official artifact (`official_artifact_joint_decode_matches_serial_decode_bitwise`)
-/// and cut four-agent C262144 coding makespan by 33.5% (4 runs per arm,
-/// 2026-10-30; `docs/research/adr063-s3-ds4-joint-decode.md`).
+/// and cut four-agent C262144 coding median makespan by 25.9% (4 runs per
+/// arm, 2026-10-30; `docs/research/adr063-s3-ds4-joint-decode.md`).
 const DEEPSEEK4_JOINT_DECODE_DEFAULT: bool = true;
+/// Widest joint step selected by default. Widths 5..=8 run only when an
+/// operator raises this explicitly; serving at those widths is unmeasured.
+const DEEPSEEK4_JOINT_DECODE_MAX_ROWS_ENV: &str = "HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS";
+const DEFAULT_DEEPSEEK4_JOINT_DECODE_ROWS: usize = 4;
 
 fn parse_deepseek4_joint_decode(raw: Option<&str>) -> Result<bool, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
@@ -45,8 +49,33 @@ fn parse_deepseek4_joint_decode(raw: Option<&str>) -> Result<bool, String> {
     }
 }
 
-/// Process-wide joint decode selection, read once at first decode turn.
-static JOINT_DECODE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+fn parse_deepseek4_joint_decode_max_rows(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(DEFAULT_DEEPSEEK4_JOINT_DECODE_ROWS);
+    };
+    raw.parse::<usize>()
+        .ok()
+        .filter(|rows| (2..=MAX_JOINT_DECODE_ROWS).contains(rows))
+        .ok_or_else(|| {
+            format!(
+                "{DEEPSEEK4_JOINT_DECODE_MAX_ROWS_ENV} must be an integer in 2..={MAX_JOINT_DECODE_ROWS}, got {raw:?}"
+            )
+        })
+}
+
+/// Joint width for this worker, or `None` for serial decode. Unproven
+/// artifacts and diagnostic configurations stay serial even when requested.
+fn select_deepseek4_joint_decode_rows(
+    requested: bool,
+    max_rows: usize,
+    unavailable: Option<&str>,
+) -> Option<usize> {
+    (requested && unavailable.is_none()).then_some(max_rows)
+}
+
+/// Resolve joint decode once when the DeepSeek-V4 worker starts and log the
+/// decision, including why an artifact or configuration keeps serial decode.
+pub(super) fn deepseek4_joint_decode_rows(model: &Deepseek4Model) -> Option<usize> {
     let raw = std::env::var(DEEPSEEK4_JOINT_DECODE_ENV).ok();
     let requested = parse_deepseek4_joint_decode(raw.as_deref()).unwrap_or_else(|error| {
         tracing::warn!(
@@ -56,19 +85,50 @@ static JOINT_DECODE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
         );
         DEEPSEEK4_JOINT_DECODE_DEFAULT
     });
-    let available = joint_decode_available();
+    let raw_rows = std::env::var(DEEPSEEK4_JOINT_DECODE_MAX_ROWS_ENV).ok();
+    let max_rows =
+        parse_deepseek4_joint_decode_max_rows(raw_rows.as_deref()).unwrap_or_else(|error| {
+            tracing::warn!(
+                error,
+                fallback = DEFAULT_DEEPSEEK4_JOINT_DECODE_ROWS,
+                "invalid DeepSeek-V4 joint decode width"
+            );
+            DEFAULT_DEEPSEEK4_JOINT_DECODE_ROWS
+        });
+    let unavailable = model.joint_decode_unavailable_reason();
+    let selected = select_deepseek4_joint_decode_rows(requested, max_rows, unavailable.as_deref());
     tracing::info!(
         target: "hf2q::serve::api::engine_deepseek4::progress",
         requested,
-        available,
-        max_rows = MAX_JOINT_DECODE_ROWS,
+        max_rows,
+        selected = selected.is_some(),
+        unavailable = unavailable.as_deref().unwrap_or("none"),
         "DeepSeek-V4 joint decode configuration"
     );
-    requested && available
-});
+    selected
+}
 
-pub(super) fn deepseek4_joint_decode_enabled() -> bool {
-    *JOINT_DECODE_ENABLED
+/// Re-check admissibility each turn. Process-wide routing variables can
+/// change after worker start (loading a Qwen3.8 model sets
+/// `HF2Q_DECODE_MV_EXT=1`); a turn that is no longer provably exact runs
+/// serially instead of failing its requests.
+pub(super) fn deepseek4_joint_decode_turn_rows(
+    model: &Deepseek4Model,
+    worker_rows: Option<usize>,
+) -> Option<usize> {
+    let rows = worker_rows?;
+    let Some(reason) = model.joint_decode_unavailable_reason() else {
+        return Some(rows);
+    };
+    static REVOKED: Once = Once::new();
+    REVOKED.call_once(|| {
+        tracing::warn!(
+            target: "hf2q::serve::api::engine_deepseek4::progress",
+            reason = %reason,
+            "DeepSeek-V4 joint decode revoked after worker start; decoding serially"
+        );
+    });
+    None
 }
 
 /// Split one decode turn into joint rows and serial leftovers. The whole turn
@@ -186,14 +246,13 @@ pub(super) fn run_deepseek4_joint_decode(
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
     decode_quantum: usize,
+    max_rows: usize,
     cold_runnable_at_start: usize,
     supervisor: &EngineSupervisor,
 ) -> Deepseek4JointRun {
-    let Some((joint, serial)) =
-        partition_deepseek4_joint_lanes(handles, MAX_JOINT_DECODE_ROWS, |handle| {
-            deepseek4_joint_lane_eligible(sessions, slots, handle)
-        })
-    else {
+    let Some((joint, serial)) = partition_deepseek4_joint_lanes(handles, max_rows, |handle| {
+        deepseek4_joint_lane_eligible(sessions, slots, handle)
+    }) else {
         return Deepseek4JointRun::NotEligible;
     };
 
@@ -398,6 +457,36 @@ mod tests {
             assert_eq!(parse_deepseek4_joint_decode(Some(raw)), Ok(false));
         }
         assert!(parse_deepseek4_joint_decode(Some("joint")).is_err());
+    }
+
+    #[test]
+    fn joint_width_defaults_to_four_and_wider_steps_need_an_explicit_cap() {
+        assert_eq!(parse_deepseek4_joint_decode_max_rows(None), Ok(4));
+        assert_eq!(parse_deepseek4_joint_decode_max_rows(Some(" ")), Ok(4));
+        assert_eq!(DEFAULT_DEEPSEEK4_JOINT_DECODE_ROWS, 4);
+        for rows in 2..=MAX_JOINT_DECODE_ROWS {
+            assert_eq!(
+                parse_deepseek4_joint_decode_max_rows(Some(&rows.to_string())),
+                Ok(rows)
+            );
+        }
+        for raw in ["0", "1", "9", "four"] {
+            assert!(parse_deepseek4_joint_decode_max_rows(Some(raw)).is_err());
+        }
+    }
+
+    #[test]
+    fn unproven_artifacts_and_disabled_switch_keep_serial_decode() {
+        assert_eq!(select_deepseek4_joint_decode_rows(true, 4, None), Some(4));
+        assert_eq!(
+            select_deepseek4_joint_decode_rows(
+                true,
+                4,
+                Some("output.weight is F32, which has no proven-exact joint OutputHead route"),
+            ),
+            None
+        );
+        assert_eq!(select_deepseek4_joint_decode_rows(false, 4, None), None);
     }
 
     #[test]

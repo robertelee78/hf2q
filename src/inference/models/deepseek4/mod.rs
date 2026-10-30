@@ -26,6 +26,7 @@ mod forward_support;
 pub mod hyper_connection;
 mod joint_decode;
 mod joint_decode_core;
+mod joint_decode_routes;
 pub mod model;
 mod output_forward;
 mod prefill_annotations;
@@ -44,7 +45,7 @@ pub(crate) use forward_support::{
     decode_scratch_stats, prefill_scratch_stats, release_decode_scratch, release_prefill_scratch,
     TransientScratchStats,
 };
-pub(crate) use joint_decode::{joint_decode_available, MAX_JOINT_DECODE_ROWS};
+pub(crate) use joint_decode::MAX_JOINT_DECODE_ROWS;
 pub use model::Deepseek4Model;
 pub use residency::Deepseek4Weights;
 pub(crate) use verifier_forward::{
