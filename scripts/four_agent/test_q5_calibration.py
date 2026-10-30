@@ -374,7 +374,8 @@ class ArgvAndCases(unittest.TestCase):
                                        {**self.builtins(), 'REPO': str(repo)}, self.required())['port']
                     for f in ('qwen38', 'qwen36', 'gemma4', 'deepseek4')}
         ports = set()
-        for family, client_family in (('deepseek4', 'deepseek4'), ('gemma4', 'gemma4'), ('qwen38', 'qwen')):
+        for family, client_family in (('deepseek4', 'deepseek4'), ('gemma4', 'gemma4'), ('qwen38', 'qwen'),
+                                      ('qwen36', 'qwen')):
             hf_case = q5_case.loads((HERE / 'q5_cases' / f'{family}.json').read_bytes())
             case = q5_case.loads((HERE / 'q5_cases' / f'peer-{family}.json').read_bytes())
             self.assertEqual(case['family'], family)
@@ -417,7 +418,7 @@ class ArgvAndCases(unittest.TestCase):
             checks = {(c['field'], json.dumps(c['equals'])) for c in plan['readiness']['checks']}
             self.assertTrue({('total_slots', '4'), ('default_generation_settings.n_ctx', '262144'),
                              ('modalities.vision', 'false'), ('build_info', '"b128-e86f5fd"')} <= checks)
-        self.assertEqual(len(ports), 3)
+        self.assertEqual(len(ports), 4)
         self.assertFalse(ports & hf_ports)
 
     def test_hf2q_case_sources_match_the_client_source_freeze(self):

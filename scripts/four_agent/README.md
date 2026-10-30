@@ -200,7 +200,7 @@ The supervisor fills in `server_pid`, `base_url`, `model`, `run_id`, `barrier_to
 
 ### Peer arm cases (Q3/Q4)
 
-`q5_cases/peer-deepseek4.json`, `peer-gemma4.json` and `peer-qwen38.json` launch the peer server directly as the four-slot benchmark arm. They use the same GGUF and model id as the hf2q case, and run the client with `--engine-kind peer`.
+`q5_cases/peer-deepseek4.json`, `peer-gemma4.json`, `peer-qwen38.json` and `peer-qwen36.json` launch the peer server directly as the four-slot benchmark arm. They use the same GGUF and model id as the hf2q case, and run the client with `--engine-kind peer`. `peer-qwen36.json` reproduces the e86 Qwen3.6 peer run's argv exactly, except for the port.
 - The server argv is the Qwen3.6 peer run's argv (`peer-qwen36-e86-none-normal-n4-20261027T185853Z/server-launch-command.json`): 4 slots, 262144 tokens per slot, flash attention on, f16 K/V, no context shift, greedy sampling, no speculation, and the reviewed family template.
 - `PEER_BIN` defaults to the e86f5fd1 build. Readiness requires `/props` `build_info == PEER_BUILD_INFO`.
 - `family_peer.py` holds the DeepSeek-V4 and Gemma 4 adapters. It translates the canonical request into native peer fields and refuses every other field. It also checks `/props` template sha256, sampling and text-only settings. `test_q5_calibration.py` ties each case's flags to the adapter's `CONTROLS`.
