@@ -1,0 +1,144 @@
+{
+  "schema": "hf2q.q5.calibration-case.v1",
+  "family": "gemma4",
+  "notes": [
+    "Derived from: Gemma4 runner: full-input N4 and largest-tool-result supervisors; nonexistent MMPROJ selects the launcher text-only branch; stock (no experiment env).",
+    "Override any variable with HF2Q_Q5_<NAME>; null variables are required. See scripts/four_agent/README.md.",
+    "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv."
+  ],
+  "workload": {
+    "id": "adr063-q5-gemma4-n4-coding-ctx262144",
+    "slots": 4,
+    "context_per_slot": 262144,
+    "client": "scripts/four_agent/qwen_n4_live_smoke.py --family gemma4"
+  },
+  "variables": {
+    "HF2Q_BIN": "{REPO}/target/release/hf2q",
+    "MODEL": "{REPO}/models/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf",
+    "MODEL_SHA256": "",
+    "MODEL_ID": "Gemma 4 26B A4B It",
+    "PORT": "18244",
+    "CARGO": null,
+    "TOOLCHAIN": null,
+    "SANDBOX_PROOF": null,
+    "SANDBOX_PROOF_SHA256": null,
+    "CLIENT_APPROVAL_TEMPLATE": null
+  },
+  "binary": "{HF2Q_BIN}",
+  "artifact": {
+    "path": "{MODEL}",
+    "sha256": "{MODEL_SHA256}"
+  },
+  "port": "{PORT}",
+  "serve": {
+    "argv": [
+      "/bin/bash",
+      "{REPO}/scripts/serve_gemma4_opencode.sh"
+    ],
+    "env": {
+      "MODEL": "{MODEL}",
+      "MMPROJ": "{OUT}/text-only-no-external-projector.gguf",
+      "LCP_CAPACITY": "8g",
+      "KV_CACHE_BUDGET_BYTES": "51539607552",
+      "REP_PENALTY": "1.05",
+      "MAX_SLOTS": "4",
+      "HOST": "127.0.0.1",
+      "PORT": "{PORT}",
+      "HF2Q_BIN": "{HF2Q_BIN}"
+    }
+  },
+  "readiness": {
+    "url": "http://127.0.0.1:{PORT}/readyz",
+    "field": "ready",
+    "equals": true,
+    "timeout_seconds": 900,
+    "record": [
+      "http://127.0.0.1:{PORT}/health",
+      "http://127.0.0.1:{PORT}/hf2q/v1/runtime"
+    ],
+    "checks": [
+      {
+        "url": "http://127.0.0.1:{PORT}/health",
+        "field": "model",
+        "equals": "{MODEL_ID}"
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/health",
+        "field": "context_length",
+        "equals": 262144
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "serve.max_slots",
+        "equals": 4
+      }
+    ]
+  },
+  "client": {
+    "argv": [
+      "{PYTHON}",
+      "-E",
+      "-s",
+      "-B",
+      "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py",
+      "--base-url",
+      "http://127.0.0.1:{PORT}/v1",
+      "--model",
+      "{MODEL_ID}",
+      "--output",
+      "{OUT}/client",
+      "--cargo",
+      "{CARGO}",
+      "--toolchain",
+      "{TOOLCHAIN}",
+      "--sandbox-exec",
+      "/usr/bin/sandbox-exec",
+      "--sandbox-proof",
+      "{SANDBOX_PROOF}",
+      "--sandbox-proof-sha256",
+      "{SANDBOX_PROOF_SHA256}",
+      "--server-pid",
+      "{SERVER_PID}",
+      "--approval",
+      "{CLIENT_APPROVAL}",
+      "--approval-sha256",
+      "{CLIENT_APPROVAL_SHA256}",
+      "--family",
+      "gemma4",
+      "--engine-kind",
+      "hf2q"
+    ],
+    "env": {},
+    "approval": {
+      "template": "{CLIENT_APPROVAL_TEMPLATE}",
+      "set": {
+        "server_pid": "{SERVER_PID}",
+        "base_url": "http://127.0.0.1:{PORT}/v1",
+        "model": "{MODEL_ID}",
+        "run_id": "{RUN_ID}",
+        "barrier_token": "{NONCE32}",
+        "python_sha256": "{PYTHON_SHA256}",
+        "sources": {
+          "sha256_of": [
+            "{REPO}/scripts/four_agent/qwen38_n1_smoke.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_tools.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_verdict.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_process.py",
+            "{REPO}/scripts/four_agent/test_qwen38_n1_verdict.py",
+            "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py",
+            "{REPO}/scripts/four_agent/test_qwen_n4_live_smoke.py",
+            "{REPO}/scripts/four_agent/coding_family.py",
+            "{REPO}/scripts/four_agent/test_coding_family.py",
+            "{REPO}/scripts/four_agent/qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/test_qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/f2_semantic.py"
+          ]
+        }
+      }
+    },
+    "summary": "{OUT}/client/summary.json",
+    "success_status": "FourAgentProtocolCompleteAwaitingIndependentReview",
+    "timeout_seconds": 7200
+  },
+  "policy": {}
+}
