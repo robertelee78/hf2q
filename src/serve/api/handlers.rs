@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use super::engine::{self, Engine, SamplingParams};
 use super::engine_error::EngineRequestError;
+use super::frontend_timing::{FrontendTiming, Span as FrontendSpan};
 use super::grammar;
 use super::lifecycle::ModelLease;
 #[cfg(test)]
@@ -629,6 +630,7 @@ async fn chat_completions_with_prepared(
         vit_soft_tokens_total,
         deepstack_data,
         positions_flat,
+        frontend_timing,
     } = prepared;
     let engine: &Engine = &loaded_engine.engine;
     // Wave-2.5 A4: save policy before params is moved into the engine call.
@@ -667,6 +669,7 @@ async fn chat_completions_with_prepared(
             .generate_with_soft_tokens(prompt_tokens, soft_tokens, params)
             .await
     };
+    frontend_timing.finish_unary(gen_outcome.is_ok());
     let result = match gen_outcome {
         Ok(r) => r,
         Err(e) => {
@@ -1297,6 +1300,9 @@ struct PreparedChatContext {
     /// Gemma / non-Qwen3-VL paths (the worker arm synthesizes
     /// text-style positions when None).
     positions_flat: Option<Vec<i32>>,
+    /// ADR-063 C5 opt-in frontend timing (`HF2Q_FRONTEND_TIMING=1`);
+    /// inert when the gate is off.
+    frontend_timing: FrontendTiming,
 }
 
 fn deepseek_required_tool_thinking_eligible(
@@ -1798,6 +1804,13 @@ async fn prepare_chat_generation_core<'s, F>(
 where
     F: FnOnce(&'s AppState, String) -> ResolverBoxFuture<'s>,
 {
+    // ADR-063 C5: opt-in frontend spans; every call below is a no-op
+    // branch unless `HF2Q_FRONTEND_TIMING=1`.
+    let mut frontend_timing = FrontendTiming::from_env(
+        req.stream.unwrap_or(false),
+        req.messages.len(),
+        req.tools.as_ref().map_or(0, |tools| tools.len()),
+    );
     // --- Readiness gate (early-503 before any expensive work) ---
     // Check `is_ready_for_gen` BEFORE running the resolver
     // (which may trigger auto-pipeline download + quantize + model load).
@@ -1854,10 +1867,13 @@ where
     // the `HotSwapManager` pool: cache hit → reused engine; cache miss
     // → auto-pipeline + admit + return.  Decision #26's 400 fires only
     // when the auto-pipeline cannot resolve the requested name.
+    let span = frontend_timing.start();
     let resolved_engine = resolver(state, req.model.clone()).await?;
+    frontend_timing.record(FrontendSpan::Admission, span);
     let loaded_engine = resolved_engine.loaded_engine;
     let model_lease = resolved_engine.model_lease;
     let engine: &Engine = &loaded_engine.engine;
+    frontend_timing.set_family(|| format!("{:?}", engine.info().arch_family));
     if let Some(cause) = engine.failure_detail() {
         return Err(ApiError::engine_failed(engine::engine_failed_message(&cause)).into_response());
     }
@@ -1879,6 +1895,7 @@ where
     // → N image tokens + MlxBuffer alloc + range computation) runs
     // after the standard render/tokenize/overflow pipeline so its
     // inputs are exactly the prompt tokens the engine sees.
+    let span = frontend_timing.start();
     let (
         messages_for_render,
         vision_embeddings,
@@ -1889,6 +1906,7 @@ where
         per_row_floats,
         qwen3vl_image_grids,
     ) = prepare_vision_context(&req.messages, state.mmproj.as_ref(), engine, cancellation).await?;
+    frontend_timing.record(FrontendSpan::Vision, span);
 
     // ADR-053: `--gcd` injects the GCD grammar into requests that do not
     // already specify a grammar. The grammar forces the answer to land
@@ -1900,6 +1918,7 @@ where
     // after the requested model has resolved. Raw token terminals, preserved
     // tokens, and lazy token/word triggers must bind to this authoritative
     // tokenizer; model-free validation would silently assign the wrong ids.
+    let span = frontend_timing.start();
     let public_constraint = match grammar::request::compile_request_output_constraint_with_tokenizer(
         req,
         &tool_choice,
@@ -1910,6 +1929,7 @@ where
             return Err(ApiError::grammar_error_for(error.param, error.message).into_response())
         }
     };
+    frontend_timing.record(FrontendSpan::Constraint, span);
     let response_grammar = public_constraint.grammar;
     let public_grammar_lazy = public_constraint.lazy;
     // Render + tokenize + apply context-overflow policy (Decision #23).
@@ -1966,6 +1986,7 @@ where
     // unused output constraint before compilation. Under Auto, an explicit
     // output constraint suppresses the optional lazy tool grammar instead, so
     // it cannot be erased by a marker that never fires.
+    let span = frontend_timing.start();
     let tool_grammar: Option<grammar::Grammar> = match compile_tool_grammar_for_request(
         req,
         &tool_choice,
@@ -1975,6 +1996,7 @@ where
         Ok(g) => g,
         Err(resp) => return Err(resp),
     };
+    frontend_timing.record(FrontendSpan::Constraint, span);
     if tool_grammar.is_some() && public_grammar_lazy.is_some() {
         return Err(ApiError::invalid_request(
             "grammar_lazy cannot be combined with a tool grammar that overrides the response constraint",
@@ -2074,6 +2096,7 @@ where
             req_tools,
             enable_thinking,
             template_kwargs,
+            &mut frontend_timing,
         )
         .await
         {
@@ -2092,6 +2115,7 @@ where
         engine.info().arch_family,
         crate::serve::load_info::ArchFamily::Gemma4 | crate::serve::load_info::ArchFamily::Qwen35
     ) {
+        let span = frontend_timing.start();
         let stable = render_chat_prompt_or_400_with_generation_prompt(
             engine.chat_template(),
             &messages_for_render,
@@ -2100,6 +2124,8 @@ where
             template_kwargs,
             false,
         )?;
+        frontend_timing.record(FrontendSpan::StableRender, span);
+        let span = frontend_timing.start();
         let stable_encoding = match engine.tokenizer().encode(stable.as_str(), false) {
             Ok(encoding) => encoding,
             Err(error) => {
@@ -2107,6 +2133,8 @@ where
                 return Err(ApiError::internal_error().into_response());
             }
         };
+        frontend_timing.record(FrontendSpan::StableTokenize, span);
+        let span = frontend_timing.start();
         let stable_tokens = stable_encoding.get_ids();
         gemma_full_input_checkpoint = match super::engine::gemma_full_input::request_tag(
             matches!(engine.info().arch_family, crate::serve::load_info::ArchFamily::Gemma4),
@@ -2122,10 +2150,12 @@ where
                 return Err(ApiError::internal_error().into_response());
             }
         };
-        (!stable_tokens.is_empty()
+        let boundary = (!stable_tokens.is_empty()
             && stable_tokens.len() < prompt_tokens.len()
             && prompt_tokens.starts_with(stable_tokens))
-        .then_some(stable_tokens.len())
+        .then_some(stable_tokens.len());
+        frontend_timing.record(FrontendSpan::PrefixMatch, span);
+        boundary
     } else {
         None
     };
@@ -2153,6 +2183,7 @@ where
             // reasoning leak -- no-fallback rule). The real render
             // already succeeded on a superset transcript, so a probe
             // failure indicates template pathology the operator must see.
+            let span = frontend_timing.start();
             let rendered = render_chat_prompt_or_400(
                 engine.chat_template(),
                 &probe_msgs,
@@ -2160,6 +2191,7 @@ where
                 enable_thinking,
                 template_kwargs,
             )?;
+            frontend_timing.record(FrontendSpan::ProbeRender, span);
             super::registry::prompt_seeds_reasoning_open(&rendered, reg)
         }
         None => false,
@@ -2212,6 +2244,7 @@ where
     // client budget is rejected, identically on every family, and a
     // server-side default budget is dropped with a warning, never a 4xx
     // (issue #278 findings 3 and 10).
+    let span = frontend_timing.start();
     let budget_resolution = resolve_thinking_budget_policy(
         engine.registration(),
         reasoning_channel,
@@ -2241,6 +2274,7 @@ where
     .map_err(|error| {
         ApiError::invalid_request(error.message, Some(error.param.into())).into_response()
     })?;
+    frontend_timing.record(FrontendSpan::Budget, span);
     if let Some((budget, reason)) = budget_resolution.dropped_budget {
         tracing::warn!(
             budget,
@@ -2479,6 +2513,10 @@ where
     } else {
         (None, None)
     };
+    frontend_timing.mark_prepared(
+        final_prompt_tokens.len(),
+        params.stable_prompt_prefix_tokens,
+    );
 
     Ok(PreparedChatContext {
         loaded_engine,
@@ -2493,6 +2531,7 @@ where
         vit_soft_tokens_total,
         deepstack_data,
         positions_flat,
+        frontend_timing,
     })
 }
 
@@ -2787,6 +2826,7 @@ async fn chat_completions_stream(
     // encoder body can move it.
     let engine: Engine = prepared.loaded_engine.engine.clone();
     let model_lease = prepared.model_lease;
+    let mut frontend_timing = prepared.frontend_timing;
 
     // Phase 2c iter-211 W79: vision streaming is supported. The
     // `Request::GenerateStream` variant now carries `soft_tokens` and the
@@ -2857,6 +2897,7 @@ async fn chat_completions_stream(
             .into_response();
         }
     };
+    let enqueue_span = frontend_timing.start();
     if let Err(e) = engine.try_admit_budget(prompt_token_count_u32, max_token_count_u32) {
         match e {
             // Guarantees tune-up item 4 (2026-08-20): the pre-stream
@@ -2896,6 +2937,7 @@ async fn chat_completions_stream(
         tracing::error!(error = %msg, "chat_completions_stream enqueue failed");
         return ApiError::generation_error(msg).into_response();
     }
+    frontend_timing.record(FrontendSpan::Enqueue, enqueue_span);
     tracing::info!(
         model = %req.model,
         prompt_tokens = prompt_token_count,
@@ -2918,7 +2960,7 @@ async fn chat_completions_stream(
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono_seconds();
-    let events_rx = engine.supervise_stream_events(events_rx);
+    let events_rx = frontend_timing.relay_stream(engine.supervise_stream_events(events_rx));
     let sse = generation_events_to_sse_with_metrics_and_guard(
         events_rx,
         request_id,
@@ -3161,16 +3203,26 @@ async fn apply_overflow_policy(
     tools: Option<&[super::schema::Tool]>,
     enable_thinking: bool,
     template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    timing: &mut FrontendTiming,
 ) -> std::result::Result<(Vec<u32>, usize, Option<usize>, Option<usize>), Response> {
     use super::schema::OverflowPolicy;
 
-    let (tokens, n) = render_and_tokenize_for_overflow(
-        engine,
+    // Same render + tokenize as `render_and_tokenize_for_overflow`, split so
+    // the opt-in C5 spans see the primary render and tokenization apart.
+    let span = timing.start();
+    let rendered = render_chat_prompt_or_400(
+        engine.chat_template(),
         messages,
         tools,
         enable_thinking,
         template_kwargs,
     )?;
+    timing.record(FrontendSpan::Render, span);
+    timing.set_rendered_bytes(rendered.len());
+    let span = timing.start();
+    let tokens = tokenize_http_prompt(engine.tokenizer(), &rendered)?;
+    timing.record(FrontendSpan::Tokenize, span);
+    let n = tokens.len();
     let ctx_len = match engine.context_length() {
         Some(c) => c,
         None => return Ok((tokens, n, None, None)), // no advertised ctx → trust the caller
@@ -3180,7 +3232,8 @@ async fn apply_overflow_policy(
     }
 
     // Prompt does not fit. Dispatch on policy.
-    match policy {
+    let span = timing.start();
+    let rewritten = match policy {
         OverflowPolicy::Reject => {
             Err(ApiError::context_length_exceeded(ctx_len, n).into_response())
         }
@@ -3208,7 +3261,9 @@ async fn apply_overflow_policy(
             )
             .await
         }
-    }
+    };
+    timing.record(FrontendSpan::OverflowRewrite, span);
+    rewritten
 }
 
 /// Render the chat template + tokenize. Returns `(tokens, n_tokens)` or
@@ -12385,6 +12440,7 @@ mod a5d_handler_429_tests {
             vit_soft_tokens_total: None,
             deepstack_data: None,
             positions_flat: None,
+            frontend_timing: FrontendTiming::disabled(),
         }
     }
 

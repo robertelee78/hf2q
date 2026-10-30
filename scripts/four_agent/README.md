@@ -304,3 +304,11 @@ python3 scripts/four_agent/f2_scoreboard_render.py --rows docs/research/adr063-f
   --evidence-root "$E" --verify [--scoreboard qwen38="$E/<run>/scoreboard.json"] \
   --output docs/research/adr063-f2-scoreboard.md
 ```
+
+## C5 warm frontend timing
+
+`c5_frontend_summary.py` reads `server.stderr` files from runs whose server had `HF2Q_FRONTEND_TIMING=1` and prints a `hf2q.c5.frontend-summary.v1` JSON per family: handler frontend work (render, tokenize, stable-prefix render/tokenize/match, probe render, budget markers, constraint compile, overflow rewrite) against warm semantic TTFT, with the ADR-063 C5 10% gate verdict (`material`, `not_material` or `unmeasured`). The measurement plan and root commands are in [docs/research/adr063-c5-warm-frontend.md](../../docs/research/adr063-c5-warm-frontend.md).
+
+```sh
+python3 scripts/four_agent/c5_frontend_summary.py "$RUN/server.stderr"
+```
