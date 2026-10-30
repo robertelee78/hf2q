@@ -27,12 +27,27 @@ MODULES = ("qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_verdict.py",
 INTERRUPTED = False
 
 
-def identity(agent, run):
+def identity(agent, run, instance=None):
     require(agent in AGENTS and isinstance(run, str) and re.fullmatch(r"[a-zA-Z0-9_-]{16,64}", run),
             "invalid independent agent/run identity")
-    return (f"Independent coding agent {agent}, workload {WORKLOAD_ID}. "
+    require(instance is None or (type(instance) is int and instance >= 0), "invalid task instance")
+    label = "" if instance is None else f", task instance {instance}"
+    return (f"Independent coding agent {agent}, workload {WORKLOAD_ID}{label}. "
             "Use only your own isolated fixture and this conversation's tool results. "
             "Do not reuse another agent's transcript, files, or claimed test results.")
+
+
+def task_instance(packet, instance):
+    """Explicit quality-campaign instance bound by the approval, or None for the canonical task."""
+    if instance is None:
+        require("instance" not in packet and "instance_table_sha256" not in packet,
+                "canonical workload approval carries a task instance")
+        return None
+    from coding_instances import select
+    workload = select(instance)
+    require(type(packet.get("instance")) is int and packet["instance"] == instance and
+            packet.get("instance_table_sha256") == workload.table_sha256, "task instance approval binding")
+    return workload
 
 
 def preflight(base):
@@ -52,18 +67,19 @@ def validate_preflight(value, base, engine_kind="hf2q", family="qwen"):
             all(v is True for v in value.values()), "four-slot actual pool selection/preflight")
 
 
-def validate_agent_binding(packet, agent, run, server_pid, barrier, token, output, family="qwen", engine_kind="hf2q"):
+def validate_agent_binding(packet, agent, run, server_pid, barrier, token, output, family="qwen", engine_kind="hf2q",
+                           instance=None):
     family_contract.validate_selection(family, engine_kind, 4)
     require(packet.get("engine_kind", "hf2q") == engine_kind, "engine approval mismatch")
     family_contract.validate_binding(packet, family, 4)
     require(packet.get("schema") == family_contract.schema(family, "agent-approval", 4) and
             packet.get("profile") == family_contract.profile(family, 4) and packet.get("diagnostic_slots") == 4,
             "N4 approval cannot claim slots1")
-    identity(agent, run)
+    identity(agent, run, instance)
     expected = {"agent_id": agent, "run_id": run, "server_pid": server_pid,
                 "barrier_dir": str(Path(barrier).resolve()), "barrier_token": token,
                 "agent_output": str(Path(output).resolve()),
-                "initial_identity_sha256": hashlib.sha256(identity(agent, run).encode()).hexdigest()}
+                "initial_identity_sha256": hashlib.sha256(identity(agent, run, instance).encode()).hexdigest()}
     require(all(packet.get(k) == v for k, v in expected.items()), "agent/server/barrier identity drift")
     require(isinstance(token, str) and re.fullmatch(r"[a-f0-9]{32}", token), "barrier nonce")
 
@@ -82,7 +98,7 @@ def save_new(path, value):
         pending.unlink()
 
 
-def validate_ready(records, run, pid, token):
+def validate_ready(records, run, pid, token, instance=None):
     require(set(records) == set(AGENTS), "all four independent agents required")
     outputs, hashes = set(), set()
     for agent in AGENTS:
@@ -90,7 +106,7 @@ def validate_ready(records, run, pid, token):
         require(record.get("schema") == "hf2q.n4-agent-ready.v1" and record.get("agent_id") == agent
                 and record.get("run_id") == run and record.get("server_pid") == pid
                 and record.get("barrier_token") == token, "ready binding")
-        require(record.get("identity_sha256") == hashlib.sha256(identity(agent, run).encode()).hexdigest(),
+        require(record.get("identity_sha256") == hashlib.sha256(identity(agent, run, instance).encode()).hexdigest(),
                 "ready initial identity")
         require(isinstance(record.get("initial_messages_sha256"), str) and
                 re.fullmatch(r"[a-f0-9]{64}", record["initial_messages_sha256"]), "ready prompt fingerprint")
@@ -99,8 +115,8 @@ def validate_ready(records, run, pid, token):
     require(len(outputs) == 4 and None not in outputs and len(hashes) == 4, "shared agent output/prompt")
 
 
-def barrier_release(records, run, pid, token, hashes):
-    validate_ready(records, run, pid, token)
+def barrier_release(records, run, pid, token, hashes, instance=None):
+    validate_ready(records, run, pid, token, instance)
     require(set(hashes) == set(AGENTS), "missing ready hashes")
     return {"schema": "hf2q.n4-barrier-release.v1", "run_id": run, "server_pid": pid,
             "barrier_token": token, "agents": list(AGENTS), "ready_sha256": hashes}
@@ -116,12 +132,12 @@ def validate_release(value, agent, run, pid, token, own_hash):
     require(hashes[agent] == own_hash, "own ready changed")
 
 
-def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approval_hash):
+def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approval_hash, instance=None):
     directory = Path(directory)
     require(directory.is_dir() and not directory.is_symlink(), "owned barrier directory")
     record = {"schema": "hf2q.n4-agent-ready.v1", "agent_id": agent, "run_id": run,
               "server_pid": pid, "barrier_token": token, "output": str(Path(output).resolve()),
-              "identity_sha256": hashlib.sha256(identity(agent, run).encode()).hexdigest(),
+              "identity_sha256": hashlib.sha256(identity(agent, run, instance).encode()).hexdigest(),
               "initial_messages_sha256": initial_hash, "approval_sha256": approval_hash}
     ready_path = directory / f"{agent}.ready.json"
     save_new(ready_path, record)
@@ -138,7 +154,8 @@ def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approv
             "f2_clock_id": value.get("f2_clock_id")}
 
 
-def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen"):
+def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen", instance_record=None):
+    """`instance_record` is the coordinator's {"id", "table_sha256"}; None for the canonical task."""
     family_contract.validate_selection(family, engine_kind, 4)
     require(set(results) == set(exits) == set(cleanup) == set(AGENTS), "missing agent result")
     initial = set()
@@ -159,8 +176,10 @@ def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwe
                 "qualification/prefix verdict scope")
         require(len(result.get("turns", [])) == 7 and len(result.get("tools", [])) == 6,
                 "not all28requests/24tools")
-        require(result.get("initial_identity_sha256") == hashlib.sha256(identity(agent, run).encode()).hexdigest(),
+        instance = None if instance_record is None else instance_record["id"]
+        require(result.get("initial_identity_sha256") == hashlib.sha256(identity(agent, run, instance).encode()).hexdigest(),
                 "aggregate prompt identity")
+        require(result.get("instance") == instance_record, "aggregate task instance")
         require(result.get("final_source_sha256") == result.get("observed_final_source_sha256")
                 and isinstance(result.get("final_source_sha256"), str), "final fixture changed")
         require(qualify(result["turns"], result["tools"], result["cleanup"],
@@ -191,6 +210,9 @@ def main():
     parser.add_argument("--family", choices=family_contract.FAMILIES, default="qwen")
     parser.add_argument("--engine-kind", choices=("hf2q", "peer"), default="hf2q")
     parser.add_argument("--benchmark-profile", choices=("gemma-matched-v1",))
+    parser.add_argument("--instance", type=int,
+                        help="quality-campaign task instance (row of fixtures/coding-instances.json); "
+                             "omit for the canonical parse_port workload")
     args = parser.parse_args()
     family_contract.validate_selection(args.family, args.engine_kind, 4)
     from qwen38_n1_smoke import new_output, PREFLIGHT
@@ -229,6 +251,12 @@ def main():
             require(packet.get("benchmark_profile") is None and
                     packet.get("agent_template", {}).get("benchmark_profile") is None,
                     "benchmark approval requires explicit CLI opt-in")
+        workload = task_instance(packet, args.instance)
+        if workload is not None:
+            require(args.benchmark_profile is None, "task instances use the canonical scorer, not a benchmark profile")
+            from coding_instances import MODULES as INSTANCE_MODULES
+            names += INSTANCE_MODULES
+            summary["instance"] = workload.record()
         sources = {name: child.digest(module_dir / name) for name in names}
         require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
         summary["engine_kind"] = args.engine_kind
@@ -253,9 +281,9 @@ def main():
                        "engine_kind": args.engine_kind, "family_controls": packet.get("family_controls"),
                        "diagnostic_slots": 4, "agent_id": agent, "run_id": run,
                        "barrier_dir": str(barrier), "barrier_token": token, "agent_output": str(path),
-                       "initial_identity_sha256": hashlib.sha256(identity(agent, run).encode()).hexdigest(),
+                       "initial_identity_sha256": hashlib.sha256(identity(agent, run, args.instance).encode()).hexdigest(),
                        "sources": sources, "server_pid": args.server_pid, "base_url": args.base_url,
-                       "model": args.model, "approved": True}
+                       "model": args.model, "approved": True, **({} if workload is None else workload.binding())}
             approval_path = output / f"{agent}.approval.json"
             save_new(approval_path, binding)
             command = [sys.executable, "-E", "-s", "-B", str(module_dir / "qwen38_n1_smoke.py")]
@@ -267,6 +295,8 @@ def main():
                         "--run-id", run, "--barrier-dir", str(barrier), "--barrier-token", token]
             if args.benchmark_profile is not None:
                 command += ["--benchmark-profile", args.benchmark_profile]
+            if workload is not None:
+                command += ["--instance", str(args.instance)]
             stdout, stderr = [(output / f"{agent}.{name}").open("xb") for name in ("stdout", "stderr")]
             streams += [stdout, stderr]
             require(not INTERRUPTED, "interrupted immediately before child launch")
@@ -287,7 +317,7 @@ def main():
                             records[agent].get("approval_sha256") == child.digest(output / f"{agent}.approval.json"),
                             "ready output/approval mismatch")
             time.sleep(0.02)
-        release = barrier_release(records, run, args.server_pid, token, hashes)
+        release = barrier_release(records, run, args.server_pid, token, hashes, args.instance)
         require(not INTERRUPTED, "interrupted before shared release")
         release["f2_clock_id"] = CLOCK_ID
         release["release_monotonic_ns"] = clock_ns()
@@ -324,7 +354,8 @@ def main():
             stream.close()
         if summary["status"] != "Failed":
             try:
-                summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.engine_kind, args.family)
+                summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.engine_kind, args.family,
+                                              summary.get("instance"))
             except BaseException as exc:
                 summary["status"], summary["error"] = "Failed", str(exc)
         if summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview":

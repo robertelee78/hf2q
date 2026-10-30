@@ -295,6 +295,46 @@ The receipt also records `peak_over_cap_bytes`, which is the measured overshoot,
 - A blind sample, meaning failed host observation or a missing real footprint while a cap is enforced, never counts as a quiet host. Three blind samples in a row stop the run.
 - Thermal state is recorded but never stops a run. It is not an out-of-memory risk.
 
+## Task-quality campaign (ADR-063 Q1 §3.5)
+
+The canonical four-agent prompts are identical on every run, so repeated cohorts are one sample per agent. The Q1 policy (`hf2q.q1.numeric-policy.v1`) therefore judges task quality over at least 24 distinct, paired task instances.
+
+### Task instances
+
+- `qwen_n4_live_smoke.py --instance N` gives all four agents row `N` of [`fixtures/coding-instances.json`](fixtures/coding-instances.json) (24 rows, ids 0..23). Without `--instance`, nothing changes: the canonical `parse_port` prompts, fixture files and approval are byte-identical to earlier receipts, so existing receipts and prefix oracles stay valid.
+- Every row is a different parser of the same difficulty class: another function name, unsigned type, inclusive bounds, reject word and test names. Each row has two explicit bounds (`0 < min < max < T::MAX`), two unit and two integration tests, and the canonical paths, tools, six-step protocol and test counts. `coding_instances.py` renders the prompt, workflow sentence, `src/lib.rs`, `tests/ports.rs` and the initial `src/ports.rs`. It refuses duplicate functions or ranges and rows where a bound would be untested.
+- The identity line names the instance (`task instance N`), identically on every arm. The run id is still not part of the prompt.
+- The coordinator approval must carry `instance` (an integer equal to `--instance`) and `instance_table_sha256`. Its `sources` must also cover `coding_instances.py` and `test_coding_instances.py`. A canonical approval that carries either key is refused. The coordinator and every agent summary record `instance: {id, table_sha256}`, and aggregation refuses an agent from another instance.
+- `--instance` is N4-only and cannot be combined with `--benchmark-profile`.
+
+### Paired campaign driver
+
+`quality_campaign.py` runs instances `0..N-1` (default 24) of one family on a subject arm (an hf2q Q5 case) and a reference arm (`--reference-kind peer` with a peer case, or `stock-hf2q` with a stock hf2q case). Without `--reference-case` the verdict is floor-only.
+
+- **Schedule.** Arms alternate in ABBA blocks: even instances run the subject first, odd instances the reference first. Each run is one `q5_calibration.py` calibration on a derived case (`cases/iNN-<arm>.json`), which is the arm's case plus `--instance N`, the approval `instance`/`instance_table_sha256` and the two instance sources. Runs are sequential, so only one runtime is loaded at a time, and Q5 preflight still refuses competitors.
+- **Variables.** Ambient `HF2Q_Q5_<NAME>` overrides go to each arm whose case declares `<NAME>`; one that neither case declares is refused. `--subject-var NAME=VALUE` and `--reference-var NAME=VALUE` override one arm only, for example the two approval templates. The effective overrides are part of the plan.
+- **Outcome per run.** An instance passes on an arm when the client summary is `FourAgentProtocolCompleteAwaitingIndependentReview`. A Q5 memory-envelope failure with a passing client is still a task pass; its Q5 verdict is recorded. After the four-agent release, a failed client, a server exit or a client timeout is a task failure of that arm. A run that never reached the release (Q5 preflight refusal, readiness failure or approval refusal) is `NotStarted`. Any other supervisor stop after the release is `Invalid`.
+- **Halting and resume.** The driver halts at the first run without a task outcome. `--resume` with the same `--output` and an identical plan (cases, overrides, instance table, sources, negative control) continues: a `NotStarted` run gets a new attempt, and a run interrupted by the driver itself is scored from what is on disk. An `Invalid` run is terminal: there are no reruns after the task has started, so start a new campaign.
+- **Outputs.** `manifest.json` (plan, plan hash, every attempt with its argv, Q5 receipt hash, Q5 verdict, stop, client summary hash and per-agent status), `cases/`, `runs/<index>-iNN-<arm>-aK/` (the Q5 receipt directories) and `logs/`. When complete, it writes `outcomes.json` (`hf2q.q1.paired-task-outcomes.v1`) and adds the verdict to the manifest. The verdict is a port of `q1_decision_policy.py paired`: `Insufficient` if n < 24; `Loss` if the exact one-sided sign test gives p < 0.05; `BelowFloor` if the subject passes fewer than 75% of instances; `Inconclusive` if subject-only failures exceed reference-only failures by more than ⌊n/8⌋; otherwise `Pass`. Every passing patch still needs independent review.
+- `--dry-run` prints the plan, the ABBA schedule, instance 0's derived client argv and missing variables per arm, and launches nothing.
+
+Qwen3.8 against the peer (needs `q5_cases/peer-qwen38.json` from the peer adapters change). Use the same exports as the Q5 root commands above, plus `NC_RECEIPT` and `Q5_ROOT`:
+
+```sh
+export HF2Q_Q5_HF2Q_BIN=/abs/path/release/hf2q HF2Q_Q5_MODEL=/abs/Qwen3.8-27B-vanilla.gguf
+export HF2Q_Q5_CARGO=/abs/cargo HF2Q_Q5_TOOLCHAIN=/abs/toolchain
+export HF2Q_Q5_SANDBOX_PROOF=/abs/sandbox-proof.json HF2Q_Q5_SANDBOX_PROOF_SHA256=<sha256>
+python3 -B scripts/four_agent/quality_campaign.py \
+  --subject-case scripts/four_agent/q5_cases/qwen38.json \
+  --subject-var CLIENT_APPROVAL_TEMPLATE=/abs/qwen38-client-approval.json \
+  --reference-case scripts/four_agent/q5_cases/peer-qwen38.json --reference-kind peer \
+  --reference-var CLIENT_APPROVAL_TEMPLATE=/abs/peer-qwen38-client-approval.json \
+  --instances 24 --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/quality-qwen38-peer-$(date -u +%Y%m%dT%H%M%SZ)"   # --dry-run first; --resume reuses this exact --output
+```
+
+A floor-only family (for example DeepSeek-V4) omits the three `--reference-*` options.
+
 ## F2 scoreboard rendering
 
 `f2_scoreboard_render.py` renders [docs/research/adr063-f2-scoreboard.md](../../docs/research/adr063-f2-scoreboard.md) from the checked-in rows manifest `docs/research/adr063-f2-scoreboard-rows.json` (schema `hf2q.f2.scoreboard-rows.v1`) plus any `f2_scoreboard_cli.py` outputs. Only those fixed-six outputs can produce Qualified F2 primary results; manifest rows are Descriptive, NegativeResult or Failure receipts and cite `$E/...` receipt paths and extraction keys, never absolute local paths. `--verify` re-reads every Verified row from its receipt and refuses drift:
