@@ -28,6 +28,9 @@ pub struct Deepseek4Model {
     /// region at cache allocation (`plant_compressed_graft`). None by
     /// default.
     pub kv_graft: Option<crate::inference::graft::BoundGraft>,
+    /// Why this artifact's matrix storage cannot use joint decode, or `None`
+    /// when every batched product has a proven-exact route.
+    pub(super) joint_route_unproven: Option<String>,
 }
 
 impl Deepseek4Model {
@@ -71,12 +74,14 @@ impl Deepseek4Model {
             .map_err(|source| anyhow::anyhow!("DeepSeek-V4 Metal initialization: {source}"))?;
         let weights = Deepseek4Weights::load_from_gguf(gguf, &cfg, ctx.device().clone())
             .context("Deepseek4Weights::load_from_gguf")?;
+        let joint_route_unproven = super::joint_decode_routes::unproven_joint_route(&cfg, &weights);
         Ok(Self {
             cfg,
             weights,
             ctx,
             glp: None,
             kv_graft: None,
+            joint_route_unproven,
         })
     }
 

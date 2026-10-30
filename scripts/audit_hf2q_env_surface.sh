@@ -31,7 +31,7 @@ classify() {
             printf '%s' 'promote-or-internalize'
             ;;
         HF2Q_LMHEAD_Q8|HF2Q_QWEN_GQA_Q2|HF2Q_BATCHED_PREFILL|\
-        HF2Q_STREAMING_PHASE3)
+        HF2Q_STREAMING_PHASE3|HF2Q_DEEPSEEK_JOINT_DECODE)
             printf '%s' 'documented-escape'
             ;;
         *)

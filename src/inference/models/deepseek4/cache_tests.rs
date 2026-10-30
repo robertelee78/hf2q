@@ -7,10 +7,10 @@ use super::verifier_forward::{
 };
 use super::Deepseek4Config;
 
-#[path = "cache_tests/warmup_capacity.rs"]
-mod warmup_capacity;
 #[path = "cache_tests/encoder_parity.rs"]
 mod encoder_parity;
+#[path = "cache_tests/warmup_capacity.rs"]
+mod warmup_capacity;
 
 fn config(ratios: Vec<u32>) -> Deepseek4Config {
     let layers = ratios.len() as u32;
@@ -438,7 +438,7 @@ fn cooperative_decode_publication_is_atomic_across_four_caches() {
         unreachable!()
     };
     let mut refs = [lane0, lane1, lane2, lane3];
-    publish_verifier_cohort_after_gate(&mut refs, [0; 4], || Ok(())).unwrap();
+    publish_verifier_cohort_after_gate(&mut refs, &[0; 4], || Ok(())).unwrap();
     assert!(caches
         .iter()
         .all(|cache| cache.position() == 1 && !cache.is_poisoned()));
@@ -450,7 +450,7 @@ fn cooperative_decode_publication_is_atomic_across_four_caches() {
         unreachable!()
     };
     let mut refs = [lane0, lane1, lane2, lane3];
-    let error = publish_verifier_cohort_after_gate(&mut refs, [0; 4], || {
+    let error = publish_verifier_cohort_after_gate(&mut refs, &[0; 4], || {
         anyhow::bail!("synthetic B=4 supervisor rejection")
     })
     .unwrap_err();
@@ -469,13 +469,55 @@ fn cooperative_decode_publication_is_atomic_across_four_caches() {
         unreachable!()
     };
     let mut refs = [lane0, lane1, lane2, lane3];
-    let error = publish_verifier_cohort_after_gate(&mut refs, [0; 4], || Ok(())).unwrap_err();
+    let error = publish_verifier_cohort_after_gate(&mut refs, &[0; 4], || Ok(())).unwrap_err();
     assert!(error.to_string().contains("prevalidate"));
     assert_eq!(caches[0].position(), 0);
     assert_eq!(caches[1].position(), 0);
     assert_eq!(caches[2].position(), 1);
     assert_eq!(caches[3].position(), 0);
     assert!(caches.iter().all(Deepseek4Cache::is_poisoned));
+}
+
+#[test]
+fn joint_decode_publication_advances_unequal_positions_together() {
+    let cfg = config(vec![4, 128]);
+    let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().unwrap();
+    let mut caches = (0..3)
+        .map(|_| Deepseek4Cache::allocate(&plan, device.clone()).unwrap())
+        .collect::<Vec<_>>();
+    caches[1].commit_step(0).unwrap();
+    for position in 0..5 {
+        caches[2].commit_step(position).unwrap();
+    }
+
+    let mut refs = caches.iter_mut().collect::<Vec<_>>();
+    publish_verifier_cohort_after_gate(&mut refs, &[0, 1, 5], || Ok(())).unwrap();
+    assert_eq!(
+        caches
+            .iter()
+            .map(Deepseek4Cache::position)
+            .collect::<Vec<_>>(),
+        [1, 2, 6]
+    );
+    assert!(caches.iter().all(|cache| !cache.is_poisoned()));
+
+    // A stale cursor on any lane rejects the whole transaction.
+    let mut refs = caches.iter_mut().take(2).collect::<Vec<_>>();
+    let error = publish_verifier_cohort_after_gate(&mut refs, &[1, 1], || Ok(())).unwrap_err();
+    assert!(error.to_string().contains("prevalidate"));
+    assert_eq!(caches[0].position(), 1);
+    assert_eq!(caches[1].position(), 2);
+    assert!(caches[0].is_poisoned() && caches[1].is_poisoned());
+    assert!(!caches[2].is_poisoned());
+
+    // A position list that does not cover every lane is rejected the same way.
+    let mut refs = caches.iter_mut().skip(2).collect::<Vec<_>>();
+    let error = publish_verifier_cohort_after_gate(&mut refs, &[6, 7], || Ok(())).unwrap_err();
+    assert!(error.to_string().contains("prevalidate"));
+    assert_eq!(caches[2].position(), 6);
+    assert!(caches[2].is_poisoned());
 }
 
 #[test]

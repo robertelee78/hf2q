@@ -343,14 +343,14 @@ fn grow_and_extend_caches(
         .collect()
 }
 
-fn read_f32(buffer: &MlxBuffer, label: &str) -> Vec<f32> {
+pub(super) fn read_f32(buffer: &MlxBuffer, label: &str) -> Vec<f32> {
     buffer
         .as_logical_slice::<f32>()
         .unwrap_or_else(|error| panic!("read {label}: {error}"))
         .to_vec()
 }
 
-fn assert_exact_f32(label: &str, expected: &[f32], actual: &[f32]) {
+pub(super) fn assert_exact_f32(label: &str, expected: &[f32], actual: &[f32]) {
     assert_eq!(expected.len(), actual.len(), "{label} length differs");
     let mismatch = expected
         .iter()
@@ -411,7 +411,7 @@ fn assert_optional_buffer_exact(
     }
 }
 
-fn assert_cache_exact(label: &str, expected: &Deepseek4Cache, actual: &Deepseek4Cache) {
+pub(super) fn assert_cache_exact(label: &str, expected: &Deepseek4Cache, actual: &Deepseek4Cache) {
     assert_eq!(
         expected.position(),
         actual.position(),

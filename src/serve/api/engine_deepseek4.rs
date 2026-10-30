@@ -5,6 +5,7 @@
 //! capacity changes and prefill only the rendered suffix;
 //! divergent/compacted transcripts reset.
 
+mod joint_decode;
 mod progress;
 mod sampling;
 mod slot_provision;
@@ -1183,9 +1184,7 @@ impl Deepseek4LoadedModel {
                 // context drift) is kept for a matching future process.
                 let remove_file = matches!(
                     error,
-                    crate::inference::models::deepseek4::cache::CacheError::AnchorImageCorrupt {
-                        ..
-                    }
+                    crate::inference::models::deepseek4::cache::CacheError::AnchorImageCorrupt { .. }
                 );
                 persistor.note_failed_hydrate(&key_hex, &format!("{error}"), remove_file);
                 return false;
