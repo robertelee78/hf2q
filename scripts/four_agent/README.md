@@ -55,3 +55,13 @@ available for compatibility with its narrower contract.
 An operator supervisor may preserve that rejected observation and request a fresh
 reading within its existing attempt/deadline limits. It must not retry a valid
 low-memory or pressure reading, and an interrupted campaign remains incomplete.
+
+## F2 scoreboard rendering
+
+`f2_scoreboard_render.py` renders [docs/research/adr063-f2-scoreboard.md](../../docs/research/adr063-f2-scoreboard.md) from the checked-in rows manifest `docs/research/adr063-f2-scoreboard-rows.json` (schema `hf2q.f2.scoreboard-rows.v1`) plus any `f2_scoreboard_cli.py` outputs. Only those fixed-six outputs can produce Qualified F2 primary results; manifest rows are Descriptive, NegativeResult or Failure receipts and cite `$E/...` receipt paths and extraction keys, never absolute local paths. `--verify` re-reads every Verified row from its receipt and refuses drift:
+
+```sh
+python3 scripts/four_agent/f2_scoreboard_render.py --rows docs/research/adr063-f2-scoreboard-rows.json \
+  --evidence-root "$E" --verify [--scoreboard qwen38="$E/<run>/scoreboard.json"] \
+  --output docs/research/adr063-f2-scoreboard.md
+```
