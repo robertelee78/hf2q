@@ -11,8 +11,8 @@
 //! causes a 4xx: under `fifo-serial` only an explicit client budget is
 //! rejected, identically on every family.
 //!
-//! The Qwen-side adaptive machinery (tool-continuation ceilings, chain
-//! reductions, the forced transition invariant) stays in
+//! The Qwen-side adaptive machinery (tool-continuation ceilings, the forced
+//! transition invariant) stays in
 //! [`super::qwen_thinking_policy`]; this module owns the table, the request
 //! parse, and the shared enforcer every family flows through.
 

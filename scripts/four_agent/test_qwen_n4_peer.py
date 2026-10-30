@@ -91,14 +91,14 @@ class PeerThinkingParity(unittest.TestCase):
             budgets.append(self.pair(self.messages, turn))
             self.messages.extend([{'role': 'assistant', 'tool_calls': [{'id': str(turn)}]},
                                   {'role': 'tool', 'content': 'actual result placeholder'}])
-        self.assertEqual(budgets, [2048, 512, 256, 256, 256, 256, 256])
+        self.assertEqual(budgets, [2048, 512, 512, 512, 512, 512, 512])
 
     def test_latest_user_resets_cycles_and_system_does_not_hide_tool(self):
         for turn in range(4):
             self.messages.extend([{'role': 'assistant', 'tool_calls': [{'id': str(turn)}]},
                                   {'role': 'tool', 'content': 'result'}])
         self.messages.append({'role': 'system', 'content': 'unchanged metadata'})
-        self.assertEqual(self.pair(self.messages, 4), 256)
+        self.assertEqual(self.pair(self.messages, 4), 512)
         self.messages.append({'role': 'user', 'content': 'new user'})
         self.assertEqual(self.pair(self.messages, 0), 2048)
         self.messages.extend([{'role': 'assistant', 'tool_calls': [{'id': 'new'}]},

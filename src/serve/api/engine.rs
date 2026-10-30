@@ -28178,7 +28178,7 @@ impl ToolCallStreamEmitter {
             let val_end = val_start + rel_close;
             let after_close = val_end + "</parameter>".len();
             let key = body[key_start..key_end].trim();
-            let val_raw = body[val_start..val_end].trim();
+            let val_raw = super::registry::qwen35_parameter_value_text(&body[val_start..val_end]);
             if key.is_empty() {
                 // Malformed — leave scan_cursor where it is so finalize can
                 // exercise the close-buffered loud-error branch under
@@ -42586,6 +42586,59 @@ mod tool_call_stream_emitter_tests {
             v, cv,
             "Qwen 3.5/3.6 streaming args MUST equal canonical parse"
         );
+    }
+
+    /// Streaming twin of `parse_qwen35_keeps_captured_write_file_whitespace`:
+    /// the captured ADR-063 `write_file` content, fed in small fragments,
+    /// keeps its trailing newline and leading indentation and matches the
+    /// unary parse byte-for-byte.
+    #[test]
+    fn streaming_qwen35_keeps_captured_write_file_whitespace() {
+        let kinds = Arc::new(super::super::registry::adr063_write_file_wire_kinds_for_test());
+        for content in [
+            super::super::registry::ADR063_PEER_WRITE_FILE_CONTENT,
+            super::super::registry::adr063_indented_write_file_content_for_test(),
+        ] {
+            let body = super::super::registry::qwen35_native_write_file_body_for_test(content);
+            let (tx, mut rx) = mpsc::channel::<GenerationEvent>(64);
+            let mut emitter =
+                ToolCallStreamEmitter::new_with_wire_kinds(Some("qwen35"), 0, Some(kinds.clone()));
+            let mut streamed = String::new();
+            for fragment in body.as_bytes().chunks(7) {
+                streamed.push_str(std::str::from_utf8(fragment).expect("ASCII fixture"));
+                emitter
+                    .advance(&streamed, &EventSink::new(&tx))
+                    .expect("incremental emit");
+            }
+            let mut tc_index = 0;
+            let mut saw_tc = false;
+            emitter
+                .finalize(
+                    body.clone(),
+                    Some(&super::super::registry::QWEN35),
+                    ToolCallPolicy::Constrained,
+                    &mut tc_index,
+                    &mut saw_tc,
+                    &EventSink::new(&tx),
+                )
+                .expect("finalize");
+            drop(tx);
+            let events = drain(&mut rx);
+            let (name, args) = rebuild_call(&events, 0);
+            assert_eq!(name.as_deref(), Some("write_file"));
+            let parsed: serde_json::Value = serde_json::from_str(&args).expect("arguments JSON");
+            assert_eq!(
+                parsed,
+                serde_json::json!({"path": "src/ports.rs", "content": content})
+            );
+            let canonical = super::super::registry::parse_tool_call_body_with_wire_kinds(
+                &super::super::registry::QWEN35,
+                &body,
+                Some(&kinds),
+            )
+            .expect("canonical schema-aware parse");
+            assert_eq!(args, canonical.arguments_json);
+        }
     }
 
     #[test]
