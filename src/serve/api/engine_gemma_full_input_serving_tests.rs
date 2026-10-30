@@ -371,8 +371,13 @@ fn gemma_slot_route_warmup_does_not_change_outputs_or_retained_slots() {
         let first = rt
             .block_on(engine.generate(first_prompt, greedy(24)))
             .unwrap();
-        // Stops at its prefill token: the slot retains exactly the prompt.
-        rt.block_on(engine.generate(retained_prompt.clone(), greedy(1)))
+        // Tool-turn shape (tagged, as the chat handler would send it) that
+        // stops at its prefill token: the slot retains exactly the prompt and
+        // publishes a checkpoint. Gemma affinity only credits a live retained
+        // prefix when the slot holds an anchor with a matching vision identity
+        // (`preferred_gemma4_slot_for_request`), so an untagged raw request
+        // without a stable boundary is never reused.
+        rt.block_on(engine.generate(retained_prompt.clone(), params(1, &retained_prompt)))
             .unwrap();
         // A warmup while slots retain prefixes must pick a clean slot.
         if warm {
