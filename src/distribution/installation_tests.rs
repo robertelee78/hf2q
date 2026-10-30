@@ -524,6 +524,11 @@ fn real_cargo_path_install_update_and_uninstall_round_trip() {
     )
     .unwrap();
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // The stub package and binary are both named `hf2q`. Nested installs
+    // inherit `CARGO_TARGET_DIR`, so without an isolated target they would
+    // overwrite the outer build's `release/hf2q` with this stub whenever the
+    // suite runs under a shared target directory.
+    let cargo_target = temp.path().join("cargo-target");
     let generated = Command::new(&cargo)
         .args(["generate-lockfile", "--manifest-path"])
         .arg(source.join("Cargo.toml"))
@@ -546,6 +551,7 @@ fn real_cargo_path_install_update_and_uninstall_round_trip() {
         .arg(&install_root)
         .args(["--locked", "--bin", "hf2q"])
         .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_TARGET_DIR", &cargo_target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -555,6 +561,10 @@ fn real_cargo_path_install_update_and_uninstall_round_trip() {
         installed.status.success(),
         "cargo install failed: {}",
         String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(
+        cargo_target.join("release/hf2q").is_file(),
+        "nested cargo install must build into the isolated target"
     );
 
     let binary = install_root.join("bin/hf2q");
@@ -569,10 +579,20 @@ fn real_cargo_path_install_update_and_uninstall_round_trip() {
     };
     assert!(matches!(source, CargoSource::Path(_)));
 
-    ManagerCommand::cargo_update(&root, &source, &options)
+    let update = ManagerCommand::cargo_update(&root, &source, &options)
         .unwrap()
-        .run()
+        .command()
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
         .unwrap();
+    assert!(
+        update.status.success(),
+        "cargo update replay failed: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
     assert_eq!(
         reconcile_cargo_update(&binary, &root, &source, &options).unwrap(),
         env!("CARGO_PKG_VERSION")
