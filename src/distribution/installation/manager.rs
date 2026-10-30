@@ -134,9 +134,17 @@ impl ManagerCommand {
             .join(" ")
     }
 
+    /// Direct-argv process for this manager command; inherits the caller's
+    /// environment exactly as `run` does.
+    pub(crate) fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.arguments);
+        command
+    }
+
     pub(crate) fn run(&self) -> Result<(), InstallationError> {
-        let status = Command::new(&self.program)
-            .args(&self.arguments)
+        let status = self
+            .command()
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
