@@ -60,7 +60,7 @@
   "deepseek4-parity": {
    "family": "deepseek4",
    "title": "DeepSeek N1 parity gate",
-   "workload": "`scripts/benchmark_deepseek4_server_parity.sh` single-request gate vs llama.cpp 3653e6d6 (ADR-042)."
+   "workload": "`scripts/benchmark_deepseek4_server_parity.sh` single-request gate vs the peer 3653e6d6 (ADR-042)."
   },
   "deepseek4-n4-balanced": {
    "family": "deepseek4",
@@ -75,7 +75,7 @@
   "qwen36-n4-coding": {
    "family": "qwen36",
    "title": "Qwen3.6 N4 coding",
-   "workload": "Four-agent coding client; llama.cpp e86 peer vs hf2q."
+   "workload": "Four-agent coding client; peer e86 build vs hf2q."
   },
   "gemma4-n4-full-input": {
    "family": "gemma4",
@@ -5551,7 +5551,7 @@
      }
     }
    },
-   "note": "llama.cpp e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
+   "note": "Peer e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
   },
   {
    "id": "q36-peer-decode_tps_per_agent",
@@ -5576,7 +5576,7 @@
    "status": "Descriptive",
    "verification": {
     "state": "Verified",
-    "key": "server.stderr llama.cpp 'eval time … tokens per second' (median over requests)",
+    "key": "server.stderr peer 'eval time … tokens per second' (median over requests)",
     "extract": {
      "value": {
       "kind": "regex",
@@ -5586,7 +5586,7 @@
      }
     }
    },
-   "note": "llama.cpp e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
+   "note": "Peer e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
   },
   {
    "id": "q36-peer-decode_tps_aggregate",
@@ -5630,7 +5630,7 @@
      }
     }
    },
-   "note": "llama.cpp e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
+   "note": "Peer e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
   },
   {
    "id": "q36-peer-prefill_tps",
@@ -5655,7 +5655,7 @@
    "status": "Descriptive",
    "verification": {
     "state": "Verified",
-    "key": "server.stderr llama.cpp 'prompt eval time … tokens per second' (median over requests)",
+    "key": "server.stderr peer 'prompt eval time … tokens per second' (median over requests)",
     "extract": {
      "value": {
       "kind": "regex",
@@ -5665,7 +5665,7 @@
      }
     }
    },
-   "note": "llama.cpp e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
+   "note": "Peer e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
   },
   {
    "id": "q36-peer-semantic_ttft_s",
@@ -5701,7 +5701,7 @@
      }
     }
    },
-   "note": "llama.cpp e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
+   "note": "Peer e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
   },
   {
    "id": "q36-peer-cached_token_share_pct",
@@ -5746,7 +5746,7 @@
      }
     }
    },
-   "note": "llama.cpp e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
+   "note": "Peer e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
   },
   {
    "id": "q36-peer-task_pass",
@@ -5782,7 +5782,7 @@
      }
     }
    },
-   "note": "llama.cpp e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
+   "note": "Peer e86 build, peer mode none; peak footprint 47.8 GB. Client receipt FourAgentProtocolCompleteAwaitingIndependentReview; not an F2 cohort."
   },
   {
    "id": "q36-hf-20261026-client_elapsed_s",
