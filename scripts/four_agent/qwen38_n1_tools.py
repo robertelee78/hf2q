@@ -33,14 +33,16 @@ IMMUTABLE = {"Cargo.toml": MANIFEST, "Cargo.lock": LOCK,
 
 
 class Tools:
-    def __init__(self, root, cargo, sandbox, sdk):
+    def __init__(self, root, cargo, sandbox, sdk, immutable=IMMUTABLE, initial=INITIAL):
+        require(set(immutable) == set(IMMUTABLE), "fixture file set")
+        self.immutable = dict(immutable)
         self.root = Path(root)
         self.root.mkdir(mode=0o700)
         self.fixture = self.root / "fixture"
         self.fixture.mkdir(mode=0o700)
         for name in ("src", "tests"):
             (self.fixture / name).mkdir(mode=0o700)
-        for name, text in {**IMMUTABLE, "src/ports.rs": INITIAL}.items():
+        for name, text in {**self.immutable, "src/ports.rs": initial}.items():
             path = self.fixture / name
             path.write_text(text)
             path.chmod(0o600 if name == "src/ports.rs" else 0o400)
@@ -73,7 +75,7 @@ class Tools:
         st = self.fixture.lstat()
         require(not stat.S_ISLNK(st.st_mode) and (st.st_dev, st.st_ino) == self.fixture_identity,
                 "owned fixture replaced")
-        for name, text in IMMUTABLE.items():
+        for name, text in self.immutable.items():
             path = self.fixture / name
             require(not path.is_symlink() and path.read_bytes() == text.encode(), "immutable fixture changed")
         for name, fd in self.dirfds.items():

@@ -49,11 +49,15 @@ def approval(args):
     require(child.digest(args.approval) == args.approval_sha256, "approval hash")
     packet = loads(Path(args.approval).read_bytes())
     n4 = args.diagnostic_slots == 4
+    workload = None
     if n4:
-        from qwen_n4_live_smoke import preflight, validate_agent_binding
+        from qwen_n4_live_smoke import preflight, task_instance, validate_agent_binding
         validate_agent_binding(packet, args.agent_id, args.run_id, args.server_pid,
-                               args.barrier_dir, args.barrier_token, args.output, args.family, args.engine_kind)
+                               args.barrier_dir, args.barrier_token, args.output, args.family, args.engine_kind,
+                               args.instance)
+        workload = task_instance(packet, args.instance)
     else:
+        require(args.instance is None, "task instances are four-agent only")
         require(packet.get("schema") == family_contract.schema(args.family, "approval", 1), "approval schema")
         require(packet.get("profile") == family_contract.profile(args.family, 1), "operating packet identity")
     family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
@@ -87,6 +91,11 @@ def approval(args):
         source_paths += [Path(__file__).with_name(n) for n in EXTRA_MODULES]
     else:
         require(packet.get("benchmark_profile") is None, "benchmark approval requires explicit CLI opt-in")
+    if workload is not None:
+        from coding_instances import MODULES as INSTANCE_MODULES
+        require(getattr(args, "benchmark_profile", None) is None,
+                "task instances use the canonical scorer, not a benchmark profile")
+        source_paths += [Path(__file__).with_name(n) for n in INSTANCE_MODULES]
     require(packet.get("sources") == {p.name: child.digest(p) for p in source_paths}, "client source drift")
     require(packet.get("approved") is True, "explicit internal operating approval absent")
     proof = child.validate_proof(args.sandbox_proof, args.sandbox_proof_sha256)
@@ -100,7 +109,19 @@ def approval(args):
             proof.get("toolchain_root") == str(Path(args.cargo).resolve().parent.parent),
             "sandbox toolchain/SDK proof mismatch")
     os.kill(args.server_pid, 0)
-    return packet
+    return packet, workload
+
+
+def initial_messages(fixture_messages, prompt_identity=None, workload=None):
+    """Turn-0 history: canonical fixture request, optional N4 identity, the instance's task, then the workflow."""
+    messages = [dict(m) for m in fixture_messages]
+    require(len(messages) == 2 and messages[-1]["role"] == "user", "initial task")
+    if prompt_identity is not None:
+        messages[0]["content"] = prompt_identity + "\n\n" + messages[0]["content"]
+    if workload is not None:
+        messages[-1]["content"] = workload.user
+    messages[-1]["content"] += "\n\n" + (WORKFLOW if workload is None else workload.workflow)
+    return messages
 
 
 def request_timeout(_signum, _frame):
@@ -249,6 +270,7 @@ def main():
     parser.add_argument("--family", choices=family_contract.FAMILIES, default="qwen")
     parser.add_argument("--engine-kind", choices=("hf2q", "peer"), default="hf2q")
     parser.add_argument("--benchmark-profile", choices=("gemma-matched-v1",))
+    parser.add_argument("--instance", type=int, help="N4 quality-campaign task instance (coding_instances.py)")
     args = parser.parse_args()
     family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
     os.umask(0o077)
@@ -268,7 +290,9 @@ def main():
                        diagnostic_slots=4, full_prefix_reuse="PendingPostOracle", barrier={"status": "Pending"})
     tools = None
     try:
-        packet = approval(args)
+        packet, workload = approval(args)
+        if workload is not None:
+            summary["instance"] = workload.record()
         summary["engine_kind"] = args.engine_kind
         if args.family in ("deepseek4", "gemma4"): summary["family_controls"] = packet["family_controls"]
         save(output / "approval-copy.json", packet)
@@ -279,14 +303,12 @@ def main():
         require(child.digest(fixture_path) == FIXTURE_SHA, "canonical fixture drift")
         fixture = loads(fixture_path.read_bytes())
         initial = fixture[0]["request"]
-        messages = [dict(m) for m in initial["messages"]]
-        require(len(messages) == 2 and messages[-1]["role"] == "user", "initial task")
+        prompt_identity = None
         if n4:
             from qwen_n4_live_smoke import identity
-            prompt_identity = identity(args.agent_id, args.run_id)
-            messages[0]["content"] = prompt_identity + "\n\n" + messages[0]["content"]
+            prompt_identity = identity(args.agent_id, args.run_id, args.instance)
             summary["initial_identity_sha256"] = hashlib.sha256(prompt_identity.encode()).hexdigest()
-        messages[-1]["content"] += "\n\n" + WORKFLOW
+        messages = initial_messages(initial["messages"], prompt_identity, workload)
         initial_hash = hashlib.sha256(json.dumps(messages, ensure_ascii=False,
                                                separators=(",", ":")).encode()).hexdigest()
         summary["initial_messages_sha256"] = initial_hash
@@ -298,14 +320,15 @@ def main():
             from gemma_matched_profile import BenchmarkTools
             tool_class = BenchmarkTools
             summary["benchmark_profile"] = args.benchmark_profile
-        tools = tool_class(output / "tools", args.cargo, args.sandbox_exec, packet["sdk_root"])
+        files = {} if workload is None else {"immutable": workload.immutable, "initial": workload.initial}
+        tools = tool_class(output / "tools", args.cargo, args.sandbox_exec, packet["sdk_root"], **files)
         seen = set()
         if n4:
             from qwen_n4_live_smoke import wait_barrier
             save(output / "summary.json", summary)
             summary["barrier"] = wait_barrier(args.barrier_dir, args.agent_id, args.run_id,
                                                args.server_pid, args.barrier_token, output,
-                                               initial_hash, args.approval_sha256)
+                                               initial_hash, args.approval_sha256, args.instance)
         started = time.monotonic()
         for turn in range(7):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
@@ -332,7 +355,8 @@ def main():
         summary["final_source_sha256"] = final_hash
         summary["f2_clock_id"] = CLOCK_ID
         summary["task_completed_monotonic_ns"] = clock_ns()
-        summary["workflow_sha256"] = hashlib.sha256(WORKFLOW.encode()).hexdigest()
+        workflow = WORKFLOW if workload is None else workload.workflow
+        summary["workflow_sha256"] = hashlib.sha256(workflow.encode()).hexdigest()
         summary["full_prefix_reuse"] = "PendingPostOracle"
         summary["runtime_qualified"] = False
     except BaseException as exc:
