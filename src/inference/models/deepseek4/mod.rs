@@ -57,9 +57,13 @@ mod attention_forward_tests;
 #[cfg(test)]
 mod cache_tests;
 #[cfg(test)]
+mod cooperative_fault;
+#[cfg(test)]
 mod ffn_forward_tests;
 #[cfg(test)]
 mod forward_tests;
+#[cfg(test)]
+pub(crate) mod mixed_step_tests;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]
@@ -68,6 +72,8 @@ mod real_artifact_cohort_tests;
 mod real_artifact_decode_cohort_tests;
 #[cfg(test)]
 mod real_artifact_joint_decode_tests;
+#[cfg(test)]
+mod real_artifact_mixed_step_tests;
 #[cfg(test)]
 mod real_artifact_tests;
 #[cfg(test)]

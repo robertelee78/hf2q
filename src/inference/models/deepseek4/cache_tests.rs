@@ -12,7 +12,7 @@ mod encoder_parity;
 #[path = "cache_tests/warmup_capacity.rs"]
 mod warmup_capacity;
 
-fn config(ratios: Vec<u32>) -> Deepseek4Config {
+pub(super) fn config(ratios: Vec<u32>) -> Deepseek4Config {
     let layers = ratios.len() as u32;
     Deepseek4Config {
         num_hidden_layers: layers,
