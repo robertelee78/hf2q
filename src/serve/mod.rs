@@ -47,6 +47,7 @@ pub(crate) use info::print_early_rejection as print_info_early_rejection;
 // Phase B iter-3+ + Phase C iter-2 (Engine wiring).
 pub mod parity_quality;
 pub(crate) mod phase_trace;
+pub(crate) mod q5_deepseek;
 #[allow(dead_code)]
 #[allow(dead_code)]
 pub mod quant_select;
@@ -3978,6 +3979,8 @@ impl multi_model::EngineConfig {
 }
 
 pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<api::engine::Engine> {
+    q5_deepseek::preflight_engine_config(config)?;
+    let _q5_serve_case = q5_deepseek::operating_case::enter_serve(config.engine_mode,config.queue_capacity)?;
     anyhow::ensure!(path.exists(), "Model not found: {}", path.display());
     // Header-only parse surfaces bad magic + populates the diagnostic
     // log line.  Cheap (memory-mapped header, no tensor read).
@@ -3992,7 +3995,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     // message (Wedge-3 deferred follow-up wires the live forward
     // pass).  See `LoadedModel::load` for the dispatch surface.
     let (resolved_context, model_id_uses_filename_fallback, glp_path) = {
-        let gguf = mlx_native::gguf::GgufFile::open(path)
+        let gguf = q5_deepseek::metadata_header(path)
             .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
         let model_id_uses_filename_fallback = gguf.metadata_string("general.name").is_none();
         let arch = gguf
@@ -4349,6 +4352,9 @@ pub fn cmd_serve(
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
 
+    q5_deepseek::validate_activation()?;
+    q5_deepseek::preflight_serve_args(&args)?;
+
     phase_trace::initialize_early().map_err(|error| anyhow::anyhow!(error))?;
 
     crate::debug::investigation_env::gemma_full_input::selected()
@@ -4374,6 +4380,8 @@ pub fn cmd_serve(
     if repository_spec.is_none() && args.output.is_some() {
         anyhow::bail!("serve --output requires a repository MODEL operand");
     }
+
+    q5_deepseek::preflight_model(args.model.as_deref())?;
 
     let (mut chat_parent_lifeline, chat_owned_listener, mut chat_startup_progress) = match (
         args.chat_parent_lifeline_fd,
@@ -4580,6 +4588,7 @@ pub fn cmd_serve(
         kv_persist_budget_bytes,
     }
     .with_serve_steering(&args));
+    q5_deepseek::preflight_engine_config(&state.engine_config_template)?;
 
     let mut automatic_mmproj = false;
     let human_startup_progress = !args.quiet && matches!(log_format, cli::LogFormat::Text);
@@ -4671,7 +4680,8 @@ pub fn cmd_serve(
         }
     }
 
-    if repository_spec.is_none() && args.mmproj.is_none() {
+    if repository_spec.is_none() && args.mmproj.is_none()
+        && q5_deepseek::allows_automatic_projector()? {
         if let Some(model) = args.model.as_ref() {
             match managed_artifacts::resolve_local_path_projector(model) {
                 Ok(Some(projector)) => {

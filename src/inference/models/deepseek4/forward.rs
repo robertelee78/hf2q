@@ -47,6 +47,7 @@ impl Deepseek4Model {
             hidden,
             hc,
         )?;
+        crate::serve::q5_deepseek::operating_case::before_submit()?;
         session
             .finish()
             .context("execute DeepSeek-V4 embedding graph")?;
@@ -79,6 +80,9 @@ impl Deepseek4Model {
                 vec![tokens, hc, hidden],
             )
             .context("allocate DeepSeek-V4 Hyper-Connection state")?;
+        crate::serve::q5_deepseek::collector::constructed("embedding/token_ids", &ids);
+        crate::serve::q5_deepseek::collector::constructed("embedding/gathered", &gathered);
+        crate::serve::q5_deepseek::collector::constructed("embedding/hyper_state", &state);
         Ok(EmbeddingArena {
             ids,
             gathered,

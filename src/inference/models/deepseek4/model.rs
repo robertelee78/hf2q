@@ -66,9 +66,13 @@ impl Deepseek4Model {
     /// runnable model bundle. DSpark draft tensors are rejected by the exact
     /// verifier catalog and belong in their own artifact.
     pub fn load_from_gguf(gguf: &GgufFile) -> Result<Self> {
+        crate::serve::q5_deepseek::require_prepared_model_load()?;
         let cfg = Deepseek4Config::from_gguf(gguf).context("Deepseek4Config::from_gguf")?;
         let ctx = GpuContext::new()
             .map_err(|source| anyhow::anyhow!("DeepSeek-V4 Metal initialization: {source}"))?;
+        // Same actual model device, before the first weight/native allocation.
+        // No selected collector is the unchanged no-op/default path.
+        crate::serve::q5_deepseek::collector::register_model_device(ctx.device())?;
         let weights = Deepseek4Weights::load_from_gguf(gguf, &cfg, ctx.device().clone())
             .context("Deepseek4Weights::load_from_gguf")?;
         Ok(Self {

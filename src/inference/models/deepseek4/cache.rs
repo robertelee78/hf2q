@@ -10,6 +10,8 @@ use super::cache_buffers::{
 use super::Deepseek4Config;
 
 mod anchor_image;
+mod q5_observation;
+pub(crate) use q5_observation::Q5CacheState;
 mod layer_allocation;
 pub(super) use layer_allocation::{allocate_layer_from_plan, initialize_layer_state};
 mod prefill;
@@ -968,6 +970,7 @@ fn snapshot_buffer(
             source.dtype(),
             source.shape().to_vec(),
         )
+        .inspect(|buffer| crate::serve::q5_deepseek::collector::constructed("cache/anchor_copy_constructor", buffer))
         .map_err(|source| CacheError::SnapshotCopy {
             layer,
             kind,
@@ -996,6 +999,7 @@ fn snapshot_buffer_valid_rows(
             source.dtype(),
             source.shape().to_vec(),
         )
+        .inspect(|buffer| crate::serve::q5_deepseek::collector::constructed("cache/anchor_copy_constructor", buffer))
         .map_err(|source| CacheError::SnapshotCopy {
             layer,
             kind,

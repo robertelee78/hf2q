@@ -6,6 +6,7 @@ use mlx_native::{CommandEncoder, MlxBuffer};
 
 pub(super) struct SubmissionChain {
     commands: Vec<(String, CommandEncoder)>,
+    observation_chain: u64,
     moe_statuses: Vec<(usize, MlxBuffer)>,
 }
 
@@ -13,11 +14,13 @@ impl SubmissionChain {
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
             commands: Vec::with_capacity(capacity),
+            observation_chain: crate::serve::q5_deepseek::collector::chain(),
             moe_statuses: Vec::new(),
         }
     }
 
     pub(super) fn push(&mut self, command: (String, CommandEncoder)) {
+        crate::serve::q5_deepseek::collector::command(self.observation_chain, self.commands.len(), None);
         self.commands.push(command);
     }
 
@@ -42,11 +45,21 @@ pub(super) fn finish_or_commit(
     in_flight: Option<&mut SubmissionChain>,
     label: String,
 ) -> Result<()> {
+    // A native quota denial may have been swallowed by an old optional fast
+    // path. Never submit another CB after selected health fails. Join EVERY
+    // already-owned Result before returning; the new session remains uncommitted.
+    if crate::serve::q5_deepseek::operating_case::is_active() {
+        if let Err(error)=crate::serve::q5_deepseek::collector::checked_health() {
+            if let Some(chain)=in_flight {let joined=drain(chain);return match joined{Ok(())=>Err(error),Err(join_error)=>Err(error.context(format!("Q5 prior-chain drain: {join_error:#}")))};}
+            return Err(error);
+        }
+    }
     if let Some(in_flight) = in_flight {
         in_flight.push((label, session.commit()));
         Ok(())
     } else {
-        session.finish().with_context(|| label)
+        session.finish().with_context(|| label)?;
+        crate::serve::q5_deepseek::collector::checked_health()
     }
 }
 
@@ -58,7 +71,11 @@ pub(super) fn drain(in_flight: &SubmissionChain) -> Result<()> {
     let profile_stages = std::env::var("HF2Q_DEEPSEEK_STAGE_PROFILE").as_deref() == Ok("1");
     let mut first_error = None;
     for (index, (label, encoder)) in in_flight.commands.iter().enumerate() {
-        match encoder.wait_until_completed() {
+        let result = encoder.wait_until_completed();
+        crate::serve::q5_deepseek::collector::command(
+            in_flight.observation_chain, index, Some(result.is_ok()),
+        );
+        match result {
             Ok(()) => {
                 encoder.accumulate_gpu_busy();
                 if profile_stages {
@@ -79,7 +96,8 @@ pub(super) fn drain(in_flight: &SubmissionChain) -> Result<()> {
     if let Some(result) = terminal_result {
         result.context("DeepSeek-V4 terminal command buffer failed")?;
     }
-    in_flight.validate_moe_statuses()
+    in_flight.validate_moe_statuses()?;
+    crate::serve::q5_deepseek::collector::checked_chain(in_flight.observation_chain, in_flight.commands.len())
 }
 
 pub(super) fn retained_reference_pipeline_enabled() -> bool {

@@ -6,6 +6,7 @@
 //! divergent/compacted transcripts reset.
 
 mod progress;
+pub(super) mod q5_observation;
 mod sampling;
 mod slot_provision;
 mod slots;
@@ -281,6 +282,8 @@ pub struct Deepseek4LoadedModel {
     disk_persistor: Option<Arc<Deepseek4DiskPersistor>>,
     /// Full-logical-context agent sessions provisioned only for SlotAware.
     slot_sessions: Option<Vec<Deepseek4Session>>,
+    // Metadata and the verified readonly FD only; no extra Metal/buffer owner.
+    q5_context: Option<crate::serve::q5_deepseek::collector::Handle>,
 }
 
 /// One retained DeepSeek-V4 agent context. The model/Metal execution state is
@@ -594,6 +597,7 @@ impl Deepseek4Session {
             &mut self.request_anchor_transaction_active,
             &mut loaded.request_anchor_transaction_active,
         );
+        q5_observation::mounted_pair(self,loaded);
     }
 }
 
@@ -754,9 +758,26 @@ impl Deepseek4LoadedModel {
         opts: &LoadOptions,
         effective_context: Option<u32>,
     ) -> Result<Self> {
+        crate::serve::q5_deepseek::load(opts, effective_context, |header| {
+            Self::load_unobserved(opts, effective_context, header)
+        })
+    }
+
+    fn load_unobserved(
+        opts: &LoadOptions,
+        effective_context: Option<u32>,
+        header: Option<crate::serve::q5_deepseek::PreparedLoad>,
+    ) -> Result<Self> {
         let started = Instant::now();
-        let gguf = GgufFile::open(&opts.model_path)
-            .map_err(|error| anyhow::anyhow!("GGUF open: {error}"))?;
+        let (gguf, q5_context) = match header {
+            Some(prepared) => {
+                let (header, context) = prepared.into_parts();
+                (header, Some(context))
+            },
+            None => (GgufFile::open(&opts.model_path)
+                .map_err(|error| anyhow::anyhow!("GGUF open: {error}"))?, None),
+        };
+        crate::serve::q5_deepseek::collector::require_selected_load_options(opts, effective_context)?;
         let tokenizer = if let Some(path) = opts.tokenizer_path.as_deref() {
             Tokenizer::from_file(path)
                 .map_err(|error| anyhow::anyhow!("load tokenizer {}: {error}", path.display()))?
@@ -944,6 +965,7 @@ impl Deepseek4LoadedModel {
         Ok(Self {
             model,
             cache,
+            q5_context,
             model_id,
             model_path: opts.model_path.clone(),
             context_length: Some(context_length),
@@ -972,6 +994,10 @@ impl Deepseek4LoadedModel {
     /// readiness poison/timeout authority was available, so a startup wedge
     /// could leave the server permanently warming with no bounded failure.
     pub(super) fn warmup(&mut self, supervisor: &EngineSupervisor) -> Result<()> {
+        if let Some(context) = &self.q5_context {
+            anyhow::ensure!(context.is_current(), "Q5 warmup model context not attached");
+            crate::serve::q5_deepseek::collector::require_lifecycle(crate::serve::q5_deepseek::collector::Lifecycle::Warmup)?;
+        }
         if std::env::var("HF2Q_DEEPSEEK_SKIP_WARMUP").as_deref() == Ok("1") {
             return Ok(());
         }
@@ -997,7 +1023,7 @@ impl Deepseek4LoadedModel {
     }
 
     pub(super) fn provision_slot_sessions(&mut self, max_slots: u32) -> Result<()> {
-        slot_provision::provision(self, max_slots)
+        q5_observation::provision(self, max_slots)
     }
 
     pub(super) fn take_slot_sessions(&mut self) -> Result<Vec<Deepseek4Session>> {
@@ -1328,6 +1354,7 @@ impl Deepseek4LoadedModel {
                 return self.begin_resumable_cached_prefill(prompt_tokens, max_tokens, progress);
             }
         }
+        crate::serve::q5_deepseek::operating_case::lengths(prompt_tokens.len(),max_tokens)?;
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
         progress.cache_reset_diagnostic(
@@ -1380,6 +1407,7 @@ impl Deepseek4LoadedModel {
             )
             .into_anyhow());
         }
+        crate::serve::q5_deepseek::operating_case::lengths(prompt_tokens.len(),max_tokens)?;
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
         let cache_poisoned = self.cache.is_poisoned();
@@ -1669,6 +1697,7 @@ impl Deepseek4LoadedModel {
         if self.disk_persistor.is_some() && !self.has_in_memory_prefix_reuse(prompt_tokens) {
             self.try_hydrate_persisted_anchor(prompt_tokens);
         }
+        crate::serve::q5_deepseek::operating_case::lengths(prompt_tokens.len(),max_tokens)?;
         self.begin_request_anchor_transaction(prompt_tokens);
         let cache_grew = self.ensure_cache_capacity(prompt_tokens.len(), max_tokens)?;
 

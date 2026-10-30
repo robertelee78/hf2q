@@ -102,6 +102,7 @@ pub(super) fn allocate_buffer(
     })?;
     device
         .alloc_buffer(bytes, plan.dtype, plan.shape.clone())
+        .inspect(|buffer| crate::serve::q5_deepseek::collector::constructed("cache/initialized_constructor", buffer))
         .map_err(|source| CacheError::Allocate {
             layer,
             kind,
@@ -128,7 +129,9 @@ pub(super) fn allocate_overwrite_buffer(
     // SAFETY: attention/indexer KV rows are hidden by `next_position` and the
     // layer cache-step valid counts until the corresponding encode operation
     // has overwritten them. This helper is never used for compressor state.
-    unsafe { device.alloc_buffer_for_overwrite(bytes, plan.dtype, plan.shape.clone()) }.map_err(
+    unsafe { device.alloc_buffer_for_overwrite(bytes, plan.dtype, plan.shape.clone()) }
+    .inspect(|buffer| crate::serve::q5_deepseek::collector::constructed("cache/overwrite_constructor", buffer))
+    .map_err(
         |source| CacheError::Allocate {
             layer,
             kind,

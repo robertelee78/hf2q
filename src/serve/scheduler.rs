@@ -1429,8 +1429,27 @@ impl InflightBatchedScheduler {
         crate::serve::phase_trace::scheduler(states,"owning_worker_work_state");
     }
 
+    /// Only cleanup of a previously witnessed terminal owner may use this.
+    /// It grants NO forward/work authority and refuses a reused/occupied slot.
+    pub(crate) fn q5_require_auto_released(&self, handle: SlotHandle) -> anyhow::Result<()> {
+        let next = handle.generation.checked_add(1).ok_or_else(|| anyhow::anyhow!("Q5 generation overflow"))?;
+        anyhow::ensure!(!self.in_flight.iter().any(|slot| slot.handle.slot_id == handle.slot_id)
+            && self.slot_generations.get(handle.slot_id.0 as usize) == Some(&next),
+            "Q5 terminal cleanup is not the exact empty auto-released generation");
+        Ok(())
+    }
+
     /// This boundary is a validated family transaction selection, NOT evidence
     /// that its internal graphs share physical rows or have already submitted.
+    /// Exact installed scheduler owner; request ID zero is valid. Diagnostic
+    /// callers must not infer this identity from a session-vector index.
+    pub(crate) fn q5_request(&self, handle: SlotHandle) -> anyhow::Result<u64> {
+        let mut matches = self.in_flight.iter().filter(|slot| slot.handle == handle);
+        let request = matches.next().ok_or_else(|| anyhow::anyhow!("Q5 absent/stale scheduler handle"))?.request_id.0;
+        anyhow::ensure!(matches.next().is_none(), "Q5 duplicate installed scheduler handle");
+        Ok(request)
+    }
+
     pub(crate) fn trace_transaction(&self, family: &'static str, operation: &'static str,
         handles: &[SlotHandle]) -> crate::inference::native_observation::Invocation {
         if !crate::serve::phase_trace::enabled() {

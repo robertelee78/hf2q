@@ -150,7 +150,7 @@ impl std::fmt::Display for QuantType {
 /// a pool key is part of cache and lifecycle identity, so it must describe the
 /// artifact that will actually execute.
 pub fn quant_type_from_gguf_path(path: &Path) -> Result<QuantType> {
-    let gguf = mlx_native::gguf::GgufFile::open(path)
+    let gguf = crate::serve::q5_deepseek::metadata_header(path)
         .with_context(|| format!("open GGUF header for pool identity: {}", path.display()))?;
     quant_type_from_gguf(&gguf, &path.display().to_string())
 }

@@ -645,3 +645,20 @@ progress/native witness and eventual healthy exact checked completion. A new
 workload, context/output/sampling and all failure outcomes; no favourable
 window/search/rescore or quota expansion. Source controls do not establish
 chunking numerical parity, model quality, timing success or primary acceptance.
+
+### Selected Q5 operating-case constructor (source candidate, 2026-10-29)
+
+The closed DeepSeek collector may acquire a private one-shot operating carrier
+only through recomputed same-FD native15 catalog/map/cache quantities, actual
+LoadOptions/serve/request boundaries, independent exact case/source/hardware
+review and fresh OS guards. Legacy packets remain RejectedPreload. A fully
+charged native live+pending cap may cover opaque native roles; separate finite
+creation history and explicit reviewed CPU/driver/OS/retired-residual/reaction
+cells remain. Optional cumulative creation-envelope charging is conservative,
+not a physical-peak theorem or a mandatory interpretation of retired pages.
+Free+external-file pages, when explicitly reviewed, is an operating availability
+estimate, never live-root/physical ownership credit. The dedicated-host
+available-RAM policy above remains; no earlier12GiB/116GiB limit is restored.
+This source decision authorizes no actual numeric case or physical/Q5/speed
+qualification. The complete contract and remaining root-owned gates are in
+`docs/research/adr063-q5-constructible-operating-budget.md`.

@@ -41,6 +41,9 @@ impl Layout {
         let initial_capacity = context.min(INITIAL_CACHE_LENGTH);
         let initial = Deepseek4CachePlan::for_context(cfg, initial_capacity)?;
         let reuse = state.reusable(initial_capacity);
+        if crate::serve::q5_deepseek::operating_case::is_active(){
+            ensure!(slots==4 && reuse,"Q5 reviewed four-cache+C128 branch requires pristine bootstrap; no five-cache fallback");
+        }
         let small = reuse
             .then(|| Deepseek4CachePlan::for_context(cfg, 128))
             .transpose()?;

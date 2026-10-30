@@ -202,7 +202,8 @@ pub(super) fn alloc(
     // 936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d.
     // Keep this opt-in at the family boundary; other model families retain
     // mlx-native's zero-on-fresh default until they have equivalent proof.
-    match TRANSIENT_POOL_PHASE.with(Cell::get) {
+    let phase = TRANSIENT_POOL_PHASE.with(Cell::get);
+    let buffer = match phase {
         TransientPoolPhase::Prefill => PREFILL_POOL
             .with(|pool| {
                 pool.borrow_mut()
@@ -218,7 +219,15 @@ pub(super) fn alloc(
         TransientPoolPhase::Inactive => device
             .alloc_buffer(bytes, dtype, shape)
             .with_context(|| format!("allocate DeepSeek-V4 {label}")),
-    }
+    }?;
+    use crate::serve::q5_deepseek::collector::{allocation, Domain};
+    let domain = match phase {
+        TransientPoolPhase::Prefill => Domain::Prefill,
+        TransientPoolPhase::Decode => Domain::Decode,
+        TransientPoolPhase::Inactive => Domain::Persistent,
+    };
+    allocation(domain, label, &buffer)?;
+    Ok(buffer)
 }
 
 pub(super) fn alloc_host_input(
@@ -242,12 +251,16 @@ pub(super) fn alloc_host_input(
     let bytes = elements
         .checked_mul(dtype.size_of())
         .with_context(|| format!("DeepSeek-V4 {label} byte size overflow"))?;
-    PREFILL_SUBMISSION_INPUT_POOL
+    let buffer = PREFILL_SUBMISSION_INPUT_POOL
         .with(|pool| {
             pool.borrow_mut()
                 .alloc_uninitialized(device, bytes, dtype, shape)
         })
-        .with_context(|| format!("allocate pooled DeepSeek-V4 prefill input {label}"))
+        .with_context(|| format!("allocate pooled DeepSeek-V4 prefill input {label}"))?;
+    crate::serve::q5_deepseek::collector::allocation(
+        crate::serve::q5_deepseek::collector::Domain::SubmissionInput, label, &buffer,
+    )?;
+    Ok(buffer)
 }
 
 pub(super) fn alloc_persistent(
@@ -263,9 +276,13 @@ pub(super) fn alloc_persistent(
     let bytes = elements
         .checked_mul(dtype.size_of())
         .with_context(|| format!("DeepSeek-V4 {label} byte size overflow"))?;
-    device
+    let buffer = device
         .alloc_buffer(bytes, dtype, shape)
-        .with_context(|| format!("allocate persistent DeepSeek-V4 {label}"))
+        .with_context(|| format!("allocate persistent DeepSeek-V4 {label}"))?;
+    crate::serve::q5_deepseek::collector::allocation(
+        crate::serve::q5_deepseek::collector::Domain::Persistent, label, &buffer,
+    )?;
+    Ok(buffer)
 }
 
 pub(super) fn rms_params(
@@ -960,4 +977,19 @@ mod tests {
         assert!(released_decode.free_bytes >= 128);
         assert_eq!(decode_scratch_stats().free_bytes, 0);
     }
+}
+
+/// Read ONLY on the owning thread at an already checked/quiescent checkpoint.
+/// These private pools use alloc/reset/clear only; no register_existing/release
+/// or cross-pool imports. Thus residency roots are a subset of free+issued;
+/// at most2*16384 source records are passed to native's bounded temporary census.
+/// This is NOT a union with caller/live-logit/command owners or physical pages.
+pub(crate) fn q5_pool_snapshot() -> Result<[mlx_native::PoolMemorySnapshot; 3]> {
+    fn one(pool: &RefCell<MlxBufferPool>) -> Result<mlx_native::PoolMemorySnapshot> {
+        let pool = pool.try_borrow().context("Q5 owning pool still mutably borrowed")?;
+        let roots = pool.free_count().checked_add(pool.in_use_count()).context("Q5 pool record overflow")?;
+        anyhow::ensure!(roots <= 16_384, "Q5 source pool census capacity exceeded");
+        Ok(pool.memory_snapshot()?)
+    }
+    Ok([PREFILL_POOL.with(one)?, PREFILL_SUBMISSION_INPUT_POOL.with(one)?, DECODE_POOL.with(one)?])
 }

@@ -220,6 +220,7 @@ impl Deepseek4Model {
                             }
                         }
                     }
+                    crate::serve::q5_deepseek::operating_case::before_submit()?;
                     submitted_any = true;
                     in_flight.push((
                         format!("execute DeepSeek-V4 B=4 decode layers {start}..{end}"),

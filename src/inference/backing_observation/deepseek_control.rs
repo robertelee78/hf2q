@@ -2,7 +2,7 @@
 use super::*;
 use crate::inference::models::deepseek4::{Deepseek4Config,cache::{Deepseek4Cache,Deepseek4CachePlan}};
 use std::collections::{BTreeMap,BTreeSet};
-fn tiny_config()->Deepseek4Config {
+pub(crate) fn tiny_config()->Deepseek4Config {
     // Same head/indexer/compressor geometry; only3layers and C256, ratios0/4/128.
     Deepseek4Config{num_hidden_layers:3,hidden_size:4096,hidden_size_out:16384,
         max_position_embeddings:256,vocab_size:129280,num_attention_heads:64,num_key_value_heads:1,

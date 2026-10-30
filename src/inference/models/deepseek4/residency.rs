@@ -15,6 +15,8 @@ use super::Deepseek4Config;
 
 #[derive(Debug, Error)]
 pub enum WeightResidencyError {
+    #[error("DeepSeek Q5 actual residency observation failed: {0}")]
+    Observation(#[source] anyhow::Error),
     #[error(transparent)]
     Catalog(#[from] WeightCatalogError),
     #[error("tensor '{name}' with role {role:?} cannot use GGML storage {actual:?}")]
@@ -81,6 +83,11 @@ pub struct Deepseek4Weights {
     _device: MlxDevice,
 }
 
+/// Shared actual source predicate; preserves the existing default and env semantics.
+pub(crate) fn raw_weights_mapped() -> bool {
+    std::env::var("HF2Q_DEEPSEEK_MMAP_WEIGHTS").as_deref() != Ok("0")
+}
+
 impl Deepseek4Weights {
     /// Validate the complete verifier catalog, then load each tensor according
     /// to its runtime role. No allocation occurs before catalog and storage
@@ -104,7 +111,7 @@ impl Deepseek4Weights {
         let mut resident_bytes = 0_u64;
         let mut file_backed_bytes = 0_u64;
         let mut anonymous_bytes = 0_u64;
-        let map_raw_weights = std::env::var("HF2Q_DEEPSEEK_MMAP_WEIGHTS").as_deref() != Ok("0");
+        let map_raw_weights = raw_weights_mapped();
         let mapped_tensor_data = map_raw_weights
             .then(|| {
                 gguf.map_tensor_data(&device)
@@ -149,6 +156,8 @@ impl Deepseek4Weights {
                 }
             };
             validate_loaded_buffer(&spec.name, spec.role, info.byte_len, &buffer)?;
+            crate::serve::q5_deepseek::collector::weight(gguf, &spec.name, &buffer)
+                .map_err(WeightResidencyError::Observation)?;
             let bytes = u64::try_from(buffer.data_byte_len()).map_err(|_| {
                 WeightResidencyError::ByteOverflow {
                     name: spec.name.clone(),
@@ -182,6 +191,8 @@ impl Deepseek4Weights {
                 },
             );
         }
+        crate::serve::q5_deepseek::collector::checked_health()
+            .map_err(WeightResidencyError::Observation)?;
         Ok(Self {
             tensors,
             resident_bytes,
@@ -276,7 +287,7 @@ impl Deepseek4Weights {
     }
 }
 
-fn validate_storage_type(
+pub(super) fn validate_storage_type(
     name: &str,
     role: TensorRole,
     actual: GgmlType,
