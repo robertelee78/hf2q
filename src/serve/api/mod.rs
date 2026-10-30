@@ -35,6 +35,7 @@ pub mod engine_error;
 pub mod engine_qwen35;
 pub mod engine_qwen3vl;
 mod engine_supervisor;
+mod frontend_timing;
 mod gcd_policy;
 pub mod grammar;
 pub mod handlers;
