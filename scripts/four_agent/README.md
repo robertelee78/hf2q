@@ -225,3 +225,12 @@ The receipt also records `peak_over_cap_bytes`, which is the measured overshoot,
 - The approval template's `agent_template`, preflight keys and `family_controls` must match the current client checkout. The dry run checks only that the template file exists.
 - A blind sample, meaning failed host observation or a missing real footprint while a cap is enforced, never counts as a quiet host. Three blind samples in a row stop the run.
 - Thermal state is recorded but never stops a run. It is not an out-of-memory risk.
+## F2 scoreboard rendering
+
+`f2_scoreboard_render.py` renders [docs/research/adr063-f2-scoreboard.md](../../docs/research/adr063-f2-scoreboard.md) from the checked-in rows manifest `docs/research/adr063-f2-scoreboard-rows.json` (schema `hf2q.f2.scoreboard-rows.v1`) plus any `f2_scoreboard_cli.py` outputs. Only those fixed-six outputs can produce Qualified F2 primary results; manifest rows are Descriptive, NegativeResult or Failure receipts and cite `$E/...` receipt paths and extraction keys, never absolute local paths. `--verify` re-reads every Verified row from its receipt and refuses drift:
+
+```sh
+python3 scripts/four_agent/f2_scoreboard_render.py --rows docs/research/adr063-f2-scoreboard-rows.json \
+  --evidence-root "$E" --verify [--scoreboard qwen38="$E/<run>/scoreboard.json"] \
+  --output docs/research/adr063-f2-scoreboard.md
+```
