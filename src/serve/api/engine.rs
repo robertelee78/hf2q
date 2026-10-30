@@ -1956,9 +1956,15 @@ mod f2_native_control_tests;
 #[path = "engine/f2_work_state.rs"]
 mod f2_work_state;
 
+#[path = "engine/deepseek4_joint_decode.rs"]
+mod deepseek4_joint_decode;
+
 pub(super) enum Request {
     /// Internal startup-only diagnostic control, never a public HTTP request.
-    ArmNativeObservation { nonce: String, reply: oneshot::Sender<Result<()>> },
+    ArmNativeObservation {
+        nonce: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Warmup {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -3613,12 +3619,8 @@ impl GemmaLoadedModel {
                  --kv-persist"
             );
             let (bank, compatibility) =
-                crate::inference::graft::validate_graft_for_model(
-                    graft_path,
-                    model_path,
-                    &gguf,
-                )
-                .with_context(|| format!("KV graft bind: {}", graft_path.display()))?;
+                crate::inference::graft::validate_graft_for_model(graft_path, model_path, &gguf)
+                    .with_context(|| format!("KV graft bind: {}", graft_path.display()))?;
             if compatibility != crate::inference::glp::Compatibility::Checkpoint {
                 tracing::warn!(
                     "KV graft does not declare a verified checkpoint revision; \
@@ -4065,8 +4067,10 @@ impl Engine {
         queue_capacity: usize,
         kv_cache_budget_bytes: Option<u64>,
     ) -> Self {
-        assert!(!crate::debug::investigation_env::gemma_full_input::selected().unwrap_or(true),
-            "Gemma full-input experiment requires fallible SlotAware spawn");
+        assert!(
+            !crate::debug::investigation_env::gemma_full_input::selected().unwrap_or(true),
+            "Gemma full-input experiment requires fallible SlotAware spawn"
+        );
         // Must precede even channel/metadata/thread creation. The normal
         // fallible entry rejects unsupported profile/mode combinations first.
         crate::inference::models::qwen35::decode_pool::profile::assert_direct_spawn_legacy();
@@ -4358,25 +4362,48 @@ impl Engine {
         let full_input = crate::debug::investigation_env::gemma_full_input::selected()
             .map_err(|e| EngineSpawnError::GemmaFullInputCheckpoint { cause: e.into() })?;
         if full_input {
-            gemma_full_input::validate_startup(matches!(&loaded, LoadedModel::Gemma(_)),
-                match mode { EngineMode::SlotAware { max_slots } => Some(max_slots), _ => None },
+            gemma_full_input::validate_startup(
+                matches!(&loaded, LoadedModel::Gemma(_)),
+                match mode {
+                    EngineMode::SlotAware { max_slots } => Some(max_slots),
+                    _ => None,
+                },
                 crate::debug::INVESTIGATION_ENV.hybrid_kv,
-                crate::debug::INVESTIGATION_ENV.tq_codebook_bits)
-                .map_err(|e| EngineSpawnError::GemmaFullInputCheckpoint { cause: e.to_string() })?;
+                crate::debug::INVESTIGATION_ENV.tq_codebook_bits,
+            )
+            .map_err(|e| EngineSpawnError::GemmaFullInputCheckpoint {
+                cause: e.to_string(),
+            })?;
         }
         if crate::inference::models::qwen35::decode_pool::profile::selected() {
             use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights};
             let native = match &loaded {
-                LoadedModel::Qwen35(q) => !q.model.layers.is_empty() && q.model.layers.iter().all(|layer| {
-                    matches!(layer, Qwen35LayerWeights::NativeFullAttn { .. } | Qwen35LayerWeights::NativeLinearAttn { .. })
-                        && matches!(layer.ffn(), Qwen35FfnWeights::DenseQ(_) | Qwen35FfnWeights::MoeQ(_))
-                }),
+                LoadedModel::Qwen35(q) => {
+                    !q.model.layers.is_empty()
+                        && q.model.layers.iter().all(|layer| {
+                            matches!(
+                                layer,
+                                Qwen35LayerWeights::NativeFullAttn { .. }
+                                    | Qwen35LayerWeights::NativeLinearAttn { .. }
+                            ) && matches!(
+                                layer.ffn(),
+                                Qwen35FfnWeights::DenseQ(_) | Qwen35FfnWeights::MoeQ(_)
+                            )
+                        })
+                }
                 _ => false,
             };
             crate::inference::models::qwen35::decode_pool::profile::prepare(
                 matches!(&loaded, LoadedModel::Qwen35(_)),
-                match mode { EngineMode::SlotAware { max_slots } => Some(max_slots), _ => None }, native,
-            ).map_err(|e| EngineSpawnError::QwenPoolProfile { cause: e.to_string() })?;
+                match mode {
+                    EngineMode::SlotAware { max_slots } => Some(max_slots),
+                    _ => None,
+                },
+                native,
+            )
+            .map_err(|e| EngineSpawnError::QwenPoolProfile {
+                cause: e.to_string(),
+            })?;
         }
         match mode {
             EngineMode::SerialFifo => {
@@ -5424,9 +5451,13 @@ impl Engine {
     pub(crate) async fn arm_native_observation(&self, nonce: String) -> Result<()> {
         self.ensure_worker_healthy()?;
         let (reply, receive) = oneshot::channel();
-        self.inner.tx.send(Request::ArmNativeObservation { nonce, reply }).await
+        self.inner
+            .tx
+            .send(Request::ArmNativeObservation { nonce, reply })
+            .await
             .map_err(|_| anyhow::anyhow!(ENGINE_UNHEALTHY_MESSAGE))?;
-        self.await_worker_reply(receive, "arm_native_observation").await?
+        self.await_worker_reply(receive, "arm_native_observation")
+            .await?
     }
 
     /// Enqueue a non-streaming generation. Returns `queue_full` if the FIFO
@@ -6298,13 +6329,14 @@ fn gemma4_cross_batch_candidate(request: &Request) -> Option<(Gemma4CrossBatchCl
             prompt_tokens,
             params,
             ..
-        } if params.gemma_full_input_checkpoint.is_none() && gemma4_cross_batch_eligible(
-            prompt_tokens.len(),
-            params.max_tokens,
-            params.stable_prompt_prefix_tokens.is_some(),
-            params.stable_prompt_prefix_tokens.is_some(),
-            false,
-        ) =>
+        } if params.gemma_full_input_checkpoint.is_none()
+            && gemma4_cross_batch_eligible(
+                prompt_tokens.len(),
+                params.max_tokens,
+                params.stable_prompt_prefix_tokens.is_some(),
+                params.stable_prompt_prefix_tokens.is_some(),
+                false,
+            ) =>
         {
             Some((
                 if params.stable_prompt_prefix_tokens.is_some() {
@@ -6320,13 +6352,14 @@ fn gemma4_cross_batch_candidate(request: &Request) -> Option<(Gemma4CrossBatchCl
             params,
             soft_tokens,
             ..
-        } if params.gemma_full_input_checkpoint.is_none() && gemma4_cross_batch_eligible(
-            prompt_tokens.len(),
-            params.max_tokens,
-            params.stable_prompt_prefix_tokens.is_some(),
-            params.stable_prompt_prefix_tokens.is_some(),
-            !soft_tokens.is_empty(),
-        ) =>
+        } if params.gemma_full_input_checkpoint.is_none()
+            && gemma4_cross_batch_eligible(
+                prompt_tokens.len(),
+                params.max_tokens,
+                params.stable_prompt_prefix_tokens.is_some(),
+                params.stable_prompt_prefix_tokens.is_some(),
+                !soft_tokens.is_empty(),
+            ) =>
         {
             Some((
                 if params.stable_prompt_prefix_tokens.is_some() {
@@ -6873,8 +6906,10 @@ impl Gemma4PrefillState {
             });
         }
 
-        if (self.params.vision_fingerprint.is_some() || self.params.gemma_full_input_checkpoint.is_some())
-            && self.progress.stable_boundary.is_none() {
+        if (self.params.vision_fingerprint.is_some()
+            || self.params.gemma_full_input_checkpoint.is_some())
+            && self.progress.stable_boundary.is_none()
+        {
             let Some(hybrid) = guard.hybrid.as_ref() else {
                 return Err(Gemma4PrefillFailure {
                     rollback_anchor,
@@ -6887,19 +6922,26 @@ impl Gemma4PrefillState {
                 gemma_full_input::capture(guard, self.slot_id, &self.prompt_tokens, tag)
             } else {
                 crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
-                    hybrid, self.slot_id, self.prompt_tokens.len())
+                    hybrid,
+                    self.slot_id,
+                    self.prompt_tokens.len(),
+                )
             };
             let kv = match capture {
-                    Ok(kv) => kv,
-                    Err(error) => {
-                        return Err(Gemma4PrefillFailure {
-                            rollback_anchor,
-                            error: error.context(if self.params.gemma_full_input_checkpoint.is_some() {
+                Ok(kv) => kv,
+                Err(error) => {
+                    return Err(Gemma4PrefillFailure {
+                        rollback_anchor,
+                        error: error.context(
+                            if self.params.gemma_full_input_checkpoint.is_some() {
                                 "capture Gemma full-input checkpoint"
-                            } else { "capture exact-image Gemma prompt boundary" }),
-                        });
-                    }
-                };
+                            } else {
+                                "capture exact-image Gemma prompt boundary"
+                            },
+                        ),
+                    });
+                }
+            };
             rollback_anchor = Some(Gemma4PromptAnchor {
                 prompt_tokens: self.prompt_tokens.clone(),
                 kv,
@@ -7203,8 +7245,12 @@ impl Gemma4DecodeState {
                     &bound.bank,
                     device,
                     multi_seq_kv,
-                    multi_seq_kv_hybrid.as_mut().map(|value| value.as_mut_slice()),
-                    multi_seq_kv_dense.as_mut().map(|value| value.as_mut_slice()),
+                    multi_seq_kv_hybrid
+                        .as_mut()
+                        .map(|value| value.as_mut_slice()),
+                    multi_seq_kv_dense
+                        .as_mut()
+                        .map(|value| value.as_mut_slice()),
                     multi_seq_kv_mlx.as_mut().map(|value| value.as_mut_slice()),
                 )
                 .map_err(|e| {
@@ -8710,6 +8756,7 @@ fn run_slot_aware_deepseek4(
     supervisor: EngineSupervisor,
 ) {
     let decode_quantum = deepseek4_slot_decode_quantum();
+    let joint_decode_rows = deepseek4_joint_decode::deepseek4_joint_decode_rows(&model.model);
     // DeepSeek's verifier owns an architecture-specific atomic matrix chunk
     // (normally 4K/2K/1K depending on cache shape). The worker reports exact
     // consumed rows after each transaction; the generic 512-token cap would
@@ -8965,12 +9012,18 @@ fn run_slot_aware_deepseek4(
                     let _ = &nonce;
                     let quiescent = supervisor.is_healthy()
                         && scheduler.stats().admitted_total == 0
-                        && slots.iter().all(Option::is_none) && pending.is_empty();
-                    let result = supervisor.run("f2_native_arm", SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, || {
-                        crate::inference::native_observation::arm_on_worker(model.model.ctx.device(), &nonce, quiescent)
-                    });
+                        && slots.iter().all(Option::is_none)
+                        && pending.is_empty();
+                    let result =
+                        supervisor.run("f2_native_arm", SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, || {
+                            crate::inference::native_observation::arm_on_worker(
+                                model.model.ctx.device(),
+                                &nonce,
+                                quiescent,
+                            )
+                        });
                     let _ = reply.send(result);
-                },
+                }
                 Request::Warmup { reply } => match model.warmup(&supervisor) {
                     Ok(()) => {
                         let _ = reply.send(Ok(()));
@@ -9109,7 +9162,7 @@ fn run_slot_aware_deepseek4(
         }
 
         let step = scheduler.step();
-        f2_work_state::deepseek(&scheduler,&slots);
+        f2_work_state::deepseek(&scheduler, &slots);
         match step {
             Ok(SchedulerStep::Idle) => match rx.blocking_recv() {
                 Some(Request::Shutdown) => {
@@ -9146,6 +9199,7 @@ fn run_slot_aware_deepseek4(
                     kv_bytes_per_token,
                     decode_quantum,
                     0,
+                    joint_decode_rows,
                     &supervisor,
                 ) {
                     fail_stop_deepseek4_worker(
@@ -9315,6 +9369,7 @@ fn run_slot_aware_deepseek4(
                     kv_bytes_per_token,
                     mixed_budget.decode_quantum,
                     active_cold_prefills,
+                    joint_decode_rows,
                     &supervisor,
                 ) {
                     fail_stop_deepseek4_worker(
@@ -10036,9 +10091,13 @@ fn advance_deepseek4_prefill_quantum(
     }
 
     lanes.sort_by_key(|lane| lane.slot_index);
-    let _native_invocation = crate::serve::phase_trace::enabled().then(||
-        scheduler.trace_transaction("deepseek4","actual_sorted_cooperative_prefill_inputs",
-            &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>()));
+    let _native_invocation = crate::serve::phase_trace::enabled().then(|| {
+        scheduler.trace_transaction(
+            "deepseek4",
+            "actual_sorted_cooperative_prefill_inputs",
+            &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>(),
+        )
+    });
     let slot_indices = lanes.iter().map(|lane| lane.slot_index).collect::<Vec<_>>();
     let token_batches = lanes
         .iter()
@@ -10316,8 +10375,13 @@ fn try_decode_batch_deepseek4_cohort(
         });
     }
 
-    let _native_invocation = crate::serve::phase_trace::enabled().then(|| scheduler.trace_transaction("deepseek4", "independent_decode_lane_cohort",
-        &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>()));
+    let _native_invocation = crate::serve::phase_trace::enabled().then(|| {
+        scheduler.trace_transaction(
+            "deepseek4",
+            "independent_decode_lane_cohort",
+            &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>(),
+        )
+    });
     tracing::info!(
         target: "hf2q::serve::api::engine_deepseek4::progress",
         lanes = lanes.len(),
@@ -10538,29 +10602,55 @@ fn decode_batch_deepseek4(
     kv_bytes_per_token: u64,
     decode_quantum: usize,
     active_cold_prefills: usize,
+    joint_decode_rows: Option<usize>,
     supervisor: &EngineSupervisor,
 ) -> Option<SlotAwareGpuFatal> {
     let cold_runnable_at_start = deepseek4_cold_runnable_work(slots);
-    match try_decode_batch_deepseek4_cohort(
-        model,
-        sessions,
-        slots,
-        last_used,
-        clock,
-        scheduler,
-        registration,
-        handles,
-        kv_bytes_per_token,
-        decode_quantum,
-        active_cold_prefills,
-        supervisor,
-    ) {
-        Deepseek4DecodeCohortRun::NotEligible => {}
-        Deepseek4DecodeCohortRun::Handled(result) => return result,
-    }
-    for &handle in handles {
+    let joint_decode_rows =
+        deepseek4_joint_decode::deepseek4_joint_decode_turn_rows(&model.model, joint_decode_rows);
+    let serial_handles = if let Some(max_rows) = joint_decode_rows {
+        match deepseek4_joint_decode::run_deepseek4_joint_decode(
+            model,
+            sessions,
+            slots,
+            last_used,
+            clock,
+            scheduler,
+            registration,
+            handles,
+            kv_bytes_per_token,
+            decode_quantum,
+            max_rows,
+            cold_runnable_at_start,
+            supervisor,
+        ) {
+            deepseek4_joint_decode::Deepseek4JointRun::NotEligible => handles.to_vec(),
+            deepseek4_joint_decode::Deepseek4JointRun::Ran { serial } => serial,
+            deepseek4_joint_decode::Deepseek4JointRun::Fatal(fatal) => return Some(fatal),
+        }
+    } else {
+        match try_decode_batch_deepseek4_cohort(
+            model,
+            sessions,
+            slots,
+            last_used,
+            clock,
+            scheduler,
+            registration,
+            handles,
+            kv_bytes_per_token,
+            decode_quantum,
+            active_cold_prefills,
+            supervisor,
+        ) {
+            Deepseek4DecodeCohortRun::NotEligible => {}
+            Deepseek4DecodeCohortRun::Handled(result) => return result,
+        }
+        handles.to_vec()
+    };
+    for &handle in &serial_handles {
         let slot_index = handle.slot_id.0 as usize;
-        let Some((work, mut reply, installed)) = slots.get_mut(slot_index).and_then(Option::take)
+        let Some((work, reply, installed)) = slots.get_mut(slot_index).and_then(Option::take)
         else {
             return Some(SlotAwareGpuFatal::invariant_handle(
                 handle,
@@ -10660,7 +10750,10 @@ fn decode_batch_deepseek4(
                     }
                 }
                 let _native_invocation = scheduler.trace_transaction(
-                    "deepseek4","actual_scalar_decode_input",&[handle]);
+                    "deepseek4",
+                    "actual_scalar_decode_input",
+                    &[handle],
+                );
                 let tick_result = state.tick(model, registration, events, supervisor);
                 match tick_result {
                     Ok(()) => {
@@ -10678,172 +10771,243 @@ fn decode_batch_deepseek4(
             sessions[slot_index].swap_with_loaded(model);
         }
 
-        if tick_error
-            .as_ref()
-            .is_some_and(|error| is_worker_fatal(supervisor, error))
-        {
-            return Some(SlotAwareGpuFatal::slot(
+        if let Some(fatal) = settle_deepseek4_decode_lane(
+            Deepseek4DecodeLaneOutcome {
                 handle,
                 reply,
-                tick_error.expect("fatal branch requires an error"),
-            ));
-        }
-
-        if client_closed {
-            record_retained_slot_kv(
-                scheduler,
-                handle,
-                sessions[slot_index].committed_tokens().len(),
-                kv_bytes_per_token,
-            );
-            if let Err(fatal) =
-                recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
-            {
-                return Some(fatal);
-            }
-            scheduler.release(handle);
-            continue;
-        }
-
-        let finished = state.is_finished();
-        let accounting = if was_parked {
-            Deepseek4DecodeAccounting::Parked {
-                deferred_ticks: deferred_decode_ticks,
-            }
-        } else {
-            Deepseek4DecodeAccounting::Fresh {
+                state,
+                cold_wave,
+                was_parked,
+                deferred_decode_ticks,
                 completed_ticks,
-                finished,
-            }
-        };
-        let pending_cold_peers = if cold_wave {
-            if was_parked {
-                cold_runnable_at_start
-            } else {
-                cold_runnable_at_start.saturating_sub(1)
-            }
-        } else {
-            0
-        };
-        let disposition = account_deepseek4_decode_turn(
+                tick_error,
+                client_closed,
+            },
+            sessions,
+            slots,
+            last_used,
+            clock,
+            scheduler,
+            registration,
+            kv_bytes_per_token,
+            cold_runnable_at_start,
+            supervisor,
+        ) {
+            return Some(fatal);
+        }
+    }
+    None
+}
+
+/// One decode lane after its ticks ran, through either the serial quantum or
+/// a joint decode group.
+struct Deepseek4DecodeLaneOutcome {
+    handle: SlotHandle,
+    reply: SlotReply,
+    state: super::engine_deepseek4::Deepseek4SlotState,
+    cold_wave: bool,
+    was_parked: bool,
+    deferred_decode_ticks: usize,
+    completed_ticks: usize,
+    tick_error: Option<anyhow::Error>,
+    client_closed: bool,
+}
+
+/// Publish one decode lane's turn: scheduler accounting, cancellation
+/// recovery, error replies, completion delivery, and slot reinstall/park.
+/// Serial and joint decode share this so both keep identical slot semantics.
+#[allow(clippy::too_many_arguments)]
+fn settle_deepseek4_decode_lane(
+    outcome: Deepseek4DecodeLaneOutcome,
+    sessions: &mut [super::engine_deepseek4::Deepseek4Session],
+    slots: &mut [Option<Deepseek4Slot>],
+    last_used: &mut [u64],
+    clock: &mut u64,
+    scheduler: &mut InflightBatchedScheduler,
+    registration: Option<&super::registry::ModelRegistration>,
+    kv_bytes_per_token: u64,
+    cold_runnable_at_start: usize,
+    supervisor: &EngineSupervisor,
+) -> Option<SlotAwareGpuFatal> {
+    let Deepseek4DecodeLaneOutcome {
+        handle,
+        mut reply,
+        state,
+        cold_wave,
+        was_parked,
+        deferred_decode_ticks,
+        completed_ticks,
+        tick_error,
+        client_closed,
+    } = outcome;
+    let slot_index = handle.slot_id.0 as usize;
+    if tick_error
+        .as_ref()
+        .is_some_and(|error| is_worker_fatal(supervisor, error))
+    {
+        return Some(SlotAwareGpuFatal::slot(
+            handle,
+            reply,
+            tick_error.expect("fatal branch requires an error"),
+        ));
+    }
+
+    if client_closed {
+        record_retained_slot_kv(
             scheduler,
             handle,
-            accounting,
-            cold_wave,
-            pending_cold_peers,
             sessions[slot_index].committed_tokens().len(),
             kv_bytes_per_token,
         );
-        if let Some(error) = tick_error {
-            state.failed(&error);
-            record_retained_slot_kv(
-                scheduler,
-                handle,
-                sessions[slot_index].committed_tokens().len(),
-                kv_bytes_per_token,
-            );
-            reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
-                Ok(reply) => reply,
-                Err(fatal) => return Some(fatal),
-            };
-            scheduler.release(handle);
-            fire_deepseek4_error(reply, error);
-            continue;
+        if let Err(fatal) = recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply) {
+            return Some(fatal);
         }
-        let ownership = match resolve_deepseek4_decode_ownership(disposition, finished) {
-            Ok(ownership) => ownership,
-            Err(error) => return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+        scheduler.release(handle);
+        return None;
+    }
+
+    let finished = state.is_finished();
+    let accounting = if was_parked {
+        Deepseek4DecodeAccounting::Parked {
+            deferred_ticks: deferred_decode_ticks,
+        }
+    } else {
+        Deepseek4DecodeAccounting::Fresh {
+            completed_ticks,
+            finished,
+        }
+    };
+    let pending_cold_peers = if cold_wave {
+        if was_parked {
+            cold_runnable_at_start
+        } else {
+            cold_runnable_at_start.saturating_sub(1)
+        }
+    } else {
+        0
+    };
+    let disposition = account_deepseek4_decode_turn(
+        scheduler,
+        handle,
+        accounting,
+        cold_wave,
+        pending_cold_peers,
+        sessions[slot_index].committed_tokens().len(),
+        kv_bytes_per_token,
+    );
+    if let Some(error) = tick_error {
+        state.failed(&error);
+        record_retained_slot_kv(
+            scheduler,
+            handle,
+            sessions[slot_index].committed_tokens().len(),
+            kv_bytes_per_token,
+        );
+        reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+            Ok(reply) => reply,
+            Err(fatal) => return Some(fatal),
         };
-        match ownership {
-            Deepseek4DecodeOwnership::Park { deferred_ticks } => {
-                if !was_parked {
-                    tracing::info!(
-                        target: "hf2q::serve::api::engine_deepseek4::progress",
-                        request_id = state.request_id(),
-                        slot = handle.slot_id.0,
-                        generation = handle.generation,
-                        deferred_ticks,
-                        pending_cold_peers,
-                        "DeepSeek-V4 terminal completion parked behind cold cohort"
-                    );
-                }
-                slots[slot_index] = Some((
-                    Deepseek4SlotWork::ParkedCompletion {
-                        state,
-                        cold_wave,
-                        deferred_decode_ticks: deferred_ticks,
-                    },
-                    reply,
-                    handle,
-                ));
+        scheduler.release(handle);
+        fire_deepseek4_error(reply, error);
+        return None;
+    }
+    let ownership = match resolve_deepseek4_decode_ownership(disposition, finished) {
+        Ok(ownership) => ownership,
+        Err(error) => return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error)),
+    };
+    match ownership {
+        Deepseek4DecodeOwnership::Park { deferred_ticks } => {
+            if !was_parked {
+                tracing::info!(
+                    target: "hf2q::serve::api::engine_deepseek4::progress",
+                    request_id = state.request_id(),
+                    slot = handle.slot_id.0,
+                    generation = handle.generation,
+                    deferred_ticks,
+                    pending_cold_peers,
+                    "DeepSeek-V4 terminal completion parked behind cold cohort"
+                );
             }
-            Deepseek4DecodeOwnership::Finalize => {
-                if was_parked {
-                    tracing::info!(
-                        target: "hf2q::serve::api::engine_deepseek4::progress",
-                        request_id = state.request_id(),
-                        slot = handle.slot_id.0,
-                        generation = handle.generation,
-                        "DeepSeek-V4 parked completion released after cold cohort"
-                    );
+            slots[slot_index] = Some((
+                Deepseek4SlotWork::ParkedCompletion {
+                    state,
+                    cold_wave,
+                    deferred_decode_ticks: deferred_ticks,
+                },
+                reply,
+                handle,
+            ));
+        }
+        Deepseek4DecodeOwnership::Finalize => {
+            if was_parked {
+                tracing::info!(
+                    target: "hf2q::serve::api::engine_deepseek4::progress",
+                    request_id = state.request_id(),
+                    slot = handle.slot_id.0,
+                    generation = handle.generation,
+                    "DeepSeek-V4 parked completion released after cold cohort"
+                );
+            }
+            let events = match &reply {
+                SlotReply::Unary(_) => None,
+                SlotReply::Stream { events, .. } => Some(events),
+            };
+            match state.finish(registration, events) {
+                Ok(completion) => {
+                    let delivered = fire_deepseek4_completion(reply, completion);
+                    if delivered {
+                        sessions[slot_index].commit_request_anchor();
+                    } else {
+                        if let Err(error) = sessions[slot_index].recover_after_cancellation() {
+                            return Some(SlotAwareGpuFatal::invariant_handle(handle, error));
+                        }
+                        record_retained_slot_kv(
+                            scheduler,
+                            handle,
+                            sessions[slot_index].committed_tokens().len(),
+                            kv_bytes_per_token,
+                        );
+                    }
+                    scheduler.release(handle);
+                    last_used[slot_index] = *clock;
+                    *clock = clock.saturating_add(1);
                 }
-                match state.finish(registration, events) {
-                    Ok(completion) => {
-                        let delivered = fire_deepseek4_completion(reply, completion);
-                        if delivered {
-                            sessions[slot_index].commit_request_anchor();
-                        } else {
-                            if let Err(error) = sessions[slot_index].recover_after_cancellation() {
-                                return Some(SlotAwareGpuFatal::invariant_handle(handle, error));
-                            }
-                            record_retained_slot_kv(
-                                scheduler,
-                                handle,
-                                sessions[slot_index].committed_tokens().len(),
-                                kv_bytes_per_token,
-                            );
+                Err(error) => {
+                    if reply.client_closed() {
+                        reply.record_client_cancellation();
+                        record_retained_slot_kv(
+                            scheduler,
+                            handle,
+                            sessions[slot_index].committed_tokens().len(),
+                            kv_bytes_per_token,
+                        );
+                        if let Err(fatal) =
+                            recover_cancelled_deepseek4_session_for_reply(sessions, handle, reply)
+                        {
+                            return Some(fatal);
                         }
                         scheduler.release(handle);
                         last_used[slot_index] = *clock;
                         *clock = clock.saturating_add(1);
+                        return None;
                     }
-                    Err(error) => {
-                        if reply.client_closed() {
-                            reply.record_client_cancellation();
-                            record_retained_slot_kv(
-                                scheduler,
-                                handle,
-                                sessions[slot_index].committed_tokens().len(),
-                                kv_bytes_per_token,
-                            );
-                            if let Err(fatal) = recover_cancelled_deepseek4_session_for_reply(
-                                sessions, handle, reply,
-                            ) {
-                                return Some(fatal);
-                            }
-                            scheduler.release(handle);
-                            last_used[slot_index] = *clock;
-                            *clock = clock.saturating_add(1);
-                            continue;
-                        }
-                        reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
-                            Ok(reply) => reply,
-                            Err(fatal) => return Some(fatal),
-                        };
-                        scheduler.release(handle);
-                        last_used[slot_index] = *clock;
-                        *clock = clock.saturating_add(1);
-                        fire_deepseek4_error(reply, error);
-                    }
+                    reply = match reset_deepseek4_session_for_reply(sessions, handle, reply) {
+                        Ok(reply) => reply,
+                        Err(fatal) => return Some(fatal),
+                    };
+                    scheduler.release(handle);
+                    last_used[slot_index] = *clock;
+                    *clock = clock.saturating_add(1);
+                    fire_deepseek4_error(reply, error);
                 }
             }
-            Deepseek4DecodeOwnership::Reinstall => {
-                slots[slot_index] = Some((
-                    Deepseek4SlotWork::Decode { state, cold_wave },
-                    reply,
-                    handle,
-                ));
-            }
+        }
+        Deepseek4DecodeOwnership::Reinstall => {
+            slots[slot_index] = Some((
+                Deepseek4SlotWork::Decode { state, cold_wave },
+                reply,
+                handle,
+            ));
         }
     }
     None
@@ -11138,8 +11302,10 @@ fn run_slot_aware_qwen3vl_unsupported(mut rx: mpsc::Receiver<Request>) {
             }
             Request::ArmNativeObservation { nonce, reply } => {
                 let _ = &nonce;
-                let _ = reply.send(Err(anyhow::anyhow!("native phase-control arm unsupported on this worker")));
-            },
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "native phase-control arm unsupported on this worker"
+                )));
+            }
             Request::Warmup { reply } => {
                 let _ = reply.send(Ok(()));
             }
@@ -12156,12 +12322,21 @@ fn run_slot_aware_gemma4(
                             let _ = &nonce;
                             let quiescent = supervisor.is_healthy()
                                 && scheduler.stats().admitted_total == 0
-                                && slots.iter().all(Option::is_none) && pending.is_empty();
-                            let result = supervisor.run("f2_native_arm", SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, || {
-                                crate::inference::native_observation::arm_on_worker(guard.model.ctx.device(), &nonce, quiescent)
-                            });
+                                && slots.iter().all(Option::is_none)
+                                && pending.is_empty();
+                            let result = supervisor.run(
+                                "f2_native_arm",
+                                SLOT_AWARE_GPU_TRANSACTION_TIMEOUT,
+                                || {
+                                    crate::inference::native_observation::arm_on_worker(
+                                        guard.model.ctx.device(),
+                                        &nonce,
+                                        quiescent,
+                                    )
+                                },
+                            );
                             let _ = reply.send(result);
-                        },
+                        }
                         Request::Warmup { reply } => {
                             let result = warmup_once(&mut guard.model, &supervisor);
                             match result {
@@ -12591,12 +12766,21 @@ fn run_slot_aware_gemma4(
                         let _ = &nonce;
                         let quiescent = supervisor.is_healthy()
                             && scheduler.stats().admitted_total == 0
-                            && slots.iter().all(Option::is_none) && pending.is_empty();
-                        let result = supervisor.run("f2_native_arm", SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, || {
-                            crate::inference::native_observation::arm_on_worker(guard.model.ctx.device(), &nonce, quiescent)
-                        });
+                            && slots.iter().all(Option::is_none)
+                            && pending.is_empty();
+                        let result = supervisor.run(
+                            "f2_native_arm",
+                            SLOT_AWARE_GPU_TRANSACTION_TIMEOUT,
+                            || {
+                                crate::inference::native_observation::arm_on_worker(
+                                    guard.model.ctx.device(),
+                                    &nonce,
+                                    quiescent,
+                                )
+                            },
+                        );
                         let _ = reply.send(result);
-                    },
+                    }
                     Request::Warmup { reply } => {
                         let result = warmup_once(&mut guard.model, &supervisor);
                         if let Err(error) = result {
@@ -12716,7 +12900,7 @@ fn run_slot_aware_gemma4(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::SchedStep,
             _hp_sched.elapsed().as_nanos() as u64,
         );
-        f2_work_state::gemma(&scheduler,&slots);
+        f2_work_state::gemma(&scheduler, &slots);
         match step {
             SchedulerStep::Idle => {
                 // Inline prefill can complete at its seed and release the
@@ -12987,11 +13171,18 @@ fn admit_gemma4_slot(
 ) -> Option<SlotAwareGpuFatal> {
     if let Some(tag) = params.gemma_full_input_checkpoint.as_ref() {
         let check = tag.validate(&prompt_tokens).and_then(|_| {
-            anyhow::ensure!(guard.hybrid.is_some() && params.stable_prompt_prefix_tokens.is_none()
-                && params.vision_fingerprint.is_none(), "Gemma full-input checkpoint requires text Hybrid without split cue");
+            anyhow::ensure!(
+                guard.hybrid.is_some()
+                    && params.stable_prompt_prefix_tokens.is_none()
+                    && params.vision_fingerprint.is_none(),
+                "Gemma full-input checkpoint requires text Hybrid without split cue"
+            );
             Ok(())
         });
-        if let Err(error) = check { slot_fire_done(reply, Err(error), false); return None; }
+        if let Err(error) = check {
+            slot_fire_done(reply, Err(error), false);
+            return None;
+        }
     }
     if reply.client_closed() {
         reply.record_client_cancellation();
@@ -13521,10 +13712,17 @@ fn admit_gemma4_slot(
         let anchor = if let Some(tag) = params.gemma_full_input_checkpoint.as_ref() {
             gemma_full_input::capture(guard, handle.slot_id, &prompt_tokens, tag)
         } else {
-            guard.hybrid.as_ref()
+            guard
+                .hybrid
+                .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Gemma vision prompt cache requires hybrid KV"))
-                .and_then(|hybrid| crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
-                    hybrid, handle.slot_id, prompt_tokens.len()))
+                .and_then(|hybrid| {
+                    crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+                        hybrid,
+                        handle.slot_id,
+                        prompt_tokens.len(),
+                    )
+                })
         };
         match anchor {
             Ok(kv) => Some(Gemma4PromptAnchor {
@@ -14161,9 +14359,13 @@ fn advance_gemma4_prefill_quantum(
         }
     }
 
-    let _native_invocation = crate::serve::phase_trace::enabled().then(||
-        scheduler.trace_transaction("gemma4","actual_installed_prefill_inputs",
-            &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>()));
+    let _native_invocation = crate::serve::phase_trace::enabled().then(|| {
+        scheduler.trace_transaction(
+            "gemma4",
+            "actual_installed_prefill_inputs",
+            &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>(),
+        )
+    });
     let max_decode_tokens = lanes
         .iter()
         .map(|lane| lane.state.params.max_tokens.max(1))
@@ -14381,7 +14583,10 @@ fn admit_gemma4_slots_batched(
         (prompt.len(), cached)
     }));
     if plan.requires_slot_admission()
-        || requests.iter().any(|(_, params, _)| params.gemma_full_input_checkpoint.is_some()) {
+        || requests
+            .iter()
+            .any(|(_, params, _)| params.gemma_full_input_checkpoint.is_some())
+    {
         #[cfg(test)]
         if plan.has_tiny_prefill {
             GEMMA4_TINY_PREFILL_BATCH_FALLBACK_COUNT
@@ -14913,9 +15118,18 @@ fn admit_gemma4_slots_stable_batched(
     };
 
     // Full-input tags are never a split-cue batch or an empty cue forward.
-    if requests.iter().any(|(_, params, _)| params.gemma_full_input_checkpoint.is_some()) {
-        return fallback_single(guard, scheduler, slots, retained_tokens, prompt_anchors,
-            requests);
+    if requests
+        .iter()
+        .any(|(_, params, _)| params.gemma_full_input_checkpoint.is_some())
+    {
+        return fallback_single(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_anchors,
+            requests,
+        );
     }
 
     // Both stable phases are multi-sequence Metal transactions. Conservatively
@@ -15839,9 +16053,7 @@ fn decode_batch_gemma4(
             // ADR-059 (3c): batched decode positions continue after graft
             // rows + prompt rows (the sliding rings subtract the offset
             // inside the batched decode body).
-            positions.push(
-                state.graft_len + state.prompt_len + state.generated_tokens.len() - 1,
-            );
+            positions.push(state.graft_len + state.prompt_len + state.generated_tokens.len() - 1);
             tokens.push(state.next_token);
             sids.push(handle.slot_id);
             captured.push((handle, slot_idx, state, reply));
@@ -15849,8 +16061,16 @@ fn decode_batch_gemma4(
         if captured.is_empty() {
             return None;
         }
-        let _native_invocation = crate::serve::phase_trace::enabled().then(|| scheduler.trace_transaction("gemma4", "selected_batched_body_inputs",
-            &captured.iter().map(|(handle, _, _, _)| *handle).collect::<Vec<_>>()));
+        let _native_invocation = crate::serve::phase_trace::enabled().then(|| {
+            scheduler.trace_transaction(
+                "gemma4",
+                "selected_batched_body_inputs",
+                &captured
+                    .iter()
+                    .map(|(handle, _, _, _)| *handle)
+                    .collect::<Vec<_>>(),
+            )
+        });
         crate::inference::models::gemma4::batched_body::host_phases::add(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::GatherMisc,
             _hp_gather.elapsed().as_nanos() as u64,
@@ -16053,8 +16273,8 @@ fn decode_batch_gemma4(
                 slot_fire_done(reply, state.finish(registration), true);
                 continue;
             }
-            let _native_invocation = scheduler.trace_transaction(
-                "gemma4","actual_scalar_decode_input",&[handle]);
+            let _native_invocation =
+                scheduler.trace_transaction("gemma4", "actual_scalar_decode_input", &[handle]);
             match supervised_gemma4_gpu_call(supervisor, "gemma4_decode_body", || {
                 state.decode_tick_capture(
                     guard.model,
@@ -16366,10 +16586,7 @@ fn splice_gemma4_graft_at_admission(
         )
     })?;
     let spliced = crate::inference::models::gemma4::kv_cache::splice_graft_into_hybrid_kv_for_slot(
-        slot_id,
-        hybrid,
-        bank,
-        device,
+        slot_id, hybrid, bank, device,
     )
     .map_err(|e| anyhow::anyhow!("KV graft splice at Gemma4 slot admission: {e}"))?;
     anyhow::ensure!(
@@ -16994,7 +17211,7 @@ fn fail_slotaware_buffered_request(request: Request, message: &str) {
         Request::ArmNativeObservation { nonce, reply } => {
             let _ = &nonce;
             let _ = reply.send(Err(error()));
-        },
+        }
         Request::Warmup { reply } => {
             let _ = reply.send(Err(error()));
         }
@@ -17215,12 +17432,13 @@ enum Qwen35WorkerFatalKind {
 }
 
 pub(super) fn is_fatal_command_buffer_error(error: &anyhow::Error) -> bool {
-    crate::inference::models::qwen35::decode_pool::profile::unhealthy() || error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<mlx_native::MlxError>(),
-            Some(mlx_native::MlxError::CommandBufferError(_))
-        )
-    })
+    crate::inference::models::qwen35::decode_pool::profile::unhealthy()
+        || error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<mlx_native::MlxError>(),
+                Some(mlx_native::MlxError::CommandBufferError(_))
+            )
+        })
 }
 
 /// Reliability-first outer transaction cap for Qwen slot-aware prompt work.
@@ -17546,7 +17764,11 @@ fn qwen35_operator_request_id(handle: SlotHandle) -> u64 {
 
 fn finish_qwen35_operator_request(handle: SlotHandle, outcome: &'static str) {
     if outcome != "complete" {
-        super::engine_supervisor::qwen_pool_request_observation(handle.slot_id.0 as usize, handle.generation, outcome);
+        super::engine_supervisor::qwen_pool_request_observation(
+            handle.slot_id.0 as usize,
+            handle.generation,
+            outcome,
+        );
     }
     crate::serve::operator_ui::request_finished(
         "qwen35",
@@ -18393,7 +18615,8 @@ fn run_slot_aware_qwen35(
     }
     let n_slots = guard.kv.as_ref().expect("kv Some at entry").n_seqs as usize;
     let prefill_chunk_tokens = match crate::serve::phase_trace::qwen_prefill_quantum(
-        qwen35_slot_prefill_chunk_tokens(n_slots)) {
+        qwen35_slot_prefill_chunk_tokens(n_slots),
+    ) {
         Ok(tokens) => tokens,
         Err(error) => {
             drain_with_startup_error(rx, &format!("Qwen diagnostic quantum: {error}"));
@@ -18609,12 +18832,18 @@ fn run_slot_aware_qwen35(
                     let _ = &nonce;
                     let quiescent = supervisor.is_healthy()
                         && scheduler.stats().admitted_total == 0
-                        && slots.iter().all(Option::is_none) && pending.is_empty();
-                    let result = supervisor.run("f2_native_arm", SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, || {
-                        guard.model.model.with_gpu_cache_mut(|device, _| crate::inference::native_observation::arm_on_worker(device, &nonce, quiescent))
-                    });
+                        && slots.iter().all(Option::is_none)
+                        && pending.is_empty();
+                    let result =
+                        supervisor.run("f2_native_arm", SLOT_AWARE_GPU_TRANSACTION_TIMEOUT, || {
+                            guard.model.model.with_gpu_cache_mut(|device, _| {
+                                crate::inference::native_observation::arm_on_worker(
+                                    device, &nonce, quiescent,
+                                )
+                            })
+                        });
                     let _ = reply.send(result);
-                },
+                }
                 Request::Warmup { reply } => {
                     let result = warmup_qwen35_once(guard.model, &supervisor);
                     if !supervisor.is_healthy()
@@ -18790,7 +19019,7 @@ fn run_slot_aware_qwen35(
                 break 'worker;
             }
         };
-        f2_work_state::qwen(&scheduler,&slots);
+        f2_work_state::qwen(&scheduler, &slots);
         match step {
             SchedulerStep::Idle => {
                 if shutdown_requested {
@@ -18970,14 +19199,8 @@ fn admit_qwen35_slot(
         .max_seq_len as usize;
     // ADR-059: the bound graft (if any) shifts every physical position and
     // adds graft_len rows per covered full-attention layer.
-    let graft = guard
-        .model
-        .model
-        .kv_graft
-        .as_ref();
-    let graft_len = graft
-        .map(|bound| bound.bank.n_slots as usize)
-        .unwrap_or(0);
+    let graft = guard.model.model.kv_graft.as_ref();
+    let graft_len = graft.map(|bound| bound.bank.n_slots as usize).unwrap_or(0);
     // ADR-059 fail-closed: extension (vision soft-token / deepstack)
     // prefill is not graft-wired. Refuse by name before validation or
     // scheduling — never serve ungrafted under a graft flag.
@@ -19263,8 +19486,11 @@ fn admit_qwen35_slot(
         }
         // ADR-059: speculative prefix boundaries carry MTP state that never
         // saw the graft; suppress reuse under a bound graft.
-        let spec_candidate =
-            if graft.is_none() { anchor.spec.clone() } else { None };
+        let spec_candidate = if graft.is_none() {
+            anchor.spec.clone()
+        } else {
+            None
+        };
         let cached_spec = spec_candidate.clone().filter(|spec| {
             spec.token_count == cached_tokens
                 && guard
@@ -19337,7 +19563,8 @@ fn admit_qwen35_slot(
     // against the ungrafted distribution. Skip speculation (an
     // optimization, never a semantic path) and serve through ordinary
     // grafted decode.
-    if graft.is_some() && slot_mtp_decision == super::qwen35_speculation::QwenSpeculationDecision::Eligible
+    if graft.is_some()
+        && slot_mtp_decision == super::qwen35_speculation::QwenSpeculationDecision::Eligible
     {
         tracing::info!(
             target: "hf2q::serve::api::engine_qwen35::graft",
@@ -19345,8 +19572,7 @@ fn admit_qwen35_slot(
             "KV graft bound: skipping SlotAware MTP (spec-decode cache is not \
              graft-wired); serving via ordinary grafted decode"
         );
-        slot_mtp_decision =
-            super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable;
+        slot_mtp_decision = super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable;
     }
     if slot_mtp_decision != super::qwen35_speculation::QwenSpeculationDecision::Eligible {
         super::qwen35_speculation::record_fallback(slot_mtp_decision);
@@ -19893,8 +20119,15 @@ fn finish_qwen35_prefill(
         scheduler.release(handle);
         finish_qwen35_operator_request(handle, "complete");
         let result = state.finish(guard.model, registration);
-        super::engine_supervisor::qwen_pool_request_observation(handle.slot_id.0 as usize, handle.generation,
-            if result.is_ok() { "completed_post_drain" } else { "failed" });
+        super::engine_supervisor::qwen_pool_request_observation(
+            handle.slot_id.0 as usize,
+            handle.generation,
+            if result.is_ok() {
+                "completed_post_drain"
+            } else {
+                "failed"
+            },
+        );
         if let Ok(generation) = result.as_ref() {
             log_qwen35_slot_decode_complete(generation, &reply, false);
             prompt_caches[slot_idx].store(&prompt_tokens, &params, generation);
@@ -20084,7 +20317,8 @@ fn decode_batch_qwen35(
             continue;
         }
 
-        let _native_invocation = scheduler.trace_transaction("qwen35", "ordinary_or_temporal_mtp_decode", &[handle]);
+        let _native_invocation =
+            scheduler.trace_transaction("qwen35", "ordinary_or_temporal_mtp_decode", &[handle]);
         let qtick = match state.decode_tick(
             guard.model,
             guard.kv.as_mut().expect("kv Some during loop"),
@@ -20225,8 +20459,15 @@ fn decode_batch_qwen35(
                 (prompt.to_vec(), params.clone())
             };
             let gr = state.finish(guard.model, registration);
-            super::engine_supervisor::qwen_pool_request_observation(handle.slot_id.0 as usize, handle.generation,
-                if !client_dropped && gr.is_ok() { "completed_post_drain" } else { "failed" });
+            super::engine_supervisor::qwen_pool_request_observation(
+                handle.slot_id.0 as usize,
+                handle.generation,
+                if !client_dropped && gr.is_ok() {
+                    "completed_post_drain"
+                } else {
+                    "failed"
+                },
+            );
             if let Ok(result) = gr.as_ref() {
                 log_qwen35_slot_decode_complete(result, &reply, client_dropped);
                 if !client_dropped {
@@ -20262,8 +20503,8 @@ fn worker_run(
     supervisor: EngineSupervisor,
 ) {
     let phase_trace_supervisor = supervisor.clone();
-    let _phase_trace_worker = crate::serve::phase_trace::worker(
-        move || phase_trace_supervisor.is_healthy());
+    let _phase_trace_worker =
+        crate::serve::phase_trace::worker(move || phase_trace_supervisor.is_healthy());
     tracing::info!(
         model = %loaded.model_id(),
         ?mode,
@@ -20382,8 +20623,10 @@ fn worker_run(
         match req {
             Request::ArmNativeObservation { nonce, reply } => {
                 let _ = &nonce;
-                let _ = reply.send(Err(anyhow::anyhow!("native phase-control arm unsupported on this worker")));
-            },
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "native phase-control arm unsupported on this worker"
+                )));
+            }
             Request::Warmup { reply } => {
                 let family = loaded_model_family(&loaded);
                 let result = match &mut loaded {
@@ -23542,13 +23785,12 @@ fn gemma4_steering_and_graft_params_hash(loaded: &GemmaLoadedModel) -> u64 {
     let mut h = sha2::Sha256::new();
     h.update(b"steering=v1");
     h.update(
-        &super::engine_qwen35::glp_steering_params_hash(loaded.weights.glp.as_ref())
-            .to_le_bytes(),
+        &super::engine_qwen35::glp_steering_params_hash(loaded.weights.glp.as_ref()).to_le_bytes(),
     );
     h.update(
-        &crate::inference::graft::graft_params_hash(loaded.weights.kv_graft.as_ref().map(
-            |bound| &bound.bank,
-        ))
+        &crate::inference::graft::graft_params_hash(
+            loaded.weights.kv_graft.as_ref().map(|bound| &bound.bank),
+        )
         .to_le_bytes(),
     );
     let digest = h.finalize();
@@ -25052,8 +25294,12 @@ fn generate_gemma4_once_slot_aware(
             &bound.bank,
             device,
             multi_seq_kv,
-            multi_seq_kv_hybrid.as_mut().map(|value| value.as_mut_slice()),
-            multi_seq_kv_dense.as_mut().map(|value| value.as_mut_slice()),
+            multi_seq_kv_hybrid
+                .as_mut()
+                .map(|value| value.as_mut_slice()),
+            multi_seq_kv_dense
+                .as_mut()
+                .map(|value| value.as_mut_slice()),
             multi_seq_kv_mlx.as_mut().map(|value| value.as_mut_slice()),
         )
         .map_err(|e| {
@@ -25767,8 +26013,12 @@ fn generate_stream_gemma4_once_slot_aware(
             &bound.bank,
             device,
             multi_seq_kv,
-            multi_seq_kv_hybrid.as_mut().map(|value| value.as_mut_slice()),
-            multi_seq_kv_dense.as_mut().map(|value| value.as_mut_slice()),
+            multi_seq_kv_hybrid
+                .as_mut()
+                .map(|value| value.as_mut_slice()),
+            multi_seq_kv_dense
+                .as_mut()
+                .map(|value| value.as_mut_slice()),
             multi_seq_kv_mlx.as_mut().map(|value| value.as_mut_slice()),
         ) {
             send!(super::sse::GenerationEvent::Error(format!(
@@ -26235,11 +26485,11 @@ fn generate_stream_gemma4_once_slot_aware(
             } else if hit_stop_string(&decoded_running, &params.stop_strings) {
                 finish_reason = "stop";
             } else {
-            generated_tokens.push(next_token);
-            for _ in 1..max_decode_tokens {
-                // ADR-059 (3c): decode positions continue after graft rows
-                // + prompt rows.
-                let pos = graft_len + prompt_tokens.len() + generated_tokens.len() - 1;
+                generated_tokens.push(next_token);
+                for _ in 1..max_decode_tokens {
+                    // ADR-059 (3c): decode positions continue after graft rows
+                    // + prompt rows.
+                    let pos = graft_len + prompt_tokens.len() + generated_tokens.len() - 1;
                     let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> =
                         None;
                     let r = loaded.weights.forward_decode_slot_aware(
@@ -30839,12 +31089,10 @@ mod tests {
         assert!(incomplete.accept_bytes(b"a"));
         validate_grammar_terminal(Some(&incomplete), GrammarKind::ResponseFormat, "length")
             .expect("a live grammar cut by max_tokens is an ordinary length finish");
-        assert!(validate_grammar_terminal(
-            Some(&incomplete),
-            GrammarKind::ResponseFormat,
-            "stop"
-        )
-        .is_err());
+        assert!(
+            validate_grammar_terminal(Some(&incomplete), GrammarKind::ResponseFormat, "stop")
+                .is_err()
+        );
 
         let mut accepted = crate::serve::api::grammar::GrammarRuntime::new(grammar.clone(), root)
             .expect("runtime");
@@ -36881,12 +37129,9 @@ assistant:
                 let eng = engine_slot.clone();
                 let pr = params.clone();
                 handles.push(tokio::spawn(async move {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
-                        eng.generate(p, pr),
-                    )
-                    .await
-                    .context("queued slot generation must complete without another request")?
+                    tokio::time::timeout(std::time::Duration::from_secs(120), eng.generate(p, pr))
+                        .await
+                        .context("queued slot generation must complete without another request")?
                 }));
             }
             let mut out = Vec::new();
@@ -38620,7 +38865,6 @@ assistant:
                     eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step (barrier_between conflict-tracking; HF2Q_BARRIER_NS)",
                         "of which barrier-track", bns as f64 / 1e6 / steps as f64);
                 }
-
             }
         }
         rt.block_on(engine.shutdown()).expect("shutdown");
@@ -43405,7 +43649,9 @@ mod gemma4_bounded_prefill_tests {
 
         assert!(validate_gemma4_generation_request(0, 1, 262_144, 0).is_err());
         assert!(validate_gemma4_generation_request(1, 0, 262_144, 0).is_err());
-        assert!(validate_gemma4_generation_request(1, u32::MAX as usize + 1, usize::MAX, 0).is_err());
+        assert!(
+            validate_gemma4_generation_request(1, u32::MAX as usize + 1, usize::MAX, 0).is_err()
+        );
         assert!(validate_gemma4_generation_request(262_140, 5, 262_144, 0).is_err());
         assert!(validate_gemma4_generation_request(usize::MAX, 1, usize::MAX, 0).is_err());
         assert_eq!(
@@ -44084,7 +44330,9 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             + "    fn spawn_inner_with_slot_aware".len();
         let body = &src[body_start..body_end];
         // Ignore preceding startup-validation matches: this is the dispatch.
-        let dispatch = body.find("match mode {\n").expect("H28: mode dispatch table");
+        let dispatch = body
+            .find("match mode {\n")
+            .expect("H28: mode dispatch table");
         let body = &body[dispatch..];
         let serial_fifo_idx = body
             .find("EngineMode::SerialFifo")
@@ -50166,22 +50414,39 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
     #[test]
     fn h92_hybrid_provisioning_gated_on_investigation_env_hybrid_kv() {
         let src = include_str!("engine.rs");
-        let start = src.find("pub fn provision_multi_seq_kv_for_slot_aware(")
+        let start = src
+            .find("pub fn provision_multi_seq_kv_for_slot_aware(")
             .expect("H92: Gemma provisioning method");
-        let end = src[start..].find("impl LoadInfoBuilder for GemmaLoadedModel")
-            .expect("H92: provisioning impl boundary") + start;
+        let end = src[start..]
+            .find("impl LoadInfoBuilder for GemmaLoadedModel")
+            .expect("H92: provisioning impl boundary")
+            + start;
         let body = &src[start..end];
-        for marker in ["ScaffoldPlan::new(", "Modes::invocation()", "plan.execute(",
+        for marker in [
+            "ScaffoldPlan::new(",
+            "Modes::invocation()",
+            "plan.execute(",
             "Phase::Hb => Allocated::Hb(alloc_hb_kv_for_layer_from_plan(&device, slot)",
             "Phase::Hybrid => Allocated::Hybrid(",
             "alloc_multi_seq_hybrid_kv_for_layer_from_plan(&device, slot)",
-            "self.multi_seq_kv = Some(", "self.multi_seq_kv_hybrid = Some("] {
-            assert!(body.contains(marker), "H92: planned allocator/publication missing {marker}");
+            "self.multi_seq_kv = Some(",
+            "self.multi_seq_kv_hybrid = Some(",
+        ] {
+            assert!(
+                body.contains(marker),
+                "H92: planned allocator/publication missing {marker}"
+            );
         }
         let plan = include_str!("../../inference/models/gemma4/cache_scaffold_plan.rs");
-        assert!(plan.contains("hybrid: env.hybrid_kv"), "H92: actual Hybrid mode binding");
+        assert!(
+            plan.contains("hybrid: env.hybrid_kv"),
+            "H92: actual Hybrid mode binding"
+        );
         assert!(plan.contains("(Phase::Hb, true)"), "H92: unconditional HB");
-        assert!(plan.contains("(Phase::Hybrid, modes.hybrid)"), "H92: captured Hybrid mode");
+        assert!(
+            plan.contains("(Phase::Hybrid, modes.hybrid)"),
+            "H92: captured Hybrid mode"
+        );
     }
 
     /// **H93 (compile pin + Display contract)** — NEW typed-error
@@ -56913,7 +57178,9 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
                 .expect("H222: spawn_inner_with_slot_aware sibling not found")
             + "    fn spawn_inner_with_slot_aware".len();
         let body = &src[body_start..body_end];
-        let dispatch = body.find("match mode {\n").expect("H222: mode dispatch table");
+        let dispatch = body
+            .find("match mode {\n")
+            .expect("H222: mode dispatch table");
         let body = &body[dispatch..];
         let serial_fifo_idx = body
             .find("EngineMode::SerialFifo")
@@ -57194,7 +57461,9 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
                 .find("    fn spawn_inner_with_slot_aware")
                 .expect("H239: spawn_inner_with_slot_aware sibling not found");
         let body = &engine_src[body_start..body_end];
-        let dispatch = body.find("match mode {\n").expect("H239: mode dispatch table");
+        let dispatch = body
+            .find("match mode {\n")
+            .expect("H239: mode dispatch table");
         let body = &body[dispatch..];
         let serial_fifo_idx = body
             .find("EngineMode::SerialFifo")

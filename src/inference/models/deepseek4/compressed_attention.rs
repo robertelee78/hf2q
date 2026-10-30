@@ -30,27 +30,28 @@ use super::prefill_flash_attention::{
     DeepseekPrefillFlashArena, DeepseekSparsePrefillFlashArena,
 };
 use super::rope::yarn_frequencies;
+use super::row_matmul::RowMatmul;
 use super::submission::{finish_or_commit, SubmissionChain};
 use super::Deepseek4Model;
 
-const SPARSE_FLASH_MIN_TOP_K: usize = 384;
+pub(super) const SPARSE_FLASH_MIN_TOP_K: usize = 384;
 fn use_gathered_sparse_prefill(valid_compressed: usize, rows: usize) -> bool {
     requires_gathered_prefill(rows) && valid_compressed > 0
 }
 
-fn sparse_attention_scratch_shape(rows: usize, attention_width: usize) -> Vec<usize> {
+pub(super) fn sparse_attention_scratch_shape(rows: usize, attention_width: usize) -> Vec<usize> {
     vec![1, rows, DEEPSEEK_SPARSE_HEADS, attention_width]
 }
 
-struct SparseFlashDecodeArena {
-    gathered_kv: MlxBuffer,
-    mask: MlxBuffer,
-    invalid_global: MlxBuffer,
-    invalid_heads: MlxBuffer,
+pub(super) struct SparseFlashDecodeArena {
+    pub(super) gathered_kv: MlxBuffer,
+    pub(super) mask: MlxBuffer,
+    pub(super) invalid_global: MlxBuffer,
+    pub(super) invalid_heads: MlxBuffer,
 }
 
 impl SparseFlashDecodeArena {
-    fn new(device: &MlxDevice, top_k: usize, head_dim: usize) -> Result<Self> {
+    pub(super) fn new(device: &MlxDevice, top_k: usize, head_dim: usize) -> Result<Self> {
         let gathered_kv = alloc(
             device,
             DType::BF16,
@@ -237,18 +238,33 @@ impl Deepseek4Model {
             .or_else(|| layer_step.map(|step| step.compressed_valid_after))
             .unwrap_or(0);
         let layout = super::compressed_attention_indexer::layout::prepare_layout(
-            ratio, rows, start_position, graft, window_capacity, valid_compressed,
-            self.cfg.index_top_k as usize, prefill_span.is_some(),
+            ratio,
+            rows,
+            start_position,
+            graft,
+            window_capacity,
+            valid_compressed,
+            self.cfg.index_top_k as usize,
+            prefill_span.is_some(),
         )?;
-        let selection = (ratio == 4).then(|| {
-            super::compressed_attention_indexer::selection::SelectionRequest::new(
-                &self.cfg, rows, start_position, valid_compressed,
-                layout.compressed_attention_offset.checked_add(graft)
-                    .context("DeepSeek-V4 indexer offset overflow")?,
-                layout.storage_stride,
-                layout.indexer_output_offset.context("ratio-four output offset missing")?,
-            )
-        }).transpose()?;
+        let selection = (ratio == 4)
+            .then(|| {
+                super::compressed_attention_indexer::selection::SelectionRequest::new(
+                    &self.cfg,
+                    rows,
+                    start_position,
+                    valid_compressed,
+                    layout
+                        .compressed_attention_offset
+                        .checked_add(graft)
+                        .context("DeepSeek-V4 indexer offset overflow")?,
+                    layout.storage_stride,
+                    layout
+                        .indexer_output_offset
+                        .context("ratio-four output offset missing")?,
+                )
+            })
+            .transpose()?;
         let core = CompressedAttentionCoreArena::new(&device, &self.cfg, rows)?;
         let main_compressor =
             MainCompressorArena::new(&device, &self.cfg, ratio, rows, compressed_count)?;
@@ -346,7 +362,11 @@ impl Deepseek4Model {
             .copy_from_slice(&frequencies);
 
         let super::compressed_attention_indexer::layout::AttentionLayout {
-            index_storage, storage_stride, attention_width, indexer_output_offset, ..
+            index_storage,
+            storage_stride,
+            attention_width,
+            indexer_output_offset,
+            ..
         } = layout;
         let mut indices = alloc_host_input(
             &device,
@@ -411,6 +431,7 @@ impl Deepseek4Model {
                 &weights.attention,
                 &core,
                 rows,
+                RowMatmul::Matrix,
             )?;
             let rope = DeepSeekTailRopeParams {
                 batch: 1,
@@ -487,9 +508,17 @@ impl Deepseek4Model {
                 window_write_inputs.push(prefix);
             }
             super::cache_window_write::encode_window_write(
-                session, registry, &device, layer_cache, window_cache_input,
-                &window_write_inputs, layer_span, layer_step,
-                window_write_count, window_capacity, head_dim,
+                session,
+                registry,
+                &device,
+                layer_cache,
+                window_cache_input,
+                &window_write_inputs,
+                layer_span,
+                layer_step,
+                window_write_count,
+                window_capacity,
+                head_dim,
             )?;
             encode_main_compressor(
                 session,
@@ -705,6 +734,7 @@ impl Deepseek4Model {
                 &positions,
                 &frequency_buffer,
                 rows,
+                RowMatmul::Matrix,
             )?;
             if profile_stages {
                 session
@@ -723,7 +753,8 @@ impl Deepseek4Model {
         } else {
             let local_executor = GraphExecutor::new(device.clone());
             let mut session = local_executor
-                .begin().map(crate::inference::native_observation::session)
+                .begin()
+                .map(crate::inference::native_observation::session)
                 .with_context(|| format!("begin DeepSeek-V4 layer {layer} compressed attention"))?;
             encode(&mut session)?;
             finish_or_commit(

@@ -46,6 +46,13 @@ accepts 1-8 on every family, checked at the CLI, config load, and the setup
 prompt; raising the bound requires a hands-on qualification at the new
 width). No `src/` occurrence of the three names remains.
 
+## Added in ADR-063 S3 (2026-10-30)
+
+- `HF2Q_DEEPSEEK_JOINT_DECODE` (`documented-escape`) is the DeepSeek-V4 joint decode kill switch. It is on by default; `0`/`off`/`false` restores serial per-slot decode.
+- `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the joint width, 2..8 with a default of 4. Widths 5–8 have no serving measurement.
+
+Both rows were added by hand. The rest of this snapshot was not regenerated.
+
 ## Remaining promotion queue
 
 The inventory deliberately identifies follow-up work without smuggling it into
@@ -145,6 +152,8 @@ this release:
 | `HF2Q_DEEPSEEK_GRAPH_DIAG` | `development-only` | 3 |
 | `HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB` | `development-only` | 5 |
 | `HF2Q_DEEPSEEK_GRAPH_REORDER` | `development-only` | 5 |
+| `HF2Q_DEEPSEEK_JOINT_DECODE` | `documented-escape` | 2 |
+| `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` | `development-only` | 1 |
 | `HF2Q_DEEPSEEK_LAYERS_PER_CB` | `development-only` | 5 |
 | `HF2Q_DEEPSEEK_MMAP_WEIGHTS` | `development-only` | 3 |
 | `HF2Q_DEEPSEEK_PREFILL_TIMING` | `development-only` | 3 |
