@@ -187,6 +187,10 @@ fn config() -> Option<&'static DumpConfig> {
 /// Returns true iff dumping is enabled (any layer / any op).
 #[inline]
 pub fn is_enabled() -> bool {
+    #[cfg(test)]
+    if crate::adr063_invariance::qwen::enabled() {
+        return true;
+    }
     config().is_some()
 }
 
@@ -285,6 +289,14 @@ pub fn dump(
     shape: &[usize],
     device: &MlxDevice,
 ) {
+    #[cfg(test)]
+    if crate::adr063_invariance::qwen::needs_drain(step, layer_idx, op) {
+        match flush_gpu(device) {
+            Ok(()) => crate::adr063_invariance::qwen::drained(step, layer_idx, op, buf, shape),
+            Err(error) => crate::adr063_invariance::qwen::drain_failed(format!("Qwen checked diagnostic drain: {error:#}")),
+        }
+        return;
+    }
     if !should_dump(layer_idx) {
         return;
     }

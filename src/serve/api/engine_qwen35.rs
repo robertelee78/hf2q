@@ -316,6 +316,10 @@ impl Qwen35LoadedModel {
         // dispatcher-level open in `LoadedModel::load`; the cost is a
         // memory-mapped header parse (~ms), small relative to the full
         // weights load below.
+        #[cfg(test)]
+        let gguf = crate::adr063_invariance::acquisition::open_model(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+        #[cfg(not(test))]
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         let provenance = provenance::detect(&gguf);

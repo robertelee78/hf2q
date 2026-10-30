@@ -34,6 +34,10 @@
 #[path = "engine_gemma_full_input.rs"]
 pub(crate) mod gemma_full_input;
 
+#[cfg(test)]
+#[path = "engine/q1_qwen_cancel.rs"]
+pub(crate) mod q1_qwen_cancel;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -3266,6 +3270,10 @@ impl LoadedModel {
             model_path.display()
         );
         // Header-only parse — cheap; no tensor read.
+        #[cfg(test)]
+        let gguf = crate::adr063_invariance::acquisition::open_model(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+        #[cfg(not(test))]
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         let arch = gguf
@@ -3371,6 +3379,10 @@ impl GemmaLoadedModel {
             resolve_tokenizer_path_optional(model_path, opts.tokenizer_path.as_deref());
 
         // Open GGUF (header + metadata only).
+        #[cfg(test)]
+        let gguf = crate::adr063_invariance::acquisition::open_model(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+        #[cfg(not(test))]
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         if load_timing {
@@ -19518,6 +19530,9 @@ fn advance_qwen35_prefill(
         max_chunk_tokens,
         supervisor,
     );
+    #[cfg(test)]
+    q1_qwen_cancel::after_actual_advance(advance.is_ok(), guard.kv.as_ref()
+        .and_then(|kv| kv.sequence_len_for_slot(handle.slot_id).ok()).map(|n| n as usize));
     match advance {
         Ok(super::engine_qwen35::Qwen35PrefillAdvance::Pending {
             state,
