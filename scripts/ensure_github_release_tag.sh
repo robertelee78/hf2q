@@ -79,12 +79,26 @@ if ! gh api --method POST "repos/$repository/git/refs" \
 fi
 read_exact_sha "created tag $tag" "$create_stdout"
 
+# GitHub's refs API is eventually consistent: a ref created a moment ago can
+# still read back as an explicit 404 (release run 41003930574). Retry only that
+# exact case, a bounded number of times; any other failure stops immediately.
+reread_attempts=${HF2Q_TAG_REREAD_ATTEMPTS:-6}
+reread_delay=${HF2Q_TAG_REREAD_DELAY_SECONDS:-5}
+[[ "$reread_attempts" =~ ^[1-9][0-9]?$ && "$reread_delay" =~ ^[0-9]+$ ]] || usage
 reread_stdout="$scratch/reread.stdout"
 reread_stderr="$scratch/reread.stderr"
-if ! gh api "$tag_endpoint" --jq .object.sha \
-  >"$reread_stdout" 2>"$reread_stderr"; then
-  fail_with_response "failed to re-read created tag $tag" \
-    "$reread_stdout" "$reread_stderr"
-fi
+attempt=1
+while ! gh api "$tag_endpoint" --jq .object.sha \
+  >"$reread_stdout" 2>"$reread_stderr"; do
+  if (( attempt >= reread_attempts )) || ! jq -e -s \
+    'length == 1 and (.[0] | type == "object" and ((.status // "") | tostring) == "404")' \
+    "$reread_stdout" >/dev/null 2>&1; then
+    fail_with_response "failed to re-read created tag $tag" \
+      "$reread_stdout" "$reread_stderr"
+  fi
+  echo "created tag $tag not yet readable (attempt $attempt/$reread_attempts); retrying" >&2
+  attempt=$((attempt + 1))
+  sleep "$reread_delay"
+done
 read_exact_sha "re-read tag $tag" "$reread_stdout"
 echo "created and verified tag $tag at $expected_sha"
