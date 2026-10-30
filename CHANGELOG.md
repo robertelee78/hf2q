@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ADR-063 Q1 numeric policy proposal (`docs/research/adr063-q1-numeric-policy.md`) and the offline `scripts/four_agent/q1_decision_policy.py` checker. It reads retained Q1 trace stores, logprob responses, task outcomes and four-agent client runs, and reports bitwise equality, a logit decision envelope, near-tie fork classification, paired task-quality verdicts and transcript equality. It never loads a model, and its thresholds await root approval.
+
 ## [0.1.28] — 2026-10-29
 
 ### Fixed
