@@ -23,7 +23,8 @@ WORKLOAD_ID = "adr063-qwen-n4-parse-port-v1"
 MODULES = ("qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_verdict.py",
            "qwen38_n1_process.py", "test_qwen38_n1_verdict.py",
            "qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py",
-           "coding_family.py", "test_coding_family.py", "qwen_n4_peer.py", "test_qwen_n4_peer.py", "f2_semantic.py")
+           "coding_family.py", "test_coding_family.py", "qwen_n4_peer.py", "test_qwen_n4_peer.py",
+           "family_peer.py", "test_family_peer.py", "f2_semantic.py")
 INTERRUPTED = False
 
 
@@ -46,8 +47,8 @@ def validate_preflight(value, base, engine_kind="hf2q", family="qwen"):
     family_contract.validate_selection(family, engine_kind, 4)
     keys = family_contract.preflight(preflight(base), family)
     if engine_kind == "peer":
-        from qwen_n4_peer import preflight as peer_preflight
-        keys = peer_preflight(keys)
+        from family_peer import preflight as peer_preflight
+        keys = peer_preflight(keys, family)
     require(isinstance(value, dict) and set(value) == keys and
             all(v is True for v in value.values()), "four-slot actual pool selection/preflight")
 
@@ -233,8 +234,8 @@ def main():
         require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
         summary["engine_kind"] = args.engine_kind
         if args.engine_kind == "peer":
-            from qwen_n4_peer import readiness
-            summary["peer_readiness"] = readiness(args.base_url, args.model, output)
+            from family_peer import readiness
+            summary["peer_readiness"] = readiness(args.base_url, args.model, output, args.family)
         require(packet.get("sources") == sources, "N4 source freeze drift")
         require(packet.get("python_sha256") == child.digest(Path(sys.executable).resolve()), "Python binary")
         run, token = packet.get("run_id"), packet.get("barrier_token")

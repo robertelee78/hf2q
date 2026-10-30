@@ -150,8 +150,9 @@ class PeerThinkingParity(unittest.TestCase):
             hf = build_request('model', self.messages, self.schemas, 0, family)
             self.assertNotIn('reasoning_budget_tokens', hf)
             self.assertEqual(hf['hf2q_overflow_policy'], 'reject')
-            with self.assertRaises(Invalid):
-                build_request('model', self.messages, self.schemas, 0, family, 'peer')
+            peer = build_request('model', self.messages, self.schemas, 0, family, 'peer')
+            self.assertNotIn('reasoning_budget_tokens', peer)  # never the Qwen adaptive budget
+            self.assertNotIn('hf2q_overflow_policy', peer)
         with self.assertRaises(Invalid):
             build_request('model', self.messages, self.schemas, 0, 'qwen', 'unknown')
 

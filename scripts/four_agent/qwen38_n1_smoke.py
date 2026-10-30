@@ -63,8 +63,8 @@ def approval(args):
             packet.get("server_pid") == args.server_pid, "server identity drift")
     keys = family_contract.preflight(preflight(PREFLIGHT) if n4 else PREFLIGHT, args.family)
     if args.engine_kind == "peer":
-        from qwen_n4_peer import preflight as peer_preflight
-        keys = peer_preflight(keys)
+        from family_peer import preflight as peer_preflight
+        keys = peer_preflight(keys, args.family)
     require(set(packet.get("preflight", {})) == keys and
             all(v is True for v in packet["preflight"].values()), "preflight unknown")
     require(packet.get("sandbox_proof_sha256") == args.sandbox_proof_sha256,
@@ -80,7 +80,8 @@ def approval(args):
     if n4:
         source_paths += [Path(__file__).with_name(n) for n in
                          ("qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py",
-                          "qwen_n4_peer.py", "test_qwen_n4_peer.py")]
+                          "qwen_n4_peer.py", "test_qwen_n4_peer.py",
+                          "family_peer.py", "test_family_peer.py")]
     if getattr(args, "benchmark_profile", None) is not None:
         from gemma_matched_profile import EXTRA_MODULES, validate_activation
         validate_activation(args.benchmark_profile, packet, args.family, args.engine_kind, args.diagnostic_slots)
@@ -115,9 +116,8 @@ def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf
     family_contract.request_controls(request, family)
     require(engine_kind in ("hf2q", "peer"), "unknown request engine")
     if engine_kind == "peer":
-        require(family == "qwen", "only Qwen peer transport is supported")
-        from qwen_n4_peer import request_controls as peer_request_controls
-        request = peer_request_controls(request)
+        from family_peer import request_controls as peer_request_controls
+        request = peer_request_controls(request, family)
     if request["stream"]:
         request["stream_options"] = {"include_usage": True}
     return request
@@ -125,11 +125,10 @@ def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf
 
 def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen"):
     if engine_kind == "peer":
-        require(family == "qwen" and "hf2q_overflow_policy" not in request,
-                "peer request must use native transport metadata")
-        # Validate the unchanged canonical envelope through the HF-only field,
-        # then serialize the actual native-peer wire without that field.
-        wire({**request, "hf2q_overflow_policy": "reject"}, family)
+        from family_peer import canonical
+        # Validate the unchanged canonical envelope (native fields must be the
+        # adapter's exact values), then serialize the actual native-peer wire.
+        wire(canonical(request, family), family)
         raw_request = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
     else:
         raw_request = wire(request, family)

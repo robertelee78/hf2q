@@ -90,7 +90,8 @@ def validate_readiness(health, props, slots, model):
             'pool_profile': 'NotApplicable:HF-only', 'full_prefix_reuse': 'PendingPostOracle'}
 
 
-def readiness(base, model, output):
+def fetch_readiness(base, output):
+    """Raw /health, /props and /slots replies, archived before any validation."""
     u = urlsplit(base)
     require(u.scheme == 'http' and u.hostname == '127.0.0.1' and u.port and u.path == '/v1'
             and not u.query and not u.fragment and u.username is None, 'peer loopback base')
@@ -101,4 +102,8 @@ def readiness(base, model, output):
             (Path(output) / f'peer-{name}.raw').write_bytes(raw)
             require(response.status == 200 and len(raw) <= 1024 * 1024, 'peer readiness status/size')
         values.append(json.loads(raw))
-    return validate_readiness(*values, model)
+    return values
+
+
+def readiness(base, model, output):
+    return validate_readiness(*fetch_readiness(base, output), model)

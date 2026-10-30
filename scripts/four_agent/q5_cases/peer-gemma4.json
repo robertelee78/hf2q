@@ -1,0 +1,226 @@
+{
+  "schema": "hf2q.q5.calibration-case.v1",
+  "family": "gemma4",
+  "notes": [
+    "Peer arm (Q3/Q4) for the canonical four-agent coding workload; same model GGUF, 4 slots and 262144 tokens per slot (the Gemma 4 family default) as gemma4.json. Flags derive from the Qwen3.6 peer run peer-qwen36-e86-none-normal-n4-20261027T185853Z (server-launch-command.json); family settings are matched to hf2q in scripts/four_agent/family_peer.py.",
+    "PEER_BIN defaults to the e86f5fd1 build recorded in peer-e86-release-build-v1/receipt.json (llama-server sha256 4b604952...). The binary is a 50 KB launcher over sibling dylibs; that receipt binds them. Readiness requires /props build_info == PEER_BUILD_INFO.",
+    "Unified f16 KV over a 1048576-token pool capped at 262144 per slot; the five full-attention layers hold about 20 GiB f16 at that pool size, the sliding-window layers under 1 GiB.",
+    "Thinking off and preserve_thinking false, as hf2q renders Gemma 4 (no thinking channel, no template kwargs); the adapter also sends chat_template_kwargs.enable_thinking=false and parallel_tool_calls=false per request. Repetition penalty 1.05 matches the hf2q Gemma launcher default.",
+    "Text-only: the peer loads a projector only with --mmproj, so the GGUF is served directly (no text_only_locator); readiness requires modalities.vision == false.",
+    "Template: the reviewed GGUF-embedded Gemma 4 template (sha256 ae53464b...); the client refuses any other /props chat_template.",
+    "Run as a calibration (no --admission-receipt): the peer binary differs from the hf2q calibration of record."
+  ],
+  "workload": {
+    "id": "adr063-q5-peer-gemma4-n4-coding-ctx262144",
+    "slots": 4,
+    "context_per_slot": 262144,
+    "client": "scripts/four_agent/qwen_n4_live_smoke.py --family gemma4 --engine-kind peer"
+  },
+  "variables": {
+    "PEER_BIN": "/opt/hf2q-worktrees/adr063-peer-reference-e86f5fd1/build-adr063/bin/llama-server",
+    "PEER_BUILD_INFO": "b128-e86f5fd",
+    "CHAT_TEMPLATE": "/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023/rendered-inputs-reviewed/gemma4.template.jinja",
+    "MODEL": "{REPO}/models/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf",
+    "MODEL_SHA256": "",
+    "MODEL_ID": "Gemma 4 26B A4B It",
+    "PORT": "18245",
+    "CARGO": null,
+    "TOOLCHAIN": null,
+    "SANDBOX_PROOF": null,
+    "SANDBOX_PROOF_SHA256": null,
+    "CLIENT_APPROVAL_TEMPLATE": null
+  },
+  "binary": "{PEER_BIN}",
+  "artifact": {
+    "path": "{MODEL}",
+    "sha256": "{MODEL_SHA256}"
+  },
+  "port": "{PORT}",
+  "serve": {
+    "argv": [
+      "{PEER_BIN}",
+      "--model",
+      "{MODEL}",
+      "--alias",
+      "{MODEL_ID}",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "{PORT}",
+      "--parallel",
+      "4",
+      "--slots",
+      "--metrics",
+      "--ctx-size",
+      "1048576",
+      "--kv-unified",
+      "--kv-unified-per-slot",
+      "262144",
+      "--fit",
+      "off",
+      "--load-mode",
+      "none",
+      "--gpu-layers",
+      "999",
+      "--cont-batching",
+      "--no-context-shift",
+      "--flash-attn",
+      "on",
+      "--cache-type-k",
+      "f16",
+      "--cache-type-v",
+      "f16",
+      "--batch-size",
+      "2048",
+      "--ubatch-size",
+      "512",
+      "--jinja",
+      "--chat-template-file",
+      "{CHAT_TEMPLATE}",
+      "--reasoning",
+      "off",
+      "--no-reasoning-preserve",
+      "--reasoning-format",
+      "deepseek",
+      "--cache-prompt",
+      "--cache-reuse",
+      "0",
+      "--cache-ram",
+      "8192",
+      "--cache-idle-slots",
+      "--ctx-checkpoints",
+      "32",
+      "--checkpoint-min-step",
+      "8192",
+      "--predict",
+      "8192",
+      "--temp",
+      "0",
+      "--top-k",
+      "0",
+      "--top-p",
+      "1",
+      "--min-p",
+      "0",
+      "--repeat-penalty",
+      "1.05",
+      "--repeat-last-n",
+      "64",
+      "--spec-type",
+      "none"
+    ],
+    "env": {}
+  },
+  "readiness": {
+    "url": "http://127.0.0.1:{PORT}/health",
+    "field": "status",
+    "equals": "ok",
+    "timeout_seconds": 900,
+    "record": [
+      "http://127.0.0.1:{PORT}/health",
+      "http://127.0.0.1:{PORT}/props",
+      "http://127.0.0.1:{PORT}/slots"
+    ],
+    "checks": [
+      {
+        "url": "http://127.0.0.1:{PORT}/props",
+        "field": "model_alias",
+        "equals": "{MODEL_ID}"
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/props",
+        "field": "total_slots",
+        "equals": 4
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/props",
+        "field": "default_generation_settings.n_ctx",
+        "equals": 262144
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/props",
+        "field": "endpoint_slots",
+        "equals": true
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/props",
+        "field": "modalities.vision",
+        "equals": false
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/props",
+        "field": "build_info",
+        "equals": "{PEER_BUILD_INFO}"
+      }
+    ]
+  },
+  "client": {
+    "argv": [
+      "{PYTHON}",
+      "-E",
+      "-s",
+      "-B",
+      "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py",
+      "--base-url",
+      "http://127.0.0.1:{PORT}/v1",
+      "--model",
+      "{MODEL_ID}",
+      "--output",
+      "{OUT}/client",
+      "--cargo",
+      "{CARGO}",
+      "--toolchain",
+      "{TOOLCHAIN}",
+      "--sandbox-exec",
+      "/usr/bin/sandbox-exec",
+      "--sandbox-proof",
+      "{SANDBOX_PROOF}",
+      "--sandbox-proof-sha256",
+      "{SANDBOX_PROOF_SHA256}",
+      "--server-pid",
+      "{SERVER_PID}",
+      "--approval",
+      "{CLIENT_APPROVAL}",
+      "--approval-sha256",
+      "{CLIENT_APPROVAL_SHA256}",
+      "--family",
+      "gemma4",
+      "--engine-kind",
+      "peer"
+    ],
+    "env": {},
+    "approval": {
+      "template": "{CLIENT_APPROVAL_TEMPLATE}",
+      "set": {
+        "server_pid": "{SERVER_PID}",
+        "base_url": "http://127.0.0.1:{PORT}/v1",
+        "model": "{MODEL_ID}",
+        "run_id": "{RUN_ID}",
+        "barrier_token": "{NONCE32}",
+        "python_sha256": "{PYTHON_SHA256}",
+        "sources": {
+          "sha256_of": [
+            "{REPO}/scripts/four_agent/qwen38_n1_smoke.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_tools.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_verdict.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_process.py",
+            "{REPO}/scripts/four_agent/test_qwen38_n1_verdict.py",
+            "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py",
+            "{REPO}/scripts/four_agent/test_qwen_n4_live_smoke.py",
+            "{REPO}/scripts/four_agent/coding_family.py",
+            "{REPO}/scripts/four_agent/test_coding_family.py",
+            "{REPO}/scripts/four_agent/qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/test_qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/family_peer.py",
+            "{REPO}/scripts/four_agent/test_family_peer.py",
+            "{REPO}/scripts/four_agent/f2_semantic.py"
+          ]
+        }
+      }
+    },
+    "summary": "{OUT}/client/summary.json",
+    "success_status": "FourAgentProtocolCompleteAwaitingIndependentReview",
+    "timeout_seconds": 7200
+  },
+  "policy": {}
+}
