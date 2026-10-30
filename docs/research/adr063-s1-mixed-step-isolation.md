@@ -169,8 +169,8 @@ Production support, both behavior-preserving:
 Model-free (Metal device, no model):
 
 ```
-cargo test --release --lib mixed_step_tests
-cargo test --release --lib deepseek4::cache_tests::cooperative
+cargo test --release --bin hf2q mixed_step_tests
+cargo test --release --bin hf2q deepseek4::cache_tests::cooperative
 ```
 
 The first command runs the four model-free tests in
@@ -183,7 +183,7 @@ Hardware (official artifact; about 107 GB resident, so run it alone):
 
 ```
 HF2Q_DEEPSEEK4_GGUF=/Users/robert/.local/share/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf \
-  cargo test --release --lib \
+  cargo test --release --bin hf2q \
   official_artifact_mixed_step_isolates_cohort_from_decoders -- --ignored --nocapture --test-threads=1
 ```
 
@@ -212,6 +212,14 @@ successor below is a design only, not implemented by S1.
 Isolation is conditional on disjoint membership: the model-free overlap test
 shows that a lane in both the cohort and the decode set poisons an innocent
 decoder, so the successor must assert disjointness before submission.
+
+Scope of the hardware proof: a three-lane cohort (the production width at a
+148-token prefix) beside two decoders on the joint-decode route. The successor
+may admit two- and four-lane cohorts, or decoders on a non-joint decode route,
+only after the same oracle passes for that shape.
+
+The inference modules live in the binary target, so `--lib` filters match
+zero tests; every command above uses `--bin hf2q`.
 
 ### Successor if isolation holds (design only)
 

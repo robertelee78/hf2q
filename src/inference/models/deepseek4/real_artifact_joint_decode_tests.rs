@@ -1,7 +1,7 @@
 //! Official-artifact proof that joint decode is bit-identical to serial decode.
 //!
 //! Run on Apple Silicon with the converted checkpoint:
-//! `HF2Q_DEEPSEEK4_GGUF=/path/to/deepseek4.gguf cargo test --release --lib \
+//! `HF2Q_DEEPSEEK4_GGUF=/path/to/deepseek4.gguf cargo test --release --bin hf2q \
 //!   official_artifact_joint_decode_matches_serial_decode_bitwise -- --ignored --nocapture`
 
 use super::cache::Deepseek4Cache;

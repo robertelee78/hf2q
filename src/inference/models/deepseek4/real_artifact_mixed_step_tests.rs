@@ -11,7 +11,7 @@
 //! live logits. Every comparison is bitwise.
 //!
 //! Run on Apple Silicon with the converted checkpoint:
-//! `HF2Q_DEEPSEEK4_GGUF=/path/to/deepseek4.gguf cargo test --release --lib \
+//! `HF2Q_DEEPSEEK4_GGUF=/path/to/deepseek4.gguf cargo test --release --bin hf2q \
 //!   official_artifact_mixed_step_isolates_cohort_from_decoders -- --ignored --nocapture`
 
 use mlx_native::MlxBuffer;
