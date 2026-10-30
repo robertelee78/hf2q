@@ -9,20 +9,31 @@ use super::forward_support::{alloc_persistent, begin_decode_pool_token, end_deco
 use super::submission::{drain, retained_reference_pipeline_enabled, SubmissionChain};
 use super::Deepseek4Model;
 
+/// Publish one decode step on every cache only after all lanes prevalidate
+/// and the supervisor gate accepts; any rejection poisons every lane. Lanes
+/// may sit at different positions (joint decode) or the same one (B=4).
 pub(super) fn publish_verifier_cohort_after_gate(
-    caches: &mut [&mut Deepseek4Cache; 4],
-    positions: [usize; 4],
+    caches: &mut [&mut Deepseek4Cache],
+    positions: &[usize],
     commit_gate: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    let tickets = positions
-        .iter()
-        .zip(caches.iter())
-        .map(|(&position, cache)| {
-            cache
-                .validate_step_commit(position)
-                .context("prevalidate DeepSeek-V4 B=4 decode publication")
-        })
-        .collect::<Result<Vec<_>>>();
+    let tickets = if positions.len() == caches.len() {
+        positions
+            .iter()
+            .zip(caches.iter())
+            .map(|(&position, cache)| {
+                cache
+                    .validate_step_commit(position)
+                    .context("prevalidate DeepSeek-V4 multi-lane decode publication")
+            })
+            .collect::<Result<Vec<_>>>()
+    } else {
+        Err(anyhow::anyhow!(
+            "prevalidate DeepSeek-V4 multi-lane decode publication: {} positions for {} caches",
+            positions.len(),
+            caches.len()
+        ))
+    };
     let tickets = match tickets {
         Ok(tickets) => tickets,
         Err(error) => {
@@ -36,7 +47,8 @@ pub(super) fn publish_verifier_cohort_after_gate(
         for cache in caches.iter_mut() {
             cache.poison();
         }
-        return Err(error).context("DeepSeek-V4 B=4 decode rejected before cache publication");
+        return Err(error)
+            .context("DeepSeek-V4 multi-lane decode rejected before cache publication");
     }
     for (cache, ticket) in caches.iter_mut().zip(tickets) {
         cache.publish_step_end(ticket);
@@ -66,7 +78,7 @@ impl Deepseek4Model {
             retained_reference_pipeline_enabled(),
             "DeepSeek-V4 B=4 decode requires retained Metal command-buffer references"
         );
-        let positions = std::array::from_fn(|lane| caches[lane].position());
+        let positions: [usize; 4] = std::array::from_fn(|lane| caches[lane].position());
         anyhow::ensure!(
             positions.iter().all(|&position| position == positions[0]),
             "DeepSeek-V4 B=4 decode requires equal cache positions, got {positions:?}"
@@ -87,7 +99,7 @@ impl Deepseek4Model {
         end_decode_pool_token();
         match result {
             Ok(state) => {
-                publish_verifier_cohort_after_gate(caches, positions, commit_gate)?;
+                publish_verifier_cohort_after_gate(caches, &positions, commit_gate)?;
                 Ok(state)
             }
             Err(error) => {
@@ -135,14 +147,21 @@ impl Deepseek4Model {
             let encode_result = (|| -> Result<()> {
                 for start in (0..layers).step_by(LAYERS_PER_COMMAND_BUFFER) {
                     let end = (start + LAYERS_PER_COMMAND_BUFFER).min(layers);
-                    let mut session = executor.begin().map(crate::inference::native_observation::session).with_context(|| {
-                        format!("begin DeepSeek-V4 B=4 decode layers {start}..{end}")
-                    })?;
+                    let mut session = executor
+                        .begin()
+                        .map(crate::inference::native_observation::session)
+                        .with_context(|| {
+                            format!("begin DeepSeek-V4 B=4 decode layers {start}..{end}")
+                        })?;
                     for layer in start..end {
                         let mut next_states = Vec::with_capacity(4);
                         for lane in 0..4 {
-                            let _native_input = crate::inference::native_observation::sorted_decode_lane_input(
-                                lane,caches[lane].position(),1);
+                            let _native_input =
+                                crate::inference::native_observation::sorted_decode_lane_input(
+                                    lane,
+                                    caches[lane].position(),
+                                    1,
+                                );
                             let attention = if layer == 0 {
                                 anyhow::ensure!(
                                     lane_states[lane].is_none(),

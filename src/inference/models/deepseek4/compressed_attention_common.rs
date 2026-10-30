@@ -12,12 +12,12 @@ use mlx_native::ops::deepseek_tail_rope::{
 use mlx_native::ops::elementwise::dispatch_cast_bf16_to_f32_with_encoder;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
-use super::prefill_annotations;
 use super::attention_weights::AttentionWeightsRef;
 use super::forward_support::{
-    alloc, grouped_output_a, grouped_output_a_batched, raw_matmul, rms_params,
-    BatchedGroupedOutputArena,
+    alloc, grouped_output_a, grouped_output_a_batched, rms_params, BatchedGroupedOutputArena,
 };
+use super::prefill_annotations;
+use super::row_matmul::{row_matmul, RowMatmul};
 use super::Deepseek4Config;
 
 pub(super) struct CompressedAttentionCoreArena {
@@ -189,6 +189,7 @@ pub(super) fn encode_compressed_attention_prelude(
     weights: &AttentionWeightsRef<'_>,
     arena: &CompressedAttentionCoreArena,
     rows: usize,
+    matmul: RowMatmul,
 ) -> Result<()> {
     let hidden = cfg.hidden_size as usize;
     let hc = cfg.hyper_connection_count as usize;
@@ -208,7 +209,8 @@ pub(super) fn encode_compressed_attention_prelude(
         rows_u32,
         hc_hidden as u32,
     )?;
-    raw_matmul(
+    row_matmul(
+        matmul,
         session,
         registry,
         device,
@@ -258,7 +260,8 @@ pub(super) fn encode_compressed_attention_prelude(
         rows_u32,
         hidden as u32,
     )?;
-    raw_matmul(
+    row_matmul(
+        matmul,
         session,
         registry,
         device,
@@ -270,7 +273,8 @@ pub(super) fn encode_compressed_attention_prelude(
         hidden,
         "compressed query A",
     )?;
-    raw_matmul(
+    row_matmul(
+        matmul,
         session,
         registry,
         device,
@@ -293,7 +297,8 @@ pub(super) fn encode_compressed_attention_prelude(
         rows_u32,
         q_rank as u32,
     )?;
-    raw_matmul(
+    row_matmul(
+        matmul,
         session,
         registry,
         device,
@@ -342,6 +347,7 @@ pub(super) fn encode_compressed_attention_epilogue(
     positions: &MlxBuffer,
     frequencies: &MlxBuffer,
     rows: usize,
+    matmul: RowMatmul,
 ) -> Result<()> {
     let hidden = cfg.hidden_size as usize;
     let heads = cfg.num_attention_heads as usize;
@@ -421,7 +427,8 @@ pub(super) fn encode_compressed_attention_epilogue(
             head_dim,
         )?;
     }
-    raw_matmul(
+    row_matmul(
+        matmul,
         session,
         registry,
         device,
