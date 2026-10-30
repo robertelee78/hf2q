@@ -70,7 +70,7 @@ setup no longer writes them):
 |---|---|---|
 | `--default-repetition-penalty` | Qwen/Gemma 4 `1.05`, DeepSeek-V4 `1.0` | Server default only when the request omits `repetition_penalty`; explicit requests win. |
 | `--default-thinking-token-budget` | Qwen `2048`, others unset | Thinking ceiling when the request omits it; `0` disables the configured default. |
-| `--default-tool-thinking-token-budget` | Qwen/DeepSeek-V4 `512`, others unset | First tool-continuation/required-tool ceiling; `0` disables the continuation override. |
+| `--default-tool-thinking-token-budget` | Qwen/DeepSeek-V4 `512`, others unset | Tool-continuation/required-tool ceiling, the same at every tool-chain depth; `0` disables the continuation override. |
 
 CLI wins over the loaded family's built-in. The former `HF2Q_DEFAULT_*`
 readers and process bridge were removed because they were both poor UX and

@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - ADR-063 Q1 numeric policy (`docs/research/adr063-q1-numeric-policy.md`), approved by the operator on 2026-10-30, and the offline `scripts/four_agent/q1_decision_policy.py` checker. The checker reads retained Q1 trace stores, logprob responses, task outcomes and four-agent client runs. It reports bitwise equality, a logit decision envelope, near-tie fork classification, paired task-quality verdicts and transcript equality, and never loads a model.
+### Fixed
+
+- Keep the Qwen tool-continuation thinking ceiling (default 512) at every tool-chain depth. Halving it to a 256-token floor from the second tool result forced the reasoning close inside the first edit plan of an ordinary read/read/write coding workflow.
+- Preserve Qwen tool-call parameter whitespace in unary and streaming responses. Only the single newline the native template wraps around each `<parameter>` value is removed; a file's trailing newline and leading indentation now reach the client intact.
 
 ## [0.1.28] — 2026-10-29
 

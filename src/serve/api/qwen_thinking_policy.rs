@@ -15,13 +15,13 @@ use super::registry;
 use super::schema::{ChatMessage, ToolChoiceValue};
 
 const QWEN_TOOL_CONTINUATION_THINKING_CEILING: usize = 512;
-const QWEN_REPEATED_CAP_THINKING_FLOOR: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct QwenToolChainState {
     pub(super) is_tool_continuation: bool,
     /// Assistant turns that requested tools since the latest user turn.
     /// Parallel results belong to one cycle and do not deepen the chain.
+    /// Logged with the resolved policy; it does not change the ceiling.
     pub(super) tool_cycles_since_user: usize,
 }
 
@@ -51,6 +51,12 @@ pub(super) fn qwen_tool_chain_state(messages: &[ChatMessage]) -> QwenToolChainSt
     }
 }
 
+/// Server-default thinking ceiling for one Qwen request. A fresh user turn
+/// keeps the base default; every tool-result continuation uses the same
+/// continuation ceiling regardless of how many tool cycles precede it.
+/// Halving the ceiling per cycle forced the reasoning close in the middle of
+/// the first edit plan of an ordinary read/read/write workflow (ADR-063 Qwen3.6
+/// four-agent coding run), so chain depth no longer shrinks the budget.
 pub(super) fn adaptive_qwen_default_thinking_budget(
     base: Option<usize>,
     continuation_override: Option<Option<usize>>,
@@ -59,15 +65,9 @@ pub(super) fn adaptive_qwen_default_thinking_budget(
     if !chain.is_tool_continuation {
         return base;
     }
-    let configured = continuation_override.unwrap_or_else(|| {
+    continuation_override.unwrap_or_else(|| {
         base.map(|budget| budget.min(QWEN_TOOL_CONTINUATION_THINKING_CEILING))
-    })?;
-    let reductions = chain
-        .tool_cycles_since_user
-        .saturating_sub(1)
-        .min(usize::BITS as usize - 1);
-    let reduced = configured >> reductions;
-    Some(reduced.max(configured.min(QWEN_REPEATED_CAP_THINKING_FLOOR)))
+    })
 }
 
 fn qwen_default_thinking_budget_for_mode(
@@ -558,5 +558,58 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.param, "thinking_token_budget");
         assert!(error.message.contains("standalone close-token sequence"));
+    }
+
+    /// Captured failure: ADR-063 run
+    /// `qwen36-template-order-coding-operating90-n4-20261027T231028Z`,
+    /// agent-2 turn-2 `request.json` (sha256 f6d0535eaeee88f9…). Two
+    /// completed `read_file` cycles precede the `write_file` step. The server
+    /// resolved `tool_cycles_since_user=2 effective_thinking_budget=256`,
+    /// forced `I need to answer now.</think>` inside the edit plan
+    /// (`...Result<u16, String`), and the patch then failed E0282. Role and
+    /// tool-call structure are verbatim; long text fields are shortened
+    /// because the policy reads only message structure.
+    #[test]
+    fn adr063_write_step_after_two_reads_keeps_the_continuation_ceiling() {
+        let messages: Vec<ChatMessage> = serde_json::from_value(serde_json::json!([
+            {"role": "system", "content": "Independent coding agent agent-2, workload adr063-qwen-n4-parse-port-v1."},
+            {"role": "user", "content": "Fix parse_port to reject zero and values above 65535, accept valid u16 ports, and report the tests you ran."},
+            {"role": "assistant", "reasoning_content": "Let's start with step 1.\n", "tool_calls": [
+                {"id": "call_hf2q_18e285bc74fe04c8", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{\"path\":\"src/ports.rs\"}"}}]},
+            {"role": "tool", "tool_call_id": "call_hf2q_18e285bc74fe04c8", "name": "read_file",
+             "content": "pub fn parse_port(s: &str) -> u16 { s.parse().unwrap() }\n"},
+            {"role": "assistant", "content": "", "reasoning_content": "Let's read the tests to understand what behavior is expected.\n", "tool_calls": [
+                {"id": "call_hf2q_18e285bd7d50a8f0", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{\"path\":\"tests/ports.rs\"}"}}]},
+            {"role": "tool", "tool_call_id": "call_hf2q_18e285bd7d50a8f0", "name": "read_file",
+             "content": "use qwen38_n1_fixture::ports::parse_port;\n"}
+        ]))
+        .expect("captured request messages");
+        let chain = qwen_tool_chain_state(&messages);
+        assert_eq!(
+            chain,
+            QwenToolChainState {
+                is_tool_continuation: true,
+                tool_cycles_since_user: 2,
+            }
+        );
+        let registration = registry::find_for("qwen3.6").expect("Qwen registration");
+        // `serve_qwen36_opencode.sh` defaults and the request's
+        // `max_completion_tokens`, with no client budget and automatic tools.
+        let resolved = resolve_qwen_thinking_policy(
+            Some(&registration),
+            true,
+            &ToolChoiceValue::Auto,
+            None,
+            "thinking_token_budget",
+            8192,
+            chain,
+            QwenThinkingDefaults::from_config(Some(2048), Some(512)),
+            true,
+            qwen_test_encode,
+        )
+        .unwrap();
+        assert_eq!(resolved.effective_budget, Some(512));
     }
 }

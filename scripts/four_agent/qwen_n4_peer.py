@@ -22,8 +22,9 @@ def request_controls(request):
     """Translate only canonical HF Qwen defaults into native peer metadata.
 
     Mirrors qwen_thinking_policy::{qwen_tool_chain_state,
-    adaptive_qwen_default_thinking_budget}: last user resets cycles; system
-    messages do not change whether the latest conversation role is tool.
+    adaptive_qwen_default_thinking_budget}: a fresh user turn gets 2048 and
+    every tool-result continuation gets 512; system messages do not change
+    whether the latest conversation role is tool.
     """
     overrides = {'reasoning_budget_tokens', 'thinking_budget_tokens',
                  'thinking_token_budget', 'tool_thinking_token_budget',
@@ -42,13 +43,9 @@ def request_controls(request):
             calls = message.get('tool_calls')
             require(calls is None or isinstance(calls, list), 'invalid assistant tool-call cycles')
     latest = next((m for m in reversed(messages) if m['role'] != 'system'), None)
-    start = next((i + 1 for i in range(len(messages) - 1, -1, -1)
-                  if messages[i]['role'] == 'user'), 0)
-    cycles = sum(m['role'] == 'assistant' and bool(m.get('tool_calls'))
-                 for m in messages[start:])
     budget = 2048
     if latest is not None and latest['role'] == 'tool':
-        budget = max(256, 512 >> min(max(cycles - 1, 0), 63))
+        budget = 512
     translated = dict(request)
     del translated['hf2q_overflow_policy']
     translated['reasoning_budget_tokens'] = budget
