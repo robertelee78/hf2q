@@ -1,6 +1,6 @@
 # ADR-063 Q1: numerical-invariance policy and per-family closure plan
 
-Status: proposal for root approval, 2026-10-30. Story: Q1 ([#367](https://github.com/robertelee78/hf2q/issues/367)).
+Status: approved by the operator (Robert E. Lee) on 2026-10-30, as proposed: thresholds frozen as `hf2q.q1.numeric-policy.v1`. Story: Q1 ([#367](https://github.com/robertelee78/hf2q/issues/367)).
 It resolves the `ExplicitInconclusiveNumericPolicy` gap left by the
 [Q1 execution plan](adr063-q1-execution-plan.md) ("Numerical policies"). The
 operator's per-family closure rule (ADR-063, "Per-family closure and release
