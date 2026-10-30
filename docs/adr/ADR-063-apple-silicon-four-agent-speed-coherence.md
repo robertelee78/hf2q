@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope, F1/F3 execution entry and the separately reviewed F2/Q1/Q2/C1 source implementation entry; other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-10-27 — separately reviewed F2/Q1/Q2/C1 designs may be implemented in parallel while Q5 continues; original hardware qualification, acceptance and delivery predecessors remain. The dedicated-host resource policy and all-four speed/quality requirements remain unchanged.
+- **Updated:** 2026-10-30 — Q5 memory admission is measured-envelope, not worst-case charged; only a projected or observed out-of-memory condition blocks work, and DeepSeek-V4 S3 hardware runs may proceed under the supervised normal-run guard. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
 - Stable source ID: ADR-063
@@ -565,6 +565,52 @@ After separate design review, the operator explicitly authorized implementing so
 Each attempt has a separate topic worktree and writer. Shared-file integration and all heavy builds, tests and model/helper execution are scheduled by one integration owner. Only one hf2q instance may run at a time, including test/metadata helpers, and a peer model must be unloaded before loading hf2q or vice versa. Source implementation is not permission to activate an unqualified runtime candidate or expand retained-state memory without the applicable Q5, harness and correctness gates. A native API change must be independently validated, published and exactly pinned before its hf2q consumer is reproducibly delivered.
 
 The approved source designs are [F2](../research/adr063-f2-execution-plan.md), [Q1](../research/adr063-q1-execution-plan.md), [Q2](../research/adr063-q2-execution-plan.md) and [C1](../research/adr063-c1-execution-plan.md). Approval and parallel source authorship establish no quality, memory-admission, performance or task-completion result. Candidate authors and independent QE remain distinct. The existing four-family win requirement and all failed-path, confidence and release gates remain unchanged.
+
+### Measured-envelope memory admission (operator update, 2026-10-30)
+
+The operator stated that the entire host is dedicated to this program, that
+no other agent or workload competes for memory, and that work must not be
+blocked unless it would actually exhaust memory. This decision supersedes the
+conflicting parts of Q5's acceptance text. The fixed positive cells
+(competitor growth, tools, separate reaction, file-cache and retired-pool
+residuals) and the requirement that a worst-case charged ledger fit a
+Free+file working estimate before loading no longer gate admission.
+
+Evidence for the change. The reviewed worst-case operating case for the
+DeepSeek-V4 Flash q2 artifact (107.4 GB) charged 149,367,089,308 B against
+137,438,953,472 B of physical memory. The guarded attempt with the
+provenance-bound source `538e9ef3` binary therefore refused before Device on
+2026-10-30, and no host state could admit it. The same artifact had already run
+the four-agent C262144 coding workload six times on 2026-10-29. Every sample
+of every run reported normal memory pressure, swap use stayed flat at 0.020 GB,
+and Free plus cached memory never fell below 5.11 GB
+(`ds-current-port-balanced-series-analysis-v2/metrics.json`). The worst-case
+ledger thus refused a configuration that had repeatedly operated with measured
+headroom.
+
+Admission and stops now work as follows:
+
+- **Admission.** A configuration is admitted from a calibrated run of the
+  same artifact, source, workload and slot count. That run must hold normal
+  pressure throughout, show no swap growth and leave positive Free plus
+  cached memory. The calibrated hf2q peak plus the host baseline measured at
+  admission must fit physical memory with a margin tied to measured stop
+  latency. The run is recalibrated when the artifact, source, context or slot
+  count changes.
+- **Live stops.** A run stops on any of: pressure leaving normal, swap
+  growth, Free plus cached memory below 2 GiB, or process growth beyond the
+  calibrated peak. One hf2q or peer runtime runs at a time.
+- **Allowances.** No allowance is reserved for other agents. Idle user
+  applications may be quit when a measurement needs the headroom; system
+  services are kept.
+- **Unchanged.** Matched context, task and output budgets may still not be
+  reduced to make a configuration fit. Any reduction must be an explicit
+  operator decision.
+
+DeepSeek-V4 batched-decode (S3) source and hardware work may proceed under
+this guard. Approval of the guard establishes no speed win or task
+completion. The source-candidate worst-case constructor at `538e9ef3`
+(draft #453) remains available as a diagnostic, not as the admission gate.
 
 ## Consequences
 
