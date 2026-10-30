@@ -13,9 +13,12 @@
 //!   `m = 1` to tiled kernels at `m > 1`, so it runs per row.
 //! - [`JointRouteMode::PaddedMvExt`]: the Qwen3.8 production policy
 //!   (`HF2Q_DECODE_MV_EXT=1`) routes K-quants through the non-exact
-//!   `mul_mv_ext` kernel at widths 4..=8. Rows are padded to a fixed width so
-//!   a row's arithmetic never depends on how many tenants share the step;
-//!   the gate is decision parity (ADR-044 precedent), not bitwise equality.
+//!   `mul_mv_ext` kernel at widths 4..=8. Every step is padded to exactly
+//!   [`PADDED_MV_EXT_WIDTH`] rows (joint width is capped there), so a row's
+//!   packed width never depends on how many tenants share the step; the
+//!   cohort-invariance gate checks the resulting bytes per row. Against
+//!   stock serial decode this is a Q1 Class B route (decision envelope,
+//!   `docs/research/adr063-q1-numeric-policy.md` §3.2), not bitwise.
 //!   Only dense-FFN artifacts are admitted in this mode.
 //!
 //! Any other block storage type is refused, so an unproven artifact keeps the
@@ -28,16 +31,16 @@ use mlx_native::DType;
 /// routes. Serving caps the default lower (see the scheduler's row cap).
 pub(crate) const MAX_JOINT_DECODE_ROWS: usize = 8;
 
-/// Fixed padded width for the decision-parity mode at the default cap.
-const PADDED_MV_EXT_WIDTH: usize = 4;
+/// The only packed width of the `mul_mv_ext` mode, and its row cap.
+pub(crate) const PADDED_MV_EXT_WIDTH: usize = 4;
 
 /// How a joint step's packed products are allowed to differ from serial.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JointRouteMode {
     /// Bitwise equal to serial decode per row.
     Exact,
-    /// Packed products use `mul_mv_ext` at a fixed padded width; gated by
-    /// decision parity against independent sequential forwards.
+    /// Packed products use `mul_mv_ext` at the fixed padded width; a Q1
+    /// Class B route against serial decode.
     PaddedMvExt,
 }
 
@@ -84,7 +87,7 @@ pub(crate) fn select_joint_route_mode(
         (true, false) => Ok(JointRouteMode::PaddedMvExt),
         (true, true) => Err(
             "HF2Q_DECODE_MV_EXT=1 routes packed MoE rows through non-exact mul_mv_ext \
-             and no decision-parity gate covers MoE artifacts"
+             and no Q1 gate covers MoE artifacts on that route"
                 .into(),
         ),
     }
@@ -104,13 +107,20 @@ pub(crate) fn check_mode_environment(
 }
 
 /// Packed width for `rows` real rows. Exact steps pack only real rows; the
-/// decision-parity mode pads to 4 (or 8 above four rows) so a row's
-/// `mul_mv_ext` width never depends on its tenants.
+/// `mul_mv_ext` mode always packs [`PADDED_MV_EXT_WIDTH`] rows (callers cap
+/// its rows there; see [`joint_mode_max_rows`]).
 pub(crate) fn joint_padded_width(mode: JointRouteMode, rows: usize) -> usize {
     match mode {
         JointRouteMode::Exact => rows,
-        JointRouteMode::PaddedMvExt if rows <= PADDED_MV_EXT_WIDTH => PADDED_MV_EXT_WIDTH,
-        JointRouteMode::PaddedMvExt => MAX_JOINT_DECODE_ROWS,
+        JointRouteMode::PaddedMvExt => PADDED_MV_EXT_WIDTH,
+    }
+}
+
+/// Joint row cap for `mode` given the operator's requested cap.
+pub(crate) fn joint_mode_max_rows(mode: JointRouteMode, requested: usize) -> usize {
+    match mode {
+        JointRouteMode::Exact => requested,
+        JointRouteMode::PaddedMvExt => requested.min(PADDED_MV_EXT_WIDTH),
     }
 }
 
@@ -205,12 +215,19 @@ mod tests {
 
     #[test]
     fn padded_width_never_depends_on_tenant_count() {
-        for rows in 1..=4 {
+        for rows in 1..=PADDED_MV_EXT_WIDTH {
             assert_eq!(joint_padded_width(JointRouteMode::PaddedMvExt, rows), 4);
             assert_eq!(joint_padded_width(JointRouteMode::Exact, rows), rows);
         }
-        for rows in 5..=MAX_JOINT_DECODE_ROWS {
-            assert_eq!(joint_padded_width(JointRouteMode::PaddedMvExt, rows), 8);
+        // An operator cap above four never widens a padded step.
+        for requested in 2..=MAX_JOINT_DECODE_ROWS {
+            let cap = joint_mode_max_rows(JointRouteMode::PaddedMvExt, requested);
+            assert_eq!(cap, requested.min(4));
+            assert_eq!(joint_padded_width(JointRouteMode::PaddedMvExt, cap), 4);
+            assert_eq!(
+                joint_mode_max_rows(JointRouteMode::Exact, requested),
+                requested
+            );
         }
     }
 

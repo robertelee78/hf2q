@@ -19,6 +19,10 @@
 //!   cargo test --release --lib \
 //!   qwen38_joint_decode_padded_mv_ext_keeps_decision_parity -- --ignored --exact
 //! ```
+//!
+//! The padded test is a Q1 diagnostic (synthetic prompts, top-1 only). Cohort
+//! invariance and the real-prompt Q1 Class B trace live in
+//! `real_artifact_joint_decode_invariance_tests`.
 
 use mlx_native::{DType, MlxBuffer};
 
@@ -29,11 +33,11 @@ use super::spec_decode::positions_for_range;
 use super::{Qwen35JointOutput, Qwen35JointRow};
 use crate::serve::multi_seq_kv::SlotId;
 
-const SLOTS: u32 = 4;
+pub(super) const SLOTS: u32 = 4;
 const CAPACITY: u32 = 160;
 const BASE: [u32; 5] = [9707, 374, 279, 15, 1_782];
 
-fn load(env: &str) -> Qwen35Model {
+pub(super) fn load(env: &str) -> Qwen35Model {
     use crate::serve::header::LoadProgress;
     use mlx_native::gguf::GgufFile;
 
@@ -59,14 +63,14 @@ fn new_cache(model: &Qwen35Model) -> HybridKvCache {
 }
 
 /// Ragged prompt for `slot` (≥ 16 tokens: the TQ prefill floor).
-fn prompt(slot: u32, generation: u32) -> Vec<u32> {
+pub(super) fn prompt(slot: u32, generation: u32) -> Vec<u32> {
     let len = 17 + 5 * slot as usize + 3 * generation as usize;
     (0..len)
         .map(|index| BASE[(index + slot as usize + generation as usize) % BASE.len()])
         .collect()
 }
 
-fn argmax(logits: &[f32]) -> u32 {
+pub(super) fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0;
     for (index, &value) in logits.iter().enumerate() {
         if value > logits[best] {
@@ -76,11 +80,11 @@ fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
-fn bits(values: &[f32]) -> Vec<u32> {
+pub(super) fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
 }
 
-fn buffer_bytes(buffer: &MlxBuffer) -> Vec<u8> {
+pub(super) fn buffer_bytes(buffer: &MlxBuffer) -> Vec<u8> {
     match buffer.dtype() {
         DType::U8 => buffer
             .as_slice::<u8>()
@@ -96,7 +100,7 @@ fn buffer_bytes(buffer: &MlxBuffer) -> Vec<u8> {
     }
 }
 
-fn hidden_bits(buffer: &MlxBuffer, hidden: usize) -> Vec<u32> {
+pub(super) fn hidden_bits(buffer: &MlxBuffer, hidden: usize) -> Vec<u32> {
     bits(&buffer.as_slice::<f32>().expect("read hidden")[..hidden])
 }
 
@@ -368,11 +372,15 @@ fn qwen38_joint_decode_mvn_matches_serial_decode_bitwise() {
     run_bitwise_gate("HF2Q_QWEN38_GGUF");
 }
 
-/// Decision-parity gate for the Qwen3.8 production route: joint rows use
-/// `mul_mv_ext` at the fixed padded width. Teacher-forced decisions must
-/// equal independent sequential forwards at every step, cursors and
-/// parities must match, and after the schedule every slot must keep making
-/// the same serial decisions for `FOLLOW_ON` further tokens.
+/// Decision diagnostic for the Qwen3.8 production route: joint rows use
+/// `mul_mv_ext` at the fixed padded width 4. On these synthetic prompts,
+/// teacher-forced top-1 decisions must equal independent sequential
+/// forwards at every step, cursors and parities must match, and every slot
+/// must keep making the same serial decisions for `FOLLOW_ON` further
+/// tokens. Under Q1 this is diagnostic only (synthetic inputs, top-1); the
+/// Class B verdict comes from `q1_decision_policy.py envelope` over the
+/// real-prompt trace written by
+/// `qwen38_joint_decode_q1_envelope_trace` (see the design note).
 #[test]
 #[ignore = "requires HF2Q_QWEN38_GGUF, HF2Q_DECODE_MVN=0, HF2Q_DECODE_MV_EXT=1 and Apple Metal"]
 fn qwen38_joint_decode_padded_mv_ext_keeps_decision_parity() {
@@ -380,19 +388,19 @@ fn qwen38_joint_decode_padded_mv_ext_keeps_decision_parity() {
     assert_eq!(
         std::env::var("HF2Q_DECODE_MVN").as_deref(),
         Ok("0"),
-        "decision-parity arm requires externally-set HF2Q_DECODE_MVN=0"
+        "padded decision diagnostic requires externally-set HF2Q_DECODE_MVN=0"
     );
     assert_eq!(
         std::env::var("HF2Q_DECODE_MV_EXT").as_deref(),
         Ok("1"),
-        "decision-parity arm requires externally-set HF2Q_DECODE_MV_EXT=1"
+        "padded decision diagnostic requires externally-set HF2Q_DECODE_MV_EXT=1"
     );
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let model = load("HF2Q_QWEN38_GGUF");
     assert_eq!(
         model.joint_decode_mode(),
         Ok(JointRouteMode::PaddedMvExt),
-        "Qwen3.8 under the production policy must select the padded decision-parity mode"
+        "Qwen3.8 under the production policy must select the padded mul_mv_ext mode"
     );
     let mut serial = new_cache(&model);
     let mut joint = new_cache(&model);

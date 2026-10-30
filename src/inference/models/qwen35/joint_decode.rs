@@ -44,8 +44,8 @@ use crate::inference::models::qwen35::joint_decode_core::{
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
     check_mode_environment, dense_ffn_route, joint_decode_env_unavailable_reason,
-    joint_padded_width, projection_route, select_joint_route_mode, JointProductRoute,
-    JointRouteMode, JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
+    joint_mode_max_rows, joint_padded_width, projection_route, select_joint_route_mode,
+    JointProductRoute, JointRouteMode, JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
 };
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::model::Qwen35Model;
@@ -204,9 +204,11 @@ impl Qwen35Model {
         kv_cache: &mut HybridKvCache,
         mode: JointRouteMode,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
+        let max_rows = joint_mode_max_rows(mode, MAX_JOINT_DECODE_ROWS);
         ensure!(
-            (1..=MAX_JOINT_DECODE_ROWS).contains(&rows.len()),
-            "Qwen joint decode requires 1..={MAX_JOINT_DECODE_ROWS} rows, got {}",
+            (1..=max_rows).contains(&rows.len()),
+            "Qwen {} joint decode requires 1..={max_rows} rows, got {}",
+            mode.label(),
             rows.len()
         );
         for (index, row) in rows.iter().enumerate() {

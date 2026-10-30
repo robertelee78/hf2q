@@ -13,8 +13,8 @@
 use std::sync::Once;
 
 use crate::inference::models::qwen35::joint_decode_routes::{
-    check_mode_environment, joint_decode_env_unavailable_reason, JointRouteMode,
-    JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
+    check_mode_environment, joint_decode_env_unavailable_reason, joint_mode_max_rows,
+    JointRouteMode, JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::serve::api::engine_qwen35::{Qwen35JointLane, Qwen35TickOutcome};
@@ -28,13 +28,27 @@ use super::{
 };
 
 /// Kill switch for A/B measurement: `1`/`on`/`true` selects joint decode,
-/// `0`/`off`/`false` keeps the serial per-slot turn.
+/// `0`/`off`/`false` keeps the serial per-slot turn. Unset selects the
+/// per-family default ([`default_joint_decode`]).
 const QWEN_JOINT_DECODE_ENV: &str = "HF2Q_QWEN_JOINT_DECODE";
-/// On by default for every admitted artifact: the exact mode is gated by the
-/// bitwise official-artifact tests and the padded `mul_mv_ext` mode by the
-/// Qwen3.8 decision-parity test (`real_artifact_joint_decode_tests`).
-const QWEN_JOINT_DECODE_DEFAULT: bool = true;
-/// Widest joint step selected by default; 5..=8 only when raised explicitly.
+
+/// Per-family default when the switch is unset. Dense artifacts (Qwen3.8)
+/// are on: the official-artifact gates passed and the four-agent ABBA A/B
+/// cut median makespan 116.4 → 90.1 s with 8/8 `CalibrationPass`. MoE
+/// artifacts (Qwen3.6) are off: their forward is bitwise exact, but joint
+/// rows commit M1 tokens where stock commits K3 verify tokens, and the
+/// incomplete A/B (2 runs per arm) failed the coding protocol on both joint
+/// runs. They need `HF2Q_QWEN_JOINT_DECODE=1` until a complete ABBA shows
+/// protocol parity.
+fn default_joint_decode(moe: bool) -> bool {
+    !moe
+}
+
+const MOE_DEFAULT_OFF_REASON: &str = "MoE artifacts default off pending a complete Qwen3.6 \
+     four-agent A/B; set HF2Q_QWEN_JOINT_DECODE=1 to opt in";
+/// Widest joint step selected by default. Exact mode accepts 5..=8 when
+/// raised explicitly (no serving measurement); the padded `mul_mv_ext` mode
+/// caps at 4 so its packed width stays fixed.
 const QWEN_JOINT_DECODE_MAX_ROWS_ENV: &str = "HF2Q_QWEN_JOINT_DECODE_MAX_ROWS";
 const DEFAULT_QWEN_JOINT_DECODE_ROWS: usize = 4;
 
@@ -45,13 +59,14 @@ pub(super) struct Qwen35JointDecodeConfig {
     pub mode: JointRouteMode,
 }
 
-fn parse_qwen_joint_decode(raw: Option<&str>) -> Result<bool, String> {
+/// `Ok(None)` when unset, so the caller applies the per-family default.
+fn parse_qwen_joint_decode(raw: Option<&str>) -> Result<Option<bool>, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok(QWEN_JOINT_DECODE_DEFAULT);
+        return Ok(None);
     };
     match raw.to_ascii_lowercase().as_str() {
-        "1" | "on" | "true" => Ok(true),
-        "0" | "off" | "false" => Ok(false),
+        "1" | "on" | "true" => Ok(Some(true)),
+        "0" | "off" | "false" => Ok(Some(false)),
         _ => Err(format!(
             "{QWEN_JOINT_DECODE_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
         )),
@@ -78,7 +93,10 @@ fn select_qwen_joint_decode(
     mode: Result<JointRouteMode, String>,
 ) -> Option<Qwen35JointDecodeConfig> {
     match (requested, mode) {
-        (true, Ok(mode)) => Some(Qwen35JointDecodeConfig { max_rows, mode }),
+        (true, Ok(mode)) => Some(Qwen35JointDecodeConfig {
+            max_rows: joint_mode_max_rows(mode, max_rows),
+            mode,
+        }),
         _ => None,
     }
 }
@@ -86,15 +104,18 @@ fn select_qwen_joint_decode(
 /// Resolve joint decode once when the Qwen worker starts and log the
 /// decision, including why an artifact or configuration keeps serial decode.
 pub(super) fn qwen35_joint_decode_config(model: &Qwen35Model) -> Option<Qwen35JointDecodeConfig> {
+    let moe = model.cfg.moe.is_some();
+    let default = default_joint_decode(moe);
     let raw = std::env::var(QWEN_JOINT_DECODE_ENV).ok();
-    let requested = parse_qwen_joint_decode(raw.as_deref()).unwrap_or_else(|error| {
+    let explicit = parse_qwen_joint_decode(raw.as_deref()).unwrap_or_else(|error| {
         tracing::warn!(
             error,
-            fallback = QWEN_JOINT_DECODE_DEFAULT,
+            fallback = default,
             "invalid Qwen joint decode switch"
         );
-        QWEN_JOINT_DECODE_DEFAULT
+        None
     });
+    let requested = explicit.unwrap_or(default);
     let raw_rows = std::env::var(QWEN_JOINT_DECODE_MAX_ROWS_ENV).ok();
     let max_rows = parse_qwen_joint_decode_max_rows(raw_rows.as_deref()).unwrap_or_else(|error| {
         tracing::warn!(
@@ -104,17 +125,19 @@ pub(super) fn qwen35_joint_decode_config(model: &Qwen35Model) -> Option<Qwen35Jo
         );
         DEFAULT_QWEN_JOINT_DECODE_ROWS
     });
-    let mode = if requested {
-        model.joint_decode_mode()
-    } else {
-        Err("disabled by HF2Q_QWEN_JOINT_DECODE".into())
+    let mode = match (requested, explicit) {
+        (true, _) => model.joint_decode_mode(),
+        (false, None) => Err(MOE_DEFAULT_OFF_REASON.into()),
+        (false, Some(_)) => Err("disabled by HF2Q_QWEN_JOINT_DECODE".into()),
     };
     let unavailable = mode.as_ref().err().cloned();
     let selected = select_qwen_joint_decode(requested, max_rows, mode);
     tracing::info!(
         target: "hf2q::serve::api::engine_qwen35::progress",
         requested,
-        max_rows,
+        explicit = explicit.is_some(),
+        moe,
+        max_rows = selected.map_or(max_rows, |config| config.max_rows),
         selected = selected.is_some(),
         mode = selected.map_or("serial", |config| config.mode.label()),
         unavailable = unavailable.as_deref().unwrap_or("none"),
@@ -123,9 +146,10 @@ pub(super) fn qwen35_joint_decode_config(model: &Qwen35Model) -> Option<Qwen35Jo
     selected
 }
 
-/// Re-check the process routing policy each turn: routing variables can
+/// Re-check the process routing policy every turn: routing variables can
 /// change after worker start; a turn that no longer satisfies the worker's
-/// mode runs serially instead of failing its requests.
+/// mode runs serially (logged once), and a later turn that satisfies it again
+/// runs jointly.
 pub(super) fn qwen35_joint_decode_turn_config(
     worker: Option<Qwen35JointDecodeConfig>,
 ) -> Option<Qwen35JointDecodeConfig> {
@@ -234,6 +258,11 @@ pub(super) fn run_qwen35_joint_decode(
 ) -> Qwen35JointRun {
     let Some((joint, serial)) = ({
         let kv = guard.kv.as_ref().expect("kv Some during loop");
+        // An active DeltaNet capture would make the joint transaction refuse
+        // after lanes were prepared; keep such a turn serial up front.
+        if kv.la_capture_active() {
+            return Qwen35JointRun::NotEligible;
+        }
         partition_qwen35_joint_lanes(handles, config.max_rows, |handle| {
             slots
                 .get(handle.slot_id.0 as usize)
@@ -400,18 +429,17 @@ mod tests {
     }
 
     #[test]
-    fn joint_decode_switch_defaults_on_and_parses_explicit_arms() {
-        assert_eq!(parse_qwen_joint_decode(None), Ok(QWEN_JOINT_DECODE_DEFAULT));
-        assert_eq!(
-            parse_qwen_joint_decode(Some("  ")),
-            Ok(QWEN_JOINT_DECODE_DEFAULT)
-        );
-        assert!(QWEN_JOINT_DECODE_DEFAULT);
+    fn joint_decode_switch_defaults_per_family_and_parses_explicit_arms() {
+        assert_eq!(parse_qwen_joint_decode(None), Ok(None));
+        assert_eq!(parse_qwen_joint_decode(Some("  ")), Ok(None));
+        // Dense (Qwen3.8) on, MoE (Qwen3.6) off unless explicitly enabled.
+        assert!(default_joint_decode(false));
+        assert!(!default_joint_decode(true));
         for raw in ["1", "on", "TRUE"] {
-            assert_eq!(parse_qwen_joint_decode(Some(raw)), Ok(true));
+            assert_eq!(parse_qwen_joint_decode(Some(raw)), Ok(Some(true)));
         }
         for raw in ["0", "Off", "false"] {
-            assert_eq!(parse_qwen_joint_decode(Some(raw)), Ok(false));
+            assert_eq!(parse_qwen_joint_decode(Some(raw)), Ok(Some(false)));
         }
         assert!(parse_qwen_joint_decode(Some("joint")).is_err());
     }
@@ -452,6 +480,18 @@ mod tests {
             select_qwen_joint_decode(false, 4, Ok(JointRouteMode::PaddedMvExt)),
             None
         );
+    }
+
+    #[test]
+    fn padded_mode_caps_joint_width_at_four() {
+        for requested in 2..=MAX_JOINT_DECODE_ROWS {
+            let padded = select_qwen_joint_decode(true, requested, Ok(JointRouteMode::PaddedMvExt))
+                .expect("admitted padded mode");
+            assert_eq!(padded.max_rows, requested.min(4));
+            let exact = select_qwen_joint_decode(true, requested, Ok(JointRouteMode::Exact))
+                .expect("admitted exact mode");
+            assert_eq!(exact.max_rows, requested);
+        }
     }
 
     #[test]

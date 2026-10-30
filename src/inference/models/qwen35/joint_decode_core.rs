@@ -17,7 +17,7 @@
 //! rows: their per-row arithmetic does not depend on the row count. The
 //! serial bodies are unchanged; this module repeats their dispatch order.
 //!
-//! Packed rows beyond the real rows (decision-parity padding) carry copies
+//! Packed rows beyond the real rows (`mul_mv_ext` width-4 padding) carry copies
 //! of row 0's core outputs so every packed kernel reads finite data; their
 //! results are discarded and they never touch a cache.
 
