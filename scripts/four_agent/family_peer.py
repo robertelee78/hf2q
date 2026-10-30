@@ -150,6 +150,21 @@ def _close(value, expected):
         value, expected, rel_tol=0, abs_tol=1e-6)
 
 
+def served_template_matches(served, family):
+    """/props reports the peer lexer's source, not the file bytes (chat.cpp:1344).
+
+    The lexer turns CR/CRLF into LF and strips one trailing newline
+    (common/jinja/lexer.cpp:44-60 at e86f5fd1), as Jinja's default
+    keep_trailing_newline=false does when rendering. Both pinned templates are
+    CR-free and end in exactly one newline, so the served source must be the
+    pinned bytes or the pinned bytes minus that newline; nothing else matches.
+    """
+    if not isinstance(served, str) or '\r' in served:
+        return False
+    pin = TEMPLATE_SHA256[family]
+    return any(hashlib.sha256(text.encode()).hexdigest() == pin for text in (served, served + '\n'))
+
+
 def validate_readiness(health, props, slots, model, family):
     if family == 'qwen':
         return qwen_n4_peer.validate_readiness(health, props, slots, model)
@@ -159,8 +174,7 @@ def validate_readiness(health, props, slots, model, family):
     commit = build.split('-', 1)[1] if isinstance(build, str) and '-' in build else ''
     require(len(commit) >= 7 and PEER_COMMIT.startswith(commit), 'peer build is not the inspected source')
     template = props.get('chat_template')
-    require(isinstance(template, str) and hashlib.sha256(template.encode()).hexdigest()
-            == TEMPLATE_SHA256[family], f'{family} peer template is not the hf2q family template')
+    require(served_template_matches(template, family), f'{family} peer template is not the hf2q family template')
     modalities = props.get('modalities')
     require(isinstance(modalities, dict) and modalities.get('vision') is False,
             'peer must serve the text-only workload without a projector')

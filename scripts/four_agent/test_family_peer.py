@@ -16,7 +16,7 @@ MODEL = {'deepseek4': 'DeepSeek V4 Flash 0731', 'gemma4': 'Gemma 4 26B A4B It'}
 
 TEMPLATE = {'deepseek4': (Path(__file__).resolve().parents[2] / 'src' / 'core' / 'chat_templates'
                           / 'deepseek-v4-flash-0731.jinja').read_bytes().decode('utf-8'),
-            'gemma4': "{{ '<|tool_call>call:' }} gemma4 stand-in"}
+            'gemma4': "{{ '<|tool_call>call:' }} gemma4 stand-in\n"}
 
 
 def schemas():
@@ -164,6 +164,22 @@ class Readiness(unittest.TestCase):
     def test_deepseek_pin_is_the_template_hf2q_renders(self):
         self.assertEqual(hashlib.sha256(TEMPLATE['deepseek4'].encode()).hexdigest(),
                          fp.TEMPLATE_SHA256['deepseek4'])
+
+    def test_peer_lexer_source_without_trailing_newline_is_the_matched_template(self):
+        # What the e86 peer's /props reported for the reviewed files in peer-arms-v1:
+        # the exact template minus its single trailing newline.
+        for family in fp.FAMILIES:
+            self.assertTrue(TEMPLATE[family].endswith('\n') and not TEMPLATE[family].endswith('\n\n'))
+            result = self.ok(family, chat_template=TEMPLATE[family][:-1])
+            self.assertEqual(result['chat_template_sha256'], fp.TEMPLATE_SHA256[family])
+
+    def test_any_other_template_text_refuses(self):
+        for family in fp.FAMILIES:
+            text = TEMPLATE[family]
+            for served in (text[:-2], text + '\n', text[:-1] + ' ', text.replace('\n', '\r\n'),
+                           text[1:-1], '', None):
+                with self.subTest(family=family, served=repr(served)[-20:]), self.assertRaises(Invalid):
+                    self.ok(family, chat_template=served if served is not None else 0)
 
     def test_matched_peer_ready_reports_inspected_source(self):
         for family in fp.FAMILIES:
