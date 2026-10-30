@@ -1,10 +1,14 @@
 """Q5 calibration supervisor controls: synthetic samples/rows/cases only; no host commands or launches."""
 import json
+import math
 import os
 from pathlib import Path
 import re
+import tempfile
 import unittest
 
+import q5_admission
+import q5_artifacts
 import q5_calibration
 import q5_case
 import q5_host
@@ -14,6 +18,7 @@ import q5_preflight as pre
 import q5_runtime
 
 MIB, GIB = 1 << 20, 1 << 30
+NC_LATENCY = 146_000_000  # accepted negative control: sample->signal->exit about 146 ms
 HERE = Path(__file__).resolve().parent
 VM_STAT = '''Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                                  5264938.
@@ -137,7 +142,7 @@ class StopRules(unittest.TestCase):
 
 class Verdicts(unittest.TestCase):
     def summary(self, **changes):
-        monitor = p.Monitor(BASELINE, policy())
+        monitor = p.Monitor(BASELINE, policy(), NC_LATENCY, 'nc')
         for i in range(4):
             monitor.feed(sample(i, footprint=30 * GIB))
         return {**monitor.summary(), **changes}
@@ -146,6 +151,16 @@ class Verdicts(unittest.TestCase):
 
     def classify(self, stop, client, summary, proven=True):
         return p.classify(stop, client, summary, proven, policy())
+
+    def test_pass_needs_min_above_the_raised_floor_and_a_measured_latency(self):
+        raised = self.summary()
+        raised['effective_floor'] = {**raised['effective_floor'], 'effective_floor_bytes': 70 * GIB}
+        verdict = self.classify(None, self.ok_client, raised)  # min free+cached is 60 GiB
+        self.assertEqual(verdict['verdict'], 'CalibrationFailed')
+        self.assertIn('effective floor', verdict['reason'])
+        unmeasured = self.summary()
+        unmeasured['effective_floor'] = {**unmeasured['effective_floor'], 'latency_ns': None}
+        self.assertIn('latency', self.classify(None, self.ok_client, unmeasured)['reason'])
 
     def test_clean_completed_run_passes_even_with_warning_pressure(self):
         self.assertEqual(self.classify(None, self.ok_client, self.summary())['verdict'], 'CalibrationPass')
@@ -299,7 +314,9 @@ class ArgvAndCases(unittest.TestCase):
         for env in ({'HF2Q_Q5_PORT': '80'}, {'HF2Q_Q5_MODEL_SHA256': 'ABC'}, {'HF2Q_Q5_HF2Q_BIN': 'target/hf2q'}):
             with self.assertRaises(q5_case.CaseError, msg=env):
                 q5_case.build_plan(self.case(), self.builtins(), {**self.required(), **env})
-        for change in ({'workload': {'id': 'x', 'slots': 2, 'context_per_slot': 1}}, {'family': 'llama'}, {'schema': 'v0'}, {'extra': 1}):
+        for change in ({'workload': {'id': 'x', 'slots': 2, 'context_per_slot': 1}}, {'family': 'llama'}, {'schema': 'v0'},
+                       {'extra': 1}, {'policy': {'footprint_cap_bytes': GIB}},
+                       {'artifact': {'path': '{MODEL}', 'text_only_locator': 'yes'}}):
             with self.assertRaises(q5_case.CaseError, msg=change):
                 q5_case.validate(self.case(**change))
 
@@ -337,7 +354,26 @@ class ArgvAndCases(unittest.TestCase):
             approval = plan['client']['approval']['set']
             self.assertEqual(approval['server_pid'], '{SERVER_PID}')
             self.assertEqual(plan['policy']['footprint_cap_bytes'], None)
+            self.assertEqual(plan['serve']['env']['MODEL'], plan['served_model'])
+            checks = {(c['field'], json.dumps(c['equals'])) for c in plan['readiness']['checks']}
+            if family in ('qwen38', 'gemma4'):
+                # The real sibling projector auto-loads unless the model is served from a private directory.
+                self.assertTrue(plan['artifact']['text_only_locator'])
+                self.assertEqual(plan['served_model'], f"/out/run/text-model/{Path(plan['artifact']['path']).name}")
+            else:
+                self.assertEqual(plan['served_model'], plan['artifact']['path'])
+            if family != 'deepseek4':
+                self.assertIn(('measurement_snapshot.active_controls.vision_projector', 'false'), checks)
         self.assertEqual(len(ports), 4)
+
+    def test_deepseek_case_uses_scoped_compressor_override(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'deepseek4.json').read_bytes())
+        env = case['serve']['env']
+        self.assertNotIn('HF2Q_DEEPSEEK_UNSAFE_MEMORY_OVERRIDE', env)
+        self.assertEqual(env['MAX_COMPRESSOR_USED_GIB'], '16')
+        launcher = (HERE.parent / 'serve_deepseek4_opencode.sh').read_text()
+        self.assertIn('MAX_COMPRESSOR_USED_GIB="${MAX_COMPRESSOR_USED_GIB:-8}"', launcher)
+        self.assertEqual(case['workload']['id'], 'adr063-q5-deepseek4-n4-coding-ctx262144-final-default')
 
     def test_run_id_matches_client_identity_rule(self):
         for name in ('x', 'q5-qwen38-20261030T120000Z', 'a.b c' * 30):
@@ -406,6 +442,187 @@ class OwnershipAndControl(unittest.TestCase):
 
     def test_child_refuses_out_of_bounds_ceiling(self):
         self.assertEqual(nc.main(['--ceiling-bytes', str(nc.HARD_MAX_BYTES + 1), '--parent-pid', str(os.getppid())]), 2)
+
+
+PHYSICAL = 128 * GIB
+
+
+def calibration_receipt(**changes):
+    receipt = {'schema': q5_admission.RECEIPT_SCHEMA, 'mode': 'calibration', 'family': 'deepseek4',
+               'verdict': {'verdict': 'CalibrationPass', 'reason': None},
+               'workload': {'id': 'w', 'slots': 4, 'context_per_slot': 262144},
+               'binary': {'sha256': 'b' * 64}, 'host': {'physical_bytes': PHYSICAL},
+               'artifact': {'path': '/m.gguf', 'bytes': 100, 'mtime_ns': 7, 'sha256': None},
+               'baseline': {'free_plus_cached_bytes': 110 * GIB},
+               'samples': {'min_free_plus_cached_bytes': 4 * GIB, 'peak_footprint_bytes': 4 * GIB,
+                           'deltas': {'swap_used_bytes': 0, 'compressor_bytes': 0}}}
+    receipt.update(changes)
+    return receipt
+
+
+def current(**changes):
+    value = {'family': 'deepseek4', 'workload': {'id': 'w', 'slots': 4, 'context_per_slot': 262144, 'client': 'x'},
+             'binary_sha256': 'b' * 64, 'physical_bytes': PHYSICAL,
+             'artifact': {'path': '/m.gguf', 'bytes': 100, 'mtime_ns': 7, 'sha256': None}}
+    value.update(changes)
+    return value
+
+
+class Admission(unittest.TestCase):
+    def test_charge_is_host_level_drop_not_process_footprint(self):
+        admission = q5_admission.admission_from(calibration_receipt(), current())
+        self.assertEqual(admission['peak_host_used_bytes'], PHYSICAL - 4 * GIB)
+        self.assertEqual(admission['baseline_host_used_bytes'], PHYSICAL - 110 * GIB)
+        self.assertEqual(admission['charged_bytes'], 106 * GIB)  # not the 4 GiB phys_footprint
+        self.assertEqual(admission['footprint_cap_bytes'], 5 * GIB)  # 4 GiB x 1.25
+
+    def test_admission_boundary_uses_charge_plus_initial_effective_floor(self):
+        admission = q5_admission.admission_from(calibration_receipt(), current())
+        self.assertEqual(admission['seed_rate_bytes_per_s'], 0)  # pre-record receipts seed nothing
+        need = 106 * GIB + 2 * GIB
+        self.assertTrue(q5_admission.admit(admission, need, 2 * GIB)['admitted'])
+        decision = q5_admission.admit(admission, need - 1, 2 * GIB)
+        self.assertFalse(decision['admitted'])
+        self.assertEqual(decision['required_free_plus_cached_bytes'], need)
+
+    def test_measured_rate_seeds_the_admitted_floor(self):
+        samples = {**calibration_receipt()['samples'],
+                   'effective_floor': {'max_post_readiness_drop_rate_bytes_per_s': 20 * GIB}}
+        admission = q5_admission.admission_from(calibration_receipt(samples=samples), current())
+        self.assertEqual(admission['seed_rate_bytes_per_s'], 20 * GIB)
+        initial = p.effective_floor(2 * GIB, admission['seed_rate_bytes_per_s'], 0.5, NC_LATENCY)
+        self.assertEqual(initial, math.ceil(20 * GIB * 0.646))
+        self.assertFalse(q5_admission.admit(admission, 106 * GIB + 2 * GIB, initial)['admitted'])
+
+    def test_any_identity_mismatch_requires_recalibration(self):
+        bad = [(calibration_receipt(family='qwen38'), current()),
+               (calibration_receipt(verdict={'verdict': 'Stopped'}), current()),
+               (calibration_receipt(run_kind='admitted'), current()),
+               (calibration_receipt(mode='negative-control'), current()),
+               (calibration_receipt(schema='other'), current()),
+               (calibration_receipt(), current(binary_sha256='c' * 64)),
+               (calibration_receipt(), current(workload={'id': 'w2', 'slots': 4, 'context_per_slot': 262144})),
+               (calibration_receipt(), current(workload={'id': 'w', 'slots': 4, 'context_per_slot': 131072})),
+               (calibration_receipt(), current(physical_bytes=64 * GIB)),
+               (calibration_receipt(), current(artifact={'bytes': 100, 'mtime_ns': 8, 'sha256': None})),
+               (calibration_receipt(artifact={'bytes': 100, 'mtime_ns': 7, 'sha256': 'a' * 64}),
+                current(artifact={'bytes': 100, 'mtime_ns': 7, 'sha256': 'e' * 64})),
+               (calibration_receipt(samples={'min_free_plus_cached_bytes': GIB, 'peak_footprint_bytes': None}), current())]
+        for receipt, now in bad:
+            with self.assertRaises(q5_admission.AdmissionError, msg=(receipt, now)):
+                q5_admission.admission_from(receipt, now)
+
+    def test_sha_match_wins_over_touched_mtime(self):
+        receipt = calibration_receipt(artifact={'bytes': 100, 'mtime_ns': 7, 'sha256': 'a' * 64})
+        now = current(artifact={'bytes': 100, 'mtime_ns': 9, 'sha256': 'a' * 64})
+        self.assertEqual(q5_admission.admission_from(receipt, now)['charged_bytes'], 106 * GIB)
+
+    def test_growth_cap_is_never_absent(self):
+        admission = q5_admission.admission_from(calibration_receipt(), current())
+        self.assertEqual(q5_admission.growth_cap(admission, PHYSICAL, 2 * GIB)['kind'], 'footprint')
+        floor_cap = q5_admission.growth_cap(None, PHYSICAL, 2 * GIB)
+        self.assertEqual((floor_cap['kind'], floor_cap['bytes']), ('host-floor', PHYSICAL - 2 * GIB))
+
+    def test_negative_control_latency(self):
+        good = {'schema': q5_admission.RECEIPT_SCHEMA, 'mode': 'negative-control',
+                'verdict': {'verdict': 'NegativeControlPass'}, 'stop_latency': {'sample_to_exit_ns': 145871166}}
+        self.assertEqual(q5_admission.negative_control_latency(good), 145871166)
+        for bad in ({**good, 'verdict': {'verdict': 'NegativeControlFailed'}}, {**good, 'stop_latency': None},
+                    {**good, 'mode': 'calibration'}):
+            with self.assertRaises(q5_admission.AdmissionError):
+                q5_admission.negative_control_latency(bad)
+
+
+class DynamicFloor(unittest.TestCase):
+    def feed(self, monitor, values, ready_index):
+        for index, free in enumerate(values):
+            if index == ready_index:
+                monitor.ready_ns = index * 500_000_000
+            decision = monitor.feed(sample(index, host(free_cached=free)))
+            if decision is not None:
+                return decision
+        return None
+
+    def test_load_phase_drop_does_not_raise_the_floor(self):
+        # 80 GiB drop while weights become wired, then 1 GiB per 0.5 s after readiness (DeepSeek-like).
+        monitor = p.Monitor(BASELINE, policy(), NC_LATENCY, 'nc')
+        self.assertIsNone(self.feed(monitor, [110 * GIB, 30 * GIB, 29 * GIB, 28 * GIB], 2))
+        record = monitor.summary()['effective_floor']
+        self.assertEqual(record['max_load_phase_drop_bytes_per_sample'], 80 * GIB)
+        self.assertEqual(record['max_post_readiness_drop_rate_bytes_per_s'], 2 * GIB)
+        self.assertEqual(record['effective_floor_bytes'], 2 * GIB)  # 2 GiB/s x 0.646 s < 2 GiB minimum
+        self.assertEqual((record['latency_ns'], record['min_free_plus_cached_bytes']), (NC_LATENCY, 28 * GIB))
+
+    def test_fast_allocation_raises_the_live_floor(self):
+        # Qwen3.8-like: 10 GiB in one post-readiness sample -> floor = 20 GiB/s x 0.646 s ~ 12.9 GiB.
+        monitor = p.Monitor(BASELINE, policy(), NC_LATENCY, 'nc')
+        descent = [100 * GIB, 90 * GIB, 80 * GIB] + [(75 - i) * GIB for i in range(64)]
+        stop = self.feed(monitor, descent, 1)
+        self.assertEqual(monitor.effective_floor(), math.ceil(20 * GIB * 0.646))
+        self.assertEqual(stop['reason'], 'free_cached_floor')
+        # The first sample below the raised floor stops, far above the 2 GiB minimum.
+        self.assertEqual(monitor.summary()['effective_floor']['min_free_plus_cached_bytes'], 12 * GIB)
+
+    def test_seeded_rate_applies_before_any_drop_and_missing_latency_uses_interval(self):
+        seeded = p.Monitor(BASELINE, policy(), NC_LATENCY, 'nc', seed_rate=20 * GIB)
+        self.assertEqual(seeded.feed(sample(0, host(free_cached=12 * GIB)))['reason'], 'free_cached_floor')
+        unmeasured = p.Monitor(BASELINE, policy(), None, 'unavailable', seed_rate=20 * GIB)
+        self.assertEqual(unmeasured.effective_floor(), 10 * GIB)
+
+
+class ArtifactIdentity(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.root = self.dir.name
+        self.model = os.path.join(self.root, 'm.gguf')
+        with open(self.model, 'wb') as handle:
+            handle.write(b'x' * 100)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def receipt(self, **output):
+        with open(self.model + '.receipt.json', 'w') as handle:
+            json.dump({'schema_version': 3, 'output': {'path': self.model, 'size': 100, 'sha256': 'a' * 64, **output}}, handle)
+
+    def test_sha_comes_from_receipt_output_sha256(self):
+        self.receipt()
+        identity = q5_artifacts.artifact_identity(self.model)
+        self.assertEqual(identity['sha256'], 'a' * 64)
+        self.assertEqual(identity['sha256_source']['field'], 'output.sha256')
+        self.assertFalse(identity['sha256_hashed_by_supervisor'])
+
+    def test_size_mismatch_or_missing_receipt_falls_back_to_size_mtime(self):
+        self.assertIsNone(q5_artifacts.artifact_identity(self.model)['sha256'])
+        self.receipt(size=99)
+        identity = q5_artifacts.artifact_identity(self.model)
+        self.assertIsNone(identity['sha256'])
+        self.assertIn('size', identity['receipt_rejected'])
+        self.assertEqual(identity['bytes'], 100)
+
+    def test_provided_digest_must_agree(self):
+        self.receipt()
+        with self.assertRaises(q5_artifacts.ArtifactError):
+            q5_artifacts.artifact_identity(self.model, 'f' * 64)
+        os.unlink(self.model + '.receipt.json')
+        identity = q5_artifacts.artifact_identity(self.model, 'f' * 64)
+        self.assertEqual((identity['sha256'], identity['sha256_source']), ('f' * 64, 'operator-provided, not verified by the supervisor'))
+
+    def test_projector_candidates_and_private_locator(self):
+        for name in ('m-mmproj.gguf', 'mmproj-x.gguf', 'other.gguf', 'm-mmproj.gguf.receipt.json'):
+            with open(os.path.join(self.root, name), 'wb') as handle:
+                handle.write(b'p')
+        names = [os.path.basename(p['path']) for p in q5_artifacts.projector_candidates(self.model)]
+        self.assertEqual(names, ['m-mmproj.gguf', 'mmproj-x.gguf'])
+        out = os.path.join(self.root, 'out')
+        os.mkdir(out)
+        locator = q5_artifacts.create_locator(self.model, out)
+        self.assertEqual(os.stat(locator['served_path']).st_ino, os.stat(self.model).st_ino)
+        self.assertEqual(q5_artifacts.projector_candidates(locator['served_path']), [])
+        open(locator['served_path'] + '.pair.lock', 'w').close()
+        removal = q5_artifacts.remove_locator(locator)
+        self.assertTrue(removal['directory_removed'])
+        self.assertTrue(os.path.isfile(self.model))
 
 
 if __name__ == '__main__':

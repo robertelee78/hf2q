@@ -2,9 +2,10 @@
   "schema": "hf2q.q5.calibration-case.v1",
   "family": "gemma4",
   "notes": [
-    "Derived from: Gemma4 runner: full-input N4 and largest-tool-result supervisors; nonexistent MMPROJ selects the launcher text-only branch; stock (no experiment env).",
+    "Derived from: Gemma4 runner: full-input N4 and largest-tool-result supervisors; stock (no experiment env).",
     "Override any variable with HF2Q_Q5_<NAME>; null variables are required. See scripts/four_agent/README.md.",
-    "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv."
+    "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
+    "Text-only: a nonexistent MMPROJ makes the launcher omit --mmproj (it would otherwise default to a repo projector path), and hf2q serve then auto-loads the sibling gemma-4-26B-A4B-it-hf2q-q4_k_m-mmproj.gguf (observed in the 2026-10-30 calibration). artifact.text_only_locator serves a hard link of the same file from a private {OUT}/text-model/ directory, and readiness requires vision_projector == false."
   ],
   "workload": {
     "id": "adr063-q5-gemma4-n4-coding-ctx262144",
@@ -27,7 +28,8 @@
   "binary": "{HF2Q_BIN}",
   "artifact": {
     "path": "{MODEL}",
-    "sha256": "{MODEL_SHA256}"
+    "sha256": "{MODEL_SHA256}",
+    "text_only_locator": true
   },
   "port": "{PORT}",
   "serve": {
@@ -36,7 +38,7 @@
       "{REPO}/scripts/serve_gemma4_opencode.sh"
     ],
     "env": {
-      "MODEL": "{MODEL}",
+      "MODEL": "{SERVED_MODEL}",
       "MMPROJ": "{OUT}/text-only-no-external-projector.gguf",
       "LCP_CAPACITY": "8g",
       "KV_CACHE_BUDGET_BYTES": "51539607552",
@@ -71,6 +73,11 @@
         "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
         "field": "serve.max_slots",
         "equals": 4
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.vision_projector",
+        "equals": false
       }
     ]
   },

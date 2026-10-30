@@ -72,6 +72,11 @@
         "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
         "field": "serve.max_slots",
         "equals": 4
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.vision_projector",
+        "equals": false
       }
     ]
   },

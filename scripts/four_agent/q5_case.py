@@ -14,6 +14,9 @@ SCHEMA = 'hf2q.q5.calibration-case.v1'
 FAMILIES = ('qwen38', 'qwen36', 'gemma4', 'deepseek4')
 BUILTINS = ('REPO', 'OUT', 'PYTHON', 'PYTHON_SHA256', 'RUN_ID', 'NONCE32')
 RUNTIME = ('SERVER_PID', 'CLIENT_APPROVAL', 'CLIENT_APPROVAL_SHA256')
+# SERVED_MODEL: the path the server loads; the artifact itself, or its hard link in
+# {OUT}/text-model/ when artifact.text_only_locator is true (q5_artifacts).
+DERIVED = ('SERVED_MODEL',)
 OVERRIDE_PREFIX = 'HF2Q_Q5_'
 PLACEHOLDER = re.compile(r'\{([A-Z][A-Z0-9_]*)\}')
 NAME = re.compile(r'[A-Z][A-Z0-9_]*')
@@ -63,13 +66,15 @@ def validate(case):
     require(isinstance(variables, dict), 'variables must be an object')
     for name, value in variables.items():
         require(NAME.fullmatch(name) is not None, 'variable names are UPPER_SNAKE: ' + name)
-        require(name not in BUILTINS + RUNTIME, 'variable shadows a built-in: ' + name)
+        require(name not in BUILTINS + RUNTIME + DERIVED, 'variable shadows a built-in: ' + name)
         require(value is None or isinstance(value, str), f'variable {name} must be a string or null')
     for key in ('binary', 'port'):
         require(isinstance(case.get(key), str), key + ' must be a string')
     artifact = case.get('artifact')
-    require(isinstance(artifact, dict) and set(artifact) <= {'path', 'sha256'} and isinstance(artifact.get('path'), str),
-            'artifact needs path and optional sha256')
+    require(isinstance(artifact, dict) and set(artifact) <= {'path', 'sha256', 'text_only_locator'}
+            and isinstance(artifact.get('path'), str) and type(artifact.get('text_only_locator', False)) is bool,
+            'artifact needs path, optional sha256 and optional boolean text_only_locator')
+    require('SERVED_MODEL' not in PLACEHOLDER.findall(artifact['path']), 'artifact.path cannot use {SERVED_MODEL}')
     serve = case.get('serve')
     require(isinstance(serve, dict) and set(serve) <= {'argv', 'env'}, 'serve needs argv and optional env')
     _check_section_env(serve, 'serve')
@@ -98,10 +103,12 @@ def validate(case):
         for name in referenced({'template': approval['template']}):
             require(name not in RUNTIME, 'client.approval.template cannot depend on launch-time values')
     require(isinstance(case.get('policy', {}), dict), 'policy must be an object')
+    require('footprint_cap_bytes' not in case.get('policy', {}),
+            'the footprint cap comes from --admission-receipt (calibrated peak), never from the case')
     for name in referenced(case, sections=('binary', 'artifact', 'port', 'serve', 'readiness')):
         require(name not in RUNTIME, f'{{{name}}} is known only after launch; use it in the client section')
     for name in referenced(case):
-        require(name in BUILTINS or name in RUNTIME or name in variables, f'undeclared placeholder {{{name}}}')
+        require(name in BUILTINS + RUNTIME + DERIVED or name in variables, f'undeclared placeholder {{{name}}}')
     return case
 
 
@@ -223,14 +230,22 @@ def build_plan(case, builtins, environ):
     from q5_policy import effective_policy, PolicyError
     validate(case)
     values, missing = resolve_variables(case, builtins, environ)
-    keep = RUNTIME + tuple(missing)
+    artifact_path = expand(case['artifact']['path'], values, tuple(missing))
+    keep_served = ()
+    if PLACEHOLDER.search(artifact_path):
+        keep_served = ('SERVED_MODEL',)  # a missing variable leaves the served path unknown too
+    else:
+        values['SERVED_MODEL'] = (os.path.join(values['OUT'], 'text-model', os.path.basename(artifact_path))
+                                  if case['artifact'].get('text_only_locator') else artifact_path)
+    keep = RUNTIME + tuple(missing) + keep_served
     sub = lambda value: expand(value, values, keep)
     plan = {'family': case['family'], 'workload': case['workload'], 'missing_variables': missing,
             'complete': not missing, 'variables': {k: values[k] for k in case.get('variables', {}) if k in values},
             'binary': sub(case['binary']), 'artifact': sub(case['artifact']), 'port': sub(case['port']),
             'serve': {'argv': sub(case['serve']['argv']), 'env': sub(case['serve'].get('env', {}))},
             'readiness': sub(case['readiness']),
-            'client': {**sub(case['client']), 'env': sub(case['client'].get('env', {}))}}
+            'client': {**sub(case['client']), 'env': sub(case['client'].get('env', {}))},
+            'served_model': values.get('SERVED_MODEL')}
     try:
         plan['policy'] = effective_policy(case.get('policy', {}))
     except PolicyError as error:

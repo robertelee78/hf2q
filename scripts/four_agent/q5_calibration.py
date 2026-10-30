@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""ADR-063 Q5 per-family memory calibration supervisor.
+"""ADR-063 Q5 per-family memory calibration and admitted-run supervisor.
 
 Runs ONE supervised four-agent workload from a JSON case file (or, with
 --negative-control, a bounded synthetic memory-growth child) on a host where it
-must be the only runtime. It records a receipt; it never retries, never selects
-a favorable sample and never claims speed. See README "Q5 per-family calibration".
+must be the only runtime. Without --admission-receipt the run is a calibration
+run; with one, it is admitted only when the current baseline covers the
+calibrated host-level charge, and it carries the calibrated footprint cap. It
+records a receipt; it never retries, never selects a favorable sample and never
+claims speed. See README "Q5 per-family calibration".
 """
 import argparse
 import datetime
@@ -21,6 +24,9 @@ import time
 import urllib.error
 import urllib.request
 
+import q5_admission
+import q5_artifacts
+from q5_artifacts import sha256
 import q5_case
 import q5_host
 import q5_negative_control as nc
@@ -30,25 +36,22 @@ import q5_runtime
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
-RECEIPT_SCHEMA = 'hf2q.q5.calibration-receipt.v1'
-SOURCES = ('q5_calibration.py', 'q5_case.py', 'q5_host.py', 'q5_policy.py', 'q5_preflight.py',
-           'q5_runtime.py', 'q5_negative_control.py')
-INPUT_FILE_LIMIT = 64 << 20
+RECEIPT_SCHEMA = q5_admission.RECEIPT_SCHEMA
+SOURCES = ('q5_calibration.py', 'q5_admission.py', 'q5_artifacts.py', 'q5_case.py', 'q5_host.py', 'q5_policy.py',
+           'q5_preflight.py', 'q5_runtime.py', 'q5_negative_control.py')
+PASSING = ('CalibrationPass', 'AdmittedRunPass', 'NegativeControlPass')
 INTERRUPTED = []
-
-
-def sha256(path):
-    digest = hashlib.sha256()
-    with open(path, 'rb') as handle:
-        for block in iter(lambda: handle.read(1 << 20), b''):
-            digest.update(block)
-    return digest.hexdigest()
+LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never route loopback through a proxy
 
 
 def save(path, value):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w', encoding='utf-8') as handle:
         handle.write(json.dumps(value, indent=2, allow_nan=False) + '\n')
+
+
+def load_json(path):
+    return q5_case.loads(Path(path).read_bytes())
 
 
 def inside_git(path):
@@ -78,34 +81,9 @@ def negative_plan(args, out):
     return {'family': 'negative-control', 'complete': True, 'missing_variables': [],
             'workload': {'id': 'q5-negative-control-synthetic-growth', 'ceiling_bytes': ceiling, 'cap_bytes': cap,
                          'step_bytes': args.nc_step_bytes, 'step_seconds': args.nc_step_seconds},
-            'binary': str(Path(sys.executable).resolve()), 'artifact': None, 'port': None,
+            'binary': str(Path(sys.executable).resolve()), 'artifact': None, 'port': None, 'served_model': None,
             'serve': {'argv': argv, 'env': {}}, 'readiness': None, 'client': None,
             'policy': q5_policy.effective_policy({'footprint_cap_bytes': cap})}
-
-
-def file_checks(plan):
-    paths = {'binary': plan['binary'], 'serve.argv[0]': plan['serve']['argv'][0]}
-    if plan.get('artifact'):
-        paths['artifact'] = plan['artifact']['path']
-    if plan.get('client'):
-        paths['client.argv[0]'] = plan['client']['argv'][0]
-        if plan['client'].get('approval'):
-            paths['client.approval.template'] = plan['client']['approval']['template']
-    return {name: os.path.isfile(path) for name, path in paths.items()}
-
-
-def input_hashes(plan):
-    argv = plan['serve']['argv'] + (plan['client']['argv'] if plan.get('client') else [])
-    if plan.get('client') and plan['client'].get('approval'):
-        argv = argv + [plan['client']['approval']['template']]
-    found = {}
-    for item in argv:
-        if os.path.isabs(item) and os.path.isfile(item) and os.path.getsize(item) <= INPUT_FILE_LIMIT:
-            found[item] = sha256(item)
-    return found
-
-
-LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never route loopback through a proxy
 
 
 def get_json(url):
@@ -134,7 +112,7 @@ def resolve_set(spec, values):
 
 
 def render_approval(approval, values, out):
-    packet = q5_case.loads(Path(approval['template']).read_bytes())
+    packet = load_json(approval['template'])
     for key, spec in approval['set'].items():
         packet[key] = resolve_set(spec, values)
     path = out / 'client-approval.json'
@@ -161,6 +139,15 @@ def preflight(plan, policy, receipt):
         return 'competing runtime(s): ' + ', '.join(f"{c['pid']}:{c['category']}" for c in found)
     if port is not None and not port['free']:
         return f'port {plan["port"]} is not free'
+    if why is None and receipt.get('admission') is not None:
+        inputs = receipt['floor_inputs']
+        initial = q5_policy.effective_floor(policy['free_cached_floor_bytes'], inputs['seed_rate_bytes_per_s'],
+                                            policy['interval_seconds'], inputs['latency_ns'])
+        decision = q5_admission.admit(receipt['admission'], baseline['free_plus_cached_bytes'], initial)
+        receipt['admission']['decision'] = decision
+        if not decision['admitted']:
+            return (f"admission refused: baseline free+cached {decision['baseline_free_plus_cached_bytes']} B < "
+                    f"calibrated charge {decision['charged_bytes']} B + initial effective floor {decision['initial_effective_floor_bytes']} B")
     return why
 
 
@@ -181,7 +168,8 @@ def wait_ready(plan, server, latch, receipt):
         except (OSError, ValueError, urllib.error.URLError):
             pass
         latch.event.wait(0.5)
-    receipt['readiness'] = {'seconds': time.monotonic() - start, 'documents': {}, 'checks': []}
+    receipt['readiness'] = {'seconds': time.monotonic() - start, 'ready_ns': time.monotonic_ns(),
+                            'documents': {}, 'checks': []}
     for index, url in enumerate(spec.get('record', [])):
         try:
             doc = get_json(url)
@@ -245,7 +233,17 @@ def supervise(plan, values, out, receipt, negative, state):
         except nc.ControlError as error:
             receipt['verdict'] = {'verdict': 'PreflightRefused', 'reason': str(error)}
             return
-    monitor, latch = q5_policy.Monitor(receipt['baseline'], policy), q5_runtime.StopLatch()
+    locator = None
+    if plan.get('artifact') and plan['artifact'].get('text_only_locator'):
+        locator = q5_artifacts.create_locator(plan['artifact']['path'], str(out))
+        if locator['served_path'] != plan['served_model']:
+            raise q5_artifacts.ArtifactError('text-only locator path differs from the planned SERVED_MODEL')
+        receipt['text_only_locator'] = locator
+        receipt['projectors_beside_served_model'] = q5_artifacts.projector_candidates(locator['served_path'])
+    inputs = receipt['floor_inputs']
+    monitor = q5_policy.Monitor(receipt['baseline'], policy, inputs['latency_ns'], inputs['latency_source'],
+                                inputs['seed_rate_bytes_per_s'])
+    latch = q5_runtime.StopLatch()
     sampler = q5_runtime.Sampler(monitor, policy['interval_seconds'], out / 'samples.jsonl', latch)
     state['monitor'] = monitor
     server = client = None
@@ -262,11 +260,15 @@ def supervise(plan, values, out, receipt, negative, state):
         latch.groups.append(server.pid)
         sampler.pgid, sampler.roots = server.pid, {server.pid}
         values['SERVER_PID'] = server.pid
-        receipt['server'] = {'pid': server.pid}
-        if plan['readiness'] is not None:
+        receipt['server'] = {'pid': server.pid, 'launch_ns': time.monotonic_ns()}
+        if plan['readiness'] is None:
+            monitor.ready_ns = receipt['server']['launch_ns']  # the control child is "ready" at launch
+        else:
             ready = wait_ready(plan, server, latch, receipt)
             if isinstance(ready, str):
                 stop(ready, 'before client launch')
+            if receipt.get('readiness'):
+                monitor.ready_ns = receipt['readiness']['ready_ns']
         if plan['client'] is not None and not latch.event.is_set():
             spec = plan['client']
             if spec.get('approval'):
@@ -302,6 +304,8 @@ def supervise(plan, values, out, receipt, negative, state):
         time.sleep(policy['interval_seconds'] * 2)  # observe memory release after exit
         sampler.halt.set()
         sampler.join(10)
+        if locator is not None:
+            receipt['text_only_locator']['removal'] = q5_artifacts.remove_locator(locator)
         if server is not None:
             receipt['server']['exit_code'] = server.returncode
         if client is not None and 'client' not in receipt:
@@ -327,12 +331,21 @@ def finish(plan, receipt, monitor, negative):
         return
     summary = monitor.summary()
     receipt['samples'] = {'file': 'samples.jsonl', **summary}
+    receipt['host_peak'] = {'physical_bytes': receipt['host']['physical_bytes'],
+                            'peak_host_used_bytes': (None if summary['min_free_plus_cached_bytes'] is None else
+                                                     receipt['host']['physical_bytes'] - summary['min_free_plus_cached_bytes']),
+                            'baseline_host_used_bytes': receipt['host']['physical_bytes'] - receipt['baseline']['free_plus_cached_bytes'],
+                            'peak_footprint_bytes': summary['peak_footprint_bytes'],
+                            'definition': 'host used = physical - (free + speculative + file-backed)'}
     if after['host'] is not None:
         receipt['recovery_free_plus_cached_delta_bytes'] = (after['host']['vm']['free_plus_cached_bytes']
                                                             - receipt['baseline']['free_plus_cached_bytes'])
     if negative and summary['peak_footprint_bytes'] is not None:
         receipt['negative_control']['peak_over_cap_bytes'] = summary['peak_footprint_bytes'] - plan['policy']['footprint_cap_bytes']
+    receipt['effective_floor'] = summary['effective_floor']
     proven = receipt['cleanup']['proven'] and receipt.get('listener_after_cleanup', {}).get('clear', True)
+    if receipt.get('text_only_locator'):
+        proven = proven and receipt['text_only_locator'].get('removal', {}).get('directory_removed') is True
     receipt['cleanup_proven'] = proven
     if receipt.get('supervisor_error'):
         receipt['verdict'] = {'verdict': 'SupervisorError', 'reason': receipt['supervisor_error']}
@@ -342,19 +355,38 @@ def finish(plan, receipt, monitor, negative):
         receipt['calibration_verdict'] = verdict
         verdict = q5_policy.classify_negative_control(verdict, summary, plan['workload']['ceiling_bytes'], proven,
                                                       receipt['server'].get('exit_code'))
+    elif receipt['run_kind'] == 'admitted' and verdict['verdict'] == 'CalibrationPass':
+        verdict = {'verdict': 'AdmittedRunPass', 'reason': None}
     receipt['verdict'] = verdict
 
 
-def identities(plan, case_path, receipt):
+def identities(plan, case_path, receipt, admission_path):
+    """Source/binary/artifact identity, then (with --admission-receipt) the admission charge and cap."""
     receipt['supervisor_sources'] = {name: sha256(HERE / name) for name in SOURCES}
     receipt['case'] = None if case_path is None else {'path': str(case_path), 'sha256': sha256(case_path)}
-    receipt['inputs'] = input_hashes(plan)
+    receipt['inputs'] = q5_artifacts.input_hashes(plan)
     binary = plan['binary']
     receipt['binary'] = {'path': binary, 'sha256': sha256(binary), 'bytes': os.path.getsize(binary)}
+    receipt['artifact'] = None
     if plan.get('artifact'):
-        stat = os.stat(plan['artifact']['path'])
-        receipt['artifact'] = {'path': plan['artifact']['path'], 'bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns,
-                               'provided_sha256': plan['artifact']['sha256'], 'sha256_verified_by_supervisor': False}
+        receipt['artifact'] = q5_artifacts.artifact_identity(plan['artifact']['path'], plan['artifact']['sha256'])
+        receipt['projectors_beside_artifact'] = q5_artifacts.projector_candidates(plan['artifact']['path'])
+    physical, floor = receipt['host']['physical_bytes'], plan['policy']['free_cached_floor_bytes']
+    if admission_path is not None:
+        admission = q5_admission.admission_from(load_json(admission_path), {
+            'family': plan['family'], 'workload': plan['workload'], 'binary_sha256': receipt['binary']['sha256'],
+            'artifact': receipt['artifact'], 'physical_bytes': physical})
+        receipt['admission'] = {**admission, 'receipt': str(admission_path), 'receipt_sha256': sha256(admission_path)}
+        plan['policy'] = q5_policy.effective_policy({**plan['policy'], 'footprint_cap_bytes': admission['footprint_cap_bytes']})
+        receipt['policy'] = plan['policy']
+        receipt['growth_cap'] = q5_admission.growth_cap(admission, physical, floor)
+        receipt['floor_inputs'].update(seed_rate_bytes_per_s=admission['seed_rate_bytes_per_s'],
+                                       seed_source='admission receipt samples.effective_floor')
+    elif plan['family'] == 'negative-control':
+        receipt['growth_cap'] = {'kind': 'footprint', 'bytes': plan['policy']['footprint_cap_bytes'],
+                                 'basis': 'negative-control cap (ceiling / 2 by default)'}
+    else:
+        receipt['growth_cap'] = q5_admission.growth_cap(None, physical, floor)
 
 
 def parse_args(argv):
@@ -362,7 +394,10 @@ def parse_args(argv):
     parser.add_argument('case', nargs='?', type=Path, help='calibration case JSON (omit with --negative-control)')
     parser.add_argument('--output', type=Path, help='new receipt directory outside any Git tree')
     parser.add_argument('--dry-run', action='store_true', help='validate and print the plan; launch nothing')
-    parser.add_argument('--footprint-cap-bytes', type=int, help='calibrated hf2q footprint cap (overrides the case)')
+    parser.add_argument('--admission-receipt', type=Path,
+                        help='prior CalibrationPass receipt for this family/workload/source/artifact; makes this an admitted run')
+    parser.add_argument('--negative-control-receipt', type=Path,
+                        help='accepted NegativeControlPass receipt; its stop latency sets the effective Free+cached floor')
     parser.add_argument('--negative-control', action='store_true', help='run the synthetic memory-growth control')
     parser.add_argument('--nc-ceiling-bytes', type=int, default=8 << 30)
     parser.add_argument('--nc-cap-bytes', type=int, help='footprint stop for the control (default ceiling/2)')
@@ -371,8 +406,12 @@ def parse_args(argv):
     args = parser.parse_args(argv)
     if args.negative_control == (args.case is not None):
         parser.error('give exactly one of CASE or --negative-control')
+    if args.negative_control and args.admission_receipt:
+        parser.error('--admission-receipt applies to family cases only')
     if not args.dry_run and args.output is None:
         parser.error('--output is required unless --dry-run')
+    if args.case is not None and not args.dry_run and args.negative_control_receipt is None:
+        parser.error('--negative-control-receipt is required: the effective floor needs a measured stop latency')
     return args
 
 
@@ -385,16 +424,20 @@ def main(argv=None):
             plan = negative_plan(args, out)
             nc.plan_ceiling(1 << 62, plan['policy']['free_cached_floor_bytes'], args.nc_ceiling_bytes, plan['workload']['cap_bytes'])
         else:
-            case = q5_case.loads(args.case.read_bytes())
-            plan = q5_case.build_plan(case, base, os.environ)
-        if args.footprint_cap_bytes is not None:
-            plan['policy'] = q5_policy.effective_policy({**plan['policy'], 'footprint_cap_bytes': args.footprint_cap_bytes})
-    except (OSError, q5_case.CaseError, q5_policy.PolicyError, nc.ControlError) as error:
+            plan = q5_case.build_plan(load_json(args.case), base, os.environ)
+        latency = {'latency_ns': None, 'latency_source': 'unavailable (floor stays at its minimum until a latency is known)'}
+        if args.negative_control_receipt is not None:
+            latency = {'latency_ns': q5_admission.negative_control_latency(load_json(args.negative_control_receipt)),
+                       'latency_source': 'negative-control receipt ' + str(args.negative_control_receipt.resolve())}
+    except (OSError, q5_case.CaseError, q5_policy.PolicyError, nc.ControlError, q5_admission.AdmissionError) as error:
         print(json.dumps({'valid': False, 'error': str(error)}, indent=2))
         return 2
-    checks = file_checks(plan) if plan['complete'] else {}
+    checks = q5_artifacts.file_checks(plan) if plan['complete'] else {}
+    if args.admission_receipt is not None:
+        checks['admission_receipt'] = args.admission_receipt.is_file()
     if args.dry_run:
         print(json.dumps({'valid': True, 'dry_run': True, 'launchable': plan['complete'] and all(checks.values()),
+                          'run_kind': 'admitted' if args.admission_receipt else 'calibration',
                           'file_checks': checks, 'plan': plan}, indent=2))
         return 0 if plan['complete'] and all(checks.values()) else 2
     if not plan['complete'] or not all(checks.values()):
@@ -406,18 +449,25 @@ def main(argv=None):
     os.umask(0o077)
     out.mkdir(mode=0o700)
     values = {**base, **plan.get('variables', {})}
+    run_kind = 'negative-control' if args.negative_control else 'admitted' if args.admission_receipt else 'calibration'
     receipt = {'schema': RECEIPT_SCHEMA, 'mode': 'negative-control' if args.negative_control else 'calibration',
-               'family': plan['family'], 'workload': plan['workload'], 'policy': plan['policy'],
+               'run_kind': run_kind, 'family': plan['family'], 'workload': plan['workload'], 'policy': plan['policy'],
                'started_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                'host': q5_host.host_identity(), 'serve_argv': plan['serve']['argv'], 'serve_env': plan['serve']['env'],
+               'served_model': plan.get('served_model'),
+               'floor_inputs': {**latency, 'seed_rate_bytes_per_s': 0, 'seed_source': 'none (minimum floor until measured)'},
                'independent_review_required': True, 'performance_claim': None, '_out': out}
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda signum, _frame: INTERRUPTED.append(signum))
     state = {}
     try:
-        identities(plan, args.case.resolve() if args.case else None, receipt)
-        receipt['plan_sha256'] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
-        supervise(plan, values, out, receipt, args.negative_control, state)
+        try:
+            identities(plan, args.case.resolve() if args.case else None, receipt, args.admission_receipt)
+        except (q5_admission.AdmissionError, q5_artifacts.ArtifactError) as error:
+            receipt['verdict'] = {'verdict': 'PreflightRefused', 'reason': str(error)}
+        if 'verdict' not in receipt:
+            receipt['plan_sha256'] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+            supervise(plan, values, out, receipt, args.negative_control, state)
     except Exception as error:
         receipt['supervisor_error'] = repr(error)
     finally:
@@ -432,7 +482,7 @@ def main(argv=None):
     print(json.dumps({'receipt': str(out / 'receipt.json'), 'verdict': receipt['verdict'],
                       'stop': receipt.get('stop'), 'cleanup_proven': receipt.get('cleanup_proven')}, indent=2))
     verdict = receipt['verdict']['verdict']
-    return 0 if verdict in ('CalibrationPass', 'NegativeControlPass') else 2 if verdict == 'PreflightRefused' else 1
+    return 0 if verdict in PASSING else 2 if verdict == 'PreflightRefused' else 1
 
 
 if __name__ == '__main__':

@@ -58,13 +58,19 @@ low-memory or pressure reading, and an interrupted campaign remains incomplete.
 
 ## Q5 per-family calibration (ADR-063 Q5)
 
-`q5_calibration.py` runs one supervised four-agent workload per family and writes a receipt. It follows the measured-admission Q5 text: the host must be running only this workload. The receipt records the host baseline, the hf2q peak, the deltas and the cleanup. Live stops end the run before memory runs out. The supervisor never retries, never picks a favorable sample and makes no speed claim. Every receipt says `independent_review_required: true`.
+`q5_calibration.py` runs one supervised four-agent workload per family and writes a receipt. It follows the measured-admission Q5 text: the host must be running only this workload. The receipt records the host baseline, the host-level and process peaks, the deltas, the effective Free+cached floor with its inputs, and the cleanup. Live stops end the run before memory runs out. The supervisor never retries, never picks a favorable sample and makes no speed claim. Every receipt says `independent_review_required: true`.
+
+Every family run has a `run_kind`:
+- **`calibration`** (no `--admission-receipt`). It establishes the family's calibrated peak. Its growth cap is the host-level floor.
+- **`admitted`** (`--admission-receipt <CalibrationPass receipt>`). It runs only if the current baseline covers the calibrated charge, and it carries the calibrated footprint cap. A pass is `AdmittedRunPass`.
 
 | File | Role |
 | --- | --- |
-| `q5_calibration.py` | CLI: dry run, preflight, launch, readiness, client, stops, cleanup, receipt |
+| `q5_calibration.py` | CLI: dry run, preflight, admission, launch, readiness, client, stops, cleanup, receipt |
+| `q5_admission.py` | Pure admission charge, mandatory growth cap and floor seeding |
+| `q5_artifacts.py` | Model/projector identity from conversion receipts; text-only locator; input hashes |
 | `q5_case.py` | Case-file schema `hf2q.q5.calibration-case.v1`, placeholders, argv rules |
-| `q5_policy.py` | Pure stop rules, sample aggregation, verdicts |
+| `q5_policy.py` | Pure stop rules, dynamic Free+cached floor, sample aggregation, verdicts |
 | `q5_preflight.py` | Detects competing runtimes; checks the port |
 | `q5_host.py` | Parsers and wrappers for `vm_stat`, `sysctl`, `footprint`, `ps`, `lsof` and the thermal state |
 | `q5_runtime.py` | Sampler thread (every 500 ms), stop latch, cleanup of the owned process groups |
@@ -83,20 +89,20 @@ low-memory or pressure reading, and an interrupted campaign remains incomplete.
    - `cargo` and `rustc` count as competing builds.
    - The supervisor's own process and its ancestors are ignored.
    - The port must have no `lsof` listener, and a connection to it must be refused.
-2. **Baseline.** It takes six samples, 500 ms apart. Every sample must be observed, pressure must not be critical, and Free+cached must stay above 2 GiB. It also records:
+2. **Baseline.** It takes six samples, 500 ms apart. Every sample must be observed, pressure must not be critical, and Free+cached must stay above 2 GiB. An admitted run is also refused unless the baseline Free+cached is at least the calibrated charge plus the run's initial effective floor (see below). It also records:
    - `vm_stat`: free, speculative, file-backed, anonymous, compressor and wired pages.
    - `vm.swapusage`.
    - `kern.memorystatus_vm_pressure_level` and `kern.memorystatus_level`.
    - `hw.memsize` and the thermal state.
-3. **Launch.** It starts the case's `serve.argv` directly, without a shell, in a new session (its own process group). The child's environment is `PATH HOME USER LOGNAME TMPDIR LANG LC_ALL LC_CTYPE SHELL TERM` plus the case's explicit `env`; nothing else passes through.
+3. **Launch.** It starts the case's `serve.argv` directly, without a shell, in a new session (its own process group). The child's environment is `PATH HOME USER LOGNAME TMPDIR LANG LC_ALL LC_CTYPE SHELL TERM` plus the case's explicit `env`; nothing else passes through. A case with `artifact.text_only_locator: true` serves a hard link of the model from a private `{OUT}/text-model/` directory, which is removed after cleanup (see the case-file notes).
 4. **Readiness.** It polls the readiness URL, saves the `record` documents and checks each `checks` entry with strict JSON equality. A mismatch, for example a context length other than 262144, stops the run before the client starts.
 5. **Client.** It renders the client approval from the template and runs `client.argv` in its own session.
 6. **Sampling.** A separate thread samples every 500 ms. Each sample has host memory plus the phys_footprint and RSS of every member of the server's process group. Samples are written to `samples.jsonl`.
 7. **Live stops.** Checked on every sample, in this priority:
    - `pressure_critical`: `kern.memorystatus_vm_pressure_level >= 4`. Warning pressure (level 2) is counted in `pressure_counts` but does not stop the run. On 2026-10-30, warning appeared within 17 s while the 107 GB DeepSeek-V4 artifact faulted in, and 6.6 GB was still reclaimable.
    - `swap_growth`: swap used is more than baseline + 512 MiB.
-   - `free_cached_floor`: free + speculative + file-backed pages are below 2 GiB.
-   - `footprint_cap`: only when a cap is set, with `--footprint-cap-bytes` or `policy.footprint_cap_bytes`.
+   - `free_cached_floor`: free + speculative + file-backed pages are below the run's *effective floor* (at least 2 GiB; see "Effective Free+cached floor" below).
+   - `footprint_cap`: the server group's phys_footprint is above the run's growth cap. Every run has one (see "Growth cap" below).
    - `sampler_blind`: 3 consecutive blind samples.
    The deciding thread sends SIGTERM to the server and client groups immediately. The receipt records the sample→signal→exit latency.
 8. **Cleanup.** Every run ends the same way, whether it completed or stopped:
@@ -114,7 +120,8 @@ low-memory or pressure reading, and an interrupted campaign remains incomplete.
 
 | Verdict | Meaning | Exit |
 | --- | --- | --- |
-| `CalibrationPass` | Client succeeded. Pressure was never critical (warning is allowed and recorded), swap growth stayed below 512 MiB, Free+cached stayed at or above 2 GiB in every sample, no sample was blind, and cleanup was proven. | 0 |
+| `CalibrationPass` | Calibration run. Client succeeded. Pressure was never critical (warning is allowed and recorded), swap growth stayed below 512 MiB, the minimum Free+cached stayed at or above the run's final effective floor, the floor used a measured stop latency, no sample was blind, and cleanup was proven. | 0 |
+| `AdmittedRunPass` | The same conditions, for an admitted run. | 0 |
 | `Stopped` | A live stop or a supervisor stop ended the run. The stop wins over every other outcome. Supervisor stops: `server_exited`, `readiness_timeout`, `readiness_mismatch`, `client_timeout`, `interrupted`. A stop is a preserved failed case, not a retry trigger. | 1 |
 | `ClientFailed` | The client exited nonzero, or `summary.status` is not `success_status`. | 1 |
 | `CalibrationFailed` | The client completed, but a pass condition failed. | 1 |
@@ -123,10 +130,46 @@ low-memory or pressure reading, and an interrupted campaign remains incomplete.
 
 A violation that first appears during the unload after a completed run does not turn the run into `Stopped`. It is recorded as `post_completion_violation`, and it still fails the pass conditions.
 
+### Admission, growth cap and effective floor
+
+**Calibrated host peak.** phys_footprint leaves out file-backed weights. A DeepSeek-V4 receipt shows a 5.3 GiB footprint against a roughly 102 GiB Free+cached drop. So every receipt records `host_peak`:
+- `peak_host_used_bytes` = physical − the run's minimum Free+cached.
+- `baseline_host_used_bytes` = physical − baseline Free+cached.
+- The process `peak_footprint_bytes`.
+
+**Admission** (`--admission-receipt`). The receipt must be a `CalibrationPass` from a calibration run (an admitted-run receipt is refused). It must match this run's family, workload `id`, slots and context, binary sha256, artifact identity (sha256, otherwise size + mtime) and physical memory. Any mismatch means "recalibrate" and refuses the run.
+- The charge is `peak_host_used_bytes − baseline_host_used_bytes` from that receipt, which equals its baseline Free+cached minus its minimum Free+cached. Receipts written before this field existed still yield it.
+- The run is refused (`PreflightRefused`) unless the current baseline Free+cached ≥ charge + the run's initial effective floor. That floor is computed from the calibration's measured drop rate (below). Receipts that predate the rate record seed nothing, so their initial floor is 2 GiB.
+- `receipt.admission` records the charge, the decision and the admission receipt's path and sha256.
+
+**Growth cap.** Every run carries one, recorded as `growth_cap`:
+- **Admitted run:** a footprint cap of the calibrated `peak_footprint_bytes × 1.25`. It bounds anonymous growth (caches, scratch, projector) with 25% headroom for run-to-run variation. File-backed weights stay covered by the floor, swap and critical-pressure stops.
+- **Calibration run:** the host-level cap. Host used may not exceed physical − the effective floor. This is exactly the `free_cached_floor` stop, and the receipt says so (`growth_cap.bytes` is shown at the 2 GiB minimum).
+- **Negative control:** its own footprint cap.
+
+Cases cannot set a footprint cap.
+
+**Effective Free+cached floor** (`receipt.effective_floor`, every run; also `samples.effective_floor`):
+
+```
+effective_floor = max(2 GiB, max_post_readiness_drop_rate × (interval + stop latency))
+```
+
+- The rate is a running maximum. Each pair of consecutive observed samples whose earlier sample started at or after readiness contributes its Free+cached drop divided by the gap between them. The live stop compares every sample against the current floor, and a sample's own drop raises the floor before that comparison.
+- An admitted run starts with its admission receipt's measured rate (`floor_inputs.seed_rate_bytes_per_s`). A calibration run starts from 0, so its floor is 2 GiB until a rate is measured.
+- The latency is the `sample_to_exit_ns` of the `--negative-control-receipt`. That argument is required for every family run; the accepted control measured 146 ms. A run that stops also records its own `stop_latency`.
+- A pass requires the minimum Free+cached to be at least the final effective floor, and the latency to be measured.
+- Replayed on the 2026-10-30 calibrations:
+  - DeepSeek-V4: floor 2.00 GiB, minimum 4.09 GiB.
+  - Qwen3.8: floor 13.23 GiB (20.5 GiB/s first-request allocation right after readiness), minimum 51.30 GiB.
+  - Gemma4: floor 5.33 GiB, minimum 65.87 GiB.
+  - All three still pass.
+- `max_load_phase_drop_bytes_per_sample` records drops before readiness separately. For example, DeepSeek-V4 page-cached weights becoming wired drop Free+cached by up to about 80 GiB in one sample. No floor can catch that. Load-phase residency is bounded by the artifact's fixed size, which the admission charge already includes.
+
 ### Case files and variables
 
 Placeholders are written `{NAME}` and are filled from three sources:
-- **Built-ins:** `REPO`, `OUT`, `PYTHON`, `PYTHON_SHA256`, `RUN_ID`, `NONCE32`. `RUN_ID` is derived from the output directory name and matches the client's `[A-Za-z0-9_-]{16,64}` rule.
+- **Built-ins:** `REPO`, `OUT`, `PYTHON`, `PYTHON_SHA256`, `RUN_ID`, `NONCE32`. `RUN_ID` is derived from the output directory name and matches the client's `[A-Za-z0-9_-]{16,64}` rule. `SERVED_MODEL` is derived: the artifact path, or its hard link in `{OUT}/text-model/` when `artifact.text_only_locator` is true.
 - **The case's `variables`.** A `null` value means the variable is required.
 - **`HF2Q_Q5_<NAME>` environment overrides.** An override must name a declared variable.
 
@@ -139,8 +182,15 @@ The example cases follow the existing runners:
 - They use the canonical launchers with explicit text-only, four-slot settings.
 - They use the checked-in four-agent client `qwen_n4_live_smoke.py`, with `--family qwen`, `gemma4` or `deepseek4`.
 - Ports are 18238 (Qwen3.8), 18236 (Qwen3.6), 18244 (Gemma4) and 18240 (DeepSeek-V4).
-- Gemma4 is made text-only by pointing `MMPROJ` at a nonexistent file inside the receipt directory, which selects the launcher's no-projector branch.
-- DeepSeek-V4 passes `--ctx 262144` and an 8 GiB shared KV budget. The Qwen and Gemma cases use a 48 GiB shared KV budget.
+- **Text-only Qwen3.8 and Gemma4.** No launcher variable disables the projector:
+  - `QWEN38_VISION=off`, `VISION_MODE=off` and a nonexistent Gemma `MMPROJ` only omit `--mmproj`.
+  - `hf2q serve` then loads a sibling `mmproj*`/`*-mmproj*.gguf` automatically (`src/serve/mod.rs`, automatic local-path projector resolution). Both 2026-10-30 calibrations loaded one (884.6 MiB and 1.1 GiB).
+  - These cases therefore set `artifact.text_only_locator: true` and `MODEL={SERVED_MODEL}`. They also add a readiness check that `/hf2q/v1/runtime` `measurement_snapshot.active_controls.vision_projector` is `false`, which Qwen3.6 has as well.
+  - The hard link needs the receipt directory on the model's volume. It is the same inode, which is verified.
+- **DeepSeek-V4** passes `--ctx 262144` and an 8 GiB shared KV budget. The Qwen and Gemma cases use a 48 GiB shared KV budget.
+  - `q5_cases/deepseek4.json` is the case of record for the 2026-10-30 calibration, with the same workload id, argv and env.
+  - The one change: the blanket `HF2Q_DEEPSEEK_UNSAFE_MEMORY_OVERRIDE=1` is replaced by the scoped `MAX_COMPRESSOR_USED_GIB=16`. The host's idle compressor holds 9.3–10.0 GiB, above the launcher's 8 GiB default; the launcher's swap and other-process refusals stay active. The justification is in the case notes.
+  - It covers the canonical C262144 coding workload only.
 
 Default `HF2Q_BIN` and `MODEL` values are repo-relative placeholders; override them with absolute paths. Required inputs:
 - `CARGO`, `TOOLCHAIN`, `SANDBOX_PROOF`, `SANDBOX_PROOF_SHA256`: the client sandbox inputs used by the existing runners.
@@ -162,32 +212,51 @@ HF2Q_Q5_MODEL=/abs/Qwen3.8-27B-vanilla.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/ab
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/qwen38.json --dry-run
 HF2Q_Q5_MODEL=/abs/Qwen3.8-27B-vanilla.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/qwen38-client-approval.json \
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/qwen38.json \
+  --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-qwen38-$(date -u +%Y%m%dT%H%M%SZ)"
 
 # Gemma4 26B-A4B
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-$(date -u +%Y%m%dT%H%M%SZ)"
 
 # Qwen3.6 35B-A3B
 HF2Q_Q5_MODEL=/abs/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/qwen36-client-approval.json \
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/qwen36.json \
+  --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-qwen36-$(date -u +%Y%m%dT%H%M%SZ)"
 
 # DeepSeek-V4 Flash
 HF2Q_Q5_MODEL=/abs/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf \
 HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/deepseek4-client-approval.json \
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/deepseek4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-deepseek4-$(date -u +%Y%m%dT%H%M%SZ)"
+
+# Any later (admitted) run of a calibrated family: same case, binary, artifact, context and slots
+HF2Q_Q5_MODEL=/abs/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/deepseek4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/deepseek4.json \
+  --admission-receipt "$Q5_ROOT/<calibration of record>/receipt.json" \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/q5-deepseek4-admitted-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
+
+`NC_RECEIPT` is the accepted `NegativeControlPass` receipt (for example `$Q5_ROOT/q5-negative-control-20261030T041437Z/receipt.json`).
 
 Run `--dry-run` before every real run; it launches nothing:
 - It prints the expanded plan, `missing_variables` and the file checks (binary, artifact, launcher, client and template).
 - It exits 2 unless the plan is launchable.
 
-Optional inputs:
-- `HF2Q_Q5_MODEL_SHA256` adds a provided digest. The receipt labels it as not verified by the supervisor; artifact identity is size plus mtime.
-- After a family's first pass, later runs of the same artifact, source, context and slot count can add `--footprint-cap-bytes <calibrated peak + margin>`. Derive the margin from the negative control's measured `peak_over_cap_bytes` and `stop_latency`.
+Optional input:
+- `HF2Q_Q5_MODEL_SHA256` adds a provided digest. It must agree with the conversion receipt's digest when there is one; a contradiction refuses the run. Without a receipt, it is recorded as operator-provided and unverified.
+
+**Model and projector identity.**
+- `receipt.artifact.sha256` comes from the adjacent `<model>.gguf.receipt.json`, field `output.sha256`. It is accepted only when that receipt's `output.size` equals the file size. `sha256_source` cites the receipt path, the field and the receipt's own sha256.
+- Otherwise the identity is size + mtime.
+- `projectors_beside_artifact`, and for text-only runs `projectors_beside_served_model`, record the same identity for every projector the server could auto-load.
+- Models are never hashed inline.
 
 **Negative control.** One run of the bounded synthetic child:
 
@@ -225,6 +294,7 @@ The receipt also records `peak_over_cap_bytes`, which is the measured overshoot,
 - The approval template's `agent_template`, preflight keys and `family_controls` must match the current client checkout. The dry run checks only that the template file exists.
 - A blind sample, meaning failed host observation or a missing real footprint while a cap is enforced, never counts as a quiet host. Three blind samples in a row stop the run.
 - Thermal state is recorded but never stops a run. It is not an out-of-memory risk.
+
 ## F2 scoreboard rendering
 
 `f2_scoreboard_render.py` renders [docs/research/adr063-f2-scoreboard.md](../../docs/research/adr063-f2-scoreboard.md) from the checked-in rows manifest `docs/research/adr063-f2-scoreboard-rows.json` (schema `hf2q.f2.scoreboard-rows.v1`) plus any `f2_scoreboard_cli.py` outputs. Only those fixed-six outputs can produce Qualified F2 primary results; manifest rows are Descriptive, NegativeResult or Failure receipts and cite `$E/...` receipt paths and extraction keys, never absolute local paths. `--verify` re-reads every Verified row from its receipt and refuses drift:

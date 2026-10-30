@@ -9,6 +9,8 @@ run. Warning pressure is recorded but does not stop it: on 2026-10-30 warning
 appeared within 17 s while the 107 GB DeepSeek-V4 artifact faulted in, with
 6.6 GB still reclaimable.
 """
+import math
+
 MIB = 1 << 20
 GIB = 1 << 30
 CRITICAL_PRESSURE_LEVEL = 4  # kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical
@@ -32,6 +34,11 @@ STOP_REASONS = MEMORY_STOPS + SUPERVISOR_STOPS
 
 class PolicyError(ValueError):
     pass
+
+
+def effective_floor(base_floor, rate_bytes_per_s, interval_s, latency_ns):
+    """At least the base floor, raised to cover rate x (sample interval + stop latency)."""
+    return max(base_floor, math.ceil(rate_bytes_per_s * (interval_s + (latency_ns or 0) / 1e9)))
 
 
 def effective_policy(overrides):
@@ -76,8 +83,13 @@ def baseline_from(samples, policy):
     }, None
 
 
-def violations(sample, baseline, policy):
-    """All memory rules this sample breaks, in MEMORY_STOPS priority order."""
+def violations(sample, baseline, policy, floor=None):
+    """All memory rules this sample breaks, in MEMORY_STOPS priority order.
+
+    `floor` is the effective Free+cached floor (Monitor.effective_floor); it is never
+    below policy free_cached_floor_bytes.
+    """
+    floor = max(policy['free_cached_floor_bytes'], floor or 0)
     host, group, found = sample.get('host'), sample.get('group') or {}, []
     if host is not None:
         if host['pressure_level'] >= CRITICAL_PRESSURE_LEVEL:
@@ -86,8 +98,8 @@ def violations(sample, baseline, policy):
         if growth > policy['swap_growth_tolerance_bytes']:
             found.append(('swap_growth', f'swap used grew {growth} B over baseline'))
         free = host['vm']['free_plus_cached_bytes']
-        if free < policy['free_cached_floor_bytes']:
-            found.append(('free_cached_floor', f'free+cached {free} B below floor'))
+        if free < floor:
+            found.append(('free_cached_floor', f'free+cached {free} B below effective floor {floor} B'))
     cap, value = policy['footprint_cap_bytes'], group.get('footprint_bytes')
     if cap is not None and value is not None and value > cap:
         found.append(('footprint_cap', f'{group.get("footprint_source")} {value} B above cap {cap} B'))
@@ -95,10 +107,23 @@ def violations(sample, baseline, policy):
 
 
 class Monitor:
-    """Feeds samples in order; aggregates extrema and returns the first stop decision."""
+    """Feeds samples in order; aggregates extrema and returns the first stop decision.
 
-    def __init__(self, baseline, policy):
+    Dynamic floor: effective_floor = max(free_cached_floor_bytes,
+    max post-readiness Free+cached drop rate x (interval + stop latency)). The rate is
+    a running maximum over consecutive observed samples whose earlier sample started
+    at or after `ready_ns` (set when the server becomes ready), seeded from the
+    admission receipt's measured rate when given. Before readiness the drops are
+    load-phase residency, bounded by the artifact size and recorded separately.
+    """
+
+    def __init__(self, baseline, policy, latency_ns=None, latency_source='unavailable', seed_rate=0):
         self.baseline, self.policy = baseline, policy
+        self.latency_ns, self.latency_source = latency_ns, latency_source
+        self.seed_rate = self.max_rate = seed_rate
+        self.ready_ns = None
+        self.max_post_drop = self.max_load_drop = 0
+        self.last_observed = None
         self.count = self.observed = self.blind_run = self.max_blind_run = 0
         self.pressure_counts = {}
         self.min_free_cached = self.max_compressor = self.max_swap = self.max_wired = None
@@ -108,6 +133,26 @@ class Monitor:
         self.last_start_ns = None
         self.stop = None
         self.post_stop_peak_footprint = None
+
+    def effective_floor(self):
+        return effective_floor(self.policy['free_cached_floor_bytes'], self.max_rate,
+                               self.policy['interval_seconds'], self.latency_ns)
+
+    def _rate(self, sample):
+        host = sample.get('host')
+        if host is None:
+            return
+        previous, self.last_observed = self.last_observed, sample
+        if previous is None:
+            return
+        drop = previous['host']['vm']['free_plus_cached_bytes'] - host['vm']['free_plus_cached_bytes']
+        seconds = (sample['start_ns'] - previous['start_ns']) / 1e9
+        if self.ready_ns is not None and previous['start_ns'] >= self.ready_ns:
+            self.max_post_drop = max(self.max_post_drop, drop)
+            if seconds > 0:
+                self.max_rate = max(self.max_rate, drop / seconds)
+        else:
+            self.max_load_drop = max(self.max_load_drop, drop)
 
     def _update(self, sample):
         host, group = sample.get('host'), sample.get('group') or {}
@@ -144,11 +189,12 @@ class Monitor:
     def feed(self, sample):
         self.count += 1
         self._update(sample)
+        self._rate(sample)
         self.blind_run = self.blind_run + 1 if self._blind(sample) else 0
         self.max_blind_run = max(self.max_blind_run, self.blind_run)
         if self.stop is not None:
             return None
-        found = violations(sample, self.baseline, self.policy)
+        found = violations(sample, self.baseline, self.policy, self.effective_floor())
         if not found and self.blind_run >= self.policy['max_blind_samples']:
             found = [('sampler_blind', f'{self.blind_run} consecutive blind samples')]
         if not found:
@@ -173,7 +219,20 @@ class Monitor:
                        'compressor_bytes': delta(self.max_compressor, b['compressor_bytes']),
                        'free_plus_cached_bytes': delta(self.min_free_cached, b['free_plus_cached_bytes']),
                        'wired_bytes': delta(self.max_wired, b['wired_bytes'])},
+            'effective_floor': self.floor_record(),
         }
+
+    def floor_record(self):
+        return {'free_cached_floor_bytes': self.policy['free_cached_floor_bytes'],
+                'seed_rate_bytes_per_s': math.ceil(self.seed_rate),
+                'max_post_readiness_drop_rate_bytes_per_s': math.ceil(self.max_rate),
+                'max_post_readiness_drop_bytes_per_sample': self.max_post_drop,
+                'interval_seconds': self.policy['interval_seconds'],
+                'latency_ns': self.latency_ns, 'latency_source': self.latency_source,
+                'effective_floor_bytes': self.effective_floor(),
+                'min_free_plus_cached_bytes': self.min_free_cached,
+                'max_load_phase_drop_bytes_per_sample': self.max_load_drop,
+                'load_phase_note': 'drops before readiness are not catchable by a floor; bounded by the artifact size'}
 
 
 def classify(stop, client, summary, cleanup_proven, policy):
@@ -182,8 +241,10 @@ def classify(stop, client, summary, cleanup_proven, policy):
     A stop wins over everything: the supervisor ended the run. A client failure is
     next. A completed run passes only if pressure was never critical (warning is
     recorded in `pressure_counts`, not failed), swap growth stayed strictly below
-    the tolerance, Free+cached stayed at or above the floor in every sample, no
-    sample was blind and cleanup was proven.
+    the tolerance, the minimum Free+cached stayed at or above the run's final
+    effective floor (at least 2 GiB, raised to the measured allocation rate times
+    interval plus stop latency), the latency was measured, no sample was blind and
+    cleanup was proven.
     """
     if stop is not None:
         return {'verdict': 'Stopped', 'reason': stop['reason'], 'detail': stop.get('detail')}
@@ -199,9 +260,11 @@ def classify(stop, client, summary, cleanup_proven, policy):
     growth = summary['deltas']['swap_used_bytes']
     if growth is None or growth >= policy['swap_growth_tolerance_bytes']:
         reasons.append('swap growth reached the tolerance')
-    low = summary['min_free_plus_cached_bytes']
-    if low is None or low < policy['free_cached_floor_bytes']:
-        reasons.append('free+cached fell below the floor')
+    low, floor = summary['min_free_plus_cached_bytes'], summary['effective_floor']
+    if low is None or low < max(policy['free_cached_floor_bytes'], floor['effective_floor_bytes']):
+        reasons.append('free+cached fell below the effective floor')
+    if floor['latency_ns'] is None:
+        reasons.append('effective floor lacks a measured stop latency')
     if not cleanup_proven:
         reasons.append('cleanup not proven')
     if reasons:

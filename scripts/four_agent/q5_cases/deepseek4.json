@@ -4,10 +4,13 @@
   "notes": [
     "Derived from: DeepSeek-V4 runner: current-port balanced series manifest and launcher (--ctx 262144, 8 GiB shared KV budget).",
     "Override any variable with HF2Q_Q5_<NAME>; null variables are required. See scripts/four_agent/README.md.",
-    "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv."
+    "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
+    "This is the case of record for the 2026-10-30 DeepSeek-V4 calibration (campaign q5-deepseek4-final-20261030T051035Z, case-final.json sha 0a546ef1...): same workload id, argv and env, except that the blanket HF2Q_DEEPSEEK_UNSAFE_MEMORY_OVERRIDE=1 is replaced by the scoped MAX_COMPRESSOR_USED_GIB=16.",
+    "MAX_COMPRESSOR_USED_GIB=16: the launcher refuses before load when the compressor holds more than MAX_COMPRESSOR_USED_GIB (default 8). The first a1 attempt (a1-20261030T042017Z) was refused for 'compressor use exceeds 8 GiB'. The dedicated host's idle baseline compressor is 9.3-10.0 GiB (QE verdict; final receipt baseline.compressor_bytes 10002579456). 16 GiB admits that measured baseline with ~6 GiB headroom while still refusing a compressor at twice the launcher default. The launcher's swap (8 GiB) and other-process (8 GiB) refusals stay active. The Q5 live stops (critical pressure, swap +512 MiB, Free+cached < 2 GiB, footprint cap) govern the run.",
+    "Scope: the canonical C262144 coding workload only (about 2.3k prompt tokens per slot, no demand-grown cache migration). Calibrate any deeper DeepSeek-V4 workload separately."
   ],
   "workload": {
-    "id": "adr063-q5-deepseek4-n4-coding-ctx262144",
+    "id": "adr063-q5-deepseek4-n4-coding-ctx262144-final-default",
     "slots": 4,
     "context_per_slot": 262144,
     "client": "scripts/four_agent/qwen_n4_live_smoke.py --family deepseek4"
@@ -45,7 +48,9 @@
       "MAX_SLOTS": "4",
       "HOST": "127.0.0.1",
       "PORT": "{PORT}",
-      "HF2Q_BIN": "{HF2Q_BIN}"
+      "HF2Q_BIN": "{HF2Q_BIN}",
+      "MAX_COMPRESSOR_USED_GIB": "16",
+      "RUST_LOG": "info"
     }
   },
   "readiness": {
