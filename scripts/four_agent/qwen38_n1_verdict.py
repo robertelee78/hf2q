@@ -9,7 +9,9 @@ RAW_LIMIT = 32 * 1024 * 1024
 PROFILE = "adr063-qwen38-n1-live-v2"
 FIXTURE_SHA = "1643af68f5be6118ab2c83a386027564fcd9954ab284d1cc1fbcba544fe053ff"
 TOOLS = {"read_file", "write_file", "run_tests"}
-WORKFLOW = (
+# The six-step protocol is shared by every task; coding_instances.py appends
+# its own task sentence in place of the canonical parse_port one.
+WORKFLOW_STEPS = (
     "Work only in this isolated Rust fixture. The paths are src/ports.rs and "
     "tests/ports.rs. Complete exactly these six steps, one tool call per response, "
     "waiting for its real result before the next step: (1) read_file src/ports.rs; "
@@ -17,6 +19,8 @@ WORKFLOW = (
     "(4) run_tests target ports; (5) read_file src/ports.rs to review the final file; "
     "(6) run_tests target all. Then give a final summary without another tool call, "
     "describing the behavior and actual test results. Do not change the tests. "
+)
+WORKFLOW = WORKFLOW_STEPS + (
     "Fix parse_port to reject zero and values above 65535, accept valid u16 ports, "
     "and return a Result<u16, String> for invalid input rather than panic."
 )

@@ -1,0 +1,30 @@
+{
+  "schema": "hf2q.four-agent.coding-instances.v1",
+  "difficulty_class": "Fix one Rust parser in src/ports.rs from `s.parse().unwrap()` to Result<T, String> over an unsigned type T, enforcing two explicit inclusive bounds min > 0 and max < T::MAX; two unit and two integration tests reject min-1, max+1, a word, -1 and T::MAX+1 and accept min and max. Paths, tools, six-step protocol and test counts equal the canonical parse_port workload.",
+  "instances": [
+    {"id": 0, "function": "parse_registered_port", "type": "u16", "min": 1024, "max": 49151, "nouns": "registered ports", "slug": "registered_ports", "word": "http"},
+    {"id": 1, "function": "parse_privileged_port", "type": "u16", "min": 1, "max": 1023, "nouns": "privileged ports", "slug": "privileged_ports", "word": "ssh"},
+    {"id": 2, "function": "parse_vlan_id", "type": "u16", "min": 1, "max": 4094, "nouns": "VLAN IDs", "slug": "vlan_ids", "word": "trunk"},
+    {"id": 3, "function": "parse_mtu", "type": "u16", "min": 576, "max": 9216, "nouns": "MTU sizes", "slug": "mtu_sizes", "word": "jumbo"},
+    {"id": 4, "function": "parse_ttl", "type": "u16", "min": 1, "max": 255, "nouns": "TTL values", "slug": "ttl_values", "word": "forever"},
+    {"id": 5, "function": "parse_listen_backlog", "type": "u16", "min": 16, "max": 4096, "nouns": "listen backlog sizes", "slug": "backlog_sizes", "word": "unbounded"},
+    {"id": 6, "function": "parse_worker_threads", "type": "u16", "min": 1, "max": 512, "nouns": "worker thread counts", "slug": "worker_counts", "word": "auto"},
+    {"id": 7, "function": "parse_max_connections", "type": "u32", "min": 1, "max": 100000, "nouns": "connection limits", "slug": "connection_limits", "word": "unlimited"},
+    {"id": 8, "function": "parse_connect_timeout_ms", "type": "u32", "min": 100, "max": 60000, "nouns": "connect timeouts in milliseconds", "slug": "connect_timeouts", "word": "never"},
+    {"id": 9, "function": "parse_keepalive_secs", "type": "u32", "min": 10, "max": 7200, "nouns": "keepalive intervals in seconds", "slug": "keepalive_intervals", "word": "off"},
+    {"id": 10, "function": "parse_retry_limit", "type": "u8", "min": 1, "max": 10, "nouns": "retry limits", "slug": "retry_limits", "word": "always"},
+    {"id": 11, "function": "parse_http_status", "type": "u16", "min": 100, "max": 599, "nouns": "HTTP status codes", "slug": "status_codes", "word": "ok"},
+    {"id": 12, "function": "parse_redirect_status", "type": "u16", "min": 300, "max": 399, "nouns": "redirect status codes", "slug": "redirect_codes", "word": "found"},
+    {"id": 13, "function": "parse_ipv4_prefix_len", "type": "u8", "min": 1, "max": 32, "nouns": "IPv4 prefix lengths", "slug": "ipv4_prefixes", "word": "slash"},
+    {"id": 14, "function": "parse_ipv6_prefix_len", "type": "u8", "min": 1, "max": 128, "nouns": "IPv6 prefix lengths", "slug": "ipv6_prefixes", "word": "full"},
+    {"id": 15, "function": "parse_window_scale", "type": "u8", "min": 1, "max": 14, "nouns": "TCP window scale shifts", "slug": "window_scales", "word": "max"},
+    {"id": 16, "function": "parse_wifi_channel", "type": "u8", "min": 1, "max": 13, "nouns": "Wi-Fi channels", "slug": "wifi_channels", "word": "any"},
+    {"id": 17, "function": "parse_dns_ttl_secs", "type": "u32", "min": 60, "max": 86400, "nouns": "DNS TTLs in seconds", "slug": "dns_ttls", "word": "default"},
+    {"id": 18, "function": "parse_queue_depth", "type": "u16", "min": 2, "max": 1024, "nouns": "queue depths", "slug": "queue_depths", "word": "deep"},
+    {"id": 19, "function": "parse_pool_size", "type": "u16", "min": 1, "max": 256, "nouns": "pool sizes", "slug": "pool_sizes", "word": "dynamic"},
+    {"id": 20, "function": "parse_body_limit_kib", "type": "u32", "min": 1, "max": 10240, "nouns": "request body limits in KiB", "slug": "body_limits", "word": "none"},
+    {"id": 21, "function": "parse_rate_limit_rps", "type": "u32", "min": 1, "max": 50000, "nouns": "rate limits in requests per second", "slug": "rate_limits", "word": "burst"},
+    {"id": 22, "function": "parse_session_minutes", "type": "u16", "min": 5, "max": 1440, "nouns": "session lengths in minutes", "slug": "session_lengths", "word": "sticky"},
+    {"id": 23, "function": "parse_vxlan_vni", "type": "u32", "min": 1, "max": 16777215, "nouns": "VXLAN network identifiers", "slug": "vxlan_vnis", "word": "overlay"}
+  ]
+}
