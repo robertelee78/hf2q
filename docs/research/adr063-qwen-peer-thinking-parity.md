@@ -7,14 +7,16 @@ Qwen3.6 N4 E0282/workflow failure remains failed and unrescored. No model/backen
 cause is established by this transport change.
 
 The actual shared build_request now receives explicit engine_kind (HF default).
-Only Qwen/peer maps the actual message chain to reasoning_budget_tokens:2048
-for a non-tool continuation,512 after the first assistant tool-call cycle since
-the latest user, then256 floor. System messages are skipped for latest-role
-selection; one parallel assistant call bundle is one cycle; a new user resets
-cycles. This mirrors qwen_thinking_policy.rs qwen_tool_chain_state and
-adaptive_qwen_default_thinking_budget with canonical2048/512 defaults. Root
-retained failed-Q36 and successful-Q38 server logs independently show effective
-2048→512→256. The budget is derived from chain semantics, not a guessed turn ID.
+Only Qwen/peer maps the actual message chain to reasoning_budget_tokens: 2048
+for a non-tool continuation and 512 for every tool-result continuation since
+the latest user. System messages are skipped for latest-role selection; a new
+user turn resets the chain. This mirrors qwen_thinking_policy.rs
+qwen_tool_chain_state and adaptive_qwen_default_thinking_budget with canonical
+2048/512 defaults. Before 2026-10-30, hf2q halved the continuation budget to a
+256 floor from the second tool cycle; that halving forced agent-2 to close its
+reasoning mid-plan in the failed Qwen3.6 N4 run, and was removed from hf2q and
+this mirror together. The budget is derived from chain semantics, not a guessed
+turn ID.
 
 Peer d854d98bae598388ecea1ed84396587e5edc326d server-common.cpp1516–1526 accepts
 reasoning_budget_tokens. Request messages/tools are preserved by reference,
