@@ -16,7 +16,7 @@ RUNTIME_EXECUTABLES = {
     'vllm', 'sglang', 'koboldcpp',
 }
 # Hosted peers started as `python -m <module>` or via the module's console script.
-PYTHON_MODULE_ROOTS = ('mlx_lm', 'mlx_vlm', 'vllm', 'llama_cpp', 'sglang')
+PYTHON_MODULE_ROOTS = ('mlx_lm', 'mlx_vlm', 'vllm', 'sglang')
 BUILD_EXECUTABLES = {'cargo', 'rustc'}
 LAUNCHER = re.compile(r'serve_[a-z0-9_]+_opencode\.sh')
 SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish'}

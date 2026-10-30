@@ -77,8 +77,8 @@ low-memory or pressure reading, and an interrupted campaign remains incomplete.
    - It looks only at each process's executable, or at the program an interpreter or `env` runs. It never searches the rest of the command line, so an agent such as omp whose prompt mentions "hf2q" does not count.
    - Matched as runtimes:
      - `hf2q` and `hf2q-*` (including Cargo test binaries).
-     - llama.cpp tools, `ollama` and `lms`.
-     - Python-hosted peers: `python -m mlx_lm.server` or `python -m mlx_lm server`, `mlx_lm.*` and `mlx_vlm.*` console scripts, `vllm`, `llama_cpp`, `sglang`.
+     - The peer engine's `llama-*` tools, `ollama` and `lms`.
+     - Python-hosted peers: `python -m mlx_lm.server` or `python -m mlx_lm server`, `mlx_lm.*` and `mlx_vlm.*` console scripts, `vllm`, `sglang`.
      - A running `serve_*_opencode.sh` launcher.
    - `cargo` and `rustc` count as competing builds.
    - The supervisor's own process and its ancestors are ignored.
