@@ -188,7 +188,7 @@ Repository ownership: hf2q owns anchor identity, lineage, component validity, pu
 
 Validation: Review HLD/LLD and run boundary state-machine regressions with synthetic state and real family layout invariants.
 
-Predecessors: F3, Q5.
+Predecessors: F3. (C1 is a test-only contract with no hardware work; under the 2026-10-30 Q5 rewrite, Q5 gates only each family's hardware work, so Q5 is not a C1 predecessor.)
 
 Priority: High. Core scope.
 
