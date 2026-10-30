@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - ADR-063 Q1 numeric policy (`docs/research/adr063-q1-numeric-policy.md`), approved by the operator on 2026-10-30, and the offline `scripts/four_agent/q1_decision_policy.py` checker. The checker reads retained Q1 trace stores, logprob responses, task outcomes and four-agent client runs. It reports bitwise equality, a logit decision envelope, near-tie fork classification, paired task-quality verdicts and transcript equality, and never loads a model.
+- ADR-063 Q3 three-arm campaign driver (`scripts/four_agent/q3_campaign.py`, rules in `docs/research/adr063-q3-campaign.md`). It runs stock hf2q, experiment hf2q and the peer's best valid configuration in Williams-ordered blocks through the Q5 supervisor, one runtime at a time. Binary, model, peer and harness identities are frozen at campaign start. Blocks run until the 95% interval of the makespan ratio is within 2.5 points (5 to 20 blocks). The driver reports per-family `Win`, `Loss`, `Inconclusive`, `Unavailable` or `Failed` verdicts and F2 scoreboard rows. The four-agent client gains `--phase-plan` for the Q3 one-agent and mixed-phase (3+1, 2+2, 1+3) controls; without it the canonical workload is byte-identical. This tooling establishes no speed result.
+
 ### Fixed
 
 - Keep the Qwen tool-continuation thinking ceiling (default 512) at every tool-chain depth. Halving it to a 256-token floor from the second tool result forced the reasoning close inside the first edit plan of an ordinary read/read/write coding workflow.
