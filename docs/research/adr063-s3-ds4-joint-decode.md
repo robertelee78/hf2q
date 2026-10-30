@@ -160,7 +160,7 @@ The value is read once per process. It is also forced off by `MLX_UNRETAINED_REF
 - **Decode scratch:** the high-water mark grows about B× (on the order of 150 MB at B=4; ratio-4 indexer scratch grows with context). It may exceed the 256 MiB retained-scratch cap and be reallocated each turn.
 - **Code duplication:** the per-row cores intentionally duplicate the one-token decode branch, so the serial reference stays untouched. Dedupe the two after promotion.
 
-## Reference: llama.cpp DSV4 multi-slot decode (read-only, HEAD 3c809f443, MIT, no code copied)
+## Reference: the peer's DSV4 multi-slot decode (read-only, HEAD 3c809f443, MIT, no code copied)
 
 **Dense products run once over all decoding rows.** The DSV4 graph applies every projection to the `nt` rows of the ubatch with ordinary `mul_mat`:
 
@@ -175,7 +175,7 @@ With one token per decoding slot, `ne11 = B`.
 
 - This is the same family as mlx-native's default-off `mul_mv_ext`.
 - Its lane partition and reduction order differ from the `ne11 = 1` matvec.
-- So llama.cpp's multi-slot decode reads the weights once but does **not** promise per-row bit equality with single-slot decode.
+- So the peer's multi-slot decode reads the weights once but does **not** promise per-row bit equality with single-slot decode.
 - hf2q's contract is stricter. That is why phase 1 keeps the exact per-row `nr2` route, and why the exact read-once kernel below is specified rather than adopting `mul_mv_ext`.
 
 **Per-row attention at different positions.**
