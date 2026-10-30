@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in DeepSeek-V4 joint decode (`HF2Q_DEEPSEEK_JOINT_DECODE=1`): every eligible decoding slot (2–8 rows, unequal positions, streaming and unary) advances through one layer-major forward per token step, with row-parallel projections, FFN and output head dispatched once per step and cache-dependent attention per row. Each row is designed to be bitwise identical to serial decode; the default stays serial until the official-artifact exactness test and the four-agent A/B pass on hardware.
+
 ## [0.1.28] — 2026-10-29
 
 ### Fixed

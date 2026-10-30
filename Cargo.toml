@@ -43,6 +43,7 @@ exclude = [
     "!tests/lcp_registry_unit.rs",
     "!tests/fixtures/deepseek_v4_encoding/**",
     "!tests/fixtures/ggml_quants/**",
+    "!tests/fixtures/hf2q-0.1.24-normalized-cargo.toml",
     "!tests/fixtures/qwen38/**",
     "!tests/fixtures/structured_output/r2c/**",
     # Reference paper PDF (TurboQuant arxiv 2504.19874).
