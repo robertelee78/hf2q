@@ -1,10 +1,12 @@
 # ADR-063 S3 — Qwen joint B-row decode (phase 1)
 
-Status (2026-10-30):
+Status (2026-10-31):
 - **Qwen3.8 (dense): default on.** Official-artifact gates passed and the four-agent ABBA A/B passed; see "Measured result".
-- **Qwen3.6 (MoE): default off, opt-in with `HF2Q_QWEN_JOINT_DECODE=1`.** Its forward is bitwise exact, but the four-agent A/B is incomplete and both joint runs failed the coding protocol; see "Qwen3.6 verdict".
+- **Qwen3.6 (MoE): default off, opt-in with `HF2Q_QWEN_JOINT_DECODE=1`.** Its forward is bitwise exact, but the four-agent A/B is incomplete. Both joint runs failed the coding protocol; so do stock hf2q, the peer and the BF16 source, so the failure is model behavior, not joint decode (`docs/research/adr063-qwen36-task-failure-diagnosis.md`). Promotion is deferred to a successor; see "Qwen3.6 verdict".
 - `HF2Q_QWEN_JOINT_DECODE=0` restores the serial path for every family.
-- **Qwen3.8 shared-weight dense FFN (padded mode): default on.** Joint steps no longer re-read the FFN gate/up weights once per packed row; `HF2Q_QWEN_JOINT_FFN_SHARED=0` restores the per-row fused kernel. Hardware gates passed, and the four-agent A/B against the kill switch measured 4.9% less makespan (block-paired 95% CI 2.2–7.6%), well short of the 2.2× bandwidth projection. The real-prompt Q1 envelope is `WithinDecisionEnvelope` for both FFN routes (below). Still open: the paired quality campaign against stock. See "Dense FFN weight sharing (padded mode)".
+- **Qwen3.8 shared-weight dense FFN (padded mode): default on.** Joint steps no longer re-read the FFN gate/up weights once per packed row; `HF2Q_QWEN_JOINT_FFN_SHARED=0` restores the per-row fused kernel. Hardware gates passed, and the four-agent A/B against the kill switch measured 4.9% less makespan (block-paired 95% CI 2.2–7.6%), well short of the 2.2× bandwidth projection. The real-prompt Q1 envelope is `WithinDecisionEnvelope` for both FFN routes (below). See "Dense FFN weight sharing (padded mode)".
+- **Qwen3.8 task quality against stock: Pass.** On the final binary 38485a23 (joint decode and shared FFN at their defaults) against the same binary with `HF2Q_QWEN_JOINT_DECODE=0`: 22/24 vs 22/24 instances, no discordant pairs (`E/quality-qwen38-exp3848-vs-stock-20261031T061243Z`). The earlier pairing against the peer was 23/24 vs 21/24 at 0b959107.
+- **Cancel under joint decode: CancelSmokePass** on Qwen3.8 (`E/s3-cancel-v1/qwen38-20261031T060010Z`). Closing one stream mid-decode left the other three agents finishing with CalibrationPass. All 435 scheduler turns ran joint (width 2: 4, width 3: 199, width 4: 232; no serial lanes).
 - All three cohort-invariance gates passed at 0b959107 (`E/qwen-joint-invariance-v1`), and the padded gate passed again on both FFN routes at c25d7ef2 (`E/qwen-ffn-gates-v1`).
 
 ## Problem
@@ -215,7 +217,7 @@ Results for the shared-FFN change (branch `c25d7ef2`) are in `E/qwen-ffn-gates-v
 **Cohort invariance** (`qwen35::real_artifact_joint_decode_invariance_tests`, ignored). For each variant, one cache with four identically prefilled slots advances slot 2 for 4 steps inside a different cohort: alone, `{0,2}`, `{2,3}`, `{1,2,3}`, `{2,3,1}`, and `{0,1,3,2}` with slot 2 packed last. Slot 2's logits, hidden, cursor, parity, KV codes/scales and conv/recurrent bytes must be bitwise equal across all variants.
 
 - `qwen36_joint_decode_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN36_GGUF`). **Passed** (`q36-invariance.log`).
-- `qwen38_joint_decode_mvn_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MV_EXT` unset). Not yet run.
+- `qwen38_joint_decode_mvn_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MV_EXT` unset). **Passed** at 0b959107 (`E/qwen-joint-invariance-v1/qwen38-mvn.log`).
 - `qwen38_joint_decode_padded_mv_ext_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1`): both dense FFN routes, shared weights first. **Passed** for both routes (`padded-invariance.log`).
 
 **Q1 Class B envelope on real prompts** (Qwen3.8 padded mode; `qwen35::real_artifact_joint_decode_q1_tests`).
