@@ -29,7 +29,7 @@ fn official_gguf() -> PathBuf {
     path
 }
 
-fn load_options() -> LoadOptions {
+pub(super) fn load_options() -> LoadOptions {
     LoadOptions {
         model_path: official_gguf(),
         tokenizer_path: None,
@@ -44,7 +44,7 @@ fn load_options() -> LoadOptions {
 }
 
 /// Synthetic ids above the special/control range, distinct per slot.
-fn synthetic_prompt(slot: usize, len: usize, vocab: usize) -> Vec<u32> {
+pub(super) fn synthetic_prompt(slot: usize, len: usize, vocab: usize) -> Vec<u32> {
     let span = vocab - 2_048;
     (0..len)
         .map(|i| (1_024 + (i * 7_919 + slot * 104_729 + 17) % span) as u32)
@@ -52,7 +52,7 @@ fn synthetic_prompt(slot: usize, len: usize, vocab: usize) -> Vec<u32> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct LaneImage {
+pub(super) struct LaneImage {
     first_token: u32,
     logits: Vec<u32>,
     /// One SHA-256 per (layer, K | V codes | V scales) over the slot's valid
@@ -66,7 +66,7 @@ struct LaneImage {
 /// `[0, global_rows)` of global layers and, for sliding layers, either the
 /// live ring rows of a `valid_tokens`-long sequence or (`whole_ring`) every
 /// ring row.
-fn slot_kv_hashes(
+pub(super) fn slot_kv_hashes(
     guard: &Gemma4KvGuard<'_>,
     slot: usize,
     global_rows: usize,
@@ -112,7 +112,7 @@ fn slot_kv_hashes(
     kv
 }
 
-fn slot_cursors(guard: &Gemma4KvGuard<'_>, slot: usize) -> Vec<u32> {
+pub(super) fn slot_cursors(guard: &Gemma4KvGuard<'_>, slot: usize) -> Vec<u32> {
     guard
         .kv
         .iter()
@@ -128,7 +128,7 @@ fn slot_cursors(guard: &Gemma4KvGuard<'_>, slot: usize) -> Vec<u32> {
         .collect()
 }
 
-fn lane_image(
+pub(super) fn lane_image(
     guard: &Gemma4KvGuard<'_>,
     slot: usize,
     valid_tokens: usize,
@@ -156,7 +156,7 @@ fn slot_isolation_image(
     )
 }
 
-fn assert_lane_equal(label: &str, joint: &LaneImage, reference: &LaneImage) {
+pub(super) fn assert_lane_equal(label: &str, joint: &LaneImage, reference: &LaneImage) {
     assert_eq!(
         joint.first_token, reference.first_token,
         "{label}: first token"

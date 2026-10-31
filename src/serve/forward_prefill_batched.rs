@@ -96,6 +96,79 @@ fn gemma_batched_mask_seq_len(seq_len: usize, live_prefix_resume: bool) -> usize
     }
 }
 
+/// Whether a batched prefill builds the request-local dense K/V decode
+/// handoff (`self.dense_kvs` / `self.dense_sdpa_tmp`) and, from it, the LCP
+/// registry snapshots. Only the SerialFifo cold route consumes them. A live
+/// resume reads and extends the mounted hybrid cache; the slot-mounted
+/// (`forward_prefill_batched*_slot_mounted`) and multi-sequence callers
+/// restore their own `dense_kvs` right after the call, and nothing in the
+/// SlotAware worker reads the LCP snapshot fields. No prefill kernel reads
+/// the handoff either, so skipping it changes no logits or live KV byte.
+pub(crate) fn gemma_batched_prefill_builds_dense_handoff(
+    live_prefix_resume: bool,
+    slot_aware_mount: bool,
+    multi_seq: bool,
+) -> bool {
+    !live_prefix_resume && ((!slot_aware_mount && !multi_seq) || legacy_dense_handoff_forced())
+}
+
+/// Real-artifact gate only: rebuild the dense handoff and LCP snapshots on
+/// every cold batched prefill, as before they were limited to the
+/// SerialFifo route, so one process can compare both arms bit for bit.
+#[cfg(test)]
+pub(crate) static FORCE_LEGACY_DENSE_HANDOFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn legacy_dense_handoff_forced() -> bool {
+    FORCE_LEGACY_DENSE_HANDOFF.load(Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn legacy_dense_handoff_forced() -> bool {
+    false
+}
+
+/// Rows per layer of an LCP snapshot leg before the graft/prompt floor: the
+/// sliding window or the tile-rounded `seq_len + max_decode_tokens` linear
+/// span (+4096 rows of turn growth under long resume), for every layer.
+pub(crate) fn gemma_lcp_snapshot_rows(
+    seq_len: usize,
+    max_decode_tokens: usize,
+    sliding_window: usize,
+    long_resume: bool,
+) -> usize {
+    sliding_window.max(
+        crate::serve::forward_prefill::gemma_flash_attn_vec_capacity(
+            seq_len + max_decode_tokens + if long_resume { 4096 } else { 0 },
+        ),
+    )
+}
+
+/// Bytes of one dual-leg LCP snapshot at `rows` rows per layer: dense K + V
+/// at `kv_elem_bytes`, plus the hybrid F16 K, U8 V codes and F32 V norm.
+/// `layers` yields `(num_kv_heads, head_dim)` per layer.
+pub(crate) fn gemma_lcp_snapshot_estimate_bytes(
+    layers: impl Iterator<Item = (usize, usize)> + Clone,
+    rows: usize,
+    kv_elem_bytes: usize,
+    hybrid: bool,
+) -> u64 {
+    let dense: u64 = layers
+        .clone()
+        .map(|(nkv, hd)| (2 * nkv * rows * hd * kv_elem_bytes) as u64)
+        .sum();
+    let hybrid: u64 = if hybrid {
+        layers
+            .map(|(nkv, hd)| (nkv * rows * (hd * 2 + hd + 4)) as u64)
+            .sum()
+    } else {
+        0
+    };
+    dense + hybrid
+}
+
 // ---------------------------------------------------------------------------
 // Auto route viability (2026-08-03)
 // ---------------------------------------------------------------------------
@@ -806,14 +879,24 @@ impl MlxModelWeights {
         );
         let linear_capacity = capacity_plan.allocation_linear;
         let sliding_layer_capacity = capacity_plan.allocation_sliding;
-        let dense_kvs_vec: Vec<DenseKvBuffers> = if live_prefix_resume {
+        // Only the SerialFifo cold route consumes the request-local dense K/V
+        // decode handoff and the LCP snapshots copied from it (see
+        // `gemma_batched_prefill_builds_dense_handoff`).
+        let dense_handoff = gemma_batched_prefill_builds_dense_handoff(
+            live_prefix_resume,
+            slot_aware_mount,
+            self.multi_seq_prefill.is_some(),
+        );
+        let dense_kvs_vec: Vec<DenseKvBuffers> = if !dense_handoff {
             // The live-prefix path reads and updates the production hybrid KV
-            // mounted by the slot-aware caller.  The old implementation also
-            // allocated a full dense K+V cache, copied every suffix row into
-            // it after attention, and immediately discarded it when the slot
-            // mount was restored.  No live-resume consumer reads that dense
-            // handoff, and LCP snapshots are disabled for live resumes below.
-            // Keep the handoff absent instead of committing duplicate pages.
+            // mounted by the slot-aware caller, and the slot-mounted and
+            // multi-sequence callers restore their own `dense_kvs` right
+            // after this call. The old implementation allocated (and
+            // zero-filled) a full dense K+V cache sized for
+            // `seq_len + max_decode_tokens`, copied every prompt row into it
+            // after attention, and the caller immediately discarded it. No
+            // prefill kernel reads it. Keep the handoff absent instead of
+            // committing duplicate pages.
             Vec::new()
         } else {
             let mut fresh = Vec::with_capacity(num_layers);
@@ -848,9 +931,16 @@ impl MlxModelWeights {
         let max_hd = self.layers.iter().map(|l| l.head_dim).max().unwrap_or(512);
         let tmp_bytes =
             mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(max_nh as u32, max_hd as u32);
-        let sdpa_tmp = dev
-            .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
-            .map_err(|e| anyhow::anyhow!("batched sdpa_tmp: {e}"))?;
+        // The decode-side flash tmp of the dense handoff; prefill attention
+        // uses its own scratch.
+        let sdpa_tmp = if dense_handoff {
+            Some(
+                dev.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+                    .map_err(|e| anyhow::anyhow!("batched sdpa_tmp: {e}"))?,
+            )
+        } else {
+            None
+        };
 
         // ADR-010 iter-64 — eager allocation of leg_hb_encoded for batched
         // prefill, mirrors per-token forward_prefill.rs:804-852. Without
@@ -4916,26 +5006,33 @@ impl MlxModelWeights {
                 // it correctly ordered against the V-norm that produced the
                 // source buffers.
                 // ------------------------------------------------------------
+                // The planned per-layer capacity (what a dense handoff
+                // allocates) bounds the copy window for every cache written
+                // below, with or without the handoff.
+                let layer_cap = if is_sliding {
+                    sliding_layer_capacity
+                } else {
+                    linear_capacity
+                };
                 let n_copy = if live_prefix_resume {
                     seq_len
                 } else {
-                    seq_len.min(dense_kvs_vec[layer_idx].capacity)
+                    seq_len.min(layer_cap)
                 };
                 let src_tok_offset = (seq_len - n_copy) as u32;
                 let dst_seq_pos_start = (start_pos as u32) + src_tok_offset;
-                if !live_prefix_resume {
-                    let layer_cap = dense_kvs_vec[layer_idx].capacity;
-                    if !dense_kvs_vec[layer_idx].is_sliding && (start_pos + seq_len) > layer_cap {
-                        anyhow::bail!(
-                            "batched prefill L{}: start_pos={} + seq_len={} = {} exceeds global dense cap={} — \
-                             increase linear_capacity allocation (max_decode_tokens param)",
-                            layer_idx,
-                            start_pos,
-                            seq_len,
-                            start_pos + seq_len,
-                            layer_cap
-                        );
-                    }
+                if !live_prefix_resume && !is_sliding && (start_pos + seq_len) > layer_cap {
+                    anyhow::bail!(
+                        "batched prefill L{}: start_pos={} + seq_len={} = {} exceeds global dense cap={} — \
+                         increase linear_capacity allocation (max_decode_tokens param)",
+                        layer_idx,
+                        start_pos,
+                        seq_len,
+                        start_pos + seq_len,
+                        layer_cap
+                    );
+                }
+                if dense_handoff {
                     // ADR-030 iter-64 (extend-mode write-position fix):
                     // include start_pos in the K/V cache destination offset.
                     // Before iter-64 `dst_seq_pos_start = src_tok_offset` which
@@ -6031,7 +6128,7 @@ impl MlxModelWeights {
                 if dump_layer == layer_idx
                     && target_tok < seq_len
                     && !use_f16_kv
-                    && !live_prefix_resume
+                    && dense_handoff
                 {
                     // Row slices from [seq_len, *, hd] row-major buffers
                     // pf_norm_out is dumped inline after the pre-attn RMS norm
@@ -6872,43 +6969,36 @@ impl MlxModelWeights {
         // bytes from shapes BEFORE the snapshot alloc+memcpy; skip when
         // the entry cannot fit the registry budget (97K-token dual-leg
         // ≈ 64 GB → swap-storm, measured live 2026-08-03).
-        let snap_cap_est = sw.max(
-            crate::serve::forward_prefill::gemma_flash_attn_vec_capacity(
-                seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 },
-            ),
+        let lcp_est_bytes = gemma_lcp_snapshot_estimate_bytes(
+            self.layers.iter().map(|l| (l.num_kv_heads, l.head_dim)),
+            gemma_lcp_snapshot_rows(seq_len, max_decode_tokens, sw, kv_lcp_long_resume),
+            kv_elem_bytes,
+            self.hybrid_kv.is_some(),
         );
-        let lcp_est_bytes: u64 = {
-            let dense: u64 = self
-                .layers
-                .iter()
-                .map(|l| (2 * l.num_kv_heads * snap_cap_est * l.head_dim * kv_elem_bytes) as u64)
-                .sum();
-            let hybrid: u64 = if self.hybrid_kv.is_some() {
-                self.layers
-                    .iter()
-                    .map(|l| {
-                        (l.num_kv_heads * snap_cap_est * (l.head_dim * 2 + l.head_dim + 4)) as u64
-                    })
-                    .sum()
-            } else {
-                0
-            };
-            dense + hybrid
-        };
         let lcp_fits_budget =
             crate::serve::kv_persist::lcp_registry::gemma_lcp_snapshot_fits_budget(lcp_est_bytes);
-        if INVESTIGATION_ENV.kv_lcp_resume && lcp_resumable_regime && !lcp_fits_budget {
+        // Snapshots copy the dense handoff, so only its consumer (the
+        // SerialFifo LCP registry) gets them. A slot-mounted prefill used to
+        // allocate and zero-fill both legs at `seq_len + max_decode_tokens`
+        // rows for every layer (about 5.4 GB per cold 458-token admission
+        // at `max_tokens` 8192) and leave them unread on the model.
+        if dense_handoff
+            && INVESTIGATION_ENV.kv_lcp_resume
+            && lcp_resumable_regime
+            && !lcp_fits_budget
+        {
             tracing::debug!(
                 "lcp_snapshot skipped (budget, batched route): est entry {} bytes >                  registry budget — snapshots skipped",
                 lcp_est_bytes
             );
         }
-        let lcp_snapshots_on = INVESTIGATION_ENV.kv_lcp_resume
-            && !live_prefix_resume
+        let lcp_snapshots_on = dense_handoff
+            && INVESTIGATION_ENV.kv_lcp_resume
             && lcp_resumable_regime
             && snapshot_safe
             && lcp_fits_budget;
-        if INVESTIGATION_ENV.kv_lcp_resume && lcp_resumable_regime && !snapshot_safe {
+        if dense_handoff && INVESTIGATION_ENV.kv_lcp_resume && lcp_resumable_regime && !snapshot_safe
+        {
             tracing::debug!(
                 "lcp_snapshot skipped (batched prefill-wrap guard): seq_len={} > sw={} \
                  on a model with sliding layers; the live ring already wrapped during \
@@ -6938,16 +7028,14 @@ impl MlxModelWeights {
         // `forward_prefill resume: cached dense_kvs[layer=5]
         // capacity 2072 < required 2080` → HTTP 500.  Both the
         // dense and hybrid snapshot legs share this snap_cap.
-        let snap_cap = sw
-            .max(
-                crate::serve::forward_prefill::gemma_flash_attn_vec_capacity(
-                    seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 },
-                ),
-            )
-            // ADR-059: FULL-layer hybrid rows are graft + prompt — the
-            // snapshot boundary and capacity cover them; sliding rings
-            // carry prompt-only rows.
-            .max(crate::serve::forward_prefill::gemma_flash_attn_vec_capacity(graft_len + seq_len));
+        let snap_cap =
+            gemma_lcp_snapshot_rows(seq_len, max_decode_tokens, sw, kv_lcp_long_resume)
+                // ADR-059: FULL-layer hybrid rows are graft + prompt — the
+                // snapshot boundary and capacity cover them; sliding rings
+                // carry prompt-only rows.
+                .max(crate::serve::forward_prefill::gemma_flash_attn_vec_capacity(
+                    graft_len + seq_len,
+                ));
         let dense_snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>> =
             if lcp_snapshots_on {
                 let mut snap: Vec<std::sync::Arc<DenseKvBuffers>> = Vec::with_capacity(num_layers);
@@ -7112,12 +7200,12 @@ impl MlxModelWeights {
         // (mirrors `forward_prefill.rs:1502`). Builder above keeps
         // `Vec<DenseKvBuffers>` so the in-flight kernel writes mutate
         // the buffers via `&mut`; Arc wrap fires once at end-of-prefill.
-        if live_prefix_resume {
+        if dense_handoff {
+            self.dense_kvs = Some(dense_kvs_vec.into_iter().map(std::sync::Arc::new).collect());
+            self.dense_sdpa_tmp = sdpa_tmp;
+        } else {
             self.dense_kvs = None;
             self.dense_sdpa_tmp = None;
-        } else {
-            self.dense_kvs = Some(dense_kvs_vec.into_iter().map(std::sync::Arc::new).collect());
-            self.dense_sdpa_tmp = Some(sdpa_tmp);
         }
 
         // Metal-1 — safety-net stop in case the layer-range end was
@@ -7865,5 +7953,94 @@ mod route_viability_tests {
         assert!(!gemma_lcp_resume_worthwhile(0, 6600, true));
         assert!(!gemma_lcp_resume_worthwhile(6600, 6600, true));
         assert!(!gemma_lcp_resume_worthwhile(6601, 6600, false));
+    }
+}
+
+#[cfg(test)]
+mod cold_prefill_handoff_tests {
+    use super::{
+        gemma_batched_prefill_builds_dense_handoff as builds_handoff,
+        gemma_lcp_snapshot_estimate_bytes, gemma_lcp_snapshot_rows,
+    };
+    use crate::serve::forward_prefill::gemma_kv_capacity_plan;
+
+    /// Gemma 4 26B-A4B: 25 sliding layers (8 KV heads × 256) and 5 global
+    /// layers (2 KV heads × 512), 1,024-row sliding window.
+    fn gemma4_26b_layers() -> impl Iterator<Item = (usize, usize, bool)> + Clone {
+        std::iter::repeat((8, 256, true))
+            .take(25)
+            .chain(std::iter::repeat((2, 512, false)).take(5))
+    }
+
+    #[test]
+    fn gemma_cold_prefill_handoff_only_for_serial_fifo_cold_prefill() {
+        // (live_prefix_resume, slot_aware_mount, multi_seq)
+        assert!(builds_handoff(false, false, false), "SerialFifo cold");
+        assert!(
+            !builds_handoff(true, false, false),
+            "SerialFifo live resume"
+        );
+        assert!(!builds_handoff(false, true, false), "slot-mounted cold");
+        assert!(
+            !builds_handoff(true, true, false),
+            "slot-mounted live resume"
+        );
+        assert!(!builds_handoff(false, false, true), "multi-sequence cold");
+        assert!(
+            !builds_handoff(true, true, true),
+            "joint warm (multi-sequence live)"
+        );
+    }
+
+    #[test]
+    fn gemma_cold_prefill_handoff_four_agent_turn_zero_sizes() {
+        // Four-agent turn 0: 458-token stable boundary, max_tokens 8192, F32
+        // dense KV. These are the bytes each cold slot admission used to
+        // allocate (and zero-fill) for outputs nothing read.
+        let (seq_len, max_tokens, sw) = (458, 8192, 1024);
+        let rows = gemma_lcp_snapshot_rows(seq_len, max_tokens, sw, false);
+        assert_eq!(
+            rows, 8_672,
+            "tile-rounded seq_len + max_tokens, every layer"
+        );
+        let snapshot = gemma_lcp_snapshot_estimate_bytes(
+            gemma4_26b_layers().map(|(nkv, hd, _)| (nkv, hd)),
+            rows,
+            4,
+            true,
+        );
+        assert_eq!(snapshot, 5_379_761_920);
+        let dense_only = gemma_lcp_snapshot_estimate_bytes(
+            gemma4_26b_layers().map(|(nkv, hd, _)| (nkv, hd)),
+            rows,
+            4,
+            false,
+        );
+        assert_eq!(dense_only, 3_907_256_320, "dense K + V legs");
+
+        let plan = gemma_kv_capacity_plan(seq_len, max_tokens, sw, false);
+        assert_eq!(
+            (plan.allocation_sliding, plan.allocation_linear),
+            (1_024, 8_672)
+        );
+        let handoff: usize = gemma4_26b_layers()
+            .map(|(nkv, hd, sliding)| {
+                let capacity = if sliding {
+                    plan.allocation_sliding
+                } else {
+                    plan.allocation_linear
+                };
+                2 * nkv * capacity * hd * 4
+            })
+            .sum();
+        assert_eq!(handoff, 774_635_520, "dense K/V decode handoff");
+
+        // Long resume adds 4,096 rows of turn growth before tile rounding.
+        assert_eq!(
+            gemma_lcp_snapshot_rows(seq_len, max_tokens, sw, true),
+            12_768
+        );
+        // Short budgets keep at least the sliding window.
+        assert_eq!(gemma_lcp_snapshot_rows(16, 16, sw, false), 1_024);
     }
 }
