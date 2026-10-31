@@ -392,9 +392,10 @@ fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
     // Isolation: every row a misaddressed write could reach in a slot outside
     // the cohort (global rows up to the longest prompt, every ring row).
     let longest = prompts.iter().map(Vec::len).max().unwrap();
-    // Five repeats of the 4-lane cohort (determinism), then subsets that
-    // move each lane's rows within the shared stream.
-    let cases: [&[usize]; 7] = [
+    // Five repeats of the 4-lane cohort (determinism), then subsets and
+    // orders that move each lane's rows within the shared stream (and change
+    // which lanes encode before it).
+    let cases: [&[usize]; 10] = [
         &[0, 1, 2, 3],
         &[0, 1, 2, 3],
         &[0, 1, 2, 3],
@@ -402,6 +403,9 @@ fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
         &[0, 1, 2, 3],
         &[0, 3],
         &[1, 2, 3],
+        &[1, 2, 3],
+        &[3, 2, 1, 0],
+        &[2, 3],
     ];
     for (case, slots) in cases.iter().enumerate() {
         let lanes: Vec<_> = slots.iter().map(|&slot| fixture.lane(slot)).collect();
@@ -509,7 +513,7 @@ fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
         "GEMMA_JOINT_WARM_THRESHOLD_DIAGNOSTIC kernel={kernel:?} rows=32 accepted_as_gate=false joint_equals_per_slot={}",
         images[0] == short_reference
     );
-    println!("GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel={kernel:?} lanes=4x5,2,3 mixed_max_tokens=true isolation=true logits_bits=true kv_bytes=true cursors=true histories={HISTORIES:?} suffixes={SUFFIXES:?}");
+    println!("GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel={kernel:?} lanes=[0123]x5,[03],[123]x2,[3210],[23] mixed_max_tokens=true isolation=true logits_bits=true kv_bytes=true cursors=true histories={HISTORIES:?} suffixes={SUFFIXES:?}");
 }
 
 fn runtime() -> tokio::runtime::Runtime {

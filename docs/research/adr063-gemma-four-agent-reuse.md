@@ -306,6 +306,47 @@ Determinism is still a hardware gate below
 (`gemma_warm_tiled_attention_is_deterministic`, repeated under
 `MLX_PRECOMPILED_METALLIB=0`).
 
+**First hardware run (`a2bc2007`, `E/gemma-stage2-gates-v1`) and fix.**
+Passed: the vec-hybrid bitwise gate, the engine cohort gate, determinism
+(5 runs), and the full-input, cold-prefill and Category 1 gates. Two gates
+failed:
+- The tiled bitwise gate: `case 6 lanes=[1, 2, 3] slot 3` differed from the
+  per-slot reference at logit 0, while the 4-lane and `{0,3}` cohorts
+  matched.
+- The envelope: the last-row max |Δlogit| was 1.15 / 4.07 / 3.64 / 2.81,
+  with top-1 flips on slots 1 and 2 (vec margins 0.17 and 0.39).
+
+Root cause, from reading the code: the inherited tiled branch encoded the
+sliding mask with no declared write. `build_sdpa_mask_f16` allocates its
+output internally, so the conflict tracker (`GraphSession::barrier_between`,
+which only sees declared ranges) never saw that write. The following
+`barrier_between(&[mask], &[blk])` therefore emitted no barrier, and on the
+concurrent encoder the `blk` classifier ran alongside the mask fill.
+`alloc_buffer` zero-fills the mask, and `blk` treats an all-zero tile as
+fully attended (`flash_attn_prefill_blk.metal:254-255`, `res = 2`). So
+wherever `blk` read before the fill, attention skipped the mask: queries
+saw future keys in their diagonal tiles and keys outside the window. How
+often that happens depends on what else is running on the GPU, which is why
+results were reproducible within one cohort shape but differed between
+shapes [INFERENCE: consistent with both failures; the localization test
+below measures it].
+
+The installed long-prompt `Tiled` lanes had the same race before this
+change. The cold prefill path builds its masks with the same undeclared
+write (`forward_prefill_batched.rs`, `build_sdpa_mask_bf16` followed by the
+cast and the `blk` classifier). It is left unchanged and recorded under
+Remaining gaps.
+
+Two fixes in `gemma_live_attention.rs`:
+- An explicit `s.barrier()` after the mask fill, before `blk`.
+- The ring stage barrier now also declares its reads of the normed K/V
+  stream. Before, a sequence's suffix copy into the stage could share a
+  concurrent group with the head norm/RoPE that writes those rows. This
+  applies to the vec-hybrid route too, and only changes ordering.
+
+The bitwise gate now also runs the cohorts `{1,2,3}` twice, `{3,2,1,0}` and
+`{2,3}`.
+
 **Q1 class: Class B, route-sensitive.** Warm-prefill numerics change once
 against the vec-hybrid route. Evidence:
 - the decision envelope (`gemma_warm_tiled_attention_decision_envelope`:
@@ -673,17 +714,19 @@ for t in \
   serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid \
   serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_engine_cohort_matches_serial_tool_turns \
   serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_is_deterministic \
-  serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_decision_envelope; do
+  serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_decision_envelope \
+  serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_layer_localization; do
   HF2Q_GEMMA4_GGUF="$GGUF" cargo test --locked --release --bin hf2q "$t" -- --exact --ignored --nocapture --test-threads=1
 done
 ```
 
-- **(a) Joint == per-slot, per route.** The Stage 1 harness (histories
-  465/714/943/1254, suffixes 56/200/311/385, 4 lanes ×5, `{0,3}`,
-  `{1,2,3}`, isolation of non-cohort slots, mixed `max_tokens`) runs on the
-  tiled route (`..._bitwise`) and the kill-switch route (`..._vec_hybrid`).
-  Markers: `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=TiledF16` and
-  `kernel=VecHybrid`.
+- **(a) Joint == per-slot, per route.** This is the Stage 1 harness:
+  histories 465/714/943/1254 and suffixes 56/200/311/385, cohorts
+  `[0,1,2,3]` ×5, `[0,3]`, `[1,2,3]` ×2, `[3,2,1,0]` and `[2,3]`,
+  isolation of non-cohort slots, and mixed `max_tokens`. It runs on the
+  tiled route (`..._bitwise`) and on the kill-switch route
+  (`..._vec_hybrid`). Markers: `GEMMA_JOINT_WARM_BITWISE_COMPLETE
+  kernel=TiledF16` and `kernel=VecHybrid`.
 - **(b) Determinism.** On the tiled route, each lane's per-slot warm
   prefill five times and the four-lane cohort five times, all bitwise equal
   (logits bits, KV bytes, cursors), and the cohort equal to per-slot.
@@ -694,7 +737,23 @@ done
   and the vec-hybrid margin is at least 0.5 logits. A 31-row suffix must be
   bitwise equal on both switches (it stays vec-hybrid). Markers:
   `GEMMA_WARM_TILED_ENVELOPE_LANE` (per lane) and `GEMMA_WARM_TILED_ENVELOPE`
-  (summary).
+  (summary). Expected after the race fix `[INFERENCE]`: max |Δlogit| in the
+  range of other cross-graph comparisons (the monolithic-vs-resume
+  diagnostic measured 0.81), and top-1 flips only on near ties. A max
+  |Δlogit| still above about 1.5 means another semantic difference remains;
+  run the localization test.
+- **Localization (diagnostic, not a gate).** Slot 1 (history 714,
+  suffix 200) runs on both routes with the test-only per-layer probe
+  (`forward_prefill_batched::live_layer_probe`). The probe forces a
+  per-layer sync and copies each layer's attention output (after the FWHT
+  undo) and residual. Per layer it prints `GEMMA_WARM_TILED_LAYER` with the
+  attention and residual max |Δ|, relative Δ, last-row Δ and worst row.
+  The summary `GEMMA_WARM_TILED_LOCALIZATION` names the first layer whose
+  attention relative Δ exceeds 5%. Layer 0 has identical inputs on both
+  routes, so its attention Δ is the pure kernel difference. Use the worst
+  row to separate cases: a worst row inside the chunk diagonal points at
+  causal leakage, near the window edge at the SWA mask, and at a global
+  layer at the d512 resume offset.
 - Re-run the Category 1 loop and the full-input and cold-prefill
   real-artifact gates above: every Gemma live resume goes through the new
   function, and `gemma_fresh_and_reused_4096_8193_bounded_outputs_match`
@@ -748,10 +807,11 @@ Measured results (root fills in; all pending):
 
 | Gate | Result | Evidence |
 |---|---|---|
-| (a) tiled joint == per-slot | pending | `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=TiledF16` |
-| (a) vec-hybrid joint == per-slot | pending | `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=VecHybrid` |
-| (b) determinism, defaults + 4× `MLX_PRECOMPILED_METALLIB=0` | pending | `GEMMA_WARM_TILED_DETERMINISM_COMPLETE` ×5 |
-| (c) envelope: max \|Δlogit\|, top-1 agree, min margin | pending | `GEMMA_WARM_TILED_ENVELOPE` |
+| (a) tiled joint == per-slot | `a2bc2007`: FAIL (`[1,2,3]` slot 3); rerun after the race fix pending | `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=TiledF16` |
+| (a) vec-hybrid joint == per-slot | `a2bc2007`: PASS; rerun pending | `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=VecHybrid` |
+| (b) determinism, defaults + 4× `MLX_PRECOMPILED_METALLIB=0` | `a2bc2007`: PASS (defaults ×1); rerun pending | `GEMMA_WARM_TILED_DETERMINISM_COMPLETE` ×5 |
+| (c) envelope: max \|Δlogit\|, top-1 agree, min margin | `a2bc2007`: 4.07, 2/4 (flips at vec margins 0.17/0.39), 0.17; rerun pending | `GEMMA_WARM_TILED_ENVELOPE` |
+| Localization: first diverging layer | pending | `GEMMA_WARM_TILED_LOCALIZATION` |
 | Joint cohort ms per turn, A vs B (t1…t6) | pending | `transaction="joint warm"` `elapsed_ms` |
 | Makespan A / B / peer (median) | pending (expected ≈13.6 / 15.2 / 12.4 s) | `client/summary.json` |
 | Quality campaign verdict | pending | `manifest.json` verdict |
@@ -817,9 +877,18 @@ plus about 20 ms. Compare turn-0 completion times, `elapsed_seconds`, and
 - Every gate above is unexecuted, including the quality campaign. Default
   promotion depends on all of them passing on hardware.
 - Joint warm prefill Stage 1 is unexecuted: the bitwise gates above decide
-  the default. Stage 2 (tiled F16 warm attention, Q1 Class B) is unexecuted:
-  its default needs the bitwise, determinism and envelope gates, the A/B and
-  the quality campaign (revert rule in its section).
+  the default. Stage 2 (tiled F16 warm attention, Q1 Class B): the first
+  hardware run failed the tiled bitwise and envelope gates; the mask/`blk`
+  ordering fix awaits a rerun. Its default needs the bitwise, determinism
+  and envelope gates, the A/B and the quality campaign (revert rule in its
+  section).
+- The cold prefill setup builds its sliding and global masks
+  (`build_sdpa_mask_bf16` / `build_block_diagonal_sdpa_mask_bf16`) without
+  declaring their writes. The F16 cast and the `blk` classifiers that read
+  them therefore get no tracked barrier, the same hazard fixed for the live
+  route. It is unchanged here (out of scope). In practice the classifiers
+  run several dispatches later, and the cold gates pass, but nothing orders
+  them `[INFERENCE]`.
 - Turn 0: the cold admission allocation fix is unexecuted on hardware.
   After it, the remaining turn-0 cost is four serial cold boundary
   prefills plus the per-slot cue. The per-step decode gap (about 20 vs

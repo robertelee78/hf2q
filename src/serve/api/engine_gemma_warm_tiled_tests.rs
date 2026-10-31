@@ -14,12 +14,18 @@
 //!   envelope evidence. It fails only on a top-1 disagreement outside a
 //!   near tie, and when a suffix below the 32-row tiled threshold is not
 //!   bitwise equal across the two routes (both must run vec-hybrid).
+//! * `gemma_warm_tiled_attention_layer_localization` (diagnostic): one lane
+//!   (history 714, suffix 200) on both routes with the per-layer probe armed;
+//!   prints, per layer, the max |difference| of the attention output and of
+//!   the residual after the layer, the worst row, and the first layer whose
+//!   attention differs by more than 5% of its magnitude.
 use super::gemma_warm_batch_tests::{
     assert_lane_equal, load_gate_model, reserve_for, LaneImage, WarmFixture, HISTORIES, MAX_DECODE,
     SUFFIXES,
 };
 use super::*;
 use crate::inference::models::gemma4::GemmaLiveKernel;
+use crate::serve::forward_prefill_batched::live_layer_probe;
 
 const REPEATS: usize = 5;
 /// A vec-hybrid top-1/top-2 margin below this many logits is a near tie: a
@@ -179,5 +185,98 @@ fn gemma_warm_tiled_attention_decision_envelope() {
     assert!(
         failures.is_empty(),
         "tiled warm attention flipped top-1 outside a near tie on slots {failures:?}"
+    );
+}
+
+/// `(max |a − b|, max |b|)`.
+fn diff_stats(a: &[f32], b: &[f32]) -> (f32, f32) {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .fold((0.0f32, 0.0f32), |(diff, scale), (x, y)| {
+            (diff.max((x - y).abs()), scale.max(y.abs()))
+        })
+}
+
+/// Attention relative difference above which a layer counts as diverged.
+const LARGE_ATTN_REL: f32 = 0.05;
+
+#[test]
+#[ignore = "official Gemma 4 GGUF: per-layer tiled vs vec-hybrid warm attention divergence (diagnostic)"]
+fn gemma_warm_tiled_attention_layer_localization() {
+    let mut loaded = load_gate_model();
+    let LoadedModel::Gemma(g) = &mut loaded else {
+        unreachable!("load_gate_model returns Gemma")
+    };
+    let mut guard = Gemma4KvGuard::take(g).unwrap();
+    let fixture = WarmFixture::build(&mut guard);
+    let slot = 1;
+    let rows = SUFFIXES[slot];
+    let prompt = fixture.prompts[slot].clone();
+    let mut capture = |kernel: GemmaLiveKernel| {
+        guard.model.weights.warm_live_kernel = kernel;
+        live_layer_probe::arm();
+        let image = fixture.per_slot(&mut guard, slot, &prompt, HISTORIES[slot], MAX_DECODE);
+        (image, live_layer_probe::take())
+    };
+    let (vec_image, vec_layers) = capture(GemmaLiveKernel::VecHybrid);
+    let (tiled_image, tiled_layers) = capture(GemmaLiveKernel::TiledF16);
+    assert!(!vec_layers.is_empty(), "the probe captured no layer");
+    assert_eq!(
+        vec_layers.len(),
+        tiled_layers.len(),
+        "one warm prefill per arm"
+    );
+
+    let mut first_large = None;
+    for (vec_layer, tiled_layer) in vec_layers.iter().zip(&tiled_layers) {
+        assert_eq!(vec_layer.layer, tiled_layer.layer);
+        let row_elems = vec_layer.attn.len() / rows;
+        let hidden = vec_layer.hidden.len() / rows;
+        let (attn_max, attn_scale) = diff_stats(&tiled_layer.attn, &vec_layer.attn);
+        let (hidden_max, hidden_scale) = diff_stats(&tiled_layer.hidden, &vec_layer.hidden);
+        let row_diff = |row: usize| {
+            let span = row * row_elems..(row + 1) * row_elems;
+            diff_stats(&tiled_layer.attn[span.clone()], &vec_layer.attn[span]).0
+        };
+        let (worst_row, worst_row_diff) =
+            (0..rows)
+                .map(|row| (row, row_diff(row)))
+                .fold(
+                    (0, 0.0f32),
+                    |best, item| if item.1 > best.1 { item } else { best },
+                );
+        let last = (rows - 1) * hidden..rows * hidden;
+        let (hidden_last, _) =
+            diff_stats(&tiled_layer.hidden[last.clone()], &vec_layer.hidden[last]);
+        let attn_rel = attn_max / attn_scale.max(f32::MIN_POSITIVE);
+        if first_large.is_none() && attn_rel > LARGE_ATTN_REL {
+            first_large = Some(vec_layer.layer);
+        }
+        println!(
+            "GEMMA_WARM_TILED_LAYER layer={} sliding={} head_dim={} attn_max_abs={attn_max:.6} attn_rel={attn_rel:.6} attn_last_row_max_abs={:.6} worst_row={worst_row} worst_row_max_abs={worst_row_diff:.6} hidden_max_abs={hidden_max:.6} hidden_rel={:.6} hidden_last_row_max_abs={hidden_last:.6}",
+            vec_layer.layer,
+            vec_layer.sliding,
+            vec_layer.head_dim,
+            row_diff(rows - 1),
+            hidden_max / hidden_scale.max(f32::MIN_POSITIVE),
+        );
+    }
+    let (logit_max, _) = diff_stats(
+        &tiled_image
+            .logits
+            .iter()
+            .map(|&bits| f32::from_bits(bits))
+            .collect::<Vec<_>>(),
+        &vec_image
+            .logits
+            .iter()
+            .map(|&bits| f32::from_bits(bits))
+            .collect::<Vec<_>>(),
+    );
+    println!(
+        "GEMMA_WARM_TILED_LOCALIZATION slot={slot} history={} suffix={rows} layers={} first_layer_attn_rel_above_{LARGE_ATTN_REL}={first_large:?} final_logit_max_abs={logit_max:.6}",
+        HISTORIES[slot],
+        vec_layers.len()
     );
 }

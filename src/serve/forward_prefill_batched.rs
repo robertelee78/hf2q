@@ -53,6 +53,104 @@ fn validate_batched_prefill_argmax(value: f32, head_row: usize) -> Result<()> {
     Ok(())
 }
 
+/// Test-only per-layer capture of batched prefills on the calling thread
+/// (ADR-063 Stage 2 envelope localization). While armed, every layer
+/// commits and waits, then copies its attention output (after the FWHT sign
+/// undo) and its residual output to the host.
+#[cfg(test)]
+pub(crate) mod live_layer_probe {
+    use std::cell::RefCell;
+
+    pub(crate) struct LayerCapture {
+        pub(crate) layer: usize,
+        pub(crate) sliding: bool,
+        pub(crate) head_dim: usize,
+        /// Attention output `[rows, heads, head_dim]`.
+        pub(crate) attn: Vec<f32>,
+        /// Residual stream after the layer `[rows, hidden]`.
+        pub(crate) hidden: Vec<f32>,
+    }
+
+    thread_local! {
+        static CAPTURES: RefCell<Option<Vec<LayerCapture>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm() {
+        CAPTURES.with(|captures| *captures.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(crate) fn armed() -> bool {
+        CAPTURES.with(|captures| captures.borrow().is_some())
+    }
+
+    pub(crate) fn push(capture: LayerCapture) {
+        CAPTURES.with(|captures| {
+            if let Some(list) = captures.borrow_mut().as_mut() {
+                list.push(capture);
+            }
+        });
+    }
+
+    /// Disarm and return every capture since `arm`.
+    pub(crate) fn take() -> Vec<LayerCapture> {
+        CAPTURES.with(|captures| captures.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+fn live_layer_probe_armed() -> bool {
+    live_layer_probe::armed()
+}
+
+#[cfg(not(test))]
+fn live_layer_probe_armed() -> bool {
+    false
+}
+
+/// Record one finished layer when the probe is armed (tests only).
+#[cfg(test)]
+fn live_layer_probe_capture(
+    layer: usize,
+    sliding: bool,
+    (heads, head_dim, hidden_size): (usize, usize, usize),
+    rows: usize,
+    attn: &MlxBuffer,
+    hidden: &MlxBuffer,
+) -> Result<()> {
+    if !live_layer_probe::armed() {
+        return Ok(());
+    }
+    let attn = attn
+        .as_slice::<f32>()
+        .map_err(|e| anyhow::anyhow!("probe attention L{layer}: {e}"))?[..rows * heads * head_dim]
+        .to_vec();
+    let hidden = hidden
+        .as_slice::<f32>()
+        .map_err(|e| anyhow::anyhow!("probe hidden L{layer}: {e}"))?[..rows * hidden_size]
+        .to_vec();
+    live_layer_probe::push(live_layer_probe::LayerCapture {
+        layer,
+        sliding,
+        head_dim,
+        attn,
+        hidden,
+    });
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn live_layer_probe_capture(
+    _layer: usize,
+    _sliding: bool,
+    _shape: (usize, usize, usize),
+    _rows: usize,
+    _attn: &MlxBuffer,
+    _hidden: &MlxBuffer,
+) -> Result<()> {
+    Ok(())
+}
+
 fn gemma_batched_mask_seq_len(seq_len: usize, live_prefix_resume: bool) -> usize {
     if live_prefix_resume {
         // Live resume attends through `gemma_live_attention`, which builds
@@ -5043,7 +5141,8 @@ impl MlxModelWeights {
                     || std::env::var("HF2Q_PROFILE_LAYERS").is_ok()
                     || std::env::var("HF2Q_SYNC_PER_LAYER").is_ok()
                     || profile_buckets_on
-                    || self.dflash_capture.is_some();
+                    || self.dflash_capture.is_some()
+                    || live_layer_probe_armed();
                 if sync_per_layer {
                     if graph_opt_prefill {
                         // ADR-029 iter-39 H40 — sync-mode with fusion.  Mirrors
@@ -5086,6 +5185,14 @@ impl MlxModelWeights {
                     drop(_committed);
                 }
             }
+            live_layer_probe_capture(
+                layer_idx,
+                is_sliding,
+                (nh, hd, hs),
+                seq_len,
+                &pf_sdpa_out,
+                &pf_hidden,
+            )?;
 
             // ADR-011 Phase 3 Wave P3b.2 — Session C ("write K,V to dense
             // cache") was merged into the tail of Session A.  Only the

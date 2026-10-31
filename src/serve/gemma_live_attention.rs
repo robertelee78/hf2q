@@ -625,8 +625,11 @@ fn encode_live_seq(
             .slice_view((stream_row * row_elems * 4) as u64, len * row_elems);
         let (attn_k, attn_v, attn_norms, kv_capacity) = if let Some(stage) = stage.as_ref() {
             let history = keys.query_offset;
+            // The stage copies this chunk's suffix rows out of the normed
+            // K/V stream, so declare those reads too: the head norm/RoPE that
+            // writes them may still be in the current concurrent group.
             s.barrier_between(
-                &[&kv.k, &kv.v_packed, &kv.v_norms],
+                &[&kv.k, &kv.v_packed, &kv.v_norms, layer.k, layer.v],
                 &[&stage.k, &stage.v, &stage.norms],
             );
             let rings = (cap, stage.capacity);
@@ -857,7 +860,6 @@ fn encode_tiled_chunk(
     )
     .map_err(|e| anyhow::anyhow!("live tiled Q permute L{layer_idx}: {e}"))?;
 
-    s.barrier_between(&[&q_f16, &dense_k, &dense_v], &[&out_f16]);
     if is_ring {
         let mask = mlx_native::ops::flash_attn_prefill_mask::build_sdpa_mask_f16(
             dev,
@@ -872,6 +874,13 @@ fn encode_tiled_chunk(
             },
         )
         .map_err(|e| anyhow::anyhow!("live tiled mask L{layer_idx}: {e}"))?;
+        // The mask buffer is allocated inside its builder, so its write was
+        // never declared to the conflict tracker: without this fence the
+        // `blk` classifier below runs concurrently with the mask fill and
+        // can classify a partly written (zero = attended) mask, letting the
+        // tile-skip path attend future or out-of-window keys. The fence also
+        // completes the K/V compaction and Q permute above.
+        s.barrier();
         let blk_params = mlx_native::ops::flash_attn_prefill_blk::BlkParams {
             seq_len_q: len as u32,
             seq_len_k: kv_seq_len as u32,
@@ -918,6 +927,7 @@ fn encode_tiled_chunk(
             hd == 512,
             "live tiled global layer L{layer_idx} has head_dim={hd}"
         );
+        s.barrier_between(&[&q_f16, &dense_k, &dense_v], &[&out_f16]);
         mlx_native::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_f16_d512_resume(
             s.encoder_mut(),
             dev,
