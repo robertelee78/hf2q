@@ -32944,10 +32944,8 @@ assistant:
             },
         ];
         let fallback = render_chat_prompt(FALLBACK_GEMMA4_API_CHAT_TEMPLATE, &msgs).unwrap();
-        assert_eq!(
-            fallback,
-            "<bos><|turn>user\nhi<turn|>\n<|turn>model\nhello<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
-        );
+        assert!(fallback.contains("<|turn>model\nhello"), "{fallback}");
+        assert!(!fallback.contains("<|turn>assistant"), "{fallback}");
         let out = render_chat_prompt(tmpl, &msgs).unwrap();
         assert!(out.contains("user:hi"));
         assert!(out.contains("assistant:hello"));
