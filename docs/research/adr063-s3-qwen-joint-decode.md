@@ -4,10 +4,16 @@ Status (2026-10-31):
 - **Qwen3.8 (dense): default on.** Official-artifact gates passed and the four-agent ABBA A/B passed; see "Measured result".
 - **Qwen3.6 (MoE): default off, opt-in with `HF2Q_QWEN_JOINT_DECODE=1`.** Its forward is bitwise exact, but the four-agent A/B is incomplete. Both joint runs failed the coding protocol; so do stock hf2q, the peer and the BF16 source, so the failure is model behavior, not joint decode (`docs/research/adr063-qwen36-task-failure-diagnosis.md`). Promotion is deferred to a successor; see "Qwen3.6 verdict".
 - `HF2Q_QWEN_JOINT_DECODE=0` restores the serial path for every family.
+<<<<<<< HEAD
+- Cohort invariance: the three gates below **passed** at 0b959107 (`E/qwen-joint-invariance-v1`).
+- Task quality against the peer: **Pass** (23/24 vs 21/24); Q3 primary stage: 22.1% faster than stock and 27.1% faster than the peer. See "Measured result".
+- Open: the Q1 Class B envelope on real prompts (Q-C2b). Until it runs, per-slot quality is shown against the peer, not against stock.
+=======
 - **Qwen3.8 shared-weight dense FFN (padded mode): default on.** Joint steps no longer re-read the FFN gate/up weights once per packed row; `HF2Q_QWEN_JOINT_FFN_SHARED=0` restores the per-row fused kernel. Hardware gates passed, and the four-agent A/B against the kill switch measured 4.9% less makespan (block-paired 95% CI 2.2–7.6%), well short of the 2.2× bandwidth projection. The real-prompt Q1 envelope is `WithinDecisionEnvelope` for both FFN routes (below). See "Dense FFN weight sharing (padded mode)".
 - **Qwen3.8 task quality against stock: Pass.** On the final binary 38485a23 (joint decode and shared FFN at their defaults) against the same binary with `HF2Q_QWEN_JOINT_DECODE=0`: 22/24 vs 22/24 instances, no discordant pairs (`E/quality-qwen38-exp3848-vs-stock-20261031T061243Z`). The earlier pairing against the peer was 23/24 vs 21/24 at 0b959107.
 - **Cancel under joint decode: CancelSmokePass** on Qwen3.8 (`E/s3-cancel-v1/qwen38-20261031T060010Z`). Closing one stream mid-decode left the other three agents finishing with CalibrationPass. All 435 scheduler turns ran joint (width 2: 4, width 3: 199, width 4: 232; no serial lanes).
 - All three cohort-invariance gates passed at 0b959107 (`E/qwen-joint-invariance-v1`), and the padded gate passed again on both FFN routes at c25d7ef2 (`E/qwen-ffn-gates-v1`).
+>>>>>>> origin/main
 
 ## Problem
 
@@ -214,7 +220,11 @@ Results for the shared-FFN change (branch `c25d7ef2`) are in `E/qwen-ffn-gates-v
 - `qwen38_joint_decode_padded_mv_ext_keeps_decision_parity` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1`): teacher-forced top-1 decisions equal independent sequential forwards at every step, cursors and parities equal, then 16 further serial decisions per slot equal. It runs the FFN route `HF2Q_QWEN_JOINT_FFN_SHARED` selects. **Passed** on the per-row fused FFN and again on the shared FFN (`padded-parity.log`). Under Q1 it is diagnostic only (synthetic prompts, top-1).
 - Exact mode refuses a valid cohort on the shared FFN route before any cache write (checked inside the bitwise gates).
 
+<<<<<<< HEAD
+**Cohort invariance** (`qwen35::real_artifact_joint_decode_invariance_tests`, ignored; **all three passed** at 0b959107, `E/qwen-joint-invariance-v1/{qwen36-exact,qwen38-mvn,qwen38-padded}.log`, source commit in `source.txt`). For each variant, one cache with four identically prefilled slots advances slot 2 for 4 steps inside a different cohort: alone, `{0,2}`, `{2,3}`, `{1,2,3}`, `{2,3,1}`, and `{0,1,3,2}` with slot 2 packed last. Slot 2's logits, hidden, cursor, parity, KV codes/scales and conv/recurrent bytes must be bitwise equal across all variants. The production padded route is therefore cohort-invariant bitwise; against stock it remains Class B (see "Numeric contract").
+=======
 **Cohort invariance** (`qwen35::real_artifact_joint_decode_invariance_tests`, ignored). For each variant, one cache with four identically prefilled slots advances slot 2 for 4 steps inside a different cohort: alone, `{0,2}`, `{2,3}`, `{1,2,3}`, `{2,3,1}`, and `{0,1,3,2}` with slot 2 packed last. Slot 2's logits, hidden, cursor, parity, KV codes/scales and conv/recurrent bytes must be bitwise equal across all variants.
+>>>>>>> origin/main
 
 - `qwen36_joint_decode_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN36_GGUF`). **Passed** (`q36-invariance.log`).
 - `qwen38_joint_decode_mvn_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MV_EXT` unset). **Passed** at 0b959107 (`E/qwen-joint-invariance-v1/qwen38-mvn.log`).
@@ -301,7 +311,23 @@ HF2Q_QWEN38_GGUF=/Users/robert/.local/share/hf2q/models/qwen38-stock/Qwen3.8-27B
 - The per-request decode and TTFT medians are independent recomputations from the run logs (`analysis-qwen38.json` has a parsing bug in its decode medians).
 - Under Q1 §3.5, frozen prompts on a deterministic engine are one sample per agent: no task-quality loss was observed, but this is not a quality verdict.
 
-Still missing: the joint width distribution (only the first engagement was logged) and decode scratch at B=4.
+**Task quality against the peer** (`E/quality-qwen38-peer-exp0b95-20261030T180957Z`, Q1 paired campaign, 24 instances, binary 0b959107):
+- Verdict **Pass**. Joint decode (default on) passed 23/24 and the peer 21/24: one subject-only failure, three peer-only failures, one-sided p = 0.94.
+- All 24 subject server logs record `selected=true mode="padded_mv_ext"`.
+- The reference is the peer, not stock. "Unchanged per-slot quality against stock" still needs Q-C2b or a paired campaign against `HF2Q_QWEN_JOINT_DECODE=0`.
+
+**Q3 primary stage** (`E/q3-campaign-v1/qwen38-n4/verdict.json`; four agents together, 5 blocks, stopped on precision):
+
+| Arm | Makespan, median |
+|---|---|
+| Experiment (main 897e39a6, joint decode default on) | 88.3 s |
+| Stock v0.1.28 | 113.6 s |
+| Peer | 122.2 s |
+
+- The experiment is 22.1% faster than stock (95% CI 20.5–23.7%) and 27.1% faster than the peer (95% CI 26.3–28.0%).
+- The verdict file reads `Inconclusive` only because the quality campaign above ran on 0b959107, not on the experiment binary.
+
+Still missing: the joint width distribution and decode scratch at B=4. Only the first engagement was logged: no retained run has the per-turn `Qwen joint decode turn` debug lines, because the family launcher passes `-v` and hf2q ignores `RUST_LOG` under `-v`.
 
 **Qwen3.6 verdict: inconclusive, unfavourable.** Default off.
 

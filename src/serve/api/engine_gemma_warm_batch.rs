@@ -39,8 +39,10 @@
 //!   own request-start rollback anchor and re-prefills it per slot in FIFO
 //!   order (`settle_gemma4_prefill_batch`). One lane's fault recurs in its own
 //!   per-slot prefill and fails only that request, as serial prefill would;
-//!   a lane that cannot be restored is failed request-locally. A worker-fatal
-//!   GPU error fails the worker, as every other Gemma transaction does;
+//!   a lane that cannot be restored is failed request-locally. The
+//!   fault-injection gate is `gemma_joint_warm_forward_fault_retries_each_lane_per_slot`
+//!   (real artifact). A worker-fatal GPU error fails the worker, as every
+//!   other Gemma transaction does;
 //! * a client that disconnects before submission is left out of the cohort
 //!   and cancelled by its per-slot advance; one that disconnects during the
 //!   forward is restored from its just-published checkpoint after the
@@ -70,6 +72,40 @@ pub(super) static JOINT_WARM_TRANSACTIONS: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 pub(super) static JOINT_WARM_LANES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// ADR-063 S3 G-C3 fault injection (tests only). When armed, the next joint
+/// warm transaction keeps its real forward's KV writes but reports a
+/// non-fatal error, so settlement must restore every lane from its rollback
+/// anchor and re-prefill it per slot. The arm is consumed by one transaction.
+#[cfg(test)]
+pub(super) static INJECT_FORWARD_FAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// `(slot, prompt tokens)` of the faulted transaction's lanes, in submission
+/// order.
+#[cfg(test)]
+pub(super) static FAULTED_LANES: std::sync::Mutex<Vec<(u32, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+/// `(slot, prompt tokens)` of every lane restored for a per-slot retry
+/// (`settle_gemma4_prefill_batch`), in retry order.
+#[cfg(test)]
+pub(super) static RETRIED_LANES: std::sync::Mutex<Vec<(u32, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn inject_forward_fault<T>(forward: Result<T>, lanes: &[Gemma4PrefillBatchLane]) -> Result<T> {
+    use std::sync::atomic::Ordering;
+    if forward.is_err() || !INJECT_FORWARD_FAULT.swap(false, Ordering::SeqCst) {
+        return forward;
+    }
+    FAULTED_LANES.lock().expect("fault record").extend(
+        lanes
+            .iter()
+            .map(|lane| (lane.handle.slot_id.0, lane.state.prompt_tokens.len())),
+    );
+    Err(anyhow::anyhow!(
+        "injected non-fatal joint warm prefill fault"
+    ))
+}
 
 fn parse_switch(raw: Option<&str>) -> std::result::Result<bool, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
@@ -578,6 +614,8 @@ pub(super) fn advance(
     };
     let elapsed = started.elapsed();
     clear_gemma4_self_mounts(guard.model);
+    #[cfg(test)]
+    let forward = inject_forward_fault(forward, &lanes);
     #[cfg(test)]
     if forward.is_ok() {
         JOINT_WARM_TRANSACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -516,14 +516,14 @@ fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
     println!("GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel={kernel:?} lanes=[0123]x5,[03],[123]x2,[3210],[23] mixed_max_tokens=true isolation=true logits_bits=true kv_bytes=true cursors=true histories={HISTORIES:?} suffixes={SUFFIXES:?}");
 }
 
-fn runtime() -> tokio::runtime::Runtime {
+pub(super) fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("test runtime")
 }
 
-fn encode_len(engine: &Engine, text: &str, len: usize) -> Vec<u32> {
+pub(super) fn encode_len(engine: &Engine, text: &str, len: usize) -> Vec<u32> {
     let mut ids = Vec::new();
     while ids.len() < len {
         ids.extend_from_slice(engine.tokenizer().encode(text, false).unwrap().get_ids());
@@ -534,7 +534,7 @@ fn encode_len(engine: &Engine, text: &str, len: usize) -> Vec<u32> {
 
 /// Tool-turn shape: the handler tags the full input; greedy with top-4
 /// logprobs so every emitted token and its alternatives compare bit for bit.
-fn tool_turn(max_tokens: usize, input: &[u32]) -> SamplingParams {
+pub(super) fn tool_turn(max_tokens: usize, input: &[u32]) -> SamplingParams {
     SamplingParams {
         temperature: 0.0,
         max_tokens,
@@ -679,7 +679,7 @@ fn gemma_joint_warm_engine_cohort_matches_serial_tool_turns() {
     println!("GEMMA_JOINT_WARM_ENGINE_COMPLETE turn1_lanes=4 turn2_lanes=3 below_threshold_fallback=true outputs_bitwise=true");
 }
 
-fn assert_same(label: &str, actual: &GenerationResult, expected: &GenerationResult) {
+pub(super) fn assert_same(label: &str, actual: &GenerationResult, expected: &GenerationResult) {
     assert_eq!(actual.text, expected.text, "{label}: text");
     assert_eq!(
         actual.reasoning_text, expected.reasoning_text,
