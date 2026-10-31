@@ -58469,6 +58469,10 @@ mod gemma_full_input_tests;
 mod gemma_full_input_serving_tests;
 
 #[cfg(test)]
+#[path = "engine_gemma_cold_prefill_tests.rs"]
+mod gemma_cold_prefill_tests;
+
+#[cfg(test)]
 #[path = "engine_gemma_warm_batch_tests.rs"]
 mod gemma_warm_batch_tests;
 
