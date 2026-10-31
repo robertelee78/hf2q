@@ -20003,19 +20003,18 @@ fn admit_qwen35_slot(
 
     // Record an explicit policy decision at SlotAware admission. Exact
     // speculation is enabled only after bounded prefill captures any required
-    // MTP state; unsupported semantics stay on ordinary target decode.
-    let mut slot_mtp_decision = super::qwen35_speculation::classify_request(
+    // MTP state; unsupported semantics stay on ordinary target decode, and a
+    // bound KV graft (ADR-059) keeps eligible requests on ordinary grafted
+    // decode because the MTP arena is not graft-wired.
+    let slot_mtp_decision = super::qwen35_speculation::classify_slot_request(
         guard.model.speculation.policy(),
         super::engine_qwen35::is_qwen_server_speculation_exact_eligible(&params),
         cached_tokens == prompt_tokens.len() && cached_spec_candidate.is_none(),
+        graft.is_some(),
     );
-    // ADR-059: the MTP cache is a separate slot arena that never receives
-    // the graft; under a bound graft its target logits would verify drafts
-    // against the ungrafted distribution. Skip speculation (an
-    // optimization, never a semantic path) and serve through ordinary
-    // grafted decode.
     if graft.is_some()
-        && slot_mtp_decision == super::qwen35_speculation::QwenSpeculationDecision::Eligible
+        && slot_mtp_decision
+            == super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable
     {
         tracing::info!(
             target: "hf2q::serve::api::engine_qwen35::graft",
@@ -20023,7 +20022,6 @@ fn admit_qwen35_slot(
             "KV graft bound: skipping SlotAware MTP (spec-decode cache is not \
              graft-wired); serving via ordinary grafted decode"
         );
-        slot_mtp_decision = super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable;
     }
     if slot_mtp_decision != super::qwen35_speculation::QwenSpeculationDecision::Eligible {
         super::qwen35_speculation::record_fallback(slot_mtp_decision);
