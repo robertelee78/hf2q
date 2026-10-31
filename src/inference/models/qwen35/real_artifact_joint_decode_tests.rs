@@ -11,22 +11,26 @@
 //! Run (one artifact per process; mlx-native snapshots its routing policy):
 //!
 //! ```text
-//! HF2Q_QWEN36_GGUF=/path/qwen36.gguf cargo test --release --lib \
+//! HF2Q_QWEN36_GGUF=/path/qwen36.gguf cargo test --release --bin hf2q \
 //!   qwen36_joint_decode_matches_serial_decode_bitwise -- --ignored --exact
-//! HF2Q_QWEN38_GGUF=/path/qwen38.gguf cargo test --release --lib \
+//! HF2Q_QWEN38_GGUF=/path/qwen38.gguf cargo test --release --bin hf2q \
 //!   qwen38_joint_decode_mvn_matches_serial_decode_bitwise -- --ignored --exact
 //! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 HF2Q_QWEN38_GGUF=/path/qwen38.gguf \
-//!   cargo test --release --lib \
+//!   cargo test --release --bin hf2q \
 //!   qwen38_joint_decode_padded_mv_ext_keeps_decision_parity -- --ignored --exact
 //! ```
 //!
-//! The padded test is a Q1 diagnostic (synthetic prompts, top-1 only). Cohort
-//! invariance and the real-prompt Q1 Class B trace live in
-//! `real_artifact_joint_decode_invariance_tests`.
+//! The padded test is a Q1 diagnostic (synthetic prompts, top-1 only) on the
+//! dense FFN route `HF2Q_QWEN_JOINT_FFN_SHARED` selects (default: shared
+//! weights). Cohort invariance lives in
+//! `real_artifact_joint_decode_invariance_tests`, the real-prompt Q1 Class B
+//! trace in `real_artifact_joint_decode_q1_tests`.
 
 use mlx_native::{DType, MlxBuffer};
 
-use super::joint_decode_routes::JointRouteMode;
+use super::joint_decode_routes::{
+    joint_ffn_shared_from_process, select_dense_ffn_route, JointDenseFfnRoute, JointRouteMode,
+};
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
 use super::spec_decode::positions_for_range;
@@ -236,6 +240,7 @@ fn assert_refusal_writes_nothing(
     joint: &mut HybridKvCache,
     lanes: &[Lane],
     mode: JointRouteMode,
+    dense_ffn: JointDenseFfnRoute,
 ) {
     let row = |slot: u32| Qwen35JointRow {
         slot_id: SlotId(slot),
@@ -243,18 +248,28 @@ fn assert_refusal_writes_nothing(
         position: lanes[slot as usize].position,
         output: Qwen35JointOutput::Logits,
     };
-    for rows in [
-        vec![row(0), row(0)],
-        vec![
-            row(1),
-            Qwen35JointRow {
-                slot_id: SlotId(SLOTS),
-                ..row(2)
-            },
-        ],
-    ] {
+    let mut refused = vec![
+        (vec![row(0), row(0)], dense_ffn),
+        (
+            vec![
+                row(1),
+                Qwen35JointRow {
+                    slot_id: SlotId(SLOTS),
+                    ..row(2)
+                },
+            ],
+            dense_ffn,
+        ),
+    ];
+    if mode == JointRouteMode::Exact {
+        // A valid cohort on the non-bitwise shared FFN route.
+        refused.push((vec![row(0), row(1)], JointDenseFfnRoute::SharedWeights));
+    }
+    for (rows, dense_ffn) in refused {
         assert!(
-            model.forward_gpu_decode_joint(&rows, joint, mode).is_err(),
+            model
+                .forward_gpu_decode_joint(&rows, joint, mode, dense_ffn)
+                .is_err(),
             "invalid joint step must be refused"
         );
         assert_caches_equal(serial, joint, "after refused step");
@@ -283,7 +298,14 @@ fn run_bitwise_gate(env: &str) {
         .map(|slot| prefill_slot(&model, &mut serial, &mut joint, slot, &prompt(slot, 0)))
         .collect::<Vec<_>>();
     assert_caches_equal(&serial, &joint, "after prefill");
-    assert_refusal_writes_nothing(&model, &serial, &mut joint, &lanes, JointRouteMode::Exact);
+    assert_refusal_writes_nothing(
+        &model,
+        &serial,
+        &mut joint,
+        &lanes,
+        JointRouteMode::Exact,
+        JointDenseFfnRoute::SerialBuilder,
+    );
 
     for (step, cohort) in SCHEDULE.iter().enumerate() {
         if step == REJOIN_STEP {
@@ -302,7 +324,12 @@ fn run_bitwise_gate(env: &str) {
             })
             .collect::<Vec<_>>();
         let outputs = model
-            .forward_gpu_decode_joint(&rows, &mut joint, JointRouteMode::Exact)
+            .forward_gpu_decode_joint(
+                &rows,
+                &mut joint,
+                JointRouteMode::Exact,
+                JointDenseFfnRoute::SerialBuilder,
+            )
             .unwrap_or_else(|error| panic!("joint step {step}: {error:#}"));
         for (row, output) in rows.iter().zip(&outputs) {
             let slot = row.slot_id.0;
@@ -373,7 +400,8 @@ fn qwen38_joint_decode_mvn_matches_serial_decode_bitwise() {
 }
 
 /// Decision diagnostic for the Qwen3.8 production route: joint rows use
-/// `mul_mv_ext` at the fixed padded width 4. On these synthetic prompts,
+/// `mul_mv_ext` at the fixed padded width 4, with the dense FFN route
+/// `HF2Q_QWEN_JOINT_FFN_SHARED` selects. On these synthetic prompts,
 /// teacher-forced top-1 decisions must equal independent sequential
 /// forwards at every step, cursors and parities must match, and every slot
 /// must keep making the same serial decisions for `FOLLOW_ON` further
@@ -402,6 +430,14 @@ fn qwen38_joint_decode_padded_mv_ext_keeps_decision_parity() {
         Ok(JointRouteMode::PaddedMvExt),
         "Qwen3.8 under the production policy must select the padded mul_mv_ext mode"
     );
+    let dense_ffn = select_dense_ffn_route(
+        JointRouteMode::PaddedMvExt,
+        joint_ffn_shared_from_process().expect("valid HF2Q_QWEN_JOINT_FFN_SHARED"),
+    );
+    eprintln!(
+        "padded decision diagnostic: dense FFN {}",
+        dense_ffn.label()
+    );
     let mut serial = new_cache(&model);
     let mut joint = new_cache(&model);
     let mut lanes = (0..SLOTS)
@@ -413,6 +449,7 @@ fn qwen38_joint_decode_padded_mv_ext_keeps_decision_parity() {
         &mut joint,
         &lanes,
         JointRouteMode::PaddedMvExt,
+        dense_ffn,
     );
     let cursors_and_parity = |serial: &HybridKvCache, joint: &HybridKvCache, label: &str| {
         for slot in 0..SLOTS {
@@ -464,7 +501,7 @@ fn qwen38_joint_decode_padded_mv_ext_keeps_decision_parity() {
             })
             .collect::<Vec<_>>();
         let outputs = model
-            .forward_gpu_decode_joint(&rows, &mut joint, JointRouteMode::PaddedMvExt)
+            .forward_gpu_decode_joint(&rows, &mut joint, JointRouteMode::PaddedMvExt, dense_ffn)
             .unwrap_or_else(|error| panic!("joint step {step}: {error:#}"));
         for (row, output) in rows.iter().zip(&outputs) {
             let serial_token = model

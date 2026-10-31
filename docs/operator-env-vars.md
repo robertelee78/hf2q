@@ -92,7 +92,7 @@ architecture.
 
 With two or more Qwen agents decoding at once, eligible slots can advance through one shared target forward per scheduler turn instead of one forward per slot. Joint rows run ordinary target decode: MTP drafting and history proposals are suppressed for them (slots with MTP state still run their MTP catch-up, so a later solo turn resumes K3). With fewer than two eligible slots the turn is serial, including MTP K3 and history speculation.
 
-Under the default exact routing policy each joint row is bitwise identical to its serial target forward and independent of which slots share its step; per-request output can still differ from stock because joint rows do not speculate. Under the Qwen3.8 production policy (`HF2Q_DECODE_MV_EXT=1`) dense artifacts use the padded `mul_mv_ext` mode: every step packs exactly 4 rows (joint width is capped at 4), so a row's packed width never depends on how many tenants share the step. That mode is an ADR-063 Q1 Class B route against stock (decision envelope, not bitwise; `docs/research/adr063-q1-numeric-policy.md`).
+Under the default exact routing policy each joint row is bitwise identical to its serial target forward and independent of which slots share its step; per-request output can still differ from stock because joint rows do not speculate. Under the Qwen3.8 production policy (`HF2Q_DECODE_MV_EXT=1`) dense artifacts use the padded `mul_mv_ext` mode: every step packs exactly 4 rows (joint width is capped at 4), so a row's packed width never depends on how many tenants share the step. In that mode the dense FFN gate and up products are also shared across the packed rows (each weight read once per step) unless `HF2Q_QWEN_JOINT_FFN_SHARED=0`. That mode is an ADR-063 Q1 Class B route against stock (decision envelope, not bitwise; `docs/research/adr063-q1-numeric-policy.md`).
 
 Joint decode is on by default for dense artifacts (Qwen3.8) and off by default for MoE artifacts (Qwen3.6), whose four-agent A/B is incomplete. MoE artifacts with `HF2Q_DECODE_MV_EXT=1`, block storage outside Q4_0/Q8_0/Q4_K/Q5_K/Q6_K, float FFN storage, GLP steering, layer dumps, `HF2Q_LEGACY_PER_LAYER_CB=1` and `MLX_UNRETAINED_REFS=1` keep serial decode. The decision and its reason are logged once at worker start; the routing policy is re-checked every turn. See [ADR-063 S3](research/adr063-s3-qwen-joint-decode.md).
 
@@ -100,6 +100,7 @@ Joint decode is on by default for dense artifacts (Qwen3.8) and off by default f
 |---|---|---|---|
 | `HF2Q_QWEN_JOINT_DECODE` | on for dense (Qwen3.8), off for MoE (Qwen3.6) | `0`/`off`/`false`, `1`/`on`/`true` | Escape hatch and A/B switch. `0` restores serial per-slot decode; `1` opts MoE artifacts in. Read once at worker start. Invalid values warn and use the per-family default. |
 | `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` | `4` | `2`–`8` | Widest joint step; further eligible slots stay serial that turn. The padded `mul_mv_ext` mode caps at 4 regardless. Widths above 4 have no serving measurement. Invalid values warn and use 4. |
+| `HF2Q_QWEN_JOINT_FFN_SHARED` | on | `0`/`off`/`false`, `1`/`on`/`true` | Padded mode only. `0` restores the serial builder's per-row fused gate/up/SiLU kernel, which reads the gate and up weights once per packed row (four times per step). Read once at worker start. Invalid values warn and use on. |
 
 ## DeepSeek-V4 decode
 
@@ -215,7 +216,7 @@ on the Gemma 4 SlotAware worker. It is read once when the worker starts.
   reusable prefix) is admitted without a yield between requests and
   prefilled as one transaction. Projections, norms, FFN/MoE and the output
   head run once over every suffix row; attention runs per slot with the
-  single-slot kernel. Each request's tokens, logprobs and cache bytes are
+  single-slot route. Each request's tokens, logprobs and cache bytes are
   bitwise equal to the per-slot prefill. A lane joins only if its suffix is
   longer than 32 tokens and the cohort stays within 4,096 rows; other
   requests prefill per slot as before.
@@ -228,4 +229,25 @@ or `HF2Q_MM_ID_ROUTING_THRESHOLD` is set, because those change the per-slot
 route the cohort must equal. The worker logs `Gemma joint warm prefill worker
 decision` at start, and each cohort logs `Gemma4 installed prefills advanced in
 one aggregate-bounded transaction` with `transaction="joint warm"`. Evidence:
+`docs/research/adr063-gemma-four-agent-reuse.md`.
+
+### Gemma tiled warm attention (default on)
+
+`HF2Q_GEMMA_WARM_TILED_ATTENTION` selects the attention kernel of Gemma 4
+warm prefills (ADR-063 Stage 2): every single-slot prefill that resumes a
+cached prefix, and every lane of a joint warm cohort. It is read once when
+the model loads.
+- **Unset, `1`, `on` or `true` (default):** tiled F16 flash attention over
+  the slot's K and dequantized V range, one sequence per dispatch (1,024-query
+  sliding chunks, 4,096-query global chunks). Suffixes shorter than 32 tokens
+  keep vec-hybrid attention. This changes warm-prefill numerics once against
+  the `0` route (Q1 Class B); a joint cohort stays bitwise equal to its
+  per-slot prefills.
+- **`0`, `off` or `false`:** kill switch; warm prefills use the vec-hybrid
+  kernel (one decode-style pass per query over the whole history).
+- **Any other value:** logs a warning and keeps the default.
+
+Installed long-prompt lanes (prompts over 4,096 tokens) keep their own
+switch, `HF2Q_GEMMA_TILED_LIVE`. The model load logs `Gemma warm live
+attention kernel`, and each live prefill banner prints `live=`. Evidence:
 `docs/research/adr063-gemma-four-agent-reuse.md`.

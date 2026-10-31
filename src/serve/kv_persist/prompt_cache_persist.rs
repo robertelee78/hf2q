@@ -62,8 +62,11 @@ use serde::{Deserialize, Serialize};
 use crate::serve::api::engine::{GrammarKind, PromptCache, PromptCacheKey, ToolCallPolicy};
 
 /// On-disk schema version for prompt-cache snapshots. Bump on any
-/// breaking schema change.
-pub const PROMPT_CACHE_FORMAT_VERSION: u32 = 2;
+/// breaking schema change, or when the meaning of persisted response
+/// fields changes. v3: Gemma 4 `reasoning_text` no longer carries the
+/// `thought` channel label (and is `None` for empty thought blocks), so
+/// v2 snapshots would replay the old reasoning shape.
+pub const PROMPT_CACHE_FORMAT_VERSION: u32 = 3;
 
 /// Payload-kind tag the spiller uses to route this envelope back to
 /// `restore_prompt_cache` on `post_admit`. Distinct from the

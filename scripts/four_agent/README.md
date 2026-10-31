@@ -76,6 +76,7 @@ Every family run has a `run_kind`:
 | `q5_runtime.py` | Sampler thread (every 500 ms), stop latch, cleanup of the owned process groups |
 | `q5_negative_control.py` | Bounded synthetic memory-growth child |
 | `q5_cases/{qwen38,qwen36,gemma4,deepseek4}.json` | Example family cases |
+| `q5_cases/cancel-{deepseek4,qwen38}.json` | S3 cancel smoke: the family server with the joint-turn trace, client `cancel_smoke.py` (see "S3 cancel smoke") |
 
 ### What one run does
 
@@ -253,6 +254,13 @@ HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_T
   --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-joint-warm-off-$(date -u +%Y%m%dT%H%M%SZ)"
 
+# Gemma4 tiled F16 warm attention A/B (ADR-063 Stage 2): same case, kill-switch arm (alternate ABAB with the default arm)
+HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=0 \
+HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/q5-gemma4-warm-tiled-off-$(date -u +%Y%m%dT%H%M%SZ)"
+
 # Qwen3.6 35B-A3B
 HF2Q_Q5_MODEL=/abs/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/qwen36-client-approval.json \
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/qwen36.json \
@@ -402,3 +410,86 @@ python3 scripts/four_agent/f2_scoreboard_render.py --rows docs/research/adr063-f
 ```sh
 python3 scripts/four_agent/c5_frontend_summary.py "$RUN/server.stderr"
 ```
+
+## S3 cancel smoke and joint row widths (ADR-063 S3: S-C1, S-C2)
+
+`cancel_smoke.py run` is a client for an already running hf2q server. It replays four recorded requests, `agent-N/turn-K/request.json` (default turn 2) from a four-agent run's `client/` directory, as four concurrent streams. Each request is sent verbatim except that `stream` is forced to `true` with `stream_options.include_usage`, and its `model` must equal `--model`.
+
+**Cancel pass.** The client closes the `--cancel-agent` stream (default `agent-0`) once it has received `--cancel-after-events` semantic events (default 16: deltas carrying content, reasoning or tool-call text). It closes only while each of the other three streams has at least one event and no `finish_reason`. If that window never opens, the run is `CancelSmokeInvalid`: no claim either way; pick a longer victim or a smaller K.
+
+**Control pass** (`--no-control` skips it). The same four requests run again without a cancel. All four completing shows that the cancelled slot was released.
+
+**`CancelSmokePass` requires all of the following:**
+- The three survivors end with valid SSE: HTTP 200 `text/event-stream`; one choice at index 0; a `stop`, `tool_calls` or `length` finish; usage with a consistent total; `[DONE]` last; no error frame or `finish_reason: error`. Tool calls need dense indices, an id, a name and JSON-object arguments, and `tool_calls` is the finish reason exactly when calls exist.
+- `/metrics` `hf2q_sse_cancellations` rises by exactly 1 in the cancel pass and by 0 in the control pass.
+- The last joint decode turn the server logged before the close has width ≥ 2.
+- The run window of the server log has no `ERROR` or `poison` lines, and `/readyz` is ready afterwards.
+- Every control-pass stream is valid.
+
+**Reported, not gated.** `control_comparison` records whether each survivor's output (content, reasoning, finish reason, tool-call names and arguments; ids excluded) equals its control output. It also records whether the victim's partial output is a prefix of its control output. Exact equality is expected on bitwise or cohort-invariant routes. The control runs on caches warmed by the cancel pass, so a difference needs diagnosis before it counts against the route.
+
+**Row widths (S-C2).** Width is `lanes` for DeepSeek-V4 and `rows` for Qwen, taken from the per-turn `DeepSeek-V4 joint decode turn` and `Qwen joint decode turn` debug lines. The receipt histograms them for the whole run, the cancel pass, the part after the close and the control pass. A DeepSeek-V4 turn runs up to `budget` lockstep steps, so `budget_steps_by_width_upper_bound` is an upper bound: lanes that finish mid-turn narrow later steps. `cancel_smoke.py widths --family F --server-log LOG` prints the same histogram for any log, such as a canonical four-agent run.
+
+**Debug lines need `LOG_FILTER`.** hf2q ignores `RUST_LOG` when `-v` is given, and the family launchers pass `-v`. So no retained run has these lines. `serve_deepseek4_opencode.sh` and `serve_qwen36_opencode.sh` (which `serve_qwen38_opencode.sh` execs) take `LOG_FILTER=<filter>`: it replaces `-v` with `RUST_LOG=<filter>`. Empty or unset keeps `-v`. `deepseek4.json` and `qwen38.json` declare `LOG_FILTER` with an empty default; the cancel cases default it to the family's debug filter.
+
+**Receipt.** `<output>/summary.json`, schema `hf2q.s3.cancel-smoke.v1`, with `status`, `reasons`, per-pass per-agent results, the close point (server-log offset and survivor event counts), counter deltas, joint turns around the close, histograms and the comparison. Per-agent request, raw SSE and assembled output are written under `<output>/{cancel,control}/agent-N/`. The exit code is 0 only on `CancelSmokePass`.
+
+**Q5 contract.** The cancel cases reuse the canonical case's launcher, environment, readiness and memory supervision. The client:
+- runs with `cwd` at the run directory;
+- reads `{OUT}/server.stderr`, which the supervisor writes;
+- writes `{OUT}/client/summary.json`, whose `success_status` is `CancelSmokePass`.
+
+There is no client approval or barrier: the client runs no tools, no cargo and no sandbox, and releases its four streams together itself. A cancel run is a calibration-kind Q5 run, so it needs `--negative-control-receipt` and no `--admission-receipt`.
+
+Root commands, one family at a time, from the repository root of the binary under test (`E`, `Q5_ROOT` and `NC_RECEIPT` as in the Q5 commands):
+
+```sh
+# DeepSeek-V4: S-C1 cancel smoke plus S-C2 widths
+HF2Q_Q5_HF2Q_BIN=/abs/target/release/hf2q \
+HF2Q_Q5_MODEL=/abs/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf \
+HF2Q_Q5_RECORDED_CLIENT="$E/q5-deepseek4-final-20261030T051035Z/client" \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/cancel-deepseek4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/s3-cancel-deepseek4-$(date -u +%Y%m%dT%H%M%SZ)"
+
+# Qwen3.8
+HF2Q_Q5_HF2Q_BIN=/abs/target/release/hf2q HF2Q_Q5_MODEL=/abs/Qwen3.8-27B-vanilla.gguf \
+HF2Q_Q5_RECORDED_CLIENT="$E/q5-qwen38-final-20261030T051303Z/client" \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/cancel-qwen38.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/s3-cancel-qwen38-$(date -u +%Y%m%dT%H%M%SZ)"
+
+# S-C2 on the canonical four-agent workload: the family case with the trace arm, then the histogram
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+HF2Q_Q5_LOG_FILTER='hf2q=info,mlx_native=info,hf2q::serve::api::engine_deepseek4::progress=debug' \
+HF2Q_Q5_MODEL=/abs/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/deepseek4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/deepseek4.json \
+  --negative-control-receipt "$NC_RECEIPT" --output "$Q5_ROOT/s3-trace-deepseek4-$STAMP"
+python3 scripts/four_agent/cancel_smoke.py widths --family deepseek4 \
+  --server-log "$Q5_ROOT/s3-trace-deepseek4-$STAMP/server.stderr"
+# Qwen3.8: q5_cases/qwen38.json with HF2Q_Q5_LOG_FILTER='hf2q=info,mlx_native=info,hf2q::serve::api::engine_qwen35::progress=debug', then --family qwen38
+```
+
+Standalone, with a server the root starts itself, the client needs only the base URL, the model id and the server's stderr file:
+
+```sh
+LOG_FILTER='hf2q=info,mlx_native=info,hf2q::serve::api::engine_deepseek4::progress=debug' \
+MODEL=/abs/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf PORT=18240 MAX_SLOTS=4 \
+KV_CACHE_BUDGET_BYTES=8589934592 MAX_COMPRESSOR_USED_GIB=16 HF2Q_BIN=/abs/target/release/hf2q \
+  scripts/serve_deepseek4_opencode.sh --ctx 262144 2> "$RUN/server.stderr" &
+# after http://127.0.0.1:18240/readyz reports ready:
+python3 scripts/four_agent/cancel_smoke.py run --base-url http://127.0.0.1:18240/v1 \
+  --model 'DeepSeek V4 Flash 0731' --family deepseek4 \
+  --requests "$E/q5-deepseek4-final-20261030T051035Z/client" \
+  --server-log "$RUN/server.stderr" --output "$RUN/client"
+```
+
+Model-free controls are in `test_cancel_smoke.py`. A loopback fake server streams SSE, counts write failures as cancellations and logs joint turns. The tests check:
+- the pass path;
+- survivor error finishes and malformed tool arguments;
+- a missed window;
+- an uncounted cancel;
+- a missing trace;
+- a divergent control (reported, not gated);
+- that the case argv matches the CLI.

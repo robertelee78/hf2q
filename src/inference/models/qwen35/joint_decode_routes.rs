@@ -21,6 +21,16 @@
 //!   `docs/research/adr063-q1-numeric-policy.md` §3.2), not bitwise.
 //!   Only dense-FFN artifacts are admitted in this mode.
 //!
+//! The dense FFN's gate/up products have their own route
+//! ([`JointDenseFfnRoute`]). Exact mode always uses the serial graph's
+//! builder, whose fused gate/up/SiLU kernel launches one threadgroup row per
+//! packed row and therefore reads the gate and up weights once per row. The
+//! padded mode defaults to [`JointDenseFfnRoute::SharedWeights`]: gate and
+//! up become separate packed products on the canonical dispatcher (each
+//! weight block read once per step), followed by `silu_mul`. It is part of
+//! the same Q1 Class B route; `HF2Q_QWEN_JOINT_FFN_SHARED=0` restores the
+//! serial builder.
+//!
 //! Any other block storage type is refused, so an unproven artifact keeps the
 //! serial path instead of coupling one conversation's numerics to another's.
 
@@ -150,8 +160,9 @@ pub(crate) fn projection_route(
     }
 }
 
-/// Dense FFN products always run packed (the fused gate/up kernels have no
-/// per-row fallback in the joint graph), so both types must be admitted.
+/// Dense FFN products always run packed on either [`JointDenseFfnRoute`]
+/// (there is no per-row fallback in the joint graph), so both types must be
+/// admitted.
 pub(crate) fn dense_ffn_route(
     layer: usize,
     gate_up: GgmlType,
@@ -163,6 +174,81 @@ pub(crate) fn dense_ffn_route(
                 "layer {layer} dense FFN {role} is {ggml_type:?}, which has no proven joint decode route"
             ));
         }
+    }
+    Ok(())
+}
+
+/// Kill switch for [`JointDenseFfnRoute::SharedWeights`]: `0`/`off`/`false`
+/// keeps the serial builder in the padded mode; unset or `1`/`on`/`true`
+/// selects the shared route.
+pub(crate) const QWEN_JOINT_FFN_SHARED_ENV: &str = "HF2Q_QWEN_JOINT_FFN_SHARED";
+
+/// How a joint step issues the dense FFN gate/up products.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JointDenseFfnRoute {
+    /// The serial graph's builder at `seq = width`. For Q4_K, Q6_K, Q8_0
+    /// and IQ4_NL gate/up it runs the fused gate/up/SiLU kernel, which
+    /// launches one threadgroup row per packed row: the gate and up weights
+    /// are read once per row.
+    SerialBuilder,
+    /// Gate and up as separate packed products on the canonical dispatcher
+    /// (`mul_mv_ext`, `mvN` or canonical Q5_K at width 4, each reading every
+    /// weight block once per step), then `silu_mul`; the down product is
+    /// unchanged. Not bitwise equal to the serial builder (different
+    /// reduction order), so it is admitted only in the padded mode, where
+    /// it is part of that mode's Q1 Class B route.
+    SharedWeights,
+}
+
+impl JointDenseFfnRoute {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::SerialBuilder => "serial_builder",
+            Self::SharedWeights => "shared_weights",
+        }
+    }
+}
+
+/// Parse [`QWEN_JOINT_FFN_SHARED_ENV`]; unset or blank means on.
+pub(crate) fn parse_joint_ffn_shared(raw: Option<&str>) -> Result<bool, String> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(true);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Ok(true),
+        "0" | "off" | "false" => Ok(false),
+        _ => Err(format!(
+            "{QWEN_JOINT_FFN_SHARED_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
+        )),
+    }
+}
+
+/// [`parse_joint_ffn_shared`] over the process environment.
+pub(crate) fn joint_ffn_shared_from_process() -> Result<bool, String> {
+    parse_joint_ffn_shared(std::env::var(QWEN_JOINT_FFN_SHARED_ENV).ok().as_deref())
+}
+
+/// Dense FFN route for `mode`. Exact mode keeps the serial builder whatever
+/// the switch says: serial `m = 1` decode runs the same per-row fused
+/// kernel, which is what makes its rows bitwise.
+pub(crate) fn select_dense_ffn_route(mode: JointRouteMode, shared: bool) -> JointDenseFfnRoute {
+    match mode {
+        JointRouteMode::PaddedMvExt if shared => JointDenseFfnRoute::SharedWeights,
+        JointRouteMode::Exact | JointRouteMode::PaddedMvExt => JointDenseFfnRoute::SerialBuilder,
+    }
+}
+
+/// Reject a dense FFN route the mode's numeric contract cannot honour.
+pub(crate) fn check_dense_ffn_route(
+    mode: JointRouteMode,
+    route: JointDenseFfnRoute,
+) -> Result<(), String> {
+    if mode == JointRouteMode::Exact && route == JointDenseFfnRoute::SharedWeights {
+        return Err(
+            "exact joint decode requires the serial dense FFN builder (the shared gate/up \
+             route is not bitwise equal to serial decode)"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -274,5 +360,107 @@ mod tests {
             "{error}"
         );
         assert!(dense_ffn_route(3, GgmlType::Q4_K, GgmlType::Q2_K).is_err());
+    }
+
+    #[test]
+    fn shared_ffn_switch_defaults_on_and_parses_explicit_arms() {
+        for raw in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("1"),
+            Some("On"),
+            Some("true"),
+        ] {
+            assert_eq!(parse_joint_ffn_shared(raw), Ok(true), "{raw:?}");
+        }
+        for raw in ["0", "OFF", "false"] {
+            assert_eq!(parse_joint_ffn_shared(Some(raw)), Ok(false), "{raw}");
+        }
+        let error = parse_joint_ffn_shared(Some("shared")).expect_err("invalid switch value");
+        assert!(error.contains(QWEN_JOINT_FFN_SHARED_ENV), "{error}");
+    }
+
+    #[test]
+    fn exact_mode_never_takes_the_shared_ffn_route() {
+        for shared in [false, true] {
+            let route = select_dense_ffn_route(JointRouteMode::Exact, shared);
+            assert_eq!(route, JointDenseFfnRoute::SerialBuilder);
+            assert!(check_dense_ffn_route(JointRouteMode::Exact, route).is_ok());
+        }
+        assert_eq!(
+            select_dense_ffn_route(JointRouteMode::PaddedMvExt, true),
+            JointDenseFfnRoute::SharedWeights
+        );
+        assert_eq!(
+            select_dense_ffn_route(JointRouteMode::PaddedMvExt, false),
+            JointDenseFfnRoute::SerialBuilder
+        );
+        assert!(
+            check_dense_ffn_route(JointRouteMode::Exact, JointDenseFfnRoute::SharedWeights)
+                .is_err()
+        );
+        for route in [
+            JointDenseFfnRoute::SerialBuilder,
+            JointDenseFfnRoute::SharedWeights,
+        ] {
+            assert!(check_dense_ffn_route(JointRouteMode::PaddedMvExt, route).is_ok());
+        }
+    }
+
+    /// The shared route's saving rests on the canonical dispatcher reading
+    /// each weight block once for all padded rows. Pin that for the Qwen3.8
+    /// dense FFN shapes (gate/up `[17408, 5120]`, down `[5120, 17408]`) and
+    /// every admitted type, under both padded-mode policies (`mvN` off, as
+    /// Qwen3.8 serving sets it, and on).
+    #[test]
+    fn shared_ffn_products_read_weights_once_per_padded_step() {
+        use mlx_native::{
+            ggml_capability, GgmlCapabilityRequest, GgmlInvocation, GgmlKernelRoute,
+            GgmlRoutingPolicy, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
+        };
+        let m = PADDED_MV_EXT_WIDTH as u32;
+        for dense_decode_mvn in [false, true] {
+            let routing = GgmlRoutingPolicy {
+                dense_decode_mvn,
+                dense_decode_mv_ext: true,
+                ..GgmlRoutingPolicy::default()
+            };
+            for ggml_type in [
+                GgmlType::Q4_0,
+                GgmlType::Q8_0,
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::Q6_K,
+            ] {
+                assert!(packed_block_type(ggml_type));
+                for (n, k) in [(17_408, 5_120), (5_120, 17_408)] {
+                    let capability = ggml_capability(GgmlCapabilityRequest {
+                        schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
+                        invocation: GgmlInvocation::DenseAuto { m, n, k },
+                        ggml_type,
+                        workload: GgmlWorkloadClass::ContinuousWidth,
+                        routing,
+                    });
+                    let at = format!("{ggml_type:?} [{n}, {k}] m={m} mvn={dense_decode_mvn}");
+                    assert!(capability.executable, "{at}: {}", capability.diagnostic);
+                    assert!(
+                        matches!(
+                            capability.route,
+                            Some(
+                                GgmlKernelRoute::DenseWidthMvExt
+                                    | GgmlKernelRoute::DenseQ4kWidthMn
+                                    | GgmlKernelRoute::DenseQ5kWidthMn
+                                    | GgmlKernelRoute::DenseQ6kWidthMn
+                                    | GgmlKernelRoute::DenseQ5kCanonicalQ4x4
+                            )
+                        ),
+                        "{at}: {:?} is not a multi-column route",
+                        capability.route
+                    );
+                    assert_eq!(capability.dispatches, 1, "{at}: one weight pass");
+                }
+            }
+        }
     }
 }

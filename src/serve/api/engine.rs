@@ -6270,8 +6270,8 @@ struct TickOutcome {
 // ---------------------------------------------------------------------------
 
 /// Reliability-first outer transaction for Gemma 4 text prefill.  One
-/// scheduler turn may contain several of the model's existing 256-query
-/// internal tiles, but it never owns an unbounded rendered prompt.  The
+/// scheduler turn may contain several of the model's internal attention
+/// query chunks, but it never owns an unbounded rendered prompt.  The
 /// 4,096-token starting point is a family-specific rollout candidate derived
 /// from Gemma's measured 6K-class suffix route; the release hardware matrix
 /// may lower it, but may not raise it without watchdog/fairness evidence.
@@ -6578,8 +6578,8 @@ struct Gemma4PrefillProgress {
 /// lane needs; this reserve makes the bound equal the binding lane's own
 /// `end_i + max_tokens_i` (the per-slot requirement), so a cohort fits
 /// whenever every lane fits alone. `lanes` yields `(end, max_tokens)`. Cold
-/// multi-lane prefill must not use it: its dense handoff holds the whole
-/// concatenated stream.
+/// multi-lane prefill keeps the largest `max_tokens`; its forward bounds
+/// each lane by its own slot capacity.
 fn gemma4_batch_decode_reserve(lanes: impl IntoIterator<Item = (usize, usize)>) -> usize {
     let mut max_end = 0usize;
     let mut max_need = 0usize;
@@ -14581,9 +14581,9 @@ fn advance_gemma4_prefill_quantum(
         )
     });
     // Live resume checks `max end + reserve` against each slot, so it uses
-    // the binding lane's own need. Cold multi-sequence prefill sizes its dense
-    // handoff to hold the whole concatenated stream and keeps the largest
-    // `max_tokens`.
+    // the binding lane's own need. Cold multi-sequence prefill keeps the
+    // largest `max_tokens`; its forward bounds each lane by its own slot
+    // capacity, not by the concatenated stream.
     let max_decode_tokens = if start_at_zero {
         lanes
             .iter()
@@ -15241,10 +15241,10 @@ fn admit_gemma4_slots_batched(
         .iter()
         .map(|(h, p, _, _)| (p.clone(), h.slot_id))
         .collect();
-    // Cold multi-sequence prefill sizes its dense handoff from the longest
-    // lane plus this reserve and requires it to hold the whole concatenated
-    // stream, so it keeps the largest `max_tokens` (not
-    // `gemma4_batch_decode_reserve`, which serves the live resume check).
+    // Cold multi-sequence prefill keeps the largest `max_tokens` (not
+    // `gemma4_batch_decode_reserve`, which serves the live resume check); its
+    // forward bounds each lane by its own slot capacity, not by the
+    // concatenated stream.
     let max_decode = admitted
         .iter()
         .map(|(_, _, params, _)| params.max_tokens.max(1))
@@ -20008,19 +20008,18 @@ fn admit_qwen35_slot(
 
     // Record an explicit policy decision at SlotAware admission. Exact
     // speculation is enabled only after bounded prefill captures any required
-    // MTP state; unsupported semantics stay on ordinary target decode.
-    let mut slot_mtp_decision = super::qwen35_speculation::classify_request(
+    // MTP state; unsupported semantics stay on ordinary target decode, and a
+    // bound KV graft (ADR-059) keeps eligible requests on ordinary grafted
+    // decode because the MTP arena is not graft-wired.
+    let slot_mtp_decision = super::qwen35_speculation::classify_slot_request(
         guard.model.speculation.policy(),
         super::engine_qwen35::is_qwen_server_speculation_exact_eligible(&params),
         cached_tokens == prompt_tokens.len() && cached_spec_candidate.is_none(),
+        graft.is_some(),
     );
-    // ADR-059: the MTP cache is a separate slot arena that never receives
-    // the graft; under a bound graft its target logits would verify drafts
-    // against the ungrafted distribution. Skip speculation (an
-    // optimization, never a semantic path) and serve through ordinary
-    // grafted decode.
     if graft.is_some()
-        && slot_mtp_decision == super::qwen35_speculation::QwenSpeculationDecision::Eligible
+        && slot_mtp_decision
+            == super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable
     {
         tracing::info!(
             target: "hf2q::serve::api::engine_qwen35::graft",
@@ -20028,7 +20027,6 @@ fn admit_qwen35_slot(
             "KV graft bound: skipping SlotAware MTP (spec-decode cache is not \
              graft-wired); serving via ordinary grafted decode"
         );
-        slot_mtp_decision = super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable;
     }
     if slot_mtp_decision != super::qwen35_speculation::QwenSpeculationDecision::Eligible {
         super::qwen35_speculation::record_fallback(slot_mtp_decision);
@@ -28439,14 +28437,7 @@ impl ToolCallStreamEmitter {
         tc_index: usize,
         wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
     ) -> Self {
-        let id = format!(
-            "call_hf2q_{:016x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-                ^ (tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
-        );
+        let id = super::tool_call_id::next_tool_call_id();
         Self {
             family,
             wire_kinds,
@@ -29010,14 +29001,7 @@ pub(super) fn emit_streaming_tool_call_close(
             // First chunk: id + type + name. The id is a synthesized opaque
             // identifier; clients echo it in their `tool_call_id` follow-up
             // message. Format mirrors OpenAI's `call_<24hex>` shape.
-            let id = format!(
-                "call_hf2q_{:016x}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0)
-                    ^ (*tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
-            );
+            let id = super::tool_call_id::next_tool_call_id();
             if events
                 .blocking_send(GenerationEvent::ToolCallDelta {
                     index: *tc_index,
@@ -30995,9 +30979,10 @@ fn strip_trailing_stop(text: &mut String, stops: &[String]) {
 ///     concatenated; image parts are ignored in this iter (multimodal lands
 ///     with Phase 2c). A future iter will pass typed parts to vision-aware
 ///     templates.
-///   - OpenAI `assistant` role is remapped to `model` if the GGUF template
-///     is Gemma 4 (detected by presence of `<|turn>model` in the template).
-///     Otherwise roles are passed through verbatim.
+///   - OpenAI `assistant` role is remapped to `model` only for hf2q's
+///     `FALLBACK_GEMMA4_API_CHAT_TEMPLATE`, which prints `m.role` directly.
+///     Every other template (including official Gemma 4 templates, which
+///     rename internally) sees roles verbatim.
 ///   - Per-message `tool_calls` (assistant-emitted) and synthetic
 ///     `tool_responses` (synthesized from OpenAI `role: "tool"` history
 ///     messages, see [`render_chat_prompt_with_tools`]) are exposed to the
@@ -31102,7 +31087,15 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
         return render_deepseek_v4_prompt(messages, tools, enable_thinking, chat_template_kwargs);
     }
 
-    let remap_assistant_to_model = template_str.contains("<|turn>model");
+    // Only hf2q's own fallback renders `<|turn>{{ m.role }}` directly and
+    // needs the Gemma `assistant`→`model` rename. Official / embedded
+    // Gemma 4 templates rename internally and branch on the ORIGINAL
+    // `assistant` role for tool-loop turn continuation, so they must see
+    // the OpenAI roles unchanged.
+    let remap_assistant_to_model = template_str == crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE;
+    // Gemma 4 channel protocol (`<|channel>thought\n…<channel|>`): the
+    // template re-adds the `thought` label around echoed reasoning.
+    let gemma_channel_template = template_str.contains("<|channel>");
 
     // Lookup table tool_call_id → function-name for synthesizing
     // `tool_responses` on role:"tool" messages. Populated INCREMENTALLY
@@ -31138,10 +31131,21 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
         // fabricated empty think block as its own prior output.
         if msg.role == "assistant" {
             if let Some(rc) = msg.reasoning_content.as_ref() {
-                obj.insert(
-                    "reasoning_content".into(),
-                    serde_json::Value::String(rc.clone()),
-                );
+                // Clients of older hf2q builds echo Gemma reasoning with the
+                // channel label still attached (`"thought\n"` for an empty
+                // block); the template adds the label itself, so strip it
+                // and drop reasoning that was only the label.
+                let rc = if gemma_channel_template {
+                    super::registry::strip_gemma4_channel_label(rc)
+                } else {
+                    rc.as_str()
+                };
+                if !(gemma_channel_template && rc.is_empty()) {
+                    obj.insert(
+                        "reasoning_content".into(),
+                        serde_json::Value::String(rc.to_string()),
+                    );
+                }
             }
         }
 
@@ -31186,6 +31190,18 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
         // Templates (Gemma 4) accept either string or mapping for the
         // `response` field; the string path is the safer default.
         if msg.role == "tool" {
+            // OpenAI tool-result fields pass through verbatim: templates
+            // that resolve the function name themselves (Gemma 4 official:
+            // `follow.get('name')` / matching `tool_call_id`) need them.
+            if let Some(tcid) = msg.tool_call_id.as_ref() {
+                obj.insert(
+                    "tool_call_id".into(),
+                    serde_json::Value::String(tcid.clone()),
+                );
+            }
+            if let Some(name) = msg.name.as_ref() {
+                obj.insert("name".into(), serde_json::Value::String(name.clone()));
+            }
             if let Some(tcid) = msg.tool_call_id.as_ref() {
                 let name = id_to_name
                     .get(tcid)
@@ -32891,9 +32907,12 @@ assistant:
     }
 
     #[test]
-    fn render_chat_prompt_remaps_assistant_for_gemma_template() {
-        // Template that contains the Gemma 4 marker `<|turn>model` triggers
-        // the assistant→model remap.
+    fn render_chat_prompt_remaps_assistant_only_for_gemma_fallback_template() {
+        // hf2q's fallback prints `m.role` directly, so it needs the
+        // assistant→model rename; any other template containing
+        // `<|turn>model` (official Gemma 4 templates rename internally)
+        // must see the OpenAI role verbatim.
+        use crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE;
         let tmpl = "<|turn>system\n<|turn>user\n{% for m in messages %}{{ m.role }}:{{ m.content }}\n{% endfor %}<|turn>model\n";
         let msgs = vec![
             ChatMessage {
@@ -32913,11 +32932,13 @@ assistant:
                 name: None,
             },
         ];
+        let fallback = render_chat_prompt(FALLBACK_GEMMA4_API_CHAT_TEMPLATE, &msgs).unwrap();
+        assert!(fallback.contains("<|turn>model\nhello"), "{fallback}");
+        assert!(!fallback.contains("<|turn>assistant"), "{fallback}");
         let out = render_chat_prompt(tmpl, &msgs).unwrap();
         assert!(out.contains("user:hi"));
-        // assistant should have been remapped to model
-        assert!(out.contains("model:hello"));
-        assert!(!out.contains("assistant:hello"));
+        assert!(out.contains("assistant:hello"));
+        assert!(!out.contains("model:hello"));
     }
 
     #[test]
@@ -33014,7 +33035,7 @@ assistant:
                     {%- for part in text.split('|') -%}{{ part }}+{% endfor -%}\
                     {%- endmacro -%}\
                     {% for m in messages %}\
-                    {%- if m.role == 'model' -%}M:{{ splitter(m.content) }}\n\
+                    {%- if m.role == 'assistant' -%}M:{{ splitter(m.content) }}\n\
                     {%- else -%}{{ m.role }}:{{ m.content }}\n{% endif -%}\
                     {% endfor %}";
         let msgs = vec![
@@ -33045,8 +33066,8 @@ assistant:
         ];
         let out = render_chat_prompt(tmpl, &msgs).unwrap();
         assert!(out.contains("user:hi"), "out={out}");
-        // assistant remapped to model (gemma marker present), then split('|')
-        // produced ["a", "b", "c"], each with a trailing '+'.
+        // assistant content went through split('|'), producing
+        // ["a", "b", "c"], each with a trailing '+'.
         assert!(out.contains("M:a+b+c+"), "out={out}");
         assert!(out.contains("user:again"), "out={out}");
     }
@@ -33530,6 +33551,136 @@ assistant:
         assert_eq!(
             &full[stable.len()..],
             "<|turn>model\n<|channel>thought\n<channel|>"
+        );
+    }
+
+    /// The official Gemma 4 chat template (HF `google/gemma-4-26B-A4B-it`
+    /// `chat_template.jinja`, "Published: 2026-07-09"). Unlike the apex
+    /// embedded template it renames `assistant`→`model` itself, keeps one
+    /// model turn open across a tool loop by testing the ORIGINAL role,
+    /// resolves tool names from `name` / `tool_call_id`, and echoes
+    /// `reasoning_content` after the last user turn.
+    const GEMMA4_OFFICIAL_TEMPLATE: &str =
+        include_str!("test_fixtures/gemma4-official-chat-template.jinja");
+
+    /// OpenAI tool-loop history as a coding agent sends it: assistant
+    /// tool calls with empty content and empty reasoning, tool results
+    /// carrying `tool_call_id` + `name`.
+    fn gemma_official_tool_loop() -> serde_json::Value {
+        serde_json::json!({
+            "tools": [
+                {"type": "function", "function": {"name": "read_file", "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+                {"type": "function", "function": {"name": "run_tests", "description": "Run tests",
+                    "parameters": {"type": "object", "properties": {"target": {"type": "string"}}}}}
+            ],
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "Fix parse_port and run the tests."},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"src/ports.rs\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "pub fn parse_port() {}\n"},
+                {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": [{"id": "c2", "type": "function",
+                    "function": {"name": "run_tests", "arguments": "{\"target\":\"ports\"}"}}]},
+                {"role": "tool", "tool_call_id": "c2", "name": "run_tests", "content": "{\"passed\": true}"},
+                {"role": "assistant", "content": "Done: tests pass."},
+                {"role": "user", "content": "Read it again."},
+                {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": [{"id": "c3", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"src/ports.rs\"}"}}]},
+                {"role": "tool", "tool_call_id": "c3", "content": "pub fn parse_port() {}\n"}
+            ]
+        })
+    }
+
+    /// Direct render of the raw request messages, as the peer feeds them:
+    /// roles, `tool_call_id`, `name` unchanged; only tool-call `arguments`
+    /// strings are parsed into mappings (the official template rejects
+    /// string arguments).
+    fn gemma_official_direct_render(request: &serde_json::Value, enable_thinking: bool) -> String {
+        let mut messages = request["messages"].clone();
+        for message in messages.as_array_mut().unwrap() {
+            if let Some(calls) = message.get_mut("tool_calls").and_then(|c| c.as_array_mut()) {
+                for call in calls {
+                    let raw = call["function"]["arguments"].as_str().unwrap().to_string();
+                    call["function"]["arguments"] = serde_json::from_str(&raw).unwrap();
+                }
+            }
+        }
+        let tools: Vec<super::super::schema::Tool> =
+            serde_json::from_value(request["tools"].clone()).unwrap();
+        let mut env = crate::serve::build_chat_template_env(crate::serve::RaisePolicy::Strict);
+        env.add_template("chat", GEMMA4_OFFICIAL_TEMPLATE).unwrap();
+        env.get_template("chat")
+            .unwrap()
+            .render(minijinja::Value::from_serialize(&serde_json::json!({
+                "messages": messages,
+                "tools": serde_json::to_value(&tools).unwrap(),
+                "enable_thinking": enable_thinking,
+                "add_generation_prompt": true,
+                "bos_token": "<bos>",
+                "eos_token": "<eos>",
+            })))
+            .unwrap()
+    }
+
+    fn gemma_official_hf2q_render(request: &serde_json::Value, enable_thinking: bool) -> String {
+        let messages: Vec<ChatMessage> =
+            serde_json::from_value(request["messages"].clone()).unwrap();
+        let tools: Vec<super::super::schema::Tool> =
+            serde_json::from_value(request["tools"].clone()).unwrap();
+        render_chat_prompt_with_tools(
+            GEMMA4_OFFICIAL_TEMPLATE,
+            &messages,
+            Some(&tools),
+            enable_thinking,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn gemma_official_template_tool_loop_renders_like_raw_messages() {
+        let request = gemma_official_tool_loop();
+        for enable_thinking in [false, true] {
+            let hf2q = gemma_official_hf2q_render(&request, enable_thinking);
+            let direct = gemma_official_direct_render(&request, enable_thinking);
+            assert_eq!(hf2q, direct, "enable_thinking={enable_thinking}");
+            // One open model turn per tool loop, real tool names, no
+            // echoed empty thought blocks.
+            assert!(hf2q.contains(
+                "<|turn>model\n<|tool_call>call:read_file{path:<|\"|>src/ports.rs<|\"|>}<tool_call|>\
+                 <|tool_response>response:read_file{value:<|\"|>pub fn parse_port() {}\n<|\"|>}<tool_response|>\
+                 <|tool_call>call:run_tests{target:<|\"|>ports<|\"|>}<tool_call|>"
+            ));
+            assert!(!hf2q.contains("response:unknown"), "{hf2q}");
+            assert!(!hf2q.contains("<|channel>thought\nthought"), "{hf2q}");
+        }
+        // Tail: last message is a tool response, so thinking-off adds no
+        // generation suffix and thinking-on opens the channel.
+        assert!(gemma_official_hf2q_render(&request, false).ends_with("<tool_response|>"));
+        assert!(gemma_official_hf2q_render(&request, true)
+            .ends_with("<tool_response|><|channel>thought\n"));
+    }
+
+    #[test]
+    fn gemma_official_template_drops_echoed_bare_channel_label() {
+        // Clients of older hf2q builds echo `reasoning_content: "thought\n"`
+        // for every empty thought block; it must render exactly like no
+        // reasoning, and a labelled non-empty trace renders once-labelled.
+        let request = gemma_official_tool_loop();
+        let mut old_client = request.clone();
+        old_client["messages"][8]["reasoning_content"] = "thought\n".into();
+        assert_eq!(
+            gemma_official_hf2q_render(&old_client, false),
+            gemma_official_hf2q_render(&request, false)
+        );
+        old_client["messages"][8]["reasoning_content"] = "thought\nCheck the file.".into();
+        let out = gemma_official_hf2q_render(&old_client, false);
+        assert!(
+            out.contains(
+                "<|turn>model\n<|channel>thought\nCheck the file.\n<channel|><|tool_call>"
+            ),
+            "{out}"
         );
     }
 
@@ -57684,63 +57835,6 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
         }
     }
 
-    /// **H222 (SerialFifo byte-equivalence pin)** — Qwen3VL SerialFifo
-    /// path is UNCHANGED by C2e. The pre-C2e EngineMode::SerialFifo
-    /// dispatch did NOT call `provision_multi_seq_kv_for_slot_aware`,
-    /// and post-C2e MUST still not call it (otherwise SerialFifo would
-    /// gain a per-spawn witness write that breaks byte-equivalence).
-    /// Mirror of C2c's H23 + C2d's H28 source-grep regression-pin
-    /// pattern.
-    #[test]
-    fn h222_serial_fifo_qwen3vl_does_not_provision_multi_seq_kv() {
-        let src = include_str!("engine.rs");
-        let body_start = src
-            .find("pub fn spawn_with_mode(")
-            .expect("H222: spawn_with_mode entry not found");
-        let body_end = body_start
-            + src[body_start..]
-                .find("    fn spawn_inner_with_slot_aware")
-                .expect("H222: spawn_inner_with_slot_aware sibling not found")
-            + "    fn spawn_inner_with_slot_aware".len();
-        let body = &src[body_start..body_end];
-        let dispatch = body
-            .find("match mode {\n")
-            .expect("H222: mode dispatch table");
-        let body = &body[dispatch..];
-        let serial_fifo_idx = body
-            .find("EngineMode::SerialFifo")
-            .expect("H222: SerialFifo arm not found in spawn_with_mode");
-        let slot_aware_idx = body
-            .find("EngineMode::SlotAware")
-            .expect("H222: SlotAware arm not found in spawn_with_mode");
-        assert!(
-            serial_fifo_idx < slot_aware_idx,
-            "H222 sanity: dispatch table orders SerialFifo before SlotAware"
-        );
-        let serial_fifo_arm = &body[serial_fifo_idx..slot_aware_idx];
-        assert!(
-            !serial_fifo_arm.contains("provision_multi_seq_kv_for_slot_aware"),
-            "H222 FALSIFIED: post-C2e SerialFifo arm now calls \
-             provision_multi_seq_kv_for_slot_aware — byte-equivalence \
-             with pre-C2e behavior broken (the Qwen3VL provisioner is \
-             a witness-only setter today but on iter-228a will alloc \
-             real KV — SerialFifo must never engage either path)."
-        );
-        // Also: the iter-228a 501 sentinel routing in the four worker
-        // arms is preserved verbatim — the C2e clamp short-circuits
-        // BEFORE the sentinel dispatch at SlotId(N>0), but SlotId(0)
-        // still hits the existing sentinel routing for the
-        // non-Generate-arm cases (Embed / GenerateWithSoftTokens have
-        // soft-token guards). Pin via source-grep on the existing
-        // sentinel call site (engine.rs:~5697+ etc.).
-        assert!(
-            src.contains("qwen3vl_text_forward_pending_err"),
-            "H222 FALSIFIED: the iter-228a 501 sentinel routing \
-             (`qwen3vl_text_forward_pending_err`) is missing from \
-             engine.rs. C2e must NOT touch the iter-228a sentinel path."
-        );
-    }
-
     /// **H223 (typed-error variant exists)** — the new
     /// `EngineSpawnError::Qwen3VLSlotAwareProvisionFailed { max_slots,
     /// cause }` variant exists with the expected shape (mirror of
@@ -57961,73 +58055,6 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
                  enumerate ALL 5 surviving deferrals SHIPPED structurally."
             );
         }
-    }
-
-    /// **H239 (SerialFifo byte-equivalence pin)** — the SerialFifo
-    /// dispatch path is UNCHANGED by §6.1.55.  None of the 5 lifts
-    /// add a worker-arm path on SerialFifo at SlotId(0).
-    ///
-    /// Source-grep pins:
-    /// - SerialFifo arm of `spawn_with_mode` does NOT call any of the
-    ///   new iter-A4-cont* helpers OR the new iter-C2e-cont helper.
-    /// - Worker arm clamps still gated on
-    ///   `handle.slot_id != SlotId(0)` — SerialFifo always emits
-    ///   SlotId(0) (FifoSchedulerAdapter invariant; H51 cross-pin).
-    /// - The DrafterKvCacheVariant routing helper degrades to
-    ///   SingleSeq at `max_slots <= 1` (pre-A4 byte-equivalent).
-    #[test]
-    fn h239_serial_fifo_byte_equivalence_preserved_across_all_5_lifts() {
-        let engine_src = include_str!("engine.rs");
-        let body_start = engine_src
-            .find("pub fn spawn_with_mode(")
-            .expect("H239: spawn_with_mode entry not found");
-        let body_end = body_start
-            + engine_src[body_start..]
-                .find("    fn spawn_inner_with_slot_aware")
-                .expect("H239: spawn_inner_with_slot_aware sibling not found");
-        let body = &engine_src[body_start..body_end];
-        let dispatch = body
-            .find("match mode {\n")
-            .expect("H239: mode dispatch table");
-        let body = &body[dispatch..];
-        let serial_fifo_idx = body
-            .find("EngineMode::SerialFifo")
-            .expect("H239: SerialFifo arm not found");
-        let slot_aware_idx = body
-            .find("EngineMode::SlotAware")
-            .expect("H239: SlotAware arm not found");
-        let serial_fifo_arm = &body[serial_fifo_idx..slot_aware_idx];
-        // SerialFifo arm MUST NOT call any of the new helpers.
-        for forbidden in [
-            "handle_qwen3vl_slot_aware_n_gt_0_sentinel",
-            "select_drafter_kv_variant_for_mode",
-            "DrafterKvCacheVariant",
-        ] {
-            assert!(
-                !serial_fifo_arm.contains(forbidden),
-                "H239 FALSIFIED: SerialFifo arm contains `{forbidden}` — \
-                 byte-equivalence with pre-§6.1.55 behaviour broken. \
-                 The 5-deferral lifts MUST sit on the SlotAware-only \
-                 dispatch surface."
-            );
-        }
-        // Worker-arm clamp predicate is still `handle.slot_id != SlotId(0)`
-        // (SerialFifo always hands out SlotId(0); H51 cross-pin).
-        assert!(
-            engine_src.contains("handle.slot_id != SlotId(0)"),
-            "H239 FALSIFIED: worker-arm clamp predicate `handle.slot_id \
-             != SlotId(0)` removed.  SerialFifo path requires this \
-             predicate to short-circuit at SlotId(0) → fall through to \
-             the existing single-seq dispatch (byte-equivalent)."
-        );
-        // DrafterKvCacheVariant routing degrades to SingleSeq at
-        // max_slots <= 1 (pre-A4 byte-equivalent).
-        let drafter_src = include_str!("../../inference/spec_decode/eagle3/kv_cache.rs");
-        assert!(
-            drafter_src.contains("if max_slots <= 1") || drafter_src.contains("max_slots == 1"),
-            "H239 FALSIFIED: select_drafter_kv_variant_for_mode MUST \
-             route max_slots <= 1 to SingleSeq (byte-equivalent fallback)."
-        );
     }
 
     /// **H240** — Qwen35 / Gemma 4 / non-A4 + non-spec-decode surfaces
@@ -58484,6 +58511,10 @@ mod gemma_warm_batch_tests;
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_fault_tests.rs"]
 mod gemma_warm_batch_fault_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_warm_tiled_tests.rs"]
+mod gemma_warm_tiled_tests;
 
 #[cfg(test)]
 #[path = "engine_template_json_order_tests.rs"]

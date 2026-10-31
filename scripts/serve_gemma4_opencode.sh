@@ -69,9 +69,12 @@
 #   Long soft-token work remains fail-closed until it has a resumable graph.
 #
 #   Normal follow-ups use zero-copy live-prefix reuse and process only the
-#   uncached suffix in bounded 256-query chunks. A real 6,784-token OpenCode
-#   tool turn reused 6,780 tokens and completed a 6,042-token tool-result
-#   suffix at about 909 tok/s with the exact required answer.
+#   uncached suffix: tiled F16 flash attention in bounded 1,024-query
+#   sliding / 4,096-query global chunks (ADR-063 Stage 2), or vec-hybrid
+#   attention in 256-query chunks under WARM_TILED_ATTENTION=0. On the
+#   vec-hybrid route a real 6,784-token OpenCode tool turn reused 6,780
+#   tokens and completed a 6,042-token tool-result suffix at about 909 tok/s
+#   with the exact required answer.
 #   Env escapes (neither should be necessary):
 #     HF2Q_SERVE_BATCHED_PREFILL=0  force linear route always
 #     HF2Q_SERVE_BATCHED_PREFILL=1  force batched route always (can
@@ -86,6 +89,11 @@
 #                                    HF2Q_GEMMA_JOINT_WARM_PREFILL; unset
 #                                    keeps the hf2q default (on). 0 is the
 #                                    A/B kill switch (per-slot warm prefill).
+#     WARM_TILED_ATTENTION=0|1       (this script) forwards
+#                                    HF2Q_GEMMA_WARM_TILED_ATTENTION; unset
+#                                    keeps the hf2q default (on). 0 is the
+#                                    A/B kill switch (vec-hybrid warm
+#                                    attention).
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -191,6 +199,15 @@ case "${JOINT_WARM_PREFILL:-}" in
         exit 2
         ;;
 esac
+WARM_TILED_ENV=""
+case "${WARM_TILED_ATTENTION:-}" in
+    "") ;;
+    0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;
+    *)
+        echo "WARM_TILED_ATTENTION must be 0, 1 or unset" >&2
+        exit 2
+        ;;
+esac
 
 # macOS bash 3.2 + `set -u`: expanding an EMPTY array via "${MMARGS[@]}"
 # is an unbound-variable error (this killed the no-mmproj boot
@@ -201,6 +218,7 @@ if [[ -f "$MMPROJ" ]]; then
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
+        ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
@@ -218,6 +236,7 @@ else
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
+        ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \

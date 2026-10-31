@@ -11,11 +11,15 @@
 //!
 //! * projections, norms, dense FFN/MoE and the per-row head run once over
 //!   every suffix row;
-//! * attention runs per slot against its own KV with the single-slot live
-//!   kernel, chunking, staging and FWHT handling.
+//! * attention runs per slot against its own KV through the one shared
+//!   live attention a single-slot warm prefill uses, on the same route
+//!   (tiled F16 by default, vec-hybrid under
+//!   `HF2Q_GEMMA_WARM_TILED_ATTENTION=0`), chunking, staging and FWHT
+//!   handling.
 //!
-//! Each lane is therefore bitwise equal to its per-slot prefill; the gate is
-//! `gemma_joint_warm_prefill_matches_per_slot_bitwise` (real artifact).
+//! Each lane is therefore bitwise equal to its per-slot prefill on either
+//! route; the gates are `gemma_joint_warm_prefill_matches_per_slot_bitwise`
+//! and `..._vec_hybrid` (real artifact).
 //!
 //! Lane eligibility: text only (no soft tokens, vision identity or stable cue
 //! split), the slot selected at admission holds `cached > 0` tokens, the
