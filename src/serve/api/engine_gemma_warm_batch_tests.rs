@@ -1,24 +1,30 @@
-//! ADR-063 Stage 1 joint warm prefill: real-artifact bitwise gates.
+//! ADR-063 joint warm prefill: real-artifact bitwise gates (Stage 1 cohort,
+//! run on both Stage 2 warm attention routes).
 //!
 //! Ignored; `HF2Q_GEMMA4_GGUF` names the official Gemma 4 26B-A4B GGUF. Run
 //! each test alone with `--exact --ignored --nocapture --test-threads=1`.
-//! * `gemma_joint_warm_prefill_matches_per_slot_bitwise`: one joint
+//! * `gemma_joint_warm_prefill_matches_per_slot_bitwise` (tiled F16 warm
+//!   attention, the default) and `..._vec_hybrid` (the
+//!   `HF2Q_GEMMA_WARM_TILED_ATTENTION=0` route): one joint
 //!   `forward_prefill_batched_multi_seq_live` (`PerSlotExact`) over 4, 2 and
-//!   3 restored slots equals each slot's own per-slot warm prefill: first
-//!   token, final logits bits, every layer's K / TQ-HB V codes / V scales
-//!   bytes over the valid (ring) rows, and the slot cursors.
+//!   3 restored slots equals each slot's own per-slot warm prefill on the
+//!   same route: first token, final logits bits, every layer's K / TQ-HB V
+//!   codes / V scales bytes over the valid (ring) rows, and the slot cursors.
 //! * `gemma_joint_warm_engine_cohort_matches_serial_tool_turns`: four
 //!   concurrent tagged tool turns through the real admission path form one
 //!   cohort and answer byte-identically to the same turns sent one at a time;
 //!   a lane whose suffix is 32 rows falls back to per-slot prefill.
 use super::*;
 use crate::inference::models::gemma4::kv_cache::{
-    restore_gemma_hybrid_slot_anchor, snapshot_gemma_hybrid_slot_anchor,
+    restore_gemma_hybrid_slot_anchor, snapshot_gemma_hybrid_slot_anchor, GemmaHybridSlotAnchor,
 };
+use crate::inference::models::gemma4::GemmaLiveKernel;
 use std::sync::atomic::Ordering;
 
-const HISTORIES: [usize; 4] = [465, 714, 943, 1254];
-const SUFFIXES: [usize; 4] = [56, 200, 311, 385];
+pub(super) const HISTORIES: [usize; 4] = [465, 714, 943, 1254];
+pub(super) const SUFFIXES: [usize; 4] = [56, 200, 311, 385];
+/// Decode budget of every gate prefill.
+pub(super) const MAX_DECODE: usize = 16;
 
 fn official_gguf() -> PathBuf {
     let path = PathBuf::from(
@@ -53,8 +59,9 @@ pub(super) fn synthetic_prompt(slot: usize, len: usize, vocab: usize) -> Vec<u32
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct LaneImage {
-    first_token: u32,
-    logits: Vec<u32>,
+    pub(super) first_token: u32,
+    /// Final logits as `f32::to_bits`.
+    pub(super) logits: Vec<u32>,
     /// One SHA-256 per (layer, K | V codes | V scales) over the slot's valid
     /// rows: `[0, len)` for global layers, the `min(len, cap)` live ring rows
     /// for sliding layers.
@@ -180,70 +187,98 @@ pub(super) fn assert_lane_equal(label: &str, joint: &LaneImage, reference: &Lane
     assert_eq!(joint.cursors, reference.cursors, "{label}: cursors");
 }
 
-#[test]
-#[ignore = "official Gemma 4 GGUF: joint warm prefill lanes equal per-slot warm prefill bit for bit"]
-fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
-    // This test thread plays the SlotAware worker that owns the scaffold and
-    // the CPU checkpoint quota.
+/// A gate lane: `(slot, prompt, history, max_tokens)`.
+pub(super) type Lane<'a> = (usize, &'a [u32], usize, usize);
+
+/// The official GGUF with a four-slot scaffold. The calling test thread
+/// plays the SlotAware worker that owns the scaffold and the CPU checkpoint
+/// quota.
+pub(super) fn load_gate_model() -> LoadedModel {
     crate::debug::investigation_env::gemma_full_input::set_worker_active(true);
     let mut loaded = LoadedModel::load(&load_options()).expect("load official Gemma GGUF");
     let LoadedModel::Gemma(g) = &mut loaded else {
         panic!("HF2Q_GEMMA4_GGUF is not a Gemma 4 artifact")
     };
     g.provision_multi_seq_kv_for_slot_aware(4).unwrap();
-    let mut guard = Gemma4KvGuard::take(g).unwrap();
-    assert_eq!(guard.model.weights.kv_graft_len(), 0, "no graft bound");
-    let vocab = guard.model.weights.vocab_size;
-    let max_decode = 16;
-    let prompts: Vec<Vec<u32>> = (0..4)
-        .map(|slot| synthetic_prompt(slot, HISTORIES[slot] + SUFFIXES[slot], vocab))
-        .collect();
+    loaded
+}
 
-    // Shared histories: one cold prefill per slot, checkpointed on the CPU so
-    // the reference and every joint arm resume from identical bytes.
-    let mut anchors = Vec::new();
-    for slot in 0..4 {
-        let history = HISTORIES[slot];
-        guard
-            .model
-            .weights
-            .forward_prefill_with_soft_tokens_slot_aware(
-                &prompts[slot][..history],
-                &[],
-                max_decode,
-                &mut guard.model.ctx,
-                SlotId(slot as u32),
-                &mut guard.kv,
-                guard.hybrid.as_mut(),
-                guard.dense.as_mut(),
-                guard.mlx.as_mut(),
-            )
-            .unwrap();
-        clear_gemma4_self_mounts(guard.model);
-        install_gemma4_slot_cursor(&mut guard, SlotId(slot as u32), history).unwrap();
-        anchors.push(
-            snapshot_gemma_hybrid_slot_anchor(
-                guard.hybrid.as_ref().unwrap(),
-                SlotId(slot as u32),
-                history,
-            )
-            .unwrap(),
-        );
+/// Four slots holding `HISTORIES`, each from one cold prefill checkpointed on
+/// the CPU, so every reference and joint arm resumes from identical bytes.
+pub(super) struct WarmFixture {
+    pub(super) prompts: Vec<Vec<u32>>,
+    anchors: Vec<GemmaHybridSlotAnchor>,
+}
+
+impl WarmFixture {
+    pub(super) fn build(guard: &mut Gemma4KvGuard<'_>) -> Self {
+        assert_eq!(guard.model.weights.kv_graft_len(), 0, "no graft bound");
+        let vocab = guard.model.weights.vocab_size;
+        let prompts: Vec<Vec<u32>> = (0..4)
+            .map(|slot| synthetic_prompt(slot, HISTORIES[slot] + SUFFIXES[slot], vocab))
+            .collect();
+        let mut anchors = Vec::new();
+        for slot in 0..4 {
+            let history = HISTORIES[slot];
+            guard
+                .model
+                .weights
+                .forward_prefill_with_soft_tokens_slot_aware(
+                    &prompts[slot][..history],
+                    &[],
+                    MAX_DECODE,
+                    &mut guard.model.ctx,
+                    SlotId(slot as u32),
+                    &mut guard.kv,
+                    guard.hybrid.as_mut(),
+                    guard.dense.as_mut(),
+                    guard.mlx.as_mut(),
+                )
+                .unwrap();
+            clear_gemma4_self_mounts(guard.model);
+            install_gemma4_slot_cursor(guard, SlotId(slot as u32), history).unwrap();
+            anchors.push(
+                snapshot_gemma_hybrid_slot_anchor(
+                    guard.hybrid.as_ref().unwrap(),
+                    SlotId(slot as u32),
+                    history,
+                )
+                .unwrap(),
+            );
+        }
+        Self { prompts, anchors }
     }
-    let restore = |guard: &mut Gemma4KvGuard<'_>, slot: usize, history: usize| {
+
+    pub(super) fn restore(&self, guard: &mut Gemma4KvGuard<'_>, slot: usize, history: usize) {
         restore_gemma_hybrid_slot_anchor(
             guard.hybrid.as_mut().unwrap(),
             SlotId(slot as u32),
-            &anchors[slot],
+            &self.anchors[slot],
             history,
         )
         .unwrap();
         install_gemma4_slot_cursor(guard, SlotId(slot as u32), history).unwrap();
-    };
+    }
 
-    // Per-slot reference: today's warm prefill route for each slot alone.
-    let per_slot = |guard: &mut Gemma4KvGuard<'_>, slot: usize, prompt: &[u32], history: usize| {
-        restore(guard, slot, history);
+    pub(super) fn lane(&self, slot: usize) -> Lane<'_> {
+        (
+            slot,
+            self.prompts[slot].as_slice(),
+            HISTORIES[slot],
+            MAX_DECODE,
+        )
+    }
+
+    /// Per-slot reference: the production warm prefill of `slot` alone.
+    pub(super) fn per_slot(
+        &self,
+        guard: &mut Gemma4KvGuard<'_>,
+        slot: usize,
+        prompt: &[u32],
+        history: usize,
+        max_decode: usize,
+    ) -> LaneImage {
+        self.restore(guard, slot, history);
         let first = guard
             .model
             .weights
@@ -265,20 +300,18 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
         let logits = guard.model.weights.logits_view().unwrap().to_vec();
         assert!(logits.iter().all(|value| value.is_finite()));
         lane_image(guard, slot, prompt.len(), first, &logits)
-    };
-    let reference: Vec<LaneImage> = (0..4)
-        .map(|slot| per_slot(&mut guard, slot, &prompts[slot], HISTORIES[slot]))
-        .collect();
+    }
 
-    // Joint arm: restore the same histories, one shared forward. `lanes` are
-    // `(slot, prompt, history, max_tokens)`; the decode reserve is the
-    // production per-lane rule.
-    let joint = |guard: &mut Gemma4KvGuard<'_>,
-                 lanes: &[(usize, &[u32], usize, usize)],
-                 reserve: usize|
-     -> Result<Vec<LaneImage>> {
+    /// Joint arm: restore every lane's history, then one shared
+    /// `PerSlotExact` forward with the given decode reserve.
+    pub(super) fn joint(
+        &self,
+        guard: &mut Gemma4KvGuard<'_>,
+        lanes: &[Lane<'_>],
+        reserve: usize,
+    ) -> Result<Vec<LaneImage>> {
         for &(slot, _, history, _) in lanes {
-            restore(guard, slot, history);
+            self.restore(guard, slot, history);
         }
         let seqs: Vec<(Vec<u32>, SlotId, usize)> = lanes
             .iter()
@@ -309,15 +342,53 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
             images.push(lane_image(guard, slot, prompt.len(), first, &logits));
         }
         Ok(images)
+    }
+}
+
+/// The production per-lane decode reserve of a joint transaction.
+pub(super) fn reserve_for(lanes: &[Lane<'_>]) -> usize {
+    gemma4_batch_decode_reserve(
+        lanes
+            .iter()
+            .map(|&(_, prompt, _, max_tokens)| (prompt.len(), max_tokens)),
+    )
+}
+
+#[test]
+#[ignore = "official Gemma 4 GGUF: joint warm prefill lanes equal per-slot warm prefill bit for bit (tiled F16 route)"]
+fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
+    joint_warm_prefill_matches_per_slot(GemmaLiveKernel::TiledF16);
+}
+
+#[test]
+#[ignore = "official Gemma 4 GGUF: joint warm prefill lanes equal per-slot warm prefill bit for bit (vec-hybrid route)"]
+fn gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid() {
+    joint_warm_prefill_matches_per_slot(GemmaLiveKernel::VecHybrid);
+}
+
+fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
+    let mut loaded = load_gate_model();
+    let LoadedModel::Gemma(g) = &mut loaded else {
+        unreachable!("load_gate_model returns Gemma")
     };
-    let reserve_for = |lanes: &[(usize, &[u32], usize, usize)]| {
-        gemma4_batch_decode_reserve(
-            lanes
-                .iter()
-                .map(|&(_, prompt, _, max_tokens)| (prompt.len(), max_tokens)),
-        )
-    };
-    let lane = |slot: usize| (slot, prompts[slot].as_slice(), HISTORIES[slot], max_decode);
+    let mut guard = Gemma4KvGuard::take(g).unwrap();
+    // Both arms read this one route: per-slot resumes directly, the
+    // `PerSlotExact` cohort through `LiveRoute::resolve`.
+    guard.model.weights.warm_live_kernel = kernel;
+    let fixture = WarmFixture::build(&mut guard);
+    let prompts = &fixture.prompts;
+    let reference: Vec<LaneImage> = (0..4)
+        .map(|slot| {
+            fixture.per_slot(
+                &mut guard,
+                slot,
+                &prompts[slot],
+                HISTORIES[slot],
+                MAX_DECODE,
+            )
+        })
+        .collect();
+
     // Isolation: every row a misaddressed write could reach in a slot outside
     // the cohort (global rows up to the longest prompt, every ring row).
     let longest = prompts.iter().map(Vec::len).max().unwrap();
@@ -333,7 +404,7 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
         &[1, 2, 3],
     ];
     for (case, slots) in cases.iter().enumerate() {
-        let lanes: Vec<_> = slots.iter().map(|&slot| lane(slot)).collect();
+        let lanes: Vec<_> = slots.iter().map(|&slot| fixture.lane(slot)).collect();
         let rows: usize = slots.iter().map(|&slot| SUFFIXES[slot]).sum();
         assert!(rows <= gemma_warm_batch::ROW_CAP);
         assert!(slots
@@ -344,11 +415,13 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
             .iter()
             .map(|&slot| slot_isolation_image(&guard, slot, longest))
             .collect();
-        let images = joint(&mut guard, &lanes, reserve_for(&lanes)).unwrap();
+        let images = fixture
+            .joint(&mut guard, &lanes, reserve_for(&lanes))
+            .unwrap();
         for (image, &slot) in images.iter().zip(slots.iter()) {
             assert_lane_equal(
                 &format!(
-                    "case {case} lanes={slots:?} slot {slot} history {} suffix {}",
+                    "{kernel:?} case {case} lanes={slots:?} slot {slot} history {} suffix {}",
                     HISTORIES[slot], SUFFIXES[slot]
                 ),
                 image,
@@ -358,7 +431,7 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
         for (&slot, before) in outside.iter().zip(&before) {
             assert!(
                 slot_isolation_image(&guard, slot, longest) == *before,
-                "case {case} lanes={slots:?} touched non-cohort slot {slot}"
+                "{kernel:?} case {case} lanes={slots:?} touched non-cohort slot {slot}"
             );
         }
     }
@@ -377,7 +450,7 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
         .unwrap()
         .capacity;
     let near_limit = (capacity / 32) * 32 - prompts[0].len();
-    let mut mixed: Vec<_> = (0..4).map(lane).collect();
+    let mut mixed: Vec<_> = (0..4).map(|slot| fixture.lane(slot)).collect();
     mixed[0].3 = near_limit;
     let per_lane_need = mixed
         .iter()
@@ -388,7 +461,8 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
         .unwrap();
     assert!(per_lane_need <= capacity, "every lane fits alone");
     let naive = mixed.iter().map(|lane| lane.3).max().unwrap();
-    let refused = joint(&mut guard, &mixed, naive)
+    let refused = fixture
+        .joint(&mut guard, &mixed, naive)
         .err()
         .expect("largest max_tokens with the longest lane exceeds the slot");
     assert!(
@@ -399,37 +473,15 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
     assert_eq!(longest + reserve, prompts[0].len() + near_limit);
     // The decode reserve only sizes capacity checks: a per-slot prefill with
     // lane 0's own max_tokens equals the 16-token reference.
-    let per_slot_near_limit = |guard: &mut Gemma4KvGuard<'_>| {
-        restore(guard, 0, HISTORIES[0]);
-        let first = guard
-            .model
-            .weights
-            .forward_prefill_with_soft_tokens_slot_aware_resume(
-                &prompts[0],
-                &[],
-                near_limit,
-                &mut guard.model.ctx,
-                SlotId(0),
-                &mut guard.kv,
-                guard.hybrid.as_mut(),
-                guard.dense.as_mut(),
-                guard.mlx.as_mut(),
-                HISTORIES[0],
-            )
-            .unwrap();
-        clear_gemma4_self_mounts(guard.model);
-        commit_gemma4_slot_cursor(guard, SlotId(0), HISTORIES[0], prompts[0].len()).unwrap();
-        let logits = guard.model.weights.logits_view().unwrap().to_vec();
-        lane_image(guard, 0, prompts[0].len(), first, &logits)
-    };
     assert_lane_equal(
         "per-slot lane 0 at its own near-limit max_tokens",
-        &per_slot_near_limit(&mut guard),
+        &fixture.per_slot(&mut guard, 0, &prompts[0], HISTORIES[0], near_limit),
         &reference[0],
     );
-    for (image, slot) in joint(&mut guard, &mixed, reserve).unwrap().iter().zip(0..4) {
+    let images = fixture.joint(&mut guard, &mixed, reserve).unwrap();
+    for (image, slot) in images.iter().zip(0..4) {
         assert_lane_equal(
-            &format!("mixed max_tokens slot {slot}"),
+            &format!("{kernel:?} mixed max_tokens slot {slot}"),
             image,
             &reference[slot],
         );
@@ -440,22 +492,24 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
     // (MoE mv_id per slot vs mm_id jointly), never a gate.
     let short: Vec<u32> = prompts[0][..HISTORIES[0] + 32].to_vec();
     assert!(!gemma_warm_batch::lane_eligible(short.len(), HISTORIES[0]));
-    let short_reference = per_slot(&mut guard, 0, &short, HISTORIES[0]);
-    let mut lanes = vec![(0, short.as_slice(), HISTORIES[0], max_decode)];
-    lanes.extend([1, 2, 3].map(lane));
-    let images = joint(&mut guard, &lanes, reserve_for(&lanes)).unwrap();
+    let short_reference = fixture.per_slot(&mut guard, 0, &short, HISTORIES[0], MAX_DECODE);
+    let mut lanes = vec![(0, short.as_slice(), HISTORIES[0], MAX_DECODE)];
+    lanes.extend([1, 2, 3].map(|slot| fixture.lane(slot)));
+    let images = fixture
+        .joint(&mut guard, &lanes, reserve_for(&lanes))
+        .unwrap();
     for (image, slot) in images.iter().skip(1).zip([1, 2, 3]) {
         assert_lane_equal(
-            &format!("slot {slot} beside a 32-row lane"),
+            &format!("{kernel:?} slot {slot} beside a 32-row lane"),
             image,
             &reference[slot],
         );
     }
     println!(
-        "GEMMA_JOINT_WARM_THRESHOLD_DIAGNOSTIC rows=32 accepted_as_gate=false joint_equals_per_slot={}",
+        "GEMMA_JOINT_WARM_THRESHOLD_DIAGNOSTIC kernel={kernel:?} rows=32 accepted_as_gate=false joint_equals_per_slot={}",
         images[0] == short_reference
     );
-    println!("GEMMA_JOINT_WARM_BITWISE_COMPLETE lanes=4x5,2,3 mixed_max_tokens=true isolation=true logits_bits=true kv_bytes=true cursors=true histories={HISTORIES:?} suffixes={SUFFIXES:?}");
+    println!("GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel={kernel:?} lanes=4x5,2,3 mixed_max_tokens=true isolation=true logits_bits=true kv_bytes=true cursors=true histories={HISTORIES:?} suffixes={SUFFIXES:?}");
 }
 
 fn runtime() -> tokio::runtime::Runtime {

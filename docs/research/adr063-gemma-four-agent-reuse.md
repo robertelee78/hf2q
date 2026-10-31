@@ -205,25 +205,140 @@ use), plus collapsed client send spread on later turns.
 
 Q1 class: Class A against the per-slot route (bitwise by gate). It changes
 no numerics, so it adds nothing to the full-input checkpoint's Class B
-quality campaign.
+quality campaign. Stage 2 below moves both the per-slot and the joint route
+to one new kernel; the Stage 1 gate now runs on both routes.
 
-### Stage 2 (successor, not implemented): tiled F16 warm attention
+### Stage 2 (this change): tiled F16 warm attention
 
-The vec-hybrid kernel reads the whole history once per query; at 385 queries
-over ~1,400 cached rows that is roughly 150 GB of sliding-layer cache traffic
-per slot, matching the ~190 ms per-slot residual over cold-rate compute
-[INFERENCE]. Stage 2 moves the one shared per-sequence attention function
-(single-slot and joint alike) to the tiled F16 kernels: compact K to dense
-F16, dequantize the active V range, then FA d256 with mask and blk for
-sliding layers and `flash_attn_prefill_f16_d512_resume` for globals.
-Joint stays bitwise equal to per-slot by construction, but warm single-slot
-numerics change once against today, so it is **Q1 Class B**: it needs the
-ADR-040 §0.19-class determinism gate (≥20 repeats, plus
-`MLX_PRECOMPILED_METALLIB=0` stress) and the paired quality campaign.
-Expected [INFERENCE]: a further −2.0 to −2.2 s; both stages together project
-a 17.5–18.5 s makespan against the peer's 18.1 s. At that point the
-`Tiled`/`PerSlotExact` split and `HF2Q_GEMMA_TILED_LIVE` collapse into the
-one function.
+Branch `perf/gemma-warm-tiled-attention` (cut from
+`perf/gemma-cold-prefill-alloc` `fdd25edf`). Source change only; no build,
+test or hardware run has been executed by the author.
+
+**Why.** In the default arm of `E/gemma-alloc-ab-v1/g-1-N-*`
+(`server.stderr:92-233`; the transaction times of `g-5-N` and `g-7-N` agree
+within 5 ms) the six joint warm cohorts take 132.9, 424.7, 516.9, 813.5,
+451.7 and 1,085.7 ms of forward (224/800/916/1,244/636/1,540 rows; 3,425 ms in
+total). A three-term least-squares fit, `fixed + a·rows + b·vec_traffic`,
+matches all six within 21 ms. The `vec_traffic` term is the number of keys
+each query reads: 25 sliding layers at `min(pos, 1024)` keys, plus 5 global
+layers at `pos` keys weighted 2× for head dim 512. The fit gives
+37.7 ms + 0.241 ms/row + 10.5 ms per million key-reads. So
+`flash_attn_vec_hybrid_batched`, which re-reads the whole history once per
+(query, head), accounts for about 1.91 s of the 3.43 s
+(40/181/279/475/260/674 ms per turn) `[INFERENCE: fit, not a kernel
+profile]`.
+
+**What.** `src/serve/gemma_live_attention.rs` holds the one per-sequence
+live attention. Single-slot resumes (`forward_prefill_batched_live_resume*`,
+SerialFifo included) and every multi-sequence lane both call
+`encode_live_layer_attention`, passing each sequence's own KV view
+addressed as slot 0. Per sequence it:
+- appends a global layer's whole suffix first;
+- for a sliding layer, stages up to `cap − 1` ring history rows plus the
+  chunk (`cap − 1 + min(T, chunk)` rows, sized per sequence), attends, and
+  only then commits the chunk into the ring;
+- quantizes TQ-HB V exactly as before, and runs the FWHT sign undo once per
+  layer over the output rows.
+
+The kernel is chosen by `LiveRoute`:
+- **`TiledF16`** (the default for warm resumes): compact K to dense F16 and
+  dequantize the active V range to F16 (F16 V is compacted).
+  - Sliding layers: `build_sdpa_mask_f16` (SWA window, causal,
+    `q_abs_offset` = staged history) plus `blk`, then
+    `flash_attn_prefill_f16_d256_with_blk`, in 1,024-query chunks.
+  - Global layers: `flash_attn_prefill_f16_d512_resume` with
+    `q_offset_in_k = graft + start`, in 4,096-query chunks (the transaction
+    cap, so every slot-aware prefill takes one chunk).
+  - Every dispatch is `batch = 1` over one sequence.
+- **`VecHybrid`**: the previous kernel, chunking (256 queries, split at
+  512/1024) and stage positions, unchanged.
+
+Route rules:
+- Warm resumes (single slot and `PerSlotExact`) read
+  `MlxModelWeights::warm_live_kernel`, resolved once per model load from
+  `HF2Q_GEMMA_WARM_TILED_ATTENTION`. Suffixes under 32 rows keep
+  `VecHybrid`: below the ADR-040 2026-08-14 tiny-prefill containment
+  boundary the tiled route has no serving evidence, and the joint cohort
+  never admits such a lane.
+- Installed long-prompt lanes and the stable batch (`Tiled`) keep
+  `HF2Q_GEMMA_TILED_LIVE` and tile every length, as before.
+
+The old multi-sequence branch (about 600 lines) and the single-slot branch
+(about 380 lines) are deleted. Live resume allocates the vec-hybrid slot
+ids, stage positions and scratch only when some sequence uses that kernel.
+The prefill banner prints `live=…`.
+
+**Installed-lane behaviour.** With graft 0 and TQ-HB V (production), the
+installed lanes issue the same kernel inputs as before. Their stage is now
+per sequence instead of cohort-sized, which only changes the stride of a
+buffer that is compacted before attention, and each lane is at most 4,096
+rows, so it takes one global chunk. Two latent defects of the old tiled
+branch are fixed:
+- With a bound graft, `q_offset_in_k` omitted `graft_len`, hiding each
+  query's last `graft_len` keys.
+- F16 V fell back to vec-hybrid with 1,024-query chunks but 256-chunk stage
+  positions.
+
+**Bitwise single == joint.** A lane and the same sequence alone resolve the
+same `LiveRoute` (`single_slot_and_joint_cohort_always_resolve_the_same_route`).
+They then issue the same dispatches with the same arguments, over Q/K/V rows
+that Stage 1 proves equal, into per-sequence scratch holding only that
+sequence's rows. The masks and `blk` depend only on `(len, kv_seq_len,
+q_abs_offset)`.
+
+**Determinism.** ADR-040's F16-FA concerns do not apply to this route:
+- §0.20's concern was F16 FA over a block-diagonal multi-sequence mask, and
+  its isolation failures were root-caused to the `blk` classifier
+  (mlx-native `cb9806c`). This route never builds a block-diagonal mask.
+- The §0.19 long-prompt non-determinism was re-validated as resolved for
+  single-sequence F16-D512 FA in §7.32K (2026-07-01): N=1 at 8k ×30,
+  N=8 concurrent ×20, 16k ×20, 32,000 × 8 slots × 3, after fixes
+  `cb9806c`, `609dfdc6`, `f070d50` and `8b16039`. Production has routed
+  globals above 8,192 tokens through it since.
+- mlx-native 0.15.15 `flash_attn_prefill*.metal` contains no atomics. Each
+  threadgroup reduces its Q tile over the K blocks in a fixed order.
+  Trailing partial K/V tiles are loaded guarded (`load_safe`,
+  `flash_attn_prefill.metal:1409-1447,1543`; `row < kL` in
+  `flash_attn_prefill_d512.metal:708-731,951-971`), so uninitialized scratch
+  past `kv_seq_len` is never read.
+
+Determinism is still a hardware gate below
+(`gemma_warm_tiled_attention_is_deterministic`, repeated under
+`MLX_PRECOMPILED_METALLIB=0`).
+
+**Q1 class: Class B, route-sensitive.** Warm-prefill numerics change once
+against the vec-hybrid route. Evidence:
+- the decision envelope (`gemma_warm_tiled_attention_decision_envelope`:
+  per-lane max |Δlogit|, top-1 agreement, top-1/top-2 margins);
+- the paired 24-instance quality campaign, default (subject) against the
+  kill switch (reference `stock-hf2q`, `GEMMA_WARM_TILED_ATTENTION=0`).
+
+**Default and revert rule.** On by default
+(`WARM_TILED_ATTENTION_DEFAULT`). If any of the following fails, set
+`WARM_TILED_ATTENTION_DEFAULT = false` in `gemma_live_attention.rs` before
+merging (`=0` stays the operator escape):
+- the bitwise gate (tiled or vec-hybrid);
+- the determinism gate;
+- the envelope's top-1 rule;
+- the campaign verdict (`Loss`, `BelowFloor` or `Inconclusive` without an
+  operator waiver);
+- the A/B, if it is not faster.
+
+**Expected saving `[INFERENCE]`.** Tiled attention does
+`4 · hd · heads` flops per (query, key) pair, without causal tile skipping:
+62/282/435/741/406/1,051 GFLOP per turn, 2,978 GFLOP in total. At 10–20
+TFLOP/s effective (the design's 290 GFLOP ≈ 20 ms per turn-6 slot is
+14.5 TFLOP/s) that is 0.15–0.30 s. Add about 5 ms per cohort of extra
+dispatches (mask, `blk`, compaction, dequant, casts; 6 cohorts). Arithmetic:
+1.91 − (0.15…0.30) − 0.03 ≈ **1.6–1.7 s** off the critical-path warm
+prefill. Joint warm prefill drops from 3.43 s to about 1.75 s, and the
+four-agent makespan from 15.2 s to about **13.5–13.7 s**, against the peer's
+12.4 s. If the fit's attention share is 25% high, the saving is about
+1.2 s (makespan about 14.0 s).
+
+The earlier design estimate (−2.0 to −2.2 s) was taken against serial
+per-slot prefill, including decode-queue creep that Stage 1 already
+removed.
 
 ## First turn (item 3)
 
@@ -519,6 +634,128 @@ Record `q1_decision_policy.py transcripts` A vs B. Stage 1 is bitwise per
 request, so identical transcripts are expected; investigate any divergence
 (it can also come from nondeterministic tool results on the client side).
 
+### Tiled warm attention (Stage 2) gates
+
+Model-free tests and the neighbours whose prefill paths changed:
+
+```sh
+cargo test --locked --bin hf2q gemma_live_attention
+cargo test --locked --bin hf2q route_viability_tests
+cargo test --locked --bin hf2q gemma_joint_warm_
+cargo test --locked --bin hf2q gemma_installed_prefill_batch_
+cargo test --locked --bin hf2q gemma4_bounded_prefill_tests
+cargo test --locked --bin hf2q gemma_cold_prefill_handoff_
+python3 -B -m unittest discover -s scripts/four_agent -p 'test_q5_calibration.py'
+bash scripts/audit_hf2q_env_surface.sh | grep -E 'HF2Q_GEMMA_(WARM_TILED_ATTENTION|TILED_LIVE)'
+```
+
+`gemma_live_attention` covers:
+- the switch: default on, `0`/`off`/`false` select vec-hybrid, and an
+  invalid value warns and keeps the default;
+- single-slot and `PerSlotExact` always resolve the same route under every
+  combination of both switches;
+- the 32-row warm threshold, and installed lanes that ignore the warm
+  switch and tile every length;
+- vec-hybrid chunking at 512/1024, and tiled chunk coverage (1,024 sliding,
+  4,096 global);
+- every chunk fits its ring stage;
+- the graft-shifted global causal offset;
+- vec-hybrid stage positions that are identical for a lane alone and inside
+  a cohort.
+
+Real-artifact gates: one process each, no other runtime loaded. Run the
+loop once with defaults, then four more times with
+`MLX_PRECOMPILED_METALLIB=0` (≥20 determinism repeats in total):
+
+```sh
+for t in \
+  serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_prefill_matches_per_slot_bitwise \
+  serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid \
+  serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_engine_cohort_matches_serial_tool_turns \
+  serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_is_deterministic \
+  serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_decision_envelope; do
+  HF2Q_GEMMA4_GGUF="$GGUF" cargo test --locked --release --bin hf2q "$t" -- --exact --ignored --nocapture --test-threads=1
+done
+```
+
+- **(a) Joint == per-slot, per route.** The Stage 1 harness (histories
+  465/714/943/1254, suffixes 56/200/311/385, 4 lanes ×5, `{0,3}`,
+  `{1,2,3}`, isolation of non-cohort slots, mixed `max_tokens`) runs on the
+  tiled route (`..._bitwise`) and the kill-switch route (`..._vec_hybrid`).
+  Markers: `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=TiledF16` and
+  `kernel=VecHybrid`.
+- **(b) Determinism.** On the tiled route, each lane's per-slot warm
+  prefill five times and the four-lane cohort five times, all bitwise equal
+  (logits bits, KV bytes, cursors), and the cohort equal to per-slot.
+  Marker: `GEMMA_WARM_TILED_DETERMINISM_COMPLETE`.
+- **(c) Decision envelope (Q1 evidence).** Per lane, from identical
+  histories, it records max |Δlogit| at the last row, top-1 agreement and
+  the top-1/top-2 margins on both routes. It fails only when top-1 differs
+  and the vec-hybrid margin is at least 0.5 logits. A 31-row suffix must be
+  bitwise equal on both switches (it stays vec-hybrid). Markers:
+  `GEMMA_WARM_TILED_ENVELOPE_LANE` (per lane) and `GEMMA_WARM_TILED_ENVELOPE`
+  (summary).
+- Re-run the Category 1 loop and the full-input and cold-prefill
+  real-artifact gates above: every Gemma live resume goes through the new
+  function, and `gemma_fresh_and_reused_4096_8193_bounded_outputs_match`
+  exercises installed lanes (including the 1-row tail).
+
+Hardware A/B (Q5 supervisor, `gemma4` case, ABAB with a thermal gap, at
+least 3 per arm; arm A default, arm B kill switch), with the peer arm
+interleaved as above:
+
+```sh
+export HF2Q_Q5_HF2Q_BIN=/abs/release/hf2q HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf \
+  HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json # + CARGO/TOOLCHAIN/SANDBOX_* as in README
+python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" --output "$Q5_ROOT/q5-gemma4-warm-tiled-on-$(date -u +%Y%m%dT%H%M%SZ)"
+HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=0 python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" --output "$Q5_ROOT/q5-gemma4-warm-tiled-off-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Gate on `server.stderr`:
+- one `Gemma warm live attention kernel` line, `kernel=TiledF16` (A) or
+  `kernel=VecHybrid` (B);
+- every warm `Batched prefill:` banner shows `live=tiled-f16 (vec-hybrid
+  below 32 rows)` (A) or `live=vec-hybrid` (B);
+- the `transaction="joint warm" requests=4` cohorts appear in both arms.
+
+Compare the per-cohort `elapsed_ms`, `client/summary.json`
+`elapsed_seconds` and `cached_tokens`. Record
+`q1_decision_policy.py transcripts` A vs B; divergence is expected (Class
+B), so classify it rather than gate on it.
+
+Quality campaign (Class B): 24 paired instances. The subject is the
+default; the reference is the same build with the kill switch, as
+`stock-hf2q`. Do not export `HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION`, because
+it would reach both arms.
+
+```sh
+python3 -B scripts/four_agent/quality_campaign.py \
+  --subject-case scripts/four_agent/q5_cases/gemma4.json \
+  --subject-var CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
+  --reference-case scripts/four_agent/q5_cases/gemma4.json --reference-kind stock-hf2q \
+  --reference-var CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
+  --reference-var GEMMA_WARM_TILED_ATTENTION=0 \
+  --instances 24 --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/quality-gemma4-warm-tiled-$(date -u +%Y%m%dT%H%M%SZ)"   # --dry-run first
+```
+
+`paired` must not return `Loss`, `BelowFloor` or `Inconclusive`. Otherwise
+record an operator waiver or apply the revert rule above.
+
+Measured results (root fills in; all pending):
+
+| Gate | Result | Evidence |
+|---|---|---|
+| (a) tiled joint == per-slot | pending | `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=TiledF16` |
+| (a) vec-hybrid joint == per-slot | pending | `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=VecHybrid` |
+| (b) determinism, defaults + 4× `MLX_PRECOMPILED_METALLIB=0` | pending | `GEMMA_WARM_TILED_DETERMINISM_COMPLETE` ×5 |
+| (c) envelope: max \|Δlogit\|, top-1 agree, min margin | pending | `GEMMA_WARM_TILED_ENVELOPE` |
+| Joint cohort ms per turn, A vs B (t1…t6) | pending | `transaction="joint warm"` `elapsed_ms` |
+| Makespan A / B / peer (median) | pending (expected ≈13.6 / 15.2 / 12.4 s) | `client/summary.json` |
+| Quality campaign verdict | pending | `manifest.json` verdict |
+
 ### Cold admission allocation gates
 
 Model-free tests and the neighbours whose prefill paths changed:
@@ -580,7 +817,9 @@ plus about 20 ms. Compare turn-0 completion times, `elapsed_seconds`, and
 - Every gate above is unexecuted, including the quality campaign. Default
   promotion depends on all of them passing on hardware.
 - Joint warm prefill Stage 1 is unexecuted: the bitwise gates above decide
-  the default. Stage 2 (tiled F16 warm attention, Q1 Class B) is design only.
+  the default. Stage 2 (tiled F16 warm attention, Q1 Class B) is unexecuted:
+  its default needs the bitwise, determinism and envelope gates, the A/B and
+  the quality campaign (revert rule in its section).
 - Turn 0: the cold admission allocation fix is unexecuted on hardware.
   After it, the remaining turn-0 cost is four serial cold boundary
   prefills plus the per-slot cue. The per-step decode gap (about 20 vs

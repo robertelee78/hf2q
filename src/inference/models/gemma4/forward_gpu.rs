@@ -3045,6 +3045,7 @@ embed_weight,
             dflash_capture: None,
             decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
             multi_seq_prefill: None,
+            warm_live_kernel: crate::inference::models::gemma4::GemmaLiveKernel::TiledF16,
         }
     }
 
@@ -3407,6 +3408,7 @@ embed_weight,
             dflash_capture: None,
             decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
             multi_seq_prefill: None,
+            warm_live_kernel: crate::inference::models::gemma4::GemmaLiveKernel::TiledF16,
         };
 
         let tokens: Vec<u32> = vec![0, 1];

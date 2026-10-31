@@ -6270,8 +6270,8 @@ struct TickOutcome {
 // ---------------------------------------------------------------------------
 
 /// Reliability-first outer transaction for Gemma 4 text prefill.  One
-/// scheduler turn may contain several of the model's existing 256-query
-/// internal tiles, but it never owns an unbounded rendered prompt.  The
+/// scheduler turn may contain several of the model's internal attention
+/// query chunks, but it never owns an unbounded rendered prompt.  The
 /// 4,096-token starting point is a family-specific rollout candidate derived
 /// from Gemma's measured 6K-class suffix route; the release hardware matrix
 /// may lower it, but may not raise it without watchdog/fairness evidence.
@@ -58521,6 +58521,10 @@ mod gemma_cold_prefill_tests;
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_tests.rs"]
 mod gemma_warm_batch_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_warm_tiled_tests.rs"]
+mod gemma_warm_tiled_tests;
 
 #[cfg(test)]
 #[path = "engine_template_json_order_tests.rs"]

@@ -52,8 +52,9 @@ width). No `src/` occurrence of the three names remains.
 - `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the joint width, 2..8 with a default of 4. Widths 5–8 have no serving measurement.
 - `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` (`documented-escape`) is the Gemma 4 full-input checkpoint switch. Unset means on where the worker's substrate and quota plan allow it; `0` is the kill switch (also skips the slot-route warmup); `1` forces it and refuses startup otherwise. It no longer needs `HF2Q_UNSAFE_EXPERIMENTS`.
 - `HF2Q_GEMMA_JOINT_WARM_PREFILL` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Gemma 4 joint warm prefill kill switch (ADR-063 Stage 1). Unset or `1`/`on`/`true`: same-step warm tool-turn suffixes share one bitwise-exact transaction; `0`/`off`/`false` restores per-slot warm prefill. Invalid values warn and keep the default. Read once per SlotAware worker; also off when `HF2Q_CROSS_SLOT_ADMIT` is off, `HF2Q_PREFILL_SLOT_BATCHED=0` or `HF2Q_MM_ID_ROUTING_THRESHOLD` is set.
-- `HF2Q_GEMMA4_GGUF` (`development-only`) names the official Gemma 4 GGUF for the ignored real-artifact checkpoint/warmup/joint-warm-prefill tests.
-- `HF2Q_GEMMA_TILED_LIVE` (`development-only`) now governs only installed long-prompt multi-sequence lanes; the joint warm cohort always uses the per-slot vec-hybrid route.
+- `HF2Q_GEMMA_WARM_TILED_ATTENTION` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Gemma 4 tiled F16 warm attention kill switch (ADR-063 Stage 2). Unset or `1`/`on`/`true`: single-slot warm prefills and joint warm cohorts attend with tiled F16 flash attention (suffixes under 32 rows keep vec-hybrid); `0`/`off`/`false` restores vec-hybrid warm attention. Invalid values warn and keep the default. Read once per model load. Installed long-prompt lanes ignore it.
+- `HF2Q_GEMMA4_GGUF` (`development-only`) names the official Gemma 4 GGUF for the ignored real-artifact checkpoint/warmup/joint-warm-prefill/warm-tiled-attention tests.
+- `HF2Q_GEMMA_TILED_LIVE` (`development-only`) governs only installed long-prompt multi-sequence lanes and the stable cue batch; warm prefills follow `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
 - `HF2Q_QWEN_JOINT_DECODE` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Qwen joint decode switch. Unset, it is on for dense artifacts (Qwen3.8) and off for MoE artifacts (Qwen3.6); `0`/`off`/`false` restores serial per-slot decode, including MTP K3 and history speculation, and `1` opts MoE artifacts in.
 - `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the Qwen joint width, 2..8 with a default of 4; the padded `mul_mv_ext` mode caps at 4.
 - `HF2Q_QWEN_JOINT_Q1_PROMPTS`, `HF2Q_QWEN_JOINT_Q1_OUT` and `HF2Q_QWEN_JOINT_Q1_STEPS` (`development-only`) drive the ignored Q1 Class B trace test.
@@ -248,7 +249,7 @@ this release:
 | `HF2Q_GEMMA4_31B_DRAFTER` | `development-only` | 5 |
 | `HF2Q_GEMMA4_31B_GGUF` | `development-only` | 8 |
 | `HF2Q_GEMMA4_EAGLE3_MIN_ACCEPT` | `development-only` | 2 |
-| `HF2Q_GEMMA4_GGUF` | `development-only` | 1 |
+| `HF2Q_GEMMA4_GGUF` | `development-only` | 11 |
 | `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_JOINT_WARM_PREFILL` | `documented-escape` | 3 |
 | `HF2Q_GEMMA_N8_EXPECTED_KV_REGIME` | `development-only` | 3 |
@@ -256,7 +257,8 @@ this release:
 | `HF2Q_GEMMA_N8_PARITY_ROUNDS` | `development-only` | 1 |
 | `HF2Q_GEMMA_N8_PREFILL_REPEATS` | `development-only` | 1 |
 | `HF2Q_GEMMA_N8_RESUME_REPEATS` | `development-only` | 1 |
-| `HF2Q_GEMMA_TILED_LIVE` | `development-only` | 1 |
+| `HF2Q_GEMMA_TILED_LIVE` | `development-only` | 4 |
+| `HF2Q_GEMMA_WARM_TILED_ATTENTION` | `documented-escape` | 7 |
 | `HF2Q_GLOBAL_FA` | `development-only` | 7 |
 | `HF2Q_GPU_BUSY` | `development-only` | 5 |
 | `HF2Q_GPU_SAMPLE` | `development-only` | 4 |
