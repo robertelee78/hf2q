@@ -3,7 +3,8 @@ use super::*;
 #[test]
 #[ignore = "real Gemma GGUF prefill/seed/ring-restore control; requires reviewed model packet"]
 fn gemma_full_input_real_prefill_preserves_sample_and_exact_retry() {
-    assert!(crate::debug::investigation_env::gemma_full_input::selected().unwrap());
+    // This test thread plays the SlotAware worker that owns the scaffold.
+    crate::debug::investigation_env::gemma_full_input::set_worker_active(true);
     let path = PathBuf::from(std::env::var("HF2Q_GEMMA_FULL_INPUT_TEST_GGUF").unwrap());
     let opts = LoadOptions {
         model_path: path,
@@ -66,9 +67,7 @@ fn gemma_full_input_real_prefill_preserves_sample_and_exact_retry() {
         0,
     )
     .unwrap();
-    let tag = gemma_full_input::request_tag(true, true, &prompt, &prompt)
-        .unwrap()
-        .unwrap();
+    let tag = gemma_full_input::request_tag(true, true, &prompt, &prompt).unwrap();
     let anchor = gemma_full_input::capture(&guard, SlotId(0), &prompt, &tag).unwrap();
     let after = guard.model.weights.logits_view().unwrap().to_vec();
     assert_eq!(

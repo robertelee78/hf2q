@@ -138,8 +138,15 @@ fn gemma4_full_input_seven_wire_post_oracle() {
         &c.expected_server_binary_sha256,
         &build
     ));
-    assert!(super::engine::gemma_full_input::request_tag(true, true, &[1], &[1])
-        .unwrap().is_some(), "replay requires explicit experimental stage + unsafe ack");
+    assert!(
+        super::engine::gemma_full_input::enabled_for_engine(
+            true,
+            super::engine::EngineMode::SlotAware {
+                max_slots: c.server_slots
+            }
+        ),
+        "replay requires the production planner enabled (not HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=0)"
+    );
     let capture_bytes = read(&c.capture_log);
     let capture_text = std::str::from_utf8(&capture_bytes).unwrap();
     let reg = registry::find_for_architecture("gemma4").unwrap();
@@ -230,7 +237,7 @@ fn gemma4_full_input_seven_wire_post_oracle() {
             snap["model_id"].as_str().unwrap());
         assert_eq!(actual_usage, receipt["usage"]);
         let last_tool = req.messages.last().is_some_and(|m| m.role == "tool");
-        let tag = super::engine::gemma_full_input::request_tag(true, last_tool, &p, &s).unwrap();
+        let tag = super::engine::gemma_full_input::request_tag(true, last_tool, &p, &s);
         if let Some(tag) = &tag { tag.validate(&p).unwrap(); }
         let cached = accept_growth(&p, &s, prior.as_deref(), &actual_usage, tag.is_some())
             .unwrap_or_else(|why| panic!("turn {i}: {why}"));

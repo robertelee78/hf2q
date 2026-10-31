@@ -7,7 +7,7 @@
 pub(crate) mod cache_scaffold_plan;
 use cache_scaffold_plan::{Modes, Phase, SlotPlan};
 #[path = "anchor_budget.rs"]
-mod anchor_budget;
+pub(crate) mod anchor_budget;
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
@@ -1628,7 +1628,7 @@ fn gemma4_copy_slot_region_out(
     );
     let per_slot = bytes.len() / n_seqs;
     let start = slot_idx * per_slot;
-    if crate::debug::investigation_env::gemma_full_input::selected().map_err(|e| anyhow!(e))? {
+    if crate::debug::investigation_env::gemma_full_input::worker_active() {
         let mut copy = Vec::new();
         copy.try_reserve_exact(per_slot).map_err(|e| anyhow!("{name}: CPU anchor allocation: {e}"))?;
         copy.extend_from_slice(&bytes[start..start + per_slot]);

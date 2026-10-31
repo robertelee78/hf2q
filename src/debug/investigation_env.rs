@@ -981,7 +981,7 @@ impl InvestigationEnv {
                 .iter().any(|name| env::var_os(name).is_some_and(|v| !matches!(v.to_str(), Some("") | Some("0"))))
                 || qwen_pool_profile::split_profile_conflict(env::var("HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS").ok().as_deref()),
             gemma_full_input_checkpoint: gemma_full_input::Mode::from_os(
-                env::var_os("HF2Q_GEMMA_FULL_INPUT_CHECKPOINT").as_deref(), ack),
+                env::var_os("HF2Q_GEMMA_FULL_INPUT_CHECKPOINT").as_deref()),
             qwen_pool_profile: qwen_pool_profile::QwenPoolProfile::from_os(
                 env::var_os("HF2Q_QWEN_POOL_GROWTH_PROFILE").as_deref(), ack),
             raw,

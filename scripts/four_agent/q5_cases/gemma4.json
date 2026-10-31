@@ -2,8 +2,9 @@
   "schema": "hf2q.q5.calibration-case.v1",
   "family": "gemma4",
   "notes": [
-    "Derived from: Gemma4 runner: full-input N4 and largest-tool-result supervisors; stock (no experiment env).",
+    "Derived from: Gemma4 runner: full-input N4 and largest-tool-result supervisors. Stock hf2q defaults; the full-input checkpoint is a default (ADR-063).",
     "Override any variable with HF2Q_Q5_<NAME>; null variables are required. See scripts/four_agent/README.md.",
+    "A/B of the Gemma full-input checkpoint: HF2Q_Q5_GEMMA_FULL_INPUT_CHECKPOINT=0 selects the kill switch (forwarded by the launcher as HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=0); the empty default leaves the hf2q default. Use a distinct --output per arm.",
     "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
     "Text-only: a nonexistent MMPROJ makes the launcher omit --mmproj (it would otherwise default to a repo projector path), and hf2q serve then auto-loads the sibling gemma-4-26B-A4B-it-hf2q-q4_k_m-mmproj.gguf (observed in the 2026-10-30 calibration). artifact.text_only_locator serves a hard link of the same file from a private {OUT}/text-model/ directory, and readiness requires vision_projector == false."
   ],
@@ -23,7 +24,8 @@
     "TOOLCHAIN": null,
     "SANDBOX_PROOF": null,
     "SANDBOX_PROOF_SHA256": null,
-    "CLIENT_APPROVAL_TEMPLATE": null
+    "CLIENT_APPROVAL_TEMPLATE": null,
+    "GEMMA_FULL_INPUT_CHECKPOINT": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -46,7 +48,8 @@
       "MAX_SLOTS": "4",
       "HOST": "127.0.0.1",
       "PORT": "{PORT}",
-      "HF2Q_BIN": "{HF2Q_BIN}"
+      "HF2Q_BIN": "{HF2Q_BIN}",
+      "FULL_INPUT_CHECKPOINT": "{GEMMA_FULL_INPUT_CHECKPOINT}"
     }
   },
   "readiness": {

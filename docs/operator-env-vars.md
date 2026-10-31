@@ -181,16 +181,26 @@ external competition remain separate. A later smaller/larger named policy is
 a new reviewed packet; the program does not resize this one automatically.
 Real-model execution remains separately gated on a complete memory packet.
 
-### Experimental Gemma full-input checkpoint
+### Gemma full-input checkpoint (default on)
 
-`HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1` plus `HF2Q_UNSAFE_EXPERIMENTS=1`
-selects the default-OFF Gemma Hybrid/TQ8 SlotAware1–4 stage. Invalid or
-unacknowledged intent refuses startup; it does not silently return a weaker
-prefix contract. The stage binds the exact token identity of a cue-less
-text/tool-result input, captures at the completed full input without another
-forward/sample, and enforces a1536MiB process requested-CPU-anchor quota across
-ALL Hybrid snapshot constructors and in-flight partial captures. Payloads drop
-before reservation refund. The quota includes projected token-ledger/metadata
-bytes; allocator/OS overhead and other CPU owners are outside this domain.
-This is not a physical admission cap or default promotion. Real-GGUF controls
-and new family-explicit seven-wire semantics remain unqualified until measured.
+`HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` controls the Gemma 4 full-input checkpoint.
+No unsafe acknowledgment is needed.
+- **Unset (default):** on for a Gemma Hybrid/TQ8 SlotAware worker with 1–4
+  slots whose provisioned geometry holds two CPU anchor generations per slot,
+  at the longest prompt ledger, inside the 1536 MiB requested-anchor quota.
+  Otherwise it stays off, and startup does not refuse.
+- **`0`:** kill switch. Tool-result turns reuse only the strict cue-less
+  anchor.
+- **`1`:** forces it on. Startup refuses if it cannot activate.
+- **Any other value:** refuses startup.
+
+When active, a native tool-result turn whose cue-less render equals the prompt
+captures the slot's sliding rings at the completed input. There is no extra
+forward or sample. The next turn restores the capture and prefills only the
+appended suffix. The quota covers all Hybrid snapshot constructors on that
+worker, including projected token-ledger and metadata bytes; payloads drop
+before the refund. Each worker has its own quota. Any refused capture keeps
+the previous anchor and serves the request unchanged. `0` also skips the
+slot-route load warmup, so the kill-switch arm is stock serving. Allocator/OS overhead and other CPU owners are
+outside this domain, so this is not a physical admission cap. Evidence:
+`docs/research/adr063-gemma-four-agent-reuse.md`.

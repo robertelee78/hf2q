@@ -437,6 +437,18 @@ class ArgvAndCases(unittest.TestCase):
         self.assertIn('MAX_COMPRESSOR_USED_GIB="${MAX_COMPRESSOR_USED_GIB:-8}"', launcher)
         self.assertEqual(case['workload']['id'], 'adr063-q5-deepseek4-n4-coding-ctx262144-final-default')
 
+    def test_gemma_case_forwards_only_an_explicit_full_input_checkpoint_arm(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['FULL_INPUT_CHECKPOINT'], '')
+        self.assertNotIn('HF2Q_GEMMA_FULL_INPUT_CHECKPOINT', stock['serve']['env'])
+        off = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_FULL_INPUT_CHECKPOINT': '0'})
+        self.assertEqual(off['serve']['env']['FULL_INPUT_CHECKPOINT'], '0')
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count('${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"}'), 2)
+        self.assertIn('0|1) FULL_INPUT_ENV="$FULL_INPUT_CHECKPOINT" ;;', launcher)
+
     def test_run_id_matches_client_identity_rule(self):
         for name in ('x', 'q5-qwen38-20261030T120000Z', 'a.b c' * 30):
             self.assertRegex(q5_calibration.run_id(name, 'f' * 32), r'^[A-Za-z0-9_-]{16,64}$')

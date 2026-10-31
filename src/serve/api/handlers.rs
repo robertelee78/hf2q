@@ -2137,20 +2137,26 @@ where
         frontend_timing.record(FrontendSpan::StableTokenize, span);
         let span = frontend_timing.start();
         let stable_tokens = stable_encoding.get_ids();
-        gemma_full_input_checkpoint = match super::engine::gemma_full_input::request_tag(
-            matches!(engine.info().arch_family, crate::serve::load_info::ArchFamily::Gemma4),
-            messages_for_render.last().is_some_and(|message| message.role == "tool")
-                && messages_for_render.iter().all(|message| message.content.as_ref()
-                    .is_none_or(|content| content.image_urls().is_empty())),
+        gemma_full_input_checkpoint = super::engine::gemma_full_input::request_tag(
+            super::engine::gemma_full_input::enabled_for_engine(
+                matches!(
+                    engine.info().arch_family,
+                    crate::serve::load_info::ArchFamily::Gemma4
+                ),
+                engine.mode(),
+            ),
+            messages_for_render
+                .last()
+                .is_some_and(|message| message.role == "tool")
+                && messages_for_render.iter().all(|message| {
+                    message
+                        .content
+                        .as_ref()
+                        .is_none_or(|content| content.image_urls().is_empty())
+                }),
             &prompt_tokens,
             stable_tokens,
-        ) {
-            Ok(tag) => tag,
-            Err(error) => {
-                tracing::warn!(%error, "Gemma full-input checkpoint intent refused");
-                return Err(ApiError::internal_error().into_response());
-            }
-        };
+        );
         let boundary = (!stable_tokens.is_empty()
             && stable_tokens.len() < prompt_tokens.len()
             && prompt_tokens.starts_with(stable_tokens))

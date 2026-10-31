@@ -2089,3 +2089,17 @@ oracle relaxation or forced enable_thinking is authorized by this change.
 The subsequent [four-agent serving proof](../research/adr063-gemma-full-input-four-agent-proof.md)
 verified full-input reuse for all four fixed coding conversations. It does not
 promote the experiment or establish a speed win.
+
+### 2026-10-30: Gemma full-input checkpoint promoted to default (ADR-063, staged)
+
+The default-OFF, ack-required stage above is superseded. Unset
+`HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` now activates it on a Gemma SlotAware
+Hybrid/TQ8 worker with 1–4 slots whose provisioned geometry holds two anchor
+generations per slot inside a per-worker 1536 MiB CPU quota; `=0` is the kill
+switch (stock behaviour, including warmup); `=1` forces it and refuses
+otherwise. `HF2Q_UNSAFE_EXPERIMENTS` is no longer involved, so the ack-bearing
+commands above are historical. Every anchor capture role degrades a quota
+refusal to "keep the previous anchor". The route is Q1 Class B
+(`RouteSensitive`): ON and OFF transcripts diverge; quality is decided by the
+24-instance paired campaign against stock. Gates, evidence and remaining
+work: `docs/research/adr063-gemma-four-agent-reuse.md`.
