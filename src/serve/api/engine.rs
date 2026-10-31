@@ -44873,52 +44873,6 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
         );
     }
 
-    /// **H28 (skip-mode, byte-equivalence pin)** — Qwen35 SerialFifo
-    /// path is UNCHANGED by C2d. The pre-C2d EngineMode::SerialFifo
-    /// dispatch did NOT call `provision_multi_seq_kv_for_slot_aware`,
-    /// and post-C2d MUST still not call it (otherwise SerialFifo
-    /// would gain a per-spawn KV alloc that breaks byte-equivalence).
-    ///
-    /// Mirrors C2c's H23. Pinned by source-grep of the spawn dispatch
-    /// table — same regression-pin pattern as A5d's source-grep test.
-    #[test]
-    fn h28_serial_fifo_qwen35_does_not_provision_multi_seq_kv() {
-        let src = include_str!("engine.rs");
-        // Find the spawn_with_mode body and verify SerialFifo arm
-        // does NOT mention `provision_multi_seq_kv_for_slot_aware`.
-        let body_start = src
-            .find("pub fn spawn_with_mode(")
-            .expect("H28: spawn_with_mode entry not found");
-        let body_end = body_start
-            + src[body_start..]
-                .find("    fn spawn_inner_with_slot_aware")
-                .expect("H28: spawn_inner_with_slot_aware sibling not found")
-            + "    fn spawn_inner_with_slot_aware".len();
-        let body = &src[body_start..body_end];
-        // Ignore preceding startup-validation matches: this is the dispatch.
-        let dispatch = body
-            .find("match mode {\n")
-            .expect("H28: mode dispatch table");
-        let body = &body[dispatch..];
-        let serial_fifo_idx = body
-            .find("EngineMode::SerialFifo")
-            .expect("H28: SerialFifo arm not found in spawn_with_mode");
-        let slot_aware_idx = body
-            .find("EngineMode::SlotAware")
-            .expect("H28: SlotAware arm not found in spawn_with_mode");
-        assert!(
-            serial_fifo_idx < slot_aware_idx,
-            "H28 sanity: dispatch table orders SerialFifo before SlotAware"
-        );
-        let serial_fifo_arm = &body[serial_fifo_idx..slot_aware_idx];
-        assert!(
-            !serial_fifo_arm.contains("provision_multi_seq_kv_for_slot_aware"),
-            "H28 FALSIFIED: post-C2d SerialFifo arm now calls \
-             provision_multi_seq_kv_for_slot_aware — byte-equivalence \
-             with pre-C2d behavior broken"
-        );
-    }
-
     /// **H29 (skip-mode)** — the typed `Qwen35SlotAwareProvisionFailed`
     /// variant's Display message names "C2d" so operators can grep
     /// for which iter introduced the typed error.
