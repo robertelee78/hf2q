@@ -377,6 +377,44 @@ class CleanupAndHarness(unittest.TestCase):
         self.assertIn("compile_outside_read_denied", PROOF_CASES)
         self.assertIn("runtime_outside_read_denied", PROOF_CASES)
 
+    def test_quota_walk_survives_file_removed_at_any_point_and_still_enforces_limits(self):
+        # Q3 qwen38 v3 n4-007: rustc removed deps/rustcXXXX/symbols.o while the poller walked
+        # the target tree, and the poller crashed the tool call with FileNotFoundError.
+        # The file vanishes at the k-th stat-family syscall on it, for every k the walk makes.
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        import qwen38_n1_process as process
+        real_stat, real_lstat = os.stat, os.lstat
+        for k in range(1, 6):
+            with self.subTest(vanish_at_call=k), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "deps").mkdir()
+                (root / "deps" / "kept.rlib").write_bytes(b"k" * 100)
+                victim = root / "deps" / "symbols.o"
+                victim.write_bytes(b"s" * 50)
+                calls = [0]
+                def racing(real):
+                    def call(path, *args, **kwargs):
+                        if os.fspath(path) == os.fspath(victim):
+                            calls[0] += 1
+                            if calls[0] == k:
+                                os.unlink(victim)
+                        return real(path, *args, **kwargs)
+                    return call
+                with patch.object(os, "stat", racing(real_stat)), patch.object(os, "lstat", racing(real_lstat)):
+                    total = process.directory_bytes(root, 1000)
+                self.assertIn(total, (100, 150))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kept.rlib").write_bytes(b"k" * 100)
+            with self.assertRaisesRegex(Invalid, "byte quota"):
+                process.directory_bytes(root, 99)
+            (root / "link").symlink_to(root / "kept.rlib")
+            with self.assertRaisesRegex(Invalid, "symlink in tool target"):
+                process.directory_bytes(root, 1000)
+
 
 class AbsoluteDeadline(unittest.TestCase):
     def test_actual_client_postread_deadline_even_without_connection_socket(self):
