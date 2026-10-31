@@ -59,12 +59,19 @@ def tool_arguments(turn):
 
 
 class FakeService:
-    """Loopback /v1/chat/completions; `serialized=True` serves one request at a time end to end."""
+    """Loopback /v1/chat/completions.
 
-    def __init__(self, timing=None, serialized=False, faults=None, model=MODEL):
-        self.timing, self.serialized, self.model = timing or Timing(), serialized, model
+    `slots=N` serves at most N requests at a time end to end (the rest wait in the accept queue
+    with their HTTP requests open); `serialized=True` is `slots=1`. `bursty=True` streams the
+    low-frame shape of hf2q Gemma: one reasoning frame, a pause of `timing.gap`, then the tool
+    name and two argument frames back to back (four progress frames per streamed turn)."""
+
+    def __init__(self, timing=None, serialized=False, faults=None, model=MODEL, slots=None, bursty=False):
+        self.timing, self.model, self.bursty = timing or Timing(), model, bursty
+        slots = 1 if serialized else slots
+        self.slots = None if slots is None else threading.BoundedSemaphore(slots)
         self.faults = dict(faults or {})
-        self.lock, self.state = threading.Lock(), threading.Lock()
+        self.state = threading.Lock()
         self.requests, self.call_ids, self.response_ids = [], {}, {}
         self.counter = 0
         service = self
@@ -78,8 +85,8 @@ class FakeService:
             def do_POST(self):
                 accepted = clock_ns()
                 body = self.rfile.read(int(self.headers["Content-Length"]))
-                if service.serialized:
-                    with service.lock:
+                if service.slots is not None:
+                    with service.slots:
                         service.respond(self, body, accepted)
                 else:
                     service.respond(self, body, accepted)
@@ -196,16 +203,19 @@ class FakeService:
         gap = self.timing.gap
         frames = [(0, delta({"role": "assistant"}))]
         if fault != "role_only":
-            size = -(-len(reasoning) // REASONING_FRAMES)
-            for index in range(REASONING_FRAMES):
+            pieces = 1 if self.bursty else REASONING_FRAMES
+            size = -(-len(reasoning) // pieces)
+            for index in range(pieces):
                 piece = reasoning[index * size:(index + 1) * size]
                 frames.append((self.timing.first if index == 0 else gap, delta({"reasoning_content": piece})))
             if fault != "reasoning_only":
                 if call is not None:
                     frames.append((gap, delta({"tool_calls": [{"index": 0, "id": call["id"], "type": "function",
                                                                "function": {"name": call["function"]["name"]}}]})))
-                    frames.append((gap, delta({"tool_calls": [{"index": 0, "function": {
-                        "arguments": call["function"]["arguments"]}}]})))
+                    arguments = call["function"]["arguments"]
+                    for part in (arguments[:1], arguments[1:]) if self.bursty else (arguments,):
+                        frames.append((0 if self.bursty else gap,
+                                       delta({"tool_calls": [{"index": 0, "function": {"arguments": part}}]})))
                 else:
                     frames.append((gap, delta({"content": content})))
         frames.append((0, frame([{"index": 0, "delta": {}, "finish_reason": finish}])))
@@ -330,16 +340,21 @@ def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="h
     return summary
 
 
-def retime(results, phase_plan, makespan_s, serialized=False, origin=10 ** 12):
-    """Deterministic lockstep (or one-at-a-time) clocks over real receipts; returns (releases, triggers).
+def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
+    """Deterministic lockstep clocks over real receipts; returns (releases, triggers).
 
-    Event counts stay those of the raw frames. Semantic events are the last frames of each stream,
-    as the fake service sends them, and every v3 timing record is recomputed with the actual function."""
+    `slots=N` (canonical plan only) runs the agents N at a time, each group after the previous one
+    finished, as a server capped at N slots would; `slots=1` is a serialized service. A later
+    cohort's streamed turns line up with the earlier cohort's (its turn t with their turn t+2), so
+    a genuine mixed population reaches all four co-active agents. Event counts stay those of the
+    raw frames. Semantic events are the last frames of each stream, as the fake service sends them,
+    and every v3 timing record is recomputed with the actual function."""
     cohorts = coordinator.phase_cohorts(phase_plan)
     agents = coordinator.active_agents(phase_plan)
+    assert slots is None or len(cohorts) == 1, "slot-capped retiming is for single-release plans"
+    groups = 1 if slots is None else -(-len(agents) // slots)
     total = round(makespan_s * 1e9)
-    slots = 7 * len(agents) if serialized else 7 + (2 if len(cohorts) > 1 else 0)
-    duration = total // (slots + 1)
+    duration = total // (7 * groups + (2 if len(cohorts) > 1 else 0) + 1)
     gap = duration // 10
     releases, triggers, start = [origin], [None], {}
     for index, cohort in enumerate(cohorts):
@@ -348,13 +363,18 @@ def retime(results, phase_plan, makespan_s, serialized=False, origin=10 ** 12):
             releases.append(max(trigger.values()) + 1)
             triggers.append(trigger)
         for agent in cohort:
-            start[agent] = releases[index] + 1 + (agents.index(agent) * 7 * duration if serialized else 0)
+            group = 0 if slots is None else agents.index(agent) // slots
+            start[agent] = releases[index] + 1 + group * 7 * duration
     for agent in agents:
-        lane = 0 if serialized else agents.index(agent) * (gap // 8)
+        lane = agents.index(agent) * (gap // 8)
+        cohort = [agent in c for c in cohorts].index(True)
         result = results[agent]
-        result["barrier"]["release_monotonic_ns"] = releases[[agent in c for c in cohorts].index(True)]
+        result["barrier"]["release_monotonic_ns"] = releases[cohort]
         for turn, receipt in enumerate(result["turns"]):
-            send = start[agent] + turn * duration + lane
+            if cohort and turn:
+                send = start[cohorts[0][0]] + (turn + 2 * cohort) * duration + lane
+            else:
+                send = start[agent] + turn * duration + lane
             count, semantic = len(receipt["progress_event_monotonic_ns"]), len(receipt["semantic_event_monotonic_ns"])
             progress = [send + (j + 1) * gap for j in range(count)]
             terminal = send + (count + 1) * gap if receipt["stream"] else send + duration // 2
@@ -394,7 +414,7 @@ def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen"):
     return _TEMPLATES[key]
 
 
-def honest_run(client_dir, makespan_s=100.0, engine_kind="hf2q", phase_plan=None, instance=None, serialized=False,
+def honest_run(client_dir, makespan_s=100.0, engine_kind="hf2q", phase_plan=None, instance=None, slots=None,
                family="qwen"):
     """Write a complete client directory (raw turns + coordinator summary) whose evidence re-derives its Pass."""
     root, results = template(engine_kind, phase_plan, instance, family)
@@ -403,7 +423,7 @@ def honest_run(client_dir, makespan_s=100.0, engine_kind="hf2q", phase_plan=None
     for agent in results:
         shutil.copytree(root / agent, client_dir / agent)
     results = copy.deepcopy(results)
-    releases, triggers = retime(results, phase_plan, makespan_s, serialized)
+    releases, triggers = retime(results, phase_plan, makespan_s, slots)
     return assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, instance)
 
 

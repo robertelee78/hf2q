@@ -166,7 +166,7 @@ def write_run(out, sha, makespan=None, outcome="pass", thermal=0, artifact_sha=M
         (out / "server.stderr").write_bytes(b"x" * 10 + b"error: Insufficient Memory (00000008:kIOGPUCommand"
                                             b"BufferCallbackErrorOutOfMemory)\n")
     if ok:
-        fake.honest_run(out / "client", makespan, engine_kind, phase_plan, serialized=serialized)
+        fake.honest_run(out / "client", makespan, engine_kind, phase_plan, slots=1 if serialized else None)
         return
     names = [f"agent-{i}" for i in range(4)]
     summary = {"status": "Failed", "barrier": {"status": "Released"},

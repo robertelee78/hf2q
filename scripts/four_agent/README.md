@@ -400,7 +400,7 @@ A floor-only family (for example DeepSeek-V4) omits the three `--reference-*` op
 - phase-cohort membership and triggers;
 - client-observed co-progress width.
 
-The co-progress width counts agents whose progress frames (`progress_event_monotonic_ns`, any SSE frame that grew reasoning or semantic output) alternate at least four times inside one streamed request. Overlapping HTTP lifetimes alone count for nothing. Q3 requires width 4 for `n4`, the largest cohort for `K+M`, and only agent-0 for `n1`; a deliberately serialized service is rejected. The width is a client-side lower bound. Physical batch membership and pure prefill/decode phases come from the server phase trace (`f2_trace.py`).
+The co-progress width is the largest set of agents whose streamed requests stay active together: each request runs from its first to its last progress frame (`progress_event_monotonic_ns`, any SSE frame that grew reasoning or semantic output), and the set needs a common window lasting at least half of the shortest member's active interval. No frame alternation is required, so low-frame bursty streams such as hf2q Gemma qualify. Overlapping HTTP lifetimes alone count for nothing. Q3 requires every active agent to be co-active at some point: 4 for `n4` and for `3+1`, `2+2` and `1+3` (the later cohort only exists after its release, and the earlier cohort must still be running then), and only agent-0 for `n1`. A serialized service, or one capped below four slots, is rejected. The width is a client-side lower bound. Physical batch membership and pure prefill/decode phases come from the server phase trace (`f2_trace.py`).
 
 `q2_fake_service.py` is test support only: a model-free OpenAI-compatible loopback service whose fault table injects:
 
@@ -412,8 +412,8 @@ The co-progress width counts agents whose progress frames (`progress_event_monot
 - silent truncation (8192 completion tokens under a non-length finish), an inflated output allowance and a `length` finish;
 - cache and usage lies;
 - a swapped model;
-- known delays;
-- one-request-at-a-time serialization.
+- known delays, and a bursty four-frame stream like hf2q Gemma's;
+- one-request-at-a-time serialization, or a cap of N slots.
 
 `test_q2_adversarial_controls.py` runs the control matrix. The live controls use four real client processes, the receipt and summary forgeries go through the audit, and the false wins go through the actual Q3 and quality drivers. Each test asserts the rejection reason. The matrix, live results and the boundary of what client evidence can prove are in [docs/research/adr063-q2-adversarial-controls.md](../../docs/research/adr063-q2-adversarial-controls.md).
 

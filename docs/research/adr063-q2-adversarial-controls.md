@@ -14,9 +14,9 @@ Each control injects one specific lie and asserts that the harness rejects it wi
 
 | File | Role |
 | --- | --- |
-| `scripts/four_agent/q2_fake_service.py` | Test support. A model-free OpenAI-compatible loopback service that answers the canonical seven-turn coding workflow. Its fault table turns single responses adversarial, and `serialized=True` serves one request at a time end to end. Clients are the real `exchange`/parser and the coordinator verdict is the real `aggregate`; tools are stubs. `run_live` drives four real client processes. `honest_run` writes complete client directories for campaign fixtures. |
+| `scripts/four_agent/q2_fake_service.py` | Test support. A model-free OpenAI-compatible loopback service that answers the canonical seven-turn coding workflow. Its fault table turns single responses adversarial. `slots=N` serves at most N requests at a time end to end (`serialized=True` is `slots=1`), and `bursty=True` streams the four-frame hf2q Gemma shape. Clients are the real `exchange`/parser and the coordinator verdict is the real `aggregate`; tools are stubs. `run_live` drives four real client processes. `honest_run` writes complete client directories for campaign fixtures, lockstep or slot-capped. |
 | `scripts/four_agent/q2_run_audit.py` | Harness detection (new). Re-derives a settled run from its raw client evidence before a Pass counts. |
-| `scripts/four_agent/test_q2_adversarial_controls.py` | The control matrix below (36 tests). |
+| `scripts/four_agent/test_q2_adversarial_controls.py` | The control matrix below (38 tests). |
 
 ## Detection added to the harness
 
@@ -32,7 +32,7 @@ These gaps were found while building the controls. Each fix is the smallest chan
    - recomputes the makespan from the release and task-completion clocks;
    - checks phase-cohort membership and triggers;
    - measures co-progress width.
-2. **No concurrency proof on the Q3 path.** A deliberately serialized four-client service completes the protocol, so the coordinator reports four-agent success. The audit now measures client-observed co-progress (next section). Q3 requires the expected width; the quality campaign does not, because task quality is not a concurrency claim.
+2. **No concurrency proof on the Q3 path.** A deliberately serialized four-client service completes the protocol, so the coordinator reports four-agent success. The audit now measures client-observed co-progress (next section). Q3 requires every active agent to be co-active at some point; the quality campaign does not, because task quality is not a concurrency claim.
 3. **Progress events were not recorded.** Semantic events alone are too sparse. Retained DeepSeek runs have one semantic event per streamed turn, because the tool call arrives in one frame. `exchange` now also records `progress_event_monotonic_ns`: every SSE frame that grew reasoning or semantic output. It uses the same timestamp as the semantic event when both apply, and it is charged to the same client trace quota. The semantic predicate and v3 timing are unchanged.
 4. **Silent truncation with a non-length finish.** Spending the whole 8192-token allowance under `finish_reason` `stop` or `tool_calls` was accepted. `qwen38_n1_verdict.output_budget` now rejects it for both unary and SSE, and for both hf2q and peer usage.
 5. **Truncated tool-argument JSON.** This used to surface as a raw `JSONDecodeError`. It is now `Invalid("incomplete/truncated tool arguments JSON")`.
@@ -45,8 +45,17 @@ These gaps were found while building the controls. Each fix is the smallest chan
 
 Overlapping HTTP lifetimes prove nothing: a serialized service keeps four requests open while it serves one.
 
-- **Co-progress.** Agent B co-progresses with agent A when, inside the span of one of A's streamed requests (first to last progress frame), the merged A/B frame order switches agents at least `MIN_INTERLEAVE = 4` times. The observed width is 1 plus the largest number of agents co-progressing with any one streamed request. If no streamed request progressed twice, the width is 0.
-- **Expected width.** `n4` must show 4. A `K+M` plan must show at least its largest cohort: 3 for `3+1` and `1+3`, 2 for `2+2`. The one-slot control `1` must show exactly agent-0, with width 1.
+- **Co-progress (v2, after independent QE review).**
+  - A streamed request is *active* from its first to its last progress frame (`progress_event_monotonic_ns`).
+  - A set of agents is *co-active* when one active request per agent shares a common window lasting at least `MIN_OVERLAP_FRACTION = 0.5` of the shortest member's active interval.
+  - The observed width is the largest co-active set. It is 1 when there is progress but no qualifying overlap, and 0 with no progress at all.
+  - The rule needs no frame alternation, so low-frame bursty streams qualify. hf2q Gemma streams one reasoning frame, then a burst of three semantic frames, in a fixed per-agent order.
+
+  The first version required four frame alternations inside one request (`MIN_INTERLEAVE`). On retained hf2q Gemma runs that left zero margin: at most 2 switches from real semantic frames, and exactly 4 only with the reasoning frame placed from `first_reasoning_seconds`. A genuine Gemma Q3 run could therefore have been marked `Invalid`.
+- **Why a capped service cannot reach the width.** A service that runs at most N requests at a time cannot keep N+1 requests mid-stream together. Its width stays at N however many HTTP requests it holds open. Only client receive jitter at request boundaries can overlap, and that is a vanishing fraction of an active interval: on real hardware the next request's first frame also waits for its prefill.
+- **Expected width.** Every active agent must be co-active at some point: 4 for `n4`, 4 for `3+1`, `2+2` and `1+3`, and 1 for the one-slot control `1`, which must contain only agent-0.
+  - For `K+M` plans this is an after-release condition. The later cohort exists only after its release, and the audit separately proves that the earlier cohort was still running at that release.
+  - A service capped at the largest cohort (2 for `2+2`, 3 for `3+1`/`1+3`) used to pass the mixed plans. It now fails them.
 - **Cohort membership.** For phase plans, the audit checks four things:
   - The recorded plan and cohorts match the expected plan.
   - Every first-decode trigger lies inside that agent's first streamed request.
@@ -54,23 +63,48 @@ Overlapping HTTP lifetimes prove nothing: a serialized service keeps four reques
   - Every agent of the earlier cohort was still running at that release, so the population really mixed.
 
   Each agent must also observe its own cohort's release, and its first request must follow that release.
-- **Boundary.** Client co-progress is a lower bound on concurrent slot progress. A server that time-slices four requests token by token also shows width 4. Physical batch membership (which owners share one forward), active and runnable prefill/decode counts, and pure four-prefill and four-decode phases come from the server phase trace. `f2_trace.validate_trace` and `qualify_window` decide those, with `forward_demand_v2`/queued-demand rules. They are controlled by `test_q2_f2_controls.py` (all populations, serialized four HTTP labels, Unknown/duplicate/stale membership, missing drains) and `test_f2_demand.py`.
+- **Boundary.** Client co-progress is a lower bound on concurrent slot progress.
+  - A server that time-slices four requests token by token also shows width 4.
+  - So does a server that parks a request mid-generation while it finishes another. To the client that looks the same as a model whose tokens are buffered between frames.
+  - Physical batch membership (which owners share one forward), active and runnable prefill/decode counts, and pure four-prefill and four-decode phases come from the server phase trace. `f2_trace.validate_trace` and `qualify_window` decide those, with `forward_demand_v2`/queued-demand rules. They are controlled by `test_q2_f2_controls.py` (all populations, serialized four HTTP labels, Unknown/duplicate/stale membership, missing drains) and `test_f2_demand.py`.
 
-Live results: four real client processes against the fake service, with known delays of 10 ms before the first delta, 10 ms between frames and 10 ms for unary responses.
+Live results: four real client processes against the fake service.
 
-| Plan | Service | Observed width | Expected | Max open HTTP | Makespan (s) | Harness |
-| --- | --- | ---: | ---: | ---: | ---: | --- |
-| n4 | concurrent | 4 | 4 | 4 | 0.316 | accepted |
-| n4 | serialized | 1 | 4 | 4 | 1.208 | `serialized service: observed co-progress width 1 < 4 with up to 4 overlapping HTTP requests` |
-| 1 | concurrent | 1 | 1 | 1 | 0.336 | accepted |
-| 3+1 | concurrent | 4 | 3 | 4 | 0.358 | accepted |
-| 3+1 | serialized | 1 | 3 | 4 | 1.222 | rejected: width 1 < 3 |
-| 2+2 | concurrent | 4 | 2 | 4 | 0.356 | accepted |
-| 2+2 | serialized | 1 | 2 | 4 | 1.240 | rejected: width 1 < 2 |
-| 1+3 | concurrent | 4 | 3 | 4 | 0.350 | accepted |
-| 1+3 | serialized | 1 | 3 | 4 | 1.270 | rejected: width 1 < 3 |
+- **Default timing:** 2 ms before the first delta, 15 ms between frames, 2 ms unary latency.
+- **Bursty rows** use the Gemma-shaped stream: one reasoning frame after 20 ms, a 60 ms pause, then three semantic frames back to back, for four progress frames per turn.
+- **Overlap** is the witness set's common window over the shortest member interval.
 
-In every row the coordinator alone reported `FourAgentProtocolCompleteAwaitingIndependentReview`. A serialized arm is slower, so it hands a false win to whichever arm it is compared with. `CampaignControls` shows the Q3 driver halting `Invalid` on a serialized stock arm, and `compute_verdict` refusing to return `Win`.
+| Plan | Service | Observed width | Expected | Overlap | Max open HTTP | Makespan (s) | Harness |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| n4 | concurrent | 4 | 4 | 0.996 | 4 | 0.347 | accepted |
+| n4 | serialized | 1 | 4 | – | 4 | 1.296 | `serialized or slot-capped service: observed co-progress width 1 < 4 with up to 4 overlapping HTTP requests` |
+| n4 | 2 slots | 2 | 4 | 1.0 | 4 | 0.658 | rejected: width 2 < 4 |
+| n4 | 3 slots | 3 | 4 | 0.981 | 4 | 0.441 | rejected: width 3 < 4 |
+| n4 | bursty, concurrent | 4 | 4 | 0.998 | 4 | 0.306 | accepted |
+| n4 | bursty, serialized | 1 | 4 | – | 4 | 1.127 | rejected: width 1 < 4 |
+| 1 | concurrent | 1 | 1 | – | 1 | 0.347 | accepted |
+| 3+1 | concurrent | 4 | 4 | 0.845 | 4 | 0.336 | accepted |
+| 3+1 | serialized | 1 | 4 | – | 4 | 1.284 | rejected: width 1 < 4 |
+| 3+1 | 3 slots | 3 | 4 | 1.0 | 4 | 0.430 | rejected: width 3 < 4 |
+| 2+2 | concurrent | 4 | 4 | 0.876 | 4 | 0.339 | accepted |
+| 2+2 | serialized | 1 | 4 | – | 4 | 1.312 | rejected: width 1 < 4 |
+| 2+2 | 2 slots | 2 | 4 | 1.0 | 4 | 0.642 | rejected: width 2 < 4 |
+| 1+3 | concurrent | 4 | 4 | 1.0 | 4 | 0.355 | accepted |
+| 1+3 | serialized | 1 | 4 | – | 4 | 1.317 | rejected: width 1 < 4 |
+| 1+3 | 3 slots | 3 | 4 | 0.798 | 4 | 0.473 | rejected: width 3 < 4 |
+
+In every row the coordinator alone reported `FourAgentProtocolCompleteAwaitingIndependentReview`. A serialized or capped arm is slower, so it hands a false win to whichever arm it is compared with. `CampaignControls` shows the Q3 driver halting `Invalid` on a serialized stock arm, and `compute_verdict` refusing to return `Win`.
+
+### Retained hf2q Gemma and peer Gemma runs (margin)
+
+All 16 completed retained runs in `gemma-stage2-ab-v1/g-*-T-*` (4) and `gemma-alloc-ab-v1/g-*` (12) were replayed through the full audit with the width gate on: 12 hf2q runs and 4 peer runs. Every one passed with width 4.
+
+- **Method.** These runs predate `progress_event_monotonic_ns`, so the real semantic timestamps were kept. Each non-semantic progress frame (hf2q: the single reasoning frame; peer: none) was placed at the recorded `first_reasoning_seconds`.
+- **hf2q Gemma.** Streams carry 3 semantic and 4 progress frames. The witness overlap was 0.9987–0.9989.
+- **Semantic timestamps alone.** Without any placed frame, which is a strict lower bound, width is still 4 with overlap 0.971–0.975. Recorded frames can only add to this.
+- **Peer Gemma.** Streams carry 7 or 11 semantic frames. Overlap was 0.990–0.993.
+
+Against the 0.5 threshold that is a margin of about 2×. The alternation rule, by contrast, left zero margin on the same evidence.
 
 ## Control matrix
 
@@ -78,7 +112,8 @@ Layer **wire** means the live client rejects the response during `exchange`; the
 
 | Acceptance item | Injected lie | Layer | Rejection reason |
 | --- | --- | --- | --- |
-| Deliberately serialized four-client service | one request at a time, four open HTTPs (live, n4 and 3+1) | audit, campaign | `serialized service: observed co-progress width 1 < 4` (or `< 3`) |
+| Deliberately serialized four-client service | one request at a time, four open HTTPs (live: n4, every mixed plan, and Gemma-shaped bursty streams; retimed: n4) | audit, campaign | `serialized or slot-capped service: observed co-progress width 1 < 4` |
+| Slot-capped service in a mixed population | at most 2 requests served for `2+2`, at most 3 for `3+1`/`1+3` (live); at most 2 or 3 for n4 (live and retimed) | audit | `… observed co-progress width 2 < 4` / `3 < 4` |
 | Role-only SSE | role frames only, then finish/usage/DONE | wire | `no semantic SSE progress` |
 | Missing semantic output | reasoning-only stream; empty final summary | wire | `no semantic SSE progress`; `final summary missing or extra tool continuation` |
 | Wrong tool arguments | `tests/ports.rs` at turn 0; target `everything` | wire | `tool arguments/workflow drift` |
@@ -103,7 +138,7 @@ Layer **wire** means the live client rejects the response during `exchange`; the
 | One-slot vs four-wide | four-agent run presented as `1`, and the reverse | audit | `agent set differs from the phase plan` |
 | Mixed population | `3+1` run presented as `n4`; release after the first cohort finished; trigger outside the first stream; release before the trigger | audit | `aggregate phase cohort`; `population never mixed`; `first-decode trigger outside the agent's first streamed request`; `cohort released before its trigger` |
 
-Positive controls: the honest service completes all seven turns on the hf2q and peer engines. Honest runs of every population pass the audit with the expected width (n4 4, `1` 1, `3+1` 3, `2+2` 2, `1+3` 3, peer n4 4). The rewritten `test_q3_campaign` and `test_quality_campaign` drivers run on audited fake-service runs.
+Positive controls: the honest service completes all seven turns on the hf2q and peer engines. Honest runs of every population pass the audit with the expected width: n4 4, `1` 1, `3+1`/`2+2`/`1+3` 4 (retimed and live), peer n4 4, and the bursty four-frame stream 4. The rewritten `test_q3_campaign` and `test_quality_campaign` drivers run on audited fake-service runs.
 
 ### Timer direction and units with known delays
 
@@ -118,7 +153,7 @@ The test asserts four properties:
 
 - **Lower bound.** Each streamed TTFT is at least the known delay before the first semantic frame: 0.15 + 4 × 0.01 = 0.19 s. A server cannot deliver earlier than it sends.
 - **Direction.** The slower service is slower on every turn.
-- **Units.** `semantic_ttft_seconds` equals `(semantic_event[0] - send) / 1e9` exactly, and send ≤ first progress ≤ first semantic ≤ terminal.
+- **Units.** The nanosecond clocks hold at least the known delay: `semantic_event[0] - send` ≥ 0.19 × 10⁹. This bound, together with the seconds bound, rules out a seconds/milliseconds mix-up without restating the TTFT formula. Ordering also holds: send ≤ first progress ≤ first semantic ≤ terminal.
 - **Through to Q3.** `q3_metrics.slot_metrics` reports the same seconds.
 
 A four-agent live run with every delay scaled by 0.25 has a shorter makespan than the unscaled run. The unscaled makespan is at least its known critical-path delay: 4 × 0.04 + 3 × (0.04 + 5 × 0.02) s. `q3_stats.paired_effect` gives the faster arm a negative log ratio, which means a ratio below 1, the "experiment faster" direction.
@@ -132,7 +167,10 @@ For this reason the audit does not treat a tool-call id shared across agents as 
 ## Not covered here
 
 - **A fully re-timed forgery.** If every clock in every receipt is rewritten consistently, client evidence alone cannot detect it. Q3 binds the Q5 receipt and frozen identities, and F2 certification requires the server phase trace and hash-bound raw cohorts (`q2_certify.py`).
-- **The real-hardware width threshold.** The width rule has not yet run on real hardware. Retained runs predate `progress_event_monotonic_ns`, so they cannot be re-audited for width. The first real Q3 warmups will exercise it. A genuine arm that falls below its expected width is measured evidence to review, not a reason to retune `MIN_INTERLEAVE` after the fact.
+- **The real-hardware width threshold.** The width rule has not yet run on real hardware with recorded progress events.
+  - Retained Gemma runs pass with about 2× margin (see above) when their reasoning frame is placed from `first_reasoning_seconds`. Retained Qwen, DeepSeek and peer runs have more frames per stream, but their reasoning timestamps were not recorded.
+  - Mixed plans now need a later-cohort streamed request that is co-active with every earlier-cohort agent at once. On hardware that depends on how the cohorts' streamed turns line up after the release.
+  - The first real Q3 warmups of each family and workload must be reviewed. A genuine arm that falls below its expected width is measured evidence to review, not a reason to retune `MIN_OVERLAP_FRACTION` after the fact.
 - **Independent QE.** Critical-path and failure-path review by Agentic-QE or an equivalent, and QE attestation of actual server traces, remain open. These tests are the deterministic fake-server and receipt negative controls named in the Q2 validation line.
 - **Native trace budget profiles.** These were already implemented before this slice and are only listed here:
   - legacy 256 MiB / 1,000,000 events;
@@ -144,7 +182,7 @@ For this reason the audit does not treat a tool-call id shared across agents as 
 
 ## Results and commands
 
-Pure-Python suite (Python 3.13, macOS): 541 tests, OK, about 45 s. That is 505 existing tests plus 36 in `test_q2_adversarial_controls.py` (about 9 s). The live concurrency and injected-delay classes passed on six consecutive repeats.
+Pure-Python suite (Python 3.13, macOS): 543 tests, OK, about 48 s. That is 505 existing tests plus 38 in `test_q2_adversarial_controls.py` (about 15 s). The live concurrency and injected-delay classes passed on eight consecutive repeats after the v2 co-progress rule.
 
 Dry audit of retained real runs (no false rejection). Ten retained four-agent client directories were audited without the width gate, because they predate `progress_event_monotonic_ns`. Their progress timestamps were synthesized at the replayed frame count, so width was not evaluated. The runs covered hf2q and peer arms of Qwen3.8, Gemma 4, DeepSeek-V4 and a quality-campaign instance: `c5-runs-v1` ×3, `peer-arms-v1` ×2, `ds4-joint-ab-v1/b2`, `q3-campaign-v1` ×2, `gemma-joint-ab-v1/g-3-P` and `quality-qwen38-peer-exp0b95/01`. Every other check passed on all ten: hashes, canonical wire, parser replay, lineage, response-id uniqueness, identity leakage, aggregate, cleanup, makespan arithmetic.
 

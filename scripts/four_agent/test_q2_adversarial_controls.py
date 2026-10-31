@@ -150,10 +150,10 @@ class AuditControls(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.count = 0
 
-    def run_dir(self, plan=None, engine="hf2q", serialized=False):
+    def run_dir(self, plan=None, engine="hf2q", slots=None):
         self.count += 1
         client = Path(self.tmp.name) / f"run{self.count}" / "client"
-        return client, fake.honest_run(client, 100.0, engine, plan, serialized=serialized)
+        return client, fake.honest_run(client, 100.0, engine, plan, slots=slots)
 
     def reason(self, client, summary, plan=None, engine="hf2q", receipt=PASSING_RECEIPT, width=True):
         report, reason = audit.check_run(receipt, client, summary, plan, engine, width)
@@ -161,7 +161,7 @@ class AuditControls(unittest.TestCase):
         return reason
 
     def test_positive_controls_every_population(self):
-        for plan, width in ((None, 4), ("1", 1), ("3+1", 3), ("2+2", 2), ("1+3", 3)):
+        for plan, width in ((None, 4), ("1", 1), ("3+1", 4), ("2+2", 4), ("1+3", 4)):
             with self.subTest(plan=plan):
                 client, summary = self.run_dir(plan)
                 report, reason = audit.check_run(PASSING_RECEIPT, client, summary, plan, "hf2q", True)
@@ -171,10 +171,13 @@ class AuditControls(unittest.TestCase):
         client, summary = self.run_dir(engine="peer")
         self.assertIsNone(audit.check_run(PASSING_RECEIPT, client, summary, None, "peer", True)[1])
 
-    def test_serialized_service_is_not_four_wide(self):
-        client, summary = self.run_dir(serialized=True)
-        self.assertEqual(summary["status"], audit.SUCCESS)  # the coordinator alone would have accepted it
-        self.assertRegex(self.reason(client, summary), r"serialized service: observed co-progress width 1 < 4")
+    def test_serialized_and_slot_capped_services_are_not_four_wide(self):
+        for slots in (1, 2, 3):
+            with self.subTest(slots=slots):
+                client, summary = self.run_dir(slots=slots)
+                self.assertEqual(summary["status"], audit.SUCCESS)  # the coordinator alone would have accepted it
+                self.assertRegex(self.reason(client, summary),
+                                 rf"slot-capped service: observed co-progress width {slots} < 4")
         # Task quality is not a concurrency claim: the quality campaign audits without the width gate.
         self.assertIsNone(audit.check_run(PASSING_RECEIPT, client, summary, None, "hf2q", False)[1])
 
@@ -305,41 +308,65 @@ class AuditControls(unittest.TestCase):
 
 class LiveConcurrency(unittest.TestCase):
     """Actual client processes against one fake service: concurrent versus one-request-at-a-time."""
-    TIMING = fake.Timing(first=0.01, gap=0.01, unary=0.01)
+    # Streams last 5 gaps (75 ms); a later cohort trails by about first + unary, so cohorts overlap.
+    TIMING = fake.Timing(first=0.002, gap=0.015, unary=0.002)
 
-    def live(self, serialized, plan=None, timing=None):
+    def live(self, serialized=False, plan=None, timing=None, slots=None, bursty=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         client = Path(tmp.name) / "client"
-        with fake.FakeService(timing or self.TIMING, serialized=serialized) as service:
+        with fake.FakeService(timing or self.TIMING, serialized=serialized, slots=slots, bursty=bursty) as service:
             summary = fake.run_live(service, client, plan)
-        self.assertEqual(summary["status"], audit.SUCCESS)  # the coordinator alone would accept both
+        self.assertEqual(summary["status"], audit.SUCCESS)  # the coordinator alone would accept every one
         self.assertTrue(all(c["verified"] and c["reaped"] for c in summary["client_cleanup"].values()))
         return client, summary
 
     def test_concurrent_four_wide_service_is_accepted(self):
-        client, summary = self.live(False)
+        client, summary = self.live()
         report = audit.audit_run(client, summary, None, "hf2q", True)
         self.assertEqual((report["progress"]["width"], report["http_overlap_max"]), (4, 4))
+        self.assertGreaterEqual(report["progress"]["witness"]["overlap_fraction"], 0.75)
 
     def test_serialized_four_client_service_is_rejected_despite_overlapping_http(self):
-        client, summary = self.live(True)
+        client, summary = self.live(serialized=True)
         turns = {a: v["turns"] for a, v in summary["agents"].items()}
         self.assertGreaterEqual(audit.http_overlap(turns), 3)  # requests were queued concurrently
-        with self.assertRaisesRegex(ValueError, r"serialized service: observed co-progress width 1 < 4"):
+        with self.assertRaisesRegex(ValueError, r"slot-capped service: observed co-progress width 1 < 4"):
             audit.audit_run(client, summary, None, "hf2q", True)
 
-    def test_mixed_population_counts_cohorts_not_labels(self):
-        client, summary = self.live(False, "3+1")
-        report = audit.audit_run(client, summary, "3+1", "hf2q", True)
-        self.assertGreaterEqual(report["progress"]["width"], 3)
-        self.assertEqual(len(report["cohort_release_ns"]), 2)
-        client, summary = self.live(True, "3+1")
-        with self.assertRaisesRegex(ValueError, r"width 1 < 3"):
-            audit.audit_run(client, summary, "3+1", "hf2q", True)
+    def test_bursty_low_frame_streams(self):
+        # hf2q Gemma shape: one reasoning frame, a pause, then three semantic frames back to back.
+        timing = fake.Timing(first=0.02, gap=0.06, unary=0.002)
+        client, summary = self.live(timing=timing, bursty=True)
+        self.assertEqual({len(t["progress_event_monotonic_ns"]) for a in summary["agents"].values()
+                          for t in a["turns"] if t["stream"]}, {4})
+        report = audit.audit_run(client, summary, None, "hf2q", True)
+        self.assertEqual(report["progress"]["width"], 4)
+        self.assertGreaterEqual(report["progress"]["witness"]["overlap_fraction"], 0.75)
+        client, summary = self.live(serialized=True, timing=timing, bursty=True)
+        with self.assertRaisesRegex(ValueError, r"width 1 < 4"):
+            audit.audit_run(client, summary, None, "hf2q", True)
+
+    def test_mixed_populations_need_all_four_agents_co_active(self):
+        for plan in ("3+1", "2+2", "1+3"):
+            with self.subTest(plan=plan):
+                client, summary = self.live(plan=plan)
+                report = audit.audit_run(client, summary, plan, "hf2q", True)
+                self.assertEqual((report["progress"]["width"], report["expected_width"]), (4, 4))
+                self.assertEqual(len(report["cohort_release_ns"]), 2)
+
+    def test_slot_capped_service_fails_mixed_populations(self):
+        # A cap at the largest cohort used to pass (width >= largest cohort); every mixed plan needs four.
+        for plan, slots in (("2+2", 2), ("3+1", 3), ("1+3", 3), ("3+1", 1)):
+            with self.subTest(plan=plan, slots=slots):
+                client, summary = self.live(plan=plan, slots=slots)
+                turns = {a: v["turns"] for a, v in summary["agents"].items()}
+                self.assertGreater(audit.http_overlap(turns), slots)  # more requests open than the cap serves
+                with self.assertRaisesRegex(ValueError, rf"observed co-progress width [1-{slots}] < 4"):
+                    audit.audit_run(client, summary, plan, "hf2q", True)
 
     def test_one_slot_control(self):
-        client, summary = self.live(False, "1")
+        client, summary = self.live(plan="1")
         report = audit.audit_run(client, summary, "1", "hf2q", True)
         self.assertEqual((report["progress"]["width"], report["expected_width"], report["http_overlap_max"]), (1, 1, 1))
 
@@ -370,8 +397,9 @@ class InjectedDelay(unittest.TestCase):
                 self.assertGreaterEqual(v3["semantic_ttft_seconds"], first_semantic)
                 self.assertLess(v3["semantic_ttft_seconds"], first_semantic + 0.5)
                 self.assertGreater(v3["semantic_ttft_seconds"], other["semantic_timing_v3"]["semantic_ttft_seconds"])
-                self.assertEqual(v3["semantic_ttft_seconds"],
-                                 (turn["semantic_event_monotonic_ns"][0] - turn["send_monotonic_ns"]) / 1e9)
+                # Units: the nanosecond clocks hold at least the known delay (a seconds or ms mix-up cannot).
+                self.assertGreaterEqual(turn["semantic_event_monotonic_ns"][0] - turn["send_monotonic_ns"],
+                                        first_semantic * 1e9)
                 self.assertTrue(turn["send_monotonic_ns"] <= turn["progress_event_monotonic_ns"][0]
                                 <= turn["semantic_event_monotonic_ns"][0] <= turn["validated_terminal_monotonic_ns"])
             else:
@@ -388,7 +416,7 @@ class CampaignControls(Harness):
         driver, _ = self.driver(decide)
         manifest = driver.run()
         self.assertEqual(manifest["status"], "Invalid")
-        self.assertIn("serialized service: observed co-progress width 1 < 4", manifest["halted"]["reason"])
+        self.assertIn("slot-capped service: observed co-progress width 1 < 4", manifest["halted"]["reason"])
         self.assertNotEqual(q3_report.compute_verdict(manifest)["verdict"], "Win")
 
     def forging(self, forge):
