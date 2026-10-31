@@ -4,9 +4,10 @@
 //! token each, every slot at its own position. Row-parallel work runs once
 //! over the packed rows: embedding gather, RMS norms, the DeltaNet and
 //! full-attention projections (per [`JointProductRoute`]), the fused
-//! residual norm, the dense FFN and the output head. Work that touches a
-//! slot's cache (DeltaNet conv + recurrence, KV write + SDPA) runs per row
-//! against that slot's cursor and ping-pong parity; see
+//! residual norm, the dense FFN (per [`JointDenseFfnRoute`]) and the output
+//! head. Work that touches a slot's cache (DeltaNet conv + recurrence, KV
+//! write + SDPA) runs per row against that slot's cursor and ping-pong
+//! parity; see
 //! [`super::super::joint_decode_core`]. MoE FFNs run per row through the
 //! serial helper: the router and shared expert are float projections whose
 //! packed route differs from `m = 1`, and routed experts are mostly distinct
@@ -35,7 +36,8 @@ use crate::inference::models::qwen35::decode_pool;
 use crate::inference::models::qwen35::dump_bisect;
 use crate::inference::models::qwen35::ffn::MoeFfnShape;
 use crate::inference::models::qwen35::gpu_ffn::{
-    build_dense_ffn_layer_gpu_q_into, build_moe_ffn_layer_gpu_q_into,
+    build_dense_ffn_layer_gpu_q_into_with_gate_up, build_moe_ffn_layer_gpu_q_into,
+    DenseGateUpDispatch,
 };
 use crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_into_with_ggml_type;
 use crate::inference::models::qwen35::joint_decode_core::{
@@ -43,9 +45,10 @@ use crate::inference::models::qwen35::joint_decode_core::{
     FullAttnRoutes, JointRows,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
-    check_mode_environment, dense_ffn_route, joint_decode_env_unavailable_reason,
-    joint_mode_max_rows, joint_padded_width, projection_route, select_joint_route_mode,
-    JointProductRoute, JointRouteMode, JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
+    check_dense_ffn_route, check_mode_environment, dense_ffn_route,
+    joint_decode_env_unavailable_reason, joint_mode_max_rows, joint_padded_width, projection_route,
+    select_joint_route_mode, JointDenseFfnRoute, JointProductRoute, JointRouteMode,
+    JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
 };
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::model::Qwen35Model;
@@ -196,13 +199,15 @@ impl Qwen35Model {
     /// Advance `rows.len()` distinct slots by one token each in one
     /// layer-major transaction. Under [`JointRouteMode::Exact`] every row's
     /// logits, hidden, KV codes, recurrent state, cursor and parity are
-    /// bitwise those of its serial one-token forward. Refusal (admission,
+    /// bitwise those of its serial one-token forward. `dense_ffn` must be
+    /// admitted for `mode` ([`check_dense_ffn_route`]). Refusal (admission,
     /// shape, slot range) happens before any cache write.
     pub(crate) fn forward_gpu_decode_joint(
         &self,
         rows: &[Qwen35JointRow],
         kv_cache: &mut HybridKvCache,
         mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
         let max_rows = joint_mode_max_rows(mode, MAX_JOINT_DECODE_ROWS);
         ensure!(
@@ -247,6 +252,8 @@ impl Qwen35Model {
         );
         check_mode_environment(mode, JointRoutingEnvironment::from_process())
             .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
+        check_dense_ffn_route(mode, dense_ffn)
+            .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
         self.ensure_gpu_cache_primed()?;
 
         let pool_operation = decode_pool::profile::Operation::enter(self as *const _ as usize)?;
@@ -279,6 +286,7 @@ impl Qwen35Model {
                 rows,
                 kv_cache,
                 mode,
+                dense_ffn,
             )
         });
         pool_operation.complete()?;
@@ -296,6 +304,7 @@ impl Qwen35Model {
         rows: &[Qwen35JointRow],
         kv_cache: &mut HybridKvCache,
         mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
         let cfg = &self.cfg;
         let hidden_size = cfg.hidden_size;
@@ -421,13 +430,17 @@ impl Qwen35Model {
             .with_context(|| format!("Qwen joint fused residual norm layer {layer_idx}"))?;
             enc.memory_barrier();
             let output = match ffn {
-                FfnWeightsGpu::DenseQ(weights) => build_dense_ffn_layer_gpu_q_into(
+                FfnWeightsGpu::DenseQ(weights) => build_dense_ffn_layer_gpu_q_into_with_gate_up(
                     enc,
                     device,
                     registry,
                     &ffn_input,
                     weights,
                     Some(&ffn_residual),
+                    match dense_ffn {
+                        JointDenseFfnRoute::SerialBuilder => DenseGateUpDispatch::PreferFused,
+                        JointDenseFfnRoute::SharedWeights => DenseGateUpDispatch::Separate,
+                    },
                 )
                 .with_context(|| format!("Qwen joint dense FFN layer {layer_idx}"))?,
                 FfnWeightsGpu::MoeQ(weights) => {
@@ -628,64 +641,15 @@ impl Qwen35Model {
 mod tests {
     use super::*;
     use crate::inference::models::qwen35::gpu_delta_net::apply_proj_with_ggml_type;
-    use crate::inference::models::qwen35::gpu_ffn::DenseFfnWeightsGpuQ;
-    use crate::inference::models::qwen35::gpu_full_attn::{download_f32, upload_f32};
+    use crate::inference::models::qwen35::gpu_ffn::{
+        build_dense_ffn_layer_gpu_q_into, DenseFfnWeightsGpuQ,
+    };
+    use crate::inference::models::qwen35::gpu_full_attn::upload_f32;
     use crate::inference::models::qwen35::joint_decode_core::project_rows;
+    use crate::inference::models::qwen35::joint_decode_test_support::{
+        bits, random_f32, synthetic_blocks,
+    };
     use mlx_native::ops::quantized_matmul_ggml::GgmlType;
-
-    const F16_SCALE: [u8; 2] = 0x211F_u16.to_le_bytes(); // ≈ 0.01
-
-    fn next(seed: &mut u32) -> u32 {
-        *seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-        *seed
-    }
-
-    fn random_f32(seed: &mut u32, n: usize) -> Vec<f32> {
-        (0..n)
-            .map(|_| (next(seed) as i32 as f32 / i32::MAX as f32) * 0.5)
-            .collect()
-    }
-
-    /// Valid GGML blocks with finite scales and random quants.
-    fn synthetic_blocks(
-        device: &MlxDevice,
-        ggml_type: GgmlType,
-        rows: u32,
-        cols: u32,
-        seed: &mut u32,
-    ) -> MlxBuffer {
-        let block_bytes = ggml_type.block_bytes() as usize;
-        let blocks = (rows * cols / ggml_type.block_values()) as usize;
-        let mut bytes = (0..blocks * block_bytes)
-            .map(|_| (next(seed) >> 24) as u8)
-            .collect::<Vec<_>>();
-        let scale_offsets: &[usize] = match ggml_type {
-            GgmlType::Q4_0 | GgmlType::Q8_0 => &[0],
-            GgmlType::Q4_K | GgmlType::Q5_K => &[0, 2],
-            GgmlType::Q6_K => &[208],
-            other => panic!("no synthetic layout for {other:?}"),
-        };
-        for block in bytes.chunks_exact_mut(block_bytes) {
-            for &offset in scale_offsets {
-                block[offset..offset + 2].copy_from_slice(&F16_SCALE);
-            }
-        }
-        let mut buffer = device
-            .alloc_buffer(bytes.len(), DType::U8, vec![bytes.len()])
-            .expect("allocate synthetic GGML blocks");
-        buffer
-            .as_mut_slice::<u8>()
-            .expect("map synthetic GGML blocks")
-            .copy_from_slice(&bytes);
-        buffer
-    }
-
-    fn bits(buffer: &MlxBuffer, count: usize) -> Vec<u32> {
-        download_f32(buffer).expect("download")[..count]
-            .iter()
-            .map(|value| value.to_bits())
-            .collect()
-    }
 
     /// Admitted block storage: one packed dispatch at `m = 2..=4` must equal
     /// the serial `m = 1` dispatch of every row, bit for bit, on the default

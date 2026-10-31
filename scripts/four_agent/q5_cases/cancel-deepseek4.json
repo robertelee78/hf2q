@@ -1,0 +1,118 @@
+{
+  "schema": "hf2q.q5.calibration-case.v1",
+  "family": "deepseek4",
+  "notes": [
+    "ADR-063 S3 S-C1/S-C2 cancel smoke for deepseek4: the server launch, readiness and memory supervision of q5_cases/deepseek4.json; the client is cancel_smoke.py instead of the four-agent coding protocol.",
+    "Override any variable with HF2Q_Q5_<NAME>; null variables are required. See scripts/four_agent/README.md \"S3 cancel smoke\".",
+    "The client replays the four recorded agent-N/turn-{TURN}/request.json of RECORDED_CLIENT as concurrent streams, closes agent CANCEL_AGENT's stream after CANCEL_AFTER_EVENTS semantic events while the other three are still decoding, then replays the four requests again without a cancel (control). Its receipt is {OUT}/client/summary.json; success is CancelSmokePass.",
+    "RECORDED_CLIENT for the current artifact: $E/q5-deepseek4-final-20261030T051035Z/client (CalibrationPass; turn-2 completions 428/245/323/383 tokens). Its requests must name MODEL_ID.",
+    "LOG_FILTER replaces the launcher's -v (under which hf2q ignores RUST_LOG) with RUST_LOG=LOG_FILTER, adding the per-turn joint decode debug lines that the client histograms from {OUT}/server.stderr (S-C2).",
+    "No client approval: the client runs no tools, cargo or sandbox; it only talks to the supervised loopback server and reads its log."
+  ],
+  "workload": {
+    "id": "adr063-s3-cancel-smoke-deepseek4-n4-ctx262144",
+    "slots": 4,
+    "context_per_slot": 262144,
+    "client": "scripts/four_agent/cancel_smoke.py run --family deepseek4"
+  },
+  "variables": {
+    "HF2Q_BIN": "{REPO}/target/release/hf2q",
+    "MODEL": "{REPO}/models/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf",
+    "MODEL_SHA256": "",
+    "MODEL_ID": "DeepSeek V4 Flash 0731",
+    "PORT": "18240",
+    "RECORDED_CLIENT": null,
+    "TURN": "2",
+    "CANCEL_AGENT": "0",
+    "CANCEL_AFTER_EVENTS": "16",
+    "LOG_FILTER": "hf2q=info,mlx_native=info,hf2q::serve::api::engine_deepseek4::progress=debug"
+  },
+  "binary": "{HF2Q_BIN}",
+  "artifact": {
+    "path": "{MODEL}",
+    "sha256": "{MODEL_SHA256}"
+  },
+  "port": "{PORT}",
+  "serve": {
+    "argv": [
+      "/bin/bash",
+      "{REPO}/scripts/serve_deepseek4_opencode.sh",
+      "--ctx",
+      "262144"
+    ],
+    "env": {
+      "MODEL": "{MODEL}",
+      "KV_CACHE_BUDGET_BYTES": "8589934592",
+      "REP_PENALTY": "1.0",
+      "REQUIRED_TOOL_THINKING_TOKEN_BUDGET": "512",
+      "MAX_SLOTS": "4",
+      "HOST": "127.0.0.1",
+      "PORT": "{PORT}",
+      "HF2Q_BIN": "{HF2Q_BIN}",
+      "MAX_COMPRESSOR_USED_GIB": "16",
+      "LOG_FILTER": "{LOG_FILTER}"
+    }
+  },
+  "readiness": {
+    "url": "http://127.0.0.1:{PORT}/readyz",
+    "field": "ready",
+    "equals": true,
+    "timeout_seconds": 900,
+    "record": [
+      "http://127.0.0.1:{PORT}/health",
+      "http://127.0.0.1:{PORT}/hf2q/v1/runtime"
+    ],
+    "checks": [
+      {
+        "url": "http://127.0.0.1:{PORT}/health",
+        "field": "model",
+        "equals": "{MODEL_ID}"
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/health",
+        "field": "context_length",
+        "equals": 262144
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "serve.max_slots",
+        "equals": 4
+      }
+    ]
+  },
+  "client": {
+    "argv": [
+      "{PYTHON}",
+      "-E",
+      "-s",
+      "-B",
+      "{REPO}/scripts/four_agent/cancel_smoke.py",
+      "run",
+      "--base-url",
+      "http://127.0.0.1:{PORT}/v1",
+      "--model",
+      "{MODEL_ID}",
+      "--family",
+      "deepseek4",
+      "--requests",
+      "{RECORDED_CLIENT}",
+      "--turn",
+      "{TURN}",
+      "--cancel-agent",
+      "{CANCEL_AGENT}",
+      "--cancel-after-events",
+      "{CANCEL_AFTER_EVENTS}",
+      "--server-log",
+      "{OUT}/server.stderr",
+      "--server-pid",
+      "{SERVER_PID}",
+      "--output",
+      "{OUT}/client"
+    ],
+    "env": {},
+    "summary": "{OUT}/client/summary.json",
+    "success_status": "CancelSmokePass",
+    "timeout_seconds": 3600
+  },
+  "policy": {}
+}

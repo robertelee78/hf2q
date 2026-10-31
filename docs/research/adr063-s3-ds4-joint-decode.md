@@ -2,6 +2,11 @@
 
 Status: **default on** since 2026-10-30. `HF2Q_DEEPSEEK_JOINT_DECODE=0` restores the serial path. Exactness and the four-agent A/B passed on hardware; see "Measured result".
 
+Closure evidence (2026-10-31):
+- **Task quality against stock: Pass,** 20/24 vs 20/24 with `ExactTranscripts` (`E/quality-ds4-joint-vs-stock-20261030T230921Z`). The reference is the same binary with `HF2Q_DEEPSEEK_JOINT_DECODE=0`.
+- **Cancel under joint decode: CancelSmokePass** (`E/s3-cancel-v1/deepseek4-20261031T060207Z`). Closing one stream mid-decode left the other three agents finishing with CalibrationPass. All 60 scheduler turns ran joint (width 2: 56, width 3: 3, width 4: 1; no serial lanes).
+- **The peer is unavailable** for the four-agent DeepSeek-V4 comparison. It hits a Metal out-of-memory at 4×262144 f16 KV in both load modes tried (`E/peer-arms-v1/peer-deepseek4-*`).
+
 ## Problem
 
 With four concurrent agents, each DeepSeek-V4 Flash request decodes at about 8.4 tok/s. The aggregate (~34 tok/s) equals single-stream speed.
@@ -283,7 +288,7 @@ Not yet measured:
 - widths 5–8 in serving;
 - long-context peak memory.
 
-The exact multi-row Q8_0 kernel in mlx-native (`perf/q8-0-mv-multirow-exact`) measured 1.15–1.46× over per-row nr2 at M=4 in isolation. It reaches hf2q only after an mlx-native release.
+The exact multi-row Q8_0 kernel in mlx-native (`perf/q8-0-mv-multirow-exact`) measured 1.15–1.46× over per-row nr2 at M=4 in isolation [unverified]. End to end it measured +1.2% (95% CI −1.8% to +4.4%), so it was not published (`docs/research/adr063-k1-q8-multirow-disposition.md`).
 
 ## Changed files
 

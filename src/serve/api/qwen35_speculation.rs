@@ -100,6 +100,44 @@ pub fn classify_request(
     }
 }
 
+/// SlotAware admission decision: [`classify_request`] plus the bound-graft
+/// fallback (ADR-059). The MTP cache is a separate slot arena that never
+/// receives the graft, so its drafts and any retained speculative boundary
+/// describe the ungrafted context. Speculation is an optimization, never a
+/// semantic path: an otherwise eligible grafted request is served by ordinary
+/// grafted decode and reported as `RuntimeUnavailable`.
+pub fn classify_slot_request(
+    policy: QwenSpeculationPolicy,
+    exact_semantics: bool,
+    prompt_cache_hit: bool,
+    graft_bound: bool,
+) -> QwenSpeculationDecision {
+    match classify_request(policy, exact_semantics, prompt_cache_hit) {
+        QwenSpeculationDecision::Eligible if graft_bound => {
+            QwenSpeculationDecision::RuntimeUnavailable
+        }
+        decision => decision,
+    }
+}
+
+/// Whether a bounded SlotAware prefill chunk also runs the MTP prompt
+/// catch-up that seeds K3 drafting. It needs `auto`, exact request semantics,
+/// a text-only chunk, MTP weights with an MTP cache arena, and no bound KV
+/// graft (same reason as [`classify_slot_request`]).
+pub fn prefill_mtp_catchup_allowed(
+    policy: QwenSpeculationPolicy,
+    exact_semantics: bool,
+    text_only: bool,
+    mtp_runtime: bool,
+    graft_bound: bool,
+) -> bool {
+    policy == QwenSpeculationPolicy::Auto
+        && exact_semantics
+        && text_only
+        && mtp_runtime
+        && !graft_bound
+}
+
 /// One-worker controller. It holds no KV tensors and only carries the
 /// current conversation identity plus the previous speculative result.
 #[derive(Debug, Clone)]
@@ -413,6 +451,53 @@ mod tests {
             controller.decide(&[7, 8, 9], true, true, false),
             QwenSpeculationDecision::Eligible
         );
+    }
+
+    /// ADR-063 D1 graft-restore fallback: a bound graft never reaches MTP,
+    /// whether the request would start cold or resume a retained speculative
+    /// boundary, while every non-eligible reason keeps its own label.
+    #[test]
+    fn bound_graft_keeps_eligible_requests_off_mtp_at_admission_and_prefill() {
+        let auto = QwenSpeculationPolicy::Auto;
+        assert_eq!(
+            classify_slot_request(auto, true, false, false),
+            QwenSpeculationDecision::Eligible
+        );
+        assert_eq!(
+            classify_slot_request(auto, true, false, true),
+            QwenSpeculationDecision::RuntimeUnavailable,
+            "a warm grafted slot with reusable speculative metadata must not resume MTP"
+        );
+        for graft_bound in [false, true] {
+            assert_eq!(
+                classify_slot_request(QwenSpeculationPolicy::Off, true, false, graft_bound),
+                QwenSpeculationDecision::Disabled
+            );
+            assert_eq!(
+                classify_slot_request(auto, false, false, graft_bound),
+                QwenSpeculationDecision::UnsupportedSemantics
+            );
+            assert_eq!(
+                classify_slot_request(auto, true, true, graft_bound),
+                QwenSpeculationDecision::PromptCacheHit
+            );
+        }
+
+        assert!(prefill_mtp_catchup_allowed(auto, true, true, true, false));
+        assert!(
+            !prefill_mtp_catchup_allowed(auto, true, true, true, true),
+            "a grafted prefill must not seed the ungrafted MTP arena"
+        );
+        assert!(!prefill_mtp_catchup_allowed(
+            QwenSpeculationPolicy::Off,
+            true,
+            true,
+            true,
+            false
+        ));
+        assert!(!prefill_mtp_catchup_allowed(auto, false, true, true, false));
+        assert!(!prefill_mtp_catchup_allowed(auto, true, false, true, false));
+        assert!(!prefill_mtp_catchup_allowed(auto, true, true, false, false));
     }
 
     #[test]

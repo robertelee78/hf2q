@@ -52,6 +52,29 @@ cargo run -- doctor
 the per-module `mod tests` blocks. A few tests need GGUF fixtures
 that download on first run.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and every push to
+`main`. Its jobs run in parallel on separate runners:
+
+| Job (check name) | Blocking | What it runs |
+|---|---|---|
+| `release (macos-latest)` | yes | mlx-native environment guard, `cargo package --list` contract, `cargo build --release --locked`, the frictionless exact-binary preflight, `cargo audit` (prebuilt cargo-audit 0.22.2), and the `activate()` warning-matrix smoke against `target/release/hf2q` |
+| `tests (macos-latest)` | yes | The hosted-safe debug `cargo test` list (library, selected integration tests, `--bin hf2q` contracts, installer and signing scripts that need `target/debug/hf2q`) and the GCD cargo contracts |
+| `check + script contracts (macos-latest)` | yes | `cargo check --locked --all-targets --all-features` (the only build of the integration tests the hosted-safe list skips), `bash -n` syntax checks, the offline `scripts/test_*_contract.sh` suites, and the GCD Python suites |
+| `lint (macos-latest, informational)` | no | `cargo fmt --check` and `cargo clippy`; continue-on-error, never awaited |
+| `build + test (macos-latest)` | yes | Aggregate; fails unless the three blocking macOS jobs succeeded. It keeps the pre-split check name, so require this check in branch protection |
+| `peer reference ratchet` | yes | `scripts/peer_ref_ratchet.sh` |
+
+Put a new step in the job that already builds what it needs: release
+binary → `release`; debug test harness or `target/debug/hf2q` → `tests`;
+no Rust build → `check + script contracts`.
+
+Each Rust job caches the cargo registry and its own dependency artifacts
+with `Swatinem/rust-cache`, keyed per job and on the pinned 1.89.0
+toolchain. The hf2q crate itself is never cached. Only pushes to `main`
+save the cache; pull requests restore `main`'s entry read-only.
+
 ## Adding a new model architecture
 
 This is the most common request. Follow the checklist in

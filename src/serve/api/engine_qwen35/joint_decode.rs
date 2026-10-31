@@ -20,7 +20,7 @@
 use anyhow::{Context, Result};
 use std::time::Instant;
 
-use crate::inference::models::qwen35::joint_decode_routes::JointRouteMode;
+use crate::inference::models::qwen35::joint_decode_routes::{JointDenseFfnRoute, JointRouteMode};
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
 use crate::serve::api::engine_supervisor::EngineSupervisor;
@@ -172,16 +172,20 @@ impl Qwen35LoadedModel {
         rows: &[Qwen35JointRow],
         kv_cache: &mut HybridKvCache,
         mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
         supervisor: &EngineSupervisor,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
         let lease = supervisor.arm("Qwen35 joint decode", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
-        let forward = self.model.forward_gpu_decode_joint(rows, kv_cache, mode);
+        let forward = self
+            .model
+            .forward_gpu_decode_joint(rows, kv_cache, mode, dense_ffn);
         lease.finish()?;
         let outputs = forward.with_context(|| {
             format!(
-                "Qwen35Model::forward_gpu_decode_joint ({} rows, {} mode)",
+                "Qwen35Model::forward_gpu_decode_joint ({} rows, {} mode, {} dense FFN)",
                 rows.len(),
-                mode.label()
+                mode.label(),
+                dense_ffn.label()
             )
         })?;
         anyhow::ensure!(
