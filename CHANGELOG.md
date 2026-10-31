@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Keep the Qwen tool-continuation thinking ceiling (default 512) at every tool-chain depth. Halving it to a 256-token floor from the second tool result forced the reasoning close inside the first edit plan of an ordinary read/read/write coding workflow.
 - Preserve Qwen tool-call parameter whitespace in unary and streaming responses. Only the single newline the native template wraps around each `<parameter>` value is removed; a file's trailing newline and leading indentation now reach the client intact.
+- Tool-call ids are now unique per process. They were derived from wall-clock nanoseconds, or from a counter that restarted at 1 for DeepSeek-V4, and collided between concurrent agents (18 of 547 retained four-agent runs). Ids keep the `call_hf2q_<16 hex>` format and come from one shared counter offset by a random per-process salt, so ids from a restarted server do not repeat ids already in a client's history.
 
 ## [0.1.28] — 2026-10-29
 

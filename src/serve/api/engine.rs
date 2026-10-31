@@ -28434,14 +28434,7 @@ impl ToolCallStreamEmitter {
         tc_index: usize,
         wire_kinds: Option<Arc<super::registry::ToolArgumentWireKinds>>,
     ) -> Self {
-        let id = format!(
-            "call_hf2q_{:016x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-                ^ (tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
-        );
+        let id = super::tool_call_id::next_tool_call_id();
         Self {
             family,
             wire_kinds,
@@ -29005,14 +28998,7 @@ pub(super) fn emit_streaming_tool_call_close(
             // First chunk: id + type + name. The id is a synthesized opaque
             // identifier; clients echo it in their `tool_call_id` follow-up
             // message. Format mirrors OpenAI's `call_<24hex>` shape.
-            let id = format!(
-                "call_hf2q_{:016x}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0)
-                    ^ (*tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
-            );
+            let id = super::tool_call_id::next_tool_call_id();
             if events
                 .blocking_send(GenerationEvent::ToolCallDelta {
                     index: *tc_index,
