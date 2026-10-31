@@ -314,7 +314,7 @@ estimator (§5: each adjacent auto/off pair is a block, df = 7):**
 | Own-output four-task makespan | 1.020 | 1.0095–1.0308 | 1.027, 1.040, 1.005, 1.008, 1.016, 1.008, 1.025, 1.032 |
 | Client elapsed | 1.020 | 1.0093–1.0306 | 1.029, 1.039, 1.006, 1.007, 1.017, 1.008, 1.024, 1.031 |
 
-Medians: own-output makespan 84.94 s (auto) vs 83.42 s (off).
+Medians: own-output makespan 84.93 s (auto) vs 83.39 s (off).
 
 - Validity (rule 1): all 16 runs `CalibrationPass`; the 8 `off` runs give
   `ExactTranscripts`. From turn 4 on, tool outputs carry run paths and cargo
