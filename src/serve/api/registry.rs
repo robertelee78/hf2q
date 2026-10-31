@@ -825,15 +825,15 @@ impl ReasoningSplitter {
 /// Gemma 4 reasoning channel name (`<|channel>thought\n…<channel|>`).
 const GEMMA4_CHANNEL_LABEL: &str = "thought";
 
-/// Strip a leading Gemma 4 channel label (plus the whitespace after it)
-/// from echoed `reasoning_content`, using the same whole-word rule as
-/// [`ReasoningSplitter`]. Older hf2q builds returned the label inside
-/// `reasoning_content`, so clients echo `"thought\n…"` back in history;
-/// the template re-adds the label itself.
+/// Strip the Gemma 4 channel label that older hf2q builds left at the start
+/// of `reasoning_content` (`"thought\n…"`, or the bare label for an empty
+/// thought block). Only that exact shape is stripped: the splitter already
+/// removes the label from new responses, so reasoning that merely begins
+/// with the word "thought" must reach the template unchanged.
 pub(crate) fn strip_gemma4_channel_label(reasoning: &str) -> &str {
     match reasoning.strip_prefix(GEMMA4_CHANNEL_LABEL) {
-        Some(rest) if rest.is_empty() || rest.starts_with('<') => rest,
-        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
+        Some(rest) if rest.is_empty() => rest,
+        Some(rest) if rest.starts_with('\n') => rest.trim_start(),
         _ => reasoning,
     }
 }
@@ -5071,6 +5071,22 @@ mod tests {
             split_full_output(&GEMMA4, "pre<|channel>thoughtful idea<channel|>post"),
             ("prepost".to_string(), Some("thoughtful idea".to_string()))
         );
+    }
+
+    #[test]
+    fn echoed_gemma4_reasoning_strips_only_the_old_label_shape() {
+        // Old builds echoed the label itself.
+        assert_eq!(strip_gemma4_channel_label("thought\n"), "");
+        assert_eq!(strip_gemma4_channel_label("thought"), "");
+        assert_eq!(strip_gemma4_channel_label("thought\nstep one"), "step one");
+        // New builds already stripped the label: real reasoning that starts
+        // with the word must not lose it a second time on echo.
+        let (_, reasoning) =
+            split_full_output(&GEMMA4, "<|channel>thought\nthought about it<channel|>x");
+        let reasoning = reasoning.unwrap();
+        assert_eq!(reasoning, "thought about it");
+        assert_eq!(strip_gemma4_channel_label(&reasoning), "thought about it");
+        assert_eq!(strip_gemma4_channel_label("thoughtful"), "thoughtful");
     }
 
     #[test]
