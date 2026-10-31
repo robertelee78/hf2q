@@ -13,8 +13,9 @@
 use std::sync::Once;
 
 use crate::inference::models::qwen35::joint_decode_routes::{
-    check_mode_environment, joint_decode_env_unavailable_reason, joint_mode_max_rows,
-    JointRouteMode, JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
+    check_mode_environment, joint_decode_env_unavailable_reason, joint_ffn_shared_from_process,
+    joint_mode_max_rows, select_dense_ffn_route, JointDenseFfnRoute, JointRouteMode,
+    JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::serve::api::engine_qwen35::{Qwen35JointLane, Qwen35TickOutcome};
@@ -57,6 +58,9 @@ const DEFAULT_QWEN_JOINT_DECODE_ROWS: usize = 4;
 pub(super) struct Qwen35JointDecodeConfig {
     pub max_rows: usize,
     pub mode: JointRouteMode,
+    /// Dense FFN gate/up route; `HF2Q_QWEN_JOINT_FFN_SHARED=0` keeps the
+    /// serial builder in the padded mode (exact mode always keeps it).
+    pub dense_ffn: JointDenseFfnRoute,
 }
 
 /// `Ok(None)` when unset, so the caller applies the per-family default.
@@ -91,11 +95,13 @@ fn select_qwen_joint_decode(
     requested: bool,
     max_rows: usize,
     mode: Result<JointRouteMode, String>,
+    ffn_shared: bool,
 ) -> Option<Qwen35JointDecodeConfig> {
     match (requested, mode) {
         (true, Ok(mode)) => Some(Qwen35JointDecodeConfig {
             max_rows: joint_mode_max_rows(mode, max_rows),
             mode,
+            dense_ffn: select_dense_ffn_route(mode, ffn_shared),
         }),
         _ => None,
     }
@@ -131,7 +137,15 @@ pub(super) fn qwen35_joint_decode_config(model: &Qwen35Model) -> Option<Qwen35Jo
         (false, Some(_)) => Err("disabled by HF2Q_QWEN_JOINT_DECODE".into()),
     };
     let unavailable = mode.as_ref().err().cloned();
-    let selected = select_qwen_joint_decode(requested, max_rows, mode);
+    let ffn_shared = joint_ffn_shared_from_process().unwrap_or_else(|error| {
+        tracing::warn!(
+            error,
+            fallback = true,
+            "invalid Qwen joint dense FFN switch"
+        );
+        true
+    });
+    let selected = select_qwen_joint_decode(requested, max_rows, mode, ffn_shared);
     tracing::info!(
         target: "hf2q::serve::api::engine_qwen35::progress",
         requested,
@@ -140,6 +154,7 @@ pub(super) fn qwen35_joint_decode_config(model: &Qwen35Model) -> Option<Qwen35Jo
         max_rows = selected.map_or(max_rows, |config| config.max_rows),
         selected = selected.is_some(),
         mode = selected.map_or("serial", |config| config.mode.label()),
+        dense_ffn = selected.map_or("serial", |config| config.dense_ffn.label()),
         unavailable = unavailable.as_deref().unwrap_or("none"),
         "Qwen joint decode configuration"
     );
@@ -308,6 +323,7 @@ pub(super) fn run_qwen35_joint_decode(
             target: "hf2q::serve::api::engine_qwen35::progress",
             lanes = lanes.len(),
             mode = config.mode.label(),
+            dense_ffn = config.dense_ffn.label(),
             "Qwen joint decode engaged"
         );
     });
@@ -348,6 +364,7 @@ pub(super) fn run_qwen35_joint_decode(
             &rows,
             guard.kv.as_mut().expect("kv Some during loop"),
             config.mode,
+            config.dense_ffn,
             supervisor,
         );
         match forward {
@@ -462,22 +479,24 @@ mod tests {
     #[test]
     fn refused_artifacts_and_disabled_switch_keep_serial_decode() {
         assert_eq!(
-            select_qwen_joint_decode(true, 4, Ok(JointRouteMode::Exact)),
+            select_qwen_joint_decode(true, 4, Ok(JointRouteMode::Exact), true),
             Some(Qwen35JointDecodeConfig {
                 max_rows: 4,
-                mode: JointRouteMode::Exact
+                mode: JointRouteMode::Exact,
+                dense_ffn: JointDenseFfnRoute::SerialBuilder,
             })
         );
         assert_eq!(
             select_qwen_joint_decode(
                 true,
                 4,
-                Err("layer 3: attn_qkv is IQ4_NL, which has no proven joint decode route".into())
+                Err("layer 3: attn_qkv is IQ4_NL, which has no proven joint decode route".into()),
+                true
             ),
             None
         );
         assert_eq!(
-            select_qwen_joint_decode(false, 4, Ok(JointRouteMode::PaddedMvExt)),
+            select_qwen_joint_decode(false, 4, Ok(JointRouteMode::PaddedMvExt), true),
             None
         );
     }
@@ -485,10 +504,11 @@ mod tests {
     #[test]
     fn padded_mode_caps_joint_width_at_four() {
         for requested in 2..=MAX_JOINT_DECODE_ROWS {
-            let padded = select_qwen_joint_decode(true, requested, Ok(JointRouteMode::PaddedMvExt))
-                .expect("admitted padded mode");
+            let padded =
+                select_qwen_joint_decode(true, requested, Ok(JointRouteMode::PaddedMvExt), true)
+                    .expect("admitted padded mode");
             assert_eq!(padded.max_rows, requested.min(4));
-            let exact = select_qwen_joint_decode(true, requested, Ok(JointRouteMode::Exact))
+            let exact = select_qwen_joint_decode(true, requested, Ok(JointRouteMode::Exact), true)
                 .expect("admitted exact mode");
             assert_eq!(exact.max_rows, requested);
         }
