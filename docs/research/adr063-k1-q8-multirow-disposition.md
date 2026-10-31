@@ -26,7 +26,7 @@ Status: measured 2026-10-30/31 on an M5 Max with 128 GB.
 | J (joint decode) | 7 | 106.0 s |
 | K (joint + multi-row Q8_0) | 7 | 104.3 s |
 
-The geometric-mean effect is +1.2% faster, 95% CI −1.8% to +4.4% (Welch on log values, p = 0.40). The independent reviewer recomputed it: +1.25% on F2 makespan, +1.15% on tokens/s, robust to session adjustment and to bootstrap. The test resolves effects of about 4% or more. All 14 runs produced the same two final-source hashes.
+The geometric-mean effect is +1.2% faster, 95% CI −1.8% to +4.4% (Welch on log values, p = 0.40). The independent reviewer recomputed it: +1.25% on client elapsed time, +1.31% on the F2 own-output makespan and +1.15% on tokens/s, robust to session adjustment and to bootstrap. The test resolves effects of about 4% or more. All 14 runs produced the same two final-source hashes.
 
 **Disposition.** There is no detectable end-to-end improvement, so the kernel is **not published or pinned**, and the branch stays unmerged as evidence. [INFERENCE] Q8_0 matvec is a small share of the DeepSeek-V4 joint step; no stage attribution was kept.
 
@@ -46,12 +46,14 @@ The live joint width is 4: padded `mul_mv_ext` mode is fixed at 4, so widths 5�
 - Per-request decode median 12.19 → 13.21 tok/s.
 - The bandwidth model projected up to 2.2× faster joint steps. That did not hold.
 
-The paired task-quality campaign against stock runs on the final main binary and is recorded under S3/Q3.
+**Why `mul_mv_ext` at width 4.** The October 28 primitive packet (`E/native-k1-existing-routes-actual-v1`, reviewed in `/tmp/adr063-k1-existing-route-independent-actual-v1.md`) compared the existing routes for Q4_K. Against the default route, `mul_mv_ext` ran −13.6% GPU median at M4 and −24.4% at M8, but +22% slower at M2. That is why padded mode packs to width 4.
+
+The paired task-quality campaign against stock, and the makespan comparison against stock with #480 included, run on the final main binary and are recorded under S3/Q3.
 
 ## 3. Other families
 
-- **Qwen3.6 (MoE):** joint decode is off by default. MoE expert products run per slot, and the dense projections follow the Qwen3.8 routes when joint decode is enabled. Whether to promote it is decided under S3/D1, not K1.
-- **Gemma 4:** decode already uses the batched body at four slots (pre-existing). K1 found no per-row K-quant decode product to change. Its remaining four-agent gap is prefill, handled under S3.
+- **Qwen3.6 (MoE):** joint decode is off by default. When enabled it runs in exact mode only, because `select_joint_route_mode` refuses MoE artifacts under `HF2Q_DECODE_MV_EXT=1` (`joint_decode_routes.rs:92-104`). It therefore uses the mvN, `Mv` or canonical Q5_K routes, never padded `mul_mv_ext`. The shared-weight FFN is never selected in exact mode, and the MoE FFN runs per row (`joint_decode.rs:448-470`). K1 keeps the existing exact routes; promotion is decided under S3/D1.
+- **Gemma 4:** K1 did not audit Gemma decode. [INFERENCE from code] The default-on batched body sends quantized dense projections through `dispatch_qmatmul` at m = N (`batched_body.rs:469-475`). MoE gate/up and down are forced onto per-token `mv_id` to keep the batched body bitwise equal to serial decode (`batched_body.rs:2005-2070`). Sharing those weights across rows would break that contract and is out of K1's scope. Gemma's remaining four-agent gap is prefill, handled under S3.
 
 ## Evidence
 
