@@ -1,8 +1,8 @@
 # ADR-063 D1: qualifying Qwen warm-turn speculation at four slots
 
-Status: source qualification and test gates written, 2026-10-30. The root has
-not built or run anything yet. No speed or quality result is claimed; the A/B
-plan in §5 decides the four-slot policy.
+Status (2026-10-31): measured. **Qwen3.8: Inconclusive; Qwen3.6: Inconclusive.**
+Under the §5 rule the shipped default (`auto`) stays for both families. No
+default changes. Results and receipts are in §7.
 
 Scope (ADR-063 D1, issue #364): prove the existing MTP/history speculation at
 four slots, disable measured losers, and keep the graft fallback. No new
@@ -285,3 +285,47 @@ and needs its own exactness gates.
 - The root runs §2's gates green; the real-artifact gate reports its near-tie notes.
 - The §5 A/B for both families, with receipts under `$E/d1-speculation-ab-v1`, a verdict per §5's rule and any resulting default change.
 - Independent review of the tests, the A/B receipts and the verdict.
+
+## 7. Result (2026-10-31, M5 Max 128 GB)
+
+**Gates.** The model-free and device gates of §2 run in CI (PR #488). The
+real-artifact gate `qwen38_slot_aware_speculation_auto_matches_off` passed on
+the D1 binary bc120cab (`$E/d1-speculation-ab-v1/real-artifact.log`, 74.95 s).
+
+**Qwen3.8, first pass** (ABBA × 2, D1 binary bc120cab,
+`$E/d1-speculation-ab-v1/analysis.json`): makespan r = 1.042 (95% CI
+0.985–1.104), so r ≥ 1.025 and the interval straddles 1.0 → extend (rule 4).
+Per-request decode throughput auto/off was 0.984 (CI 0.968–0.9996; higher is
+better, so `auto` decoded about 1.6% slower).
+
+**Qwen3.8, extension.** Rule 4 asks for two more ABBA blocks. Instead of
+pooling across binaries, a fresh 8 + 8 (ABBA × 4) ran on the frozen Q3
+experiment binary 38485a23 (`$E/d1-speculation-ext-v2`, `run.sh`,
+`analysis.json`). The arm each run actually served was confirmed from its receipt
+(`QWEN38_SPECULATION`).
+
+| Metric (lower is better) | auto median | off median | r = auto/off | 95% CI | Per block |
+|---|---:|---:|---:|---|---|
+| Client elapsed (s) | 85.23 | 83.83 | 1.020 | 0.9995–1.041 | 1.034, 1.006, 1.012, 1.027 |
+| Own-output four-task makespan (s) | 84.94 | 83.42 | 1.020 | 0.9997–1.041 | 1.034, 1.006, 1.012, 1.029 |
+
+- Validity (rule 1): all 16 runs `CalibrationPass`. The 8 `off` runs are
+  `ExactTranscripts` (112 request groups). All 16 runs together are also
+  `ExactTranscripts` (208 groups), so speculation changed no output.
+- Rules 2 and 3: the lower bound 0.9995 is not above 1.0 (no Loss) and the upper
+  bound 1.041 is not below 1.0 (no Win). After the extension the verdict is
+  **Inconclusive**: `auto` stays the default.
+- What it means: at four slots `auto` never measured faster. Every block of the
+  extension had `auto` 0.6–3.4% slower, consistent with §4 (each MTP-holding
+  lane pays the MTP catch-up while K3/history run only in solo turns). The
+  effect sits at the edge of the 95% interval and is not a declared loss.
+
+**Qwen3.6** (`$E/d1-speculation-ab-v1/analysis.json`): per-agent completion
+differs across runs (the model fails the task; see
+`adr063-qwen36-task-failure-diagnosis.md`), so §5 rules out makespan and decides
+on decode throughput: auto/off 1.014 (95% CI 0.978–1.051; higher is better).
+The interval straddles 1.0 and the effect is inside the 2.5% neutral band →
+**Inconclusive**, keep the default. For completeness, the excluded makespan
+ratio was 1.076 (CI 1.004–1.154); it compares runs that finished different work.
+
+No default change, so `docs/operator-env-vars.md` and the launchers are unchanged.
