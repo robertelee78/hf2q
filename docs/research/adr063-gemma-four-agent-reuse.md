@@ -967,9 +967,11 @@ ABBA × 3, i.e. 6 + 6 runs (`$E/gemma-gc1-ab-v2`: `run.sh`, `analysis.json`).
 - All 12 runs `CalibrationPass`. Every A run logged
   `requested=false active=false` and 0 joint transactions. Every B run logged
   `active=true` and 2–5 `transaction="joint warm" requests=4`.
-- Own-output four-task makespan on/off: **0.9997** (95% CI 0.9965–1.0029;
-  per block 0.9994, 1.0011, 0.9986). Client elapsed: 1.000 (CI 0.980–1.020),
-  medians 13.93 s (on) and 13.63 s (off).
+- Own-output four-task makespan on/off, using the declared adjacent-pair
+  estimator (6 pairs, df = 5): **0.9997** (95% CI 0.967–1.034; per pair 0.990,
+  1.009, 0.996, 1.006, 1.049, 0.951). Client elapsed: 1.000 (CI 0.970–1.031).
+  Medians: own-output 13.54 s (on) and 13.26 s (off). The interval rules out a
+  gain or loss larger than about 3–4%. It does not resolve smaller effects.
 
 **Disposition: neutral, not a win.** When it landed, joint warm prefill took
 makespan from 21.1 to 16.0 s (`$E/gemma-joint-ab-v1`). Since then the
