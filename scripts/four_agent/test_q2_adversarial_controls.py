@@ -307,15 +307,23 @@ class AuditControls(unittest.TestCase):
 
 
 class LiveConcurrency(unittest.TestCase):
-    """Actual client processes against one fake service: concurrent versus one-request-at-a-time."""
-    # Streams last 5 gaps (75 ms); a later cohort trails by about first + unary, so cohorts overlap.
+    """Actual client processes against one fake service: concurrent versus slot-capped.
+
+    Width outcomes do not depend on host load. A concurrent service holds each rendezvous group
+    (fake.rendezvous_groups) mid-stream until every member's client acknowledged its first
+    progress frame, which keeps the overlap fraction at or above 0.5 (fake.Rendezvous). A
+    slot-capped service keeps a slot until the client closed its connection, so its
+    client-observed width cannot exceed the cap. A failed construction wait fails the test
+    loudly (FakeService.__exit__)."""
     TIMING = fake.Timing(first=0.002, gap=0.015, unary=0.002)
 
-    def live(self, serialized=False, plan=None, timing=None, slots=None, bursty=False):
+    def live(self, plan=None, timing=None, slots=None, bursty=False, rendezvous=True, admit_together=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         client = Path(tmp.name) / "client"
-        with fake.FakeService(timing or self.TIMING, serialized=serialized, slots=slots, bursty=bursty) as service:
+        groups = fake.rendezvous_groups(plan) if rendezvous and slots is None else ()
+        with fake.FakeService(timing or self.TIMING, slots=slots, bursty=bursty, rendezvous=groups,
+                              admit_together=admit_together) as service:
             summary = fake.run_live(service, client, plan)
         self.assertEqual(summary["status"], audit.SUCCESS)  # the coordinator alone would accept every one
         self.assertTrue(all(c["verified"] and c["reaped"] for c in summary["client_cleanup"].values()))
@@ -325,12 +333,11 @@ class LiveConcurrency(unittest.TestCase):
         client, summary = self.live()
         report = audit.audit_run(client, summary, None, "hf2q", True)
         self.assertEqual((report["progress"]["width"], report["http_overlap_max"]), (4, 4))
-        self.assertGreaterEqual(report["progress"]["witness"]["overlap_fraction"], 0.75)
 
     def test_serialized_four_client_service_is_rejected_despite_overlapping_http(self):
-        client, summary = self.live(serialized=True)
+        client, summary = self.live(slots=1, admit_together=4)
         turns = {a: v["turns"] for a, v in summary["agents"].items()}
-        self.assertGreaterEqual(audit.http_overlap(turns), 3)  # requests were queued concurrently
+        self.assertEqual(audit.http_overlap(turns), 4)  # all four requests open, one served
         with self.assertRaisesRegex(ValueError, r"slot-capped service: observed co-progress width 1 < 4"):
             audit.audit_run(client, summary, None, "hf2q", True)
 
@@ -342,9 +349,8 @@ class LiveConcurrency(unittest.TestCase):
                           for t in a["turns"] if t["stream"]}, {4})
         report = audit.audit_run(client, summary, None, "hf2q", True)
         self.assertEqual(report["progress"]["width"], 4)
-        self.assertGreaterEqual(report["progress"]["witness"]["overlap_fraction"], 0.75)
-        client, summary = self.live(serialized=True, timing=timing, bursty=True)
-        with self.assertRaisesRegex(ValueError, r"width 1 < 4"):
+        client, summary = self.live(timing=timing, bursty=True, slots=1, admit_together=4)
+        with self.assertRaisesRegex(ValueError, r"width 1 < 4 with up to 4 overlapping HTTP requests"):
             audit.audit_run(client, summary, None, "hf2q", True)
 
     def test_mixed_populations_need_all_four_agents_co_active(self):
@@ -357,11 +363,12 @@ class LiveConcurrency(unittest.TestCase):
 
     def test_slot_capped_service_fails_mixed_populations(self):
         # A cap at the largest cohort used to pass (width >= largest cohort); every mixed plan needs four.
+        # The audit checks mixing before width: an earlier-cohort agent finishes no sooner than 0.235 s of
+        # known server delay (TIMING) after its own first decode; the release follows its cohort's last first
+        # decode within one 2 ms poll of run_live.
         for plan, slots in (("2+2", 2), ("3+1", 3), ("1+3", 3), ("3+1", 1)):
             with self.subTest(plan=plan, slots=slots):
                 client, summary = self.live(plan=plan, slots=slots)
-                turns = {a: v["turns"] for a, v in summary["agents"].items()}
-                self.assertGreater(audit.http_overlap(turns), slots)  # more requests open than the cap serves
                 with self.assertRaisesRegex(ValueError, rf"observed co-progress width [1-{slots}] < 4"):
                     audit.audit_run(client, summary, plan, "hf2q", True)
 
@@ -371,11 +378,12 @@ class LiveConcurrency(unittest.TestCase):
         self.assertEqual((report["progress"]["width"], report["expected_width"], report["http_overlap_max"]), (1, 1, 1))
 
     def test_known_speedup_has_the_right_direction(self):
-        slow_timing = fake.Timing(first=0.04, gap=0.02, unary=0.04)
-        slow = self.live(False, timing=slow_timing)[1]["own_output_four_task_makespan_seconds"]
-        fast = self.live(False, timing=slow_timing.scaled(0.25))[1]["own_output_four_task_makespan_seconds"]
-        # Per agent: 4 unary waits + 3 streams of (first + 5 gaps) of known server delay.
-        self.assertGreaterEqual(slow, 4 * 0.04 + 3 * (0.04 + 5 * 0.02))
+        slow_timing = fake.Timing(first=0.1, gap=0.05, unary=0.1)
+        slow = self.live(timing=slow_timing, rendezvous=False)[1]["own_output_four_task_makespan_seconds"]
+        fast = self.live(timing=slow_timing.scaled(0.1), rendezvous=False)[1]["own_output_four_task_makespan_seconds"]
+        # Per agent: 4 unary waits + 3 streams of (first + 5 gaps): 1.45 s of known delay, 0.145 s scaled.
+        self.assertGreaterEqual(slow, 4 * 0.1 + 3 * (0.1 + 5 * 0.05))
+        self.assertGreaterEqual(fast, 4 * 0.01 + 3 * (0.01 + 5 * 0.005))
         self.assertLess(fast, slow)
         self.assertLess(q3_stats.paired_effect([(fast, slow)])["log_ratios"][0], 0)  # experiment faster: ratio < 1
 
@@ -388,14 +396,15 @@ class InjectedDelay(unittest.TestCase):
             return fake.drive_agent(service.url, Path(tmp) / "agent-0", "agent-0")
 
     def test_timer_direction_and_units(self):
-        slow = self.receipts(fake.Timing(first=0.15, gap=0.01, unary=0.06))
+        # The 0.5 s pre-semantic delay dwarfs host scheduling noise, so direction does not hinge on load.
+        slow = self.receipts(fake.Timing(first=0.5, gap=0.01, unary=0.2))
         fast = self.receipts(fake.Timing(first=0.01, gap=0.01, unary=0.0))
-        first_semantic = 0.15 + fake.REASONING_FRAMES * 0.01  # first reasoning delay + gaps up to the tool name
+        first_semantic = 0.5 + fake.REASONING_FRAMES * 0.01  # first reasoning delay + gaps up to the tool name
         for turn, other in zip(slow["turns"], fast["turns"]):
             v3 = turn["semantic_timing_v3"]
             if turn["stream"]:
                 self.assertGreaterEqual(v3["semantic_ttft_seconds"], first_semantic)
-                self.assertLess(v3["semantic_ttft_seconds"], first_semantic + 0.5)
+                self.assertLess(v3["semantic_ttft_seconds"], first_semantic + 10)  # milliseconds would read 1000x
                 self.assertGreater(v3["semantic_ttft_seconds"], other["semantic_timing_v3"]["semantic_ttft_seconds"])
                 # Units: the nanosecond clocks hold at least the known delay (a seconds or ms mix-up cannot).
                 self.assertGreaterEqual(turn["semantic_event_monotonic_ns"][0] - turn["send_monotonic_ns"],
@@ -403,7 +412,7 @@ class InjectedDelay(unittest.TestCase):
                 self.assertTrue(turn["send_monotonic_ns"] <= turn["progress_event_monotonic_ns"][0]
                                 <= turn["semantic_event_monotonic_ns"][0] <= turn["validated_terminal_monotonic_ns"])
             else:
-                self.assertGreaterEqual(v3["unary_completion_seconds"], 0.06)
+                self.assertGreaterEqual(v3["unary_completion_seconds"], 0.2)
         self.assertGreaterEqual(q3_metrics.slot_metrics(slow)["ttft_p95_s"], first_semantic)
 
 

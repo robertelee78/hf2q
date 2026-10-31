@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -58,22 +59,111 @@ def tool_arguments(turn):
     return name, ({"path": "src/ports.rs", "content": FIXED_SOURCE} if arguments is None else arguments)
 
 
+RENDEZVOUS_HOLD = 0.1
+# Every construction wait (rendezvous, admission gate, client close) fails after this many seconds.
+# It stays below drive_agent's 30 s request deadline, so a stall is reported as the named wait.
+WAIT_TIMEOUT = 20.0
+
+
+def rendezvous_groups(phase_plan):
+    """Streamed (agent, turn) sets a genuinely concurrent service holds open together.
+
+    n4: every agent's first streamed turn. K+M: the earlier cohort's second streamed turn (turn 3)
+    with the later cohort's first (turn 1); the later cohort is released during the earlier
+    cohort's turn 1, so both are reached without either waiting on the other. "1": none."""
+    cohorts = coordinator.phase_cohorts(phase_plan)
+    if len(cohorts) == 1:
+        return [] if len(cohorts[0]) == 1 else [{(agent, 1) for agent in cohorts[0]}]
+    return [{(agent, 3) for agent in cohorts[0]} | {(agent, 1) for agent in cohorts[1]}]
+
+
+def first_progress_ack(directory, agent, turn):
+    """Marker a live client writes once it has stamped its first progress frame of `turn`."""
+    return Path(directory) / f"{agent}.turn-{turn}.first-progress"
+
+
+def acknowledging(path, then=None):
+    """`on_first_token` hook: write the rendezvous acknowledgement `path`, then run `then`.
+
+    `exchange` calls the hook after it has appended the first progress timestamp."""
+    def hook(monotonic_ns):
+        path.touch(exist_ok=False)
+        if then is not None:
+            then(monotonic_ns)
+    return hook
+
+
+class Rendezvous:
+    """One group of member streams, (agent, turn), that a concurrent service holds mid-stream together.
+
+    A member stamps `sent` just before it writes its first progress frame. It then waits until every
+    member has done so and every member's client has acknowledged stamping that frame
+    (`first_progress_ack`). Observing all of that at clock t, it holds until
+    t + max(RENDEZVOUS_HOLD, t - earliest sent) before it writes the rest of its stream.
+
+    Why the audit's overlap fraction is then >= 0.5 whatever the scheduling: let F be the group's
+    latest first-progress stamp, and j the member whose last progress stamp L is earliest. Each
+    acknowledgement is written after its stamp, so F <= t_j. Member j's last frame is written after
+    its hold, so L >= t_j + hold_j and the common window L - F >= hold_j. A client cannot stamp a
+    frame before it is written, so f_j >= earliest sent and F - f_j <= t_j - earliest sent <= hold_j.
+    Member j's active interval (L - F) + (F - f_j) is therefore at most twice the window, and so is
+    the shortest member's. All stamps are CLOCK_MONOTONIC on the one host."""
+
+    def __init__(self, members, acks):
+        self.members, self.acks = sorted(members), acks
+        self.sent, self.lock = {}, threading.Lock()
+
+    def hold(self, member, sent_ns):
+        """Called after `member` wrote its first progress frame; raises TimeoutError naming what is missing."""
+        with self.lock:
+            self.sent[member] = sent_ns
+        limit = time.monotonic() + WAIT_TIMEOUT
+        while True:
+            with self.lock:
+                written, earliest = len(self.sent), min(self.sent.values())
+            missing = [m for m in self.members if not first_progress_ack(self.acks, *m).exists()]
+            if written == len(self.members) and not missing:
+                break
+            if time.monotonic() > limit:
+                raise TimeoutError(f"rendezvous of {member[0]} turn {member[1]}: first progress of "
+                                   f"{', '.join(f'{a} turn {t}' for a, t in missing)} not acknowledged "
+                                   f"after {WAIT_TIMEOUT}s")
+            time.sleep(0.001)
+        now = clock_ns()
+        until = now + max(round(RENDEZVOUS_HOLD * 1e9), now - earliest)
+        while (now := clock_ns()) < until:
+            time.sleep((until - now) / 1e9)
+
+
 class FakeService:
     """Loopback /v1/chat/completions.
 
-    `slots=N` serves at most N requests at a time end to end (the rest wait in the accept queue
-    with their HTTP requests open); `serialized=True` is `slots=1`. `bursty=True` streams the
-    low-frame shape of hf2q Gemma: one reasoning frame, a pause of `timing.gap`, then the tool
-    name and two argument frames back to back (four progress frames per streamed turn)."""
+    Concurrency, and its absence, is by construction, never by timing luck:
+    - `rendezvous=[{(agent, turn), ...}]` (concurrent service only; see `Rendezvous`): the members
+      of a group are mid-stream together with an overlap fraction of at least 0.5. Live clients
+      acknowledge their first progress frame in `self.acks` (run_live passes it to drive_agent).
+    - `slots=N` serves at most N requests at a time end to end (the rest wait with their HTTP
+      requests open); `slots=1` is a serialized service. A slot is held until the client has closed
+      its connection, i.e. after it stamped every frame, so more than N client-observed active
+      intervals never share an instant, however loaded the host is.
+    - `admit_together=N` holds the first N requests until all N are open (deterministic HTTP overlap).
+    A rendezvous, admission or close wait that fails is recorded and fails `__exit__` loudly.
+    `bursty=True` streams the low-frame shape of hf2q Gemma: one reasoning frame, a pause of
+    `timing.gap`, then the tool name and two argument frames back to back (four progress frames)."""
 
-    def __init__(self, timing=None, serialized=False, faults=None, model=MODEL, slots=None, bursty=False):
+    def __init__(self, timing=None, faults=None, model=MODEL, slots=None, bursty=False, rendezvous=(),
+                 admit_together=None):
         self.timing, self.model, self.bursty = timing or Timing(), model, bursty
-        slots = 1 if serialized else slots
+        assert not (slots and rendezvous), "a slot-capped service cannot hold a rendezvous group open"
         self.slots = None if slots is None else threading.BoundedSemaphore(slots)
+        self.acks = Path(tempfile.mkdtemp(prefix="q2-rendezvous-")) if rendezvous else None
+        self.rendezvous = {member: group for members in rendezvous
+                           for group in [Rendezvous(members, self.acks)] for member in members}
+        self.admission = None if admit_together is None else threading.Barrier(admit_together)
         self.faults = dict(faults or {})
         self.state = threading.Lock()
-        self.requests, self.call_ids, self.response_ids = [], {}, {}
-        self.counter = 0
+        self.requests, self.call_ids, self.response_ids, self.errors = [], {}, {}, []
+        self.counter = self.admitted = 0
         service = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -85,9 +175,12 @@ class FakeService:
             def do_POST(self):
                 accepted = clock_ns()
                 body = self.rfile.read(int(self.headers["Content-Length"]))
+                if service.admission is not None:
+                    service.admit()
                 if service.slots is not None:
                     with service.slots:
                         service.respond(self, body, accepted)
+                        service.await_client_close(self)
                 else:
                     service.respond(self, body, accepted)
 
@@ -95,14 +188,44 @@ class FakeService:
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
 
+    def fail(self, reason):
+        with self.state:
+            self.errors.append(reason)
+
+    def admit(self):
+        """The first `admit_together` requests proceed only once all of them are open."""
+        with self.state:
+            self.admitted += 1
+            gated = self.admitted <= self.admission.parties
+        if gated:
+            try:
+                self.admission.wait(WAIT_TIMEOUT)
+            except threading.BrokenBarrierError:
+                self.fail(f"admission gate of {self.admission.parties} requests not filled after {WAIT_TIMEOUT}s")
+
+    def await_client_close(self, handler):
+        """Half-close (the client sees end of stream), then hold the slot until the client closes."""
+        try:
+            handler.wfile.flush()
+            handler.connection.shutdown(socket.SHUT_WR)
+            handler.connection.settimeout(WAIT_TIMEOUT)
+            while handler.connection.recv(4096):
+                pass
+        except OSError as error:
+            self.fail(f"client close not observed: {type(error).__name__}: {error}")
+
     def __enter__(self):
         self.thread.start()
         return self
 
-    def __exit__(self, *_args):
+    def __exit__(self, *_exception):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(5)
+        if self.acks is not None:
+            shutil.rmtree(self.acks, ignore_errors=True)
+        if self.errors:  # raised over (and chained to) any exception already propagating
+            raise AssertionError("fake service construction failed: " + "; ".join(self.errors))
 
     @property
     def url(self):
@@ -168,11 +291,18 @@ class FakeService:
             handler.send_header("Content-Type", "text/event-stream")
             handler.send_header("Connection", "close")
             handler.end_headers()
+            group = self.rendezvous.get((agent, turn))
             for index, (delay, frame) in enumerate(frames):
                 if delay:
                     time.sleep(delay)
+                sent = clock_ns()
                 handler.wfile.write(frame)
                 handler.wfile.flush()
+                if index == 1 and group is not None:  # frames[1] is the first progress frame
+                    try:
+                        group.hold((agent, turn), sent)
+                    except TimeoutError as error:
+                        self.fail(str(error))
         else:
             time.sleep(self.timing.unary)
             message = {"role": "assistant", "content": content, "reasoning_content": reasoning}
@@ -261,8 +391,11 @@ class StubTools:
 
 
 def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", family="qwen", instance=None,
-                phase=None, release_ns=None, on_first_token=None, server_pid=SERVER_PID):
-    """The agent child's turn loop with stub tools; raises the actual client rejection on a bad response."""
+                phase=None, release_ns=None, on_first_token=None, server_pid=SERVER_PID, acks=None):
+    """The agent child's turn loop with stub tools; raises the actual client rejection on a bad response.
+
+    `acks` (a rendezvous service's `acks` directory): acknowledge the first progress frame of every
+    streamed turn there, after the actual `exchange` stamped it."""
     out = Path(out)
     out.mkdir(parents=True)
     workload = None if instance is None else coding_instances.select(instance)
@@ -293,6 +426,8 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
         turn_out = out / f"turn-{turn}"
         turn_out.mkdir()
         callback = on_first_token if turn == 1 else None
+        if acks is not None:
+            callback = acknowledging(first_progress_ack(acks, agent, turn), callback)
         message, call, receipt = exchange(base, request, turn_out, turn, seen, deadline=30, engine_kind=engine_kind,
                                           family=family, on_first_token=callback)
         summary["turns"].append(receipt)
@@ -442,7 +577,8 @@ def run_live(service, client_dir, phase_plan=None, engine_kind="hf2q", family="q
     processes = {}
     for agent in coordinator.active_agents(phase_plan):
         config = {"base": service.url, "out": str(client_dir / agent), "agent": agent, "engine_kind": engine_kind,
-                  "family": family, "phase_plan": phase_plan, "barrier": str(barrier)}
+                  "family": family, "phase_plan": phase_plan, "barrier": str(barrier),
+                  "acks": None if service.acks is None else str(service.acks)}
         processes[agent] = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "agent",
                                              json.dumps(config)], cwd=HERE, start_new_session=True,
                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -490,7 +626,7 @@ def agent_main(config):
         def marker(ns):
             coordinator.first_decode_marker(barrier, agent, RUN, TOKEN, ns)
     drive_agent(config["base"], config["out"], agent, engine_kind=config["engine_kind"], family=config["family"],
-                phase=phase, release_ns=release_ns, on_first_token=marker)
+                phase=phase, release_ns=release_ns, on_first_token=marker, acks=config["acks"])
     return 0
 
 

@@ -14,7 +14,7 @@ Each control injects one specific lie and asserts that the harness rejects it wi
 
 | File | Role |
 | --- | --- |
-| `scripts/four_agent/q2_fake_service.py` | Test support. A model-free OpenAI-compatible loopback service that answers the canonical seven-turn coding workflow. Its fault table turns single responses adversarial. `slots=N` serves at most N requests at a time end to end (`serialized=True` is `slots=1`), and `bursty=True` streams the four-frame hf2q Gemma shape. Clients are the real `exchange`/parser and the coordinator verdict is the real `aggregate`; tools are stubs. `run_live` drives four real client processes. `honest_run` writes complete client directories for campaign fixtures, lockstep or slot-capped. |
+| `scripts/four_agent/q2_fake_service.py` | Test support. A model-free OpenAI-compatible loopback service that answers the canonical seven-turn coding workflow. Its fault table turns single responses adversarial. `slots=N` serves at most N requests at a time end to end (`slots=1` is a serialized service), `rendezvous` holds the given streams mid-stream together until their clients acknowledge their first progress frame, and `bursty=True` streams the four-frame hf2q Gemma shape (see "Deterministic under load" below). Clients are the real `exchange`/parser and the coordinator verdict is the real `aggregate`; tools are stubs. `run_live` drives four real client processes. `honest_run` writes complete client directories for campaign fixtures, lockstep or slot-capped. |
 | `scripts/four_agent/q2_run_audit.py` | Harness detection (new). Re-derives a settled run from its raw client evidence before a Pass counts. |
 | `scripts/four_agent/test_q2_adversarial_controls.py` | The control matrix below (38 tests). |
 
@@ -68,7 +68,7 @@ Overlapping HTTP lifetimes prove nothing: a serialized service keeps four reques
   - So does a server that parks a request mid-generation while it finishes another. To the client that looks the same as a model whose tokens are buffered between frames.
   - Physical batch membership (which owners share one forward), active and runnable prefill/decode counts, and pure four-prefill and four-decode phases come from the server phase trace. `f2_trace.validate_trace` and `qualify_window` decide those, with `forward_demand_v2`/queued-demand rules. They are controlled by `test_q2_f2_controls.py` (all populations, serialized four HTTP labels, Unknown/duplicate/stale membership, missing drains) and `test_f2_demand.py`.
 
-Live results: four real client processes against the fake service.
+Live results: four real client processes against the fake service. This table was measured on an unloaded host, before the rendezvous and close-wait construction described under "Deterministic under load". The live controls now use that construction, so their width outcomes no longer depend on timing; overlap and makespan values differ under it.
 
 - **Default timing:** 2 ms before the first delta, 15 ms between frames, 2 ms unary latency.
 - **Bursty rows** use the Gemma-shaped stream: one reasoning frame after 20 ms, a 60 ms pause, then three semantic frames back to back, for four progress frames per turn.
@@ -112,8 +112,8 @@ Layer **wire** means the live client rejects the response during `exchange`; the
 
 | Acceptance item | Injected lie | Layer | Rejection reason |
 | --- | --- | --- | --- |
-| Deliberately serialized four-client service | one request at a time, four open HTTPs (live: n4, every mixed plan, and Gemma-shaped bursty streams; retimed: n4) | audit, campaign | `serialized or slot-capped service: observed co-progress width 1 < 4` |
-| Slot-capped service in a mixed population | at most 2 requests served for `2+2`, at most 3 for `3+1`/`1+3` (live); at most 2 or 3 for n4 (live and retimed) | audit | `… observed co-progress width 2 < 4` / `3 < 4` |
+| Deliberately serialized four-client service | one request at a time, four open HTTPs (live: n4, `3+1`, and Gemma-shaped bursty streams; retimed: n4) | audit, campaign | `serialized or slot-capped service: observed co-progress width 1 < 4` |
+| Slot-capped service in a mixed population | at most 2 requests served for `2+2`, at most 3 for `3+1`/`1+3` (live); at most 2 or 3 for n4 (retimed) | audit | `… observed co-progress width 2 < 4` / `3 < 4` |
 | Role-only SSE | role frames only, then finish/usage/DONE | wire | `no semantic SSE progress` |
 | Missing semantic output | reasoning-only stream; empty final summary | wire | `no semantic SSE progress`; `final summary missing or extra tool continuation` |
 | Wrong tool arguments | `tests/ports.rs` at turn 0; target `everything` | wire | `tool arguments/workflow drift` |
@@ -142,21 +142,44 @@ Positive controls: the honest service completes all seven turns on the hf2q and 
 
 ### Timer direction and units with known delays
 
-A single agent drives the real exchange loop against known server delays.
+A single agent drives the real exchange loop against known server delays: a slow service (0.5 s before the first delta, 0.01 s between frames, 0.2 s unary latency) and a fast one (0.01 / 0.01 / 0).
 
-| Delay (s): first / gap / unary | Turn timing (s), turns 0–6 (streamed turns are TTFT, unary turns are completion) |
-| --- | --- |
-| 0.15 / 0.01 / 0.06 | 0.071, 0.221, 0.071, 0.217, 0.071, 0.221, 0.071 |
-| 0.01 / 0.01 / 0.00 | 0.0006, 0.0755, 0.0007, 0.0755, 0.0007, 0.0726, 0.0006 |
+The test asserts five properties:
 
-The test asserts four properties:
-
-- **Lower bound.** Each streamed TTFT is at least the known delay before the first semantic frame: 0.15 + 4 × 0.01 = 0.19 s. A server cannot deliver earlier than it sends.
-- **Direction.** The slower service is slower on every turn.
-- **Units.** The nanosecond clocks hold at least the known delay: `semantic_event[0] - send` ≥ 0.19 × 10⁹. This bound, together with the seconds bound, rules out a seconds/milliseconds mix-up without restating the TTFT formula. Ordering also holds: send ≤ first progress ≤ first semantic ≤ terminal.
+- **Lower bound.** Each streamed TTFT is at least the known delay before the first semantic frame: 0.5 + 4 × 0.01 = 0.54 s. A server cannot deliver earlier than it sends. Each unary completion is at least 0.2 s.
+- **Upper bound.** The TTFT stays below 0.54 + 10 s. A millisecond value read as seconds would be 1000 times too large.
+- **Direction.** The slower service is slower on every turn. The 0.5 s pre-semantic delay dwarfs host scheduling noise.
+- **Units.** The nanosecond clocks hold at least the known delay: `semantic_event[0] - send` ≥ 0.54 × 10⁹. With the seconds bounds, this rules out a seconds/milliseconds mix-up without restating the TTFT formula. Ordering also holds: send ≤ first progress ≤ first semantic ≤ terminal.
 - **Through to Q3.** `q3_metrics.slot_metrics` reports the same seconds.
 
-A four-agent live run with every delay scaled by 0.25 has a shorter makespan than the unscaled run. The unscaled makespan is at least its known critical-path delay: 4 × 0.04 + 3 × (0.04 + 5 × 0.02) s. `q3_stats.paired_effect` gives the faster arm a negative log ratio, which means a ratio below 1, the "experiment faster" direction.
+A four-agent live run with every delay scaled by 0.1 has a shorter makespan than the unscaled run (0.1 s first, 0.05 s gaps, 0.1 s unary). Each makespan is at least its known critical-path delay: 4 × 0.1 + 3 × (0.1 + 5 × 0.05) = 1.45 s unscaled, 0.145 s scaled. `q3_stats.paired_effect` gives the faster arm a negative log ratio, which means a ratio below 1, the "experiment faster" direction.
+
+### Deterministic under load
+
+A loaded CI runner (suite 149 s against 48 s locally) once returned width 3 for a concurrent bursty run. One concurrent stream had started late, so its overlap with the others fell below 0.5 of the shortest interval. The live controls now get their concurrency, and their lack of it, by construction. The audit is unchanged.
+
+- **Concurrent services: client-acknowledged rendezvous.** `rendezvous_groups(plan)` names the streams that a genuinely concurrent service holds open together:
+  - n4: every agent's turn 1;
+  - `K+M`: the earlier cohort's turn 3 with the later cohort's turn 1;
+  - `1`: none.
+
+  Each member stream stamps the clock and sends its first progress frame. The live client acknowledges that frame through its `on_first_token` hook, after `exchange` has stamped it, by writing a marker into the service's `acks` directory. The member stream then waits until every member has sent its first frame and every member's client has acknowledged it. Observing that at clock t, it holds until t + max(0.1 s, t − earliest first send), then sends the rest of its stream.
+
+  The overlap fraction is then at least 0.5 however late any thread or process runs. Let F be the group's latest first-progress stamp, and j the member whose last progress stamp L is earliest:
+  - every acknowledgement precedes t, so F ≤ t_j;
+  - j's last frame is sent after its hold, so the common window L − F is at least that hold;
+  - no client stamps a frame before it is sent, so F − f_j ≤ t_j − earliest first send, which is at most the same hold.
+
+  j's active interval, (L − F) + (F − f_j), is therefore at most twice the common window, and so is the shortest member's. Server and clients stamp the same host's `CLOCK_MONOTONIC`. In `K+M` plans the rendezvous also mixes the population by construction: the earlier cohort cannot finish before the later cohort has started streaming.
+- **Slot-capped services: close-wait.** A slot-capped or serialized service half-closes each response, then keeps the slot until the client closes its connection. The client closes only after it has stamped every frame. Every client-observed active interval therefore lies inside its slot-holding interval, so the width cannot exceed the cap however loaded the host is.
+- **Admission gate.** For the "despite overlapping HTTP" claim, `admit_together=4` holds the first four requests until all four are open. The live serialized controls therefore always have 4 overlapping HTTP requests.
+- **Loud failures.** A rendezvous, admission or close wait that fails is recorded, and the service's `__exit__` fails the test with the reason, chained to any error already raised. The waits time out after 20 s, below the client's 30 s request deadline, so a stall is reported as the named wait. A failed wait never turns into a timing-dependent width.
+
+Three assertions still compare against wall-clock time. Each has a known server delay as its margin:
+
+- **Speedup direction.** The slow makespan is at least 1.45 s of known delay. The fast run has 0.145 s of known delay plus client overhead.
+- **Timer direction.** Each slow streamed TTFT is at least 0.54 s, and the fast one is 0.05 s plus overhead. The upper bound sits 10 s above the known delay.
+- **Slot-capped mixing.** The audit checks that a mixed population really mixed before it checks width, and a slot-capped service has no rendezvous. At default timing, an earlier-cohort agent still has 0.235 s of known server delay ahead of it at its own first decode. The later cohort is released once the whole earlier cohort has decoded, and `run_live` polls for that every 2 ms.
 
 ## Finding: hf2q tool-call ids collide across concurrent agents
 
@@ -182,7 +205,7 @@ For this reason the audit does not treat a tool-call id shared across agents as 
 
 ## Results and commands
 
-Pure-Python suite (Python 3.13, macOS): 543 tests, OK, about 48 s. That is 505 existing tests plus 38 in `test_q2_adversarial_controls.py` (about 15 s). The live concurrency and injected-delay classes passed on eight consecutive repeats after the v2 co-progress rule.
+Pure-Python suite (Python 3.13, macOS), measured before the deterministic construction: 543 tests, OK, about 48 s. That is 505 existing tests plus 38 in `test_q2_adversarial_controls.py` (about 15 s). The construction does not change the test count.
 
 Dry audit of retained real runs (no false rejection). Ten retained four-agent client directories were audited without the width gate, because they predate `progress_event_monotonic_ns`. Their progress timestamps were synthesized at the replayed frame count, so width was not evaluated. The runs covered hf2q and peer arms of Qwen3.8, Gemma 4, DeepSeek-V4 and a quality-campaign instance: `c5-runs-v1` ×3, `peer-arms-v1` ×2, `ds4-joint-ab-v1/b2`, `q3-campaign-v1` ×2, `gemma-joint-ab-v1/g-3-P` and `quality-qwen38-peer-exp0b95/01`. Every other check passed on all ten: hashes, canonical wire, parser replay, lineage, response-id uniqueness, identity leakage, aggregate, cleanup, makespan arithmetic.
 
