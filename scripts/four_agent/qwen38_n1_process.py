@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import selectors
 import signal
+import stat
 import subprocess
 import time
 
@@ -94,9 +95,13 @@ def directory_bytes(path, limit=TARGET_LIMIT):
             entries += 1
             require(entries <= FILE_COUNT_LIMIT, "writable tree file-count quota")
             p = Path(root) / name
-            require(not p.is_symlink(), "symlink in tool target")
-            if p.is_file():
-                total += p.stat().st_size
+            try:
+                st = p.lstat()
+            except FileNotFoundError:
+                continue  # removed mid-walk by the running tool (e.g. rustc temp files); it holds no bytes
+            require(not stat.S_ISLNK(st.st_mode), "symlink in tool target")
+            if stat.S_ISREG(st.st_mode):
+                total += st.st_size
                 require(total <= limit, "writable tree byte quota")
     return total
 
