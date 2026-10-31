@@ -56,18 +56,21 @@ pub fn encode_embedding_rows(
                 n_tokens: params.2,
             },
         )?,
-        GgmlType::Q2_K => session.embedding_gather_q2_k(
-            registry,
-            device,
-            &weight.buffer,
-            token_ids,
-            output,
-            &mlx_native::ops::embedding_q2_k::EmbeddingQ2KParams {
-                vocab_size: params.0,
-                embed_dim: params.1,
-                n_tokens: params.2,
-            },
-        )?,
+        GgmlType::Q2_K => {
+            mlx_native::ops::embedding_q2_k::register(registry);
+            session.embedding_gather_q2_k(
+                registry,
+                device,
+                &weight.buffer,
+                token_ids,
+                output,
+                &mlx_native::ops::embedding_q2_k::EmbeddingQ2KParams {
+                    vocab_size: params.0,
+                    embed_dim: params.1,
+                    n_tokens: params.2,
+                },
+            )?
+        }
         GgmlType::Q4_K => session.embedding_gather_q4_k(
             registry,
             device,
@@ -80,42 +83,51 @@ pub fn encode_embedding_rows(
                 n_tokens: params.2,
             },
         )?,
-        GgmlType::Q5_K => session.embedding_gather_q5_k(
-            registry,
-            device,
-            &weight.buffer,
-            token_ids,
-            output,
-            &mlx_native::ops::embedding_kquant::EmbeddingQ5KParams {
-                vocab_size: params.0,
-                embed_dim: params.1,
-                n_tokens: params.2,
-            },
-        )?,
-        GgmlType::Q6_K => session.embedding_gather_q6_k(
-            registry,
-            device,
-            &weight.buffer,
-            token_ids,
-            output,
-            &mlx_native::ops::embedding_kquant::EmbeddingQ6KParams {
-                vocab_size: params.0,
-                embed_dim: params.1,
-                n_tokens: params.2,
-            },
-        )?,
-        GgmlType::Q8_0 => session.embedding_gather_q8_0(
-            registry,
-            device,
-            &weight.buffer,
-            token_ids,
-            output,
-            &mlx_native::ops::embedding_q8_0::EmbeddingQ8_0Params {
-                vocab_size: params.0,
-                embed_dim: params.1,
-                n_tokens: params.2,
-            },
-        )?,
+        GgmlType::Q5_K => {
+            mlx_native::ops::embedding_kquant::register(registry);
+            session.embedding_gather_q5_k(
+                registry,
+                device,
+                &weight.buffer,
+                token_ids,
+                output,
+                &mlx_native::ops::embedding_kquant::EmbeddingQ5KParams {
+                    vocab_size: params.0,
+                    embed_dim: params.1,
+                    n_tokens: params.2,
+                },
+            )?
+        }
+        GgmlType::Q6_K => {
+            mlx_native::ops::embedding_kquant::register(registry);
+            session.embedding_gather_q6_k(
+                registry,
+                device,
+                &weight.buffer,
+                token_ids,
+                output,
+                &mlx_native::ops::embedding_kquant::EmbeddingQ6KParams {
+                    vocab_size: params.0,
+                    embed_dim: params.1,
+                    n_tokens: params.2,
+                },
+            )?
+        }
+        GgmlType::Q8_0 => {
+            mlx_native::ops::embedding_q8_0::register(registry);
+            session.embedding_gather_q8_0(
+                registry,
+                device,
+                &weight.buffer,
+                token_ids,
+                output,
+                &mlx_native::ops::embedding_q8_0::EmbeddingQ8_0Params {
+                    vocab_size: params.0,
+                    embed_dim: params.1,
+                    n_tokens: params.2,
+                },
+            )?
+        }
         other => bail!("Gemma embedding dispatch reached unadmitted type {other:?}"),
     }
     session.track_dispatch(&[&weight.buffer, token_ids], &[output]);

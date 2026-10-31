@@ -1,11 +1,20 @@
 """Pure controls for actual-used N4 identity/approval/barrier/aggregation boundaries."""
+import argparse
 import hashlib
+import json
+import sys
+import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from qwen38_n1_verdict import Invalid, EXPECTED
-from qwen_n4_live_smoke import (AGENTS, PROFILE, aggregate, barrier_release, identity,
-                               preflight, validate_agent_binding, validate_ready, validate_release, validate_preflight)
+import qwen38_n1_process as child
+from qwen_n4_live_smoke import (AGENTS, PROFILE, active_agents, agent_command, agent_phase, aggregate,
+                               barrier_release, first_decode_marker, identity, phase_cohorts, phase_trigger,
+                               preflight, release_name, validate_agent_binding, validate_ready, validate_release,
+                               validate_preflight, wait_barrier)
 
 RUN = "n4_source_fixture_20261025"
 TOKEN = "a" * 32
@@ -163,6 +172,143 @@ class FourAgent(unittest.TestCase):
             data[AGENTS[2]][key] = data[AGENTS[2]][key][:-1]
             with self.subTest(key=key), self.assertRaises(Invalid):
                 aggregate(data, dict.fromkeys(AGENTS, 0), dict.fromkeys(AGENTS, True), PID, RUN)
+
+
+def client_args(phase_plan=None):
+    return argparse.Namespace(base_url="http://127.0.0.1:18238/v1", model="Qwen3.8 27B", cargo="/x/cargo",
+                              toolchain="stable", sandbox_exec="/usr/bin/sandbox-exec", sandbox_proof="/x/proof.json",
+                              sandbox_proof_sha256="b" * 64, server_pid=PID, family="qwen", engine_kind="hf2q",
+                              benchmark_profile=None, instance=None, phase_plan=phase_plan)
+
+
+class PhasePlans(unittest.TestCase):
+    """ADR-063 Q3 --phase-plan controls; absent, the canonical workload is unchanged."""
+
+    def test_canonical_child_argv_is_byte_identical_without_a_phase_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            approval = Path(tmp) / "agent-1.approval.json"
+            approval.write_text("{}")
+            module_dir, barrier, path = Path("/m"), Path("/r/barrier"), Path("/r/agent-1")
+            legacy = [sys.executable, "-E", "-s", "-B", "/m/qwen38_n1_smoke.py",
+                      "--base-url", "http://127.0.0.1:18238/v1", "--model", "Qwen3.8 27B", "--cargo", "/x/cargo",
+                      "--toolchain", "stable", "--sandbox-exec", "/usr/bin/sandbox-exec",
+                      "--sandbox-proof", "/x/proof.json", "--sandbox-proof-sha256", "b" * 64,
+                      "--server-pid", str(PID), "--output", "/r/agent-1", "--approval", str(approval),
+                      "--approval-sha256", child.digest(approval), "--diagnostic-slots", "4", "--family", "qwen",
+                      "--engine-kind", "hf2q", "--agent-id", "agent-1", "--run-id", RUN,
+                      "--barrier-dir", "/r/barrier", "--barrier-token", TOKEN]
+            self.assertEqual(agent_command(client_args(), module_dir, "agent-1", path, approval, barrier, RUN, TOKEN),
+                             legacy)
+            staged = agent_command(client_args("3+1"), module_dir, "agent-3", path, approval, barrier, RUN, TOKEN)
+            self.assertEqual(staged[-4:], ["--phase-plan", "3+1", "--phase-cohort", "2"])
+
+    def test_canonical_release_and_results_carry_no_phase_fields(self):
+        hashes = {a: hashlib.sha256(a.encode()).hexdigest() for a in AGENTS}
+        release = barrier_release(ready(), RUN, PID, TOKEN, hashes)
+        self.assertEqual(list(release), ["schema", "run_id", "server_pid", "barrier_token", "agents", "ready_sha256"])
+        data = results()
+        data[AGENTS[1]]["phase"] = {"plan": "3+1", "cohort": 1}
+        with self.assertRaises(Invalid):
+            aggregate(data, dict.fromkeys(AGENTS, 0), dict.fromkeys(AGENTS, True), PID, RUN)
+
+    def test_cohorts_and_release_files(self):
+        self.assertEqual(phase_cohorts(None), (AGENTS,))
+        self.assertEqual(phase_cohorts("1"), (("agent-0",),))
+        self.assertEqual(phase_cohorts("3+1"), (AGENTS[:3], AGENTS[3:]))
+        self.assertEqual(phase_cohorts("1+3"), (AGENTS[:1], AGENTS[1:]))
+        self.assertEqual(agent_phase("2+2", "agent-2"), {"plan": "2+2", "cohort": 2})
+        self.assertIsNone(agent_phase(None, "agent-2"))
+        self.assertEqual((release_name(1), release_name(2)), ("release.json", "release-2.json"))
+        for bad in ("4", "2+1", "0+4"):
+            with self.subTest(plan=bad), self.assertRaises(Invalid):
+                phase_cohorts(bad)
+        with self.assertRaises(Invalid):
+            agent_phase("1", "agent-1")  # the one-agent control runs agent-0 only
+
+    def test_one_agent_control_binds_only_agent_zero(self):
+        agents = active_agents("1")
+        records = {a: r for a, r in ready().items() if a in agents}
+        hashes = {a: hashlib.sha256(a.encode()).hexdigest() for a in agents}
+        release = barrier_release(records, RUN, PID, TOKEN, hashes, agents=agents)
+        self.assertEqual(release["agents"], ["agent-0"])
+        validate_release(release, "agent-0", RUN, PID, TOKEN, hashes["agent-0"], agents)
+        with self.assertRaises(Invalid):  # a four-agent child cannot accept a one-agent release
+            validate_release(release, "agent-0", RUN, PID, TOKEN, hashes["agent-0"])
+        with self.assertRaises(Invalid):
+            barrier_release(ready(), RUN, PID, TOKEN, hashes, agents=agents)
+        data = {a: {**r, "phase": {"plan": "1", "cohort": 1}} for a, r in results().items() if a in agents}
+        ok = dict.fromkeys(agents, 0), dict.fromkeys(agents, True)
+        self.assertEqual(aggregate(data, *ok, PID, RUN, phase_plan="1"),
+                         "FourAgentProtocolCompleteAwaitingIndependentReview")
+        with self.assertRaises(Invalid):  # missing phase record
+            aggregate({a: results()[a] for a in agents}, *ok, PID, RUN, phase_plan="1")
+
+    def test_staggered_results_need_each_agents_cohort(self):
+        data = {a: {**r, "phase": agent_phase("2+2", a)} for a, r in results().items()}
+        ok = dict.fromkeys(AGENTS, 0), dict.fromkeys(AGENTS, True)
+        self.assertEqual(aggregate(data, *ok, PID, RUN, phase_plan="2+2"),
+                         "FourAgentProtocolCompleteAwaitingIndependentReview")
+        data["agent-3"]["phase"] = {"plan": "2+2", "cohort": 1}
+        with self.assertRaises(Invalid):
+            aggregate(data, *ok, PID, RUN, phase_plan="2+2")
+
+    def test_trigger_waits_for_every_first_cohort_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = phase_cohorts("3+1")[0]
+            for agent, ns in zip(first[:2], (5, 7)):
+                first_decode_marker(tmp, agent, RUN, TOKEN, ns)
+            self.assertIsNone(phase_trigger(tmp, first, RUN, TOKEN))
+            first_decode_marker(tmp, first[2], RUN, TOKEN, 9)
+            self.assertEqual(phase_trigger(tmp, first, RUN, TOKEN), {"agent-0": 5, "agent-1": 7, "agent-2": 9})
+            with self.assertRaises(Invalid):
+                phase_trigger(tmp, first, RUN, "c" * 32)  # a marker from another barrier
+            with self.assertRaises(FileExistsError):
+                first_decode_marker(tmp, first[0], RUN, TOKEN, 11)  # published once
+
+    def test_later_cohort_waits_for_its_own_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            barrier, agent = Path(tmp), "agent-3"
+            phase = agent_phase("3+1", agent)
+
+            def coordinator():
+                own = barrier / f"{agent}.ready.json"
+                while not own.exists():
+                    time.sleep(0.01)
+                hashes = {a: hashlib.sha256(a.encode()).hexdigest() for a in AGENTS}
+                hashes[agent] = child.digest(own)
+                base = {"schema": "hf2q.n4-barrier-release.v1", "run_id": RUN, "server_pid": PID,
+                        "barrier_token": TOKEN, "agents": list(AGENTS), "ready_sha256": hashes, "phase_plan": "3+1"}
+                (barrier / "release.json").write_text(json.dumps({**base, "cohort": 1, "release_monotonic_ns": 1}))
+                time.sleep(0.1)
+                (barrier / "release-2.json").write_text(json.dumps({**base, "cohort": 2, "release_monotonic_ns": 2}))
+
+            thread = threading.Thread(target=coordinator)
+            thread.start()
+            released = wait_barrier(barrier, agent, RUN, PID, TOKEN, barrier / agent, "d" * 64, "e" * 64, phase=phase)
+            thread.join()
+            self.assertEqual(released["release_monotonic_ns"], 2)
+            self.assertEqual(released["release_sha256"], child.digest(barrier / "release-2.json"))
+
+    def test_first_token_callback_fires_once_at_first_decoded_token(self):
+        from qwen38_n1_smoke import exchange
+        from test_q2_socket_controls import FakeSocket, frame
+        from test_qwen38_n1_verdict import request, chunk, stats
+        value = request()
+        value["stream"] = True
+        parts = [(0, frame(chunk({"role": "assistant"}))),
+                 (.05, frame(chunk({"reasoning_content": "think"}))),
+                 (.10, frame(chunk({"tool_calls": [{"index": 0, "id": "live", "type": "function",
+                                                    "function": {"name": "read_file"}}]}))),
+                 (.01, frame(chunk({"tool_calls": [{"index": 0, "function": {"arguments": '{"path":"src/ports.rs"}'}}]}))),
+                 (.01, frame(chunk({}, "tool_calls", stats()))), (0, frame("[DONE]"))]
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, FakeSocket(parts) as server:
+            out = Path(tmp).resolve() / "turn"
+            out.mkdir()
+            _, _, receipt = exchange(server.url, value, out, 0, set(), deadline=2, on_first_token=calls.append)
+        self.assertEqual(len(calls), 1)
+        self.assertGreaterEqual(calls[0], receipt["send_monotonic_ns"])
+        self.assertLess(calls[0], receipt["semantic_event_monotonic_ns"][0])  # reasoning precedes the tool name
 
 
 if __name__ == "__main__":
