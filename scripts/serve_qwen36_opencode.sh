@@ -72,6 +72,11 @@
 #                           required.
 #   --kv-cache-budget       Shared physical high-water across the full-context
 #                           slots. MAX_SLOTS=8 is the np8-like setting.
+#   -v                      Info-level request/prefill/decode progress. hf2q
+#                           ignores RUST_LOG under -v, so LOG_FILTER=<filter>
+#                           replaces -v with RUST_LOG=<filter>, e.g.
+#                           "hf2q=info,mlx_native=info,hf2q::serve::api::engine_qwen35::progress=debug"
+#                           for the per-turn joint decode trace (ADR-063 S3).
 #
 # Family contract and prefix-cache stack:
 #   * The loader uses the GGUF-embedded Qwen ChatML template and validates its
@@ -179,10 +184,13 @@ case "$VISION_MODE" in
         ;;
 esac
 
-HF2Q_SERVE_ARGS=(
-    -v serve
-    --model "$MODEL"
-)
+if [[ -n "${LOG_FILTER:-}" ]]; then
+    export RUST_LOG="$LOG_FILTER"
+    HF2Q_SERVE_ARGS=(serve)
+else
+    HF2Q_SERVE_ARGS=(-v serve)
+fi
+HF2Q_SERVE_ARGS+=(--model "$MODEL")
 if (( ${#MMPROJ_ARGS[@]} > 0 )); then
     HF2Q_SERVE_ARGS+=("${MMPROJ_ARGS[@]}")
 fi

@@ -54,6 +54,11 @@
 #   -v                      Enables request/cache/prefill/decode progress at
 #                           info level. Direct `hf2q serve` remains quiet by
 #                           default; this foreground launcher is observable.
+#                           hf2q ignores RUST_LOG under -v, so
+#                           LOG_FILTER=<filter> replaces -v with
+#                           RUST_LOG=<filter>, e.g.
+#                           "hf2q=info,mlx_native=info,hf2q::serve::api::engine_deepseek4::progress=debug"
+#                           for the per-turn joint decode trace (ADR-063 S3).
 #
 # Unlike the Qwen launcher, this does not set HF2Q_KV_LCP_RESUME or configure
 # --kv-persist. DeepSeek-V4 owns a family-specific live cache and recovery
@@ -273,7 +278,13 @@ if (( CHECK_ONLY == 1 )); then
     exit 0
 fi
 
-exec "$HF2Q_BIN" -v serve \
+if [[ -n "${LOG_FILTER:-}" ]]; then
+    export RUST_LOG="$LOG_FILTER"
+    VERBOSITY=(serve)
+else
+    VERBOSITY=(-v serve)
+fi
+exec "$HF2Q_BIN" "${VERBOSITY[@]}" \
         --model "$MODEL" \
         --host "$HOST" \
         --port "$PORT" \

@@ -5,7 +5,8 @@
     "Derived from: Qwen3.8 runner: matched-baseline1512 supervisor/policy plus qwen_n4_live_smoke.py; launcher text-only, 48 GiB shared KV budget.",
     "Override any variable with HF2Q_Q5_<NAME>; null variables are required. See scripts/four_agent/README.md.",
     "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
-    "Text-only: QWEN38_VISION=off only omits --mmproj, and hf2q serve then auto-loads the sibling Qwen3.8-27B-vanilla-mmproj.gguf (observed in the 2026-10-30 calibration). artifact.text_only_locator serves a hard link of the same file from a private {OUT}/text-model/ directory, and readiness requires vision_projector == false."
+    "Text-only: QWEN38_VISION=off only omits --mmproj, and hf2q serve then auto-loads the sibling Qwen3.8-27B-vanilla-mmproj.gguf (observed in the 2026-10-30 calibration). artifact.text_only_locator serves a hard link of the same file from a private {OUT}/text-model/ directory, and readiness requires vision_projector == false.",
+    "LOG_FILTER (empty default: the launcher keeps -v) is the ADR-063 S3 trace arm: HF2Q_Q5_LOG_FILTER='hf2q=info,mlx_native=info,hf2q::serve::api::engine_qwen35::progress=debug' replaces -v with RUST_LOG=LOG_FILTER, adding the per-turn joint decode lines for cancel_smoke.py widths."
   ],
   "workload": {
     "id": "adr063-q5-qwen38-n4-coding-ctx262144",
@@ -23,7 +24,8 @@
     "TOOLCHAIN": null,
     "SANDBOX_PROOF": null,
     "SANDBOX_PROOF_SHA256": null,
-    "CLIENT_APPROVAL_TEMPLATE": null
+    "CLIENT_APPROVAL_TEMPLATE": null,
+    "LOG_FILTER": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -44,7 +46,8 @@
       "MAX_SLOTS": "4",
       "HOST": "127.0.0.1",
       "PORT": "{PORT}",
-      "HF2Q_BIN": "{HF2Q_BIN}"
+      "HF2Q_BIN": "{HF2Q_BIN}",
+      "LOG_FILTER": "{LOG_FILTER}"
     }
   },
   "readiness": {
