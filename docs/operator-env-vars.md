@@ -204,3 +204,28 @@ the previous anchor and serves the request unchanged. `0` also skips the
 slot-route load warmup, so the kill-switch arm is stock serving. Allocator/OS overhead and other CPU owners are
 outside this domain, so this is not a physical admission cap. Evidence:
 `docs/research/adr063-gemma-four-agent-reuse.md`.
+
+### Gemma joint warm prefill (default on)
+
+`HF2Q_GEMMA_JOINT_WARM_PREFILL` controls ADR-063 Stage 1 joint warm prefill
+on the Gemma 4 SlotAware worker. It is read once when the worker starts.
+- **Unset, `1`, `on` or `true` (default):** when every slot is idle, a
+  contiguous run of warm text requests in one admission quantum (tool-result
+  turns resuming a full-input checkpoint, or any request whose slot holds a
+  reusable prefix) is admitted without a yield between requests and
+  prefilled as one transaction. Projections, norms, FFN/MoE and the output
+  head run once over every suffix row; attention runs per slot with the
+  single-slot kernel. Each request's tokens, logprobs and cache bytes are
+  bitwise equal to the per-slot prefill. A lane joins only if its suffix is
+  longer than 32 tokens and the cohort stays within 4,096 rows; other
+  requests prefill per slot as before.
+- **`0`, `off` or `false`:** kill switch; every warm request prefills per
+  slot.
+- **Any other value:** logs a warning and keeps the default.
+
+It is also off when `HF2Q_CROSS_SLOT_ADMIT` is off, `HF2Q_PREFILL_SLOT_BATCHED=0`
+or `HF2Q_MM_ID_ROUTING_THRESHOLD` is set, because those change the per-slot
+route the cohort must equal. The worker logs `Gemma joint warm prefill worker
+decision` at start, and each cohort logs `Gemma4 installed prefills advanced in
+one aggregate-bounded transaction` with `transaction="joint warm"`. Evidence:
+`docs/research/adr063-gemma-four-agent-reuse.md`.
