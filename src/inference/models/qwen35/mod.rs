@@ -64,12 +64,18 @@ pub use fa_prefill_arena::FaPrefillArena;
 pub use fa_projections_arena::FaProjectionsArena;
 pub mod io_heads;
 pub(crate) mod joint_decode_core;
+#[cfg(test)]
+mod joint_decode_ffn_tests;
 pub(crate) mod joint_decode_routes;
+#[cfg(test)]
+pub(crate) mod joint_decode_test_support;
 pub(crate) use forward_gpu::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
 #[cfg(test)]
 mod real_artifact_joint_decode_tests;
 #[cfg(test)]
 mod real_artifact_joint_decode_invariance_tests;
+#[cfg(test)]
+mod real_artifact_joint_decode_q1_tests;
 pub mod kernels;
 pub mod kv_cache;
 pub mod model;

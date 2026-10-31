@@ -905,6 +905,39 @@ planned` lines should fall from about 500 ms to about the prefill time
 plus about 20 ms. Compare turn-0 completion times, `elapsed_seconds`, and
 `q1_decision_policy.py transcripts`; identical transcripts are expected.
 
+## Template fidelity fix (2026-10-30) and the peer comparison
+
+Up to this fix, hf2q rendered Gemma 4 tool-loop history differently from the
+official template and from the peer, in three ways:
+
+- `reasoning_content` echoed `thought\n` back for every empty thought block;
+- `assistant` was renamed to `model` before the template ran, which defeated
+  the template's same-turn continuation;
+- tool results were rendered as `response:unknown`.
+
+As a result, in `E/gemma-alloc-ab-v1`, hf2q's `prompt_tokens` drifted from
+the peer's from turn 1 on, by +9 tokens for each extra assistant turn (−2 for
+the tool name on turn 1, then +43 by turn 6). Because the prompts differed,
+the generations differed from turn 4 on: hf2q kept writing the empty thought
+block and the peer did not.
+
+The fix strips the label in the reasoning splitter, keeps original roles for
+every template except hf2q's fallback, and passes `tool_call_id` and `name`
+through to the template.
+
+A model-free replay checked this against the captured requests. Each request
+was rendered with the reviewed template, which is byte-identical to the
+vendored `src/serve/api/test_fixtures/gemma4-official-chat-template.jinja`,
+and counted with the reviewed tokenizer:
+
+- with the old message shaping, the counts match hf2q's reported
+  `prompt_tokens` on all 112 `g-*-N` turns;
+- with the fixed shaping, they match the peer's on all 112 `g-*-P` turns.
+
+Gemma Q3/Q4 peer comparisons and `rendered-inputs-reviewed` captures made
+before this fix measure different prompts after turn 0. Rerun or recapture
+them after the fix.
+
 ## Remaining gaps
 
 - Gates without a recorded result above remain unexecuted. Default

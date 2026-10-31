@@ -57,6 +57,7 @@ width). No `src/` occurrence of the three names remains.
 - `HF2Q_GEMMA_TILED_LIVE` (`development-only`) governs only installed long-prompt multi-sequence lanes and the stable cue batch; warm prefills follow `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
 - `HF2Q_QWEN_JOINT_DECODE` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Qwen joint decode switch. Unset, it is on for dense artifacts (Qwen3.8) and off for MoE artifacts (Qwen3.6); `0`/`off`/`false` restores serial per-slot decode, including MTP K3 and history speculation, and `1` opts MoE artifacts in.
 - `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the Qwen joint width, 2..8 with a default of 4; the padded `mul_mv_ext` mode caps at 4.
+- `HF2Q_QWEN_JOINT_FFN_SHARED` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the kill switch for the weight-shared dense FFN of the padded Qwen joint mode. Unset or `1`/`on`/`true`: gate and up run as separate width-4 products (weights read once per step) followed by `silu_mul`; `0`/`off`/`false` restores the serial builder's per-row fused gate/up kernel. Exact mode ignores it. Read once at worker start; invalid values warn and keep the default.
 - `HF2Q_QWEN_JOINT_Q1_PROMPTS`, `HF2Q_QWEN_JOINT_Q1_OUT` and `HF2Q_QWEN_JOINT_Q1_STEPS` (`development-only`) drive the ignored Q1 Class B trace test.
 - `HF2Q_QWEN36_GGUF` and `HF2Q_QWEN38_GGUF` (`development-only`) select the official artifacts for the ignored Qwen joint decode hardware gates.
 
@@ -365,6 +366,7 @@ this release:
 | `HF2Q_QWEN_GQA_Q2` | `documented-escape` | 2 |
 | `HF2Q_QWEN_JOINT_DECODE` | `documented-escape` | 1 |
 | `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` | `development-only` | 1 |
+| `HF2Q_QWEN_JOINT_FFN_SHARED` | `documented-escape` | 8 |
 | `HF2Q_QWEN_JOINT_Q1_OUT` | `development-only` | 1 |
 | `HF2Q_QWEN_JOINT_Q1_PROMPTS` | `development-only` | 1 |
 | `HF2Q_QWEN_JOINT_Q1_STEPS` | `development-only` | 1 |

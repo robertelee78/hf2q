@@ -1128,6 +1128,45 @@ pub fn build_dense_ffn_layer_gpu_q_into(
     weights: &DenseFfnWeightsGpuQ,
     add_residual: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
+    build_dense_ffn_layer_gpu_q_into_with_gate_up(
+        enc,
+        device,
+        registry,
+        x,
+        weights,
+        add_residual,
+        DenseGateUpDispatch::PreferFused,
+    )
+}
+
+/// How the dense quantized FFN issues its gate and up products.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DenseGateUpDispatch {
+    /// The serial graph's choice: the fused gate/up/SiLU kernel when the
+    /// codec has one and fusion is enabled. That kernel launches one
+    /// threadgroup row per input row, so it reads the gate and up weights
+    /// once per row.
+    PreferFused,
+    /// Separate gate and up products through the canonical GGML dispatcher,
+    /// then `silu_mul`. Weight reuse is whatever that dispatcher's route
+    /// gives for the type, width and routing policy. At width 4 under
+    /// `HF2Q_DECODE_MV_EXT=1` (the padded joint mode) every admitted type
+    /// reads each weight block once for all rows. At widths 2..=3 with
+    /// `mvN` off, K-quants take the per-row `Mv` kernel instead.
+    Separate,
+}
+
+/// [`build_dense_ffn_layer_gpu_q_into`] with an explicit gate/up dispatch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_dense_ffn_layer_gpu_q_into_with_gate_up(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DenseFfnWeightsGpuQ,
+    add_residual: Option<&MlxBuffer>,
+    gate_up: DenseGateUpDispatch,
+) -> Result<MlxBuffer> {
     // Dispatch policy (W-5b.15 simplification of W-5b.14):
     //
     // The pooled variant routes 4 internal scratches (gate, up, hidden,
@@ -1153,8 +1192,10 @@ pub fn build_dense_ffn_layer_gpu_q_into(
                 x,
                 weights,
                 add_residual,
+                gate_up,
             );
         } else {
+            // No fused path here, so this serves either gate/up dispatch.
             return build_dense_ffn_layer_gpu_q_into_device(
                 enc,
                 device,
@@ -1165,7 +1206,15 @@ pub fn build_dense_ffn_layer_gpu_q_into(
             );
         }
     }
-    build_dense_ffn_layer_gpu_q_into_pooled(enc, device, registry, x, weights, add_residual)
+    build_dense_ffn_layer_gpu_q_into_pooled(
+        enc,
+        device,
+        registry,
+        x,
+        weights,
+        add_residual,
+        gate_up,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1176,6 +1225,7 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     x: &MlxBuffer,
     weights: &DenseFfnWeightsGpuQ,
     add_residual: Option<&MlxBuffer>,
+    gate_up: DenseGateUpDispatch,
 ) -> Result<MlxBuffer> {
     let h = weights.hidden_size;
     let m = weights.intermediate_size;
@@ -1315,8 +1365,9 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         weights.ggml_type_gate_up,
         mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
     );
-    let fused_eligible =
-        (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q6_k) && dense_gate_up_fusion_enabled();
+    let fused_eligible = gate_up == DenseGateUpDispatch::PreferFused
+        && (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q6_k)
+        && dense_gate_up_fusion_enabled();
     if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
