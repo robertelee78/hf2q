@@ -119,7 +119,7 @@ fn emit_tool_block(
         .with_context(|| format!("parse DeepSeek-V4 DSML tool call block: body={body:?}"))?;
     for call in calls {
         let index = *next_index;
-        let id = format!("call_hf2q_{:016x}", next_call_id(index));
+        let id = crate::serve::api::tool_call_id::next_tool_call_id();
         send_visible(
             events,
             GenerationEvent::ToolCallDelta {
@@ -136,11 +136,6 @@ fn emit_tool_block(
     }
     body.clear();
     Ok(*next_index > 0)
-}
-
-fn next_call_id(index: usize) -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed) ^ (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 fn trigger_tool_grammar_on_raw_marker(

@@ -642,6 +642,14 @@ pub struct MlxModelWeights {
     /// persists across calls. Hybrid-KV regime only (the production default);
     /// other regimes admit serially. Gated behind `HF2Q_PREFILL_CROSS_SLOT=1`.
     pub multi_seq_prefill: Option<MultiSeqPrefillState>,
+
+    /// ADR-063 Stage 2 — kernel of warm live-resume attention: every
+    /// single-slot resume and every [`GemmaLiveAttention::PerSlotExact`]
+    /// cohort lane (installed lanes follow [`GemmaLiveAttention::Tiled`]).
+    /// Resolved once at load from `HF2Q_GEMMA_WARM_TILED_ATTENTION` (default
+    /// [`GemmaLiveKernel::TiledF16`]; `0` restores
+    /// [`GemmaLiveKernel::VecHybrid`]).
+    pub warm_live_kernel: GemmaLiveKernel,
 }
 
 /// ADR-040 iter-G(a) — per-call descriptor for cross-slot batched prefill.
@@ -690,21 +698,32 @@ pub struct MultiSeqPrefillState {
 
 /// Attention route for resumed multi-sequence Gemma prefill. Row-parallel work
 /// (projections, norms, FFN/MoE, per-row head) runs once over every suffix row
-/// in both routes; only the per-sequence attention against each slot's own KV
-/// differs.
+/// in both routes; per-sequence attention against each slot's own KV runs
+/// through the one shared live-attention function
+/// (`serve::gemma_live_attention`). Only the kernel policy differs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GemmaLiveAttention {
     /// Installed long-prompt lanes and the stable cue batch: tiled F16 flash
-    /// attention over a dequantized V range with 1024-query sliding chunks, or
-    /// the vec-hybrid kernel when `HF2Q_GEMMA_TILED_LIVE=0`. Not bitwise equal
-    /// to a per-slot resume.
+    /// attention for every suffix length, or the vec-hybrid kernel when
+    /// `HF2Q_GEMMA_TILED_LIVE=0`. Not bitwise equal to a per-slot resume.
     Tiled,
-    /// Joint warm tool-turn cohort: the single-slot live-resume attention
-    /// exactly (`flash_attn_vec_hybrid_batched`, 256-query chunks split at
-    /// 512/1024, per-sequence ring staging `cap - 1 + min(rows, 256)`, slot
-    /// view addressed as slot 0, FWHT sign undo), so every lane is bitwise
-    /// equal to its per-slot resume.
+    /// Joint warm tool-turn cohort: exactly the single-slot live-resume
+    /// route ([`MlxModelWeights::warm_live_kernel`], with suffixes under 32
+    /// rows on vec-hybrid), the slot view addressed as slot 0, so every lane
+    /// is bitwise equal to its per-slot resume.
     PerSlotExact,
+}
+
+/// Kernel of the per-sequence live (warm-resume) attention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GemmaLiveKernel {
+    /// Tiled F16 flash attention over compacted K and dequantized V
+    /// (ADR-063 Stage 2): d256 + SWA mask + `blk` for sliding layers,
+    /// `flash_attn_prefill_f16_d512_resume` for global layers.
+    TiledF16,
+    /// `flash_attn_vec_hybrid_batched`: one decode-style threadgroup per
+    /// (query, head) over F16 K and TQ-HB V.
+    VecHybrid,
 }
 
 /// Per-request head output from one shared multi-sequence Gemma prefill.
@@ -1424,6 +1443,7 @@ impl MlxModelWeights {
             // installed by default. The forward_prefill_batched_multi_seq
             // wrapper sets it per-call; None preserves byte-identical single-seq.
             multi_seq_prefill: None,
+            warm_live_kernel: crate::serve::gemma_live_attention::warm_live_kernel_from_env(),
         });
 
         // Pre-initialize constant param buffers so we never write them
