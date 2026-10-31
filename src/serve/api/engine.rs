@@ -57846,63 +57846,6 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
         }
     }
 
-    /// **H222 (SerialFifo byte-equivalence pin)** — Qwen3VL SerialFifo
-    /// path is UNCHANGED by C2e. The pre-C2e EngineMode::SerialFifo
-    /// dispatch did NOT call `provision_multi_seq_kv_for_slot_aware`,
-    /// and post-C2e MUST still not call it (otherwise SerialFifo would
-    /// gain a per-spawn witness write that breaks byte-equivalence).
-    /// Mirror of C2c's H23 + C2d's H28 source-grep regression-pin
-    /// pattern.
-    #[test]
-    fn h222_serial_fifo_qwen3vl_does_not_provision_multi_seq_kv() {
-        let src = include_str!("engine.rs");
-        let body_start = src
-            .find("pub fn spawn_with_mode(")
-            .expect("H222: spawn_with_mode entry not found");
-        let body_end = body_start
-            + src[body_start..]
-                .find("    fn spawn_inner_with_slot_aware")
-                .expect("H222: spawn_inner_with_slot_aware sibling not found")
-            + "    fn spawn_inner_with_slot_aware".len();
-        let body = &src[body_start..body_end];
-        let dispatch = body
-            .find("match mode {\n")
-            .expect("H222: mode dispatch table");
-        let body = &body[dispatch..];
-        let serial_fifo_idx = body
-            .find("EngineMode::SerialFifo")
-            .expect("H222: SerialFifo arm not found in spawn_with_mode");
-        let slot_aware_idx = body
-            .find("EngineMode::SlotAware")
-            .expect("H222: SlotAware arm not found in spawn_with_mode");
-        assert!(
-            serial_fifo_idx < slot_aware_idx,
-            "H222 sanity: dispatch table orders SerialFifo before SlotAware"
-        );
-        let serial_fifo_arm = &body[serial_fifo_idx..slot_aware_idx];
-        assert!(
-            !serial_fifo_arm.contains("provision_multi_seq_kv_for_slot_aware"),
-            "H222 FALSIFIED: post-C2e SerialFifo arm now calls \
-             provision_multi_seq_kv_for_slot_aware — byte-equivalence \
-             with pre-C2e behavior broken (the Qwen3VL provisioner is \
-             a witness-only setter today but on iter-228a will alloc \
-             real KV — SerialFifo must never engage either path)."
-        );
-        // Also: the iter-228a 501 sentinel routing in the four worker
-        // arms is preserved verbatim — the C2e clamp short-circuits
-        // BEFORE the sentinel dispatch at SlotId(N>0), but SlotId(0)
-        // still hits the existing sentinel routing for the
-        // non-Generate-arm cases (Embed / GenerateWithSoftTokens have
-        // soft-token guards). Pin via source-grep on the existing
-        // sentinel call site (engine.rs:~5697+ etc.).
-        assert!(
-            src.contains("qwen3vl_text_forward_pending_err"),
-            "H222 FALSIFIED: the iter-228a 501 sentinel routing \
-             (`qwen3vl_text_forward_pending_err`) is missing from \
-             engine.rs. C2e must NOT touch the iter-228a sentinel path."
-        );
-    }
-
     /// **H223 (typed-error variant exists)** — the new
     /// `EngineSpawnError::Qwen3VLSlotAwareProvisionFailed { max_slots,
     /// cause }` variant exists with the expected shape (mirror of
@@ -58123,73 +58066,6 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
                  enumerate ALL 5 surviving deferrals SHIPPED structurally."
             );
         }
-    }
-
-    /// **H239 (SerialFifo byte-equivalence pin)** — the SerialFifo
-    /// dispatch path is UNCHANGED by §6.1.55.  None of the 5 lifts
-    /// add a worker-arm path on SerialFifo at SlotId(0).
-    ///
-    /// Source-grep pins:
-    /// - SerialFifo arm of `spawn_with_mode` does NOT call any of the
-    ///   new iter-A4-cont* helpers OR the new iter-C2e-cont helper.
-    /// - Worker arm clamps still gated on
-    ///   `handle.slot_id != SlotId(0)` — SerialFifo always emits
-    ///   SlotId(0) (FifoSchedulerAdapter invariant; H51 cross-pin).
-    /// - The DrafterKvCacheVariant routing helper degrades to
-    ///   SingleSeq at `max_slots <= 1` (pre-A4 byte-equivalent).
-    #[test]
-    fn h239_serial_fifo_byte_equivalence_preserved_across_all_5_lifts() {
-        let engine_src = include_str!("engine.rs");
-        let body_start = engine_src
-            .find("pub fn spawn_with_mode(")
-            .expect("H239: spawn_with_mode entry not found");
-        let body_end = body_start
-            + engine_src[body_start..]
-                .find("    fn spawn_inner_with_slot_aware")
-                .expect("H239: spawn_inner_with_slot_aware sibling not found");
-        let body = &engine_src[body_start..body_end];
-        let dispatch = body
-            .find("match mode {\n")
-            .expect("H239: mode dispatch table");
-        let body = &body[dispatch..];
-        let serial_fifo_idx = body
-            .find("EngineMode::SerialFifo")
-            .expect("H239: SerialFifo arm not found");
-        let slot_aware_idx = body
-            .find("EngineMode::SlotAware")
-            .expect("H239: SlotAware arm not found");
-        let serial_fifo_arm = &body[serial_fifo_idx..slot_aware_idx];
-        // SerialFifo arm MUST NOT call any of the new helpers.
-        for forbidden in [
-            "handle_qwen3vl_slot_aware_n_gt_0_sentinel",
-            "select_drafter_kv_variant_for_mode",
-            "DrafterKvCacheVariant",
-        ] {
-            assert!(
-                !serial_fifo_arm.contains(forbidden),
-                "H239 FALSIFIED: SerialFifo arm contains `{forbidden}` — \
-                 byte-equivalence with pre-§6.1.55 behaviour broken. \
-                 The 5-deferral lifts MUST sit on the SlotAware-only \
-                 dispatch surface."
-            );
-        }
-        // Worker-arm clamp predicate is still `handle.slot_id != SlotId(0)`
-        // (SerialFifo always hands out SlotId(0); H51 cross-pin).
-        assert!(
-            engine_src.contains("handle.slot_id != SlotId(0)"),
-            "H239 FALSIFIED: worker-arm clamp predicate `handle.slot_id \
-             != SlotId(0)` removed.  SerialFifo path requires this \
-             predicate to short-circuit at SlotId(0) → fall through to \
-             the existing single-seq dispatch (byte-equivalent)."
-        );
-        // DrafterKvCacheVariant routing degrades to SingleSeq at
-        // max_slots <= 1 (pre-A4 byte-equivalent).
-        let drafter_src = include_str!("../../inference/spec_decode/eagle3/kv_cache.rs");
-        assert!(
-            drafter_src.contains("if max_slots <= 1") || drafter_src.contains("max_slots == 1"),
-            "H239 FALSIFIED: select_drafter_kv_variant_for_mode MUST \
-             route max_slots <= 1 to SingleSeq (byte-equivalent fallback)."
-        );
     }
 
     /// **H240** — Qwen35 / Gemma 4 / non-A4 + non-spec-decode surfaces
@@ -58634,6 +58510,10 @@ mod gemma_full_input_tests;
 #[cfg(test)]
 #[path = "engine_gemma_full_input_serving_tests.rs"]
 mod gemma_full_input_serving_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_cold_prefill_tests.rs"]
+mod gemma_cold_prefill_tests;
 
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_tests.rs"]

@@ -235,11 +235,12 @@ in 0.34 s, about 20 ms per step. The turn-0 cost sits in each slot's
 
 - **458-token boundary prefill:** 188 ms, and 264–392 ms for the first slot
   only.
-- **The remaining ~0.36 s per slot:** the stable anchor snapshot (about
-  19 ms, from the full-input run's per-capture delta) plus the 7-token
-  generation cue. The cue is shorter than the 32-row batched minimum, so it
-  is replayed as 7 single-slot decode forwards at about 48 ms each. [INFERENCE]
-  This last split comes from the timings, not a profile.
+- **The remaining ~0.3 s per slot:** first misattributed to the 7-token
+  cue. A stack sample (`/tmp/adr063-gemma-turn0-sample.txt`) and JSON-log
+  timelines (`gemma-turn0-diag-v1`) show where it actually goes: the
+  slot-mounted batched prefill builds SerialFifo-only outputs that nothing
+  reads (see "Cold admission allocation" below). A joint cue replay measured
+  158 ms for all 28 cue tokens, against about 0.3 s for the per-slot cue.
 
 Fixes:
 - **First-use prefill penalty (cheap exact warmup, implemented):**
@@ -252,10 +253,92 @@ Fixes:
   A/B TTFT. `=0` skips this warmup, so the kill-switch arm is stock serving.
   A non-fatal warmup failure logs and continues; only a worker-fatal GPU
   fault fails the load.
-- **Cue replay (≈1.35 s per four-slot turn 0):** not a warmup issue. The lever
-  is to replay the cue tokens of all admitted slots through the joint B-row
-  decode step, which the comments say is byte-identical to single-row decode
-  `[INFERENCE]`, instead of 28 serial single-slot forwards. Not implemented.
+- **Cue replay:** prototyped on `perf/gemma-cold-turn` (joint batched-body
+  cue replay, bitwise gates pass). Measured gain: turn 0 went from 2.78 s to
+  2.65 s, and makespan was unchanged (16.55 s vs 16.5 s).
+- **Cold admission allocation (implemented, below).**
+
+### Cold admission allocation
+
+**Sample evidence.** Each cold four-agent admission takes about 500 ms
+(`Gemma4 slot admission planned` to the next one). Its 458-token prefill
+takes 202–236 ms of that. In the worker stack under
+`prefill_seed → forward_prefill_with_soft_tokens_slot_aware_impl →
+forward_prefill_batched_inner` (303 samples):
+
+| Where | Samples |
+|---|---|
+| Waiting on the GPU (`commit_and_wait`) | 108 |
+| `MlxDevice::alloc_buffer → __bzero` at the four LCP-snapshot allocation sites | 68 / 67 / 34 / 11 |
+| Snapshot copies (`memmove`) | 15 |
+
+`alloc_buffer` zero-fills every new buffer. The 4 : 4 : 2 : 1 ratio matches
+the snapshot legs: dense K, dense V (F32), hybrid K (F16), hybrid V codes
+(U8).
+
+**Cause.** `forward_prefill_batched_inner` gated its end-of-prefill LCP
+snapshots on `!live_prefix_resume` only. The non-batched sibling also
+requires `!slot_aware`. So every cold slot-mounted prefill (the
+SlotAware cold route) did two things nothing reads:
+
+- **LCP snapshots.** Sized `max(sw, tile(seq_len + max_tokens))` rows for
+  every layer, sliding layers included. Turn 0 has `seq_len` 458 and
+  `max_tokens` 8192, so that is 8,672 rows per layer:
+
+  | Leg | Bytes |
+  |---|---|
+  | Dense K + V (F32) | 3,907,256,320 |
+  | Hybrid K (F16) + V codes (U8) + V norms (F32) | 1,472,505,600 |
+  | **Total, zero-filled per admission** | **5,379,761,920** |
+
+  The 458 valid rows were then copied in (284 MB). The result was parked on
+  `dense_kvs_snapshot_for_lcp` / `hybrid_kv_snapshot_for_lcp`, which only
+  the SerialFifo engine paths consume. So the worker also held about 5.4 GB
+  per worker, about 10.8 GB at the moment the next admission allocated.
+  These snapshots require `HF2Q_KV_LCP_RESUME_CAPACITY` to admit them; the
+  four-agent launcher sets it to 8g.
+- **Dense K/V decode handoff.** 774,635,520 bytes, plus the dense flash
+  tmp and 30 per-layer copy dispatches. The slot-mounted caller discards it
+  immediately, because it restores its own `dense_kvs`. No prefill kernel
+  reads it: its comment says so, and the hybrid writes carry their own
+  `barrier_between` on the same sources. The cold multi-sequence prefill
+  (`forward_prefill_batched_multi_seq`) had the same discarded handoff and
+  snapshot gate.
+
+**Fix.** `gemma_batched_prefill_builds_dense_handoff` limits the handoff,
+its flash tmp, its copy and the snapshots to the SerialFifo cold route. A
+live resume, a slot mount or a multi-sequence descriptor builds none of
+them. The copy window (`n_copy`) and the global-capacity check now use the
+planned capacity, which equals what the handoff allocated, so every hybrid
+and HB write is unchanged.
+
+This is a removal, not a reuse. The buffers had no consumer, so there is no
+persistent scratch to keep and nothing that could carry stale data between
+slots or conversations. Kernels that need zero-filled scratch are untouched:
+the per-prefill activations, masks and the live flash tmp still come from
+`alloc_buffer`.
+
+**Expected saving `[INFERENCE]`.** The snapshot sites hold 65% of the
+sampled admission time (180 bzero + 15 copy + 2 allocation samples of
+303). That is consistent with the ~0.28 s per admission spent outside the
+prefill. Four serial cold admissions therefore save about 1.1 s: turn 0
+goes from 2.65 s to about 1.55 s against the peer's 1.0 s, and the
+four-agent makespan from 16.5 s to about 15.4 s against 13.9 s. The
+handoff removal adds an unmeasured few tens of ms. The 775 MB of pages are
+recycled between admissions and do not appear in the sample. About 5.4 GB
+of resident memory per Gemma SlotAware worker goes away.
+
+**Other paths checked.**
+- **Warm single-slot and joint warm prefills** (`live_prefix_resume`) never
+  built the handoff or snapshots. Their per-call allocations are the
+  suffix-sized activations and the live flash tmp.
+- **Decode** still allocates its batched scratch per step
+  (`BatchedDecodeBuffers::new`, about 25 small `[N, …]` buffers) and the
+  head's logits buffer (`encode_lm_head_into`, `N × 262,144 × 4` bytes).
+  In the sample that is 8 of 205 decode samples (about 4%, ~0.8 ms per
+  20 ms step), plus residency-set churn on release. A persistent per-width
+  decode scratch is a possible successor for the per-step gap, but it needs
+  its own audit of which of those buffers kernels read before writing.
 
 ## Root commands
 
@@ -436,6 +519,62 @@ Record `q1_decision_policy.py transcripts` A vs B. Stage 1 is bitwise per
 request, so identical transcripts are expected; investigate any divergence
 (it can also come from nondeterministic tool results on the client side).
 
+### Cold admission allocation gates
+
+Model-free tests and the neighbours whose prefill paths changed:
+
+```sh
+cargo test --locked --bin hf2q gemma_cold_prefill_handoff_
+cargo test --locked --bin hf2q route_viability_tests
+cargo test --locked --bin hf2q gemma_cold_batch_
+cargo test --locked --bin hf2q gemma_joint_warm_
+cargo test --locked --bin hf2q gemma_full_input_
+cargo test --locked --bin hf2q gemma4_bounded_prefill_tests
+```
+
+- `gemma_cold_prefill_handoff_only_for_serial_fifo_cold_prefill`: which
+  routes build the handoff.
+- `gemma_cold_prefill_handoff_four_agent_turn_zero_sizes`: the eliminated
+  bytes for the turn-0 geometry.
+
+Real-artifact gate, one process, no other runtime loaded. Rerun the
+existing cold-batch, joint-warm and full-input real-artifact gates too: the
+multi-sequence cold prefill and the stable/full-input admissions share the
+changed function.
+
+```sh
+HF2Q_GEMMA4_GGUF="$GGUF" HF2Q_KV_LCP_RESUME_CAPACITY=8g \
+  cargo test --locked --release --bin hf2q \
+  serve::api::engine::gemma_cold_prefill_tests::gemma_cold_prefill_handoff_skip_matches_legacy_bitwise \
+  -- --exact --ignored --nocapture --test-threads=1
+```
+
+The gate runs two arms, each a fresh model load.
+- **Schedule:** seven cold admissions at `max_tokens` 8192 over
+  conversations of 458, 1,300 (ring wrap) and 700 tokens. Slots are reused
+  by other conversations.
+- **Arms:** production against the legacy route (`FORCE_LEGACY_DENSE_HANDOFF`,
+  test-only).
+- **Equal per admission:** first token, logits `to_bits`, every layer's K,
+  TQ-HB V codes and V scales over the valid rows, every sliding ring row
+  (what the stable-boundary checkpoint copies), checkpoint size, and
+  cursors.
+- **Lean arm only:** every admission of a conversation must equal its
+  first, whatever slot and predecessor it got, and no LCP snapshot may
+  remain on the model.
+- **Legacy arm only:** it must have built its snapshots.
+- **Markers:** `GEMMA_COLD_PREFILL_HANDOFF_BITWISE_COMPLETE`, and
+  `GEMMA_COLD_PREFILL_HANDOFF_TIMING` with per-admission prefill ms per arm
+  (diagnostic, not a gate).
+
+Hardware A/B: there is no kill switch, because the change removes dead
+work. Compare against the parent build (`d3bf681b`) on the Q5 `gemma4`
+case, ABAB, at least 3 runs per arm, with the peer interleaved. Gate on
+`server.stderr`: the gap between consecutive turn-0 `Gemma4 slot admission
+planned` lines should fall from about 500 ms to about the prefill time
+plus about 20 ms. Compare turn-0 completion times, `elapsed_seconds`, and
+`q1_decision_policy.py transcripts`; identical transcripts are expected.
+
 ## Template fidelity fix (2026-10-30) and the peer comparison
 
 Up to this fix, hf2q rendered Gemma 4 tool-loop history differently from the
@@ -475,8 +614,10 @@ them after the fix.
   promotion depends on all of them passing on hardware.
 - Joint warm prefill Stage 1 is unexecuted: the bitwise gates above decide
   the default. Stage 2 (tiled F16 warm attention, Q1 Class B) is design only.
-- Turn-0 cue replay (about 1.35 s) and the per-step decode gap (about 20 vs
-  18 ms) are not addressed.
+- Turn 0: the cold admission allocation fix is unexecuted on hardware.
+  After it, the remaining turn-0 cost is four serial cold boundary
+  prefills plus the per-slot cue. The per-step decode gap (about 20 vs
+  18 ms) is not addressed.
 - Requests are still tagged when a default-mode worker stays inactive (the
   geometry does not fit). The worker ignores those tags in every path, so
   behaviour equals `=0`; the handler cannot see the worker's geometry decision.
