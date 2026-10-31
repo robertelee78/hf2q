@@ -956,6 +956,29 @@ Gemma Q3/Q4 peer comparisons and `rendered-inputs-reviewed` captures made
 before this fix measure different prompts after turn 0. Rerun or recapture
 them after the fix.
 
+## Joint warm prefill after Stage 2: G-C1 (2026-10-31)
+
+The S3 review asked for a ≥ 6 + 6 A/B before calling joint warm prefill a win
+(G-C1). It ran on main f3e37690, which has Stage 2 and the cold-prefill fixes,
+with one binary and one case (`scripts/four_agent/q5_cases/gemma4.json`). Arm A
+set `HF2Q_GEMMA_JOINT_WARM_PREFILL=0`; arm B used the default (on). The order was
+ABBA × 3, i.e. 6 + 6 runs (`$E/gemma-gc1-ab-v2`: `run.sh`, `analysis.json`).
+
+- All 12 runs `CalibrationPass`. Every A run logged
+  `requested=false active=false` and 0 joint transactions. Every B run logged
+  `active=true` and 2–5 `transaction="joint warm" requests=4`.
+- Own-output four-task makespan on/off: **0.9997** (95% CI 0.9965–1.0029;
+  per block 0.9994, 1.0011, 0.9986). Client elapsed: 1.000 (CI 0.980–1.020),
+  medians 13.93 s (on) and 13.63 s (off).
+
+**Disposition: neutral, not a win.** When it landed, joint warm prefill took
+makespan from 21.1 to 16.0 s (`$E/gemma-joint-ab-v1`). Since then the
+cold-admission allocation fix and Stage 2 tiled F16 warm attention have made
+per-slot warm prefill fast enough that batching the suffixes no longer changes
+makespan. The route is bitwise exact against per-slot prefill (Stage 1 gates,
+G-C3 fault test #491), so keeping it on the default path costs nothing measurable;
+removing it is a separate simplification decision.
+
 ## Remaining gaps
 
 - Gates without a recorded result above remain unexecuted. Default
@@ -965,24 +988,20 @@ them after the fix.
   B): bitwise, determinism, Category 1, A/B and the quality campaign pass.
   The envelope exceeds the pre-run 1.5 expectation and is dispositioned as
   Class B above. The follow-ups listed there remain open.
-- The cold prefill setup builds its sliding and global masks
-  (`build_sdpa_mask_bf16` / `build_block_diagonal_sdpa_mask_bf16`) without
-  declaring their writes. The F16 cast and the `blk` classifiers that read
-  them therefore get no tracked barrier, the same hazard fixed for the live
-  route. It is unchanged here (out of scope). In practice the classifiers
-  run several dispatches later, and the cold gates pass, but nothing orders
-  them `[INFERENCE]`.
-- Turn 0: the cold admission allocation fix is unexecuted on hardware.
-  After it, the remaining turn-0 cost is four serial cold boundary
-  prefills plus the per-slot cue. The per-step decode gap (about 20 vs
-  18 ms) is not addressed.
+- Cold prefill mask fills are now declared to the barrier tracker
+  (`encode_tracked_mask`, PR #486). See "Mask fill ordering" below.
+- Turn 0: the cold admission allocation fix ran on hardware (PR #476,
+  `$E/gemma-alloc-ab-v1`: makespan 16.0 → 15.2 s). The remaining turn-0 cost is
+  four serial cold boundary prefills plus the per-slot cue. The per-step decode
+  gap (about 20 vs 18 ms) is not addressed.
 - Requests are still tagged when a default-mode worker stays inactive (the
   geometry does not fit). The worker ignores those tags in every path, so
   behaviour equals `=0`; the handler cannot see the worker's geometry decision.
 - The per-slot anchor generation bound (two) comes from reading the code. The
   degrade branches are driven only through `capture_or_skip`, not by a
   request-level fault injection; the per-worker quota is the enforcing
-  backstop.
+  backstop. (The joint-forward retry path does have a request-level fault
+  gate: `gemma_joint_warm_forward_fault_retries_each_lane_per_slot`, PR #491.)
 - `handlers_gemma_matched_tokens_tests.rs` still classifies an empty env as
   the historical study's OFF arm; that study is source-hash bound and
   unaffected by the new default.
@@ -1007,8 +1026,8 @@ them after the fix.
   (`E/gemma-cold-mask-gates-v1`) the capture tests
   (`cargo test --locked --bin hf2q gemma_cold_masks`), the cold-prefill
   handoff bitwise gate and the cold-batch, full-input and bounded suites
-  passed. The multi-sequence cold determinism/isolation gate could not run:
-  see the next entry.
+  passed. The multi-sequence cold determinism/isolation gate ran after the
+  capacity fix in the next entry.
 - Multi-sequence cold capacity check: since `b9514c99` the batched prefill
   plans full-layer capacity from the longest sequence (`max_i end_i +
   max_tokens`), but the global-layer bound still compared the concatenated
@@ -1024,12 +1043,11 @@ them after the fix.
   each full-layer slot capacity (the copy kernels index `pos % capacity`,
   so an overflow would wrap rather than fault). Production four-agent turn
   0 (4 × 458 rows, `max_tokens` 8192) never hit it; a cold batch of long
-  prompts with small `max_tokens` would have `[INFERENCE]`. Unexecuted:
-  `cargo test --locked --bin hf2q cold_prefill_handoff_tests` and
-  `HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GGUF" cargo test
-  --locked --release --bin hf2q iter_g_a_bf16_determinism_isolation_gate --
-  --nocapture --test-threads=1` (20 bitwise repeats plus per-sequence
-  no-leakage), which also exercises the mask-fill fence on the
+  prompts with small `max_tokens` would have `[INFERENCE]`. Passed on the
+  pre-merge head 5bd8d211 (`$E/gemma-cold-mask-gates-v2`) and again on merged
+  main f3e37690 (`$E/gemma-merged-gates-f3e37690…`):
+  `iter_g_a_bf16_determinism_isolation_gate` (20 bitwise repeats plus
+  per-sequence no-leakage), which also exercises the mask-fill fence on the
   block-diagonal path.
 - Multi-sequence cold ring writes: a cold cohort lane may be up to 4,096
   rows (`gemma4_cross_batch_eligible`, `engine.rs` ~6309; the cohort total
@@ -1040,11 +1058,9 @@ them after the fix.
   apart raced for the same ring row and decode could continue from a ring
   holding older positions. `gemma_multi_seq_kv_write` now applies the
   single-sequence rule per lane (rings take the last `capacity` rows; full
-  layers take every row after the graft and must fit). Unexecuted:
-  `cargo test --locked --bin hf2q gemma_cold_multi_seq_` (plan tests and a
-  model-free copy-kernel test) and the ignored real-artifact gate
-  `HF2Q_GEMMA4_GGUF="$GGUF" cargo test --locked --release --bin hf2q
-  serve::api::engine::gemma_cold_prefill_tests::gemma_cold_multi_seq_long_lane_ring_deterministic
-  -- --exact --ignored --nocapture --test-threads=1` (lanes 2,100 / 1,300 /
-  458 rows, ten bitwise repeats, untouched neighbour slot, layer-0 ring
-  K / V codes equal to per-slot cold prefill).
+  layers take every row after the graft and must fit). Passed on 5bd8d211 and
+  on merged main f3e37690: the ignored real-artifact gate
+  `gemma_cold_multi_seq_long_lane_ring_deterministic` (lanes 2,100 / 1,300 /
+  458 rows, ten bitwise repeats, untouched neighbour slot, layer-0 ring K / V
+  codes equal to per-slot cold prefill). On f3e37690 the cold-handoff bitwise
+  gate, Category 1 ×4 and the Stage 2 joint/tiled gates also pass.
