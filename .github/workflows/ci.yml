@@ -7,20 +7,35 @@ name: CI
 # perf gate is wired in a separate workflow (release-check.yml) that
 # needs a self-hosted runner with the Gemma-4 26B DWQ GGUF.
 #
-# Lint strictness policy:
-#   * cargo check + build --release + hosted-safe tests — BLOCKING.
-#     GitHub's hosted macOS VM compiles Metal, but does not expose a usable
-#     residency set. Real Metal tests require a self-hosted Apple Silicon gate.
-#   * cargo clippy — INFORMATIONAL. The legacy tree has a broad lint backlog;
-#     check/build/test remain the blocking correctness gates.
-#   * cargo fmt --check — INFORMATIONAL (continue-on-error). The
-#     baseline carries ~700 rustfmt diffs from earlier style drift;
-#     running `cargo fmt --all` against the whole tree is a separate
-#     policy decision (touches wide swaths of legacy code). Kept in
-#     the log so new drift is visible.
-#   * activate() warning-matrix smoke — BLOCKING; confirms the
-#     HF2Q_UNSAFE_EXPERIMENTS ack gate (docs/shipping-contract.md)
-#     still refuses/activates/warns correctly.
+# Job layout (independent runners in parallel; CONTRIBUTING.md
+# "Continuous integration" has the rationale):
+#   * release   — BLOCKING. mlx-native environment guard, package-list
+#                 contract, cargo build --release, the exact-binary
+#                 frictionless preflight, cargo audit (prebuilt
+#                 cargo-audit), and the activate() warning-matrix smoke,
+#                 which confirms the HF2Q_UNSAFE_EXPERIMENTS ack gate
+#                 (docs/shipping-contract.md) still refuses/activates/warns.
+#   * tests     — BLOCKING. Hosted-safe debug cargo tests and the GCD cargo
+#                 contracts. GitHub's hosted macOS VM compiles Metal but does
+#                 not expose a usable residency set; real Metal tests require
+#                 a self-hosted Apple Silicon gate.
+#   * contracts — BLOCKING. cargo check --all-targets (the only compile of the
+#                 integration-test targets the tests job does not run),
+#                 shell-script syntax and contract scripts, and the GCD Python
+#                 suites. None of these needs a test or release build.
+#   * lint      — INFORMATIONAL (continue-on-error). cargo fmt --check (the
+#                 baseline carries ~700 rustfmt diffs from earlier style
+#                 drift; reformatting the tree is a separate policy decision)
+#                 and cargo clippy (legacy lint backlog). The aggregate does
+#                 not need it, so it never blocks or delays the gate.
+#   * build-and-test — aggregate that keeps the pre-split check name
+#                 `build + test (macos-latest)` for required checks; it fails
+#                 unless release, tests and contracts all succeeded.
+#
+# Caching: Swatinem/rust-cache keeps the cargo registry and dependency
+# artifacts (never the hf2q crate itself) under a per-job key that includes
+# the pinned toolchain. Only pushes to main save; pull requests restore
+# main's entry read-only, so the cache stays fresh and never accumulates.
 
 on:
   push:
@@ -51,12 +66,11 @@ jobs:
       - name: peer_ref_ratchet
         run: sh scripts/peer_ref_ratchet.sh
 
-  build-and-test:
-    name: build + test (macos-latest)
+  release:
+    name: release (macos-latest)
     runs-on: macos-latest
-    # This covers a cold locked build, audit, serialized hosted-safe contracts,
-    # and post-job cache cleanup. It is a fail-closed ceiling, not the expected
-    # duration; build-script invalidation must leave enough margin for cleanup.
+    # Fail-closed ceiling for a cold locked release build (no dependency
+    # cache), not the expected duration.
     timeout-minutes: 60
 
     steps:
@@ -69,29 +83,15 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.89.0"
-          components: rustfmt, clippy
 
-      - name: Cache cargo registry + target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Cache cargo registry + release dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          shared-key: release
+          key: rust-1.89.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: false
 
-      # --- fmt: informational (baseline drift, see header) ---
-      - name: cargo fmt --check (informational)
-        continue-on-error: true
-        run: cargo fmt --all -- --check
-
-      # --- clippy: informational until the legacy lint backlog is retired ---
-      - name: cargo clippy (informational)
-        continue-on-error: true
-        run: cargo clippy --locked --all-targets --all-features
-
-      # --- Blocking compile + test ---
       - name: Require canonical mlx-native build environment
         shell: bash
         run: |
@@ -151,16 +151,13 @@ jobs:
             grep -Fqx -- "$required" <<<"$package_list"
           done
 
-      - name: cargo check
-        run: cargo check --locked --all-targets --all-features
-
       - name: cargo build --release
         run: cargo build --release --locked
 
-      # Run the packed/public binary's complete PTY contract before audit and
-      # the long hosted-safe suite. Conflicting outer color preferences prove
-      # that the smoke owns its terminal environment rather than inheriting
-      # whichever branch a developer shell happened to select.
+      # Run the packed/public binary's complete PTY contract right after the
+      # release build. Conflicting outer color preferences prove that the
+      # smoke owns its terminal environment rather than inheriting whichever
+      # branch a developer shell happened to select.
       - name: Frictionless exact-binary preflight
         shell: bash
         env:
@@ -173,10 +170,87 @@ jobs:
             "$GITHUB_WORKSPACE/target/release/hf2q" \
             "$RUNNER_TEMP/hf2q-pr-frictionless"
 
+      # Prebuilt, checksum-verified release binary of the same pinned
+      # version; fallback: none fails loudly instead of compiling from source.
+      - name: Install cargo-audit 0.22.2 (prebuilt)
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
       - name: cargo audit
+        run: cargo audit
+
+      # --- Blocking: activate() matrix matches the shipping contract ---
+      - name: activate() matrix smoke (clean / REFUSED / UNSAFE)
+        shell: bash
         run: |
-          cargo install cargo-audit --locked --version 0.22.2 --no-default-features
-          cargo audit
+          set -euo pipefail
+
+          echo "--- clean env should produce no investigation output ---"
+          ./target/release/hf2q --help > /dev/null 2>/tmp/stderr_clean.log
+          if [[ -s /tmp/stderr_clean.log ]]; then
+            echo "FAIL: clean-env run produced stderr:" >&2
+            cat /tmp/stderr_clean.log >&2
+            exit 1
+          fi
+          echo "  OK"
+
+          echo "--- Gemma full-input checkpoint activation matrix ---"
+          HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1 ./target/release/hf2q --help > /dev/null 2>/tmp/gemma_checkpoint_forced.log
+          grep -q "HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1: Gemma full-input checkpoint forced on" /tmp/gemma_checkpoint_forced.log
+          if grep -q REFUSED /tmp/gemma_checkpoint_forced.log; then exit 1; fi
+          HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=0 ./target/release/hf2q --help > /dev/null 2>/tmp/gemma_checkpoint_off.log
+          grep -q "HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=0: Gemma full-input checkpoint disabled (kill switch)" /tmp/gemma_checkpoint_off.log
+          if grep -q REFUSED /tmp/gemma_checkpoint_off.log; then exit 1; fi
+          HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=2 ./target/release/hf2q --help > /dev/null 2>/tmp/gemma_checkpoint_invalid.log
+          grep -q "REFUSED HF2Q_GEMMA_FULL_INPUT_CHECKPOINT" /tmp/gemma_checkpoint_invalid.log
+          ./target/release/hf2q --help > /dev/null 2>/tmp/gemma_checkpoint_default.log
+          if grep -q "HF2Q_GEMMA_FULL_INPUT_CHECKPOINT" /tmp/gemma_checkpoint_default.log; then exit 1; fi
+
+          echo "--- HF2Q_F16_KV=1 without ack must REFUSE ---"
+          HF2Q_F16_KV=1 ./target/release/hf2q --help \
+              > /dev/null 2>/tmp/stderr_refused.log
+          grep -q "REFUSED" /tmp/stderr_refused.log
+          grep -q "HF2Q_F16_KV=1" /tmp/stderr_refused.log
+          echo "  OK"
+
+          echo "--- HF2Q_F16_KV=1 + HF2Q_UNSAFE_EXPERIMENTS=1 must ACTIVATE ---"
+          HF2Q_F16_KV=1 HF2Q_UNSAFE_EXPERIMENTS=1 \
+              ./target/release/hf2q --help \
+              > /dev/null 2>/tmp/stderr_unsafe.log
+          grep -q "UNSAFE (ack-required, activated)" /tmp/stderr_unsafe.log
+          if grep -q "REFUSED" /tmp/stderr_unsafe.log; then
+            echo "FAIL: explicitly acknowledged unsafe activation was refused" >&2
+            exit 1
+          fi
+          echo "  OK"
+
+  tests:
+    name: tests (macos-latest)
+    runs-on: macos-latest
+    # Fail-closed ceiling for cold locked debug test builds (no dependency
+    # cache), not the expected duration.
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (1.89.0, as pinned in Cargo.toml)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.89.0"
+
+      - name: Cache cargo registry + test dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: tests
+          key: rust-1.89.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: false
 
       # GitHub's hosted macOS VM returns nil from Metal residency-set
       # creation. Keep the hosted gate blocking and deterministic by running
@@ -511,6 +585,94 @@ jobs:
           cargo test --locked --bin hf2q --all-features public_watchdog_fixture_bytes_are_stable_without_a_model -- --test-threads=1
           cargo test --locked --bin hf2q --all-features public_watchdog_fixture_consumers_share_the_canonical_digests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features readiness_guard_tests -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features deepseek4 -- \
+            --skip attention_forward_tests \
+            --skip allocator_materializes_the_plan_as_zeroed_bf16_buffers \
+            --skip cache_steps_publish_only_complete_groups_and_commit_transactionally \
+            --skip partial_token_poison_requires_reset_before_replay \
+            --skip start_zero_prefill_span_counts_complete_groups_and_publishes_once \
+            --skip ffn_forward_tests \
+            --skip raw_matmul_accepts_quality_sensitive_f32_weights \
+            --skip embedding_forward_rejects_empty_input \
+            --skip q2_k_embeddings_expand_to_four_identical_hc_streams \
+            --skip native_model_load_keeps_weights_and_cache_on_one_device \
+            --skip native_output_head_produces_finite_vocab_logits_and_rejects_shape_drift \
+            --skip loader_preserves_raw_blocks_and_expands_only_elementwise_state \
+            --skip loader_rejects_catalog_and_i32_storage_before_residency
+
+      - name: GCD policy and measurement identity contracts
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          set -euo pipefail
+          contract_failures=0
+          for contract in \
+            tool_strict \
+            deepseek_dsml_boundary_tests \
+            registry::dsml_string::tests \
+            gcd_policy::tests \
+            gcd_schema_tests \
+            gcd_schema_locked_requires_gcd_schema_on_serve_and_chat \
+            measurement::tests \
+            prefix_post_oracle_tests::prefix_acceptance \
+            deepseek_prefix_post_oracle_tests \
+            serve::memory_ledger \
+            inference::glp::discovery::tests \
+            inference::glp::compatibility::tests \
+            inference::glp::source_identity::tests \
+            calibrate::export_tests \
+            inference::glp::reader::tests \
+            inference::graft::reader::tests \
+            inference::graft::compatibility::tests \
+            inference::graft::bind::tests \
+            glp_cache_identity_tests; do
+            if ! cargo test --locked --bin hf2q --all-features "$contract"; then
+              contract_failures=1
+            fi
+          done
+          exit "$contract_failures"
+
+  contracts:
+    name: check + script contracts (macos-latest)
+    runs-on: macos-latest
+    # Fail-closed ceiling for a cold check build plus the script suites,
+    # not the expected duration.
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (1.89.0, as pinned in Cargo.toml)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.89.0"
+
+      - name: Cache cargo registry + check dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: check
+          key: rust-1.89.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: false
+
+      # Blocking: type-checks every target, including the integration tests
+      # under tests/ that the tests job never builds (it runs only the
+      # hosted-safe subset). There are no benches or Rust examples today;
+      # --all-targets picks them up if added. It runs here because this job
+      # has no other Rust compile, which keeps it off the critical path.
+      - name: cargo check
+        run: cargo check --locked --all-targets --all-features
+
+      # Shell syntax and offline contract scripts. They use scratch fixtures
+      # only; no test or release build is needed. (test_standalone_installer.sh
+      # needs target/debug/hf2q and stays in the tests job.)
+      - name: Script contracts
+        run: |
+          set -euo pipefail
           bash -n scripts/qwen36_watchdog_validate.sh \
             scripts/test_getting_started_guide.sh \
             scripts/test_shipping_contract.sh \
@@ -592,52 +754,14 @@ jobs:
           bash scripts/test_release_tag_recovery_contract.sh
           bash scripts/test_frictionless_diagnostics_contract.sh
           bash scripts/test_gemma4_long_short_overlap_contract.sh
-          cargo test --locked --bin hf2q --all-features deepseek4 -- \
-            --skip attention_forward_tests \
-            --skip allocator_materializes_the_plan_as_zeroed_bf16_buffers \
-            --skip cache_steps_publish_only_complete_groups_and_commit_transactionally \
-            --skip partial_token_poison_requires_reset_before_replay \
-            --skip start_zero_prefill_span_counts_complete_groups_and_publishes_once \
-            --skip ffn_forward_tests \
-            --skip raw_matmul_accepts_quality_sensitive_f32_weights \
-            --skip embedding_forward_rejects_empty_input \
-            --skip q2_k_embeddings_expand_to_four_identical_hc_streams \
-            --skip native_model_load_keeps_weights_and_cache_on_one_device \
-            --skip native_output_head_produces_finite_vocab_logits_and_rejects_shape_drift \
-            --skip loader_preserves_raw_blocks_and_expands_only_elementwise_state \
-            --skip loader_rejects_catalog_and_i32_storage_before_residency
 
-      - name: GCD policy and measurement identity contracts
+      - name: GCD Python contracts (grammar probe, four-agent)
         shell: bash
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: |
           set -euo pipefail
           contract_failures=0
-          for contract in \
-            tool_strict \
-            deepseek_dsml_boundary_tests \
-            registry::dsml_string::tests \
-            gcd_policy::tests \
-            gcd_schema_tests \
-            gcd_schema_locked_requires_gcd_schema_on_serve_and_chat \
-            measurement::tests \
-            prefix_post_oracle_tests::prefix_acceptance \
-            deepseek_prefix_post_oracle_tests \
-            serve::memory_ledger \
-            inference::glp::discovery::tests \
-            inference::glp::compatibility::tests \
-            inference::glp::source_identity::tests \
-            calibrate::export_tests \
-            inference::glp::reader::tests \
-            inference::graft::reader::tests \
-            inference::graft::compatibility::tests \
-            inference::graft::bind::tests \
-            glp_cache_identity_tests; do
-            if ! cargo test --locked --bin hf2q --all-features "$contract"; then
-              contract_failures=1
-            fi
-          done
           if ! python3 -B -m unittest discover -s scripts/grammar_probe -p 'test*.py'; then
             contract_failures=1
           fi
@@ -646,47 +770,69 @@ jobs:
           fi
           exit "$contract_failures"
 
-      # --- Blocking: activate() matrix matches the shipping contract ---
-      - name: activate() matrix smoke (clean / REFUSED / UNSAFE)
+  lint:
+    name: lint (macos-latest, informational)
+    runs-on: macos-latest
+    # Informational: no job needs it, and continue-on-error keeps a lint (or
+    # lint-runner) failure from failing the workflow run.
+    continue-on-error: true
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (1.89.0, as pinned in Cargo.toml)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.89.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + clippy dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: lint
+          key: rust-1.89.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: false
+
+      # --- fmt: informational (baseline drift, see header) ---
+      - name: cargo fmt --check (informational)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      # --- clippy: informational until the legacy lint backlog is retired ---
+      - name: cargo clippy (informational)
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets --all-features
+
+  # Keeps the pre-split check name so branch protection that requires
+  # `build + test (macos-latest)` keeps working. It only inspects results,
+  # so it runs on Linux. always() makes it report failure, not "skipped"
+  # (which a required check treats as passing), when a blocking job fails
+  # or is cancelled.
+  build-and-test:
+    name: build + test (macos-latest)
+    needs: [release, tests, contracts]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require release, tests and contracts to succeed
         shell: bash
+        env:
+          RELEASE_RESULT: ${{ needs.release.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+          CONTRACTS_RESULT: ${{ needs.contracts.result }}
         run: |
           set -euo pipefail
-
-          echo "--- clean env should produce no investigation output ---"
-          ./target/release/hf2q --help > /dev/null 2>/tmp/stderr_clean.log
-          if [[ -s /tmp/stderr_clean.log ]]; then
-            echo "FAIL: clean-env run produced stderr:" >&2
-            cat /tmp/stderr_clean.log >&2
-            exit 1
-          fi
-          echo "  OK"
-
-          echo "--- Gemma full-input checkpoint activation matrix ---"
-          HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1 ./target/release/hf2q --help > /dev/null 2>/tmp/gemma_checkpoint_forced.log
-          grep -q "HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=1: Gemma full-input checkpoint forced on" /tmp/gemma_checkpoint_forced.log
-          if grep -q REFUSED /tmp/gemma_checkpoint_forced.log; then exit 1; fi
-          HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=0 ./target/release/hf2q --help > /dev/null 2>/tmp/gemma_checkpoint_off.log
-          grep -q "HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=0: Gemma full-input checkpoint disabled (kill switch)" /tmp/gemma_checkpoint_off.log
-          if grep -q REFUSED /tmp/gemma_checkpoint_off.log; then exit 1; fi
-          HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=2 ./target/release/hf2q --help > /dev/null 2>/tmp/gemma_checkpoint_invalid.log
-          grep -q "REFUSED HF2Q_GEMMA_FULL_INPUT_CHECKPOINT" /tmp/gemma_checkpoint_invalid.log
-          ./target/release/hf2q --help > /dev/null 2>/tmp/gemma_checkpoint_default.log
-          if grep -q "HF2Q_GEMMA_FULL_INPUT_CHECKPOINT" /tmp/gemma_checkpoint_default.log; then exit 1; fi
-
-          echo "--- HF2Q_F16_KV=1 without ack must REFUSE ---"
-          HF2Q_F16_KV=1 ./target/release/hf2q --help \
-              > /dev/null 2>/tmp/stderr_refused.log
-          grep -q "REFUSED" /tmp/stderr_refused.log
-          grep -q "HF2Q_F16_KV=1" /tmp/stderr_refused.log
-          echo "  OK"
-
-          echo "--- HF2Q_F16_KV=1 + HF2Q_UNSAFE_EXPERIMENTS=1 must ACTIVATE ---"
-          HF2Q_F16_KV=1 HF2Q_UNSAFE_EXPERIMENTS=1 \
-              ./target/release/hf2q --help \
-              > /dev/null 2>/tmp/stderr_unsafe.log
-          grep -q "UNSAFE (ack-required, activated)" /tmp/stderr_unsafe.log
-          if grep -q "REFUSED" /tmp/stderr_unsafe.log; then
-            echo "FAIL: explicitly acknowledged unsafe activation was refused" >&2
-            exit 1
-          fi
-          echo "  OK"
+          status=0
+          for job in "release=$RELEASE_RESULT" "tests=$TESTS_RESULT" "contracts=$CONTRACTS_RESULT"; do
+            echo "$job"
+            if [[ "${job#*=}" != success ]]; then
+              status=1
+            fi
+          done
+          exit "$status"
