@@ -112,6 +112,69 @@ pub(crate) fn gemma_batched_prefill_builds_dense_handoff(
     !live_prefix_resume && ((!slot_aware_mount && !multi_seq) || legacy_dense_handoff_forced())
 }
 
+/// Whether a cold batched prefill's token stream overflows a full-attention
+/// cache planned with `layer_cap` rows. A single-sequence stream, and the
+/// dense handoff (which always receives the whole stream), is written into
+/// one cache from `start_pos`. A multi-sequence stream is scattered into
+/// each sequence's own slot region instead, bounded per slot at the scatter;
+/// the plan sizes `layer_cap` from the longest sequence, so the concatenated
+/// length is no bound there.
+pub(crate) fn gemma_batched_stream_overflows_cache(
+    start_pos: usize,
+    seq_len: usize,
+    layer_cap: usize,
+    multi_seq: bool,
+    dense_handoff: bool,
+) -> bool {
+    (!multi_seq || dense_handoff) && start_pos + seq_len > layer_cap
+}
+
+/// Rows one sequence of a multi-sequence cold prefill writes into one layer
+/// of its slot. The copy and quantize kernels store absolute position `p` at
+/// row `p % capacity` and run one thread group per row with no ordering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GemmaSeqKvWrite {
+    /// Absolute position of the first written row.
+    pub(crate) dst_pos_start: u32,
+    pub(crate) rows: u32,
+    /// Row of the first written token in the concatenated stream.
+    pub(crate) src_row: u32,
+}
+
+/// The single-sequence row rule for the sequence at stream rows
+/// `[offset, offset + len)`. A ring keeps only the last `capacity` rows, so
+/// only those are written and each lands on a distinct ring row (writing
+/// all of them would let two thread groups store to the same row in either
+/// order). A full-attention layer writes every row after the `graft_len`
+/// graft rows and must hold them all; a wrap would overwrite earlier rows.
+pub(crate) fn gemma_multi_seq_kv_write(
+    offset: usize,
+    len: usize,
+    capacity: usize,
+    ring: bool,
+    graft_len: usize,
+) -> Result<GemmaSeqKvWrite> {
+    let (dst_pos_start, rows) = if ring {
+        let rows = len.min(capacity);
+        (len - rows, rows)
+    } else {
+        anyhow::ensure!(
+            graft_len + len <= capacity,
+            "graft {graft_len} + {len} rows exceed slot capacity {capacity}"
+        );
+        (graft_len, len)
+    };
+    let skipped = if ring { dst_pos_start } else { 0 };
+    let narrow = |value: usize| {
+        u32::try_from(value).map_err(|_| anyhow::anyhow!("KV write row {value} exceeds u32"))
+    };
+    Ok(GemmaSeqKvWrite {
+        dst_pos_start: narrow(dst_pos_start)?,
+        rows: narrow(rows)?,
+        src_row: narrow(offset + skipped)?,
+    })
+}
+
 /// Real-artifact gate only: rebuild the dense handoff and LCP snapshots on
 /// every cold batched prefill, as before they were limited to the
 /// SerialFifo route, so one process can compare both arms bit for bit.
@@ -4967,7 +5030,16 @@ impl MlxModelWeights {
                 };
                 let src_tok_offset = (seq_len - n_copy) as u32;
                 let dst_seq_pos_start = (start_pos as u32) + src_tok_offset;
-                if !live_prefix_resume && !is_sliding && (start_pos + seq_len) > layer_cap {
+                if !live_prefix_resume
+                    && !is_sliding
+                    && gemma_batched_stream_overflows_cache(
+                        start_pos,
+                        seq_len,
+                        layer_cap,
+                        self.multi_seq_prefill.is_some(),
+                        dense_handoff,
+                    )
+                {
                     anyhow::bail!(
                         "batched prefill L{}: start_pos={} + seq_len={} = {} exceeds global dense cap={} — \
                          increase linear_capacity allocation (max_decode_tokens param)",
@@ -5080,27 +5152,34 @@ impl MlxModelWeights {
                             // N concatenated prompts, so each seq's [O_i, L_i)
                             // slice must land in ITS OWN slot region. We loop the
                             // EXACT same kernels (F16 K copy + TQ-HB V quant) the
-                            // single-seq path uses, with src_tok_offset=O_i (read
-                            // seq i from the T-stream), dst_seq_pos_start=0 (write
-                            // to position 0 of slot i), n_copy=L_i. Destination is
-                            // the slot-view bundle the wrapper built per-seq
-                            // (slice_views sharing the multi_seq_kv_hybrid
-                            // scaffold's Metal buffers → the write lands in the
-                            // slot's scaffold region). Byte-identical to running
-                            // each prompt through the single-seq write alone.
+                            // single-seq path uses, with the single-seq row rule
+                            // per sequence (`gemma_multi_seq_kv_write`): rings
+                            // take the last `cap` rows, full layers every row
+                            // after the graft. Destination is the slot-view
+                            // bundle the wrapper built per-seq (slice_views
+                            // sharing the multi_seq_kv_hybrid scaffold's Metal
+                            // buffers → the write lands in the slot's scaffold
+                            // region).
                             for (si, sv_layers) in ms.slot_views_hybrid.iter().enumerate() {
                                 let dst = &sv_layers[layer_idx];
                                 let hb_cap = dst.capacity as u32;
                                 let hb_is_ring = dst.is_sliding;
-                                let o_i = ms.seq_offsets[si] as u32;
-                                let l_i = ms.seq_lens[si] as u32;
                                 // ADR-059 (3c): the slot's graft rows occupy
                                 // `0..graft_len` of the FULL-layer slot views
-                                // (the engine spliced them at slot admission),
-                                // so the scatter's destination starts at
-                                // `graft_len` there; sliding rings stay
-                                // prompt-indexed (they never hold graft rows).
-                                let hb_dst_start = if hb_is_ring { 0 } else { graft_len as u32 };
+                                // (the engine spliced them at slot admission);
+                                // sliding rings stay prompt-indexed.
+                                let write = gemma_multi_seq_kv_write(
+                                    ms.seq_offsets[si],
+                                    ms.seq_lens[si],
+                                    dst.capacity,
+                                    hb_is_ring,
+                                    graft_len,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!("multi-seq prefill L{layer_idx} seq{si}: {e}")
+                                })?;
+                                let (hb_dst_start, l_i, o_i) =
+                                    (write.dst_pos_start, write.rows, write.src_row);
                                 s.barrier_between(
                                     &[&pf_k_normed, &pf_v_normed],
                                     &[&dst.k, &dst.v_packed, &dst.v_norms],
@@ -7906,7 +7985,8 @@ mod route_viability_tests {
 mod cold_prefill_handoff_tests {
     use super::{
         gemma_batched_prefill_builds_dense_handoff as builds_handoff,
-        gemma_lcp_snapshot_estimate_bytes, gemma_lcp_snapshot_rows,
+        gemma_batched_stream_overflows_cache as overflows, gemma_lcp_snapshot_estimate_bytes,
+        gemma_lcp_snapshot_rows, gemma_multi_seq_kv_write as kv_write, GemmaSeqKvWrite,
     };
     use crate::serve::forward_prefill::gemma_kv_capacity_plan;
 
@@ -7936,6 +8016,163 @@ mod cold_prefill_handoff_tests {
             !builds_handoff(true, true, true),
             "joint warm (multi-sequence live)"
         );
+    }
+
+    /// Ring rows `(dst_pos_start .. + rows) % capacity` written by `write`.
+    fn ring_rows(write: GemmaSeqKvWrite, capacity: usize) -> Vec<usize> {
+        (0..write.rows as usize)
+            .map(|row| (write.dst_pos_start as usize + row) % capacity)
+            .collect()
+    }
+
+    #[test]
+    fn gemma_cold_multi_seq_ring_write_keeps_last_window_rows() {
+        // A cold cohort lane may hold up to 4,096 rows (the cross-batch
+        // eligibility and transaction limits); the sliding ring holds 1,024.
+        let cap = 1_024;
+        for (offset, len) in [
+            (0, 2_048),
+            (458, 1_300),
+            (2_048, 1_025),
+            (100, 1_024),
+            (7, 70),
+        ] {
+            let write = kv_write(offset, len, cap, true, 0).unwrap();
+            let rows = len.min(cap);
+            assert_eq!(
+                write,
+                GemmaSeqKvWrite {
+                    dst_pos_start: (len - rows) as u32,
+                    rows: rows as u32,
+                    src_row: (offset + len - rows) as u32,
+                },
+                "offset {offset} len {len}"
+            );
+            // Every written position lands on its own ring row: no two
+            // thread groups store to the same row.
+            let mut written = ring_rows(write, cap);
+            written.sort_unstable();
+            written.dedup();
+            assert_eq!(written.len(), rows, "offset {offset} len {len}");
+            // Position p of the sequence sits at ring row p % cap and comes
+            // from stream row offset + p (the single-sequence rule).
+            let last = write.dst_pos_start as usize + rows - 1;
+            assert_eq!(last, len - 1);
+            assert_eq!(write.src_row as usize + rows - 1, offset + len - 1);
+        }
+        // The graft never enters a ring.
+        assert_eq!(kv_write(10, 30, cap, true, 64).unwrap().dst_pos_start, 0);
+    }
+
+    #[test]
+    fn gemma_cold_multi_seq_full_layer_write_bounds_slot() {
+        let write = kv_write(458, 1_300, 262_145, false, 64).unwrap();
+        assert_eq!(
+            write,
+            GemmaSeqKvWrite {
+                dst_pos_start: 64,
+                rows: 1_300,
+                src_row: 458,
+            }
+        );
+        assert!(kv_write(0, 96, 96, false, 0).is_ok());
+        assert!(kv_write(0, 96, 96, false, 1).is_err(), "graft + rows wrap");
+        assert!(kv_write(0, 97, 96, false, 0).is_err());
+    }
+
+    /// The plan against the real copy kernel: after a long lane's write the
+    /// ring holds exactly its last `cap` positions, each at `p % cap`.
+    #[test]
+    fn gemma_cold_multi_seq_ring_write_kernel_holds_last_window() {
+        use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16;
+        use mlx_native::{DType, KernelRegistry, MlxDevice};
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            eprintln!("skip: no MlxDevice");
+            return;
+        };
+        let (heads, dim, cap, offset, len, stream) = (2usize, 4usize, 8usize, 3usize, 21usize, 30);
+        // Stream row r, head h, element e = r + h / 2 + e / 8 (exact in F16).
+        let value = |row: usize, head: usize, elem: usize| {
+            row as f32 + head as f32 / 2.0 + elem as f32 / 8.0
+        };
+        let mut src = device
+            .alloc_buffer(
+                stream * heads * dim * 4,
+                DType::F32,
+                vec![stream, heads, dim],
+            )
+            .unwrap();
+        for (index, slot) in src.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+            *slot = value(index / (heads * dim), index / dim % heads, index % dim);
+        }
+        let mut cache = device
+            .alloc_buffer(heads * cap * dim * 2, DType::F16, vec![heads, cap, dim])
+            .unwrap();
+        cache
+            .as_mut_slice::<half::f16>()
+            .unwrap()
+            .fill(half::f16::from_f32(-1.0));
+        let write = kv_write(offset, len, cap, true, 0).unwrap();
+        let mut registry = KernelRegistry::new();
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_kv_cache_copy_seq_f32_to_f16(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &src,
+            &cache,
+            heads as u32,
+            dim as u32,
+            cap as u32,
+            write.dst_pos_start,
+            write.rows,
+            write.src_row,
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+        let cache = cache.as_slice::<half::f16>().unwrap();
+        for position in len - cap..len {
+            let ring_row = position % cap;
+            for head in 0..heads {
+                for elem in 0..dim {
+                    assert_eq!(
+                        cache[(head * cap + ring_row) * dim + elem].to_f32(),
+                        value(offset + position, head, elem),
+                        "position {position} head {head} elem {elem}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemma_cold_multi_seq_stream_not_bounded_by_longest_sequence_plan() {
+        // The iter-G(a) determinism gate's cohort: eight prompts, 304 rows
+        // concatenated, longest 70, max_tokens 24. The plan sizes full layers
+        // from the longest sequence.
+        let lens = [26usize, 40, 13, 55, 70, 19, 33, 48];
+        let total: usize = lens.iter().sum();
+        let longest = *lens.iter().max().unwrap();
+        let cap = gemma_kv_capacity_plan(longest, 24, 1024, false).allocation_linear;
+        assert_eq!((total, cap), (304, 96));
+        // (start_pos, seq_len, layer_cap, multi_seq, dense_handoff)
+        assert!(
+            !overflows(0, total, cap, true, false),
+            "multi-sequence cold scatters per slot"
+        );
+        assert!(
+            overflows(0, total, cap, true, true),
+            "a forced dense handoff receives the whole stream"
+        );
+        assert!(overflows(0, total, cap, false, false), "single sequence");
+        assert!(
+            overflows(0, total, cap, false, true),
+            "single sequence + handoff"
+        );
+        assert!(!overflows(0, longest, cap, false, true));
+        assert!(overflows(40, 57, cap, false, false), "start_pos counts");
+        assert!(!overflows(40, 56, cap, false, false));
     }
 
     #[test]

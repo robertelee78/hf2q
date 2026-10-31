@@ -17,8 +17,17 @@
 //! and the slot cursors. Within the lean arm, every admission of the same
 //! conversation must be identical whichever slot and predecessor it got,
 //! and no LCP snapshot may be left on the model.
+//!
+//! `gemma_cold_multi_seq_long_lane_ring_deterministic` (same environment):
+//! a cold multi-sequence cohort with lanes longer than the 1,024-row ring.
+//! Ten repeats must agree bit for bit (first tokens, logits, KV rows,
+//! whole rings, cursors), a non-cohort slot must be untouched, and each
+//! lane's layer-0 ring K / V codes (row-wise functions of its own tokens)
+//! must equal a per-slot cold prefill of the same prompt, which pins that
+//! the ring holds the last 1,024 positions.
 use super::gemma_warm_batch_tests::{
-    assert_lane_equal, lane_image, load_options, slot_kv_hashes, synthetic_prompt, LaneImage,
+    assert_lane_equal, lane_image, load_options, slot_cursors, slot_kv_hashes, synthetic_prompt,
+    LaneImage,
 };
 use super::*;
 use crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor;
@@ -185,4 +194,156 @@ fn gemma_cold_prefill_handoff_skip_matches_legacy_bitwise() {
         "GEMMA_COLD_PREFILL_HANDOFF_BITWISE_COMPLETE admissions={} logits_bits=true kv_bytes=true rings=true anchors=true cursors=true cross_slot=true",
         SCHEDULE.len()
     );
+}
+
+/// `(slot, prompt length)` of the cohort: two lanes wrap the ring; 3,858 rows
+/// in total, inside the 4,096-row cold transaction limit.
+const RING_LANES: [(usize, usize); 3] = [(0, 2_100), (1, 1_300), (2, 458)];
+const ISOLATED_SLOT: usize = 3;
+const RING_REPEATS: usize = 10;
+
+fn reset_slot(guard: &mut Gemma4KvGuard<'_>, slot: usize) {
+    let slot_id = SlotId(slot as u32);
+    for buf in guard.kv.iter_mut() {
+        buf.reset_for_slot(slot_id).unwrap();
+    }
+    for buf in guard.hybrid.as_mut().unwrap().iter_mut() {
+        buf.reset_for_slot(slot_id).unwrap();
+    }
+}
+
+/// Per-slot cold prefill of `prompt`, as the cold gate above runs it.
+fn per_slot_cold(guard: &mut Gemma4KvGuard<'_>, slot: usize, prompt: &[u32]) -> u32 {
+    reset_slot(guard, slot);
+    let first = guard
+        .model
+        .weights
+        .forward_prefill_with_soft_tokens_slot_aware(
+            prompt,
+            &[],
+            MAX_TOKENS,
+            &mut guard.model.ctx,
+            SlotId(slot as u32),
+            &mut guard.kv,
+            guard.hybrid.as_mut(),
+            guard.dense.as_mut(),
+            guard.mlx.as_mut(),
+        )
+        .unwrap();
+    clear_gemma4_self_mounts(guard.model);
+    install_gemma4_slot_cursor(guard, SlotId(slot as u32), prompt.len()).unwrap();
+    first
+}
+
+#[test]
+#[ignore = "official Gemma 4 GGUF: cold multi-sequence lanes longer than the ring are deterministic and keep the last window"]
+fn gemma_cold_multi_seq_long_lane_ring_deterministic() {
+    crate::debug::investigation_env::gemma_full_input::set_worker_active(true);
+    let mut loaded = LoadedModel::load(&load_options()).expect("load official Gemma GGUF");
+    let LoadedModel::Gemma(g) = &mut loaded else {
+        panic!("HF2Q_GEMMA4_GGUF is not a Gemma 4 artifact")
+    };
+    g.provision_multi_seq_kv_for_slot_aware(4).unwrap();
+    let mut guard = Gemma4KvGuard::take(g).unwrap();
+    assert_eq!(guard.model.weights.kv_graft_len(), 0, "no graft bound");
+    let vocab = guard.model.weights.vocab_size;
+    let prompts: Vec<Vec<u32>> = RING_LANES
+        .iter()
+        .map(|&(slot, len)| synthetic_prompt(slot, len, vocab))
+        .collect();
+    let longest = RING_LANES.iter().map(|&(_, len)| len).max().unwrap();
+    assert!(gemma4_batch_rows_within_transaction_limit(
+        RING_LANES.iter().map(|&(_, len)| len)
+    ));
+
+    // A neighbour the cohort must not touch.
+    let isolated_prompt = synthetic_prompt(ISOLATED_SLOT, 700, vocab);
+    per_slot_cold(&mut guard, ISOLATED_SLOT, &isolated_prompt);
+    let isolation = |guard: &Gemma4KvGuard<'_>| {
+        (
+            slot_kv_hashes(guard, ISOLATED_SLOT, longest, longest, true),
+            slot_cursors(guard, ISOLATED_SLOT),
+        )
+    };
+    let isolated_before = isolation(&guard);
+
+    let seqs: Vec<(Vec<u32>, SlotId)> = RING_LANES
+        .iter()
+        .zip(&prompts)
+        .map(|(&(slot, _), prompt)| (prompt.clone(), SlotId(slot as u32)))
+        .collect();
+    // Per lane: (image, whole-ring hashes, live-row hashes).
+    type LaneRun = (LaneImage, Vec<[u8; 32]>, Vec<[u8; 32]>);
+    let mut repeats: Vec<Vec<LaneRun>> = Vec::with_capacity(RING_REPEATS);
+    for _ in 0..RING_REPEATS {
+        for &(slot, _) in &RING_LANES {
+            reset_slot(&mut guard, slot);
+        }
+        let output = guard
+            .model
+            .weights
+            .forward_prefill_batched_multi_seq(
+                &seqs,
+                guard.hybrid.as_deref().unwrap(),
+                MAX_TOKENS,
+                &mut guard.model.ctx,
+            )
+            .expect("cold multi-sequence prefill");
+        clear_gemma4_self_mounts(guard.model);
+        let mut lanes = Vec::with_capacity(RING_LANES.len());
+        for (lane, &(slot, len)) in RING_LANES.iter().enumerate() {
+            install_gemma4_slot_cursor(&mut guard, SlotId(slot as u32), len).unwrap();
+            assert!(output.logits[lane].iter().all(|value| value.is_finite()));
+            lanes.push((
+                lane_image(
+                    &guard,
+                    slot,
+                    len,
+                    output.first_tokens[lane],
+                    &output.logits[lane],
+                ),
+                slot_kv_hashes(&guard, slot, len, len, true),
+                slot_kv_hashes(&guard, slot, len, len, false),
+            ));
+        }
+        repeats.push(lanes);
+    }
+    for (repeat, lanes) in repeats.iter().enumerate().skip(1) {
+        for (lane, &(slot, len)) in RING_LANES.iter().enumerate() {
+            let label = format!("repeat {repeat} lane {lane} (slot {slot}, {len} rows)");
+            assert_lane_equal(&label, &lanes[lane].0, &repeats[0][lane].0);
+            assert!(
+                lanes[lane].1 == repeats[0][lane].1,
+                "{label}: whole-ring bytes differ from repeat 0"
+            );
+        }
+    }
+    assert!(
+        isolation(&guard) == isolated_before,
+        "the cohort changed non-cohort slot {ISOLATED_SLOT}"
+    );
+
+    // Layer 0 is a sliding layer whose K and V rows depend only on each
+    // row's own token and position, so the live ring rows must equal a
+    // per-slot cold prefill's: the ring holds positions [len - 1024, len).
+    for (lane, (&(slot, len), prompt)) in RING_LANES.iter().zip(&prompts).enumerate() {
+        let multi = &repeats[0][lane].2;
+        per_slot_cold(&mut guard, slot, prompt);
+        let single = slot_kv_hashes(&guard, slot, len, len, false);
+        assert!(
+            guard.hybrid.as_ref().unwrap()[0].is_sliding,
+            "layer 0 is a sliding layer"
+        );
+        assert_eq!(
+            [multi[0], multi[1]],
+            [single[0], single[1]],
+            "lane {lane} (slot {slot}, {len} rows): layer-0 ring K / V codes differ from per-slot cold prefill"
+        );
+    }
+    println!(
+        "GEMMA_COLD_MULTI_SEQ_RING_COMPLETE lanes={:?} repeats={RING_REPEATS} logits_bits=true kv_bytes=true rings=true cursors=true isolation=true layer0_vs_per_slot=true",
+        RING_LANES
+    );
+    drop(guard);
+    drop(loaded);
 }
