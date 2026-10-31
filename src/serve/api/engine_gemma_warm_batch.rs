@@ -294,7 +294,7 @@ pub(super) fn admit_cohort(
             Vec::new(),
             params,
             reply,
-            true,
+            Gemma4AdmitRoute::JointWarmCandidate,
         ) {
             return Some((fatal, requests.collect()));
         }

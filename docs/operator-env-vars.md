@@ -229,3 +229,26 @@ route the cohort must equal. The worker logs `Gemma joint warm prefill worker
 decision` at start, and each cohort logs `Gemma4 installed prefills advanced in
 one aggregate-bounded transaction` with `transaction="joint warm"`. Evidence:
 `docs/research/adr063-gemma-four-agent-reuse.md`.
+
+### Gemma joint cue replay (default on)
+
+`HF2Q_GEMMA_JOINT_CUE` controls how the Gemma 4 SlotAware worker replays the
+short generation cue after a request's stable prompt boundary. It is read once
+when the worker starts.
+- **Unset, `1`, `on` or `true` (default):** when one admission quantum holds
+  several stable-split requests that cannot form a stable batch (cold turns,
+  or cues shorter than 32 tokens), each is still prefilled to its stable
+  boundary and checkpointed per slot in arrival order. Their cues are then
+  replayed together: one batched decode-body step per cue position for all
+  lanes, and the batched output head on each lane's last cue token. Each
+  request's tokens, logprobs and cache bytes are bitwise equal to the
+  per-slot cue replay (one single-slot decode forward per cue token).
+- **`0`, `off` or `false`:** kill switch; every cue replays per slot.
+- **Any other value:** logs a warning and keeps the default.
+
+It is also off when `HF2Q_CROSS_SLOT_ADMIT` is off, `HF2Q_BATCHED_BODY=0` or
+hybrid KV is off, and a cohort replays per slot under any non-default GGML
+routing policy (for example `HF2Q_DECODE_MV_EXT=1`, which loading a Qwen3.8
+model sets for the whole process). The worker logs `Gemma joint cue replay
+worker decision` at start, and each cohort logs `Gemma4 joint cue replay`.
+Evidence: `docs/research/adr063-gemma-four-agent-reuse.md`.

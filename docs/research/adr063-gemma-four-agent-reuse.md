@@ -252,10 +252,94 @@ Fixes:
   A/B TTFT. `=0` skips this warmup, so the kill-switch arm is stock serving.
   A non-fatal warmup failure logs and continues; only a worker-fatal GPU
   fault fails the load.
-- **Cue replay (≈1.35 s per four-slot turn 0):** not a warmup issue. The lever
-  is to replay the cue tokens of all admitted slots through the joint B-row
-  decode step, which the comments say is byte-identical to single-row decode
-  `[INFERENCE]`, instead of 28 serial single-slot forwards. Not implemented.
+- **Cue replay (implemented, joint cue replay below):** not a warmup issue.
+  The cue tokens of all same-step stable lanes now go through the joint
+  batched decode body, instead of 28 serial single-slot forwards.
+
+### Turn-0 breakdown after Stage 1
+
+Stage 1 A/B (`gemma-joint-ab-v1`, g-1-A): all four agents' turn 0 (465-token
+requests, `stable_prompt_prefix_tokens=458`, so a 7-token cue) completes at
++2.663 s. The peer's completes at +0.98–1.11 s. The logs show this sequence:
+
+1. The four requests are Stable class and reach
+   `admit_gemma4_slots_stable_batched`. The stable batch plan refuses because
+   no lane has a cached prefix, so `fallback_single` admits each request
+   inline, one after another, in one quantum.
+2. Each inline admission runs `prefill_seed`'s stable branch: a cold
+   458-token boundary prefill (201/189/190/189 ms), the stable-boundary
+   anchor capture (about 19 ms), then the cue. The cue is shorter than
+   `GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS` (32), so
+   `forward_prefill_with_soft_tokens_slot_aware_resume` replays it as 7
+   `forward_decode_slot_aware` calls.
+3. The four slots then decode jointly, about 17 steps at about 20 ms.
+
+2663 − 769 (prefills) − 76 (anchors) − 340 (joint decode) ≈ 1.48 s for the
+28 cue forwards, about 53 ms each. `[INFERENCE]`: the logs carry no
+per-forward timing.
+
+### Joint cue replay (this change)
+
+`engine_gemma_cue_batch.rs`, switch `HF2Q_GEMMA_JOINT_CUE` (default on).
+
+- **Admission:** when a stable batch falls back (`fallback_single`) with two
+  or more requests, `admit_cohort` admits each request with
+  `Gemma4AdmitRoute::JointCueCandidate`. Slot choice, anchor restore,
+  boundary prefill and the stable-boundary checkpoint capture stay exactly
+  the inline code in arrival order. `prefill_seed` returns
+  `Gemma4SeedOutcome::CueDeferred` instead of replaying the cue, but only
+  when that cue would be replayed per token (0 < cue < 32), the request is
+  text-only, and there are no soft tokens. Every other lane is seeded inline
+  as before.
+- **Replay:** `replay_cues_jointly` makes one `forward_decode_body_batched`
+  call per cue position. This is the production joint decode body with the
+  hybrid regime, one row per lane still inside its cue, at that lane's
+  physical position. The batched head (`lm_head_batched`, or the fused head
+  when `HF2Q_FUSE_LMHEAD=1`) covers each lane's last cue row. The first token
+  is the first-max argmax, as production decode selects it. Lanes with
+  different cue lengths drop out of the batch after their last token.
+- **Publication:** each lane then follows the inline tail
+  (`finish_gemma4_slot_seed`, extracted from `admit_gemma4_slot_routed`):
+  cursor commit to the full prompt, stable-boundary checkpoint publication,
+  cancellation recovery, scheduler advance, seed token, decode install.
+  Lanes publish in arrival order.
+- **Exactness contract:** per lane, first token, final logits bits, KV bytes
+  and cursors equal the per-slot cue replay. The boundary checkpoint is
+  captured before the cue on both routes, from the same boundary prefill, so
+  it is unchanged by construction. The joint route depends on two things.
+  First, decode-body row independence: per-slot attention, and row-wise
+  projection and MoE kernels, are claimed byte-identical between m=1 and m=N
+  (ADR-040 H-S1/H-S2 at kernel level). Second, `lm_head_batched` row
+  parity. Production joint decode already relies on both, but they are
+  proven only for tokens, not logits, so the new gate is the proof. A cohort
+  replays per slot under any non-default GGML routing policy
+  (`mlx_native::ggml_routing_policy_from_environment()`; for example
+  `HF2Q_DECODE_MV_EXT=1`, which a Qwen3.8 load sets process-wide), because
+  the opt-in multi-column routes are not row-identical.
+- **Failure semantics:** if an admission fails, the earlier lanes and the
+  remaining requests fail the way the inline loop fails them.
+  - A worker-fatal GPU fault in the joint replay fails every lane.
+  - A non-fatal joint error restores each lane from its boundary checkpoint
+    (anchor restore plus cursor install) and replays its cue per slot, in
+    arrival order.
+  - A lane whose boundary capture was refused by the quota cannot be
+    restored, so a non-fatal joint error fails it like an inline cue error
+    would.
+
+Expected saving `[INFERENCE]`: 28 single-slot forwards (≈1.48 s) become 7
+four-row body steps at the observed joint decode cost (≈20 ms each) plus one
+head, about 0.15 s. Saving ≈ 1.3 s, so turn 0 goes from 2.66 s to about
+1.35 s against the peer's 1.0 s, and the four-agent makespan from 16.0 s to
+about 14.7 s against the peer's 13.9 s. The remaining turn-0 gap is four
+serial cold boundary prefills (≈0.77 s).
+
+Successor (not implemented): joint cold stable-prefix prefill. It would run
+the four cold boundary prefills as one `PerSlotExact`-style transaction
+(shared projections/FFN/head, per-slot cold attention with each slot's own
+chunking and ring staging). That needs a per-lane cold attention route
+proven equal to the single-slot cold prefill (FA/tensor-mm at 458 rows), and
+the anchor capture must stay per slot after the shared forward. Estimated
+gain −0.2 to −0.3 s `[INFERENCE]`.
 
 ## Root commands
 
@@ -436,14 +520,91 @@ Record `q1_decision_policy.py transcripts` A vs B. Stage 1 is bitwise per
 request, so identical transcripts are expected; investigate any divergence
 (it can also come from nondeterministic tool results on the client side).
 
+### Joint cue replay (turn 0) gates
+
+Focused model-free tests (which cues are deferred, step schedule with mixed
+cue lengths and head rows, routing-policy guard, switch parsing), plus the
+neighbours whose paths changed (`prefill_seed`, admission tail, stable
+fallback):
+
+```sh
+cargo test --locked --bin hf2q gemma_joint_cue_
+cargo test --locked --bin hf2q gemma_joint_warm_
+cargo test --locked --bin hf2q gemma_cross_slot_batches_
+cargo test --locked --bin hf2q gemma4_bounded_prefill_tests
+cargo test --locked --bin hf2q gemma_cold_batch_
+cargo test --locked --bin hf2q gemma_full_input_
+python3 -B -m unittest discover -s scripts/four_agent -p 'test_q5_calibration.py'
+bash scripts/audit_hf2q_env_surface.sh | grep HF2Q_GEMMA_JOINT_CUE
+```
+
+Real-artifact gates, one process each, no other runtime loaded:
+
+```sh
+for t in \
+  serve::api::engine::gemma_cue_batch_tests::gemma_joint_cue_replay_matches_per_slot_bitwise \
+  serve::api::engine::gemma_cue_batch_tests::gemma_joint_cue_engine_turn_zero_matches_serial \
+  serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_prefill_matches_per_slot_bitwise \
+  serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_engine_cohort_matches_serial_tool_turns; do
+  HF2Q_GEMMA4_GGUF="$GGUF" cargo test --locked --release --bin hf2q "$t" -- --exact --ignored --nocapture --test-threads=1
+done
+```
+
+- `gemma_joint_cue_replay_matches_per_slot_bitwise`: four slots,
+  cold-prefilled to boundaries 458/300/700/1100 (the last has a wrapped
+  ring) and checkpointed. Each arm restores the boundary checkpoint with
+  ledger 0 (the cold admission state). One arm is the joint replay, the
+  other each slot's inline per-slot cue call. Cases: four 7-token cues
+  (three repeats), mixed cues 7/3/12/31, a 2-lane `{0,3}` and a 3-lane
+  `{1,2,3}` cohort. Equal: first token, final logits `to_bits`, every
+  layer's K, TQ-HB V codes and V scales bytes over the valid rows, and
+  cursors. Slots outside the cohort keep their bytes and cursors. Marker:
+  `GEMMA_JOINT_CUE_BITWISE_COMPLETE`.
+- `gemma_joint_cue_engine_turn_zero_matches_serial`: four concurrent cold
+  stable-split requests (458-token boundary, 7-token cue) through the real
+  engine must form one cohort over 4 lanes (`JOINT_CUE_*` counters).
+  Turn 1 extends each boundary with a 64-token tool result and moves the
+  boundary after it. It resumes from the turn-0 checkpoint
+  (`cached_tokens=458`) and again forms one warm-lane cohort. Text,
+  reasoning, completion tokens, finish reason, top-4 logprob bits and
+  `cached_tokens` must equal the same turns sent one at a time, which also
+  proves that the published checkpoints are equal. Marker:
+  `GEMMA_JOINT_CUE_ENGINE_COMPLETE`.
+- Re-run the Category 1 loop above: `prefill_seed` and the admission tail
+  changed shape.
+
+Hardware A/B (Q5 supervisor, `gemma4` case, ABAB with a thermal gap, at least
+3 per arm; arm A default, arm B kill switch, the peer interleaved):
+
+```sh
+python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" --output "$Q5_ROOT/q5-gemma4-joint-cue-on-$(date -u +%Y%m%dT%H%M%SZ)"
+HF2Q_Q5_GEMMA_JOINT_CUE=0 python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" --output "$Q5_ROOT/q5-gemma4-joint-cue-off-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Gate on `server.stderr`:
+- One `Gemma joint cue replay worker decision` line, with `active=true` in A
+  and `requested=false` in B.
+- In A, turn 0 logs one `Gemma4 joint cue replay` with `requests=4`; B logs
+  none.
+- Zero `joint cue replay failed` lines in either arm.
+
+Compare the agents' turn-0 completion times, which should fall from about
++2.66 s by about 1.3 s. Also compare `elapsed_seconds` and
+`q1_decision_policy.py transcripts`, A vs B; the transcripts are expected to
+be identical.
+
 ## Remaining gaps
 
 - Every gate above is unexecuted, including the quality campaign. Default
   promotion depends on all of them passing on hardware.
 - Joint warm prefill Stage 1 is unexecuted: the bitwise gates above decide
   the default. Stage 2 (tiled F16 warm attention, Q1 Class B) is design only.
-- Turn-0 cue replay (about 1.35 s) and the per-step decode gap (about 20 vs
-  18 ms) are not addressed.
+- Joint cue replay is unexecuted: its bitwise gates above decide the
+  default. Joint cold stable-prefix prefill (the four serial ≈190 ms
+  boundary prefills) and the per-step decode gap (about 20 vs 18 ms) are not
+  addressed.
 - Requests are still tagged when a default-mode worker stays inactive (the
   geometry does not fit). The worker ignores those tags in every path, so
   behaviour equals `=0`; the handler cannot see the worker's geometry decision.

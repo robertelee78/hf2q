@@ -6313,6 +6313,8 @@ fn gemma4_cross_batch_eligible(
 
 #[path = "engine_gemma_cold_batch.rs"]
 mod gemma_cold_batch;
+#[path = "engine_gemma_cue_batch.rs"]
+mod gemma_cue_batch;
 #[path = "engine_gemma_slot_warmup.rs"]
 mod gemma_slot_warmup;
 #[path = "engine_gemma_warm_batch.rs"]
@@ -6729,6 +6731,23 @@ enum Gemma4PrefillAdvance {
 struct Gemma4PrefillFailure {
     rollback_anchor: Option<Gemma4PromptAnchor>,
     error: anyhow::Error,
+}
+
+/// Result of [`Gemma4DecodeState::prefill_seed`].
+enum Gemma4SeedOutcome {
+    /// The whole prompt is prefilled and completion token zero is selected.
+    Seeded(
+        Gemma4DecodeState,
+        Option<crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor>,
+    ),
+    /// The prompt reached its stable boundary and the boundary checkpoint was
+    /// attempted (`None` = quota refusal); the tiny generation cue after the
+    /// boundary is left for a joint cue replay (`gemma_cue_batch`).
+    CueDeferred {
+        boundary: usize,
+        boundary_anchor: Option<crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor>,
+        boundary_duration: Duration,
+    },
 }
 
 impl Gemma4PrefillState {
@@ -7237,10 +7256,11 @@ impl Gemma4DecodeState {
         >,
         supervisor: &EngineSupervisor,
         cached_tokens: usize,
-    ) -> Result<(
-        Self,
-        Option<crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor>,
-    )> {
+        // `gemma_cue_batch`: when the stable cue would be replayed through
+        // per-slot decode forwards, stop after the boundary checkpoint and
+        // leave the cue to one joint batched-body replay.
+        defer_cue: bool,
+    ) -> Result<Gemma4SeedOutcome> {
         let max_decode_tokens = params.max_tokens.max(1);
 
         if cached_tokens > prompt_tokens.len() {
@@ -7403,6 +7423,17 @@ impl Gemma4DecodeState {
                     loaded.weights.kv_graft_len() + boundary,
                 ),
             )?;
+            if defer_cue
+                && soft_tokens.is_empty()
+                && params.vision_fingerprint.is_none()
+                && gemma_cue_batch::cue_replays_per_token(prompt_tokens.len(), boundary)
+            {
+                return Ok(Gemma4SeedOutcome::CueDeferred {
+                    boundary,
+                    boundary_anchor: anchor,
+                    boundary_duration: prefill_started.elapsed(),
+                });
+            }
             let first_decode_token =
                 supervised_gemma4_gpu_call(supervisor, "gemma4_prefill_stable_cue", || {
                     loaded
@@ -7472,7 +7503,7 @@ impl Gemma4DecodeState {
 
         // State construction extracted to `from_first_token` (shared with the
         // iter-G(a) batched admit path, which supplies the multi-seq first token).
-        Ok((
+        Ok(Gemma4SeedOutcome::Seeded(
             Self::from_first_token(
                 loaded,
                 prompt_tokens,
@@ -12003,6 +12034,11 @@ fn run_slot_aware_gemma4(
     // ADR-063: same-step warm tool-turn suffixes share one bitwise-exact
     // transaction; `HF2Q_GEMMA_JOINT_WARM_PREFILL=0` keeps per-slot prefill.
     let joint_warm_prefill = cross_slot_admit && gemma_warm_batch::worker_enabled();
+    // ADR-063: same-step stable lanes replay their tiny generation cues as
+    // one batched-body decode per cue position instead of one per-slot
+    // decode forward per cue token; `HF2Q_GEMMA_JOINT_CUE=0` keeps the
+    // per-slot replay.
+    let joint_cue_replay = cross_slot_admit && gemma_cue_batch::worker_enabled();
 
     // ADR-040 production profiling — zero the buckets at worker entry so the
     // worker-exit dump reflects THIS worker's lifetime, not leftover state.
@@ -12607,6 +12643,7 @@ fn run_slot_aware_gemma4(
                         kv_bytes_per_token,
                         &supervisor,
                         stable_batch,
+                        joint_cue_replay,
                     ) {
                         fail_stop_gemma4_worker(
                             &supervisor,
@@ -13311,16 +13348,28 @@ fn admit_gemma4_slot(
         soft_token_data,
         params,
         reply,
-        false,
+        Gemma4AdmitRoute::Inline,
     )
 }
 
-/// [`admit_gemma4_slot`] with an optional joint-warm route: when
-/// `joint_warm_candidate` is set and the slot actually selected holds a
-/// reusable prefix with a joint-eligible suffix
-/// (`gemma_warm_batch::lane_eligible`), the request is installed as a
-/// GPU-free joint-warm prefill lane instead of prefilling inline. Every other
-/// outcome is the inline admission unchanged.
+/// How [`admit_gemma4_slot_routed`] may defer GPU work for a same-step
+/// cohort. Every other outcome is the inline admission unchanged.
+enum Gemma4AdmitRoute<'a> {
+    /// Prefill inline (the per-slot route).
+    Inline,
+    /// When the slot actually selected holds a reusable prefix with a
+    /// joint-eligible suffix (`gemma_warm_batch::lane_eligible`), install a
+    /// GPU-free joint-warm prefill lane instead of prefilling inline.
+    JointWarmCandidate,
+    /// Prefill to the stable boundary and checkpoint it inline, but when the
+    /// generation cue would be replayed per token
+    /// (`gemma_cue_batch::cue_replays_per_token`), push the lane here instead
+    /// of replaying the cue, for one joint batched-body cue replay.
+    JointCueCandidate(&'a mut Vec<gemma_cue_batch::CueLane>),
+}
+
+/// [`admit_gemma4_slot`] with an optional cohort route (see
+/// [`Gemma4AdmitRoute`]).
 #[allow(clippy::too_many_arguments)]
 fn admit_gemma4_slot_routed(
     guard: &mut Gemma4KvGuard<'_>,
@@ -13337,7 +13386,7 @@ fn admit_gemma4_slot_routed(
     soft_token_data: Vec<SoftTokenData>,
     params: SamplingParams,
     mut reply: SlotReply,
-    joint_warm_candidate: bool,
+    route: Gemma4AdmitRoute<'_>,
 ) -> Option<SlotAwareGpuFatal> {
     if let Some(tag) = gemma_full_input::effective(&params) {
         let check = tag.validate(&prompt_tokens).and_then(|_| {
@@ -13713,7 +13762,7 @@ fn admit_gemma4_slot_routed(
     // A joint-warm candidate whose actually selected slot holds a reusable
     // prefix with a joint-eligible suffix is installed without GPU work; the
     // cohort then runs as one transaction (`gemma_warm_batch::run_installed`).
-    let install_joint_warm = joint_warm_candidate
+    let install_joint_warm = matches!(route, Gemma4AdmitRoute::JointWarmCandidate)
         && guard.hybrid.is_some()
         && soft_token_data.is_empty()
         && params.stable_prompt_prefix_tokens.is_none()
@@ -13827,9 +13876,37 @@ fn admit_gemma4_slot_routed(
         guard.mlx.as_mut(),
         supervisor,
         cached_tokens,
+        matches!(route, Gemma4AdmitRoute::JointCueCandidate(_)),
     );
     let (state, stable_anchor) = match seed {
-        Ok(seed) => seed,
+        Ok(Gemma4SeedOutcome::Seeded(state, stable_anchor)) => (state, stable_anchor),
+        Ok(Gemma4SeedOutcome::CueDeferred {
+            boundary,
+            boundary_anchor,
+            boundary_duration,
+        }) => {
+            let Gemma4AdmitRoute::JointCueCandidate(lanes) = route else {
+                return Some(SlotAwareGpuFatal::invariant_slot(
+                    handle,
+                    reply,
+                    anyhow::anyhow!("Gemma4 prefill deferred a cue outside a cue cohort"),
+                ));
+            };
+            clear_gemma4_self_mounts(guard.model);
+            lanes.push(gemma_cue_batch::CueLane {
+                handle,
+                reply,
+                prompt_tokens,
+                params,
+                cached_tokens,
+                shape_prompt_tokens: shape.prompt_tokens,
+                boundary,
+                request_rollback_anchor,
+                boundary_anchor,
+                boundary_duration,
+            });
+            return None;
+        }
         Err(e) => {
             if is_worker_fatal(supervisor, &e) {
                 return Some(SlotAwareGpuFatal::slot(handle, reply, e));
@@ -13859,6 +13936,52 @@ fn admit_gemma4_slot_routed(
             return None;
         }
     };
+    finish_gemma4_slot_seed(
+        guard,
+        scheduler,
+        slots,
+        retained_tokens,
+        prompt_anchors,
+        registration,
+        kv_bytes_per_token,
+        handle,
+        reply,
+        prompt_tokens,
+        params,
+        cached_tokens,
+        shape.prompt_tokens,
+        request_rollback_anchor,
+        state,
+        stable_anchor,
+    )
+}
+
+/// Publish a seeded admission exactly as the inline path does: cursor commit
+/// to the full prompt, checkpoint publication (stable boundary, exact image
+/// or full input, else the request-start rollback anchor), cancellation
+/// recovery, scheduler advance, seed token, and decode install. Shared by
+/// inline admission and the joint cue cohort (`gemma_cue_batch`).
+#[allow(clippy::too_many_arguments)]
+fn finish_gemma4_slot_seed(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Gemma4Slot>],
+    retained_tokens: &mut [Vec<u32>],
+    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    registration: Option<&super::registry::ModelRegistration>,
+    kv_bytes_per_token: u64,
+    handle: SlotHandle,
+    mut reply: SlotReply,
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+    cached_tokens: usize,
+    shape_prompt_tokens: u32,
+    request_rollback_anchor: Option<Gemma4PromptAnchor>,
+    state: Gemma4DecodeState,
+    stable_anchor: Option<crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor>,
+) -> Option<SlotAwareGpuFatal> {
+    let slot_idx = handle.slot_id.0 as usize;
+    let operator_request_id = gemma4_operator_request_id(handle);
     let (completed, work, rate) = state.operator_prefill_progress();
     crate::serve::operator_ui::prefill_progress(
         "gemma4",
@@ -14015,7 +14138,7 @@ fn admit_gemma4_slot_routed(
 
     // Prefill consumed the whole prompt in one shot → advance the
     // scheduler's Prefilling phase to Decoding immediately.
-    scheduler.advance_after_prefill(handle, shape.prompt_tokens);
+    scheduler.advance_after_prefill(handle, shape_prompt_tokens);
 
     // Prefill has already selected completion token zero. Route it before the
     // first decode tick so a native Gemma tool opener is not omitted from SSE.
@@ -15482,7 +15605,11 @@ fn admit_gemma4_slots_stable_batched(
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
     requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>,
+    joint_cue: bool,
 ) -> Option<SlotAwareGpuFatal> {
+    // Same-step stable lanes that cannot form a stable batch (cold, or a
+    // tiny cue) are admitted in FIFO order exactly as before; with the joint
+    // cue route their per-token cue replays share one batched-body replay.
     let fallback_single = |guard: &mut Gemma4KvGuard<'_>,
                            scheduler: &mut InflightBatchedScheduler,
                            slots: &mut [Option<Gemma4Slot>],
@@ -15490,6 +15617,21 @@ fn admit_gemma4_slots_stable_batched(
                            prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
                            requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>|
      -> Option<SlotAwareGpuFatal> {
+        if joint_cue && requests.len() >= 2 {
+            return gemma_cue_batch::admit_cohort(
+                guard,
+                scheduler,
+                slots,
+                retained_tokens,
+                prompt_anchors,
+                registration,
+                scheduler_stats_snapshot,
+                per_slot_kv_budget_bytes,
+                kv_bytes_per_token,
+                supervisor,
+                requests,
+            );
+        }
         let mut requests = requests.into_iter();
         while let Some((prompt_tokens, params, reply)) = requests.next() {
             if let Some(mut fatal) = admit_gemma4_slot(
@@ -58513,6 +58655,10 @@ mod gemma_full_input_tests;
 #[cfg(test)]
 #[path = "engine_gemma_full_input_serving_tests.rs"]
 mod gemma_full_input_serving_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_cue_batch_tests.rs"]
+mod gemma_cue_batch_tests;
 
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_tests.rs"]
