@@ -1568,9 +1568,11 @@ impl MlxModelWeights {
         // pairs, costing an extra commit_and_wait per prefill.  The two
         // workloads are independent (embed writes pf_hidden; mask+blk write
         // sliding_mask, global_mask, blk_sliding, blk_global — no overlap),
-        // so they share the setup command buffer.  The blk dispatches still
-        // need barrier_between against their masks (intra-session ordering)
-        // but no inter-workload barrier is required.
+        // so they share the setup command buffer.  Each mask's F16 cast and
+        // blk classifier are ordered after its fill by the conflict tracker
+        // (the fill is declared by `gemma_cold_masks::encode_tracked_mask`,
+        // since the builder allocates the mask internally); no
+        // inter-workload barrier is required.
         // -------------------------------------------------------------------
         //
         // ADR-011 Phase 2 Wave 4 mask + blk pre-pass docs (preserved):
@@ -1597,12 +1599,10 @@ impl MlxModelWeights {
         let blk_sliding: MlxBuffer;
         let blk_global: MlxBuffer;
         {
-            use mlx_native::ops::flash_attn_prefill_blk::{
-                BlkParams, alloc_blk_buffer, dispatch_flash_attn_prefill_blk,
+            use crate::serve::gemma_cold_masks::{
+                encode_cold_mask, encode_mask_tiles, ColdMaskLayout,
             };
-            use mlx_native::ops::flash_attn_prefill_mask::{
-                SdpaMaskParams, build_block_diagonal_sdpa_mask_bf16, build_sdpa_mask_bf16,
-            };
+            use mlx_native::ops::flash_attn_prefill_blk::{alloc_blk_buffer, BlkParams};
 
             let mask_seq_len = gemma_batched_mask_seq_len(seq_len, live_prefix_resume);
 
@@ -1632,9 +1632,9 @@ impl MlxModelWeights {
             // Wave P4.17 — each setup sub-step gets its own bucket timing
             // when HF2Q_PROFILE_BUCKETS=1.  The five sub-steps (embed,
             // sliding mask, global mask, sliding blk, global blk) are
-            // independent in the default path (no barrier_between between
-            // embed and the masks; the masks and blks serialize per-pair
-            // via explicit barriers).  Splitting them adds 4 extra commit+
+            // independent in the default path (no barrier between embed
+            // and the masks; each mask's cast and blk wait on its declared
+            // fill).  Splitting them adds 4 extra commit+
             // wait transitions (~50-200 µs each) under the profile flag;
             // normal runs keep the single session.
 
@@ -1667,7 +1667,7 @@ impl MlxModelWeights {
             } else {
                 None
             };
-            sliding_mask = if let Some(ref sid) = pf_seq_id {
+            let sliding_layout = match pf_seq_id.as_ref() {
                 // ADR-040 iter-G(a) delta 2 — block-diagonal causal SLIDING
                 // mask, GPU-BUILT from the per-token seq-id + per-seq local
                 // positions (pf_positions). Query qi attends key kj iff same-seq
@@ -1677,56 +1677,26 @@ impl MlxModelWeights {
                 // GPU-PRODUCED (not host-written) so the F16 cast / blk / FA read
                 // a GPU buffer — a CPU-written final mask buffer is NOT reliably
                 // read by those consumers.
-                build_block_diagonal_sdpa_mask_bf16(
-                    dev,
-                    reg,
-                    s.encoder_mut(),
-                    sid,
-                    &pf_positions,
-                    seq_len as u32,
-                    Some(self.sliding_window as u32),
-                    true,
-                )
-                .map_err(|e| anyhow::anyhow!("build multi-seq sliding_mask: {e}"))?
-            } else {
-                build_sdpa_mask_bf16(
-                    dev,
-                    reg,
-                    s.encoder_mut(),
-                    &SdpaMaskParams {
-                        seq_len_q: mask_seq_len as u32,
-                        seq_len_k: mask_seq_len as u32,
-                        window_size: Some(self.sliding_window as u32),
-                        causal: true,
-                        q_abs_offset: 0,
-                    },
-                )
-                .map_err(|e| anyhow::anyhow!("build sliding_mask: {e}"))?
+                Some(sid) => ColdMaskLayout::BlockDiagonal {
+                    seq_id: sid,
+                    local_pos: &pf_positions,
+                    len: seq_len,
+                },
+                None => ColdMaskLayout::Square { len: mask_seq_len },
             };
-            // HF2Q_FA_F16=1: cast the BF16 sliding mask to F16 once, reused
-            // across all 25 sliding D=256 layers' F16 FA dispatches.
-            // Must be rank-2 [seq_len, seq_len] so the FA dispatcher's
-            // rank-2 broadcast detection (`mask.shape().len() == 2`) fires.
-            sliding_mask_f16 = if use_fa_f16 {
-                let mask_elems = mask_seq_len * mask_seq_len;
-                let m_f16 = dev
-                    .alloc_buffer(mask_elems * 2, DType::F16, vec![mask_seq_len, mask_seq_len])
-                    .map_err(|e| anyhow::anyhow!("alloc sliding_mask_f16: {e}"))?;
-                s.barrier_between(&[&sliding_mask], &[&m_f16]);
-                mlx_native::ops::elementwise::cast(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &sliding_mask,
-                    &m_f16,
-                    mask_elems,
-                    mlx_native::ops::elementwise::CastDirection::BF16ToF16,
-                )
-                .map_err(|e| anyhow::anyhow!("cast sliding_mask BF16→F16: {e}"))?;
-                Some(m_f16)
-            } else {
-                None
-            };
+            // HF2Q_FA_F16=1: the BF16 sliding mask is also cast to F16 once,
+            // reused across all 25 sliding D=256 layers' F16 FA dispatches.
+            let sliding = encode_cold_mask(
+                &mut s,
+                dev,
+                reg,
+                sliding_layout,
+                Some(self.sliding_window as u32),
+                use_fa_f16,
+                "sliding_mask",
+            )?;
+            sliding_mask = sliding.bf16;
+            sliding_mask_f16 = sliding.f16;
             if let Some(t0) = t0_mask_sw {
                 bucket_finish!(
                     s,
@@ -1773,62 +1743,32 @@ impl MlxModelWeights {
             } else {
                 None
             };
-            global_mask = if let Some(ref sid) = pf_seq_id {
+            let global_layout = match pf_seq_id.as_ref() {
                 // ADR-040 iter-G(a) delta 2 — block-diagonal causal GLOBAL mask
                 // (no sliding window), GPU-built. Full per-seq causal; off-
                 // diagonal blocks -inf isolate the N sequences across the 5
                 // global D=512 layers (F16 FA for T<=64, tensor-mm for T>64 per
                 // §0.19 — both consume this GPU-produced buffer).
-                build_block_diagonal_sdpa_mask_bf16(
-                    dev,
-                    reg,
-                    s.encoder_mut(),
-                    sid,
-                    &pf_positions,
-                    seq_len as u32,
-                    None,
-                    true,
-                )
-                .map_err(|e| anyhow::anyhow!("build multi-seq global_mask: {e}"))?
-            } else {
-                build_sdpa_mask_bf16(
-                    dev,
-                    reg,
-                    s.encoder_mut(),
-                    &SdpaMaskParams {
-                        seq_len_q: mask_seq_len as u32,
-                        seq_len_k: mask_seq_len as u32,
-                        window_size: None,
-                        causal: true,
-                        q_abs_offset: 0,
-                    },
-                )
-                .map_err(|e| anyhow::anyhow!("build global_mask: {e}"))?
+                Some(sid) => ColdMaskLayout::BlockDiagonal {
+                    seq_id: sid,
+                    local_pos: &pf_positions,
+                    len: seq_len,
+                },
+                None => ColdMaskLayout::Square { len: mask_seq_len },
             };
-            // HF2Q_FA_F16=1: cast the BF16 global mask to F16 once, reused
-            // across all 5 global D=512 layers' F16 FA dispatches.
-            // Must be rank-2 [seq_len, seq_len] so the FA dispatcher's
-            // rank-2 broadcast detection (`mask.shape().len() == 2`) fires.
-            global_mask_f16 = if use_fa_f16 {
-                let mask_elems = mask_seq_len * mask_seq_len;
-                let m_f16 = dev
-                    .alloc_buffer(mask_elems * 2, DType::F16, vec![mask_seq_len, mask_seq_len])
-                    .map_err(|e| anyhow::anyhow!("alloc global_mask_f16: {e}"))?;
-                s.barrier_between(&[&global_mask], &[&m_f16]);
-                mlx_native::ops::elementwise::cast(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &global_mask,
-                    &m_f16,
-                    mask_elems,
-                    mlx_native::ops::elementwise::CastDirection::BF16ToF16,
-                )
-                .map_err(|e| anyhow::anyhow!("cast global_mask BF16→F16: {e}"))?;
-                Some(m_f16)
-            } else {
-                None
-            };
+            // HF2Q_FA_F16=1: F16 copy reused across all 5 global D=512
+            // layers' F16 FA dispatches.
+            let global = encode_cold_mask(
+                &mut s,
+                dev,
+                reg,
+                global_layout,
+                None,
+                use_fa_f16,
+                "global_mask",
+            )?;
+            global_mask = global.bf16;
+            global_mask_f16 = global.f16;
             if let Some(t0) = t0_mask_gl {
                 bucket_finish!(
                     s,
@@ -1847,16 +1787,15 @@ impl MlxModelWeights {
             } else {
                 None
             };
-            s.barrier_between(&[&sliding_mask], &[&blk_sliding]);
-            dispatch_flash_attn_prefill_blk(
-                s.encoder_mut(),
+            encode_mask_tiles(
+                &mut s,
                 dev,
                 reg,
                 &sliding_mask,
                 &blk_sliding,
                 &blk_sliding_params,
-            )
-            .map_err(|e| anyhow::anyhow!("dispatch blk_sliding: {e}"))?;
+                "blk_sliding",
+            )?;
             if let Some(t0) = t0_blk_sw {
                 bucket_finish!(
                     s,
@@ -1874,16 +1813,15 @@ impl MlxModelWeights {
             } else {
                 None
             };
-            s.barrier_between(&[&global_mask], &[&blk_global]);
-            dispatch_flash_attn_prefill_blk(
-                s.encoder_mut(),
+            encode_mask_tiles(
+                &mut s,
                 dev,
                 reg,
                 &global_mask,
                 &blk_global,
                 &blk_global_params,
-            )
-            .map_err(|e| anyhow::anyhow!("dispatch blk_global: {e}"))?;
+                "blk_global",
+            )?;
             if let Some(t0) = t0_blk_gl {
                 bucket_finish!(
                     s,
@@ -2887,14 +2825,22 @@ impl MlxModelWeights {
                                     s.barrier_between(&[&q_f16, &dense_k, &dense_v], &[&out_f16]);
                                     if is_ring {
                                         let history_len = kv_seq_len as usize - chunk_len;
-                                        let mask = mlx_native::ops::flash_attn_prefill_mask::build_sdpa_mask_f16(
-                                            dev, reg, s.encoder_mut(),
-                                            &mlx_native::ops::flash_attn_prefill_mask::SdpaMaskParams {
-                                                seq_len_q: chunk_len as u32,
-                                                seq_len_k: kv_seq_len,
-                                                window_size: Some(sliding_window),
-                                                causal: true,
-                                                q_abs_offset: history_len as u32,
+                                        // The builder allocates the mask, so its fill
+                                        // is declared after encoding; otherwise the blk
+                                        // classifier below finds no conflict and reads a
+                                        // partly filled mask.
+                                        let mask = crate::serve::gemma_cold_masks::encode_tracked_mask(
+                                            &mut s, &[], |encoder| {
+                                                mlx_native::ops::flash_attn_prefill_mask::build_sdpa_mask_f16(
+                                                    dev, reg, encoder,
+                                                    &mlx_native::ops::flash_attn_prefill_mask::SdpaMaskParams {
+                                                        seq_len_q: chunk_len as u32,
+                                                        seq_len_k: kv_seq_len,
+                                                        window_size: Some(sliding_window),
+                                                        causal: true,
+                                                        q_abs_offset: history_len as u32,
+                                                    },
+                                                )
                                             },
                                         ).map_err(|e| anyhow::anyhow!(
                                             "multi-seq tiled live mask L{layer_idx}: {e}"

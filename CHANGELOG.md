@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Keep the Qwen tool-continuation thinking ceiling (default 512) at every tool-chain depth. Halving it to a 256-token floor from the second tool result forced the reasoning close inside the first edit plan of an ordinary read/read/write coding workflow.
 - Preserve Qwen tool-call parameter whitespace in unary and streaming responses. Only the single newline the native template wraps around each `<parameter>` value is removed; a file's trailing newline and leading indentation now reach the client intact.
+- Order Gemma 4 batched-prefill attention masks before their readers. The mask builders allocate and fill the mask on the GPU inside the call, and that write was never declared to the session's barrier tracker, so the F16 mask cast and the tile-skip classifier could run concurrently with the fill on cold prefills (single-sequence and multi-sequence), as could the tile classifier of tiled multi-sequence warm-resume sliding attention. A classifier reading a partly filled mask can mark masked tiles as attended: future or out-of-window keys, or another sequence's keys in a multi-sequence cold batch. Every mask fill is now declared to the tracker, which places a barrier before its first reader.
 
 ## [0.1.28] — 2026-10-29
 

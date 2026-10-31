@@ -595,3 +595,26 @@ plus about 20 ms. Compare turn-0 completion times, `elapsed_seconds`, and
 - `handlers_gemma_matched_tokens_tests.rs` still classifies an empty env as
   the historical study's OFF arm; that study is source-hash bound and
   unaffected by the new default.
+- Mask fill ordering (branch `fix/gemma-cold-prefill-mask-fence`, found by
+  the Stage 2 review): the mlx-native mask builders allocate and fill their
+  mask inside the call, so no batched-prefill session declared the fill to
+  the barrier tracker. The F16 mask cast and the `blk` classifier of the
+  cold setup session (single- and multi-sequence), and the `blk` classifier
+  of the main-branch tiled multi-sequence warm sliding path, could run
+  concurrently with the fill. In a multi-sequence cold batch a classifier
+  that reads a partly filled block-diagonal mask can mark an off-diagonal
+  tile as attended, leaking attention across sequences `[INFERENCE]`.
+  `src/serve/gemma_cold_masks.rs` now declares every fill
+  (`encode_tracked_mask`). Audit of the other alloc-and-fill helpers of
+  mlx-native 0.15.15 (`quantized_matmul`, `quantized_matmul_simd`,
+  `dispatch_quantized_matmul_simd_bf16{,_expert}`, `quantized_matmul_id`,
+  the `GraphSession` wrappers): no caller in hf2q, so no Gemma decode,
+  Qwen 3.5 or DeepSeek-V4 site exists. Its other alloc-and-return helpers
+  (`compute_g_beta_gpu`, `silu_mul_gpu`, `materialize_f16_shadow`) commit
+  their own command buffer. Stage 2's live attention module fences its own
+  mask fill with an explicit barrier. Unexecuted: the model-free capture
+  tests (`cargo test --locked --bin hf2q gemma_cold_masks`) and a rerun of
+  the multi-sequence cold determinism/isolation gate
+  (`HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GGUF" cargo test
+  --locked --release --bin hf2q iter_g_a_bf16_determinism_isolation_gate --
+  --nocapture --test-threads=1`), plus the cold-prefill handoff gate above.
