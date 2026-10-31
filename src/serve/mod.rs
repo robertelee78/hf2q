@@ -19,6 +19,7 @@ pub mod forward_prefill;
 pub mod forward_prefill_batched;
 pub(crate) mod gemma_live_attention;
 pub mod gpu;
+pub(crate) mod gemma_cold_masks;
 pub mod header;
 mod info;
 mod info_catalog;

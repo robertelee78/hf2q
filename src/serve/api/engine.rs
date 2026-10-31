@@ -6578,8 +6578,8 @@ struct Gemma4PrefillProgress {
 /// lane needs; this reserve makes the bound equal the binding lane's own
 /// `end_i + max_tokens_i` (the per-slot requirement), so a cohort fits
 /// whenever every lane fits alone. `lanes` yields `(end, max_tokens)`. Cold
-/// multi-lane prefill must not use it: its dense handoff holds the whole
-/// concatenated stream.
+/// multi-lane prefill keeps the largest `max_tokens`; its forward bounds
+/// each lane by its own slot capacity.
 fn gemma4_batch_decode_reserve(lanes: impl IntoIterator<Item = (usize, usize)>) -> usize {
     let mut max_end = 0usize;
     let mut max_need = 0usize;
@@ -14581,9 +14581,9 @@ fn advance_gemma4_prefill_quantum(
         )
     });
     // Live resume checks `max end + reserve` against each slot, so it uses
-    // the binding lane's own need. Cold multi-sequence prefill sizes its dense
-    // handoff to hold the whole concatenated stream and keeps the largest
-    // `max_tokens`.
+    // the binding lane's own need. Cold multi-sequence prefill keeps the
+    // largest `max_tokens`; its forward bounds each lane by its own slot
+    // capacity, not by the concatenated stream.
     let max_decode_tokens = if start_at_zero {
         lanes
             .iter()
@@ -15236,10 +15236,10 @@ fn admit_gemma4_slots_batched(
         .iter()
         .map(|(h, p, _, _)| (p.clone(), h.slot_id))
         .collect();
-    // Cold multi-sequence prefill sizes its dense handoff from the longest
-    // lane plus this reserve and requires it to hold the whole concatenated
-    // stream, so it keeps the largest `max_tokens` (not
-    // `gemma4_batch_decode_reserve`, which serves the live resume check).
+    // Cold multi-sequence prefill keeps the largest `max_tokens` (not
+    // `gemma4_batch_decode_reserve`, which serves the live resume check); its
+    // forward bounds each lane by its own slot capacity, not by the
+    // concatenated stream.
     let max_decode = admitted
         .iter()
         .map(|(_, _, params, _)| params.max_tokens.max(1))

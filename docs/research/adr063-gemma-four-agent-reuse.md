@@ -158,8 +158,8 @@ them (+24 to +92 ms creep per later slot).
   other resumed multi-lane calls (installed long-prompt resumes and both
   stable-batch passes), which previously paired the largest `max_tokens`
   with the longest lane. Cold multi-lane prefill keeps the largest
-  `max_tokens`: it sizes a dense handoff that must hold the whole
-  concatenated stream, and a smaller reserve could newly refuse it.
+  `max_tokens`; it no longer needs it to cover the whole concatenated
+  stream (see "Multi-sequence cold capacity check" under Remaining gaps).
   The reserve only sizes capacity checks on the live route; it changes no
   numerics (the gate checks a per-slot prefill at a near-limit `max_tokens`
   against the 16-token reference).
@@ -968,3 +968,65 @@ them after the fix.
 - `handlers_gemma_matched_tokens_tests.rs` still classifies an empty env as
   the historical study's OFF arm; that study is source-hash bound and
   unaffected by the new default.
+- Mask fill ordering (branch `fix/gemma-cold-prefill-mask-fence`, found by
+  the Stage 2 review): the mlx-native mask builders allocate and fill their
+  mask inside the call, so no batched-prefill session declared the fill to
+  the barrier tracker. The F16 mask cast and the `blk` classifier of the
+  cold setup session (single- and multi-sequence), and the `blk` classifier
+  of the main-branch tiled multi-sequence warm sliding path, could run
+  concurrently with the fill. In a multi-sequence cold batch a classifier
+  that reads a partly filled block-diagonal mask can mark an off-diagonal
+  tile as attended, leaking attention across sequences `[INFERENCE]`.
+  `src/serve/gemma_cold_masks.rs` now declares every fill
+  (`encode_tracked_mask`). Audit of the other alloc-and-fill helpers of
+  mlx-native 0.15.15 (`quantized_matmul`, `quantized_matmul_simd`,
+  `dispatch_quantized_matmul_simd_bf16{,_expert}`, `quantized_matmul_id`,
+  the `GraphSession` wrappers): no caller in hf2q, so no Gemma decode,
+  Qwen 3.5 or DeepSeek-V4 site exists. Its other alloc-and-return helpers
+  (`compute_g_beta_gpu`, `silu_mul_gpu`, `materialize_f16_shadow`) commit
+  their own command buffer. Stage 2's live attention module fences its own
+  mask fill with an explicit barrier. On `7a9459db`
+  (`E/gemma-cold-mask-gates-v1`) the capture tests
+  (`cargo test --locked --bin hf2q gemma_cold_masks`), the cold-prefill
+  handoff bitwise gate and the cold-batch, full-input and bounded suites
+  passed. The multi-sequence cold determinism/isolation gate could not run:
+  see the next entry.
+- Multi-sequence cold capacity check: since `b9514c99` the batched prefill
+  plans full-layer capacity from the longest sequence (`max_i end_i +
+  max_tokens`), but the global-layer bound still compared the concatenated
+  stream (`start_pos + seq_len`) with it. A cold cohort whose total length
+  exceeded `roundup32(longest + max_tokens)` was refused, although each
+  sequence is scattered into its own slot region and, since the dense
+  handoff was dropped for this route, nothing writes the concatenated
+  stream into one cache. `iter_g_a_bf16_determinism_isolation_gate` (eight
+  prompts, 304 rows, longest 70, `max_tokens` 24, cap 96) failed at L5 on
+  main before and after the handoff change. The bound now applies only to
+  streams written into one cache (single sequence, or a forced legacy
+  handoff), and the multi-sequence scatter checks `graft + len_i` against
+  each full-layer slot capacity (the copy kernels index `pos % capacity`,
+  so an overflow would wrap rather than fault). Production four-agent turn
+  0 (4 × 458 rows, `max_tokens` 8192) never hit it; a cold batch of long
+  prompts with small `max_tokens` would have `[INFERENCE]`. Unexecuted:
+  `cargo test --locked --bin hf2q cold_prefill_handoff_tests` and
+  `HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GGUF" cargo test
+  --locked --release --bin hf2q iter_g_a_bf16_determinism_isolation_gate --
+  --nocapture --test-threads=1` (20 bitwise repeats plus per-sequence
+  no-leakage), which also exercises the mask-fill fence on the
+  block-diagonal path.
+- Multi-sequence cold ring writes: a cold cohort lane may be up to 4,096
+  rows (`gemma4_cross_batch_eligible`, `engine.rs` ~6309; the cohort total
+  is capped at 4,096 by `gemma_cold_batch::plan`, which batches
+  `[2048, 2048]`), while the per-slot sliding ring holds `sliding_window`
+  (1,024) rows (`layer_type_to_alloc_params_per_slot`). The scatter wrote
+  every row of each sequence with `pos % capacity`, so rows 1,024 positions
+  apart raced for the same ring row and decode could continue from a ring
+  holding older positions. `gemma_multi_seq_kv_write` now applies the
+  single-sequence rule per lane (rings take the last `capacity` rows; full
+  layers take every row after the graft and must fit). Unexecuted:
+  `cargo test --locked --bin hf2q gemma_cold_multi_seq_` (plan tests and a
+  model-free copy-kernel test) and the ignored real-artifact gate
+  `HF2Q_GEMMA4_GGUF="$GGUF" cargo test --locked --release --bin hf2q
+  serve::api::engine::gemma_cold_prefill_tests::gemma_cold_multi_seq_long_lane_ring_deterministic
+  -- --exact --ignored --nocapture --test-threads=1` (lanes 2,100 / 1,300 /
+  458 rows, ten bitwise repeats, untouched neighbour slot, layer-0 ring
+  K / V codes equal to per-slot cold prefill).
