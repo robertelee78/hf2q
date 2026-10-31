@@ -248,7 +248,8 @@ The kernel is chosen by `LiveRoute`:
     `flash_attn_prefill_f16_d256_with_blk`, in 1,024-query chunks.
   - Global layers: `flash_attn_prefill_f16_d512_resume` with
     `q_offset_in_k = graft + start`, in 4,096-query chunks (the transaction
-    cap, so every slot-aware prefill takes one chunk).
+    cap; SerialFifo rejects longer Gemma prompts, so in serving every
+    sequence takes one chunk).
   - Every dispatch is `batch = 1` over one sequence.
 - **`VecHybrid`**: the previous kernel, chunking (256 queries, split at
   512/1024) and stage positions, unchanged.
@@ -326,10 +327,11 @@ concurrent encoder the `blk` classifier ran alongside the mask fill.
 fully attended (`flash_attn_prefill_blk.metal:254-255`, `res = 2`). So
 wherever `blk` read before the fill, attention skipped the mask: queries
 saw future keys in their diagonal tiles and keys outside the window. How
-often that happens depends on what else is running on the GPU, which is why
-results were reproducible within one cohort shape but differed between
-shapes [INFERENCE: consistent with both failures; the localization test
-below measures it].
+often that happens depends on what else is running on the GPU. That
+explains the tiled bitwise failure: results were reproducible within one
+cohort shape but differed between shapes. The fix (`b0f96d86`) cleared it;
+see the results table. It did not explain the envelope, which measured the
+same after the fix (see the envelope disposition below).
 
 The installed long-prompt `Tiled` lanes had the same race before this
 change. The cold prefill path builds its masks with the same undeclared
@@ -737,11 +739,10 @@ done
   and the vec-hybrid margin is at least 0.5 logits. A 31-row suffix must be
   bitwise equal on both switches (it stays vec-hybrid). Markers:
   `GEMMA_WARM_TILED_ENVELOPE_LANE` (per lane) and `GEMMA_WARM_TILED_ENVELOPE`
-  (summary). Expected after the race fix `[INFERENCE]`: max |Δlogit| in the
-  range of other cross-graph comparisons (the monolithic-vs-resume
-  diagnostic measured 0.81), and top-1 flips only on near ties. A max
-  |Δlogit| still above about 1.5 means another semantic difference remains;
-  run the localization test.
+  (summary). The pre-run expectation (max |Δlogit| near the 0.81
+  cross-graph level, with "above about 1.5 means another semantic
+  difference remains") was wrong; see the envelope disposition after the
+  results table.
 - **Localization (diagnostic, not a gate).** Slot 1 (history 714,
   suffix 200) runs on both routes with the test-only per-layer probe
   (`forward_prefill_batched::live_layer_probe`). The probe forces a
@@ -803,18 +804,50 @@ python3 -B scripts/four_agent/quality_campaign.py \
 `paired` must not return `Loss`, `BelowFloor` or `Inconclusive`. Otherwise
 record an operator waiver or apply the revert rule above.
 
-Measured results (root fills in; all pending):
+Measured results. Gates ran on the merge commit `1aa0b9c1`
+(`E/gemma-stage2-gates-v3`); the vec-hybrid bitwise gate, envelope and
+localization ran on `b0f96d86` (`E/gemma-stage2-gates-v2`). The v1 run
+(`a2bc2007`) failed the tiled bitwise gate at `[1,2,3]` slot 3, from the
+mask race fixed in `b0f96d86`.
 
 | Gate | Result | Evidence |
 |---|---|---|
-| (a) tiled joint == per-slot | `a2bc2007`: FAIL (`[1,2,3]` slot 3); rerun after the race fix pending | `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=TiledF16` |
-| (a) vec-hybrid joint == per-slot | `a2bc2007`: PASS; rerun pending | `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=VecHybrid` |
-| (b) determinism, defaults + 4× `MLX_PRECOMPILED_METALLIB=0` | `a2bc2007`: PASS (defaults ×1); rerun pending | `GEMMA_WARM_TILED_DETERMINISM_COMPLETE` ×5 |
-| (c) envelope: max \|Δlogit\|, top-1 agree, min margin | `a2bc2007`: 4.07, 2/4 (flips at vec margins 0.17/0.39), 0.17; rerun pending | `GEMMA_WARM_TILED_ENVELOPE` |
-| Localization: first diverging layer | pending | `GEMMA_WARM_TILED_LOCALIZATION` |
-| Joint cohort ms per turn, A vs B (t1…t6) | pending | `transaction="joint warm"` `elapsed_ms` |
-| Makespan A / B / peer (median) | pending (expected ≈13.6 / 15.2 / 12.4 s) | `client/summary.json` |
-| Quality campaign verdict | pending | `manifest.json` verdict |
+| (a) tiled joint == per-slot (`[0123]`×5, `[03]`, `[123]`×2, `[3210]`, `[23]`, mixed `max_tokens`, isolation) | PASS, defaults and `MLX_PRECOMPILED_METALLIB=0` | v3 `a-default.log`, `a-nometallib.log`: `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=TiledF16` |
+| (a) vec-hybrid joint == per-slot (same cohorts) | PASS | v2 `a-vec.log`: `GEMMA_JOINT_WARM_BITWISE_COMPLETE kernel=VecHybrid` |
+| Engine cohort == serial tool turns | PASS | v3 `a-engine.log`: `GEMMA_JOINT_WARM_ENGINE_COMPLETE` |
+| (b) determinism, defaults + 4× `MLX_PRECOMPILED_METALLIB=0` | PASS, 5 runs × 5 repeats = 25 per-slot and joint repeats, all bitwise equal, joint == per-slot | v3 `b-default.log`, `b-nometallib-{1..4}.log`: `GEMMA_WARM_TILED_DETERMINISM_COMPLETE` |
+| Category 1 ×4 (skip=0) | PASS | v3 `cat1-*.log` |
+| (c) envelope: max \|Δlogit\| per lane, top-1 agree, min vec margin | 1.15 / 4.07 / 3.64 / 2.81; 2/4 agree; both flips are near ties (vec margins 0.167 and 0.392 < 0.5); 31-row suffix bitwise equal | v2 `c-envelope.log`: `GEMMA_WARM_TILED_ENVELOPE` |
+| Localization (slot 1, history 714, suffix 200) | Layer-0 attention rel Δ 3.6e-4 (max abs 0.0044) on identical inputs. Residual Δ jumps 40× at layer 1 (0.0116 → 0.466) while attention Δ is only 0.0138. Attention rel Δ first exceeds 5% at layer 3 (0.051). Final logit Δ 4.07. | v2 `d-localize.log`: `GEMMA_WARM_TILED_LOCALIZATION`, `GEMMA_WARM_TILED_LAYER` |
+| Joint cohort ms per turn t1…t6, A (tiled) vs B (vec-hybrid) | A ≈ 123 / 350 / 411 / 542 / 311 / 705 (≈2.44 s); B ≈ 147 / 452 / 545 / 849 / 476 / 1,130 (≈3.60 s). The saving is about 1.16 s of cohort time, against the projected 1.6–1.7 s. | `E/gemma-stage2-ab-v1/g-*-{T,V}-*/server.stderr` `transaction="joint warm"` `elapsed_ms` (A `g-1-T` t1 = 240 ms first-use outlier) |
+| Makespan A / B / peer (median of 4) | 13.66 / 14.81 / 12.39 s (A −7.8% vs B) | `E/gemma-stage2-ab-v1` `client/summary.json` / receipts |
+| Quality campaign (24 paired, subject default vs `stock-hf2q` with `GEMMA_WARM_TILED_ATTENTION=0`) | `Pass`: subject 21/24, reference 20/24, discordant 2 subject-only vs 3 reference-only, one-sided p = 0.8125 | `E/quality-gemma4-stage2-vs-vec-20261031T042314Z/manifest.json` |
+
+**Envelope disposition (the 4.07 max |Δlogit| against the 1.5 rule).** The
+section's "above about 1.5 means another semantic difference remains" rule
+fires: 4.07, 3.64 and 2.81 exceed it. The localization run does not show a
+semantic attention defect:
+- Layer 0 sees identical inputs on both routes, and its attention differs
+  by 3.6e-4 relative, about one F16 half-ulp.
+- The independent review confirmed that both tiled kernels accumulate in
+  F32. The only differences from vec-hybrid are F16 storage of the
+  dequantized V and of O, and reduction order.
+- The 40× residual jump at layer 1, while attention differs by only 0.0138,
+  puts the amplification outside attention. That is consistent with MoE
+  top-k routing flips on near-tied router logits `[INFERENCE]`.
+
+So the 1.5 rule was a wrong pre-run expectation (it extrapolated the 0.81
+monolithic-vs-resume figure), not a gate. The disposition is Q1 Class B,
+route-sensitive, accepted on task quality: the paired campaign returned
+`Pass` (21/24 vs 20/24), the A/B is 7.8% faster, top-1 flips occur only at
+near ties, and the 31-row control is bitwise equal.
+
+Open follow-ups:
+- localize lane 3 (history 1254 ≥ window, so it exercises the window cut
+  and d512 over a longer history);
+- a tiled-vs-cold envelope;
+- hardware coverage for graft > 0 and F16 V storage, which no gate
+  exercises.
 
 ### Cold admission allocation gates
 
@@ -874,14 +907,13 @@ plus about 20 ms. Compare turn-0 completion times, `elapsed_seconds`, and
 
 ## Remaining gaps
 
-- Every gate above is unexecuted, including the quality campaign. Default
+- Gates without a recorded result above remain unexecuted. Default
   promotion depends on all of them passing on hardware.
-- Joint warm prefill Stage 1 is unexecuted: the bitwise gates above decide
-  the default. Stage 2 (tiled F16 warm attention, Q1 Class B): the first
-  hardware run failed the tiled bitwise and envelope gates; the mask/`blk`
-  ordering fix awaits a rerun. Its default needs the bitwise, determinism
-  and envelope gates, the A/B and the quality campaign (revert rule in its
-  section).
+- Joint warm prefill Stage 1: the vec-hybrid bitwise and engine cohort gates
+  pass (results table above). Stage 2 (tiled F16 warm attention, Q1 Class
+  B): bitwise, determinism, Category 1, A/B and the quality campaign pass.
+  The envelope exceeds the pre-run 1.5 expectation and is dispositioned as
+  Class B above. The follow-ups listed there remain open.
 - The cold prefill setup builds its sliding and global masks
   (`build_sdpa_mask_bf16` / `build_block_diagonal_sdpa_mask_bf16`) without
   declaring their writes. The F16 cast and the `blk` classifiers that read

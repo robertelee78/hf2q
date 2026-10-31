@@ -46,10 +46,12 @@ pub(crate) const VEC_QUERY_CHUNK: usize = 256;
 /// ring stage (`cap - 1` history rows plus the chunk) holds every key any
 /// chunk query can see.
 pub(crate) const TILED_SLIDING_QUERY_CHUNK: usize = 1024;
-/// Tiled global-layer query chunk. It equals the Gemma 4 slot transaction
-/// row cap, so every slot-aware warm prefill and every installed lane takes
-/// one global chunk; only unbounded SerialFifo appends split, which bounds
-/// the F16 Q/O scratch.
+/// Tiled global-layer query chunk. It equals the Gemma 4 transaction row
+/// cap: slot-aware warm prefills and installed lanes never exceed it, and
+/// SerialFifo rejects Gemma prompts above it
+/// (`validate_serial_prefill_family`), so in serving every sequence takes one
+/// global chunk. The split only guards direct callers of the live resume
+/// against unbounded F16 Q/O scratch.
 pub(crate) const TILED_GLOBAL_QUERY_CHUNK: usize = 4096;
 /// Warm suffixes shorter than this keep the vec-hybrid kernel under
 /// [`GemmaLiveKernel::TiledF16`]: below the 32-token batched-prefill
