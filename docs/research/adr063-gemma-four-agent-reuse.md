@@ -462,7 +462,8 @@ defaults and once with `MLX_PRECOMPILED_METALLIB=0`:
 ```sh
 for t in \
   serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_prefill_matches_per_slot_bitwise \
-  serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_engine_cohort_matches_serial_tool_turns; do
+  serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_engine_cohort_matches_serial_tool_turns \
+  serve::api::engine::gemma_warm_batch_fault_tests::gemma_joint_warm_forward_fault_retries_each_lane_per_slot; do
   HF2Q_GEMMA4_GGUF="$GGUF" cargo test --locked --release --bin hf2q "$t" -- --exact --ignored --nocapture --test-threads=1
 done
 ```
@@ -493,6 +494,23 @@ done
   reasoning, completion tokens, finish reason, top-4 logprob bits and
   `cached_tokens` must equal the same turns sent one at a time. Marker:
   `GEMMA_JOINT_WARM_ENGINE_COMPLETE`.
+- `gemma_joint_warm_forward_fault_retries_each_lane_per_slot` (S3 G-C3):
+  the same four conversations (every turn-2 suffix above 32 rows), with
+  turn 1 sent in admission order 2,0,3,1 (not slot order). A test-only hook
+  (`gemma_warm_batch::INJECT_FORWARD_FAULT`,
+  compiled only under `cfg(test)`) lets that turn's real joint forward write
+  every lane's KV, then reports a non-fatal error. The test requires:
+  - the faulted cohort held all four lanes in FIFO admission order;
+  - `settle_gemma4_prefill_batch` restored every lane from its rollback
+    anchor and retried it per slot in that same order;
+  - no joint transaction succeeded on that turn;
+  - every answer equals the serial reference (same fields as above), with
+    `cached_tokens` equal to the turn-0 prompt.
+
+  The joint forward overwrote ring rows that the retry attends to, so a
+  missed restore changes the outputs. A fault-free turn 2 then forms a 4-lane
+  cohort again and still matches the reference. Marker:
+  `GEMMA_JOINT_WARM_FAULT_RETRY_COMPLETE`.
 - Re-run the Category 1 loop above and the full-input real-artifact loop:
   the installed long-prompt and stable batches now share
   `settle_gemma4_prefill_batch` and the slot-view global binding.

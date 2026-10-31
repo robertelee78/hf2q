@@ -14720,6 +14720,11 @@ fn settle_gemma4_prefill_batch(
                     match restore_gemma4_lane_for_retry(guard, &lane) {
                         Ok(()) => {
                             let slot_index = lane.handle.slot_id.0 as usize;
+                            #[cfg(test)]
+                            gemma_warm_batch::RETRIED_LANES
+                                .lock()
+                                .expect("retry record")
+                                .push((lane.handle.slot_id.0, lane.state.prompt_tokens.len()));
                             lane.state.joint_warm = None;
                             retries.push(lane.handle);
                             slots[slot_index] = Some((
@@ -58475,6 +58480,10 @@ mod gemma_cold_prefill_tests;
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_tests.rs"]
 mod gemma_warm_batch_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_warm_batch_fault_tests.rs"]
+mod gemma_warm_batch_fault_tests;
 
 #[cfg(test)]
 #[path = "engine_template_json_order_tests.rs"]

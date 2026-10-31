@@ -4,7 +4,9 @@ Status (2026-10-30):
 - **Qwen3.8 (dense): default on.** Official-artifact gates passed and the four-agent ABBA A/B passed; see "Measured result".
 - **Qwen3.6 (MoE): default off, opt-in with `HF2Q_QWEN_JOINT_DECODE=1`.** Its forward is bitwise exact, but the four-agent A/B is incomplete and both joint runs failed the coding protocol; see "Qwen3.6 verdict".
 - `HF2Q_QWEN_JOINT_DECODE=0` restores the serial path for every family.
-- Open: the Q1 Class B envelope on real prompts (Q-C2b) and the cohort-invariance gates below have not run yet.
+- Cohort invariance: the three gates below **passed** at 0b959107 (`E/qwen-joint-invariance-v1`).
+- Task quality against the peer: **Pass** (23/24 vs 21/24); Q3 primary stage: 22.1% faster than stock and 27.1% faster than the peer. See "Measured result".
+- Open: the Q1 Class B envelope on real prompts (Q-C2b). Until it runs, per-slot quality is shown against the peer, not against stock.
 
 ## Problem
 
@@ -112,7 +114,7 @@ In-transaction refusals are unreachable in normal serving: the same checks run o
 - `qwen38_joint_decode_mvn_matches_serial_decode_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MV_EXT` unset): the same bitwise contract on the exact mvN route. **Passed.**
 - `qwen38_joint_decode_padded_mv_ext_keeps_decision_parity` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1`): teacher-forced top-1 decisions equal independent sequential forwards at every step, cursors and parities equal, then 16 further serial decisions per slot equal. **Passed.** Under Q1 it is diagnostic only (synthetic prompts, top-1).
 
-**Cohort invariance** (`qwen35::real_artifact_joint_decode_invariance_tests`, ignored; not yet run). For each variant, one cache with four identically prefilled slots advances slot 2 for 4 steps inside a different cohort: alone, `{0,2}`, `{2,3}`, `{1,2,3}`, `{2,3,1}`, and `{0,1,3,2}` with slot 2 packed last. Slot 2's logits, hidden, cursor, parity, KV codes/scales and conv/recurrent bytes must be bitwise equal across all variants.
+**Cohort invariance** (`qwen35::real_artifact_joint_decode_invariance_tests`, ignored; **all three passed** at 0b959107, `E/qwen-joint-invariance-v1/{qwen36-exact,qwen38-mvn,qwen38-padded}.log`, source commit in `source.txt`). For each variant, one cache with four identically prefilled slots advances slot 2 for 4 steps inside a different cohort: alone, `{0,2}`, `{2,3}`, `{1,2,3}`, `{2,3,1}`, and `{0,1,3,2}` with slot 2 packed last. Slot 2's logits, hidden, cursor, parity, KV codes/scales and conv/recurrent bytes must be bitwise equal across all variants. The production padded route is therefore cohort-invariant bitwise; against stock it remains Class B (see "Numeric contract").
 
 - `qwen36_joint_decode_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN36_GGUF`)
 - `qwen38_joint_decode_mvn_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MV_EXT` unset)
@@ -160,7 +162,23 @@ A `WithinDecisionEnvelope` verdict on real prompts closes Q-C2b. A `RouteSensiti
 - The per-request decode and TTFT medians are independent recomputations from the run logs (`analysis-qwen38.json` has a parsing bug in its decode medians).
 - Under Q1 §3.5, frozen prompts on a deterministic engine are one sample per agent: no task-quality loss was observed, but this is not a quality verdict.
 
-Still missing: the joint width distribution (only the first engagement was logged) and decode scratch at B=4.
+**Task quality against the peer** (`E/quality-qwen38-peer-exp0b95-20261030T180957Z`, Q1 paired campaign, 24 instances, binary 0b959107):
+- Verdict **Pass**. Joint decode (default on) passed 23/24 and the peer 21/24: one subject-only failure, three peer-only failures, one-sided p = 0.94.
+- All 24 subject server logs record `selected=true mode="padded_mv_ext"`.
+- The reference is the peer, not stock. "Unchanged per-slot quality against stock" still needs Q-C2b or a paired campaign against `HF2Q_QWEN_JOINT_DECODE=0`.
+
+**Q3 primary stage** (`E/q3-campaign-v1/qwen38-n4/verdict.json`; four agents together, 5 blocks, stopped on precision):
+
+| Arm | Makespan, median |
+|---|---|
+| Experiment (main 897e39a6, joint decode default on) | 88.3 s |
+| Stock v0.1.28 | 113.6 s |
+| Peer | 122.2 s |
+
+- The experiment is 22.1% faster than stock (95% CI 20.5–23.7%) and 27.1% faster than the peer (95% CI 26.3–28.0%).
+- The verdict file reads `Inconclusive` only because the quality campaign above ran on 0b959107, not on the experiment binary.
+
+Still missing: the joint width distribution and decode scratch at B=4. Only the first engagement was logged: no retained run has the per-turn `Qwen joint decode turn` debug lines, because the family launcher passes `-v` and hf2q ignores `RUST_LOG` under `-v`.
 
 **Qwen3.6 verdict: inconclusive, unfavourable.** Default off.
 
