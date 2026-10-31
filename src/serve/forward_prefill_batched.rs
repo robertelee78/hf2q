@@ -31,7 +31,9 @@ use super::config::LayerType;
 use super::gpu::GpuContext;
 use crate::debug::INVESTIGATION_ENV;
 use crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers;
-use crate::inference::models::gemma4::model::{MultiSeqPrefillOutput, MultiSeqPrefillState};
+use crate::inference::models::gemma4::model::{
+    GemmaLiveAttention, MultiSeqPrefillOutput, MultiSeqPrefillState,
+};
 use crate::inference::models::gemma4::{
     DenseKvBuffers, HbKvBuffers, HybridKvBuffers, MlxModelWeights,
 };
@@ -1322,40 +1324,26 @@ impl MlxModelWeights {
                 }
             }
         }
+        // Live attention addresses each sequence through its own slot view, so
+        // every query row reads view slot 0 (the single-slot binding).
         let live_slot_ids: Option<MlxBuffer> = if live_prefix_resume {
             let mut slots = alloc_u32(seq_len, "pf_live_slot_ids")?;
-            let values = slots
+            slots
                 .as_mut_slice::<u32>()
-                .map_err(|e| anyhow::anyhow!("live slot ids write: {e}"))?;
-            if let Some(ms) = self.multi_seq_prefill.as_ref() {
-                let mut row = 0usize;
-                for (seq_idx, len) in ms.seq_lens.iter().copied().enumerate() {
-                    values[row..row + len].fill(ms.slot_ids[seq_idx].0);
-                    row += len;
-                }
-            } else {
-                values.fill(0);
-            }
+                .map_err(|e| anyhow::anyhow!("live slot ids write: {e}"))?
+                .fill(0);
             Some(slots)
         } else {
             None
         };
-        let live_zero_slot_ids: Option<MlxBuffer> =
-            if live_prefix_resume && self.multi_seq_prefill.is_some() {
-                let query_chunk = if gemma_tiled_live_enabled() {
-                    GEMMA_LIVE_TILED_QUERY_CHUNK
-                } else {
-                    GEMMA_LIVE_QUERY_CHUNK
-                };
-                let mut slots = alloc_u32(seq_len.min(query_chunk), "pf_live_zero_slot_ids")?;
-                slots
-                    .as_mut_slice::<u32>()
-                    .map_err(|e| anyhow::anyhow!("live zero slot ids write: {e}"))?
-                    .fill(0);
-                Some(slots)
-            } else {
-                None
-            };
+        // Resumed multi-sequence attention route; tiled only for installed
+        // long-prompt lanes, and only while `HF2Q_GEMMA_TILED_LIVE` allows it.
+        let multi_seq_live_tiled = live_prefix_resume
+            && self
+                .multi_seq_prefill
+                .as_ref()
+                .is_some_and(|ms| ms.live_attention == GemmaLiveAttention::Tiled)
+            && gemma_tiled_live_enabled();
         let live_sliding_cache_capacity = if live_prefix_resume {
             let capacities: Vec<usize> = if let Some(ms) = self.multi_seq_prefill.as_ref() {
                 ms.full_views_hybrid
@@ -1449,7 +1437,13 @@ impl MlxModelWeights {
         // like pf_positions for RoPE); the produced mask is GPU-WRITTEN so its
         // downstream consumers (F16 cast / blk / FA) read a GPU buffer. None in
         // single-seq mode (the GPU single-seq mask builder runs instead).
-        let pf_seq_id: Option<MlxBuffer> = if let Some(ref ms) = self.multi_seq_prefill {
+        // Live resume never reads the square masks, so no block-diagonal mask
+        // is built for a resumed multi-sequence cohort either.
+        let pf_seq_id: Option<MlxBuffer> = if let Some(ms) = self
+            .multi_seq_prefill
+            .as_ref()
+            .filter(|_| !live_prefix_resume)
+        {
             let mut buf = alloc_u32(seq_len, "pf_seq_id")?;
             {
                 let sid: &mut [u32] = buf
@@ -1839,7 +1833,7 @@ impl MlxModelWeights {
                 s.finish()
                     .map_err(|e| anyhow::anyhow!("batched setup finish: {e}"))?;
                 if std::env::var("HF2Q_DUMP_SLIDING_MASK").as_deref() == Ok("1") {
-                    if let Some(ref ms) = self.multi_seq_prefill {
+                    if let (Some(ms), Some(_)) = (self.multi_seq_prefill.as_ref(), &pf_seq_id) {
                         let t = seq_len;
                         if let Ok(sm) = sliding_mask.as_slice::<half::bf16>() {
                             // A-query rows are seq0 [0,L0); B-key cols are seq1.
@@ -2472,21 +2466,22 @@ impl MlxModelWeights {
                         let slots = live_slot_ids
                             .as_ref()
                             .expect("live slot ids allocated with live resume");
-                        let zero_slots = live_zero_slot_ids
-                            .as_ref()
-                            .expect("multi-seq live zero slot ids allocated");
                         let tmp = live_sdpa_tmp
                             .as_ref()
                             .expect("live SDPA tmp allocated with live resume");
                         let row_elems = nh * hd;
-                        let ring_stage = if is_ring {
-                            let query_chunk = if gemma_tiled_live_enabled() {
-                                GEMMA_LIVE_TILED_QUERY_CHUNK
-                            } else {
-                                GEMMA_LIVE_QUERY_CHUNK
-                            };
-                            let stage_capacity = cap.saturating_sub(1) + seq_len.min(query_chunk);
-                            let norms_per_pos = full_layer_kv.norms_per_pos;
+                        let norms_per_pos = full_layer_kv.norms_per_pos;
+                        let stage_v_dtype = full_layer_kv.v_packed.dtype();
+                        // Chronological ring stage: up to `cap - 1` history rows
+                        // plus one query chunk.
+                        let alloc_ring_stage = |stage_rows: usize| -> Result<(
+                            MlxBuffer,
+                            MlxBuffer,
+                            MlxBuffer,
+                            usize,
+                            usize,
+                        )> {
+                            let stage_capacity = cap.saturating_sub(1) + stage_rows;
                             anyhow::ensure!(
                                 stage_capacity > 0 && norms_per_pos > 0,
                                 "multi-seq live ring stage L{layer_idx} has invalid shape"
@@ -2508,8 +2503,8 @@ impl MlxModelWeights {
                             })?;
                             let v = unsafe {
                                 dev.alloc_buffer_for_overwrite(
-                                    v_elements * full_layer_kv.v_packed.dtype().size_of(),
-                                    full_layer_kv.v_packed.dtype(),
+                                    v_elements * stage_v_dtype.size_of(),
+                                    stage_v_dtype,
                                     vec![nkv, stage_capacity, hd],
                                 )
                             }
@@ -2526,7 +2521,13 @@ impl MlxModelWeights {
                             .map_err(|e| {
                                 anyhow::anyhow!("multi-seq live ring stage norms L{layer_idx}: {e}")
                             })?;
-                            Some((k, v, norms, stage_capacity, norms_per_pos))
+                            Ok((k, v, norms, stage_capacity, norms_per_pos))
+                        };
+                        // The tiled route shares one cohort-sized stage. The
+                        // vec-hybrid route sizes each sequence's stage from its
+                        // own rows, exactly as the single-slot path does.
+                        let shared_ring_stage = if is_ring && multi_seq_live_tiled {
+                            Some(alloc_ring_stage(seq_len.min(GEMMA_LIVE_TILED_QUERY_CHUNK))?)
                         } else {
                             None
                         };
@@ -2536,9 +2537,15 @@ impl MlxModelWeights {
                             let seq_offset = ms.seq_offsets[seq_idx];
                             let seq_len_i = ms.seq_lens[seq_idx];
                             let start_i = ms.start_positions[seq_idx];
+                            let own_ring_stage = if is_ring && !multi_seq_live_tiled {
+                                Some(alloc_ring_stage(seq_len_i.min(GEMMA_LIVE_QUERY_CHUNK))?)
+                            } else {
+                                None
+                            };
+                            let ring_stage = shared_ring_stage.as_ref().or(own_ring_stage.as_ref());
                             let mut local_start = 0usize;
                             while local_start < seq_len_i {
-                                let chunk_len = if gemma_tiled_live_enabled() {
+                                let chunk_len = if multi_seq_live_tiled {
                                     if is_ring {
                                         (seq_len_i - local_start).min(GEMMA_LIVE_TILED_QUERY_CHUNK)
                                     } else {
@@ -2577,7 +2584,7 @@ impl MlxModelWeights {
                                     stage_norms,
                                     stage_capacity,
                                     norms_per_pos,
-                                )) = ring_stage.as_ref()
+                                )) = ring_stage
                                 {
                                     let history_len =
                                         absolute_chunk_start.min(cap.saturating_sub(1));
@@ -2636,7 +2643,7 @@ impl MlxModelWeights {
                                             ).map_err(|e| anyhow::anyhow!("multi-seq live ring stage FWHT V suffix L{layer_idx}: {e}"))?;
                                     }
                                     (
-                                        zero_slots.slice_view(0, chunk_len),
+                                        slots.slice_view(0, chunk_len),
                                         stage_k,
                                         stage_v,
                                         stage_norms,
@@ -2649,14 +2656,13 @@ impl MlxModelWeights {
                                         sw as u32,
                                     )
                                 } else {
+                                    // The sequence's own slot view addressed as
+                                    // slot 0: the single-slot binding.
                                     (
-                                        slots.slice_view(
-                                            (concat_start * std::mem::size_of::<u32>()) as u64,
-                                            chunk_len,
-                                        ),
-                                        &full_layer_kv.k,
-                                        &full_layer_kv.v_packed,
-                                        &full_layer_kv.v_norms,
+                                        slots.slice_view(0, chunk_len),
+                                        &slot_layer_kv.k,
+                                        &slot_layer_kv.v_packed,
+                                        &slot_layer_kv.v_norms,
                                         &pf_positions,
                                         // ADR-059 (3c): the full-layer live read
                                         // extent covers the slot's graft rows
@@ -2673,7 +2679,7 @@ impl MlxModelWeights {
                                         0u32,
                                     )
                                 };
-                                if gemma_tiled_live_enabled() && attn_v.dtype() != DType::F16 {
+                                if multi_seq_live_tiled && attn_v.dtype() != DType::F16 {
                                     // Persistent V remains TQ-HB compressed. Expand only
                                     // this layer's active range, then use the same tiled F16
                                     // prefill kernel as the coherent cold path. Scratch is
@@ -7488,6 +7494,8 @@ impl MlxModelWeights {
             slot_ids: seqs.iter().map(|(_, slot_id)| *slot_id).collect(),
             slot_views_hybrid,
             full_views_hybrid: self.build_full_views_hybrid(scaffold)?,
+            // Cold prefill never reads slot history; the route is unused.
+            live_attention: GemmaLiveAttention::Tiled,
             out_first_tokens: Vec::new(),
             out_logits: Vec::new(),
         });
@@ -7526,11 +7534,19 @@ impl MlxModelWeights {
     /// slot. The model weights and token-wise projections/MoE execute once
     /// over the concatenated suffix stream; attention reads and writes the
     /// caller's persistent per-slot KV regions.
+    ///
+    /// `attention` selects the per-sequence attention route.
+    /// [`GemmaLiveAttention::PerSlotExact`] runs the single-slot live-resume
+    /// attention for every lane, so each lane's logits and KV bytes equal its
+    /// own `forward_prefill_batched_live_resume_slot_mounted` call, provided
+    /// every lane has more than 32 suffix rows: at 32 or fewer a per-slot MoE
+    /// takes the `mv_id` route while the joint stream takes `mm_id`.
     pub fn forward_prefill_batched_multi_seq_live(
         &mut self,
         seqs: &[(Vec<u32>, SlotId, usize)],
         scaffold: &[MultiSeqHybridKvBuffers],
         max_decode_tokens: usize,
+        attention: GemmaLiveAttention,
         gpu: &mut GpuContext,
     ) -> Result<MultiSeqPrefillOutput> {
         anyhow::ensure!(
@@ -7562,6 +7578,13 @@ impl MlxModelWeights {
             slot_ids.push(*slot_id);
             concat.extend_from_slice(suffix);
         }
+        anyhow::ensure!(
+            slot_ids
+                .iter()
+                .enumerate()
+                .all(|(index, slot)| !slot_ids[..index].contains(slot)),
+            "multi-seq live resume requires distinct slots"
+        );
 
         let mut slot_views_hybrid = Vec::with_capacity(seqs.len());
         for (_, slot_id, _) in seqs {
@@ -7576,6 +7599,7 @@ impl MlxModelWeights {
             slot_ids,
             slot_views_hybrid,
             full_views_hybrid,
+            live_attention: attention,
             out_first_tokens: Vec::new(),
             out_logits: Vec::new(),
         });

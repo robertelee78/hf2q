@@ -659,9 +659,9 @@ pub struct MultiSeqPrefillState {
     /// contribution. Cold multi-sequence prefill uses zero for every entry;
     /// resumed prefill uses the exact cached-prefix length for that slot.
     pub start_positions: Vec<usize>,
-    /// Physical KV slot selected by each sequence. This is redundant with
-    /// `slot_views_hybrid` for writes, but is required by mlx-native's
-    /// batched hybrid-attention kernel when it reads the full shared slab.
+    /// Physical KV slot selected by each sequence. Redundant with
+    /// `slot_views_hybrid`, which every read and write goes through; kept
+    /// for the native transaction descriptor.
     pub slot_ids: Vec<crate::serve::multi_seq_kv::SlotId>,
     /// Per-seq × per-layer hybrid-KV slot-views. Outer index = sequence,
     /// inner index = layer. Each `HybridKvBuffers` is a `slice_view` bundle
@@ -670,10 +670,13 @@ pub struct MultiSeqPrefillState {
     /// in the slot's scaffold region. Built by the wrapper via
     /// `build_slot_view_hybrid` (the iter-G(b) slot-view primitive, per-seq).
     pub slot_views_hybrid: Vec<Vec<HybridKvBuffers>>,
-    /// Per-layer views over the complete multi-slot hybrid scaffold. Used
-    /// only by resumed multi-sequence attention; per-query `slot_ids` select
-    /// an isolated slot region inside these shared buffers.
+    /// Per-layer views over the complete multi-slot hybrid scaffold. Resumed
+    /// multi-sequence attention reads layer geometry (capacity, ring, V
+    /// dtype) from them and mounts them as the model's hybrid KV for the call.
     pub full_views_hybrid: Vec<HybridKvBuffers>,
+    /// Attention route of a resumed (live) multi-sequence prefill. Ignored by
+    /// cold multi-sequence prefill, which never reads a slot's history.
+    pub live_attention: GemmaLiveAttention,
     /// Filled by the head delta: each seq's first decoded (greedy argmax)
     /// token. Length `== seq_lens.len()` on return. Empty until the head runs.
     pub out_first_tokens: Vec<u32>,
@@ -683,6 +686,25 @@ pub struct MultiSeqPrefillState {
     /// transformer-body pass. Returning only argmax tokens would silently
     /// weaken native tool semantics for batched agent requests.
     pub out_logits: Vec<Vec<f32>>,
+}
+
+/// Attention route for resumed multi-sequence Gemma prefill. Row-parallel work
+/// (projections, norms, FFN/MoE, per-row head) runs once over every suffix row
+/// in both routes; only the per-sequence attention against each slot's own KV
+/// differs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GemmaLiveAttention {
+    /// Installed long-prompt lanes and the stable cue batch: tiled F16 flash
+    /// attention over a dequantized V range with 1024-query sliding chunks, or
+    /// the vec-hybrid kernel when `HF2Q_GEMMA_TILED_LIVE=0`. Not bitwise equal
+    /// to a per-slot resume.
+    Tiled,
+    /// Joint warm tool-turn cohort: the single-slot live-resume attention
+    /// exactly (`flash_attn_vec_hybrid_batched`, 256-query chunks split at
+    /// 512/1024, per-sequence ring staging `cap - 1 + min(rows, 256)`, slot
+    /// view addressed as slot 0, FWHT sign undo), so every lane is bitwise
+    /// equal to its per-slot resume.
+    PerSlotExact,
 }
 
 /// Per-request head output from one shared multi-sequence Gemma prefill.

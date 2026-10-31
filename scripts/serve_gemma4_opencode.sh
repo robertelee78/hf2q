@@ -82,6 +82,10 @@
 #                                    HF2Q_GEMMA_FULL_INPUT_CHECKPOINT; unset
 #                                    keeps the hf2q default (on where
 #                                    supported). 0 is the A/B kill switch.
+#     JOINT_WARM_PREFILL=0|1         (this script) forwards
+#                                    HF2Q_GEMMA_JOINT_WARM_PREFILL; unset
+#                                    keeps the hf2q default (on). 0 is the
+#                                    A/B kill switch (per-slot warm prefill).
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -178,6 +182,15 @@ case "${FULL_INPUT_CHECKPOINT:-}" in
         exit 2
         ;;
 esac
+JOINT_WARM_ENV=""
+case "${JOINT_WARM_PREFILL:-}" in
+    "") ;;
+    0|1) JOINT_WARM_ENV="$JOINT_WARM_PREFILL" ;;
+    *)
+        echo "JOINT_WARM_PREFILL must be 0, 1 or unset" >&2
+        exit 2
+        ;;
+esac
 
 # macOS bash 3.2 + `set -u`: expanding an EMPTY array via "${MMARGS[@]}"
 # is an unbound-variable error (this killed the no-mmproj boot
@@ -187,6 +200,7 @@ if [[ -f "$MMPROJ" ]]; then
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
+        ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
@@ -203,6 +217,7 @@ else
         HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
+        ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
