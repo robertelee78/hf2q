@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 
+import q2_run_audit
 import q3_identity
 import q3_metrics
 import q3_report
@@ -335,14 +336,23 @@ class Driver:
         output = Path(record["output"])
         case = json.loads(Path(record["case"]).read_text())
         receipt = q3_metrics.load_json(output / "receipt.json")
-        summary = q3_metrics.load_json(q5_case.expand(case["client"]["summary"], {"OUT": str(output)}))
+        summary_path = Path(q5_case.expand(case["client"]["summary"], {"OUT": str(output)}))
+        summary = q3_metrics.load_json(summary_path)
+        audit = None
         if not output.exists():
             outcome, kind, reason = "NotStarted", "other", "Q5 never created the run directory"
         else:
             outcome, kind, reason = q3_metrics.classify(receipt, summary, False)
             if outcome in ("Fail", "NotStarted"):
                 outcome, kind, reason = q3_metrics.classify(receipt, summary, q3_metrics.has_oom_marker(output / "server.stderr"))
+        if outcome == "Pass":
+            # A claimed Pass counts only after its raw client evidence re-derives it (ADR-063 Q2).
+            audit, failure = q2_run_audit.check_run(receipt, summary_path.parent, summary, stage["phase_plan"],
+                                                   self.plan["arms"][entry["arm"]]["engine_kind"], require_width=True)
+            if failure is not None:
+                outcome, kind, reason = "Invalid", None, failure
         metrics = q3_metrics.run_metrics(output, receipt, summary, stage["agents"], post_thermal)
+        metrics["audit"] = audit
         record.update(q5_exit=code, outcome=outcome, failure_kind=kind, reason=reason,
                       receipt_sha256=sha256(output / "receipt.json") if receipt is not None else None,
                       q5_verdict=None if receipt is None else receipt.get("verdict"),

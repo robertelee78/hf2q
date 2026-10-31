@@ -129,7 +129,10 @@ def assistant(message, finish, turn, seen_ids):
     function = call.get("function", {})
     name = function.get("name")
     require(name == EXPECTED[turn][0], "initial six-step workflow not followed")
-    args = loads(function.get("arguments", ""))
+    try:
+        args = loads(function.get("arguments", ""))
+    except json.JSONDecodeError as exc:
+        raise Invalid("incomplete/truncated tool arguments JSON") from exc
     require(isinstance(args, dict), "tool arguments not object")
     if name == "write_file":
         require(set(args) == {"path", "content"} and args["path"] == "src/ports.rs"
@@ -150,7 +153,15 @@ def unary(raw, model, turn, seen, engine_kind="hf2q", *, assistant_policy=None):
     message = choices[0].get("message")
     policy = assistant if assistant_policy is None else assistant_policy
     call = policy(message, choices[0].get("finish_reason"), turn, seen)
-    return message, call, usage(obj.get("usage"), turn, engine_kind)
+    stats = usage(obj.get("usage"), turn, engine_kind)
+    output_budget(stats, choices[0].get("finish_reason"))
+    return message, call, stats
+
+
+def output_budget(stats, finish):
+    """A response that spent the whole 8192-token allowance was cut by the budget; only `length` may say so."""
+    require(finish == "length" or stats["completion_tokens"] < 8192,
+            "output allowance exhausted without finish_reason length (silent truncation)")
 
 
 class SSE:
@@ -226,6 +237,7 @@ class SSE:
         if self.calls:
             self.message["tool_calls"] = [self.calls[0]]
         call = self.assistant_policy(self.message, self.finish, self.turn, self.seen)
+        output_budget(self.stats, self.finish)
         return self.message, call, self.stats
 
 

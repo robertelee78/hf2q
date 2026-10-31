@@ -63,8 +63,10 @@ class BoundReader:
         return loads(self.raw(bound, maximum))
 
 
-def replay_response(raw, request, turn, seen, engine, semantic_frames=None, *, assistant_policy=None):
-    """Use mature actual parser; framing is identical to exchange, not a new oracle."""
+def replay_response(raw, request, turn, seen, engine, semantic_frames=None, *, assistant_policy=None,
+                    progress_frames=None):
+    """Use mature actual parser; framing is identical to exchange, not a new oracle.
+    `progress_frames` collects frames that grew reasoning or semantic output (exchange's progress events)."""
     policy = {} if assistant_policy is None else {"assistant_policy": assistant_policy}
     if not request["stream"]:
         return unary(raw, request["model"], turn, seen, engine, **policy)
@@ -81,12 +83,27 @@ def replay_response(raw, request, turn, seen, engine, semantic_frames=None, *, a
         else:
             require(len(frame) <= 1, "multiline SSE data")
             if frame:
+                before = len(parser.message["reasoning_content"])
                 semantic = parser.feed(frame[0].decode("utf8", "strict"))
                 if semantic and semantic_frames is not None:
                     semantic_frames.append(True)
+                if progress_frames is not None and (semantic or len(parser.message["reasoning_content"]) > before):
+                    progress_frames.append(True)
                 frame = []
     require(not frame, "incomplete SSE frame")
     return parser.result()
+
+
+def request_wire(request, request_raw, family, engine):
+    """The archived request bytes are the actual canonical wire: no altered allowance or silent truncation."""
+    if engine == "hf2q":
+        require(wire(request, family) == request_raw, "canonical wire/no silent truncation")
+    else:
+        # Same validation boundary as actual peer exchange, retaining native metadata.
+        from family_peer import canonical
+        wire(canonical(request, family), family)
+        require(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
+                == request_raw, "canonical native peer wire")
 
 
 def require_clock(value):
@@ -177,14 +194,7 @@ def audit_agent(reader, agent, expected, name):
         from qwen38_n1_smoke import build_request
         require(request == build_request(expected["model"], request["messages"], request["tools"],
                     turn, expected["family"], expected["engine_kind"]), "actual request builder drift")
-        if expected["engine_kind"] == "hf2q":
-            require(wire(request, expected["family"]) == request_raw, "canonical wire/no silent truncation")
-        else:
-            # Same validation boundary as actual peer exchange, retaining native metadata.
-            from family_peer import canonical
-            wire(canonical(request, expected["family"]), expected["family"])
-            require(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
-                    == request_raw, "canonical native peer wire")
+        request_wire(request, request_raw, expected["family"], expected["engine_kind"])
         if messages is None:
             require(request == reader.obj(expected["initial_requests"][name]),
                     "externally frozen canonical initial task/schema")

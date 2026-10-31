@@ -345,7 +345,7 @@ The canonical four-agent prompts are identical on every run, so repeated cohorts
 
 - **Schedule.** Arms alternate in ABBA blocks: even instances run the subject first, odd instances the reference first. Each run is one `q5_calibration.py` calibration on a derived case (`cases/iNN-<arm>.json`), which is the arm's case plus `--instance N`, the approval `instance`/`instance_table_sha256` and the two instance sources. Runs are sequential, so only one runtime is loaded at a time, and Q5 preflight still refuses competitors.
 - **Variables.** Ambient `HF2Q_Q5_<NAME>` overrides go to each arm whose case declares `<NAME>`; one that neither case declares is refused. `--subject-var NAME=VALUE` and `--reference-var NAME=VALUE` override one arm only, for example the two approval templates. The effective overrides are part of the plan.
-- **Outcome per run.** An instance passes on an arm when the client summary is `FourAgentProtocolCompleteAwaitingIndependentReview`. A Q5 memory-envelope failure with a passing client is still a task pass; its Q5 verdict is recorded. After the four-agent release, a failed client, a server exit or a client timeout is a task failure of that arm. A run that never reached the release (Q5 preflight refusal, readiness failure or approval refusal) is `NotStarted`. Any other supervisor stop after the release is `Invalid`.
+- **Outcome per run.** An instance passes on an arm when the client summary is `FourAgentProtocolCompleteAwaitingIndependentReview` and the Q2 run audit (`q2_run_audit.py`, without the concurrency-width gate) re-derives that success from the raw client evidence; a summary whose receipts contradict it is `Invalid`. A Q5 memory-envelope failure with a passing client is still a task pass; its Q5 verdict is recorded. After the four-agent release, a failed client, a server exit or a client timeout is a task failure of that arm. A run that never reached the release (Q5 preflight refusal, readiness failure or approval refusal) is `NotStarted`. Any other supervisor stop after the release is `Invalid`.
 - **Halting and resume.** The driver halts at the first run without a task outcome. `--resume` with the same `--output` and an identical plan (cases, overrides, instance table, sources, negative control) continues: a `NotStarted` run gets a new attempt, and a run interrupted by the driver itself is scored from what is on disk. An `Invalid` run is terminal: there are no reruns after the task has started, so start a new campaign.
 - **Outputs.** `manifest.json` (plan, plan hash, every attempt with its argv, Q5 receipt hash, Q5 verdict, stop, client summary hash and per-agent status), `cases/`, `runs/<index>-iNN-<arm>-aK/` (the Q5 receipt directories) and `logs/`. When complete, it writes `outcomes.json` (`hf2q.q1.paired-task-outcomes.v1`) and adds the verdict to the manifest. The verdict is a port of `q1_decision_policy.py paired`: `Insufficient` if n < 24; `Loss` if the exact one-sided sign test gives p < 0.05; `BelowFloor` if the subject passes fewer than 75% of instances; `Inconclusive` if subject-only failures exceed reference-only failures by more than ⌊n/8⌋; otherwise `Pass`. Every passing patch still needs independent review.
 - `--dry-run` prints the plan, the ABBA schedule, instance 0's derived client argv and missing variables per arm, and launches nothing.
@@ -384,6 +384,44 @@ A floor-only family (for example DeepSeek-V4) omits the three `--reference-*` op
 | `q3_metrics.py` | Run outcome classification and per-run metrics from receipts |
 | `q3_stats.py` | Williams sequences, paired log-ratio estimator, stopping rule, family verdict |
 | `q3_report.py` | Stage effects, `verdict.json`, quality inputs, F2 rows |
+
+## Q2 adversarial controls and run audit
+
+`q2_run_audit.py` re-derives a settled four-agent run from its raw client evidence. Both campaigns call `check_run` on every claimed Pass and turn a contradicted claim into a terminal `Invalid` with the reason. It does not trust the coordinator's status, makespan or timing fields. It checks:
+
+- that every archived `turn-N/request.json` and `response.bin` matches its receipt hash and size, and that the request is the canonical wire;
+- each response, replayed through the actual parser, against the receipt usage and event counts;
+- v3 timing, recomputed;
+- request lineage, plus unique response ids across all agents and turns;
+- assistant output for another agent's identity sentence;
+- the scoring, by re-running the coordinator `aggregate`;
+- owned cleanup;
+- the makespan, recomputed from the release and completion clocks;
+- phase-cohort membership and triggers;
+- client-observed co-progress width.
+
+The co-progress width counts agents whose progress frames (`progress_event_monotonic_ns`, any SSE frame that grew reasoning or semantic output) alternate at least four times inside one streamed request. Overlapping HTTP lifetimes alone count for nothing. Q3 requires width 4 for `n4`, the largest cohort for `K+M`, and only agent-0 for `n1`; a deliberately serialized service is rejected. The width is a client-side lower bound. Physical batch membership and pure prefill/decode phases come from the server phase trace (`f2_trace.py`).
+
+`q2_fake_service.py` is test support only: a model-free OpenAI-compatible loopback service whose fault table injects:
+
+- role-only and reasoning-only SSE;
+- an empty final summary;
+- wrong or truncated tool arguments;
+- reused tool-call or response ids;
+- foreign identity text;
+- silent truncation (8192 completion tokens under a non-length finish), an inflated output allowance and a `length` finish;
+- cache and usage lies;
+- a swapped model;
+- known delays;
+- one-request-at-a-time serialization.
+
+`test_q2_adversarial_controls.py` runs the control matrix. The live controls use four real client processes, the receipt and summary forgeries go through the audit, and the false wins go through the actual Q3 and quality drivers. Each test asserts the rejection reason. The matrix, live results and the boundary of what client evidence can prove are in [docs/research/adr063-q2-adversarial-controls.md](../../docs/research/adr063-q2-adversarial-controls.md).
+
+| File | Role |
+| --- | --- |
+| `q2_run_audit.py` | Settled-run audit used by `q3_campaign.py` and `quality_campaign.py` |
+| `q2_fake_service.py` | Model-free fake service, honest-run fixtures and live four-process driver (tests only) |
+| `test_q2_adversarial_controls.py` | Wire, audit, live-concurrency, injected-delay and campaign controls |
 
 ## F2 scoreboard rendering
 

@@ -161,7 +161,7 @@ def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"
             endpoint.username is None, "only bound loopback /v1 endpoint allowed")
     connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=900)
     started_ns = clock_ns()
-    semantic_events_ns = []
+    semantic_events_ns, progress_events_ns = [], []
     started = time.monotonic()
     previous_alarm = signal.signal(signal.SIGALRM, request_timeout)
     previous_timer = signal.setitimer(signal.ITIMER_REAL, deadline)
@@ -228,11 +228,16 @@ def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"
                                 record["first_frame_seconds"] = elapsed
                             before = len(parser.message["reasoning_content"])
                             semantic = parser.feed(frame[0].decode("utf8", "strict"))
-                            if semantic:
-                                append_semantic_event(semantic_events_ns, clock_ns())
+                            grew = len(parser.message["reasoning_content"]) > before
+                            if semantic or grew:
+                                # Progress is any decoded delta (reasoning or semantic); semantic
+                                # events are the subset that counts for TTFT.
+                                event_ns = clock_ns()
+                                append_semantic_event(progress_events_ns, event_ns)
+                                if semantic:
+                                    append_semantic_event(semantic_events_ns, event_ns)
                             if semantic and record["semantic_ttft_seconds"] is None:
                                 record["semantic_ttft_seconds"] = elapsed
-                            grew = len(parser.message["reasoning_content"]) > before
                             if on_first_token is not None and (semantic or grew):
                                 on_first_token(clock_ns())
                                 on_first_token = None
@@ -240,13 +245,14 @@ def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"
                                 record["first_reasoning_seconds"] = elapsed
                             frame = []
                 require(not frame and not pending, "incomplete SSE line/frame")
-                message, call, stats = parser.result()
                 require(record["semantic_ttft_seconds"] is not None, "no semantic SSE progress")
+                message, call, stats = parser.result()
         terminal_ns = clock_ns()
         record["f2_clock_id"] = CLOCK_ID
         record["semantic_timing_v3"] = semantic_timing_v3(
             started_ns, semantic_events_ns, terminal_ns, request["stream"], True)
         record["semantic_event_monotonic_ns"] = semantic_events_ns
+        record["progress_event_monotonic_ns"] = progress_events_ns
         record["send_monotonic_ns"] = started_ns
         record["validated_terminal_monotonic_ns"] = terminal_ns
         record.update({"usage": stats, "elapsed_seconds": time.monotonic() - started,
