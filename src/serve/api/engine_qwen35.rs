@@ -4163,19 +4163,17 @@ impl Qwen35PrefillState {
             let chunk_started = Instant::now();
             let lease =
                 supervisor.arm("Qwen35 bounded prefill", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
+            // ADR-059: a bound graft skips the catch-up because the MTP
+            // arena never receives the graft (see `classify_slot_request`).
             let mtp_prefill = (self.cached_tokens == 0 || self.mtp_pending_hidden.is_some())
                 && !self.speculation_unavailable
-                && self.vision.is_none()
-                // ADR-059: the MTP cache is a separate slot arena that never
-                // receives the graft; under a bound graft its target logits
-                // would verify drafts against the ungrafted distribution.
-                // Skip the catch-up (an optimization, never a semantic path).
-                && qwen.model.kv_graft.is_none()
-                && qwen.speculation.policy()
-                    == super::qwen35_speculation::QwenSpeculationPolicy::Auto
-                && is_qwen_server_speculation_exact_eligible(&self.params)
-                && qwen.model.mtp.is_some()
-                && kv_cache.mtp_slot.is_some();
+                && super::qwen35_speculation::prefill_mtp_catchup_allowed(
+                    qwen.speculation.policy(),
+                    is_qwen_server_speculation_exact_eligible(&self.params),
+                    self.vision.is_none(),
+                    qwen.model.mtp.is_some() && kv_cache.mtp_slot.is_some(),
+                    qwen.model.kv_graft.is_some(),
+                );
             let (forward, mtp_hidden) = if let Some(vision) = vision_chunk.as_ref() {
                 let soft_tokens: Vec<_> = vision
                     .soft_tokens
@@ -4499,6 +4497,12 @@ pub(in crate::serve::api) struct Qwen35CoherentTarget {
 #[path = "engine_qwen35/joint_decode.rs"]
 mod joint_decode;
 pub(in crate::serve::api) use joint_decode::Qwen35JointLane;
+#[cfg(test)]
+#[path = "engine_qwen35/speculation_qualification_tests.rs"]
+mod speculation_qualification_tests;
+#[cfg(test)]
+#[path = "engine_qwen35/speculation_real_artifact_tests.rs"]
+mod speculation_real_artifact_tests;
 
 const QWEN35_REPETITION_WINDOW: usize = 64;
 
