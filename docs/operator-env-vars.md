@@ -216,7 +216,7 @@ on the Gemma 4 SlotAware worker. It is read once when the worker starts.
   reusable prefix) is admitted without a yield between requests and
   prefilled as one transaction. Projections, norms, FFN/MoE and the output
   head run once over every suffix row; attention runs per slot with the
-  single-slot kernel. Each request's tokens, logprobs and cache bytes are
+  single-slot route. Each request's tokens, logprobs and cache bytes are
   bitwise equal to the per-slot prefill. A lane joins only if its suffix is
   longer than 32 tokens and the cohort stays within 4,096 rows; other
   requests prefill per slot as before.
@@ -229,4 +229,25 @@ or `HF2Q_MM_ID_ROUTING_THRESHOLD` is set, because those change the per-slot
 route the cohort must equal. The worker logs `Gemma joint warm prefill worker
 decision` at start, and each cohort logs `Gemma4 installed prefills advanced in
 one aggregate-bounded transaction` with `transaction="joint warm"`. Evidence:
+`docs/research/adr063-gemma-four-agent-reuse.md`.
+
+### Gemma tiled warm attention (default on)
+
+`HF2Q_GEMMA_WARM_TILED_ATTENTION` selects the attention kernel of Gemma 4
+warm prefills (ADR-063 Stage 2): every single-slot prefill that resumes a
+cached prefix, and every lane of a joint warm cohort. It is read once when
+the model loads.
+- **Unset, `1`, `on` or `true` (default):** tiled F16 flash attention over
+  the slot's K and dequantized V range, one sequence per dispatch (1,024-query
+  sliding chunks, 4,096-query global chunks). Suffixes shorter than 32 tokens
+  keep vec-hybrid attention. This changes warm-prefill numerics once against
+  the `0` route (Q1 Class B); a joint cohort stays bitwise equal to its
+  per-slot prefills.
+- **`0`, `off` or `false`:** kill switch; warm prefills use the vec-hybrid
+  kernel (one decode-style pass per query over the whole history).
+- **Any other value:** logs a warning and keeps the default.
+
+Installed long-prompt lanes (prompts over 4,096 tokens) keep their own
+switch, `HF2Q_GEMMA_TILED_LIVE`. The model load logs `Gemma warm live
+attention kernel`, and each live prefill banner prints `live=`. Evidence:
 `docs/research/adr063-gemma-four-agent-reuse.md`.

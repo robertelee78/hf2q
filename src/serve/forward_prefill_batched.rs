@@ -40,6 +40,9 @@ use crate::inference::models::gemma4::{
 use crate::serve::forward_mlx_shared::{
     dispatch_qmatmul, dispatch_rms_norm_unit_perhead_dual_perm,
 };
+use crate::serve::gemma_live_attention::{
+    encode_live_layer_attention, LiveLayer, LiveRoute, LiveSeq, LiveSpan, LiveVecScratch,
+};
 use crate::serve::multi_seq_kv::SlotId;
 
 fn validate_batched_prefill_argmax(value: f32, head_row: usize) -> Result<()> {
@@ -50,46 +53,110 @@ fn validate_batched_prefill_argmax(value: f32, head_row: usize) -> Result<()> {
     Ok(())
 }
 
-/// Bound the live-prefix attention scratch while keeping every dispatch in a
-/// single hybrid-kernel scheduling bucket. The cache-length thresholds mirror
-/// mlx-native's current hybrid NWG/NSG policies.
-const GEMMA_LIVE_QUERY_CHUNK: usize = 256;
-const GEMMA_LIVE_TILED_QUERY_CHUNK: usize = 1024;
+/// Test-only per-layer capture of batched prefills on the calling thread
+/// (ADR-063 Stage 2 envelope localization). While armed, every layer
+/// commits and waits, then copies its attention output (after the FWHT sign
+/// undo) and its residual output to the host.
+#[cfg(test)]
+pub(crate) mod live_layer_probe {
+    use std::cell::RefCell;
 
-fn gemma_tiled_live_enabled() -> bool {
-    !matches!(
-        std::env::var("HF2Q_GEMMA_TILED_LIVE").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
-    )
-}
-
-fn gemma_live_query_chunk_len(start_pos: usize, remaining: usize) -> usize {
-    let mut len = remaining.min(GEMMA_LIVE_QUERY_CHUNK);
-    for boundary in [512usize, 1024usize] {
-        if start_pos < boundary && start_pos.saturating_add(len) > boundary {
-            len = boundary - start_pos;
-            break;
-        }
+    pub(crate) struct LayerCapture {
+        pub(crate) layer: usize,
+        pub(crate) sliding: bool,
+        pub(crate) head_dim: usize,
+        /// Attention output `[rows, heads, head_dim]`.
+        pub(crate) attn: Vec<f32>,
+        /// Residual stream after the layer `[rows, hidden]`.
+        pub(crate) hidden: Vec<f32>,
     }
-    len.max(1)
+
+    thread_local! {
+        static CAPTURES: RefCell<Option<Vec<LayerCapture>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm() {
+        CAPTURES.with(|captures| *captures.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(crate) fn armed() -> bool {
+        CAPTURES.with(|captures| captures.borrow().is_some())
+    }
+
+    pub(crate) fn push(capture: LayerCapture) {
+        CAPTURES.with(|captures| {
+            if let Some(list) = captures.borrow_mut().as_mut() {
+                list.push(capture);
+            }
+        });
+    }
+
+    /// Disarm and return every capture since `arm`.
+    pub(crate) fn take() -> Vec<LayerCapture> {
+        CAPTURES.with(|captures| captures.borrow_mut().take().unwrap_or_default())
+    }
 }
 
-/// Logical query offset inside a chronological sliding-cache staging buffer.
-///
-/// The stage copies up to `cache_capacity - 1` history rows before the current
-/// suffix chunk. Its per-query position must use that exact history length;
-/// capping at the model sliding-window size would point long linear-resume
-/// queries at the wrong staged rows.
-fn gemma_live_stage_history_len(absolute_start: usize, cache_capacity: usize) -> usize {
-    absolute_start.min(cache_capacity.saturating_sub(1))
+#[cfg(test)]
+fn live_layer_probe_armed() -> bool {
+    live_layer_probe::armed()
+}
+
+#[cfg(not(test))]
+fn live_layer_probe_armed() -> bool {
+    false
+}
+
+/// Record one finished layer when the probe is armed (tests only).
+#[cfg(test)]
+fn live_layer_probe_capture(
+    layer: usize,
+    sliding: bool,
+    (heads, head_dim, hidden_size): (usize, usize, usize),
+    rows: usize,
+    attn: &MlxBuffer,
+    hidden: &MlxBuffer,
+) -> Result<()> {
+    if !live_layer_probe::armed() {
+        return Ok(());
+    }
+    let attn = attn
+        .as_slice::<f32>()
+        .map_err(|e| anyhow::anyhow!("probe attention L{layer}: {e}"))?[..rows * heads * head_dim]
+        .to_vec();
+    let hidden = hidden
+        .as_slice::<f32>()
+        .map_err(|e| anyhow::anyhow!("probe hidden L{layer}: {e}"))?[..rows * hidden_size]
+        .to_vec();
+    live_layer_probe::push(live_layer_probe::LayerCapture {
+        layer,
+        sliding,
+        head_dim,
+        attn,
+        hidden,
+    });
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn live_layer_probe_capture(
+    _layer: usize,
+    _sliding: bool,
+    _shape: (usize, usize, usize),
+    _rows: usize,
+    _attn: &MlxBuffer,
+    _hidden: &MlxBuffer,
+) -> Result<()> {
+    Ok(())
 }
 
 fn gemma_batched_mask_seq_len(seq_len: usize, live_prefix_resume: bool) -> usize {
     if live_prefix_resume {
-        // Live resume uses the hybrid KV kernel with absolute query positions
-        // and does not consume the cold-prefill square masks. Keep the legacy
-        // setup buffers valid for the shared control flow without allocating
-        // O(suffix²) memory for data that is never read.
+        // Live resume attends through `gemma_live_attention`, which builds
+        // only per-chunk masks, and never consumes the cold-prefill square
+        // masks. Keep the legacy setup buffers valid for the shared control
+        // flow without allocating O(suffix²) memory for data never read.
         1
     } else {
         seq_len
@@ -810,8 +877,17 @@ impl MlxModelWeights {
         PROFILE_GPU_TS_ON.store(profile_gpu_ts_on, Ordering::Relaxed);
         let profile_buckets_on = profile_gpu_ts_on || std::env::var("HF2Q_PROFILE_BUCKETS").is_ok();
 
+        // Live resume attention route (ADR-063 Stage 2): a single-slot
+        // resume and a `PerSlotExact` cohort resolve the same route.
+        let live_route = live_prefix_resume.then(|| {
+            LiveRoute::resolve(
+                self.multi_seq_prefill.as_ref().map(|ms| ms.live_attention),
+                self.warm_live_kernel,
+            )
+        });
+
         eprintln!(
-            "Batched prefill: KV={:?}, seq_len={}, path={}, globals={}{}",
+            "Batched prefill: KV={:?}, seq_len={}, path={}, globals={}{}{}{}",
             kv_dtype,
             seq_len,
             if use_no_fa {
@@ -826,6 +902,9 @@ impl MlxModelWeights {
             } else {
                 "flash-attn"
             },
+            // A live resume never takes the cold attention path above.
+            live_route.map_or("", |_| ", live="),
+            live_route.map_or("", LiveRoute::label),
             if profile_buckets_on {
                 " [BUCKET_PROFILE]"
             } else {
@@ -1414,110 +1493,60 @@ impl MlxModelWeights {
                 }
             }
         }
-        // Live attention addresses each sequence through its own slot view, so
-        // every query row reads view slot 0 (the single-slot binding).
-        let live_slot_ids: Option<MlxBuffer> = if live_prefix_resume {
-            let mut slots = alloc_u32(seq_len, "pf_live_slot_ids")?;
-            slots
-                .as_mut_slice::<u32>()
-                .map_err(|e| anyhow::anyhow!("live slot ids write: {e}"))?
-                .fill(0);
-            Some(slots)
-        } else {
-            None
-        };
-        // Resumed multi-sequence attention route; tiled only for installed
-        // long-prompt lanes, and only while `HF2Q_GEMMA_TILED_LIVE` allows it.
-        let multi_seq_live_tiled = live_prefix_resume
-            && self
-                .multi_seq_prefill
-                .as_ref()
-                .is_some_and(|ms| ms.live_attention == GemmaLiveAttention::Tiled)
-            && gemma_tiled_live_enabled();
-        let live_sliding_cache_capacity = if live_prefix_resume {
-            let capacities: Vec<usize> = if let Some(ms) = self.multi_seq_prefill.as_ref() {
-                ms.full_views_hybrid
-                    .iter()
-                    .filter(|cache| cache.is_sliding)
-                    .map(|cache| cache.capacity)
+        // Live resume: each sequence's rows in the suffix stream, and the
+        // vec-hybrid inputs of the shared live attention
+        // (`gemma_live_attention`). The tiled F16 route allocates its scratch
+        // per chunk, so a forward with no vec-hybrid sequence allocates none.
+        let live_spans: Vec<LiveSpan> = match (live_route, self.multi_seq_prefill.as_ref()) {
+            (None, _) => Vec::new(),
+            (Some(_), Some(ms)) => {
+                anyhow::ensure!(
+                    ms.seq_lens.len() == ms.seq_offsets.len()
+                        && ms.seq_lens.len() == ms.start_positions.len()
+                        && ms.seq_lens.len() == ms.slot_views_hybrid.len(),
+                    "multi-seq live descriptor shape mismatch"
+                );
+                (0..ms.seq_lens.len())
+                    .map(|seq_idx| LiveSpan {
+                        offset: ms.seq_offsets[seq_idx],
+                        rows: ms.seq_lens[seq_idx],
+                        start: ms.start_positions[seq_idx],
+                    })
                     .collect()
-            } else {
-                self.hybrid_kv
-                    .as_ref()
-                    .into_iter()
-                    .flatten()
-                    .filter(|cache| cache.is_sliding)
-                    .map(|cache| cache.capacity)
-                    .collect()
-            };
-            let capacity = capacities.first().copied().ok_or_else(|| {
-                anyhow::anyhow!("batched live resume has no sliding hybrid cache")
-            })?;
-            anyhow::ensure!(
-                capacities.iter().all(|&candidate| candidate == capacity),
-                "batched live resume sliding cache capacities differ"
-            );
-            capacity
-        } else {
-            sliding_layer_capacity
-        };
-        let live_linear_positions: Option<MlxBuffer> = if live_prefix_resume {
-            let mut positions = alloc_u32(seq_len, "pf_live_linear_positions")?;
-            let values = positions
-                .as_mut_slice::<u32>()
-                .map_err(|e| anyhow::anyhow!("live linear positions write: {e}"))?;
-            if let Some(ms) = self.multi_seq_prefill.as_ref() {
-                for seq_idx in 0..ms.seq_lens.len() {
-                    let seq_offset = ms.seq_offsets[seq_idx];
-                    let seq_len_i = ms.seq_lens[seq_idx];
-                    let start_i = ms.start_positions[seq_idx];
-                    let mut local_start = 0usize;
-                    while local_start < seq_len_i {
-                        let chunk_len = gemma_live_query_chunk_len(
-                            start_i + local_start,
-                            seq_len_i - local_start,
-                        );
-                        let history_len = gemma_live_stage_history_len(
-                            start_i + local_start,
-                            live_sliding_cache_capacity,
-                        );
-                        for local in 0..chunk_len {
-                            values[seq_offset + local_start + local] = (history_len + local) as u32;
-                        }
-                        local_start += chunk_len;
-                    }
-                }
-            } else {
-                let mut chunk_start = 0usize;
-                while chunk_start < seq_len {
-                    let chunk_len =
-                        gemma_live_query_chunk_len(start_pos + chunk_start, seq_len - chunk_start);
-                    let history_len = gemma_live_stage_history_len(
-                        start_pos + chunk_start,
-                        live_sliding_cache_capacity,
-                    );
-                    for local in 0..chunk_len {
-                        values[chunk_start + local] = (history_len + local) as u32;
-                    }
-                    chunk_start += chunk_len;
-                }
             }
-            Some(positions)
-        } else {
-            None
+            (Some(_), None) => vec![LiveSpan {
+                offset: 0,
+                rows: seq_len,
+                start: start_pos,
+            }],
         };
-        let live_sdpa_tmp: Option<MlxBuffer> = if live_prefix_resume {
-            let chunk_queries = seq_len.min(GEMMA_LIVE_QUERY_CHUNK);
-            let tmp_bytes = mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(
-                (chunk_queries * nh) as u32,
-                max_hd as u32,
-            );
-            Some(
-                dev.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
-                    .map_err(|e| anyhow::anyhow!("batched live sdpa tmp: {e}"))?,
-            )
-        } else {
-            None
+        let live_vec_scratch: Option<LiveVecScratch> = match live_route {
+            Some(route) => {
+                let capacities: Vec<usize> = if let Some(ms) = self.multi_seq_prefill.as_ref() {
+                    ms.full_views_hybrid
+                        .iter()
+                        .filter(|cache| cache.is_sliding)
+                        .map(|cache| cache.capacity)
+                        .collect()
+                } else {
+                    self.hybrid_kv
+                        .as_ref()
+                        .into_iter()
+                        .flatten()
+                        .filter(|cache| cache.is_sliding)
+                        .map(|cache| cache.capacity)
+                        .collect()
+                };
+                let capacity = capacities.first().copied().ok_or_else(|| {
+                    anyhow::anyhow!("batched live resume has no sliding hybrid cache")
+                })?;
+                anyhow::ensure!(
+                    capacities.iter().all(|&candidate| candidate == capacity),
+                    "batched live resume sliding cache capacities differ"
+                );
+                LiveVecScratch::alloc(dev, route, &live_spans, capacity, seq_len, nh, max_hd)?
+            }
+            None => None,
         };
         // ADR-040 iter-G(a) — per-token sequence-id buffer for the GPU
         // block-diagonal mask kernel. In multi-seq mode, `pf_seq_id[i]` is the
@@ -2488,980 +2517,53 @@ impl MlxModelWeights {
                 let route_through_nofa =
                     !live_prefix_resume && (use_no_fa || force_global_nofa) && !is_sliding;
                 if live_prefix_resume {
+                    // One shared per-sequence attention (ADR-063 Stage 2):
+                    // a single-slot resume passes its own view, a resumed
+                    // multi-sequence cohort passes each lane's slot view.
+                    let route = live_route.expect("live route resolved with live resume");
+                    let live_layer = LiveLayer {
+                        layer_idx,
+                        nh,
+                        nkv,
+                        hd,
+                        sliding_window: sw as u32,
+                        graft_len,
+                        tq_scale_factor_d512,
+                        tq_codebook_bits: tq_codebook_bits_prefill,
+                        q: &pf_q_normed,
+                        k: &pf_k_normed,
+                        v: &pf_v_normed,
+                        out: &pf_sdpa_out,
+                        positions: &pf_positions,
+                        vec: live_vec_scratch.as_ref(),
+                        total_rows: seq_len,
+                    };
                     if let Some(ms) = self.multi_seq_prefill.as_ref() {
-                        let full_layer_kv = &ms.full_views_hybrid[layer_idx];
-                        let cap = full_layer_kv.capacity;
-                        let is_ring = full_layer_kv.is_sliding;
-                        anyhow::ensure!(
-                            ms.seq_lens.len() == ms.seq_offsets.len()
-                                && ms.seq_lens.len() == ms.start_positions.len()
-                                && ms.seq_lens.len() == ms.slot_views_hybrid.len(),
-                            "multi-seq live descriptor shape mismatch"
-                        );
-
-                        // Global layers are append-only. Materialize every
-                        // sequence's suffix into its own slot view first, then
-                        // let the batched attention kernel select the slot for
-                        // each query row. The expensive projections and MoE
-                        // above have already run once over the concatenated
-                        // suffix stream.
-                        if !is_ring {
-                            for seq_idx in 0..ms.seq_lens.len() {
-                                let slot_layer_kv = &ms.slot_views_hybrid[seq_idx][layer_idx];
-                                let seq_offset = ms.seq_offsets[seq_idx];
-                                let seq_len_i = ms.seq_lens[seq_idx];
-                                // ADR-059 (3c): the FULL-layer write position is
-                                // absolute — the slot's graft rows occupy
-                                // `0..graft_len` (the engine spliced them at
-                                // slot admission), so the live suffix continues
-                                // at `graft_len + start_i`.
-                                let start_i = graft_len + ms.start_positions[seq_idx];
-                                anyhow::ensure!(
-                                    start_i + seq_len_i <= cap,
-                                    "multi-seq live global KV overflow L{layer_idx}: start={start_i} len={seq_len_i} cap={cap}"
-                                );
-                                s.barrier_between(
-                                    &[&pf_k_normed, &pf_v_normed],
-                                    &[
-                                        &slot_layer_kv.k,
-                                        &slot_layer_kv.v_packed,
-                                        &slot_layer_kv.v_norms,
-                                    ],
-                                );
-                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                    s.encoder_mut(), reg, metal_dev,
-                                    &pf_k_normed, &slot_layer_kv.k,
-                                    nkv as u32, hd as u32, cap as u32,
-                                    start_i as u32, seq_len_i as u32, seq_offset as u32,
-                                ).map_err(|e| anyhow::anyhow!("multi-seq live hybrid F16 K L{layer_idx}: {e}"))?;
-                                if slot_layer_kv.v_packed.dtype() == DType::F16 {
-                                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                        s.encoder_mut(), reg, metal_dev,
-                                        &pf_v_normed, &slot_layer_kv.v_packed,
-                                        nkv as u32, hd as u32, cap as u32,
-                                        start_i as u32, seq_len_i as u32, seq_offset as u32,
-                                    ).map_err(|e| anyhow::anyhow!("multi-seq live hybrid F16 V L{layer_idx}: {e}"))?;
-                                } else {
-                                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
-                                        s.encoder_mut(), reg, metal_dev,
-                                        &pf_v_normed, &slot_layer_kv.v_packed, &slot_layer_kv.v_norms,
-                                        nkv as u32, hd as u32, cap as u32,
-                                        start_i as u32, seq_len_i as u32, seq_offset as u32,
-                                        false, tq_scale_factor_d512, tq_codebook_bits_prefill,
-                                    ).map_err(|e| anyhow::anyhow!("multi-seq live hybrid FWHT V L{layer_idx}: {e}"))?;
-                                }
-                            }
-                        }
-
-                        let slots = live_slot_ids
-                            .as_ref()
-                            .expect("live slot ids allocated with live resume");
-                        let tmp = live_sdpa_tmp
-                            .as_ref()
-                            .expect("live SDPA tmp allocated with live resume");
-                        let row_elems = nh * hd;
-                        let norms_per_pos = full_layer_kv.norms_per_pos;
-                        let stage_v_dtype = full_layer_kv.v_packed.dtype();
-                        // Chronological ring stage: up to `cap - 1` history rows
-                        // plus one query chunk.
-                        let alloc_ring_stage = |stage_rows: usize| -> Result<(
-                            MlxBuffer,
-                            MlxBuffer,
-                            MlxBuffer,
-                            usize,
-                            usize,
-                        )> {
-                            let stage_capacity = cap.saturating_sub(1) + stage_rows;
-                            anyhow::ensure!(
-                                stage_capacity > 0 && norms_per_pos > 0,
-                                "multi-seq live ring stage L{layer_idx} has invalid shape"
-                            );
-                            let k_elements = nkv * stage_capacity * hd;
-                            let v_elements = nkv * stage_capacity * hd;
-                            let norm_elements = nkv * stage_capacity * norms_per_pos;
-                            // SAFETY: each dispatch below initializes the
-                            // exact history+suffix prefix it reads.
-                            let k = unsafe {
-                                dev.alloc_buffer_for_overwrite(
-                                    k_elements * DType::F16.size_of(),
-                                    DType::F16,
-                                    vec![nkv, stage_capacity, hd],
-                                )
-                            }
-                            .map_err(|e| {
-                                anyhow::anyhow!("multi-seq live ring stage K L{layer_idx}: {e}")
-                            })?;
-                            let v = unsafe {
-                                dev.alloc_buffer_for_overwrite(
-                                    v_elements * stage_v_dtype.size_of(),
-                                    stage_v_dtype,
-                                    vec![nkv, stage_capacity, hd],
-                                )
-                            }
-                            .map_err(|e| {
-                                anyhow::anyhow!("multi-seq live ring stage V L{layer_idx}: {e}")
-                            })?;
-                            let norms = unsafe {
-                                dev.alloc_buffer_for_overwrite(
-                                    norm_elements * DType::F32.size_of(),
-                                    DType::F32,
-                                    vec![nkv, stage_capacity, norms_per_pos],
-                                )
-                            }
-                            .map_err(|e| {
-                                anyhow::anyhow!("multi-seq live ring stage norms L{layer_idx}: {e}")
-                            })?;
-                            Ok((k, v, norms, stage_capacity, norms_per_pos))
-                        };
-                        // The tiled route shares one cohort-sized stage. The
-                        // vec-hybrid route sizes each sequence's stage from its
-                        // own rows, exactly as the single-slot path does.
-                        let shared_ring_stage = if is_ring && multi_seq_live_tiled {
-                            Some(alloc_ring_stage(seq_len.min(GEMMA_LIVE_TILED_QUERY_CHUNK))?)
-                        } else {
-                            None
-                        };
-
-                        for seq_idx in 0..ms.seq_lens.len() {
-                            let slot_layer_kv = &ms.slot_views_hybrid[seq_idx][layer_idx];
-                            let seq_offset = ms.seq_offsets[seq_idx];
-                            let seq_len_i = ms.seq_lens[seq_idx];
-                            let start_i = ms.start_positions[seq_idx];
-                            let own_ring_stage = if is_ring && !multi_seq_live_tiled {
-                                Some(alloc_ring_stage(seq_len_i.min(GEMMA_LIVE_QUERY_CHUNK))?)
-                            } else {
-                                None
-                            };
-                            let ring_stage = shared_ring_stage.as_ref().or(own_ring_stage.as_ref());
-                            let mut local_start = 0usize;
-                            while local_start < seq_len_i {
-                                let chunk_len = if multi_seq_live_tiled {
-                                    if is_ring {
-                                        (seq_len_i - local_start).min(GEMMA_LIVE_TILED_QUERY_CHUNK)
-                                    } else {
-                                        seq_len_i - local_start
-                                    }
-                                } else {
-                                    gemma_live_query_chunk_len(
-                                        start_i + local_start,
-                                        seq_len_i - local_start,
-                                    )
-                                };
-                                let chunk_end = local_start + chunk_len;
-                                let concat_start = seq_offset + local_start;
-                                let absolute_chunk_start = start_i + local_start;
-                                let q = pf_q_normed.slice_view(
-                                    (concat_start * row_elems * std::mem::size_of::<f32>()) as u64,
-                                    chunk_len * row_elems,
-                                );
-                                let output = pf_sdpa_out.slice_view(
-                                    (concat_start * row_elems * std::mem::size_of::<f32>()) as u64,
-                                    chunk_len * row_elems,
-                                );
-                                let (
-                                    slot_chunk,
-                                    attn_k,
-                                    attn_v,
-                                    attn_norms,
-                                    pos_source,
-                                    kv_seq_len,
-                                    kv_capacity,
-                                    mask_type,
-                                    sliding_window,
-                                ) = if let Some((
-                                    stage_k,
-                                    stage_v,
-                                    stage_norms,
-                                    stage_capacity,
-                                    norms_per_pos,
-                                )) = ring_stage
-                                {
-                                    let history_len =
-                                        absolute_chunk_start.min(cap.saturating_sub(1));
-                                    let stage_seq_len = history_len + chunk_len;
-                                    s.barrier_between(
-                                        &[
-                                            &slot_layer_kv.k,
-                                            &slot_layer_kv.v_packed,
-                                            &slot_layer_kv.v_norms,
-                                        ],
-                                        &[stage_k, stage_v, stage_norms],
-                                    );
-                                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_linearize_ring_bytes(
-                                            s.encoder_mut(), reg, metal_dev,
-                                            &slot_layer_kv.k, stage_k,
-                                            nkv as u32, cap as u32, *stage_capacity as u32,
-                                            history_len as u32, absolute_chunk_start as u32,
-                                            (hd * DType::F16.size_of()) as u32,
-                                        ).map_err(|e| anyhow::anyhow!("multi-seq live ring stage K history L{layer_idx}: {e}"))?;
-                                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_linearize_ring_bytes(
-                                            s.encoder_mut(), reg, metal_dev,
-                                            &slot_layer_kv.v_packed, stage_v,
-                                            nkv as u32, cap as u32, *stage_capacity as u32,
-                                            history_len as u32, absolute_chunk_start as u32,
-                                            (hd * slot_layer_kv.v_packed.dtype().size_of()) as u32,
-                                        ).map_err(|e| anyhow::anyhow!("multi-seq live ring stage V history L{layer_idx}: {e}"))?;
-                                    if slot_layer_kv.v_packed.dtype() != DType::F16 {
-                                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_linearize_ring_bytes(
-                                                s.encoder_mut(), reg, metal_dev,
-                                                &slot_layer_kv.v_norms, stage_norms,
-                                                nkv as u32, cap as u32, *stage_capacity as u32,
-                                                history_len as u32, absolute_chunk_start as u32,
-                                                (*norms_per_pos * DType::F32.size_of()) as u32,
-                                            ).map_err(|e| anyhow::anyhow!("multi-seq live ring stage norm history L{layer_idx}: {e}"))?;
-                                    }
-                                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                            s.encoder_mut(), reg, metal_dev,
-                                            &pf_k_normed, stage_k,
-                                            nkv as u32, hd as u32, *stage_capacity as u32,
-                                            history_len as u32, chunk_len as u32, concat_start as u32,
-                                        ).map_err(|e| anyhow::anyhow!("multi-seq live ring stage K suffix L{layer_idx}: {e}"))?;
-                                    if slot_layer_kv.v_packed.dtype() == DType::F16 {
-                                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                                s.encoder_mut(), reg, metal_dev,
-                                                &pf_v_normed, stage_v,
-                                                nkv as u32, hd as u32, *stage_capacity as u32,
-                                                history_len as u32, chunk_len as u32, concat_start as u32,
-                                            ).map_err(|e| anyhow::anyhow!("multi-seq live ring stage V suffix L{layer_idx}: {e}"))?;
-                                    } else {
-                                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
-                                                s.encoder_mut(), reg, metal_dev,
-                                                &pf_v_normed, stage_v, stage_norms,
-                                                nkv as u32, hd as u32, *stage_capacity as u32,
-                                                history_len as u32, chunk_len as u32, concat_start as u32,
-                                                false, tq_scale_factor_d512, tq_codebook_bits_prefill,
-                                            ).map_err(|e| anyhow::anyhow!("multi-seq live ring stage FWHT V suffix L{layer_idx}: {e}"))?;
-                                    }
-                                    (
-                                        slots.slice_view(0, chunk_len),
-                                        stage_k,
-                                        stage_v,
-                                        stage_norms,
-                                        live_linear_positions
-                                            .as_ref()
-                                            .expect("live linear positions allocated"),
-                                        stage_seq_len as u32,
-                                        *stage_capacity as u32,
-                                        3u32,
-                                        sw as u32,
-                                    )
-                                } else {
-                                    // The sequence's own slot view addressed as
-                                    // slot 0: the single-slot binding.
-                                    (
-                                        slots.slice_view(0, chunk_len),
-                                        &slot_layer_kv.k,
-                                        &slot_layer_kv.v_packed,
-                                        &slot_layer_kv.v_norms,
-                                        &pf_positions,
-                                        // ADR-059 (3c): the full-layer live read
-                                        // extent covers the slot's graft rows
-                                        // (`0..graft_len`) plus the prompt prefix
-                                        // and this chunk — the graft participates
-                                        // in live prefill attention, and the
-                                        // causal mask by absolute position
-                                        // (`pf_positions`, graft-shifted) stays
-                                        // exact because row index == absolute
-                                        // position for full layers.
-                                        (graft_len + start_i + chunk_end) as u32,
-                                        cap as u32,
-                                        1u32,
-                                        0u32,
-                                    )
-                                };
-                                if multi_seq_live_tiled && attn_v.dtype() != DType::F16 {
-                                    // Persistent V remains TQ-HB compressed. Expand only
-                                    // this layer's active range, then use the same tiled F16
-                                    // prefill kernel as the coherent cold path. Scratch is
-                                    // O(active KV in one layer), not O(model layers × slots).
-                                    let dense_k = unsafe {
-                                        dev.alloc_buffer_for_overwrite(
-                                            nkv * kv_seq_len as usize * hd * DType::F16.size_of(),
-                                            DType::F16,
-                                            vec![nkv, kv_seq_len as usize, hd],
-                                        )
-                                    }
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "multi-seq tiled live K scratch L{layer_idx}: {e}"
-                                        )
-                                    })?;
-                                    let dense_v = unsafe {
-                                        dev.alloc_buffer_for_overwrite(
-                                            nkv * kv_seq_len as usize * hd * DType::F16.size_of(),
-                                            DType::F16,
-                                            vec![nkv, kv_seq_len as usize, hd],
-                                        )
-                                    }
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "multi-seq tiled live V scratch L{layer_idx}: {e}"
-                                        )
-                                    })?;
-                                    let q_f16 = unsafe {
-                                        dev.alloc_buffer_for_overwrite(
-                                            chunk_len * row_elems * DType::F16.size_of(),
-                                            DType::F16,
-                                            vec![nh, chunk_len, hd],
-                                        )
-                                    }
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "multi-seq tiled live Q scratch L{layer_idx}: {e}"
-                                        )
-                                    })?;
-                                    let out_f16 = unsafe {
-                                        dev.alloc_buffer_for_overwrite(
-                                            chunk_len * row_elems * DType::F16.size_of(),
-                                            DType::F16,
-                                            vec![nh, chunk_len, hd],
-                                        )
-                                    }
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "multi-seq tiled live O scratch L{layer_idx}: {e}"
-                                        )
-                                    })?;
-                                    let out_f32_head = unsafe {
-                                        dev.alloc_buffer_for_overwrite(
-                                            chunk_len * row_elems * DType::F32.size_of(),
-                                            DType::F32,
-                                            vec![nh, chunk_len, hd],
-                                        )
-                                    }
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "multi-seq tiled live O32 scratch L{layer_idx}: {e}"
-                                        )
-                                    })?;
-
-                                    let (source_k, source_v, source_norms, source_capacity) =
-                                        if is_ring {
-                                            (attn_k, attn_v, attn_norms, kv_capacity)
-                                        } else {
-                                            (
-                                                &slot_layer_kv.k,
-                                                &slot_layer_kv.v_packed,
-                                                &slot_layer_kv.v_norms,
-                                                cap as u32,
-                                            )
-                                        };
-                                    s.barrier_between(
-                                        &[source_k, source_v, source_norms, &q],
-                                        &[&dense_k, &dense_v, &q_f16],
-                                    );
-                                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_linearize_ring_bytes(
-                                        s.encoder_mut(), reg, metal_dev,
-                                        source_k, &dense_k,
-                                        nkv as u32, source_capacity, kv_seq_len,
-                                        kv_seq_len, kv_seq_len,
-                                        (hd * DType::F16.size_of()) as u32,
-                                    ).map_err(|e| anyhow::anyhow!(
-                                        "multi-seq tiled live K compact L{layer_idx}: {e}"
-                                    ))?;
-                                    mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv_seq_f16(
-                                        s.encoder_mut(), reg, metal_dev,
-                                        source_v, source_norms, &dense_v,
-                                        nkv as u32, hd as u32, source_capacity,
-                                        0, kv_seq_len,
-                                        tq_scale_factor_d512, tq_codebook_bits_prefill,
-                                    ).map_err(|e| anyhow::anyhow!(
-                                        "multi-seq tiled live V expand L{layer_idx}: {e}"
-                                    ))?;
-                                    mlx_native::ops::transpose::permute_021_f32_to_f16(
-                                        s.encoder_mut(),
-                                        reg,
-                                        metal_dev,
-                                        &q,
-                                        &q_f16,
-                                        chunk_len,
-                                        nh,
-                                        hd,
-                                    )
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "multi-seq tiled live Q permute L{layer_idx}: {e}"
-                                        )
-                                    })?;
-
-                                    s.barrier_between(&[&q_f16, &dense_k, &dense_v], &[&out_f16]);
-                                    if is_ring {
-                                        let history_len = kv_seq_len as usize - chunk_len;
-                                        let mask = mlx_native::ops::flash_attn_prefill_mask::build_sdpa_mask_f16(
-                                            dev, reg, s.encoder_mut(),
-                                            &mlx_native::ops::flash_attn_prefill_mask::SdpaMaskParams {
-                                                seq_len_q: chunk_len as u32,
-                                                seq_len_k: kv_seq_len,
-                                                window_size: Some(sliding_window),
-                                                causal: true,
-                                                q_abs_offset: history_len as u32,
-                                            },
-                                        ).map_err(|e| anyhow::anyhow!(
-                                            "multi-seq tiled live mask L{layer_idx}: {e}"
-                                        ))?;
-                                        let blk_params =
-                                            mlx_native::ops::flash_attn_prefill_blk::BlkParams {
-                                                seq_len_q: chunk_len as u32,
-                                                seq_len_k: kv_seq_len,
-                                                bq: 32,
-                                                bk: 16,
-                                            };
-                                        let blk = mlx_native::ops::flash_attn_prefill_blk::alloc_blk_buffer(
-                                            dev, &blk_params,
-                                        ).map_err(|e| anyhow::anyhow!(
-                                            "multi-seq tiled live blk alloc L{layer_idx}: {e}"
-                                        ))?;
-                                        s.barrier_between(&[&mask], &[&blk]);
-                                        mlx_native::ops::flash_attn_prefill_blk::dispatch_flash_attn_prefill_blk_f16(
-                                            s.encoder_mut(), dev, reg, &mask, &blk, &blk_params,
-                                        ).map_err(|e| anyhow::anyhow!(
-                                            "multi-seq tiled live blk L{layer_idx}: {e}"
-                                        ))?;
-                                        s.barrier_between(
-                                            &[&q_f16, &dense_k, &dense_v, &mask, &blk],
-                                            &[&out_f16],
-                                        );
-                                        mlx_native::ops::flash_attn_prefill::dispatch_flash_attn_prefill_f16_d256_with_blk(
-                                            s.encoder_mut(), dev, reg,
-                                            &q_f16, &dense_k, &dense_v,
-                                            Some(&mask), Some(&blk), &out_f16,
-                                            &mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams {
-                                                n_heads: nh as u32,
-                                                n_kv_heads: nkv as u32,
-                                                head_dim: hd as u32,
-                                                seq_len_q: chunk_len as u32,
-                                                seq_len_k: kv_seq_len,
-                                                batch: 1,
-                                                scale: 1.0,
-                                                do_causal: false,
-                                            },
-                                        ).map_err(|e| anyhow::anyhow!(
-                                            "multi-seq tiled live sliding FA L{layer_idx}: {e}"
-                                        ))?;
-                                    } else {
-                                        anyhow::ensure!(
-                                            hd == 512,
-                                            "multi-seq tiled global layer has head_dim={hd}"
-                                        );
-                                        mlx_native::ops::flash_attn_prefill_d512::dispatch_flash_attn_prefill_f16_d512_resume(
-                                            s.encoder_mut(), dev, reg,
-                                            &q_f16, &dense_k, &dense_v, &out_f16,
-                                            &mlx_native::ops::flash_attn_prefill::FlashAttnPrefillResumeParams {
-                                                n_heads: nh as u32,
-                                                n_kv_heads: nkv as u32,
-                                                head_dim: hd as u32,
-                                                seq_len_q: chunk_len as u32,
-                                                seq_len_k: kv_seq_len,
-                                                batch: 1,
-                                                scale: 1.0,
-                                                do_causal: true,
-                                                q_offset_in_k: absolute_chunk_start as u32,
-                                                kv_capacity: kv_seq_len,
-                                            },
-                                        ).map_err(|e| anyhow::anyhow!(
-                                            "multi-seq tiled live global FA L{layer_idx}: {e}"
-                                        ))?;
-                                    }
-                                    s.barrier_between(&[&out_f16], &[&out_f32_head]);
-                                    mlx_native::ops::elementwise::cast(
-                                        s.encoder_mut(),
-                                        reg,
-                                        metal_dev,
-                                        &out_f16,
-                                        &out_f32_head,
-                                        chunk_len * row_elems,
-                                        mlx_native::ops::elementwise::CastDirection::F16ToF32,
-                                    )
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "multi-seq tiled live O cast L{layer_idx}: {e}"
-                                        )
-                                    })?;
-                                    s.barrier_between(&[&out_f32_head], &[&output]);
-                                    mlx_native::ops::transpose::permute_021_f32(
-                                        s.encoder_mut(),
-                                        reg,
-                                        metal_dev,
-                                        &out_f32_head,
-                                        &output,
-                                        nh,
-                                        chunk_len,
-                                        hd,
-                                    )
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "multi-seq tiled live O permute L{layer_idx}: {e}"
-                                        )
-                                    })?;
-                                } else {
-                                    let pos_chunk = pos_source.slice_view(
-                                        (concat_start * std::mem::size_of::<u32>()) as u64,
-                                        chunk_len,
-                                    );
-                                    let params = mlx_native::ops::flash_attn_vec_hybrid::FlashAttnVecTqHbParams {
-                                        num_heads: nh as u32,
-                                        num_kv_heads: nkv as u32,
-                                        head_dim: hd as u32,
-                                        kv_seq_len,
-                                        kv_capacity,
-                                        scale: 1.0,
-                                        mask_type,
-                                        sliding_window,
-                                        softcap: 0.0,
-                                        ring_start: 0,
-                                        scale_factor_d512: tq_scale_factor_d512,
-                                        codebook_bits: tq_codebook_bits_prefill,
-                                        fuse_fwht_pre: 0,
-                                        nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(kv_seq_len),
-                                    };
-                                    s.barrier_between(
-                                        &[
-                                            &q,
-                                            attn_k,
-                                            attn_v,
-                                            attn_norms,
-                                            tmp,
-                                            &slot_chunk,
-                                            &pos_chunk,
-                                        ],
-                                        &[&output, tmp],
-                                    );
-                                    mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
-                                        s.encoder_mut(), reg, dev, chunk_len as u32,
-                                        &q, attn_k, attn_v, attn_norms, &output, tmp,
-                                        &slot_chunk, &pos_chunk, &params,
-                                    ).map_err(|e| anyhow::anyhow!("multi-seq live hybrid SDPA L{layer_idx}: {e}"))?;
-                                }
-                                if is_ring {
-                                    s.barrier_between(
-                                        &[&pf_k_normed, &pf_v_normed],
-                                        &[
-                                            &slot_layer_kv.k,
-                                            &slot_layer_kv.v_packed,
-                                            &slot_layer_kv.v_norms,
-                                        ],
-                                    );
-                                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                        s.encoder_mut(), reg, metal_dev,
-                                        &pf_k_normed, &slot_layer_kv.k,
-                                        nkv as u32, hd as u32, cap as u32,
-                                        absolute_chunk_start as u32, chunk_len as u32, concat_start as u32,
-                                    ).map_err(|e| anyhow::anyhow!("multi-seq live ring commit K L{layer_idx}: {e}"))?;
-                                    if slot_layer_kv.v_packed.dtype() == DType::F16 {
-                                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                            s.encoder_mut(), reg, metal_dev,
-                                            &pf_v_normed, &slot_layer_kv.v_packed,
-                                            nkv as u32, hd as u32, cap as u32,
-                                            absolute_chunk_start as u32, chunk_len as u32, concat_start as u32,
-                                        ).map_err(|e| anyhow::anyhow!("multi-seq live ring commit V L{layer_idx}: {e}"))?;
-                                    } else {
-                                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
-                                            s.encoder_mut(), reg, metal_dev,
-                                            &pf_v_normed, &slot_layer_kv.v_packed, &slot_layer_kv.v_norms,
-                                            nkv as u32, hd as u32, cap as u32,
-                                            absolute_chunk_start as u32, chunk_len as u32, concat_start as u32,
-                                            true, tq_scale_factor_d512, tq_codebook_bits_prefill,
-                                        ).map_err(|e| anyhow::anyhow!("multi-seq live ring commit FWHT V L{layer_idx}: {e}"))?;
-                                    }
-                                }
-                                local_start = chunk_end;
-                            }
-                        }
-                        if full_layer_kv.v_packed.dtype() != DType::F16 {
-                            s.barrier_between(&[&pf_sdpa_out], &[&pf_sdpa_out]);
-                            mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &pf_sdpa_out,
-                                (seq_len * nh) as u32,
-                                hd as u32,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("multi-seq live hybrid FWHT undo L{layer_idx}: {e}")
-                            })?;
-                        }
+                        let seqs =
+                            live_spans
+                                .iter()
+                                .zip(&ms.slot_views_hybrid)
+                                .map(|(&span, views)| LiveSeq {
+                                    kv: &views[layer_idx],
+                                    span,
+                                });
+                        encode_live_layer_attention(&mut s, reg, dev, &live_layer, route, seqs)?;
                     } else {
                         let hybrid = self.hybrid_kv.as_ref().ok_or_else(|| {
                             anyhow::anyhow!("batched live attention has no hybrid KV")
                         })?;
-                        let layer_kv = &hybrid[layer_idx];
-                        let cap = layer_kv.capacity;
-                        let is_ring = layer_kv.is_sliding;
-
-                        // Full-attention storage is append-only, so the entire
-                        // suffix can be materialized before its queries run.
-                        // Sliding storage is a ring: bulk materialization would
-                        // let later suffix rows overwrite history needed by an
-                        // earlier query. Ring layers therefore stage bounded
-                        // chunks below and commit each chunk only after its
-                        // attention has consumed a chronological linear view.
-                        if !is_ring {
-                            // ADR-059 (3b): the FULL-layer live write position
-                            // is absolute — the single-seq hybrid buffer's
-                            // graft rows occupy `0..graft_len` (the splice at
-                            // cold admission), so the live suffix continues
-                            // at `graft_len + start_pos`.
-                            let live_full_start = graft_len + start_pos;
-                            s.barrier_between(
-                                &[&pf_k_normed, &pf_v_normed],
-                                &[&layer_kv.k, &layer_kv.v_packed, &layer_kv.v_norms],
-                            );
-                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &pf_k_normed,
-                                &layer_kv.k,
-                                nkv as u32,
-                                hd as u32,
-                                cap as u32,
-                                live_full_start as u32,
-                                seq_len as u32,
-                                0,
-                            )
-                            .map_err(|e| anyhow::anyhow!("live hybrid F16 K L{layer_idx}: {e}"))?;
-                            if layer_kv.v_packed.dtype() == DType::F16 {
-                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &pf_v_normed,
-                                &layer_kv.v_packed,
-                                nkv as u32,
-                                hd as u32,
-                                cap as u32,
-                                live_full_start as u32,
-                                seq_len as u32,
-                                0,
-                            )
-                            .map_err(|e| anyhow::anyhow!("live hybrid F16 V L{layer_idx}: {e}"))?;
-                            } else {
-                                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &pf_v_normed,
-                                &layer_kv.v_packed,
-                                &layer_kv.v_norms,
-                                nkv as u32,
-                                hd as u32,
-                                cap as u32,
-                                live_full_start as u32,
-                                seq_len as u32,
-                                0,
-                                false,
-                                tq_scale_factor_d512,
-                                tq_codebook_bits_prefill,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("live hybrid FWHT V L{layer_idx}: {e}")
-                            })?;
-                            }
-                        }
-
-                        let slots = live_slot_ids
-                            .as_ref()
-                            .expect("live slot ids allocated with live resume");
-                        let tmp = live_sdpa_tmp
-                            .as_ref()
-                            .expect("live SDPA tmp allocated with live resume");
-                        let row_elems = nh * hd;
-                        let ring_stage = if is_ring {
-                            let stage_capacity =
-                                cap.saturating_sub(1) + seq_len.min(GEMMA_LIVE_QUERY_CHUNK);
-                            let norms_per_pos = layer_kv.v_norms.element_count() / (nkv * cap);
-                            anyhow::ensure!(
-                                stage_capacity > 0 && norms_per_pos > 0,
-                                "live ring stage L{layer_idx} has invalid shape"
-                            );
-                            let k_elements = nkv * stage_capacity * hd;
-                            let v_elements = nkv * stage_capacity * hd;
-                            let norm_elements = nkv * stage_capacity * norms_per_pos;
-                            // SAFETY: every row below `kv_seq_len` is populated by
-                            // the ring-history copy plus suffix encode before the
-                            // attention dispatch. Tail rows are never read.
-                            let k = unsafe {
-                                dev.alloc_buffer_for_overwrite(
-                                    k_elements * DType::F16.size_of(),
-                                    DType::F16,
-                                    vec![nkv, stage_capacity, hd],
-                                )
-                            }
-                            .map_err(|e| anyhow::anyhow!("live ring stage K L{layer_idx}: {e}"))?;
-                            // SAFETY: same initialized-prefix contract as K. F16 V
-                            // kernels ignore norms; packed V initializes both.
-                            let v = unsafe {
-                                dev.alloc_buffer_for_overwrite(
-                                    v_elements * layer_kv.v_packed.dtype().size_of(),
-                                    layer_kv.v_packed.dtype(),
-                                    vec![nkv, stage_capacity, hd],
-                                )
-                            }
-                            .map_err(|e| anyhow::anyhow!("live ring stage V L{layer_idx}: {e}"))?;
-                            // SAFETY: packed-V attention reads the initialized
-                            // history+suffix prefix; F16-V attention specializes
-                            // the norms load away.
-                            let norms = unsafe {
-                                dev.alloc_buffer_for_overwrite(
-                                    norm_elements * DType::F32.size_of(),
-                                    DType::F32,
-                                    vec![nkv, stage_capacity, norms_per_pos],
-                                )
-                            }
-                            .map_err(|e| {
-                                anyhow::anyhow!("live ring stage norms L{layer_idx}: {e}")
-                            })?;
-                            Some((k, v, norms, stage_capacity, norms_per_pos))
-                        } else {
-                            None
+                        let seq = LiveSeq {
+                            kv: &hybrid[layer_idx],
+                            span: live_spans[0],
                         };
-                        let mut chunk_start = 0usize;
-                        while chunk_start < seq_len {
-                            let chunk_len = gemma_live_query_chunk_len(
-                                start_pos + chunk_start,
-                                seq_len - chunk_start,
-                            );
-                            let chunk_end = chunk_start + chunk_len;
-                            let absolute_chunk_start = start_pos + chunk_start;
-                            let q = pf_q_normed.slice_view(
-                                (chunk_start * row_elems * std::mem::size_of::<f32>()) as u64,
-                                chunk_len * row_elems,
-                            );
-                            let output = pf_sdpa_out.slice_view(
-                                (chunk_start * row_elems * std::mem::size_of::<f32>()) as u64,
-                                chunk_len * row_elems,
-                            );
-                            let slot_chunk = slots.slice_view(
-                                (chunk_start * std::mem::size_of::<u32>()) as u64,
-                                chunk_len,
-                            );
-                            let (
-                                attn_k,
-                                attn_v,
-                                attn_norms,
-                                pos_source,
-                                kv_seq_len,
-                                kv_capacity,
-                                mask_type,
-                                sliding_window,
-                            ) = if let Some((
-                                stage_k,
-                                stage_v,
-                                stage_norms,
-                                stage_capacity,
-                                norms_per_pos,
-                            )) = ring_stage.as_ref()
-                            {
-                                let history_len = absolute_chunk_start.min(cap.saturating_sub(1));
-                                let stage_seq_len = history_len + chunk_len;
-                                s.barrier_between(
-                                    &[&layer_kv.k, &layer_kv.v_packed, &layer_kv.v_norms],
-                                    &[stage_k, stage_v, stage_norms],
-                                );
-                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_linearize_ring_bytes(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &layer_kv.k,
-                                stage_k,
-                                nkv as u32,
-                                cap as u32,
-                                *stage_capacity as u32,
-                                history_len as u32,
-                                absolute_chunk_start as u32,
-                                (hd * DType::F16.size_of()) as u32,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("live ring stage K history L{layer_idx}: {e}")
-                            })?;
-                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_linearize_ring_bytes(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &layer_kv.v_packed,
-                                stage_v,
-                                nkv as u32,
-                                cap as u32,
-                                *stage_capacity as u32,
-                                history_len as u32,
-                                absolute_chunk_start as u32,
-                                (hd * layer_kv.v_packed.dtype().size_of()) as u32,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("live ring stage V history L{layer_idx}: {e}")
-                            })?;
-                                if layer_kv.v_packed.dtype() != DType::F16 {
-                                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_linearize_ring_bytes(
-                                    s.encoder_mut(), reg, metal_dev,
-                                    &layer_kv.v_norms, stage_norms,
-                                    nkv as u32, cap as u32, *stage_capacity as u32,
-                                    history_len as u32, absolute_chunk_start as u32,
-                                    (*norms_per_pos * DType::F32.size_of()) as u32,
-                                ).map_err(|e| anyhow::anyhow!("live ring stage norm history L{layer_idx}: {e}"))?;
-                                }
-                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &pf_k_normed,
-                                stage_k,
-                                nkv as u32,
-                                hd as u32,
-                                *stage_capacity as u32,
-                                history_len as u32,
-                                chunk_len as u32,
-                                chunk_start as u32,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("live ring stage K suffix L{layer_idx}: {e}")
-                            })?;
-                                if layer_kv.v_packed.dtype() == DType::F16 {
-                                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                    s.encoder_mut(), reg, metal_dev,
-                                    &pf_v_normed, stage_v,
-                                    nkv as u32, hd as u32, *stage_capacity as u32,
-                                    history_len as u32, chunk_len as u32, chunk_start as u32,
-                                ).map_err(|e| anyhow::anyhow!("live ring stage V suffix L{layer_idx}: {e}"))?;
-                                } else {
-                                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
-                                    s.encoder_mut(), reg, metal_dev,
-                                    &pf_v_normed, stage_v, stage_norms,
-                                    nkv as u32, hd as u32, *stage_capacity as u32,
-                                    history_len as u32, chunk_len as u32, chunk_start as u32,
-                                    false, tq_scale_factor_d512, tq_codebook_bits_prefill,
-                                ).map_err(|e| anyhow::anyhow!("live ring stage FWHT V suffix L{layer_idx}: {e}"))?;
-                                }
-                                let positions = live_linear_positions
-                                    .as_ref()
-                                    .expect("live linear positions allocated with live resume");
-                                (
-                                    stage_k,
-                                    stage_v,
-                                    stage_norms,
-                                    positions,
-                                    stage_seq_len as u32,
-                                    *stage_capacity as u32,
-                                    3u32,
-                                    sw as u32,
-                                )
-                            } else {
-                                (
-                                    &layer_kv.k,
-                                    &layer_kv.v_packed,
-                                    &layer_kv.v_norms,
-                                    &pf_positions,
-                                    // ADR-059 (3b): the full-layer live read
-                                    // extent covers the graft rows
-                                    // (`0..graft_len`) plus the prompt prefix
-                                    // and this chunk — the graft participates
-                                    // in live prefill attention (row index ==
-                                    // absolute position for full layers, so
-                                    // the `pf_positions` causal mask stays
-                                    // exact).
-                                    (graft_len + start_pos + chunk_end) as u32,
-                                    cap as u32,
-                                    1u32,
-                                    0u32,
-                                )
-                            };
-                            let pos_chunk = pos_source.slice_view(
-                                (chunk_start * std::mem::size_of::<u32>()) as u64,
-                                chunk_len,
-                            );
-                            let params =
-                                mlx_native::ops::flash_attn_vec_hybrid::FlashAttnVecTqHbParams {
-                                    num_heads: nh as u32,
-                                    num_kv_heads: nkv as u32,
-                                    head_dim: hd as u32,
-                                    kv_seq_len,
-                                    kv_capacity,
-                                    scale: 1.0,
-                                    mask_type,
-                                    sliding_window,
-                                    softcap: 0.0,
-                                    ring_start: 0,
-                                    scale_factor_d512: tq_scale_factor_d512,
-                                    codebook_bits: tq_codebook_bits_prefill,
-                                    fuse_fwht_pre: 0,
-                                    nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(
-                                        kv_seq_len,
-                                    ),
-                                };
-                            s.barrier_between(
-                                &[&q, attn_k, attn_v, attn_norms, tmp, &slot_chunk, &pos_chunk],
-                                &[&output, tmp],
-                            );
-                            mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
-                                s.encoder_mut(),
-                                reg,
-                                dev,
-                                chunk_len as u32,
-                                &q,
-                                attn_k,
-                                attn_v,
-                                attn_norms,
-                                &output,
-                                tmp,
-                                &slot_chunk,
-                                &pos_chunk,
-                                &params,
-                            )
-                            .map_err(|e| anyhow::anyhow!("live hybrid SDPA L{layer_idx}: {e}"))?;
-                            if is_ring {
-                                s.barrier_between(
-                                    &[&pf_k_normed, &pf_v_normed],
-                                    &[&layer_kv.k, &layer_kv.v_packed, &layer_kv.v_norms],
-                                );
-                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &pf_k_normed,
-                                &layer_kv.k,
-                                nkv as u32,
-                                hd as u32,
-                                cap as u32,
-                                absolute_chunk_start as u32,
-                                chunk_len as u32,
-                                chunk_start as u32,
-                            )
-                            .map_err(|e| anyhow::anyhow!("live ring commit K L{layer_idx}: {e}"))?;
-                                if layer_kv.v_packed.dtype() == DType::F16 {
-                                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                                    s.encoder_mut(), reg, metal_dev,
-                                    &pf_v_normed, &layer_kv.v_packed,
-                                    nkv as u32, hd as u32, cap as u32,
-                                    absolute_chunk_start as u32, chunk_len as u32,
-                                    chunk_start as u32,
-                                ).map_err(|e| anyhow::anyhow!("live ring commit V L{layer_idx}: {e}"))?;
-                                } else {
-                                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
-                                    s.encoder_mut(), reg, metal_dev,
-                                    &pf_v_normed, &layer_kv.v_packed, &layer_kv.v_norms,
-                                    nkv as u32, hd as u32, cap as u32,
-                                    absolute_chunk_start as u32, chunk_len as u32,
-                                    chunk_start as u32, true,
-                                    tq_scale_factor_d512, tq_codebook_bits_prefill,
-                                ).map_err(|e| anyhow::anyhow!("live ring commit FWHT V L{layer_idx}: {e}"))?;
-                                }
-                            }
-                            chunk_start = chunk_end;
-                        }
-                        if layer_kv.v_packed.dtype() != DType::F16 {
-                            s.barrier_between(&[&pf_sdpa_out], &[&pf_sdpa_out]);
-                            mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &pf_sdpa_out,
-                                (seq_len * nh) as u32,
-                                hd as u32,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("live hybrid FWHT undo L{layer_idx}: {e}")
-                            })?;
-                        }
+                        encode_live_layer_attention(
+                            &mut s,
+                            reg,
+                            dev,
+                            &live_layer,
+                            route,
+                            std::iter::once(seq),
+                        )?;
                     }
                 } else if route_through_nofa {
                     // ---- HF2Q_NO_FA path: tensor-mm attention ----
@@ -6039,7 +5141,8 @@ impl MlxModelWeights {
                     || std::env::var("HF2Q_PROFILE_LAYERS").is_ok()
                     || std::env::var("HF2Q_SYNC_PER_LAYER").is_ok()
                     || profile_buckets_on
-                    || self.dflash_capture.is_some();
+                    || self.dflash_capture.is_some()
+                    || live_layer_probe_armed();
                 if sync_per_layer {
                     if graph_opt_prefill {
                         // ADR-029 iter-39 H40 — sync-mode with fusion.  Mirrors
@@ -6082,6 +5185,14 @@ impl MlxModelWeights {
                     drop(_committed);
                 }
             }
+            live_layer_probe_capture(
+                layer_idx,
+                is_sliding,
+                (nh, hd, hs),
+                seq_len,
+                &pf_sdpa_out,
+                &pf_hidden,
+            )?;
 
             // ADR-011 Phase 3 Wave P3b.2 — Session C ("write K,V to dense
             // cache") was merged into the tail of Session A.  Only the
@@ -7623,12 +6734,14 @@ impl MlxModelWeights {
     /// over the concatenated suffix stream; attention reads and writes the
     /// caller's persistent per-slot KV regions.
     ///
-    /// `attention` selects the per-sequence attention route.
-    /// [`GemmaLiveAttention::PerSlotExact`] runs the single-slot live-resume
-    /// attention for every lane, so each lane's logits and KV bytes equal its
-    /// own `forward_prefill_batched_live_resume_slot_mounted` call, provided
-    /// every lane has more than 32 suffix rows: at 32 or fewer a per-slot MoE
-    /// takes the `mv_id` route while the joint stream takes `mm_id`.
+    /// `attention` selects the per-sequence attention route; every route runs
+    /// the one shared live attention (`gemma_live_attention`).
+    /// [`GemmaLiveAttention::PerSlotExact`] resolves exactly the single-slot
+    /// live-resume route (`warm_live_kernel`), so each lane's logits and KV
+    /// bytes equal its own `forward_prefill_batched_live_resume_slot_mounted`
+    /// call, provided every lane has more than 32 suffix rows: at 32 or fewer
+    /// a per-slot MoE takes the `mv_id` route while the joint stream takes
+    /// `mm_id`.
     pub fn forward_prefill_batched_multi_seq_live(
         &mut self,
         seqs: &[(Vec<u32>, SlotId, usize)],
@@ -7871,8 +6984,7 @@ mod block_diagonal_mask_tests {
 mod route_viability_tests {
     use super::{
         batched_route_overhead_bytes as overhead, gemma_batched_mask_seq_len,
-        gemma_lcp_resume_worthwhile, gemma_live_query_chunk_len, gemma_live_stage_history_len,
-        validate_batched_prefill_argmax,
+        gemma_lcp_resume_worthwhile, validate_batched_prefill_argmax,
     };
 
     #[test]
@@ -7890,23 +7002,6 @@ mod route_viability_tests {
         assert_eq!(gemma_batched_mask_seq_len(1, true), 1);
         assert_eq!(gemma_batched_mask_seq_len(131_072, true), 1);
         assert_eq!(gemma_batched_mask_seq_len(131_072, false), 131_072);
-    }
-
-    #[test]
-    fn live_query_chunks_are_bounded_and_do_not_cross_kernel_buckets() {
-        assert_eq!(gemma_live_query_chunk_len(0, 900), 256);
-        assert_eq!(gemma_live_query_chunk_len(500, 900), 12);
-        assert_eq!(gemma_live_query_chunk_len(512, 900), 256);
-        assert_eq!(gemma_live_query_chunk_len(1000, 900), 24);
-        assert_eq!(gemma_live_query_chunk_len(1024, 900), 256);
-        assert_eq!(gemma_live_query_chunk_len(7_000, 17), 17);
-    }
-
-    #[test]
-    fn live_stage_positions_follow_the_actual_cache_history() {
-        assert_eq!(gemma_live_stage_history_len(2_005, 18_404), 2_005);
-        assert_eq!(gemma_live_stage_history_len(2_005, 1_024), 1_023);
-        assert_eq!(gemma_live_stage_history_len(0, 0), 0);
     }
 
     #[test]
