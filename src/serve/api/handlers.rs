@@ -1048,14 +1048,7 @@ fn extract_tool_calls_from_text_with_wire_kinds(
                     match registry::parse_tool_call_bodies_with_wire_kinds(reg, &body, wire_kinds) {
                         Some(parsed_calls) if !parsed_calls.is_empty() => {
                             for parsed in parsed_calls {
-                                let id = format!(
-                                    "call_hf2q_{:016x}",
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_nanos() as u64)
-                                        .unwrap_or(0)
-                                        ^ (tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
-                                );
+                                let id = super::tool_call_id::next_tool_call_id();
                                 tool_calls.push(super::schema::ToolCall {
                                     id,
                                     call_type: "function".to_string(),
