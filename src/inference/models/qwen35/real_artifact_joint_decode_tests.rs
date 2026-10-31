@@ -11,12 +11,12 @@
 //! Run (one artifact per process; mlx-native snapshots its routing policy):
 //!
 //! ```text
-//! HF2Q_QWEN36_GGUF=/path/qwen36.gguf cargo test --release --lib \
+//! HF2Q_QWEN36_GGUF=/path/qwen36.gguf cargo test --release --bin hf2q \
 //!   qwen36_joint_decode_matches_serial_decode_bitwise -- --ignored --exact
-//! HF2Q_QWEN38_GGUF=/path/qwen38.gguf cargo test --release --lib \
+//! HF2Q_QWEN38_GGUF=/path/qwen38.gguf cargo test --release --bin hf2q \
 //!   qwen38_joint_decode_mvn_matches_serial_decode_bitwise -- --ignored --exact
 //! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 HF2Q_QWEN38_GGUF=/path/qwen38.gguf \
-//!   cargo test --release --lib \
+//!   cargo test --release --bin hf2q \
 //!   qwen38_joint_decode_padded_mv_ext_keeps_decision_parity -- --ignored --exact
 //! ```
 //!

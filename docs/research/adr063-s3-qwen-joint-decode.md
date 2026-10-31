@@ -4,8 +4,8 @@ Status (2026-10-30):
 - **Qwen3.8 (dense): default on.** Official-artifact gates passed and the four-agent ABBA A/B passed; see "Measured result".
 - **Qwen3.6 (MoE): default off, opt-in with `HF2Q_QWEN_JOINT_DECODE=1`.** Its forward is bitwise exact, but the four-agent A/B is incomplete and both joint runs failed the coding protocol; see "Qwen3.6 verdict".
 - `HF2Q_QWEN_JOINT_DECODE=0` restores the serial path for every family.
-- **Qwen3.8 shared-weight dense FFN (padded mode): default on in this change, pending root gates.** Joint steps no longer re-read the FFN gate/up weights once per packed row; `HF2Q_QWEN_JOINT_FFN_SHARED=0` restores the per-row fused kernel. See "Dense FFN weight sharing (padded mode)".
-- Open: the Q1 Class B envelope on real prompts (Q-C2b) and the cohort-invariance gates below have not run yet.
+- **Qwen3.8 shared-weight dense FFN (padded mode): default on.** Joint steps no longer re-read the FFN gate/up weights once per packed row; `HF2Q_QWEN_JOINT_FFN_SHARED=0` restores the per-row fused kernel. Hardware gates passed, and the four-agent A/B against the kill switch measured 4.9% less makespan (block-paired 95% CI 2.2–7.6%), well short of the 2.2× bandwidth projection. The real-prompt Q1 envelope is `WithinDecisionEnvelope` for both FFN routes (below). Still open: the paired quality campaign against stock. See "Dense FFN weight sharing (padded mode)".
+- All three cohort-invariance gates passed at 0b959107 (`E/qwen-joint-invariance-v1`), and the padded gate passed again on both FFN routes at c25d7ef2 (`E/qwen-ffn-gates-v1`).
 
 ## Problem
 
@@ -126,11 +126,24 @@ Gate and up were 25.67 GB of the 35.06 GB the step's kernels read (73%). The cha
 | 433 GB/s | 81.0 ms | 36.5 ms | 44.5 ms |
 | 546 GB/s | 64.2 ms | 29.0 ms | 35.3 ms |
 
-If joint turns are fully bandwidth bound, they become up to about 2.2× faster. The makespan effect is smaller: it scales with the share of the four-agent makespan spent in joint steps, which is not attributed yet (prefill, tool time, MTP catch-ups and serial turns are unchanged). Two things can shrink the gain. The GPU's system-level cache may already absorb part of the per-row re-reads (a 100 MB gate+up pair per layer is larger than it, so only partial hits are expected). And `mul_mv_ext` at `r1ptg = 4` does four rows of dequantization arithmetic per weight read, so the new products could become partly compute bound. The A/B below decides.
+If joint turns were fully bandwidth bound, they would become up to about 2.2× faster. The makespan effect is smaller: it scales with the share of the four-agent makespan spent in joint steps, which is not attributed yet (prefill, tool time, MTP catch-ups and serial turns are unchanged). Two things can shrink the gain. The GPU's system-level cache may already absorb part of the per-row re-reads (a 100 MB gate+up pair per layer is larger than it, so only partial hits are expected). And `mul_mv_ext` at `r1ptg = 4` does four rows of dequantization arithmetic per weight read, so the new products could become partly compute bound.
+
+**Measured result** (`E/qwen-joint-ffn-ab-v1`, branch `c25d7ef2`, same binary, Q5 supervisor, ABBA × 4: `ffn1` = default, `ffn0` = `HF2Q_QWEN_JOINT_FFN_SHARED=0`; `analysis.json`):
+
+| Metric | `ffn0` (per-row fused) | `ffn1` (shared) |
+|---|---:|---:|
+| Makespan per run (s) | 96.74, 91.50, 91.22, 90.16 | 90.21, 87.32, 88.32, 86.57 |
+| Makespan, median | 91.36 s | 87.82 s |
+| Per-request decode, median (n = 112 requests per arm) | 12.19 tok/s | 13.21 tok/s (+8.4%) |
+| Decode, token-weighted | 12.15 tok/s | 13.04 tok/s (+7.3%) |
+
+- Makespan is 4.9% shorter with the shared route. The unpaired 95% CI is 0.3–9.6%. Every ABBA block favours it (7.2, 4.8, 3.3 and 4.2%), and the block-paired CI is 2.2–7.6%.
+- **The 2.2× projection did not hold.** Decode rose 7–8%, not up to 2.2×, so joint turns are not purely weight-bandwidth bound on the old route. [INFERENCE] Some of the per-row re-reads were already served from cache, `mul_mv_ext` at four rows does more arithmetic per weight read, and the non-weight work of a joint turn (per-row DeltaNet recurrence and SDPA, MTP catch-ups, host scheduling) is a larger share than the bytes model assumed. No stage attribution was retained to separate these.
+- **Transcripts.** Comparing the two routes, 2 of 114 same-request transcript groups differ. That is expected for a Class B route change and is not yet classified (near-tie or not); the real-prompt envelope below is the numeric gate.
 
 **Root commands.** `E=/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023`, release binary built from this branch.
 
-A/B, same binary, default vs kill switch, ABBA × 4 (8 runs; case copies follow the `E/qwen-joint-ab-v1` pattern):
+A/B, same binary, default vs kill switch, ABBA × 4 (8 runs; case copies follow the `E/qwen-joint-ab-v1` pattern; this produced `E/qwen-joint-ffn-ab-v1`):
 
 ```sh
 AB=$E/qwen-joint-ffn-ab-v1; mkdir -p "$AB"
@@ -152,17 +165,23 @@ done
 
 Every run must log `dense_ffn=shared_weights` (ffn1) or `dense_ffn=serial_builder` (ffn0) in `Qwen joint decode engaged`. Report the geometric-mean makespan ratio with its 95% CI, as for `E/qwen-joint-ab-v1`.
 
-Paired task quality against stock (Q1 §3.5), reference = the same binary with the kill switch:
+Paired task quality against stock (Q1 §3.5). The reference is stock serving: the same binary with joint decode off (`HF2Q_QWEN_JOINT_DECODE=0`, serial per-slot decode with MTP K3 and history speculation). It is not the `ffn0` kill-switch arm, which is itself a Class B joint route.
 
 ```sh
+python3 - "$AB" <<'PY'
+import json, sys
+case = json.load(open("scripts/four_agent/q5_cases/qwen38.json"))
+case["serve"]["env"].update({"RUST_LOG": "info", "HF2Q_QWEN_JOINT_DECODE": "0"})
+json.dump(case, open(f"{sys.argv[1]}/qwen38-stock.json", "w"), indent=2)
+PY
 python3 -B scripts/four_agent/quality_campaign.py \
   --subject-case "$AB/qwen38-ffn1.json" \
-  --reference-case "$AB/qwen38-ffn0.json" --reference-kind stock-hf2q \
+  --reference-case "$AB/qwen38-stock.json" --reference-kind stock-hf2q \
   --instances 24 --negative-control-receipt "$NC_RECEIPT" \
   --output "$E/quality-qwen38-joint-ffn-$(date -u +%Y%m%dT%H%M%SZ)"   # --dry-run first
 ```
 
-The reference arm is this binary with the kill switch, i.e. main's joint decode with the per-row fused gate/up. Run both commands from the worktree root. A reference without joint decode at all is the published `v0.1.28` binary on the unmodified `scripts/four_agent/q5_cases/qwen38.json` (`--reference-var HF2Q_BIN=/abs/v0.1.28/hf2q`); that comparison mixes this change with the whole S3 joint route.
+Run every command from the worktree root with the exports above. In its `Qwen joint decode configuration` line, the stock reference worker must log `selected=false` with the reason `disabled by HF2Q_QWEN_JOINT_DECODE`. The subject must log `dense_ffn=shared_weights`.
 
 ## Failure semantics
 
@@ -178,66 +197,88 @@ In-transaction refusals are unreachable in normal serving: the same checks run o
 
 ## Gates (root-run)
 
-**Host tests:** `qwen35_joint_decode::tests`, `joint_decode_routes::tests` (kill-switch parsing, exact mode never takes the shared FFN, and the planner's one-pass route for every admitted type at the Qwen3.8 FFN shapes and `m = 4` under both padded-mode policies).
+Results for the shared-FFN change (branch `c25d7ef2`) are in `E/qwen-ffn-gates-v1/*.log`, with the source identity in `source.txt`.
+
+**Host tests:** `qwen35_joint_decode::tests`, `joint_decode_routes::tests` (kill-switch parsing, exact mode never takes the shared FFN, and the planner's one-pass route for every admitted type at the Qwen3.8 FFN shapes and `m = 4` under both padded-mode policies). **Passed** (12 and 9 tests). The `engine_qwen35` (53), `qwen35_tool` (7) and `deepseek4` (200) suites also passed.
 
 **Metal tests.**
-- `qwen35::forward_gpu::joint_decode::tests` (packed vs per-row, bitwise): every admitted block type at `m = 2..4` through the DeltaNet projection helper and the gather path, and the packed serial-builder dense FFN against per-row FFNs. A failing type must leave the admitted set.
-- `qwen35::joint_decode_ffn_tests` (shared FFN, padded-mode policy frozen on the registry, `mvN` off and on): each row's bytes are identical across packed orders and a full padding replay, and each row is within 1e-3 (relative to the row's max magnitude) of the serial `m = 1` builder.
+- `qwen35::forward_gpu::joint_decode::tests` (packed vs per-row, bitwise): every admitted block type at `m = 2..4` through the DeltaNet projection helper and the gather path, and the packed serial-builder dense FFN against per-row FFNs. A failing type must leave the admitted set. **Passed** (2).
+- `qwen35::joint_decode_ffn_tests` (shared FFN, padded-mode policy frozen on the registry, `mvN` off and on): each row's bytes are identical across packed orders and a full padding replay, and each row is within 1e-3 (relative to the row's max magnitude) of the serial `m = 1` builder. **Passed** (`ffn-metal.log`).
 
 **Official-artifact gates** (`qwen35::real_artifact_joint_decode_tests`, ignored). Four slots with ragged prompts in two identical caches: serial one-token forwards vs joint steps over full and partial cohorts, a lone row, a row that stops while others continue, and a slot reset and re-prefilled before rejoining. Refused steps must write nothing.
 
 - `qwen36_joint_decode_matches_serial_decode_bitwise` (`HF2Q_QWEN36_GGUF`): logits, hidden, greedy tokens, cursors, parities and all KV/state bytes. **Passed** (`E/qwen-joint-exactness-v1`).
-- `qwen38_joint_decode_mvn_matches_serial_decode_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MV_EXT` unset): the same bitwise contract on the exact mvN route. **Passed.**
-- `qwen38_joint_decode_padded_mv_ext_keeps_decision_parity` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1`): teacher-forced top-1 decisions equal independent sequential forwards at every step, cursors and parities equal, then 16 further serial decisions per slot equal. **Passed** on the per-row fused FFN; it now runs the FFN route `HF2Q_QWEN_JOINT_FFN_SHARED` selects (default shared). Under Q1 it is diagnostic only (synthetic prompts, top-1).
+- `qwen38_joint_decode_mvn_matches_serial_decode_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MV_EXT` unset): the same bitwise contract on the exact mvN route. **Passed**, and passed again with the shared-FFN change, including the exact-mode refusal of the shared route (`mvn-bitwise.log`).
+- `qwen38_joint_decode_padded_mv_ext_keeps_decision_parity` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1`): teacher-forced top-1 decisions equal independent sequential forwards at every step, cursors and parities equal, then 16 further serial decisions per slot equal. It runs the FFN route `HF2Q_QWEN_JOINT_FFN_SHARED` selects. **Passed** on the per-row fused FFN and again on the shared FFN (`padded-parity.log`). Under Q1 it is diagnostic only (synthetic prompts, top-1).
 - Exact mode refuses a valid cohort on the shared FFN route before any cache write (checked inside the bitwise gates).
 
-**Cohort invariance** (`qwen35::real_artifact_joint_decode_invariance_tests`, ignored; not yet run). For each variant, one cache with four identically prefilled slots advances slot 2 for 4 steps inside a different cohort: alone, `{0,2}`, `{2,3}`, `{1,2,3}`, `{2,3,1}`, and `{0,1,3,2}` with slot 2 packed last. Slot 2's logits, hidden, cursor, parity, KV codes/scales and conv/recurrent bytes must be bitwise equal across all variants.
+**Cohort invariance** (`qwen35::real_artifact_joint_decode_invariance_tests`, ignored). For each variant, one cache with four identically prefilled slots advances slot 2 for 4 steps inside a different cohort: alone, `{0,2}`, `{2,3}`, `{1,2,3}`, `{2,3,1}`, and `{0,1,3,2}` with slot 2 packed last. Slot 2's logits, hidden, cursor, parity, KV codes/scales and conv/recurrent bytes must be bitwise equal across all variants.
 
-- `qwen36_joint_decode_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN36_GGUF`)
-- `qwen38_joint_decode_mvn_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MV_EXT` unset)
-- `qwen38_joint_decode_padded_mv_ext_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1`): both dense FFN routes, shared weights first.
+- `qwen36_joint_decode_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN36_GGUF`). **Passed** (`q36-invariance.log`).
+- `qwen38_joint_decode_mvn_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MV_EXT` unset). Not yet run.
+- `qwen38_joint_decode_padded_mv_ext_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1`): both dense FFN routes, shared weights first. **Passed** for both routes (`padded-invariance.log`).
 
-**Q1 Class B envelope on real prompts** (Qwen3.8 padded mode; not yet run; `qwen35::real_artifact_joint_decode_q1_tests`).
+**Q1 Class B envelope on real prompts** (Qwen3.8 padded mode; `qwen35::real_artifact_joint_decode_q1_tests`).
+
+Measured 2026-10-31 at c25d7ef2 (`E/q1-qwen38-joint-envelope-20261031T*`). Four real turn-2 agent prompts of 1057 tokens each (including the two forked turns), 32 teacher-forced steps, 128 rows:
+
+| Route vs serial | Classification | Max decision error | p95 | Top-1 agree | Flips |
+|---|---|---:|---:|---:|---:|
+| joint, shared-weight FFN | `WithinDecisionEnvelope` | 0.179 nat | 0.053 nat | 128/128 | 0 |
+| joint, per-row fused FFN | `WithinDecisionEnvelope` | 0.107 nat | 0.037 nat | 128/128 | 0 |
+
+Both routes are inside the 0.25 nat route bound, which closes Q-C2b for the earlier route as well.
 
 `qwen38_joint_decode_q1_envelope_trace` takes 2–4 real agent prompts (`HF2Q_QWEN_JOINT_Q1_PROMPTS`) and requires the padded mode:
-- **Input format.** A JSON array where each entry is either the exact rendered chat prompt as token IDs, or the rendered prompt text tokenized with the serving `tokenizer.json` at `HF2Q_QWEN35_TOKENIZER`. Use the four-agent turn-0 and turn-2 requests, including the two forked turns (agent-1 and agent-3 turn-2).
+- **Input format.** A JSON array where each entry is either the exact rendered chat prompt as token IDs, or the rendered prompt text tokenized with the serving `tokenizer.json` at `HF2Q_QWEN35_TOKENIZER`.
 - **Run.** It prefills each prompt into three identical caches, then decodes `HF2Q_QWEN_JOINT_Q1_STEPS` (default 32) teacher-forced steps. Every cache consumes the serial top-1 at every step.
 - **Stores** (`hf2q.adr063.invariance.v2`, keyed by agent, absolute row and step):
   - `$OUT/serial/trace.json`: the serial one-token `forward_gpu_last_logits` (stock M1 target route);
   - `$OUT/joint_shared_ffn/trace.json`: `forward_gpu_decode_joint` over all agents with the shared-weight FFN (production default);
   - `$OUT/joint_serial_ffn/trace.json`: the same with the per-row fused FFN (`HF2Q_QWEN_JOINT_FFN_SHARED=0`).
 
+**Prepared input.** `/tmp/adr063-qwen38-q1-prompts.json` holds four token-ID prompts, entry N = agent-N. They are the recorded turn-2 requests of `E/qwen-joint-ffn-ab-v1/q38-1-ffn1-20261031T034127Z/client/agent-{0,1,2,3}/turn-2/request.json`; agent-1 and agent-3 turn-2 are the turns that forked in the S3 A/B.
+- **Renderer.** They were rendered outside the repo by `/tmp/adr063-q1-render/render.py`. It mirrors `render_chat_prompt_with_tools_generation_prompt`: the GGUF chat template (sha256 `c3cf9e34…`), `enable_thinking=true`, `preserve_thinking=true`, `add_generation_prompt=true`, `strict` dropped from tools, object tool arguments, and serde-style `tojson`.
+- **Tokenizer.** Tokenized with the Qwen3.8 source `tokenizer.json` (sha256 `0997f410…`, identical to the file recorded in the GGUF's conversion receipt), without added special tokens.
+- **Check.** Each prompt is 1,057 tokens, equal to the server's `usage.prompt_tokens` for that request. The same renderer reproduces `prompt_tokens` for all 28 recorded requests of that run.
+- **Retention.** The rendered text and provenance sit beside the prompts file (`.text.json`, `.provenance.json`). Recorded requests carry per-run ids, so these are that run's turn-2 requests, not byte copies of the S3 A/B's forked requests.
+
 Root commands, the test from this branch and `q1_decision_policy.py` from any checkout containing PR #465:
 
 ```sh
+Q1IN=$E/q1-qwen38-prompts-v1; mkdir -p "$Q1IN"
+cp /tmp/adr063-qwen38-q1-prompts.json /tmp/adr063-qwen38-q1-prompts.text.json \
+   /tmp/adr063-qwen38-q1-prompts.provenance.json /tmp/adr063-q1-render/render.py "$Q1IN/"
 OUT=$E/q1-qwen38-joint-envelope-$(date -u +%Y%m%dT%H%M%SZ)
 HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 \
 HF2Q_QWEN38_GGUF=/Users/robert/.local/share/hf2q/models/qwen38-stock/Qwen3.8-27B-vanilla.gguf \
-HF2Q_QWEN_JOINT_Q1_PROMPTS=/abs/qwen38-agent-prompts.json \
-HF2Q_QWEN35_TOKENIZER=/abs/qwen38-tokenizer.json \
+HF2Q_QWEN_JOINT_Q1_PROMPTS=$Q1IN/adr063-qwen38-q1-prompts.json \
+HF2Q_QWEN_JOINT_Q1_STEPS=32 \
 HF2Q_QWEN_JOINT_Q1_OUT=$OUT \
-  cargo test --release --lib qwen38_joint_decode_q1_envelope_trace -- --ignored --exact --nocapture --test-threads=1
+  cargo test --release --bin hf2q inference::models::qwen35::real_artifact_joint_decode_q1_tests::qwen38_joint_decode_q1_envelope_trace -- --ignored --exact --nocapture --test-threads=1
 python3 -B scripts/four_agent/q1_decision_policy.py envelope "$OUT/serial/trace.json" "$OUT/joint_shared_ffn/trace.json"
 python3 -B scripts/four_agent/q1_decision_policy.py envelope "$OUT/serial/trace.json" "$OUT/joint_serial_ffn/trace.json"
 ```
+
+Token-ID entries need no `HF2Q_QWEN35_TOKENIZER`.
 
 The first verdict gates the shared FFN route; the second is Q-C2b for the per-row route that served the S3 A/B. A `WithinDecisionEnvelope` verdict on real prompts closes the respective gate. A `RouteSensitive` verdict requires localization and blocks any "neutral" claim (policy §3.2). The two forked A/B turns are classified separately with the policy's fork rule.
 
 **Focused root commands** for this change:
 
 ```sh
-cargo test --release --lib joint_decode_routes
-cargo test --release --lib qwen35_joint_decode
-cargo test --release --lib joint_decode_ffn_tests -- --test-threads=1
-cargo test --release --lib forward_gpu::joint_decode::tests -- --test-threads=1
+cargo test --release --bin hf2q joint_decode_routes
+cargo test --release --bin hf2q qwen35_joint_decode
+cargo test --release --bin hf2q joint_decode_ffn_tests -- --test-threads=1
+cargo test --release --bin hf2q forward_gpu::joint_decode::tests -- --test-threads=1
 HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 \
 HF2Q_QWEN38_GGUF=/Users/robert/.local/share/hf2q/models/qwen38-stock/Qwen3.8-27B-vanilla.gguf \
-  cargo test --release --lib qwen38_joint_decode_padded_mv_ext_rows_are_cohort_invariant_bitwise -- --ignored --exact --nocapture
+  cargo test --release --bin hf2q qwen38_joint_decode_padded_mv_ext_rows_are_cohort_invariant_bitwise -- --ignored --exact --nocapture
 HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 \
 HF2Q_QWEN38_GGUF=/Users/robert/.local/share/hf2q/models/qwen38-stock/Qwen3.8-27B-vanilla.gguf \
-  cargo test --release --lib qwen38_joint_decode_padded_mv_ext_keeps_decision_parity -- --ignored --exact --nocapture
+  cargo test --release --bin hf2q qwen38_joint_decode_padded_mv_ext_keeps_decision_parity -- --ignored --exact --nocapture
 HF2Q_QWEN38_GGUF=/Users/robert/.local/share/hf2q/models/qwen38-stock/Qwen3.8-27B-vanilla.gguf \
-  cargo test --release --lib qwen38_joint_decode_mvn_matches_serial_decode_bitwise -- --ignored --exact --nocapture
+  cargo test --release --bin hf2q qwen38_joint_decode_mvn_matches_serial_decode_bitwise -- --ignored --exact --nocapture
 ```
 
 ## Measured result

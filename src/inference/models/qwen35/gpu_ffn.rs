@@ -1148,8 +1148,11 @@ pub(crate) enum DenseGateUpDispatch {
     /// once per row.
     PreferFused,
     /// Separate gate and up products through the canonical GGML dispatcher,
-    /// then `silu_mul`. At widths 2..=8 its multi-column matvec routes read
-    /// each weight block once for every row.
+    /// then `silu_mul`. Weight reuse is whatever that dispatcher's route
+    /// gives for the type, width and routing policy. At width 4 under
+    /// `HF2Q_DECODE_MV_EXT=1` (the padded joint mode) every admitted type
+    /// reads each weight block once for all rows. At widths 2..=3 with
+    /// `mvN` off, K-quants take the per-row `Mv` kernel instead.
     Separate,
 }
 
