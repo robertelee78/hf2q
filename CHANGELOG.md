@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Keep the Qwen tool-continuation thinking ceiling (default 512) at every tool-chain depth. Halving it to a 256-token floor from the second tool result forced the reasoning close inside the first edit plan of an ordinary read/read/write coding workflow.
 - Preserve Qwen tool-call parameter whitespace in unary and streaming responses. Only the single newline the native template wraps around each `<parameter>` value is removed; a file's trailing newline and leading indentation now reach the client intact.
+- Gemma 4 `reasoning_content` no longer includes the `thought` channel label. An empty thought block (which the model writes after each tool result) now yields no `reasoning_content`, in both unary and streaming responses. This matches the tokenizer's reasoning `x-regex`. History that an older client echoes as `"thought\n…"` renders as if it had no label.
+- Gemma 4 tool-loop history now renders the way the official chat template intends. Assistant messages keep their `assistant` role; only hf2q's fallback template still renames them to `model`. Each tool-loop step therefore continues the open model turn instead of closing and reopening it. Tool results pass their `tool_call_id` and `name` to the template, so they render as `response:<function>` and no longer as `response:unknown`. Gemma prompt bytes change for multi-turn tool conversations, so cached prefixes from earlier renders stop matching once. Persisted Gemma response-replay snapshots move to format version 3.
 
 ## [0.1.28] — 2026-10-29
 

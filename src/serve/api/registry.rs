@@ -412,9 +412,10 @@ pub enum GrammarShape {
 /// tokenizer_config:8,28). This iter corrects the registration so the
 /// engine's `ReasoningSplitter` detects what the model emits during decode
 /// (any `<|channel>thought\n…<channel|>` block the model produces gets
-/// routed to `delta.reasoning_content`; the literal `thought\n` channel
-/// identifier remains visible inside the routed reasoning text by design,
-/// mirroring `strip_thinking`'s scope).
+/// routed to `delta.reasoning_content`). The `thought` channel label and
+/// the whitespace after it are dropped, matching the tokenizer `x-regex`
+/// capture `<|channel>thought\n(?P<thinking>.*?)<channel|>`; an empty
+/// block therefore yields no `reasoning_content` at all.
 pub const GEMMA4: ModelRegistration = ModelRegistration {
     family: "gemma4",
     id_substrings: &["gemma-4", "gemma4"],
@@ -553,11 +554,29 @@ pub struct ReasoningSplitter {
     /// protocol, not to OpenAI `content`.
     post_close_separator: &'static str,
     awaiting_post_close_separator: bool,
+    /// Gemma 4 opens its reasoning channel as `<|channel>thought\n`. The
+    /// channel name is protocol framing, not reasoning text: the tokenizer
+    /// `x-regex` `<|channel>thought\n(?P<thinking>.*?)<channel|>` excludes
+    /// it. Empty for families without a channel label.
+    open_label: &'static str,
+    open_label_state: OpenLabelState,
     in_reasoning: bool,
     /// Sliding tail of decoded text — long enough to see either marker span
     /// across token boundaries.
     tail_buf: String,
     tail_cap: usize,
+}
+
+/// Progress through stripping [`ReasoningSplitter::open_label`] (plus the
+/// whitespace after it) right after a reasoning open marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenLabelState {
+    /// Not at a channel start.
+    Idle,
+    /// Just consumed the open marker; the label may still arrive.
+    AwaitLabel,
+    /// Label consumed; dropping the whitespace that follows it.
+    StripWhitespace,
 }
 
 impl ReasoningSplitter {
@@ -600,6 +619,12 @@ impl ReasoningSplitter {
             implicit_reasoning_close_marker,
             post_close_separator: if close == "</think>" { "\n\n" } else { "" },
             awaiting_post_close_separator: false,
+            open_label: if reg.family == "gemma4" {
+                GEMMA4_CHANNEL_LABEL
+            } else {
+                ""
+            },
+            open_label_state: OpenLabelState::Idle,
             in_reasoning: forced_open,
             tail_buf: String::with_capacity(cap * 2),
             tail_cap: cap,
@@ -639,6 +664,48 @@ impl ReasoningSplitter {
                     out_cursor = scan_cursor;
                 }
                 self.awaiting_post_close_separator = false;
+            }
+            match self.open_label_state {
+                OpenLabelState::Idle => {}
+                OpenLabelState::AwaitLabel => {
+                    let remainder = &scan[scan_cursor..];
+                    let label = self.open_label;
+                    // Hold back until the label (and the byte after it) is
+                    // decidable; fragments may split `thought\n` anywhere.
+                    if remainder.len() <= label.len() && label.starts_with(remainder) {
+                        self.tail_buf = scan[out_cursor..].to_string();
+                        break;
+                    }
+                    self.open_label_state = OpenLabelState::Idle;
+                    if let Some(after) = remainder.strip_prefix(label) {
+                        // Only a whole label word counts: `thought` followed
+                        // by whitespace or a marker (`<channel|>`, `<|tool_call>`).
+                        match after.chars().next() {
+                            Some(c) if c.is_whitespace() => {
+                                scan_cursor += label.len();
+                                out_cursor = scan_cursor;
+                                self.open_label_state = OpenLabelState::StripWhitespace;
+                                continue;
+                            }
+                            Some('<') => {
+                                scan_cursor += label.len();
+                                out_cursor = scan_cursor;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                OpenLabelState::StripWhitespace => {
+                    let remainder = &scan[scan_cursor..];
+                    let trimmed = remainder.trim_start();
+                    scan_cursor += remainder.len() - trimmed.len();
+                    out_cursor = scan_cursor;
+                    if trimmed.is_empty() {
+                        self.tail_buf.clear();
+                        break;
+                    }
+                    self.open_label_state = OpenLabelState::Idle;
+                }
             }
             let (active_marker, implicit_close) = if self.in_reasoning {
                 let close = scan[scan_cursor..]
@@ -688,6 +755,9 @@ impl ReasoningSplitter {
                     out_cursor = scan_cursor;
                     self.awaiting_post_close_separator =
                         closed_reasoning && !self.post_close_separator.is_empty();
+                    if !closed_reasoning && !self.open_label.is_empty() {
+                        self.open_label_state = OpenLabelState::AwaitLabel;
+                    }
                 }
                 None => {
                     // No more markers in the remainder. Commit the tail
@@ -728,6 +798,13 @@ impl ReasoningSplitter {
             self.tail_buf.clear();
             self.awaiting_post_close_separator = false;
         }
+        if self.open_label_state == OpenLabelState::AwaitLabel
+            && self.open_label.starts_with(self.tail_buf.as_str())
+        {
+            // Generation ended on (a prefix of) the bare channel label.
+            self.tail_buf.clear();
+        }
+        self.open_label_state = OpenLabelState::Idle;
         if self.tail_buf.is_empty() {
             return None;
         }
@@ -742,6 +819,22 @@ impl ReasoningSplitter {
 
     pub fn in_reasoning(&self) -> bool {
         self.in_reasoning
+    }
+}
+
+/// Gemma 4 reasoning channel name (`<|channel>thought\n…<channel|>`).
+const GEMMA4_CHANNEL_LABEL: &str = "thought";
+
+/// Strip a leading Gemma 4 channel label (plus the whitespace after it)
+/// from echoed `reasoning_content`, using the same whole-word rule as
+/// [`ReasoningSplitter`]. Older hf2q builds returned the label inside
+/// `reasoning_content`, so clients echo `"thought\n…"` back in history;
+/// the template re-adds the label itself.
+pub(crate) fn strip_gemma4_channel_label(reasoning: &str) -> &str {
+    match reasoning.strip_prefix(GEMMA4_CHANNEL_LABEL) {
+        Some(rest) if rest.is_empty() || rest.starts_with('<') => rest,
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
+        _ => reasoning,
     }
 }
 
@@ -4871,11 +4964,12 @@ mod tests {
         );
     }
 
-    /// Iter D W67: realistic Gemma 4 emission — the model produces
+    /// Realistic Gemma 4 emission — the model produces
     /// `<|channel>thought\n[REASONING_TEXT]<channel|>[ANSWER]` per the
-    /// tokenizer_config `x-regex`. The literal `thought\n` channel
-    /// identifier is part of the routed reasoning span (`strip_thinking`
-    /// preserves the channel name), and the post-close run is content.
+    /// tokenizer_config `x-regex`
+    /// `<|channel>thought\n(?P<thinking>.*?)<channel|>`: the `thought`
+    /// channel label and the whitespace after it are framing, not
+    /// reasoning, and the post-close run is content.
     #[test]
     fn splitter_gemma4_realistic_thought_channel_emission() {
         let out = split(
@@ -4886,12 +4980,96 @@ mod tests {
         assert_eq!(
             joined,
             vec![
-                (
-                    SplitSlot::Reasoning,
-                    "thought\nlet me compute 73 * 47".into()
-                ),
+                (SplitSlot::Reasoning, "let me compute 73 * 47".into()),
                 (SplitSlot::Content, "The answer is 3431".into()),
             ]
+        );
+    }
+
+    /// The empty thought block Gemma 4 emits after a tool response with
+    /// thinking off carries no reasoning: unary output omits
+    /// `reasoning_content` entirely, so clients never echo the bare
+    /// `thought\n` label back into history.
+    #[test]
+    fn splitter_gemma4_empty_thought_block_has_no_reasoning() {
+        let text = "<|channel>thought\n<channel|><|tool_call>call:f{}<tool_call|>";
+        assert_eq!(
+            split(&GEMMA4, text),
+            vec![(
+                SplitSlot::Content,
+                "<|tool_call>call:f{}<tool_call|>".into()
+            )]
+        );
+        let (content, reasoning) = split_full_output(&GEMMA4, text);
+        assert_eq!(content, "<|tool_call>call:f{}<tool_call|>");
+        assert_eq!(reasoning, None);
+        assert_eq!(
+            split_full_output(&GEMMA4, "<|channel>thought<channel|>ok"),
+            ("ok".to_string(), None)
+        );
+        // Generation ending on the bare label is not reasoning either.
+        assert_eq!(
+            split_full_output(&GEMMA4, "<|channel>thought"),
+            (String::new(), None)
+        );
+    }
+
+    /// Streaming deltas must equal the unary split for every
+    /// fragmentation, including fragments that cut the label, the
+    /// whitespace after it, or the markers.
+    #[test]
+    fn splitter_gemma4_label_strip_streaming_matches_unary() {
+        let cases = [
+            "<|channel>thought\n<channel|>done",
+            "<|channel>thought\n\n  step one\nstep two<channel|>answer",
+            "pre<|channel>thoughtful idea<channel|>post",
+            "<|channel>thought<|tool_call>call:f{}<tool_call|>",
+            "<|channel>thought\nα<channel|>β",
+        ];
+        for text in cases {
+            let (content, reasoning) = split_full_output(&GEMMA4, text);
+            for size in 1..=text.len() {
+                let mut sp = ReasoningSplitter::from_registration(&GEMMA4).unwrap();
+                let (mut c, mut r) = (String::new(), String::new());
+                let mut start = 0;
+                while start < text.len() {
+                    let mut end = (start + size).min(text.len());
+                    while !text.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    for (slot, frag) in sp.feed(&text[start..end]) {
+                        match slot {
+                            SplitSlot::Content => c.push_str(&frag),
+                            SplitSlot::Reasoning => r.push_str(&frag),
+                        }
+                    }
+                    start = end;
+                }
+                if let Some((slot, frag)) = sp.finish() {
+                    match slot {
+                        SplitSlot::Content => c.push_str(&frag),
+                        SplitSlot::Reasoning => r.push_str(&frag),
+                    }
+                }
+                assert_eq!(c, content, "content, {text:?} size {size}");
+                assert_eq!(
+                    (!r.is_empty()).then_some(r),
+                    reasoning,
+                    "reasoning, {text:?} size {size}"
+                );
+            }
+        }
+        assert_eq!(
+            split_full_output(
+                &GEMMA4,
+                "<|channel>thought\n\n  step one\nstep two<channel|>answer"
+            ),
+            ("answer".to_string(), Some("step one\nstep two".to_string()))
+        );
+        // `thoughtful` is not the channel label.
+        assert_eq!(
+            split_full_output(&GEMMA4, "pre<|channel>thoughtful idea<channel|>post"),
+            ("prepost".to_string(), Some("thoughtful idea".to_string()))
         );
     }
 

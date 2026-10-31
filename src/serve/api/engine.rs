@@ -30990,9 +30990,10 @@ fn strip_trailing_stop(text: &mut String, stops: &[String]) {
 ///     concatenated; image parts are ignored in this iter (multimodal lands
 ///     with Phase 2c). A future iter will pass typed parts to vision-aware
 ///     templates.
-///   - OpenAI `assistant` role is remapped to `model` if the GGUF template
-///     is Gemma 4 (detected by presence of `<|turn>model` in the template).
-///     Otherwise roles are passed through verbatim.
+///   - OpenAI `assistant` role is remapped to `model` only for hf2q's
+///     `FALLBACK_GEMMA4_API_CHAT_TEMPLATE`, which prints `m.role` directly.
+///     Every other template (including official Gemma 4 templates, which
+///     rename internally) sees roles verbatim.
 ///   - Per-message `tool_calls` (assistant-emitted) and synthetic
 ///     `tool_responses` (synthesized from OpenAI `role: "tool"` history
 ///     messages, see [`render_chat_prompt_with_tools`]) are exposed to the
@@ -31097,7 +31098,15 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
         return render_deepseek_v4_prompt(messages, tools, enable_thinking, chat_template_kwargs);
     }
 
-    let remap_assistant_to_model = template_str.contains("<|turn>model");
+    // Only hf2q's own fallback renders `<|turn>{{ m.role }}` directly and
+    // needs the Gemma `assistant`→`model` rename. Official / embedded
+    // Gemma 4 templates rename internally and branch on the ORIGINAL
+    // `assistant` role for tool-loop turn continuation, so they must see
+    // the OpenAI roles unchanged.
+    let remap_assistant_to_model = template_str == crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE;
+    // Gemma 4 channel protocol (`<|channel>thought\n…<channel|>`): the
+    // template re-adds the `thought` label around echoed reasoning.
+    let gemma_channel_template = template_str.contains("<|channel>");
 
     // Lookup table tool_call_id → function-name for synthesizing
     // `tool_responses` on role:"tool" messages. Populated INCREMENTALLY
@@ -31133,10 +31142,21 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
         // fabricated empty think block as its own prior output.
         if msg.role == "assistant" {
             if let Some(rc) = msg.reasoning_content.as_ref() {
-                obj.insert(
-                    "reasoning_content".into(),
-                    serde_json::Value::String(rc.clone()),
-                );
+                // Clients of older hf2q builds echo Gemma reasoning with the
+                // channel label still attached (`"thought\n"` for an empty
+                // block); the template adds the label itself, so strip it
+                // and drop reasoning that was only the label.
+                let rc = if gemma_channel_template {
+                    super::registry::strip_gemma4_channel_label(rc)
+                } else {
+                    rc.as_str()
+                };
+                if !(gemma_channel_template && rc.is_empty()) {
+                    obj.insert(
+                        "reasoning_content".into(),
+                        serde_json::Value::String(rc.to_string()),
+                    );
+                }
             }
         }
 
@@ -31181,6 +31201,18 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
         // Templates (Gemma 4) accept either string or mapping for the
         // `response` field; the string path is the safer default.
         if msg.role == "tool" {
+            // OpenAI tool-result fields pass through verbatim: templates
+            // that resolve the function name themselves (Gemma 4 official:
+            // `follow.get('name')` / matching `tool_call_id`) need them.
+            if let Some(tcid) = msg.tool_call_id.as_ref() {
+                obj.insert(
+                    "tool_call_id".into(),
+                    serde_json::Value::String(tcid.clone()),
+                );
+            }
+            if let Some(name) = msg.name.as_ref() {
+                obj.insert("name".into(), serde_json::Value::String(name.clone()));
+            }
             if let Some(tcid) = msg.tool_call_id.as_ref() {
                 let name = id_to_name
                     .get(tcid)
@@ -32886,9 +32918,12 @@ assistant:
     }
 
     #[test]
-    fn render_chat_prompt_remaps_assistant_for_gemma_template() {
-        // Template that contains the Gemma 4 marker `<|turn>model` triggers
-        // the assistant→model remap.
+    fn render_chat_prompt_remaps_assistant_only_for_gemma_fallback_template() {
+        // hf2q's fallback prints `m.role` directly, so it needs the
+        // assistant→model rename; any other template containing
+        // `<|turn>model` (official Gemma 4 templates rename internally)
+        // must see the OpenAI role verbatim.
+        use crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE;
         let tmpl = "<|turn>system\n<|turn>user\n{% for m in messages %}{{ m.role }}:{{ m.content }}\n{% endfor %}<|turn>model\n";
         let msgs = vec![
             ChatMessage {
@@ -32908,11 +32943,15 @@ assistant:
                 name: None,
             },
         ];
+        let fallback = render_chat_prompt(FALLBACK_GEMMA4_API_CHAT_TEMPLATE, &msgs).unwrap();
+        assert_eq!(
+            fallback,
+            "<bos><|turn>user\nhi<turn|>\n<|turn>model\nhello<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        );
         let out = render_chat_prompt(tmpl, &msgs).unwrap();
         assert!(out.contains("user:hi"));
-        // assistant should have been remapped to model
-        assert!(out.contains("model:hello"));
-        assert!(!out.contains("assistant:hello"));
+        assert!(out.contains("assistant:hello"));
+        assert!(!out.contains("model:hello"));
     }
 
     #[test]
@@ -33009,7 +33048,7 @@ assistant:
                     {%- for part in text.split('|') -%}{{ part }}+{% endfor -%}\
                     {%- endmacro -%}\
                     {% for m in messages %}\
-                    {%- if m.role == 'model' -%}M:{{ splitter(m.content) }}\n\
+                    {%- if m.role == 'assistant' -%}M:{{ splitter(m.content) }}\n\
                     {%- else -%}{{ m.role }}:{{ m.content }}\n{% endif -%}\
                     {% endfor %}";
         let msgs = vec![
@@ -33040,8 +33079,8 @@ assistant:
         ];
         let out = render_chat_prompt(tmpl, &msgs).unwrap();
         assert!(out.contains("user:hi"), "out={out}");
-        // assistant remapped to model (gemma marker present), then split('|')
-        // produced ["a", "b", "c"], each with a trailing '+'.
+        // assistant content went through split('|'), producing
+        // ["a", "b", "c"], each with a trailing '+'.
         assert!(out.contains("M:a+b+c+"), "out={out}");
         assert!(out.contains("user:again"), "out={out}");
     }
@@ -33525,6 +33564,136 @@ assistant:
         assert_eq!(
             &full[stable.len()..],
             "<|turn>model\n<|channel>thought\n<channel|>"
+        );
+    }
+
+    /// The official Gemma 4 chat template (HF `google/gemma-4-26B-A4B-it`
+    /// `chat_template.jinja`, "Published: 2026-07-09"). Unlike the apex
+    /// embedded template it renames `assistant`→`model` itself, keeps one
+    /// model turn open across a tool loop by testing the ORIGINAL role,
+    /// resolves tool names from `name` / `tool_call_id`, and echoes
+    /// `reasoning_content` after the last user turn.
+    const GEMMA4_OFFICIAL_TEMPLATE: &str =
+        include_str!("test_fixtures/gemma4-official-chat-template.jinja");
+
+    /// OpenAI tool-loop history as a coding agent sends it: assistant
+    /// tool calls with empty content and empty reasoning, tool results
+    /// carrying `tool_call_id` + `name`.
+    fn gemma_official_tool_loop() -> serde_json::Value {
+        serde_json::json!({
+            "tools": [
+                {"type": "function", "function": {"name": "read_file", "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+                {"type": "function", "function": {"name": "run_tests", "description": "Run tests",
+                    "parameters": {"type": "object", "properties": {"target": {"type": "string"}}}}}
+            ],
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "Fix parse_port and run the tests."},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"src/ports.rs\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "pub fn parse_port() {}\n"},
+                {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": [{"id": "c2", "type": "function",
+                    "function": {"name": "run_tests", "arguments": "{\"target\":\"ports\"}"}}]},
+                {"role": "tool", "tool_call_id": "c2", "name": "run_tests", "content": "{\"passed\": true}"},
+                {"role": "assistant", "content": "Done: tests pass."},
+                {"role": "user", "content": "Read it again."},
+                {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": [{"id": "c3", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"src/ports.rs\"}"}}]},
+                {"role": "tool", "tool_call_id": "c3", "content": "pub fn parse_port() {}\n"}
+            ]
+        })
+    }
+
+    /// Direct render of the raw request messages, as the peer feeds them:
+    /// roles, `tool_call_id`, `name` unchanged; only tool-call `arguments`
+    /// strings are parsed into mappings (the official template rejects
+    /// string arguments).
+    fn gemma_official_direct_render(request: &serde_json::Value, enable_thinking: bool) -> String {
+        let mut messages = request["messages"].clone();
+        for message in messages.as_array_mut().unwrap() {
+            if let Some(calls) = message.get_mut("tool_calls").and_then(|c| c.as_array_mut()) {
+                for call in calls {
+                    let raw = call["function"]["arguments"].as_str().unwrap().to_string();
+                    call["function"]["arguments"] = serde_json::from_str(&raw).unwrap();
+                }
+            }
+        }
+        let tools: Vec<super::super::schema::Tool> =
+            serde_json::from_value(request["tools"].clone()).unwrap();
+        let mut env = crate::serve::build_chat_template_env(crate::serve::RaisePolicy::Strict);
+        env.add_template("chat", GEMMA4_OFFICIAL_TEMPLATE).unwrap();
+        env.get_template("chat")
+            .unwrap()
+            .render(minijinja::Value::from_serialize(&serde_json::json!({
+                "messages": messages,
+                "tools": serde_json::to_value(&tools).unwrap(),
+                "enable_thinking": enable_thinking,
+                "add_generation_prompt": true,
+                "bos_token": "<bos>",
+                "eos_token": "<eos>",
+            })))
+            .unwrap()
+    }
+
+    fn gemma_official_hf2q_render(request: &serde_json::Value, enable_thinking: bool) -> String {
+        let messages: Vec<ChatMessage> =
+            serde_json::from_value(request["messages"].clone()).unwrap();
+        let tools: Vec<super::super::schema::Tool> =
+            serde_json::from_value(request["tools"].clone()).unwrap();
+        render_chat_prompt_with_tools(
+            GEMMA4_OFFICIAL_TEMPLATE,
+            &messages,
+            Some(&tools),
+            enable_thinking,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn gemma_official_template_tool_loop_renders_like_raw_messages() {
+        let request = gemma_official_tool_loop();
+        for enable_thinking in [false, true] {
+            let hf2q = gemma_official_hf2q_render(&request, enable_thinking);
+            let direct = gemma_official_direct_render(&request, enable_thinking);
+            assert_eq!(hf2q, direct, "enable_thinking={enable_thinking}");
+            // One open model turn per tool loop, real tool names, no
+            // echoed empty thought blocks.
+            assert!(hf2q.contains(
+                "<|turn>model\n<|tool_call>call:read_file{path:<|\"|>src/ports.rs<|\"|>}<tool_call|>\
+                 <|tool_response>response:read_file{value:<|\"|>pub fn parse_port() {}\n<|\"|>}<tool_response|>\
+                 <|tool_call>call:run_tests{target:<|\"|>ports<|\"|>}<tool_call|>"
+            ));
+            assert!(!hf2q.contains("response:unknown"), "{hf2q}");
+            assert!(!hf2q.contains("<|channel>thought\nthought"), "{hf2q}");
+        }
+        // Tail: last message is a tool response, so thinking-off adds no
+        // generation suffix and thinking-on opens the channel.
+        assert!(gemma_official_hf2q_render(&request, false).ends_with("<tool_response|>"));
+        assert!(gemma_official_hf2q_render(&request, true)
+            .ends_with("<tool_response|><|channel>thought\n"));
+    }
+
+    #[test]
+    fn gemma_official_template_drops_echoed_bare_channel_label() {
+        // Clients of older hf2q builds echo `reasoning_content: "thought\n"`
+        // for every empty thought block; it must render exactly like no
+        // reasoning, and a labelled non-empty trace renders once-labelled.
+        let request = gemma_official_tool_loop();
+        let mut old_client = request.clone();
+        old_client["messages"][8]["reasoning_content"] = "thought\n".into();
+        assert_eq!(
+            gemma_official_hf2q_render(&old_client, false),
+            gemma_official_hf2q_render(&request, false)
+        );
+        old_client["messages"][8]["reasoning_content"] = "thought\nCheck the file.".into();
+        let out = gemma_official_hf2q_render(&old_client, false);
+        assert!(
+            out.contains(
+                "<|turn>model\n<|channel>thought\nCheck the file.\n<channel|><|tool_call>"
+            ),
+            "{out}"
         );
     }
 
