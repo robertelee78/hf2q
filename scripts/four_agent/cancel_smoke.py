@@ -46,7 +46,8 @@ ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 JOINT = re.compile(r'\b(?P<engine>DeepSeek-V4|Qwen) joint decode turn(?P<fields>(?:\s+[a-z_]+=\S+)*)')
 FIELD = re.compile(r'([a-z_]+)=(\S+)')
 ERROR_LINE = re.compile(r'^\s*ERROR\s')
-POISON = re.compile(r'poison', re.IGNORECASE)
+# A poison event, not a `cache_poisoned=false` field on an INFO progress line.
+POISON = re.compile(r'poison(?!(?:ed)?=false\b)', re.IGNORECASE)
 CANCELLATIONS = re.compile(r'^hf2q_sse_cancellations\s+(\d+)\s*$', re.MULTILINE)
 LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 

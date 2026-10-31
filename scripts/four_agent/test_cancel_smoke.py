@@ -294,6 +294,10 @@ class Parsing(unittest.TestCase):
     def test_problem_lines(self):
         self.assertEqual(cs.problem_lines(self.lines(' INFO ok\n ERROR boom\n WARN engine poisoned\n')),
                          [' ERROR boom', ' WARN engine poisoned'])
+        # A healthy progress line reports `cache_poisoned=false`; that is not a poison event.
+        quiet = ' INFO prefix reuse rejected cache_poisoned=false matrix_prefill_forced=false\n'
+        self.assertEqual(cs.problem_lines(self.lines(quiet + ' WARN cache_poisoned=true\n')),
+                         [' WARN cache_poisoned=true'])
 
 
 class Accumulating(unittest.TestCase):
