@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 import coding_instances
+import q2_fake_service as fake
 import q5_calibration
 import q5_case
 import quality_campaign as qc
@@ -162,7 +163,10 @@ class Classify(unittest.TestCase):
 
 
 class FakeRuns:
-    """Stands in for q5_calibration.py: writes the receipt and client summary a run would leave."""
+    """Stands in for q5_calibration.py: writes the receipt and client directory a run would leave.
+
+    A passing client directory comes from the model-free fake service (raw turns + coordinator
+    summary), so the Q2 run audit re-derives the task success instead of trusting its status."""
 
     def __init__(self, result):
         self.result, self.calls = result, []
@@ -179,12 +183,16 @@ class FakeRuns:
             (output / "receipt.json").write_text(json.dumps(receipt(verdict="PreflightRefused", client=False)))
             return 2
         output.mkdir()
-        (output / "client").mkdir()
         stop = {"reason": "footprint_cap"} if kind == "stopped" else None
-        (output / "receipt.json").write_text(json.dumps(receipt(stop, exit_code=0 if kind == "pass" else 1)))
-        (output / "client" / "summary.json").write_text(
-            json.dumps(summary(qc.SUCCESS if kind == "pass" else "Failed", instance=instance)))
-        return 0 if kind == "pass" else 1
+        value = receipt(stop, exit_code=0 if kind == "pass" else 1)
+        value.update(cleanup={"proven": True}, cleanup_proven=True)
+        (output / "receipt.json").write_text(json.dumps(value))
+        if kind == "pass":
+            fake.honest_run(output / "client", instance=instance)
+            return 0
+        (output / "client").mkdir()
+        (output / "client" / "summary.json").write_text(json.dumps(summary("Failed", instance=instance)))
+        return 1
 
 
 class Campaign(unittest.TestCase):

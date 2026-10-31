@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 import f2_scoreboard_render as f2
+import q2_fake_service as fake
 import q3_campaign as q3
 import q3_identity
 import q3_metrics
@@ -140,8 +141,10 @@ def turns(ttft=1.0, gaps_ms=(10, 20)):
             {"semantic_timing_v3": {"stream": True, "semantic_ttft_seconds": ttft}, "semantic_event_monotonic_ns": events}]
 
 
-def write_run(out, sha, makespan=None, outcome="pass", agents=4, thermal=0, ttft=1.0, artifact_sha=MODEL_SHA, build=None):
-    """Receipt-shaped files as q5_calibration.py and the four-agent client write them."""
+def write_run(out, sha, makespan=None, outcome="pass", thermal=0, artifact_sha=MODEL_SHA, build=None,
+              phase_plan=None, engine_kind="hf2q", serialized=False):
+    """Receipt-shaped files as q5_calibration.py writes them; a passing client directory comes from the
+    model-free fake service (raw turns + coordinator summary) so the Q2 run audit can re-derive it."""
     out.mkdir(parents=True)
     if outcome == "preflight":
         receipt = {"verdict": {"verdict": "PreflightRefused", "reason": "competitor"}, "client": None, "stop": None}
@@ -154,7 +157,7 @@ def write_run(out, sha, makespan=None, outcome="pass", agents=4, thermal=0, ttft
                            "pressure_counts": {"normal": 3}, "peak_footprint_bytes": 1, "max_compressor_bytes": 1},
                "effective_floor": {"effective_floor_bytes": 2 << 30}, "preflight": {"thermal_state": thermal},
                "binary": {"sha256": sha}, "artifact": {"path": "/m.gguf", "bytes": 10, "sha256": artifact_sha},
-               "readiness": {"documents": {}}}
+               "readiness": {"documents": {}}, "cleanup": {"proven": ok}, "cleanup_proven": ok}
     if build is not None:
         (out / "readiness-1.json").write_text(json.dumps({"build_info": build}))
         receipt["readiness"]["documents"]["http://127.0.0.1:1/props"] = "readiness-1.json"
@@ -162,16 +165,18 @@ def write_run(out, sha, makespan=None, outcome="pass", agents=4, thermal=0, ttft
     if outcome == "oom":
         (out / "server.stderr").write_bytes(b"x" * 10 + b"error: Insufficient Memory (00000008:kIOGPUCommand"
                                             b"BufferCallbackErrorOutOfMemory)\n")
-    names = [f"agent-{i}" for i in range(agents)]
-    status = "ProtocolCompleteAwaitingIndependentPatchReview"
-    summary = {"status": "FourAgentProtocolCompleteAwaitingIndependentReview" if ok else "Failed",
-               "barrier": {"status": "Released"},
-               "agents": {a: {"status": status if ok else "Failed", "final_source_sha256": "f" * 64,
-                              "turns": turns(ttft)} for a in names}}
     if ok:
-        summary["own_output_four_task_makespan_seconds"] = makespan
+        fake.honest_run(out / "client", makespan, engine_kind, phase_plan, slots=1 if serialized else None)
+        return
+    names = [f"agent-{i}" for i in range(4)]
+    summary = {"status": "Failed", "barrier": {"status": "Released"},
+               "agents": {a: {"status": "Failed", "final_source_sha256": fake.FINAL_SOURCE_SHA256, "turns": []}
+                          for a in names}}
     (out / "client").mkdir()
     (out / "client" / "summary.json").write_text(json.dumps(summary))
+
+
+PLANS = {slug: q3.WORKLOADS[key] for key, slug in q3.SLUGS.items()}
 
 
 class FakeRunner:
@@ -184,7 +189,9 @@ class FakeRunner:
         case, out = Path(argv[3]), Path(argv[5])
         workload, arm = case.stem.split("-", 1)
         self.calls.append((workload, arm, out.name, env))
-        spec = {"sha": SHAS[arm], "build": "b1" if arm.startswith("peer") else None, **self.decide(arm, workload, len(self.calls))}
+        spec = {"sha": SHAS[arm], "build": "b1" if arm.startswith("peer") else None,
+                "phase_plan": PLANS[workload], "engine_kind": "peer" if arm.startswith("peer") else "hf2q",
+                **self.decide(arm, workload, len(self.calls))}
         write_run(out, **spec)
         return 0
 
@@ -254,7 +261,7 @@ class Driver(Harness):
         self.assertAlmostEqual(verdict["primary"]["effects"]["vs_peer"]["ratio"], 0.8, places=2)
         self.assertEqual(verdict["warmups_discarded"], 3)
         self.assertEqual(verdict["primary"]["arms"]["experiment"]["thermal"]["in_run"], "unrecorded")
-        self.assertEqual(verdict["quality"]["patch_review"]["pending"], ["f" * 64])
+        self.assertEqual(verdict["quality"]["patch_review"]["pending"], [fake.FINAL_SOURCE_SHA256])
 
     def test_noisy_campaign_runs_to_twenty_blocks_and_is_inconclusive(self):
         driver, runner = self.driver(lambda arm, w, call: {"makespan": noisy(100, call // 3, 0.2) * (0.9 if arm == "experiment" else 1)})
@@ -382,7 +389,7 @@ class Driver(Harness):
         quality.write_text(json.dumps(document))
         self.assertEqual(self.verdict(manifest, quality_paths=[quality])["verdict"], "Inconclusive")
         review = self.root / "review.json"
-        review.write_text(json.dumps({"schema": q3_report.PATCH_REVIEW_SCHEMA, "verdicts": {"f" * 64: "Fail"}}))
+        review.write_text(json.dumps({"schema": q3_report.PATCH_REVIEW_SCHEMA, "verdicts": {fake.FINAL_SOURCE_SHA256: "Fail"}}))
         self.assertEqual(self.verdict(manifest, review_path=review)["verdict"], "Failed")
 
     def test_rows_validate_and_verify_against_the_f2_renderer(self):

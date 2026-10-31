@@ -28,6 +28,7 @@ import subprocess
 import sys
 
 import coding_instances
+import q2_run_audit
 import q5_case
 
 HERE = Path(__file__).resolve().parent
@@ -261,14 +262,21 @@ def settle(entry, record, case, plan, code):
     receipt = load_json(output / "receipt.json")
     summary_path = Path(q5_case.expand(case["client"]["summary"], {"OUT": str(output)}))
     summary = load_json(summary_path)
+    report = None
     if output.exists():
         outcome, reason = classify(receipt, summary, entry["instance"], plan["instance_table"]["sha256"])
     else:
         outcome, reason = "NotStarted", "Q5 never created the run directory"
+    if outcome == "Pass":
+        # A claimed task success counts only after its raw client evidence re-derives it (ADR-063 Q2).
+        report, failure = q2_run_audit.check_run(receipt, summary_path.parent, summary, None,
+                                                 plan["arms"][entry["arm"]]["engine_kind"], require_width=False)
+        if failure is not None:
+            outcome, reason = "Invalid", failure
     record.update(q5_exit=code, outcome=outcome, reason=reason,
                   receipt_sha256=sha256(output / "receipt.json") if receipt is not None else None,
                   q5_verdict=None if receipt is None else receipt.get("verdict"),
-                  stop=None if receipt is None else receipt.get("stop"))
+                  stop=None if receipt is None else receipt.get("stop"), audit=report)
     if summary is not None:
         record.update(client_summary=str(summary_path), client_summary_sha256=sha256(summary_path),
                       client_status=summary.get("status"), client_error=summary.get("error"),
