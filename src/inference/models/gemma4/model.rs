@@ -647,8 +647,8 @@ pub struct MlxModelWeights {
     /// single-slot resume and every [`GemmaLiveAttention::PerSlotExact`]
     /// cohort lane (installed lanes follow [`GemmaLiveAttention::Tiled`]).
     /// Resolved once at load from `HF2Q_GEMMA_WARM_TILED_ATTENTION` (default
-    /// [`GemmaLiveKernel::TiledF16`]; `0` restores
-    /// [`GemmaLiveKernel::VecHybrid`]).
+    /// [`GemmaLiveKernel::VecHybrid`]; `1` opts in to
+    /// [`GemmaLiveKernel::TiledF16`]).
     pub warm_live_kernel: GemmaLiveKernel,
 }
 
