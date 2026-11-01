@@ -16,7 +16,7 @@ Each control injects one specific lie and asserts that the harness rejects it wi
 | --- | --- |
 | `scripts/four_agent/q2_fake_service.py` | Test support. A model-free OpenAI-compatible loopback service that answers the canonical seven-turn coding workflow. Its fault table turns single responses adversarial. `slots=N` serves at most N requests at a time end to end (`slots=1` is a serialized service), `rendezvous` holds the given streams mid-stream together until their clients acknowledge their first progress frame, and `bursty=True` streams the four-frame hf2q Gemma shape (see "Deterministic under load" below). Clients are the real `exchange`/parser and the coordinator verdict is the real `aggregate`; tools are stubs. `run_live` drives four real client processes. `honest_run` writes complete client directories for campaign fixtures, lockstep or slot-capped. |
 | `scripts/four_agent/q2_run_audit.py` | Harness detection (new). Re-derives a settled run from its raw client evidence before a Pass counts. |
-| `scripts/four_agent/test_q2_adversarial_controls.py` | The control matrix below (38 tests). |
+| `scripts/four_agent/test_q2_adversarial_controls.py` | The control matrix below (42 tests). |
 
 ## Detection added to the harness
 
@@ -45,14 +45,24 @@ These gaps were found while building the controls. Each fix is the smallest chan
 
 Overlapping HTTP lifetimes prove nothing: a serialized service keeps four requests open while it serves one.
 
-- **Co-progress (v2, after independent QE review).**
+- **Co-progress (v3, after the first real mixed-plan runs; v2 after independent QE review).**
   - A streamed request is *active* from its first to its last progress frame (`progress_event_monotonic_ns`).
-  - A set of agents is *co-active* when one active request per agent shares a common window lasting at least `MIN_OVERLAP_FRACTION = 0.5` of the shortest member's active interval.
+  - The *common window* of one active request per agent is the closed interval [latest first frame, earliest last frame]. It must have positive length.
+  - A set of agents is *co-active* when such a common window either
+    - (route `fraction`) lasts at least `MIN_OVERLAP_FRACTION = 0.5` of the shortest member's active interval, or
+    - (route `frames`) holds at least `MIN_FRAMES_IN_WINDOW = 3` progress frames of every member.
   - The observed width is the largest co-active set. It is 1 when there is progress but no qualifying overlap, and 0 with no progress at all.
+  - The witness records the route, the members, the window, the overlap fraction and each member's frame count inside the window. The larger set wins; ties go to the larger fraction, then to the larger smallest frame count, then to the first set found.
   - The rule needs no frame alternation, so low-frame bursty streams qualify. hf2q Gemma streams one reasoning frame, then a burst of three semantic frames, in a fixed per-agent order.
 
   The first version required four frame alternations inside one request (`MIN_INTERLEAVE`). On retained hf2q Gemma runs that left zero margin: at most 2 switches from real semantic frames, and exactly 4 only with the reasoning frame placed from `first_reasoning_seconds`. A genuine Gemma Q3 run could therefore have been marked `Invalid`.
-- **Why a capped service cannot reach the width.** A service that runs at most N requests at a time cannot keep N+1 requests mid-stream together. Its width stays at N however many HTTP requests it holds open. Only client receive jitter at request boundaries can overlap, and that is a vanishing fraction of an active interval: on real hardware the next request's first frame also waits for its prefill.
+- **Why a capped service cannot reach the width.** Take a service that serves at most N requests at a time and does not preempt them, and any N+1 of its requests. Their service intervals cannot all share an instant, and intervals that pairwise intersect share one (Helly, in one dimension). So two of them, A and B, are served one after the other: A completes before B's slot starts it. A common window of a set containing both opens no earlier than B's first frame, which B's slot sends after A completed, and closes no later than A's last frame, which A's slot sent before it completed. The window is non-empty only because the client stamps A's frames later than they were sent: it lies inside A's completion plus A's receive lag.
+  - Route `fraction`: that lag is a vanishing fraction of an active interval, and on real hardware B's first frame also waits for its prefill.
+  - Route `frames`: every member needs k = `MIN_FRAMES_IN_WINDOW` = 3 stamps in the window. A's stamps need no time inside it: the client stamps every frame parsed from one `read1(16384)` block within microseconds (the SSE loop of `exchange` in `qwen38_n1_smoke.py`), so A's last k frames can arrive as one coalesced read. The protection comes from B. Its k frames are generated after A completed, so they need B's time to first token (including its prefill) plus k − 1 of B's frame intervals, and all of them must be stamped before A's last stamp. A capped service therefore passes the frames route only if A's last frames are received at least B's TTFT + (k − 1) × B's frame interval after A completed.
+  - Measured receive spread: in run `p3p1-047-w00-peer-a0`, frames of the same decode step were stamped within about 1 ms across all four clients (73.765–73.766 s, 73.825–73.826 s and 74.132–74.134 s after the run's first send). The bound asks for a lag of B's TTFT plus two frame intervals, hundreds of milliseconds there. Server-side output buffering flushes no later than slot release, so only an HTTP writer that keeps draining A's output for that long after the slot was freed could pass.
+  - Residual: a server that emits several SSE frames per forward (speculative tokens, separate reasoning and content frames) lowers the bound towards B's TTFT alone, because B's k frames may then come from one forward.
+  - The fake service's slot-capped mode holds each slot until the client closed its connection, so there the window is empty for either route (see "Deterministic under load").
+  - So the width of such a service stays at N however many HTTP requests it holds open.
 - **Expected width.** Every active agent must be co-active at some point: 4 for `n4`, 4 for `3+1`, `2+2` and `1+3`, and 1 for the one-slot control `1`, which must contain only agent-0.
   - For `K+M` plans this is an after-release condition. The later cohort exists only after its release, and the audit separately proves that the earlier cohort was still running at that release.
   - A service capped at the largest cohort (2 for `2+2`, 3 for `3+1`/`1+3`) used to pass the mixed plans. It now fails them.
@@ -64,7 +74,7 @@ Overlapping HTTP lifetimes prove nothing: a serialized service keeps four reques
 
   Each agent must also observe its own cohort's release, and its first request must follow that release.
 - **Boundary.** Client co-progress is a lower bound on concurrent slot progress.
-  - A server that time-slices four requests token by token also shows width 4.
+  - A server that time-slices four requests token by token also shows width 4, by either route.
   - So does a server that parks a request mid-generation while it finishes another. To the client that looks the same as a model whose tokens are buffered between frames.
   - Physical batch membership (which owners share one forward), active and runnable prefill/decode counts, and pure four-prefill and four-decode phases come from the server phase trace. `f2_trace.validate_trace` and `qualify_window` decide those, with `forward_demand_v2`/queued-demand rules. They are controlled by `test_q2_f2_controls.py` (all populations, serialized four HTTP labels, Unknown/duplicate/stale membership, missing drains) and `test_f2_demand.py`.
 
@@ -105,6 +115,27 @@ All 16 completed retained runs in `gemma-stage2-ab-v1/g-*-T-*` (4) and `gemma-al
 - **Peer Gemma.** Streams carry 7 or 11 semantic frames. Overlap was 0.990–0.993.
 
 Against the 0.5 threshold that is a margin of about 2×. The alternation rule, by contrast, left zero margin on the same evidence.
+
+### v3 amendment: frames route for staggered mixed cohorts (2026-10-31)
+
+The 0.5 fraction was calibrated on n4 runs only. In `K+M` plans the later cohort's streamed turns are staggered against the earlier cohort's, so a genuinely concurrent server can show short 4-way windows.
+
+- **Measured defect.** The Q3 v7 Qwen3.8 `3+1` stage rejected run `p3p1-047-w00-peer-a0`, a peer server whose 4 slots were readiness-verified: `serialized or slot-capped service: observed co-progress width 3 < 4 with up to 4 overlapping HTTP requests`. Its best 4-way common window was 1.15 s (turns 5, 5, 5, 3), with 4, 18, 5 and 17 progress frames inside it per agent and overlap fraction 0.273. The hf2q stock and experiment `3+1` runs of the same stage passed with fractions 0.5046 and 0.5097 (windows 7.38 s and 4.13 s; frames in window 39, 57, 43, 61 and 41, 41, 43, 64), zero margin.
+- **Change.** Route `frames` above: a set whose positive-length common window holds at least 3 progress frames of every member is co-active even below the fraction. `MIN_OVERLAP_FRACTION` is not retuned and `expected_width` is unchanged. The measured 4-way window qualifies by route `frames` (its smallest member has 4 frames inside); the hf2q windows already qualified by route `fraction`, which still ranks first. Every set that qualified under v2 qualifies under v3 (the fraction route is identical, and v2 already required a positive window), so v3 can only raise a width.
+- **Re-audit.** The retained stamped runs were re-audited under v2 and v3 with `$E/q2-width-v3-reaudit/reaudit.py`: `$E/q2-width-v3-reaudit/reaudit.json` (sha256 `447ce9e05c6dd878cc4bf39d0ae9a212c36f2fc052790f82118ee838820354a4`) records `width_v2`, `width_v3` and the coverage list for all 194 stamped runs; only `p3p1-047-w00-peer-a0` changes (3 → 4). The independent review's own recomputation over 185 stamped runs agrees.
+- **Why 3.** Under k frames a capped service needs a receive lag of at least B's TTFT + (k − 1) × B's frame interval (see the capped-service argument above). k = 3 requires B to show its first frame and two decode intervals inside the window. k = 2 would require one interval, so the difference between them is one frame interval of B (about 60 ms in the measured run), not a qualitative gap; the bound rests on B's TTFT either way. k was chosen after seeing the measured minimum of 4 frames, so the measured run clears it by one frame.
+- **Controls.** Unit tests in `ProgressWidthRule` reproduce the measured shape (width 4 by `frames`) and the boundary (3 frames per member qualify, 2 do not below the fraction). A 3-slot-capped shape whose later request is stamped strictly after the earlier one's last frame stays at width 3. A second 3-slot-capped shape pins k: the back-to-back pair A, B has exactly 2 frames each inside a 10 ms window while the two other members have a coalesced 3-frame read inside it; it stays at width 3 at k = 3 and the test asserts it would be width 4 by `frames` at k = 2. The retimed and live serialized and slot-capped controls (n4 1/2/3 slots, `3+1` 3 and 1 slots, `2+2` 2 slots, `1+3` 3 slots, bursty serialized) are unchanged and still reject: their N+1 active intervals never share an instant, so no common window exists for either route. No live control exercises the frames route; the fake service has no mode that delays delivery after slot release.
+- **Methodology commitments.**
+  - (a) This amendment is posted on #369 before any new data. The new campaign pins a harness commit that contains it and records the `q2_run_audit.py` sha256 in its identities.
+  - (b) The v7 `qwen38-all` campaign stays `Invalid`. Re-auditing `p3p1-047-w00-peer-a0` never revives it; the failure justifies the amendment only, and acceptance needs a fresh run.
+  - (c) A new campaign runs only `3+1`, `2+2` and `1+3`, with the same arms, binaries and identities. The v7 `n4` and `n1` results are of record and are not re-run (their widths are the same under v3).
+  - (d) v2 passes in the running v7 chain stand, since a v2 pass is a v3 pass. A v2 width-only halt moves only the remaining stages to a new v3 campaign; nothing is re-audited into validity and completed stages are never re-run.
+  - (e) The width rule is frozen for the ADR-063 Q3 record. A width-only `Invalid` in the new campaign stands as reported.
+- **Disclosed post-hoc elements and risks.**
+  - k = 3 was chosen after seeing the measured minimum of 4 frames per member.
+  - The hf2q arms' under-2% margin on the fraction route (0.5046, 0.5097) was seen in warmups.
+  - The peer's `3+1` validity rests on one incidental stagger window, which clears k by one frame.
+  - Structural risk: a later-cohort streamed turn can line up with the earlier cohort's unary turns, which carry no progress frames. The frames route does not fix that, so a genuine run can still halt width-only; under (e) that halt stands.
 
 ## Control matrix
 
