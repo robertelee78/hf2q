@@ -93,6 +93,80 @@ class Envelope(unittest.TestCase):
         self.assertEqual(result["first_differing"][:2], ["Logits", "agent-1"])
 
 
+def bits(value):
+    return array.array("I", array.array("f", [value]).tobytes())[0]
+
+
+IDENTITY = {"family": "Gemma4", "model_sha256": "m" * 64, "token_vectors_sha256": "t" * 64}
+
+
+def routing_row(lane, position, layer, selected, kth=0.30, nxt=0.29, namespace="Canonical"):
+    return {"kind": "routing_row",
+            "at": {"namespace": namespace, "layer": layer, "row": {"lane": lane, "position": position},
+                   "domain": "SoftmaxBeforeTopKRenorm"},
+            "scores_f32_bits": [bits(kth), bits(nxt)], "boundary_ids": [selected[-1], 99],
+            "selected_ids": selected, "selected_weights_f32_bits": [bits(0.5)] * len(selected),
+            "native_boundary_valid": True, "selected_copy_valid": True, "native_decode_error": None}
+
+
+def witness(root, name, rows, identity=IDENTITY, records=None):
+    path = Path(root) / f"{name}.jsonl"
+    events = [{"kind": "header", "identity": identity}, *rows,
+              {"kind": "end", "records": len(rows) if records is None else records,
+               "all_scored_rows_captured": True}]
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return path
+
+
+class Routing(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.rows = [routing_row(lane, 0, layer, [1, 2, 3]) for lane in range(2) for layer in range(2)]
+        self.left = witness(self.root, "left", self.rows)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_identical_selection_is_exact_routing(self):
+        result = q.routing(self.left, witness(self.root, "right", list(reversed(self.rows))))
+        self.assertEqual((result["classification"], result["rows"], result["changed_rows"]),
+                         ("ExactRouting", 4, 0))
+
+    def test_flip_and_order_change_report_both_margins(self):
+        rows = list(self.rows)
+        rows[1] = routing_row(0, 0, 1, [1, 2, 99], kth=0.295, nxt=0.30)
+        rows[2] = routing_row(1, 0, 0, [2, 1, 3])
+        result = q.routing(self.left, witness(self.root, "right", rows))
+        self.assertEqual(result["classification"], "RoutingChanged")
+        self.assertEqual((result["changed_rows"], result["set_changed_rows"], result["order_only_rows"]),
+                         (2, 1, 1))
+        flip = next(row for row in result["changed"] if row["set_changed"])
+        self.assertEqual((flip["lane"], flip["layer"], flip["right"]["selected_ids"]), (0, 1, [1, 2, 99]))
+        self.assertAlmostEqual(flip["left"]["gap"], 0.01, places=6)
+        self.assertAlmostEqual(flip["right"]["gap"], -0.005, places=6)
+        self.assertEqual(flip["left"]["domain"], "SoftmaxBeforeTopKRenorm")
+
+    def test_unpaired_duplicate_or_incomplete_witness_refuses(self):
+        with self.assertRaises(Invalid):
+            q.routing(self.left, witness(self.root, "short", self.rows[:3]))
+        with self.assertRaises(Invalid):
+            q.routing(self.left, witness(self.root, "dup", self.rows + self.rows[:1]))
+        with self.assertRaises(Invalid):
+            q.routing(self.left, witness(self.root, "count", self.rows, records=5))
+        other = {**IDENTITY, "token_vectors_sha256": "u" * 64}
+        with self.assertRaises(Invalid):
+            q.routing(self.left, witness(self.root, "inputs", self.rows, identity=other))
+        bad = dict(self.rows[0], selected_copy_valid=False)
+        with self.assertRaises(Invalid):
+            q.routing(self.left, witness(self.root, "invalid", [bad, *self.rows[1:]]))
+
+    def test_namespace_is_part_of_the_join_key(self):
+        rows = self.rows + [routing_row(0, 0, 0, [1, 2, 3], namespace="UnpublishedCancelled")]
+        with self.assertRaises(Invalid):
+            q.routing(self.left, witness(self.root, "extra", rows))
+
+
 def response(tokens):
     content = [{"token": t, "logprob": dict(top)[t], "bytes": list(t.encode()),
                 "top_logprobs": [{"token": x, "logprob": lp, "bytes": list(x.encode())} for x, lp in top]}
