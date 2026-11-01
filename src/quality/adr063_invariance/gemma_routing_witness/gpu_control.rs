@@ -68,7 +68,7 @@ fn actual_scalar_and_batch_bank_copy_survives_gpu_scratch_overwrite() -> Result<
         "pre-device fixed parent budget"
     );
     ensure!(
-        env!("HF2Q_MLX_NATIVE_VERSION") == "0.15.11",
+        env!("HF2Q_MLX_NATIVE_VERSION") == WITNESS_NATIVE_VERSION,
         "published exact native gate"
     );
     // No retirement proof between cases: conservatively retain BOTH named

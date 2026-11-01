@@ -40,8 +40,8 @@ pub fn install(
         return Ok(None);
     }
     ensure!(
-        env!("HF2Q_MLX_NATIVE_VERSION") == "0.15.11",
-        "published1511 exact pin required; no path patch"
+        env!("HF2Q_MLX_NATIVE_VERSION") == WITNESS_NATIVE_VERSION,
+        "exact published routing-witness native pin required; no path patch"
     );
     ensure!(
         root.is_absolute() && root.canonicalize()? == root,

@@ -18,6 +18,17 @@ fn finite_case_budget_covers_t5_and_cancelled_extra_namespaces() {
     assert!(serde_json::from_value::<Budget>(value).is_err());
 }
 #[test]
+fn witness_native_pin_matches_the_built_native_so_exact_budgets_admit() {
+    // The build stamp is the Cargo.toml exact pin (`build_native_pin` control).
+    assert_eq!(WITNESS_NATIVE_VERSION, env!("HF2Q_MLX_NATIVE_VERSION"));
+    validate_budget(Some(&Budget {
+        payload_bytes: PAYLOAD_BYTES,
+        metadata_bytes: METADATA_BYTES,
+        cpu_ledger_bytes: CPU_LEDGER_BYTES,
+    }))
+    .unwrap();
+}
+#[test]
 fn actual_row_map_refuses_duplicate_wrong_slot_position_and_capacity() {
     let row = Row {
         lane: 2,

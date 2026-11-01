@@ -81,7 +81,7 @@ fn run()->Result<()> {
     let mut raw=Vec::new();File::open(path)?.take(1024*1024+1).read_to_end(&mut raw)?;
     ensure!(raw.len()<=1024*1024,"bounded metadata config");let c:Config=serde_json::from_slice(&raw)?;
     output_preflight(&c.output)?;
-    if c.routing_recipes {ensure!(env!("HF2Q_MLX_NATIVE_VERSION")=="0.15.11","routing recipe metadata requires exact published1511 build");}
+    if c.routing_recipes {ensure!(env!("HF2Q_MLX_NATIVE_VERSION")==super::gemma_routing_witness::WITNESS_NATIVE_VERSION,"routing recipe metadata requires the exact published routing-witness native build");}
     ensure!(exact_hex(&c.expected_exporter_source_commit,40)&&exact_hex(&c.expected_exporter_binary_sha256,64)
         &&c.model.retained_full_sha256==MODEL_SHA,"exact selected source/binary/model bindings");
     let source=option_env!("HF2Q_BUILD_GIT_SHA").context("compiled source stamp")?;

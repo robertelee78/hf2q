@@ -1,4 +1,5 @@
-//! Explicit test-only SAME-producer routing witnesses. Requires published native1511.
+//! Explicit test-only SAME-producer routing witnesses. Requires the exact
+//! published native named by [`WITNESS_NATIVE_VERSION`].
 //! No CPU softmax, extra submission/wait, inferred selector or default activation.
 use super::{acquisition::Acquisition, receipt::Identity};
 use anyhow::{ensure, Context, Result};
@@ -27,6 +28,21 @@ const ENTRY_CAP: usize = ROW_CAP * LAYERS;
 pub const PAYLOAD_BYTES: u64 = (ENTRY_CAP * 84) as u64;
 pub const METADATA_BYTES: u64 = 64 * 1024 * 1024;
 pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
+/// Exact published native this witness (and the routing-recipe prep) runs on.
+/// Re-reviewed 0.15.11 -> 0.15.15 (registry crates `7d689ee` -> `9c67e1f`,
+/// 4 commits): `src/ops/routing_selection_witness.rs` is byte-identical
+/// (sha256 6d086d61...4d16a17 in both); `src/ops/**`, `src/shaders/**`,
+/// `kernel_registry.rs`, `device.rs`, `build.rs` and `build_support/**` are
+/// unchanged. The only changes are additive: bounded GGUF header/map-plan
+/// entries (legacy `GgufFile::from_file` now calls the shared parser with the
+/// same 100k/1M/256 MiB/64M caps and alignment), buffer backing descriptors,
+/// `command_buffer_uses_unretained_references`, opt-in completed-GPU
+/// timestamps (off unless the new `install_..._with_gpu_timestamps` is used)
+/// and read-only page observation. `CommandEncoder`, `KernelRegistry`,
+/// `MlxBuffer`, `MlxDevice`, `blit_copy_bytes` and the witness dispatch keep
+/// their semantics, so the route label `native-routing1511-v1` (the witness
+/// protocol introduced in 0.15.11) is kept.
+pub const WITNESS_NATIVE_VERSION: &str = "0.15.15";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
@@ -118,8 +134,8 @@ pub fn validate_budget(b: Option<&Budget>) -> Result<()> {
             "exact routing bank+metadata+CPU ledger admission"
         );
         ensure!(
-            env!("HF2Q_MLX_NATIVE_VERSION") == "0.15.11",
-            "published1511 exact pin required BEFORE model load"
+            env!("HF2Q_MLX_NATIVE_VERSION") == WITNESS_NATIVE_VERSION,
+            "exact published routing-witness native pin required BEFORE model load"
         );
     }
     Ok(())

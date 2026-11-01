@@ -50,6 +50,9 @@ struct Packet {
     /// Prompt chunk lengths; must sum to 128. Default All128.
     #[serde(default = "all128")]
     prefill_chunks: Vec<usize>,
+    /// Warm live-resume kernel the loaded model must resolve; absent = VecHybrid.
+    #[serde(default)]
+    warm_live_kernel: super::gemma_actual::WarmLiveKernel,
 }
 fn all128() -> Vec<usize> {
     vec![128]
@@ -194,6 +197,9 @@ fn q1_gemma_actual_stage_localizer() {
         .tokens
         .iter()
         .all(|&t| (t as usize) < model.weights.vocab_size));
+    let warm_live_kernel =
+        super::gemma_actual::require_warm_kernel(packet.warm_live_kernel, model.weights.warm_live_kernel)
+            .unwrap();
     acquisition_scope
         .check_config(
             &packet.identity,
@@ -298,7 +304,7 @@ fn q1_gemma_actual_stage_localizer() {
         trace.coverage.errors
     );
     let evidence = serde_json::json!({"schema":"hf2q.adr063.q1.stage-localizer.v1","packet_sha256":hash(&raw),"rerun_id":packet.rerun_id,
-        "route":"GemmaActualHybridSlotAwareWithCheckedDiagnosticLayerSplits","prefill_chunks":packet.prefill_chunks,
+        "route":"GemmaActualHybridSlotAwareWithCheckedDiagnosticLayerSplits","prefill_chunks":packet.prefill_chunks,"warm_live_kernel":warm_live_kernel,
         "logical_lane":"slot0","declared_slots":4,
         "tokens":144,"records":trace.coverage.captured.len(),"whole_q1_qualified":false,
         "full_prefill_logits":"NotEstablishedByLastRowProductionHead","other_three_lane_execution":"NotClaimedBySingleLaneLocalizer",

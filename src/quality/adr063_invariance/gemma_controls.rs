@@ -47,6 +47,18 @@ fn ordinary_axis_refusal_is_before_model_acquisition() {
     }
 }
 #[test]
+fn q1_gemma_warm_kernel_defaults_to_shipped_vec_hybrid_and_refuses_undeclared_tiled() {
+    use crate::inference::models::gemma4::GemmaLiveKernel as K;
+    assert_eq!(crate::serve::gemma_live_attention::default_warm_live_kernel(),K::VecHybrid);
+    assert_eq!(WarmLiveKernel::default(),WarmLiveKernel::VecHybrid);
+    assert_eq!(require_warm_kernel(WarmLiveKernel::VecHybrid,K::VecHybrid).unwrap(),WarmLiveKernel::VecHybrid);
+    assert!(require_warm_kernel(WarmLiveKernel::VecHybrid,K::TiledF16).is_err());
+    assert!(require_warm_kernel(WarmLiveKernel::TiledF16,K::VecHybrid).is_err());
+    assert_eq!(require_warm_kernel(WarmLiveKernel::TiledF16,K::TiledF16).unwrap(),WarmLiveKernel::TiledF16);
+    assert_eq!(serde_json::to_value(WarmLiveKernel::VecHybrid).unwrap(),serde_json::json!("VecHybrid"));
+    assert!(serde_json::from_value::<WarmLiveKernel>(serde_json::json!("Tiled")).is_err());
+}
+#[test]
 fn complete_active_cache_plan_has_every_head_and_distinct_actual_restore64() {
     let cfg=cfg();
     let t0=gemma_cache::expected(&cfg,&[0,1,2,3],&positions(Trajectory::T0ColdSerial)).unwrap();
