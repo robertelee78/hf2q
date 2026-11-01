@@ -61,9 +61,11 @@ pub(crate) const TILED_GLOBAL_QUERY_CHUNK: usize = 4096;
 pub(crate) const WARM_TILED_MIN_ROWS: usize = GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS;
 
 pub(crate) const WARM_TILED_ATTENTION_ENV: &str = "HF2Q_GEMMA_WARM_TILED_ATTENTION";
-/// On by default. Revert rule: if the root's real-artifact gates or the
-/// paired quality campaign fail, set this to `false` before merging.
-const WARM_TILED_ATTENTION_DEFAULT: bool = true;
+/// Off by default (ADR-063 quality gate, 2026-11-01): under a four-agent
+/// cohort the tiled route moved a lane's decision logits enough to change
+/// its greedy choice at a 1.5-nat solo margin, so the vec-hybrid route
+/// serves unless `1` opts in.
+const WARM_TILED_ATTENTION_DEFAULT: bool = false;
 
 fn parse_warm_tiled_switch(raw: Option<&str>) -> std::result::Result<bool, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
@@ -991,23 +993,16 @@ mod tests {
     }
 
     #[test]
-    fn warm_switch_defaults_on_and_zero_selects_the_vec_hybrid_route() {
-        for raw in [
-            None,
-            Some(""),
-            Some("  "),
-            Some("1"),
-            Some("on"),
-            Some("TRUE"),
-        ] {
-            assert_eq!(warm_kernel_for_switch(raw), TiledF16, "{raw:?}");
+    fn warm_switch_defaults_off_and_one_selects_the_tiled_route() {
+        for raw in [None, Some(""), Some("  "), Some("0"), Some("off"), Some("False"), Some(" 0 ")] {
+            assert_eq!(warm_kernel_for_switch(raw), VecHybrid, "{raw:?}");
         }
-        for raw in ["0", "off", "False", " 0 "] {
-            assert_eq!(warm_kernel_for_switch(Some(raw)), VecHybrid, "{raw:?}");
+        for raw in ["1", "on", "TRUE"] {
+            assert_eq!(warm_kernel_for_switch(Some(raw)), TiledF16, "{raw:?}");
         }
         assert!(parse_warm_tiled_switch(Some("yes")).is_err());
-        // An invalid value keeps the default rather than silently reverting.
-        assert_eq!(warm_kernel_for_switch(Some("yes")), TiledF16);
+        // An invalid value keeps the vec-hybrid default rather than opting in.
+        assert_eq!(warm_kernel_for_switch(Some("yes")), VecHybrid);
     }
 
     #[test]
