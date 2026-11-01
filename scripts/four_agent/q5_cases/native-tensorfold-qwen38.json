@@ -1,0 +1,196 @@
+{
+  "schema": "hf2q.q5.calibration-case.v1",
+  "family": "qwen38",
+  "notes": [
+    "Native TensorFold arm, no drafter (operator decision 2026-10-31; ADR-063 D2 arm T0): TensorFold 1157ea5b (version 1.2.0) serving its own MLX 4-bit checkpoint TensorFold/Qwen3.8-27B-MLX-4bit@22d8d538 (a quantization of Qwen/Qwen3.8-27B; three shards, about 16 GB). It is NOT the hf2q GGUF and NOT the same-GGUF peer. In Q3 it runs only as the separately labeled peer arm 'TensorFold 1157ea5 (native Qwen3.8-27B MLX 4-bit, no drafter)' of a --native-comparison campaign: task makespan only, never the verdict of record. native-tensorfold-qwen38-dflash2.json is the DFlash2 arm; the two argv differ only in '--drafter {DRAFTER_DIR} --drafter-bits 4'.",
+    "Flags (zig/src/server/cli.zig:41-155; TensorFold source at /opt/TensorFold): the snapshot directory is served directly, so no hub lookup runs and /v1/benchmark/manifest attests model.revision from the snapshots/<sha> directory name (server/benchmark_manifest.zig:190-196; TF_CHECKPOINT_REVISION must agree or the revision is dropped). --context 262144 is the per-request prompt-plus-reply bound and the model's maximum (native/metal.zig:357-361); each slot is sized at context plus the verify window (native/qwen27_served.zig:332,355). --parallel 4 is a fixed lane count: if four slots do not fit beside the weights and an 8 GiB margin, startup refuses with '--parallel 4 needs X GiB ... lower --parallel or --context' (qwen27_served.zig:336-338) instead of shrinking ('auto' would shrink). --temperature 0 is greedy (server.zig:252-264). --max-tokens 8192 is the default reply limit (requests send max_completion_tokens 8192). --keep-warm 900 is the default made explicit (README.md:297). --no-update-check, HF_HUB_OFFLINE=1, TENSORFOLD_NO_UPDATE_CHECK=1 and TENSORFOLD_NO_LIVE=1 are TensorFold's own benchmark child environment (server/benchmark_server.zig:50-56): no network, no live status line. No drafter: Qwen3.8-27B 'decodes plain without one' (README.md:294; docs/recipes/qwen3.8-27b.md:3-5).",
+    "Settings kept at hf2q-equivalent semantics; the client binds the server argv (ps) to exactly these flags. Prompt cache stays on at its default auto budget (no --prompt-cache-gib; at most 16 GiB of what 70% of RAM leaves, native/cache_fit.zig:14,94-125), because hf2q reuses prefix KV across turns; slot-0 resume stays on (TF_QWEN27_SLOT_RESUME unset). The budget is parsed from the startup log ('prompt cache: X GiB ...') into native_readiness.startup.prompt_cache; at 4 x 262144 it is likely 0 GiB (no room left), which also turns warm turns off. No --learn, --recall, --idle-unload, --loop-guard, --thinking-budget/--reasoning-effort/--no-thinking (each request decides), --kv-cache fp8 or --prompt-precision int8. q5_case.child_env passes only PATH/HOME/USER/... plus this env, so no TF_* tuning variable leaks in.",
+    "Memory: weights about 15 GiB plus four 262144-token bf16 KV slots (16 attention layers x 2 x 262160 x 1024 x 2 B, about 16 GiB each), attention scratch (512 prompt rows; about 6 GiB on M5, up to about 16 GiB on M1-M4) and an 8 GiB margin: about 96-106 GiB against Metal's maxWorkingSet (qwen27_served.zig:182-191). A 128 GB Mac's default working set may refuse it unless iogpu.wired_limit_mb is raised (docs/recipes/qwen3.8-27b.md:304). Slots past the first take memory on first use; a slot that does not fit waits ('a slot needs X GiB ... the request waits', qwen27_served.zig:192-200), which the post-run audit counts. The startup reserve line (qwen27_served.zig:345) and /health memory at readiness and after the run are recorded.",
+    "Identity: TF_BIN_SHA256 (the root's build of 1157ea5b; the binary embeds only its version, build.zig:74-79) and TARGET_CONFIG_SHA256 (sha256 of the snapshot config.json, TensorFold's own config_sha256) are required inputs. The client recomputes config_sha256 and tokenizer_sha256 (benchmark_model.zig:14,160-189; chat_template.jinja included) from the local snapshot and requires the manifest to equal them; the snapshot chat_template.jinja must be the hf2q Qwen3.8 template bytes (sha256 c3cf9e34..., git blob c0c686f9). Readiness also requires /health max_batch_size 4, version 1.2.0, backend metal, /v1/models context_length 262144 with thinking on and no server effort, and the startup lines 'serving qwen3.8-27b ... (sampling: greedy; drafts: <no DFlash2>; context: 262144 ...)' and 'Qwen3.8-27B: 4 streams of 262144 tokens' without the DFlash2 suffix.",
+    "Run as a calibration (no --admission-receipt): different binary and artifact from every hf2q calibration."
+  ],
+  "workload": {
+    "id": "adr063-q5-native-tensorfold-qwen38-n4-coding-ctx262144",
+    "slots": 4,
+    "context_per_slot": 262144,
+    "client": "scripts/four_agent/qwen_n4_live_smoke.py --family qwen --engine-kind tensorfold"
+  },
+  "variables": {
+    "TF_BIN": "/opt/TensorFold/zig-out/native/bin/tensorfold-native",
+    "TF_BIN_SHA256": null,
+    "TF_COMMIT": "1157ea5b0f636469aa550aab8d8da7b22083dcd9",
+    "TF_VERSION": "1.2.0",
+    "HF_HUB_CACHE": "/Users/robert/.cache/huggingface/hub",
+    "TARGET_REVISION": "22d8d538154e0e5b6f8dcb1fcc74a60a0798104c",
+    "TARGET_DIR": "{HF_HUB_CACHE}/models--TensorFold--Qwen3.8-27B-MLX-4bit/snapshots/{TARGET_REVISION}",
+    "TARGET_CONFIG_SHA256": null,
+    "MODEL_ID": "qwen3.8-27b",
+    "PORT": "18252",
+    "CARGO": null,
+    "TOOLCHAIN": null,
+    "SANDBOX_PROOF": null,
+    "SANDBOX_PROOF_SHA256": null,
+    "CLIENT_APPROVAL_TEMPLATE": null
+  },
+  "binary": "{TF_BIN}",
+  "artifact": {
+    "path": "{TARGET_DIR}/config.json",
+    "sha256": "{TARGET_CONFIG_SHA256}"
+  },
+  "port": "{PORT}",
+  "serve": {
+    "argv": [
+      "{TF_BIN}",
+      "serve",
+      "{TARGET_DIR}",
+      "--name",
+      "{MODEL_ID}",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "{PORT}",
+      "--context",
+      "262144",
+      "--parallel",
+      "4",
+      "--temperature",
+      "0",
+      "--max-tokens",
+      "8192",
+      "--keep-warm",
+      "900",
+      "--no-update-check"
+    ],
+    "env": {
+      "HF_HUB_CACHE": "{HF_HUB_CACHE}",
+      "HF_HUB_OFFLINE": "1",
+      "TENSORFOLD_NO_UPDATE_CHECK": "1",
+      "TENSORFOLD_NO_LIVE": "1",
+      "TF_CHECKPOINT_REVISION": "{TARGET_REVISION}"
+    }
+  },
+  "readiness": {
+    "url": "http://127.0.0.1:{PORT}/health",
+    "field": "status",
+    "equals": "ok",
+    "timeout_seconds": 1800,
+    "record": [
+      "http://127.0.0.1:{PORT}/health",
+      "http://127.0.0.1:{PORT}/v1/models",
+      "http://127.0.0.1:{PORT}/v1/benchmark/manifest"
+    ],
+    "checks": [
+      {
+        "url": "http://127.0.0.1:{PORT}/health",
+        "field": "model",
+        "equals": "{MODEL_ID}"
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/health",
+        "field": "max_batch_size",
+        "equals": 4
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/health",
+        "field": "version",
+        "equals": "{TF_VERSION}"
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/v1/benchmark/manifest",
+        "field": "model.revision",
+        "equals": "{TARGET_REVISION}"
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/v1/benchmark/manifest",
+        "field": "model.config_sha256",
+        "equals": "{TARGET_CONFIG_SHA256}"
+      }
+    ]
+  },
+  "client": {
+    "argv": [
+      "{PYTHON}",
+      "-E",
+      "-s",
+      "-B",
+      "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py",
+      "--base-url",
+      "http://127.0.0.1:{PORT}/v1",
+      "--model",
+      "{MODEL_ID}",
+      "--output",
+      "{OUT}/client",
+      "--cargo",
+      "{CARGO}",
+      "--toolchain",
+      "{TOOLCHAIN}",
+      "--sandbox-exec",
+      "/usr/bin/sandbox-exec",
+      "--sandbox-proof",
+      "{SANDBOX_PROOF}",
+      "--sandbox-proof-sha256",
+      "{SANDBOX_PROOF_SHA256}",
+      "--server-pid",
+      "{SERVER_PID}",
+      "--approval",
+      "{CLIENT_APPROVAL}",
+      "--approval-sha256",
+      "{CLIENT_APPROVAL_SHA256}",
+      "--family",
+      "qwen",
+      "--engine-kind",
+      "tensorfold"
+    ],
+    "env": {},
+    "approval": {
+      "template": "{CLIENT_APPROVAL_TEMPLATE}",
+      "set": {
+        "server_pid": "{SERVER_PID}",
+        "base_url": "http://127.0.0.1:{PORT}/v1",
+        "model": "{MODEL_ID}",
+        "run_id": "{RUN_ID}",
+        "barrier_token": "{NONCE32}",
+        "python_sha256": "{PYTHON_SHA256}",
+        "sources": {
+          "sha256_of": [
+            "{REPO}/scripts/four_agent/qwen38_n1_smoke.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_tools.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_verdict.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_process.py",
+            "{REPO}/scripts/four_agent/test_qwen38_n1_verdict.py",
+            "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py",
+            "{REPO}/scripts/four_agent/test_qwen_n4_live_smoke.py",
+            "{REPO}/scripts/four_agent/coding_family.py",
+            "{REPO}/scripts/four_agent/test_coding_family.py",
+            "{REPO}/scripts/four_agent/qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/test_qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/family_peer.py",
+            "{REPO}/scripts/four_agent/test_family_peer.py",
+            "{REPO}/scripts/four_agent/f2_semantic.py",
+            "{REPO}/scripts/four_agent/native_peers.py",
+            "{REPO}/scripts/four_agent/native_peer_tensorfold.py",
+            "{REPO}/scripts/four_agent/native_peer_tensorfold_ready.py",
+            "{REPO}/scripts/four_agent/test_native_peer_tensorfold.py"
+          ]
+        },
+        "native_tensorfold": {
+          "binary": "{TF_BIN}",
+          "binary_sha256": "{TF_BIN_SHA256}",
+          "commit": "{TF_COMMIT}",
+          "version": "{TF_VERSION}",
+          "target_dir": "{TARGET_DIR}",
+          "target_revision": "{TARGET_REVISION}",
+          "target_config_sha256": "{TARGET_CONFIG_SHA256}",
+          "drafter": "none",
+          "port": "{PORT}",
+          "server_stdout": "{OUT}/server.stdout",
+          "server_stderr": "{OUT}/server.stderr"
+        }
+      }
+    },
+    "summary": "{OUT}/client/summary.json",
+    "success_status": "FourAgentProtocolCompleteAwaitingIndependentReview",
+    "timeout_seconds": 7200
+  },
+  "policy": {}
+}

@@ -115,6 +115,25 @@ Q3_ROLE = (f'{LABEL}: separately labeled different-artifact comparison, task mak
            'not the same-GGUF peer verdict (ADR-063 Q4)')
 SAME_GGUF_UNAVAILABLE = ('same-GGUF peer unavailable; the peer arm is the native ds4 different-artifact '
                          'comparison, reported separately as native_peer (ADR-063 Q4)')
+NATIVE_COMPARISON = None  # DeepSeek-V4 runs only with the same-GGUF --peer-unavailable-evidence
+# native_peers.py interface (the registry resolves kind 'ds4' to this module).
+TITLE = 'DeepSeek-V4'
+Q3_FAMILY = FAMILY
+CLIENT_MODULES = ('native_peers.py', 'native_peer_ds4.py', 'test_native_peer_ds4.py')
+PROCESSES = ('ds4', 'ds4-server', 'ds4-agent', 'ds4-bench', 'ds4-eval')  # native ds4 binaries (/opt/ds4 Makefile:78)
+BASELINES = {'ds4_native': LABEL}
+AUDIT = 'native_peer_ds4_audit'
+closing = None
+PEER_CASE_REFUSAL = ('a native ds4 --peer-case needs --peer-unavailable-evidence for the same-GGUF peer (ADR-063 Q4), '
+                     'and that evidence admits no same-GGUF peer case')
+
+
+def label(case):
+    return LABEL
+
+
+def q3_role(case):
+    return Q3_ROLE
 
 
 def _family(family):
@@ -274,6 +293,16 @@ def campaign_identity(plan):
     variables = plan['variables']
     return {'peer_build_info': build_info(variables.get('DS4_COMMIT'), variables.get('DS4_BIN_SHA256')),
             'native_runtime': runtime_identity(variables.get('DS4_DIR'))}
+
+
+def launch_problems(name, artifact, hf2q_sha256):
+    """Q3 launch refusals: an ambient hf2q MODEL/MODEL_SHA256 must never stand in for the native artifact."""
+    problems = []
+    if artifact and Path(artifact['path']).name != MODEL_FILE:
+        problems.append(f'{name}: native artifact must be {MODEL_FILE} (set --peer-var MODEL)')
+    if artifact.get('sha256') and artifact['sha256'] == hf2q_sha256:
+        problems.append(f"{name}: native artifact sha256 equals the hf2q artifact's (set --peer-var MODEL_SHA256)")
+    return problems
 
 
 def native_spec(spec):

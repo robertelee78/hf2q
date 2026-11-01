@@ -20,6 +20,9 @@ def quiet_inventory(raw, service, binary):
     """One exact identity exception, not a generic PID/name allowlist."""
     service_identity(service, binary)
     require(type(raw) is bytes and len(raw) <= 4 * 1024 * 1024, "quiet inventory envelope")
+    from native_peers import process_names
+    competing = {"hf2q", "llama-server", "llama-cli", "test-binary", "helper-binary", "cargo", "rustc", "clang", "clang++",
+                 "opencode"} | process_names()
     allowed = None
     for line in raw.decode("utf8", "strict").splitlines():
         fields = line.strip().split(None, 8)
@@ -32,8 +35,7 @@ def quiet_inventory(raw, service, binary):
                     "preexisting service PID/start/argv/binary drift")
             allowed = {"pid": pid, "ppid": ppid, "start": start, "ucomm": fields[7], "args": args}
             continue
-        require(name not in {"hf2q", "llama-server", "llama-cli", "ds4", "ds4-server", "ds4-agent", "ds4-bench", "ds4-eval",
-                             "test-binary", "helper-binary", "cargo", "rustc", "clang", "clang++", "opencode"}
+        require(name not in competing
                 and not name.startswith(("hf2q-", "mlx_native-", "noalloc-size", "live-wired", "owned-overlap")),
                 "known competing model/test/compiler/client worker")
     require(service is None or allowed is not None, "bound preexisting service disappeared; re-review identity")

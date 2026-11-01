@@ -16,13 +16,15 @@ import sys
 from pathlib import Path
 
 from f2_scoreboard import SCHEMA as SCOREBOARD_SCHEMA
+import native_peers
 
 ROWS_SCHEMA = "hf2q.f2.scoreboard-rows.v1"
 REPO = Path(__file__).resolve().parents[2]
 ARMS = {"hf2q_current": "hf2q current", "candidate": "candidate",
         "v0127_stock": "v0.1.27 stock", "peer": "peer"}
-# Effect baselines: every arm, plus the separately labeled native ds4 arm (never a measured column).
-BASELINE_ARMS = {**ARMS, "ds4_native": "ds4 c97964b (native Flash-0731 q2 artifact)"}
+# Effect baselines: every arm, plus each separately labeled native-engine arm (never a measured column).
+NATIVE_BASELINES = native_peers.baselines()
+BASELINE_ARMS = {**ARMS, **NATIVE_BASELINES}
 STATUSES = {"Qualified": "Q", "Descriptive": "D", "NegativeResult": "NEG", "Failure": "FAIL"}
 # key: (title, unit, direction, gap key); direction None = not a ratio metric.
 METRICS = {
@@ -292,7 +294,7 @@ def comparisons(manifest):
 
 
 def effect_is_win(row):  # a native-engine (different artifact) comparison is never a win
-    return (row["kind"] == "effect" and row["verification"]["state"] == "Verified" and row.get("baseline_arm") != "ds4_native"
+    return (row["kind"] == "effect" and row["verification"]["state"] == "Verified" and row.get("baseline_arm") not in NATIVE_BASELINES
             and row["status"] in ("Qualified", "Descriptive") and row.get("ci95") is not None and row["ci95"][0] > 0)
 
 
@@ -342,8 +344,8 @@ def short(sha):
 def render(manifest, scoreboards, manifest_sha256):
     fams, groups, rows = manifest["families"], manifest["groups"], manifest["rows"]
     controls = [x for x in rows if "control_of" in x]  # Q3 controls of a primary of record: own section, never a win/non-win
-    native = [x for x in rows if x.get("baseline_arm") == "ds4_native" and "control_of" not in x]  # own section only, never a win/non-win
-    rows = [x for x in rows if x.get("baseline_arm") != "ds4_native" and "control_of" not in x]
+    native = [x for x in rows if x.get("baseline_arm") in NATIVE_BASELINES and "control_of" not in x]  # own section only, never a win/non-win
+    rows = [x for x in rows if x.get("baseline_arm") not in NATIVE_BASELINES and "control_of" not in x]
     band = manifest["neutral_band_ratio"]
     comps = comparisons(manifest)
     out = ["# ADR-063 F2 four-agent scoreboard", "",
