@@ -53,8 +53,9 @@ from qwen38_n1_verdict import integer, require
 
 ENGINE = 'tensorfold'
 FAMILY = 'qwen'
+FAMILIES = (FAMILY,)
 TITLE = 'Qwen3.8'
-Q3_FAMILY = 'qwen38'
+Q3_FAMILIES = ('qwen38',)
 SLOTS = 4
 CONTEXT_PER_SLOT = 262144
 MAX_TOKENS = 8192

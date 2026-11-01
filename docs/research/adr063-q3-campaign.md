@@ -27,6 +27,11 @@ The checked-in peer cases match hf2q's model-facing settings (template, thinking
 - The stock arm stays in the design. Dropping it would need new plan and verdict code, so an experiment-plus-TensorFold-only campaign is not offered.
 - Adapter and controls: `scripts/four_agent/README.md`, section "Native TensorFold arm".
 
+**Native oMLX arm (Qwen3.8, Qwen3.6, Gemma 4; operator decision 2026-10-31).** Every one of these families has a runnable same-GGUF peer, so oMLX runs only in a separate `--native-comparison` campaign, with TensorFold's rules: `--peer-case q5_cases/native-omlx-<family>.json --native-comparison`. oMLX 6b413c90 then runs in the `peer` slot on the pinned mlx-community 4-bit snapshot.
+- The artifact is the snapshot's `config.json`; `MODEL_CONFIG_SHA256` and `TEMPLATE_SHA256` are required. Build identity is `omlx <version> <commit> venv-freeze-sha256 <sha>`, from the venv's dist-info inventory. The snapshot file listing and the venv inventory are frozen with the campaign identity.
+- `verdict.json` and F2 rows carry the not-of-record label. `native_peer` is withheld under the TensorFold rules, and also when any oMLX run logged tool-parser warnings. F2 groups are `<family>-q3-omlx-<family>-native`, and the oMLX row renders only under "Native-engine comparisons".
+- Adapter and controls: `scripts/four_agent/README.md`, section "Native oMLX arm".
+
 `HF2Q_Q5_HF2Q_BIN` and `--stock-var/--experiment-var HF2Q_BIN=…` are refused. The hf2q binaries come only from `--stock-bin` and `--experiment-bin`, so a case default can never stand in for one of them.
 
 ## Frozen identities
@@ -233,6 +238,45 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/qwen38-matched-baseline1512-normal-n4-202610
   --peer-var TARGET_CONFIG_SHA256=$(shasum -a 256 "$TFHUB/config.json" | cut -d' ' -f1) \
   --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-tensorfold-qwen38-client-approval.json \
   --output "$Q3/qwen38-native-tensorfold"
+
+# Native oMLX comparisons (separately labeled; never the verdict of record). Install per scripts/four_agent/README.md
+# "Native oMLX arm" first (isolated clone $HOME/.local/share/hf2q/peers/omlx-6b413c9 and the pinned HF snapshots).
+OHUB=$HOME/.cache/huggingface/hub
+omlx_vars() {  # $1 = snapshot dir
+  echo --peer-var MODEL_CONFIG_SHA256=$(shasum -a 256 "$1/config.json" | cut -d' ' -f1) \
+       --peer-var TEMPLATE_SHA256=$(shasum -a 256 "$1/chat_template.jinja" | cut -d' ' -f1)
+}
+Q38=$OHUB/models--mlx-community--Qwen3.8-27B-4bit/snapshots/10c35caafbb80f7dc6a7a432cdd11af10a6d4818
+HF2Q_Q5_MODEL=$MODELS/qwen38-stock/Qwen3.8-27B-vanilla.gguf \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/qwen38-matched-baseline1512-normal-n4-20261029T024609Z/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family qwen38 "${STOCK[@]}" "${EXP[@]}" "${COMMON[@]}" \
+  --peer-case scripts/four_agent/q5_cases/native-omlx-qwen38.json --native-comparison $(omlx_vars "$Q38") \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-omlx-qwen38-client-approval.json \
+  --output "$Q3/qwen38-native-omlx"
+Q36=$OHUB/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46
+HF2Q_Q5_MODEL=$MODELS/qwen36-stock-adr063/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/qwen36-template-order-coding-operating90-n4-20261027T231028Z/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family qwen36 "${STOCK[@]}" "${EXP[@]}" "${COMMON[@]}" \
+  --peer-case scripts/four_agent/q5_cases/native-omlx-qwen36.json --native-comparison $(omlx_vars "$Q36") \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-omlx-qwen36-client-approval.json \
+  --output "$Q3/qwen36-native-omlx"
+G4=$OHUB/models--mlx-community--gemma-4-26b-a4b-it-4bit/snapshots/0d77464eeb233a2da68ebf9d7dc4edaac7db956d
+HF2Q_Q5_MODEL=$MODELS/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/gemma4-full-input-n4-20261026T210724Z/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family gemma4 "${STOCK[@]}" "${EXP[@]}" "${COMMON[@]}" \
+  --peer-case scripts/four_agent/q5_cases/native-omlx-gemma4.json --native-comparison $(omlx_vars "$G4") \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-omlx-gemma4-client-approval.json \
+  --output "$Q3/gemma4-native-omlx"
+# Qwen3.6 re-test on oMLX's tokenizer/sampler stack (quality campaign; oMLX is the labeled reference arm, never the
+# subject). CLIENT_APPROVAL_TEMPLATE is declared by both cases, so each arm gets its own with --subject-var/--reference-var.
+HF2Q_Q5_MODEL=$MODELS/qwen36-stock-adr063/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf \
+  python3 -B scripts/four_agent/quality_campaign.py --subject-case scripts/four_agent/q5_cases/qwen36.json \
+  --subject-var HF2Q_BIN=$E/q3-experiment-bin-$EXP_COMMIT/hf2q \
+  --subject-var CLIENT_APPROVAL_TEMPLATE=$E/qwen36-template-order-coding-operating90-n4-20261027T231028Z/client-approval.json \
+  --reference-kind omlx-native --reference-case scripts/four_agent/q5_cases/native-omlx-qwen36.json \
+  --reference-var CLIENT_APPROVAL_TEMPLATE=$T/native-omlx-qwen36-client-approval.json \
+  $(omlx_vars "$Q36" | sed s/--peer-var/--reference-var/g) \
+  --negative-control-receipt "$NC" --output "$Q3/quality-qwen36-omlx-reference"
 
 # Qwen3.6 35B-A3B
 HF2Q_Q5_MODEL=$MODELS/qwen36-stock-adr063/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf \

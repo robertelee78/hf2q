@@ -17,9 +17,9 @@ KINDS = NATIVE_KINDS
 # The declared interface of an arm module. Hooks marked "or None" may be None.
 INTERFACE = {
     'ENGINE': 'the engine kind (equals the registry key)',
-    'FAMILY': 'harness family (coding_family.FAMILIES) of the client run',
+    'FAMILIES': 'harness families (coding_family.FAMILIES) its client runs use',
     'TITLE': 'family title used in selection refusals',
-    'Q3_FAMILY': 'q5/Q3 case family',
+    'Q3_FAMILIES': 'q5/Q3 case families',
     'SLOTS': 'four-slot coding workload only',
     'CLIENT_MODULES': 'client source-freeze additions (registry, arm client modules, arm test)',
     'PROCESSES': 'executable names for the competing-runtime inventories',

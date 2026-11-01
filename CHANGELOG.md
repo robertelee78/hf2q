@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ADR-063 native oMLX arm for Qwen3.8 27B, Qwen3.6 35B-A3B and Gemma 4 26B-A4B (`scripts/four_agent/native_peer_omlx.py`, `native_peer_omlx_ready.py`, `native_peer_omlx_launch.py`, `native_peer_omlx_audit.py`; cases `q5_cases/native-omlx-{qwen38,qwen36,gemma4}.json`). It runs oMLX 6b413c90 (0.7.3rc1) on pinned mlx-community 4-bit snapshots as a separately labeled different-artifact arm. oMLX silently drops unknown request fields, so the client enforces a closed request and reply envelope. It sends hf2q's controls explicitly: greedy sampling, repetition penalty 1.05 over 64 tokens, Qwen thinking with the 2048/512 budgets, and Gemma thinking off. A launcher writes the run's own `model_settings.json`/`settings.json` (hot-only prefix cache, no SSD tier), links the snapshot as the only model and records the launch. Identity is bound through:
+  - the clean detached checkout and the venv's mlx/mlx-lm/mlx-vlm pins;
+  - the snapshot revision and its config/template digests;
+  - the launch record, `/api/status` (custom kernels), `/v1/models/status` and the saved settings;
+  - a per-turn `/v1/tokenize` rendered-prompt proof, with session counters equal to the client receipts at closing;
+  - a post-run audit matching the server's completion lines to the client turns.
+
+  Q3 runs it only in a `--native-comparison` campaign; `quality_campaign.py` accepts it as `--reference-kind omlx-native`. The native-arm registry now declares family scope as tuples (`FAMILIES`, `Q3_FAMILIES`). This tooling establishes no speed result.
 - ADR-063 native TensorFold arm for Qwen3.8 27B (`scripts/four_agent/native_peer_tensorfold.py`, `native_peer_tensorfold_ready.py`, `native_peer_tensorfold_audit.py`; cases `q5_cases/native-tensorfold-qwen38.json` and `native-tensorfold-qwen38-dflash2.json`). It runs TensorFold 1157ea5b on its own MLX 4-bit checkpoint, without a drafter or with DFlash2, as a separately labeled different-artifact arm and as the D2 T0/T2 arms. The client sends hf2q's Qwen3.8 controls explicitly (greedy, thinking at effort xhigh, the 2048/512 thinking ceilings) and enforces a closed request/reply envelope, because TensorFold ignores unknown fields. Identity is bound through:
   - the binary sha256, the pinned commit and version, and the exact server argv;
   - the HF snapshot revisions, with TensorFold's `config_sha256`/`tokenizer_sha256` recomputed locally;
