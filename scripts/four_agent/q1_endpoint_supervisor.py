@@ -3,12 +3,18 @@
 Parametrized copy of the reviewed Gemma five-axis endpoint supervisor
 (`adr063-q1-gemma-endpoints-supervisor-disabled-v1.py`, plus the witness-on
 row validation of `q1-gemma-routing1511-t0-on-actual-v1/supervisor.py`).
-Three changes, nothing else:
+Changes:
   1. every constant comes from one sha-pinned bindings.json (BINDINGS and
-     BINDINGS_SHA256 below are set in the per-family instance copy);
+     BINDINGS_SHA256 below are set in the per-family instance copy); its bytes
+     are read once, and the hashed bytes are the ones parsed and copied;
   2. filter, packet env var, completion marker and its stream are per family;
   3. expected logit/cache record counts are derived from the packet, not the
-     literal Gemma 5616/576.
+     literal Gemma 5616/576;
+  4. `first_case` must be the family's T0 (`T0ColdSerial`) endpoint case;
+  5. a `"kind": "localizer"` case runs one single-lane stage localizer packet
+     (no trajectory, no 4x144 logits) with its own filter/env/marker;
+  6. SIGHUP and SIGQUIT are handled like SIGTERM/SIGINT, so a terminal hangup
+     still drains the child's process group.
 The foreign-process denylist and the listener ports are read from the reviewed
 Gemma supervisor source (sha-pinned) so the reviewed list is reused verbatim.
 No physical-admission, performance, float-policy or whole-Q1 qualification.
@@ -27,6 +33,13 @@ RESTORE64_FIELD = {'gemma': 'active64_exact_copy', 'qwen38': None,
                    'qwen36': 'qwen36_restore64_exact', 'deepseek': 'full_active64_exact_restore'}
 PLANNED_FIELD = {'gemma': 'planned_tensor_payload', 'qwen38': 'planned_tensor_payload_bytes',
                  'qwen36': 'planned_tensor_payload_bytes', 'deepseek': 'planned_capture_bytes'}
+FIRST_TRAJECTORY = 'T0ColdSerial'  # every family's T0
+HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT)
+LOCALIZER_SCHEMA = 'hf2q.adr063.q1.stage-localizer.v1'
+LOCALIZER_CASE_KEYS = {'kind', 'out', 'packet', 'operating_review', 'filter', 'packet_env', 'completion_marker', 'marker_stream'}
+# Rust-side localizer token lengths: Gemma 128 prompt + 16 forced; DS/Qwen 64 or 128.
+LOCALIZER_TOKENS = {'gemma': (144,), 'qwen38': (64, 128), 'qwen36': (64, 128), 'deepseek': (64, 128)}
+GEMMA_DEFAULT_WARM_KERNEL = 'VecHybrid'  # shipped since #544; packets must declare any other
 INTERRUPTED = 0
 
 
@@ -42,7 +55,22 @@ def bind(p): return dict(path=str(p), sha256=sha(p))
 def bound(b, why):
     require(type(b) is dict and set(b) == {'path', 'sha256'} and Path(b['path']).is_absolute() and sha(b['path']) == b['sha256'], why)
     return Path(b['path'])
-def load(b, why): return json.loads(bound(b, why).read_text())
+def checked_bytes(path, pinned, why):
+    """Read once; the hashed bytes are the bytes the caller parses."""
+    data = Path(path).read_bytes(); require(hashlib.sha256(data).hexdigest() == pinned, why); return data
+def load(b, why):
+    require(type(b) is dict and set(b) == {'path', 'sha256'} and Path(b['path']).is_absolute(), why)
+    return json.loads(checked_bytes(b['path'], b['sha256'], why))
+def case_plan(b, name):
+    """Closed launch plan: an endpoint trajectory or a single-lane localizer."""
+    first = b['cases'].get(b['first_case'])
+    require(type(first) is dict and first.get('kind', 'endpoint') == 'endpoint' and first.get('trajectory') == FIRST_TRAJECTORY, 'first_case is the family T0 (T0ColdSerial) endpoint case')
+    require(name in b['cases'], 'declared case'); c = b['cases'][name]; kind = c.get('kind', 'endpoint')
+    if kind == 'endpoint':
+        require(type(c.get('trajectory')) is str, 'endpoint trajectory')
+        return dict(kind=kind, mode=c['trajectory'], filter=c.get('filter', b['filter']), packet_env=b['packet_env'], completion_marker=b['completion_marker'], marker_stream=b['marker_stream'])
+    require(kind == 'localizer' and set(c) == LOCALIZER_CASE_KEYS and c['marker_stream'] in ('stdout', 'stderr') and all(type(c[k]) is str and c[k] for k in ('filter', 'packet_env', 'completion_marker')), 'closed localizer case: own filter/env/marker, no trajectory')
+    return dict(kind=kind, mode='localizer', filter=c['filter'], packet_env=c['packet_env'], completion_marker=c['completion_marker'], marker_stream=c['marker_stream'])
 def interrupt(sig, frame):
     global INTERRUPTED
     INTERRUPTED = sig
@@ -104,13 +132,42 @@ def disk_bytes(root): return sum(p.stat().st_size for p in root.rglob('*') if p.
 def coordinate(x): return tuple(x['at'][k] for k in ('logical_step', 'layer', 'stage', 'agent', 'logical_row_start', 'segment'))
 
 
-def validate_endpoint(out, b, case, packet, identity, policy):
-    """Packet-derived completeness; the family helper owns the numeric checks."""
-    family = b['family']; execution = json.loads((out / 'output/execution.json').read_text()); trace = json.loads((out / 'output/trace.json').read_text())
+def checked_trace(out, identity):
+    """execution.json + complete, unique trace.json for the composed identity."""
+    execution = json.loads((out / 'output/execution.json').read_text()); trace = json.loads((out / 'output/trace.json').read_text())
     require(execution['whole_q1_qualified'] is False and not trace['coverage']['errors'] and trace['identity'] == identity, 'complete trace for the composed identity')
     require(trace['acquisition']['observed_model_opens'] >= trace['acquisition']['required_model_opens'] >= 1, 'actual descriptor opens')
     captured, expected = trace['coverage']['captured'], trace['coverage']['expected']
     require(len(captured) == len(expected) and len({coordinate(x) for x in captured}) == len(captured), 'complete unique capture coordinates')
+    return execution, captured, expected
+
+
+def require_gemma_warm_kernel(family, execution, packet):
+    if family == 'gemma':
+        require(execution['warm_live_kernel'] == packet.get('warm_live_kernel', GEMMA_DEFAULT_WARM_KERNEL), 'resolved Gemma warm kernel = packet declaration (absent = shipped VecHybrid)')
+
+
+def validate_localizer(out, b, plan, packet, identity, policy):
+    """One real workload lane; the packet's `expected` is the whole extent."""
+    family = b['family']; execution, captured, expected = checked_trace(out, identity)
+    require(execution['schema'] == LOCALIZER_SCHEMA and execution['packet_sha256'] == sha(out / 'packet.json') and execution['rerun_id'] == packet['rerun_id'] and execution['records'] == len(captured), 'localizer receipt for this exact packet')
+    require(len(expected) == len(packet['expected']) and {coordinate(x) for x in expected} == {coordinate(x) for x in packet['expected']}, 'packet manifest is the complete localizer extent')
+    agent, tokens, lanes = packet['agent'], packet['tokens'], packet['workload']['lanes']
+    require(type(agent) is int and len(lanes) == 4 and 0 <= agent < 4 and len(tokens) in LOCALIZER_TOKENS[family] and tokens == lanes[agent][:len(tokens)], 'one real workload lane prefix')
+    require(all(x['at']['agent'] == 'agent-' + str(agent) for x in captured), 'every record on the localized lane')
+    total = sum(x['logical_bytes'] for x in captured)
+    require(total <= packet['host_payload_limit'] and total <= policy['phase_payload_upper_bytes'], 'captured bytes <= packet and policy bounds')
+    line = plan['completion_marker'] + ' records=' + str(len(captured)) + ' whole_q1_qualified=false'
+    require(line in (out / plan['marker_stream']).read_text().splitlines(), 'exact localizer completion line')
+    require_gemma_warm_kernel(family, execution, packet)
+    if family == 'gemma': require(execution['prefill_chunks'] == packet.get('prefill_chunks', [128]), 'executed Gemma prefill route = packet')
+    return dict(execution=execution, captured_records=len(captured), captured_bytes=total, whole_q1_qualified=False)
+
+
+def validate_endpoint(out, b, case, packet, identity, policy):
+    """Packet-derived completeness; the family helper owns the numeric checks."""
+    family = b['family']; execution, captured, expected = checked_trace(out, identity)
+    require_gemma_warm_kernel(family, execution, packet)
     lanes = packet['workload']['lanes']; rows = len(lanes[0]); require(len(lanes) == 4 and all(len(l) == rows == 144 for l in lanes), 'four144 packet workload')
     logits = [x for x in captured if x['at']['stage'] == 'Logits']
     require({(x['at']['agent'], x['at']['logical_row_start']) for x in logits} == {('agent-' + str(l), p) for l in range(4) for p in range(rows)} and len(logits) == 4 * rows, 'every lane x row logit record')
@@ -145,11 +202,11 @@ def validate_endpoint(out, b, case, packet, identity, policy):
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--case', required=True); args = ap.parse_args()
-    require(sys.flags.isolated and __debug__ and BINDINGS is not None and BINDINGS_SHA256 is not None and sha(BINDINGS) == BINDINGS_SHA256, 'PENDING sha-pinned bindings in the instance copy')
-    b = json.loads(Path(BINDINGS).read_text())
-    require(b['schema'] == SCHEMA and b['final_approval'] is True and b['family'] in RESTORE64_FIELD and args.case in b['cases'] and b['first_case'] in b['cases'], 'closed approved family bindings')
+    require(sys.flags.isolated and __debug__ and BINDINGS is not None and BINDINGS_SHA256 is not None, 'PENDING sha-pinned bindings in the instance copy')
+    bindings_bytes = checked_bytes(BINDINGS, BINDINGS_SHA256, 'sha-pinned bindings'); b = json.loads(bindings_bytes)
+    require(b['schema'] == SCHEMA and b['final_approval'] is True and b['family'] in RESTORE64_FIELD and args.case in b['cases'], 'closed approved family bindings')
     require(not any(k.startswith(AMBIENT) for k in os.environ), 'ambient runtime override')
-    case = b['cases'][args.case]; mode = case['trajectory']; out = Path(case['out']); require(out.is_absolute() and not out.exists(), 'one fresh case only')
+    plan = case_plan(b, args.case); case = b['cases'][args.case]; mode = plan['mode']; out = Path(case['out']); require(out.is_absolute() and not out.exists(), 'one fresh case only')
     outputs = [Path(c['out']) for c in b['cases'].values()]
     composition = load(b['composition'], 'composition binding'); review = load(b['acquisition_review'], 'acquisition review binding')
     require(review == dict(schema='hf2q.q1.acquisition-review.v1', verdict='Accepted', composition_sha256=b['composition']['sha256']), 'closed accepted composition')
@@ -168,14 +225,14 @@ def main():
     stat_model()
     if args.case != b['first_case']:
         first = Path(b['cases'][b['first_case']]['out']); require(json.loads((first / 'receipt.json').read_text())['case_complete'] is True, b['first_case'] + ' must complete before another axis')
-    require(packet['execution_approved'] is False and packet['trajectory'] == mode, 'exact disabled family axis packet')
+    require(packet['execution_approved'] is False and (packet.get('trajectory') == mode if plan['kind'] == 'endpoint' else 'trajectory' not in packet), 'exact disabled family axis/localizer packet')
     for k, v in list(packet['identity'].items()):
         if v is None: require(k in NULLABLE_IDENTITY, 'only native_checksum may be filled'); packet['identity'][k] = identity[k]
     require(packet['identity'] == identity, 'packet identity = composition comparison key')
     acquisition = dict(composition=b['composition'], independent_review=b['acquisition_review'])
     require(packet.get('acquisition') in (None, acquisition) or packet['acquisition']['composition'] == b['composition'], 'packet composition binding')
     packet.update(execution_approved=True, acquisition=acquisition, output=str(out / 'output'))
-    os.umask(0o077); out.mkdir(mode=0o700); shutil.copy2(__file__, out / 'supervisor.py'); shutil.copy2(BINDINGS, out / 'bindings.json'); subprocess.run(['/bin/cp', '-c', str(binary), str(out / 'test-binary')], check=True, timeout=30); shutil.copy2(parser_source, out / 'meminfo_interface.py'); save(out / 'resource-policy.json', policy); save(out / 'acquisition-composition.json', composition); save(out / 'acquisition-review.json', review)
+    os.umask(0o077); out.mkdir(mode=0o700); shutil.copy2(__file__, out / 'supervisor.py'); (out / 'bindings.json').write_bytes(bindings_bytes); subprocess.run(['/bin/cp', '-c', str(binary), str(out / 'test-binary')], check=True, timeout=30); shutil.copy2(parser_source, out / 'meminfo_interface.py'); save(out / 'resource-policy.json', policy); save(out / 'acquisition-composition.json', composition); save(out / 'acquisition-review.json', review)
     save(out / 'packet.json', packet)
     tree = ast.parse(sampler_source.read_text()); nodes = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in ('sample', 'proc_fields', 'ledger_ready')]; require(len(nodes) == 3, 'three exact reviewed observation functions')
     assignments = {n.targets[0].id: n.value for n in tree.body if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)}; POLICY = ast.literal_eval(assignments['POLICY']); POLICY.update(preload_free_floor_bytes=policy['preload_available_floor_bytes'], runtime_free_floor_bytes=policy['runtime_available_floor_bytes'], reserve_free_bytes=policy['reserve_bytes'], overshoot_margin_bytes=policy['reaction_overshoot_bytes'], process_rss_abort_bytes=policy['process_rss_limit_bytes'], process_footprint_abort_bytes=policy['process_footprint_limit_bytes'])
@@ -187,8 +244,8 @@ def main():
     require(globals_used <= set(namespace) | set(dir(builtins)), 'missing observer globals:' + repr(globals_used - set(namespace) - set(dir(builtins))))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(sampler_source), 'exec'), namespace); sample = namespace['sample']
     deadline = policy['deadline_seconds']
-    result = dict(family=b['family'], case=args.case, case_complete=False, mode=mode, model_launch_attempted=False, physical_admission=False, performance_qualified=False, whole_q1_qualified=False); child = None
-    for sig in (signal.SIGTERM, signal.SIGINT): signal.signal(sig, interrupt)
+    result = dict(family=b['family'], case=args.case, kind=plan['kind'], case_complete=False, mode=mode, model_launch_attempted=False, physical_admission=False, performance_qualified=False, whole_q1_qualified=False); child = None
+    for sig in HANDLED_SIGNALS: signal.signal(sig, interrupt)
     def available(x, owned): return x['physical']['free'] + x['physical']['cached_files'] - sum(disk_bytes(o) for o in owned)
     try:
         quiet(out, 'pre', deny); chip = raw(out, 'host-chip', ['sysctl', '-n', 'machdep.cpu.brand_string']); require(chip['exit'] == 0 and chip['stdout'].strip() == host['chip'] and not chip['stderr'], 'mandatory host chip'); epoch = time.monotonic_ns(); baseline = []
@@ -196,9 +253,9 @@ def main():
             target = epoch + i * 500000000; time.sleep(max(0, (target - time.monotonic_ns()) / 1e9)); x = sample('baseline', i, target); baseline.append(x)
             require(x['pressure_raw'] == '1' and available(x, [o for o in outputs if o != out]) >= policy['preload_available_floor_bytes'], 'preload operating headroom/pressure (nothing else resident)')
         require(not INTERRUPTED, 'interrupted before load'); stat_model(); require(sha(binary) == b['binary_sha256'], 'prelaunch binary')
-        selected_filter = case.get('filter', b['filter'])
-        command = [str(out / 'test-binary'), selected_filter, '--exact', '--ignored', '--nocapture', '--test-threads=1']; save(out / 'command.json', dict(argv=command, binary_sha256=b['binary_sha256'], source_commit=b['source_commit'], packet_sha256=sha(out / 'packet.json'), packet_env=b['packet_env'], deadline_seconds=deadline, mode=mode))
-        env = {k: v for k, v in os.environ.items() if not k.startswith(AMBIENT)}; env[b['packet_env']] = str(out / 'packet.json')
+        selected_filter = plan['filter']
+        command = [str(out / 'test-binary'), selected_filter, '--exact', '--ignored', '--nocapture', '--test-threads=1']; save(out / 'command.json', dict(argv=command, binary_sha256=b['binary_sha256'], source_commit=b['source_commit'], packet_sha256=sha(out / 'packet.json'), packet_env=plan['packet_env'], deadline_seconds=deadline, mode=mode, kind=plan['kind']))
+        env = {k: v for k, v in os.environ.items() if not k.startswith(AMBIENT)}; env[plan['packet_env']] = str(out / 'packet.json')
         with (out / 'stdout').open('xb') as so, (out / 'stderr').open('xb') as se:
             quiet(out, 'immediate-prelaunch', deny); require(not INTERRUPTED, 'interrupted immediately before Popen'); spawn_ns = time.monotonic_ns(); started = time.monotonic(); child = subprocess.Popen(command, cwd=out, env=env, stdout=so, stderr=se, stdin=subprocess.DEVNULL, start_new_session=True); result.update(model_launch_attempted=True, pid=child.pid); i = 0; next_sample = time.monotonic_ns(); proc_identity = None; last_live_ledger = None; previous_sample_ns = None
             while child.poll() is None:
@@ -218,9 +275,9 @@ def main():
                     require(sum(disk_bytes(o) for o in outputs) <= policy['paired_disk_working_limit_bytes'], 'owned disk quota; no cold-cache refund'); i += 1; next_sample = time.monotonic_ns() + 500000000
                 time.sleep(.02)
         result.update(exit=child.returncode, elapsed_seconds=time.monotonic() - started, runtime_samples=i); require(proc_identity is not None, 'no validated live owned process ledger'); require(sum(disk_bytes(o) for o in outputs) <= policy['paired_disk_working_limit_bytes'], 'final owned disk quota'); require(child.returncode == 0 and result['elapsed_seconds'] <= deadline, 'actual helper failed/deadline')
-        stdout = (out / 'stdout').read_text(); marked = (out / b['marker_stream']).read_text()
-        require('test result: ok. 1 passed; 0 failed; 0 ignored;' in stdout and b['completion_marker'] in marked, 'exact helper pass and family completion marker')
-        result['helper_evidence'] = validate_endpoint(out, b, args.case, packet, identity, policy)
+        stdout = (out / 'stdout').read_text(); marked = (out / plan['marker_stream']).read_text()
+        require('test result: ok. 1 passed; 0 failed; 0 ignored;' in stdout and plan['completion_marker'] in marked, 'exact helper pass and family completion marker')
+        result['helper_evidence'] = validate_endpoint(out, b, args.case, packet, identity, policy) if plan['kind'] == 'endpoint' else validate_localizer(out, b, plan, packet, identity, policy)
         stat_model(); require(sha(out / 'test-binary') == b['binary_sha256'] and sha(BINDINGS) == BINDINGS_SHA256, 'terminal source/bindings identity')
         for key in ('composition', 'acquisition_review', 'resource_policy', 'build_receipt'): bound(b[key], 'terminal ' + key)
     except BaseException as e: result['failure'] = repr(e)
