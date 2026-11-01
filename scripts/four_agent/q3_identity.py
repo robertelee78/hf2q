@@ -86,6 +86,25 @@ def same_model(ids, native=()):
     return len(keys) == 1
 
 
+def controls_identity(plan, ids):
+    """What a controls-only campaign must share with its primary of record (#369 amendment): family,
+    measured arms, binaries, declared commits, model artifact, peer build and case. Harness sources may differ."""
+    arms = {}
+    for name, spec in plan["arms"].items():
+        identity = ids["arms"][name]
+        artifact = identity["artifact"] or {}
+        arms[name] = {"engine_kind": spec["engine_kind"], "binary_sha256": identity["binary"]["sha256"],
+                      "model": {"sha256": artifact.get("sha256"), "bytes": artifact.get("bytes")}}
+        if name in ("stock", "experiment"):
+            arms[name]["commit"] = plan["declared"][name]["commit"]
+        else:
+            arms[name].update(case_sha256=spec["case_sha256"], peer_build_info=identity["peer_build_info"],
+                              sibling_dylibs=identity["binary"].get("sibling_dylibs"),
+                              native_runtime=identity.get("native_runtime"))
+    return {"family": plan["family"], "measured_arms": plan["measured_arms"],
+            "peer_unavailable_evidence": sorted(e["sha256"] for e in plan["peer_unavailable_evidence"]), "arms": arms}
+
+
 def launch_problems(plan, ids):
     """Everything that keeps a campaign from starting; empty when launchable."""
     problems = [f"--{name}-bin is required" for name in ("stock", "experiment") if not plan["declared"][name]["binary"]]
@@ -120,6 +139,11 @@ def launch_problems(plan, ids):
         problems.append("--qe-identity (the named QE session/host executing Q3) is required")
     if "negative_control_receipt" not in plan:
         problems.append("--negative-control-receipt is required")
+    record = plan.get("controls_of")
+    if record is not None:
+        drift = diff(record["identity"], controls_identity(plan, ids))
+        if drift:
+            problems.append(f"differs from the primary of record {record['verdict']['path']}: " + ", ".join(drift))
     return problems
 
 

@@ -35,7 +35,7 @@ The driver recomputes every identity before each run. Each run's own Q5 receipt 
 
 ## Workloads and controls
 
-The server is always the frozen four-slot C262144 configuration; only the client's release plan changes. `--workloads` (default `n4,n1,3+1,2+2,1+3`) lists the stages in order, and the primary `n4` comes first.
+The server is always the frozen four-slot C262144 configuration; only the client's release plan changes. `--workloads` (default `n4,n1,3+1,2+2,1+3`) lists the stages in order, and the primary `n4` comes first, except in a controls-only campaign (below).
 
 | Key | Client | Definition |
 | --- | --- | --- |
@@ -120,6 +120,24 @@ The `n1` and mixed-phase stages are reported in `verdict.json` `controls` with t
   - controls, failures, peer status, quality inputs and patch-review status;
   - rejected trials (Invalid, Abandoned, Skipped or not-started attempts), the number of discarded warmups, and the predeclared design.
 - `q3_campaign.py --rows CAMPAIGN --evidence-root "$E"` prints a `{groups, rows}` fragment in the `hf2q.f2.scoreboard-rows.v1` vocabulary. It holds the experiment-vs-stock and experiment-vs-peer makespan effects as `% improvement`, with `$E/...` receipt references and JSON extraction keys into `verdict.json`, so `f2_scoreboard_render.py --verify` can re-read them. Merge it into `docs/research/adr063-f2-scoreboard-rows.json` only after independent review. Statuses: `Win`/`Inconclusive`/`Unavailable` → `Descriptive`, `Loss` → `NegativeResult`, `Failed` → `Failure`.
+
+## Controls-only campaign (#369 amendment)
+
+The pre-registered amendment on [#369](https://github.com/robertelee78/hf2q/issues/369#issuecomment-6551952975) keeps the v7 `n4` and `n1` results of record and does not re-run them. A new campaign runs only the mixed stages `3+1`, `2+2` and `1+3`, with the same arms, binaries and identities. A width-only `Invalid` stands as reported.
+
+- `--controls-of PRIMARY_VERDICT_JSON` enables the mode and needs exactly one `--family`. `--workloads` must then name distinct control keys (`n1`, `3+1`, `2+2`, `1+3`) and never `n4`. Without the flag, a list that does not start with `n4` is refused, and the default campaign is unchanged.
+- The referenced `verdict.json` must carry a primary verdict and bind the `campaign.json` beside it (its `campaign_sha256` and `identities_sha256`). The plan records `controls_of`: both files' paths and sha256, the family, the recorded verdict and primary effects, and the recorded frozen identities and harness source map.
+- The launch is refused when the family or any arm identity differs from the recorded campaign: the measured arms, the peer-unavailable evidence, each arm's binary sha256, the declared stock and experiment commits, the model sha256 and size, and the peer `build_info`, case sha256, sibling dylibs and native runtime. Harness sources may differ.
+- `verdict.json`: `verdict` is `ControlsOnly`, `primary` and `primary_workload` are null, and `controls` is as in a full campaign. `primary_of_record` holds the path, sha256, recorded verdict and effects, plus both harness source maps (`harness.of_record`, `harness.this_campaign`, `harness.differs`) and `q2_run_audit_sha256` for both. `--verdict` refuses when the bound file has changed. Reasons list the campaign status, experiment and peer failures, and peer unavailability.
+- Halting is unchanged. An experiment failure stops the campaign, `Invalid` (including a width-only audit failure) is terminal and stands, and `IdentityDrift` is terminal.
+- `--rows` emits only control stages that reached their stopping rule, in group `<family>-q3-controls`. Each row is `Descriptive` and carries `control_of` (the `$E/` reference of the primary of record). It is never derived from a Win or Loss. `f2_scoreboard_render.py` renders these rows only in their own "Q3 controls of a primary verdict of record" section, never among wins or non-wins.
+
+```sh
+python3 -B scripts/four_agent/q3_campaign.py --family qwen38 "${STOCK[@]}" "${EXP[@]}" "${COMMON[@]}" \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/peer-qwen38-client-approval.json \
+  --controls-of "$Q3/<v7 campaign>/qwen38/verdict.json" --workloads 3+1,2+2,1+3 \
+  --output "$Q3/<controls campaign>/qwen38"
+```
 
 ## Existing evidence (not rerun)
 
