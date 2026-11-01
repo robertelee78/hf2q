@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import q2_fake_service as fake
 import q2_run_audit as audit
@@ -304,6 +305,79 @@ class AuditControls(unittest.TestCase):
         release = summary["phase"]["releases"][1]
         release["release_monotonic_ns"] = max(release["trigger_first_decode_monotonic_ns"].values()) - 1
         self.assertRegex(self.reason(client, summary, plan="1+3"), "cohort released before its trigger")
+
+
+def streamed(turn, stamps_ms):
+    return {"turn": turn, "progress_event_monotonic_ns": [round(ms * 10 ** 6) for ms in stamps_ms]}
+
+
+def inside(count, low, high):
+    """`count` evenly spread stamps strictly between low and high (ms)."""
+    return [low + (high - low) * (k + 1) / (count + 1) for k in range(count)]
+
+
+def every(start, stop, step=15):
+    return list(range(start, stop + 1, step))
+
+
+class ProgressWidthRule(unittest.TestCase):
+    """progress_width on synthetic client stamps: the fraction route, the frames route and their boundary."""
+
+    @staticmethod
+    def peer_3p1(agent0_inside):
+        # Measured shape of a genuine 4-slot peer 3+1 run (p3p1-047-w00-peer-a0): best 4-way window
+        # [10.000 s, 11.150 s] (turns 5, 5, 5, 3), shortest member 4.21 s, overlap fraction 0.273.
+        return {"agent-0": [streamed(5, [6940, 7500, 8000, 9000, 9500] + agent0_inside)],
+                "agent-1": [streamed(5, [5000, 8000] + inside(18, 10000, 11150) + [12000, 20000])],
+                "agent-2": [streamed(5, [10000] + inside(4, 10000, 11150) + [12000, 16000])],
+                "agent-3": [streamed(3, [4000] + inside(17, 10000, 11150) + [18000])]}
+
+    def test_staggered_mixed_cohort_is_co_active_by_frames(self):
+        progress = audit.progress_width(self.peer_3p1([10200, 10600, 11000, 11150]))
+        witness = progress["witness"]
+        self.assertEqual((progress["width"], witness["route"]), (4, "frames"))
+        self.assertEqual(witness["members"], [["agent-0", 5], ["agent-1", 5], ["agent-2", 5], ["agent-3", 3]])
+        self.assertEqual(witness["window_ns"], [10000 * 10 ** 6, 11150 * 10 ** 6])
+        self.assertEqual(witness["frames_in_window"], [4, 18, 5, 17])
+        self.assertEqual(witness["overlap_fraction"], 0.2732)
+        self.assertLess(witness["overlap_fraction"], audit.MIN_OVERLAP_FRACTION)
+        self.assertEqual(progress["min_frames_in_window"], audit.MIN_FRAMES_IN_WINDOW)
+
+    def test_member_with_two_frames_in_a_short_window_is_not_co_active(self):
+        # Same staggered window, fraction 0.273 < 0.5: three frames of every member qualify, two do not.
+        for agent0_inside, width in (([10600, 11000, 11150], 4), ([11000, 11150], 3)):
+            with self.subTest(frames=len(agent0_inside)):
+                progress = audit.progress_width(self.peer_3p1(agent0_inside))
+                self.assertEqual(progress["width"], width)
+                self.assertEqual(progress["witness"]["route"], "frames" if width == 4 else "fraction")
+
+    def test_three_slot_capped_shape_stays_three_wide(self):
+        # A 3-slot service at the fake service's default pacing (15 ms between frames): agent-3 is served
+        # after agent-0's slot freed, and its first frame is stamped after agent-0's last: no 4-way window.
+        agents = {"agent-0": [streamed(1, every(10000, 11985) + [11998, 12000])],
+                  "agent-1": [streamed(1, every(10005, 13005))],
+                  "agent-2": [streamed(1, every(10010, 13010))],
+                  "agent-3": [streamed(1, [12001, 12003] + every(12015, 13500))]}
+        progress = audit.progress_width(agents)
+        self.assertEqual((progress["width"], progress["witness"]["route"]), (3, "fraction"))
+
+    def test_capped_back_to_back_pair_with_two_frames_each_is_not_co_active(self):
+        # A 3-slot service: agent-3 (B) is served after agent-0 (A) completed, but A's last two frames are
+        # stamped 10 ms late, so B's first two frames land in the 4-way window [11990, 12000]. The members that
+        # were never back to back (agent-1, agent-2) each have a coalesced 3-frame read inside it. Only the
+        # 3-frame minimum keeps the back-to-back pair, at exactly 2 frames each, from counting as co-active.
+        agents = {"agent-0": [streamed(1, every(10000, 11985) + [11995, 12000])],
+                  "agent-1": [streamed(1, every(10005, 11970) + [11991, 11992, 11993] + every(12015, 13005))],
+                  "agent-2": [streamed(1, every(10010, 11975) + [11994, 11995, 11996] + every(12010, 13010))],
+                  "agent-3": [streamed(1, [11990, 11998] + every(12015, 13500))]}
+        self.assertEqual(audit.MIN_FRAMES_IN_WINDOW, 3)
+        progress = audit.progress_width(agents)
+        self.assertEqual((progress["width"], progress["witness"]["route"]), (3, "fraction"))
+        with mock.patch.object(audit, "MIN_FRAMES_IN_WINDOW", 2):  # the threshold, not the shape, rejects it
+            progress = audit.progress_width(agents)
+        self.assertEqual((progress["width"], progress["witness"]["route"]), (4, "frames"))
+        self.assertEqual(progress["witness"]["window_ns"], [11990 * 10 ** 6, 12000 * 10 ** 6])
+        self.assertEqual(progress["witness"]["frames_in_window"], [2, 3, 3, 2])
 
 
 class LiveConcurrency(unittest.TestCase):
