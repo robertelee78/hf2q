@@ -1,7 +1,8 @@
 # ADR-065: Four-agent joint speculative verify and multi-slot decode
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-31
+- **Updated:** 2026-11-01 — accepted by the owner; execution waits for the ADR-063 v0.1.28 milestone to complete.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speculation, joint-decode, speed
 - **Depends on:** ADR-063
@@ -865,7 +866,7 @@ The measurement phase delays implementation, every native primitive adds a relea
 
 ### Neutral
 
-Proposed status permits decomposition for design discussion only; implementation begins after owner approval of this ADR.
+The owner accepted this ADR on 2026-11-01. Execution waits until the ADR-063 v0.1.28 milestone is complete, because its measurements need the host undisturbed; stories stay in Backlog until then.
 
 ## Successor watchlist
 
