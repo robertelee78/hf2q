@@ -15,6 +15,8 @@ one discarded warmup per arm per driver session, then Williams-ordered blocks: a
 at most 20, stopping once the 95% half-width of every required experiment contrast is
 <= 2.5 points. Writes campaign.json and verdict.json. Design, estimator, verdict rules
 and root commands: docs/research/adr063-q3-campaign.md.
+--controls-of runs control stages only, as controls of a primary verdict of record (#369
+amendment): its family and arm identities must match that campaign's frozen ones.
 """
 import argparse
 import datetime
@@ -39,6 +41,7 @@ CLIENT = qc.CLIENT
 WORKLOADS = {"n4": None, "n1": "1", "3+1": "3+1", "2+2": "2+2", "1+3": "1+3"}
 SLUGS = {"n4": "n4", "n1": "n1", "3+1": "p3p1", "2+2": "p2p2", "1+3": "p1p3"}
 PRIMARY = "n4"
+CONTROLS = tuple(key for key in WORKLOADS if key != PRIMARY)
 ARMS = ("stock", "experiment", "peer", "peer_matched")
 ROLES = {"stock": "stock hf2q: frozen released baseline", "experiment": "experimental hf2q on that baseline",
          "peer": "peer, best valid configuration (mandatory comparator)",
@@ -77,11 +80,44 @@ def derive_case(case, workload):
     return q5_case.validate(derived)
 
 
-def parse_workloads(text):
+def parse_workloads(text, controls_only=False):
     keys = [k.strip() for k in text.split(",") if k.strip()]
+    if controls_only:
+        qc.require(keys and len(set(keys)) == len(keys) and set(keys) <= set(CONTROLS),
+                   f"--workloads with --controls-of must name distinct control keys of {','.join(CONTROLS)} (never {PRIMARY})")
+        return keys
     qc.require(keys and keys[0] == PRIMARY and len(set(keys)) == len(keys) and set(keys) <= set(WORKLOADS),
                f"--workloads must start with {PRIMARY} and name distinct keys of {','.join(WORKLOADS)}")
     return keys
+
+
+def primary_of_record(path, family):
+    """--controls-of: the campaign of record for the primary (#369 amendment), bound by path and sha256."""
+    verdict_path = Path(path).resolve()
+    campaign_path = verdict_path.parent / "campaign.json"
+    verdict, manifest = q3_metrics.load_json(verdict_path), q3_metrics.load_json(campaign_path)
+    qc.require(verdict_path.name == "verdict.json" and isinstance(verdict, dict)
+               and verdict.get("schema") == q3_report.VERDICT_SCHEMA
+               and isinstance(manifest, dict) and manifest.get("schema") == SCHEMA,
+               f"--controls-of {verdict_path} must be a Q3 verdict.json beside its campaign.json")
+    qc.require(verdict.get("primary") is not None and manifest["plan"].get("controls_of") is None,
+               f"--controls-of {verdict_path} carries no primary verdict")
+    qc.require(verdict["primary"]["status"] == "Complete",
+               f"the primary of record {verdict_path} did not complete (stage {verdict['primary']['status']})")
+    qc.require(verdict["campaign_sha256"] == sha256(campaign_path)
+               and verdict["identities_sha256"] == manifest["identities_sha256"] == qc.plan_sha256(manifest["identities"]),
+               f"{verdict_path} does not bind {campaign_path}")
+    qc.require(verdict["family"] == manifest["plan"]["family"] == family,
+               f"the primary of record {verdict_path} is family {verdict['family']}, not {family}")
+    harness = manifest["identities"]["harness"]
+    return {"verdict": {"path": str(verdict_path), "sha256": sha256(verdict_path)},
+            "campaign": {"path": str(campaign_path), "sha256": verdict["campaign_sha256"]},
+            "family": family, "verdict_of_record": verdict["verdict"], "campaign_status": verdict["campaign_status"],
+            "stages": {stage["workload"]: stage["status"] for stage in manifest["stages"]},
+            "primary_workload": verdict["primary_workload"], "effects": verdict["primary"]["effects"],
+            "plan_sha256": manifest["plan_sha256"], "identities_sha256": manifest["identities_sha256"],
+            "identity": q3_identity.controls_identity(manifest["plan"], manifest["identities"]),
+            "harness": {"git_commit": harness["git_commit"], "sources": harness["sources"]}}
 
 
 def arm_cases(args, family):
@@ -98,6 +134,7 @@ def build_plan(args, environ, family):
     """(plan, cases). The plan is everything a resume must reproduce exactly."""
     qc.require("HF2Q_Q5_HF2Q_BIN" not in environ, "set the hf2q binaries with --stock-bin/--experiment-bin, "
                "not HF2Q_Q5_HF2Q_BIN (it would apply to both hf2q arms)")
+    record = None if args.controls_of is None else primary_of_record(args.controls_of, family)
     cases, arms = {}, {}
     explicit = {"stock": [f"HF2Q_BIN={args.stock_bin}"] if args.stock_bin else [],
                 "experiment": [f"HF2Q_BIN={args.experiment_bin}"] if args.experiment_bin else []}
@@ -126,7 +163,11 @@ def build_plan(args, environ, family):
     unused = sorted(ambient - {n for case in cases.values() for n in case.get("variables", {})})
     qc.require(not unused, "ambient overrides name no variable of any arm case: " + ",".join(unused))
     evidence = [{"path": str(Path(p).resolve()), "sha256": sha256(p)} for p in args.peer_unavailable_evidence or []]
-    plan = {"schema": SCHEMA, "family": family, "primary": PRIMARY, "workloads": parse_workloads(args.workloads),
+    workloads = parse_workloads(args.workloads, record is not None)
+    done = [key for key in workloads if record and record["stages"].get(key) == "Complete"]
+    qc.require(not done, f"--workloads {','.join(done)}: Complete in the campaign of record "
+               f"{record and record['campaign']['path']}; a completed stage is never re-run")
+    plan = {"schema": SCHEMA, "family": family, "primary": None if record else PRIMARY, "workloads": workloads,
             "measured_arms": [arm for arm in ARMS if arm in arms], "arms": arms,
             "peer_unavailable_evidence": evidence,
             "design": {"metric": "client summary own_output_four_task_makespan_seconds",
@@ -142,6 +183,8 @@ def build_plan(args, environ, family):
     if args.negative_control_receipt is not None:
         receipt = Path(args.negative_control_receipt).resolve()
         plan["negative_control_receipt"] = {"path": str(receipt), "sha256": sha256(receipt)}
+    if record is not None:
+        plan["controls_of"] = record
     return plan, cases
 
 
@@ -415,7 +458,11 @@ def parse_args(argv):
     for arm in ARMS:
         parser.add_argument(f"--{arm.replace('_', '-')}-var", action="append", metavar="NAME=VALUE",
                             help=f"HF2Q_Q5_<NAME> override for the {arm} arm only (repeatable)")
-    parser.add_argument("--workloads", default=",".join(WORKLOADS), help="stages in order; n4 (primary) first")
+    parser.add_argument("--workloads", default=",".join(WORKLOADS),
+                        help="stages in order; n4 (primary) first, or control keys only with --controls-of")
+    parser.add_argument("--controls-of", type=Path, metavar="PRIMARY_VERDICT_JSON",
+                        help="controls-only campaign (#369 amendment): run control stages only, as controls of this "
+                             "Q3 verdict.json of record; family and arm identities must match its campaign")
     parser.add_argument("--negative-control-receipt", help="accepted NegativeControlPass receipt, passed to every run")
     parser.add_argument("--qe-identity", help="named QE session/host executing the campaign")
     parser.add_argument("--quality-verdict", action="append", default=[], metavar="MANIFEST",
@@ -435,6 +482,8 @@ def parse_args(argv):
             parser.error("a campaign run needs --output and exactly one --family")
         if args.hf2q_case and args.family and len(args.family) > 1:
             parser.error("--hf2q-case applies to one family")
+        if args.controls_of is not None and (not args.family or len(args.family) != 1):
+            parser.error("--controls-of applies to exactly one --family")
         if args.peer_unavailable_evidence and args.peer_matched_case:
             parser.error("--peer-unavailable-evidence runs no same-GGUF peer arm")
     return args

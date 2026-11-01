@@ -86,6 +86,52 @@ def same_model(ids, native=()):
     return len(keys) == 1
 
 
+# Arm overrides outside the controls identity: the client approval template must be regenerated whenever
+# the frozen client sources change (a controls campaign may run newer harness sources), and the hf2q
+# binaries are compared by content (binary_sha256).
+UNBOUND_OVERRIDES = ("CLIENT_APPROVAL_TEMPLATE", "HF2Q_BIN")
+
+
+def override_identity(spec, identity):
+    """An arm's overrides by content: the sha256 of a file its argv names (identity `inputs`), else the
+    literal value. Other absolute paths (model, binaries, directories) are bound by the model, binary and
+    native runtime identities instead."""
+    inputs = identity.get("inputs") or {}
+    bound = {}
+    for name, value in spec["overrides"].items():
+        if name in UNBOUND_OVERRIDES:
+            continue
+        if isinstance(value, str) and value in inputs:
+            bound[name] = {"sha256": inputs[value]}
+        elif not (isinstance(value, str) and os.path.isabs(value)):
+            bound[name] = value
+    return bound
+
+
+def controls_identity(plan, ids):
+    """What a controls-only campaign must share with its primary of record (#369 amendment): family,
+    measured arms, peer-unavailable evidence, host, Python, and per arm the case, binary, declared commit,
+    model artifact, override contents, peer build, sibling dylibs and native runtime. Harness sources and
+    approval templates may differ."""
+    arms = {}
+    for name, spec in plan["arms"].items():
+        identity = ids["arms"][name]
+        artifact = identity["artifact"] or {}
+        arms[name] = {"engine_kind": spec["engine_kind"], "case_sha256": spec["case_sha256"],
+                      "binary_sha256": identity["binary"]["sha256"],
+                      "model": {"sha256": artifact.get("sha256"), "bytes": artifact.get("bytes")},
+                      "overrides": override_identity(spec, identity)}
+        if name in ("stock", "experiment"):
+            arms[name]["commit"] = plan["declared"][name]["commit"]
+        else:
+            arms[name].update(peer_build_info=identity["peer_build_info"],
+                              sibling_dylibs=identity["binary"].get("sibling_dylibs"),
+                              native_runtime=identity.get("native_runtime"))
+    return {"family": plan["family"], "measured_arms": plan["measured_arms"],
+            "peer_unavailable_evidence": sorted(e["sha256"] for e in plan["peer_unavailable_evidence"]),
+            "host": ids["host"], "python_sha256": ids["python"]["sha256"], "arms": arms}
+
+
 def launch_problems(plan, ids):
     """Everything that keeps a campaign from starting; empty when launchable."""
     problems = [f"--{name}-bin is required" for name in ("stock", "experiment") if not plan["declared"][name]["binary"]]
@@ -120,6 +166,11 @@ def launch_problems(plan, ids):
         problems.append("--qe-identity (the named QE session/host executing Q3) is required")
     if "negative_control_receipt" not in plan:
         problems.append("--negative-control-receipt is required")
+    record = plan.get("controls_of")
+    if record is not None:
+        drift = diff(record["identity"], controls_identity(plan, ids))
+        if drift:
+            problems.append(f"differs from the primary of record {record['verdict']['path']}: " + ", ".join(drift))
     return problems
 
 

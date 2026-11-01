@@ -22,6 +22,7 @@ import q3_metrics
 import q3_report
 import q3_stats
 import q5_case
+from test_native_peer_ds4_campaign import manifest as native_manifest
 
 HERE = Path(__file__).resolve().parent
 EXP_SHA, STOCK_SHA, PEER_SHA, MODEL_SHA = "e" * 64, "5" * 64, "9" * 64, "a" * 64
@@ -201,7 +202,8 @@ def fake_identities(plan, changed=None):
                           "artifact": {"path": "/m.gguf", "bytes": 10, "sha256": MODEL_SHA},
                           "peer_build_info": "b1" if arm.startswith("peer") else None, "missing_variables": [],
                           "file_checks": {}, "inputs": {}} for arm in plan["arms"]},
-           "harness": {"git_commit": "c" * 40, "git_dirty": [], "sources": {}}, "python": {}, "host": {},
+           "harness": {"git_commit": "c" * 40, "git_dirty": [], "sources": {}},
+           "python": {"path": "/usr/bin/python3", "sha256": "7" * 64}, "host": {"chip": "test"},
            "negative_control_receipt": plan.get("negative_control_receipt")}
     if changed:
         ids["harness"]["sources"]["scripts/four_agent/q3_campaign.py"] = changed
@@ -405,6 +407,305 @@ class Driver(Harness):
         self.assertEqual(f2.verify_rows(document, self.root), [r["id"] for r in rows["rows"]])
         self.assertEqual({r["baseline_arm"] for r in rows["rows"]}, {"hf2q_current", "peer"})
         self.assertAlmostEqual(rows["rows"][0]["value"], 20.0, places=0)
+        self.assertFalse(any("control_of" in r for r in rows["rows"]))  # default mode: primary rows only
+
+
+class ControlsOnly(Harness):
+    """--controls-of (#369 amendment): control stages only, bound to a primary verdict of record."""
+    win = Driver.win
+
+    def record(self, *extra, workloads="n4,n1", ids=fake_identities):
+        """A completed default campaign (n4,n1 unless told otherwise) with its verdict.json: the primary of
+        record. Later campaigns in this test write to a sibling directory."""
+        driver, _ = self.driver(self.win, *extra, workloads=workloads, identify=lambda: ids(driver.plan))
+        q3.write_verdict(self.out, driver.run(), [], None)
+        record = self.out / "verdict.json"
+        self.out = self.out.parent / "q3-qwen38-controls"
+        return record
+
+    def controls(self, record, *extra, workloads="3+1,2+2,1+3", **kwargs):
+        return self.driver(self.win, "--controls-of", str(record), *extra, workloads=workloads, **kwargs)
+
+    def test_default_mode_is_unchanged(self):
+        self.assertEqual(q3.parse_args(["--dry-run"]).workloads, ",".join(q3.WORKLOADS))
+        plan, _ = q3.build_plan(self.args(workloads=",".join(q3.WORKLOADS)), {}, "qwen38")
+        self.assertEqual((plan["primary"], plan["workloads"]), ("n4", list(q3.WORKLOADS)))
+        self.assertNotIn("controls_of", plan)
+
+    def test_controls_only_needs_the_flag_and_never_reruns_a_recorded_stage(self):
+        for workloads in ("3+1,2+2,1+3", "n1", "n1,n4"):  # without --controls-of n4 comes first
+            with self.subTest(workloads=workloads), self.assertRaisesRegex(q3.qc.CampaignError, "must start with n4"):
+                q3.build_plan(self.args(workloads=workloads), {}, "qwen38")
+        record = self.record()
+        for workloads in ("n4", "n4,3+1", "3+1,n4", "3+1,3+1", "3+1,n5", ","):
+            with self.subTest(workloads=workloads), self.assertRaisesRegex(q3.qc.CampaignError, r"\(never n4\)"):
+                q3.build_plan(self.args("--controls-of", str(record), workloads=workloads), {}, "qwen38")
+        for workloads in ("n1", "n1,3+1", "3+1,n1"):  # n1 is Complete in the record: never re-run
+            with self.subTest(workloads=workloads), self.assertRaisesRegex(
+                    q3.qc.CampaignError, "n1: Complete in the campaign of record .*never re-run"):
+                q3.build_plan(self.args("--controls-of", str(record), workloads=workloads), {}, "qwen38")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            q3.parse_args(["--dry-run", "--controls-of", str(record)])  # exactly one --family
+        # only the current verdict.json, of a completed primary, is a record
+        superseded = record.with_name("verdict.pre-patch-review.json")
+        superseded.write_text(record.read_text())
+        with self.assertRaisesRegex(q3.qc.CampaignError, "must be a Q3 verdict.json"):
+            q3.build_plan(self.args("--controls-of", str(superseded), workloads="3+1"), {}, "qwen38")
+        incomplete = self.root / "evidence" / "q3-qwen38-incomplete"
+        incomplete.mkdir()
+        (incomplete / "campaign.json").write_bytes((record.parent / "campaign.json").read_bytes())
+        verdict = json.loads(record.read_text())
+        verdict["primary"]["status"] = "Running"
+        (incomplete / "verdict.json").write_text(json.dumps(verdict))
+        with self.assertRaisesRegex(q3.qc.CampaignError, r"did not complete \(stage Running\)"):
+            q3.build_plan(self.args("--controls-of", str(incomplete / "verdict.json"), workloads="3+1"), {}, "qwen38")
+
+    def test_identity_mismatch_with_the_primary_of_record_is_refused(self):
+        record = self.record()
+        with self.assertRaisesRegex(q3.qc.CampaignError, "is family qwen38, not gemma4"):
+            q3.build_plan(self.args("--controls-of", str(record), workloads="3+1"), {}, "gemma4")
+
+        def changed(change):
+            def identify(plan):
+                ids = fake_identities(plan)
+                change(ids)
+                return ids
+            return identify
+        cases_dir = self.root / "cases"
+        cases_dir.mkdir()
+        for name in ("qwen38.json", "peer-qwen38.json"):  # same case, different bytes
+            (cases_dir / name).write_text((HERE / "q5_cases" / name).read_text() + "\n")
+        cases = {
+            "arms.experiment.binary_sha256": ((), changed(lambda i: i["arms"]["experiment"]["binary"].update(sha256="0" * 64))),
+            "arms.stock.model.sha256": ((), changed(lambda i: [a["artifact"].update(sha256="b" * 64) for a in i["arms"].values()])),
+            "arms.peer.peer_build_info": ((), changed(lambda i: i["arms"]["peer"].update(peer_build_info="b2"))),
+            "arms.peer.sibling_dylibs": ((), changed(lambda i: i["arms"]["peer"]["binary"].update(
+                sibling_dylibs={"libggml.dylib": "0" * 64}))),
+            "arms.peer.native_runtime": ((), changed(lambda i: i["arms"]["peer"].update(native_runtime={"a.metal": "0" * 64}))),
+            "host.chip": ((), changed(lambda i: i["host"].update(chip="other"))),
+            "python_sha256": ((), changed(lambda i: i["python"].update(sha256="0" * 64))),
+            "arms.experiment.commit": (("--experiment-commit", "3" * 40), fake_identities),
+            "arms.stock.case_sha256": (("--hf2q-case", str(cases_dir / "qwen38.json")), fake_identities),
+            "arms.peer.case_sha256": (("--peer-case", str(cases_dir / "peer-qwen38.json")), fake_identities),
+            "arms.peer.overrides.PORT": (("--peer-var", "PORT=18999"), fake_identities),
+            "measured_arms": (("--peer-unavailable-evidence", str(self.nc)), fake_identities),
+        }
+        for drift, (extra, identify) in cases.items():
+            with self.subTest(drift=drift):
+                driver, runner = self.controls(record, *extra, identify=lambda: identify(driver.plan))
+                with self.assertRaisesRegex(q3.qc.CampaignError, "differs from the primary of record") as refused:
+                    driver.run()
+                self.assertIn(drift, str(refused.exception))
+                self.assertEqual(runner.calls, [])
+                self.assertFalse(self.out.exists())
+        campaign = record.parent / "campaign.json"
+        campaign.write_text(campaign.read_text() + "\n")  # the verdict no longer binds its campaign
+        with self.assertRaisesRegex(q3.qc.CampaignError, "does not bind"):
+            self.controls(record)
+
+    def test_controls_only_campaign_runs_controls_and_binds_the_primary_of_record(self):
+        record = self.record()
+        of_record = json.loads(record.read_text())
+        self.assertNotIn("primary_of_record", of_record)
+        # harness sources may differ from the primary of record's; binaries, commits, model and peer may not
+        driver, runner = self.controls(record, identify=lambda: fake_identities(driver.plan, changed="x"))
+        manifest = driver.run()
+        self.assertEqual(manifest["status"], "Complete")
+        self.assertEqual([(s["workload"], s["status"]) for s in manifest["stages"]],
+                         [("3+1", "Complete"), ("2+2", "Complete"), ("1+3", "Complete")])
+        self.assertEqual({c[0] for c in runner.calls}, {"p3p1", "p2p2", "p1p3"})
+        self.assertEqual(sorted(p.name for p in (self.out / "cases").iterdir()),
+                         sorted(f"{s}-{a}.json" for s in ("p3p1", "p2p2", "p1p3") for a in ("stock", "experiment", "peer")))
+        plan = manifest["plan"]
+        self.assertIsNone(plan["primary"])
+        self.assertEqual(plan["controls_of"]["verdict"], {"path": str(record), "sha256": q3.sha256(record)})
+        self.assertEqual(plan["controls_of"]["campaign"]["sha256"], q3.sha256(record.parent / "campaign.json"))
+        verdict = q3.write_verdict(self.out, manifest, [], None)
+        self.assertEqual(verdict["verdict"], "ControlsOnly")
+        self.assertIsNone(verdict["primary"])
+        self.assertIsNone(verdict["primary_workload"])
+        self.assertIn("no primary verdict is computed", verdict["reasons"][0])
+        self.assertEqual(set(verdict["controls"]), {"3+1", "2+2", "1+3"})
+        bound = verdict["primary_of_record"]
+        self.assertEqual((bound["path"], bound["sha256"], bound["verdict"]), (str(record), q3.sha256(record), "Win"))
+        self.assertEqual(bound["effects"], of_record["primary"]["effects"])
+        self.assertEqual(bound["harness"]["differs"], ["scripts/four_agent/q3_campaign.py"])
+        self.assertEqual(bound["q2_run_audit_sha256"], {"of_record": None, "this_campaign": None})
+        # F2 rows: control effects only, labeled controls of the primary of record, never a win or loss
+        rows = q3_report.rows(self.out, self.root)
+        self.assertEqual(list(rows["groups"]), ["qwen38-q3-controls"])
+        self.assertEqual(len(rows["rows"]), 6)  # vs stock and vs peer for each control
+        for row in rows["rows"]:
+            self.assertEqual((row["status"], row["control_of"]), ("Descriptive", "$E/evidence/q3-qwen38/verdict.json"))
+            self.assertTrue(row["verification"]["key"].startswith("verdict.json controls."))
+            self.assertNotIn("Q3 verdict", row["note"])
+        document = {"schema": f2.ROWS_SCHEMA, "evidence_root_symbol": "$E", "evidence_root_description": "test",
+                    "neutral_band_ratio": 1.025, "neutral_band_basis": "test",
+                    "families": {"qwen38": {"title": "Qwen3.8 27B", "artifact_sha256": MODEL_SHA, "note": ""}},
+                    **rows}
+        f2.validate_manifest(document)
+        self.assertEqual(f2.verify_rows(document, self.root), [r["id"] for r in rows["rows"]])
+        text = f2.render(document, [], "0" * 64)
+        self.assertIn("### Descriptive wins (not F2 primary qualified results)\n\nNone.", text)
+        self.assertIn("## Q3 controls of a primary verdict of record (never a win or loss)", text)
+        for row in rows["rows"]:
+            self.assertEqual(text.count(f"`{row['id']}`"), 1)  # only in the controls section
+        # a rejected patch review is reported as a quality loss; the verdict stays ControlsOnly
+        review = self.root / "review.json"
+        review.write_text(json.dumps({"schema": q3_report.PATCH_REVIEW_SCHEMA, "verdicts": {fake.FINAL_SOURCE_SHA256: "Fail"}}))
+        rejected = q3_report.compute_verdict(manifest, review_path=review)
+        self.assertEqual(rejected["verdict"], "ControlsOnly")
+        self.assertTrue(any(r.startswith("quality loss: independent patch review rejected") for r in rejected["reasons"]))
+        # a controls-only verdict is no primary of record, and neither bound record file may change
+        with self.assertRaisesRegex(q3.qc.CampaignError, "carries no primary verdict"):
+            q3.build_plan(self.args("--controls-of", str(self.out / "verdict.json"), workloads="3+1"), {}, "qwen38")
+        for bound in (record.parent / "campaign.json", record):
+            with self.subTest(bound=bound.name):
+                original = bound.read_bytes()
+                bound.write_bytes(original + b"\n")
+                with self.assertRaisesRegex(ValueError, f"{bound.name} changed since the campaign bound it"):
+                    q3_report.compute_verdict(manifest)
+                bound.write_bytes(original)
+
+    def test_width_only_invalid_in_a_control_halts_and_stands(self):
+        record = self.record()
+        real, audits = q3.q2_run_audit.check_run, itertools.count()
+
+        def width_only(*args, **kwargs):
+            audit, failure = real(*args, **kwargs)
+            return audit, ("slot-capped service: observed co-progress width 3 < 4" if next(audits) == 5 else failure)
+        driver, runner = self.controls(record, workloads="3+1,2+2")
+        with mock.patch.object(q3.q2_run_audit, "check_run", side_effect=width_only):
+            manifest = driver.run()
+        self.assertEqual(manifest["status"], "Invalid")
+        self.assertFalse(manifest["halted"]["resumable"])
+        self.assertIn("co-progress width 3 < 4", manifest["halted"]["reason"])
+        self.assertEqual(len(runner.calls), 6)
+        self.assertEqual([s["status"] for s in manifest["stages"]], ["Running", "Pending"])
+        verdict = q3.write_verdict(self.out, manifest, [], None)
+        self.assertEqual((verdict["verdict"], verdict["campaign_status"]), ("ControlsOnly", "Invalid"))
+        self.assertTrue(any(r.startswith("campaign Invalid") for r in verdict["reasons"]))
+        self.assertEqual(q3_report.rows(self.out, self.root)["rows"], [])
+        with self.assertRaises(q3.qc.CampaignError):  # Invalid is terminal: no resume, no rerun
+            self.controls(record, workloads="3+1,2+2")[0].run(resume=True)
+
+    def test_override_contents_bind_but_approval_templates_and_harness_sources_do_not(self):
+        template, approval = self.root / "chat-template.jinja", self.root / "client-approval.json"
+        template.write_text("template")
+        approval.write_text("approval")
+
+        def ids(plan, chat="1" * 64, audit="a" * 64):
+            identity = fake_identities(plan)
+            identity["arms"]["peer"]["inputs"] = {str(template): chat, str(approval): "2" * 64}
+            identity["harness"]["sources"][q3_report.Q2_RUN_AUDIT] = audit
+            return identity
+        record = self.record("--peer-var", f"CHAT_TEMPLATE={template}", workloads="n4", ids=ids)
+        extra = ("--peer-var", f"CHAT_TEMPLATE={template}", "--peer-var", f"CLIENT_APPROVAL_TEMPLATE={approval}")
+        plan, _ = q3.build_plan(self.args("--controls-of", str(record), *extra, workloads="3+1"), {}, "qwen38")
+        self.assertEqual(plan["controls_of"]["identity"]["arms"]["peer"]["overrides"], {"CHAT_TEMPLATE": {"sha256": "1" * 64}})
+        drift = " ".join(q3_identity.launch_problems(plan, ids(plan, chat="3" * 64)))
+        self.assertIn("arms.peer.overrides.CHAT_TEMPLATE.sha256", drift)  # same path, other template content
+        # a new approval template and a newer q2_run_audit.py launch, and both audit hashes are recorded
+        driver, _ = self.controls(record, *extra, workloads="3+1", identify=lambda: ids(driver.plan, audit="b" * 64))
+        manifest = driver.run()
+        self.assertEqual(manifest["status"], "Complete")
+        bound = q3.write_verdict(self.out, manifest, [], None)["primary_of_record"]
+        self.assertEqual(bound["q2_run_audit_sha256"], {"of_record": "a" * 64, "this_campaign": "b" * 64})
+        self.assertEqual(bound["harness"]["differs"], [q3_report.Q2_RUN_AUDIT])
+
+    def test_peer_unavailable_evidence_must_be_the_recorded_evidence(self):
+        first, second = self.root / "peer-oom-1.json", self.root / "peer-oom-2.json"
+        first.write_text("{}")
+        second.write_text("{ }")
+        record = self.record("--peer-unavailable-evidence", str(first), workloads="n4")
+        plan, _ = q3.build_plan(self.args("--controls-of", str(record), "--peer-unavailable-evidence", str(first),
+                                          workloads="3+1"), {}, "qwen38")
+        self.assertEqual(q3_identity.launch_problems(plan, fake_identities(plan)), [])
+        plan, _ = q3.build_plan(self.args("--controls-of", str(record), "--peer-unavailable-evidence", str(second),
+                                          workloads="3+1"), {}, "qwen38")
+        drift = " ".join(q3_identity.launch_problems(plan, fake_identities(plan)))
+        self.assertIn("peer_unavailable_evidence", drift)
+        self.assertNotIn("measured_arms", drift)
+
+    def test_resume_after_the_record_changed_is_refused(self):
+        record = self.record()
+
+        def decide(arm, workload, call):
+            return {"outcome": "preflight"} if call == 5 else self.win(arm, workload, call)
+        driver, _ = self.driver(decide, "--controls-of", str(record), workloads="3+1")
+        manifest = driver.run()
+        self.assertEqual((manifest["status"], manifest["halted"]["resumable"]), ("Halted", True))
+        self.assertEqual(q3.qc.plan_sha256(self.controls(record, workloads="3+1")[0].plan), manifest["plan_sha256"])
+        record.write_text(record.read_text() + "\n")  # e.g. the record's verdict was recomputed
+        with self.assertRaisesRegex(q3.qc.CampaignError, "resume needs the identical plan"):
+            self.controls(record, workloads="3+1")[0].run(resume=True)
+
+    def test_experiment_failure_in_a_control_stage_is_a_failure_row(self):
+        record = self.record()
+
+        def decide(arm, workload, call):
+            return {"outcome": "fail"} if arm == "experiment" and call > 5 else self.win(arm, workload, call)
+        driver, _ = self.driver(decide, "--controls-of", str(record), workloads="3+1,2+2")
+        manifest = driver.run()
+        self.assertEqual(manifest["status"], "Complete")
+        self.assertEqual([s["status"] for s in manifest["stages"]], ["Stopped", "NotRun"])
+        verdict = q3.write_verdict(self.out, manifest, [], None)
+        self.assertEqual(verdict["verdict"], "ControlsOnly")
+        self.assertTrue(any(r.startswith("experiment failed its task") for r in verdict["reasons"]))
+        rows = q3_report.rows(self.out, self.root)
+        [row] = rows["rows"]
+        self.assertEqual((row["status"], row["metric"], row["kind"], row["value"]), ("Failure", "task_pass", "measurement", 0))
+        self.assertEqual(row["control_of"], "$E/evidence/q3-qwen38/verdict.json")
+        self.assertTrue(row["verification"]["key"].startswith("campaign.json stages.0."))
+        document = {"schema": f2.ROWS_SCHEMA, "evidence_root_symbol": "$E", "evidence_root_description": "test",
+                    "neutral_band_ratio": 1.025, "neutral_band_basis": "test",
+                    "families": {"qwen38": {"title": "Qwen3.8 27B", "artifact_sha256": MODEL_SHA, "note": ""}},
+                    **rows}
+        f2.validate_manifest(document)
+        self.assertEqual(f2.verify_rows(document, self.root), [row["id"]])
+        text = f2.render(document, [], "0" * 64)
+        self.assertIn("### Descriptive wins (not F2 primary qualified results)\n\nNone.", text)
+        controls = text.split("## Q3 controls of a primary verdict of record (never a win or loss)")[1].split("## Open gaps")[0]
+        self.assertIn(f"0/4 tasks [FAIL] | {row['note']}", controls)
+        self.assertEqual(text.count(f"`{row['id']}`"), 1)
+
+    def test_native_ds4_controls_report_per_stage_and_label_rows(self):
+        record_dir, out = self.root / "evidence" / "q3-deepseek4", self.root / "evidence" / "q3-deepseek4-controls"
+        record_dir.mkdir()
+        out.mkdir()
+        for name in ("campaign.json", "verdict.json"):
+            (record_dir / name).write_text("{}")
+        document = native_manifest("ds4")
+        document["stages"][0].update(workload="3+1", phase_plan="3+1")
+        document["identities"]["harness"] = {"git_commit": "c" * 40, "sources": {}}
+        document["plan"].update(primary=None, controls_of={
+            **{name.split(".")[0]: {"path": str(record_dir / name), "sha256": q3.sha256(record_dir / name)}
+               for name in ("campaign.json", "verdict.json")},
+            "verdict_of_record": "Unavailable", "primary_workload": "n4", "effects": {}, "identities_sha256": "y",
+            "identity": {}, "harness": {"git_commit": "c" * 40, "sources": {}}})
+        (out / "campaign.json").write_text(json.dumps(document))
+        verdict = q3_report.compute_verdict(document)
+        (out / "verdict.json").write_text(json.dumps(verdict))
+        self.assertEqual((verdict["verdict"], verdict["primary"]), ("ControlsOnly", None))
+        self.assertEqual(set(verdict["native_peer"]), {"3+1"})
+        self.assertTrue(verdict["native_peer"]["3+1"]["statement"].startswith(
+            "main HEAD finishes the same coding task 20.0% sooner than ds4 c97964b"))
+        rows = q3_report.rows(out, self.root)
+        self.assertEqual({r["baseline_arm"] for r in rows["rows"]}, {"hf2q_current", "ds4_native"})
+        self.assertEqual({(r["status"], r["control_of"]) for r in rows["rows"]},
+                         {("Descriptive", "$E/evidence/q3-deepseek4/verdict.json")})
+        native_row = next(r for r in rows["rows"] if r["baseline_arm"] == "ds4_native")
+        self.assertTrue(native_row["verification"]["key"].startswith("verdict.json controls.3+1.effects.vs_peer"))
+        self.assertIn("Median tokens per run", native_row["note"])
+        board = {"schema": f2.ROWS_SCHEMA, "evidence_root_symbol": "$E", "evidence_root_description": "test",
+                 "neutral_band_ratio": 1.025, "neutral_band_basis": "test",
+                 "families": {"deepseek4": {"title": "DeepSeek-V4 Flash", "artifact_sha256": "a" * 64, "note": ""}},
+                 **rows}
+        f2.validate_manifest(board)
+        self.assertEqual(f2.verify_rows(board, self.root), [r["id"] for r in rows["rows"]])
+        text = f2.render(board, [], "0" * 64)
+        self.assertNotIn("## Native-engine comparisons", text)  # controls render only in their own section
+        self.assertEqual(text.count(f"`{native_row['id']}`"), 1)
 
 
 class Plan(Harness):
