@@ -1,0 +1,159 @@
+{
+  "schema": "hf2q.q5.calibration-case.v1",
+  "family": "deepseek4",
+  "notes": [
+    "Native ds4 arm (operator decision 2026-10-31): antirez ds4 c97964b serving its own ds4f-q2 Flash 0731 artifact (download_model.sh:16, about 81 GiB; IQ2_XXS gate/up, Q2_K down, Q8 attention projections, shared experts and output). It is NOT the hf2q GGUF and NOT the same-GGUF peer: ds4 rejects the hf2q DS4 GGUF's Q3_K ffn_down_exps (ds4.c:4994 tensor_is_routed_expert_type). Q3 runs it only as the separately labeled peer arm 'ds4 c97964b (native Flash-0731 q2 artifact)' with --peer-unavailable-evidence for the same-GGUF peer; the comparison is task makespan only.",
+    "Think Max control: the canonical request sends reasoning_effort=max, which ds4 honours only when the per-session context is >= 393216 (DS4_THINK_MAX_MIN_CONTEXT, ds4.c:424-427, 61096-61100) and otherwise silently renders normal thinking. --ctx is per session (each of the 4 sessions gets cfg.ctx_size, ds4_server.c:15993-16003), so NATIVE_DS4_CTX defaults to 393216 and the adapter refuses anything lower. The workload stays 262144 per slot: the client refuses any turn whose prompt plus 8192 output exceeds 262144. Memory implication: four 393216-token sessions; the startup line 'N resident sessions request at least X GiB ... or Y GiB when the model shares one prefill workspace' (ds4_server.c:15514-15527) is parsed and recorded by native_peer_ds4.readiness.",
+    "Parity flags: --batched-session 4 (four resident sessions, ds4_server.c:15695-15696); no --mtp/--dspark (session batching disables them anyway, ds4_server.c:16021-16024); no --kv-disk-dir, so the disk KV cache is off (ds4_server.c:16006-16009), matching hf2q DeepSeek disk_persistence=false; the --kv-cache-* knobs only tune that disk cache and keep their defaults; --power 100 is the default made explicit (ds4.c:60388); --tokens 8192 mirrors the peer's --predict 8192 and is proved by /v1/models top_provider.max_completion_tokens; exact DSML tool replay stays on (default).",
+    "--chdir {DS4_DIR}: ds4 reads its 26 Metal kernel sources from metal/*.metal relative to the working directory at startup (ds4_metal.m:4754-4823); q5 launches with cwd={OUT}, and child_env passes no DS4_METAL_*_SOURCE override (q5_case.PASSTHROUGH). The client pins the sha256 of every kernel source at c97964b.",
+    "--trace {OUT}/ds4-trace.txt records each request's think_mode, sampling, max_tokens and rendered prompt (trace_begin, ds4_server.c:11983-12036). q2_run_audit refuses a Pass unless every request ran think_mode max, greedy sampling, max_tokens 8192 and a rendered prompt beginning with BOS plus ds4's Think Max prefix. Trace writes are unbuffered per token piece (ds4_server.c:12039-12045, 16034).",
+    "Identity: DS4_BIN_SHA256 (the root's c97964b build) and MODEL_SHA256 are required inputs (download_model.sh pins no checksum for this file, artifact_identity 466-537). Readiness is GET /v1/models ('object' == 'list'), served only after the model and all four sessions exist (listen at ds4_server.c:16071-16088, after session creation at 15993-16003). The client then checks the binary sha256, the kernel sources, /v1/models (V4 Flash shape, context, 8192 output) and the startup log. Template parity is Unavailable: ds4 renders DSML in C, and its Think Max prefix is the hf2q 0731 template's 'high' tier text, not its 'max' tier text.",
+    "Run as a calibration (no --admission-receipt): different binary and artifact from every hf2q calibration."
+  ],
+  "workload": {
+    "id": "adr063-q5-native-ds4-deepseek4-n4-coding-ctx262144",
+    "slots": 4,
+    "context_per_slot": 262144,
+    "client": "scripts/four_agent/qwen_n4_live_smoke.py --family deepseek4 --engine-kind ds4"
+  },
+  "variables": {
+    "DS4_DIR": "/opt/ds4",
+    "DS4_BIN": "{DS4_DIR}/ds4-server",
+    "DS4_BIN_SHA256": null,
+    "DS4_COMMIT": "c97964b8aa77034a8e17afb10ca7a686c40ab511",
+    "MODEL": "{DS4_DIR}/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+    "MODEL_SHA256": null,
+    "MODEL_ID": "deepseek-v4-flash",
+    "NATIVE_DS4_CTX": "393216",
+    "PORT": "18251",
+    "CARGO": null,
+    "TOOLCHAIN": null,
+    "SANDBOX_PROOF": null,
+    "SANDBOX_PROOF_SHA256": null,
+    "CLIENT_APPROVAL_TEMPLATE": null
+  },
+  "binary": "{DS4_BIN}",
+  "artifact": {
+    "path": "{MODEL}",
+    "sha256": "{MODEL_SHA256}"
+  },
+  "port": "{PORT}",
+  "serve": {
+    "argv": [
+      "{DS4_BIN}",
+      "--chdir",
+      "{DS4_DIR}",
+      "-m",
+      "{MODEL}",
+      "--ctx",
+      "{NATIVE_DS4_CTX}",
+      "--batched-session",
+      "4",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "{PORT}",
+      "--tokens",
+      "8192",
+      "--power",
+      "100",
+      "--metal",
+      "--trace",
+      "{OUT}/ds4-trace.txt"
+    ],
+    "env": {}
+  },
+  "readiness": {
+    "url": "http://127.0.0.1:{PORT}/v1/models",
+    "field": "object",
+    "equals": "list",
+    "timeout_seconds": 1800,
+    "record": [
+      "http://127.0.0.1:{PORT}/v1/models"
+    ],
+    "checks": []
+  },
+  "client": {
+    "argv": [
+      "{PYTHON}",
+      "-E",
+      "-s",
+      "-B",
+      "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py",
+      "--base-url",
+      "http://127.0.0.1:{PORT}/v1",
+      "--model",
+      "{MODEL_ID}",
+      "--output",
+      "{OUT}/client",
+      "--cargo",
+      "{CARGO}",
+      "--toolchain",
+      "{TOOLCHAIN}",
+      "--sandbox-exec",
+      "/usr/bin/sandbox-exec",
+      "--sandbox-proof",
+      "{SANDBOX_PROOF}",
+      "--sandbox-proof-sha256",
+      "{SANDBOX_PROOF_SHA256}",
+      "--server-pid",
+      "{SERVER_PID}",
+      "--approval",
+      "{CLIENT_APPROVAL}",
+      "--approval-sha256",
+      "{CLIENT_APPROVAL_SHA256}",
+      "--family",
+      "deepseek4",
+      "--engine-kind",
+      "ds4"
+    ],
+    "env": {},
+    "approval": {
+      "template": "{CLIENT_APPROVAL_TEMPLATE}",
+      "set": {
+        "server_pid": "{SERVER_PID}",
+        "base_url": "http://127.0.0.1:{PORT}/v1",
+        "model": "{MODEL_ID}",
+        "run_id": "{RUN_ID}",
+        "barrier_token": "{NONCE32}",
+        "python_sha256": "{PYTHON_SHA256}",
+        "sources": {
+          "sha256_of": [
+            "{REPO}/scripts/four_agent/qwen38_n1_smoke.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_tools.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_verdict.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_process.py",
+            "{REPO}/scripts/four_agent/test_qwen38_n1_verdict.py",
+            "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py",
+            "{REPO}/scripts/four_agent/test_qwen_n4_live_smoke.py",
+            "{REPO}/scripts/four_agent/coding_family.py",
+            "{REPO}/scripts/four_agent/test_coding_family.py",
+            "{REPO}/scripts/four_agent/qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/test_qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/family_peer.py",
+            "{REPO}/scripts/four_agent/test_family_peer.py",
+            "{REPO}/scripts/four_agent/f2_semantic.py",
+            "{REPO}/scripts/four_agent/native_peer_ds4.py",
+            "{REPO}/scripts/four_agent/test_native_peer_ds4.py"
+          ]
+        },
+        "native_ds4": {
+          "binary": "{DS4_BIN}",
+          "binary_sha256": "{DS4_BIN_SHA256}",
+          "commit": "{DS4_COMMIT}",
+          "chdir": "{DS4_DIR}",
+          "model": "{MODEL}",
+          "model_sha256": "{MODEL_SHA256}",
+          "ctx": "{NATIVE_DS4_CTX}",
+          "port": "{PORT}",
+          "server_log": "{OUT}/server.stderr",
+          "trace": "{OUT}/ds4-trace.txt"
+        }
+      }
+    },
+    "summary": "{OUT}/client/summary.json",
+    "success_status": "FourAgentProtocolCompleteAwaitingIndependentReview",
+    "timeout_seconds": 7200
+  },
+  "policy": {}
+}

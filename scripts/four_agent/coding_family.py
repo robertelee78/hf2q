@@ -4,10 +4,12 @@ FAMILIES = ('qwen', 'deepseek4', 'gemma4')
 
 
 def validate_selection(family, engine_kind, slots):
-    require(family in FAMILIES and engine_kind in ('hf2q', 'peer') and slots in (1, 4),
+    require(family in FAMILIES and engine_kind in ('hf2q', 'peer', 'ds4') and slots in (1, 4),
             'unsupported diagnostic selection')
     require(engine_kind != 'peer' or slots == 4,
             'the peer arm is the four-slot coding workload only')
+    require(engine_kind != 'ds4' or (family == 'deepseek4' and slots == 4),
+            'the native ds4 arm is the four-slot DeepSeek-V4 coding workload only')
 
 
 def profile(family, slots):
@@ -48,6 +50,10 @@ def validate_binding(packet, family, slots):
     if packet.get('engine_kind', 'hf2q') == 'peer' and family != 'qwen':
         from family_peer import validate_controls
         validate_controls(packet.get('family_controls'), family)
+        return
+    if packet.get('engine_kind', 'hf2q') == 'ds4':
+        from native_peer_ds4 import validate_controls as native_controls
+        native_controls(packet.get('family_controls'), family)
         return
     if family == 'gemma4':
         controls = packet.get('family_controls')

@@ -17,6 +17,8 @@ Every arm runs the same GGUF, the canonical four-agent coding client (`qwen_n4_l
 
 The checked-in peer cases match hf2q's model-facing settings (template, thinking, sampling, context, slots; see their notes and `family_peer.py`). No better valid peer configuration has been identified for these workloads, so they are the declared best valid configuration. The DeepSeek-V4 `--load-mode` mmap, `--ubatch-size 256` variant (`$E/peer-arms-v1/peer-deepseek4-mmap.json`) was the best-valid-configuration attempt for that family. Declaring a different best configuration is an operator decision made before a campaign starts: pass it as `--peer-case` and keep the matched one as `--peer-matched-case`.
 
+**Native ds4 arm (DeepSeek-V4 only, operator decision 2026-10-31).** `--peer-case q5_cases/native-ds4-deepseek4.json` with the same-GGUF `--peer-unavailable-evidence` runs antirez ds4 c97964b in the `peer` slot, on its own ds4f-q2 Flash 0731 artifact. The plan labels the arm `ds4 c97964b (native Flash-0731 q2 artifact)`. Its artifact is exempt from the same-model rule but must carry a sha256. Its build identity is the ds4 commit plus the `ds4-server` sha256, and its 26 runtime Metal sources are frozen too. The family verdict stays `Unavailable`, because there is no same-GGUF peer. `verdict.json` `native_peer` reports the task-makespan comparison separately, and F2 rows use baseline `ds4_native`. Adapter and controls: `scripts/four_agent/README.md` "Native ds4 arm".
+
 `HF2Q_Q5_HF2Q_BIN` and `--stock-var/--experiment-var HF2Q_BIN=…` are refused. The hf2q binaries come only from `--stock-bin` and `--experiment-bin`, so a case default can never stand in for one of them.
 
 ## Frozen identities
@@ -169,6 +171,21 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/current-port-balanced-c1-normal-n4-v1/client
   --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-mmap-20261030T165948Z/receipt.json \
   --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-mmap-20261030T165948Z/server.stderr \
   --output "$Q3/deepseek4"
+
+# DeepSeek-V4 Flash, native ds4 arm (separately labeled; same evidence keeps the same-GGUF verdict Unavailable)
+HF2Q_Q5_MODEL=$MODELS/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf \
+HF2Q_Q5_MODEL_SHA256=50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6 \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/current-port-balanced-c1-normal-n4-v1/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family deepseek4 "${STOCK[@]}" "${EXP[@]}" "${COMMON[@]}" \
+  --peer-case scripts/four_agent/q5_cases/native-ds4-deepseek4.json \
+  --peer-var MODEL=/opt/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+  --peer-var MODEL_SHA256=<sha256 of that file> --peer-var DS4_BIN_SHA256=<sha256 of /opt/ds4/ds4-server> \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-ds4-deepseek4-client-approval.json \
+  --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-20261030T165847Z/receipt.json \
+  --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-20261030T165847Z/server.stderr \
+  --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-mmap-20261030T165948Z/receipt.json \
+  --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-mmap-20261030T165948Z/server.stderr \
+  --output "$Q3/deepseek4-native-ds4"
 
 # Qwen3.6 35B-A3B
 HF2Q_Q5_MODEL=$MODELS/qwen36-stock-adr063/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf \

@@ -90,10 +90,13 @@ def wire(request, family="qwen"):
 
 
 def usage(value, turn, engine_kind="hf2q"):
-    require(engine_kind in ("hf2q", "peer"), "engine kind")
+    require(engine_kind in ("hf2q", "peer", "ds4"), "engine kind")
     if engine_kind == "peer":
         from qwen_n4_peer import usage as peer_usage
         return peer_usage(value, turn)
+    if engine_kind == "ds4":
+        from native_peer_ds4 import usage as native_usage
+        return native_usage(value, turn)
     require(isinstance(value, dict), "missing usage")
     prompt = integer(value.get("prompt_tokens"), "prompt tokens", 262144)
     completion = integer(value.get("completion_tokens"), "completion tokens", 8192)
@@ -146,6 +149,9 @@ def assistant(message, finish, turn, seen_ids):
 def unary(raw, model, turn, seen, engine_kind="hf2q", *, assistant_policy=None):
     obj = loads(raw)
     require(isinstance(obj, dict) and "error" not in obj, "API error")
+    if engine_kind == "ds4":
+        from native_peer_ds4 import check_unary
+        check_unary(obj)
     require(obj.get("model") == model and isinstance(obj.get("id"), str), "response identity")
     choices = obj.get("choices")
     require(isinstance(choices, list) and len(choices) == 1 and choices[0].get("index") == 0,
@@ -168,6 +174,10 @@ class SSE:
     """Consume every complete SSE data frame, including usage and terminal marker."""
     def __init__(self, model, turn, seen, engine_kind="hf2q", *, assistant_policy=None):
         self.engine_kind = engine_kind
+        self.native_frame = None
+        if engine_kind == "ds4":
+            from native_peer_ds4 import check_frame
+            self.native_frame = check_frame
         self.assistant_policy = assistant if assistant_policy is None else assistant_policy
         self.model, self.turn, self.seen = model, turn, seen
         self.identity = None
@@ -188,6 +198,8 @@ class SSE:
             return False
         obj = loads(data)
         require(isinstance(obj, dict) and "error" not in obj, "SSE API error")
+        if self.native_frame is not None:
+            self.native_frame(obj)
         require(obj.get("model") == self.model and isinstance(obj.get("id"), str), "SSE identity")
         if self.identity is None:
             self.identity = obj["id"]
