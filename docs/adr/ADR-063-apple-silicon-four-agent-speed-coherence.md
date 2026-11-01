@@ -627,6 +627,77 @@ serial decode. Qwen3.6's hf2q arm fails its coding task on a near-tie in model
 output (#461). DeepSeek-V4 and Gemma 4 have no peer adapter. This update
 establishes no speed win by itself.
 
+### Native-engine peer arms (operator decision 2026-10-31)
+
+The operator approved native-engine peers as separately labeled benchmark arms:
+antirez ds4, TensorFold and oMLX. Each runs its own native artifact, not the
+hf2q GGUF. This section records the ds4 arm (`engine_kind ds4`,
+`scripts/four_agent/native_peer_ds4.py`,
+`q5_cases/native-ds4-deepseek4.json`). The TensorFold and oMLX arms are
+recorded when their adapters land.
+
+- **The DeepSeek-V4 same-GGUF peer stays Unavailable.** Both runs
+  `$E/peer-arms-v1/peer-deepseek4-20261030T165847Z` and
+  `peer-deepseek4-mmap-20261030T165948Z` loaded the hf2q artifact and then hit
+  Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory` on their first requests.
+  The Q3/Q4 same-GGUF verdict for DeepSeek-V4 remains `Unavailable` with that
+  evidence. A native arm never substitutes for it.
+- **The ds4 arm is a labeled different-artifact comparison.** ds4 c97964b
+  serves its ds4f-q2 Flash 0731 GGUF: about 81 GiB, IQ2_XXS gate/up, Q2_K down
+  and Q8 attention projections, shared experts and output. ds4 rejects the
+  hf2q artifact's Q3_K routed experts (`ds4.c:4994`). Reports name the arm
+  `ds4 c97964b (native Flash-0731 q2 artifact)`. As required by Q4, this
+  native-format competition is reported separately from the same-GGUF verdict:
+  `verdict.json` `native_peer`, F2 baseline `ds4_native`.
+- **The verdict wording is task makespan only.** The claim takes the form
+  "<hf2q label> finishes the same coding task X% sooner (or later) than ds4
+  c97964b (native Flash-0731 q2 artifact)", with the paired 95% interval. It
+  always comes with each arm's token volumes (median prompt and completion
+  tokens per run), per-output-token rate (median completion tokens per
+  makespan second) and the worst-slot p95 TTFT ratio. The weights differ, so
+  it is never a same-weights engine-speed, per-token-efficiency or
+  model-quality claim.
+- **The quality gate applies.** The experiment arm keeps every Q1/Q3 task and
+  quality gate. ds4 must complete the same canonical four-agent task:
+  - ds4 task failures are recorded;
+  - an unavailable ds4 arm is recorded;
+  - ds4 server-side tool-call recovery is recorded per run from `--trace`.
+    ds4 can repair an unterminated tool call, or append a model-visible tool
+    error and decode again inside one request, so the client sees only the
+    second attempt (`ds4_server.c:12627-12639, 14313-14385, 14448-14520`). The
+    run stays valid;
+  - while any of these holds, or while either arm has a failed run, no
+    makespan statement is published (`statement_withheld`).
+  - Native comparisons never count as F2 wins. The scoreboard renders them in
+    their own "Native-engine comparisons" section, together with their
+    companion figures.
+- **The Think Max control is explicit.** The canonical DeepSeek-V4 request uses
+  `reasoning_effort=max`.
+  - ds4 renders Think Max only when the per-session `--ctx` is at least
+    393216, and silently falls back to normal thinking otherwise
+    (`ds4.c:424-427, 61096-61100`).
+  - The case therefore runs four 393216-token sessions (`NATIVE_DS4_CTX`), and
+    the adapter refuses any lower context. The workload stays 262144 tokens per
+    slot, enforced on every turn's usage.
+  - The added KV memory is recorded from ds4's startup line. An estimate from
+    ds4's own sizing formulas (`ds4.c:40421-40530`): about 16.5 GiB of context
+    buffers with a shared prefill workspace, or 25.5 GiB without one, versus
+    about 11.5 GiB at 262144. That is on top of about 81 GiB of weights. The
+    root's first calibration establishes whether this fits.
+  - Prompt structure is not identical. ds4 renders the tool schemas before the
+    client system text (`ds4_server.c:3114-3133`), while the 0731 template
+    appends them after it (`deepseek-v4-flash-0731.jinja:42-46, 54-60`). ds4's
+    Think Max prefix is the template's `high` text, not its `max` text. The
+    weaker wording likely shortens ds4's reasoning, which biases makespan in
+    ds4's favour. Byte-identical prompts are therefore `Unavailable`.
+    Per-request think mode, greedy sampling, the rendered prefix and the token
+    counts are proven from ds4's `--trace`, bound to each client request by the
+    sha256 of its body.
+  - ds4 cohorts are not Q2-certified (`q2_certify.py` refuses them). Q3/Q1
+    audit every ds4 Pass with the trace audit instead.
+
+This decision establishes no speed win and changes no same-GGUF verdict.
+
 ## Consequences
 
 ### Positive

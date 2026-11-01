@@ -14,6 +14,7 @@ RUNTIME_EXECUTABLES = {
     'llama-simple', 'llama-speculative', 'ollama', 'ollama_llama_server', 'lms',
     'mlx_lm.server', 'mlx_lm.generate', 'mlx_lm.chat', 'mlx_vlm.server', 'mlx_vlm.generate',
     'vllm', 'sglang', 'koboldcpp',
+    'ds4', 'ds4-server', 'ds4-agent', 'ds4-bench', 'ds4-eval',  # native ds4 binaries (/opt/ds4 Makefile:78)
 }
 # Hosted peers started as `python -m <module>` or via the module's console script.
 PYTHON_MODULE_ROOTS = ('mlx_lm', 'mlx_vlm', 'vllm', 'sglang')

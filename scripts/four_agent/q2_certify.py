@@ -99,8 +99,11 @@ def request_wire(request, request_raw, family, engine):
     if engine == "hf2q":
         require(wire(request, family) == request_raw, "canonical wire/no silent truncation")
     else:
-        # Same validation boundary as actual peer exchange, retaining native metadata.
-        from family_peer import canonical
+        # Same validation boundary as actual native-engine exchange, retaining native metadata.
+        if engine == "ds4":
+            from native_peer_ds4 import canonical
+        else:
+            from family_peer import canonical
         wire(canonical(request, family), family)
         require(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
                 == request_raw, "canonical native peer wire")
@@ -296,7 +299,7 @@ def certify_cohort(cohort_manifest_path, expected_plan):
         require(count == 4 and set(ready) == {"health", "props", "slots"}, "raw peer readiness envelope")
         validate_readiness(ready["health"], ready["props"], ready["slots"], expected_plan["model"],
                            expected_plan["family"])
-    else:
+    else:  # native ds4 cohorts are not Q2-certified: Q3/Q1 audit them with q2_run_audit + native_peer_ds4_audit
         require(expected_plan["engine_kind"] == "hf2q", "closed engine family")
         require(ready["health"]["model"] == expected_plan["model"]
                 and ready["health"]["context_length"] == 262144, "actual model/full context readiness")

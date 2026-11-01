@@ -96,12 +96,22 @@ def worst(slots, key):
     return max(values, default=None)
 
 
-def peer_build_info(run_dir, receipt):
+def peer_build_info(run_dir, receipt, summary=None):
     for url, name in ((receipt.get("readiness") or {}).get("documents") or {}).items():
         if url.endswith("/props"):
             document = load_json(Path(run_dir) / name)
             return None if document is None else document.get("build_info")
-    return None
+    # The native ds4 arm has no /props: its client binds commit + binary sha at readiness.
+    return ((summary or {}).get("native_readiness") or {}).get("build_info")
+
+
+def token_volume(agents):
+    """Summed usage over every agent turn (None when any turn lacks it); descriptive, never a verdict input."""
+    usage = [t.get("usage") for agent in agents.values() for t in agent.get("turns", [])]
+    if not usage or not all(isinstance(u, dict) for u in usage):
+        return None
+    total = {k: sum(u.get(f"{k}_tokens") or 0 for u in usage) for k in ("prompt", "completion")}
+    return {**total, "cached": sum((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0 for u in usage)}
 
 
 def run_metrics(run_dir, receipt, summary, agents_expected, post_thermal):
@@ -135,5 +145,6 @@ def run_metrics(run_dir, receipt, summary, agents_expected, post_thermal):
                     "valid": None if not observed else all(x < THERMAL_INVALID for x in observed)},
         "binary_sha256": ((receipt or {}).get("binary") or {}).get("sha256"),
         "artifact": {k: ((receipt or {}).get("artifact") or {}).get(k) for k in ("path", "bytes", "sha256")},
-        "peer_build_info": None if receipt is None else peer_build_info(run_dir, receipt),
+        "peer_build_info": None if receipt is None else peer_build_info(run_dir, receipt, summary),
+        "tokens": token_volume(agents),
     }

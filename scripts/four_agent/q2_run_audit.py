@@ -9,11 +9,16 @@ many agents made streamed progress at the same time.
 Co-progress is measured from client progress events (`progress_event_monotonic_ns`: every
 SSE frame that grew reasoning or semantic output). A streamed request is active from its
 first to its last progress frame. A set of agents is co-active when one active request per
-agent shares a common window lasting at least MIN_OVERLAP_FRACTION of the shortest member's
-active interval. The width is the largest co-active set. A server that serves requests one
-at a time (or at most N at a time) cannot keep N+1 requests mid-stream together, so its width
-stays at 1 (or N) however many HTTP requests it holds open; only boundary jitter of the
-client's receive timestamps can overlap, and that is a vanishing fraction of an interval.
+agent shares a common window [latest first frame, earliest last frame] of positive length that
+either lasts at least MIN_OVERLAP_FRACTION of the shortest member's active interval, or holds
+at least MIN_FRAMES_IN_WINDOW progress frames of every member. The width is the largest
+co-active set. A server that serves requests one at a time (or at most N at a time) cannot
+keep N+1 requests mid-stream together, so its width stays at 1 (or N) however many HTTP
+requests it holds open: such a common window must open after one member's service started
+and close before an earlier member's last frame, which that capped slot sent before the later
+member was served, so only client receive lag of the earlier member can make it non-empty. That
+is a vanishing fraction of an interval, and too short for the later-served member to reach its
+first frame (after its prefill) and stream more frames inside it.
 Bursty low-frame streams (one reasoning frame, then a semantic burst) still qualify because
 no frame alternation is required. This is a client-side lower bound on concurrent slot
 progress. A server that parks a request mid-generation while finishing another looks the
@@ -32,6 +37,7 @@ import qwen_n4_live_smoke as coordinator
 
 SUCCESS = "FourAgentProtocolCompleteAwaitingIndependentReview"
 MIN_OVERLAP_FRACTION = 0.5
+MIN_FRAMES_IN_WINDOW = 3
 PASSING_Q5 = ("CalibrationPass", "AdmittedRunPass")
 
 
@@ -42,21 +48,26 @@ def expected_width(phase_plan):
 
 
 def active_intervals(agents):
-    """{agent: [(turn, first_progress_ns, last_progress_ns)]} for streamed requests with two or more frames."""
+    """{agent: [(turn, first_progress_ns, last_progress_ns, stamps)]} for streamed requests with two or more frames."""
     found = {}
     for name, turns in agents.items():
         for turn in turns:
             stamps = turn.get("progress_event_monotonic_ns") or []
             if len(stamps) >= 2 and stamps[-1] > stamps[0]:
-                found.setdefault(name, []).append((turn.get("turn"), stamps[0], stamps[-1]))
+                found.setdefault(name, []).append((turn.get("turn"), stamps[0], stamps[-1], stamps))
     return found
 
 
 def progress_width(agents):
-    """{agent: turn receipts} -> largest co-active agent set; 1 with progress but no qualifying overlap, 0 without."""
+    """{agent: turn receipts} -> largest co-active agent set; 1 with progress but no qualifying overlap, 0 without.
+
+    A set qualifies by route 'fraction' (common window >= MIN_OVERLAP_FRACTION of the shortest member's
+    active interval) or else by route 'frames' (every member has >= MIN_FRAMES_IN_WINDOW progress frames
+    inside the closed common window). The larger set wins; ties go to the larger fraction, then to the
+    larger smallest per-member frame count, then to the first set found."""
     spans = active_intervals(agents)
     width = 1 if any(turn.get("progress_event_monotonic_ns") for turns in agents.values() for turn in turns) else 0
-    witness, best_fraction = None, 0.0
+    witness, best = None, None
     for anchor_agent, anchor_spans in spans.items():
         others = [[None] + [(agent, span) for span in found] for agent, found in spans.items() if agent != anchor_agent]
         for anchor in anchor_spans:
@@ -66,14 +77,27 @@ def progress_width(agents):
                     continue
                 low = max(span[1] for _, span in members)
                 high = min(span[2] for _, span in members)
-                shortest = min(span[2] - span[1] for _, span in members)
-                fraction = (high - low) / shortest if high > low else 0.0
-                if fraction >= MIN_OVERLAP_FRACTION and (len(members), fraction) > (width, best_fraction):
-                    width, best_fraction = len(members), fraction
-                    witness = {"members": sorted([agent, span[0]] for agent, span in members),
-                               "window_ns": [low, high], "overlap_fraction": round(fraction, 4)}
+                if high <= low:
+                    continue
+                fraction = (high - low) / min(span[2] - span[1] for _, span in members)
+                frames = [sum(low <= t <= high for t in span[3]) for _, span in members]
+                if fraction >= MIN_OVERLAP_FRACTION:
+                    route = "fraction"
+                elif min(frames) >= MIN_FRAMES_IN_WINDOW:
+                    route = "frames"
+                else:
+                    continue
+                rank = (len(members), fraction, min(frames))
+                if best is None or rank > best:
+                    width, best = len(members), rank
+                    chosen = sorted((agent, span[0], count) for (agent, span), count in zip(members, frames))
+                    witness = {"route": route, "members": [[agent, turn] for agent, turn, _ in chosen],
+                               "window_ns": [low, high], "overlap_fraction": round(fraction, 4),
+                               "frames_in_window": [count for _, _, count in chosen]}
     return {"width": width, "witness": witness, "min_overlap_fraction": MIN_OVERLAP_FRACTION,
-            "basis": "sustained overlap of streamed requests' first-to-last progress frames"}
+            "min_frames_in_window": MIN_FRAMES_IN_WINDOW,
+            "basis": "streamed requests' first-to-last progress frames sharing a common window that lasts "
+                     "min_overlap_fraction of the shortest member or holds min_frames_in_window frames of every member"}
 
 
 def http_overlap(agents):
@@ -233,6 +257,9 @@ def audit_run(client_dir, summary, phase_plan, engine_kind, require_width):
     require(not require_width or progress["width"] >= report["expected_width"],
             f"serialized or slot-capped service: observed co-progress width {progress['width']} < {report['expected_width']} "
             f"with up to {report['http_overlap_max']} overlapping HTTP requests")
+    if engine_kind == "ds4":  # trace bound to these requests: Think Max, greedy, prefix, usage; recovery counted
+        from native_peer_ds4_audit import audit_run as native_audit
+        report["native_trace"] = native_audit(summary, client_dir, turns)
     return report
 
 
