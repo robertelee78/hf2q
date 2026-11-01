@@ -247,7 +247,7 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/peer-deepseek4-client-approval.json \
   - F2 rows use baseline `ds4_native`. They never count as wins: the scoreboard renders them in their own "Native-engine comparisons" section, with the statement and the companion figures.
   - In `quality_campaign.py` it is `--reference-kind ds4-native`.
   - Ambient `HF2Q_Q5_MODEL`/`MODEL_SHA256`/`CLIENT_APPROVAL_TEMPLATE` would also reach this case, so pass its values with `--peer-var`/`--reference-var`.
-  - ds4 cohorts are not Q2-certified: `q2_certify.py` refuses `engine_kind ds4`. Q3/Q1 audit them with `q2_run_audit.py`.
+  - ds4 cohorts are not Q2-certified: `q2_certify.py` refuses `engine_kind ds4` (and `peer`; only hf2q writes the server phase trace). Q3/Q1 audit them with `q2_run_audit.py`.
 
 ```sh
 HF2Q_Q5_DS4_BIN_SHA256=<sha256 of /opt/ds4/ds4-server> HF2Q_Q5_MODEL_SHA256=<sha256 of the 0731 q2 GGUF> \
@@ -471,6 +471,17 @@ The co-progress width is the largest set of agents whose streamed requests stay 
 | `q2_run_audit.py` | Settled-run audit used by `q3_campaign.py` and `quality_campaign.py` |
 | `q2_fake_service.py` | Model-free fake service, honest-run fixtures and live four-process driver (tests only) |
 | `test_q2_adversarial_controls.py` | Wire, audit, live-concurrency, injected-delay and campaign controls |
+
+### Q2 raw-cohort certification (`q2_manifest.py`, `q2_certify.py`)
+
+`q2_manifest.py` hashes the retained files of one cohort into `hf2q.q2.cohort.v1`; `q2_certify.py` replays and validates them against an externally frozen `hf2q.q2.expected-plan.v1`. Without an independent QE attestation the best result is `PendingIndependentQE` (exit 2); a hash-bound `hf2q.q2.qe-verdict.v1` that names the exact manifest and auditor sha256 makes it `Qualified` (exit 0). A refused cohort gets a `Rejected` certificate with the reason (exit 2). Certificates are create-new and never inside a Git tree.
+
+- **Inputs.** `server_receipt` and `readiness` are the files the F2 operating90 supervisor writes (`receipt.json` with `protocol_complete`/`final_verified`/`cleanup_proved` and a cleanup list; `readiness.json` with `health` and `runtime`). The q5 calibration receipt and its separate `readiness-N.json` files are not certifiable inputs.
+- **Server phase trace.** The JSONL file `hf2q serve` writes under `HF2Q_PHASE_TRACE_CONFIG`, one record per line. Its size bound is its own header's metadata quota (`f2_trace.metadata_total_limit`: 256 MiB, or 2/8 GiB for the declared native capture profiles). Each line is at most one trace event (64 KiB). The file is streamed record by record on every pass, and each pass re-checks its frozen sha256, so a multi-GB trace is never loaded whole.
+- **`trace_scenario`** (in the expected plan): the `hf2q.f2.trace-expectation.v1` keys `f2_trace.validate_trace` reads (`schema`, `run_id`, `config_sha256`, and when used `metadata_budget_profile`, `forward_witness_manifest`, `forward_demand_policy`), plus the frozen window: `composition`, `arrival_ns` and `population_policy`. `population_policy` is required, with no default: `ready_now_v1`, `forward_demand_v2` (the Q2 item 4 policy) or `queued_forward_demand_v3`. It is passed to `f2_trace.qualify_window` unchanged.
+- **Engines.** Only hf2q cohorts carry the server phase trace, so `engine_kind` `peer` is refused (`peer cohort has no hf2q server phase trace: never Q2-certifiable`) and `ds4` is refused (`closed engine family`). Peer agents can still be dry-audited with `q2_certify.audit_agent`; ds4 runs are audited by `q2_run_audit.py`.
+
+`test_q2_certify.py` runs a synthetic N1 cohort (a fake-service agent, stub compile/test receipts, a synthetic native trace) through `q2_manifest.assemble`, `certify_cohort` and `main`, with the refusal reasons and the JSONL trace bounds.
 
 ## F2 scoreboard rendering
 

@@ -1,6 +1,12 @@
 """Independent raw-cohort audit; no inference, subprocess, tools or import actions.
 A raw protocol audit awaits independent QE: only a separately hash-bound QE
 attestation supplied by the externally frozen expected plan grants Qualified.
+
+Evidence shapes (ADR-063 Q2 item 6): the outer `server_receipt` and the `readiness`
+envelope ({health, runtime, ...}) are the ones the F2 operating90 supervisor writes; the
+q5 calibration receipt and its separate readiness files are not certifiable inputs. The
+server phase trace is the JSONL file `hf2q serve` writes under HF2Q_PHASE_TRACE_CONFIG.
+Only hf2q cohorts carry that trace, so peer and ds4 cohorts are refused, never Qualified.
 """
 from pathlib import Path
 import argparse
@@ -9,6 +15,7 @@ import json
 import os
 import re
 
+import f2_demand
 from qwen38_n1_verdict import (SSE, Invalid, loads, qualify, require, test_harness,
                               unary, wire)
 import qwen38_n1_tools as tool_source
@@ -18,6 +25,8 @@ RAW_LIMIT = 32 * 1024 * 1024
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 IDENTITY = {"model_sha256", "server_binary_sha256", "server_source", "native_version",
             "native_checksum", "tokenizer_sha256", "template_sha256", "profile_sha256"}
+# Closed f2_trace.qualify_window policies; the expected plan must name one, there is no default.
+POPULATION_POLICIES = ("ready_now_v1", "forward_demand_v2", f2_demand.POLICY)
 
 
 def digest(path):
@@ -61,6 +70,38 @@ class BoundReader:
 
     def obj(self, bound, maximum=RAW_LIMIT):
         return loads(self.raw(bound, maximum))
+
+
+class TraceFile:
+    """Hash-bound JSONL server phase trace, one record per line.
+    Its size bound is the header's own metadata quota (f2_trace.metadata_total_limit), not a
+    fixed cap. Every pass streams one bounded line at a time and re-verifies the frozen hash
+    at its end, so a multi-GB native trace is never held in memory whole."""
+    def __init__(self, reader, bound):
+        from f2_trace import EVENT_LIMIT, metadata_total_limit
+        require(isinstance(bound, dict) and set(bound) == {"path", "sha256"}, "closed BoundFile")
+        self.path, self.sha256, self.line_limit = Path(bound["path"]), bound["sha256"], EVENT_LIMIT + 1
+        require(self.path.is_absolute() and not self.path.is_symlink() and self.path.is_file()
+                and self.path == self.path.resolve(), "canonical regular evidence file")
+        with self.path.open("rb") as stream:
+            header = self.record(stream.readline(self.line_limit))
+        require(type(header) is dict and header.get("kind") == "header" and type(header.get("payload")) is dict,
+                "bound trace header required")
+        self.limit = metadata_total_limit(header["payload"])
+        require(self.path.stat().st_size <= self.limit, "phase trace exceeds its header metadata quota")
+        reader.path(bound, self.limit)
+
+    def record(self, line):
+        require(line.endswith(b"\n") and len(line) <= self.line_limit, "unterminated or over-quota trace line")
+        return loads(line)
+
+    def __iter__(self):
+        h = hashlib.sha256()
+        with self.path.open("rb") as stream:
+            for line in iter(lambda: stream.readline(self.line_limit), b""):
+                h.update(line)
+                yield self.record(line)
+        require(h.hexdigest() == self.sha256, "raw evidence hash changed")
 
 
 def replay_response(raw, request, turn, seen, engine, semantic_frames=None, *, assistant_policy=None,
@@ -265,13 +306,18 @@ def certify_cohort(cohort_manifest_path, expected_plan):
     require(expected_plan["schema"] == "hf2q.q2.expected-plan.v1"
             and expected_plan["required_cardinality"] in (1, 4), "N1/N4 separate plan")
     require(set(expected_plan["identity"]) == IDENTITY, "complete model/binary/native/template identity")
+    # Only hf2q writes the server phase trace this certificate requires (src/serve/phase_trace.rs).
+    # Peer cohorts are dry-audited with audit_agent; ds4 cohorts with q2_run_audit + native_peer_ds4_audit.
+    require(expected_plan["engine_kind"] != "peer",
+            "peer cohort has no hf2q server phase trace: never Q2-certifiable")
+    require(expected_plan["engine_kind"] == "hf2q", "closed engine family")
     required_sources = {"q2_certify.py", "qwen38_n1_verdict.py", "qwen38_n1_smoke.py",
                         "qwen38_n1_tools.py", "qwen_n4_live_smoke.py", "coding_family.py", "f2_trace.py", "f2_semantic.py"}
-    if expected_plan["engine_kind"] == "peer":
-        required_sources |= {"qwen_n4_peer.py", "family_peer.py"}
     require(required_sources <= set(expected_plan["source_files"]), "all actual audit/production sources bound")
-    require(isinstance(expected_plan["trace_scenario"], dict) and expected_plan["trace_scenario"].get("run_id") == expected_plan["run_id"],
+    scenario = expected_plan["trace_scenario"]
+    require(isinstance(scenario, dict) and scenario.get("run_id") == expected_plan["run_id"],
             "externally frozen actual trace population scenario")
+    require(scenario.get("population_policy") in POPULATION_POLICIES, "externally frozen trace population policy")
     reader = BoundReader()
     for name, expected in expected_plan["source_files"].items():
         require(Path(name).name == name and SHA.fullmatch(expected), "source whitelist name/SHA")
@@ -293,18 +339,11 @@ def certify_cohort(cohort_manifest_path, expected_plan):
     require(isinstance(outer.get("cleanup"), list) and outer["cleanup"]
             and all(c.get("reaped") is True and c.get("group_empty") is True
                     and not c.get("errors") for c in outer["cleanup"]), "raw server/client process cleanup")
-    ready = reader.obj(manifest["readiness"])
-    if expected_plan["engine_kind"] == "peer":
-        from family_peer import validate_readiness
-        require(count == 4 and set(ready) == {"health", "props", "slots"}, "raw peer readiness envelope")
-        validate_readiness(ready["health"], ready["props"], ready["slots"], expected_plan["model"],
-                           expected_plan["family"])
-    else:  # native ds4 cohorts are not Q2-certified: Q3/Q1 audit them with q2_run_audit + native_peer_ds4_audit
-        require(expected_plan["engine_kind"] == "hf2q", "closed engine family")
-        require(ready["health"]["model"] == expected_plan["model"]
-                and ready["health"]["context_length"] == 262144, "actual model/full context readiness")
-        require(ready["runtime"]["measurement_snapshot"]["process_pid"] == expected_plan["server_pid"]
-                and ready["runtime"]["serve"]["max_slots"] == count, "actual worker/slot readiness")
+    ready = reader.obj(manifest["readiness"])  # F2 supervisor envelope {health, runtime, readyz, pool_binding}
+    require(ready["health"]["model"] == expected_plan["model"]
+            and ready["health"]["context_length"] == 262144, "actual model/full context readiness")
+    require(ready["runtime"]["measurement_snapshot"]["process_pid"] == expected_plan["server_pid"]
+            and ready["runtime"]["serve"]["max_slots"] == count, "actual worker/slot readiness")
     results = {name: audit_agent(reader, refs, expected_plan, name)
                for name, refs in manifest["agents"].items()}
     whole = reader.obj(manifest["client_summary"])
@@ -349,12 +388,12 @@ def certify_cohort(cohort_manifest_path, expected_plan):
     require(type(finished_ns) is int and 0 <= started_ns < finished_ns, "real task interval")
     # F1 owns actual production trace validation; absence is Pending, never a mock PASS.
     from f2_trace import validate_trace, qualify_window
-    trace = reader.obj(manifest["trace"], 256 * 1024 * 1024)
-    trace_report = validate_trace(trace, expected_plan["identity"], expected_plan["trace_scenario"])
+    trace = TraceFile(reader, manifest["trace"])
+    trace_report = validate_trace(trace, expected_plan["identity"], scenario)
     require(isinstance(trace_report, dict) and trace_report.get("qualified") is True,
             "actual trace validator must qualify frozen progress scenario")
-    scenario = expected_plan["trace_scenario"]
-    window = qualify_window(trace, tuple(scenario["composition"]), scenario["arrival_ns"])
+    window = qualify_window(trace, tuple(scenario["composition"]), scenario["arrival_ns"],
+                            population_policy=scenario["population_policy"])
     require(window.get("status") == "Qualified", "actual admitted-slot population/progress not qualified")
     from f2_semantic import slot_semantic_summary
     report = dict(schema="hf2q.q2.certification.v1", cohort_id=manifest["cohort_id"],

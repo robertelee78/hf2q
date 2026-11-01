@@ -3,6 +3,7 @@
 No HTTP overlap, scheduler phase, temporal verifier row or inflight heartbeat is
 promoted into physical batching or runnable-forward evidence.
 """
+from collections.abc import Iterable
 import json
 import f2_demand
 
@@ -45,17 +46,28 @@ def metadata_total_limit(header):
             else NATIVE_TOTAL_LIMIT)
 
 
+def records_source(records):
+    """A list, or a re-iterable whose every pass yields the same records (q2_certify's streamed JSONL file)."""
+    return type(records) is list or (isinstance(records, Iterable) and iter(records) is not records
+                                     and not isinstance(records, (str, bytes, bytearray, dict)))
+
+
 def validate_trace(records, expected_identity, scenario):
-    require(type(records) is list and len(records) >= 2, "header and final bound required")
+    """One streaming pass: no record is indexed, so a multi-GB JSONL trace is never held in memory."""
+    require(records_source(records), "header and final bound required")
     require(scenario.get("schema") == "hf2q.f2.trace-expectation.v1", "frozen trace expectation")
     submissions, drained, latest, generations, progress_positions, owners = {}, {}, {}, {}, {}, {}
     terminated = set()
     previous = 0
     size = 0
+    count = 0
+    ended = False
     header = None
     native = None
     demand = f2_demand.Validator()
     for seq, record in enumerate(records):
+        require(not ended, "finalized nonoverflowing trace required")
+        count += 1
         require(set(record) == {"schema", "seq", "at_ns", "kind", "payload"} and
                 record["schema"] == SCHEMA and type(record["seq"]) is int and record["seq"] == seq and
                 natural(record["at_ns"]) and record["at_ns"] >= previous,
@@ -187,21 +199,23 @@ def validate_trace(records, expected_identity, scenario):
             require(native is not None, "native record without explicit diagnostic configuration")
             native.consume(record, latest)
         elif kind == "end":
-            require(seq == len(records) - 1 and set(payload) == {"error", "dropped_events"} and
+            require(set(payload) == {"error", "dropped_events"} and
                     payload["error"] is None and payload["dropped_events"] == 0,
                     "finalized nonoverflowing trace required")
+            ended = True
         else:
             raise ValueError("unknown trace event")
+    require(count >= 2, "header and final bound required")
     demand.finish(header)
-    require(records[-1]["kind"] == "end", "missing final trace: no truncation qualification")
+    require(ended, "missing final trace: no truncation qualification")
     if native is not None:
         require(not submissions and not drained, "legacy CB-union rows cannot replace native operator witnesses")
         report = native.finish()
-        return {"schema": SCHEMA, "status": "Qualified", "qualified": True, "events": len(records),
+        return {"schema": SCHEMA, "status": "Qualified", "qualified": True, "events": count,
                 "bytes": size, "diagnostic_only": True, "primary_native_trace": "NotCaptured",
                 "shared_batch4_claim": False, **report}
     require(submissions and submissions.keys() == drained.keys(), "missing actual submit/drain join")
-    return {"schema": SCHEMA, "status": "Qualified", "qualified": True, "events": len(records), "bytes": size,
+    return {"schema": SCHEMA, "status": "Qualified", "qualified": True, "events": count, "bytes": size,
             "submissions": len(submissions), "physical_membership": "Known",
             "shared_batch4_claim": any(len({lineage(r) for r in s["payload"]["rows"]}) == 4
                                        for s in submissions.values())}
@@ -209,33 +223,39 @@ def validate_trace(records, expected_identity, scenario):
 
 def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
                    deadline_ns=30_000_000_000, population_policy="ready_now_v1"):
-    """Called only after validate_trace; no two-second GPU completion deadline."""
+    """Called only after validate_trace; no two-second GPU completion deadline.
+    Two streaming passes over `records` (see records_source); only scheduler snapshots are retained."""
     require(composition in ((1, 0), (0, 1), (4, 0), (3, 1), (2, 2), (1, 3), (0, 4)) and
             natural(arrival_ns) and window_ns == 2_000_000_000 and deadline_ns == 30_000_000_000,
             "frozen population/window required")
     require(population_policy in ("ready_now_v1", "forward_demand_v2", f2_demand.POLICY),
             "externally frozen population policy required")
-    native_report = None
-    if "native_observer" in records[0]["payload"]:
-        # Public callers must first validate against the independently frozen
-        # expected identity/config/witness manifest; Q2 does this explicitly.
-        from f2_native_trace import NativeTrace
-        native_header = records[0]["payload"]
-        parser = NativeTrace(native_header, {"forward_witness_manifest":
-            native_header["native_observer"]["witness_manifest"]})
-        latest = {}
-        for record in records[1:]:
-            if record["kind"] == "slots":
-                latest = {lineage(slot): slot for slot in record["payload"]["slots"]}
-            elif record["kind"] in NATIVE_KINDS:
-                parser.consume(record, latest)
-        native_report = parser.finish()
+    require(records_source(records), "header and final bound required")
+    header, parser, latest, snapshots, drained, last_ns = None, None, {}, [], set(), None
+    for record in records:  # first pass: owners, native witnesses, checked drains and the final clock
+        last_ns = record["at_ns"]
+        if header is None:
+            header = record["payload"]
+            if "native_observer" in header:
+                # Public callers must first validate against the independently frozen
+                # expected identity/config/witness manifest; Q2 does this explicitly.
+                from f2_native_trace import NativeTrace
+                parser = NativeTrace(header, {"forward_witness_manifest":
+                    header["native_observer"]["witness_manifest"]})
+        elif record["kind"] == "slots":
+            snapshots.append(record)
+            latest = {lineage(slot): slot for slot in record["payload"]["slots"]}
+        elif record["kind"] in NATIVE_KINDS and parser is not None:
+            parser.consume(record, latest)
+        elif record["kind"] == "drain" and record["payload"]["success"] is True:
+            drained.add(record["payload"]["submission_id"])
+    require(header is not None, "header and final bound required")
+    native_report = None if parser is None else parser.finish()
     require(population_policy == "ready_now_v1" or native_report is not None,
             "forward demand requires actual native operator witnesses")
     if population_policy == f2_demand.POLICY:
-        require(records[0]["payload"].get("forward_demand_policy") == f2_demand.CONFIG,
+        require(header.get("forward_demand_policy") == f2_demand.CONFIG,
                 "queued demand must be frozen in actual trace configuration")
-    snapshots = [r for r in records if r["kind"] == "slots"]
     def population(record, ready_only=False):
         slots = record["payload"]["slots"]
         if len(slots) != sum(composition):
@@ -286,7 +306,7 @@ def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
         return {"status": "Unqualified", "reason": "no source-qualified population within deadline"}
     first = candidates[0]
     start, end = first["at_ns"], first["at_ns"] + window_ns
-    require(records[-1]["at_ns"] >= end, "trace ends before entire frozen window")
+    require(last_ns >= end, "trace ends before entire frozen window")
     coverage = 0
     ready_coverage = 0
     intervals = [r for r in snapshots if start <= r["at_ns"] < end]
@@ -297,8 +317,6 @@ def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
             ready_coverage += b["at_ns"] - a["at_ns"]
     admitted = {lineage(s) for s in first["payload"]["slots"]}
     progress = set()
-    drained = {r["payload"]["submission_id"] for r in records
-               if r["kind"] == "drain" and r["payload"]["success"] is True}
     for r in records:
         if not start <= r["at_ns"] <= end:
             continue

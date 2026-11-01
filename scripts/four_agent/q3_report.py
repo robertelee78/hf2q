@@ -224,8 +224,11 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
             state["peer_unavailable"] = {"reason": native_peer_ds4.SAME_GGUF_UNAVAILABLE,
                                          "evidence": plan["peer_unavailable_evidence"]}
         verdict, reasons = q3_stats.family_verdict(state)
+    # Default mode: a control stage that halts the campaign (Invalid, IdentityDrift) does not replace the
+    # completed primary's verdict; campaign_status and the halt record travel with it into every row note.
     result = {"schema": VERDICT_SCHEMA, "family": plan["family"], "campaign_sha256": campaign_sha256,
             "identities_sha256": manifest["identities_sha256"], "campaign_status": manifest["status"],
+            "halted": manifest.get("halted"),
             "verdict": verdict, "reasons": reasons, "primary_workload": plan["primary"],
             "primary": None if record else report[plan["primary"]],
             **({"primary_of_record": primary_of_record(manifest, record)} if record else {}),
@@ -317,7 +320,7 @@ def rows(campaign_dir, evidence_root):
                 "verification": {"state": "Verified", "key": f"verdict.json {path}.improvement_percent",
                                  "extract": {"value": {"kind": "json", "file": ref, "path": f"{path}.improvement_percent", "reduce": "one"},
                                              "ci95": {"kind": "json", "file": ref, "path": f"{path}.improvement_ci95.*", "reduce": "list"}}},
-                "note": (f"Q3 verdict {verdict['verdict']}; " if control is None else
+                "note": (f"Q3 verdict {verdict['verdict']}, campaign {verdict['campaign_status']}; " if control is None else
                          f"Q3 control {control} (client --phase-plan {stage['phase_plan']}) of the primary of record "
                          f"{control_of}; never a win or loss; ")
                         + f"{e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "

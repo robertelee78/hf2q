@@ -115,7 +115,8 @@ The `n1` and mixed-phase stages are reported in `verdict.json` `controls` with t
   - unavailable arms with their evidence, and the halt state.
 - Q5 run directories are under `runs/`, and the derived cases are under `cases/<workload>-<arm>.json`. The `n4` case files are exact copies of the source cases.
 - `verdict.json` (`hf2q.adr063.q3-verdict.v1`) contains:
-  - the family verdict and its reasons;
+  - the family verdict and its reasons, the campaign status (`campaign_status`) and the halt record (`halted`: entry, reason, resumable);
+  - in a default campaign, a control stage that halts the campaign (for example `Invalid` after the primary completed) does not replace the primary verdict: `verdict` stays the primary's, while `campaign_status` and `halted` record the halt, and every primary row note states `Q3 verdict <verdict>, campaign <status>`;
   - primary effects with CIs, secondary effects and per-arm summaries (median makespan and goodput, memory, maximum observed thermal state);
   - controls, failures, peer status, quality inputs and patch-review status;
   - rejected trials (Invalid, Abandoned, Skipped or not-started attempts), the number of discarded warmups, and the predeclared design.
