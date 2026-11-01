@@ -4,6 +4,7 @@ import json
 import statistics
 from pathlib import Path
 
+import native_peers
 import q3_metrics
 import q3_stats
 
@@ -169,12 +170,14 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
              "thermal_valid": False if False in thermal else (True if thermal and None not in thermal else None),
              "memory_valid": all(e["metrics"]["memory"]["q5_pass"] for e in measured
                                  if e["arm"] == "experiment" and e["outcome"] == "Pass")}
-    native = plan["arms"].get("peer", {}).get("engine_kind") == "ds4"
-    if native:  # the same-GGUF peer is unavailable; the native ds4 arm is reported separately
-        import native_peer_ds4
-        state["peer_unavailable"] = {"reason": native_peer_ds4.SAME_GGUF_UNAVAILABLE,
+    native = native_peers.peer_kind(plan)
+    comparison = plan.get("native_comparison")
+    if native:  # the native arm never yields the same-GGUF verdict; it is reported separately as native_peer
+        state["peer_unavailable"] = {"reason": comparison or native_peers.adapter(native).SAME_GGUF_UNAVAILABLE,
                                      "evidence": plan["peer_unavailable_evidence"]}
     verdict, reasons = q3_stats.family_verdict(state)
+    if comparison and verdict == "Unavailable":
+        reasons = [comparison]
     result = {"schema": VERDICT_SCHEMA, "family": plan["family"], "campaign_sha256": campaign_sha256,
             "identities_sha256": manifest["identities_sha256"], "campaign_status": manifest["status"],
             "verdict": verdict, "reasons": reasons, "primary_workload": plan["primary"],
@@ -190,9 +193,10 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
             "design": plan["design"], "declared": plan["declared"],
             "independent_review_required": True}
     if native:
-        import native_peer_ds4_audit
-        result["native_peer"] = native_peer_ds4_audit.q3_section(primary, manifest,
-                                                                 plan["declared"]["experiment"]["label"])
+        result["native_peer"] = native_peers.audit(native).q3_section(primary, manifest,
+                                                                      plan["declared"]["experiment"]["label"])
+    if comparison:
+        result.update(campaign_label="native-comparison campaign; not the verdict of record", verdict_of_record=False)
     return result
 
 
@@ -206,14 +210,17 @@ def rows(campaign_dir, evidence_root):
     family, plan = manifest["plan"]["family"], manifest["plan"]
     arms = manifest["identities"]["arms"]
     peer_arm = plan["arms"].get("peer", {})
-    native_label = peer_arm.get("label") if peer_arm.get("engine_kind") == "ds4" else None
+    native = native_peers.peer_kind(plan)
+    native_label = peer_arm.get("label") if native else None
+    comparison = "native-comparison campaign; not the verdict of record" if plan.get("native_comparison") else None
     peer_note = (f"{native_label}; different artifact, task makespan only, not the same-GGUF peer verdict"
                  if native_label else "peer best valid configuration")
     if native_label:
-        from native_peer_ds4_audit import note as native_note
+        native_note = native_peers.audit(native).note
     ref = "$E/" + str((campaign_dir / "verdict.json").relative_to(root))
-    group = f"{family}-q3"
-    out = {"groups": {group: {"family": family, "title": f"{family} Q3 three-arm campaign",
+    group = f"{family}-q3" if comparison is None else f"{family}-q3-{native_peers.baseline_of(native, native_label).replace('_', '-')}"
+    out = {"groups": {group: {"family": family, "title": f"{family} Q3 three-arm campaign"
+                                                         + (f" ({comparison})" if comparison else ""),
                               "workload": "Four-agent coding client, 262144 context, 4 slots; stock "
                                           f"{plan['declared']['stock']['label']} vs experiment "
                                           f"{plan['declared']['experiment']['label']} vs "
@@ -224,7 +231,8 @@ def rows(campaign_dir, evidence_root):
         return out
     if not arms["experiment"]["artifact"] or not arms["experiment"]["artifact"].get("sha256"):
         raise ValueError("F2 rows need the model sha256 (conversion receipt or HF2Q_Q5_MODEL_SHA256)")
-    for name, baseline in (("vs_stock", "hf2q_current"), ("vs_peer", "ds4_native" if native_label else "peer")):
+    for name, baseline in (("vs_stock", "hf2q_current"),
+                           ("vs_peer", native_peers.baseline_of(native, native_label) if native_label else "peer")):
         e = verdict["primary"]["effects"].get(name)
         withheld = native_label and (verdict.get("native_peer") or {}).get("statement_withheld")
         if e is None or e["improvement_percent"] is None or (name == "vs_peer" and (
@@ -234,7 +242,7 @@ def rows(campaign_dir, evidence_root):
         out["rows"].append({
             "id": f"{group}-makespan-{name.replace('_', '-')}", "family": family, "group": group,
             "metric": "makespan_s", "kind": "effect", "arm": "candidate",
-            "variant": f"Q3 experiment {plan['declared']['experiment']['label']}",
+            "variant": f"Q3 experiment {plan['declared']['experiment']['label']}" + (f" ({comparison})" if comparison else ""),
             "value": round(e["improvement_percent"], 3), "decimals": 3, "unit": "% improvement",
             "ci95": [round(x, 3) for x in e["improvement_ci95"]], "baseline_arm": baseline,
             "n_slots": 4, "context": "262144", "date": manifest["created_utc"][:10],
@@ -243,7 +251,8 @@ def rows(campaign_dir, evidence_root):
             "verification": {"state": "Verified", "key": f"verdict.json {path}.improvement_percent",
                              "extract": {"value": {"kind": "json", "file": ref, "path": f"{path}.improvement_percent", "reduce": "one"},
                                          "ci95": {"kind": "json", "file": ref, "path": f"{path}.improvement_ci95.*", "reduce": "list"}}},
-            "note": f"Q3 verdict {verdict['verdict']}; {e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
+            "note": (f"{comparison}. " if comparison else "")
+                    + f"Q3 verdict {verdict['verdict']}; {e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
                     f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else peer_note})."
                     + (f" {native_note(verdict['native_peer'])}." if name == "vs_peer" and native_label else "")})
     return out

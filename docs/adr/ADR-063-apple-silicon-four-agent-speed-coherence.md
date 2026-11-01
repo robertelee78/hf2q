@@ -633,8 +633,10 @@ The operator approved native-engine peers as separately labeled benchmark arms:
 antirez ds4, TensorFold and oMLX. Each runs its own native artifact, not the
 hf2q GGUF. This section records the ds4 arm (`engine_kind ds4`,
 `scripts/four_agent/native_peer_ds4.py`,
-`q5_cases/native-ds4-deepseek4.json`). The TensorFold and oMLX arms are
-recorded when their adapters land.
+`q5_cases/native-ds4-deepseek4.json`) and the TensorFold arm (`engine_kind
+tensorfold`, below). The oMLX arm is recorded when its adapter lands. Every
+consumer resolves a native kind through one registry,
+`scripts/four_agent/native_peers.py`.
 
 - **The DeepSeek-V4 same-GGUF peer stays Unavailable.** Both runs
   `$E/peer-arms-v1/peer-deepseek4-20261030T165847Z` and
@@ -695,6 +697,61 @@ recorded when their adapters land.
     sha256 of its body.
   - ds4 cohorts are not Q2-certified (`q2_certify.py` refuses them). Q3/Q1
     audit every ds4 Pass with the trace audit instead.
+
+**TensorFold arm (operator approval 2026-10-31).** TensorFold 1157ea5b
+(version 1.2.0) serves Qwen3.8 27B from its own MLX 4-bit checkpoint,
+`TensorFold/Qwen3.8-27B-MLX-4bit@22d8d538`. Two cases are recorded:
+without a drafter (`q5_cases/native-tensorfold-qwen38.json`) and with the
+stock DFlash2 drafter `z-lab/Qwen3.8-27B-DFlash2@50307d4c`
+(`native-tensorfold-qwen38-dflash2.json`). The two argv differ only by
+`--drafter DIR --drafter-bits 4`.
+
+- **It never produces the same-GGUF verdict.** Qwen3.8's same-GGUF peer is
+  runnable, so TensorFold runs only in a separate Q3 campaign declared with
+  `--native-comparison`. Its `verdict.json` and F2 rows are labeled
+  "native-comparison campaign; not the verdict of record". `native_peer`
+  carries the task-makespan-only statement, under the same rules as ds4: never
+  a win, withheld on failures or a missing audit. F2 baselines are
+  `tensorfold_native` and `tensorfold_dflash2_native`.
+- **Request parity is explicit.** The adapter sends greedy sampling,
+  thinking on, and `reasoning_effort: "xhigh"`. That is the effort hf2q
+  renders: its Qwen3.8 template has the same bytes as TensorFold's
+  `chat_template.jinja`, and it defaults to xhigh. The adapter also sends hf2q's
+  2048/512 thinking ceilings as `thinking_budget`, and leaves
+  `parallel_tool_calls` unsent. With `false`, TensorFold would silently drop
+  extra calls; unsent, the client refuses them. TensorFold ignores unknown
+  request fields, so the adapter enforces its own closed envelope.
+- **These differences are recorded, not hidden:**
+  - no repetition penalty (hf2q uses 1.05);
+  - a different forced thinking close;
+  - no tool grammar;
+  - an unlogged closing of tool calls cut by an end token;
+  - a re-saved `tokenizer.json`. Per-turn TensorFold token ids are archived
+    for the hf2q token oracle.
+- **Identity is bound end to end.** The client binds:
+  - the binary sha256 and the pinned commit and version;
+  - the snapshot revisions, through the HF cache layout and
+    `/v1/benchmark/manifest`;
+  - `config_sha256` and `tokenizer_sha256`, recomputed locally with
+    TensorFold's framing;
+  - the exact server argv;
+  - `/health` (4 lanes) and `/v1/models` (262144 context);
+  - the startup lines for streams, context, drafter state, reserve and
+    prompt cache;
+  - every turn's rendered prompt, via `/tokenize` (count equals
+    `usage.prompt_tokens`).
+
+  The post-run audit binds each reply to TensorFold's own `done` line
+  (thinking, effort, tokens, finish, draft counters).
+- **Memory may not fit.** Four 262144-token bf16 slots plus weights and the
+  margin come to about 96–106 GiB against Metal's working set. `--parallel 4`
+  refuses rather than shrinking. The first calibration decides whether the arm
+  runs at full context.
+- **D2 (#365) uses both cases as T0 and T2.** The two arms are compared in this
+  order: four-slot task completion, then quality, then memory (Q5 verdict,
+  startup reserve, `/health` memory, slot waits), then net makespan.
+  Accepted-per-drafted and tokens-per-round counts explain the result but never
+  decide it.
 
 This decision establishes no speed win and changes no same-GGUF verdict.
 

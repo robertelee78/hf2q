@@ -18,7 +18,8 @@ from coding_family import preflight as family_preflight, validate_binding, valid
 from q2_certify import replay_response
 from qwen38_n1_smoke import PREFLIGHT, build_request, exchange
 from qwen38_n1_verdict import SSE, Invalid, unary, usage as verdict_usage, wire
-from qwen_n4_live_smoke import MODULES, NATIVE_MODULES, preflight as n4_preflight, validate_preflight
+from native_peer_ds4 import CLIENT_MODULES as NATIVE_MODULES
+from qwen_n4_live_smoke import MODULES, preflight as n4_preflight, validate_preflight
 
 HERE = Path(__file__).resolve().parent
 CASE = HERE / 'q5_cases' / 'native-ds4-deepseek4.json'

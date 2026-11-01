@@ -69,9 +69,9 @@ def approval(args):
     if args.engine_kind == "peer":
         from family_peer import preflight as peer_preflight
         keys = peer_preflight(keys, args.family)
-    elif args.engine_kind == "ds4":
-        from native_peer_ds4 import preflight as native_preflight
-        keys = native_preflight(keys, args.family)
+    elif args.engine_kind in family_contract.NATIVE_KINDS:
+        from native_peers import adapter
+        keys = adapter(args.engine_kind).preflight(keys, args.family)
     require(set(packet.get("preflight", {})) == keys and
             all(v is True for v in packet["preflight"].values()), "preflight unknown")
     require(packet.get("sandbox_proof_sha256") == args.sandbox_proof_sha256,
@@ -85,12 +85,14 @@ def approval(args):
         "qwen38_n1_verdict.py", "test_qwen38_n1_verdict.py",
         "coding_family.py", "test_coding_family.py", "f2_semantic.py")]
     if n4:
-        from qwen_n4_live_smoke import NATIVE_MODULES
+        native = ()
+        if args.engine_kind in family_contract.NATIVE_KINDS:
+            from native_peers import adapter
+            native = adapter(args.engine_kind).CLIENT_MODULES
         source_paths += [Path(__file__).with_name(n) for n in
                          ("qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py",
                           "qwen_n4_peer.py", "test_qwen_n4_peer.py",
-                          "family_peer.py", "test_family_peer.py")
-                         + (NATIVE_MODULES if args.engine_kind == "ds4" else ())]
+                          "family_peer.py", "test_family_peer.py") + native]
     if getattr(args, "benchmark_profile", None) is not None:
         from gemma_matched_profile import EXTRA_MODULES, validate_activation
         validate_activation(args.benchmark_profile, packet, args.family, args.engine_kind, args.diagnostic_slots)
@@ -140,13 +142,13 @@ def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf
                "tool_choice": "auto", "max_completion_tokens": 8192,
                "logprobs": False, "hf2q_overflow_policy": "reject", "stream": turn % 2 == 1}
     family_contract.request_controls(request, family)
-    require(engine_kind in ("hf2q", "peer", "ds4"), "unknown request engine")
+    require(engine_kind in family_contract.ENGINE_KINDS, "unknown request engine")
     if engine_kind == "peer":
         from family_peer import request_controls as peer_request_controls
         request = peer_request_controls(request, family)
-    elif engine_kind == "ds4":
-        from native_peer_ds4 import request_controls as native_request_controls
-        request = native_request_controls(request, family)
+    elif engine_kind in family_contract.NATIVE_KINDS:
+        from native_peers import adapter
+        request = adapter(engine_kind).request_controls(request, family)
     if request["stream"]:
         request["stream_options"] = {"include_usage": True}
     return request
@@ -155,10 +157,11 @@ def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf
 def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen", on_first_token=None):
     """`on_first_token(monotonic_ns)` runs once, at the first streamed reasoning or semantic token."""
     if engine_kind != "hf2q":
-        if engine_kind == "ds4":
-            from native_peer_ds4 import canonical
-        else:
+        if engine_kind == "peer":
             from family_peer import canonical
+        else:
+            from native_peers import adapter
+            canonical = adapter(engine_kind).canonical
         # Validate the unchanged canonical envelope (native fields must be the
         # adapter's exact values), then serialize the actual native-engine wire.
         wire(canonical(request, family), family)
@@ -289,7 +292,7 @@ def main():
     for name in ("agent-id", "run-id", "barrier-dir", "barrier-token"):
         parser.add_argument("--" + name)
     parser.add_argument("--family", choices=family_contract.FAMILIES, default="qwen")
-    parser.add_argument("--engine-kind", choices=("hf2q", "peer", "ds4"), default="hf2q")
+    parser.add_argument("--engine-kind", choices=family_contract.ENGINE_KINDS, default="hf2q")
     parser.add_argument("--benchmark-profile", choices=("gemma-matched-v1",))
     parser.add_argument("--instance", type=int, help="N4 quality-campaign task instance (coding_instances.py)")
     parser.add_argument("--phase-plan", help="Q3 phase plan from the four-agent coordinator (qwen_n4_live_smoke.py)")
@@ -398,6 +401,11 @@ def main():
         summary["workflow_sha256"] = hashlib.sha256(workflow.encode()).hexdigest()
         summary["full_prefix_reuse"] = "PendingPostOracle"
         summary["runtime_qualified"] = False
+        if args.engine_kind in family_contract.NATIVE_KINDS:
+            from native_peers import adapter
+            after_task = adapter(args.engine_kind).after_task
+            if after_task is not None:  # native per-run proof, after the task clock (outside the makespan)
+                summary["native_render"] = after_task(args.base_url, output, summary["turns"])
     except BaseException as exc:
         summary["status"] = "Failed"
         summary["error"] = f"{type(exc).__name__}: {exc}"

@@ -28,6 +28,7 @@ import subprocess
 import sys
 
 import coding_instances
+import native_peers
 import q2_run_audit
 import q5_case
 
@@ -39,9 +40,9 @@ TABLE = "{REPO}/scripts/four_agent/fixtures/coding-instances.json"
 SUCCESS = "FourAgentProtocolCompleteAwaitingIndependentReview"
 # Supervisor stops that are the arm's own failure once the task has started.
 ARM_FAILURE_STOPS = ("server_exited", "client_timeout")
-# Reference kind -> the reference client's --engine-kind. "ds4-native" is the separately labeled
-# native ds4 arm (different artifact; native_peer_ds4.py), never the same-GGUF peer.
-REFERENCE_KINDS = {"peer": "peer", "stock-hf2q": "hf2q", "ds4-native": "ds4"}
+# Reference kind -> the reference client's --engine-kind. "<kind>-native" is a separately labeled
+# native-engine arm (different artifact; native_peers.py), never the same-GGUF peer.
+REFERENCE_KINDS = {"peer": "peer", "stock-hf2q": "hf2q", **{f"{kind}-native": kind for kind in native_peers.KINDS}}
 OVERRIDE = q5_case.OVERRIDE_PREFIX
 
 # Port of q1_decision_policy.py `paired` (hf2q.q1.numeric-policy.v1,
