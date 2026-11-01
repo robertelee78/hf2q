@@ -95,9 +95,11 @@ For window width w in 1..4, FFN mode (`SharedWeights` padded or `SerialBuilder` 
 
 Every hardware run MUST record source commit, binary SHA-256, artifact digest, native version and case file, and MUST pass Q5 `CalibrationPass`.
 
-A two-arm A/B MUST use one binary with arms differing only in a kill switch, ABBA-balanced paired blocks with warm-up, and a block count fixed before qualification. This ADR extends ADR-063's 5-to-20-block bound and the F2 fixed-count rule to two arms: 6 blocks by default, or 8, 12, 16 or 20 chosen from a separately labelled pilot whose runs are never pooled, with no sequential peeking. The primary effect is the paired log-makespan Student-t 95% interval, as a percentage-point reduction. **Win** requires the interval to exclude zero favourably with a half-width of at most 2.5 points; **Loss** requires exclusion in the unfavourable direction; anything else is **Inconclusive** and is never reported as neutral or as a win. Task, tool, protocol, isolation or truncation failures make a run quality-ineligible and are retained. Controls: the N=1 control's effect interval MUST lie within ±2.5 points, and mixed 3+1, 2+2 and 1+3 phases are reported.
+A two-arm A/B MUST use one binary with arms differing only in a kill switch, ABBA-balanced paired blocks with warm-up, and a block count fixed before qualification. This ADR extends ADR-063's 5-to-20-block bound and the F2 fixed-count rule to two arms: 6 blocks by default, or 8, 12, 16 or 20 chosen from a separately labelled pilot whose runs are never pooled, with no sequential peeking. The primary effect is the paired log-makespan Student-t 95% interval, as a percentage-point reduction. **Win** requires the interval to exclude zero favourably with a half-width of at most 2.5 points; **Loss** requires exclusion in the unfavourable direction; anything else is **Inconclusive** and is never reported as neutral or as a win. Task, tool, protocol, isolation or truncation failures make a run quality-ineligible and are retained. Controls: the N=1 control's effect interval MUST lie within ±2.5 points, and mixed 3+1, 2+2 and 1+3 phases are reported. **Equivalent** means the 95% interval lies entirely within ±2.5 points; it is a bounded no-difference result, distinct from Inconclusive. "The previous default" in any story means the immediately preceding default configuration of the same binary, with every other ADR-065 kill switch held at its current default.
 
 Fairness ceilings MUST be frozen from the phase-1 baseline before any candidate run: per-run, per-slot p95 semantic TTFT and per-run maximum semantic SSE gap (ADR-063 F2 estimands), each ceiling being the largest baseline value. Every candidate run and slot MUST stay at or below both ceilings; no median or pooled aggregate may hide a violating run.
+
+Execution prerequisites apply to every hardware run: one named integration owner schedules it; the host is reserved exclusively; no peer or other hf2q process is loaded; at least 60 seconds separate engine loads; the official artifacts and Q5 case files named in B1's campaign file are used; Q5 admission is re-established whenever the binary, artifact, workload or capture footprint changes.
 
 A story closes by type:
 
@@ -126,7 +128,8 @@ Acceptance:
 
 - Record the phase-1 default binary, artifact digests, native version and case files for Qwen3.8 and DeepSeek-V4.
 - Run the predeclared baseline campaign and retain per-run, per-slot p95 semantic TTFT and maximum semantic SSE gap; publish the ceilings.
-- Predeclare each later A/B's fixed block count, controls and stopping rule in a checked-in campaign file.
+- A checked-in campaign file names, per family, the official artifact path and digest, the Q5 case file, the run order, the block definition (one block is one paired A and B run; consecutive blocks alternate AB and BA so each pair of blocks forms ABBA), each later A/B's fixed block count, controls, cooldown and total run budget.
+- A checked-in two-arm analysis tool implements the fixed-count paired log-makespan interval, the Win, Loss, Equivalent and Inconclusive verdicts, the per-run fairness checks and retention of failed runs, with unit tests on synthetic receipts.
 
 Repository ownership: hf2q owns campaign files and receipts; no native change.
 
@@ -142,7 +145,7 @@ Delivery boundary: Receipts and campaign files merged to main.
 
 ### E1. Attribute joint and solo round time by stage
 
-Outcome: Qwen solo K3, Qwen joint and DeepSeek joint steps have a per-class time split whose distortion is known.
+Outcome: Qwen solo K3, Qwen joint, DeepSeek joint and Gemma 4 joint steps have a per-class time split whose distortion is known.
 
 Requirement: The program MUST attribute joint and solo round time by stage class with a supported method and quantified distortion.
 
@@ -154,7 +157,7 @@ Acceptance:
 
 Repository ownership: hf2q owns wiring and analysis; mlx-native supplies existing command-buffer timing.
 
-Validation: Profiled and unprofiled runs on the official artifacts with retained receipts.
+Validation: Profiled and unprofiled runs on the Qwen3.8, DeepSeek-V4 and Gemma 4 official artifacts with retained receipts.
 
 Predecessors: B1.
 
@@ -166,13 +169,14 @@ Delivery boundary: Diagnostic merged to main with receipts.
 
 Outcome: Complete-round wall and GPU time is known for the configurations joint verify would run.
 
-Requirement: The program MUST measure complete-round cost for active slots 1–4 and per-slot window widths 1–4, including ragged mixes, at three context buckets.
+Requirement: The program MUST measure complete-round cost for active slots 1–4 and per-slot window widths 1–4, including ragged mixes, at three context positions.
 
 Acceptance:
 
-- Configurations 4×1, 4×2, 4×3, 4×4, ragged mixes such as 4+4+1+1, and 1–3 active slots.
-- Distinct per-layer matrices; no repeated-matrix cache effects.
-- Stage split from E1 where attributable.
+- Configurations 4×1, 4×2, 4×3, 4×4, the ragged mixes 4+4+1+1 and 4+1+1+1, and 1–3 active slots with width 4, at context positions near 2k, 16k and 64k tokens.
+- Seven timed repetitions after one warm-up per configuration; distinct per-layer matrices; no repeated-matrix cache effects.
+- Stage split from E1 where attributable, including logit readback and host selection for verify windows.
+- E2 owns the full grid; E7 supplies the prototype it runs on.
 
 Repository ownership: hf2q.
 
@@ -200,7 +204,7 @@ Repository ownership: hf2q.
 
 Validation: Four-agent runs with retained receipts.
 
-Predecessors: B1, ADR-063 D1 disposition.
+Predecessors: B1, ADR-063 D1 (#364) disposition.
 
 Priority: High.
 
@@ -214,8 +218,9 @@ Requirement: The program MUST measure critical-path time of joint turns, solo tu
 
 Acceptance:
 
-- Joint-width distribution and eligible critical-path joint time per run, using the delivered `LOG_FILTER` case control.
-- f = eligible critical-path joint decode time divided by baseline makespan, with uncertainty.
+- Timestamped intervals for every joint turn, solo turn, prefill slice and idle or tool gap, joined to per-lane verify eligibility, using the delivered `LOG_FILTER` case control plus any interval events this story adds.
+- A checked-in critical-path extractor computes f = eligible critical-path joint decode time divided by baseline makespan per run, with run-clustered uncertainty.
+- Joint-width distribution per run.
 
 Repository ownership: hf2q.
 
@@ -282,7 +287,7 @@ Acceptance:
 
 - Prototype covers grouped projections, per-slot cores and per-slot capture behind a diagnostic observer; it never serves production traffic.
 - It runs only after B1, the contract above and Qwen3.8 Q5 admission are frozen.
-- Receipts give complete-round cost per configuration for E2.
+- A reproducible driver and Q5 case run the prototype; a bounded smoke receipt shows complete rounds at 4×1 and 4×4. The full grid belongs to E2.
 
 Repository ownership: hf2q.
 
@@ -302,10 +307,11 @@ Requirement: The program MUST compute the G0 projection and record go or no-go b
 
 Acceptance:
 
-- s = projected joint-turn tokens per ms of four-slot verify windows over phase-1 joint decode, from E2, E3 and E7.
+- s = (expected committed tokens per verify round, from E3's accepted-prefix histograms, divided by E2's complete-round time for the matching configuration) over phase-1 joint tokens per ms from B1's baseline, weighted by E4's configuration mix.
 - S = 1 / ((1 − f) + f / s) with f from E4.
+- Uncertainty for s, f and S comes from a run-clustered bootstrap over the input receipts, predeclared in the decision record before computation.
 - Go only if s ≥ 1.15 and S ≥ 1.05 with the lower 95% bound of S above 1.0.
-- On no-go, J4, J5, A1, A2, P3a and P3b close as not pursued; every other story stands on its own acceptance.
+- On no-go, J4, J5, J6, A1, A2, P3a and P3b close as not pursued; every other story stands on its own acceptance.
 
 Repository ownership: hf2q.
 
@@ -334,7 +340,7 @@ Repository ownership: hf2q.
 
 Validation: Existing and extended unit tests; a four-agent transcript comparison.
 
-Predecessors: none.
+Predecessors: B1 (source work may start earlier; the transcript comparison needs B1's campaign file).
 
 Priority: High.
 
@@ -356,7 +362,7 @@ Repository ownership: hf2q.
 
 Validation: Unit and official-artifact cache tests; a four-agent transcript comparison.
 
-Predecessors: J1.
+Predecessors: B1, J1.
 
 Priority: High.
 
@@ -378,56 +384,79 @@ Repository ownership: hf2q; mlx-native unchanged.
 
 Validation: Unit and official-artifact parity tests; a four-agent transcript comparison.
 
-Predecessors: E6.
+Predecessors: B1, E6.
 
 Priority: High.
 
 Delivery boundary: Merged to main.
 
-### J4. Verify every slot's window in one joint forward
+### J4. Build joint verify windows behind a default-off switch
 
-Outcome: Four-slot Qwen3.8 serving verifies each eligible slot's K3 window inside the joint step.
+Outcome: The Qwen3.8 joint step can verify each eligible slot's K3 window, proven against the numerical and transaction contract, with the feature off by default.
 
-Requirement: The program MUST verify each eligible slot's drafted window inside the joint forward under the numerical and transaction contract, behind a kill switch.
+Requirement: The program MUST build joint verify windows under the numerical and transaction contract behind a kill switch that defaults to off.
 
 Acceptance:
 
 - Joint rows become windows; projections use fixed padded groups of the width E6 proves; per-slot DeltaNet and attention run on windows with per-slot capture.
-- Joint admission accepts capture-active lanes only behind `HF2Q_QWEN_JOINT_VERIFY`; with it set to `0`, admission and served output equal phase 1.
+- Joint admission accepts capture-active lanes only when `HF2Q_QWEN_JOINT_VERIFY=1`; unset or `0`, admission and served output equal phase 1 (`ExactTranscripts`).
 - Grafted lanes and lanes outside phase-1 joint eligibility keep their existing fallback; phase-1-eligible lanes that cannot verify contribute REF(1) rows.
-- Class A cohort invariance, the Class B envelope, transaction cases (full, partial and zero acceptance mixed across lanes; EOS as accepted draft, first draft, bonus and replacement; grammar end; forced thinking close; tool trigger; length boundary; queue-drain cancellation; eight later ordinary decisions per lane) and the three failure classes pass on the official artifact.
-- Four-agent A/B against phase 1, quality and fairness per the acceptance rules.
+- Class A cohort invariance, the Class B envelope, transaction cases (full, partial and zero acceptance mixed across lanes; EOS as accepted draft, first draft, bonus and replacement; grammar end; forced thinking close; tool trigger; length boundary; queue-drain cancellation; eight later ordinary decisions per lane) and the three failure classes pass on the official artifact with the switch on.
 
 Repository ownership: hf2q.
 
-Validation: Official-artifact gates, cancel smoke and a four-agent A/B with independent verdict.
+Validation: Unit and official-artifact gates with the switch on and off.
 
 Predecessors: E8, J1, J2, J3.
 
 Priority: High.
 
-Delivery boundary: Merged to main with the default set by the A/B verdict.
+Delivery boundary: Merged to main with the switch defaulting to off.
 
-### J5. Decide whether solo K3 runs through the joint reference route
+### J5. Qualify joint verify on the four-agent workload
 
-Outcome: Solo and joint verify either share arithmetic or the difference is covered by the Class B envelope.
+Outcome: The four-agent workload has a verdict on joint verify, and the switch's default follows it.
 
-Requirement: The program MUST measure solo K3 through REF(4) against today's solo verify and record whether to migrate.
+Requirement: The program MUST qualify joint verify against the previous default on the four-agent workload and set the switch's default from the verdict.
 
 Acceptance:
 
-- Migrate only if the N=1 control's effect interval for REF(4) against today's solo verify does not show a Loss; then solo and joint transcripts for the same window are bitwise equal.
-- Otherwise record the decision and keep the Class B envelope for both routes.
+- Q5 admission for the J4 binary with the switch on, including its capture footprint.
+- Cancel smoke with the switch on.
+- Four-agent A/B against the previous default under the A/B rule, with quality and per-run fairness ceilings.
+- The default turns on only on a Win with quality and fairness passing; otherwise it stays off and the verdict is recorded.
 
 Repository ownership: hf2q.
 
-Validation: N=1 A/B and transcript comparison.
+Validation: Four-agent A/B receipts with an independent verdict.
 
-Predecessors: J4.
+Predecessors: B1, J4.
+
+Priority: High.
+
+Delivery boundary: Merged to main with the default set by the A/B verdict.
+
+### J6. Decide whether solo K3 runs through the joint reference route
+
+Outcome: A recorded decision says whether solo K3 should share arithmetic with joint verify.
+
+Requirement: The program MUST measure solo K3 through REF(4) against today's solo verify at N=1 and record whether to migrate.
+
+Acceptance:
+
+- An N=1 A/B of REF(4) against today's solo verify under the A/B rule.
+- Migration is recommended only on a Win or Equivalent verdict; on Loss or Inconclusive the decision keeps today's route and the Class B envelope covers both routes.
+- A recommended migration is a separately approved design.
+
+Repository ownership: hf2q.
+
+Validation: Independent review of the decision and its receipts.
+
+Predecessors: B1, J4.
 
 Priority: Medium.
 
-Delivery boundary: Decision record, and migration if chosen, merged to main.
+Delivery boundary: Decision record merged to main.
 
 ## A. Cost-priced row allocation
 
@@ -440,7 +469,8 @@ Requirement: The program MUST maintain a timed cost table keyed by route, quanti
 Acceptance:
 
 - Fastest of seven runs after warm-up; neighbours re-timed on dips above 3%; full re-time on drift above 15%; cached per binary hash, chip, model shape and artifact digest.
-- No interpolation across projection-group boundaries; calibration cost bounded and reported.
+- Table cost is the joint target-forward cost only (GPU and host time of the forward); drafting, catch-up and rollback are measured separately and added by A2, so each cost is charged once.
+- No interpolation across projection-group boundaries; calibration runs only at load or while idle and takes at most 60 seconds per binary, chip, model and artifact.
 
 Repository ownership: hf2q.
 
@@ -461,16 +491,16 @@ Requirement: The program MUST choose per-slot draft depth by exhaustive allocati
 Acceptance:
 
 - Per-slot conditional per-depth acceptance with cumulative products for expected tokens.
-- All 256 allocations for four slots are scored with cost from A1 plus draft, catch-up and rollback; least-recently-served tie-break; unit-tested against brute force with fairness invariants.
-- The allocator sits behind its own kill switch; switched off, behaviour equals J4's default.
+- All 256 allocations for four slots are scored with A1's forward cost plus separately measured draft, catch-up and rollback costs; least-recently-served tie-break; unit-tested against brute force with fairness invariants.
+- The allocator sits behind its own kill switch; switched off, behaviour equals the previous default.
 - MTP catch-up charging and the four-slot disable policy come from ADR-063 D1.
-- Transaction tests re-run; four-agent A/B against J4's default.
+- Transaction tests re-run; four-agent A/B against the previous default.
 
 Repository ownership: hf2q.
 
 Validation: Unit tests and a four-agent A/B with independent verdict.
 
-Predecessors: A1, ADR-063 D1 disposition.
+Predecessors: A1, J5, ADR-063 D1 (#364) disposition.
 
 Priority: Medium.
 
@@ -478,7 +508,7 @@ Delivery boundary: Merged to main with the default set by the A/B verdict.
 
 ## P. Multi-slot native primitives
 
-Each "a" story is a native primitive delivered by an mlx-native issue and PR, contract, parity tests, microbenchmark and published release. Each "b" story is the hf2q integration that pins that release exactly and closes on the hf2q integration row, behind its own kill switch.
+Each "a" story is a native primitive delivered by an mlx-native issue and PR, contract, parity tests, microbenchmark and published release; its hf2q issue tracks that work and closes when the linked mlx-native issue and PR, contract, results on both metallib paths and release checksum (or qualification-only record) are attested. Each "b" story is the hf2q integration that pins that release exactly and closes on the hf2q integration row, behind its own kill switch.
 
 ### P1a. Provide slot-indexed DeltaNet conv and gated delta net
 
@@ -600,13 +630,13 @@ Acceptance:
 
 - Exact pin of the P3a release from a clean registry build.
 - Class A cohort invariance and the Class B envelope on the official artifact.
-- Four-agent A/B against J4's default with quality and fairness.
+- Four-agent A/B against the previous default with quality and fairness.
 
 Repository ownership: hf2q.
 
 Validation: Official-artifact gates and A/B with independent verdict.
 
-Predecessors: P3a, J4.
+Predecessors: B1, P3a, J5.
 
 Priority: Medium.
 
@@ -663,14 +693,14 @@ Requirement: The program MUST decide GPU selection of untransformed greedy verif
 
 Acceptance:
 
-- Go only if E1 attributes at least 5% of the joint verify round to logit readback and host selection, and E3 shows at least 50% of verify rows untransformed.
+- Go only if E2 attributes at least 5% of the complete joint verify round to logit readback and host selection, and E3 shows at least 50% of verify rows untransformed.
 - A go decision specifies first-max ties, non-finite rows as invalid and full-logit fallback for transformed rows; implementation is a separately approved design.
 
 Repository ownership: hf2q.
 
 Validation: Independent review of the decision.
 
-Predecessors: E1, E3.
+Predecessors: E2, E3.
 
 Priority: Low.
 
@@ -750,7 +780,7 @@ Requirement: The program MUST decide Gemma 4 multi-slot attention by a numeric r
 
 Acceptance:
 
-- Go only if attention is the largest attributable class of Gemma's joint step in its category profile and at least 20% of that step.
+- Go only if attention is the largest attributable class of the Gemma 4 joint step in E1's profile and at least 20% of that step.
 - Any go is a separately approved successor design.
 
 Repository ownership: hf2q.
@@ -773,6 +803,8 @@ Requirement: The program MUST measure the combined default configuration against
 
 Acceptance:
 
+- A checked-in switch manifest lists every ADR-065 kill switch and its final default.
+- The all-off arm of the final binary gives `ExactTranscripts` against the B1 baseline binary on the N=1 control and one four-agent run per family.
 - One two-arm campaign per family with a merged change, using one final binary: one arm with every ADR-065 kill switch off (phase-1 behaviour), the other at the final defaults, under the A/B and fairness rules.
 - The report lists every story's disposition and states Win, Loss or Inconclusive per family.
 
@@ -780,7 +812,7 @@ Repository ownership: hf2q.
 
 Validation: Independent review of the campaign and report.
 
-Predecessors: B1, E1, E2, E3, E4, E5, E6, E7, E8, J1, J2, J3, J4, J5, A1, A2, P1a, P1b, P2a, P2b, P3a, P3b, P4a, P4b, P5, P6, F1, F2, F3.
+Predecessors: B1, E1, E2, E3, E4, E5, E6, E7, E8, J1, J2, J3, J4, J5, J6, A1, A2, P1a, P1b, P2a, P2b, P3a, P3b, P4a, P4b, P5, P6, F1, F2, F3.
 
 Priority: Medium.
 
@@ -788,7 +820,7 @@ Delivery boundary: Report merged to main.
 
 ## Coverage and sequencing
 
-B1 precedes every candidate run and every E story except E6. E6 has no predecessor; E7 needs B1 and E6; E2 needs E1 and E7. E8 decides whether J4, J5, A1, A2, P3a and P3b proceed. J1–J3 change no served output and may proceed before E8; J2 changes no joint admission. P stories follow their probes; P1b and P2b integrate into whichever joint graph is current. F stories apply their numeric rules to their traces. ADR-063 D1 precedes E3 and A2; ADR-063 D2 precedes any drafter or tree successor. C1 runs after every other story is closed; the graph shows only its leaf predecessors.
+B1 precedes every candidate run and every E story except E6. E6 has no predecessor; E7 needs B1 and E6; E2 needs E1 and E7. E8 decides whether J4, J5, J6, A1, A2, P3a and P3b proceed. J1–J3 change no served output and may proceed before E8 (their source work may start before B1; their transcript comparisons need B1); J2 changes no joint admission. J4 lands default-off; J5 sets its default. P stories follow their probes; P1b and P2b integrate into whichever joint graph is current. F stories apply their numeric rules to their traces. ADR-063 D1 (#364) precedes E3 and A2; ADR-063 D2 (#365) precedes any drafter or tree successor. C1 runs after every other story is closed; the graph shows only its leaf predecessors.
 
 ```mermaid
 flowchart LR
@@ -796,23 +828,27 @@ flowchart LR
   E6 --> E7 --> E2
   E1 --> E2
   E1 & E2 & E3 & E4 & E7 --> E8
-  J1 --> J2
-  E6 --> J3
+  B1 --> J1 --> J2
+  B1 & E6 --> J3
   E8 & J1 & J2 & J3 --> J4 --> J5
+  B1 --> J2 & J5 & J6
+  J4 --> J6
   J4 --> A1 --> A2
+  J5 --> A2
   E6 --> P1a --> P1b
   E6 --> P2a --> P2b
-  B1 --> P1b & P2b & P4b
+  B1 --> P1b & P2b & P3b & P4b
   J3 --> P2b
   E6 & E8 --> P3a --> P3b
-  J4 --> P3b
+  J5 --> P3b
   E6 --> P4a --> P4b
   J1 --> P4b
-  E1 & E3 --> P5
+  E2 & E3 --> P5
   E1 & E2 --> P6
   E1 --> F1 & F3
   E1 & E5 --> F2
-  E8 & J5 & A2 & P1b & P2b & P3b & P4b & P5 & P6 & F1 & F2 & F3 --> C1
+  D1[ADR-063 D1 #364] -.-> E3 & A2
+  E8 & J6 & A2 & P1b & P2b & P3b & P4b & P5 & P6 & F1 & F2 & F3 --> C1
 ```
 
 Release placement: each story ships in the first hf2q release that contains it; the owner assigns milestones.
