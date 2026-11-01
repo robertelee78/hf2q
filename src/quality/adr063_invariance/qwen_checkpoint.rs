@@ -7,6 +7,22 @@ pub fn captures64(family: Family, trajectory: Trajectory) -> bool {
     family == Family::Qwen36
         && matches!(trajectory, Trajectory::T1Resume64 | Trajectory::T3Chunk64)
 }
+/// The one Qwen endpoint config recipe. `qwen_actual` checks it against the
+/// packet identity and the endpoint metadata prepare emits its digest. `cfg`
+/// is `Qwen35Config::from_gguf` (or the loaded model config) exactly as
+/// parsed: no context override.
+pub fn endpoint_recipe(family: Family, capacity: u32, cfg: &Qwen35Config)
+    -> super::acquisition::ConfigRecipe<'static> {
+    super::acquisition::ConfigRecipe {
+        family,
+        capacity: capacity as u64,
+        slots: 1,
+        output_allowance: 0,
+        cache_mode: "QwenTQ8",
+        route: "endpoint",
+        actual_model_config_sha256: super::store::hash(format!("{cfg:?}").as_bytes()),
+    }
+}
 pub fn expected_cache(cfg: &Qwen35Config, family: Family, trajectory: Trajectory,
     capacity: u32, mtp_positions: [usize; 2]) -> Result<Vec<ExpectedTensor>> {
     ensure!(matches!((family,cfg.variant),

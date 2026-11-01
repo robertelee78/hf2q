@@ -78,15 +78,11 @@ fn q1_qwen_actual_endpoint_trace() {
     acquisition_scope
         .check_config(
             &packet.identity,
-            &super::acquisition::ConfigRecipe {
-                family: packet.identity.family,
-                capacity: packet.configured_capacity as u64,
-                slots: 1,
-                output_allowance: 0,
-                cache_mode: "QwenTQ8",
-                route: "endpoint",
-                actual_model_config_sha256: hash(format!("{:?}", &header_cfg).as_bytes()),
-            },
+            &super::qwen_checkpoint::endpoint_recipe(
+                packet.identity.family,
+                packet.configured_capacity,
+                &header_cfg,
+            ),
         )
         .unwrap();
     let preplanned_cache = super::qwen_checkpoint::expected_cache(&header_cfg,
@@ -102,15 +98,11 @@ fn q1_qwen_actual_endpoint_trace() {
     acquisition_scope
         .check_config(
             &packet.identity,
-            &super::acquisition::ConfigRecipe {
-                family: packet.identity.family,
-                capacity: packet.configured_capacity as u64,
-                slots: 1,
-                output_allowance: 0,
-                cache_mode: "QwenTQ8",
-                route: "endpoint",
-                actual_model_config_sha256: hash(format!("{:?}", &model.cfg).as_bytes()),
-            },
+            &super::qwen_checkpoint::endpoint_recipe(
+                packet.identity.family,
+                packet.configured_capacity,
+                &model.cfg,
+            ),
         )
         .unwrap();
     model.ensure_gpu_cache_primed().unwrap();

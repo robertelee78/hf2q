@@ -315,3 +315,6 @@ mod continuation;
 
 #[path = "q1_qwen_cancel/prepare.rs"]
 mod prepare;
+
+#[path = "q1_qwen_cancel/endpoint_prepare.rs"]
+mod endpoint_prepare;

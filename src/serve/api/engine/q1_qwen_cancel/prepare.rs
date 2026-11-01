@@ -7,7 +7,7 @@ use crate::adr063_invariance::{
 };
 use crate::inference::models::qwen35::{Qwen35Config, Qwen35Variant};
 use anyhow::{ensure, Context, Result};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -16,22 +16,22 @@ use std::{
 };
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ModelBinding {
-    path: PathBuf,
-    retained_full_sha256: String,
-    file_identity: FileIdentity,
+pub(super) struct ModelBinding {
+    pub(super) path: PathBuf,
+    pub(super) retained_full_sha256: String,
+    pub(super) file_identity: FileIdentity,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Config {
-    model: ModelBinding,
-    full_content_receipt: FileBinding,
-    tokenizer: FileBinding,
-    template: FileBinding,
-    workload: FileBinding,
-    expected_exporter_source_commit: String,
-    expected_exporter_binary_sha256: String,
-    output: PathBuf,
+pub(super) struct Config {
+    pub(super) model: ModelBinding,
+    pub(super) full_content_receipt: FileBinding,
+    pub(super) tokenizer: FileBinding,
+    pub(super) template: FileBinding,
+    pub(super) workload: FileBinding,
+    pub(super) expected_exporter_source_commit: String,
+    pub(super) expected_exporter_binary_sha256: String,
+    pub(super) output: PathBuf,
 }
 fn exact_hex(value: &str, length: usize) -> bool {
     value.len() == length
@@ -67,7 +67,7 @@ fn recipe_values(cfg: &Qwen35Config, work: &Workload) -> Result<(String, String,
         recipe_json,
     ))
 }
-fn output_preflight(output: &std::path::Path) -> Result<()> {
+pub(super) fn output_preflight(output: &std::path::Path) -> Result<()> {
     ensure!(
         output.is_absolute() && !output.ancestors().any(|p| p.join(".git").exists()),
         "private output outside Git"
@@ -86,16 +86,33 @@ fn output_preflight(output: &std::path::Path) -> Result<()> {
 fn q1_qwen_continuation_metadata_packet_prepare() {
     run().unwrap();
 }
-fn run() -> Result<()> {
-    let path = PathBuf::from(
-        std::env::var_os("HF2Q_Q1_QWEN_PREP_CONFIG").context("explicit metadata config")?,
-    );
+/// Bounded config read from one explicit env var (1 MiB), raw bytes retained.
+pub(super) fn read_config<T: DeserializeOwned>(var: &str) -> Result<(Vec<u8>, T)> {
+    let path = PathBuf::from(std::env::var_os(var).context("explicit metadata config")?);
     let mut raw = Vec::new();
     File::open(path)?
         .take(1024 * 1024 + 1)
         .read_to_end(&mut raw)?;
     ensure!(raw.len() <= 1024 * 1024, "metadata config bound");
-    let config: Config = serde_json::from_slice(&raw)?;
+    let config = serde_json::from_slice(&raw)?;
+    Ok((raw, config))
+}
+/// Every bound input of one Qwen metadata prepare, read once; header only.
+pub(super) struct Bound {
+    pub(super) source: &'static str,
+    pub(super) binary: String,
+    pub(super) full_receipt: Vec<u8>,
+    pub(super) tokenizer: Vec<u8>,
+    pub(super) template: Vec<u8>,
+    pub(super) vectors: Vec<u8>,
+    pub(super) work: Workload,
+    pub(super) file: File,
+    pub(super) before: FileIdentity,
+    pub(super) header: mlx_native::gguf::GgufFile,
+    /// `Qwen35Config::from_gguf` exactly as parsed; no context override.
+    pub(super) header_cfg: Qwen35Config,
+}
+pub(super) fn bind(config: &Config) -> Result<Bound> {
     output_preflight(&config.output)?;
     ensure!(
         exact_hex(&config.expected_exporter_source_commit, 40)
@@ -156,49 +173,80 @@ fn run() -> Result<()> {
         header.metadata_string("tokenizer.chat_template") == Some(template_text),
         "bound template is not exact embedded model template"
     );
-    let mut cfg = Qwen35Config::from_gguf(&header)?;
+    let header_cfg = Qwen35Config::from_gguf(&header)?;
+    Ok(Bound {
+        source,
+        binary,
+        full_receipt,
+        tokenizer,
+        template,
+        vectors,
+        work,
+        file,
+        before,
+        header,
+        header_cfg,
+    })
+}
+impl Bound {
+    pub(super) fn model_unchanged(&self, when: &str) -> Result<()> {
+        ensure!(
+            FileIdentity::observed(&self.file)? == self.before,
+            "model FD changed {when}"
+        );
+        Ok(())
+    }
+    /// Recheck every bound small input after parse, then create the private
+    /// output directory and write each file exclusively.
+    pub(super) fn recheck_and_write(&self, config: &Config, files: &[(&str, &[u8])]) -> Result<()> {
+        ensure!(
+            acquisition::checked_file(&config.full_content_receipt, 16 * 1024 * 1024)? == self.full_receipt,
+            "receipt changed"
+        );
+        ensure!(
+            acquisition::checked_file(&config.tokenizer, 64 * 1024 * 1024)? == self.tokenizer,
+            "tokenizer changed"
+        );
+        ensure!(
+            acquisition::checked_file(&config.template, 1024 * 1024)? == self.template,
+            "template changed"
+        );
+        ensure!(
+            acquisition::checked_file(&config.workload, 1024 * 1024)? == self.vectors,
+            "workload changed"
+        );
+        self.model_unchanged("before metadata output")?;
+        output_preflight(&config.output)?;
+        std::fs::create_dir(&config.output)?;
+        std::fs::set_permissions(&config.output, std::fs::Permissions::from_mode(0o700))?;
+        for (name, bytes) in files {
+            let mut out = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(config.output.join(name))?;
+            out.write_all(bytes)?;
+        }
+        Ok(())
+    }
+}
+fn run() -> Result<()> {
+    let (raw, config): (_, Config) = read_config("HF2Q_Q1_QWEN_PREP_CONFIG")?;
+    let b = bind(&config)?;
+    let (source, binary, work) = (b.source, &b.binary, &b.work);
+    let (tokenizer, template, vectors, before, header) =
+        (&b.tokenizer, &b.template, &b.vectors, &b.before, &b.header);
+    let mut cfg = b.header_cfg.clone();
     cfg.max_position_embeddings = 262144;
     let (config_debug_sha256, config_sha256, token_vectors_sha256, recipe_json) =
-        recipe_values(&cfg, &work)?;
-    ensure!(
-        FileIdentity::observed(&file)? == before,
-        "model FD changed while reading metadata"
-    );
+        recipe_values(&cfg, work)?;
+    b.model_unchanged("while reading metadata")?;
     // Retain bounded source-bound inputs for independent review. Hashes are
     // raw file identities, not a claimed HTTP semantic/tokenizer attestation.
-    let value = serde_json::json!({"schema":"hf2q.q1.qwen-continuation-packet-preparation.v1","exporter_source_commit":source,"exporter_binary_sha256":binary,"native_version":env!("HF2Q_MLX_NATIVE_VERSION"),"native_checksum_verification":"external registry/build composition required","header_data_offset":header.tensor_data_offset(),"config_input_sha256":hash(&raw),"family":work.family,"model_path":config.model.path,"model_file_identity":before,"model_full_sha256_retained":config.model.retained_full_sha256,"model_payload_rehashed":false,"full_content_receipt_path":config.full_content_receipt.path,"full_content_receipt_sha256":config.full_content_receipt.sha256,"tokenizer_file_sha256":hash(&tokenizer),"template_file_sha256":hash(&template),"workload_file_sha256":hash(&vectors),"token_vectors_sha256":token_vectors_sha256,"actual_qwen_config_debug":format!("{cfg:?}"),"actual_qwen_config_debug_sha256":config_debug_sha256,"config_sha256":config_sha256,"recipe":serde_json::from_str::<serde_json::Value>(&recipe_json)?,"configured_context":262144,"output_allowance":8192,"logical_lanes":4,"tokens_per_lane":144,"prospective_tail_scope":[64,144],"model_content_identity":"retained full-content receipt +actual FD stat join, not rehashed","tokenizer_semantic_attestation":false,"execution_approved":false,"composition_reviewed":false,"acquisition_attested":false,"model_loaded":false,"device_created":false,"context_created":false,"inference_performed":false,"whole_q1_qualified":false});
+    let value = serde_json::json!({"schema":"hf2q.q1.qwen-continuation-packet-preparation.v1","exporter_source_commit":source,"exporter_binary_sha256":binary,"native_version":env!("HF2Q_MLX_NATIVE_VERSION"),"native_checksum_verification":"external registry/build composition required","header_data_offset":header.tensor_data_offset(),"config_input_sha256":hash(&raw),"family":work.family,"model_path":config.model.path,"model_file_identity":before,"model_full_sha256_retained":config.model.retained_full_sha256,"model_payload_rehashed":false,"full_content_receipt_path":config.full_content_receipt.path,"full_content_receipt_sha256":config.full_content_receipt.sha256,"tokenizer_file_sha256":hash(tokenizer),"template_file_sha256":hash(template),"workload_file_sha256":hash(vectors),"token_vectors_sha256":token_vectors_sha256,"actual_qwen_config_debug":format!("{cfg:?}"),"actual_qwen_config_debug_sha256":config_debug_sha256,"config_sha256":config_sha256,"recipe":serde_json::from_str::<serde_json::Value>(&recipe_json)?,"configured_context":262144,"output_allowance":8192,"logical_lanes":4,"tokens_per_lane":144,"prospective_tail_scope":[64,144],"model_content_identity":"retained full-content receipt +actual FD stat join, not rehashed","tokenizer_semantic_attestation":false,"execution_approved":false,"composition_reviewed":false,"acquisition_attested":false,"model_loaded":false,"device_created":false,"context_created":false,"inference_performed":false,"whole_q1_qualified":false});
     let encoded = serde_json::to_vec_pretty(&value)?;
     ensure!(encoded.len() <= 2 * 1024 * 1024, "metadata output bound");
-    // Recheck every bound small input after parse, before exclusive output.
-    ensure!(
-        acquisition::checked_file(&config.full_content_receipt, 16 * 1024 * 1024)? == full_receipt,
-        "receipt changed"
-    );
-    ensure!(
-        acquisition::checked_file(&config.tokenizer, 64 * 1024 * 1024)? == tokenizer,
-        "tokenizer changed"
-    );
-    ensure!(
-        acquisition::checked_file(&config.template, 1024 * 1024)? == template,
-        "template changed"
-    );
-    ensure!(
-        acquisition::checked_file(&config.workload, 1024 * 1024)? == vectors,
-        "workload changed"
-    );
-    ensure!(
-        FileIdentity::observed(&file)? == before,
-        "model FD changed before metadata output"
-    );
-    output_preflight(&config.output)?;
-    std::fs::create_dir(&config.output)?;
-    std::fs::set_permissions(&config.output, std::fs::Permissions::from_mode(0o700))?;
-    let mut out = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(config.output.join("prepared.json"))?;
-    out.write_all(&encoded)?;
+    b.recheck_and_write(&config, &[("prepared.json", encoded.as_slice())])?;
     println!("Q1_QWEN_CONTINUATION_METADATA_PREPARED family={:?} lanes=4 tokens=144 device=false acquisition=false execution_approved=false",work.family);
     Ok(())
 }
