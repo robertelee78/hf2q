@@ -356,10 +356,17 @@ against the vec-hybrid route. Evidence:
 - the paired 24-instance quality campaign, default (subject) against the
   kill switch (reference `stock-hf2q`, `GEMMA_WARM_TILED_ATTENTION=0`).
 
-**Default and revert rule.** On by default
-(`WARM_TILED_ATTENTION_DEFAULT`). If any of the following fails, set
-`WARM_TILED_ATTENTION_DEFAULT = false` in `gemma_live_attention.rs` before
-merging (`=0` stays the operator escape):
+**Default and revert rule.** Shipped on by default, then reverted to **off**
+(`WARM_TILED_ATTENTION_DEFAULT = false`, `=1` opts in) by the ADR-063
+quality gate on 2026-11-01. A replay of the canonical four-agent task on
+main f3e37690 (`$E/gemma-divergence-v1/solo-vs-concurrent-by-tiled.json`)
+found the tiled route changing a follow-up turn's decision, not only its
+low-order logits: after `if port == 0`, agent-3's top-2 log-probabilities
+were −0.149 (` {`) / −1.978 (` ||`) on vec-hybrid and −0.368 / −1.179 on
+tiled, and with the 1.05 repetition penalty tiled wrote ` ||` (a different,
+correct patch). Solo and four-agent cohorts were identical within each
+route, so the effect is the warm kernel, not batching. The original revert
+conditions were:
 - the bitwise gate (tiled or vec-hybrid);
 - the determinism gate;
 - the envelope's top-1 rule;
