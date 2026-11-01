@@ -245,6 +245,11 @@ the model loads.
   per-slot prefills.
 - **`0`, `off` or `false`:** kill switch; warm prefills use the vec-hybrid
   kernel (one decode-style pass per query over the whole history).
+- **`precise`:** experimental tiled route with an exact sliding-layer
+  softmax scale: Q is scaled by `log2(e)` in F32 before its single F16
+  rounding, so the d256 kernel neither rounds Q twice nor runs the softmax
+  at the F16-rounded `log2(e)` (temperature 1.000216). V and O stay F16.
+  Same chunking, 32-row threshold and joint-cohort bitwise contract as `1`.
 - **Any other value:** logs a warning and keeps the default.
 
 Installed long-prompt lanes (prompts over 4,096 tokens) keep their own

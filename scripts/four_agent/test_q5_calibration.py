@@ -472,9 +472,11 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(off['serve']['env']['WARM_TILED_ATTENTION'], '0')
         self.assertEqual(off['serve']['env']['JOINT_WARM_PREFILL'], '', 'arms are independent')
         self.assertEqual(off['serve']['env']['FULL_INPUT_CHECKPOINT'], '', 'arms are independent')
+        precise = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION': 'precise'})
+        self.assertEqual(precise['serve']['env']['WARM_TILED_ATTENTION'], 'precise')
         launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
         self.assertEqual(launcher.count('${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"}'), 2)
-        self.assertIn('0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)
+        self.assertIn('0|1|precise) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)
 
     def test_run_id_matches_client_identity_rule(self):
         for name in ('x', 'q5-qwen38-20261030T120000Z', 'a.b c' * 30):

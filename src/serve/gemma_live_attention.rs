@@ -16,7 +16,7 @@
 //! * TQ-HB V is quantized exactly as decode stores it, and the FWHT sign undo
 //!   runs once over the layer's output rows.
 //!
-//! Two kernels implement the attention step:
+//! Three kernels implement the attention step:
 //!
 //! * [`GemmaLiveKernel::TiledF16`]: compact K to dense F16, dequantize (or
 //!   compact) the active V range to F16, then tiled flash attention: d256
@@ -24,6 +24,9 @@
 //!   chunks), `flash_attn_prefill_f16_d512_resume` for global layers
 //!   (4096-query chunks). One `batch = 1` dispatch per (sequence, chunk):
 //!   no block-diagonal mask is involved.
+//! * [`GemmaLiveKernel::TiledF16Precise`]: the same route, except that the
+//!   sliding-layer Q is pre-scaled by `log2(e)` in F32 before its F16 cast
+//!   (see [`SLIDING_PRESCALED_SCALE`]).
 //! * [`GemmaLiveKernel::VecHybrid`]: `flash_attn_vec_hybrid_batched`, one
 //!   decode-style threadgroup per (query, head), in 256-query chunks split
 //!   at the 512/1024 cache-length buckets.
@@ -53,45 +56,56 @@ pub(crate) const TILED_SLIDING_QUERY_CHUNK: usize = 1024;
 /// global chunk. The split only guards direct callers of the live resume
 /// against unbounded F16 Q/O scratch.
 pub(crate) const TILED_GLOBAL_QUERY_CHUNK: usize = 4096;
-/// Warm suffixes shorter than this keep the vec-hybrid kernel under
-/// [`GemmaLiveKernel::TiledF16`]: below the 32-token batched-prefill
-/// containment boundary (ADR-040, 2026-08-14 tiny-prefill fault) the tiled
-/// route has no serving evidence, and the joint cohort never admits such a
-/// lane.
+/// Warm suffixes shorter than this keep the vec-hybrid kernel under a tiled
+/// warm kernel: below the 32-token batched-prefill containment boundary
+/// (ADR-040, 2026-08-14 tiny-prefill fault) the tiled route has no serving
+/// evidence, and the joint cohort never admits such a lane.
 pub(crate) const WARM_TILED_MIN_ROWS: usize = GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS;
+/// d256 `scale` of the [`GemmaLiveKernel::TiledF16Precise`] sliding route,
+/// whose Q is already multiplied by `log2(e)` in F32.
+///
+/// The tiled d256 kernel scales Q in F16 by `half(scale * log2(e))`
+/// (mlx-native `flash_attn_prefill.metal`, `TransformScale<T>`). At
+/// `scale = 1.0` that factor rounds to 1.4423828 instead of 1.4426950, so
+/// every sliding softmax runs at temperature 1.000216, and Q is rounded to
+/// F16 a second time. With `scale = ln 2` the in-kernel factor is exactly
+/// 1.0 (`LN_2 * LOG2_E == 1.0` in F32), so the prescaled Q keeps its single
+/// F16 rounding and the softmax is `exp2(log2(e) * q·k)`.
+pub(crate) const SLIDING_PRESCALED_SCALE: f32 = std::f32::consts::LN_2;
 
 pub(crate) const WARM_TILED_ATTENTION_ENV: &str = "HF2Q_GEMMA_WARM_TILED_ATTENTION";
 /// On by default. Revert rule: if the root's real-artifact gates or the
 /// paired quality campaign fail, set this to `false` before merging.
 const WARM_TILED_ATTENTION_DEFAULT: bool = true;
 
-fn parse_warm_tiled_switch(raw: Option<&str>) -> std::result::Result<bool, String> {
+fn default_warm_kernel() -> GemmaLiveKernel {
+    if WARM_TILED_ATTENTION_DEFAULT {
+        GemmaLiveKernel::TiledF16
+    } else {
+        GemmaLiveKernel::VecHybrid
+    }
+}
+
+fn parse_warm_tiled_switch(raw: Option<&str>) -> std::result::Result<GemmaLiveKernel, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok(WARM_TILED_ATTENTION_DEFAULT);
+        return Ok(default_warm_kernel());
     };
     match raw.to_ascii_lowercase().as_str() {
-        "1" | "on" | "true" => Ok(true),
-        "0" | "off" | "false" => Ok(false),
+        "1" | "on" | "true" => Ok(GemmaLiveKernel::TiledF16),
+        "0" | "off" | "false" => Ok(GemmaLiveKernel::VecHybrid),
+        "precise" => Ok(GemmaLiveKernel::TiledF16Precise),
         _ => Err(format!(
-            "{WARM_TILED_ATTENTION_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
+            "{WARM_TILED_ATTENTION_ENV} must be 1/on/true, 0/off/false or precise, got {raw:?}"
         )),
     }
 }
 
 fn warm_kernel_for_switch(raw: Option<&str>) -> GemmaLiveKernel {
-    let tiled = parse_warm_tiled_switch(raw).unwrap_or_else(|error| {
-        tracing::warn!(
-            error,
-            fallback = WARM_TILED_ATTENTION_DEFAULT,
-            "invalid Gemma warm tiled attention switch"
-        );
-        WARM_TILED_ATTENTION_DEFAULT
-    });
-    if tiled {
-        GemmaLiveKernel::TiledF16
-    } else {
-        GemmaLiveKernel::VecHybrid
-    }
+    parse_warm_tiled_switch(raw).unwrap_or_else(|error| {
+        let fallback = default_warm_kernel();
+        tracing::warn!(error, ?fallback, "invalid Gemma warm tiled attention switch");
+        fallback
+    })
 }
 
 /// Kernel for warm live-resume attention (single-slot resumes and joint warm
@@ -117,7 +131,7 @@ fn tiled_live_enabled() -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LiveRoute {
     kernel: GemmaLiveKernel,
-    /// Under `TiledF16`, sequences with fewer rows keep `VecHybrid`.
+    /// Under a tiled warm kernel, sequences with fewer rows keep `VecHybrid`.
     min_tiled_rows: usize,
 }
 
@@ -153,9 +167,10 @@ impl LiveRoute {
     }
 
     pub(crate) fn seq_kernel(self, rows: usize) -> GemmaLiveKernel {
-        match self.kernel {
-            GemmaLiveKernel::TiledF16 if rows >= self.min_tiled_rows => GemmaLiveKernel::TiledF16,
-            _ => GemmaLiveKernel::VecHybrid,
+        if self.kernel.is_tiled() && rows >= self.min_tiled_rows {
+            self.kernel
+        } else {
+            GemmaLiveKernel::VecHybrid
         }
     }
 
@@ -171,6 +186,10 @@ impl LiveRoute {
             (GemmaLiveKernel::VecHybrid, _) => "vec-hybrid",
             (GemmaLiveKernel::TiledF16, 0) => "tiled-f16",
             (GemmaLiveKernel::TiledF16, _) => "tiled-f16 (vec-hybrid below 32 rows)",
+            (GemmaLiveKernel::TiledF16Precise, 0) => "tiled-f16-precise",
+            (GemmaLiveKernel::TiledF16Precise, _) => {
+                "tiled-f16-precise (vec-hybrid below 32 rows)"
+            }
         }
     }
 }
@@ -205,8 +224,12 @@ fn vec_query_chunk_len(start_pos: usize, remaining: usize) -> usize {
 fn chunk_len(kernel: GemmaLiveKernel, is_ring: bool, start_pos: usize, remaining: usize) -> usize {
     match kernel {
         GemmaLiveKernel::VecHybrid => vec_query_chunk_len(start_pos, remaining),
-        GemmaLiveKernel::TiledF16 if is_ring => remaining.min(TILED_SLIDING_QUERY_CHUNK),
-        GemmaLiveKernel::TiledF16 => remaining.min(TILED_GLOBAL_QUERY_CHUNK),
+        GemmaLiveKernel::TiledF16 | GemmaLiveKernel::TiledF16Precise if is_ring => {
+            remaining.min(TILED_SLIDING_QUERY_CHUNK)
+        }
+        GemmaLiveKernel::TiledF16 | GemmaLiveKernel::TiledF16Precise => {
+            remaining.min(TILED_GLOBAL_QUERY_CHUNK)
+        }
     }
 }
 
@@ -234,7 +257,7 @@ fn chunks(
 fn stage_query_rows(kernel: GemmaLiveKernel, rows: usize) -> usize {
     rows.min(match kernel {
         GemmaLiveKernel::VecHybrid => VEC_QUERY_CHUNK,
-        GemmaLiveKernel::TiledF16 => TILED_SLIDING_QUERY_CHUNK,
+        GemmaLiveKernel::TiledF16 | GemmaLiveKernel::TiledF16Precise => TILED_SLIDING_QUERY_CHUNK,
     })
 }
 
@@ -680,7 +703,7 @@ fn encode_live_seq(
         };
 
         match kernel {
-            GemmaLiveKernel::TiledF16 => encode_tiled_chunk(
+            GemmaLiveKernel::TiledF16 | GemmaLiveKernel::TiledF16Precise => encode_tiled_chunk(
                 s,
                 reg,
                 dev,
@@ -688,6 +711,7 @@ fn encode_live_seq(
                 (attn_k, attn_v, attn_norms),
                 kv_capacity,
                 is_ring,
+                kernel == GemmaLiveKernel::TiledF16Precise,
                 keys,
                 len,
                 &q,
@@ -775,6 +799,10 @@ fn encode_live_seq(
 
 /// Tiled F16 flash attention for one chunk of one sequence: compact K,
 /// expand V to F16, attend with `batch = 1`, and write F32 rows back.
+/// `exact_sliding_scale` selects the [`SLIDING_PRESCALED_SCALE`] Q path on
+/// sliding layers ([`GemmaLiveKernel::TiledF16Precise`]); global layers are
+/// identical either way (the d512 kernel keeps Q unscaled and applies the
+/// scale in F32 after Q·K).
 #[allow(clippy::too_many_arguments)]
 fn encode_tiled_chunk(
     s: &mut GraphSession<'_>,
@@ -784,6 +812,7 @@ fn encode_tiled_chunk(
     (src_k, src_v, src_norms): (&MlxBuffer, &MlxBuffer, &MlxBuffer),
     src_capacity: usize,
     is_ring: bool,
+    exact_sliding_scale: bool,
     keys: ChunkKeys,
     len: usize,
     q: &MlxBuffer,
@@ -796,7 +825,9 @@ fn encode_tiled_chunk(
     let scratch = |elements: usize, dtype: DType, shape: Vec<usize>, what: &str| {
         // SAFETY: the compaction / dequantization / permute dispatches below
         // initialize every element the attention reads; O is fully written
-        // by the attention kernel before the cast reads it.
+        // by the attention kernel before the cast reads it. On the
+        // prescaled sliding path the O32 scratch first stages the scaled Q,
+        // fully written by the scale before the Q permute reads it.
         let buffer =
             unsafe { dev.alloc_buffer_for_overwrite(elements * dtype.size_of(), dtype, shape) };
         buffer.map_err(|e| anyhow::anyhow!("live tiled {what} scratch L{layer_idx}: {e}"))
@@ -816,8 +847,12 @@ fn encode_tiled_chunk(
     let q_f16 = scratch(len * row_elems, DType::F16, vec![nh, len, hd], "Q")?;
     let out_f16 = scratch(len * row_elems, DType::F16, vec![nh, len, hd], "O")?;
     let out_f32_head = scratch(len * row_elems, DType::F32, vec![nh, len, hd], "O32")?;
+    // The prescaled Q (`[len, nh, hd]` F32, the same element count) is staged
+    // in the O32 scratch, which nothing else touches until the O cast.
+    let prescale_q = exact_sliding_scale && is_ring;
+    let q_stage = if prescale_q { &out_f32_head } else { &q_f16 };
 
-    s.barrier_between(&[src_k, src_v, src_norms, q], &[&dense_k, &dense_v, &q_f16]);
+    s.barrier_between(&[src_k, src_v, src_norms, q], &[&dense_k, &dense_v, q_stage]);
     // `history = logical_end = kv_seq_len` copies rows `[0, kv_seq_len)`:
     // the stage is already chronological and global rows are linear.
     let rings = (src_capacity, kv_seq_len);
@@ -850,11 +885,27 @@ fn encode_tiled_chunk(
         )
         .map_err(|e| anyhow::anyhow!("live tiled V expand L{layer_idx}: {e}"))?;
     }
+    let q_rows = if prescale_q {
+        mlx_native::ops::elementwise::scalar_mul_f32(
+            s.encoder_mut(),
+            reg,
+            metal_dev,
+            q,
+            &out_f32_head,
+            len * row_elems,
+            std::f32::consts::LOG2_E,
+        )
+        .map_err(|e| anyhow::anyhow!("live tiled Q log2(e) prescale L{layer_idx}: {e}"))?;
+        s.barrier_between(&[&out_f32_head], &[&q_f16]);
+        &out_f32_head
+    } else {
+        q
+    };
     mlx_native::ops::transpose::permute_021_f32_to_f16(
         s.encoder_mut(),
         reg,
         metal_dev,
-        q,
+        q_rows,
         &q_f16,
         len,
         nh,
@@ -919,7 +970,11 @@ fn encode_tiled_chunk(
                 seq_len_q: len as u32,
                 seq_len_k: kv_seq_len as u32,
                 batch: 1,
-                scale: 1.0,
+                scale: if prescale_q {
+                    SLIDING_PRESCALED_SCALE
+                } else {
+                    1.0
+                },
                 do_causal: false,
             },
         )
@@ -982,7 +1037,7 @@ fn encode_tiled_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::models::gemma4::GemmaLiveKernel::{TiledF16, VecHybrid};
+    use crate::inference::models::gemma4::GemmaLiveKernel::{TiledF16, TiledF16Precise, VecHybrid};
 
     fn chunk_list(kernel: GemmaLiveKernel, is_ring: bool, start: usize, rows: usize) -> Vec<usize> {
         chunks(kernel, is_ring, start, rows)
@@ -1005,14 +1060,29 @@ mod tests {
         for raw in ["0", "off", "False", " 0 "] {
             assert_eq!(warm_kernel_for_switch(Some(raw)), VecHybrid, "{raw:?}");
         }
+        for raw in ["precise", "PRECISE", " Precise "] {
+            assert_eq!(warm_kernel_for_switch(Some(raw)), TiledF16Precise, "{raw:?}");
+        }
         assert!(parse_warm_tiled_switch(Some("yes")).is_err());
         // An invalid value keeps the default rather than silently reverting.
         assert_eq!(warm_kernel_for_switch(Some("yes")), TiledF16);
     }
 
     #[test]
+    fn precise_sliding_scale_makes_the_d256_prescale_exactly_one() {
+        // mlx-native `flash_attn_prefill.metal` scales Q by
+        // `half(params.scale * 1.44269504089)`; that literal is LOG2_E in F32.
+        let kernel_factor = |scale: f32| half::f16::from_f32(scale * std::f32::consts::LOG2_E);
+        // Default tiled route: the factor rounds 2.2e-4 below log2(e).
+        assert_eq!(kernel_factor(1.0).to_f32(), 1.442_382_8);
+        // Precise route: exactly 1.0, so the in-kernel Q scale is the identity.
+        assert_eq!(SLIDING_PRESCALED_SCALE * std::f32::consts::LOG2_E, 1.0);
+        assert_eq!(kernel_factor(SLIDING_PRESCALED_SCALE), half::f16::ONE);
+    }
+
+    #[test]
     fn single_slot_and_joint_cohort_always_resolve_the_same_route() {
-        for warm in [TiledF16, VecHybrid] {
+        for warm in [TiledF16, TiledF16Precise, VecHybrid] {
             for tiled_live in [true, false] {
                 let single = LiveRoute::select(None, warm, tiled_live);
                 let joint =
@@ -1029,11 +1099,13 @@ mod tests {
     fn warm_route_follows_its_switch_and_keeps_tiny_suffixes_on_vec_hybrid() {
         // `HF2Q_GEMMA_TILED_LIVE` never moves the warm route.
         for tiled_live in [true, false] {
-            let tiled = LiveRoute::select(None, TiledF16, tiled_live);
-            assert_eq!(tiled.seq_kernel(1), VecHybrid);
-            assert_eq!(tiled.seq_kernel(31), VecHybrid);
-            assert_eq!(tiled.seq_kernel(32), TiledF16);
-            assert_eq!(tiled.seq_kernel(385), TiledF16);
+            for kernel in [TiledF16, TiledF16Precise] {
+                let tiled = LiveRoute::select(None, kernel, tiled_live);
+                assert_eq!(tiled.seq_kernel(1), VecHybrid);
+                assert_eq!(tiled.seq_kernel(31), VecHybrid);
+                assert_eq!(tiled.seq_kernel(32), kernel);
+                assert_eq!(tiled.seq_kernel(385), kernel);
+            }
             let vec = LiveRoute::select(None, VecHybrid, tiled_live);
             assert_eq!(vec.seq_kernel(385), VecHybrid);
         }
@@ -1042,7 +1114,7 @@ mod tests {
     #[test]
     fn installed_lanes_keep_their_own_switch_and_tile_every_length() {
         // `HF2Q_GEMMA_WARM_TILED_ATTENTION` never moves installed lanes.
-        for warm in [TiledF16, VecHybrid] {
+        for warm in [TiledF16, TiledF16Precise, VecHybrid] {
             let on = LiveRoute::select(Some(GemmaLiveAttention::Tiled), warm, true);
             assert_eq!(on.seq_kernel(1), TiledF16, "a 4096+4096+1 tail stays tiled");
             assert_eq!(on.seq_kernel(4096), TiledF16);
@@ -1078,16 +1150,18 @@ mod tests {
 
     #[test]
     fn tiled_chunks_cover_each_sequence_in_window_and_transaction_sized_steps() {
-        // Every gate lane is one chunk on both layer kinds.
-        for (start, rows) in [(465, 56), (714, 200), (943, 311), (1254, 385)] {
-            assert_eq!(chunk_list(TiledF16, true, start, rows), [rows]);
-            assert_eq!(chunk_list(TiledF16, false, start, rows), [rows]);
+        for kernel in [TiledF16, TiledF16Precise] {
+            // Every gate lane is one chunk on both layer kinds.
+            for (start, rows) in [(465, 56), (714, 200), (943, 311), (1254, 385)] {
+                assert_eq!(chunk_list(kernel, true, start, rows), [rows]);
+                assert_eq!(chunk_list(kernel, false, start, rows), [rows]);
+            }
+            assert_eq!(chunk_list(kernel, true, 0, 2_500), [1024, 1024, 452]);
+            assert_eq!(chunk_list(kernel, false, 7, 4_096), [4096]);
+            assert_eq!(chunk_list(kernel, false, 7, 9_000), [4096, 4096, 808]);
         }
-        assert_eq!(chunk_list(TiledF16, true, 0, 2_500), [1024, 1024, 452]);
-        assert_eq!(chunk_list(TiledF16, false, 7, 4_096), [4096]);
-        assert_eq!(chunk_list(TiledF16, false, 7, 9_000), [4096, 4096, 808]);
         // Chunks are contiguous and cover the sequence exactly.
-        for kernel in [TiledF16, VecHybrid] {
+        for kernel in [TiledF16, TiledF16Precise, VecHybrid] {
             for is_ring in [true, false] {
                 let mut next = 0;
                 for (local, len) in chunks(kernel, is_ring, 1_000, 5_000) {
@@ -1103,7 +1177,7 @@ mod tests {
     #[test]
     fn ring_stage_holds_the_window_history_plus_the_largest_chunk() {
         let cap = 1024;
-        for kernel in [TiledF16, VecHybrid] {
+        for kernel in [TiledF16, TiledF16Precise, VecHybrid] {
             for (start, rows) in [(465, 56), (1254, 385), (0, 2_500), (40_000, 3_000)] {
                 let stage = cap - 1 + stage_query_rows(kernel, rows);
                 for (local, len) in chunks(kernel, true, start, rows) {

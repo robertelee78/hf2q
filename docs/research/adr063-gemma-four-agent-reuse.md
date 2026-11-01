@@ -760,7 +760,10 @@ done
   (summary). The pre-run expectation (max |Δlogit| near the 0.81
   cross-graph level, with "above about 1.5 means another semantic
   difference remains") was wrong; see the envelope disposition after the
-  results table.
+  results table. (Since the precise-variant follow-up the gate reports
+  log-prob nats per tiled arm and fails at a vec-hybrid margin of 0.10 nat,
+  the Q1 policy threshold; the results below used the old 0.5-logit rule.
+  See `docs/research/adr063-gemma-tiled-precise.md`.)
 - **Localization (diagnostic, not a gate).** Slot 1 (history 714,
   suffix 200) runs on both routes with the test-only per-layer probe
   (`forward_prefill_batched::live_layer_probe`). The probe forces a
@@ -865,7 +868,12 @@ Open follow-ups:
   and d512 over a longer history);
 - a tiled-vs-cold envelope;
 - hardware coverage for graft > 0 and F16 V storage, which no gate
-  exercises.
+  exercises;
+- the precise tiled variant (`HF2Q_GEMMA_WARM_TILED_ATTENTION=precise`): the
+  d256 kernel pre-scales Q in F16 by the F16-rounded `log2(e)` (softmax
+  temperature 1.000216 on every sliding layer, Q rounded twice); its rounding
+  map, gates (0.10-nat envelope per tiled arm) and the mlx-native F32-O patch
+  are in `docs/research/adr063-gemma-tiled-precise.md`.
 
 ### Cold admission allocation gates
 

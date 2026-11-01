@@ -4,8 +4,9 @@
 //! Ignored; `HF2Q_GEMMA4_GGUF` names the official Gemma 4 26B-A4B GGUF. Run
 //! each test alone with `--exact --ignored --nocapture --test-threads=1`.
 //! * `gemma_joint_warm_prefill_matches_per_slot_bitwise` (tiled F16 warm
-//!   attention, the default) and `..._vec_hybrid` (the
-//!   `HF2Q_GEMMA_WARM_TILED_ATTENTION=0` route): one joint
+//!   attention, the default), `..._tiled_precise` (the
+//!   `HF2Q_GEMMA_WARM_TILED_ATTENTION=precise` route) and `..._vec_hybrid`
+//!   (the `HF2Q_GEMMA_WARM_TILED_ATTENTION=0` route): one joint
 //!   `forward_prefill_batched_multi_seq_live` (`PerSlotExact`) over 4, 2 and
 //!   3 restored slots equals each slot's own per-slot warm prefill on the
 //!   same route: first token, final logits bits, every layer's K / TQ-HB V
@@ -364,6 +365,12 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
 #[ignore = "official Gemma 4 GGUF: joint warm prefill lanes equal per-slot warm prefill bit for bit (vec-hybrid route)"]
 fn gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid() {
     joint_warm_prefill_matches_per_slot(GemmaLiveKernel::VecHybrid);
+}
+
+#[test]
+#[ignore = "official Gemma 4 GGUF: joint warm prefill lanes equal per-slot warm prefill bit for bit (tiled F16 precise route)"]
+fn gemma_joint_warm_prefill_matches_per_slot_bitwise_tiled_precise() {
+    joint_warm_prefill_matches_per_slot(GemmaLiveKernel::TiledF16Precise);
 }
 
 fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {

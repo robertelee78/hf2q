@@ -89,11 +89,12 @@
 #                                    HF2Q_GEMMA_JOINT_WARM_PREFILL; unset
 #                                    keeps the hf2q default (on). 0 is the
 #                                    A/B kill switch (per-slot warm prefill).
-#     WARM_TILED_ATTENTION=0|1       (this script) forwards
+#     WARM_TILED_ATTENTION=0|1|precise  (this script) forwards
 #                                    HF2Q_GEMMA_WARM_TILED_ATTENTION; unset
 #                                    keeps the hf2q default (on). 0 is the
 #                                    A/B kill switch (vec-hybrid warm
-#                                    attention).
+#                                    attention); precise selects the tiled
+#                                    route with the exact sliding scale.
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -202,9 +203,9 @@ esac
 WARM_TILED_ENV=""
 case "${WARM_TILED_ATTENTION:-}" in
     "") ;;
-    0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;
+    0|1|precise) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;
     *)
-        echo "WARM_TILED_ATTENTION must be 0, 1 or unset" >&2
+        echo "WARM_TILED_ATTENTION must be 0, 1, precise or unset" >&2
         exit 2
         ;;
 esac

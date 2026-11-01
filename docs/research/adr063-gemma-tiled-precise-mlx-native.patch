@@ -1,0 +1,388 @@
+diff -r a/src/ops/flash_attn_prefill.rs b/src/ops/flash_attn_prefill.rs
+--- a/src/ops/flash_attn_prefill.rs	2026-11-01 13:00:40.984961000 -0800
++++ b/src/ops/flash_attn_prefill.rs	2026-11-01 13:01:29.221967816 -0800
+@@ -133,7 +133,7 @@
+ pub static FLASH_ATTN_PREFILL_SHADER_SOURCE: &str =
+     include_str!("../shaders/flash_attn_prefill.metal");
+ 
+-// ─── All 12 kernel entry-point names ─────────────────────────────────────────
++// ─── All 13 kernel entry-point names ─────────────────────────────────────────
+ 
+ /// D=256, bf16 I/O, bf16 additive mask.
+ const K_BF16_D256: &str = "flash_attn_prefill_bf16_d256";
+@@ -143,6 +143,10 @@
+ const K_F16_D256: &str = "flash_attn_prefill_f16_d256";
+ /// D=256, f16 I/O, bool mask.
+ const K_F16_D256_BOOLMASK: &str = "flash_attn_prefill_f16_d256_boolmask";
++/// D=256, f16 Q/K/V, f16 additive mask, F32 scores scaled after Q·K^T and
++/// F32 O (selected by an F32 `out` in
++/// [`dispatch_flash_attn_prefill_f16_d256_with_blk`]).
++const K_F16_D256_O32: &str = "flash_attn_prefill_f16_d256_o32";
+ /// D=512, bf16 I/O, bf16 additive mask.
+ const K_BF16_D512: &str = "flash_attn_prefill_bf16_d512";
+ /// D=512, bf16 I/O, bool mask.
+@@ -160,7 +164,7 @@
+ /// D=64, f16 I/O, bool mask.
+ const K_F16_D64_BOOLMASK: &str = "flash_attn_prefill_f16_d64_boolmask";
+ 
+-/// All 12 kernel entry-point names exported by `flash_attn_prefill.metal`.
++/// All 13 kernel entry-point names exported by `flash_attn_prefill.metal`.
+ ///
+ /// Registering all of them against the single shader source costs nothing at
+ /// registration time (source is a static `&str`) and ensures additional
+@@ -171,6 +175,7 @@
+     K_BF16_D256_BOOLMASK,
+     K_F16_D256,
+     K_F16_D256_BOOLMASK,
++    K_F16_D256_O32,
+     K_BF16_D512,
+     K_BF16_D512_BOOLMASK,
+     K_F16_D512,
+@@ -185,16 +190,16 @@
+ 
+ /// Register all flash-attention prefill kernel entry points with the registry.
+ ///
+-/// Maps all 12 entry-point names to the single `flash_attn_prefill.metal`
++/// Maps all 13 entry-point names to the single `flash_attn_prefill.metal`
+ /// source.  This must be called before any dispatch to these kernels.
+ ///
+ /// # Design note
+ ///
+-/// `KernelRegistry` compiles one Metal library per kernel name.  All 12 names
++/// `KernelRegistry` compiles one Metal library per kernel name.  All 13 names
+ /// point at the same source text, so the Metal compiler sees the same ~1 500-line
+ /// source each time — compilation is amortised in `KernelRegistry::get_pipeline`
+ /// (first call per name triggers compilation; subsequent calls return the cached
+-/// pipeline).  Registering all 12 here rather than only the Phase 1a subset
++/// pipeline).  Registering all 13 here rather than only the Phase 1a subset
+ /// means Phase 2/4 dispatcher functions can be added without touching this file.
+ pub fn register(registry: &mut KernelRegistry) {
+     for &name in ALL_KERNEL_NAMES {
+@@ -854,6 +859,15 @@
+ /// (BF16 7-bit mantissa vs F16 10-bit) and the per-element output store.
+ /// F16's narrower exponent range (5 bits, ±65504) safely contains all
+ /// Gemma 4 activation magnitudes (max |V| ≈ 15, RMS-normalised Q/K ≈ 1).
++///
++/// # F32 output (precise variant)
++///
++/// `out` may be F32: the dispatcher then selects
++/// `flash_attn_prefill_f16_d256_o32`, which keeps Q exactly as loaded,
++/// multiplies the F32 scores by `scale * log2(e)` after Q·K^T (instead of
++/// scaling the F16 Q tile by the F16-rounded factor, 1.4423828 for
++/// `scale = 1`), and stores O as F32. All other parameters and the mask /
++/// blk contract are unchanged.
+ #[allow(clippy::too_many_arguments)]
+ pub fn dispatch_flash_attn_prefill_f16_d256_with_blk(
+     encoder: &mut CommandEncoder,
+@@ -883,8 +897,9 @@
+     }
+     validate_params(params)?;
+ 
+-    // All buffers must be F16 for this dispatcher.
+-    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
++    // Q/K/V must be F16; `out` selects the F16-output kernel or the precise
++    // F32-output kernel.
++    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V")] {
+         if buf.dtype() != DType::F16 {
+             return Err(MlxError::InvalidArgument(format!(
+                 "dispatch_flash_attn_prefill_f16_d256_with_blk: {name} buffer must be F16, \
+@@ -893,6 +908,16 @@
+             )));
+         }
+     }
++    let kernel_name = match out.dtype() {
++        DType::F16 => K_F16_D256,
++        DType::F32 => K_F16_D256_O32,
++        other => {
++            return Err(MlxError::InvalidArgument(format!(
++                "dispatch_flash_attn_prefill_f16_d256_with_blk: out buffer must be F16 or \
++                 F32, got {other:?}"
++            )));
++        }
++    };
+     if let Some(m) = mask {
+         if m.dtype() != DType::F16 {
+             return Err(MlxError::InvalidArgument(format!(
+@@ -956,9 +981,7 @@
+         }
+     }
+ 
+-    // ── Kernel name ───────────────────────────────────────────────────────
+-    let kernel_name = K_F16_D256;
+-
++    // ── Pipeline ──────────────────────────────────────────────────────────
+     let pipeline = registry.get_pipeline_with_bool_constants(
+         kernel_name,
+         device.metal_device(),
+@@ -1982,6 +2005,7 @@
+             "flash_attn_prefill_bf16_d256_boolmask",
+             "flash_attn_prefill_f16_d256",
+             "flash_attn_prefill_f16_d256_boolmask",
++            "flash_attn_prefill_f16_d256_o32",
+             // D=512 — wide-head models
+             "flash_attn_prefill_bf16_d512",
+             "flash_attn_prefill_bf16_d512_boolmask",
+diff -r a/src/ops/flash_attn_prefill_d512.rs b/src/ops/flash_attn_prefill_d512.rs
+--- a/src/ops/flash_attn_prefill_d512.rs	2026-11-01 13:00:40.985168000 -0800
++++ b/src/ops/flash_attn_prefill_d512.rs	2026-11-01 13:01:48.104331579 -0800
+@@ -122,18 +122,22 @@
+ pub const K_D512_F16: &str = "flash_attn_prefill_d512_f16";
+ /// D=512 NSG-specialised, f16 I/O, bool mask.
+ pub const K_D512_F16_BOOLMASK: &str = "flash_attn_prefill_d512_f16_boolmask";
++/// D=512 NSG-specialised, f16 Q/K/V, F32 O (selected by an F32 `out` in
++/// [`dispatch_flash_attn_prefill_f16_d512_resume`]).
++pub const K_D512_F16_O32: &str = "flash_attn_prefill_d512_f16_o32";
+ 
+-/// All four kernel entry-point names registered by this module.
++/// All five kernel entry-point names registered by this module.
+ pub const ALL_KERNEL_NAMES: &[&str] = &[
+     K_D512_BF16,
+     K_D512_BF16_BOOLMASK,
+     K_D512_F16,
+     K_D512_F16_BOOLMASK,
++    K_D512_F16_O32,
+ ];
+ 
+ // ─── Registration ─────────────────────────────────────────────────────────────
+ 
+-/// Register all four D=512 kernel entry points against the new shader source.
++/// Register all five D=512 kernel entry points against the new shader source.
+ ///
+ /// Must be called before any dispatch to these kernels.  Safe to call alongside
+ /// [`crate::ops::flash_attn_prefill::register`] — the D=256 and D=512 kernels
+@@ -1294,8 +1298,8 @@
+     }
+ 
+     #[test]
+-    fn test_four_kernel_names_registered() {
+-        assert_eq!(ALL_KERNEL_NAMES.len(), 4);
++    fn test_five_kernel_names_registered() {
++        assert_eq!(ALL_KERNEL_NAMES.len(), 5);
+         let mut seen = std::collections::HashSet::new();
+         for &name in ALL_KERNEL_NAMES {
+             assert!(!name.is_empty());
+@@ -1403,7 +1407,8 @@
+ // - `n_heads` not divisible by `n_kv_heads`
+ // - Buffer too small for declared shape (Q/O against `seq_len_q`,
+ //   K/V against `kv_capacity`)
+-// - Any buffer dtype != F16
++// - Q/K/V dtype != F16, or `out` dtype not F16/F32 (F32 selects the
++//   `flash_attn_prefill_d512_f16_o32` entry point: same math, F32 O store)
+ #[allow(clippy::too_many_arguments)]
+ pub fn dispatch_flash_attn_prefill_f16_d512_resume(
+     encoder: &mut CommandEncoder,
+@@ -1456,7 +1461,7 @@
+         )));
+     }
+ 
+-    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V"), (out as &MlxBuffer, "out")] {
++    for (buf, name) in &[(q, "Q"), (k, "K"), (v, "V")] {
+         if buf.dtype() != DType::F16 {
+             return Err(MlxError::InvalidArgument(format!(
+                 "dispatch_flash_attn_prefill_f16_d512_resume: {name} buffer \
+@@ -1465,6 +1470,16 @@
+             )));
+         }
+     }
++    let kernel_name = match out.dtype() {
++        DType::F16 => K_D512_F16,
++        DType::F32 => K_D512_F16_O32,
++        other => {
++            return Err(MlxError::InvalidArgument(format!(
++                "dispatch_flash_attn_prefill_f16_d512_resume: out buffer must be F16 \
++                 or F32, got {other:?}"
++            )));
++        }
++    };
+ 
+     let batch = params.batch as usize;
+     let h = params.n_heads as usize;
+@@ -1497,8 +1512,7 @@
+     let has_blk = false;
+     let do_causal = params.do_causal;
+ 
+-    // ── Pipeline lookup (F16 kernel, NSG fc) ──────────────────────────────
+-    let kernel_name = K_D512_F16;
++    // ── Pipeline lookup (F16 Q/K/V kernel, NSG fc) ────────────────────────
+     let pipeline = registry.get_pipeline_with_constants(
+         kernel_name,
+         device.metal_device(),
+diff -r a/src/shaders/flash_attn_prefill.metal b/src/shaders/flash_attn_prefill.metal
+--- a/src/shaders/flash_attn_prefill.metal	2026-11-01 13:00:40.984476000 -0800
++++ b/src/shaders/flash_attn_prefill.metal	2026-11-01 13:00:52.147669240 -0800
+@@ -1150,12 +1150,19 @@
+     int WM,
+     int WN,
+     typename MaskType = float,
+-    typename AccumType = float>
++    typename AccumType = float,
++    // Output element type. `float` writes O without the final T rounding.
++    typename OutT = T,
++    // When true, Q stays exactly as loaded and `scale * log2(e)` multiplies
++    // the F32 scores after Q·K^T. When false (every pre-existing entry
++    // point), Q is scaled in T by `T(scale * log2(e))`, which rounds both
++    // the factor (log2(e) -> 1.4423828 in half) and every scaled element.
++    bool ScaleScores = false>
+ [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void attention(
+     const device T* Q [[buffer(0)]],
+     const device T* K [[buffer(1)]],
+     const device T* V [[buffer(2)]],
+-    device T* O [[buffer(3)]],
++    device OutT* O [[buffer(3)]],
+     const constant AttnParams* params [[buffer(4)]],
+     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
+     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
+@@ -1248,6 +1255,8 @@
+       V, params->V_strides[2], Vs, simd_group_id, simd_lane_id);
+ 
+   TransformScale<T> ts(static_cast<T>(params->scale * 1.44269504089));
++  const AccumType score_scale =
++      AccumType(params->scale) * AccumType(1.44269504089f);
+ 
+   // Prepare MMA tiles
+   constexpr short kFragSize = 8; // MMAFrag size
+@@ -1296,7 +1305,9 @@
+   } else {
+     loader_q.load_unsafe();
+   }
+-  loader_q.apply_inplace_op(ts);
++  if (!ScaleScores) {
++    loader_q.apply_inplace_op(ts);
++  }
+ 
+   // Init row reduction variables
+   constexpr short kRowsPT = decltype(Stile)::kRowsPerThread;
+@@ -1431,6 +1442,13 @@
+       tile_matmad(Stile, Qtile, Ktile, Stile);
+     }
+ 
++    if (ScaleScores) {
++      STEEL_PRAGMA_UNROLL
++      for (short i = 0; i < decltype(Stile)::kNumFrags; ++i) {
++        Stile.val_frags[i] *= score_scale;
++      }
++    }
++
+     // Mask out length sequence
+     if (!align_K && kb == (params->NK_aligned)) {
+       using stile_t = decltype(Stile);
+@@ -1644,9 +1662,9 @@
+     if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0)
+       return;
+ 
+-    Otile.template store_safe<T, 1, 1>(O, params->O_strides[2], dst_tile_dims);
++    Otile.template store_safe<OutT, 1, 1>(O, params->O_strides[2], dst_tile_dims);
+   } else {
+-    Otile.template store<T, 1, 1>(O, params->O_strides[2]);
++    Otile.template store<OutT, 1, 1>(O, params->O_strides[2]);
+   }
+ }
+ 
+@@ -1683,6 +1701,10 @@
+ instantiate_flash_attn_prefill("flash_attn_prefill_bf16_d256_boolmask", bfloat16_t, 32, 16, 256, 4, 1, bool)
+ instantiate_flash_attn_prefill("flash_attn_prefill_f16_d256",           half,       32, 16, 256, 4, 1, half)
+ instantiate_flash_attn_prefill("flash_attn_prefill_f16_d256_boolmask",  half,       32, 16, 256, 4, 1, bool)
++// Precise F16 D=256 (hf2q ADR-063 warm resume): F16 Q/K/V, F32 scores scaled
++// after Q·K^T, F32 O. Same tile geometry and threadgroup memory as above.
++instantiate_kernel("flash_attn_prefill_f16_d256_o32",
++    attention, half, 32, 16, 256, 4, 1, half, float, float, true)
+ 
+ // D=512 — global-attention layers (Gemma 4 family).
+ // BQ=8, BK=8, WM=1, WN=1 → 32 threads / threadgroup, 1 simdgroup.
+diff -r a/src/shaders/flash_attn_prefill_d512.metal b/src/shaders/flash_attn_prefill_d512.metal
+--- a/src/shaders/flash_attn_prefill_d512.metal	2026-11-01 13:00:40.984746000 -0800
++++ b/src/shaders/flash_attn_prefill_d512.metal	2026-11-01 13:01:00.748323465 -0800
+@@ -266,7 +266,9 @@
+ // kernel.  It does not carry `[[kernel]]` — a kernel cannot be called from
+ // another function in MSL, but a plain function with threadgroup/grid/
+ // lane-id arguments forwarded from the caller is legal.
+-template <typename T, typename MaskT, short NSG>
++// OutT — Output element type: T (pre-existing entry points) or float (O
++//        written without the final T rounding).
++template <typename T, typename MaskT, short NSG, typename OutT>
+ void flash_attn_prefill_d512_impl(
+     const device char* q_base,
+     const device char* k_base,
+@@ -385,7 +387,7 @@
+   const device T* q_typed = (const device T*)(q_base);
+   const device T* k_typed = (const device T*)(k_base);
+   const device T* v_typed = (const device T*)(v_base);
+-  device       T* o_typed = (device       T*)(o_base);
++  device    OutT* o_typed = (device    OutT*)(o_base);
+ 
+   // Q / O are per-query-head (H heads).  K / V are per-KV-head (H / gqa).
+   const ulong kv_head = iq2 / args.gqa_factor;
+@@ -396,7 +398,7 @@
+                                     +       kv_head * (ulong)args.K_strides[1];
+   const device T* v_head = v_typed + (ulong)iq3 * (ulong)args.V_strides[0]
+                                     +       kv_head * (ulong)args.V_strides[1];
+-  device       T* o_head = o_typed + (ulong)iq3 * (ulong)args.O_strides[0]
++  device    OutT* o_head = o_typed + (ulong)iq3 * (ulong)args.O_strides[0]
+                                     + (ulong)iq2 * (ulong)args.O_strides[1];
+ 
+   // K / V element-stride between consecutive KV items.  Layout is contiguous
+@@ -1040,7 +1042,7 @@
+       continue;  // past qL tail (align_Q=false case)
+     }
+ 
+-    device T* o_row = o_head + (ulong)(iq1 + j) * (ulong)args.O_strides[2];
++    device OutT* o_row = o_head + (ulong)(iq1 + j) * (ulong)args.O_strides[2];
+ 
+     const float scale = (S[jj] == 0.0f) ? 0.0f : 1.0f / S[jj];
+ 
+@@ -1051,7 +1053,7 @@
+     // writes per lane.
+     FOR_UNROLL (short ii = 0; ii < DV / NW; ++ii) {
+       const short i = ii * NW + tiisg;
+-      o_row[i] = (T)(so[j * PV + i] * scale);
++      o_row[i] = (OutT)(so[j * PV + i] * scale);
+     }
+   }
+ }
+@@ -1061,7 +1063,7 @@
+ // function constant `fc_nsg`.
+ // ──────────────────────────────────────────────────────────────────────────
+ 
+-template <typename T, typename MaskT>
++template <typename T, typename MaskT, typename OutT>
+ [[kernel, max_total_threads_per_threadgroup(32 * 8)]]
+ void flash_attn_prefill_d512(
+     const device char* q_base    [[buffer(0)]],
+@@ -1085,12 +1087,12 @@
+   // pipeline.  Cases 1 and 2 are omitted (unused by our dispatcher).
+   switch (nsg_def) {
+     case 4:
+-      flash_attn_prefill_d512_impl<T, MaskT, 4>(
++      flash_attn_prefill_d512_impl<T, MaskT, 4, OutT>(
+           q_base, k_base, v_base, o_base, args,
+           mask_args, mask_base, blk_base, sinks, shmem_f16, tgpig, tiisg, sgitg);
+       break;
+     case 8:
+-      flash_attn_prefill_d512_impl<T, MaskT, 8>(
++      flash_attn_prefill_d512_impl<T, MaskT, 8, OutT>(
+           q_base, k_base, v_base, o_base, args,
+           mask_args, mask_base, blk_base, sinks, shmem_f16, tgpig, tiisg, sgitg);
+       break;
+@@ -1109,12 +1111,14 @@
+ // constant at pipeline-creation time (one entry per (dtype, DK, DV), NSG
+ // chosen at FC-time).
+ 
+-#define instantiate_d512(name, T, MaskT) \
++#define instantiate_d512(name, T, MaskT, OutT) \
+   template [[host_name(name)]] [[kernel]] \
+-  decltype(flash_attn_prefill_d512<T, MaskT>) \
+-  flash_attn_prefill_d512<T, MaskT>;
+-
+-instantiate_d512("flash_attn_prefill_d512_bf16",          bfloat, bfloat)
+-instantiate_d512("flash_attn_prefill_d512_bf16_boolmask", bfloat, bool)
+-instantiate_d512("flash_attn_prefill_d512_f16",           half,   half)
+-instantiate_d512("flash_attn_prefill_d512_f16_boolmask",  half,   bool)
++  decltype(flash_attn_prefill_d512<T, MaskT, OutT>) \
++  flash_attn_prefill_d512<T, MaskT, OutT>;
++
++instantiate_d512("flash_attn_prefill_d512_bf16",          bfloat, bfloat, bfloat)
++instantiate_d512("flash_attn_prefill_d512_bf16_boolmask", bfloat, bool,   bfloat)
++instantiate_d512("flash_attn_prefill_d512_f16",           half,   half,   half)
++instantiate_d512("flash_attn_prefill_d512_f16_boolmask",  half,   bool,   half)
++// Precise F16 D=512 (hf2q ADR-063 warm resume): F16 Q/K/V, F32 O.
++instantiate_d512("flash_attn_prefill_d512_f16_o32",       half,   half,   float)

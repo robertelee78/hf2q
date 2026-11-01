@@ -648,7 +648,8 @@ pub struct MlxModelWeights {
     /// cohort lane (installed lanes follow [`GemmaLiveAttention::Tiled`]).
     /// Resolved once at load from `HF2Q_GEMMA_WARM_TILED_ATTENTION` (default
     /// [`GemmaLiveKernel::TiledF16`]; `0` restores
-    /// [`GemmaLiveKernel::VecHybrid`]).
+    /// [`GemmaLiveKernel::VecHybrid`]; `precise` selects
+    /// [`GemmaLiveKernel::TiledF16Precise`]).
     pub warm_live_kernel: GemmaLiveKernel,
 }
 
@@ -721,9 +722,23 @@ pub enum GemmaLiveKernel {
     /// (ADR-063 Stage 2): d256 + SWA mask + `blk` for sliding layers,
     /// `flash_attn_prefill_f16_d512_resume` for global layers.
     TiledF16,
+    /// [`GemmaLiveKernel::TiledF16`] with an exact sliding-layer softmax
+    /// scale: Q is multiplied by `log2(e)` in F32 before its single F16
+    /// rounding and the d256 kernel's own pre-scale is the exact `1.0`, so
+    /// Q is rounded once (as in vec-hybrid) and the softmax temperature is
+    /// not biased by the F16-rounded `log2(e)` (1.4423828 instead of
+    /// 1.4426950). V and O stay F16 (the only tiled instantiations).
+    TiledF16Precise,
     /// `flash_attn_vec_hybrid_batched`: one decode-style threadgroup per
     /// (query, head) over F16 K and TQ-HB V.
     VecHybrid,
+}
+
+impl GemmaLiveKernel {
+    /// Whether this kernel runs the tiled flash-attention route.
+    pub fn is_tiled(self) -> bool {
+        matches!(self, Self::TiledF16 | Self::TiledF16Precise)
+    }
 }
 
 /// Per-request head output from one shared multi-sequence Gemma prefill.
