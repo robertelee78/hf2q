@@ -129,7 +129,7 @@ The 0.5 fraction was calibrated on n4 runs only. In `K+M` plans the later cohort
   - (a) This amendment is posted on #369 before any new data. The new campaign pins a harness commit that contains it and records the `q2_run_audit.py` sha256 in its identities.
   - (b) The v7 `qwen38-all` campaign stays `Invalid`. Re-auditing `p3p1-047-w00-peer-a0` never revives it; the failure justifies the amendment only, and acceptance needs a fresh run.
   - (c) A new campaign runs only `3+1`, `2+2` and `1+3`, with the same arms, binaries and identities. The v7 `n4` and `n1` results are of record and are not re-run (their widths are the same under v3).
-  - (d) v2 passes in the running v7 chain stand, since a v2 pass is a v3 pass. A v2 width-only halt goes to a new v3 campaign, never to a re-audit. Completed campaigns are never re-run.
+  - (d) v2 passes in the running v7 chain stand, since a v2 pass is a v3 pass. A v2 width-only halt moves only the remaining stages to a new v3 campaign; nothing is re-audited into validity and completed stages are never re-run.
   - (e) The width rule is frozen for the ADR-063 Q3 record. A width-only `Invalid` in the new campaign stands as reported.
 - **Disclosed post-hoc elements and risks.**
   - k = 3 was chosen after seeing the measured minimum of 4 frames per member.
