@@ -128,7 +128,8 @@ The `n1` and mixed-phase stages are reported in `verdict.json` `controls` with t
   - primary effects with CIs, secondary effects and per-arm summaries (median makespan and goodput, memory, maximum observed thermal state);
   - controls, failures, peer status, quality inputs and patch-review status;
   - rejected trials (Invalid, Abandoned, Skipped or not-started attempts), the number of discarded warmups, and the predeclared design.
-- `q3_campaign.py --rows CAMPAIGN --evidence-root "$E"` prints a `{groups, rows}` fragment in the `hf2q.f2.scoreboard-rows.v1` vocabulary. It holds the experiment-vs-stock and experiment-vs-peer makespan effects as `% improvement`, with `$E/...` receipt references and JSON extraction keys into `verdict.json`, so `f2_scoreboard_render.py --verify` can re-read them. Merge it into `docs/research/adr063-f2-scoreboard-rows.json` only after independent review. Statuses: `Win`/`Inconclusive`/`Unavailable` → `Descriptive`, `Loss` → `NegativeResult`, `Failed` → `Failure`.
+- `q3_campaign.py --rows CAMPAIGN --evidence-root "$E"` prints a `{groups, rows}` fragment in the `hf2q.f2.scoreboard-rows.v1` vocabulary. It holds the experiment-vs-stock (baseline `v0128_stock`, the v0.1.28 release) and experiment-vs-peer makespan effects as `% improvement`, with `$E/...` receipt references and JSON extraction keys into `verdict.json`, so `f2_scoreboard_render.py --verify` can re-read them. Merge it into `docs/research/adr063-f2-scoreboard-rows.json` only after independent review. Statuses: `Win`/`Inconclusive`/`Unavailable` → `Descriptive`, `Loss` → `NegativeResult`, `Failed` → `Failure`.
+- `--rows CAMPAIGN --of-record [--quality-gate REFERENCE=MANIFEST ...] [--review FILE]` emits a reviewed verdict of record for the F2 "Q3 verdicts of record" tier (F2 closure option B), in place of that campaign's default fragment. The group `<family>-q3-record` carries `q3_record`: the verdict, `campaign_status` and the halt (entry, stage, reason from `campaign.json`), the primary stop, the reasons, peer unavailability, thermal and memory validity, one quality gate per reference kind (`stock-hf2q`, `peer`, `<kind>-native`: `Pending` while the `quality_campaign.py` manifest is absent or not `Complete`, otherwise `Pass` or `Fail` from its Q1 paired verdict; a settled manifest whose subject receipts are not the experiment binary is refused) and the `$E/` review. Every row carries `q3_of_record: true`: the makespan and worst-slot TTFT p95 / SSE-gap max effects vs stock and peer, each with a verified `half_width_pp`, plus per arm the median prompt and completion tokens and completion tokens per makespan-second over the primary stage's passing runs, re-read from each run's `client/summary.json`. Controls-only, native-comparison and native-peer campaigns are refused (their rows keep their own sections), and the rows manifest holds one record per family. `--verify` re-derives the record from `verdict.json`, `campaign.json` and the quality manifests, so a gate that settles after the merge is reported as drift until the fragment is regenerated.
 
 ## Controls-only campaign (#369 amendment)
 
@@ -252,8 +253,11 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/gemma4-full-input-n4-20261026T210724Z/client
 # After a Q1 paired campaign on the experiment binary, or an independent patch review:
 python3 -B scripts/four_agent/q3_campaign.py --verdict "$Q3/qwen38" \
   --quality-verdict "$E/<quality campaign>/manifest.json" --patch-review "$Q3/qwen38-patch-review.json"
-# F2 scoreboard rows (merge after review):
+# F2 scoreboard rows (merge after review); a reviewed verdict of record for the F2 tier:
 python3 -B scripts/four_agent/q3_campaign.py --rows "$Q3/qwen38" --evidence-root "$E"
+python3 -B scripts/four_agent/q3_campaign.py --rows "$Q3/qwen38" --evidence-root "$E" --of-record \
+  --quality-gate stock-hf2q="$E/<quality gate vs v0.1.28>/manifest.json" --quality-gate peer="$E/<quality gate vs peer>/manifest.json" \
+  --review "$E/reviews/<independent verdict review>.md"
 ```
 
 `HF2Q_Q5_*` exports apply to every arm whose case declares the variable. `--peer-var` overrides the peer arm only. The hf2q approval templates above are the ones the 2026-10-29/30 receipts used. Their `sources` are recomputed at run time, so they stay valid after the client change. Before starting, the root checks that the stock binary accepts the current launchers' flags: a server that refuses an option makes the first stock warmup `NotStarted` and halts the campaign before any measured block.

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope, F1/F3 execution entry and the separately reviewed F2/Q1/Q2/C1 source implementation entry; other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
+- **Updated:** 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
 - Stable source ID: ADR-063
@@ -757,6 +757,41 @@ stock DFlash2 drafter `z-lab/Qwen3.8-27B-DFlash2@50307d4c`
   decide it.
 
 This decision establishes no speed win and changes no same-GGUF verdict.
+
+### F2 closure scope: option B (operator decision 2026-10-31/11-01)
+
+The operator approved option B of the F2 intent review
+(`$E/reviews/adr063-f2-intent-v1.md` §5 B) as the closure scope of F2
+(#357). F2 closes when the scoreboard shows, for each family:
+
+- **A Q3 verdict of record:** Win, Loss, Unavailable or Failed, from an
+  independently reviewed `verdict.json` under the predeclared Q3 design
+  (Williams blocks, 5 to 20 per stage, 2.5-point precision stop;
+  `docs/research/adr063-q3-campaign.md`).
+- **Controls:** the `n1` one-slot control and the `3+1`, `2+2` and `1+3`
+  mixed-phase controls, reported as controls of that record. A mixed-stage
+  width halt shows as campaign status `Invalid` and does not change the
+  completed primary.
+- **The quality gate against both references:** paired quality campaigns on
+  the exact Q3 experiment binary against v0.1.28 and against the peer (the
+  native ds4 arm for DeepSeek-V4).
+- **Fairness against stock and against the peer:** worst-slot TTFT and SSE-gap
+  ratios against both. The peer comparison is stated as task makespan only.
+- **Native-engine rows kept separate:** they render in their own section and
+  never stand in for the same-GGUF verdict.
+
+The scoreboard renders this as the "Q3 verdicts of record" tier above the
+Descriptive results (`scripts/four_agent/f2_q3_tier.py`; how to read it is in
+`docs/research/adr063-f2-scoreboard.md`). "Win" appears there only against
+v0.1.28 stock (release `9a0b79c7`; the stock arm is v0.1.28, not v0.1.27), and
+only when the quality gate passed against both references.
+
+Moved to successor scope: the fixed-six three-arm campaign, canonical-transcript
+replay timing lanes, the cancellation/retry, divergent-edit and request-order
+permutation scenarios, and captured production-client sampling. The F2
+acceptance bullets that name them are the successor's acceptance, not this
+closure's; `f2_scoreboard_cli.py` still renders any fixed-six result produced.
+This decision establishes no speed win by itself.
 
 ## Consequences
 

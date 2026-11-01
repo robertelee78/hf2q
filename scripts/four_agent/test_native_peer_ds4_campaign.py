@@ -214,7 +214,7 @@ class Campaign(unittest.TestCase):
         (out / 'campaign.json').write_text(json.dumps(document))
         (out / 'verdict.json').write_text(json.dumps(q3_report.compute_verdict(document)))
         rows = q3_report.rows(out, self.root)
-        self.assertEqual({r['baseline_arm'] for r in rows['rows']}, {'hf2q_current', 'ds4_native'})
+        self.assertEqual({r['baseline_arm'] for r in rows['rows']}, {'v0128_stock', 'ds4_native'})
         self.assertIn(nd.LABEL, rows['groups']['deepseek4-q3']['workload'])
         self.assertIn('not the same-GGUF peer verdict', rows['rows'][1]['note'])
         board = {'schema': f2.ROWS_SCHEMA, 'evidence_root_symbol': '$E', 'evidence_root_description': 'test',

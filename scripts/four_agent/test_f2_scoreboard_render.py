@@ -90,9 +90,9 @@ class Direction(unittest.TestCase):
 
     def test_peer_and_stock_are_baselines_for_hf2q_current(self):
         m = manifest(runs("h", "prefill_tps", "hf2q_current", [700.0, 701.0]) + runs("p", "prefill_tps", "peer", [600.0, 601.0])
-                     + runs("s", "prefill_tps", "v0127_stock", [800.0, 801.0]))
+                     + runs("s", "prefill_tps", "v0128_stock", [800.0, 801.0]))
         got = {c["baseline"][0]: (c["arm"][0], c["verdict"]) for c in r.comparisons(m)}
-        self.assertEqual(got, {"peer": ("hf2q_current", "Win"), "v0127_stock": ("hf2q_current", "Regression")})
+        self.assertEqual(got, {"peer": ("hf2q_current", "Win"), "v0128_stock": ("hf2q_current", "Regression")})
 
     def test_comparisons_stay_within_group(self):
         m = manifest(runs("c", "makespan_s", "candidate", [100.0, 101.0], group="g") +
@@ -152,8 +152,8 @@ class Gaps(unittest.TestCase):
         rows = runs("p", "client_elapsed_s", "peer", [30.0])
         rows += runs("f", "task_pass", "hf2q_current", [0], status="Failure")
         text = section(r.render(manifest(rows), [], "0" * 64), "## Open gaps")
-        self.assertIn("| Family | makespan | candidate, v0.1.27 stock | hf2q current |", text)
-        self.assertIn("| Family | prefill_tps | candidate, v0.1.27 stock, peer | hf2q current |", text)
+        self.assertIn("| Family | makespan | candidate, v0.1.28 stock | hf2q current |", text)
+        self.assertIn("| Family | prefill_tps | candidate, v0.1.28 stock, peer | hf2q current |", text)
         self.assertIn("Family: no F2 primary Qualified fixed-six result.", text)
 
 

@@ -405,7 +405,7 @@ class Driver(Harness):
                     **rows}
         f2.validate_manifest(document)
         self.assertEqual(f2.verify_rows(document, self.root), [r["id"] for r in rows["rows"]])
-        self.assertEqual({r["baseline_arm"] for r in rows["rows"]}, {"hf2q_current", "peer"})
+        self.assertEqual({r["baseline_arm"] for r in rows["rows"]}, {"v0128_stock", "peer"})
         self.assertAlmostEqual(rows["rows"][0]["value"], 20.0, places=0)
         self.assertFalse(any("control_of" in r for r in rows["rows"]))  # default mode: primary rows only
 
@@ -691,7 +691,7 @@ class ControlsOnly(Harness):
         self.assertTrue(verdict["native_peer"]["3+1"]["statement"].startswith(
             "main HEAD finishes the same coding task 20.0% sooner than ds4 c97964b"))
         rows = q3_report.rows(out, self.root)
-        self.assertEqual({r["baseline_arm"] for r in rows["rows"]}, {"hf2q_current", "ds4_native"})
+        self.assertEqual({r["baseline_arm"] for r in rows["rows"]}, {"v0128_stock", "ds4_native"})
         self.assertEqual({(r["status"], r["control_of"]) for r in rows["rows"]},
                          {("Descriptive", "$E/evidence/q3-deepseek4/verdict.json")})
         native_row = next(r for r in rows["rows"] if r["baseline_arm"] == "ds4_native")
