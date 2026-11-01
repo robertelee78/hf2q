@@ -234,6 +234,20 @@ class AuditControls(unittest.TestCase):
         turn = summary["agents"]["agent-1"]["turns"][5]
         turn["progress_event_monotonic_ns"][0] = turn["send_monotonic_ns"] - 1
         self.assertRegex(self.reason(client, summary), "progress events outside their request")
+        # Start side of the makespan: the release clock cannot be moved after the fact.
+        client, summary = self.run_dir()
+        summary["makespan_started_ns"] += 10 ** 9  # only the start: a shorter makespan
+        self.assertRegex(self.reason(client, summary), "makespan start is not the recorded release")
+        client, summary = self.run_dir()
+        later = summary["barrier"]["release_monotonic_ns"] + 10 ** 9  # every release clock, consistently
+        summary.update(makespan_started_ns=later)
+        summary["barrier"]["release_monotonic_ns"] = later
+        for agent in summary["agents"].values():
+            agent["barrier"]["release_monotonic_ns"] = later
+        self.assertRegex(self.reason(client, summary), "agent request before its cohort release")
+        client, summary = self.run_dir()
+        summary["agents"]["agent-2"]["barrier"]["release_monotonic_ns"] -= 1  # one agent's release
+        self.assertRegex(self.reason(client, summary), "agent did not observe its cohort release")
 
     def test_result_scoring_contradictions(self):
         client, summary = self.run_dir()
@@ -305,6 +319,15 @@ class AuditControls(unittest.TestCase):
         release = summary["phase"]["releases"][1]
         release["release_monotonic_ns"] = max(release["trigger_first_decode_monotonic_ns"].values()) - 1
         self.assertRegex(self.reason(client, summary, plan="1+3"), "cohort released before its trigger")
+        client, summary = self.run_dir()
+        summary["phase"] = {"plan": "3+1", "cohorts": [["agent-0", "agent-1", "agent-2"], ["agent-3"]], "releases": []}
+        self.assertRegex(self.reason(client, summary), "canonical run carries a phase record")
+        client, summary = self.run_dir("3+1")
+        del summary["phase"]["releases"][1]
+        self.assertRegex(self.reason(client, summary, plan="3+1"), "missing cohort release")
+        client, summary = self.run_dir("2+2")
+        del summary["phase"]["releases"][1]["trigger_first_decode_monotonic_ns"]["agent-1"]
+        self.assertRegex(self.reason(client, summary, plan="2+2"), "cohort trigger membership")
 
 
 def streamed(turn, stamps_ms):

@@ -3,6 +3,7 @@ Requires integration of F2 source; no skip or mock substitute when it is missing
 """
 import copy
 import importlib
+import re
 import unittest
 
 
@@ -80,13 +81,19 @@ class ProductionContractControls(unittest.TestCase):
             with self.subTest(corrupt=corrupt),self.assertRaises(ValueError):self.validate(r)
 
     def test_missing_failed_drains_sequence_overflow(self):
-        for corrupt in ("drain","failed","sequence","overflow"):
+        for corrupt,reason in (("drain","missing actual submit/drain join"),
+                               ("failed","missing/duplicate/failed checked drain"),
+                               ("sequence","trace schema, sequence gap or monotonic clock failure"),
+                               ("overflow","finalized nonoverflowing trace required")):
             r=trace_fixture()
-            if corrupt=="drain":r.pop(-2)
+            if corrupt=="drain":
+                r.pop(-2)
+                for seq,item in enumerate(r):item["seq"]=seq  # no sequence gap: only the join is missing
             elif corrupt=="failed":r[-2]["payload"]["success"]=False
             elif corrupt=="sequence":r[2]["seq"]=999
             else:r[-1]["payload"]["dropped_events"]=1
-            with self.subTest(corrupt=corrupt),self.assertRaises(ValueError):self.validate(r)
+            with self.subTest(corrupt=corrupt),self.assertRaisesRegex(ValueError,"^"+re.escape(reason)+"$"):
+                self.validate(r)
 
     def test_stale_progress_cannot_replace_actual_owner(self):
         r=trace_fixture();r.insert(2,dict(schema=r[0]["schema"],seq=2,at_ns=1,kind="progress",
