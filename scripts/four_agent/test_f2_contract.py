@@ -1,6 +1,7 @@
 """Small actual-entrypoint controls. Hardware/source binding remains separate."""
 import copy
 import json
+import re
 import unittest
 
 import f2_scoreboard as score
@@ -84,15 +85,42 @@ class TraceControls(unittest.TestCase):
         self.assertTrue(trace.validate_trace(records, identity, scenario)["qualified"])
 
     def test_missing_failed_unknown_stale_overflow_refuse(self):
-        for mutation in ("missing", "failed", "unknown", "stale", "overflow", "gap"):
+        cases = (("missing", "missing actual submit/drain join"),
+                 ("failed", "missing/duplicate/failed checked drain"),
+                 ("unknown", "actual known physical row membership required"),
+                 ("stale", "physical row has unknown/stale scheduler owner"),
+                 ("overflow", "finalized nonoverflowing trace required"),
+                 ("gap", "trace schema, sequence gap or monotonic clock failure"))
+        for mutation, reason in cases:
             r, identity, scenario = trace_fixture()
-            if mutation == "missing": r.pop(3)
+            if mutation == "missing":
+                r.pop(3)
+                for seq, item in enumerate(r):  # no sequence gap: only the join is missing
+                    item["seq"] = seq
             if mutation == "failed": r[3]["payload"]["success"] = False
             if mutation == "unknown": r[2]["payload"]["membership"] = "Unknown"
             if mutation == "stale": r[2]["payload"]["rows"][0]["generation"] = 1
             if mutation == "overflow": r[-1]["payload"]["error"] = "quota exceeded"
             if mutation == "gap": r[2]["seq"] += 1
-            with self.assertRaises(ValueError, msg=mutation):
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(ValueError, "^" + re.escape(reason) + "$"):
+                trace.validate_trace(r, identity, scenario)
+
+    def test_header_identity_run_clock_and_config_are_bound(self):
+        cases = (("identity", lambda h, s: h.update(identity={"fixture": "another artifact"}), "bound trace header required"),
+                 ("expected identity", None, "bound trace header required"),
+                 ("run_id", lambda h, s: h.update(run_id="OTHER"), "bound trace header required"),
+                 ("scenario run_id", lambda h, s: s.update(run_id="OTHER"), "bound trace header required"),
+                 ("clock_id", lambda h, s: h.update(clock_id="CLOCK_REALTIME"), "bound trace header required"),
+                 ("clock", lambda h, s: h.update(clock="mach_absolute_time ticks"), "bound trace header required"),
+                 ("config_sha256", lambda h, s: h.update(config_sha256="e" * 64), "trace configuration drift"),
+                 ("scenario config_sha256", lambda h, s: s.update(config_sha256="e" * 64), "trace configuration drift"))
+        for name, mutate, reason in cases:
+            r, identity, scenario = trace_fixture()
+            if mutate is None:
+                identity = {"fixture": "independently frozen other identity"}
+            else:
+                mutate(r[0]["payload"], scenario)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "^" + re.escape(reason) + "$"):
                 trace.validate_trace(r, identity, scenario)
 
     def test_submitted_in_window_drain_later_counts_not_heartbeat(self):
