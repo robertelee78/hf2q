@@ -1,9 +1,9 @@
 # ADR-063 Stage 2 follow-up: a precise tiled warm attention for Gemma 4
 
 Status: implemented behind `HF2Q_GEMMA_WARM_TILED_ATTENTION=precise`
-(experimental, default unchanged); hardware gates not yet run. A full-precision
-variant needs the mlx-native patch in
-`docs/research/adr063-gemma-tiled-precise-mlx-native.patch`.
+(experimental; the warm default stays vec-hybrid, as set by the 2026-11-01
+quality gate); hardware gates not yet run. A full-precision variant needs the
+mlx-native patch in `docs/research/adr063-gemma-tiled-precise-mlx-native.patch`.
 
 ## Question
 
@@ -24,26 +24,26 @@ pinned crate for every file cited here). hf2q citations are to this worktree.
 Shared by both routes (`src/serve/gemma_live_attention.rs`): Q/K/V arrive as
 F32 normed, RoPE'd rows. The suffix K is written to the F16 cache and V is
 TQ-HB-quantized (FWHT-rotated, byte codes and per-position F32 norms) exactly
-as decode stores it (`write_kv_rows`, :490-:555). Sliding layers stage
+as decode stores it (`write_kv_rows`, :492-:557). Sliding layers stage
 `min(start, cap - 1)` chronological history rows plus the chunk
-(`linearize_rows` + `write_kv_rows`, :665-:699). Both routes then attend the same K bytes and V
-codes, and the layer ends with the same F32 FWHT sign undo (:412-:421). The
+(`linearize_rows` + `write_kv_rows`, :667-:701). Both routes then attend the same K bytes and V
+codes, and the layer ends with the same F32 FWHT sign undo (:414-:423). The
 O projection reads the F32 attention rows (`forward_prefill_batched.rs:3978-3990`).
 
-- `VecHybrid` (:720-:776): `flash_attn_vec_hybrid_batched`, one threadgroup
+- `VecHybrid` (:722-:778): `flash_attn_vec_hybrid_batched`, one threadgroup
   per (query, head). Sliding chunks use `mask_type = 3` with per-row stage
   positions; global chunks use `mask_type = 1` with the graft-shifted RoPE
   positions (`forward_prefill_batched.rs:1554-1556`), `scale = 1.0`,
   `softcap = 0.0`.
-- `TiledF16` (`encode_tiled_chunk`, :807-:1035): compact K to dense F16
-  (:861-:869), dequantize V to F16 (`dispatch_tq_dequantize_hb_kv_seq_f16`,
-  :871-:886), permute Q F32 → F16 (:904-:914). Sliding: build the F16 SWA mask
-  (`window = sliding_window`, causal, `q_abs_offset = history`, :917-:928),
+- `TiledF16` (`encode_tiled_chunk`, :809-:1037): compact K to dense F16
+  (:863-:871), dequantize V to F16 (`dispatch_tq_dequantize_hb_kv_seq_f16`,
+  :873-:888), permute Q F32 → F16 (:906-:916). Sliding: build the F16 SWA mask
+  (`window = sliding_window`, causal, `q_abs_offset = history`, :919-:930),
   classify tiles (`blk`), `dispatch_flash_attn_prefill_f16_d256_with_blk`
-  (:956-:981, `scale = 1.0` on the default route). Global:
+  (:958-:983, `scale = 1.0` on `TiledF16`). Global:
   `dispatch_flash_attn_prefill_f16_d512_resume` (`scale = 1.0`, causal,
-  `q_offset_in_k = graft + start`, :988-:1009). Then O F16 → F32 cast
-  (:1012-:1021) and permute back (:1023-:1033).
+  `q_offset_in_k = graft + start`, :990-:1011). Then O F16 → F32 cast
+  (:1014-:1023) and permute back (:1025-:1035).
 
 ## Rounding and semantic map
 
@@ -140,13 +140,14 @@ already ships:
   `TiledF16`.
 
 Cost: one Q-sized F32 elementwise pass and one barrier per sliding chunk.
-Defaults are unchanged; `1`/`on`/`true` and unset still select `TiledF16`,
-and `0` selects `VecHybrid`.
+Defaults are unchanged: unset and `0`/`off`/`false` select `VecHybrid`,
+`1`/`on`/`true` opts in to `TiledF16`.
 
 Files: `src/serve/gemma_live_attention.rs` (switch, route, Q prescale, unit
 tests including the exact-factor test), `src/inference/models/gemma4/model.rs`
 (variant, `is_tiled`), `src/serve/api/engine_gemma_warm_tiled_tests.rs`
-(envelope and localization per tiled arm, 0.10-nat policy),
+(`gemma_warm_attention_route_envelope`: all three routes against vec-hybrid
+on the same histories, 0.10-nat policy; localization per tiled arm),
 `src/serve/api/engine_gemma_warm_batch_tests.rs` (joint == per-slot on the
 precise route), `scripts/serve_gemma4_opencode.sh` and the Q5 `gemma4` case
 (`WARM_TILED_ATTENTION=precise`), operator docs.
@@ -197,8 +198,7 @@ Real-artifact gates, one process each:
 ```sh
 GGUF=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf
 for t in \
-  serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_precise_attention_decision_envelope \
-  serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_decision_envelope \
+  serve::api::engine::gemma_warm_tiled_tests::gemma_warm_attention_route_envelope \
   serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_precise_attention_layer_localization \
   serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_layer_localization \
   serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_prefill_matches_per_slot_bitwise_tiled_precise; do
@@ -207,12 +207,19 @@ done
 ```
 
 Read:
-- `GEMMA_WARM_TILED_ENVELOPE_LANE kernel=…` per lane: `max_abs_logprob_diff`
-  (whole vocabulary), `max_abs_logprob_diff_top2` (the vec-hybrid top-2),
-  `top1_agree`, both log-prob pairs and `margin_vec_nat`. The summary
-  `GEMMA_WARM_TILED_ENVELOPE kernel=…` fails when top-1 differs and the
-  vec-hybrid margin is at least 0.10 nat. Run both arms: the `TiledF16` line
-  is the baseline the precise arm must improve on.
+- `GEMMA_WARM_ROUTE_ENVELOPE_LANE route=… slot=…`, one per (route, lane),
+  every route against the same vec-hybrid reference image of that lane:
+  `max_abs_logprob_diff` (whole vocabulary, last row),
+  `max_abs_logprob_diff_top2` (the vec-hybrid top-2), `top1_agree`, both
+  log-prob pairs, `margin_vec_nat`, `margin_route_nat`, `near_tie` and
+  `policy_failure` (top-1 differs and the vec-hybrid margin is at least
+  0.10 nat). The `VecHybrid` route is a control rerun: it must be bitwise
+  equal to the reference (asserted), so its deltas are 0.
+- `GEMMA_WARM_ROUTE_ENVELOPE route=…`: per-route summary.
+- `GEMMA_WARM_ROUTE_ENVELOPE_JSON {…}`: the whole result as one JSON object
+  (`routes[].per_lane[]`, `routes[].policy_pass`). The test fails only on a
+  `TiledF16Precise` policy failure; `TiledF16` is the measured baseline the
+  precise route must improve on.
 - `GEMMA_WARM_TILED_LAYER kernel=…`: layer 0 sees identical inputs, so its
   `attn_rel` is the pure kernel difference (3.6e-4 measured for `TiledF16`).
   The precise arm should lower it; what remains is the F16 V/O floor.
@@ -252,8 +259,8 @@ HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=0 python3 scripts/four_agent/q5_calibration.p
   --negative-control-receipt "$NC_RECEIPT" --output "$Q5_ROOT/q5-gemma4-warm-tiled-off-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
-Re-enable rule: make `precise` the warm default only if both precise
-envelope gates hold (no top-1 flip at a vec-hybrid margin ≥ 0.10 nat), the
-precise joint bitwise and determinism gates pass, the replay keeps the
-vec-hybrid decision at the divergence token, and the Q5 makespan keeps the
-tiled saving (A −7.8% against vec-hybrid in the Stage 2 A/B).
+Default rule: make `precise` the warm default only if the route envelope
+passes (no `TiledF16Precise` top-1 flip at a vec-hybrid margin ≥ 0.10 nat),
+the precise joint bitwise gate passes, the replay keeps the vec-hybrid
+decision at the divergence token, and the Q5 makespan keeps the tiled
+saving (A −7.8% against vec-hybrid in the Stage 2 A/B).

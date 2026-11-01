@@ -69,9 +69,9 @@
 #   Long soft-token work remains fail-closed until it has a resumable graph.
 #
 #   Normal follow-ups use zero-copy live-prefix reuse and process only the
-#   uncached suffix: tiled F16 flash attention in bounded 1,024-query
-#   sliding / 4,096-query global chunks (ADR-063 Stage 2), or vec-hybrid
-#   attention in 256-query chunks under WARM_TILED_ATTENTION=0. On the
+#   uncached suffix: vec-hybrid attention in 256-query chunks, or tiled F16
+#   flash attention in bounded 1,024-query sliding / 4,096-query global
+#   chunks under WARM_TILED_ATTENTION=1 (ADR-063 Stage 2, opt-in). On the
 #   vec-hybrid route a real 6,784-token OpenCode tool turn reused 6,780
 #   tokens and completed a 6,042-token tool-result suffix at about 909 tok/s
 #   with the exact required answer.
@@ -91,9 +91,9 @@
 #                                    A/B kill switch (per-slot warm prefill).
 #     WARM_TILED_ATTENTION=0|1|precise  (this script) forwards
 #                                    HF2Q_GEMMA_WARM_TILED_ATTENTION; unset
-#                                    keeps the hf2q default (on). 0 is the
-#                                    A/B kill switch (vec-hybrid warm
-#                                    attention); precise selects the tiled
+#                                    keeps the hf2q default (off, vec-hybrid
+#                                    warm attention). 1 opts in to tiled F16;
+#                                    precise (experimental) selects the tiled
 #                                    route with the exact sliding scale.
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):

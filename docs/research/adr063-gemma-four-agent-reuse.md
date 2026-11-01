@@ -351,15 +351,23 @@ The bitwise gate now also runs the cohorts `{1,2,3}` twice, `{3,2,1,0}` and
 
 **Q1 class: Class B, route-sensitive.** Warm-prefill numerics change once
 against the vec-hybrid route. Evidence:
-- the decision envelope (`gemma_warm_tiled_attention_decision_envelope`:
-  per-lane max |Δlogit|, top-1 agreement, top-1/top-2 margins);
+- the decision envelope (`gemma_warm_attention_route_envelope`, formerly
+  `gemma_warm_tiled_attention_decision_envelope`: per-lane max |Δ log-prob|,
+  top-1 agreement, top-1/top-2 margins);
 - the paired 24-instance quality campaign, default (subject) against the
   kill switch (reference `stock-hf2q`, `GEMMA_WARM_TILED_ATTENTION=0`).
 
-**Default and revert rule.** On by default
-(`WARM_TILED_ATTENTION_DEFAULT`). If any of the following fails, set
-`WARM_TILED_ATTENTION_DEFAULT = false` in `gemma_live_attention.rs` before
-merging (`=0` stays the operator escape):
+**Default and revert rule.** Shipped on by default, then reverted to **off**
+(`WARM_TILED_ATTENTION_DEFAULT = false`, `=1` opts in) by the ADR-063
+quality gate on 2026-11-01. A replay of the canonical four-agent task on
+main f3e37690 (`$E/gemma-divergence-v1/solo-vs-concurrent-by-tiled.json`)
+found the tiled route changing a follow-up turn's decision, not only its
+low-order logits: after `if port == 0`, agent-3's top-2 log-probabilities
+were −0.149 (` {`) / −1.978 (` ||`) on vec-hybrid and −0.368 / −1.179 on
+tiled, and with the 1.05 repetition penalty tiled wrote ` ||` (a different,
+correct patch). Solo and four-agent cohorts were identical within each
+route, so the effect is the warm kernel, not batching. The original revert
+conditions were:
 - the bitwise gate (tiled or vec-hybrid);
 - the determinism gate;
 - the envelope's top-1 rule;
@@ -734,7 +742,7 @@ for t in \
   serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid \
   serve::api::engine::gemma_warm_batch_tests::gemma_joint_warm_engine_cohort_matches_serial_tool_turns \
   serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_is_deterministic \
-  serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_decision_envelope \
+  serve::api::engine::gemma_warm_tiled_tests::gemma_warm_attention_route_envelope \
   serve::api::engine::gemma_warm_tiled_tests::gemma_warm_tiled_attention_layer_localization; do
   HF2Q_GEMMA4_GGUF="$GGUF" cargo test --locked --release --bin hf2q "$t" -- --exact --ignored --nocapture --test-threads=1
 done
@@ -760,10 +768,15 @@ done
   (summary). The pre-run expectation (max |Δlogit| near the 0.81
   cross-graph level, with "above about 1.5 means another semantic
   difference remains") was wrong; see the envelope disposition after the
-  results table. (Since the precise-variant follow-up the gate reports
-  log-prob nats per tiled arm and fails at a vec-hybrid margin of 0.10 nat,
-  the Q1 policy threshold; the results below used the old 0.5-logit rule.
-  See `docs/research/adr063-gemma-tiled-precise.md`.)
+  results table. (Since the precise-variant follow-up the gate is
+  `gemma_warm_attention_route_envelope`: it measures the vec-hybrid control,
+  `TiledF16` and `TiledF16Precise` against vec-hybrid on the same histories
+  in log-prob nats, prints `GEMMA_WARM_ROUTE_ENVELOPE_LANE`,
+  `GEMMA_WARM_ROUTE_ENVELOPE` and a `GEMMA_WARM_ROUTE_ENVELOPE_JSON`
+  summary, and fails only on a precise-route top-1 flip at a vec-hybrid
+  margin of at least 0.10 nat, the Q1 policy threshold; the results below
+  used the old 0.5-logit rule and the old markers. See
+  `docs/research/adr063-gemma-tiled-precise.md`.)
 - **Localization (diagnostic, not a gate).** Slot 1 (history 714,
   suffix 200) runs on both routes with the test-only per-layer probe
   (`forward_prefill_batched::live_layer_probe`). The probe forces a

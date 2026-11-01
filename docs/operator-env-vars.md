@@ -231,25 +231,30 @@ decision` at start, and each cohort logs `Gemma4 installed prefills advanced in
 one aggregate-bounded transaction` with `transaction="joint warm"`. Evidence:
 `docs/research/adr063-gemma-four-agent-reuse.md`.
 
-### Gemma tiled warm attention (default on)
+### Gemma tiled warm attention (default off)
 
 `HF2Q_GEMMA_WARM_TILED_ATTENTION` selects the attention kernel of Gemma 4
 warm prefills (ADR-063 Stage 2): every single-slot prefill that resumes a
 cached prefix, and every lane of a joint warm cohort. It is read once when
 the model loads.
-- **Unset, `1`, `on` or `true` (default):** tiled F16 flash attention over
-  the slot's K and dequantized V range, one sequence per dispatch (1,024-query
+- **Unset, `0`, `off` or `false` (default):** warm prefills use the
+  vec-hybrid kernel (one decode-style pass per query over the whole history).
+- **`1`, `on` or `true`:** opt in to tiled F16 flash attention over the
+  slot's K and dequantized V range, one sequence per dispatch (1,024-query
   sliding chunks, 4,096-query global chunks). Suffixes shorter than 32 tokens
-  keep vec-hybrid attention. This changes warm-prefill numerics once against
-  the `0` route (Q1 Class B); a joint cohort stays bitwise equal to its
-  per-slot prefills.
-- **`0`, `off` or `false`:** kill switch; warm prefills use the vec-hybrid
-  kernel (one decode-style pass per query over the whole history).
-- **`precise`:** experimental tiled route with an exact sliding-layer
+  keep vec-hybrid attention. A joint cohort stays bitwise equal to its
+  per-slot prefills, but the route changes warm-prefill decisions against
+  the default: on the canonical four-agent task it moved a follow-up turn's
+  top-2 log-probabilities from −0.149/−1.978 to −0.368/−1.179 and changed the
+  written code (`$E/gemma-divergence-v1`). Default off since the ADR-063
+  quality gate (2026-11-01).
+- **`precise` (experimental):** the tiled route with an exact sliding-layer
   softmax scale: Q is scaled by `log2(e)` in F32 before its single F16
   rounding, so the d256 kernel neither rounds Q twice nor runs the softmax
   at the F16-rounded `log2(e)` (temperature 1.000216). V and O stay F16.
   Same chunking, 32-row threshold and joint-cohort bitwise contract as `1`.
+  Not a default candidate until the real-artifact route gate shows it within
+  the near-tie policy of vec-hybrid.
 - **Any other value:** logs a warning and keeps the default.
 
 Installed long-prompt lanes (prompts over 4,096 tokens) keep their own
