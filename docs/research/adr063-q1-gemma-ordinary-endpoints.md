@@ -42,6 +42,14 @@ this adapter does not proclaim equality. T0's All128 has no invented64 state.
 T4 reverses independent slot order; T7/T8 are separate root-supervised cold
 processes with the same frozen workload, not warm repeats in this test.
 
+Warm kernel: the 64-row resumes of T1/T3/T6 (and the localizer's `[64,64]`
+route) run the warm live-resume attention kernel, which the model resolves once
+at load and which `config_sha256` does not cover. Packets carry an optional
+`warm_live_kernel` (`VecHybrid` or `TiledF16`; absent means `VecHybrid`, the
+shipped default since #544 and the kernel of every retained Gemma Q1 run). The
+adapter and the localizer refuse a loaded model whose kernel differs and record
+the resolved kernel in `execution.json`; the supervisor checks it again.
+
 For the selected30-layer metadata (25 sliding Hkv8 D256, five global Hkv2 D512),
 logits request 603,979,776 bytes for576 rows. Active cache requests are computed
 before model/device loading, with an explicit positive packet quota at most
