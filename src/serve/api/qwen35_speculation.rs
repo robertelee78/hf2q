@@ -11,12 +11,12 @@ use std::time::Duration;
 /// Server policy selected with `HF2Q_QWEN_SPECULATION`.
 ///
 /// An explicit `off`/`auto` always wins. When the variable is unset the
-/// default depends on the worker ([`default_server_policy`]): `auto` for
-/// SerialFifo, narrow SlotAware workers and MoE artifacts (ADR-044, updated
-/// 2026-08-21: every admission path fails closed, so the worst case is
-/// ordinary decode plus telemetry), and `off` for dense artifacts (Qwen3.8)
-/// on SlotAware workers with at least [`UNSET_OFF_MIN_SLOTS`] slots, where
-/// ADR-063 D1 measured a four-agent makespan loss for `auto`.
+/// default depends on the worker ([`default_server_policy`]): `off` for a
+/// dense artifact on a SlotAware worker that selected joint decode and has
+/// at least [`UNSET_OFF_MIN_SLOTS`] slots, where ADR-063 D1 measured a
+/// four-agent makespan loss for `auto` (Qwen3.8); `auto` everywhere else
+/// (ADR-044, updated 2026-08-21: every admission path fails closed, so the
+/// worst case is ordinary decode plus telemetry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QwenSpeculationPolicy {
     Off,
@@ -24,19 +24,24 @@ pub enum QwenSpeculationPolicy {
 }
 
 /// Narrowest SlotAware width at which an unset policy resolves to `off` for
-/// dense artifacts. ADR-063 D1 (#364): at four slots, Qwen3.8 `auto` vs
-/// `off` makespan ratio 1.020 (95% CI 1.0093-1.0306, 8 adjacent ABBA pairs,
-/// every pair slower under `auto`; receipts
+/// dense joint-decode workers. ADR-063 D1 (#364): at four slots, Qwen3.8
+/// `auto` vs `off` own-output makespan ratio 1.020 (95% CI 1.0095-1.0308,
+/// 8 adjacent ABBA pairs, every pair slower under `auto`; receipts
 /// `adr063-preflight-20261023/d1-speculation-ext-v2`).
 pub const UNSET_OFF_MIN_SLOTS: usize = 4;
 
-/// Unset default for a worker serving `max_slots` slots. Dense artifacts
-/// (the family where joint decode defaults on) at [`UNSET_OFF_MIN_SLOTS`] or
-/// more slots are on the ADR-063 D1 measured-loss list and default `off`;
-/// SerialFifo (one slot), narrower SlotAware workers and MoE artifacts
+/// Unset default for a worker serving `max_slots` slots. Only the measured
+/// configuration defaults `off`: a dense artifact whose worker selected joint
+/// decode (where each MTP-holding lane pays its catch-up inside joint steps)
+/// at [`UNSET_OFF_MIN_SLOTS`] or more slots. SerialFifo, narrower workers,
+/// workers whose joint decode is off or unavailable, and MoE artifacts
 /// (Qwen3.6, not measured as a loss) keep `auto`.
-pub fn default_server_policy(max_slots: usize, moe: bool) -> QwenSpeculationPolicy {
-    if !moe && max_slots >= UNSET_OFF_MIN_SLOTS {
+pub fn default_server_policy(
+    max_slots: usize,
+    moe: bool,
+    joint_decode: bool,
+) -> QwenSpeculationPolicy {
+    if !moe && joint_decode && max_slots >= UNSET_OFF_MIN_SLOTS {
         QwenSpeculationPolicy::Off
     } else {
         QwenSpeculationPolicy::Auto
@@ -44,9 +49,9 @@ pub fn default_server_policy(max_slots: usize, moe: bool) -> QwenSpeculationPoli
 }
 
 const DENSE_WIDE_DEFAULT_OFF_REASON: &str = "unset: ADR-063 D1 measured a dense four-slot \
-     makespan loss for auto (ratio 1.020); set HF2Q_QWEN_SPECULATION=auto to opt in";
+     joint-decode makespan loss for auto (ratio 1.020); set HF2Q_QWEN_SPECULATION=auto to opt in";
 const DEFAULT_AUTO_REASON: &str = "unset: auto default (ADR-044); ADR-063 D1 disables it only \
-     for dense workers with max_slots >= 4";
+     for dense joint-decode workers with max_slots >= 4";
 const EXPLICIT_REASON: &str = "explicit HF2Q_QWEN_SPECULATION";
 
 impl QwenSpeculationPolicy {
@@ -86,13 +91,24 @@ impl QwenSpeculationPolicy {
 
     /// Server-side resolution for the qwen35 engine: an explicit request
     /// wins; an unset one takes [`default_server_policy`] for a worker of
-    /// `max_slots` slots serving a dense (`!moe`) or MoE artifact. Pure.
-    pub fn resolve_server_policy(requested: Option<Self>, max_slots: usize, moe: bool) -> Self {
-        requested.unwrap_or_else(|| default_server_policy(max_slots, moe))
+    /// `max_slots` slots serving a dense (`!moe`) or MoE artifact, with or
+    /// without joint decode selected. Pure.
+    pub fn resolve_server_policy(
+        requested: Option<Self>,
+        max_slots: usize,
+        moe: bool,
+        joint_decode: bool,
+    ) -> Self {
+        requested.unwrap_or_else(|| default_server_policy(max_slots, moe, joint_decode))
     }
 
-    fn resolution_reason(requested: Option<Self>, max_slots: usize, moe: bool) -> &'static str {
-        match (requested, default_server_policy(max_slots, moe)) {
+    fn resolution_reason(
+        requested: Option<Self>,
+        max_slots: usize,
+        moe: bool,
+        joint_decode: bool,
+    ) -> &'static str {
+        match (requested, default_server_policy(max_slots, moe, joint_decode)) {
             (Some(_), _) => EXPLICIT_REASON,
             (None, Self::Off) => DENSE_WIDE_DEFAULT_OFF_REASON,
             (None, Self::Auto) => DEFAULT_AUTO_REASON,
@@ -216,16 +232,20 @@ impl QwenSpeculationController {
 
     /// Resolve the unset default for a SlotAware worker of `max_slots`
     /// slots once at worker start (ADR-063 D1) and log the decision.
-    pub fn resolve_for_worker(&mut self, max_slots: usize, moe: bool) {
+    /// `joint_decode` is whether the worker selected Qwen joint decode.
+    pub fn resolve_for_worker(&mut self, max_slots: usize, moe: bool, joint_decode: bool) {
         let requested = self.requested;
-        self.policy = QwenSpeculationPolicy::resolve_server_policy(requested, max_slots, moe);
-        let reason = QwenSpeculationPolicy::resolution_reason(requested, max_slots, moe);
+        self.policy =
+            QwenSpeculationPolicy::resolve_server_policy(requested, max_slots, moe, joint_decode);
+        let reason =
+            QwenSpeculationPolicy::resolution_reason(requested, max_slots, moe, joint_decode);
         tracing::info!(
             target: "hf2q::serve::api::engine_qwen35::progress",
             requested = requested.map_or("unset", QwenSpeculationPolicy::label),
             policy = self.policy.label(),
             max_slots,
             moe,
+            joint_decode,
             reason,
             "Qwen speculation worker policy"
         );
@@ -495,36 +515,39 @@ mod tests {
         }
     }
 
-    /// ADR-063 D1: unset resolves to `off` only for dense workers with at
-    /// least four slots; explicit values always win.
+    /// ADR-063 D1: unset resolves to `off` only for dense joint-decode
+    /// workers with at least four slots; explicit values always win.
     #[test]
     fn server_policy_resolution_table() {
         use QwenSpeculationPolicy::{Auto, Off};
         let invalid = QwenSpeculationPolicy::requested(Some("always"));
-        // (requested, max_slots, moe, expected)
+        // (requested, max_slots, moe, joint_decode, expected)
         let table = [
-            (None, 4, false, Off),
-            (None, 8, false, Off),
-            (None, 3, false, Auto),
-            (None, 1, false, Auto),
-            (None, 4, true, Auto),
-            (None, 8, true, Auto),
-            (None, 1, true, Auto),
-            (Some(Auto), 4, false, Auto),
-            (Some(Auto), 8, false, Auto),
-            (Some(Off), 1, false, Off),
-            (Some(Off), 3, false, Off),
-            (Some(Off), 4, false, Off),
-            (Some(Off), 1, true, Off),
-            (Some(Off), 4, true, Off),
-            (invalid, 1, true, Off),
-            (invalid, 4, false, Off),
+            (None, 4, false, true, Off),
+            (None, 8, false, true, Off),
+            (None, 3, false, true, Auto),
+            (None, 1, false, true, Auto),
+            (None, 4, false, false, Auto),
+            (None, 8, false, false, Auto),
+            (None, 4, true, false, Auto),
+            (None, 4, true, true, Auto),
+            (None, 8, true, true, Auto),
+            (None, 1, true, false, Auto),
+            (Some(Auto), 4, false, true, Auto),
+            (Some(Auto), 8, false, true, Auto),
+            (Some(Off), 1, false, false, Off),
+            (Some(Off), 3, false, true, Off),
+            (Some(Off), 4, false, true, Off),
+            (Some(Off), 1, true, false, Off),
+            (Some(Off), 4, true, true, Off),
+            (invalid, 1, true, false, Off),
+            (invalid, 4, false, true, Off),
         ];
-        for (requested, max_slots, moe, expected) in table {
+        for (requested, max_slots, moe, joint, expected) in table {
             assert_eq!(
-                QwenSpeculationPolicy::resolve_server_policy(requested, max_slots, moe),
+                QwenSpeculationPolicy::resolve_server_policy(requested, max_slots, moe, joint),
                 expected,
-                "requested={requested:?} max_slots={max_slots} moe={moe}"
+                "requested={requested:?} max_slots={max_slots} moe={moe} joint={joint}"
             );
         }
     }
@@ -536,21 +559,24 @@ mod tests {
             policy: QwenSpeculationPolicy::Auto,
             conversation_prompt: None,
         };
-        let mut dense_four = unset();
-        dense_four.resolve_for_worker(4, false);
-        assert_eq!(dense_four.policy(), QwenSpeculationPolicy::Off);
+        let mut dense_joint_four = unset();
+        dense_joint_four.resolve_for_worker(4, false, true);
+        assert_eq!(dense_joint_four.policy(), QwenSpeculationPolicy::Off);
+        let mut dense_serial_four = unset();
+        dense_serial_four.resolve_for_worker(4, false, false);
+        assert_eq!(dense_serial_four.policy(), QwenSpeculationPolicy::Auto);
         let mut moe_four = unset();
-        moe_four.resolve_for_worker(4, true);
+        moe_four.resolve_for_worker(4, true, false);
         assert_eq!(moe_four.policy(), QwenSpeculationPolicy::Auto);
-        let mut dense_three = unset();
-        dense_three.resolve_for_worker(3, false);
-        assert_eq!(dense_three.policy(), QwenSpeculationPolicy::Auto);
+        let mut dense_joint_three = unset();
+        dense_joint_three.resolve_for_worker(3, false, true);
+        assert_eq!(dense_joint_three.policy(), QwenSpeculationPolicy::Auto);
 
         let mut explicit_auto = QwenSpeculationController::new(QwenSpeculationPolicy::Auto);
-        explicit_auto.resolve_for_worker(4, false);
+        explicit_auto.resolve_for_worker(4, false, true);
         assert_eq!(explicit_auto.policy(), QwenSpeculationPolicy::Auto);
         let mut explicit_off = QwenSpeculationController::new(QwenSpeculationPolicy::Off);
-        explicit_off.resolve_for_worker(1, true);
+        explicit_off.resolve_for_worker(1, true, false);
         assert_eq!(explicit_off.policy(), QwenSpeculationPolicy::Off);
     }
 

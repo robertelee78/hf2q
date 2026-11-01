@@ -19091,10 +19091,13 @@ fn run_slot_aware_qwen35(
     let mut prompt_anchors: Vec<Option<Qwen35PromptAnchor>> = (0..n_slots).map(|_| None).collect();
     let qwen_joint_decode = qwen35_joint_decode::qwen35_joint_decode_config(&guard.model.model);
     // ADR-063 D1: resolve the unset speculation default for this worker's
-    // width and family beside the joint-decode default; every admission,
-    // prefill catch-up and history-lookup check reads the resolved policy.
+    // width, family and joint-decode selection; every admission, prefill
+    // catch-up and history-lookup check reads the resolved policy.
     let moe = guard.model.model.cfg.moe.is_some();
-    guard.model.speculation.resolve_for_worker(n_slots, moe);
+    guard
+        .model
+        .speculation
+        .resolve_for_worker(n_slots, moe, qwen_joint_decode.is_some());
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
