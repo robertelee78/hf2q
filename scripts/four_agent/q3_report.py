@@ -20,6 +20,9 @@ CONTRASTS = (("vs_stock", "stock"), ("vs_peer", "peer"), ("diagnostic_vs_peer_ma
 SETTLED = ("Pass", "Fail", "Unavailable", "Skipped")
 F2_STATUS = {"Win": "Descriptive", "Inconclusive": "Descriptive", "Unavailable": "Descriptive",
              "Loss": "NegativeResult", "Failed": "Failure"}
+# Controls-only campaign (#369 amendment): no primary verdict; the primary is of record in another campaign.
+CONTROLS_ONLY = "ControlsOnly"
+Q2_RUN_AUDIT = "scripts/four_agent/q2_run_audit.py"
 
 
 def sha256(path):
@@ -148,40 +151,87 @@ def quality_state(manifest, quality_paths, review_path):
     return {"status": status, "reason": "; ".join(reasons) or None, "q1_paired": inputs, "patch_review": review}
 
 
+def primary_of_record(manifest, record):
+    """verdict.json `primary_of_record`: the bound primary verdict, its effects, and both harness source maps."""
+    path = Path(record["verdict"]["path"])
+    for bound in (record["verdict"], record["campaign"]):
+        if sha256(bound["path"]) != bound["sha256"]:
+            raise ValueError(f"primary of record {bound['path']} changed since the campaign bound it")
+    then, now = record["harness"]["sources"], manifest["identities"]["harness"]["sources"]
+    return {"path": str(path), "sha256": record["verdict"]["sha256"], "verdict": record["verdict_of_record"],
+            "primary_workload": record["primary_workload"], "effects": record["effects"],
+            "campaign": record["campaign"], "identities_sha256": record["identities_sha256"], "identity": record["identity"],
+            "harness": {"of_record": record["harness"],
+                        "this_campaign": {"git_commit": manifest["identities"]["harness"]["git_commit"], "sources": now},
+                        "differs": sorted(k for k in set(then) | set(now) if then.get(k) != now.get(k))},
+            "q2_run_audit_sha256": {"of_record": then.get(Q2_RUN_AUDIT), "this_campaign": now.get(Q2_RUN_AUDIT)}}
+
+
+def controls_only_reasons(manifest, record, state):
+    reasons = [f"controls only: the {record['primary_workload']} primary verdict is of record in "
+               f"{record['verdict']['path']} ({record['verdict_of_record']}); no primary verdict is computed (#369 amendment)"]
+    if manifest["status"] != "Complete":
+        reasons.append(f"campaign {manifest['status']}: {(manifest.get('halted') or {}).get('reason')}")
+    reasons += [f"experiment failed its task: {f}" for f in state["experiment_failures"]]
+    reasons += [f"peer failed its task: {f}" for f in state["peer_failures"]]
+    if state["peer_unavailable"]:
+        reasons.append(f"peer unavailable: {state['peer_unavailable']['reason']}")
+    if state["quality"]["status"] == "loss":
+        reasons.append(f"quality loss: {state['quality']['reason']}")
+    return reasons
+
+
+def stopped_experiment_failures(manifest):
+    """(workload, campaign.json path, entry) of each failed experiment run in a Stopped stage."""
+    for i, stage in enumerate(manifest["stages"]):
+        if stage["status"] != "Stopped":
+            continue
+        located = [(f"stages.{i}.warmups.{j}", e) for j, e in enumerate(stage["warmups"])]
+        located += [(f"stages.{i}.blocks.{b}.entries.{j}", e) for b, block in enumerate(stage["blocks"])
+                    for j, e in enumerate(block["entries"])]
+        for path, entry in located:
+            if entry["arm"] == "experiment" and entry["outcome"] == "Fail":
+                yield stage["workload"], path, entry
+
+
 def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha256=None):
     plan = manifest["plan"]
+    record = plan.get("controls_of")  # controls-only: the primary is of record in another campaign
     stages = {stage["workload"]: stage for stage in manifest["stages"]}
-    primary = stages[plan["primary"]]
+    primary = None if record else stages[plan["primary"]]
     report = {name: {"phase_plan": stage["phase_plan"], "status": stage["status"], "stop": stage["stop"],
                      "blocks": len(stage["blocks"]), **stage_effects(stage, plan["measured_arms"]),
                      "arms": {arm: arm_summary(stage, arm) for arm in plan["measured_arms"]}}
               for name, stage in stages.items()}
-    effects = report[plan["primary"]]["effects"]
-    empty = q3_stats.paired_effect([])
     quality = quality_state(manifest, quality_paths, review_path)
     measured = [e for e in entries(manifest, kind="measured") if e.get("metrics")]
     thermal = [e["metrics"]["thermal"]["valid"] for e in measured]
     state = {"experiment_failures": failures(manifest, "experiment"),
              "peer_unavailable": manifest["unavailable"].get("peer"),
              "peer_failures": failures(manifest, "peer"), "quality": quality,
-             "complete": primary["stop"] is not None,
-             "vs_stock": effects["vs_stock"], "vs_peer": effects.get("vs_peer", empty),
-             "fairness": {m: report[plan["primary"]]["secondary"][m]["vs_stock"] for m in FAIRNESS},
              "thermal_valid": False if False in thermal else (True if thermal and None not in thermal else None),
              "memory_valid": all(e["metrics"]["memory"]["q5_pass"] for e in measured
                                  if e["arm"] == "experiment" and e["outcome"] == "Pass")}
     native = native_peers.peer_kind(plan)
     comparison = plan.get("native_comparison")
-    if native:  # the native arm never yields the same-GGUF verdict; it is reported separately as native_peer
-        state["peer_unavailable"] = {"reason": comparison or native_peers.adapter(native).SAME_GGUF_UNAVAILABLE,
-                                     "evidence": plan["peer_unavailable_evidence"]}
-    verdict, reasons = q3_stats.family_verdict(state)
-    if comparison and verdict == "Unavailable":
-        reasons = [comparison]
+    if record:
+        verdict, reasons = CONTROLS_ONLY, controls_only_reasons(manifest, record, state)
+    else:
+        effects = report[plan["primary"]]["effects"]
+        state.update(complete=primary["stop"] is not None, vs_stock=effects["vs_stock"],
+                     vs_peer=effects.get("vs_peer", q3_stats.paired_effect([])),
+                     fairness={m: report[plan["primary"]]["secondary"][m]["vs_stock"] for m in FAIRNESS})
+        if native:  # the native arm never yields the same-GGUF verdict; it is reported separately as native_peer
+            state["peer_unavailable"] = {"reason": comparison or native_peers.adapter(native).SAME_GGUF_UNAVAILABLE,
+                                         "evidence": plan["peer_unavailable_evidence"]}
+        verdict, reasons = q3_stats.family_verdict(state)
+        if comparison and verdict == "Unavailable":
+            reasons = [comparison]
     result = {"schema": VERDICT_SCHEMA, "family": plan["family"], "campaign_sha256": campaign_sha256,
             "identities_sha256": manifest["identities_sha256"], "campaign_status": manifest["status"],
             "verdict": verdict, "reasons": reasons, "primary_workload": plan["primary"],
-            "primary": report[plan["primary"]],
+            "primary": None if record else report[plan["primary"]],
+            **({"primary_of_record": primary_of_record(manifest, record)} if record else {}),
             "controls": {k: v for k, v in report.items() if k != plan["primary"]},
             "peer": {"unavailable": manifest["unavailable"], "failures": state["peer_failures"]},
             "stock_failures": failures(manifest, "stock"), "experiment_failures": state["experiment_failures"],
@@ -193,15 +243,20 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
             "design": plan["design"], "declared": plan["declared"],
             "independent_review_required": True}
     if native:
-        result["native_peer"] = native_peers.audit(native).q3_section(primary, manifest,
-                                                                      plan["declared"]["experiment"]["label"])
+        audit = native_peers.audit(native)
+        label = plan["declared"]["experiment"]["label"]
+        result["native_peer"] = ({key: audit.q3_section(stage, manifest, label) for key, stage in stages.items()}
+                                 if record else audit.q3_section(primary, manifest, label))
     if comparison:
         result.update(campaign_label="native-comparison campaign; not the verdict of record", verdict_of_record=False)
     return result
 
 
 def rows(campaign_dir, evidence_root):
-    """F2 scoreboard rows (hf2q.f2.scoreboard-rows.v1 vocabulary) for the primary effects of one campaign."""
+    """F2 scoreboard rows (hf2q.f2.scoreboard-rows.v1 vocabulary) for the primary effects of one campaign; for a
+    controls-only campaign, the completed control stages' effects (status Descriptive) and each failed experiment
+    run of a stopped control stage (task_pass, status Failure), all labeled `control_of` the primary of record:
+    never a win or loss."""
     campaign_dir, root = Path(campaign_dir).resolve(), Path(evidence_root).resolve()
     if not campaign_dir.is_relative_to(root):
         raise ValueError("campaign directory must be under --evidence-root to be cited as $E/...")
@@ -218,41 +273,87 @@ def rows(campaign_dir, evidence_root):
     if native_label:
         native_note = native_peers.audit(native).note
     ref = "$E/" + str((campaign_dir / "verdict.json").relative_to(root))
-    group = f"{family}-q3" if comparison is None else f"{family}-q3-{native_peers.baseline_of(native, native_label).replace('_', '-')}"
-    out = {"groups": {group: {"family": family, "title": f"{family} Q3 three-arm campaign"
-                                                         + (f" ({comparison})" if comparison else ""),
+    record = verdict.get("primary_of_record")
+    if record is not None:
+        of_record = Path(record["path"]).resolve()
+        if not of_record.is_relative_to(root):
+            raise ValueError("the primary of record must be under --evidence-root to be cited as $E/...")
+        control_of = "$E/" + str(of_record.relative_to(root))
+    native_baseline = native_peers.baseline_of(native, native_label) if native_label else "peer"
+    group = ((f"{family}-q3" if record is None else f"{family}-q3-controls")
+             + ("" if comparison is None else f"-{native_baseline.replace('_', '-')}"))
+    out = {"groups": {group: {"family": family,
+                              "title": (f"{family} Q3 three-arm campaign" if record is None
+                                        else f"{family} Q3 controls of the primary of record")
+                                       + (f" ({comparison})" if comparison else ""),
                               "workload": "Four-agent coding client, 262144 context, 4 slots; stock "
                                           f"{plan['declared']['stock']['label']} vs experiment "
                                           f"{plan['declared']['experiment']['label']} vs "
-                                          f"{native_label or 'the peer'}, Williams blocks."}},
+                                          f"{native_label or 'the peer'}, Williams blocks."
+                                          + ("" if record is None else f" Controls (client --phase-plan) of the primary "
+                                                                       f"of record {control_of}; never a win or loss.")}},
            "rows": []}
-    status = F2_STATUS.get(verdict["verdict"])
-    if status is None:
+    if record is None:
+        status = F2_STATUS.get(verdict["verdict"])
+        sections = [] if status is None else [("primary", None, verdict["primary"], verdict.get("native_peer"))]
+    else:
+        status = "Descriptive"  # a control of a primary of record never wins or loses (#369 amendment)
+        sections = [(f"controls.{key}", key, stage, (verdict.get("native_peer") or {}).get(key))
+                    for key, stage in verdict["controls"].items() if stage["status"] == "Complete"]
+    failed = [] if record is None else list(stopped_experiment_failures(manifest))
+    if not sections and not failed:
         return out
     if not arms["experiment"]["artifact"] or not arms["experiment"]["artifact"].get("sha256"):
         raise ValueError("F2 rows need the model sha256 (conversion receipt or HF2Q_Q5_MODEL_SHA256)")
-    for name, baseline in (("vs_stock", "hf2q_current"),
-                           ("vs_peer", native_peers.baseline_of(native, native_label) if native_label else "peer")):
-        e = verdict["primary"]["effects"].get(name)
-        withheld = native_label and (verdict.get("native_peer") or {}).get("statement_withheld")
-        if e is None or e["improvement_percent"] is None or (name == "vs_peer" and (
-                withheld or (verdict["verdict"] == "Unavailable" and not native_label))):
-            continue
-        path = f"primary.effects.{name}"
+    for prefix, control, stage, section_native in sections:
+        peer_gone = verdict["verdict"] == "Unavailable" if control is None else bool(verdict["peer"]["unavailable"].get("peer"))
+        for name, baseline in (("vs_stock", "hf2q_current"), ("vs_peer", native_baseline)):
+            e = stage["effects"].get(name)
+            withheld = native_label and (section_native or {}).get("statement_withheld")
+            if e is None or e["improvement_percent"] is None or (name == "vs_peer" and (
+                    withheld or (peer_gone and not native_label))):
+                continue
+            path = f"{prefix}.effects.{name}"
+            row = {
+                "id": f"{group}-{'' if control is None else control.replace('+', 'p') + '-'}makespan-{name.replace('_', '-')}",
+                "family": family, "group": group, "metric": "makespan_s", "kind": "effect", "arm": "candidate",
+                "variant": f"Q3 experiment {plan['declared']['experiment']['label']}"
+                           + ("" if control is None else f", control {control}")
+                           + (f" ({comparison})" if comparison else ""),
+                "value": round(e["improvement_percent"], 3), "decimals": 3, "unit": "% improvement",
+                "ci95": [round(x, 3) for x in e["improvement_ci95"]], "baseline_arm": baseline,
+                "n_slots": 4, "context": "262144", "date": manifest["created_utc"][:10],
+                "source": {"commit": plan["declared"]["experiment"]["commit"], "binary_sha256": arms["experiment"]["binary"]["sha256"]},
+                "artifact_sha256": arms["experiment"]["artifact"]["sha256"], "receipt": ref, "status": status,
+                "verification": {"state": "Verified", "key": f"verdict.json {path}.improvement_percent",
+                                 "extract": {"value": {"kind": "json", "file": ref, "path": f"{path}.improvement_percent", "reduce": "one"},
+                                             "ci95": {"kind": "json", "file": ref, "path": f"{path}.improvement_ci95.*", "reduce": "list"}}},
+                "note": (f"{comparison}. " if comparison else "")
+                        + (f"Q3 verdict {verdict['verdict']}; " if control is None else
+                           f"Q3 control {control} (client --phase-plan {stage['phase_plan']}) of the primary of record "
+                           f"{control_of}; never a win or loss; ")
+                        + f"{e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
+                        f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else peer_note})."
+                        + (f" {native_note(section_native)}." if name == "vs_peer" and native_label else "")}
+            if control is not None:
+                row["control_of"] = control_of
+            out["rows"].append(row)
+    campaign_ref = "$E/" + str((campaign_dir / "campaign.json").relative_to(root))
+    for key, where, entry in failed:
+        path = f"{where}.metrics.tasks_passed"
         out["rows"].append({
-            "id": f"{group}-makespan-{name.replace('_', '-')}", "family": family, "group": group,
-            "metric": "makespan_s", "kind": "effect", "arm": "candidate",
-            "variant": f"Q3 experiment {plan['declared']['experiment']['label']}" + (f" ({comparison})" if comparison else ""),
-            "value": round(e["improvement_percent"], 3), "decimals": 3, "unit": "% improvement",
-            "ci95": [round(x, 3) for x in e["improvement_ci95"]], "baseline_arm": baseline,
+            "id": f"{group}-{key.replace('+', 'p')}-task-pass-{entry['name']}", "family": family, "group": group,
+            "metric": "task_pass", "kind": "measurement", "arm": "candidate",
+            "variant": f"Q3 experiment {plan['declared']['experiment']['label']}, control {key}"
+                       + (f" ({comparison})" if comparison else ""),
+            "value": entry["metrics"]["tasks_passed"], "decimals": 0, "unit": "tasks",
             "n_slots": 4, "context": "262144", "date": manifest["created_utc"][:10],
             "source": {"commit": plan["declared"]["experiment"]["commit"], "binary_sha256": arms["experiment"]["binary"]["sha256"]},
-            "artifact_sha256": arms["experiment"]["artifact"]["sha256"], "receipt": ref, "status": status,
-            "verification": {"state": "Verified", "key": f"verdict.json {path}.improvement_percent",
-                             "extract": {"value": {"kind": "json", "file": ref, "path": f"{path}.improvement_percent", "reduce": "one"},
-                                         "ci95": {"kind": "json", "file": ref, "path": f"{path}.improvement_ci95.*", "reduce": "list"}}},
+            "artifact_sha256": arms["experiment"]["artifact"]["sha256"], "receipt": campaign_ref, "status": "Failure",
+            "verification": {"state": "Verified", "key": f"campaign.json {path}",
+                             "extract": {"value": {"kind": "json", "file": campaign_ref, "path": path, "reduce": "one"}}},
             "note": (f"{comparison}. " if comparison else "")
-                    + f"Q3 verdict {verdict['verdict']}; {e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
-                    f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else peer_note})."
-                    + (f" {native_note(verdict['native_peer'])}." if name == "vs_peer" and native_label else "")})
+                    + f"Q3 control {key} of the primary of record {control_of}: experiment run {entry['name']} failed its "
+                    f"task ({entry['failure_kind']}); the stage stopped and later stages did not run.",
+            "control_of": control_of})
     return out
