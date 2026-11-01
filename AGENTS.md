@@ -22,63 +22,31 @@ Start with these sources when working in an unfamiliar area:
 - `docs/arch-onboarding.md` for adding a model family.
 - `docs/shipping-contract.md` for experimental-feature safety gates.
 - The relevant `docs/ADR-*.md` before changing an architectural decision.
-- Ruflo AgentDB memory for prior decisions, evidence, and failure patterns.
+- `memory-bank/` (agent-memory) for prior decisions, evidence, and operator rules.
 
-## Ruflo and ADR memory workflow
+## Project memory
 
-Ruflo is the coordination and recall ledger; it does not replace the Rust
-implementation, checked-in ADRs, tests, or source-bound evidence.
+`memory-bank/` is the repository's shared memory, maintained with the
+agent-memory skill. It does not replace the Rust implementation, checked-in
+ADRs, tests, or source-bound evidence; memory is context, not authority to
+override source or operator instructions. Record validated decisions and
+evidence only after focused tests or benchmarks, bound to exact commits, model
+artifacts, prompts, settings, and hardware.
 
-Before architecture, performance, model-family, serving, or cache work:
+### Concurrent agents and the shared host
 
-1. Run `ak status` to inspect the integrated project state. It reports the
-   active native AgentDB writer, learning state, MCP registration, host
-   routing, and OpenCode convergence.
-2. Use the live Ruflo MCP `memory_search` or `memory_search_unified` across
-   relevant namespaces, then retrieve important entries by exact key.
-3. Read the ADR named by the recalled decision and verify it against current
-   source. Memory is evidence and context, not authority to override source or
-   user instructions.
-4. Record validated decisions and evidence only after focused tests or
-   benchmarks. Keep claims bound to exact commits, model artifacts, prompts,
-   settings, and hardware.
+This repo is worked concurrently by agents on several platforms. Check with the
+operator or the session driving the current release before heavy host work
+(builds, model loads); self-hosted model gates fail closed on host contention.
+Exactly one release driver dispatches cache-lifecycle/release workflows. Merges
+to main are never blocked by gate runs. Gate models are pinned via repo Actions
+variables (`<FAMILY>_MODEL_PATH`/`_SHA256`); an agent MUST NOT delete anything
+under `/opt/hf2q/models/`; it is release-gate infrastructure.
 
-The generic `ruflo status` command primarily reports active swarm/session
-state. It may show no active memory backend when no swarm is running even while
-the project's native AgentDB is healthy. Do not infer that project memory is
-empty from that view; use `ak status` and the live memory MCP.
-
-Established memory namespaces include `decisions`, `evidence`, `hf2q`,
-`hf2q-patterns`, and `coordination`. For DeepSeek-V4, the decision key
-`deepseek-v4-flash-architecture-contract` points to
-`docs/adr/ADR-042-deepseek-v4-flash-rust-native.md`; the agentic acceptance contract
-is stored as `hf2q/deepseek4-agentic-serving-contract-2026-08-05`.
-
-### Live multi-agent coordination (all platforms)
-
-This repo is worked concurrently by agents on multiple platforms (Claude
-Code, Codex, OpenCode, …). The shared bus is Ruflo memory, namespace
-`coordination` — every platform has the memory tools; use them, not
-platform-private memory, for anything another agent might need:
-
-- `hf2q/release/status` — live release/gate state. Check it BEFORE heavy
-  box work (builds, model loads); the self-hosted model gates fail closed
-  on host contention.
-- `hf2q/release/driver` — which session is driving a release. Exactly one
-  driver dispatches cache-lifecycle/release workflows; ask it (key
-  `hf2q/release/inbox/<your-name>`) instead of dispatching yourself.
-- `hf2q/release/protocol` — the standing rules: merges to main are never
-  blocked by gate runs (identity checks assert main *ancestry*, not tip);
-  compile-quiet applies only during model-gate windows; gate models are
-  pinned via repo Actions variables (`<FAMILY>_MODEL_PATH`/`_SHA256`);
-  an agent MUST NOT delete anything under `/opt/hf2q/models/`; it is
-  release-gate infrastructure.
-
-Use Ruflo routing or swarms only when work has genuinely independent lanes and
-the added coordination is useful. Two writers MUST NOT share one worktree.
-One integration owner reconciles manifests, lockfiles, ADRs, and final commits.
-Machine-managed Claude/Codex dual-host guidance belongs in machine-scoped
-configuration and MUST NOT be copied into this checked-in file.
+Two writers MUST NOT share one worktree. One integration owner reconciles
+manifests, lockfiles, ADRs, and final commits. Machine-managed Claude/Codex
+dual-host guidance belongs in machine-scoped configuration and MUST NOT be
+copied into this checked-in file.
 
 ## Non-negotiable product boundaries
 
@@ -170,7 +138,7 @@ A failed spike is useful evidence, not a shippable change. Remove it from the
 landing diff and record the measured conclusion before pursuing the revised
 hypothesis. Stopping short of the complete loop is a Kata violation.
 
-1. Recall Ruflo decisions/evidence and read the governing ADR.
+1. Read the relevant `memory-bank/` entries and the governing ADR.
 2. Inspect `git status`, relevant source, tests, dependency pins, runtime state,
    and any existing user changes before editing.
 3. State the observable contract and failure path. Add or update the smallest
@@ -262,7 +230,7 @@ release, and an unpushed commit MUST be described as local.
 - After `main` has been fast-forwarded past the merge, the owner of the
   worktree SHOULD remove it and its local topic branch.
 - Files that a tool generates into a checkout, such as a rewritten
-  `CLAUDE.md` or `AGENTS.md`, `.claude/`, `.claude-flow/`, or `.agentic-qe/`,
+  `CLAUDE.md` or `AGENTS.md` or `.claude/`,
   MUST NOT be committed. An agent that finds the primary checkout dirty with
   such files MUST restore them from `HEAD` instead of carrying them into a
   change.
