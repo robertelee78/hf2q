@@ -623,8 +623,11 @@ published:
 
 Evidence at the time of the decision: DeepSeek-V4 joint decode (#458)
 reduced four-agent median makespan from 141.7 s to 105.0 s, bitwise equal to
-serial decode. Qwen3.6's hf2q arm fails its coding task on a near-tie in model
-output (#461). DeepSeek-V4 and Gemma 4 have no peer adapter. This update
+serial decode. Qwen3.6 fails its coding task on both engines because of a
+non-compiling idiom in the model weights, not hf2q numerics (BelowFloor
+campaign `quality-qwen36-peer-exp0b95-20261030T174020Z`; diagnosis in
+`docs/research/adr063-qwen36-task-failure-diagnosis.md`; hf2q fixes in #461).
+DeepSeek-V4 and Gemma 4 have no peer adapter. This update
 establishes no speed win by itself.
 
 ### Native-engine peer arms (operator decision 2026-10-31)
