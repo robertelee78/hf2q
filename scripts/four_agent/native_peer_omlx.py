@@ -14,10 +14,15 @@ Request (api/openai_models.py:333-428, server.py:4994-5240):
   global defaults (temperature 1.0, top_p 0.95; settings.py:806-808) unless force_sampling is set
   (server.py:1882-2047); the model settings pin force_sampling false and every request sends top_p 1, top_k 0,
   min_p 0, presence/frequency 0 explicitly.
-- repetition_penalty 1.05 with repetition_context_size 64: hf2q's Qwen and Gemma penalty and its 64-token window
-  (engine_qwen35.rs QWEN35_REPETITION_WINDOW; family_peer.SAMPLING gemma4). mlx-lm's default window is 20
-  (request.py:64-67; server.py:5198-5203). Whether mlx-lm's BatchGenerator seeds the window with the prompt
-  tail, as hf2q does, is not established from source: recorded as a parity risk.
+- repetition_penalty 1.05 (hf2q's Qwen and Gemma value) with a per-family repetition_context_size; mlx-lm's
+  default window is 20 (request.py:64-67; server.py:5198-5203).
+  Qwen 64: hf2q seeds a 64-token sliding window with the prompt tail and slides it over generated tokens
+  (src/serve/api/engine_qwen35.rs:4508-4519).
+  Gemma 8192 (= MAX_TOKENS): hf2q penalizes every distinct token generated in the request, with no window and an
+  empty history at the first token (src/serve/api/engine.rs:7785-7788, src/serve/sampler_pure.rs:557-574).
+  Whether oMLX's mlx-lm processor history includes prompt tokens is not established from source: for Qwen the
+  window may hold different prompt tokens than hf2q's tail; for Gemma a prompt-seeded history would penalize
+  prompt tokens hf2q never penalizes. Recorded as a parity risk (Unavailable), never assumed.
 - chat_template_kwargs reach the template (server.py:4817-4842; model_settings.py:1919-1949). Qwen: hf2q
   renders thinking on with preserve_thinking true (handlers.rs:1733-1737) and no explicit effort, so the
   request sends {enable_thinking: true, preserve_thinking: true} and no reasoning_effort (the template's own
@@ -91,9 +96,16 @@ ARTIFACTS = {
 MODEL_IDS = {q3: a['model_id'] for q3, a in ARTIFACTS.items()}
 LABELS = {q3: f"oMLX {OMLX_COMMIT[:7]} (native {a['title']} MLX 4-bit)" for q3, a in ARTIFACTS.items()}
 SAMPLING_FIELDS = {'temperature': 0, 'top_p': 1.0, 'top_k': 0, 'min_p': 0.0, 'presence_penalty': 0.0,
-                   'frequency_penalty': 0.0, 'repetition_penalty': 1.05, 'repetition_context_size': 64}
-NATIVE = {'qwen': {**SAMPLING_FIELDS, 'chat_template_kwargs': {'enable_thinking': True, 'preserve_thinking': True}},
-          'gemma4': {**SAMPLING_FIELDS, 'chat_template_kwargs': {'enable_thinking': False}}}
+                   'frequency_penalty': 0.0, 'repetition_penalty': 1.05}
+# hf2q's repetition history: Qwen a 64-token sliding window seeded from the prompt tail (engine_qwen35.rs:4508-4519);
+# Gemma every generated token of the request, no window (engine.rs:7785-7788, sampler_pure.rs:557-574).
+REPETITION_WINDOW = {'qwen': 64, 'gemma4': MAX_TOKENS}
+SAMPLING = {family: {**SAMPLING_FIELDS, 'repetition_context_size': window}
+            for family, window in REPETITION_WINDOW.items()}
+REPETITION_PARITY = ('Unavailable:whether oMLX/mlx-lm seeds the repetition history with prompt tokens is not '
+                     'established from source (hf2q: Qwen seeds 64 prompt-tail tokens, Gemma seeds none)')
+NATIVE = {'qwen': {**SAMPLING['qwen'], 'chat_template_kwargs': {'enable_thinking': True, 'preserve_thinking': True}},
+          'gemma4': {**SAMPLING['gemma4'], 'chat_template_kwargs': {'enable_thinking': False}}}
 _CONTROLS = {'engine': ENGINE, 'source_commit': OMLX_COMMIT, 'version': OMLX_VERSION, 'slots': SLOTS,
              'context_per_slot': CONTEXT_PER_SLOT, 'max_concurrent_requests': SLOTS,
              'max_context_window': CONTEXT_PER_SLOT, 'default_max_tokens': MAX_TOKENS, 'model_type_override': 'llm',
@@ -103,6 +115,7 @@ _CONTROLS = {'engine': ENGINE, 'source_commit': OMLX_COMMIT, 'version': OMLX_VER
              **{'request_' + k: v for k, v in SAMPLING_FIELDS.items()}, 'request_parallel_tool_calls': 'omitted'}
 CONTROLS = {q3: {**_CONTROLS, 'q3_family': q3, 'cache_family': a['family'], 'model_id': a['model_id'],
                  'target': f"{a['repo']}@{a['revision']}",
+                 'request_repetition_context_size': REPETITION_WINDOW[a['family']],
                  **({'request_enable_thinking': True, 'request_preserve_thinking': True,
                      'request_thinking_budget_user': BUDGET_USER, 'request_thinking_budget_tool': BUDGET_TOOL}
                     if a['family'] == 'qwen' else {'request_enable_thinking': False, 'request_thinking_budget': None})}

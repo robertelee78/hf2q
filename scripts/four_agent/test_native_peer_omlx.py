@@ -96,7 +96,8 @@ class Translation(unittest.TestCase):
                         expected = {'model': MODEL[q3], 'messages': messages, 'tools': schemas(), 'tool_choice': 'auto',
                                     'max_completion_tokens': 8192, 'logprobs': False, 'stream': turn % 2 == 1,
                                     'temperature': 0, 'top_p': 1.0, 'top_k': 0, 'min_p': 0.0, 'presence_penalty': 0.0,
-                                    'frequency_penalty': 0.0, 'repetition_penalty': 1.05, 'repetition_context_size': 64,
+                                    'frequency_penalty': 0.0, 'repetition_penalty': 1.05,
+                                    'repetition_context_size': 64 if qwen else 8192,
                                     'chat_template_kwargs': ({'enable_thinking': True, 'preserve_thinking': True} if qwen
                                                              else {'enable_thinking': False}),
                                     **({'thinking_budget': budget} if qwen else {})}
@@ -106,8 +107,17 @@ class Translation(unittest.TestCase):
                         self.assertIs(type(request['temperature']), int)
                         self.assertFalse({'parallel_tool_calls', 'reasoning_effort'} & set(request))
                         delta = {k for k in request if k not in hf} | {k for k in hf if k not in request}
-                        self.assertEqual(delta, {'hf2q_overflow_policy', 'chat_template_kwargs', *om.SAMPLING_FIELDS}
-                                         | ({'thinking_budget'} if qwen else set()))
+                        self.assertEqual(delta, {'hf2q_overflow_policy', 'chat_template_kwargs', 'repetition_context_size',
+                                                 *om.SAMPLING_FIELDS} | ({'thinking_budget'} if qwen else set()))
+
+    def test_repetition_window_matches_the_hf2q_family_history(self):
+        # Qwen: 64-token sliding window (engine_qwen35.rs:4508-4519); Gemma: every generated token, no window
+        # (engine.rs:7785-7788) -- 8192 covers the whole output allowance.
+        self.assertEqual(native(0, 'qwen36')['repetition_context_size'], 64)
+        self.assertEqual(native(0, 'gemma4')['repetition_context_size'], om.MAX_TOKENS)
+        self.assertEqual({q3: c['request_repetition_context_size'] for q3, c in om.CONTROLS.items()},
+                         {'qwen38': 64, 'qwen36': 64, 'gemma4': 8192})
+        self.assertTrue(om.REPETITION_PARITY.startswith('Unavailable:'))
 
     def test_budget_follows_the_hf2q_qwen_ceiling_rule(self):
         tail = chain() + [{'role': 'system', 'content': 'late system'}]
@@ -124,7 +134,8 @@ class Translation(unittest.TestCase):
                 wire(canonical, family)
             request = native(1, q3)
             drift = [('temperature', 0.6), ('top_p', 0.95), ('top_k', 20), ('min_p', 0.05), ('top_p', True),
-                     ('repetition_penalty', 1.0), ('repetition_context_size', 20), ('presence_penalty', 0.5),
+                     ('repetition_penalty', 1.0), ('repetition_context_size', 20),
+                     ('repetition_context_size', 8192 if family == 'qwen' else 64), ('presence_penalty', 0.5),
                      ('frequency_penalty', 0.1), ('chat_template_kwargs', {'enable_thinking': True}),
                      ('chat_template_kwargs', {'enable_thinking': family != 'qwen', 'preserve_thinking': True}),
                      ('reasoning_effort', 'xhigh'), ('parallel_tool_calls', False), ('seed', 1), ('stop', ['x']),

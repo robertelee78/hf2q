@@ -400,7 +400,8 @@ def readiness(base, model, output, packet):
             'source_revision': om.OMLX_COMMIT, 'version': om.OMLX_VERSION, 'logical_slots': om.SLOTS,
             'context_per_slot': om.CONTEXT_PER_SLOT,
             'think_mode': 'thinking (preserve_thinking, budget 2048/512)' if om.ARTIFACTS[q3]['family'] == 'qwen'
-            else 'no thinking', 'sampling': dict(om.SAMPLING_FIELDS), 'controls': packet['family_controls'],
+            else 'no thinking', 'sampling': dict(om.SAMPLING[om.ARTIFACTS[q3]['family']]),
+            'repetition_history': om.REPETITION_PARITY, 'controls': packet['family_controls'],
             'identity': identity, 'server_argv': launch['argv'], 'process_title': title, 'health': health,
             'status': status, 'served_model': served, 'settings': {**settings, 'model_settings_sha256':
                                                                     packet['native_omlx_settings_sha256']},

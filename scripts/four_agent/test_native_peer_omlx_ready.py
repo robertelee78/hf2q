@@ -100,7 +100,7 @@ def tools(title='omlx-server', dirty=b''):
     return patch.object(ready.subprocess, 'run', side_effect=run)
 
 
-def saved_settings(spec, **changes):
+def saved_settings(spec, changes=None):
     paths = ready.layout(ready.native_spec(spec))
     doc = {'version': '1.0', 'server': {'host': '127.0.0.1', 'port': int(spec['port']), 'sse_keepalive_mode': 'off',
                                         'log_level': 'info', 'burst_decode_mode': 'balanced'},
@@ -110,7 +110,7 @@ def saved_settings(spec, **changes):
            'memory': {'memory_guard_tier': 'aggressive', 'prefill_memory_guard': True},
            'huggingface': {'endpoint': None, 'hf_cache_enabled': False}, 'idle_timeout': {'idle_timeout_seconds': None},
            'sampling': {'temperature': 1.0, 'top_p': 0.95, 'max_tokens': 32768}}
-    for (section, key), value in changes.items():
+    for (section, key), value in (changes or {}).items():
         doc[section][key] = value
     (paths['base'] / 'settings.json').write_text(json.dumps(doc))
 
@@ -314,7 +314,7 @@ class Readiness(unittest.TestCase):
         for change, docs in cases:
             with self.subTest(change=change, docs=list(docs)):
                 packet = {**good, **change.get('packet', {})}
-                saved_settings(spec, **change.get('settings', {}))
+                saved_settings(spec, change.get('settings'))
                 logs(spec, change.get('log', ''))
                 with self.serve(spec, **docs), tools(change.get('title', 'omlx-server')), self.assertRaises(Invalid):
                     ready.readiness(change.get('base', base), change.get('model', model_id), self.root, packet)

@@ -251,9 +251,14 @@ class Audit(unittest.TestCase):
             report = audit.audit_run(*self.run_dir(Path(tmp)))
         self.assertEqual((report['requests'], report['totals']['completion_tokens'], report['totals']['cached_tokens'],
                           report['tool_parser_warnings']), (2, 80, 768, 0))
-        warning = '2026-10-31 10:00:03,000 - omlx.api.tool_calling - WARNING - Recovered tool call from reasoning\n'
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(audit.audit_run(*self.run_dir(Path(tmp), extra=warning))['tool_parser_warnings'], 1)
+        for warning in ('2026-10-31 10:00:03,000 - omlx.api.tool_calling - WARNING - Native tool parser failed '
+                        'for qwen, recovered via XML fallback\n',
+                        '2026-10-31 10:00:03,000 - omlx.api.tool_calling - INFO - Remapped namespaced tool call name '
+                        "'functions.read_file' -> 'read_file'\n"):
+            with tempfile.TemporaryDirectory() as tmp:
+                warned = audit.audit_run(*self.run_dir(Path(tmp), extra=warning))
+            self.assertEqual(warned['tool_parser_warnings'], 1, warning)
+            self.assertTrue(warned['recovery_attribution'].startswith('Unavailable:'))
         self.assertEqual(audit.final_finish(stream(), True), 'tool_calls')
         self.assertEqual(audit.final_finish(completion_body(call_message(), 'tool_calls'), False), 'tool_calls')
         self.assertEqual(CALL, call_message()['tool_calls'][0]['id'])
@@ -268,6 +273,8 @@ class Audit(unittest.TestCase):
                  {'lines': stream_line},  # a client response the server never recorded
                  {'extra': line(model, use(), 'stop', False)},  # a chat request the client never sent
                  {'extra': '2026-10-31 - omlx.api.tool_calling - WARNING - Dropping tool call \'x\': bad\n'},
+                 {'extra': '2026-10-31 - omlx.api.tool_calling - WARNING - Dropping bracket tool call: bad\n'},
+                 {'extra': '2026-10-31 - omlx.api.tool_calling - WARNING - Dropped 1 tool call(s) from reasoning\n'},
                  {'proof': False}, {'tamper': True}]
         for changes in cases:
             with self.subTest(changes=changes), tempfile.TemporaryDirectory() as tmp, self.assertRaises(Invalid):
