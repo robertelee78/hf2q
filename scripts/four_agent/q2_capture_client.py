@@ -55,7 +55,7 @@ def quiet(service, binary):
 
 def sandbox_profile(root, binary, port):
     # Empty HOME/config/cwd removes repository/user hooks. File reads cannot
-    # reach old user configuration, credentials, plugins or Ruflo packages.
+    # reach old user configuration, credentials or plugins.
     require(type(port) is int and 1024 <= port <= 65535, "owned stub port before sandbox rendering")
     for value in (str(root), str(binary)):
         require(not any(c in value for c in ('"', '\\', '\n')), "sandbox path quoting")

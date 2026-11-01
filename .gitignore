@@ -3,14 +3,9 @@ __pycache__/
 _bmad-output/
 _bmad/
 !vendor/candle-metal-kernels/examples/
-.agentic-qe/
 .cargo/
 .cfa-archive/
 .cfa-worktrees/
-.claude-flow/
-.claude-flow/data/
-.claude-flow/logs/
-.claude-flow/sessions/
 .claude/
 .codex/
 .DS_Store
@@ -18,15 +13,10 @@ _bmad/
 .env.*.local
 .env.local
 .mcp.json
-.swarm/
 .worktrees/
-*.rvf
-*.rvf.idmap.json
-*.rvf.lock
 /.agents/
 /artifacts/
 /cache
-/CLAUDE.md.pre-ruflo*
 /metrics.txt
 /models/
 /target
@@ -37,13 +27,11 @@ _bmad/
 # 2026-05-16: `examples/` at the repo root is now part of the public
 # ADR-005 Phase 2c iter-101 vision E2E harness:
 # ADR-033 P6: temporary byte-cmp output (large quantized GGUFs)
-# Agentic-QE local SQLite memory (accidentally committed in 9602b06; reverted)
 # and docs/; multi-gigabyte runtime artifacts never belong in git.
 # bench scripts; that material moved to scripts/ long ago.
 # BMad project files
 # Build artifacts
 # Claude Code local config
-# Claude Flow runtime data
 # Codex local configuration
 # Data artifacts — local databases and lock files
 # dump_layer_states binary (built separately via g++)
@@ -65,7 +53,6 @@ _bmad/
 # per-run report and must not be committed.
 # receipts. Checked-in fixtures and reproducible evidence live under tests/
 # release (5 self-contained scenarios + README index).  Was gitignored
-# Ruflo local secrets and runtime data
 # Runtime logs (per-session, never committed).
 # Runtime output from `hf2q generate --benchmark` (ADR-005 1bNEW.0 metrics
 # sibling-path convention to nested on 2026-04-24 per Robert's directive).
@@ -82,7 +69,6 @@ CLAUDE.md
 docs/phase0-candle-perkernel-raw.json
 iter*_audit.json
 logs/
-ruvector.db
 scripts/dump_layer_states
 tests/fixtures/vision/*.png
 tests/fixtures/vision/last_e2e_report.json

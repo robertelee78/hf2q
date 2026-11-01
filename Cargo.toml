@@ -27,7 +27,6 @@ exclude = [
     # deliberately outside the crate, even when a developer has not added
     # them to a personal gitignore yet.
     ".agents/**",
-    "CLAUDE.md.pre-ruflo*",
     "artifacts/**",
     # Test harnesses are excluded except the small source/fixture files that
     # crate-local unit tests read with include_str!. Keeping those makes the
