@@ -109,24 +109,6 @@ def log(ctx=393216, port=18251, trace='/run/ds4-trace.txt', sessions=4, backend=
     return '\n'.join(lines) + '\n'
 
 
-def trace_block(rid, stream_on, think='max', temp='0.000', min_p='0.000', max_tokens=8192, prefix=True, include=None):
-    include = stream_on if include is None else include
-    return (f'\n===== request {rid} 2026-10-31 12:00:0{rid} =====\nkind: chat\nmodel: {M}\nstream: {int(stream_on)}\n'
-            f'tools: 1\nthink_mode: {think}\nprompt_tokens: 1000\neffective_prompt_tokens: 1000\ncached_tokens: 0\n'
-            f'max_tokens: {max_tokens}\ntemperature: {temp}\ntop_k: 0\ntop_p: 1.000\nmin_p: {min_p}\nignore_eos: 0\n'
-            f'seed: 0\nstream_include_usage: {int(include)}\n'
-            '\n--- cache decision ---\nlive_tokens_before: 0\ncache_source: none\ncached_tokens: 0\n'
-            '\n--- raw request json ---\n{"model":"deepseek-v4-flash"}\n'
-            '\n--- rendered prompt ---\n' + nd.BOS + (nd.THINK_MAX_PREFIX if prefix else '') +
-            'unchanged<｜User｜>task<｜Assistant｜><think>\n\n--- generated text ---\n')
-
-
-def trace_text(first=None, second=None, ends=(1, 2)):
-    end = ''.join(f'\n\n--- parsed message ---\nfinish: tool_calls\n\n===== end request {r} =====\n' for r in ends)
-    return ((first or trace_block(1, False)) + 'piece of 1 ' + (second or trace_block(2, True)) +
-            'more of 1 piece of 2' + end)
-
-
 class Translation(unittest.TestCase):
     def test_canonical_request_maps_to_exact_ds4_fields(self):
         for turn in range(7):
@@ -364,45 +346,6 @@ class Readiness(unittest.TestCase):
                                       **nd.CONTROLS, 'native_ctx_per_session': 524288}})):
                     with self.subTest(base=base, bad=str(bad)[:40]), self.assertRaises(Invalid):
                         nd.readiness(base, M, out, bad)
-
-
-class Trace(unittest.TestCase):
-    def audit(self, text, requests=2, streamed=1):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / nd.TRACE_NAME
-            path.write_text(text)
-            return nd.audit_trace(path, M, requests, streamed)
-
-    def test_every_request_ran_think_max_greedy_with_the_rendered_prefix(self):
-        self.assertEqual(self.audit(trace_text())['requests'], 2)
-
-    def test_trace_drift_refuses(self):
-        for text in (trace_text(trace_block(1, False, think='high')), trace_text(trace_block(1, False, temp='1.000')),
-                     trace_text(trace_block(1, False, min_p='0.050')), trace_text(trace_block(1, False, prefix=False)),
-                     trace_text(trace_block(1, False, max_tokens=393216)),
-                     trace_text(trace_block(1, False, include=True)), trace_text(ends=(1,)),
-                     trace_text(second=trace_block(3, True))):
-            with self.subTest(text=text[:90]), self.assertRaises(Invalid):
-                self.audit(text)
-        with self.assertRaises(Invalid):
-            self.audit(trace_text(), requests=3)
-        with self.assertRaises(Invalid):
-            self.audit(trace_text(), streamed=2)
-
-    def test_run_audit_binds_the_trace_of_this_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run = Path(tmp).resolve()
-            (run / 'client').mkdir()
-            (run / nd.TRACE_NAME).write_text(trace_text())
-            summary = {'native_readiness': {'engine_kind': 'ds4', 'source_revision': nd.DS4_COMMIT, 'think_mode': 'max',
-                                            'startup': {'trace_path': str(run / nd.TRACE_NAME)}}}
-            turns = {'agent-0': [{'stream': False}, {'stream': True}]}
-            self.assertEqual(nd.audit_run(summary, run / 'client', turns)['think_mode'], 'max')
-            summary['native_readiness']['startup']['trace_path'] = str(run / 'client' / nd.TRACE_NAME)
-            with self.assertRaises(Invalid):
-                nd.audit_run(summary, run / 'client', turns)
-            with self.assertRaises(Invalid):
-                nd.audit_run({}, run / 'client', turns)
 
 
 class Binding(unittest.TestCase):

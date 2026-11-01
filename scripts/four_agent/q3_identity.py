@@ -98,6 +98,15 @@ def launch_problems(plan, ids):
         problems.append("every arm must serve the same model artifact (sha256, or path and size)")
     problems += [f"{name}: native artifact with its sha256 is required" for name in native
                  if not (ids["arms"][name]["artifact"] or {}).get("sha256")]
+    if native:  # an ambient hf2q MODEL/MODEL_SHA256 must never stand in for the native artifact
+        import native_peer_ds4
+        hf2q_sha = (ids["arms"]["experiment"]["artifact"] or {}).get("sha256")
+        for name in native:
+            artifact = ids["arms"][name]["artifact"] or {}
+            if artifact and Path(artifact["path"]).name != native_peer_ds4.MODEL_FILE:
+                problems.append(f"{name}: native artifact must be {native_peer_ds4.MODEL_FILE} (set --peer-var MODEL)")
+            if artifact.get("sha256") and artifact["sha256"] == hf2q_sha:
+                problems.append(f"{name}: native artifact sha256 equals the hf2q artifact's (set --peer-var MODEL_SHA256)")
     stock, experiment = ids["arms"]["stock"]["binary"]["sha256"], ids["arms"]["experiment"]["binary"]["sha256"]
     if stock is not None and stock == experiment:
         problems.append("stock and experiment binaries are identical")

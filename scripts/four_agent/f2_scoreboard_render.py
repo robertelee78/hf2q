@@ -287,9 +287,9 @@ def comparisons(manifest):
                                          c["arm"][1] or "", c["baseline"][0]))
 
 
-def effect_is_win(row):
-    return (row["kind"] == "effect" and row["verification"]["state"] == "Verified" and
-            row["status"] in ("Qualified", "Descriptive") and row.get("ci95") is not None and row["ci95"][0] > 0)
+def effect_is_win(row):  # a native-engine (different artifact) comparison is never a win
+    return (row["kind"] == "effect" and row["verification"]["state"] == "Verified" and row.get("baseline_arm") != "ds4_native"
+            and row["status"] in ("Qualified", "Descriptive") and row.get("ci95") is not None and row["ci95"][0] > 0)
 
 
 def fmt(value, decimals):
@@ -337,6 +337,8 @@ def short(sha):
 
 def render(manifest, scoreboards, manifest_sha256):
     fams, groups, rows = manifest["families"], manifest["groups"], manifest["rows"]
+    native = [x for x in rows if x.get("baseline_arm") == "ds4_native"]  # own section only, never a win/non-win
+    rows = [x for x in rows if x.get("baseline_arm") != "ds4_native"]
     band = manifest["neutral_band_ratio"]
     comps = comparisons(manifest)
     out = ["# ADR-063 F2 four-agent scoreboard", "",
@@ -400,6 +402,12 @@ def render(manifest, scoreboards, manifest_sha256):
     out += [f"| {fams[r['family']]['title']} | {groups[r['group']]['title']}: {METRICS[r['metric']][0]} | "
             f"{arm_label((r['arm'], r['variant']))} | — | {row_value(r)} {tag(r)}: {r['note']} | `{r['id']}` |"
             for r in rows if r["status"] == "Failure"]
+    if native:
+        out += ["", "## Native-engine comparisons (different artifact, task makespan only)", "",
+                "| Family | Comparison | Makespan effect | Statement, token volume, output rate, TTFT ratio | Evidence |",
+                "|---|---|---|---|---|"] + [
+            f"| {fams[x['family']]['title']} | {arm_label((x['arm'], x['variant']))} vs {BASELINE_ARMS[x['baseline_arm']]} | "
+            f"{row_value(x)} {tag(x)} | {x['note']} | `{x['id']}` |" for x in native]
     out += ["", "## Open gaps", "", "| Family | Metric | Missing arms | Arms with only failed runs |", "|---|---|---|---|"]
     for fam in fams:
         frows = [r for r in rows if r["family"] == fam]

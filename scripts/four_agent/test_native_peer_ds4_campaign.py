@@ -91,7 +91,8 @@ def metrics(makespan, completion=2000, ttft=1.0):
 def manifest(peer_kind):
     blocks = [{'block': b, 'order': ['stock', 'experiment', 'peer'], 'entries': [
         {'name': f'n4-{b}-{arm}', 'arm': arm, 'kind': 'measured', 'block': b, 'attempts': [], 'outcome': 'Pass',
-         'failure_kind': None, 'reason': None, 'metrics': metrics(*spec)}
+         'failure_kind': None, 'reason': None,
+         'metrics': {**metrics(*spec), 'audit': {'native_trace': {'recovery_total': 0}} if arm == 'peer' else None}}
         for arm, spec in (('stock', (100.0,)), ('experiment', (80.0, 2400, 1.5)), ('peer', (100.0, 1600, 3.0)))]}
         for b in range(1, 6)]
     peer = {'engine_kind': peer_kind, **({'label': nd.LABEL} if peer_kind == 'ds4' else {})}
@@ -157,6 +158,13 @@ class Campaign(unittest.TestCase):
         self.assertFalse(q3_identity.same_model(ids))  # the default rule still sees two artifacts
         ids['arms']['peer']['artifact']['sha256'] = None
         self.assertIn('peer: native artifact with its sha256 is required', q3_identity.launch_problems(plan, ids))
+        ids['arms']['peer']['artifact'] = {'path': '/m.gguf', 'bytes': 10, 'sha256': 'a' * 64}  # ambient hf2q MODEL leaked
+        problems = q3_identity.launch_problems(plan, ids)
+        self.assertIn(f'peer: native artifact must be {nd.MODEL_FILE} (set --peer-var MODEL)', problems)
+        self.assertIn("peer: native artifact sha256 equals the hf2q artifact's (set --peer-var MODEL_SHA256)", problems)
+        ids['arms']['peer']['artifact'] = {'path': f'/opt/ds4/gguf/{nd.MODEL_FILE}', 'bytes': 9, 'sha256': 'a' * 64}
+        self.assertEqual([p for p in q3_identity.launch_problems(plan, ids) if p.startswith('peer:')],
+                         ["peer: native artifact sha256 equals the hf2q artifact's (set --peer-var MODEL_SHA256)"])
 
     def test_verdict_reports_task_makespan_separately_from_the_same_gguf_verdict(self):
         verdict = q3_report.compute_verdict(manifest('ds4'))
@@ -184,6 +192,20 @@ class Campaign(unittest.TestCase):
         self.assertEqual((native['statement_withheld'], native['failures']['peer']), ('failed task runs', ['n4-1-peer']))
         self.assertEqual(native['makespan']['blocks'], 4)
 
+    def test_server_side_tool_call_recovery_withholds_the_statement(self):
+        document = manifest('ds4')
+        peer = document['stages'][0]['blocks'][0]['entries'][2]
+        peer['metrics']['audit']['native_trace']['recovery_total'] = 2
+        native = q3_report.compute_verdict(document)['native_peer']
+        self.assertIsNone(native['statement'])
+        self.assertTrue(native['statement_withheld'].startswith('ds4 server-side tool-call recovery'))
+        self.assertIn('n4-1-peer', native['statement_withheld'])
+        self.assertEqual(native['tool_call_recovery_per_run']['n4-1-peer'], 2)
+        self.assertEqual(q3_report.compute_verdict(document)['verdict'], 'Unavailable')  # recorded, never Invalid
+        peer['metrics']['audit'] = None
+        self.assertTrue(q3_report.compute_verdict(document)['native_peer']['statement_withheld']
+                        .startswith('ds4 trace audit missing'))
+
     def test_rows_label_the_native_baseline_and_validate(self):
         out = self.root / 'evidence' / 'q3-deepseek4'
         out.mkdir(parents=True)
@@ -200,6 +222,19 @@ class Campaign(unittest.TestCase):
                  **rows}
         f2.validate_manifest(board)
         self.assertEqual(f2.verify_rows(board, self.root), [r['id'] for r in rows['rows']])
+        native_row = rows['rows'][1]
+        for figure in ('finishes the same coding task 20.0% sooner', 'Median tokens per run', 'output tokens/s',
+                       'TTFT ratio experiment/ds4 0.5'):
+            self.assertIn(figure, native_row['note'])
+        text = f2.render(f2.validate_manifest(board), [], '0' * 64)
+        title = '## Native-engine comparisons (different artifact, task makespan only)'
+        section = lambda start: text[text.index(start):text.find('\n## ', text.index(start) + len(start))]
+        self.assertIn(f"`{native_row['id']}`", section(title))
+        self.assertIn('Median tokens per run', section(title))
+        self.assertIn(f"`{rows['rows'][0]['id']}`", section('### Descriptive wins'))
+        for other in ('## Wins vs baseline', '## Negative results', '## Open gaps', '## DeepSeek-V4 Flash'):
+            self.assertNotIn(f"`{native_row['id']}`", section(other))
+        self.assertFalse(f2.effect_is_win(native_row))
 
     def test_metrics_carry_native_build_identity_and_token_volume(self):
         summary = {'native_readiness': {'build_info': 'ds4 x'},

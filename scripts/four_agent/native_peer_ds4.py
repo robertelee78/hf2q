@@ -29,7 +29,6 @@ startup log (log_context_memory 15496-15528, batched line 16014-16020, trace 160
 import hashlib
 from pathlib import Path
 import re
-import statistics
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
@@ -103,8 +102,13 @@ THINK_MAX_PREFIX = ('Reasoning Effort: Absolute maximum with no shortcuts permit
                     'Explicitly write out your entire deliberation process, documenting every intermediate step, '
                     'considered alternative, and rejected hypothesis to ensure absolutely no assumption is left '
                     'unchecked.\n\n')
-TEMPLATE = ('Unavailable:ds4 renders DSML/think prompts in C (no template file); per-request think_mode and '
-            'the Think Max rendered-prompt prefix are proven by the --trace audit')
+# Known prompt differences from hf2q's 0731 template (deepseek-v4-flash-0731.jinja:42-46, 54-60):
+# ds4 puts tool schemas BEFORE the client system text (ds4_server.c:3114-3133), and its Think Max
+# prefix is the template's weaker `high` wording, which likely shortens ds4 reasoning (favours ds4).
+TEMPLATE = ('Unavailable:ds4 renders DSML/think prompts in C (no template file); differs from the hf2q 0731 '
+            'template in tools-before-system ordering and in using the template `high` (not `max`) effort text, '
+            'which likely shortens ds4 reasoning and favours ds4 on makespan; per-request think_mode and the ds4 '
+            'Think Max rendered-prompt prefix are proven by the --trace audit')
 SUPPORTED = ['tools', 'tool_choice', 'max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'ignore_eos',
              'stop', 'seed', 'stream', 'reasoning_effort']  # ds4_server.c:15124-15136
 Q3_ROLE = (f'{LABEL}: separately labeled different-artifact comparison, task makespan only; '
@@ -405,97 +409,3 @@ def readiness(base, model, output, packet):
     (Path(output) / 'ds4-startup.log').write_bytes(log)
     record = validate_readiness(models, log.decode('utf-8', 'replace'), model, spec['ctx'], spec['port'], spec['trace'])
     return {**record, 'identity': identity, 'build_info': build_info(spec['commit'], spec['binary_sha256'])}
-
-
-HEADER = re.compile(r'\n===== request (\d+) \d{4}-\d\d-\d\d \d\d:\d\d:\d\d =====\nkind: (\w+)\nmodel: ([^\n]*)\n'
-                    r'stream: ([01])\ntools: ([01])\nthink_mode: (\S+)\nprompt_tokens: (\d+)\n'
-                    r'effective_prompt_tokens: (\d+)\ncached_tokens: (\d+)\nmax_tokens: (\d+)\n'
-                    r'temperature: ([0-9.]+)\ntop_k: (-?\d+)\ntop_p: ([0-9.]+)\nmin_p: ([0-9.]+)\n'
-                    r'ignore_eos: ([01])\nseed: (\d+)\nstream_include_usage: ([01])\n')
-RAW_MARK, PROMPT_MARK, GEN_MARK = '\n--- raw request json ---\n', '\n--- rendered prompt ---\n', '\n--- generated text ---\n'
-
-
-def parse_trace(text):
-    """Per-request header facts; each header..generated-text block is written under one lock."""
-    records = []
-    for match in HEADER.finditer(text):
-        (rid, kind, model, stream, tools, think, prompt, _effective, cached, max_tokens,
-         temperature, top_k, top_p, min_p, ignore_eos, _seed, include_usage) = match.groups()
-        raw = text.find(RAW_MARK, match.end())
-        rendered = text.find(PROMPT_MARK, raw)
-        generated = text.find(GEN_MARK, rendered)
-        nxt = HEADER.search(text, match.end())
-        require(0 < raw < rendered < generated and (nxt is None or nxt.start() > generated), 'ds4 trace request block')
-        records.append({'id': int(rid), 'kind': kind, 'model': model, 'stream': stream == '1', 'tools': tools == '1',
-                        'think_mode': think, 'prompt_tokens': int(prompt), 'cached_tokens': int(cached),
-                        'max_tokens': int(max_tokens), 'sampling': (temperature, int(top_k), top_p, min_p),
-                        'ignore_eos': ignore_eos == '1', 'include_usage': include_usage == '1',
-                        'think_max_prefix': text.startswith(BOS + THINK_MAX_PREFIX, rendered + len(PROMPT_MARK)),
-                        'ended': f'\n===== end request {rid} =====\n' in text})
-    return records
-
-
-def audit_trace(path, model, requests, streamed):
-    """Every chat request ran Think Max with greedy sampling and the ds4 Think Max rendered prefix."""
-    records = parse_trace(Path(path).read_bytes().decode('utf-8', 'surrogateescape'))
-    require([r['id'] for r in records] == list(range(1, requests + 1)), 'ds4 trace request count/order')
-    for r in records:
-        require(r['kind'] == 'chat' and r['model'] == model and r['tools'] and r['ended'], 'ds4 trace request identity')
-        require(r['think_mode'] == 'max' and r['think_max_prefix'], 'ds4 request did not run Think Max')
-        require(r['sampling'] == ('0.000', 0, '1.000', '0.000') and r['max_tokens'] == MAX_TOKENS
-                and not r['ignore_eos'] and r['include_usage'] == r['stream'], 'ds4 trace sampling/output controls')
-    require(sum(r['stream'] for r in records) == streamed, 'ds4 trace transport mix')
-    return {'path': str(path), 'requests': requests, 'think_mode': 'max', 'rendered_prefix': 'ds4 Think Max',
-            'sampling': 'greedy (temperature 0.000, top_k 0, top_p 1.000, min_p 0.000)', 'max_tokens': MAX_TOKENS}
-
-
-def audit_run(summary, client_dir, turns):
-    """q2_run_audit hook: bind the client's readiness record and audit the run's --trace."""
-    record = summary.get('native_readiness')
-    require(isinstance(record, dict) and record.get('engine_kind') == ENGINE and record.get('source_revision') == DS4_COMMIT
-            and record.get('think_mode') == 'max', 'ds4 readiness record missing from the client summary')
-    path = Path(record['startup']['trace_path']).resolve()
-    require(path == Path(client_dir).resolve().parent / TRACE_NAME and path.is_file(),
-            'ds4 trace missing or not in this run directory')
-    count = sum(len(t) for t in turns.values())
-    streamed = sum(1 for t in turns.values() for receipt in t if receipt.get('stream'))
-    return audit_trace(path, MODEL_ID, count, streamed)
-
-
-def _median(values):
-    values = [v for v in values if isinstance(v, (int, float))]
-    return statistics.median(values) if values else None
-
-
-def q3_section(stage, manifest, experiment_label):
-    """Task-makespan-only native comparison for verdict.json (never the same-GGUF peer verdict).
-
-    The statement is withheld while either arm has a failed task or ds4 became unavailable: a
-    failed or missing comparator yields no makespan claim (ADR-063 Q3)."""
-    from q3_report import effect
-    makespan = effect(stage, 'experiment', 'peer', 'makespan_s')
-    entries = [e for b in stage['blocks'] for e in b['entries']]
-    runs = {arm: [e['metrics'] for e in entries if e['arm'] == arm and e['outcome'] == 'Pass' and e.get('metrics')]
-            for arm in ('experiment', 'peer')}
-    volume = {arm: {k: _median([(m.get('tokens') or {}).get(k) for m in ms]) for k in ('prompt', 'completion')}
-              for arm, ms in runs.items()}
-    rate = {arm: _median([m['tokens']['completion'] / m['makespan_s'] for m in ms
-                          if m.get('makespan_s') and (m.get('tokens') or {}).get('completion') is not None])
-            for arm, ms in runs.items()}
-    ttft = {arm: _median([m.get('worst_slot_ttft_p95_s') for m in ms]) for arm, ms in runs.items()}
-    failures = {arm: [e['name'] for e in entries if e['arm'] == arm and e['outcome'] == 'Fail']
-                for arm in ('experiment', 'peer')}
-    unavailable = manifest['unavailable'].get('peer')
-    withheld = ('ds4 arm unavailable' if unavailable else 'failed task runs' if any(failures.values())
-                else 'fewer than two complete paired blocks' if makespan['improvement_percent'] is None else None)
-    x = makespan['improvement_percent']
-    statement = None if withheld else (
-        f"{experiment_label} finishes the same coding task {abs(x):.1f}% {'sooner' if x >= 0 else 'later'} than "
-        f"{LABEL} (95% CI {makespan['improvement_ci95'][0]:.1f}..{makespan['improvement_ci95'][1]:.1f}%, "
-        f"{makespan['blocks']} blocks; different artifacts, task makespan only)")
-    return {'engine_kind': ENGINE, 'label': LABEL, 'comparison': 'different-artifact native engine; task makespan only',
-            'statement': statement, 'statement_withheld': withheld, 'makespan': makespan,
-            'token_volume_median': volume, 'output_tokens_per_s_median': rate,
-            'ttft_p95_ratio_experiment_over_ds4': None if not (ttft['experiment'] and ttft['peer'])
-            else ttft['experiment'] / ttft['peer'],
-            'unavailable': unavailable, 'failures': failures}

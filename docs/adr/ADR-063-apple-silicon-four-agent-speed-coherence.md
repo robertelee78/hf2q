@@ -661,8 +661,16 @@ recorded when their adapters land.
   quality gate. ds4 must complete the same canonical four-agent task:
   - ds4 task failures are recorded;
   - an unavailable ds4 arm is recorded;
-  - while either holds, or while either arm has a failed run, no makespan
-    statement is published (`statement_withheld`).
+  - ds4 server-side tool-call recovery is recorded per run from `--trace`.
+    ds4 can repair an unterminated tool call, or append a model-visible tool
+    error and decode again inside one request, so the client sees only the
+    second attempt (`ds4_server.c:12627-12639, 14313-14385, 14448-14520`). The
+    run stays valid;
+  - while any of these holds, or while either arm has a failed run, no
+    makespan statement is published (`statement_withheld`).
+  - Native comparisons never count as F2 wins. The scoreboard renders them in
+    their own "Native-engine comparisons" section, together with their
+    companion figures.
 - **The Think Max control is explicit.** The canonical DeepSeek-V4 request uses
   `reasoning_effort=max`.
   - ds4 renders Think Max only when the per-session `--ctx` is at least
@@ -676,10 +684,17 @@ recorded when their adapters land.
     buffers with a shared prefill workspace, or 25.5 GiB without one, versus
     about 11.5 GiB at 262144. That is on top of about 81 GiB of weights. The
     root's first calibration establishes whether this fits.
-  - Two things are not provable. ds4's Think Max prefix is the hf2q 0731
-    template's `high` text, not its `max` text, so byte-identical prompts are
-    `Unavailable`. Per-request think mode, greedy sampling and the rendered
-    prefix are proven from ds4's `--trace`.
+  - Prompt structure is not identical. ds4 renders the tool schemas before the
+    client system text (`ds4_server.c:3114-3133`), while the 0731 template
+    appends them after it (`deepseek-v4-flash-0731.jinja:42-46, 54-60`). ds4's
+    Think Max prefix is the template's `high` text, not its `max` text. The
+    weaker wording likely shortens ds4's reasoning, which biases makespan in
+    ds4's favour. Byte-identical prompts are therefore `Unavailable`.
+    Per-request think mode, greedy sampling, the rendered prefix and the token
+    counts are proven from ds4's `--trace`, bound to each client request by the
+    sha256 of its body.
+  - ds4 cohorts are not Q2-certified (`q2_certify.py` refuses them). Q3/Q1
+    audit every ds4 Pass with the trace audit instead.
 
 This decision establishes no speed win and changes no same-GGUF verdict.
 

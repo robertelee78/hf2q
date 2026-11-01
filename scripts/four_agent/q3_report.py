@@ -190,7 +190,9 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
             "design": plan["design"], "declared": plan["declared"],
             "independent_review_required": True}
     if native:
-        result["native_peer"] = native_peer_ds4.q3_section(primary, manifest, plan["declared"]["experiment"]["label"])
+        import native_peer_ds4_audit
+        result["native_peer"] = native_peer_ds4_audit.q3_section(primary, manifest,
+                                                                 plan["declared"]["experiment"]["label"])
     return result
 
 
@@ -207,6 +209,8 @@ def rows(campaign_dir, evidence_root):
     native_label = peer_arm.get("label") if peer_arm.get("engine_kind") == "ds4" else None
     peer_note = (f"{native_label}; different artifact, task makespan only, not the same-GGUF peer verdict"
                  if native_label else "peer best valid configuration")
+    if native_label:
+        from native_peer_ds4_audit import note as native_note
     ref = "$E/" + str((campaign_dir / "verdict.json").relative_to(root))
     group = f"{family}-q3"
     out = {"groups": {group: {"family": family, "title": f"{family} Q3 three-arm campaign",
@@ -240,5 +244,6 @@ def rows(campaign_dir, evidence_root):
                              "extract": {"value": {"kind": "json", "file": ref, "path": f"{path}.improvement_percent", "reduce": "one"},
                                          "ci95": {"kind": "json", "file": ref, "path": f"{path}.improvement_ci95.*", "reduce": "list"}}},
             "note": f"Q3 verdict {verdict['verdict']}; {e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
-                    f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else peer_note})."})
+                    f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else peer_note})."
+                    + (f" {native_note(verdict['native_peer'])}." if name == "vs_peer" and native_label else "")})
     return out
