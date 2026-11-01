@@ -99,8 +99,11 @@ def request_wire(request, request_raw, family, engine):
     if engine == "hf2q":
         require(wire(request, family) == request_raw, "canonical wire/no silent truncation")
     else:
-        # Same validation boundary as actual peer exchange, retaining native metadata.
-        from family_peer import canonical
+        # Same validation boundary as actual native-engine exchange, retaining native metadata.
+        if engine == "ds4":
+            from native_peer_ds4 import canonical
+        else:
+            from family_peer import canonical
         wire(canonical(request, family), family)
         require(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
                 == request_raw, "canonical native peer wire")
@@ -266,6 +269,8 @@ def certify_cohort(cohort_manifest_path, expected_plan):
                         "qwen38_n1_tools.py", "qwen_n4_live_smoke.py", "coding_family.py", "f2_trace.py", "f2_semantic.py"}
     if expected_plan["engine_kind"] == "peer":
         required_sources |= {"qwen_n4_peer.py", "family_peer.py"}
+    elif expected_plan["engine_kind"] == "ds4":
+        required_sources |= {"native_peer_ds4.py"}
     require(required_sources <= set(expected_plan["source_files"]), "all actual audit/production sources bound")
     require(isinstance(expected_plan["trace_scenario"], dict) and expected_plan["trace_scenario"].get("run_id") == expected_plan["run_id"],
             "externally frozen actual trace population scenario")
@@ -296,6 +301,10 @@ def certify_cohort(cohort_manifest_path, expected_plan):
         require(count == 4 and set(ready) == {"health", "props", "slots"}, "raw peer readiness envelope")
         validate_readiness(ready["health"], ready["props"], ready["slots"], expected_plan["model"],
                            expected_plan["family"])
+    elif expected_plan["engine_kind"] == "ds4":
+        from native_peer_ds4 import validate_readiness as native_readiness
+        require(count == 4 and set(ready) == {"models", "startup_log"}, "raw ds4 readiness envelope")
+        native_readiness(ready["models"], ready["startup_log"], expected_plan["model"])
     else:
         require(expected_plan["engine_kind"] == "hf2q", "closed engine family")
         require(ready["health"]["model"] == expected_plan["model"]

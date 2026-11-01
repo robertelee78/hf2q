@@ -21,6 +21,8 @@ ROWS_SCHEMA = "hf2q.f2.scoreboard-rows.v1"
 REPO = Path(__file__).resolve().parents[2]
 ARMS = {"hf2q_current": "hf2q current", "candidate": "candidate",
         "v0127_stock": "v0.1.27 stock", "peer": "peer"}
+# Effect baselines: every arm, plus the separately labeled native ds4 arm (never a measured column).
+BASELINE_ARMS = {**ARMS, "ds4_native": "ds4 c97964b (native Flash-0731 q2 artifact)"}
 STATUSES = {"Qualified": "Q", "Descriptive": "D", "NegativeResult": "NEG", "Failure": "FAIL"}
 # key: (title, unit, direction, gap key); direction None = not a ratio metric.
 METRICS = {
@@ -107,7 +109,7 @@ def validate_manifest(m):
         kind = row.get("kind")
         if kind == "effect":
             require(row.get("unit") == EFFECT_UNIT, f"{rid}: effect unit")
-            require(row.get("baseline_arm") in ARMS and row["baseline_arm"] != row["arm"], f"{rid}: effect baseline")
+            require(row.get("baseline_arm") in BASELINE_ARMS and row["baseline_arm"] != row["arm"], f"{rid}: effect baseline")
             ci = row.get("ci95")
             if ci is not None:
                 require(isinstance(ci, list) and len(ci) == 2 and ci[0] <= row["value"] <= ci[1], f"{rid}: ci95")
@@ -301,7 +303,7 @@ def arm_label(key):
 def row_value(row):
     if row["kind"] == "effect":
         ci = f" [{fmt(row['ci95'][0], row['decimals'])}, {fmt(row['ci95'][1], row['decimals'])}]" if row.get("ci95") else " (no CI)"
-        return f"{fmt(row['value'], row['decimals'])}{EFFECT_UNIT}{ci} vs {ARMS[row['baseline_arm']]}"
+        return f"{fmt(row['value'], row['decimals'])}{EFFECT_UNIT}{ci} vs {BASELINE_ARMS[row['baseline_arm']]}"
     if row["metric"] == "task_pass":
         return f"{int(row['value'])}/{row['n_slots']} tasks"
     return f"{fmt(row['value'], row['decimals'])} {row['unit']}"
@@ -385,7 +387,7 @@ def render(manifest, scoreboards, manifest_sha256):
     out += ["", "### Descriptive wins (not F2 primary qualified results)", ""]
     dwins = [_comp_line(c, groups, fams) for c in comps if c["verdict"] == "Win" and c["label"] == "Descriptive"]
     dwins += [f"| {fams[r['family']]['title']} | {groups[r['group']]['title']}: {METRICS[r['metric']][0]} | "
-              f"{arm_label((r['arm'], r['variant']))} vs {ARMS[r['baseline_arm']]} | — | {row_value(r)} {tag(r)} | `{r['id']}` |"
+              f"{arm_label((r['arm'], r['variant']))} vs {BASELINE_ARMS[r['baseline_arm']]} | — | {row_value(r)} {tag(r)} | `{r['id']}` |"
               for r in rows if effect_is_win(r)]
     out += (["| Family | Metric | Arm vs baseline | Ratio | Detail | Evidence |", "|---|---|---|---|---|---|"] + dwins
             if dwins else ["None."])
@@ -393,7 +395,7 @@ def render(manifest, scoreboards, manifest_sha256):
             "| Family | Metric | Arm vs baseline | Ratio | Detail | Evidence |", "|---|---|---|---|---|---|"]
     out += [_comp_line(c, groups, fams) for c in comps if c["verdict"] != "Win"]
     out += [f"| {fams[r['family']]['title']} | {groups[r['group']]['title']}: {METRICS[r['metric']][0]} | "
-            f"{arm_label((r['arm'], r['variant']))} vs {ARMS[r['baseline_arm']]} | — | {row_value(r)} {tag(r)} | `{r['id']}` |"
+            f"{arm_label((r['arm'], r['variant']))} vs {BASELINE_ARMS[r['baseline_arm']]} | — | {row_value(r)} {tag(r)} | `{r['id']}` |"
             for r in rows if r["kind"] == "effect" and not effect_is_win(r)]
     out += [f"| {fams[r['family']]['title']} | {groups[r['group']]['title']}: {METRICS[r['metric']][0]} | "
             f"{arm_label((r['arm'], r['variant']))} | — | {row_value(r)} {tag(r)}: {r['note']} | `{r['id']}` |"

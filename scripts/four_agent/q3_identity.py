@@ -50,12 +50,16 @@ def arm(name, case, overrides, environ):
     plan = q5_case.build_plan(case, q5_calibration.builtins(Path("/q3-identity") / name), qc.arm_environ(environ, overrides))
     artifact = plan["artifact"]
     exists = not q5_case.PLACEHOLDER.search(artifact["path"]) and os.path.isfile(artifact["path"])
-    return {"binary": binary(plan["binary"], name.startswith("peer")),
-            "artifact": q5_artifacts.artifact_identity(artifact["path"], artifact.get("sha256") or None) if exists else None,
-            "peer_build_info": plan["variables"].get("PEER_BUILD_INFO"),
-            "missing_variables": plan["missing_variables"],
-            "file_checks": q5_artifacts.file_checks(plan) if plan["complete"] else {},
-            "inputs": q5_artifacts.input_hashes(plan)}
+    identity = {"binary": binary(plan["binary"], name.startswith("peer")),
+                "artifact": q5_artifacts.artifact_identity(artifact["path"], artifact.get("sha256") or None) if exists else None,
+                "peer_build_info": plan["variables"].get("PEER_BUILD_INFO"),
+                "missing_variables": plan["missing_variables"],
+                "file_checks": q5_artifacts.file_checks(plan) if plan["complete"] else {},
+                "inputs": q5_artifacts.input_hashes(plan)}
+    if qc.engine_kind(case) == "ds4":  # commit + binary sha as build identity, plus runtime Metal sources
+        import native_peer_ds4
+        identity.update(native_peer_ds4.campaign_identity(plan))
+    return identity
 
 
 def identities(plan, cases, environ):
@@ -65,9 +69,16 @@ def identities(plan, cases, environ):
             "host": q5_host.host_identity(), "negative_control_receipt": plan.get("negative_control_receipt")}
 
 
-def same_model(ids):
+def native_arms(plan):
+    """Arms that serve their own native artifact (engine_kind ds4); excluded from the same-model rule."""
+    return [name for name, spec in plan["arms"].items() if spec["engine_kind"] == "ds4"]
+
+
+def same_model(ids, native=()):
     keys = set()
-    for identity in ids["arms"].values():
+    for name, identity in ids["arms"].items():
+        if name in native:
+            continue
         artifact = identity["artifact"]
         if artifact is None:
             return False
@@ -82,8 +93,11 @@ def launch_problems(plan, ids):
                  if i["missing_variables"]]
     problems += [f"{name}: {what} not found" for name, i in ids["arms"].items() for what, ok in i["file_checks"].items() if not ok]
     problems += [f"{name}: binary {i['binary']['path']} not found" for name, i in ids["arms"].items() if not i["binary"]["exists"]]
-    if not same_model(ids):
+    native = native_arms(plan)
+    if not same_model(ids, native):
         problems.append("every arm must serve the same model artifact (sha256, or path and size)")
+    problems += [f"{name}: native artifact with its sha256 is required" for name in native
+                 if not (ids["arms"][name]["artifact"] or {}).get("sha256")]
     stock, experiment = ids["arms"]["stock"]["binary"]["sha256"], ids["arms"]["experiment"]["binary"]["sha256"]
     if stock is not None and stock == experiment:
         problems.append("stock and experiment binaries are identical")

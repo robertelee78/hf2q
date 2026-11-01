@@ -169,8 +169,13 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
              "thermal_valid": False if False in thermal else (True if thermal and None not in thermal else None),
              "memory_valid": all(e["metrics"]["memory"]["q5_pass"] for e in measured
                                  if e["arm"] == "experiment" and e["outcome"] == "Pass")}
+    native = plan["arms"].get("peer", {}).get("engine_kind") == "ds4"
+    if native:  # the same-GGUF peer is unavailable; the native ds4 arm is reported separately
+        import native_peer_ds4
+        state["peer_unavailable"] = {"reason": native_peer_ds4.SAME_GGUF_UNAVAILABLE,
+                                     "evidence": plan["peer_unavailable_evidence"]}
     verdict, reasons = q3_stats.family_verdict(state)
-    return {"schema": VERDICT_SCHEMA, "family": plan["family"], "campaign_sha256": campaign_sha256,
+    result = {"schema": VERDICT_SCHEMA, "family": plan["family"], "campaign_sha256": campaign_sha256,
             "identities_sha256": manifest["identities_sha256"], "campaign_status": manifest["status"],
             "verdict": verdict, "reasons": reasons, "primary_workload": plan["primary"],
             "primary": report[plan["primary"]],
@@ -184,6 +189,9 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
             "warmups_discarded": sum(1 for _ in entries(manifest, kind="warmup")),
             "design": plan["design"], "declared": plan["declared"],
             "independent_review_required": True}
+    if native:
+        result["native_peer"] = native_peer_ds4.q3_section(primary, manifest, plan["declared"]["experiment"]["label"])
+    return result
 
 
 def rows(campaign_dir, evidence_root):
@@ -195,21 +203,28 @@ def rows(campaign_dir, evidence_root):
     verdict = json.loads((campaign_dir / "verdict.json").read_text())
     family, plan = manifest["plan"]["family"], manifest["plan"]
     arms = manifest["identities"]["arms"]
+    peer_arm = plan["arms"].get("peer", {})
+    native_label = peer_arm.get("label") if peer_arm.get("engine_kind") == "ds4" else None
+    peer_note = (f"{native_label}; different artifact, task makespan only, not the same-GGUF peer verdict"
+                 if native_label else "peer best valid configuration")
     ref = "$E/" + str((campaign_dir / "verdict.json").relative_to(root))
     group = f"{family}-q3"
     out = {"groups": {group: {"family": family, "title": f"{family} Q3 three-arm campaign",
                               "workload": "Four-agent coding client, 262144 context, 4 slots; stock "
                                           f"{plan['declared']['stock']['label']} vs experiment "
-                                          f"{plan['declared']['experiment']['label']} vs the peer, Williams blocks."}},
+                                          f"{plan['declared']['experiment']['label']} vs "
+                                          f"{native_label or 'the peer'}, Williams blocks."}},
            "rows": []}
     status = F2_STATUS.get(verdict["verdict"])
     if status is None:
         return out
     if not arms["experiment"]["artifact"] or not arms["experiment"]["artifact"].get("sha256"):
         raise ValueError("F2 rows need the model sha256 (conversion receipt or HF2Q_Q5_MODEL_SHA256)")
-    for name, baseline in (("vs_stock", "hf2q_current"), ("vs_peer", "peer")):
+    for name, baseline in (("vs_stock", "hf2q_current"), ("vs_peer", "ds4_native" if native_label else "peer")):
         e = verdict["primary"]["effects"].get(name)
-        if e is None or e["improvement_percent"] is None or (name == "vs_peer" and verdict["verdict"] == "Unavailable"):
+        withheld = native_label and (verdict.get("native_peer") or {}).get("statement_withheld")
+        if e is None or e["improvement_percent"] is None or (name == "vs_peer" and (
+                withheld or (verdict["verdict"] == "Unavailable" and not native_label))):
             continue
         path = f"primary.effects.{name}"
         out["rows"].append({
@@ -225,5 +240,5 @@ def rows(campaign_dir, evidence_root):
                              "extract": {"value": {"kind": "json", "file": ref, "path": f"{path}.improvement_percent", "reduce": "one"},
                                          "ci95": {"kind": "json", "file": ref, "path": f"{path}.improvement_ci95.*", "reduce": "list"}}},
             "note": f"Q3 verdict {verdict['verdict']}; {e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
-                    f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else 'peer best valid configuration'})."})
+                    f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else peer_note})."})
     return out

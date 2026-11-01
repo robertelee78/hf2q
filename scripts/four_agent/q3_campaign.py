@@ -3,7 +3,9 @@
 
 Arms: stock hf2q (the released binary), experiment hf2q (the candidate binary) and the
 peer in its best valid configuration (q5_cases/peer-<family>.json), plus an optional
-labeled matched-settings peer diagnostic. Every run is one q5_calibration.py supervised
+labeled matched-settings peer diagnostic. A native ds4 --peer-case (DeepSeek-V4 only, its own
+artifact) needs --peer-unavailable-evidence for the same-GGUF peer and is reported separately
+(verdict.json native_peer, task makespan only). Every run is one q5_calibration.py supervised
 runtime, started only after the previous one exited. Identities (binaries, model, peer
 build, harness sources and commit, Python, host) are frozen at campaign start and
 re-checked before every run; any change halts the campaign for good.
@@ -41,6 +43,8 @@ ARMS = ("stock", "experiment", "peer", "peer_matched")
 ROLES = {"stock": "stock hf2q: frozen released baseline", "experiment": "experimental hf2q on that baseline",
          "peer": "peer, best valid configuration (mandatory comparator)",
          "peer_matched": "peer, matched-settings diagnostic (never enters the verdict)"}
+# The peer arm may instead be the native ds4 engine (its own artifact): labeled, reported separately.
+ARM_KINDS = {"stock": ("hf2q",), "experiment": ("hf2q",), "peer": ("peer", "ds4"), "peer_matched": ("peer",)}
 TERMINAL = ("Complete", "Invalid", "IdentityDrift")
 
 
@@ -83,7 +87,7 @@ def parse_workloads(text):
 def arm_cases(args, family):
     paths = {"stock": args.hf2q_case or HERE / "q5_cases" / f"{family}.json",
              "experiment": args.hf2q_case or HERE / "q5_cases" / f"{family}.json"}
-    if not args.peer_unavailable_evidence:
+    if args.peer_case or not args.peer_unavailable_evidence:
         paths["peer"] = args.peer_case or HERE / "q5_cases" / f"peer-{family}.json"
         if args.peer_matched_case:
             paths["peer_matched"] = args.peer_matched_case
@@ -105,10 +109,17 @@ def build_plan(args, environ, family):
         cases[arm] = q5_case.validate(q5_case.loads(path.read_bytes()))
         kind = qc.engine_kind(cases[arm])
         qc.require(cases[arm]["family"] == family, f"{arm} case {path} is not family {family}")
-        qc.require(kind == ("peer" if arm.startswith("peer") else "hf2q"), f"{arm} case {path} has engine kind {kind}")
+        qc.require(kind in ARM_KINDS[arm], f"{arm} case {path} has engine kind {kind}")
         qc.require(CLIENT in cases[arm]["client"]["argv"], f"{arm} case must run the canonical four-agent client")
         arms[arm] = {"case": str(path), "case_sha256": sha256(path), "engine_kind": kind, "role": ROLES[arm],
                      "overrides": qc.overrides(cases[arm], explicit.get(arm, []) + (extra[arm] or []), environ)}
+        if kind == "ds4":
+            import native_peer_ds4
+            arms[arm].update(role=native_peer_ds4.Q3_ROLE, label=native_peer_ds4.LABEL)
+    native = arms.get("peer", {}).get("engine_kind") == "ds4"
+    qc.require(native == bool(args.peer_case and args.peer_unavailable_evidence),
+               "a native ds4 --peer-case needs --peer-unavailable-evidence for the same-GGUF peer (ADR-063 Q4), "
+               "and that evidence admits no same-GGUF peer case")
     for arm in ("stock", "experiment"):  # without --<arm>-bin the case default would silently stand in
         arms[arm]["overrides"].setdefault("HF2Q_BIN", None)
     ambient = {k[len(qc.OVERRIDE):] for k in environ if k.startswith(qc.OVERRIDE)}
@@ -202,7 +213,7 @@ class Driver:
             for name in ("cases", "runs", "logs"):
                 (self.out / name).mkdir(mode=0o700)
             unavailable = {}
-            if self.plan["peer_unavailable_evidence"]:
+            if self.plan["peer_unavailable_evidence"] and "peer" not in self.plan["measured_arms"]:
                 unavailable["peer"] = {"reason": "declared from prior evidence", "evidence": self.plan["peer_unavailable_evidence"]}
             self.manifest = {"schema": SCHEMA, "plan": self.plan, "plan_sha256": digest, "identities": frozen,
                              "identities_sha256": qc.plan_sha256(frozen), "created_utc": now(), "status": "Running",
@@ -395,10 +406,12 @@ def parse_args(argv):
     parser.add_argument("--experiment-commit", help="40-hex source commit of the experiment binary")
     parser.add_argument("--experiment-label", default="main HEAD")
     parser.add_argument("--hf2q-case", help="hf2q Q5 case for both hf2q arms (default q5_cases/<family>.json)")
-    parser.add_argument("--peer-case", help="peer best valid configuration (default q5_cases/peer-<family>.json)")
+    parser.add_argument("--peer-case", help="peer best valid configuration (default q5_cases/peer-<family>.json); "
+                        "or q5_cases/native-ds4-deepseek4.json with --peer-unavailable-evidence")
     parser.add_argument("--peer-matched-case", help="optional matched-settings peer diagnostic arm (labeled, not in the verdict)")
     parser.add_argument("--peer-unavailable-evidence", action="append", metavar="FILE",
-                        help="receipt proving no runnable peer arm (repeatable); runs stock and experiment only")
+                        help="receipt proving no runnable same-GGUF peer arm (repeatable); runs stock and "
+                             "experiment only, or the native ds4 --peer-case")
     for arm in ARMS:
         parser.add_argument(f"--{arm.replace('_', '-')}-var", action="append", metavar="NAME=VALUE",
                             help=f"HF2Q_Q5_<NAME> override for the {arm} arm only (repeatable)")
@@ -422,8 +435,8 @@ def parse_args(argv):
             parser.error("a campaign run needs --output and exactly one --family")
         if args.hf2q_case and args.family and len(args.family) > 1:
             parser.error("--hf2q-case applies to one family")
-        if args.peer_unavailable_evidence and (args.peer_case or args.peer_matched_case):
-            parser.error("--peer-unavailable-evidence runs no peer arm")
+        if args.peer_unavailable_evidence and args.peer_matched_case:
+            parser.error("--peer-unavailable-evidence runs no same-GGUF peer arm")
     return args
 
 
@@ -434,7 +447,8 @@ def dry_run(args, environ):
         ids = q3_identity.identities(plan, cases, environ)
         report.append({"family": family, "launch_problems": q3_identity.launch_problems(plan, ids),
                        "plan_sha256": qc.plan_sha256(plan), "plan": plan, "identities": ids,
-                       "same_model": q3_identity.same_model(ids), "schedule": schedule_preview(plan),
+                       "same_model": q3_identity.same_model(ids, q3_identity.native_arms(plan)),
+                       "schedule": schedule_preview(plan),
                        "q5_argv_template": qc.q5_argv("<OUTPUT>/cases/<workload>-<arm>.json", "<OUTPUT>/runs/<entry>-aK",
                                                       plan.get("negative_control_receipt", {}).get("path", "<NC_RECEIPT>"))})
     print(json.dumps({"valid": True, "dry_run": True, "families": report}, indent=2))

@@ -233,6 +233,9 @@ def audit_run(client_dir, summary, phase_plan, engine_kind, require_width):
     require(not require_width or progress["width"] >= report["expected_width"],
             f"serialized or slot-capped service: observed co-progress width {progress['width']} < {report['expected_width']} "
             f"with up to {report['http_overlap_max']} overlapping HTTP requests")
+    if engine_kind == "ds4":  # every request ran Think Max, greedy, with ds4's rendered prefix (--trace)
+        from native_peer_ds4 import audit_run as native_audit
+        report["native_trace"] = native_audit(summary, client_dir, turns)
     return report
 
 
