@@ -501,8 +501,9 @@ Start the launcher for the model family you want to serve:
 # Qwen 3.8-27B multimodal (default port 8081)
 ./scripts/serve_qwen38_opencode.sh
 
-# Disable the launcher's exact, cost-gated MTP/history speculation if needed
-QWEN38_SPECULATION=off ./scripts/serve_qwen38_opencode.sh
+# Opt into exact, cost-gated MTP/history speculation (off by default at
+# MAX_SLOTS>=4 since ADR-063 D1)
+QWEN38_SPECULATION=auto ./scripts/serve_qwen38_opencode.sh
 
 # DeepSeek-V4 (default port 8081; run one large family at a time)
 ./scripts/serve_deepseek4_opencode.sh
@@ -611,9 +612,10 @@ multiple cold prompts rotate fairly, and cache/ledger state advances only
 after the verifier full-attention cursors agree. Ordinary prefixes may omit
 speculative metadata; a Qwen3.8 prefix that advertises reusable MTP state must
 have equal target and MTP cursors at the exact published token count. The
-canonical Qwen3.8 launcher enables exact, independently cost-gated fixed-K3
-MTP and request-history lookup with `QWEN38_SPECULATION=auto`; unsupported
-request semantics remain on ordinary target decode. Run
+Qwen3.8 exact, independently cost-gated fixed-K3 MTP and request-history
+lookup are off by default on workers with four or more slots (ADR-063 D1
+measured a four-agent makespan loss) and on below that; `QWEN38_SPECULATION=auto`
+opts in. Unsupported request semantics remain on ordinary target decode. Run
 `scripts/qwen38_speculation_ab.sh` for the exact-output OFF/AUTO performance
 gate. For a bound Qwen3.8 projector, image requests carry soft-token
 embeddings, the explicit DeepStack layout, and 3D positions through the same

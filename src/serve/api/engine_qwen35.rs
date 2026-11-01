@@ -687,9 +687,10 @@ impl Qwen35LoadedModel {
             // populates this lazily via `HybridKvCache::new_with_options
             // (... n_seqs = max_slots, ...)`.
             persistent_kv_cache: None,
-            // ADR-044 (2026-08-21): `auto` is now the default server
-            // policy for this family when HF2Q_QWEN_SPECULATION is unset;
-            // explicit `off` remains the escape. See qwen35_speculation.rs.
+            // ADR-044 (2026-08-21) / ADR-063 D1: an unset
+            // HF2Q_QWEN_SPECULATION is `auto` here (one slot); a SlotAware
+            // worker re-resolves it at start, to `off` for dense artifacts
+            // with max_slots >= 4. Explicit values always win.
             speculation: super::qwen35_speculation::QwenSpeculationController::from_environment(),
         };
 
