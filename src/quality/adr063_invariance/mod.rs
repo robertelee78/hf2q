@@ -1,0 +1,59 @@
+//! ADR063 Q1 test-only diagnostic oracle. No production math or service policy.
+pub(crate) mod acquisition;
+pub(crate) mod capture;
+pub(crate) mod compare;
+#[cfg(test)]
+mod deepseek_actual;
+pub(crate) mod deepseek_cache;
+#[cfg(test)]
+mod deepseek_localizer;
+pub(crate) mod deepseek_runner;
+pub(crate) mod family;
+#[cfg(test)]
+mod gemma_localizer;
+pub(crate) mod gemma_prefill;
+pub(crate) mod gemma_stage;
+pub(crate) mod protocol;
+pub(crate) mod qwen;
+#[cfg(test)]
+mod qwen_actual;
+pub(crate) mod qwen_cache;
+pub(crate) mod qwen_continuation;
+#[cfg(test)]
+mod qwen_localizer;
+pub(crate) mod qwen_runner;
+pub(crate) mod qwen_speculation;
+pub(crate) mod receipt;
+pub(crate) mod store;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod continuation_artifact_compare;
+#[cfg(test)]
+mod t5_artifact_compare;
+
+pub(crate) mod matrix;
+
+pub(crate) mod gemma_endpoint;
+pub(crate) mod gemma_cache;
+#[cfg(test)]
+mod gemma_actual;
+
+pub(crate) mod qwen_checkpoint;
+#[cfg(test)]
+mod gemma_prepare;
+
+#[cfg(test)]
+mod gemma_artifact_compare;
+#[cfg(test)]
+mod deepseek_prepare;
+
+#[cfg(test)]
+mod gemma_greedy_prepare;
+
+#[cfg(test)]
+pub(crate) mod gemma_ngram;
+
+#[cfg(test)]
+pub(crate) mod gemma_routing_witness;
