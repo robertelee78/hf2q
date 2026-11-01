@@ -101,7 +101,7 @@ def peer_build_info(run_dir, receipt, summary=None):
         if url.endswith("/props"):
             document = load_json(Path(run_dir) / name)
             return None if document is None else document.get("build_info")
-    # The native ds4 arm has no /props: its client binds commit + binary sha at readiness.
+    # A native-engine arm has no /props: its client binds commit + binary sha at readiness.
     return ((summary or {}).get("native_readiness") or {}).get("build_info")
 
 

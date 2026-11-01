@@ -7378,17 +7378,17 @@ mod tests {
             "required": ["arguments"]
         }"#;
 
-        let mut qwen = qwen35_runtime("ruflo_call", schema);
-        let qwen_call = b"<function=ruflo_call>\n<parameter=arguments>\n{\"query\":\"cache\",\"limit\":5,\"nested\":{\"ok\":true}}\n</parameter>\n</function>";
+        let mut qwen = qwen35_runtime("repo_call", schema);
+        let qwen_call = b"<function=repo_call>\n<parameter=arguments>\n{\"query\":\"cache\",\"limit\":5,\"nested\":{\"ok\":true}}\n</parameter>\n</function>";
         assert!(
             qwen.accept_bytes(qwen_call),
             "Qwen rejected OpenCode Zod record"
         );
         assert!(qwen.is_accepted(), "Qwen record call incomplete");
 
-        let mut gemma = gemma4_runtime("ruflo_call", schema);
+        let mut gemma = gemma4_runtime("repo_call", schema);
         let gemma_call =
-            b"call:ruflo_call{arguments:{query:<|\"|>cache<|\"|>,limit:5,nested:{ok:true}}}";
+            b"call:repo_call{arguments:{query:<|\"|>cache<|\"|>,limit:5,nested:{ok:true}}}";
         assert!(
             gemma.accept_bytes(gemma_call),
             "Gemma rejected OpenCode Zod record"
@@ -7412,7 +7412,7 @@ mod tests {
         });
         for registration in [&QWEN35, &GEMMA4] {
             let error = registration
-                .tool_call_gbnf("ruflo_call", &schema, GrammarShape::SingleBody)
+                .tool_call_gbnf("repo_call", &schema, GrammarShape::SingleBody)
                 .expect_err("constrained propertyNames must fail closed");
             assert!(
                 error.contains("constrained propertyNames"),
@@ -7439,7 +7439,7 @@ mod tests {
             });
             for registration in [&QWEN35, &GEMMA4] {
                 registration
-                    .tool_call_gbnf("ruflo_call", &schema, GrammarShape::SingleBody)
+                    .tool_call_gbnf("repo_call", &schema, GrammarShape::SingleBody)
                     .expect("unconstrained root propertyNames must compile");
             }
         }
@@ -7451,7 +7451,7 @@ mod tests {
         });
         for registration in [&QWEN35, &GEMMA4] {
             let error = registration
-                .tool_call_gbnf("ruflo_call", &constrained, GrammarShape::SingleBody)
+                .tool_call_gbnf("repo_call", &constrained, GrammarShape::SingleBody)
                 .expect_err("constrained root propertyNames must fail closed");
             assert!(error.contains("constrained propertyNames"));
         }
@@ -7971,7 +7971,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// The exact iter-231c driver: a tool schema whose array items carry
-    /// `pattern: "^[a-z][a-z0-9-]*$"` (the ruvnet-brain `argv` shape that
+    /// `pattern: "^[a-z][a-z0-9-]*$"` (a kebab-case MCP `argv` shape that
     /// 400'd opencode).  Grammar must accept conforming items and reject
     /// non-conforming ones.
     #[test]
@@ -7986,7 +7986,7 @@ mod tests {
             }
         }"#;
         let mut rt = qwen35_runtime("cli_help", schema);
-        let good = b"<function=cli_help>\n<parameter=argv>\n[\"ruflo\",\"claude-flow\",\"a\",\"z9-x\"]\n</parameter>\n</function>";
+        let good = b"<function=cli_help>\n<parameter=argv>\n[\"hf2q\",\"model-cache\",\"a\",\"z9-x\"]\n</parameter>\n</function>";
         assert!(rt.accept_bytes(good), "conforming argv rejected");
         assert!(rt.is_accepted());
 
@@ -8086,7 +8086,7 @@ mod tests {
             }
         }"#;
         let mut rt = gemma4_runtime("cli_help", schema);
-        let good = b"call:cli_help{argv:[<|\"|>ruflo<|\"|>,<|\"|>claude-flow<|\"|>]}";
+        let good = b"call:cli_help{argv:[<|\"|>hf2q<|\"|>,<|\"|>model-cache<|\"|>]}";
         assert!(rt.accept_bytes(good), "conforming argv rejected (gemma)");
         assert!(rt.is_accepted());
 

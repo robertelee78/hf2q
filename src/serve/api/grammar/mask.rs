@@ -532,10 +532,10 @@ mod tests {
     #[test]
     fn agentic_grammar_contract_candidate_set_matches_clone_oracle_across_runtime_states() {
         let names = vocab(&[
-            "ruflo_call",
-            "ruflo_search",
-            "aqe_call",
-            "aqe_search",
+            "repo_call",
+            "repo_search",
+            "qa_call",
+            "qa_search",
             "task",
             "read",
             "write",
@@ -552,7 +552,7 @@ mod tests {
             "",
         ]);
         let runtime = rt(
-            "root ::= \"ruflo_call\" | \"ruflo_search\" | \"aqe_call\" | \"aqe_search\" | \"task\" | \"read\" | \"write\" | \"bash\" | \"brain\" | \"skill\" | \"agent\" | \"memory\" | \"workflow\" | \"hooks\" | \"routing\" | \"swarm\"\n",
+            "root ::= \"repo_call\" | \"repo_search\" | \"qa_call\" | \"qa_search\" | \"task\" | \"read\" | \"write\" | \"bash\" | \"brain\" | \"skill\" | \"agent\" | \"memory\" | \"workflow\" | \"hooks\" | \"routing\" | \"swarm\"\n",
             "root",
         );
         let mut logits = vec![1.0; names.len()];
@@ -574,8 +574,8 @@ mod tests {
         // Broad-string state after the function name is selected.  Include
         // escapes, multi-byte UTF-8, an incomplete tail, malformed UTF-8,
         // an empty special token, and a pre-masked candidate.
-        let mut string_runtime = rt("root ::= \"ruflo_call:\\\"\" [^\\\"]* \"\\\"\"\n", "root");
-        assert!(string_runtime.accept_bytes(b"ruflo_call:\""));
+        let mut string_runtime = rt("root ::= \"repo_call:\\\"\" [^\\\"]* \"\\\"\"\n", "root");
+        assert!(string_runtime.accept_bytes(b"repo_call:\""));
         let string_tokens = vec![
             b"plain".to_vec(),
             b"{}".to_vec(),

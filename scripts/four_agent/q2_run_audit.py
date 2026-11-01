@@ -257,9 +257,9 @@ def audit_run(client_dir, summary, phase_plan, engine_kind, require_width):
     require(not require_width or progress["width"] >= report["expected_width"],
             f"serialized or slot-capped service: observed co-progress width {progress['width']} < {report['expected_width']} "
             f"with up to {report['http_overlap_max']} overlapping HTTP requests")
-    if engine_kind == "ds4":  # trace bound to these requests: Think Max, greedy, prefix, usage; recovery counted
-        from native_peer_ds4_audit import audit_run as native_audit
-        report["native_trace"] = native_audit(summary, client_dir, turns)
+    if engine_kind not in ("hf2q", "peer"):  # the arm's server-side record bound to these requests (native_peers AUDIT)
+        from native_peers import audit
+        report["native_trace"] = audit(engine_kind).audit_run(summary, client_dir, turns)
     return report
 
 

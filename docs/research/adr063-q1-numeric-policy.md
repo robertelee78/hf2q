@@ -97,23 +97,25 @@ the decode work:
 ### 2.4 Qwen3.6 35B-A3B (MoE)
 
 Q1 endpoints: the active64 adapter is built (`q1-qwen36-active64-root-build-v1`);
-nothing has executed. Task quality: the hf2q N4 coding task fails (agents 1–2
-write E0282 code; PR #461), while the peer passes 4/4
-(`peer-qwen36-e86-none-normal-n4-20261027T185853Z`).
+nothing has executed. Task quality: BelowFloor on both engines. In the 24-instance
+paired campaign `$E/quality-qwen36-peer-exp0b95-20261030T174020Z` hf2q passed 5
+and the peer 4 (sign test p = 0.77); the failing E0282 idiom comes from the
+weights (`docs/research/adr063-qwen36-task-failure-diagnosis.md`). The earlier
+4/4 peer cohort (`peer-qwen36-e86-none-normal-n4-20261027T185853Z`) is superseded.
 
 Comparing TQ8 against F32 KV (`q5-qwen36-fix-20261030T044749Z` vs
 `q5-qwen36-tqkv0-20261030T045814Z`) gives `DivergedTranscripts` for every
 agent within turns 0–2. That is expected: it is a Class C representation
-change. No logprob margin has been captured, so "near-tie" is not yet a
-measured fact. `/tmp/adr063-qwen36-divergence-plan-v1.md` is the measurement
-design.
+change. Write-turn fork logprobs were since captured (diagnosis record): the
+closure fork has |e − _| < 0.10 nat in only 3–4 of 48 prompts, but no formal
+§3.4 fork classification was run.
 
 ### 2.5 What remains, by family
 
 | Family | Class A still missing | Class B still missing | Quality |
 |---|---|---|---|
 | Qwen3.8 | T4 order, T7/T8 at endpoint level (serving transcripts already show cross-run determinism) | — (chunk and verifier rows measured) | Peer arm never run; hf2q 4/4 in every recorded cohort |
-| Qwen3.6 | T1, T3, T4, T6, T7 endpoints | T0 vs T3 chunk, T5 | Fork classification (§3.4), then the paired campaign (§3.5) |
+| Qwen3.6 | T1, T3, T4, T6, T7 endpoints | T0 vs T3 chunk, T5 | Done: BelowFloor on both engines, not attributable to hf2q (`$E/quality-qwen36-peer-exp0b95-20261030T174020Z`; diagnosis record). §5.2 step 1 superseded by step 4 plus the BF16 reference |
 | DeepSeek-V4 | T1 vs T3, T4, T7 endpoints (adapter exists); T6 needs its separate variant | T0 vs T3 chunk (if chunk sizes differ in production) | No peer adapter: floor-only verdict, A/B vs stock for candidates |
 | Gemma 4 | T4, T6, T7 on greedy144 | T0 vs T3 and T0 vs T2 on greedy144; localize the layer-5/layer-1 onsets | No current-binary F2 rows; no peer adapter |
 

@@ -43283,7 +43283,7 @@ mod tool_call_stream_emitter_tests {
         let tools = vec![super::super::schema::Tool {
             tool_type: "function".to_string(),
             function: super::super::schema::ToolFunction {
-                name: "ruflo_call".to_string(),
+                name: "repo_call".to_string(),
                 description: None,
                 parameters: Some(serde_json::json!({
                     "type": "object",
@@ -43296,7 +43296,7 @@ mod tool_call_stream_emitter_tests {
             super::super::registry::qwen35_tool_argument_wire_kinds(&tools).expect("wire kinds"),
         );
         let body = concat!(
-            "<function=ruflo_call>",
+            "<function=repo_call>",
             "<parameter=arguments_json>{\"query\":\"cache\"}</parameter>",
             "</function>"
         );

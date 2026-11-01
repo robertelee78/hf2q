@@ -133,6 +133,7 @@
             "{REPO}/scripts/four_agent/family_peer.py",
             "{REPO}/scripts/four_agent/test_family_peer.py",
             "{REPO}/scripts/four_agent/f2_semantic.py",
+            "{REPO}/scripts/four_agent/native_peers.py",
             "{REPO}/scripts/four_agent/native_peer_ds4.py",
             "{REPO}/scripts/four_agent/test_native_peer_ds4.py"
           ]

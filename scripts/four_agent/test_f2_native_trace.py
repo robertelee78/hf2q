@@ -102,6 +102,80 @@ def packed_quad(records, scenario, source):
     record(records, "native_event", "DispatchEncoded")["payload"]["geometry"]["grid"] = [4, 1, 1]
 
 
+def with_busy_owners(records, at_ns):
+    """Insert one actual scheduler snapshot at `at_ns` in which every owner is transaction-busy:
+    not ready-now, still forward-eligible. Records are renumbered."""
+    busy = copy.deepcopy(record(records, "slots"))
+    busy["at_ns"] = at_ns
+    for slot in busy["payload"]["slots"]:
+        slot.update(runnable_forward=False, runnable_emit=False, inflight=None, blocked="OwningWorkerTransaction")
+    records.insert(next(i for i, item in enumerate(records) if item["at_ns"] > at_ns), busy)
+    for seq, item in enumerate(records):
+        item["seq"] = seq
+    return records
+
+
+def four_lanes(composition=(0, 4)):
+    """Four owners, the first composition[0] in prefill, each with its own declared, encoded and
+    submitted target input (rows labelled with the owner's phase); every checked drain lands after
+    the first fixed window. Lane i's submit bracket ends at 22 + 100 i."""
+    assert sum(composition) == 4
+    original, identity, scenario = fixture()
+    records = copy.deepcopy(original[:4])
+    owner = records[3]["payload"]["slots"][0]
+    records[3]["payload"]["slots"] = []
+    def append(item):
+        item["seq"] = len(records)
+        records.append(item)
+    for i in range(4):
+        phase = "prefill" if i < composition[0] else "decode"
+        row_phase = "prefill" if phase == "prefill" else "ordinary"
+        slot = copy.deepcopy(owner)
+        slot.update(request_id=5+i, slot_id=i, phase=phase)
+        records[3]["payload"]["slots"].append(slot)
+        for old in original[4:10]:  # actual declaration/create/encode/submit prefix
+            item = copy.deepcopy(old)
+            item["at_ns"] += i * 100
+            p = item["payload"]
+            if item["kind"] == "forward_input":
+                p.update(forward_id=30+i, epoch=10+i)
+                p["packed_rows"][0]["logical"].update(request_id=5+i, slot_id=i, phase=row_phase)
+            elif item["kind"] == "scope_definition":
+                p["scope"].update(epoch=10+i, id=20+i)
+                p["rows"][0].update(request_id=5+i, slot_id=i, phase=row_phase)
+            elif item["kind"] == "forward_witness":
+                p["forward_id"] = 30+i
+                p["scope"].update(epoch=10+i, id=20+i)
+            else:
+                p.update(command_id=1+i, invocation_epoch=10+i)
+                p["begin_monotonic_ns"] += i * 100
+                p["end_monotonic_ns"] += i * 100
+                if p["scope"]:
+                    p["scope"].update(epoch=10+i, id=20+i)
+            append(item)
+    for i in range(4):
+        for old in original[10:12]:
+            item = copy.deepcopy(old)
+            item["at_ns"] += i * 10
+            p = item["payload"]
+            p.update(command_id=1+i, invocation_epoch=10+i)
+            p["begin_monotonic_ns"] += i * 10
+            p["end_monotonic_ns"] += i * 10
+            append(item)
+    final = copy.deepcopy(original[12])
+    final["payload"]["events"] = 20
+    final["at_ns"] = records[-1]["at_ns"] + 1
+    append(final)
+    footer = copy.deepcopy(original[13])
+    footer["at_ns"] = final["at_ns"] + 1
+    append(footer)
+    return records, identity, scenario
+
+
+MIXED = ((4, 0), (3, 1), (2, 2), (1, 3), (0, 4))
+
+
+
 class NativeControls(unittest.TestCase):
     def test_missing_or_unretired_native_owners_cannot_qualify(self):
         for kind in ("native_baseline", "native_arm_ack", "native_final"):
@@ -197,13 +271,7 @@ class NativeControls(unittest.TestCase):
 
     def test_forward_demand_v2_preserves_ready_metric_and_requires_actual_service(self):
         records, identity, scenario = fixture()
-        busy = copy.deepcopy(record(records, "slots"))
-        busy["at_ns"] = 10
-        busy["payload"]["slots"][0].update(runnable_forward=False,
-            runnable_emit=False, inflight=None, blocked="OwningWorkerTransaction")
-        records.insert(9, busy)  # after actual encoded witness, before its commit
-        for seq,item in enumerate(records):
-            item["seq"] = seq
+        with_busy_owners(records, 10)  # after actual encoded witness, before its commit
         trace.validate_trace(records, identity, scenario)
         self.assertEqual(trace.qualify_window(records, (0,1), 0)["status"], "Unqualified")
         result = trace.qualify_window(records, (0,1), 0, population_policy="forward_demand_v2")
@@ -288,56 +356,49 @@ class NativeControls(unittest.TestCase):
         self.assertFalse(result["shared_batch4_claim"])
 
     def test_four_known_singletons_qualify_progress_without_fabricated_physical_quad(self):
-        original, identity, scenario = fixture()
-        records = copy.deepcopy(original[:4])
-        owner = records[3]["payload"]["slots"][0]
-        records[3]["payload"]["slots"] = []
-        def append(item):
-            item["seq"] = len(records)
-            records.append(item)
-        for i in range(4):
-            slot = copy.deepcopy(owner)
-            slot.update(request_id=5+i, slot_id=i)
-            records[3]["payload"]["slots"].append(slot)
-            for old in original[4:10]:  # actual declaration/create/encode/submit prefix
-                item = copy.deepcopy(old)
-                item["at_ns"] += i * 100
-                p = item["payload"]
-                if item["kind"] == "forward_input":
-                    p.update(forward_id=30+i, epoch=10+i)
-                    p["packed_rows"][0]["logical"].update(request_id=5+i, slot_id=i)
-                elif item["kind"] == "scope_definition":
-                    p["scope"].update(epoch=10+i, id=20+i)
-                    p["rows"][0].update(request_id=5+i, slot_id=i)
-                elif item["kind"] == "forward_witness":
-                    p["forward_id"] = 30+i
-                    p["scope"].update(epoch=10+i, id=20+i)
-                else:
-                    p.update(command_id=1+i, invocation_epoch=10+i)
-                    p["begin_monotonic_ns"] += i * 100
-                    p["end_monotonic_ns"] += i * 100
-                    if p["scope"]:
-                        p["scope"].update(epoch=10+i, id=20+i)
-                append(item)
-        for i in range(4):
-            for old in original[10:12]:
-                item = copy.deepcopy(old)
-                item["at_ns"] += i * 10
-                p = item["payload"]
-                p.update(command_id=1+i, invocation_epoch=10+i)
-                p["begin_monotonic_ns"] += i * 10
-                p["end_monotonic_ns"] += i * 10
-                append(item)
-        final = copy.deepcopy(original[12])
-        final["payload"]["events"] = 20
-        final["at_ns"] = records[-1]["at_ns"] + 1
-        append(final)
-        footer = copy.deepcopy(original[13])
-        footer["at_ns"] = final["at_ns"] + 1
-        append(footer)
+        records, identity, scenario = four_lanes()
         result = trace.validate_trace(records, identity, scenario)
         self.assertFalse(result["operator_shared_batch4_observed"])
         self.assertEqual(trace.qualify_window(records, (0, 4), 0)["status"], "Qualified")
+
+    def test_forward_demand_v2_mixed_and_four_prefill_windows_need_actual_service(self):
+        # Every owner turns transaction-busy at 330, after all four submit brackets ended: from
+        # then on only the validated commit-to-checked-return service keeps it in the population.
+        for composition in MIXED:
+            with self.subTest(composition=composition):
+                records, identity, scenario = four_lanes(composition)
+                with_busy_owners(records, 330)
+                trace.validate_trace(records, identity, scenario)
+                ready = trace.qualify_window(records, composition, 0)
+                self.assertEqual(ready["status"], "Unqualified")
+                self.assertLess(ready["target_fraction"], 0.001)
+                result = trace.qualify_window(records, composition, 0, population_policy="forward_demand_v2")
+                self.assertEqual(result["status"], "Qualified")
+                self.assertEqual((result["start_ns"], result["end_ns"]), (3, 2_000_000_003))
+                self.assertEqual(result["target_fraction"], 1)
+                self.assertLess(result["ready_now_fraction"], 0.001)
+                self.assertEqual(result["slots_without_required_forward_witness"], [])
+
+    def test_forward_demand_v2_one_mixed_plan_cannot_pass_as_another(self):
+        for composition in MIXED:
+            records, identity, scenario = four_lanes(composition)
+            with_busy_owners(records, 330)
+            trace.validate_trace(records, identity, scenario)
+            for other in MIXED:
+                if other == composition:
+                    continue
+                with self.subTest(trace=composition, claimed=other):
+                    self.assertEqual(trace.qualify_window(records, other, 0, population_policy="forward_demand_v2"),
+                                     {"status": "Unqualified", "reason": "no source-qualified population within deadline"})
+        # Service credit joins the owner's phase: a prefill owner served by an ordinary row is not prefill demand.
+        records, identity, scenario = four_lanes((3, 1))
+        record(records, "forward_input")["payload"]["packed_rows"][0]["logical"]["phase"] = "ordinary"
+        record(records, "scope_definition")["payload"]["rows"][0]["phase"] = "ordinary"
+        with_busy_owners(records, 330)
+        trace.validate_trace(records, identity, scenario)
+        result = trace.qualify_window(records, (3, 1), 0, population_policy="forward_demand_v2")
+        self.assertEqual(result["status"], "Unqualified")
+        self.assertLess(result["target_fraction"], 0.001)
 
 
 if __name__ == "__main__":

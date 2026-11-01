@@ -3,8 +3,8 @@
 //!
 //! Frontier constraint engines (llguidance, xgrammar) compile regex
 //! constraints into the grammar; the peer's json-schema-to-grammar
-//! defers `pattern`. Real-world tool schemas (e.g. MCP servers such as
-//! ruvnet-brain's `argv` items: `^[a-z][a-z0-9-]*$`) DO use `pattern`,
+//! defers `pattern`. Real-world tool schemas (e.g. MCP servers with kebab-case
+//! `argv` items: `^[a-z][a-z0-9-]*$`) DO use `pattern`,
 //! so this module closes the gap with a real compiler instead of a
 //! bypass.
 //!
@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn anchored_identifier_pattern_compiles() {
-        // The ruvnet-brain `argv` items pattern — the iter-231c driver.
+        // A kebab-case `argv` items pattern — the iter-231c driver.
         let body = compile("^[a-z][a-z0-9-]*$");
         assert_eq!(body, r#"[a-z] [a-z0-9-]*"#);
     }

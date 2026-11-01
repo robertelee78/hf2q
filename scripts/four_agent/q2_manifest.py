@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 from qwen38_n1_verdict import loads, require
-from q2_certify import BoundReader, digest
+from q2_certify import BoundReader, TraceFile, digest
 
 
 def bound(path, maximum=32 * 1024 * 1024):
@@ -70,8 +70,9 @@ def assemble(spec):
     agents = {f"agent-{i}": agent_refs(root, f"agent-{i}", count) for i in range(count)}
     # Inputs refer to the exact retained raw server/readiness/trace files; no
     # favorable summary rewriting, cache-count substitution or trace invention.
-    for key in ("server_receipt", "readiness", "trace"):
-        reader.path(spec[key], 256 * 1024 * 1024 if key == "trace" else 32 * 1024 * 1024)
+    for key in ("server_receipt", "readiness"):
+        reader.path(spec[key], 32 * 1024 * 1024)
+    TraceFile(reader, spec["trace"])  # JSONL bounded by its own header's metadata quota
     manifest = {"schema": "hf2q.q2.cohort.v1",
                 **{key: plan[key] for key in ("cohort_id", "identity", "family", "engine_kind", "model", "server_pid", "run_id")},
                 "logical_clients": count, "server_receipt": spec["server_receipt"],
