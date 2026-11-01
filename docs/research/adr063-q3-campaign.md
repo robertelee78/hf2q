@@ -29,7 +29,7 @@ The checked-in peer cases match hf2q's model-facing settings (template, thinking
 
 **Native oMLX arm (Qwen3.8, Qwen3.6, Gemma 4; operator decision 2026-10-31).** Every one of these families has a runnable same-GGUF peer, so oMLX runs only in a separate `--native-comparison` campaign, with TensorFold's rules: `--peer-case q5_cases/native-omlx-<family>.json --native-comparison`. oMLX 6b413c90 then runs in the `peer` slot on the pinned mlx-community 4-bit snapshot.
 - The artifact is the snapshot's `config.json`; `MODEL_CONFIG_SHA256` and `TEMPLATE_SHA256` are required. Build identity is `omlx <version> <commit> venv-freeze-sha256 <sha>`, from the venv's dist-info inventory. The snapshot file listing and the venv inventory are frozen with the campaign identity.
-- `verdict.json` and F2 rows carry the not-of-record label. `native_peer` is withheld under the TensorFold rules, and also when any oMLX run logged tool-parser warnings. F2 groups are `<family>-q3-omlx-<family>-native`, and the oMLX row renders only under "Native-engine comparisons".
+- `verdict.json` and F2 rows carry the not-of-record label. `native_peer` is withheld under the TensorFold rules, and also when any oMLX run logged tool-parser WARNING/INFO lines; tool-call repairs oMLX does not log are disclosed with every statement as `recovery_attribution: Unavailable:…`. F2 groups are `<family>-q3-omlx-<family>-native`, and the oMLX row renders only under "Native-engine comparisons".
 - Adapter and controls: `scripts/four_agent/README.md`, section "Native oMLX arm".
 
 `HF2Q_Q5_HF2Q_BIN` and `--stock-var/--experiment-var HF2Q_BIN=…` are refused. The hf2q binaries come only from `--stock-bin` and `--experiment-bin`, so a case default can never stand in for one of them.

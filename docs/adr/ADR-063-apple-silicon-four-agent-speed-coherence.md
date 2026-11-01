@@ -769,7 +769,8 @@ tuple (`FAMILIES`, `Q3_FAMILIES`) so one arm can serve several families.
   runnable same-GGUF peer, so oMLX runs only in a separate `--native-comparison`
   campaign. Labels, withholding and the F2 placement are TensorFold's: F2
   baselines `omlx_<family>_native`, never a win. Any oMLX tool-parser warning
-  in a run also withholds the statement. The Qwen3.6 re-test with a different
+  or INFO repair line in a run also withholds the statement; repairs oMLX does
+  not log are disclosed with every statement (`recovery_attribution`). The Qwen3.6 re-test with a different
   tokenizer and sampler stack uses `quality_campaign.py --reference-kind
   omlx-native`; oMLX cannot be the subject arm.
 - **Request parity is explicit.** oMLX silently drops unknown request fields,
