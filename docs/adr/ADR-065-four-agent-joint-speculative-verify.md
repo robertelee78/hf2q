@@ -105,7 +105,7 @@ A story closes by type:
 |---|---|
 | Measurement | Retained receipt with identities, method distortion quantified, analysis reproducible from checked-in commands, independent review. |
 | Decision | A decision record applying the story's numeric rule to cited receipts, independently reviewed. Any implementation it calls for is a separately approved design. |
-| Native primitive | mlx-native contract, parity tests on both metallib paths, a distinct-matrix microbenchmark at served shapes; merged and released; crates.io bytes verified. |
+| Native primitive | mlx-native contract and parity tests on both metallib paths; where a kernel is built, a distinct-matrix microbenchmark at served shapes, a merged and published release and verified crates.io bytes; where existing primitives suffice, a merged qualification record instead. |
 | hf2q integration | Exact native pin from a clean registry build where a primitive is consumed; applicable contract tests on the official artifact; cancel smoke; four-agent A/B against the previous default; quality and fairness as above; independent verdict. |
 | Refactor | Serving transcripts `ExactTranscripts` against the previous default; existing gates pass. |
 | Policy | Unit tests against brute force, transaction tests re-run, four-agent A/B, quality, fairness ceilings, independent verdict. |
@@ -148,7 +148,7 @@ Requirement: The program MUST attribute joint and solo round time by stage class
 
 Acceptance:
 
-- Category-separated diagnostic command buffers, extending Gemma `catsplit`, cover projections, DeltaNet conv/GDN, KV write, attention, FFN/MoE, head, MTP draft, MTP catch-up, rollback (CPU), per-row arena setup (CPU) and host gaps (CPU).
+- Category-separated diagnostic command buffers, extending Gemma `catsplit`, cover projections, DeltaNet conv/GDN, KV write, attention, FFN/MoE, head, MTP draft, MTP catch-up, logit readback and host selection (CPU), rollback (CPU), per-row arena setup (CPU) and host gaps (CPU), plus a count of DeepSeek decode-scratch release and reallocation events per joint completion.
 - Report profiled versus unprofiled complete-round time; any class the method cannot attribute is Unknown and excluded from every decision rule.
 - Off by default; unprofiled serving transcripts are `ExactTranscripts` against the previous default.
 
@@ -462,6 +462,7 @@ Acceptance:
 
 - Per-slot conditional per-depth acceptance with cumulative products for expected tokens.
 - All 256 allocations for four slots are scored with cost from A1 plus draft, catch-up and rollback; least-recently-served tie-break; unit-tested against brute force with fairness invariants.
+- The allocator sits behind its own kill switch; switched off, behaviour equals J4's default.
 - MTP catch-up charging and the four-slot disable policy come from ADR-063 D1.
 - Transaction tests re-run; four-agent A/B against J4's default.
 
@@ -517,7 +518,7 @@ Repository ownership: hf2q.
 
 Validation: Official-artifact gates and A/B with independent verdict.
 
-Predecessors: P1a.
+Predecessors: B1, P1a.
 
 Priority: Medium.
 
@@ -562,7 +563,7 @@ Repository ownership: hf2q.
 
 Validation: Official-artifact gates and A/B with independent verdict.
 
-Predecessors: P2a, J3.
+Predecessors: B1, P2a, J3.
 
 Priority: Medium.
 
@@ -648,7 +649,7 @@ Repository ownership: hf2q.
 
 Validation: Official-artifact gates and A/B with independent verdict.
 
-Predecessors: P4a, J1.
+Predecessors: B1, P4a, J1.
 
 Priority: Medium.
 
@@ -706,8 +707,8 @@ Requirement: The program MUST, if E1 attributes at least 3% of the DeepSeek join
 
 Acceptance:
 
-- A recorded check of the rule against E1 and the scratch trace; if it fails, the story closes with that record.
-- Otherwise serving transcripts are `ExactTranscripts` against the previous default, existing DeepSeek joint bitwise gates pass, the decode scratch high-water mark is reported, and a four-agent A/B runs against the previous default.
+- A recorded check of the rule against E1's arena-setup class and scratch release and reallocation count; if it fails, the story closes with that record.
+- Otherwise the change sits behind its own kill switch, serving transcripts are `ExactTranscripts` against the previous default, existing DeepSeek joint bitwise gates pass, the decode scratch high-water mark is reported, and a four-agent A/B runs against the previous default.
 
 Repository ownership: hf2q.
 
@@ -766,20 +767,20 @@ Delivery boundary: Decision record merged to main.
 
 ### C1. Report the combined effect against the frozen baseline
 
-Outcome: The program's combined default configuration has one measured effect against the B1 baseline.
+Outcome: The program's combined default configuration has one measured effect against phase-1 behaviour, reported beside the B1 baseline.
 
-Requirement: The program MUST measure the combined default configuration against the B1-frozen phase-1 baseline once every other story of this ADR is closed.
+Requirement: The program MUST measure the combined default configuration against phase-1 behaviour in the same final binary once every other story of this ADR is closed, and report it beside the B1-frozen baseline.
 
 Acceptance:
 
-- One two-arm campaign, B1 baseline binary against the final combined default, per family with a merged change, under the A/B and fairness rules.
+- One two-arm campaign per family with a merged change, using one final binary: one arm with every ADR-065 kill switch off (phase-1 behaviour), the other at the final defaults, under the A/B and fairness rules.
 - The report lists every story's disposition and states Win, Loss or Inconclusive per family.
 
 Repository ownership: hf2q.
 
 Validation: Independent review of the campaign and report.
 
-Predecessors: B1, E8.
+Predecessors: B1, E1, E2, E3, E4, E5, E6, E7, E8, J1, J2, J3, J4, J5, A1, A2, P1a, P1b, P2a, P2b, P3a, P3b, P4a, P4b, P5, P6, F1, F2, F3.
 
 Priority: Medium.
 
@@ -787,7 +788,7 @@ Delivery boundary: Report merged to main.
 
 ## Coverage and sequencing
 
-B1 precedes every candidate run and every E story except E6. E6 has no predecessor; E7 needs B1 and E6; E2 needs E1 and E7. E8 decides whether J4, J5, A1, A2, P3a and P3b proceed. J1–J3 change no served output and may proceed before E8; J2 changes no joint admission. P stories follow their probes; P1b and P2b integrate into whichever joint graph is current. F stories apply their numeric rules to their traces. ADR-063 D1 precedes E3 and A2; ADR-063 D2 precedes any drafter or tree successor. C1 runs after every other story is closed.
+B1 precedes every candidate run and every E story except E6. E6 has no predecessor; E7 needs B1 and E6; E2 needs E1 and E7. E8 decides whether J4, J5, A1, A2, P3a and P3b proceed. J1–J3 change no served output and may proceed before E8; J2 changes no joint admission. P stories follow their probes; P1b and P2b integrate into whichever joint graph is current. F stories apply their numeric rules to their traces. ADR-063 D1 precedes E3 and A2; ADR-063 D2 precedes any drafter or tree successor. C1 runs after every other story is closed; the graph shows only its leaf predecessors.
 
 ```mermaid
 flowchart LR
@@ -801,6 +802,7 @@ flowchart LR
   J4 --> A1 --> A2
   E6 --> P1a --> P1b
   E6 --> P2a --> P2b
+  B1 --> P1b & P2b & P4b
   J3 --> P2b
   E6 & E8 --> P3a --> P3b
   J4 --> P3b
@@ -810,7 +812,7 @@ flowchart LR
   E1 & E2 --> P6
   E1 --> F1 & F3
   E1 & E5 --> F2
-  B1 & E8 --> C1
+  E8 & J5 & A2 & P1b & P2b & P3b & P4b & P5 & P6 & F1 & F2 & F3 --> C1
 ```
 
 Release placement: each story ships in the first hf2q release that contains it; the owner assigns milestones.
