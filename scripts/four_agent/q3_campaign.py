@@ -96,11 +96,14 @@ def primary_of_record(path, family):
     verdict_path = Path(path).resolve()
     campaign_path = verdict_path.parent / "campaign.json"
     verdict, manifest = q3_metrics.load_json(verdict_path), q3_metrics.load_json(campaign_path)
-    qc.require(isinstance(verdict, dict) and verdict.get("schema") == q3_report.VERDICT_SCHEMA
+    qc.require(verdict_path.name == "verdict.json" and isinstance(verdict, dict)
+               and verdict.get("schema") == q3_report.VERDICT_SCHEMA
                and isinstance(manifest, dict) and manifest.get("schema") == SCHEMA,
                f"--controls-of {verdict_path} must be a Q3 verdict.json beside its campaign.json")
     qc.require(verdict.get("primary") is not None and manifest["plan"].get("controls_of") is None,
                f"--controls-of {verdict_path} carries no primary verdict")
+    qc.require(verdict["primary"]["status"] == "Complete",
+               f"the primary of record {verdict_path} did not complete (stage {verdict['primary']['status']})")
     qc.require(verdict["campaign_sha256"] == sha256(campaign_path)
                and verdict["identities_sha256"] == manifest["identities_sha256"] == qc.plan_sha256(manifest["identities"]),
                f"{verdict_path} does not bind {campaign_path}")
@@ -110,6 +113,7 @@ def primary_of_record(path, family):
     return {"verdict": {"path": str(verdict_path), "sha256": sha256(verdict_path)},
             "campaign": {"path": str(campaign_path), "sha256": verdict["campaign_sha256"]},
             "family": family, "verdict_of_record": verdict["verdict"], "campaign_status": verdict["campaign_status"],
+            "stages": {stage["workload"]: stage["status"] for stage in manifest["stages"]},
             "primary_workload": verdict["primary_workload"], "effects": verdict["primary"]["effects"],
             "plan_sha256": manifest["plan_sha256"], "identities_sha256": manifest["identities_sha256"],
             "identity": q3_identity.controls_identity(manifest["plan"], manifest["identities"]),
@@ -159,8 +163,11 @@ def build_plan(args, environ, family):
     unused = sorted(ambient - {n for case in cases.values() for n in case.get("variables", {})})
     qc.require(not unused, "ambient overrides name no variable of any arm case: " + ",".join(unused))
     evidence = [{"path": str(Path(p).resolve()), "sha256": sha256(p)} for p in args.peer_unavailable_evidence or []]
-    plan = {"schema": SCHEMA, "family": family, "primary": None if record else PRIMARY,
-            "workloads": parse_workloads(args.workloads, record is not None),
+    workloads = parse_workloads(args.workloads, record is not None)
+    done = [key for key in workloads if record and record["stages"].get(key) == "Complete"]
+    qc.require(not done, f"--workloads {','.join(done)}: Complete in the campaign of record "
+               f"{record and record['campaign']['path']}; a completed stage is never re-run")
+    plan = {"schema": SCHEMA, "family": family, "primary": None if record else PRIMARY, "workloads": workloads,
             "measured_arms": [arm for arm in ARMS if arm in arms], "arms": arms,
             "peer_unavailable_evidence": evidence,
             "design": {"metric": "client summary own_output_four_task_makespan_seconds",

@@ -120,9 +120,9 @@ def validate_manifest(m):
             require(row.get("unit") == METRICS[row["metric"]][1], f"{rid}: unit must be {METRICS[row['metric']][1]}")
             require("ci95" not in row and "baseline_arm" not in row, f"{rid}: measurement has no effect fields")
         if "control_of" in row:  # a Q3 control of a primary verdict of record (#369 amendment)
-            require(isinstance(row["control_of"], str) and row["control_of"].startswith("$E/") and kind == "effect"
-                    and row["status"] == "Descriptive", f"{rid}: control_of must cite a $E/ primary of record "
-                    "on a Descriptive effect row")
+            require(isinstance(row["control_of"], str) and row["control_of"].startswith("$E/")
+                    and ((kind == "effect" and row["status"] == "Descriptive") or row["status"] == "Failure"),
+                    f"{rid}: control_of must cite a $E/ primary of record on a Descriptive effect or a Failure row")
         require(type(row.get("n_slots")) is int and row["n_slots"] >= 1, f"{rid}: n_slots")
         if row["metric"] == "task_pass":
             require(float(row["value"]).is_integer() and 0 <= row["value"] <= row["n_slots"], f"{rid}: task pass count")
@@ -415,9 +415,10 @@ def render(manifest, scoreboards, manifest_sha256):
             f"{row_value(x)} {tag(x)} | {x['note']} | `{x['id']}` |" for x in native]
     if controls:
         out += ["", "## Q3 controls of a primary verdict of record (never a win or loss)", "",
-                "| Family | Comparison | Makespan effect | Note | Primary of record | Evidence |",
+                "| Family | Comparison | Result | Note | Primary of record | Evidence |",
                 "|---|---|---|---|---|---|"] + [
-            f"| {fams[x['family']]['title']} | {arm_label((x['arm'], x['variant']))} vs {BASELINE_ARMS[x['baseline_arm']]} | "
+            f"| {fams[x['family']]['title']} | {arm_label((x['arm'], x['variant']))}"
+            f"{' vs ' + BASELINE_ARMS[x['baseline_arm']] if x['kind'] == 'effect' else ''} | "
             f"{row_value(x)} {tag(x)} | {x['note']} | `{x['control_of']}` | `{x['id']}` |" for x in controls]
     out += ["", "## Open gaps", "", "| Family | Metric | Missing arms | Arms with only failed runs |", "|---|---|---|---|"]
     for fam in fams:

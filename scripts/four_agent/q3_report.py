@@ -153,8 +153,9 @@ def quality_state(manifest, quality_paths, review_path):
 def primary_of_record(manifest, record):
     """verdict.json `primary_of_record`: the bound primary verdict, its effects, and both harness source maps."""
     path = Path(record["verdict"]["path"])
-    if sha256(path) != record["verdict"]["sha256"]:
-        raise ValueError(f"primary of record {path} changed since the campaign bound it")
+    for bound in (record["verdict"], record["campaign"]):
+        if sha256(bound["path"]) != bound["sha256"]:
+            raise ValueError(f"primary of record {bound['path']} changed since the campaign bound it")
     then, now = record["harness"]["sources"], manifest["identities"]["harness"]["sources"]
     return {"path": str(path), "sha256": record["verdict"]["sha256"], "verdict": record["verdict_of_record"],
             "primary_workload": record["primary_workload"], "effects": record["effects"],
@@ -174,7 +175,22 @@ def controls_only_reasons(manifest, record, state):
     reasons += [f"peer failed its task: {f}" for f in state["peer_failures"]]
     if state["peer_unavailable"]:
         reasons.append(f"peer unavailable: {state['peer_unavailable']['reason']}")
+    if state["quality"]["status"] == "loss":
+        reasons.append(f"quality loss: {state['quality']['reason']}")
     return reasons
+
+
+def stopped_experiment_failures(manifest):
+    """(workload, campaign.json path, entry) of each failed experiment run in a Stopped stage."""
+    for i, stage in enumerate(manifest["stages"]):
+        if stage["status"] != "Stopped":
+            continue
+        located = [(f"stages.{i}.warmups.{j}", e) for j, e in enumerate(stage["warmups"])]
+        located += [(f"stages.{i}.blocks.{b}.entries.{j}", e) for b, block in enumerate(stage["blocks"])
+                    for j, e in enumerate(block["entries"])]
+        for path, entry in located:
+            if entry["arm"] == "experiment" and entry["outcome"] == "Fail":
+                yield stage["workload"], path, entry
 
 
 def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha256=None):
@@ -233,8 +249,9 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
 
 def rows(campaign_dir, evidence_root):
     """F2 scoreboard rows (hf2q.f2.scoreboard-rows.v1 vocabulary) for the primary effects of one campaign; for a
-    controls-only campaign, the completed control stages' effects, labeled controls of the primary of record
-    (`control_of`, status Descriptive: never a win or loss)."""
+    controls-only campaign, the completed control stages' effects (status Descriptive) and each failed experiment
+    run of a stopped control stage (task_pass, status Failure), all labeled `control_of` the primary of record:
+    never a win or loss."""
     campaign_dir, root = Path(campaign_dir).resolve(), Path(evidence_root).resolve()
     if not campaign_dir.is_relative_to(root):
         raise ValueError("campaign directory must be under --evidence-root to be cited as $E/...")
@@ -273,7 +290,8 @@ def rows(campaign_dir, evidence_root):
         status = "Descriptive"  # a control of a primary of record never wins or loses (#369 amendment)
         sections = [(f"controls.{key}", key, stage, (verdict.get("native_peer") or {}).get(key))
                     for key, stage in verdict["controls"].items() if stage["status"] == "Complete"]
-    if not sections:
+    failed = [] if record is None else list(stopped_experiment_failures(manifest))
+    if not sections and not failed:
         return out
     if not arms["experiment"]["artifact"] or not arms["experiment"]["artifact"].get("sha256"):
         raise ValueError("F2 rows need the model sha256 (conversion receipt or HF2Q_Q5_MODEL_SHA256)")
@@ -308,4 +326,20 @@ def rows(campaign_dir, evidence_root):
             if control is not None:
                 row["control_of"] = control_of
             out["rows"].append(row)
+    campaign_ref = "$E/" + str((campaign_dir / "campaign.json").relative_to(root))
+    for key, where, entry in failed:
+        path = f"{where}.metrics.tasks_passed"
+        out["rows"].append({
+            "id": f"{group}-{key.replace('+', 'p')}-task-pass-{entry['name']}", "family": family, "group": group,
+            "metric": "task_pass", "kind": "measurement", "arm": "candidate",
+            "variant": f"Q3 experiment {plan['declared']['experiment']['label']}, control {key}",
+            "value": entry["metrics"]["tasks_passed"], "decimals": 0, "unit": "tasks",
+            "n_slots": 4, "context": "262144", "date": manifest["created_utc"][:10],
+            "source": {"commit": plan["declared"]["experiment"]["commit"], "binary_sha256": arms["experiment"]["binary"]["sha256"]},
+            "artifact_sha256": arms["experiment"]["artifact"]["sha256"], "receipt": campaign_ref, "status": "Failure",
+            "verification": {"state": "Verified", "key": f"campaign.json {path}",
+                             "extract": {"value": {"kind": "json", "file": campaign_ref, "path": path, "reduce": "one"}}},
+            "note": f"Q3 control {key} of the primary of record {control_of}: experiment run {entry['name']} failed its "
+                    f"task ({entry['failure_kind']}); the stage stopped and later stages did not run.",
+            "control_of": control_of})
     return out
