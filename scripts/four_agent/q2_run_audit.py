@@ -16,8 +16,9 @@ co-active set. A server that serves requests one at a time (or at most N at a ti
 keep N+1 requests mid-stream together, so its width stays at 1 (or N) however many HTTP
 requests it holds open: such a common window must open after one member's service started
 and close before an earlier member's last frame, which that capped slot sent before the later
-member was served, so only client receive jitter can make it non-empty. That is a vanishing
-fraction of an interval, and too short for every member to stream several frames inside it.
+member was served, so only client receive lag of the earlier member can make it non-empty. That
+is a vanishing fraction of an interval, and too short for the later-served member to reach its
+first frame (after its prefill) and stream more frames inside it.
 Bursty low-frame streams (one reasoning frame, then a semantic burst) still qualify because
 no frame alternation is required. This is a client-side lower bound on concurrent slot
 progress. A server that parks a request mid-generation while finishing another looks the
