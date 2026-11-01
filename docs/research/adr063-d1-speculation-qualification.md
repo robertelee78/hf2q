@@ -326,26 +326,31 @@ Medians: own-output makespan 84.93 s (auto) vs 83.39 s (off).
 - **Analysis deviation, disclosed.** The first version of this section used
   4-run ABBA blocks (df = 3; r = 1.020, CI 0.9995–1.041) and reported
   Inconclusive. That is not the declared estimator. The independent review
-  (`/tmp/adr063-d1-independent-verdict-v1.md`) caught it, and the declared-pair
+  (`$E/reviews/adr063-d1-independent-verdict-v1.md`) caught it, and the declared-pair
   result above replaces it. The review's recomputations point the same way:
   rule 4 taken literally (first pass plus two more blocks) gives 1.031
   (1.0065–1.056), and all runs pooled give 1.027 (1.012–1.043).
-- Decode throughput (not the decision metric; higher is better): the reviewer's
-  estimate is 0.980 (0.973–0.986). The root's estimate over streamed turns
-  only, which carry first-frame timing (12 of 28 turns per run), is 0.993
-  (0.975–1.012). The methods differ.
+- Decode throughput (the §5 secondary metric, not the decision metric; higher
+  is better): per-run median of `tokens_per_second` over the 28
+  `Qwen35 decode complete` server lines, auto/off **0.980** (95% CI
+  0.975–0.985, adjacent pairs; computed by the review and reproduced by the
+  root). An extra estimate over streamed client turns only (12 of 28 per run,
+  from first-frame timing) gives 0.993 (0.975–1.012).
 - Mechanism [INFERENCE]: §4's account (each MTP-holding lane pays the MTP
   catch-up while K3/history run only in solo turns) fits the direction, but the
   uncounted `HF2Q_MTP_PHASE_PROFILE=1` run that §5 asks for was not made, so
   K3 engagement in this workload is unmeasured.
 
 **Disabling at N4.** Per the paragraph after the decision rule, the unset
-default is now worker-aware: on a SlotAware worker with `max_slots ≥ 4` and a
-dense artifact (where joint decode defaults on), an unset
-`HF2Q_QWEN_SPECULATION` resolves to `off`. Everywhere else it resolves to
-`auto`, and an explicit value always wins (`QWEN38_SPECULATION=auto` opts back
-in). The worker logs `Qwen speculation worker policy`. Code, launcher,
-operator docs and CHANGELOG: branch `feat/d1-n4-speculation-off`.
+default is now worker-aware. On a SlotAware worker with `max_slots ≥ 4`, a
+dense artifact and joint decode selected (the measured configuration), an
+unset `HF2Q_QWEN_SPECULATION` resolves to `off`. Everywhere else it resolves to
+`auto`, including workers whose joint decode is off or unavailable, and an
+explicit value always wins (`QWEN38_SPECULATION=auto` opts back in). Other
+dense Qwen artifacts that select joint decode get the same default without
+their own measurement. The worker logs `Qwen speculation worker policy`. Code,
+launcher, operator docs and CHANGELOG: PR #493; it merges together with this
+document.
 
 **Qwen3.6** (`$E/d1-speculation-ab-v1/analysis.json`): §5 rules out makespan
 because per-agent completion differs between arms. Per the independent review,

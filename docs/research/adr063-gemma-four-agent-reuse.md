@@ -966,15 +966,17 @@ ABBA × 3, i.e. 6 + 6 runs (`$E/gemma-gc1-ab-v2`: `run.sh`, `analysis.json`).
 
 - All 12 runs `CalibrationPass`. Every A run logged
   `requested=false active=false` and 0 joint transactions. Every B run logged
-  `active=true` and 2–5 `transaction="joint warm" requests=4`.
+  `active=true` and 2–4 `transaction="joint warm" requests=4` (one run also
+  formed one smaller cohort).
 - Own-output four-task makespan on/off, using the declared adjacent-pair
   estimator (6 pairs, df = 5): **0.9997** (95% CI 0.967–1.034; per pair 0.990,
   1.009, 0.996, 1.006, 1.049, 0.951). Client elapsed: 1.000 (CI 0.970–1.031).
   Medians: own-output 13.29 s (on) and 13.15 s (off). The interval rules out a
   gain or loss larger than about 3–4%. It does not resolve smaller effects.
 
-**Disposition: neutral, not a win.** When it landed, joint warm prefill took
-makespan from 21.1 to 16.0 s (`$E/gemma-joint-ab-v1`). Since then the
+**Disposition: neutral, not a win.** When it landed, joint warm prefill was a
+measured gain: in `$E/gemma-joint-ab-v1`, on vs off medians were 15.68 vs
+16.62 s own-output (16.00 vs 17.01 s client), about 6%. Since then the
 cold-admission allocation fix and Stage 2 tiled F16 warm attention have made
 per-slot warm prefill fast enough that batching the suffixes no longer changes
 makespan. The route is bitwise exact against per-slot prefill (Stage 1 gates,
