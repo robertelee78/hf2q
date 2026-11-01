@@ -401,11 +401,6 @@ def main():
         summary["workflow_sha256"] = hashlib.sha256(workflow.encode()).hexdigest()
         summary["full_prefix_reuse"] = "PendingPostOracle"
         summary["runtime_qualified"] = False
-        if args.engine_kind in family_contract.NATIVE_KINDS:
-            from native_peers import adapter
-            after_task = adapter(args.engine_kind).after_task
-            if after_task is not None:  # native per-run proof, after the task clock (outside the makespan)
-                summary["native_render"] = after_task(args.base_url, output, summary["turns"])
     except BaseException as exc:
         summary["status"] = "Failed"
         summary["error"] = f"{type(exc).__name__}: {exc}"

@@ -100,7 +100,8 @@ def logs(spec, drafts=None, streams=4, tokens=262144, suffix=None, extra_out='',
            f"[tensorfold] serving {M} at http://127.0.0.1:{spec['port']}/v1 (sampling: greedy; drafts: {drafts}; "
            'context: 262144; loaded in 41.2s)\n' + extra_out)
     err = ('info: qwen27: prompt capacity=512 rows, startup stream and scratch reserve=21474836480 bytes\n'
-           'info: qwen27: lane rounds, 16-row window\n'
+           + ('info: qwen27: lone loop=lanes width=16; lane window=16, lane copies=off\n' if dflash2 else
+              'info: qwen27: lone loop=plain width=1; lane window=16, lane copies=off\n') +
            'info: prompt cache: 0.0 GiB from 0.0 GiB free under the 70% cap (95.2 GiB in use once loaded, 128 GiB '
            'of RAM, 8 GiB kept for prompt buffers)\n'
            f'info: Qwen3.8-27B: {streams} streams of {tokens} tokens{suffix}\n' + extra_err)
@@ -198,7 +199,10 @@ class Documents(unittest.TestCase):
             self.assertEqual((facts['streams'], facts['stream_tokens'], facts['dflash2_loaded'], facts['prompt_rows']),
                              (4, 262144, variant == 'dflash2', 512))
             self.assertEqual((facts['prompt_cache']['budget_gib'], facts['prompt_cache']['enabled']), (0.0, False))
-            self.assertEqual(facts['loop_policy'], ['lane rounds, 16-row window'])
+            self.assertEqual(facts['loop_policy'], ['lone loop=lanes width=16; lane window=16, lane copies=off'
+                                                    if variant == 'dflash2' else
+                                                    'lone loop=plain width=1; lane window=16, lane copies=off'])
+            self.assertEqual(facts['lane_copies'], 'off')
         plain = ready.native_spec(spec_for(Path('/x')))
         drafted = ready.native_spec(spec_for(Path('/x'), 'dflash2'))
         bad = [(plain, logs(plain, drafts='DFlash2 (/x/d)')), (plain, logs(plain, suffix=', DFlash2 drafts for one of them')),
@@ -211,7 +215,9 @@ class Documents(unittest.TestCase):
                (plain, (logs(plain)[0].replace('context: 262144', 'context: 32768'), logs(plain)[1])),
                (plain, (logs(plain)[0].replace('127.0.0.1:18252', '127.0.0.1:9'), logs(plain)[1])),
                (plain, (logs(plain)[0] * 2, logs(plain)[1])),
-               (plain, (logs(plain)[0], logs(plain)[1].replace('info: prompt cache', 'info: kept states')))]
+               (plain, (logs(plain)[0], logs(plain)[1].replace('info: prompt cache', 'info: kept states'))),
+               (plain, (logs(plain)[0], logs(plain)[1].replace('lone loop=plain width=1', 'lone loop=lanes width=16'))),
+               (drafted, (logs(drafted)[0], logs(drafted)[1].replace('lone loop=lanes width=16', 'lone loop=plain width=1')))]
         for spec, (out, err) in bad:
             with self.subTest(out=out[-120:], err=err[-80:]), self.assertRaises(Invalid):
                 ready.startup(out, err, spec)
@@ -319,14 +325,29 @@ class Readiness(unittest.TestCase):
             with self.subTest(bad=bad), patch.object(ready, 'fetch', side_effect=fetch), self.assertRaises(Invalid):
                 ready.render_proof('http://127.0.0.1:18252/v1', out, bad)
 
-    def test_closing_and_campaign_identity(self):
+    def test_closing_proves_every_agent_and_records_health(self):
+        out = self.root / 'coordinator'
+        for agent in ('agent-0', 'agent-1'):
+            (out / agent / 'turn-0').mkdir(parents=True)
+            raw = json.dumps(native(0), ensure_ascii=False, separators=(',', ':')).encode()
+            (out / agent / 'turn-0' / 'request.json').write_bytes(raw)
+            (out / agent / 'summary.json').write_text(json.dumps(
+                {'turns': [{'turn': 0, 'request_sha256': sha(raw), 'usage': {'prompt_tokens': 3}}]}))
+
         def fetch(port, path, output, name, body=None, limit=None, timeout=None):
-            raw = json.dumps(health(warming=True)).encode()
+            doc = health(warming=True) if path == '/health' else {'count': 3, 'max_model_len': 262144, 'tokens': [1, 2, 3]}
+            raw = json.dumps(doc).encode()
             Path(output, name).write_bytes(raw)
             return raw
         with patch.object(ready, 'fetch', side_effect=fetch):
-            closing = ready.closing('http://127.0.0.1:18252/v1', self.root / 'client')
+            closing = ready.closing('http://127.0.0.1:18252/v1', out)
         self.assertEqual(closing['health']['memory_bytes']['peak'], 3)
+        self.assertEqual(sorted(closing['render']), ['agent-0', 'agent-1'])
+        self.assertEqual(closing['render']['agent-1']['turns'][0]['tokens_sha256'], sha(b'1,2,3'))
+        self.assertTrue(closing['render']['agent-0']['timing'].startswith('coordinator closing'))
+        self.assertTrue((out / 'agent-1' / 'turn-0' / 'tensorfold-tokenize.raw').is_file())
+
+    def test_campaign_identity_and_launch_problems(self):
         plan = {'variables': {'TF_COMMIT': tf.TF_COMMIT, 'TF_BIN_SHA256': 'a' * 64, 'TF_VERSION': tf.TF_VERSION,
                               'TARGET_DIR': str(self.target), 'DRAFTER_DIR': str(self.drafter)}}
         identity = ready.campaign_identity(plan)

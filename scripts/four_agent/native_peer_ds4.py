@@ -123,8 +123,9 @@ CLIENT_MODULES = ('native_peers.py', 'native_peer_ds4.py', 'test_native_peer_ds4
 PROCESSES = ('ds4', 'ds4-server', 'ds4-agent', 'ds4-bench', 'ds4-eval')  # native ds4 binaries (/opt/ds4 Makefile:78)
 BASELINES = {'ds4_native': LABEL}
 AUDIT = 'native_peer_ds4_audit'
-after_task = None  # per-request rendering is proven by the --trace audit (native_peer_ds4_audit)
 closing = None
+PEER_CASE_REFUSAL = ('a native ds4 --peer-case needs --peer-unavailable-evidence for the same-GGUF peer (ADR-063 Q4), '
+                     'and that evidence admits no same-GGUF peer case')
 
 
 def label(case):

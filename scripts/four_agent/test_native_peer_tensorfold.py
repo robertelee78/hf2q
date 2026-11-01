@@ -106,7 +106,7 @@ class Translation(unittest.TestCase):
             for turn in range(7):
                 hf = build_request(M, messages, schemas(), turn, 'qwen')
                 request = native(turn, messages)
-                expected = {'model': M, 'messages': messages, 'tools': schemas(), 'tool_choice': 'auto',
+                expected = {'model': M, 'messages': messages, 'tools': tf.native_tools(schemas()), 'tool_choice': 'auto',
                             'max_completion_tokens': 8192, 'logprobs': False, 'stream': turn % 2 == 1,
                             'temperature': 0, 'top_p': 1.0, 'top_k': 0, 'min_p': 0.0, 'reasoning_effort': 'xhigh',
                             'chat_template_kwargs': {'enable_thinking': True}, 'thinking_budget': budget}
@@ -114,6 +114,10 @@ class Translation(unittest.TestCase):
                     expected['stream_options'] = {'include_usage': True}
                 self.assertEqual(request, expected)
                 self.assertIs(type(request['temperature']), int)
+                # hf2q's render: tool schemas without `strict`, every object key sorted (qwen38-cold.prompt.txt:9-11)
+                self.assertEqual(json.dumps(request['tools']), json.dumps(request['tools'], sort_keys=True))
+                self.assertEqual(json.dumps(request['tools'][0]), '{"function": {"name": "read_file", "parameters": '
+                                 '{"properties": {}, "type": "object"}}, "type": "function"}')
                 self.assertNotIn('parallel_tool_calls', request)  # omitted: TensorFold returns every call
                 delta = {k for k in request if k not in hf} | {k for k in hf if k not in request}
                 self.assertEqual(delta, {'hf2q_overflow_policy', 'temperature', 'top_p', 'top_k', 'min_p',
@@ -137,7 +141,8 @@ class Translation(unittest.TestCase):
                            ('chat_template_kwargs', {'enable_thinking': False}), ('thinking_budget', 2048),
                            ('thinking_budget', 512.0), ('parallel_tool_calls', False), ('repetition_penalty', 1.05),
                            ('draft', False), ('return_token_ids', True), ('hf2q_overflow_policy', 'reject'),
-                           ('stream_options', {'include_usage': False})]:
+                           ('stream_options', {'include_usage': False}), ('tools', schemas()),
+                           ('tools', [{'type': 'function', 'function': t['function']} for t in tf.native_tools(schemas())])]:
             with self.subTest(key=key, value=value), self.assertRaises(Invalid):
                 tf.canonical({**request, key: value}, 'qwen')
         for key in list(tf.NATIVE) + ['thinking_budget', 'stream_options']:
@@ -325,7 +330,8 @@ class Registry(unittest.TestCase):
     def test_ds4_resolves_to_its_unchanged_arm(self):
         self.assertIs(native_peers.adapter('ds4'), nd)
         self.assertEqual(nd.BASELINES, {'ds4_native': nd.LABEL})
-        self.assertIsNone(nd.after_task)
+        self.assertIsNone(nd.closing)
+        self.assertTrue(nd.PEER_CASE_REFUSAL.startswith('a native ds4 --peer-case needs --peer-unavailable-evidence'))
         self.assertIsNone(nd.NATIVE_COMPARISON)
         self.assertEqual(nd.label({}), nd.LABEL)
         self.assertEqual(nd.q3_role({}), nd.Q3_ROLE)

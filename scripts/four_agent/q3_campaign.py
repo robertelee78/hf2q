@@ -160,6 +160,7 @@ def build_plan(args, environ, family):
     evidence, comparison = bool(args.peer_unavailable_evidence), bool(args.native_comparison)
     qc.require((native is None and not comparison and not (args.peer_case and evidence))
                or (native is not None and evidence != comparison),
+               native_peers.adapter(native).PEER_CASE_REFUSAL if native is not None else
                "a native --peer-case needs exactly one of --peer-unavailable-evidence (no runnable same-GGUF peer, "
                "ADR-063 Q4) or --native-comparison (a separately labeled campaign beside the verdict of record), "
                "and neither admits a same-GGUF peer case")

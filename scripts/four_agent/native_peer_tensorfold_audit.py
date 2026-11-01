@@ -63,8 +63,9 @@ def audit_run(summary, client_dir, turns):
         done[match.group(1)] = match.groups()[1:]
     totals = dict.fromkeys(COUNTERS, 0)
     totals.update(requests=0, drafts_enabled=0)
+    renders = (summary.get('native_closing') or {}).get('render') or {}
     for agent, receipts in sorted(turns.items()):
-        proof = summary['agents'][agent].get('native_render') or {}
+        proof = renders.get(agent) or {}
         rows = proof.get('turns') or []
         require(proof.get('status') == 'Observed' and [r.get('turn') for r in rows] == [r['turn'] for r in receipts],
                 f'TensorFold render proof missing for {agent}')
@@ -98,15 +99,18 @@ def audit_run(summary, client_dir, turns):
                 totals[key] += value
             totals['requests'] += 1
             totals['drafts_enabled'] += runtime['drafts'] is True
-    variant = record['variant']
+    require(not done, 'TensorFold served chat requests the client did not send')
+    variant, copies = record['variant'], (record.get('startup') or {}).get('lane_copies')
     require(variant == 'none' or totals['drafted'] > 0, 'the DFlash2 arm drafted nothing in this run')
+    require(variant != 'none' or copies != 'off' or totals['drafted'] == 0,
+            'the no-drafter arm (lone loop=plain, lane copies=off) drafted')
     waits = SLOT_WAIT.findall(stderr)
     return {'engine_kind': ENGINE, 'variant': variant, 'requests': totals['requests'], 'totals': totals,
             'accepted_per_drafted': totals['accepted'] / totals['drafted'] if totals['drafted'] else None,
             'tokens_per_round': totals['completion_tokens'] / totals['rounds'] if totals['rounds'] else None,
             'thinking': f'every request thinking=True effort={EFFORT} (done line and runtime extras)',
             'sampling': 'greedy (runtime extras)', 'render': '/tokenize count == usage.prompt_tokens on every turn',
-            'slot_memory_waits': len(waits), 'unclaimed_done_lines': len(done),
+            'slot_memory_waits': len(waits), 'lane_copies': copies,
             'startup': record.get('startup'),
             'recovery': 'Unavailable:TensorFold closes a call that an end token cut before its closing markup '
                         '(chat.zig:313-317, docs/api.md:290-293) without a log line; malformed calls come back as '

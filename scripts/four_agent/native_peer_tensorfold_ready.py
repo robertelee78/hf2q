@@ -232,11 +232,15 @@ def startup(stdout, stderr, spec):
     count, tokens, drafted, images = found['streams'][0]
     require(int(count) == tf.SLOTS and int(tokens) == tf.CONTEXT_PER_SLOT and bool(drafted) == dflash2 and not images,
             'TensorFold streams/context/drafter startup line')
+    loops = [line for line in POLICY.findall(stderr) if line.startswith('lone loop=')]
+    require(len(loops) == 1 and loops[0].startswith('lone loop=plain ') != dflash2
+            and re.search(r'lane copies=(on|off)$', loops[0]) is not None,
+            'TensorFold loop policy line (qwen27_window.zig:86-92): plain exactly when no drafter loaded')
     rows, reserve = found['capacity'][0]
     budget, detail = found['cache'][0]
     return {'drafts': drafts, 'loaded_seconds': float(loaded), 'streams': tf.SLOTS, 'stream_tokens': tf.CONTEXT_PER_SLOT,
             'dflash2_loaded': dflash2, 'prompt_rows': int(rows), 'startup_reserve_bytes': int(reserve),
-            'loop_policy': POLICY.findall(stderr),
+            'loop_policy': POLICY.findall(stderr), 'lane_copies': loops[0].rsplit('=', 1)[1],
             'prompt_cache': {'status': 'Observed', 'budget_gib': float(budget), 'detail': detail,
                              'enabled': float(budget) > 0, 'flags': 'default auto budget (no --prompt-cache-gib)'}}
 
@@ -299,7 +303,7 @@ def readiness(base, model, output, packet):
                                                                 'runtime': manifest['runtime']},
             'startup': facts, 'build_info': build_info(tf.TF_COMMIT, spec['binary_sha256'], tf.TF_VERSION),
             'chat_template': f'Observed: chat_template.jinja sha256 {tf.TEMPLATE_SHA256} is the hf2q Qwen3.8 '
-                             'template; every turn\'s rendered ids are proven by /tokenize (native_render)',
+                             'template; every turn\'s rendered ids are proven by /tokenize (native_closing.render)',
             'tokenizer': 'Unavailable:the target tokenizer.json differs from the base Qwen/Qwen3.8-27B one hf2q '
                          'serves; per-turn TensorFold ids are archived for the post-run oracle',
             'physical_cohort': 'Unavailable:not proved by readiness or HTTP overlap',
@@ -333,15 +337,18 @@ def render_proof(base, output, turns):
                      'tokens_sha256': token_sha256(doc['tokens']),
                      'response_sha256': hashlib.sha256(reply).hexdigest()})
     return {'status': 'Observed', 'endpoint': '/tokenize', 'fields': list(TOKENIZE_FIELDS), 'turns': rows,
-            'timing': 'after task_completed_monotonic_ns: outside the makespan clock',
+            'timing': 'coordinator closing, after every agent finished: outside the makespan clock',
             'hf2q_token_parity': 'PendingPostOracle: hf2q renders the same template bytes; its GGUF tokenizer '
                                  'is the base one, so ids are compared offline from tensorfold-tokenize.raw'}
 
 
 def closing(base, output):
-    """/health once every agent finished: the D2 memory peak, archived raw."""
+    """Once every agent finished (outside the makespan): each agent's /tokenize proofs, then /health (D2 memory peak)."""
+    render = {}
+    for summary in sorted(Path(output).glob('agent-*/summary.json')):
+        render[summary.parent.name] = render_proof(base, summary.parent, loads(summary.read_bytes())['turns'])
     health = validate_health(loads(fetch(_port(base), '/health', output, 'tensorfold-health-final.raw')), ready=False)
-    return {'health': health, 'source': '/health memory (status_routes.zig:48-55), peak since start'}
+    return {'render': render, 'health': health, 'source': '/health memory (status_routes.zig:48-55), peak since start'}
 
 
 def campaign_identity(plan):

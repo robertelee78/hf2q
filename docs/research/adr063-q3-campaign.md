@@ -23,7 +23,7 @@ The checked-in peer cases match hf2q's model-facing settings (template, thinking
 - `--peer-unavailable-evidence` and `--peer-matched-case` both refuse with this flag. Without the flag, a TensorFold `--peer-case` refuses.
 - The artifact is the pinned target snapshot's `config.json` (TensorFold's `config_sha256`), with `TARGET_CONFIG_SHA256` required. Build identity is `tensorfold <version> <commit> binary-sha256 <TF_BIN_SHA256>`, and the target and drafter snapshot file listings are frozen with the campaign identity.
 - `verdict.json` sets `verdict_of_record: false` and `campaign_label: "native-comparison campaign; not the verdict of record"`, and the family verdict is `Unavailable` with that reason. `native_peer` carries the task-makespan statement, with the same withholding rules as ds4.
-- F2 rows go to group `qwen38-q3-tensorfold-native` or `qwen38-q3-tensorfold-dflash2-native`, and every row carries the not-of-record label. The TensorFold row renders only under "Native-engine comparisons".
+- F2 rows go to group `qwen38-q3-tensorfold-native` or `qwen38-q3-tensorfold-dflash2-native` (`-controls-` groups under `--controls-of`), and every row carries the not-of-record label. No experiment-vs-stock row is emitted: that effect belongs to the campaign of record. The TensorFold row renders only under "Native-engine comparisons".
 - The stock arm stays in the design. Dropping it would need new plan and verdict code, so an experiment-plus-TensorFold-only campaign is not offered.
 - Adapter and controls: `scripts/four_agent/README.md`, section "Native TensorFold arm".
 

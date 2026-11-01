@@ -307,7 +307,9 @@ def rows(campaign_dir, evidence_root):
         raise ValueError("F2 rows need the model sha256 (conversion receipt or HF2Q_Q5_MODEL_SHA256)")
     for prefix, control, stage, section_native in sections:
         peer_gone = verdict["verdict"] == "Unavailable" if control is None else bool(verdict["peer"]["unavailable"].get("peer"))
-        for name, baseline in (("vs_stock", "hf2q_current"), ("vs_peer", native_baseline)):
+        # a native-comparison campaign is not the verdict of record: its experiment-vs-stock effect is never a row
+        contrasts = (() if comparison else (("vs_stock", "hf2q_current"),)) + (("vs_peer", native_baseline),)
+        for name, baseline in contrasts:
             e = stage["effects"].get(name)
             withheld = native_label and (section_native or {}).get("statement_withheld")
             if e is None or e["improvement_percent"] is None or (name == "vs_peer" and (

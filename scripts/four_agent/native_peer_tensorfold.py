@@ -44,6 +44,7 @@ are stop/length/tool_calls; cancelled (chat.zig:468-474) and content_filter (--l
 Identity, readiness and the /tokenize rendered-prompt proof: native_peer_tensorfold_ready.py.
 """
 import copy
+import json
 import re
 
 import qwen_n4_peer
@@ -112,6 +113,8 @@ CLIENT_MODULES = ('native_peers.py', 'native_peer_tensorfold.py', 'native_peer_t
 PROCESSES = ('tensorfold', 'tensorfold-native')  # packaging/homebrew/tensorfold.rb.in:18-23, README.md:375
 BASELINES = {'tensorfold_native': LABELS['none'], 'tensorfold_dflash2_native': LABELS['dflash2']}
 AUDIT = 'native_peer_tensorfold_audit'
+PEER_CASE_REFUSAL = ('a native TensorFold --peer-case needs --native-comparison (Qwen3.8 has a runnable same-GGUF '
+                     'peer, ADR-063 Q4)')
 
 
 def _family(family):
@@ -171,7 +174,32 @@ def request_controls(request, family):
     budget = qwen_n4_peer.request_controls(request)['reasoning_budget_tokens']  # also checks roles/overflow
     require(budget == thinking_budget(request['messages']), 'Qwen thinking ceiling rule drift')
     native = {k: v for k, v in request.items() if k != 'hf2q_overflow_policy'}
-    return {**native, **copy.deepcopy(NATIVE), 'thinking_budget': budget}
+    return {**native, 'tools': native_tools(request['tools']), **copy.deepcopy(NATIVE), 'thinking_budget': budget}
+
+
+def _sorted(value):
+    if isinstance(value, dict):
+        return {key: _sorted(value[key]) for key in sorted(value)}
+    return [_sorted(item) for item in value] if isinstance(value, list) else value
+
+
+def native_tools(tools):
+    """hf2q's rendered tool schemas: no `strict` key and every object key sorted (rendered-inputs-reviewed/
+    qwen38-cold.prompt.txt:9-11); TensorFold's template sees the request's own order, and strict false is
+    TensorFold's default (no tool grammar, server.zig:302-314)."""
+    require(isinstance(tools, list) and all(isinstance(t, dict) and isinstance(t.get('function'), dict)
+                                            and t['function'].get('strict') is False for t in tools),
+            'canonical tool schemas carry strict false')
+    return [_sorted({**t, 'function': {k: v for k, v in t['function'].items() if k != 'strict'}}) for t in tools]
+
+
+def canonical_tools(tools):
+    """Inverse of native_tools: sorted, strict-free schemas get strict false back; anything else refuses."""
+    require(isinstance(tools, list) and all(isinstance(t, dict) and isinstance(t.get('function'), dict)
+                                            and 'strict' not in t['function']
+                                            and json.dumps(t) == json.dumps(_sorted(t)) for t in tools),
+            'TensorFold tool schemas must be the sorted, strict-free hf2q render')
+    return [{**t, 'function': {**t['function'], 'strict': False}} for t in tools]
 
 
 def canonical(request, family):
@@ -188,7 +216,7 @@ def canonical(request, family):
             and ('stream_options' in stripped) == stream
             and (not stream or same(stripped['stream_options'], {'include_usage': True})),
             'TensorFold request carries a field outside the closed envelope')
-    return {**stripped, 'hf2q_overflow_policy': 'reject'}
+    return {**stripped, 'tools': canonical_tools(stripped['tools']), 'hf2q_overflow_policy': 'reject'}
 
 
 def compact_json(text):
@@ -331,13 +359,9 @@ def readiness(base, model, output, packet):
     return ready(base, model, output, packet)
 
 
-def after_task(base, output, turns):
-    """Per-turn /tokenize proof, run after the agent's task clock stopped (outside the makespan)."""
-    from native_peer_tensorfold_ready import render_proof
-    return render_proof(base, output, turns)
-
 
 def closing(base, output):
+    """Every agent's /tokenize proofs and the final /health, after all agents finished (outside the makespan)."""
     from native_peer_tensorfold_ready import closing as close
     return close(base, output)
 

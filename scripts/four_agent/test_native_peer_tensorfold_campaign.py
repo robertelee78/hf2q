@@ -217,18 +217,19 @@ class Campaign(unittest.TestCase):
         group = 'qwen38-q3-tensorfold-dflash2-native'
         self.assertEqual(list(rows['groups']), [group])
         self.assertIn('not the verdict of record', rows['groups'][group]['title'])
-        self.assertEqual([r['baseline_arm'] for r in rows['rows']], ['hf2q_current', 'tensorfold_dflash2_native'])
+        # not the verdict of record: no experiment-vs-stock row, only the TensorFold comparison
+        self.assertEqual([r['baseline_arm'] for r in rows['rows']], ['tensorfold_dflash2_native'])
         for row in rows['rows']:
             self.assertTrue(row['note'].startswith('native-comparison campaign; not the verdict of record. Q3 verdict'))
             self.assertTrue(row['variant'].endswith('(native-comparison campaign; not the verdict of record)'))
-        self.assertIn('TTFT ratio experiment/TensorFold 0.5', rows['rows'][1]['note'])
+        self.assertIn('TTFT ratio experiment/TensorFold 0.5', rows['rows'][0]['note'])
         board = {'schema': f2.ROWS_SCHEMA, 'evidence_root_symbol': '$E', 'evidence_root_description': 'test',
                  'neutral_band_ratio': 1.025, 'neutral_band_basis': 'test',
                  'families': {'qwen38': {'title': 'Qwen3.8 27B', 'artifact_sha256': 'a' * 64, 'note': ''}}, **rows}
         f2.validate_manifest(board)
         self.assertEqual(f2.verify_rows(board, self.root), [r['id'] for r in rows['rows']])
         text = f2.render(f2.validate_manifest(board), [], '0' * 64)
-        native_row, stock_row = rows['rows'][1], rows['rows'][0]
+        native_row = rows['rows'][0]
         title = '## Native-engine comparisons (different artifact, task makespan only)'
         section = lambda start: text[text.index(start):text.find('\n## ', text.index(start) + len(start))]
         self.assertIn(f"`{native_row['id']}`", section(title))
@@ -236,8 +237,9 @@ class Campaign(unittest.TestCase):
         self.assertFalse(f2.effect_is_win(native_row))
         for other in ('## Wins vs baseline', '## Negative results', '## Open gaps'):
             self.assertNotIn(f"`{native_row['id']}`", section(other))
-        stock_line = next(line for line in text.splitlines() if f"`{stock_row['id']}`" in line)
-        self.assertIn('not the verdict of record', stock_line)
+        wins = section('## Wins vs baseline')
+        self.assertNotIn('qwen38-q3-tensorfold-dflash2-native-makespan-vs-stock', text)
+        self.assertNotIn('Q3 experiment main HEAD', wins)
 
 
 def done(rid, usage, finish='stop', thinking='True', effort='xhigh', spec=None):
@@ -249,7 +251,8 @@ def done(rid, usage, finish='stop', thinking='True', effort='xhigh', spec=None):
 
 
 class Audit(unittest.TestCase):
-    def run_dir(self, root, variant='dflash2', spec=None, done_changes=None, proof=True, tamper=False):
+    def run_dir(self, root, variant='dflash2', spec=None, done_changes=None, proof=True, tamper=False, copies='off',
+                extra_done=''):
         spec = speculative() if spec is None else spec
         client = root / 'client'
         unary_usage, stream_usage = use(), use(cached=900)
@@ -273,12 +276,13 @@ class Audit(unittest.TestCase):
                          'tokens_sha256': ready.token_sha256(range(1000)),
                          'response_sha256': hashlib.sha256(tokens).hexdigest()})
             lines += done(rid, usage, **{'spec': spec, **((done_changes or {}) if turn == 0 else {})})
-        (root / 'server.stdout').write_text('[tensorfold] serving qwen3.8-27b ...\n' + lines)
+        (root / 'server.stdout').write_text('[tensorfold] serving qwen3.8-27b ...\n' + lines + extra_done)
         (root / 'server.stderr').write_text('info: Qwen3.8-27B: a slot needs 16.1 GiB and 9.0 GiB is free beside the '
                                             'weights and an 8 GiB margin: the request waits for a stream to end\n')
         summary = {'native_readiness': {'engine_kind': 'tensorfold', 'source_revision': tf.TF_COMMIT, 'variant': variant,
-                                        'think_mode': 'thinking, reasoning_effort xhigh', 'startup': {}},
-                   'agents': {'agent-0': {'native_render': {'status': 'Observed', 'turns': rows} if proof else None}}}
+                                        'think_mode': 'thinking, reasoning_effort xhigh',
+                                        'startup': {'lane_copies': copies}},
+                   'native_closing': {'render': {'agent-0': {'status': 'Observed', 'turns': rows}} if proof else {}}}
         return summary, client, {'agent-0': receipts}
 
     def test_audit_binds_done_lines_runtime_and_tokenize_proofs(self):
@@ -288,8 +292,8 @@ class Audit(unittest.TestCase):
         self.assertEqual((report['requests'], totals['drafted'], totals['accepted'], totals['rounds'],
                           totals['completion_tokens'], totals['cached_tokens'], totals['drafts_enabled']),
                          (2, 128, 80, 60, 80, 900, 2))
-        self.assertEqual((report['accepted_per_drafted'], report['slot_memory_waits'], report['unclaimed_done_lines']),
-                         (0.625, 1, 0))
+        self.assertEqual((report['accepted_per_drafted'], report['slot_memory_waits'], report['lane_copies']),
+                         (0.625, 1, 'off'))
         self.assertAlmostEqual(report['tokens_per_round'], 80 / 60)
         self.assertTrue(report['recovery'].startswith('Unavailable:'))
         self.assertEqual(audit.final_object(stream(), True)[1], ['{"path":"tests/ports.rs"}'])
@@ -300,14 +304,18 @@ class Audit(unittest.TestCase):
         cases = [{'done_changes': {'effort': 'high'}}, {'done_changes': {'thinking': 'False'}},
                  {'done_changes': {'finish': 'length'}}, {'done_changes': {'spec': speculative(accepted=39)}},
                  {'proof': False}, {'tamper': True},
-                 {'spec': speculative(drafted=0, accepted=0, acceptance_rate=0.0)}]
+                 {'spec': speculative(drafted=0, accepted=0, acceptance_rate=0.0)},
+                 {'extra_done': done('chatcmpl-' + '3' * 32, use())},  # a chat request the client never sent
+                 {'variant': 'none'}]  # lone loop=plain with lane copies off, yet drafted
         for changes in cases:
             with self.subTest(changes=changes), tempfile.TemporaryDirectory() as tmp, self.assertRaises(Invalid):
                 audit.audit_run(*self.run_dir(Path(tmp), **changes))
-        with tempfile.TemporaryDirectory() as tmp:  # the plain arm may draft nothing (no drafter)
-            report = audit.audit_run(*self.run_dir(Path(tmp), 'none', spec=speculative(drafted=0, accepted=0,
-                                                                                         acceptance_rate=0.0)))
+        plain = speculative(drafted=0, accepted=0, acceptance_rate=0.0)
+        with tempfile.TemporaryDirectory() as tmp:  # the plain arm drafts nothing
+            report = audit.audit_run(*self.run_dir(Path(tmp), 'none', spec=plain))
             self.assertIsNone(report['accepted_per_drafted'])
+        with tempfile.TemporaryDirectory() as tmp:  # with lane copies on, copy drafts are recorded, not refused
+            self.assertEqual(audit.audit_run(*self.run_dir(Path(tmp), 'none', copies='on'))['totals']['drafted'], 128)
         with tempfile.TemporaryDirectory() as tmp:
             summary, client, turns = self.run_dir(Path(tmp))
             (Path(tmp) / 'server.stdout').write_text('')
