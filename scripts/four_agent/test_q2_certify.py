@@ -1,10 +1,13 @@
 """Model-free controls of the actual Q2 raw-cohort certifier (q2_certify) and manifest assembler.
 
-The cohort is synthetic: one honest fake-service agent (the actual exchange client and parser),
-stub compile/test receipts and a synthetic native phase trace from test_f2_native_trace. Nothing
-here is hardware, model or QE evidence; the controls show what certify_cohort accepts and the
-exact reasons it refuses.
+The cohorts are synthetic: honest fake-service agents (the actual exchange client and parser),
+stub compile/test receipts and synthetic native phase traces from test_f2_native_trace. The N4
+cohort's four agents are re-timed to one shared release with fake.retime and bound by an actual
+coordinator barrier release. Nothing here is hardware, model or QE evidence; the controls show
+what certify_cohort accepts and the exact reasons it refuses.
 """
+import copy
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -18,9 +21,10 @@ import f2_trace
 import q2_certify as certify
 import q2_fake_service as fake
 import q2_manifest
+import qwen_n4_live_smoke as coordinator
 import qwen38_n1_tools as tool_source
 from qwen38_n1_verdict import Invalid
-from test_f2_native_trace import fixture as trace_fixture, with_busy_owners
+from test_f2_native_trace import fixture as trace_fixture, four_lanes, with_busy_owners
 
 HERE = Path(__file__).resolve().parent
 SOURCES = ("q2_certify.py", "qwen38_n1_verdict.py", "qwen38_n1_smoke.py", "qwen38_n1_tools.py",
@@ -46,27 +50,25 @@ def ref(path):
 
 
 class Cohort:
-    """One N1 hf2q cohort laid out as q2_manifest.agent_refs reads it, plus its frozen plan inputs."""
+    """One N1 or N4 hf2q cohort laid out as q2_manifest.agent_refs reads it, plus its frozen plan inputs."""
 
-    def __init__(self, root, trace=None):
+    def __init__(self, root, trace=None, cardinality=1):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
-        self.serial = 0
+        self.serial, self.count = 0, cardinality
         template_root, results = fake.template()
         self.client = self.root / "client"
-        shutil.copytree(template_root / "agent-0", self.client)
-        fixture = self.client / "tools" / "fixture"
-        for name, text in tool_source.IMMUTABLE.items():
-            (fixture / name).parent.mkdir(parents=True, exist_ok=True)
-            (fixture / name).write_text(text)
-        for number, tool in enumerate(results["agent-0"]["tools"], 1):
-            tool = dict(tool)
-            if tool["name"] == "run_tests":
-                tool["artifact_sha256"] = self.test_group(number, tool["target"], fixture / "Cargo.toml")
-            write_json(self.client / "tools" / f"tool-{number:02d}" / "result.json", tool)
-        self.initial = self.root / "initial" / "agent-0.json"
-        self.initial.parent.mkdir()
-        shutil.copyfile(self.client / "turn-0" / "request.json", self.initial)
+        names = [f"agent-{i}" for i in range(cardinality)]
+        dirs = {"agent-0": self.client} if cardinality == 1 else {name: self.client / name for name in names}
+        self.initial = {}
+        for name, directory in dirs.items():
+            shutil.copytree(template_root / name, directory)
+            self.agent_files(directory, results[name]["tools"])
+            self.initial[name] = self.root / "initial" / f"{name}.json"
+            self.initial[name].parent.mkdir(exist_ok=True)
+            shutil.copyfile(directory / "turn-0" / "request.json", self.initial[name])
+        if cardinality == 4:
+            self.barrier(dirs, copy.deepcopy({name: results[name] for name in names}))
         self.records, self.identity, self.scenario = trace_fixture() if trace is None else trace
         self.trace = write_jsonl(self.root / "native-phase-trace.jsonl", self.records)
         self.server_receipt = write_json(self.root / "receipt.json", {
@@ -74,16 +76,54 @@ class Cohort:
             "listener_cleanup_error": None, "cleanup": [{"reaped": True, "group_empty": True, "errors": []}]})
         self.readiness = write_json(self.root / "readiness.json", {
             "health": {"model": fake.MODEL, "context_length": 262144},
-            "runtime": {"measurement_snapshot": {"process_pid": fake.SERVER_PID}, "serve": {"max_slots": 1}},
+            "runtime": {"measurement_snapshot": {"process_pid": fake.SERVER_PID}, "serve": {"max_slots": cardinality}},
             "readyz": {"ready": True}, "pool_binding": None})
         self.spec = {"schema": "hf2q.q2.manifest-input.v1", "expected_plan": ref(self.file("plan", self.plan())),
                      "client_root": str(self.client), "server_receipt": ref(self.server_receipt),
                      "readiness": ref(self.readiness), "trace": ref(self.trace)}
-        self.manifest = write_json(self.root / "cohort-manifest.json", q2_manifest.assemble(self.spec))
+        self.manifest = self.reassemble()
 
-    def test_group(self, number, target, manifest):
+    def reassemble(self):
+        """A new cohort manifest over the files as they are now."""
+        return self.file("cohort-manifest", q2_manifest.assemble(self.spec))
+
+    def agent_files(self, directory, tools):
+        fixture = directory / "tools" / "fixture"
+        for name, text in tool_source.IMMUTABLE.items():
+            (fixture / name).parent.mkdir(parents=True, exist_ok=True)
+            (fixture / name).write_text(text)
+        for number, tool in enumerate(tools, 1):
+            tool = dict(tool)
+            if tool["name"] == "run_tests":
+                tool["artifact_sha256"] = self.test_group(directory, number, tool["target"], fixture / "Cargo.toml")
+            write_json(directory / "tools" / f"tool-{number:02d}" / "result.json", tool)
+
+    def barrier(self, dirs, results):
+        """One shared release: re-timed raw receipts and agent summaries, ready records, the actual
+        coordinator release (bound by its ready hashes) and the coordinator summary."""
+        releases, triggers = fake.retime(results, None, 100.0)
+        self.release_ns = releases[0]
+        for name, directory in dirs.items():
+            for turn, receipt in enumerate(results[name]["turns"]):
+                write_json(directory / f"turn-{turn}" / "receipt.json", receipt)
+            write_json(directory / "summary.json", results[name])
+        ready = {name: {"schema": "hf2q.n4-agent-ready.v1", "agent_id": name, "run_id": fake.RUN,
+                        "server_pid": fake.SERVER_PID, "barrier_token": fake.TOKEN,
+                        "identity_sha256": hashlib.sha256(coordinator.identity(name, fake.RUN).encode()).hexdigest(),
+                        "initial_messages_sha256": results[name]["initial_messages_sha256"], "output": str(directory)}
+                 for name, directory in dirs.items()}
+        barrier = self.client / "barrier"
+        hashes = {name: certify.digest(write_json(barrier / f"{name}.ready.json", record)) for name, record in ready.items()}
+        release = dict(coordinator.barrier_release(ready, fake.RUN, fake.SERVER_PID, fake.TOKEN, hashes),
+                       release_monotonic_ns=releases[0], f2_clock_id="CLOCK_MONOTONIC")
+        release_path = write_json(barrier / "release.json", release)
+        summary = fake.assemble(self.client, results, releases, triggers, None)
+        summary["barrier"].update(ready=ready, release_sha256=certify.digest(release_path))
+        write_json(self.client / "summary.json", summary)
+
+    def test_group(self, directory, number, target, manifest):
         """Compile and test receipts in the actual Tools.tests layout; the binaries are never executed."""
-        tool = self.client / "tools" / f"tool-{number:02d}"
+        tool = directory / "tools" / f"tool-{number:02d}"
         names = ["ports"] if target == "ports" else ["qwen38_n1_fixture", "ports"]
         binaries = []
         for name in names:
@@ -116,10 +156,11 @@ class Cohort:
         return {"schema": "hf2q.q2.expected-plan.v1", "cohort_id": COHORT, "identity": self.identity,
                 "source_files": {name: certify.digest(HERE / name) for name in SOURCES}, "family": "qwen",
                 "engine_kind": "hf2q", "model": fake.MODEL, "server_pid": fake.SERVER_PID,
-                "run_id": self.scenario["run_id"], "required_cardinality": 1,
-                "initial_requests": {"agent-0": ref(self.initial)}, "barrier_token": None,
-                "trace_scenario": {**self.scenario, "composition": [0, 1], "arrival_ns": 0,
-                                   "population_policy": "ready_now_v1", **scenario},
+                "run_id": self.scenario["run_id"], "required_cardinality": self.count,
+                "initial_requests": {name: ref(path) for name, path in self.initial.items()},
+                "barrier_token": fake.TOKEN if self.count == 4 else None,
+                "trace_scenario": {**self.scenario, "composition": [0, 1] if self.count == 1 else [4, 0],
+                                   "arrival_ns": 0, "population_policy": "ready_now_v1", **scenario},
                 "qe_attestation": qe}
 
     def attestation(self, **changes):
@@ -129,8 +170,8 @@ class Cohort:
             "auditor_sha256": certify.digest(certify.__file__), "cohort_id": COHORT, "identity": self.identity,
             **changes}))
 
-    def certify(self, plan):
-        return certify.certify_cohort(str(self.manifest), plan)
+    def certify(self, plan, manifest=None):
+        return certify.certify_cohort(str(manifest or self.manifest), plan)
 
 
 class Certify(unittest.TestCase):
@@ -252,6 +293,78 @@ class Certify(unittest.TestCase):
                         self.assertRaisesRegex(Invalid, "^canonical private certificate outside Git$"):
                     self.main(self.cohort.plan(), output)
                 self.assertFalse(output.exists())
+
+
+def n4_trace():
+    """Four admitted prefill owners, transaction-busy after their submits: a (4,0) window only forward_demand_v2 credits."""
+    records, identity, scenario = four_lanes((4, 0))
+    with_busy_owners(records, 330)
+    records[0]["payload"]["run_id"] = scenario["run_id"] = fake.RUN
+    return records, identity, scenario
+
+
+class CertifyN4(unittest.TestCase):
+    """The four-agent branch: coordinator exits, release identity, ready join, barrier release, aggregate, clocks."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.cohort = Cohort(Path(cls.tmp.name) / "n4", n4_trace(), cardinality=4)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def plan(self, **changes):
+        return self.cohort.plan(population_policy="forward_demand_v2", **changes)
+
+    def test_four_agents_released_together_await_qe_then_qualify(self):
+        report = self.cohort.certify(self.plan())
+        self.assertEqual((report["status"], report["required_cardinality"]), ("PendingIndependentQE", 4))
+        self.assertEqual(report["makespan_started_ns"], self.cohort.release_ns)
+        self.assertEqual(report["makespan_finished_ns"] - report["makespan_started_ns"], 100 * 10 ** 9)
+        self.assertEqual(set(report["per_slot_metrics"]), {f"agent-{i}" for i in range(4)})
+        window = report["phase_window"]
+        self.assertEqual((window["status"], window["population_policy"], window["target_fraction"]),
+                         ("Qualified", "forward_demand_v2", 1))
+        self.assertEqual(window["slots_without_required_forward_witness"], [])
+        with self.assertRaisesRegex(Invalid, "^actual admitted-slot population/progress not qualified$"):
+            self.cohort.certify(self.cohort.plan())  # ready_now_v1: busy owners are not ready-now
+        qe = self.cohort.attestation()
+        report = self.cohort.certify(self.plan(qe=qe))
+        self.assertEqual((report["status"], report["qe"]), ("Qualified", qe))
+
+    def forged(self, name, mutate, reason):
+        path = self.cohort.client / name
+        original = path.read_bytes()
+        value = json.loads(original)
+        mutate(value)
+        write_json(path, value)
+        try:
+            manifest = self.cohort.reassemble()
+            with self.subTest(reason=reason), self.assertRaisesRegex(Invalid, "^" + re.escape(reason) + "$"):
+                self.cohort.certify(self.plan(), manifest)
+        finally:
+            path.write_bytes(original)
+
+    def test_release_identity_and_ready_join_forgeries(self):
+        self.forged("summary.json", lambda s: s["barrier"].update(release_sha256="0" * 64), "actual release identity")
+        self.forged("barrier/release.json", lambda r: r.update(release_monotonic_ns=r["release_monotonic_ns"] + 1),
+                    "actual release identity")  # the coordinator summary still names the original release
+        self.forged("summary.json", lambda s: s["barrier"]["ready"]["agent-1"].update(initial_messages_sha256="0" * 64),
+                    "raw ready/aggregate join")
+        self.forged("summary.json", lambda s: s["exits"].pop("agent-3"), "actual coordinator exits")
+        self.forged("summary.json", lambda s: s.update(status="Failed"), "actual four-task aggregate")
+        stale = self.plan()
+        stale["barrier_token"] = "f" * 32
+        with self.assertRaisesRegex(Invalid, "^stale/mismatched barrier release$"):
+            self.cohort.certify(stale)
+
+    def test_makespan_start_and_completion_clock_forgeries(self):
+        self.forged("summary.json", lambda s: s.update(makespan_started_ns=s["makespan_started_ns"] + 10 ** 9),
+                    "actual declared cohort release clock")
+        self.forged("summary.json", lambda s: s.update(makespan_finished_ns=s["makespan_finished_ns"] - 10 ** 9),
+                    "actual four-task completion clock")
 
 
 class TraceFileControls(unittest.TestCase):
