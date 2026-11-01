@@ -1,5 +1,14 @@
 //! Actual Gemma Hybrid slot path, not a Qwen/DS approximation. Root must bind
 //! an independently reviewed environment/resource packet before real execution.
+//!
+//! `prefill_chunks` selects the prompt route: `[128]` (All128, the T0 route)
+//! or `[64,64]` (the T3 route: the second chunk resumes through the same
+//! `forward_prefill_with_soft_tokens_slot_aware_resume` call `gemma_actual`
+//! uses). Each chunk and decode commits the slot cursor exactly as
+//! `gemma_actual` does. With `normalize_rows` targets keyed at every chunk
+//! start, both routes emit the same per-row coordinates, so `exact` on the two
+//! stores localizes the first differing (layer, stage). There is no packed
+//! T2 (cohort) route here: T2 stage localization is recorded as Missing.
 use super::{
     family,
     receipt::*,
@@ -38,6 +47,30 @@ struct Packet {
     targets: Vec<Target>,
     host_payload_limit: u64,
     rerun_id: String,
+    /// Prompt chunk lengths; must sum to 128. Default All128.
+    #[serde(default = "all128")]
+    prefill_chunks: Vec<usize>,
+}
+fn all128() -> Vec<usize> {
+    vec![128]
+}
+fn validate_prefill_chunks(chunks: &[usize]) -> Result<(), String> {
+    if chunks.is_empty() || chunks.contains(&0) || chunks.iter().sum::<usize>() != 128 {
+        return Err(format!("prefill_chunks {chunks:?} must be non-empty positive lengths summing to 128"));
+    }
+    Ok(())
+}
+#[test]
+fn q1_gemma_localizer_prefill_chunks_must_cover_the_128_prompt() {
+    assert!(validate_prefill_chunks(&all128()).is_ok());
+    assert!(validate_prefill_chunks(&[64, 64]).is_ok());
+    assert!(validate_prefill_chunks(&[64, 63]).is_err());
+    assert!(validate_prefill_chunks(&[64, 65]).is_err());
+    assert!(validate_prefill_chunks(&[0, 128]).is_err());
+    assert!(validate_prefill_chunks(&[]).is_err());
+    let packet: serde_json::Value = serde_json::json!({"prefill_chunks": [64, 64]});
+    let chunks: Vec<usize> = serde_json::from_value(packet["prefill_chunks"].clone()).unwrap();
+    assert_eq!(chunks, vec![64, 64]);
 }
 #[test]
 #[ignore = "root-controlled real Gemma stage localizer, private resource packet required"]
@@ -77,6 +110,7 @@ fn q1_gemma_actual_stage_localizer() {
     assert_eq!(packet.configured_output_allowance, 8192);
     assert!(packet.host_payload_limit <= 1024 * 1024 * 1024);
     assert!(!packet.rerun_id.trim().is_empty());
+    validate_prefill_chunks(&packet.prefill_chunks).unwrap();
     assert!(!packet.targets.is_empty() && packet.targets.len() <= 4096);
     let mut targets = BTreeMap::new();
     for entry in packet.targets {
@@ -194,28 +228,53 @@ fn q1_gemma_actual_stage_localizer() {
     );
     let _capture_scope = family::install(Family::Gemma4, store, targets).unwrap();
     use crate::serve::multi_seq_kv::SlotId;
+    let slot = SlotId(0);
     let result = (|| -> anyhow::Result<()> {
-        model.weights.forward_prefill_with_soft_tokens_slot_aware(
-            &packet.tokens[..128],
-            &[],
-            packet.configured_output_allowance,
-            &mut model.ctx,
-            SlotId(0),
-            model
+        let mut cached = 0usize;
+        for &chunk in &packet.prefill_chunks {
+            let end = cached + chunk;
+            let hb = model
                 .multi_seq_kv
                 .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("HB scaffold absent"))?,
-            model.multi_seq_kv_hybrid.as_mut(),
-            model.multi_seq_kv_dense.as_mut(),
-            model.multi_seq_kv_mlx.as_mut(),
-        )?;
+                .ok_or_else(|| anyhow::anyhow!("HB scaffold absent"))?;
+            if cached == 0 {
+                model.weights.forward_prefill_with_soft_tokens_slot_aware(
+                    &packet.tokens[..end],
+                    &[],
+                    packet.configured_output_allowance,
+                    &mut model.ctx,
+                    slot,
+                    hb,
+                    model.multi_seq_kv_hybrid.as_mut(),
+                    model.multi_seq_kv_dense.as_mut(),
+                    model.multi_seq_kv_mlx.as_mut(),
+                )?;
+            } else {
+                model.weights.forward_prefill_with_soft_tokens_slot_aware_resume(
+                    &packet.tokens[..end],
+                    &[],
+                    packet.configured_output_allowance,
+                    &mut model.ctx,
+                    slot,
+                    hb,
+                    model.multi_seq_kv_hybrid.as_mut(),
+                    model.multi_seq_kv_dense.as_mut(),
+                    model.multi_seq_kv_mlx.as_mut(),
+                    cached,
+                )?;
+            }
+            crate::serve::api::engine::q1_gemma_cohort::commit_after_checked_return(
+                &mut model, slot, cached, end,
+            )?;
+            cached = end;
+        }
         for position in 128..144 {
             model.weights.forward_decode_slot_aware(
                 packet.tokens[position],
                 position,
                 &mut model.ctx,
                 &mut None,
-                SlotId(0),
+                slot,
                 model
                     .multi_seq_kv
                     .as_mut()
@@ -223,6 +282,9 @@ fn q1_gemma_actual_stage_localizer() {
                 model.multi_seq_kv_hybrid.as_mut(),
                 model.multi_seq_kv_dense.as_mut(),
                 model.multi_seq_kv_mlx.as_mut(),
+            )?;
+            crate::serve::api::engine::q1_gemma_cohort::commit_after_checked_return(
+                &mut model, slot, position, position + 1,
             )?;
         }
         Ok(())
@@ -236,9 +298,11 @@ fn q1_gemma_actual_stage_localizer() {
         trace.coverage.errors
     );
     let evidence = serde_json::json!({"schema":"hf2q.adr063.q1.stage-localizer.v1","packet_sha256":hash(&raw),"rerun_id":packet.rerun_id,
-        "route":"GemmaActualHybridSlotAwareWithCheckedDiagnosticLayerSplits","logical_lane":"slot0","declared_slots":4,
+        "route":"GemmaActualHybridSlotAwareWithCheckedDiagnosticLayerSplits","prefill_chunks":packet.prefill_chunks,
+        "logical_lane":"slot0","declared_slots":4,
         "tokens":144,"records":trace.coverage.captured.len(),"whole_q1_qualified":false,
-        "full_prefill_logits":"NotEstablishedByLastRowProductionHead","other_three_lane_execution":"NotClaimedBySingleLaneLocalizer"});
+        "full_prefill_logits":"NotEstablishedByLastRowProductionHead","other_three_lane_execution":"NotClaimedBySingleLaneLocalizer",
+        "packed_t2_route":"Missing: no packed-cohort stage localizer"});
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
