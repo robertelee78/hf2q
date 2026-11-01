@@ -6,7 +6,7 @@ Evidence shapes (ADR-063 Q2 item 6): the outer `server_receipt` and the `readine
 envelope ({health, runtime, ...}) are the ones the F2 operating90 supervisor writes; the
 q5 calibration receipt and its separate readiness files are not certifiable inputs. The
 server phase trace is the JSONL file `hf2q serve` writes under HF2Q_PHASE_TRACE_CONFIG.
-Only hf2q cohorts carry that trace, so peer and ds4 cohorts are refused, never Qualified.
+Only hf2q cohorts carry that trace, so peer and native-engine cohorts are refused, never Qualified.
 """
 from pathlib import Path
 import argparse
@@ -141,10 +141,11 @@ def request_wire(request, request_raw, family, engine):
         require(wire(request, family) == request_raw, "canonical wire/no silent truncation")
     else:
         # Same validation boundary as actual native-engine exchange, retaining native metadata.
-        if engine == "ds4":
-            from native_peer_ds4 import canonical
-        else:
+        if engine == "peer":
             from family_peer import canonical
+        else:
+            from native_peers import adapter
+            canonical = adapter(engine).canonical
         wire(canonical(request, family), family)
         require(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
                 == request_raw, "canonical native peer wire")
@@ -307,7 +308,7 @@ def certify_cohort(cohort_manifest_path, expected_plan):
             and expected_plan["required_cardinality"] in (1, 4), "N1/N4 separate plan")
     require(set(expected_plan["identity"]) == IDENTITY, "complete model/binary/native/template identity")
     # Only hf2q writes the server phase trace this certificate requires (src/serve/phase_trace.rs).
-    # Peer cohorts are dry-audited with audit_agent; ds4 cohorts with q2_run_audit + native_peer_ds4_audit.
+    # Peer cohorts are dry-audited with audit_agent; native-engine cohorts by q2_run_audit + the arm's AUDIT module.
     require(expected_plan["engine_kind"] != "peer",
             "peer cohort has no hf2q server phase trace: never Q2-certifiable")
     require(expected_plan["engine_kind"] == "hf2q", "closed engine family")

@@ -3,9 +3,10 @@
 
 Arms: stock hf2q (the released binary), experiment hf2q (the candidate binary) and the
 peer in its best valid configuration (q5_cases/peer-<family>.json), plus an optional
-labeled matched-settings peer diagnostic. A native ds4 --peer-case (DeepSeek-V4 only, its own
-artifact) needs --peer-unavailable-evidence for the same-GGUF peer and is reported separately
-(verdict.json native_peer, task makespan only). Every run is one q5_calibration.py supervised
+labeled matched-settings peer diagnostic. A native-engine --peer-case (native_peers.py: its own
+artifact) runs in the peer slot either with --peer-unavailable-evidence for the same-GGUF peer
+(ds4) or as a separately labeled --native-comparison campaign beside the verdict of record
+(TensorFold); verdict.json native_peer reports it, task makespan only. Every run is one q5_calibration.py supervised
 runtime, started only after the previous one exited. Identities (binaries, model, peer
 build, harness sources and commit, Python, host) are frozen at campaign start and
 re-checked before every run; any change halts the campaign for good.
@@ -24,6 +25,7 @@ import json
 import os
 from pathlib import Path
 
+import native_peers
 import q2_run_audit
 import q3_identity
 import q3_metrics
@@ -46,8 +48,9 @@ ARMS = ("stock", "experiment", "peer", "peer_matched")
 ROLES = {"stock": "stock hf2q: frozen released baseline", "experiment": "experimental hf2q on that baseline",
          "peer": "peer, best valid configuration (mandatory comparator)",
          "peer_matched": "peer, matched-settings diagnostic (never enters the verdict)"}
-# The peer arm may instead be the native ds4 engine (its own artifact): labeled, reported separately.
-ARM_KINDS = {"stock": ("hf2q",), "experiment": ("hf2q",), "peer": ("peer", "ds4"), "peer_matched": ("peer",)}
+# The peer arm may instead be a native engine (its own artifact): labeled, reported separately.
+ARM_KINDS = {"stock": ("hf2q",), "experiment": ("hf2q",), "peer": ("peer",) + native_peers.KINDS,
+             "peer_matched": ("peer",)}
 TERMINAL = ("Complete", "Invalid", "IdentityDrift")
 
 
@@ -150,13 +153,22 @@ def build_plan(args, environ, family):
         qc.require(CLIENT in cases[arm]["client"]["argv"], f"{arm} case must run the canonical four-agent client")
         arms[arm] = {"case": str(path), "case_sha256": sha256(path), "engine_kind": kind, "role": ROLES[arm],
                      "overrides": qc.overrides(cases[arm], explicit.get(arm, []) + (extra[arm] or []), environ)}
-        if kind == "ds4":
-            import native_peer_ds4
-            arms[arm].update(role=native_peer_ds4.Q3_ROLE, label=native_peer_ds4.LABEL)
-    native = arms.get("peer", {}).get("engine_kind") == "ds4"
-    qc.require(native == bool(args.peer_case and args.peer_unavailable_evidence),
-               "a native ds4 --peer-case needs --peer-unavailable-evidence for the same-GGUF peer (ADR-063 Q4), "
-               "and that evidence admits no same-GGUF peer case")
+        if native_peers.is_native(kind):
+            module = native_peers.adapter(kind)
+            arms[arm].update(role=module.q3_role(cases[arm]), label=module.label(cases[arm]))
+    native = native_peers.peer_kind({"arms": arms})
+    evidence, comparison = bool(args.peer_unavailable_evidence), bool(args.native_comparison)
+    qc.require((native is None and not comparison and not (args.peer_case and evidence))
+               or (native is not None and evidence != comparison),
+               native_peers.adapter(native).PEER_CASE_REFUSAL if native is not None else
+               "a native --peer-case needs exactly one of --peer-unavailable-evidence (no runnable same-GGUF peer, "
+               "ADR-063 Q4) or --native-comparison (a separately labeled campaign beside the verdict of record), "
+               "and neither admits a same-GGUF peer case")
+    if native is not None:
+        module = native_peers.adapter(native)
+        qc.require((module.SAME_GGUF_UNAVAILABLE if evidence else module.NATIVE_COMPARISON) is not None,
+                   f"the native {native} arm does not run with "
+                   + ("--peer-unavailable-evidence" if evidence else "--native-comparison"))
     for arm in ("stock", "experiment"):  # without --<arm>-bin the case default would silently stand in
         arms[arm]["overrides"].setdefault("HF2Q_BIN", None)
     ambient = {k[len(qc.OVERRIDE):] for k in environ if k.startswith(qc.OVERRIDE)}
@@ -180,6 +192,8 @@ def build_plan(args, environ, family):
                          "experiment": {"label": args.experiment_label, "commit": args.experiment_commit,
                                         "binary": args.experiment_bin},
                          "qe_identity": args.qe_identity}}
+    if comparison:
+        plan["native_comparison"] = native_peers.adapter(native).NATIVE_COMPARISON
     if args.negative_control_receipt is not None:
         receipt = Path(args.negative_control_receipt).resolve()
         plan["negative_control_receipt"] = {"path": str(receipt), "sha256": sha256(receipt)}
@@ -450,11 +464,14 @@ def parse_args(argv):
     parser.add_argument("--experiment-label", default="main HEAD")
     parser.add_argument("--hf2q-case", help="hf2q Q5 case for both hf2q arms (default q5_cases/<family>.json)")
     parser.add_argument("--peer-case", help="peer best valid configuration (default q5_cases/peer-<family>.json); "
-                        "or q5_cases/native-ds4-deepseek4.json with --peer-unavailable-evidence")
+                        "or a native-engine case (native_peers.py) with --peer-unavailable-evidence or --native-comparison")
     parser.add_argument("--peer-matched-case", help="optional matched-settings peer diagnostic arm (labeled, not in the verdict)")
     parser.add_argument("--peer-unavailable-evidence", action="append", metavar="FILE",
                         help="receipt proving no runnable same-GGUF peer arm (repeatable); runs stock and "
-                             "experiment only, or the native ds4 --peer-case")
+                             "experiment only, or a native --peer-case whose arm accepts it (ds4)")
+    parser.add_argument("--native-comparison", action="store_true",
+                        help="the native --peer-case (TensorFold) runs beside a runnable same-GGUF peer: a separately "
+                             "labeled campaign whose verdict and rows are never the verdict of record")
     for arm in ARMS:
         parser.add_argument(f"--{arm.replace('_', '-')}-var", action="append", metavar="NAME=VALUE",
                             help=f"HF2Q_Q5_<NAME> override for the {arm} arm only (repeatable)")
@@ -484,8 +501,8 @@ def parse_args(argv):
             parser.error("--hf2q-case applies to one family")
         if args.controls_of is not None and (not args.family or len(args.family) != 1):
             parser.error("--controls-of applies to exactly one --family")
-        if args.peer_unavailable_evidence and args.peer_matched_case:
-            parser.error("--peer-unavailable-evidence runs no same-GGUF peer arm")
+        if (args.peer_unavailable_evidence or args.native_comparison) and args.peer_matched_case:
+            parser.error("--peer-unavailable-evidence and --native-comparison run no same-GGUF peer arm")
     return args
 
 

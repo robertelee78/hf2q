@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import native_peers
 import q5_artifacts
 import q5_case
 import q5_host
@@ -56,9 +57,8 @@ def arm(name, case, overrides, environ):
                 "missing_variables": plan["missing_variables"],
                 "file_checks": q5_artifacts.file_checks(plan) if plan["complete"] else {},
                 "inputs": q5_artifacts.input_hashes(plan)}
-    if qc.engine_kind(case) == "ds4":  # commit + binary sha as build identity, plus runtime Metal sources
-        import native_peer_ds4
-        identity.update(native_peer_ds4.campaign_identity(plan))
+    if native_peers.is_native(qc.engine_kind(case)):  # the arm's build identity and frozen native runtime
+        identity.update(native_peers.adapter(qc.engine_kind(case)).campaign_identity(plan))
     return identity
 
 
@@ -70,8 +70,8 @@ def identities(plan, cases, environ):
 
 
 def native_arms(plan):
-    """Arms that serve their own native artifact (engine_kind ds4); excluded from the same-model rule."""
-    return [name for name, spec in plan["arms"].items() if spec["engine_kind"] == "ds4"]
+    """Arms that serve their own native artifact (native_peers kinds); excluded from the same-model rule."""
+    return [name for name, spec in plan["arms"].items() if native_peers.is_native(spec["engine_kind"])]
 
 
 def same_model(ids, native=()):
@@ -144,15 +144,10 @@ def launch_problems(plan, ids):
         problems.append("every arm must serve the same model artifact (sha256, or path and size)")
     problems += [f"{name}: native artifact with its sha256 is required" for name in native
                  if not (ids["arms"][name]["artifact"] or {}).get("sha256")]
-    if native:  # an ambient hf2q MODEL/MODEL_SHA256 must never stand in for the native artifact
-        import native_peer_ds4
-        hf2q_sha = (ids["arms"]["experiment"]["artifact"] or {}).get("sha256")
-        for name in native:
-            artifact = ids["arms"][name]["artifact"] or {}
-            if artifact and Path(artifact["path"]).name != native_peer_ds4.MODEL_FILE:
-                problems.append(f"{name}: native artifact must be {native_peer_ds4.MODEL_FILE} (set --peer-var MODEL)")
-            if artifact.get("sha256") and artifact["sha256"] == hf2q_sha:
-                problems.append(f"{name}: native artifact sha256 equals the hf2q artifact's (set --peer-var MODEL_SHA256)")
+    hf2q_sha = (ids["arms"]["experiment"]["artifact"] or {}).get("sha256")
+    for name in native:  # an ambient hf2q artifact must never stand in for the native artifact
+        problems += native_peers.adapter(plan["arms"][name]["engine_kind"]).launch_problems(
+            name, ids["arms"][name]["artifact"] or {}, hf2q_sha)
     stock, experiment = ids["arms"]["stock"]["binary"]["sha256"], ids["arms"]["experiment"]["binary"]["sha256"]
     if stock is not None and stock == experiment:
         problems.append("stock and experiment binaries are identical")

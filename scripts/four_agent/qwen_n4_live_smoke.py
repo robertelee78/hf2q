@@ -25,7 +25,6 @@ MODULES = ("qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_verdict.py",
            "qwen_n4_live_smoke.py", "test_qwen_n4_live_smoke.py",
            "coding_family.py", "test_coding_family.py", "qwen_n4_peer.py", "test_qwen_n4_peer.py",
            "family_peer.py", "test_family_peer.py", "f2_semantic.py")
-NATIVE_MODULES = ("native_peer_ds4.py", "test_native_peer_ds4.py")  # bound only for --engine-kind ds4
 INTERRUPTED = False
 # ADR-063 Q3 controls (--phase-plan): agents in release cohorts on the same four-slot server.
 # "1" is the one-agent control; "K+M" releases K agents, then the remaining M once every one of
@@ -101,9 +100,9 @@ def validate_preflight(value, base, engine_kind="hf2q", family="qwen"):
     if engine_kind == "peer":
         from family_peer import preflight as peer_preflight
         keys = peer_preflight(keys, family)
-    elif engine_kind == "ds4":
-        from native_peer_ds4 import preflight as native_preflight
-        keys = native_preflight(keys, family)
+    elif engine_kind in family_contract.NATIVE_KINDS:
+        from native_peers import adapter
+        keys = adapter(engine_kind).preflight(keys, family)
     require(isinstance(value, dict) and set(value) == keys and
             all(v is True for v in value.values()), "four-slot actual pool selection/preflight")
 
@@ -306,7 +305,7 @@ def main():
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--server-pid", type=int, required=True)
     parser.add_argument("--family", choices=family_contract.FAMILIES, default="qwen")
-    parser.add_argument("--engine-kind", choices=("hf2q", "peer", "ds4"), default="hf2q")
+    parser.add_argument("--engine-kind", choices=family_contract.ENGINE_KINDS, default="hf2q")
     parser.add_argument("--benchmark-profile", choices=("gemma-matched-v1",))
     parser.add_argument("--instance", type=int,
                         help="quality-campaign task instance (row of fixtures/coding-instances.json); "
@@ -361,16 +360,19 @@ def main():
             summary["instance"] = workload.record()
         require(args.phase_plan is None or (workload is None and args.benchmark_profile is None),
                 "phase plans are controls of the canonical workload")
-        if args.engine_kind == "ds4": names += NATIVE_MODULES
+        native = None
+        if args.engine_kind in family_contract.NATIVE_KINDS:  # the arm's registry, client modules and test
+            from native_peers import adapter
+            native = adapter(args.engine_kind)
+            names += native.CLIENT_MODULES
         sources = {name: child.digest(module_dir / name) for name in names}
         require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
         summary["engine_kind"] = args.engine_kind
         if args.engine_kind == "peer":
             from family_peer import readiness
             summary["peer_readiness"] = readiness(args.base_url, args.model, output, args.family)
-        elif args.engine_kind == "ds4":
-            from native_peer_ds4 import readiness as native_readiness
-            summary["native_readiness"] = native_readiness(args.base_url, args.model, output, packet)
+        elif native is not None:
+            summary["native_readiness"] = native.readiness(args.base_url, args.model, output, packet)
         require(packet.get("sources") == sources, "N4 source freeze drift")
         require(packet.get("python_sha256") == child.digest(Path(sys.executable).resolve()), "Python binary")
         run, token = packet.get("run_id"), packet.get("barrier_token")
@@ -454,6 +456,8 @@ def main():
                                                          "trigger_first_decode_monotonic_ns": trigger})
                     next_cohort += 1
             time.sleep(0.05)
+        if native is not None and native.closing is not None:  # every agent finished: native closing facts
+            summary["native_closing"] = native.closing(args.base_url, output)
     except BaseException as exc:
         summary["status"], summary["error"] = "Failed", f"{type(exc).__name__}: {exc}"
     finally:

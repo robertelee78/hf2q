@@ -16,7 +16,8 @@ import q3_metrics
 import q3_report
 import q5_case
 from qwen38_n1_verdict import Invalid
-from qwen_n4_live_smoke import MODULES, NATIVE_MODULES
+from native_peer_ds4 import CLIENT_MODULES as NATIVE_MODULES
+from qwen_n4_live_smoke import MODULES
 from test_native_peer_ds4 import CASE, HERE, M, use
 
 

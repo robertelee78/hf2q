@@ -19,6 +19,14 @@ The checked-in peer cases match hf2q's model-facing settings (template, thinking
 
 **Native ds4 arm (DeepSeek-V4 only, operator decision 2026-10-31).** `--peer-case q5_cases/native-ds4-deepseek4.json` with the same-GGUF `--peer-unavailable-evidence` runs antirez ds4 c97964b in the `peer` slot, on its own ds4f-q2 Flash 0731 artifact. The plan labels the arm `ds4 c97964b (native Flash-0731 q2 artifact)`. Its artifact is exempt from the same-model rule but must carry a sha256. Its build identity is the ds4 commit plus the `ds4-server` sha256, and its 26 runtime Metal sources are frozen too. The family verdict stays `Unavailable`, because there is no same-GGUF peer. `verdict.json` `native_peer` reports the task-makespan comparison separately, and F2 rows use baseline `ds4_native`. Adapter and controls: `scripts/four_agent/README.md` "Native ds4 arm".
 
+**Native TensorFold arm (Qwen3.8 only, operator decision 2026-10-31).** Qwen3.8's same-GGUF peer is runnable, so TensorFold never replaces it in the campaign of record. A separate campaign passes `--peer-case q5_cases/native-tensorfold-qwen38.json` (no drafter) or `native-tensorfold-qwen38-dflash2.json` (DFlash2) together with `--native-comparison`. TensorFold 1157ea5b then runs in the `peer` slot on its own MLX 4-bit checkpoint, and the plan records `native_comparison`.
+- `--peer-unavailable-evidence` and `--peer-matched-case` both refuse with this flag. Without the flag, a TensorFold `--peer-case` refuses.
+- The artifact is the pinned target snapshot's `config.json` (TensorFold's `config_sha256`), with `TARGET_CONFIG_SHA256` required. Build identity is `tensorfold <version> <commit> binary-sha256 <TF_BIN_SHA256>`, and the target and drafter snapshot file listings are frozen with the campaign identity.
+- `verdict.json` sets `verdict_of_record: false` and `campaign_label: "native-comparison campaign; not the verdict of record"`, and the family verdict is `Unavailable` with that reason. `native_peer` carries the task-makespan statement, with the same withholding rules as ds4.
+- F2 rows go to group `qwen38-q3-tensorfold-native` or `qwen38-q3-tensorfold-dflash2-native` (`-controls-` groups under `--controls-of`), and every row carries the not-of-record label. No experiment-vs-stock row is emitted: that effect belongs to the campaign of record. The TensorFold row renders only under "Native-engine comparisons".
+- The stock arm stays in the design. Dropping it would need new plan and verdict code, so an experiment-plus-TensorFold-only campaign is not offered.
+- Adapter and controls: `scripts/four_agent/README.md`, section "Native TensorFold arm".
+
 `HF2Q_Q5_HF2Q_BIN` and `--stock-var/--experiment-var HF2Q_BIN=…` are refused. The hf2q binaries come only from `--stock-bin` and `--experiment-bin`, so a case default can never stand in for one of them.
 
 ## Frozen identities
@@ -214,6 +222,18 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/current-port-balanced-c1-normal-n4-v1/client
   --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-mmap-20261030T165948Z/receipt.json \
   --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-mmap-20261030T165948Z/server.stderr \
   --output "$Q3/deepseek4-native-ds4"
+
+# Qwen3.8 27B, native TensorFold comparison (separately labeled; never the verdict of record). For DFlash2 use
+# q5_cases/native-tensorfold-qwen38-dflash2.json, a dflash2 approval template and output qwen38-native-tensorfold-dflash2.
+TFHUB=$HOME/.cache/huggingface/hub/models--TensorFold--Qwen3.8-27B-MLX-4bit/snapshots/22d8d538154e0e5b6f8dcb1fcc74a60a0798104c
+HF2Q_Q5_MODEL=$MODELS/qwen38-stock/Qwen3.8-27B-vanilla.gguf \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/qwen38-matched-baseline1512-normal-n4-20261029T024609Z/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family qwen38 "${STOCK[@]}" "${EXP[@]}" "${COMMON[@]}" \
+  --peer-case scripts/four_agent/q5_cases/native-tensorfold-qwen38.json --native-comparison \
+  --peer-var TF_BIN_SHA256=$(shasum -a 256 /opt/TensorFold/zig-out/native/bin/tensorfold-native | cut -d' ' -f1) \
+  --peer-var TARGET_CONFIG_SHA256=$(shasum -a 256 "$TFHUB/config.json" | cut -d' ' -f1) \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-tensorfold-qwen38-client-approval.json \
+  --output "$Q3/qwen38-native-tensorfold"
 
 # Qwen3.6 35B-A3B
 HF2Q_Q5_MODEL=$MODELS/qwen36-stock-adr063/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf \

@@ -9,13 +9,14 @@ import os
 import re
 import socket
 
+from native_peers import process_names
+
 RUNTIME_EXECUTABLES = {
     'hf2q', 'llama-server', 'llama-cli', 'llama-bench', 'llama-mtmd-cli', 'llama-run',
     'llama-simple', 'llama-speculative', 'ollama', 'ollama_llama_server', 'lms',
     'mlx_lm.server', 'mlx_lm.generate', 'mlx_lm.chat', 'mlx_vlm.server', 'mlx_vlm.generate',
     'vllm', 'sglang', 'koboldcpp',
-    'ds4', 'ds4-server', 'ds4-agent', 'ds4-bench', 'ds4-eval',  # native ds4 binaries (/opt/ds4 Makefile:78)
-}
+} | process_names()  # native-engine arms' binaries (each arm's PROCESSES)
 # Hosted peers started as `python -m <module>` or via the module's console script.
 PYTHON_MODULE_ROOTS = ('mlx_lm', 'mlx_vlm', 'vllm', 'sglang')
 BUILD_EXECUTABLES = {'cargo', 'rustc'}
