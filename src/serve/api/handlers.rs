@@ -13404,3 +13404,7 @@ mod qwen38_largest_prompt_tests;
 #[cfg(test)]
 #[path = "handlers_tool_result_capacity_tokens_tests.rs"]
 mod tool_result_capacity_tokens_tests;
+
+#[cfg(test)]
+#[path="handlers_q1_deepseek_prepare.rs"]
+pub(crate) mod q1_deepseek_prepare;
