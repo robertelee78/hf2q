@@ -132,7 +132,7 @@ def required_references(family, peer_unavailable):
         return [STOCK_REFERENCE, "peer"]
     return [STOCK_REFERENCE] + [f"{kind}-native" for kind in native_peers.KINDS
                                 if native_peers.adapter(kind).SAME_GGUF_UNAVAILABLE
-                                and native_peers.adapter(kind).Q3_FAMILY == family]
+                                and family in native_peers.adapter(kind).Q3_FAMILIES]
 
 
 def halt_record(campaign, root):
