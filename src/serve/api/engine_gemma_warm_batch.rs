@@ -13,8 +13,8 @@
 //!   every suffix row;
 //! * attention runs per slot against its own KV through the one shared
 //!   live attention a single-slot warm prefill uses, on the same route
-//!   (tiled F16 by default, vec-hybrid under
-//!   `HF2Q_GEMMA_WARM_TILED_ATTENTION=0`), chunking, staging and FWHT
+//!   (vec-hybrid by default, tiled F16 under
+//!   `HF2Q_GEMMA_WARM_TILED_ATTENTION=1`), chunking, staging and FWHT
 //!   handling.
 //!
 //! Each lane is therefore bitwise equal to its per-slot prefill on either

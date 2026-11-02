@@ -459,12 +459,12 @@ HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_T
   --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-joint-warm-off-$(date -u +%Y%m%dT%H%M%SZ)"
 
-# Gemma4 tiled F16 warm attention A/B (ADR-063 Stage 2): same case, kill-switch arm (alternate ABAB with the default arm)
-HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=0 \
+# Gemma4 tiled F16 warm attention A/B (ADR-063 Stage 2): same case, tiled opt-in arm (alternate ABAB with the default vec-hybrid arm)
+HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=1 \
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
   --negative-control-receipt "$NC_RECEIPT" \
-  --output "$Q5_ROOT/q5-gemma4-warm-tiled-off-$(date -u +%Y%m%dT%H%M%SZ)"
+  --output "$Q5_ROOT/q5-gemma4-warm-tiled-on-$(date -u +%Y%m%dT%H%M%SZ)"
 
 # Qwen3.6 35B-A3B
 HF2Q_Q5_MODEL=/abs/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/qwen36-client-approval.json \
@@ -641,12 +641,23 @@ The co-progress width is the largest set of agents whose streamed requests stay 
 
 `q2_manifest.py` hashes the retained files of one cohort into `hf2q.q2.cohort.v1`; `q2_certify.py` replays and validates them against an externally frozen `hf2q.q2.expected-plan.v1`. Without an independent QE attestation the best result is `PendingIndependentQE` (exit 2); a hash-bound `hf2q.q2.qe-verdict.v1` that names the exact manifest and auditor sha256 makes it `Qualified` (exit 0). A refused cohort gets a `Rejected` certificate with the reason (exit 2). Certificates are create-new and never inside a Git tree.
 
-- **Inputs.** `server_receipt` and `readiness` are the files the F2 operating90 supervisor writes (`receipt.json` with `protocol_complete`/`final_verified`/`cleanup_proved` and a cleanup list; `readiness.json` with `health` and `runtime`). The q5 calibration receipt and its separate `readiness-N.json` files are not certifiable inputs.
+- **Inputs.** `server_receipt` and `readiness` are the files `q2_traced_run.py` (or the F2 operating90 supervisor) writes (`receipt.json` with `protocol_complete`/`final_verified`/`cleanup_proved` and a cleanup list; `readiness.json` with `health` and `runtime`). The q5 calibration receipt and its separate `readiness-N.json` files are not certifiable inputs.
 - **Server phase trace.** The JSONL file `hf2q serve` writes under `HF2Q_PHASE_TRACE_CONFIG`, one record per line. Its size bound is its own header's metadata quota (`f2_trace.metadata_total_limit`: 256 MiB, or 2/8 GiB for the declared native capture profiles). Each line is at most one trace event (64 KiB). The file is streamed record by record on every pass, and each pass re-checks its frozen sha256, so a multi-GB trace is never loaded whole.
 - **`trace_scenario`** (in the expected plan): the `hf2q.f2.trace-expectation.v1` keys `f2_trace.validate_trace` reads (`schema`, `run_id`, `config_sha256`, and when used `metadata_budget_profile`, `forward_witness_manifest`, `forward_demand_policy`), plus the frozen window: `composition`, `arrival_ns` and `population_policy`. `population_policy` is required, with no default: `ready_now_v1`, `forward_demand_v2` (the Q2 item 4 policy) or `queued_forward_demand_v3`. It is passed to `f2_trace.qualify_window` unchanged.
 - **Engines.** Only hf2q cohorts carry the server phase trace, so `engine_kind` `peer` is refused (`peer cohort has no hf2q server phase trace: never Q2-certifiable`) and every native engine kind of the `native_peers` registry (ds4, TensorFold) is refused (`closed engine family`). Peer agents can still be dry-audited with `q2_certify.audit_agent`; native-engine runs are audited by `q2_run_audit.py` with the arm's AUDIT module.
 
 `test_q2_certify.py` runs a synthetic N1 cohort (a fake-service agent, stub compile/test receipts, a synthetic native trace) through `q2_manifest.assemble`, `certify_cohort` and `main`, with the refusal reasons and the JSONL trace bounds.
+
+### Q2 traced cohort (`q2_traced_run.py`, `q2_traced_freeze.py`)
+
+`q2_traced_run.py` runs one supervised attempt of the Qwen3.8 four-slot case (`q5_cases/qwen38.json`) on a given hf2q binary with `HF2Q_PHASE_TRACE_CONFIG` set. `--population` is `n4` (the canonical release of all four agents) or a Q3 control (`n1`, `3+1`, `2+2`, `1+3`, passed to the client as `--phase-plan`). It reuses the Q5 preflight, memory sampler, stop latch and owned-group cleanup. It never retries.
+
+- **One identity.** `--identity` is the eight-key q2_certify identity. Before launch it must match the binary sha256, the build receipt (`source`, `sha256`), the client approval template sha256 (`profile_sha256`), the model's conversion-receipt sha256 and the mlx-native pin in `<server_source>:Cargo.lock`. At readiness, the served tokenizer and template sha256 and the server pid must match too.
+- **One run id.** The run id is `q2t-<output directory name>`. The client approval and `native-config.json` both carry it, and the trace header must repeat it.
+- **Trace.** `native-config.json` uses `native_command_capture_v3`: server budget 6 GiB, client budget 128 MiB, 8,000,000 native events, 16 MiB native metadata, a fresh control nonce and the `target_input_rms_norm` witness manifest. There is no `forward_demand_policy`. The worker-checked arm ACK is read back before the client starts. After cleanup, the trace must end with `end` (`error` null, `dropped_events` 0).
+- **Outputs.** The run writes `receipt.json` (`hf2q.q2.traced-run-receipt.v1`, status `TracedCohortCompleteAwaitingQ2Certification` or `FailedOrHeld` with the reason), `readiness.json` (`{health, runtime, readyz}`), `native-arm-readback.json` and `samples.jsonl`. Every active agent's compile receipt and both test executables are read back through `q2_manifest.test_group` and listed under `retained_test_executables`. The client never deletes them. Exit 0 complete, 1 failed or held, 2 refused before launch.
+
+`q2_traced_freeze.py plan` freezes the expected plan and manifest input of an `n4` run. Its window is `(4,0)` at `barrier/release.json`, and the `--population-policy` is recorded in `trace_scenario`. `q2_traced_freeze.py windows` validates the trace once and qualifies each pre-registered window of any population offline: `n4` `(4,0)` at the release and `(0,4)` at the last agent's first turn-1 decoded delta; `n1` `(1,0)`/`(0,1)` likewise; `3+1` `(1,3)`, `2+2` `(2,2)` and `1+3` `(3,1)` at `barrier/release-2.json`. Arrivals are client CLOCK_MONOTONIC instants minus the trace header origin, so they are fixed before any trace body is read. n1 and phase-plan runs are not q2_certify cohorts. `test_q2_traced_run.py` covers the argument, identity, readiness, readback, cleanup and run-id checks.
 
 ## F2 scoreboard rendering
 
