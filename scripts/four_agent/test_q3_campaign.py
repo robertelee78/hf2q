@@ -290,6 +290,38 @@ class Driver(Harness):
         with self.assertRaises(q3.qc.CampaignError):  # Complete is terminal
             self.driver(self.win)[0].run(resume=True)
 
+    def test_experiment_failure_in_the_primary_is_a_failure_row_of_record(self):
+        def decide(arm, workload, call):
+            return {"outcome": "fail"} if arm == "experiment" else self.win(arm, workload, call)
+        driver, _ = self.driver(decide, workloads="n4,n1")
+        manifest = driver.run()
+        q3.write_verdict(self.out, manifest, [], None)
+        failed = next(e for e in manifest["stages"][0]["warmups"] if e["arm"] == "experiment")
+        summary = Path(failed["attempts"][-1]["output"]) / "client" / "summary.json"
+        document = json.loads(summary.read_text())
+        document["agents"]["agent-1"]["error"] = "KeyboardInterrupt: signal 15"  # stopped by the coordinator
+        document["agents"]["agent-2"].update(error="Invalid: initial six-step workflow not followed", tools=[
+            {"name": "run_tests", "result": json.dumps({"target": "ports", "passed": False,
+                                                        "output": "error[E0282]: type annotations needed"})}])
+        summary.write_text(json.dumps(document))
+        rows = q3_report.rows(self.out, self.root, of_record=True)
+        [row] = rows["rows"]
+        self.assertEqual((row["status"], row["metric"], row["value"], row["q3_of_record"], row["receipt"]),
+                         ("Failure", "task_pass", 0, True, "$E/evidence/q3-qwen38/campaign.json"))
+        self.assertNotIn("control_of", row)
+        self.assertIn(f"Q3 verdict of record Failed (rule 1): the n4 warmup experiment run {failed['name']} failed its "
+                      "task (task): agent-2: run_tests ports failed with E0282, then Invalid: initial six-step workflow "
+                      "not followed; the stage stopped", row["note"])
+        self.assertNotIn("agent-1", row["note"])
+        board = {"schema": f2.ROWS_SCHEMA, "evidence_root_symbol": "$E", "evidence_root_description": "test",
+                 "neutral_band_ratio": 1.025, "neutral_band_basis": "test",
+                 "families": {"qwen38": {"title": "Qwen3.8 27B", "artifact_sha256": MODEL_SHA, "note": ""}}, **rows}
+        f2.validate_manifest(board)
+        self.assertEqual(f2.verify_rows(board, self.root), [row["id"]])
+        text = f2.render(board, [], "0" * 64)
+        self.assertIn(f"0/4 tasks [FAIL]: {row['note']} (`{row['id']}`)", text)
+        self.assertEqual(text.count(f"`{row['id']}`"), 2)  # the tier's stock cell and its rows-of-record list
+
     def test_peer_out_of_memory_makes_the_peer_unavailable_and_keeps_stock_contrast(self):
         def decide(arm, workload, call):
             return {"outcome": "oom"} if arm == "peer" else self.win(arm, workload, call)
@@ -539,6 +571,11 @@ class ControlsOnly(Harness):
             self.assertEqual((row["status"], row["control_of"]), ("Descriptive", "$E/evidence/q3-qwen38/verdict.json"))
             self.assertTrue(row["verification"]["key"].startswith("verdict.json controls."))
             self.assertNotIn("Q3 verdict", row["note"])
+            self.assertTrue(row["note"].endswith(" campaign Complete."), row["note"])
+            if row["baseline_arm"] == "peer":  # the operator's peer wording: task makespan on the slower arm's base
+                self.assertRegex(row["note"], r"hf2q 22222222 finishes the same coding task \d+\.\d% sooner than the peer "
+                                              r"\(95% CI \d+\.\d–\d+\.\d%; median [\d.]+ s vs [\d.]+ s\)\.")
+                self.assertIn("hf2q's worst-slot p95 TTFT was", row["note"])
         document = {"schema": f2.ROWS_SCHEMA, "evidence_root_symbol": "$E", "evidence_root_description": "test",
                     "neutral_band_ratio": 1.025, "neutral_band_basis": "test",
                     "families": {"qwen38": {"title": "Qwen3.8 27B", "artifact_sha256": MODEL_SHA, "note": ""}},
@@ -689,7 +726,7 @@ class ControlsOnly(Harness):
         self.assertEqual((verdict["verdict"], verdict["primary"]), ("ControlsOnly", None))
         self.assertEqual(set(verdict["native_peer"]), {"3+1"})
         self.assertTrue(verdict["native_peer"]["3+1"]["statement"].startswith(
-            "main HEAD finishes the same coding task 20.0% sooner than ds4 c97964b"))
+            "hf2q 22222222 finishes the same coding task 20.0% sooner than ds4 c97964b"))
         rows = q3_report.rows(out, self.root)
         self.assertEqual({r["baseline_arm"] for r in rows["rows"]}, {"ds4_native"})  # native-peer campaign: native rows only
         self.assertEqual({(r["status"], r["control_of"]) for r in rows["rows"]},

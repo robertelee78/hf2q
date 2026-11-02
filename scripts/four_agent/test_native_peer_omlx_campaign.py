@@ -173,7 +173,7 @@ class Campaign(unittest.TestCase):
                          (False, 'native-comparison campaign; not the verdict of record'))
         native = verdict['native_peer']
         self.assertTrue(native['statement'].startswith(
-            f"main HEAD finishes the same coding task 20.0% sooner than {om.LABELS['qwen36']}"))
+            f"hf2q 22222222 finishes the same coding task 20.0% sooner than {om.LABELS['qwen36']}"))
         self.assertEqual(native['ttft_p95_ratio_experiment_over_omlx'], 0.5)
         self.assertEqual(native['tool_parser_warnings_per_run']['n4-1-peer'], 0)
 

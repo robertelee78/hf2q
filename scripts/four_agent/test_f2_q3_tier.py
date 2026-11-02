@@ -167,7 +167,7 @@ class Tier(unittest.TestCase):
     def test_unavailable_shows_the_native_ds4_statement_and_an_unmeasurable_sse_gap_does_not_gate(self):
         rows = [effect("deepseek4", "ds-ms-stock", "makespan_s", "v0128_stock", 24.7, [23.9, 25.6], hw=1.17)]
         rows += fairness("deepseek4", stock=((10.0, [5.0, 15.0]),))  # the verdict's SSE effect is null: no row
-        statement = ("main HEAD finishes the same coding task 5.2% sooner than ds4 c97964b (native Flash-0731 q2 artifact) "
+        statement = ("hf2q 38485a23 finishes the same coding task 5.2% sooner than ds4 c97964b (native Flash-0731 q2 artifact) "
                      "(95% CI 3.0..7.4%, 15 blocks; different artifacts, task makespan only)")
         native = plain(effect("deepseek4", "ds-native", "makespan_s", "ds4_native", 5.218, [3.006, 7.380],
                               group="deepseek4-q3", note=statement, receipt="$E/q3/deepseek4-native-ds4/verdict.json"))
@@ -190,17 +190,51 @@ class Tier(unittest.TestCase):
             cells = tier_line(r.render(board({"deepseek4": {**rec, **over}}, rows), [], "0" * 64), "DeepSeek-V4 Flash")
             self.assertTrue(cells[2].endswith(f"; not a win: {reason}"), cells[2])
 
-    def test_failed_family_shows_its_reasons_and_never_wins(self):
+    def test_failed_family_shows_its_failure_row_and_never_wins(self):
         reason = "experiment failed its task: n4-002-w00-experiment: client_failed: agent-0 Failed"
         rec = record("qwen36", "Failed", [], campaign_status="Complete", halt=None, reasons=[reason],
                      primary_stop={"reason": "experiment_failed", "blocks": 0},
                      stages=[["n4", "Stopped"], ["n1", "NotRun"], ["3+1", "NotRun"], ["2+2", "NotRun"], ["1+3", "NotRun"]])
-        cells = tier_line(r.render(board({"qwen36": rec}, []), [], "0" * 64), "Qwen3.6 35B-A3B")
+        failure = row("qwen36", "q36-fail", "task_pass", 1, unit="tasks", decimals=0, status="Failure",
+                      receipt="$E/q3/qwen36/campaign.json", note="agent-2: run_tests ports failed with E0282")
+        cells = tier_line(r.render(board({"qwen36": rec}, [failure]), [], "0" * 64), "Qwen3.6 35B-A3B")
         self.assertEqual(cells[1], f"Failed: {reason}")
-        self.assertTrue(cells[2].startswith("hf2q 38485a23: —; not a win: the family verdict is Failed (hf2q task failure); "
-                                            "no makespan effect vs stock"))
-        self.assertEqual((cells[3], cells[5], cells[6]), ("—", "not declared", "Complete; the primary stopped on experiment_failed "
-                                                          "after 0 blocks; not run: n1, 3+1, 2+2, 1+3"))
+        self.assertEqual(cells[2], "hf2q 38485a23: no speed effect; not a win: the family verdict is Failed (hf2q task "
+                                   "failure). 1/4 tasks [FAIL]: agent-2: run_tests ports failed with E0282 (`q36-fail`)")
+        self.assertEqual((cells[3], cells[4], cells[5], cells[6]),
+                         ("—", "— (no paired block)", "not declared",
+                          "Complete; the primary stopped on experiment_failed after 0 blocks; not run: n1, 3+1, 2+2, 1+3"))
+        # a task_pass row of record is only the Failure of a Failed verdict, read from its campaign.json
+        for over in ({"status": "Descriptive"}, {"receipt": "$E/q3/qwen36/verdict.json"}):
+            with self.subTest(over=over), self.assertRaises(ValueError):
+                board({"qwen36": rec}, [{**failure, **over}])
+        with self.assertRaises(ValueError):
+            board({"qwen38": record("qwen38", "Win", BOTH)}, [row("qwen38", "q38-fail", "task_pass", 1, unit="tasks",
+                  decimals=0, status="Failure", receipt="$E/q3/qwen38/campaign.json")])
+
+    def test_a_failed_primary_has_no_unmeasurable_effect(self):
+        null = {"blocks": 0, "improvement_percent": None}
+        verdict = {"verdict": "Failed", "family": "qwen36", "campaign_status": "Complete", "reasons": [],
+                   "primary": {"stop": {"reason": "experiment_failed", "blocks": 0},
+                               "secondary": {m: {"vs_stock": null, "vs_peer": null} for m in tier.FAIRNESS}},
+                   "peer": {"unavailable": {}}, "thermal_valid": True, "memory_valid": True,
+                   "quality": {"patch_review": {"pending": []}}}
+        campaign = {"identities": {"arms": {}}, "stages": [],
+                    "plan": {"declared": {"experiment": {"label": "main HEAD", "commit": COMMIT}}}}
+        build = lambda: tier.build_record(verdict, campaign, "/nonexistent", ("$E/v.json", "$E/c.json"), [], None)
+        self.assertEqual((build()["unmeasurable"], build()["experiment"]), ([], f"hf2q {COMMIT[:8]}"))
+        verdict["primary"]["stop"] = {"reason": "precision", "blocks": 5}  # paired blocks, but the metric was empty
+        self.assertEqual(build()["unmeasurable"], [f"{m}.{c}" for m in tier.FAIRNESS for c in ("vs_stock", "vs_peer")])
+
+    def test_family_notes_render_under_the_tier_and_validate(self):
+        document = qwen38(BOTH)
+        document["q3_family_notes"] = {"qwen38": ["**Vs peer:** sentence of record."]}
+        text = r.render(r.validate_manifest(document), [], "0" * 64)
+        notes = text[text.index("### Family notes"):text.index("## Wins vs baseline")]
+        self.assertEqual(notes, "### Family notes\n\n**Qwen3.8 27B**\n\n- **Vs peer:** sentence of record.\n\n")
+        for bad in ({"nope": ["x"]}, {"qwen38": []}, {"qwen38": [""]}, {"qwen38": "x"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                r.validate_manifest({**document, "q3_family_notes": bad})
 
 
 class Validation(unittest.TestCase):

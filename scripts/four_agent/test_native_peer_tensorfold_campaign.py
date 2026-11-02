@@ -189,7 +189,7 @@ class Campaign(unittest.TestCase):
                          (False, 'native-comparison campaign; not the verdict of record'))
         native = verdict['native_peer']
         self.assertTrue(native['statement'].startswith(
-            f"main HEAD finishes the same coding task 20.0% sooner than {tf.LABELS['dflash2']}"))
+            f"hf2q 22222222 finishes the same coding task 20.0% sooner than {tf.LABELS['dflash2']}"))
         self.assertIn('task makespan only', native['statement'])
         self.assertEqual(native['campaign'], tf.NATIVE_COMPARISON)
         self.assertEqual(native['ttft_p95_ratio_experiment_over_tensorfold'], 0.5)
