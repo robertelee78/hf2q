@@ -10,7 +10,7 @@
 - Stable source ID: ADR-066
 - Audited baseline: hf2q `188c277e` (origin/main, 2026-11-01) with mlx-native `=0.15.15` (`9c67e1f`). Cited hf2q lines refer to that commit.
 - Model sources studied: `deepseek-ai/DeepSeek-V4.1-Flash-1017` at `1bae0e1088993b9b82de08f59de5be5a34e42170` (official FP8/FP4 checkpoint, reference `inference/` and `encoding/`); `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` at `8a6ec9cf118e785a362ea94ee123c61c70553be6`.
-- Reference implementations studied read-only: upstream llama.cpp `3c809f443` (DeepSeek-V4.1 merged in #31086 `74bca3950`, review fixes #31137); the unsloth llama.cpp fork (PR #298) for its GGUF type table; antirez ds4 `c97964b` (C/Metal, V4.1 text, vision, Engram, DSpark, SSD streaming); `deepseek-ai/deepseek-recipe` `935817c` (official Rust prompt toolkit).
+- Reference implementations studied read-only: the upstream peer `3c809f443` (DeepSeek-V4.1 merged in #31086 `74bca3950`, review fixes #31137); the unsloth fork of the peer (PR #298) for its GGUF type table; antirez ds4 `c97964b` (C/Metal, V4.1 text, vision, Engram, DSpark, SSD streaming); `deepseek-ai/deepseek-recipe` `935817c` (official Rust prompt toolkit).
 
 ## Context
 
@@ -51,7 +51,7 @@ Unsloth publishes split GGUF sets (shard 1 holds metadata only, 0 tensors; `spli
 
 Non-expert tensors are Q8_0, Q6_K, Q5_K, BF16 or F32 in every quant. The Engram table is always one tensor alone in one shard, but not always the last shard (shard 8 of 9 for Q4/Q8). The DSpark drafter ships as a separate `general.architecture = dflash` GGUF (78 tensors, 7.98 GB Q8_0 or 8.51 GB BF16) and vision as `mmproj-BF16/F16.gguf` (0.97 GB). Unsloth's documented Engram-table swap re-stamps two header values in place (`engram/set_split.py`).
 
-**GGML type 43 means two different layouts.** Upstream ggml defines `GGML_TYPE_F8_E4M3 = 43` with block size 1 and no scale (added 2026-10-29). The unsloth fork defines `GGML_TYPE_MXFP8 = 43` as `{u8 e8m0; u8 e4m3[32]}`, 33 bytes per 32 values. The published 202,758,032,592-byte table shard equals 768,022,850 × 264 + 192 header bytes, which only the fork layout fits. Upstream llama.cpp reads that tensor as 1 byte per value, which passes its bounds check and decodes garbage; mlx-native's byte-length check (`src/gguf/mod.rs:423-453`) would likewise not notice. ds4 uses a third, private row layout. Upstream's converter writes the Engram table as BF16 (393.2 GB).
+**GGML type 43 means two different layouts.** Upstream ggml defines `GGML_TYPE_F8_E4M3 = 43` with block size 1 and no scale (added 2026-10-29). The unsloth fork defines `GGML_TYPE_MXFP8 = 43` as `{u8 e8m0; u8 e4m3[32]}`, 33 bytes per 32 values. The published 202,758,032,592-byte table shard equals 768,022,850 × 264 + 192 header bytes, which only the fork layout fits. The upstream peer reads that tensor as 1 byte per value, which passes its bounds check and decodes garbage; mlx-native's byte-length check (`src/gguf/mod.rs:423-453`) would likewise not notice. ds4 uses a third, private row layout. Upstream's converter writes the Engram table as BF16 (393.2 GB).
 
 ### Where hf2q stands
 
@@ -62,8 +62,8 @@ hf2q serves DeepSeek-V4-Flash-0731 in production (ADR-042) and cannot load eithe
 3. **Architecture and identity.** `deepseek41` is rejected by `src/serve/info.rs:123-129`, the engine arch dispatch (`src/serve/api/engine.rs:3311-3330`), `src/inference/gguf_contract.rs:16-35` and `deepseek4/config.rs:138-140`. The model registry's `"deepseek-v4"` substring (`src/serve/api/registry.rs:464`) would match V4.1 model ids and select the 0731 tool-call tag set. Artifact identity uses a 6-value `QuantType` derived from `general.file_type` (`src/serve/quant_select.rs:47-76,152-185`), so every unsloth UD quant collides on one key and hf2q's MXFP4 or IQ profiles have none; `:UD-Q4_K_XL` selectors resolve to no quant (`src/model_spec.rs:91-93`).
 4. **Tensor catalog and shapes.** The 0731 catalog is exact (`deepseek4/weights.rs:227-266`). MoE is fixed at 4096/256/6/2048 with hash layers required (`ffn_forward.rs:138-147`); mlx-native DeepSeek shaders bake 256 experts, top-6, intermediate 2048, hidden 4096, 64 indexer heads and compression ratios 4/128 into threadgroup arrays and loop bounds, and the MoE map kernel has no top-3 instantiation. The unsloth GGUF stores 43 `compress_ratios` entries against `block_count = 40` (`config.rs:271` requires equality).
 5. **Residency.** Every mapped tensor becomes a no-copy Metal buffer in the device residency set; a single tensor larger than `maxBufferLength` is a hard error (`src/gguf/mod.rs:1904-1935`). The Engram table is one tensor of 135–203 GB. On the M5 Max `maxBufferLength` is 80.64 GiB and the recommended working set 107.52 GiB (`docs/research/ADR-030-phase1-m5max-results.json`).
-6. **Graph and cache.** The V4 graph has 6 production layer loops plus a separate joint-decode attention encoder (`joint_decode.rs:276-532`), about 50 `ratio == 4/128` predicates that mean "owns an indexer", a per-layer cache and a prefill scratch pool recycled between layers. hf2q's DeepSeek state is F32 (`ffn_forward.rs:148`); the reference runs BF16 activations. Keeping V4's per-layer cache layout for V4.1 would cost about 36 GiB of KV per 1M-token slot; source-only sharing costs about 3.1 GiB (3,200 B/token, matching llama.cpp's row width). No synthetic attention-plus-FFN forward test exists even for 0731, and no frozen output golden protects 0731.
-7. **Conversion.** The converter recognizes only `model_type == "deepseek_v4"` (`src/convert/source_reader.rs:437`), decodes MXFP4 experts to F32 (`:795-830`), round-trips every tensor through F16 before quantizing (`orchestrator.rs:224-230`), materializes direct tensors whole, has no MXFP4/IQ2/IQ3 codecs (placeholders in `src/quantize/ggml_quants/ggml_type.rs`), averages imatrix data across experts (`orchestrator.rs:1020-1037`) and writes one file. The pinned peer (`data/llama_cpp_pin.txt`, `e15384a5`) predates `deepseek41`, so no V4.1 output could meet README's "loads in the stock peer engine" today.
+6. **Graph and cache.** The V4 graph has 6 production layer loops plus a separate joint-decode attention encoder (`joint_decode.rs:276-532`), about 50 `ratio == 4/128` predicates that mean "owns an indexer", a per-layer cache and a prefill scratch pool recycled between layers. hf2q's DeepSeek state is F32 (`ffn_forward.rs:148`); the reference runs BF16 activations. Keeping V4's per-layer cache layout for V4.1 would cost about 36 GiB of KV per 1M-token slot; source-only sharing costs about 3.1 GiB (3,200 B/token, matching the peer's row width). No synthetic attention-plus-FFN forward test exists even for 0731, and no frozen output golden protects 0731.
+7. **Conversion.** The converter recognizes only `model_type == "deepseek_v4"` (`src/convert/source_reader.rs:437`), decodes MXFP4 experts to F32 (`:795-830`), round-trips every tensor through F16 before quantizing (`orchestrator.rs:224-230`), materializes direct tensors whole, has no MXFP4/IQ2/IQ3 codecs (placeholders in `src/quantize/ggml_quants/ggml_type.rs`), averages imatrix data across experts (`orchestrator.rs:1020-1037`) and writes one file. The pinned peer (`data/` peer pin file, `e15384a5`) predates `deepseek41`, so no V4.1 output could meet README's "loads in the stock peer engine" today.
 8. **Serving.** The native encoder implements the 0731 format. V4.1 changes 22 encoding details, including spaced DSML tags (`<｜DSML｜ calls>`), a `<｜System｜>` token (id 128799), numeric reasoning effort 1–100 rendered after BOS, `developer` role removal, `\n\n` content-part joins, tool placement on the leading system message, and argument normalization. The unsloth GGUF's tokenizer pre-type `joyai-llm` is refused by `deepseek4/tokenizer.rs:40`. Its embedded Jinja reproduces the reference only when tool-call arguments arrive pre-parsed. Reasoning controls route only `"deepseek4"` to the DeepSeek channel (`reasoning_controls.rs:314-322`).
 9. **DSpark and vision.** DeepSeek conversion drops `mtp.*`; the weight catalog rejects draft tensors; no DeepSeek vision projector exists (`src/inference/vision/mmproj.rs` supports Mlp, Gemma4v, Qwen3VlMerger and Resampler).
 
@@ -92,14 +92,14 @@ The current host is an M5 Max with 128 GiB and 186 GB of free disk. No admissibl
 
 Items marked **(owner review)** are listed again under Open questions.
 
-- **Structure.** V4.1 is a `Deepseek4Variant::{V4Flash0731, V41Flash1017}` inside `src/inference/models/deepseek4/`, resolved only from the exact `general.architecture` string; every divergent behaviour is an exhaustive `match`, and unknown strings still fail. A per-layer `LayerPlan` resolved once at load replaces the `ratio == 4/128` predicates. V4.1-only logic lives in new focused files. One binary serves both variants. Rationale: reuses the ADR-063 scheduler, joint-decode, cooperative-prefill, anchor and supervisor machinery (about 6,300 serve LOC and 673 `engine.rs` references typed on DeepSeek), follows the `Qwen35Variant` precedent and what both peers converged on (ds4 variant enum; llama.cpp subclass), and keeps AGENTS.md's explicit-family rule.
+- **Structure.** V4.1 is a `Deepseek4Variant::{V4Flash0731, V41Flash1017}` inside `src/inference/models/deepseek4/`, resolved only from the exact `general.architecture` string; every divergent behaviour is an exhaustive `match`, and unknown strings still fail. A per-layer `LayerPlan` resolved once at load replaces the `ratio == 4/128` predicates. V4.1-only logic lives in new focused files. One binary serves both variants. Rationale: reuses the ADR-063 scheduler, joint-decode, cooperative-prefill, anchor and supervisor machinery (about 6,300 serve LOC and 673 `engine.rs` references typed on DeepSeek), follows the `Qwen35Variant` precedent and what both peers converged on (ds4 variant enum; the peer's subclass), and keeps AGENTS.md's explicit-family rule.
 - **Experimental gating until qualification.** `deepseek41` serve admission and `deepseek_v41` conversion require `HF2Q_UNSAFE_EXPERIMENTS=1` (shipping-contract Category 3) until E7b, which lifts both gates only for artifacts and profiles that Q2a, Q2b or Q2c qualified, and only after the M5 Ultra release gate exists (Q5). No release cut from main before E7b advertises V4.1 support.
 - **MXFP4 first.** The first milestone (Q2a) proves the MXFP4 artifacts end to end on real weights: UD-Q4_K_XL, UD-Q8_K_XL and the hf2q MXFP4 profiles, with drafters and projectors. They need only one new expert kernel type and no imatrix. IQ kernels, IQ quantizers, the native imatrix, the remaining unsloth quants and kernel tuning follow that milestone.
 - **Engram placement.** The table is never mapped as a Metal buffer, never joins the residency set and contributes zero resident bytes beyond a fixed staging buffer. Rows are read on the CPU with parallel `pread` on a dedicated descriptor, sorted and deduplicated per batch, decoded on the CPU into a BF16 staging buffer, and prefetched during prefill. `F_NOCACHE` is on provisionally; L3 measures it against buffered reads and keeps the faster one. No row cache in the first release, and no resident-table mode.
 - **Type 43.** mlx-native classifies a type-43 tensor by its byte extent, defined as the distance to the next tensor's offset or to end of file, less at most one alignment unit of padding: 264 bytes per 256-wide row is fork MXFP8, 256 bytes is upstream F8_E4M3. Exactly one layout MUST match; a tensor whose extent fits neither layout, or fits both (possible for tiny tensors within the padding tolerance), fails closed unless an explicit `deepseek41.engram.encoding` marker names the layout and the marker agrees with the extent. hf2q-written MXFP8 tables always carry `deepseek41.engram.encoding = "mxfp8_e4m3_e8m0_32"`. ds4's private row layout is not accepted.
-- **Shard sets.** A set is opened from its `-00001-of-NNNNN` path following llama.cpp's validation rules (shard 0 first, `split.no` per shard, `split.count`, no duplicate tensors, `split.tensors.count` total), plus a check that no extra shard exists. The Engram shard is located by the tensor name `per_layer_token_embd.weight`. Hub-resolved sets MUST match the B2 lock's size and LFS SHA-256 per shard; a one-time SHA-256 per shard is recorded in the managed store and not repeated on every load. Local sets opened by path have no Hub identity: they load, and receipts label them `unverified-local`; this is how an unsloth Engram swap runs. Cache fingerprints include a content hash of the Engram shard, computed once per file identity, so a swapped table never reuses another table's cached state.
+- **Shard sets.** A set is opened from its `-00001-of-NNNNN` path following the peer's validation rules (shard 0 first, `split.no` per shard, `split.count`, no duplicate tensors, `split.tensors.count` total), plus a check that no extra shard exists. The Engram shard is located by the tensor name `per_layer_token_embd.weight`. Hub-resolved sets MUST match the B2 lock's size and LFS SHA-256 per shard; a one-time SHA-256 per shard is recorded in the managed store and not repeated on every load. Local sets opened by path have no Hub identity: they load, and receipts label them `unverified-local`; this is how an unsloth Engram swap runs. Cache fingerprints include a content hash of the Engram shard, computed once per file identity, so a swapped table never reuses another table's cached state.
 - **Artifact identity.** V4.1 artifacts are identified by an explicit selector (an unsloth label such as `UD-Q4_K_XL` or an hf2q profile name) plus the shard-set identity, not by `general.file_type`.
-- **Conversion output.** Split sets: a metadata-only first shard, every non-Engram shard at most 50 GB, and the Engram tensor alone in its own shard. Metadata uses upstream llama.cpp keys plus `hash_layer_count = 0`; `tokenizer.ggml.pre = "joyai-llm"`; token 128799 marked control; a Jinja chat-template port is embedded for peer interop (validated against the reference goldens) and never executed by hf2q. The converter uses an F32 intermediate for `deepseek_v41`, never F16. Default outputs are the text set plus a paired `deepseek41v` projector; the `dflash` drafter is an explicit additional output.
+- **Conversion output.** Split sets: a metadata-only first shard, every non-Engram shard at most 50 GB, and the Engram tensor alone in its own shard. Metadata uses the upstream peer's keys plus `hash_layer_count = 0`; `tokenizer.ggml.pre = "joyai-llm"`; token 128799 marked control; a Jinja chat-template port is embedded for peer interop (validated against the reference goldens) and never executed by hf2q. The converter uses an F32 intermediate for `deepseek_v41`, never F16. Default outputs are the text set plus a paired `deepseek41v` projector; the `dflash` drafter is an explicit additional output.
 - **Request mapping.** Reasoning effort accepts an integer 1–100, a decimal string "1".."100", or a name: `none`/`minimal` → thinking off, `low` 50, `medium` 75, `high` 75, `xhigh` 100, `max` 100 (names follow ADR-062 D5's tiers; numbers follow `encoding.py` and deepseek-recipe); absent with thinking on → 75; bool, float and out-of-range values → 400 with `param=reasoning_effort`. ADR-062 D5's `thinking_token_budget` ceilings apply as an independent cap: by name for named efforts, and for numeric efforts 1–50 → the `low` ceiling, 51–75 → the `high` ceiling, 76–100 → no ceiling. Thinking is on by default. `developer` maps to `system` (the reference raises). Tools attach only to a leading system message (an empty one is inserted otherwise). `tool_choice` `required`/named while thinking keeps hf2q's grammar-constrained path (deepseek-recipe returns 400). Family defaults when the request omits them: temperature 1.0 and top_p 1.0 (model card); `max_tokens` 8,192 without thinking, 65,536 with thinking, 131,072 at effort 100 (deepseek-recipe; the model card's "≥ 256K" recommendation is an operator setting, not a default). Tool namespaces are deferred.
 - **Not ported to V4.1 at release (owner review):** the B=4 same-position decode cohort (`decode_cohort.rs`, used only when joint decode is disabled; V4.1 falls back to serial decode), KV grafts (ADR-059) and GLP steering/calibration (ADR-053/054). Graft and GLP flags are refused at startup when a `deepseek41` model is loaded. Grammar-constrained decoding and structured output (ADR-052, ADR-056, ADR-057) ARE ported (E8).
 
@@ -120,7 +120,7 @@ Out of scope: UD-IQ1_S, UD-IQ1_M and any IQ1 output from `hf2q convert`; ds4-for
 - **Synthetic oracle parity.** Quantization, selection and hash kernels fed the oracle's own inputs MUST produce bit-identical outputs. Floating-point ops MUST stay within a norm-wise relative error bound expressed in BF16 rounding units. End-to-end comparisons on the B3 models are teacher-forced: per-position KL divergence and top-1 agreement within bounds. All bounds are calibrated in B3 from oracle-versus-oracle perturbation (for example a different reduction order) and frozen in B6 before the first Metal comparison.
 - **Route references.** Joint decode is bitwise equal to serial decode; cooperative prefill is bitwise equal to solo prefill with the same chunk plan; a mixed step is bitwise equal to its solo parts (as ADR-063 established for 0731). Matrix and chunked prefill are compared with a token-serial, teacher-forced oracle within the synthetic bounds. DSpark speculation keeps exact transactions given identical logits, and its output stays within the decision envelope frozen in B6 against the non-speculative route; it is never described as bitwise equal.
 - **Real-model correctness.** On the M5 Ultra, Q2a runs a teacher-forced, layer-by-layer comparison of hf2q against `model.py` (B3 harness at real dimensions, one layer resident at a time, never co-resident with hf2q) for layers 0, 1, 2, 14, 20, 24 and 39, within the B6 bounds. The oracle's weights are the same artifact's weights decoded independently of hf2q, so the comparison measures implementation error, not quantization loss. Against UD-Q8_K_XL, whose weights are value-equivalent to the official checkpoint (MXFP4 experts and the MXFP8 Engram table byte-exact, FP8 dense weights exactly representable in BF16), this also proves official-checkpoint semantics. Quantization loss is judged only by the quality rule below.
-- **Real-model quality.** hf2q running UD-Q8_K_XL (MXFP4 experts, BF16 dense) is the in-repo quality reference; no full-precision reference fits Apple hardware. Q2a–Q2c measure KL divergence and top-1 agreement of every admitted quant and profile against it on a fixed corpus. Unsloth's published figures (llama.cpp, F32 reference, no activation fake-quantization) are a sanity check, not a threshold. Pass thresholds are frozen in B6.
+- **Real-model quality.** hf2q running UD-Q8_K_XL (MXFP4 experts, BF16 dense) is the in-repo quality reference; no full-precision reference fits Apple hardware. Q2a–Q2c measure KL divergence and top-1 agreement of every admitted quant and profile against it on a fixed corpus. Unsloth's published figures (the peer, F32 reference, no activation fake-quantization) are a sanity check, not a threshold. Pass thresholds are frozen in B6.
 
 ### Measurement and acceptance rules
 
@@ -174,7 +174,7 @@ Requirement: The program MUST pin the source checkpoint, unsloth repository, pro
 
 Acceptance:
 
-- `docs/research/adr066-reference-lock.md` records: official checkpoint `1bae0e10…` with per-shard sizes; unsloth repository `8a6ec9cf…` with every shard's size and LFS SHA-256 for the admissible quants, the DSpark files, the mmproj files and `imatrix_unsloth.gguf_file`; `encoding.py` and its 5 golden fixtures; deepseek-recipe `935817c`; llama.cpp `74bca3950`/`3c809f443`; the unsloth fork commit used for type tables; ds4 `c97964b`.
+- `docs/research/adr066-reference-lock.md` records: official checkpoint `1bae0e10…` with per-shard sizes; unsloth repository `8a6ec9cf…` with every shard's size and LFS SHA-256 for the admissible quants, the DSpark files, the mmproj files and `imatrix_unsloth.gguf_file`; `encoding.py` and its 5 golden fixtures; deepseek-recipe `935817c`; the peer `74bca3950`/`3c809f443`; the unsloth fork commit used for type tables; ds4 `c97964b`.
 - The lock records the type-43 layout evidence and the published Engram type per quant.
 - A later revision change is a deliberate lock update with its own review.
 
@@ -238,7 +238,7 @@ Delivery boundary: Merged to main with the gate receipt.
 
 Outcome: The pinned peer can load V4.1 GGUFs.
 
-Requirement: The integration owner MUST bump `data/llama_cpp_pin.txt` to a llama.cpp commit at or after `74bca3950` and MUST re-run ADR-033's byte-identity fixtures.
+Requirement: The integration owner MUST bump the peer pin file under `data/` to a peer commit at or after `74bca3950` and MUST re-run ADR-033's byte-identity fixtures.
 
 Acceptance:
 
@@ -1084,7 +1084,7 @@ Acceptance:
 
 - MXFP8 output is byte-identical to the source codes and scales.
 - K-quant outputs match ggml's quantizers bit for bit on sampled rows.
-- ADR-004 and README's conversion sentence are amended: MXFP8-Engram artifacts load in hf2q and the unsloth fork but are misread by upstream llama.cpp, whose type 43 means F8_E4M3; receipt and metadata say so, and MXFP8 is never a default.
+- ADR-004 and README's conversion sentence are amended: MXFP8-Engram artifacts load in hf2q and the unsloth fork but are misread by the upstream peer, whose type 43 means F8_E4M3; receipt and metadata say so, and MXFP8 is never a default.
 
 Repository ownership: hf2q.
 
@@ -1126,7 +1126,7 @@ Requirement: hf2q MUST port ggml's quantizers for those five types, including gr
 Acceptance:
 
 - Byte parity with ggml's quantizers on fixed inputs and imatrix data.
-- Per-expert slicing matches llama.cpp's use of each expert's own row.
+- Per-expert slicing matches the peer's use of each expert's own row.
 
 Repository ownership: hf2q.
 
@@ -1513,7 +1513,7 @@ Acceptance:
 - The real-model correctness and quality rules of the Numerical contract, with B6 thresholds.
 - DSpark: teacher-forced stage-by-stage parity against `model.py` on real weights, separately for the unsloth drafter and the hf2q drafter from C9a, each against its own decoded weights.
 - Vision: parity against `vision.py` on real weights from identical decoded RGB arrays, separately for the unsloth projector and the hf2q projector from C9a.
-- Greedy transcripts and logits compared with the unsloth fork of llama.cpp on the same unsloth file, and with ds4 as unmatched behavioural context; every disagreement localized to a layer and explained.
+- Greedy transcripts and logits compared with the unsloth fork of the peer on the same unsloth file, and with ds4 as unmatched behavioural context; every disagreement localized to a layer and explained.
 - Engram reads verified against an independent decode of sampled rows.
 
 Repository ownership: hf2q.
@@ -1534,7 +1534,7 @@ Requirement: The program MUST apply Q2a's correctness and quality rules to each.
 
 Acceptance:
 
-- Q2a's acceptance items for each quant, compared with upstream llama.cpp (B5 pin) where it reads the file correctly and with the unsloth fork otherwise.
+- Q2a's acceptance items for each quant, compared with the upstream peer (B5 pin) where it reads the file correctly and with the unsloth fork otherwise.
 
 Repository ownership: hf2q.
 
@@ -1575,7 +1575,7 @@ Requirement: The program MUST pass E6 in V4.1 mode with 1 and 4 clients, with DS
 Acceptance:
 
 - All E6 assertions and B6 bounds; cached-token counts, prefill and decode rates, time to first semantic token, exact prompts and settings, and the agent task outcome recorded.
-- The same scripted task run once against the fork or upstream llama.cpp serving the same unsloth file is recorded as the matched reference result.
+- The same scripted task run once against the fork or the upstream peer serving the same unsloth file is recorded as the matched reference result.
 
 Repository ownership: hf2q.
 
@@ -1591,7 +1591,7 @@ Delivery boundary: Receipts merged to main.
 
 Outcome: V4.1 performance is known against matched peers on the same host.
 
-Requirement: The program MUST measure prefill, decode and time to first token at 8K, 128K and 1M contexts, single and four-agent, under AGENTS.md's performance rules. The matched pairs are upstream llama.cpp (B5 pin) on a Q6_K-table quant such as UD-IQ3_S, and the unsloth fork on the MXFP8-table quants; ds4 on its own artifact is reported as unmatched context.
+Requirement: The program MUST measure prefill, decode and time to first token at 8K, 128K and 1M contexts, single and four-agent, under AGENTS.md's performance rules. The matched pairs are the upstream peer (B5 pin) on a Q6_K-table quant such as UD-IQ3_S, and the unsloth fork on the MXFP8-table quants; ds4 on its own artifact is reported as unmatched context.
 
 Acceptance:
 
@@ -1719,7 +1719,7 @@ hf2q gains DeepSeek-V4.1-Flash-1017 on its target hardware through both an owned
 
 ### Negative
 
-The program is large, and execution waits for the M5 Ultra, so the first end-to-end proof (Q2a) comes after its foundations are built on that host. Matching reference fake-quantization on every linear input adds work per token that neither llama.cpp nor ds4 does. The MXFP8 Engram option produces files that upstream llama.cpp silently misreads, contained only by metadata, receipts and documentation. Unsloth's type-43 choice and the fork it relies on can change; B2's lock and N1's extent check make that visible rather than silent. Cold 1M-token prefill will take minutes even on the M5 Ultra (indexer cost grows with the square of context), which pressures AGENTS.md's time-to-first-semantic-token requirement; B6 makes the owner set that bound explicitly.
+The program is large, and execution waits for the M5 Ultra, so the first end-to-end proof (Q2a) comes after its foundations are built on that host. Matching reference fake-quantization on every linear input adds work per token that neither the peer nor ds4 does. The MXFP8 Engram option produces files that the upstream peer silently misreads, contained only by metadata, receipts and documentation. Unsloth's type-43 choice and the fork it relies on can change; B2's lock and N1's extent check make that visible rather than silent. Cold 1M-token prefill will take minutes even on the M5 Ultra (indexer cost grows with the square of context), which pressures AGENTS.md's time-to-first-semantic-token requirement; B6 makes the owner set that bound explicitly.
 
 ### Neutral
 
@@ -1732,7 +1732,7 @@ An independent review (GPT-6.1 Sol, 2026-11-02) recommended the defaults below, 
 1. **What "matches DeepSeek exactly" means.** Bit-identical wherever inputs are identical, measured tolerances elsewhere, plus a real-weight layer-by-layer check. Default: accept.
 2. **Storage to buy.** The plan needs about 4 TB plus staging, the Engram table must sit on fast internal storage, and the internal SSD can't be upgraded later. Default: 8 TB internal.
 3. **When V4.1 becomes generally available.** It stays behind the experimental switch until it is qualified on the M5 Ultra and covered by the release gate. Default: accept.
-4. **Speed bar.** hf2q does extra work to match DeepSeek's training-time numerics, which costs speed. Default: at least as fast as llama.cpp on the same file; any shortfall needs your sign-off.
+4. **Speed bar.** hf2q does extra work to match DeepSeek's training-time numerics, which costs speed. Default: at least as fast as the peer on the same file; any shortfall needs your sign-off.
 5. **First-read wait for a 1M-token prompt.** The first read of a whole-codebase prompt takes minutes; follow-ups are fast. Default: provisional one-hour ceiling, revisited after measuring the M5 Ultra; follow-ups held to much tighter limits.
 6. **"Think harder" limits and request mapping.** Default: as in Defaults → Request mapping, including tiered thinking limits for numeric effort.
 7. **Features skipped for V4.1 at first.** KV grafts, GLP steering and the B=4 fallback decode mode. Default: skip.
@@ -1762,5 +1762,5 @@ SSD expert streaming for 128 GiB hosts (ds4 measured 11.9–19.3 tok/s decode on
 - DeepSeek-V4.1-Flash-1017: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
 - Unsloth GGUFs: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF
 - deepseek-recipe: https://github.com/deepseek-ai/deepseek-recipe
-- llama.cpp DeepSeek-V4.1: https://github.com/ggml-org/llama.cpp/pull/31086
+- The peer's DeepSeek-V4.1 support: upstream PR #31086 (the peer project is named in `NOTICE`).
 - ds4: https://github.com/antirez/ds4
