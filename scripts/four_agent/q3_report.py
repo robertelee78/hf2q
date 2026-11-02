@@ -1,6 +1,7 @@
 """ADR-063 Q3 effects, family verdict.json and F2 scoreboard rows from a campaign.json. No launches."""
 import hashlib
 import json
+import re
 import statistics
 from pathlib import Path
 
@@ -248,7 +249,7 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
             "independent_review_required": True}
     if native:
         audit = native_peers.audit(native)
-        label = plan["declared"]["experiment"]["label"]
+        label = f2_q3_tier.experiment_name(plan["declared"]["experiment"])
         result["native_peer"] = ({key: audit.q3_section(stage, manifest, label) for key, stage in stages.items()}
                                  if record else audit.q3_section(primary, manifest, label))
     if comparison:
@@ -280,6 +281,22 @@ def _usage(ref, kind):
     return {"kind": "json", "file": ref, "path": f"agents.*.turns.*.usage.{kind}_tokens", "reduce": "sum", "skip_null": True}
 
 
+def arm_runs(stage, arm, root):
+    """(`$E/` summary ref, token volume, makespan, block index) of each passing measured run of one arm, each re-read
+    from the run's client/summary.json; [] when any of them lacks usage."""
+    runs = []
+    for b, block in enumerate(stage["blocks"]):
+        for entry in (e for e in block["entries"] if e["arm"] == arm and e["outcome"] == "Pass"):
+            path = Path(entry["attempts"][-1]["output"]).resolve() / "client" / "summary.json"
+            summary = json.loads(path.read_text())
+            volume = q3_metrics.token_volume(summary.get("agents") or {})
+            makespan = summary.get("own_output_four_task_makespan_seconds")
+            if volume is None or not makespan:
+                return []
+            runs.append((cite(path, root, "a run summary"), volume, makespan, b))
+    return runs
+
+
 def token_rows(manifest, root, base, status, campaign_ref, experiment):
     """Per arm: median prompt and completion tokens and median completion tokens per makespan-second over the
     primary stage's passing runs, each re-read from the run's client/summary.json. An arm with a run that lacks
@@ -288,16 +305,7 @@ def token_rows(manifest, root, base, status, campaign_ref, experiment):
     stage = next(s for s in manifest["stages"] if s["workload"] == plan["primary"])
     out = []
     for arm, f2arm in (("experiment", "candidate"), ("stock", "v0128_stock"), ("peer", "peer")):
-        runs = []
-        for entry in (e for b in stage["blocks"] for e in b["entries"] if e["arm"] == arm and e["outcome"] == "Pass"):
-            path = Path(entry["attempts"][-1]["output"]).resolve() / "client" / "summary.json"
-            summary = json.loads(path.read_text())
-            volume = q3_metrics.token_volume(summary.get("agents") or {})
-            makespan = summary.get("own_output_four_task_makespan_seconds")
-            if volume is None or not makespan:
-                runs = []
-                break
-            runs.append((cite(path, root, "a run summary"), volume, makespan))
+        runs = [run[:3] for run in arm_runs(stage, arm, root)]
         if not runs:
             continue
         rate = [{"kind": "ratio", "numerator": _usage(r, "completion"), "denominator": {
@@ -318,6 +326,80 @@ def token_rows(manifest, root, base, status, campaign_ref, experiment):
                                          "extract": {"value": {"kind": "median_of", "items": items}}},
                         "note": "Descriptive companion of the Q3 verdict of record; never a verdict input."})
     return out
+
+
+def _whole(x):
+    """A token count; medians of an even number of runs end in .5 and round half up."""
+    return f"{int(x + 0.5):,}"
+
+
+def peer_sentence(stage, report, root, experiment):
+    """The operator's peer wording for one stage's same-GGUF peer contrast: task makespan on the slower arm's base
+    (X = 1 - faster/slower), then peer/hf2q completion and prompt token ratios and the per-output-token rate ratio
+    (paired over blocks, with per-arm medians), and hf2q's worst-slot p95 TTFT relative to the peer's. Never a win."""
+    effect, arms = report["effects"]["vs_peer"], report["arms"]
+    r, (low, high) = effect["ratio"], effect["ratio_ci95"]
+    mine, theirs = arms["experiment"]["makespan_median_s"], arms["peer"]["makespan_median_s"]
+    if r <= 1:
+        text = (f"{experiment} finishes the same coding task {100 * (1 - r):.1f}% sooner than the peer (95% CI "
+                f"{100 * (1 - high):.1f}–{100 * (1 - low):.1f}%; median {mine:.1f} s vs {theirs:.1f} s).")
+    else:
+        text = (f"The peer finishes the same coding task {100 * (1 - 1 / r):.1f}% sooner than {experiment} (95% CI "
+                f"{100 * (1 - 1 / low):.1f}–{100 * (1 - 1 / high):.1f}%; median {theirs:.1f} s vs {mine:.1f} s).")
+    runs = {arm: {b: (v, m) for _, v, m, b in arm_runs(stage, arm, root)} for arm in ("experiment", "peer")}
+    blocks = sorted(set(runs["experiment"]) & set(runs["peer"]))
+    if len(blocks) >= 2:
+        measures = {"completion": lambda v, m: v["completion"], "prompt": lambda v, m: v["prompt"],
+                    "rate": lambda v, m: v["completion"] / m}
+        paired = {k: q3_stats.paired_effect([(f(*runs["peer"][b]), f(*runs["experiment"][b])) for b in blocks], True)
+                  for k, f in measures.items()}
+        median = {(arm, k): statistics.median(f(*runs[arm][b]) for b in blocks)
+                  for arm in ("experiment", "peer") for k, f in measures.items()}
+        rate = paired["rate"]
+        text += (f" The peer generated {paired['completion']['ratio']:.2f}× the completion tokens "
+                 f"({_whole(median['peer', 'completion'])} vs {_whole(median['experiment', 'completion'])} per run) and "
+                 f"{paired['prompt']['ratio']:.2f}× the prompt tokens ({_whole(median['peer', 'prompt'])} vs "
+                 f"{_whole(median['experiment', 'prompt'])}). The peer's per-output-token rate was {rate['ratio']:.2f}× "
+                 f"hf2q's ({median['peer', 'rate']:.1f} vs {median['experiment', 'rate']:.1f} completion tokens per "
+                 f"makespan-second; CI {rate['ratio_ci95'][0]:.2f}–{rate['ratio_ci95'][1]:.2f}×).")
+    ttft = (report["secondary"].get("worst_slot_ttft_p95_s") or {}).get("vs_peer") or {}
+    if ttft.get("ratio") is not None:
+        text += (f" hf2q's worst-slot p95 TTFT was {ttft['ratio']:.2f}× the peer's "
+                 f"({arms['experiment']['worst_slot_ttft_p95_median_s']:.3g} s vs "
+                 f"{arms['peer']['worst_slot_ttft_p95_median_s']:.3g} s; "
+                 f"CI {ttft['ratio_ci95'][0]:.2f}–{ttft['ratio_ci95'][1]:.2f}×).")
+    return text
+
+
+def failure_detail(entry):
+    """The agents that failed an experiment run on their own (not those the coordinator stopped afterwards), each
+    with its error and the target and compiler error code of its last failed run_tests (client/summary.json)."""
+    if not entry["attempts"]:
+        return ""
+    path = Path(entry["attempts"][-1]["output"]) / "client" / "summary.json"
+    if not path.is_file():
+        return ""
+    parts = []
+    for name, agent in sorted((json.loads(path.read_text()).get("agents") or {}).items()):
+        error = agent.get("error") or ""
+        if agent.get("status") != "Failed" or not error or error.startswith("KeyboardInterrupt"):
+            continue
+        failed = [json.loads(t["result"]) for t in agent.get("tools") or []
+                  if t.get("name") == "run_tests" and isinstance(t.get("result"), str)
+                  and json.loads(t["result"]).get("passed") is False]
+        tests = ""
+        if failed:
+            code = re.search(r"error\[(E\d{4})\]", failed[-1].get("output") or "")
+            tests = f" run_tests {failed[-1].get('target')} failed" + (f" with {code.group(1)}" if code else "") + ", then"
+        parts.append(f"{name}:{tests} {error}")
+    return "; ".join(parts)
+
+
+def campaign_note(verdict, manifest, root):
+    """'campaign <status>', with the halted stage and entry when a stage halted the campaign."""
+    halt = f2_q3_tier.halt_record(manifest, root)
+    return f"campaign {verdict['campaign_status']}" + (
+        "" if halt is None else f": halted at {halt['stage'] or 'campaign'} entry {halt['entry']} ({halt['reason']})")
 
 
 def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=None):
@@ -362,7 +444,7 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
     group = (f"{family}-q3-record" if of_record else (f"{family}-q3" if record is None else f"{family}-q3-controls")
              + ("" if comparison is None else f"-{native_baseline.replace('_', '-')}"))
     declared = plan["declared"]["experiment"]
-    experiment = f"hf2q {declared['commit'][:8]}" if declared.get("commit") else declared["label"]
+    experiment = f2_q3_tier.experiment_name(declared)
     gone = f2_q3_tier.unavailable((verdict["peer"]["unavailable"] or {}).get("peer"), root)
     out = {"groups": {group: {"family": family,
                               "title": (f"{family} Q3 verdict of record" if of_record else f"{family} Q3 three-arm campaign"
@@ -389,7 +471,10 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
         status = "Descriptive"  # a control of a primary of record never wins or loses (#369 amendment)
         sections = [(f"controls.{key}", key, stage, (verdict.get("native_peer") or {}).get(key))
                     for key, stage in verdict["controls"].items() if stage["status"] == "Complete"]
-    failed = [] if record is None else list(stopped_experiment_failures(manifest))
+    # A failed experiment run (Q3 rule 1) is a Failure row: of a stopped control stage in a controls-only
+    # campaign, or of the primary stage of a verdict of record (the family verdict is then Failed).
+    failed = ([f for f in stopped_experiment_failures(manifest) if f[0] == plan["primary"]] if of_record
+              else [] if record is None else list(stopped_experiment_failures(manifest)))
     if not sections and not failed:
         return out
     if not arms["experiment"]["artifact"] or not arms["experiment"]["artifact"].get("sha256"):
@@ -416,6 +501,11 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                            "ci95": {"kind": "json", "file": ref, "path": f"{path}.improvement_ci95.*", "reduce": "list"}}
                 blocks = (f"{e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
                           f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else peer_note}).")
+                if control is not None and name == "vs_peer" and not native_label:
+                    blocks += " " + peer_sentence(next(s for s in manifest["stages"] if s["workload"] == control),
+                                                  stage, root, experiment)
+                if record is not None:
+                    blocks += f" {campaign_note(verdict, manifest, root)}."
                 row = {
                     "id": f"{group}-{'' if control is None else control.replace('+', 'p') + '-'}{what}-{name.replace('_', '-')}",
                     **base, **({"q3_of_record": True} if of_record_row else {}),
@@ -445,10 +535,12 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
         out["rows"] += token_rows(manifest, root, {**base, "q3_of_record": True}, status, campaign_ref, experiment)
     for key, where, entry in failed:
         path = f"{where}.metrics.tasks_passed"
-        out["rows"].append({
+        detail = failure_detail(entry)
+        row = {
             "id": f"{group}-{key.replace('+', 'p')}-task-pass-{entry['name']}", "family": family, "group": group,
+            **({"q3_of_record": True} if of_record else {}),
             "metric": "task_pass", "kind": "measurement", "arm": "candidate",
-            "variant": f"Q3 experiment {experiment}, control {key}"
+            "variant": f"Q3 experiment {experiment}" + ("" if of_record else f", control {key}")
                        + (f" ({comparison})" if comparison else ""),
             "value": entry["metrics"]["tasks_passed"], "decimals": 0, "unit": "tasks",
             "n_slots": 4, "context": "262144", "date": manifest["created_utc"][:10],
@@ -457,7 +549,14 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
             "verification": {"state": "Verified", "key": f"campaign.json {path}",
                              "extract": {"value": {"kind": "json", "file": campaign_ref, "path": path, "reduce": "one"}}},
             "note": (f"{comparison}. " if comparison else "")
-                    + f"Q3 control {key} of the primary of record {control_of}: experiment run {entry['name']} failed its "
-                    f"task ({entry['failure_kind']}); the stage stopped and later stages did not run.",
-            "control_of": control_of})
+                    + (f"Q3 verdict of record {verdict['verdict']} (rule 1): the {key} {entry['kind']} experiment run "
+                       if of_record else f"Q3 control {key} of the primary of record {control_of}: experiment run ")
+                    + f"{entry['name']} failed its task ({entry['failure_kind']})"
+                    + (f": {detail}" if detail else "")
+                    + "; the stage stopped and later stages did not run."
+                    + (" The count is the agents that finished before the coordinator stopped the run; it is not "
+                       "a partial success." if of_record else "")}
+        if not of_record:
+            row["control_of"] = control_of
+        out["rows"].append(row)
     return out

@@ -82,6 +82,10 @@ def validate_manifest(m):
                 isinstance(f.get("artifact_sha256"), str) and SHA64.match(f["artifact_sha256"]), "family fields")
     for g in groups.values():
         require(g.get("family") in families and g.get("title") and g.get("workload"), "group binding")
+    notes = m.get("q3_family_notes", {})  # reviewed sentences and disclosures rendered under the Q3 tier
+    require(isinstance(notes, dict) and set(notes) <= set(families) and all(
+        isinstance(v, list) and v and all(isinstance(s, str) and s for s in v) for v in notes.values()),
+        "q3_family_notes: family -> non-empty list of sentences")
     record_refs = q3tier.validate(groups)
     ids = set()
     for row in m.get("rows", []):

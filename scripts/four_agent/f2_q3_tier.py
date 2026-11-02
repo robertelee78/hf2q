@@ -53,6 +53,8 @@ HOW_TO_READ = [
     "- **Peer: task makespan only.** The sentence names whichever arm finishes sooner and computes X on the slower "
     "arm's time, X = 1 − faster/slower; it is never a win. Unavailable families show the native-engine statement "
     "(different artifact) when one exists.",
+    "- **Failed** families (an experiment run failed its task, Q3 rule 1) show that run's Failure row and no speed "
+    "effect; with no paired block, no fairness effect exists.",
     "- **Fairness** is the worst-slot ratio hf2q/reference with its 95% CI; above 1 means hf2q's worst slot waits "
     f"longer. An SSE gap that the Q3 verdict could not estimate is {UNMEASURABLE} and does not gate, as in the Q3 rule. "
     "SSE gaps against the peer are not comparable (different event granularity).",
@@ -62,7 +64,14 @@ HOW_TO_READ = [
     "- **Campaign** status includes a halt in a later stage (for example Invalid from a mixed-stage width halt), "
     "which does not change the completed primary, and lists which control stages were measured. Control effects of "
     "the record and native-engine rows keep their own sections below.",
+    "- **Family notes** below the tables carry each family's reviewed scoreboard sentences and the disclosures the "
+    "independent reviews require; they cite the reviews and add no number of their own.",
 ]
+
+
+def experiment_name(declared):
+    """The Q3 experiment as cited on the board: `hf2q <commit8>` of the frozen binary, never a branch label."""
+    return f"hf2q {declared['commit'][:8]}" if declared.get("commit") else declared["label"]
 
 
 def symbolic(text, root):
@@ -165,16 +174,18 @@ def build_record(verdict, campaign, root, refs, gates, review):
         status, q1, sha = gate_status(document, reference, verdict["family"], arms)
         quality.append({"reference": reference, "manifest": ref, "status": status, "q1_verdict": q1, "reference_sha256": sha})
     secondary = (verdict.get("primary") or {}).get("secondary") or {}
-    declared = campaign["plan"]["declared"]["experiment"]
+    # An effect is unmeasurable only when the primary has paired blocks but the metric was empty in them; a primary
+    # stopped before any block (Failed) has no fairness effect at all.
+    paired = ((verdict.get("primary") or {}).get("stop") or {}).get("blocks", 0) >= 2
     return {"verdict": verdict["verdict"], "verdict_ref": refs[0], "campaign_ref": refs[1],
             "campaign_status": verdict["campaign_status"], "halt": halt_record(campaign, root),
             "primary_stop": (verdict.get("primary") or {}).get("stop"),
             "stages": [[s["workload"], s["status"]] for s in campaign["stages"]],
             "reasons": [symbolic(r, root) for r in verdict["reasons"]],
-            "experiment": f"hf2q {declared['commit'][:8]}" if declared.get("commit") else declared["label"],
+            "experiment": experiment_name(campaign["plan"]["declared"]["experiment"]),
             "peer_unavailable": unavailable((verdict["peer"]["unavailable"] or {}).get("peer"), root),
-            "unmeasurable": [f"{m}.{c}" for m in FAIRNESS for c in ("vs_stock", "vs_peer")
-                             if (secondary.get(m) or {}).get(c) is not None and secondary[m][c]["improvement_percent"] is None],
+            "unmeasurable": [f"{m}.{c}" for m in FAIRNESS for c in ("vs_stock", "vs_peer") if paired
+                             and (secondary.get(m) or {}).get(c) is not None and secondary[m][c]["improvement_percent"] is None],
             "thermal_valid": verdict["thermal_valid"], "memory_valid": verdict["memory_valid"],
             "patch_review_pending": list(verdict["quality"]["patch_review"]["pending"]),
             "quality_gate": quality, "review": review}
@@ -228,6 +239,10 @@ def validate_row(row, groups):
     if row["kind"] == "effect":
         require(row["baseline_arm"] in (STOCK_ARM, "peer") and row["metric"] in ("makespan_s", *FAIRNESS),
                 f"{rid}: Q3 effects are makespan or worst-slot fairness vs v0128_stock or peer")
+    elif row["metric"] == "task_pass":
+        require(row["status"] == "Failure" and row["arm"] == "candidate" and rec["verdict"] == "Failed"
+                and row["receipt"] == rec["campaign_ref"],
+                f"{rid}: a Q3 task_pass row of record is the Failure of a Failed verdict, read from its campaign.json")
     else:
         require(row["metric"] in TOKENS and row["arm"] in TOKEN_ARMS, f"{rid}: Q3 measurements are token volume or rate")
 

@@ -870,6 +870,47 @@ acceptance bullets that name them are the successor's acceptance, not this
 closure's; `f2_scoreboard_cli.py` still renders any fixed-six result produced.
 This decision establishes no speed win by itself.
 
+### F2 scoreboard of record (2026-11-02)
+
+The "Q3 verdicts of record" tier of `docs/research/adr063-f2-scoreboard.md`
+now carries one reviewed record per family, rendered with `--verify` from
+`docs/research/adr063-f2-scoreboard-rows.json`. Every quality gate of record
+is `Pass` (all six `quality-gate-v1` manifests and patch reviews). The
+reviews' scoreboard sentences and disclosures are in the tier's "Family
+notes". Per family:
+
+- **Qwen3.8 27B (Q3 v7, hf2q 38485a23): Win against v0.1.28.** The four-task
+  makespan is 26.4% shorter (95% CI 24.7–28.0%, 6 blocks). Against the peer,
+  hf2q finishes 31.5% sooner (CI 31.1–31.9%), while the peer emits 1.91× the
+  completion tokens at a 1.31× per-token rate, and hf2q's worst-slot p95 TTFT
+  is 1.69× the peer's. n1 is neutral against stock (−1.8%). The v8 controls
+  measured 3+1 (25.9% sooner than stock) and 2+2 (23.0%); 1+3 is unmeasured
+  after a width-only halt at the peer warmup.
+- **DeepSeek-V4 Flash (Q3 v7, hf2q 38485a23): Unavailable.** The same-GGUF
+  peer runs out of memory (prior evidence). Against stock, hf2q finishes 24.7%
+  sooner (CI 23.8–25.6%, 5 blocks), with byte-identical final sources in both
+  arms; the SSE fairness check is not measurable, and n1 is neutral. On
+  different artifacts, hf2q 38485a23 finishes 5.2% sooner than ds4 c97964b
+  (CI 3.0–7.4%; task makespan only, with the disclosed parity gaps; never a
+  Win). The ds4 artifact sha256 is per HF LFS metadata and not yet locally
+  re-hashed. Every mixed stage is unmeasured (structural stock-warmup halts).
+- **Qwen3.6 35B-A3B (Q3 v10, hf2q 38485a23): Failed** (Q3 rule 1). The n4
+  experiment warmup failed its task (agent-2, E0282, no repair turn allowed);
+  0 paired blocks, so no speed effect. Stock v0.1.28 failed the same way; the
+  peer was not run.
+- **Gemma 4 26B-A4B (Q3 v9, hf2q 5d421a2c): Loss.** hf2q finishes 37.0%
+  sooner than v0.1.28 (CI 35.6–38.4%), but it is not a Win: the stock SSE-gap
+  fairness gate fails (1.047×, CI 1.036–1.058). The peer finishes 13.4% sooner
+  (CI 10.6–16.2%; 20-block cap, vs-peer precision not met). Every mixed stage
+  is unmeasured (structural stock-warmup halts in v7, v8 and v9).
+
+Two verdicts on the board are recomputed copies, because the frozen campaign
+files are read-only. Each is under `$E/f2-assembly/`, beside a byte-identical
+copy of its `campaign.json`. `deepseek4-native-ds4/verdict.json` carries the
+native statement labelled hf2q 38485a23 (the frozen v8 file says "main HEAD").
+`qwen38-controls/verdict.json` binds both Qwen3.8 quality-gate manifests and
+the v7 patch review.
+
 ## Consequences
 
 ### Positive

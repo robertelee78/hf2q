@@ -173,7 +173,7 @@ class Campaign(unittest.TestCase):
         self.assertIn('same-GGUF peer unavailable', verdict['reasons'][0])
         native = verdict['native_peer']
         self.assertTrue(native['statement'].startswith(
-            'main HEAD finishes the same coding task 20.0% sooner than ds4 c97964b (native Flash-0731 q2 artifact)'))
+            'hf2q 22222222 finishes the same coding task 20.0% sooner than ds4 c97964b (native Flash-0731 q2 artifact)'))
         self.assertIn('task makespan only', native['statement'])
         self.assertEqual(native['token_volume_median'], {'experiment': {'prompt': 100000, 'completion': 2400},
                                                          'peer': {'prompt': 100000, 'completion': 1600}})

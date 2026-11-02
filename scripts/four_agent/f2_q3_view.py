@@ -64,8 +64,10 @@ def gate_reasons(rec, family):
 
 
 def stock_reasons(rec, effects, band, family):
-    """Every unmet condition for showing a Win against v0.1.28 stock (empty: Win)."""
-    reasons = ["the family verdict is Failed (hf2q task failure)"] if rec["verdict"] == "Failed" else []
+    """Every unmet condition for showing a Win against v0.1.28 stock (empty: Win). A Failed family has one: rule 1."""
+    if rec["verdict"] == "Failed":
+        return ["the family verdict is Failed (hf2q task failure)"]
+    reasons = []
     if not rec["primary_stop"]:
         reasons.append("the primary stage has not reached its stopping rule")
     row = effects.get(("makespan_s", STOCK_ARM))
@@ -135,10 +137,12 @@ def render(manifest, q3_rows, native_rows, baseline_labels):
         mine = sorted((r for r in q3_rows if r["group"] == gid), key=lambda r: r["id"])
         effects = {(r["metric"], r["baseline_arm"]): r for r in mine if r["kind"] == "effect"}
         measured = {(r["metric"], r["arm"]): r for r in mine if r["kind"] == "measurement"}
+        failures = [r for r in mine if r["status"] == "Failure" and r["metric"] == "task_pass"]
         unmet = stock_reasons(rec, effects, band, fam)
         stock = effects.get(("makespan_s", STOCK_ARM))
-        stock_cell = (f"{hf2q}: —" if stock is None else sooner(stock, "v0.1.28 stock", hf2q)) + (
+        stock_cell = (f"{hf2q}: no speed effect" if stock is None else sooner(stock, "v0.1.28 stock", hf2q)) + (
             "; **Win**" if not unmet else "; not a win: " + "; ".join(unmet))
+        stock_cell += "".join(f". {r['value']:.0f}/{r['n_slots']} tasks [FAIL]: {r['note']} (`{r['id']}`)" for r in failures)
         verdict = rec["verdict"]
         if verdict == "Win" and unmet:
             verdict = "Withheld: " + "; ".join(unmet)
@@ -154,8 +158,9 @@ def render(manifest, q3_rows, native_rows, baseline_labels):
                                  if x["family"] == fam and NATIVE_COMPARISON not in (x["variant"] or "") + x["note"])
         else:
             peer_cell = "—"
-        fair = f"vs stock: {fairness(effects, STOCK_ARM, rec)}; vs peer: " + (
-            fairness(effects, "peer", rec) if peer is not None else "—")
+        fair = ("— (no paired block)" if not any(m in FAIRNESS for m, _ in effects) and not rec["unmeasurable"] else
+                f"vs stock: {fairness(effects, STOCK_ARM, rec)}; vs peer: "
+                + (fairness(effects, "peer", rec) if peer is not None else "—"))
         gate = "; ".join(f"{REFERENCES[g['reference']]} {g['status']}"
                          + (f" ({g['q1_verdict']})" if g["q1_verdict"] not in (None, g["status"]) else "")
                          + f" `{g['manifest']}`" for g in rec["quality_gate"]) or "not declared"
@@ -177,4 +182,11 @@ def render(manifest, q3_rows, native_rows, baseline_labels):
             if tokens else ["None recorded."])
     out += ["", "Rows of record (receipt and extraction key in the rows manifest); the record's control effects "
             "are in the Q3 controls section:", ""] + (evidence or ["None."])
+    notes = manifest.get("q3_family_notes") or {}
+    if notes:
+        out += ["", "### Family notes", ""]
+        for fam, family in fams.items():
+            if fam in notes:
+                out += [f"**{family['title']}**", ""] + [f"- {line}" for line in notes[fam]] + [""]
+        out.pop()
     return out + [""]
