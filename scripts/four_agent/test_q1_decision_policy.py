@@ -295,6 +295,27 @@ class Transcripts(unittest.TestCase):
         self.assertEqual(result["classification"], "DivergedTranscripts")
         self.assertEqual(result["divergent"][0]["agent"], "agent-1")
 
+    def test_random_tool_call_ids_compare_exact_but_content_differences_do_not(self):
+        user = [{"role": "user", "content": "fix it"}]
+
+        def run(name, call_id, next_path):
+            history = user + [call('{"path": "a"}', call_id), {"role": "tool", "tool_call_id": call_id, "content": "pub fn f()"}]
+            return client_run(self.tmp.name, name, {
+                ("agent-0", "turn-0"): (user, call('{"path": "a"}', call_id)),
+                ("agent-0", "turn-1"): (history, call(json.dumps({"path": next_path}), call_id[::-1]))})
+        # the peer's random 32-character ids differ in every run; here only the ids differ
+        a = run("a", "WOVpsbvDqk3nC8xYr2LmT7aZp0eUw9Hf", "b")
+        b = run("b", "Jb4tQ0zNcR6vYp1sKx8mWd3hLa5uFe2G", "b")
+        result = q.transcripts([a, b])
+        self.assertEqual((result["classification"], result["same_request_groups"]), ("ExactTranscripts", 2))
+        # the same history with a different turn-1 answer still diverges once the ids are normalised
+        c = run("c", "Zq9wXe8rTy7uIo6pAs5dFg4hJk3lMn2B", "c")
+        result = q.transcripts([a, c])
+        self.assertEqual(result["classification"], "DivergedTranscripts")
+        self.assertEqual([(d["agent"], d["turn"]) for d in result["divergent"]], [("agent-0", "turn-1")])
+        self.assertEqual(q.normalise_call_ids([{"tool_calls": [{"id": "x"}]}, {"tool_call_id": "x"}, {"tool_call_id": "y"}]),
+                         [{"tool_calls": [{"id": "CALL0"}]}, {"tool_call_id": "CALL0"}, {"tool_call_id": "CALL1"}])
+
 
 if __name__ == "__main__":
     unittest.main()

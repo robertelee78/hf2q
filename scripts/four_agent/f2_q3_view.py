@@ -1,6 +1,6 @@
 """Markdown of the F2 'Q3 verdicts of record' tier (f2_q3_tier records and rows). Pure: no receipt reads."""
-from f2_q3_tier import (FAIRNESS, HOW_TO_READ, NATIVE_COMPARISON, PRECISION_PP, REFERENCES, SSE, STOCK_ARM,
-                        TOKEN_ARMS, TOKENS, UNMEASURABLE, required_references)
+from f2_q3_tier import (FAIRNESS, HOW_TO_READ, NATIVE_COMPARISON, PEER_SPEC_OFF, PRECISION_PP, REFERENCES, SSE,
+                        STOCK_ARM, TOKEN_ARMS, TOKENS, UNMEASURABLE, required_references)
 
 
 def ratio(row):
@@ -64,10 +64,11 @@ def gate_reasons(rec, family):
 
 
 def stock_reasons(rec, effects, band, family):
-    """Every unmet condition for showing a Win against v0.1.28 stock (empty: Win). A Failed family has one: rule 1."""
+    """Every unmet condition for showing a Win against v0.1.28 stock (empty: Win). A Failed family has one: rule 1.
+    A family whose verdict is Loss vs the peer is never a Q3 Win, whatever its stock contrast."""
     if rec["verdict"] == "Failed":
         return ["the family verdict is Failed (hf2q task failure)"]
-    reasons = []
+    reasons = ["the family verdict is Loss vs the peer"] if rec["verdict"] == "Loss" else []
     if not rec["primary_stop"]:
         reasons.append("the primary stage has not reached its stopping rule")
     row = effects.get(("makespan_s", STOCK_ARM))
@@ -122,6 +123,7 @@ def campaign_cell(rec, effects):
 def render(manifest, q3_rows, native_rows, baseline_labels):
     """Markdown lines of the tier: one line per family, a token table and each family's row ids."""
     fams, groups, band = manifest["families"], manifest["groups"], manifest["neutral_band_ratio"]
+    notices = manifest.get("q3_verdict_notices") or {}  # e.g. a record a pre-registered campaign will replace
     records = {g["family"]: (gid, g["q3_record"]) for gid, g in groups.items() if "q3_record" in g}
     out = ["## Q3 verdicts of record (F2's qualified display under option B; above Descriptive)", "", *HOW_TO_READ, "",
            "| Family | Q3 verdict of record | Makespan vs v0.1.28 stock | Makespan vs peer (task makespan only) | "
@@ -141,16 +143,18 @@ def render(manifest, q3_rows, native_rows, baseline_labels):
         unmet = stock_reasons(rec, effects, band, fam)
         stock = effects.get(("makespan_s", STOCK_ARM))
         stock_cell = (f"{hf2q}: no speed effect" if stock is None else sooner(stock, "v0.1.28 stock", hf2q)) + (
-            "; **Win**" if not unmet else "; not a win: " + "; ".join(unmet))
+            "; **Win**" if not unmet else "; not a Q3 Win: " + "; ".join(unmet))
         stock_cell += "".join(f". {r['value']:.0f}/{r['n_slots']} tasks [FAIL]: {r['note']} (`{r['id']}`)" for r in failures)
         verdict = rec["verdict"]
         if verdict == "Win" and unmet:
             verdict = "Withheld: " + "; ".join(unmet)
         elif verdict in ("Failed", "Inconclusive", "Pending") and rec["reasons"]:
             verdict += ": " + "; ".join(rec["reasons"])
+        if fam in notices:
+            verdict += f" — **{notices[fam]}**"
         peer = effects.get(("makespan_s", "peer"))
         if peer is not None:
-            peer_cell = sooner(peer, "the peer", hf2q)
+            peer_cell = sooner(peer, f"the {PEER_SPEC_OFF}" if PEER_SPEC_OFF in peer["note"] else "the peer", hf2q)
         elif rec["peer_unavailable"] or rec["verdict"] == "Unavailable":
             peer_cell = f"Unavailable: {rec['peer_unavailable'] or '; '.join(rec['reasons'])}"
             peer_cell += "".join(f". Native {baseline_labels[x['baseline_arm']]} (different artifact, task makespan only): "

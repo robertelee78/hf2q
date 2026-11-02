@@ -86,6 +86,9 @@ def validate_manifest(m):
     require(isinstance(notes, dict) and set(notes) <= set(families) and all(
         isinstance(v, list) and v and all(isinstance(s, str) and s for s in v) for v in notes.values()),
         "q3_family_notes: family -> non-empty list of sentences")
+    notices = m.get("q3_verdict_notices", {})  # appended to a family's Q3 verdict (a record due to be replaced)
+    require(isinstance(notices, dict) and set(notices) <= set(families)
+            and all(isinstance(v, str) and v for v in notices.values()), "q3_verdict_notices: family -> sentence")
     record_refs = q3tier.validate(groups)
     ids = set()
     for row in m.get("rows", []):
@@ -116,6 +119,12 @@ def validate_manifest(m):
             require(isinstance(row["control_of"], str) and row["control_of"].startswith("$E/")
                     and ((kind == "effect" and row["status"] == "Descriptive") or row["status"] == "Failure"),
                     f"{rid}: control_of must cite a $E/ primary of record on a Descriptive effect or a Failure row")
+        if "superseded_by" in row:  # a former verdict of record, kept beside the record that replaced it
+            replacement = next((g["q3_record"] for g in groups.values() if g["family"] == row["family"]
+                                and "q3_record" in g and g["q3_record"]["verdict_ref"] == row["superseded_by"]), None)
+            require(replacement is not None and kind == "effect" and row["status"] == "Descriptive"
+                    and "control_of" not in row and "q3_of_record" not in row,
+                    f"{rid}: superseded_by must cite its family's current Q3 verdict of record on a Descriptive effect")
         if "q3_of_record" in row:
             q3tier.validate_row(row, groups)
         else:
@@ -217,6 +226,8 @@ def comparisons(manifest):
                 verdict = "Neutral"
             elif not (repeated and (min(num_s) > max(den_s) if ratio > 1 else max(num_s) < min(den_s))):
                 verdict = "Unseparated"
+            elif den_key[0] == "peer":  # Win is only against v0.1.28 stock; against the peer it stays descriptive
+                verdict = "Faster" if ratio > 1 else "Slower"
             else:
                 verdict = "Win" if ratio > 1 else "Regression"
             result.append({"group": group, "metric": metric, "arm": num_key, "baseline": den_key, "value": num,
@@ -227,8 +238,9 @@ def comparisons(manifest):
                                          c["arm"][1] or "", c["baseline"][0]))
 
 
-def effect_is_win(row):  # a native-engine (different artifact) comparison is never a win
-    return (row["kind"] == "effect" and row["verification"]["state"] == "Verified" and row.get("baseline_arm") not in NATIVE_BASELINES
+def effect_is_win(row):  # a native-engine (different artifact) or peer comparison is never a win
+    return (row["kind"] == "effect" and row["verification"]["state"] == "Verified"
+            and row.get("baseline_arm") not in (*NATIVE_BASELINES, "peer")
             and row["status"] in ("Qualified", "Descriptive") and row.get("ci95") is not None and row["ci95"][0] > 0)
 
 
@@ -278,9 +290,11 @@ def short(sha):
 def render(manifest, scoreboards, manifest_sha256):
     fams, groups, rows = manifest["families"], manifest["groups"], manifest["rows"]
     controls = [x for x in rows if "control_of" in x]  # Q3 controls of a primary of record: own section, never a win/non-win
+    superseded = [x for x in rows if "superseded_by" in x]  # former Q3 records: own section, never a win/non-win
     native = [x for x in rows if x.get("baseline_arm") in NATIVE_BASELINES and "control_of" not in x]  # own section only, never a win/non-win
     q3 = [x for x in rows if "q3_of_record" in x]  # Q3 verdicts of record: their own tier only
-    rows = [x for x in rows if x.get("baseline_arm") not in NATIVE_BASELINES and "control_of" not in x and "q3_of_record" not in x]
+    rows = [x for x in rows if x.get("baseline_arm") not in NATIVE_BASELINES and "control_of" not in x
+            and "q3_of_record" not in x and "superseded_by" not in x]
     band = manifest["neutral_band_ratio"]
     comps = comparisons(manifest)
     out = ["# ADR-063 F2 four-agent scoreboard", "",
@@ -360,13 +374,23 @@ def render(manifest, scoreboards, manifest_sha256):
             f"| {fams[x['family']]['title']} | {arm_label((x['arm'], x['variant']))}"
             f"{' vs ' + BASELINE_ARMS[x['baseline_arm']] if x['kind'] == 'effect' else ''} | "
             f"{row_value(x)} {tag(x)} | {x['note']} | `{x['control_of']}` | `{x['id']}` |" for x in controls]
-    out += ["", "## Open gaps", "", "| Family | Metric | Missing arms | Arms with only failed runs |", "|---|---|---|---|"]
+    if superseded:
+        out += ["", "## Superseded Q3 records (evidence beside the current record; never a win or loss)", "",
+                "| Family | Comparison | Result | Note | Replaced by | Evidence |",
+                "|---|---|---|---|---|---|"] + [
+            f"| {fams[x['family']]['title']} | {arm_label((x['arm'], x['variant']))} vs {BASELINE_ARMS[x['baseline_arm']]} | "
+            f"{row_value(x)} {tag(x)} | {x['note']} | `{x['superseded_by']}` | `{x['id']}` |" for x in superseded]
+    out += ["", "## Open gaps", "", "An arm counts as measured when a verified row measures it, or when a verified effect "
+            "(Q3 tier and controls included) uses it as the baseline. The Q3 verdicts of record measure task makespan; "
+            "the other metrics below are F2 fixed-six scope (successor scope under option B).", "",
+            "| Family | Metric | Missing arms | Arms with only failed runs |", "|---|---|---|---|"]
     for fam in fams:
-        frows = [r for r in rows if r["family"] == fam]
+        frows = [r for r in manifest["rows"] if r["family"] == fam]
         for gap in GAP_METRICS:
             missing, failed = [], []
             for arm in ARMS:
-                arm_rows = [r for r in frows if r["arm"] == arm and METRICS[r["metric"]][3] == gap]
+                arm_rows = [r for r in frows if METRICS[r["metric"]][3] == gap
+                            and (r["arm"] == arm or (r["kind"] == "effect" and r.get("baseline_arm") == arm))]
                 if any(r["verification"]["state"] == "Verified" and r["status"] != "Failure" for r in arm_rows):
                     continue
                 failed_arm = any(r["status"] == "Failure" and r["arm"] == arm for r in frows)

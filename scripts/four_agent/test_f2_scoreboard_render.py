@@ -25,9 +25,10 @@ def row(rid, metric, arm, value, status="Descriptive", variant=None, group="g", 
     return out
 
 
-def effect(rid, value, ci95, status="Descriptive"):
+def effect(rid, value, ci95, status="Descriptive", **over):
     out = row(rid, "semantic_ttft_s", "candidate", value, status=status, kind="effect", unit=r.EFFECT_UNIT,
               ci95=ci95, baseline_arm="hf2q_current")
+    out.update(over)
     if ci95 is not None:
         out["verification"]["extract"]["ci95"] = {"kind": "json", "file": out["receipt"], "path": "ci.*", "reduce": "list"}
     return out
@@ -92,7 +93,11 @@ class Direction(unittest.TestCase):
         m = manifest(runs("h", "prefill_tps", "hf2q_current", [700.0, 701.0]) + runs("p", "prefill_tps", "peer", [600.0, 601.0])
                      + runs("s", "prefill_tps", "v0128_stock", [800.0, 801.0]))
         got = {c["baseline"][0]: (c["arm"][0], c["verdict"]) for c in r.comparisons(m)}
-        self.assertEqual(got, {"peer": ("hf2q_current", "Win"), "v0128_stock": ("hf2q_current", "Regression")})
+        # Win is only against v0.1.28 stock: a separated result against the peer is Faster or Slower
+        self.assertEqual(got, {"peer": ("hf2q_current", "Faster"), "v0128_stock": ("hf2q_current", "Regression")})
+        text = r.render(m, [], "0" * 64)
+        self.assertIn("None.", section(text, "### Descriptive wins"))
+        self.assertIn("Faster [D]", section(text, "## Negative results"))
 
     def test_comparisons_stay_within_group(self):
         m = manifest(runs("c", "makespan_s", "candidate", [100.0, 101.0], group="g") +
@@ -145,6 +150,10 @@ class Labels(unittest.TestCase):
         for rid in ("e2", "e3", "e4"):
             self.assertNotIn(f"`{rid}`", wins)
             self.assertIn(f"`{rid}`", losses)
+        peer = manifest([effect("e5", 30.0, [25.0, 35.0], baseline_arm="peer")])
+        text = r.render(peer, [], "0" * 64)
+        self.assertNotIn("`e5`", section(text, "### Descriptive wins"))
+        self.assertIn("`e5`", section(text, "## Negative results"))
 
 
 class Gaps(unittest.TestCase):
@@ -155,6 +164,20 @@ class Gaps(unittest.TestCase):
         self.assertIn("| Family | makespan | candidate, v0.1.28 stock | hf2q current |", text)
         self.assertIn("| Family | prefill_tps | candidate, v0.1.28 stock, peer | hf2q current |", text)
         self.assertIn("Family: no F2 primary Qualified fixed-six result.", text)
+
+    def test_an_effect_measures_its_baseline_arm(self):
+        rows = runs("c", "makespan_s", "candidate", [100.0])
+        rows += [effect("e", 20.0, [15.0, 25.0], metric="makespan_s", baseline_arm="v0128_stock")]
+        text = section(r.render(manifest(rows), [], "0" * 64), "## Open gaps")
+        self.assertIn("| Family | makespan | hf2q current, peer | — |", text)
+
+
+class Notices(unittest.TestCase):
+    def test_verdict_notices_validate(self):
+        for bad in ({"nope": "x"}, {"fam": ""}, {"fam": ["x"]}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                r.validate_manifest({**manifest([]), "q3_verdict_notices": bad})
+        r.validate_manifest({**manifest([]), "q3_verdict_notices": {"fam": "Pending v11"}})
 
 
 class Scoreboards(unittest.TestCase):

@@ -139,7 +139,12 @@ real stale-KV corruption bug (ADR-040 lines 561–630), not numerics.
 
 Tooling: `q1_decision_policy.py exact` checks all stages; the Rust comparator
 (`compare.rs`) checks with `NumericPolicy::Exact`; `q1_decision_policy.py
-transcripts` checks serving runs.
+transcripts` checks serving runs. Before comparing a turn's request history it
+replaces every tool-call id (assistant `tool_calls[].id` and tool
+`tool_call_id`) by its ordinal of first appearance, so random per-run ids
+(hf2q's `call_hf2q_…` and the peer's 32-character ids) never split identical
+histories. Until 2026-11-02 it normalised only `call_hf2q_…` ids, so for peer
+runs it compared turn 0 alone (Q3 v11 review, finding 3).
 
 ### 3.2 Class B: decision envelope for declared alternate routes
 
