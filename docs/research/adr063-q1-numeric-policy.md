@@ -353,6 +353,9 @@ and runs each case under the existing Q5 supervisor, one model at a time:
 1. **Class B on accepted inputs:** `HF2Q_Q1_GEMMA_ENDPOINT_PACKET` with the greedy144 workload (`842768`), filters `adr063_invariance::gemma_actual::q1_gemma_actual_ordinary_endpoint_trace` (T0/T1/T3/T4/T7), `…::q1_gemma_actual_cohort_endpoint_trace` (T2) and `…::q1_gemma_actual_cancel_endpoint_trace` (T6). That is 7 processes at about 45 s each, per the routing-witness receipts.
 2. **Checks:** `exact` on T1 vs T3, T6 vs T3, T4 vs T0 and T7 vs T0; `envelope` on T0 vs T3 and T0 vs T2.
 3. **Localize any `RouteSensitive` pair** with `adr063_invariance::gemma_localizer::q1_gemma_actual_stage_localizer` (`HF2Q_Q1_GEMMA_LOCALIZER_PACKET`). Start at the layer-5 onset for rows < 64 and the layer-1 onset for rows ≥ 64. Record routing flips with their witness margins.
+   - Packets come from the Gemma metadata prepare with an optional `localizer` block (`agent`, `layers`, `stages`, `normalize_rows`, `routes` of `rerun_id` + `prefill_chunks`, e.g. `[128]` and `[64,64]`). It writes `localizer-prepared.json` (stage-localizer `config_sha256`, recipe, identity with `native_checksum: null`, `planned_payload` per route) and one disabled `localizer-packet-<rerun_id>.json` per route, and prints `Q1_GEMMA_LOCALIZER_METADATA_PREPARED`. Every route freezes the same `expected` list, so `exact` can compare them.
+   - The stage-localizer `config_sha256` differs from the endpoint one, so the localizer needs its own composition, acquisition review and bindings file.
+   - The Qwen endpoint prepare takes the same block, with `operations` (`embed`, `attn_out`, `ffn_out`, `layer_out`) instead of `stages`. Its routes are 128 tokens as `[128]` or `[64,64]` on one cache, and it prints `Q1_QWEN_LOCALIZER_METADATA_PREPARED`.
 4. **Quality:** floor-only (no peer) on 24 instances; any candidate that changes chunk or batch routing needs the paired A/B against stock.
 
 ### 5.5 Per-family closure checklist

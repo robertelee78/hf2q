@@ -8,7 +8,7 @@ use super::prepare::{self, Config};
 use crate::adr063_invariance::{
     acquisition::{self, FileBinding},
     protocol::{Trajectory, Workload},
-    qwen_checkpoint,
+    qwen_checkpoint, qwen_localizer,
     receipt::{ExpectedTensor, Family},
     store::hash,
 };
@@ -41,6 +41,32 @@ struct EndpointConfig {
     /// Optional `derivation.json` of `q1_qwen36_suffix144_workload_prepare`;
     /// when present it must name the bound workload file.
     workload_derivation: Option<FileBinding>,
+    /// Optional stage-localizer packets; absent leaves every output unchanged.
+    localizer: Option<LocalizerConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalizerRoute {
+    rerun_id: String,
+    prefill_chunks: Vec<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalizerConfig {
+    agent: usize,
+    layers: Vec<usize>,
+    operations: Vec<String>,
+    normalize_rows: bool,
+    routes: Vec<LocalizerRoute>,
+}
+
+pub(super) struct LocalizerPlan {
+    pub(super) config_sha256: String,
+    pub(super) recipe: serde_json::Value,
+    /// `(rerun_id, prefill_chunks, manifest)` per route.
+    pub(super) routes: Vec<(String, Vec<usize>, qwen_localizer::Manifest)>,
 }
 
 pub(super) struct EndpointPlan {
@@ -97,6 +123,134 @@ pub(super) fn plan(
     })
 }
 
+/// Pure localizer plan from the un-overridden header config: the recipe
+/// `qwen_localizer` checks and one manifest per route from its own builder.
+/// Every route must freeze the identical `expected`, or `compare` refuses.
+fn localizer_plan(
+    header_cfg: &Qwen35Config,
+    work: &Workload,
+    capacity: u32,
+    l: &LocalizerConfig,
+) -> Result<LocalizerPlan> {
+    ensure!((144..=262144).contains(&capacity), "localizer capacity 144..=262144");
+    ensure!(!l.routes.is_empty() && l.routes.len() <= 8, "one to eight localizer routes");
+    let mut routes: Vec<(String, Vec<usize>, qwen_localizer::Manifest)> = Vec::new();
+    for r in &l.routes {
+        ensure!(
+            !r.rerun_id.is_empty()
+                && r.rerun_id.len() <= 64
+                && r.rerun_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+                && routes.iter().all(|(id, _, _)| *id != r.rerun_id),
+            "distinct file-safe localizer rerun ids"
+        );
+        let manifest = qwen_localizer::localizer_manifest(
+            header_cfg,
+            l.agent,
+            &r.prefill_chunks,
+            &l.layers,
+            &l.operations,
+            l.normalize_rows,
+        )
+        .map_err(anyhow::Error::msg)?;
+        if let Some((_, _, first)) = routes.first() {
+            ensure!(
+                first.1 == manifest.1,
+                "localizer routes must freeze identical expected coordinates"
+            );
+        }
+        routes.push((r.rerun_id.clone(), r.prefill_chunks.clone(), manifest));
+    }
+    let recipe = qwen_localizer::localizer_recipe(work.family, capacity, header_cfg);
+    Ok(LocalizerPlan {
+        config_sha256: acquisition::config_digest(&recipe)?,
+        recipe: serde_json::to_value(&recipe)?,
+        routes,
+    })
+}
+
+/// `localizer-prepared.json` plus one DISABLED packet per route. The identity
+/// is the endpoint identity with the stage-localizer `config_sha256`: the key
+/// of a SEPARATE localizer composition, acquisition review and bindings file.
+fn localizer_files(
+    b: &prepare::Bound,
+    common: &Config,
+    raw: &[u8],
+    capacity: u32,
+    endpoint_identity: &serde_json::Value,
+    l: &LocalizerConfig,
+    lp: &LocalizerPlan,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut identity = endpoint_identity.clone();
+    identity["config_sha256"] = serde_json::json!(lp.config_sha256);
+    let mut files = Vec::new();
+    let mut planned = serde_json::Map::new();
+    for (rerun_id, chunks, (targets, expected, bytes)) in &lp.routes {
+        let tokens = chunks.iter().sum::<usize>();
+        planned.insert(rerun_id.clone(), serde_json::json!(bytes));
+        let packet = serde_json::json!({
+            "execution_approved": false,
+            "acquisition": null,
+            "identity": identity,
+            "model": common.model.path,
+            "output": null,
+            "tokens": b.work.lanes[l.agent][..tokens],
+            "workload": b.work,
+            "agent": l.agent,
+            "configured_capacity": capacity,
+            "expected": expected,
+            "targets": targets,
+            "host_payload_limit": bytes,
+            "rerun_id": rerun_id,
+            "prefill_chunks": chunks,
+        });
+        let encoded = serde_json::to_vec_pretty(&packet)?;
+        ensure!(
+            encoded.len() + 65536 <= 8 * 1024 * 1024,
+            "packet must fit the localizer 8 MiB read"
+        );
+        files.push((format!("localizer-packet-{rerun_id}.json"), encoded));
+    }
+    let value = serde_json::json!({
+        "schema": "hf2q.q1.qwen-localizer-preparation.v1",
+        "exporter_source_commit": b.source,
+        "exporter_binary_sha256": b.binary,
+        "native_version": env!("HF2Q_MLX_NATIVE_VERSION"),
+        "config_input_sha256": hash(raw),
+        "family": b.work.family,
+        "model_path": common.model.path,
+        "model_file_identity": b.before,
+        "model_full_sha256_retained": common.model.retained_full_sha256,
+        "header_data_offset": b.header.tensor_data_offset(),
+        "header_qwen_config_debug": format!("{:?}", b.header_cfg),
+        "header_config_context_override": false,
+        "config_sha256": lp.config_sha256,
+        "recipe": lp.recipe,
+        "identity": identity,
+        "comparison_key_scope": "SEPARATE stage-localizer composition/acquisition review/bindings; not the endpoint composition",
+        "agent": l.agent,
+        "layers": l.layers,
+        "operations": l.operations,
+        "normalize_rows": l.normalize_rows,
+        "configured_capacity": capacity,
+        "records_per_route": lp.routes[0].2 .1.len(),
+        "planned_payload": planned,
+        "host_payload_cap": qwen_localizer::HOST_PAYLOAD_CAP,
+        "packets": files.iter().map(|(name, bytes)| serde_json::json!({
+            "file": name, "sha256": hash(bytes)})).collect::<Vec<_>>(),
+        "model_loaded": false,
+        "device_created": false,
+        "inference_performed": false,
+        "acquisition_attested": false,
+        "execution_approved": false,
+        "composition_reviewed": false,
+        "whole_q1_qualified": false,
+    });
+    let encoded = serde_json::to_vec_pretty(&value)?;
+    ensure!(encoded.len() <= 2 * 1024 * 1024, "bounded localizer metadata");
+    files.insert(0, ("localizer-prepared.json".into(), encoded));
+    Ok(files)
+}
+
 #[test]
 #[ignore = "root-reviewed bound header/JSON files only; no model/device execution"]
 fn q1_qwen_endpoint_metadata_prepare() {
@@ -128,6 +282,13 @@ fn run() -> Result<()> {
         config.requested_payload_limit,
         config.mtp_positions,
     )?;
+    let localizer = match &config.localizer {
+        Some(l) => {
+            let lp = localizer_plan(&b.header_cfg, &b.work, config.configured_capacity, l)?;
+            Some((l, lp))
+        }
+        None => None,
+    };
     b.model_unchanged("while reading metadata")?;
     let identity = serde_json::json!({
         "family": b.work.family,
@@ -210,6 +371,12 @@ fn run() -> Result<()> {
     });
     let encoded = serde_json::to_vec_pretty(&value)?;
     ensure!(encoded.len() <= 2 * 1024 * 1024, "metadata output bound");
+    let localizer_out = match &localizer {
+        Some((l, lp)) => {
+            localizer_files(&b, common, &raw, config.configured_capacity, &identity, l, lp)?
+        }
+        None => Vec::new(),
+    };
     if let Some((binding, _)) = &derivation {
         // Re-read after parse like every other bound input.
         acquisition::checked_file(binding, 1024 * 1024)?;
@@ -219,7 +386,17 @@ fn run() -> Result<()> {
         ("workload.json", b.vectors.as_slice()),
     ];
     out.extend(files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
+    out.extend(localizer_out.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
     b.recheck_and_write(common, &out)?;
+    if let Some((l, lp)) = &localizer {
+        println!(
+            "Q1_QWEN_LOCALIZER_METADATA_PREPARED family={:?} routes={} agent={} records_per_route={} device=false execution_approved=false",
+            b.work.family,
+            lp.routes.len(),
+            l.agent,
+            lp.routes[0].2 .1.len()
+        );
+    }
     println!(
         "Q1_QWEN_ENDPOINT_METADATA_PREPARED family={:?} packets={} lanes=4 tokens=144 device=false execution_approved=false",
         b.work.family,

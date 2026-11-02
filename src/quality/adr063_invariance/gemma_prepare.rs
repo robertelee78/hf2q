@@ -1,6 +1,6 @@
 //! Metadata-only preparation from retained ACTUAL Rust-tokenized Gemma inputs.
 //! No model, context, tensor loader, device, native command or inference.
-use super::{acquisition::{self,FileBinding,FileIdentity},protocol::Workload,receipt::Family,store::hash};
+use super::{acquisition::{self,FileBinding,FileIdentity},protocol::Workload,receipt::{Family,Stage},store::hash};
 use anyhow::{ensure,Context,Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -13,12 +13,20 @@ struct Model {path:PathBuf,retained_full_sha256:String,file_identity:FileIdentit
 #[serde(deny_unknown_fields)]
 struct Config {
     #[serde(default)] routing_recipes:bool,
+    /// Optional stage-localizer packets; absent leaves every output unchanged.
+    #[serde(default)] localizer:Option<Localizer>,
     model:Model,full_content_receipt:FileBinding,tokenizer:FileBinding,template:FileBinding,
     producer_metadata:FileBinding,producer_build_receipt:FileBinding,
     producer_export_receipt:FileBinding,producer_config:FileBinding,
     producer_vectors:[FileBinding;4],expected_exporter_source_commit:String,
     expected_exporter_binary_sha256:String,output:PathBuf,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalizerRoute {rerun_id:String,prefill_chunks:Vec<usize>}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Localizer {agent:usize,layers:Vec<u32>,stages:Vec<Stage>,normalize_rows:bool,routes:Vec<LocalizerRoute>}
 fn exact_hex(s:&str,n:usize)->bool {s.len()==n && s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))}
 fn output_preflight(path:&Path)->Result<()> {
     ensure!(path.is_absolute() && !path.ancestors().any(|p|p.join(".git").exists()),"private output outsideGit");
@@ -72,6 +80,71 @@ fn routing_recipe_export(cfg:&crate::serve::config::Gemma4Config)->Result<Vec<Va
         }
     }
     Ok(rows)
+}
+/// One manifest per route from the localizer's own builder. Every route must
+/// freeze the identical `expected` list, or `compare` cannot localize them.
+fn localizer_routes<'a>(cfg:&crate::serve::config::Gemma4Config,l:&'a Localizer)
+    ->Result<Vec<(&'a LocalizerRoute,super::gemma_localizer::Manifest)>> {
+    ensure!(!l.routes.is_empty() && l.routes.len()<=8,"one to eight localizer routes");
+    let mut out:Vec<(&LocalizerRoute,super::gemma_localizer::Manifest)>=Vec::new();
+    for r in &l.routes {
+        ensure!(!r.rerun_id.is_empty() && r.rerun_id.len()<=64
+            &&r.rerun_id.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'||b==b'_')
+            &&out.iter().all(|(o,_)|o.rerun_id!=r.rerun_id),"distinct file-safe localizer rerun ids");
+        let m=super::gemma_localizer::localizer_manifest(cfg,l.agent,&r.prefill_chunks,&l.layers,&l.stages,l.normalize_rows)
+            .map_err(anyhow::Error::msg)?;
+        if let Some((_,first))=out.first() {ensure!(first.1==m.1,"localizer routes must freeze identical expected coordinates");}
+        out.push((r,m));
+    }
+    Ok(out)
+}
+struct LocalizerExport {files:Vec<(String,Vec<u8>)>,routes:usize,agent:usize,records:usize}
+/// `localizer-prepared.json` plus one DISABLED packet per route. The supervisor
+/// fills `acquisition`, `output` and `identity.native_checksum` and flips
+/// `execution_approved`; the identity is the key of a SEPARATE localizer
+/// composition (its `config_sha256` is the stage-localizer recipe digest).
+#[allow(clippy::too_many_arguments)]
+fn localizer_export(c:&Config,l:&Localizer,cfg:&crate::serve::config::Gemma4Config,work:&Workload,source:&str,
+    binary:&str,raw:&[u8],model_file:&FileIdentity,header_data_offset:impl serde::Serialize)->Result<LocalizerExport> {
+    let routes=localizer_routes(cfg,l)?;
+    let recipe=super::gemma_localizer::localizer_recipe(cfg,262144);
+    let config_sha256=acquisition::config_digest(&recipe)?;
+    let token_vectors_sha256=acquisition::tokens_digest(work)?;
+    let identity=serde_json::json!({"family":Family::Gemma4,"source_commit":source,"binary_sha256":binary,
+        "native_version":env!("HF2Q_MLX_NATIVE_VERSION"),"native_checksum":null,"model_sha256":MODEL_SHA,
+        "tokenizer_sha256":c.tokenizer.sha256,"template_sha256":c.template.sha256,
+        "config_sha256":config_sha256,"token_vectors_sha256":token_vectors_sha256});
+    let mut files=Vec::new();let mut planned=serde_json::Map::new();
+    for (route,(targets,expected,bytes)) in &routes {
+        planned.insert(route.rerun_id.clone(),serde_json::json!(bytes));
+        let packet=serde_json::json!({"execution_approved":false,"acquisition":null,"identity":identity,
+            "model":c.model.path,"output":null,"tokens":work.lanes[l.agent],"workload":work,"agent":l.agent,
+            "configured_context":262144,"configured_output_allowance":8192,"expected":expected,"targets":targets,
+            "host_payload_limit":bytes,"rerun_id":route.rerun_id,"prefill_chunks":route.prefill_chunks});
+        let encoded=serde_json::to_vec_pretty(&packet)?;
+        ensure!(encoded.len()+65536<=8*1024*1024,"packet must fit the localizer 8 MiB read");
+        files.push((format!("localizer-packet-{}.json",route.rerun_id),encoded));
+    }
+    let records=routes[0].1.1.len();
+    let value=serde_json::json!({"schema":"hf2q.q1.gemma-localizer-preparation.v1","exporter_source_commit":source,
+        "exporter_binary_sha256":binary,"native_version":env!("HF2Q_MLX_NATIVE_VERSION"),"config_input_sha256":hash(raw),
+        "family":Family::Gemma4,"model_path":c.model.path,"model_full_sha256_retained":MODEL_SHA,
+        "model_file_identity":model_file,"header_data_offset":header_data_offset,
+        "actual_gemma_config_debug":format!("{cfg:?}"),"actual_gemma_config_debug_sha256":recipe.actual_model_config_sha256,
+        "config_sha256":config_sha256,"recipe":recipe,"identity":identity,
+        "comparison_key_scope":"SEPARATE stage-localizer composition/acquisition review/bindings; not the endpoint composition",
+        "tokenizer_file_sha256":c.tokenizer.sha256,"template_file_sha256":c.template.sha256,
+        "token_vectors_sha256":token_vectors_sha256,"agent":l.agent,"layers":l.layers,"stages":l.stages,
+        "normalize_rows":l.normalize_rows,"configured_context":262144,"configured_output_allowance":8192,
+        "records_per_route":records,"planned_payload":planned,
+        "host_payload_cap":super::gemma_localizer::HOST_PAYLOAD_CAP,
+        "packets":files.iter().map(|(name,bytes)|serde_json::json!({"file":name,"sha256":hash(bytes)})).collect::<Vec<_>>(),
+        "packed_t2_route":"Missing: no packed-cohort stage localizer",
+        "model_loaded":false,"device_created":false,"inference_performed":false,"acquisition_attested":false,
+        "execution_approved":false,"composition_reviewed":false,"physical_admission":false,"whole_q1_qualified":false});
+    let encoded=serde_json::to_vec_pretty(&value)?;ensure!(encoded.len()<=2*1024*1024,"bounded localizer metadata");
+    files.insert(0,("localizer-prepared.json".into(),encoded));
+    Ok(LocalizerExport {files,routes:routes.len(),agent:l.agent,records})
 }
 #[test]
 #[ignore="root-supervised header/retainedJSON only; no model/device"]
@@ -158,6 +231,10 @@ fn run()->Result<()> {
             "acquisition_attested":false,"execution_approved":false,"physical_admission":false,"whole_q1_qualified":false});
         let encoded=serde_json::to_vec_pretty(&v)?;ensure!(encoded.len()<=128*1024,"bounded recipe metadata");Some(encoded)
     }else{None};
+    let localizer=match &c.localizer {
+        Some(l)=>Some(localizer_export(&c,l,&cfg,&work,source,&binary,&raw,&before,gguf.tensor_data_offset())?),
+        None=>None,
+    };
     for ((b,n),old) in bindings.iter().zip(&bound) {ensure!(acquisition::checked_file(b,*n)?==*old,"bound input changed");}
     for (b,old) in c.producer_vectors.iter().zip(&vector_raw) {ensure!(acquisition::checked_file(b,4*1024*1024)?==*old,"producer vector changed");}
     ensure!(FileIdentity::observed(&fd)?==before,"model descriptor changed during metadata read");
@@ -168,6 +245,13 @@ fn run()->Result<()> {
     if let Some(bytes)=routing_encoded {
         OpenOptions::new().create_new(true).write(true).mode(0o600).open(c.output.join("routing-recipes.json"))?.write_all(&bytes)?;
         println!("Q1_GEMMA_ROUTING_RECIPES_METADATA_PREPARED recipes=4 dataset_attested=false model=false device=false execution=false");
+    }
+    if let Some(export)=localizer {
+        for (name,bytes) in &export.files {
+            OpenOptions::new().create_new(true).write(true).mode(0o600).open(c.output.join(name))?.write_all(bytes)?;
+        }
+        println!("Q1_GEMMA_LOCALIZER_METADATA_PREPARED routes={} agent={} records_per_route={} device=false execution_approved=false",
+            export.routes,export.agent,export.records);
     }
     println!("Q1_GEMMA_ENDPOINT_METADATA_PREPARED lanes=4 tokens=144 device=false execution=false");Ok(())
 }

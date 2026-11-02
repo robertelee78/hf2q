@@ -121,3 +121,106 @@ fn metadata_routing_optin_defaults_false_and_rejects_null_or_unknown() {
     value["routing_recipes"]=serde_json::json!(false);value["routing_recipe_fallback"]=serde_json::json!(true);
     assert!(serde_json::from_value::<Config>(value).is_err());
 }
+
+fn localizer_config(localizer:Option<serde_json::Value>)->serde_json::Value {
+    let bound=serde_json::json!({"path":"/private/tmp/x","sha256":"a".repeat(64)});
+    let mut value=serde_json::json!({"model":{"path":"/private/tmp/model","retained_full_sha256":MODEL_SHA,
+        "file_identity":{"device":1,"inode":2,"bytes":3,"mtime":4,"mtime_ns":5,"ctime":6,"ctime_ns":7}},
+        "full_content_receipt":bound,"tokenizer":bound,"template":bound,"producer_metadata":bound,
+        "producer_build_receipt":bound,"producer_export_receipt":bound,"producer_config":bound,
+        "producer_vectors":[bound,bound,bound,bound],"expected_exporter_source_commit":"b".repeat(40),
+        "expected_exporter_binary_sha256":"c".repeat(64),"output":"/private/tmp/new-q1-gemma"});
+    if let Some(l)=localizer {value["localizer"]=l;}
+    value
+}
+fn two_routes(normalize_rows:bool)->serde_json::Value {
+    serde_json::json!({"agent":0,"layers":[1,6],"stages":super::super::gemma_localizer::PREFILL_STAGES,
+        "normalize_rows":normalize_rows,"routes":[{"rerun_id":"loc-r128","prefill_chunks":[128]},
+        {"rerun_id":"loc-r64","prefill_chunks":[64,64]}]})
+}
+#[test]
+fn localizer_recipe_pins_todays_stage_localizer_literal() {
+    let cfg=cfg();let r=super::super::gemma_localizer::localizer_recipe(&cfg,262144);
+    // The literal both localizer config checks used before this cutover.
+    assert_eq!(serde_json::to_value(&r).unwrap(),serde_json::json!({"family":"Gemma4","capacity":262144,"slots":4,
+        "output_allowance":8192,"cache_mode":"GemmaHybrid","route":"stage-localizer",
+        "actual_model_config_sha256":hash(format!("{:?}",&cfg).as_bytes())}));
+    for routing in [false,true] {
+        assert_ne!(acquisition::config_digest(&r).unwrap(),
+            acquisition::config_digest(&super::super::gemma_actual::selected_recipe(&cfg,routing)).unwrap());
+    }
+    let mut other=cfg.clone();other.max_position_embeddings=128;
+    assert_ne!(super::super::gemma_localizer::localizer_recipe(&other,262144).actual_model_config_sha256,
+        r.actual_model_config_sha256);
+}
+#[test]
+fn localizer_manifest_routes_freeze_identical_coordinates_within_cap() {
+    use super::super::gemma_localizer::{localizer_manifest,HOST_PAYLOAD_CAP,PREFILL_STAGES};
+    use super::super::receipt::Scalar;
+    use std::collections::BTreeSet;
+    let cfg=cfg();
+    let (t128,e128,b128)=localizer_manifest(&cfg,0,&[128],&[1,6],&PREFILL_STAGES,true).unwrap();
+    let (t64,e64,b64)=localizer_manifest(&cfg,0,&[64,64],&[6,1],&PREFILL_STAGES,true).unwrap();
+    assert_eq!(e128,e64);assert_eq!(b128,b64);assert!(b128<=HOST_PAYLOAD_CAP);
+    let set=|e:&[super::super::receipt::ExpectedTensor]|e.iter().map(|x|x.at.clone()).collect::<BTreeSet<_>>();
+    assert_eq!(set(&e128[..]),set(&e64[..]));assert_eq!(set(&e128[..]).len(),e128.len());
+    assert_eq!(e128.len(),2*14*128);
+    // Two sliding layers: 3x[16,256] + 3x[8,256] + 5x[2816] F32, 128 logits, 2x top-8.
+    assert_eq!(b128,2*128*(3*16*256*4+3*8*256*4+5*2816*4+128*4+8*4+8*4));
+    assert_eq!(b128,33_439_744);
+    assert_eq!(e128[0].at.layer,1);assert_eq!(e128[0].at.stage,Stage::Query);
+    assert_eq!(e128[0].shape,vec![1,16,256]);assert_eq!(e128[0].scalar,Scalar::F32);
+    assert_eq!(e128[1].at.logical_row_start,1);
+    let ids=e128.iter().find(|e|e.at.stage==Stage::RouterIds).unwrap();
+    assert_eq!((ids.scalar,ids.shape.clone()),(Scalar::U32,vec![1,8]));
+    assert!(e128.iter().all(|e|e.at.agent=="agent-0" && e.at.logical_step==0 && e.at.segment==0));
+    assert_eq!(t128.len(),28);assert_eq!(t64.len(),56);
+    assert_eq!(t64.iter().filter(|t|t.source_step==64).count(),28);
+    for t in t128.iter().chain(&t64) {
+        assert_eq!(t.source_stage,t.target.at.stage);assert_eq!(t.source_layer,t.target.at.layer);
+        assert_eq!(t.target.at.logical_row_start,t.source_step);assert_eq!(t.target.at.logical_step,0);
+        assert!(t.target.normalize_rows);
+    }
+    // Global layer geometry (layer 5: 2 KV heads x 512).
+    let (_,full,_)=localizer_manifest(&cfg,2,&[128],&[5],&[Stage::Key],true).unwrap();
+    assert_eq!(full[0].shape,vec![1,2,512]);assert_eq!(full[0].at.agent,"agent-2");
+    // Unnormalized captures are per chunk, so routes do not share coordinates.
+    let (_,raw128,_)=localizer_manifest(&cfg,0,&[128],&[1],&[Stage::Key],false).unwrap();
+    let (_,raw64,_)=localizer_manifest(&cfg,0,&[64,64],&[1],&[Stage::Key],false).unwrap();
+    assert_eq!(raw128[0].shape,vec![128,8,256]);assert_eq!(raw64.len(),2);assert_ne!(raw128,raw64);
+}
+#[test]
+fn localizer_manifest_refuses_unbound_scope() {
+    use super::super::gemma_localizer::{localizer_manifest,PREFILL_STAGES};
+    let cfg=cfg();
+    assert!(localizer_manifest(&cfg,4,&[128],&[1],&PREFILL_STAGES,true).is_err());
+    assert!(localizer_manifest(&cfg,0,&[64,63],&[1],&PREFILL_STAGES,true).is_err());
+    assert!(localizer_manifest(&cfg,0,&[128],&[],&PREFILL_STAGES,true).is_err());
+    assert!(localizer_manifest(&cfg,0,&[128],&[30],&PREFILL_STAGES,true).is_err());
+    assert!(localizer_manifest(&cfg,0,&[128],&[1,1],&PREFILL_STAGES,true).is_err());
+    assert!(localizer_manifest(&cfg,0,&[128],&[1],&[],true).is_err());
+    assert!(localizer_manifest(&cfg,0,&[128],&[1],&[Stage::Norm],true).is_err());
+    assert!(localizer_manifest(&cfg,0,&[128],&[1],&[Stage::Key,Stage::Key],true).is_err());
+    // A 16 MiB F32 hidden row x 5 roles x 128 rows exceeds the 1 GiB host cap.
+    let mut wide=cfg;wide.hidden_size=1<<22;
+    assert!(localizer_manifest(&wide,0,&[128],&[1],&PREFILL_STAGES,true).is_err());
+}
+#[test]
+fn localizer_prep_config_is_optional_closed_and_route_invariant() {
+    assert!(serde_json::from_value::<Config>(localizer_config(None)).unwrap().localizer.is_none());
+    let c:Config=serde_json::from_value(localizer_config(Some(two_routes(true)))).unwrap();
+    let l=c.localizer.as_ref().unwrap();
+    let routes=localizer_routes(&cfg(),l).unwrap();
+    assert_eq!(routes.iter().map(|(r,_)|r.rerun_id.as_str()).collect::<Vec<_>>(),vec!["loc-r128","loc-r64"]);
+    assert_eq!(routes[0].1.1,routes[1].1.1);assert_eq!(routes[0].1.2,routes[1].1.2);
+    let mut unknown=two_routes(true);unknown["warm_live_kernel"]=serde_json::json!("VecHybrid");
+    assert!(serde_json::from_value::<Config>(localizer_config(Some(unknown))).is_err());
+    let raw:Config=serde_json::from_value(localizer_config(Some(two_routes(false)))).unwrap();
+    assert!(localizer_routes(&cfg(),raw.localizer.as_ref().unwrap()).is_err());
+    let mut duplicate=two_routes(true);duplicate["routes"][1]["rerun_id"]=serde_json::json!("loc-r128");
+    let duplicate:Config=serde_json::from_value(localizer_config(Some(duplicate))).unwrap();
+    assert!(localizer_routes(&cfg(),duplicate.localizer.as_ref().unwrap()).is_err());
+    let mut unsafe_id=two_routes(true);unsafe_id["routes"][0]["rerun_id"]=serde_json::json!("../x");
+    let unsafe_id:Config=serde_json::from_value(localizer_config(Some(unsafe_id))).unwrap();
+    assert!(localizer_routes(&cfg(),unsafe_id.localizer.as_ref().unwrap()).is_err());
+}

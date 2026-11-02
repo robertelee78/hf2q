@@ -25,6 +25,24 @@ pub(crate) struct Evidence {
     recovered_cursor:usize,retained_tokens:usize,real_receiver_closed_after_checked_advance:bool,
     scheduler_in_flight_after:u32,supervisor_healthy:bool,
 }
+/// A fresh scheduler mints slot ids in order and honours a preferred id only
+/// when it is recycled or the next fresh id: mint and return the lower ids, then
+/// admit the frozen prompt on the lane's own slot.
+fn admit_lane(scheduler:&mut InflightBatchedScheduler,slot:SlotId)->Result<SlotHandle> {
+    for _ in 0..slot.0 {
+        let minted=scheduler.admit(AdmitRequest {prompt_tokens:1,max_tokens:1,
+            kv_bytes_needed:0,prompt_kv_bytes:0,preferred_slot:None})
+            .map_err(|e|anyhow::anyhow!("Gemma Q1 lower-slot mint refused: {e:?}"))?;
+        scheduler.release(minted.handle.context("Gemma Q1 lower-slot mint queued")?);
+    }
+    let admitted=scheduler.admit(AdmitRequest {prompt_tokens:128,max_tokens:8192,
+        kv_bytes_needed:0,prompt_kv_bytes:0,preferred_slot:Some(slot)})
+        .map_err(|e|anyhow::anyhow!("Gemma Q1 admission refused: {e:?}"))?;
+    let handle=admitted.handle.context("Gemma Q1 unexpectedly queued")?;
+    anyhow::ensure!(handle.slot_id==slot && scheduler.stats().in_flight_slots==1,
+        "actual Gemma preferred slot mismatch");
+    Ok(handle)
+}
 pub(crate) fn run_loaded(model:&mut GemmaLoadedModel,lane:usize,prompt:&[u32],
     mut observe:impl FnMut(bool,&[crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers])->Result<()>)
     ->Result<Evidence> {
@@ -37,11 +55,7 @@ pub(crate) fn run_loaded(model:&mut GemmaLoadedModel,lane:usize,prompt:&[u32],
         stable_prompt_prefix_tokens:Some(64),..SamplingParams::default()};
     let state=Gemma4PrefillState::new(slot,prompt.to_vec(),Vec::new(),params,0,None,Some(64))?;
     let mut scheduler=InflightBatchedScheduler::new(4,4);
-    let admitted=scheduler.admit(AdmitRequest {prompt_tokens:128,max_tokens:8192,
-        kv_bytes_needed:0,prompt_kv_bytes:0,preferred_slot:Some(slot)})
-        .map_err(|e|anyhow::anyhow!("Gemma Q1 admission refused: {e:?}"))?;
-    let handle=admitted.handle.context("Gemma Q1 unexpectedly queued")?;
-    anyhow::ensure!(handle.slot_id==slot,"actual Gemma preferred slot mismatch");
+    let handle=admit_lane(&mut scheduler,slot)?;
     let (send,receive)=oneshot::channel();
     let mut slots:Vec<Option<Gemma4Slot>>=(0..4).map(|_|None).collect();
     slots[lane]=Some((Gemma4SlotWork::Prefill(state),SlotReply::Unary(send),handle));

@@ -26,3 +26,12 @@ fn gemma_cancel_hook_drop_disarms_and_rejects_nested_owner() {
     after_actual_advance(true,h,Some(128)).unwrap();
     assert!(!called.get());
 }
+#[test]
+fn gemma_cancel_admits_every_lane_on_its_own_slot_with_one_in_flight() {
+    for lane in 0..4u32 {
+        let mut scheduler=InflightBatchedScheduler::new(4,4);
+        let handle=admit_lane(&mut scheduler,SlotId(lane)).unwrap();
+        assert_eq!(handle.slot_id,SlotId(lane));
+        assert_eq!(scheduler.stats().in_flight_slots,1);
+    }
+}
