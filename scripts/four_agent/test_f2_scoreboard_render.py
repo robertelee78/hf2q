@@ -104,7 +104,7 @@ class Labels(unittest.TestCase):
     def test_descriptive_win_never_rendered_as_qualified(self):
         m = manifest(runs("c", "makespan_s", "candidate", [100.0, 101.0]) + runs("b", "makespan_s", "hf2q_current", [120.0, 121.0]))
         text = r.render(m, [], "0" * 64)
-        self.assertIn("None yet: no F2 primary Qualified win exists.", section(text, "### Qualified wins"))
+        self.assertIn("None yet: no fixed-six F2 primary Qualified win exists (successor scope).", section(text, "### Qualified wins"))
         self.assertIn("Win [D]", section(text, "### Descriptive wins"))
 
     def test_one_descriptive_row_makes_comparison_descriptive(self):
