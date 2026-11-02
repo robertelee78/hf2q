@@ -149,7 +149,7 @@ fn localizer_recipe_pins_todays_stage_localizer_literal() {
         assert_ne!(acquisition::config_digest(&r).unwrap(),
             acquisition::config_digest(&super::super::gemma_actual::selected_recipe(&cfg,routing)).unwrap());
     }
-    let mut other=cfg();other.max_position_embeddings=128;
+    let mut other=cfg.clone();other.max_position_embeddings=128;
     assert_ne!(super::super::gemma_localizer::localizer_recipe(&other,262144).actual_model_config_sha256,
         r.actual_model_config_sha256);
 }
