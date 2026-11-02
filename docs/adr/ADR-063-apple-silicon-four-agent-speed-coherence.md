@@ -875,7 +875,8 @@ This decision establishes no speed win by itself.
 The "Q3 verdicts of record" tier of `docs/research/adr063-f2-scoreboard.md`
 now carries one reviewed record per family, rendered with `--verify` from
 `docs/research/adr063-f2-scoreboard-rows.json`. Every quality gate of record
-is `Pass` (all six `quality-gate-v1` manifests and patch reviews). The
+is `Pass` (all six `quality-gate-v1` manifests and patch reviews; Qwen3.6
+declares none). The
 reviews' scoreboard sentences and disclosures are in the tier's "Family
 notes". Per family:
 
@@ -888,7 +889,8 @@ notes". Per family:
   after a width-only halt at the peer warmup.
 - **DeepSeek-V4 Flash (Q3 v7, hf2q 38485a23): Unavailable.** The same-GGUF
   peer runs out of memory (prior evidence). Against stock, hf2q finishes 24.7%
-  sooner (CI 23.8–25.6%, 5 blocks), with byte-identical final sources in both
+  sooner (CI 23.8–25.6%, 5 blocks), shown in the tier as a Win against
+  v0.1.28, with byte-identical final sources in both
   arms; the SSE fairness check is not measurable, and n1 is neutral. On
   different artifacts, hf2q 38485a23 finishes 5.2% sooner than ds4 c97964b
   (CI 3.0–7.4%; task makespan only, with the disclosed parity gaps; never a
@@ -904,8 +906,9 @@ notes". Per family:
   (CI 10.6–16.2%; 20-block cap, vs-peer precision not met). Every mixed stage
   is unmeasured (structural stock-warmup halts in v7, v8 and v9).
 
-Two verdicts on the board are recomputed copies, because the frozen campaign
-files are read-only. Each is under `$E/f2-assembly/`, beside a byte-identical
+Two verdicts on the board are recomputed copies, because the reviews cite the
+frozen verdict files by hash (`748f6507…` for the Qwen3.8 controls,
+`a1caf7d4…` for native ds4), so those files stay unchanged. Each copy is under `$E/f2-assembly/`, beside a byte-identical
 copy of its `campaign.json`. `deepseek4-native-ds4/verdict.json` carries the
 native statement labelled hf2q 38485a23 (the frozen v8 file says "main HEAD").
 `qwen38-controls/verdict.json` binds both Qwen3.8 quality-gate manifests and

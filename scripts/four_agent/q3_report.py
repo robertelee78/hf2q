@@ -365,8 +365,8 @@ def peer_sentence(stage, report, root, experiment):
     ttft = (report["secondary"].get("worst_slot_ttft_p95_s") or {}).get("vs_peer") or {}
     if ttft.get("ratio") is not None:
         text += (f" hf2q's worst-slot p95 TTFT was {ttft['ratio']:.2f}× the peer's "
-                 f"({arms['experiment']['worst_slot_ttft_p95_median_s']:.3g} s vs "
-                 f"{arms['peer']['worst_slot_ttft_p95_median_s']:.3g} s; "
+                 f"({arms['experiment']['worst_slot_ttft_p95_median_s']:#.3g} s vs "
+                 f"{arms['peer']['worst_slot_ttft_p95_median_s']:#.3g} s; "
                  f"CI {ttft['ratio_ci95'][0]:.2f}–{ttft['ratio_ci95'][1]:.2f}×).")
     return text
 
