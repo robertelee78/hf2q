@@ -33,7 +33,7 @@ def bindings(cases, first="t0"):
 
 
 LOCALIZER_CASE = {
-    "kind": "localizer", "out": "/x/loc", "packet": {}, "operating_review": {},
+    "kind": "localizer", "out": "/x/loc", "packet": {},
     "filter": "adr063_invariance::gemma_localizer::q1_gemma_actual_stage_localizer",
     "packet_env": "HF2Q_Q1_GEMMA_LOCALIZER_PACKET",
     "completion_marker": "Q1_GEMMA_ACTUAL_STAGE_LOCALIZER_COMPLETE", "marker_stream": "stderr",
@@ -93,7 +93,9 @@ class CasePlan(unittest.TestCase):
                     {**LOCALIZER_CASE, "marker_stream": "../receipt.json"},
                     {**LOCALIZER_CASE, "completion_marker": ""},
                     {k: v for k, v in LOCALIZER_CASE.items() if k != "filter"},
-                    {**LOCALIZER_CASE, "kind": "other"}):
+                    {**LOCALIZER_CASE, "kind": "other"},
+                    # Pinning the operating review in the bindings is a hash cycle: it is a launch argument.
+                    {**LOCALIZER_CASE, "operating_review": {"path": "/x/review.json", "sha256": "0" * 64}}):
             with self.assertRaises(ValueError):
                 s.case_plan(bindings({"t0": {"trajectory": "T0ColdSerial"}, "loc": bad}), "loc")
 
