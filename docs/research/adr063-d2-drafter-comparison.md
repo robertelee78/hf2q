@@ -2,7 +2,7 @@
 
 Date: 2026-11-02. Host: M5 Max 128 GB (`runs-v2/host-sysctl.txt`). Status: primary,
 abliterated (A) and qualification complete; non-repetitive code (N) being
-rerun (see §6); long context (LC) pass 1 complete, pass 2 pending (see §7).
+rerun (see §6); long context (LC) complete (see §7).
 
 `$E` = `/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023`;
 `$D2` = `$E/d2-v1`. Every path below is relative to `$D2` unless absolute. The
@@ -26,8 +26,10 @@ as-is either; it is the strongest observation for successor MTP work.**
   completes 4/4 tasks with passing final tests in 3/3 runs, but its median
   makespan is 90.7 s vs H1 82.3 s, so it ranks below H1 in the primary group
   (§4). On the peer (P2) it corrupts output at four slots and is negative in
-  qualification (§3). In LC pass 1 it is the slowest passing arm (1034.5 s vs H1
-  595.5 s; §7).
+  qualification (§3). At long context it passed one of two runs (1034.5 s vs
+  H1's 594.8 s median, the slowest passing LC run) and Q5 stopped the other on
+  the free+cached floor (`free_cached_floor`) with 2 of 4 agents complete
+  (§7).
 - **DSpark** (Red Hat speculators): in the primary group P3 is arm-negative
   (one agent broke the six-step workflow; 0/4 completion; dropped from later
   passes per the pre-registered rule; §4, §8). Its only primary-workload pass,
@@ -45,7 +47,7 @@ as-is either; it is the strongest observation for successor MTP work.**
   pass 1, Q5 stopped it with `Stopped: swap_growth` (swap grew 1,224,338,309 B,
   about 1.22 GB, over baseline against a 0.5 GiB tolerance;
   `long-context-runs/passes/04-LC-P1-20261102T104157Z/receipt.json`
-  `.verdict`), so it fails the memory tier in LC and is dropped from pass 2.
+  `.verdict`), so it fails the memory tier in LC and was dropped from pass 2.
   The memory veto means P1 is not successor scope as-is. It is the strongest
   observation for successor work on hf2q's MTP path at N4: what the peer's MTP
   achieves at four slots that hf2q's `auto` does not, with memory as the
@@ -289,19 +291,28 @@ veto on an arm that already ranks above H1 in the primary group; neither
 DFlash2 (T2) nor DSpark (P3) does. N matters only for P1, which already fails
 the memory tier in LC (§7).
 
-## 7. Long context (LC) — pass 1 complete, pass 2 pending
+## 7. Long context (LC)
 
 `long-context-v1`: canonical parse_port task plus a 150 KB read-only Rust
 module; from turn 2 every request carries about 40k wire-estimated tokens
 (measured max prompt 41,732–42,168 tokens). Arms H1 H0 P0 P1 T2 (P3, T0
 omitted: README v3). One H1 fit run, then two passes `H1 H0 P0 P1 T2 | T2 P1 P0
-H0 H1` into `long-context-runs/passes/` (`long-context-runs/summary.tsv`).
+H0 H1` into `long-context-runs/passes/`. `run_long_context.sh` exited 0;
+`long-context-runs/summary.tsv` sha256 `d4f0bae6…fe48`.
 
 Fit run `long-context-runs/fit/00-LC-H1-20261102T100038Z`: CalibrationPass, 4/4,
-4/4, makespan 635.9 s, headroom 23.82 GB (not pooled).
+4/4, makespan 635.9 s, headroom 23.82 GB. It is not pooled.
 
-Pass 1 (`extract.py table long-context-runs/passes`, runs 01–05, as of
-2026-11-02 ~11:10Z):
+Command (passes only):
+
+```sh
+python3 -B $D2/extract.py table $D2/long-context-runs/passes \
+    --json $D2/long-context-runs/passes/d2-extract.json \
+    --md $D2/long-context-runs/passes/d2-extract.md
+```
+
+Per run (`long-context-runs/passes/d2-extract.md`, sha256 `23c3397f…a281`;
+cached/uncached prompt tokens from the per-run lines in `run_long_context.log`):
 
 | Run | Arm | Q5 | Completion | Quality | Makespan s | Headroom GB | Peak GB | Acc/draft | Emitted/verify step | Tok/decode-s | Cached / uncached prompt tokens |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -310,32 +321,52 @@ Pass 1 (`extract.py table long-context-runs/passes`, runs 01–05, as of
 | `03-LC-P0-20261102T103122Z` | P0 | CalibrationPass | 4/4 | 4/4 | 621.3 | 0.58 | 107.90 | – | 1.00 | 5.23 | 627,860 / 205,959 |
 | `04-LC-P1-20261102T104157Z` | P1 | **Stopped: swap_growth** | 0/4 | 1/4 | – | 0.33 | 112.62 | 0.85 | 3.53 | 6.56 | 254,161 / 161,573 |
 | `05-LC-T2-20261102T104912Z` | T2 | CalibrationPass | 4/4 | 4/4 | 1034.5 | 3.41 | 96.67 | 0.42 | 5.66 | 40.49 | 165,301 / 665,227 |
+| `06-LC-T2-20261102T110640Z` | T2 | **Stopped: free_cached_floor** | 2/4 | 4/4 | – | −0.37 | 96.62 | 0.43 | 5.55 | 36.06 | 165,326 / 581,181 |
+| (07 LC-P1) | P1 | skipped (dropped after run 04) | | | | | | | | | |
+| `08-LC-P0-20261102T112225Z` | P0 | CalibrationPass | 4/4 | 4/4 | 527.7 | 5.74 | 105.32 | – | 1.00 | 6.34 | 669,684 / 164,135 |
+| `09-LC-H0-20261102T113126Z` | H0 | CalibrationPass | 4/4 | 4/4 | 577.5 | 49.04 | 57.17 | – | – | 9.42 | 660,777 / 167,588 |
+| `10-LC-H1-20261102T114114Z` | H1 | CalibrationPass | 4/4 | 4/4 | 594.0 | 44.53 | 62.07 | 0.67 | 3.00 | 9.21 | 660,884 / 167,606 |
 
-(cached/uncached prompt tokens from the per-run lines in `run_long_context.log`.)
-LC-P1's Q5 receipt (`long-context-runs/passes/04-LC-P1-20261102T104157Z/receipt.json`)
-has verdict `Stopped`, reason `swap_growth`: swap used grew 1,224,338,309 B
-over the 1,786,773,504 B baseline, against a 536,870,912 B tolerance. Footprint
-at the stop was 112.62 GB. `run_long_context.log` records it as `arm-negative`
-and drops P1 from pass 2 (the log's `memory-refused` label is the run script's
-class for any Q5 memory stop). T2 decodes fastest per request but prefills
-about 4× more uncached tokens than the hf2q/peer arms, which is consistent with
-its 1034.5 s makespan and with its prompt cache being disabled in the primary
-audit (§4) [INFERENCE: the LC-T2 audit has not been run yet].
+Per arm (same file):
 
-Pass-1 order (completion, quality, memory, makespan): **H0 > H1 > P0 > T2 >
-P1**; T2 ranks below H1.
+| Arm | Runs | Q5 pass | Completion | Quality | Worst headroom GB | Median peak GB | Median makespan s | Acc/draft | Acc/verify step | Tok/decode-s | Tok/makespan-s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| H0 | 2 | 2 | 1.00 | 1.00 | 38.21 | 57.22 | 581.0 | – | – | 8.96 | 10.60 |
+| H1 | 2 | 2 | 1.00 | 1.00 | 32.76 | 62.06 | 594.8 | 0.64 | 1.92 | 9.15 | 10.31 |
+| P0 | 2 | 2 | 1.00 | 1.00 | 0.58 | 106.61 | 574.5 | – | – | 5.78 | 13.88 |
+| P1 | 1 | 0 | 0.00 | 0.25 | 0.33 | 112.62 | – | 0.85 | 2.53 | 6.56 | – |
+| T2 | 2 | 1 | 0.75 | 1.00 | −0.37 | 96.64 | 1034.5 | 0.42 | 4.61 | 38.28 | 6.56 |
 
-<!-- TODO(LC): when long-context-runs/summary.tsv shows pass 2 finished
-(runs 06-LC-T2 … 10-LC-H1), replace the pass-1 table with the per-arm aggregate
-from the passes only (the fit run must not be pooled):
+**LC order** (`extract.py`; completion, quality, memory tier, median makespan):
+**P0 > H0 > H1 > T2 > P1.** P0 and H0 rank above H1; T2 and P1 rank below.
 
-  python3 -B $D2/extract.py table $D2/long-context-runs/passes \
-      --json $D2/long-context-runs/passes/d2-extract.json \
-      --md $D2/long-context-runs/passes/d2-extract.md
-  (cd /opt/hf2q-worktrees/run-harness-d60d38de && \
-   python3 -B scripts/four_agent/native_peer_tensorfold_audit.py <LC-T2 runs>)
+- **P1:** `Stopped: swap_growth` in pass 1
+  (`04-LC-P1-*/receipt.json` `.verdict`: swap used grew 1,224,338,309 B over the
+  1,786,773,504 B baseline, against a 536,870,912 B tolerance; footprint at
+  the stop 112.62 GB). `run_long_context.log` records it `arm-negative` and
+  dropped it from later passes, so run 07 was skipped. The log's
+  `memory-refused` label is the run script's class for any Q5 memory stop.
+- **T2:** passed pass 1 (1034.5 s, the slowest passing LC run). In pass 2,
+  run 06 was `Stopped: free_cached_floor`: free+cached 22,040,772,608 B fell
+  below the effective floor of 22,406,972,704 B (`06-LC-T2-*/receipt.json`),
+  with 2 of 4 agents complete. It is `arm-negative` per `run_long_context.log`.
+  So DFlash2 fails both completion and the memory tier at long context.
+- **TensorFold audit** (`native_peer_tensorfold_audit.py`, runner d60d38de,
+  output `long-context-runs/passes/tensorfold-audit.json`, sha256
+  `19705c78…4281`):
+  - run 05: `serialized or slot-capped service: observed co-progress width
+    3 < 4`;
+  - run 06: `client did not claim four-agent success`;
+  - prompt cache disabled in both (auto budget 0.0 GiB).
 
-and restate the LC order. -->
+  T2 prefills about 4× more uncached tokens than the hf2q/peer arms (581k–665k
+  vs 164k–206k), consistent with the disabled prompt cache and with its makespan.
+- **P0 above H1** (574.5 vs 594.8 s median; per run 621.3 and 527.7) is a
+  baseline-vs-baseline comparison, not a drafter result. P0 passes the Q5 tier
+  with 0.58 GB worst headroom. It is recorded as a long-context observation
+  for hf2q prefill/decode work.
+- **H1 vs H0:** H1 is again not faster than H0 (594.8 vs 581.0 s); MTP drafts
+  stay rare (87 and 111 drafted per run).
 
 ## 8. Unavailable and negative arms
 
@@ -347,6 +378,7 @@ and restate the LC order. -->
 | T0/T2, group A | unavailable | no MLX checkpoint of the abliterated target | README v2 |
 | N1-P0 … N2-H1 (12 runs) | no data yet; being rerun | N1-P0 refused by Q5 quiet-host preflight (transient `cargo test --no-run` build); the 11 after it were not attempted | §6 |
 | LC-P1 | arm-negative | Q5 `Stopped: swap_growth` (swap +1.22 GB over baseline; 0.33 GB headroom) | §7 |
+| LC-T2 | arm-negative after run 06 (pass 2) | Q5 `Stopped: free_cached_floor` (free+cached 0.37 GB below the effective floor), 2/4 agents complete | §7 |
 | LC-P3, LC-T0 | not run (by design) | P3 already below H1 on completion; T0 is not a candidate | README v3 |
 
 The P3 and T0 primary failures are task failures (an agent violated the

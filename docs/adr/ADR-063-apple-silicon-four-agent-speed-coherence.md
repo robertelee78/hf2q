@@ -378,9 +378,11 @@ baseline). That memory veto means it is not successor scope as-is; it is the
 strongest observation for successor MTP work. The TensorFold target tokenizer
 differs from the base one hf2q serves (same vocab and merges; different
 pre-tokenizer regex and offset/decoder options), so the T arms are near-exact
-target matches. The non-repetitive code runs are being rerun (12 of 14 have no
-data yet) and the long-context second pass is pending; neither can make
-DFlash2 or DSpark successor scope.
+target matches. Long context (2 passes, about 40k-token prompts): the order is
+P0 574.5 s, H0 581.0 s, H1 594.8 s, then T2 (one pass at 1034.5 s, one Q5
+`Stopped: free_cached_floor`) and P1 (`Stopped: swap_growth`). The
+non-repetitive code runs are being rerun (12 of 14 have no data yet); they
+cannot make DFlash2 or DSpark successor scope.
 
 ## K. Apple Silicon kernels and ownership
 
