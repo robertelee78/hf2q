@@ -310,7 +310,7 @@ Two cases launch TensorFold (`/opt/TensorFold` at `1157ea5b`, version 1.2.0) on 
 
   Drafted output must equal the plain decode on this engine (`README.md:203-207`), so final sources may legitimately match.
 
-  For D2's long-context requirement, run the same comparison on the [long-context workload](#long-context-workload-adr-063-d2-365) (T0 and T2 cases derived with `coding_long_context.py derive-case`); both D2 records must then show the same `workload.variant`.
+  For D2's long-context requirement, run the same comparison on the [long-context workload](#long-context-workload-adr-063-d2-365), with T0 and T2 cases derived by `coding_long_context.py derive-case`. The D2 command refuses runs whose `workload.variant` differs.
 
 ```sh
 TF=/opt/TensorFold/zig-out/native/bin/tensorfold-native
@@ -550,6 +550,8 @@ D2's acceptance includes long contexts, and the canonical client tops out near 2
 - **Determinism.** `coding_long_context.render()` builds the fixture from its `SCHEMA` table. `FIXTURE_SHA256` pins the committed bytes, and the client refuses drift. To change the fixture, define a new variant id; never re-pin `long-context-v1`.
 - **Binding.** The coordinator approval must carry `workload_variant` (equal to `--workload`) and `workload_fixture_sha256`. Its `sources` must also cover `coding_long_context.py` and `test_coding_long_context.py`. A canonical approval that carries either key is refused. The coordinator and every agent summary record `workload_variant: {id, fixture_sha256}`. Aggregation, and therefore `q2_run_audit.py`, refuses an agent from another workload, and the D2 record prints `workload: {id, variant}`.
 - **Composition.** `--workload` is N4-only and cannot be combined with `--instance` or `--benchmark-profile`. `--phase-plan` is allowed, so `q3_campaign.py` can derive its controls from a long-context case.
+- **Campaigns.** `q3_campaign.py` refuses a plan unless every arm's client `--workload` equals that arm's approval `workload_variant` and all arms select the same variant (or all run the canonical files). `quality_campaign.py` refuses a case that already selects a variant. `native_peer_tensorfold_audit.py` refuses D2 runs with different `workload.variant`.
+- **Scope.** The fixture covers D2's *long contexts* only. It is generated from one template per setting, so it is deliberately repetitive code: it is not evidence for D2's *nonrepetitive code* item, which needs its own workload.
 - **Prompt growth.** `python3 coding_long_context.py estimate` builds the seven actual requests of one agent offline: the real file contents, a canonical fix and about 1 KiB of reasoning per reply. It reports wire bytes / 4 per turn:
 
   | Turn | 0 | 1 | 2 | 3 | 4 | 5 | 6 |

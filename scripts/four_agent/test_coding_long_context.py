@@ -257,5 +257,101 @@ class Cases(unittest.TestCase):
         self.assertTrue(re.fullmatch(r"[a-z0-9-]+", lc.derive_case(case)["workload"]["id"]))
 
 
+class Campaigns(unittest.TestCase):
+    """Every campaign driver keeps workload selection explicit and equal across the compared runs."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "nc.json").write_text("{}")
+
+    def q3_plan(self, *cases):
+        import q3_campaign as q3
+        args = q3.parse_args(["--family", "qwen38", "--stock-bin", "/bin/stock", "--stock-commit", "1" * 40,
+                              "--experiment-bin", "/bin/experiment", "--experiment-commit", "2" * 40,
+                              "--qe-identity", "qe-test", "--negative-control-receipt", str(self.root / "nc.json"),
+                              "--workloads", "n4", "--output", str(self.root / "q3"), *cases])
+        return q3.build_plan(args, {}, "qwen38")
+
+    def test_q3_arms_must_run_the_same_workload_variant(self):
+        import quality_campaign as qc
+        hf2q, peer = HERE / "q5_cases" / "qwen38-long-context.json", HERE / "q5_cases" / "peer-qwen38-long-context.json"
+        plan, cases = self.q3_plan("--hf2q-case", str(hf2q), "--peer-case", str(peer))
+        self.assertEqual({lc.case_selection(case) for case in cases.values()}, {(lc.ID, lc.ID)})
+        self.assertEqual(set(plan["arms"]), {"stock", "experiment", "peer"})
+        for extra in (("--hf2q-case", str(hf2q)), ("--peer-case", str(peer))):  # the other arm stays canonical
+            with self.subTest(extra=extra), self.assertRaisesRegex(qc.CampaignError, "same workload variant"):
+                self.q3_plan(*extra)
+        unbound = json.loads(hf2q.read_text())
+        unbound["client"]["approval"]["set"].pop("workload_variant")  # --workload without its approval key
+        path = self.root / "unbound.json"
+        path.write_text(json.dumps(unbound))
+        with self.assertRaisesRegex(qc.CampaignError, "same workload variant"):
+            self.q3_plan("--hf2q-case", str(path), "--peer-case", str(peer))
+
+    def test_d2_records_refuse_runs_on_different_workloads(self):
+        from unittest import mock
+        import native_peer_tensorfold_audit as tfa
+        variant = lc.select(lc.ID).record()
+        records = {"t0": {"run": "t0", "workload": {"id": "a", "variant": variant}},
+                   "t2": {"run": "t2", "workload": {"id": "b", "variant": variant}},
+                   "c2": {"run": "c2", "workload": {"id": "c", "variant": None}}}
+        with mock.patch.object(tfa, "d2_record", lambda path: records[path]):
+            self.assertEqual(tfa.d2_records(["t0", "t2"]), [records["t0"], records["t2"]])
+            for runs in (["t0", "c2"], ["c2", "t2"]):
+                with self.subTest(runs=runs), self.assertRaisesRegex(Invalid, "different workload variants"):
+                    tfa.d2_records(runs)
+
+    def test_quality_campaign_refuses_workload_variant_cases(self):
+        import quality_campaign as qc
+        case = q5_case.loads((HERE / "q5_cases" / "qwen38.json").read_bytes())
+        self.assertEqual(qc.derive_case(case, 3)["client"]["argv"][-2:], ["--instance", "3"])
+        derived = q5_case.loads((HERE / "q5_cases" / "qwen38-long-context.json").read_bytes())
+        unflagged = json.loads(json.dumps(derived))
+        unflagged["client"]["argv"] = case["client"]["argv"]  # approval keys alone also refuse
+        for bad in (derived, unflagged):
+            with self.subTest(argv=bad["client"]["argv"][-2:]), self.assertRaises(qc.CampaignError):
+                qc.derive_case(bad, 3)
+
+
+class AgentApproval(unittest.TestCase):
+    """qwen38_n1_smoke.approval refuses a variant outside the canonical four-agent task before any later check."""
+
+    def args(self, packet_value, **changes):
+        import argparse
+        from qwen38_n1_process import digest as file_digest
+        handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(packet_value, handle)
+        handle.close()
+        self.addCleanup(Path(handle.name).unlink)
+        values = dict(approval=handle.name, approval_sha256=file_digest(handle.name), diagnostic_slots=4,
+                      agent_id="agent-0", run_id=RUN, server_pid=1, barrier_dir="/private/b",
+                      barrier_token="a" * 32, output="/private/o", family="qwen", engine_kind="hf2q",
+                      benchmark_profile=None, instance=None, workload=lc.ID, base_url="http://127.0.0.1:9/v1",
+                      model="Qwen3.8 27B")
+        values.update(changes)
+        return argparse.Namespace(**values)
+
+    def test_one_agent_runs_refuse_a_variant(self):
+        from qwen38_n1_smoke import approval
+        with self.assertRaisesRegex(Invalid, "^workload variants are four-agent only$"):
+            approval(self.args({}, diagnostic_slots=1))
+
+    def test_a_variant_refuses_a_task_instance_or_benchmark_profile(self):
+        import coding_instances
+        from qwen38_n1_smoke import approval
+        variant, instance = lc.select(lc.ID), coding_instances.select(5)
+        both = {**packet(variant), **instance.binding(),
+                "initial_identity_sha256": hashlib.sha256(identity("agent-0", RUN, 5).encode()).hexdigest()}
+        with self.assertRaisesRegex(Invalid, "^a workload variant runs the canonical task"):
+            approval(self.args(both, instance=5))
+        with self.assertRaisesRegex(Invalid, "^a workload variant runs the canonical task"):
+            approval(self.args(packet(variant), benchmark_profile="gemma-matched-v1"))
+        with self.assertRaises(Invalid) as alone:  # the variant alone passes this gate and fails later
+            approval(self.args(packet(variant)))
+        self.assertNotRegex(str(alone.exception), "workload variant")
+
+
 if __name__ == "__main__":
     unittest.main()

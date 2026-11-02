@@ -435,6 +435,14 @@ def estimate(variant=None, family="qwen"):
     return rows
 
 
+def case_selection(case):
+    """(client --workload value, approval workload_variant) of a Q5 case; (None, None) for the canonical files."""
+    argv = case["client"]["argv"]
+    flag = argv[argv.index("--workload") + 1] if "--workload" in argv[:-1] else None
+    approved = ((case["client"].get("approval") or {}).get("set") or {}).get("workload_variant")
+    return flag, approved
+
+
 def derive_case(case, name=ID):
     """A Q5 case running `case`'s server and client on this workload variant; `case` is a canonical N4 case."""
     import q5_case

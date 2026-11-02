@@ -206,5 +206,13 @@ def d2_record(run_dir):
             'tokens': metrics['tokens'], 'worst_slot_ttft_p95_s': metrics['worst_slot_ttft_p95_s']}
 
 
+def d2_records(run_dirs):
+    """D2 records of the compared runs; runs on different workload variants are not comparable and refuse."""
+    records = [d2_record(path) for path in run_dirs]
+    variants = {json.dumps(record['workload']['variant'], sort_keys=True) for record in records}
+    require(len(variants) <= 1, 'D2 runs use different workload variants: ' + ', '.join(sorted(variants)))
+    return records
+
+
 if __name__ == '__main__':
-    print(json.dumps([d2_record(path) for path in sys.argv[1:]], indent=2))
+    print(json.dumps(d2_records(sys.argv[1:]), indent=2))

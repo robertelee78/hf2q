@@ -761,8 +761,11 @@ stock DFlash2 drafter `z-lab/Qwen3.8-27B-DFlash2@50307d4c`
   pinned 150 KB read-only Rust module (`fixtures/long-context-v1.rs`) to
   `tests/ports.rs`. Turns 2–6 then carry about 40k prompt tokens (estimated as
   wire bytes / 4). Approvals and summaries bind the variant id and the fixture
-  sha256. T0 and T2 are derived with `coding_long_context.py derive-case`; see
-  `scripts/four_agent/README.md`.
+  sha256. Q3 plans and the D2 command refuse runs on different variants. T0
+  and T2 are derived with `coding_long_context.py derive-case`; see
+  `scripts/four_agent/README.md`. The fixture is templated, repetitive code, so
+  it covers long contexts only. It is not evidence for the nonrepetitive-code
+  item.
 
 **oMLX arm (operator decision 2026-10-31).** oMLX 6b413c90 (version 0.7.3rc1,
 MLX/mlx-lm continuous batching) serves three families from mlx-community 4-bit

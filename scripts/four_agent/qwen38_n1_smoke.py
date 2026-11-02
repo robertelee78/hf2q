@@ -57,6 +57,8 @@ def approval(args):
                                args.instance)
         workload = task_instance(packet, args.instance)
         variant = workload_variant(packet, args.workload)
+        require(variant is None or (workload is None and getattr(args, "benchmark_profile", None) is None),
+                "a workload variant runs the canonical task, without a benchmark profile or task instance")
     else:
         require(args.instance is None, "task instances are four-agent only")
         require(args.workload is None, "workload variants are four-agent only")
@@ -107,8 +109,6 @@ def approval(args):
         source_paths += [Path(__file__).with_name(n) for n in INSTANCE_MODULES]
     if variant is not None:
         from coding_long_context import MODULES as VARIANT_MODULES
-        require(getattr(args, "benchmark_profile", None) is None and workload is None,
-                "a workload variant runs the canonical task, without a benchmark profile or task instance")
         source_paths += [Path(__file__).with_name(n) for n in VARIANT_MODULES]
     require(packet.get("sources") == {p.name: child.digest(p) for p in source_paths}, "client source drift")
     require(packet.get("approved") is True, "explicit internal operating approval absent")
