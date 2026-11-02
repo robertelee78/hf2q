@@ -16,6 +16,7 @@ from pathlib import Path
 from f2_rows_extract import REPO, extract, number as _number, require, resolve, strict_json
 from f2_scoreboard import SCHEMA as SCOREBOARD_SCHEMA
 import f2_q3_tier as q3tier
+import f2_q3_view as q3view
 import native_peers
 
 ROWS_SCHEMA = "hf2q.f2.scoreboard-rows.v1"
@@ -81,7 +82,7 @@ def validate_manifest(m):
                 isinstance(f.get("artifact_sha256"), str) and SHA64.match(f["artifact_sha256"]), "family fields")
     for g in groups.values():
         require(g.get("family") in families and g.get("title") and g.get("workload"), "group binding")
-    q3tier.validate(groups)
+    record_refs = q3tier.validate(groups)
     ids = set()
     for row in m.get("rows", []):
         rid = row.get("id")
@@ -113,6 +114,8 @@ def validate_manifest(m):
                     f"{rid}: control_of must cite a $E/ primary of record on a Descriptive effect or a Failure row")
         if "q3_of_record" in row:
             q3tier.validate_row(row, groups)
+        else:
+            q3tier.validate_foreign(row, record_refs)
         require(type(row.get("n_slots")) is int and row["n_slots"] >= 1, f"{rid}: n_slots")
         if row["metric"] == "task_pass":
             require(float(row["value"]).is_integer() and 0 <= row["value"] <= row["n_slots"], f"{rid}: task pass count")
@@ -307,7 +310,7 @@ def render(manifest, scoreboards, manifest_sha256):
                 cols = ["—", "—", "—"]
             out.append(f"| {fams[sb['family']]['title']} | {d['status']} | {' | '.join(cols)} | `{sb['ref']}` |")
         out.append("")
-    out += q3tier.render(manifest, q3, native, BASELINE_ARMS)
+    out += q3view.render(manifest, q3, native, BASELINE_ARMS)
     qualified_wins = []
     for sb in scoreboards:
         d = sb["data"]
@@ -320,9 +323,10 @@ def render(manifest, scoreboards, manifest_sha256):
                                       f"{1 / e['geometric_ratio']:.3f}× | {e['reduction_percent']:.2f}% "
                                       f"[{e['nominal_pointwise_ci95_percent'][0]:.2f}, {e['nominal_pointwise_ci95_percent'][1]:.2f}] | `{sb['ref']}` |")
     qualified_wins += [_comp_line(c, groups, fams) for c in comps if c["verdict"] == "Win" and c["label"] == "Qualified"]
-    out += ["## Wins vs baseline", "", "### Qualified wins", ""]
+    out += ["## Wins vs baseline", "", "### Qualified wins (fixed-six; successor scope)", ""]
     out += (["| Family | Metric | Arm vs baseline | Ratio | Detail | Evidence |", "|---|---|---|---|---|---|"] + qualified_wins
-            if qualified_wins else ["None yet: no F2 primary Qualified win exists."])
+            if qualified_wins else ["None yet: no fixed-six F2 primary Qualified win exists (successor scope). Under option B, "
+                                    "F2's qualified display is the Q3 verdicts of record tier above."])
     out += ["", "### Descriptive wins (not F2 primary qualified results)", ""]
     dwins = [_comp_line(c, groups, fams) for c in comps if c["verdict"] == "Win" and c["label"] == "Descriptive"]
     dwins += [f"| {fams[r['family']]['title']} | {groups[r['group']]['title']}: {METRICS[r['metric']][0]} | "

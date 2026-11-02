@@ -280,7 +280,7 @@ def _usage(ref, kind):
     return {"kind": "json", "file": ref, "path": f"agents.*.turns.*.usage.{kind}_tokens", "reduce": "sum", "skip_null": True}
 
 
-def token_rows(manifest, root, base, status, campaign_ref):
+def token_rows(manifest, root, base, status, campaign_ref, experiment):
     """Per arm: median prompt and completion tokens and median completion tokens per makespan-second over the
     primary stage's passing runs, each re-read from the run's client/summary.json. An arm with a run that lacks
     usage gets no rows (the tier shows 'not recorded')."""
@@ -309,7 +309,7 @@ def token_rows(manifest, root, base, status, campaign_ref):
         for metric, (values, items, decimals, unit) in specs.items():
             out.append({"id": f"{base['group']}-{metric.replace('_', '-')}-{f2arm.replace('_', '-')}", **base,
                         "metric": metric, "kind": "measurement", "arm": f2arm,
-                        "variant": f"Q3 {arm}" + (f" {declared['label']}" if declared else ""),
+                        "variant": f"Q3 {arm}" + (f" {experiment}" if arm == "experiment" else f" {declared['label']}" if declared else ""),
                         "value": round(statistics.median(values), decimals), "decimals": decimals, "unit": unit,
                         "source": {"commit": declared.get("commit"), "binary_sha256": arms[arm]["binary"]["sha256"]},
                         "artifact_sha256": arms[arm]["artifact"]["sha256"], "receipt": campaign_ref, "status": status,
@@ -327,9 +327,11 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
     never a win or loss.
 
     of_record (a reviewed verdict.json of record, F2 option B): group `<family>-q3-record` carries the
-    f2_q3_tier record (verdict, campaign status and halt, quality gate per (reference, manifest) of
-    quality_gate, the review) and every row is flagged `q3_of_record`: makespan and worst-slot fairness effects
-    vs stock and peer with their half-widths, plus per-arm token volume and output-rate rows."""
+    f2_q3_tier record (verdict, campaign status, halt and stages, quality gate per (reference, manifest) of
+    quality_gate bound to the campaign's arm identities, pending patch reviews, the review). Its primary rows are
+    flagged `q3_of_record`: makespan and worst-slot fairness effects vs stock and peer with their half-widths, plus
+    per-arm token volume and output-rate rows. Its completed control stages (n1, mixed) are Descriptive rows with
+    `control_of` this verdict, rendered in the Q3 controls section."""
     campaign_dir, root = Path(campaign_dir).resolve(), Path(evidence_root).resolve()
     if not campaign_dir.is_relative_to(root):
         raise ValueError("campaign directory must be under --evidence-root to be cited as $E/...")
@@ -359,23 +361,30 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
     native_baseline = native_peers.baseline_of(native, native_label) if native_label else "peer"
     group = (f"{family}-q3-record" if of_record else (f"{family}-q3" if record is None else f"{family}-q3-controls")
              + ("" if comparison is None else f"-{native_baseline.replace('_', '-')}"))
+    declared = plan["declared"]["experiment"]
+    experiment = f"hf2q {declared['commit'][:8]}" if declared.get("commit") else declared["label"]
+    gone = f2_q3_tier.unavailable((verdict["peer"]["unavailable"] or {}).get("peer"), root)
     out = {"groups": {group: {"family": family,
                               "title": (f"{family} Q3 verdict of record" if of_record else f"{family} Q3 three-arm campaign"
                                         if record is None else f"{family} Q3 controls of the primary of record")
                                        + (f" ({comparison})" if comparison else ""),
                               "workload": "Four-agent coding client, 262144 context, 4 slots; stock "
-                                          f"{plan['declared']['stock']['label']} vs experiment "
-                                          f"{plan['declared']['experiment']['label']} vs "
-                                          f"{native_label or 'the peer'}, Williams blocks."
+                                          f"{plan['declared']['stock']['label']} vs experiment {experiment} vs "
+                                          + (native_label or ("the peer" if gone is None else f"the peer (peer unavailable: {gone})"))
+                                          + ", Williams blocks."
                                           + ("" if record is None else f" Controls (client --phase-plan) of the primary "
                                                                        f"of record {control_of}; never a win or loss.")}},
            "rows": []}
     if of_record:
         gates, review_ref = record_inputs(root, quality_gate, review)
         out["groups"][group]["q3_record"] = f2_q3_tier.build_record(verdict, manifest, root, (ref, campaign_ref), gates, review_ref)
+        control_of = ref  # the record's own completed controls (n1, mixed) render as controls of this verdict
     if record is None:
         status = F2_STATUS.get(verdict["verdict"])
         sections = [] if status is None else [("primary", None, verdict["primary"], verdict.get("native_peer"))]
+        if of_record:
+            sections += [(f"controls.{key}", key, stage, None) for key, stage in verdict["controls"].items()
+                         if stage["status"] == "Complete"]
     else:
         status = "Descriptive"  # a control of a primary of record never wins or loses (#369 amendment)
         sections = [(f"controls.{key}", key, stage, (verdict.get("native_peer") or {}).get(key))
@@ -385,15 +394,15 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
         return out
     if not arms["experiment"]["artifact"] or not arms["experiment"]["artifact"].get("sha256"):
         raise ValueError("F2 rows need the model sha256 (conversion receipt or HF2Q_Q5_MODEL_SHA256)")
-    base = {"family": family, "group": group, "n_slots": 4, "context": "262144", "date": manifest["created_utc"][:10],
-            **({"q3_of_record": True} if of_record else {})}
+    base = {"family": family, "group": group, "n_slots": 4, "context": "262144", "date": manifest["created_utc"][:10]}
     for prefix, control, stage, section_native in sections:
+        of_record_row = of_record and control is None
         peer_gone = verdict["verdict"] == "Unavailable" if control is None else bool(verdict["peer"]["unavailable"].get("peer"))
         # A campaign whose peer arm is a native engine (ds4, TensorFold) is never the verdict of record: it emits
         # only its native row(s), never experiment-vs-stock (that effect belongs to the same-GGUF campaign of record).
         contrasts = (() if native else (("vs_stock", "v0128_stock"),)) + (("vs_peer", native_baseline),)
         tables = [("makespan_s", "effects", stage["effects"])]
-        tables += [(m, f"secondary.{m}", stage["secondary"][m]) for m in f2_q3_tier.FAIRNESS] if of_record else []
+        tables += [(m, f"secondary.{m}", stage["secondary"][m]) for m in f2_q3_tier.FAIRNESS] if of_record_row else []
         for metric, where, table in tables:
             for name, baseline in contrasts:
                 e = table.get(name)
@@ -409,36 +418,37 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                           f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else peer_note}).")
                 row = {
                     "id": f"{group}-{'' if control is None else control.replace('+', 'p') + '-'}{what}-{name.replace('_', '-')}",
-                    **base,
+                    **base, **({"q3_of_record": True} if of_record_row else {}),
                     "metric": metric, "kind": "effect", "arm": "candidate",
-                    "variant": f"Q3 experiment {plan['declared']['experiment']['label']}"
+                    "variant": f"Q3 experiment {experiment}"
                                + ("" if control is None else f", control {control}")
                                + (f" ({comparison})" if comparison else ""),
                     "value": round(e["improvement_percent"], 3), "decimals": 3, "unit": "% improvement",
                     "ci95": [round(x, 3) for x in e["improvement_ci95"]], "baseline_arm": baseline,
-                    "source": {"commit": plan["declared"]["experiment"]["commit"], "binary_sha256": arms["experiment"]["binary"]["sha256"]},
-                    "artifact_sha256": arms["experiment"]["artifact"]["sha256"], "receipt": ref, "status": status,
+                    "source": {"commit": declared["commit"], "binary_sha256": arms["experiment"]["binary"]["sha256"]},
+                    "artifact_sha256": arms["experiment"]["artifact"]["sha256"], "receipt": ref,
+                    "status": status if control is None else "Descriptive",
                     "verification": {"state": "Verified", "key": f"verdict.json {path}.improvement_percent", "extract": extract},
                     "note": (f"Q3 verdict of record ({'task makespan only' if name == 'vs_peer' else 'see the tier'}); {blocks}"
-                             if of_record else (f"{comparison}. " if comparison else "")
+                             if of_record_row else (f"{comparison}. " if comparison else "")
                              + (f"Q3 verdict {verdict['verdict']}, campaign {verdict['campaign_status']}; " if control is None else
                                 f"Q3 control {control} (client --phase-plan {stage['phase_plan']}) of the primary of record "
                                 f"{control_of}; never a win or loss; ")
                              + blocks + (f" {native_note(section_native)}." if name == "vs_peer" and native_label else ""))}
-                if of_record:
-                    row["half_width_pp"] = round(e["half_width_pp"], 3)
+                if of_record_row:  # full precision: the tier renders it, --verify compares at the row's decimals
+                    row["half_width_pp"] = e["half_width_pp"]
                     extract["half_width_pp"] = {"kind": "json", "file": ref, "path": f"{path}.half_width_pp", "reduce": "one"}
                 if control is not None:
                     row["control_of"] = control_of
                 out["rows"].append(row)
-    if of_record:
-        out["rows"] += token_rows(manifest, root, base, status, campaign_ref)
+    if of_record and status is not None:
+        out["rows"] += token_rows(manifest, root, {**base, "q3_of_record": True}, status, campaign_ref, experiment)
     for key, where, entry in failed:
         path = f"{where}.metrics.tasks_passed"
         out["rows"].append({
             "id": f"{group}-{key.replace('+', 'p')}-task-pass-{entry['name']}", "family": family, "group": group,
             "metric": "task_pass", "kind": "measurement", "arm": "candidate",
-            "variant": f"Q3 experiment {plan['declared']['experiment']['label']}, control {key}"
+            "variant": f"Q3 experiment {experiment}, control {key}"
                        + (f" ({comparison})" if comparison else ""),
             "value": entry["metrics"]["tasks_passed"], "decimals": 0, "unit": "tasks",
             "n_slots": 4, "context": "262144", "date": manifest["created_utc"][:10],

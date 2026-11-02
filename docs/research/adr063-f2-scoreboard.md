@@ -19,17 +19,17 @@ Ratios are oriented so **> 1 means the first arm is better** (tok/s: arm/baselin
 
 No `hf2q.f2.fixed-six-scoreboard.v1` result has been rendered: no family has an F2 primary result yet.
 
-## Q3 verdicts of record (F2 option B; above Descriptive)
+## Q3 verdicts of record (F2's qualified display under option B; above Descriptive)
 
 How to read this tier:
 
-- **Source.** One Q3 `verdict.json` of record per family, merged with `q3_campaign.py --rows CAMPAIGN --of-record` after independent review. `--verify` re-reads every number from its receipt and re-derives the verdict, campaign status, halt and quality gate from `verdict.json`, `campaign.json` and the quality manifests.
+- **Source.** One Q3 `verdict.json` of record per family, merged with `q3_campaign.py --rows CAMPAIGN --of-record` after independent review. `--verify` re-reads every number from its receipt and re-derives the verdict, campaign status, halt, stages and quality gate from `verdict.json`, `campaign.json` and the quality manifests. Under option B this tier is F2's qualified display; the fixed-six Qualified section below is successor scope.
 - **Q3 verdict of record** is the family verdict of the predeclared Q3 rules (`docs/research/adr063-q3-campaign.md`): Win, Loss, Unavailable (no runnable same-GGUF peer) or Failed (hf2q task failure). A Q3 Win whose stock conditions or quality gate below are unmet shows as Withheld, with the reasons.
-- **Win appears only against v0.1.28 stock** (release `9a0b79c7`), and only when the makespan interval vs stock excludes a tie at half-width ≤ 2.5 points, neither stock fairness effect regresses beyond the neutral band, the primary stage reached its stopping rule with valid thermal and memory receipts, and the quality gate passed against **both** references (v0.1.28 stock and the peer; the native ds4 arm for DeepSeek-V4). Otherwise the numbers are shown with the gating reason.
+- **Win appears only against v0.1.28 stock** (release `9a0b79c7`), and only when the makespan interval vs stock excludes a tie at half-width ≤ 2.5 points, neither measurable stock fairness effect regresses beyond the neutral band, the primary stage reached its stopping rule with valid thermal and memory receipts, no final source awaits patch review, and the quality gate passed against **both** references (v0.1.28 stock, and the same-GGUF peer or, where it is unavailable, the family's native stand-in: ds4 for DeepSeek-V4). Otherwise the numbers are shown with the gating reason.
 - **Peer: task makespan only.** The sentence names whichever arm finishes sooner and computes X on the slower arm's time, X = 1 − faster/slower; it is never a win. Unavailable families show the native-engine statement (different artifact) when one exists.
-- **Fairness** is the worst-slot ratio hf2q/reference with its 95% CI; above 1 means hf2q's worst slot waits longer.
-- **Quality gate**, per reference: Pending (manifest absent or not Complete), Pass (Q1 paired verdict Pass on the experiment binary) or Fail (any other settled Q1 verdict, shown in parentheses).
-- **Campaign** status includes a halt in a later stage (for example Invalid from a mixed-stage width halt); it does not change the completed primary. Controls and native-engine rows keep their own sections below.
+- **Fairness** is the worst-slot ratio hf2q/reference with its 95% CI; above 1 means hf2q's worst slot waits longer. An SSE gap that the Q3 verdict could not estimate is not measurable (one semantic event per streamed turn) and does not gate, as in the Q3 rule. SSE gaps against the peer are not comparable (different event granularity).
+- **Quality gate**, per reference: Pending (manifest absent or still running), Halted (the campaign halted), Pass (Q1 paired verdict Pass, subject runs on the experiment binary and reference runs on that reference's binary) or Fail (any other settled Q1 verdict, shown in parentheses).
+- **Campaign** status includes a halt in a later stage (for example Invalid from a mixed-stage width halt), which does not change the completed primary, and lists which control stages were measured. Control effects of the record and native-engine rows keep their own sections below.
 
 | Family | Q3 verdict of record | Makespan vs v0.1.28 stock | Makespan vs peer (task makespan only) | Worst-slot fairness, hf2q/reference [95% CI] | Quality gate | Campaign | Reviewed verdict |
 |---|---|---|---|---|---|---|---|
@@ -42,15 +42,15 @@ Token volume and per-output-token rate (medians over the primary stage's passing
 
 None recorded.
 
-Rows of record (receipt and extraction key in the rows manifest):
+Rows of record (receipt and extraction key in the rows manifest); the record's control effects are in the Q3 controls section:
 
 None.
 
 ## Wins vs baseline
 
-### Qualified wins
+### Qualified wins (fixed-six; successor scope)
 
-None yet: no F2 primary Qualified win exists.
+None yet: no fixed-six F2 primary Qualified win exists (successor scope). Under option B, F2's qualified display is the Q3 verdicts of record tier above.
 
 ### Descriptive wins (not F2 primary qualified results)
 
