@@ -4,6 +4,7 @@ No HTTP overlap, scheduler phase, temporal verifier row or inflight heartbeat is
 promoted into physical batching or runnable-forward evidence.
 """
 from collections.abc import Iterable
+import bisect
 import json
 import f2_demand
 
@@ -256,6 +257,29 @@ def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
     if population_policy == f2_demand.POLICY:
         require(header.get("forward_demand_policy") == f2_demand.CONFIG,
                 "queued demand must be frozen in actual trace configuration")
+    def brackets(item):
+        # Joined epoch obligation: [commit end, checked return) of every command
+        # in the forward's invocation epoch; legacy reports carry only the witness CB.
+        return item.get("obligation") or [(item["end_ns"], item["checked_return_ns"])]
+    service = {}
+    if population_policy == "forward_demand_v2":
+        # Owner key -> union of its joined obligation brackets (sorted, disjoint).
+        for item in native_report["submissions"]:
+            for row in item["rows"]:
+                key = (lineage(row), row["request_id"], row["phase"] == "prefill")
+                service.setdefault(key, []).extend(map(tuple, brackets(item)))
+        for key, spans in service.items():
+            merged = []
+            for a, b in sorted(spans):
+                if merged and a <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], b)
+                else:
+                    merged.append([a, b])
+            service[key] = ([a for a, _ in merged], [b for _, b in merged])
+    def outstanding_at(slot, at):
+        starts, ends = service.get((lineage(slot), slot["request_id"], slot["phase"] == "prefill"), ((), ()))
+        i = bisect.bisect_right(starts, at) - 1
+        return i >= 0 and at < ends[i]
     def population(record, ready_only=False):
         slots = record["payload"]["slots"]
         if len(slots) != sum(composition):
@@ -274,10 +298,7 @@ def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
                 continue
             outstanding = False
             if population_policy == "forward_demand_v2" and not ready_only:
-                outstanding = any(item["end_ns"] <= record["at_ns"] < item["checked_return_ns"] and
-                    any(lineage(row) == lineage(slot) and row["request_id"] == slot["request_id"] and
-                        ((row["phase"] == "prefill") == (slot["phase"] == "prefill"))
-                        for row in item["rows"]) for item in native_report["submissions"])
+                outstanding = outstanding_at(slot, record["at_ns"])
             if ready is None and not outstanding:
                 return None
             if ready is True or outstanding:
@@ -289,7 +310,7 @@ def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
         # validated exact commit/checked-return interval for that current owner.
         boundaries = {r["at_ns"] for r in snapshots}
         boundaries.update(t for item in native_report["submissions"]
-                          for t in (item["end_ns"], item["checked_return_ns"]))
+                          for bracket in brackets(item) for t in bracket)
         original = snapshots
         snapshots = []
         cursor = 0
