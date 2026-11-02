@@ -5094,6 +5094,9 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
     // terminal commit+wait, satisfying the unretained-reference lifetime
     // contract as well.
     enc.commit_labeled("layer.full_attn.tq_bridge_dequant");
+    // Release the submitted encoder so the native observer retains this
+    // command before the dense resume's wait checks the queue.
+    drop(enc);
 
     // Dispatch the same dense resume kernel against the tight temp
     // buffers. kv_capacity = kv_seq_len so the kernel's head-stride

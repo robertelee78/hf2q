@@ -2212,6 +2212,8 @@ fn apply_output_head_gpu_greedy_legacy(
     )
     .context("dispatch_rms_norm output legacy")?;
     enc_norm.commit_labeled("output_head.norm");
+    // Release submitted encoders before the argmax wait checks the queue.
+    drop(enc_norm);
 
     let mut enc_lm = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc lm_head legacy")?;
     apply_linear_projection_f32_into_with_ggml_type(
@@ -2228,6 +2230,7 @@ fn apply_output_head_gpu_greedy_legacy(
     )
     .context("lm_head projection legacy")?;
     enc_lm.commit_labeled("output_head.lm_head_native");
+    drop(enc_lm);
 
     let mut enc_argmax = device.command_encoder().map(crate::inference::native_observation::encoder).context("enc argmax legacy")?;
     dispatch_argmax_f32(
