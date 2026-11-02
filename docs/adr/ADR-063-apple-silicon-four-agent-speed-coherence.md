@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope, F1/F3 execution entry and the separately reviewed F2/Q1/Q2/C1 source implementation entry; other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
+- **Updated:** 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
 - Stable source ID: ADR-063
@@ -819,6 +819,53 @@ tuple (`FAMILIES`, `Q3_FAMILIES`) so one arm can serve several families.
   root's decision.
 
 This decision establishes no speed win and changes no same-GGUF verdict.
+
+### F2 closure scope: option B (operator decision 2026-10-31/11-01)
+
+The operator approved option B of the F2 intent review
+(`$E/reviews/adr063-f2-intent-v1.md` §5 B) on 2026-10-31/11-01 as the closure
+scope of F2 (#357). F2 closes when the scoreboard shows, for each family, the
+items below. Each option-B item is kept, changed or waived as stated:
+
+| Option B item | Disposition |
+|---|---|
+| 1. An independently reviewed Q3 `n4` verdict | Kept: the Q3 verdict of record (Win, Loss, Unavailable or Failed) from a reviewed `verdict.json`. |
+| 2. A one-slot control stage | Kept: the record's completed `n1` control is reported as a control of that record. |
+| 3. Task quality bound to the experiment binary | Kept and widened: paired quality campaigns run on the exact Q3 experiment binary against v0.1.28 and against the peer (against the native ds4 arm for DeepSeek-V4, whose same-GGUF peer is unavailable). Each reference is bound to the campaign's arm identity: the v0.1.28 binary, the peer binary, or one native readiness identity of that engine. Final sources still pending patch review also block a Win. |
+| 4. The Q2 run audit's co-progress width of 4 for every passing run | Kept: every counted run passes the v3 width audit (the Q3 Pass rule). A width failure makes the run `Invalid`, which stands. |
+| 5. Worst-slot TTFT and SSE-gap against stock and peer, with a declared fairness ceiling against the peer | Changed: worst-slot TTFT p95 and SSE-gap max ratios are shown against stock and peer. The stock band (×1.025) gates a Win. Against the peer they are reported only, with no ceiling, because the operator worded the peer comparison as task makespan only. SSE gaps against the peer are shown as not comparable (different event granularity). An SSE gap the verdict cannot estimate is shown as not measurable and does not gate, as in the Q3 rule. |
+| 6. 3+1, 2+2 and 1+3 controls (descriptive) | Kept, for every family: completed mixed stages are controls of the record. Stages that halted or did not run are disclosed as unmeasured. |
+| One statistics rule | The Q3 design statistics (5–20 Williams blocks, sequential 2.5-point precision stop). The sequential rule is the Q3 rule pre-registered on #369 (`docs/research/adr063-q3-campaign.md` "Design", fixed before any campaign data), not a new choice made for F2. The fixed-six rule moves to successor scope. |
+| A board that shows a Q3 Win as qualified | Changed: the "Q3 verdicts of record" tier is F2's qualified display. The fixed-six "Qualified wins" section is labeled successor scope. |
+
+Justification of the sequential rule. The independent Q3 reviews re-derived
+every stopping decision from the raw runs under it and accepted the verdicts
+of record: `$E/reviews/adr063-q3-v7-qwen38-verdict-v1.md`,
+`adr063-q3-v7-deepseek4-verdict-v1.md`, `adr063-q3-v7-gemma4-verdict-v1.md`
+and `adr063-q3-v9-gemma4-verdict-v1.md`. A stage that reaches 20 blocks
+without precision is inconclusive on that contrast and is disclosed as such.
+
+Native-engine rows stay separate. They render in their own section and never
+stand in for the same-GGUF verdict. A campaign with a native peer arm
+contributes only its native rows.
+
+The scoreboard renders this as the "Q3 verdicts of record" tier above the
+Descriptive results (`scripts/four_agent/f2_q3_tier.py`,
+`f2_q3_view.py`; how to read it is in `docs/research/adr063-f2-scoreboard.md`).
+"Win" appears there only against v0.1.28 stock (release `9a0b79c7`; the stock
+arm is v0.1.28, not v0.1.27), and only when all of these hold:
+- the makespan interval against stock excludes a tie, with half-width ≤ 2.5 points;
+- neither measurable stock fairness effect regresses beyond the neutral band;
+- the primary stage reached its stopping rule, with valid thermal and memory receipts;
+- no final source awaits patch review;
+- the quality gate passed against both references.
+
+Moved to successor scope: the fixed-six three-arm campaign, canonical-transcript
+replay timing lanes, the cancellation/retry, divergent-edit and request-order
+permutation scenarios, and captured production-client sampling. The F2
+acceptance bullets that name them are the successor's acceptance, not this
+closure's; `f2_scoreboard_cli.py` still renders any fixed-six result produced.
+This decision establishes no speed win by itself.
 
 ## Consequences
 

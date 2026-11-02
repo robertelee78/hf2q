@@ -214,16 +214,17 @@ class Campaign(unittest.TestCase):
         (out / 'campaign.json').write_text(json.dumps(document))
         (out / 'verdict.json').write_text(json.dumps(q3_report.compute_verdict(document)))
         rows = q3_report.rows(out, self.root)
-        self.assertEqual({r['baseline_arm'] for r in rows['rows']}, {'hf2q_current', 'ds4_native'})
+        # a native-peer campaign is never the verdict of record: only the ds4 row, no experiment-vs-stock row
+        self.assertEqual([r['baseline_arm'] for r in rows['rows']], ['ds4_native'])
         self.assertIn(nd.LABEL, rows['groups']['deepseek4-q3']['workload'])
-        self.assertIn('not the same-GGUF peer verdict', rows['rows'][1]['note'])
+        self.assertIn('not the same-GGUF peer verdict', rows['rows'][0]['note'])
         board = {'schema': f2.ROWS_SCHEMA, 'evidence_root_symbol': '$E', 'evidence_root_description': 'test',
                  'neutral_band_ratio': 1.025, 'neutral_band_basis': 'test',
                  'families': {'deepseek4': {'title': 'DeepSeek-V4 Flash', 'artifact_sha256': 'a' * 64, 'note': ''}},
                  **rows}
         f2.validate_manifest(board)
         self.assertEqual(f2.verify_rows(board, self.root), [r['id'] for r in rows['rows']])
-        native_row = rows['rows'][1]
+        native_row = rows['rows'][0]
         for figure in ('finishes the same coding task 20.0% sooner', 'Median tokens per run', 'output tokens/s',
                        'TTFT ratio experiment/ds4 0.5'):
             self.assertIn(figure, native_row['note'])
@@ -232,7 +233,7 @@ class Campaign(unittest.TestCase):
         section = lambda start: text[text.index(start):text.find('\n## ', text.index(start) + len(start))]
         self.assertIn(f"`{native_row['id']}`", section(title))
         self.assertIn('Median tokens per run', section(title))
-        self.assertIn(f"`{rows['rows'][0]['id']}`", section('### Descriptive wins'))
+        self.assertIn('None.', section('### Descriptive wins'))  # nothing of this campaign lands among the wins
         for other in ('## Wins vs baseline', '## Negative results', '## Open gaps', '## DeepSeek-V4 Flash'):
             self.assertNotIn(f"`{native_row['id']}`", section(other))
         self.assertFalse(f2.effect_is_win(native_row))
