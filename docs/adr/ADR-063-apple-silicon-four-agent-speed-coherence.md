@@ -360,6 +360,23 @@ Priority: High. Core scope.
 
 Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
 
+**Result (2026-11-02, M5 Max 128 GB; `docs/research/adr063-d2-drafter-comparison.md`).**
+No current pretrained drafter qualifies as successor scope; D2 closes negative
+for DFlash2 and DSpark on Qwen3.8 27B at four slots. Primary group (vanilla
+target, 3 interleaved passes, lexicographic rule completion → final tests →
+Q5 memory tier → median makespan): P1 (peer MTP) 77.7 s > H0 81.4 s > H1 82.3 s
+> T2 (official DFlash2 on TensorFold) 90.7 s > P0 118.9 s > P3 (peer DSpark,
+arm-negative: task failure) > T0 (arm-negative: task failure). The peer's
+DFlash2 (P2) corrupted tool-call output at four slots and failed qualification.
+DSpark ranks above H1 only on the abliterated target (group A), which the rule
+does not accept as a substitute for the primary rank. H1 does not beat H0 at
+N4, consistent with D1. The peer's own MTP head is faster than H1 but runs with
+about 2 GB worst memory headroom and was stopped by Q5 for memory at long
+context; this is recorded as an observation for successor MTP work, not a
+drafter verdict. Non-repetitive code is incomplete (11 runs unavailable after
+a quiet-host preflight refusal) and the long-context group's second pass is
+pending; neither can change the drafter verdict.
+
 ## K. Apple Silicon kernels and ownership
 
 ### K1. Tune October small-row quantized verifier and decode dispatch
