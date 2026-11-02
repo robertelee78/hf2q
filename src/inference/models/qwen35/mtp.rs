@@ -977,6 +977,8 @@ impl MtpWeights {
         )
         .context("MTP fused residual norm")?;
         enc.commit();
+        // Release before the FFN, whose teacher-scope route may wait.
+        drop(enc);
 
         match &self.ffn {
             MtpFfnWeightsGpu::Dense {

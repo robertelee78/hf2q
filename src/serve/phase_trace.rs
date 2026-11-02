@@ -137,8 +137,12 @@ impl Recorder {
     }
 
     /// Same-kind records in order with one file write. Each record is still
-    /// sequenced and charged on its own; the first failing record ends the
-    /// batch with the earlier records written, exactly as single appends would.
+    /// sequenced and charged on its own, and `at_ns` is taken as it is
+    /// serialized, up to one batch before the write. A record that fails to
+    /// serialize or charge ends the batch with the earlier records written,
+    /// as single appends would. A failed write leaves the sequence and byte
+    /// counts unadvanced for the whole batch, though part of it may be in the
+    /// file. Every failure is sticky, so an invalid trace gets no `end` record.
     fn append_all<P: Serialize>(&mut self, kind: &str, payloads: impl IntoIterator<Item = P>) {
         if self.invalid.is_some() {
             return;

@@ -73,12 +73,26 @@ MTP-holding rows always ends each lane with one.
 A second late-check class exists but never reaches the end of a run. Some
 4-dispatch prefill commands (grid `[4, N, 1]`: 96 in n1, 384 in n4) are
 checked one inspection late, but always by a later wait inside the same
-prefill.
+prefill. [INFERENCE] These are the TQ bridge dequant (K and V dequant plus
+FWHT undo) in `apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot`.
+Its encoder outlived the dense resume's `commit_and_wait`.
 
 **Fix.** `process_target_batch` now drops the copy encoder right after
 `commit()`. The command is then in the registry before the transaction's
 drain, and that drain checks it. Observer semantics are unchanged: `finish()`
 still invalidates any command that is genuinely unretired.
+
+The same early drop is applied at three other sites where a committed encoder
+outlived a later wait in the same function:
+
+- the TQ bridge dequant above (`gpu_full_attn.rs`);
+- the MTP residual-norm encoder in `forward_ffn_residual`, which outlived the
+  dense FFN's teacher-scope wait (`mtp.rs`);
+- the legacy output head's norm and lm_head encoders, which outlived the argmax
+  wait (`forward_gpu.rs`, `HF2Q_LEGACY_PER_LAYER_CB=1` only).
+
+An encoder holds no buffers, and every bound buffer stays owned by the caller
+or the frame until the wait. Neither buffer lifetimes nor queue order change.
 
 ## 2. Native sink queue overflow (3+1 dropped events)
 
@@ -115,9 +129,16 @@ lock and append it as a `Value` with two `write(2)` calls.
 
 - The writer drains up to 64 queued events at a time. It appends them with
   one trace lock and one `write`.
-- Each record is still sequenced and charged on its own. If one record fails,
-  the earlier records in the batch stay written and the failure is sticky,
-  exactly as with single appends.
+- Each record is still sequenced and charged on its own. If a record fails to
+  serialize or charge, the earlier records in the batch stay written, as with
+  single appends. If the batch's `write` fails, the sequence and byte counts
+  are not advanced for any of it, though part of the batch may already be in
+  the file. Both failures are sticky, so an invalid trace gets no `end`
+  record.
+- `at_ns` is now taken as each record is serialized, up to one batch (about
+  33 µs) before the actual `write`. A queue-depth reconstruction like the one
+  above, which reads `origin_monotonic_ns + at_ns` as write time, is early by
+  up to that much on traces from this writer.
 - Records serialize through a typed `Line { schema, seq, at_ns, kind,
   payload }`. A test proves this is byte-identical to the previous `json!`
   object.
