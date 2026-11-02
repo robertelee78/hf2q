@@ -636,8 +636,8 @@ The operator approved native-engine peers as separately labeled benchmark arms:
 antirez ds4, TensorFold and oMLX. Each runs its own native artifact, not the
 hf2q GGUF. This section records the ds4 arm (`engine_kind ds4`,
 `scripts/four_agent/native_peer_ds4.py`,
-`q5_cases/native-ds4-deepseek4.json`) and the TensorFold arm (`engine_kind
-tensorfold`, below). The oMLX arm is recorded when its adapter lands. Every
+`q5_cases/native-ds4-deepseek4.json`), the TensorFold arm (`engine_kind
+tensorfold`, below) and the oMLX arm (`engine_kind omlx`, below). Every
 consumer resolves a native kind through one registry,
 `scripts/four_agent/native_peers.py`.
 
@@ -755,6 +755,60 @@ stock DFlash2 drafter `z-lab/Qwen3.8-27B-DFlash2@50307d4c`
   startup reserve, `/health` memory, slot waits), then net makespan.
   Accepted-per-drafted and tokens-per-round counts explain the result but never
   decide it.
+
+**oMLX arm (operator decision 2026-10-31).** oMLX 6b413c90 (version 0.7.3rc1,
+MLX/mlx-lm continuous batching) serves three families from mlx-community 4-bit
+checkpoints: Qwen3.8 27B (`Qwen3.8-27B-4bit@10c35caa`), Qwen3.6 35B-A3B
+(`Qwen3.6-35B-A3B-4bit@38740b84`) and Gemma 4 26B-A4B
+(`gemma-4-26b-a4b-it-4bit@0d77464e`), with cases
+`q5_cases/native-omlx-{qwen38,qwen36,gemma4}.json`. DeepSeek-V4 is out of
+scope because no 4-bit conversion fits. The registry's family scope became a
+tuple (`FAMILIES`, `Q3_FAMILIES`) so one arm can serve several families.
+
+- **It never produces the same-GGUF verdict.** All three families have a
+  runnable same-GGUF peer, so oMLX runs only in a separate `--native-comparison`
+  campaign. Labels, withholding and the F2 placement are TensorFold's: F2
+  baselines `omlx_<family>_native`, never a win. Any oMLX tool-parser warning
+  or INFO repair line in a run also withholds the statement; repairs oMLX does
+  not log are disclosed with every statement (`recovery_attribution`). The Qwen3.6 re-test with a different
+  tokenizer and sampler stack uses `quality_campaign.py --reference-kind
+  omlx-native`; oMLX cannot be the subject arm.
+- **Request parity is explicit.** oMLX silently drops unknown request fields,
+  so the adapter enforces a closed envelope. It sends greedy sampling, hf2q's
+  repetition penalty 1.05 over a 64-token window, and thinking as hf2q renders
+  it. For Qwen that is `enable_thinking`/`preserve_thinking` true, no explicit
+  effort, and `thinking_budget` 2048/512. For Gemma it is `enable_thinking`
+  false. `parallel_tool_calls` is not sent: oMLX has no such field, and the
+  client refuses a second call. A generated `model_settings.json` pins the same
+  values server-side. Its sha256 is in the approval, and it must be unchanged
+  at closing.
+- **These differences are recorded, not hidden:**
+  - MLX affine 4-bit weights instead of hf2q's Q4_K_M GGUF;
+  - the mlx-community tokenizer, and a template whose identity with hf2q's
+    reviewed template is recorded per run;
+  - oMLX's tool-schema normalization (sorted keys, injected empty
+    descriptions, no tool grammar);
+  - a different forced thinking close;
+  - unproven seeding of the repetition window with the prompt tail.
+- **Identity is bound end to end.** The client binds:
+  - the detached clean checkout and its version file;
+  - the venv's mlx, mlx-lm and mlx-vlm pins, from dist-info (a pip-freeze
+    equivalent hash);
+  - the snapshot revision, `config.json` and `chat_template.jinja`;
+  - the launch record (pid, exact argv, environment);
+  - `/api/status` (version, every custom kernel available, no request before
+    the barrier) and `/v1/models/status` (served path, text engine, 262144
+    context);
+  - the re-saved `settings.json` (hot-only prefix cache, no SSD tier);
+  - every turn's rendered prompt via `/v1/tokenize`.
+
+  At closing the server's session counters must equal the client receipts.
+  oMLX logs no response id, so the post-run audit binds the multiset of
+  `Chat completion:` lines (transport, tokens, finish) to the client turns.
+- **Memory is paged.** KV grows with real tokens: up to about 64 GiB
+  (Qwen3.8), 20 GiB (Qwen3.6) or 20 GiB (Gemma 4) at four full 262144-token
+  slots, on top of 15–20 GB of weights. Raising `iogpu.wired_limit_mb` is the
+  root's decision.
 
 This decision establishes no speed win and changes no same-GGUF verdict.
 

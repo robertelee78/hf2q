@@ -118,7 +118,7 @@ SAME_GGUF_UNAVAILABLE = ('same-GGUF peer unavailable; the peer arm is the native
 NATIVE_COMPARISON = None  # DeepSeek-V4 runs only with the same-GGUF --peer-unavailable-evidence
 # native_peers.py interface (the registry resolves kind 'ds4' to this module).
 TITLE = 'DeepSeek-V4'
-Q3_FAMILY = FAMILY
+FAMILIES = Q3_FAMILIES = (FAMILY,)
 CLIENT_MODULES = ('native_peers.py', 'native_peer_ds4.py', 'test_native_peer_ds4.py')
 PROCESSES = ('ds4', 'ds4-server', 'ds4-agent', 'ds4-bench', 'ds4-eval')  # native ds4 binaries (/opt/ds4 Makefile:78)
 BASELINES = {'ds4_native': LABEL}

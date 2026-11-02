@@ -2,7 +2,7 @@
 from qwen38_n1_verdict import require
 FAMILIES = ('qwen', 'deepseek4', 'gemma4')
 # Native-engine peer arms; native_peers.py resolves kind K to native_peer_K.py.
-NATIVE_KINDS = ('ds4', 'tensorfold')
+NATIVE_KINDS = ('ds4', 'tensorfold', 'omlx')
 ENGINE_KINDS = ('hf2q', 'peer') + NATIVE_KINDS
 
 
@@ -14,7 +14,7 @@ def validate_selection(family, engine_kind, slots):
     if engine_kind in NATIVE_KINDS:
         from native_peers import adapter
         native = adapter(engine_kind)
-        require(family == native.FAMILY and slots == native.SLOTS,
+        require(family in native.FAMILIES and slots == native.SLOTS,
                 f'the native {engine_kind} arm is the four-slot {native.TITLE} coding workload only')
 
 
