@@ -277,7 +277,7 @@ def main():
                         require(value['resident_size'] <= policy['process_rss_limit_bytes'] and value['phys_footprint'] <= policy['process_footprint_limit_bytes'], 'RSS/footprint operating limit')
                     else:
                         terminal_esrch(ledger, value, child.pid, child.poll(), namespace['ledger_ready'](last_live_ledger, POLICY, time.monotonic_ns(), after_ns=spawn_ns)); result['terminal_ledger_race'] = ledger
-                    require(sum(disk_bytes(o) for o in outputs) <= policy['paired_disk_working_limit_bytes'], 'owned disk quota; no cold-cache refund'); i += 1; next_sample = time.monotonic_ns() + 500000000
+                    require(sum(disk_bytes(o) for o in outputs) <= policy['paired_disk_working_limit_bytes'], 'owned disk quota; no cold-cache refund'); i += 1; next_sample = now + 500000000  # fixed cadence from the sample start: the 1 s gap bound must not absorb the per-sample ledger/disk work
                 time.sleep(.02)
         result.update(exit=child.returncode, elapsed_seconds=time.monotonic() - started, runtime_samples=i); require(proc_identity is not None, 'no validated live owned process ledger'); require(sum(disk_bytes(o) for o in outputs) <= policy['paired_disk_working_limit_bytes'], 'final owned disk quota'); require(child.returncode == 0 and result['elapsed_seconds'] <= deadline, 'actual helper failed/deadline')
         stdout = (out / 'stdout').read_text(); marked = (out / plan['marker_stream']).read_text()
