@@ -106,6 +106,13 @@ pub(crate) fn warm_live_kernel_from_env() -> GemmaLiveKernel {
     kernel
 }
 
+/// Warm kernel with `HF2Q_GEMMA_WARM_TILED_ATTENTION` unset (the shipped
+/// default); ADR-063 Q1 harnesses pin their expected route to it.
+#[cfg(test)]
+pub(crate) fn default_warm_live_kernel() -> GemmaLiveKernel {
+    warm_kernel_for_switch(None)
+}
+
 /// `HF2Q_GEMMA_TILED_LIVE`: installed long-prompt multi-sequence lanes and
 /// the stable cue batch ([`GemmaLiveAttention::Tiled`]) only.
 fn tiled_live_enabled() -> bool {

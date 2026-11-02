@@ -9,6 +9,11 @@
                        same frozen inputs. Every Logits record is joined,
                        hash-checked and classified as ExactEqual,
                        WithinDecisionEnvelope or RouteSensitive.
+  routing LEFT RIGHT   Two endpoint routing-witness.jsonl files. Every
+                       routing_row is joined on (namespace, lane, position,
+                       layer); selected_ids are compared in order. Each changed
+                       row reports both sides' k-th minus (k+1)-th score gap,
+                       boundary_ids and domain: ExactRouting or RoutingChanged.
   fork HF2Q PEER       Two non-streamed responses with logprobs/top_logprobs
                        (chat `choices[0].logprobs.content` or the peer's
                        `/completion` `completion_probabilities`). Classifies
@@ -30,6 +35,7 @@ import heapq
 import json
 import math
 import re
+import struct
 import sys
 from pathlib import Path
 
@@ -197,6 +203,84 @@ def envelope(left_trace, right_trace, policy=POLICY):
     }
 
 
+# --- routing --------------------------------------------------------------
+
+ROUTING_IDENTITY = ("family", "model_sha256", "token_vectors_sha256")
+
+
+def f32(bits):
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def routing_rows(path):
+    path = Path(path)
+    header = end = None
+    rows = {}
+    with path.open() as handle:
+        for number, line in enumerate(handle, 1):
+            event = json.loads(line)
+            kind = event.get("kind")
+            if kind == "header":
+                require(header is None and not rows, f"{path}:{number}: header must come first, once")
+                header = event
+            elif kind == "routing_row":
+                require(header is not None and end is None, f"{path}:{number}: row outside header/end")
+                require(event["native_boundary_valid"] is True and event["selected_copy_valid"] is True
+                        and event["native_decode_error"] is None, f"{path}:{number}: invalid witness row")
+                at = event["at"]
+                key = (at["namespace"], at["row"]["lane"], at["row"]["position"], at["layer"])
+                require(key not in rows, f"{path}:{number}: duplicate routing key {key}")
+                rows[key] = event
+            elif kind == "end":
+                require(end is None, f"{path}:{number}: duplicate end")
+                end = event
+            else:
+                raise Invalid(f"{path}:{number}: unknown event kind {kind!r}")
+    require(header is not None and end is not None, f"{path}: missing header or end")
+    require(end["all_scored_rows_captured"] is True and end["records"] == len(rows),
+            f"{path}: end record count/coverage differs from rows")
+    require(rows, f"{path}: no routing rows")
+    return header, rows
+
+
+def boundary_gap(event):
+    scores = event["scores_f32_bits"]
+    return f32(scores[0]) - f32(scores[1]) if len(scores) == 2 else None
+
+
+def routing_side(event):
+    return {"selected_ids": event["selected_ids"], "gap": boundary_gap(event),
+            "boundary_ids": event["boundary_ids"], "domain": event["at"]["domain"]}
+
+
+def routing(left_path, right_path):
+    left_header, left = routing_rows(left_path)
+    right_header, right = routing_rows(right_path)
+    for field in ROUTING_IDENTITY:
+        require(left_header["identity"][field] == right_header["identity"][field],
+                f"routing witnesses differ in identity.{field}; not the same frozen inputs")
+    unpaired = sorted(set(left) ^ set(right))
+    require(not unpaired, f"{len(unpaired)} unpaired routing keys, first {unpaired[:1]}")
+    changed = []
+    for key in sorted(left):
+        l, r = left[key], right[key]
+        if l["selected_ids"] != r["selected_ids"]:
+            changed.append({"namespace": key[0], "lane": key[1], "position": key[2], "layer": key[3],
+                            "set_changed": set(l["selected_ids"]) != set(r["selected_ids"]),
+                            "left": routing_side(l), "right": routing_side(r)})
+    margins = [abs(side["gap"]) for row in changed for side in (row["left"], row["right"])
+               if side["gap"] is not None]
+    return {"schema": "hf2q.q1.routing-comparison.v1",
+            "classification": "RoutingChanged" if changed else "ExactRouting",
+            "rows": len(left), "changed_rows": len(changed),
+            "set_changed_rows": sum(row["set_changed"] for row in changed),
+            "order_only_rows": sum(not row["set_changed"] for row in changed),
+            "weight_bits_differing_rows": sum(left[k]["selected_weights_f32_bits"]
+                                              != right[k]["selected_weights_f32_bits"] for k in left),
+            "changed_gap_max": max(margins) if margins else None,
+            "changed": changed}
+
+
 # --- fork -----------------------------------------------------------------
 
 def token_bytes(entry):
@@ -349,6 +433,9 @@ def main(argv=None):
     e = sub.add_parser("envelope")
     e.add_argument("left_trace")
     e.add_argument("right_trace")
+    r = sub.add_parser("routing")
+    r.add_argument("left_witness")
+    r.add_argument("right_witness")
     f = sub.add_parser("fork")
     f.add_argument("hf2q_response")
     f.add_argument("peer_response")
@@ -362,6 +449,8 @@ def main(argv=None):
             result = exact(args.left_trace, args.right_trace)
         elif args.command == "envelope":
             result = envelope(args.left_trace, args.right_trace)
+        elif args.command == "routing":
+            result = routing(args.left_witness, args.right_witness)
         elif args.command == "fork":
             result = fork(json.loads(Path(args.hf2q_response).read_text()),
                           json.loads(Path(args.peer_response).read_text()))

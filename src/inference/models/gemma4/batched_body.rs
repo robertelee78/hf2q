@@ -1928,6 +1928,13 @@ impl MlxModelWeights {
             let w_i = bufs
                 .moe_routing_weights_gpu
                 .slice_view(row_off(ids_stride, i), ids_stride);
+            #[cfg(test)]
+            let q1_routed=crate::adr063_invariance::gemma_routing_witness::scalar(
+                session.encoder_mut(),reg,dev,&rl_i,&ids_i,&w_i,
+                &self.layers[layer_idx].moe.per_expert_scale,num_experts as u32,top_k as u32,
+                layer_idx,seq_positions[i],Some(slot_ids[i].0 as usize),i)?;
+            #[cfg(not(test))] let q1_routed=false;
+            if !q1_routed {
             mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_f32(
                 session.encoder_mut(),
                 reg,
@@ -1940,6 +1947,7 @@ impl MlxModelWeights {
                 top_k as u32,
             )
             .map_err(|e| anyhow::anyhow!("batched MoE routing L{layer_idx} slot{i}: {e}"))?;
+            }
         }
         // catsplit: fused_gelu_mul (dense SwiGLU) + per-slot MoE routing/top-k.
         cat_boundary(session, exec, catsplit::Cat::MoeOther)?;

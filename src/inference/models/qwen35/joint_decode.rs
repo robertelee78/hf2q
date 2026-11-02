@@ -343,6 +343,8 @@ impl Qwen35Model {
             device,
             registry,
             &mut embedded,
+            #[cfg(test)]
+            None,
         )
         .context("Qwen joint embedding gather")?;
 
