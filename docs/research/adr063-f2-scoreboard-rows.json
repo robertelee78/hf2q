@@ -8,12 +8,12 @@
   "qwen38": {
    "title": "Qwen3.8 27B",
    "artifact_sha256": "cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7",
-   "note": "Vanilla hf2q-produced Q4_K_M GGUF (`qwen38-stock/Qwen3.8-27B-vanilla.gguf`). No peer adapter run for this artifact yet."
+   "note": "Vanilla hf2q-produced Q4_K_M GGUF (`qwen38-stock/Qwen3.8-27B-vanilla.gguf`), run by hf2q and the peer in the Q3 v7 record and the v8 controls (see the Q3 tier). The rows below are earlier descriptive measurements."
   },
   "deepseek4": {
    "title": "DeepSeek-V4 Flash",
    "artifact_sha256": "50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6",
-   "note": "`deepseek4/…agentic-q2.gguf`. The 2026-08 parity rows used a different artifact (`936a97e6…`); the ADR-063 coding client has no DeepSeek peer adapter."
+   "note": "`deepseek4/…agentic-q2.gguf`. The 2026-08 parity rows used a different artifact (`936a97e6…`). In Q3 the same-GGUF peer ran out of memory (Unavailable, prior evidence), and native ds4 ran on its own artifact (see the Q3 tier)."
   },
   "qwen36": {
    "title": "Qwen3.6 35B-A3B",
@@ -23,7 +23,7 @@
   "gemma4": {
    "title": "Gemma4 26B-A4B",
    "artifact_sha256": "bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53",
-   "note": "hf2q q4_k_m GGUF. The plan marks the Gemma peer adapter unsupported."
+   "note": "hf2q q4_k_m GGUF, run by hf2q and the peer in the Q3 v9 record (see the Q3 tier). The rows below are earlier descriptive measurements."
   }
  },
  "groups": {
@@ -60,7 +60,7 @@
   "deepseek4-parity": {
    "family": "deepseek4",
    "title": "DeepSeek N1 parity gate",
-   "workload": "`scripts/benchmark_deepseek4_server_parity.sh` single-request gate vs the peer 3653e6d6 (ADR-042)."
+   "workload": "`scripts/benchmark_deepseek4_server_parity.sh` single-request gate vs the peer 3653e6d6 (ADR-042), on the 2026-08 artifact `936a97e6…`, not the Q3 artifact. Per-token decode rate, not task makespan: descriptive only, never a Win."
   },
   "deepseek4-n4-balanced": {
    "family": "deepseek4",
@@ -6680,7 +6680,7 @@
      }
     }
    },
-   "note": "Q3 verdict of record (task makespan only); 6 paired blocks, half-width 0.62 points (baseline peer best valid configuration).",
+   "note": "Q3 verdict of record (task makespan only); 6 paired blocks, half-width 0.62 points (baseline peer without speculation (matched comparison)).",
    "half_width_pp": 0.615486206523852
   },
   {
@@ -6788,7 +6788,7 @@
      }
     }
    },
-   "note": "Q3 verdict of record (task makespan only); 6 paired blocks, half-width 6.63 points (baseline peer best valid configuration).",
+   "note": "Q3 verdict of record (task makespan only); 6 paired blocks, half-width 6.63 points (baseline peer without speculation (matched comparison)).",
    "half_width_pp": 6.632235533010999
   },
   {
@@ -6896,7 +6896,7 @@
      }
     }
    },
-   "note": "Q3 verdict of record (task makespan only); 6 paired blocks, half-width 33.12 points (baseline peer best valid configuration).",
+   "note": "Q3 verdict of record (task makespan only); 6 paired blocks, half-width 33.12 points (baseline peer without speculation (matched comparison)).",
    "half_width_pp": 33.11763873247284
   },
   {
@@ -6990,7 +6990,7 @@
      }
     }
    },
-   "note": "Q3 control n1 (client --phase-plan 1) of the primary of record $E/q3-campaign-v7/qwen38-all/verdict.json; never a win or loss; 7 paired blocks, half-width 2.12 points (baseline peer best valid configuration). hf2q 38485a23 finishes the same coding task 56.7% sooner than the peer (95% CI 55.8–57.6%; median 28.1 s vs 64.9 s). The peer generated 1.93× the completion tokens (1,656 vs 868 per run) and 1.20× the prompt tokens (11,912 vs 9,967). The peer's per-output-token rate was 0.84× hf2q's (25.7 vs 30.7 completion tokens per makespan-second; CI 0.83–0.85×). hf2q's worst-slot p95 TTFT was 0.90× the peer's (3.69 s vs 4.13 s; CI 0.89–0.90×).",
+   "note": "Q3 control n1 (client --phase-plan 1) of the primary of record $E/q3-campaign-v7/qwen38-all/verdict.json; never a win or loss; 7 paired blocks, half-width 2.12 points (baseline peer without speculation (matched comparison)). hf2q 38485a23 finishes the same coding task 56.7% sooner than the peer (95% CI 55.8–57.6%; median 28.1 s vs 64.9 s). The peer generated 1.93× the completion tokens (1,656 vs 868 per run) and 1.20× the prompt tokens (11,912 vs 9,967). The peer's per-output-token rate was 0.84× hf2q's (25.7 vs 30.7 completion tokens per makespan-second; CI 0.83–0.85×). hf2q's worst-slot p95 TTFT was 0.90× the peer's (3.69 s vs 4.13 s; CI 0.89–0.90×).",
    "control_of": "$E/q3-campaign-v7/qwen38-all/verdict.json"
   },
   {
@@ -8654,7 +8654,7 @@
      }
     }
    },
-   "note": "Q3 verdict of record (task makespan only); 20 paired blocks, half-width 3.31 points (baseline peer best valid configuration).",
+   "note": "Q3 verdict of record (task makespan only); 20 paired blocks, half-width 3.31 points (baseline peer without speculation (matched comparison)).",
    "half_width_pp": 3.312026729799422
   },
   {
@@ -8762,7 +8762,7 @@
      }
     }
    },
-   "note": "Q3 verdict of record (task makespan only); 20 paired blocks, half-width 2.59 points (baseline peer best valid configuration).",
+   "note": "Q3 verdict of record (task makespan only); 20 paired blocks, half-width 2.59 points (baseline peer without speculation (matched comparison)).",
    "half_width_pp": 2.5924020086986355
   },
   {
@@ -8870,7 +8870,7 @@
      }
     }
    },
-   "note": "Q3 verdict of record (task makespan only); 20 paired blocks, half-width 19.08 points (baseline peer best valid configuration).",
+   "note": "Q3 verdict of record (task makespan only); 20 paired blocks, half-width 19.08 points (baseline peer without speculation (matched comparison)).",
    "half_width_pp": 19.082126253265976
   },
   {
@@ -8964,7 +8964,7 @@
      }
     }
    },
-   "note": "Q3 control n1 (client --phase-plan 1) of the primary of record $E/q3-campaign-v9/gemma4-all/verdict.json; never a win or loss; 20 paired blocks, half-width 5.79 points (baseline peer best valid configuration). The peer finishes the same coding task 13.5% sooner than hf2q 5d421a2c (95% CI 8.5–18.2%; median 5.8 s vs 6.7 s). The peer generated 1.01× the completion tokens (411 vs 404 per run) and 1.00× the prompt tokens (6,974 vs 6,974). The peer's per-output-token rate was 1.17× hf2q's (74.0 vs 62.0 completion tokens per makespan-second; CI 1.14–1.20×). hf2q's worst-slot p95 TTFT was 1.72× the peer's (0.363 s vs 0.210 s; CI 1.72–1.73×).",
+   "note": "Q3 control n1 (client --phase-plan 1) of the primary of record $E/q3-campaign-v9/gemma4-all/verdict.json; never a win or loss; 20 paired blocks, half-width 5.79 points (baseline peer without speculation (matched comparison)). The peer finishes the same coding task 13.5% sooner than hf2q 5d421a2c (95% CI 8.5–18.2%; median 5.8 s vs 6.7 s). The peer generated 1.01× the completion tokens (411 vs 404 per run) and 1.00× the prompt tokens (6,974 vs 6,974). The peer's per-output-token rate was 1.17× hf2q's (74.0 vs 62.0 completion tokens per makespan-second; CI 1.14–1.20×). hf2q's worst-slot p95 TTFT was 1.72× the peer's (0.363 s vs 0.210 s; CI 1.72–1.73×).",
    "control_of": "$E/q3-campaign-v9/gemma4-all/verdict.json"
   },
   {
@@ -11219,7 +11219,7 @@
      }
     }
    },
-   "note": "Q3 control 3+1 (client --phase-plan 3+1) of the primary of record $E/q3-campaign-v7/qwen38-all/verdict.json; never a win or loss; 5 paired blocks, half-width 0.87 points (baseline peer best valid configuration). hf2q 38485a23 finishes the same coding task 31.0% sooner than the peer (95% CI 30.4–31.6%; median 86.3 s vs 124.7 s). The peer generated 1.88× the completion tokens (6,676 vs 3,545 per run) and 1.20× the prompt tokens (47,985 vs 39,951). The peer's per-output-token rate was 1.30× hf2q's (53.5 vs 41.1 completion tokens per makespan-second; CI 1.29–1.31×). hf2q's worst-slot p95 TTFT was 1.40× the peer's (14.4 s vs 9.88 s; CI 1.26–1.56×). campaign Invalid: halted at 1+3 entry p1p3-038-w00-peer (p1p3-038-w00-peer is Invalid (run audit: serialized or slot-capped service: observed co-progress width 3 < 4 with up to 4 overlapping HTTP requests); no reruns after the task started, so start a new campaign).",
+   "note": "Q3 control 3+1 (client --phase-plan 3+1) of the primary of record $E/q3-campaign-v7/qwen38-all/verdict.json; never a win or loss; 5 paired blocks, half-width 0.87 points (baseline peer without speculation (matched comparison)). hf2q 38485a23 finishes the same coding task 31.0% sooner than the peer (95% CI 30.4–31.6%; median 86.3 s vs 124.7 s). The peer generated 1.88× the completion tokens (6,676 vs 3,545 per run) and 1.20× the prompt tokens (47,985 vs 39,951). The peer's per-output-token rate was 1.30× hf2q's (53.5 vs 41.1 completion tokens per makespan-second; CI 1.29–1.31×). hf2q's worst-slot p95 TTFT was 1.40× the peer's (14.4 s vs 9.88 s; CI 1.26–1.56×). campaign Invalid: halted at 1+3 entry p1p3-038-w00-peer (p1p3-038-w00-peer is Invalid (run audit: serialized or slot-capped service: observed co-progress width 3 < 4 with up to 4 overlapping HTTP requests); no reruns after the task started, so start a new campaign).",
    "control_of": "$E/q3-campaign-v7/qwen38-all/verdict.json"
   },
   {
@@ -11313,15 +11313,16 @@
      }
     }
    },
-   "note": "Q3 control 2+2 (client --phase-plan 2+2) of the primary of record $E/q3-campaign-v7/qwen38-all/verdict.json; never a win or loss; 5 paired blocks, half-width 1.11 points (baseline peer best valid configuration). hf2q 38485a23 finishes the same coding task 30.5% sooner than the peer (95% CI 29.7–31.3%; median 88.2 s vs 126.5 s). The peer generated 1.83× the completion tokens (6,476 vs 3,511 per run) and 1.20× the prompt tokens (47,933 vs 39,951). The peer's per-output-token rate was 1.28× hf2q's (51.0 vs 40.0 completion tokens per makespan-second; CI 1.27–1.28×). hf2q's worst-slot p95 TTFT was 1.41× the peer's (15.0 s vs 10.7 s; CI 1.39–1.42×). campaign Invalid: halted at 1+3 entry p1p3-038-w00-peer (p1p3-038-w00-peer is Invalid (run audit: serialized or slot-capped service: observed co-progress width 3 < 4 with up to 4 overlapping HTTP requests); no reruns after the task started, so start a new campaign).",
+   "note": "Q3 control 2+2 (client --phase-plan 2+2) of the primary of record $E/q3-campaign-v7/qwen38-all/verdict.json; never a win or loss; 5 paired blocks, half-width 1.11 points (baseline peer without speculation (matched comparison)). hf2q 38485a23 finishes the same coding task 30.5% sooner than the peer (95% CI 29.7–31.3%; median 88.2 s vs 126.5 s). The peer generated 1.83× the completion tokens (6,476 vs 3,511 per run) and 1.20× the prompt tokens (47,933 vs 39,951). The peer's per-output-token rate was 1.28× hf2q's (51.0 vs 40.0 completion tokens per makespan-second; CI 1.27–1.28×). hf2q's worst-slot p95 TTFT was 1.41× the peer's (15.0 s vs 10.7 s; CI 1.39–1.42×). campaign Invalid: halted at 1+3 entry p1p3-038-w00-peer (p1p3-038-w00-peer is Invalid (run audit: serialized or slot-capped service: observed co-progress width 3 < 4 with up to 4 overlapping HTTP requests); no reruns after the task started, so start a new campaign).",
    "control_of": "$E/q3-campaign-v7/qwen38-all/verdict.json"
   }
  ],
  "q3_family_notes": {
   "qwen38": [
    "Review: `$E/reviews/adr063-q3-v7-qwen38-verdict-v1.md` (record), `$E/reviews/adr063-q3-v8-controls-verdict-v1.md` (controls). The experiment 38485a23 is the frozen Qwen-family Q3 binary (`fbf6bfcf…`).",
+   "**Pending v11.** Every Qwen3.8 peer row of this record (n4, n1, 3+1, 2+2) used the peer without speculation (`--spec-type none`): a matched comparison, not the peer's best configuration. The best-configuration peer (with its own MTP head) is re-run in the Q3 v11 campaign, pre-registered on #369 on 2026-11-02, whose result will replace this record. The D2 drafter comparison (`docs/research/adr063-d2-drafter-comparison.md`) measured, on the same workload and binaries, a median makespan of 77.7 s for the peer with MTP against 82.3 s for hf2q's Q3 configuration (3 runs per arm; not a Q3 campaign). Until v11 lands, the vs-stock Win stands and the vs-peer sentences below describe the matched comparison only (independent closure review `$E/reviews/adr063-q3-closure-v1.md`, finding 1).",
    "**Vs stock:** Qwen3.8 27B, n4: hf2q 38485a23 has a 26.4% shorter four-task makespan than the v0.1.28 release (95% CI 24.7–28.0%; 6 Williams blocks; half-width 2.22 pp; median 87.0 s vs 116.7 s). **Win.**",
-   "**Vs peer:** On the Qwen3.8 27B four-agent coding task (n4, 4 slots × 262,144 context, same GGUF `cf0eb010…`), hf2q 38485a23 finishes the same coding task 31.5% sooner than the peer (b128-e86f5fd) (own-output four-task makespan, median 87.0 s vs 126.6 s, 95% CI 31.1–31.9%, 6 Williams blocks). The peer generated 1.91× the completion tokens (6,716 vs 3,531 per run) and 1.20× the prompt tokens (47,953 vs 39,916). Per output token the peer's aggregate rate was 1.31× hf2q's (52.7 vs 40.6 completion tokens per makespan-second). hf2q's worst-slot TTFT p95 was 1.69× the peer's (15.6 s vs 9.0 s, CI 1.59–1.81×).",
+   "**Vs peer (peer without speculation, matched comparison):** On the Qwen3.8 27B four-agent coding task (n4, 4 slots × 262,144 context, same GGUF `cf0eb010…`), hf2q 38485a23 finishes the same coding task 31.5% sooner than the peer (b128-e86f5fd) (own-output four-task makespan, median 87.0 s vs 126.6 s, 95% CI 31.1–31.9%, 6 Williams blocks). The peer generated 1.91× the completion tokens (6,716 vs 3,531 per run) and 1.20× the prompt tokens (47,953 vs 39,916). Per output token the peer's aggregate rate was 1.31× hf2q's (52.7 vs 40.6 completion tokens per makespan-second). hf2q's worst-slot TTFT p95 was 1.69× the peer's (15.6 s vs 9.0 s, CI 1.59–1.81×).",
    "**n1 control:** experiment vs stock is −1.8% (CI −3.9 to +0.3%), so no change in single-stream makespan. Against the peer, hf2q finishes 56.7% sooner (CI 55.8–57.6%), while the peer emits 1.93× the completion tokens. Per output token hf2q is faster here (peer/hf2q rate 0.84×), and its TTFT is 0.90× the peer's.",
    "**Fairness vs stock (n4):** worst-slot TTFT p95 0.696× (CI 0.653–0.741); SSE gap: no regression demonstrated (CI 0.69–1.27). SSE gaps against the peer are not comparable (about 9 gaps per slot for hf2q, 4 semantic events per streamed turn, against 67–72 gaps per slot for the peer).",
    "**Quality:** the quality gate passed on 38485a23 against v0.1.28 (`$E/quality-gate-v1/qwen38-vs-v0128/manifest.json`) and against the peer (`$E/quality-gate-v1/qwen38-vs-peer/manifest.json`); both final sources (`a046ea41…`, `b60253f8…`) passed patch review (`$E/q3-campaign-v7/qwen38-patch-review.json`). On the Q3 task, quality against the v0.1.28 release is also task-completion parity (40/40 vs 40/40 agent-tasks, all tests passed). The Q1 input recorded in the v7 `verdict.json` is joint decode vs the same binary with `HF2Q_QWEN_JOINT_DECODE=0`, not v0.1.28.",
@@ -11337,6 +11338,7 @@
    "Reviews: `$E/reviews/adr063-q3-v7-deepseek4-verdict-v1.md` (record), `$E/reviews/adr063-q3-v8-native-ds4-verdict-v1.md` (native ds4), `$E/reviews/adr063-q3-v8-controls-verdict-v1.md` (mixed stages).",
    "DeepSeek-V4 Q3 n4: Unavailable (peer out of memory, prior evidence). Against stock, the experiment (hf2q 38485a23) finishes the same coding task 24.7% sooner (CI 23.8–25.6; 103.5 vs 137.1 s median; 5 ABBA blocks). Completion tokens experiment/stock 0.980 (CI 0.962–0.998); output-token rate 1.30× stock's; worst-slot TTFT ratio 0.83 (CI 0.797–0.870). The SSE fairness check is not measurable: every streamed turn carries one semantic event. n1: neutral, −0.14% (CI −2.57 to +2.23). No same-GGUF peer comparison.",
    "**Final sources and quality:** stock v0.1.28 produced byte-identical final sources (`80a3b158…`, `2463108d…`) in every run; both passed patch review (`$E/q3-campaign-v7/deepseek4-patch-review.json`, bound in the record's `verdict.json`). Quality is task-completion parity on v7, with identical final sources in both arms, and the quality gate passed on 38485a23 against v0.1.28 (`$E/quality-gate-v1/deepseek4-vs-v0128/manifest.json`) and against ds4 (`$E/quality-gate-v1/deepseek4-vs-ds4/manifest.json`). The earlier Q1 input is 0b959107 joint decode vs the same binary with `HF2Q_DEEPSEEK_JOINT_DECODE=0`; it is neither bound to 38485a23 nor compared with v0.1.28.",
+   "**Q1 deferral:** the DeepSeek-V4 Q1 numerical endpoint captures (T0/T1/T3/T4/T7) are deferred to v0.1.29 (#549; #367 comment 6566342659): their 119.18 GiB preload floor exceeds the host's observed 109.34 GiB. Quality for DeepSeek-V4 in v0.1.28 is therefore the paired task-quality gate against v0.1.28 and against ds4, plus the S3 bitwise joint == serial check.",
    "**Scope:** v7 n4 and n1 are the stages of record. The campaign is Invalid from the width-only halt at the first 3+1 warmup (a stock run); 2+2 and 1+3 were not run. The v8 controls campaign halted the same way at its first 3+1 stock warmup, so every DeepSeek-V4 mixed stage is unmeasured; with stock-first warmups, DeepSeek-V4 cannot reach a measured mixed stage under the frozen width rule. No mixed-stage control rows exist.",
    "**Native ds4 (Q3 v8, different artifacts):** hf2q 38485a23 finishes the same coding task 5.2% sooner than ds4 c97964b on its own Flash-0731 q2 artifact (95% CI 3.0–7.4%; median makespan 102.9 vs 108.7 s; 15 blocks; task makespan only). Median tokens per run (prompt/completion): hf2q 39,807/3,815, ds4 40,582/3,550; output tokens per second of makespan 37.2 vs 32.7 (1.14×); worst-slot p95 TTFT hf2q/ds4 1.73 (hf2q's first semantic token is later). Never a Win or a peer-margin result (the CI upper bound 0.970 is above the 0.95 margin), and not the same-GGUF peer verdict, which stays Unavailable. That campaign's stock contrast (25.5%) is not of record.",
    "**Native ds4 label:** the frozen v8 `verdict.json` names the experiment 'main HEAD' (the run used the default `--experiment-label`). The statement was recomputed with the label hf2q 38485a23 into `$E/f2-assembly/deepseek4-native-ds4/verdict.json`; its `campaign.json` is byte-identical to the frozen `$E/q3-campaign-v8/deepseek4-native-ds4/campaign.json` (sha256 `1e2b8f4c…`), and only `native_peer` and the harness's `halted` field (null) differ. The native row cites that verdict.",
@@ -11352,6 +11354,7 @@
   ],
   "gemma4": [
    "Review: `$E/reviews/adr063-q3-v9-gemma4-verdict-v1.md`. The experiment 5d421a2c is the PR #544 head (main 644e586d tree), shown on the board as hf2q 5d421a2c.",
+   "**Peer configuration:** the Gemma peer arm also ran without speculation (`--spec-type none`), a matched comparison. No campaign ran a separate matched-settings diagnostic; since the family verdict is already a Loss against this peer, a faster peer configuration could not change it into a peer win (closure review finding 8).",
    "Gemma 4 26B-A4B, ADR-063 Q3 v9 primary n4 (experiment 5d421a2c, PR #544 head, tiled F16 warm attention off, vs stock v0.1.28 9a0b79c7; 20 Williams blocks, cap reached): hf2q finishes the four-agent coding task 37.0% sooner than stock v0.1.28 (95% CI 35.6–38.4%). This is not a Q3 Win: the pre-registered stock fairness gate fails on worst-slot max SSE gap (1.047×, CI 1.036–1.058; the first tool-call argument burst takes 62.5 ms against 59.0 ms, with all four slots in lockstep and no mid-stream pause).",
    "Against the peer (same GGUF, build e86f5fd1), the peer finishes the same coding task 13.4% sooner (95% CI 10.6–16.2%; hf2q's makespan is 15.5% longer, CI 11.8–19.3%). Per run, completion tokens are 1,616 for hf2q and 1,644 for the peer (the same tool calls; the peer reports one more token per turn), and prompt tokens are 27,896 for both. The peer's per-output-token rate is 18.3% higher (130.2 vs 109.1 tok/s, CI 16.6–20.1%). hf2q's worst-slot p95 TTFT is 1.31× the peer's (CI 1.28–1.34). Family verdict: Loss (Q3 rule 5); the vs-peer half-width of 3.31 points missed the 2.5-point target at the 20-block cap. This replaces the v7 record (f3e37690, tiled route: 41.5% sooner than v0.1.28, Loss vs the peer), whose tiled route changed agent decisions.",
    "**Quality gate:** it has since passed on 5d421a2c against v0.1.28 (`$E/quality-gate-v1/gemma4-vs-v0128/manifest.json`) and against the peer (`$E/quality-gate-v1/gemma4-vs-peer/manifest.json`), so the speed result counts under the operator's 2026-11-01 rule. The final source `eaa64e2e…` passed patch review for v9 (`$E/q3-campaign-v9/gemma4-patch-review.json`).",
@@ -11359,5 +11362,8 @@
    "**Disclosures:** n4 hit the 20-block cap without vs-peer precision (3.31 pp); n1 is imprecise on both contrasts. `campaign_status: Invalid` comes only from the 3+1 stock warmup; the mixed stages are unmeasured after structural, width-only halts at the 3+1 stock warmup in v7, v8 and v9, and Gemma 4 cannot reach a measured mixed stage under the frozen rule. The v8 Gemma controls were bound to the superseded v7 record and are not on the board. Cross-engine TTFT: hf2q emits a tool-call frame only once the call is parsed, while the peer streams token by token; SSE gaps against the peer are not comparable (3 events per streamed hf2q turn against 7–11).",
    "**Identity and timing:** the commit 5d421a2c is bound by the string embedded in the binary and by the binary path, not by a build receipt. A pre-declaration smoke run (`gemma-tiled-off-smoke-5d421a2c`, 20:53:29Z, one experiment-only run, makespan 14.38 s) preceded the v9 declaration and had no bearing on it. Absolute seconds are not comparable with v7: every arm drifted by about 7%."
   ]
+ },
+ "q3_verdict_notices": {
+  "qwen38": "Pending v11: the vs-peer rows are against the peer without speculation (matched comparison); the best-configuration peer (with its MTP) is re-run in v11, pre-registered on #369 on 2026-11-02, and its result will replace this record. D2 measured peer MTP 77.7 s vs hf2q 82.3 s median makespan (see Family notes)"
  }
 }

@@ -27,6 +27,8 @@ STOCK_ARM = "v0128_stock"
 FAIRNESS = {"worst_slot_ttft_p95_s": "TTFT p95", "worst_slot_sse_gap_max_s": "SSE gap max"}
 SSE = "worst_slot_sse_gap_max_s"
 UNMEASURABLE = "not measurable (one semantic event per streamed turn)"
+# A same-GGUF peer arm whose case ran `--spec-type none` is a matched comparison, not the peer's best configuration.
+PEER_SPEC_OFF = "peer without speculation (matched comparison)"
 TOKENS = {"prompt_tokens": "Prompt tokens per run", "completion_tokens": "Completion tokens per run",
           "output_tokens_per_s": "Completion tokens per makespan-second"}
 TOKEN_ARMS = {"candidate": "hf2q experiment", STOCK_ARM: "v0.1.28 stock", "peer": "peer"}
@@ -41,6 +43,9 @@ HOW_TO_READ = [
     "--of-record` after independent review. `--verify` re-reads every number from its receipt and re-derives "
     "the verdict, campaign status, halt, stages and quality gate from `verdict.json`, `campaign.json` and the quality "
     "manifests. Under option B this tier is F2's qualified display; the fixed-six Qualified section below is successor scope.",
+    "- **Who ran it.** The root session ran every campaign (`qe_identity` `root-resume-20261030`), not a separate QE "
+    "session or host. Independent reviewers who did not implement the candidates reproduced every verdict from the raw "
+    "receipts (`docs/research/adr063-q3-campaign.md`, \"Independent QE and reproduction\").",
     "- **Q3 verdict of record** is the family verdict of the predeclared Q3 rules (`docs/research/adr063-q3-campaign.md`): "
     "Win, Loss, Unavailable (no runnable same-GGUF peer) or Failed (hf2q task failure). A Q3 Win whose stock "
     "conditions or quality gate below are unmet shows as Withheld, with the reasons.",
@@ -51,8 +56,9 @@ HOW_TO_READ = [
     "where it is unavailable, the family's native stand-in: ds4 for DeepSeek-V4). Otherwise the numbers are shown "
     "with the gating reason.",
     "- **Peer: task makespan only.** The sentence names whichever arm finishes sooner and computes X on the slower "
-    "arm's time, X = 1 − faster/slower; it is never a win. Unavailable families show the native-engine statement "
-    "(different artifact) when one exists.",
+    "arm's time, X = 1 − faster/slower; it is never a win. A peer arm that ran with speculation off is named the "
+    f"{PEER_SPEC_OFF}. Unavailable families show the native-engine statement (different artifact) when one exists. "
+    "A notice on a family's verdict marks a record that a pre-registered campaign will replace.",
     "- **Failed** families (an experiment run failed its task, Q3 rule 1) show that run's Failure row and no speed "
     "effect; with no paired block, no fairness effect exists.",
     "- **Fairness** is the worst-slot ratio hf2q/reference with its 95% CI; above 1 means hf2q's worst slot waits "

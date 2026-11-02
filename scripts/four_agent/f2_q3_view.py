@@ -1,6 +1,6 @@
 """Markdown of the F2 'Q3 verdicts of record' tier (f2_q3_tier records and rows). Pure: no receipt reads."""
-from f2_q3_tier import (FAIRNESS, HOW_TO_READ, NATIVE_COMPARISON, PRECISION_PP, REFERENCES, SSE, STOCK_ARM,
-                        TOKEN_ARMS, TOKENS, UNMEASURABLE, required_references)
+from f2_q3_tier import (FAIRNESS, HOW_TO_READ, NATIVE_COMPARISON, PEER_SPEC_OFF, PRECISION_PP, REFERENCES, SSE,
+                        STOCK_ARM, TOKEN_ARMS, TOKENS, UNMEASURABLE, required_references)
 
 
 def ratio(row):
@@ -122,6 +122,7 @@ def campaign_cell(rec, effects):
 def render(manifest, q3_rows, native_rows, baseline_labels):
     """Markdown lines of the tier: one line per family, a token table and each family's row ids."""
     fams, groups, band = manifest["families"], manifest["groups"], manifest["neutral_band_ratio"]
+    notices = manifest.get("q3_verdict_notices") or {}  # e.g. a record a pre-registered campaign will replace
     records = {g["family"]: (gid, g["q3_record"]) for gid, g in groups.items() if "q3_record" in g}
     out = ["## Q3 verdicts of record (F2's qualified display under option B; above Descriptive)", "", *HOW_TO_READ, "",
            "| Family | Q3 verdict of record | Makespan vs v0.1.28 stock | Makespan vs peer (task makespan only) | "
@@ -148,9 +149,11 @@ def render(manifest, q3_rows, native_rows, baseline_labels):
             verdict = "Withheld: " + "; ".join(unmet)
         elif verdict in ("Failed", "Inconclusive", "Pending") and rec["reasons"]:
             verdict += ": " + "; ".join(rec["reasons"])
+        if fam in notices:
+            verdict += f" — **{notices[fam]}**"
         peer = effects.get(("makespan_s", "peer"))
         if peer is not None:
-            peer_cell = sooner(peer, "the peer", hf2q)
+            peer_cell = sooner(peer, f"the {PEER_SPEC_OFF}" if PEER_SPEC_OFF in peer["note"] else "the peer", hf2q)
         elif rec["peer_unavailable"] or rec["verdict"] == "Unavailable":
             peer_cell = f"Unavailable: {rec['peer_unavailable'] or '; '.join(rec['reasons'])}"
             peer_cell += "".join(f". Native {baseline_labels[x['baseline_arm']]} (different artifact, task makespan only): "

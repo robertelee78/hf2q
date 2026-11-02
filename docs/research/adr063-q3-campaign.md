@@ -146,7 +146,9 @@ The `n1` and mixed-phase stages are reported in `verdict.json` `controls` with t
 
   A `Failed` verdict of record whose primary stage was stopped by an experiment task failure (Q3 rule 1) gives one `Failure` `task_pass` row of record per failed experiment run, verified against `campaign.json`. Its note names the agents that failed on their own (not those the coordinator stopped afterwards), each with the target and compiler error code of its last failed `run_tests` and its error, read from the run's `client/summary.json`; the count is the agents that finished before the coordinator stopped the run, never a partial success. The tier shows it in the stock cell in place of a speed effect.
 
-  The record's completed control rows against the same-GGUF peer carry the operator's peer wording, as controls-only rows do (below). The rows manifest may carry `q3_family_notes` (family → sentences): the reviewed scoreboard sentences and required disclosures, rendered as "Family notes" under the tier. They cite the reviews and add no number of their own.
+  The record's completed control rows against the same-GGUF peer carry the operator's peer wording, as controls-only rows do (below). The rows manifest may carry `q3_family_notes` (family → sentences): the reviewed scoreboard sentences and required disclosures, rendered as "Family notes" under the tier. They cite the reviews and add no number of their own. It may also carry `q3_verdict_notices` (family → sentence), appended to that family's verdict in the tier, for example a record that a pre-registered campaign will replace.
+
+  A same-GGUF peer row names its baseline from the case files the peer runs launched: a peer that ran `--spec-type none` is the "peer without speculation (matched comparison)", in row notes and in the tier's peer sentence, never "best valid configuration". Outside the tier, `f2_scoreboard_render.py` never labels a comparison against the peer a Win: a separated faster or slower result against the peer reads `Faster` or `Slower` and is listed with the non-wins.
 
 ## Controls-only campaign (#369 amendment)
 

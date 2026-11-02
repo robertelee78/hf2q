@@ -440,6 +440,19 @@ class Driver(Harness):
         self.assertEqual({r["baseline_arm"] for r in rows["rows"]}, {"v0128_stock", "peer"})
         self.assertAlmostEqual(rows["rows"][0]["value"], 20.0, places=0)
         self.assertFalse(any("control_of" in r for r in rows["rows"]))  # default mode: primary rows only
+        # the checked-in Qwen3.8 peer case runs --spec-type none: a matched comparison, never "best valid configuration"
+        peer_row = next(r for r in rows["rows"] if r["baseline_arm"] == "peer")
+        self.assertIn(f"(baseline {q3_report.f2_q3_tier.PEER_SPEC_OFF})", peer_row["note"])
+        self.assertNotIn("best valid", peer_row["note"])
+        record = q3_report.rows(self.out, self.root, of_record=True)
+        board = {"schema": f2.ROWS_SCHEMA, "evidence_root_symbol": "$E", "evidence_root_description": "test",
+                 "neutral_band_ratio": 1.025, "neutral_band_basis": "test",
+                 "families": {"qwen38": {"title": "Qwen3.8 27B", "artifact_sha256": MODEL_SHA, "note": ""}},
+                 "q3_verdict_notices": {"qwen38": "Pending v11"}, **record}
+        text = f2.render(f2.validate_manifest(board), [], "0" * 64)
+        line = next(l for l in text.splitlines() if l.startswith("| Qwen3.8 27B | "))
+        self.assertIn(" — **Pending v11** |", line)
+        self.assertIn("sooner than the peer without speculation (matched comparison) (95% CI", line)
 
 
 class ControlsOnly(Harness):

@@ -86,6 +86,9 @@ def validate_manifest(m):
     require(isinstance(notes, dict) and set(notes) <= set(families) and all(
         isinstance(v, list) and v and all(isinstance(s, str) and s for s in v) for v in notes.values()),
         "q3_family_notes: family -> non-empty list of sentences")
+    notices = m.get("q3_verdict_notices", {})  # appended to a family's Q3 verdict (a record due to be replaced)
+    require(isinstance(notices, dict) and set(notices) <= set(families)
+            and all(isinstance(v, str) and v for v in notices.values()), "q3_verdict_notices: family -> sentence")
     record_refs = q3tier.validate(groups)
     ids = set()
     for row in m.get("rows", []):
@@ -217,6 +220,8 @@ def comparisons(manifest):
                 verdict = "Neutral"
             elif not (repeated and (min(num_s) > max(den_s) if ratio > 1 else max(num_s) < min(den_s))):
                 verdict = "Unseparated"
+            elif den_key[0] == "peer":  # Win is only against v0.1.28 stock; against the peer it stays descriptive
+                verdict = "Faster" if ratio > 1 else "Slower"
             else:
                 verdict = "Win" if ratio > 1 else "Regression"
             result.append({"group": group, "metric": metric, "arm": num_key, "baseline": den_key, "value": num,
@@ -227,8 +232,9 @@ def comparisons(manifest):
                                          c["arm"][1] or "", c["baseline"][0]))
 
 
-def effect_is_win(row):  # a native-engine (different artifact) comparison is never a win
-    return (row["kind"] == "effect" and row["verification"]["state"] == "Verified" and row.get("baseline_arm") not in NATIVE_BASELINES
+def effect_is_win(row):  # a native-engine (different artifact) or peer comparison is never a win
+    return (row["kind"] == "effect" and row["verification"]["state"] == "Verified"
+            and row.get("baseline_arm") not in (*NATIVE_BASELINES, "peer")
             and row["status"] in ("Qualified", "Descriptive") and row.get("ci95") is not None and row["ci95"][0] > 0)
 
 
@@ -360,13 +366,17 @@ def render(manifest, scoreboards, manifest_sha256):
             f"| {fams[x['family']]['title']} | {arm_label((x['arm'], x['variant']))}"
             f"{' vs ' + BASELINE_ARMS[x['baseline_arm']] if x['kind'] == 'effect' else ''} | "
             f"{row_value(x)} {tag(x)} | {x['note']} | `{x['control_of']}` | `{x['id']}` |" for x in controls]
-    out += ["", "## Open gaps", "", "| Family | Metric | Missing arms | Arms with only failed runs |", "|---|---|---|---|"]
+    out += ["", "## Open gaps", "", "An arm counts as measured when a verified row measures it, or when a verified effect "
+            "(Q3 tier and controls included) uses it as the baseline. The Q3 verdicts of record measure task makespan; "
+            "the other metrics below are F2 fixed-six scope (successor scope under option B).", "",
+            "| Family | Metric | Missing arms | Arms with only failed runs |", "|---|---|---|---|"]
     for fam in fams:
-        frows = [r for r in rows if r["family"] == fam]
+        frows = [r for r in manifest["rows"] if r["family"] == fam]
         for gap in GAP_METRICS:
             missing, failed = [], []
             for arm in ARMS:
-                arm_rows = [r for r in frows if r["arm"] == arm and METRICS[r["metric"]][3] == gap]
+                arm_rows = [r for r in frows if METRICS[r["metric"]][3] == gap
+                            and (r["arm"] == arm or (r["kind"] == "effect" and r.get("baseline_arm") == arm))]
                 if any(r["verification"]["state"] == "Verified" and r["status"] != "Failure" for r in arm_rows):
                     continue
                 failed_arm = any(r["status"] == "Failure" and r["arm"] == arm for r in frows)

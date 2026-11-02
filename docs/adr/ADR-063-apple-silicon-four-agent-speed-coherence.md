@@ -906,13 +906,19 @@ declares none). The
 reviews' scoreboard sentences and disclosures are in the tier's "Family
 notes". Per family:
 
-- **Qwen3.8 27B (Q3 v7, hf2q 38485a23): Win against v0.1.28.** The four-task
-  makespan is 26.4% shorter (95% CI 24.7–28.0%, 6 blocks). Against the peer,
-  hf2q finishes 31.5% sooner (CI 31.1–31.9%), while the peer emits 1.91× the
-  completion tokens at a 1.31× per-token rate, and hf2q's worst-slot p95 TTFT
-  is 1.69× the peer's. n1 is neutral against stock (−1.8%). The v8 controls
-  measured 3+1 (25.9% sooner than stock) and 2+2 (23.0%); 1+3 is unmeasured
-  after a width-only halt at the peer warmup.
+- **Qwen3.8 27B (Q3 v7, hf2q 38485a23): Win against v0.1.28; pending v11.**
+  The four-task makespan is 26.4% shorter (95% CI 24.7–28.0%, 6 blocks).
+  Against the peer without speculation (`--spec-type none`, a matched
+  comparison, not the peer's best configuration), hf2q finishes 31.5% sooner
+  (CI 31.1–31.9%), while that peer emits 1.91× the completion tokens at a
+  1.31× per-token rate, and hf2q's worst-slot p95 TTFT is 1.69× its. n1 is
+  neutral against stock (−1.8%). The v8 controls measured 3+1 (25.9% sooner
+  than stock) and 2+2 (23.0%); 1+3 is unmeasured after a width-only halt at
+  the peer warmup. The D2 drafter comparison measured the peer with its own
+  MTP head at 77.7 s median makespan against 82.3 s for hf2q's Q3
+  configuration on the same workload (Q3 closure review finding 1). The
+  best-configuration peer is re-run in Q3 v11, pre-registered on #369 on
+  2026-11-02, and its result replaces this record.
 - **DeepSeek-V4 Flash (Q3 v7, hf2q 38485a23): Unavailable.** The same-GGUF
   peer runs out of memory (prior evidence). Against stock, hf2q finishes 24.7%
   sooner (CI 23.8–25.6%, 5 blocks), shown in the tier as a Win against
@@ -922,6 +928,11 @@ notes". Per family:
   (CI 3.0–7.4%; task makespan only, with the disclosed parity gaps; never a
   Win). The ds4 artifact sha256 is per HF LFS metadata and not yet locally
   re-hashed. Every mixed stage is unmeasured (structural stock-warmup halts).
+  The DeepSeek-V4 Q1 numerical endpoint captures are deferred to v0.1.29
+  (#549; #367 comment 6566342659; their 119.18 GiB preload floor exceeds the
+  host's 109.34 GiB), so DeepSeek-V4 quality in v0.1.28 is the paired
+  task-quality gate against v0.1.28 and against ds4, plus the S3 bitwise
+  joint == serial check.
 - **Qwen3.6 35B-A3B (Q3 v10, hf2q 38485a23): Failed** (Q3 rule 1). The n4
   experiment warmup failed its task (agent-2, E0282, no repair turn allowed);
   0 paired blocks, so no speed effect. Stock v0.1.28 failed the same way; the
@@ -939,6 +950,13 @@ copy of its `campaign.json`. `deepseek4-native-ds4/verdict.json` carries the
 native statement labelled hf2q 38485a23 (the frozen v8 file says "main HEAD").
 `qwen38-controls/verdict.json` binds both Qwen3.8 quality-gate manifests and
 the v7 patch review.
+
+The root session ran every Q3 campaign (`qe_identity` `root-resume-20261030`)
+rather than a separate QE session or host. Q3's independence requirement is
+met by substitution: independent reviewers who did not implement the
+candidates reproduced every verdict from the raw receipts
+(`docs/research/adr063-q3-campaign.md`, "Independent QE and reproduction";
+`$E/reviews/adr063-q3-closure-v1.md`, finding 5).
 
 ## Consequences
 

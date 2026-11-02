@@ -402,6 +402,25 @@ def campaign_note(verdict, manifest, root):
         "" if halt is None else f": halted at {halt['stage'] or 'campaign'} entry {halt['entry']} ({halt['reason']})")
 
 
+def _argv_pairs(value):
+    """Every adjacent (flag, value) pair in any list of a JSON document."""
+    if isinstance(value, dict):
+        for v in value.values():
+            yield from _argv_pairs(v)
+    elif isinstance(value, list):
+        yield from ((a, b) for a, b in zip(value, value[1:]) if isinstance(a, str) and isinstance(b, str))
+        for v in value:
+            yield from _argv_pairs(v)
+
+
+def peer_speculation_off(manifest):
+    """Whether the same-GGUF peer arm ran `--spec-type none`, read from the case files its runs launched."""
+    cases = {a["case"] for e in entries(manifest, arm="peer") for a in e["attempts"] if a.get("case")}
+    return any(("--spec-type", "none") in set(_argv_pairs(json.loads(Path(c).read_text())))
+               for c in cases if Path(c).is_file())
+
+
+
 def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=None):
     """F2 scoreboard rows (hf2q.f2.scoreboard-rows.v1 vocabulary) for the primary effects of one campaign; for a
     controls-only campaign, the completed control stages' effects (status Descriptive) and each failed experiment
@@ -426,7 +445,8 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
     native_label = peer_arm.get("label") if native else None
     comparison = f2_q3_tier.NATIVE_COMPARISON if plan.get("native_comparison") else None
     peer_note = (f"{native_label}; different artifact, task makespan only, not the same-GGUF peer verdict"
-                 if native_label else "peer best valid configuration")
+                 if native_label else f2_q3_tier.PEER_SPEC_OFF if peer_speculation_off(manifest)
+                 else "peer best valid configuration")
     if native_label:
         native_note = native_peers.audit(native).note
     ref = "$E/" + str((campaign_dir / "verdict.json").relative_to(root))
