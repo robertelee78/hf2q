@@ -360,6 +360,32 @@ Priority: High. Core scope.
 
 Delivery boundary: Measured evidence or qualified implementation merged to main for v0.1.28.
 
+**Result (2026-11-02, M5 Max 128 GB; `docs/research/adr063-d2-drafter-comparison.md`).**
+No current pretrained external drafter qualifies as successor scope; D2 closes
+negative for DFlash2 and DSpark on Qwen3.8 27B at four slots. Primary group
+(vanilla target, 3 interleaved passes, lexicographic rule completion, final
+tests, Q5 memory tier, median makespan), best first: P1 (peer MTP) 77.7 s, H0
+81.4 s, H1 82.3 s, T2 (official DFlash2 on TensorFold) 90.7 s, P0 118.9 s, then
+P3 (peer DSpark) and T0 (TensorFold copy-draft baseline), both arm-negative on a
+task failure. The peer's DFlash2 (P2) corrupted tool-call output at four slots
+and failed qualification. DSpark's one passing run on the primary workload
+(qualification, 107.9 s) is behind H1, and it ranks above H1 only on the
+abliterated target (group A), which the rule does not accept in place of the
+primary rank. H1 does not beat H0 at N4, consistent with D1. P1, a
+pre-registered arm, ranks above H1 in the primary group and in A, but Q5
+stopped its long-context run with `Stopped: swap_growth` (swap +1.22 GB over
+baseline). That memory veto means it is not successor scope as-is; it is the
+strongest observation for successor MTP work. The TensorFold target tokenizer
+differs from the base one hf2q serves (same vocab and merges; different
+pre-tokenizer regex and offset/decoder options), so the T arms are near-exact
+target matches. Long context (2 passes, about 40k-token prompts): the order is
+P0 574.5 s, H0 581.0 s, H1 594.8 s, then T2 (one pass at 1034.5 s, one Q5
+`Stopped: free_cached_floor`) and P1 (`Stopped: swap_growth`). Non-repetitive
+code (2 task instances, 13 of 14 runs with data; N1-P0 was refused by the
+quiet-host preflight): P1 78.1 s, T2 86.0 s, H1 89.6 s, then P3 108.8 s, T0,
+H0 (one task failure) and P0. N does not veto P1, and T2's N gain cannot
+override its primary rank, so neither DFlash2 nor DSpark is successor scope.
+
 ## K. Apple Silicon kernels and ownership
 
 ### K1. Tune October small-row quantized verifier and decode dispatch
