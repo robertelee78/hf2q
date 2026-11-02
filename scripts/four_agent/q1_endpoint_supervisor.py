@@ -36,7 +36,9 @@ PLANNED_FIELD = {'gemma': 'planned_tensor_payload', 'qwen38': 'planned_tensor_pa
 FIRST_TRAJECTORY = 'T0ColdSerial'  # every family's T0
 HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT)
 LOCALIZER_SCHEMA = 'hf2q.adr063.q1.stage-localizer.v1'
-LOCALIZER_CASE_KEYS = {'kind', 'out', 'packet', 'operating_review', 'filter', 'packet_env', 'completion_marker', 'marker_stream'}
+# The per-case operating review is passed on the command line (--operating-review), never pinned in the
+# bindings: it must name BINDINGS_SHA256 and this copy's sha256, so pinning it there would be a hash cycle.
+LOCALIZER_CASE_KEYS = {'kind', 'out', 'packet', 'filter', 'packet_env', 'completion_marker', 'marker_stream'}
 # Rust-side localizer token lengths: Gemma 128 prompt + 16 forced; DS/Qwen 64 or 128.
 LOCALIZER_TOKENS = {'gemma': (144,), 'qwen38': (64, 128), 'qwen36': (64, 128), 'deepseek': (64, 128)}
 GEMMA_DEFAULT_WARM_KERNEL = 'VecHybrid'  # shipped since #544; packets must declare any other
@@ -201,7 +203,9 @@ def validate_endpoint(out, b, case, packet, identity, policy):
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument('--case', required=True); args = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument('--case', required=True)
+    ap.add_argument('--operating-review', required=True, help='absolute path of the independent per-case operating review')
+    args = ap.parse_args()
     require(sys.flags.isolated and __debug__ and BINDINGS is not None and BINDINGS_SHA256 is not None, 'PENDING sha-pinned bindings in the instance copy')
     bindings_bytes = checked_bytes(BINDINGS, BINDINGS_SHA256, 'sha-pinned bindings'); b = json.loads(bindings_bytes)
     require(b['schema'] == SCHEMA and b['final_approval'] is True and b['family'] in RESTORE64_FIELD and args.case in b['cases'], 'closed approved family bindings')
@@ -217,7 +221,8 @@ def main():
     require(sha('/usr/bin/meminfo') == obs['meminfo_sha256'] and sha('/usr/bin/osascript') == obs['thermal_sha256'], 'reviewed observation binaries')
     deny = reviewed_denylist(bound(obs['denylist_source'], 'reviewed denylist source'))
     policy = load(b['resource_policy'], 'resource policy binding'); require(policy['family'] == b['family'] and policy['physical_admission'] is False, 'family resource policy')
-    operating = load(case['operating_review'], 'operating review binding')
+    require('operating_review' not in case and Path(args.operating_review).is_absolute(), 'operating review is a launch argument, not a bindings entry')
+    operating_bytes = Path(args.operating_review).read_bytes(); operating = json.loads(operating_bytes); operating_sha = hashlib.sha256(operating_bytes).hexdigest()
     require(operating == dict(schema=REVIEW_SCHEMA, verdict='AcceptedForOneAttempt', family=b['family'], case=args.case, composition_sha256=b['composition']['sha256'], policy_sha256=b['resource_policy']['sha256'], bindings_sha256=BINDINGS_SHA256, supervisor_sha256=sha(__file__), physical_admission=False), 'closed per-case operating review; not physical fit')
     packet = load(case['packet'], 'disabled packet binding'); model = Path(packet['model']); expected_stat = composition['model_file']
     def stat_model():
@@ -232,7 +237,7 @@ def main():
     acquisition = dict(composition=b['composition'], independent_review=b['acquisition_review'])
     require(packet.get('acquisition') in (None, acquisition) or packet['acquisition']['composition'] == b['composition'], 'packet composition binding')
     packet.update(execution_approved=True, acquisition=acquisition, output=str(out / 'output'))
-    os.umask(0o077); out.mkdir(mode=0o700); shutil.copy2(__file__, out / 'supervisor.py'); (out / 'bindings.json').write_bytes(bindings_bytes); subprocess.run(['/bin/cp', '-c', str(binary), str(out / 'test-binary')], check=True, timeout=30); shutil.copy2(parser_source, out / 'meminfo_interface.py'); save(out / 'resource-policy.json', policy); save(out / 'acquisition-composition.json', composition); save(out / 'acquisition-review.json', review)
+    os.umask(0o077); out.mkdir(mode=0o700); shutil.copy2(__file__, out / 'supervisor.py'); (out / 'bindings.json').write_bytes(bindings_bytes); subprocess.run(['/bin/cp', '-c', str(binary), str(out / 'test-binary')], check=True, timeout=30); shutil.copy2(parser_source, out / 'meminfo_interface.py'); save(out / 'resource-policy.json', policy); save(out / 'acquisition-composition.json', composition); save(out / 'acquisition-review.json', review); (out / 'operating-review.json').write_bytes(operating_bytes)
     save(out / 'packet.json', packet)
     tree = ast.parse(sampler_source.read_text()); nodes = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in ('sample', 'proc_fields', 'ledger_ready')]; require(len(nodes) == 3, 'three exact reviewed observation functions')
     assignments = {n.targets[0].id: n.value for n in tree.body if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)}; POLICY = ast.literal_eval(assignments['POLICY']); POLICY.update(preload_free_floor_bytes=policy['preload_available_floor_bytes'], runtime_free_floor_bytes=policy['runtime_available_floor_bytes'], reserve_free_bytes=policy['reserve_bytes'], overshoot_margin_bytes=policy['reaction_overshoot_bytes'], process_rss_abort_bytes=policy['process_rss_limit_bytes'], process_footprint_abort_bytes=policy['process_footprint_limit_bytes'])
@@ -244,7 +249,7 @@ def main():
     require(globals_used <= set(namespace) | set(dir(builtins)), 'missing observer globals:' + repr(globals_used - set(namespace) - set(dir(builtins))))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(sampler_source), 'exec'), namespace); sample = namespace['sample']
     deadline = policy['deadline_seconds']
-    result = dict(family=b['family'], case=args.case, kind=plan['kind'], case_complete=False, mode=mode, model_launch_attempted=False, physical_admission=False, performance_qualified=False, whole_q1_qualified=False); child = None
+    result = dict(family=b['family'], case=args.case, kind=plan['kind'], operating_review_sha256=operating_sha, case_complete=False, mode=mode, model_launch_attempted=False, physical_admission=False, performance_qualified=False, whole_q1_qualified=False); child = None
     for sig in HANDLED_SIGNALS: signal.signal(sig, interrupt)
     def available(x, owned): return x['physical']['free'] + x['physical']['cached_files'] - sum(disk_bytes(o) for o in owned)
     try:
