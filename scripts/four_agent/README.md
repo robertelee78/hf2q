@@ -248,7 +248,7 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/peer-deepseek4-client-approval.json \
 - **Q3/Q1.** In `q3_campaign.py` the case is a `--peer-case` together with the same-GGUF `--peer-unavailable-evidence`. The plan labels the arm, and the same-model rule exempts it. Launch refuses a native artifact whose file name is not the ds4f-q2 file, or whose sha256 equals the hf2q artifact's.
   - The family verdict stays `Unavailable` (no same-GGUF peer).
   - `verdict.json` `native_peer` reports "finishes the same coding task X% sooner", with token volumes, output tokens/s, the TTFT ratio and per-run recovery counts. The statement is withheld when ds4 is unavailable, when either arm failed, or when any ds4 run shows tool-call recovery.
-  - F2 rows use baseline `ds4_native`. They never count as wins: the scoreboard renders them in their own "Native-engine comparisons" section, with the statement and the companion figures.
+  - F2 rows use baseline `ds4_native`. They never count as wins: the scoreboard renders them in their own "Native-engine comparisons" section, with the statement and the companion figures. A campaign with a native peer arm emits only these native rows (plus control failure rows), never an experiment-vs-stock row: that effect is of record only in the same-GGUF campaign.
   - In `quality_campaign.py` it is `--reference-kind ds4-native`.
   - Ambient `HF2Q_Q5_MODEL`/`MODEL_SHA256`/`CLIENT_APPROVAL_TEMPLATE` would also reach this case, so pass its values with `--peer-var`/`--reference-var`.
   - ds4 cohorts are not Q2-certified: `q2_certify.py` refuses every native engine kind and `peer` (only hf2q writes the server phase trace). Q3/Q1 audit them with `q2_run_audit.py`.

@@ -691,7 +691,7 @@ class ControlsOnly(Harness):
         self.assertTrue(verdict["native_peer"]["3+1"]["statement"].startswith(
             "main HEAD finishes the same coding task 20.0% sooner than ds4 c97964b"))
         rows = q3_report.rows(out, self.root)
-        self.assertEqual({r["baseline_arm"] for r in rows["rows"]}, {"v0128_stock", "ds4_native"})
+        self.assertEqual({r["baseline_arm"] for r in rows["rows"]}, {"ds4_native"})  # native-peer campaign: native rows only
         self.assertEqual({(r["status"], r["control_of"]) for r in rows["rows"]},
                          {("Descriptive", "$E/evidence/q3-deepseek4/verdict.json")})
         native_row = next(r for r in rows["rows"] if r["baseline_arm"] == "ds4_native")

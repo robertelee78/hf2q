@@ -761,13 +761,15 @@ This decision establishes no speed win and changes no same-GGUF verdict.
 ### F2 closure scope: option B (operator decision 2026-10-31/11-01)
 
 The operator approved option B of the F2 intent review
-(`$E/reviews/adr063-f2-intent-v1.md` §5 B) as the closure scope of F2
-(#357). F2 closes when the scoreboard shows, for each family:
+(`$E/reviews/adr063-f2-intent-v1.md` §5 B) on 2026-10-31/11-01 as the closure
+scope of F2 (#357). Its statistics are the Q3 design statistics (5–20
+Williams blocks, sequential 2.5-point precision stop); that sequential rule
+is the Q3 rule pre-registered on #369, not a new choice made for F2. F2
+closes when the scoreboard shows, for each family:
 
 - **A Q3 verdict of record:** Win, Loss, Unavailable or Failed, from an
   independently reviewed `verdict.json` under the predeclared Q3 design
-  (Williams blocks, 5 to 20 per stage, 2.5-point precision stop;
-  `docs/research/adr063-q3-campaign.md`).
+  (`docs/research/adr063-q3-campaign.md`).
 - **Controls:** the `n1` one-slot control and the `3+1`, `2+2` and `1+3`
   mixed-phase controls, reported as controls of that record. A mixed-stage
   width halt shows as campaign status `Invalid` and does not change the

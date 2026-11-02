@@ -389,8 +389,9 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
             **({"q3_of_record": True} if of_record else {})}
     for prefix, control, stage, section_native in sections:
         peer_gone = verdict["verdict"] == "Unavailable" if control is None else bool(verdict["peer"]["unavailable"].get("peer"))
-        # a native-comparison campaign is not the verdict of record: its experiment-vs-stock effect is never a row
-        contrasts = (() if comparison else (("vs_stock", "v0128_stock"),)) + (("vs_peer", native_baseline),)
+        # A campaign whose peer arm is a native engine (ds4, TensorFold) is never the verdict of record: it emits
+        # only its native row(s), never experiment-vs-stock (that effect belongs to the same-GGUF campaign of record).
+        contrasts = (() if native else (("vs_stock", "v0128_stock"),)) + (("vs_peer", native_baseline),)
         tables = [("makespan_s", "effects", stage["effects"])]
         tables += [(m, f"secondary.{m}", stage["secondary"][m]) for m in f2_q3_tier.FAIRNESS] if of_record else []
         for metric, where, table in tables:
