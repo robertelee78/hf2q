@@ -380,9 +380,11 @@ differs from the base one hf2q serves (same vocab and merges; different
 pre-tokenizer regex and offset/decoder options), so the T arms are near-exact
 target matches. Long context (2 passes, about 40k-token prompts): the order is
 P0 574.5 s, H0 581.0 s, H1 594.8 s, then T2 (one pass at 1034.5 s, one Q5
-`Stopped: free_cached_floor`) and P1 (`Stopped: swap_growth`). The
-non-repetitive code runs are being rerun (12 of 14 have no data yet); they
-cannot make DFlash2 or DSpark successor scope.
+`Stopped: free_cached_floor`) and P1 (`Stopped: swap_growth`). Non-repetitive
+code (2 task instances, 13 of 14 runs with data; N1-P0 was refused by the
+quiet-host preflight): P1 78.1 s, T2 86.0 s, H1 89.6 s, then P3 108.8 s, T0,
+H0 (one task failure) and P0. N does not veto P1, and T2's N gain cannot
+override its primary rank, so neither DFlash2 nor DSpark is successor scope.
 
 ## K. Apple Silicon kernels and ownership
 

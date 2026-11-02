@@ -1,8 +1,8 @@
 # ADR-063 D2 (#365): current pretrained drafters at four slots — result
 
-Date: 2026-11-02. Host: M5 Max 128 GB (`runs-v2/host-sysctl.txt`). Status: primary,
-abliterated (A) and qualification complete; non-repetitive code (N) being
-rerun (see §6); long context (LC) complete (see §7).
+Date: 2026-11-02. Host: M5 Max 128 GB (`runs-v2/host-sysctl.txt`). Status:
+qualification, primary, abliterated (A), non-repetitive code (N) and long
+context (LC) are all complete. One N run (N1-P0) has no data (§6).
 
 `$E` = `/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023`;
 `$D2` = `$E/d2-v1`. Every path below is relative to `$D2` unless absolute. The
@@ -29,21 +29,25 @@ as-is either; it is the strongest observation for successor MTP work.**
   qualification (§3). At long context it passed one of two runs (1034.5 s vs
   H1's 594.8 s median, the slowest passing LC run) and Q5 stopped the other on
   the free+cached floor (`free_cached_floor`) with 2 of 4 agents complete
-  (§7).
+  (§7). On non-repetitive code T2 beats H1 (86.0 vs 89.6 s median, 2/2
+  complete; §6), but the rule needs the primary rank, so N cannot make it
+  successor scope.
 - **DSpark** (Red Hat speculators): in the primary group P3 is arm-negative
   (one agent broke the six-step workflow; 0/4 completion; dropped from later
   passes per the pre-registered rule; §4, §8). Its only primary-workload pass,
   the qualification run, completed 4/4 at 107.9 s (P0 121.5 s, P1 81.1 s in the
   same qualification set, harness 005c9707; §3), still behind H1's 82.3 s.
   It ranks above H1 only on the abliterated target (A, 71.4 s vs 93.1 s), and the
-  rule requires the primary rank, so A cannot make it successor scope.
+  rule requires the primary rank, so A cannot make it successor scope. On
+  non-repetitive code it completes 2/2 but ranks below H1 (108.8 vs 89.6 s; §6).
 - **Native MTP + history (H1)** does not beat H0 (speculation off) at N4:
   82.3 s vs 81.4 s median in the primary group, consistent with D1's measured
   Loss for `auto` at N4 (`docs/research/adr063-d1-speculation-qualification.md`
   §7, r = 1.020, CI 1.0095–1.0308).
 - **P1 (peer `draft-mtp`, the target's own MTP head), under the rule:** ranks
   above H1 in the primary group (77.7 s median, 4/4 completion, 3/3 Q5 pass,
-  worst headroom 2.00 GB) and in A (53.1 s vs 93.1 s). N is pending (§6). In LC
+  worst headroom 2.00 GB), in A (53.1 s vs 93.1 s) and in N (78.1 vs 89.6 s;
+  so N does not veto it, §6). In LC
   pass 1, Q5 stopped it with `Stopped: swap_growth` (swap grew 1,224,338,309 B,
   about 1.22 GB, over baseline against a 0.5 GiB tolerance;
   `long-context-runs/passes/04-LC-P1-20261102T104157Z/receipt.json`
@@ -256,40 +260,83 @@ modified trunk (acceptance 0.48 for DSpark vs 0.53 on vanilla; MTP 0.78 vs
 abliterated target's agents produce different trajectories (peer arms are
 faster here, hf2q arms slower), so A answers compatibility, not ranking.
 
-## 6. Non-repetitive code (N) — being rerun
+## 6. Non-repetitive code (N)
 
 Cases `cases/extra/N{1,2}-{H0,H1,P0,P1,P3,T0,T2}.json` (task instances 1
-`parse_privileged_port` and 2 `parse_vlan_id`; 14 pre-registered runs).
-State at the time of writing (`extra-runs/N/summary.tsv`):
-
-| Run | Arm | Q5 | Completion | Quality | Makespan s | Note |
-|---|---|---|---|---|---|---|
-| `01-N1-H1-20261102T054653Z` | H1 | CalibrationPass | 4/4 | 4/4 | 88.2 | drafted 39, accepted 19 |
-| `02-N1-H0-20261102T054830Z` | H0 | ClientFailed | 0/4 | 3/4 | – | `task-failed:Invalid: initial six-step workflow not followed` (agent 0) |
-| `03-N1-P0-20261102T100003Z` | P0 | PreflightRefused | – | – | – | `competing runtime(s): 35678:build, 60983:build` (`run_extra_n_rerun.log`) |
-
-12 of the 14 runs have no data yet: N1-P0 was refused, and the 11 runs after it
-(N1-P1 … N2-H1) were never attempted. N1-H0 first halted `run_extra.sh` under the
-original halt rule (§9). The resumed `run_extra_n_rerun.sh` then hit Q5's
-quiet-host preflight: a transient `cargo test --no-run` build (rustc processes)
-was running on the host at 10:00Z, Q5 refused to launch, and the script halted
-as an infrastructure failure, which is correct under the v3 policy. The N runs
-are being rerun after LC finishes, with the same resumable script, which skips
-cases already recorded:
+`parse_privileged_port` and 2 `parse_vlan_id`; 14 pre-registered runs, runner
+188c277e). Runs 01–02 come from `run_extra.sh`. Runs 03–14 come from the resumable
+`run_extra_n_rerun.sh` (`run_extra_n_rerun.log`, exit 0), which writes to the same
+`extra-runs/N/` and skips cases already recorded in `extra-runs/N/summary.tsv`
+(sha256 `4b842f6f…b5a9`). Command:
 
 ```sh
-bash $D2/run_extra_n_rerun.sh 2>&1 | tee -a $D2/run_extra_n_rerun.log
-python3 -B $D2/extract.py table $D2/extra-runs/N
+python3 -B $D2/extract.py table $D2/extra-runs/N \
+    --json $D2/extra-runs/N/d2-extract.json --md $D2/extra-runs/N/d2-extract.md
 ```
 
-<!-- TODO(N): when the N rerun finishes, add the extract.py per-run and per-arm
-tables for all arms (N1 and N2: H0 H1 P0 P1 P3 T0 T2), the N order, and each
-arm's rank vs H1; then update the P1 bullet in §1. -->
+Per run (`extra-runs/N/d2-extract.md`, sha256 `1a7adb03…2287`):
 
-Effect on the decision: none for the external drafters. The rule makes N a
-veto on an arm that already ranks above H1 in the primary group; neither
-DFlash2 (T2) nor DSpark (P3) does. N matters only for P1, which already fails
-the memory tier in LC (§7).
+| Run | Arm | Q5 | Completion | Quality | Makespan s | Headroom GB | Peak GB | Acc/draft | Emitted/verify step | Tok/decode-s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `01-N1-H1-20261102T054653Z` | H1 | CalibrationPass | 4/4 | 4/4 | 88.2 | 48.52 | 59.69 | 0.49 | 2.46 | 12.90 |
+| `02-N1-H0-20261102T054830Z` | H0 | ClientFailed | 0/4 | 3/4 | – | 53.69 | 54.94 | – | – | 12.99 |
+| `03-N1-P0-20261102T100003Z` | P0 | PreflightRefused | – | – | – | – | – | – | – | – |
+| `04-N1-P1-20261102T115222Z` | P1 | CalibrationPass | 4/4 | 4/4 | 76.9 | 4.00 | 106.89 | 0.83 | 3.47 | 27.26 |
+| `05-N1-P3-20261102T115351Z` | P3 | CalibrationPass | 4/4 | 4/4 | 107.2 | 3.66 | 111.26 | 0.53 | 4.66 | 18.42 |
+| `06-N1-T0-20261102T115551Z` | T0 | CalibrationPass | 4/4 | 4/4 | 116.7 | 8.91 | 94.63 | 0.37 | 1.15 | 24.46 |
+| `07-N1-T2-20261102T115800Z` | T2 | CalibrationPass | 4/4 | 4/4 | 88.5 | 5.59 | 96.33 | 0.56 | 5.36 | 94.90 |
+| `08-N2-T2-20261102T115939Z` | T2 | CalibrationPass | 4/4 | 4/4 | 83.5 | 4.94 | 96.51 | 0.58 | 5.57 | 106.11 |
+| `09-N2-T0-20261102T120114Z` | T0 | CalibrationPass | 4/4 | 4/4 | 113.0 | 7.22 | 94.56 | 0.46 | 1.21 | 25.25 |
+| `10-N2-P3-20261102T120317Z` | P3 | CalibrationPass | 4/4 | 4/4 | 110.5 | 4.42 | 111.80 | 0.56 | 4.84 | 18.80 |
+| `11-N2-P1-20261102T120520Z` | P1 | CalibrationPass | 4/4 | 4/4 | 79.4 | 6.86 | 105.89 | 0.86 | 3.54 | 26.83 |
+| `12-N2-P0-20261102T120653Z` | P0 | CalibrationPass | 4/4 | 4/4 | 121.0 | 19.26 | 98.86 | – | 1.00 | 15.92 |
+| `13-N2-H0-20261102T120906Z` | H0 | CalibrationPass | 4/4 | 4/4 | 90.8 | 57.00 | 54.96 | – | – | 13.80 |
+| `14-N2-H1-20261102T121045Z` | H1 | CalibrationPass | 4/4 | 4/4 | 91.1 | 51.43 | 59.79 | 0.79 | 3.36 | 13.92 |
+
+Per arm (same file):
+
+| Arm | Runs | Q5 pass | Completion | Quality | Worst headroom GB | Median peak GB | Median makespan s | Acc/draft | Acc/verify step | Tok/decode-s | Tok/makespan-s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| H0 | 2 | 1 | 0.50 | 0.88 | 53.69 | 54.95 | 90.8 | – | – | 13.39 | 39.16 |
+| H1 | 2 | 2 | 1.00 | 1.00 | 48.52 | 59.74 | 89.6 | 0.72 | 2.15 | 13.41 | 40.31 |
+| P0 | 2 | 1 | 0.50 | 0.50 | 19.26 | 98.86 | 121.0 | – | – | 15.92 | 52.15 |
+| P1 | 2 | 2 | 1.00 | 1.00 | 4.00 | 106.39 | 78.1 | 0.84 | 2.51 | 27.05 | 84.27 |
+| P3 | 2 | 2 | 1.00 | 1.00 | 3.66 | 111.53 | 108.8 | 0.55 | 3.75 | 18.61 | 60.78 |
+| T0 | 2 | 2 | 1.00 | 1.00 | 7.22 | 94.59 | 114.8 | 0.41 | 0.18 | 24.85 | 54.58 |
+| T2 | 2 | 2 | 1.00 | 1.00 | 4.94 | 96.42 | 86.0 | 0.57 | 4.47 | 100.50 | 74.37 |
+
+**N order** (`extract.py`; completion, quality, memory tier, median makespan):
+**P1 > T2 > H1 > P3 > T0 > H0 > P0.** P1 and T2 rank above H1; P3, T0, H0 and
+P0 rank below.
+
+Reading notes:
+- **N1-P0 has no data.** It was refused by Q5's quiet-host preflight (a
+  transient `cargo test --no-run` build at 10:00Z; `competing runtime(s):
+  35678:build, 60983:build`). The resumable script skipped it as already
+  recorded, so it was never re-attempted. `extract.py` counts the refused run
+  as 0/4 completion and 0/4 quality, so P0's aggregate 0.50/0.50 reflects an
+  infrastructure refusal, not a task result. P0's only N run (N2) is 4/4,
+  121.0 s. P0 is a baseline, so this does not affect any verdict.
+- **N1-H0** is a real task failure (agent 0 broke the six-step workflow). Under
+  the v3 policy it is `task-negative` and H0 stayed in the block (§9).
+- **P3 and T0** completed both N runs, so their primary failures (§4) did not
+  recur on non-repetitive code.
+
+**N veto per arm** (README v2 rule: an arm that ranks above H1 in the primary
+group is successor scope only if N does not contradict it):
+
+| Arm | Primary rank vs H1 | N rank vs H1 | N veto | Outcome |
+|---|---|---|---|---|
+| P1 (peer MTP) | above | above (78.1 vs 89.6 s) | not contradicted | still vetoed by memory in LC (§7) |
+| H0 (baseline) | above | below (task failure in N1) | contradicted | baseline, not a candidate |
+| T2 (DFlash2) | below | above (86.0 vs 89.6 s) | n/a | the N gain cannot override the primary rank; also negative in LC |
+| P3 (DSpark) | below (arm-negative) | below (108.8 s) | n/a | not successor scope |
+| T0, P0 | below | below | n/a | baselines |
+
+Effect on the decision: none. DFlash2 beats H1 on non-repetitive code
+(86.0 vs 89.6 s median, 2/2 complete) but ranks below H1 in the primary group
+and fails LC. DSpark ranks below H1 in N too. N confirms P1's lead over H1
+(78.1 vs 89.6 s), but P1 remains vetoed on memory at long context.
 
 ## 7. Long context (LC)
 
@@ -376,7 +423,7 @@ Per arm (same file):
 | P3 (peer DSpark), primary | arm-negative after run 1 | agent broke the six-step workflow; 0/4 completion, 3/4 final tests | `runs-v2/05-P3-dspark-20261102T050850Z`; `extract.py classify` → `task-failed:Invalid: initial six-step workflow not followed` |
 | T0 (TensorFold baseline), primary | arm-negative after run 1 | same task failure | `runs-v2/06-T0-tensorfold-20261102T051027Z`, same classify result |
 | T0/T2, group A | unavailable | no MLX checkpoint of the abliterated target | README v2 |
-| N1-P0 … N2-H1 (12 runs) | no data yet; being rerun | N1-P0 refused by Q5 quiet-host preflight (transient `cargo test --no-run` build); the 11 after it were not attempted | §6 |
+| N1-P0 | no data | refused by Q5 quiet-host preflight (transient `cargo test --no-run` build); skipped as already recorded by the resumable script, never re-attempted | §6 |
 | LC-P1 | arm-negative | Q5 `Stopped: swap_growth` (swap +1.22 GB over baseline; 0.33 GB headroom) | §7 |
 | LC-T2 | arm-negative after run 06 (pass 2) | Q5 `Stopped: free_cached_floor` (free+cached 0.37 GB below the effective floor), 2/4 agents complete | §7 |
 | LC-P3, LC-T0 | not run (by design) | P3 already below H1 on completion; T0 is not a candidate | README v3 |
@@ -385,7 +432,8 @@ The P3 and T0 primary failures are task failures (an agent violated the
 client's workflow), not memory or infrastructure; the same failure class hit
 reference arm H0 in N1, so it is not drafter-specific evidence by itself. The
 pre-registered drafter rule (drop after a failure) still applies and is kept.
-P3 passed both its qualification run and both A runs.
+P3 passed its qualification run, both A runs and both N runs; T0 passed both
+N runs.
 
 ## 9. Deviations (disclosed)
 
