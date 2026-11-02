@@ -543,6 +543,11 @@ impl MtpWeights {
             .context("MTP shift target nextn prefix")?;
         }
         enc.commit();
+        // Release the submitted copy now: the native observer retains a
+        // command for its checked drain only once the encoder drops, so an
+        // encoder held past the drain below stays unchecked until some later
+        // same-queue wait, or forever when this catch-up is the last GPU work.
+        drop(enc);
 
         let seq_len_u32 = u32::try_from(seq_len).context("MTP batch seq_len exceeds u32")?;
         let pos_buf = upload_i32(position_ids, device).context("MTP upload batch positions")?;

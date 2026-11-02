@@ -79,7 +79,15 @@ impl Config {
     }
 }
 
-const QUEUED_EVENTS: usize = 1024;
+/// A full queue fails the sink and invalidates the whole capture. Multi-slot
+/// decode submits about 1,000 events per 2 ms at peak; this bound absorbs such
+/// a burst during a writer park or stall and stays within half the reserved
+/// bookkeeping (checked at install).
+const QUEUED_EVENTS: usize = 2048;
+/// Events per trace lock and file write. One write per event cannot keep up
+/// with multi-slot decode submission; a bounded batch amortizes the write
+/// without holding the trace lock long against the worker's own records.
+const WRITE_BATCH: usize = 64;
 static STOP: AtomicBool = AtomicBool::new(false);
 static WRITER: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 struct Sink(SyncSender<SubmissionEvent>);
@@ -107,13 +115,27 @@ pub(super) fn install(config: &Config) -> Result<(), String> {
             let writer = std::thread::Builder::new()
                 .name("f2-native-trace".into())
                 .stack_size(256 * 1024)
-                .spawn(move || loop {
-                    match receiver.try_recv() {
-                        Ok(event) => super::publish("native_event", serde_json::json!(event)),
-                        Err(TryRecvError::Disconnected) => break,
-                        Err(TryRecvError::Empty) if STOP.load(Ordering::Acquire) => break,
-                        Err(TryRecvError::Empty) => {
-                            std::thread::park_timeout(std::time::Duration::from_millis(1))
+                .spawn(move || {
+                    let mut batch = Vec::with_capacity(WRITE_BATCH);
+                    loop {
+                        let mut idle = None;
+                        while batch.len() < WRITE_BATCH {
+                            match receiver.try_recv() {
+                                Ok(event) => batch.push(event),
+                                Err(error) => {
+                                    idle = Some(error);
+                                    break;
+                                }
+                            }
+                        }
+                        if !batch.is_empty() {
+                            super::publish_all("native_event", batch.drain(..));
+                            continue;
+                        }
+                        match idle {
+                            Some(TryRecvError::Disconnected) => break,
+                            Some(TryRecvError::Empty) if STOP.load(Ordering::Acquire) => break,
+                            _ => std::thread::park_timeout(std::time::Duration::from_millis(1)),
                         }
                     }
                 })
@@ -157,6 +179,14 @@ pub(super) fn final_status() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queue_and_write_batch_fit_reserved_bookkeeping() {
+        // `install` refuses a queue past half the bookkeeping; a native pin
+        // that grows the event must fail here, not at a traced launch.
+        let event = std::mem::size_of::<SubmissionEvent>();
+        assert!(QUEUED_EVENTS * event <= BOOKKEEPING_BYTES as usize / 2);
+        assert!((QUEUED_EVENTS + WRITE_BATCH) * event <= BOOKKEEPING_BYTES as usize);
+    }
     #[test]
     fn native_budget_is_carved_not_added_to_packet() {
         let config = Config {
