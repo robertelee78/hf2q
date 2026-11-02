@@ -266,7 +266,11 @@ class Audit(unittest.TestCase):
     def test_audit_refuses_contradicting_server_records(self):
         model = MODEL['qwen38']
         stream_line = line(model, use(cached=768), 'tool_calls', True)
-        cases = [{'lines': line(model, use(), 'length', False) + stream_line},
+        # A unary call is logged with the engine finish before parsing; a complete envelope parses after `length`.
+        with tempfile.TemporaryDirectory() as tmp:
+            accepted = audit.audit_run(*self.run_dir(Path(tmp), lines=line(model, use(), 'length', False) + stream_line))
+        self.assertEqual(accepted['requests'], 2)
+        cases = [{'lines': line(model, use(), 'error', False) + stream_line},
                  {'lines': line(model, use(completion=41), 'stop', False) + stream_line},
                  {'lines': line(model, use(), 'stop', True) + stream_line},  # unary served as a stream
                  {'lines': line(MODEL['qwen36'], use(), 'stop', False) + stream_line},
