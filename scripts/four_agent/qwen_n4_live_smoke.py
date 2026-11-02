@@ -87,6 +87,19 @@ def task_instance(packet, instance):
     return workload
 
 
+def workload_variant(packet, name):
+    """Explicit workload variant (coding_long_context.py) bound by the approval, or None for the canonical task."""
+    if name is None:
+        require("workload_variant" not in packet and "workload_fixture_sha256" not in packet,
+                "canonical workload approval carries a workload variant")
+        return None
+    from coding_long_context import select
+    variant = select(name)
+    require(packet.get("workload_variant") == name and
+            packet.get("workload_fixture_sha256") == variant.fixture_sha256, "workload variant approval binding")
+    return variant
+
+
 def preflight(base):
     return (set(base) - {"ctx262144_slots1_verified", "cpu_owned_io_3g_tool2g_client128m",
                          "profile24g_ack_verified"}) | {
@@ -229,9 +242,10 @@ def phase_trigger(directory, agents, run, token):
 
 
 def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen", instance_record=None,
-              phase_plan=None):
+              phase_plan=None, variant_record=None):
     """`instance_record` is the coordinator's {"id", "table_sha256"}; None for the canonical task.
-    `phase_plan` selects the active agents and each agent's cohort; None is all four together."""
+    `phase_plan` selects the active agents and each agent's cohort; None is all four together.
+    `variant_record` is the coordinator's workload variant {"id", "fixture_sha256"}; None for the canonical files."""
     family_contract.validate_selection(family, engine_kind, 4)
     agents = active_agents(phase_plan)
     require(set(results) == set(exits) == set(cleanup) == set(agents), "missing agent result")
@@ -257,6 +271,7 @@ def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwe
         require(result.get("initial_identity_sha256") == hashlib.sha256(identity(agent, run, instance).encode()).hexdigest(),
                 "aggregate prompt identity")
         require(result.get("instance") == instance_record, "aggregate task instance")
+        require(result.get("workload_variant") == variant_record, "aggregate workload variant")
         require(result.get("phase") == agent_phase(phase_plan, agent), "aggregate phase cohort")
         require(result.get("final_source_sha256") == result.get("observed_final_source_sha256")
                 and isinstance(result.get("final_source_sha256"), str), "final fixture changed")
@@ -292,6 +307,8 @@ def agent_command(args, module_dir, agent, path, approval_path, barrier, run, to
         command += ["--benchmark-profile", args.benchmark_profile]
     if args.instance is not None:
         command += ["--instance", str(args.instance)]
+    if args.workload is not None:
+        command += ["--workload", args.workload]
     phase = agent_phase(args.phase_plan, agent)
     if phase is not None:
         command += ["--phase-plan", phase["plan"], "--phase-cohort", str(phase["cohort"])]
@@ -310,6 +327,9 @@ def main():
     parser.add_argument("--instance", type=int,
                         help="quality-campaign task instance (row of fixtures/coding-instances.json); "
                              "omit for the canonical parse_port workload")
+    parser.add_argument("--workload",
+                        help="workload variant of the canonical task (coding_long_context.py: long-context-v1); "
+                             "omit for the canonical files")
     parser.add_argument("--phase-plan", choices=sorted(PHASE_PLANS),
                         help="ADR-063 Q3 control: '1' runs agent-0 alone; 'K+M' releases K agents, then the "
                              "other M once each of the K has its first decoded token; omit for all four at once")
@@ -358,6 +378,13 @@ def main():
             from coding_instances import MODULES as INSTANCE_MODULES
             names += INSTANCE_MODULES
             summary["instance"] = workload.record()
+        variant = workload_variant(packet, args.workload)
+        if variant is not None:
+            require(args.benchmark_profile is None and workload is None,
+                    "a workload variant runs the canonical task, without a benchmark profile or task instance")
+            from coding_long_context import MODULES as VARIANT_MODULES
+            names += VARIANT_MODULES
+            summary["workload_variant"] = variant.record()
         require(args.phase_plan is None or (workload is None and args.benchmark_profile is None),
                 "phase plans are controls of the canonical workload")
         native = None
@@ -395,7 +422,8 @@ def main():
                        "barrier_dir": str(barrier), "barrier_token": token, "agent_output": str(path),
                        "initial_identity_sha256": hashlib.sha256(identity(agent, run, args.instance).encode()).hexdigest(),
                        "sources": sources, "server_pid": args.server_pid, "base_url": args.base_url,
-                       "model": args.model, "approved": True, **({} if workload is None else workload.binding())}
+                       "model": args.model, "approved": True, **({} if workload is None else workload.binding()),
+                       **({} if variant is None else variant.binding())}
             approval_path = output / f"{agent}.approval.json"
             save_new(approval_path, binding)
             command = agent_command(args, module_dir, agent, path, approval_path, barrier, run, token)
@@ -478,7 +506,7 @@ def main():
         if summary["status"] != "Failed":
             try:
                 summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.engine_kind, args.family,
-                                              summary.get("instance"), args.phase_plan)
+                                              summary.get("instance"), args.phase_plan, summary.get("workload_variant"))
             except BaseException as exc:
                 summary["status"], summary["error"] = "Failed", str(exc)
         if summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview":

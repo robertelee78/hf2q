@@ -755,6 +755,14 @@ stock DFlash2 drafter `z-lab/Qwen3.8-27B-DFlash2@50307d4c`
   startup reserve, `/health` memory, slot waits), then net makespan.
   Accepted-per-drafted and tokens-per-round counts explain the result but never
   decide it.
+- **D2's long contexts use `--workload long-context-v1`.** The canonical
+  coding client reaches only about 2.8k prompt tokens per turn. The variant
+  keeps the canonical task, prompts, tools, workflow and grading, and appends a
+  pinned 150 KB read-only Rust module (`fixtures/long-context-v1.rs`) to
+  `tests/ports.rs`. Turns 2–6 then carry about 40k prompt tokens (estimated as
+  wire bytes / 4). Approvals and summaries bind the variant id and the fixture
+  sha256. T0 and T2 are derived with `coding_long_context.py derive-case`; see
+  `scripts/four_agent/README.md`.
 
 **oMLX arm (operator decision 2026-10-31).** oMLX 6b413c90 (version 0.7.3rc1,
 MLX/mlx-lm continuous batching) serves three families from mlx-community 4-bit
