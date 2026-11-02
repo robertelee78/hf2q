@@ -2,10 +2,11 @@
 
 - **Status:** Proposed
 - **Date:** 2026-11-02
+- **Updated:** 2026-11-02 — amended by the owner after a field report: UD-IQ1_S runs on a 128 GiB M5 Max (the peer, about 360 tok/s prefill and 35 tok/s decode). hf2q supports UD-IQ1_S on the M5 Max as its first V4.1 target, starting now; the M5 Ultra remains the target for the higher-quality versions.
 - **Deciders:** Robert E. Lee (product owner)
-- **Tags:** deepseek, deepseek41, gguf, split-gguf, mxfp4, iq-quants, engram, dspark, vision, m5-ultra, agentic-serving
+- **Tags:** deepseek, deepseek41, gguf, split-gguf, mxfp4, iq-quants, engram, dspark, vision, m5-max, m5-ultra, agentic-serving
 - **Depends on:** ADR-042, ADR-063, ADR-065
-- **Amends (when the named story lands):** ADR-004 and README conversion compatibility (C4), ADR-062 D5 effort table (E3), ADR-042 variant relationship (Q6), `docs/shipping-contract.md` production and r2c matrices (Q5)
+- **Amends (when the named story lands):** ADR-004 and README conversion compatibility (C4), ADR-062 D5 effort table (E3), ADR-042 variant relationship (Q6), `docs/shipping-contract.md` production and r2c matrices (M4, Q5), README, ADR-017 and `docs/shipping-contract.md` for M5 Max support (M6)
 - **Related:** ADR-033, ADR-035, ADR-050, ADR-052, ADR-053, ADR-056, ADR-059, ADR-061
 - Stable source ID: ADR-066
 - Audited baseline: hf2q `188c277e` (origin/main, 2026-11-01) with mlx-native `=0.15.15` (`9c67e1f`). Cited hf2q lines refer to that commit.
@@ -39,7 +40,7 @@ Unsloth publishes split GGUF sets (shard 1 holds metadata only, 0 tensors; `spli
 
 | Unsloth quant | Body GB (non-Engram) | Engram table | Routed-expert types | Admissible under this ADR |
 |---|---:|---|---|---|
-| UD-IQ1_S | 122.4 | IQ4_NL 110.6 | IQ1_S, IQ2_XXS | No (IQ1 quant) |
+| UD-IQ1_S | 122.4 | IQ4_NL 110.6 | IQ1_S, IQ2_XXS | Yes (M5 Max target, section M) |
 | UD-IQ1_M | 139.8 | IQ4_NL 110.6 | IQ1_M and others | No (IQ1 quant) |
 | UD-IQ2_XXS | 165.3 | Q5_K 135.2 | IQ2_S, IQ2_XXS, IQ3_XXS, IQ1_S, IQ2_XS, Q2_K | Yes |
 | UD-Q2_K_XL | 199.6 | Q5_K 135.2 | IQ3_XXS, IQ2_XXS, IQ2_S, IQ3_S, MXFP4, IQ2_XS | Yes |
@@ -69,7 +70,7 @@ hf2q serves DeepSeek-V4-Flash-0731 in production (ADR-042) and cannot load eithe
 
 ### Hardware
 
-The current host is an M5 Max with 128 GiB and 186 GB of free disk. No admissible quant fits it: the smallest admissible body is 165.3 GB. The target host is a Mac Studio M5 Ultra with 512 GB, expected December 2026; its Metal limits and SSD are unmeasured. On it, every admissible body fits with the Engram table on SSD; UD-Q4_K_XL body plus table (≈466 GiB) would exceed a working set scaled from the M5 Max ratio (≈430 GiB), so the table stays off-GPU in every mode. Storage for the full program is about 3.7 TB (source 510 GB, the hf2q profiles 1,691 GB, the three largest admissible unsloth quants 1,494 GB), about 4.4 TB with interim IQ artifacts, plus staging for the seven admissible unsloth quants (2,948 GB).
+The current host is an M5 Max with 128 GiB and 186 GB of free disk. UD-IQ1_S fits it: its body is 122.4 GB (114 GiB) of resident weights, the Engram table stays on SSD, and V4.1's KV cache is small (about 0.1 GiB per 32K-token slot). It needs the GPU memory limit raised above the default recommended working set (107.52 GiB) with `iogpu.wired_limit_mb`, and about 56 GB of disk freed plus headroom for the 233 GB set and its 0.97 GB projector. A colleague reports the peer running UD-IQ1_S on an identical M5 Max at about 360 tok/s prefill and 35 tok/s decode. Decode reads about 7.5 GB of weights per token (attention, shared expert, output head and 6 of 384 experts per layer), so 35 tok/s is about 260 GB/s, consistent with fully resident weights rather than SSD paging. M1 reproduces this. The original analysis treated hf2q's ADR-042 peak budget (116 GiB) as a hardware limit and wrongly concluded that nothing fits. The DSpark drafter (7.43 GiB) does not fit beside the UD-IQ1_S body, so it is not offered on the M5 Max. Every other admissible quant needs the M5 Ultra (512 GB, expected December 2026; Metal limits and SSD unmeasured); the smallest, UD-IQ2_XXS, has a 165.3 GB body. On the M5 Ultra every admissible body fits with the Engram table on SSD; UD-Q4_K_XL body plus table (≈466 GiB) would exceed a working set scaled from the M5 Max ratio (≈430 GiB), so the table stays off-GPU in every mode. Storage on the M5 Ultra for the full program is about 3.7 TB (source 510 GB, the hf2q profiles 1,691 GB, the three largest admissible unsloth quants 1,494 GB), about 4.4 TB with interim IQ artifacts, plus staging for the admissible unsloth quants.
 
 ## Decision
 
@@ -77,24 +78,25 @@ The current host is an M5 Max with 128 GiB and 186 GB of free disk. No admissibl
 
 | # | Decision |
 |---|---|
-| P-1 | hf2q supports DeepSeek-V4.1-Flash-1017 on the 512 GB M5 Ultra through **both** paths: `hf2q serve` loads the unsloth split GGUFs, and `hf2q convert` produces hf2q-owned V4.1 GGUFs from the official checkpoint. |
-| P-2 | Weight types in scope: MXFP4, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ1_S kernels, plus the existing Q2_K–Q8_0 family. IQ1_S kernels exist only to admit UD-IQ2_XXS; the IQ1 quants UD-IQ1_S and UD-IQ1_M are out of scope. |
+| P-1 | hf2q supports DeepSeek-V4.1-Flash-1017 on the 512 GB M5 Ultra through **both** paths: `hf2q serve` loads the unsloth split GGUFs, and `hf2q convert` produces hf2q-owned V4.1 GGUFs from the official checkpoint. M5 Max support is limited to serving UD-IQ1_S (P-11). |
+| P-2 | Weight types in scope: MXFP4, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ1_S kernels, plus the existing Q2_K–Q8_0 family. IQ1_S kernels admit UD-IQ1_S and UD-IQ2_XXS. UD-IQ1_M and any IQ1 output from `hf2q convert` remain out of scope. (Amended 2026-11-02.) |
 | P-3 | `hf2q convert` writes the Engram table as Q8_0 (MXFP4 profile), Q6_K (IQ3 profiles) or Q5_K (IQ2 profiles), **and** offers a lossless MXFP8 encoding in the fork's type-43 layout as an explicit option. |
 | P-4 | The release imatrix for hf2q IQ profiles is hf2q-generated. The unsloth imatrix MAY be used as an explicit, receipt-bound operator input for interim IQ artifacts. |
 | P-5 | V4.1 numerics match the DeepSeek reference exactly, including its activation fake-quantization. The Numerical contract below defines how "exactly" is proven. |
-| P-6 | The release includes text, the DSpark drafter and vision. Work is ordered text first; DSpark and vision depend on the text forward pass. |
+| P-6 | The M5 Ultra release (Q6) includes text, the DSpark drafter and vision. Work is ordered text first; DSpark and vision depend on the text forward pass. The M5 Max release (M6) includes text and vision; DSpark does not fit there. |
 | P-7 | Four-agent joint decode is required at release, matching V4's production default. |
-| P-8 | 1M-token context per slot at release. |
-| P-9 | Execution starts when the M5 Ultra arrives (December 2026). Until then this ADR is the documented plan; no story starts before the hardware is available. |
+| P-8 | 1M-token context per slot in the M5 Ultra release (Q6). The M5 Max release (M6) supports the context frozen in B6 from M1's measurement. |
+| P-9 | Execution starts now on the M5 Max with UD-IQ1_S (section M). Work that needs more than 128 GiB starts when the M5 Ultra arrives (December 2026). (Amended 2026-11-02.) |
 | P-10 | The agentic serving gate uses omp, not OpenCode. |
+| P-11 | hf2q offers supported V4.1 serving of UD-IQ1_S on a 128 GiB M5 Max, documented as the lower-quality option, released when section M is qualified and ahead of the M5 Ultra release. (Added 2026-11-02.) |
 
 ### Defaults adopted in this ADR
 
-Items marked **(owner review)** are listed again under Open questions.
+Items marked **(owner review)** are listed again under Owner confirmations.
 
 - **Structure.** V4.1 is a `Deepseek4Variant::{V4Flash0731, V41Flash1017}` inside `src/inference/models/deepseek4/`, resolved only from the exact `general.architecture` string; every divergent behaviour is an exhaustive `match`, and unknown strings still fail. A per-layer `LayerPlan` resolved once at load replaces the `ratio == 4/128` predicates. V4.1-only logic lives in new focused files. One binary serves both variants. Rationale: reuses the ADR-063 scheduler, joint-decode, cooperative-prefill, anchor and supervisor machinery (about 6,300 serve LOC and 673 `engine.rs` references typed on DeepSeek), follows the `Qwen35Variant` precedent and what both peers converged on (ds4 variant enum; the peer's subclass), and keeps AGENTS.md's explicit-family rule.
-- **Experimental gating until qualification.** `deepseek41` serve admission and `deepseek_v41` conversion require `HF2Q_UNSAFE_EXPERIMENTS=1` (shipping-contract Category 3) until E7b, which lifts both gates only for artifacts and profiles that Q2a, Q2b or Q2c qualified, and only after the M5 Ultra release gate exists (Q5). No release cut from main before E7b advertises V4.1 support.
-- **MXFP4 first.** The first milestone (Q2a) proves the MXFP4 artifacts end to end on real weights: UD-Q4_K_XL, UD-Q8_K_XL and the hf2q MXFP4 profiles, with drafters and projectors. They need only one new expert kernel type and no imatrix. IQ kernels, IQ quantizers, the native imatrix, the remaining unsloth quants and kernel tuning follow that milestone.
+- **Experimental gating until qualification.** `deepseek41` serve admission and `deepseek_v41` conversion require `HF2Q_UNSAFE_EXPERIMENTS=1` (shipping-contract Category 3) until a qualifying story lifts the gate for specific artifacts: M5 lifts it for UD-IQ1_S on the M5 Max after M2–M4; E7b lifts it for artifacts and profiles that Q2a, Q2b or Q2c qualified, after the M5 Ultra release gate exists (Q5). No release advertises V4.1 support for an artifact before its gate is lifted.
+- **Two first milestones.** M2 proves UD-IQ1_S end to end on the M5 Max, available now; it needs the IQ1_S and IQ2_XXS expert kernels and IQ4_NL Engram decoding. Q2a proves the MXFP4 artifacts end to end on the M5 Ultra: UD-Q4_K_XL, UD-Q8_K_XL and the hf2q MXFP4 profiles, with drafters and projectors. IQ quantizers, the native imatrix, the remaining unsloth quants and kernel tuning follow Q2a.
 - **Engram placement.** The table is never mapped as a Metal buffer, never joins the residency set and contributes zero resident bytes beyond a fixed staging buffer. Rows are read on the CPU with parallel `pread` on a dedicated descriptor, sorted and deduplicated per batch, decoded on the CPU into a BF16 staging buffer, and prefetched during prefill. `F_NOCACHE` is on provisionally; L3 measures it against buffered reads and keeps the faster one. No row cache in the first release, and no resident-table mode.
 - **Type 43.** mlx-native classifies a type-43 tensor by its byte extent, defined as the distance to the next tensor's offset or to end of file, less at most one alignment unit of padding: 264 bytes per 256-wide row is fork MXFP8, 256 bytes is upstream F8_E4M3. Exactly one layout MUST match; a tensor whose extent fits neither layout, or fits both (possible for tiny tensors within the padding tolerance), fails closed unless an explicit `deepseek41.engram.encoding` marker names the layout and the marker agrees with the extent. hf2q-written MXFP8 tables always carry `deepseek41.engram.encoding = "mxfp8_e4m3_e8m0_32"`. ds4's private row layout is not accepted.
 - **Shard sets.** A set is opened from its `-00001-of-NNNNN` path following the peer's validation rules (shard 0 first, `split.no` per shard, `split.count`, no duplicate tensors, `split.tensors.count` total), plus a check that no extra shard exists. The Engram shard is located by the tensor name `per_layer_token_embd.weight`. Hub-resolved sets MUST match the B2 lock's size and LFS SHA-256 per shard; a one-time SHA-256 per shard is recorded in the managed store and not repeated on every load. Local sets opened by path have no Hub identity: they load, and receipts label them `unverified-local`; this is how an unsloth Engram swap runs. Cache fingerprints include a content hash of the Engram shard, computed once per file identity, so a swapped table never reuses another table's cached state.
@@ -105,11 +107,11 @@ Items marked **(owner review)** are listed again under Open questions.
 
 ### Global acceptance and exclusions
 
-The program MUST deliver, on the M5 Ultra: loading and serving of every admissible unsloth quant; `hf2q convert` producing the C8a and C8b profiles from the pinned official checkpoint; text, DSpark and vision inference under the Numerical contract; four-agent joint decode; 1M-token context per slot; and an omp multi-turn agentic gate with OpenAI unary/SSE compatibility, native tool semantics, tool-result continuation, structured output and prefix reuse.
+The program MUST deliver, on the M5 Max: supported UD-IQ1_S serving with the omp agentic gate (section M). It MUST deliver, on the M5 Ultra: loading and serving of every admissible unsloth quant; `hf2q convert` producing the C8a and C8b profiles from the pinned official checkpoint; text, DSpark and vision inference under the Numerical contract; four-agent joint decode; 1M-token context per slot; and an omp multi-turn agentic gate with OpenAI unary/SSE compatibility, native tool semantics, tool-result continuation, structured output and prefix reuse.
 
 The program MUST preserve every product boundary in AGENTS.md: Rust-owned conversion, quantization and inference; no Python, peer engine or vendor converter at runtime; hosted GGUF bytes never satisfy `convert`; downloads only through `hf-hub` or operator scripts. Python and peer engines appear only in developer parity harnesses. The program MUST NOT regress DeepSeek-V4-Flash-0731 serving (the 0731 invariance gate).
 
-Out of scope: UD-IQ1_S, UD-IQ1_M and any IQ1 output from `hf2q convert`; ds4-format GGUFs; GPU-resident Engram tables; SSD expert streaming for 128 GiB hosts (successor watchlist); tool namespaces; executing a GGUF's embedded Jinja template; a hosted admission contract for `deepseek4` (0731); new drafter architectures beyond DeepSeek's DSpark.
+Out of scope: UD-IQ1_M and any IQ1 output from `hf2q convert`; ds4-format GGUFs; GPU-resident Engram tables; SSD expert streaming for 128 GiB hosts (successor watchlist); tool namespaces; executing a GGUF's embedded Jinja template; a hosted admission contract for `deepseek4` (0731); new drafter architectures beyond DeepSeek's DSpark.
 
 ### Numerical contract
 
@@ -119,12 +121,12 @@ Out of scope: UD-IQ1_S, UD-IQ1_M and any IQ1 output from `hf2q convert`; ds4-for
 - **0731 invariance gate.** After every change that touches shared DeepSeek code: (a) logits, transcripts and serialized anchor images on the B1 production-route corpus (serial decode, matrix prefill, cooperative prefill, 4-lane joint decode, mixed steps) and the B1 diagnostic per-layer dumps MUST be byte-identical between the candidate binary and the pre-change main binary, both run in the same reserved window on the same macOS and Metal build; (b) performance MUST pass a paired, interleaved comparison with the pre-change binary: the candidate's decode and prefill medians are not slower by more than the larger of 2% and the noise floor of a same-window A/A run (one-sided; speedups pass); (c) the frozen B1 golden is a drift detector and is re-captured with the pre-change binary whenever the OS or Metal build changes. A story that deliberately changes 0731 arithmetic MUST say so, and then the fallback criterion (identical greedy transcripts, logit max-abs ≤ 1e-3, top-5 agreement) applies only after independent review.
 - **Synthetic oracle parity.** Quantization, selection and hash kernels fed the oracle's own inputs MUST produce bit-identical outputs. Floating-point ops MUST stay within a norm-wise relative error bound expressed in BF16 rounding units. End-to-end comparisons on the B3 models are teacher-forced: per-position KL divergence and top-1 agreement within bounds. All bounds are calibrated in B3 from oracle-versus-oracle perturbation (for example a different reduction order) and frozen in B6 before the first Metal comparison.
 - **Route references.** Joint decode is bitwise equal to serial decode; cooperative prefill is bitwise equal to solo prefill with the same chunk plan; a mixed step is bitwise equal to its solo parts (as ADR-063 established for 0731). Matrix and chunked prefill are compared with a token-serial, teacher-forced oracle within the synthetic bounds. DSpark speculation keeps exact transactions given identical logits, and its output stays within the decision envelope frozen in B6 against the non-speculative route; it is never described as bitwise equal.
-- **Real-model correctness.** On the M5 Ultra, Q2a runs a teacher-forced, layer-by-layer comparison of hf2q against `model.py` (B3 harness at real dimensions, one layer resident at a time, never co-resident with hf2q) for layers 0, 1, 2, 14, 20, 24 and 39, within the B6 bounds. The oracle's weights are the same artifact's weights decoded independently of hf2q, so the comparison measures implementation error, not quantization loss. Against UD-Q8_K_XL, whose weights are value-equivalent to the official checkpoint (MXFP4 experts and the MXFP8 Engram table byte-exact, FP8 dense weights exactly representable in BF16), this also proves official-checkpoint semantics. Quantization loss is judged only by the quality rule below.
-- **Real-model quality.** hf2q running UD-Q8_K_XL (MXFP4 experts, BF16 dense) is the in-repo quality reference; no full-precision reference fits Apple hardware. Q2a–Q2c measure KL divergence and top-1 agreement of every admitted quant and profile against it on a fixed corpus. Unsloth's published figures (the peer, F32 reference, no activation fake-quantization) are a sanity check, not a threshold. Pass thresholds are frozen in B6.
+- **Real-model correctness.** On the M5 Ultra, Q2a runs a teacher-forced, layer-by-layer comparison of hf2q against `model.py` (B3 harness at real dimensions, one layer resident at a time, never co-resident with hf2q) for layers 0, 1, 2, 14, 20, 24 and 39, within the B6 bounds; on the M5 Max, M2 runs the same comparison for UD-IQ1_S. The oracle's weights are the same artifact's weights decoded independently of hf2q, so the comparison measures implementation error, not quantization loss. Against UD-Q8_K_XL, whose weights are value-equivalent to the official checkpoint (MXFP4 experts and the MXFP8 Engram table byte-exact, FP8 dense weights exactly representable in BF16), this also proves official-checkpoint semantics. Quantization loss is judged only by the quality rule below.
+- **Real-model quality.** hf2q running UD-Q8_K_XL (MXFP4 experts, BF16 dense) is the in-repo quality reference; no full-precision reference fits Apple hardware. Q2a–Q2c measure KL divergence and top-1 agreement of every admitted quant and profile against it on a fixed corpus; Q2b includes UD-IQ1_S. Until Q2b runs, M5 Max documentation cites Unsloth's published UD-IQ1_S figure, labelled as Unsloth's. Unsloth's published figures (the peer, F32 reference, no activation fake-quantization) are a sanity check, not a threshold. Pass thresholds are frozen in B6.
 
 ### Measurement and acceptance rules
 
-Every hardware run MUST record source commit, binary SHA-256, artifact digests (every shard), mlx-native version, macOS and Metal build, and the Q1 host receipt. Performance claims follow AGENTS.md: identical artifacts, prompts, sampling, context and batch against matched peers, warm-up, medians of at least 5 runs, and a checked-in command. The owner is the integration owner: schedules heavy builds and model loads, owns release-gate infrastructure, and assigns agent workers per area with independent agent reviewers. On any host, only one large model runtime is resident at a time. Work on the shared M5 Max follows the ADR-063/ADR-065 host-reservation rules; 0731 gate runs load the 100 GB artifact and need a reserved window.
+Every hardware run MUST record source commit, binary SHA-256, artifact digests (every shard), mlx-native version, macOS and Metal build, and the host receipt (M1 on the M5 Max, Q1 on the M5 Ultra). Performance claims follow AGENTS.md: identical artifacts, prompts, sampling, context and batch against matched peers, warm-up, medians of at least 5 runs, and a checked-in command. The owner is the integration owner: schedules heavy builds and model loads, owns release-gate infrastructure, and assigns agent workers per area with independent agent reviewers. On any host, only one large model runtime is resident at a time. Work on the shared M5 Max follows the ADR-063/ADR-065 host-reservation rules; 0731 gate runs load the 100 GB artifact and need a reserved window.
 
 A story closes by type:
 
@@ -258,12 +260,12 @@ Delivery boundary: Merged to main.
 
 Outcome: Every numeric pass criterion in this ADR is fixed before the evidence it judges exists.
 
-Requirement: The program MUST record, with owner approval: the synthetic-oracle bounds (from B3); the real-model layer-parity bounds; the quality thresholds for Q2a–Q2c; time-to-first-semantic-token bounds for cold 8K, 128K and 1M prompts and for a cached suffix (proposed: a provisional ceiling of one hour for a cold 1M prompt, and much tighter bounds for cached turns); the prefix-reuse slack used by E5 and E6; performance targets against matched peers (proposed: at least 1.0× matched-peer throughput with no regression in time to first semantic token; any shortfall needs the owner's sign-off); and the DSpark decision envelope.
+Requirement: The program MUST record, with owner approval: the synthetic-oracle bounds (from B3); the real-model layer-parity bounds; the agreement thresholds for M2 and the quality thresholds for Q2a–Q2c; time-to-first-semantic-token bounds for cold 8K, 128K and 1M prompts and for a cached suffix (proposed: a provisional ceiling of one hour for a cold 1M prompt, and much tighter bounds for cached turns); for the M5 Max, the minimum slots and context section M must support (proposed: four slots at the largest context M1 records for the peer) and time-to-first-semantic-token bounds at that context; the prefix-reuse slack used by E5 and E6; performance targets against matched peers (proposed: at least 1.0× matched-peer throughput with no regression in time to first semantic token, against the M1 baseline on the M5 Max; any shortfall needs the owner's sign-off); and the DSpark decision envelope.
 
 Acceptance:
 
-- One checked-in threshold file referenced by E5, E6, G4–G6, D3, D4, Q2a–Q2c, Q3 and Q4.
-- Hardware-dependent values MAY be revised once, at Q1 and before any V4.1 hardware run, with owner approval; any later change is an amendment.
+- One checked-in threshold file referenced by E5, E6, G4–G6, D3, D4, M1–M3, Q2a–Q2c, Q3 and Q4.
+- Hardware-dependent values MAY be revised once with owner approval: M5 Max values at M1, before any hf2q V4.1 run on that host, and M5 Ultra values at Q1, before any V4.1 run there; any later change is an amendment.
 
 Repository ownership: hf2q.
 
@@ -367,13 +369,14 @@ Delivery boundary: Released and pinned in hf2q.
 
 ### N5. Provide IQ1_S expert kernels
 
-Outcome: UD-IQ2_XXS, whose 20 gate/up tensors in 10 layers are IQ1_S, runs on Metal.
+Outcome: UD-IQ1_S and UD-IQ2_XXS (whose 20 gate/up tensors in 10 layers are IQ1_S) run on Metal.
 
-Requirement: mlx-native MUST provide IQ1_S `mv_id`, `mm_id` and tensor `mm_id` kernels with CPU-oracle parity. This does not admit IQ1 quants.
+Requirement: mlx-native MUST provide IQ1_S `mv_id`, `mm_id` and tensor `mm_id` kernels with CPU-oracle parity.
 
 Acceptance:
 
 - Parity and microbenchmarks at V4.1 expert shapes.
+- Together with N4 (IQ2_XXS) and N6 (IQ4_NL Engram rows), admission of UD-IQ1_S needs no further weight kernel.
 
 Repository ownership: mlx-native.
 
@@ -381,7 +384,7 @@ Validation: Native primitive closure.
 
 Predecessors: N3.
 
-Priority: Medium.
+Priority: High.
 
 Delivery boundary: Released and pinned in hf2q.
 
@@ -389,7 +392,7 @@ Delivery boundary: Released and pinned in hf2q.
 
 Outcome: hf2q can decode any admissible Engram row on the CPU.
 
-Requirement: mlx-native MUST expose a public CPU API that decodes arbitrary rows of a 256-wide table in MXFP8 (fork 43), F8_E4M3, Q8_0, Q6_K, Q5_K and BF16 to BF16, with 64-bit row offsets.
+Requirement: mlx-native MUST expose a public CPU API that decodes arbitrary rows of a 256-wide table in MXFP8 (fork 43), F8_E4M3, Q8_0, Q6_K, Q5_K, IQ4_NL and BF16 to BF16, with 64-bit row offsets.
 
 Acceptance:
 
@@ -615,8 +618,8 @@ Acceptance:
 
 - One shared check serves `info` (as a report), serve load and hot-swap.
 - The V4.1 KV estimate uses the shared-source layout, not the 0731 constant (`src/serve/info.rs:243-253`).
-- The scratch high-water term is measured for 0731; for V4.1 it is a stated provisional bound from the synthetic model and the cache plan, replaced by the G6 measurement on the M5 Ultra.
-- hf2q never sets `iogpu.wired_limit_mb`; the report states when the configured working set is the binding term.
+- The scratch high-water term is measured for 0731; for V4.1 it is a stated provisional bound from the synthetic model and the cache plan, replaced by the M2 measurement on the M5 Max and the G6 measurement on the M5 Ultra.
+- hf2q never sets `iogpu.wired_limit_mb`; when the configured working set is the binding term, the report states it and names the limit needed (UD-IQ1_S on a 128 GiB M5 Max needs a limit above its 114 GiB resident body plus KV, scratch and staging).
 
 Repository ownership: hf2q.
 
@@ -972,11 +975,11 @@ Delivery boundary: Merged to main.
 
 Outcome: Qualified V4.1 artifacts serve and convert without the experimental acknowledgement.
 
-Requirement: hf2q MUST lift the serve gate for each unsloth quant or hf2q artifact, and the conversion gate for each hf2q profile, that Q2a, Q2b or Q2c qualified, and only for those, once Q5's release gate exists.
+Requirement: hf2q MUST lift the serve gate for each unsloth quant or hf2q artifact, and the conversion gate for each hf2q profile, that Q2a, Q2b or Q2c qualified, and only for those, once Q5's release gate exists. Artifacts whose gate M5 lifted stay lifted.
 
 Acceptance:
 
-- Unqualified quants and profiles still require the acknowledgement for serving and conversion.
+- Unqualified quants and profiles still require the acknowledgement for serving and conversion; UD-IQ1_S stays as M5 left it.
 
 Repository ownership: hf2q.
 
@@ -1479,6 +1482,136 @@ Priority: Medium.
 
 Delivery boundary: Merged to main.
 
+## M. M5 Max support for UD-IQ1_S
+
+### M1. Reproduce the peer's UD-IQ1_S baseline on the M5 Max
+
+Outcome: The reported peer result on a 128 GiB M5 Max is reproduced and recorded as the M5 Max speed bar.
+
+Requirement: The program MUST run the B2-pinned upstream peer on UD-IQ1_S on the M5 Max and record a receipt under AGENTS.md's performance rules.
+
+Acceptance:
+
+- Host receipt: `maxBufferLength`, recommended working set, the `iogpu.wired_limit_mb` value used, free disk, macOS and Metal build.
+- Peer prefill and decode medians over at least 5 warm runs at fixed prompts and contexts (including 8K and 32K), with the exact command, flags and context; compared with the reported 360 and 35 tok/s.
+- The largest context and slot count the M5 Max holds for UD-IQ1_S is recorded.
+
+Repository ownership: hf2q.
+
+Validation: Hardware qualification closure.
+
+Predecessors: B5.
+
+Priority: High.
+
+Delivery boundary: Receipts merged to main.
+
+### M2. Prove UD-IQ1_S end to end on the M5 Max
+
+Outcome: hf2q runs UD-IQ1_S correctly on real weights on the M5 Max.
+
+Requirement: The program MUST run UD-IQ1_S through the G4/G5 routes on the M5 Max and compare against references.
+
+Acceptance:
+
+- Layer-by-layer parity against `model.py` with the same artifact's decoded weights, within the B6 bounds.
+- Greedy transcripts and logits compared with the peer on the same file; every disagreement localized to a layer and explained.
+- Peer agreement: KL divergence and top-1 agreement against the peer on the same file within B6 thresholds. This includes the intended difference from P-5 fake-quantization, so it is not a quality measure; quality is measured in Q2b.
+- Vision projector parity on real weights. DSpark is not offered on the M5 Max.
+- L4 admits the B6 minimum slots and context, with the scratch high-water term measured on this host.
+
+Repository ownership: hf2q.
+
+Validation: Hardware qualification closure.
+
+Predecessors: G5, L3, L4, N4, N5, N6, B6, M1, V2.
+
+Priority: High.
+
+Delivery boundary: Receipts merged to main.
+
+### M3. Pass the omp agentic gate on the M5 Max
+
+Outcome: Real multi-turn agent work succeeds on UD-IQ1_S on the M5 Max.
+
+Requirement: The program MUST pass E6 in V4.1 mode on the M5 Max with UD-IQ1_S, with 1 and 4 clients, a structured-output turn and an image turn, at the B6 minimum slots and context.
+
+Acceptance:
+
+- All E6 assertions; cached-token counts, prefill and decode rates, time to first semantic token, exact prompts and settings, and the agent task outcome recorded.
+- Prefill and decode against the M1 baseline meet the B6 speed bar, or the shortfall goes to the owner.
+- The same scripted task run once against the peer serving the same file is recorded as the matched reference result.
+
+Repository ownership: hf2q.
+
+Validation: Hardware qualification closure.
+
+Predecessors: M2, E5, E6, E7a, E8, V3, L6.
+
+Priority: High.
+
+Delivery boundary: Receipts merged to main.
+
+### M4. Add UD-IQ1_S on the M5 Max to the release gates
+
+Outcome: Every release is checked against UD-IQ1_S on an M5 Max.
+
+Requirement: The integration owner MUST add `deepseek41` UD-IQ1_S to the shipping-contract production and r2c matrices on a 128 GiB M5 Max runner, with shard-set identity in the Actions variables, and freeze a production-route golden for later regression checks.
+
+Acceptance:
+
+- A passing release-gate run on the M5 Max for UD-IQ1_S.
+
+Repository ownership: hf2q; integration owner.
+
+Validation: Hardware qualification closure.
+
+Predecessors: M2, B4.
+
+Priority: High.
+
+Delivery boundary: Merged to main with the gate receipt.
+
+### M5. Lift the experimental gate for UD-IQ1_S on the M5 Max
+
+Outcome: UD-IQ1_S serves on the M5 Max without the experimental acknowledgement.
+
+Requirement: hf2q MUST lift the serve gate for UD-IQ1_S only, on hosts L4 admits, after M2–M4.
+
+Acceptance:
+
+- Every other V4.1 artifact still requires the acknowledgement.
+
+Repository ownership: hf2q.
+
+Validation: hf2q implementation closure.
+
+Predecessors: E7a, M2, M3, M4.
+
+Priority: High.
+
+Delivery boundary: Merged to main.
+
+### M6. Document and release UD-IQ1_S support on the M5 Max
+
+Outcome: V4.1 support on the M5 Max is documented and released.
+
+Requirement: The program MUST document UD-IQ1_S on the M5 Max as the lower-quality V4.1 option (hardware, wired-limit setting, disk, context and slot limits, measured speed, Unsloth's published quality figure labelled as such until Q2b, no DSpark, known deviations) in README, ADR-017 per-family status and `docs/shipping-contract.md`, and release.
+
+Acceptance:
+
+- Release follows ADR-061.
+
+Repository ownership: hf2q.
+
+Validation: Independent review.
+
+Predecessors: M3, M4, M5.
+
+Priority: High.
+
+Delivery boundary: Included in a published hf2q release.
+
 ## Q. Qualification on the M5 Ultra
 
 ### Q1. Record the M5 Ultra host
@@ -1528,7 +1661,7 @@ Delivery boundary: Receipts merged to main.
 
 ### Q2b. Prove the remaining unsloth quants
 
-Outcome: Every other admissible unsloth quant (UD-IQ2_XXS, UD-Q2_K_XL, UD-IQ3_XXS, UD-IQ3_S, UD-Q3_K_XL) runs correctly on real weights.
+Outcome: Every other admissible unsloth quant (UD-IQ1_S, UD-IQ2_XXS, UD-Q2_K_XL, UD-IQ3_XXS, UD-IQ3_S, UD-Q3_K_XL) runs correctly on real weights, and its quality is measured against the UD-Q8_K_XL reference.
 
 Requirement: The program MUST apply Q2a's correctness and quality rules to each.
 
@@ -1649,7 +1782,7 @@ Delivery boundary: Included in a published hf2q release.
 
 ## Coverage and sequencing
 
-Execution starts when the M5 Ultra arrives. B4 precedes B1, and B1 precedes every hf2q change to shared DeepSeek code (G1, G2) and S4. B2 precedes everything that cites a reference. The plan runs in three phases. **Phase 1, foundations and MXFP4 bootstrap:** B1–B6, N1, N2, N6, N8, S1–S4, L1–L5, G1–G5, E1–E7a, E8, C1–C5, C8a, C9a, D1a–D3, V1a–V3, Q1 and Q2a. **Phase 2, IQ and remaining quants:** N3–N5, N7, C6, C7a, C7b, C8b, C9b, C10, Q2b, Q2c, G6, D4. **Phase 3, qualification and release:** L6, Q3–Q6, E7b. Unit, synthetic and 0731 work MAY use the M5 Max under host-reservation rules. E6 rehearses on 0731 once B6 exists; its V4.1 mode needs E7a (dotted). Open DeepSeek-V4 pull requests (#420, #421, #439, #453) and ADR-065 F1 change files that G2, G3 and G5 rewrite; whichever lands first, the pre-change binary for the 0731 invariance gate is taken from the resulting main.
+Execution starts now on the M5 Max. B4 precedes B1, and B1 precedes every hf2q change to shared DeepSeek code (G1, G2) and S4. B2 precedes everything that cites a reference. The plan runs in four phases. **Phase 0, M5 Max with UD-IQ1_S (starts now):** B1–B6, N1–N6, N8, S1–S4, L1–L6, G1–G5, E1–E7a, E8, C1–C5, D1a–D3, V1a–V3 and M1–M6. **Phase 1, M5 Ultra MXFP4 bootstrap:** Q1, C8a, C9a, Q2a and G6. **Phase 2, IQ and remaining quants:** N7, C6, C7a, C7b, C8b, C9b, C10, Q2b, Q2c and D4. **Phase 3, M5 Ultra qualification and release:** Q3–Q6 and E7b. E6 rehearses on 0731 once B6 exists; its V4.1 mode needs E7a (dotted). Open DeepSeek-V4 pull requests (#420, #421, #439, #453) and ADR-065 F1 change files that G2, G3 and G5 rewrite; whichever lands first, the pre-change binary for the 0731 invariance gate is taken from the resulting main.
 
 ```mermaid
 flowchart LR
@@ -1703,13 +1836,19 @@ flowchart LR
   Q2a & B4 --> Q5
   E7a & Q2a & Q2b & Q2c & Q3 & Q5 --> E7b
   Q2b & Q2c & Q3 & Q4 & Q5 & E7b --> Q6
+  B5 --> M1
+  G5 & L3 & L4 & N4 & N5 & N6 & B6 & M1 & V2 --> M2
+  M2 & E5 & E6 & E7a & E8 & V3 & L6 --> M3
+  M2 & B4 --> M4
+  E7a & M2 & M3 & M4 --> M5
+  M3 & M4 & M5 --> M6
 ```
 
-**Critical paths.** Phase 1: Q1 and B4 → B1 → G1 → G2 → S4 → G3 → G4 → G5 → Q2a, with C9a (the first real conversion) feeding Q2a. Phase 2: Q2a → C7b → C10 → Q2c (release IQ profiles), the longest path because the native imatrix needs the qualified MXFP4 forward pass. Phase 3: Q2a → D4 → Q3 → E7b → Q6.
+**Critical paths.** Phase 0: B4 → B1 → G1 → G2 → S4 → G3 → G4 → G5 → M2 → M3 → M5 → M6, the first V4.1 support release, on the M5 Max. Phase 1: Q1 → C9a → Q2a. Phase 2: Q2a → C7b → C10 → Q2c (release IQ profiles), the longest path because the native imatrix needs the qualified MXFP4 forward pass. Phase 3: Q2a → D4 → Q3 → E7b → Q6.
 
-**Effort.** Estimated engineer-weeks for one engineer familiar with the code, to be revised as stories close: B 3–4; N 6–8; S 4–6; L 6–8; G 10–13; E 6–8; C 9–11; D 5–7; V 5–8; Q 3–4 of engineering. Total about 57–77 engineer-weeks, excluding hardware-bound runtime (conversions, imatrix collection and qualification campaigns). This is a planning range, not a schedule: the owner executes with agent workers per area and independent agent reviewers, and sets the release date after Q2a.
+**Effort.** Estimated engineer-weeks for one engineer familiar with the code, to be revised as stories close: B 3–4; N 6–8; S 4–6; L 6–8; G 10–13; E 6–8; C 9–11; D 5–7; V 5–8; M 2–3; Q 3–4 of engineering. Total about 59–80 engineer-weeks, excluding hardware-bound runtime (conversions, imatrix collection and qualification campaigns). This is a planning range, not a schedule: the owner executes with agent workers per area and independent agent reviewers, and sets release dates after M2 and Q2a.
 
-Release placement: stories merge to main as they close, behind the experimental gate where it applies; the V4.1 feature ships in the first hf2q release after Q6.
+Release placement: stories merge to main as they close, behind the experimental gate where it applies. UD-IQ1_S support on the M5 Max ships in the first hf2q release after M6; the full V4.1 feature ships in the first hf2q release after Q6.
 
 ## Consequences
 
@@ -1719,7 +1858,7 @@ hf2q gains DeepSeek-V4.1-Flash-1017 on its target hardware through both an owned
 
 ### Negative
 
-The program is large, and execution waits for the M5 Ultra, so the first end-to-end proof (Q2a) comes after its foundations are built on that host. Matching reference fake-quantization on every linear input adds work per token that neither the peer nor ds4 does. The MXFP8 Engram option produces files that the upstream peer silently misreads, contained only by metadata, receipts and documentation. Unsloth's type-43 choice and the fork it relies on can change; B2's lock and N1's extent check make that visible rather than silent. Cold 1M-token prefill will take minutes even on the M5 Ultra (indexer cost grows with the square of context), which pressures AGENTS.md's time-to-first-semantic-token requirement; B6 makes the owner set that bound explicitly.
+The program is large. The M5 Max milestone (M2) gives an early end-to-end proof on UD-IQ1_S, but that quant's quality is low, so it does not stand in for the M5 Ultra proof (Q2a) of the higher-quality versions. Matching reference fake-quantization on every linear input adds work per token that neither the peer nor ds4 does, which pressures the M5 Max speed bar against the peer. The MXFP8 Engram option produces files that the upstream peer silently misreads, contained only by metadata, receipts and documentation. Unsloth's type-43 choice and the fork it relies on can change; B2's lock and N1's extent check make that visible rather than silent. Cold 1M-token prefill will take minutes even on the M5 Ultra (indexer cost grows with the square of context), which pressures AGENTS.md's time-to-first-semantic-token requirement; B6 makes the owner set that bound explicitly.
 
 ### Neutral
 
@@ -1739,8 +1878,9 @@ An independent review (GPT-6.1 Sol, 2026-11-02) recommended the defaults below, 
 8. **If our own compressed version loses to Unsloth's.** Default: revise and re-measure; dropping it needs your amendment.
 9. **Lossless Engram option.** Default: offered only with the MXFP4 profiles.
 10. **Engram swaps and caching.** Default: allow local swaps as unverified, with caches tied to the table's contents; keep page-cache bypass only if measurement favours it.
-11. **Staffing and date.** Default: the owner acts as integration owner, with agent workers per area and independent agent reviewers; the release date is set after the MXFP4 milestone (Q2a).
-12. **MXFP4 first.** Default: prove the MXFP4 artifacts end to end before IQ work (Phase 1 above).
+11. **Staffing and date.** Default: the owner acts as integration owner, with agent workers per area and independent agent reviewers; release dates are set after the M5 Max milestone (M2) and the MXFP4 milestone (Q2a).
+12. **MXFP4 first on the M5 Ultra.** Default: prove the MXFP4 artifacts end to end before IQ work there (Phase 1 above).
+13. **UD-IQ1_S on the M5 Max.** Supported as the lower-quality option (Unsloth measures about 83% top-token agreement with the full model), with text and vision but no DSpark drafter, which doesn't fit. Raising the GPU memory limit is an operator step that hf2q reports but never performs, and about 56 GB of disk must be freed plus headroom. Default: accept.
 
 ## Successor watchlist
 
