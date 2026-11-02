@@ -484,5 +484,37 @@ class NativeControls(unittest.TestCase):
         self.assertGreater(result["target_fraction"], 0.99)
 
 
+    def test_forward_demand_v2_two_owners_in_one_epoch_credit_only_own_witness_bracket(self):
+        # Cooperative shape: lanes 0 and 1 declare distinct forward inputs in ONE epoch (10);
+        # a further epoch-10 command carries sibling work. No owner set owns the epoch.
+        import f2_native_trace
+        from unittest import mock
+        records, identity, scenario = four_lanes((2, 2))
+        for item in records:
+            p = item["payload"]
+            if item["kind"] == "forward_input" and p["forward_id"] == 31:
+                p["epoch"] = 10
+            elif item["kind"] in ("scope_definition", "forward_witness") and p["scope"]["epoch"] == 11:
+                p["scope"]["epoch"] = 10
+            elif item["kind"] == "native_event" and p["invocation_epoch"] == 11:
+                p["invocation_epoch"] = 10
+                if p["scope"]:
+                    p["scope"]["epoch"] = 10
+        epoch_commands(records, [(9, 600, 1_900_000_000)])
+        reports = []
+        finish = f2_native_trace.NativeTrace.finish
+        def capture(self):
+            reports.append(finish(self))
+            return reports[-1]
+        with mock.patch.object(f2_native_trace.NativeTrace, "finish", capture):
+            trace.validate_trace(records, identity, scenario)
+        by_slot = {item["rows"][0]["slot_id"]: item for item in reports[-1]["submissions"]}
+        for slot in (0, 1):
+            item = by_slot[slot]
+            self.assertEqual(item["obligation"], [[item["end_ns"], item["checked_return_ns"]]])
+        for slot in (2, 3):  # one-owner epochs still join (here: only their witness command)
+            self.assertEqual(len(by_slot[slot]["obligation"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

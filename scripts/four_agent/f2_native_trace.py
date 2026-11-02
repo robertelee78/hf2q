@@ -334,16 +334,23 @@ class NativeTrace:
         forwards = [item["declaration"]["payload"]["forward_id"] for item in self.witnesses.values()]
         need(len(forwards) == len(set(forwards)) and set(forwards) == self.inputs.keys(),
              "required forward input replaced by auxiliary/missing/duplicate witness")
-        epochs = {}
+        epochs, owners = {}, {}
         for c in self.commands.values():
             epochs.setdefault(c["created"]["invocation_epoch"], []).append(c)
+        for item in self.inputs.values():
+            owners.setdefault(item["payload"]["epoch"], set()).add(frozenset(
+                (span["logical"]["request_id"], span["logical"]["slot_id"], span["logical"]["generation"])
+                for span in item["payload"]["packed_rows"]))
         for identity, witness in self.witnesses.items():
             need(len(witness["encodes"]) == 1, "required one-dispatch witness missing/duplicated")
             epoch = self.inputs[witness["declaration"]["payload"]["forward_id"]]["payload"]["epoch"]
-            # Joined obligation: every command of the forward's invocation epoch
+            # Joined obligation: only when every forward input of the epoch has one
+            # owner set (a single scheduler transaction), every command of the epoch
             # that carried work must have committed and returned a healthy check.
+            # Otherwise (e.g. cooperative lanes sharing an epoch) sibling work is not
+            # this owner's obligation: only the witness command's own bracket counts.
             obligation = []
-            for joined in epochs.get(epoch, ()):
+            for joined in epochs.get(epoch, ()) if len(owners[epoch]) == 1 else ():
                 if not (joined["dispatches"] or joined["noncompute"]):
                     continue
                 need(joined["submit"] and joined["drain"],
@@ -359,7 +366,8 @@ class NativeTrace:
                 "end_ns": p["end_monotonic_ns"] - self.origin,
                 "checked_return_ns": c["drain"]["payload"]["end_monotonic_ns"] - self.origin,
                 "rows": self.scopes[identity]["payload"]["rows"], "operator": self.policy["operator"],
-                "obligation": sorted(obligation)})
+                "obligation": sorted(obligation) or [[p["end_monotonic_ns"] - self.origin,
+                    c["drain"]["payload"]["end_monotonic_ns"] - self.origin]]})
         need(submissions, "auxiliary-only trace cannot qualify required forward witnesses")
         return {"submissions": submissions, "native_events": self.events,
                 "auxiliary_dispatches": self.auxiliary, "unmapped_operator_attempts": self.unmapped,
