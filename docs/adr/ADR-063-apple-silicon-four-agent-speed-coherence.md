@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope, F1/F3 execution entry and the separately reviewed F2/Q1/Q2/C1 source implementation entry; other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
+- **Updated:** 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
 - Stable source ID: ADR-063
@@ -636,8 +636,8 @@ The operator approved native-engine peers as separately labeled benchmark arms:
 antirez ds4, TensorFold and oMLX. Each runs its own native artifact, not the
 hf2q GGUF. This section records the ds4 arm (`engine_kind ds4`,
 `scripts/four_agent/native_peer_ds4.py`,
-`q5_cases/native-ds4-deepseek4.json`) and the TensorFold arm (`engine_kind
-tensorfold`, below). The oMLX arm is recorded when its adapter lands. Every
+`q5_cases/native-ds4-deepseek4.json`), the TensorFold arm (`engine_kind
+tensorfold`, below) and the oMLX arm (`engine_kind omlx`, below). Every
 consumer resolves a native kind through one registry,
 `scripts/four_agent/native_peers.py`.
 
@@ -755,8 +755,120 @@ stock DFlash2 drafter `z-lab/Qwen3.8-27B-DFlash2@50307d4c`
   startup reserve, `/health` memory, slot waits), then net makespan.
   Accepted-per-drafted and tokens-per-round counts explain the result but never
   decide it.
+- **D2's long contexts use `--workload long-context-v1`.** The canonical
+  coding client reaches only about 2.8k prompt tokens per turn. The variant
+  keeps the canonical task, prompts, tools, workflow and grading, and appends a
+  pinned 150 KB read-only Rust module (`fixtures/long-context-v1.rs`) to
+  `tests/ports.rs`. Turns 2–6 then carry about 40k prompt tokens (estimated as
+  wire bytes / 4). Approvals and summaries bind the variant id and the fixture
+  sha256. Q3 plans and the D2 command refuse runs on different variants. T0
+  and T2 are derived with `coding_long_context.py derive-case`; see
+  `scripts/four_agent/README.md`. The fixture is templated, repetitive code, so
+  it covers long contexts only. It is not evidence for the nonrepetitive-code
+  item.
+
+**oMLX arm (operator decision 2026-10-31).** oMLX 6b413c90 (version 0.7.3rc1,
+MLX/mlx-lm continuous batching) serves three families from mlx-community 4-bit
+checkpoints: Qwen3.8 27B (`Qwen3.8-27B-4bit@10c35caa`), Qwen3.6 35B-A3B
+(`Qwen3.6-35B-A3B-4bit@38740b84`) and Gemma 4 26B-A4B
+(`gemma-4-26b-a4b-it-4bit@0d77464e`), with cases
+`q5_cases/native-omlx-{qwen38,qwen36,gemma4}.json`. DeepSeek-V4 is out of
+scope because no 4-bit conversion fits. The registry's family scope became a
+tuple (`FAMILIES`, `Q3_FAMILIES`) so one arm can serve several families.
+
+- **It never produces the same-GGUF verdict.** All three families have a
+  runnable same-GGUF peer, so oMLX runs only in a separate `--native-comparison`
+  campaign. Labels, withholding and the F2 placement are TensorFold's: F2
+  baselines `omlx_<family>_native`, never a win. Any oMLX tool-parser warning
+  or INFO repair line in a run also withholds the statement; repairs oMLX does
+  not log are disclosed with every statement (`recovery_attribution`). The Qwen3.6 re-test with a different
+  tokenizer and sampler stack uses `quality_campaign.py --reference-kind
+  omlx-native`; oMLX cannot be the subject arm.
+- **Request parity is explicit.** oMLX silently drops unknown request fields,
+  so the adapter enforces a closed envelope. It sends greedy sampling, hf2q's
+  repetition penalty 1.05 over a 64-token window, and thinking as hf2q renders
+  it. For Qwen that is `enable_thinking`/`preserve_thinking` true, no explicit
+  effort, and `thinking_budget` 2048/512. For Gemma it is `enable_thinking`
+  false. `parallel_tool_calls` is not sent: oMLX has no such field, and the
+  client refuses a second call. A generated `model_settings.json` pins the same
+  values server-side. Its sha256 is in the approval, and it must be unchanged
+  at closing.
+- **These differences are recorded, not hidden:**
+  - MLX affine 4-bit weights instead of hf2q's Q4_K_M GGUF;
+  - the mlx-community tokenizer, and a template whose identity with hf2q's
+    reviewed template is recorded per run;
+  - oMLX's tool-schema normalization (sorted keys, injected empty
+    descriptions, no tool grammar);
+  - a different forced thinking close;
+  - unproven seeding of the repetition window with the prompt tail.
+- **Identity is bound end to end.** The client binds:
+  - the detached clean checkout and its version file;
+  - the venv's mlx, mlx-lm and mlx-vlm pins, from dist-info (a pip-freeze
+    equivalent hash);
+  - the snapshot revision, `config.json` and `chat_template.jinja`;
+  - the launch record (pid, exact argv, environment);
+  - `/api/status` (version, every custom kernel available, no request before
+    the barrier) and `/v1/models/status` (served path, text engine, 262144
+    context);
+  - the re-saved `settings.json` (hot-only prefix cache, no SSD tier);
+  - every turn's rendered prompt via `/v1/tokenize`.
+
+  At closing the server's session counters must equal the client receipts.
+  oMLX logs no response id, so the post-run audit binds the multiset of
+  `Chat completion:` lines (transport, tokens, finish) to the client turns.
+- **Memory is paged.** KV grows with real tokens: up to about 64 GiB
+  (Qwen3.8), 20 GiB (Qwen3.6) or 20 GiB (Gemma 4) at four full 262144-token
+  slots, on top of 15–20 GB of weights. Raising `iogpu.wired_limit_mb` is the
+  root's decision.
 
 This decision establishes no speed win and changes no same-GGUF verdict.
+
+### F2 closure scope: option B (operator decision 2026-10-31/11-01)
+
+The operator approved option B of the F2 intent review
+(`$E/reviews/adr063-f2-intent-v1.md` §5 B) on 2026-10-31/11-01 as the closure
+scope of F2 (#357). F2 closes when the scoreboard shows, for each family, the
+items below. Each option-B item is kept, changed or waived as stated:
+
+| Option B item | Disposition |
+|---|---|
+| 1. An independently reviewed Q3 `n4` verdict | Kept: the Q3 verdict of record (Win, Loss, Unavailable or Failed) from a reviewed `verdict.json`. |
+| 2. A one-slot control stage | Kept: the record's completed `n1` control is reported as a control of that record. |
+| 3. Task quality bound to the experiment binary | Kept and widened: paired quality campaigns run on the exact Q3 experiment binary against v0.1.28 and against the peer (against the native ds4 arm for DeepSeek-V4, whose same-GGUF peer is unavailable). Each reference is bound to the campaign's arm identity: the v0.1.28 binary, the peer binary, or one native readiness identity of that engine. Final sources still pending patch review also block a Win. |
+| 4. The Q2 run audit's co-progress width of 4 for every passing run | Kept: every counted run passes the v3 width audit (the Q3 Pass rule). A width failure makes the run `Invalid`, which stands. |
+| 5. Worst-slot TTFT and SSE-gap against stock and peer, with a declared fairness ceiling against the peer | Changed: worst-slot TTFT p95 and SSE-gap max ratios are shown against stock and peer. The stock band (×1.025) gates a Win. Against the peer they are reported only, with no ceiling, because the operator worded the peer comparison as task makespan only. SSE gaps against the peer are shown as not comparable (different event granularity). An SSE gap the verdict cannot estimate is shown as not measurable and does not gate, as in the Q3 rule. |
+| 6. 3+1, 2+2 and 1+3 controls (descriptive) | Kept, for every family: completed mixed stages are controls of the record. Stages that halted or did not run are disclosed as unmeasured. |
+| One statistics rule | The Q3 design statistics (5–20 Williams blocks, sequential 2.5-point precision stop). The sequential rule is the Q3 rule pre-registered on #369 (`docs/research/adr063-q3-campaign.md` "Design", fixed before any campaign data), not a new choice made for F2. The fixed-six rule moves to successor scope. |
+| A board that shows a Q3 Win as qualified | Changed: the "Q3 verdicts of record" tier is F2's qualified display. The fixed-six "Qualified wins" section is labeled successor scope. |
+
+Justification of the sequential rule. The independent Q3 reviews re-derived
+every stopping decision from the raw runs under it and accepted the verdicts
+of record: `$E/reviews/adr063-q3-v7-qwen38-verdict-v1.md`,
+`adr063-q3-v7-deepseek4-verdict-v1.md`, `adr063-q3-v7-gemma4-verdict-v1.md`
+and `adr063-q3-v9-gemma4-verdict-v1.md`. A stage that reaches 20 blocks
+without precision is inconclusive on that contrast and is disclosed as such.
+
+Native-engine rows stay separate. They render in their own section and never
+stand in for the same-GGUF verdict. A campaign with a native peer arm
+contributes only its native rows.
+
+The scoreboard renders this as the "Q3 verdicts of record" tier above the
+Descriptive results (`scripts/four_agent/f2_q3_tier.py`,
+`f2_q3_view.py`; how to read it is in `docs/research/adr063-f2-scoreboard.md`).
+"Win" appears there only against v0.1.28 stock (release `9a0b79c7`; the stock
+arm is v0.1.28, not v0.1.27), and only when all of these hold:
+- the makespan interval against stock excludes a tie, with half-width ≤ 2.5 points;
+- neither measurable stock fairness effect regresses beyond the neutral band;
+- the primary stage reached its stopping rule, with valid thermal and memory receipts;
+- no final source awaits patch review;
+- the quality gate passed against both references.
+
+Moved to successor scope: the fixed-six three-arm campaign, canonical-transcript
+replay timing lanes, the cancellation/retry, divergent-edit and request-order
+permutation scenarios, and captured production-client sampling. The F2
+acceptance bullets that name them are the successor's acceptance, not this
+closure's; `f2_scoreboard_cli.py` still renders any fixed-six result produced.
+This decision establishes no speed win by itself.
 
 ## Consequences
 

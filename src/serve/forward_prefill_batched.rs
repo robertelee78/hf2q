@@ -1994,6 +1994,8 @@ impl MlxModelWeights {
         let mut capture_active: bool = false;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            #[cfg(test)]
+            let mut q1_layer_terminal_checked = false;
             // Metal-1 — begin/end programmatic GPU capture around the
             // configured layer range (HF2Q_METAL_CAPTURE_LAYERS).
             if let Some(p) = capture_path.as_ref() {
@@ -4607,6 +4609,15 @@ impl MlxModelWeights {
                         ),
                     );
                 }
+                #[cfg(test)]
+                let q1_routed=crate::adr063_invariance::gemma_routing_witness::batch(
+                    s.encoder_mut(),reg,dev,&pf_router_logits,&pf_expert_ids,&pf_routing_weights,
+                    &self.layers[layer_idx].moe.per_expert_scale,num_experts as u32,top_k as u32,
+                    layer_idx,start_pos,seq_len,self.multi_seq_prefill.as_ref().map(|ms|
+                        ms.slot_ids.iter().zip(&ms.start_positions).zip(&ms.seq_lens).zip(&ms.seq_offsets)
+                            .map(|(((slot,start),len),offset)|(slot.0,*start,*len,*offset)).collect()))?;
+                #[cfg(not(test))] let q1_routed=false;
+                if !q1_routed {
                 mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_batch_f32(
                     s.encoder_mut(),
                     reg,
@@ -4620,6 +4631,7 @@ impl MlxModelWeights {
                     seq_len as u32,
                 )
                 .map_err(|e| anyhow::anyhow!("batched MoE routing L{layer_idx}: {e}"))?;
+                }
                 if let Some(t0) = t0_gelu_mul_routing {
                     bucket_finish!(
                         s,
@@ -5154,7 +5166,12 @@ impl MlxModelWeights {
                 // hook reads.  Adds ~30 per-layer sync points (one per
                 // layer per token-position) only when spec-decode is
                 // running; production cmd_generate path is bit-identical.
-                let sync_per_layer = batched_dump.is_some()
+                #[cfg(test)]
+                let q1_checked_layer = crate::adr063_invariance::family::enabled(
+                    crate::adr063_invariance::receipt::Family::Gemma4);
+                #[cfg(not(test))]
+                let q1_checked_layer = false;
+                let sync_per_layer = q1_checked_layer || batched_dump.is_some()
                     || std::env::var("HF2Q_PROFILE_LAYERS").is_ok()
                     || std::env::var("HF2Q_SYNC_PER_LAYER").is_ok()
                     || profile_buckets_on
@@ -5173,6 +5190,8 @@ impl MlxModelWeights {
                         s.finish()
                             .map_err(|e| anyhow::anyhow!("batched mlp finish L{layer_idx}: {e}"))?;
                     }
+                    #[cfg(test)]
+                    { q1_layer_terminal_checked = true; }
                     if std::env::var("HF2Q_PROFILE_LAYERS").is_ok() {
                         let kind = if is_sliding { "SW" } else { "GL" };
                         eprintln!(
@@ -5231,6 +5250,26 @@ impl MlxModelWeights {
             // layers' cursor continues after graft rows + prompt rows
             // (absolute); sliding rings stay prompt-indexed (they never
             // hold graft rows).
+            #[cfg(test)]
+            crate::adr063_invariance::gemma_prefill::after_layer(
+                q1_layer_terminal_checked, start_pos, layer_idx, &[
+                    (crate::adr063_invariance::receipt::Stage::Query, &pf_q, vec![seq_len, nh, hd]),
+                    (crate::adr063_invariance::receipt::Stage::Key, &pf_k, vec![seq_len, nkv, hd]),
+                    (crate::adr063_invariance::receipt::Stage::Value, &pf_v_normed, vec![seq_len, nkv, hd]),
+                    (crate::adr063_invariance::receipt::Stage::RopeQuery, &pf_q_normed, vec![seq_len, nh, hd]),
+                    (crate::adr063_invariance::receipt::Stage::RopeKey, &pf_k_normed, vec![seq_len, nkv, hd]),
+                    (crate::adr063_invariance::receipt::Stage::Attention, &pf_sdpa_out, vec![seq_len, nh, hd]),
+                    (crate::adr063_invariance::receipt::Stage::Residual, &pf_residual, vec![seq_len, hs]),
+                    (crate::adr063_invariance::receipt::Stage::FfnNorm, &pf_moe_norm_out, vec![seq_len, hs]),
+                    (crate::adr063_invariance::receipt::Stage::RouterLogits, &pf_router_logits, vec![seq_len, num_experts]),
+                    (crate::adr063_invariance::receipt::Stage::RouterIds, &pf_expert_ids, vec![seq_len, top_k]),
+                    (crate::adr063_invariance::receipt::Stage::RouterWeights, &pf_routing_weights, vec![seq_len, top_k]),
+                    (crate::adr063_invariance::receipt::Stage::DenseOutput, &pf_mlp_down, vec![seq_len, hs]),
+                    (crate::adr063_invariance::receipt::Stage::MoeOutput, &pf_moe_accum, vec![seq_len, hs]),
+                    (crate::adr063_invariance::receipt::Stage::LayerOutput, &pf_hidden, vec![seq_len, hs]),
+                ],
+            )?;
+
             let new_write_pos = self
                 .multi_seq_prefill
                 .as_ref()
@@ -5525,6 +5564,18 @@ impl MlxModelWeights {
                 .collect(),
             None => vec![seq_len - 1],
         };
+        #[cfg(test)]
+        let q1_endpoint_rows = crate::adr063_invariance::gemma_endpoint::head_rows(
+            start_pos, seq_len, self.multi_seq_prefill.as_ref().map(|ms|
+                ms.slot_ids.iter().zip(&ms.start_positions).zip(&ms.seq_lens).zip(&ms.seq_offsets)
+                    .map(|(((slot,start),len),offset)|(slot.0,*start,*len,*offset)).collect()))
+            .map_err(anyhow::Error::msg)?;
+        #[cfg(test)]
+        let q1_endpoint_all_rows = q1_endpoint_rows.is_some();
+        #[cfg(test)]
+        let original_head_rows = head_rows.clone();
+        #[cfg(test)]
+        let head_rows = q1_endpoint_rows.unwrap_or(head_rows);
         let mut ms_tokens: Vec<u32> = Vec::with_capacity(head_rows.len());
         let mut ms_logits: Vec<Vec<f32>> = Vec::with_capacity(head_rows.len());
         let capture_multi_seq_logits = self.multi_seq_prefill.is_some();
@@ -5683,7 +5734,15 @@ impl MlxModelWeights {
             s.finish()
                 .map_err(|e| anyhow::anyhow!("batched head finish: {e}"))?;
 
-            if capture_multi_seq_logits {
+            #[cfg(test)]
+            crate::adr063_invariance::gemma_endpoint::logits(
+                head_row, &self.activations.logits, vocab_size).map_err(anyhow::Error::msg)?;
+
+            #[cfg(test)]
+            let publish_selected_head = !q1_endpoint_all_rows || original_head_rows.contains(&head_row);
+            #[cfg(not(test))]
+            let publish_selected_head = true;
+            if capture_multi_seq_logits && publish_selected_head {
                 let logits: &[f32] = self
                     .activations
                     .logits
@@ -5717,10 +5776,13 @@ impl MlxModelWeights {
             validate_batched_prefill_argmax(argmax_value, head_row)?;
             // first_token (the fn's return) is seq 0's token — single-seq
             // callers read it; multi-seq callers read out_first_tokens.
-            if ms_tokens.is_empty() {
+            if ms_tokens.is_empty() && publish_selected_head {
                 first_token = tok;
             }
-            ms_tokens.push(tok);
+            // Diagnostic visits every row; preserve the ordinary last-row result.
+            #[cfg(test)]
+            if q1_endpoint_all_rows && !capture_multi_seq_logits { first_token = tok; }
+            if publish_selected_head { ms_tokens.push(tok); }
         }
         // iter-G(a): hand the per-seq first tokens back to the wrapper. No-op
         // in single-seq mode (multi_seq_prefill is None).

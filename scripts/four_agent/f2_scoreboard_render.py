@@ -8,20 +8,21 @@ every Verified row from its receipt under `--evidence-root` and refuses drift.
 """
 import argparse
 import hashlib
-import json
-import math
 import re
 import statistics
 import sys
 from pathlib import Path
 
+from f2_rows_extract import REPO, extract, number as _number, require, resolve, strict_json
 from f2_scoreboard import SCHEMA as SCOREBOARD_SCHEMA
+import f2_q3_tier as q3tier
+import f2_q3_view as q3view
 import native_peers
 
 ROWS_SCHEMA = "hf2q.f2.scoreboard-rows.v1"
-REPO = Path(__file__).resolve().parents[2]
+# v0128_stock: the released v0.1.28 standalone binary (source 9a0b79c7), the Q3 stock arm.
 ARMS = {"hf2q_current": "hf2q current", "candidate": "candidate",
-        "v0127_stock": "v0.1.27 stock", "peer": "peer"}
+        "v0128_stock": "v0.1.28 stock", "peer": "peer"}
 # Effect baselines: every arm, plus each separately labeled native-engine arm (never a measured column).
 NATIVE_BASELINES = native_peers.baselines()
 BASELINE_ARMS = {**ARMS, **NATIVE_BASELINES}
@@ -37,6 +38,12 @@ METRICS = {
     "client_elapsed_s": ("Client coordinator elapsed", "s", "lower", "makespan"),
     "cached_token_share_pct": ("Cached-token share of prompt tokens", "%", "higher", "cached_token_share_pct"),
     "task_pass": ("Successful agent tasks", "tasks", None, "task_pass"),
+    # Q3 verdict-of-record rows only (f2_q3_tier): worst-slot fairness effects, token volume and output rate.
+    "worst_slot_ttft_p95_s": ("Worst-slot semantic TTFT p95", "s", "lower", None),
+    "worst_slot_sse_gap_max_s": ("Worst-slot SSE gap max", "s", "lower", None),
+    "prompt_tokens": ("Prompt tokens per run (median)", "tokens", None, None),
+    "completion_tokens": ("Completion tokens per run (median)", "tokens", None, None),
+    "output_tokens_per_s": ("Completion tokens per makespan-second (median per run)", "tok/s", None, None),
 }
 GAP_METRICS = ("decode_tps_per_agent", "decode_tps_aggregate", "decode_tps_single_stream", "prefill_tps",
                "semantic_ttft_s", "makespan", "cached_token_share_pct", "task_pass")
@@ -45,23 +52,6 @@ SCOREBOARD_STATUSES = {"Qualified", "InconclusivePrecision", "QualityIneligible"
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
 DATE = re.compile(r"^\d{4}-\d{2}(-\d{2})?$")
-
-
-def require(ok, why):
-    if not ok:
-        raise ValueError(why)
-
-
-def strict_json(raw):
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            require(key not in result, f"duplicate JSON key {key!r}")
-            result[key] = value
-        return result
-    def nonfinite(token):
-        raise ValueError(f"nonfinite JSON {token}")
-    return json.loads(raw, object_pairs_hook=unique, parse_constant=nonfinite)
 
 
 def _strings(value):
@@ -74,10 +64,6 @@ def _strings(value):
     elif isinstance(value, list):
         for v in value:
             yield from _strings(v)
-
-
-def _number(value, why):
-    require(type(value) in (int, float) and math.isfinite(value), why)
 
 
 def validate_manifest(m):
@@ -96,6 +82,7 @@ def validate_manifest(m):
                 isinstance(f.get("artifact_sha256"), str) and SHA64.match(f["artifact_sha256"]), "family fields")
     for g in groups.values():
         require(g.get("family") in families and g.get("title") and g.get("workload"), "group binding")
+    record_refs = q3tier.validate(groups)
     ids = set()
     for row in m.get("rows", []):
         rid = row.get("id")
@@ -125,6 +112,10 @@ def validate_manifest(m):
             require(isinstance(row["control_of"], str) and row["control_of"].startswith("$E/")
                     and ((kind == "effect" and row["status"] == "Descriptive") or row["status"] == "Failure"),
                     f"{rid}: control_of must cite a $E/ primary of record on a Descriptive effect or a Failure row")
+        if "q3_of_record" in row:
+            q3tier.validate_row(row, groups)
+        else:
+            q3tier.validate_foreign(row, record_refs)
         require(type(row.get("n_slots")) is int and row["n_slots"] >= 1, f"{rid}: n_slots")
         if row["metric"] == "task_pass":
             require(float(row["value"]).is_integer() and 0 <= row["value"] <= row["n_slots"], f"{rid}: task pass count")
@@ -143,77 +134,14 @@ def validate_manifest(m):
             require(isinstance(v.get("key"), str) and v["key"] and isinstance(v.get("extract"), dict) and
                     "value" in v["extract"], f"{rid}: verified rows need key and value extract")
             require(("ci95" in v["extract"]) == (row.get("ci95") is not None), f"{rid}: ci95 extract")
+            require(set(v["extract"]) <= {"value", "ci95", "half_width_pp"}, f"{rid}: extract fields")
+            require(("half_width_pp" in v["extract"]) == ("half_width_pp" in row), f"{rid}: half_width_pp needs its extract")
         else:
-            require(isinstance(v.get("reason"), str) and v["reason"], f"{rid}: unverified reason")
+            require(isinstance(v.get("reason"), str) and v["reason"] and "half_width_pp" not in row, f"{rid}: unverified reason")
+        if "half_width_pp" in row:
+            _number(row["half_width_pp"], f"{rid}: half_width_pp")
         require(isinstance(row.get("note"), str), f"{rid}: note")
     return m
-
-
-def resolve(ref, evidence_root):
-    if ref.startswith("$E/"):
-        require(evidence_root is not None, "--evidence-root required to verify $E references")
-        base, rel = Path(evidence_root), ref[3:]
-    else:
-        require(ref.startswith("repo:"), f"bad reference {ref}")
-        base, rel = REPO, ref[5:]
-    path = (base / rel).resolve()
-    require(path.is_relative_to(base.resolve()) and path.is_file(), f"missing receipt {ref}")
-    return path
-
-
-def _walk(value, path):
-    values = [value]
-    for part in path.split(".") if path else []:
-        nxt = []
-        for v in values:
-            if part == "*" and isinstance(v, dict):
-                nxt.extend(v[k] for k in sorted(v))
-            elif part == "*" and isinstance(v, list):
-                nxt.extend(v)
-            elif isinstance(v, dict) and part in v:
-                nxt.append(v[part])
-            elif isinstance(v, list) and part.isdigit() and int(part) < len(v):
-                nxt.append(v[int(part)])
-        values = nxt
-    return values
-
-
-def _reduce(values, spec):
-    if spec.get("skip_null"):
-        values = [v for v in values if v is not None]
-    how = spec["reduce"]
-    if how == "count_equal":
-        return float(sum(1 for v in values if v == spec["equal"]))
-    if how == "one":
-        require(len(values) == 1, f"expected exactly one value, found {len(values)}")
-    require(values, "extract matched nothing")
-    if how == "list":
-        return [float(v) for v in values]
-    numbers = [float(v) for v in values]
-    for x in numbers:
-        _number(x, "extracted value")
-    return {"one": lambda: numbers[0], "median": lambda: statistics.median(numbers), "sum": lambda: math.fsum(numbers),
-            "min": lambda: min(numbers), "max": lambda: max(numbers)}[how]()
-
-
-def extract(spec, evidence_root, cache):
-    kind = spec["kind"]
-    if kind == "ratio":
-        num, den = extract(spec["numerator"], evidence_root, cache), extract(spec["denominator"], evidence_root, cache)
-        require(den != 0, "zero denominator")
-        value = num / den * spec.get("scale", 1)
-    else:
-        path = resolve(spec["file"], evidence_root)
-        if path not in cache:
-            cache[path] = path.read_text(errors="replace")
-        if kind == "json":
-            value = _reduce(_walk(strict_json(cache[path]), spec["path"]), spec)
-        else:
-            require(kind == "regex", f"unknown extract kind {kind}")
-            value = _reduce(re.findall(spec["regex"], cache[path]), spec)
-    if spec.get("transform") == "improvement_percent_from_ratio":
-        value = 100 * (1 - value)
-    return value
 
 
 def verify_rows(manifest, evidence_root):
@@ -225,11 +153,13 @@ def verify_rows(manifest, evidence_root):
         got = extract(v["extract"]["value"], evidence_root, cache)
         require(round(got, row["decimals"]) == round(row["value"], row["decimals"]),
                 f"{row['id']}: receipt gives {got!r}, manifest records {row['value']!r}")
-        if "ci95" in v["extract"]:
-            ci = extract(v["extract"]["ci95"], evidence_root, cache)
-            require([round(x, row["decimals"]) for x in ci] == [round(x, row["decimals"]) for x in row["ci95"]],
-                    f"{row['id']}: ci95 drift")
+        for field in ("ci95", "half_width_pp"):
+            if field in v["extract"]:
+                got = extract(v["extract"][field], evidence_root, cache)
+                same = lambda x: [round(y, row["decimals"]) for y in (x if field == "ci95" else [x])]
+                require(same(got) == same(row[field]), f"{row['id']}: {field} drift")
         checked.append(row["id"])
+    q3tier.verify(manifest, evidence_root, resolve)
     return checked
 
 
@@ -247,7 +177,7 @@ def load_scoreboard(family, ref, data, families):
 
 def eligible(row):
     return (row["verification"]["state"] == "Verified" and row["status"] in ("Qualified", "Descriptive", "NegativeResult")
-            and row["kind"] == "measurement" and METRICS[row["metric"]][2] is not None)
+            and row["kind"] == "measurement" and METRICS[row["metric"]][2] is not None and "q3_of_record" not in row)
 
 
 def comparisons(manifest):
@@ -259,7 +189,7 @@ def comparisons(manifest):
     result = []
     for (group, metric), arms in buckets.items():
         pairs = [(k, ("hf2q_current", None)) for k in arms if k[0] == "candidate"]
-        pairs += [(("hf2q_current", None), k) for k in arms if k[0] in ("peer", "v0127_stock")]
+        pairs += [(("hf2q_current", None), k) for k in arms if k[0] in ("peer", "v0128_stock")]
         for num_key, den_key in pairs:
             if num_key not in arms or den_key not in arms:
                 continue
@@ -345,7 +275,8 @@ def render(manifest, scoreboards, manifest_sha256):
     fams, groups, rows = manifest["families"], manifest["groups"], manifest["rows"]
     controls = [x for x in rows if "control_of" in x]  # Q3 controls of a primary of record: own section, never a win/non-win
     native = [x for x in rows if x.get("baseline_arm") in NATIVE_BASELINES and "control_of" not in x]  # own section only, never a win/non-win
-    rows = [x for x in rows if x.get("baseline_arm") not in NATIVE_BASELINES and "control_of" not in x]
+    q3 = [x for x in rows if "q3_of_record" in x]  # Q3 verdicts of record: their own tier only
+    rows = [x for x in rows if x.get("baseline_arm") not in NATIVE_BASELINES and "control_of" not in x and "q3_of_record" not in x]
     band = manifest["neutral_band_ratio"]
     comps = comparisons(manifest)
     out = ["# ADR-063 F2 four-agent scoreboard", "",
@@ -359,7 +290,8 @@ def render(manifest, scoreboards, manifest_sha256):
            "(no fixed-six blocks, no Q2 certification, usually pending independent review). Never presented as a Qualified win.",
            "- **[NEG] NegativeResult**: a recorded verdict of no win or a failed acceptance criterion.",
            "- **[FAIL] Failure**: the run failed its task; its numbers are never used as a ratio baseline.",
-           "- `(unverified)`: the value could not be re-read from its receipt; excluded from wins.", "",
+           "- `(unverified)`: the value could not be re-read from its receipt; excluded from wins.",
+           "- **v0.1.28 stock**: the released v0.1.28 standalone binary (source `9a0b79c7`), the Q3 stock arm.", "",
            f"Ratios are oriented so **> 1 means the first arm is better** (tok/s: arm/baseline; seconds: baseline/arm). "
            f"Repeated runs compare by median. Ratios within ×{band} either way are Neutral. Outside that band, a Win or "
            "Regression also needs at least two runs per arm with non-overlapping ranges; otherwise it is Unseparated, never a win.", ""]
@@ -378,6 +310,7 @@ def render(manifest, scoreboards, manifest_sha256):
                 cols = ["—", "—", "—"]
             out.append(f"| {fams[sb['family']]['title']} | {d['status']} | {' | '.join(cols)} | `{sb['ref']}` |")
         out.append("")
+    out += q3view.render(manifest, q3, native, BASELINE_ARMS)
     qualified_wins = []
     for sb in scoreboards:
         d = sb["data"]
@@ -390,9 +323,10 @@ def render(manifest, scoreboards, manifest_sha256):
                                       f"{1 / e['geometric_ratio']:.3f}× | {e['reduction_percent']:.2f}% "
                                       f"[{e['nominal_pointwise_ci95_percent'][0]:.2f}, {e['nominal_pointwise_ci95_percent'][1]:.2f}] | `{sb['ref']}` |")
     qualified_wins += [_comp_line(c, groups, fams) for c in comps if c["verdict"] == "Win" and c["label"] == "Qualified"]
-    out += ["## Wins vs baseline", "", "### Qualified wins", ""]
+    out += ["## Wins vs baseline", "", "### Qualified wins (fixed-six; successor scope)", ""]
     out += (["| Family | Metric | Arm vs baseline | Ratio | Detail | Evidence |", "|---|---|---|---|---|---|"] + qualified_wins
-            if qualified_wins else ["None yet: no F2 primary Qualified win exists."])
+            if qualified_wins else ["None yet: no fixed-six F2 primary Qualified win exists (successor scope). Under option B, "
+                                    "F2's qualified display is the Q3 verdicts of record tier above."])
     out += ["", "### Descriptive wins (not F2 primary qualified results)", ""]
     dwins = [_comp_line(c, groups, fams) for c in comps if c["verdict"] == "Win" and c["label"] == "Descriptive"]
     dwins += [f"| {fams[r['family']]['title']} | {groups[r['group']]['title']}: {METRICS[r['metric']][0]} | "

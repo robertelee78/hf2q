@@ -11,6 +11,7 @@ Labels:
 - **[NEG] NegativeResult**: a recorded verdict of no win or a failed acceptance criterion.
 - **[FAIL] Failure**: the run failed its task; its numbers are never used as a ratio baseline.
 - `(unverified)`: the value could not be re-read from its receipt; excluded from wins.
+- **v0.1.28 stock**: the released v0.1.28 standalone binary (source `9a0b79c7`), the Q3 stock arm.
 
 Ratios are oriented so **> 1 means the first arm is better** (tok/s: arm/baseline; seconds: baseline/arm). Repeated runs compare by median. Ratios within ×1.025 either way are Neutral. Outside that band, a Win or Regression also needs at least two runs per arm with non-overlapping ranges; otherwise it is Unseparated, never a win.
 
@@ -18,11 +19,38 @@ Ratios are oriented so **> 1 means the first arm is better** (tok/s: arm/baselin
 
 No `hf2q.f2.fixed-six-scoreboard.v1` result has been rendered: no family has an F2 primary result yet.
 
+## Q3 verdicts of record (F2's qualified display under option B; above Descriptive)
+
+How to read this tier:
+
+- **Source.** One Q3 `verdict.json` of record per family, merged with `q3_campaign.py --rows CAMPAIGN --of-record` after independent review. `--verify` re-reads every number from its receipt and re-derives the verdict, campaign status, halt, stages and quality gate from `verdict.json`, `campaign.json` and the quality manifests. Under option B this tier is F2's qualified display; the fixed-six Qualified section below is successor scope.
+- **Q3 verdict of record** is the family verdict of the predeclared Q3 rules (`docs/research/adr063-q3-campaign.md`): Win, Loss, Unavailable (no runnable same-GGUF peer) or Failed (hf2q task failure). A Q3 Win whose stock conditions or quality gate below are unmet shows as Withheld, with the reasons.
+- **Win appears only against v0.1.28 stock** (release `9a0b79c7`), and only when the makespan interval vs stock excludes a tie at half-width ≤ 2.5 points, neither measurable stock fairness effect regresses beyond the neutral band, the primary stage reached its stopping rule with valid thermal and memory receipts, no final source awaits patch review, and the quality gate passed against **both** references (v0.1.28 stock, and the same-GGUF peer or, where it is unavailable, the family's native stand-in: ds4 for DeepSeek-V4). Otherwise the numbers are shown with the gating reason.
+- **Peer: task makespan only.** The sentence names whichever arm finishes sooner and computes X on the slower arm's time, X = 1 − faster/slower; it is never a win. Unavailable families show the native-engine statement (different artifact) when one exists.
+- **Fairness** is the worst-slot ratio hf2q/reference with its 95% CI; above 1 means hf2q's worst slot waits longer. An SSE gap that the Q3 verdict could not estimate is not measurable (one semantic event per streamed turn) and does not gate, as in the Q3 rule. SSE gaps against the peer are not comparable (different event granularity).
+- **Quality gate**, per reference: Pending (manifest absent or still running), Halted (the campaign halted), Pass (Q1 paired verdict Pass, subject runs on the experiment binary and reference runs on that reference's binary) or Fail (any other settled Q1 verdict, shown in parentheses).
+- **Campaign** status includes a halt in a later stage (for example Invalid from a mixed-stage width halt), which does not change the completed primary, and lists which control stages were measured. Control effects of the record and native-engine rows keep their own sections below.
+
+| Family | Q3 verdict of record | Makespan vs v0.1.28 stock | Makespan vs peer (task makespan only) | Worst-slot fairness, hf2q/reference [95% CI] | Quality gate | Campaign | Reviewed verdict |
+|---|---|---|---|---|---|---|---|
+| Qwen3.8 27B | No Q3 verdict of record | — | — | — | — | — | — |
+| DeepSeek-V4 Flash | No Q3 verdict of record | — | — | — | — | — | — |
+| Qwen3.6 35B-A3B | No Q3 verdict of record | — | — | — | — | — | — |
+| Gemma4 26B-A4B | No Q3 verdict of record | — | — | — | — | — | — |
+
+Token volume and per-output-token rate (medians over the primary stage's passing runs; descriptive, never a verdict input):
+
+None recorded.
+
+Rows of record (receipt and extraction key in the rows manifest); the record's control effects are in the Q3 controls section:
+
+None.
+
 ## Wins vs baseline
 
-### Qualified wins
+### Qualified wins (fixed-six; successor scope)
 
-None yet: no F2 primary Qualified win exists.
+None yet: no fixed-six F2 primary Qualified win exists (successor scope). Under option B, F2's qualified display is the Q3 verdicts of record tier above.
 
 ### Descriptive wins (not F2 primary qualified results)
 
@@ -76,38 +104,38 @@ None yet: no F2 primary Qualified win exists.
 
 | Family | Metric | Missing arms | Arms with only failed runs |
 |---|---|---|---|
-| Qwen3.8 27B | decode_tps_per_agent | v0.1.27 stock, peer | — |
-| Qwen3.8 27B | decode_tps_aggregate | v0.1.27 stock, peer | — |
-| Qwen3.8 27B | decode_tps_single_stream | candidate, v0.1.27 stock, peer | — |
-| Qwen3.8 27B | prefill_tps | hf2q current, candidate, v0.1.27 stock, peer | — |
-| Qwen3.8 27B | semantic_ttft_s | v0.1.27 stock, peer | — |
-| Qwen3.8 27B | makespan | v0.1.27 stock, peer | — |
-| Qwen3.8 27B | cached_token_share_pct | v0.1.27 stock, peer | — |
-| Qwen3.8 27B | task_pass | v0.1.27 stock, peer | — |
-| DeepSeek-V4 Flash | decode_tps_per_agent | v0.1.27 stock, peer | — |
-| DeepSeek-V4 Flash | decode_tps_aggregate | v0.1.27 stock, peer | — |
-| DeepSeek-V4 Flash | decode_tps_single_stream | candidate, v0.1.27 stock | — |
-| DeepSeek-V4 Flash | prefill_tps | v0.1.27 stock | — |
-| DeepSeek-V4 Flash | semantic_ttft_s | v0.1.27 stock, peer | — |
-| DeepSeek-V4 Flash | makespan | v0.1.27 stock, peer | — |
-| DeepSeek-V4 Flash | cached_token_share_pct | v0.1.27 stock, peer | — |
-| DeepSeek-V4 Flash | task_pass | v0.1.27 stock, peer | — |
-| Qwen3.6 35B-A3B | decode_tps_per_agent | v0.1.27 stock | hf2q current, candidate |
-| Qwen3.6 35B-A3B | decode_tps_aggregate | v0.1.27 stock | hf2q current, candidate |
-| Qwen3.6 35B-A3B | decode_tps_single_stream | v0.1.27 stock, peer | hf2q current, candidate |
-| Qwen3.6 35B-A3B | prefill_tps | v0.1.27 stock | hf2q current, candidate |
-| Qwen3.6 35B-A3B | semantic_ttft_s | v0.1.27 stock | hf2q current, candidate |
-| Qwen3.6 35B-A3B | makespan | v0.1.27 stock | hf2q current, candidate |
-| Qwen3.6 35B-A3B | cached_token_share_pct | v0.1.27 stock | hf2q current, candidate |
-| Qwen3.6 35B-A3B | task_pass | v0.1.27 stock | hf2q current, candidate |
-| Gemma4 26B-A4B | decode_tps_per_agent | hf2q current, candidate, v0.1.27 stock, peer | — |
-| Gemma4 26B-A4B | decode_tps_aggregate | hf2q current, v0.1.27 stock, peer | — |
-| Gemma4 26B-A4B | decode_tps_single_stream | hf2q current, candidate, v0.1.27 stock, peer | — |
-| Gemma4 26B-A4B | prefill_tps | hf2q current, v0.1.27 stock, peer | — |
-| Gemma4 26B-A4B | semantic_ttft_s | hf2q current, v0.1.27 stock, peer | — |
-| Gemma4 26B-A4B | makespan | hf2q current, v0.1.27 stock, peer | — |
-| Gemma4 26B-A4B | cached_token_share_pct | hf2q current, v0.1.27 stock, peer | — |
-| Gemma4 26B-A4B | task_pass | hf2q current, v0.1.27 stock, peer | — |
+| Qwen3.8 27B | decode_tps_per_agent | v0.1.28 stock, peer | — |
+| Qwen3.8 27B | decode_tps_aggregate | v0.1.28 stock, peer | — |
+| Qwen3.8 27B | decode_tps_single_stream | candidate, v0.1.28 stock, peer | — |
+| Qwen3.8 27B | prefill_tps | hf2q current, candidate, v0.1.28 stock, peer | — |
+| Qwen3.8 27B | semantic_ttft_s | v0.1.28 stock, peer | — |
+| Qwen3.8 27B | makespan | v0.1.28 stock, peer | — |
+| Qwen3.8 27B | cached_token_share_pct | v0.1.28 stock, peer | — |
+| Qwen3.8 27B | task_pass | v0.1.28 stock, peer | — |
+| DeepSeek-V4 Flash | decode_tps_per_agent | v0.1.28 stock, peer | — |
+| DeepSeek-V4 Flash | decode_tps_aggregate | v0.1.28 stock, peer | — |
+| DeepSeek-V4 Flash | decode_tps_single_stream | candidate, v0.1.28 stock | — |
+| DeepSeek-V4 Flash | prefill_tps | v0.1.28 stock | — |
+| DeepSeek-V4 Flash | semantic_ttft_s | v0.1.28 stock, peer | — |
+| DeepSeek-V4 Flash | makespan | v0.1.28 stock, peer | — |
+| DeepSeek-V4 Flash | cached_token_share_pct | v0.1.28 stock, peer | — |
+| DeepSeek-V4 Flash | task_pass | v0.1.28 stock, peer | — |
+| Qwen3.6 35B-A3B | decode_tps_per_agent | v0.1.28 stock | hf2q current, candidate |
+| Qwen3.6 35B-A3B | decode_tps_aggregate | v0.1.28 stock | hf2q current, candidate |
+| Qwen3.6 35B-A3B | decode_tps_single_stream | v0.1.28 stock, peer | hf2q current, candidate |
+| Qwen3.6 35B-A3B | prefill_tps | v0.1.28 stock | hf2q current, candidate |
+| Qwen3.6 35B-A3B | semantic_ttft_s | v0.1.28 stock | hf2q current, candidate |
+| Qwen3.6 35B-A3B | makespan | v0.1.28 stock | hf2q current, candidate |
+| Qwen3.6 35B-A3B | cached_token_share_pct | v0.1.28 stock | hf2q current, candidate |
+| Qwen3.6 35B-A3B | task_pass | v0.1.28 stock | hf2q current, candidate |
+| Gemma4 26B-A4B | decode_tps_per_agent | hf2q current, candidate, v0.1.28 stock, peer | — |
+| Gemma4 26B-A4B | decode_tps_aggregate | hf2q current, v0.1.28 stock, peer | — |
+| Gemma4 26B-A4B | decode_tps_single_stream | hf2q current, candidate, v0.1.28 stock, peer | — |
+| Gemma4 26B-A4B | prefill_tps | hf2q current, v0.1.28 stock, peer | — |
+| Gemma4 26B-A4B | semantic_ttft_s | hf2q current, v0.1.28 stock, peer | — |
+| Gemma4 26B-A4B | makespan | hf2q current, v0.1.28 stock, peer | — |
+| Gemma4 26B-A4B | cached_token_share_pct | hf2q current, v0.1.28 stock, peer | — |
+| Gemma4 26B-A4B | task_pass | hf2q current, v0.1.28 stock, peer | — |
 
 - Qwen3.8 27B: no F2 primary Qualified fixed-six result.
 - DeepSeek-V4 Flash: no F2 primary Qualified fixed-six result.
@@ -118,7 +146,7 @@ None yet: no F2 primary Qualified win exists.
 
 Artifact SHA-256 `cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7`. Vanilla hf2q-produced Q4_K_M GGUF (`qwen38-stock/Qwen3.8-27B-vanilla.gguf`). No peer adapter run for this artifact yet.
 
-| Workload | Metric | hf2q current | candidate | v0.1.27 stock | peer |
+| Workload | Metric | hf2q current | candidate | v0.1.28 stock | peer |
 |---|---|---|---|---|---|
 | Qwen3.8 N1 coding | Single-stream decode tok/s | 45.375 tok/s [D] | — | — | — |
 | Qwen3.8 N1 coding | Semantic TTFT (median, streamed turns) | 2.040 s [D] | — | — | — |
@@ -228,7 +256,7 @@ Workloads:
 
 Artifact SHA-256 `50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6`. `deepseek4/…agentic-q2.gguf`. The 2026-08 parity rows used a different artifact (`936a97e6…`); the ADR-063 coding client has no DeepSeek peer adapter.
 
-| Workload | Metric | hf2q current | candidate | v0.1.27 stock | peer |
+| Workload | Metric | hf2q current | candidate | v0.1.28 stock | peer |
 |---|---|---|---|---|---|
 | DeepSeek N1 coding | Single-stream decode tok/s | 33.774 tok/s [D] | — | — | — |
 | DeepSeek N1 coding | Prefill tok/s | 362.259 tok/s [D] | — | — | — |
@@ -339,7 +367,7 @@ Workloads:
 
 Artifact SHA-256 `815a22cab21649948352c0eea6e9be0d9d15606e2024d86e7bdb71fb9df08220`. `qwen36-stock-adr063/…Q4_K_M.gguf`, shared by hf2q and peer arms. hf2q fails the N4 coding task, so no speed ratio exists.
 
-| Workload | Metric | hf2q current | candidate | v0.1.27 stock | peer |
+| Workload | Metric | hf2q current | candidate | v0.1.28 stock | peer |
 |---|---|---|---|---|---|
 | Qwen3.6 N4 coding | Decode tok/s per agent (median per-request server rate) | — | — | — | 54.555 tok/s [D] |
 | Qwen3.6 N4 coding | Aggregate output tok/s (completion tokens / client elapsed) | — | — | — | 174.364 tok/s [D] |
@@ -373,7 +401,7 @@ Workloads:
 
 Artifact SHA-256 `bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53`. hf2q q4_k_m GGUF. The plan marks the Gemma peer adapter unsupported.
 
-| Workload | Metric | hf2q current | candidate | v0.1.27 stock | peer |
+| Workload | Metric | hf2q current | candidate | v0.1.28 stock | peer |
 |---|---|---|---|---|---|
 | Gemma4 N4 full-input | Aggregate output tok/s (completion tokens / client elapsed) | — | full-input checkpoint ON: 94.404 tok/s [D] | — | — |
 | Gemma4 N4 full-input | Prefill tok/s | — | full-input checkpoint ON: 1334.200 tok/s [D] | — | — |

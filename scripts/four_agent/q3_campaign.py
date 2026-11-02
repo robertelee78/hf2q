@@ -25,6 +25,7 @@ import json
 import os
 from pathlib import Path
 
+import coding_long_context
 import native_peers
 import q2_run_audit
 import q3_identity
@@ -156,6 +157,10 @@ def build_plan(args, environ, family):
         if native_peers.is_native(kind):
             module = native_peers.adapter(kind)
             arms[arm].update(role=module.q3_role(cases[arm]), label=module.label(cases[arm]))
+    selections = {arm: coding_long_context.case_selection(case) for arm, case in cases.items()}
+    qc.require(all(flag == approved for flag, approved in selections.values()) and len(set(selections.values())) == 1,
+               "every arm must run the same workload variant (client --workload equal to the approval "
+               "workload_variant): " + ", ".join(f"{arm}={flag}" for arm, (flag, _) in sorted(selections.items())))
     native = native_peers.peer_kind({"arms": arms})
     evidence, comparison = bool(args.peer_unavailable_evidence), bool(args.native_comparison)
     qc.require((native is None and not comparison and not (args.peer_case and evidence))
@@ -491,9 +496,19 @@ def parse_args(argv):
     parser.add_argument("--verdict", type=Path, metavar="CAMPAIGN", help="recompute CAMPAIGN/verdict.json only")
     parser.add_argument("--rows", type=Path, metavar="CAMPAIGN", help="print F2 scoreboard rows for CAMPAIGN")
     parser.add_argument("--evidence-root", type=Path, help="evidence root ($E) for --rows")
+    parser.add_argument("--of-record", action="store_true",
+                        help="--rows for a reviewed Q3 verdict.json of record (F2 'Q3 verdicts of record' tier)")
+    parser.add_argument("--quality-gate", action="append", default=[], metavar="REFERENCE=MANIFEST",
+                        help="with --of-record: quality_campaign.py manifest per reference kind (stock-hf2q, peer, "
+                             "<kind>-native); a manifest not written yet is Pending (repeatable)")
+    parser.add_argument("--review", type=Path, help="with --of-record: the independent review of the verdict")
     args = parser.parse_args(argv)
     if args.rows is not None and args.evidence_root is None:
         parser.error("--rows needs --evidence-root")
+    if (args.of_record and args.rows is None) or ((args.quality_gate or args.review) and not args.of_record):
+        parser.error("--of-record applies to --rows; --quality-gate and --review need --of-record")
+    if any("=" not in item for item in args.quality_gate):
+        parser.error("--quality-gate takes REFERENCE=MANIFEST")
     if args.rows is None and args.verdict is None:
         if not args.dry_run and (args.output is None or not args.family or len(args.family) != 1):
             parser.error("a campaign run needs --output and exactly one --family")
@@ -526,7 +541,8 @@ def main(argv=None):
     environ = dict(os.environ)
     try:
         if args.rows is not None:
-            print(json.dumps(q3_report.rows(args.rows, args.evidence_root), indent=2))
+            gates = [tuple(item.split("=", 1)) for item in args.quality_gate]
+            print(json.dumps(q3_report.rows(args.rows, args.evidence_root, args.of_record, gates, args.review), indent=2))
             return 0
         if args.verdict is not None:
             manifest = json.loads((args.verdict / "campaign.json").read_text())

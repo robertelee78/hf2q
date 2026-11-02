@@ -17,7 +17,7 @@ Every arm runs the same GGUF, the canonical four-agent coding client (`qwen_n4_l
 
 The checked-in peer cases match hf2q's model-facing settings (template, thinking, sampling, context, slots; see their notes and `family_peer.py`). No better valid peer configuration has been identified for these workloads, so they are the declared best valid configuration. The DeepSeek-V4 `--load-mode` mmap, `--ubatch-size 256` variant (`$E/peer-arms-v1/peer-deepseek4-mmap.json`) was the best-valid-configuration attempt for that family. Declaring a different best configuration is an operator decision made before a campaign starts: pass it as `--peer-case` and keep the matched one as `--peer-matched-case`.
 
-**Native ds4 arm (DeepSeek-V4 only, operator decision 2026-10-31).** `--peer-case q5_cases/native-ds4-deepseek4.json` with the same-GGUF `--peer-unavailable-evidence` runs antirez ds4 c97964b in the `peer` slot, on its own ds4f-q2 Flash 0731 artifact. The plan labels the arm `ds4 c97964b (native Flash-0731 q2 artifact)`. Its artifact is exempt from the same-model rule but must carry a sha256. Its build identity is the ds4 commit plus the `ds4-server` sha256, and its 26 runtime Metal sources are frozen too. The family verdict stays `Unavailable`, because there is no same-GGUF peer. `verdict.json` `native_peer` reports the task-makespan comparison separately, and F2 rows use baseline `ds4_native`. Adapter and controls: `scripts/four_agent/README.md` "Native ds4 arm".
+**Native ds4 arm (DeepSeek-V4 only, operator decision 2026-10-31).** `--peer-case q5_cases/native-ds4-deepseek4.json` with the same-GGUF `--peer-unavailable-evidence` runs antirez ds4 c97964b in the `peer` slot, on its own ds4f-q2 Flash 0731 artifact. The plan labels the arm `ds4 c97964b (native Flash-0731 q2 artifact)`. Its artifact is exempt from the same-model rule but must carry a sha256. Its build identity is the ds4 commit plus the `ds4-server` sha256, and its 26 runtime Metal sources are frozen too. The family verdict stays `Unavailable`, because there is no same-GGUF peer. `verdict.json` `native_peer` reports the task-makespan comparison separately, and F2 rows use baseline `ds4_native`. Like every campaign with a native peer arm, it emits only those native rows (plus control failure rows), never an experiment-vs-stock row: that effect is of record only in the same-GGUF campaign. Adapter and controls: `scripts/four_agent/README.md` "Native ds4 arm".
 
 **Native TensorFold arm (Qwen3.8 only, operator decision 2026-10-31).** Qwen3.8's same-GGUF peer is runnable, so TensorFold never replaces it in the campaign of record. A separate campaign passes `--peer-case q5_cases/native-tensorfold-qwen38.json` (no drafter) or `native-tensorfold-qwen38-dflash2.json` (DFlash2) together with `--native-comparison`. TensorFold 1157ea5b then runs in the `peer` slot on its own MLX 4-bit checkpoint, and the plan records `native_comparison`.
 - `--peer-unavailable-evidence` and `--peer-matched-case` both refuse with this flag. Without the flag, a TensorFold `--peer-case` refuses.
@@ -26,6 +26,11 @@ The checked-in peer cases match hf2q's model-facing settings (template, thinking
 - F2 rows go to group `qwen38-q3-tensorfold-native` or `qwen38-q3-tensorfold-dflash2-native` (`-controls-` groups under `--controls-of`), and every row carries the not-of-record label. No experiment-vs-stock row is emitted: that effect belongs to the campaign of record. The TensorFold row renders only under "Native-engine comparisons".
 - The stock arm stays in the design. Dropping it would need new plan and verdict code, so an experiment-plus-TensorFold-only campaign is not offered.
 - Adapter and controls: `scripts/four_agent/README.md`, section "Native TensorFold arm".
+
+**Native oMLX arm (Qwen3.8, Qwen3.6, Gemma 4; operator decision 2026-10-31).** Every one of these families has a runnable same-GGUF peer, so oMLX runs only in a separate `--native-comparison` campaign, with TensorFold's rules: `--peer-case q5_cases/native-omlx-<family>.json --native-comparison`. oMLX 6b413c90 then runs in the `peer` slot on the pinned mlx-community 4-bit snapshot.
+- The artifact is the snapshot's `config.json`; `MODEL_CONFIG_SHA256` and `TEMPLATE_SHA256` are required. Build identity is `omlx <version> <commit> venv-freeze-sha256 <sha>`, from the venv's dist-info inventory. The snapshot file listing and the venv inventory are frozen with the campaign identity.
+- `verdict.json` and F2 rows carry the not-of-record label. `native_peer` is withheld under the TensorFold rules, and also when any oMLX run logged tool-parser WARNING/INFO lines; tool-call repairs oMLX does not log are disclosed with every statement as `recovery_attribution: Unavailable:…`. F2 groups are `<family>-q3-omlx-<family>-native`, and the oMLX row renders only under "Native-engine comparisons".
+- Adapter and controls: `scripts/four_agent/README.md`, section "Native oMLX arm".
 
 `HF2Q_Q5_HF2Q_BIN` and `--stock-var/--experiment-var HF2Q_BIN=…` are refused. The hf2q binaries come only from `--stock-bin` and `--experiment-bin`, so a case default can never stand in for one of them.
 
@@ -128,7 +133,16 @@ The `n1` and mixed-phase stages are reported in `verdict.json` `controls` with t
   - primary effects with CIs, secondary effects and per-arm summaries (median makespan and goodput, memory, maximum observed thermal state);
   - controls, failures, peer status, quality inputs and patch-review status;
   - rejected trials (Invalid, Abandoned, Skipped or not-started attempts), the number of discarded warmups, and the predeclared design.
-- `q3_campaign.py --rows CAMPAIGN --evidence-root "$E"` prints a `{groups, rows}` fragment in the `hf2q.f2.scoreboard-rows.v1` vocabulary. It holds the experiment-vs-stock and experiment-vs-peer makespan effects as `% improvement`, with `$E/...` receipt references and JSON extraction keys into `verdict.json`, so `f2_scoreboard_render.py --verify` can re-read them. Merge it into `docs/research/adr063-f2-scoreboard-rows.json` only after independent review. Statuses: `Win`/`Inconclusive`/`Unavailable` → `Descriptive`, `Loss` → `NegativeResult`, `Failed` → `Failure`.
+- `q3_campaign.py --rows CAMPAIGN --evidence-root "$E"` prints a `{groups, rows}` fragment in the `hf2q.f2.scoreboard-rows.v1` vocabulary. It holds the experiment-vs-stock (baseline `v0128_stock`, the v0.1.28 release) and experiment-vs-peer makespan effects as `% improvement`, with `$E/...` receipt references and JSON extraction keys into `verdict.json`, so `f2_scoreboard_render.py --verify` can re-read them. Merge it into `docs/research/adr063-f2-scoreboard-rows.json` only after independent review. Statuses: `Win`/`Inconclusive`/`Unavailable` → `Descriptive`, `Loss` → `NegativeResult`, `Failed` → `Failure`.
+- `--rows CAMPAIGN --of-record [--quality-gate REFERENCE=MANIFEST ...] [--review FILE]` emits a reviewed verdict of record for the F2 "Q3 verdicts of record" tier (F2 closure option B), in place of that campaign's default fragment. The group `<family>-q3-record` carries `q3_record`:
+  - the verdict, `campaign_status`, the halt (entry, stage, reason from `campaign.json`), every stage's status, the primary stop and the reasons;
+  - the experiment as `hf2q <commit8>` (row variants use the same label, never "main HEAD");
+  - peer unavailability, read as "peer out of memory (prior evidence)" when declared evidence includes a server log with a Metal out-of-memory marker;
+  - fairness effects the verdict could not estimate (`unmeasurable`), thermal and memory validity, and the final-source hashes still pending patch review;
+  - one quality gate per reference kind (`stock-hf2q`, `peer`, `<kind>-native`). A gate is `Pending` while the `quality_campaign.py` manifest is absent or running, `Halted` when it halted, otherwise `Pass` or `Fail` from its Q1 paired verdict. A settled manifest is refused unless its subject receipts are the experiment binary and its reference receipts are the campaign's arm of that kind: the stock binary for `stock-hf2q`, the peer binary for `peer`, and for `<kind>-native` an arm of that engine kind with one native readiness identity and one binary;
+  - the `$E/` review.
+
+  The tier requires the `stock-hf2q` gate and the `peer` gate, or, when the same-GGUF peer is unavailable, the family's native stand-in (`ds4-native` for DeepSeek-V4). Primary rows carry `q3_of_record: true`: the makespan and worst-slot TTFT p95 / SSE-gap max effects vs stock and peer, each with a verified full-precision `half_width_pp`, plus per arm the median prompt and completion tokens and completion tokens per makespan-second over the primary stage's passing runs, re-read from each run's `client/summary.json`. Completed control stages of the same campaign (`n1`, and mixed stages that completed) are `Descriptive` rows with `control_of` this verdict, shown in the Q3 controls section. Controls-only, native-comparison and native-peer campaigns are refused (their rows keep their own sections). The rows manifest holds one record per family, and a row outside the record that cites the record's `verdict.json` or `campaign.json` (for example the same campaign's default fragment) is refused unless it is a control of that record. `--verify` re-derives the record from `verdict.json`, `campaign.json` and the quality manifests, so a gate that settles after the merge is reported as drift until the fragment is regenerated.
 
 ## Controls-only campaign (#369 amendment)
 
@@ -235,6 +249,45 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/qwen38-matched-baseline1512-normal-n4-202610
   --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-tensorfold-qwen38-client-approval.json \
   --output "$Q3/qwen38-native-tensorfold"
 
+# Native oMLX comparisons (separately labeled; never the verdict of record). Install per scripts/four_agent/README.md
+# "Native oMLX arm" first (isolated clone $HOME/.local/share/hf2q/peers/omlx-6b413c9 and the pinned HF snapshots).
+OHUB=$HOME/.cache/huggingface/hub
+omlx_vars() {  # $1 = snapshot dir
+  echo --peer-var MODEL_CONFIG_SHA256=$(shasum -a 256 "$1/config.json" | cut -d' ' -f1) \
+       --peer-var TEMPLATE_SHA256=$(shasum -a 256 "$1/chat_template.jinja" | cut -d' ' -f1)
+}
+Q38=$OHUB/models--mlx-community--Qwen3.8-27B-4bit/snapshots/10c35caafbb80f7dc6a7a432cdd11af10a6d4818
+HF2Q_Q5_MODEL=$MODELS/qwen38-stock/Qwen3.8-27B-vanilla.gguf \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/qwen38-matched-baseline1512-normal-n4-20261029T024609Z/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family qwen38 "${STOCK[@]}" "${EXP[@]}" "${COMMON[@]}" \
+  --peer-case scripts/four_agent/q5_cases/native-omlx-qwen38.json --native-comparison $(omlx_vars "$Q38") \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-omlx-qwen38-client-approval.json \
+  --output "$Q3/qwen38-native-omlx"
+Q36=$OHUB/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46
+HF2Q_Q5_MODEL=$MODELS/qwen36-stock-adr063/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/qwen36-template-order-coding-operating90-n4-20261027T231028Z/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family qwen36 "${STOCK[@]}" "${EXP[@]}" "${COMMON[@]}" \
+  --peer-case scripts/four_agent/q5_cases/native-omlx-qwen36.json --native-comparison $(omlx_vars "$Q36") \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-omlx-qwen36-client-approval.json \
+  --output "$Q3/qwen36-native-omlx"
+G4=$OHUB/models--mlx-community--gemma-4-26b-a4b-it-4bit/snapshots/0d77464eeb233a2da68ebf9d7dc4edaac7db956d
+HF2Q_Q5_MODEL=$MODELS/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/gemma4-full-input-n4-20261026T210724Z/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family gemma4 "${STOCK[@]}" "${EXP[@]}" "${COMMON[@]}" \
+  --peer-case scripts/four_agent/q5_cases/native-omlx-gemma4.json --native-comparison $(omlx_vars "$G4") \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-omlx-gemma4-client-approval.json \
+  --output "$Q3/gemma4-native-omlx"
+# Qwen3.6 re-test on oMLX's tokenizer/sampler stack (quality campaign; oMLX is the labeled reference arm, never the
+# subject). CLIENT_APPROVAL_TEMPLATE is declared by both cases, so each arm gets its own with --subject-var/--reference-var.
+HF2Q_Q5_MODEL=$MODELS/qwen36-stock-adr063/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf \
+  python3 -B scripts/four_agent/quality_campaign.py --subject-case scripts/four_agent/q5_cases/qwen36.json \
+  --subject-var HF2Q_BIN=$E/q3-experiment-bin-$EXP_COMMIT/hf2q \
+  --subject-var CLIENT_APPROVAL_TEMPLATE=$E/qwen36-template-order-coding-operating90-n4-20261027T231028Z/client-approval.json \
+  --reference-kind omlx-native --reference-case scripts/four_agent/q5_cases/native-omlx-qwen36.json \
+  --reference-var CLIENT_APPROVAL_TEMPLATE=$T/native-omlx-qwen36-client-approval.json \
+  $(omlx_vars "$Q36" | sed s/--peer-var/--reference-var/g) \
+  --negative-control-receipt "$NC" --output "$Q3/quality-qwen36-omlx-reference"
+
 # Qwen3.6 35B-A3B
 HF2Q_Q5_MODEL=$MODELS/qwen36-stock-adr063/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf \
 HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/qwen36-template-order-coding-operating90-n4-20261027T231028Z/client-approval.json \
@@ -252,8 +305,11 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/gemma4-full-input-n4-20261026T210724Z/client
 # After a Q1 paired campaign on the experiment binary, or an independent patch review:
 python3 -B scripts/four_agent/q3_campaign.py --verdict "$Q3/qwen38" \
   --quality-verdict "$E/<quality campaign>/manifest.json" --patch-review "$Q3/qwen38-patch-review.json"
-# F2 scoreboard rows (merge after review):
+# F2 scoreboard rows (merge after review); a reviewed verdict of record for the F2 tier:
 python3 -B scripts/four_agent/q3_campaign.py --rows "$Q3/qwen38" --evidence-root "$E"
+python3 -B scripts/four_agent/q3_campaign.py --rows "$Q3/qwen38" --evidence-root "$E" --of-record \
+  --quality-gate stock-hf2q="$E/<quality gate vs v0.1.28>/manifest.json" --quality-gate peer="$E/<quality gate vs peer>/manifest.json" \
+  --review "$E/reviews/<independent verdict review>.md"
 ```
 
 `HF2Q_Q5_*` exports apply to every arm whose case declares the variable. `--peer-var` overrides the peer arm only. The hf2q approval templates above are the ones the 2026-10-29/30 receipts used. Their `sources` are recomputed at run time, so they stay valid after the client change. Before starting, the root checks that the stock binary accepts the current launchers' flags: a server that refuses an option makes the first stock warmup `NotStarted` and halts the campaign before any measured block.

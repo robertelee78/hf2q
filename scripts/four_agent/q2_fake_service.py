@@ -26,6 +26,7 @@ import uuid
 
 import coding_family as family_contract
 import coding_instances
+import coding_long_context
 from f2_semantic import CLOCK_ID, clock_ns, semantic_timing_v3
 import qwen38_n1_process as child
 from qwen38_n1_smoke import build_request, exchange, initial_messages
@@ -357,12 +358,13 @@ class FakeService:
 class StubTools:
     """Tool-receipt shape the coordinator scores; no file system sandbox or compiler is involved."""
 
-    def __init__(self, root, workload=None):
+    def __init__(self, root, workload=None, variant=None):
         self.fixture = Path(root) / "tools" / "fixture"
         (self.fixture / "src").mkdir(parents=True)
         self.files = {"src/ports.rs": "pub fn parse_port(s: &str) -> u16 { s.parse().unwrap() }\n" if workload is None
                       else workload.initial,
-                      "tests/ports.rs": "#[test] fn ports() {}\n"}
+                      "tests/ports.rs": "#[test] fn ports() {}\n" if variant is None
+                      else variant.immutable["tests/ports.rs"]}
         self.receipts = []
         self.save()
 
@@ -391,7 +393,7 @@ class StubTools:
 
 
 def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", family="qwen", instance=None,
-                phase=None, release_ns=None, on_first_token=None, server_pid=SERVER_PID, acks=None):
+                phase=None, release_ns=None, on_first_token=None, server_pid=SERVER_PID, acks=None, variant=None):
     """The agent child's turn loop with stub tools; raises the actual client rejection on a bad response.
 
     `acks` (a rendezvous service's `acks` directory): acknowledge the first progress frame of every
@@ -399,6 +401,7 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
     out = Path(out)
     out.mkdir(parents=True)
     workload = None if instance is None else coding_instances.select(instance)
+    selected = None if variant is None else coding_long_context.select(variant)
     fixture = loads((HERE / "fixtures" / "canonical-coding-requests.json").read_bytes())
     initial = fixture[0]["request"]
     prompt_identity = coordinator.identity(agent, run, instance)
@@ -418,9 +421,11 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
                "turns": [], "tools": [], "f2_clock_id": CLOCK_ID}
     if workload is not None:
         summary["instance"] = workload.record()
+    if selected is not None:
+        summary["workload_variant"] = selected.record()
     if phase is not None:
         summary["phase"] = phase
-    tools, seen = StubTools(out, workload), set()
+    tools, seen = StubTools(out, workload, selected), set()
     for turn in range(7):
         request = build_request(model, messages, schemas, turn, family, engine_kind)
         turn_out = out / f"turn-{turn}"
@@ -445,12 +450,13 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
 
 
 def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="hf2q", family="qwen", instance=None,
-             cleanup=None, run=RUN, server_pid=SERVER_PID):
+             cleanup=None, run=RUN, server_pid=SERVER_PID, variant=None):
     """Coordinator summary over `results`; its status is the actual coordinator aggregate."""
     agents = coordinator.active_agents(phase_plan)
     cleanup = cleanup or {agent: copy.deepcopy(CLEAN) for agent in agents}
     exits = {agent: 0 for agent in agents}
     record = None if instance is None else coding_instances.select(instance).record()
+    variant_record = None if variant is None else coding_long_context.select(variant).record()
     summary = {"schema": family_contract.schema(family, "coordinator-result", 4), "profile": family_contract.profile(family, 4),
                "family": family, "status": "Pending", "server_pid": server_pid, "diagnostic_slots": 4, "cleanup": False,
                "runtime_qualified": False, "model_qualified": False, "full_prefix_reuse": "PendingPostOracle",
@@ -460,12 +466,14 @@ def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="h
                            "release_monotonic_ns": releases[0]}}
     if record is not None:
         summary["instance"] = record
+    if variant_record is not None:
+        summary["workload_variant"] = variant_record
     if phase_plan is not None:
         summary["phase"] = {"plan": phase_plan, "cohorts": [list(c) for c in coordinator.phase_cohorts(phase_plan)],
                             "releases": [{"cohort": i + 1, "release_monotonic_ns": at, "trigger_first_decode_monotonic_ns": t}
                                          for i, (at, t) in enumerate(zip(releases, triggers))]}
     summary["status"] = coordinator.aggregate(results, exits, {a: cleanup[a]["verified"] for a in agents}, server_pid, run,
-                                              engine_kind, family, record, phase_plan)
+                                              engine_kind, family, record, phase_plan, variant_record)
     finished = max(results[a]["task_completed_monotonic_ns"] for a in agents)
     summary.update(makespan_finished_ns=finished, own_output_four_task_makespan_seconds=(finished - releases[0]) / 1e9,
                    agents=results, exits=exits, client_cleanup=cleanup, cleanup=True,
@@ -531,10 +539,10 @@ _TEMPLATES = {}
 _TEMPLATE_ROOT = None
 
 
-def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen"):
+def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen", variant=None):
     """Raw evidence of one honest run (cached per process): directory and per-agent results."""
     global _TEMPLATE_ROOT
-    key = (engine_kind, phase_plan, instance, family)
+    key = (engine_kind, phase_plan, instance, family, variant)
     if key not in _TEMPLATES:
         if _TEMPLATE_ROOT is None:
             _TEMPLATE_ROOT = tempfile.TemporaryDirectory(prefix="q2-fake-templates-")
@@ -544,22 +552,23 @@ def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen"):
         with FakeService() as service:
             for agent in coordinator.active_agents(phase_plan):
                 results[agent] = drive_agent(service.url, root / agent, agent, engine_kind=engine_kind, family=family,
-                                             instance=instance, phase=coordinator.agent_phase(phase_plan, agent))
+                                             instance=instance, phase=coordinator.agent_phase(phase_plan, agent),
+                                             variant=variant)
         _TEMPLATES[key] = (root, results)
     return _TEMPLATES[key]
 
 
 def honest_run(client_dir, makespan_s=100.0, engine_kind="hf2q", phase_plan=None, instance=None, slots=None,
-               family="qwen"):
+               family="qwen", variant=None):
     """Write a complete client directory (raw turns + coordinator summary) whose evidence re-derives its Pass."""
-    root, results = template(engine_kind, phase_plan, instance, family)
+    root, results = template(engine_kind, phase_plan, instance, family, variant)
     client_dir = Path(client_dir)
     client_dir.mkdir(parents=True)
     for agent in results:
         shutil.copytree(root / agent, client_dir / agent)
     results = copy.deepcopy(results)
     releases, triggers = retime(results, phase_plan, makespan_s, slots)
-    return assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, instance)
+    return assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, instance, variant=variant)
 
 
 def write_json(path, value):

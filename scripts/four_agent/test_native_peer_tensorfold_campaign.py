@@ -46,7 +46,7 @@ class Case(unittest.TestCase):
             plan = self.plan(path)
             self.assertFalse(plan['complete'])
             self.assertEqual(set(plan['missing_variables']), {'TF_BIN_SHA256', 'TARGET_CONFIG_SHA256'})
-            self.assertEqual(q5_case.loads(path.read_bytes())['family'], tf.Q3_FAMILY)
+            self.assertEqual((q5_case.loads(path.read_bytes())['family'],), tf.Q3_FAMILIES)
 
     def test_launch_argv_is_the_adapter_launch_and_differs_only_by_the_drafter(self):
         argv = {}

@@ -314,7 +314,7 @@ class Binding(unittest.TestCase):
 class Registry(unittest.TestCase):
     def test_every_native_arm_declares_the_interface(self):
         self.assertEqual(native_peers.KINDS, NATIVE_KINDS)
-        self.assertEqual(ENGINE_KINDS, ('hf2q', 'peer', 'ds4', 'tensorfold'))
+        self.assertEqual(ENGINE_KINDS, ('hf2q', 'peer', 'ds4', 'tensorfold', 'omlx'))
         for kind in NATIVE_KINDS:
             arm = native_peers.adapter(kind)
             self.assertEqual(arm.ENGINE, kind)
@@ -323,7 +323,7 @@ class Registry(unittest.TestCase):
             self.assertEqual(arm.CLIENT_MODULES[0], 'native_peers.py')
             self.assertTrue(all((HERE / name).is_file() for name in arm.CLIENT_MODULES))
             self.assertIsNotNone(native_peers.audit(kind).q3_section)
-        for kind in ('hf2q', 'peer', 'omlx', None):
+        for kind in ('hf2q', 'peer', 'vllm', None):
             with self.subTest(kind=kind), self.assertRaises(Invalid):
                 native_peers.adapter(kind)
 
@@ -341,18 +341,20 @@ class Registry(unittest.TestCase):
         self.assertIs(SSE('m', 0, set(), 'tensorfold').native_frame, tf.check_frame)
         self.assertEqual(verdict_usage(use(), 0, 'tensorfold')['engine_kind'], 'tensorfold')
         with self.assertRaises(Invalid):
-            verdict_usage(use(), 0, 'omlx')
+            verdict_usage(use(), 0, 'vllm')
 
     def test_consumer_vocabularies_come_from_the_registry(self):
+        import native_peer_omlx as om
         self.assertEqual(f2.NATIVE_BASELINES, {'ds4_native': nd.LABEL, 'tensorfold_native': tf.LABELS['none'],
-                                               'tensorfold_dflash2_native': tf.LABELS['dflash2']})
+                                               'tensorfold_dflash2_native': tf.LABELS['dflash2'],
+                                               **{f'omlx_{q3}_native': om.LABELS[q3] for q3 in om.Q3_FAMILIES}})
         self.assertFalse(set(f2.NATIVE_BASELINES) & set(f2.ARMS))
-        self.assertEqual(q3.ARM_KINDS['peer'], ('peer', 'ds4', 'tensorfold'))
+        self.assertEqual(q3.ARM_KINDS['peer'], ('peer', 'ds4', 'tensorfold', 'omlx'))
         self.assertEqual(q3.ARM_KINDS['peer_matched'], ('peer',))
         self.assertEqual({k: v for k, v in quality_campaign.REFERENCE_KINDS.items() if k.endswith('-native')},
-                         {'ds4-native': 'ds4', 'tensorfold-native': 'tensorfold'})
+                         {'ds4-native': 'ds4', 'tensorfold-native': 'tensorfold', 'omlx-native': 'omlx'})
         names = native_peers.process_names()
-        self.assertTrue({'ds4', 'ds4-server', 'tensorfold', 'tensorfold-native'} <= names)
+        self.assertTrue({'ds4', 'ds4-server', 'tensorfold', 'tensorfold-native', 'omlx', 'omlx-server'} <= names)
         import q5_preflight
         self.assertEqual(q5_preflight.classify_argv(['/opt/TensorFold/zig-out/native/bin/tensorfold-native', 'serve']),
                          'runtime')

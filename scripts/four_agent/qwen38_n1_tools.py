@@ -33,9 +33,12 @@ IMMUTABLE = {"Cargo.toml": MANIFEST, "Cargo.lock": LOCK,
 
 
 class Tools:
-    def __init__(self, root, cargo, sandbox, sdk, immutable=IMMUTABLE, initial=INITIAL):
+    def __init__(self, root, cargo, sandbox, sdk, immutable=IMMUTABLE, initial=INITIAL, read_limit=FILE_LIMIT):
+        """`read_limit` bounds read_file results only (coding_long_context.py raises it for its tests file)."""
         require(set(immutable) == set(IMMUTABLE), "fixture file set")
+        require(type(read_limit) is int and read_limit >= FILE_LIMIT, "read limit below the canonical bound")
         self.immutable = dict(immutable)
+        self.read_limit = read_limit
         self.root = Path(root)
         self.root.mkdir(mode=0o700)
         self.fixture = self.root / "fixture"
@@ -92,9 +95,9 @@ class Tools:
             st = os.fstat(fd)
             require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == os.getuid(),
                     "unsafe read owner/type/links")
-            require(st.st_size <= FILE_LIMIT, "whole file exceeds64KiB")
-            data = os.read(fd, FILE_LIMIT + 1)
-            require(len(data) == st.st_size and len(data) <= FILE_LIMIT, "file changed/oversized")
+            require(st.st_size <= self.read_limit, "whole file exceeds the read limit")
+            data = os.read(fd, self.read_limit + 1)
+            require(len(data) == st.st_size and len(data) <= self.read_limit, "file changed/oversized")
             return data.decode("utf8", "strict")
         finally:
             os.close(fd)
@@ -212,7 +215,8 @@ class Tools:
                                     ensure_ascii=False)
             else:
                 raise Invalid("unknown tool")
-            require(len(result.encode()) <= FILE_LIMIT, "tool result exceeds64KiB; no clipped continuation")
+            limit = self.read_limit if name == "read_file" else FILE_LIMIT
+            require(len(result.encode()) <= limit, "tool result exceeds its limit; no clipped continuation")
             self.invariant()
             receipt.update({"result": result, "source_sha256": self.source_hash,
                             "cleanup": True, "status": "Complete"})
