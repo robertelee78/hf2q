@@ -119,6 +119,12 @@ def validate_manifest(m):
             require(isinstance(row["control_of"], str) and row["control_of"].startswith("$E/")
                     and ((kind == "effect" and row["status"] == "Descriptive") or row["status"] == "Failure"),
                     f"{rid}: control_of must cite a $E/ primary of record on a Descriptive effect or a Failure row")
+        if "superseded_by" in row:  # a former verdict of record, kept beside the record that replaced it
+            replacement = next((g["q3_record"] for g in groups.values() if g["family"] == row["family"]
+                                and "q3_record" in g and g["q3_record"]["verdict_ref"] == row["superseded_by"]), None)
+            require(replacement is not None and kind == "effect" and row["status"] == "Descriptive"
+                    and "control_of" not in row and "q3_of_record" not in row,
+                    f"{rid}: superseded_by must cite its family's current Q3 verdict of record on a Descriptive effect")
         if "q3_of_record" in row:
             q3tier.validate_row(row, groups)
         else:
@@ -284,9 +290,11 @@ def short(sha):
 def render(manifest, scoreboards, manifest_sha256):
     fams, groups, rows = manifest["families"], manifest["groups"], manifest["rows"]
     controls = [x for x in rows if "control_of" in x]  # Q3 controls of a primary of record: own section, never a win/non-win
+    superseded = [x for x in rows if "superseded_by" in x]  # former Q3 records: own section, never a win/non-win
     native = [x for x in rows if x.get("baseline_arm") in NATIVE_BASELINES and "control_of" not in x]  # own section only, never a win/non-win
     q3 = [x for x in rows if "q3_of_record" in x]  # Q3 verdicts of record: their own tier only
-    rows = [x for x in rows if x.get("baseline_arm") not in NATIVE_BASELINES and "control_of" not in x and "q3_of_record" not in x]
+    rows = [x for x in rows if x.get("baseline_arm") not in NATIVE_BASELINES and "control_of" not in x
+            and "q3_of_record" not in x and "superseded_by" not in x]
     band = manifest["neutral_band_ratio"]
     comps = comparisons(manifest)
     out = ["# ADR-063 F2 four-agent scoreboard", "",
@@ -366,6 +374,12 @@ def render(manifest, scoreboards, manifest_sha256):
             f"| {fams[x['family']]['title']} | {arm_label((x['arm'], x['variant']))}"
             f"{' vs ' + BASELINE_ARMS[x['baseline_arm']] if x['kind'] == 'effect' else ''} | "
             f"{row_value(x)} {tag(x)} | {x['note']} | `{x['control_of']}` | `{x['id']}` |" for x in controls]
+    if superseded:
+        out += ["", "## Superseded Q3 records (evidence beside the current record; never a win or loss)", "",
+                "| Family | Comparison | Result | Note | Replaced by | Evidence |",
+                "|---|---|---|---|---|---|"] + [
+            f"| {fams[x['family']]['title']} | {arm_label((x['arm'], x['variant']))} vs {BASELINE_ARMS[x['baseline_arm']]} | "
+            f"{row_value(x)} {tag(x)} | {x['note']} | `{x['superseded_by']}` | `{x['id']}` |" for x in superseded]
     out += ["", "## Open gaps", "", "An arm counts as measured when a verified row measures it, or when a verified effect "
             "(Q3 tier and controls included) uses it as the baseline. The Q3 verdicts of record measure task makespan; "
             "the other metrics below are F2 fixed-six scope (successor scope under option B).", "",

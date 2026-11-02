@@ -34,7 +34,6 @@ import hashlib
 import heapq
 import json
 import math
-import re
 import struct
 import sys
 from pathlib import Path
@@ -384,7 +383,19 @@ def paired(document, policy=POLICY):
 
 # --- transcripts ----------------------------------------------------------
 
-CALL_ID = re.compile(r"call_hf2q_[0-9a-f]+")
+
+def normalise_call_ids(messages):
+    """Replace every tool-call id (assistant `tool_calls[].id` and tool `tool_call_id`) by its ordinal of first
+    appearance, so random per-run ids (hf2q's `call_hf2q_…`, the peer's 32-character ids) never make two otherwise
+    identical histories differ, while the call/result pairing stays part of the comparison."""
+    ordinal = {}
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            if "id" in call:
+                call["id"] = ordinal.setdefault(call["id"], f"CALL{len(ordinal)}")
+        if "tool_call_id" in message:
+            message["tool_call_id"] = ordinal.setdefault(message["tool_call_id"], f"CALL{len(ordinal)}")
+    return messages
 
 
 def turn_digests(run):
@@ -394,7 +405,7 @@ def turn_digests(run):
         for call in message.get("tool_calls") or []:
             call.pop("id", None)
         request = json.loads((answer.parent / "request.json").read_text())
-        history = CALL_ID.sub("CALL", json.dumps(request["messages"], sort_keys=True))
+        history = json.dumps(normalise_call_ids(request["messages"]), sort_keys=True)
         key = (answer.parent.parent.name, answer.parent.name)
         turns[key] = (hashlib.sha256(history.encode()).hexdigest(),
                       hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest())

@@ -421,7 +421,7 @@ def peer_speculation_off(manifest):
 
 
 
-def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=None):
+def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=None, superseded_by=None):
     """F2 scoreboard rows (hf2q.f2.scoreboard-rows.v1 vocabulary) for the primary effects of one campaign; for a
     controls-only campaign, the completed control stages' effects (status Descriptive) and each failed experiment
     run of a stopped control stage (task_pass, status Failure), all labeled `control_of` the primary of record:
@@ -432,7 +432,11 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
     quality_gate bound to the campaign's arm identities, pending patch reviews, the review). Its primary rows are
     flagged `q3_of_record`: makespan and worst-slot fairness effects vs stock and peer with their half-widths, plus
     per-arm token volume and output-rate rows. Its completed control stages (n1, mixed) are Descriptive rows with
-    `control_of` this verdict, rendered in the Q3 controls section."""
+    `control_of` this verdict, rendered in the Q3 controls section.
+
+    superseded_by (the verdict.json of the record that replaced this campaign's verdict): group
+    `<family>-q3-superseded` keeps the old record's makespan effects (primary and completed controls) as
+    Descriptive evidence beside the new record, each row carrying `superseded_by`; never a win or loss."""
     campaign_dir, root = Path(campaign_dir).resolve(), Path(evidence_root).resolve()
     if not campaign_dir.is_relative_to(root):
         raise ValueError("campaign directory must be under --evidence-root to be cited as $E/...")
@@ -455,19 +459,29 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
     if of_record and (record is not None or comparison or native):
         raise ValueError("--of-record needs a default same-GGUF campaign: controls-only, native-comparison and "
                          "native-peer campaigns are never the Q3 verdict of record (their rows keep their own sections)")
+    if superseded_by is not None:
+        if of_record or record is not None or comparison or native:
+            raise ValueError("--superseded-by applies to a default same-GGUF campaign that was a verdict of record")
+        replacement = Path(superseded_by).resolve()
+        if not replacement.is_relative_to(root) or replacement.name != "verdict.json" or replacement == campaign_dir / "verdict.json":
+            raise ValueError("--superseded-by must name another verdict.json under --evidence-root")
+        superseded_ref = "$E/" + str(replacement.relative_to(root))
     if record is not None:
         of_record_path = Path(record["path"]).resolve()
         if not of_record_path.is_relative_to(root):
             raise ValueError("the primary of record must be under --evidence-root to be cited as $E/...")
         control_of = "$E/" + str(of_record_path.relative_to(root))
     native_baseline = native_peers.baseline_of(native, native_label) if native_label else "peer"
-    group = (f"{family}-q3-record" if of_record else (f"{family}-q3" if record is None else f"{family}-q3-controls")
+    group = (f"{family}-q3-record" if of_record else f"{family}-q3-superseded" if superseded_by is not None
+             else (f"{family}-q3" if record is None else f"{family}-q3-controls")
              + ("" if comparison is None else f"-{native_baseline.replace('_', '-')}"))
     declared = plan["declared"]["experiment"]
     experiment = f2_q3_tier.experiment_name(declared)
     gone = f2_q3_tier.unavailable((verdict["peer"]["unavailable"] or {}).get("peer"), root)
     out = {"groups": {group: {"family": family,
-                              "title": (f"{family} Q3 verdict of record" if of_record else f"{family} Q3 three-arm campaign"
+                              "title": (f"{family} Q3 verdict of record" if of_record else
+                                        f"{family} Q3 superseded record" if superseded_by is not None else
+                                        f"{family} Q3 three-arm campaign"
                                         if record is None else f"{family} Q3 controls of the primary of record")
                                        + (f" ({comparison})" if comparison else ""),
                               "workload": "Four-agent coding client, 262144 context, 4 slots; stock "
@@ -475,16 +489,18 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                                           + (native_label or ("the peer" if gone is None else f"the peer (peer unavailable: {gone})"))
                                           + ", Williams blocks."
                                           + ("" if record is None else f" Controls (client --phase-plan) of the primary "
-                                                                       f"of record {control_of}; never a win or loss.")}},
+                                                                       f"of record {control_of}; never a win or loss.")
+                                          + ("" if superseded_by is None else f" Superseded as the Q3 verdict of record "
+                                                                              f"by {superseded_ref}; never a win or loss.")}},
            "rows": []}
     if of_record:
         gates, review_ref = record_inputs(root, quality_gate, review)
         out["groups"][group]["q3_record"] = f2_q3_tier.build_record(verdict, manifest, root, (ref, campaign_ref), gates, review_ref)
         control_of = ref  # the record's own completed controls (n1, mixed) render as controls of this verdict
     if record is None:
-        status = F2_STATUS.get(verdict["verdict"])
+        status = "Descriptive" if superseded_by is not None else F2_STATUS.get(verdict["verdict"])
         sections = [] if status is None else [("primary", None, verdict["primary"], verdict.get("native_peer"))]
-        if of_record:
+        if of_record or superseded_by is not None:
             sections += [(f"controls.{key}", key, stage, None) for key, stage in verdict["controls"].items()
                          if stage["status"] == "Complete"]
     else:
@@ -521,10 +537,10 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                            "ci95": {"kind": "json", "file": ref, "path": f"{path}.improvement_ci95.*", "reduce": "list"}}
                 blocks = (f"{e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
                           f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else peer_note}).")
-                if control is not None and name == "vs_peer" and not native_label:
-                    blocks += " " + peer_sentence(next(s for s in manifest["stages"] if s["workload"] == control),
+                if (control is not None or superseded_by is not None) and name == "vs_peer" and not native_label:
+                    blocks += " " + peer_sentence(next(s for s in manifest["stages"] if s["workload"] == (control or plan["primary"])),
                                                   stage, root, experiment)
-                if record is not None:
+                if record is not None or superseded_by is not None:
                     blocks += f" {campaign_note(verdict, manifest, root)}."
                 row = {
                     "id": f"{group}-{'' if control is None else control.replace('+', 'p') + '-'}{what}-{name.replace('_', '-')}",
@@ -540,7 +556,10 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                     "status": status if control is None else "Descriptive",
                     "verification": {"state": "Verified", "key": f"verdict.json {path}.improvement_percent", "extract": extract},
                     "note": (f"Q3 verdict of record ({'task makespan only' if name == 'vs_peer' else 'see the tier'}); {blocks}"
-                             if of_record_row else (f"{comparison}. " if comparison else "")
+                             if of_record_row else
+                             f"Superseded Q3 record{'' if control is None else ', control ' + control}, replaced as the "
+                             f"verdict of record by {superseded_ref}; never a win or loss; {blocks}"
+                             if superseded_by is not None else (f"{comparison}. " if comparison else "")
                              + (f"Q3 verdict {verdict['verdict']}, campaign {verdict['campaign_status']}; " if control is None else
                                 f"Q3 control {control} (client --phase-plan {stage['phase_plan']}) of the primary of record "
                                 f"{control_of}; never a win or loss; ")
@@ -548,7 +567,9 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                 if of_record_row:  # full precision: the tier renders it, --verify compares at the row's decimals
                     row["half_width_pp"] = e["half_width_pp"]
                     extract["half_width_pp"] = {"kind": "json", "file": ref, "path": f"{path}.half_width_pp", "reduce": "one"}
-                if control is not None:
+                if superseded_by is not None:
+                    row["superseded_by"] = superseded_ref
+                elif control is not None:
                     row["control_of"] = control_of
                 out["rows"].append(row)
     if of_record and status is not None:

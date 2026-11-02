@@ -134,7 +134,7 @@ class Tier(unittest.TestCase):
             cells = tier_line(r.render(qwen38(gates), [], "0" * 64), "Qwen3.8 27B")
             self.assertNotIn("**Win**", " | ".join(cells))
             self.assertEqual(cells[1], want.strip())
-            self.assertTrue(cells[2].endswith("half-width 2.22 points); not a win: " + want.strip()[len("Withheld: "):]))
+            self.assertTrue(cells[2].endswith("half-width 2.22 points); not a Q3 Win: " + want.strip()[len("Withheld: "):]))
         cells = tier_line(r.render(qwen38([gate("stock-hf2q", "Pass"), gate("peer", "Halted")]), [], "0" * 64), "Qwen3.8 27B")
         self.assertEqual(cells[5], "v0.1.28 stock Pass `$E/qg/stock-hf2q/manifest.json`; peer Halted `$E/qg/peer/manifest.json`")
 
@@ -153,7 +153,7 @@ class Tier(unittest.TestCase):
         # hf2q/peer = 1.8: the peer finishes 1 - 1/1.8 = 44.4% sooner, never 80% (hf2q's base)
         self.assertEqual(cells[3], "the peer finishes 44.4% sooner than hf2q 5d421a2c (95% CI 37.5 to 50.0%, half-width 3.31 points)")
         self.assertEqual(cells[2], "hf2q 5d421a2c finishes 41.6% sooner than v0.1.28 stock (95% CI 40.8 to 42.3%, half-width "
-                                   "1.24 points); not a win: worst-slot SSE gap max vs stock regresses beyond the ×1.025 band "
+                                   "1.24 points); not a Q3 Win: the family verdict is Loss vs the peer; worst-slot SSE gap max vs stock regresses beyond the ×1.025 band "
                                    "(ratio CI lower 1.150)")
         self.assertIn("; the primary stopped on max_blocks after 20 blocks, precision not met (vs-peer half-width 3.31 points); "
                       + V7_CONTROLS, cells[6])
@@ -188,7 +188,7 @@ class Tier(unittest.TestCase):
         for over, reason in (({"unmeasurable": []}, "worst-slot SSE gap max vs stock not recorded"),
                              ({"quality_gate": [gate("stock-hf2q", "Pass"), gate("peer", "Pass")]}, "quality gate vs ds4 native not declared")):
             cells = tier_line(r.render(board({"deepseek4": {**rec, **over}}, rows), [], "0" * 64), "DeepSeek-V4 Flash")
-            self.assertTrue(cells[2].endswith(f"; not a win: {reason}"), cells[2])
+            self.assertTrue(cells[2].endswith(f"; not a Q3 Win: {reason}"), cells[2])
 
     def test_failed_family_shows_its_failure_row_and_never_wins(self):
         reason = "experiment failed its task: n4-002-w00-experiment: client_failed: agent-0 Failed"
@@ -199,7 +199,7 @@ class Tier(unittest.TestCase):
                       receipt="$E/q3/qwen36/campaign.json", note="agent-2: run_tests ports failed with E0282")
         cells = tier_line(r.render(board({"qwen36": rec}, [failure]), [], "0" * 64), "Qwen3.6 35B-A3B")
         self.assertEqual(cells[1], f"Failed: {reason}")
-        self.assertEqual(cells[2], "hf2q 38485a23: no speed effect; not a win: the family verdict is Failed (hf2q task "
+        self.assertEqual(cells[2], "hf2q 38485a23: no speed effect; not a Q3 Win: the family verdict is Failed (hf2q task "
                                    "failure). 1/4 tasks [FAIL]: agent-2: run_tests ports failed with E0282 (`q36-fail`)")
         self.assertEqual((cells[3], cells[4], cells[5], cells[6]),
                          ("—", "— (no paired block)", "not declared",

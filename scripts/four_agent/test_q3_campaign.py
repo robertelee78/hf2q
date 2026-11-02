@@ -4,11 +4,13 @@ The driver tests replace q5_calibration.py with a fake runner that writes receip
 they prove scheduling, stopping, identity freezing and classification, never model speed.
 """
 import contextlib
+import copy
 import io
 import itertools
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
@@ -452,7 +454,49 @@ class Driver(Harness):
         text = f2.render(f2.validate_manifest(board), [], "0" * 64)
         line = next(l for l in text.splitlines() if l.startswith("| Qwen3.8 27B | "))
         self.assertIn(" — **Pending v11** |", line)
-        self.assertIn("sooner than the peer without speculation (matched comparison) (95% CI", line)
+        self.assertIn("sooner than the peer, speculation off (matched settings) (95% CI", line)
+
+    def test_a_superseded_record_stays_beside_its_replacement_and_never_wins(self):
+        driver, _ = self.driver(self.win)
+        q3.write_verdict(self.out, driver.run(), [], None)
+        replacement = self.root / "evidence" / "q3-qwen38-v2"
+        replacement.mkdir()
+        for name in ("campaign.json", "verdict.json"):
+            shutil.copyfile(self.out / name, replacement / name)
+        verdict = json.loads((replacement / "verdict.json").read_text())
+        verdict["verdict"] = "Loss"  # e.g. against a better peer configuration
+        (replacement / "verdict.json").write_text(json.dumps(verdict))
+        record = q3_report.rows(replacement, self.root, of_record=True)
+        old = q3_report.rows(self.out, self.root, superseded_by=replacement / "verdict.json")
+        self.assertEqual(list(old["groups"]), ["qwen38-q3-superseded"])
+        self.assertEqual({(r["status"], r["superseded_by"]) for r in old["rows"]},
+                         {("Descriptive", "$E/evidence/q3-qwen38-v2/verdict.json")})
+        peer_row = next(r for r in old["rows"] if r["baseline_arm"] == "peer")
+        self.assertRegex(peer_row["note"], r"^Superseded Q3 record, replaced as the verdict of record by \$E/evidence/"
+                                           r"q3-qwen38-v2/verdict\.json; never a win or loss; .*finishes the same coding task")
+        board = {"schema": f2.ROWS_SCHEMA, "evidence_root_symbol": "$E", "evidence_root_description": "test",
+                 "neutral_band_ratio": 1.025, "neutral_band_basis": "test",
+                 "families": {"qwen38": {"title": "Qwen3.8 27B", "artifact_sha256": MODEL_SHA, "note": ""}},
+                 "groups": {**record["groups"], **old["groups"]}, "rows": record["rows"] + old["rows"]}
+        f2.validate_manifest(board)
+        self.assertEqual(f2.verify_rows(board, self.root), [r["id"] for r in board["rows"]])
+        text = f2.render(board, [], "0" * 64)
+        self.assertIn("### Descriptive wins (not F2 primary qualified results)\n\nNone.", text)
+        section = text.split("## Superseded Q3 records")[1].split("## Open gaps")[0]
+        for row in old["rows"]:
+            self.assertEqual(text.count(f"`{row['id']}`"), 1)
+            self.assertIn(f"`{row['id']}`", section)
+        # a Loss family is never shown as a Win against stock, whatever its stock contrast
+        line = next(l for l in text.splitlines() if l.startswith("| Qwen3.8 27B | Loss | "))
+        self.assertIn("; not a Q3 Win: the family verdict is Loss vs the peer", line)
+        self.assertNotIn("**Win**", line)
+        # superseded_by must cite the family's current record
+        stray = copy.deepcopy(board)
+        stray["rows"][-1]["superseded_by"] = "$E/evidence/q3-qwen38/verdict.json"
+        with self.assertRaisesRegex(ValueError, "superseded_by must cite"):
+            f2.validate_manifest(stray)
+        with self.assertRaisesRegex(ValueError, "another verdict.json"):
+            q3_report.rows(self.out, self.root, superseded_by=self.out / "verdict.json")
 
 
 class ControlsOnly(Harness):

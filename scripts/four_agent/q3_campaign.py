@@ -502,11 +502,16 @@ def parse_args(argv):
                         help="with --of-record: quality_campaign.py manifest per reference kind (stock-hf2q, peer, "
                              "<kind>-native); a manifest not written yet is Pending (repeatable)")
     parser.add_argument("--review", type=Path, help="with --of-record: the independent review of the verdict")
+    parser.add_argument("--superseded-by", type=Path, metavar="RECORD_VERDICT_JSON",
+                        help="with --rows: this campaign's verdict was a record that RECORD_VERDICT_JSON replaced; its "
+                             "rows stay published beside the new record as Descriptive evidence (never a win or loss)")
     args = parser.parse_args(argv)
     if args.rows is not None and args.evidence_root is None:
         parser.error("--rows needs --evidence-root")
     if (args.of_record and args.rows is None) or ((args.quality_gate or args.review) and not args.of_record):
         parser.error("--of-record applies to --rows; --quality-gate and --review need --of-record")
+    if args.superseded_by is not None and (args.rows is None or args.of_record):
+        parser.error("--superseded-by applies to --rows without --of-record")
     if any("=" not in item for item in args.quality_gate):
         parser.error("--quality-gate takes REFERENCE=MANIFEST")
     if args.rows is None and args.verdict is None:
@@ -542,7 +547,8 @@ def main(argv=None):
     try:
         if args.rows is not None:
             gates = [tuple(item.split("=", 1)) for item in args.quality_gate]
-            print(json.dumps(q3_report.rows(args.rows, args.evidence_root, args.of_record, gates, args.review), indent=2))
+            print(json.dumps(q3_report.rows(args.rows, args.evidence_root, args.of_record, gates, args.review,
+                                            args.superseded_by), indent=2))
             return 0
         if args.verdict is not None:
             manifest = json.loads((args.verdict / "campaign.json").read_text())

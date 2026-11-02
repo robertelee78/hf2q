@@ -64,10 +64,11 @@ def gate_reasons(rec, family):
 
 
 def stock_reasons(rec, effects, band, family):
-    """Every unmet condition for showing a Win against v0.1.28 stock (empty: Win). A Failed family has one: rule 1."""
+    """Every unmet condition for showing a Win against v0.1.28 stock (empty: Win). A Failed family has one: rule 1.
+    A family whose verdict is Loss vs the peer is never a Q3 Win, whatever its stock contrast."""
     if rec["verdict"] == "Failed":
         return ["the family verdict is Failed (hf2q task failure)"]
-    reasons = []
+    reasons = ["the family verdict is Loss vs the peer"] if rec["verdict"] == "Loss" else []
     if not rec["primary_stop"]:
         reasons.append("the primary stage has not reached its stopping rule")
     row = effects.get(("makespan_s", STOCK_ARM))
@@ -142,7 +143,7 @@ def render(manifest, q3_rows, native_rows, baseline_labels):
         unmet = stock_reasons(rec, effects, band, fam)
         stock = effects.get(("makespan_s", STOCK_ARM))
         stock_cell = (f"{hf2q}: no speed effect" if stock is None else sooner(stock, "v0.1.28 stock", hf2q)) + (
-            "; **Win**" if not unmet else "; not a win: " + "; ".join(unmet))
+            "; **Win**" if not unmet else "; not a Q3 Win: " + "; ".join(unmet))
         stock_cell += "".join(f". {r['value']:.0f}/{r['n_slots']} tasks [FAIL]: {r['note']} (`{r['id']}`)" for r in failures)
         verdict = rec["verdict"]
         if verdict == "Win" and unmet:
