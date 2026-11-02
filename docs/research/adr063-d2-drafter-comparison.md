@@ -12,7 +12,7 @@ cited in the 2026-11-02T01:53Z pre-run declaration, sha256 `9a5f3a29a8c703ad…`
 The README was edited after that: the v3 section (N failure policy, long
 context, results so far) was added before the 2026-11-02T09:55Z deviation
 disclosure, and its sha256 at the time of writing is `e1b6742a…2669`. The v2
-arms, cases and decision rule were not changed by those edits.
+arms, cases and decision rule were not changed by those edits [assertion; no archived snapshot of the pre-registered README].
 
 ## 1. Decision
 
@@ -125,7 +125,7 @@ verdict, because T2 ranks below H1 on makespan.
 Summary-file hashes at the time of writing: `qualify/summary.tsv`
 `f0ec234d…5ca`, `runs-v2/summary.tsv` `81f87ff0…cb3`,
 `extra-runs/A/summary.tsv` `a0351e52…3f2`, `extra-runs/N/summary.tsv`
-`b35c02ef…56a`.
+`4b842f6f…b5a9`.
 
 ## 3. Arms and qualification
 
@@ -452,6 +452,10 @@ N runs.
   tier), which supersedes the v1 "beats H1 on all four" wording; both lead to
   the same result here because no drafter beats H1 on makespan in the primary
   group.
+- **LC failures as a memory-tier veto:** an LC failure in the memory tier is
+  treated as a veto on a primary-group rank; README v2 names only N as that
+  check, and v3 says LC "is decided by the same lexicographic rule". This
+  changes nothing for DFlash2 or DSpark.
 
 ## 10. Reproduction
 
