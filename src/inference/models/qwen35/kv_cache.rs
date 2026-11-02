@@ -3368,6 +3368,8 @@ impl HybridKvCache {
     /// and MTP buffers are sliced at `n_tokens`; DeltaNet recurrent and conv
     /// state are read from the per-position capture buffers at
     /// `capture_index` rather than from the live end-of-forward state.
+    /// The MTP cursor is the live cursor clamped to `n_tokens`; an ordinary
+    /// forward never advances it, so it is not forced to the boundary.
     ///
     /// This lets agentic serving process a short changed suffix in one GPU
     /// forward and still retain the stable boundary immediately before a
@@ -3393,11 +3395,6 @@ impl HybridKvCache {
 
         for lengths in &mut snapshot.full_attn_current_len {
             for length in lengths {
-                *length = n_tokens as u32;
-            }
-        }
-        if let Some(mtp) = snapshot.mtp.as_mut() {
-            for length in &mut mtp.current_len {
                 *length = n_tokens as u32;
             }
         }
@@ -3494,7 +3491,17 @@ impl HybridKvCache {
                     ),
                     None => None,
                 },
-                current_len: slot.current_len.clone(),
+                // Only the copied prefix is addressable in the snapshot,
+                // and the MTP cursor is independent of the target cursor
+                // (ordinary forwards never write the MTP slot). Record the
+                // true live cursor, truncated to the copied prefix.
+                current_len: match prefix_tokens {
+                    Some(n_tokens) => {
+                        let boundary = u32::try_from(n_tokens).unwrap_or(u32::MAX);
+                        slot.current_len.iter().map(|&cursor| cursor.min(boundary)).collect()
+                    }
+                    None => slot.current_len.clone(),
+                },
                 // iter-35: MTP slot's TQ snapshot (same shape as
                 // full-attn slots when present).
                 tq: match slot.tq.as_ref() {
@@ -3857,8 +3864,12 @@ impl HybridKvCache {
     /// are byte-copied directly via `copy_buffer_bytes`, same as
     /// `restore_from`.
     ///
-    /// MTP slot: same partial-position semantics as the regular
-    /// full-attn slots when present.
+    /// MTP slot: the first `n_tokens` positions are copied like the regular
+    /// full-attn slots, but the MTP cursor is restored from the snapshot
+    /// (clamped to `n_tokens`) rather than forced to `n_tokens`. Ordinary
+    /// target forwards never write the MTP slot, so its cursor is
+    /// independent of the target sequence length; forcing it would claim
+    /// MTP K/V positions that were never written.
     ///
     /// # Errors
     ///
@@ -4008,9 +4019,16 @@ impl HybridKvCache {
                     !slot.current_len.is_empty(),
                     "restore_partial: mtp slot.current_len is empty"
                 );
-                slot.current_len[0] = n_tokens as u32;
-                for v in slot.current_len.iter_mut().skip(1) {
-                    *v = n_tokens as u32;
+                anyhow::ensure!(
+                    snap.current_len.len() == slot.current_len.len(),
+                    "restore_partial: mtp current_len shape mismatch ({} snapshot vs {} cache)",
+                    snap.current_len.len(),
+                    slot.current_len.len()
+                );
+                let boundary = u32::try_from(n_tokens)
+                    .context("restore_partial: n_tokens exceeds u32 cursor range")?;
+                for (dst, &src) in slot.current_len.iter_mut().zip(snap.current_len.iter()) {
+                    *dst = src.min(boundary);
                 }
             }
             (None, None) => {}
@@ -11909,13 +11927,21 @@ mod tests {
             .iter()
             .flatten()
             .all(|&len| len == 20));
-        assert!(snapshot
-            .mtp
-            .as_ref()
-            .expect("mtp snapshot")
-            .current_len
-            .iter()
-            .all(|&len| len == 20));
+        // The fixture never advanced the MTP slot (ordinary-forward shape):
+        // the capture snapshot must not invent MTP positions.
+        assert_eq!(
+            snapshot.mtp.as_ref().expect("mtp snapshot").current_len,
+            vec![0]
+        );
+        // A live MTP cursor beyond the boundary is truncated to it.
+        cache.mtp_slot.as_mut().expect("mtp").current_len.fill(24);
+        let truncated = cache
+            .snapshot_prefix_from_capture(&device, 20, 1)
+            .expect("captured prefix snapshot with live MTP");
+        assert_eq!(
+            truncated.mtp.as_ref().expect("mtp snapshot").current_len,
+            vec![20]
+        );
 
         cache.clear_la_capture();
         assert!(!cache.la_capture_active());
@@ -12130,6 +12156,167 @@ mod tests {
                 "F32 k prefix diverged (23d-γ must not perturb the legacy path)"
             );
         }
+    }
+
+    /// TQ-only source cache with planted full-attn + MTP bytes and explicit,
+    /// independent target / MTP cursors.
+    fn mtp_cursor_fixture(
+        cfg: &Qwen35Config,
+        device: &MlxDevice,
+        max_seq_len: u32,
+        target_cursor: u32,
+        mtp_cursor: u32,
+    ) -> HybridKvCache {
+        let mut cache = HybridKvCache::new_with_options(cfg, device, max_seq_len, 1, true)
+            .expect("alloc MTP cursor fixture");
+        for slot in &mut cache.full_attn {
+            plant_tq_pattern(slot.tq.as_mut().expect("tq"), 3);
+            slot.current_len.fill(target_cursor);
+        }
+        let mtp = cache.mtp_slot.as_mut().expect("mtp");
+        plant_tq_pattern(mtp.tq.as_mut().expect("mtp tq"), 5);
+        mtp.current_len.fill(mtp_cursor);
+        cache
+    }
+
+    fn mtp_cursors(cache: &HybridKvCache) -> Vec<u32> {
+        cache.mtp_slot.as_ref().expect("mtp").current_len.clone()
+    }
+
+    /// ADR-063 Q1 regression: an ordinary (non-speculative) forward advances
+    /// only the target cursor. Prefix snapshot + restore must reproduce MTP
+    /// cursor 0 rather than claim `n_tokens` MTP K/V positions that were
+    /// never written.
+    #[test]
+    fn restore_partial_mtp_inactive_prefix_restores_zero_mtp_cursor() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_with_mtp();
+        let max_seq_len = 64u32;
+        let n_tokens = 40usize;
+        let src = mtp_cursor_fixture(&cfg, &device, max_seq_len, n_tokens as u32, 0);
+
+        let snap = src
+            .snapshot_prefix(&device, n_tokens)
+            .expect("prefix snapshot");
+        assert_eq!(snap.mtp.as_ref().expect("mtp snap").current_len, vec![0]);
+
+        let mut dst = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+            .expect("alloc dst");
+        // Restore replaces the slot state wholesale; a stale destination
+        // MTP cursor must not survive.
+        dst.mtp_slot.as_mut().expect("dst mtp").current_len.fill(7);
+        dst.restore_partial(&snap, n_tokens)
+            .expect("restore ordinary prefix");
+        for slot in &dst.full_attn {
+            assert_eq!(slot.current_len, vec![n_tokens as u32]);
+        }
+        assert_eq!(mtp_cursors(&dst), vec![0]);
+        let slot0 = crate::serve::multi_seq_kv::SlotId(0);
+        assert!(
+            dst.validate_speculative_cursors_for_slot(slot0, n_tokens)
+                .is_err(),
+            "an ordinary prefix must not pass the speculative cursor boundary"
+        );
+    }
+
+    /// MTP-active prefixes (target and MTP cursors advanced together by the
+    /// prompt catch-up) restore the exact MTP cursor and K/V prefix; a
+    /// lagging MTP cursor is reproduced as-is.
+    #[test]
+    fn restore_partial_mtp_active_prefix_restores_true_mtp_cursor() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_with_mtp();
+        let max_seq_len = 64u32;
+        let n_tokens = 40usize;
+        let src = mtp_cursor_fixture(&cfg, &device, max_seq_len, n_tokens as u32, 40);
+
+        let snap = src
+            .snapshot_prefix(&device, n_tokens)
+            .expect("prefix snapshot");
+        assert_eq!(snap.mtp.as_ref().expect("mtp snap").current_len, vec![40]);
+        let mut dst = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+            .expect("alloc dst");
+        dst.restore_partial(&snap, n_tokens)
+            .expect("restore MTP-active prefix");
+        assert_eq!(mtp_cursors(&dst), vec![40]);
+        let slot0 = crate::serve::multi_seq_kv::SlotId(0);
+        dst.validate_speculative_cursors_for_slot(slot0, n_tokens)
+            .expect("restored speculative boundary keeps target/MTP equality");
+        let src_tq = src
+            .mtp_slot
+            .as_ref()
+            .expect("src mtp")
+            .tq
+            .as_ref()
+            .expect("src mtp tq");
+        let dst_tq = dst
+            .mtp_slot
+            .as_ref()
+            .expect("dst mtp")
+            .tq
+            .as_ref()
+            .expect("dst mtp tq");
+        for (d, s) in [
+            (&dst_tq.k_packed, &src_tq.k_packed),
+            (&dst_tq.k_norms, &src_tq.k_norms),
+            (&dst_tq.v_packed, &src_tq.v_packed),
+            (&dst_tq.v_norms, &src_tq.v_norms),
+        ] {
+            for head in 0..d.shape()[1] {
+                assert_eq!(
+                    read_head_prefix(d, head, n_tokens),
+                    read_head_prefix(s, head, n_tokens)
+                );
+            }
+        }
+
+        let lagging = mtp_cursor_fixture(&cfg, &device, max_seq_len, n_tokens as u32, 33);
+        let snap = lagging
+            .snapshot_prefix(&device, n_tokens)
+            .expect("lagging prefix snapshot");
+        let mut dst = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+            .expect("alloc lagging dst");
+        dst.restore_partial(&snap, n_tokens)
+            .expect("restore lagging MTP prefix");
+        assert_eq!(mtp_cursors(&dst), vec![33]);
+    }
+
+    /// Only the copied prefix is addressable: a live MTP cursor beyond the
+    /// snapshot boundary is truncated at snapshot time, and a wider snapshot
+    /// restored at a shorter boundary is truncated at restore time.
+    #[test]
+    fn snapshot_prefix_truncates_live_mtp_cursor_to_prefix() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_with_mtp();
+        let max_seq_len = 64u32;
+        let n_tokens = 40usize;
+        let src = mtp_cursor_fixture(&cfg, &device, max_seq_len, 48, 48);
+
+        let snap = src
+            .snapshot_prefix(&device, n_tokens)
+            .expect("prefix snapshot");
+        let snap_mtp = snap.mtp.as_ref().expect("mtp snap");
+        assert_eq!(snap_mtp.current_len, vec![n_tokens as u32]);
+        assert_eq!(
+            snap_mtp.tq.as_ref().expect("mtp snap tq").k_packed.shape()[2],
+            n_tokens
+        );
+        let mut dst = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+            .expect("alloc dst");
+        dst.restore_partial(&snap, n_tokens)
+            .expect("restore truncated prefix");
+        assert_eq!(mtp_cursors(&dst), vec![n_tokens as u32]);
+
+        let full = src.snapshot(&device).expect("live-cursor snapshot");
+        assert_eq!(full.mtp.as_ref().expect("mtp snap").current_len, vec![48]);
+        let mut dst = HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+            .expect("alloc wide dst");
+        dst.restore_partial(&full, n_tokens)
+            .expect("restore wide snapshot at shorter boundary");
+        assert_eq!(mtp_cursors(&dst), vec![n_tokens as u32]);
     }
 
     #[test]
