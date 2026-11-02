@@ -1,46 +1,57 @@
 # ADR-063 D2 (#365): current pretrained drafters at four slots — result
 
 Date: 2026-11-02. Host: M5 Max 128 GB (`runs-v2/host-sysctl.txt`). Status: primary,
-abliterated (A) and qualification complete; non-repetitive code (N) incomplete
-(see §6); long context (LC) partially complete (see §7).
+abliterated (A) and qualification complete; non-repetitive code (N) being
+rerun (see §6); long context (LC) pass 1 complete, pass 2 pending (see §7).
 
 `$E` = `/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023`;
 `$D2` = `$E/d2-v1`. Every path below is relative to `$D2` unless absolute. The
-plan, frozen inputs and pre-registration are `$D2/README.md` (v2 and v3
-sections; sha256 at the time of writing `e1b6742a…2669`) and the two decision
-comments on #365 (2026-11-02T01:53Z pre-run declaration; 2026-11-02T09:55Z
-deviation disclosure).
+plan, frozen inputs and pre-registration are `$D2/README.md` and the two
+decision comments on #365. The pre-registered README (v2 section) is the one
+cited in the 2026-11-02T01:53Z pre-run declaration, sha256 `9a5f3a29a8c703ad…`.
+The README was edited after that: the v3 section (N failure policy, long
+context, results so far) was added before the 2026-11-02T09:55Z deviation
+disclosure, and its sha256 at the time of writing is `e1b6742a…2669`. The v2
+arms, cases and decision rule were not changed by those edits.
 
 ## 1. Decision
 
-**No pretrained drafter qualifies as successor scope. D2 closes negative for
-DFlash2 and DSpark at four slots on Qwen3.8 27B.**
+**No pretrained external drafter (DFlash2, DSpark) qualifies as successor
+scope. D2 closes negative for both at four slots on Qwen3.8 27B. The
+pre-registered arm P1 (the peer's MTP) ranks above H1 in the primary group and
+in A, but the long-context run vetoes it on memory, so it is not successor scope
+as-is either; it is the strongest observation for successor MTP work.**
 
 - **DFlash2** (official z-lab drafter): on its own engine TensorFold (T2) it
   completes 4/4 tasks with passing final tests in 3/3 runs, but its median
   makespan is 90.7 s vs H1 82.3 s, so it ranks below H1 in the primary group
   (§4). On the peer (P2) it corrupts output at four slots and is negative in
-  qualification (§3). In LC it is the slowest passing arm (1034.5 s vs H1
-  595.5 s, pass 1; §7).
+  qualification (§3). In LC pass 1 it is the slowest passing arm (1034.5 s vs H1
+  595.5 s; §7).
 - **DSpark** (Red Hat speculators): in the primary group P3 is arm-negative
-  (one agent broke the six-step workflow; 0/4 completion, run dropped from later
-  passes per the pre-registered rule; §4, §8). It ranks above H1 only on the
-  abliterated target (A, 71.4 s vs 93.1 s), and the rule requires the primary
-  rank, so A cannot make it successor scope.
+  (one agent broke the six-step workflow; 0/4 completion; dropped from later
+  passes per the pre-registered rule; §4, §8). Its only primary-workload pass,
+  the qualification run, completed 4/4 at 107.9 s (P0 121.5 s, P1 81.1 s in the
+  same qualification set, harness 005c9707; §3), still behind H1's 82.3 s.
+  It ranks above H1 only on the abliterated target (A, 71.4 s vs 93.1 s), and the
+  rule requires the primary rank, so A cannot make it successor scope.
 - **Native MTP + history (H1)** does not beat H0 (speculation off) at N4:
   82.3 s vs 81.4 s median in the primary group, consistent with D1's measured
   Loss for `auto` at N4 (`docs/research/adr063-d1-speculation-qualification.md`
   §7, r = 1.020, CI 1.0095–1.0308).
-- **Observation, not a drafter verdict:** the peer's own MTP head (P1) is the
-  fastest primary arm (77.7 s median, 4/4 completion, 3/3 Q5 pass) but runs with
-  2.00 GB worst memory headroom, and in LC it was stopped by Q5 for memory
-  (0.33 GB headroom). P1 is the target's own MTP head, not a pretrained
-  external drafter, so it is outside D2's drafter question; it is recorded for
-  successor work on hf2q's MTP path at N4 (what the peer's MTP does at four
-  slots that hf2q's `auto` does not).
+- **P1 (peer `draft-mtp`, the target's own MTP head), under the rule:** ranks
+  above H1 in the primary group (77.7 s median, 4/4 completion, 3/3 Q5 pass,
+  worst headroom 2.00 GB) and in A (53.1 s vs 93.1 s). N is pending (§6). In LC
+  pass 1, Q5 stopped it with `Stopped: swap_growth` (swap grew 1,224,338,309 B,
+  about 1.22 GB, over baseline against a 0.5 GiB tolerance;
+  `long-context-runs/passes/04-LC-P1-20261102T104157Z/receipt.json`
+  `.verdict`), so it fails the memory tier in LC and is dropped from pass 2.
+  The memory veto means P1 is not successor scope as-is. It is the strongest
+  observation for successor work on hf2q's MTP path at N4: what the peer's MTP
+  achieves at four slots that hf2q's `auto` does not, with memory as the
+  constraint.
 
-Per the rule, no forced winner: the A ranking (P1 > P3 > P0 > H1 > H0) is
-recorded but does not decide.
+Per the rule, no winner is forced.
 
 ## 2. Setup and frozen inputs
 
@@ -75,9 +86,35 @@ Drafter metadata (README "Drafter GGUF metadata"): DFlash2 GGUF is
 `general.architecture=dflash`, 81 tensors, no `markov_w1.weight`,
 `target_layers [6,20,34,48,62]`, `block_size 8`, sliding window 2048. DSpark is
 `dflash`, 62 tensors, `markov_w1.weight` present, `target_layers
-[4,12,20,28,36,44,52,60]`, `sample_from_anchor`, confidence head. Tokenizer and
-chat template are the target's (the drafters share the target vocabulary; the
-TensorFold template is the hf2q Qwen3.8 template, hash above).
+[4,12,20,28,36,44,52,60]`, `sample_from_anchor`, confidence head. Both drafters
+use the target vocabulary; hf2q and the peer serve the base Qwen3.8 tokenizer
+from the target GGUF.
+
+**Tokenizer (TensorFold differs).** The TensorFold target ships its own
+`tokenizer.json` (blob
+`06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523`), which is
+not byte-identical to the base Qwen3.8 tokenizer hf2q serves
+(`src/qwen38-tok/tokenizer.json`,
+`0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3`). Compared
+field by field (2026-11-02): identical vocab (and merges, 247,587, once the
+pair-list vs string encoding is normalised), added tokens, normalizer and post
+processor. They differ in three places:
+- the pre-tokenizer Split regex: the base one also matches `\p{M}` (combining
+  marks) in letter runs and excludes it from the punctuation class;
+- pre-tokenizer ByteLevel `trim_offsets` (TensorFold `true`, base `false`);
+- the decoder ByteLevel options (TensorFold `add_prefix_space`/`trim_offsets`/
+  `use_regex` all `true`, base all `false`).
+
+The T0/T2 client summaries record this themselves: `tokenizer` is
+`Unavailable: the target tokenizer.json differs from the base Qwen/Qwen3.8-27B
+one hf2q serves; per-turn TensorFold ids are archived for the post-run oracle`
+and `hf2q_token_parity` is `PendingPostOracle`
+(`runs-v2/06-T0-*/client/summary.json`, `runs-v2/07-T2-*/client/summary.json`).
+The template bytes are the same (hash above). The differences only affect text
+with combining marks and offset/decoding details; the coding workload is ASCII
+Rust and English [INFERENCE: no token-id comparison was run]. T arms are
+therefore near-exact, not exact, target matches; this does not affect the
+verdict, because T2 ranks below H1 on makespan.
 
 Summary-file hashes at the time of writing: `qualify/summary.tsv`
 `f0ec234d…5ca`, `runs-v2/summary.tsv` `81f87ff0…cb3`,
@@ -94,18 +131,23 @@ Summary-file hashes at the time of writing: `qualify/summary.tsv`
 | P1 | peer, `draft-mtp` (target's own MTP head, n-max 3) | peer MTP (not an external drafter) |
 | P2 | peer, `draft-dflash` (DFlash2 GGUF, n-max 7) | DFlash2 on the peer |
 | P3 | peer, `draft-dspark` (DSpark BF16, n-max 7) | DSpark on the peer |
-| T0 | TensorFold, no drafter | TensorFold baseline |
-| T2 | TensorFold + official DFlash2 (4-bit) | DFlash2 on its official engine |
+| T0 | TensorFold, no learned drafter (`drafts: copies only`: TensorFold's built-in copy drafting; 1,449 drafted / 559 accepted in run 06) | TensorFold baseline (copy drafts) |
+| T2 | TensorFold + official DFlash2 (4-bit) (`drafts: DFlash2 … + copies`) | DFlash2 on its official engine; acceptance mixes DFlash2 and copy drafts |
 
 Qualification (`run_qualify.sh`, one N4 run each at `--log-verbosity 4`,
 `qualify/summary.tsv`):
 
-| Arm | Run | Result | Evidence |
-|---|---|---|---|
-| P0 | `qualify/01-P0-none-20261101T030309Z` | qualified | `qualify/01-P0-none-*.checks.txt` |
-| P1 | `qualify/02-P1-mtp-20261101T030522Z` | qualified; `ExactTranscripts` vs P0, 52 groups, 0 differences | `qualify/02-P1-mtp-*.transcripts-vs-P0.json` |
-| P2 | `qualify/03-P2-dflash2-20261101T030656Z` | **negative-run** (Q5 `ClientFailed`, client exit 1) | below |
-| P3 | `qualify/04-P3-dspark-20261101T030804Z` | qualified; `extract_layers = [4, 12, 20, 28, 36, 44, 52, 60]`, SWA KV 8704 cells; `ExactTranscripts` vs P0, 52 groups, 0 differences | `qualify/04-P3-dspark-*.checks.txt`, `*.transcripts-vs-P0.json` |
+| Arm | Run | Result | Makespan s | Evidence |
+|---|---|---|---|---|
+| P0 | `qualify/01-P0-none-20261101T030309Z` | qualified, 4/4, 4/4 | 121.5 | `qualify/01-P0-none-*.checks.txt` |
+| P1 | `qualify/02-P1-mtp-20261101T030522Z` | qualified, 4/4, 4/4; `ExactTranscripts` vs P0, 52 groups, 0 differences | 81.1 | `qualify/02-P1-mtp-*.transcripts-vs-P0.json` |
+| P2 | `qualify/03-P2-dflash2-20261101T030656Z` | **negative-run** (Q5 `ClientFailed`, client exit 1), 0/4 | – | below |
+| P3 | `qualify/04-P3-dspark-20261101T030804Z` | qualified, 4/4, 4/4; `extract_layers = [4, 12, 20, 28, 36, 44, 52, 60]`, SWA KV 8704 cells; `ExactTranscripts` vs P0, 52 groups, 0 differences | 107.9 | `qualify/04-P3-dspark-*.checks.txt`, `*.transcripts-vs-P0.json` |
+
+Makespans from `extract.py line qualify/<run>`. Qualification ran on harness
+005c9707 at `--log-verbosity 4`, so its timings are indicative only and not
+pooled with v2; even so, DSpark's one passing run (107.9 s) is behind H1's
+primary median (82.3 s).
 
 **P2 corrupted output.** At four slots the peer's DFlash2 path emitted tool-call
 markup inside the reasoning channel:
@@ -151,7 +193,8 @@ Per-run makespans (s): H0 83.3/80.3/81.4; H1 83.4/82.1/82.3; P0
 119.5/118.9/118.6; P1 77.7/78.2/76.2; T2 90.1/90.7/92.5 (`runs-v2/d2-extract.md`
 per-run table; runs `01…21-*` in `runs-v2/`). Tool calls: 24 in every passing
 run, 22 in the two failing runs. Max prompt: 2368 (hf2q), 2804–2806 (peer),
-3584–3615 (TensorFold) tokens.
+3584–3615 (TensorFold) tokens in passing runs; 2406 (P3 run 05) and 2331 (T0
+run 06) in the failing runs.
 
 Speculation cost notes:
 - H1 drafted only 36–63 tokens per run (`runs-v2/*-H1-auto-*.metrics/last.prom`),
@@ -160,12 +203,31 @@ Speculation cost notes:
 - T2 has the highest per-request decode rate (66.78 tok/s, 4.04 accepted per
   verify step) but not the best net four-slot makespan: the decode-rate
   headline does not decide (README v2 decision rule).
-- P1 accepts 0.83 of drafted tokens at 2.46 per verify step and doubles the
-  peer's decode rate over P0 (26.48 vs 16.32 tok/s).
+- P1 accepts 0.83 of drafted tokens at 2.46 per verify step and raises the
+  peer's decode rate 1.62× over P0 (26.48 vs 16.32 tok/s).
+- T0's counters are TensorFold's copy drafts (0.39 accepted per drafted), so
+  T2's acceptance (0.52) mixes DFlash2 and copy drafts; the counters do not
+  separate them.
 
 **Order** (`extract.py`, lexicographic: completion, quality, memory tier,
 median makespan): **P1 > H0 > H1 > T2 > P0 > P3 > T0.** P1 and H0 rank above
 H1; T2, P0, P3, T0 rank below.
+
+**TensorFold adapter audit** (`native_peer_tensorfold_audit.py`, runner
+188c277e, on runs 06 T0, 07/08/21 T2; output `runs-v2/tensorfold-audit.json`,
+sha256 `16698399…432b`):
+- T0 run 06: `client did not claim four-agent success` (the task failure).
+- T2 runs 07, 08, 21: `serialized or slot-capped service: observed co-progress
+  width 3 < 4 with up to 4 overlapping HTTP requests`. TensorFold's prompt
+  cache was disabled in every T2 run (auto budget 0.0 GiB under its 70% memory
+  cap; startup reserve about 79.7 GB). So T2 did not serve all four slots
+  concurrently at all times, and it ran without prompt-cache reuse. Both
+  findings concern TensorFold's own memory sizing on this host, not DFlash2;
+  they help explain T2's makespan but do not change the measured order. Q5
+  passed all three T2 runs with no swap growth.
+- The audit's own `drafting.totals` are null for every run; the drafted and
+  accepted counts above come from `extract.py` (per-reply `speculative`
+  fields).
 
 ## 5. Abliterated/grafted target compatibility (A)
 
@@ -192,11 +254,11 @@ modified trunk (acceptance 0.48 for DSpark vs 0.53 on vanilla; MTP 0.78 vs
 abliterated target's agents produce different trajectories (peer arms are
 faster here, hf2q arms slower), so A answers compatibility, not ranking.
 
-## 6. Non-repetitive code (N) — incomplete
+## 6. Non-repetitive code (N) — being rerun
 
 Cases `cases/extra/N{1,2}-{H0,H1,P0,P1,P3,T0,T2}.json` (task instances 1
 `parse_privileged_port` and 2 `parse_vlan_id`; 14 pre-registered runs).
-`extra-runs/N/summary.tsv`:
+State at the time of writing (`extra-runs/N/summary.tsv`):
 
 | Run | Arm | Q5 | Completion | Quality | Makespan s | Note |
 |---|---|---|---|---|---|---|
@@ -204,23 +266,30 @@ Cases `cases/extra/N{1,2}-{H0,H1,P0,P1,P3,T0,T2}.json` (task instances 1
 | `02-N1-H0-20261102T054830Z` | H0 | ClientFailed | 0/4 | 3/4 | – | `task-failed:Invalid: initial six-step workflow not followed` (agent 0) |
 | `03-N1-P0-20261102T100003Z` | P0 | PreflightRefused | – | – | – | `competing runtime(s): 35678:build, 60983:build` (`run_extra_n_rerun.log`) |
 
-N1-H0 halted `run_extra.sh` under the original halt rule (§9). The resumed
-`run_extra_n_rerun.sh` then hit Q5's quiet-host preflight: two `build`
-processes were running on the host at 10:00Z, Q5 refused to launch, and the
-script halted as an infrastructure failure (correct under the v3 policy). 11
-pre-registered N runs (N1-P1 … N2-H1) are therefore **unavailable**. The script
-is resumable and skips recorded cases:
+12 of the 14 runs have no data yet: N1-P0 was refused, and the 11 runs after it
+(N1-P1 … N2-H1) were never attempted. N1-H0 first halted `run_extra.sh` under the
+original halt rule (§9). The resumed `run_extra_n_rerun.sh` then hit Q5's
+quiet-host preflight: a transient `cargo test --no-run` build (rustc processes)
+was running on the host at 10:00Z, Q5 refused to launch, and the script halted
+as an infrastructure failure, which is correct under the v3 policy. The N runs
+are being rerun after LC finishes, with the same resumable script, which skips
+cases already recorded:
 
 ```sh
-bash $D2/run_extra_n_rerun.sh 2>&1 | tee -a $D2/run_extra_n_rerun.log   # on a quiet host
+bash $D2/run_extra_n_rerun.sh 2>&1 | tee -a $D2/run_extra_n_rerun.log
 python3 -B $D2/extract.py table $D2/extra-runs/N
 ```
 
-Effect on the decision: none for the drafters. The rule makes N a veto on a
-drafter that already ranks above H1 in the primary group; neither DFlash2 (T2)
-nor DSpark (P3) does. N would matter only for the P1 observation.
+<!-- TODO(N): when the N rerun finishes, add the extract.py per-run and per-arm
+tables for all arms (N1 and N2: H0 H1 P0 P1 P3 T0 T2), the N order, and each
+arm's rank vs H1; then update the P1 bullet in §1. -->
 
-## 7. Long context (LC) — in progress
+Effect on the decision: none for the external drafters. The rule makes N a
+veto on an arm that already ranks above H1 in the primary group; neither
+DFlash2 (T2) nor DSpark (P3) does. N matters only for P1, which already fails
+the memory tier in LC (§7).
+
+## 7. Long context (LC) — pass 1 complete, pass 2 pending
 
 `long-context-v1`: canonical parse_port task plus a 150 KB read-only Rust
 module; from turn 2 every request carries about 40k wire-estimated tokens
@@ -239,15 +308,19 @@ Pass 1 (`extract.py table long-context-runs/passes`, runs 01–05, as of
 | `01-LC-H1-20261102T101123Z` | H1 | CalibrationPass | 4/4 | 4/4 | 595.5 | 32.76 | 62.05 | 0.61 | 2.83 | 9.09 | 660,884 / 167,606 |
 | `02-LC-H0-20261102T102128Z` | H0 | CalibrationPass | 4/4 | 4/4 | 584.5 | 38.21 | 57.27 | – | – | 8.50 | 660,884 / 167,606 |
 | `03-LC-P0-20261102T103122Z` | P0 | CalibrationPass | 4/4 | 4/4 | 621.3 | 0.58 | 107.90 | – | 1.00 | 5.23 | 627,860 / 205,959 |
-| `04-LC-P1-20261102T104157Z` | P1 | **Stopped** (memory) | 0/4 | 1/4 | – | 0.33 | 112.62 | 0.85 | 3.53 | 6.56 | 254,161 / 161,573 |
+| `04-LC-P1-20261102T104157Z` | P1 | **Stopped: swap_growth** | 0/4 | 1/4 | – | 0.33 | 112.62 | 0.85 | 3.53 | 6.56 | 254,161 / 161,573 |
 | `05-LC-T2-20261102T104912Z` | T2 | CalibrationPass | 4/4 | 4/4 | 1034.5 | 3.41 | 96.67 | 0.42 | 5.66 | 40.49 | 165,301 / 665,227 |
 
 (cached/uncached prompt tokens from the per-run lines in `run_long_context.log`.)
-LC-P1 is `arm-negative memory-refused` and dropped from pass 2
-(`run_long_context.log`). T2 decodes fastest per request but prefills about 4×
-more uncached tokens than the hf2q/peer arms, which is consistent with its
-1034.5 s makespan [INFERENCE: prefix-cache reuse on TensorFold at N4 is weaker;
-not separately measured].
+LC-P1's Q5 receipt (`long-context-runs/passes/04-LC-P1-20261102T104157Z/receipt.json`)
+has verdict `Stopped`, reason `swap_growth`: swap used grew 1,224,338,309 B
+over the 1,786,773,504 B baseline, against a 536,870,912 B tolerance. Footprint
+at the stop was 112.62 GB. `run_long_context.log` records it as `arm-negative`
+and drops P1 from pass 2 (the log's `memory-refused` label is the run script's
+class for any Q5 memory stop). T2 decodes fastest per request but prefills
+about 4× more uncached tokens than the hf2q/peer arms, which is consistent with
+its 1034.5 s makespan and with its prompt cache being disabled in the primary
+audit (§4) [INFERENCE: the LC-T2 audit has not been run yet].
 
 Pass-1 order (completion, quality, memory, makespan): **H0 > H1 > P0 > T2 >
 P1**; T2 ranks below H1.
@@ -272,8 +345,8 @@ and restate the LC order. -->
 | P3 (peer DSpark), primary | arm-negative after run 1 | agent broke the six-step workflow; 0/4 completion, 3/4 final tests | `runs-v2/05-P3-dspark-20261102T050850Z`; `extract.py classify` → `task-failed:Invalid: initial six-step workflow not followed` |
 | T0 (TensorFold baseline), primary | arm-negative after run 1 | same task failure | `runs-v2/06-T0-tensorfold-20261102T051027Z`, same classify result |
 | T0/T2, group A | unavailable | no MLX checkpoint of the abliterated target | README v2 |
-| N1-P1 … N2-H1 (11 runs) | unavailable | halted: H0 task failure under the original rule, then Q5 quiet-host preflight refusal | §6 |
-| LC-P1 | arm-negative | Q5 stopped the run for memory (0.33 GB headroom) | §7 |
+| N1-P0 … N2-H1 (12 runs) | no data yet; being rerun | N1-P0 refused by Q5 quiet-host preflight (transient `cargo test --no-run` build); the 11 after it were not attempted | §6 |
+| LC-P1 | arm-negative | Q5 `Stopped: swap_growth` (swap +1.22 GB over baseline; 0.33 GB headroom) | §7 |
 | LC-P3, LC-T0 | not run (by design) | P3 already below H1 on completion; T0 is not a candidate | README v3 |
 
 The P3 and T0 primary failures are task failures (an agent violated the
