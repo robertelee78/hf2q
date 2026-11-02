@@ -491,9 +491,19 @@ def parse_args(argv):
     parser.add_argument("--verdict", type=Path, metavar="CAMPAIGN", help="recompute CAMPAIGN/verdict.json only")
     parser.add_argument("--rows", type=Path, metavar="CAMPAIGN", help="print F2 scoreboard rows for CAMPAIGN")
     parser.add_argument("--evidence-root", type=Path, help="evidence root ($E) for --rows")
+    parser.add_argument("--of-record", action="store_true",
+                        help="--rows for a reviewed Q3 verdict.json of record (F2 'Q3 verdicts of record' tier)")
+    parser.add_argument("--quality-gate", action="append", default=[], metavar="REFERENCE=MANIFEST",
+                        help="with --of-record: quality_campaign.py manifest per reference kind (stock-hf2q, peer, "
+                             "<kind>-native); a manifest not written yet is Pending (repeatable)")
+    parser.add_argument("--review", type=Path, help="with --of-record: the independent review of the verdict")
     args = parser.parse_args(argv)
     if args.rows is not None and args.evidence_root is None:
         parser.error("--rows needs --evidence-root")
+    if (args.of_record and args.rows is None) or ((args.quality_gate or args.review) and not args.of_record):
+        parser.error("--of-record applies to --rows; --quality-gate and --review need --of-record")
+    if any("=" not in item for item in args.quality_gate):
+        parser.error("--quality-gate takes REFERENCE=MANIFEST")
     if args.rows is None and args.verdict is None:
         if not args.dry_run and (args.output is None or not args.family or len(args.family) != 1):
             parser.error("a campaign run needs --output and exactly one --family")
@@ -526,7 +536,8 @@ def main(argv=None):
     environ = dict(os.environ)
     try:
         if args.rows is not None:
-            print(json.dumps(q3_report.rows(args.rows, args.evidence_root), indent=2))
+            gates = [tuple(item.split("=", 1)) for item in args.quality_gate]
+            print(json.dumps(q3_report.rows(args.rows, args.evidence_root, args.of_record, gates, args.review), indent=2))
             return 0
         if args.verdict is not None:
             manifest = json.loads((args.verdict / "campaign.json").read_text())
