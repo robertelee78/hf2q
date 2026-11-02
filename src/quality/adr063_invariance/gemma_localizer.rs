@@ -14,7 +14,7 @@ use super::{
     receipt::*,
     store::{hash, Store},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::OpenOptions,
@@ -22,13 +22,13 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
 };
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Target {
-    source_step: u64,
-    source_layer: u32,
-    source_stage: Stage,
-    target: CaptureTarget,
+pub(super) struct Target {
+    pub(super) source_step: u64,
+    pub(super) source_layer: u32,
+    pub(super) source_stage: Stage,
+    pub(super) target: CaptureTarget,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +62,167 @@ fn validate_prefill_chunks(chunks: &[usize]) -> Result<(), String> {
         return Err(format!("prefill_chunks {chunks:?} must be non-empty positive lengths summing to 128"));
     }
     Ok(())
+}
+/// Localizer packets must keep `host_payload_limit` at or below this.
+pub(super) const HOST_PAYLOAD_CAP: u64 = 1024 * 1024 * 1024;
+/// The one Gemma stage-localizer config recipe. The localizer checks it on the
+/// header config before load and on the loaded config after load; the metadata
+/// prepare emits its digest. `cfg` has `max_position_embeddings` = `context`.
+pub(super) fn localizer_recipe(
+    cfg: &crate::serve::config::Gemma4Config,
+    context: u32,
+) -> super::acquisition::ConfigRecipe<'static> {
+    super::acquisition::ConfigRecipe {
+        family: Family::Gemma4,
+        capacity: context as u64,
+        slots: 4,
+        output_allowance: 8192,
+        cache_mode: "GemmaHybrid",
+        route: "stage-localizer",
+        actual_model_config_sha256: hash(format!("{cfg:?}").as_bytes()),
+    }
+}
+/// The roles `gemma_prefill::after_layer` hands to the capture at the batched
+/// prefill per-layer terminal (`forward_prefill_batched.rs`), in that order.
+pub(super) const PREFILL_STAGES: [Stage; 14] = [
+    Stage::Query,
+    Stage::Key,
+    Stage::Value,
+    Stage::RopeQuery,
+    Stage::RopeKey,
+    Stage::Attention,
+    Stage::Residual,
+    Stage::FfnNorm,
+    Stage::RouterLogits,
+    Stage::RouterIds,
+    Stage::RouterWeights,
+    Stage::DenseOutput,
+    Stage::MoeOutput,
+    Stage::LayerOutput,
+];
+/// Scalar and per-row axes of one prefill role: the `vec![seq_len, ..]` shape
+/// passed to `gemma_prefill::after_layer` without its leading row axis. The
+/// batched prefill takes `nh`, `hd`, `nkv`, `top_k` from the same config.
+fn prefill_row(
+    cfg: &crate::serve::config::Gemma4Config,
+    layer: usize,
+    stage: Stage,
+) -> Option<(Scalar, Vec<usize>)> {
+    let nh = cfg.num_attention_heads;
+    let hd = cfg.head_dim_for_layer(layer);
+    let nkv = cfg.num_kv_heads_for_layer(layer);
+    Some(match stage {
+        Stage::Query | Stage::RopeQuery | Stage::Attention => (Scalar::F32, vec![nh, hd]),
+        Stage::Key | Stage::Value | Stage::RopeKey => (Scalar::F32, vec![nkv, hd]),
+        Stage::Residual
+        | Stage::FfnNorm
+        | Stage::DenseOutput
+        | Stage::MoeOutput
+        | Stage::LayerOutput => (Scalar::F32, vec![cfg.hidden_size]),
+        Stage::RouterLogits => (Scalar::F32, vec![cfg.num_experts]),
+        Stage::RouterIds => (Scalar::U32, vec![cfg.top_k_experts]),
+        Stage::RouterWeights => (Scalar::F32, vec![cfg.top_k_experts]),
+        _ => return None,
+    })
+}
+/// `(targets, expected, planned payload bytes)` of one localizer route.
+pub(super) type Manifest = (Vec<Target>, Vec<ExpectedTensor>, u64);
+/// Targets keyed at every chunk start of `chunks` (the prefill hook's step is
+/// the chunk's start position), each writing `logical_step` 0 and
+/// `logical_row_start` = chunk start. With `normalize_rows` the `expected`
+/// list is one row per prompt position in layer -> stage -> row order, so it
+/// is identical for every route that covers the 128-row prompt.
+pub(super) fn localizer_manifest(
+    cfg: &crate::serve::config::Gemma4Config,
+    agent: usize,
+    chunks: &[usize],
+    layers: &[u32],
+    stages: &[Stage],
+    normalize_rows: bool,
+) -> Result<Manifest, String> {
+    validate_prefill_chunks(chunks)?;
+    if agent >= 4 {
+        return Err("localizer agent must be one of the four workload lanes".into());
+    }
+    let mut layers = layers.to_vec();
+    layers.sort_unstable();
+    if layers.is_empty()
+        || layers.windows(2).any(|w| w[0] == w[1])
+        || layers.iter().any(|&l| l as usize >= cfg.num_hidden_layers)
+    {
+        return Err("localizer layers must be distinct actual Gemma layers".into());
+    }
+    let ordered: Vec<Stage> = PREFILL_STAGES
+        .into_iter()
+        .filter(|stage| stages.contains(stage))
+        .collect();
+    if stages.is_empty() || ordered.len() != stages.len() {
+        return Err("localizer stages must be distinct Gemma batched-prefill roles".into());
+    }
+    let label = format!("agent-{agent}");
+    let at = |layer: u32, stage: Stage, row: usize| Coordinate {
+        logical_step: 0,
+        layer,
+        stage,
+        agent: label.clone(),
+        logical_row_start: row as u64,
+        segment: 0,
+    };
+    let spans: Vec<(usize, usize)> = chunks
+        .iter()
+        .scan(0usize, |next, &len| {
+            let start = *next;
+            *next += len;
+            Some((start, len))
+        })
+        .collect();
+    let mut targets = Vec::new();
+    let mut expected = Vec::new();
+    for &layer in &layers {
+        for &stage in &ordered {
+            let (scalar, row) =
+                prefill_row(cfg, layer as usize, stage).ok_or("unsupported Gemma prefill role")?;
+            for &(start, _) in &spans {
+                targets.push(Target {
+                    source_step: start as u64,
+                    source_layer: layer,
+                    source_stage: stage,
+                    target: CaptureTarget {
+                        at: at(layer, stage, start),
+                        normalize_rows,
+                    },
+                });
+            }
+            let extents: Vec<(usize, usize)> = if normalize_rows {
+                (0..128).map(|r| (r, 1)).collect()
+            } else {
+                spans.clone()
+            };
+            for (start, rows) in extents {
+                expected.push(ExpectedTensor {
+                    at: at(layer, stage, start),
+                    scalar,
+                    shape: std::iter::once(rows).chain(row.iter().copied()).collect(),
+                });
+            }
+        }
+    }
+    if targets.len() > 4096 || expected.len() > 65536 {
+        return Err("localizer target/record quota exceeded".into());
+    }
+    let bytes = expected
+        .iter()
+        .try_fold(0u64, |sum, e| {
+            e.shape
+                .iter()
+                .try_fold(e.scalar.bytes() as u64, |n, &d| n.checked_mul(d as u64))
+                .and_then(|n| sum.checked_add(n))
+        })
+        .ok_or("localizer payload overflow")?;
+    if bytes > HOST_PAYLOAD_CAP {
+        return Err("localizer payload exceeds the 1 GiB host cap".into());
+    }
+    Ok((targets, expected, bytes))
 }
 #[test]
 fn q1_gemma_localizer_prefill_chunks_must_cover_the_128_prompt() {
@@ -111,7 +272,7 @@ fn q1_gemma_actual_stage_localizer() {
     );
     assert_eq!(packet.configured_context, 262144);
     assert_eq!(packet.configured_output_allowance, 8192);
-    assert!(packet.host_payload_limit <= 1024 * 1024 * 1024);
+    assert!(packet.host_payload_limit <= HOST_PAYLOAD_CAP);
     assert!(!packet.rerun_id.trim().is_empty());
     validate_prefill_chunks(&packet.prefill_chunks).unwrap();
     assert!(!packet.targets.is_empty() && packet.targets.len() <= 4096);
@@ -165,15 +326,7 @@ fn q1_gemma_actual_stage_localizer() {
     acquisition_scope
         .check_config(
             &packet.identity,
-            &super::acquisition::ConfigRecipe {
-                family: packet.identity.family,
-                capacity: packet.configured_context as u64,
-                slots: 4,
-                output_allowance: 8192,
-                cache_mode: "GemmaHybrid",
-                route: "stage-localizer",
-                actual_model_config_sha256: hash(format!("{:?}", &header_cfg).as_bytes()),
-            },
+            &localizer_recipe(&header_cfg, packet.configured_context),
         )
         .unwrap();
     drop(header);
@@ -203,15 +356,7 @@ fn q1_gemma_actual_stage_localizer() {
     acquisition_scope
         .check_config(
             &packet.identity,
-            &super::acquisition::ConfigRecipe {
-                family: packet.identity.family,
-                capacity: packet.configured_context as u64,
-                slots: 4,
-                output_allowance: 8192,
-                cache_mode: "GemmaHybrid",
-                route: "stage-localizer",
-                actual_model_config_sha256: hash(format!("{:?}", &model.config).as_bytes()),
-            },
+            &localizer_recipe(&model.config, packet.configured_context),
         )
         .unwrap();
     store

@@ -110,24 +110,29 @@ pub fn drained(step: u64, layer: Option<usize>, op: &str, buf: &MlxBuffer, shape
             }
             a.pending = keep;
             if let Some(target) = a.targets.get(&(step, layer, op.into())).cloned() {
-                let result = if target.normalize_rows {
-                    capture::rows_after_checked_drain(
-                        &mut a.store,
-                        target.at,
-                        buf,
-                        None,
-                        "qwen dump_bisect::flush_gpu checked success",
-                    )
-                } else {
-                    capture::after_checked_drain(
-                        &mut a.store,
-                        target.at,
-                        buf,
-                        shape,
-                        None,
-                        "qwen dump_bisect::flush_gpu checked success",
-                    )
-                };
+                // The dump's own `[seq_len, ..]` shape is the logical extent:
+                // several sources (e.g. the residual `hidden`) are allocated
+                // 1-D `[n]`, as `retain_current` already handles.
+                let result = logical_view(buf, shape).and_then(|view| {
+                    if target.normalize_rows {
+                        capture::rows_after_checked_drain(
+                            &mut a.store,
+                            target.at,
+                            &view,
+                            None,
+                            "qwen dump_bisect::flush_gpu checked success",
+                        )
+                    } else {
+                        capture::after_checked_drain(
+                            &mut a.store,
+                            target.at,
+                            &view,
+                            shape,
+                            None,
+                            "qwen dump_bisect::flush_gpu checked success",
+                        )
+                    }
+                });
                 if let Err(e) = result {
                     a.failed = true;
                     a.store.fail(format!("Qwen actual capture {op}: {e}"));
@@ -135,6 +140,22 @@ pub fn drained(step: u64, layer: Option<usize>, op: &str, buf: &MlxBuffer, shape
             }
         }
     })
+}
+/// Leading `shape` extent of `buf`, refused if the actual role is smaller.
+fn logical_view(buf: &MlxBuffer, shape: &[usize]) -> Result<MlxBuffer, String> {
+    let elements = shape
+        .iter()
+        .try_fold(1usize, |a, &b| a.checked_mul(b))
+        .ok_or("Qwen dump shape overflow")?;
+    let bytes = elements
+        .checked_mul(buf.dtype().size_of())
+        .ok_or("Qwen dump byte overflow")?;
+    if shape.is_empty() || bytes > buf.data_byte_len() {
+        return Err("Qwen dump shape exceeds logical source".into());
+    }
+    buf.slice_view(0, elements)
+        .with_shape(shape.to_vec())
+        .map_err(|e| e.to_string())
 }
 pub fn drain_failed(error: String) {
     ACTIVE.with(|slot| {

@@ -20,7 +20,7 @@ mod qwen_actual;
 pub(crate) mod qwen_cache;
 pub(crate) mod qwen_continuation;
 #[cfg(test)]
-mod qwen_localizer;
+pub(crate) mod qwen_localizer;
 pub(crate) mod qwen_runner;
 pub(crate) mod qwen_speculation;
 pub(crate) mod receipt;
