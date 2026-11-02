@@ -49,17 +49,20 @@ def approval(args):
     require(child.digest(args.approval) == args.approval_sha256, "approval hash")
     packet = loads(Path(args.approval).read_bytes())
     n4 = args.diagnostic_slots == 4
-    workload = None
+    workload = variant = None
     if n4:
-        from qwen_n4_live_smoke import preflight, task_instance, validate_agent_binding
+        from qwen_n4_live_smoke import preflight, task_instance, validate_agent_binding, workload_variant
         validate_agent_binding(packet, args.agent_id, args.run_id, args.server_pid,
                                args.barrier_dir, args.barrier_token, args.output, args.family, args.engine_kind,
                                args.instance)
         workload = task_instance(packet, args.instance)
+        variant = workload_variant(packet, args.workload)
+        require(variant is None or (workload is None and getattr(args, "benchmark_profile", None) is None),
+                "a workload variant runs the canonical task, without a benchmark profile or task instance")
     else:
         require(args.instance is None, "task instances are four-agent only")
+        require(args.workload is None, "workload variants are four-agent only")
         require(packet.get("schema") == family_contract.schema(args.family, "approval", 1), "approval schema")
-        require(packet.get("profile") == family_contract.profile(args.family, 1), "operating packet identity")
     family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
     require(packet.get("engine_kind", "hf2q") == args.engine_kind, "engine approval mismatch")
     family_contract.validate_binding(packet, args.family, args.diagnostic_slots)
@@ -104,6 +107,9 @@ def approval(args):
         require(getattr(args, "benchmark_profile", None) is None,
                 "task instances use the canonical scorer, not a benchmark profile")
         source_paths += [Path(__file__).with_name(n) for n in INSTANCE_MODULES]
+    if variant is not None:
+        from coding_long_context import MODULES as VARIANT_MODULES
+        source_paths += [Path(__file__).with_name(n) for n in VARIANT_MODULES]
     require(packet.get("sources") == {p.name: child.digest(p) for p in source_paths}, "client source drift")
     require(packet.get("approved") is True, "explicit internal operating approval absent")
     proof = child.validate_proof(args.sandbox_proof, args.sandbox_proof_sha256)
@@ -117,7 +123,7 @@ def approval(args):
             proof.get("toolchain_root") == str(Path(args.cargo).resolve().parent.parent),
             "sandbox toolchain/SDK proof mismatch")
     os.kill(args.server_pid, 0)
-    return packet, workload
+    return packet, workload, variant
 
 
 def initial_messages(fixture_messages, prompt_identity=None, workload=None):
@@ -295,6 +301,7 @@ def main():
     parser.add_argument("--engine-kind", choices=family_contract.ENGINE_KINDS, default="hf2q")
     parser.add_argument("--benchmark-profile", choices=("gemma-matched-v1",))
     parser.add_argument("--instance", type=int, help="N4 quality-campaign task instance (coding_instances.py)")
+    parser.add_argument("--workload", help="N4 workload variant of the canonical task (coding_long_context.py)")
     parser.add_argument("--phase-plan", help="Q3 phase plan from the four-agent coordinator (qwen_n4_live_smoke.py)")
     parser.add_argument("--phase-cohort", type=int, help="this agent's release cohort under --phase-plan")
     args = parser.parse_args()
@@ -325,9 +332,11 @@ def main():
             summary["phase"] = phase
     tools = None
     try:
-        packet, workload = approval(args)
+        packet, workload, variant = approval(args)
         if workload is not None:
             summary["instance"] = workload.record()
+        if variant is not None:
+            summary["workload_variant"] = variant.record()
         summary["engine_kind"] = args.engine_kind
         if args.family in ("deepseek4", "gemma4"): summary["family_controls"] = packet["family_controls"]
         save(output / "approval-copy.json", packet)
@@ -356,6 +365,8 @@ def main():
             tool_class = BenchmarkTools
             summary["benchmark_profile"] = args.benchmark_profile
         files = {} if workload is None else {"immutable": workload.immutable, "initial": workload.initial}
+        if variant is not None:
+            files = {"immutable": variant.immutable, "initial": variant.initial, "read_limit": variant.read_limit}
         tools = tool_class(output / "tools", args.cargo, args.sandbox_exec, packet["sdk_root"], **files)
         seen = set()
         first_decode = []

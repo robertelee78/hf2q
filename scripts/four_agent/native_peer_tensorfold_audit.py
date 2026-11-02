@@ -189,6 +189,10 @@ def d2_record(run_dir):
     ready = summary.get('native_readiness') or {}
     trace = (report or {}).get('native_trace') or {}
     return {'run': str(run), 'label': ready.get('label'), 'variant': ready.get('variant'),
+            # Compare T0 and T2 only on the same workload: the q5 workload id and the client's
+            # workload variant (None for the canonical files, else {id, fixture_sha256}).
+            'workload': {'id': (receipt.get('workload') or {}).get('id'),
+                         'variant': summary.get('workload_variant')},
             'audit': 'Pass' if failure is None else failure,
             'tasks_passed': metrics['tasks_passed'], 'final_source_sha256': metrics['final_source_sha256'],
             'makespan_s': metrics['makespan_s'], 'q5_memory': metrics['memory'],
@@ -202,5 +206,13 @@ def d2_record(run_dir):
             'tokens': metrics['tokens'], 'worst_slot_ttft_p95_s': metrics['worst_slot_ttft_p95_s']}
 
 
+def d2_records(run_dirs):
+    """D2 records of the compared runs; runs on different workload variants are not comparable and refuse."""
+    records = [d2_record(path) for path in run_dirs]
+    variants = {json.dumps(record['workload']['variant'], sort_keys=True) for record in records}
+    require(len(variants) <= 1, 'D2 runs use different workload variants: ' + ', '.join(sorted(variants)))
+    return records
+
+
 if __name__ == '__main__':
-    print(json.dumps([d2_record(path) for path in sys.argv[1:]], indent=2))
+    print(json.dumps(d2_records(sys.argv[1:]), indent=2))

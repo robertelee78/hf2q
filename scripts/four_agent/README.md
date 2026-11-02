@@ -310,6 +310,8 @@ Two cases launch TensorFold (`/opt/TensorFold` at `1157ea5b`, version 1.2.0) on 
 
   Drafted output must equal the plain decode on this engine (`README.md:203-207`), so final sources may legitimately match.
 
+  For D2's long-context requirement, run the same comparison on the [long-context workload](#long-context-workload-adr-063-d2-365), with T0 and T2 cases derived by `coding_long_context.py derive-case`. The D2 command refuses runs whose `workload.variant` differs.
+
 ```sh
 TF=/opt/TensorFold/zig-out/native/bin/tensorfold-native
 HUB=$HOME/.cache/huggingface/hub/models--TensorFold--Qwen3.8-27B-MLX-4bit/snapshots/22d8d538154e0e5b6f8dcb1fcc74a60a0798104c
@@ -539,6 +541,36 @@ The receipt also records `peak_over_cap_bytes`, which is the measured overshoot,
 - The approval template's `agent_template`, preflight keys and `family_controls` must match the current client checkout. The dry run checks only that the template file exists.
 - A blind sample, meaning failed host observation or a missing real footprint while a cap is enforced, never counts as a quiet host. Three blind samples in a row stop the run.
 - Thermal state is recorded but never stops a run. It is not an out-of-memory risk.
+
+## Long-context workload (ADR-063 D2, #365)
+
+D2's acceptance includes long contexts, and the canonical client tops out near 2.8k prompt tokens per turn. `qwen_n4_live_smoke.py --workload long-context-v1` runs the canonical `parse_port` task with one change: `tests/ports.rs` is the canonical two integration tests followed by [`fixtures/long-context-v1.rs`](fixtures/long-context-v1.rs). That fixture is a 150 KB read-only Rust module, `mod netconf`: the configuration schema of the daemon the port parser feeds. It has 8 sections and 55 settings, each with bounds, a parser, a defaulting reader, a formatter and help text. The module is `#[allow(dead_code)]` and has no `#[test]`. Workflow step (2) reads the file, so every request from turn 2 on carries it.
+
+- **Unchanged.** The prompts and identity line are the canonical ones, so the turn-0 and turn-1 requests are byte-identical to the canonical workload. So are the six-step workflow and its sha256, the tools, the transport matrix, `src/`, the test counts (two per target), grading, the prefix-reuse checks, the 256 KiB wire bound, and the 64 KiB bounds on writes and test output. Only `read_file` gets a 192 KiB bound (`Tools(read_limit=…)`), and only under this variant.
+- **Determinism.** `coding_long_context.render()` builds the fixture from its `SCHEMA` table. `FIXTURE_SHA256` pins the committed bytes, and the client refuses drift. To change the fixture, define a new variant id; never re-pin `long-context-v1`.
+- **Binding.** The coordinator approval must carry `workload_variant` (equal to `--workload`) and `workload_fixture_sha256`. Its `sources` must also cover `coding_long_context.py` and `test_coding_long_context.py`. A canonical approval that carries either key is refused. The coordinator and every agent summary record `workload_variant: {id, fixture_sha256}`. Aggregation, and therefore `q2_run_audit.py`, refuses an agent from another workload, and the D2 record prints `workload: {id, variant}`.
+- **Composition.** `--workload` is N4-only and cannot be combined with `--instance` or `--benchmark-profile`. `--phase-plan` is allowed, so `q3_campaign.py` can derive its controls from a long-context case.
+- **Campaigns.** `q3_campaign.py` refuses a plan unless every arm's client `--workload` equals that arm's approval `workload_variant` and all arms select the same variant (or all run the canonical files). `quality_campaign.py` refuses a case that already selects a variant. `native_peer_tensorfold_audit.py` refuses D2 runs with different `workload.variant`.
+- **Scope.** The fixture covers D2's *long contexts* only. It is generated from one template per setting, so it is deliberately repetitive code: it is not evidence for D2's *nonrepetitive code* item, which needs its own workload.
+- **Prompt growth.** `python3 coding_long_context.py estimate` builds the seven actual requests of one agent offline: the real file contents, a canonical fix and about 1 KiB of reasoning per reply. It reports wire bytes / 4 per turn:
+
+  | Turn | 0 | 1 | 2 | 3 | 4 | 5 | 6 |
+  |---|---|---|---|---|---|---|---|
+  | canonical | 528 | 874 | 1,282 | 1,714 | 2,086 | 2,487 | 2,858 |
+  | `long-context-v1` | 528 | 874 | 39,748 | 40,180 | 40,552 | 40,953 | 41,324 |
+
+  The final request is 165,297 bytes, against the 262,144-byte wire bound. Served `prompt_tokens` add the chat template's own text, and Rust tokenizes at about 3–3.5 bytes per token, so served counts from turn 2 on should land around 45–50k (an estimate, not a measurement). That is far inside 262144 tokens per slot.
+- **Cases.** `q5_cases/qwen38-long-context.json` and `q5_cases/peer-qwen38-long-context.json` are `derive-case` of `qwen38.json` and `peer-qwen38.json`. They keep the same server, argv and port, and add the client `--workload`, the two approval keys, the two sources and a `-long-context-v1` workload id. Because the workload id differs, Q5 calibrates them separately, and a canonical admission receipt is refused.
+- **TensorFold / D2 cases.** Derive T0 and T2 the same way:
+
+  ```sh
+  for arm in native-tensorfold-qwen38 native-tensorfold-qwen38-dflash2; do
+    python3 scripts/four_agent/coding_long_context.py derive-case \
+      scripts/four_agent/q5_cases/$arm.json > "$Q5_ROOT/cases/$arm-long-context.json"
+  done
+  ```
+
+  Then run them exactly like T0 and T2 above. Keep the derived files outside `q5_cases/`: the campaign tests require ports 18252 and 18253 to appear once each there. Other canonical N4 cases derive the same way; the estimate above is for the Qwen request shape.
 
 ## Task-quality campaign (ADR-063 Q1 §3.5)
 

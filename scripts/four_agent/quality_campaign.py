@@ -28,6 +28,7 @@ import subprocess
 import sys
 
 import coding_instances
+import coding_long_context
 import native_peers
 import q2_run_audit
 import q5_case
@@ -116,13 +117,14 @@ def derive_case(case, instance):
     q5_case.validate(case)
     derived = json.loads(json.dumps(case))
     client = derived["client"]
-    require(CLIENT in client["argv"] and "--instance" not in client["argv"],
-            "case client must be the canonical four-agent coding client without --instance")
+    require(CLIENT in client["argv"] and not coding_long_context.FOREIGN_OPTIONS & set(client["argv"]),
+            "case client must be the canonical four-agent coding client without --instance, --workload, "
+            "--phase-plan or --benchmark-profile")
     require(set(q5_case.PLACEHOLDER.findall(client.get("summary", ""))) == {"OUT"},
             "client.summary must be a path under {OUT}")
     approval = client.get("approval")
-    require(approval is not None and not {"instance", "instance_table_sha256"} & set(approval["set"]),
-            "case approval must not already set a task instance")
+    require(approval is not None and not coding_long_context.FOREIGN_KEYS & set(approval["set"]),
+            "case approval must not already set a task instance or workload variant")
     sources = approval["set"].get("sources")
     require(isinstance(sources, dict) and set(sources) == {"sha256_of"} and isinstance(sources["sha256_of"], list),
             "case approval must freeze client sources with sha256_of")

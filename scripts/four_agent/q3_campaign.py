@@ -25,6 +25,7 @@ import json
 import os
 from pathlib import Path
 
+import coding_long_context
 import native_peers
 import q2_run_audit
 import q3_identity
@@ -156,6 +157,10 @@ def build_plan(args, environ, family):
         if native_peers.is_native(kind):
             module = native_peers.adapter(kind)
             arms[arm].update(role=module.q3_role(cases[arm]), label=module.label(cases[arm]))
+    selections = {arm: coding_long_context.case_selection(case) for arm, case in cases.items()}
+    qc.require(all(flag == approved for flag, approved in selections.values()) and len(set(selections.values())) == 1,
+               "every arm must run the same workload variant (client --workload equal to the approval "
+               "workload_variant): " + ", ".join(f"{arm}={flag}" for arm, (flag, _) in sorted(selections.items())))
     native = native_peers.peer_kind({"arms": arms})
     evidence, comparison = bool(args.peer_unavailable_evidence), bool(args.native_comparison)
     qc.require((native is None and not comparison and not (args.peer_case and evidence))
