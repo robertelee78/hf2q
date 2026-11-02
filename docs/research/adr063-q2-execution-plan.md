@@ -104,6 +104,20 @@ quality/client/clock/trace gaps retain their existing failure disposition.
 The source validator and expected-plan join must pass the F2 V4 deciding
 controls before activation; this documentation alone qualifies no case.
 
+Harness join (2026-11-02): an owner's submitted-outstanding obligation is the
+whole forward, not only the command buffer that encoded its
+`target_input_rms_norm` witness. `NativeTrace.finish` joins every native
+command whose `invocation_epoch` equals the witness's `forward_input.epoch`;
+each such command that carried work must have a healthy CheckedDrain, else the
+trace fails closed. `qualify_window` credits the owner only inside one of those
+commands' `[Submitted.end, CheckedDrain.end)` brackets; gaps between brackets
+(host graph preparation) stay uncredited. Rows, witness progress and physical
+membership are unchanged; auxiliary commands still claim no rows or batch-4.
+The epoch join applies only when every `forward_input` of that epoch has the
+same owner set (one scheduler transaction for one owner set). If owners are mixed,
+for example cooperative lanes that share an epoch, each owner keeps only its
+witness command's own bracket and is never credited for a sibling's work.
+
 
 ### Capacity exception does not certify an earlier failure
 

@@ -247,7 +247,7 @@ class NativeTrace:
             need(identity not in self.commands and p["dispatch_ordinal"] == 0 and not p["submitted"] and
                  p["noncompute_operations"] == 0 and p["checked_status"] is None and p["scope"] is None,
                  "duplicate/late command creation")
-            self.commands[identity] = {"created": p, "dispatches": [], "submit": None, "drain": None,
+            self.commands[identity] = {"created": p, "dispatches": 0, "submit": None, "drain": None,
                                        "dropped": False, "noncompute": 0, "end": p["end_monotonic_ns"]}
             return
         c = self.commands.get(identity)
@@ -256,7 +256,7 @@ class NativeTrace:
              p["begin_monotonic_ns"] >= c["end"], "command identity/order drift")
         c["end"] = p["end_monotonic_ns"]
         if kind == "DispatchEncoded":
-            need(c["submit"] is None and p["dispatch_ordinal"] == len(c["dispatches"]) + 1 and
+            need(c["submit"] is None and p["dispatch_ordinal"] == c["dispatches"] + 1 and
                  p["geometry"] is not None and p["replay_binding"] in
                  ("Direct", "ImmediateCapture", "ExplicitRemap"), "actual dispatch ordinal/geometry/replay")
             geometry = p["geometry"]
@@ -292,7 +292,7 @@ class NativeTrace:
                 self.witnesses[scope]["encodes"].append((identity, record))
             else:
                 self.auxiliary += 1
-            c["dispatches"].append(record)
+            c["dispatches"] += 1
         elif kind == "NonComputeEncoded":
             need(c["submit"] is None and p["checked_status"] is None and
                  p["noncompute_operations"] == c["noncompute"] + 1,
@@ -300,7 +300,7 @@ class NativeTrace:
             c["noncompute"] += 1
         elif kind == "Submitted":
             need(c["submit"] is None and p["submitted"] is True and
-                 p["dispatch_ordinal"] == len(c["dispatches"]) and
+                 p["dispatch_ordinal"] == c["dispatches"] and
                  p["noncompute_operations"] == c["noncompute"] and p["checked_status"] is None,
                  "one actual commit bracket")
             c["submit"] = record
@@ -314,6 +314,12 @@ class NativeTrace:
             need(p["submitted"] == bool(c["submit"]) and
                  p["checked_status"] == (4 if c["drain"] else None), "drop status mismatch")
             c["dropped"] = True
+            # Retired: keep only what finish() joins (epoch, work, commit/check instants).
+            c["created"] = {"invocation_epoch": p["invocation_epoch"]}
+            for name in ("submit", "drain"):
+                if c[name]:
+                    c[name] = {"payload": {field: c[name]["payload"][field]
+                                           for field in ("begin_monotonic_ns", "end_monotonic_ns")}}
         else:
             raise ValueError("unknown native command event")
         if kind != "DispatchEncoded":
@@ -328,8 +334,29 @@ class NativeTrace:
         forwards = [item["declaration"]["payload"]["forward_id"] for item in self.witnesses.values()]
         need(len(forwards) == len(set(forwards)) and set(forwards) == self.inputs.keys(),
              "required forward input replaced by auxiliary/missing/duplicate witness")
+        epochs, owners = {}, {}
+        for c in self.commands.values():
+            epochs.setdefault(c["created"]["invocation_epoch"], []).append(c)
+        for item in self.inputs.values():
+            owners.setdefault(item["payload"]["epoch"], set()).add(frozenset(
+                (span["logical"]["request_id"], span["logical"]["slot_id"], span["logical"]["generation"])
+                for span in item["payload"]["packed_rows"]))
         for identity, witness in self.witnesses.items():
             need(len(witness["encodes"]) == 1, "required one-dispatch witness missing/duplicated")
+            epoch = self.inputs[witness["declaration"]["payload"]["forward_id"]]["payload"]["epoch"]
+            # Joined obligation: only when every forward input of the epoch has one
+            # owner set (a single scheduler transaction), every command of the epoch
+            # that carried work must have committed and returned a healthy check.
+            # Otherwise (e.g. cooperative lanes sharing an epoch) sibling work is not
+            # this owner's obligation: only the witness command's own bracket counts.
+            obligation = []
+            for joined in epochs.get(epoch, ()) if len(owners[epoch]) == 1 else ():
+                if not (joined["dispatches"] or joined["noncompute"]):
+                    continue
+                need(joined["submit"] and joined["drain"],
+                     "joined forward epoch command was never submitted/completed")
+                obligation.append([joined["submit"]["payload"]["end_monotonic_ns"] - self.origin,
+                                   joined["drain"]["payload"]["end_monotonic_ns"] - self.origin])
             command, encoded = witness["encodes"][0]
             c = self.commands[command]
             need(c["submit"] and c["drain"], "arithmetic witness was never submitted/completed")
@@ -338,7 +365,9 @@ class NativeTrace:
                 "begin_ns": p["begin_monotonic_ns"] - self.origin,
                 "end_ns": p["end_monotonic_ns"] - self.origin,
                 "checked_return_ns": c["drain"]["payload"]["end_monotonic_ns"] - self.origin,
-                "rows": self.scopes[identity]["payload"]["rows"], "operator": self.policy["operator"]})
+                "rows": self.scopes[identity]["payload"]["rows"], "operator": self.policy["operator"],
+                "obligation": sorted(obligation) or [[p["end_monotonic_ns"] - self.origin,
+                    c["drain"]["payload"]["end_monotonic_ns"] - self.origin]]})
         need(submissions, "auxiliary-only trace cannot qualify required forward witnesses")
         return {"submissions": submissions, "native_events": self.events,
                 "auxiliary_dispatches": self.auxiliary, "unmapped_operator_attempts": self.unmapped,

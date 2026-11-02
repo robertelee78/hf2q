@@ -172,6 +172,45 @@ def four_lanes(composition=(0, 4)):
     return records, identity, scenario
 
 
+def epoch_commands(records, extra, witness_drain_ns=None, epoch=10):
+    """Add noncompute commands (id, submit_end_ns, drain_end_ns|None) in `epoch`; ns are trace-relative.
+    Optionally move the witness command's checked drain earlier. Records are re-sorted/renumbered."""
+    origin = records[0]["payload"]["origin_monotonic_ns"]
+    template = record(records, "native_event", "Created")["payload"]
+    if witness_drain_ns is not None:
+        for kind, at in (("CheckedDrain", witness_drain_ns), ("Dropped", witness_drain_ns + 1)):
+            item = record(records, "native_event", kind)
+            item["at_ns"] = at
+            item["payload"].update(begin_monotonic_ns=origin + at, end_monotonic_ns=origin + at)
+    added = []
+    for command, submit, drain in extra:
+        steps = [("Created", 30, {}), ("NonComputeEncoded", 31, {"noncompute_operations": 1})]
+        if submit is None:  # encoded work that was never committed
+            steps += [("Dropped", 32, {"noncompute_operations": 1})]
+            drain = False
+        else:
+            steps += [("Submitted", submit, {"noncompute_operations": 1, "submitted": True})]
+        if drain is False:
+            pass
+        elif drain is not None:
+            steps += [("CheckedDrain", drain, {"noncompute_operations": 1, "submitted": True, "checked_status": 4}),
+                      ("Dropped", drain + 1, {"noncompute_operations": 1, "submitted": True, "checked_status": 4})]
+        else:
+            steps += [("Dropped", submit + 1, {"noncompute_operations": 1, "submitted": True})]
+        for kind, at, change in steps:
+            payload = dict(copy.deepcopy(template), command_id=command, invocation_epoch=epoch, kind=kind,
+                           begin_monotonic_ns=origin + at, end_monotonic_ns=origin + at, **change)
+            added.append({"schema": trace.SCHEMA, "seq": 0, "kind": "native_event", "at_ns": at, "payload": payload})
+    final = record(records, "native_final")
+    final["payload"]["events"] += len(added)
+    tail = [r for r in records if r["kind"] in ("native_final", "end")]
+    body = sorted([r for r in records if r not in tail] + added, key=lambda r: r["at_ns"])
+    records[:] = body + tail
+    for seq, item in enumerate(records):
+        item["seq"] = seq
+    return records
+
+
 MIXED = ((4, 0), (3, 1), (2, 2), (1, 3), (0, 4))
 
 
@@ -399,6 +438,82 @@ class NativeControls(unittest.TestCase):
         result = trace.qualify_window(records, (3, 1), 0, population_policy="forward_demand_v2")
         self.assertEqual(result["status"], "Unqualified")
         self.assertLess(result["target_fraction"], 0.001)
+
+
+    def test_forward_demand_v2_credits_every_command_of_the_joined_epoch(self):
+        # Witness CB returns at 1.0 s; a second CB of the same epoch is outstanding 1.5 s..end.
+        def run(extra, epoch=10):
+            records, identity, scenario = fixture()
+            epoch_commands(records, extra, witness_drain_ns=1_000_000_000, epoch=epoch)
+            with_busy_owners(records, 10)
+            trace.validate_trace(records, identity, scenario)
+            return trace.qualify_window(records, (0, 1), 0, population_policy="forward_demand_v2")
+        alone = run([])
+        self.assertAlmostEqual(alone["target_fraction"], 0.5, places=6)
+        joined = run([(2, 1_500_000_000, 2_000_000_005)])
+        self.assertEqual(joined["status"], "Unqualified")  # 0.5 s gap between brackets is not credited
+        self.assertAlmostEqual(joined["target_fraction"], 0.75, places=6)
+        full = run([(2, 900_000_000, 1_600_000_000), (3, 1_500_000_000, 2_000_000_005)])
+        self.assertEqual(full["status"], "Qualified")
+        self.assertGreater(full["target_fraction"], 0.99)
+        foreign = run([(2, 900_000_000, 2_000_000_005)], epoch=11)
+        self.assertAlmostEqual(foreign["target_fraction"], 0.5, places=6)
+
+    def test_forward_demand_v2_joined_epoch_command_without_checked_drain_fails_closed(self):
+        for submit in (900_000_000, None):  # submitted-undrained (Dropped rule) or never committed
+            with self.subTest(submit=submit):
+                records, identity, scenario = fixture()
+                epoch_commands(records, [(2, submit, None)], witness_drain_ns=1_000_000_000)
+                with self.assertRaises(ValueError):
+                    trace.validate_trace(records, identity, scenario)
+
+    def test_forward_demand_v2_legacy_witness_only_report_still_scores(self):
+        import f2_native_trace
+        from unittest import mock
+        records, identity, scenario = fixture()
+        with_busy_owners(records, 10)
+        finish = f2_native_trace.NativeTrace.finish
+        def legacy(self):
+            report = finish(self)
+            for item in report["submissions"]:
+                del item["obligation"]
+            return report
+        with mock.patch.object(f2_native_trace.NativeTrace, "finish", legacy):
+            result = trace.qualify_window(records, (0, 1), 0, population_policy="forward_demand_v2")
+        self.assertEqual(result["status"], "Qualified")
+        self.assertGreater(result["target_fraction"], 0.99)
+
+
+    def test_forward_demand_v2_two_owners_in_one_epoch_credit_only_own_witness_bracket(self):
+        # Cooperative shape: lanes 0 and 1 declare distinct forward inputs in ONE epoch (10);
+        # a further epoch-10 command carries sibling work. No owner set owns the epoch.
+        import f2_native_trace
+        from unittest import mock
+        records, identity, scenario = four_lanes((2, 2))
+        for item in records:
+            p = item["payload"]
+            if item["kind"] == "forward_input" and p["forward_id"] == 31:
+                p["epoch"] = 10
+            elif item["kind"] in ("scope_definition", "forward_witness") and p["scope"]["epoch"] == 11:
+                p["scope"]["epoch"] = 10
+            elif item["kind"] == "native_event" and p["invocation_epoch"] == 11:
+                p["invocation_epoch"] = 10
+                if p["scope"]:
+                    p["scope"]["epoch"] = 10
+        epoch_commands(records, [(9, 600, 1_900_000_000)])
+        reports = []
+        finish = f2_native_trace.NativeTrace.finish
+        def capture(self):
+            reports.append(finish(self))
+            return reports[-1]
+        with mock.patch.object(f2_native_trace.NativeTrace, "finish", capture):
+            trace.validate_trace(records, identity, scenario)
+        by_slot = {item["rows"][0]["slot_id"]: item for item in reports[-1]["submissions"]}
+        for slot in (0, 1):
+            item = by_slot[slot]
+            self.assertEqual(item["obligation"], [[item["end_ns"], item["checked_return_ns"]]])
+        for slot in (2, 3):  # one-owner epochs still join (here: only their witness command)
+            self.assertEqual(len(by_slot[slot]["obligation"]), 1)
 
 
 if __name__ == "__main__":
