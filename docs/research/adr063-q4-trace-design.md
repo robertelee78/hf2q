@@ -1,6 +1,6 @@
 # ADR-063 Q4-TRACE (#663): Qwen joint-decode forward witness — HLD/LLD
 
-- **Status:** Design revision 2, awaiting operator approval (ADR-063 "Execution entry": each implementation story needs a recorded design approval). Revision 2 resolves the independent review `ReviewTraceDesign` of revision 1 (`26e2e462`, verdict ACCEPT-WITH-CONDITIONS); see §8.
+- **Status:** Design revision 3, awaiting operator approval (ADR-063 "Execution entry": each implementation story needs a recorded design approval). Revision 2 resolved the independent review `ReviewTraceDesign` of revision 1 (`26e2e462`, verdict ACCEPT-WITH-CONDITIONS). Revision 3 applies that review's closure-check fixes A–C to revision 2 (`b103c303`). See §8.
 - **Story:** [#663](https://github.com/robertelee78/hf2q/issues/663). Parent #355, milestone v0.1.30. Blocked by #371 (Q5); blocking #658.
 - **Source of truth:** `docs/adr/ADR-063-apple-silicon-four-agent-speed-coherence.md` §Q4-TRACE (lines 780–802), §Q4-QWEN38 (586–610), and the v0.1.31 successor list (1441–1446). Also `docs/adr/ADR-065-four-agent-joint-speculative-verify.md` §E1 (147–167) and §E4 (214–234).
 - **Code basis:** main `d817dffa7371a2db85a43ed1d6502350906c33f5` (v0.1.29 plus later merges), mlx-native 0.15.16 (pinned, `Cargo.toml:174`). Line numbers below refer to this commit.
@@ -236,14 +236,14 @@ The same call covers Qwen3.6 MoE joint decode, which is opt-in. It uses the same
 
 **Transaction binding (new).** `f2_trace.validate_trace` already validates `transaction` (189-198). It additionally calls `native.transaction(payload)` when `native` is configured. `qualify_window`'s parser path (240-250) does the same. `NativeTrace.transaction` then works as follows:
 
-- On any transaction: if a pending joint transaction is still unbound, add 1 to `joint_unwitnessed`. Set `pending = lanes` if `operation == "joint_ordinary_decode"`, otherwise `None`, remember `self.current_op = operation`, and clear `self.tx_epoch`.
-- On the first `scope_definition` after a transaction: set `self.tx_epoch = scope.epoch`. This is the invocation epoch `invocation()` allocated right after the `transaction` record (`scheduler.rs:1449-1483`); it is the same ordering rule the T0 extractor uses (§5.3).
+- On any transaction: if a pending joint transaction is still unbound, add 1 to `joint_unwitnessed`. If a bound joint input is still awaiting its epoch confirmation or its `forward_input_end`, raise. Set `pending = lanes` if `operation == "joint_ordinary_decode"`, otherwise `None`, and remember `self.current_op = operation`.
 - On a joint-source `forward_input`, require all of:
   - `pending` is set and `[(request_id, slot_id, generation) of packed logical rows] == pending lanes`, in order;
-  - freshness and epoch consistency: `p["epoch"] == self.tx_epoch`, and `p["epoch"]` is strictly greater than the epoch of every earlier bound joint input and differs from every earlier `forward_input` epoch.
+  - freshness, checked at input time: `p["epoch"]` is strictly greater than the epoch of every earlier bound joint input and differs from every earlier `forward_input` epoch.
 
-  Then bind it, add 1 to `joint_witnessed`, and clear `pending`. A second joint input inside one transaction, one outside any joint transaction, or a stale or mismatched epoch raises.
-- On `forward_input_end`: require that it is the first marker for the most recently bound joint input (same `forward_id` and `epoch`), arrives before the next `transaction`, and has `scope_watermark >= ` that forward's witness scope id. A joint input with no marker by the next transaction, or by `finish`, raises. A marker under a policy without the joint source raises.
+  Then bind it, add 1 to `joint_witnessed`, clear `pending`, and set `self.awaiting_epoch = (forward_id, epoch)`. A second joint input inside one transaction, one outside any joint transaction, or a stale epoch raises.
+- Epoch consistency, checked at the first `scope_definition` after a bound joint input: while `self.awaiting_epoch` is set, the next `scope_definition` (in the real order this is the auxiliary scope of the first encoder created after the input, ahead of the Known witness scope) must have `scope.epoch == ` the bound input's epoch; then clear `self.awaiting_epoch`. A mismatch raises. Reaching `forward_input_end` or the next `transaction` with `self.awaiting_epoch` still set also raises. The rule is: transaction epoch == epoch of the first scope created after the input. It is not tied to scopes published between the `transaction` and the input, because whether any exist depends on work done before `encode_joint_decode`.
+- On `forward_input_end`: require that it is the first marker for the most recently bound joint input (same `forward_id` and `epoch`), that the epoch-consistency check has completed, that it arrives before the next `transaction`, and that `scope_watermark >= ` that forward's witness scope id. A joint input with no marker by the next transaction, or by `finish`, raises. A marker under a policy without the joint source raises.
 - On `forward_witness_unmapped`: add 1 to `unmapped_by_operation[self.current_op]` as well as the existing `self.unmapped`.
 - At `finish`: a pending unbound joint transaction counts as unwitnessed.
 
@@ -330,11 +330,15 @@ Rust tests live in `native_observation` and `witness.rs` `#[cfg(test)]`, next to
 
 Python tests extend `scripts/four_agent/test_f2_native_trace.py`, which already has `fixture`, `four_lanes` and `with_busy_owners`:
 
-- **P1, positive:** `logical4_pad0`, `logical3_pad1`, `logical2_pad2` and `logical1_pad3` joint forwards bound to `joint_ordinary_decode` transactions, each with its `forward_input_end`, plus settle commands after the watermark. Expect `unmapped_operator_attempts == 0`, `witnessed == transactions`, the histogram buckets, and correct `forward`/`settle` command splits, including a dispatch-free command on each side of `end_monotonic_ns` and one exactly at it (counted ambiguous).
-- **P2, negatives (each raises):** `padding_rows` on `qwen35.forward.actual_tokens`; `padding_rows > 0` with `matrix_rows != 4`; `matrix_rows != offset + padding_rows`; joint `token_count == 2`; joint `role == target_verify`; joint row `phase == prefill`; duplicate slot; lanes differing from the transaction (order or generation); two joint inputs in one transaction; a joint input with no open joint transaction; witness `rows` equal to logical rather than physical rows; a joint input epoch different from the transaction's first `scope_definition` epoch; a reused (stale) joint epoch; a missing, duplicate, misplaced or mismatched `forward_input_end`; a watermark below the witness scope id; a `forward_input_end` under a policy without the joint source.
+- **P1, positive:** `logical4_pad0`, `logical3_pad1`, `logical2_pad2` and `logical1_pad3` joint forwards bound to `joint_ordinary_decode` transactions, each with its `forward_input_end`, plus settle commands after the watermark. The fixture uses the real record order: `transaction`, `slots` (`owning_worker_enter_transaction`), joint `forward_input`, the first encoder's auxiliary `scope_definition` (same epoch), the Known `scope_definition` and `forward_witness`, native events, `forward_input_end`, then settle scopes and commands. A second fixture variant also puts auxiliary scopes of the same epoch between the `slots` record and the input, and it must reduce identically. Expect `unmapped_operator_attempts == 0`, `witnessed == transactions`, the histogram buckets, and correct `forward`/`settle` command splits, including a dispatch-free command on each side of `end_monotonic_ns` and one exactly at it (counted ambiguous).
+- **P2, negatives (each raises):** `padding_rows` on `qwen35.forward.actual_tokens`; `padding_rows > 0` with `matrix_rows != 4`; `matrix_rows != offset + padding_rows`; joint `token_count == 2`; joint `role == target_verify`; joint row `phase == prefill`; duplicate slot; lanes differing from the transaction (order or generation); two joint inputs in one transaction; a joint input with no open joint transaction; witness `rows` equal to logical rather than physical rows; a reused (stale) joint epoch at input time; a first post-input `scope_definition` whose epoch differs from the input's; a `forward_input_end` or next `transaction` arriving before any post-input `scope_definition`; a missing, duplicate, misplaced or mismatched `forward_input_end`; a watermark below the witness scope id; a `forward_input_end` under a policy without the joint source.
 - **P3, coverage:** a joint transaction with no input reduces, but reports `unwitnessed == 1`, and the acceptance script fails it. An unmapped record inside a joint transaction is attributed to `unmapped_by_operation["joint_ordinary_decode"]`.
 - **P4, compatibility:** every existing test passes unchanged. Re-freezing the retained n4-fix run under the old policy yields `windows` output byte-identical to `windows-epoch-v1` (the QE §7 method; read-only, CPU).
-- **P5, Q2 v2 isolation (required by the review):** take a synthetic traced cohort with serial and joint forwards (extending `four_lanes`/`with_busy_owners` and the `test_f2_demand` queued fixtures). Compute every `qualify_window` result for every composition and population policy, (a) on the trace with joint records under the joint policy and (b) on the same trace with every joint-source record (`forward_input`, its Known `scope_definition`, `forward_witness`, `forward_input_end`) removed, under the old policy. The window outputs must be identical, and `operator_shared_batch4_observed` must not change. The same comparison is run read-only on the hardware run T1 (§5.2 check 2).
+- **P5, Q2 v2 isolation (required by the review):** take a synthetic traced cohort with serial and joint forwards (extending `four_lanes`/`with_busy_owners` and the `test_f2_demand` queued fixtures). Compute every `f2_trace.qualify_window` result for every composition and population policy, calling `qualify_window` directly on the record lists rather than through `q2_traced_freeze`, for two traces:
+  - (a) the trace with joint records, under a header policy that names the joint source;
+  - (b) the same trace transformed into the pre-hook shape. Every joint `forward_input`, `forward_witness` and `forward_input_end` is dropped. Each joint witness's Known `scope_definition` is kept, because native `DispatchEncoded` events reference its scope id, but it is relabelled as `OpaqueAuxiliary` with `operation: "opaque_auxiliary"` and `rows: []`. The joint source is removed from the header's `native_observer.witness_manifest.input_sources`.
+
+  The window outputs must be identical, and `operator_shared_batch4_observed` must not change. The same comparison, with the same transform, is run read-only on the hardware run T1 (§5.2 check 2).
 - `test_f2_trace.py`, `test_f2_demand.py`, `test_q2_certify.py`, `test_q2_traced_run.py` (updated WITNESS list) and `test_f2_metadata_budget.py` pass.
 
 GPU test (needs the GPU lane; added next to `real_artifact_joint_decode_invariance_tests.rs`, which already compares joint rows bitwise across cohorts):
@@ -376,7 +380,7 @@ The exact `q3_campaign.py` flags for the single off arm are pinned in the implem
 Acceptance checks:
 
 1. `q2_traced_freeze.py windows --run T1 --out … --population-policy forward_demand_v2` (the QE §7 command) produces a report with `unmapped_operator_attempts == 0`, `unmapped_by_operation.joint_ordinary_decode == 0`, and `joint_ordinary_decode.unwitnessed == 0` with `witnessed == transactions > 0`. Every joint epoch's commands are checked-drained (the reducer's obligation join passes). `boundary_ambiguous_commands` is reported.
-2. Q2 v2 isolation on hardware: the T1 `windows` output equals the windows computed from T1 with every joint-source record removed (P5's method, read-only CPU).
+2. Q2 v2 isolation on hardware: `f2_trace.qualify_window`, called directly, gives identical outputs on T1 and on T1 transformed by P5(b)'s method (joint `forward_input`/`forward_witness`/`forward_input_end` dropped, joint Known scopes relabelled `OpaqueAuxiliary`, joint source removed from the header policy). Read-only CPU.
 3. Exactness, the four transcript comparisons through `python3 scripts/four_agent/q1_decision_policy.py transcripts`, all reported:
    - `T1 O1`: the bound criterion, hook binary trace on vs off;
    - `T0 O0`: observer-only control, parent binary trace on vs off;
@@ -384,12 +388,12 @@ Acceptance checks:
    - `O1 O0`: hook binary vs parent, both untraced.
 4. G1 (§5.1) passes on the same binary H.
 
-**Pre-registered exactness rule.** Fixed before any run; one attempt per run, with the single repeat allowed below.
+**Pre-registered exactness rule.** Fixed before any run; one attempt per run, with the single repeat allowed below. Rows are evaluated top to bottom, and the first match decides.
 
 | T1 vs O1 | G1 | T0 vs O0 | Classification | Outcome |
 |---|---|---|---|---|
+| any | fail | any | `HookAttributable` | Story fails; fix the hook. G1 proves on a fixed schedule whether the hook changes output bytes, so a G1 failure fails the story even if the four-agent transcripts happen to agree. |
 | Exact | pass | any | `Exact` | Exactness criterion met. |
-| Diverged | fail | any | `HookAttributable` | Story fails; fix the hook. |
 | Diverged | pass | Diverged | `ObserverAttributable` | The hook is cleared: it is bitwise-neutral on a fixed schedule, and the observer alone also diverges. The bound criterion is not met as worded, so this goes to the operator with all four comparisons, the `divergent[]` turns and a recommended ADR re-wording ("bitwise neutral on a fixed schedule; observer-induced schedule divergence disclosed"). The operator's decision is recorded in ADR-063 before the story closes. |
 | Diverged | pass | Exact | `Unresolved` | Run one more pair, T1′ and O1′, with identical inputs. If `T1′ O1′` is Exact, classify `ScheduleNondeterministic` and go to the operator as in the previous row. If it diverges again, classify `HookAttributable` and the story fails. |
 
@@ -440,4 +444,12 @@ Remaining risks:
 | 2 [P2] Spans covered the whole transaction epoch, including per-lane MTP catch-up | Boundary closed with `forward_input_end` (scope watermark plus monotonic end) at guard drop, joint policy only. Commands are split into `forward` and `settle`; `epoch_span_ns` is named as such (§3.2, §3.4). |
 | 3 [P2] No observer-only exactness baseline | `T0 O0` added, with all four comparisons, the G1 bitwise hook test and a pre-registered classification rule (§5.2). |
 | 4 [P3] Histogram keys collided with population names; no 1-row case | Keys are `logical<N>_pad<M>`; the `logical1_pad3` case is in the report and in P1 and G1. |
-| 5 [P3] Order binding could be tightened | Epoch freshness and equality with the transaction's first `scope_definition` epoch (§3.4), with P2 negatives. §7.3 reworded: the epoch-on-transaction field is deferred, not impossible. |
+| 5 [P3] Order binding could be tightened | Freshness is checked when the joint input arrives. Epoch equality is checked against the first `scope_definition` after the bound input, and it must arrive before `forward_input_end` and before the next transaction (§3.4), with P1 real-order fixtures and P2 negatives. §7.3 reworded: the epoch-on-transaction field is deferred, not impossible. |
+
+Closure-check fixes (revision 3):
+
+| Fix | Resolution |
+|---|---|
+| A [P1] The epoch-equality anchor was the first scope after the *transaction*, which can precede the input | Equality moved to the first `scope_definition` after the bound joint input, required before `forward_input_end` and the next transaction. Freshness stays at input time. P1 uses the real order (`transaction`, `slots`, `forward_input`, auxiliary scope), plus a variant with pre-input auxiliary scopes (§3.4, §5.1). |
+| B [P2] The P5(b) stripped trace would fail to reduce once Known scopes were removed | P5(b) and hardware check 2 keep each joint Known `scope_definition`, relabelled `OpaqueAuxiliary` (`opaque_auxiliary`, `rows: []`). They drop only the joint `forward_input`, `forward_witness` and `forward_input_end`, remove the joint source from the header policy, and call `qualify_window` directly (§5.1, §5.2). |
+| C [P3] A G1 failure with exact transcripts was unclassified | First rule row is `any \| fail \| any → HookAttributable`. Rows are evaluated top to bottom (§5.2). |
