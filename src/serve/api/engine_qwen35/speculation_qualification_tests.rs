@@ -82,7 +82,7 @@ fn toy_cfg() -> Qwen35Config {
 
 /// Weightless loaded model: the decode-state paths under test read only the
 /// vocabulary size, EOS ids, tokenizer fragments and speculation policy.
-fn loaded_model(policy: QwenSpeculationPolicy) -> Qwen35LoadedModel {
+pub(super) fn loaded_model(policy: QwenSpeculationPolicy) -> Qwen35LoadedModel {
     Qwen35LoadedModel {
         model: Qwen35Model::empty_from_cfg(toy_cfg()),
         tokenizer: tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default()),

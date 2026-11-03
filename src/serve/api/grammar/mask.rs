@@ -210,7 +210,8 @@ pub fn sample_greedy_valid_token(
 /// Mask tokens whose byte-text would drive the grammar dead.
 ///
 /// `token_bytes[i]` is the UTF-8 text emitted when token id `i` is
-/// sampled (typically `tokenizer.decode(&[i], false)` bytes). Candidates are
+/// sampled (`token_text::token_raw_bytes`: the decoded text, or the raw
+/// bytes of a lone byte-fallback/byte-level piece). Candidates are
 /// decoded into one shared code-point arena and rejected against the live
 /// grammar stacks; rejected `logits[i]` are set to `f32::NEG_INFINITY`.
 ///
@@ -645,12 +646,7 @@ mod tests {
         });
         let vocab_size = tokenizer.get_vocab_size(true);
         let token_bytes = (0..vocab_size as u32)
-            .map(|id| {
-                tokenizer
-                    .decode(&[id], false)
-                    .unwrap_or_default()
-                    .into_bytes()
-            })
+            .map(|id| crate::serve::api::token_text::token_raw_bytes(&tokenizer, id))
             .collect::<Vec<_>>();
 
         let mut runtime = rt("root ::= \"\\\"\" [^\\\"]* \"\\\"\"\n", "root");
@@ -955,7 +951,7 @@ mod tests {
     // exercises that exact path.
     //
     // Methodology: mirror Engine::token_bytes_table's body
-    // (`tok.decode(&[id], false)` per id) and assert id 48 decodes to
+    // (`token_raw_bytes(tok, id)` per id) and assert id 48 decodes to
     // the literal 12-byte UTF-8 string "<|tool_call>". Then build a
     // grammar that requires that exact byte sequence at byte 0 and
     // confirm the mask leaves token 48 surviving (not pushed to
@@ -989,13 +985,12 @@ mod tests {
 
     /// Build the per-vocab byte table for a small id range using the
     /// SAME mechanism as `Engine::token_bytes_table`
-    /// (`tok.decode(&[id], false)`). Returns `Vec<Vec<u8>>` indexed by
+    /// (`token_raw_bytes(tok, id)`). Returns `Vec<Vec<u8>>` indexed by
     /// id from 0 to `up_to` exclusive.
     fn token_bytes_table_for_range(tok: &tokenizers::Tokenizer, up_to: u32) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(up_to as usize);
         for id in 0..up_to {
-            let s = tok.decode(&[id], false).unwrap_or_default();
-            out.push(s.into_bytes());
+            out.push(crate::serve::api::token_text::token_raw_bytes(tok, id));
         }
         out
     }
@@ -1132,5 +1127,67 @@ mod tests {
         let mut logits = vec![10.0, 9.0];
         let token = sample_greedy_valid_token(&mut logits, &[0], 2.0, &runtime, &token_bytes, &[]);
         assert_eq!(token, 1, "penalized prior token must no longer win");
+    }
+
+    /// #553: raw token bytes reach the grammar, so it must accept only
+    /// well-formed UTF-8 (Unicode Table 3-7). Surrogates, overlongs and
+    /// sequences above U+10FFFF would otherwise pass the grammar and then
+    /// render as U+FFFD in the visible text.
+    #[test]
+    fn mask_and_runtime_accept_only_well_formed_utf8() {
+        let string = rt("root ::= \"\\\"\" [^\"\\\\]* \"\\\"\"\n", "root");
+        let mut open = string.clone();
+        assert!(open.accept_bytes(b"\""));
+
+        let candidates: Vec<Vec<u8>> = vec![
+            vec![0xE0, 0x80], // 0: overlong 3-byte prefix
+            vec![0xE0, 0xA0], // 1: well-formed U+0800.. prefix
+            vec![0xF4, 0x90], // 2: above U+10FFFF
+            vec![0xF4, 0x8F], // 3: well-formed U+10FFFF.. prefix
+            vec![0xF0, 0x8F], // 4: overlong 4-byte prefix
+            vec![0xC0],       // 5: overlong lead
+            vec![0xC1],       // 6: overlong lead
+            vec![0xF5],       // 7: lead beyond U+10FFFF
+            vec![0xED],       // 8: lead of U+D000..U+D7FF
+            vec![0xED, 0xA0], // 9: surrogate prefix
+        ];
+        let mut logits = vec![1.0; candidates.len()];
+        mask_invalid_tokens_with_eog(&open, &candidates, &[], &mut logits);
+        let survivors: Vec<usize> = (0..candidates.len())
+            .filter(|&i| logits[i].is_finite())
+            .collect();
+        assert_eq!(survivors, vec![1, 3, 8]);
+        for (index, bytes) in candidates.iter().enumerate() {
+            assert_eq!(
+                open.clone().accept_token(index as u32, bytes),
+                survivors.contains(&index),
+                "accept_token {bytes:02x?}"
+            );
+            assert_eq!(
+                open.clone().accept_bytes(bytes),
+                survivors.contains(&index),
+                "accept_bytes {bytes:02x?}"
+            );
+        }
+
+        // ED then A0 (surrogate) is masked; ED 95 9C (`한`, U+D55C) is not.
+        let mut after_ed = open.clone();
+        assert!(after_ed.accept_token(8, &[0xED]));
+        let continuations = vec![vec![0xA0], vec![0xBF], vec![0x95], vec![0x80]];
+        let mut logits = vec![1.0; continuations.len()];
+        mask_invalid_tokens_with_eog(&after_ed, &continuations, &[], &mut logits);
+        assert!(!logits[0].is_finite());
+        assert!(!logits[1].is_finite());
+        assert!(logits[2].is_finite());
+        assert!(logits[3].is_finite());
+        assert!(!after_ed.clone().accept_token(9, &[0xA0]));
+        assert!(after_ed.accept_token(10, &[0x95]));
+        assert!(after_ed.accept_token(11, &[0x9C]));
+        assert!(after_ed.accept_bytes(b"\""));
+        assert!(after_ed.is_terminally_accepted());
+
+        let mut whole = string.clone();
+        assert!(whole.accept_bytes("\"한\"".as_bytes()));
+        assert!(whole.is_terminally_accepted());
     }
 }

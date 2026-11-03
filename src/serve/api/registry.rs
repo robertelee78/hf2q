@@ -6345,10 +6345,7 @@ mod tests {
         let encoding = tokenizer.encode(malformed, false).expect("encode mutant");
         let mut rejected_token = None;
         for &token in encoding.get_ids() {
-            let bytes = tokenizer
-                .decode(&[token], false)
-                .expect("decode token")
-                .into_bytes();
+            let bytes = crate::serve::api::token_text::token_raw_bytes(&tokenizer, token);
             assert!(!bytes.is_empty(), "mutant token {token} decoded empty");
             let oracle_accepts = runtime.clone().accept_bytes(&bytes);
             let mut logits = vec![f32::NEG_INFINITY; token as usize + 1];
@@ -6480,12 +6477,7 @@ mod tests {
 
         let vocab_size = tokenizer.get_vocab_size(true);
         let table = (0..vocab_size as u32)
-            .map(|token| {
-                tokenizer
-                    .decode(&[token], false)
-                    .unwrap_or_default()
-                    .into_bytes()
-            })
+            .map(|token| crate::serve::api::token_text::token_raw_bytes(&tokenizer, token))
             .collect::<Vec<_>>();
         let mut logits = vec![1.0_f32; table.len()];
         crate::serve::api::grammar::mask::mask_invalid_tokens(&runtime, &table, &mut logits);
@@ -8291,7 +8283,7 @@ mod tests {
         // Build a tiny vocab: one token that starts the open marker (`<`),
         // and several non-marker tokens that the grammar must reject.
         // token_bytes table mirrors what `Engine::token_bytes_table`
-        // produces from `Tokenizer::decode(&[id], false)`.
+        // produces (`token_text::token_raw_bytes`; ASCII pieces = decode).
         let token_bytes: Vec<Vec<u8>> = vec![
             b"<".to_vec(),            // 0: starts <|tool_call> — survives
             b"<|tool_call>".to_vec(), // 1: full open marker     — survives

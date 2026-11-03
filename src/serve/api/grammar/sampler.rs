@@ -56,6 +56,38 @@ struct PublicLazyRuntime {
     positions: Vec<LazyBufferedToken>,
 }
 
+/// Byte that stands in for each invalid UTF-8 byte when trigger regexes scan
+/// the lazy buffer (ASCII SUB, "substitute").
+const LAZY_TRIGGER_INVALID_BYTE_PLACEHOLDER: u8 = 0x1A;
+
+/// Same-length view of a lazy trigger buffer for regex matching.
+///
+/// The buffer holds raw token bytes (#553), so a lone byte-fallback or
+/// byte-level piece can leave invalid UTF-8 in it. Trigger regexes run in
+/// Unicode mode, where `.` and `[\s\S]` never match an invalid byte, so one
+/// such byte would keep a `^...$` or spanning trigger from ever firing. Each
+/// invalid byte is replaced by one ASCII placeholder that every wildcard
+/// matches, keeping match offsets valid for the raw buffer. An incomplete
+/// sequence at the end stays as it is until a later token completes or
+/// breaks it. Valid UTF-8 is matched unchanged and without a copy.
+fn lazy_trigger_match_view(buffer: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let mut view: Option<Vec<u8>> = None;
+    let mut offset = 0usize;
+    while let Err(error) = std::str::from_utf8(&buffer[offset..]) {
+        let Some(invalid) = error.error_len() else {
+            break;
+        };
+        let start = offset + error.valid_up_to();
+        let view = view.get_or_insert_with(|| buffer.to_vec());
+        view[start..start + invalid].fill(LAZY_TRIGGER_INVALID_BYTE_PLACEHOLDER);
+        offset = start + invalid;
+    }
+    match view {
+        Some(view) => std::borrow::Cow::Owned(view),
+        None => std::borrow::Cow::Borrowed(buffer),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Position + Stack types
 // ---------------------------------------------------------------------------
@@ -116,12 +148,46 @@ pub struct PartialUtf8 {
     pub n_remain: i8,
 }
 
+/// Classify a UTF-8 lead byte under Unicode Table 3-7 (well-formed byte
+/// sequences): returns the continuation-byte count and the lead's payload
+/// bits. Continuation bytes, the overlong leads C0/C1 and F5–FF (beyond
+/// U+10FFFF) are never leads.
+fn utf8_lead(first: u8) -> Option<(i8, u32)> {
+    match first {
+        0x00..=0x7F => Some((0, first as u32)),
+        0xC2..=0xDF => Some((1, (first & 0x1F) as u32)),
+        0xE0..=0xEF => Some((2, (first & 0x0F) as u32)),
+        0xF0..=0xF4 => Some((3, (first & 0x07) as u32)),
+        _ => None,
+    }
+}
+
+/// Whether `byte` may extend `partial` under Unicode Table 3-7. Beyond the
+/// `10xxxxxx` form, the byte right after E0, ED, F0 and F4 is restricted so
+/// no overlong (E0 80–9F, F0 80–8F), surrogate (ED A0–BF) or above-U+10FFFF
+/// (F4 90–BF) sequence is ever accepted. `(n_remain, value)` identifies
+/// "just after the lead" uniquely: a 4-byte sequence that reaches
+/// `n_remain == 2` has `value >= 0x10` once its own second byte is checked.
+fn utf8_continuation_ok(partial: PartialUtf8, byte: u8) -> bool {
+    if byte & 0xC0 != 0x80 {
+        return false;
+    }
+    match (partial.n_remain, partial.value) {
+        (2, 0x0) => byte >= 0xA0,
+        (2, 0xD) => byte <= 0x9F,
+        (3, 0x0) => byte >= 0x90,
+        (3, 0x4) => byte <= 0x8F,
+        _ => true,
+    }
+}
+
 /// Decode one token's bytes into the shared code-point arena, continuing a
 /// partial UTF-8 sequence inherited from the live grammar runtime.
 ///
-/// This deliberately matches [`GrammarRuntime::accept_bytes`]: malformed
-/// lead/continuation bytes reject the candidate, while an incomplete trailing
-/// code point is retained in `PartialUtf8` for the next sampled token.
+/// This deliberately matches [`GrammarRuntime::accept_bytes`]: ill-formed
+/// lead/continuation bytes (Unicode Table 3-7) reject the candidate, while an
+/// incomplete trailing code point is retained in `PartialUtf8` for the next
+/// sampled token.
 pub(super) fn decode_candidate_utf8(
     bytes: &[u8],
     partial_start: PartialUtf8,
@@ -136,7 +202,7 @@ pub(super) fn decode_candidate_utf8(
     if partial.n_remain > 0 {
         while i < bytes.len() && partial.n_remain > 0 {
             let byte = bytes[i];
-            if (byte & 0xC0) != 0x80 {
+            if !utf8_continuation_ok(partial, byte) {
                 return None;
             }
             partial.value = (partial.value << 6) | (byte & 0x3F) as u32;
@@ -152,15 +218,7 @@ pub(super) fn decode_candidate_utf8(
 
     while i < bytes.len() {
         let first = bytes[i];
-        let (needed, mut value) = if first & 0x80 == 0 {
-            (0i8, first as u32)
-        } else if first & 0xE0 == 0xC0 {
-            (1, (first & 0x1F) as u32)
-        } else if first & 0xF0 == 0xE0 {
-            (2, (first & 0x0F) as u32)
-        } else if first & 0xF8 == 0xF0 {
-            (3, (first & 0x07) as u32)
-        } else {
+        let Some((needed, mut value)) = utf8_lead(first) else {
             return None;
         };
         i += 1;
@@ -168,7 +226,13 @@ pub(super) fn decode_candidate_utf8(
         let mut remain = needed;
         while i < bytes.len() && remain > 0 {
             let byte = bytes[i];
-            if (byte & 0xC0) != 0x80 {
+            if !utf8_continuation_ok(
+                PartialUtf8 {
+                    value,
+                    n_remain: remain,
+                },
+                byte,
+            ) {
                 return None;
             }
             value = (value << 6) | (byte & 0x3F) as u32;
@@ -292,7 +356,10 @@ pub fn match_char(grammar: &Grammar, mut pos: Pos, chr: u32) -> (bool, Pos) {
 }
 
 /// Returns `true` iff some continuation of the given partial UTF-8 sequence
-/// could satisfy the char range at `pos`.
+/// could satisfy the char range at `pos`. A positive set matches when any of
+/// its ranges overlaps the completions `[low, high]`; an excluded set (`[^…]`)
+/// rejects only when its ranges cover all of `[low, high]`, so one excluded
+/// character no longer blocks its 64- or 4096-code-point neighbours.
 pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8) -> bool {
     let rule = match grammar.rules.get(pos.rule_id as usize) {
         Some(r) => r.as_slice(),
@@ -312,7 +379,8 @@ pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8)
     let shift = (n_remain as u32) * 6;
     let mut low = partial.value << shift;
     let mask = if shift == 0 { 0 } else { (1u32 << shift) - 1 };
-    let high = low | mask;
+    // Completions never exceed the last scalar value (F4 8F BF BF).
+    let high = (low | mask).min(0x10FFFF);
     if low == 0 {
         if n_remain == 2 {
             low = 1 << 11;
@@ -321,28 +389,71 @@ pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8)
         }
     }
 
+    // Excluded ranges clipped to `[low, high]` (negative sets only).
+    let mut excluded: Vec<(u32, u32)> = Vec::new();
     loop {
         let cur = rule[pos.elem_idx as usize];
         let next = rule.get(pos.elem_idx as usize + 1);
-        if next.map(|e| e.ty) == Some(GretType::CharRngUpper) {
-            let end = next.unwrap().value;
-            if cur.value <= high && low <= end {
-                return is_positive_char;
-            }
+        let (start, end) = if next.map(|e| e.ty) == Some(GretType::CharRngUpper) {
             pos.elem_idx += 2;
+            (cur.value, next.unwrap().value)
         } else if cur.ty == GretType::CharAny {
             return true;
         } else {
-            if low <= cur.value && cur.value <= high {
-                return is_positive_char;
-            }
             pos.elem_idx += 1;
+            (cur.value, cur.value)
+        };
+        if start <= high && low <= end {
+            if is_positive_char {
+                return true;
+            }
+            excluded.push((start.max(low), end.min(high)));
         }
         if rule.get(pos.elem_idx as usize).map(|e| e.ty) != Some(GretType::CharAlt) {
             break;
         }
     }
-    !is_positive_char
+    if is_positive_char {
+        return false;
+    }
+    excluded.sort_unstable();
+    let mut first_uncovered = low;
+    for (start, end) in excluded {
+        if start > first_uncovered {
+            return true;
+        }
+        first_uncovered = first_uncovered.max(end.saturating_add(1));
+        if first_uncovered > high {
+            return false;
+        }
+    }
+    first_uncovered <= high
+}
+
+/// Keep only the stacks whose top character position some completion of the
+/// pending partial UTF-8 sequence can satisfy; a token terminal never can.
+/// A completed (empty) stack cannot continue a partial character either:
+/// token acceptance drops it, matching the mask, while byte acceptance keeps
+/// it as structural acceptance (terminal acceptance still requires a complete
+/// UTF-8 tail). No-op when no partial sequence is pending.
+fn retain_partial_char_stacks(
+    grammar: &Grammar,
+    stacks: &mut Stacks,
+    partial: PartialUtf8,
+    keep_completed: bool,
+) {
+    if partial.n_remain == 0 {
+        return;
+    }
+    stacks.retain(|stack| match stack.last() {
+        None => keep_completed,
+        Some(&top) => at(grammar, top).is_some_and(|element| {
+            matches!(
+                element.ty,
+                GretType::Char | GretType::CharNot | GretType::CharAny
+            ) && match_partial_char(grammar, top, partial)
+        }),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -615,13 +726,17 @@ fn reject_candidates_for_stack(
 
     for candidate in candidates.iter().copied() {
         if candidate.cursor >= candidate.end {
-            // Preserve hf2q's existing token-table contract exactly: a
-            // syntactically valid but incomplete UTF-8 tail remains alive
-            // while the grammar stack is non-empty, and is resolved after the
-            // next sampled token. hf2q's current table is built from decoded
-            // Rust `String`s and cannot
-            // authoritatively classify byte-fallback fragments.  The clone
-            // oracle exercises this distinction.
+            // End of the token's complete code points. An incomplete UTF-8
+            // tail survives only if some completion of it can satisfy this
+            // character position (the peer's `match_partial_char`). The
+            // token table carries raw bytes for byte-fallback / byte-level
+            // pieces (#553), so a lead byte where no such character fits is
+            // rejected here instead of dead-ending the next step.
+            if candidate.partial_utf8.n_remain != 0
+                && !match_partial_char(grammar, top, candidate.partial_utf8)
+            {
+                rejects.push(candidate);
+            }
             continue;
         }
 
@@ -976,8 +1091,9 @@ impl GrammarRuntime {
                 end: lazy.buffer.len(),
             });
 
+            let view = lazy_trigger_match_view(&lazy.buffer);
             let trigger_start = lazy.trigger_patterns.iter().find_map(|pattern| {
-                let captures = pattern.captures(&lazy.buffer)?;
+                let captures = pattern.captures(&view)?;
                 (1..captures.len())
                     .find_map(|index| {
                         captures
@@ -1035,8 +1151,9 @@ impl GrammarRuntime {
         let suffix = {
             let lazy = self.public_lazy.as_mut().expect("checked above");
             lazy.buffer.extend_from_slice(bytes);
-            lazy.trigger_patterns.iter().find_map(|pattern| {
-                let captures = pattern.captures(&lazy.buffer)?;
+            let view = lazy_trigger_match_view(&lazy.buffer);
+            let suffix = lazy.trigger_patterns.iter().find_map(|pattern| {
+                let captures = pattern.captures(&view)?;
                 let start = (1..captures.len())
                     .find_map(|index| {
                         captures
@@ -1046,7 +1163,8 @@ impl GrammarRuntime {
                     })
                     .or_else(|| captures.get(0).map(|capture| capture.start()))?;
                 Some(lazy.buffer[start..].to_vec())
-            })
+            });
+            suffix
         };
         let Some(suffix) = suffix else {
             return Some(true);
@@ -1148,6 +1266,7 @@ impl GrammarRuntime {
                 }
             }
         }
+        retain_partial_char_stacks(&self.grammar, &mut stacks_new, partial_utf8, false);
         self.stacks = stacks_new;
         if self.dsml_guard.is_some() {
             self.dsml_scan=self.dsml_scan.through(&code_points);
@@ -1211,7 +1330,7 @@ impl GrammarRuntime {
             let mut partial = self.partial_utf8;
             while i < bytes.len() && partial.n_remain > 0 {
                 let b = bytes[i];
-                if (b & 0xC0) != 0x80 {
+                if !utf8_continuation_ok(partial, b) {
                     self.partial_utf8 = PartialUtf8 {
                         value: 0,
                         n_remain: -1,
@@ -1226,6 +1345,7 @@ impl GrammarRuntime {
             if partial.n_remain > 0 {
                 // Still incomplete at end-of-buffer — stash for next call.
                 self.partial_utf8 = partial;
+                retain_partial_char_stacks(&self.grammar, &mut self.stacks, partial, true);
                 return !self.stacks.is_empty();
             }
             // Completed code point.
@@ -1238,23 +1358,21 @@ impl GrammarRuntime {
         // Now consume full code points from `bytes[i..]`.
         while i < bytes.len() {
             let first = bytes[i];
-            let (needed, mut val) = if first & 0x80 == 0 {
-                (0usize, first as u32)
-            } else if first & 0xE0 == 0xC0 {
-                (1, (first & 0x1F) as u32)
-            } else if first & 0xF0 == 0xE0 {
-                (2, (first & 0x0F) as u32)
-            } else if first & 0xF8 == 0xF0 {
-                (3, (first & 0x07) as u32)
-            } else {
+            let Some((needed, mut val)) = utf8_lead(first) else {
                 self.stacks.clear();
                 return false;
             };
             i += 1;
-            let mut remain = needed as i8;
+            let mut remain = needed;
             while remain > 0 && i < bytes.len() {
                 let b = bytes[i];
-                if (b & 0xC0) != 0x80 {
+                if !utf8_continuation_ok(
+                    PartialUtf8 {
+                        value: val,
+                        n_remain: remain,
+                    },
+                    b,
+                ) {
                     self.stacks.clear();
                     return false;
                 }
@@ -1267,6 +1385,8 @@ impl GrammarRuntime {
                     value: val,
                     n_remain: remain,
                 };
+                let partial = self.partial_utf8;
+                retain_partial_char_stacks(&self.grammar, &mut self.stacks, partial, true);
                 return !self.stacks.is_empty();
             }
             if !self.accept_char(val) {
@@ -2004,6 +2124,87 @@ mod tests {
         exact.configure_public_lazy(&config).unwrap();
         assert!(exact.accept_token(2, b"tool:BODY"));
         assert!(exact.is_terminally_accepted());
+    }
+
+    /// #553: the lazy buffer holds raw token bytes, so a lone byte-fallback
+    /// piece (`<0x82>`) leaves invalid UTF-8 before the trigger. Unicode-mode
+    /// wildcards must still span it, and the replayed suffix keeps its offsets.
+    #[test]
+    fn public_lazy_patterns_see_through_lone_invalid_bytes() {
+        let full = LazyGrammarConfig {
+            trigger_patterns: vec!["^[\\s\\S]*?tool:(BODY)$".into()],
+            ..Default::default()
+        };
+        let mut rt = runtime_from("root ::= \"BODY\"\n", "root");
+        rt.configure_public_lazy(&full).unwrap();
+        assert!(rt.accept_token(1, b"(1-3"));
+        assert!(rt.accept_token(2, &[0x82]));
+        assert!(rt.accept_token(3, b"2) tool:BO"));
+        assert!(rt.is_awaiting_trigger());
+        assert!(rt.accept_token(4, b"DY"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.is_terminally_accepted());
+
+        let spanning = LazyGrammarConfig {
+            trigger_patterns: vec!["a.b(BODY)".into()],
+            ..Default::default()
+        };
+        let mut rt = runtime_from("root ::= \"BODY\"\n", "root");
+        rt.configure_public_lazy(&spanning).unwrap();
+        assert!(rt.accept_token(1, b"xa"));
+        assert!(rt.accept_token(2, &[0x82]));
+        assert!(rt.accept_token(3, b"bBODY"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.is_terminally_accepted());
+
+        let mut bytes = runtime_from("root ::= \"BODY\"\n", "root");
+        bytes.configure_public_lazy(&full).unwrap();
+        assert!(bytes.accept_bytes(&[0x82]));
+        assert!(bytes.accept_bytes(b" tool:BODY"));
+        assert!(bytes.is_terminally_accepted());
+    }
+
+    #[test]
+    fn lazy_trigger_view_replaces_only_invalid_bytes() {
+        let valid = "名前 tool".as_bytes();
+        assert!(matches!(
+            lazy_trigger_match_view(valid),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // A lone continuation byte and a broken lead byte are replaced; an
+        // incomplete trailing sequence waits for its next token.
+        let raw = [b'a', 0x82, b'b', 0xE5, b'c', 0xE5, 0x90];
+        let view = lazy_trigger_match_view(&raw);
+        assert_eq!(&*view, &[b'a', 0x1A, b'b', 0x1A, b'c', 0xE5, 0x90]);
+    }
+
+    /// Excluded sets reject a pending lead byte only when they exclude every
+    /// completion. `前` (U+524D) and `剃` (U+5243) share the prefix E5 89; a
+    /// sibling key spelled byte by byte must survive the mismatch branch that
+    /// excludes the declared key's next character (Gemma bare-key trie shape).
+    #[test]
+    fn excluded_set_keeps_non_ascii_sibling_key() {
+        let grammar = "root ::= \"名\" ( \"前\" | [^前] [a-z]* ) \"=\"\n";
+        let mut rt = runtime_from(grammar, "root");
+        assert!(rt.accept_bytes("名".as_bytes()));
+        assert!(rt.accept_token(1, &[0xE5]));
+        assert!(rt.accept_token(2, &[0x89]));
+        assert!(rt.accept_token(3, &[0x83]), "剃 completes via [^前]");
+        assert!(rt.accept_token(4, b"x="));
+        assert!(rt.is_terminally_accepted());
+
+        let mut declared = runtime_from(grammar, "root");
+        assert!(declared.accept_bytes("名前=".as_bytes()));
+        assert!(declared.is_terminally_accepted());
+
+        // A set excluding every completion of the lead byte still rejects it.
+        let covered = format!(
+            "root ::= [^{}-{}]\n",
+            char::from_u32(0x5000).unwrap(),
+            char::from_u32(0x5FFF).unwrap()
+        );
+        assert!(!runtime_from(&covered, "root").accept_token(1, &[0xE5]));
+        assert!(runtime_from(&covered, "root").accept_token(1, &[0xE6]));
     }
 
     #[test]

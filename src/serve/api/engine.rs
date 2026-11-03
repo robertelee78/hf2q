@@ -352,7 +352,7 @@ pub struct SamplingParams {
     /// `Clone` (cheap — just a `Vec<Vec<GretElement>>`); the chat
     /// handler clones it into the per-request `SamplingParams`.
     pub grammar: Option<super::grammar::Grammar>,
-    /// Per-vocab decoded UTF-8 byte table for grammar masking.  `None`
+    /// Per-vocab raw token byte table for grammar masking.  `None`
     /// when `grammar` is also `None` (no grammar, no need for the
     /// table).  When `grammar` is `Some`, this MUST be `Some(table)`
     /// — the chat handler obtains it via `Engine::token_bytes_table()`
@@ -1825,8 +1825,8 @@ struct EngineInner {
     /// (Decision #21). `None` when no family matches this model's id.
     registration: Option<super::registry::ModelRegistration>,
     vision_consumer_contract: Option<VisionConsumerContract>,
-    /// Per-vocab decoded UTF-8 byte table — `token_bytes[id]` is the
-    /// bytes the tokenizer emits when token `id` is sampled.  Built on
+    /// Per-vocab raw token byte table — `token_bytes[id]` is the bytes
+    /// token `id` contributes to the output when sampled.  Built on
     /// first grammar request via `Engine::token_bytes_table()` and
     /// cached for the engine's lifetime (vocab × ~3-5 bytes ≈ 1 MB at
     /// 256K vocab — trivial vs the model weights).  `OnceLock` so
@@ -5196,14 +5196,16 @@ impl Engine {
         self.inner.vision_consumer_contract.clone()
     }
 
-    /// Lazily build + cache the per-vocab decoded UTF-8 byte table used
-    /// by the grammar mask (Phase 2a Task #5 / iter-95).
+    /// Lazily build + cache the per-vocab raw byte table used by the
+    /// grammar mask (Phase 2a Task #5 / iter-95).
     ///
-    /// `token_bytes[id]` is the bytes the tokenizer emits when token `id`
-    /// is sampled — exactly `tokenizer.decode(&[id], false)` lowered to
-    /// raw UTF-8 bytes. Empty non-EOG entries are rejected by the grammar
-    /// mask. Model EOG ids are handled separately and survive only once the
-    /// grammar is accepting.
+    /// `token_bytes[id]` is the bytes token `id` contributes to the output
+    /// (`token_text::token_raw_bytes`): `tokenizer.decode(&[id], false)`
+    /// when that is lossless, else the raw byte-fallback / byte-level bytes,
+    /// so a lone `<0x82>` is an invalid byte the grammar rejects rather than
+    /// a valid U+FFFD (#553). Empty non-EOG entries are rejected by the
+    /// grammar mask. Model EOG ids are handled separately and survive only
+    /// once the grammar is accepting.
     ///
     /// Cost: vocab × one tokenizer.decode call.  At Gemma-4's vocab=256K
     /// this is ~50-200 ms on first call (CPU work; not on hot path),
@@ -5222,14 +5224,10 @@ impl Engine {
                 let tok = &self.inner.tokenizer;
                 let mut out: Vec<Vec<u8>> = Vec::with_capacity(v);
                 for id in 0..v as u32 {
-                    // `decode` returns the rendered text per token; for
-                    // BPE-byte-fallback vocabs the bytes round-trip via
-                    // UTF-8.  Failure (out-of-range id, unsupported
-                    // token) returns an empty string — emit empty bytes
-                    // so the mask treats it as a "special" / unprintable
-                    // token (left untouched).
-                    let s = tok.decode(&[id], false).unwrap_or_default();
-                    out.push(s.into_bytes());
+                    // Failure (out-of-range id, unsupported token) yields
+                    // empty bytes so the mask treats it as a "special" /
+                    // unprintable token.
+                    out.push(super::token_text::token_raw_bytes(tok, id));
                 }
                 tracing::info!(
                     "Engine: built per-vocab token_bytes table ({} ids, ~{:.1} MB)",
@@ -7099,6 +7097,9 @@ struct Gemma4DecodeState {
     next_token: u32,
     generated_tokens: Vec<u32>,
     decoded_text: String,
+    /// Holds back an incomplete UTF-8 sequence spread over byte tokens so
+    /// neither `decoded_text` nor SSE fragments split a character (#553).
+    text_decoder: super::token_text::TokenTextDecoder,
     /// Classification of the prefill-selected first fragment. Streaming must
     /// route that fragment before decode tick one; otherwise a tool opener can
     /// be lost even though the final unary transcript remains parseable.
@@ -7619,12 +7620,10 @@ impl Gemma4DecodeState {
         let decode_started = Instant::now();
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_decode_tokens);
         let mut decoded_text = String::new();
+        let mut text_decoder = super::token_text::TokenTextDecoder::default();
 
         // First emitted token → text BEFORE EOS check (serial ref 9123-9145).
-        let first_fragment = loaded
-            .tokenizer
-            .decode(&[next_token], false)
-            .unwrap_or_default();
+        let first_fragment = text_decoder.push(&loaded.tokenizer, next_token);
         decoded_text.push_str(&first_fragment);
         let mut seed_is_reasoning = false;
         if let Some(sp) = reasoning_splitter.as_mut() {
@@ -7658,6 +7657,9 @@ impl Gemma4DecodeState {
         } else {
             generated_tokens.push(next_token);
         }
+        if gemma4_seed_finished(finish_reason, generated_tokens.len(), max_decode_tokens) {
+            decoded_text.push_str(&text_decoder.finish());
+        }
         // `next_token` stays as the first token; the first decode tick feeds
         // it (pos = prompt_len + generated_tokens.len() - 1, serial ref 9159).
         let _ = &mut next_token;
@@ -7688,6 +7690,7 @@ impl Gemma4DecodeState {
             next_token,
             generated_tokens,
             decoded_text,
+            text_decoder,
             seed_is_reasoning,
             finish_reason,
             prefill_duration,
@@ -7824,20 +7827,35 @@ impl Gemma4DecodeState {
             greedy_token
         };
 
-        // EOS before push/decode (serial ref 9228-9231): suppress the token.
+        // EOS before push/decode (serial ref 9228-9231): suppress the token
+        // but flush any incomplete UTF-8 tail held back by the decoder,
+        // classified by the splitters like any other fragment. EOS is not a
+        // completion token, so it does not count toward reasoning tokens.
         if loaded.is_generation_stop_token(self.next_token) {
             self.finish_reason = "stop";
+            let fragment = self.text_decoder.finish();
+            let mut is_reasoning = false;
+            if !fragment.is_empty() {
+                self.decoded_text.push_str(&fragment);
+                if let Some(sp) = self.reasoning_splitter.as_mut() {
+                    let _ = sp.feed(&fragment);
+                    is_reasoning = sp.in_reasoning();
+                }
+                if let Some(tcs) = self.tc_splitter.as_mut() {
+                    let _ = tcs.feed(&fragment);
+                }
+            }
             return Ok(TickOutcome {
-                fragment: String::new(),
-                is_reasoning: false,
+                fragment,
+                is_reasoning,
                 finished: true,
             });
         }
         self.generated_tokens.push(self.next_token);
-        let fragment = loaded
-            .tokenizer
-            .decode(&[self.next_token], false)
-            .unwrap_or_default();
+        let mut fragment = self.text_decoder.push(&loaded.tokenizer, self.next_token);
+        if self.generated_tokens.len() >= self.max_decode_tokens {
+            fragment.push_str(&self.text_decoder.finish());
+        }
         self.decoded_text.push_str(&fragment);
         let mut is_reasoning = false;
         if let Some(sp) = self.reasoning_splitter.as_mut() {
@@ -7864,6 +7882,7 @@ impl Gemma4DecodeState {
         if hit_stop_string(&self.decoded_text, &self.stop_strings) {
             self.finish_reason = "stop";
             strip_trailing_stop(&mut self.decoded_text, &self.stop_strings);
+            self.text_decoder.discard();
             return Ok(TickOutcome {
                 fragment,
                 is_reasoning,
@@ -7882,6 +7901,7 @@ impl Gemma4DecodeState {
                 .tokenizer
                 .decode(&self.generated_tokens, false)
                 .unwrap_or_default();
+            self.text_decoder.discard();
             return Ok(TickOutcome {
                 fragment,
                 is_reasoning,
@@ -7954,7 +7974,7 @@ impl Gemma4DecodeState {
     /// Assemble the `GenerationResult` at end-of-decode — mirror of serial
     /// ref engine.rs:9277-9299.
     fn finish(
-        self,
+        mut self,
         registration: Option<&super::registry::ModelRegistration>,
     ) -> Result<GenerationResult> {
         validate_grammar_terminal(
@@ -7962,6 +7982,9 @@ impl Gemma4DecodeState {
             self.grammar_kind,
             self.finish_reason,
         )?;
+        // A slot released outside a terminal tick keeps no bytes back.
+        let tail = self.text_decoder.finish();
+        self.decoded_text.push_str(&tail);
         let (content, reasoning_text) = match registration {
             Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(
                 reg,
@@ -20880,7 +20903,7 @@ fn settle_qwen35_decode_lane(
 ) -> Option<Qwen35FatalFailure> {
     let slot_idx = handle.slot_id.0 as usize;
     let qtick = match tick {
-        Ok(t) => t,
+        Ok(t) => state.complete_tick(t),
         Err(e) => {
             if !supervisor.is_healthy() {
                 return Some(Qwen35FatalFailure {
@@ -25203,10 +25226,8 @@ fn generate_once_with_soft_tokens(
     // immune to that off-by-one ambiguity.
     let mut physical_decode_writes: usize = 0;
 
-    let first_fragment = loaded
-        .tokenizer
-        .decode(&[next_token], false)
-        .unwrap_or_default();
+    let mut text_decoder = super::token_text::TokenTextDecoder::default();
+    let first_fragment = text_decoder.push(&loaded.tokenizer, next_token);
     let mut decoded_text = first_fragment.clone();
     if let Some(sp) = splitter.as_mut() {
         let _ = sp.feed(&first_fragment);
@@ -25311,10 +25332,7 @@ fn generate_once_with_soft_tokens(
             }
 
             generated_tokens.push(next_token);
-            let fragment = loaded
-                .tokenizer
-                .decode(&[next_token], false)
-                .unwrap_or_default();
+            let fragment = text_decoder.push(&loaded.tokenizer, next_token);
             decoded_text.push_str(&fragment);
             if let Some(sp) = splitter.as_mut() {
                 let _ = sp.feed(&fragment);
@@ -25349,6 +25367,7 @@ fn generate_once_with_soft_tokens(
                 // convention per ADR-005 "Stop-sequence stripping from
                 // returned text").
                 strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                text_decoder.discard();
                 break;
             }
             // Grammar-driven termination (Phase 2a Task #5 / iter-95).
@@ -25381,10 +25400,12 @@ fn generate_once_with_soft_tokens(
                     .tokenizer
                     .decode(&generated_tokens, false)
                     .unwrap_or_default();
+                text_decoder.discard();
                 break;
             }
         }
     }
+    decoded_text.push_str(&text_decoder.finish());
     let decode_duration = decode_start.elapsed();
 
     validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)?;
@@ -26066,12 +26087,10 @@ fn generate_gemma4_once_slot_aware(
         let decode_started = Instant::now();
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_decode_tokens);
         let mut decoded_text = String::new();
+        let mut text_decoder = super::token_text::TokenTextDecoder::default();
 
         // Decode the first emitted token into text BEFORE the EOS check.
-        let first_fragment = loaded
-            .tokenizer
-            .decode(&[next_token], false)
-            .unwrap_or_default();
+        let first_fragment = text_decoder.push(&loaded.tokenizer, next_token);
         decoded_text.push_str(&first_fragment);
         if let Some(sp) = splitter.as_mut() {
             let _ = sp.feed(&first_fragment);
@@ -26181,10 +26200,7 @@ fn generate_gemma4_once_slot_aware(
                     break;
                 }
                 generated_tokens.push(next_token);
-                let fragment = loaded
-                    .tokenizer
-                    .decode(&[next_token], false)
-                    .unwrap_or_default();
+                let fragment = text_decoder.push(&loaded.tokenizer, next_token);
                 decoded_text.push_str(&fragment);
                 if let Some(sp) = splitter.as_mut() {
                     let _ = sp.feed(&fragment);
@@ -26206,6 +26222,7 @@ fn generate_gemma4_once_slot_aware(
                 if hit_stop_string(&decoded_text, &params.stop_strings) {
                     finish_reason = "stop";
                     strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                    text_decoder.discard();
                     break;
                 }
                 // Grammar-dead termination (mirror of generate_once at
@@ -26218,10 +26235,12 @@ fn generate_gemma4_once_slot_aware(
                         .tokenizer
                         .decode(&generated_tokens, false)
                         .unwrap_or_default();
+                    text_decoder.discard();
                     break;
                 }
             }
         }
+        decoded_text.push_str(&text_decoder.finish());
         let decode_duration = decode_started.elapsed();
 
         // Reasoning-text split at end-of-decode.  Mirror of generate_once
@@ -27003,11 +27022,9 @@ fn generate_stream_gemma4_once_slot_aware(
             let mut completion_token_count: usize = 0;
             let mut finish_reason: &'static str = "length";
             let mut decoded_running = String::new();
+            let mut text_decoder = super::token_text::TokenTextDecoder::default();
 
-            let first_fragment = loaded
-                .tokenizer
-                .decode(&[next_token], false)
-                .unwrap_or_default();
+            let first_fragment = text_decoder.push(&loaded.tokenizer, next_token);
             decoded_running.push_str(&first_fragment);
             if emit_fragment(
                 &event_sink,
@@ -27140,10 +27157,7 @@ fn generate_stream_gemma4_once_slot_aware(
                         break;
                     }
                     generated_tokens.push(next_token);
-                    let fragment = loaded
-                        .tokenizer
-                        .decode(&[next_token], false)
-                        .unwrap_or_default();
+                    let fragment = text_decoder.push(&loaded.tokenizer, next_token);
                     decoded_running.push_str(&fragment);
                     if emit_fragment(
                         &event_sink,
@@ -27171,12 +27185,41 @@ fn generate_stream_gemma4_once_slot_aware(
 
                     if hit_stop_string(&decoded_running, &params.stop_strings) {
                         finish_reason = "stop";
+                        text_decoder.discard();
                         break;
                     }
                     if grammar_runtime.as_ref().is_some_and(|rt| rt.is_dead()) {
                         finish_reason = "stop";
+                        text_decoder.discard();
                         break;
                     }
+                }
+            }
+            // Flush an incomplete UTF-8 tail held back at EOS / max_tokens.
+            let tail = text_decoder.finish();
+            if !tail.is_empty() {
+                decoded_running.push_str(&tail);
+                if emit_fragment(
+                    &event_sink,
+                    &mut reason_splitter,
+                    &mut tool_splitter,
+                    &mut tool_call_body,
+                    &mut tool_call_index,
+                    &mut saw_tool_call,
+                    &mut tool_call_emitter,
+                    &mut grammar_runtime,
+                    &tail,
+                    registration,
+                )
+                .is_err()
+                {
+                    tracing::info!(
+                        "SSE stream dropped by client; aborting gemma4 slot-aware decode"
+                    );
+                    if let Some(c) = cancellation_counter {
+                        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return;
                 }
             }
             // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48
@@ -27930,11 +27973,9 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
         let decode_started = Instant::now();
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_decode_tokens);
         let mut decoded_text = String::new();
+        let mut text_decoder = super::token_text::TokenTextDecoder::default();
 
-        let first_fragment = loaded
-            .tokenizer
-            .decode(&[next_token], false)
-            .unwrap_or_default();
+        let first_fragment = text_decoder.push(&loaded.tokenizer, next_token);
         decoded_text.push_str(&first_fragment);
         if let Some(sp) = splitter.as_mut() {
             let _ = sp.feed(&first_fragment);
@@ -28040,10 +28081,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                     break;
                 }
                 generated_tokens.push(next_token);
-                let fragment = loaded
-                    .tokenizer
-                    .decode(&[next_token], false)
-                    .unwrap_or_default();
+                let fragment = text_decoder.push(&loaded.tokenizer, next_token);
                 decoded_text.push_str(&fragment);
                 if let Some(sp) = splitter.as_mut() {
                     let _ = sp.feed(&fragment);
@@ -28065,6 +28103,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 if hit_stop_string(&decoded_text, &params.stop_strings) {
                     finish_reason = "stop";
                     strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                    text_decoder.discard();
                     break;
                 }
                 if grammar_runtime.as_ref().is_some_and(|rt| rt.is_dead()) {
@@ -28074,10 +28113,12 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                         .tokenizer
                         .decode(&generated_tokens, false)
                         .unwrap_or_default();
+                    text_decoder.discard();
                     break;
                 }
             }
         }
+        decoded_text.push_str(&text_decoder.finish());
         let decode_duration = decode_started.elapsed();
 
         let (content, reasoning_text) = match registration {
@@ -30548,10 +30589,8 @@ fn generate_stream_once(
     let mut physical_decode_writes: usize = 0;
 
     // Emit prefill-produced first token:
-    let first_text = loaded
-        .tokenizer
-        .decode(&[next_token], false)
-        .unwrap_or_default();
+    let mut text_decoder = super::token_text::TokenTextDecoder::default();
+    let first_text = text_decoder.push(&loaded.tokenizer, next_token);
     let mut is_eos_first = loaded.is_generation_stop_token(next_token);
     if !is_eos_first && !first_text.is_empty() {
         accumulated_text.push_str(&first_text);
@@ -30669,10 +30708,7 @@ fn generate_stream_once(
             }
             completion_tokens += 1;
             generated_tokens.push(next_token);
-            let fragment = loaded
-                .tokenizer
-                .decode(&[next_token], false)
-                .unwrap_or_default();
+            let fragment = text_decoder.push(&loaded.tokenizer, next_token);
             accumulated_text.push_str(&fragment);
             if emit_fragment(
                 &mut splitter,
@@ -30696,8 +30732,31 @@ fn generate_stream_once(
             }
             if hit_stop_string(&accumulated_text, &params.stop_strings) {
                 finish_reason = "stop";
+                text_decoder.discard();
                 break;
             }
+        }
+    }
+    // Flush an incomplete UTF-8 tail held back at EOS / max_tokens.
+    let tail = text_decoder.finish();
+    if !tail.is_empty() {
+        accumulated_text.push_str(&tail);
+        if emit_fragment(
+            &mut splitter,
+            &mut tool_splitter,
+            &mut tool_call_body,
+            &mut tool_call_index,
+            &mut saw_tool_call,
+            &mut tool_call_emitter,
+            &mut grammar_runtime,
+            events,
+            &tail,
+            registration,
+        )
+        .is_err()
+        {
+            tracing::info!("SSE stream dropped by client; aborting decode");
+            return serial_stream_client_closed(cancellation_counter);
         }
     }
 
