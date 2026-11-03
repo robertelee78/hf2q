@@ -1,8 +1,8 @@
 # ADR-063: Apple Silicon four-agent GGUF speed and coherence
 
-- **Status:** Accepted program scope, F1/F3 execution entry and the separately reviewed F2/Q1/Q2/C1 source implementation entry; other implementation designs require separate approval.
+- **Status:** Accepted program scope, F1/F3 execution entry, the separately reviewed F2/Q1/Q2/C1 source implementation entry and the 2026-11-03 measurement-only entry (see "Speed program, Q1 successors and release mapping"); other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA, Q4-DS4 and Q4-QWEN36 plus Q4-TRACE; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b, frozen limits, delivery v0.1.30); remaining Q2/Q3/F2/parity leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
+- **Updated:** 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA, Q4-DS4 and Q4-QWEN36, with Q4-GEMMA-KERNEL (mlx-native) and Q4-TRACE; Q4-DS4 consumes the IQ2_XXS subset of ADR-066 N1/N3/N4 pulled ahead of ADR-066 B2; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b with J1 joining v0.1.30, frozen limits, delivery v0.1.30); remaining verification leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28, v0.1.30
 - Stable source ID: ADR-063
@@ -204,17 +204,19 @@ Acceptance:
 
 - Implement bounded slot-local anchors with pending publication, atomic restore, lineage pruning, saved-logit equality hits, right-sized payloads and owned-byte telemetry. Recurrent (DeltaNet/conv) state restore builds on the ADR-065 P4a/P4b GPU DeltaNet restore rather than a second restore path.
 
+- An approved C2 HLD/LLD states how anchor-snapshot→state restore reuses the P4a primitive, whose contract covers capture→state only. If the primitive must be extended, the design links the mlx-native issue that states the extension's contract.
+
 - Prove cold-versus-resumed exactness on both Qwen artifacts with graft absent/present/identity change, speculation off/auto, cancellation, failed restore and four concurrent clients.
 
 - Test the cold (non-restore) divergent prefill that completes successfully and then refuses the older anchor whose rows it overwrote (C1 final review carry-over O1, success-path twin).
 
-- Anchor capture/restore does not make joint-decode-eligible turns `NotEligible`: the joint-decode eligibility rate with anchors on equals anchors off on the same workload and binary.
+- No joint turn is refused `NotEligible` because of anchor capture/restore (a reason-tagged counter reads 0), and the joint-decode eligibility rate with anchors on is within the Q3 CI of anchors off on the same workload and binary.
 
 - Frozen limits: divergent-turn worst-slot semantic TTFT, paired against cold on the same binary with the anchors kill switch, has a Q3 Williams-block (5–20 blocks) 95% CI that excludes 0 in the improving direction; append-only four-agent makespan and worst-slot TTFT p95/SSE-gap max ratios are ≤ 1.025 against anchors off; process footprint with anchors on is ≤ 1.25× a fresh Q5 calibration.
 
 - Fresh Q5 calibration for Qwen3.8 and Qwen3.6 with the declared anchors per slot at the declared workload precedes any C2 hardware run.
 
-- Qwen3.6 is judged by cold-versus-resumed bitwise exactness and `ExactTranscripts` against anchors off, not by task pass rate, because it fails the canonical task on every engine from its weights (`docs/research/adr063-qwen36-task-failure-diagnosis.md`). Qwen3.8 additionally passes the paired task-quality gate.
+- Qwen3.6 is judged by cold-versus-resumed bitwise exactness and `ExactTranscripts` against anchors off, not by task pass rate, while no workload on which Qwen3.6 passes is declared (Q4-QWEN36). Qwen3.8 additionally passes the paired task-quality gate.
 
 - Primary Qwen3.8 evidence uses the vanilla official 27B dense model; grafted/abliterated variants remain separate compatibility arms. Family parity obligations for future Gemma/DeepSeek implementations remain explicit successors, not a universal multi-anchor shipping claim.
 
@@ -223,7 +225,7 @@ Repository ownership: hf2q owns Qwen model/cache integration and anchor selectio
 
 Validation: Run the four-slot divergent-edit state/lifecycle gates that C2 itself authors and runs (on the workload-variant mechanism), the paired TTFT and append-only campaigns above and allocation accounting. The F2 fixed-six successor campaign is not a C2 predecessor. An independent reviewer reproduces the exactness matrix and the paired TTFT effect from raw receipts.
 
-Predecessors: C1, ADR-065 P4a (GPU restore of DeltaNet state from capture), ADR-065 P4b (GPU DeltaNet restore after partial rejection). Moved to v0.1.29 (operator decision, 2026-10-30), then to v0.1.30 (operator decision, 2026-11-03).
+Predecessors: C1, ADR-065 P4a (#526), ADR-065 P4b (#527; itself requires ADR-065 B1 #503 and J1 #512). Moved to v0.1.29 (operator decision, 2026-10-30), then to v0.1.30 (operator decision, 2026-11-03).
 
 Priority: High. Core scope.
 
@@ -536,6 +538,8 @@ Acceptance:
 
 - The Q1 successors (Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC, Q1-GEMMA-SPEC) do not gate Q4. DeepSeek-V4 quality for Q4 is the paired task-quality gate plus the S3 bitwise joint == serial check.
 
+- Q4 cannot close until every family story is Win or the operator records a re-scope of that family in this ADR. A family that cannot reach Win keeps its verdict of record (Loss, Unavailable or Failed) with evidence.
+
 Repository ownership: The integration owner coordinates two release chains: merge/publish/verify mlx-native updates first, pin and clean-build hf2q, then qualify and publish the hf2q crate plus signed standalone artifacts. Record both package versions/checksums, immutable source commits, native PRs and all four independent model verdicts.
 
 Validation: Independent review of the combined candidate and raw receipts, followed by exact-artifact release verification on the target Apple host.
@@ -589,7 +593,7 @@ Acceptance:
 
 - Starting point (Q3 v11, hf2q `38485a23`): the MTP peer finishes 6.0% sooner (95% CI 4.2–7.9%), emitting 1.88× the completion tokens at a 2.00× per-output-token rate; hf2q's worst-slot p95 TTFT is 2.61× the peer's.
 
-- Per-stage attribution of the gap on the same run, using the ADR-065 B1 baseline and fairness freeze and its E1–E8 deciding measurements (stage time split, complete-round cost, counterfactual acceptance, makespan composition and eligibility), with the Q4-TRACE joint-decode witness. The distortion of each attribution is stated.
+- Per-stage attribution of the gap on the same run, using the ADR-065 B1 (#503) baseline and fairness freeze and its E1–E8 (#504–#511) deciding measurements (stage time split, complete-round cost, counterfactual acceptance, makespan composition and eligibility), with the Q4-TRACE joint-decode witness. The distortion of each attribution is stated.
 
 - The 2.6× worst-slot TTFT gap is decomposed into queueing, admission, prefill and first-token stages, and each stage is closed or disclosed with evidence.
 
@@ -601,35 +605,61 @@ Repository ownership: hf2q owns attribution wiring, scheduling, speculation poli
 
 Validation: Independent review of the per-stage attribution and of the Q3-design hf2q-versus-peer campaign from raw receipts.
 
-Predecessors: ADR-065 E8 (G0 gate decision), Q4-TRACE, Q5. Consumes ADR-065 P4a/P4b and any ADR-065 build story admitted after the E8 gate.
+Predecessors: ADR-065 E8 (#511, G0 gate decision), Q4-TRACE, Q5. Consumes ADR-065 P4a (#526), P4b (#527) and any ADR-065 build story admitted after the E8 gate.
 
 Priority: High. Core scope (first-tier family).
 
 Delivery boundary: Release v0.1.30, or the first published hf2q release containing the accepted Qwen3.8 configuration.
 
-### Q4-GEMMA. Profile the Gemma 4 gap and land a precise tiled warm attention
+### Q4-GEMMA-KERNEL. Provide a precise tiled warm attention primitive in mlx-native
 
-Outcome: hf2q finishes the canonical Gemma 4 26B-A4B four-agent coding task at least 5% sooner than the peer in its best valid configuration, with the stock fairness gate passing.
+Outcome: mlx-native provides a tiled warm attention primitive with 32-bit accumulation that Gemma 4 warm resumes can use without the `TiledF16` decision flips.
 
-Requirement: The program MUST, in parallel, (a) profile hf2q and the peer by stage on the same run and (b) deliver a precise tiled warm attention kernel with 32-bit accumulation in mlx-native integrated in hf2q, and MUST deliver a Gemma 4 configuration whose Q4 verdict is Win.
+Requirement: mlx-native MUST provide, under a stated primitive contract, a tiled warm attention kernel with F32 accumulation and F32 output, published and pinnable before hf2q integrates it.
 
 Acceptance:
 
-- Starting point (Q3 v9, hf2q `5d421a2c`): the peer finishes 13.4% sooner (CI 10.6–16.2%, 20-block cap); the stock SSE-gap fairness gate fails at 1.047× (CI 1.036–1.058).
+- A linked mlx-native issue states the primitive contract before implementation: input layouts (F16 K cache, dequantized TQ-HB V, Q rows), sliding and global masks, scale and softcap, supported head dimensions, F32 accumulation and F32 output, and the tolerance against an F32 reference attention.
+
+- The draft F32-accumulate/F32-output patch from the closed PR #552, kept on branch `exp/gemma-tiled-precise` (`docs/research/adr063-gemma-tiled-precise-mlx-native.patch`, with the diagnosis in `docs/research/adr063-gemma-tiled-precise.md`), is the starting point; the branch is retained until the kernel lands or is falsified.
+
+- Primitive parity tests against an F32 reference attention and against the vec-hybrid route pass at Gemma 4 warm-resume shapes, and a microbenchmark compares it with `TiledF16` and `VecHybrid` at those shapes.
+
+- The kernel is merged, released, verified on crates.io and available for an exact hf2q pin.
+
+Repository ownership: mlx-native owns the kernel, its dispatcher, contract, parity tests, microbenchmarks and release. hf2q consumes it only through Q4-GEMMA.
+
+Validation: Independent review of the contract, the parity and microbenchmark receipts and the published release.
+
+Predecessors: none.
+
+Priority: High. Core scope (second-tier family).
+
+Delivery boundary: Published mlx-native release containing the primitive, pinned by hf2q for v0.1.30.
+
+### Q4-GEMMA. Profile the Gemma 4 gap and integrate the precise tiled warm attention
+
+Outcome: hf2q finishes the canonical Gemma 4 26B-A4B four-agent coding task at least 5% sooner than the peer in its best valid configuration, with the stock fairness gate passing.
+
+Requirement: The program MUST, in parallel, (a) profile hf2q and the peer by stage on the same run and (b) integrate the Q4-GEMMA-KERNEL primitive in hf2q, and MUST deliver a Gemma 4 configuration whose Q4 verdict is Win.
+
+Acceptance:
+
+- Starting point (Q3 v9, hf2q `5d421a2c`): the peer finishes 13.4% sooner (CI 10.6–16.2%, 20-block cap), measured against the peer with speculation off (`--spec-type none`); the stock SSE-gap fairness gate fails at 1.047× (CI 1.036–1.058).
+
+- Before the Q4 campaign, establish the peer's best valid Gemma 4 configuration (its speculation options), as D2 did for Qwen3.8. The gap may widen.
 
 - Track (a): a per-stage profile of hf2q and the peer on the same run attributes the gap (attention, MoE, dispatch/encode, scheduling, SSE cadence) with stated distortion.
 
-- Track (b): #544 set warm tiled attention default-off after `TiledF16` flipped a near-tie decision against `VecHybrid`; tiled-off costs Gemma about 7.8–9.2% (v9 review), and v7 with tiled on was still a Loss (1.058), so the kernel alone cannot be assumed to flip the verdict. The draft precise variant and its F32-accumulate/F32-output mlx-native patch from the closed PR #552 live on branch `exp/gemma-tiled-precise` (`docs/research/adr063-gemma-tiled-precise.md`, `docs/research/adr063-gemma-tiled-precise-mlx-native.patch`); that branch is retained until the kernel lands or is falsified.
-
-- The tiled kernel accumulates in 32-bit and passes mlx-native primitive parity against the vec-hybrid route; in hf2q it stays within the Q1 decision envelope and exactness classes (including the 0.10-nat near-tie policy) at the canonical divergence coordinate and passes the paired task-quality gates before it can become a default.
+- Track (b): #544 set warm tiled attention default-off after `TiledF16` flipped a near-tie decision against `VecHybrid`; tiled-off costs Gemma about 7.8–9.2% (v9 review), and v7 with tiled on was still a Loss (1.058), so the kernel alone cannot be assumed to flip the verdict. In hf2q the Q4-GEMMA-KERNEL route stays within the Q1 decision envelope and exactness classes (including the 0.10-nat near-tie policy) at the canonical divergence coordinate and passes the paired task-quality gates before it can become a default.
 
 - The stock SSE-gap max ratio returns within 1.025, and the family verdict meets the Q4 win definition and every Q4 gate on the release candidate.
 
-Repository ownership: mlx-native owns the tiled kernel, its dispatcher, parity tests and microbenchmarks, published and exactly pinned before hf2q consumes it. hf2q owns route selection, integration, profiling and the campaign.
+Repository ownership: hf2q owns route selection, integration, profiling and the campaign, consuming Q4-GEMMA-KERNEL at an exact published mlx-native pin.
 
-Validation: Independent review of the profile, the kernel parity and Q1-envelope receipts, the quality gates and the Q3-design hf2q-versus-peer campaign.
+Validation: Independent review of the profile, the Q1-envelope receipts, the quality gates and the Q3-design hf2q-versus-peer campaign.
 
-Predecessors: Q5.
+Predecessors: Q5, Q4-GEMMA-KERNEL (track (b) only; track (a) may start on Q5 alone).
 
 Priority: High. Core scope (second-tier family).
 
@@ -637,7 +667,7 @@ Delivery boundary: Release v0.1.30, or the first published hf2q release containi
 
 ### Q4-DS4. Run the peer on the ds4 DeepSeek-V4 file and compete on it
 
-Outcome: DeepSeek-V4 gets a runnable same-GGUF peer arm on the 128 GB host, and hf2q finishes the four-agent task on that file at least 5% sooner than the peer.
+Outcome: Whether the same-GGUF peer can run ds4's DeepSeek-V4 file on the 128 GB host is established; if it can, hf2q finishes the four-agent task on that file at least 5% sooner than the peer.
 
 Requirement: The program MUST establish whether the peer fits on this host with ds4's DeepSeek-V4 file and, if it fits, MUST support that file in hf2q and compare hf2q, the peer and ds4 on it.
 
@@ -645,19 +675,23 @@ Acceptance:
 
 - Starting point (Q3 v7): Unavailable; the same-GGUF peer runs out of memory on hf2q's DeepSeek-V4 artifact. On different artifacts hf2q `38485a23` finishes 5.2% sooner than ds4 (never a Win).
 
-- Step 1: run the peer alone on `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf` (86,720,111,488 bytes, sha256 `ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0`, re-hashed locally 2026-11-02): `deepseek4` architecture, the same 1,328 tensors, IQ2_XXS/Q2_K experts. Record fit or no-fit with Q5 live-stop receipts, one runtime at a time.
+- Step 1: run the peer alone on `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf` (86,720,111,488 bytes, sha256 `ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0`, re-hashed locally 2026-11-02; it sits in the ds4 peer directory `peers/ds4-c97964b/gguf/` under the hf2q data directory, not the `/opt/ds4/gguf/` path in `docs/research/adr063-q3-campaign.md`): `deepseek4` architecture, the same 1,328 tensors, IQ2_XXS/Q2_K experts. Record fit or no-fit with Q5 live-stop receipts, one runtime at a time.
 
-- If it does not fit, DeepSeek-V4 stays Unavailable with that evidence and step 2 does not start.
+- Fit = the peer, in its best valid configuration, completes the largest declared four-agent workload (4 slots × 262,144 context, matched settings) with Q5 `CalibrationPass`. Any context or slot reduction is an operator decision (Q5).
 
-- Step 2, only if it fits: add IQ2_XXS (GGML type 16) support: an hf2q loader, mlx-native Metal dequantize/matmul kernels with primitive parity against the reference dequantization, and quality checks (tensor-load parity, paired task-quality gate). Then run hf2q, the peer and ds4 on that one file under the Q3 design.
+- A no-fit result closes step 1, keeps DeepSeek-V4 Unavailable with that evidence and returns Q4-DS4 to the operator as `needs_decision`; step 2 does not start.
+
+- Step 2, only if it fits: consume the IQ2_XXS storage type, CPU dequantization and expert kernels of ADR-066 N1 (#580), N3 (#582) and N4 (#583), whose IQ2_XXS subset gains parity at DeepSeek-V4-Flash expert shapes (256 experts, top-6); no duplicate kernels. Add the hf2q loader for this file and the quality checks (tensor-load parity, paired task-quality gate). Then run hf2q, the peer and ds4 on that one file under the Q3 design.
+
+- A per-stage attribution of the hf2q-versus-peer gap on the same run (prefill, decode, MoE/attention, dispatch, scheduling, SSE cadence), with stated distortion.
 
 - The file is a benchmark comparison artifact, not a substitute for hf2q conversion. The family verdict meets the Q4 win definition and every Q4 gate.
 
-Repository ownership: mlx-native owns the IQ2_XXS kernels and their parity tests; hf2q owns the loader, quality checks, Q5 calibration and campaign.
+Repository ownership: mlx-native owns the IQ2_XXS kernels and their parity tests through ADR-066 N1/N3/N4; hf2q owns the loader for this file, quality checks, Q5 calibration and campaign.
 
 Validation: Independent review of the fit receipt and, after step 2, of the parity, quality and three-arm campaign receipts.
 
-Predecessors: Q5.
+Predecessors: Q5; for step 2, the IQ2_XXS subset of ADR-066 N1 (#580), N3 (#582) and N4 (#583), pulled ahead of ADR-066 B2 (operator decision, 2026-11-03).
 
 Priority: High. Core scope (first-tier family).
 
@@ -671,17 +705,21 @@ Requirement: The program MUST investigate the Qwen3.6 failure before choosing a 
 
 Acceptance:
 
-- Starting point (Q3 v10): Failed; the experiment and v0.1.28 both fail the canonical task (E0282, no repair turn) from the model weights (`docs/research/adr063-qwen36-task-failure-diagnosis.md`).
+- Starting point (Q3 v10): Failed; the experiment and v0.1.28 both fail the canonical task (E0282, no repair turn), diagnosed as coming from the model weights (`docs/research/adr063-qwen36-task-failure-diagnosis.md`).
 
-- Diff the harness against Qwen's recommended agentic setup, with sources: thinking mode, whether past reasoning is resent, system prompt and tool-call format. Re-run the 24-run check with the recommended setup on the peer and on hf2q.
+- The check used below is the 24-instance paired task campaign (Q1 numeric policy §3.5, `q1_decision_policy.py paired`) as in `adr063-qwen36-task-failure-diagnosis.md`, reporting instances passed per arm and the floor verdict.
 
-- Download third-party vanilla Q4_K_M GGUFs (ggml-org, unsloth) as diagnostic data only, not as a conversion substitute or a release artifact, and run the 24-run check on the peer and on hf2q with them.
+- Diff the harness against Qwen's recommended agentic setup, with sources: thinking mode, whether past reasoning is resent, system prompt and tool-call format. Re-run the check with the recommended setup on the peer and on hf2q.
 
-- Record the workload decision with this evidence; changing the canonical workload is an operator decision recorded in this ADR. The family verdict on that workload meets the Q4 win definition and every Q4 gate.
+- Download third-party vanilla Q4_K_M GGUFs (ggml-org, unsloth) as diagnostic data only, not as a conversion substitute or a release artifact, and run the check on the peer and on hf2q with them.
+
+- If Qwen3.6 stays BelowFloor under every setup tested, Q4-QWEN36 returns to the operator as `needs_decision` with that evidence.
+
+- Record the workload decision with this evidence; changing the canonical workload is an operator decision recorded in this ADR. On that workload, a per-stage attribution of the hf2q-versus-peer gap on the same run (prefill, decode, MoE/attention, dispatch, scheduling, SSE cadence) is recorded with stated distortion, and the family verdict meets the Q4 win definition and every Q4 gate.
 
 Repository ownership: hf2q owns the harness diff, templates/tool format, the checks and the campaign.
 
-Validation: Independent review of the setup diff, both 24-run checks and the subsequent Q3-design campaign.
+Validation: Independent review of the setup diff, both checks and the subsequent Q3-design campaign.
 
 Predecessors: Q5.
 
@@ -697,7 +735,7 @@ Requirement: The program MUST deliver a Qwen joint-decode forward witness/trace 
 
 Acceptance:
 
-- A full traced four-agent Qwen3.8 run leaves zero unmapped `joint_ordinary_decode` records (the Q2 closure found 43,008 unmapped per run).
+- `scripts/four_agent/f2_native_trace.py` reports `unmapped_operator_attempts == 0` for every `joint_ordinary_decode` forward of a full traced four-agent Qwen3.8 run (the Q2 closure QE §6 found 43,008 per run, as `forward_witness_unmapped` records with reason `NoActualInputManifest`).
 
 - The hook is off by default and fails closed; with it on, transcripts are `ExactTranscripts` against it off, and its timing overhead is measured and stated.
 
@@ -705,9 +743,9 @@ Acceptance:
 
 Repository ownership: mlx-native owns low-level trace support; hf2q owns the witness wiring, records and validation.
 
-Validation: Independent review of a traced run with zero unmapped records and the trace-on/off exactness control.
+Validation: Independent review of a traced run with `unmapped_operator_attempts == 0` and the trace-on/off exactness control.
 
-Predecessors: none.
+Predecessors: Q5.
 
 Priority: High. Core scope.
 
@@ -721,9 +759,13 @@ Requirement: The program MUST replace the borrowed serving-census preload floor 
 
 Acceptance:
 
-- The borrowed 119.18 GiB preload floor (`q1-closure-v1/README.md` §4.2) is replaced by a measured Q1 test-run footprint and a new resource policy that an independent reviewer accepts before the endpoint runs. If the measured footprint does not fit, the result is recorded as not runnable with evidence.
+- The borrowed 119.18 GiB preload floor (`$E/q1-closure-v1/README.md` §4.2) is replaced by a measured Q1 test-run footprint and a new resource policy that an independent reviewer accepts before the endpoint runs. If the measured footprint does not fit, the result is recorded as not runnable with evidence.
 
-- Run on the served artifact `DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf` (sha256 `50df7e3d…`) with a Q1 test binary built from main at or after `ea6caf46` (native 0.15.16); the composition is authored immediately before the family block.
+- The footprint measurement run uses Q5 live stops, with the effective floor as its cap.
+
+- The new policy reconciles the Q1 supervisor's normal-pressure-at-every-sample rule with Q5, where warning pressure is not a stop; every DeepSeek serving run here reached `warning` (README §4.2).
+
+- Run on the served artifact `DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf` (sha256 `50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6`) with a Q1 test binary built from main at or after `ea6caf46` (native 0.15.16); the composition is authored immediately before the family block.
 
 - `exact` T1 vs T3 is `ExactOnCommon` with restored-64 extras only and the receipt `full_active64_exact_restore {"Ok":n>0}`; `exact` T4 vs T0 and T7 vs T0 are `ExactEqual`.
 
@@ -781,7 +823,7 @@ Requirement: The program MUST re-run Qwen3.8 T1/T3 on a Q1 test binary built aft
 
 Acceptance:
 
-- The test binary is built from main at or after `ea6caf46` (the retained build `1d200821` predates #561, `9fc7b31b`).
+- Runs use a Q1 test binary from main at or after `ea6caf46` (the retained build `1d200821` predates #561, `9fc7b31b`) and before ADR-065 P4b (#527) or J1 (#512) merges (P4b changes solo K3 rollback). Otherwise pin a commit that precedes both and record that relation.
 
 - `exact` T1 vs T3 is `ExactOnCommon` with restored-64 extras only.
 
@@ -789,7 +831,7 @@ Repository ownership: hf2q owns the run and verdict.
 
 Validation: Independent review of the endpoint receipts.
 
-Predecessors: Q1. Ready now.
+Predecessors: Q1, Q5.
 
 Priority: Medium. Successor scope; does not gate Q4.
 
@@ -807,7 +849,7 @@ Acceptance:
 
 - Routing margins are Missing-with-reason (no Qwen3.6 routing witness); a verifier-route `RouteSensitive` result is reported, not called localized, unless a verifier-route localizer is added.
 
-- Runs land before ADR-065 changes the Qwen speculative-verify path, or are pinned to a pre-ADR-065 commit with that relation recorded.
+- Runs use a Q1 test binary from main at or after `ea6caf46` and before ADR-065 P4b (#527) or J1 (#512) merges (P4b changes solo K3 rollback). Otherwise pin a commit that precedes both and record that relation.
 
 Repository ownership: hf2q owns the run and verdict.
 
@@ -833,11 +875,13 @@ Acceptance:
 
 - The supervisor change is shared with Q1-GEMMA-T2LOC: one change, one admission review.
 
+- The comparison runs and is classified under the frozen rule; the receipt records the verdict.
+
 Repository ownership: hf2q owns the adapter, supervisor case and verdict.
 
 Validation: Independent review of the design, the frozen rule and the receipts.
 
-Predecessors: Q1, Q5. Shares the Q1-GEMMA-T2LOC supervisor change and its admission review.
+Predecessors: Q1, Q5, Q1-GEMMA-T2LOC (its supervisor change and admission review).
 
 Priority: Medium. Successor scope; does not gate Q4.
 
@@ -1248,30 +1292,53 @@ Win in any family):
   U+FFFD tool-argument fix (#553, a serving defect outside this ADR's
   stories). v0.1.30 is the speed program: Q4 and its family stories, C2,
   Q4-TRACE and the Q1 successors. v0.1.31 carries ADR-064 and the tracked
-  successor scope listed under "Successor watchlist".
+  successor scope listed under "Successor watchlist and tracked successor
+  scope".
 - **Q4 reframed.** Do not measure harder; understand why hf2q is slower than
   the peer on the same hardware and improve. All four families are targets,
   and the bar is "clearly faster": the Q4 win definition in Q4 (peer margin
   0.95), with the quality gates still required. Q4 becomes the umbrella
   closed by Q4-QWEN38, Q4-GEMMA, Q4-DS4 and Q4-QWEN36.
-- **ADR-065.** Its baseline freeze and deciding measurements (B1, E1–E8)
-  and P4a/P4b GPU DeltaNet restore join the speed program; its other build
-  stories join after the E8 gate decision. C2 builds on P4a/P4b, and
-  Q4-QWEN38 follows the E8 gate.
+- **Gemma 4.** A precise tiled attention kernel (32-bit accumulation, in
+  mlx-native) and a per-stage profile of hf2q against the peer proceed in
+  parallel (Q4-GEMMA-KERNEL, Q4-GEMMA).
+- **DeepSeek-V4.** Run the peer alone on ds4's file; if it fits, add IQ2_XXS
+  support and compare hf2q, the peer and ds4 on that file (Q4-DS4). The
+  IQ2_XXS subset of ADR-066 N1 (#580), N3 (#582) and N4 (#583) is pulled
+  forward ahead of ADR-066 B2; DeepSeek-V4 consumes it, with no duplicate
+  kernels.
+- **Qwen3.6.** Investigate the failure before choosing a speed workload
+  (Q4-QWEN36).
+- **ADR-065.** Its baseline freeze and deciding measurements, B1 (#503) and
+  E1–E8 (#504–#511), and P4a/P4b (#526/#527) GPU DeltaNet restore join the
+  speed program; J1 (#512) joins v0.1.30 as P4b's predecessor. Its other
+  build stories join after the E8 gate decision. C2 builds on P4a/P4b.
 - **Q1 successors.** All run on this Mac. #549 becomes Q1-DS4 with a
   measured footprint replacing the borrowed floor; #652 becomes
-  Q1-GEMMA-T2LOC; #653 is split into Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and
-  Q1-GEMMA-SPEC. Order against ADR-065: ADR-065 consumes Q1 Class A/B
-  unchanged and will change the Qwen speculative-verify paths, so
-  Q1-QWEN38-RERUN and Q1-QWEN36-SPEC run before that change or pin a
-  pre-ADR-065 commit. Q1-QWEN38-RERUN is ready now; Q1-GEMMA-T2LOC precedes
-  Q1-GEMMA-SPEC's runs because they share one supervisor change.
+  Q1-GEMMA-T2LOC as planned; #653 is split into Q1-QWEN38-RERUN,
+  Q1-QWEN36-SPEC and Q1-GEMMA-SPEC.
 - **C2** is built regardless of measured demand, on ADR-065 P4a/P4b, with
   joint-decode eligibility protected; its delivery moves to v0.1.30,
   superseding the 2026-10-30 v0.1.29 placement.
 - **v0.1.28 leftovers.** Only what the speed work needs is v0.1.30 scope
-  (Q4-TRACE); the remaining Q2/Q3/F2 leftovers are tracked successor scope,
-  v0.1.31.
+  (Q4-TRACE, the Qwen joint-decode trace hook). The remaining verification
+  leftovers are tracked successor scope, v0.1.31 (operator-confirmed).
+
+Sequencing derived from the planning reviews (not separate operator
+decisions): Q4-QWEN38 follows the ADR-065 E8 gate; ADR-065 consumes Q1
+Class A/B unchanged and P4b/J1 change the Qwen solo K3 rollback, so
+Q1-QWEN38-RERUN and Q1-QWEN36-SPEC run before P4b or J1 merges or pin a
+commit that precedes both; Q1-GEMMA-T2LOC's supervisor change precedes
+Q1-GEMMA-SPEC; the Gemma/DeepSeek multi-anchor parity and the DeepSeek
+selection witness in the v0.1.31 list come from the planning reviews.
+
+Execution entry. The measurement-only work may start once its listed
+predecessors are met: Q1-QWEN38-RERUN (ready now), Q1-QWEN36-SPEC, Q1-DS4,
+Q4-DS4 step 1, the Q4-QWEN36 investigation and the profiling track of
+Q4-GEMMA. Each implementation story or step (C2, Q4-TRACE,
+Q4-GEMMA-KERNEL, Q4-GEMMA track (b), Q4-DS4 step 2, the Q1-GEMMA-T2LOC
+hooks and supervisor change, the Q1-GEMMA-SPEC adapter) needs a recorded
+design approval before implementation.
 
 This amendment establishes no speed win, quality result or memory admission.
 
@@ -1308,11 +1375,11 @@ A v3 runtime packet MUST separately charge its additional allowed serialized I/O
 
 Both actual Rust config validation and strict Python artifact validation must reject legacy256MiB+1, v2 2GiB+1, v3 8GiB+1, unsupported or unbound profile, missing/non-diagnostic native observer and client under128MiB. Native live metadata above16MiB refuses in every profile; native events above1,000,000 refuse for legacy/v2 and above16,000,000 refuse for v3. No compression, omission, sampling, trimming, wrapping, favourable window, changed workload/context/output or rescore is permitted. Every quota/identity/lifecycle/unknown/drop failure still invalidates the comparison; complete native trace, Q2 certification and independent quality/performance acceptance remain open gates.
 
-## Successor watchlist (not committed v0.1.28 implementation scope)
+## Successor watchlist and tracked successor scope
 
-Gemma and DeepSeek multi-depth anchor implementations; production mixed-prefill policy after S1; queue-aware locality after traces; a native DFlash2/DSpark port after D2; lattice trees at a global four-slot row budget; NAX attention; scratch-lifetime synchronization removal; output/LSE shared-segment attention. Each needs its own measured deciding result, memory budget and approved design. ANE conversion/offload, approximate recurrent/nonprefix replay and custom-training-first plans remain excluded.
+Production mixed-prefill policy after S1; queue-aware locality after traces; a native DFlash2/DSpark port after D2; lattice trees at a global four-slot row budget; NAX attention; scratch-lifetime synchronization removal; output/LSE shared-segment attention. Each needs its own measured deciding result, memory budget and approved design. ANE conversion/offload, approximate recurrent/nonprefix replay and custom-training-first plans remain excluded.
 
-Tracked successor scope, v0.1.31 (operator decision 2026-11-03; not v0.1.30 speed-program scope):
+Tracked successor scope, v0.1.31 (operator-confirmed 2026-11-03; the last two items are carried from the planning reviews; not v0.1.30 speed-program scope):
 
 - **Q2 v3:** the `queued_forward_demand_v3` population counting rule with fresh traced n1/n4/3+1/2+2/1+3 cohorts (consuming the Q4-TRACE witness), the F1 multi-owner-epoch rule with a two-owner control before any DeepSeek-V4 or Gemma window is scored, the first positive hardware `q2_certify` certificate and the hardware one-slot/four-client width negative control.
 - **Q3/F2:** mixed stages against the best-valid (MTP) peer, the F2 fixed-six three-arm campaign with its cancellation/retry, divergent-edit and request-order permutation scenarios, and a separate QE identity.
