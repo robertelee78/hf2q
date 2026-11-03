@@ -878,19 +878,21 @@ async fn chat_completions_with_prepared(
             // completion_tokens when the decode loop captured them via
             // sampler_pure::sample_token_with_logprob_topk.  Each record
             // carries the emitted token id, its raw-softmax logprob, and
-            // the request's top-K alternatives; decode ids to text/bytes
-            // via the engine's tokenizer (skip_special_tokens=false,
-            // matching the decode loop's fragment decoding).
+            // the request's top-K alternatives; decode ids to text via the
+            // engine's tokenizer (skip_special_tokens=false, matching the
+            // decode loop) and report each token's raw bytes, which differ
+            // from the text for lone byte-fallback/byte-level pieces (#553).
             logprobs: result.logprobs.as_ref().map(|records| {
                 let tokenizer = engine.tokenizer();
                 let decode_id = |id: u32| tokenizer.decode(&[id], false).unwrap_or_default();
+                let raw_bytes = |id: u32| super::token_text::token_raw_bytes(tokenizer, id);
                 ChoiceLogprobs {
                     content: records
                         .iter()
                         .map(|record| {
                             let token_text = decode_id(record.token_id);
                             TokenLogprob {
-                                bytes: Some(token_text.clone().into_bytes()),
+                                bytes: Some(raw_bytes(record.token_id)),
                                 token: token_text,
                                 logprob: record.logprob,
                                 top_logprobs: record
@@ -899,7 +901,7 @@ async fn chat_completions_with_prepared(
                                     .map(|(id, lp)| {
                                         let alt_text = decode_id(*id);
                                         TopLogprobEntry {
-                                            bytes: Some(alt_text.clone().into_bytes()),
+                                            bytes: Some(raw_bytes(*id)),
                                             token: alt_text,
                                             logprob: *lp,
                                         }

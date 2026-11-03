@@ -139,18 +139,10 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
     )
     .map_err(|e| anyhow!("Split::new(\" \", MergedWithPrevious): {e}"))?;
 
-    let decoder_replace = NormReplace::new(SPM_SPACE, " ")
-        .map_err(|e| anyhow!("Decoder Replace {SPM_SPACE}→space: {e}"))?;
-    let decoder = DecSeq::new(vec![
-        DecoderWrapper::Replace(decoder_replace),
-        DecoderWrapper::ByteFallback(ByteFallback::new()),
-        DecoderWrapper::Fuse(Fuse::new()),
-    ]);
-
     let mut tok = Tokenizer::new(bpe);
     tok.with_normalizer(Some(normalizer));
     tok.with_pre_tokenizer(Some(pre));
-    tok.with_decoder(Some(decoder));
+    tok.with_decoder(Some(gemma4_decoder()?));
 
     let token_types = read_i32_array(gguf, "tokenizer.ggml.token_type").ok();
     if let Some(types) = &token_types {
@@ -195,6 +187,17 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
     }
 
     Ok(tok)
+}
+
+/// The Gemma4 decoder chain: `Replace("▁" → " ")`, `ByteFallback`, `Fuse`.
+pub(crate) fn gemma4_decoder() -> Result<DecSeq> {
+    let decoder_replace = NormReplace::new(SPM_SPACE, " ")
+        .map_err(|e| anyhow!("Decoder Replace {SPM_SPACE}→space: {e}"))?;
+    Ok(DecSeq::new(vec![
+        DecoderWrapper::Replace(decoder_replace),
+        DecoderWrapper::ByteFallback(ByteFallback::new()),
+        DecoderWrapper::Fuse(Fuse::new()),
+    ]))
 }
 
 fn read_string_array(gguf: &GgufFile, key: &str) -> Result<Vec<String>> {

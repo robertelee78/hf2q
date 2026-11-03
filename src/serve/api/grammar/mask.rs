@@ -210,7 +210,8 @@ pub fn sample_greedy_valid_token(
 /// Mask tokens whose byte-text would drive the grammar dead.
 ///
 /// `token_bytes[i]` is the UTF-8 text emitted when token id `i` is
-/// sampled (typically `tokenizer.decode(&[i], false)` bytes). Candidates are
+/// sampled (`token_text::token_raw_bytes`: the decoded text, or the raw
+/// bytes of a lone byte-fallback/byte-level piece). Candidates are
 /// decoded into one shared code-point arena and rejected against the live
 /// grammar stacks; rejected `logits[i]` are set to `f32::NEG_INFINITY`.
 ///
@@ -645,12 +646,7 @@ mod tests {
         });
         let vocab_size = tokenizer.get_vocab_size(true);
         let token_bytes = (0..vocab_size as u32)
-            .map(|id| {
-                tokenizer
-                    .decode(&[id], false)
-                    .unwrap_or_default()
-                    .into_bytes()
-            })
+            .map(|id| crate::serve::api::token_text::token_raw_bytes(&tokenizer, id))
             .collect::<Vec<_>>();
 
         let mut runtime = rt("root ::= \"\\\"\" [^\\\"]* \"\\\"\"\n", "root");
@@ -955,7 +951,7 @@ mod tests {
     // exercises that exact path.
     //
     // Methodology: mirror Engine::token_bytes_table's body
-    // (`tok.decode(&[id], false)` per id) and assert id 48 decodes to
+    // (`token_raw_bytes(tok, id)` per id) and assert id 48 decodes to
     // the literal 12-byte UTF-8 string "<|tool_call>". Then build a
     // grammar that requires that exact byte sequence at byte 0 and
     // confirm the mask leaves token 48 surviving (not pushed to
@@ -989,13 +985,12 @@ mod tests {
 
     /// Build the per-vocab byte table for a small id range using the
     /// SAME mechanism as `Engine::token_bytes_table`
-    /// (`tok.decode(&[id], false)`). Returns `Vec<Vec<u8>>` indexed by
+    /// (`token_raw_bytes(tok, id)`). Returns `Vec<Vec<u8>>` indexed by
     /// id from 0 to `up_to` exclusive.
     fn token_bytes_table_for_range(tok: &tokenizers::Tokenizer, up_to: u32) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(up_to as usize);
         for id in 0..up_to {
-            let s = tok.decode(&[id], false).unwrap_or_default();
-            out.push(s.into_bytes());
+            out.push(crate::serve::api::token_text::token_raw_bytes(tok, id));
         }
         out
     }
