@@ -32,7 +32,10 @@ concurrency:
 jobs:
   build-release-candidate:
     name: build exact packed Apple-Silicon candidate
-    runs-on: macos-latest
+    # Pinned image label: the floating "latest" label can move to a new
+    # macOS/Xcode/SDK silently and change the shipped Metal bytes. Bump
+    # deliberately, together with verify_standalone_candidate.sh.
+    runs-on: macos-26
     timeout-minutes: 90
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
@@ -40,6 +43,50 @@ jobs:
       CARGO_TERM_COLOR: always
       MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
+      # First step of every Release: fail within a minute when the crates.io
+      # credential is dead instead of after the 36-minute publish job. The
+      # token is scoped to this step only and no repository code has been
+      # checked out yet. /api/v1/me rejects API tokens, so the probe uses the
+      # side-effect-free token-creation refusal: crates.io authenticates the
+      # caller, then answers 400 "cannot use an API token to create a new API
+      # token" for a live token and 401/403 for an expired or revoked one.
+      - name: Release credential preflight (crates.io)
+        if: ${{ github.workflow == 'Release' }}
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN is not set; publish relies on crates.io Trusted Publishing (exchanged in the crates-publish job)"
+            exit 0
+          fi
+          body=$(mktemp)
+          trap 'rm -f "$body"' EXIT
+          status=$(curl --silent --show-error --output "$body" \
+            --write-out '%{http_code}' --max-time 30 \
+            --request POST https://crates.io/api/v1/me/tokens \
+            --header "Authorization: $CARGO_REGISTRY_TOKEN" \
+            --header 'Content-Type: application/json' \
+            --header 'User-Agent: hf2q-release-preflight (github.com/robertelee78/hf2q)' \
+            --data '{"api_token":{"name":"hf2q-release-preflight-probe"}}')
+          case "$status" in
+            400)
+              if grep -Fq 'cannot use an API token to create a new API token' "$body"; then
+                echo "crates.io credential preflight: CARGO_REGISTRY_TOKEN authenticates"
+                exit 0
+              fi
+              echo "::warning::crates.io preflight probe returned an unrecognized 400; credential not proven, continuing"
+              ;;
+            401|403)
+              echo "::error::CARGO_REGISTRY_TOKEN is expired, revoked, or invalid (HTTP $status). Rotate the secret, or delete it once crates.io Trusted Publishing is configured." >&2
+              exit 1
+              ;;
+            *)
+              echo "::warning::crates.io preflight probe returned HTTP $status; credential not proven, continuing"
+              ;;
+          esac
+
       - name: Checkout exact candidate
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -128,29 +175,9 @@ jobs:
             bash "$trusted_verifier" check-build-root \
               "$package_root" "$checkout_root" "$cargo_home" "$cargo_target"
           )
-          assert_macho_string_pool_aligned() {
-            local macho=$1
-            local stroff
-            stroff=$(/usr/bin/otool -l "$macho" | awk '
-              $1 == "cmd" && $2 == "LC_SYMTAB" { in_symtab = 1; next }
-              in_symtab && $1 == "cmd" { in_symtab = 0 }
-              in_symtab && $1 == "stroff" { print $2; exit }
-            ')
-            [[ -z "$stroff" || "$stroff" =~ ^[0-9]+$ ]]
-            if [[ -n "$stroff" && $((stroff % 8)) -ne 0 ]]; then
-              echo "misaligned Mach-O LINKEDIT string pool: $macho (stroff=$stroff)" >&2
-              exit 1
-            fi
-          }
-          dylib_count=0
-          while IFS= read -r -d '' dylib; do
-            assert_macho_string_pool_aligned "$dylib"
-            ((dylib_count += 1))
-          done < <(find "$cargo_target/release" -type f -name '*.dylib' -print0)
-          test "$dylib_count" -gt 0
+          bash "$checkout_root/scripts/assert_macho_string_pool_aligned.sh" \
+            "$cargo_target/release/hf2q" "$cargo_target/release"
           built_binary="$cargo_target/release/hf2q"
-          test -x "$built_binary"
-          assert_macho_string_pool_aligned "$built_binary"
           test "$(/usr/bin/lipo -archs "$built_binary")" = arm64
           test "$(/usr/bin/vtool -show-build "$built_binary" | awk '$1 == "minos" {print $2}')" = 14.0
           test "$("$built_binary" --version)" = \
@@ -165,12 +192,26 @@ jobs:
           chmod 0555 "$candidate_root/hf2q-unsigned"
           cp "$crate" "$candidate_root/hf2q-${EXPECTED_VERSION}.crate"
           cp -R "$provenance_stage/." "$candidate_root/dependency-provenance/"
+          # Record the build host so an image, Xcode, or SDK move is visible
+          # in the receipt (and asserted by verify_standalone_candidate.sh).
+          macos_product_version=$(/usr/bin/sw_vers -productVersion)
+          macos_build_version=$(/usr/bin/sw_vers -buildVersion)
+          xcode_version=$(/usr/bin/xcodebuild -version | paste -sd ';' - | sed 's/;/; /g')
+          sdk_version=$(/usr/bin/xcrun --show-sdk-version)
+          runner_image_os=${ImageOS:?ImageOS is required on hosted runners}
+          runner_image_version=${ImageVersion:?ImageVersion is required on hosted runners}
           jq -nS \
             --arg source_sha "$EXPECTED_SHA" \
             --arg version "$EXPECTED_VERSION" \
             --arg crate_sha256 "$crate_sha" \
             --arg binary_sha256 "$built_sha" \
-            '{kind:"hf2q.standalone-build-candidate",schema_version:1,source_sha:$source_sha,version:$version,target:"aarch64-apple-darwin",minimum_macos:"14.0",crate_sha256:$crate_sha256,unsigned_binary_sha256:$binary_sha256}' \
+            --arg macos_product_version "$macos_product_version" \
+            --arg macos_build_version "$macos_build_version" \
+            --arg xcode_version "$xcode_version" \
+            --arg sdk_version "$sdk_version" \
+            --arg runner_image_os "$runner_image_os" \
+            --arg runner_image_version "$runner_image_version" \
+            '{kind:"hf2q.standalone-build-candidate",schema_version:2,source_sha:$source_sha,version:$version,target:"aarch64-apple-darwin",minimum_macos:"14.0",crate_sha256:$crate_sha256,unsigned_binary_sha256:$binary_sha256,build_host:{macos_product_version:$macos_product_version,macos_build_version:$macos_build_version,xcode_version:$xcode_version,sdk_version:$sdk_version,runner_image_os:$runner_image_os,runner_image_version:$runner_image_version}}' \
             > "$candidate_root/build.json"
           chmod 0444 "$candidate_root/build.json" \
             "$candidate_root/hf2q-${EXPECTED_VERSION}.crate"
@@ -207,7 +248,7 @@ jobs:
   sign-release-candidate:
     name: Developer ID sign and notarize exact candidate
     needs: build-release-candidate
-    runs-on: macos-latest
+    runs-on: macos-26
     environment: apple-release
     timeout-minutes: 60
     env:
@@ -232,6 +273,22 @@ jobs:
           git fetch origin main
           git merge-base --is-ancestor "$EXPECTED_SHA" origin/main
           git diff --exit-code
+
+      # Fail fast on dead Apple credentials before the candidate download. It
+      # never touches candidate bytes; the checked-out script is the same
+      # trusted source as the signer below.
+      - name: Release credential preflight (Apple signing and notary)
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ vars.APPLE_DEVELOPER_ID_APPLICATION }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_CODESIGN_IDENTIFIER: ${{ vars.APPLE_CODESIGN_IDENTIFIER }}
+        run: bash scripts/preflight_apple_release_credentials.sh
 
       - name: Download exact build candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -260,13 +317,16 @@ jobs:
             --arg source_sha "$EXPECTED_SHA" \
             --arg version "$EXPECTED_VERSION" '
               .kind == "hf2q.standalone-build-candidate"
-              and .schema_version == 1
+              and .schema_version == 2
               and .source_sha == $source_sha
               and .version == $version
               and .target == "aarch64-apple-darwin"
               and .minimum_macos == "14.0"
               and (.crate_sha256 | test("^[0-9a-f]{64}$"))
               and (.unsigned_binary_sha256 | test("^[0-9a-f]{64}$"))
+              and (.build_host.macos_product_version | test("^[0-9]+(\\.[0-9]+)*$"))
+              and (.build_host.sdk_version | test("^[0-9]+(\\.[0-9]+)*$"))
+              and (.build_host.runner_image_version | length > 0)
             ' "$build_receipt" >/dev/null
           unsigned="$build_root/hf2q-unsigned"
           chmod 0555 "$unsigned"

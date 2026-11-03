@@ -10,8 +10,9 @@ name: CI
 # Job layout (independent runners in parallel; CONTRIBUTING.md
 # "Continuous integration" has the rationale):
 #   * release   — BLOCKING. mlx-native environment guard, package-list
-#                 contract, cargo build --release, the exact-binary
-#                 frictionless preflight, cargo audit (prebuilt
+#                 contract, cargo build --release, the Mach-O LINKEDIT
+#                 alignment check, the exact-binary frictionless preflight,
+#                 cargo audit (prebuilt
 #                 cargo-audit), and the activate() warning-matrix smoke,
 #                 which confirms the HF2Q_UNSAFE_EXPERIMENTS ack gate
 #                 (docs/shipping-contract.md) still refuses/activates/warns.
@@ -20,8 +21,9 @@ name: CI
 #                 not expose a usable residency set; real Metal tests require
 #                 a self-hosted Apple Silicon gate.
 #   * contracts — BLOCKING. cargo check --all-targets (the only compile of the
-#                 integration-test targets the tests job does not run),
-#                 shell-script syntax and contract scripts, and the GCD Python
+#                 integration-test targets the tests job does not run), the
+#                 same check on the packed crate, shell-script syntax and
+#                 contract scripts, and the GCD Python
 #                 suites. None of these needs a test or release build.
 #   * lint      — INFORMATIONAL (continue-on-error). cargo fmt --check (the
 #                 baseline carries ~700 rustfmt diffs from earlier style
@@ -153,6 +155,14 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release --locked
+
+      # The standalone candidate build refuses a misaligned LINKEDIT string
+      # pool. Run the same script on the PR's release build so the failure
+      # lands on the PR, not after a release dispatch.
+      - name: Mach-O LINKEDIT string-pool alignment
+        run: |
+          bash scripts/assert_macho_string_pool_aligned.sh \
+            target/release/hf2q target/release
 
       # Run the packed/public binary's complete PTY contract right after the
       # release build. Conflicting outer color preferences prove that the
@@ -667,6 +677,31 @@ jobs:
       - name: cargo check
         run: cargo check --locked --all-targets --all-features
 
+      # Release builds and checks the *packed* crate, not the checkout. A file
+      # missing from the package (e.g. a test fixture) only shows up there,
+      # so check the packed crate on every PR. The target dir is the cached
+      # checkout target, so dependencies are not rebuilt.
+      - name: cargo check of the packed crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          cargo package --locked --no-verify
+          crate="$GITHUB_WORKSPACE/target/package/hf2q-${version}.crate"
+          test -s "$crate"
+          package_stage=$(mktemp -d "$RUNNER_TEMP/hf2q-ci-package.XXXXXX")
+          /usr/bin/tar -xzf "$crate" -C "$package_stage"
+          package_root=$(cd "$package_stage/hf2q-${version}" && pwd -P)
+          case "$package_root/" in
+            "$GITHUB_WORKSPACE/"*)
+              echo "packed root must be outside the checkout" >&2
+              exit 1
+              ;;
+          esac
+          cd "$package_root"
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+            cargo check --locked --all-targets --all-features
+
       # Shell syntax and offline contract scripts. They use scratch fixtures
       # only; no test or release build is needed. (test_standalone_installer.sh
       # needs target/debug/hf2q and stays in the tests job.)
@@ -709,8 +744,12 @@ jobs:
             scripts/seal_release_binary.sh \
             scripts/test_release_binary_seal_contract.sh \
             scripts/sign_notarize_standalone_release.sh \
+            scripts/preflight_apple_release_credentials.sh \
+            scripts/assert_macho_string_pool_aligned.sh \
+            scripts/release.sh \
             scripts/verify_standalone_candidate.sh \
             scripts/test_standalone_release_signing_contract.sh \
+            scripts/test_release_workflow_reliability_contract.sh \
             scripts/verify_release_dependency_provenance.sh \
             scripts/test_release_dependency_provenance_contract.sh \
             scripts/run_release_gate_process_group.sh \
@@ -747,6 +786,7 @@ jobs:
           bash scripts/test_qwen38_matched_reference_contract.sh
           bash scripts/test_release_binary_seal_contract.sh
           bash scripts/test_standalone_release_signing_contract.sh
+          bash scripts/test_release_workflow_reliability_contract.sh
           bash scripts/test_release_dependency_provenance_contract.sh
           bash scripts/test_release_gate_process_group_contract.sh
           bash scripts/test_cache_lifecycle_evidence_contract.sh

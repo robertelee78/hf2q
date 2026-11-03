@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Release reliability: Release now fails within its first minute on a rejected crates.io token and at the start of signing on bad Apple credentials. It publishes via crates.io Trusted Publishing, falling back to `CARGO_REGISTRY_TOKEN` until that is configured. Publish no longer runs after a failed candidate build. A fresh dispatch replaces stale assets on a still-draft release, while published releases stay immutable. Release jobs are pinned to `macos-26`, and the candidate `build.json` (schema 2) records and verifies the macOS, Xcode, SDK and runner image. `scripts/release.sh` dispatches a release and re-runs the same run's jobs when a hosted runner is never acquired.
+- PR CI now checks the packed crate (`cargo check --all-targets` in the unpacked `cargo package` root) and the Mach-O LINKEDIT string-pool alignment of the release build. Before, these ran only during a release.
+
 ## [0.1.29] — 2026-11-03
 
 ### Changed

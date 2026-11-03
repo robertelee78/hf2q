@@ -281,6 +281,13 @@ public and verifies its unauthenticated downloads and production-trust
 installer. Immutable standalone assets are never uploaded with overwrite
 authority, and stable-release workflow runs are globally serialized.
 
+Note (2026-11-03): immutability applies to published releases. A
+still-draft release is not public, and candidate builds are not
+byte-reproducible across runs, so a fresh Release dispatch deletes and
+re-uploads a draft asset that differs from its own candidate (logged). A
+published release still refuses any differing or missing asset, and no asset
+is ever uploaded with `--clobber`.
+
 The installer never owns `$HOME/.hf2q`, model directories, Hugging Face
 caches, or another application. If `$HOME/.local/bin` is not on `PATH`, it
 prints one exact shell instruction instead of silently rewriting unrelated
