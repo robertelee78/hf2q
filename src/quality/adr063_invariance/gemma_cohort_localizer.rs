@@ -232,7 +232,14 @@ mod controls {
         let first_decode = lane0.iter().position(|e| e.at.logical_row_start >= 128).unwrap();
         assert!(lane0[first_decode..].windows(2).all(|w| w[0].at.logical_row_start <= w[1].at.logical_row_start));
         assert!(lane0[..first_decode].iter().all(|e| e.at.logical_row_start < 128));
-        assert!(bytes <= STAGE_PAYLOAD_CAP && bytes > 100 * 1024 * 1024);
+        // Two sliding layers, 4 lanes: prefill 512 rows x (3x[16,256] + 3x[8,256]
+        // + 5x[2816] F32 + 128 logits + 2x top-8), decode 64 rows x (Norm + Q,K,
+        // RopeQ,RopeK,V,Attn + FfnNorm + router + LayerOutput).
+        let prefill_row = 3 * 16 * 256 * 4 + 3 * 8 * 256 * 4 + 5 * 2816 * 4 + 128 * 4 + 8 * 4 + 8 * 4;
+        let decode_row = 3 * 2816 * 4 + 3 * 16 * 256 * 4 + 3 * 8 * 256 * 4 + 128 * 4 + 8 * 4 + 8 * 4;
+        assert_eq!(bytes, 2 * (512 * prefill_row + 64 * decode_row) as u64);
+        assert_eq!(bytes, 147_595_264);
+        assert!(bytes <= STAGE_PAYLOAD_CAP);
         // Global layer 5: 2 KV heads x 512.
         let (_, global, _) = manifest(&cfg, &[5], &[Stage::Key], &[]).unwrap();
         assert_eq!(global.len(), 512);

@@ -190,8 +190,9 @@ fn cohort_localizer_export(c:&Config,l:&CohortLocalizer,cfg:&crate::serve::confi
                 "prefill_stages":l.prefill_stages,"decode_stages":l.decode_stages,"host_payload_limit":stage_bytes},
             "lanes":[0,1,2,3],"expected_stores":{cohort::ENDPOINT_STORE:endpoint,cohort::STAGE_STORE:stages}});
         let encoded=serde_json::to_vec_pretty(&packet)?;
-        // The supervisor rewrites the packet indent-2; keep room below the 16 MiB read.
-        ensure!(encoded.len()*2<=16*1024*1024,"cohort packet must fit the localizer read after re-indent");
+        // The supervisor rewrites the packet indent-2 (the same layout) and fills
+        // its bindings; keep 1 MiB of room below the 16 MiB localizer read.
+        ensure!(encoded.len()+1024*1024<=16*1024*1024,"cohort packet must fit the localizer read after the supervisor fill");
         let file=format!("cohort-localizer-packet-{name}.json");
         routes.push(serde_json::json!({"rerun_id":rerun_id,"trajectory":trajectory,"filter":filter,
             "stage_route":cohort::route(trajectory).map_err(anyhow::Error::msg)?,"packet":{"file":file,"sha256":hash(&encoded)},
