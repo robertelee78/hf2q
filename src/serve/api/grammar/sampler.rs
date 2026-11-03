@@ -148,12 +148,46 @@ pub struct PartialUtf8 {
     pub n_remain: i8,
 }
 
+/// Classify a UTF-8 lead byte under Unicode Table 3-7 (well-formed byte
+/// sequences): returns the continuation-byte count and the lead's payload
+/// bits. Continuation bytes, the overlong leads C0/C1 and F5–FF (beyond
+/// U+10FFFF) are never leads.
+fn utf8_lead(first: u8) -> Option<(i8, u32)> {
+    match first {
+        0x00..=0x7F => Some((0, first as u32)),
+        0xC2..=0xDF => Some((1, (first & 0x1F) as u32)),
+        0xE0..=0xEF => Some((2, (first & 0x0F) as u32)),
+        0xF0..=0xF4 => Some((3, (first & 0x07) as u32)),
+        _ => None,
+    }
+}
+
+/// Whether `byte` may extend `partial` under Unicode Table 3-7. Beyond the
+/// `10xxxxxx` form, the byte right after E0, ED, F0 and F4 is restricted so
+/// no overlong (E0 80–9F, F0 80–8F), surrogate (ED A0–BF) or above-U+10FFFF
+/// (F4 90–BF) sequence is ever accepted. `(n_remain, value)` identifies
+/// "just after the lead" uniquely: a 4-byte sequence that reaches
+/// `n_remain == 2` has `value >= 0x10` once its own second byte is checked.
+fn utf8_continuation_ok(partial: PartialUtf8, byte: u8) -> bool {
+    if byte & 0xC0 != 0x80 {
+        return false;
+    }
+    match (partial.n_remain, partial.value) {
+        (2, 0x0) => byte >= 0xA0,
+        (2, 0xD) => byte <= 0x9F,
+        (3, 0x0) => byte >= 0x90,
+        (3, 0x4) => byte <= 0x8F,
+        _ => true,
+    }
+}
+
 /// Decode one token's bytes into the shared code-point arena, continuing a
 /// partial UTF-8 sequence inherited from the live grammar runtime.
 ///
-/// This deliberately matches [`GrammarRuntime::accept_bytes`]: malformed
-/// lead/continuation bytes reject the candidate, while an incomplete trailing
-/// code point is retained in `PartialUtf8` for the next sampled token.
+/// This deliberately matches [`GrammarRuntime::accept_bytes`]: ill-formed
+/// lead/continuation bytes (Unicode Table 3-7) reject the candidate, while an
+/// incomplete trailing code point is retained in `PartialUtf8` for the next
+/// sampled token.
 pub(super) fn decode_candidate_utf8(
     bytes: &[u8],
     partial_start: PartialUtf8,
@@ -168,7 +202,7 @@ pub(super) fn decode_candidate_utf8(
     if partial.n_remain > 0 {
         while i < bytes.len() && partial.n_remain > 0 {
             let byte = bytes[i];
-            if (byte & 0xC0) != 0x80 {
+            if !utf8_continuation_ok(partial, byte) {
                 return None;
             }
             partial.value = (partial.value << 6) | (byte & 0x3F) as u32;
@@ -184,15 +218,7 @@ pub(super) fn decode_candidate_utf8(
 
     while i < bytes.len() {
         let first = bytes[i];
-        let (needed, mut value) = if first & 0x80 == 0 {
-            (0i8, first as u32)
-        } else if first & 0xE0 == 0xC0 {
-            (1, (first & 0x1F) as u32)
-        } else if first & 0xF0 == 0xE0 {
-            (2, (first & 0x0F) as u32)
-        } else if first & 0xF8 == 0xF0 {
-            (3, (first & 0x07) as u32)
-        } else {
+        let Some((needed, mut value)) = utf8_lead(first) else {
             return None;
         };
         i += 1;
@@ -200,7 +226,13 @@ pub(super) fn decode_candidate_utf8(
         let mut remain = needed;
         while i < bytes.len() && remain > 0 {
             let byte = bytes[i];
-            if (byte & 0xC0) != 0x80 {
+            if !utf8_continuation_ok(
+                PartialUtf8 {
+                    value,
+                    n_remain: remain,
+                },
+                byte,
+            ) {
                 return None;
             }
             value = (value << 6) | (byte & 0x3F) as u32;
@@ -347,7 +379,8 @@ pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8)
     let shift = (n_remain as u32) * 6;
     let mut low = partial.value << shift;
     let mask = if shift == 0 { 0 } else { (1u32 << shift) - 1 };
-    let high = low | mask;
+    // Completions never exceed the last scalar value (F4 8F BF BF).
+    let high = (low | mask).min(0x10FFFF);
     if low == 0 {
         if n_remain == 2 {
             low = 1 << 11;
@@ -1297,7 +1330,7 @@ impl GrammarRuntime {
             let mut partial = self.partial_utf8;
             while i < bytes.len() && partial.n_remain > 0 {
                 let b = bytes[i];
-                if (b & 0xC0) != 0x80 {
+                if !utf8_continuation_ok(partial, b) {
                     self.partial_utf8 = PartialUtf8 {
                         value: 0,
                         n_remain: -1,
@@ -1325,23 +1358,21 @@ impl GrammarRuntime {
         // Now consume full code points from `bytes[i..]`.
         while i < bytes.len() {
             let first = bytes[i];
-            let (needed, mut val) = if first & 0x80 == 0 {
-                (0usize, first as u32)
-            } else if first & 0xE0 == 0xC0 {
-                (1, (first & 0x1F) as u32)
-            } else if first & 0xF0 == 0xE0 {
-                (2, (first & 0x0F) as u32)
-            } else if first & 0xF8 == 0xF0 {
-                (3, (first & 0x07) as u32)
-            } else {
+            let Some((needed, mut val)) = utf8_lead(first) else {
                 self.stacks.clear();
                 return false;
             };
             i += 1;
-            let mut remain = needed as i8;
+            let mut remain = needed;
             while remain > 0 && i < bytes.len() {
                 let b = bytes[i];
-                if (b & 0xC0) != 0x80 {
+                if !utf8_continuation_ok(
+                    PartialUtf8 {
+                        value: val,
+                        n_remain: remain,
+                    },
+                    b,
+                ) {
                     self.stacks.clear();
                     return false;
                 }
