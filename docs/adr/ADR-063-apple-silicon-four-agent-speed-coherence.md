@@ -4,7 +4,7 @@
 - **Date:** 2026-10-22
 - **Updated:** 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA, Q4-DS4 and Q4-QWEN36 plus Q4-TRACE; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b, frozen limits, delivery v0.1.30); remaining Q2/Q3/F2/parity leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
-- **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28
+- **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28, v0.1.30
 - Stable source ID: ADR-063
 - Audited baseline: hf2q `5d1ffe7f1c5cf4ba5ffca452ec4bde738231beef` / v0.1.27.
 - Research cutoff: 2026-10-22; [research evidence and sources](../research/apple-silicon-speed-parity-2026-10-22.md).
@@ -36,7 +36,7 @@ This is one performance program spanning two owned repositories. Every Metal com
 
 For every winning change that modifies `mlx-native`, record separate immutable native and hf2q commits and PRs. Complete native correctness/performance review and merge, publish a new native version through its release workflow, verify the crates.io archive checksum and downloaded-archive tests, then pin that exact registry version/checksum in hf2q `Cargo.toml`/`Cargo.lock` and its dependency-provenance verifier. Rebuild hf2q from a clean registry-resolving tree and qualify the combined configuration. A local path patch is spike evidence only.
 
-Q4 MUST publish both updated packages when native changes are included: the required `mlx-native` crate/version/tag first, followed by the qualified hf2q v0.1.28 crate and signed/notarized standalone release artifacts. Verify public package/asset bytes, dependency provenance and clean installs through each repository's existing release gates. Native publication alone does not deliver the hf2q integration; hf2q publication against an unpublished native revision is forbidden. If the winning subset does not change native code, explicitly record the already-published native version and verify it rather than inventing a native release.
+Q4 MUST publish both updated packages when native changes are included: the required `mlx-native` crate/version/tag first, followed by the qualified hf2q crate of v0.1.30 (or the first release containing each family's accepted configuration) and signed/notarized standalone release artifacts. Verify public package/asset bytes, dependency provenance and clean installs through each repository's existing release gates. Native publication alone does not deliver the hf2q integration; hf2q publication against an unpublished native revision is forbidden. If the winning subset does not change native code, explicitly record the already-published native version and verify it rather than inventing a native release.
 
 Keep this document's existing work keys as the program's acceptance ledger. For any native implementation, link a separately scoped `mlx-native` issue/PR with its primitive contract and tests to the owning story before implementation. Do not duplicate kernels or turn hf2q tickets into permission to edit native policy without a contract. Native implementation delivery is merged and published native code; the hf2q story's own boundary additionally requires pinned integration and its declared end-to-end evidence. One integration owner reconciles the exact combined configuration.
 
@@ -645,7 +645,7 @@ Acceptance:
 
 - Starting point (Q3 v7): Unavailable; the same-GGUF peer runs out of memory on hf2q's DeepSeek-V4 artifact. On different artifacts hf2q `38485a23` finishes 5.2% sooner than ds4 (never a Win).
 
-- Step 1: run the peer alone on `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf` (86,720,111,488 bytes, sha256 `ca22ae2f…` per HF LFS metadata, re-hashed locally before use): `deepseek4` architecture, the same 1,328 tensors, IQ2_XXS/Q2_K experts. Record fit or no-fit with Q5 live-stop receipts, one runtime at a time.
+- Step 1: run the peer alone on `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf` (86,720,111,488 bytes, sha256 `ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0`, re-hashed locally 2026-11-02): `deepseek4` architecture, the same 1,328 tensors, IQ2_XXS/Q2_K experts. Record fit or no-fit with Q5 live-stop receipts, one runtime at a time.
 
 - If it does not fit, DeepSeek-V4 stays Unavailable with that evidence and step 2 does not start.
 
@@ -845,7 +845,7 @@ Delivery boundary: Measured evidence merged to main for v0.1.30.
 
 ## Coverage and sequencing
 
-F1 precedes F2; F2 is the scoreboard that renders every measured lane, but since 2026-10-30 it no longer gates other stories. F3 precedes C1 because the checkpoint contract must reflect current graft and persistence behavior. A family's Q5 calibration precedes that family's hardware experiments and retained-state expansion; families do not wait on each other. Qwen implementation C2 follows C1 and moves to v0.1.29. Gemma/DeepSeek multi-anchor implementation, mixed-policy production work, queue-aware admission, new native block drafters/lattice trees, NAX attention and scratch-wait changes are successor candidates after the primary deciding measurements, not promised v0.1.28 features. S1 and D2 record deciding evidence before successor designs. Q1's numerical-invariance evidence informs shared target batching, speculation and numerical kernels, which must still prove exactness against their own serial reference. Different edits to a shared file require merge coordination, not invented product dependencies.
+F1 precedes F2; F2 is the scoreboard that renders every measured lane, but since 2026-10-30 it no longer gates other stories. F3 precedes C1 because the checkpoint contract must reflect current graft and persistence behavior. A family's Q5 calibration precedes that family's hardware experiments and retained-state expansion; families do not wait on each other. Qwen implementation C2 follows C1 and ADR-065 P4a/P4b and is delivered in v0.1.30 (see "Speed program, Q1 successors and release mapping (operator decisions, 2026-11-03)"). Gemma/DeepSeek multi-anchor implementation, mixed-policy production work, queue-aware admission, new native block drafters/lattice trees, NAX attention and scratch-wait changes are successor candidates after the primary deciding measurements, not promised v0.1.28 features. S1 and D2 record deciding evidence before successor designs. Q1's numerical-invariance evidence informs shared target batching, speculation and numerical kernels, which must still prove exactness against their own serial reference. Different edits to a shared file require merge coordination, not invented product dependencies.
 
 All acceptance, exclusions, failed-path requirements and the winning-subset release rule above are material source obligations and must be represented in the awa extraction coverage. Numerical or API-semantic failures stop promotion. A negative experiment is valuable measured evidence, not a shipped feature; no performance estimate in the research report is an acceptance receipt.
 
@@ -1267,9 +1267,8 @@ Win in any family):
   pre-ADR-065 commit. Q1-QWEN38-RERUN is ready now; Q1-GEMMA-T2LOC precedes
   Q1-GEMMA-SPEC's runs because they share one supervisor change.
 - **C2** is built regardless of measured demand, on ADR-065 P4a/P4b, with
-  joint-decode eligibility protected; its delivery moves to v0.1.30. This
-  supersedes the 2026-10-30 "C2 moves to v0.1.29" placement in "Coverage and
-  sequencing".
+  joint-decode eligibility protected; its delivery moves to v0.1.30,
+  superseding the 2026-10-30 v0.1.29 placement.
 - **v0.1.28 leftovers.** Only what the speed work needs is v0.1.30 scope
   (Q4-TRACE); the remaining Q2/Q3/F2 leftovers are tracked successor scope,
   v0.1.31.
