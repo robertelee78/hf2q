@@ -194,7 +194,7 @@ all-F16/BF16 validation and outputs unchanged.
 | Dispatcher | Kernel entry point(s) | Use |
 |---|---|---|
 | `dispatch_flash_attn_prefill_precise_d256` | `flash_attn_prefill_precise_d256_v32`, `…_v16` (and `…_vcodes` if §3.7 option c is chosen) | sliding layers: external mask plus optional `blk`, or the in-kernel window (§3.4) |
-| `dispatch_flash_attn_prefill_precise_d512_resume` | `flash_attn_prefill_precise_d512_vcodes`, `…_v16` | global layers: causal resume with `q_offset_in_k`. K and V are read **in place** from the slot's global cache with a `kv_capacity` head stride (§3.8). |
+| `dispatch_flash_attn_prefill_precise_d512_resume` | `flash_attn_prefill_precise_d512_vcodes`, `…_v16`, and `…_v32` (parity-only, §5.1 P9; hf2q never dispatches it, which an hf2q unit test asserts) | global layers: causal resume with `q_offset_in_k`. K and V are read **in place** from the slot's global cache with a `kv_capacity` head stride (§3.8). |
 
 The names are proposals. The binding parts are:
 - one dispatcher per head-dim family;
@@ -390,14 +390,50 @@ The contract therefore bounds it:
   - mlx-native P10 (§5.1) proves the in-place stride handling.
   - hf2q A7 (§8.2) proves that the cache rows read in place are bitwise the
     rows `linearize_rows` compacts for `TiledF16` today.
-- **d256 dense scratch is bounded by the window.** With `kL ≤ 2,047`, dense F32
-  V is at most 8 × 2,047 × 256 × 4 B ≈ 16.8 MB per sliding chunk and dense F16
-  K at most 8.4 MB. Per-sequence, per-layer warm scratch is therefore at most
-  about 26 MB on sliding layers plus the Q/O scratch (`qL × 16 × D × 6` B ≤
-  50 MB at qL = 4096, D = 512), independent of context length.
-- The hf2q integration records peak transient allocation per warm forward
-  (§8.1 observability). A Gemma long-context Q5 receipt on the `precise` arm
-  (§9.2) proves the bound at served context.
+- **d256 dense scratch is bounded by the window.** Sliding `kL ≤ 2,047`, so
+  the K/V scratch per sliding chunk is at most 8.4 MB (F16 K) + 16.8 MB (F32
+  V), independent of context length.
+- **Q and O32 scratch scale with the chunk rows.** A global chunk at
+  qL = 4096, D = 512 carries Q 67.1 MB + O32 134.2 MB ≈ 201 MB.
+
+**Frozen TOTAL formula.** It is an upper bound on one warm forward's transient
+scratch. `[INFERENCE]` It assumes every chunk's scratch stays alive until the
+command buffer completes, because Metal retains buffers referenced by an
+encoded command buffer.
+
+Per sliding chunk with `L` query rows and `kL = min(start, cap − 1) + L`
+keys:
+
+    S(L, kL) = 4096·kL (K F16) + 8192·kL (V F32; 0 under `_vcodes`)
+             + 8192·L (Q F16) + 16384·L (O32)
+             + 2·L·kL (mask; 0 with the in-kernel window)
+             + ceil(L/BQ)·ceil(kL/BK) (blk)
+
+Per global chunk with `L` rows:
+
+    G(L) = 16384·L (Q F16) + 32768·L (O32)
+
+The formula then sums over sequences:
+
+    seq   = 25 · Σ_sliding chunks S(L, kL) + 5 · Σ_global chunks G(L)
+    TOTAL = Σ over the forward's sequences (joint lanes, or 1 for a
+            single-slot resume) of seq
+            + the existing vec-hybrid scratch when any lane is under 32 rows
+
+Worked values:
+- A full 1,024-row sliding chunk at kL = 2,047 gives S ≈ 54.5 MB.
+- A 4,096-row sequence gives about 25 × 4 × 54.5 MB + 5 × 201 MB ≈ 6.5 GB
+  with the external mask.
+- `TiledF16` today allocates the same per sliding chunk: its F16 V and extra
+  O16 replace the F32 V. On global chunks it allocates more (dense K/V plus
+  O16). `[INFERENCE]` So `TiledF32` ≤ `TiledF16` at every shape.
+
+Checks:
+- The warm forward logs its observed peak scratch bytes and the TOTAL
+  computed from its own logged shapes (§8.1 observability).
+- The long-context Q5 receipt (§9.2) passes only if every logged peak is
+  ≤ its TOTAL.
+- Memory admission itself stays Q5's job.
 
 ## 4. Starting point and branch hygiene
 
@@ -457,8 +493,8 @@ ref)/rms(ref)` and `nmax = max|O − ref| / max|ref|`.
 | P6 | masks | external mask plus `blk` and the in-kernel predicate (if adopted) are bitwise equal, and both match the predicate reference |
 | P7 | no regression | every existing `flash_attn_prefill*` entry point gives bitwise its 0.15.16 output on fixed seeds (golden digests recorded before the change) |
 | P8 | origin | `pipeline_identity(...).origin` asserted per path; cross-path O digest equality recorded |
-| P9 | `_vcodes` values | in-kernel V values are bitwise equal to the `tq_dequantize_hb_kv_seq` output (a debug dump entry or an O-equality test against `_v32` on d256) |
-| P10 | d512 in place | `_vcodes` with `kv_capacity > kL` and NaN-poisoned rows in `[kL, kv_capacity)` gives bitwise the O of `_vcodes` on a compacted copy (`kv_capacity = kL`) |
+| P9 | `_vcodes` values | method: the `_vcodes` O is bitwise equal to the `_v32` O of the same template (d256 `_v32`; d512 parity-only `_v32`), fed `tq_dequantize_hb_kv_seq` output for the same codes and norms, on both paths. Both entries share all arithmetic except the V load, so O equality proves the in-kernel V values equal the dequant output. |
+| P10 | d512 in place | `_vcodes` with `kv_capacity > kL` gives bitwise the O of `_vcodes` on a compacted copy (`kv_capacity = kL`). Rows `[kL, kv_capacity)` are poisoned: K F16 = NaN, V norms = NaN, V codes = 0xFF. |
 
 N1–N3 are diagnostic. Each must fail its bound, which proves that the
 mismatch alone is detectable at served shapes. Their recorded magnitudes split
@@ -466,6 +502,11 @@ mismatch alone is detectable at served shapes. Their recorded magnitudes split
 They also make the cost of requiring F32 V evidence-based. If N2 turns out to
 be negligible beside N1 and N3, that is recorded, but the F32 V requirement
 stands: vec-hybrid's V is F32.
+
+**An unexpected pass of N1, N2 or N3 blocks §5** until it is explained in
+the receipt. A pass means the test cannot detect that mismatch at that shape,
+so the bounds or shapes are suspect. Bounds are not loosened to explain it
+(Q1 §3.7).
 
 Bound rationale `[INFERENCE]`: the F32 error of a 256- or 512-term dot
 product plus a ≤ 2,048-key online softmax sits near √n · 2⁻²⁴ ≈ 3e-6
@@ -544,8 +585,8 @@ run.
   single-sequence cells are reported but do not gate.
 - M2 (reported, not gated): the precise/`TiledF16` ratio on the same cells.
   Above 1.5 is flagged, because the projected saving shrinks.
-- M3 (reported): long-context stress cells and their peak transient
-  allocation, checked against the §3.8 bound.
+- M3 (reported): long-context stress cells, with their peak transient
+  allocation against the §3.8 TOTAL for the same shapes.
 - The §3.7 option and the window-predicate choice: the fastest variant that
   passes §5.1, with ties broken by the simpler code.
 
@@ -582,7 +623,13 @@ consumes a path dependency.
   dequantized at all under §3.7 option c (`_vcodes`);
 - global (d512) layers: **no K compaction and no V scratch**. The dispatch
   reads the slot's global F16 K cache and TQ-HB V codes and norms (or F16 V
-  cache) in place with `kv_capacity = src_capacity` (§3.8);
+  cache) in place with `kv_capacity = src_capacity` (§3.8). Because nothing
+  is compacted, the dispatch itself must declare its reads. Before the d512
+  dispatch, `s.barrier_between(&[k_cache, v_codes, v_norms (or v_f16),
+  &q_f16], &[&out_f32_head])` orders it after this layer's `write_kv_rows`
+  suffix append on the concurrent encoder. `TiledF16`'s compaction got that
+  ordering from its own declared reads. An hf2q unit test asserts the
+  declaration, and A1/A2 cover it on hardware;
 - keeps the Q F32 → F16 permute;
 - for sliding layers, builds the mask, fences and builds `blk`, or uses the
   in-kernel window, per §6;
@@ -612,9 +659,9 @@ silent fall-back to another kernel is not allowed.
 - New `active_controls.gemma_warm_attention_kernel` in `/hf2q/v1/runtime`
   (`src/serve/api/measurement.rs`), so Q5 receipts bind the arm.
 - The Q5 `gemma4` case gains a readiness check of that field per arm.
-- The warm forward logs its peak transient scratch bytes (sum of the live
-  per-layer K/V/Q/O scratch). The long-context Q5 receipt (§9.2) checks it
-  against the §3.8 bound.
+- The warm forward logs its observed peak transient scratch bytes and the
+  §3.8 TOTAL computed from its own shapes. The long-context Q5 receipt
+  (§9.2) requires every logged peak ≤ its TOTAL.
 
 Surfaces updated in the same change:
 - `scripts/serve_gemma4_opencode.sh` accepts `0|1|precise`.
@@ -678,12 +725,15 @@ arms `VecHybrid` control, `TiledF16` baseline, `TiledF32`).
 Rule (frozen):
 - **Prefix condition.** Every generated token of the `precise` arm before
   the decision coordinate must equal the `0` arm's.
-- **Earlier divergence.** If the `precise` arm diverges earlier, its first
-  differing token is judged as the decision row instead. E2 fails there when
-  the `0` arm's margin at that row is ≥ 0.10 nat, or D > 0.25.
-  - If both are below their bounds, (a) and (b) are judged at that row and
-    the replay is not continued past it.
-  - The canonical coordinate is then reported as not reached.
+- **Earlier divergence.** If the `precise` arm diverges before the canonical
+  coordinate, the replay stops at its first differing token. That row is a
+  **defined non-pass outcome**, never a pass:
+  - **Fail** if the `0` arm's margin at that row is ≥ 0.10 nat or D > 0.25.
+    Disposal: the route is falsified (§8.5).
+  - **Inconclusive** otherwise (a near-tie row, D ≤ 0.25). This goes to the
+    operator as `needs_decision`. Disposal: as for an E2(c)-only miss
+    (§8.5). The operator weighs D at that row, E1 and §9.1.
+  - The canonical coordinate is reported as not reached in both cases.
 - **At the decision row**, with D computed against the `0` arm, `precise`
   must have:
   - (a) the same raw top-1;
@@ -736,15 +786,15 @@ It also runs the Q5 calibration unit tests, the env-surface audit
 
 ### 8.5 Falsification outcomes
 
-- **Fails E1, the localization bound, or E2 (a)/(b)/prefix:** the route is
-  falsified for default use. Record the receipts. The kernel may still ship
-  in mlx-native. **hf2q removes the `precise` value and the `TiledF32`
-  variant** in a clean cutover. The `1` arm (`TiledF16`) already provides the
-  speed A/B surface. Gemma's Win then has to come entirely from the other
-  profiled stages (§10).
-- **E2(c)-only miss:** `precise` stays opt-in, default `VecHybrid`, until
-  the operator rules on the `needs_decision` (§8.3). It is then promoted or
-  removed per the ruling.
+- **Fails E1, the localization bound, E2 (a)/(b), or an earlier-divergence
+  Fail:** the route is falsified for default use. Record the receipts. The
+  kernel may still ship in mlx-native. **hf2q removes the `precise` value and
+  the `TiledF32` variant** in a clean cutover. The `1` arm (`TiledF16`)
+  already provides the speed A/B surface. Gemma's Win then has to come
+  entirely from the other profiled stages (§10).
+- **E2(c)-only miss or earlier-divergence Inconclusive:** `precise` stays
+  opt-in, default `VecHybrid`, until the operator rules on the
+  `needs_decision` (§8.3). It is then promoted or removed per the ruling.
 - **Passes E1/E2 but fails M1 or the §9.2 speed gate:** the speed basis is
   falsified. The default stays `VecHybrid`.
 
@@ -824,7 +874,8 @@ long-context workload variant (PR #551). It uses a new
 `q5_cases/qwen38-long-context.json`. The run must:
 - pass `CalibrationPass`;
 - complete the task;
-- log a peak transient scratch within the §3.8 bound.
+- log, for every warm forward, a peak transient scratch ≤ the §3.8 TOTAL
+  computed from that forward's logged shapes.
 
 A failure blocks promotion.
 
@@ -866,7 +917,8 @@ candidate, never per experiment.
 `TiledF32` becomes the default (§8.1 table) only when all of these hold:
 - §5 passed and the version is published and pinned;
 - A1–A7 and the localization bound passed;
-- E1 and E2 passed (or an E2(c)-only `needs_decision` ruled in favour), and
+- E1 and E2 passed (or an E2(c)-only or earlier-divergence Inconclusive
+  `needs_decision` ruled in favour), and
   E3 is recorded;
 - the long-context receipt (§9.2) passed;
 - §9.1 is `Pass`;
@@ -948,11 +1000,12 @@ It does not change the route design.
 
 ## 11. Recorded decisions (reviewer recommendations, ReviewGemmaKernelDesign)
 
-1. **Falsified route:** if E1, the localization bound or E2 (a)/(b)/prefix
-   falsify `TiledF32`, the `precise` value and the variant are removed (clean
-   cutover). The `1` arm keeps the speed A/B surface. The one exception is an
-   E2(c)-only `needs_decision`: `precise` stays opt-in until the operator
-   rules (§8.5).
+1. **Falsified route:** if E1, the localization bound, E2 (a)/(b) or an
+   earlier-divergence Fail falsify `TiledF32`, the `precise` value and the
+   variant are removed (clean
+   cutover). The `1` arm keeps the speed A/B surface. The exceptions are an
+   E2(c)-only miss or an earlier-divergence Inconclusive (`needs_decision`):
+   `precise` stays opt-in until the operator rules (§8.5).
 2. **τ stays 0.25 nat.** Q1 §3.7 forbids changing tie thresholds or learning
    tolerances. The 0.365-nat cold-versus-warm gap shows the coordinate is
    route-sensitive, not that τ is wrong. What the operator weighs in an
