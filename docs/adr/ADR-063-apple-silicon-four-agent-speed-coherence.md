@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope, F1/F3 execution entry, the separately reviewed F2/Q1/Q2/C1 source implementation entry and the 2026-11-03 measurement-only entry (see "Speed program, Q1 successors and release mapping"); other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA, Q4-DS4 and Q4-QWEN36, with Q4-GEMMA-KERNEL (mlx-native) and Q4-TRACE; Q4-DS4 consumes the IQ2_XXS subset of ADR-066 N1/N3/N4 pulled ahead of ADR-066 B2; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b with J1 joining v0.1.30, frozen limits, delivery v0.1.30); remaining verification leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
+- **Updated:** 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with Q4-DS4-RACE, and Q4-QWEN36, with Q4-GEMMA-KERNEL (mlx-native) and Q4-TRACE; the measurement tracks Q4-GEMMA (profiling) and Q4-DS4 (fit) are split from their implementation tracks and their designs are operator-approved; Q4-DS4-RACE consumes the IQ2_XXS subset of ADR-066 N1/N3/N4 pulled ahead of ADR-066 B2; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b with J1 joining v0.1.30, frozen limits, delivery v0.1.30); remaining verification leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28, v0.1.30
 - Stable source ID: ADR-063
@@ -516,7 +516,7 @@ Delivery boundary: Measured evidence or qualified implementation merged to main 
 
 Outcome: The program understands why hf2q is slower than the peer on the same Mac and becomes clearly faster: per family, the published hf2q finishes the canonical four-agent coding task at least 5% sooner than the peer in its best valid configuration, with quality gates passing.
 
-Requirement: The program MUST explain, per family, where hf2q loses time against the peer on the M5 Max 128 GB and MUST deliver, for each of Qwen3.8, DeepSeek-V4, Qwen3.6 and Gemma 4, a configuration whose Q4 verdict is Win, with the declared quality, fairness and memory gates intact. Q4 is the umbrella story; it closes through the per-family stories Q4-QWEN38, Q4-GEMMA, Q4-DS4 and Q4-QWEN36.
+Requirement: The program MUST explain, per family, where hf2q loses time against the peer on the M5 Max 128 GB and MUST deliver, for each of Qwen3.8, DeepSeek-V4, Qwen3.6 and Gemma 4, a configuration whose Q4 verdict is Win, with the declared quality, fairness and memory gates intact. Q4 is the umbrella story; it closes through the per-family stories Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with Q4-DS4-RACE, and Q4-QWEN36.
 
 Acceptance:
 
@@ -538,13 +538,13 @@ Acceptance:
 
 - The Q1 successors (Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC, Q1-GEMMA-SPEC) do not gate Q4. DeepSeek-V4 quality for Q4 is the paired task-quality gate plus the S3 bitwise joint == serial check.
 
-- Q4 cannot close until every family story is Win or the operator records a re-scope of that family in this ADR. A family that cannot reach Win keeps its verdict of record (Loss, Unavailable or Failed) with evidence.
+- Q4 cannot close until every family is Win or the operator records a re-scope of that family in this ADR. A family's Win is measured in its closing story: Q4-QWEN38, Q4-GEMMA-ATTN (after the Q4-GEMMA profile), Q4-DS4-RACE (after the Q4-DS4 fit result) and Q4-QWEN36. A family that cannot reach Win keeps its verdict of record (Loss, Unavailable or Failed) with evidence; a Q4-DS4 no-fit or a Q4-QWEN36 BelowFloor result goes to the operator as `needs_decision`.
 
 Repository ownership: The integration owner coordinates two release chains: merge/publish/verify mlx-native updates first, pin and clean-build hf2q, then qualify and publish the hf2q crate plus signed standalone artifacts. Record both package versions/checksums, immutable source commits, native PRs and all four independent model verdicts.
 
 Validation: Independent review of the combined candidate and raw receipts, followed by exact-artifact release verification on the target Apple host.
 
-Predecessors: F3, Q2, Q3, Q5, Q4-QWEN38, Q4-GEMMA, Q4-DS4, Q4-QWEN36.
+Predecessors: F3, Q2, Q3, Q5, Q4-QWEN38, Q4-GEMMA, Q4-GEMMA-ATTN, Q4-DS4, Q4-DS4-RACE, Q4-QWEN36.
 
 Priority: High. Core scope.
 
@@ -627,7 +627,7 @@ Acceptance:
 
 - The kernel is merged, released, verified on crates.io and available for an exact hf2q pin.
 
-Repository ownership: mlx-native owns the kernel, its dispatcher, contract, parity tests, microbenchmarks and release. hf2q consumes it only through Q4-GEMMA.
+Repository ownership: mlx-native owns the kernel, its dispatcher, contract, parity tests, microbenchmarks and release. hf2q consumes it only through Q4-GEMMA-ATTN.
 
 Validation: Independent review of the contract, the parity and microbenchmark receipts and the published release.
 
@@ -637,61 +637,111 @@ Priority: High. Core scope (second-tier family).
 
 Delivery boundary: Published mlx-native release containing the primitive, pinned by hf2q for v0.1.30.
 
-### Q4-GEMMA. Profile the Gemma 4 gap and integrate the precise tiled warm attention
+### Q4-GEMMA. Profile the Gemma 4 gap to the peer
 
-Outcome: hf2q finishes the canonical Gemma 4 26B-A4B four-agent coding task at least 5% sooner than the peer in its best valid configuration, with the stock fairness gate passing.
+Outcome: The Gemma 4 26B-A4B gap to the peer in its best valid configuration is attributed by stage on the same run.
 
-Requirement: The program MUST, in parallel, (a) profile hf2q and the peer by stage on the same run and (b) integrate the Q4-GEMMA-KERNEL primitive in hf2q, and MUST deliver a Gemma 4 configuration whose Q4 verdict is Win.
+Requirement: The program MUST establish the peer's best valid Gemma 4 configuration and MUST profile hf2q and that peer by stage on the same run.
 
 Acceptance:
 
 - Starting point (Q3 v9, hf2q `5d421a2c`): the peer finishes 13.4% sooner (CI 10.6–16.2%, 20-block cap), measured against the peer with speculation off (`--spec-type none`); the stock SSE-gap fairness gate fails at 1.047× (CI 1.036–1.058).
 
-- Before the Q4 campaign, establish the peer's best valid Gemma 4 configuration (its speculation options), as D2 did for Qwen3.8. The gap may widen.
+- Establish the peer's best valid Gemma 4 configuration (its speculation options), as D2 did for Qwen3.8, before any Q4 campaign. The gap may widen.
 
-- Track (a): a per-stage profile of hf2q and the peer on the same run attributes the gap (attention, MoE, dispatch/encode, scheduling, SSE cadence) with stated distortion.
+- A per-stage profile of hf2q and the peer on the same run attributes the gap (attention, MoE, dispatch/encode, scheduling, SSE cadence) with stated distortion, including the share attributable to warm attention and to the stock SSE-gap regression.
 
-- Track (b): #544 set warm tiled attention default-off after `TiledF16` flipped a near-tie decision against `VecHybrid`; tiled-off costs Gemma about 7.8–9.2% (v9 review), and v7 with tiled on was still a Loss (1.058), so the kernel alone cannot be assumed to flip the verdict. In hf2q the Q4-GEMMA-KERNEL route stays within the Q1 decision envelope and exactness classes (including the 0.10-nat near-tie policy) at the canonical divergence coordinate and passes the paired task-quality gates before it can become a default.
+- The profile names the stages Q4-GEMMA-ATTN and any further Gemma change must close; it makes no speed claim by itself.
 
-- The stock SSE-gap max ratio returns within 1.025, and the family verdict meets the Q4 win definition and every Q4 gate on the release candidate.
+Repository ownership: hf2q owns profiling wiring, the peer configuration search and the profile record.
 
-Repository ownership: hf2q owns route selection, integration, profiling and the campaign, consuming Q4-GEMMA-KERNEL at an exact published mlx-native pin.
+Validation: Independent review of the peer best-configuration evidence and the per-stage profile from raw receipts.
 
-Validation: Independent review of the profile, the Q1-envelope receipts, the quality gates and the Q3-design hf2q-versus-peer campaign.
+Predecessors: Q5 (#371).
 
-Predecessors: Q5, Q4-GEMMA-KERNEL (track (b) only; track (a) may start on Q5 alone).
+Priority: High. Core scope (second-tier family).
+
+Delivery boundary: Measured evidence merged to main for v0.1.30.
+
+### Q4-GEMMA-ATTN. Integrate the precise tiled warm attention and close the Gemma 4 gap
+
+Outcome: hf2q finishes the canonical Gemma 4 26B-A4B four-agent coding task at least 5% sooner than the peer in its best valid configuration, with the stock fairness gate passing.
+
+Requirement: The program MUST integrate the Q4-GEMMA-KERNEL primitive in hf2q under the Q1 exactness/envelope and quality gates, and MUST deliver a Gemma 4 configuration whose Q4 verdict is Win.
+
+Acceptance:
+
+- A written design, approved before implementation, states the route selection, kill switch and how the integration addresses the stages the Q4-GEMMA profile attributes.
+
+- #544 set warm tiled attention default-off after `TiledF16` flipped a near-tie decision against `VecHybrid`; tiled-off costs Gemma about 7.8–9.2% (v9 review), and v7 with tiled on was still a Loss (1.058), so the kernel alone cannot be assumed to flip the verdict. Any further change the profile requires is scoped with its own design.
+
+- In hf2q the Q4-GEMMA-KERNEL route stays within the Q1 decision envelope and exactness classes (including the 0.10-nat near-tie policy) at the canonical divergence coordinate and passes the paired task-quality gates before it can become a default.
+
+- The stock SSE-gap max ratio returns within 1.025, and the family verdict against the peer's best valid configuration (from Q4-GEMMA) meets the Q4 win definition and every Q4 gate on the release candidate.
+
+Repository ownership: hf2q owns route selection, integration and the campaign, consuming Q4-GEMMA-KERNEL at an exact published mlx-native pin.
+
+Validation: Independent review of the design, the Q1-envelope receipts, the quality gates and the Q3-design hf2q-versus-peer campaign.
+
+Predecessors: Q4-GEMMA-KERNEL, Q4-GEMMA (#660, profiling result), Q5 (#371).
 
 Priority: High. Core scope (second-tier family).
 
 Delivery boundary: Release v0.1.30, or the first published hf2q release containing the accepted Gemma 4 configuration.
 
-### Q4-DS4. Run the peer on the ds4 DeepSeek-V4 file and compete on it
+### Q4-DS4. Run the peer on the ds4 DeepSeek-V4 file and determine fit
 
-Outcome: Whether the same-GGUF peer can run ds4's DeepSeek-V4 file on the 128 GB host is established; if it can, hf2q finishes the four-agent task on that file at least 5% sooner than the peer.
+Outcome: Whether the same-GGUF peer can run ds4's DeepSeek-V4 file on the 128 GB host is established, and the peer's per-stage behavior on it is recorded.
 
-Requirement: The program MUST establish whether the peer fits on this host with ds4's DeepSeek-V4 file and, if it fits, MUST support that file in hf2q and compare hf2q, the peer and ds4 on it.
+Requirement: The program MUST establish whether the peer fits on this host with ds4's DeepSeek-V4 file and, if it fits, MUST record a per-stage attribution against hf2q.
 
 Acceptance:
 
 - Starting point (Q3 v7): Unavailable; the same-GGUF peer runs out of memory on hf2q's DeepSeek-V4 artifact. On different artifacts hf2q `38485a23` finishes 5.2% sooner than ds4 (never a Win).
 
-- Step 1: run the peer alone on `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf` (86,720,111,488 bytes, sha256 `ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0`, re-hashed locally 2026-11-02; it sits in the ds4 peer directory `peers/ds4-c97964b/gguf/` under the hf2q data directory, not the `/opt/ds4/gguf/` path in `docs/research/adr063-q3-campaign.md`): `deepseek4` architecture, the same 1,328 tensors, IQ2_XXS/Q2_K experts. Record fit or no-fit with Q5 live-stop receipts, one runtime at a time.
+- Run the peer alone on `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf` (86,720,111,488 bytes, sha256 `ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0`, re-hashed locally 2026-11-02; it sits in the ds4 peer directory `peers/ds4-c97964b/gguf/` under the hf2q data directory, not the `/opt/ds4/gguf/` path in `docs/research/adr063-q3-campaign.md`): `deepseek4` architecture, the same 1,328 tensors, IQ2_XXS/Q2_K experts. Record fit or no-fit with Q5 live-stop receipts, one runtime at a time.
 
 - Fit = the peer, in its best valid configuration, completes the largest declared four-agent workload (4 slots × 262,144 context, matched settings) with Q5 `CalibrationPass`. Any context or slot reduction is an operator decision (Q5).
 
-- A no-fit result closes step 1, keeps DeepSeek-V4 Unavailable with that evidence and returns Q4-DS4 to the operator as `needs_decision`; step 2 does not start.
+- A no-fit result closes this story, keeps DeepSeek-V4 Unavailable with that evidence and returns the family to the operator as `needs_decision`; Q4-DS4-RACE does not start.
 
-- Step 2, only if it fits: consume the IQ2_XXS storage type, CPU dequantization and expert kernels of ADR-066 N1 (#580), N3 (#582) and N4 (#583), whose IQ2_XXS subset gains parity at DeepSeek-V4-Flash expert shapes (256 experts, top-6); no duplicate kernels. Add the hf2q loader for this file and the quality checks (tensor-load parity, paired task-quality gate). Then run hf2q, the peer and ds4 on that one file under the Q3 design.
+- If it fits: a per-stage profile of the peer on that file (prefill, decode, MoE/attention, dispatch, scheduling, SSE cadence) set against hf2q's per-stage profile on its DeepSeek-V4 artifact at the same workload, with stated distortion and the artifact difference disclosed. The same-file attribution follows in Q4-DS4-RACE.
 
-- A per-stage attribution of the hf2q-versus-peer gap on the same run (prefill, decode, MoE/attention, dispatch, scheduling, SSE cadence), with stated distortion.
+- The file is a benchmark comparison artifact, not a substitute for hf2q conversion.
 
-- The file is a benchmark comparison artifact, not a substitute for hf2q conversion. The family verdict meets the Q4 win definition and every Q4 gate.
+Repository ownership: hf2q owns the peer run, Q5 receipts, profiles and the fit record.
+
+Validation: Independent review of the fit receipt and the per-stage profiles.
+
+Predecessors: Q5 (#371).
+
+Priority: High. Core scope (first-tier family).
+
+Delivery boundary: Measured evidence merged to main for v0.1.30.
+
+### Q4-DS4-RACE. Support the ds4 file in hf2q and race hf2q, the peer and ds4 on it
+
+Outcome: hf2q finishes the four-agent task on ds4's DeepSeek-V4 file at least 5% sooner than the peer in its best valid configuration.
+
+Requirement: The program MUST support the IQ2_XXS ds4 file in hf2q by consuming the ADR-066 IQ2_XXS subset and MUST compare hf2q, the peer and ds4 on that one file.
+
+Acceptance:
+
+- A written design, approved before implementation, states the loader, tensor mapping and quality checks for this file.
+
+- Consume the IQ2_XXS storage type, CPU dequantization and expert kernels of ADR-066 N1 (#580), N3 (#582) and N4 (#583), whose IQ2_XXS subset gains parity at DeepSeek-V4-Flash expert shapes (256 experts, top-6); no duplicate kernels. Add the hf2q loader for this file and the quality checks (tensor-load parity, paired task-quality gate).
+
+- Fresh Q5 calibration of hf2q on this file, then run hf2q, the peer and ds4 on it under the Q3 design.
+
+- A per-stage attribution of the hf2q-versus-peer gap on the same file and run (prefill, decode, MoE/attention, dispatch, scheduling, SSE cadence), with stated distortion.
+
+- The family verdict meets the Q4 win definition and every Q4 gate.
 
 Repository ownership: mlx-native owns the IQ2_XXS kernels and their parity tests through ADR-066 N1/N3/N4; hf2q owns the loader for this file, quality checks, Q5 calibration and campaign.
 
-Validation: Independent review of the fit receipt and, after step 2, of the parity, quality and three-arm campaign receipts.
+Validation: Independent review of the design, the parity and quality receipts and the three-arm campaign.
 
-Predecessors: Q5; for step 2, the IQ2_XXS subset of ADR-066 N1 (#580), N3 (#582) and N4 (#583), pulled ahead of ADR-066 B2 (operator decision, 2026-11-03).
+Predecessors: Q4-DS4 (#661, fit result), ADR-066 N1 (#580), N3 (#582), N4 (#583) (IQ2_XXS subset, pulled ahead of ADR-066 B2, operator decision 2026-11-03), Q5 (#371).
 
 Priority: High. Core scope (first-tier family).
 
@@ -1298,15 +1348,17 @@ Win in any family):
   the peer on the same hardware and improve. All four families are targets,
   and the bar is "clearly faster": the Q4 win definition in Q4 (peer margin
   0.95), with the quality gates still required. Q4 becomes the umbrella
-  closed by Q4-QWEN38, Q4-GEMMA, Q4-DS4 and Q4-QWEN36.
+  closed by Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with
+  Q4-DS4-RACE, and Q4-QWEN36.
 - **Gemma 4.** A precise tiled attention kernel (32-bit accumulation, in
   mlx-native) and a per-stage profile of hf2q against the peer proceed in
-  parallel (Q4-GEMMA-KERNEL, Q4-GEMMA).
-- **DeepSeek-V4.** Run the peer alone on ds4's file; if it fits, add IQ2_XXS
-  support and compare hf2q, the peer and ds4 on that file (Q4-DS4). The
-  IQ2_XXS subset of ADR-066 N1 (#580), N3 (#582) and N4 (#583) is pulled
-  forward ahead of ADR-066 B2; DeepSeek-V4 consumes it, with no duplicate
-  kernels.
+  parallel (Q4-GEMMA-KERNEL, Q4-GEMMA); the hf2q integration follows both
+  (Q4-GEMMA-ATTN).
+- **DeepSeek-V4.** Run the peer alone on ds4's file (Q4-DS4); if it fits,
+  add IQ2_XXS support and compare hf2q, the peer and ds4 on that file
+  (Q4-DS4-RACE). The IQ2_XXS subset of ADR-066 N1 (#580), N3 (#582) and
+  N4 (#583) is pulled forward ahead of ADR-066 B2; DeepSeek-V4 consumes it,
+  with no duplicate kernels.
 - **Qwen3.6.** Investigate the failure before choosing a speed workload
   (Q4-QWEN36).
 - **ADR-065.** Its baseline freeze and deciding measurements, B1 (#503) and
@@ -1334,11 +1386,18 @@ selection witness in the v0.1.31 list come from the planning reviews.
 
 Execution entry. The measurement-only work may start once its listed
 predecessors are met: Q1-QWEN38-RERUN (ready now), Q1-QWEN36-SPEC, Q1-DS4,
-Q4-DS4 step 1, the Q4-QWEN36 investigation and the profiling track of
-Q4-GEMMA. Each implementation story or step (C2, Q4-TRACE,
-Q4-GEMMA-KERNEL, Q4-GEMMA track (b), Q4-DS4 step 2, the Q1-GEMMA-T2LOC
-hooks and supervisor change, the Q1-GEMMA-SPEC adapter) needs a recorded
-design approval before implementation.
+Q4-DS4, the Q4-QWEN36 investigation and Q4-GEMMA. Each implementation
+story (C2, Q4-TRACE, Q4-GEMMA-KERNEL, Q4-GEMMA-ATTN, Q4-DS4-RACE, the
+Q1-GEMMA-T2LOC hooks and supervisor change, the Q1-GEMMA-SPEC adapter)
+needs a recorded design approval before implementation.
+
+Design approval of the measurement tracks (operator, 2026-11-03): the
+operator approved the designs of Q4-QWEN36 (#662), Q4-DS4 (#661, the fit
+determination), Q4-GEMMA (#660, the profiling track), Q1-QWEN38-RERUN
+(#664), Q1-DS4 (#549), Q1-GEMMA-T2LOC (#652) and ADR-065 B1/E1–E8
+(#503–#511). Q4-DS4 and Q4-GEMMA were split from their implementation
+tracks (Q4-DS4-RACE, Q4-GEMMA-ATTN) so that per-issue tracker blockers do
+not hold the approved measurement work.
 
 This amendment establishes no speed win, quality result or memory admission.
 
