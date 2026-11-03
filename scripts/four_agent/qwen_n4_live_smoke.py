@@ -107,7 +107,7 @@ def preflight(base):
         "pool_profile_selection_verified"}
 
 
-def validate_preflight(value, base, engine_kind="hf2q", family="qwen"):
+def validate_preflight(value, base, engine_kind="hf2q", family="qwen", setup=None):
     family_contract.validate_selection(family, engine_kind, 4)
     keys = family_contract.preflight(preflight(base), family)
     if engine_kind == "peer":
@@ -116,6 +116,9 @@ def validate_preflight(value, base, engine_kind="hf2q", family="qwen"):
     elif engine_kind in family_contract.ADAPTER_KINDS:
         from native_peers import adapter
         keys = adapter(engine_kind).preflight(keys, family)
+    if setup is not None:
+        import request_setup
+        keys = request_setup.preflight(keys, setup)
     require(isinstance(value, dict) and set(value) == keys and
             all(v is True for v in value.values()), "four-slot actual pool selection/preflight")
 
@@ -242,10 +245,11 @@ def phase_trigger(directory, agents, run, token):
 
 
 def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen", instance_record=None,
-              phase_plan=None, variant_record=None):
+              phase_plan=None, variant_record=None, request_setup=None):
     """`instance_record` is the coordinator's {"id", "table_sha256"}; None for the canonical task.
     `phase_plan` selects the active agents and each agent's cohort; None is all four together.
-    `variant_record` is the coordinator's workload variant {"id", "fixture_sha256"}; None for the canonical files."""
+    `variant_record` is the coordinator's workload variant {"id", "fixture_sha256"}; None for the canonical files.
+    `request_setup` is the run's request_setup.py name; None for the canonical request."""
     family_contract.validate_selection(family, engine_kind, 4)
     agents = active_agents(phase_plan)
     require(set(results) == set(exits) == set(cleanup) == set(agents), "missing agent result")
@@ -272,6 +276,7 @@ def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwe
                 "aggregate prompt identity")
         require(result.get("instance") == instance_record, "aggregate task instance")
         require(result.get("workload_variant") == variant_record, "aggregate workload variant")
+        require(result.get("request_setup") == request_setup, "aggregate request setup")
         require(result.get("phase") == agent_phase(phase_plan, agent), "aggregate phase cohort")
         require(result.get("final_source_sha256") == result.get("observed_final_source_sha256")
                 and isinstance(result.get("final_source_sha256"), str), "final fixture changed")
@@ -309,6 +314,8 @@ def agent_command(args, module_dir, agent, path, approval_path, barrier, run, to
         command += ["--instance", str(args.instance)]
     if args.workload is not None:
         command += ["--workload", args.workload]
+    if args.request_setup is not None:
+        command += ["--request-setup", args.request_setup]
     phase = agent_phase(args.phase_plan, agent)
     if phase is not None:
         command += ["--phase-plan", phase["plan"], "--phase-cohort", str(phase["cohort"])]
@@ -333,6 +340,9 @@ def main():
     parser.add_argument("--phase-plan", choices=sorted(PHASE_PLANS),
                         help="ADR-063 Q3 control: '1' runs agent-0 alone; 'K+M' releases K agents, then the "
                              "other M once each of the K has its first decoded token; omit for all four at once")
+    parser.add_argument("--request-setup", choices=("qwen36-vendor-coding-v1",),
+                        help="explicit vendor request setup (request_setup.py), bound by the approval; "
+                             "omit for the canonical greedy request")
     args = parser.parse_args()
     family_contract.validate_selection(args.family, args.engine_kind, 4)
     from qwen38_n1_smoke import new_output, PREFLIGHT
@@ -387,6 +397,19 @@ def main():
             summary["workload_variant"] = variant.record()
         require(args.phase_plan is None or (workload is None and args.benchmark_profile is None),
                 "phase plans are controls of the canonical workload")
+        if args.request_setup is not None:
+            import request_setup
+            request_setup.validate_activation(args.request_setup, packet, args.family, args.engine_kind, 4)
+            request_setup.validate_activation(args.request_setup, packet.get("agent_template", {}), args.family,
+                                              args.engine_kind, 4)
+            require(args.phase_plan is None and args.benchmark_profile is None,
+                    "a request setup runs the canonical workflow, without a phase plan or benchmark profile")
+            names += request_setup.EXTRA_MODULES
+            summary["request_setup"] = args.request_setup
+        else:
+            require(packet.get("request_setup") is None and
+                    packet.get("agent_template", {}).get("request_setup") is None,
+                    "request-setup approval requires explicit CLI opt-in")
         native = None
         if args.engine_kind in family_contract.ADAPTER_KINDS:  # the arm's registry, client modules and test
             from native_peers import adapter
@@ -406,7 +429,7 @@ def main():
         identity(AGENTS[0], run)
         require(isinstance(token, str) and re.fullmatch(r"[a-f0-9]{32}", token), "barrier nonce")
         template = packet.get("agent_template", {})
-        validate_preflight(template.get("preflight"), PREFLIGHT, args.engine_kind, args.family)
+        validate_preflight(template.get("preflight"), PREFLIGHT, args.engine_kind, args.family, args.request_setup)
         summary["run_id"] = run
         if args.phase_plan is not None:
             summary["phase"] = {"plan": args.phase_plan, "cohorts": [list(c) for c in cohorts], "releases": []}
@@ -506,7 +529,8 @@ def main():
         if summary["status"] != "Failed":
             try:
                 summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.engine_kind, args.family,
-                                              summary.get("instance"), args.phase_plan, summary.get("workload_variant"))
+                                              summary.get("instance"), args.phase_plan, summary.get("workload_variant"),
+                                              args.request_setup)
             except BaseException as exc:
                 summary["status"], summary["error"] = "Failed", str(exc)
         if summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview":

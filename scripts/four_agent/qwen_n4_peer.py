@@ -18,13 +18,18 @@ def preflight(hf_keys):
     return (set(hf_keys) - HF_ONLY) | PEER_ONLY
 
 
-def request_controls(request):
+def request_controls(request, setup=None):
     """Translate only canonical HF Qwen defaults into native peer metadata.
 
     Mirrors qwen_thinking_policy::{qwen_tool_chain_state,
     adaptive_qwen_default_thinking_budget}: a fresh user turn gets 2048 and
     every tool-result continuation gets 512; system messages do not change
     whether the latest conversation role is tool.
+
+    Under an explicit request setup (request_setup.py) the sampling fields
+    pass through under the peer's names and no budget is sent: the setup's
+    launch case runs the peer with --reasoning-budget -1, as hf2q runs with
+    both default thinking budgets disabled.
     """
     overrides = {'reasoning_budget_tokens', 'thinking_budget_tokens',
                  'thinking_token_budget', 'tool_thinking_token_budget',
@@ -48,6 +53,9 @@ def request_controls(request):
         budget = 512
     translated = dict(request)
     del translated['hf2q_overflow_policy']
+    if setup is not None:
+        import request_setup
+        return request_setup.to_peer(translated, setup)
     translated['reasoning_budget_tokens'] = budget
     return translated
 

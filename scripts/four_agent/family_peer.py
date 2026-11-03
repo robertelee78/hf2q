@@ -108,10 +108,11 @@ def _messages(messages):
             require(calls is None or isinstance(calls, list), 'invalid assistant tool-call cycles')
 
 
-def request_controls(request, family):
+def request_controls(request, family, setup=None):
     """Canonical hf2q request -> native peer request; any other field refuses."""
     if family == 'qwen':
-        return qwen_n4_peer.request_controls(request)
+        return qwen_n4_peer.request_controls(request, setup)
+    require(setup is None, 'request setups are Qwen only')
     _family(family)
     extra = sorted(set(request) - CANONICAL_KEYS[family])
     require(not extra, 'unsupported peer override: ' + ','.join(extra))
@@ -132,11 +133,16 @@ def request_controls(request, family):
     return translated
 
 
-def canonical(request, family):
+def canonical(request, family, setup=None):
     """Inverse of request_controls at the wire boundary: native fields must be exact."""
     require('hf2q_overflow_policy' not in request, 'peer request must use native transport metadata')
     if family == 'qwen':
+        if setup is not None:
+            import request_setup
+            require('reasoning_budget_tokens' not in request, 'request setup peer budget drift')
+            request = request_setup.from_peer(request, setup)
         return {**request, 'hf2q_overflow_policy': 'reject'}
+    require(setup is None, 'request setups are Qwen only')
     _family(family)
     for key, value in NATIVE[family].items():
         require(key in request and same(request[key], value), 'peer native control drift: ' + key)

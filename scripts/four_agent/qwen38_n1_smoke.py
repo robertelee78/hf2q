@@ -75,6 +75,13 @@ def approval(args):
     elif args.engine_kind in family_contract.ADAPTER_KINDS:
         from native_peers import adapter
         keys = adapter(args.engine_kind).preflight(keys, args.family)
+    setup = getattr(args, "request_setup", None)
+    if setup is not None:
+        import request_setup
+        request_setup.validate_activation(setup, packet, args.family, args.engine_kind, args.diagnostic_slots)
+        keys = request_setup.preflight(keys, setup)
+    else:
+        require(packet.get("request_setup") is None, "request-setup approval requires explicit CLI opt-in")
     require(set(packet.get("preflight", {})) == keys and
             all(v is True for v in packet["preflight"].values()), "preflight unknown")
     require(packet.get("sandbox_proof_sha256") == args.sandbox_proof_sha256,
@@ -102,6 +109,8 @@ def approval(args):
         source_paths += [Path(__file__).with_name(n) for n in EXTRA_MODULES]
     else:
         require(packet.get("benchmark_profile") is None, "benchmark approval requires explicit CLI opt-in")
+    if setup is not None:
+        source_paths += [Path(__file__).with_name(n) for n in request_setup.EXTRA_MODULES]
     if workload is not None:
         from coding_instances import MODULES as INSTANCE_MODULES
         require(getattr(args, "benchmark_profile", None) is None,
@@ -142,17 +151,23 @@ def request_timeout(_signum, _frame):
     raise TimeoutError("absolute request deadline")
 
 
-def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf2q"):
-    """Actual shared request construction, before the exchange wire boundary."""
+def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf2q", setup=None):
+    """Actual shared request construction, before the exchange wire boundary.
+    `setup` is an explicit request_setup.py name; None is the canonical request."""
     request = {"model": model, "messages": messages, "tools": schemas,
                "tool_choice": "auto", "max_completion_tokens": 8192,
                "logprobs": False, "hf2q_overflow_policy": "reject", "stream": turn % 2 == 1}
     family_contract.request_controls(request, family)
+    if setup is not None:
+        import request_setup
+        require(family == "qwen", "request setups are Qwen only")
+        request_setup.apply(request, setup)
     require(engine_kind in family_contract.ENGINE_KINDS, "unknown request engine")
     if engine_kind == "peer":
         from family_peer import request_controls as peer_request_controls
-        request = peer_request_controls(request, family)
+        request = peer_request_controls(request, family, setup)
     elif engine_kind in family_contract.ADAPTER_KINDS:
+        require(setup is None, "request setups run on hf2q or the same-GGUF peer only")
         from native_peers import adapter
         request = adapter(engine_kind).request_controls(request, family)
     if request["stream"]:
@@ -160,20 +175,22 @@ def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf
     return request
 
 
-def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen", on_first_token=None):
+def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen", on_first_token=None,
+             setup=None):
     """`on_first_token(monotonic_ns)` runs once, at the first streamed reasoning or semantic token."""
     if engine_kind != "hf2q":
         if engine_kind == "peer":
             from family_peer import canonical
+            native = canonical(request, family, setup)
         else:
             from native_peers import adapter
-            canonical = adapter(engine_kind).canonical
+            native = adapter(engine_kind).canonical(request, family)
         # Validate the unchanged canonical envelope (native fields must be the
         # adapter's exact values), then serialize the actual native-engine wire.
-        wire(canonical(request, family), family)
+        wire(native, family, setup)
         raw_request = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
     else:
-        raw_request = wire(request, family)
+        raw_request = wire(request, family, setup)
     (output / "request.json").write_bytes(raw_request)
     endpoint = urlsplit(base)
     require(endpoint.scheme == "http" and endpoint.hostname == "127.0.0.1" and endpoint.port and
@@ -304,13 +321,15 @@ def main():
     parser.add_argument("--workload", help="N4 workload variant of the canonical task (coding_long_context.py)")
     parser.add_argument("--phase-plan", help="Q3 phase plan from the four-agent coordinator (qwen_n4_live_smoke.py)")
     parser.add_argument("--phase-cohort", type=int, help="this agent's release cohort under --phase-plan")
+    parser.add_argument("--request-setup", choices=("qwen36-vendor-coding-v1",),
+                        help="explicit vendor request setup (request_setup.py), bound by the approval")
     args = parser.parse_args()
     family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
     phase = None
     if args.phase_plan is not None or args.phase_cohort is not None:
         from qwen_n4_live_smoke import agent_phase
-        require(args.diagnostic_slots == 4 and args.instance is None and args.benchmark_profile is None,
-                "phase plans are four-agent controls of the canonical workload")
+        require(args.diagnostic_slots == 4 and args.instance is None and args.benchmark_profile is None
+                and args.request_setup is None, "phase plans are four-agent controls of the canonical workload")
         phase = {"plan": args.phase_plan, "cohort": args.phase_cohort}
         require(agent_phase(args.phase_plan, args.agent_id) == phase, "agent outside its phase cohort")
     os.umask(0o077)
@@ -337,6 +356,8 @@ def main():
             summary["instance"] = workload.record()
         if variant is not None:
             summary["workload_variant"] = variant.record()
+        if args.request_setup is not None:
+            summary["request_setup"] = args.request_setup
         summary["engine_kind"] = args.engine_kind
         if args.family in ("deepseek4", "gemma4"): summary["family_controls"] = packet["family_controls"]
         save(output / "approval-copy.json", packet)
@@ -384,13 +405,14 @@ def main():
         for turn in range(7):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
             os.kill(args.server_pid, 0)
-            request = build_request(args.model, messages, schemas, turn, args.family, args.engine_kind)
+            request = build_request(args.model, messages, schemas, turn, args.family, args.engine_kind,
+                                    args.request_setup)
             turn_output = output / f"turn-{turn}"
             turn_output.mkdir(mode=0o700)
             on_first_token = first_decode.pop() if first_decode and request["stream"] else None
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
                                                deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind, family=args.family,
-                                               on_first_token=on_first_token)
+                                               on_first_token=on_first_token, setup=args.request_setup)
             summary["turns"].append(receipt)
             messages.append(message)
             if call is not None:

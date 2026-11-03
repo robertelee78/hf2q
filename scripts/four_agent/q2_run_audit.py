@@ -150,7 +150,7 @@ def audit_agent(directory, name, result, family, engine, response_ids):
         request = loads(request_raw)
         require(receipt.get("turn") == turn and receipt.get("stream") is request.get("stream") is (turn % 2 == 1),
                 "turn/transport receipt")
-        request_wire(request, request_raw, family, engine)
+        request_wire(request, request_raw, family, engine, result.get("request_setup"))
         model = request["model"] if model is None else model
         require(request["model"] == model, "model identity changed between turns")
         if turn == 0:
@@ -233,7 +233,8 @@ def audit_run(client_dir, summary, phase_plan, engine_kind, require_width):
         checked_cleanup(cleanup[name])
     require(coordinator.aggregate(results, summary["exits"], {n: cleanup[n]["verified"] for n in agents},
                                   summary["server_pid"], summary["run_id"], engine_kind, family,
-                                  summary.get("instance"), phase_plan, summary.get("workload_variant")) == summary["status"],
+                                  summary.get("instance"), phase_plan, summary.get("workload_variant"),
+                                  summary.get("request_setup")) == summary["status"],
             "result scoring disagrees with the claimed status")
     releases = cohort_releases(summary, phase_plan, cohorts, results)
     response_ids, turns = {}, {}

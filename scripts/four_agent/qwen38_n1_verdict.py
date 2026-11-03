@@ -57,17 +57,25 @@ def loads(raw):
                       parse_constant=lambda x: (_ for _ in ()).throw(Invalid(x)))
 
 
-def wire(request, family="qwen"):
+def wire(request, family="qwen", setup=None):
+    """`setup` is an explicit request_setup.py name; None keeps the canonical greedy omissions."""
     require(family in ("qwen", "deepseek4", "gemma4"), "unsupported request family")
     require(request.get("max_completion_tokens") == 8192, "output allowance drift")
     require(request.get("tool_choice") == "auto", "tool choice drift")
     require(request.get("logprobs") is False and "response_format" not in request,
             "constraint settings drift")
+    sampled = {}
+    if setup is not None:
+        import request_setup
+        require(family == "qwen", "request setups are Qwen only")
+        request_setup.check(request, setup)
+        sampled = request_setup.sampling(setup)
     for key in ("top_p", "top_k", "min_p", "seed",
                 "frequency_penalty", "presence_penalty", "repetition_penalty"):
-        require(key not in request, f"captured omission changed: {key}")
+        require(key in sampled or key not in request, f"captured omission changed: {key}")
     if family in ("qwen", "gemma4"):
-        require("temperature" not in request, "captured omission changed: temperature")
+        require("temperature" in sampled or "temperature" not in request,
+                "captured omission changed: temperature")
         require("reasoning_effort" not in request, "family reasoning control drift")
         if family == "gemma4":
             require(all(k not in request for k in ("chat_template_kwargs", "thinking_budget",
