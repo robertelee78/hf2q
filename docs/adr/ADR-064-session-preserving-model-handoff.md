@@ -6,6 +6,7 @@
 - **Stable source ID:** ADR-064
 - **Related:** ADR-005, ADR-008, ADR-013, ADR-017, ADR-027, ADR-040, ADR-042, ADR-050, ADR-059, ADR-062, ADR-063 C1.
 - **Evidence:** [Research and bounded spikes](../research/model-handoff-feasibility-2026-10-29.md), hf2q baseline `7be222a5711dd9750b964e5555cdcfbece7dd2a6`.
+- **Note (2026-11-03):** Planned for release v0.1.31 by operator decision. Story issues H0–H8 (#442–#450) are in milestone v0.1.31. The body below is unchanged and remains the bound source of #442–#450; see *Planning review findings (2026-11-03)* under Current disposition for fixes required before execution.
 
 ## Context and product contract
 
@@ -505,3 +506,17 @@ execution entry; acceptance of the product ambition is not evidence of a
 working transport.
 
 Independent review: [Opus 5.5 findings, dispositions and follow-up verdict](../research/ADR-064-opus-review-2026-10-29.md).
+
+### Planning review findings (2026-11-03)
+
+The 2026-11-03 planning review requires these fixes before H0 execution:
+
+1. **Stale DeepSeek admission premise.** Replace the original DeepSeek admission assumption with the ADR-063 Q3 serving policy and the measured Q1 floor.
+2. **Name the target pair artifacts.** Pin the exact Qwen3.8 and DeepSeek-V4 artifacts (identity, quantization, digests) the program qualifies.
+3. **Define the long coding workload fixture.** Specify the reproducible long coding-session fixture used for baseline, handoff and UX measurements.
+4. **Split H0** into H0.0–H0.3 and **split H2** into H2a–H2d, each with its own entry and acceptance evidence.
+5. **H1 depends only on H0.0**, not on the whole of H0.
+6. **H3 prerequisites:** ADR-063 C2 (#360) runtime plus a DeepSeek multi-anchor successor.
+7. **Add an H5.5 runtime-implementation story** between translator decisions and round-trip proof.
+8. **Exact-return-only path:** if H5 falsifies first-visit transfer, the program continues with exact returning-model resume only, without translators.
+9. **Open operator decisions** to be recorded before execution: target pair and artifacts, workload fixture, the behavioral shipping bar, and acceptance of the exact-return-only fallback scope.
