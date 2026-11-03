@@ -2059,6 +2059,33 @@ fn qwen35_strip_trailing_stop(text: &mut String, stops: &[String]) {
     }
 }
 
+/// Reasoning token count: rerun the splitter token-by-token over the same
+/// UTF-8-safe text the decode loop emits (#553), attributing each completion
+/// token to the slot the splitter is in after its fragment.
+fn qwen35_reasoning_token_count(
+    tokenizer: &Tokenizer,
+    registration: Option<&ModelRegistration>,
+    reasoning_forced_open: bool,
+    tokens: &[u32],
+) -> usize {
+    let Some(reg) = registration.filter(|reg| reg.has_reasoning()) else {
+        return 0;
+    };
+    let Some(mut splitter) = super::registry::make_reasoning_splitter(reg, reasoning_forced_open)
+    else {
+        return 0;
+    };
+    let mut text = super::token_text::TokenTextDecoder::default();
+    let mut count = 0usize;
+    for &token in tokens {
+        let _ = splitter.feed(&text.push(tokenizer, token));
+        if splitter.in_reasoning() {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Wedge-3 / Phase D: non-streaming chat generation against a loaded
 /// Qwen3.5/3.6 model.  Replaces the `worker_run` 501 arm for
 /// `Request::Generate`.
@@ -2885,10 +2912,8 @@ fn generate_qwen35_once_ordinary(
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
 
-    let first_fragment = qwen
-        .tokenizer
-        .decode(&[next_token], false)
-        .unwrap_or_default();
+    let mut text_decoder = super::token_text::TokenTextDecoder::default();
+    let first_fragment = text_decoder.push(&qwen.tokenizer, next_token);
     let mut decoded_text = first_fragment.clone();
 
     let mut finish_reason: &'static str = "length";
@@ -2899,6 +2924,7 @@ fn generate_qwen35_once_ordinary(
     } else if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
         finish_reason = "stop";
         qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+        text_decoder.discard();
     } else {
         for step in 1..max_tokens {
             // ADR-059: decode positions shift by the graft region.
@@ -2976,18 +3002,17 @@ fn generate_qwen35_once_ordinary(
                 break;
             }
             generated_tokens.push(next_token);
-            let fragment = qwen
-                .tokenizer
-                .decode(&[next_token], false)
-                .unwrap_or_default();
+            let fragment = text_decoder.push(&qwen.tokenizer, next_token);
             decoded_text.push_str(&fragment);
             if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
                 finish_reason = "stop";
                 qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                text_decoder.discard();
                 break;
             }
         }
     }
+    decoded_text.push_str(&text_decoder.finish());
     let decode_duration = decode_start.elapsed();
     qwen.persistent_kv_cache = Some(kv_cache);
     tracing::info!(
@@ -3017,28 +3042,12 @@ fn generate_qwen35_once_ordinary(
         _ => (decoded_text, None),
     };
 
-    // Reasoning token count: rerun the splitter token-by-token to
-    // attribute each completion token to a slot.  Cheap (one decode
-    // per token + a tail-buffered splitter) and matches the Gemma
-    // path's `reasoning_token_count` semantics.
-    let reasoning_token_count = match registration {
-        Some(reg) if reg.has_reasoning() => {
-            let mut sp =
-                super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
-            let mut count = 0usize;
-            for &tok in &generated_tokens {
-                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
-                if let Some(splitter) = sp.as_mut() {
-                    let _ = splitter.feed(&frag);
-                    if splitter.in_reasoning() {
-                        count += 1;
-                    }
-                }
-            }
-            count
-        }
-        _ => 0,
-    };
+    let reasoning_token_count = qwen35_reasoning_token_count(
+        &qwen.tokenizer,
+        registration,
+        params.reasoning_forced_open,
+        &generated_tokens,
+    );
 
     tracing::info!(
         target: "hf2q::serve::api::engine_qwen35::progress",
@@ -3220,24 +3229,12 @@ fn generate_qwen35_once_mtp(
         ),
         _ => (std::mem::take(&mut decoded_text), None),
     };
-    let reasoning_token_count = match registration {
-        Some(reg) if reg.has_reasoning() => {
-            let mut splitter =
-                super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
-            let mut count = 0usize;
-            for &token in &result.tokens {
-                let fragment = qwen.tokenizer.decode(&[token], false).unwrap_or_default();
-                if let Some(splitter) = splitter.as_mut() {
-                    let _ = splitter.feed(&fragment);
-                    if splitter.in_reasoning() {
-                        count += 1;
-                    }
-                }
-            }
-            count
-        }
-        _ => 0,
-    };
+    let reasoning_token_count = qwen35_reasoning_token_count(
+        &qwen.tokenizer,
+        registration,
+        params.reasoning_forced_open,
+        &result.tokens,
+    );
     Ok((
         GenerationResult {
             text: content,
@@ -3486,10 +3483,8 @@ pub fn generate_qwen35_once_slot_aware(
     let decode_start = Instant::now();
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
-    let mut decoded_text = qwen
-        .tokenizer
-        .decode(&[next_token], false)
-        .unwrap_or_default();
+    let mut text_decoder = super::token_text::TokenTextDecoder::default();
+    let mut decoded_text = text_decoder.push(&qwen.tokenizer, next_token);
     let stops = &params.stop_strings;
     let mut finish_reason: &'static str = "length";
     if qwen.eos_token_ids.contains(&next_token) {
@@ -3497,9 +3492,11 @@ pub fn generate_qwen35_once_slot_aware(
         // surfaced to the user even though we count it.
         generated_tokens.pop();
         decoded_text.clear();
+        text_decoder.discard();
         finish_reason = "stop";
     } else if qwen35_hit_stop_string(&decoded_text, stops) {
         qwen35_strip_trailing_stop(&mut decoded_text, stops);
+        text_decoder.discard();
         finish_reason = "stop";
     }
 
@@ -3565,15 +3562,17 @@ pub fn generate_qwen35_once_slot_aware(
             break;
         }
         generated_tokens.push(tok);
-        let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+        let frag = text_decoder.push(&qwen.tokenizer, tok);
         decoded_text.push_str(&frag);
         if qwen35_hit_stop_string(&decoded_text, stops) {
             qwen35_strip_trailing_stop(&mut decoded_text, stops);
+            text_decoder.discard();
             finish_reason = "stop";
             break;
         }
         step += 1;
     }
+    decoded_text.push_str(&text_decoder.finish());
     let decode_duration = decode_start.elapsed();
 
     // Per-slot reset at exit — leave the slot clean for the next
@@ -3595,25 +3594,12 @@ pub fn generate_qwen35_once_slot_aware(
         ),
         _ => (decoded_text, None),
     };
-    // Reasoning token count: same shape as generate_qwen35_once.
-    let reasoning_token_count = match registration {
-        Some(reg) if reg.has_reasoning() => {
-            let mut sp =
-                super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
-            let mut count = 0usize;
-            for &tok in &generated_tokens {
-                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
-                if let Some(splitter) = sp.as_mut() {
-                    let _ = splitter.feed(&frag);
-                    if splitter.in_reasoning() {
-                        count += 1;
-                    }
-                }
-            }
-            count
-        }
-        _ => 0,
-    };
+    let reasoning_token_count = qwen35_reasoning_token_count(
+        &qwen.tokenizer,
+        registration,
+        params.reasoning_forced_open,
+        &generated_tokens,
+    );
 
     Ok(GenerationResult {
         text: content_text,
@@ -4454,6 +4440,10 @@ pub(crate) struct Qwen35DecodeState {
     /// completion ledger.
     sampling_history: Vec<u32>,
     decoded_text: String,
+    /// Holds back an incomplete UTF-8 sequence spread over byte-level
+    /// tokens so neither `decoded_text` nor SSE fragments split a
+    /// character (#553). Flushed by `complete_tick` / `finish`.
+    text_decoder: super::token_text::TokenTextDecoder,
     stop_strings: Vec<String>,
     finish_reason: &'static str,
     /// Decode-step counter, mirrors the serial ref `step` (starts at 1).
@@ -4508,6 +4498,9 @@ mod speculation_qualification_tests;
 #[cfg(test)]
 #[path = "engine_qwen35/speculation_real_artifact_tests.rs"]
 mod speculation_real_artifact_tests;
+#[cfg(test)]
+#[path = "engine_qwen35/text_decode_tests.rs"]
+mod text_decode_tests;
 
 const QWEN35_REPETITION_WINDOW: usize = 64;
 
@@ -4790,6 +4783,7 @@ struct Qwen35SpecSemanticState {
     sampling_history: Vec<u32>,
     grammar_runtime: Option<super::grammar::GrammarRuntime>,
     tool_splitter: Option<ToolCallSplitter>,
+    text_decoder: super::token_text::TokenTextDecoder,
     thinking_budget: Option<Qwen35ThinkingBudgetState>,
 }
 
@@ -4800,6 +4794,7 @@ impl Qwen35SpecSemanticState {
             sampling_history: state.sampling_history.clone(),
             grammar_runtime: state.grammar_runtime.clone(),
             tool_splitter: state.tool_splitter.clone(),
+            text_decoder: state.text_decoder.clone(),
             thinking_budget: state.thinking_budget.clone(),
         }
     }
@@ -4842,7 +4837,7 @@ impl Qwen35SpecSemanticState {
 
         self.generated_tokens.push(token);
         qwen35_observe_sampling_history(&mut self.sampling_history, token);
-        let fragment = qwen.tokenizer.decode(&[token], false).unwrap_or_default();
+        let fragment = self.text_decoder.push(&qwen.tokenizer, token);
         let tool_opened = self.tool_splitter.as_mut().is_some_and(|splitter| {
             splitter
                 .feed(&fragment)
@@ -5046,10 +5041,8 @@ impl Qwen35DecodeState {
         let mut generated_tokens = Vec::with_capacity(max_tokens);
         generated_tokens.push(next_token);
         qwen35_observe_sampling_history(&mut sampling_history, next_token);
-        let mut decoded_text = qwen
-            .tokenizer
-            .decode(&[next_token], false)
-            .unwrap_or_default();
+        let mut text_decoder = super::token_text::TokenTextDecoder::default();
+        let mut decoded_text = text_decoder.push(&qwen.tokenizer, next_token);
         let mut tool_opened = false;
         if let Some(splitter) = tool_splitter.as_mut() {
             let marker_events = splitter.feed(&decoded_text);
@@ -5069,9 +5062,11 @@ impl Qwen35DecodeState {
         {
             generated_tokens.pop();
             decoded_text.clear();
+            text_decoder.discard();
             finish_reason = "stop";
         } else if qwen35_hit_stop_string(&decoded_text, &stop_strings) {
             qwen35_strip_trailing_stop(&mut decoded_text, &stop_strings);
+            text_decoder.discard();
             finish_reason = "stop";
         }
 
@@ -5117,6 +5112,7 @@ impl Qwen35DecodeState {
             generated_tokens,
             sampling_history,
             decoded_text,
+            text_decoder,
             stop_strings,
             finish_reason,
             step: 1,
@@ -5150,6 +5146,19 @@ impl Qwen35DecodeState {
     /// decoded_text); on a stop-string hit it is the stop-stripped prefix.
     pub(crate) fn seed_fragment(&self) -> String {
         self.decoded_text.clone()
+    }
+
+    /// Flush any incomplete UTF-8 tail the decoder holds back into the
+    /// final tick's fragment, so the last SSE delta and `decoded_text` end
+    /// with exactly the bytes a full-sequence decode would render. Every
+    /// serial and joint tick settles through this before it is emitted.
+    pub(crate) fn complete_tick(&mut self, mut tick: Qwen35TickOutcome) -> Qwen35TickOutcome {
+        if tick.finished {
+            let tail = self.text_decoder.finish();
+            self.decoded_text.push_str(&tail);
+            tick.fragment.push_str(&tail);
+        }
+        tick
     }
 
     /// Exact input-token prefix represented by the live KV/recurrent state.
@@ -5390,7 +5399,7 @@ impl Qwen35DecodeState {
         }
         self.generated_tokens.push(tok);
         qwen35_observe_sampling_history(&mut self.sampling_history, tok);
-        let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+        let frag = self.text_decoder.push(&qwen.tokenizer, tok);
         self.decoded_text.push_str(&frag);
         let mut tool_opened = false;
         if let Some(splitter) = self.tool_splitter.as_mut() {
@@ -5409,6 +5418,7 @@ impl Qwen35DecodeState {
         }
         if qwen35_hit_stop_string(&self.decoded_text, &self.stop_strings) {
             qwen35_strip_trailing_stop(&mut self.decoded_text, &self.stop_strings);
+            self.text_decoder.discard();
             self.finish_reason = "stop";
             return Ok(Qwen35TickOutcome {
                 fragment: frag,
@@ -6437,7 +6447,7 @@ impl Qwen35DecodeState {
         self.generated_tokens.push(token);
         qwen35_observe_sampling_history(&mut self.sampling_history, token);
         self.next_token = token;
-        let fragment = qwen.tokenizer.decode(&[token], false).unwrap_or_default();
+        let fragment = self.text_decoder.push(&qwen.tokenizer, token);
         self.decoded_text.push_str(&fragment);
         let mut tool_opened = false;
         if let Some(splitter) = self.tool_splitter.as_mut() {
@@ -6478,7 +6488,7 @@ impl Qwen35DecodeState {
     /// including the POST-HOC reasoning-token recompute (re-feed all
     /// generated tokens through a fresh splitter) that diverges from gemma4.
     pub(crate) fn finish(
-        self,
+        mut self,
         qwen: &Qwen35LoadedModel,
         registration: Option<&ModelRegistration>,
     ) -> Result<GenerationResult> {
@@ -6487,6 +6497,9 @@ impl Qwen35DecodeState {
             self.params.grammar_kind,
             self.finish_reason,
         )?;
+        // A slot released outside a terminal tick keeps no bytes back.
+        let tail = self.text_decoder.finish();
+        self.decoded_text.push_str(&tail);
         let (content_text, reasoning_text) = match registration {
             Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(
                 reg,
@@ -6495,26 +6508,12 @@ impl Qwen35DecodeState {
             ),
             _ => (self.decoded_text.clone(), None),
         };
-        let reasoning_token_count = match registration {
-            Some(reg) if reg.has_reasoning() => {
-                let mut sp = super::registry::make_reasoning_splitter(
-                    reg,
-                    self.params.reasoning_forced_open,
-                );
-                let mut count = 0usize;
-                for &tok in &self.generated_tokens {
-                    let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
-                    if let Some(splitter) = sp.as_mut() {
-                        let _ = splitter.feed(&frag);
-                        if splitter.in_reasoning() {
-                            count += 1;
-                        }
-                    }
-                }
-                count
-            }
-            _ => 0,
-        };
+        let reasoning_token_count = qwen35_reasoning_token_count(
+            &qwen.tokenizer,
+            registration,
+            self.params.reasoning_forced_open,
+            &self.generated_tokens,
+        );
         let decode_duration = self.decode_start.elapsed();
         Ok(GenerationResult {
             text: content_text,
@@ -7034,10 +7033,8 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
     let mut reasoning_token_count = 0usize;
     let mut finish_reason: &'static str = "length";
 
-    let first_text = qwen
-        .tokenizer
-        .decode(&[next_token], false)
-        .unwrap_or_default();
+    let mut text_decoder = super::token_text::TokenTextDecoder::default();
+    let first_text = text_decoder.push(&qwen.tokenizer, next_token);
     let mut is_eos_first = qwen.eos_token_ids.contains(&next_token);
     if !is_eos_first && !first_text.is_empty() {
         accumulated_text.push_str(&first_text);
@@ -7071,9 +7068,11 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
     }
     if is_eos_first {
         finish_reason = "stop";
+        text_decoder.discard();
     } else if qwen35_hit_stop_string(&accumulated_text, &params.stop_strings) {
         finish_reason = "stop";
         is_eos_first = true;
+        text_decoder.discard();
     }
 
     if !is_eos_first {
@@ -7145,10 +7144,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
             }
             generated_tokens.push(next_token);
             completion_tokens += 1;
-            let fragment = qwen
-                .tokenizer
-                .decode(&[next_token], false)
-                .unwrap_or_default();
+            let fragment = text_decoder.push(&qwen.tokenizer, next_token);
             accumulated_text.push_str(&fragment);
             if !emit_fragment_qwen35_slot_aware(
                 &mut reasoning_splitter,
@@ -7176,8 +7172,31 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
             }
             if qwen35_hit_stop_string(&accumulated_text, &params.stop_strings) {
                 finish_reason = "stop";
+                text_decoder.discard();
                 break;
             }
+        }
+    }
+    // Flush an incomplete UTF-8 tail held back at EOS / max_tokens.
+    let tail = text_decoder.finish();
+    if !tail.is_empty() {
+        accumulated_text.push_str(&tail);
+        if !emit_fragment_qwen35_slot_aware(
+            &mut reasoning_splitter,
+            &mut tool_splitter,
+            &mut tool_call_body,
+            &mut tool_call_index,
+            &mut saw_tool_call,
+            registration,
+            params.tool_argument_wire_kinds.as_deref(),
+            events,
+            &tail,
+        ) {
+            if let Some(c) = cancellation_counter {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = kv_cache.reset_for_slot(slot_id);
+            return;
         }
     }
 
@@ -7453,10 +7472,8 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
 
-    let first_fragment = qwen
-        .tokenizer
-        .decode(&[next_token], false)
-        .unwrap_or_default();
+    let mut text_decoder = super::token_text::TokenTextDecoder::default();
+    let first_fragment = text_decoder.push(&qwen.tokenizer, next_token);
     let mut decoded_text = first_fragment.clone();
 
     let mut finish_reason: &'static str = "length";
@@ -7466,6 +7483,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
     } else if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
         finish_reason = "stop";
         qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+        text_decoder.discard();
     } else {
         for step in 1..max_tokens {
             let pos = (prompt_len + step - 1) as i32;
@@ -7538,18 +7556,17 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
                 break;
             }
             generated_tokens.push(next_token);
-            let fragment = qwen
-                .tokenizer
-                .decode(&[next_token], false)
-                .unwrap_or_default();
+            let fragment = text_decoder.push(&qwen.tokenizer, next_token);
             decoded_text.push_str(&fragment);
             if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
                 finish_reason = "stop";
                 qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                text_decoder.discard();
                 break;
             }
         }
     }
+    decoded_text.push_str(&text_decoder.finish());
     let decode_duration = decode_start.elapsed();
     validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)?;
 
@@ -7563,24 +7580,12 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
         _ => (decoded_text, None),
     };
 
-    let reasoning_token_count = match registration {
-        Some(reg) if reg.has_reasoning() => {
-            let mut sp =
-                super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
-            let mut count = 0usize;
-            for &tok in &generated_tokens {
-                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
-                if let Some(splitter) = sp.as_mut() {
-                    let _ = splitter.feed(&frag);
-                    if splitter.in_reasoning() {
-                        count += 1;
-                    }
-                }
-            }
-            count
-        }
-        _ => 0,
-    };
+    let reasoning_token_count = qwen35_reasoning_token_count(
+        &qwen.tokenizer,
+        registration,
+        params.reasoning_forced_open,
+        &generated_tokens,
+    );
 
     Ok(GenerationResult {
         text: content,
@@ -7790,10 +7795,8 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
 
-    let first_fragment = qwen
-        .tokenizer
-        .decode(&[next_token], false)
-        .unwrap_or_default();
+    let mut text_decoder = super::token_text::TokenTextDecoder::default();
+    let first_fragment = text_decoder.push(&qwen.tokenizer, next_token);
     let mut decoded_text = first_fragment.clone();
 
     let mut finish_reason: &'static str = "length";
@@ -7803,6 +7806,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     } else if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
         finish_reason = "stop";
         qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+        text_decoder.discard();
     } else {
         for step in 1..max_tokens {
             // Decode position is `t_post + (step - 1)`, broadcast across
@@ -7877,18 +7881,17 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
                 break;
             }
             generated_tokens.push(next_token);
-            let fragment = qwen
-                .tokenizer
-                .decode(&[next_token], false)
-                .unwrap_or_default();
+            let fragment = text_decoder.push(&qwen.tokenizer, next_token);
             decoded_text.push_str(&fragment);
             if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
                 finish_reason = "stop";
                 qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                text_decoder.discard();
                 break;
             }
         }
     }
+    decoded_text.push_str(&text_decoder.finish());
     let decode_duration = decode_start.elapsed();
     validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)?;
     qwen.persistent_kv_cache = Some(kv_cache);
@@ -7902,24 +7905,12 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
         _ => (decoded_text, None),
     };
 
-    let reasoning_token_count = match registration {
-        Some(reg) if reg.has_reasoning() => {
-            let mut sp =
-                super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
-            let mut count = 0usize;
-            for &tok in &generated_tokens {
-                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
-                if let Some(splitter) = sp.as_mut() {
-                    let _ = splitter.feed(&frag);
-                    if splitter.in_reasoning() {
-                        count += 1;
-                    }
-                }
-            }
-            count
-        }
-        _ => 0,
-    };
+    let reasoning_token_count = qwen35_reasoning_token_count(
+        &qwen.tokenizer,
+        registration,
+        params.reasoning_forced_open,
+        &generated_tokens,
+    );
 
     Ok(GenerationResult {
         text: content,
@@ -8887,10 +8878,8 @@ pub(super) fn generate_stream_qwen35_once_extended(
     let mut finish_reason: &'static str = "length";
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
 
-    let first_text = qwen
-        .tokenizer
-        .decode(&[next_token], false)
-        .unwrap_or_default();
+    let mut text_decoder = super::token_text::TokenTextDecoder::default();
+    let first_text = text_decoder.push(&qwen.tokenizer, next_token);
     let mut is_eos_first = qwen.eos_token_ids.contains(&next_token);
     if !is_eos_first && qwen35_grammar_terminal_token(grammar_runtime.as_ref(), params, next_token)
     {
@@ -8930,9 +8919,11 @@ pub(super) fn generate_stream_qwen35_once_extended(
     }
     if is_eos_first {
         finish_reason = "stop";
+        text_decoder.discard();
     } else if qwen35_hit_stop_string(&accumulated_text, &params.stop_strings) {
         finish_reason = "stop";
         is_eos_first = true;
+        text_decoder.discard();
     }
 
     if !is_eos_first {
@@ -9007,10 +8998,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
             }
             completion_tokens += 1;
             generated_tokens.push(next_token);
-            let fragment = qwen
-                .tokenizer
-                .decode(&[next_token], false)
-                .unwrap_or_default();
+            let fragment = text_decoder.push(&qwen.tokenizer, next_token);
             accumulated_text.push_str(&fragment);
             if !emit_fragment_qwen35(
                 &mut reasoning_splitter,
@@ -9038,8 +9026,31 @@ pub(super) fn generate_stream_qwen35_once_extended(
             }
             if qwen35_hit_stop_string(&accumulated_text, &params.stop_strings) {
                 finish_reason = "stop";
+                text_decoder.discard();
                 break;
             }
+        }
+    }
+    // Flush an incomplete UTF-8 tail held back at EOS / max_tokens.
+    let tail = text_decoder.finish();
+    if !tail.is_empty() {
+        accumulated_text.push_str(&tail);
+        if !emit_fragment_qwen35(
+            &mut reasoning_splitter,
+            &mut tool_splitter,
+            &mut tool_call_body,
+            &mut tool_call_index,
+            &mut saw_tool_call,
+            params.tool_call_policy,
+            registration,
+            params.tool_argument_wire_kinds.as_deref(),
+            events,
+            &tail,
+        ) {
+            if let Some(c) = cancellation_counter {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok(SerialStreamEnd::ClientClosed);
         }
     }
 
@@ -9671,10 +9682,8 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
 
-    let first_fragment = qwen
-        .tokenizer
-        .decode(&[next_token], false)
-        .unwrap_or_default();
+    let mut text_decoder = super::token_text::TokenTextDecoder::default();
+    let first_fragment = text_decoder.push(&qwen.tokenizer, next_token);
     let mut decoded_text = first_fragment.clone();
 
     let mut finish_reason: &'static str = "length";
@@ -9684,6 +9693,7 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
     } else if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
         finish_reason = "stop";
         qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+        text_decoder.discard();
     } else {
         for step in 1..max_tokens {
             let pos = (prompt_len + step - 1) as i32;
@@ -9755,18 +9765,17 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
                 break;
             }
             generated_tokens.push(next_token);
-            let fragment = qwen
-                .tokenizer
-                .decode(&[next_token], false)
-                .unwrap_or_default();
+            let fragment = text_decoder.push(&qwen.tokenizer, next_token);
             decoded_text.push_str(&fragment);
             if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
                 finish_reason = "stop";
                 qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                text_decoder.discard();
                 break;
             }
         }
     }
+    decoded_text.push_str(&text_decoder.finish());
     let decode_duration = decode_start.elapsed();
 
     // Per-slot reset at exit — leave the slot clean for the next
@@ -9786,24 +9795,12 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
         _ => (decoded_text, None),
     };
 
-    let reasoning_token_count = match registration {
-        Some(reg) if reg.has_reasoning() => {
-            let mut sp =
-                super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
-            let mut count = 0usize;
-            for &tok in &generated_tokens {
-                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
-                if let Some(splitter) = sp.as_mut() {
-                    let _ = splitter.feed(&frag);
-                    if splitter.in_reasoning() {
-                        count += 1;
-                    }
-                }
-            }
-            count
-        }
-        _ => 0,
-    };
+    let reasoning_token_count = qwen35_reasoning_token_count(
+        &qwen.tokenizer,
+        registration,
+        params.reasoning_forced_open,
+        &generated_tokens,
+    );
 
     Ok(GenerationResult {
         text: content,
@@ -10021,10 +10018,8 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
 
-    let first_fragment = qwen
-        .tokenizer
-        .decode(&[next_token], false)
-        .unwrap_or_default();
+    let mut text_decoder = super::token_text::TokenTextDecoder::default();
+    let first_fragment = text_decoder.push(&qwen.tokenizer, next_token);
     let mut decoded_text = first_fragment.clone();
 
     let mut finish_reason: &'static str = "length";
@@ -10034,6 +10029,7 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
     } else if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
         finish_reason = "stop";
         qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+        text_decoder.discard();
     } else {
         for step in 1..max_tokens {
             let pos = t_post + (step as i32 - 1);
@@ -10102,18 +10098,17 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
                 break;
             }
             generated_tokens.push(next_token);
-            let fragment = qwen
-                .tokenizer
-                .decode(&[next_token], false)
-                .unwrap_or_default();
+            let fragment = text_decoder.push(&qwen.tokenizer, next_token);
             decoded_text.push_str(&fragment);
             if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
                 finish_reason = "stop";
                 qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                text_decoder.discard();
                 break;
             }
         }
     }
+    decoded_text.push_str(&text_decoder.finish());
     let decode_duration = decode_start.elapsed();
 
     // Per-slot reset at exit — mirror of iter-1/2/3 exit discipline.
@@ -10130,24 +10125,12 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
         _ => (decoded_text, None),
     };
 
-    let reasoning_token_count = match registration {
-        Some(reg) if reg.has_reasoning() => {
-            let mut sp =
-                super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
-            let mut count = 0usize;
-            for &tok in &generated_tokens {
-                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
-                if let Some(splitter) = sp.as_mut() {
-                    let _ = splitter.feed(&frag);
-                    if splitter.in_reasoning() {
-                        count += 1;
-                    }
-                }
-            }
-            count
-        }
-        _ => 0,
-    };
+    let reasoning_token_count = qwen35_reasoning_token_count(
+        &qwen.tokenizer,
+        registration,
+        params.reasoning_forced_open,
+        &generated_tokens,
+    );
 
     Ok(GenerationResult {
         text: content,

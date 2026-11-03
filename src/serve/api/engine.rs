@@ -7828,14 +7828,26 @@ impl Gemma4DecodeState {
         };
 
         // EOS before push/decode (serial ref 9228-9231): suppress the token
-        // but flush any incomplete UTF-8 tail held back by the decoder.
+        // but flush any incomplete UTF-8 tail held back by the decoder,
+        // classified by the splitters like any other fragment. EOS is not a
+        // completion token, so it does not count toward reasoning tokens.
         if loaded.is_generation_stop_token(self.next_token) {
             self.finish_reason = "stop";
             let fragment = self.text_decoder.finish();
-            self.decoded_text.push_str(&fragment);
+            let mut is_reasoning = false;
+            if !fragment.is_empty() {
+                self.decoded_text.push_str(&fragment);
+                if let Some(sp) = self.reasoning_splitter.as_mut() {
+                    let _ = sp.feed(&fragment);
+                    is_reasoning = sp.in_reasoning();
+                }
+                if let Some(tcs) = self.tc_splitter.as_mut() {
+                    let _ = tcs.feed(&fragment);
+                }
+            }
             return Ok(TickOutcome {
                 fragment,
-                is_reasoning: false,
+                is_reasoning,
                 finished: true,
             });
         }
@@ -20891,7 +20903,7 @@ fn settle_qwen35_decode_lane(
 ) -> Option<Qwen35FatalFailure> {
     let slot_idx = handle.slot_id.0 as usize;
     let qtick = match tick {
-        Ok(t) => t,
+        Ok(t) => state.complete_tick(t),
         Err(e) => {
             if !supervisor.is_healthy() {
                 return Some(Qwen35FatalFailure {

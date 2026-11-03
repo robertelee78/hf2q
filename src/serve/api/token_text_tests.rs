@@ -306,3 +306,95 @@ fn real_gemma4_vocab_byte_tokens_carry_raw_bytes() {
     // Exactly the 128 non-ASCII byte-fallback pieces differ from decode.
     assert_eq!(lossy, 128);
 }
+
+/// Real Qwen vocabulary (ignored): `HF2Q_QWEN35_TOKENIZER` names a byte-level
+/// `tokenizer.json`. A JSON-schema enum value holding an emoji (split over
+/// byte-level pieces) stays reachable token by token through the mask, and
+/// inside the ASCII key no partial-UTF-8 piece survives (the Qwen3.8 replay
+/// sampled `ä¹` = E4 B9 after `"p` before the partial-char check).
+#[test]
+#[ignore = "requires HF2Q_QWEN35_TOKENIZER"]
+fn real_qwen_vocab_emoji_enum_is_reachable_through_the_mask() {
+    let path = std::env::var("HF2Q_QWEN35_TOKENIZER").expect("HF2Q_QWEN35_TOKENIZER");
+    let tokenizer = Tokenizer::from_file(path).expect("tokenizer.json");
+    let table = raw_table(&tokenizer);
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"pick": {"type": "string", "enum": ["🦀 crab", "🧬 helix", "plain"]}},
+        "required": ["pick"],
+        "additionalProperties": false
+    });
+    let source = crate::serve::api::grammar::json_schema::schema_to_gbnf(&schema).expect("gbnf");
+
+    let mut in_key = runtime(&source);
+    assert!(in_key.accept_bytes(b"{\n  \"p"));
+    let mut logits = vec![1.0_f32; table.len()];
+    mask_invalid_tokens_with_eog(&in_key, &table, &[], &mut logits);
+    let partial_survivors: Vec<usize> = (0..table.len())
+        .filter(|&i| logits[i].is_finite() && std::str::from_utf8(&table[i]).is_err())
+        .collect();
+    assert!(partial_survivors.is_empty(), "{partial_survivors:?}");
+    let ick = tokenizer.token_to_id("ick").expect("ick") as usize;
+    assert!(logits[ick].is_finite());
+    let stray = (0..table.len())
+        .find(|&i| table[i] == [0xE4, 0xB9])
+        .expect("E4 B9 piece");
+    assert!(!in_key.clone().accept_token(stray as u32, &table[stray]));
+
+    let mut grammar = runtime(&source);
+    let prefix = tokenizer
+        .encode("{\"pick\": ", false)
+        .expect("encode prefix");
+    let value = tokenizer
+        .encode("\"🦀 crab\"}", false)
+        .expect("encode value");
+    for &token in prefix.get_ids().iter().chain(value.get_ids()) {
+        let mut logits = vec![1.0_f32; table.len()];
+        mask_invalid_tokens_with_eog(&grammar, &table, &[], &mut logits);
+        assert!(
+            logits[token as usize].is_finite(),
+            "token {token} {:?} masked",
+            tokenizer.id_to_token(token)
+        );
+        assert!(grammar.accept_token(token, &table[token as usize]));
+    }
+    assert!(grammar.is_terminally_accepted());
+}
+
+#[test]
+fn partial_utf8_survives_only_where_its_character_can_match() {
+    let tokenizer = gemma_like_tokenizer();
+    let table = raw_table(&tokenizer);
+    let lead_e2 = byte_id(&tokenizer, 0xE2);
+    let lead_ce = byte_id(&tokenizer, 0xCE);
+    let cont_b1 = byte_id(&tokenizer, 0xB1);
+
+    // Only ASCII `i` fits: no lead byte may start a character here.
+    let ascii = runtime("root ::= \"pick\"\n");
+    let mut probe = ascii.clone();
+    assert!(probe.accept_bytes(b"p"));
+    let mut logits = vec![1.0_f32; table.len()];
+    mask_invalid_tokens_with_eog(&probe, &table, &[], &mut logits);
+    assert!(!logits[lead_e2 as usize].is_finite());
+    assert!(!logits[lead_ce as usize].is_finite());
+    assert!(!probe
+        .clone()
+        .accept_token(lead_e2, &table[lead_e2 as usize]));
+    assert!(!probe.clone().accept_bytes(&[0xE2]));
+
+    // `α` = CE B1: its lead byte may start it, another lead byte may not.
+    let alpha = runtime("root ::= \"α\"\n");
+    let mut logits = vec![1.0_f32; table.len()];
+    mask_invalid_tokens_with_eog(&alpha, &table, &[], &mut logits);
+    assert!(logits[lead_ce as usize].is_finite());
+    assert!(!logits[lead_e2 as usize].is_finite());
+    let mut grammar = alpha.clone();
+    assert!(grammar.accept_token(lead_ce, &table[lead_ce as usize]));
+    assert!(grammar.accept_token(cont_b1, &table[cont_b1 as usize]));
+    assert!(grammar.is_terminally_accepted());
+
+    // A completed grammar never continues a partial character.
+    let mut done = runtime("root ::= \"a\"\n");
+    assert!(done.accept_bytes(b"a"));
+    assert!(!done.clone().accept_token(lead_ce, &table[lead_ce as usize]));
+}

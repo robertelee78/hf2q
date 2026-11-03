@@ -77,7 +77,7 @@ fn byte_level_byte(c: char) -> Option<u8> {
 /// as `String::from_utf8_lossy` would render them. Unary text is the
 /// concatenation of every `push` result plus `finish`; SSE emits each `push`
 /// result as its fragment.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct TokenTextDecoder {
     pending: Vec<u8>,
 }

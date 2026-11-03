@@ -345,6 +345,32 @@ pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8)
     !is_positive_char
 }
 
+/// Keep only the stacks whose top character position some completion of the
+/// pending partial UTF-8 sequence can satisfy; a token terminal never can.
+/// A completed (empty) stack cannot continue a partial character either:
+/// token acceptance drops it, matching the mask, while byte acceptance keeps
+/// it as structural acceptance (terminal acceptance still requires a complete
+/// UTF-8 tail). No-op when no partial sequence is pending.
+fn retain_partial_char_stacks(
+    grammar: &Grammar,
+    stacks: &mut Stacks,
+    partial: PartialUtf8,
+    keep_completed: bool,
+) {
+    if partial.n_remain == 0 {
+        return;
+    }
+    stacks.retain(|stack| match stack.last() {
+        None => keep_completed,
+        Some(&top) => at(grammar, top).is_some_and(|element| {
+            matches!(
+                element.ty,
+                GretType::Char | GretType::CharNot | GretType::CharAny
+            ) && match_partial_char(grammar, top, partial)
+        }),
+    });
+}
+
 // ---------------------------------------------------------------------------
 // advance_stack — expand a stack until every entry is a terminal element
 // ---------------------------------------------------------------------------
@@ -615,13 +641,17 @@ fn reject_candidates_for_stack(
 
     for candidate in candidates.iter().copied() {
         if candidate.cursor >= candidate.end {
-            // Preserve hf2q's existing token-table contract exactly: a
-            // syntactically valid but incomplete UTF-8 tail remains alive
-            // while the grammar stack is non-empty, and is resolved after the
-            // next sampled token. hf2q's current table is built from decoded
-            // Rust `String`s and cannot
-            // authoritatively classify byte-fallback fragments.  The clone
-            // oracle exercises this distinction.
+            // End of the token's complete code points. An incomplete UTF-8
+            // tail survives only if some completion of it can satisfy this
+            // character position (the peer's `match_partial_char`). The
+            // token table carries raw bytes for byte-fallback / byte-level
+            // pieces (#553), so a lead byte where no such character fits is
+            // rejected here instead of dead-ending the next step.
+            if candidate.partial_utf8.n_remain != 0
+                && !match_partial_char(grammar, top, candidate.partial_utf8)
+            {
+                rejects.push(candidate);
+            }
             continue;
         }
 
@@ -1148,6 +1178,7 @@ impl GrammarRuntime {
                 }
             }
         }
+        retain_partial_char_stacks(&self.grammar, &mut stacks_new, partial_utf8, false);
         self.stacks = stacks_new;
         if self.dsml_guard.is_some() {
             self.dsml_scan=self.dsml_scan.through(&code_points);
@@ -1226,6 +1257,7 @@ impl GrammarRuntime {
             if partial.n_remain > 0 {
                 // Still incomplete at end-of-buffer — stash for next call.
                 self.partial_utf8 = partial;
+                retain_partial_char_stacks(&self.grammar, &mut self.stacks, partial, true);
                 return !self.stacks.is_empty();
             }
             // Completed code point.
@@ -1267,6 +1299,8 @@ impl GrammarRuntime {
                     value: val,
                     n_remain: remain,
                 };
+                let partial = self.partial_utf8;
+                retain_partial_char_stacks(&self.grammar, &mut self.stacks, partial, true);
                 return !self.stacks.is_empty();
             }
             if !self.accept_char(val) {
