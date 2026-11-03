@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ADR-063 Q1-GEMMA-T2LOC (test-only): a four-lane Gemma stage localizer for the packed T2 route and its All128 reference. Packed prefill rows map to their agents through `gemma_endpoint::packed_owners`, and new batched-decode stage hooks sit in `batched_body.rs`. Each route also writes the unchanged endpoint store, which serves as the observer-effect control against the b3 stores. The Q1 endpoint supervisor gains a `multistore` case kind with closed registry checks (`gemma_loc4`). `q1_stage_localization.py` reports the per-lane first divergence. No production path changes.
+
 ### Changed
 
 - Release reliability: the protected sign job now checks the crates.io token and the Apple credentials before touching the candidate, so a dead credential fails before signing. Before, a bad crates.io token surfaced only at `cargo publish`. Release publishes via crates.io Trusted Publishing, falling back to `CARGO_REGISTRY_TOKEN` until that is configured. Publish no longer runs after a failed candidate build. A fresh dispatch replaces stale assets on a still-draft release, while published releases stay immutable. A candidate commit cut before this change is refused before the build. Release jobs and the CI `release`/`contracts` jobs are pinned to `macos-26`, and the candidate `build.json` (schema 2) records and verifies the macOS, Xcode, SDK and runner image. `scripts/release.sh` dispatches a release and re-runs the same run's jobs when a hosted runner is never acquired.

@@ -168,5 +168,147 @@ class GemmaEndpointWarmKernel(unittest.TestCase):
                 self.run_case(resolved, declared)
 
 
+MULTISTORE_CASE = {
+    "kind": "multistore", "out": "/x/loc4", "packet": {},
+    "filter": "adr063_invariance::gemma_actual::q1_gemma_actual_cohort_stage_localizer",
+    "packet_env": "HF2Q_Q1_GEMMA_ENDPOINT_PACKET",
+    "completion_marker": "Q1_GEMMA_COHORT_STAGE_LOCALIZER_COMPLETE", "marker_stream": "stdout",
+    "stores": {"endpoint": ".", "stages": "stages"}, "checks": ["gemma_loc4"],
+}
+
+
+class MultistorePlan(unittest.TestCase):
+    def plan(self, case):
+        return s.case_plan(bindings({"t0": {"trajectory": "T0ColdSerial"}, "loc4": case}), "loc4")
+
+    def test_closed_multistore_plan(self):
+        plan = self.plan(MULTISTORE_CASE)
+        self.assertEqual((plan["kind"], plan["mode"], plan["checks"], plan["completion_line"]), ("multistore", "multistore", ["gemma_loc4"], None))
+        self.assertEqual(plan["stores"], {"endpoint": ".", "stages": "stages"})
+        fixed = self.plan({**MULTISTORE_CASE, "completion_line": "Q1_GEMMA_COHORT_STAGE_LOCALIZER_COMPLETE mode=x whole_q1=false"})
+        self.assertTrue(fixed["completion_line"].endswith("whole_q1=false"))
+        self.plan({**MULTISTORE_CASE, "manifest": {"path": "/x/m.json", "sha256": "0" * 64}})
+        for bad in ({**MULTISTORE_CASE, "trajectory": "T2ActualCohort"},
+                    {**MULTISTORE_CASE, "checks": ["unknown_check"]},
+                    {**MULTISTORE_CASE, "checks": []},
+                    {**MULTISTORE_CASE, "checks": ["gemma_loc4", "gemma_loc4"]},
+                    {**MULTISTORE_CASE, "stores": {}},
+                    {**MULTISTORE_CASE, "stores": {"endpoint": ".", "stages": "../escape"}},
+                    {**MULTISTORE_CASE, "stores": {"endpoint": ".", "stages": "/abs"}},
+                    {**MULTISTORE_CASE, "stores": {"endpoint": ".", "stages": "a//b"}},
+                    {**MULTISTORE_CASE, "stores": {"endpoint": ".", "stages": "."}},
+                    {**MULTISTORE_CASE, "completion_line": "OTHER_MARKER records=1"},
+                    {**MULTISTORE_CASE, "manifest": {"path": "/x/m.json"}},
+                    {**MULTISTORE_CASE, "operating_review": {"path": "/x/review.json", "sha256": "0" * 64}},
+                    {k: v for k, v in MULTISTORE_CASE.items() if k != "stores"},
+                    {**MULTISTORE_CASE, "marker_stream": "receipt.json"}):
+            with self.assertRaises(ValueError):
+                self.plan(bad)
+
+    def test_multistore_cannot_be_the_first_case(self):
+        with self.assertRaises(ValueError):
+            s.case_plan(bindings({"loc4": {**MULTISTORE_CASE, "trajectory": "T0ColdSerial"}}, "loc4"), "loc4")
+
+    def test_packet_scope_by_kind(self):
+        endpoint = dict(kind="endpoint", mode="T2ActualCohort")
+        self.assertTrue(s.packet_scope(endpoint, {"trajectory": "T2ActualCohort"}))
+        self.assertFalse(s.packet_scope(endpoint, {"trajectory": "T2ActualCohort", "expected_stores": {}}))
+        self.assertFalse(s.packet_scope(dict(kind="localizer"), {"trajectory": "T0ColdSerial"}))
+        self.assertTrue(s.packet_scope(dict(kind="multistore"), {"trajectory": "T2ActualCohort"}))
+
+    def test_extent_from_exactly_one_source(self):
+        extent = {"lanes": [0, 1, 2, 3], "host_payload_limit": 10, "expected_stores": {"a": []}}
+        self.assertEqual(s.multistore_extent(MULTISTORE_CASE, dict(extent, other=1), None), extent)
+        manifest = {**MULTISTORE_CASE, "manifest": {"path": "/x/m.json", "sha256": "0" * 64}}
+        self.assertEqual(s.multistore_extent(manifest, {"trajectory": "T5"}, json.dumps(extent).encode()), extent)
+        for case, packet, data in ((manifest, extent, json.dumps(extent).encode()),   # both
+                                   (MULTISTORE_CASE, {}, None),                       # neither
+                                   (manifest, {}, None),                              # case names an unread manifest
+                                   (MULTISTORE_CASE, {**extent, "lanes": [1, 0]}, None),
+                                   (MULTISTORE_CASE, {**extent, "lanes": [4]}, None),
+                                   (MULTISTORE_CASE, {**extent, "lanes": []}, None),
+                                   (MULTISTORE_CASE, {k: v for k, v in extent.items() if k != "lanes"}, None),
+                                   (manifest, {}, json.dumps({**extent, "extra": 1}).encode())):
+            with self.assertRaises((ValueError, KeyError)):
+                s.multistore_extent(case, packet, data)
+
+
+class GemmaLoc4(unittest.TestCase):
+    LANES = [[lane * 1000 + i for i in range(144)] for lane in range(4)]
+
+    def run_case(self, trajectory="T2ActualCohort", mutate=None):
+        with tempfile.TemporaryDirectory() as root:
+            out = Path(root)
+            logits = [{"at": at("agent-" + str(l), p), "logical_bytes": 8} for l in range(4) for p in range(144)]
+            stages = [{"at": at("agent-" + str(l), r, "Key", 1), "logical_bytes": 16} for l in range(4) for r in range(128)]
+            case = dict(policy={"phase_payload_upper_bytes": 1 << 20, "lanes": 4, "stage_payload_upper_bytes": 1 << 16},
+                        packet={"trajectory": trajectory, "workload": {"lanes": self.LANES},
+                                "stage_localizer": {"rerun_id": "cohort-packed", "host_payload_limit": 16 * 512},
+                                "lanes": [0, 1, 2, 3], "host_payload_limit": 8 * 576 + 16 * 512,
+                                "expected_stores": {"endpoint": logits, "stages": stages}},
+                        execution={"whole_q1_qualified": False, "planned_tensor_payload": 8 * 576, "warm_live_kernel": "VecHybrid",
+                                   "schema": s.COHORT_SCHEMA, "trajectory": trajectory, "stage_route": s.COHORT_ROUTES.get(trajectory),
+                                   "rerun_id": "cohort-packed", "stage_store": "stages", "lanes": [0, 1, 2, 3],
+                                   "stage_records": 512, "stage_planned_payload": 16 * 512},
+                        logits=logits, stages=stages, records=576 + 512, plan_case=dict(MULTISTORE_CASE))
+            if mutate:
+                mutate(case)
+            packet = case["packet"]
+            (out / "packet.json").write_text(json.dumps(packet))
+            case["execution"]["packet_sha256"] = s.sha(out / "packet.json")
+            write_run(out, case["execution"], case["logits"])
+            (out / "output/stages").mkdir()
+            (out / "output/stages/trace.json").write_text(json.dumps({"identity": IDENTITY,
+                "acquisition": {"observed_model_opens": 3, "required_model_opens": 3},
+                "coverage": {"captured": case["stages"], "expected": case["stages"], "errors": []}}))
+            (out / "stdout").write_text("test result: ok.\nQ1_GEMMA_COHORT_STAGE_LOCALIZER_COMPLETE records=%d whole_q1_qualified=false\n" % case["records"])
+            b = bindings({"t0": {"trajectory": "T0ColdSerial"}, "loc4": case["plan_case"]})
+            plan = s.case_plan(b, "loc4")
+            extent = s.multistore_extent(case["plan_case"], packet, None)
+            return s.validate_multistore(out, b, "loc4", plan, packet, extent, IDENTITY, case["policy"])
+
+    def test_complete_four_lane_localizer_passes_for_both_routes(self):
+        for trajectory in ("T2ActualCohort", "T0ColdSerial"):
+            evidence = self.run_case(trajectory)
+            self.assertEqual(evidence["captured_records"], 1088)
+            self.assertEqual(evidence["stores"], {"endpoint": {"records": 576, "bytes": 4608}, "stages": {"records": 512, "bytes": 8192}})
+            self.assertEqual(evidence["gemma_loc4"]["stage_route"], s.COHORT_ROUTES[trajectory])
+            self.assertEqual(evidence["gemma_loc4"]["logit_records"], 576)
+
+    def test_refusals(self):
+        def drop_lane(c):  # stage store misses lane 3 (and its frozen manifest agrees)
+            c["stages"] = [x for x in c["stages"] if x["at"]["agent"] != "agent-3"]
+            c["packet"]["expected_stores"]["stages"] = c["stages"]; c["records"] -= 128
+            c["execution"]["stage_records"] -= 128; c["execution"]["stage_planned_payload"] -= 2048
+        def foreign_lane(c):
+            c["packet"]["lanes"] = [0, 1, 2]
+        def drift(c):  # captured store differs from the frozen packet extent
+            c["packet"]["expected_stores"]["stages"] = c["stages"][:-1]
+        def route(c):
+            c["execution"]["stage_route"] = s.COHORT_ROUTES["T0ColdSerial"]
+        def stage_bytes(c):
+            c["execution"]["stage_planned_payload"] += 1
+        def two_lane_policy(c):
+            c["policy"]["lanes"] = 2
+        def stage_policy(c):
+            c["policy"]["stage_payload_upper_bytes"] = 1024
+        def host(c):
+            c["packet"]["host_payload_limit"] = 100
+        def marker(c):
+            c["records"] += 1
+        def stores(c):
+            c["plan_case"]["stores"] = {"endpoint": ".", "stages": "other"}
+        def missing_logit(c):
+            c["logits"] = c["logits"][:-1]; c["packet"]["expected_stores"]["endpoint"] = c["logits"]; c["records"] -= 1
+        def ordinary_axis(c):
+            c["packet"]["trajectory"] = "T3Chunk64"
+        def no_plan(c):
+            del c["packet"]["stage_localizer"]
+        for mutate in (drop_lane, foreign_lane, drift, route, stage_bytes, two_lane_policy, stage_policy, host,
+                       marker, stores, missing_logit, ordinary_axis, no_plan):
+            with self.subTest(mutate.__name__), self.assertRaises((ValueError, KeyError, FileNotFoundError)):
+                self.run_case(mutate=mutate)
+
+
 if __name__ == "__main__":
     unittest.main()

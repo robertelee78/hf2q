@@ -1,19 +1,26 @@
 //! Root-only actual four-logical-lane Gemma ordinary trajectories. No T2/T5/T6
-//! substitution, no model/device construction in hosted controls.
-use super::{acquisition, gemma_cache, gemma_endpoint as endpoint, protocol::*,receipt::*,store::{hash,Store}};
+//! substitution, no model/device construction in hosted controls. The cohort
+//! stage localizer (`gemma_cohort_localizer`) runs the T0/T2 bodies here, under
+//! its own filters, with a nested stage store beside the unchanged endpoints.
+use super::{acquisition, gemma_cache, gemma_cohort_localizer as cohort, gemma_endpoint as endpoint, protocol::*,receipt::*,store::{hash,Store}};
 use anyhow::{ensure,Context,Result};
 use serde::{Deserialize,Serialize};
-use std::{fs::OpenOptions,io::{Read,Write},os::unix::fs::OpenOptionsExt,path::PathBuf};
+use std::{collections::BTreeMap,fs::OpenOptions,io::{Read,Write},os::unix::fs::OpenOptionsExt,path::PathBuf};
 use crate::serve::{api::engine::{GemmaLoadedModel,LoadOptions,LoadedModel},multi_seq_kv::SlotId};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Packet {
+pub(super) struct Packet {
     execution_approved:bool, acquisition:acquisition::Binding,identity:Identity,
     workload:Workload,trajectory:Trajectory,model:PathBuf,output:PathBuf,
     configured_context:u32,configured_output_allowance:usize,host_payload_limit:u64,
     #[serde(default)] routing_witness:Option<super::gemma_routing_witness::Budget>,
     /// Warm live-resume kernel the loaded model must resolve; absent = VecHybrid.
     #[serde(default)] warm_live_kernel:WarmLiveKernel,
+    /// Cohort stage localizer only: the stage plan, the lanes it covers and
+    /// every store's frozen record list (`endpoint`, `stages`).
+    #[serde(default)] stage_localizer:Option<cohort::Plan>,
+    #[serde(default)] lanes:Option<Vec<usize>>,
+    #[serde(default)] expected_stores:Option<BTreeMap<String,Vec<ExpectedTensor>>>,
 }
 /// Gemma warm live-resume attention kernel (T1/T3/T6 64-row resumes and the
 /// localizer's `[64,64]` route). It is resolved once at model load and is not
@@ -28,7 +35,10 @@ pub(super) fn require_warm_kernel(declared:WarmLiveKernel,resolved:crate::infere
     ensure!(resolved==declared,"resolved Gemma warm live kernel {resolved:?} differs from the packet's {declared:?} (absent = shipped VecHybrid)");
     Ok(resolved)
 }
-fn preflight(p:&Packet)->Result<()> {
+const ENDPOINT_PACKET_BYTES:usize=1024*1024;
+/// A localizer packet carries both frozen store lists (indent-2 JSON).
+const LOCALIZER_PACKET_BYTES:usize=16*1024*1024;
+pub(super) fn preflight(p:&Packet,localizer:bool)->Result<()> {
     p.identity.validate().map_err(anyhow::Error::msg)?;p.workload.validate().map_err(anyhow::Error::msg)?;
     ensure!(p.execution_approved && p.identity.family==Family::Gemma4 && p.workload.family==Family::Gemma4,
         "explicit approved Gemma packet/family required");
@@ -40,6 +50,17 @@ fn preflight(p:&Packet)->Result<()> {
     ensure!(p.host_payload_limit>0 && p.host_payload_limit<=2*1024*1024*1024,
         "bounded explicit Gemma host payload required");
     super::gemma_routing_witness::validate_budget(p.routing_witness.as_ref())?;
+    ensure!(p.stage_localizer.is_some()==localizer && p.lanes.is_some()==localizer && p.expected_stores.is_some()==localizer,
+        "stage-localizer packets run only under their own filters, and only they carry stores");
+    if localizer {
+        cohort::route(p.trajectory).map_err(anyhow::Error::msg)?;
+        ensure!(p.routing_witness.is_some(),"cohort localizer mirrors the witness-ON b3 endpoint stores");
+        ensure!(p.lanes.as_deref()==Some(&[0,1,2,3][..]),"cohort localizer covers all four workload lanes");
+        ensure!(p.expected_stores.as_ref().is_some_and(|s|s.len()==2 && s.contains_key(cohort::ENDPOINT_STORE)
+            && s.contains_key(cohort::STAGE_STORE)),"exactly the endpoint and stage stores");
+        ensure!(std::env::var_os("HF2Q_PARALLEL_ENCODE").is_none(),
+            "single-row decode stage hooks run on the owning thread only");
+    }
     Ok(())
 }
 pub(super) fn require_ordinary(t:Trajectory)->Result<()> {
@@ -62,6 +83,21 @@ pub(super) fn positions(t:Trajectory)->Vec<(usize,bool)> {
     let mut p=vec![(128,false),(144,false)];
     if matches!(t,Trajectory::T1Resume64|Trajectory::T3Chunk64|Trajectory::T6CancelRestore) {p.push((64,false));}
     if matches!(t,Trajectory::T1Resume64|Trajectory::T6CancelRestore) {p.push((64,true));}p
+}
+/// Every endpoint record of one trajectory, in capture order: active cache at
+/// its boundaries, then all four lanes' 144 logit rows.
+pub(super) fn endpoint_expected(cfg:&crate::serve::config::Gemma4Config,t:Trajectory)->Result<Vec<ExpectedTensor>> {
+    let mut expected=gemma_cache::expected(cfg,&[0,1,2,3],&positions(t)).map_err(anyhow::Error::msg)?;
+    for lane in 0..4 {for pos in 0..144 {expected.push(ExpectedTensor {at:Coordinate {
+        logical_step:0,layer:u32::MAX,stage:Stage::Logits,agent:format!("agent-{lane}"),
+        logical_row_start:pos,segment:0},scalar:Scalar::F32,shape:vec![1,cfg.vocab_size]});}}
+    Ok(expected)
+}
+fn payload(expected:&[ExpectedTensor])->Result<u64> {
+    expected.iter().try_fold(0u64,|sum,e| {
+        let n=e.shape.iter().try_fold(e.scalar.bytes() as u64,|a,&b|a.checked_mul(b as u64))?;
+        sum.checked_add(n)
+    }).context("Gemma capture payload overflow")
 }
 fn cache(model:&GemmaLoadedModel,lane:usize,pos:usize,restored:bool)->Result<()> {
     endpoint::with_store(|s|gemma_cache::after_checked_return(s,&model.config,
@@ -86,58 +122,94 @@ fn prefill(model:&mut GemmaLoadedModel,tokens:&[u32],lane:usize,cached:usize)->R
 }
 #[test]
 #[ignore="root supervised actual Gemma model; reviewed acquisition/resource packet required"]
-fn q1_gemma_actual_ordinary_endpoint_trace() {run(None).unwrap();}
+fn q1_gemma_actual_ordinary_endpoint_trace() {run(None,false).unwrap();}
 #[test]
 #[ignore="root supervised actual Gemma packed cohort; reviewed resource/identity packet"]
-fn q1_gemma_actual_cohort_endpoint_trace() {run(Some(Trajectory::T2ActualCohort)).unwrap();}
+fn q1_gemma_actual_cohort_endpoint_trace() {run(Some(Trajectory::T2ActualCohort),false).unwrap();}
 #[test]
 #[ignore="root supervised actual Gemma owning-worker cancellation and exact64 restore"]
-fn q1_gemma_actual_cancel_endpoint_trace() {run(Some(Trajectory::T6CancelRestore)).unwrap();}
-fn run(separate:Option<Trajectory>)->Result<()> {
+fn q1_gemma_actual_cancel_endpoint_trace() {run(Some(Trajectory::T6CancelRestore),false).unwrap();}
+#[test]
+#[ignore="root supervised actual Gemma four-lane All128 stage localizer; reviewed multistore packet"]
+fn q1_gemma_actual_all128_stage_localizer() {run(Some(Trajectory::T0ColdSerial),true).unwrap();}
+#[test]
+#[ignore="root supervised actual Gemma packed T2 stage localizer; reviewed multistore packet"]
+fn q1_gemma_actual_cohort_stage_localizer() {run(Some(Trajectory::T2ActualCohort),true).unwrap();}
+fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
     ensure!(cfg!(target_endian="little"),"raw tensor encoding requires little endian");
     let path=std::env::var_os("HF2Q_Q1_GEMMA_ENDPOINT_PACKET").context("explicit Gemma endpoint packet")?;
-    let mut raw=Vec::new();std::fs::File::open(path)?.take(1024*1024+1).read_to_end(&mut raw)?;
-    ensure!(raw.len()<=1024*1024,"Gemma packet quota");
-    let p:Packet=serde_json::from_slice(&raw)?;preflight(&p)?;
+    let quota=if localizer {LOCALIZER_PACKET_BYTES}else{ENDPOINT_PACKET_BYTES};
+    let mut raw=Vec::new();std::fs::File::open(path)?.take(quota as u64+1).read_to_end(&mut raw)?;
+    ensure!(raw.len()<=quota,"Gemma packet quota");
+    let p:Packet=serde_json::from_slice(&raw)?;preflight(&p,localizer)?;
     if let Some(t)=separate {ensure!(p.trajectory==t,"actual test filter/trajectory mismatch");}
     else {require_ordinary(p.trajectory)?;}
+    let recipe_for=|cfg:&crate::serve::config::Gemma4Config| if localizer {cohort::recipe(cfg)}
+        else {selected_recipe(cfg,p.routing_witness.is_some())};
     let scope=acquisition::Scope::begin(&p.acquisition,&p.identity,&p.workload,&p.model,&p.output,&raw)?;
     let header=acquisition::open_model(&p.model)?;
     ensure!(header.metadata_string("general.architecture")==Some("gemma4"),"no family fallback");
     let mut cfg=crate::serve::config::Gemma4Config::from_gguf(&header)?;
     cfg.max_position_embeddings=p.configured_context as usize;
     ensure!(cfg.vocab_size==p.workload.vocab_size as usize,"Gemma actual vocabulary mismatch");
-    scope.check_config(&p.identity,&selected_recipe(&cfg,p.routing_witness.is_some()))?;drop(header);
-    let mut expected=gemma_cache::expected(&cfg,&[0,1,2,3],&positions(p.trajectory)).map_err(anyhow::Error::msg)?;
-    for lane in 0..4 {for pos in 0..144 {expected.push(ExpectedTensor {at:Coordinate {
-        logical_step:0,layer:u32::MAX,stage:Stage::Logits,agent:format!("agent-{lane}"),
-        logical_row_start:pos,segment:0},scalar:Scalar::F32,shape:vec![1,cfg.vocab_size]});}}
-    let bytes=expected.iter().try_fold(0u64,|sum,e| {
-        let n=e.shape.iter().try_fold(e.scalar.bytes() as u64,|a,&b|a.checked_mul(b as u64))?;
-        sum.checked_add(n)
-    }).context("Gemma capture payload overflow")?;
+    scope.check_config(&p.identity,&recipe_for(&cfg))?;drop(header);
+    let expected=endpoint_expected(&cfg,p.trajectory)?;
+    let bytes=payload(&expected)?;
     ensure!(bytes<=p.host_payload_limit,"Gemma payload exceeds pre-load bound");
-    if p.routing_witness.is_some(){ensure!(bytes+super::gemma_routing_witness::PAYLOAD_BYTES+
-        super::gemma_routing_witness::METADATA_BYTES+super::gemma_routing_witness::CPU_LEDGER_BYTES<=p.host_payload_limit,
+    let witness=super::gemma_routing_witness::PAYLOAD_BYTES+super::gemma_routing_witness::METADATA_BYTES
+        +super::gemma_routing_witness::CPU_LEDGER_BYTES;
+    if p.routing_witness.is_some(){ensure!(bytes+witness<=p.host_payload_limit,
         "routing+metadata+CPU ledger must join pre-load host bound");}
+    // Cohort localizer: both frozen store lists must be the source manifests,
+    // and endpoint + routing + stage bytes join the one packet bound.
+    let stage_root=p.output.join(cohort::STAGE_STORE);
+    let (stage_plan,mut stage_targets,stage_bytes)=match (&p.stage_localizer,&p.expected_stores) {
+        (Some(plan),Some(stores))=>{
+            ensure!(stores[cohort::ENDPOINT_STORE]==expected,"packet endpoint store differs from the source endpoint manifest");
+            let frozen=&stores[cohort::STAGE_STORE];
+            let (targets,stage_bytes)=cohort::admit(&cfg,plan,frozen).map_err(anyhow::Error::msg)?;
+            ensure!(bytes+witness+plan.host_payload_limit<=p.host_payload_limit,
+                "endpoint+routing+stage payload must join the packet host bound");
+            (Some((plan,frozen.clone())),Some(targets),stage_bytes)
+        }
+        _=>(None,None,0),
+    };
     let records=expected.len();
     let mut store=Store::new(&p.output,p.identity.clone(),p.trajectory.label().into(),expected,
         p.host_payload_limit,records).map_err(anyhow::Error::msg)?;
+    let mut stage_store=match stage_plan {
+        Some((plan,frozen))=>{let n=frozen.len();Some(Store::new(&stage_root,p.identity.clone(),plan.rerun_id.clone(),
+            frozen,plan.host_payload_limit,n).map_err(anyhow::Error::msg)?)}
+        None=>None,
+    };
     let _gpu=crate::inference::hf2q_gpu_test_lock();
     let options=LoadOptions {model_path:p.model.clone(),tokenizer_path:None,config_path:None,
         dwq_overlay_path:None,kv_persist_dir:None,kv_persist_budget_bytes:0,glp_path:None,glp_alpha:None,kv_graft_path:None};
     let LoadedModel::Gemma(mut model)=LoadedModel::load_with_context(&options,Some(p.configured_context))?
         else {anyhow::bail!("explicit Gemma model required")};
-    scope.check_config(&p.identity,&selected_recipe(&model.config,p.routing_witness.is_some()))?;
+    scope.check_config(&p.identity,&recipe_for(&model.config))?;
     let warm_live_kernel=require_warm_kernel(p.warm_live_kernel,model.weights.warm_live_kernel)?;
     let observed=scope.observed(model.ctx.executor.device(),&model as *const _ as usize as u64,3)?;
     store.bind_acquisition(observed.clone()).map_err(anyhow::Error::msg)?;
+    if let Some(stages)=stage_store.as_mut() {
+        // Same acquisition; the nested store's own root.
+        stages.bind_acquisition(acquisition::Acquisition {output_root:stage_root.clone(),..observed.clone()})
+            .map_err(anyhow::Error::msg)?;
+        if p.stage_localizer.as_ref().is_some_and(|plan|plan.prefill_stages.iter().chain(&plan.decode_stages)
+            .any(|s|matches!(s,Stage::RouterLogits|Stage::RouterIds|Stage::RouterWeights))) {
+            stages.missing_capability("Gemma actual native post-softmax/renormalized selection kth+1 GPU score is not a captured stage output; the routing witness carries the selection-domain margins");
+        }
+    }
     model.provision_multi_seq_kv_for_slot_aware(4)?;
     ensure!(model.multi_seq_kv_hybrid.is_some() && model.multi_seq_kv_dense.is_none()
         && model.multi_seq_kv_mlx.is_none(),"selected Hybrid only; other actual legs require explicit coverage");
     let routing_mode=if p.trajectory==Trajectory::T6CancelRestore {super::gemma_routing_witness::Mode::Cancelled}else{super::gemma_routing_witness::Mode::Ordinary};
     let _routing=super::gemma_routing_witness::install(model.ctx.executor.device(),&p.output,&p.identity,&observed,routing_mode,p.routing_witness.as_ref())?;
     let _capture=endpoint::install(store).map_err(anyhow::Error::msg)?;
+    let _stages=match (stage_store,stage_targets.take()) {
+        (Some(stages),Some(targets))=>Some(super::family::install(Family::Gemma4,stages,targets).map_err(anyhow::Error::msg)?),
+        _=>None,
+    };
     let order=if p.trajectory==Trajectory::T4ReverseOrder {[3,2,1,0]}else{[0,1,2,3]};
     let mut cancellation=Vec::new();
     let result=(||->Result<()> {
@@ -165,6 +237,9 @@ fn run(separate:Option<Trajectory>)->Result<()> {
             return Ok(());
         }
         for lane in order {
+            // All128 reference localizer: every single-sequence call of this
+            // lane owns its stage rows (packed T2 rows carry their own owners).
+            let _lane=if localizer {Some(super::gemma_prefill::serial_lane(lane)?)}else{None};
             let tokens=&p.workload.lanes[lane];
             if p.trajectory==Trajectory::T6CancelRestore {
                 endpoint::begin_call(lane,0,64).map_err(anyhow::Error::msg)?;
@@ -200,24 +275,49 @@ fn run(separate:Option<Trajectory>)->Result<()> {
     })();
     if let Err(ref error)=result {let _=endpoint::with_store(|s|{s.fail(error.to_string());Ok(())});}
     scope.check_unchanged()?;
+    let stage_trace=localizer.then(|| super::family::finish().map_err(anyhow::Error::msg));
     let trace=endpoint::finish().map_err(anyhow::Error::msg)?;result?;
+    let stage_trace=stage_trace.transpose()?;
     super::gemma_routing_witness::finish()?;
     ensure!(trace.coverage.errors.is_empty(),"Gemma endpoint extent incomplete");
+    if let Some(stages)=&stage_trace {
+        ensure!(stages.coverage.errors.is_empty(),"Gemma cohort stage coverage incomplete: {:?}",stages.coverage.errors);
+    }
     let exact64=if matches!(p.trajectory,Trajectory::T1Resume64|Trajectory::T6CancelRestore) {
         Some(gemma_cache::require_restore64_exact(&trace.coverage.captured))
     } else {None};
-    let report=serde_json::json!({"schema":"hf2q.q1.gemma-ordinary-endpoint.v1","packet_sha256":hash(&raw),
+    let mut report=serde_json::json!({"schema":"hf2q.q1.gemma-ordinary-endpoint.v1","packet_sha256":hash(&raw),
         "trajectory":p.trajectory,"actual_cancellation":cancellation,"active64_exact_copy":exact64,"logical_lanes":4,"physical_graph_membership":if p.trajectory==Trajectory::T2ActualCohort {
             "actual packed prefill512 rows with four128-owner spans; actual decode input4rows; operator-specific source geometry, not whole-kernel/F2 membership"
         } else {"per-request ordinary; not T2"},
         "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,"warm_live_kernel":warm_live_kernel,
         "planned_tensor_payload":bytes,"oracle_quality_qualified":false,"whole_q1_qualified":false,
         "float_policy":"Unspecified","diagnostic_head_scope":"same production scalar head applied to every actual prefill hidden row"});
+    let mut stage_records=0;
+    if let (Some(stages),Some(plan))=(&stage_trace,&p.stage_localizer) {
+        stage_records=stages.coverage.captured.len();
+        let extra=serde_json::json!({"schema":cohort::SCHEMA,"rerun_id":plan.rerun_id,
+            "stage_route":cohort::route(p.trajectory).map_err(anyhow::Error::msg)?,"lanes":[0,1,2,3],
+            "stage_store":cohort::STAGE_STORE,"stage_records":stage_records,"stage_planned_payload":stage_bytes,
+            "stage_layers":plan.layers,"prefill_stages":plan.prefill_stages,"decode_stages":plan.decode_stages,
+            "row_owners":if p.trajectory==Trajectory::T2ActualCohort {
+                "packed prefill rows via gemma_endpoint::packed_owners (lane*128); batched decode row i = slot i = lane i"
+            } else {"one serial-lane lease per lane around its single-sequence prefill and single-row decode"},
+            "decode_hooks":if p.trajectory==Trajectory::T2ActualCohort {"batched_body.rs capture_batched"}else{"gpu_full_attn.rs single-row capture"},
+            "observer_effect_control":"exact of this endpoint store against the b3 endpoint store of the same trajectory",
+            "route_class":"ClassB packed-versus-All128; localization implies no fix"});
+        report.as_object_mut().context("report object")?.extend(extra.as_object().context("stage receipt")?.clone());
+    }
     let mut file=OpenOptions::new().create_new(true).write(true).mode(0o600).open(p.output.join("execution.json"))?;
     file.write_all(&serde_json::to_vec_pretty(&report)?)?;
     if let Some(exact)=exact64 {exact.map_err(anyhow::Error::msg)?;}
-    println!("Q1_GEMMA_ORDINARY_ENDPOINT_COMPLETE lanes=4 logits=144 whole_q1=false");Ok(())
+    if localizer {
+        println!("{} records={} whole_q1_qualified=false",cohort::MARKER,records+stage_records);
+    } else {
+        println!("Q1_GEMMA_ORDINARY_ENDPOINT_COMPLETE lanes=4 logits=144 whole_q1=false");
+    }
+    Ok(())
 }
 #[cfg(test)]
 #[path="gemma_controls.rs"]
-mod controls;
+pub(super) mod controls;

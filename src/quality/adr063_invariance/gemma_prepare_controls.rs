@@ -224,3 +224,43 @@ fn localizer_prep_config_is_optional_closed_and_route_invariant() {
     let unsafe_id:Config=serde_json::from_value(localizer_config(Some(unsafe_id))).unwrap();
     assert!(localizer_routes(&cfg(),unsafe_id.localizer.as_ref().unwrap()).is_err());
 }
+#[test]
+fn cohort_localizer_prep_emits_two_admissible_multistore_packets() {
+    use super::super::{gemma_actual,gemma_cohort_localizer as cohort,gemma_localizer::PREFILL_STAGES,receipt::ExpectedTensor};
+    let block=serde_json::json!({"layers":[0,1],"prefill_stages":PREFILL_STAGES,"decode_stages":cohort::DECODE_STAGES});
+    let mut value=localizer_config(None);value["cohort_localizer"]=block.clone();
+    let c:Config=serde_json::from_value(value.clone()).unwrap();
+    let mut unknown=value;unknown["cohort_localizer"]["agent"]=serde_json::json!(0);
+    assert!(serde_json::from_value::<Config>(unknown).is_err());
+    let work=Workload {family:Family::Gemma4,vocab_size:262144,
+        lanes:(0..4u32).map(|lane|(0..144).map(|i|lane*1000+i).collect()).collect()};
+    let files=cohort_localizer_export(&c,c.cohort_localizer.as_ref().unwrap(),&cfg(),&work,&"b".repeat(40),&"c".repeat(64),b"raw").unwrap();
+    assert_eq!(files.iter().map(|(n,_)|n.as_str()).collect::<Vec<_>>(),
+        vec!["cohort-localizer-prepared.json","cohort-localizer-packet-all128.json","cohort-localizer-packet-packed.json"]);
+    let prepared:serde_json::Value=serde_json::from_slice(&files[0].1).unwrap();
+    assert_eq!(prepared["supervisor_case"]["kind"],"multistore");
+    let (_,stages,stage_bytes)=cohort::manifest(&cfg(),&[0,1],&PREFILL_STAGES,&cohort::DECODE_STAGES).unwrap();
+    let mut config=None;
+    for ((_,bytes),trajectory) in files[1..].iter().zip(["T0ColdSerial","T2ActualCohort"]) {
+        let mut packet:serde_json::Value=serde_json::from_slice(bytes).unwrap();
+        assert_eq!(packet["trajectory"],trajectory);assert_eq!(packet["execution_approved"],false);
+        assert_eq!(packet["identity"]["native_checksum"],serde_json::Value::Null);
+        let frozen:Vec<ExpectedTensor>=serde_json::from_value(packet["expected_stores"]["stages"].clone()).unwrap();
+        assert_eq!(frozen,stages);
+        let endpoint:Vec<ExpectedTensor>=serde_json::from_value(packet["expected_stores"]["endpoint"].clone()).unwrap();
+        assert_eq!(endpoint,gemma_actual::endpoint_expected(&cfg(),serde_json::from_value(packet["trajectory"].clone()).unwrap()).unwrap());
+        let charge=super::super::gemma_routing_witness::PAYLOAD_BYTES+super::super::gemma_routing_witness::METADATA_BYTES
+            +super::super::gemma_routing_witness::CPU_LEDGER_BYTES;
+        assert_eq!(packet["host_payload_limit"],788765696+charge+stage_bytes);
+        // Both routes share one separate composition key.
+        let key=packet["identity"]["config_sha256"].clone();assert_eq!(*config.get_or_insert(key.clone()),key);
+        // What the supervisor fills; the actual filter's preflight then admits it.
+        packet["execution_approved"]=serde_json::json!(true);packet["output"]=serde_json::json!("/x/out");
+        packet["identity"]["native_checksum"]=serde_json::json!("d".repeat(64));
+        packet["acquisition"]=serde_json::json!({"composition":{"path":"/x/c","sha256":"e".repeat(64)},
+            "independent_review":{"path":"/x/r","sha256":"f".repeat(64)}});
+        let p:gemma_actual::Packet=serde_json::from_value(packet).unwrap();
+        gemma_actual::preflight(&p,true).unwrap();
+    }
+    assert_eq!(config.unwrap(),serde_json::json!(acquisition::config_digest(&cohort::recipe(&cfg())).unwrap()));
+}

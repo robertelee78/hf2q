@@ -48,3 +48,45 @@ multi-sequence mismatch and omitted-row refusals. Root must compile and execute
 those controls before preparing a guarded actual Gemma T2 case. No CPU oracle
 or new numeric tolerance is introduced; backend findings remain separate from
 oracle completeness and independent task quality.
+
+## Four-lane stage localizer (Q1-GEMMA-T2LOC, #652)
+
+Two test filters in `gemma_actual` run the T0 and T2 bodies above unchanged,
+with the same endpoint cache/logit capture and routing witness as the b3
+stores, and add a nested stage store at `output/stages`:
+`q1_gemma_actual_all128_stage_localizer` (`T0ColdSerial`, the All128
+reference for agents 0–3) and `q1_gemma_actual_cohort_stage_localizer`
+(`T2ActualCohort`). Both read `HF2Q_Q1_GEMMA_ENDPOINT_PACKET`, refuse an
+ordinary endpoint packet, and the endpoint filters refuse theirs.
+
+- **Packed prefill.** The per-layer prefill terminal receives the exact
+  packed descriptor and maps every one of the 512 rows at `lane*128` through
+  `gemma_endpoint::packed_owners` to `(agent, position)`.
+- **Batched decode.** New `#[cfg(test)]` hooks in `batched_body.rs`
+  (`gemma_stage::capture_batched`) capture the single-row decode roles (Norm,
+  Query, Key, RopeQuery, RopeKey, Value, Attention, FfnNorm, router
+  logits/ids/weights, LayerOutput) per actual `[N, stride]` row. Row `i`
+  belongs to slot `i`, which the Q1 cohort binds to lane `i`.
+- **All128 reference.** A serial-lane lease names the lane of each
+  single-sequence prefill and single-row decode, so the existing single-row
+  hooks label rows by lane. They serve the All128 route only.
+
+Targets are owned-row templates. A row is stored only at the owner the source
+names, and a fixed-lane path cannot capture them. One route-agnostic manifest
+(`gemma_cohort_localizer::manifest`: layers × prefill roles × 4 lanes × rows
+0–127, then decode positions 128–143) is frozen in both packets. The two stage
+stores therefore compare coordinate for coordinate. Both routes share one
+separate composition key (`gemma-four-lane-stage-localizer-native-routing1511-v1`).
+
+The metadata prepare's optional `cohort_localizer` block (`layers`,
+`prefill_stages`, `decode_stages`) writes `cohort-localizer-prepared.json` and
+two disabled `multistore` packets (`all128`, `packed`). The supervisor's
+`multistore` kind with check `gemma_loc4` validates both stores, all four lanes
+and the four-lane policy (`lanes: 4`, `stage_payload_upper_bytes`).
+
+Observer-effect control: `exact` of each localizer endpoint store against
+`gemma-t0-b3` / `gemma-t2-b3` must be `ExactEqual`. The stage localization
+record is `scripts/four_agent/q1_stage_localization.py` (per-lane first
+divergence in execution order, router-id changes, and the rows 29–127
+repetition with its magnitude). Packed versus All128 is Class B, so a
+localized stage implies no fix.

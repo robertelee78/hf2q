@@ -1993,6 +1993,15 @@ impl MlxModelWeights {
         // end of the function knows whether to call stop_capture.
         let mut capture_active: bool = false;
 
+        // ADR-063 Q1: the exact packed source descriptor (slot,start,len,offset)
+        // that both the per-layer stage capture and the diagnostic head map
+        // through `gemma_endpoint::packed_owners`. `None` = single sequence.
+        #[cfg(test)]
+        let q1_packed_layout: Option<crate::adr063_invariance::gemma_endpoint::PackedLayout> =
+            self.multi_seq_prefill.as_ref().map(|ms| {
+                ms.slot_ids.iter().zip(&ms.start_positions).zip(&ms.seq_lens).zip(&ms.seq_offsets)
+                    .map(|(((slot, start), len), offset)| (slot.0, *start, *len, *offset)).collect()
+            });
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             #[cfg(test)]
             let mut q1_layer_terminal_checked = false;
@@ -5268,6 +5277,7 @@ impl MlxModelWeights {
                     (crate::adr063_invariance::receipt::Stage::MoeOutput, &pf_moe_accum, vec![seq_len, hs]),
                     (crate::adr063_invariance::receipt::Stage::LayerOutput, &pf_hidden, vec![seq_len, hs]),
                 ],
+                q1_packed_layout.as_ref(),
             )?;
 
             let new_write_pos = self
@@ -5566,9 +5576,7 @@ impl MlxModelWeights {
         };
         #[cfg(test)]
         let q1_endpoint_rows = crate::adr063_invariance::gemma_endpoint::head_rows(
-            start_pos, seq_len, self.multi_seq_prefill.as_ref().map(|ms|
-                ms.slot_ids.iter().zip(&ms.start_positions).zip(&ms.seq_lens).zip(&ms.seq_offsets)
-                    .map(|(((slot,start),len),offset)|(slot.0,*start,*len,*offset)).collect()))
+            start_pos, seq_len, q1_packed_layout.clone())
             .map_err(anyhow::Error::msg)?;
         #[cfg(test)]
         let q1_endpoint_all_rows = q1_endpoint_rows.is_some();
