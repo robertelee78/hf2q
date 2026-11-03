@@ -421,6 +421,31 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(len(ports), 4)
         self.assertFalse(ports & hf_ports)
 
+    def test_ds4_file_peer_case_differs_from_the_matched_peer_arm_only_in_artifact_and_tuning(self):
+        # Q4-DS4 (#661): ds4's DeepSeek-V4 file under the matched peer arm. Only the artifact, the port and the
+        # declared best-valid-configuration knobs (load mode, ubatch, log verbosity) may differ.
+        base = q5_case.loads((HERE / 'q5_cases' / 'peer-deepseek4.json').read_bytes())
+        case = q5_case.loads((HERE / 'q5_cases' / 'peer-deepseek4-ds4file.json').read_bytes())
+        self.assertEqual(case['family'], 'deepseek4')
+        variables = case['variables']
+        self.assertTrue(variables['MODEL'].endswith(
+            '/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf'))
+        self.assertEqual(variables['MODEL_SHA256'], 'ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0')
+        self.assertEqual((variables['LOAD_MODE'], variables['UBATCH'], variables['PEER_LOG_VERBOSITY']),
+                         ('auto', '512', '4'))
+        tuning = {'MODEL', 'MODEL_SHA256', 'PORT', 'LOAD_MODE', 'UBATCH', 'PEER_LOG_VERBOSITY'}
+        self.assertEqual({k: v for k, v in variables.items() if k not in tuning},
+                         {k: v for k, v in base['variables'].items() if k not in tuning})
+        self.assertNotEqual(variables['PORT'], base['variables']['PORT'])
+        expected = list(base['serve']['argv'])
+        expected[expected.index('--load-mode') + 1] = '{LOAD_MODE}'
+        expected[expected.index('--ubatch-size') + 1] = '{UBATCH}'
+        self.assertEqual(case['serve'], {'argv': expected + ['--log-verbosity', '{PEER_LOG_VERBOSITY}'], 'env': {}})
+        for section in ('readiness', 'client', 'binary', 'artifact', 'port', 'policy'):
+            self.assertEqual(case[section], base[section], section)
+        self.assertEqual({k: v for k, v in case['workload'].items() if k != 'id'},
+                         {k: v for k, v in base['workload'].items() if k != 'id'})
+
     def test_hf2q_case_sources_match_the_client_source_freeze(self):
         from qwen_n4_live_smoke import MODULES
         for family in ('qwen38', 'qwen36', 'gemma4', 'deepseek4'):
