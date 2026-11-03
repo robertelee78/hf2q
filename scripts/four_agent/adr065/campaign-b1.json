@@ -1,0 +1,114 @@
+{
+  "schema": "hf2q.adr065.campaign.v1",
+  "story": "ADR-065 B1 (#503): freeze the phase-1 baseline and fairness ceilings",
+  "doc": "docs/research/adr065-b1-campaign.md",
+  "roots": {
+    "E": "/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023",
+    "MODELS": "/Users/robert/.local/share/hf2q/models"
+  },
+  "baseline": {
+    "label": "v0.1.29 release (phase-1 default)",
+    "binary": {
+      "release_asset": "https://github.com/robertelee78/hf2q/releases/download/v0.1.29/hf2q-aarch64-apple-darwin",
+      "sha256": "86b64b029c6f717f3b6c58654c2aa5b29f420ffa93fe09f31348755fd2df48f2",
+      "bytes": 55972368,
+      "source_commit": "c40fbf37bc2bc24cebd2c57faa60891debd1179a",
+      "release_proof_sha256": "0874062b2c7dc7147d44070a15e89ccca36e3a11d425c4e94d2a13060efbb09b"
+    },
+    "native": {"crate": "mlx-native", "version": "0.15.16"},
+    "notes": [
+      "main d817dffa differs from v0.1.29 only in release tooling (no src/, Cargo.toml or Cargo.lock change), so the released standalone binary is the phase-1 default of main.",
+      "The driver checks the binary sha256 and that the binary embeds exactly one mlx-native version string, equal to native.version."
+    ]
+  },
+  "environment": {
+    "CARGO": "/Users/robert/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+    "TOOLCHAIN": "stable-aarch64-apple-darwin",
+    "sandbox_proof": {"path": "{E}/owned-cleanup-sandbox-capability-20261031T222313Z/proof.json",
+                      "sha256": "8b2866842913c206b9b801ced3c86397b5ccde7631b8422fb2166bdbe26ea589"},
+    "negative_control_receipt": {"path": "{E}/q5-negative-control-20261030T041437Z/receipt.json",
+                                 "sha256": "b3c1db0bbd3df2ff8783ea1df447b2c94799763cf1255fe3623b1155eaea1e3b"}
+  },
+  "run_order": ["qwen38", "deepseek4", "gemma4"],
+  "families": {
+    "qwen38": {
+      "title": "Qwen3.8 27B",
+      "artifact": {"path": "{MODELS}/qwen38-stock/Qwen3.8-27B-vanilla.gguf",
+                   "sha256": "cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7",
+                   "bytes": 16810714976,
+                   "conversion_receipt_sha256": "8a370d80c6f06a5f7111abe1dad46ae9cc1dbf66034e6fa2abe90276b0f13b23"},
+      "q5_case": {"path": "scripts/four_agent/q5_cases/qwen38.json",
+                  "sha256": "4358e4c3c94c55fb737284e33d22a340a3e12edcbfa3abcaf19d98f1aae25633"},
+      "client_approval_template": {"path": "{E}/approval-templates-proof-8b286684/qwen38-client-approval.json",
+                                   "sha256": "d6c89cee2e6b7eb549f3d68ff7c3ab287b3abfc1fae31ffa6115862236b84041"},
+      "ab_blocks": 6,
+      "run_seconds_estimate": [95, 135]
+    },
+    "deepseek4": {
+      "title": "DeepSeek-V4 Flash",
+      "artifact": {"path": "{MODELS}/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf",
+                   "sha256": "50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6",
+                   "bytes": 107431343264,
+                   "conversion_receipt_sha256": "9c5dc7ea21411e44ced343352f510a59039f16c11bdb19e7e4f3a10bfa88e03b"},
+      "q5_case": {"path": "scripts/four_agent/q5_cases/deepseek4.json",
+                  "sha256": "d362f00ea484facd8e4422affbdefc77364f3aceb89dbc660f0212895d9e1004"},
+      "client_approval_template": {"path": "{E}/approval-templates-proof-8b286684/deepseek4-client-approval.json",
+                                   "sha256": "dfa0bf88fbd640f12bcfd0ce7598511a352a1e6f43a25147dfa6013902c2b6f3"},
+      "ab_blocks": 6,
+      "run_seconds_estimate": [111, 160]
+    },
+    "gemma4": {
+      "title": "Gemma 4 26B-A4B",
+      "artifact": {"path": "{MODELS}/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf",
+                   "sha256": "bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53",
+                   "bytes": 16796018144,
+                   "conversion_receipt_sha256": "299aa501a10546a26d85ca1e5600c6d6e5873e2fc2d35a4b0337409771677caf"},
+      "q5_case": {"path": "scripts/four_agent/q5_cases/gemma4.json",
+                  "sha256": "c83d4de49315c622fa197957e4c5565565ad7c9140fc2e50490a516b4b71ed80"},
+      "client_approval_template": {"path": "{E}/approval-templates-proof-8b286684/gemma4-client-approval.json",
+                                   "sha256": "d2e30e96f769d5f4892b51949fb9780788acf24df473766947a6775ebd04d8a8"},
+      "ab_blocks": 6,
+      "run_seconds_estimate": [29, 35]
+    }
+  },
+  "workloads": {
+    "order": ["n4", "n1", "3+1", "2+2", "1+3"],
+    "primary": "n4",
+    "n1_control": "for a change that should not engage with one agent, the n1 interval must lie within +-2.5 points",
+    "mixed_controls": "3+1, 2+2 and 1+3 effects are reported"
+  },
+  "design": {
+    "arms": {"A": "the previous default", "B": "the candidate: the same binary with one kill switch changed"},
+    "block": "one block is one paired A and B run; odd blocks run A then B and even blocks B then A, so each pair of consecutive blocks forms ABBA",
+    "warmup": "one discarded run per arm per stage per driver session, in the next block's order",
+    "ab_block_count": {"default": 6, "allowed": [6, 8, 12, 16, 20],
+                       "rule": "a count other than 6 is chosen from a separately labelled pilot campaign before qualification; pilot runs are never pooled; no sequential peeking"},
+    "primary_metric": "client summary own_output_four_task_makespan_seconds",
+    "effect": "paired log-makespan Student-t 95% interval over quality-eligible blocks (both runs Pass), as a percentage-point reduction of B against A",
+    "verdict_order": ["Loss", "Win", "Equivalent", "Inconclusive"],
+    "margin_points": 2.5,
+    "failed_runs": "task, tool, protocol, isolation or truncation failures make a run quality-ineligible; every run is retained in the receipt",
+    "fairness": "per-run per-slot p95 semantic TTFT and per-run maximum semantic SSE gap of every measured candidate run at or below the frozen ceiling of its family and workload"
+  },
+  "baseline_campaign": {
+    "arms": ["A"],
+    "runs_per_stage": {"n4": 20, "n1": 6, "3+1": 6, "2+2": 6, "1+3": 6},
+    "ceiling": "the largest value over the stage's passing measured runs and their slots; warmups never count"
+  },
+  "execution": {
+    "cooldown_seconds": 60,
+    "retry_allowance_attempts": 6,
+    "budget": {
+      "rule": "a campaign halts for good once its attempts reach planned runs + retry_allowance_attempts; hours = runs x (run_seconds_estimate + cooldown_seconds)",
+      "baseline_per_family": {"planned_runs": 49, "max_attempts": 55,
+                              "hours": {"qwen38": [2.1, 2.7], "deepseek4": [2.3, 3.0], "gemma4": [1.2, 1.3]}},
+      "baseline_total_hours": [5.6, 6.9],
+      "ab_per_family_at_6_blocks": {"planned_runs": 70, "max_attempts": 76,
+                                    "hours": {"qwen38": [3.0, 3.8], "deepseek4": [3.3, 4.3], "gemma4": [1.7, 1.8]}}
+    },
+    "host": "reserved exclusively under HOST-LOCK; no peer or other hf2q process loaded; one engine at a time",
+    "q5": "every run is one q5_calibration.py supervised runtime and must reach CalibrationPass",
+    "thermal": "a serious or critical thermal state invalidates the run for acceptance",
+    "identities": "binary, model, case, harness, Python and host are frozen at campaign start and re-checked before every run; drift halts the campaign for good"
+  }
+}

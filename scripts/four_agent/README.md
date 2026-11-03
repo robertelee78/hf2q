@@ -631,6 +631,20 @@ A floor-only family (for example DeepSeek-V4) omits the three `--reference-*` op
 | `q3_stats.py` | Williams sequences, paired log-ratio estimator, stopping rule, family verdict |
 | `q3_report.py` | Stage effects, `verdict.json`, quality inputs, F2 rows |
 
+## Fixed-count two-arm campaigns (ADR-065 B1)
+
+`adr065_campaign.py` runs ADR-065 measurements from the checked-in campaign file `adr065/campaign-b1.json`, which names, per family, the official artifact and digest, the Q5 case, the approval template, the A/B block count, and the cooldown and run budget. It subclasses the Q3 driver: identities, warmups, settling, the Q2 run audit and resume are unchanged. Design and root commands: [docs/research/adr065-b1-campaign.md](../../docs/research/adr065-b1-campaign.md).
+
+- **`baseline`** runs the phase-1 default binary (arm A only) for a fixed number of runs per workload. **`ceilings DIR`** then writes `ceilings.json`: every run's per-slot p95 semantic TTFT and maximum SSE gap, and the largest value per workload.
+- **`ab`** runs one binary in two arms. B's case differs from the family case only in `serve.env`, the kill switch. Odd blocks run A then B, even blocks B then A. The block count is fixed: 6, or 8/12/16/20 from a `pilot` named with `--pilot-of`. A failed run is kept and the campaign continues. The campaign waits 60 s before every load and halts for good when its attempts exceed the budget.
+- **`analyze DIR --ceilings FILE`** writes `analysis.json`: the paired log-makespan interval and Loss/Win/Equivalent/Inconclusive per stage, the n1 control rule, per-run fairness checks against the ceilings, and every run, failed and discarded ones included.
+
+| File | Role |
+| --- | --- |
+| `adr065_campaign.py` | CLI and driver: plan from the campaign file, launch checks, fixed counts, cooldown, budget, ceilings and analysis files |
+| `adr065_stats.py` | Interval, verdicts, ceilings, fairness checks, analysis document (pure) |
+| `adr065/campaign-b1.json` | The predeclared B1 campaign file |
+
 ## Q2 adversarial controls and run audit
 
 `q2_run_audit.py` re-derives a settled four-agent run from its raw client evidence. Both campaigns call `check_run` on every claimed Pass and turn a contradicted claim into a terminal `Invalid` with the reason. It does not trust the coordinator's status, makespan or timing fields. It checks:
