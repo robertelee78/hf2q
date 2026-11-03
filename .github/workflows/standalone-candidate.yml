@@ -32,7 +32,10 @@ concurrency:
 jobs:
   build-release-candidate:
     name: build exact packed Apple-Silicon candidate
-    runs-on: macos-latest
+    # Pinned image label: the floating "latest" label can move to a new
+    # macOS/Xcode/SDK silently and change the shipped Metal bytes. Bump
+    # deliberately, together with verify_standalone_candidate.sh.
+    runs-on: macos-26
     timeout-minutes: 90
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
@@ -57,6 +60,28 @@ jobs:
           git fetch origin main
           git merge-base --is-ancestor "$actual_sha" origin/main
           git diff --exit-code
+
+      # The workflow files come from the dispatch ref, but the scripts they
+      # call come from the candidate checkout. A candidate cut before these
+      # files existed would build for ten minutes and then fail at signing
+      # or verification, so refuse it before the build.
+      - name: Require release-reliability tooling in the candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for required in \
+            scripts/assert_macho_string_pool_aligned.sh \
+            scripts/preflight_crates_io_credential.sh \
+            scripts/preflight_apple_release_credentials.sh; do
+            [[ -f "$required" ]] || missing+=("$required")
+          done
+          grep -Fq 'and .schema_version == 2' scripts/verify_standalone_candidate.sh ||
+            missing+=("schema-2 scripts/verify_standalone_candidate.sh")
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::commit predates the release-reliability changes: finish it with scripts/release.sh --resume RUN_ID or release a new version cut after the release-reliability merge (missing: ${missing[*]})" >&2
+            exit 1
+          fi
 
       - name: Toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -128,29 +153,9 @@ jobs:
             bash "$trusted_verifier" check-build-root \
               "$package_root" "$checkout_root" "$cargo_home" "$cargo_target"
           )
-          assert_macho_string_pool_aligned() {
-            local macho=$1
-            local stroff
-            stroff=$(/usr/bin/otool -l "$macho" | awk '
-              $1 == "cmd" && $2 == "LC_SYMTAB" { in_symtab = 1; next }
-              in_symtab && $1 == "cmd" { in_symtab = 0 }
-              in_symtab && $1 == "stroff" { print $2; exit }
-            ')
-            [[ -z "$stroff" || "$stroff" =~ ^[0-9]+$ ]]
-            if [[ -n "$stroff" && $((stroff % 8)) -ne 0 ]]; then
-              echo "misaligned Mach-O LINKEDIT string pool: $macho (stroff=$stroff)" >&2
-              exit 1
-            fi
-          }
-          dylib_count=0
-          while IFS= read -r -d '' dylib; do
-            assert_macho_string_pool_aligned "$dylib"
-            ((dylib_count += 1))
-          done < <(find "$cargo_target/release" -type f -name '*.dylib' -print0)
-          test "$dylib_count" -gt 0
+          bash "$checkout_root/scripts/assert_macho_string_pool_aligned.sh" \
+            "$cargo_target/release/hf2q" "$cargo_target/release"
           built_binary="$cargo_target/release/hf2q"
-          test -x "$built_binary"
-          assert_macho_string_pool_aligned "$built_binary"
           test "$(/usr/bin/lipo -archs "$built_binary")" = arm64
           test "$(/usr/bin/vtool -show-build "$built_binary" | awk '$1 == "minos" {print $2}')" = 14.0
           test "$("$built_binary" --version)" = \
@@ -165,12 +170,26 @@ jobs:
           chmod 0555 "$candidate_root/hf2q-unsigned"
           cp "$crate" "$candidate_root/hf2q-${EXPECTED_VERSION}.crate"
           cp -R "$provenance_stage/." "$candidate_root/dependency-provenance/"
+          # Record the build host so an image, Xcode, or SDK move is visible
+          # in the receipt (and asserted by verify_standalone_candidate.sh).
+          macos_product_version=$(/usr/bin/sw_vers -productVersion)
+          macos_build_version=$(/usr/bin/sw_vers -buildVersion)
+          xcode_version=$(/usr/bin/xcodebuild -version | paste -sd ';' - | sed 's/;/; /g')
+          sdk_version=$(/usr/bin/xcrun --show-sdk-version)
+          runner_image_os=${ImageOS:?ImageOS is required on hosted runners}
+          runner_image_version=${ImageVersion:?ImageVersion is required on hosted runners}
           jq -nS \
             --arg source_sha "$EXPECTED_SHA" \
             --arg version "$EXPECTED_VERSION" \
             --arg crate_sha256 "$crate_sha" \
             --arg binary_sha256 "$built_sha" \
-            '{kind:"hf2q.standalone-build-candidate",schema_version:1,source_sha:$source_sha,version:$version,target:"aarch64-apple-darwin",minimum_macos:"14.0",crate_sha256:$crate_sha256,unsigned_binary_sha256:$binary_sha256}' \
+            --arg macos_product_version "$macos_product_version" \
+            --arg macos_build_version "$macos_build_version" \
+            --arg xcode_version "$xcode_version" \
+            --arg sdk_version "$sdk_version" \
+            --arg runner_image_os "$runner_image_os" \
+            --arg runner_image_version "$runner_image_version" \
+            '{kind:"hf2q.standalone-build-candidate",schema_version:2,source_sha:$source_sha,version:$version,target:"aarch64-apple-darwin",minimum_macos:"14.0",crate_sha256:$crate_sha256,unsigned_binary_sha256:$binary_sha256,build_host:{macos_product_version:$macos_product_version,macos_build_version:$macos_build_version,xcode_version:$xcode_version,sdk_version:$sdk_version,runner_image_os:$runner_image_os,runner_image_version:$runner_image_version}}' \
             > "$candidate_root/build.json"
           chmod 0444 "$candidate_root/build.json" \
             "$candidate_root/hf2q-${EXPECTED_VERSION}.crate"
@@ -207,7 +226,7 @@ jobs:
   sign-release-candidate:
     name: Developer ID sign and notarize exact candidate
     needs: build-release-candidate
-    runs-on: macos-latest
+    runs-on: macos-26
     environment: apple-release
     timeout-minutes: 60
     env:
@@ -232,6 +251,32 @@ jobs:
           git fetch origin main
           git merge-base --is-ancestor "$EXPECTED_SHA" origin/main
           git diff --exit-code
+
+      # Credential preflight, before the candidate download: the build job
+      # stays secret-free (ADR-045), so the first job that holds release
+      # credentials checks them before doing anything else. Neither step
+      # touches candidate bytes; the checked-out scripts are the same trusted
+      # source as the signer below. The crates.io probe runs only for Release
+      # (a standalone candidate dispatch publishes nothing).
+      - name: Release credential preflight (crates.io)
+        if: ${{ github.workflow == 'Release' }}
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: bash scripts/preflight_crates_io_credential.sh
+
+      - name: Release credential preflight (Apple signing and notary)
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ vars.APPLE_DEVELOPER_ID_APPLICATION }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_CODESIGN_IDENTIFIER: ${{ vars.APPLE_CODESIGN_IDENTIFIER }}
+        run: bash scripts/preflight_apple_release_credentials.sh
 
       - name: Download exact build candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -260,13 +305,16 @@ jobs:
             --arg source_sha "$EXPECTED_SHA" \
             --arg version "$EXPECTED_VERSION" '
               .kind == "hf2q.standalone-build-candidate"
-              and .schema_version == 1
+              and .schema_version == 2
               and .source_sha == $source_sha
               and .version == $version
               and .target == "aarch64-apple-darwin"
               and .minimum_macos == "14.0"
               and (.crate_sha256 | test("^[0-9a-f]{64}$"))
               and (.unsigned_binary_sha256 | test("^[0-9a-f]{64}$"))
+              and (.build_host.macos_product_version | test("^[0-9]+(\\.[0-9]+)*$"))
+              and (.build_host.sdk_version | test("^[0-9]+(\\.[0-9]+)*$"))
+              and (.build_host.runner_image_version | length > 0)
             ' "$build_receipt" >/dev/null
           unsigned="$build_root/hf2q-unsigned"
           chmod 0555 "$unsigned"

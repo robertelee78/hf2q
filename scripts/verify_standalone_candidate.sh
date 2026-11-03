@@ -81,18 +81,33 @@ for required in "$build_receipt" "$crate" "$unsigned" \
   [[ -f "$required" && ! -L "$required" ]] || \
     fail "build artifact is missing $(basename "$required")"
 done
+# The candidate build runs on the pinned macos-26 image label
+# (standalone-candidate.yml). Moving the label is a deliberate change that
+# must update this constant in the same commit.
+expected_build_macos_major=26
 jq -e \
   --arg source_sha "$source_sha" \
-  --arg version "$version" '
+  --arg version "$version" \
+  --arg macos_major "$expected_build_macos_major" '
     .kind == "hf2q.standalone-build-candidate"
-    and .schema_version == 1
+    and .schema_version == 2
     and .source_sha == $source_sha
     and .version == $version
     and .target == "aarch64-apple-darwin"
     and .minimum_macos == "14.0"
     and (.crate_sha256 | test("^[0-9a-f]{64}$"))
     and (.unsigned_binary_sha256 | test("^[0-9a-f]{64}$"))
+    and (.build_host | type) == "object"
+    and (.build_host.macos_product_version | test("^[0-9]+(\\.[0-9]+)*$"))
+    and (.build_host.macos_product_version | split(".")[0]) == $macos_major
+    and (.build_host.macos_build_version | length > 0)
+    and (.build_host.xcode_version | startswith("Xcode "))
+    and (.build_host.sdk_version | test("^[0-9]+(\\.[0-9]+)*$"))
+    and (.build_host.runner_image_os | length > 0)
+    and (.build_host.runner_image_version | length > 0)
   ' "$build_receipt" >/dev/null || fail "build receipt is invalid"
+jq -r '.build_host | "candidate build host: macOS \(.macos_product_version) (\(.macos_build_version)), \(.xcode_version), SDK \(.sdk_version), image \(.runner_image_os) \(.runner_image_version)"' \
+  "$build_receipt"
 crate_sha=$(jq -er .crate_sha256 "$build_receipt")
 unsigned_sha=$(jq -er .unsigned_binary_sha256 "$build_receipt")
 [[ $(sha256_file "$crate") == "$crate_sha" ]] || fail "crate digest differs from receipt"

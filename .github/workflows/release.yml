@@ -48,10 +48,29 @@ jobs:
   publish:
     needs: [standalone-candidate, cache-lifecycle]
     # When skip_qualification is set, cache-lifecycle is skipped; publish must
-    # not wait on a skipped job's result.
-    if: ${{ always() && (inputs.skip_qualification || needs.cache-lifecycle.result == 'success') }}
-    runs-on: macos-latest
+    # not wait on a skipped job's result. always() keeps that skip from
+    # skipping publish, so the candidate result must be required explicitly:
+    # a failed or never-acquired build must never reach publication.
+    if: ${{ always() && needs.standalone-candidate.result == 'success' && (inputs.skip_qualification || needs.cache-lifecycle.result == 'success') }}
+    # Pinned image label; see standalone-candidate.yml.
+    runs-on: macos-26
     timeout-minutes: 90
+    # crates.io Trusted Publishing is bound to this workflow file and this
+    # environment, so an OIDC token minted by any other job is refused.
+    environment: crates-publish
+    permissions:
+      actions: read
+      contents: write
+      # Only for rust-lang/crates-io-auth-action. Defense in depth, not a
+      # boundary: every run step below unsets the OIDC request variables
+      # before running candidate, dependency, or tool code, but `uses:`
+      # action steps (toolchain, artifact upload) still receive them, and a
+      # job-level permission cannot be narrowed to one step. Residual risk:
+      # candidate or dependency code run in this job can still recover them
+      # (by writing BASH_ENV or DYLD_* to $GITHUB_ENV, or by reading another
+      # process's environment or memory), as can a compromised pinned action,
+      # so either could mint a short-lived crates.io token while the job runs.
+      id-token: write
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
       EXPECTED_VERSION: ${{ inputs.version }}
@@ -68,6 +87,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           actual_sha=$(git rev-parse HEAD)
           test "$actual_sha" = "$EXPECTED_SHA"
           git fetch origin main
@@ -82,6 +102,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           # Accept a green CI run on the exact SHA from either a push event
           # or an explicit workflow_dispatch rerun. Push-event-only matching
           # broke on batch pushes: only the batch head gets a push run, so a
@@ -101,6 +122,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           proof_root="$RUNNER_TEMP/standalone-candidate-proof"
           scripts/verify_standalone_candidate.sh \
             "$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" \
@@ -114,6 +136,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           qualification_root="$RUNNER_TEMP/cache-lifecycle-proof"
           scripts/verify_cache_lifecycle_candidate.sh \
             "$EXPECTED_CACHE_LIFECYCLE_RUN_ID" \
@@ -139,6 +162,8 @@ jobs:
       - name: cargo audit
         shell: bash
         run: |
+          set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           cargo install cargo-audit --locked --version 0.22.2 --no-default-features
           cargo audit
 
@@ -146,6 +171,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           if [[ ${MLX_NATIVE_SKIP_METALLIB+x} ]]; then
             echo "MLX_NATIVE_SKIP_METALLIB is forbidden for release builds" >&2
             exit 1
@@ -173,6 +199,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           package_root=${RELEASE_PACKAGE_ROOT:?RELEASE_PACKAGE_ROOT is required}
           (
             cd "$package_root"
@@ -238,6 +265,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           standalone_stage=$(mktemp -d "$RUNNER_TEMP/hf2q-standalone-release.XXXXXX")
           source_dir=${STANDALONE_RELEASE_DIR:?STANDALONE_RELEASE_DIR is required}
           binary="$standalone_stage/hf2q-aarch64-apple-darwin"
@@ -342,6 +370,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           tag="v${EXPECTED_VERSION}"
           bash scripts/ensure_github_release_tag.sh \
             "$GITHUB_REPOSITORY" "$tag" "$EXPECTED_SHA"
@@ -357,6 +386,11 @@ jobs:
           test "$(jq -r .targetCommitish <<<"$release_json")" = "$EXPECTED_SHA"
           is_draft=$(jq -r .isDraft <<<"$release_json")
 
+          # A published release is immutable: any differing or missing asset
+          # refuses. A draft is not public yet; candidate builds are not
+          # byte-reproducible across runs, so a fresh dispatch after an
+          # earlier failed attempt replaces the stale draft asset (delete,
+          # then upload) instead of failing on it.
           ensure_exact_asset() {
             local asset=$1
             local name directory
@@ -364,10 +398,14 @@ jobs:
             directory=$(mktemp -d "$RUNNER_TEMP/hf2q-existing-asset.XXXXXX")
             if gh release download "$tag" --pattern "$name" --dir "$directory" \
               >/dev/null 2>&1; then
-              cmp -s "$asset" "$directory/$name" || {
+              cmp -s "$asset" "$directory/$name" && return 0
+              if [[ "$is_draft" != true ]]; then
                 echo "published release asset differs from candidate: $name" >&2
                 return 1
-              }
+              fi
+              echo "::warning::draft release asset differs from this run's candidate; replacing $name"
+              gh release delete-asset "$tag" "$name" --yes
+              gh release upload "$tag" "$asset"
             else
               test "$is_draft" = true || {
                 echo "published release is missing immutable asset: $name" >&2
@@ -408,6 +446,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           tag="v${EXPECTED_VERSION}"
           release_dir=$(mktemp -d "$RUNNER_TEMP/hf2q-draft-release.XXXXXX")
           gh release download "$tag" --dir "$release_dir"
@@ -433,13 +472,39 @@ jobs:
             cmp -s "$asset" "$release_dir/$(basename "$asset")"
           done
 
+      # Trusted Publishing: a 30-minute crates.io token minted from this job's
+      # OIDC identity right before cargo publish. Only the publish step sees
+      # it. It stays valid until the action's post step revokes it at job end
+      # (DELETE /api/v1/trusted_publishing/tokens); revoking it earlier
+      # ourselves would make that post step fail the job, because at the
+      # pinned SHA it calls setFailed on any non-2xx revoke response.
+      # continue-on-error keeps the legacy CARGO_REGISTRY_TOKEN as the
+      # fallback until Trusted Publishing is configured on crates.io.
+      - name: Exchange crates.io Trusted Publishing token
+        id: crates-io-auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
       - name: Publish exact package
         shell: bash
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          TRUSTED_PUBLISHING_OUTCOME: ${{ steps.crates-io-auth.outcome }}
+          TRUSTED_PUBLISHING_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+          FALLBACK_CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          test -n "$CARGO_REGISTRY_TOKEN"
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+          if [[ "$TRUSTED_PUBLISHING_OUTCOME" == success && -n "$TRUSTED_PUBLISHING_TOKEN" ]]; then
+            echo "crates.io credential: Trusted Publishing token"
+            publish_token=$TRUSTED_PUBLISHING_TOKEN
+          elif [[ -n "$FALLBACK_CARGO_REGISTRY_TOKEN" ]]; then
+            echo "::warning::crates.io Trusted Publishing exchange failed (outcome: $TRUSTED_PUBLISHING_OUTCOME); falling back to CARGO_REGISTRY_TOKEN. Configure Trusted Publishing (docs/RELEASING.md) and delete the secret."
+            publish_token=$FALLBACK_CARGO_REGISTRY_TOKEN
+          else
+            echo "::error::no crates.io credential: Trusted Publishing exchange failed and CARGO_REGISTRY_TOKEN is unset" >&2
+            exit 1
+          fi
+          unset TRUSTED_PUBLISHING_TOKEN FALLBACK_CARGO_REGISTRY_TOKEN
           published="$RUNNER_TEMP/hf2q-${EXPECTED_VERSION}-published.crate"
           if curl --fail --location --silent --show-error \
             "https://static.crates.io/crates/hf2q/hf2q-${EXPECTED_VERSION}.crate" \
@@ -449,13 +514,15 @@ jobs:
             # The exact package was already compiled and tested above. Avoid
             # re-running dependency build scripts while the registry token is
             # present in this narrowly scoped step.
-            cargo publish --locked --no-verify --token "$CARGO_REGISTRY_TOKEN"
+            CARGO_REGISTRY_TOKEN="$publish_token" \
+              cargo publish --locked --no-verify
           fi
 
       - name: Verify crates.io bytes
         shell: bash
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           expected=$(awk '{print $1}' "$RUNNER_TEMP/release-crate.sha256")
           downloaded="$RUNNER_TEMP/hf2q-${EXPECTED_VERSION}.crate"
           for _ in $(seq 1 24); do
@@ -474,6 +541,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           downloaded="$RUNNER_TEMP/hf2q-${EXPECTED_VERSION}.crate"
           registry_root="$RUNNER_TEMP/hf2q-registry"
           install_root="$RUNNER_TEMP/hf2q-registry-install"
@@ -503,6 +571,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           tag="v${EXPECTED_VERSION}"
           release_json=$(gh release view "$tag" --json isDraft,targetCommitish)
           test "$(jq -r .targetCommitish <<<"$release_json")" = "$EXPECTED_SHA"
@@ -517,6 +586,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           tag="v${EXPECTED_VERSION}"
           public_base="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag"
           release_dir=$(mktemp -d "$RUNNER_TEMP/hf2q-public-release.XXXXXX")

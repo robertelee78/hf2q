@@ -93,14 +93,26 @@ EOF
 then
   fail "final binary profile accepted the misaligning strip mode"
 fi
+ALIGNMENT_SCRIPT="$ROOT_DIR/scripts/assert_macho_string_pool_aligned.sh"
+bash -n "$ALIGNMENT_SCRIPT"
 for required in \
   'assert_macho_string_pool_aligned()' \
   'assert_macho_string_pool_aligned "$dylib"' \
-  'assert_macho_string_pool_aligned "$built_binary"' \
-  'test "$dylib_count" -gt 0'; do
-  grep -Fq -- "$required" "$STANDALONE_WORKFLOW" ||
-    fail "standalone candidate omits Mach-O alignment proof: $required"
+  'assert_macho_string_pool_aligned "$binary"' \
+  'test "$dylib_count" -gt 0' \
+  '$((stroff % 8))'; do
+  grep -Fq -- "$required" "$ALIGNMENT_SCRIPT" ||
+    fail "Mach-O alignment script omits proof: $required"
 done
+grep -Fq 'bash "$checkout_root/scripts/assert_macho_string_pool_aligned.sh" \' \
+  "$STANDALONE_WORKFLOW" ||
+  fail "standalone candidate does not run the trusted Mach-O alignment proof"
+grep -Fq '"$cargo_target/release/hf2q" "$cargo_target/release"' \
+  "$STANDALONE_WORKFLOW" ||
+  fail "standalone candidate alignment proof does not cover the packed build"
+grep -Fq 'bash scripts/assert_macho_string_pool_aligned.sh \' \
+  "$ROOT_DIR/.github/workflows/ci.yml" ||
+  fail "PR CI does not run the Mach-O alignment proof"
 
 for required in \
   '/usr/bin/codesign --force --sign' \

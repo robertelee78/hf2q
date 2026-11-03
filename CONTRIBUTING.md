@@ -59,9 +59,9 @@ that download on first run.
 
 | Job (check name) | Blocking | What it runs |
 |---|---|---|
-| `release (macos-latest)` | yes | mlx-native environment guard, `cargo package --list` contract, `cargo build --release --locked`, the frictionless exact-binary preflight, `cargo audit` (prebuilt cargo-audit 0.22.2), and the `activate()` warning-matrix smoke against `target/release/hf2q` |
+| `release (macos-latest)` | yes | mlx-native environment guard, `cargo package --list` contract, `cargo build --release --locked`, the Mach-O LINKEDIT string-pool alignment check (`scripts/assert_macho_string_pool_aligned.sh`, shared with the standalone candidate build), the frictionless exact-binary preflight, `cargo audit` (prebuilt cargo-audit 0.22.2), and the `activate()` warning-matrix smoke against `target/release/hf2q` |
 | `tests (macos-latest)` | yes | The hosted-safe debug `cargo test` list (library, selected integration tests, `--bin hf2q` contracts, installer and signing scripts that need `target/debug/hf2q`) and the GCD cargo contracts |
-| `check + script contracts (macos-latest)` | yes | `cargo check --locked --all-targets --all-features` (the only build of the integration tests the hosted-safe list skips), `bash -n` syntax checks, the offline `scripts/test_*_contract.sh` suites, and the GCD Python suites |
+| `check + script contracts (macos-latest)` | yes | `cargo check --locked --all-targets --all-features` (the only build of the integration tests the hosted-safe list skips), the same check in the unpacked `cargo package` root outside the checkout, `bash -n` syntax checks, the offline `scripts/test_*_contract.sh` suites, and the GCD Python suites |
 | `lint (macos-latest, informational)` | no | `cargo fmt --check` and `cargo clippy`; continue-on-error, never awaited |
 | `build + test (macos-latest)` | yes | Aggregate; fails unless the three blocking macOS jobs succeeded. It keeps the pre-split check name, so require this check in branch protection |
 | `peer reference ratchet` | yes | `scripts/peer_ref_ratchet.sh` |
