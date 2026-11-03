@@ -65,8 +65,11 @@ jobs:
       # boundary: every run step below unsets the OIDC request variables
       # before running candidate, dependency, or tool code, but `uses:`
       # action steps (toolchain, artifact upload) still receive them, and a
-      # job-level permission cannot be narrowed to one step. Residual risk: a
-      # compromised pinned action in this job could mint a crates.io token.
+      # job-level permission cannot be narrowed to one step. Residual risk:
+      # candidate or dependency code run in this job can still recover them
+      # (by writing BASH_ENV or DYLD_* to $GITHUB_ENV, or by reading another
+      # process's environment or memory), as can a compromised pinned action,
+      # so either could mint a short-lived crates.io token while the job runs.
       id-token: write
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
