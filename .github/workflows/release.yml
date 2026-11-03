@@ -61,9 +61,12 @@ jobs:
     permissions:
       actions: read
       contents: write
-      # Only for rust-lang/crates-io-auth-action. Every run step below
-      # unsets the OIDC request variables before running any candidate,
-      # dependency, or tool code, so only the exchange step can mint a token.
+      # Only for rust-lang/crates-io-auth-action. Defense in depth, not a
+      # boundary: every run step below unsets the OIDC request variables
+      # before running candidate, dependency, or tool code, but `uses:`
+      # action steps (toolchain, artifact upload) still receive them, and a
+      # job-level permission cannot be narrowed to one step. Residual risk: a
+      # compromised pinned action in this job could mint a crates.io token.
       id-token: write
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
@@ -467,9 +470,13 @@ jobs:
           done
 
       # Trusted Publishing: a 30-minute crates.io token minted from this job's
-      # OIDC identity right before cargo publish; the action's post step
-      # revokes it. continue-on-error keeps the legacy CARGO_REGISTRY_TOKEN
-      # as the fallback until Trusted Publishing is configured on crates.io.
+      # OIDC identity right before cargo publish. Only the publish step sees
+      # it. It stays valid until the action's post step revokes it at job end
+      # (DELETE /api/v1/trusted_publishing/tokens); revoking it earlier
+      # ourselves would make that post step fail the job, because at the
+      # pinned SHA it calls setFailed on any non-2xx revoke response.
+      # continue-on-error keeps the legacy CARGO_REGISTRY_TOKEN as the
+      # fallback until Trusted Publishing is configured on crates.io.
       - name: Exchange crates.io Trusted Publishing token
         id: crates-io-auth
         continue-on-error: true

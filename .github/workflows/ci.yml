@@ -70,7 +70,10 @@ jobs:
 
   release:
     name: release (macos-latest)
-    runs-on: macos-latest
+    # Same image as the release candidate (standalone-candidate.yml), so the
+    # PR-time LINKEDIT check sees the release toolchain. The check name keeps
+    # its historical "(macos-latest)" suffix so existing checks stay stable.
+    runs-on: macos-26
     # Fail-closed ceiling for a cold locked release build (no dependency
     # cache), not the expected duration.
     timeout-minutes: 60
@@ -645,7 +648,9 @@ jobs:
 
   contracts:
     name: check + script contracts (macos-latest)
-    runs-on: macos-latest
+    # Same image as the release candidate, for the packed-crate check; the
+    # check name keeps its historical suffix.
+    runs-on: macos-26
     # Fail-closed ceiling for a cold check build plus the script suites,
     # not the expected duration.
     timeout-minutes: 45
@@ -745,6 +750,7 @@ jobs:
             scripts/test_release_binary_seal_contract.sh \
             scripts/sign_notarize_standalone_release.sh \
             scripts/preflight_apple_release_credentials.sh \
+            scripts/preflight_crates_io_credential.sh \
             scripts/assert_macho_string_pool_aligned.sh \
             scripts/release.sh \
             scripts/verify_standalone_candidate.sh \

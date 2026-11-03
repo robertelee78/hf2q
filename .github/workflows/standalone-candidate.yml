@@ -43,50 +43,6 @@ jobs:
       CARGO_TERM_COLOR: always
       MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
-      # First step of every Release: fail within a minute when the crates.io
-      # credential is dead instead of after the 36-minute publish job. The
-      # token is scoped to this step only and no repository code has been
-      # checked out yet. /api/v1/me rejects API tokens, so the probe uses the
-      # side-effect-free token-creation refusal: crates.io authenticates the
-      # caller, then answers 400 "cannot use an API token to create a new API
-      # token" for a live token and 401/403 for an expired or revoked one.
-      - name: Release credential preflight (crates.io)
-        if: ${{ github.workflow == 'Release' }}
-        shell: bash
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-            echo "::notice::CARGO_REGISTRY_TOKEN is not set; publish relies on crates.io Trusted Publishing (exchanged in the crates-publish job)"
-            exit 0
-          fi
-          body=$(mktemp)
-          trap 'rm -f "$body"' EXIT
-          status=$(curl --silent --show-error --output "$body" \
-            --write-out '%{http_code}' --max-time 30 \
-            --request POST https://crates.io/api/v1/me/tokens \
-            --header "Authorization: $CARGO_REGISTRY_TOKEN" \
-            --header 'Content-Type: application/json' \
-            --header 'User-Agent: hf2q-release-preflight (github.com/robertelee78/hf2q)' \
-            --data '{"api_token":{"name":"hf2q-release-preflight-probe"}}')
-          case "$status" in
-            400)
-              if grep -Fq 'cannot use an API token to create a new API token' "$body"; then
-                echo "crates.io credential preflight: CARGO_REGISTRY_TOKEN authenticates"
-                exit 0
-              fi
-              echo "::warning::crates.io preflight probe returned an unrecognized 400; credential not proven, continuing"
-              ;;
-            401|403)
-              echo "::error::CARGO_REGISTRY_TOKEN is expired, revoked, or invalid (HTTP $status). Rotate the secret, or delete it once crates.io Trusted Publishing is configured." >&2
-              exit 1
-              ;;
-            *)
-              echo "::warning::crates.io preflight probe returned HTTP $status; credential not proven, continuing"
-              ;;
-          esac
-
       - name: Checkout exact candidate
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -104,6 +60,28 @@ jobs:
           git fetch origin main
           git merge-base --is-ancestor "$actual_sha" origin/main
           git diff --exit-code
+
+      # The workflow files come from the dispatch ref, but the scripts they
+      # call come from the candidate checkout. A candidate cut before these
+      # files existed would build for ten minutes and then fail at signing
+      # or verification, so refuse it before the build.
+      - name: Require release-reliability tooling in the candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for required in \
+            scripts/assert_macho_string_pool_aligned.sh \
+            scripts/preflight_crates_io_credential.sh \
+            scripts/preflight_apple_release_credentials.sh; do
+            [[ -f "$required" ]] || missing+=("$required")
+          done
+          grep -Fq 'and .schema_version == 2' scripts/verify_standalone_candidate.sh ||
+            missing+=("schema-2 scripts/verify_standalone_candidate.sh")
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::commit predates the release-reliability changes: finish it with scripts/release.sh --resume RUN_ID or release a new version cut after the release-reliability merge (missing: ${missing[*]})" >&2
+            exit 1
+          fi
 
       - name: Toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -274,9 +252,19 @@ jobs:
           git merge-base --is-ancestor "$EXPECTED_SHA" origin/main
           git diff --exit-code
 
-      # Fail fast on dead Apple credentials before the candidate download. It
-      # never touches candidate bytes; the checked-out script is the same
-      # trusted source as the signer below.
+      # Credential preflight, before the candidate download: the build job
+      # stays secret-free (ADR-045), so the first job that holds release
+      # credentials checks them before doing anything else. Neither step
+      # touches candidate bytes; the checked-out scripts are the same trusted
+      # source as the signer below. The crates.io probe runs only for Release
+      # (a standalone candidate dispatch publishes nothing).
+      - name: Release credential preflight (crates.io)
+        if: ${{ github.workflow == 'Release' }}
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: bash scripts/preflight_crates_io_credential.sh
+
       - name: Release credential preflight (Apple signing and notary)
         shell: bash
         env:

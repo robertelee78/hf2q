@@ -67,10 +67,11 @@ The self-hosted model qualification job is off by default and runs only if
 the owner asks for it (`-f skip_qualification=false`). QE is ad hoc
 (ADR-061 D2); it never gates a release.
 
-The workflow checks the crates.io and Apple credentials first, then tags,
-builds, signs, notarizes, publishes the crate, verifies the crate bytes, and
-only then makes the GitHub Release public. If any step fails, the draft
-release MUST NOT be made public by hand.
+The workflow builds the candidate (without secrets), then checks the
+crates.io and Apple credentials at the start of the protected sign job,
+before it touches the candidate. It then signs, notarizes, tags, publishes
+the crate, verifies the crate bytes, and only then makes the GitHub Release
+public. If any step fails, the draft release MUST NOT be made public by hand.
 
 Resume versus fresh dispatch:
 
@@ -83,6 +84,13 @@ Resume versus fresh dispatch:
   not byte-reproducible between runs, so the workflow replaces any differing
   asset on a still-draft release (logged as a warning). It never alters a
   published release: a differing or missing asset there fails the run.
+- A commit cut before these release-reliability changes cannot be released
+  by a fresh dispatch: the build job stops at once with "commit predates the
+  release-reliability changes". Finish it by resuming its existing run, or
+  release a new version cut after the merge. v0.1.29 is finished with
+  `scripts/release.sh --resume 41586213149`. That run uses its original
+  workflow files, which publish only with `CARGO_REGISTRY_TOKEN`, so rotate
+  that secret first (its 403 is what failed attempt 1).
 
 ### crates.io credential
 
@@ -93,10 +101,10 @@ owner `robertelee78`, repository `hf2q`, workflow filename `release.yml`,
 environment `crates-publish`. Restrict that GitHub environment to `main`.
 Until it is configured, the exchange fails and publish falls back to the
 `CARGO_REGISTRY_TOKEN` secret with a warning. Once a release has published
-through Trusted Publishing, delete that secret: while it exists, the
-preflight fails the release in its first minute if crates.io rejects it.
-The Apple signing and notary credentials are checked at the start of the
-protected sign job.
+through Trusted Publishing, delete that secret: while it exists, the sign
+job's preflight fails the release if crates.io rejects it (expired or
+revoked). A scoped publish token passes the preflight. The exchanged token
+lives until the action's post step revokes it at the end of the publish job.
 
 ## 3. Update hf2q.us
 

@@ -286,7 +286,12 @@ still-draft release is not public, and candidate builds are not
 byte-reproducible across runs, so a fresh Release dispatch deletes and
 re-uploads a draft asset that differs from its own candidate (logged). A
 published release still refuses any differing or missing asset, and no asset
-is ever uploaded with `--clobber`.
+is ever uploaded with `--clobber`. The crates.io publish job holds
+`id-token: write` for Trusted Publishing. Its run steps unset the OIDC request
+variables before running candidate code, but that is defense in depth, not a
+boundary: the job's pinned `uses:` actions still see them. The candidate
+build job stays secret-free; the credential preflights run at the start of
+the protected sign job, before the candidate is downloaded.
 
 The installer never owns `$HOME/.hf2q`, model directories, Hugging Face
 caches, or another application. If `$HOME/.local/bin` is not on `PATH`, it
