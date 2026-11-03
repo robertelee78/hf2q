@@ -56,6 +56,38 @@ struct PublicLazyRuntime {
     positions: Vec<LazyBufferedToken>,
 }
 
+/// Byte that stands in for each invalid UTF-8 byte when trigger regexes scan
+/// the lazy buffer (ASCII SUB, "substitute").
+const LAZY_TRIGGER_INVALID_BYTE_PLACEHOLDER: u8 = 0x1A;
+
+/// Same-length view of a lazy trigger buffer for regex matching.
+///
+/// The buffer holds raw token bytes (#553), so a lone byte-fallback or
+/// byte-level piece can leave invalid UTF-8 in it. Trigger regexes run in
+/// Unicode mode, where `.` and `[\s\S]` never match an invalid byte, so one
+/// such byte would keep a `^...$` or spanning trigger from ever firing. Each
+/// invalid byte is replaced by one ASCII placeholder that every wildcard
+/// matches, keeping match offsets valid for the raw buffer. An incomplete
+/// sequence at the end stays as it is until a later token completes or
+/// breaks it. Valid UTF-8 is matched unchanged and without a copy.
+fn lazy_trigger_match_view(buffer: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let mut view: Option<Vec<u8>> = None;
+    let mut offset = 0usize;
+    while let Err(error) = std::str::from_utf8(&buffer[offset..]) {
+        let Some(invalid) = error.error_len() else {
+            break;
+        };
+        let start = offset + error.valid_up_to();
+        let view = view.get_or_insert_with(|| buffer.to_vec());
+        view[start..start + invalid].fill(LAZY_TRIGGER_INVALID_BYTE_PLACEHOLDER);
+        offset = start + invalid;
+    }
+    match view {
+        Some(view) => std::borrow::Cow::Owned(view),
+        None => std::borrow::Cow::Borrowed(buffer),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Position + Stack types
 // ---------------------------------------------------------------------------
@@ -292,7 +324,10 @@ pub fn match_char(grammar: &Grammar, mut pos: Pos, chr: u32) -> (bool, Pos) {
 }
 
 /// Returns `true` iff some continuation of the given partial UTF-8 sequence
-/// could satisfy the char range at `pos`.
+/// could satisfy the char range at `pos`. A positive set matches when any of
+/// its ranges overlaps the completions `[low, high]`; an excluded set (`[^…]`)
+/// rejects only when its ranges cover all of `[low, high]`, so one excluded
+/// character no longer blocks its 64- or 4096-code-point neighbours.
 pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8) -> bool {
     let rule = match grammar.rules.get(pos.rule_id as usize) {
         Some(r) => r.as_slice(),
@@ -321,28 +356,45 @@ pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8)
         }
     }
 
+    // Excluded ranges clipped to `[low, high]` (negative sets only).
+    let mut excluded: Vec<(u32, u32)> = Vec::new();
     loop {
         let cur = rule[pos.elem_idx as usize];
         let next = rule.get(pos.elem_idx as usize + 1);
-        if next.map(|e| e.ty) == Some(GretType::CharRngUpper) {
-            let end = next.unwrap().value;
-            if cur.value <= high && low <= end {
-                return is_positive_char;
-            }
+        let (start, end) = if next.map(|e| e.ty) == Some(GretType::CharRngUpper) {
             pos.elem_idx += 2;
+            (cur.value, next.unwrap().value)
         } else if cur.ty == GretType::CharAny {
             return true;
         } else {
-            if low <= cur.value && cur.value <= high {
-                return is_positive_char;
-            }
             pos.elem_idx += 1;
+            (cur.value, cur.value)
+        };
+        if start <= high && low <= end {
+            if is_positive_char {
+                return true;
+            }
+            excluded.push((start.max(low), end.min(high)));
         }
         if rule.get(pos.elem_idx as usize).map(|e| e.ty) != Some(GretType::CharAlt) {
             break;
         }
     }
-    !is_positive_char
+    if is_positive_char {
+        return false;
+    }
+    excluded.sort_unstable();
+    let mut first_uncovered = low;
+    for (start, end) in excluded {
+        if start > first_uncovered {
+            return true;
+        }
+        first_uncovered = first_uncovered.max(end.saturating_add(1));
+        if first_uncovered > high {
+            return false;
+        }
+    }
+    first_uncovered <= high
 }
 
 /// Keep only the stacks whose top character position some completion of the
@@ -1006,8 +1058,9 @@ impl GrammarRuntime {
                 end: lazy.buffer.len(),
             });
 
+            let view = lazy_trigger_match_view(&lazy.buffer);
             let trigger_start = lazy.trigger_patterns.iter().find_map(|pattern| {
-                let captures = pattern.captures(&lazy.buffer)?;
+                let captures = pattern.captures(&view)?;
                 (1..captures.len())
                     .find_map(|index| {
                         captures
@@ -1065,8 +1118,9 @@ impl GrammarRuntime {
         let suffix = {
             let lazy = self.public_lazy.as_mut().expect("checked above");
             lazy.buffer.extend_from_slice(bytes);
-            lazy.trigger_patterns.iter().find_map(|pattern| {
-                let captures = pattern.captures(&lazy.buffer)?;
+            let view = lazy_trigger_match_view(&lazy.buffer);
+            let suffix = lazy.trigger_patterns.iter().find_map(|pattern| {
+                let captures = pattern.captures(&view)?;
                 let start = (1..captures.len())
                     .find_map(|index| {
                         captures
@@ -1076,7 +1130,8 @@ impl GrammarRuntime {
                     })
                     .or_else(|| captures.get(0).map(|capture| capture.start()))?;
                 Some(lazy.buffer[start..].to_vec())
-            })
+            });
+            suffix
         };
         let Some(suffix) = suffix else {
             return Some(true);
@@ -2038,6 +2093,87 @@ mod tests {
         exact.configure_public_lazy(&config).unwrap();
         assert!(exact.accept_token(2, b"tool:BODY"));
         assert!(exact.is_terminally_accepted());
+    }
+
+    /// #553: the lazy buffer holds raw token bytes, so a lone byte-fallback
+    /// piece (`<0x82>`) leaves invalid UTF-8 before the trigger. Unicode-mode
+    /// wildcards must still span it, and the replayed suffix keeps its offsets.
+    #[test]
+    fn public_lazy_patterns_see_through_lone_invalid_bytes() {
+        let full = LazyGrammarConfig {
+            trigger_patterns: vec!["^[\\s\\S]*?tool:(BODY)$".into()],
+            ..Default::default()
+        };
+        let mut rt = runtime_from("root ::= \"BODY\"\n", "root");
+        rt.configure_public_lazy(&full).unwrap();
+        assert!(rt.accept_token(1, b"(1-3"));
+        assert!(rt.accept_token(2, &[0x82]));
+        assert!(rt.accept_token(3, b"2) tool:BO"));
+        assert!(rt.is_awaiting_trigger());
+        assert!(rt.accept_token(4, b"DY"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.is_terminally_accepted());
+
+        let spanning = LazyGrammarConfig {
+            trigger_patterns: vec!["a.b(BODY)".into()],
+            ..Default::default()
+        };
+        let mut rt = runtime_from("root ::= \"BODY\"\n", "root");
+        rt.configure_public_lazy(&spanning).unwrap();
+        assert!(rt.accept_token(1, b"xa"));
+        assert!(rt.accept_token(2, &[0x82]));
+        assert!(rt.accept_token(3, b"bBODY"));
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.is_terminally_accepted());
+
+        let mut bytes = runtime_from("root ::= \"BODY\"\n", "root");
+        bytes.configure_public_lazy(&full).unwrap();
+        assert!(bytes.accept_bytes(&[0x82]));
+        assert!(bytes.accept_bytes(b" tool:BODY"));
+        assert!(bytes.is_terminally_accepted());
+    }
+
+    #[test]
+    fn lazy_trigger_view_replaces_only_invalid_bytes() {
+        let valid = "名前 tool".as_bytes();
+        assert!(matches!(
+            lazy_trigger_match_view(valid),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // A lone continuation byte and a broken lead byte are replaced; an
+        // incomplete trailing sequence waits for its next token.
+        let raw = [b'a', 0x82, b'b', 0xE5, b'c', 0xE5, 0x90];
+        let view = lazy_trigger_match_view(&raw);
+        assert_eq!(&*view, &[b'a', 0x1A, b'b', 0x1A, b'c', 0xE5, 0x90]);
+    }
+
+    /// Excluded sets reject a pending lead byte only when they exclude every
+    /// completion. `前` (U+524D) and `剃` (U+5243) share the prefix E5 89; a
+    /// sibling key spelled byte by byte must survive the mismatch branch that
+    /// excludes the declared key's next character (Gemma bare-key trie shape).
+    #[test]
+    fn excluded_set_keeps_non_ascii_sibling_key() {
+        let grammar = "root ::= \"名\" ( \"前\" | [^前] [a-z]* ) \"=\"\n";
+        let mut rt = runtime_from(grammar, "root");
+        assert!(rt.accept_bytes("名".as_bytes()));
+        assert!(rt.accept_token(1, &[0xE5]));
+        assert!(rt.accept_token(2, &[0x89]));
+        assert!(rt.accept_token(3, &[0x83]), "剃 completes via [^前]");
+        assert!(rt.accept_token(4, b"x="));
+        assert!(rt.is_terminally_accepted());
+
+        let mut declared = runtime_from(grammar, "root");
+        assert!(declared.accept_bytes("名前=".as_bytes()));
+        assert!(declared.is_terminally_accepted());
+
+        // A set excluding every completion of the lead byte still rejects it.
+        let covered = format!(
+            "root ::= [^{}-{}]\n",
+            char::from_u32(0x5000).unwrap(),
+            char::from_u32(0x5FFF).unwrap()
+        );
+        assert!(!runtime_from(&covered, "root").accept_token(1, &[0xE5]));
+        assert!(runtime_from(&covered, "root").accept_token(1, &[0xE6]));
     }
 
     #[test]
