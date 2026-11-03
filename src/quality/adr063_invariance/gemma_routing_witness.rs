@@ -42,7 +42,11 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// `MlxBuffer`, `MlxDevice`, `blit_copy_bytes` and the witness dispatch keep
 /// their semantics, so the route label `native-routing1511-v1` (the witness
 /// protocol introduced in 0.15.11) is kept.
-pub const WITNESS_NATIVE_VERSION: &str = "0.15.15";
+/// Re-reviewed 0.15.15 -> 0.15.16 (`9c67e1f` -> `20540a51`): the witness
+/// shaders gain the threadgroup barrier after the softmax-max broadcast read
+/// (the same WAR race fix as the production decode routing kernels), with no
+/// arithmetic change; `src/ops/routing_selection_witness.rs` is unchanged.
+pub const WITNESS_NATIVE_VERSION: &str = "0.15.16";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
