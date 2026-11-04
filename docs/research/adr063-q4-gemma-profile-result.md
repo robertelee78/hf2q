@@ -239,9 +239,10 @@ stories or the operator records a re-scope.
   `docs/research/adr063-q4-gemma-cold-design.md` §10): the joint 4 × 465-row forward does not keep the
   275 ms per-slot prefill, because the per-row term dominates. That moves the sum of all levers to about
   2.1–3.2 s against the 3.0 s Win requirement.
-- With the prefill MoE (0.08–0.28 s), decode (lowest adoptable 0.36–0.42 s upward, attention included) and
-  speculation (G0 0.40 s) designs, the revised Gemma lever budget is about 2–3.5 s against 3.0 s needed
-  `[INFERENCE]`; only the combined candidate gives a valid total.
+- Revised Gemma lever budget (estimate), low/high: attention 1.2/1.4, cold 0.20/0.35, prefill MoE 0.08/0.28,
+  speculation 0.40 (G0)/0.50, decode including attention 0.36 (lowest adoptable)/1.52 s (all levers at
+  threshold, decode design §5.1): about 2.2–4.0 s against 3.0 s needed `[INFERENCE]`; only the combined
+  candidate gives a valid total.
 
 **hf2q Gemma 4 assistant-drafter support.** Checked in source at `7f295b38`; hf2q does not support it.
 - `src/inference/gguf_contract.rs:83` asserts that `gemma4-assistant` has no runtime contract. Loading the
