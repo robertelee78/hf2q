@@ -8,7 +8,14 @@ This document and the campaign file [`scripts/four_agent/adr065/campaign-b1.json
 
 **Operator decision (2026-11-04).** B1 baselines the fixed engine: hf2q main, once mlx-native 0.15.18 is published and pinned on main. 0.15.18 carries the RoPE partial-rotary fix for a bug in `rope_multi.metal`, which affects Qwen3.6 and Qwen3.8. B1 is never run on the v0.1.29 release binary.
 
-The campaign file holds that commit's identity in `baseline`. Until the commit exists and is built, its fields are `null` placeholders, and the driver refuses to launch a baseline while any field is `null`.
+The campaign file holds that commit's identity in `baseline`. While a field is `null` (a placeholder), the driver refuses to launch a baseline.
+
+**Finalized 2026-11-04:**
+
+- **Source commit:** `38eea8393862b16068bee23789ded41ddf853328`. Its `Cargo.lock` pins mlx-native 0.15.18, checksum `9d10f97e0e25a00c1b4706a0ea9a838b2524b3fc2b999d05f21cd2580c524bee`.
+- **Binary:** `$B1/main-build/hf2q`, sha256 `627d152a122239079a4ee1cef0d6fc6a76877a8fab7d76ec697208761b3a5dff`, 55,518,824 bytes. It reports `hf2q 0.1.29` and embeds only mlx-native 0.15.18.
+- **Build receipt:** sha256 `a7846eb8fe6f9f0b03c900216ac20c134ee3e1b12bbafe42a2ace850a1d7952a`.
+- **Build log:** `$B1/main-build.log`.
 
 | Item | Value |
 | --- | --- |

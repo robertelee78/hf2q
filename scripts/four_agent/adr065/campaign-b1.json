@@ -11,11 +11,12 @@
     "label": "hf2q main with mlx-native 0.15.18 (RoPE partial-rotary fix; phase-1 default)",
     "kind": "main-build",
     "binary": {
-      "source_commit": null,
-      "sha256": null,
-      "bytes": null,
+      "source_commit": "38eea8393862b16068bee23789ded41ddf853328",
+      "sha256": "627d152a122239079a4ee1cef0d6fc6a76877a8fab7d76ec697208761b3a5dff",
+      "bytes": 55518824,
       "path": "{B1}/main-build/hf2q",
-      "build_receipt": {"path": "{B1}/main-build/build-receipt.json", "sha256": null},
+      "build_receipt": {"path": "{B1}/main-build/build-receipt.json",
+                        "sha256": "a7846eb8fe6f9f0b03c900216ac20c134ee3e1b12bbafe42a2ace850a1d7952a"},
       "build": {
         "source_checkout": "/opt/hf2q-worktrees/b1-main-build (detached at source_commit, clean)",
         "cargo_target_dir": "/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool",
@@ -24,10 +25,11 @@
         "copy": "target/release/hf2q -> {B1}/main-build/hf2q"
       }
     },
-    "native": {"crate": "mlx-native", "version": "0.15.18", "checksum": null},
+    "native": {"crate": "mlx-native", "version": "0.15.18",
+               "checksum": "9d10f97e0e25a00c1b4706a0ea9a838b2524b3fc2b999d05f21cd2580c524bee"},
     "notes": [
       "Operator decision 2026-11-04: B1 baselines the fixed engine, hf2q main once mlx-native 0.15.18 (RoPE partial-rotary fix in rope_multi.metal, affecting Qwen3.6/3.8) is published and pinned on main; never the v0.1.29 release.",
-      "Null fields are placeholders until that commit exists and is built; the driver refuses to launch a baseline while any is null.",
+      "Finalized 2026-11-04 from the main build of 38eea839 (version output 'hf2q 0.1.29'; mlx-native =0.15.18 pinned by db0e44d1).",
       "Before launch the driver checks the binary's sha256 and size, the build receipt (bound by sha256: source commit, binary sha256 and size, native version and checksum), the mlx-native pin in Cargo.lock at source_commit, and that the binary embeds exactly one mlx-native version, equal to native.version."
     ]
   },

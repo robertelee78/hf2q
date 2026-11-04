@@ -230,8 +230,10 @@ class Plan(Harness):
         self.assertIn("every arm must run the same binary (arms differ only in a kill switch)",
                       ac.launch_problems(ab, mixed, ["0.15.18"], fake_lock))
 
-    def test_checked_in_placeholder_baseline_never_launches(self):
-        self.campaign["baseline"] = ac.load_campaign()[0]["baseline"]
+    def test_placeholder_baseline_never_launches(self):
+        self.campaign["baseline"]["binary"].update(source_commit=None, sha256=None, bytes=None)
+        self.campaign["baseline"]["binary"]["build_receipt"]["sha256"] = None
+        self.campaign["baseline"]["native"]["checksum"] = None
         plan, _ = self.plan()
         self.assertIsNone(plan["declared"]["commit"])
         problems = ac.launch_problems(plan, fake_ids(plan), ["0.15.18"], fake_lock)

@@ -408,7 +408,7 @@ def main(argv=None):
             qc.require(not args.output.exists(), f"{args.output} exists")
             document = build_receipt(args.binary, args.source_checkout, args.command)
             qc.save(args.output, document)
-            print(json.dumps({"receipt": str(args.output.resolve()), "sha256": q5_artifacts.sha256(args.output),
+            print(json.dumps({"receipt": str(args.output.resolve()), "receipt_sha256": q5_artifacts.sha256(args.output),
                               **{k: document[k] for k in ("source", "sha256", "bytes", "native_version", "native_checksum")}},
                              indent=2))
             return 0
