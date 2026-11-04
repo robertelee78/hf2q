@@ -461,12 +461,21 @@ fail-closed, naming the mismatch, unless all of these hold:
 
 - The hf2q-built Q8_0 artifact (§4.1) is published as a managed artifact,
   in an hf2q-owned location fixed at release time, with its receipt.
-- Its sha256 is pinned in hf2q's managed-artifact table beside the target's
-  pairing (`src/serve/managed_artifacts.rs:344`; the pair-guard precedent is
-  `automatic_pair_guard_authority_paths`, `src/serve/mod.rs:4328`).
-- When serving a target whose managed entry names an assistant, hf2q
-  resolves and verifies the assistant artifact. A digest mismatch refuses
-  `mtp` at load.
+- hf2q has no static managed-artifact table; managed artifacts are bound
+  one at a time. The assistant therefore **reuses the mmproj companion
+  binding** (`src/serve/managed_artifacts.rs:159, 364-415, 461-523`), which
+  already resolves a paired file beside the target. That binding provides:
+  - the companion's identity: repo, revision, filename and sha256;
+  - a stable-file verification against its own sha256;
+  - the fallback behaviour when the companion is absent.
+
+  The assistant is a second companion kind on that path. Line 344 of the
+  same file is only the runtime-contract check before load. It is unchanged
+  and still refuses `gemma4-assistant` as a primary model.
+- When serving a target whose managed binding names an assistant companion,
+  hf2q resolves and verifies it through that binding. A digest mismatch, or
+  an absent companion, leaves speculation off and logs the reason. Explicit
+  `HF2Q_GEMMA_SPECULATION=mtp` refuses to start instead.
 - `--gemma-assistant <PATH>` overrides the managed resolution. It is the
   only path the Q5 cases use, so every receipt binds an explicit file and
   sha256.
@@ -605,9 +614,13 @@ Per layer:
   are its own), then one batched flash over all R queries with per-query
   slot id and position. Each query's extent is `pos_r + 1`, so its keys
   `≤ pos_r` are exactly the bytes M1 would have written. The batched kernel
-  is used only if every query shares the `(nwg, nsg)` bucket. Otherwise each
-  rank slice is split by bucket, as the existing mixed-bucket fallback does
-  (`:891-901`).
+  is used only if every query shares the `(nwg, nsg)` bucket.
+  - In a **speculative** tick, a mixed-bucket rank slice is split by bucket.
+    A1 and A4 cover this.
+  - Any tick **without** a speculating window keeps today's all-or-nothing
+    fallback (`:891-901`) unchanged: batched if every row shares one bucket,
+    otherwise per-row. The per-bucket split never runs there, so A5 holds
+    trivially.
 - **Sliding layers** (ring of 1,024). For `j = 0 .. w_max−1`: KV-encode
   slice j, then the batched flash on slice j, then the FWHT undo on slice j.
   - Once `ksl == cap` the kernel reads all 1,024 ring slots with no
@@ -666,12 +679,28 @@ per row, in today's order:
    `rt.trigger()`), stop strings and grammar-dead. At temperature 0 the
    greedy-with-penalty pick returns before any random draw
    (`sampler_pure.rs:98-107`).
-3. Emit the fragment. The **first failed emit stops** the walk at this row,
-   with today's failure handling for that request (`engine.rs:16930,
-   16942`).
+3. Emit the fragment.
 4. `scheduler.advance_after_decode(handle)`, once per row
-   (`scheduler.rs:1565-1599`). If it auto-releases at `max_tokens`, the
-   release is captured as a deferred finish and the walk stops.
+   (`scheduler.rs:1565-1599`). It runs **also for a row whose emit failed**,
+   exactly as the ordinary path does (`engine.rs:16930-16940`). The walk
+   then stops at that row, with today's emit-failure handling for the
+   request (`:16942`). It also stops after a row whose advance auto-releases
+   at `max_tokens`.
+
+   The scheduler-side release inside `advance_after_decode`
+   (`scheduler.rs:1576-1590`) happens **immediately and cannot be
+   deferred**. Only the engine-side finish effects are deferred: retained
+   prefix, `record_retained_slot_kv`, recovery and request completion. The
+   early release is harmless:
+   - the worker admits nothing between the walk and the restore plus cursor
+     commit, because admission runs only at the top of the worker loop,
+     before `scheduler.step()` (`engine.rs:12960`);
+   - nothing else touches the released slot's KV in that interval;
+   - the deferred engine-side effects then read the restored state.
+
+   U5 pins the count and order of `advance_after_decode` calls, the
+   emit-failure row included, against the ordinary path. U6b asserts that no
+   admission or snapshot runs before the restore.
 
 The walk over a speculating lane:
 
@@ -783,14 +812,15 @@ equal the serial path's.
 
 - **Lane-local refusal before submission** (entry or draft-pass error): that
   lane runs as an ordinary row in the same tick, with state untouched.
-- **A failure of the submitted shared verify or restore**: every
-  participating lane is reset through the existing Gemma slot-reset path,
-  and its request terminates with an error. Non-participants' state and
-  committed prefixes are unmutated, because their rows are rank 0 and write
-  only their own `pos` row, exactly as an M1 tick would.
-- **A failure after the verify but before the restore and cursor commit
-  complete**: worker-fatal, fail-stop. No slot state is reused, because the
-  ring may hold unrestorable rows. Deferred finishes do not run.
+- **A failure of the submitted shared verify forward**: every participating
+  lane is reset through the existing Gemma slot-reset path, and its request
+  terminates with an error. Non-participants' state and committed prefixes
+  are unmutated, because their rows are rank 0 and write only their own
+  `pos` row, exactly as an M1 tick would.
+- **A failure after the verify completed, including any restore or cursor
+  commit failure**: worker-fatal only, fail-stop. No slot state is reused,
+  because the ring may hold unrestorable rows. Deferred finishes do not run.
+  No lane-level reset is attempted on this path.
 - Cancellation during a round takes effect after the round's restore and
   cursor commit, as a deferred finish (§5.4).
 
@@ -930,10 +960,10 @@ crate path). Real-artifact tests are ignored, one process each,
 | U2 | `gemma4_assistant_pairing_guard_matrix` | Accepts the §4.2 pair under both head paths; refuses each of rules 1–8 in isolation with its message (including `HF2Q_FULL_F16_KV=1` and a bound graft); the kata test plus the drafter-contract assertion |
 | U3 | `gemma_speculation_switch_table` | §5.8 table before and after promotion; `mtp` without an assistant fails startup |
 | U4 | `gemma_speculation_eligibility` | Sampled is refused (and no RNG is drawn); an omitted `temperature` resolves greedy; penalty, bias, grammar and logprobs allowed; budget window `min(K+1, remaining)`; first tick after prefill is ordinary; per-width cost controller recreated at admission |
-| U5 | `gemma_spec_walk_matches_serial_ticks` | With synthetic logits through `gemma_commit_decoded_row`, the walk equals the same rows as successive ordinary ticks in: fragments, request state, `valid_tokens`, the cursor commit by m, the count and order of `advance_after_decode` calls, and the deferred finish/release (retained prefix length = c, `record_retained_slot_kv`), applied after restore. Cases: every combination of full, partial and zero acceptance; EOS, stop string, grammar trigger and grammar-dead at each row; `max_tokens` auto-release at each row; first failed emit at each row; cancellation arriving mid-round; penalty sensitivity across rows (a row whose argmax flips only because of an earlier row's token in the window) |
+| U5 | `gemma_spec_walk_matches_serial_ticks` | With synthetic logits through `gemma_commit_decoded_row`, the walk equals the same rows as successive ordinary ticks in: fragments, request state, `valid_tokens`, the cursor commit by m, the count and order of `advance_after_decode` calls (**including the call for a row whose emit failed**), the immediate scheduler-side release, and the deferred engine-side finish (retained prefix length = c, `record_retained_slot_kv`), applied after restore. Cases: every combination of full, partial and zero acceptance; EOS, stop string, grammar trigger and grammar-dead at each row; `max_tokens` auto-release at each row; first failed emit at each row; cancellation arriving mid-round; penalty sensitivity across rows (a row whose argmax flips only because of an earlier row's token in the window) |
 | U6 | `gemma_spec_ring_preimage_plan` | For each `(pos0, K, m)`, including pos0 ∈ {1020..1026} and deep wrap: `r_lo`, `n_saved`, save `logical_end`; restore `src_row_offset`, `n_restore`; accepted rows never restored; no save before wrap; per-slot view bounds checked before the save dispatch |
-| U6b | `gemma_spec_no_snapshot_between_verify_and_restore` | No anchor, prefix-cache, retained-prefix or warm-resume snapshot path runs between a round's verify submission and its restore plus cursor commit; deferred finishes run only after them |
-| U7 | `gemma_spec_failure_semantics` | Injected lane-local refusal leaves the lane ordinary; a shared verify failure resets participants and leaves non-participants unmutated; a failure after verify fail-stops and runs no deferred finish |
+| U6b | `gemma_spec_no_snapshot_between_verify_and_restore` | No admission and no anchor, prefix-cache, retained-prefix or warm-resume snapshot path runs between a round's verify submission and its restore plus cursor commit, even when `advance_after_decode` released a slot during the walk; engine-side deferred finishes run only after them |
+| U7 | `gemma_spec_failure_semantics` | Injected lane-local refusal leaves the lane ordinary. A shared verify-forward failure resets participants and leaves non-participants unmutated. A restore or cursor-commit failure is worker-fatal only: no lane reset and no deferred finish |
 | U8 | `gemma_spec_window_rows_layout` | **Rank-major** layout: slice j holds rank j of every window in window order, and slice 0 equals today's one-row-per-slot batch; `rank_offsets`, the window-major `row_of` map, per-row positions and slot ids; each phase is a contiguous slice; dense grouping ⌈R/8⌉; full-layer bucket split |
 | U9 | `gemma_spec_metrics_and_controls` | Metric names and runtime control fields |
 
@@ -1143,7 +1173,7 @@ The Q4 gates apply there:
 | R3 Lower acceptance than the peer: hf2q's V is TQ-HB quantized, while the peer's KV is F16 and the drafter was trained on exact KV; Q8_0 drafter; sliding-window choice | Lower L | D2 measures it; BF16 is the fallback (D2 rule); the D1 window pin |
 | R3b The L(K) model is wrong at depth 1 | M0's provisional K\* differs from M1's | K\* and G0 are final only at M1, on measured L |
 | R4 SSE/TTFT fairness: a round is about c× an ordinary tick, and Mixed steps delay prefill quanta | S1-d failure | Bursts deliver several tokens per gap; `mtp-decode-only` is pre-declared (D7); the cost controller |
-| R5 Bucket edge cases (mixed `(nwg, nsg)` buckets inside a rank slice) | A1 failure | The rank slice is split by bucket, as the existing fallback does; A1 covers bucket edges; a graft is refused at load |
+| R5 Bucket edge cases (mixed `(nwg, nsg)` buckets inside a rank slice) | A1 failure | In speculative ticks only, the rank slice is split by bucket. Non-speculative ticks keep today's all-or-nothing fallback. A1 and A4 cover bucket edges; a graft is refused at load |
 | R6 Bookkeeping drift between the walk and ordinary ticks (`valid_tokens`, cursor commit, `advance_after_decode`, emit failure, finish/cancel) | Wrong retained prefix or release; non-exact transcripts | One shared `gemma_commit_decoded_row`; finishes deferred until after restore; U5; A6 |
 | R7 Ring restore omission (a snapshot or read between verify and restore) | Silent state corruption | Restore and cursor commit run in the same worker step before any deferred finish; U6b; A2 includes the next 8 ordinary decodes |
 | R8 Carry-buffer lifetime (the next head overwrites it before the draft pass reads it) | Wrong drafts (speed only) | Double-buffered; A3 and D1 read through it |
