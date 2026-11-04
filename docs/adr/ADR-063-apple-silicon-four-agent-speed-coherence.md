@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope, F1/F3 execution entry, the separately reviewed F2/Q1/Q2/C1 source implementation entry and the 2026-11-03 measurement-only entry (see "Speed program, Q1 successors and release mapping"); other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-11-04 (Splash peer) — for Qwen3.8 and Qwen3.6 a Q4 Win requires hf2q to finish the four-agent task at least 5% sooner than both the peer and Splash, each in its best valid configuration; Splash `031a25a6` joins as a second same-artifact peer of record on the hf2q GGUFs (see "Splash peer of record for the Qwen families"; design `docs/research/adr063-splash-peer-design.md`, decisions D1–D10). Earlier 2026-11-03 (design approvals) — operator approval of the designs for Q4-GEMMA-KERNEL/Q4-GEMMA-ATTN (`docs/research/adr063-gemma-tiled-attn-design.md`), Q4-TRACE (`docs/research/adr063-q4-trace-design.md`, with its three §7 answers), Q1-QWEN36-SPEC/Q1-GEMMA-SPEC (`docs/research/adr063-q1-spec-design.md`; the unlocalized-`RouteSensitive` exception is rejected, Gemma results must be localized and #665 includes the verifier-route localizer) and Q4-DS4-RACE with ADR-066 N-IQ2XXS (`docs/research/adr066-iq2xxs-subset-design.md`); Q4-QWEN36: the conversion audit found no defect, and the first third-party check is unsloth UD-Q4_K_M under the canonical setup on both engines (see "Design approvals and Qwen3.6 decisions"). Earlier 2026-11-03 (C2 sign-offs) — owner sign-off of C2 (#360) decisions D1–D5 (`docs/research/adr063-c2-design.md` §10): divergent turns are judged by the Q1 decision envelope on every teacher-forced row of each divergent turn, `RouteSensitive` blocks; append-only turns keep `ExactTranscripts` plus the bitwise same-route twin; "≤ 1.025" limits are 95% CI upper bounds at Q3's sequential precision stop; campaigns use that stop instead of fixed blocks; anchor identity omits C1's `conversation` field; cancellation discards the request's own pending anchor. Earlier 2026-11-03 (later) — Q4-DS4 result Fit (six of seven peer runs valid; best configuration provisional); Q4-DS4-RACE now consumes ADR-066 N-IQ2XXS (the IQ2_XXS subset as its own story) instead of N1/N3/N4; Q4-DS4-RACE decision D1: on the ds4 file the race is judged against the peer only, and the vs-stock makespan contrast, fairness band and stock quality gate come from a same-artifact candidate-vs-v0.1.28 record on hf2q's own DeepSeek-V4 artifact with the same candidate binary; Q4-DS4-RACE decision D2: ds4 runs on the same file in a declared same-artifact native-comparison campaign (design `docs/research/adr066-iq2xxs-subset-design.md`). Earlier 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with Q4-DS4-RACE, and Q4-QWEN36, with Q4-GEMMA-KERNEL (mlx-native) and Q4-TRACE; the measurement tracks Q4-GEMMA (profiling) and Q4-DS4 (fit) are split from their implementation tracks and their designs are operator-approved; Q4-DS4-RACE consumes the IQ2_XXS subset of ADR-066 N1/N3/N4 pulled ahead of ADR-066 B2; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b with J1 joining v0.1.30, frozen limits, delivery v0.1.30); remaining verification leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
+- **Updated:** 2026-11-04 (Gemma 4 gap stories) — operator decision adding Q4-GEMMA-COLD, Q4-GEMMA-PREFILL-MOE, Q4-GEMMA-DECODE and Q4-GEMMA-SPEC-SERVE, with their designs approved (`docs/research/adr063-q4-gemma-{cold,prefill-moe,decode,spec-serve}-design.md`) and their recorded decisions; decode attention is lever A of Q4-GEMMA-DECODE (root decision); the four are predecessors of Q4-GEMMA-ATTN's closing combined candidate; the revised Gemma lever budget is about 2–3.5 s against the 3.0 s a Win needs; the mlx-native `rope_multi` partial-rotary defect (fix mlx-native PR #86, release 0.15.18) pins all Qwen GPU validation and the ADR-065 B1 baseline run on main to 0.15.18 (see "Gemma 4 gap stories and the rope_multi pin"). Earlier 2026-11-04 (Splash peer) — for Qwen3.8 and Qwen3.6 a Q4 Win requires hf2q to finish the four-agent task at least 5% sooner than both the peer and Splash, each in its best valid configuration; Splash `031a25a6` joins as a second same-artifact peer of record on the hf2q GGUFs (see "Splash peer of record for the Qwen families"; design `docs/research/adr063-splash-peer-design.md`, decisions D1–D10). Earlier 2026-11-03 (design approvals) — operator approval of the designs for Q4-GEMMA-KERNEL/Q4-GEMMA-ATTN (`docs/research/adr063-gemma-tiled-attn-design.md`), Q4-TRACE (`docs/research/adr063-q4-trace-design.md`, with its three §7 answers), Q1-QWEN36-SPEC/Q1-GEMMA-SPEC (`docs/research/adr063-q1-spec-design.md`; the unlocalized-`RouteSensitive` exception is rejected, Gemma results must be localized and #665 includes the verifier-route localizer) and Q4-DS4-RACE with ADR-066 N-IQ2XXS (`docs/research/adr066-iq2xxs-subset-design.md`); Q4-QWEN36: the conversion audit found no defect, and the first third-party check is unsloth UD-Q4_K_M under the canonical setup on both engines (see "Design approvals and Qwen3.6 decisions"). Earlier 2026-11-03 (C2 sign-offs) — owner sign-off of C2 (#360) decisions D1–D5 (`docs/research/adr063-c2-design.md` §10): divergent turns are judged by the Q1 decision envelope on every teacher-forced row of each divergent turn, `RouteSensitive` blocks; append-only turns keep `ExactTranscripts` plus the bitwise same-route twin; "≤ 1.025" limits are 95% CI upper bounds at Q3's sequential precision stop; campaigns use that stop instead of fixed blocks; anchor identity omits C1's `conversation` field; cancellation discards the request's own pending anchor. Earlier 2026-11-03 (later) — Q4-DS4 result Fit (six of seven peer runs valid; best configuration provisional); Q4-DS4-RACE now consumes ADR-066 N-IQ2XXS (the IQ2_XXS subset as its own story) instead of N1/N3/N4; Q4-DS4-RACE decision D1: on the ds4 file the race is judged against the peer only, and the vs-stock makespan contrast, fairness band and stock quality gate come from a same-artifact candidate-vs-v0.1.28 record on hf2q's own DeepSeek-V4 artifact with the same candidate binary; Q4-DS4-RACE decision D2: ds4 runs on the same file in a declared same-artifact native-comparison campaign (design `docs/research/adr066-iq2xxs-subset-design.md`). Earlier 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with Q4-DS4-RACE, and Q4-QWEN36, with Q4-GEMMA-KERNEL (mlx-native) and Q4-TRACE; the measurement tracks Q4-GEMMA (profiling) and Q4-DS4 (fit) are split from their implementation tracks and their designs are operator-approved; Q4-DS4-RACE consumes the IQ2_XXS subset of ADR-066 N1/N3/N4 pulled ahead of ADR-066 B2; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b with J1 joining v0.1.30, frozen limits, delivery v0.1.30); remaining verification leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28, v0.1.30
 - Stable source ID: ADR-063
@@ -693,11 +693,158 @@ Repository ownership: hf2q owns route selection, integration and the campaign, c
 
 Validation: Independent review of the design, the Q1-envelope receipts, the quality gates and the Q3-design hf2q-versus-peer campaign.
 
-Predecessors: Q4-GEMMA-KERNEL, Q4-GEMMA (#660, profiling result), Q5 (#371).
+Predecessors: Q4-GEMMA-KERNEL, Q4-GEMMA (#660, profiling result), Q5 (#371). The closing campaign (the combined candidate) also has as predecessors Q4-GEMMA-COLD, Q4-GEMMA-PREFILL-MOE, Q4-GEMMA-DECODE and Q4-GEMMA-SPEC-SERVE (operator decision 2026-11-04): each delivers its qualified change, or its recorded falsification or stop, before that campaign runs.
 
 Priority: High. Core scope (second-tier family).
 
 Delivery boundary: Release v0.1.30, or the first published hf2q release containing the accepted Gemma 4 configuration.
+
+### Q4-GEMMA-COLD. Prefill the simultaneous cold Gemma 4 first turns in one exact joint transaction
+
+Outcome: The four simultaneous cold first prompts of the Gemma 4 26B-A4B four-agent task are prefilled in one joint transaction that is bitwise equal to per-slot prefill, so no agent waits for the other agents' serial prefills on turn 0.
+
+Requirement: The program MUST admit every eligible cohort (design §3.1: all slots idle, two or more text lanes, each cold with an exact pre-generation boundary of at least 33 rows, at most 4,096 prompt rows in total, no graft, no diagnostic route override) of cold Gemma 4 requests into one joint prefill transaction that is Q1 Class A against the per-slot route, publishing each lane's boundary anchor, cursor and first token exactly as per-slot admission does. Every other group keeps its current route. It MUST measure the turn-0 effect on the four-agent task.
+
+Acceptance:
+
+- A written design, approved before implementation: `docs/research/adr063-q4-gemma-cold-design.md`. It covers the cohort rule (§3.1), per-sequence cold attention (§4.3), cue replay through the batched decode body (§4.4), failure semantics (§4.5) and kill switch `HF2Q_GEMMA_JOINT_COLD_PREFILL=0` (default on once the bitwise gates pass). Approved by the operator, 2026-11-04, with decisions D1–D4 as recommended (design §12).
+
+- Starting point (Q4-GEMMA #660, L1, 7 blocks, hf2q `7f295b38`): the four turn-0 requests coalesce but are admitted per slot in series. Because each carries a stable boundary, the stable batch refuses them as uncached and the cold batch refuses boundaries. The result is a server-queue staircase of 1/285/560/834 ms (lane medians), 275 ms of prefill per lane and 1.19 s of "decode" on the first-served lane. The turn-0 span is +496 ms against the peer's MT, 18% of the 2.73 s makespan gap.
+
+- Class A: on the official artifact, every cohort lane's first-token logits, cursors, all 30 layers' slot KV through the prompt, boundary anchor bytes and 16 following decode rows equal the per-slot route byte for byte. This covers the turn-0 prompts and the §6.2 synthetic shapes, including the 32-row per-slot cue and mixed {7, 40} cues, and is deterministic over 20 repeats. The iter-G(a) cold batch moved to the same per-sequence attention (lane floor 33 rows) also matches per slot bitwise. For the installed long-prompt cold prefill, only the cursor-0 chunk forward is claimed exact. Any differing byte blocks; no Class B fallback ships without a separate operator decision and the Q1 §3.5 campaign.
+
+- `ExactTranscripts` on the four-agent workload, kill switch on against off.
+
+- Speed, paired four-agent replay (same binary, kill switch off against on, 7 paired blocks, Q5 `CalibrationPass` per run): turn-0 span median reduction ≥ 0.20 s per agent with a 95% CI excluding 0; turn-0 server queue median ≤ 30 ms; turn-0 decode median ≤ 420 ms; cohort size 4 in at least 6 of 7 runs. Makespan is reported, not gated; the makespan verdict belongs to the combined candidate. The transaction itself takes ≤ 0.80× the per-slot sum on the turn-0 prompts. The no-boundary cold batch on the new attention route takes ≤ 1.05× its previous transaction time.
+
+- The stock fairness band 1.025 (worst-slot TTFT p95, SSE-gap max) and the Q5 memory tier hold in the Q4-GEMMA-ATTN combined candidate, which carries this change; the Q4 Win is measured there, not here.
+
+Repository ownership: hf2q owns the cohort admission, the per-sequence cold attention route, the cue replay, the tests and the campaign. It uses existing mlx-native kernels at the current pin; no mlx-native change.
+
+Validation: Independent review of the design, the bitwise and determinism gate receipts, the Q1 T0/T2 `ExactEqual` witness on the candidate build, the `ExactTranscripts` record and the paired four-agent replay from raw receipts.
+
+Predecessors: Q4-GEMMA (#660, profiling result), Q5 (#371).
+
+Priority: High. Core scope (second-tier family).
+
+Delivery boundary: Qualified implementation merged to main for v0.1.30 and included in the Q4-GEMMA-ATTN combined candidate.
+
+### Q4-GEMMA-PREFILL-MOE. Reduce the Gemma 4 warm-prefill MoE cost per row
+
+Outcome: Gemma 4 26B-A4B warm prefill spends measurably less GPU time per row in the routed experts, bitwise identical to the previous route, and the saving enters the combined Gemma candidate.
+
+Requirement: The program MUST reduce the GPU time per row of the warm-prefill routed-expert stage (34% of warm-prefill GPU time in the Q4-GEMMA profile) without changing any output byte. It MUST first test, with a model-free microbenchmark, the hypothesis that expert matrix-multiply launch geometry is a material part of that stage. It MUST record the measured saving, or the falsification, against the profiled MoE share.
+
+Acceptance:
+
+- Starting point (Q4-GEMMA #660, hf2q `7f295b38`, native 0.15.16): warm-prefill MoE and layer tail are 34% of warm-prefill GPU time (1.09–1.11 s per run serialized; attention 48%, dense 11%, pre-attention 7.5%). About 225 M expert-matmul threadgroups are launched per four-agent run, of which an estimated 3.1 M have work (routing proxy; design §2.4).
+
+- A written design, approved before implementation: `docs/research/adr063-q4-gemma-prefill-moe-design.md`. It covers the Gemma prefill MoE down call on the slotted expert entry point (P1, hf2q); a compact per-expert tile schedule with schedule reuse (P2, P2b, mlx-native); and a half-tile skip only where it is bitwise (P2c). The `mm_id`/`mv_id` threshold (32), dense thresholds, tensor-API selection and storage types are unchanged. Approved by the operator, 2026-11-04, with decisions D1–D7 as recommended (design §12).
+
+- Every shipped change is Q1 Class A against the previous route. The mlx-native parity matrix (design §5.1) is bitwise on both metallib paths, and so are the hf2q real-artifact gates (joint warm == per-slot on every warm attention route, engine cohort == serial tool turns, per-slot parity, the route A/B layer-byte test, and the greedy144 Q1 endpoint `ExactEqual`). `ExactTranscripts` holds over every A/B run pair. A non-bitwise variant does not ship under this story.
+
+- Speed, with one binary and the previous route as the A arm: at least 6 ABBA pairs matched by warm-transaction structure (design §7.1). The per-run sum of unprofiled joint-warm forward walls improves by at least 0.05 s (95% CI upper bound < 0). The profiled MoE category falls by at least half the measured microbenchmark saving, with the other categories within ±3%. The four-agent makespan does not regress (CI upper bound ≤ +0.05 s). The worst-slot TTFT p95 and SSE-gap max ratios stay within 1.025.
+
+- Stop path (design §6, §7.4): if the frozen microbenchmark prediction for P1 + P2 + P2b is below 0.05 s per run, or the warm-prefill gate fails, P1 still merges as a bitwise change with its switch removed, P2/P2b/P2c are not built, and the story closes with the recorded falsification.
+
+- The real-artifact gates run under the design's invocation rules (`--exact`, env gates set, `1 passed` with no skip line). The shared-kernel regression gates for DeepSeek-V4 and Qwen MoE pass at the native pin. Every run passes Q5 `CalibrationPass`.
+
+Repository ownership: mlx-native owns the compact schedule, the schedule-reuse entry point, the half-tile skip, the parity tests, the microbenchmark and the release. hf2q owns the slotted down call, route switches, integration, the real-artifact gates and the A/B campaign, consuming mlx-native at an exact published pin.
+
+Validation: Independent review of the design, the parity and microbenchmark receipts, the Class A real-artifact receipts and the A/B campaign from raw receipts.
+
+Predecessors: Q4-GEMMA (#660, profile result PR #687, merged on main as `2dfe71ba`), Q5 (#371). Consumed by Q4-GEMMA-ATTN's combined candidate, which lists this story among its closing-campaign predecessors.
+
+Priority: High. Core scope (second-tier family).
+
+Delivery boundary: P1 merged to main; and either the mlx-native release containing P2 pinned and integrated by hf2q (P3), or, on the stop path, the recorded falsification. For v0.1.30, or the first published hf2q release containing the accepted Gemma 4 configuration.
+
+### Q4-GEMMA-DECODE. Make Gemma 4 four-slot decode kernels exact and faster
+
+Outcome: Gemma 4 26B-A4B joint decode at four slots spends less GPU time per step in its dense projections, routed experts and attention. Every output stays bitwise equal to today's decode.
+
+Requirement: mlx-native MUST provide exact row-tiled dense, expert-grouped and GQA-grouped attention decode kernels under a stated contract (Q1 Class A against the stock kernels). The program MUST integrate them into the Gemma batched decode body behind a kill switch, and MUST measure the per-step GPU and makespan saving against that switch.
+
+Acceptance:
+
+- Starting point (Q4-GEMMA #660, binary `7f295b38`, mlx-native 0.15.16):
+  - The decode body splits as follows: routed MoE 40% (gate/up 21.8%, down 15.3%), dense projections and FFN 37.5%, attention 17.8%, norms 4.5%.
+  - In decode-only windows, hf2q is GPU-busy 2.0–2.5 s per run longer than the peer's MT configuration. Part of that gap is MT's speculation (2.34 tokens per verify step, i.e. fewer target steps), not kernel speed; #660 sized decode kernels at 0.3–0.7 s.
+  - At width 4, the Q4_K/Q6_K dense projections move their weights at 155–184 GB/s. Per element-column they already match or exceed the expert kernels (1.0–1.19 T against 0.83 T per second), so the exact lever is capped near 2×.
+  - Dense `ffn_down` (Q5_0/Q8_0) streams its weight once per row.
+  - Both engines stream each (token, expert) pair separately, although the four rows share about 35% of their expert selections (Q1 witness proxy).
+  - Decode attention loads and decodes each KV row once per query head: 2× on sliding layers, 8× on global layers.
+
+- Design approved before implementation: `docs/research/adr063-q4-gemma-decode-design.md`, revision 2: §3 (exactness contract), §4 (S0 spike; levers D1, D2, E1, A1/A2; optional F1/F2; policy and refusal rules), §7 (M0 thresholds), §8 (gates). Approved by the operator, 2026-11-04, with the design §13 decisions 1–5.
+
+- A linked mlx-native issue states the §3 contract before implementation. The kernels are:
+  - row-tiled Q4_K/Q6_K `mN`, with the lm head decided independently;
+  - Q5_0/Q8_0 `mN`;
+  - expert-grouped `mv_id` for Q4_K gate_up and Q5_0/Q8_0 down, admitting up to 16 tokens × top-8;
+  - GQA-grouped and mixed-bucket vec-hybrid decode attention.
+
+  New per-lever routing-policy fields default off and are never resolved from the environment. Existing entry points stay bit-identical. Each new kernel is compiled with its reference kernel's flags.
+
+- Exactness, verified in order:
+  - A Q4_K R0 = 2 parity spike runs before the microbenchmark.
+  - Primitive parity is u32-bitwise against the stock kernels at every Gemma shape, synthetic row tails, m = 1..8, all expert patterns (all-distinct, all-shared, empirical, invalid id), attention KV lengths across every bucket edge, and both metallib paths, with the toolchain recorded.
+  - M0 uses cold-weight rotation and a host roofline. It reports weight GB/s and element-columns per second, uses the real-workload routing and KV-length distributions, and includes a peer per-kernel reference. Each lever is adopted only at its frozen threshold.
+
+- hf2q switch and Class A gates:
+  - `HF2Q_GEMMA_DECODE_KERNELS` (`0` is the kill switch) captures the environment routing policy at load. It refuses unless the reference flags hold.
+  - A stock-equivalence test compares logits, tokens, KV, and expert ids and weights bitwise against `0`.
+  - The slot-aware n1/n4/n8 and eviction parity tests pass.
+  - The two arms are `ExactEqual` on the Q1 T2 cohort trace.
+
+- Speed:
+  - In situ, decode-step GPU at width 4 is ≤ 0.90 × the kill switch, with no width-1 regression and the lm head reported separately.
+  - Four-agent Q5 A/B, same binary (ABBA, at least 4 runs per arm): median makespan ratio ≤ 0.96, block-paired 95% CI upper below 1.00.
+  - `ExactTranscripts` holds across the A/B.
+  - Worst-slot TTFT p95 and SSE-gap max ratios are ≤ 1.025.
+  - The 0.96 closes this story's share of the Gemma Win only if the other Gemma stories reach their high estimates; otherwise about 0.93 is needed. Any shortfall is re-budgeted across the Gemma stories (operator preference, 2026-11-04).
+
+- The default flips only after every gate passes. The Gemma verdict is then decided on the combined candidate in the Q4 closing campaign: Win against the peer's MT configuration, paired quality Pass against v0.1.28 and against the peer, stock fairness 1.025, and a fresh Q5.
+
+Repository ownership: mlx-native owns the kernels, dispatchers, policy fields, contract, parity tests, microbenchmarks and release. hf2q owns route selection, the switch and refusal rules, the overlap diagnostic, integration, the Class A gates and the campaigns, consuming an exact published mlx-native pin.
+
+Validation: Independent review of the contract, of the spike, parity and microbenchmark receipts (including the peer reference), of the Class A receipts, and of the A/B from raw receipts.
+
+Predecessors: Q4-GEMMA (#660, profiling result), Q5 (#371). It is independent of Q4-GEMMA-KERNEL and Q4-GEMMA-ATTN. Its grouped expert and attention kernels serve Q4-GEMMA-SPEC-SERVE's verify rows.
+
+Priority: High. Core scope (second-tier family).
+
+Delivery boundary: A published mlx-native release pinned exactly by hf2q, plus the integration merged for v0.1.30 (or the first published hf2q release containing the accepted Gemma 4 configuration).
+
+### Q4-GEMMA-SPEC-SERVE. Serve Gemma 4 with its assistant (MTP) drafter at four slots
+
+Outcome: hf2q's Gemma 4 26B-A4B serving worker speculates with the Gemma 4 assistant drafter at four slots, as the peer's best configuration does, and finishes the canonical four-agent coding task measurably sooner than the same binary without speculation, with transcripts unchanged.
+
+Requirement: The program MUST convert and load `google/gemma-4-26B-A4B-it-assistant@6e5aaaf4` as a paired drafter and MUST provide a joint four-slot draft/verify transaction in the Gemma serving worker whose verified rows, commits and rollbacks are Class A exact against the serial decode route.
+
+Acceptance:
+
+- A written design, approved before implementation, states the verify route, rollback, switch and kill switch: `docs/research/adr063-q4-gemma-spec-serve-design.md`. In it: the assistant comes from managed download pinned by sha256, with `--gemma-assistant` as the override; `HF2Q_GEMMA_SPECULATION=mtp` enables speculation; it is off by default until every gate passes, then on when an assistant is resolved; `0` is the kill switch; only greedy requests speculate; the depth K ∈ {1, 2, 3} is measured with K = 1 first. Approved by the operator, 2026-11-04, with the design §13 recorded decisions.
+- The drafter loads only through a drafter contract paired to a `gemma4` target, behind a fail-closed pairing guard. `gemma4-assistant` stays out of the primary runtime contracts. The 26B-A4B checkpoint's head is the dense tied embedding (`use_ordered_embeddings: false`); ordered-embedding (centroid) assistants are refused, never approximated. The drafter's step-0 input is the target head's retained post-final-norm operand; the fused head stays on.
+- The round-cost curve is measured on the verify route before any drafter runtime, with a frozen drafter-cost bound, a frozen acceptance model fitted to the peer, and a time-weighted width histogram. Gate G0: the projected decode saving at the chosen depth must be ≥ 0.40 s per run (the lower end of the Q4-GEMMA booked 0.4–0.5 s). G0 is re-checked, and the depth fixed, on hf2q's measured acceptance. A miss ends the story as a recorded falsification, and the windowed verify is removed unless a zero-cost drafter reuses it.
+- Class A gates pass:
+  - verified rows are bitwise equal to teacher-forced serial decode rows in every cohort;
+  - ordinary rows are invariant;
+  - after a round with *a* accepted drafts, the state readable at the cursor (full layers below it, the sliding ring's window, cursors) equals serial decoding of a+1 tokens, and so do the next eight decodes;
+  - the per-token bookkeeping (valid tokens, cursor commit, scheduler advance, emit failure, finish and cancellation after restore) equals the ordinary ticks';
+  - the drafter pass leaves the target state unchanged;
+  - serving transcripts with speculation on and off are `ExactTranscripts` in every A/B block.
+- Same-binary A/B under the ADR-065 two-arm rules (12 ABBA blocks): verdict Win, median makespan reduction ≥ 0.30 s and ≥ 60% of the M0 projection, decode stage −0.35 s or more, and paired TTFT/SSE fairness within 1.025 against the speculation-off arm. A fresh Q5 calibration of the target plus assistant artifact set passes.
+- Every native primitive (the byte-exact ring-row restore with a source row offset) is published in mlx-native and consumed at an exact pin. The Q8_0 assistant artifact is published and pinned before promotion.
+
+Repository ownership: hf2q owns the converter, drafter contract, serving transaction, policy, telemetry and campaigns. mlx-native owns the ring-row restore primitive, its parity tests and release.
+
+Validation: Independent review of the design, the Class A receipts, the M0 round-cost curve and G0 decision, the acceptance replay and the A/B receipts.
+
+Predecessors: Q4-GEMMA (#660, profiling result), Q5 (#371). Q4-GEMMA-ATTN's closing campaign consumes the accepted configuration.
+
+Priority: High. Core scope (second-tier family).
+
+Delivery boundary: Release v0.1.30, or the first published hf2q release containing the accepted Gemma 4 configuration; a G0 miss delivers the recorded falsification instead.
 
 ### Q4-DS4. Run the peer on the ds4 DeepSeek-V4 file and determine fit
 
@@ -1613,6 +1760,91 @@ Design approvals and Qwen3.6 decisions (operator, 2026-11-03):
   both engines.
 
 This amendment establishes no speed win, quality result or memory admission.
+
+### Gemma 4 gap stories and the rope_multi pin (operator decisions, 2026-11-04)
+
+The Q4-GEMMA profile result (#660,
+`docs/research/adr063-q4-gemma-profile-result.md` §7) found that
+Q4-GEMMA-ATTN alone cannot produce a Gemma Win and that no v0.1.30 story
+covered the other levers. The operator decided on 2026-11-04 to add four
+v0.1.30 stories, each a predecessor of Q4-GEMMA-ATTN's closing combined
+candidate: Q4-GEMMA-COLD, Q4-GEMMA-PREFILL-MOE, Q4-GEMMA-DECODE and
+Q4-GEMMA-SPEC-SERVE.
+
+Design approvals (operator, 2026-11-04), with the accepted decisions as
+recorded in each design:
+
+- **Q4-GEMMA-COLD.** `docs/research/adr063-q4-gemma-cold-design.md`
+  approved with §12 D1–D4 as recommended. D1: Class A only; a failed bitwise
+  gate stops the story for localization, and no Class B joint cold route
+  ships without a separate decision and the Q1 §3.5 campaign. D2: clean
+  cutover of every cold multi-sequence caller to the per-sequence cold
+  attention (iter-G(a) lane floor 33 rows; the installed long-prompt prefill
+  is exact only for its cursor-0 chunk; G-S3 shows no no-boundary
+  regression; graft-bound callers go per slot). D3: default on, kill switch
+  `HF2Q_GEMMA_JOINT_COLD_PREFILL=0`. D4: Q4-GEMMA-ATTN predecessor and a
+  dated #660 §7 note. If D1 stops the story, the combined candidate proceeds
+  without it (kill switch default off or code reverted), the root restates
+  the Win arithmetic here before the closing campaign (about 1.9–2.9 s of
+  levers), and the story goes to the operator as `needs_decision`.
+- **Q4-GEMMA-PREFILL-MOE.**
+  `docs/research/adr063-q4-gemma-prefill-moe-design.md` approved with §12
+  D1–D7 as recommended. D1: Class A changes only. D2: one story in three
+  PRs (P1 hf2q, P2 mlx-native with a linked contract issue, P3 pin and
+  integration). D3: `HF2Q_GEMMA_PREFILL_MOE_DOWN` is deleted at promotion or
+  in the stop-path PR; `HF2Q_MM_ID_SCHEDULE=grid` stays one release as a
+  native diagnostic. D4: stop path if `S_pred(P1) + S_pred(P2) < 0.05 s` per
+  run. D5: the story's own acceptance is a category saving with no makespan
+  regression; the Win is measured on the combined candidate. D6: DeepSeek-V4
+  and Qwen MoE bitwise gates plus one `ExactTranscripts` smoke each at the
+  pin. D7: P2 ships with Q4-GEMMA-KERNEL's mlx-native release or alone,
+  whichever is ready first, sequenced so receipts and digests regenerate
+  once per pin.
+- **Q4-GEMMA-DECODE.** `docs/research/adr063-q4-gemma-decode-design.md`
+  approved with §13 decisions 1–5: Class A-only scope (the peer's MMA,
+  `mul_mv_ext` and K-split routes excluded; the S0 spike runs before M0); if
+  M2 misses 0.96, prefer (a) accepting the measured saving and re-budgeting
+  the Win across the other Gemma stories, then (b) a Class B few-row MMA
+  spike only if M0-P shows a large enough per-kernel peer advantage, with
+  (c) a re-scope of the Gemma Win last; the M0-P peer reference build runs
+  before adoption is frozen; decode attention is added as lever A; the
+  `HF2Q_GEMMA_DECODE_KERNELS` switch and promotion rule follow §4.8.
+- **Root decision: decode attention is lever A of Q4-GEMMA-DECODE**
+  (A1/A2, Class A, bitwise against today's vec-hybrid route, with adopt/drop
+  thresholds and the peer's decode attention in M0-P). The #660 plan left it
+  unowned.
+- **Q4-GEMMA-SPEC-SERVE.**
+  `docs/research/adr063-q4-gemma-spec-serve-design.md` approved with its §13
+  decisions. D1: verify route R-A only; on a G0 miss the windowed verify,
+  rank-phase code and walk are deleted unless a zero-cost drafter reuses
+  them. D2: Q8_0 drafter artifact by default, BF16 only if M1's
+  accepted-per-drafted drop exceeds 0.02. D3: managed download with a
+  sha256 pin, `--gemma-assistant` as the override. D4: the peer's MT arm is
+  re-qualified with hf2q's Q8_0 assistant GGUF as a tie-break arm, and the
+  faster becomes the peer arm of record for the closing campaign. D5: after
+  promotion the default is `mtp` when an assistant is resolved, `0` the kill
+  switch. D6: G0 threshold 0.40 s, re-checked at M1. D7: `mtp-decode-only`
+  is the one pre-declared extra arm if S1's TTFT fairness fails. Depth K = 1
+  is measured first and is the working value; one cost controller per
+  decoding width, recreated at each admission; only greedy requests
+  speculate.
+
+**Revised Gemma lever budget.** A Win needs about 3.0 s off the 14.87 s
+makespan (0.95 × the peer's MT 12.48 s). With the designs' re-estimates
+(precise warm attention 1.2–1.4 s, #668; cold turn 0.20–0.35 s, down from
+0.4–0.5 s; prefill MoE 0.08–0.28 s; serving speculation 0.40 s at G0 to
+0.5 s; decode kernels including attention from the lowest adoptable
+0.36–0.42 s upward), the levers together come to about 2–3.5 s against the
+3.0 s needed `[INFERENCE]`. A Win is not assured; any shortfall is
+re-budgeted across the Gemma stories (Q4-GEMMA-DECODE decision 2), and only
+the combined candidate gives a valid total.
+
+**mlx-native `rope_multi` partial-rotary defect (found 2026-11-04).** The
+`rope_multi` kernel was defective for partial rotary dimensions; the fix is
+mlx-native PR #86, released as 0.15.18. Operator principle: don't test
+something known defective. All Qwen GPU validation and the ADR-065 B1
+(#503) baseline run on main are pinned to mlx-native 0.15.18: B1 baselines
+the fixed main, and the Q1 spec b6 run uses that pin.
 
 ## Consequences
 
