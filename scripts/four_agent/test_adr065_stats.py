@@ -9,9 +9,13 @@ import q3_stats
 
 
 def metrics(makespan=100.0, ttft=(1.0, 1.0, 1.0, 1.0), sse=(0.2, 0.2, 0.2, 0.2), q5=True, thermal=True):
+    """q3_metrics.run_metrics shape: per-slot values and their worst-slot run values."""
+    worst = lambda values: max((v for v in values if v is not None), default=None)
+    verdict = q5 if isinstance(q5, str) else ("CalibrationPass" if q5 else "ClientFailed")
     return {"makespan_s": makespan,
             "slots": {f"agent-{i}": {"ttft_p95_s": t, "sse_gap_max_s": g} for i, (t, g) in enumerate(zip(ttft, sse))},
-            "memory": {"q5_verdict": "CalibrationPass" if q5 else "ClientFailed", "q5_pass": q5},
+            "worst_slot_ttft_p95_s": worst(ttft), "worst_slot_sse_gap_max_s": worst(sse),
+            "memory": {"q5_verdict": verdict, "q5_pass": verdict in ("CalibrationPass", "AdmittedRunPass")},
             "thermal": {"valid": thermal}}
 
 
@@ -149,7 +153,9 @@ class Ceilings(unittest.TestCase):
         n4, n1 = doc["ceilings"]["n4"], doc["ceilings"]["n1"]
         self.assertEqual(n4["ttft_p95_s"], {"value": 2.5, "run": "n4-b02-A", "slot": "agent-2"})
         self.assertEqual(n4["sse_gap_max_s"], {"value": 0.9, "run": "n4-b02-A", "slot": "agent-1"})
-        self.assertEqual((n4["passing_runs"], n4["measured_runs"]), (2, 3))
+        self.assertEqual((n4["eligible_runs"], n4["measured_runs"]), (2, 3))
+        self.assertEqual(n4["excluded_runs"], [{"run": "n4-b03-A", "reason": "outcome Fail"}])
+        self.assertEqual(doc["cap_factor"], 1.5)
         self.assertEqual(n1["ttft_p95_s"]["value"], 0.6)
         self.assertIsNone(n1["sse_gap_max_s"]["value"])  # one semantic event per streamed turn: unmeasurable
         self.assertEqual([r["name"] for r in doc["retained_failures"]], ["n4-b03-A"])
@@ -170,17 +176,32 @@ class Ceilings(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "baseline"):
             self.doc(ab)
         failed = baseline_manifest({"n4": [{"outcome": "Fail"}]})
-        with self.assertRaisesRegex(ValueError, "no passing"):
+        with self.assertRaisesRegex(ValueError, "no eligible measured run"):
             self.doc(failed)
 
-    def test_fairness_check_per_run_and_slot(self):
+    def test_runs_without_calibration_pass_or_with_thermal_trouble_never_set_a_ceiling(self):
+        manifest = baseline_manifest({"n4": [
+            {"ttft": (1.0, 1.2, 1.1, 1.0), "sse": (0.3, 0.2, 0.2, 0.2)},
+            {"q5": "CalibrationFailed", "ttft": (9, 9, 9, 9), "sse": (0.2,) * 4},
+            {"q5": "AdmittedRunPass", "ttft": (8, 8, 8, 8), "sse": (0.2,) * 4},
+            {"thermal": False, "ttft": (1, 1, 1, 1), "sse": (7, 7, 7, 7)}]})
+        n4 = self.doc(manifest)["ceilings"]["n4"]
+        self.assertEqual((n4["ttft_p95_s"]["value"], n4["sse_gap_max_s"]["value"], n4["eligible_runs"]), (1.2, 0.3, 1))
+        self.assertEqual(n4["excluded_runs"], [{"run": "n4-b02-A", "reason": "Q5 verdict CalibrationFailed"},
+                                               {"run": "n4-b03-A", "reason": "Q5 verdict AdmittedRunPass"},
+                                               {"run": "n4-b04-A", "reason": "serious or critical thermal state"}])
+        only_bad = baseline_manifest({"n4": [{"q5": "CalibrationFailed"}, {"thermal": False}]})
+        with self.assertRaisesRegex(ValueError, "no eligible measured run .* for n4"):
+            self.doc(only_bad)
+
+    def test_safety_cap_per_run_and_slot_is_ceiling_plus_half(self):
         ceiling = {"ttft_p95_s": {"value": 2.0}, "sse_gap_max_s": {"value": 0.5}}
         check = lambda **m: s.fairness_check(entry("r", "B", **m), ceiling)
-        self.assertEqual(check(ttft=(2.0, 2.0, 1.0, 1.0), sse=(0.5, 0.1, 0.1, 0.1)), [])  # at the ceiling complies
-        problems = check(ttft=(1.0, 2.01, 1.0, 3.0), sse=(0.1, 0.6, 0.1, 0.1))
+        self.assertEqual(check(ttft=(3.0, 2.5, 1.0, 1.0), sse=(0.75, 0.1, 0.1, 0.1)), [])  # at the cap complies
+        problems = check(ttft=(1.0, 3.01, 1.0, 4.0), sse=(0.1, 0.76, 0.1, 0.1))
         self.assertEqual(len(problems), 3)
-        self.assertIn("r agent-1: p95 semantic TTFT", problems[0])
-        self.assertIn("max semantic SSE gap 0.6", problems[2])
+        self.assertEqual(problems[0], "r agent-1: p95 semantic TTFT 3.01 s > cap 3 s")
+        self.assertIn("max semantic SSE gap 0.76 s > cap 0.75 s", problems[2])
         self.assertIn("Unverifiable", check(ttft=(None, 1, 1, 1))[0])
         self.assertIn("Unverifiable", check(sse=(None,) * 4)[0])
         unmeasurable = {"ttft_p95_s": {"value": 2.0}, "sse_gap_max_s": {"value": None}}
@@ -216,13 +237,58 @@ class Analysis(unittest.TestCase):
         row = next(r for r in doc["runs"] if r["name"] == "n4-b04-B")
         self.assertEqual((row["outcome"], row["quality_eligible"], row["attempts"]), ("Fail", False, ["n4-b04-B-a0"]))
 
-    def test_fairness_violation_in_any_run_blocks_acceptance_despite_a_win(self):
-        stage = ab_stage("n4", self.win, overrides={(2, "B"): {"ttft": (1, 1, 2.2, 1)}, (5, "A"): {"ttft": (9, 9, 9, 9)}})
+    def test_safety_cap_violation_in_any_run_blocks_acceptance_despite_a_win(self):
+        stage = ab_stage("n4", self.win, overrides={(2, "B"): {"ttft": (1, 1, 3.2, 1)}, (5, "A"): {"ttft": (9, 9, 9, 9)}})
         doc = self.analyze(ab_manifest([stage, ab_stage("n1", self.flat)]))
         self.assertEqual(doc["verdict"], "Win")
         self.assertFalse(doc["gates_pass"])
+        self.assertFalse(doc["stages"]["n4"]["paired_fairness"]["worst_slot_ttft_p95_s"]["regression"])
         self.assertEqual(doc["stages"]["n4"]["fairness_problems"],
-                         ["n4-b02-B agent-2: p95 semantic TTFT 2.2 s > ceiling 2 s"])  # arm A is never checked
+                         ["n4-b02-B agent-2: p95 semantic TTFT 3.2 s > cap 3 s"])  # arm A is never checked
+
+    def test_paired_fairness_regression_beyond_the_neutral_band(self):
+        worse = [1.10, 1.12, 1.09, 1.11, 1.10, 1.13]
+        stage = ab_stage("n4", self.win, overrides={(b, "B"): {"ttft": (t, 1, 1, 1)} for b, t in enumerate(worse, 1)})
+        doc = self.analyze(ab_manifest([stage, ab_stage("n1", self.flat)]))
+        record = doc["stages"]["n4"]["paired_fairness"]["worst_slot_ttft_p95_s"]
+        self.assertTrue(record["regression"])
+        self.assertEqual(record["effect"]["blocks"], 6)
+        self.assertGreater(record["effect"]["ratio_ci95"][0], 1.025)
+        self.assertEqual((doc["verdict"], doc["gates_pass"]), ("Win", False))
+        self.assertTrue(doc["gate_failures"][0].startswith("fairness: n4: worst_slot_ttft_p95_s paired regression"))
+        # Within the 1.025 band, or worse once in one block only: no regression (a single bad run is the cap's job).
+        for overrides in ({(b, "B"): {"ttft": (1.02, 1, 1, 1)} for b in range(1, 7)}, {(3, "B"): {"ttft": (2.9, 1, 1, 1)}}):
+            doc = self.analyze(ab_manifest([ab_stage("n4", self.win, overrides=overrides), ab_stage("n1", self.flat)]))
+            self.assertEqual(doc["gate_failures"], [], overrides)
+
+    def test_unmeasurable_sse_gap_does_not_gate_but_a_missing_ttft_interval_does(self):
+        none = {(b, arm): {"sse": (None,) * 4} for b in range(1, 7) for arm in "AB"}
+        self.ceilings["ceilings"]["n4"]["sse_gap_max_s"]["value"] = None
+        doc = self.analyze(ab_manifest([ab_stage("n4", self.win, overrides=none), ab_stage("n1", self.flat)]))
+        self.assertFalse(doc["stages"]["n4"]["paired_fairness"]["worst_slot_sse_gap_max_s"]["measurable"])
+        self.assertEqual(doc["gate_failures"], [])
+        one = [ab_stage("n4", self.win[:1]), ab_stage("n1", self.flat)]
+        self.assertIn("fairness: n4: worst_slot_ttft_p95_s Unverifiable: 1 paired blocks, no interval",
+                      self.analyze(ab_manifest(one))["gate_failures"])
+
+    def test_halted_campaign_and_incomplete_controls_never_pass_the_gates(self):
+        stages = [ab_stage("n4", self.win), ab_stage("n1", self.flat[:3], status="Halted")]
+        stages += [{"workload": k, "status": "Pending", "warmups": [], "blocks": []} for k in s.MIXED]
+        manifest = ab_manifest(stages, status="Halted")
+        manifest["halted"] = {"reason": "run budget exhausted: 76 attempts (max 76)"}
+        doc = self.analyze(manifest)
+        self.assertEqual(doc["verdict"], "Win")  # the n4 stage is complete; acceptance still fails
+        self.assertFalse(doc["gates_pass"])
+        self.assertEqual(doc["gate_failures"][0], "campaign Halted, not Complete: run budget exhausted: 76 attempts (max 76)")
+        self.assertIn("n1 control stage Halted, not Complete", doc["gate_failures"])
+        self.assertFalse(doc["controls"]["n1"]["within_margin"])
+        self.assertEqual(doc["controls"]["2+2"]["status"], "Pending")
+
+    def test_n1_control_needs_every_fixed_block_quality_eligible(self):
+        n1 = ab_stage("n1", self.flat, overrides={(2, "A"): {"outcome": "Fail"}})
+        doc = self.analyze(ab_manifest([ab_stage("n4", self.win), n1]))
+        self.assertIn("n1 control: 5 of 6 blocks quality-eligible", doc["gate_failures"])
+        self.assertFalse(doc["controls"]["n1"]["within_margin"])
 
     def test_n1_control_required_or_reported(self):
         stages = [ab_stage("n4", self.win), ab_stage("n1", self.win)]

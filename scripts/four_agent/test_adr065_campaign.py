@@ -39,6 +39,9 @@ class CampaignFile(unittest.TestCase):
         self.assertEqual(tuple(self.doc["design"]["ab_block_count"]["allowed"]), adr065_stats.ALLOWED_BLOCKS)
         self.assertEqual(self.doc["design"]["verdict_order"], list(adr065_stats.VERDICTS))
         self.assertEqual(self.doc["design"]["margin_points"], adr065_stats.MARGIN_PP)
+        fairness = self.doc["design"]["fairness"]
+        self.assertEqual((fairness["neutral_ratio"], fairness["cap_factor"]),
+                         (q3.q3_stats.NEUTRAL_RATIO, adr065_stats.CAP_FACTOR))
         self.assertEqual(self.doc["workloads"]["order"], list(q3.WORKLOADS))
 
     def test_declared_budget_matches_the_rule(self):

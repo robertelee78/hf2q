@@ -31,6 +31,7 @@ Every run also uses the sandbox proof `owned-cleanup-sandbox-capability-20261031
 - **Block count.** Fixed before qualification: 6 by default for every family (`ab_blocks`). The alternatives are 8, 12, 16 or 20, chosen from a separately labelled `pilot` campaign that is named with `--pilot-of` and bound by sha256. Pilot runs are never pooled, and a pilot has no verdict. There is no sequential peeking: a stage stops only at its fixed count.
 - **Stages.** `n4` is primary. The controls follow in this order: `n1`, then `3+1`, `2+2` and `1+3`, using the same client phase plans as Q3.
 - **Effect.** On every complete block whose two runs both passed (quality-eligible), take d = ln(B makespan / A makespan), where makespan is the client's `own_output_four_task_makespan_seconds`. The interval is mean(d) ± t(0.975, n−1)·sd(d)/√n, reported as a percentage-point reduction 100·(1 − e^x). This is `q3_report.effect` / `q3_stats.paired_effect`, unchanged. The half-width is ADR-063's 100·(e^h − 1). When B is faster, it bounds the reduction interval's half-width from above.
+- **Precision test is slightly stricter than the ADR text (review finding 4, accepted as written).** The ADR asks for a Win half-width of at most 2.5 points. The tool tests Q3's 100·(e^h − 1), which is always at least the half-width of the reduction interval itself. In the reviewer's 20,000 synthetic campaigns, 115 (0.6%) moved from Win to Inconclusive because of this, and none moved the other way.
 - **Verdict**, assigned in order, with the cases mutually exclusive:
   1. **Loss** if the interval excludes zero unfavourably (upper bound < 0).
   2. **Win** if it excludes zero favourably (lower bound > 0) with a half-width ≤ 2.5 points.
@@ -39,21 +40,27 @@ Every run also uses the sandbox proof `owned-cleanup-sandbox-capability-20261031
 
   If fewer than the fixed count of blocks are quality-eligible, a Loss stands, but a Win or Equivalent becomes Inconclusive. A stage that did not complete is Inconclusive. An `Invalid` or `IdentityDrift` campaign has no verdict.
 - **Failed runs.** A run with a task, tool, protocol, isolation or truncation failure is quality-ineligible. It stays in the receipt (`analysis.json` `runs`, with its outcome, failure kind, reason and attempts), and the campaign continues to its fixed count. Any quality-ineligible B run fails acceptance. Q3's terminal `Invalid` rule is unchanged: a run whose Pass the Q2 audit contradicts, or whose receipt is missing, still halts the campaign.
-- **Controls.** By default the change should not engage with one agent. In that case the `n1` interval must lie within ±2.5 points, and the A/B fails acceptance otherwise. `--n1-engages` marks a change that does engage with one agent, and its `n1` effect is then only reported. J6, whose primary comparison is itself an N=1 A/B, has no n1 control: it runs with `--n1-engages`. Mixed `3+1`, `2+2` and `1+3` effects are reported.
-- **Fairness.** In every measured B run, each slot's p95 semantic TTFT must be at or below the frozen TTFT ceiling for the workload, and the run's maximum semantic SSE gap at or below the SSE ceiling. A run that misses a needed value is `Unverifiable`, which fails acceptance. A baseline with no SSE ceiling (DeepSeek-V4 emits one semantic event per streamed turn) passes the SSE check only for a candidate that still measures none. Arm A is never checked. No median or pooled value is used.
-- **Other gates.** Every run must reach a passing Q5 verdict, and none may show a serious or critical thermal state. `analysis.json` lists every failed gate in `gate_failures`, beside the verdict. `gates_pass` is true only when the list is empty. A candidate is accepted as a Win only with verdict `Win` and `gates_pass`.
+- **Controls.** By default the change should not engage with one agent. In that case the `n1` stage must be `Complete`, all of its fixed blocks must be quality-eligible, and its interval must lie within ±2.5 points; otherwise the A/B fails acceptance. `--n1-engages` marks a change that does engage with one agent, and its `n1` effect is then only reported. J6, whose primary comparison is itself an N=1 A/B, has no n1 control: it runs with `--n1-engages`. Mixed `3+1`, `2+2` and `1+3` effects are reported, with their stage status.
+- **Fairness (operator decision 2026-11-03).** Two checks, both on arm B only:
+  1. **Paired regression test, the primary check.** This is Q3's existing test, reused unchanged (`q3_report.FAIRNESS`, `q3_report.effect`, `q3_stats.regression`). For each workload and each of two run metrics, take the block-paired ln(B/A) over quality-eligible blocks and its Student-t 95% interval. The metrics are the run's worst-slot p95 semantic TTFT and its worst-slot maximum semantic SSE gap. The candidate fails if the ratio interval's lower bound exceeds 1.025, meaning it is reliably worse beyond the 2.5-point neutral band. A metric that is measured but has no interval (fewer than two paired blocks) is `Unverifiable` and fails. A metric that no passing run measured does not gate; DeepSeek-V4 emits one semantic event per streamed turn, so it has no SSE gap.
+  2. **Absolute safety cap.** In every measured B run, each slot's p95 semantic TTFT must be at or below 1.5 × the frozen TTFT ceiling for the workload. The run's maximum semantic SSE gap must be at or below 1.5 × the SSE ceiling. A run missing a needed value is `Unverifiable` and fails. A baseline with no SSE ceiling passes the SSE cap only for a candidate that still measures none.
+
+  No median or pooled value replaces either check.
+
+  **Why the change.** The ADR's original rule required every candidate run and slot to stay at or below the largest baseline value. The B1 review (finding 3) simulated that rule with the real `stage_ceilings` and `fairness_check` on exchangeable null data. A candidate identical to the baseline was flagged at about 0.39–0.41 per stage on `n4` and about 0.75 per 6-run control. It passed all five stages only 0.15–0.35% of the time. Holding the false-flag rate to 5% per metric would need about 114 baseline `n4` runs. The paired test compares the arms within each block, so its false-flag rate does not depend on how many baseline runs there are. The +50% cap still catches a single pathological run that the paired test cannot detect on its own.
+- **Other gates.** Every run must reach a passing Q5 verdict, and none may show a serious or critical thermal state. The campaign must be `Complete`: a `Halted` campaign, even one whose `n4` stage completed, fails acceptance, so analysing part-way never accepts. `analysis.json` lists every failed gate in `gate_failures`, beside the verdict. `gates_pass` is true only when the list is empty. A candidate is accepted as a Win only with verdict `Win` and `gates_pass`.
 
 ## Baseline campaign (B1)
 
 Arm A only, on the phase-1 default binary. For each family in the run order Qwen3.8, DeepSeek-V4, Gemma 4, the stages run in workload order. Each stage is one discarded warmup followed by a fixed number of measured runs: 20 for `n4`, and 6 each for `n1`, `3+1`, `2+2` and `1+3`.
 
-For each workload, a ceiling is the largest value over that stage's passing measured runs and their slots:
-- the TTFT ceiling over per-slot p95 semantic TTFT;
-- the SSE ceiling over per-slot maximum semantic SSE gap, which is the same as the largest per-run maximum.
+For each workload, a ceiling is the largest value over that stage's eligible measured runs and their slots. A run is eligible when its outcome is Pass, its Q5 verdict is `CalibrationPass`, and it saw no serious or critical thermal state.
+- The TTFT ceiling is taken over per-slot p95 semantic TTFT.
+- The SSE ceiling is taken over per-slot maximum semantic SSE gap, which equals the largest per-run maximum.
 
-Warmups and failed runs never set a ceiling. They are kept in `ceilings.json` (`runs`, `retained_failures`). A stage whose measured runs all failed has no ceiling, and `ceilings` refuses it. Ceilings are written only for a `Complete` baseline campaign, and they bind the campaign by sha256.
+Warmups, failed runs and excluded runs never set a ceiling. Every run is kept in `ceilings.json` (`runs`). Failed runs are also listed in `retained_failures`, and each stage lists its `excluded_runs` with the reason. `ceilings` refuses a stage with no eligible run. Ceilings are written only for a `Complete` baseline campaign, and they bind the campaign by sha256.
 
-Property of the rule: a candidate identical to the baseline exceeds the largest of the baseline's 4·20 n4 slot values with probability about 24/(80+24) ≈ 23% per metric in a 6-block A/B (24 candidate slot values). The 6-run controls carry a higher rate. The ADR fixes the max rule. The 20-run `n4` baseline keeps the false-flag rate as low as the budget allows.
+The ceilings serve only as the base of the +50% safety cap. Fairness acceptance rests on the paired test, so the baseline counts (20 `n4`, 6 per control) are sized for the baseline means and the `n4` throughput that E1, E8 and Q4-GEMMA consume, not for the cap.
 
 ## Execution and budget
 
@@ -93,3 +100,22 @@ python3 -B scripts/four_agent/adr065_campaign.py analyze <dir> --ceilings "$B1/b
 ```
 
 After an independent review of this file, the campaign file and the baseline receipts, the reviewed `ceilings.json` of each family is published with the B1 receipts on main.
+
+## Draft ADR-065 amendment (for the root to land)
+
+The fairness rule above departs from the current text of ADR-065 ("Measurement and acceptance rules", third paragraph, and the B1 acceptance bullet). The ADR text needs this amendment before any candidate is judged by it.
+
+> **Amendment 2026-11-03 (operator decision; B1 review finding 3).** Replace the fairness-ceiling paragraph with:
+>
+> Fairness MUST be checked per workload with ADR-063 Q3's paired fairness test. For the run's worst-slot p95 semantic TTFT and its worst-slot maximum semantic SSE gap (ADR-063 F2 estimands), compute the block-paired candidate/previous-default log ratio and its Student-t 95% interval. A candidate fails if the interval's lower bound exceeds 1.025, the 2.5-point neutral band. A metric that is measurable but has no interval fails. A metric that no passing run measures (one semantic event per streamed turn) does not gate.
+>
+> In addition, the phase-1 baseline freezes per-run, per-slot p95 semantic TTFT and per-run maximum semantic SSE gap, each ceiling being the largest value over eligible baseline runs. A run is eligible when it passed, its Q5 verdict is `CalibrationPass`, and it saw no serious or critical thermal state. Every candidate run and slot MUST stay at or below 1.5 × both ceilings, an absolute safety cap. No median or pooled aggregate may replace either check.
+>
+> Rationale: under the previous rule (every run and slot at or below the largest baseline value), a candidate identical to the baseline failed in about 99.7% of five-stage campaigns.
+>
+> In B1's acceptance, read "publish the ceilings" as "publish the ceilings used by the safety cap".
+
+The ADR's acceptance text also implies, without stating, the following rules, which this tool enforces:
+- A campaign that is not `Complete` fails acceptance.
+- A required `n1` control must complete with all of its fixed blocks quality-eligible.
+- The Win precision test uses ADR-063's 100·(e^h − 1) half-width.

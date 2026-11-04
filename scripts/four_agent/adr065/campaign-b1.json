@@ -88,12 +88,18 @@
     "verdict_order": ["Loss", "Win", "Equivalent", "Inconclusive"],
     "margin_points": 2.5,
     "failed_runs": "task, tool, protocol, isolation or truncation failures make a run quality-ineligible; every run is retained in the receipt",
-    "fairness": "per-run per-slot p95 semantic TTFT and per-run maximum semantic SSE gap of every measured candidate run at or below the frozen ceiling of its family and workload"
+    "fairness": {
+      "paired_regression": "per workload, Q3's paired fairness test: block-paired ln(B/A) of the run's worst-slot p95 semantic TTFT and of its worst-slot maximum semantic SSE gap (Student-t 95% interval); a candidate fails if the ratio interval's lower bound exceeds neutral_ratio (reliably worse beyond the band). A measurable metric without an interval is Unverifiable and fails; a metric no passing run measured (one semantic event per streamed turn) does not gate.",
+      "neutral_ratio": 1.025,
+      "safety_cap": "every measured candidate run and slot: p95 semantic TTFT, and the run's maximum semantic SSE gap, at or below cap_factor x the frozen baseline ceiling of its family and workload",
+      "cap_factor": 1.5,
+      "decision": "operator decision 2026-11-03 (ReviewB1 finding 3); ADR-065 amendment drafted in docs/research/adr065-b1-campaign.md"
+    }
   },
   "baseline_campaign": {
     "arms": ["A"],
     "runs_per_stage": {"n4": 20, "n1": 6, "3+1": 6, "2+2": 6, "1+3": 6},
-    "ceiling": "the largest value over the stage's passing measured runs and their slots; warmups never count"
+    "ceiling": "the largest value over the stage's eligible measured runs (outcome Pass, Q5 verdict CalibrationPass, no serious or critical thermal state) and their slots; warmups never count; excluded runs are listed; a stage without an eligible run has no ceiling and is refused"
   },
   "execution": {
     "cooldown_seconds": 60,

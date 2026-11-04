@@ -8,6 +8,7 @@ warmups, blocks, entries with outcome and q3_metrics.run_metrics). Arm A is the 
 candidate; the effect is the reduction of B's makespan against A's.
 """
 import q3_report
+import q3_stats
 
 DEFAULT_BLOCKS = 6
 ALLOWED_BLOCKS = (6, 8, 12, 16, 20)
@@ -18,6 +19,8 @@ MIXED = ("3+1", "2+2", "1+3")
 CEILING_SCHEMA = "hf2q.adr065.fairness-ceilings.v1"
 ANALYSIS_SCHEMA = "hf2q.adr065.ab-analysis.v1"
 TTFT, SSE = "ttft_p95_s", "sse_gap_max_s"  # q3_metrics.slot_metrics keys (ADR-063 F2 estimands)
+CAP_FACTOR = 1.5  # absolute safety cap: frozen baseline ceiling + 50%
+CEILING_Q5 = "CalibrationPass"
 
 
 def effect(stage):
@@ -92,21 +95,36 @@ def fairness_values(metrics):
 # --- ceilings -----------------------------------------------------------------------------------
 
 
+def ceiling_exclusion(entry):
+    """Why a measured baseline run may not set a ceiling; None when it may (a Pass with a CalibrationPass
+    Q5 verdict and no serious or critical thermal state)."""
+    if entry["outcome"] != "Pass":
+        return f"outcome {entry['outcome']}"
+    metrics = entry["metrics"]
+    if metrics["memory"]["q5_verdict"] != CEILING_Q5:
+        return f"Q5 verdict {metrics['memory']['q5_verdict']}"
+    if metrics["thermal"]["valid"] is False:
+        return "serious or critical thermal state"
+    return None
+
+
 def stage_ceilings(stage):
-    """Largest per-slot p95 TTFT and largest per-run maximum SSE gap over the stage's passing measured runs.
-    A metric no passing run measured (one semantic event per streamed turn) has value None."""
-    best = {TTFT: None, SSE: None}
+    """Largest per-slot p95 TTFT and largest per-run maximum SSE gap over the stage's eligible measured runs
+    (ceiling_exclusion). A metric no eligible run measured (one semantic event per streamed turn) is None."""
+    best, excluded, eligible = {TTFT: None, SSE: None}, [], 0
     for entry in runs(stage):
-        if entry["outcome"] != "Pass":
+        why = ceiling_exclusion(entry)
+        if why is not None:
+            excluded.append({"run": entry["name"], "reason": why})
             continue
+        eligible += 1
         values = fairness_values(entry["metrics"])
         for slot, slot_values in values["slots"].items():
             for key in (TTFT, SSE):
                 value = slot_values[key]
                 if value is not None and (best[key] is None or value > best[key]["value"]):
                     best[key] = {"value": value, "run": entry["name"], "slot": slot}
-    passed = sum(entry["outcome"] == "Pass" for entry in runs(stage))
-    return {"passing_runs": passed, "measured_runs": sum(1 for _ in runs(stage)),
+    return {"eligible_runs": eligible, "measured_runs": sum(1 for _ in runs(stage)), "excluded_runs": excluded,
             TTFT: best[TTFT] or {"value": None, "run": None, "slot": None},
             SSE: best[SSE] or {"value": None, "run": None, "slot": None}}
 
@@ -122,7 +140,8 @@ def ceilings(manifest, sources):
     stages = {stage["workload"]: stage_ceilings(stage) for stage in manifest["stages"]}
     empty = [key for key, value in stages.items() if value[TTFT]["value"] is None]
     if empty:
-        raise ValueError("no passing measured run defines a TTFT ceiling for " + ", ".join(empty))
+        raise ValueError("no eligible measured run (Pass, CalibrationPass, thermal valid) defines a TTFT ceiling for "
+                         + ", ".join(empty))
     rows = retained(manifest)
     arm = manifest["identities"]["arms"]["A"]
     return {"schema": CEILING_SCHEMA, "family": plan["family"], "sources": sources,
@@ -130,35 +149,56 @@ def ceilings(manifest, sources):
                          "artifact": {k: (arm["artifact"] or {}).get(k) for k in ("path", "bytes", "sha256")},
                          "case": plan["arms"]["A"]["case"], "case_sha256": plan["arms"]["A"]["case_sha256"],
                          "harness_commit": manifest["identities"]["harness"]["git_commit"]},
-            "rule": "each ceiling is the largest baseline value over passing measured runs (and their slots) of the "
-                    "workload; every measured candidate run and slot must stay at or below both",
+            "rule": "each ceiling is the largest baseline value over eligible measured runs (Pass, Q5 CalibrationPass, "
+                    "no serious or critical thermal state) and their slots of the workload; candidate runs and slots "
+                    f"must stay at or below {CAP_FACTOR} x the ceiling (absolute safety cap)",
+            "cap_factor": CAP_FACTOR,
             "ceilings": stages,
             "retained_failures": [r for r in rows if r["kind"] == "measured" and r["outcome"] != "Pass"],
             "runs": rows, "independent_review_required": True}
 
 
 def fairness_check(entry, ceiling):
-    """Problems of one candidate run against its workload's ceilings; [] when it complies.
-    'Unverifiable' when a value or ceiling needed for the comparison is missing."""
+    """Safety-cap problems of one candidate run: every slot's p95 TTFT and the run's maximum SSE gap at or
+    below CAP_FACTOR x the frozen ceiling; [] when it complies. 'Unverifiable' when a needed value is missing."""
     if not entry.get("metrics"):
         return [f"{entry['name']}: Unverifiable: no metrics"]
     values, problems = fairness_values(entry["metrics"]), []
     if not values["slots"]:
         return [f"{entry['name']}: Unverifiable: no slots"]
-    ttft = ceiling[TTFT]["value"]
+    ttft = CAP_FACTOR * ceiling[TTFT]["value"]
     for slot, slot_values in values["slots"].items():
         if slot_values[TTFT] is None:
             problems.append(f"{entry['name']} {slot}: Unverifiable: no streamed TTFT")
         elif slot_values[TTFT] > ttft:
-            problems.append(f"{entry['name']} {slot}: p95 semantic TTFT {slot_values[TTFT]:.4g} s > ceiling {ttft:.4g} s")
+            problems.append(f"{entry['name']} {slot}: p95 semantic TTFT {slot_values[TTFT]:.4g} s > cap {ttft:.4g} s")
     sse, gap = ceiling[SSE]["value"], values["run_sse_gap_max_s"]
     if sse is None and gap is not None:
         problems.append(f"{entry['name']}: Unverifiable: SSE gap {gap:.4g} s measured but the baseline has no SSE ceiling")
     elif sse is not None and gap is None:
         problems.append(f"{entry['name']}: Unverifiable: no SSE gap measured against ceiling {sse:.4g} s")
-    elif sse is not None and gap > sse:
-        problems.append(f"{entry['name']}: max semantic SSE gap {gap:.4g} s > ceiling {sse:.4g} s")
+    elif sse is not None and gap > CAP_FACTOR * sse:
+        problems.append(f"{entry['name']}: max semantic SSE gap {gap:.4g} s > cap {CAP_FACTOR * sse:.4g} s")
     return problems
+
+
+def paired_fairness(stage):
+    """Q3's paired fairness test (q3_report.FAIRNESS, q3_stats.regression): per metric, the block-paired B/A
+    effect and whether B is reliably worse beyond the neutral band. ({metric: record}, problems)."""
+    measured = list(runs(stage))
+    records, problems = {}, []
+    for metric in q3_report.FAIRNESS:
+        result = q3_report.effect(stage, "B", "A", metric)
+        measurable = any((e.get("metrics") or {}).get(metric) is not None for e in measured if e["outcome"] == "Pass")
+        regressed = q3_stats.regression(result)
+        records[metric] = {"effect": result, "measurable": measurable, "regression": regressed,
+                           "neutral_ratio": q3_stats.NEUTRAL_RATIO}
+        if regressed:
+            problems.append(f"{stage['workload']}: {metric} paired regression: B/A ratio 95% CI "
+                            f"[{result['ratio_ci95'][0]:.4f}, {result['ratio_ci95'][1]:.4f}] above {q3_stats.NEUTRAL_RATIO}")
+        elif measurable and result["ratio_ci95"] is None:
+            problems.append(f"{stage['workload']}: {metric} Unverifiable: {result['blocks']} paired blocks, no interval")
+    return records, problems
 
 
 # --- A/B analysis -------------------------------------------------------------------------------
@@ -178,37 +218,47 @@ def analyze(manifest, ceilings_doc, sources):
         stage_verdict, reasons = verdict(result, fixed)
         if stage["status"] != "Complete":
             stage_verdict, reasons = "Inconclusive", [f"stage {stage['status']}: {len(stage['blocks'])} of {fixed} blocks"]
+        paired, paired_problems = paired_fairness(stage)
         ceiling = ceilings_doc["ceilings"].get(key)
-        fairness = ([f"{key}: no frozen ceiling for this workload"] if ceiling is None else
-                    [p for e in measured if e["arm"] == "B" for p in fairness_check(e, ceiling)])
+        cap = ([f"{key}: no frozen ceiling for this workload"] if ceiling is None else
+               [p for e in measured if e["arm"] == "B" for p in fairness_check(e, ceiling)])
         ineligible = [e["name"] for e in measured if e["outcome"] != "Pass"]
         stages[key] = {"status": stage["status"], "blocks": len(stage["blocks"]), "fixed_blocks": fixed,
                        "effect": result, "verdict": stage_verdict, "reasons": reasons,
-                       "fairness_problems": fairness, "quality_ineligible_runs": ineligible,
+                       "paired_fairness": paired, "fairness_problems": paired_problems + cap,
+                       "quality_ineligible_runs": ineligible,
                        "q5_non_pass_runs": [e["name"] for e in measured
                                             if e.get("metrics") and not e["metrics"]["memory"]["q5_pass"]],
                        "thermal_invalid_runs": [e["name"] for e in measured
                                                 if e.get("metrics") and e["metrics"]["thermal"]["valid"] is False]}
-        gates += [f"fairness: {p}" for p in fairness]
+        gates += [f"fairness: {p}" for p in stages[key]["fairness_problems"]]
         gates += [f"{key}: quality-ineligible candidate run {e['name']} ({e['failure_kind']}: {e['reason']})"
                   for e in measured if e["arm"] == "B" and e["outcome"] != "Pass"]
         gates += [f"{key}: run {name} lacks a passing Q5 verdict" for name in stages[key]["q5_non_pass_runs"]]
         gates += [f"{key}: run {name} observed serious or critical thermal state" for name in stages[key]["thermal_invalid_runs"]]
+    status = manifest["status"]
+    if status != "Complete":
+        gates.insert(0, f"campaign {status}, not Complete: {(manifest.get('halted') or {}).get('reason')}")
     controls = {}
+    required = plan["n1_control"] == "required"
     if "n1" in stages:
-        required = plan["n1_control"] == "required"
-        ok = within_margin(stages["n1"]["effect"])
-        controls["n1"] = {"rule": "interval within +-2.5 points" if required else "reported (the change engages one agent)",
-                          "within_margin": ok}
-        if required and not ok:
+        n1 = stages["n1"]
+        ok = n1["status"] == "Complete" and n1["effect"]["blocks"] == fixed and within_margin(n1["effect"])
+        controls["n1"] = {"rule": "interval within +-2.5 points over the fixed block count" if required
+                          else "reported (the change engages one agent)", "within_margin": ok}
+        if required and n1["status"] != "Complete":
+            gates.append(f"n1 control stage {n1['status']}, not Complete")
+        elif required and n1["effect"]["blocks"] != fixed:
+            gates.append(f"n1 control: {n1['effect']['blocks']} of {fixed} blocks quality-eligible")
+        elif required and not ok:
             gates.append("n1 control: interval does not lie within +-2.5 points")
     for key in MIXED:
         if key in stages:
-            controls[key] = {"rule": "reported", "improvement_ci95": stages[key]["effect"]["improvement_ci95"]}
-    if plan["n1_control"] == "required" and "n1" not in stages:
+            controls[key] = {"rule": "reported", "status": stages[key]["status"],
+                             "improvement_ci95": stages[key]["effect"]["improvement_ci95"]}
+    if required and "n1" not in stages:
         gates.append("n1 control required but not run")
     primary = stages.get(PRIMARY)
-    status = manifest["status"]
     if plan["mode"] == "pilot":
         result, reasons = "Pilot", ["a pilot is never a verdict and its runs are never pooled"]
     elif status in ("Invalid", "IdentityDrift") or primary is None:
