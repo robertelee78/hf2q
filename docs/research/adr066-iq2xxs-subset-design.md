@@ -720,9 +720,10 @@ binary (ADR-063 Q4).
 All three campaigns run with one candidate binary and one runtime at a time.
 
 1. **Stock record, on hf2q's own artifact** (existing harness):
-   `q3_campaign.py --family deepseek4 --stock-bin <v0.1.28> --experiment-bin
-   <candidate> --peer-unavailable-evidence <the 2026-10-30 peer OOM receipts,
-   $E/peer-arms-v1/peer-deepseek4-*>`.
+   `q3_campaign.py --family deepseek4 --stock-bin <v0.1.28> --stock-commit
+   <v0.1.28 40-hex commit> --experiment-bin <candidate> --experiment-commit
+   <candidate 40-hex commit> --peer-unavailable-evidence <the 2026-10-30 peer
+   OOM receipts, $E/peer-arms-v1/peer-deepseek4-*>`.
    - Arms: stock and experiment, Williams blocks 5–20, n4 primary.
    - It supplies the vs-stock makespan ratio, its precision and the fairness
      effects. Its own `family_verdict` is `Unavailable` (no peer) and is not
@@ -734,7 +735,8 @@ All three campaigns run with one candidate binary and one runtime at a time.
    `q3_campaign.py --family deepseek4 --hf2q-case
    q5_cases/deepseek4-ds4file.json --peer-case
    q5_cases/peer-deepseek4-ds4file.json --no-stock-arm --stock-record
-   <step 1 verdict.json> --experiment-bin <candidate>`.
+   <step 1 verdict.json> --experiment-bin <candidate> --experiment-commit
+   <candidate 40-hex commit>`.
    - Arms: experiment and peer, n4 primary, then the n1 and 3+1/2+2/1+3
      controls (Q3 design).
    - It produces the Q4 `family_verdict`, with the vs-stock terms read from
@@ -743,7 +745,8 @@ All three campaigns run with one candidate binary and one runtime at a time.
    `q3_campaign.py --family deepseek4 --hf2q-case
    q5_cases/deepseek4-ds4file.json --peer-case
    q5_cases/native-ds4-deepseek4-samefile.json --native-comparison
-   --no-stock-arm --experiment-bin <candidate>`.
+   --no-stock-arm --experiment-bin <candidate> --experiment-commit
+   <candidate 40-hex commit>`.
    - Arms: the experiment and ds4 with `--ctx 393216` (the Think Max rule).
    - It is reported in `verdict.json` `native_peer`, task makespan only.
      Prompts are not byte-identical (ds4 renders tool schemas first, and its
@@ -845,6 +848,24 @@ the behaviour of an existing campaign. Line numbers refer to `d817dffa`.
    "from the same-artifact record <id> on hf2q's artifact". `--of-record` is
    accepted for a stock-record campaign (`:459-461` refuses only
    controls-only, native-comparison and native-peer campaigns).
+   Two more `q3_report` sites read the stock arm unconditionally and change
+   with it:
+   - `compute_verdict` (`:222-225`) indexes `effects["vs_stock"]` and the
+     `vs_stock` fairness secondaries. Without a stock arm this is a
+     `KeyError`. In a stock-record campaign both come from the bound record,
+     as above. In a no-stock campaign with no record (only the §8.2 native
+     comparison), `vs_stock` is the empty `q3_stats.paired_effect([])` and
+     `fairness` is `{}`. The native branch (`:226-228`) then sets
+     `peer_unavailable`, so the verdict is `Unavailable` with the comparison
+     reason (`:230-231`), as for any native comparison today.
+   - `rows` reads `plan['declared']['stock']['label']` for the workload text
+     (`:487-488`) and the vs-stock `blocks` baseline (`:538-539`). With
+     `declared.stock` null:
+     - the workload text names the bound record's stock label and artifact
+       ("stock <label> on hf2q's artifact, from record <id>");
+     - without a record it says "no stock arm";
+     - the vs-stock baseline text comes from the record. No vs-stock row
+       exists without a record (native campaigns emit none, `:524`).
 7. **`q3_stats.family_verdict`** (`:89-125`). The decision logic is
    unchanged; it consumes the record-sourced `vs_stock`/`fairness`.
    - New input `stock_source`; when present, every vs-stock reason names it.
