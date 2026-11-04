@@ -16,7 +16,7 @@ The program MUST factor the solo K3 tick into draft, verify-to-plan and commit f
 1. `decode_tick_mtp_k3` calls the extracted functions, and `plan_qwen35_verified_block` is unchanged byte for byte.
 2. The existing speculation qualification tests pass, and serving transcripts are `ExactTranscripts` against the previous default.
 
-Here "the previous default" is the pre-J1 `main` binary. J1 has no kill switch, because a refactor with an exactness gate does not need one. The comparison is therefore between two binaries: the frozen B1 phase-1 default (or the main commit J1 is rebased on, whichever B1's campaign file names) and the J1 binary. Both run the same artifact and Q5 case.
+Here "the previous default" is J1's parent commit. J1 has no kill switch, because a refactor with an exactness gate does not need one. The comparison is therefore between exactly two binaries: J1's parent commit (base) and the J1 commit (candidate). Both are built with the same `mlx-native` pin and the same `Cargo.lock` apart from J1's own source, and both run the same artifact and the Q5 case named in B1's campaign file. Any native pin bump (for example the runtime-registry fix, §7) lands before the base commit or entirely outside the pair, never between base and candidate. That way a transcript difference can only come from J1.
 
 ### What exists today
 
@@ -44,6 +44,19 @@ The failure handling is not uniform, and J1 must preserve it exactly:
 | Shape, embed, catch-up admission, catch-up, logits view, semantic walk | Clear capture, `reset_for_slot`, return the error with its exact context string. |
 | Inside the commit closure (6033-6052) | Clear capture, `reset_for_slot`, return. |
 | Carry hidden | `reset_for_slot` only, because capture was already cleared. |
+
+The `#[cfg(test)]` hooks return with `?` at fixed points, and each return leaves a specific state behind. J1 must keep every hook at the same position relative to capture arming, clearing and cursor mutation. The checklist:
+
+| Hook (`q1_speculation`) | Site today | State left behind on an `Err` return |
+|---|---|---|
+| `first_fork::after_draft_discard` | 5875, after the draft discard | Capture armed; MTP cursor already truncated to `prior_mtp_len` |
+| `after_drafts` | 5878 | Capture armed |
+| `first_fork::verifier_pre_catchup` | 5924, after the verify forward | Capture armed; 4 target rows and capture rows written; parity flipped; no reset |
+| `verified_buffers` | 5995, after catch-up | Capture armed; MTP caught up; no reset |
+| `canonical_decision` | 6016, inside the semantic walk | Through the walk's error arm: clear capture plus `reset_for_slot` |
+| `state_committed` | 6080, after the commit scope and the carry hidden row | Capture cleared; cursors committed; `verifier_hidden` set; pending output not yet set |
+
+Production builds compile none of these, so they cannot change served output. They do define the Q1 store contents that T-J1-6 compares.
 
 `decode_tick_history_lookup` (`engine_qwen35.rs:5442-5753`) has the same shape: verify, plan, then commit with `rollback_la_to` at 5672. It is not part of J1's requirement ("solo K3 tick").
 
@@ -110,6 +123,9 @@ pub(in crate::serve::api) struct K3Draft {
 pub(in crate::serve::api) struct K3VerifyRows {
     pub logits: MlxBuffer,
     pub hidden: MlxBuffer,
+    /// Wall time of the verify forward (today's `verify_elapsed`, 5898-5925).
+    /// J4 fills it with its window share or `Duration::ZERO`.
+    pub verify_elapsed: Duration,
 }
 
 /// Planned transaction. `plan` is the unchanged `Qwen35VerifiedBlockPlan`.
@@ -118,7 +134,17 @@ pub(in crate::serve::api) struct K3Plan {
     pub hidden: MlxBuffer,
     pub plan: Qwen35VerifiedBlockPlan,
     pub committed_cursor: u32,
-    pub timing: K3PlanTiming,  // embed, catch-up, semantic Durations (profile line only)
+    pub timing: K3PlanTiming,
+}
+
+/// Profile-line durations measured inside `k3_verify_to_plan`, exactly at
+/// today's `Instant` sites: `verify` is copied from `K3VerifyRows`;
+/// `embed` 5944-5955, `catchup` 5969-5992, `semantic` 6006-6028.
+pub(in crate::serve::api) struct K3PlanTiming {
+    pub verify: Duration,
+    pub embed: Duration,
+    pub catchup: Duration,
+    pub semantic: Duration,
 }
 
 /// DeltaNet restore owed after cursor settlement; `None` on full acceptance.
@@ -154,22 +180,32 @@ fn decode_tick_mtp_k3(&mut self, qwen, kv_cache, supervisor) -> Result<Qwen35Tic
     }
     let round_started = Instant::now();
     let entry = self.k3_entry(kv_cache)?;
-    let draft = self.k3_draft(qwen, kv_cache, supervisor, entry)?;   // draft_elapsed measured here
+    let draft = self.k3_draft(qwen, kv_cache, supervisor, entry)?;
+    let draft_elapsed = round_started.elapsed();                       // as 5876
     let rows  = self.k3_verify_solo(qwen, kv_cache, supervisor, &draft)?;
     let plan  = self.k3_verify_to_plan(qwen, kv_cache, supervisor, draft, rows)?;
+    let state_started = Instant::now();                                // as 6031
+    let mut rollback_elapsed = Duration::ZERO;                         // as 6032
     let state_result = (|| -> Result<()> {
         if let Some(r) = self.k3_commit_cursors(kv_cache, &plan)? {
+            let rollback_started = Instant::now();
             kv_cache.rollback_la_to(r.slot, r.capture_row)
-                .context("Qwen SlotAware MTP K3 recurrent rollback")?;   // P4b seam
+                .context("Qwen SlotAware MTP K3 recurrent rollback")?;   // P4b: becomes route-dispatched `rollback_la`
+            rollback_elapsed = rollback_started.elapsed();
         }
         self.k3_commit_settle(kv_cache, &plan)
     })();
+    let state_elapsed = state_started.elapsed();                       // as 6053
     if let Err(error) = state_result {
         // Unchanged: clear capture, reset_for_slot, return (6054-6060).
     }
+    let timing = plan.timing;                                          // verify/embed/catchup/semantic
     let committed = self.k3_commit_finish(qwen, kv_cache, plan)?;
-    // Profile line, record_proposer_timing, observe_speculative_round and the
-    // first pending output, unchanged (6091-6148).
+    // [MTP_PHASE] line from draft_elapsed, timing.*, state_elapsed and
+    // rollback_elapsed, with `partial` and `remainder` as 6096-6118.
+    // round_elapsed stays in the wrapper, so record_proposer_timing and
+    // observe_speculative_round (6119-6137) see the same interval as today.
+    // Then the first pending output, unchanged (6139-6148).
 }
 ```
 
@@ -198,7 +234,7 @@ Two J4/J2 obligations remain, and J1 records them without changing them:
 | `la_capture_active_tokens` (`kv_cache.rs:928`) | inline (armed at 5805; cleared at 13 sites in this method) | `k3_draft` arms it. Each failure arm and `k3_commit_settle` clear it, at the same points |
 | MTP K/V and cursor | draft writes then truncates (5864); catch-up writes 4 rows (5971); commit truncates (6038) | `k3_draft`, `k3_verify_to_plan`, `k3_commit_cursors` |
 | Target K/V and cursor | verify writes 4 rows; commit truncates (6035) | `k3_verify_solo`, `k3_commit_cursors` |
-| DeltaNet conv/recurrent (current, by parity) | verify writes scratch and flips parity; partial commit overwrites current from capture | `k3_verify_solo`; the restore seam in the wrapper (P4b changes its implementation) |
+| DeltaNet conv/recurrent (current, by parity) | verify writes scratch and flips parity; partial commit overwrites current from capture | `k3_verify_solo`; the restore seam in the wrapper (P4b replaces `rollback_la_to` there with the route-dispatched `rollback_la`) |
 | `verifier_hidden`, `pending_speculation_output`, `terminal_after_pending` | commit (6075-6082) | `k3_commit_finish` |
 | `mtp_cost`, `self.mtp = None` on unprofitability | 6129-6137 | wrapper |
 
@@ -223,13 +259,15 @@ Story-type gate (Refactor): the existing gates pass, plus `ExactTranscripts`.
 | T-J1-5 | Transaction exactness seed for J4: two clones of the same 4-slot cache run `k3_commit_cursors` + restore + `k3_commit_settle` + `k3_commit_finish` for slot 2 with identical rows. Their post-commit slot-state digests are byte-identical (target and MTP cursors, MTP K/V region, parity, current conv/recurrent, carry hidden), and slots 0, 1 and 3 are byte-identical to before | new unit (Class A building block) |
 | T-J1-6 | Q1 actual transaction store: `q1_qwen_actual_t5_speculation_phase` (`#[ignore]`, `engine_qwen35/q1_speculation/runner.rs:105`) is run on the official Qwen3.8 artifact at base and at J1. The `hf2q.adr063.invariance` stores compare `ExactEqual` with `scripts/four_agent/q1_decision_policy.py` (store comparison) | real artifact; GPU lane required |
 | T-J1-7 | `qwen38_slot_aware_speculation_auto_matches_off` (`speculation_real_artifact_tests.rs:358`) passes | real artifact; GPU lane required |
-| T-J1-8 | Four-agent transcript comparison: B1 campaign case for Qwen3.8, base binary vs J1 binary, `q1_decision_policy.py transcripts` → `ExactTranscripts`, in two pairs. (a) `HF2Q_QWEN_SPECULATION` unset: the dense four-slot worker resolves to `off` (`qwen35_speculation.rs:51-52`, the D1 loss), so this pair proves the default serving path is untouched. (b) `HF2Q_QWEN_SPECULATION=auto` on both binaries: solo turns run K3, so this pair exercises the moved code under real four-agent interleaving | hardware; GPU lane, Q5 CalibrationPass |
+| T-J1-8 | Four-agent transcript comparison: base binary (J1's parent) vs J1 binary, `q1_decision_policy.py transcripts` → `ExactTranscripts`, in three pairs. (a) Qwen3.8 B1 campaign case, `HF2Q_QWEN_SPECULATION` unset: the dense four-slot worker resolves to `off` (`default_server_policy`, `qwen35_speculation.rs:38-48`; the D1 loss), so this pair shows only that Qwen3.8's default serving path is untouched; it never runs the moved code. (b) Qwen3.8 B1 campaign case with `HF2Q_QWEN_SPECULATION=auto` on both binaries: solo turns run K3, so this pair exercises the moved code under real four-agent interleaving. (c) Qwen3.6 default configuration (`scripts/four_agent/q5_cases/qwen36.json`, speculation unset): the MoE four-slot worker resolves to `auto`, so this pair exercises the moved code on a shipped default path. Qwen3.6 is judged by `ExactTranscripts` only, not task pass rate (Q4-QWEN36) | hardware; GPU lane, Q5 CalibrationPass |
 
 Class A cohort invariance does not apply to J1 as an acceptance item, because J1 changes no joint arithmetic. T-J1-5 is the per-slot building block that J4's Class A tests reuse: a commit for one slot is a function of that slot's rows only and mutates nothing else.
 
 ## 7. Measurement plan
 
 J1 makes no performance claim. Every hardware run (T-J1-6..8) records source commit, binary SHA-256, artifact digest, native version (`mlx-native =0.15.16` unless re-pinned) and case file, and passes Q5 `CalibrationPass`. Evidence goes under `/Users/robert/.local/state/hf2q/v0130/j1-512/`.
+
+**Runtime-metallib dependency.** hf2q's production kernel registry (`forward_gpu.rs:3604-3609`) never calls `gated_delta_net_decode::register`. At `mlx-native` 0.15.16, every K3 or history verify with `MLX_PRECOMPILED_METALLIB=0` therefore fails with a non-fatal `KernelNotFound`, so the slot resets and the request errors. Until the mlx-native fix `4e32003` is merged, released, verified on crates.io and pinned exactly in hf2q, all J1 hardware evidence runs on the precompiled metallib only (`MLX_PRECOMPILED_METALLIB` unset or `1`), and every receipt says so. The root files that release. The pin bump is not part of J1: it lands before J1's parent commit or entirely outside the base/candidate pair (§1).
 
 An optional diagnostic, never an acceptance item: `HF2Q_MTP_PHASE_PROFILE=1` lines on a single-agent `HF2Q_QWEN_SPECULATION=auto` run, base vs J1. It confirms that the extra function boundaries add no measurable `remainder=` time. No campaign or A/B is required for a Refactor.
 
@@ -240,8 +278,9 @@ An optional diagnostic, never an acceptance item: `HF2Q_MTP_PHASE_PROFILE=1` lin
 | A moved `?` changes which reset runs (for example, carry hidden ends up inside the fail-closed scope) | The failure-handling table in §1 is the review checklist. T-J1-3 injects failures at validation and carry-hidden |
 | Error stringification changes fatal classification | §5 rule; reviewer greps for `anyhow!("{` in the diff |
 | Test-hook order moves and silently changes Q1 stores | T-J1-6 store equality is bitwise and covers every hook |
-| J4 calls `k3_commit_finish` per lane before J2 and clears another lane's capture | Recorded as a J4/J2 obligation (§3.4). `clear_la_capture` stays cache-global in J1 |
+| J4 calls `k3_commit_settle` per lane before J2 and clears another lane's capture | Recorded as a J4/J2 obligation (§3.4). `clear_la_capture` stays cache-global in J1 |
 | Pair (b) of T-J1-8 runs a non-default speculation policy, so its Q5 admission differs from the default case | Q5 admission is re-established for the `auto` case before pair (b) (ADR-065 execution prerequisites). The capture footprint for 4 rows × 4 slots is already part of the K3 path's allocation |
+| A native pin bump between base and candidate breaks `ExactTranscripts` without J1 being at fault | Base is J1's parent on the same pin and lockfile (§1). Pin bumps land outside the pair (§7) |
 
 ## 9. Non-goals
 

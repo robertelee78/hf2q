@@ -105,54 +105,53 @@ bits(conv_dst[j][c·Km1 + k])   := bits(conv_cap[((s_j·T + t_j)·Km1 + k)·C + 
 
 **Anchor images.** A tensor with capture layout and `T = S = 1` is a valid `rec_cap`/`conv_cap` pair. Restoring from such an image with `(s, t) = (0, 0)` is inside this contract; C2 relies on it (C2 §3.3). The contract covers capture-layout → state-layout only. The reverse direction (state → capture image) is not part of P4a.
 
-### 2.2 Delivery path A: existing primitives suffice (decided by E6 item 4)
+### 2.2 Delivery: existing primitives (path A), decided by E6
 
-ADR-065 E6 item 4 asks whether the existing GPU copy primitives serve capture-to-state restore with the parity-aware conv re-index. The E6 reference is mlx-native `src/encoder.rs:1554-1569`. In 0.15.16 that range is the doc comment and signature of `CommandEncoder::blit_copy_bytes`, which starts at 1563. The candidate composition, per layer and item, is:
+ADR-065 E6 item 4 asked whether the existing GPU copy primitives serve capture-to-state restore with the parity-aware conv re-index. E6 has answered yes. The record is on mlx-native branch `test/adr065-e6-probes` (commits `608425d`, `7cbafef`, `e8c63f1`), in `docs/adr065-e6-verify-window-probes.md` (rows 4 and "Capture restore") with test `tests/adr065_e6_capture_restore_copy.rs`:
+- `e6_capture_restore_blit_and_strided_copy_match_host_rollback` passed bitwise on both `MLX_PRECOMPILED_METALLIB=1` and `=0`;
+- it covered four slots, mixed ping-pong parity, accepted `t` ∈ {0, 1, 2, 3} and one command buffer, against a port of `rollback_la_to`;
+- with `E6_STRICT_NAN=1` it included every NaN payload, so every u32 bit pattern passed for both the blit and the strided copy.
+
+P4a therefore commits to **path A**. No kernel is built, no release is made, and no microbenchmark is required (ADR-065 requires one only when a kernel is built). The composition, per layer and item, is:
 
 | Component | Primitive (mlx-native 0.15.16) | Arguments |
 |---|---|---|
-| Recurrent | `CommandEncoder::blit_copy_bytes` (`src/encoder.rs:1563`); byte-exact by Metal definition | source = `rec_cap` at byte offset `(s·T+t)·E·4`, destination = `rec_dst`, length `E·4` |
-| Recurrent (alternative) | `ops::copy::dispatch_copy_f32` (`src/ops/copy.rs:145`, kernel `offset_copy_f32`) | whole buffers, element offsets `(s·T+t)·E` and `slot·E`, `count = E` |
+| Recurrent | `CommandEncoder::blit_copy_bytes` (`src/encoder.rs:1563`); byte-exact by Metal definition, and E6-verified | source = `rec_cap` at byte offset `(s·T+t)·E·4`, destination = `rec_dst`, length `E·4` |
 | Conv re-index | `ops::copy::dispatch_strided_copy_f32` (`src/ops/copy.rs:68`, kernel `strided_copy_f32`, `src/shaders/copy.metal:24`) | `src = conv_cap.slice_view(((s·T+t)·Km1·C)·4, Km1·C)`, `dst = conv_dst`, `rows = C`, `cols = Km1`, `stride_row = 1`, `stride_col = C`. The kernel computes `dst[row·cols+col] = src[row·stride_row + col·stride_col]` = `dst[c·Km1+k] = src[k·C+c]` |
 
-Path A passes only if E6 records all of the following, on both `MLX_PRECOMPILED_METALLIB=1` and `=0`:
+`offset_copy_f32` and `transpose_2d` are not used. E6 never probed `offset_copy_f32`, and one route per component keeps the qualification surface minimal.
 
-1. `strided_copy_f32` (and `offset_copy_f32`, if chosen) is bitwise for every bit class in §2.1. The kernels move `float` values through registers, so this is an empirical property of the compiled code, not a definition. A single failing NaN or subnormal pattern sends P4a to path B.
-2. View composition is correct: `slice_view` byte offsets for `s > 0`, `t > 0` and the conv capture's non-zero base.
-3. The bounds checks are understood. `dispatch_strided_copy_f32` and `dispatch_copy_f32` validate against `MlxBuffer::byte_len()`, the whole Metal allocation (`src/buffer.rs:338`), not the view's `data_byte_len()` (`:347`). The native checks are therefore not view-exact. Path A is acceptable only with hf2q-side preflight of every range (§3.3), and the qualification record must say so.
-4. Multi-item lists (1–4 items across 4 slots) leave peer bytes unchanged.
+**Encoding order.** Each `blit_copy_bytes` call ends any active compute pass and then opens and ends its own blit encoder (`src/encoder.rs:1636-1651`). The hf2q helper encodes all conv strided copies (one compute pass) for all layers and items first, then all recurrent blits (`L·items` blit encoders; 48 per item on Qwen3.8). The two families have disjoint destinations and read-only sources, so no barrier is needed between them. E6 interleaved blits and strided copies; this compute-first ordering is a different encoding, so the merged parity test covers it explicitly (T-P4a-3).
 
-If E6 qualifies path A, P4a closes with a qualification record merged to mlx-native main. Proposed contents:
-- `tests/deltanet_capture_restore_parity.rs`: parity of the composition against a host reference with the same indexing as `kv_cache.rs:2821-3022`, over both metallib paths, served shapes and a small shape;
-- `docs/deltanet-capture-restore-qualification.md`: the contract of §2.1 and the bounds-check caveat.
+**Bounds checks.** `dispatch_strided_copy_f32` validates against `MlxBuffer::byte_len()`, the whole Metal allocation (`src/buffer.rs:338`), not the view's `data_byte_len()` (`:347`). Its native check is therefore not view-exact, and hf2q preflights every range (§3.3). `blit_copy_bytes` validates against view extents (`data_byte_len()`, 1579-1593) and rejects overlapping same-allocation ranges.
 
-No release is made. hf2q composes the primitives itself, because ADR-065 assigns encode-only helpers to hf2q.
+**Closure.** P4a closes on the E6 record **merged to mlx-native main**, extended with the tests of §4.1. The branch is unmerged today, so P4a does not close on it yet. The merged record includes:
+- `tests/adr065_e6_capture_restore_copy.rs`, plus the compute-first ordering, anchor-image and preflight cases of §4.1;
+- the C2 snapshot-direction cases (§2.4);
+- `docs/adr065-e6-verify-window-probes.md`, plus the contract of §2.1, the bounds-check caveat, and a statement that P4a is satisfied without a release.
 
-Each `blit_copy_bytes` call ends any active compute pass and then opens and ends its own blit encoder (`src/encoder.rs:1636-1651`). Interleaving recurrent blits with conv compute dispatches would therefore reopen a compute pass after every blit. The hf2q helper encodes all conv strided copies (compute) for all layers and items first, then all recurrent copies. The two families have disjoint destinations and read-only sources, so no barrier is needed between them. That leaves one compute pass plus `L·items` blit encoders (48 per item on Qwen3.8) when the recurrent component uses blits, or a single compute pass when it uses `offset_copy_f32`. Unlike the f32 compute copies, `blit_copy_bytes` validates against view extents (`data_byte_len()`, 1579-1593) and rejects overlapping same-allocation ranges. The P4a microbenchmark chooses between blit and `offset_copy_f32` for the recurrent component; both are exact under path A.
+hf2q composes the primitives itself, because ADR-065 assigns encode-only helpers to hf2q.
 
-### 2.3 Delivery path B: a native kernel (if E6 fails path A)
+### 2.3 Runtime-registry fix (not a P4a dependency)
 
-The proposed mlx-native op is `ops::deltanet_restore::dispatch_capture_restore_u32`, with kernel `deltanet_capture_restore_u32`. It needs a separate mlx-native issue stating §2.1. The issue is filed by the root, because tracker writes are not this author's to make.
+E6 also found that `KernelRegistry::new()` does not register the `gated_delta_net_decode_capture_f32_*` runtime sources (record row "`gated_delta_net_decode` capture", `KernelNotFound` on the runtime path). hf2q's production registry (`forward_gpu.rs:3604-3609`) never calls `ops::gated_delta_net_decode::register`. So at 0.15.16, every K3 or history verify with `MLX_PRECOMPILED_METALLIB=0` fails with a non-fatal `KernelNotFound`, and the slot resets.
 
-- One dispatch per layer covers every item and both components. Loads and stores are raw `uint` (`device const uint*` / `device uint*`), so no float path exists.
-- Bindings:
-  - `rec_cap`, `conv_cap`;
-  - `rec_dst_a`, `rec_dst_b`, `conv_dst_a`, `conv_dst_b` (the slot's two ping-pong buffers);
-  - a constant item table `{s, t, parity_select, dst_slot}`, at most 4 items;
-  - params `{E, C, Km1, T, S, n_items, n_seqs_dst}`.
+- **P4a is unaffected.** The restore primitives pass on the runtime path at 0.15.16, and the P4a tests fill capture buffers from the host.
+- **P4b and J1 hardware evidence is precompiled-only** until the mlx-native fix `4e32003` ("register gated_delta_net_decode_capture runtime sources in KernelRegistry::new") is merged, released, verified on crates.io and pinned exactly in hf2q. Every receipt states the metallib path.
+- **That release is not a P4a release.** P4b acceptance item 1 ("exact pin of any P4a release") stays vacuous. The pin bump is tracked separately, and the root files the release issue. It lands before, or entirely outside, the P4b A/B binary and the J1 base/candidate pair.
 
-  The destination for item `j` is `(parity_select ? b : a)` at `dst_slot·E` (or `dst_slot·C·Km1`). That reproduces `recurrent_current_mut` / `conv_current_mut` without the host choosing views.
-- Grid: `(ceil(max(E, C·Km1)/256), n_items)` threadgroups of 256. Threads below `E` copy recurrent; threads below `C·Km1` copy conv via the transpose index.
-- Validation in Rust: the same preconditions as §2.1, against `data_byte_len()` of views (not `byte_len()`).
+### 2.4 C2 snapshot-direction parity in the same record
 
-Deliverables follow the ADR-065 "Native primitive" closure:
-- parity tests on both metallib paths against the host reference, over the §2.1 bit classes, at served shapes (`E = 786,432` / `524,288`; `C = 10,240` / `8,192`; `Km1 = 3`; `T = 4`; `S = 4`; items 1–4) and a small shape;
-- a distinct-matrix microbenchmark at served shapes reporting GPU time and encode time per layer and per restore;
-- merged PR, published release, verified crates.io bytes.
+ADR-063 C2 requires any state-copy primitive it uses to be parity-tested in mlx-native before a pinned integration. C2's snapshot (state → anchor image) uses the same two primitives in the reverse direction (C2 design §3.3). The merged qualification record therefore also covers:
+- a blit **out of** the parity-current recurrent region of slot `s` (`s > 0`, both parities) into a `T = S = 1` image, bitwise;
+- the inverse conv re-index with `dispatch_strided_copy_f32`: `rows = Km1`, `cols = C`, `stride_row = 1`, `stride_col = Km1`, giving `img[k·C + c] = state[c·Km1 + k]`, bitwise for every u32 class, on both metallib paths;
+- a round trip from state to image and back to state that is byte-identical.
 
-### 2.4 Native out-of-scope
+These are tests of existing primitives, not a P4a contract extension. The §2.1 contract stays capture → state.
 
-- State → capture-image snapshot.
+### 2.5 Native out-of-scope
+
+- A new native kernel or release.
 - Deeper or variable `T` semantics.
 - Gemma and DeepSeek state.
 - Any change to `ssm_conv_capture_forward_f32` or the capture layout.
@@ -187,10 +186,14 @@ pub struct LaRestoreItem<'a> {
 /// against `data_byte_len()` and against each other before any encode.
 pub(crate) struct LaRestorePlan { /* per layer: (src ranges, dst buffer+range) per item */ }
 
+/// Which implementation a cache uses for slot-aware DeltaNet restores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaRestoreRoute { Host, Gpu }
+
 impl HybridKvCache {
     /// Preflight only; no mutation, no encode.
     pub(crate) fn plan_la_restore(&self, items: &[LaRestoreItem<'_>]) -> Result<LaRestorePlan>;
-    /// Encode the plan into `enc` (path A composition or path B kernel).
+    /// Encode the plan into `enc` (blits plus strided copies, §2.2).
     /// Does not commit or wait. Mutates nothing host-visible.
     pub(crate) fn encode_la_restore(&self, enc: &mut CommandEncoder,
                                     registry: &mut KernelRegistry,
@@ -198,9 +201,12 @@ impl HybridKvCache {
     /// Apply the host-side half of a completed plan (parity bits for
     /// `NamedResetParity` items). Called only after a successful wait.
     pub(crate) fn finish_la_restore(&mut self, plan: LaRestorePlan);
-    /// Single-slot convenience used by every current rollback caller:
-    /// `(CaptureRow(accepted_idx), CurrentByParity)`, plan, encode into a
-    /// fresh command buffer, commit and wait, then finish.
+    /// Slot-aware rollback: dispatches on `self.la_restore_route`.
+    /// `Gpu`: `(CaptureRow(accepted_idx), CurrentByParity)`, plan, encode
+    /// into a fresh command buffer, commit and wait, then finish.
+    /// `Host`: the unchanged `rollback_la_to`.
+    pub(crate) fn rollback_la(&mut self, slot: SlotId, accepted_idx: u32) -> Result<()>;
+    /// Today's host copy, unchanged (`kv_cache.rs:2745-3025`).
     pub fn rollback_la_to(&mut self, slot: SlotId, accepted_idx: u32) -> Result<()>;
     /// Multi-slot rollback for J4: one command buffer for all items.
     /// Shipped by P4b only if J4 has landed; otherwise J4 adds it (§3.2).
@@ -210,10 +216,27 @@ impl HybridKvCache {
 
 P4b ships only the `CaptureRow` + `CurrentByParity` combination on a production path. C2 adds the `AnchorImage` + `NamedResetParity` caller ([adr063-c2-design.md](adr063-c2-design.md) §3.3). The enums are introduced by whichever of P4b or C2 lands first that needs the variant, so no variant ships without a caller.
 
-- **Signature.** `rollback_la_to` keeps its signature and error contract: `SlotOutOfRange`, missing capture, `accepted_idx >= n_tokens_max`, layout-invariant errors. That makes the cutover reach all four production callers (§1.1) without call-site edits.
-- **The host body is renamed, not deleted.** It becomes `rollback_la_to_host` and remains for two purposes only: the kill-switch arm (`HF2Q_QWEN_LA_GPU_RESTORE=0`) and the parity oracle in tests. It is not a fallback after a GPU failure (§3.4).
-- **Kernel registry.** `HybridKvCache` gains a lazily created `restore_registry: Option<KernelRegistry>`, used only for the copy pipelines (path A: `strided_copy_f32` and optionally `offset_copy_f32`; path B: the restore kernel). It is created once per cache, which avoids threading the model's registry through the DFlash and serial callers. Unlike the graft splice (`kv_cache.rs:2311`), it does not compile pipelines per call. The metallib selection follows the same `MLX_PRECOMPILED_METALLIB` policy as the model registry. That `KernelRegistry` is `Send` with the cache is checked at implementation. If it is not, the registry is passed in from `with_gpu_cache_mut` at the two slot-aware callers, and the serial and DFlash callers use their model's registry.
-- **Kill switch.** `HF2Q_QWEN_LA_GPU_RESTORE` takes `0|1`. It is read once at engine load into the cache (as `HF2Q_QWEN_SPECULATION` is read at load, `src/serve/api/qwen35_speculation.rs:221-224`) and logged in the startup line. Invalid values fail closed at load. The default is set by the A/B verdict (§5.3).
+**Callers and route.**
+
+| Caller | After P4b | Why |
+|---|---|---|
+| Slot-aware MTP K3 commit (`engine_qwen35.rs:6043`; J1 restore seam) | `rollback_la` (route-dispatched) | P4b requirement ("solo K3") |
+| Slot-aware history-lookup commit (`engine_qwen35.rs:5672`) | `rollback_la` | Same transaction shape and supervision as K3 |
+| J4 joint verify (when landed) | `rollback_la_many` or the plan/encode/finish API | P4b requirement ("joint verify rollback") |
+| Serial K=N spec decode (`spec_decode.rs:939`) | `rollback_la_to`, host, unchanged | Not a P4b requirement. It has no supervisor, and its fail-stop policy is not the slot-aware worker's |
+| DFlash Qwen target (`dflash/qwen35_target.rs:223`) | `rollback_la_to`, host, unchanged | The `rollback_kv` trait method is infallible and logs and swallows errors (213-229). A GPU `CommandBufferError` there would be hidden, which ADR-065's fail-stop rule forbids |
+| Tests (`kv_cache.rs:9125-9240`, `10700-10950`, `11660-11680`) | `rollback_la_to` unchanged; it is also the parity oracle for T-P4b-2 | |
+
+So the GPU path can only run where failures fail-stop through the slot-aware worker (§3.4). `rollback_la_to` is not renamed and has no new callers.
+
+- **Route resolution.** `HybridKvCache` gains `la_restore_route: LaRestoreRoute`, initialized to `Host` by every constructor. Only the slot-aware Qwen engine sets it, once at worker construction, from `resolve_la_restore_route(env, artifact)`:
+  - `HF2Q_QWEN_LA_GPU_RESTORE=0` → `Host`; `=1` → `Gpu`, for any artifact (operator override);
+  - invalid values fail closed at load;
+  - **unset, dense artifact (Qwen3.8)** → the shipped default set by the A/B verdict (§5.3);
+  - **unset, MoE artifact (Qwen3.6)** → `Host`, always. ADR-065 excludes Qwen3.6 default changes, and P4b gathers no Qwen3.6 evidence. There is no owner exception.
+
+  The resolved route is logged in the worker's startup line, beside the speculation policy (`qwen35_speculation.rs:221-224`). Caches built anywhere else (serial runner, DFlash, tests) keep `Host` unless a test sets the route explicitly.
+- **Kernel registry.** `HybridKvCache` gains a lazily created `restore_registry: Option<KernelRegistry>`, used only for `strided_copy_f32` (blits need no pipeline). It is created once per cache on the first GPU restore, so it does not compile pipelines per call, unlike the graft splice (`kv_cache.rs:2311`). The metallib selection follows the same `MLX_PRECOMPILED_METALLIB` policy as the model registry. Whether `KernelRegistry` is `Send` with the cache is checked at implementation. If it is not, the registry is passed in from `with_gpu_cache_mut` at the two slot-aware callers.
 
 ### 3.2 Data flow (solo K3 after J1)
 
@@ -226,9 +249,9 @@ sequenceDiagram
   W->>W: k3_verify_to_plan: catch-up, plan (valid_input_tokens, carry_hidden_row)
   W->>K: k3_commit_cursors: truncate target + MTP cursors
   alt partial (valid_input_tokens < 4)
-    W->>K: rollback_la_to(slot, carry_hidden_row)
+    W->>K: rollback_la(slot, carry_hidden_row)  [route Gpu]
     K->>K: plan_la_restore (preflight all layers)
-    K->>G: one command buffer: conv re-index ×L, recurrent copy ×L
+    K->>G: one command buffer: conv strided copies ×L (one compute pass), then recurrent blits ×L
     G-->>K: commit_and_wait (error → MlxError::CommandBufferError)
   end
   W->>K: k3_commit_settle: clear capture, validate cursors
@@ -236,7 +259,7 @@ sequenceDiagram
 ```
 
 - **Sources are complete before the restore runs.** The verify forward's terminal command buffer was waited on: logits were read on the CPU by the semantic walk, so the capture rows are complete. The restore command buffer is the next GPU work for this slot, and the next reader of the restored state is a later forward submitted after `commit_and_wait` returns. No fence beyond command-buffer order is needed.
-- **Supervision.** The slot-aware K3 and history commits wrap the restore in `supervisor.arm("Qwen35 SlotAware MTP K3 restore", QWEN35_WORKER_TRANSACTION_TIMEOUT)` (history: "Qwen35 history restore"), so a hung wait is supervised like every other GPU stage of the round. The serial and DFlash callers have no supervisor today and get none.
+- **Supervision.** The slot-aware K3 and history commits wrap the restore in `supervisor.arm("Qwen35 SlotAware MTP K3 restore", QWEN35_WORKER_TRANSACTION_TIMEOUT)` (history: "Qwen35 history restore"), so a hung wait is supervised like every other GPU stage of the round. The serial K=N and DFlash callers stay on the host path (§3.1), so they need no supervision change.
 - **Joint path.** If J4 has landed, its commit calls `rollback_la_many` once for every partially rejected lane, between `k3_commit_cursors` (all lanes) and `k3_commit_settle` (J1 §3.4). If J4 has not landed when P4b merges, P4b does not ship `rollback_la_many`, which would have no production caller. `plan_la_restore`/`encode_la_restore`/`finish_la_restore` already take item slices, and J4 adds `rollback_la_many` as a thin wrapper over them rather than a second restore path. The root should record that as a J4 obligation.
 - **Profile line.** The `HF2Q_MTP_PHASE_PROFILE` field `rollback=` keeps measuring the wall time of the restore call, now including encode, commit and wait.
 
@@ -266,45 +289,55 @@ There is no host fallback after a GPU attempt. Once a restore was submitted, the
 
 Non-participating slots are never written: destinations are slot regions, and preflight proves disjointness. A failed multi-slot restore (J4) poisons only the participating lanes, unless the error is fatal, in which case the whole worker stops (ADR-065 shared-submitted-forward failure semantics).
 
+These guarantees hold because only slot-aware worker callers can reach the GPU route (§3.1 caller table). The serial K=N runner and the DFlash target keep today's host copy and today's error handling. In particular, DFlash's log-and-continue on rollback errors is unchanged and never sees a GPU error.
+
 ## 4. Tests
 
 ### 4.1 P4a (mlx-native)
 
+All P4a tests extend the E6 record (`tests/adr065_e6_capture_restore_copy.rs`) and run on `MLX_PRECOMPILED_METALLIB=1` and `0`. They use exactly the path A composition: `blit_copy_bytes` for recurrent and `dispatch_strided_copy_f32` for conv.
+
 | ID | Test |
 |---|---|
-| T-P4a-1 | Parity against the host reference for `(s, t)` ∈ {0..S−1} × {0..T−1}, `S = T = 4`, served shapes and a 2-layer small shape. Payloads come from a seeded u32 generator with forced coverage of NaN payload bits, signaling NaN, ±0, the minimum and maximum subnormal, ±∞ and ±FLT_MAX. Bitwise compare on `MLX_PRECOMPILED_METALLIB=1` and `0` |
-| T-P4a-2 | Acceptance classes as rows: full (no item, a no-op), partial (`t ∈ {1, 2}`) and zero (`t = 0`). The restored state equals the host path's bytes (the host reference reproduces `kv_cache.rs:2821-3022`) |
-| T-P4a-3 | Cohort and order invariance: items `{(s, t)}` for every subset of 4 slots in every order. Each item's destination bytes equal the single-item run, and peer regions equal a sentinel fill |
-| T-P4a-4 | Anchor-image form: `T = S = 1`, `(0, 0)`, both metallib paths (C2 dependency) |
-| T-P4a-5 | Negative preflight: overlapping destinations, out-of-range `s/t`, a view past its logical end, zero dims. Each refuses with nothing encoded |
-| T-P4a-6 (path B only) | Microbenchmark at served shapes: GPU time per layer and per restore of 1 and 4 items, distinct matrices per layer |
+| T-P4a-1 | (E6, existing) Parity against a port of `rollback_la_to` for four slots, mixed parity, `t ∈ {0..3}`, one command buffer, every u32 bit class with `E6_STRICT_NAN=1` |
+| T-P4a-2 | Acceptance classes as rows: full (no item, a no-op), partial (`t ∈ {1, 2}`) and zero (`t = 0`). The restored state equals the host path's bytes (the reference reproduces `kv_cache.rs:2821-3022`) |
+| T-P4a-3 | **Compute-first ordering**, the encoding hf2q ships: every conv strided copy for all layers and items in one compute pass, then every recurrent blit, in one command buffer. Covers 1–4 items, every subset of 4 slots in every order, served shapes (`E = 786,432`, `C = 10,240`; `E = 524,288`, `C = 8,192`; `Km1 = 3`; `T = 4`) and a 2-layer small shape. Each item's destination bytes equal the single-item run, and peer regions and the non-current parity buffer equal a sentinel fill |
+| T-P4a-4 | Anchor-image form: `T = S = 1`, `(0, 0)` (C2 dependency) |
+| T-P4a-5 | C2 snapshot direction (§2.4): blit out of the parity-current recurrent region and the inverse strided copy into a `T = S = 1` image, bitwise for every u32 class; round trip from state to image and back to state is byte-identical |
+| T-P4a-6 | Native refusals: `blit_copy_bytes` rejects overlapping same-allocation ranges and views past `data_byte_len()`, and `dispatch_strided_copy_f32` rejects zero dims. The record also documents that the strided copy's bounds check uses `byte_len()`, so view-exact checking is hf2q's preflight (§3.3) |
 
 ### 4.2 P4b (hf2q)
 
 | ID | Test | Kind |
 |---|---|---|
-| T-P4b-1 | The existing `rollback_la_to_*` tests (`kv_cache.rs:9125-9240`, `10700-10950`, `11660-11680`) pass unchanged on the GPU arm, and again with the kill switch at 0 | unit, Metal |
-| T-P4b-2 | GPU vs host parity on a tiny Qwen config with real `HybridKvCache` geometry: random capture payloads with the §2.1 bit classes, both parities per slot, every `(slot, idx)`. Current-buffer bytes and parity bits equal `rollback_la_to_host`, and scratch and peer bytes are unchanged | unit, Metal |
+| T-P4b-1 | The existing `rollback_la_to_*` tests (`kv_cache.rs:9125-9240`, `10700-10950`, `11660-11680`) pass unchanged (host). The same cases also run through `rollback_la` with the route set to `Gpu` | unit, Metal |
+| T-P4b-2 | GPU vs host parity on a tiny Qwen config with real `HybridKvCache` geometry: random capture payloads with the §2.1 bit classes, both parities per slot, every `(slot, idx)`. Current-buffer bytes and parity bits equal `rollback_la_to`, and scratch and peer bytes are unchanged | unit, Metal |
 | T-P4b-3 | A multi-item plan (`plan_la_restore` + `encode_la_restore` + `finish_la_restore`, one command buffer) with 2–4 slots in permuted orders equals sequential single restores byte for byte (Class A building block for J4; it also covers `rollback_la_many` when shipped) | unit, Metal |
 | T-P4b-4 | Preflight atomicity: corrupt the last layer's conv capture shape. The call errors and the bytes of every layer are unchanged. Today's host path partially writes, so this is a deliberate behaviour improvement | unit, Metal |
-| T-P4b-5 | Transaction cases: the speculation qualification suite (`src/serve/api/engine_qwen35/speculation_qualification_tests.rs`: full, partial and zero acceptance followed by 8 ordinary decisions; chained mixed rounds; EOS in or after the block; length boundary; cancellation mid-drain) green with the switch at 1 and at 0 | unit |
+| T-P4b-5 | Transaction cases: the speculation qualification suite (`src/serve/api/engine_qwen35/speculation_qualification_tests.rs`: full, partial and zero acceptance followed by 8 ordinary decisions; chained mixed rounds; EOS in or after the block; length boundary; cancellation mid-drain) green with the route at `Gpu` and at `Host` | unit |
+| T-P4b-5b | Route resolution: unset on a MoE artifact → `Host` regardless of the dense default; `0`/`1` override on both families; an invalid value fails at load; caches built by the serial runner and DFlash stay `Host` | unit |
+| T-P4b-5c | Fatal classification: an injected `MlxError::CommandBufferError` from the restore wait reaches `is_fatal_command_buffer_error` through the K3 and history commit paths (error chain not stringified) | unit |
 | T-P4b-6 | Q1 actual transaction store: `q1_qwen_actual_t5_speculation_phase` on the official Qwen3.8 artifact, switch 0 vs 1. Stores are `ExactEqual` (`scripts/four_agent/q1_decision_policy.py`), including the `state_committed` snapshots after partial rounds | real artifact, GPU lane |
 | T-P4b-7 | `qwen38_slot_aware_speculation_auto_matches_off` passes with the switch at 1 | real artifact, GPU lane |
 | T-P4b-8 | Cancel smoke (`scripts/four_agent/cancel_smoke.py`, `q5_cases/cancel-qwen38.json`) with the switch at 1 | hardware |
-| T-P4b-9 | Serving transcripts `ExactTranscripts`, switch 1 vs 0 on the same binary, from the A/B runs (§5.3) at `HF2Q_QWEN_SPECULATION=auto` | hardware |
+| T-P4b-9 | Serving transcripts `ExactTranscripts`, switch 1 vs 0 on the same binary, from the A/B runs (§5.3) at `HF2Q_QWEN_SPECULATION=auto`, both the four-agent and the N=1 runs | hardware |
 | T-P4b-10 | If J4 has landed: the J4 transaction matrix (mixed full, partial and zero across lanes) re-run with P4b on. Class A cohort invariance of post-commit DeltaNet state (current conv/recurrent and parity) between REF(w) alone and cohorts of 1–4 windows | real artifact, GPU lane |
 
-Clean-registry pin (P4b acceptance item 1): under path B, hf2q's `Cargo.toml` pins `mlx-native = "=<P4a release>"`, and a clean `CARGO_HOME` build resolves it from crates.io. The receipt records `Cargo.lock` and the crate checksum. Under path A, no pin changes, and the receipt states that no P4a release exists.
+Clean-registry pin (P4b acceptance item 1): P4a makes no release, so no P4a pin exists, and the receipt says so. The `mlx-native` pin a P4b binary uses is whatever main pins. If the runtime-registry fix release (§2.3) is pinned by then, that bump is a separate commit landed before the P4b binary is built. It is never introduced between A/B arms, which share one binary anyway.
 
 ## 5. Measurement plan
 
 All hardware runs need the GPU lane granted by the root. Each records source commit, binary SHA-256, artifact digest, native version and case file, and passes Q5 `CalibrationPass`. Evidence goes under `/Users/robert/.local/state/hf2q/v0130/p4b-527/` (P4a qualification receipts: `…/p4a-526/`).
 
+Until the runtime-registry fix is released and pinned (§2.3), every P4b hardware run uses the precompiled metallib (`MLX_PRECOMPILED_METALLIB` unset or `1`). The runtime metallib cannot run K3 at 0.15.16, and receipts state the path. The T-P4a tests cover both metallib paths for the restore primitives themselves.
+
 ### 5.1 Why the default four-agent configuration barely exercises P4b
 
-With `HF2Q_QWEN_SPECULATION` unset, the dense Qwen3.8 four-slot worker resolves speculation to `off` (`qwen35_speculation.rs:51-52`; ADR-063 D1 measured a 1.020 makespan loss). Single-slot workers default to `auto`. The changed code runs only on K3 and history partial rejections. Therefore:
+With `HF2Q_QWEN_SPECULATION` unset, the dense Qwen3.8 four-slot worker resolves speculation to `off` (`default_server_policy`, `qwen35_speculation.rs:38-48`; ADR-063 D1 measured a 1.020 makespan loss). Single-slot workers default to `auto`. The changed code runs only on K3 and history partial rejections. Therefore:
 - the four-agent A/B arms both run at `HF2Q_QWEN_SPECULATION=auto`. That is a declared campaign parameter, not an ADR-065 kill switch, so "previous default" is still the same binary with only `HF2Q_QWEN_LA_GPU_RESTORE` toggled;
-- the N=1 control is an engaged arm, not a ±2.5-point non-engagement control, because single-agent K3 is the path this changes. It is reported with its own verdict.
+- the N=1 run is an engaged arm, not a ±2.5-point non-engagement control, because single-agent K3 is the path this changes, and single-slot dense workers are where the shipped default runs P4b most often. It gets its own A/B verdict under the same rule, and that verdict gates the default (§5.3).
+
+Qwen3.6 is not measured. Its default route stays `Host` (§3.1).
 
 ### 5.2 P4b-M0: restore cost attribution (diagnostic, before the A/B)
 
@@ -316,30 +349,36 @@ With `HF2Q_QWEN_SPECULATION` unset, the dense Qwen3.8 four-slot worker resolves 
 
 The ADR-065 two-arm rule applies:
 - one binary; arms `HF2Q_QWEN_LA_GPU_RESTORE=0` (A, previous default) vs `=1` (B);
-- ABBA paired blocks with warm-up; 6 blocks unless a labelled pilot (never pooled) selects 8, 12, 16 or 20;
+- ABBA paired blocks with warm-up; the block count is the one fixed in B1's campaign file for Qwen3.8 A/Bs (ADR-065 B1), not chosen here;
 - paired log-makespan Student-t 95% interval;
 - verdicts in the order Loss, Win, Equivalent, Inconclusive;
-- fairness ceilings frozen by B1 (per-run, per-slot p95 semantic TTFT and maximum semantic SSE gap) must hold in every candidate run and slot;
+- **fairness reference at `auto`.** B1 freezes its baseline from the phase-1 default, which is `off` for Qwen3.8 four-slot. D1 measured a loss at `auto`, so B1's `off`-baseline reference does not apply to `auto` runs. B1 now judges fairness by Q3-style paired regression (operator decision, 2026-11-03), and P4b uses whichever of these B1's campaign file provides:
+  1. a frozen Qwen3.8 `auto` baseline with its own fairness reference; or
+  2. a declared reference, namely arm A at `auto` of the same campaign. Each fairness metric (per-run worst-slot p95 semantic TTFT and maximum semantic SSE gap) is a paired B/A effect (`q3_stats.paired_effect`), and a regression (`q3_stats.regression`: lower CI bound above the neutral band) fails the story.
+
+  If B1's campaign file provides neither, the root declares option 2 in the campaign file before any P4b run;
 - quality: the arms are `ExactTranscripts` (T-P4b-9), so B inherits task quality. A non-exact pair blocks the story pending diagnosis;
-- the Q5 case is the B1 campaign file's Qwen3.8 case derived at `auto`. Q5 admission is re-established for the P4b binary (the capture footprint is unchanged: the GPU path allocates nothing; path B adds only pipeline state).
+- the Q5 case is the B1 campaign file's Qwen3.8 case derived at `auto`, plus its N=1 case. Q5 admission is re-established for the P4b binary. The capture footprint is unchanged, because the GPU path allocates nothing beyond the one strided-copy pipeline.
 
-Default mapping. ADR-065 says "default set by the A/B verdict" but gives no mapping for P4b. Proposed, for root confirmation before the campaign runs:
+Default mapping, for dense artifacts only (MoE stays `Host`). ADR-065 says "default set by the A/B verdict" but gives no mapping for P4b. Accepted by review with conditions (Win/Equivalent → on, following the J6 precedent):
 
-| Verdict | Default | Reason |
+| Four-agent verdict | Default (dense, unset) | Conditions |
 |---|---|---|
-| Win | on | — |
-| Equivalent | on | Exact transcripts plus a bounded no-difference result. The story's outcome (no host copy) and J4's need for a batched restore favour the GPU path at no measured cost |
-| Loss or Inconclusive | off | The verdict is recorded. The switch stays, and the host path remains the default |
+| Win | on | N=1 verdict is not Loss; fairness passes; transcripts exact |
+| Equivalent | on | Same conditions. Exact transcripts plus a bounded no-difference result: the story's outcome (no host copy) and J4's need for a batched restore favour the GPU path at no measured cost |
+| Loss or Inconclusive, or any condition failing | off | The verdict is recorded. The switch stays, and the host path remains the default |
 
 ## 6. Risks
 
 | Risk | Mitigation |
 |---|---|
-| Float copy kernels are not bit-preserving for some payloads (path A) | E6 / T-P4a-1 bit-class coverage. Failure moves P4a to path B, which uses u32 loads and stores only |
-| Native bounds checks use `byte_len()`, not view extents | hf2q preflight checks every range against `data_byte_len()` (§3.3). Path B validates views natively |
-| Encoder-switch overhead from blits | Compute-first ordering (§2.2). The microbenchmark selects `offset_copy_f32` if it is cheaper |
-| Command-buffer submit and wait (one per partial round) costs more than the host copy at small `E` | P4b-M0 plus the A/B decide the default. The Qwen3.6 MoE shape (62.8 MiB) is the smallest served case |
-| A stringified error hides a GPU fault from fatal classification | §3.4 rule; a unit test asserts the error chain contains `MlxError::CommandBufferError` under injected failure (mlx-native test hook or mock encoder) |
+| Native bounds checks for the strided copy use `byte_len()`, not view extents | hf2q preflight checks every range against `data_byte_len()` (§3.3). T-P4a-6 records the caveat |
+| Encoder-switch overhead from `L·items` blit encoders | Compute-first ordering (§2.2). P4b-M0 and the A/B measure the whole restore; a Loss leaves the default off |
+| Command-buffer submit and wait (one per partial round) costs more than the host copy | P4b-M0 plus the A/B decide the dense default; the N=1 verdict is a separate condition |
+| A stringified error hides a GPU fault from fatal classification | §3.4 rule and T-P4b-5c |
+| A GPU restore reached through a caller without fail-stop semantics | Only slot-aware callers use `rollback_la`; serial K=N and DFlash keep `rollback_la_to` (§3.1). T-P4b-5b |
+| Qwen3.6 default changes without evidence | Unset MoE resolves to `Host` (§3.1), tested by T-P4b-5b |
+| Runtime metallib cannot run K3 at 0.15.16 | Precompiled-only hardware evidence until the registry fix is pinned (§2.3, §5) |
 | The cache-owned `KernelRegistry` is not `Send` | The alternative in §3.1 (registry passed in at the slot-aware callers) |
 | J4 lands later and adds its own host rollback | The slice-taking plan/encode/finish API exists; J4 adds only the thin `rollback_la_many` wrapper, plus the J4 obligation recorded by the root (§3.2) |
 
