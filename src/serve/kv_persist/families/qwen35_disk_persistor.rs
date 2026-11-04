@@ -677,10 +677,27 @@ impl Qwen35DiskPersistor {
 /// sequence count, codec, fixed DeltaNet state shape, and substrate. This is
 /// what lets a checkpoint written by one OpenCode turn hydrate after restart
 /// into the differently-sized cache allocated for the next turn.
+///
+/// The fingerprint also binds [`QWEN35_ROPE_CONVENTION`]: snapshots store K
+/// after RoPE, so K written under a different rotary pairing must never
+/// hydrate into a cache whose Q uses the current one.
 fn compute_config_fingerprint_hex(cfg: &Qwen35HybridConfig) -> String {
+    config_fingerprint_hex_with_rope_tag(cfg, QWEN35_ROPE_CONVENTION)
+}
+
+/// RoPE convention of the K stored in snapshots. Partial-rotary IMROPE pairs
+/// `(p, p + rotary_dim/2)` with the tail passed through (mlx-native 0.15.18).
+/// Snapshots written before this tag existed used `(p, p + head_dim/2)`; an
+/// empty tag reproduces their fingerprint, so they live in a different
+/// directory and are never read. Change this tag whenever the stored K's
+/// rotation changes.
+const QWEN35_ROPE_CONVENTION: &[u8] = b"rope:imrope-pairs-within-rotary-block";
+
+fn config_fingerprint_hex_with_rope_tag(cfg: &Qwen35HybridConfig, rope_tag: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(b"QH35-cfg-fp-v2-capacity-independent");
+    h.update(rope_tag);
     h.update(&cfg.n_full_attn.to_le_bytes());
     h.update(&cfg.n_linear_attn.to_le_bytes());
     h.update(&[u8::from(cfg.has_mtp)]);
@@ -1213,6 +1230,22 @@ mod tests {
             Qwen35DiskPersistor::fingerprint_hex_for(&cfg_a),
             Qwen35DiskPersistor::fingerprint_hex_for(&cfg_b),
             "head-dimension drift remains incompatible"
+        );
+    }
+
+    /// Snapshots written before the RoPE-convention tag (K rotated with the
+    /// pre-0.15.18 `(p, p + head_dim/2)` pairing) must land in a different
+    /// fingerprint directory, so they are never hydrated. An empty tag is a
+    /// no-op SHA-256 update, so it reproduces the pre-tag fingerprint.
+    #[test]
+    fn qh35_fingerprint_isolates_pre_rope_fix_snapshots() {
+        let cfg = synth_cfg();
+        let current = Qwen35DiskPersistor::fingerprint_hex_for(&cfg);
+        let pre_fix = config_fingerprint_hex_with_rope_tag(&cfg, b"");
+        assert_ne!(current, pre_fix);
+        assert_eq!(
+            current,
+            config_fingerprint_hex_with_rope_tag(&cfg, QWEN35_ROPE_CONVENTION)
         );
     }
 

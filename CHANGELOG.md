@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PR CI now checks the packed crate (`cargo check --all-targets` in the unpacked `cargo package` root) and the Mach-O LINKEDIT string-pool alignment of the release build. Before, these ran only during a release.
 - ADR-063 Q1 test harness (no serving change): the Qwen3.8 T1 endpoint now captures the source and restored 64-row active caches and checks them byte for byte, as Qwen3.6 already did. Qwen3.8 T1 vs T3 is now `ExactOnCommon` with exactly the 1,408 restored-64 records as extras (#664; `docs/research/adr063-q1-qwen38-rerun-b5.md`). The Qwen endpoint payload cap is 4 GiB, because the Qwen3.8 T1 store is 3.1 GB.
 
+### Fixed
+
+- Qwen3.5 / Qwen3.6 / Qwen3.8 full-attention RoPE (with the mlx-native 0.15.18 `rope_multi` fix): partial rotary (head_dim 256, rotary_dim 64) now pairs `(p, p + 32)` and passes dims 64..255 through, as the reference does. Before, the kernel paired `(p, p + 128)`, which moved layer-3 Q/K after RoPE to rel-L2 0.60/0.54 against the reference and every later full-attention layer with it. The CPU oracles in `full_attn.rs` and `gpu_full_attn.rs`, which encoded the old pairing, are corrected, and `imrope_matches_cpu_ref` now covers the 256/64 production shape up to position 262143. Persisted Qwen3.5/3.6 KV snapshots written before the fix hold K rotated the old way; the persistor fingerprint now binds the RoPE convention, so they are no longer hydrated. The lazy tensor-map loader (activation capture from a lazy map) set `rotary_dim = head_dim/2`; it now uses the family's 0.25 factor and sections `[11, 11, 10, 0]`.
+
 ## [0.1.29] — 2026-11-03
 
 ### Changed
