@@ -39,6 +39,10 @@ PRECISION_PP = 2.5
 RECORD_KEYS = {"verdict", "verdict_ref", "campaign_ref", "campaign_status", "halt", "primary_stop", "stages", "reasons",
                "experiment", "peer_unavailable", "unmeasurable", "thermal_valid", "memory_valid",
                "patch_review_pending", "quality_gate", "review"}
+# Optional record field of a --stock-record campaign (ADR-063 Q4-DS4-RACE decision D1): the bound same-artifact stock
+# record on hf2q's artifact that its vs-stock effects and the stock-hf2q gate come from (records before it carry none).
+STOCK_RECORD = "stock_record"
+STOCK_RECORD_KEYS = {"verdict_ref", "artifact_sha256", "stock_label"}
 GATE_KEYS = {"reference", "manifest", "status", "q1_verdict", "reference_sha256"}
 HOW_TO_READ = [
     "How to read this tier:", "",
@@ -110,10 +114,19 @@ def native_identities(document):
     return out
 
 
-def gate_status(document, reference, family, arms):
+def receipt_artifacts(document, arm):
+    """Receipt artifact sha256 of every attempt of one quality-campaign arm (None for a missing receipt)."""
+    return {json.loads((out / "receipt.json").read_text()).get("artifact", {}).get("sha256")
+            if (out / "receipt.json").is_file() else None for out in attempts(document, arm)}
+
+
+def gate_status(document, reference, family, arms, stock_record=None):
     """(status, Q1 verdict, reference binary sha256) of one quality_campaign.py manifest. A settled gate must run its
     subject on the Q3 experiment binary and its reference on the campaign's arm of that kind: the stock binary for
-    stock-hf2q, the peer binary for peer, and for <kind>-native an arm of that engine kind on one native binary."""
+    stock-hf2q, the peer binary for peer, and for <kind>-native an arm of that engine kind on one native binary.
+    stock_record (a --stock-record campaign's plan binding, no stock arm): the stock-hf2q gate runs the record's stock
+    binary on the record's hf2q artifact (its subject is the record's experiment binary, equal to this campaign's),
+    and the peer gate runs this campaign's peer binary on the peer arm's artifact."""
     if document is None:
         return "Pending", None, None
     plan = document.get("plan") or {}
@@ -131,8 +144,19 @@ def gate_status(document, reference, family, arms):
     ran = binaries(document, "reference")
     if reference in (STOCK_REFERENCE, "peer", SPLASH):
         arm = {STOCK_REFERENCE: "stock", "peer": "peer", SPLASH: SPLASH}[reference]
-        require(arm in arms, f"quality gate {reference}: the campaign has no {arm} arm")
-        want = arms[arm]["binary"]["sha256"]
+        if stock_record is not None and reference in (STOCK_REFERENCE, "peer"):
+            artifact = stock_record["artifact_sha256"] if reference == STOCK_REFERENCE else (
+                (arms.get("peer") or {}).get("artifact") or {}).get("sha256")
+            require(reference == STOCK_REFERENCE or arm in arms, f"quality gate {reference}: the campaign has no {arm} arm")
+            require(stock_record["experiment_binary_sha256"] == arms["experiment"]["binary"]["sha256"],
+                    f"quality gate {reference}: the stock record's experiment binary is not this campaign's")
+            require(artifact is not None and receipt_artifacts(document, "subject") | receipt_artifacts(document, "reference")
+                    == {artifact}, f"quality gate {reference} was not run on the "
+                    + ("stock record's hf2q artifact" if reference == STOCK_REFERENCE else "peer arm's artifact"))
+            want = stock_record["stock_binary_sha256"] if reference == STOCK_REFERENCE else arms[arm]["binary"]["sha256"]
+        else:
+            require(arm in arms, f"quality gate {reference}: the campaign has no {arm} arm")
+            want = arms[arm]["binary"]["sha256"]
         if reference == SPLASH:
             identity = native_identities(document)
             require(len(identity) == 1 and next(iter(identity))[0] == SPLASH and next(iter(identity))[1] != "null"
@@ -153,7 +177,8 @@ def gate_status(document, reference, family, arms):
 
 def required_references(family, peer_unavailable, splash=None):
     """stock-hf2q always; the same-GGUF peer while it is available, else the family's native stand-in (ds4); and
-    Splash where the record requires it (Qwen families, `splash` record field)."""
+    Splash where the record requires it (Qwen families, `splash` record field). A stock-record campaign keeps
+    [stock-hf2q, peer]: its stock-hf2q gate is bound to the record's stock binary and hf2q artifact (gate_status)."""
     extra = [SPLASH] if (splash or {}).get("required") else []
     if peer_unavailable is None:
         return [STOCK_REFERENCE, "peer"] + extra
@@ -187,11 +212,15 @@ def build_record(verdict, campaign, root, refs, gates, review):
     require(verdict.get("verdict_of_record", True) and not verdict.get("primary_of_record"),
             "a controls-only or native-comparison verdict is never a Q3 verdict of record")
     arms = campaign["identities"]["arms"]
+    bound = campaign["plan"].get(STOCK_RECORD)
     quality = []
     for reference, ref, document in gates:
-        status, q1, sha = gate_status(document, reference, verdict["family"], arms)
+        status, q1, sha = gate_status(document, reference, verdict["family"], arms, bound)
         quality.append({"reference": reference, "manifest": ref, "status": status, "q1_verdict": q1, "reference_sha256": sha})
     secondary = (verdict.get("primary") or {}).get("secondary") or {}
+    stock = verdict.get(STOCK_RECORD)
+    if stock is not None:  # the vs-stock fairness effects of a stock-record campaign live in the bound record
+        secondary = {m: {**(secondary.get(m) or {}), **(stock["secondary"].get(m) or {})} for m in FAIRNESS}
     # An effect is unmeasurable only when the primary has paired blocks but the metric was empty in them; a primary
     # stopped before any block (Failed) has no fairness effect at all.
     paired = ((verdict.get("primary") or {}).get("stop") or {}).get("blocks", 0) >= 2
@@ -212,7 +241,10 @@ def build_record(verdict, campaign, root, refs, gates, review):
                 "unavailable": None if verdict["splash"]["unavailable"] is None
                 else symbolic(verdict["splash"]["unavailable"]["reason"], root),
                 "failures": [symbolic(f, root) for f in verdict["splash"]["failures"]],
-                "label": verdict["splash"]["label"]}})}
+                "label": verdict["splash"]["label"]}}),
+            **({} if stock is None else {STOCK_RECORD: {
+                "verdict_ref": symbolic(stock["path"], root), "artifact_sha256": stock["artifact_sha256"],
+                "stock_label": stock["stock"]["label"]}})}
 
 
 def validate(groups):
@@ -222,7 +254,14 @@ def validate(groups):
         rec = group.get("q3_record")
         if rec is None:
             continue
-        require(isinstance(rec, dict) and set(rec) in (RECORD_KEYS, RECORD_KEYS | {SPLASH}), f"{gid}: q3_record fields")
+        require(isinstance(rec, dict) and RECORD_KEYS <= set(rec) <= RECORD_KEYS | {SPLASH, STOCK_RECORD},
+                f"{gid}: q3_record fields")
+        stock = rec.get(STOCK_RECORD)
+        require(STOCK_RECORD not in rec or (
+            isinstance(stock, dict) and set(stock) == STOCK_RECORD_KEYS and isinstance(stock["verdict_ref"], str)
+            and stock["verdict_ref"].startswith("$E/") and stock["verdict_ref"].endswith("/verdict.json")
+            and isinstance(stock["artifact_sha256"], str) and isinstance(stock["stock_label"], str)),
+            f"{gid}: q3_record stock_record")
         splash = rec.get(SPLASH)
         require(splash is None and SPLASH not in rec or (
             isinstance(splash, dict) and set(splash) == {"required", "unavailable", "failures", "label"}

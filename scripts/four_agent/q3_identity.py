@@ -62,11 +62,20 @@ def arm(name, case, overrides, environ):
     return identity
 
 
+def stock_record_files(record):
+    """Current sha256 of the bound stock record's verdict.json and campaign.json (None when a file is gone)."""
+    return {name: q5_artifacts.sha256(record[name]["path"]) if os.path.isfile(record[name]["path"]) else None
+            for name in ("verdict", "campaign")}
+
+
 def identities(plan, cases, environ):
+    """Frozen identities. A stock-record campaign (--stock-record) also freezes the bound record files' sha256, so a
+    record changed after binding halts the campaign before the next run."""
     arms = {name: arm(name, cases[name], spec["overrides"], environ) for name, spec in plan["arms"].items()}
     python = Path(sys.executable).resolve()
     return {"arms": arms, "harness": harness(), "python": {"path": str(python), "sha256": q5_artifacts.sha256(python)},
-            "host": q5_host.host_identity(), "negative_control_receipt": plan.get("negative_control_receipt")}
+            "host": q5_host.host_identity(), "negative_control_receipt": plan.get("negative_control_receipt"),
+            **({"stock_record": stock_record_files(plan["stock_record"])} if "stock_record" in plan else {})}
 
 
 def native_arms(plan):
@@ -134,8 +143,11 @@ def controls_identity(plan, ids):
 
 def launch_problems(plan, ids, output=None):
     """Everything that keeps a campaign from starting; empty when launchable. output: the campaign directory, which
-    same-artifact arms check (Splash run directories must be on APFS)."""
-    problems = [f"--{name}-bin is required" for name in ("stock", "experiment") if not plan["declared"][name]["binary"]]
+    same-artifact arms check (Splash run directories must be on APFS). Without a stock arm (--no-stock-arm) only the
+    experiment binary and commit are required; a bound stock record must still be the frozen files, measured on this
+    campaign's experiment binary."""
+    hf2q = [name for name in ("stock", "experiment") if name in plan["arms"]]
+    problems = [f"--{name}-bin is required" for name in hf2q if not plan["declared"][name]["binary"]]
     problems += [f"{name}: missing variables {','.join(i['missing_variables'])}" for name, i in ids["arms"].items()
                  if i["missing_variables"]]
     problems += [f"{name}: {what} not found" for name, i in ids["arms"].items() for what, ok in i["file_checks"].items() if not ok]
@@ -151,18 +163,30 @@ def launch_problems(plan, ids, output=None):
     # (Splash): the artifact must be the experiment's GGUF itself, the build found must be the declared one, and the
     # output volume must suit its run directories.
     for name in native:
-        problems += native_peers.adapter(plan["arms"][name]["engine_kind"]).launch_problems(
-            name, ids["arms"][name]["artifact"] or {}, hf2q_sha)
+        spec = plan["arms"][name]
+        problems += native_peers.adapter(spec["engine_kind"]).launch_problems(
+            name, ids["arms"][name]["artifact"] or {}, hf2q_sha, q5_case.loads(Path(spec["case"]).read_bytes()))
     for name in same_artifact:
         problems += native_peers.adapter(plan["arms"][name]["engine_kind"]).launch_problems(
             name, ids["arms"][name]["artifact"] or {}, hf2q_sha, ids["arms"][name], output)
-    stock, experiment = ids["arms"]["stock"]["binary"]["sha256"], ids["arms"]["experiment"]["binary"]["sha256"]
+    experiment = ids["arms"]["experiment"]["binary"]["sha256"]
+    stock = ids["arms"]["stock"]["binary"]["sha256"] if "stock" in ids["arms"] else None
     if stock is not None and stock == experiment:
         problems.append("stock and experiment binaries are identical")
-    for name in ("stock", "experiment"):
+    for name in hf2q:
         commit = plan["declared"][name]["commit"]
         if not (isinstance(commit, str) and len(commit) == 40 and all(c in "0123456789abcdef" for c in commit)):
             problems.append(f"--{name}-commit must be the 40-hex source commit of the {name} binary")
+    bound = plan.get("stock_record")
+    if bound is not None:
+        if bound["experiment_binary_sha256"] != experiment:
+            problems.append(f"the stock record {bound['verdict']['path']} was measured on experiment binary "
+                            f"{bound['experiment_binary_sha256']}, not this campaign's --experiment-bin ({experiment})")
+        files = ids.get("stock_record") or {}
+        changed = [name for name in ("verdict", "campaign") if files.get(name) != bound[name]["sha256"]]
+        if changed:
+            problems.append(f"the stock record {' and '.join(bound[n]['path'] for n in changed)} changed since the "
+                            "campaign bound it (freeze the record read-only before binding)")
     if ids["harness"]["git_commit"] is None or ids["harness"]["git_dirty"]:
         problems.append("the harness checkout must be a clean Git commit (scripts/ has uncommitted changes)")
     if not plan["declared"]["qe_identity"]:

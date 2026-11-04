@@ -31,6 +31,8 @@ INTERFACE = {
     'PROCESSES': 'executable names for the competing-runtime inventories',
     'PYTHON_MODULES': 'full `python -m` module names of the arm\'s server for the competing-runtime inventories',
     'BASELINES': 'F2 effect baseline id -> label; never a measured column, never a win',
+    'SAME_FILE_BASELINES': 'the BASELINES ids of same-file native comparisons (the native artifact is the hf2q '
+                           'artifact itself, artifact_relation same_as_hf2q); every other id is a different artifact',
     'AUDIT': 'post-run audit module: audit_run, q3_section, note',
     'SAME_GGUF_UNAVAILABLE': 'verdict reason when the campaign carries --peer-unavailable-evidence',
     'NATIVE_COMPARISON': 'verdict reason when the campaign declares --native-comparison',
@@ -44,9 +46,12 @@ INTERFACE = {
     'readiness': '(base, model, output, approval packet) -> native_readiness record',
     'closing': '(base, coordinator output) -> record once every agent finished (outside the makespan), or None',
     'PEER_CASE_REFUSAL': 'Q3 refusal text when the arm\'s --peer-case lacks its required campaign flag',
+    'mode_problems': '(q5 case, --peer-unavailable-evidence given, --native-comparison given) -> refusal strings for a '
+                     'campaign mode the case\'s artifact relation does not admit',
     'campaign_identity': '(q5 plan) -> frozen identity additions (peer_build_info, native_runtime)',
-    'launch_problems': '(arm name, artifact identity, hf2q artifact sha256) -> refusal strings; same-artifact arms '
-                       'also take (arm identity, campaign output directory)',
+    'launch_problems': '(arm name, artifact identity, hf2q artifact sha256, q5 case) -> refusal strings; same-artifact '
+                       'arms take (arm name, artifact identity, hf2q artifact sha256, arm identity, campaign output '
+                       'directory) instead',
     'label': '(q5 case) -> arm label',
     'q3_role': '(q5 case) -> Q3 plan role',
 }
@@ -79,6 +84,23 @@ def audit(kind):
     return importlib.import_module(adapter(kind).AUDIT)
 
 
+# Native case artifact relation (the approval's native_<kind> block, field artifact_relation): a native arm serves its
+# own different artifact unless its case declares the hf2q artifact itself (ADR-063 Q4-DS4-RACE decision D2).
+DIFFERENT, SAME_AS_HF2Q = 'different', 'same_as_hf2q'
+RELATIONS = (DIFFERENT, SAME_AS_HF2Q)
+
+
+def artifact_relation(case):
+    """The declared artifact relation of a native q5 case; 'different' when no native block declares one."""
+    approval = ((case or {}).get('client') or {}).get('approval') or {}
+    blocks = [value for key, value in (approval.get('set') or {}).items()
+              if key.startswith('native_') and isinstance(value, dict) and 'artifact_relation' in value]
+    require(len(blocks) <= 1, 'more than one native block declares artifact_relation')
+    relation = blocks[0]['artifact_relation'] if blocks else DIFFERENT
+    require(relation in RELATIONS, f'artifact_relation must be one of {", ".join(RELATIONS)}')
+    return relation
+
+
 def peer_kind(plan):
     """The Q3 plan's native peer kind, or None when its peer arm is the same-GGUF peer (or absent)."""
     kind = plan['arms'].get('peer', {}).get('engine_kind')
@@ -91,6 +113,11 @@ def baselines():
     for kind in KINDS:
         out.update(adapter(kind).BASELINES)
     return out
+
+
+def same_file_baselines():
+    """Every native F2 baseline id whose comparison runs on the hf2q artifact itself."""
+    return frozenset(key for kind in KINDS for key in adapter(kind).SAME_FILE_BASELINES)
 
 
 def baseline_of(kind, label):

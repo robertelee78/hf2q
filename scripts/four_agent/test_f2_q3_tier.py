@@ -1,5 +1,5 @@
 """Controls for the rendered F2 'Q3 verdicts of record' tier and its manifest validation: synthetic records and
-rows only. Receipt re-derivation and q3_report.rows(of_record=True) are in test_f2_q3_record.py."""
+rows only. Receipt re-derivation, quality-gate binding and q3_report.rows(of_record=True) are in test_f2_q3_record.py."""
 import copy
 import unittest
 
@@ -276,6 +276,33 @@ class Validation(unittest.TestCase):
         self.assertEqual(tuple(tier.FAIRNESS), q3_report.FAIRNESS)
         self.assertEqual(tier.required_references("deepseek4", "peer out of memory (prior evidence)"), ["stock-hf2q", "ds4-native"])
         self.assertEqual(tier.required_references("qwen38", None), ["stock-hf2q", "peer"])
+
+
+class StockRecordTier(unittest.TestCase):
+    """A --stock-record campaign's record (ADR-063 Q4-DS4-RACE decision D1): its vs-stock terms come from the bound
+    same-artifact record on hf2q's artifact, and the tier says so."""
+    BOUND = {"verdict_ref": "$E/q3/deepseek4-hf2q-artifact/verdict.json", "artifact_sha256": "f" * 64,
+             "stock_label": "v0.1.28 release"}
+
+    def test_the_cells_name_the_hf2q_artifact_record(self):
+        text = r.render(qwen38(BOTH, stock_record=self.BOUND), [], "0" * 64)
+        cells = tier_line(text, "Qwen3.8 27B")
+        self.assertEqual(cells[2], "hf2q 38485a23 finishes 26.4% sooner than v0.1.28 stock (hf2q artifact record) (95% CI "
+                                   "24.7 to 28.1%, half-width 2.22 points); **Win**")
+        self.assertTrue(cells[4].startswith("vs stock (hf2q artifact record): TTFT p95 0.696 [0.653, 0.741]"))
+        plain_cells = tier_line(r.render(qwen38(BOTH), [], "0" * 64), "Qwen3.8 27B")  # records before it: unchanged
+        self.assertTrue(plain_cells[4].startswith("vs stock: TTFT p95"))
+        # the gate references stay [stock-hf2q, peer]; the stock-hf2q gate binds the record (test_f2_q3_record)
+        self.assertEqual(tier.required_references("deepseek4", None), ["stock-hf2q", "peer"])
+        self.assertIn("quality gate Pending vs peer",
+                      tier_line(r.render(qwen38([gate("stock-hf2q", "Pass"), gate("peer", "Pending")],
+                                                stock_record=self.BOUND), [], "0" * 64), "Qwen3.8 27B")[1])
+
+    def test_the_record_field_is_closed(self):
+        for bad in ({**self.BOUND, "extra": 1}, {**self.BOUND, "verdict_ref": "q3/verdict.json"},
+                    {**self.BOUND, "verdict_ref": "$E/q3/campaign.json"}, {**self.BOUND, "artifact_sha256": None}, None):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "q3_record stock_record"):
+                qwen38(BOTH, stock_record=bad)
 
 
 if __name__ == "__main__":

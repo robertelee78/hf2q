@@ -62,6 +62,7 @@ import copy
 import re
 
 import family_peer
+import native_peers
 import qwen_n4_peer
 from family_peer import SHARED_KEYS, same
 from qwen38_n1_verdict import Invalid, integer, loads, require
@@ -142,9 +143,15 @@ CLIENT_MODULES = ('native_peers.py', 'native_peer_omlx.py', 'native_peer_omlx_re
 PROCESSES = ('omlx', 'omlx-server')     # pyproject.toml:233-234 console script; process_title.py:8 setproctitle
 PYTHON_MODULES = ()                     # the server runs as the omlx console script (PROCESSES)
 BASELINES = {f'omlx_{q3}_native': label for q3, label in LABELS.items()}
+SAME_FILE_BASELINES = ()                # oMLX serves its own MLX checkpoints, never the hf2q GGUF
 AUDIT = 'native_peer_omlx_audit'
 PEER_CASE_REFUSAL = ('a native oMLX --peer-case needs --native-comparison (Qwen3.8, Qwen3.6 and Gemma 4 have a '
                      'runnable same-GGUF peer, ADR-063 Q4)')
+
+
+def mode_problems(case, evidence, comparison):
+    """No relation-dependent mode: SAME_GGUF_UNAVAILABLE and PEER_CASE_REFUSAL already fix --native-comparison."""
+    return []
 
 
 def _family(family):
@@ -352,6 +359,8 @@ def campaign_identity(plan):
     return identity(plan)
 
 
-def launch_problems(name, artifact, hf2q_sha256):
+def launch_problems(name, artifact, hf2q_sha256, case=None):
     from native_peer_omlx_ready import launch_problems as problems
-    return problems(name, artifact, hf2q_sha256)
+    refused = ([f'{name}: an oMLX case is never artifact_relation same_as_hf2q (it serves its own checkpoint)']
+               if native_peers.artifact_relation(case) == native_peers.SAME_AS_HF2Q else [])
+    return refused + problems(name, artifact, hf2q_sha256)

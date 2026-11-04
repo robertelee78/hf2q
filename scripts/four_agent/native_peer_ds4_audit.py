@@ -17,7 +17,8 @@ from pathlib import Path
 import re
 import statistics
 
-from native_peer_ds4 import BOS, DS4_COMMIT, ENGINE, LABEL, MAX_TOKENS, MODEL_ID, THINK_MAX_PREFIX, TRACE_NAME
+from native_peer_ds4 import (BOS, DS4_COMMIT, ENGINE, LABEL, MAX_TOKENS, MODEL_ID, SAMEFILE_LABEL, THINK_MAX_PREFIX,
+                             TRACE_NAME)
 from qwen38_n1_verdict import require
 
 HEADER = re.compile(r'\n===== request (\d+) \d{4}-\d\d-\d\d \d\d:\d\d:\d\d =====\nkind: (\w+)\nmodel: ([^\n]*)\n'
@@ -104,10 +105,13 @@ def _median(values):
 
 
 def q3_section(stage, manifest, experiment_label):
-    """Task-makespan-only native comparison for verdict.json (never the same-GGUF peer verdict).
+    """Task-makespan-only native comparison for verdict.json (never the same-GGUF peer verdict). The plan's peer label
+    names the artifact relation: the different-artifact arm, or the same-file arm (ds4 on the hf2q arm's ds4 file).
 
     The statement is withheld while ds4 is unavailable, either arm has a failed task, or any ds4 run
     shows server-side tool-call recovery (or lacks its trace audit): no makespan claim then (ADR-063 Q3)."""
+    label = manifest['plan']['arms'].get('peer', {}).get('label') or LABEL
+    same = label == SAMEFILE_LABEL
     from q3_report import effect
     makespan = effect(stage, 'experiment', 'peer', 'makespan_s')
     entries = [e for b in stage['blocks'] for e in b['entries']]
@@ -133,9 +137,10 @@ def q3_section(stage, manifest, experiment_label):
     x = makespan['improvement_percent']
     statement = None if withheld else (
         f"{experiment_label} finishes the same coding task {abs(x):.1f}% {'sooner' if x >= 0 else 'later'} than "
-        f"{LABEL} (95% CI {makespan['improvement_ci95'][0]:.1f}..{makespan['improvement_ci95'][1]:.1f}%, "
-        f"{makespan['blocks']} blocks; different artifacts, task makespan only)")
-    return {'engine_kind': ENGINE, 'label': LABEL, 'comparison': 'different-artifact native engine; task makespan only',
+        f"{label} (95% CI {makespan['improvement_ci95'][0]:.1f}..{makespan['improvement_ci95'][1]:.1f}%, "
+        f"{makespan['blocks']} blocks; {'same file' if same else 'different artifacts'}, task makespan only)")
+    return {'engine_kind': ENGINE, 'label': label,
+            'comparison': ('same-file' if same else 'different-artifact') + ' native engine; task makespan only',
             'statement': statement, 'statement_withheld': withheld, 'makespan': makespan,
             'token_volume_median': volume, 'output_tokens_per_s_median': rate,
             'ttft_p95_ratio_experiment_over_ds4': None if not (ttft['experiment'] and ttft['peer'])

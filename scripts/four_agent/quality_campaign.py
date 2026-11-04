@@ -42,7 +42,8 @@ SUCCESS = "FourAgentProtocolCompleteAwaitingIndependentReview"
 # Supervisor stops that are the arm's own failure once the task has started.
 ARM_FAILURE_STOPS = ("server_exited", "client_timeout")
 # Reference kind -> the reference client's --engine-kind. "<kind>-native" is a separately labeled
-# native-engine arm (different artifact; native_peers.py), never the same-GGUF peer. "splash" is the same-artifact
+# native-engine arm (native_peers.py: its own different artifact, or for a ds4 case declaring artifact_relation
+# same_as_hf2q the ds4 file the hf2q arm loads), never the same-GGUF peer. "splash" is the same-artifact
 # Splash peer of record (Qwen families; ADR-063 "Splash peer of record for the Qwen families").
 REFERENCE_KINDS = {"peer": "peer", "stock-hf2q": "hf2q", "splash": "splash",
                    **{f"{kind}-native": kind for kind in native_peers.KINDS}}

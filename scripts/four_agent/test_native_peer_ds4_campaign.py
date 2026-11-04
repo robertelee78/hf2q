@@ -247,5 +247,178 @@ class Campaign(unittest.TestCase):
         self.assertIsNone(q3_metrics.token_volume({'agent-0': {'turns': [{'usage': None}]}}))
 
 
+SAMEFILE = HERE / 'q5_cases' / 'native-ds4-deepseek4-samefile.json'
+DS4FILE = HERE / 'q5_cases' / 'deepseek4-ds4file.json'
+DS4_SHA = 'ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0'
+
+
+def samefile_manifest():
+    """manifest('ds4') as the section 7.4 step 3 campaign: no stock arm, the same-file ds4 arm, --native-comparison."""
+    document = manifest('ds4')
+    for block in document['stages'][0]['blocks']:
+        block.update(order=['experiment', 'peer'], entries=[e for e in block['entries'] if e['arm'] != 'stock'])
+    plan = document['plan']
+    plan.update(measured_arms=['experiment', 'peer'], peer_unavailable_evidence=[], native_comparison=nd.NATIVE_COMPARISON)
+    del plan['arms']['stock']
+    plan['arms']['peer']['label'] = nd.SAMEFILE_LABEL
+    plan['declared']['stock'] = None
+    return document
+
+
+class SameFileCase(unittest.TestCase):
+    """The Q4-DS4-RACE L8 case files (docs/research/adr066-iq2xxs-subset-design.md section 7.2)."""
+    BUILTINS, REQUIRED = Case.BUILTINS, Case.REQUIRED
+
+    def test_the_ds4_file_hf2q_case_is_deepseek4_json_on_the_ds4_file(self):
+        base, case = (q5_case.loads(p.read_bytes()) for p in (HERE / 'q5_cases' / 'deepseek4.json', DS4FILE))
+        q5_case.validate(case)
+        changed = {'MODEL', 'MODEL_SHA256', 'MODEL_ID'}
+        self.assertEqual({k: v for k, v in case['variables'].items() if k not in changed},
+                         {k: v for k, v in base['variables'].items() if k not in changed})
+        self.assertEqual((Path(case['variables']['MODEL']).name, case['variables']['MODEL_SHA256'],
+                          case['variables']['MODEL_ID']), (nd.MODEL_FILE, DS4_SHA, 'DeepSeek V4 Flash'))
+        self.assertNotEqual(case['workload']['id'], base['workload']['id'])
+        for section in ('serve', 'readiness', 'client', 'binary', 'artifact', 'port', 'policy'):
+            self.assertEqual(case[section], base[section], section)
+        notes = ' '.join(case['notes'])
+        self.assertIn('fresh calibration', notes)
+        self.assertIn('/Users/robert/.local/state/hf2q/v0130/q4-ds4-race/t2-digest.json', notes)
+        plan = q5_case.build_plan(case, self.BUILTINS, {**self.REQUIRED, 'HF2Q_Q5_HF2Q_BIN': '/bin/hf2q'})
+        self.assertTrue(plan['complete'])
+        self.assertEqual(plan['artifact'], {'path': case['variables']['MODEL'], 'sha256': DS4_SHA})
+
+    def test_the_same_file_native_case_declares_the_relation_on_the_same_file(self):
+        base, case = (q5_case.loads(p.read_bytes()) for p in (CASE, SAMEFILE))
+        self.assertNotIn('artifact_relation', base['client']['approval']['set']['native_ds4'])  # unchanged case
+        self.assertEqual(nd.relation(base), 'different')
+        self.assertEqual((nd.relation(case), nd.label(case)), ('same_as_hf2q', 'ds4 c97964b (same ds4 file)'))
+        self.assertEqual({k for k in case['variables'] if case['variables'][k] != base['variables'][k]},
+                         {'DS4_DIR', 'MODEL_SHA256', 'PORT'})
+        self.assertEqual(case['variables']['MODEL_SHA256'], DS4_SHA)
+        plan = q5_case.build_plan(case, self.BUILTINS, {**self.REQUIRED, 'HF2Q_Q5_DS4_BIN_SHA256': 'd' * 64})
+        self.assertTrue(plan['complete'])
+        hf2q = q5_case.loads(DS4FILE.read_bytes())['variables']['MODEL']
+        self.assertEqual(plan['artifact'], {'path': hf2q, 'sha256': DS4_SHA})  # the hf2q arm's file itself
+        spec = nd.native_spec(plan['client']['approval']['set']['native_ds4'])
+        self.assertEqual((spec['artifact_relation'], spec['model'], spec['model_sha256']), ('same_as_hf2q', hf2q, DS4_SHA))
+        self.assertEqual(nd.campaign_identity(plan)['artifact_relation'], 'same_as_hf2q')
+        with self.assertRaises(q5_case.CaseError):  # the declaration is not a case variable
+            q5_case.build_plan(case, self.BUILTINS, {**self.REQUIRED, 'HF2Q_Q5_ARTIFACT_RELATION': 'different'})
+
+    def test_the_ds4_file_peer_case_keeps_the_enforced_template(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'peer-deepseek4-ds4file.json').read_bytes())
+        argv = case['serve']['argv']
+        self.assertEqual(argv[argv.index('--chat-template-file') + 1], '{CHAT_TEMPLATE}')
+        self.assertTrue(case['variables']['CHAT_TEMPLATE'].endswith('/deepseek4.template.jinja'))
+        self.assertEqual((case['variables']['LOAD_MODE'], case['variables']['UBATCH']), ('none', '1024'))
+        self.assertIn('finalized after the docs/research/adr066-iq2xxs-subset-design.md section 7.1 re-sweep',
+                      ' '.join(case['notes']))
+
+
+class SameFileCampaign(unittest.TestCase):
+    """ADR-063 Q4-DS4-RACE decision D2: ds4 on the ds4 file (section 7.4 step 3), under --native-comparison."""
+    setUp, tearDown, args = Campaign.setUp, Campaign.tearDown, Campaign.args
+
+    def samefile(self, *extra):
+        return q3.parse_args(['--family', 'deepseek4', '--no-stock-arm', '--hf2q-case', str(DS4FILE),
+                              '--peer-case', str(SAMEFILE), '--native-comparison',
+                              '--experiment-bin', '/bin/experiment', '--experiment-commit', '2' * 40, '--qe-identity',
+                              'qe', '--negative-control-receipt', str(self.nc), '--workloads', 'n4',
+                              '--output', str(self.root / 'q3'), *extra])
+
+    def ids(self, plan, native=DS4_SHA, hf2q=DS4_SHA):
+        ids = {'arms': {arm: {'binary': {'path': f'/bin/{arm}', 'sha256': str(i) * 64, 'exists': True},
+                              'artifact': {'path': f'/u/gguf/{nd.MODEL_FILE}', 'bytes': 9, 'sha256': hf2q},
+                              'peer_build_info': None, 'missing_variables': [], 'file_checks': {}, 'inputs': {}}
+                        for i, arm in enumerate(plan['arms'], 1)},
+               'harness': {'git_commit': 'c' * 40, 'git_dirty': [], 'sources': {}}, 'python': {}, 'host': {},
+               'negative_control_receipt': plan['negative_control_receipt']}
+        ids['arms']['peer']['artifact'] = {'path': f'/u/gguf/{nd.MODEL_FILE}', 'bytes': 9, 'sha256': native}
+        return ids
+
+    def test_the_same_file_arm_runs_only_as_a_labeled_native_comparison(self):
+        plan, cases = q3.build_plan(self.samefile(), {}, 'deepseek4')
+        peer = plan['arms']['peer']
+        self.assertEqual((plan['measured_arms'], plan['declared']['stock'], plan['native_comparison']),
+                         (['experiment', 'peer'], None, nd.NATIVE_COMPARISON))
+        self.assertEqual((peer['engine_kind'], peer['label'], peer['role']),
+                         ('ds4', nd.SAMEFILE_LABEL, nd.q3_role(cases['peer'])))
+        self.assertIn('same-file native comparison', peer['role'])
+        with_stock, _ = q3.build_plan(self.args('--hf2q-case', str(DS4FILE), '--peer-case', str(SAMEFILE),
+                                                '--native-comparison'), {}, 'deepseek4')
+        self.assertEqual(with_stock['measured_arms'], ['stock', 'experiment', 'peer'])
+        # evidence mode is refused for same_as_hf2q, comparison mode for the different-artifact case
+        with self.assertRaisesRegex(q3.qc.CampaignError, 'runs only with --native-comparison'):
+            q3.build_plan(self.args('--peer-case', str(SAMEFILE), '--peer-unavailable-evidence', str(self.evidence)),
+                          {}, 'deepseek4')
+        with self.assertRaisesRegex(q3.qc.CampaignError, 'needs artifact_relation same_as_hf2q'):
+            q3.build_plan(self.args('--peer-case', str(CASE), '--native-comparison'), {}, 'deepseek4')
+        evidence, _ = q3.build_plan(self.args('--peer-case', str(CASE), '--peer-unavailable-evidence', str(self.evidence)),
+                                    {}, 'deepseek4')
+        self.assertEqual((evidence['arms']['peer']['label'], evidence.get('native_comparison')), (nd.LABEL, None))
+
+    def test_same_file_launch_requires_equal_sha256(self):
+        plan, _ = q3.build_plan(self.samefile(), {}, 'deepseek4')
+        self.assertEqual(q3_identity.launch_problems(plan, self.ids(plan)), [])
+        mismatch = 'peer: a same_as_hf2q ds4 case needs the native and the hf2q artifact sha256 both present and equal'
+        for native, hf2q in (('e' * 64, DS4_SHA), (DS4_SHA, None)):
+            with self.subTest(native=native, hf2q=hf2q):
+                self.assertTrue(any(p.startswith(mismatch) for p in q3_identity.launch_problems(plan, self.ids(plan, native, hf2q))))
+        # the different-artifact campaign keeps today's refusal of an equal sha256
+        different, _ = q3.build_plan(self.args('--peer-case', str(CASE), '--peer-unavailable-evidence', str(self.evidence)),
+                                     {}, 'deepseek4')
+        self.assertIn("peer: native artifact sha256 equals the hf2q artifact's (set --peer-var MODEL_SHA256)",
+                      q3_identity.launch_problems(different, self.ids(different)))
+
+    def test_other_native_arms_refuse_a_same_file_declaration(self):
+        import native_peer_omlx as om
+        import native_peer_tensorfold as tf
+        same = {'client': {'approval': {'set': {'native_ds4': {'artifact_relation': 'same_as_hf2q'}}}}}
+        for module in (tf, om):
+            with self.subTest(engine=module.ENGINE):
+                self.assertEqual(module.mode_problems(same, False, True), [])
+                self.assertIn('never artifact_relation same_as_hf2q', module.launch_problems('peer', {}, 'a' * 64, same)[0])
+                self.assertEqual(module.launch_problems('peer', {}, 'a' * 64, None), [])
+
+    def test_no_stock_native_comparison_verdict_and_rows(self):
+        document = samefile_manifest()
+        verdict = q3_report.compute_verdict(document)  # no stock arm and no record: never a KeyError
+        self.assertEqual((verdict['verdict'], verdict['reasons']), ('Unavailable', [nd.NATIVE_COMPARISON]))
+        self.assertEqual((verdict['verdict_of_record'], verdict['stock_failures']), (False, []))
+        self.assertNotIn('vs_stock', verdict['primary']['effects'])
+        native = verdict['native_peer']
+        self.assertEqual((native['label'], native['comparison']), (nd.SAMEFILE_LABEL, 'same-file native engine; task makespan only'))
+        self.assertTrue(native['statement'].startswith('hf2q 22222222 finishes the same coding task 20.0% sooner than '
+                                                       'ds4 c97964b (same ds4 file)'))
+        self.assertIn('blocks; same file, task makespan only)', native['statement'])
+        self.assertEqual(q3_report.required_effects(document['stages'][0], document).keys(), {'vs_peer'})
+        out = self.root / 'evidence' / 'q3-deepseek4-samefile'
+        out.mkdir(parents=True)
+        (out / 'campaign.json').write_text(json.dumps(document))
+        (out / 'verdict.json').write_text(json.dumps(verdict))
+        rows = q3_report.rows(out, self.root)
+        [(group, spec)] = rows['groups'].items()
+        self.assertEqual(group, 'deepseek4-q3-ds4-samefile')
+        self.assertIn('4 slots; no stock arm; experiment hf2q 22222222 vs ds4 c97964b (same ds4 file)', spec['workload'])
+        [row] = rows['rows']
+        self.assertEqual(row['baseline_arm'], 'ds4_samefile')
+        self.assertIn('ds4 c97964b (same ds4 file); same file, task makespan only, not the same-GGUF peer verdict',
+                      row['note'])
+        self.assertNotIn('different artifact', row['note'])
+        with self.assertRaisesRegex(ValueError, 'never the Q3 verdict of record'):
+            q3_report.rows(out, self.root, of_record=True)
+        board = {'schema': f2.ROWS_SCHEMA, 'evidence_root_symbol': '$E', 'evidence_root_description': 'test',
+                 'neutral_band_ratio': 1.025, 'neutral_band_basis': 'test',
+                 'families': {'deepseek4': {'title': 'DeepSeek-V4 Flash', 'artifact_sha256': 'a' * 64, 'note': ''}},
+                 **rows}
+        f2.validate_manifest(board)
+        self.assertEqual(f2.verify_rows(board, self.root), [row['id']])
+        text = f2.render(board, [], '0' * 64)
+        title = '## Native-engine comparisons (same file as the hf2q arm, task makespan only)'
+        self.assertIn(f"`{row['id']}`", text[text.index(title):])
+        self.assertNotIn('## Native-engine comparisons (different artifact', text)
+        self.assertFalse(f2.effect_is_win(row))
+
+
 if __name__ == '__main__':
     unittest.main()

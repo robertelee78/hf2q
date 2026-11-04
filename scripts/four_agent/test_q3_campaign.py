@@ -10,6 +10,7 @@ import itertools
 import json
 import math
 import os
+import re
 import shutil
 from pathlib import Path
 import tempfile
@@ -970,6 +971,258 @@ class Metrics(unittest.TestCase):
         self.assertEqual((m["tasks_passed"], m["memory"]["swap_growth_bytes"], m["peer_build_info"]), (4, 0, "b1"))
         self.assertFalse(m["thermal"]["valid"])  # critical after the run
         self.assertEqual(m["thermal"]["in_run"], "unrecorded")
+
+
+DS4_ART = "d" * 64  # the campaign's own artifact (ds4's file), distinct from the stock record's hf2q artifact MODEL_SHA
+
+
+class StockRecordHarness(Harness):
+    """--no-stock-arm --stock-record (ADR-063 Q4-DS4-RACE decision D1): the verdict-of-record mode without a stock arm,
+    its vs-stock terms read from a bound same-artifact stock record. The generic harness runs qwen38, so the stock-record
+    families are widened to it here; the deepseek4-only rule has its own control."""
+    win = Driver.win
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(q3, "STOCK_RECORD_FAMILIES", ("qwen38",))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def record(self, *extra, decide=None, workloads="n4", thermal=lambda: 0):
+        """A completed default campaign with a stock arm (the record, on MODEL_SHA); later campaigns write beside it."""
+        driver, _ = self.driver(decide or self.win, *extra, workloads=workloads, thermal=thermal)
+        q3.write_verdict(self.out, driver.run(), [], None)
+        record = self.out / "verdict.json"
+        self.out = self.out.parent / "q3-qwen38-ds4file"
+        return record
+
+    def no_stock(self, *extra, workloads="n4"):
+        return q3.parse_args(["--family", "qwen38", "--no-stock-arm", "--experiment-bin", "/bin/experiment",
+                              "--experiment-commit", "2" * 40, "--qe-identity", "qe-test",
+                              "--negative-control-receipt", str(self.nc), "--workloads", workloads,
+                              "--output", str(self.out), *extra])
+
+    def ids(self, plan):
+        """Fake identities of a campaign on DS4_ART, with the bound record files as they are now on disk."""
+        ids = fake_identities(plan)
+        for arm in ("experiment", "peer"):
+            ids["arms"][arm]["artifact"] = {"path": "/m.gguf", "bytes": 10, "sha256": DS4_ART}  # write_run's receipt
+        ids["stock_record"] = q3_identity.stock_record_files(plan["stock_record"])
+        return ids
+
+    def campaign(self, record, decide=None, identify=None, workloads="n4"):
+        plan, cases = q3.build_plan(self.no_stock("--stock-record", str(record), workloads=workloads), {}, "qwen38")
+        runner = FakeRunner(lambda arm, w, call: {**(decide or self.win)(arm, w, call), "artifact_sha": DS4_ART})
+        return q3.Driver(plan, cases, self.out, {}, runner, lambda: 0, identify or (lambda: self.ids(plan))), runner
+
+
+class StockRecord(StockRecordHarness):
+    """The refusal matrix, the binding, the mismatch and changed-file halts, the verdict state and the rows."""
+
+    def test_argument_matrix(self):
+        record = str(self.record())
+        refusals = [(self.args("--stock-record", record), "--stock-record needs --no-stock-arm"),
+                    (self.no_stock(), "--no-stock-arm needs exactly one of --stock-record"),
+                    (self.no_stock("--stock-record", record, "--native-comparison"), "needs exactly one of"),
+                    (self.no_stock("--stock-record", record, "--stock-bin", "/bin/stock"), "--stock-bin refused"),
+                    (self.no_stock("--stock-record", record, "--stock-commit", "1" * 40), "--stock-commit refused"),
+                    (self.no_stock("--stock-record", record, "--stock-label", "v0.1.28"), "--stock-label refused"),
+                    (self.no_stock("--stock-record", record, "--stock-var", "PORT=1"), "--stock-var refused"),
+                    (self.no_stock("--stock-record", record, "--controls-of", record), "no controls-only mode")]
+        for args, reason in refusals:
+            with self.subTest(reason=reason), self.assertRaisesRegex(q3.qc.CampaignError, re.escape(reason)):
+                q3.build_plan(args, {}, "qwen38")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            q3.parse_args(["--dry-run", "--no-stock-arm", "--stock-record", record])  # exactly one --family
+        default, _ = q3.build_plan(self.args(), {}, "qwen38")  # the default campaign is unchanged
+        self.assertEqual((default["measured_arms"], default["declared"]["stock"]["label"]),
+                         (["stock", "experiment", "peer"], "v0.1.28 release"))
+        self.assertNotIn("stock_record", default)
+
+    def test_the_record_must_be_a_complete_same_artifact_stock_primary(self):
+        record = self.record()
+        with mock.patch.object(q3, "STOCK_RECORD_FAMILIES", ("deepseek4",)), \
+                self.assertRaisesRegex(q3.qc.CampaignError, "--stock-record applies to deepseek4 only"):
+            q3.build_plan(self.no_stock("--stock-record", str(record)), {}, "qwen38")
+        with self.assertRaisesRegex(q3.qc.CampaignError, "is family qwen38, not gemma4"):
+            with mock.patch.object(q3, "STOCK_RECORD_FAMILIES", ("gemma4",)):
+                q3.build_plan(self.no_stock("--stock-record", str(record)), {}, "gemma4")
+        incomplete = self.root / "evidence" / "q3-incomplete"
+        incomplete.mkdir()
+        shutil.copyfile(record.parent / "campaign.json", incomplete / "campaign.json")
+        verdict = json.loads(record.read_text())
+        verdict["primary"]["status"] = "Running"
+        (incomplete / "verdict.json").write_text(json.dumps(verdict))
+        with self.assertRaisesRegex(q3.qc.CampaignError, r"is not a complete qwen38 primary \(stage Running\)"):
+            q3.build_plan(self.no_stock("--stock-record", str(incomplete / "verdict.json")), {}, "qwen38")
+        (incomplete / "campaign.json").write_text((record.parent / "campaign.json").read_text() + " ")
+        verdict["primary"]["status"] = "Complete"
+        (incomplete / "verdict.json").write_text(json.dumps(verdict))
+        with self.assertRaisesRegex(q3.qc.CampaignError, "does not bind"):
+            q3.build_plan(self.no_stock("--stock-record", str(incomplete / "verdict.json")), {}, "qwen38")
+        # a stock-record campaign is itself never a stock record
+        driver, _ = self.campaign(record)
+        q3.write_verdict(self.out, driver.run(), [], None)
+        self.out = self.out.parent / "q3-qwen38-again"
+        with self.assertRaisesRegex(q3.qc.CampaignError, "is a no-stock campaign itself"):
+            q3.build_plan(self.no_stock("--stock-record", str(self.out.parent / "q3-qwen38-ds4file" / "verdict.json")),
+                          {}, "qwen38")
+        # nor is a native-peer campaign
+        native = self.root / "evidence" / "q3-deepseek4-native"
+        native.mkdir()
+        document = native_manifest("ds4")
+        document.update(schema=q3.SCHEMA, identities_sha256=q3.qc.plan_sha256(document["identities"]))
+        (native / "campaign.json").write_text(json.dumps(document))
+        q3.save(native / "verdict.json", q3_report.compute_verdict(document, campaign_sha256=q3.sha256(native / "campaign.json")))
+        with mock.patch.object(q3, "STOCK_RECORD_FAMILIES", ("deepseek4",)), \
+                self.assertRaisesRegex(q3.qc.CampaignError, "is a native campaign"):
+            q3.build_plan(self.no_stock("--stock-record", str(native / "verdict.json")), {}, "deepseek4")
+
+    def test_binding_launch_and_a_win_from_the_bound_record(self):
+        record = self.record()
+        recorded = json.loads(record.read_text())
+        driver, runner = self.campaign(record)
+        plan = driver.plan
+        self.assertEqual((plan["measured_arms"], plan["declared"]["stock"], set(plan["arms"])),
+                         (["experiment", "peer"], None, {"experiment", "peer"}))
+        bound = plan["stock_record"]
+        self.assertEqual((bound["verdict"], bound["campaign"]),
+                         ({"path": str(record), "sha256": q3.sha256(record)},
+                          {"path": str(record.parent / "campaign.json"), "sha256": q3.sha256(record.parent / "campaign.json")}))
+        self.assertEqual((bound["family"], bound["primary_status"], bound["stock_binary_sha256"],
+                          bound["experiment_binary_sha256"], bound["artifact_sha256"], bound["stock"]["label"]),
+                         ("qwen38", "Complete", STOCK_SHA, EXP_SHA, MODEL_SHA, "v0.1.28 release"))
+        self.assertEqual(q3_identity.launch_problems(plan, self.ids(plan)), [])  # no --stock-bin/--stock-commit needed
+        manifest = driver.run()
+        self.assertEqual((manifest["status"], manifest["stages"][0]["stop"]), ("Complete", {"reason": "precision", "blocks": 5}))
+        self.assertEqual({c[1] for c in runner.calls}, {"experiment", "peer"})
+        self.assertEqual(set(q3_report.required_effects(manifest["stages"][0], manifest)), {"vs_peer"})
+        verdict = q3.write_verdict(self.out, manifest, [], None)
+        self.assertEqual(verdict["verdict"], "Win", verdict["reasons"])
+        self.assertNotIn("vs_stock", verdict["primary"]["effects"])
+        self.assertEqual(verdict["stock_record"]["effects"]["vs_stock"], recorded["primary"]["effects"]["vs_stock"])
+        self.assertEqual(verdict["stock_record"]["secondary"]["worst_slot_ttft_p95_s"]["vs_stock"],
+                         recorded["primary"]["secondary"]["worst_slot_ttft_p95_s"]["vs_stock"])
+        self.assertEqual((verdict["stock_record"]["status"], verdict["stock_record"]["path"],
+                          verdict["stock_record"]["sha256"]), ("Complete", str(record), q3.sha256(record)))
+        # the plan, binding included, is what a resume reproduces
+        self.assertEqual(q3.qc.plan_sha256(self.campaign(record)[0].plan), manifest["plan_sha256"])
+
+    def test_experiment_binary_mismatch_is_refused_at_launch_and_halts_before_a_run(self):
+        record = self.record()
+        driver, _ = self.campaign(record)
+        ids = self.ids(driver.plan)
+        ids["arms"]["experiment"]["binary"]["sha256"] = "0" * 64
+        self.assertIn(f"the stock record {record} was measured on experiment binary {EXP_SHA}, not this campaign's "
+                      f"--experiment-bin ({'0' * 64})", q3_identity.launch_problems(driver.plan, ids))
+        with self.assertRaisesRegex(q3.qc.CampaignError, "was measured on experiment binary"):
+            self.campaign(record, identify=lambda: ids)[0].run()
+        calls = itertools.count()
+
+        def identify():
+            current = self.ids(plan)
+            if next(calls) > 4:  # the experiment binary is rebuilt mid-campaign
+                current["arms"]["experiment"]["binary"]["sha256"] = "0" * 64
+            return current
+        self.out = self.out.parent / "q3-qwen38-rebuilt"
+        driver, _ = self.campaign(record, identify=identify)
+        plan = driver.plan
+        manifest = driver.run()
+        self.assertEqual(manifest["status"], "IdentityDrift")
+        self.assertIn("arms.experiment.binary.sha256", manifest["identity_drift"])
+
+    def test_a_record_changed_after_binding_halts_the_campaign(self):
+        record = self.record()
+        original = record.read_bytes()
+        driver, _ = self.campaign(record)
+        record.write_bytes(original + b" ")
+        self.assertIn(f"the stock record {record} changed since the campaign bound it (freeze the record read-only "
+                      "before binding)", q3_identity.launch_problems(driver.plan, self.ids(driver.plan)))
+        record.write_bytes(original)
+
+        def decide(arm, workload, call):
+            if call == 4:
+                record.write_bytes(original + b"\n")  # the record is recomputed while the campaign runs
+            return self.win(arm, workload, call)
+        driver, _ = self.campaign(record, decide=decide)
+        manifest = driver.run()
+        self.assertEqual(manifest["status"], "IdentityDrift")
+        self.assertEqual(manifest["identity_drift"], ["stock_record.verdict"])
+        with self.assertRaises(q3.qc.CampaignError):
+            self.campaign(record)[0].run(resume=True)
+        verdict = q3_report.compute_verdict(manifest)  # a changed record never supplies a vs-stock effect
+        self.assertEqual((verdict["verdict"], verdict["stock_record"]["status"]), ("Pending", "Changed"))
+        self.assertEqual(verdict["reasons"], [f"the bound stock record {record} is Changed: {record} changed since the "
+                                              "campaign bound it; no vs-stock effect"])
+        record.unlink()
+        self.assertEqual(q3_report.compute_verdict(manifest)["stock_record"]["status"], "Missing")
+
+    def test_failures_thermal_and_memory_come_from_both_campaigns(self):
+        def control_failure(arm, workload, call):  # the record's n1 control stops on an experiment failure
+            return {"outcome": "fail"} if arm == "experiment" and workload == "n1" else self.win(arm, workload, call)
+        record = self.record(decide=control_failure, workloads="n4,n1", thermal=lambda: 2)
+        recorded = json.loads(record.read_text())
+        self.assertTrue(recorded["experiment_failures"])
+        self.assertIs(recorded["thermal_valid"], False)
+        driver, _ = self.campaign(record)
+        verdict = q3.write_verdict(self.out, driver.run(), [], None)
+        self.assertEqual(verdict["experiment_failures"], [f"{f} (stock record {record})" for f in recorded["experiment_failures"]])
+        self.assertIs(verdict["thermal_valid"], False)
+        self.assertEqual(verdict["verdict"], "Failed")
+        self.assertIn(f"(stock record {record})", verdict["reasons"][0])
+        self.assertEqual(q3_report.tristate_and(True, None), None)
+        self.assertEqual((q3_report.tristate_and(True, True), q3_report.tristate_and(None, False)), (True, False))
+
+    def test_family_verdict_names_the_record_and_waits_for_it(self):
+        source = {"record": "/e/q3/verdict.json", "sha256": "f" * 64, "status": "Complete", "reason": None}
+        named = " (from the bound stock record /e/q3/verdict.json, sha256 " + "f" * 64 + ")"
+        self.assertEqual(q3_stats.family_verdict(state(stock_source=source)), ("Win", []))
+        verdict, reasons = q3_stats.family_verdict(state(stock_source=source, vs_stock=effect_of([1.0] * 5),
+                                                         fairness={"worst_slot_ttft_p95_s": effect_of([1.2] * 5)}))
+        self.assertEqual(verdict, "Inconclusive")
+        self.assertIn("no demonstrated makespan gain over stock (95% CI of the ratio reaches 1)" + named, reasons)
+        self.assertIn("fairness regression vs stock: worst_slot_ttft_p95_s" + named, reasons)
+        wide = effect_of([0.5, 0.9, 0.6, 0.95, 0.7])
+        self.assertTrue(q3_stats.family_verdict(state(stock_source=source, vs_stock=wide))[1][0].endswith(named))
+        for status in ("Missing", "Changed", "Running"):
+            with self.subTest(status=status):
+                verdict, reasons = q3_stats.family_verdict(state(stock_source={**source, "status": status, "reason": "r"}))
+                self.assertEqual(verdict, "Pending")
+                self.assertEqual(reasons, [f"the bound stock record /e/q3/verdict.json is {status}: r; no vs-stock effect"])
+
+    def test_rows_cite_the_record_for_the_vs_stock_effect(self):
+        record = self.record()
+        driver, _ = self.campaign(record)
+        q3.write_verdict(self.out, driver.run(), [], None)
+        record_ref = "$E/evidence/q3-qwen38/verdict.json"
+        for of_record in (False, True):
+            with self.subTest(of_record=of_record):
+                rows = q3_report.rows(self.out, self.root, of_record)  # --of-record is accepted for this mode
+                [group] = rows["groups"].values()
+                self.assertIn(f"4 slots; stock v0.1.28 release on hf2q's artifact, from record {record_ref}; experiment "
+                              "hf2q 22222222 vs the peer, Williams blocks.", group["workload"])
+                stock = [r for r in rows["rows"] if r.get("baseline_arm") == "v0128_stock"]
+                self.assertEqual({r["metric"] for r in stock},
+                                 {"makespan_s", *(q3_report.f2_q3_tier.FAIRNESS if of_record else ())})
+                ms = next(r for r in stock if r["metric"] == "makespan_s")
+                self.assertEqual(ms["verification"]["key"], "verdict.json stock_record.effects.vs_stock.improvement_percent")
+                self.assertEqual((ms["artifact_sha256"], ms["receipt"]),
+                                 (MODEL_SHA, f"$E/evidence/q3-qwen38-ds4file/verdict.json"))
+                self.assertIn(f"(baseline stock v0.1.28 release, from the same-artifact record {record_ref} on hf2q's "
+                              "artifact)", ms["note"])
+                peer = next(r for r in rows["rows"] if r.get("baseline_arm") == "peer" and r["metric"] == "makespan_s")
+                self.assertEqual(peer["artifact_sha256"], DS4_ART)
+                board = {"schema": f2.ROWS_SCHEMA, "evidence_root_symbol": "$E", "evidence_root_description": "test",
+                         "neutral_band_ratio": 1.025, "neutral_band_basis": "test",
+                         "families": {"qwen38": {"title": "Qwen3.8 27B", "artifact_sha256": DS4_ART, "note": ""}}, **rows}
+                f2.validate_manifest(board)
+                self.assertEqual(f2.verify_rows(board, self.root), [r["id"] for r in rows["rows"]])
+                if of_record:
+                    self.assertEqual(group["q3_record"]["stock_record"],
+                                     {"verdict_ref": record_ref, "artifact_sha256": MODEL_SHA, "stock_label": "v0.1.28 release"})
+                    line = next(l for l in f2.render(board, [], "0" * 64).splitlines() if l.startswith("| Qwen3.8 27B | "))
+                    self.assertIn("sooner than v0.1.28 stock (hf2q artifact record) (95% CI", line)
+                    self.assertIn("| vs stock (hf2q artifact record): TTFT p95 ", line)
 
 
 if __name__ == "__main__":
