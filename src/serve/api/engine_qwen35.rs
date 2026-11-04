@@ -4493,6 +4493,9 @@ pub(in crate::serve::api) struct Qwen35CoherentTarget {
 #[path = "engine_qwen35/joint_decode.rs"]
 mod joint_decode;
 pub(in crate::serve::api) use joint_decode::Qwen35JointLane;
+#[path = "engine_qwen35/k3_transaction.rs"]
+mod k3_transaction;
+use k3_transaction::K3_VERIFY_ROWS;
 #[cfg(test)]
 #[path = "engine_qwen35/speculation_qualification_tests.rs"]
 mod speculation_qualification_tests;
@@ -5758,337 +5761,32 @@ impl Qwen35DecodeState {
     /// reconciles the MTP K/V cache.
     /// Partial rejection commits the valid prefix directly from captured
     /// target state; no ordinary replay is required.
+    /// The transaction units live in `k3_transaction` (ADR-065 J1); this
+    /// wrapper keeps the solo-only policy: warm-up fallback, phase profile,
+    /// proposer timing and the cost controller.
     fn decode_tick_mtp_k3(
         &mut self,
         qwen: &mut Qwen35LoadedModel,
         kv_cache: &mut HybridKvCache,
         supervisor: &EngineSupervisor,
     ) -> Result<Qwen35TickOutcome> {
-        const DRAFT_DEPTH: usize = 3;
-        const VERIFY_ROWS: usize = DRAFT_DEPTH + 1;
-
         if let Some(token) = take_pending_speculation_output(&mut self.pending_speculation_output) {
             return self.commit_speculation_output(qwen, token);
         }
         let remaining = self.max_tokens.saturating_sub(self.generated_tokens.len());
-        if remaining < VERIFY_ROWS || !self.mtp_cost.may_speculate() {
+        if remaining < K3_VERIFY_ROWS || !self.mtp_cost.may_speculate() {
             return self.decode_tick_mtp_warmup(qwen, kv_cache, supervisor);
         }
 
         let round_started = Instant::now();
         let phase_profile = std::env::var("HF2Q_MTP_PHASE_PROFILE").as_deref() == Ok("1");
-        let next_token = *self
-            .generated_tokens
-            .last()
-            .context("Qwen SlotAware MTP K3 needs a seeded output token")?;
-        let next_pos = (self.decode_position_base + self.generated_tokens.len() - 1) as i32;
-        let prior_target_len = kv_cache
-            .sequence_len_for_slot(self.slot_id)
-            .context("Qwen SlotAware MTP K3 read target cursor")?;
-        let prior_mtp_len = mtp_cursor_for_slot(kv_cache, self.slot_id)?;
-        anyhow::ensure!(
-            prior_target_len == prior_mtp_len,
-            "Qwen SlotAware MTP K3 requires equal entry cursors (target={prior_target_len}, mtp={prior_mtp_len})"
-        );
-
-        let mtp = qwen
-            .model
-            .mtp
-            .as_ref()
-            .context("Qwen SlotAware MTP K3 weights missing")?;
-        let initial_hidden = &self
-            .mtp
-            .as_ref()
-            .context("Qwen SlotAware MTP K3 state missing")?
-            .verifier_hidden;
-        if let Err(error) = qwen.model.with_gpu_cache_mut(|device, _registry| {
-            kv_cache
-                .ensure_la_capture(&qwen.model.cfg, device, VERIFY_ROWS as u32)
-                .context("Qwen SlotAware MTP K3 allocate recurrent capture")
-        }) {
-            kv_cache.clear_la_capture();
-            return Err(error);
-        }
-        let draft_lease = match supervisor.arm(
-            "Qwen35 SlotAware MTP K3 draft",
-            QWEN35_WORKER_TRANSACTION_TIMEOUT,
-        ) {
-            Ok(lease) => lease,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                return Err(error.context("Qwen SlotAware MTP K3 draft admission"));
-            }
-        };
-        let drafted = qwen.model.with_gpu_cache_mut(|device, registry| {
-            let mut drafts = Vec::with_capacity(DRAFT_DEPTH);
-            let mut chain_hidden: Option<MlxBuffer> = None;
-            let mut chain_token = next_token;
-            for depth in 0..DRAFT_DEPTH {
-                let shared_embed =
-                    qwen.model
-                        .embed_tokens_gpu_in_context(&[chain_token], device, registry)?;
-                let previous = chain_hidden.as_ref().unwrap_or(initial_hidden);
-                let (token, next_hidden) = mtp.forward_draft_greedy_for_token(
-                    previous,
-                    chain_token,
-                    &shared_embed,
-                    kv_cache,
-                    self.slot_id,
-                    &[next_pos + depth as i32; 4],
-                    device,
-                    registry,
-                    &qwen.model.cfg,
-                )?;
-                drafts.push(token);
-                chain_token = token;
-                chain_hidden = Some(next_hidden);
-            }
-            Ok::<_, anyhow::Error>(drafts)
-        });
-        let draft_supervision = draft_lease.finish();
-        if let Err(error) = draft_supervision.and(
-            drafted
-                .as_ref()
-                .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("{e:#}")),
-        ) {
-            kv_cache.clear_la_capture();
-            return rollback_slot_mtp_draft_error(
-                kv_cache,
-                self.slot_id,
-                prior_mtp_len,
-                error,
-                "Qwen SlotAware MTP K3 draft",
-            );
-        }
-        let drafts = drafted.expect("draft result checked above");
-        if let Err(error) = kv_cache.truncate_mtp_to_for_slot(self.slot_id, prior_mtp_len) {
-            kv_cache.clear_la_capture();
-            return rollback_slot_mtp_draft_error(
-                kv_cache,
-                self.slot_id,
-                prior_mtp_len,
-                error,
-                "Qwen SlotAware MTP K3 discard speculative draft cache",
-            );
-        }
-        #[cfg(test)]
-        q1_speculation::first_fork::after_draft_discard(next_pos, kv_cache)?;
+        let entry = self.k3_entry(kv_cache)?;
+        let draft = self.k3_draft(qwen, kv_cache, supervisor, entry)?;
         let draft_elapsed = round_started.elapsed();
-        #[cfg(test)]
-        let drafts = q1_speculation::after_drafts(next_pos, prior_target_len, prior_mtp_len, drafts)?;
-
-
-        let mut verify_input = Vec::with_capacity(VERIFY_ROWS);
-        verify_input.push(next_token);
-        verify_input.extend_from_slice(&drafts);
-        let verify_positions = crate::inference::models::qwen35::spec_decode::positions_for_range(
-            next_pos,
-            VERIFY_ROWS,
-        );
-        let verify_lease = match supervisor.arm(
-            "Qwen35 SlotAware MTP K3 verify",
-            QWEN35_WORKER_TRANSACTION_TIMEOUT,
-        ) {
-            Ok(lease) => lease,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                return Err(error.context("Qwen SlotAware MTP K3 verify admission"));
-            }
-        };
-        let verify_started = Instant::now();
-        let verified = {
-            let _native_role = crate::inference::native_observation::target_verify();
-            qwen.model.forward_gpu_with_nextn_hidden_buffer(
-                &verify_input,
-                &verify_positions,
-                kv_cache,
-                self.slot_id,
-            )
-        };
-        let verify_supervision = verify_lease.finish();
-        let (mut verify_logits, verify_hidden) = match (verify_supervision, verified) {
-            (Ok(()), Ok(value)) => value,
-            (supervision, forward) => {
-                let error = supervision
-                    .err()
-                    .or_else(|| forward.err())
-                    .expect("failed verification has an error");
-                kv_cache.clear_la_capture();
-                kv_cache.reset_for_slot(self.slot_id).with_context(|| {
-                    format!("Qwen SlotAware MTP K3 verify failed ({error:#}); fail-closed reset")
-                })?;
-                return Err(error.context("Qwen SlotAware MTP K3 verify"));
-            }
-        };
-        #[cfg(test)]
-        q1_speculation::first_fork::verifier_pre_catchup(next_pos, &verify_logits, &verify_hidden)?;
-        let verify_elapsed = verify_started.elapsed();
-        let vocab = qwen.vocab_size;
-        if verify_logits.element_count() != VERIFY_ROWS * vocab
-            || verify_hidden.element_count() != VERIFY_ROWS * qwen.model.cfg.hidden_size as usize
-        {
-            let error = anyhow::anyhow!(
-                "Qwen SlotAware MTP K3 verify shape mismatch: logits={} expected={}, hidden={} expected={}",
-                verify_logits.element_count(),
-                VERIFY_ROWS * vocab,
-                verify_hidden.element_count(),
-                VERIFY_ROWS * qwen.model.cfg.hidden_size as usize,
-            );
-            kv_cache.clear_la_capture();
-            kv_cache
-                .reset_for_slot(self.slot_id)
-                .context("Qwen SlotAware MTP K3 shape failure reset")?;
-            return Err(error);
-        }
-
-        let embed_started = Instant::now();
-        let shared_embed_rows = match qwen.model.embed_tokens_gpu(&verify_input) {
-            Ok(rows) => rows,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 embedding failure reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 verifier embeddings"));
-            }
-        };
-        let embed_elapsed = embed_started.elapsed();
-        let catchup_lease = match supervisor.arm(
-            "Qwen35 SlotAware MTP K3 target catch-up",
-            QWEN35_WORKER_TRANSACTION_TIMEOUT,
-        ) {
-            Ok(lease) => lease,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 catch-up admission reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 catch-up admission"));
-            }
-        };
-        let catchup_started = Instant::now();
-        let caught_up = qwen.model.with_gpu_cache_mut(|device, registry| {
-            mtp.process_target_batch(
-                &verify_input,
-                Some(initial_hidden),
-                &verify_hidden,
-                &shared_embed_rows,
-                kv_cache,
-                self.slot_id,
-                &verify_positions,
-                device,
-                registry,
-                &qwen.model.cfg,
-            )
-        });
-        let catchup_supervision = catchup_lease.finish();
-        if let Err(error) = catchup_supervision.and(caught_up) {
-            kv_cache.clear_la_capture();
-            kv_cache.reset_for_slot(self.slot_id).with_context(|| {
-                format!("Qwen SlotAware MTP K3 catch-up failed ({error:#}); fail-closed reset")
-            })?;
-            return Err(error.context("Qwen SlotAware MTP K3 target catch-up"));
-        }
-        let catchup_elapsed = catchup_started.elapsed();
-
-        #[cfg(test)]
-        q1_speculation::verified_buffers(next_pos, &verify_logits, &verify_hidden)?;
-        let verify_logits = match verify_logits.as_mut_slice::<f32>() {
-            Ok(logits) => logits,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 logits view failure reset")?;
-                return Err(anyhow::anyhow!("{error}").context("Qwen SlotAware MTP K3 logits view"));
-            }
-        };
-        let semantic_started = Instant::now();
-        let mut semantic = Qwen35SpecSemanticState::from_decode(self);
-        let plan = match plan_qwen35_verified_block(&drafts, |row| {
-            let start = row * vocab;
-            let decision = semantic.select_and_observe(
-                qwen,
-                &self.params,
-                &mut verify_logits[start..start + vocab],
-            )?;
-            #[cfg(test)]
-            q1_speculation::canonical_decision(next_pos, row, decision.token, decision.terminal)?;
-            Ok(decision)
-        }) {
-            Ok(plan) => plan,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 semantic failure reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 canonical accept walk"));
-            }
-        };
-        let semantic_elapsed = semantic_started.elapsed();
-
-        let committed_cursor = prior_target_len + plan.valid_input_tokens as u32;
-        let state_started = Instant::now();
-        let mut rollback_elapsed = Duration::ZERO;
-        let state_result = (|| -> Result<()> {
-            kv_cache
-                .truncate_full_attn_to_for_slot(self.slot_id, committed_cursor)
-                .context("Qwen SlotAware MTP K3 target truncate")?;
-            kv_cache
-                .truncate_mtp_to_for_slot(self.slot_id, committed_cursor)
-                .context("Qwen SlotAware MTP K3 MTP truncate")?;
-            if plan.valid_input_tokens < VERIFY_ROWS {
-                let rollback_started = Instant::now();
-                kv_cache
-                    .rollback_la_to(self.slot_id, plan.carry_hidden_row as u32)
-                    .context("Qwen SlotAware MTP K3 recurrent rollback")?;
-                rollback_elapsed = rollback_started.elapsed();
-            }
-            kv_cache.clear_la_capture();
-            kv_cache
-                .validate_speculative_cursors_for_slot(self.slot_id, committed_cursor as usize)
-                .context("Qwen SlotAware MTP K3 committed cursor equality")?;
-            Ok(())
-        })();
-        let state_elapsed = state_started.elapsed();
-        if let Err(error) = state_result {
-            kv_cache.clear_la_capture();
-            kv_cache.reset_for_slot(self.slot_id).with_context(|| {
-                format!("Qwen SlotAware MTP K3 commit failed ({error:#}); fail-closed reset")
-            })?;
-            return Err(error);
-        }
-
-        let carry_hidden = match crate::inference::models::qwen35::spec_decode::nth_hidden_row(
-            &verify_hidden,
-            qwen.model.cfg.hidden_size,
-            plan.carry_hidden_row as u64,
-        ) {
-            Ok(hidden) => hidden,
-            Err(error) => {
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 carry-hidden failure reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 carry hidden"));
-            }
-        };
-        self.mtp
-            .as_mut()
-            .expect("MTP state checked above")
-            .verifier_hidden = carry_hidden;
-        #[cfg(test)]
-        q1_speculation::state_committed(next_pos, kv_cache, &plan)?;
-        self.pending_speculation_output = plan.output;
-        self.terminal_after_pending = plan.terminal_after_pending;
-        super::qwen35_speculation::record_proposer_outcome(
-            super::qwen35_speculation::QwenSpeculationProposer::Mtp,
-            DRAFT_DEPTH,
-            plan.matched_drafts,
-            plan.rejected_drafts,
-            1,
-            0,
-        );
+        let rows = self.k3_verify_solo(qwen, kv_cache, supervisor, &draft)?;
+        let plan = self.k3_verify_to_plan(qwen, kv_cache, supervisor, draft, rows)?;
+        let timing = plan.timing;
+        let commit = self.k3_commit_solo(qwen, kv_cache, plan)?;
         let equivalent_decisions = equivalent_target_decisions(
             &self.pending_speculation_output,
             self.terminal_after_pending,
@@ -6098,20 +5796,20 @@ impl Qwen35DecodeState {
             eprintln!(
                 "[MTP_PHASE] draft={:.2}ms verify={:.2}ms embed={:.2}ms catchup={:.2}ms semantic={:.2}ms state={:.2}ms rollback={:.2}ms partial={} remainder={:.2}ms total={:.2}ms",
                 draft_elapsed.as_secs_f64() * 1000.0,
-                verify_elapsed.as_secs_f64() * 1000.0,
-                embed_elapsed.as_secs_f64() * 1000.0,
-                catchup_elapsed.as_secs_f64() * 1000.0,
-                semantic_elapsed.as_secs_f64() * 1000.0,
-                state_elapsed.as_secs_f64() * 1000.0,
-                rollback_elapsed.as_secs_f64() * 1000.0,
-                plan.valid_input_tokens < VERIFY_ROWS,
+                timing.verify.as_secs_f64() * 1000.0,
+                timing.embed.as_secs_f64() * 1000.0,
+                timing.catchup.as_secs_f64() * 1000.0,
+                timing.semantic.as_secs_f64() * 1000.0,
+                commit.state_elapsed.as_secs_f64() * 1000.0,
+                commit.rollback_elapsed.as_secs_f64() * 1000.0,
+                commit.committed.valid_input_tokens < K3_VERIFY_ROWS,
                 round_elapsed
                     .saturating_sub(draft_elapsed)
-                    .saturating_sub(verify_elapsed)
-                    .saturating_sub(embed_elapsed)
-                    .saturating_sub(catchup_elapsed)
-                    .saturating_sub(semantic_elapsed)
-                    .saturating_sub(state_elapsed)
+                    .saturating_sub(timing.verify)
+                    .saturating_sub(timing.embed)
+                    .saturating_sub(timing.catchup)
+                    .saturating_sub(timing.semantic)
+                    .saturating_sub(commit.state_elapsed)
                     .as_secs_f64()
                     * 1000.0,
                 round_elapsed.as_secs_f64() * 1000.0,
