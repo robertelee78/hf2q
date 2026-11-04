@@ -290,10 +290,19 @@ fn hf2q_artifact_takes_none_of_the_ds4_file_routes() {
         crate::serve::quant_select::quant_type_from_gguf_path(&path).unwrap(),
         crate::serve::quant_select::QuantType::Q2_K
     );
-    assert_eq!(gguf.metadata_string("tokenizer.ggml.pre"), Some("deepseek-v3"));
+    assert_eq!(
+        gguf.metadata_string("tokenizer.ggml.pre"),
+        Some("deepseek-v3")
+    );
     let cfg = Deepseek4Config::from_gguf(&gguf).unwrap();
-    assert_eq!(gguf.metadata_u32("deepseek4.embedding_length_out"), Some(cfg.hidden_size_out));
-    assert_eq!(cfg.hidden_size_out, cfg.hidden_size * cfg.hyper_connection_count);
+    assert_eq!(
+        gguf.metadata_u32("deepseek4.embedding_length_out"),
+        Some(cfg.hidden_size_out)
+    );
+    assert_eq!(
+        cfg.hidden_size_out,
+        cfg.hidden_size * cfg.hyper_connection_count
+    );
     assert!(gguf.metadata("deepseek4.swiglu_clamp_shexp").is_some());
     let Some(MetadataValue::Array(ratios)) = gguf.metadata("deepseek4.attention.compress_ratios")
     else {
@@ -311,11 +320,17 @@ fn hf2q_artifact_takes_none_of_the_ds4_file_routes() {
                 spec.name,
                 info.ggml_type
             );
-            *raw_types.entry(format!("{:?}", info.ggml_type)).or_default() += 1;
+            *raw_types
+                .entry(format!("{:?}", info.ggml_type))
+                .or_default() += 1;
         }
     }
     for name in ["token_embd.weight", "output_hc_fn.weight"] {
-        assert_eq!(gguf.tensor_info(name).unwrap().ggml_type, GgmlType::Q8_0, "{name}");
+        assert_eq!(
+            gguf.tensor_info(name).unwrap().ggml_type,
+            GgmlType::Q8_0,
+            "{name}"
+        );
     }
     eprintln!("hf2q artifact raw matrix types: {raw_types:?}");
 }
