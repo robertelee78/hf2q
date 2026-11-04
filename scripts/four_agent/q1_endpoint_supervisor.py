@@ -102,8 +102,9 @@ def case_plan(b, name):
     require(kind == 'localizer' and set(c) == LOCALIZER_CASE_KEYS and launch, 'closed localizer case: own filter/env/marker, no trajectory')
     return dict(kind=kind, mode='localizer', filter=c['filter'], packet_env=c['packet_env'], completion_marker=c['completion_marker'], marker_stream=c['marker_stream'])
 def packet_scope(plan, packet):
-    """The disabled packet matches its case kind: an endpoint carries its trajectory and no stores, a localizer no trajectory."""
-    if plan['kind'] == 'endpoint': return packet.get('trajectory') == plan['mode'] and not MULTISTORE_EXTENT_KEYS & set(packet)
+    """The disabled packet matches its case kind: an endpoint carries its trajectory and no multistore lanes/stores
+    (its own `host_payload_limit` is an ordinary endpoint field), a localizer no trajectory."""
+    if plan['kind'] == 'endpoint': return packet.get('trajectory') == plan['mode'] and not {'lanes', 'expected_stores', 'stage_localizer'} & set(packet)
     if plan['kind'] == 'localizer': return 'trajectory' not in packet
     return True  # multistore: the registry checks own the trajectory
 def multistore_extent(case, packet, manifest_bytes):

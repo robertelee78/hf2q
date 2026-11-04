@@ -238,8 +238,11 @@ class MultistorePlan(unittest.TestCase):
 
     def test_packet_scope_by_kind(self):
         endpoint = dict(kind="endpoint", mode="T2ActualCohort")
-        self.assertTrue(s.packet_scope(endpoint, {"trajectory": "T2ActualCohort"}))
-        self.assertFalse(s.packet_scope(endpoint, {"trajectory": "T2ActualCohort", "expected_stores": {}}))
+        # Every reviewed endpoint packet carries its own host_payload_limit; that stays admitted.
+        self.assertTrue(s.packet_scope(endpoint, {"trajectory": "T2ActualCohort", "host_payload_limit": 962391936}))
+        for extra in ({"expected_stores": {}}, {"lanes": [0, 1, 2, 3]}, {"stage_localizer": {}}):
+            self.assertFalse(s.packet_scope(endpoint, {"trajectory": "T2ActualCohort", **extra}))
+        self.assertFalse(s.packet_scope(endpoint, {"trajectory": "T0ColdSerial"}))
         self.assertFalse(s.packet_scope(dict(kind="localizer"), {"trajectory": "T0ColdSerial"}))
         self.assertTrue(s.packet_scope(dict(kind="multistore"), {"trajectory": "T2ActualCohort"}))
 
