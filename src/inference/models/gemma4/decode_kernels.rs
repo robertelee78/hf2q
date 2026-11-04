@@ -24,6 +24,9 @@ pub(crate) const ENV: &str = "HF2Q_GEMMA_DECODE_KERNELS";
 const BATCHED_FLASH_ENV: &str = "HF2Q_BATCHED_FLASH";
 const HYBRID_NWG_ENV: &str = "HF2Q_HYBRID_NWG";
 const TQ_NSG_ENV: &str = "HF2Q_TQ_NSG";
+/// KV regime selector (`INVESTIGATION_ENV.hybrid_kv`, default on); the
+/// GQA mixed-bucket lever only covers the hybrid F16-K regime.
+const HYBRID_KV_ENV: &str = "HF2Q_HYBRID_KV";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Switch {
@@ -41,19 +44,24 @@ pub(crate) fn parse_switch(raw: Option<&str>) -> Result<Switch> {
     }
 }
 
-/// Decode attention route under the adopted set. Only today's vec-hybrid
-/// route exists; the A1/A2 levers (design §4.5) are added here and consumed
-/// by the batched body's attention call sites.
+/// Decode attention route under the adopted set (design §4.5), consumed by
+/// the hybrid-regime flash gate of the batched body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttentionLever {
     /// `flash_attn_vec_hybrid_batched` plus the per-slot fallback (stock).
     VecHybrid,
+    /// Lever A (A1 GQA-grouped + A2 mixed-bucket):
+    /// `flash_attn_vec_hybrid_batched_gqa` on every step, each slot at its own
+    /// stock `(nwg, nsg)` bucket and the largest legal group size; no
+    /// per-slot fallback for mixed-bucket steps.
+    GqaMixedBucket,
 }
 
 impl AttentionLever {
     pub(crate) fn name(self) -> &'static str {
         match self {
             AttentionLever::VecHybrid => "vec_hybrid",
+            AttentionLever::GqaMixedBucket => "gqa_mixed_bucket",
         }
     }
 }
@@ -84,7 +92,7 @@ pub(crate) const ADOPTED_LEVERS: Levers = Levers {
     expert_grouped_q4k: true,
     expert_grouped_q5_0: true,
     expert_grouped_q8_0: true,
-    attention: AttentionLever::VecHybrid,
+    attention: AttentionLever::GqaMixedBucket,
 };
 
 impl Levers {
@@ -112,6 +120,9 @@ pub(crate) struct AttentionEnv {
     pub batched_flash: Option<String>,
     pub hybrid_nwg: Option<String>,
     pub tq_nsg: Option<String>,
+    /// `HF2Q_HYBRID_KV` turned the hybrid regime off (full-TQ decode), as
+    /// engine.rs selects the batched decode `BatchedKvRegime`.
+    pub full_tq: bool,
 }
 
 impl AttentionEnv {
@@ -120,6 +131,7 @@ impl AttentionEnv {
             batched_flash: std::env::var(BATCHED_FLASH_ENV).ok(),
             hybrid_nwg: std::env::var(HYBRID_NWG_ENV).ok(),
             tq_nsg: std::env::var(TQ_NSG_ENV).ok(),
+            full_tq: !crate::debug::INVESTIGATION_ENV.hybrid_kv,
         }
     }
 }
@@ -172,6 +184,13 @@ impl GemmaDecodeKernels {
             env.tq_nsg.is_none(),
             format!("{TQ_NSG_ENV} must be unset, got {:?}", env.tq_nsg),
         );
+        need(
+            !(env.full_tq && levers.attention == AttentionLever::GqaMixedBucket),
+            format!(
+                "{HYBRID_KV_ENV} must keep the hybrid KV regime on: attention lever {} has no full-TQ route",
+                levers.attention.name()
+            ),
+        );
         if !refused.is_empty() {
             bail!(
                 "{ENV}=1 refused: the exact decode routes need the stock reference kernels: {}",
@@ -223,7 +242,7 @@ impl GemmaDecodeKernels {
             .then_some(&self.expert_policy)
     }
 
-    /// Attention route of the adopted set (hook for A1/A2).
+    /// Attention route of the adopted set.
     pub(crate) fn attention(&self) -> AttentionLever {
         self.levers.attention
     }
@@ -356,6 +375,18 @@ mod tests {
     }
 
     #[test]
+    fn decode_kernels_refuses_gqa_mixed_bucket_under_full_tq() {
+        let full_tq = AttentionEnv { full_tq: true, ..Default::default() };
+        let e = GemmaDecodeKernels::adopt(GgmlRoutingPolicy::default(), &full_tq, ADOPTED_LEVERS)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(ENV) && e.contains(HYBRID_KV_ENV) && e.contains("gqa_mixed_bucket"), "{e}");
+        // The stock attention lever has no full-TQ restriction.
+        let stock_attn = Levers { attention: AttentionLever::VecHybrid, ..ADOPTED_LEVERS };
+        assert!(GemmaDecodeKernels::adopt(GgmlRoutingPolicy::default(), &full_tq, stock_attn).is_ok());
+    }
+
+    #[test]
     fn decode_kernels_derives_three_policies_from_base() {
         // A non-default but reference-holding base must carry through.
         let base = GgmlRoutingPolicy {
@@ -388,7 +419,7 @@ mod tests {
             }
         );
         assert!(!body.dense_row_tiled_m1 && !head.dense_row_tiled_m1);
-        assert_eq!(k.attention(), AttentionLever::VecHybrid);
+        assert_eq!(k.attention(), AttentionLever::GqaMixedBucket);
 
         let none = Levers {
             dense_row_tiled_q4k: false,
@@ -405,6 +436,7 @@ mod tests {
         assert_eq!(*k.body_policy_for(GgmlType::Q6_K).unwrap(), base);
         assert_eq!(*k.expert_policy_for(GgmlType::Q4_K).unwrap(), base);
         assert!(k.lm_head_policy_for(GgmlType::Q6_K).is_none(), "unadopted head stays stock");
+        assert_eq!(k.attention(), AttentionLever::VecHybrid, "the stock attention lever is selectable");
     }
 
     #[test]
@@ -429,7 +461,7 @@ mod tests {
             banner(Some(&adopted())),
             "gemma decode kernels: HF2Q_GEMMA_DECODE_KERNELS=1 levers=[dense_row_tiled_q4k,\
              dense_row_tiled_q6k,dense_mn_q5_0,dense_mn_q8_0,lm_head_row_tiled_q6k,\
-             expert_grouped_q4k,expert_grouped_q5_0,expert_grouped_q8_0] attention=vec_hybrid \
+             expert_grouped_q4k,expert_grouped_q5_0,expert_grouped_q8_0] attention=gqa_mixed_bucket \
              base: dense_q6k_mv_nr2=true dense_q8_0_mv_nr2=true expert_q8_0_mv_nr2=false \
              dense_decode_mv_ext=false"
         );
@@ -437,8 +469,21 @@ mod tests {
         let r = report(Some(&adopted()));
         assert_eq!(r["switch"], "1");
         assert_eq!(r["levers"].as_array().unwrap().len(), 8);
-        assert_eq!(r["attention"], "vec_hybrid");
+        assert_eq!(r["attention"], "gqa_mixed_bucket");
         assert_eq!(r["base"]["dense_q6k_mv_nr2"], true);
         assert_eq!(r["base"]["expert_q8_0_mv_nr2"], false);
+        // A set carrying the stock attention lever reports it.
+        let stock_attn = Levers { attention: AttentionLever::VecHybrid, ..ADOPTED_LEVERS };
+        let k = GemmaDecodeKernels::adopt(GgmlRoutingPolicy::default(), &AttentionEnv::default(), stock_attn)
+            .unwrap();
+        assert!(banner(Some(&k)).contains(" attention=vec_hybrid "), "{}", banner(Some(&k)));
+        assert_eq!(report(Some(&k))["attention"], "vec_hybrid");
+    }
+
+    #[test]
+    fn decode_kernels_attention_lever_names() {
+        assert_eq!(AttentionLever::VecHybrid.name(), "vec_hybrid");
+        assert_eq!(AttentionLever::GqaMixedBucket.name(), "gqa_mixed_bucket");
+        assert_eq!(ADOPTED_LEVERS.attention, AttentionLever::GqaMixedBucket);
     }
 }

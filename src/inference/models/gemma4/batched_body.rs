@@ -575,11 +575,10 @@ impl MlxModelWeights {
     }
 
     /// Attention route of the adopted decode set; [`AttentionLever::VecHybrid`]
-    /// (today's route) when `HF2Q_GEMMA_DECODE_KERNELS` is off. Hook for the
-    /// A1/A2 call sites.
+    /// (today's route) when `HF2Q_GEMMA_DECODE_KERNELS` is off. Read by the
+    /// hybrid-regime flash gate of [`Self::encode_one_layer_batched`].
     ///
     /// [`AttentionLever::VecHybrid`]: super::decode_kernels::AttentionLever::VecHybrid
-    #[allow(dead_code)]
     pub(crate) fn decode_attention_lever(&self) -> super::decode_kernels::AttentionLever {
         self.decode_kernels
             .as_ref()
@@ -998,8 +997,14 @@ impl MlxModelWeights {
                 // gated to same-(nwg,nsg)-bucket slots so the per-query math is bit-identical
                 // to the per-slot flash; mixed-bucket (e.g. staggered) slots fall back to the
                 // per-slot loop below.
-                let use_batched_flash =
-                    std::env::var("HF2Q_BATCHED_FLASH").as_deref() != Ok("0") && same_bucket;
+                // ADR-063 lever A (`AttentionLever::GqaMixedBucket`): the GQA-grouped
+                // flash runs each slot at its OWN (nwg, nsg) bucket in-kernel, so
+                // mixed-bucket steps take the batched branch too (batched KV encode,
+                // one flash, batched/per-slot undo as for same-bucket steps).
+                let gqa_flash = self.decode_attention_lever()
+                    == super::decode_kernels::AttentionLever::GqaMixedBucket;
+                let use_batched_flash = std::env::var("HF2Q_BATCHED_FLASH").as_deref() != Ok("0")
+                    && (same_bucket || gqa_flash);
                 // ROWDIFF probe (HF2Q_DECODE_TRACE): layer 0 only — dump per-slot
                 // seq_positions / ksl / cache_pos so we can tell whether staggered slot-0
                 // divergence is BOOKKEEPING (positions differ) or KV-CONTENT (identical).
@@ -1161,30 +1166,75 @@ impl MlxModelWeights {
                         ],
                         &[&bufs.sdpa_out, &bufs.sdpa_tmp],
                     );
-                    mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
-                        session.encoder_mut(),
-                        reg,
-                        dev,
-                        n as u32,
-                        &bufs.attn_q_normed,
-                        &buf.k,
-                        &buf.v_packed,
-                        &buf.v_norms,
-                        &bufs.sdpa_out,
-                        &bufs.sdpa_tmp,
-                        slot_id_buf,
-                        // ADR-059 (3c): sliding rings derive their per-query
-                        // read extents prompt-indexed (no graft rows in the
-                        // ring); full layers keep the absolute positions (the
-                        // graft rows participate in their reads).
-                        if is_ring {
-                            ring_positions_buf.unwrap_or(positions_buf)
-                        } else {
-                            positions_buf
-                        },
-                        &p_hyb,
-                    )
-                    .map_err(|e| anyhow::anyhow!("batched flash L{layer_idx}: {e}"))?;
+                    // ADR-059 (3c): sliding rings derive their per-query
+                    // read extents prompt-indexed (no graft rows in the
+                    // ring); full layers keep the absolute positions (the
+                    // graft rows participate in their reads).
+                    let flash_positions_buf: &MlxBuffer = if is_ring {
+                        ring_positions_buf.unwrap_or(positions_buf)
+                    } else {
+                        positions_buf
+                    };
+                    if gqa_flash {
+                        // ADR-063 lever A: one GQA-grouped dispatch, slot i at the
+                        // stock bucket of its own KV length (the per-slot fallback's
+                        // `compute_nwg`/`compute_nsg(kv_seq_len)`), reduced per
+                        // maximal same-NWG run with the stock reduce.
+                        use mlx_native::ops::flash_attn_vec_hybrid as fav;
+                        let buckets: Vec<fav::HybridSlotBucket> =
+                            (0..n).map(|i| fav::HybridSlotBucket::for_kv_seq_len(ksl_of(i))).collect();
+                        let bucket_nsg_max = buckets.iter().map(|b| b.nsg).max().unwrap_or(1);
+                        let group = fav::flash_attn_vec_hybrid_batched_gqa_pick_group(
+                            nh as u32,
+                            nkv as u32,
+                            hd as u32,
+                            bucket_nsg_max,
+                        );
+                        let tmp_need =
+                            fav::flash_attn_vec_hybrid_batched_gqa_tmp_bytes(nh as u32, hd as u32, &buckets)
+                                .map_err(|e| anyhow::anyhow!("gqa flash tmp plan L{layer_idx}: {e}"))?;
+                        if bufs.sdpa_tmp.byte_len() < tmp_need {
+                            anyhow::bail!(
+                                "gqa flash L{layer_idx}: sdpa_tmp holds {} bytes, the {n}-slot \
+                                 grouped flash needs {tmp_need}",
+                                bufs.sdpa_tmp.byte_len()
+                            );
+                        }
+                        fav::flash_attn_vec_hybrid_batched_gqa(
+                            session.encoder_mut(),
+                            reg,
+                            dev,
+                            &bufs.attn_q_normed,
+                            &buf.k,
+                            &buf.v_packed,
+                            &buf.v_norms,
+                            &bufs.sdpa_out,
+                            &bufs.sdpa_tmp,
+                            slot_id_buf,
+                            flash_positions_buf,
+                            &p_hyb,
+                            group,
+                            &buckets,
+                        )
+                        .map_err(|e| anyhow::anyhow!("gqa batched flash L{layer_idx}: {e}"))?;
+                    } else {
+                        mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
+                            session.encoder_mut(),
+                            reg,
+                            dev,
+                            n as u32,
+                            &bufs.attn_q_normed,
+                            &buf.k,
+                            &buf.v_packed,
+                            &buf.v_norms,
+                            &bufs.sdpa_out,
+                            &bufs.sdpa_tmp,
+                            slot_id_buf,
+                            flash_positions_buf,
+                            &p_hyb,
+                        )
+                        .map_err(|e| anyhow::anyhow!("batched flash L{layer_idx}: {e}"))?;
+                    }
                     // PHASE 3 — FWHT-undo. ATTNPRE: ONE batched undo over all N queries
                     // (num_heads=N*nh; kernel base=head_idx*hd over tight [N, nh*hd] ⇒
                     // bit-identical). Else per-slot.
