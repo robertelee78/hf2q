@@ -407,7 +407,10 @@ keys:
     S(L, kL) = 4096·kL (K F16) + 8192·kL (V F32; 0 under `_vcodes`)
              + 8192·L (Q F16) + 16384·L (O32)
              + 2·L·kL (mask; 0 with the in-kernel window)
-             + ceil(L/BQ)·ceil(kL/BK) (blk)
+             + max(32, ⌈ceil(L/BQ)·ceil(kL/BK) / 32⌉·32)
+               (blk: exactly `blk_buffer_byte_len`,
+                `flash_attn_prefill_blk.rs` 0.15.16 lines 188–212;
+                0 with the in-kernel window)
 
 Per global chunk with `L` rows:
 
