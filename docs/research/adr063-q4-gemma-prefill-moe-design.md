@@ -460,7 +460,11 @@ and simdgroup paths. Out of scope: `fused_gate_up_silu_mm_id_q6_K` and the
   `hids.element_count()` by `htpe.element_count()` and would otherwise
   reallocate on every call, moves to these accessors.
 - **Key invalidation.** A buffer access through the mutable accessors
-  invalidates the P2b schedule key.
+  invalidates the P2b schedule key. **Every kernel that writes the scratch
+  must take it through the invalidating mutable accessor**, including GPU
+  writers that only borrow the buffers today. Examples are the legacy `map0`
+  inside Qwen's fused gate/up-SiLU call (`gpu_ffn.rs:2896`) and any test
+  helper. A read accessor never hands out a buffer that a kernel writes.
 - **Capacity check.** `check_capacity(n_experts, n_tokens, top_k)` checks the
   experts, the tokens and `n_tokens·top_k ≤ capacity_rows`.
 
@@ -486,7 +490,11 @@ already in `scratch`. `IdMmScratch` records a schedule key at every `map0`
 encode. The key is:
 - the ids buffer's base address, offset and byte extent;
 - `n_tokens`, `top_k`, `n_experts`, the schedule kind;
-- the encoder identity and a per-scratch encode serial.
+- the encoder identity, meaning the `CommandEncoder` **object**, not its
+  current command buffer. A `commit_wait_and_rotate` keeps the encoder and the
+  schedule bytes, so it does not invalidate the key. A new session or encoder
+  does invalidate it;
+- a per-scratch encode serial.
 
 The new call validates that key against its own `(ids, n_tokens, top_k,
 n_experts)`, the current encoder and "no `map0` since". On any mismatch it
@@ -494,7 +502,11 @@ returns `InvalidArgument` before encoding.
 
 **hf2q integration.** hf2q does not let a valid mismatch become an error. The
 Gemma body tracks whether it rotated its session between gate/up and down.
-Rotation happens under `profile_buckets_on`:
+Rotation happens under `profile_buckets_on` or when an imatrix collector is
+installed. The imatrix intercept runs `commit_wait_and_rotate` between gate/up
+and down. That is safe under the encoder-object key, but the fallback covers it
+anyway so collection can never hit a propagated `InvalidArgument`:
+- an installed `ImatrixCollector` (`intercept_qmatmul_id_with_hint` active);
 - `HF2Q_PROFILE_MOE`;
 - `HF2Q_PROFILE_BUCKETS`;
 - `HF2Q_PROFILE_GPU_TS`, via `bucket_finish!` and the `moe_dn` pre-finish
