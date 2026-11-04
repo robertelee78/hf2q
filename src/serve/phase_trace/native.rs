@@ -41,6 +41,7 @@ impl WitnessManifest {
             "deepseek4.sorted_cache_lane",
             "deepseek4.prefill.actual_cooperative_lane",
             "deepseek4.prefill.actual_cooperative_pack",
+            "qwen35.joint_decode.actual_slot_rows",
         ];
         self.schema == "hf2q.f2.forward-witness-policy.v1"
             && self.operator == "target_input_rms_norm"
@@ -231,6 +232,25 @@ mod tests {
         manifest
             .input_sources
             .push("unreviewed_arbitrary_source".into());
+        assert!(!manifest.validate());
+    }
+    #[test]
+    fn qwen_traced_manifest_admits_the_joint_decode_source_once() {
+        let mut manifest = WitnessManifest {
+            schema: "hf2q.f2.forward-witness-policy.v1".into(),
+            operator: "target_input_rms_norm".into(),
+            input_sources: vec![
+                "qwen35.greedy.actual_tokens".into(),
+                "qwen35.forward.actual_tokens".into(),
+                "qwen35.joint_decode.actual_slot_rows".into(),
+            ],
+            coverage: "each_admitted_lane_in_first_fixed_window".into(),
+            batching_scope: "operator_only_full_body_unknown".into(),
+        };
+        assert!(manifest.validate());
+        manifest
+            .input_sources
+            .push("qwen35.joint_decode.actual_slot_rows".into());
         assert!(!manifest.validate());
     }
 }

@@ -76,6 +76,8 @@ mod real_artifact_joint_decode_tests;
 mod real_artifact_joint_decode_invariance_tests;
 #[cfg(test)]
 mod real_artifact_joint_decode_q1_tests;
+#[cfg(test)]
+mod real_artifact_joint_decode_witness_tests;
 pub mod kernels;
 pub mod kv_cache;
 pub mod model;

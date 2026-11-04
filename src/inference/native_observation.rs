@@ -1,12 +1,16 @@
 //! Explicit HF-side native observation. Never controls inference or scheduling.
 //! A caller supplies actual logical input spans; constructors do not infer rows.
+use crate::inference::models::qwen35::joint_decode_routes::MAX_JOINT_DECODE_ROWS;
 use mlx_native::submission_observer::{ObservationScope, ObservationStatus};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 mod witness;
+#[cfg(test)]
+pub(crate) use witness::take_hook_counts;
 pub(crate) use witness::{input, single_input, witness_command_rms_norm, witness_rms_norm, Input};
+use witness::{input_rows, JOINT_SOURCE};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -167,6 +171,39 @@ pub(crate) fn qwen_input(
             }],
         ),
         _ => input(source, &[]),
+    }
+}
+
+/// Joint ordinary decode: one actual one-token span per packed row, in matrix
+/// order (slot, fed position); `matrix_rows` is the physical packed width.
+/// Rows past the logical ones are padding and have no owner.
+pub(crate) fn joint_decode_input(
+    rows: impl Iterator<Item = (u32, i32)>,
+    matrix_rows: usize,
+) -> Input {
+    if !ARMED.load(Ordering::Acquire) {
+        return input(JOINT_SOURCE, &[]);
+    }
+    let spans: Option<Vec<InputSpan>> = rows
+        .take(MAX_JOINT_DECODE_ROWS + 1)
+        .map(|(slot, position)| {
+            Some(InputSpan {
+                slot,
+                start: u64::try_from(position).ok()?,
+                count: 1,
+            })
+        })
+        .collect();
+    match spans {
+        Some(spans)
+            if !spans.is_empty()
+                && spans.len() <= matrix_rows
+                && matrix_rows <= MAX_JOINT_DECODE_ROWS =>
+        {
+            // Both bounded by MAX_JOINT_DECODE_ROWS above.
+            input_rows(JOINT_SOURCE, &spans, (matrix_rows - spans.len()) as u32)
+        }
+        _ => input(JOINT_SOURCE, &[]),
     }
 }
 
@@ -581,6 +618,43 @@ fn attach(encoder: &mut mlx_native::CommandEncoder) {
         crate::serve::phase_trace::invalidate("native session observation refused");
     } else {
         encoder.set_observation_scope(current);
+    }
+}
+
+/// GPU-test stand-in for an armed owning-worker transaction: arms the
+/// process-global observer and binds `owners` as this thread's selected and
+/// live owners under a fresh epoch. Its test must run alone (`--exact`).
+#[cfg(test)]
+pub(crate) struct ArmedTransaction {
+    previous_owners: Vec<crate::serve::phase_trace::SlotState>,
+    _invocation: Invocation,
+}
+#[cfg(test)]
+impl Drop for ArmedTransaction {
+    fn drop(&mut self) {
+        OWNERS.with(|value| *value.borrow_mut() = std::mem::take(&mut self.previous_owners));
+        ARMED.store(false, Ordering::Release);
+    }
+}
+#[cfg(test)]
+pub(crate) fn armed_transaction_for_test(
+    owners: Vec<crate::serve::phase_trace::SlotState>,
+) -> ArmedTransaction {
+    assert!(
+        !ARMED.swap(true, Ordering::AcqRel),
+        "native observer already armed"
+    );
+    let previous_owners = OWNERS.with(|value| value.replace(owners.clone()));
+    let previous = SELECTED.with(|value| value.replace(owners));
+    let epoch = next_id().expect("native scope identity");
+    let previous_epoch = EPOCH.with(|value| value.replace(epoch));
+    ArmedTransaction {
+        previous_owners,
+        _invocation: Invocation {
+            previous: Some(previous),
+            previous_epoch,
+            _thread_bound: PhantomData,
+        },
     }
 }
 

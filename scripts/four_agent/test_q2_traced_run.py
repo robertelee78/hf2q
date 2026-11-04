@@ -111,7 +111,8 @@ class RunIdentityTest(unittest.TestCase):
                          {"event_limit": 8_000_000, "metadata_limit_bytes": 16 * 1024 ** 2,
                           "diagnostic_case": True, "control_nonce": NONCE})
         self.assertEqual(cfg["native_observer"]["witness_manifest"]["input_sources"],
-                         ["qwen35.greedy.actual_tokens", "qwen35.forward.actual_tokens"])
+                         ["qwen35.greedy.actual_tokens", "qwen35.forward.actual_tokens",
+                          "qwen35.joint_decode.actual_slot_rows"])
         self.assertNotIn("forward_demand_policy", cfg)
         with self.assertRaisesRegex(ValueError, "invalid control nonce"):
             traced.trace_config(Path("/r"), RUN, IDENTITY, "short")
