@@ -311,19 +311,80 @@ the peer in every arm):
     direction on the first write (closure-parameter margin, hf2q −0.09 vs peer +0.28 nat). On the
     longer repair-turn prompt the shift is larger.
 
-**Next step (not run).** Localize the bias by layer. Options:
-- the ADR-063 Q1 stage localizer on the repair-turn prompts (`qwen36` is a localizer family);
-- an independent BF16 reference on the same prefixes (`$E/qwen36-fork-v1/ref_mlx.py`; the BF16 source has
-  to be re-downloaded).
+### Bias localization (2026-11-04): partial-rotary RoPE pairs the wrong dimensions
 
-If BF16 sides with the peer, the defect is in hf2q's Q4_K/MoE/DeltaNet/attention compute path. The
-grammar newline is worth a separate fix either way.
+Evidence: `~/.local/state/hf2q/v0130/q4-qwen36/localize/` (`compare.json`, `lens.json`,
+`layer3/stage-000.json`, `layer3/stage-001.json`, `summary.txt`). Same 63 copy/fix points and same token ids
+on every engine: hf2q's exact generated ids up to each fork (prompt tokens equal the recorded ones 63/63).
+
+- **Reference runs.** Three engines score the same prefixes:
+  - hf2q v0.1.29 `generate`, raw passthrough template, one prefill, speculation off. It agrees with the
+    serve route to a median 0.19 nat.
+  - The pinned peer (`e86f5fd1`) through a small eval-callback dump tool on the same GGUF.
+  - The BF16 safetensors through mlx_lm, read-only (`/opt/hf2q/models/sources/Qwen3.6-35B-A3B-stock`).
+- **BF16 sides with the peer.** Copy-over-fix preference relative to the peer:
+  - hf2q +1.55 nat median, positive at 52/63.
+  - BF16 −0.58, positive at 14/63.
+  - hf2q − BF16 +1.95, positive at 59/63.
+- **Noise baseline.**
+  - Peer f16 vs q8_0 KV: 0.0012 median rel-L2 on the last-token residual at layer 3, rising to 0.054 at
+    layer 39. The preference moves by −0.04 nat.
+  - Peer ubatch 512 vs 2048: bit-identical on the 44 points where the 2048 run finished. The dump tool died
+    on SIGBUS in the other 19.
+  - hf2q KV precision can't serve as a baseline here: the last prefill token attends to fresh K/V. TQ and
+    dense KV gave bit-identical logits on point 000.
+- **First divergent layer: 3, the first full-attention layer.**
+  - Median rel-L2 of hf2q vs peer, last-token residual: 0.0006–0.0008 after the three DeltaNet layers 0–2,
+    then 0.082 after layer 3. That is 68× the KV-precision noise at the same layer.
+  - Every full-attention layer (3, 7, …, 39) adds +0.03 to +0.10, 0.52 in total. The 30 DeltaNet/MoE layers
+    add −0.20 in total (each between −0.033 and +0.014).
+- **Stage within layer 3, all 1,784 positions, points 000 and 001.** Median rel-L2 hf2q vs peer:
+
+  | stage | median rel-L2 |
+  |---|---|
+  | attention input norm | 0.0007 |
+  | Q after q-norm | 0.0011 |
+  | K after k-norm | 0.0010 |
+  | V | 0.0013 |
+  | output gate | 0.0003 |
+  | Q after RoPE | **0.60** |
+  | K after RoPE | **0.54** |
+  | attention output, pre-gate | 0.24 |
+  | attention block output | 0.27 |
+
+  - At position 0 the two engines agree (0.001), as they must, since RoPE is the identity there.
+  - Both engines use the right frequencies, θ_i = 10⁷^(−2i/64).
+  - They pair different dimensions. The peer rotates `(x[i], x[i+32])` for i < 32 (NeoX within the 64-dim
+    rotary slice). hf2q rotates `(x[i], x[i+128])`.
+  - A CPU rotation of hf2q's own q-norm output with pairing `(i, i+32)` reproduces the peer's Q to 0.0011.
+    With pairing `(i, i+128)` it reproduces hf2q's to 1e-5.
+- **Cause.**
+  - mlx-native 0.15.16 `src/shaders/rope_multi.metal` documents the pairing as `(x[p], x[p + head_dim/2])`
+    and implements it the same way: `half_dim = head_dim / 2` at lines 178 and 253, and
+    `x1 = input[base + pair_idx + half_dim]` at line 226.
+  - Only `rope_dim/2` pairs rotate. With partial rotary (Qwen3.5/3.6: `rope_dim` 64 of `head_dim` 256), the
+    partner element must be `p + rope_dim/2`, as in the BF16 reference and the peer. The kernel uses
+    `p + head_dim/2`.
+  - hf2q's Qwen3.5-family full attention calls it through `apply_imrope`/`apply_imrope_into`
+    (`gpu_full_attn.rs`) on prefill. Per the code, the same call serves decode, MTP and joint decode
+    (`joint_decode_core.rs`, `mtp.rs`) [INFERENCE: decode not dumped].
+  - The fused `fused_head_norm_rope_*` kernels pair `(i, i + half_rope)` correctly.
+- **How the bias reaches the token.** A logit lens projects each layer's residual onto the copy−fix row
+  difference of the BF16 head; the lens reproduces the peer's final preference to 0.025 nat.
+  - The wrong relative-position encoding perturbs every full-attention layer.
+  - The copy preference itself appears late: hf2q − peer is +0.25 at layer 31, +1.18 at 33 and +1.37 at 35,
+    against q8_0-KV noise of 0.07–0.17. BF16 − peer stays at −0.0 to −0.55.
+
+This defect is in hf2q's compute path, not the artifact, and it applies to every Qwen3.5-family model whose
+`rope_dim` is smaller than `head_dim` [INFERENCE: only Qwen3.6-35B-A3B measured]. The fix (pair
+`p + rope_dim/2`) belongs in mlx-native. R1 and the Q3 Qwen3.6 rows need re-measurement after it. The
+grammar newline is still worth a separate fix.
 
 ### Draft ADR-063 amendment (DRAFT, pending the R1 defect diagnosis; the root lands the ADR edit)
 
-Do not land this text yet. R1 is an hf2q `Loss` on this workload. The amendment waits until the
-same-prefix fork replay names the cause of hf2q re-emitting the failing file on the repair turn, and until
-any defect it finds is fixed and re-measured.
+Do not land this text yet. R1 is an hf2q `Loss` on this workload. The localization above names the cause:
+the partial-rotary RoPE pairing in mlx-native `rope_multi`. The amendment waits until that defect is fixed
+and R1 is re-measured.
 
 Under Q4-QWEN36, after "If Qwen3.6 stays BelowFloor under every setup tested …":
 
