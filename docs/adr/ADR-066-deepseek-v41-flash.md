@@ -112,7 +112,7 @@ The program MUST deliver, on the M5 Max: supported UD-IQ1_S serving with the omp
 
 The program MUST preserve every product boundary in AGENTS.md: Rust-owned conversion, quantization and inference; no Python, peer engine or vendor converter at runtime; hosted GGUF bytes never satisfy `convert`; downloads only through `hf-hub` or operator scripts. Python and peer engines appear only in developer parity harnesses. The program MUST NOT regress DeepSeek-V4-Flash-0731 serving (the 0731 invariance gate).
 
-Out of scope: UD-IQ1_M and any IQ1 output from `hf2q convert`; ds4-format GGUFs; GPU-resident Engram tables; SSD expert streaming for 128 GiB hosts (successor watchlist); tool namespaces; executing a GGUF's embedded Jinja template; a hosted admission contract for `deepseek4` (0731); new drafter architectures beyond DeepSeek's DSpark.
+Out of scope: UD-IQ1_M and any IQ1 output from `hf2q convert`; ds4's private tensor and row layouts and any ds4-produced V4.1 file (the standard-ggml ds4 DeepSeek-V4-Flash-0731 GGUF, IQ2_XXS/Q2_K/Q8_0/F16, is served under ADR-063 Q4-DS4-RACE using N-IQ2XXS, not by this ADR's V4.1 work); GPU-resident Engram tables; SSD expert streaming for 128 GiB hosts (successor watchlist); tool namespaces; executing a GGUF's embedded Jinja template; a hosted admission contract for `deepseek4` (0731); new drafter architectures beyond DeepSeek's DSpark.
 
 ### Numerical contract
 
@@ -141,7 +141,7 @@ A story closes by type:
 
 ## Repository ownership
 
-mlx-native owns every Metal kernel, GGUF type, shard-set reader, residency filter, CPU decode helper, parity test and release. hf2q owns the variant, plan, graph, cache, Engram reader orchestration, conversion, quantizers, serving, launcher, gates, receipts and documentation. The integration owner owns release-gate infrastructure, Actions variables and the peer pin. A native change is evidence only after it is merged, released, verified on crates.io and pinned exactly in hf2q (AGENTS.md). Native releases are batched: (0) N-IQ2XXS alone, ahead of the others, for v0.1.30; (1) N1, N2, S1; (2) N3–N6, S2, S3, L1; (3) N8 and any G3 kernel change; (4) N7.
+mlx-native owns every Metal kernel, GGUF type, shard-set reader, residency filter, CPU decode helper, parity test and release. hf2q owns the variant, plan, graph, cache, Engram reader orchestration, conversion, quantizers, serving, launcher, gates, receipts and documentation. The integration owner owns release-gate infrastructure, Actions variables and the peer pin. A native change is evidence only after it is merged, released, verified on crates.io and pinned exactly in hf2q (AGENTS.md). Native releases are batched: (0) N-IQ2XXS, ahead of the others, for v0.1.30 — no other ADR-066 story ships in that release, which may also carry ADR-063's v0.1.30 mlx-native work (for example Q4-GEMMA-KERNEL); (1) N1, N2, S1; (2) N3–N6, S2, S3, L1; (3) N8 and any G3 kernel change; (4) N7.
 
 ## B. Baselines, references, oracles and thresholds
 
@@ -289,10 +289,10 @@ Requirement: mlx-native MUST parse GGML type 16 with ggml's block geometry and a
 Acceptance:
 
 - `GgmlType` gains IQ2_XXS (256 values, 66 bytes per block) with the frozen serde name `iq2_xxs`. Dense IQ2_XXS mv/mm report "no kernel" and return a typed error, never a panic.
-- CPU dequantization matches ggml's `dequantize_row_iq2_xxs` bit for bit on seeded random blocks and on edge blocks (every scale nibble, grid index and sign index; ±0, subnormal, largest finite, ±inf and NaN scales), through a checked-in fixture whose generator records the ggml source revision and hashes.
-- The `iq2xxs_grid`, `ksigns_iq2xs` and `kmask_iq2xs` tables live in one Rust module that later IQ grids join (N3). Every shader copy is generated from it and checked byte for byte, and the table bytes match pinned sha256 values of ggml's tables.
+- CPU dequantization matches ggml's `dequantize_row_iq2_xxs` bit for bit on seeded random blocks and on edge blocks (every scale nibble, grid index and sign index; ±0, subnormal, largest finite and ±inf scales), through a checked-in fixture whose generator records the ggml source revision and hashes. NaN scales are compared by class (NaN where ggml gives NaN), not by bit pattern.
+- The `iq2xxs_grid`, `ksigns_iq2xs` and `kmask_iq2xs` tables live in one Rust module that later IQ grids join (N3). Every shader copy is generated from it and checked byte for byte, and the bytes of all three tables match pinned sha256 values of ggml's tables.
 - IQ2_XXS `mv_id`, simdgroup `mm_id` and tensor `mm_id` match the CPU oracle at 256 experts, top-6, K = 4096 and N = 2048, from 1 routed row to 4,096 tokens, within bounds frozen before the first Metal run. The paired gate/up entry point works with IQ2_XXS over one shared expert map.
-- `mv_id` output at m = 1..8 rows is bitwise equal to m one-row calls, for IQ2_XXS at K = 4096/N = 2048 and for Q2_K at K = 2048/N = 4096. This is the proof hf2q's joint decode requires.
+- `mv_id` output at m = 1..8 rows is bitwise equal to m one-row calls, through the forced `mv_id` entry at the shapes hf2q's joint decode issues: IQ2_XXS gate/up with m tokens and top-6 at K = 4096/N = 2048, and Q2_K down with 6·m routed rows and top-1 at K = 2048/N = 4096 (48 rows at m = 8, above the automatic `mm_id` threshold). This is the proof hf2q's joint decode requires.
 - Q2_K `mv_id`, `mm_id`, tensor `mm_id` and the slotted down path match the CPU oracle at 256 experts, top-6, K = 2048 and N = 4096. No new Q2_K kernel is added.
 - Every IQ2_XXS kernel name resolves with `MLX_PRECOMPILED_METALLIB=0`, and the capability row reports the expert routes as native.
 - Microbenchmarks at those shapes recorded, including Q2_K at the same gate/up shape as the baseline.
