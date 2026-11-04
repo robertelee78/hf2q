@@ -192,7 +192,7 @@ class MultistorePlan(unittest.TestCase):
                     {**MULTISTORE_CASE, "checks": ["unknown_check"]},
                     {**MULTISTORE_CASE, "checks": []},
                     {**MULTISTORE_CASE, "checks": ["gemma_loc4", "gemma_loc4"]},
-                    {**MULTISTORE_CASE, "stores": {}},
+                    {**MULTISTORE_CASE, "stores": []},
                     {**MULTISTORE_CASE, "stores": {"endpoint": ".", "stages": "../escape"}},
                     {**MULTISTORE_CASE, "stores": {"endpoint": ".", "stages": "/abs"}},
                     {**MULTISTORE_CASE, "stores": {"endpoint": ".", "stages": "a//b"}},
@@ -204,6 +204,33 @@ class MultistorePlan(unittest.TestCase):
                     {**MULTISTORE_CASE, "marker_stream": "receipt.json"}):
             with self.assertRaises(ValueError):
                 self.plan(bad)
+
+    def test_storeless_case_and_fixed_line_exactly_once(self):
+        line = "Q1_GEMMA_COHORT_STAGE_LOCALIZER_COMPLETE mode=prep whole_q1=false"
+        case = {**MULTISTORE_CASE, "stores": {}, "checks": ["probe"], "completion_line": line}
+        seen = []
+        s.MULTISTORE_CHECKS["probe"] = lambda *a: seen.append(a[7]) or {"ok": True}
+        try:
+            b = bindings({"t0": {"trajectory": "T0ColdSerial"}, "loc4": case})
+            plan = s.case_plan(b, "loc4")
+            self.assertEqual(plan["stores"], {})
+            for count, passes in ((1, True), (0, False), (2, False)):
+                with tempfile.TemporaryDirectory() as root:
+                    out = Path(root); (out / "output").mkdir()
+                    (out / "packet.json").write_text("{}")
+                    (out / "output/execution.json").write_text(json.dumps({"packet_sha256": s.sha(out / "packet.json"), "whole_q1_qualified": False}))
+                    (out / "stdout").write_text("noise\n" + (line + "\n") * count)
+                    extent = {"lanes": [0, 1, 2, 3], "host_payload_limit": 1, "expected_stores": {}}
+                    run = lambda: s.validate_multistore(out, b, "loc4", plan, {}, extent, IDENTITY, {"phase_payload_upper_bytes": 1})
+                    if passes:
+                        evidence = run()
+                        self.assertEqual((evidence["captured_records"], evidence["stores"], evidence["probe"]), (0, {}, {"ok": True}))
+                    else:
+                        with self.assertRaises(ValueError):
+                            run()
+            self.assertEqual(seen, [{}])  # the check owns a storeless receipt
+        finally:
+            del s.MULTISTORE_CHECKS["probe"]
 
     def test_multistore_cannot_be_the_first_case(self):
         with self.assertRaises(ValueError):

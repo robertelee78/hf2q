@@ -90,7 +90,8 @@ def case_plan(b, name):
     if kind == 'multistore':
         require(MULTISTORE_CASE_KEYS <= set(c) <= MULTISTORE_CASE_KEYS | MULTISTORE_OPTIONAL_KEYS and launch, 'closed multistore case: own filter/env/marker, no trajectory')
         stores = c['stores']; checks = c['checks']
-        require(type(stores) is dict and stores and all(type(k) is str and k for k in stores) and len({store_dir(v) for v in stores.values()}) == len(stores), 'distinct named stores under output/')
+        # `{}` = no trace store (e.g. a preparation phase); the registry checks then own the whole receipt.
+        require(type(stores) is dict and all(type(k) is str and k for k in stores) and len({store_dir(v) for v in stores.values()}) == len(stores), 'distinct named stores under output/')
         require(type(checks) is list and checks and len(set(checks)) == len(checks) and all(type(x) is str and x in MULTISTORE_CHECKS for x in checks), 'closed registry checks')
         line = c.get('completion_line')
         require(line is None or (type(line) is str and c['completion_marker'] in line), 'fixed completion line names the marker')
@@ -267,8 +268,11 @@ def validate_multistore(out, b, case, plan, packet, extent, identity, policy):
         stores[name] = dict(captured=captured, expected=expected, bytes=sum(x['logical_bytes'] for x in captured))
     total = sum(s['bytes'] for s in stores.values()); records = sum(len(s['captured']) for s in stores.values())
     require(total <= extent['host_payload_limit'] and total <= policy['phase_payload_upper_bytes'], 'captured bytes <= extent and policy bounds')
-    line = plan['completion_line'] or plan['completion_marker'] + ' records=' + str(records) + ' whole_q1_qualified=false'
-    require(line in (out / plan['marker_stream']).read_text().splitlines(), 'exact multistore completion line')
+    lines = (out / plan['marker_stream']).read_text().splitlines()
+    if plan['completion_line']:
+        require(lines.count(plan['completion_line']) == 1, 'fixed completion line exactly once')
+    else:
+        require(plan['completion_marker'] + ' records=' + str(records) + ' whole_q1_qualified=false' in lines, 'exact multistore completion line')
     evidence = dict(execution=execution, stores={n: dict(records=len(s['captured']), bytes=s['bytes']) for n, s in stores.items()}, captured_records=records, captured_bytes=total, whole_q1_qualified=False)
     for check in plan['checks']:
         evidence[check] = MULTISTORE_CHECKS[check](out, b, case, plan, packet, extent, execution, stores, identity, policy)
