@@ -656,6 +656,10 @@ pub struct MlxModelWeights {
     /// (flattened or slotted; bitwise equal). Resolved once at load from
     /// `HF2Q_GEMMA_PREFILL_MOE_DOWN` (default slotted).
     pub(crate) prefill_moe_down: crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown,
+    /// ADR-063 Q4-GEMMA-DECODE — adopted exact decode routes of the
+    /// `[N,hidden]` batched body, resolved once at load from
+    /// `HF2Q_GEMMA_DECODE_KERNELS`. `None` (unset/`0`) is today's path.
+    pub(crate) decode_kernels: Option<super::decode_kernels::GemmaDecodeKernels>,
 }
 
 /// ADR-040 iter-G(a) — per-call descriptor for cross-slot batched prefill.
@@ -913,6 +917,9 @@ impl MlxModelWeights {
     ) -> Result<Self> {
         let mlx_device = gpu.device();
         tracing::debug!("Loading mlx-native weights directly from GGUF...");
+        // ADR-063 Q4-GEMMA-DECODE: resolve HF2Q_GEMMA_DECODE_KERNELS once,
+        // before any allocation, so a refused reference fails fast.
+        let decode_kernels = super::decode_kernels::resolve_at_load()?;
 
         // Preflight the tied/untied IO contract before any Metal allocation.
         // Malformed or unsupported storage therefore cannot leave a partially
@@ -1461,6 +1468,7 @@ impl MlxModelWeights {
             multi_seq_prefill: None,
             warm_live_kernel: crate::serve::gemma_live_attention::warm_live_kernel_from_env(),
             prefill_moe_down: crate::serve::gemma_prefill_moe::prefill_moe_down_from_env(),
+            decode_kernels,
         });
 
         // Pre-initialize constant param buffers so we never write them

@@ -308,7 +308,6 @@ pub(crate) fn load_gguf_qweight(
 /// Takes `registry` and `device` separately to avoid borrow conflicts on
 /// `GpuContext` (registry is `&mut`, device is `&`).
 #[allow(clippy::too_many_arguments)]
-
 pub fn dispatch_qmatmul(
     session: &mut GraphSession<'_>,
     registry: &mut mlx_native::KernelRegistry,
@@ -318,6 +317,51 @@ pub fn dispatch_qmatmul(
     output: &MlxBuffer,
     m: u32,
     imatrix_hint: ImatrixHint<'_>,
+) -> Result<()> {
+    dispatch_qmatmul_impl(session, registry, device, input, weight, output, m, imatrix_hint, None)
+}
+
+/// [`dispatch_qmatmul`] with an explicit GGML routing policy for the block-
+/// quantized branch (`quantized_matmul_ggml_with_policy`). Affine, F16-shadow
+/// and scalar weights route exactly as in [`dispatch_qmatmul`]; the Q6_K m=1
+/// baked record is skipped only when the policy routes width 1 through the
+/// row-tiled kernels (`dense_row_tiled_m1`). ADR-063 Q4-GEMMA-DECODE.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_qmatmul_with_policy(
+    session: &mut GraphSession<'_>,
+    registry: &mut mlx_native::KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxQWeight,
+    output: &MlxBuffer,
+    m: u32,
+    imatrix_hint: ImatrixHint<'_>,
+    policy: &mlx_native::GgmlRoutingPolicy,
+) -> Result<()> {
+    dispatch_qmatmul_impl(
+        session,
+        registry,
+        device,
+        input,
+        weight,
+        output,
+        m,
+        imatrix_hint,
+        Some(policy),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_qmatmul_impl(
+    session: &mut GraphSession<'_>,
+    registry: &mut mlx_native::KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxQWeight,
+    output: &MlxBuffer,
+    m: u32,
+    imatrix_hint: ImatrixHint<'_>,
+    policy: Option<&mlx_native::GgmlRoutingPolicy>,
 ) -> Result<()> {
     // ADR-033 §Pi Stage 2 — imatrix collector intercept (inline-hint API).
     //
@@ -604,7 +648,10 @@ pub fn dispatch_qmatmul(
     //     m > MM_ROUTING_THRESHOLD)
     //   - weight.info.ggml_dtype != F32 (would have returned at F32 block)
     //   - weight.info.ggml_dtype != F16 (would have returned at F16 block)
-    if m == 1 && weight.info.ggml_dtype == mlx_native::GgmlType::Q6_K {
+    if m == 1
+        && weight.info.ggml_dtype == mlx_native::GgmlType::Q6_K
+        && !policy.is_some_and(|p| p.dense_row_tiled_m1)
+    {
         let n = weight.info.rows as u32;
         let k = weight.info.cols as u32;
         let record_opt = weight.decode_record_q6k_m1.get_or_init(|| {
@@ -626,9 +673,22 @@ pub fn dispatch_qmatmul(
     }
 
     let params = weight.matmul_params(m)?;
-    session
-        .quantized_matmul_ggml(registry, device, input, &weight.buffer, output, &params)
-        .map_err(|e| anyhow::anyhow!("quantized_matmul_ggml failed: {e}"))
+    match policy {
+        None => session
+            .quantized_matmul_ggml(registry, device, input, &weight.buffer, output, &params)
+            .map_err(|e| anyhow::anyhow!("quantized_matmul_ggml failed: {e}")),
+        Some(policy) => mlx_native::ops::quantized_matmul_ggml::quantized_matmul_ggml_with_policy(
+            session.encoder_mut(),
+            registry,
+            device,
+            input,
+            &weight.buffer,
+            output,
+            &params,
+            policy,
+        )
+        .map_err(|e| anyhow::anyhow!("quantized_matmul_ggml_with_policy failed: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -106,6 +106,12 @@
 #                                    HF2Q_MM_ID_SCHEDULE; unset keeps the
 #                                    mlx-native expert-matmul schedule
 #                                    default. grid is the bitwise A/B arm.
+#     DECODE_KERNELS=0|1             (this script) forwards
+#                                    HF2Q_GEMMA_DECODE_KERNELS; unset keeps
+#                                    the hf2q default (0, stock decode
+#                                    kernels). 1 selects the adopted exact
+#                                    width-4 decode routes (ADR-063
+#                                    Q4-GEMMA-DECODE).
 #     ROUTING_OVERLAP=0|1            (this script) forwards
 #                                    HF2Q_GEMMA_ROUTING_OVERLAP; unset keeps
 #                                    it off. 1 prints the V2 [ROUTING_OVERLAP]
@@ -252,6 +258,15 @@ case "${MM_ID_SCHEDULE:-}" in
         exit 2
         ;;
 esac
+DECODE_KERNELS_ENV=""
+case "${DECODE_KERNELS:-}" in
+    "") ;;
+    0|1) DECODE_KERNELS_ENV="$DECODE_KERNELS" ;;
+    *)
+        echo "DECODE_KERNELS must be 0, 1 or unset" >&2
+        exit 2
+        ;;
+esac
 ROUTING_OVERLAP_ENV=""
 case "${ROUTING_OVERLAP:-}" in
     "") ;;
@@ -275,6 +290,7 @@ if [[ -f "$MMPROJ" ]]; then
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
+        ${DECODE_KERNELS_ENV:+HF2Q_GEMMA_DECODE_KERNELS="$DECODE_KERNELS_ENV"} \
         ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
@@ -297,6 +313,7 @@ else
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
+        ${DECODE_KERNELS_ENV:+HF2Q_GEMMA_DECODE_KERNELS="$DECODE_KERNELS_ENV"} \
         ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \

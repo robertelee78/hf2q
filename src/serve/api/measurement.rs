@@ -182,6 +182,15 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
             // ADR-063: the resolved Gemma warm-prefill attention
             // kernel, so a Q5 receipt binds its arm (`null` off Gemma).
             "gemma_warm_attention_kernel": engine.info().gemma_warm_attention_kernel,
+            // ADR-063 Q4-GEMMA-DECODE: switch, adopted levers and base
+            // reference flags resolved at Gemma 4 load; null for other families.
+            "gemma_decode_kernels": if engine.info().arch_family
+                == crate::serve::load_info::ArchFamily::Gemma4
+            {
+                crate::inference::models::gemma4::decode_kernels::runtime_report()
+            } else {
+                Value::Null
+            },
         },
     }))
 }

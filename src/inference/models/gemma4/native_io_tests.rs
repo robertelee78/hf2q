@@ -92,6 +92,7 @@ fn native_q8_embedding_and_batched_head_match_stored_values() {
             hidden,
             vocab,
             ImatrixHint::None,
+            None,
         )
         .unwrap();
         session.finish().unwrap();

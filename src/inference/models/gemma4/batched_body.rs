@@ -29,7 +29,8 @@ use crate::debug::INVESTIGATION_ENV;
 use crate::quantize::imatrix::ImatrixHint;
 use crate::serve::config::LayerType;
 use crate::serve::forward_mlx_shared::{
-    dispatch_qmatmul, dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
+    dispatch_qmatmul, dispatch_qmatmul_with_policy, dispatch_rms_norm_unit_perhead,
+    RmsNormPerHeadArgs,
 };
 use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
 
@@ -451,6 +452,11 @@ fn cat_boundary<'a>(
 /// per-row matvec; otherwise loop m=1 per row (correct, weight re-read N times —
 /// these are the minority dense projections; the dominant MoE experts batch
 /// bit-identically via `quantized_matmul_id_ggml`).
+///
+/// `policy` is `None` for the stock route; with `HF2Q_GEMMA_DECODE_KERNELS=1`
+/// the caller passes its adopted body or lm-head policy for §3.1 weight types
+/// and the batched m=N branch dispatches through
+/// [`dispatch_qmatmul_with_policy`]. The per-row m=1 loop stays stock.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_dense_rowident(
     session: &mut GraphSession<'_>,
@@ -463,6 +469,7 @@ pub(super) fn dispatch_dense_rowident(
     in_stride: usize,
     out_stride: usize,
     hint: ImatrixHint<'_>,
+    policy: Option<&mlx_native::GgmlRoutingPolicy>,
 ) -> Result<()> {
     use mlx_native::GgmlType;
     // Measured (ADR-040 M4, 2026-06-24): for F32/F16 weights at decode N≤8 the
@@ -476,7 +483,12 @@ pub(super) fn dispatch_dense_rowident(
     ) && (n as u32)
         <= mlx_native::ops::quantized_matmul_ggml::MM_ROUTING_THRESHOLD;
     if batched_rowident {
-        dispatch_qmatmul(session, reg, dev, input, weight, output, n as u32, hint)
+        match policy {
+            None => dispatch_qmatmul(session, reg, dev, input, weight, output, n as u32, hint),
+            Some(policy) => dispatch_qmatmul_with_policy(
+                session, reg, dev, input, weight, output, n as u32, hint, policy,
+            ),
+        }
     } else {
         // Measured (ADR-040 M4): amortizing the F16/F32 weight read across rows
         // (dispatch row 0 only) was throughput-NEUTRAL (152.3 vs 151.8 @ N=4) —
@@ -492,6 +504,40 @@ pub(super) fn dispatch_dense_rowident(
 }
 
 impl MlxModelWeights {
+    /// Adopted body policy for a dense projection weight; `None` (stock) when
+    /// `HF2Q_GEMMA_DECODE_KERNELS` is off or the type is outside §3.1.
+    pub(super) fn body_policy(
+        &self,
+        weight: &crate::serve::forward_mlx_shared::MlxQWeight,
+    ) -> Option<&mlx_native::GgmlRoutingPolicy> {
+        self.decode_kernels.as_ref()?.body_policy_for(weight.info.ggml_dtype)
+    }
+
+    /// Adopted lm-head policy; `None` (stock) unless adopted for this head.
+    pub(super) fn lm_head_policy(&self) -> Option<&mlx_native::GgmlRoutingPolicy> {
+        self.decode_kernels
+            .as_ref()?
+            .lm_head_policy_for(self.resolved_lm_head().info.ggml_dtype)
+    }
+
+    /// Adopted routed-expert policy; `None` (stock) when off or the stack type
+    /// is outside §3.1.
+    fn expert_policy(&self, ty: mlx_native::GgmlType) -> Option<&mlx_native::GgmlRoutingPolicy> {
+        self.decode_kernels.as_ref()?.expert_policy_for(ty)
+    }
+
+    /// Attention route of the adopted decode set; [`AttentionLever::VecHybrid`]
+    /// (today's route) when `HF2Q_GEMMA_DECODE_KERNELS` is off. Hook for the
+    /// A1/A2 call sites.
+    ///
+    /// [`AttentionLever::VecHybrid`]: super::decode_kernels::AttentionLever::VecHybrid
+    #[allow(dead_code)]
+    pub(crate) fn decode_attention_lever(&self) -> super::decode_kernels::AttentionLever {
+        self.decode_kernels
+            .as_ref()
+            .map_or(super::decode_kernels::AttentionLever::VecHybrid, |k| k.attention())
+    }
+
     /// ADR-040 S2/S3 — one `[N,hidden]` decode layer (production hybrid-TQ path).
     ///
     /// Position-INDEPENDENT ops (input-norm, post-attn norm, fused MLP, MoE) run
@@ -597,6 +643,7 @@ impl MlxModelWeights {
                 tag: "attn_q",
                 layer: layer_idx,
             },
+            self.body_policy(&self.layers[layer_idx].attn.q_proj),
         )?;
         cat_boundary(session, exec, catsplit::Cat::DenseQ)?;
         dispatch_dense_rowident(
@@ -613,6 +660,7 @@ impl MlxModelWeights {
                 tag: "attn_k",
                 layer: layer_idx,
             },
+            self.body_policy(&self.layers[layer_idx].attn.k_proj),
         )?;
         cat_boundary(session, exec, catsplit::Cat::DenseK)?;
         let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
@@ -631,6 +679,7 @@ impl MlxModelWeights {
                     tag: "attn_v",
                     layer: layer_idx,
                 },
+                self.body_policy(self.layers[layer_idx].attn.v_proj.as_ref().unwrap()),
             )?;
             cat_boundary(session, exec, catsplit::Cat::DenseV)?;
         }
@@ -1796,6 +1845,7 @@ impl MlxModelWeights {
                 tag: "attn_output",
                 layer: layer_idx,
             },
+            self.body_policy(&self.layers[layer_idx].attn.o_proj),
         )?;
         cat_boundary(session, exec, catsplit::Cat::DenseO)?;
 
@@ -1881,6 +1931,7 @@ impl MlxModelWeights {
                 tag: "ffn_gate",
                 layer: layer_idx,
             },
+            self.body_policy(&self.layers[layer_idx].mlp.gate_proj),
         )?;
         dispatch_dense_rowident(
             session,
@@ -1896,6 +1947,7 @@ impl MlxModelWeights {
                 tag: "ffn_up",
                 layer: layer_idx,
             },
+            self.body_policy(&self.layers[layer_idx].mlp.up_proj),
         )?;
         // router_proj is F32 (ffn_gate_inp) → per-row m=1 (tile path not byte-identical).
         dispatch_dense_rowident(
@@ -1912,6 +1964,7 @@ impl MlxModelWeights {
                 tag: "ffn_gate_inp",
                 layer: layer_idx,
             },
+            None,
         )?;
         // catsplit: dense MLP gate + up + router projection.
         cat_boundary(session, exec, catsplit::Cat::DenseFfn)?;
@@ -2005,9 +2058,10 @@ impl MlxModelWeights {
             ],
         )?;
 
-        // -- B11: dense down: mlp_fused -> mlp_down. down_proj is F16
-        // (intermediate=2112 not 256-aligned) → per-row m=1 (tile path not
-        // byte-identical to the m=1 matvec). --
+        // -- B11: dense down: mlp_fused -> mlp_down. On the q4_k_m artifact
+        // down_proj is Q5_0/Q8_0 (intermediate=2112 is not 256-aligned) and
+        // takes the batched m=N `Mv` route like the other quantized dense
+        // projections; an F16/F32 down_proj loops per-row m=1. --
         session.barrier_between(
             &[
                 &bufs.mlp_fused,
@@ -2029,6 +2083,7 @@ impl MlxModelWeights {
                 tag: "ffn_down",
                 layer: layer_idx,
             },
+            self.body_policy(&self.layers[layer_idx].mlp.down_proj),
         )?;
         // catsplit: dense MLP down projection.
         cat_boundary(session, exec, catsplit::Cat::DenseFfn)?;
@@ -2081,6 +2136,7 @@ impl MlxModelWeights {
             &bufs.moe_expert_ids,
             &bufs.moe_gate_up_id_out,
             &gu_params,
+            self.expert_policy(gu_params.ggml_type),
         )
         .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
         // catsplit: MoE gate_up `_id` (per-token mv_id) — the big expert read.
@@ -2126,6 +2182,7 @@ impl MlxModelWeights {
             &bufs.moe_expert_ids,
             &bufs.moe_down_id_out,
             &dn_params,
+            self.expert_policy(dn_params.ggml_type),
         )
         .map_err(|e| anyhow::anyhow!("batched down _id L{layer_idx}: {e}"))?;
         // catsplit: MoE down `_id` (per-token mv_id) — the second big expert read.
