@@ -7,8 +7,8 @@ Date: 2026-11-04. Host: Apple M5 Max, 128 GiB. Evidence roots:
 ## Result
 
 **The packed route first diverges from All128 at layer 0, prefill `Attention` (the SDPA output), in all four lanes and on all 128 prompt rows.**
-- Everything before that point is byte-identical on both routes: layer-0 Query, Key, Value, RopeQuery and RopeKey for every prompt row, and every layer-0 decode stage.
-- The batched decode body adds no divergence of its own. In decode, layer 0 is exact at all 16 positions. Layer 1 decode Query, Key and Value are exact, and the first decode difference is layer-1 decode `Attention`, which reads the layer-1 KV cache that the packed prefill wrote.
+- Everything before that point in execution order is byte-identical on both routes: layer-0 prefill Query, Key, Value, RopeQuery and RopeKey for every prompt row.
+- Decode, after the prefill: decode layer 0 is exact at all 16 positions on both routes, so at layer 0 the batched decode body is bit-exact given equal inputs. Layer-1 decode Query, Key and Value are also exact. The first decode difference is layer-1 decode `Attention`, which reads the layer-1 KV cache that the packed prefill already wrote differently, so the decode body's own contribution at layer 1 cannot be separated. **Scope:** only sliding-window layers 0–1 (head dim 256) were observed in decode. The full-attention layers (5, 11, 17, 23, 29; head dim 512, a different SDPA path) were not observed in decode, and this record makes no claim about them.
 
 Packed versus All128 is a Class B route pair, so this record implies no fix.
 
@@ -27,12 +27,12 @@ This agrees with the earlier endpoint bracket (Q1 #367): layer-0 K/V cache equal
 
 | Phase | Layer | Equal | Differing (records) | max \|Δ\| | relative RMS (differing) |
 |---|---|---|---|---|---|
-| prefill | 0 | Query, Key, Value, RopeQuery, RopeKey (512 each) | — | 0 | — |
+| prefill | 0 | Query, Key, Value, RopeQuery, RopeKey (512 each); MoeOutput 512 (all zero on both routes, see below) | — | 0 | — |
 | prefill | 0 | | Attention 512 | 0.1875 | 0.0034 |
 | prefill | 0 | | Residual 512, FfnNorm 512, RouterLogits 512, RouterWeights 512 | 0.643 / 0.0113 / 0.0171 / 0.0034 | 0.0021 / 0.0022 / 0.0010 / 0.0013 |
 | prefill | 0 | | RouterIds 7 | — (ids) | — |
 | prefill | 0 | | DenseOutput 512, LayerOutput 512 | 47.7 / 4.09 | 0.0067 / 0.0063 |
-| prefill | 1 | | every role except MoeOutput (512 each); RouterIds 37 | Key 2.17, Attention 0.469, DenseOutput 55.9 | 0.0037–0.0114 |
+| prefill | 1 | MoeOutput 512 (all zero on both routes) | every other role (512 each); RouterIds 37 | Key 2.17, Attention 0.469, DenseOutput 55.9 | 0.0037–0.0114 |
 | decode | 0 | all 12 roles (64 each) | — | 0 | — |
 | decode | 1 | Norm, Query, Key, RopeQuery, RopeKey, Value | Attention 64, FfnNorm 64, RouterLogits 64, RouterWeights 64, LayerOutput 64; RouterIds 1 | 0.0313 (Attention) | 0.0007–0.0020 |
 
@@ -126,17 +126,24 @@ The ADR named b3 `91b0c382` as the build of record. Root decided on 2026-11-03 (
 Store shas (`trace.json`):
 - t0 `44d3abb25be3b487c86c971995eb8d0b65959e18e884577c9977beafddb9f85a`;
 - loc4-all128 endpoint `5596112b078e3b0cb5e68ff5a513a53edfef0953b2fc9a9cff27d878e86ae67c`, stages `16e25a8d2d8c88f72244c322d21d6601a648bd04720952501035971f262b2c19`;
-- loc4-packed endpoint `4053b28d4e1c853a2bccbcf943f7316efd1204d9fcd95379d07cad9c4da8d42b`, stages `16e1d9a2050e7720837962f0f9a3983361553503f9a15eddfd514fdc507869a8`.
+- loc4-packed endpoint `4053b28d2e1c853a2bccbcf943f7316efd1204d9fcd95379d07cad9c4da8d42b`, stages `16e1d9a2050e7720837962f0f9a3983361553503f9a15eddfd514fdc507869a8`.
 
-Decision files are in `$L/decisions/`:
+Decision files are in `$L/decisions/`.
 
-| File | sha256 |
-|---|---|
-| the four observer `exact` files | `07c1fd75c7dbee642c64297de65c322072ee9f5eb47951032b21a6e26055d7f2` (all four are byte-identical) |
-| stage `exact` | `11cfddc6f0abdb4925b5b5a2e2c76243e3f2af4d7c4adcb9ca24fd3b1c6cbb87` |
-| `routing` | `15f78365e58544b92a97c58d688edb6d3d3a1d695046068b969a6c5453b0cdad` |
-| `localization-record.json` | `795f56434dffff3aa0bf384f462bd5d61b010359ce931140b1d4faff1bcf5a16` |
-| `stage-table.json` | `f834471ec2afa4ba7555e36ba9956b62cb1fb3237caebe5bd16ba6427e9ec3a0` |
+Each file has a `hf2q.q1.closure-decision-record.v1` `<name>.record.json` beside it. The record holds the exact argv (`nice -n 19 python3 -I -B` running the tool by `runpy`), the tool sha, the input paths and shas, the output sha, the bindings, the expectation and the check rule.
+
+The records were produced by `$L/sup/record_decisions.py` (`22d7a8c87cc8f098925698838b09fcae95014751c9855aa412d9d455225ad4fd`). It re-executes every decision against the internal `$L/outs` stores and refuses unless the result is byte-identical to the stored file; every result was. The decision tools are those of the build of record:
+- `q1_decision_policy.py`: `b152c92d4c84080c33251aae1ba1afc9847405b737fca58af52c0d311c0945e2`;
+- `q1_stage_localization.py`: `313f6155f6c499fdc4c8955805d09c931bf8885466f1049097c12ff85ff59572`;
+- `stage-table.json` producer `$L/sup/stage_table.py`: `503145f814477f548759b41c38ec34ee722eb40532ec1d22a6c85681d741de76`. It imports the two tools above.
+
+| File | sha256 | Record sha256 |
+|---|---|---|
+| `exact-loc4all128-t0new.json`, `exact-loc4all128-t0b3.json`, `exact-loc4packed-t2b3.json`, `exact-t0new-t0b3.json` | `07c1fd75c7dbee642c64297de65c322072ee9f5eb47951032b21a6e26055d7f2` (all four byte-identical) | `89843c0b1cb5fe327ac353de723bc143ff36e58dbe5d5c10b81a3a9cc02b12d8`, `1c56cab33743587ab0a60c2acb37ffb2eb4f3b523249bf0cdf6a74ea588a0b42`, `5fdb476e04e62977d23e9ad5237921b7be16e6778948652d1b1d0797af78aead`, `d03fdddb23b786325b436be3b60752e9984cf831657fe80cf4b5cabd61a93a71` |
+| `exact-stages-all128-packed.json` | `11cfddc6f0abdb4925b5b5a2e2c76243e3f2af4d7c4adcb9ca24fd3b1c6cbb87` | `68651f06d940f5244f48de4ebe61d33f51e4bc33eec4f6bc94f08aaa94ad2224` |
+| `routing-loc4all128-loc4packed.json` | `15f78365e58544b92a97c58d688edb6d3d3a1d695046068b969a6c5453b0cdad` | `53cd68fefcaf36f5ca57f03f7a2ecaff1ef34143dcfaa544975336dadf18beb1` |
+| `localization-record.json` | `795f56434dffff3aa0bf384f462bd5d61b010359ce931140b1d4faff1bcf5a16` | `f1a60d3cde6d32dd0ec8f19361e1c2de34cd8fff9233f026fa3e060636b67720` |
+| `stage-table.json` | `f834471ec2afa4ba7555e36ba9956b62cb1fb3237caebe5bd16ba6427e9ec3a0` | `3045183089fc92623c9ac11b8f3529c3edf3a1d973eceb9b0cecb8dda66044db` |
 
 ## Reviews
 
@@ -146,4 +153,9 @@ Decision files are in `$L/decisions/`:
   - resource-policy values (accepted; placement moved to internal APFS by root decision);
   - packet derivations (attested);
   - three operating reviews.
-- **Pending:** independent review of this localization record and of the observer-effect control (story Validation).
+- **Localization record and observer-effect control (story Validation): Review680, 2026-11-04, story #652 ACCEPT.** The reviewer re-derived every decision byte for byte and recomputed all 52 stage-table rows independently. Their PR findings are applied in this revision:
+  - the corrected packed endpoint store sha;
+  - the decode claim limited to the observed sliding layers 0–1;
+  - the result ordering;
+  - decision provenance records;
+  - the MoeOutput row in the stage table.
