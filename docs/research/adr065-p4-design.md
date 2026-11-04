@@ -335,7 +335,7 @@ Until the runtime-registry fix is released and pinned (§2.3), every P4b hardwar
 
 With `HF2Q_QWEN_SPECULATION` unset, the dense Qwen3.8 four-slot worker resolves speculation to `off` (`default_server_policy`, `qwen35_speculation.rs:38-48`; ADR-063 D1 measured a 1.020 makespan loss). Single-slot workers default to `auto`. The changed code runs only on K3 and history partial rejections. Therefore:
 - the four-agent A/B arms both run at `HF2Q_QWEN_SPECULATION=auto`. That is a declared campaign parameter, not an ADR-065 kill switch, so "previous default" is still the same binary with only `HF2Q_QWEN_LA_GPU_RESTORE` toggled;
-- the N=1 run is an engaged arm, not a ±2.5-point non-engagement control, because single-agent K3 is the path this changes, and single-slot dense workers are where the shipped default runs P4b most often. It gets its own A/B verdict under the same rule, and that verdict gates the default (§5.3).
+- the N=1 stage is an engaged stage, not a ±2.5-point non-engagement control, because single-agent K3 is the path this changes, and single-slot dense workers are where the shipped default runs P4b most often. The campaign therefore runs with `--n1-engages` (B1 campaign doc, "Controls"; `scripts/four_agent/adr065_stats.py`). Under that flag the analyzer reports the `n1` effect instead of gating on the ±2.5-point window, and P4b's "N=1 not Loss" condition (§5.3) is judged from that reported effect.
 
 Qwen3.6 is not measured. Its default route stays `Host` (§3.1).
 
@@ -352,11 +352,11 @@ The ADR-065 two-arm rule applies:
 - ABBA paired blocks with warm-up; the block count is the one fixed in B1's campaign file for Qwen3.8 A/Bs (ADR-065 B1), not chosen here;
 - paired log-makespan Student-t 95% interval;
 - verdicts in the order Loss, Win, Equivalent, Inconclusive;
-- **fairness reference at `auto`.** B1 freezes its baseline from the phase-1 default, which is `off` for Qwen3.8 four-slot. D1 measured a loss at `auto`, so B1's `off`-baseline reference does not apply to `auto` runs. B1 now judges fairness by Q3-style paired regression (operator decision, 2026-11-03), and P4b uses whichever of these B1's campaign file provides:
-  1. a frozen Qwen3.8 `auto` baseline with its own fairness reference; or
-  2. a declared reference, namely arm A at `auto` of the same campaign. Each fairness metric (per-run worst-slot p95 semantic TTFT and maximum semantic SSE gap) is a paired B/A effect (`q3_stats.paired_effect`), and a regression (`q3_stats.regression`: lower CI bound above the neutral band) fails the story.
+- **fairness: B1's checks, unchanged** (`docs/research/adr065-b1-campaign.md` "Fairness" and its ADR amendment, as of `1dad1672`; implemented by `scripts/four_agent/adr065_stats.py`). Both checks apply to arm B only:
+  1. **Paired regression test, the primary check.** This is B1's block-paired B-vs-A test, reused unchanged: Q3's `q3_report.FAIRNESS`, `q3_report.effect` and `q3_stats.regression`, applied to the run's worst-slot p95 semantic TTFT and worst-slot maximum semantic SSE gap. It fails if the ratio interval's lower bound exceeds 1.025, and a measured metric without an interval is `Unverifiable` and fails. Arm A is the same binary at `auto` with the switch at 0, so this test isolates P4b by construction and needs no `auto` baseline.
+  2. **Absolute safety cap.** `CAP_FACTOR = 1.5` × **B1's frozen phase-1 (`off`) ceilings** for the workload. This holds in every measured B run and slot, and a missing value is `Unverifiable` and fails. The cap is an absolute bound on user-facing latency, not a comparison with the previous default, so the phase-1 ceilings are a sound base even though both arms run at `auto`: the cap asks whether any served run is pathological against the frozen phase-1 service level, and that question does not depend on the arm's speculation policy. P4b does not freeze a separate `auto` baseline.
 
-  If B1's campaign file provides neither, the root declares option 2 in the campaign file before any P4b run;
+  If an arm-A run would also breach the cap, the cap still fails B's breaching runs, and the default stays off (§5.3 mapping). The receipt then records the arm-A values beside B's, so the root can see that the breach comes from `auto` rather than from P4b and decide whether a frozen `auto` baseline is warranted for a later campaign;
 - quality: the arms are `ExactTranscripts` (T-P4b-9), so B inherits task quality. A non-exact pair blocks the story pending diagnosis;
 - the Q5 case is the B1 campaign file's Qwen3.8 case derived at `auto`, plus its N=1 case. Q5 admission is re-established for the P4b binary. The capture footprint is unchanged, because the GPU path allocates nothing beyond the one strided-copy pipeline.
 
@@ -364,7 +364,7 @@ Default mapping, for dense artifacts only (MoE stays `Host`). ADR-065 says "defa
 
 | Four-agent verdict | Default (dense, unset) | Conditions |
 |---|---|---|
-| Win | on | N=1 verdict is not Loss; fairness passes; transcripts exact |
+| Win | on | The N=1 effect reported under `--n1-engages` is not Loss (its interval does not exclude zero unfavourably, by the same verdict order); `gates_pass` (fairness, safety cap, Q5, thermal, completeness); transcripts exact |
 | Equivalent | on | Same conditions. Exact transcripts plus a bounded no-difference result: the story's outcome (no host copy) and J4's need for a batched restore favour the GPU path at no measured cost |
 | Loss or Inconclusive, or any condition failing | off | The verdict is recorded. The switch stays, and the host path remains the default |
 
