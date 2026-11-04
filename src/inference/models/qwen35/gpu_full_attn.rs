@@ -9225,9 +9225,11 @@ mod tests {
                     );
                     continue;
                 }
-                // Both sides evaluate pow/sin/cos in f32; the angle error
-                // grows with the position.
-                let tol = 1e-5 + 1e-7 * token_pos[t] as f32;
+                // Both sides evaluate pow/sin/cos in f32, so the angle error
+                // grows with the position (|theta| <= pos): with inputs in
+                // [-0.5, 0.5] (|x0| + |x1| <= 1) and up to 2 ulps per side,
+                // the output error is at most 4 * eps * pos.
+                let tol = 1e-5 + 4.0 * f32::EPSILON * token_pos[t] as f32;
                 let d_err = (g - e).abs();
                 assert!(
                     d_err <= tol,
