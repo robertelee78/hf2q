@@ -231,6 +231,34 @@ decision` at start, and each cohort logs `Gemma4 installed prefills advanced in
 one aggregate-bounded transaction` with `transaction="joint warm"`. Evidence:
 `docs/research/adr063-gemma-four-agent-reuse.md`.
 
+### Gemma joint cold prefill (default on)
+
+`HF2Q_GEMMA_JOINT_COLD_PREFILL` controls ADR-063 Q4-GEMMA-COLD joint cold
+prefill on the Gemma 4 SlotAware worker. It is read once when the worker
+starts.
+- **Unset, `1`, `on` or `true` (default):** when every slot is idle, two or
+  more cold text requests in one admission quantum, each with an exact
+  pre-generation boundary of at least 33 tokens (the four-agent first turn),
+  run as one transaction: one joint prefill of every boundary, each lane's
+  boundary checkpoint in arrival order, then one joint replay of the short
+  generation cues. Attention runs per request with the single-slot route.
+  Each request's tokens, logprobs, checkpoint and cache bytes are bitwise
+  equal to the per-slot admission, and no request waits for the others'
+  serial prefills. Groups with a cached lane, a grammar, a vision input or
+  more than 4,096 rows keep the per-slot route.
+- **`0`, `off` or `false`:** kill switch; every cold request is admitted per
+  slot.
+- **Any other value:** logs a warning and keeps the default.
+
+It is also off when cross-slot admission or hybrid KV is off, or under
+`HF2Q_BATCHED_BODY=0`, `HF2Q_PREFILL_SLOT_BATCHED=0`,
+`HF2Q_MM_ID_ROUTING_THRESHOLD`, `HF2Q_DFLASH_XLEN_SDPA=1`, `HF2Q_FA_F16=0`,
+`HF2Q_NO_FA` or `HF2Q_GLOBAL_FA`, because those change or bypass the per-slot
+route the cohort must equal. The worker logs `Gemma joint cold prefill worker
+decision` at start, and each cohort logs `Gemma4 cold stable cohort prefilled
+in one joint transaction` with its phase timings. Evidence:
+`docs/research/adr063-q4-gemma-cold-design.md`.
+
 ### Gemma tiled warm attention (default off)
 
 `HF2Q_GEMMA_WARM_TILED_ATTENTION` selects the attention kernel of Gemma 4

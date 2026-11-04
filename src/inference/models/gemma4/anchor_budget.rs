@@ -177,6 +177,50 @@ pub(super) fn reserve(
     )
     .map(Some)
 }
+/// Whether captures of `requested` bytes each, reserved one after another on
+/// top of `used`, all fit `limit`. Releases are not credited, so a `true`
+/// holds for every release order (a joint cohort that frees every lane's old
+/// anchor first, or serial admission that frees one before each capture).
+pub fn serial_captures_fit(
+    used: usize,
+    limit: usize,
+    requested: impl IntoIterator<Item = usize>,
+) -> bool {
+    requested
+        .into_iter()
+        .try_fold(used, |total, bytes| total.checked_add(bytes).filter(|t| *t <= limit))
+        .is_some()
+}
+/// The ADR-063 Q4-GEMMA-COLD anchor pre-check: would this worker accept the
+/// stable-boundary captures at `prompt_lens` (physical boundaries, FIFO), on
+/// whichever slots they land, without any release? Always true while the
+/// full-input quota is inactive (captures reserve nothing then).
+pub fn boundary_captures_fit(
+    scaffold: &[MultiSeqHybridKvBuffers],
+    prompt_lens: impl IntoIterator<Item = usize>,
+) -> Result<bool> {
+    if !crate::debug::investigation_env::gemma_full_input::worker_active() {
+        return Ok(true);
+    }
+    let slots = scaffold
+        .first()
+        .map(|layer| layer.n_seqs as usize)
+        .ok_or_else(|| anyhow!("Gemma anchor pre-check needs a Hybrid scaffold"))?;
+    let mut requested = Vec::new();
+    for prompt_len in prompt_lens {
+        let mut bytes = 0;
+        for slot in 0..slots {
+            bytes = bytes.max(requested_bytes(scaffold, slot, prompt_len)?);
+        }
+        requested.push(bytes);
+    }
+    let quota = worker_quota();
+    Ok(serial_captures_fit(
+        quota.used.load(Ordering::Acquire),
+        quota.limit,
+        requested,
+    ))
+}
 /// Requested bytes currently reserved on this worker thread (test observability).
 #[cfg(test)]
 pub fn used_bytes() -> usize {

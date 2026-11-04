@@ -69,6 +69,15 @@ These rows were added by hand. The rest of this snapshot was not regenerated.
 
 This row was added by hand.
 
+## Added in ADR-063 Q4-GEMMA-COLD (2026-11-04)
+
+- `HF2Q_GEMMA_JOINT_COLD_PREFILL` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Gemma 4 joint cold prefill kill switch. Unset or `1`/`on`/`true` (default, operator decision D3): simultaneous cold first turns with an exact pre-generation boundary of at least 33 rows (all slots idle, at least two lanes, at most 4,096 rows) prefill in one transaction whose every lane is bitwise equal to its per-slot admission; `0`/`off`/`false` restores per-slot admission. Invalid values warn and keep the default. Read once per SlotAware worker and logged as `Gemma joint cold prefill worker decision`; also off when cross-slot admission or hybrid KV is off, or under `HF2Q_BATCHED_BODY=0`, `HF2Q_PREFILL_SLOT_BATCHED=0`, `HF2Q_MM_ID_ROUTING_THRESHOLD`, `HF2Q_DFLASH_XLEN_SDPA=1`, `HF2Q_FA_F16=0`, `HF2Q_NO_FA` or `HF2Q_GLOBAL_FA`.
+- `HF2Q_GEMMA_COLD_TURN0_PROMPTS` (`development-only`) names the JSON file of the four actual turn-0 prompts for the ignored Q4-GEMMA-COLD bitwise gates.
+- `HF2Q_GEMMA_COLD_GS3_REPEATS` (`development-only`) sets the timed repeats of the ignored G-S3 harness (`scripts/q4_gemma_cold_gs3.sh`).
+- `HF2Q_DUMP_SLIDING_MASK` is removed with the block-diagonal cold multi-sequence mask it dumped (D2 cutover).
+
+These rows were added by hand.
+
 ## Remaining promotion queue
 
 The inventory deliberately identifies follow-up work without smuggling it into
@@ -220,7 +229,6 @@ this release:
 | `HF2Q_DUMP_RUN_NAME` | `development-only` | 9 |
 | `HF2Q_DUMP_SDPA_MAX_POS` | `development-only` | 7 |
 | `HF2Q_DUMP_SLIDING_LAYER_0` | `development-only` | 9 |
-| `HF2Q_DUMP_SLIDING_MASK` | `development-only` | 1 |
 | `HF2Q_DUMP_TQ_STATE` | `development-only` | 4 |
 | `HF2Q_EAGLE3_DRAFTER_PATH` | `development-only` | 5 |
 | `HF2Q_EAGLE3_EQUIVALENCE_REPETITIONS` | `development-only` | 3 |
@@ -257,7 +265,10 @@ this release:
 | `HF2Q_GEMMA4_31B_GGUF` | `development-only` | 8 |
 | `HF2Q_GEMMA4_EAGLE3_MIN_ACCEPT` | `development-only` | 2 |
 | `HF2Q_GEMMA4_GGUF` | `development-only` | 11 |
+| `HF2Q_GEMMA_COLD_GS3_REPEATS` | `development-only` | 2 |
+| `HF2Q_GEMMA_COLD_TURN0_PROMPTS` | `development-only` | 3 |
 | `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` | `documented-escape` | 4 |
+| `HF2Q_GEMMA_JOINT_COLD_PREFILL` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_JOINT_WARM_PREFILL` | `documented-escape` | 3 |
 | `HF2Q_GEMMA_N8_EXPECTED_KV_REGIME` | `development-only` | 3 |
 | `HF2Q_GEMMA_N8_PARITY_MAX_TOKENS` | `development-only` | 1 |
