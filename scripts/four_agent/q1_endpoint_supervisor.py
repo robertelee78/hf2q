@@ -647,7 +647,7 @@ def check_gemma_t5_localizer(out, b, case, plan, packet, extent, execution, stor
 
 
 def all128_precondition(packet, execution, branch):
-    """Branch P only (§2.6, condition 7): the packet binds the PyTools `all128-precondition` record. The b5g All128
+    """Branch P only (§2.6, condition 7): the packet binds the PyTools `all128-precondition` record. The same-build All128
     reference's own row-127 argmax must equal frozen[128] (`holds` true) on this case's greedy workload; the receipt
     echoes {path, sha256, holds}. Branch N carries no precondition (absent or null)."""
     bound_record = packet.get('all128_precondition')

@@ -59,7 +59,7 @@ Every Qwen phase and the Gemma series now run on **one** build of record, **b6**
 |---|---|---|---|
 | **b6** | hf2q main after the `mlx-native = "=0.15.18"` pin lands, and while #512 and #527 are still unmerged. If either merges first, use a pinned topic commit: the 0.15.18 pin plus D1/D2 (#684) plus #685, on a parent that precedes both. **Native must be mlx-native 0.15.18**; a candidate on another native version is refused | All of #653: the T0/T3 endpoint gate, T3cm/T6 (§1.4), T5 Preparation, OrdinaryBaseline and ForcedProposal, and the first fork (§1.5). All of #665 (§2.7). The offline D1/D2 tools (`t5_artifact_compare` Q36, `exact --scope`, `q1_gemma_t5_artifact_compare`) run from the b6 helper on the b6 stores | `git merge-base --is-ancestor ea6caf46 <b6>` is true. Record `gh issue view 512/527 --json state,closedAt`, plus `git merge-base --is-ancestor <J1/P4b merge> <b6>` = false for each merge that exists. Record the native version and registry checksum from `Cargo.lock` and the build receipt (0.15.18) |
 
-- **Witness native pin:** the Gemma routing witness admits only `WITNESS_NATIVE_VERSION` (`gemma_routing_witness.rs`, currently 0.15.16). The 0.15.18 pin change must re-review the witness shaders for 0.15.18 and move that constant, or every Gemma b6 case refuses before load.
+- **Witness native pin:** the Gemma routing witness admits only `WITNESS_NATIVE_VERSION` (`gemma_routing_witness.rs`, currently 0.15.16). The 0.15.18 pin change must re-review the witness shaders for 0.15.18 and move that constant. It must also update the hardcoded control `gemma_cohort_localizer.rs:371` (`require_published("0.15.16")`). That control otherwise fails, the b6 build receipt then has `controls_exit` ≠ 0, and every b6 case refuses. If only the constant is left unmoved, the witness-ON Gemma cases refuse before load: T0, T5 and the localizer, but not DriftAll128.
 - **Build receipt:** the b6 receipt records the `adr063_invariance`, `q1_`, full non-ignored and four_agent Python control counts, as earlier builds did.
 - **Same build throughout:** every comparison pair, the first fork and the preparation it consumes are all on b6, so the cross-build preparation precedent is no longer needed. Every hardware run records source commit, binary sha256, artifact digest, native version (0.15.18) and case file, and passes Q5 CalibrationPass.
 
@@ -198,7 +198,7 @@ Each step needs its own composition (§1.2 table), operating review and Q5 Calib
 5. b6: first-fork baseline → first-fork forced.
 6. Offline: `t5_artifact_compare` (Q36), `exact --scope`, `envelope`, then independent review of the receipts.
 
-GPU time [INFERENCE, from the Qwen3.8 precedents of about 1.5 min per process]: 10 processes, about 15–20 minutes.
+GPU time [INFERENCE, from the Qwen3.8 precedents of about 1.5 min per process]: 9 processes (t0, t3, t3cm, t6, t5prep, t5base, t5forced, t5ffbase, t5ffforced), about 14–18 minutes.
 
 ### 1.7 D1 source delta (cfg(test) and tooling only; no serving change)
 
