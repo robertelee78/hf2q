@@ -1,7 +1,7 @@
 # ADR-063: Splash as a second peer of record for the Qwen families — design
 
-Status: design accepted, 2026-11-04 (operator decisions D1–D10 in §10). The investigation was CPU-only, with no
-model load, no server start and no GPU run.
+Status: design approved (operator, 2026-11-04), with decisions D1–D10 in §10 as amended by the independent review.
+The investigation was CPU-only: no model load, no server start and no GPU run.
 Operator decision (2026-11-03): for Qwen3.8 and Qwen3.6, a v0.1.30 Win requires hf2q to finish the canonical
 four-agent coding task at least 5% sooner than **both** the current peer and Splash, each in its best valid
 configuration. This document gives the Splash facts that decision needs, the harness design, the sweep, the GPU
@@ -115,8 +115,9 @@ closing audit checks `/status.transport` and the console's relaunch lines.
 ### 3.3 Memory plan
 
 The plan sizes everything within the Metal budget at start (`engine::planStreamedMemory`). KV grows in extents
-on demand, and a spare reserve of 7% of RAM (2–7 GiB) plus 1 GiB is kept against cache growth
-(`docs/internals.md` Admission and eviction).
+on demand. Growth that no request needs, the prefix cache included, keeps a spare reserve of 7% of RAM clamped to
+2–7 GiB, plus a 1 GiB margin (`docs/internals.md` Admission and eviction). On this 128 GB Mac that is 7 + 1 =
+**8 GiB**.
 
 KV sizes, derived from the GGUF geometry:
 - **Qwen3.8**: 16 full-attention layers × K+V × 4 KV heads × 256 × 1 B (int8) ≈ 32 KiB per token, about 8 GiB at
@@ -127,12 +128,18 @@ Per-lane GDN state is 153 MiB for the 27B and 64 MiB for the 35B in fp32 (`docs/
 roughly the GGUF minus the MTP block. The 35B's routed experts load whole where they fit (`--expert-memory auto`),
 which they do at 128 GB; readiness requires `/status.streamed_experts == null`.
 
-Q5 interaction **[INFERENCE, to be measured in the fit run]**: Splash's cache growth deliberately drives the host's
-spare memory down to its reserve. The Qwen3.8 Q5 effective floor measured on 2026-10-30 was 13.2 GiB of Free plus
-cached memory, above Splash's 7%+1 GiB (≈ 9.96 GiB) spare target. A long run could therefore trip the floor stop
-while Splash is behaving as designed. The canonical client reaches about 2.8k prompt tokens per turn, so the risk
-is small there and larger for the long-context variant. If the calibration trips the floor, the remedy is an
-explicit `--max-memory` (decision D6), not a silent context cut.
+Q5 interaction **[INFERENCE, to be measured in the fit run]**:
+- **Splash's target.** Splash lets its cache grow until the host's spare memory falls to its 8 GiB reserve. It
+  counts purgeable pages and part of what compressing anonymous pages would free (up to a quarter of them) as spare.
+- **Q5's measure.** Q5 measures free plus speculative plus file-backed memory (`q5_host.py`), which excludes both.
+  Splash can therefore drive Q5's measure below 8 GiB while it is still above its own reserve.
+- **Q5's floor.** The effective floor is at least 2 GiB, raised per run from that run's own fastest post-readiness
+  drop and the stop latency (ADR-063 Q5). The 13.2 GiB measured on 2026-10-30 is hf2q's Qwen3.8 floor, not
+  Splash's; Splash gets its own from its fit calibration.
+- **Exposure.** A run can trip the floor while Splash behaves as designed. Long prompts, the long-context variant and
+  bf16 KV (which doubles the KV) are most exposed. The canonical client reaches about 2.8k prompt tokens per turn.
+- **Remedy (decision D6).** An explicit `--max-memory` cap, recorded as part of the configuration. It applies at
+  every sweep point and in the campaign, never as a silent context cut.
 
 ### 3.4 ANE prefill (Qwen3.8 only)
 
@@ -144,8 +151,8 @@ The harness records the directory listing and digests before and after every run
 
 The first start of a configuration calibrates (3–8 s, plus a program compile). It runs in the sweep preflight, never
 inside a timed run. The split uses a private ANE interface. A Splash arm with the split is the engine's documented
-default and is valid unless the quality gate fails. `--disable-ane` is a sweep point and part of the matched
-diagnostic.
+default. Like every configuration, it is valid when Splash's own task outcomes pass (§7.1). `--disable-ane` is a
+sweep point and part of the matched diagnostic.
 
 ### 3.5 Prefix cache and determinism
 
@@ -161,7 +168,7 @@ never made for Splash.
 
 | Path | When | Harness handling |
 |---|---|---|
-| `<models_dir>/.resolved/<sha>/` (symlinks to the GGUF and the draft, plus `model.json` and derived tokenizer/config) | every start | campaign-scoped `models_dir` under `$V/splash-peer/<campaign>/models`, never the checkout's `install/models` |
+| `<models_dir>/.resolved/<sha>/` (symlinks to the GGUF and the draft, plus `model.json` and derived tokenizer/config) | every start | per-run `models_dir` `{OUT}/splash/models`, never the checkout's `install/models` |
 | `<models_dir>/.metadata` | first start of a GGUF | same dir; keyed by GGUF size and digest |
 | `$TMPDIR/splash-cache-*` | SSD cache on | unlinked at creation; space returns at exit. Record `df` before and after |
 | `~/Library/Caches/Splash/prefix-cache/` | every start prunes namespaces unused 14 days (persistent cache off: nothing written) | record listing before and after |
@@ -174,9 +181,12 @@ links them, and it reads the GGUF once per new assembly to digest it. Whether a 
 acceptable under the "never link a model file" host rule is decision D8. The hf2q Qwen3.8 case's
 `text_only_locator` already hard-links the same file per run.
 
-Note: creating that hard link changes the GGUF's ctime. Splash keys its assembly on path, size, mtime and ctime, so
-after every hf2q Qwen3.8 run the next Splash start re-hashes 16.8 GB (about 5–10 s, outside the makespan) and gets a
-new `.resolved/<sha>` path. Runs therefore bind the recorded **digest**, never the assembly path.
+Note: creating that hard link changes the GGUF's ctime. `model.json` records each linked file's path, size, mtime,
+ctime and content digest, and the assembly directory is the sha256 of `model.json` (`install/assembly.py:61-78,
+113-129`). After every hf2q Qwen3.8 run, the next Splash start therefore re-hashes 16.8 GB (outside the makespan)
+and gets a new `.resolved/<sha>` path, `model.json` sha256 and argv. The campaign identity freezes none of those
+(§6.2). It freezes an argv template with the assembly as a per-run value, and the content digests and `model.json`
+fields other than paths and times.
 
 ## 4. Same-artifact check (hf2q's GGUFs)
 
@@ -226,7 +236,8 @@ Implications:
   drafter weights", which is satisfied by digest binding (§5).
 - Splash's GGUF loader repacks the weights into its own kernel layouts in memory at load ("no copy on disk"). The
   numerics differ from hf2q's (int8 KV by default, ANE W8A8 FFN split on the 27B, its own kernels). That is engine
-  behaviour, judged by the quality gate.
+  behaviour. A configuration's validity rests on Splash's own task outcomes (§7.1); the hf2q-vs-Splash quality gate
+  applies to the hf2q candidate.
 
 ## 5. Drafter pins
 
@@ -247,10 +258,11 @@ The native-arm registry (`native_peers.py`) assumes "serve their own native arti
 verdict of record". Splash is neither. It reuses the **adapter interface** (closed request/response envelopes,
 usage, readiness, closing audit, identity, process names) and gets a new role:
 
-- `coding_family.ENGINE_KINDS` gains `splash`. It goes in a new tuple `SAME_ARTIFACT_PEERS = ('splash',)` beside
-  `NATIVE_KINDS`, so that every "native means not the verdict" branch stays correct. The adapter module is
-  `native_peer_splash.py`, resolved by a registry function that accepts both tuples. `q3_role` returns "peer of
-  record (same hf2q GGUF)", and `NATIVE_COMPARISON`/`SAME_GGUF_UNAVAILABLE` are `None`.
+- `coding_family` gains `SAME_ARTIFACT_KINDS = ('splash',)` beside `NATIVE_KINDS`, with
+  `ADAPTER_KINDS = NATIVE_KINDS + SAME_ARTIFACT_KINDS` for client adapter dispatch. Every "native means not the
+  verdict" branch keeps testing `NATIVE_KINDS` (`native_peers.is_native`) and so stays correct.
+- The adapter module is `native_peer_splash.py`, resolved by `native_peers.adapter`, which accepts `ADAPTER_KINDS`.
+  `q3_role` returns "same-artifact peer of record", and `NATIVE_COMPARISON`/`SAME_GGUF_UNAVAILABLE` are `None`.
 - `launch_problems` **requires** the case artifact sha256 to equal the hf2q arm's artifact sha256. This is the
   inverse of the native arms, which refuse an ambient hf2q artifact.
 - `PROCESSES = ('splash',)` covers the engine binary. The Python server is identified by argv, `-m server.server`
@@ -258,19 +270,40 @@ usage, readiness, closing audit, identity, process names) and gets a new role:
 
 ### 6.2 Launch wrapper (`native_peer_splash_launch.py`; serve.argv execs it, so `SERVER_PID` is the server)
 
-1. Verify `SPLASH_DIR`: the clean detached checkout at `SPLASH_COMMIT`, the binary/metallib/host-step sha256s,
-   `build-identity.json` `build_id == SPLASH_BUILD_ID`, and `.venv` pip-freeze sha256.
-2. Verify the GGUF size and mtime against the case, plus `MODEL_SHA256` from the hf2q receipt. Verify the draft
-   dir's blob names and sizes against the pins.
-3. Snapshot the cross-run state listings (§3.6) to `{OUT}/splash/state-before.json`.
-4. Call `install.local.prepare_local_model(MODEL, draft=DRAFT_DIR, models_dir=SPLASH_MODELS_DIR)` inside Splash's
-   `.venv`. Assert the returned `model.json` records the GGUF `digest == MODEL_SHA256` and the draft safetensors
-   digest equal to the pin. Write `{OUT}/splash/launch.json` with the assembly path, `model.json` sha256, argv and
-   env. Its sha256 goes in the approval.
-5. `execve` `{SPLASH_DIR}/.venv/bin/python -u -P -m server.server <assembly> --model hf2q/<family> --binary
+1. Verify `SPLASH_DIR`:
+   - the clean detached checkout at `SPLASH_COMMIT`;
+   - `build-identity.json` `build_id == SPLASH_BUILD_ID`;
+   - `build/splash` sha256 `== SPLASH_BIN_SHA256`, with `host-step.metallib` present;
+   - every `install/requirements.txt` pin present in `.venv`, and the dist-info freeze sha256
+     `== SPLASH_VENV_FREEZE_SHA256`.
+2. Verify the draft: `DRAFT_DIR` is the pinned HF cache snapshot, its `config.json` sha256 equals the pin, and its
+   `model.safetensors` blob name equals the pinned LFS sha256.
+3. Call `install.local.prepare_local_model(MODEL, draft=DRAFT_DIR, models_dir={OUT}/splash/models)` inside Splash's
+   `.venv`. It is a per-run directory and makes no network request.
+4. Check the returned `model.json`:
+   - `family`, `target_format gguf`, `vision_format none`;
+   - exactly one linked GGUF, whose content `digest == MODEL_SHA256`;
+   - the draft weights' digest equal to the pin.
+5. Write `{OUT}/splash/launch.json`. It holds the pid, the argv, the environment, the verified identity, the
+   assembly (path, `model.json` sha256, family, digests) and the cross-run state before the run. It is per run: its
+   sha256 is bound into that run's approval (`native_splash_launch_sha256`), never into the campaign identity.
+6. `execve` the argv template with that run's assembly path:
+   `{SPLASH_DIR}/.venv/bin/python -P -u -m server.server <assembly> --model hf2q/<family> --binary
    {SPLASH_DIR}/build/splash --host 127.0.0.1 --port {PORT} --max-context 256K --idle-release off --no-webui
-   --thinking-end-text <D4> <config flags>`. The environment is `PYTHONPATH={SPLASH_DIR}`, `HF_HUB_OFFLINE=1`,
-   and no `SPLASH_*` except those the case names.
+   --thinking-end-text <D4> <config flags>`.
+   The environment is `PYTHONPATH={SPLASH_DIR}`, `HF_HUB_OFFLINE=1` and `HF_HUB_DISABLE_TELEMETRY=1`. No
+   `SPLASH_*`, `PYTHON*`, `HF_HOME`, `HF_HUB_CACHE` or `HF_TOKEN` is inherited.
+
+What the campaign identity freezes (q3_identity, re-checked before every run):
+- the commit, `build_id`, binary sha256 and venv freeze;
+- the draft's revision and digests;
+- `MODEL_SHA256`, through the same-model rule;
+- `SPLASH_CONFIG`;
+- the argv template.
+
+It never freezes the assembly path, `model.json` bytes, `launch.json` or file times, which change whenever an hf2q
+run touches the GGUF's ctime (§3.6). Per run, readiness re-derives the argv from the template and that run's
+assembly, and requires every `model.json` field other than paths and times to match the frozen values.
 
 ### 6.3 Request parity (closed envelope; Splash ignores unknown Chat fields, `frontend.py` reads by `body.get`)
 
@@ -311,9 +344,24 @@ calibration). Recorded: `/status`, `/v1/models`, `/metrics`. Checks:
 Closing (outside the makespan):
 - `/status` counters equal the client's turn count (`requests.completed`, `failed == 0`, `cancelled == 0`), with
   no engine relaunch;
-- every turn's rendered prompt is re-rendered through `POST /apply-template`. Its bytes must equal hf2q's
-  rendering of the same messages (byte parity), and `/tokenize` of it must equal `usage.prompt_tokens`;
-- each reply is bound to its `Done` console line (tokens, cached, speculation).
+- every turn's prompt is re-rendered through `POST /apply-template`, and `/tokenize` of it must equal
+  `usage.prompt_tokens`; the rendered bytes are archived as `splash-apply-template.raw`;
+- prompt byte parity with hf2q is checked offline after the run, by the hf2q renderer below. Until it runs, the
+  run's parity is `PendingPostOracle`. A mismatch makes the run Invalid;
+- each reply is bound to its `Done` console line (input, cached and output token counts).
+
+**Offline hf2q renderer.** This is the hf2q exact-prefix post-oracle
+(`src/serve/api/handlers_prefix_post_oracle_tests.rs`, `qwen38_n1_exact_prefix_post_oracle`;
+`docs/research/adr063-qwen38-prefix-post-oracle.md`), extended with a Splash mode for both Qwen families. It is
+model-free and starts no server. For each archived Splash request it:
+1. takes the canonical hf2q form of the request (`native_peer_splash.canonical`: the same messages and tools,
+   `enable_thinking` and `preserve_thinking` true, no effort);
+2. renders it with hf2q's production request schema, Qwen template kwargs and renderer, using the frozen
+   artifact's GGUF-embedded template and tokenizer;
+3. compares the prompt bytes with `splash-apply-template.raw`.
+
+Splash's later-system patch is kept only when ordinary conversations render byte-identically to the original
+template, so a byte mismatch means a real rendering difference.
 
 ### 6.5 Q5 cases (to be added with the adapter, not before)
 
@@ -322,39 +370,69 @@ Closing (outside the makespan):
 - `binary {SPLASH_DIR}/build/splash`;
 - artifact `{MODEL}`/`{MODEL_SHA256}`, the **same** values as `qwen38.json`/`qwen36.json`, required non-empty;
 - variables `SPLASH_DIR`, `SPLASH_COMMIT`, `SPLASH_BUILD_ID`, `SPLASH_BIN_SHA256`, `SPLASH_VENV_FREEZE_SHA256`,
-  `DRAFT_DIR`, `DRAFT_SHA256`, `SPLASH_MODELS_DIR` and `SPLASH_CONFIG` (a named sweep point, §7);
-- `client.argv … --engine-kind splash`. The approval carries a `native_splash` block (identity, config, launch.json
-  sha256) and the source freeze adds `native_peers.py`, `native_peer_splash*.py` and their test.
+  `DRAFT_DIR` and `SPLASH_CONFIG` (§7);
+- `client.argv … --engine-kind splash`. The approval carries a `native_splash` block (the launch inputs) and the
+  per-run `launch.json` sha256. The source freeze adds `native_peers.py`, `native_peer_splash.py`,
+  `native_peer_splash_ready.py` and their test.
 
 Sweep cases are derived per config by `splash_sweep.py derive-case --config <name>`, which changes only
 `SPLASH_CONFIG`.
 
-### 6.6 Q2 certification and Q3 code changes
+### 6.6 Run audit and Q3/Q4 code changes
 
-Because Splash cohorts are verdict-bearing, they must be Q2-certified with the adversarial controls, unlike the
-native arms (`q2_certify.py` refuses native cohorts today). Code changes:
-- `q3_campaign.ARMS` gains `splash` (and an optional `splash_matched`), from `--splash-case`;
-- `q3_stats.family_verdict` gains a `vs_splash` contrast with the same `PEER_MARGIN 0.95`, and Win requires both
-  peer contrasts;
-- `required_effects`/the stopping rule include `vs_splash`;
-- `q3_report`/F2 render the Splash contrast beside the peer contrast;
-- `quality_campaign.py --reference-kind splash`;
-- the identity freeze binds the Splash identity in §6.2.
+Splash cohorts are audited the way the peer's are: the dry `audit_agent` audit, plus `q2_run_audit` with the arm's
+audit module (`native_peer_splash_audit.audit_run`: Done/Started lines, render-proof archive, no cancellation, error
+or engine restart). They are not Q2-certified: `q2_certify.py` refuses every non-hf2q cohort, the peer's included,
+because only hf2q has a server phase trace. Code changes:
+- **Arms.** `q3_campaign.ARMS` gains `splash`, set with `--splash-case` (kind `splash` only), `--splash-var`. There
+  is no `splash_matched` arm: the matched-settings diagnostic is sweep-only (§7.2, M × 2).
+- **Stages (D7).** The `splash` arm runs only in the n4 and n1 stages. The 3+1/2+2/1+3 control stages leave it out
+  of their measured arms and Williams orders.
+- **Splash is required.** For `qwen38` and `qwen36`, a campaign of record without a `splash` arm is refused at plan
+  time. In `family_verdict` a missing Splash arm is `Unavailable`, never a Win against the peer alone.
+- **Verdict state.** `state` gains `splash_required`, `splash_unavailable` (dict or None), `splash_failures` and
+  `vs_splash`.
+- **Check order** in `family_verdict`:
+  1. experiment failures → `Failed`;
+  2. quality loss → `Failed`;
+  3. peer unavailable → `Unavailable`;
+  4. Splash required and unavailable → `Unavailable` ("no runnable Splash arm");
+  5. peer failures → `Failed`;
+  6. Splash failures → `Failed` ("a failed Splash arm cannot yield a win");
+  7. not complete → `Pending`;
+  8. vs-peer ratio CI above 1 → `Loss`;
+  9. vs-Splash ratio CI above 1 → `Loss` ("experiment makespan is longer than Splash's");
+  10. the Win conditions, where `vs_splash` must be precise with a CI upper bound ≤ `PEER_MARGIN 0.95`, beside
+      `vs_stock` and `vs_peer`.
+- **Stopping rule.** `q3_report.required_effects` adds `vs_splash` while Splash is available and has not failed.
+  `CONTRASTS` gains `("vs_splash", "splash")`.
+- **Report.** `verdict.json` gains a `splash` block (unavailable, failures, label). Rows render
+  experiment-vs-Splash with baseline `splash`, descriptive, task makespan only, never a win label. Fairness against
+  Splash is reported and not gated.
+- **Quality gate.** `quality_campaign.py --reference-kind splash` (reference engine kind `splash`). In
+  `f2_q3_tier`: `REFERENCES["splash"] = "Splash"`; `required_references` adds `splash` for Qwen families whose
+  record has a Splash arm; `gate_status` binds the reference runs to the campaign's `splash` arm binary and one
+  Splash readiness identity. `--of-record` takes the Splash gate manifest beside the stock and peer ones.
+- **Identity.** `q3_identity` adds the adapter's `campaign_identity` for the `splash` arm. The same-model rule
+  applies to it, unlike native arms, and `launch_problems` requires its artifact sha256 to equal the
+  experiment's.
 
 ## 7. Best valid configuration
 
 ### 7.1 Validity
 
-A configuration is valid when all of these hold:
-- the run is Q5 `CalibrationPass`;
-- it reports 4 lanes (compiled), `max_model_len 262144`, text only, and no engine relaunch;
-- it completes the canonical four-agent task with every Q1/Q3 task and tool gate;
-- its request parity is per §6.3;
-- the arm passes the paired task-quality check against the hf2q candidate's reference (the same rule as the
-  current peer's).
+A configuration is valid when **Splash's own runs** pass, with no hf2q arm involved:
+- every run is Q5 `CalibrationPass`, with no engine relaunch;
+- every run reports 4 lanes, `max_model_len 262144` and text only;
+- every run passes the dry audit, `q2_run_audit` with the Splash audit module, and request parity per §6.3;
+- across the configuration's runs, Splash's task pass fraction (agents whose task passed over agents run) is at
+  least the Q1 numeric-policy floor `paired_min_pass_fraction` 0.75 (`quality_campaign.POLICY`), and every
+  passing task passes the Q1/Q3 task and tool gates.
 
-Engine-documented lossy defaults (int8 KV, the ANE W8A8 split, bf16 state) are valid unless that quality check
-fails.
+The paired task-quality gate between the hf2q candidate and Splash is a Q4 gate on the candidate (§6.6). It never
+rules out a Splash configuration: that would discard exactly the configurations where Splash does better than hf2q.
+Engine-documented lossy settings (int8 KV, which is the default; the Neural Engine W8A8 split, the default on
+Qwen3.8; bf16 state if selected) are valid whenever these conditions hold.
 
 ### 7.2 Sweep grid (one factor at a time from the default, 2 runs each, then confirmation)
 
@@ -366,7 +444,7 @@ fails.
 | S3 | `--disable-ane` | `--verify-rows all` |
 | S4/S5 | `--decode-share 0.25` / `1.0` | same |
 | S6 | `--max-cache-disk 0` | same |
-| M (matched diagnostic, not the arm) | bf16 KV, fp32 state, `--disable-ane`, cache-disk 0 | bf16 KV, fp32 state, `--verify-rows all`, cache-disk 0 |
+| M (matched diagnostic, sweep-only; not a campaign arm) | bf16 KV, fp32 state, `--disable-ane`, cache-disk 0 | bf16 KV, fp32 state, `--verify-rows all`, cache-disk 0 |
 
 Selection uses the declared makespan rule (Q4-DS4 precedent): lowest median makespan among valid points. A best
 within the noise of the runner-up is provisional, and both are re-run (3 runs each) before the campaign of record.
@@ -378,8 +456,9 @@ Speculation on/off cannot be swept (§1). Disclose it as "speculation always on 
 
 1. `build/splash model-check` on the prepared assembly (CPU).
 2. A first start, untimed. It digests the GGUF, derives the tokenizer and, for Qwen3.8, calibrates the ANE split.
-3. Q5 calibration run of S0. If the free-plus-cached floor trips (§3.3), the operator chooses a `--max-memory` cap
-   (D6) and S0 is re-run.
+3. Q5 calibration run of S0. Splash gets its own effective floor from this run (§3.3). If the floor trips here, at
+   any later sweep point or in the campaign, the operator chooses a `--max-memory` cap (D6), and the affected
+   configuration is re-run under the cap.
 
 ## 8. GPU time estimates
 
@@ -412,34 +491,43 @@ arms", and makes these changes:
 - the Q4 win and quality-gate acceptance bullets: the hf2q/Splash ratio meets the same 0.95 bound, and the quality
   gate also runs against Splash;
 - the Q4-QWEN38 Outcome and Predecessors: the Splash Qwen3.8 fit and best-configuration record;
-- the Q4-QWEN36 workload bullet and Predecessors: Splash runs the declared repair-turn workload.
+- the Q4-QWEN36 workload bullet and Predecessors: Splash runs the declared Qwen3.6 workload.
 
 ## 10. Decisions (operator, 2026-11-04)
 
-The operator accepted every recommendation on 2026-11-04. The rejected alternatives are kept for the record.
+The operator accepted every recommendation on 2026-11-04 and approved this design (operator, 2026-11-04). The
+independent review (ACCEPT-WITH-CONDITIONS) then tightened D6, D9 and D10 as written here. The rejected alternatives
+are kept for the record.
 
 - **D1 — Campaign structure: one five-arm Williams campaign per family** (stock, experiment, peer, peer_matched,
-  splash), with same-session thermal conditions and one identity freeze. The rejected alternative was a separate
-  experiment-vs-Splash campaign bound to the record campaign's candidate binary.
+  splash), with same-session thermal conditions and one identity freeze. There is no Splash matched-settings arm:
+  that diagnostic is sweep-only (§7.2). The rejected alternative was a separate experiment-vs-Splash campaign bound
+  to the record campaign's candidate binary.
 - **D2 — Pin: source build `031a25a6`** (§2.1 identity). The `1.5.0` bottle is not used.
 - **D3 — Repetition penalty: none is sent** (Splash default 1.0), as the TensorFold arm does. The difference from
   hf2q's 1.05 over a 64-token window is recorded in every Splash statement and run audit.
 - **D4 — Forced thinking close: hf2q's text**, `--thinking-end-text $'\nI need to answer now.</think>'` (8 tokens,
   §4).
 - **D5 — `parallel_tool_calls: false`** is sent (hf2q's default). Splash constrains calls by its grammar.
-- **D6 — Memory cap: `--max-memory auto`.** An explicit cap is allowed only if the Q5 free-plus-cached floor trips
-  in the S0 calibration. The cap then becomes part of the recorded configuration and is never silently changed.
+- **D6 — Memory cap: `--max-memory auto` by default.** If the Q5 floor trips at any sweep point or in the campaign
+  (§3.3), an explicit cap is allowed. The cap is recorded as part of that configuration (`max_memory` knob) and
+  applied to every later run of it. A cap found during the campaign halts it, and the configuration is re-confirmed
+  under the cap before the campaign restarts. It is never silently changed or used to cut context.
 - **D7 — Controls: Splash runs in the n4 (four-agent) and n1 (single-agent) stages only.** It does not run in the
   3+1/2+2/1+3 mixed controls.
 - **D8 — Symlinks: acceptable.** Splash's assembly symlinks to the GGUF and the draft (no hard link, no write).
-- **D9 — Qwen3.6 workload: the repair-turn workload.** The Splash Qwen3.6 case runs the Q4-QWEN36 repair-turn
-  workload, one repair turn after a failed `run_tests` (`qwen_n4_live_smoke.py --repair-turns 1`, Qwen3.6 only),
-  exactly as the hf2q and peer Qwen3.6 arms do. Qwen3.8 keeps the canonical six-step protocol. The client's
-  repair-turn gate ("repair turns are Qwen hf2q/peer runs") is widened to `splash` once that workload lands on
-  main.
-- **D10 — Lossy defaults are valid unless Splash's quality gate fails.** These are int8 KV, bf16 state if selected,
-  and the Neural Engine W8A8 FFN split. If the paired task-quality check against Splash fails in a configuration,
-  that configuration is invalid for the best-configuration choice.
+- **D9 — Qwen3.6 workload: the declared Qwen3.6 workload.** The Splash Qwen3.6 case runs whatever workload
+  Q4-QWEN36 declares for the hf2q and peer Qwen3.6 arms. The operator's direction is the repair-turn workload,
+  one repair turn after a failed `run_tests` (`qwen_n4_live_smoke.py --repair-turns 1`, Qwen3.6 only), once it is
+  recorded in ADR-063. That workload and its decision are still unmerged (#662), and the draft makes it
+  conditional on clearing the quality floor. Until it is recorded, the Splash Qwen3.6 arm waits. Qwen3.8 keeps the
+  canonical six-step protocol. When the workload lands, the client's repair-turn gate ("repair turns are Qwen
+  hf2q/peer runs") is widened to `splash`.
+- **D10 — Lossy engine settings are valid when Splash's own task outcomes pass.** These are int8 KV (the default),
+  bf16 state (only if a sweep point selects it; fp32 is the default) and the Neural Engine W8A8 FFN split (the
+  Qwen3.8 default). A configuration is valid or invalid on Splash's own runs (§7.1): Q5, the run audits, the Q1
+  pass-fraction floor and the task gates. The paired hf2q-vs-Splash quality gate is a Q4 gate on the hf2q
+  candidate and never disqualifies a Splash configuration.
 
 ## 11. Open risks
 
