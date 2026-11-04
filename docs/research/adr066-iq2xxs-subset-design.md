@@ -698,8 +698,9 @@ quality campaign.
   adapter does not hash inline. The verification is §6.1 T2's full-file
   digest. Its receipt path goes into each case's notes, and the campaign
   reports cite it.
-- `q5_cases/peer-deepseek4-ds4file.json` takes its flags from Q4-DS4's best
-  valid configuration (load mode none, ubatch 1024). It keeps
+- `q5_cases/peer-deepseek4-ds4file.json` takes its flags from the best
+  valid configuration of the §7.1 re-sweep (none/1024, auto/1024, none/512
+  on this file). It keeps
   `--chat-template-file` at `aec3d906…`, which the client enforces
   (`family_peer.py:45-46,153,176-177`).
 - `q5_cases/native-ds4-deepseek4-samefile.json` is a copy of
@@ -1017,7 +1018,8 @@ Both are recorded in ADR-063 (commit `64c6f902`).
    1. §6.1 (including T2's file digest) and §6.2;
    2. §6.3;
    3. the Q5 calibration (§7.3);
-   4. §7.4 step 1, then QG-stock;
+   4. the §7.1 peer re-sweep (none/1024, auto/1024, none/512 on this file),
+      then §7.4 step 1, then QG-stock;
    5. §7.4 steps 2 and 3, then QG-peer and QG-ds4 (§6.5);
    6. attribution (§7.5);
    7. the verdict (§7.6).
