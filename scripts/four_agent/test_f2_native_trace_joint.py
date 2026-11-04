@@ -156,6 +156,13 @@ def widths(pre_aux=False):
     return joint.build()
 
 
+def full_width_only():
+    joint = Joint(False)
+    for index in range(2):
+        joint.forward((0, 1, 2, 3), boundary=index == 0)
+    return joint.build()
+
+
 def joint_records(records, kind, forward=0):
     """Records of `kind` belonging to the `forward`-th joint transaction."""
     epoch = 100 + 20 * forward
@@ -207,6 +214,11 @@ class JointWitnessP1(unittest.TestCase):
         # Joint witnesses never enter the Q2 v2 counting input.
         self.assertEqual([item["command_id"] for item in result["submissions"]], [1, 2, 3, 4])
         self.assertFalse(result["operator_shared_batch4_observed"])
+
+    def test_histogram_keys_do_not_depend_on_observed_widths(self):
+        joint = report(*full_width_only())[native.JOINT_OPERATION]
+        self.assertEqual(joint["width_histogram"], {"logical4_pad0": 2, "logical3_pad1": 0,
+                                                    "logical2_pad2": 0, "logical1_pad3": 0})
 
     def test_pre_input_auxiliary_scopes_reduce_identically(self):
         base, variant = report(*widths()), report(*widths(pre_aux=True))

@@ -476,9 +476,7 @@ class NativeTrace:
             return {"commands": len(commands), "dispatches": sum(c["dispatches"] for c in commands),
                     "first_submit_ns": min(submits, default=None),
                     "last_checked_return_ns": max(drains, default=None)}
-        histogram = {}
-        if any(forward["padding"] for forward in self.joint_forwards.values()):
-            histogram = {f"logical{n}_pad{JOINT_PADDED_WIDTH - n}": 0 for n in range(JOINT_PADDED_WIDTH, 0, -1)}
+        histogram = {f"logical{n}_pad{JOINT_PADDED_WIDTH - n}": 0 for n in range(JOINT_PADDED_WIDTH, 0, -1)}
         forwards, ambiguous, pre_forward = [], 0, 0
         for forward_id, forward in sorted(self.joint_forwards.items()):
             bucket = f"logical{forward['logical']}_pad{forward['padding']}"
