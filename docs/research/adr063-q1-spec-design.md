@@ -30,7 +30,7 @@ Binding text:
 
 Requirements the hosted controls cannot prove, so the run must:
 - T5 requires a loaded MTP head (`runner.rs:224-227`, `model.model.mtp.is_some()`). The independent review read the Qwen3.6 GGUF header: `qwen35moe.nextn_predict_layers` = 1 and 20 `blk.40.*` tensors. If the head still fails to load, the runner refuses before forward work. T5 is then recorded as `SourceCapabilityRefusal` with that error, not Missing.
-- T5 forced mode needs `mtp_cost.may_speculate()` after one ordinary warm-up (`trajectory.rs:128-132`; `cost_controller.rs:39-41`: enabled and `ordinary_samples > 0`). There is no override. A refusal here is an infrastructure-class failure with no helper verdict (§1.5 rerun rule).
+- T5 forced mode needs `mtp_cost.may_speculate()` after one ordinary warm-up (`trajectory.rs:128-132`; `cost_controller.rs:39-41`: enabled and `ordinary_samples > 0`). There is no override. A refusal here is a **deterministic helper refusal**. It is recorded as `SourceCapabilityRefusal`, or as an adapter defect if `ordinary_samples` is 0 after the warm-up, and it is never rerun (§1.4 rerun boundary).
 
 ### 1.2 Build and ordering against ADR-065
 
@@ -41,7 +41,7 @@ The rule is that the binary comes from main at or after `ea6caf46` and before P4
 | Build | Source | Use | Relation, recorded in every receipt |
 |---|---|---|---|
 | **b4** | main `d817dffa7371a2db85a43ed1d6502350906c33f5`; test binary `$C/build-d817dffa…/test-binary`, sha256 `8c0b6a054530beb18bec76d7d43b457095cf53b12011f77c39e8596dae26d823` | T6 block (§1.4), the T0/T3 endpoint gate, and the T5 phases Preparation, OrdinaryBaseline and ForcedProposal (§1.5). None of these needs a D1 runtime change. Shareable with Q1-QWEN38-RERUN (#664) | `git merge-base --is-ancestor ea6caf46 d817dffa` is true (20 commits after it). #527 and #512 were OPEN on 2026-11-03 |
-| **b5** | main after the D1 delta (§1.7) merges, while #512 and #527 are still unmerged. If either merges first, use a pinned topic commit `d817dffa + D1`, whose parent precedes both | `qwen36-t0-b5` (the b5 T0-first gate), then the T5 first fork only. The offline D1 tools (`t5_artifact_compare` Q36, `exact --scope`) run from the b5 helper on the b4 stores, as the Qwen3.8 T5 compare did (separate helper binary) | Record `gh issue view 512/527 --json state,closedAt`, plus `git merge-base --is-ancestor <J1/P4b merge> <b5>` = false for each merge that exists |
+| **b5** | main after the D1 delta (§1.7) merges, while #512 and #527 are still unmerged. If either merges first, use a pinned topic commit `d817dffa + D1`, whose parent precedes both. **Native must be mlx-native 0.15.16**, the same pin as b4; the fallback commit inherits it from `d817dffa`. A b5 candidate on another native version is refused | `qwen36-t0-b5` (the b5 T0-first gate), then the T5 first fork only. The offline D1 tools (`t5_artifact_compare` Q36, `exact --scope`) run from the b5 helper on the b4 stores, as the Qwen3.8 T5 compare did (separate helper binary) | Record `gh issue view 512/527 --json state,closedAt`, plus `git merge-base --is-ancestor <J1/P4b merge> <b5>` = false for each merge that exists. Record the native version and registry checksum from `Cargo.lock` and the build receipt; both must equal b4's (0.15.16) |
 
 Build-log observations for b4 (`build-receipt.json` present):
 - adr063_invariance: 104 passed / 0 failed / 17 ignored;
@@ -116,7 +116,12 @@ Verdict rules:
 - **Pass:** P6-1, P6-2 and P6-3 all as expected.
 - **Defect:** any `DivergedExactInvariant` in P6-1 to P6-3. The case fails, as for the Qwen3.8 #561 cursor bug, and it is not rerun.
 - **Count mismatch with complete stores:** an evidence-binding error (wrong store or extent). The decision is recomputed on the correctly bound stores; the model is not rerun.
-- **Rerun rule (all Part 1 and Part 2 cases):** a model process is rerun only after a supervisor or infrastructure failure that produced no helper verdict (host gate, deadline, interrupt, preload headroom). A helper refusal or a completed decision is the verdict, so a deterministic route is never rerun until it passes (policy §3.7).
+- **Rerun boundary (all Part 1 and Part 2 cases), decided from the supervisor `receipt.json`** (`q1_endpoint_supervisor.py:255-299`). A model process is rerun **only** in these cases:
+  - `model_launch_attempted` is false, meaning a pre-Popen supervisor check failed: quiet host, chip, baseline pressure/headroom, bindings, model stat or binary identity;
+  - `failure` is the deadline watchdog: `'interruption/case watchdog'` while the child runs, or `'actual helper failed/deadline'` with `exit` 0 and `elapsed_seconds` above the deadline;
+  - the run was interrupted (signal);
+  - a runtime resource gate fired: `'runtime pressure'`, `'runtime operating floor'`, `'swap/compressor growth'` or `'RSS/footprint operating limit'` (`:270-277`).
+- **Helper verdict, never rerun:** any non-zero helper `exit` after launch. This covers a panic, an `anyhow` refusal, or an in-process check (the runner's `.unwrap()` turns every refusal into a test failure). The record keeps the stderr panic text, the helper's `execution.json` `error` and status, and every store the helper finished. Exit 0 followed by a supervisor validation failure (marker, store extent, registry check) is also evidence about the helper, not grounds for a rerun. Rerunning a deterministic route until it passes is forbidden (policy §3.7).
 - **P6-4/P6-5:** a divergence there with P6-1 to P6-3 exact is attributed to the prefix route (engine prefill vs direct `forward_gpu`) and recorded as a finding. It is not a T6 failure.
 
 Supervisor check `qwen_t6_continuation` (§3), with per-store count binding, because `execution.json` `trace_records` counts only the `continuation` store:
@@ -267,6 +272,7 @@ Extend `adr063_invariance::gemma_ngram` rather than add a parallel module. Its h
   6. **Teacher-forced** continuation: for positions 129+a..143, `forward_decode(frozen[p], p)`. The fallback ID and each model argmax are recorded as decisions, never as inputs. This keeps §3.2's "identical frozen inputs" over the whole row set.
   7. Capture the cache at 144.
 - In T5 mode the journal writes events only (proposal, verify_input, acceptance, commit, lineage, cache_ownership). Tensors go to the stores.
+- **Failure receipt:** like the Qwen T5 runner (`runner.rs:334-395`), the Gemma T5 adapter catches the per-lane result, then calls `fail(error)` and `finish` on every store. It always writes `output/execution.json` with `schema hf2q.q1.gemma-t5-phase.v1`, `packet_sha256`, `arm`, `status` (`CompleteScopedAcquisition` or `FailedOrIncomplete`), `error` (the full error chain, or null), the decisions recorded so far, per-store `records`, and `whole_q1_qualified: false`. Only after that does it return the error. A Class B refusal (initial decision at row 127) is therefore on record from the helper's own receipt.
 
 **Stores, coordinates and counts** [INFERENCE: cache count from v3, which held 4200 cache tensors per phase over 4 owners = 1050 per lane per boundary = 630 Hybrid + 420 dense companion; the adapter's manifest, validated against the live banks before capture as the journal already does, is authoritative]:
 
