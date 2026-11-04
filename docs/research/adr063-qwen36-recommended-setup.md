@@ -252,7 +252,11 @@ Campaign `$V/q4-qwen36/campaigns/quality-qwen36-repair1-ours-20261104T054600Z`, 
 
 Analysis: `analyze_repair.py` writes `repair-analysis.json` in the evidence directory.
 
-### Draft ADR-063 amendment (for the operator; the root lands the ADR edit)
+### Draft ADR-063 amendment (DRAFT, pending the R1 defect diagnosis; the root lands the ADR edit)
+
+Do not land this text yet. R1 is an hf2q `Loss` on this workload. The amendment waits until the
+same-prefix fork replay names the cause of hf2q re-emitting the failing file on the repair turn, and until
+any defect it finds is fixed and re-measured.
 
 Under Q4-QWEN36, after "If Qwen3.6 stays BelowFloor under every setup tested …":
 
