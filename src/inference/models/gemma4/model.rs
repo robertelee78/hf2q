@@ -650,6 +650,11 @@ pub struct MlxModelWeights {
     /// [`GemmaLiveKernel::VecHybrid`]; `1` opts in to
     /// [`GemmaLiveKernel::TiledF16`]).
     pub warm_live_kernel: GemmaLiveKernel,
+
+    /// ADR-063 Q4-GEMMA-PREFILL-MOE — shape of the prefill MoE down call
+    /// (flattened or slotted; bitwise equal). Resolved once at load from
+    /// `HF2Q_GEMMA_PREFILL_MOE_DOWN` (default slotted).
+    pub(crate) prefill_moe_down: crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown,
 }
 
 /// ADR-040 iter-G(a) — per-call descriptor for cross-slot batched prefill.
@@ -1444,6 +1449,7 @@ impl MlxModelWeights {
             // wrapper sets it per-call; None preserves byte-identical single-seq.
             multi_seq_prefill: None,
             warm_live_kernel: crate::serve::gemma_live_attention::warm_live_kernel_from_env(),
+            prefill_moe_down: crate::serve::gemma_prefill_moe::prefill_moe_down_from_env(),
         });
 
         // Pre-initialize constant param buffers so we never write them

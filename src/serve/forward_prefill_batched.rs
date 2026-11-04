@@ -54,9 +54,10 @@ fn validate_batched_prefill_argmax(value: f32, head_row: usize) -> Result<()> {
 }
 
 /// Test-only per-layer capture of batched prefills on the calling thread
-/// (ADR-063 Stage 2 envelope localization). While armed, every layer
-/// commits and waits, then copies its attention output (after the FWHT sign
-/// undo) and its residual output to the host.
+/// (ADR-063 Stage 2 envelope localization, Q4-GEMMA-PREFILL-MOE route
+/// A/B). While armed, every layer commits and waits, then copies its
+/// attention output (after the FWHT sign undo), its routed-expert down
+/// output, its combined MLP output and its residual output to the host.
 #[cfg(test)]
 pub(crate) mod live_layer_probe {
     use std::cell::RefCell;
@@ -69,6 +70,12 @@ pub(crate) mod live_layer_probe {
         pub(crate) attn: Vec<f32>,
         /// Residual stream after the layer `[rows, hidden]`.
         pub(crate) hidden: Vec<f32>,
+        /// Routed-expert down output `[rows, top_k, hidden]`.
+        pub(crate) moe_down: Vec<f32>,
+        /// Dense + weighted-expert MLP output after the post-FFN norms
+        /// `[rows, hidden]` (the fused weighted sum writes here, not into
+        /// `pf_moe_accum`).
+        pub(crate) mlp_out: Vec<f32>,
     }
 
     thread_local! {
@@ -109,44 +116,50 @@ fn live_layer_probe_armed() -> bool {
 
 /// Record one finished layer when the probe is armed (tests only).
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn live_layer_probe_capture(
     layer: usize,
     sliding: bool,
     (heads, head_dim, hidden_size): (usize, usize, usize),
     rows: usize,
+    top_k: usize,
     attn: &MlxBuffer,
     hidden: &MlxBuffer,
+    (moe_down, mlp_out): (&MlxBuffer, &MlxBuffer),
 ) -> Result<()> {
     if !live_layer_probe::armed() {
         return Ok(());
     }
-    let attn = attn
-        .as_slice::<f32>()
-        .map_err(|e| anyhow::anyhow!("probe attention L{layer}: {e}"))?[..rows * heads * head_dim]
-        .to_vec();
-    let hidden = hidden
-        .as_slice::<f32>()
-        .map_err(|e| anyhow::anyhow!("probe hidden L{layer}: {e}"))?[..rows * hidden_size]
-        .to_vec();
+    let copy = |buffer: &MlxBuffer, len: usize, name: &str| -> Result<Vec<f32>> {
+        Ok(buffer
+            .as_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("probe {name} L{layer}: {e}"))?[..len]
+            .to_vec())
+    };
     live_layer_probe::push(live_layer_probe::LayerCapture {
         layer,
         sliding,
         head_dim,
-        attn,
-        hidden,
+        attn: copy(attn, rows * heads * head_dim, "attention")?,
+        hidden: copy(hidden, rows * hidden_size, "hidden")?,
+        moe_down: copy(moe_down, rows * top_k * hidden_size, "moe_down")?,
+        mlp_out: copy(mlp_out, rows * hidden_size, "mlp_out")?,
     });
     Ok(())
 }
 
 #[cfg(not(test))]
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn live_layer_probe_capture(
     _layer: usize,
     _sliding: bool,
     _shape: (usize, usize, usize),
     _rows: usize,
+    _top_k: usize,
     _attn: &MlxBuffer,
     _hidden: &MlxBuffer,
+    _moe: (&MlxBuffer, &MlxBuffer),
 ) -> Result<()> {
     Ok(())
 }
@@ -4988,7 +5001,24 @@ impl MlxModelWeights {
                         anyhow::anyhow!("imatrix moe intercept (down) L{layer_idx}: {e}")
                     })?;
 
-                    crate::inference::expert_dispatch::dispatch_expert_matmul_id_pooled(
+                    // ADR-063 Q4-GEMMA-PREFILL-MOE P1: at mm_id row counts
+                    // the slotted call reads the same `[seq_len, top_k, K]`
+                    // rows and writes the same offsets as the flattened
+                    // `[seq_len·top_k]` call, bitwise, with top_k× fewer
+                    // launched threadgroups (design §3.2, §4.1).
+                    let down = crate::serve::gemma_prefill_moe::down_call(
+                        self.prefill_moe_down,
+                        seq_len,
+                        top_k,
+                        gemma_moe_use_affine,
+                        crate::serve::gemma_prefill_moe::mm_id_threshold_override_present(),
+                    );
+                    let dispatch_down = if down.slotted {
+                        crate::inference::expert_dispatch::dispatch_expert_matmul_id_pooled_slotted
+                    } else {
+                        crate::inference::expert_dispatch::dispatch_expert_matmul_id_pooled
+                    };
+                    dispatch_down(
                         &mut s,
                         reg,
                         dev,
@@ -4998,8 +5028,8 @@ impl MlxModelWeights {
                         &mut pf_moe_down,
                         &mut pf_moe_mm_scratch,
                         &mlx_native::GgmlQuantizedMatmulIdParams {
-                            n_tokens: (seq_len * top_k) as u32,
-                            top_k: 1,
+                            n_tokens: down.n_tokens,
+                            top_k: down.top_k,
                             n: hs as u32,
                             k: moe_int as u32,
                             n_experts: num_experts as u32,
@@ -5274,8 +5304,10 @@ impl MlxModelWeights {
                 is_sliding,
                 (nh, hd, hs),
                 seq_len,
+                self.layers[layer_idx].moe.top_k,
                 &pf_sdpa_out,
                 &pf_hidden,
+                (&pf_moe_down, &pf_mlp_down),
             )?;
 
             // ADR-011 Phase 3 Wave P3b.2 — Session C ("write K,V to dense

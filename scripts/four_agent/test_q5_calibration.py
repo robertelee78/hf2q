@@ -501,6 +501,27 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(launcher.count('${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"}'), 2)
         self.assertIn('0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)
 
+    def test_gemma_case_forwards_only_explicit_prefill_moe_arms(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['PREFILL_MOE_DOWN'], '')
+        self.assertEqual(stock['serve']['env']['MM_ID_SCHEDULE'], '')
+        self.assertNotIn('HF2Q_GEMMA_PREFILL_MOE_DOWN', stock['serve']['env'])
+        self.assertNotIn('HF2Q_MM_ID_SCHEDULE', stock['serve']['env'])
+        arm_a = q5_case.build_plan(case, builtins, {
+            **self.required(), 'HF2Q_Q5_GEMMA_PREFILL_MOE_DOWN': 'flat', 'HF2Q_Q5_MM_ID_SCHEDULE': 'grid'})
+        self.assertEqual(arm_a['serve']['env']['PREFILL_MOE_DOWN'], 'flat')
+        self.assertEqual(arm_a['serve']['env']['MM_ID_SCHEDULE'], 'grid')
+        self.assertEqual(arm_a['serve']['env']['WARM_TILED_ATTENTION'], '', 'arms are independent')
+        self.assertEqual(arm_a['serve']['env']['JOINT_WARM_PREFILL'], '', 'arms are independent')
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count(
+            '${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"}'), 2)
+        self.assertEqual(launcher.count('${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"}'), 2)
+        self.assertIn('flat|slotted) PREFILL_MOE_DOWN_ENV="$PREFILL_MOE_DOWN" ;;', launcher)
+        self.assertIn('grid|compact) MM_ID_SCHEDULE_ENV="$MM_ID_SCHEDULE" ;;', launcher)
+
     def test_run_id_matches_client_identity_rule(self):
         for name in ('x', 'q5-qwen38-20261030T120000Z', 'a.b c' * 30):
             self.assertRegex(q5_calibration.run_id(name, 'f' * 32), r'^[A-Za-z0-9_-]{16,64}$')

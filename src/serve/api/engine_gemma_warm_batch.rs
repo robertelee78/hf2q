@@ -698,6 +698,24 @@ mod tests {
             .collect()
     }
 
+    /// ADR-063 Q4-GEMMA-PREFILL-MOE §4.1: both prefill MoE down routes are
+    /// Class A, so neither refuses joint warm prefill.
+    #[test]
+    fn gemma_prefill_moe_down_switch_keeps_joint_warm_worker() {
+        let env = crate::serve::gemma_prefill_moe::PREFILL_MOE_DOWN_ENV;
+        let saved = std::env::var_os(env);
+        std::env::remove_var(env);
+        let baseline = worker_enabled();
+        for value in ["flat", "slotted"] {
+            std::env::set_var(env, value);
+            assert_eq!(worker_enabled(), baseline, "{env}={value}");
+        }
+        match saved {
+            Some(value) => std::env::set_var(env, value),
+            None => std::env::remove_var(env),
+        }
+    }
+
     #[test]
     fn gemma_joint_warm_four_tool_turns_form_one_cohort() {
         let requests: Vec<Request> = (0..4)

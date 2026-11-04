@@ -3060,6 +3060,7 @@ embed_weight,
             decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
             multi_seq_prefill: None,
             warm_live_kernel: crate::inference::models::gemma4::GemmaLiveKernel::TiledF16,
+            prefill_moe_down: crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown::Slotted,
         }
     }
 
@@ -3423,6 +3424,7 @@ embed_weight,
             decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
             multi_seq_prefill: None,
             warm_live_kernel: crate::inference::models::gemma4::GemmaLiveKernel::TiledF16,
+            prefill_moe_down: crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown::Slotted,
         };
 
         let tokens: Vec<u32> = vec![0, 1];

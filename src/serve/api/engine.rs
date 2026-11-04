@@ -58613,5 +58613,9 @@ mod gemma_warm_batch_fault_tests;
 mod gemma_warm_tiled_tests;
 
 #[cfg(test)]
+#[path = "engine_gemma_prefill_moe_tests.rs"]
+mod gemma_prefill_moe_tests;
+
+#[cfg(test)]
 #[path = "engine_template_json_order_tests.rs"]
 mod template_json_order_tests;
