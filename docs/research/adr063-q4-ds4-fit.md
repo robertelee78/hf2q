@@ -20,10 +20,11 @@ The file is a benchmark comparison artifact, not a substitute for hf2q conversio
 |---|---|
 | Peer binary | `4b604952a8ac42121974fec1124b34bdeb345383450f0c17c5a20a4d16458c6b`, `/props` build `b128-e86f5fd` (source `e86f5fd1`) |
 | Peer artifact | `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`, 86,720,111,488 bytes, sha256 `ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0` |
-| hf2q binary | v0.1.29 release `86b64b029c6f717f3b6c58654c2aa5b29f420ffa93fe09f31348755fd2df48f2` (main `d817dffa`) |
+| hf2q binary | v0.1.29 release `86b64b029c6f717f3b6c58654c2aa5b29f420ffa93fe09f31348755fd2df48f2` (tag `v0.1.29` = `c40fbf37`) |
 | hf2q artifact | `DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf`, 107,431,343,264 bytes, sha256 `50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6` |
 | Peer case | `scripts/four_agent/q5_cases/peer-deepseek4-ds4file.json`, sha256 `72cc4f6e…` (commit `61aa5171`) |
 | hf2q cases | `q5_cases/deepseek4.json` `d362f00e…` (H1, trace log filter); derived stage-profile case `06265819…` (H2, `HF2Q_DEEPSEEK_STAGE_PROFILE=1`) |
+| hf2q receipts | H1 `33e4aceecbaed9d73ebbe254e0207373c225ae34a1648d745e761ff193e30cb9` (CalibrationPass, 102.96 s); H2 `d27e0268f98b39f46264c379514a689911aa8e51fb656981238874b1348798a6` (CalibrationPass, serial graph, makespan not compared) |
 | Chat template (both arms) | reviewed DeepSeek-V4 0731 template `aec3d906…` |
 | Sandbox proof / approvals | `owned-cleanup-sandbox-capability-20261031T222313Z/proof.json` `8b286684…`; `approval-templates-proof-8b286684/{peer-deepseek4,deepseek4}-client-approval.json` |
 
@@ -42,7 +43,7 @@ Peer device memory at exit (run r2, MiB): `110100 total = 19341 free + (90757 se
 1928 compute)`. The KV buffers are allocated for the full 4 × 262,144 up front: CSA 5,376, lightning indexer 1,344,
 HCA 160, SWA 215 MiB, plus 46.6 MiB of compressor state. No run logged a Metal out-of-memory or compute error. Every
 run: `stop: null`, `cleanup_proven: true`, pressure normal throughout, no blind samples, thermal state 0. Peak host
-use 103.1–111.6 GiB (minimum free+cached 16.4–24.9 GiB against a 2.0–2.6 GiB floor).
+use 103.1–111.6 GiB (minimum free+cached 16.4–24.9 GiB against a 2.0 GiB effective floor).
 
 | Run | Load mode / ubatch | Q5 verdict | Makespan (s) | Completion tokens | Peak host GiB | receipt sha256 |
 |---|---|---|---|---|---|---|
@@ -128,7 +129,8 @@ bytes alone. The same-file attribution is Q4-DS4-RACE.
 
 All under `$V/q4-ds4/`:
 - `runs/peer-{f1,f1b,s1,s2,s3,r1,r2}-*/` (Q5 receipt, `server.stderr`, client summaries), each with sibling
-  `.metrics.jsonl`, `.profile.{json,txt}`, `.identities.txt`, `.host-{before,after}.txt`;
+  `.metrics.jsonl`, `.profile.{json,txt}` (regenerated with extractor `b643d9ed…`, schema
+  `hf2q.q4-ds4.stage-profile.v2`), `.identities.txt`, `.host-{before,after}.txt`;
 - `runs/hf2q-trace-h1-v0129-trace-20261103T230844Z/`, `runs/hf2q-stage-h2-v0129-stage-20261103T231216Z/`;
 - `stage-profile-comparison.{json,txt}`, `fit-preflight.json` (pre-run memory estimate: 6.72 GiB KV predicted,
   7,095 MiB KV buffers observed), `run_q4_ds4.sh`, `poll_peer.py`, `profile_extract.py`, `cases/`;
