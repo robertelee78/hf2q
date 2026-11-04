@@ -9132,111 +9132,110 @@ mod tests {
         }
     }
 
-    /// **Parity test**: IMROPE on GPU matches the scalar CPU reference.
-    /// Input is a synthetic Q buffer shaped `[seq_len, n_head, head_dim]`
-    /// already per-head-normalized; positions are text-convention
-    /// `[t, t, t, t]` per token. Expected output is `imrope_inplace()` from
-    /// the CPU reference (re-implemented inline here to keep the test
-    /// self-contained).
+    /// **Parity test**: IMROPE on GPU matches the scalar CPU reference
+    /// `full_attn::imrope_inplace` (pairs `(p, p + rotary_dim/2)`, tail
+    /// pass-through). Input is a synthetic Q buffer shaped
+    /// `[seq_len, n_head, head_dim]`; positions are text-convention
+    /// `[t, t, t, t]` per token. Covers the small fixture shape (16/8) and the
+    /// Qwen3.5/3.6 production shape (256/64, sections [11,11,10,0], theta 1e7)
+    /// at positions from 0 to 262143.
     #[test]
     fn imrope_matches_cpu_ref() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
-        let (shape, _weights_cpu, seq_len) = small_shape_and_weights();
-        let nh = shape.n_head as usize;
-        let d = shape.head_dim as usize;
-        let rotary_dim = shape.rotary_dim as usize;
-        let half_rope = rotary_dim / 2;
-        let half_dim = d / 2;
-        let sect_dims = shape.mrope_section.iter().sum::<u32>().max(1);
+        let (small, _weights_cpu, small_seq) = small_shape_and_weights();
+        let small_pos: Vec<i32> = (0..small_seq as i32).collect();
+        let mut production = small;
+        production.n_head = 4;
+        production.head_dim = 256;
+        production.rotary_dim = 64;
+        production.rope_theta = 1e7;
+        production.mrope_section = [11, 11, 10, 0];
+        let production_pos = vec![0, 1, 31, 1000, 4095, 262_143];
 
-        // Synthetic Q after per-head norm.
-        let n_elem = seq_len as usize * nh * d;
-        let mut seed = 0xBEEF_u32;
-        let q_cpu: Vec<f32> = (0..n_elem)
-            .map(|_| {
-                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-                ((seed as i32 as f32) / (i32::MAX as f32)) * 0.5
-            })
-            .collect();
+        for (shape, token_pos) in [(small, small_pos), (production, production_pos)] {
+            let seq_len = token_pos.len() as u32;
+            let nh = shape.n_head as usize;
+            let d = shape.head_dim as usize;
+            let n_elem = seq_len as usize * nh * d;
+            let mut seed = 0xBEEF_u32;
+            let q_cpu: Vec<f32> = (0..n_elem)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((seed as i32 as f32) / (i32::MAX as f32)) * 0.5
+                })
+                .collect();
+            // Axis-major positions buffer: [t..., h..., w..., e...].
+            let positions: Vec<i32> = token_pos
+                .iter()
+                .copied()
+                .cycle()
+                .take(4 * token_pos.len())
+                .collect();
 
-        // Text-only positions: all 4 axes equal token index.
-        let positions: Vec<i32> = (0..seq_len as i32)
-            .cycle()
-            .take(4 * seq_len as usize)
-            .collect();
-
-        // CPU reference (same formula as full_attn::imrope_inplace).
-        let pick_axis = |sector: u32| -> usize {
-            if sector % 3 == 0 && sector < 3 * shape.mrope_section[0] {
-                0
-            } else if sector % 3 == 1 && sector < 3 * shape.mrope_section[1] {
-                1
-            } else if sector % 3 == 2 && sector < 3 * shape.mrope_section[2] {
-                2
-            } else {
-                3
+            let mut expected = q_cpu.clone();
+            for (t, &p) in token_pos.iter().enumerate() {
+                super::super::full_attn::imrope_inplace(
+                    &mut expected[t * nh * d..(t + 1) * nh * d],
+                    shape.n_head,
+                    shape.head_dim,
+                    shape.rotary_dim,
+                    shape.rope_theta,
+                    [p; 4],
+                    shape.mrope_section,
+                );
             }
-        };
-        let mut expected = q_cpu.clone();
-        for t in 0..seq_len as usize {
-            for h in 0..nh {
-                let base = (t * nh + h) * d;
-                for pair in 0..half_rope {
-                    let sector = (pair as u32) % sect_dims;
-                    let axis = pick_axis(sector);
-                    let pos = positions[axis * seq_len as usize + t] as f32;
-                    let dim_ratio = 2.0 * pair as f32 / rotary_dim as f32;
-                    let freq = 1.0 / shape.rope_theta.powf(dim_ratio);
-                    let angle = pos * freq;
-                    let (ca, sa) = (angle.cos(), angle.sin());
-                    let x0 = q_cpu[base + pair];
-                    let x1 = q_cpu[base + pair + half_dim];
-                    expected[base + pair] = x0 * ca - x1 * sa;
-                    expected[base + pair + half_dim] = x0 * sa + x1 * ca;
+
+            let q_gpu = upload_f32(&q_cpu, &device).expect("upload");
+            let mut pos_buf = device
+                .alloc_buffer(positions.len() * 4, DType::I32, vec![positions.len()])
+                .expect("alloc positions");
+            pos_buf
+                .as_mut_slice::<i32>()
+                .expect("mut")
+                .copy_from_slice(&positions);
+
+            let mut encoder = device.command_encoder().expect("enc");
+            let out = apply_imrope(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &q_gpu,
+                &pos_buf,
+                seq_len,
+                shape.n_head,
+                shape.head_dim,
+                shape.rotary_dim,
+                shape.rope_theta,
+                shape.mrope_section,
+            )
+            .expect("apply imrope");
+            encoder.commit_and_wait().expect("commit");
+
+            let got = download_f32(&out).expect("download");
+            for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+                let t = i / (nh * d);
+                let dim = i % d;
+                if dim >= shape.rotary_dim as usize {
+                    assert_eq!(
+                        g.to_bits(),
+                        q_cpu[i].to_bits(),
+                        "tail dim {dim} changed at {i}"
+                    );
+                    continue;
                 }
+                // Both sides evaluate pow/sin/cos in f32, so the angle error
+                // grows with the position (|theta| <= pos): with inputs in
+                // [-0.5, 0.5] (|x0| + |x1| <= 1) and up to 2 ulps per side,
+                // the output error is at most 4 * eps * pos.
+                let tol = 1e-5 + 4.0 * f32::EPSILON * token_pos[t] as f32;
+                let d_err = (g - e).abs();
+                assert!(
+                    d_err <= tol,
+                    "imrope mismatch (head_dim {d}) at {i}: gpu={g}, cpu={e}, diff={d_err}, tol={tol}"
+                );
             }
-        }
-
-        // GPU path.
-        let q_gpu = upload_f32(&q_cpu, &device).expect("upload");
-        let mut pos_buf = device
-            .alloc_buffer(positions.len() * 4, DType::I32, vec![positions.len()])
-            .expect("alloc positions");
-        pos_buf
-            .as_mut_slice::<i32>()
-            .expect("mut")
-            .copy_from_slice(&positions);
-
-        let mut encoder = device.command_encoder().expect("enc");
-        let out = apply_imrope(
-            &mut encoder,
-            &mut registry,
-            &device,
-            &q_gpu,
-            &pos_buf,
-            seq_len,
-            shape.n_head,
-            shape.head_dim,
-            shape.rotary_dim,
-            shape.rope_theta,
-            shape.mrope_section,
-        )
-        .expect("apply imrope");
-        encoder.commit_and_wait().expect("commit");
-
-        let got = download_f32(&out).expect("download");
-        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
-            let d_err = (g - e).abs();
-            assert!(
-                d_err < 1e-5,
-                "imrope mismatch at {}: gpu={}, cpu={}, diff={}",
-                i,
-                g,
-                e,
-                d_err
-            );
         }
     }
 
@@ -11012,49 +11011,19 @@ mod tests {
             1.0 / (1.0 + (-x).exp())
         }
 
-        fn imrope_inplace(
-            data: &mut [f32],
-            n_head: usize,
-            head_dim: usize,
-            rot_dim: usize,
-            theta: f32,
-            pos: [i32; 4],
-            sections: [u32; 4],
-        ) {
-            let half_dim = head_dim / 2;
-            let half_rope = rot_dim / 2;
-            let sect_total = sections.iter().sum::<u32>().max(1);
-            let pick_axis = |sec: u32| -> usize {
-                let s0 = sections[0];
-                let s1 = s0 + sections[1];
-                let s2 = s1 + sections[2];
-                if sec < s0 {
-                    0
-                } else if sec < s1 {
-                    1
-                } else if sec < s2 {
-                    2
-                } else {
-                    3
-                }
-            };
-            for h in 0..n_head {
-                let base = h * head_dim;
-                for pair in 0..half_rope {
-                    let sector = (pair as u32) % sect_total;
-                    let axis = pick_axis(sector);
-                    let p = pos[axis] as f32;
-                    let dim_ratio = 2.0 * pair as f32 / rot_dim as f32;
-                    let freq = 1.0 / theta.powf(dim_ratio);
-                    let angle = p * freq;
-                    let (ca, sa) = (angle.cos(), angle.sin());
-                    let x0 = data[base + pair];
-                    let x1 = data[base + pair + half_dim];
-                    data[base + pair] = x0 * ca - x1 * sa;
-                    data[base + pair + half_dim] = x0 * sa + x1 * ca;
-                }
-            }
-        }
+        // IMROPE, the same reference the prefill/decode tests use (pairs
+        // `(p, p + rotary_dim/2)`, tail pass-through).
+        let imrope_inplace = |data: &mut [f32], n_head: usize, pos: [i32; 4]| {
+            super::super::full_attn::imrope_inplace(
+                data,
+                n_head as u32,
+                d as u32,
+                rotary_dim as u32,
+                rope_theta,
+                pos,
+                mrope_section,
+            )
+        };
 
         let q_total = nq * d;
         let kv_total = nkv * d;
@@ -11098,27 +11067,11 @@ mod tests {
         // Step 4: IMROPE on Q and K
         for t in 0..seq {
             let base = t * nq * d;
-            imrope_inplace(
-                &mut q[base..base + nq * d],
-                nq,
-                d,
-                rotary_dim,
-                rope_theta,
-                positions[t],
-                mrope_section,
-            );
+            imrope_inplace(&mut q[base..base + nq * d], nq, positions[t]);
         }
         for t in 0..seq {
             let base = t * nkv * d;
-            imrope_inplace(
-                &mut k[base..base + nkv * d],
-                nkv,
-                d,
-                rotary_dim,
-                rope_theta,
-                positions[t],
-                mrope_section,
-            );
+            imrope_inplace(&mut k[base..base + nkv * d], nkv, positions[t]);
         }
 
         // Step 6: KV cache write — [prefix+pos] for each head

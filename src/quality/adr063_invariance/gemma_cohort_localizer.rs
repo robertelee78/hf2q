@@ -368,7 +368,7 @@ mod controls {
         assert!(Mode::Cohort.admit_native(build, build).is_ok());
         assert!(Mode::Cohort.admit_native("0.15.9", "0.15.16").is_err());
         use super::super::gemma_actual::routing::require_published;
-        assert!(require_published("0.15.16").is_ok());
+        assert!(require_published(env!("HF2Q_MLX_NATIVE_VERSION")).is_ok());
         assert!(require_published("0.15.9").is_err());
     }
     #[test]

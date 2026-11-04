@@ -355,6 +355,14 @@ fn required_i32_array_4(gguf: &GgufFile, key: &str) -> Result<[u32; 4]> {
     Ok(out)
 }
 
+/// Qwen3.5 / Qwen3.6 published partial-rotary factor: full-attention layers
+/// rotate `head_dim / 4` dims (64 of 256). Default when a source config
+/// omits it, and the value for loaders that carry no config metadata.
+pub(crate) const QWEN35_DEFAULT_PARTIAL_ROTARY_FACTOR: f32 = 0.25;
+
+/// Qwen3.5 / Qwen3.6 published IMROPE sections (sum 32 = rotary_dim / 2).
+pub(crate) const QWEN35_DEFAULT_MROPE_SECTION: [u32; 4] = [11, 11, 10, 0];
+
 /// Compute `layer_types` from `num_hidden_layers` and `full_attention_interval`.
 ///
 /// Convention (verified against apex GGUF tensor dump on 2026-04-23 — layers

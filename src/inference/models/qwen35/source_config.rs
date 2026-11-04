@@ -3,7 +3,10 @@
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
 
-use super::{default_layer_types, Qwen35Config, Qwen35Variant};
+use super::{
+    default_layer_types, Qwen35Config, Qwen35Variant, QWEN35_DEFAULT_MROPE_SECTION,
+    QWEN35_DEFAULT_PARTIAL_ROTARY_FACTOR,
+};
 
 const MAX_QWEN35_EVIDENCE_LAYERS: u32 = 256;
 
@@ -108,7 +111,7 @@ pub(super) fn qwen35_config_from_authenticated_source(config: &Value) -> Result<
             Some(value) => value.as_f64().context(
                 "authenticated Qwen config rope_parameters.partial_rotary_factor must be numeric",
             )?,
-            None => 0.25,
+            None => f64::from(QWEN35_DEFAULT_PARTIAL_ROTARY_FACTOR),
         },
     } as f32;
     let rope_theta = match rope_parameters.and_then(|rope| rope.get("rope_theta")) {
@@ -141,7 +144,7 @@ pub(super) fn qwen35_config_from_authenticated_source(config: &Value) -> Result<
         ),
         None => None,
     }
-    .unwrap_or_else(|| vec![11, 11, 10]);
+    .unwrap_or_else(|| QWEN35_DEFAULT_MROPE_SECTION.to_vec());
     while mrope.len() < 4 {
         mrope.push(0);
     }

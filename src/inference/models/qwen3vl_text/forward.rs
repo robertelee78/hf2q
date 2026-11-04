@@ -561,7 +561,8 @@ pub fn forward_text_prefill_logits_last(
             enc.memory_barrier();
 
             // 3D-IMROPE: mode=40 (Imrope), sections=[24,20,20,0] for
-            // Qwen3-VL-2B → first 64 slots rotated, next 64 identity.
+            // Qwen3-VL-2B, full rotation (rotary_dim == head_dim = 128): all
+            // 64 NeoX pairs (p, p + 64) rotate; no pass-through tail.
             let q_rope = apply_imrope(
                 enc,
                 registry,
