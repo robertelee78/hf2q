@@ -252,6 +252,73 @@ Campaign `$V/q4-qwen36/campaigns/quality-qwen36-repair1-ours-20261104T054600Z`, 
 
 Analysis: `analyze_repair.py` writes `repair-analysis.json` in the evidence directory.
 
+### Repair-turn fork replay (2026-11-04): why hf2q re-emits the failing file
+
+**Setup.** Evidence is in `$V/q4-qwen36/fork2/`. The replayed requests are the recorded R1 turn-4 (repair)
+requests, sent byte-for-byte, so both engines see the same prefix. The cases are:
+- the 16 hf2q identical-rewrite agents;
+- 16 hf2q agents whose repair changed the file, 8 of them from the same instances.
+
+Decoding is greedy and unary on one memguarded server per session. hf2q is the v0.1.29 release binary
+`86b64b02…`, the peer is e86f5fd1 `4b604952…`, and the GGUF is `815a22ca…`. Modes:
+- **single:** first send, then the same request at once (cold: 0 cached tokens; then warm: about 1,830
+  cached);
+- **logprobs:** `top_logprobs` 20;
+- **chain:** turns 0–4 replayed to rebuild the agent's own state;
+- **conc:** every agent of an instance replayed together.
+
+**Identical rewrites of the 16 cases on the same prefix** (the controls stay at 1–4/16 on hf2q and 0–1/16 on
+the peer in every arm):
+
+| Arm | single (cold / warm) | logprobs | chain | conc |
+|---|---:|---:|---:|---:|
+| hf2q default (rep 1.05, speculation `auto`, TQ K/V) | 12 / 12 | 14 | 15 | 16 |
+| hf2q `HF2Q_QWEN_SPECULATION=off` | 14 / 14 | 14 | 14 | — |
+| hf2q dense K/V (`HF2Q_TQ_KV=0`) | 14 / 14 | 14 | — | — |
+| hf2q repetition penalty 1.0 | 7 / 7 | 7 | 6 | — |
+| hf2q penalty 1.0 and speculation off | 7 / 7 | 7 | 7 | — |
+| hf2q penalty 1.0 and dense K/V | 7 / 7 | 6 | — | — |
+| Peer default (rep 1.05, 64-token window with prompt) | 0 / 0 | 0 | 0 | 1 |
+| Peer, repetition penalty 1.0 | 1 / 1 | 1 | 0 | — |
+
+**Verdict per suspect:**
+- **Prefix/KV reuse: excluded.** Cold and warm give identical results; rebuilt chains and concurrent
+  replays reproduce the rewrite, and turns 0–3 of the chains reproduce the recorded hf2q turns 124/128.
+  Dense K/V gives the same rate, and on equal prefixes its fork preferences equal TQ K/V's (median
+  difference +0.01 nat, 43 points).
+- **Speculation or joint route: excluded.** Speculation off gives 14/16, and the speculation-ineligible
+  logprobs route gives 14/16. Joint decode is off for this MoE worker (`joint_decode=false`), and
+  single sequential requests reproduce the rewrite.
+- **Tool grammar: a separate format defect, not the cause.**
+  - hf2q's auto-lazy Qwen tool grammar starts the body at `<function=` right after the `<tool_call>`
+    trigger. It therefore suppresses the template's newline: hf2q emits `<tool_call><function=…` in 192/192
+    logprobs outputs, the peer `<tool_call>\n<function=…` in 64/64. hf2q's top-20 after `<tool_call>` holds
+    only `<` and `<f`, and the peer's top-1 there is `\n` at about 0 nat.
+  - Forcing the peer with hf2q's reasoning and hf2q's newline-less opening (raw `/completion`, vendor
+    render, token counts equal to the recorded 1,721…, `repeat_penalty` 1.0) gives 0/16 rewrites. The same
+    forcing with the newline also gives 0/16.
+- **Repetition penalty: an amplifier.**
+  - At 1.0, hf2q drops from 12–14/16 to 7/16. The peer stays at 0–1/16 with or without its penalty.
+  - In 6 of the 14 copy/fix forks, hf2q's raw (pre-penalty) top-1 is the fix, and the 1.05 penalty flips
+    the greedy pick to the copy (`probe-summary.txt`).
+- **Raw logits (numerics or compute): the root.**
+  - The peer was given hf2q's exact generated text up to each copy/fix fork: `s.parse` followed by `().` or
+    `::<`, and `map_err(|e` followed by `|` or `:`. That covers all 32 cases, 63 points.
+  - hf2q's raw logits favor the failing form over the fix by a median +1.73 nat more than the peer's
+    (+1.81 on identical cases, +1.36 on controls). The shift is positive at 54/63 points (`probe-all-summary.txt`).
+  - It is unchanged with dense K/V and with speculation off. The bias is in hf2q's forward pass on the Q4_K
+    artifact, not in state reuse, routing, grammar or sampling. The canonical diagnosis measured the same
+    direction on the first write (closure-parameter margin, hf2q −0.09 vs peer +0.28 nat). On the
+    longer repair-turn prompt the shift is larger.
+
+**Next step (not run).** Localize the bias by layer. Options:
+- the ADR-063 Q1 stage localizer on the repair-turn prompts (`qwen36` is a localizer family);
+- an independent BF16 reference on the same prefixes (`$E/qwen36-fork-v1/ref_mlx.py`; the BF16 source has
+  to be re-downloaded).
+
+If BF16 sides with the peer, the defect is in hf2q's Q4_K/MoE/DeltaNet/attention compute path. The
+grammar newline is worth a separate fix either way.
+
 ### Draft ADR-063 amendment (DRAFT, pending the R1 defect diagnosis; the root lands the ADR edit)
 
 Do not land this text yet. R1 is an hf2q `Loss` on this workload. The amendment waits until the
