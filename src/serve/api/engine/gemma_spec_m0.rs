@@ -5,14 +5,18 @@
 //! Case file (`HF2Q_GEMMA_SPEC_M0_CASE`, JSON):
 //! ```json
 //! { "model": "/path/target.gguf", "context": 32768,
-//!   "lanes": [[token ids of lane 0 …], …4 lanes],
+//!   "lanes": [[token ids …] | {"request": "/…/turn-N/request.json",
+//!             "prompt_tokens": 1222}, …4 lanes],
 //!   "tick_seconds_by_width": {"1": s, "2": s, "3": s, "4": s},
 //!   "output": "/path/evidence/dir", "warmup": 20, "samples": 200 }
 //! ```
-//! - `lanes`: the canonical turn-2 rendered prompt token ids. Each lane is
-//!   prefilled except its last four tokens; those four are the forced
-//!   window `[x, d0, d1, d2]` at `pos0 = len − 4` (drafts taken from real
-//!   text, so routing sees realistic tokens).
+//! - `lanes`: rendered prompt token ids, either literal or a recorded
+//!   chat-completions request rendered with the loaded model's template and
+//!   tokenizer exactly as the server does (tools in scope, template-default
+//!   thinking, no kwargs); the rendered length must equal the recorded
+//!   `prompt_tokens`. Each lane is prefilled except its last four tokens;
+//!   those four are the forced window `[x, d0, d1, d2]` at `pos0 = len − 4`.
+//!   Lane 0 and at least one other lane must reach the wrapped ring.
 //! - `tick_seconds_by_width`: `hf2q_gemma_decode_tick_seconds_total{width,
 //!   speculative="false"}` from one spec-off Q5 run of the same binary.
 //!
@@ -51,13 +55,76 @@ const MV_COPY_BUDGET_BYTES: usize = 256 << 20;
 struct M0Case {
     model: PathBuf,
     context: u32,
-    lanes: Vec<Vec<u32>>,
+    lanes: Vec<LaneInput>,
     tick_seconds_by_width: BTreeMap<String, f64>,
     output: PathBuf,
     #[serde(default = "default_warmup")]
     warmup: usize,
     #[serde(default = "default_samples")]
     samples: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum LaneInput {
+    Tokens(Vec<u32>),
+    Request {
+        request: PathBuf,
+        prompt_tokens: usize,
+    },
+}
+
+impl LaneInput {
+    fn tokens(&self, model: &GemmaLoadedModel) -> Result<Vec<u32>> {
+        let (request, expected) = match self {
+            Self::Tokens(tokens) => return Ok(tokens.clone()),
+            Self::Request {
+                request,
+                prompt_tokens,
+            } => (request, *prompt_tokens),
+        };
+        let wire = std::fs::read(request).with_context(|| format!("read {request:?}"))?;
+        let req: super::super::schema::ChatCompletionRequest = serde_json::from_slice(&wire)?;
+        anyhow::ensure!(
+            req.chat_template_kwargs.is_none(),
+            "M0 lane request {request:?} carries chat_template_kwargs"
+        );
+        let template = model.chat_template.as_str();
+        let thinking = crate::serve::template_supports_enable_thinking(template);
+        let rendered = render_chat_prompt_with_tools_generation_prompt(
+            template,
+            &req.messages,
+            req.tools.as_deref(),
+            thinking,
+            None,
+            true,
+        )?;
+        let tokens = model
+            .tokenizer
+            .encode(rendered, false)
+            .map_err(|e| anyhow::anyhow!("tokenize {request:?}: {e}"))?
+            .get_ids()
+            .to_vec();
+        anyhow::ensure!(
+            tokens.len() == expected,
+            "M0 lane {request:?} renders {} tokens, recorded prompt_tokens {expected}",
+            tokens.len()
+        );
+        Ok(tokens)
+    }
+
+    fn describe(&self, tokens: &[u32]) -> serde_json::Value {
+        let ids = tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>();
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&ids));
+        match self {
+            Self::Tokens(_) => serde_json::json!({"source": "token_ids", "tokens": tokens.len(),
+                "token_ids_le_sha256": digest}),
+            Self::Request { request, .. } => serde_json::json!({"source": "request",
+                "request": request, "request_sha256": std::fs::read(request).ok()
+                    .map(|b| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&b))),
+                "tokens": tokens.len(), "token_ids_le_sha256": digest}),
+        }
+    }
 }
 
 fn default_warmup() -> usize {
@@ -531,7 +598,18 @@ fn run() -> Result<()> {
     anyhow::ensure!(model.weights.kv_graft_len() == 0, "M0 refuses a bound KV graft");
 
     let mut lanes = Vec::with_capacity(LANES);
-    for (index, tokens) in case.lanes.iter().enumerate() {
+    let rendered = case
+        .lanes
+        .iter()
+        .map(|lane| lane.tokens(&model))
+        .collect::<Result<Vec<_>>>()?;
+    let lane_sources: Vec<serde_json::Value> = case
+        .lanes
+        .iter()
+        .zip(&rendered)
+        .map(|(lane, tokens)| lane.describe(tokens))
+        .collect();
+    for (index, tokens) in rendered.iter().enumerate() {
         anyhow::ensure!(tokens.len() > MAX_WINDOW, "lane {index} shorter than its window");
         anyhow::ensure!(tokens.len() < case.context as usize, "lane {index} exceeds context");
         let pos0 = tokens.len() - MAX_WINDOW;
@@ -663,8 +741,12 @@ fn run() -> Result<()> {
         "case_sha256": hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&raw)),
         "model": case.model,
         "context": case.context,
-        "lanes": h.lanes.iter().map(|l| serde_json::json!({"slot": l.slot.0, "pos0": l.pos0,
-            "window": l.tail})).collect::<Vec<_>>(),
+        "lanes": h.lanes.iter().zip(&lane_sources).map(|(l, source)| serde_json::json!({
+            "slot": l.slot.0, "pos0": l.pos0, "window": l.tail, "source": source}))
+            .collect::<Vec<_>>(),
+        "mlx_native_version": env!("HF2Q_MLX_NATIVE_VERSION"),
+        "restore_pipeline_identity": format!("{:?}", h.model.ctx.split().1
+            .pipeline_identity("kv_cache_restore_ring_bytes")),
         "warmup": case.warmup,
         "samples": case.samples,
         "class_a": class_a,
