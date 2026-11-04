@@ -359,7 +359,11 @@ A RouteSensitive Gemma T5 result must be localized. #665 therefore builds a veri
 - **Branch N:** G5-B committed rows is `RouteSensitive`. The pair is n-gram arm vs ordinary-global arm.
 - **Branch P:** the n-gram arm refused at row 127 because the global-route initial decision differed from `frozen[128]`. The pair is the ordinary-global arm vs the slot-aware All128 route, which produced the frozen dataset.
   - **Precondition** (condition 7): the b5g All128 reference's own row-127 `Logits` argmax (its endpoint store) must equal `frozen[128]`.
-  - If it does not, the frozen decision has drifted across builds, not routes. The record becomes **build-drift localization**: T2Loc's `q1_stage_localization.py` (same-manifest mode) runs on the b3 All128 stage store vs a b5g All128 run under the same b3 plan. Branch P is not run.
+  - If it does not, the frozen decision has drifted across builds, not routes. The record becomes a **build-drift localization**, and branch P is not run. Steps:
+    1. Build a reviewed **diagnostic build**: the greedy144 preparation's source commit `540a470842a73d63675526bc915923491c65f84a` (native 0.15.9; `$E/q1-gemma-greedy144-preparation-actual-v1`), with only T2Loc's cfg(test) stage hooks and All128 localizer added. It is labelled diagnostic and is never a build of record.
+    2. **Gate:** its All128 localizer endpoint `Logits` row 127 must be byte-equal (`exact`, per lane) to the preparation's retained row-127 logits (`output/trace.json` of that preparation; 68 logit rows, 127..143 per lane).
+       - If the gate fails, the hooks or the build do not reproduce the preparation. That is a defect of the diagnostic build, and it follows the observer-effect defect path below. It is never localized from an unverified reference.
+    3. If the gate passes, run T2Loc's same-manifest `q1_stage_localization.py` on the diagnostic All128 stage store vs the b5g All128 stage store, both under the same plan. The result is the first divergence per lane between the preparation build and b5g on the All128 route.
 
 It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 
@@ -410,7 +414,11 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 
 **Key map** (`q1_stage_localization.py ngram-map NGRAM_T5_EXECUTION ORDINARY_T5_EXECUTION PLAN > map.json`).
 - The map is mechanical and sha-pinned, and it is reviewed before any comparison. Schema `hf2q.q1.key-map.v1`.
-- It binds both receipts' sha256, the per-lane `a`, the sha256 of the four traces the comparator reads (both stage stores and both logit stores, condition 4), and lists the pairs **per phase**, in candidate execution order within each phase. Keys are T2Loc's `key(at)` = (stage, agent, row, layer, segment, step).
+- The reviewed **pre-run** map binds only what exists before the run (condition 4): both T5 receipts' sha256, the frozen Plan (layers and roles, pass 1 or pass 2), and the per-lane `a`. It lists the pairs **per phase**, in candidate execution order within each phase. Keys are T2Loc's `key(at)` = (stage, agent, row, layer, segment, step).
+- **Per-pass binding file** `pass-binding.json` (schema `hf2q.q1.localizer-pass-binding.v1`):
+  - It is written after each pass completes and before any comparison.
+  - It binds `map_sha256`, the pass, and the path and sha256 of the four traces the comparator reads: both stage stores and both logit stores.
+  - `mapped` copies the binding (and its sha) into its output record, so every localization record names its exact inputs.
 
 | Phase (branch N) | Candidate (n-gram) | Reference (ordinary-global) | Roles |
 |---|---|---|---|
@@ -425,10 +433,10 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 - The routing pairs of §2.5 are in the same file.
 
 **Offline comparators** (added to T2Loc's existing scripts, not new tools):
-- **`q1_stage_localization.py mapped REFERENCE_STAGES CANDIDATE_STAGES REFERENCE_LOGITS CANDIDATE_LOGITS WORKLOAD MAP`** (condition 4)
+- **`q1_stage_localization.py mapped MAP PASS_BINDING WORKLOAD`** (condition 4)
   - Inputs:
     - The logit traces are the `committed` stores (branch N), or the All128 endpoint store and the ordinary `prefork` store (branch P).
-    - All four traces must match the sha256 bound in the map.
+    - All four traces must match the sha256 bound in `PASS_BINDING`, and `PASS_BINDING.map_sha256` must equal the sha of `MAP`.
     - Every mapped key must be captured, and payloads are hash-verified (`captured_records`, `verified_payload`).
   - Grouping: per lane, by candidate execution order into (phase, decode position, layer, stage).
   - Output: the first group with a differing row: phase, decode position, layer, stage, `rows_in_group`, `differing_rows`, `max_abs` and `relative_rms`.
@@ -456,7 +464,8 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
   - a synthetic difference only in `verify-prefix` layer 3 `Attention` is localized there;
   - a difference only in an unmapped row is reported but not localized;
   - a missing mapped key refuses, and a layout mismatch refuses;
-  - a logit trace whose sha differs from the map refuses;
+  - a trace whose sha differs from `PASS_BINDING` refuses, and a `PASS_BINDING` whose `map_sha256` differs from the map refuses;
+  - the `mapped` output record embeds the pass binding and its sha;
   - the head rule fires when only `Logits` differ, and does not fire when an earlier `RouterIds` group differs (order-only);
   - `routing-mapped` pairs `T5Verify`/`T5Continuation` with `Canonical` per phase, refuses an unpaired key, and reports gaps.
 
@@ -492,7 +501,13 @@ One change to `scripts/four_agent/q1_endpoint_supervisor.py`, with one admission
 - `stores` may be `{}` (then `expected_stores` must be `{}`, records = 0, and the checks own the receipt). This covers the Qwen T5 Preparation, which writes no trace store (`ba6654c4`).
 - `checks` are names from a closed in-file registry.
 - Endpoint and localizer kinds and the T0-first gate are unchanged.
-- **Extent source:** either the packet carries {lanes, host_payload_limit, expected_stores}, or the case key `manifest` = {path, sha256} binds a JSON with exactly those keys. Exactly one source is allowed. The Qwen runners need the `manifest` form because their packets are `deny_unknown_fields` (`runner.rs:27-39`, `continuation.rs:151-164`) and the T6 block must run on b4 unchanged. **Gemma T5 and localizer cases also use the `manifest` form**, because of the packet-size bound (§2.3, ReviewSpec26 condition 1).
+- **Extent source:** either the packet carries {lanes, host_payload_limit, expected_stores}, or the case key `manifest` = {path, sha256} binds a JSON with exactly those keys.
+  - **Manifest form** (condition 1): the packet must not carry `expected_stores`. If it carries `lanes` or `host_payload_limit` (the Gemma T5 packet carries `lanes`, and T2Loc's localizer Plan carries `host_payload_limit`), each must equal the manifest's value. The manifest is the extent of record.
+  - This replaces T2Loc's current "extent from exactly one of packet / manifest", which refuses any extent key in the packet when a manifest is bound. The change goes into the same single admission review. Supervisor tests:
+    - a manifest-form case whose packet still carries both `lanes` and `host_payload_limit`, equal to the manifest's, is admitted;
+    - unequal values refuse;
+    - a packet `expected_stores` with a manifest refuses.
+  - The Qwen runners need the `manifest` form because their packets are `deny_unknown_fields` (`runner.rs:27-39`, `continuation.rs:151-164`) and the T6 block must run on b4 unchanged. **Gemma T5 and localizer cases also use the `manifest` form**, because of the packet-size bound (§2.3, ReviewSpec26 condition 1).
 
 Completion lines:
 - The Qwen runners print fixed lines rather than `records=<Σ>`: `Q1_QWEN_T5_PHASE_COMPLETE …` (`runner.rs:443`) and `Q1_QWEN_RECOVERY_CONTINUATION_COMPLETE …` (`continuation.rs:482`).
