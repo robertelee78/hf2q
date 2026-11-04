@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope, F1/F3 execution entry, the separately reviewed F2/Q1/Q2/C1 source implementation entry and the 2026-11-03 measurement-only entry (see "Speed program, Q1 successors and release mapping"); other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with Q4-DS4-RACE, and Q4-QWEN36, with Q4-GEMMA-KERNEL (mlx-native) and Q4-TRACE; the measurement tracks Q4-GEMMA (profiling) and Q4-DS4 (fit) are split from their implementation tracks and their designs are operator-approved; Q4-DS4-RACE consumes the IQ2_XXS subset of ADR-066 N1/N3/N4 pulled ahead of ADR-066 B2; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b with J1 joining v0.1.30, frozen limits, delivery v0.1.30); remaining verification leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
+- **Updated:** 2026-11-03 (later) — Q4-DS4 result Fit; Q4-DS4-RACE now consumes ADR-066 N-IQ2XXS (the IQ2_XXS subset as its own story) instead of N1/N3/N4; operator decision D1: on the ds4 file the race is judged against the peer only, and the vs-stock makespan contrast, fairness band and stock quality gate come from a same-artifact candidate-vs-v0.1.28 record on hf2q's own DeepSeek-V4 artifact with the same candidate binary; operator decision D2: ds4 runs on the same file in a declared same-artifact native-comparison campaign (design `docs/research/adr066-iq2xxs-subset-design.md`). Earlier 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with Q4-DS4-RACE, and Q4-QWEN36, with Q4-GEMMA-KERNEL (mlx-native) and Q4-TRACE; the measurement tracks Q4-GEMMA (profiling) and Q4-DS4 (fit) are split from their implementation tracks and their designs are operator-approved; Q4-DS4-RACE consumes the IQ2_XXS subset of ADR-066 N1/N3/N4 pulled ahead of ADR-066 B2; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b with J1 joining v0.1.30, frozen limits, delivery v0.1.30); remaining verification leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28, v0.1.30
 - Stable source ID: ADR-063
@@ -526,6 +526,8 @@ Acceptance:
 
 - Fairness: worst-slot TTFT p95 and SSE-gap max ratios against v0.1.28 stock stay within the stock fairness band 1.025 (`NEUTRAL_RATIO`). Vs-peer TTFT ratios are disclosed, not gated; SSE gaps against the peer are shown as not comparable.
 
+- DeepSeek-V4 exception (operator decision D1, 2026-11-03): no released hf2q opens ds4's file, so in Q4-DS4-RACE the vs-stock makespan gain, its precision, this fairness band and the v0.1.28 quality gate are taken from a same-artifact candidate-vs-v0.1.28 campaign on hf2q's own DeepSeek-V4 artifact run with the same candidate binary, bound into the ds4-file record campaign by path and sha256; the ds4-file campaign itself measures only the peer contrast.
+
 - Each family's accepted configuration passes a fresh Q5 calibration on the release candidate.
 
 - One-slot (n1) regressions against v0.1.28 or the peer are disclosed with the release, not gating. Single-slot or microkernel speed alone cannot satisfy this story.
@@ -723,25 +725,29 @@ Delivery boundary: Measured evidence merged to main for v0.1.30.
 
 Outcome: hf2q finishes the four-agent task on ds4's DeepSeek-V4 file at least 5% sooner than the peer in its best valid configuration.
 
-Requirement: The program MUST support the IQ2_XXS ds4 file in hf2q by consuming the ADR-066 IQ2_XXS subset and MUST compare hf2q, the peer and ds4 on that one file.
+Requirement: The program MUST support the IQ2_XXS ds4 file in hf2q by consuming ADR-066 N-IQ2XXS and MUST compare hf2q, the peer and ds4 on that one file.
 
 Acceptance:
 
 - A written design, approved before implementation, states the loader, tensor mapping and quality checks for this file.
 
-- Consume the IQ2_XXS storage type, CPU dequantization and expert kernels of ADR-066 N1 (#580), N3 (#582) and N4 (#583), whose IQ2_XXS subset gains parity at DeepSeek-V4-Flash expert shapes (256 experts, top-6); no duplicate kernels. Add the hf2q loader for this file and the quality checks (tensor-load parity, paired task-quality gate).
+- Starting point (Q4-DS4, #661): Fit. The peer had 7 of 7 valid runs on this file; its best valid configuration is load mode none with ubatch 1024, makespan median 65.2 s (evidence `/Users/robert/.local/state/hf2q/v0130/q4-ds4/`).
 
-- Fresh Q5 calibration of hf2q on this file, then run hf2q, the peer and ds4 on it under the Q3 design.
+- Consume the IQ2_XXS storage type, CPU dequantization, grids and expert kernels of ADR-066 N-IQ2XXS, which gains parity at DeepSeek-V4-Flash expert shapes (256 experts, top-6) and proves the Q2_K expert kernels at the down shape; no duplicate kernels. ADR-066 N1/N3/N4 build on N-IQ2XXS and are not predecessors. Add the hf2q loader for this file and the quality checks (tensor-load parity, real-weight kernel parity, joint == serial bitwise on this file, paired task-quality gate).
+
+- Fresh Q5 calibration of hf2q on this file. The verdict of record runs hf2q (experiment) and the peer on this file under the Q3 design, with no stock arm, bound to a same-artifact candidate-vs-v0.1.28 campaign on hf2q's own artifact for the vs-stock contrast, fairness band and stock quality gate (operator decision D1, 2026-11-03; Q4 DeepSeek-V4 exception). ds4 runs on the same file in a separately labeled native-comparison campaign that declares the shared artifact (operator decision D2, 2026-11-03); it never enters the verdict.
 
 - A per-stage attribution of the hf2q-versus-peer gap on the same file and run (prefill, decode, MoE/attention, dispatch, scheduling, SSE cadence), with stated distortion.
 
-- The family verdict meets the Q4 win definition and every Q4 gate.
+- The family verdict meets the Q4 win definition and every Q4 gate, with the vs-stock terms supplied by the bound same-artifact record. The paired task-quality gates are against the peer on this file and against v0.1.28 on hf2q's artifact.
 
-Repository ownership: mlx-native owns the IQ2_XXS kernels and their parity tests through ADR-066 N1/N3/N4; hf2q owns the loader for this file, quality checks, Q5 calibration and campaign.
+- A Q4-DS4 no-fit would have stopped this story before any hf2q change; only the mlx-native N-IQ2XXS work is ADR-066 scope independent of this story.
+
+Repository ownership: mlx-native owns the IQ2_XXS type, grids, kernels and their parity tests through ADR-066 N-IQ2XXS; hf2q owns the loader for this file, quality checks, the harness changes, Q5 calibration and campaigns.
 
 Validation: Independent review of the design, the parity and quality receipts and the three-arm campaign.
 
-Predecessors: Q4-DS4 (#661, fit result), ADR-066 N1 (#580), N3 (#582), N4 (#583) (IQ2_XXS subset, pulled ahead of ADR-066 B2, operator decision 2026-11-03), Q5 (#371).
+Predecessors: Q4-DS4 (#661, fit result), ADR-066 N-IQ2XXS (pulled ahead of ADR-066 B2, operator decision 2026-11-03), Q5 (#371).
 
 Priority: High. Core scope (first-tier family).
 
@@ -1358,7 +1364,9 @@ Win in any family):
   add IQ2_XXS support and compare hf2q, the peer and ds4 on that file
   (Q4-DS4-RACE). The IQ2_XXS subset of ADR-066 N1 (#580), N3 (#582) and
   N4 (#583) is pulled forward ahead of ADR-066 B2; DeepSeek-V4 consumes it,
-  with no duplicate kernels.
+  with no duplicate kernels. (Amended later on 2026-11-03: the subset is its
+  own ADR-066 story, N-IQ2XXS, and is Q4-DS4-RACE's predecessor in place of
+  N1/N3/N4.)
 - **Qwen3.6.** Investigate the failure before choosing a speed workload
   (Q4-QWEN36).
 - **ADR-065.** Its baseline freeze and deciding measurements, B1 (#503) and
@@ -1398,6 +1406,30 @@ determination), Q4-GEMMA (#660, the profiling track), Q1-QWEN38-RERUN
 (#503–#511). Q4-DS4 and Q4-GEMMA were split from their implementation
 tracks (Q4-DS4-RACE, Q4-GEMMA-ATTN) so that per-issue tracker blockers do
 not hold the approved measurement work.
+
+Later decisions (operator, 2026-11-03), after Q4-DS4 reported Fit (peer
+7/7 valid runs, best valid configuration load mode none / ubatch 1024,
+makespan median 65.2 s; `/Users/robert/.local/state/hf2q/v0130/q4-ds4/`)
+and the Q4-DS4-RACE design review
+(`docs/research/adr066-iq2xxs-subset-design.md`):
+
+- **D1, stock arm on ds4's file.** No released hf2q opens the file, and
+  comparing v0.1.28 on a different artifact would mix an artifact change
+  with the engine change (AGENTS.md: compare identical artifacts). The
+  ds4-file campaign of record therefore runs without a stock arm and is
+  judged against the peer. The vs-stock makespan gain, its precision, the
+  fairness band and the v0.1.28 quality gate come from a same-artifact
+  candidate-vs-v0.1.28 campaign on hf2q's own DeepSeek-V4 artifact with the
+  same candidate binary, bound by path and sha256. This needs a no-stock-arm
+  campaign mode and matching `required_references`/`family_verdict`
+  changes in the harness.
+- **D2, ds4 on the same file.** ds4 c97964b runs on the same file only in a
+  `--native-comparison` campaign whose native case declares the shared
+  artifact. Both sha256 values must be present and equal, the declaration
+  is part of the frozen campaign identity, `--peer-unavailable-evidence` is
+  refused in that mode (the same-file peer runs), and labels say "same ds4
+  file" instead of "different artifact". The statement stays task makespan
+  only, because ds4's rendered prompts differ.
 
 This amendment establishes no speed win, quality result or memory admission.
 
