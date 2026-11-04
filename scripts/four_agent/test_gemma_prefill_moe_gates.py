@@ -65,19 +65,36 @@ class Gates(unittest.TestCase):
             self.assertTrue(gates.s4(blocks)["pass"])
             self.assertTrue(all(v["pass"] for v in gates.fairness(blocks).values()))
 
-    def test_per_transaction_substitution_below_six_blocks(self):
+    def campaign(self, root, blocks, split_blocks):
+        """ABBA campaign of `blocks` blocks; the first run of each block in `split_blocks` splits."""
+        runs = []
+        for i, arm in enumerate(("ABBA" * blocks)[:2 * blocks]):
+            wall = 1000.0 if arm == "A" else 920.0
+            turns = [(4, 58, 137.0), (4, 355, wall)]
+            if i % 2 == 0 and i // 2 in split_blocks:
+                turns = [(4, 58, 137.0), [(355, 300.0)] * 4]
+            runs.append(gates.load_run(arm, self.run_dir(root, f"r{i}", turns, 100.0)))
+        return gates.blocks_of(runs)
+
+    def test_fewer_than_six_matched_blocks_needs_more_pairs_before_the_cap(self):
         with tempfile.TemporaryDirectory() as root:
-            runs = []
-            for i, arm in enumerate("ABBAAB"):
-                wall = 1000.0 if arm == "A" else 920.0
-                turns = [(4, 58, 137.0), (4, 355, wall)]
-                if i in (0, 2):
-                    turns = [(4, 58, 137.0), [(355, 300.0)] * 4]
-                runs.append(gates.load_run(arm, self.run_dir(root, f"r{i}", turns, 100.0)))
-            s2 = gates.s2(gates.blocks_of(runs))
+            s2 = gates.s2(self.campaign(root, 3, {0, 1}))
+            self.assertFalse(s2["per_transaction_substitution"])
+            self.assertFalse(s2["pass"])
+            self.assertEqual(s2["deltas_s"], [])
+            self.assertIn("need more pairs", s2["note"])
+
+    def test_per_transaction_substitution_once_the_cap_is_used(self):
+        with tempfile.TemporaryDirectory() as root:
+            s2 = gates.s2(self.campaign(root, 12, set(range(7))))
+            self.assertEqual(s2["matched_blocks"], 5)
             self.assertTrue(s2["per_transaction_substitution"])
-            self.assertEqual(len(s2["deltas_s"]), 3)
-            self.assertEqual(s2["deltas_s"][0], 0.0, "only the matched 4x58 turn is summed")
+            self.assertEqual(len(s2["deltas_s"]), 12)
+            self.assertEqual(s2["deltas_s"][0], 0.0, "split block: only the matched 4x58 turn is summed")
+            self.assertAlmostEqual(s2["deltas_s"][-1], -0.08)
+            # 7 of 12 blocks only match on the unchanged 4x58 turn: median 0, gate fails.
+            self.assertEqual(s2["median_delta_s"], 0.0)
+            self.assertFalse(s2["pass"])
 
     def test_blocks_require_one_run_per_arm(self):
         run = {"arm": "A"}

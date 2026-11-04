@@ -104,7 +104,10 @@ pub(crate) fn down_call(
     let slotted = switch == GemmaPrefillMoeDown::Slotted
         && !affine
         && !threshold_override_present
-        && seq_len > MM_ID_ROUTING_THRESHOLD as usize;
+        && seq_len > MM_ID_ROUTING_THRESHOLD as usize
+        // The mm_id route (and its map0 instantiations) exists only for
+        // these top_k; any other top_k keeps today's flattened call.
+        && matches!(top_k, 1 | 6 | 8);
     if slotted {
         DownCall {
             n_tokens: seq_len as u32,
@@ -176,6 +179,20 @@ mod tests {
             // Affine stacks and the A arm keep the flattened call.
             assert_eq!(down_call(Slotted, seq_len, 8, true, false), flat(seq_len));
             assert_eq!(down_call(Flat, seq_len, 8, false, false), flat(seq_len));
+        }
+        for top_k in [1usize, 6, 8] {
+            assert!(down_call(Slotted, 232, top_k, false, false).slotted, "top_k {top_k}");
+        }
+        for top_k in [2usize, 4, 7, 16] {
+            assert_eq!(
+                down_call(Slotted, 232, top_k, false, false),
+                DownCall {
+                    n_tokens: (232 * top_k) as u32,
+                    top_k: 1,
+                    slotted: false
+                },
+                "top_k {top_k} has no mm_id route: flattened call"
+            );
         }
     }
 }

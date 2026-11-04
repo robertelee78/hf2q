@@ -153,10 +153,18 @@ def s2(blocks):
     excluded = [{"arm": run["arm"], "dir": run["dir"], "structure": run["structure"]}
                 for block in blocks for run in block.values() if run["structure"] != modal]
     matched = [b for b in blocks if b["A"]["structure"] == modal and b["B"]["structure"] == modal]
+    cap_used = len(blocks) >= S2_MIN_BLOCKS + S2_MAX_EXTRA_BLOCKS
+    note = None
+    substituted = False
     if len(matched) >= S2_MIN_BLOCKS:
         deltas = [b["B"]["warm_wall_s"] - b["A"]["warm_wall_s"] for b in matched]
-        substituted = False
+    elif not cap_used:
+        # Fewer than 6 matched blocks and replacement blocks remain: run more pairs.
+        deltas = []
+        note = (f"need more pairs: {len(matched)} of {S2_MIN_BLOCKS} structure-matched blocks, "
+                f"{len(blocks)} of {S2_MIN_BLOCKS + S2_MAX_EXTRA_BLOCKS} blocks run")
     else:
+        # The frozen replacement cap is used: per-transaction substitution.
         deltas = []
         for b in blocks:
             a, bb = matched_wall_s(b["A"], modal), matched_wall_s(b["B"], modal)
@@ -165,13 +173,11 @@ def s2(blocks):
                 deltas.append(sum(bb[k] for k in common) - sum(a[k] for k in common))
         substituted = True
     median, ci = median_ci(deltas)
-    passed = (median is not None and ci is not None and median <= -S2_SAVING_S and ci[1] < 0
+    passed = (bool(deltas) and median <= -S2_SAVING_S and ci[1] < 0
               and (substituted or len(matched) >= S2_MIN_BLOCKS))
-    return {"modal_structure": modal, "matched_blocks": len(matched), "excluded_runs": excluded,
-            "per_transaction_substitution": substituted, "deltas_s": deltas, "median_delta_s": median,
-            "ci95_s": ci, "pass": passed,
-            "note": None if len(blocks) - len(matched) <= S2_MAX_EXTRA_BLOCKS else
-            "more replacement blocks than the frozen cap of 6"}
+    return {"modal_structure": modal, "matched_blocks": len(matched), "blocks": len(blocks),
+            "excluded_runs": excluded, "per_transaction_substitution": substituted, "deltas_s": deltas,
+            "median_delta_s": median, "ci95_s": ci, "pass": passed, "note": note}
 
 
 def s4(blocks):
