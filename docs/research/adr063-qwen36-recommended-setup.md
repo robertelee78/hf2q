@@ -235,5 +235,9 @@ Under Q4-QWEN36, after "If Qwen3.6 stays BelowFloor under every setup tested …
 >
 > Gates:
 > - The 24-instance paired task campaign (Q1 §3.5) on this workload decides the floor and the engine verdict.
-> - The Q4 speed race follows only if it clears the floor.
+> - The Q4 speed race follows only if it clears the floor. A cleared floor also makes this the declared
+>   Qwen3.6 workload of C2's quality rule ("while no workload on which Qwen3.6 passes is declared").
 > - If it stays BelowFloor, Q4-QWEN36 returns to the operator as `needs_decision`.
+>
+> Placement: under Q4-QWEN36 Acceptance, after "If Qwen3.6 stays BelowFloor under every setup tested …",
+> with an "Updated" header line in the ADR.
