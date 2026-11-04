@@ -543,7 +543,9 @@ Checks registered for #653/#665:
 | drift, diagnostic build | drift-diag-p{1,2} (build `540a4708`, native 0.15.9) | T2Loc's `gemma_loc4` in its `DriftAll128` form: schema as the cohort localizer, route `gemma-all128-stage-drift-witness-off-v1`, 4 lanes, `stages` store equal to the bound manifest (prefill rows 0..127, `decode_stages: []`), endpoint store present, **no routing bank asserted**, `observer_effect_reference` null. The row-127 byte-equality gate against the preparation's retained logits runs offline (`exact`) before pass 1 is used |
 | drift, b5g side | drift-b5g-p{1,2} (b5g, native 0.15.16) | the same `gemma_loc4` `DriftAll128` form, with the same plan and manifest as the diagnostic side for the same pass |
 
-The drift composition's bindings carry **no `routing_witness`** (ReviewSpec26 closing note). That is the condition under which `gemma_loc4` skips the routing-bank assertion. It does so only for the `DriftAll128` route label; any other route with no witness refuses. Each build's drift bindings declare their own `t0` T0-first gate, a witness-off ordinary endpoint T0 on that same build: `gemma_actual::q1_gemma_actual_ordinary_endpoint_trace` exists at `540a4708`, and on b5g the gate is `gemma-t0-b5g`.
+The drift composition's bindings carry **no `routing_witness`** (ReviewSpec26 closing note). That is the condition under which `gemma_loc4` skips the routing-bank assertion. It does so only for the `DriftAll128` route label; any other route with no witness refuses. Each build's drift bindings declare that build's own `t0` T0-first gate:
+- at `540a4708`: an ordinary endpoint T0, `gemma_actual::q1_gemma_actual_ordinary_endpoint_trace`, which exists there. It runs without a witness, because that build has none.
+- on b5g: `gemma-t0-b5g`.
 
 ## 4. Review outcome: author answers as accepted
 
