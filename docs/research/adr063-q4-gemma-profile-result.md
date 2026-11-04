@@ -230,6 +230,20 @@ needs. **Gemma cannot reach Win through #668 alone.** It also needs cold-turn ad
 and/or decode kernels, and **no v0.1.30 story covers those**. Per ADR-063 Q4, the family either gets new
 stories or the operator records a re-scope.
 
+**Dated notes (2026-11-04; the rows above are unchanged).**
+- The operator added four v0.1.30 stories for the unowned levers, each a predecessor of #668's closing
+  combined candidate: Q4-GEMMA-COLD (cold-turn admission), Q4-GEMMA-PREFILL-MOE (warm-prefill MoE),
+  Q4-GEMMA-DECODE (decode kernels, including decode attention as its lever A) and Q4-GEMMA-SPEC-SERVE
+  (the serving drafter). See ADR-063 "Gemma 4 gap stories and the rope_multi pin".
+- Cold-turn admission is re-estimated at −0.20 to −0.35 s (from 0.4–0.5 s;
+  `docs/research/adr063-q4-gemma-cold-design.md` §10): the joint 4 × 465-row forward does not keep the
+  275 ms per-slot prefill, because the per-row term dominates. That moves the sum of all levers to about
+  2.1–3.2 s against the 3.0 s Win requirement.
+- Revised Gemma lever budget (estimate), low/high: attention 1.2/1.4, cold 0.20/0.35, prefill MoE 0.08/0.28,
+  speculation 0.40 (G0)/0.50, decode including attention 0.36 (lowest adoptable)/1.52 s (all levers at
+  threshold, decode design §5.1): about 2.2–4.0 s against 3.0 s needed `[INFERENCE]`; only the combined
+  candidate gives a valid total.
+
 **hf2q Gemma 4 assistant-drafter support.** Checked in source at `7f295b38`; hf2q does not support it.
 - `src/inference/gguf_contract.rs:83` asserts that `gemma4-assistant` has no runtime contract. Loading the
   assistant GGUF would refuse, as model-family rules require.
