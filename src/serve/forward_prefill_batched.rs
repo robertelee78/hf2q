@@ -948,6 +948,12 @@ impl MlxModelWeights {
                 self.warm_live_kernel,
             )
         });
+        if live_prefix_resume && crate::serve::gemma_prefill_catsplit::enabled() {
+            crate::serve::gemma_prefill_catsplit::forward(
+                seq_len,
+                self.multi_seq_prefill.as_ref().map_or(1, |ms| ms.seq_lens.len()),
+            );
+        }
 
         eprintln!(
             "Batched prefill: KV={:?}, seq_len={}, path={}, globals={}{}{}{}",
@@ -2193,6 +2199,11 @@ impl MlxModelWeights {
                 && std::env::var("HF2Q_PROFILE_MM").is_err()
                 && std::env::var("HF2Q_PROFILE_FA").is_err()
                 && std::env::var("HF2Q_PROFILE_MOE").is_err();
+            // ADR-063 Q4-GEMMA warm-prefill split (HF2Q_GEMMA_PREFILL_CATSPLIT=1,
+            // off by default): GPU-timed segment boundaries in warm layers only.
+            let warm_split = live_prefix_resume
+                && !graph_opt_prefill
+                && crate::serve::gemma_prefill_catsplit::enabled();
             {
                 let mut s = if graph_opt_prefill {
                     exec.begin_recorded().map(crate::inference::native_observation::session).map_err(|e| {
@@ -2529,6 +2540,13 @@ impl MlxModelWeights {
                 let route_through_nofa =
                     !live_prefix_resume && (use_no_fa || force_global_nofa) && !is_sliding;
                 if live_prefix_resume {
+                    if warm_split {
+                        crate::serve::gemma_prefill_catsplit::boundary(
+                            &mut s,
+                            exec,
+                            crate::serve::gemma_prefill_catsplit::Cat::PreAttn,
+                        )?;
+                    }
                     // One shared per-sequence attention (ADR-063 Stage 2):
                     // a single-slot resume passes its own view, a resumed
                     // multi-sequence cohort passes each lane's slot view.
@@ -2575,6 +2593,13 @@ impl MlxModelWeights {
                             &live_layer,
                             route,
                             std::iter::once(seq),
+                        )?;
+                    }
+                    if warm_split {
+                        crate::serve::gemma_prefill_catsplit::boundary(
+                            &mut s,
+                            exec,
+                            crate::serve::gemma_prefill_catsplit::Cat::Attention,
                         )?;
                     }
                 } else if route_through_nofa {
@@ -4721,6 +4746,13 @@ impl MlxModelWeights {
                 } else {
                     self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()
                 };
+                if warm_split {
+                    crate::serve::gemma_prefill_catsplit::boundary(
+                        &mut s,
+                        exec,
+                        crate::serve::gemma_prefill_catsplit::Cat::Dense,
+                    )?;
+                }
                 s.barrier_between(
                     &[&pf_moe_norm_out, &pf_expert_ids, gu_w_buf],
                     &[&pf_moe_gate_up],
@@ -5186,6 +5218,13 @@ impl MlxModelWeights {
                     || profile_buckets_on
                     || self.dflash_capture.is_some()
                     || live_layer_probe_armed();
+                if warm_split {
+                    crate::serve::gemma_prefill_catsplit::boundary(
+                        &mut s,
+                        exec,
+                        crate::serve::gemma_prefill_catsplit::Cat::Moe,
+                    )?;
+                }
                 if sync_per_layer {
                     if graph_opt_prefill {
                         // ADR-029 iter-39 H40 — sync-mode with fusion.  Mirrors
