@@ -391,6 +391,64 @@ class GemmaLoc4(unittest.TestCase):
                        marker, stores, missing_logit, ordinary_axis, no_plan, no_bindings_witness, no_packet_witness, short_bank):
             with self.subTest(mutate.__name__), self.assertRaises((ValueError, KeyError, FileNotFoundError)):
                 self.run_case(mutate=mutate)
+class ResourcePolicyRules(unittest.TestCase):
+    LIMITS = {"process_rss_limit_bytes": 10, "process_footprint_limit_bytes": 20}
+
+    def test_runtime_pressure_defaults_to_normal_and_q5_admits_warning_never_critical(self):
+        self.assertEqual(s.runtime_pressure({}), ("1",))
+        self.assertEqual(s.runtime_pressure({"runtime_pressure_rule": "normal-every-sample"}), ("1",))
+        q5 = s.runtime_pressure({"runtime_pressure_rule": "q5-critical-stop"})
+        self.assertEqual(q5, ("1", "2"))
+        self.assertNotIn("4", q5)
+        for bad in ("warning", None, "q5"):
+            with self.assertRaises(ValueError):
+                s.runtime_pressure({"runtime_pressure_rule": bad})
+
+    def test_process_caps_required_except_q5_footprint_calibration(self):
+        self.assertEqual(s.process_limits(self.LIMITS), (False, 10, 20))
+        calibration = {"footprint_calibration": True, "runtime_pressure_rule": "q5-critical-stop",
+                       "process_rss_limit_bytes": None, "process_footprint_limit_bytes": None}
+        self.assertEqual(s.process_limits(calibration), (True, None, None))
+        for bad in ({**self.LIMITS, "process_rss_limit_bytes": None},
+                    {**calibration, "runtime_pressure_rule": "normal-every-sample"},
+                    {**calibration, "process_footprint_limit_bytes": 5},
+                    {**self.LIMITS, "footprint_calibration": "yes"}):
+            with self.assertRaises(ValueError):
+                s.process_limits(bad)
+
+
+class MemoryRecordSummary(unittest.TestCase):
+    @staticmethod
+    def sample(free, cached, wired, pressure="1", swap=100, compressor=50, start=0):
+        return {"physical": {"free": free, "cached_files": cached, "wired": wired, "compressor": compressor},
+                "pressure_raw": pressure, "swap_bytes": swap, "start_ns": start}
+
+    def test_charge_is_baseline_min_minus_runtime_min_with_process_peaks(self):
+        base = [self.sample(10, 90, 5), self.sample(12, 86, 6)]
+        m = s.MemoryRecord(base)
+        for t, (free, cached, wired, pressure) in enumerate([(5, 40, 50, "1"), (2, 6, 90, "2"), (3, 9, 88, "2")]):
+            m.sample(self.sample(free, cached, wired, pressure, swap=100 + t, compressor=50 + 2 * t, start=1000 + t), 7 - t, 1000)
+            m.ledger({"phys_footprint": 4 + t, "resident_size": 3, "wired_size": 9 - t, "lifetime_max_phys_footprint": 7})
+        r = m.summary()
+        self.assertEqual(r["baseline"]["min_free_plus_cached_bytes"], 98)
+        self.assertEqual(r["min_free_plus_cached_bytes"], 8)
+        self.assertEqual(r["charged_bytes"], 90)
+        self.assertEqual(r["min_available_after_owned_outputs_bytes"], 5)
+        self.assertEqual(r["pressure_counts"], {"1": 1, "2": 2})
+        self.assertEqual((r["max_wired_growth_bytes"], r["max_swap_growth_bytes"], r["max_compressor_growth_bytes"]), (84, 2, 4))
+        self.assertEqual(r["max_sample_drop_bytes"], 37)
+        self.assertEqual((r["peak_phys_footprint_bytes"], r["peak_wired_bytes"], r["last_sample_t_ns"]), (6, 9, 2))
+        self.assertEqual(m.series[1]["footprint"], 5)
+
+    def test_max_sample_drop_is_the_largest_fall_not_the_largest_rise(self):
+        m = s.MemoryRecord([self.sample(0, 100, 0)])
+        for t, cached in enumerate([100, 70, 60, 61]):  # falls 30 then 10, one rise of 1
+            m.sample(self.sample(0, cached, 0, start=t), cached, 0)
+        self.assertEqual(m.summary()["max_sample_drop_bytes"], 30)
+        rising = s.MemoryRecord([self.sample(0, 100, 0)])
+        for t, cached in enumerate([50, 60, 90]):  # only rises after the first sample: the largest fall is negative
+            rising.sample(self.sample(0, cached, 0, start=t), cached, 0)
+        self.assertEqual(rising.summary()["max_sample_drop_bytes"], -10)
 
 
 if __name__ == "__main__":
