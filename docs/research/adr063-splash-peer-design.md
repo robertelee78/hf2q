@@ -1,6 +1,7 @@
 # ADR-063: Splash as a second peer of record for the Qwen families — design
 
-Status: design, 2026-11-03. CPU-only investigation (no model load, no server start, no GPU run).
+Status: design accepted, 2026-11-04 (operator decisions D1–D10 in §10). The investigation was CPU-only, with no
+model load, no server start and no GPU run.
 Operator decision (2026-11-03): for Qwen3.8 and Qwen3.6, a v0.1.30 Win requires hf2q to finish the canonical
 four-agent coding task at least 5% sooner than **both** the current peer and Splash, each in its best valid
 configuration. This document gives the Splash facts that decision needs, the harness design, the sweep, the GPU
@@ -232,9 +233,9 @@ Implications:
 | Family | Draft dir (local `--draft-model`) | Pins |
 |---|---|---|
 | Qwen3.8 | `~/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2/snapshots/50307d4c…` (present) | `config.json` sha256 `873e3556…`, `model.safetensors` sha256 `67fc76d6…`; equal to `incoai/Qwen3.8-27B-DFlash2@015e7956` (HF API LFS sha and config bytes compared 2026-11-03) |
-| Qwen3.6 | `~/.cache/huggingface/hub/models--incoai--Qwen3.6-35B-A3B-DFlash2/snapshots/51ef7b69…` (to fetch) | `model.safetensors` sha256 `d1f16c0f…`, 1.05 GB |
+| Qwen3.6 | `~/.cache/huggingface/hub/models--incoai--Qwen3.6-35B-A3B-DFlash2/snapshots/51ef7b69…` (downloaded 2026-11-04) | `config.json` sha256 `86d2e8e57e7c70bb867240708d00c0535ae9ed3c828dbdcb21584471c7bbce59`, `model.safetensors` sha256 `d1f16c0ff85afbe6166fabfae998af3ec16fa11da87da4391b5e0e0a7c796a4d` (re-hashed locally, equal to the HF LFS sha), 1,052,513,456 B |
 
-Fetch command, root-run, internal disk because timed runs read it at load:
+Downloaded to the internal disk, because timed runs read the draft at load:
 `HF_HUB_CACHE=~/.cache/huggingface/hub hf download incoai/Qwen3.6-35B-A3B-DFlash2 --revision 51ef7b6923ad6c14cb1bb41c37a9041446496ab6 config.json model.safetensors`.
 Splash refuses a draft whose config does not match the target (`model-check` with the draft config).
 
@@ -390,7 +391,7 @@ read and repacked, a GGUF re-digest after a ctime change, ANE program build), so
 
 | Item | Qwen3.8 | Qwen3.6 |
 |---|---|---|
-| Preflight (model-check, first start, Q5 S0) | ~10 min | ~8 min (+1 GB draft fetch, network only) |
+| Preflight (model-check, first start, Q5 S0) | ~10 min | ~8 min |
 | Sweep S0–S6 × 2 + confirmation 2×3 + M × 2 | 22 runs ≈ 55 min | 22 runs ≈ 40 min |
 | **Fit + sweep total** | **≈ 1.1 h (range 0.8–1.6 h)** | **≈ 0.8 h (0.6–1.2 h)** |
 | Paired quality gate vs Splash (same instance count as the peer gate; observed ~45 s/run on Qwen3.6, ~1.5 min on Qwen3.8; ~48 runs) | ≈ 1.2 h | ≈ 0.7 h |
@@ -399,89 +400,46 @@ read and repacked, a GGUF re-digest after a ctime change, ANE program build), so
 | **Full paired race per family (n4 + n1)** | **≈ 1.4–5.2 h**; Splash's share ≈ 25% | **≈ 1.0–3.6 h** |
 
 Two peer contrasts must both reach the 2.5-point half-width. Expect the race to need more blocks than v11's 5 when
-the two peers' makespans differ a lot. The mixed 3+1/2+2/1+3 controls, if Splash runs them, add about the n4
-figure again per stage (decision D7).
+the two peers' makespans differ a lot. Splash does not run the mixed 3+1/2+2/1+3 controls (decision D7).
 
-## 9. ADR-063 amendment text (proposed)
+## 9. ADR-063 amendment
 
-New section after "Native-engine peer arms":
+The amendment is applied in `docs/adr/ADR-063-apple-silicon-four-agent-speed-coherence.md`. It adds a new section,
+"Splash peer of record for the Qwen families (operator decisions 2026-11-03/11-04)", after "Native-engine peer
+arms", and makes these changes:
+- the Updated line;
+- the Q4 Outcome: both peers for Qwen3.8/Qwen3.6;
+- the Q4 win and quality-gate acceptance bullets: the hf2q/Splash ratio meets the same 0.95 bound, and the quality
+  gate also runs against Splash;
+- the Q4-QWEN38 Outcome and Predecessors: the Splash Qwen3.8 fit and best-configuration record;
+- the Q4-QWEN36 workload bullet and Predecessors: Splash runs the declared repair-turn workload.
 
-> ### Splash peer of record for the Qwen families (operator decision 2026-11-03)
->
-> For Qwen3.8 27B and Qwen3.6 35B-A3B, Splash (`incoai/splash`, source build `031a25a6`, engine kind `splash`) is a
-> second same-artifact peer of record. Splash serves neither Gemma 4 nor DeepSeek-V4 (`install/families.py`), so
-> those families keep one peer.
->
-> - **Same artifact.** Splash serves the hf2q GGUF of the family's hf2q arm, the same path and sha256, read through
->   its local-file mode; its `model.json` digest must equal the hf2q artifact sha256. It decodes with its DFlash2
->   drafter, a separately pinned artifact (F1): Qwen3.8 `incoai/Qwen3.8-27B-DFlash2@015e7956`, byte-identical to
->   `z-lab/…@50307d4c`, and Qwen3.6 `incoai/Qwen3.6-35B-A3B-DFlash2@51ef7b69`, bound by digest. It serves text only,
->   with four lanes and a 262,144-token context.
-> - **Best valid configuration.** Splash has no switch that turns speculation off. Its best valid configuration is
->   chosen per family by the declared makespan rule from a one-factor sweep of its documented knobs: KV and state
->   formats, Neural Engine prefill split (Qwen3.8), verify rows (Qwen3.6), decode share and the SSD cache tier.
->   Every sweep run passes Q5 and the task gates, and the choice is confirmed before the campaign of record. A
->   matched-settings diagnostic (bf16 KV, fp32 state, Neural Engine split off, every verify row, no SSD tier) is
->   kept and labeled. A Splash no-speculation arm is Unavailable.
-> - **Q3.** Q3 campaigns for these families add the measured arm `splash` to the Williams blocks and report
->   experiment-versus-Splash beside experiment-versus-peer. Splash cohorts are Q2-certified like the peer's.
-> - **Q4 win (Qwen families).** `family_verdict` is Win only when the hf2q/peer and the hf2q/Splash four-agent
->   makespan ratios both have 95% CI upper bounds ≤ 0.95, each against that engine's best valid configuration, and
->   every other Q4 gate holds. A missing, failed or disqualified Splash arm cannot yield a Win. Splash task failures
->   are recorded as quality findings.
-> - **Quality gate.** The paired task-quality gate on the exact candidate binary also runs against Splash, bound to
->   the Splash readiness identity.
-> - **Fairness.** Vs-Splash worst-slot TTFT ratios are disclosed and not gated. SSE gaps against Splash are not
->   comparable, because one emission can carry several speculative tokens.
-> - **Recorded differences.** Request parity differs in the repetition penalty (D3), the tool grammar (D5) and the
->   forced thinking close (D4). Splash greedy output is not run-to-run exact on the MoE target under its default
->   verify rows. Its numerics include int8 KV and the Neural Engine W8A8 FFN split where the chosen configuration
->   uses them. Per-turn prompt bytes are proven equal to hf2q's through `/apply-template`.
-> - **Identity.** The commit, the binary/metallib sha256s, the `build_id`, the venv freeze, the drafter digests,
->   the exact argv and the Neural Engine calibration state are frozen with the campaign identity.
->
-> This decision establishes no speed win.
+## 10. Decisions (operator, 2026-11-04)
 
-Amended sentences:
-- **Q4 Outcome.** Append: "For Qwen3.8 and Qwen3.6, at least 5% sooner than both the peer and Splash, each in its
-  best valid configuration."
-- **Q4 Acceptance, the win bullet.** Add: "For Qwen3.8 and Qwen3.6, the hf2q/Splash ratio must meet the same bound."
-- **Q4 Acceptance, the quality bullet.** Add: "and against Splash for Qwen3.8 and Qwen3.6."
-- **Q4-QWEN38 and Q4-QWEN36 Outcomes.** Add: "and than Splash in its best valid configuration"; the per-stage
-  attribution is extended to the Splash gap.
-- **Predecessors of Q4-QWEN38/Q4-QWEN36.** Add "Splash fit and best-configuration record (Qwen family)".
+The operator accepted every recommendation on 2026-11-04. The rejected alternatives are kept for the record.
 
-## 10. Decisions needed (operator)
-
-- **D1 — Campaign structure.**
-  - (a) Recommended: one five-arm Williams campaign per family (stock, experiment, peer, peer_matched, splash),
-    with same-session thermal conditions and one identity freeze.
-  - (b) A separate experiment-vs-Splash campaign without a stock arm, bound to the record campaign's candidate
-    binary by sha256, as in the Q4-DS4-RACE D1 pattern. It is cheaper per block, but needs the no-stock-arm mode
-    and cross-campaign binding.
-- **D2 — Pin.** Recommended: source build `031a25a6` (§2). Alternative: the `1.5.0` bottle, which is older and lacks
-  the M5 prefill tile.
-- **D3 — Repetition penalty.**
-  - (a) Recommended: send none (1.0), as the TensorFold arm does, and record it.
-  - (b) Send 1.05. It then applies over the whole prompt and output, a stronger and different penalty that Splash
-    warns delays tool calls.
-- **D4 — Forced thinking close.**
-  - (a) Recommended: `--thinking-end-text $'\nI need to answer now.</think>'`, hf2q's text. The CPU probe
-    accepted it as 8 tokens ending in `</think>` (§4).
-  - (b) Splash's default `</think>`.
-- **D5 — `parallel_tool_calls`.**
-  - (a) Recommended: send `false`. This is hf2q's default, and Splash then constrains calls by its grammar.
-  - (b) Omit it, for unconstrained output. The client refuses a second call either way.
-- **D6 — Memory cap.** Default `--max-memory auto`. If the Q5 floor trips, allow an explicit cap, recorded as part
-  of the configuration?
-- **D7 — Controls.** Splash in n4 and n1 only (recommended), or also in the 3+1/2+2/1+3 mixed controls (about
-  +1 n4-equivalent each).
-- **D8 — Symlinks.** Is a symlink to the GGUF in a Splash run directory acceptable under the host rule "never
-  link a model file"? Splash makes no hard link and does not touch the file.
-- **D9 — Qwen3.6 workload.** The Splash case follows whatever Q4-QWEN36 declares, canonical or repair variant.
-  Splash's Qwen3.6 arm waits for that decision.
-- **D10 — Validity of lossy defaults.** Are int8 KV and the Neural Engine split valid unless the quality gate
-  fails (recommended), or must the Splash arm match hf2q's KV precision?
+- **D1 — Campaign structure: one five-arm Williams campaign per family** (stock, experiment, peer, peer_matched,
+  splash), with same-session thermal conditions and one identity freeze. The rejected alternative was a separate
+  experiment-vs-Splash campaign bound to the record campaign's candidate binary.
+- **D2 — Pin: source build `031a25a6`** (§2.1 identity). The `1.5.0` bottle is not used.
+- **D3 — Repetition penalty: none is sent** (Splash default 1.0), as the TensorFold arm does. The difference from
+  hf2q's 1.05 over a 64-token window is recorded in every Splash statement and run audit.
+- **D4 — Forced thinking close: hf2q's text**, `--thinking-end-text $'\nI need to answer now.</think>'` (8 tokens,
+  §4).
+- **D5 — `parallel_tool_calls: false`** is sent (hf2q's default). Splash constrains calls by its grammar.
+- **D6 — Memory cap: `--max-memory auto`.** An explicit cap is allowed only if the Q5 free-plus-cached floor trips
+  in the S0 calibration. The cap then becomes part of the recorded configuration and is never silently changed.
+- **D7 — Controls: Splash runs in the n4 (four-agent) and n1 (single-agent) stages only.** It does not run in the
+  3+1/2+2/1+3 mixed controls.
+- **D8 — Symlinks: acceptable.** Splash's assembly symlinks to the GGUF and the draft (no hard link, no write).
+- **D9 — Qwen3.6 workload: the repair-turn workload.** The Splash Qwen3.6 case runs the Q4-QWEN36 repair-turn
+  workload, one repair turn after a failed `run_tests` (`qwen_n4_live_smoke.py --repair-turns 1`, Qwen3.6 only),
+  exactly as the hf2q and peer Qwen3.6 arms do. Qwen3.8 keeps the canonical six-step protocol. The client's
+  repair-turn gate ("repair turns are Qwen hf2q/peer runs") is widened to `splash` once that workload lands on
+  main.
+- **D10 — Lossy defaults are valid unless Splash's quality gate fails.** These are int8 KV, bf16 state if selected,
+  and the Neural Engine W8A8 FFN split. If the paired task-quality check against Splash fails in a configuration,
+  that configuration is invalid for the best-configuration choice.
 
 ## 11. Open risks
 
