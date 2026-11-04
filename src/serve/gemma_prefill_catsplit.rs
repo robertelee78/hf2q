@@ -33,9 +33,13 @@ pub(crate) const SCHEMA: &str = "hf2q.gemma4.prefill-catsplit.v1";
 /// Segment category; the value is the bucket index and the report order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Cat {
-    /// Input norm, Q/K/V projections, head norms, RoPE and KV writes.
+    /// Input norm, Q/K/V projections, head norms and RoPE. No KV writes: in a
+    /// live resume they are encoded inside the attention segment.
     PreAttn = 0,
-    /// The live warm attention (`encode_live_layer_attention`).
+    /// Everything `encode_live_layer_attention` encodes: the KV writes (global
+    /// append with F16 K copy and V quantize, sliding ring staging of K/V/norms
+    /// and the suffix commit), the attention kernel itself and the FWHT undo.
+    /// It is therefore larger than the attention-kernel time alone.
     Attention = 1,
     /// Everything after attention up to the routed experts: O projection,
     /// post-attention norm/residual, the dense FFN, the router and the routed

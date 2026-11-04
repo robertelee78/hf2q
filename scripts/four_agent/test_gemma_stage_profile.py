@@ -129,6 +129,16 @@ class Compare(unittest.TestCase):
         base = [self.profile(f"b{i}", 10.0, 2.0) for i in range(3)]
         self.assertEqual(gsp.compare(arm, base)["pairing"], "unpaired")
 
+    def test_same_block_labels_in_different_directories_are_unpaired(self):
+        arm = [dict(self.profile(f"n-{i:03}-b{i:02}-hf2q-x", 11.0, 3.0), path=f"/r/l2/n-{i:03}-b{i:02}-hf2q-x")
+               for i in range(3)]
+        base = [dict(self.profile(f"n-{i:03}-b{i:02}-hf2q-y", 10.0, 2.0), path=f"/r/l1/n-{i:03}-b{i:02}-hf2q-y")
+                for i in range(3)]
+        self.assertEqual(gsp.compare(arm, base)["pairing"], "unpaired")
+        for p in base:
+            p["path"] = p["path"].replace("/l1/", "/l2/")
+        self.assertEqual(gsp.compare(arm, base)["pairing"], "block")
+
 
 class WarmModel(unittest.TestCase):
     def test_recovers_known_coefficients(self):

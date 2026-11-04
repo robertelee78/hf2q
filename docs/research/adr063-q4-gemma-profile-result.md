@@ -45,7 +45,7 @@ Ranking: completion, final tests, Q5 memory tier, median makespan (`$G/search/pr
 | 5 | NV ngram-map-k4v | 3 | 14.40 | 0.36 | 52 |
 | 6 | DF draft-dflash | 3 | 14.53 | 0.23 | 39 |
 | 7 | NC ngram-cache | 3 | 15.04 | 0.25 | 52 |
-| 8 | DS2 draft-simple (E2B, target token list) | 3 | 25.78 | – | – |
+| 8 | DS2 draft-simple (E2B, target token list) | 3 | 25.78 | 0.64 | 36.9 |
 | 9 | E3 draft-eagle3 | 3 | 27.10 | 0.19 | 29 |
 
 Every arm has completion 1.0, quality 1.0 and 3/3 (or 7/7) Q5 passes. MT is −0.35 s against P0, with a 95%
@@ -96,8 +96,11 @@ Per turn (medians over agents and runs, in ms; queue is hf2q's server-side wait)
 - **SSE cadence.**
   - hf2q's worst-slot gap is 62–66 ms in all 7 runs, always on turn 1, and coincides with another agent's
     prefill window less than 0.1% of the time.
-  - The peer's worst gap is 98–190 ms, on turn 1 in 6 of 7 runs, from draft-verify bursts; 2–27% of its
-    excess gap time overlaps other agents' prefill windows.
+  - The peer's worst gap is 98–190 ms. In 6 of 7 runs it is on turn 1 and lies entirely inside another
+    agent's prefill window (overlap 1.0): co-scheduled prefill stalls the slot's stream. In the seventh run
+    it is on turn 3 with no overlap. Across all excess gaps, 2–27% of the peer's excess gap time overlaps
+    other agents' prefill windows. The receipts do not measure draft/verify timing, so no cadence is
+    attributed to it.
   - hf2q's semantic first-token time is later on every streamed turn (603/973/759 vs 372/650/530 ms). It
     emits each tool call in 3 events against the peer's 7–11.
   - Against MT, the SSE-gap metric favours hf2q (0.064 vs 0.125 s). The stock SSE-gap regression (hf2q vs
@@ -121,23 +124,32 @@ Per traced run, in seconds, over the request window [first send, last terminal]:
 
 **The gap is GPU work, not host dispatch or scheduling idle.** hf2q is GPU-busy 3.4–4.1 s longer per run,
 while its idle-with-a-request-in-flight (dispatch, encode, sampling, delivery) is about 0.5 s *smaller* than
-the peer's. Splitting the extra GPU time: about 1.4–1.5 s falls in prefill windows and 2.0–2.5 s in
-decode-only time.
+the peer's. hf2q's extra GPU time is about 1.4–1.5 s inside prefill windows and 2.0–2.5 s in decode-only
+time.
 
-Distortion, traced vs the L1 untraced medians: hf2q +0.52 s (+3.5%, CI +0.10 to +1.67), peer +0.26 s (CI
-−0.57 to +0.35; `distortion-*-traced-vs-l1.json`).
+**Caveat.** A prefill window is [send, terminal − decode]. With four slots it also contains other slots'
+decode steps, and hf2q's windows are longer (4.78–5.00 s vs the peer's 3.92–4.00 s) because they include
+its queue. "GPU busy in prefill windows" is therefore not prefill GPU work, and part of hf2q's excess there
+comes from window length. It is not used to size any lever.
+
+Distortion, traced vs the L1 untraced medians (unpaired, since L2 and L1 are different blocks): hf2q
++0.56 s (+3.7%, CI −0.16 to +1.44); peer −0.21 s (CI −0.55 to +0.26). See `distortion-*-traced-vs-l1.json`.
 
 ## 4. hf2q GPU classes (L3, profiled; shares of serialized GPU-busy time)
 
 Warm prefill, from the new `HF2Q_GEMMA_PREFILL_CATSPLIT` (3 runs; 6–7 warm forwards per run, 24 lanes,
-about 4,990 rows): attention is 1.53 s per run. Shares are the mean of the 3 runs:
+about 4,990 rows): the attention segment is 1.53 s per run. Shares are the mean of the 3 runs:
 
 | Category | GPU s per run | Share |
 |---|---:|---:|
-| live warm attention (vec-hybrid) | 1.53–1.54 | 48% |
+| attention segment: KV writes (global append with F16 K copy and V quantize; sliding ring staging of K/V/norms and the suffix commit), the vec-hybrid attention kernel, FWHT undo | 1.53–1.54 | 48% |
 | routed MoE + layer tail | 1.09–1.11 | 34% |
 | dense (O-proj, dense FFN, router, MoE input norm) | 0.35 | 11% |
-| pre-attention (norm, QKV, head norm, RoPE, KV write) | 0.24 | 7.5% |
+| pre-attention (norm, QKV, head norm, RoPE; no KV writes) | 0.24 | 7.5% |
+
+In a live resume the KV writes are encoded inside `encode_live_layer_attention`, so they fall in the attention
+segment. The 48% is therefore an upper bound on the attention kernel's share. A tiled route still pays the
+KV staging.
 
 Decode body (`HF2Q_DECODE_CATSPLIT`, one command buffer per category; lm-head and sampling excluded):
 - routed MoE 40% (gate/up 21.8%, down 15.3%, other 3.1%);
@@ -150,24 +162,38 @@ Host phases (`HF2Q_HOST_PHASES`, 2 runs): the sample loop (argmax, detokenize, s
 
 Distortion:
 - **HC (both splits) vs H.** Makespan 59.8 vs 14.2 s (+45.3 s), almost all of it decode (+41.1 s). The
-  decode split serializes about 14,000 command buffers per run, so it is a relative ranking only. Warm
-  prefill under HC is +0.47 s (+13%), which bounds the prefill split's own perturbation. The decode split's
-  4.2× run length confounds it.
-- **HH vs H.** +0.48 s (+3.4%, CI −0.07 to +1.20).
+  decode split commits about 225,000–258,000 command buffers per run (13,800 per category, i.e. 460 decode
+  steps × 30 layers, across 12 categories), so it is a relative ranking only. Warm prefill under HC is
+  +0.47 s (+13%), which bounds the prefill split's own perturbation; the decode split's 4.2× run length
+  confounds it.
+- **HH vs H.** +0.48 s (+3.4%, CI −0.07 to +1.20). This comparison is unpaired: only 2 common blocks, below
+  the ≥ 3 pairing rule.
 
 ## 5. Warm-attention counterfactual (CF): unavailable
 
 The first tiled-F16 warm-attention run (HT, `HF2Q_GEMMA_WARM_TILED_ATTENTION=1`) failed its task: agents 0 and
 2 failed with "tool arguments/workflow drift" (Q5 `ClientFailed`, `$G/profile/cf/031-b01-ht-*`). This is
-the known #544 decision flip. Per the halt-on-failure rule, the remaining CF runs were not taken. The
-warm-attention share therefore rests on §4's measured split (48% of warm-prefill GPU time) and the L2
-prefill-window GPU excess (about 1.4–1.5 s per run), not on a makespan counterfactual.
+the known #544 decision flip. Per the halt-on-failure rule, the remaining CF runs were not taken. As
+designed, the HT arm cannot be expected to complete, so no makespan counterfactual can be measured on this
+workload.
+
+### Root decisions on the two partial acceptance items (root, 2026-11-04)
+
+- **Share attributable to warm attention.** The share of record is the v9 measured tiled-off cost, 7.8–9.2%
+  of makespan (ADR-063 Q4-GEMMA-ATTN acceptance; the v9 review). The HT counterfactual is not completable by
+  design, and #668's own A/B of the precise tiled route will measure the share directly. §4's 48% is
+  supporting evidence only: a share of serialized warm-prefill GPU time that includes KV staging.
+- **Share attributable to the stock SSE-gap regression.** It is recorded qualitatively, from the Q3 v9
+  re-reading (method doc §5). hf2q's worst gap is about 60 ms, at the end of the turn-1 tool call, between
+  its last two events. It is the same in stock and experiment despite different decode steps, so it is not
+  decode cadence. No numeric share was measured in this campaign.
 
 ## 6. Stages the Gemma work must close
 
-1. **Warm-prefill attention** (Q4-GEMMA-KERNEL/ATTN): 48% of hf2q's warm-prefill GPU time, about 1.5 s per
-   run. The warm-prefill gap is about +1.4 s per agent. This is the largest single attributable class. Even
-   removing it fully would not close the 2.73 s gap alone.
+1. **Warm-prefill attention** (Q4-GEMMA-KERNEL/ATTN). The share of record is 7.8–9.2% of makespan (root
+   decision, §5); the attention segment, including KV staging, is 48% of warm-prefill GPU time. The
+   warm-prefill gap is about +1.4 s per agent. This is the largest single attributable class, but even
+   removing it would not close the 2.73 s gap alone.
 2. **Decode GPU work**: +2.0–2.5 s decode-only GPU per run. Routed MoE (40%) and dense projections and FFN
    (38%) dominate. Part of this is the peer's MTP, which removes target decode steps (MT vs P0: −0.48 s of
    decode). This is out of Q4-GEMMA-ATTN's scope; it needs its own design (Gemma MTP, or MoE/dense decode
@@ -189,7 +215,7 @@ Estimates are in makespan seconds per run.
 
 | Stage (measured gap) | Candidate lever | Recoverable (estimate) | Basis | Story |
 |---|---|---:|---|---|
-| Warm-prefill attention, part of the +1.40 s per agent on warm turns 1–6 | Precise tiled warm attention (F32 accumulation) instead of vec-hybrid | 1.2–1.4 s | The tiled-off cost measured in the v9 review, 7.8–9.2% of makespan (ADR-063, Q4-GEMMA-ATTN acceptance), × 14.87 s. Consistent with attention being 48% of warm-prefill GPU time (§4), about 1.5 s per run serialized. Assumes the precise kernel matches TiledF16's speed and does not flip decisions | **#659 Q4-GEMMA-KERNEL → #668 Q4-GEMMA-ATTN** |
+| Warm-prefill attention, part of the +1.40 s per agent on warm turns 1–6 | Precise tiled warm attention (F32 accumulation) instead of vec-hybrid | 1.2–1.4 s | The share of record (§5 root decision): the v9 tiled-off cost, 7.8–9.2% of makespan, × 14.87 s. That figure is a route A/B, so it already nets out the KV staging that a tiled route still pays. §4's 48% (the attention segment including KV writes and ring staging) is an upper bound, not used for sizing. Assumes the precise kernel matches TiledF16's speed and does not flip decisions | **#659 Q4-GEMMA-KERNEL → #668 Q4-GEMMA-ATTN** |
 | Warm-prefill per-row cost (MoE 34%, dense 11%, pre-attention 7.5% of warm-prefill GPU) | Faster prefill MoE (`mul_mm_id`) and dense kernels; larger joint warm cohorts | ≤ 0.3 s | The warm-prefill gap is +1.40 s per agent; once the attention lever's 1.2–1.4 s is removed, ≤ 0.2–0.3 s remains. The fit's per-row term (2.13 vs 1.18 s per 1k new rows) also contains vec-hybrid's per-row attention, so it overstates this lever | **none** |
 | Cold-turn admission (turn 0: +0.50 s span; 422 ms hf2q queue, +459 ms decode, −299 ms prefill) | Batch the four simultaneous cold prompts into one joint cold prefill before any decode, as the peer does (its turn-0 prefill of 574 ms covers all four at once) | 0.4–0.5 s | The turn-0 span delta is +0.496 s. The upper bound assumes hf2q's faster per-slot cold prefill (275 ms) carries into a joint 4×465-row forward [INFERENCE] | **none**. ADR-065 E4 measures makespan composition but changes nothing |
 | Decode, speculation (part of +1.17 s decode; the peer's MT accepts 0.79 per drafted, 2.34 per verify step) | Gemma 4 assistant-drafter MTP or another drafter in hf2q **serving** at 4 slots | 0.4–0.5 s | MT vs P0 on the peer: −0.48 s decode and −0.35 s makespan (§1; CI includes 0). An hf2q equivalent could recover a similar amount on the long decode turns 2 and 6 | **none** (see the support check below) |

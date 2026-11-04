@@ -279,12 +279,17 @@ def _metric(p, stage):
 def compare(arm, base):
     """Stage medians of arm and base, arm - base deltas with 95% bootstrap CIs and shares of the makespan delta.
 
-    Blocks (`-wNN-`/`-bNN-` in run names) shared by both arms are resampled as paired differences;
-    otherwise runs are resampled independently per arm.
+    Blocks (`-wNN-`/`-bNN-` in run names) shared by both arms are resampled as paired differences, but only
+    when the two runs sit in the same directory (one campaign layer): equal labels in different directories
+    are different blocks. Otherwise runs are resampled independently per arm.
     """
     out = {"arm_runs": len(arm), "base_runs": len(base), "stages": {}}
-    blocks_a = {m.group(1): p for p in arm if (m := BLOCK.search(p["run"]))}
-    blocks_b = {m.group(1): p for p in base if (m := BLOCK.search(p["run"]))}
+
+    def block(p):
+        m = BLOCK.search(p["run"])
+        return (str(Path(p["path"]).parent) if p.get("path") else "", m.group(1)) if m else None
+    blocks_a = {k: p for p in arm if (k := block(p))}
+    blocks_b = {k: p for p in base if (k := block(p))}
     common = sorted(set(blocks_a) & set(blocks_b))
     out["pairing"] = "block" if len(common) >= 3 else "unpaired"
     d_makespan = None
