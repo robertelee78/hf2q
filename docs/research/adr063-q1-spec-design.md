@@ -511,7 +511,7 @@ One change to `scripts/four_agent/q1_endpoint_supervisor.py`, with one admission
 - Every record's agent must be in `lanes`.
 - Σ bytes ≤ `host_payload_limit` and ≤ the policy's phase upper bound.
 - `output/execution.json` must have `packet_sha256` = the packet's sha and `whole_q1_qualified: false`.
-- Completion: without `completion_line`, the line must be exactly `<marker> records=<Σ> whole_q1_qualified=false`.
+- Completion: without `completion_line`, the line must be exactly `<marker> records=<Σ> whole_q1_qualified=false`, and it must occur **exactly once** in `marker_stream`, either bare or with the case's libtest prefix `test <filter> ... ` (libtest prints that prefix and the test's first stdout line on one line).
 - `stores` may be `{}` (then `expected_stores` must be `{}`, records = 0, and the checks own the receipt). This covers the Qwen T5 Preparation, which writes no trace store (`ba6654c4`).
 - `checks` are names from a closed in-file registry.
 - Endpoint and localizer kinds and the T0-first gate are unchanged.
@@ -525,7 +525,7 @@ One change to `scripts/four_agent/q1_endpoint_supervisor.py`, with one admission
 
 Completion lines:
 - The Qwen runners print fixed lines rather than `records=<Σ>`: `Q1_QWEN_T5_PHASE_COMPLETE …` (`runner.rs:443`) and `Q1_QWEN_RECOVERY_CONTINUATION_COMPLETE …` (`continuation.rs:482`).
-- An optional case key `completion_line` (a non-empty string that contains `completion_marker`). When present, that exact line must occur **exactly once** in `marker_stream` (`ba6654c4`), and it replaces the Σ rule.
+- An optional case key `completion_line` (a non-empty string that contains `completion_marker`). When present, that line must occur **exactly once** in `marker_stream` (`ba6654c4`), counting both the bare form and the libtest-prefixed form `test <filter> ... <line>`, and it replaces the Σ rule. The binding may carry either form; the registry checks compare the bare part with the source line (#685).
 - Conditions from review answer 4: the line is copied verbatim from the source at the bound commit (`runner.rs:443`, `continuation.rs:482`, with the mode filled in). Because these fixed lines carry no record count, the registry checks bind every store's count to `execution.json` and to the source manifest.
 - Qwen T5 and T6 cases declare their exact line, for example `Q1_QWEN_RECOVERY_CONTINUATION_COMPLETE mode=CancelledThenRecovered lanes=4 rows_per_lane=80 first64_logits=false whole_q1=false`.
 - The Gemma T5 adapter prints the Σ form.
