@@ -247,9 +247,23 @@ def verify_assembly(spec, assembly):
             'Splash links exactly one GGUF (no projector, no other part)')
     weights = [f for f in files.values() if f.get('digest') == artifact['draft_weights_sha256']]
     require(len(weights) == 1, 'Splash model.json does not link the pinned draft weights')
+    template = files.get('tokenizer/chat_template.jinja') or {}
+    require(template.get('digest') == artifact['template_sha256'],
+            'the template Splash derived from the GGUF is not the reviewed hf2q template')
     return {'path': str(assembly), 'model_json_sha256': hashlib.sha256(raw).hexdigest(),
             'family': record['family'], 'target_digest': target['digest'], 'draft_digest': weights[0]['digest'],
-            'linked_files': sorted(files)}
+            'template_digest': template['digest'], 'linked_files': sorted(files)}
+
+
+def filesystem(path):
+    """The file system type of the volume holding path (`df -P` mount point, then `mount`)."""
+    df = subprocess.run(['/bin/df', '-P', str(path)], capture_output=True, timeout=10, check=True).stdout.decode()
+    point = df.splitlines()[-1].split(None, 5)[-1]
+    for line in subprocess.run(['/sbin/mount'], capture_output=True, timeout=10, check=True).stdout.decode().splitlines():
+        head, _, options = line.rpartition(' (')
+        if head.endswith(' on ' + point):
+            return options.split(',')[0]
+    return None
 
 
 def ane_cache_dir():
@@ -271,6 +285,9 @@ def cross_run_state():
 def prepare_run(spec, environ):
     """Launcher side: the run's own model directory through prepare_local_model; returns (assembly, record)."""
     paths = layout(spec)
+    # Splash's installer collects garbage in models_dir and stops on the AppleDouble `._*` files exFAT volumes write
+    # (observed on the external drive), so the run directory must be on APFS (the internal disk).
+    require(filesystem(paths['run'].parent) == 'apfs', 'the Splash run directory must be on an APFS volume')
     paths['run'].mkdir()
     paths['models'].mkdir()
     result = subprocess.run([str(paths['python']), '-P', '-c', PREPARE, spec['model'], spec['draft_dir'],

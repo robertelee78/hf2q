@@ -311,7 +311,10 @@ class Launch(unittest.TestCase):
                           'target/Qwen3.8-27B-vanilla.gguf': {'path': spec['model'], 'bytes': 1, 'mtime_ns': 1,
                                                               'ctime_ns': 1, 'digest': 'f' * 64},
                           'draft/model.safetensors': {'path': '/hub/x', 'bytes': 1, 'mtime_ns': 1, 'ctime_ns': 1,
-                                                      'digest': weights}}}
+                                                      'digest': weights},
+                          'tokenizer/chat_template.jinja': {'path': '/m/.metadata/x/chat_template.jinja', 'bytes': 1,
+                                                            'mtime_ns': 1, 'ctime_ns': 1,
+                                                            'digest': sp.ARTIFACTS['qwen38']['template_sha256']}}}
             (assembly / 'model.json').write_text(json.dumps(record))
             self.assertEqual(ready.verify_assembly(spec, assembly)['target_digest'], 'f' * 64)
             for change in ({'family': 'Qwen3.6-35B-A3B'}, {'vision_format': 'gguf'},

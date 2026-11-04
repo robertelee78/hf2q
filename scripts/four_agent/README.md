@@ -439,7 +439,7 @@ decodes with its family's pinned DFlash2 draft. Q3 runs it as its own measured a
 | `native_peer_splash_ready.py` | Launch inputs, build/venv/toolchain/draft identity, per-run model assembly (`model.json` digests), argv template, readiness, closing render proof (`/apply-template` + `/tokenize`), campaign identity |
 | `native_peer_splash_launch.py` | q5 serve entry: verifies, prepares `{OUT}/splash/models`, writes `launch.json`, execs the Splash server in the same process |
 | `native_peer_splash_audit.py` | Post-run audit (Done/Started lines bound to client turns, render archive, no cancel/error/restart) and `run_record` |
-| `splash_sweep.py` | `identity` (the build variables), `derive-case` (one sweep point, optional D6 `--max-memory` cap), `select` (validity from Splash's own runs and the best configuration) |
+| `splash_sweep.py` | `identity` (the build variables), `derive-case` (one sweep point, optional D6 `--max-memory` cap), `select` (validity from Splash's own runs and the best configuration), `parity-config` (the input of hf2q's `splash_prompt_parity_post_oracle`) |
 | `q5_cases/splash-qwen38.json`, `splash-qwen36.json` | Q5 cases; `SPLASH_CONFIG` is the configuration (default: sweep point `s0`) |
 
 - **Build.** Build a clean detached clone of `031a25a6` with `make -j4 && make install-environment`, only while
@@ -458,6 +458,10 @@ decodes with its family's pinned DFlash2 draft. Q3 runs it as its own measured a
 - **Per run.** Every start digests the GGUF again into a fresh `{OUT}/splash/models`, outside the makespan. The
   campaign identity freezes the build, toolchain, venv, draft, configuration and argv template, never the assembly
   path.
+  - Splash's `model.json` must record the hf2q GGUF with `MODEL_SHA256`, the pinned draft weights, and the reviewed
+    template as `tokenizer/chat_template.jinja`.
+  - `{OUT}` must be on APFS (the internal disk). On the exFAT external drive, Splash's model-directory cleanup stops
+    on the `._*` files macOS writes there.
 - **Q3.** `--splash-case` defaults to `q5_cases/splash-<family>.json` for qwen38/qwen36. The arm runs only in the
   `n4` and `n1` stages (D7). `--splash-unavailable-evidence` declares Splash unavailable; the family verdict is
   then `Unavailable`, never a Win against the peer alone. A Splash Q5 memory stop halts the campaign: record a
