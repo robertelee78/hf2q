@@ -251,10 +251,12 @@ Extend `adr063_invariance::gemma_ngram` rather than add a parallel module. Its h
 - Completion line: `Q1_GEMMA_T5_COMPLETE records=<n> whole_q1_qualified=false`.
 - Packet: the existing closed profile (`runner.rs:16-20`: k3, ngram 1..3, context 262144, output 8192, 4 serial owners), plus:
   - `arm` ∈ {`OrdinaryGlobal`, `NgramTransaction`};
-  - `lanes` [0,1,2,3];
-  - `host_payload_limit`;
-  - `expected_stores` (the multistore contract, §3).
-- `routing_witness` is ON in both arms with the exact admitted budget (`gemma_routing_witness::validate_budget`). The ordinary arm writes `Canonical` rows 0..143. The n-gram arm writes `T5Initial` 0..127, `T5Verify` 0..131 and `T5Continuation` 129+a..143 (`gemma_ngram.rs:74-76`, `before_verify`). Both fit `ROW_CAP = 4 × (128 + 132 + 16)`. §2.5 explains why.
+  - `lanes` [0,1,2,3].
+- **Packet-size bound (ReviewSpec26 condition 1):** the packet carries no record lists. `gemma_ngram/runner.rs:80` reads at most 1 MiB, and the three T5 store lists alone are about 8,472 entries. Instead:
+  - The adapter computes each store's expected extent from the source manifest functions.
+  - The supervisor gets the extent {lanes, host_payload_limit, expected_stores} from the case's bound `manifest` file (Part 3). A no-model metadata export writes that file from the same functions, the way T2Loc's metadata prepare does.
+  - A hosted control asserts that the largest Gemma T5 and localizer packet (n-gram pass 2) is ≤ 1 MiB, and the largest manifest file is ≤ 64 MiB.
+- `routing_witness` is ON in both arms with the exact admitted budget (`gemma_routing_witness::validate_budget`). The ordinary arm writes `Canonical` rows 0..143. The n-gram arm writes `T5Initial` 0..127, `T5Verify` 0..131 and `T5Continuation` 129+a..143 (`gemma_ngram.rs:74-76`, `before_verify`). Both fit `ROW_CAP = 4 × (128 + 132 + 16)`. §2.5 explains why; the supervisor validates the witness (Part 3, `gemma_t5_ordinary` / `gemma_t5_ngram`).
 
 **Workload:** the accepted greedy144 dataset bound by review receipt `9b097208…` (`runner.rs:43-46`), with token digest `84276820…5034`. This is the lineage of `gemma-t0-b3` and of the v3 probe.
 
@@ -332,12 +334,13 @@ Reporting rules:
 The witness is **on** in both T5 arms (§2.3), so routing flips and margins (§3.3) are always recorded for the T5 pair, not only when the result is RouteSensitive.
 - In the n-gram arm, committed rows come from two namespaces: `T5Verify` for rows 128..128+a, from a 132-row re-prefill that also re-routes rows 0..127, and `T5Continuation` (`gemma_routing_witness.rs:64-70`). The ordinary arm writes `Canonical` rows.
 - `routing` joins on (namespace, lane, position, layer) and refuses unpaired keys (`q1_decision_policy.py` `routing`, failure `'… unpaired routing keys …'`), so it cannot pair the two arms directly.
-- The new key-mapping comparator `routing-mapped` (§2.6) joins them through the frozen key map. Pairs:
-  - `T5Initial` p < 128 ↔ `Canonical` p: same call, expected ExactRouting;
-  - `T5Verify` p ≤ 128 + a ↔ `Canonical` p;
-  - `T5Continuation` p ↔ `Canonical` p.
-  - `T5Verify` rows 129+a..131 have no counterpart; they are listed as unmapped, with their selections and gaps.
-- `routing-mapped` reports the T5 pair's `changed_rows`, `set_changed_rows`, `order_only_rows` and `changed_gap_max`, split by mapped phase.
+- The new key-mapping comparator `routing-mapped` (§2.6) joins them through the frozen key map. The map is **one-to-one per phase**, and each phase is reported separately (ReviewSpec26 condition 2):
+  - `verify-prefix`: `T5Verify` p < 128 ↔ `Canonical` p;
+  - `verify-committed`: `T5Verify` 128 ≤ p ≤ 128 + a ↔ `Canonical` p;
+  - `continuation`: `T5Continuation` p ↔ `Canonical` p.
+  - `T5Initial` ↔ `Canonical` is **not** mapped. It is the same call that G5-A1 already proves byte-equal, and mapping it would pair `Canonical` rows 0..127 twice.
+  - Unmapped and listed, with selections and gaps: `T5Initial` 0..127 and `T5Verify` 129+a..131. Every `Canonical` row 0..143 is mapped exactly once, in one of the three phases.
+- `routing-mapped` reports `changed_rows`, `set_changed_rows`, `order_only_rows` and `changed_gap_max` per phase, and no cross-phase total.
 
 ### 2.6 Verifier-route localizer (in #665 scope, operator decision 2026-11-03)
 
@@ -349,16 +352,18 @@ A RouteSensitive Gemma T5 result must be localized. #665 therefore builds a veri
 - Roles: `gemma_localizer::PREFILL_STAGES` (14) and `gemma_cohort_localizer::DECODE_STAGES` (12).
 - Manifest shape and admission: `gemma_cohort_localizer::Plan` / `admit`, including the 1 GiB stage cap and the 65,536-record and 4,096-target quotas.
 - Offline record: `scripts/four_agent/q1_stage_localization.py`, reusing `compare_group`, `segment_magnitude`, `repetition` and `routing_changes`.
-- Supervisor: the `multistore` kind.
+- Supervisor: the `multistore` kind, with the extent in the bound `manifest` file (condition 1).
 - D2 builds on #652's change, so #665's localizer lands after it.
 
 **When it runs.** It runs only after the T5 offline decisions, and only in two cases:
 - **Branch N:** G5-B committed rows is `RouteSensitive`. The pair is n-gram arm vs ordinary-global arm.
 - **Branch P:** the n-gram arm refused at row 127 because the global-route initial decision differed from `frozen[128]`. The pair is the ordinary-global arm vs the slot-aware All128 route, which produced the frozen dataset.
+  - **Precondition** (condition 7): the b5g All128 reference's own row-127 `Logits` argmax (its endpoint store) must equal `frozen[128]`.
+  - If it does not, the frozen decision has drifted across builds, not routes. The record becomes **build-drift localization**: T2Loc's `q1_stage_localization.py` (same-manifest mode) runs on the b3 All128 stage store vs a b5g All128 run under the same b3 plan. Branch P is not run.
 
 It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 
-**Rust (cfg(test)), localizer mode of the §2.3 adapter.** Each arm gets a `stage_localizer` packet block with the `Plan` shape {rerun_id, layers, prefill_stages, decode_stages, host_payload_limit}. It writes a nested stage store at `output/stages` beside the T5 stores, with the witness ON.
+**Rust (cfg(test)), localizer mode of the §2.3 adapter.** Each arm gets a `stage_localizer` packet block with the `Plan` shape {rerun_id, layers, prefill_stages, decode_stages, host_payload_limit} plus `accepted`. The packet carries no record list (condition 1); the stage extent comes from the source manifest and from the bound `manifest` file. The localizer writes a nested stage store at `output/stages` beside the T5 stores, with the witness ON.
 - Lane ownership: each lane runs inside `gemma_prefill::serial_lane(lane)`, so every prefill row and every single-row decode row is owned as (lane, absolute position).
 - **Ordinary-global arm:**
   - initial prefill: prefill roles at rows 0..127, `segment 0`, step key 0;
@@ -374,14 +379,21 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
     - the prefill layer, then the stage, then rows 0..R (R = 128 for the ordinary arm, 132 for the verify re-prefill);
     - then the decode position, layer and stage.
   - `accepted` is taken from the T5 n-gram receipt (`a` per lane). It is frozen into the localizer packet before launch, and the run refuses if its observed `a` differs.
-  - Admission is like `admit`: the packet's `expected_stores["stages"]` must equal the source manifest.
-- **Preflight:** refuse `HF2Q_PARALLEL_ENCODE` (the `encode_parallel_layers_chunked` path has no stage hooks), xlen (already refused) and witness OFF.
-- **Branch P reference:** run T2Loc's own `gemma_actual::q1_gemma_actual_all128_stage_localizer` (slot-aware serial All128) with this design's layer and role plan and `decode_stages: []`, on the same build.
+  - Admission is like `admit`: the stage extent computed from the packet's Plan must equal the extent in the bound `manifest` file, and the supervisor re-checks the store against that file.
+- **Preflight:** refuse `HF2Q_PARALLEL_ENCODE` (condition 8). `encode_parallel_layers_chunked` does call `encode_one_layer`, but it runs on the worker thread, and the single-row decode stage hooks capture only on the owning thread, where the capture thread-local lives (as `gemma_actual.rs` states for its route). Also refuse xlen (already refused) and witness OFF.
+- **Branch P reference:** run T2Loc's `gemma_actual::q1_gemma_actual_all128_stage_localizer` (slot-aware serial All128) with this design's layer and role plan and `decode_stages: []`, on the same build.
+  - D2 makes two changes to T2Loc's code, and both go through the same single admission review (condition 9).
+  - **Plan-only packet form:** today T2Loc's packet carries `expected_stores["stages"]`, and `cohort_localizer_export` refuses anything over 15 MiB (`gemma_actual` reads at most 16 MiB). Branch P pass 2 would be about 18 MiB. In the new form, the stage list comes from the source `manifest()` and the bound `manifest` file. #652's existing form stays valid. Both forms are tested.
+  - **Observer-effect reference parameter:** the export's hardcoded `observer_effect_reference: "gemma-t0-b3"` becomes a prepare-config parameter. Branch P sets it to `gemma-t0-b5g`.
 - **Observer-effect control:**
   - each localizer arm's `prefork`, `committed` and `raw-verifier` stores must be `ExactEqual` to the same arm's T5 stores;
   - its witness must be `ExactRouting` against the T5 witness;
   - the branch P reference's endpoint store must be `ExactEqual` to `gemma-t0-b5g`.
-  - Any difference is a defect in the localizer, and the record is withheld.
+  - Any difference is a defect in the localizer adapter, and the record is withheld. Next step (condition 7):
+    - the defect gets an issue and a source fix;
+    - a new build is made;
+    - **on that build**, both T5 arms, the T0 gate and the localizer passes are rerun, because the observer control must be same-build.
+    - The earlier T5 result stays on record. This is a rerun after a source fix, not a retry of a deterministic route (policy §3.7).
 
 **Two passes, rule frozen now.**
 - **Pass 1 (onset layer):**
@@ -389,31 +401,35 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
   - Roles: {RouterLogits, RouterIds, LayerOutput} for both prefill and decode.
   - Size: 132 rows × 4 lanes × 30 layers × 11,808 B ≈ 187 MB of prefill plus about 23 MB of decode per arm. Records: n-gram ≤ 47,520 + 5,760, under the T2Loc quotas.
   - Output: per lane, the first divergent layer L* in candidate execution order.
-  - **Head rule:** if every mapped `LayerOutput` row at layer 29 is exact but the row's committed `Logits` differ, the onset is the output head, recorded as stage `Head`. The verifier head (`per_position_argmax_from_hidden_batched_impl`) is a different kernel from the decode head. Pass 2 is then skipped for that lane.
+  - **Head rule** (condition 6): it applies **only when no pass-1 group differs** for that lane (no `RouterLogits`, `RouterIds` or `LayerOutput` group at any layer) but the row's committed `Logits` differ. The onset is then the output head, recorded as stage `Head`, and pass 2 is skipped for that lane. The verifier head (`per_position_argmax_from_hidden_batched_impl`) is a different kernel from the decode head. If any pass-1 group differs, the first differing group gives L*.
 - **Pass 2 (stage within the layer):**
   - Layers: the union over lanes of {L* − 1, L*}, or {0} when L* = 0; at most 8 layers.
   - Roles: all 14 prefill and 12 decode roles.
-  - Size: ≤ 8 × 14 × 4 × 132 + 16 × 8 × 12 × 4 = 65,280 records, about 0.6 GB, under the 1 GiB cap.
+  - Size: ≤ 64,896 records for the n-gram arm and 63,488 for the ordinary arm, under 65,536. Up to about 0.69 GB in the worst case of 4 global layers, under the 1 GiB stage cap. Branch P pass 2 is about 1.98 GB in total against `gemma_actual`'s 2 GiB host bound, which fits with little margin; a pre-launch byte plan is required.
   - Output: the first divergent (phase, layer, stage) per lane.
 
 **Key map** (`q1_stage_localization.py ngram-map NGRAM_T5_EXECUTION ORDINARY_T5_EXECUTION PLAN > map.json`).
 - The map is mechanical and sha-pinned, and it is reviewed before any comparison. Schema `hf2q.q1.key-map.v1`.
-- It binds both receipts' sha256, the per-lane `a`, and lists the pairs in candidate execution order. Keys are T2Loc's `key(at)` = (stage, agent, row, layer, segment, step).
+- It binds both receipts' sha256, the per-lane `a`, the sha256 of the four traces the comparator reads (both stage stores and both logit stores, condition 4), and lists the pairs **per phase**, in candidate execution order within each phase. Keys are T2Loc's `key(at)` = (stage, agent, row, layer, segment, step).
 
 | Phase (branch N) | Candidate (n-gram) | Reference (ordinary-global) | Roles |
 |---|---|---|---|
+| `logits` | `committed` Logits rows 128..143 | `committed` Logits rows 128..143 | head rule input |
 | `verify-prefix` | segment 1, rows 0..127, prefill role s | segment 0, initial prefill row p, role s | 14 prefill roles |
 | `verify-committed` | segment 1, rows 128..128+a | segment 0, decode position p | the 11 roles in both sets (Query, Key, Value, RopeQuery, RopeKey, Attention, FfnNorm, RouterLogits/Ids/Weights, LayerOutput) |
 | `continuation` | segment 0, decode 129+a..143 | segment 0, decode p | 12 decode roles |
-| unmapped (listed, not compared) | segment 1 rows 129+a..131; prefill-only roles at rows ≥ 128 | decode rows 129..128+a | — |
+| unmapped (listed, not compared) | segment 1 rows 129+a..131 (all roles); prefill-only roles (Residual, DenseOutput, MoeOutput) at segment 1 rows 128..128+a | **`Norm` at decode rows 128..128+a** (decode-only role; condition 3) | — |
 
-- Branch P uses an identity map on prefill rows 0..127, plus `Logits` row 127. The candidate is the ordinary-global arm, and the reference is the T2Loc All128 stage store.
-- Each pair must have equal scalar and shape. The map is one-to-one; a duplicate key on either side refuses.
+- Branch P uses an identity map on prefill rows 0..127. Its `logits` phase maps `Logits` row 127: the candidate is the ordinary arm's `prefork` store, and the reference is the All128 localizer's endpoint store. The candidate is the ordinary-global arm, and the reference is the T2Loc All128 stage store.
+- Each pair must have equal scalar and shape. Within a phase, the map is one-to-one, and a duplicate key on either side refuses. Every captured key of both stage stores is either mapped or listed as unmapped (completeness).
 - The routing pairs of §2.5 are in the same file.
 
 **Offline comparators** (added to T2Loc's existing scripts, not new tools):
-- **`q1_stage_localization.py mapped REFERENCE_STAGES CANDIDATE_STAGES WORKLOAD MAP`**
-  - Inputs: every mapped key must be captured, and payloads are hash-verified (`captured_records`, `verified_payload`).
+- **`q1_stage_localization.py mapped REFERENCE_STAGES CANDIDATE_STAGES REFERENCE_LOGITS CANDIDATE_LOGITS WORKLOAD MAP`** (condition 4)
+  - Inputs:
+    - The logit traces are the `committed` stores (branch N), or the All128 endpoint store and the ordinary `prefork` store (branch P).
+    - All four traces must match the sha256 bound in the map.
+    - Every mapped key must be captured, and payloads are hash-verified (`captured_records`, `verified_payload`).
   - Grouping: per lane, by candidate execution order into (phase, decode position, layer, stage).
   - Output: the first group with a differing row: phase, decode position, layer, stage, `rows_in_group`, `differing_rows`, `max_abs` and `relative_rms`.
   - `verify-prefix` groups also carry `prompt_segments`: rows 0–28, rows 29–127, and rows 128..128+a for `verify-committed`.
@@ -429,15 +445,20 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
   - n-gram manifest counts for a ∈ {0,1,2}; refusal of a ∉ {0,1,2} and of a mismatch with the frozen `accepted`;
   - segment-1 verify owners (lane, 0..131), and refusal of rows > 131 or a start ≠ 0;
   - no capture under `family::pause()`, and a nested pause refuses;
-  - admit refuses a manifest other than the source manifest;
-  - pass-2 layer-union rule and its cap.
+  - admit refuses a Plan whose extent differs from the bound manifest;
+  - pass-2 layer-union rule and its caps;
+  - **packet-size control:** the largest pass-2 packet (n-gram and T2Loc plan-only form) is ≤ 1 MiB, and the manifest file is ≤ 64 MiB;
+  - T2Loc's existing form and the plan-only form are both admitted, and `observer_effect_reference` is honoured.
 - Python (`test_q1_stage_localization.py`, `test_q1_decision_policy.py`):
-  - the map is one-to-one and complete for each a;
+  - for each a, the map is one-to-one per phase and complete, with `Norm` at decode rows 128..128+a listed;
+  - a duplicate key within a phase refuses;
+  - `routing-mapped` has no `T5Initial` pair and does not double-count `Canonical` rows 0..127;
   - a synthetic difference only in `verify-prefix` layer 3 `Attention` is localized there;
   - a difference only in an unmapped row is reported but not localized;
   - a missing mapped key refuses, and a layout mismatch refuses;
-  - the head rule fires when only `Logits` differ;
-  - `routing-mapped` pairs `T5Verify`/`T5Continuation` with `Canonical`, refuses an unpaired key, and reports gaps.
+  - a logit trace whose sha differs from the map refuses;
+  - the head rule fires when only `Logits` differ, and does not fire when an earlier `RouterIds` group differs (order-only);
+  - `routing-mapped` pairs `T5Verify`/`T5Continuation` with `Canonical` per phase, refuses an unpaired key, and reports gaps.
 
 **Receipt and verdict.** The #665 receipt names the branch, the map sha, both passes' records and the observer-effect decisions. The verdict reads, for example: "RouteSensitive; localized: lane l first divergence `verify-prefix` layer L stage S rows … max_abs …". Packed-versus-All128-style Class B wording applies: a localized stage implies no fix.
 
@@ -471,7 +492,7 @@ One change to `scripts/four_agent/q1_endpoint_supervisor.py`, with one admission
 - `stores` may be `{}` (then `expected_stores` must be `{}`, records = 0, and the checks own the receipt). This covers the Qwen T5 Preparation, which writes no trace store (`ba6654c4`).
 - `checks` are names from a closed in-file registry.
 - Endpoint and localizer kinds and the T0-first gate are unchanged.
-- **Extent source:** either the packet carries {lanes, host_payload_limit, expected_stores}, or the case key `manifest` = {path, sha256} binds a JSON with exactly those keys. Exactly one source is allowed. This is required because the Qwen runners' packets are `deny_unknown_fields` (`runner.rs:27-39`, `continuation.rs:151-164`) and the T6 block must run on b4 unchanged. Gemma T5 packets carry the fields themselves.
+- **Extent source:** either the packet carries {lanes, host_payload_limit, expected_stores}, or the case key `manifest` = {path, sha256} binds a JSON with exactly those keys. Exactly one source is allowed. The Qwen runners need the `manifest` form because their packets are `deny_unknown_fields` (`runner.rs:27-39`, `continuation.rs:151-164`) and the T6 block must run on b4 unchanged. **Gemma T5 and localizer cases also use the `manifest` form**, because of the packet-size bound (§2.3, ReviewSpec26 condition 1).
 
 Completion lines:
 - The Qwen runners print fixed lines rather than `records=<Σ>`: `Q1_QWEN_T5_PHASE_COMPLETE …` (`runner.rs:443`) and `Q1_QWEN_RECOVERY_CONTINUATION_COMPLETE …` (`continuation.rs:482`).
@@ -487,9 +508,10 @@ Checks registered for #653/#665:
 | `qwen_t6_continuation` | t3cm, t6 | §1.4 check list; stores {continuation, prefix64} or {continuation, before, recovered} by mode; `continuation` = `trace_records` = 1440; every 64-snapshot store = 560 |
 | `qwen_t5_phase` | t5prep, t5base, t5forced | `schema hf2q.q1.qwen-t5-phase.v1`; mode as packet; prep: status `CompleteWorkloadPreparationNotComparable`, stores `{}`, `committed_records`/`raw_records` null, and `frozen-workload.json` + `preparation-only.json` present; phases: status `CompleteScopedAcquisition`, store `committed` = `committed_records` = 1840, `raw-verifier` = `raw_records` = 20 (forced) or absent and null (baseline), 0 or 4 transitions |
 | `qwen_t5_first_fork` | t5ffbase, t5ffforced | status `CompleteFirstForkDiagnosticNotQ1Qualified`, agent 0 only, `logical_lanes_executed` 1, each `first_fork.capture_stores` count equal to its store's records |
-| `gemma_t5_ordinary` | t5ord | arm, 4 lanes, initial argmax recorded vs `frozen[128]`, inputs 128..143 = frozen, stores {prefork = 4204, committed = 4264} equal to the execution receipt's counts |
-| `gemma_t5_ngram` | t5ngram | arm, 4 transactions with injected origin, initial argmax equal to the ordinary arm (cross-case, from that case's receipt), a and fallback recorded, cursor 129 + a, inputs 129+a..143 = frozen, stores {prefork = 4204, committed = 4264, raw-verifier = 4} equal to the receipt's counts |
-| `gemma_t5_localizer` | t5loc-{ord,ngram}-p{1,2} (and branch P's All128 reference uses `gemma_loc4`) | schema `hf2q.q1.gemma-t5-localizer.v1`, arm, branch, pass, frozen `accepted` equal to the T5 receipt's `a`, plan admitted equal to the source manifest, stores {prefork, committed, (raw-verifier), stages} with counts equal to the receipt, witness namespaces as §2.3 |
+| `gemma_t5_ordinary` | t5ord | arm, 4 lanes, initial argmax recorded vs `frozen[128]`, inputs 128..143 = frozen, stores {prefork = 4204, committed = 4264} equal to the execution receipt's counts. **Witness** (condition 5), in `output/routing-witness.jsonl`: header identity = composition comparison key, `qualified` false; only namespace `Canonical`; exact per-lane rows 0..143 × 30 layers; every row native-valid with finite raw values; metadata ≤ quota; `end.records` = rows and `all_scored_rows_captured` true |
+| `gemma_t5_ngram` | t5ngram | arm, 4 transactions with injected origin, initial argmax equal to the ordinary arm (cross-case, from that case's receipt), a and fallback recorded, cursor 129 + a, inputs 129+a..143 = frozen, stores {prefork = 4204, committed = 4264, raw-verifier = 4} equal to the receipt's counts. **Witness:** the same header, validity and quota rules as `gemma_t5_ordinary`, with exactly the namespaces {T5Initial, T5Verify, T5Continuation} and exact per-lane rows `T5Initial` 0..127, `T5Verify` 0..131, `T5Continuation` 129+a..143 × 30 layers |
+| `gemma_t5_localizer` | t5loc-{ord,ngram}-p{1,2} | schema `hf2q.q1.gemma-t5-localizer.v1`, arm, branch, pass, plan extent equal to the bound manifest, stores {prefork, committed, (raw-verifier), stages} with counts equal to the receipt, and the witness rules of the matching T5 check. **Branch N:** frozen `accepted` equal to the T5 n-gram receipt's `a`. **Branch P** (condition 9): only the `OrdinaryGlobal` arm runs; `accepted` is null; the T5 n-gram receipt must show the row-127 initial-decision refusal; the All128 precondition is recorded |
+| branch P reference | t5loc-all128-p{1,2} | T2Loc's `gemma_loc4` check, unchanged, on the plan-only packet form with `observer_effect_reference` = `gemma-t0-b5g` |
 
 ## 4. Review outcome: author answers as accepted
 
@@ -502,4 +524,7 @@ The independent review accepted the four author answers, with these conditions:
 
 Operator decision (2026-11-03): the design is approved **without** an unlocalized-RouteSensitive exception for #665. A RouteSensitive Gemma T5 result must be localized, and the verifier-route localizer (§2.6) is in #665's scope.
 
-Checks for the main agent after D1/D2: `cargo test --bin hf2q adr063_invariance`, the `q1_` controls, and both four_agent unittest suites (`test_q1_decision_policy.py`, `test_q1_endpoint_supervisor.py`).
+Checks for the main agent after D1/D2:
+- `cargo test --bin hf2q adr063_invariance`, including the new manifest, pause, map and packet-size controls;
+- the `q1_` controls;
+- the four_agent unittest suites `test_q1_stage_localization.py`, `test_q1_decision_policy.py` and `test_q1_endpoint_supervisor.py`.
