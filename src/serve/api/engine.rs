@@ -16385,8 +16385,9 @@ fn decode_batch_gemma4(
 ) -> Option<SlotAwareGpuFatal> {
     // ADR-063 Q4-GEMMA-SPEC-SERVE §5.9: per-width tick wall time (the M0
     // time-weighted width histogram reads it from a speculation-off run).
-    let _tick_timer =
-        super::gemma_speculation::GemmaDecodeTickTimer::start(handles.len(), false);
+    // The width is the number of slots actually decoded, set once the
+    // batch is gathered; a tick that decodes nothing records nothing.
+    let mut tick_timer = super::gemma_speculation::GemmaDecodeTickTimer::start(0, false);
     // First-max argmax (matches dispatch_argmax_f32's `>` tie-break). Only the
     // VALUE (== logits max) feeds the rerank threshold; the index is a cosmetic
     // seed that finalize_token_from_logits never lets affect the result (the max
@@ -16888,6 +16889,7 @@ fn decode_batch_gemma4(
 
     // Pass 2 — finalize each slot from its logits row.
     let _hp_sample = std::time::Instant::now();
+    tick_timer.set_width(captured.len());
     let mut captured = captured.into_iter().enumerate();
     while let Some((i, (handle, slot_idx, mut state, mut reply))) = captured.next() {
         let logits_row = &head.logits[i * vocab..(i + 1) * vocab];

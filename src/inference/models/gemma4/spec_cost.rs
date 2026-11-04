@@ -7,9 +7,12 @@
 //! - Acceptance model: geometric per-depth acceptance fitted to the peer's
 //!   L(3) = 3.34, `L(K) = Σ_{i=0..K} α^i`.
 //! - Round cost: `c(K, n) = (td_bound + ts + tv(K+1, n) + E[tr]) / t1(n)`,
-//!   where `E[tr] = (1 − α^K) · tr(K, n)`: under the frozen model a round
-//!   restores iff some draft is rejected, and `tr` is the measured full-tail
-//!   restore (an upper bound on any partial restore).
+//!   where `E[tr] = (1 − α^(K·n)) · tr(K, n)`: `tr` is the measured
+//!   full-tail restore of every wrapped lane in one submission (an upper
+//!   bound on any partial restore), and under the frozen model that
+//!   submission runs iff any of the n lanes rejects a draft. With fewer than
+//!   n wrapped lanes this over-weights `tr`, which keeps the bound
+//!   conservative.
 //! - Projection: `ΔD(K) = Σ_n D·h(n)·(1 − c(K, n)/L(K))`; K* maximizes it
 //!   over K ∈ {1, 2, 3}; G0 passes iff `ΔD(K*) ≥ 0.40 s`.
 
@@ -140,7 +143,7 @@ pub(crate) fn round_cost(
         .get(&n)
         .with_context(|| format!("drafter bound parts({n}) not measured"))?;
     let td = td_bound(k, parts);
-    let expected_tr = (1.0 - alpha.powi(k as i32)) * tr;
+    let expected_tr = (1.0 - alpha.powi((k * n) as i32)) * tr;
     Ok(((td + ts + tv + expected_tr) / t1, td))
 }
 
@@ -278,7 +281,7 @@ mod tests {
         m.tr.insert((2, 2), 0.002);
         m.drafter.insert(2, parts);
         let (c, got_td) = round_cost(&m, alpha, 2, 2).unwrap();
-        let expected = (td + 0.001 + 0.03 + (1.0 - alpha * alpha) * 0.002) / 0.02;
+        let expected = (td + 0.001 + 0.03 + (1.0 - alpha.powi(4)) * 0.002) / 0.02;
         assert!(close(c, expected, 1e-12));
         assert_eq!(got_td, td);
         assert!(round_cost(&m, alpha, 1, 2).is_err());

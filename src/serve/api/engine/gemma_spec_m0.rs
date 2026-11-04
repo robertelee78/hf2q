@@ -567,6 +567,19 @@ fn run() -> Result<()> {
         vocab,
     };
 
+    // The phase ordering and the pre-image only matter once the window
+    // reaches the wrapped ring (`pos0 + 1 ≥ cap`): the width-1 check runs on
+    // lane 0 and the width-4 check must include another wrapped lane, so a
+    // case whose lanes stay below the ring would check nothing that matters.
+    let wraps = |lane: &Lane| lane.pos0 + 1 >= h.ring_capacity;
+    let wrapped: Vec<bool> = h.lanes.iter().map(wraps).collect();
+    anyhow::ensure!(
+        wrapped[0] && wrapped[1..].iter().any(|&w| w),
+        "M0 case must wrap the {}-row ring in lane 0 and at least one other lane \
+         (pos0 + 1 ≥ cap); lane pos0 = {:?}",
+        h.ring_capacity,
+        h.lanes.iter().map(|l| l.pos0).collect::<Vec<_>>()
+    );
     let mut class_a = Vec::new();
     let mut measurements: BTreeMap<&str, RoundCostMeasurements> = BTreeMap::new();
     let mut flat = Vec::new();
@@ -575,6 +588,7 @@ fn run() -> Result<()> {
         for n in [1, LANES] {
             let mut record = class_a_check(&mut h, n)?;
             record["head"] = head.into();
+            record["wrapped_lanes"] = wrapped[..n].iter().filter(|&&w| w).count().into();
             class_a.push(record);
         }
         let m = measurements.entry(head).or_default();
@@ -660,6 +674,12 @@ fn run() -> Result<()> {
         "decision": decisions,
         "batched_n1_needed": batched_n1_needed,
         "ring_dispatches_per_lane": h.preimages[0].dispatches_per_lane(),
+        "wrap_coverage": h.lanes.iter().zip(&wrapped).map(|(l, &w)| serde_json::json!({
+            "slot": l.slot.0, "pos0": l.pos0, "wraps_ring": w,
+            "ring_capacity": h.ring_capacity})).collect::<Vec<_>>(),
+        "known_bias": "tv(w, n) at w ≥ 3 (K ≥ 2) is biased high: with more than 8 rows the dense \
+            projections and the lm_head run one m=1 pass per row (design §5.3's m ≤ 8 grouping is \
+            not implemented), so the provisional K* leans toward 1.",
         "g0_pass_both_head_paths": pass_both,
     });
     let out = case.output.join("m0-round-cost.json");

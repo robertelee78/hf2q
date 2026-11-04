@@ -91,6 +91,11 @@ impl GemmaDecodeTickTimer {
             start: Instant::now(),
         }
     }
+
+    /// The decoding width this tick is recorded under (0 records nothing).
+    pub(crate) fn set_width(&mut self, width: usize) {
+        self.width = width;
+    }
 }
 
 impl Drop for GemmaDecodeTickTimer {
