@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-31
-- **Updated:** 2026-11-03 — operator decision on B1 fairness (B1 review finding 3): fairness is ADR-063 Q3's block-paired regression test (fail only if the B/A interval lower bound exceeds 1.025 on worst-slot p95 semantic TTFT or worst-slot maximum semantic SSE gap); the frozen worst-ever baseline ceilings survive only as a 1.5× per-run, per-slot safety cap, set from `CalibrationPass`, thermal-valid baseline runs; campaign completeness and the `n1` control are explicit acceptance gates (see "Measurement and acceptance rules"). Earlier 2026-11-01 — accepted by the owner; execution waits for the ADR-063 v0.1.28 milestone to complete.
+- **Updated:** 2026-11-03 (later) — operator design approvals for J1 (#512), P4a (#526) and P4b (#527): P4a delivers through existing primitives (path A, no release); P4b defaults on only for dense Qwen3.8 on a Win or Equivalent with the stated conditions, Qwen3.6 unchanged; J1/P4b runtime-metallib evidence depends on the runtime-registry fix in mlx-native 0.15.17 (see "Design approvals"). Earlier 2026-11-03 — operator decision on B1 fairness (B1 review finding 3): fairness is ADR-063 Q3's block-paired regression test (fail only if the B/A interval lower bound exceeds 1.025 on worst-slot p95 semantic TTFT or worst-slot maximum semantic SSE gap); the frozen worst-ever baseline ceilings survive only as a 1.5× per-run, per-slot safety cap, set from `CalibrationPass`, thermal-valid baseline runs; campaign completeness and the `n1` control are explicit acceptance gates (see "Measurement and acceptance rules"). Earlier 2026-11-01 — accepted by the owner; execution waits for the ADR-063 v0.1.28 milestone to complete.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speculation, joint-decode, speed
 - **Depends on:** ADR-063
@@ -118,6 +118,13 @@ A story closes by type:
 | hf2q integration | Exact native pin from a clean registry build where a primitive is consumed; applicable contract tests on the official artifact; cancel smoke; four-agent A/B against the previous default; quality and fairness as above; independent verdict. |
 | Refactor | Serving transcripts `ExactTranscripts` against the previous default; existing gates pass. |
 | Policy | Unit tests against brute force, transaction tests re-run, four-agent A/B, quality, fairness (paired test and safety cap), independent verdict. |
+
+### Design approvals (operator, 2026-11-03)
+
+- **J1 (#512).** Design `docs/research/adr065-j1-design.md` approved. The solo K3 tick splits into entry, draft, verify-to-plan and a three-part commit (`k3_commit_cursors`, `k3_commit_settle`, `k3_commit_finish`) around the DeltaNet restore, so that J4 and P4b can batch the restore; no arithmetic moves and `plan_qwen35_verified_block` is untouched. J1 has no kill switch: the `ExactTranscripts` comparison is between J1's parent commit and the J1 commit, with the same native pin and lock file.
+- **P4a (#526).** Design `docs/research/adr065-p4-design.md` §2 approved. P4a takes path A: E6 shows the existing primitives suffice (`blit_copy_bytes` for recurrent state, `dispatch_strided_copy_f32` for the parity-aware conv re-index), so no kernel is built and no release is made; the story closes with the parity record on both metallib paths, which also carries C2's snapshot-direction parity.
+- **P4b (#527).** Design `docs/research/adr065-p4-design.md` §3–§5 approved. Kill switch `HF2Q_QWEN_LA_GPU_RESTORE`; the A/B uses B1's fairness checks unchanged (paired test, 1.5× cap on B1's phase-1 ceilings). The default turns on only for dense Qwen3.8, and only on a four-agent Win or Equivalent whose N=1 effect (`--n1-engages`) is not Loss, with every gate passing (fairness, safety cap, Q5, thermal, completeness) and exact transcripts; otherwise it stays off with the verdict recorded. Qwen3.6 (MoE) stays on the host restore, unchanged.
+- **Runtime-registry dependency.** At mlx-native 0.15.16 the runtime-metallib path cannot find the `gated_delta_net_decode_capture_f32_*` sources (`KernelNotFound`). The fix ships in mlx-native 0.15.17, which hf2q pins exactly before or entirely outside the J1 base/candidate pair and the P4b A/B binary; until then J1 and P4b hardware evidence is precompiled-metallib only and every receipt states the path. 0.15.17 is not a P4a release.
 
 ## Repository ownership
 
@@ -680,7 +687,7 @@ Acceptance:
 
 - Exact pin of any P4a release from a clean registry build.
 - Transaction cases for full, partial and zero acceptance pass; serving transcripts are `ExactTranscripts` against the previous default.
-- Four-agent A/B against the previous default with fairness.
+- Four-agent A/B against the previous default with fairness. The default turns on only for dense Qwen3.8 on a Win or Equivalent under the conditions in "Design approvals"; Qwen3.6 keeps the host restore.
 
 Repository ownership: hf2q.
 
