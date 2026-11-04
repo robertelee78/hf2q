@@ -8245,9 +8245,13 @@ mod tests {
         grammar_runtime_for_gbnf(&gbnf)
     }
 
-    /// Bytes the in-tree Qwen3.6/3.8 chat template emits for an assistant
-    /// turn carrying `calls`, from just after the first `<tool_call>`
-    /// (the lazy trigger) through the final `</tool_call>`.
+    /// Bytes the in-tree `qwen3-chatml.jinja` (byte-identical to the stock
+    /// Qwen3.6 template) emits for an assistant turn carrying `calls`, from
+    /// just after the first `<tool_call>` (the lazy trigger) through the
+    /// final `</tool_call>`. The Qwen3.8 template's tool-call block differs
+    /// only by an `arguments != ''` guard and emits the same bytes; it is not
+    /// vendored, so the Qwen3.8 cases below reuse these bytes and exercise
+    /// the Qwen3.8 registration's grammar.
     fn qwen_template_native_tool_bytes(calls: &[(&str, serde_json::Value)]) -> String {
         use crate::serve::api::schema::{ChatMessage, MessageContent, ToolCall, ToolCallFunction};
         let user = ChatMessage {
@@ -8318,7 +8322,9 @@ mod tests {
 
     /// #662 fork replay: after the `<tool_call>` trigger the Auto-lazy
     /// grammar must accept the template's own `\n<function=...` bytes, token
-    /// by token, for every Qwen release on the XML tool wire.
+    /// by token, for both the Qwen3.6 and Qwen3.8 model-id registrations
+    /// (bytes rendered from the in-tree Qwen3.6 template; see
+    /// `qwen_template_native_tool_bytes`).
     #[test]
     fn qwen_auto_lazy_grammar_accepts_template_native_tool_call_bytes() {
         let native = qwen_template_native_tool_bytes(&[(
