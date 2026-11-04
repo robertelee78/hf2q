@@ -113,7 +113,7 @@ def validate_preflight(value, base, engine_kind="hf2q", family="qwen"):
     if engine_kind == "peer":
         from family_peer import preflight as peer_preflight
         keys = peer_preflight(keys, family)
-    elif engine_kind in family_contract.NATIVE_KINDS:
+    elif engine_kind in family_contract.ADAPTER_KINDS:
         from native_peers import adapter
         keys = adapter(engine_kind).preflight(keys, family)
     require(isinstance(value, dict) and set(value) == keys and
@@ -388,7 +388,7 @@ def main():
         require(args.phase_plan is None or (workload is None and args.benchmark_profile is None),
                 "phase plans are controls of the canonical workload")
         native = None
-        if args.engine_kind in family_contract.NATIVE_KINDS:  # the arm's registry, client modules and test
+        if args.engine_kind in family_contract.ADAPTER_KINDS:  # the arm's registry, client modules and test
             from native_peers import adapter
             native = adapter(args.engine_kind)
             names += native.CLIENT_MODULES

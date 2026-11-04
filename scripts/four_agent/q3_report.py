@@ -18,7 +18,12 @@ SECONDARY = {"goodput_tasks_per_hour": True, "client_elapsed_s": False,
              "worst_slot_ttft_p95_s": False, "worst_slot_ttft_max_s": False,
              "worst_slot_sse_gap_p95_s": False, "worst_slot_sse_gap_max_s": False}
 FAIRNESS = ("worst_slot_ttft_p95_s", "worst_slot_sse_gap_max_s")
-CONTRASTS = (("vs_stock", "stock"), ("vs_peer", "peer"), ("diagnostic_vs_peer_matched", "peer_matched"))
+CONTRASTS = (("vs_stock", "stock"), ("vs_peer", "peer"), ("diagnostic_vs_peer_matched", "peer_matched"),
+             ("vs_splash", "splash"))
+# ADR-063 "Splash peer of record for the Qwen families": the families whose verdict of record needs the Splash arm,
+# and the stages it runs in (decision D7: n4 and n1, never the mixed controls).
+SPLASH_FAMILIES = ("qwen38", "qwen36")
+SPLASH_STAGES = ("n4", "n1")
 SETTLED = ("Pass", "Fail", "Unavailable", "Skipped")
 F2_STATUS = {"Win": "Descriptive", "Inconclusive": "Descriptive", "Unavailable": "Descriptive",
              "Loss": "NegativeResult", "Failed": "Failure"}
@@ -62,6 +67,11 @@ def effect(stage, subject, reference, key, higher_is_better=False):
     return q3_stats.paired_effect(pairs, higher_is_better)
 
 
+def stage_arms(plan, workload):
+    """The measured arms of one stage: the Splash arm only in SPLASH_STAGES (decision D7)."""
+    return [arm for arm in plan["measured_arms"] if arm != "splash" or workload in SPLASH_STAGES]
+
+
 def stage_effects(stage, arms):
     """Experiment-vs-arm effects on makespan (primary) and the secondary metrics."""
     present = [(name, arm) for name, arm in CONTRASTS if arm in arms]
@@ -72,11 +82,13 @@ def stage_effects(stage, arms):
 
 
 def required_effects(stage, manifest):
-    """Contrasts the stopping rule waits for: stock always, the peer while it is available and has not failed."""
-    effects = stage_effects(stage, manifest["plan"]["measured_arms"])["effects"]
+    """Contrasts the stopping rule waits for: stock always, the peer and Splash while each is available and has
+    not failed."""
+    effects = stage_effects(stage, stage_arms(manifest["plan"], stage["workload"]))["effects"]
     required = {"vs_stock": effects["vs_stock"]}
-    if "vs_peer" in effects and "peer" not in manifest["unavailable"] and not failures(manifest, "peer"):
-        required["vs_peer"] = effects["vs_peer"]
+    for name, arm in (("vs_peer", "peer"), ("vs_splash", "splash")):
+        if name in effects and arm not in manifest["unavailable"] and not failures(manifest, arm):
+            required[name] = effects[name]
     return required
 
 
@@ -202,8 +214,8 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
     stages = {stage["workload"]: stage for stage in manifest["stages"]}
     primary = None if record else stages[plan["primary"]]
     report = {name: {"phase_plan": stage["phase_plan"], "status": stage["status"], "stop": stage["stop"],
-                     "blocks": len(stage["blocks"]), **stage_effects(stage, plan["measured_arms"]),
-                     "arms": {arm: arm_summary(stage, arm) for arm in plan["measured_arms"]}}
+                     "blocks": len(stage["blocks"]), **stage_effects(stage, stage_arms(plan, name)),
+                     "arms": {arm: arm_summary(stage, arm) for arm in stage_arms(plan, name)}}
               for name, stage in stages.items()}
     quality = quality_state(manifest, quality_paths, review_path)
     measured = [e for e in entries(manifest, kind="measured") if e.get("metrics")]
@@ -214,6 +226,13 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
              "thermal_valid": False if False in thermal else (True if thermal and None not in thermal else None),
              "memory_valid": all(e["metrics"]["memory"]["q5_pass"] for e in measured
                                  if e["arm"] == "experiment" and e["outcome"] == "Pass")}
+    required = bool(plan.get("splash_required"))  # set at plan time (campaigns planned before Splash have none)
+    splash_measured = "splash" in plan["measured_arms"]
+    if required or splash_measured:
+        state.update(splash_required=required, splash_failures=failures(manifest, "splash"),
+                     splash_unavailable=manifest["unavailable"].get("splash") or (
+                         None if splash_measured else {"reason": "the campaign has no Splash arm (ADR-063 Splash peer "
+                                                                 "of record for the Qwen families)", "evidence": []}))
     native = native_peers.peer_kind(plan)
     comparison = plan.get("native_comparison")
     if record:
@@ -222,6 +241,7 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
         effects = report[plan["primary"]]["effects"]
         state.update(complete=primary["stop"] is not None, vs_stock=effects["vs_stock"],
                      vs_peer=effects.get("vs_peer", q3_stats.paired_effect([])),
+                     vs_splash=effects.get("vs_splash", q3_stats.paired_effect([])),
                      fairness={m: report[plan["primary"]]["secondary"][m]["vs_stock"] for m in FAIRNESS})
         if native:  # the native arm never yields the same-GGUF verdict; it is reported separately as native_peer
             state["peer_unavailable"] = {"reason": comparison or native_peers.adapter(native).SAME_GGUF_UNAVAILABLE,
@@ -239,6 +259,10 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
             **({"primary_of_record": primary_of_record(manifest, record)} if record else {}),
             "controls": {k: v for k, v in report.items() if k != plan["primary"]},
             "peer": {"unavailable": manifest["unavailable"], "failures": state["peer_failures"]},
+            **({"splash": {"required": state["splash_required"], "unavailable": state["splash_unavailable"],
+                           "failures": state["splash_failures"],
+                           "label": plan["arms"].get("splash", {}).get("label")}}
+               if "splash_required" in state else {}),
             "stock_failures": failures(manifest, "stock"), "experiment_failures": state["experiment_failures"],
             "quality": quality, "thermal_valid": state["thermal_valid"], "memory_valid": state["memory_valid"],
             "rejected_trials": [{"name": e["name"], "outcome": e["outcome"], "reason": e.get("reason")}
@@ -518,10 +542,14 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
     base = {"family": family, "group": group, "n_slots": 4, "context": "262144", "date": manifest["created_utc"][:10]}
     for prefix, control, stage, section_native in sections:
         of_record_row = of_record and control is None
-        peer_gone = verdict["verdict"] == "Unavailable" if control is None else bool(verdict["peer"]["unavailable"].get("peer"))
+        splash_gone = bool((verdict.get("splash") or {}).get("unavailable"))
+        peer_gone = ((verdict["verdict"] == "Unavailable" and not (splash_gone and not verdict["peer"]["unavailable"].get("peer")))
+                     if control is None else bool(verdict["peer"]["unavailable"].get("peer")))
         # A campaign whose peer arm is a native engine (ds4, TensorFold) is never the verdict of record: it emits
         # only its native row(s), never experiment-vs-stock (that effect belongs to the same-GGUF campaign of record).
-        contrasts = (() if native else (("vs_stock", "v0128_stock"),)) + (("vs_peer", native_baseline),)
+        # Splash (a same-artifact peer of record, Qwen families) adds its own task-makespan contrast.
+        contrasts = ((() if native else (("vs_stock", "v0128_stock"),)) + (("vs_peer", native_baseline),)
+                     + (() if native or "splash" not in plan["measured_arms"] else (("vs_splash", "splash"),)))
         tables = [("makespan_s", "effects", stage["effects"])]
         tables += [(m, f"secondary.{m}", stage["secondary"][m]) for m in f2_q3_tier.FAIRNESS] if of_record_row else []
         for metric, where, table in tables:
@@ -529,14 +557,14 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                 e = table.get(name)
                 withheld = native_label and (section_native or {}).get("statement_withheld")
                 if e is None or e["improvement_percent"] is None or (name == "vs_peer" and (
-                        withheld or (peer_gone and not native_label))):
+                        withheld or (peer_gone and not native_label))) or (name == "vs_splash" and splash_gone):
                     continue
                 path = f"{prefix}.{where}.{name}"
                 what = "makespan" if metric == "makespan_s" else metric.replace("_", "-")
                 extract = {"value": {"kind": "json", "file": ref, "path": f"{path}.improvement_percent", "reduce": "one"},
                            "ci95": {"kind": "json", "file": ref, "path": f"{path}.improvement_ci95.*", "reduce": "list"}}
                 blocks = (f"{e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
-                          f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else peer_note}).")
+                          f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else 'Splash best valid configuration (same GGUF)' if name == 'vs_splash' else peer_note}).")
                 if (control is not None or superseded_by is not None) and name == "vs_peer" and not native_label:
                     blocks += " " + peer_sentence(next(s for s in manifest["stages"] if s["workload"] == (control or plan["primary"])),
                                                   stage, root, experiment)
@@ -555,7 +583,7 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                     "artifact_sha256": arms["experiment"]["artifact"]["sha256"], "receipt": ref,
                     "status": status if control is None else "Descriptive",
                     "verification": {"state": "Verified", "key": f"verdict.json {path}.improvement_percent", "extract": extract},
-                    "note": (f"Q3 verdict of record ({'task makespan only' if name == 'vs_peer' else 'see the tier'}); {blocks}"
+                    "note": (f"Q3 verdict of record ({'task makespan only' if name in ('vs_peer', 'vs_splash') else 'see the tier'}); {blocks}"
                              if of_record_row else
                              f"Superseded Q3 record{'' if control is None else ', control ' + control}, replaced as the "
                              f"verdict of record by {superseded_ref}; never a win or loss; {blocks}"

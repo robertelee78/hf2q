@@ -32,6 +32,24 @@ The checked-in peer cases match hf2q's model-facing settings (template, thinking
 - `verdict.json` and F2 rows carry the not-of-record label. `native_peer` is withheld under the TensorFold rules, and also when any oMLX run logged tool-parser WARNING/INFO lines; tool-call repairs oMLX does not log are disclosed with every statement as `recovery_attribution: Unavailable:…`. F2 groups are `<family>-q3-omlx-<family>-native`, and the oMLX row renders only under "Native-engine comparisons".
 - Adapter and controls: `scripts/four_agent/README.md`, section "Native oMLX arm".
 
+**Splash arm (Qwen3.8 and Qwen3.6; ADR-063 "Splash peer of record for the Qwen families", operator decisions 2026-11-03/11-04).**
+Splash is a same-artifact peer of record. It is not a native comparison, so it gets its own measured arm, `splash`,
+beside `peer`.
+- **Default.** A default campaign for `qwen38` or `qwen36` runs `--splash-case`, which defaults to
+  `q5_cases/splash-<family>.json`.
+- **Unavailable up front.** `--splash-unavailable-evidence FILE…` declares Splash unavailable before the campaign
+  (hashed into the plan), and no Splash arm runs.
+- **Same artifact.** The Splash artifact must equal the experiment's GGUF sha256 (same-model rule plus the adapter's
+  launch check).
+- **Identity.** Its build identity covers the commit, `build_id`, the binary, metallib and host-step sha256s, the
+  toolchain and the venv freeze. The draft, configuration and argv template are frozen with the campaign identity.
+- **Stages (decision D7).** The arm runs in the `n4` and `n1` stages only. The mixed `K+M` controls leave it out of
+  their measured arms and Williams orders.
+- **Memory stop (decision D6).** A Splash Q5 memory stop halts the campaign. The fix is to record a `--max-memory`
+  cap in `SPLASH_CONFIG`, re-confirm that configuration and start a new campaign.
+- **Adapter and controls.** `scripts/four_agent/README.md`, section "Splash peer of record"; design
+  `docs/research/adr063-splash-peer-design.md`.
+
 `HF2Q_Q5_HF2Q_BIN` and `--stock-var/--experiment-var HF2Q_BIN=…` are refused. The hf2q binaries come only from `--stock-bin` and `--experiment-bin`, so a case default can never stand in for one of them.
 
 ## Frozen identities
@@ -101,18 +119,23 @@ Secondary block-paired effects use the same estimator on: successful-task goodpu
 Rules apply in this order:
 1. `Failed`: any experiment run failed its task (Q4: "a family whose hf2q arm fails its task is recorded as failed"), or task quality was lost.
 2. `Unavailable`: no runnable peer arm, with evidence. The experiment-vs-stock effect is still reported.
-3. `Failed`: the peer failed its task. A failed peer cannot yield a win.
-4. `Pending`: the primary stage has not reached its stopping rule.
-5. `Loss`: the experiment-vs-peer makespan ratio CI lies above 1, so the experiment is slower than the peer. This holds at any precision, because a longer makespan with an interval excluding a tie is a measured loss.
-6. `Win`: every one of the following holds.
-   - Both required contrasts reached the precision target.
+3. `Unavailable` (Qwen3.8 and Qwen3.6 only): no runnable Splash arm. This covers declared evidence, a load or memory
+   failure, or a campaign without a Splash arm. A Win is never measured against the peer alone.
+4. `Failed`: the peer failed its task. A failed peer cannot yield a win.
+5. `Failed` (Qwen families): the Splash arm failed its task. A failed Splash arm cannot yield a win.
+6. `Pending`: the primary stage has not reached its stopping rule.
+7. `Loss`: the experiment-vs-peer makespan ratio CI lies above 1, so the experiment is slower than the peer. This holds at any precision, because a longer makespan with an interval excluding a tie is a measured loss.
+8. `Loss` (Qwen families): the experiment-vs-Splash makespan ratio CI lies above 1.
+9. `Win`: every one of the following holds.
+   - Every required contrast (stock, peer, and Splash for Qwen families) reached the precision target. The stopping
+     rule waits for vs-Splash while Splash is available and has not failed.
    - Against stock, the CI upper bound is below 1.
-   - Against the peer, the CI upper bound is ≤ 0.95. This is Q4's "at least 5% lower makespan … with paired uncertainty excluding a tie": the whole interval must clear the margin.
+   - Against the peer, the CI upper bound is ≤ 0.95. This is Q4's "at least 5% lower makespan … with paired uncertainty excluding a tie": the whole interval must clear the margin. For Qwen3.8 and Qwen3.6, the vs-Splash CI upper bound must also be ≤ 0.95.
    - Neither fairness effect against stock (worst-slot p95 TTFT, worst-slot max SSE gap) has a CI lower bound above the 2.5-point neutral band (ratio 1.025).
    - Quality is not unresolved.
    - No run observed a serious or critical thermal state.
    - Every passing experiment run has a passing Q5 memory verdict.
-7. `Inconclusive`: everything else, with every unmet condition listed as a reason. An unresolved interval is inconclusive, not faster.
+10. `Inconclusive`: everything else, with every unmet condition listed as a reason. An unresolved interval is inconclusive, not faster.
 
 **Quality.** `--quality-verdict MANIFEST` takes a `quality_campaign.py` manifest that carries a Q1 paired verdict. It counts only if its subject runs' receipts show the experiment binary sha256. `Loss` or `BelowFloor` → `Failed`. `Inconclusive`, `Insufficient` or an unbound binary → unresolved, so no win. Without a Q1 verdict, quality is task-completion parity: no experiment run failed.
 

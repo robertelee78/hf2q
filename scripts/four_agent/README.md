@@ -426,6 +426,64 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/native-omlx-qwen36-client-approval.json \
 # Qwen3.8 and Gemma 4: the same with native-omlx-qwen38.json / native-omlx-gemma4.json and their snapshot.
 ```
 
+### Splash peer of record (Qwen3.8, Qwen3.6; operator decisions 2026-11-03/11-04)
+
+Splash (`incoai/splash`, source build `031a25a6`, engine kind `splash`) is a second **same-artifact** peer of record
+for the Qwen families. It serves the hf2q GGUF itself: the same path and sha256 as the family's hf2q case. It
+decodes with its family's pinned DFlash2 draft. Q3 runs it as its own measured arm `splash` beside `peer`, and for
+`qwen38`/`qwen36` a Win needs ≥5% sooner than both. Design: [docs/research/adr063-splash-peer-design.md](../../docs/research/adr063-splash-peer-design.md).
+
+| File | Role |
+| --- | --- |
+| `native_peer_splash.py` | Adapter: pinned build, families and drafts, configuration knobs and sweep presets, `family_controls`, closed request/response/usage envelopes |
+| `native_peer_splash_ready.py` | Launch inputs, build/venv/toolchain/draft identity, per-run model assembly (`model.json` digests), argv template, readiness, closing render proof (`/apply-template` + `/tokenize`), campaign identity |
+| `native_peer_splash_launch.py` | q5 serve entry: verifies, prepares `{OUT}/splash/models`, writes `launch.json`, execs the Splash server in the same process |
+| `native_peer_splash_audit.py` | Post-run audit (Done/Started lines bound to client turns, render archive, no cancel/error/restart) and `run_record` |
+| `splash_sweep.py` | `identity` (the build variables), `derive-case` (one sweep point, optional D6 `--max-memory` cap), `select` (validity from Splash's own runs and the best configuration), `parity-config` (the input of hf2q's `splash_prompt_parity_post_oracle`) |
+| `q5_cases/splash-qwen38.json`, `splash-qwen36.json` | Q5 cases; `SPLASH_CONFIG` is the configuration (default: sweep point `s0`) |
+
+- **Build.** Build a clean detached clone of `031a25a6` with `make -j4 && make install-environment`, only while
+  `HOST-LOCK` is absent, and record the toolchain the build used (`xcodebuild -version`, `xcrun metal --version`,
+  `clang --version`, `xcrun --show-sdk-version`, `sw_vers`) in `toolchain.txt`. Then
+  `python3 scripts/four_agent/splash_sweep.py identity --splash-dir DIR --build-toolchain toolchain.txt` prints
+  `SPLASH_BIN_SHA256`, `SPLASH_METALLIB_SHA256`, `SPLASH_HOST_STEP_SHA256`, `SPLASH_TOOLCHAIN_SHA256` and
+  `SPLASH_VENV_FREEZE_SHA256`, refusing a host toolchain the build did not record. The case requires all five; it
+  also requires `MODEL_SHA256`, the hf2q GGUF's.
+- **Drafts.** Qwen3.8 uses `z-lab/Qwen3.8-27B-DFlash2@50307d4c`, which is byte-identical to
+  `incoai/Qwen3.8-27B-DFlash2@015e7956`. Qwen3.6 uses `incoai/Qwen3.6-35B-A3B-DFlash2@51ef7b69`. Each is an HF
+  cache snapshot on the internal disk.
+- **Approval template.** `CLIENT_APPROVAL_TEMPLATE` must carry:
+  - `engine_kind: "splash"`, family `qwen`;
+  - `family_controls` equal to `native_peer_splash.controls("<q3 family>", SPLASH_CONFIG)`;
+  - the preflight keys from `native_peer_splash.preflight`.
+
+  The supervisor adds `native_splash` (the launch inputs) and the per-run `native_splash_launch_sha256`.
+- **Per run.** Every start digests the GGUF again into a fresh `{OUT}/splash/models`, outside the makespan. The
+  campaign identity freezes the build, toolchain, venv, draft, configuration and argv template, never the assembly
+  path.
+  - Splash's `model.json` must record the hf2q GGUF with `MODEL_SHA256`, the pinned draft weights, and the reviewed
+    template as `tokenizer/chat_template.jinja`.
+  - `{OUT}` must be on APFS (the internal disk). On the exFAT external drive, Splash's model-directory cleanup stops
+    on the `._*` files macOS writes there.
+  - The run must add no draft pin to the shared HF cache (`refs/splash`); local sources carry none.
+  - `/status` must report the configured KV format and cache dtype and no engine restart, at readiness and closing.
+- **Sweep.** After each settled sweep run, write `parity-config RUN --template FILE` (default output
+  `RUN/splash-prompt-parity`) and run hf2q's `splash_prompt_parity_post_oracle` on it. `select` counts a
+  configuration valid only when every run has a `PassedByteIdentical` result there. A run that stopped before the
+  client is an invalid row of its own.
+- **Q3.** `--splash-case` defaults to `q5_cases/splash-<family>.json` for qwen38/qwen36. The arm runs only in the
+  `n4` and `n1` stages (D7). `--splash-unavailable-evidence` declares Splash unavailable; the family verdict is
+  then `Unavailable`, never a Win against the peer alone. A peer-unavailable campaign requires no Splash arm (its
+  verdict is Unavailable already).
+  - Launch refuses a campaign whose Splash build, toolchain or venv differs from the case's declared hashes, or
+    whose output is not on APFS, before any run.
+  - A Splash Q5 memory stop halts the campaign, also before the client starts (load and readiness window): record
+    a `--max-memory` cap (D6), re-confirm the configuration and start a new campaign.
+- **Quality gate.** Run `quality_campaign.py --reference-kind splash` with a Splash reference case. The F2 tier
+  requires a `splash` gate for records that require Splash.
+- **Qwen3.6 workload.** The arm runs the declared Qwen3.6 workload. The repair-turn workload applies once it is
+  recorded on main: add `--repair-turns 1` to the hf2q, peer and Splash Qwen3.6 cases together.
+
 ### Root commands
 
 Run the commands from the repository root, one family at a time, with no other runtime loaded. `Q5_ROOT` is a campaign evidence directory outside Git. The supervisor refuses an output directory inside a Git tree or one that already exists.
@@ -616,7 +674,7 @@ A floor-only family (for example DeepSeek-V4) omits the three `--reference-*` op
 
 ## Three-arm speed campaign (ADR-063 Q3)
 
-`q3_campaign.py` runs the per-family Q3 comparison: stock hf2q (`--stock-bin`, the released binary), experiment hf2q (`--experiment-bin`) and the peer's best valid configuration (`q5_cases/peer-<family>.json`). A labeled matched-settings peer diagnostic (`--peer-matched-case`) is optional. Every run is one `q5_calibration.py` runtime, run one at a time. The design, estimator, verdict rules and root commands are in [docs/research/adr063-q3-campaign.md](../../docs/research/adr063-q3-campaign.md).
+`q3_campaign.py` runs the per-family Q3 comparison: stock hf2q (`--stock-bin`, the released binary), experiment hf2q (`--experiment-bin`) and the peer's best valid configuration (`q5_cases/peer-<family>.json`); for Qwen3.8 and Qwen3.6 also Splash's best valid configuration (`--splash-case`, default `q5_cases/splash-<family>.json`; see "Splash peer of record"). A labeled matched-settings peer diagnostic (`--peer-matched-case`) is optional. Every run is one `q5_calibration.py` runtime, run one at a time. The design, estimator, verdict rules and root commands are in [docs/research/adr063-q3-campaign.md](../../docs/research/adr063-q3-campaign.md).
 
 - **Identities.** Binaries (with the peer's sibling dylibs), model, peer `build_info`, argv input files, harness sources and commit, Python and host are frozen at start and re-checked before every run and against every receipt. Any change is a terminal `IdentityDrift`.
 - **Stages.** `n4` (primary, all four agents together), then the controls `n1`, `3+1`, `2+2` and `1+3`. Each stage runs one discarded warmup per arm per driver session, then Williams-ordered blocks: 5 to 20 blocks, stopping when every required makespan contrast has a 95% half-width ≤ 2.5 points.

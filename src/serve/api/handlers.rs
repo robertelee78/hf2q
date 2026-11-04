@@ -13410,3 +13410,7 @@ mod tool_result_capacity_tokens_tests;
 #[cfg(test)]
 #[path="handlers_q1_deepseek_prepare.rs"]
 pub(crate) mod q1_deepseek_prepare;
+
+#[cfg(test)]
+#[path = "handlers_splash_prompt_parity_post_oracle_tests.rs"]
+mod splash_prompt_parity_post_oracle_tests;

@@ -1,19 +1,25 @@
-"""Native-engine peer arms (ADR-063 "Native-engine peer arms"): the one registry of engine kinds that
-serve their own native artifact, beside 'hf2q' and the same-GGUF 'peer'.
+"""Adapter-protocol engine arms: the one registry of engine kinds whose client protocol is an adapter module,
+beside 'hf2q' and the same-GGUF 'peer'.
+
+Two roles share the interface. Native-engine peer arms (ADR-063 "Native-engine peer arms";
+coding_family.NATIVE_KINDS: ds4, tensorfold, omlx) serve their own native artifact and never produce the
+same-GGUF verdict. Same-artifact peers of record (ADR-063 "Splash peer of record for the Qwen families";
+coding_family.SAME_ARTIFACT_KINDS: splash) serve the hf2q GGUF itself and run as their own measured Q3 arm.
 
 Every consumer (the four-agent client, Q2 certify/run audit, Q3 campaign/identity/report, F2 render,
-quality campaign and the process inventories) resolves a native kind here instead of branching on
-its name. Kinds are declared in coding_family.NATIVE_KINDS, which every client already freezes; the
-arm for kind K is the module native_peer_K.py. The client imports this registry and its own arm only,
-so an arm's CLIENT_MODULES (this file, the arm's client modules and the arm's test) are exactly the
-extra source-freeze entries of that kind's client runs.
+quality campaign and the process inventories) resolves a kind here instead of branching on its name.
+Kinds are declared in coding_family, which every client already freezes; the arm for kind K is the module
+native_peer_K.py. The client imports this registry and its own arm only, so an arm's CLIENT_MODULES (this
+file, the arm's client modules and the arm's test) are exactly the extra source-freeze entries of that kind's
+client runs.
 """
 import importlib
 
-from coding_family import NATIVE_KINDS
+from coding_family import ADAPTER_KINDS, NATIVE_KINDS, SAME_ARTIFACT_KINDS
 from qwen38_n1_verdict import require
 
 KINDS = NATIVE_KINDS
+SAME_ARTIFACT = SAME_ARTIFACT_KINDS
 # The declared interface of an arm module. Hooks marked "or None" may be None.
 INTERFACE = {
     'ENGINE': 'the engine kind (equals the registry key)',
@@ -23,6 +29,7 @@ INTERFACE = {
     'SLOTS': 'four-slot coding workload only',
     'CLIENT_MODULES': 'client source-freeze additions (registry, arm client modules, arm test)',
     'PROCESSES': 'executable names for the competing-runtime inventories',
+    'PYTHON_MODULES': 'full `python -m` module names of the arm\'s server for the competing-runtime inventories',
     'BASELINES': 'F2 effect baseline id -> label; never a measured column, never a win',
     'AUDIT': 'post-run audit module: audit_run, q3_section, note',
     'SAME_GGUF_UNAVAILABLE': 'verdict reason when the campaign carries --peer-unavailable-evidence',
@@ -38,19 +45,30 @@ INTERFACE = {
     'closing': '(base, coordinator output) -> record once every agent finished (outside the makespan), or None',
     'PEER_CASE_REFUSAL': 'Q3 refusal text when the arm\'s --peer-case lacks its required campaign flag',
     'campaign_identity': '(q5 plan) -> frozen identity additions (peer_build_info, native_runtime)',
-    'launch_problems': '(arm name, artifact identity, hf2q artifact sha256) -> refusal strings',
+    'launch_problems': '(arm name, artifact identity, hf2q artifact sha256) -> refusal strings; same-artifact arms '
+                       'also take (arm identity, campaign output directory)',
     'label': '(q5 case) -> arm label',
     'q3_role': '(q5 case) -> Q3 plan role',
 }
 
 
 def is_native(kind):
+    """A different-artifact native arm: never the same-GGUF verdict."""
     return kind in KINDS
 
 
+def is_same_artifact(kind):
+    """A same-artifact peer of record served by another engine (its own measured Q3 arm)."""
+    return kind in SAME_ARTIFACT
+
+
+def has_adapter(kind):
+    return kind in ADAPTER_KINDS
+
+
 def adapter(kind):
-    """The arm module for a native kind; refuses an unknown kind or an incomplete arm."""
-    require(kind in KINDS, f'unknown native engine kind {kind!r}')
+    """The arm module for an adapter kind; refuses an unknown kind or an incomplete arm."""
+    require(kind in ADAPTER_KINDS, f'unknown native engine kind {kind!r}')
     module = importlib.import_module(f'native_peer_{kind}')
     missing = sorted(name for name in INTERFACE if not hasattr(module, name))
     require(not missing and module.ENGINE == kind, f'native arm {kind} lacks ' + ','.join(missing))
@@ -83,4 +101,8 @@ def baseline_of(kind, label):
 
 
 def process_names():
-    return frozenset(name for kind in KINDS for name in adapter(kind).PROCESSES)
+    return frozenset(name for kind in ADAPTER_KINDS for name in adapter(kind).PROCESSES)
+
+
+def python_modules():
+    return frozenset(name for kind in ADAPTER_KINDS for name in adapter(kind).PYTHON_MODULES)

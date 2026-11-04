@@ -121,6 +121,7 @@ TITLE = 'DeepSeek-V4'
 FAMILIES = Q3_FAMILIES = (FAMILY,)
 CLIENT_MODULES = ('native_peers.py', 'native_peer_ds4.py', 'test_native_peer_ds4.py')
 PROCESSES = ('ds4', 'ds4-server', 'ds4-agent', 'ds4-bench', 'ds4-eval')  # native ds4 binaries (/opt/ds4 Makefile:78)
+PYTHON_MODULES = ()
 BASELINES = {'ds4_native': LABEL}
 AUDIT = 'native_peer_ds4_audit'
 closing = None

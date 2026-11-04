@@ -168,11 +168,12 @@ never made for Splash.
 
 | Path | When | Harness handling |
 |---|---|---|
-| `<models_dir>/.resolved/<sha>/` (symlinks to the GGUF and the draft, plus `model.json` and derived tokenizer/config) | every start | per-run `models_dir` `{OUT}/splash/models`, never the checkout's `install/models` |
-| `<models_dir>/.metadata` | first start of a GGUF | same dir; keyed by GGUF size and digest |
+| `<models_dir>/.resolved/<sha>/` (symlinks to the GGUF and the draft, plus `model.json` and derived tokenizer/config) | every start | per-run `models_dir` `{OUT}/splash/models`, never the checkout's `install/models`. `{OUT}` must be on APFS: on exFAT, Splash's `collect_garbage` stops on the `._*` files macOS writes (observed in the dry run); `prepare_run` and Q3 `launch_problems` refuse it |
+| `<HF cache>/models--<draft>/refs/splash/<installation>/<commit>` | only for sources with a revision (`install/assembly.py` `pins`, `install/hub.py` `pin`) | the local paths the harness passes record revision `null` (dry run), so no pin is written; `prepare_run` refuses a run that adds one, and `cross_run_state` records the folder before and after each run |
+| `<models_dir>/.metadata` | every start (per-run dir) | same per-run dir; keyed by GGUF size and digest |
 | `$TMPDIR/splash-cache-*` | SSD cache on | unlinked at creation; space returns at exit. Record `df` before and after |
 | `~/Library/Caches/Splash/prefix-cache/` | every start prunes namespaces unused 14 days (persistent cache off: nothing written) | record listing before and after |
-| `$DARWIN_USER_CACHE_DIR/splash-ane/remembered-*` | ANE calibration | record, keep (cross-run state, bound in identity) |
+| `$DARWIN_USER_CACHE_DIR/splash-ane/remembered-*` | ANE calibration | keep; recorded before and after each run (per-run record, not frozen in the campaign identity) |
 | `~/Library/Application Support/Splash/thinking.key` | server start | record; harmless (Messages API only) |
 | `<checkout>/build/runtime` | server lock | ignored files in the pinned checkout |
 
@@ -357,10 +358,12 @@ Closing (outside the makespan):
   run's parity is `PendingPostOracle`. A mismatch makes the run Invalid;
 - each reply is bound to its `Done` console line (input, cached and output token counts).
 
-**Offline hf2q renderer.** This is the hf2q exact-prefix post-oracle
-(`src/serve/api/handlers_prefix_post_oracle_tests.rs`, `qwen38_n1_exact_prefix_post_oracle`;
-`docs/research/adr063-qwen38-prefix-post-oracle.md`), extended with a Splash mode for both Qwen families. It is
-model-free and starts no server. For each archived Splash request it:
+**Offline hf2q renderer.** This is a Splash mode of the hf2q exact-prefix post-oracle. It is a new ignored test,
+`splash_prompt_parity_post_oracle` (`src/serve/api/handlers_splash_prompt_parity_post_oracle_tests.rs`), which
+shares the evidence binding of `qwen38_n1_exact_prefix_post_oracle`
+(`docs/research/adr063-qwen38-prefix-post-oracle.md`). `splash_sweep.py parity-config RUN --template FILE
+--output-dir DIR` writes its frozen config. The oracle is model-free and starts no server. For each archived Splash
+request it:
 1. takes the canonical hf2q form of the request (`native_peer_splash.canonical`: the same messages and tools,
    `enable_thinking` and `preserve_thinking` true, no effort);
 2. renders it with hf2q's production request schema, Qwen template kwargs and renderer, using the frozen
@@ -395,8 +398,19 @@ because only hf2q has a server phase trace. Code changes:
   is no `splash_matched` arm: the matched-settings diagnostic is sweep-only (§7.2, M × 2).
 - **Stages (D7).** The `splash` arm runs only in the n4 and n1 stages. The 3+1/2+2/1+3 control stages leave it out
   of their measured arms and Williams orders.
-- **Splash is required.** For `qwen38` and `qwen36`, a campaign of record without a `splash` arm is refused at plan
-  time. In `family_verdict` a missing Splash arm is `Unavailable`, never a Win against the peer alone.
+- **Splash is required.**
+  - For `qwen38` and `qwen36`, the default campaign always runs the `splash` arm. `--splash-case` defaults to
+    `q5_cases/splash-<family>.json`. The arm is left out only with `--splash-unavailable-evidence`; a
+    peer-unavailable campaign (already `Unavailable`) runs no Splash arm, and a controls-only campaign follows its
+    primary of record.
+  - `plan.splash_required` is set when the arm is planned or declared unavailable. Such a campaign without a
+    runnable Splash arm (declared unavailable, or a load failure) gets `Unavailable` from `family_verdict`, never a
+    Win against the peer alone. Campaigns planned before Splash carry no requirement and keep their verdicts of
+    record.
+  - Q3 `launch_problems` refuses, before any run, a Splash build, toolchain or venv that differs from the case's
+    declared hashes and a campaign output that is not on APFS; each would otherwise make every launch refuse.
+  - A Splash Q5 memory stop halts the campaign (D6), including one in the load and readiness window before the
+    client (the receipt's `stop.reason` is a memory stop, or the server died of Metal out-of-memory).
 - **Verdict state.** `state` gains `splash_required`, `splash_unavailable` (dict or None), `splash_failures` and
   `vs_splash`.
 - **Check order** in `family_verdict`:

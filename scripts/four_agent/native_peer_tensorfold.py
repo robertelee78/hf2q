@@ -112,6 +112,7 @@ NATIVE_COMPARISON = ('native-comparison campaign; not the verdict of record: the
 CLIENT_MODULES = ('native_peers.py', 'native_peer_tensorfold.py', 'native_peer_tensorfold_ready.py',
                   'test_native_peer_tensorfold.py')
 PROCESSES = ('tensorfold', 'tensorfold-native')  # packaging/homebrew/tensorfold.rb.in:18-23, README.md:375
+PYTHON_MODULES = ()
 BASELINES = {'tensorfold_native': LABELS['none'], 'tensorfold_dflash2_native': LABELS['dflash2']}
 AUDIT = 'native_peer_tensorfold_audit'
 PEER_CASE_REFUSAL = ('a native TensorFold --peer-case needs --native-comparison (Qwen3.8 has a runnable same-GGUF '

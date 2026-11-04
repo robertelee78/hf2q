@@ -23,9 +23,11 @@ ROWS_SCHEMA = "hf2q.f2.scoreboard-rows.v1"
 # v0128_stock: the released v0.1.28 standalone binary (source 9a0b79c7), the Q3 stock arm.
 ARMS = {"hf2q_current": "hf2q current", "candidate": "candidate",
         "v0128_stock": "v0.1.28 stock", "peer": "peer"}
-# Effect baselines: every arm, plus each separately labeled native-engine arm (never a measured column).
+PEER_BASELINES = ("peer", "splash")  # same-artifact peers: task makespan comparisons, never a win
+# Effect baselines: every arm, Splash (same-artifact peer of record for the Qwen families; an effect baseline, not a
+# measured column), plus each separately labeled native-engine arm (never a measured column).
 NATIVE_BASELINES = native_peers.baselines()
-BASELINE_ARMS = {**ARMS, **NATIVE_BASELINES}
+BASELINE_ARMS = {**ARMS, "splash": "Splash", **NATIVE_BASELINES}
 STATUSES = {"Qualified": "Q", "Descriptive": "D", "NegativeResult": "NEG", "Failure": "FAIL"}
 # key: (title, unit, direction, gap key); direction None = not a ratio metric.
 METRICS = {
@@ -226,7 +228,7 @@ def comparisons(manifest):
                 verdict = "Neutral"
             elif not (repeated and (min(num_s) > max(den_s) if ratio > 1 else max(num_s) < min(den_s))):
                 verdict = "Unseparated"
-            elif den_key[0] == "peer":  # Win is only against v0.1.28 stock; against the peer it stays descriptive
+            elif den_key[0] in PEER_BASELINES:  # Win is only against v0.1.28 stock; against a peer it stays descriptive
                 verdict = "Faster" if ratio > 1 else "Slower"
             else:
                 verdict = "Win" if ratio > 1 else "Regression"
@@ -240,7 +242,7 @@ def comparisons(manifest):
 
 def effect_is_win(row):  # a native-engine (different artifact) or peer comparison is never a win
     return (row["kind"] == "effect" and row["verification"]["state"] == "Verified"
-            and row.get("baseline_arm") not in (*NATIVE_BASELINES, "peer")
+            and row.get("baseline_arm") not in (*NATIVE_BASELINES, *PEER_BASELINES)
             and row["status"] in ("Qualified", "Descriptive") and row.get("ci95") is not None and row["ci95"][0] > 0)
 
 
@@ -249,7 +251,7 @@ def fmt(value, decimals):
 
 
 def arm_label(key):
-    return ARMS[key[0]] + (f" ({key[1]})" if key[1] else "")
+    return BASELINE_ARMS[key[0]] + (f" ({key[1]})" if key[1] else "")
 
 
 def row_value(row):
