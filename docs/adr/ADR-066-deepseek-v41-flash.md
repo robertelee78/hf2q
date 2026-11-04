@@ -4,6 +4,7 @@
 - **Date:** 2026-11-02
 - **Updated:** 2026-11-02 — amended by the owner after a field report: UD-IQ1_S runs on a 128 GiB M5 Max (the peer, about 360 tok/s prefill and 35 tok/s decode). hf2q supports UD-IQ1_S on the M5 Max as its first V4.1 target, starting now; the M5 Ultra remains the target for the higher-quality versions.
 - **Updated:** 2026-11-03 — operator decision (ADR-063 v0.1.30 speed program): the IQ2_XXS subset of N1, N3 and N4 is pulled ahead of B2 as its own story, N-IQ2XXS, for ADR-063 Q4-DS4-RACE (#667), which serves ds4's DeepSeek-V4-Flash-0731 IQ2_XXS file. N1, N3 and N4 are narrowed to build on it, with no duplicate kernels. Design: `docs/research/adr066-iq2xxs-subset-design.md`.
+- **Updated:** 2026-11-03 (later) — operator approval of the N-IQ2XXS design (`docs/research/adr066-iq2xxs-subset-design.md` §3), jointly with ADR-063 Q4-DS4-RACE (#667); see N-IQ2XXS.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** deepseek, deepseek41, gguf, split-gguf, mxfp4, iq-quants, engram, dspark, vision, m5-max, m5-ultra, agentic-serving
 - **Depends on:** ADR-042, ADR-063, ADR-065
@@ -288,6 +289,7 @@ Requirement: mlx-native MUST parse GGML type 16 with ggml's block geometry and a
 
 Acceptance:
 
+- Design approved by the operator, 2026-11-03: `docs/research/adr066-iq2xxs-subset-design.md` §3 (one type registration, one checked table source, IQ2_XXS `mv_id`/`mm_id`/tensor `mm_id` kernels; Q2_K, Q8_0 and F16 reuse existing kernels with new parity tests; release and pin per §3.8).
 - `GgmlType` gains IQ2_XXS (256 values, 66 bytes per block) with the frozen serde name `iq2_xxs`. Dense IQ2_XXS mv/mm report "no kernel" and return a typed error, never a panic.
 - CPU dequantization matches ggml's `dequantize_row_iq2_xxs` bit for bit on seeded random blocks and on edge blocks (every scale nibble, grid index and sign index; ±0, subnormal, largest finite and ±inf scales), through a checked-in fixture whose generator records the ggml source revision and hashes. NaN scales are compared by class (NaN where ggml gives NaN), not by bit pattern.
 - The `iq2xxs_grid`, `ksigns_iq2xs` and `kmask_iq2xs` tables live in one Rust module that later IQ grids join (N3). Every shader copy is generated from it and checked byte for byte, and the bytes of all three tables match pinned sha256 values of ggml's tables.
