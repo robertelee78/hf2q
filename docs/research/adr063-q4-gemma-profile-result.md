@@ -180,6 +180,47 @@ prefill-window GPU excess (about 1.4–1.5 s per run), not on a makespan counter
    queue/delivery residual after turn 0. SSE cadence affects semantic TTFT and the fairness metric, not
    makespan.
 
+## 7. What closes the Gemma gap (plan; estimates, not measurements)
+
+**Target.** A Q4 Win needs hf2q at or below 0.95 × the peer's MT makespan: 0.95 × 12.48 = 11.85 s, about
+3.0 s below today's 14.87 s. That is more than the whole measured gap of 2.73 s, because Win requires a 5%
+margin. The table works from per-agent stage deltas (§2 per-turn medians) and the GPU classes (§3, §4).
+Estimates are in makespan seconds per run.
+
+| Stage (measured gap) | Candidate lever | Recoverable (estimate) | Basis | Story |
+|---|---|---:|---|---|
+| Warm-prefill attention, part of the +1.40 s per agent on warm turns 1–6 | Precise tiled warm attention (F32 accumulation) instead of vec-hybrid | 1.2–1.4 s | The tiled-off cost measured in the v9 review, 7.8–9.2% of makespan (ADR-063, Q4-GEMMA-ATTN acceptance), × 14.87 s. Consistent with attention being 48% of warm-prefill GPU time (§4), about 1.5 s per run serialized. Assumes the precise kernel matches TiledF16's speed and does not flip decisions | **#659 Q4-GEMMA-KERNEL → #668 Q4-GEMMA-ATTN** |
+| Warm-prefill per-row cost (MoE 34%, dense 11%, pre-attention 7.5% of warm-prefill GPU) | Faster prefill MoE (`mul_mm_id`) and dense kernels; larger joint warm cohorts | ≤ 0.3 s | The warm-prefill gap is +1.40 s per agent; once the attention lever's 1.2–1.4 s is removed, ≤ 0.2–0.3 s remains. The fit's per-row term (2.13 vs 1.18 s per 1k new rows) also contains vec-hybrid's per-row attention, so it overstates this lever | **none** |
+| Cold-turn admission (turn 0: +0.50 s span; 422 ms hf2q queue, +459 ms decode, −299 ms prefill) | Batch the four simultaneous cold prompts into one joint cold prefill before any decode, as the peer does (its turn-0 prefill of 574 ms covers all four at once) | 0.4–0.5 s | The turn-0 span delta is +0.496 s. The upper bound assumes hf2q's faster per-slot cold prefill (275 ms) carries into a joint 4×465-row forward [INFERENCE] | **none**. ADR-065 E4 measures makespan composition but changes nothing |
+| Decode, speculation (part of +1.17 s decode; the peer's MT accepts 0.79 per drafted, 2.34 per verify step) | Gemma 4 assistant-drafter MTP or another drafter in hf2q **serving** at 4 slots | 0.4–0.5 s | MT vs P0 on the peer: −0.48 s decode and −0.35 s makespan (§1; CI includes 0). An hf2q equivalent could recover a similar amount on the long decode turns 2 and 6 | **none** (see the support check below) |
+| Decode, per-step kernels (decode-only GPU +2.0–2.5 s per run; MoE 40%, dense 38%, attention 18% of the decode split) | Faster `mul_mv_id` MoE and dense decode kernels at width 4 | 0.3–0.7 s | Decode delta per turn: +20/+337/+60/+89/+26/+39 ms on turns 1–6 (0.57 s), of which speculation explains part. P0-vs-hf2q decode gaps were +1.12 s in v9 and +0.25 s across sessions here (unpaired), so this term is the least certain | **none** for Gemma. #658 Q4-QWEN38 covers Qwen only |
+| Client/tools (+0.10 s) and tail (+0.26 s, CI includes 0) | None; client work and agent-finish imbalance | ~0 | Not engine work | — |
+| SSE cadence (worst gap 62–66 ms; 3 events per tool call; semantic TTFT +230–320 ms) | Stream tool-call argument deltas as tokens decode | 0 s makespan | Fairness metric and TTFT only. #668 must keep the stock SSE-gap ratio ≤ 1.025 | inside #668's acceptance |
+| Host dispatch/encode, queue/delivery after turn 0 | None needed | 0 | hf2q's in-flight GPU idle is 0.5 s *below* the peer's (§3); residual Δ −0.03 s | — |
+
+**Sum and verdict.** #668 alone gives about 1.2–1.4 s, which would put hf2q near 13.5–13.7 s, still a Loss
+(about 1.09–1.10 × the peer). Every lever together gives an estimated 2.3–3.4 s, around the 3.0 s that Win
+needs. **Gemma cannot reach Win through #668 alone.** It also needs cold-turn admission, a serving drafter,
+and/or decode kernels, and **no v0.1.30 story covers those**. Per ADR-063 Q4, the family either gets new
+stories or the operator records a re-scope.
+
+**hf2q Gemma 4 assistant-drafter support.** Checked in source at `7f295b38`; hf2q does not support it.
+- `src/inference/gguf_contract.rs:83` asserts that `gemma4-assistant` has no runtime contract. Loading the
+  assistant GGUF would refuse, as model-family rules require.
+- hf2q's Gemma speculation exists only in the offline `generate` spec-decode path
+  (`src/serve/spec_decode_cli.rs`): EAGLE-3 for the 31B, DFlash for the 26B-A4B (ignored hardware tests),
+  and n-gram. No Gemma speculation is wired into the serving engine. The four-agent workload never
+  speculates on hf2q.
+- #665 Q1-GEMMA-SPEC is a Q1 numeric comparison of n-gram rows, not a serving speed story.
+- Adding the assistant drafter means:
+  - a new architecture: registry, a 4-layer KV-sharing assistant graph reading the target's last hidden
+    state and KV, and the centroid-masked LM head;
+  - a joint 4-slot draft/verify path in the Gemma worker;
+  - Q1 exactness classes for verified rows.
+
+  That is larger than one story and needs an approved design first. Q4-QWEN38's MTP work is
+  Qwen-specific and does not transfer.
+
 ## Evidence
 
 - `$G/search/qualify/`, `$G/search/primary/`, including `extract.{json,md}` and `final-{MT,DS2}-vs-P0.json`.
