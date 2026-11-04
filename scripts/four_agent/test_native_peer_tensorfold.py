@@ -314,7 +314,7 @@ class Binding(unittest.TestCase):
 class Registry(unittest.TestCase):
     def test_every_native_arm_declares_the_interface(self):
         self.assertEqual(native_peers.KINDS, NATIVE_KINDS)
-        self.assertEqual(ENGINE_KINDS, ('hf2q', 'peer', 'ds4', 'tensorfold', 'omlx'))
+        self.assertEqual(ENGINE_KINDS, ('hf2q', 'peer', 'ds4', 'tensorfold', 'omlx', 'splash'))
         for kind in NATIVE_KINDS:
             arm = native_peers.adapter(kind)
             self.assertEqual(arm.ENGINE, kind)

@@ -6,7 +6,9 @@ peer in its best valid configuration (q5_cases/peer-<family>.json), plus an opti
 labeled matched-settings peer diagnostic. A native-engine --peer-case (native_peers.py: its own
 artifact) runs in the peer slot either with --peer-unavailable-evidence for the same-GGUF peer
 (ds4) or as a separately labeled --native-comparison campaign beside the verdict of record
-(TensorFold); verdict.json native_peer reports it, task makespan only. Every run is one q5_calibration.py supervised
+(TensorFold); verdict.json native_peer reports it, task makespan only. For Qwen3.8 and Qwen3.6 the default campaign
+also runs the Splash arm (--splash-case, a same-artifact peer of record on the hf2q GGUF; n4 and n1 stages only), and
+the family verdict needs a Win against both the peer and Splash. Every run is one q5_calibration.py supervised
 runtime, started only after the previous one exited. Identities (binaries, model, peer
 build, harness sources and commit, Python, host) are frozen at campaign start and
 re-checked before every run; any change halts the campaign for good.
@@ -45,13 +47,16 @@ WORKLOADS = {"n4": None, "n1": "1", "3+1": "3+1", "2+2": "2+2", "1+3": "1+3"}
 SLUGS = {"n4": "n4", "n1": "n1", "3+1": "p3p1", "2+2": "p2p2", "1+3": "p1p3"}
 PRIMARY = "n4"
 CONTROLS = tuple(key for key in WORKLOADS if key != PRIMARY)
-ARMS = ("stock", "experiment", "peer", "peer_matched")
+ARMS = ("stock", "experiment", "peer", "peer_matched", "splash")
 ROLES = {"stock": "stock hf2q: frozen released baseline", "experiment": "experimental hf2q on that baseline",
          "peer": "peer, best valid configuration (mandatory comparator)",
-         "peer_matched": "peer, matched-settings diagnostic (never enters the verdict)"}
-# The peer arm may instead be a native engine (its own artifact): labeled, reported separately.
+         "peer_matched": "peer, matched-settings diagnostic (never enters the verdict)",
+         "splash": "Splash, best valid configuration (same-artifact peer of record, Qwen families)"}
+# The peer arm may instead be a native engine (its own artifact): labeled, reported separately. The splash arm is a
+# same-artifact peer of record (ADR-063 "Splash peer of record for the Qwen families").
 ARM_KINDS = {"stock": ("hf2q",), "experiment": ("hf2q",), "peer": ("peer",) + native_peers.KINDS,
-             "peer_matched": ("peer",)}
+             "peer_matched": ("peer",), "splash": native_peers.SAME_ARTIFACT}
+PEER_LIKE = ("peer", "peer_matched", "splash")  # arms whose memory/load failures make them Unavailable
 TERMINAL = ("Complete", "Invalid", "IdentityDrift")
 
 
@@ -124,14 +129,31 @@ def primary_of_record(path, family):
             "harness": {"git_commit": harness["git_commit"], "sources": harness["sources"]}}
 
 
-def arm_cases(args, family):
+def arm_cases(args, family, splash=False):
     paths = {"stock": args.hf2q_case or HERE / "q5_cases" / f"{family}.json",
              "experiment": args.hf2q_case or HERE / "q5_cases" / f"{family}.json"}
     if args.peer_case or not args.peer_unavailable_evidence:
         paths["peer"] = args.peer_case or HERE / "q5_cases" / f"peer-{family}.json"
         if args.peer_matched_case:
             paths["peer_matched"] = args.peer_matched_case
+    if splash:
+        paths["splash"] = args.splash_case or HERE / "q5_cases" / f"splash-{family}.json"
     return {arm: Path(path).resolve() for arm, path in paths.items()}
+
+
+def splash_arm(args, family, record):
+    """Whether the campaign runs the splash arm: a Qwen family's default campaign does unless Splash is declared
+    unavailable with evidence; a controls-only campaign follows its primary of record; native campaigns never."""
+    qc.require(not (args.splash_case and args.splash_unavailable_evidence),
+               "--splash-case and --splash-unavailable-evidence exclude each other")
+    if family not in q3_report.SPLASH_FAMILIES or args.native_comparison or args.peer_unavailable_evidence:
+        qc.require(not args.splash_case and not args.splash_unavailable_evidence,
+                   "Splash runs only in the default same-GGUF campaign of Qwen3.8 and Qwen3.6")
+        return False
+    if record is not None:
+        qc.require(not args.splash_unavailable_evidence, "a controls-only campaign follows its primary's arms")
+        return "splash" in record["identity"]["measured_arms"]
+    return not args.splash_unavailable_evidence
 
 
 def build_plan(args, environ, family):
@@ -143,10 +165,10 @@ def build_plan(args, environ, family):
     explicit = {"stock": [f"HF2Q_BIN={args.stock_bin}"] if args.stock_bin else [],
                 "experiment": [f"HF2Q_BIN={args.experiment_bin}"] if args.experiment_bin else []}
     extra = {"stock": args.stock_var, "experiment": args.experiment_var, "peer": args.peer_var,
-             "peer_matched": args.peer_matched_var}
+             "peer_matched": args.peer_matched_var, "splash": args.splash_var}
     qc.require(not any(v.startswith("HF2Q_BIN=") for arm in ("stock", "experiment") for v in extra[arm] or []),
                "set the hf2q binaries with --stock-bin/--experiment-bin")
-    for arm, path in arm_cases(args, family).items():
+    for arm, path in arm_cases(args, family, splash_arm(args, family, record)).items():
         cases[arm] = q5_case.validate(q5_case.loads(path.read_bytes()))
         kind = qc.engine_kind(cases[arm])
         qc.require(cases[arm]["family"] == family, f"{arm} case {path} is not family {family}")
@@ -154,7 +176,7 @@ def build_plan(args, environ, family):
         qc.require(CLIENT in cases[arm]["client"]["argv"], f"{arm} case must run the canonical four-agent client")
         arms[arm] = {"case": str(path), "case_sha256": sha256(path), "engine_kind": kind, "role": ROLES[arm],
                      "overrides": qc.overrides(cases[arm], explicit.get(arm, []) + (extra[arm] or []), environ)}
-        if native_peers.is_native(kind):
+        if native_peers.has_adapter(kind):
             module = native_peers.adapter(kind)
             arms[arm].update(role=module.q3_role(cases[arm]), label=module.label(cases[arm]))
     selections = {arm: coding_long_context.case_selection(case) for arm, case in cases.items()}
@@ -180,6 +202,8 @@ def build_plan(args, environ, family):
     unused = sorted(ambient - {n for case in cases.values() for n in case.get("variables", {})})
     qc.require(not unused, "ambient overrides name no variable of any arm case: " + ",".join(unused))
     evidence = [{"path": str(Path(p).resolve()), "sha256": sha256(p)} for p in args.peer_unavailable_evidence or []]
+    splash_evidence = [{"path": str(Path(p).resolve()), "sha256": sha256(p)}
+                       for p in args.splash_unavailable_evidence or []]
     workloads = parse_workloads(args.workloads, record is not None)
     done = [key for key in workloads if record and record["stages"].get(key) == "Complete"]
     qc.require(not done, f"--workloads {','.join(done)}: Complete in the campaign of record "
@@ -187,6 +211,7 @@ def build_plan(args, environ, family):
     plan = {"schema": SCHEMA, "family": family, "primary": None if record else PRIMARY, "workloads": workloads,
             "measured_arms": [arm for arm in ARMS if arm in arms], "arms": arms,
             "peer_unavailable_evidence": evidence,
+            **({"splash_unavailable_evidence": splash_evidence} if splash_evidence else {}),
             "design": {"metric": "client summary own_output_four_task_makespan_seconds",
                        "estimator": "mean of per-block ln(experiment/reference), 95% t interval over complete blocks",
                        "blocks": "Williams sequences over the measured arms", "min_blocks": q3_stats.MIN_BLOCKS,
@@ -204,13 +229,15 @@ def build_plan(args, environ, family):
         plan["negative_control_receipt"] = {"path": str(receipt), "sha256": sha256(receipt)}
     if record is not None:
         plan["controls_of"] = record
+    if q3_report.splash_required(plan):  # recorded in the plan: campaigns planned before Splash keep their rules
+        plan["splash_required"] = True
     return plan, cases
 
 
 def schedule_preview(plan):
-    arms = plan["measured_arms"]
-    return {key: {"phase_plan": WORKLOADS[key], "warmup_order": q3_stats.block_order(arms, 1),
-                  "blocks": [{"block": b, "order": q3_stats.block_order(arms, b)} for b in range(1, q3_stats.MAX_BLOCKS + 1)],
+    return {key: {"phase_plan": WORKLOADS[key], "warmup_order": q3_stats.block_order(q3_report.stage_arms(plan, key), 1),
+                  "blocks": [{"block": b, "order": q3_stats.block_order(q3_report.stage_arms(plan, key), b)}
+                             for b in range(1, q3_stats.MAX_BLOCKS + 1)],
                   "stop": f"after block >= {q3_stats.MIN_BLOCKS} when every required contrast has 95% half-width "
                           f"<= {q3_stats.HALF_WIDTH_PP} points; inconclusive at {q3_stats.MAX_BLOCKS}"}
             for key in plan["workloads"]}
@@ -277,6 +304,9 @@ class Driver:
             unavailable = {}
             if self.plan["peer_unavailable_evidence"] and "peer" not in self.plan["measured_arms"]:
                 unavailable["peer"] = {"reason": "declared from prior evidence", "evidence": self.plan["peer_unavailable_evidence"]}
+            if self.plan.get("splash_unavailable_evidence"):
+                unavailable["splash"] = {"reason": "declared from prior evidence",
+                                         "evidence": self.plan["splash_unavailable_evidence"]}
             self.manifest = {"schema": SCHEMA, "plan": self.plan, "plan_sha256": digest, "identities": frozen,
                              "identities_sha256": qc.plan_sha256(frozen), "created_utc": now(), "status": "Running",
                              "halted": None, "sessions": [], "next_seq": 0, "unavailable": unavailable,
@@ -285,7 +315,7 @@ class Driver:
                                          "status": "Pending", "stop": None, "warmups": [], "blocks": []}
                                         for key in self.plan["workloads"]]}
             for stage in self.manifest["stages"]:
-                for arm in self.plan["measured_arms"]:
+                for arm in q3_report.stage_arms(self.plan, stage["workload"]):
                     self.case_path(stage, arm).write_text(json.dumps(derive_case(self.cases[arm], stage["workload"]), indent=2) + "\n")
         self.frozen = self.manifest["identities"]
         self.session = len(self.manifest["sessions"])
@@ -329,7 +359,7 @@ class Driver:
         return reason is not None
 
     def run_stage(self, stage):
-        arms = self.plan["measured_arms"]
+        arms = q3_report.stage_arms(self.plan, stage["workload"])
         if self.finished(stage):
             return
         if not any(w["session"] == self.session for w in stage["warmups"]):
@@ -396,6 +426,12 @@ class Driver:
         if entry["outcome"] == "Unavailable":
             self.manifest["unavailable"][entry["arm"]] = {"reason": f"{record['failure_kind']}: {record['reason']}",
                                                           "evidence": [record["output"]]}
+            if entry["arm"] == "splash" and record["failure_kind"] in ("out_of_memory", "memory_stop"):
+                # Decision D6: a Q5 memory stop in the campaign is answered with a recorded --max-memory cap and a
+                # re-confirmed configuration, never by running on without Splash.
+                self.stop("Halted", entry, f"{entry['name']}: Splash tripped the Q5 memory stop ({record['reason']}); "
+                          "record a --max-memory cap in SPLASH_CONFIG (decision D6), re-confirm that configuration "
+                          "and start a new campaign", False)
         if entry["arm"] == "experiment" and entry["outcome"] == "Fail":
             stage.update(status="Stopped", stop={"reason": "experiment_failed", "blocks": len(stage["blocks"])})
             self.manifest["status"] = "Complete"  # Failed is terminal for the family; later stages do not run
@@ -438,11 +474,11 @@ class Driver:
             drift.append("binary.sha256")
         if receipt is not None and receipt.get("artifact") and frozen["artifact"] is not None:
             drift += [f"artifact.{k}" for k in ("bytes", "sha256") if receipt["artifact"].get(k) != frozen["artifact"].get(k)]
-        if entry["arm"].startswith("peer") and metrics["peer_build_info"] not in (None, frozen["peer_build_info"]):
+        if entry["arm"] in PEER_LIKE and metrics["peer_build_info"] not in (None, frozen["peer_build_info"]):
             drift.append("peer_build_info")
         if drift:
             record["identity_drift"] = drift
-        peer = entry["arm"].startswith("peer")
+        peer = entry["arm"] in PEER_LIKE
         if outcome in ("Pass", "Fail"):
             unavailable = peer and kind in ("out_of_memory", "memory_stop")
             entry.update(outcome="Unavailable" if unavailable else outcome, failure_kind=kind, reason=reason, metrics=metrics)
@@ -477,6 +513,11 @@ def parse_args(argv):
     parser.add_argument("--native-comparison", action="store_true",
                         help="the native --peer-case (TensorFold) runs beside a runnable same-GGUF peer: a separately "
                              "labeled campaign whose verdict and rows are never the verdict of record")
+    parser.add_argument("--splash-case", help="Splash best valid configuration (default q5_cases/splash-<family>.json "
+                        "for qwen38/qwen36, whose default campaign always runs it; ADR-063 Splash peer of record)")
+    parser.add_argument("--splash-unavailable-evidence", action="append", metavar="FILE",
+                        help="receipt proving no runnable Splash arm (repeatable): the Qwen campaign runs without it "
+                             "and its verdict is Unavailable, never a Win against the peer alone")
     for arm in ARMS:
         parser.add_argument(f"--{arm.replace('_', '-')}-var", action="append", metavar="NAME=VALUE",
                             help=f"HF2Q_Q5_<NAME> override for the {arm} arm only (repeatable)")
@@ -500,7 +541,7 @@ def parse_args(argv):
                         help="--rows for a reviewed Q3 verdict.json of record (F2 'Q3 verdicts of record' tier)")
     parser.add_argument("--quality-gate", action="append", default=[], metavar="REFERENCE=MANIFEST",
                         help="with --of-record: quality_campaign.py manifest per reference kind (stock-hf2q, peer, "
-                             "<kind>-native); a manifest not written yet is Pending (repeatable)")
+                             "splash, <kind>-native); a manifest not written yet is Pending (repeatable)")
     parser.add_argument("--review", type=Path, help="with --of-record: the independent review of the verdict")
     parser.add_argument("--superseded-by", type=Path, metavar="RECORD_VERDICT_JSON",
                         help="with --rows: this campaign's verdict was a record that RECORD_VERDICT_JSON replaced; its "
@@ -519,6 +560,8 @@ def parse_args(argv):
             parser.error("a campaign run needs --output and exactly one --family")
         if args.hf2q_case and args.family and len(args.family) > 1:
             parser.error("--hf2q-case applies to one family")
+        if args.splash_case and args.family and len(args.family) > 1:
+            parser.error("--splash-case applies to one family")
         if args.controls_of is not None and (not args.family or len(args.family) != 1):
             parser.error("--controls-of applies to exactly one --family")
         if (args.peer_unavailable_evidence or args.native_comparison) and args.peer_matched_case:

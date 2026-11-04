@@ -72,7 +72,7 @@ def approval(args):
     if args.engine_kind == "peer":
         from family_peer import preflight as peer_preflight
         keys = peer_preflight(keys, args.family)
-    elif args.engine_kind in family_contract.NATIVE_KINDS:
+    elif args.engine_kind in family_contract.ADAPTER_KINDS:
         from native_peers import adapter
         keys = adapter(args.engine_kind).preflight(keys, args.family)
     require(set(packet.get("preflight", {})) == keys and
@@ -89,7 +89,7 @@ def approval(args):
         "coding_family.py", "test_coding_family.py", "f2_semantic.py")]
     if n4:
         native = ()
-        if args.engine_kind in family_contract.NATIVE_KINDS:
+        if args.engine_kind in family_contract.ADAPTER_KINDS:
             from native_peers import adapter
             native = adapter(args.engine_kind).CLIENT_MODULES
         source_paths += [Path(__file__).with_name(n) for n in
@@ -152,7 +152,7 @@ def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf
     if engine_kind == "peer":
         from family_peer import request_controls as peer_request_controls
         request = peer_request_controls(request, family)
-    elif engine_kind in family_contract.NATIVE_KINDS:
+    elif engine_kind in family_contract.ADAPTER_KINDS:
         from native_peers import adapter
         request = adapter(engine_kind).request_controls(request, family)
     if request["stream"]:

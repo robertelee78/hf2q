@@ -20,8 +20,11 @@ VERDICTS = ("Win", "Loss", "Unavailable", "Failed", "Inconclusive", "Pending")
 GATE_STATUSES = ("Pass", "Pending", "Halted", "Fail")
 STOCK_REFERENCE = "stock-hf2q"
 # quality_campaign.py --reference-kind vocabulary (test_f2_q3_tier binds it to quality_campaign.REFERENCE_KINDS).
-REFERENCES = {STOCK_REFERENCE: "v0.1.28 stock", "peer": "peer",
+REFERENCES = {STOCK_REFERENCE: "v0.1.28 stock", "peer": "peer", "splash": "Splash",
               **{f"{kind}-native": f"{kind} native" for kind in native_peers.KINDS}}
+# Same-artifact peer of record of the Qwen families (ADR-063 "Splash peer of record for the Qwen families"): its own
+# quality-gate reference, F2 baseline arm and optional record field (records before Splash carry none).
+SPLASH = "splash"
 STOCK_ARM = "v0128_stock"
 # Worst-slot fairness metrics of the Q3 rule (q3_report.FAIRNESS) and the token rows of the tier.
 FAIRNESS = {"worst_slot_ttft_p95_s": "TTFT p95", "worst_slot_sse_gap_max_s": "SSE gap max"}
@@ -126,10 +129,15 @@ def gate_status(document, reference, family, arms):
     require(binaries(document, "subject") == {arms["experiment"]["binary"]["sha256"]},
             f"quality gate {reference} was not run on the experiment binary")
     ran = binaries(document, "reference")
-    if reference in (STOCK_REFERENCE, "peer"):
-        arm = "stock" if reference == STOCK_REFERENCE else "peer"
+    if reference in (STOCK_REFERENCE, "peer", SPLASH):
+        arm = {STOCK_REFERENCE: "stock", "peer": "peer", SPLASH: SPLASH}[reference]
         require(arm in arms, f"quality gate {reference}: the campaign has no {arm} arm")
         want = arms[arm]["binary"]["sha256"]
+        if reference == SPLASH:
+            identity = native_identities(document)
+            require(len(identity) == 1 and next(iter(identity))[0] == SPLASH and next(iter(identity))[1] != "null"
+                    and next(iter(identity))[1] == json.dumps(arms[arm].get("peer_build_info"), sort_keys=True),
+                    f"quality gate {reference}: reference runs are not the campaign's Splash readiness identity")
     else:
         kind = reference[:-len("-native")]
         require(((plan.get("arms") or {}).get("reference") or {}).get("engine_kind") == kind,
@@ -143,13 +151,15 @@ def gate_status(document, reference, family, arms):
     return ("Pass" if q1 == "Pass" else "Fail"), q1, want
 
 
-def required_references(family, peer_unavailable):
-    """stock-hf2q always; the same-GGUF peer while it is available, else the family's native stand-in (ds4)."""
+def required_references(family, peer_unavailable, splash=None):
+    """stock-hf2q always; the same-GGUF peer while it is available, else the family's native stand-in (ds4); and
+    Splash where the record requires it (Qwen families, `splash` record field)."""
+    extra = [SPLASH] if (splash or {}).get("required") else []
     if peer_unavailable is None:
-        return [STOCK_REFERENCE, "peer"]
+        return [STOCK_REFERENCE, "peer"] + extra
     return [STOCK_REFERENCE] + [f"{kind}-native" for kind in native_peers.KINDS
                                 if native_peers.adapter(kind).SAME_GGUF_UNAVAILABLE
-                                and family in native_peers.adapter(kind).Q3_FAMILIES]
+                                and family in native_peers.adapter(kind).Q3_FAMILIES] + extra
 
 
 def halt_record(campaign, root):
@@ -192,11 +202,17 @@ def build_record(verdict, campaign, root, refs, gates, review):
             "reasons": [symbolic(r, root) for r in verdict["reasons"]],
             "experiment": experiment_name(campaign["plan"]["declared"]["experiment"]),
             "peer_unavailable": unavailable((verdict["peer"]["unavailable"] or {}).get("peer"), root),
-            "unmeasurable": [f"{m}.{c}" for m in FAIRNESS for c in ("vs_stock", "vs_peer") if paired
+            "unmeasurable": [f"{m}.{c}" for m in FAIRNESS for c in ("vs_stock", "vs_peer", "vs_splash") if paired
                              and (secondary.get(m) or {}).get(c) is not None and secondary[m][c]["improvement_percent"] is None],
             "thermal_valid": verdict["thermal_valid"], "memory_valid": verdict["memory_valid"],
             "patch_review_pending": list(verdict["quality"]["patch_review"]["pending"]),
-            "quality_gate": quality, "review": review}
+            "quality_gate": quality, "review": review,
+            **({} if "splash" not in verdict else {SPLASH: {
+                "required": verdict["splash"]["required"],
+                "unavailable": None if verdict["splash"]["unavailable"] is None
+                else symbolic(verdict["splash"]["unavailable"]["reason"], root),
+                "failures": [symbolic(f, root) for f in verdict["splash"]["failures"]],
+                "label": verdict["splash"]["label"]}})}
 
 
 def validate(groups):
@@ -206,7 +222,13 @@ def validate(groups):
         rec = group.get("q3_record")
         if rec is None:
             continue
-        require(isinstance(rec, dict) and set(rec) == RECORD_KEYS, f"{gid}: q3_record fields")
+        require(isinstance(rec, dict) and set(rec) in (RECORD_KEYS, RECORD_KEYS | {SPLASH}), f"{gid}: q3_record fields")
+        splash = rec.get(SPLASH)
+        require(splash is None and SPLASH not in rec or (
+            isinstance(splash, dict) and set(splash) == {"required", "unavailable", "failures", "label"}
+            and type(splash["required"]) is bool and (splash["unavailable"] is None or isinstance(splash["unavailable"], str))
+            and isinstance(splash["failures"], list) and all(isinstance(f, str) for f in splash["failures"])
+            and (splash["label"] is None or isinstance(splash["label"], str))), f"{gid}: q3_record splash")
         require(group["family"] not in seen, f"{gid}: one Q3 verdict of record per family")
         seen.add(group["family"])
         require(rec["verdict"] in VERDICTS and isinstance(rec["campaign_status"], str)
@@ -245,8 +267,8 @@ def validate_row(row, groups):
     rec = groups[row["group"]]["q3_record"]
     require(row.get("receipt") in (rec["verdict_ref"], rec["campaign_ref"]), f"{rid}: receipt must be the record's verdict or campaign")
     if row["kind"] == "effect":
-        require(row["baseline_arm"] in (STOCK_ARM, "peer") and row["metric"] in ("makespan_s", *FAIRNESS),
-                f"{rid}: Q3 effects are makespan or worst-slot fairness vs v0128_stock or peer")
+        require(row["baseline_arm"] in (STOCK_ARM, "peer", SPLASH) and row["metric"] in ("makespan_s", *FAIRNESS),
+                f"{rid}: Q3 effects are makespan or worst-slot fairness vs v0128_stock, peer or splash")
     elif row["metric"] == "task_pass":
         require(row["status"] == "Failure" and row["arm"] == "candidate" and rec["verdict"] == "Failed"
                 and row["receipt"] == rec["campaign_ref"],
@@ -277,5 +299,5 @@ def verify(manifest, evidence_root, resolve):
             resolve(rec["review"], evidence_root)
         again = build_record(load(rec["verdict_ref"]), load(rec["campaign_ref"]), evidence_root,
                              (rec["verdict_ref"], rec["campaign_ref"]), gates, rec["review"])
-        for key in sorted(RECORD_KEYS):
-            require(again[key] == rec[key], f"{gid}: q3_record {key} drift: receipts give {again[key]!r}")
+        for key in sorted(set(RECORD_KEYS) | ({SPLASH} if SPLASH in rec or SPLASH in again else set())):
+            require(again.get(key) == rec.get(key), f"{gid}: q3_record {key} drift: receipts give {again.get(key)!r}")

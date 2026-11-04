@@ -3,7 +3,12 @@ from qwen38_n1_verdict import require
 FAMILIES = ('qwen', 'deepseek4', 'gemma4')
 # Native-engine peer arms; native_peers.py resolves kind K to native_peer_K.py.
 NATIVE_KINDS = ('ds4', 'tensorfold', 'omlx')
-ENGINE_KINDS = ('hf2q', 'peer') + NATIVE_KINDS
+# Same-artifact peers of record served by another engine (the hf2q GGUF itself; ADR-063 "Splash peer of record
+# for the Qwen families"). They share the native adapter interface (native_peers.py) but never the native role.
+SAME_ARTIFACT_KINDS = ('splash',)
+# Every engine kind whose client protocol is an adapter module (native_peers.adapter).
+ADAPTER_KINDS = NATIVE_KINDS + SAME_ARTIFACT_KINDS
+ENGINE_KINDS = ('hf2q', 'peer') + ADAPTER_KINDS
 
 
 def validate_selection(family, engine_kind, slots):
@@ -11,11 +16,12 @@ def validate_selection(family, engine_kind, slots):
             'unsupported diagnostic selection')
     require(engine_kind != 'peer' or slots == 4,
             'the peer arm is the four-slot coding workload only')
-    if engine_kind in NATIVE_KINDS:
+    if engine_kind in ADAPTER_KINDS:
         from native_peers import adapter
         native = adapter(engine_kind)
+        kind = f'native {engine_kind}' if engine_kind in NATIVE_KINDS else engine_kind
         require(family in native.FAMILIES and slots == native.SLOTS,
-                f'the native {engine_kind} arm is the four-slot {native.TITLE} coding workload only')
+                f'the {kind} arm is the four-slot {native.TITLE} coding workload only')
 
 
 def profile(family, slots):
@@ -57,7 +63,7 @@ def validate_binding(packet, family, slots):
         from family_peer import validate_controls
         validate_controls(packet.get('family_controls'), family)
         return
-    if packet.get('engine_kind', 'hf2q') in NATIVE_KINDS:
+    if packet.get('engine_kind', 'hf2q') in ADAPTER_KINDS:
         from native_peers import adapter
         adapter(packet['engine_kind']).validate_controls(packet.get('family_controls'), family)
         return

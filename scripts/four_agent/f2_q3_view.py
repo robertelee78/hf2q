@@ -30,7 +30,7 @@ def sooner(row, reference, subject="hf2q"):
 def fairness(effects, baseline, rec):
     """Worst-slot ratios against one reference. SSE gaps against the peer are never compared (engines emit
     different event granularity); an SSE gap the verdict could not estimate is shown as not measurable."""
-    contrast = "vs_stock" if baseline == STOCK_ARM else "vs_peer"
+    contrast = "vs_stock" if baseline == STOCK_ARM else "vs_splash" if baseline == "splash" else "vs_peer"
     parts = []
     for metric, label in FAIRNESS.items():
         row = effects.get((metric, baseline))
@@ -49,7 +49,7 @@ def gate_reasons(rec, family):
     """Unmet quality-gate conditions: each required reference (v0.1.28 stock, and the same-GGUF peer or the family's
     native stand-in) must be declared and Pass, and no experiment final source may await patch review."""
     gates = {g["reference"]: g for g in rec["quality_gate"]}
-    required = required_references(family, rec["peer_unavailable"])
+    required = required_references(family, rec["peer_unavailable"], rec.get("splash"))
     reasons = [f"quality gate vs {REFERENCES[k]} not declared" for k in required if k not in gates]
     if len(required) < 2:
         reasons.append("no quality-gate reference exists for the unavailable peer")
@@ -68,7 +68,8 @@ def stock_reasons(rec, effects, band, family):
     A family whose verdict is Loss vs the peer is never a Q3 Win, whatever its stock contrast."""
     if rec["verdict"] == "Failed":
         return ["the family verdict is Failed (hf2q task failure)"]
-    reasons = ["the family verdict is Loss vs the peer"] if rec["verdict"] == "Loss" else []
+    loss = "the family verdict is Loss vs the peer" + (" or Splash" if rec.get("splash") else "")
+    reasons = [loss] if rec["verdict"] == "Loss" else []
     if not rec["primary_stop"]:
         reasons.append("the primary stage has not reached its stopping rule")
     row = effects.get(("makespan_s", STOCK_ARM))
@@ -162,9 +163,17 @@ def render(manifest, q3_rows, native_rows, baseline_labels):
                                  if x["family"] == fam and NATIVE_COMPARISON not in (x["variant"] or "") + x["note"])
         else:
             peer_cell = "—"
+        splash, splash_rec = effects.get(("makespan_s", "splash")), rec.get("splash")
+        if splash is not None:
+            peer_cell += "; Splash (same GGUF): " + sooner(splash, "Splash", hf2q)
+        elif splash_rec and splash_rec["required"]:
+            peer_cell += "; Splash: " + (f"Unavailable: {splash_rec['unavailable']}" if splash_rec["unavailable"]
+                                         else "failed: " + "; ".join(splash_rec["failures"]) if splash_rec["failures"]
+                                         else "no effect")
         fair = ("— (no paired block)" if not any(m in FAIRNESS for m, _ in effects) and not rec["unmeasurable"] else
                 f"vs stock: {fairness(effects, STOCK_ARM, rec)}; vs peer: "
-                + (fairness(effects, "peer", rec) if peer is not None else "—"))
+                + (fairness(effects, "peer", rec) if peer is not None else "—")
+                + (f"; vs Splash: {fairness(effects, 'splash', rec)}" if splash is not None else ""))
         gate = "; ".join(f"{REFERENCES[g['reference']]} {g['status']}"
                          + (f" ({g['q1_verdict']})" if g["q1_verdict"] not in (None, g["status"]) else "")
                          + f" `{g['manifest']}`" for g in rec["quality_gate"]) or "not declared"

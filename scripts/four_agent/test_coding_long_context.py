@@ -267,12 +267,16 @@ class Campaigns(unittest.TestCase):
         (self.root / "nc.json").write_text("{}")
 
     def q3_plan(self, *cases):
+        from unittest import mock
         import q3_campaign as q3
+        import q3_report
         args = q3.parse_args(["--family", "qwen38", "--stock-bin", "/bin/stock", "--stock-commit", "1" * 40,
                               "--experiment-bin", "/bin/experiment", "--experiment-commit", "2" * 40,
                               "--qe-identity", "qe-test", "--negative-control-receipt", str(self.root / "nc.json"),
                               "--workloads", "n4", "--output", str(self.root / "q3"), *cases])
-        return q3.build_plan(args, {}, "qwen38")
+        # The long-context variant (D2) has no Splash case; the Splash arm is covered by test_native_peer_splash.
+        with mock.patch.object(q3_report, "SPLASH_FAMILIES", ()):
+            return q3.build_plan(args, {}, "qwen38")
 
     def test_q3_arms_must_run_the_same_workload_variant(self):
         import quality_campaign as qc
