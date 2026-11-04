@@ -7,8 +7,8 @@
 //! uses). Each chunk and decode commits the slot cursor exactly as
 //! `gemma_actual` does. With `normalize_rows` targets keyed at every chunk
 //! start, both routes emit the same per-row coordinates, so `exact` on the two
-//! stores localizes the first differing (layer, stage). There is no packed
-//! T2 (cohort) route here: T2 stage localization is recorded as Missing.
+//! stores localizes the first differing (layer, stage). This single-lane route
+//! has no packed T2 (cohort) leg; that is `gemma_cohort_localizer`.
 use super::{
     family,
     receipt::*,
@@ -103,7 +103,7 @@ pub(super) const PREFILL_STAGES: [Stage; 14] = [
 /// Scalar and per-row axes of one prefill role: the `vec![seq_len, ..]` shape
 /// passed to `gemma_prefill::after_layer` without its leading row axis. The
 /// batched prefill takes `nh`, `hd`, `nkv`, `top_k` from the same config.
-fn prefill_row(
+pub(super) fn prefill_row(
     cfg: &crate::serve::config::Gemma4Config,
     layer: usize,
     stage: Stage,
@@ -453,7 +453,7 @@ fn q1_gemma_actual_stage_localizer() {
         "logical_lane":"slot0","declared_slots":4,
         "tokens":144,"records":trace.coverage.captured.len(),"whole_q1_qualified":false,
         "full_prefill_logits":"NotEstablishedByLastRowProductionHead","other_three_lane_execution":"NotClaimedBySingleLaneLocalizer",
-        "packed_t2_route":"Missing: no packed-cohort stage localizer"});
+        "packed_t2_route":"NotThisRoute: gemma_actual::q1_gemma_actual_cohort_stage_localizer"});
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)

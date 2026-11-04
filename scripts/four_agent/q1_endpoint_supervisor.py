@@ -14,7 +14,15 @@ Changes:
   5. a `"kind": "localizer"` case runs one single-lane stage localizer packet
      (no trajectory, no 4x144 logits) with its own filter/env/marker;
   6. SIGHUP and SIGQUIT are handled like SIGTERM/SIGINT, so a terminal hangup
-     still drains the child's process group.
+     still drains the child's process group;
+  7. a `"kind": "multistore"` case runs one packet that writes several stores
+     under output/ (e.g. a four-lane stage localizer beside its endpoints).
+     Its extent (lanes, host_payload_limit, expected_stores) comes from the
+     packet, or from a bound `manifest` file of record (the packet then has
+     no expected_stores, and any lanes/host_payload_limit it keeps must
+     equal the manifest's); every store must be complete and equal its
+     frozen extent; closed registry `checks` own the family-specific
+     receipt rules.
 The foreign-process denylist and the listener ports are read from the reviewed
 Gemma supervisor source (sha-pinned) so the reviewed list is reused verbatim.
 No physical-admission, performance, float-policy or whole-Q1 qualification.
@@ -39,9 +47,14 @@ LOCALIZER_SCHEMA = 'hf2q.adr063.q1.stage-localizer.v1'
 # The per-case operating review is passed on the command line (--operating-review), never pinned in the
 # bindings: it must name BINDINGS_SHA256 and this copy's sha256, so pinning it there would be a hash cycle.
 LOCALIZER_CASE_KEYS = {'kind', 'out', 'packet', 'filter', 'packet_env', 'completion_marker', 'marker_stream'}
+MULTISTORE_CASE_KEYS = LOCALIZER_CASE_KEYS | {'stores', 'checks'}
+MULTISTORE_OPTIONAL_KEYS = {'manifest', 'completion_line'}  # manifest: bound extent file; completion_line: exact fixed line
+MULTISTORE_EXTENT_KEYS = {'lanes', 'host_payload_limit', 'expected_stores'}
 # Rust-side localizer token lengths: Gemma 128 prompt + 16 forced; DS/Qwen 64 or 128.
 LOCALIZER_TOKENS = {'gemma': (144,), 'qwen38': (64, 128), 'qwen36': (64, 128), 'deepseek': (64, 128)}
 GEMMA_DEFAULT_WARM_KERNEL = 'VecHybrid'  # shipped since #544; packets must declare any other
+COHORT_SCHEMA = 'hf2q.adr063.q1.cohort-stage-localizer.v1'
+COHORT_ROUTES = {'T0ColdSerial': 'SerialAll128PrefillSingleRowDecode', 'T2ActualCohort': 'PackedPrefill512OwnersBatchedDecodeRows'}
 INTERRUPTED = 0
 
 
@@ -63,16 +76,55 @@ def checked_bytes(path, pinned, why):
 def load(b, why):
     require(type(b) is dict and set(b) == {'path', 'sha256'} and Path(b['path']).is_absolute(), why)
     return json.loads(checked_bytes(b['path'], b['sha256'], why))
+def store_dir(rel):
+    """A store directory relative to output/: '.' or plain descending names only."""
+    require(type(rel) is str and rel and not Path(rel).is_absolute() and (rel == '.' or all(p not in ('', '.', '..') for p in rel.split('/'))), 'store directory inside output/')
+    return rel
 def case_plan(b, name):
-    """Closed launch plan: an endpoint trajectory or a single-lane localizer."""
+    """Closed launch plan: an endpoint trajectory, a single-lane localizer or a multistore case."""
     first = b['cases'].get(b['first_case'])
     require(type(first) is dict and first.get('kind', 'endpoint') == 'endpoint' and first.get('trajectory') == FIRST_TRAJECTORY, 'first_case is the family T0 (T0ColdSerial) endpoint case')
     require(name in b['cases'], 'declared case'); c = b['cases'][name]; kind = c.get('kind', 'endpoint')
     if kind == 'endpoint':
         require(type(c.get('trajectory')) is str, 'endpoint trajectory')
         return dict(kind=kind, mode=c['trajectory'], filter=c.get('filter', b['filter']), packet_env=b['packet_env'], completion_marker=b['completion_marker'], marker_stream=b['marker_stream'])
-    require(kind == 'localizer' and set(c) == LOCALIZER_CASE_KEYS and c['marker_stream'] in ('stdout', 'stderr') and all(type(c[k]) is str and c[k] for k in ('filter', 'packet_env', 'completion_marker')), 'closed localizer case: own filter/env/marker, no trajectory')
+    launch = all(type(c.get(k)) is str and c[k] for k in ('filter', 'packet_env', 'completion_marker')) and c.get('marker_stream') in ('stdout', 'stderr')
+    if kind == 'multistore':
+        require(MULTISTORE_CASE_KEYS <= set(c) <= MULTISTORE_CASE_KEYS | MULTISTORE_OPTIONAL_KEYS and launch, 'closed multistore case: own filter/env/marker, no trajectory')
+        stores = c['stores']; checks = c['checks']
+        # `{}` = no trace store (e.g. a preparation phase); the registry checks then own the whole receipt.
+        require(type(stores) is dict and all(type(k) is str and k for k in stores) and len({store_dir(v) for v in stores.values()}) == len(stores), 'distinct named stores under output/')
+        require(type(checks) is list and checks and len(set(checks)) == len(checks) and all(type(x) is str and x in MULTISTORE_CHECKS for x in checks), 'closed registry checks')
+        line = c.get('completion_line')
+        require(line is None or (type(line) is str and c['completion_marker'] in line), 'fixed completion line names the marker')
+        require('manifest' not in c or (type(c['manifest']) is dict and set(c['manifest']) == {'path', 'sha256'} and type(c['manifest']['path']) is str and Path(c['manifest']['path']).is_absolute()), 'bound extent manifest at an absolute path')
+        return dict(kind=kind, mode='multistore', filter=c['filter'], packet_env=c['packet_env'], completion_marker=c['completion_marker'], marker_stream=c['marker_stream'], stores=dict(stores), checks=list(checks), completion_line=line)
+    require(kind == 'localizer' and set(c) == LOCALIZER_CASE_KEYS and launch, 'closed localizer case: own filter/env/marker, no trajectory')
     return dict(kind=kind, mode='localizer', filter=c['filter'], packet_env=c['packet_env'], completion_marker=c['completion_marker'], marker_stream=c['marker_stream'])
+def packet_scope(plan, packet):
+    """The disabled packet matches its case kind: an endpoint carries its trajectory and no multistore lanes/stores
+    (its own `host_payload_limit` is an ordinary endpoint field), a localizer no trajectory."""
+    if plan['kind'] == 'endpoint': return packet.get('trajectory') == plan['mode'] and not {'lanes', 'expected_stores', 'stage_localizer'} & set(packet)
+    if plan['kind'] == 'localizer': return 'trajectory' not in packet
+    return True  # multistore: the registry checks own the trajectory
+def multistore_extent(case, packet, manifest_bytes):
+    """(lanes, host_payload_limit, expected_stores): the packet's, or, in manifest form, the bound manifest's.
+
+    Manifest form: the manifest is the extent of record. The packet may not carry `expected_stores`; a packet
+    `lanes` or `host_payload_limit` it keeps for its own runner must equal the manifest's value."""
+    require((manifest_bytes is None) == ('manifest' not in case), 'manifest case key and bound bytes agree')
+    if manifest_bytes is None:
+        require(MULTISTORE_EXTENT_KEYS <= set(packet), 'packet-form extent: lanes, host_payload_limit, expected_stores')
+        extent = {k: packet[k] for k in MULTISTORE_EXTENT_KEYS}
+    else:
+        extent = json.loads(manifest_bytes)
+        require(type(extent) is dict and set(extent) == MULTISTORE_EXTENT_KEYS, 'closed manifest: lanes, host_payload_limit, expected_stores')
+        require('expected_stores' not in packet, 'manifest form: the packet carries no expected_stores')
+        require(all(packet[k] == extent[k] for k in ('lanes', 'host_payload_limit') if k in packet), 'manifest form: packet lanes/host_payload_limit equal the manifest')
+    lanes = extent['lanes']
+    require(type(lanes) is list and lanes and lanes == sorted(set(lanes)) and all(type(l) is int and 0 <= l < 4 for l in lanes), 'declared distinct workload lanes')
+    require(type(extent['host_payload_limit']) is int and extent['host_payload_limit'] > 0 and type(extent['expected_stores']) is dict, 'bounded extent')
+    return extent
 def interrupt(sig, frame):
     global INTERRUPTED
     INTERRUPTED = sig
@@ -134,13 +186,21 @@ def disk_bytes(root): return sum(p.stat().st_size for p in root.rglob('*') if p.
 def coordinate(x): return tuple(x['at'][k] for k in ('logical_step', 'layer', 'stage', 'agent', 'logical_row_start', 'segment'))
 
 
-def checked_trace(out, identity):
-    """execution.json + complete, unique trace.json for the composed identity."""
-    execution = json.loads((out / 'output/execution.json').read_text()); trace = json.loads((out / 'output/trace.json').read_text())
-    require(execution['whole_q1_qualified'] is False and not trace['coverage']['errors'] and trace['identity'] == identity, 'complete trace for the composed identity')
+def checked_store(root, identity):
+    """Complete, unique root/trace.json for the composed identity."""
+    trace = json.loads((root / 'trace.json').read_text())
+    require(not trace['coverage']['errors'] and trace['identity'] == identity, 'complete trace for the composed identity')
     require(trace['acquisition']['observed_model_opens'] >= trace['acquisition']['required_model_opens'] >= 1, 'actual descriptor opens')
     captured, expected = trace['coverage']['captured'], trace['coverage']['expected']
     require(len(captured) == len(expected) and len({coordinate(x) for x in captured}) == len(captured), 'complete unique capture coordinates')
+    return captured, expected
+
+
+def checked_trace(out, identity):
+    """execution.json + complete, unique trace.json for the composed identity."""
+    execution = json.loads((out / 'output/execution.json').read_text())
+    require(execution['whole_q1_qualified'] is False, 'no whole-Q1 claim')
+    captured, expected = checked_store(out / 'output', identity)
     return execution, captured, expected
 
 
@@ -168,7 +228,12 @@ def validate_localizer(out, b, plan, packet, identity, policy):
 
 def validate_endpoint(out, b, case, packet, identity, policy):
     """Packet-derived completeness; the family helper owns the numeric checks."""
-    family = b['family']; execution, captured, expected = checked_trace(out, identity)
+    execution, captured, expected = checked_trace(out, identity)
+    return endpoint_evidence(out, b, b['cases'][case]['trajectory'], packet, execution, captured, expected, identity, policy)
+
+
+def endpoint_evidence(out, b, trajectory, packet, execution, captured, expected, identity, policy):
+    family = b['family']
     require_gemma_warm_kernel(family, execution, packet)
     lanes = packet['workload']['lanes']; rows = len(lanes[0]); require(len(lanes) == 4 and all(len(l) == rows == 144 for l in lanes), 'four144 packet workload')
     logits = [x for x in captured if x['at']['stage'] == 'Logits']
@@ -178,7 +243,6 @@ def validate_endpoint(out, b, case, packet, identity, policy):
         require(cache == {coordinate(x) for x in packet['expected_cache']}, 'packet cache manifest is the complete non-logit extent')
     total = sum(x['logical_bytes'] for x in captured)
     require(total == execution[PLANNED_FIELD[family]] <= policy['phase_payload_upper_bytes'], 'actual captured bytes = planned <= policy')
-    trajectory = b['cases'][case]['trajectory']
     if trajectory in ('T1Resume64', 'T6CancelRestore') and RESTORE64_FIELD[family]:
         exact = execution[RESTORE64_FIELD[family]]
         require(type(exact) is dict and set(exact) == {'Ok'} and type(exact['Ok']) is int and exact['Ok'] > 0, 'actual complete encoded64 exact restore')
@@ -200,6 +264,50 @@ def validate_endpoint(out, b, case, packet, identity, policy):
         require(canonical == {(l, p, k) for l in range(4) for p in range(rows) for k in range(layers)} and end is not None and end['records'] == len(seen) and end['all_scored_rows_captured'] is True and end['full_Q1_qualified'] is False, 'complete canonical routing bank')
         require(path.stat().st_size <= witness['metadata_limit_bytes'], 'routing metadata quota')
     return dict(execution=execution, captured_records=len(captured), logit_records=len(logits), captured_bytes=total, whole_q1_qualified=False)
+
+
+def validate_multistore(out, b, case, plan, packet, extent, identity, policy):
+    """Every declared store complete and equal to its frozen extent; then the closed registry checks."""
+    execution = json.loads((out / 'output/execution.json').read_text())
+    require(execution['packet_sha256'] == sha(out / 'packet.json') and execution['whole_q1_qualified'] is False, 'multistore receipt for this exact packet')
+    require(set(extent['expected_stores']) == set(plan['stores']), 'one frozen extent per declared store')
+    agents = {'agent-' + str(l) for l in extent['lanes']}; stores = {}
+    for name, rel in plan['stores'].items():
+        captured, expected = checked_store(out / 'output' / store_dir(rel), identity); frozen = extent['expected_stores'][name]
+        require(len(expected) == len(frozen) and {coordinate(x) for x in expected} == {coordinate(x) for x in frozen}, 'store ' + name + ' = frozen extent')
+        require(all(x['at']['agent'] in agents for x in captured), 'store ' + name + ': every record on a declared lane')
+        stores[name] = dict(captured=captured, expected=expected, bytes=sum(x['logical_bytes'] for x in captured))
+    total = sum(s['bytes'] for s in stores.values()); records = sum(len(s['captured']) for s in stores.values())
+    require(total <= extent['host_payload_limit'] and total <= policy['phase_payload_upper_bytes'], 'captured bytes <= extent and policy bounds')
+    lines = (out / plan['marker_stream']).read_text().splitlines()
+    if plan['completion_line']:
+        require(lines.count(plan['completion_line']) == 1, 'fixed completion line exactly once')
+    else:
+        require(plan['completion_marker'] + ' records=' + str(records) + ' whole_q1_qualified=false' in lines, 'exact multistore completion line')
+    evidence = dict(execution=execution, stores={n: dict(records=len(s['captured']), bytes=s['bytes']) for n, s in stores.items()}, captured_records=records, captured_bytes=total, whole_q1_qualified=False)
+    for check in plan['checks']:
+        evidence[check] = MULTISTORE_CHECKS[check](out, b, case, plan, packet, extent, execution, stores, identity, policy)
+    return evidence
+
+
+def check_gemma_loc4(out, b, case, plan, packet, extent, execution, stores, identity, policy):
+    """Gemma four-lane stage localizer (#652): the unchanged T0/T2 endpoint store plus a four-lane stage store."""
+    trajectory = packet.get('trajectory'); stage = packet.get('stage_localizer')
+    require(b['family'] == 'gemma' and plan['stores'] == {'endpoint': '.', 'stages': 'stages'} and trajectory in COHORT_ROUTES and type(stage) is dict, 'Gemma All128/packed localizer stores')
+    # The canonical routing bank is part of this route's evidence: never skipped (spec Part 3; only DriftAll128 may omit it).
+    require(type(b.get('routing_witness')) is dict and type(packet.get('routing_witness')) is dict, 'cohort localizer requires the routing witness in bindings and packet')
+    require(extent['lanes'] == [0, 1, 2, 3] and policy.get('lanes') == 4 and type(policy.get('stage_payload_upper_bytes')) is int, 'four-lane extent and resource policy')
+    staged = stores['stages']
+    require(execution['schema'] == COHORT_SCHEMA and execution['trajectory'] == trajectory and execution['stage_route'] == COHORT_ROUTES[trajectory] and execution['rerun_id'] == stage['rerun_id'] and execution['stage_store'] == 'stages' and execution['lanes'] == [0, 1, 2, 3] and execution['stage_records'] == len(staged['captured']), 'cohort localizer receipt for this route')
+    require({x['at']['agent'] for x in staged['captured']} == {'agent-' + str(l) for l in range(4)}, 'stage records cover all four lanes')
+    require(staged['bytes'] == execution['stage_planned_payload'] <= stage['host_payload_limit'] <= policy['stage_payload_upper_bytes'], 'stage bytes = planned <= packet <= four-lane policy')
+    endpoint = stores['endpoint']
+    evidence = endpoint_evidence(out, b, trajectory, packet, execution, endpoint['captured'], endpoint['expected'], identity, policy)
+    return dict(trajectory=trajectory, stage_route=COHORT_ROUTES[trajectory], stage_records=len(staged['captured']), stage_bytes=staged['bytes'], endpoint_records=evidence['captured_records'], logit_records=evidence['logit_records'], endpoint_bytes=evidence['captured_bytes'])
+
+
+# Closed registry of multistore check functions: (out, b, case, plan, packet, extent, execution, stores, identity, policy) -> evidence dict.
+MULTISTORE_CHECKS = {'gemma_loc4': check_gemma_loc4}
 
 
 def main():
@@ -230,7 +338,9 @@ def main():
     stat_model()
     if args.case != b['first_case']:
         first = Path(b['cases'][b['first_case']]['out']); require(json.loads((first / 'receipt.json').read_text())['case_complete'] is True, b['first_case'] + ' must complete before another axis')
-    require(packet['execution_approved'] is False and (packet.get('trajectory') == mode if plan['kind'] == 'endpoint' else 'trajectory' not in packet), 'exact disabled family axis/localizer packet')
+    require(packet['execution_approved'] is False and packet_scope(plan, packet), 'exact disabled family axis/localizer/multistore packet')
+    manifest_bytes = checked_bytes(case['manifest']['path'], case['manifest']['sha256'], 'bound extent manifest') if plan['kind'] == 'multistore' and 'manifest' in case else None
+    extent = multistore_extent(case, packet, manifest_bytes) if plan['kind'] == 'multistore' else None
     for k, v in list(packet['identity'].items()):
         if v is None: require(k in NULLABLE_IDENTITY, 'only native_checksum may be filled'); packet['identity'][k] = identity[k]
     require(packet['identity'] == identity, 'packet identity = composition comparison key')
@@ -239,6 +349,7 @@ def main():
     packet.update(execution_approved=True, acquisition=acquisition, output=str(out / 'output'))
     os.umask(0o077); out.mkdir(mode=0o700); shutil.copy2(__file__, out / 'supervisor.py'); (out / 'bindings.json').write_bytes(bindings_bytes); subprocess.run(['/bin/cp', '-c', str(binary), str(out / 'test-binary')], check=True, timeout=30); shutil.copy2(parser_source, out / 'meminfo_interface.py'); save(out / 'resource-policy.json', policy); save(out / 'acquisition-composition.json', composition); save(out / 'acquisition-review.json', review); (out / 'operating-review.json').write_bytes(operating_bytes)
     save(out / 'packet.json', packet)
+    if manifest_bytes is not None: (out / 'manifest.json').write_bytes(manifest_bytes)
     tree = ast.parse(sampler_source.read_text()); nodes = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in ('sample', 'proc_fields', 'ledger_ready')]; require(len(nodes) == 3, 'three exact reviewed observation functions')
     assignments = {n.targets[0].id: n.value for n in tree.body if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)}; POLICY = ast.literal_eval(assignments['POLICY']); POLICY.update(preload_free_floor_bytes=policy['preload_available_floor_bytes'], runtime_free_floor_bytes=policy['runtime_available_floor_bytes'], reserve_free_bytes=policy['reserve_bytes'], overshoot_margin_bytes=policy['reaction_overshoot_bytes'], process_rss_abort_bytes=policy['process_rss_limit_bytes'], process_footprint_abort_bytes=policy['process_footprint_limit_bytes'])
     spec = importlib.util.spec_from_file_location('q1_frozen_meminfo_parser', out / 'meminfo_interface.py'); parser = importlib.util.module_from_spec(spec); spec.loader.exec_module(parser)
@@ -282,9 +393,13 @@ def main():
         result.update(exit=child.returncode, elapsed_seconds=time.monotonic() - started, runtime_samples=i); require(proc_identity is not None, 'no validated live owned process ledger'); require(sum(disk_bytes(o) for o in outputs) <= policy['paired_disk_working_limit_bytes'], 'final owned disk quota'); require(child.returncode == 0 and result['elapsed_seconds'] <= deadline, 'actual helper failed/deadline')
         stdout = (out / 'stdout').read_text(); marked = (out / plan['marker_stream']).read_text()
         require('test result: ok. 1 passed; 0 failed; 0 ignored;' in stdout and plan['completion_marker'] in marked, 'exact helper pass and family completion marker')
-        result['helper_evidence'] = validate_endpoint(out, b, args.case, packet, identity, policy) if plan['kind'] == 'endpoint' else validate_localizer(out, b, plan, packet, identity, policy)
+        validate = dict(endpoint=lambda: validate_endpoint(out, b, args.case, packet, identity, policy),
+                        localizer=lambda: validate_localizer(out, b, plan, packet, identity, policy),
+                        multistore=lambda: validate_multistore(out, b, args.case, plan, packet, extent, identity, policy))
+        result['helper_evidence'] = validate[plan['kind']]()
         stat_model(); require(sha(out / 'test-binary') == b['binary_sha256'] and sha(BINDINGS) == BINDINGS_SHA256, 'terminal source/bindings identity')
         for key in ('composition', 'acquisition_review', 'resource_policy', 'build_receipt'): bound(b[key], 'terminal ' + key)
+        if manifest_bytes is not None: bound(case['manifest'], 'terminal extent manifest')
     except BaseException as e: result['failure'] = repr(e)
     finally:
         if child is not None: result['cleanup'] = drain(child)

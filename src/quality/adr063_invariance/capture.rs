@@ -55,6 +55,47 @@ pub fn rows_after_checked_drain(
     submission_id: Option<u64>,
     checked_drain: &str,
 ) -> Result<(), String> {
+    each_row_after_checked_drain(store, buffer, submission_id, checked_drain, |row| {
+        let mut at = base.clone();
+        at.logical_row_start = at
+            .logical_row_start
+            .checked_add(row as u64)
+            .ok_or("logical row overflow")?;
+        Ok(at)
+    })
+}
+
+/// Same complete row walk, but every row is labelled by its SOURCE owner
+/// `(lane, absolute position)` (a packed or batched row stream), not by an
+/// offset from one base. `owners` must cover every actual row exactly once.
+pub fn owned_rows_after_checked_drain(
+    store: &mut Store,
+    template: &Coordinate,
+    buffer: &MlxBuffer,
+    owners: &[(usize, usize)],
+    submission_id: Option<u64>,
+    checked_drain: &str,
+) -> Result<(), String> {
+    if buffer.shape().first() != Some(&owners.len()) {
+        return Err("owned row stream differs from its source owner map".into());
+    }
+    each_row_after_checked_drain(store, buffer, submission_id, checked_drain, |row| {
+        let (lane, position) = owners[row];
+        Ok(Coordinate {
+            agent: format!("agent-{lane}"),
+            logical_row_start: position as u64,
+            ..template.clone()
+        })
+    })
+}
+
+fn each_row_after_checked_drain(
+    store: &mut Store,
+    buffer: &MlxBuffer,
+    submission_id: Option<u64>,
+    checked_drain: &str,
+    mut at: impl FnMut(usize) -> Result<Coordinate, String>,
+) -> Result<(), String> {
     let shape = buffer.shape();
     if shape.is_empty() || shape[0] == 0 {
         return Err("empty row capture".into());
@@ -82,17 +123,12 @@ pub fn rows_after_checked_drain(
     let mut row_shape = shape.to_vec();
     row_shape[0] = 1;
     for (row, bytes) in all.chunks_exact(row_bytes).enumerate() {
-        let mut at = base.clone();
-        at.logical_row_start = at
-            .logical_row_start
-            .checked_add(row as u64)
-            .ok_or("logical row overflow")?;
         let offset = buffer
             .byte_offset()
             .checked_add((row * row_bytes) as u64)
             .ok_or("physical row overflow")?;
         store.capture(
-            at,
+            at(row)?,
             scalar,
             row_shape.clone(),
             buffer.contents_ptr() as usize as u64,

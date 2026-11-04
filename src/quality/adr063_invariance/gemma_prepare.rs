@@ -15,6 +15,8 @@ struct Config {
     #[serde(default)] routing_recipes:bool,
     /// Optional stage-localizer packets; absent leaves every output unchanged.
     #[serde(default)] localizer:Option<Localizer>,
+    /// Optional four-lane cohort stage-localizer packets (All128 + packed T2).
+    #[serde(default)] cohort_localizer:Option<CohortLocalizer>,
     model:Model,full_content_receipt:FileBinding,tokenizer:FileBinding,template:FileBinding,
     producer_metadata:FileBinding,producer_build_receipt:FileBinding,
     producer_export_receipt:FileBinding,producer_config:FileBinding,
@@ -27,6 +29,15 @@ struct LocalizerRoute {rerun_id:String,prefill_chunks:Vec<usize>}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Localizer {agent:usize,layers:Vec<u32>,stages:Vec<Stage>,normalize_rows:bool,routes:Vec<LocalizerRoute>}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CohortLocalizer {layers:Vec<u32>,prefill_stages:Vec<Stage>,decode_stages:Vec<Stage>,
+    /// Endpoint store the All128 route's endpoint store must be `ExactEqual` to.
+    #[serde(default="all128_reference")] observer_effect_reference:String,
+    /// Endpoint store the packed route's endpoint store must be `ExactEqual` to.
+    #[serde(default="packed_reference")] packed_observer_effect_reference:String}
+fn all128_reference()->String {"gemma-t0-b3".into()}
+fn packed_reference()->String {"gemma-t2-b3".into()}
 fn exact_hex(s:&str,n:usize)->bool {s.len()==n && s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))}
 fn output_preflight(path:&Path)->Result<()> {
     ensure!(path.is_absolute() && !path.ancestors().any(|p|p.join(".git").exists()),"private output outsideGit");
@@ -139,12 +150,82 @@ fn localizer_export(c:&Config,l:&Localizer,cfg:&crate::serve::config::Gemma4Conf
         "records_per_route":records,"planned_payload":planned,
         "host_payload_cap":super::gemma_localizer::HOST_PAYLOAD_CAP,
         "packets":files.iter().map(|(name,bytes)|serde_json::json!({"file":name,"sha256":hash(bytes)})).collect::<Vec<_>>(),
-        "packed_t2_route":"Missing: no packed-cohort stage localizer",
+        "packed_t2_route":"NotThisRoute: cohort_localizer block (gemma_cohort_localizer)",
         "model_loaded":false,"device_created":false,"inference_performed":false,"acquisition_attested":false,
         "execution_approved":false,"composition_reviewed":false,"physical_admission":false,"whole_q1_qualified":false});
     let encoded=serde_json::to_vec_pretty(&value)?;ensure!(encoded.len()<=2*1024*1024,"bounded localizer metadata");
     files.insert(0,("localizer-prepared.json".into(),encoded));
     Ok(LocalizerExport {files,routes:routes.len(),agent:l.agent,records})
+}
+/// `cohort-localizer-prepared.json` plus two DISABLED multistore packets: the
+/// All128 reference (`T0ColdSerial`) and the packed route (`T2ActualCohort`).
+/// Both freeze the same endpoint extent as the b3 T0/T2 stores and one
+/// route-agnostic stage manifest; their identity is a SEPARATE composition key
+/// (`gemma_cohort_localizer::recipe`).
+fn cohort_localizer_export(c:&Config,l:&CohortLocalizer,cfg:&crate::serve::config::Gemma4Config,work:&Workload,source:&str,
+    binary:&str,raw:&[u8])->Result<Vec<(String,Vec<u8>)>> {
+    use super::gemma_cohort_localizer as cohort;
+    use super::gemma_routing_witness as witness;
+    ensure!(env!("HF2Q_MLX_NATIVE_VERSION")==witness::WITNESS_NATIVE_VERSION,
+        "cohort localizer packets require the exact published routing-witness native build");
+    let (_,stages,stage_bytes)=cohort::manifest(cfg,&l.layers,&l.prefill_stages,&l.decode_stages).map_err(anyhow::Error::msg)?;
+    let recipe=cohort::recipe(cfg);let config_sha256=acquisition::config_digest(&recipe)?;
+    let token_vectors_sha256=acquisition::tokens_digest(work)?;
+    let identity=serde_json::json!({"family":Family::Gemma4,"source_commit":source,"binary_sha256":binary,
+        "native_version":env!("HF2Q_MLX_NATIVE_VERSION"),"native_checksum":null,"model_sha256":MODEL_SHA,
+        "tokenizer_sha256":c.tokenizer.sha256,"template_sha256":c.template.sha256,
+        "config_sha256":config_sha256,"token_vectors_sha256":token_vectors_sha256});
+    let budget=serde_json::json!({"payload_bytes":witness::PAYLOAD_BYTES,"metadata_bytes":witness::METADATA_BYTES,
+        "cpu_ledger_bytes":witness::CPU_LEDGER_BYTES});
+    let charge=witness::PAYLOAD_BYTES+witness::METADATA_BYTES+witness::CPU_LEDGER_BYTES;
+    let mut files=Vec::new();let mut routes=Vec::new();
+    for reference in [&l.observer_effect_reference,&l.packed_observer_effect_reference] {
+        ensure!(!reference.is_empty() && reference.len()<=64
+            && reference.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'||b==b'_'),"file-safe observer-effect reference store");
+    }
+    for (name,trajectory,filter,reference) in [
+        ("all128",super::protocol::Trajectory::T0ColdSerial,"adr063_invariance::gemma_actual::q1_gemma_actual_all128_stage_localizer",&l.observer_effect_reference),
+        ("packed",super::protocol::Trajectory::T2ActualCohort,"adr063_invariance::gemma_actual::q1_gemma_actual_cohort_stage_localizer",&l.packed_observer_effect_reference)] {
+        let endpoint=super::gemma_actual::endpoint_expected(cfg,trajectory)?;
+        let endpoint_bytes=endpoint.iter().try_fold(0u64,|sum,e|e.shape.iter()
+            .try_fold(e.scalar.bytes() as u64,|n,&d|n.checked_mul(d as u64)).and_then(|n|sum.checked_add(n)))
+            .context("endpoint payload overflow")?;
+        let host=endpoint_bytes.checked_add(charge).and_then(|n|n.checked_add(stage_bytes)).context("host payload overflow")?;
+        ensure!(host<=2*1024*1024*1024,"endpoint+routing+stage payload exceeds the 2 GiB endpoint ceiling");
+        let rerun_id=format!("cohort-{name}");
+        let packet=serde_json::json!({"execution_approved":false,"acquisition":null,"identity":identity,
+            "workload":work,"trajectory":trajectory,"model":c.model.path,"output":null,
+            "configured_context":262144,"configured_output_allowance":8192,"host_payload_limit":host,
+            "routing_witness":budget,"stage_localizer":{"rerun_id":rerun_id,"layers":l.layers,
+                "prefill_stages":l.prefill_stages,"decode_stages":l.decode_stages,"host_payload_limit":stage_bytes},
+            "lanes":[0,1,2,3],"expected_stores":{cohort::ENDPOINT_STORE:endpoint,cohort::STAGE_STORE:stages}});
+        let encoded=serde_json::to_vec_pretty(&packet)?;
+        // The supervisor rewrites the packet indent-2 (the same layout) and fills
+        // its bindings; keep 1 MiB of room below the 16 MiB localizer read.
+        ensure!(encoded.len()+1024*1024<=16*1024*1024,"cohort packet must fit the localizer read after the supervisor fill");
+        let file=format!("cohort-localizer-packet-{name}.json");
+        routes.push(serde_json::json!({"rerun_id":rerun_id,"trajectory":trajectory,"filter":filter,
+            "stage_route":cohort::route(trajectory).map_err(anyhow::Error::msg)?,"packet":{"file":file,"sha256":hash(&encoded)},
+            "endpoint_records":endpoint.len(),"endpoint_planned_payload":endpoint_bytes,"routing_witness_charge":charge,
+            "stage_planned_payload":stage_bytes,"host_payload_limit":host,"observer_effect_reference":reference}));
+        files.push((file,encoded));
+    }
+    let value=serde_json::json!({"schema":"hf2q.q1.gemma-cohort-localizer-preparation.v1","exporter_source_commit":source,
+        "exporter_binary_sha256":binary,"native_version":env!("HF2Q_MLX_NATIVE_VERSION"),"config_input_sha256":hash(raw),
+        "family":Family::Gemma4,"model_path":c.model.path,"model_full_sha256_retained":MODEL_SHA,
+        "actual_gemma_config_debug_sha256":recipe.actual_model_config_sha256,"config_sha256":config_sha256,"recipe":recipe,
+        "identity":identity,"comparison_key_scope":"SEPARATE cohort-localizer composition/acquisition review/bindings; both routes share it",
+        "layers":l.layers,"prefill_stages":l.prefill_stages,"decode_stages":l.decode_stages,"lanes":[0,1,2,3],
+        "stage_records":stages.len(),"stage_planned_payload":stage_bytes,"routes":routes,
+        "supervisor_case":{"kind":"multistore","stores":{cohort::ENDPOINT_STORE:".",cohort::STAGE_STORE:cohort::STAGE_STORE},
+            "checks":["gemma_loc4"],"packet_env":"HF2Q_Q1_GEMMA_ENDPOINT_PACKET","completion_marker":cohort::MARKER,"marker_stream":"stdout"},
+        "workload_scope":"the prep's derived first-144 vectors; a runtime dataset swap must replace workload and identity.token_vectors_sha256 only (store manifests are token-independent)",
+        "route_class":"ClassB packed-versus-All128; no fix implied",
+        "model_loaded":false,"device_created":false,"inference_performed":false,"acquisition_attested":false,
+        "execution_approved":false,"composition_reviewed":false,"physical_admission":false,"whole_q1_qualified":false});
+    let encoded=serde_json::to_vec_pretty(&value)?;ensure!(encoded.len()<=2*1024*1024,"bounded cohort localizer metadata");
+    files.insert(0,("cohort-localizer-prepared.json".into(),encoded));
+    Ok(files)
 }
 #[test]
 #[ignore="root-supervised header/retainedJSON only; no model/device"]
@@ -235,6 +316,10 @@ fn run()->Result<()> {
         Some(l)=>Some(localizer_export(&c,l,&cfg,&work,source,&binary,&raw,&before,gguf.tensor_data_offset())?),
         None=>None,
     };
+    let cohort=match &c.cohort_localizer {
+        Some(l)=>Some(cohort_localizer_export(&c,l,&cfg,&work,source,&binary,&raw)?),
+        None=>None,
+    };
     for ((b,n),old) in bindings.iter().zip(&bound) {ensure!(acquisition::checked_file(b,*n)?==*old,"bound input changed");}
     for (b,old) in c.producer_vectors.iter().zip(&vector_raw) {ensure!(acquisition::checked_file(b,4*1024*1024)?==*old,"producer vector changed");}
     ensure!(FileIdentity::observed(&fd)?==before,"model descriptor changed during metadata read");
@@ -252,6 +337,12 @@ fn run()->Result<()> {
         }
         println!("Q1_GEMMA_LOCALIZER_METADATA_PREPARED routes={} agent={} records_per_route={} device=false execution_approved=false",
             export.routes,export.agent,export.records);
+    }
+    if let Some(files)=cohort {
+        for (name,bytes) in &files {
+            OpenOptions::new().create_new(true).write(true).mode(0o600).open(c.output.join(name))?.write_all(bytes)?;
+        }
+        println!("Q1_GEMMA_COHORT_LOCALIZER_METADATA_PREPARED routes=2 lanes=4 device=false execution_approved=false");
     }
     println!("Q1_GEMMA_ENDPOINT_METADATA_PREPARED lanes=4 tokens=144 device=false execution=false");Ok(())
 }

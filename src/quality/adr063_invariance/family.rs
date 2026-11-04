@@ -96,11 +96,57 @@ pub fn drained(
         let Some(target) = active.targets.get(&(step, layer, stage)).cloned() else {
             return Ok(());
         };
+        if target.at.agent == OWNED_AGENT {
+            let e = "owned-row target reached a source without its row owners".to_string();
+            active.store.fail(e.clone());
+            return Err(e);
+        }
         let shape = buf.shape().to_vec();
         let result = if target.normalize_rows {
             capture::rows_after_checked_drain(&mut active.store, target.at, buf, None, drain)
         } else {
             capture::after_checked_drain(&mut active.store, target.at, buf, &shape, None, drain)
+        };
+        if let Err(e) = &result {
+            active.store.fail(e.clone());
+        }
+        result
+    })
+}
+/// Agent label of a target template whose rows name their own owner: a packed
+/// or batched source supplies `(lane, absolute position)` for every row. Such
+/// a template never captures through [`drained`].
+pub const OWNED_AGENT: &str = "owned-rows";
+/// [`drained`] for a row stream whose rows belong to different lanes. Only an
+/// [`OWNED_AGENT`] row-normalized target admits it; each row is stored at
+/// `agent-<lane>` / `position`, which must lie at or after the keyed step.
+#[allow(clippy::too_many_arguments)]
+pub fn drained_owned_rows(
+    family: Family,
+    step: u64,
+    layer: u32,
+    stage: Stage,
+    buf: &MlxBuffer,
+    owners: &[(usize, usize)],
+    drain: &str,
+) -> Result<(), String> {
+    ACTIVE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(active) = slot.as_mut() else {
+            return Ok(());
+        };
+        if active.family != family {
+            return Ok(());
+        }
+        let Some(target) = active.targets.get(&(step, layer, stage)).cloned() else {
+            return Ok(());
+        };
+        let result = if target.at.agent != OWNED_AGENT || !target.normalize_rows {
+            Err("row owners supplied for a fixed-lane or unnormalized target".to_string())
+        } else if owners.iter().any(|&(lane, position)| lane >= 4 || (position as u64) < step) {
+            Err("row owner outside the four lanes or before the keyed step".to_string())
+        } else {
+            capture::owned_rows_after_checked_drain(&mut active.store, &target.at, buf, owners, None, drain)
         };
         if let Err(e) = &result {
             active.store.fail(e.clone());
