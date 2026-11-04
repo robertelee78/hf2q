@@ -12,6 +12,7 @@ pub enum Adapter {
     GemmaOwningWorkerRecovery,
     QwenOwningWorkerRecovery,
     QwenCoherentSpeculation,
+    GemmaNgramTransaction,
     SourceRefusal,
     Missing,
 }
@@ -61,9 +62,9 @@ pub fn cell(family: Family, trajectory: Trajectory) -> Cell {
         (Gemma4, T0ColdSerial | T1Resume64 | T3Chunk64 | T4ReverseOrder | T7RepeatCold | T8RepeatCold) => (GemmaOrdinary,
             "gemma_actual production slot-aware Hybrid body; same scalar head for all actual rows",
             "authored diagnostic; actual execution, exact checkpoint and full cache coverage pending"),
-        (Gemma4, _) => (Missing,
-            "single-lane Gemma localizer is not a four-lane nine-trajectory runner",
-            "actual family adapter/full-row logits/cache extents required; no blanket unsupported disposition"),
+        (Gemma4, T5GenuineSpeculation) => (GemmaNgramTransaction,
+            "gemma_ngram global OptionC injected K3 transaction vs same-route ordinary arm",
+            "not the slot-aware serving body"),
     };
     Cell { family, trajectory, adapter, scope, gap }
 }
@@ -82,6 +83,7 @@ pub fn ordinary_preflight(family: Family, trajectory: Trajectory) -> Result<(), 
             Err(format!("SeparateActualAdapterRequired: {}", cell(family, trajectory).scope)),
         Adapter::GemmaOwningWorkerRecovery => Err("SeparateActualAdapterRequired: Gemma owning cancellation endpoint filter".into()),
         Adapter::GemmaPackedCohort => Err("SeparateActualAdapterRequired: Gemma packed cohort endpoint filter".into()),
+        Adapter::GemmaNgramTransaction => Err(format!("SeparateActualAdapterRequired: {}", cell(family, trajectory).scope)),
         Adapter::Missing => Err(format!("LocalizationIncomplete: {}", cell(family, trajectory).gap)),
     }
 }

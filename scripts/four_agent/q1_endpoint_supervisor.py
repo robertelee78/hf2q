@@ -22,7 +22,9 @@ Changes:
      no expected_stores, and any lanes/host_payload_limit it keeps must
      equal the manifest's); every store must be complete and equal its
      frozen extent; closed registry `checks` own the family-specific
-     receipt rules.
+     receipt rules: gemma_loc4 (#652; legacy, plan-only and DriftAll128 forms),
+     qwen_t6_continuation, qwen_t5_phase, qwen_t5_first_fork (#653),
+     gemma_t5_ordinary, gemma_t5_ngram, gemma_t5_localizer (#665).
   8. the resource policy may select the ADR-063 Q5 runtime pressure rule
      (`runtime_pressure_rule: "q5-critical-stop"`: warning is recorded, only
      critical or unknown pressure stops; baseline samples stay normal-only), and
@@ -65,6 +67,25 @@ COHORT_ROUTES = {'T0ColdSerial': 'SerialAll128PrefillSingleRowDecode', 'T2Actual
 # Runtime pressure rules (kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical). Absent = the
 # reviewed Q1 rule. `q5-critical-stop` is ADR-063 Q5: warning pressure is recorded but is not a stop.
 RUNTIME_PRESSURE = {'normal-every-sample': ('1',), 'q5-critical-stop': ('1', '2')}
+# gemma_actual `localizer_mode` -> recipe route label; only DriftAll128 runs with the routing witness off.
+LOCALIZER_ROUTES = {'Cohort': 'gemma-four-lane-stage-localizer-native-routing1511-v1', 'DriftAll128': 'gemma-all128-stage-drift-witness-off-v1'}
+LOGIT_LAYER = 2**32 - 1  # u32::MAX: logits/verifier rows are not a layer
+# #653 source-manifest counts (design §1.4/§1.5; confirmed pre-launch against the exported manifest).
+QWEN_T6_RECORDS = {'qwen36': dict(continuation=1440, snapshot=560)}
+QWEN_T6_SNAPSHOTS = {'ColdChunkMatched64': ('prefix64',), 'CancelledThenRecovered': ('before', 'recovered')}
+QWEN_T5_RECORDS = {'qwen36': {'committed': 1840, 'raw-verifier': 20}}
+QWEN_T5_SCHEMA = 'hf2q.q1.qwen-t5-phase.v1'
+QWEN_FROZEN_REVIEW_SCHEMA = 'hf2q.q1.qwen-t5-frozen-review.v1'
+# #665 Gemma T5 adapter (design §2.3 table; contracts C2/C3).
+GEMMA_T5_PHASE_SCHEMA = 'hf2q.q1.gemma-t5-phase.v1'
+GEMMA_T5_LOCALIZER_SCHEMA = 'hf2q.q1.gemma-t5-localizer.v1'
+GEMMA_T5_STORES = {'OrdinaryGlobal': ('prefork', 'committed'), 'NgramTransaction': ('prefork', 'committed', 'raw-verifier')}
+GEMMA_T5_RECORDS = {'prefork': 4204, 'committed': 4264, 'raw-verifier': 4}
+GEMMA_INJECTED_ORIGIN = 'InjectedDiagnosticFixtureNotProductionProposalQuality'
+GEMMA_ROW127_REFUSAL = 'RouteSensitive: global-route initial decision differs from frozen at row 127'
+GEMMA_EOS = (1, 106)
+GEMMA_VOCAB = 262144
+GEMMA_ROUTING_LAYERS = 30
 INTERRUPTED = 0
 
 
@@ -175,7 +196,8 @@ def multistore_extent(case, packet, manifest_bytes):
         require(all(packet[k] == extent[k] for k in ('lanes', 'host_payload_limit') if k in packet), 'manifest form: packet lanes/host_payload_limit equal the manifest')
     lanes = extent['lanes']
     require(type(lanes) is list and lanes and lanes == sorted(set(lanes)) and all(type(l) is int and 0 <= l < 4 for l in lanes), 'declared distinct workload lanes')
-    require(type(extent['host_payload_limit']) is int and extent['host_payload_limit'] > 0 and type(extent['expected_stores']) is dict, 'bounded extent')
+    # A storeless extent (Qwen T5 Preparation) plans no tensor payload: its limit is exactly 0.
+    require(type(extent['expected_stores']) is dict and type(extent['host_payload_limit']) is int and (extent['host_payload_limit'] > 0 or (extent['host_payload_limit'] == 0 and extent['expected_stores'] == {})), 'bounded extent')
     return extent
 def interrupt(sig, frame):
     global INTERRUPTED
@@ -284,6 +306,25 @@ def validate_endpoint(out, b, case, packet, identity, policy):
     return endpoint_evidence(out, b, b['cases'][case]['trajectory'], packet, execution, captured, expected, identity, policy)
 
 
+def routing_bank(out, identity, witness, namespaces, mode=None):
+    """output/routing-witness.jsonl as written by gemma_routing_witness: header for this composed identity (and witness
+    mode, when given), unique native-valid Scored rows with finite raw values in `namespaces` only, end.records = rows,
+    all scored rows captured, metadata <= the bindings quota. Returns the (namespace, lane, position, layer) keys."""
+    seen = set(); end = None; path = out / 'output/routing-witness.jsonl'
+    with path.open() as file:
+        header = json.loads(next(file)); require(header['kind'] == 'header' and header['identity'] == identity and header['qualified'] is False and (mode is None or header['mode'] == mode), 'same actual identity routing bank')
+        for line in file:
+            require(end is None, 'no data after routing end'); r = json.loads(line)
+            if r['kind'] == 'end': end = r; continue
+            require(r['kind'] == 'routing_row' and r['native_boundary_valid'] is True and r['selected_copy_valid'] is True and r['native_decode_error'] is None and r['qualified'] is False, 'actual native Scored row')
+            at = r['at']; key = (at['namespace'], at['row']['lane'], at['row']['position'], at['layer'])
+            require(key not in seen and at['namespace'] in namespaces, 'unique row in a declared namespace'); seen.add(key)
+            require(all(type(x) is int and 0 <= x < 2**32 and (x & 0x7f800000) != 0x7f800000 for x in r['scores_f32_bits'] + r['selected_weights_f32_bits']), 'finite raw native values')
+    require(end is not None and end['records'] == len(seen) and end['all_scored_rows_captured'] is True and end['full_Q1_qualified'] is False, 'complete routing bank end')
+    require(path.stat().st_size <= witness['metadata_limit_bytes'], 'routing metadata quota')
+    return seen
+
+
 def endpoint_evidence(out, b, trajectory, packet, execution, captured, expected, identity, policy):
     family = b['family']
     require_gemma_warm_kernel(family, execution, packet)
@@ -302,19 +343,9 @@ def endpoint_evidence(out, b, trajectory, packet, execution, captured, expected,
         require(len(execution['actual_cancellation']) == 4 and {x['slot'] for x in execution['actual_cancellation']} == {0, 1, 2, 3} and all(x['real_receiver_closed_after_checked_advance'] is True and x['checked_prefix'] == 64 and x['actual_unpublished_end'] == 128 and x['recovered_cursor'] == 64 and x['retained_tokens'] == 64 and x['scheduler_in_flight_after'] == 0 and x['supervisor_healthy'] is True for x in execution['actual_cancellation']), 'actual four-owning-cancellation recovery')
     witness = b.get('routing_witness')
     if witness:
-        layers = witness['layers']; seen = set(); end = None; path = out / 'output/routing-witness.jsonl'
-        with path.open() as file:
-            header = json.loads(next(file)); require(header['kind'] == 'header' and header['identity'] == identity and header['qualified'] is False, 'same actual identity routing bank')
-            for line in file:
-                require(end is None, 'no data after routing end'); r = json.loads(line)
-                if r['kind'] == 'end': end = r; continue
-                require(r['kind'] == 'routing_row' and r['native_boundary_valid'] is True and r['selected_copy_valid'] is True and r['native_decode_error'] is None and r['qualified'] is False, 'actual native Scored row')
-                at = r['at']; key = (at['namespace'], at['row']['lane'], at['row']['position'], at['layer'])
-                require(key not in seen and (at['namespace'] == 'Canonical' or at['namespace'] in witness.get('extra_namespaces', ())), 'unique row in a declared namespace'); seen.add(key)
-                require(all(type(x) is int and 0 <= x < 2**32 and (x & 0x7f800000) != 0x7f800000 for x in r['scores_f32_bits'] + r['selected_weights_f32_bits']), 'finite raw native values')
+        seen = routing_bank(out, identity, witness, {'Canonical', *witness.get('extra_namespaces', ())})
         canonical = {k[1:] for k in seen if k[0] == 'Canonical'}
-        require(canonical == {(l, p, k) for l in range(4) for p in range(rows) for k in range(layers)} and end is not None and end['records'] == len(seen) and end['all_scored_rows_captured'] is True and end['full_Q1_qualified'] is False, 'complete canonical routing bank')
-        require(path.stat().st_size <= witness['metadata_limit_bytes'], 'routing metadata quota')
+        require(canonical == {(l, p, k) for l in range(4) for p in range(rows) for k in range(witness['layers'])}, 'complete canonical routing bank')
     return dict(execution=execution, captured_records=len(captured), logit_records=len(logits), captured_bytes=total, whole_q1_qualified=False)
 
 
@@ -343,11 +374,26 @@ def validate_multistore(out, b, case, plan, packet, extent, identity, policy):
 
 
 def check_gemma_loc4(out, b, case, plan, packet, extent, execution, stores, identity, policy):
-    """Gemma four-lane stage localizer (#652): the unchanged T0/T2 endpoint store plus a four-lane stage store."""
-    trajectory = packet.get('trajectory'); stage = packet.get('stage_localizer')
+    """Gemma four-lane stage localizer (#652): the unchanged T0/T2 endpoint store plus a four-lane stage store.
+
+    Stage extent: the legacy packet `expected_stores` form, or the plan-only form (packet `stage_manifest` = the case's
+    bound `manifest`, no `expected_stores`). `localizer_mode` (absent = Cohort): Cohort keeps the routing bank in bindings,
+    packet and receipt; DriftAll128 (#665 §2.6, route DRIFT_ROUTE only) is All128 prefill-only with the witness OFF
+    everywhere (packet `routing_witness` null, no bindings witness, no bank file) and `observer_effect_reference` null."""
+    trajectory = packet.get('trajectory'); stage = packet.get('stage_localizer'); mode = packet.get('localizer_mode', 'Cohort')
     require(b['family'] == 'gemma' and plan['stores'] == {'endpoint': '.', 'stages': 'stages'} and trajectory in COHORT_ROUTES and type(stage) is dict, 'Gemma All128/packed localizer stores')
-    # The canonical routing bank is part of this route's evidence: never skipped (spec Part 3; only DriftAll128 may omit it).
-    require(type(b.get('routing_witness')) is dict and type(packet.get('routing_witness')) is dict, 'cohort localizer requires the routing witness in bindings and packet')
+    drift = mode == 'DriftAll128'; reference = packet.get('observer_effect_reference')
+    require(mode in LOCALIZER_ROUTES and execution['localizer_mode'] == mode and execution['route'] == LOCALIZER_ROUTES[mode] and execution['observer_effect_reference'] == reference and (reference is None or (type(reference) is str and reference)), 'localizer mode, recipe route and observer-effect reference echoed')
+    if drift:
+        # The only witness-OFF route: no routing bank is asserted, and none may exist.
+        require(trajectory == 'T0ColdSerial' and 'routing_witness' in packet and packet['routing_witness'] is None and b.get('routing_witness') is None and reference is None and stage.get('decode_stages') == [] and execution['routing_witness_installed'] is False and not (out / 'output/routing-witness.jsonl').exists(), 'DriftAll128: All128 prefill-only, witness off everywhere, no observer reference')
+    else:
+        # The canonical routing bank is part of this route's evidence: never skipped (spec Part 3; only DriftAll128 may omit it).
+        require(type(b.get('routing_witness')) is dict and type(packet.get('routing_witness')) is dict and execution['routing_witness_installed'] is True, 'cohort localizer requires the routing witness in bindings and packet')
+    if 'stage_manifest' in packet:
+        require('expected_stores' not in packet and 'manifest' in b['cases'][case] and packet['stage_manifest'] == b['cases'][case]['manifest'] and execution['stage_extent_source'] == 'BoundStageManifest' and execution['stage_manifest'] == packet['stage_manifest'], 'plan-only form: stage extent from the bound case manifest')
+    else:
+        require('expected_stores' in packet and execution['stage_extent_source'] == 'PacketExpectedStores' and execution['stage_manifest'] is None, 'legacy form: stage extent from the packet')
     require(extent['lanes'] == [0, 1, 2, 3] and policy.get('lanes') == 4 and type(policy.get('stage_payload_upper_bytes')) is int, 'four-lane extent and resource policy')
     staged = stores['stages']
     require(execution['schema'] == COHORT_SCHEMA and execution['trajectory'] == trajectory and execution['stage_route'] == COHORT_ROUTES[trajectory] and execution['rerun_id'] == stage['rerun_id'] and execution['stage_store'] == 'stages' and execution['lanes'] == [0, 1, 2, 3] and execution['stage_records'] == len(staged['captured']), 'cohort localizer receipt for this route')
@@ -355,11 +401,238 @@ def check_gemma_loc4(out, b, case, plan, packet, extent, execution, stores, iden
     require(staged['bytes'] == execution['stage_planned_payload'] <= stage['host_payload_limit'] <= policy['stage_payload_upper_bytes'], 'stage bytes = planned <= packet <= four-lane policy')
     endpoint = stores['endpoint']
     evidence = endpoint_evidence(out, b, trajectory, packet, execution, endpoint['captured'], endpoint['expected'], identity, policy)
-    return dict(trajectory=trajectory, stage_route=COHORT_ROUTES[trajectory], stage_records=len(staged['captured']), stage_bytes=staged['bytes'], endpoint_records=evidence['captured_records'], logit_records=evidence['logit_records'], endpoint_bytes=evidence['captured_bytes'])
+    return dict(trajectory=trajectory, stage_route=COHORT_ROUTES[trajectory], localizer_mode=mode, route=LOCALIZER_ROUTES[mode], observer_effect_reference=reference, stage_extent_source=execution['stage_extent_source'], routing_bank_asserted=not drift, stage_records=len(staged['captured']), stage_bytes=staged['bytes'], endpoint_records=evidence['captured_records'], logit_records=evidence['logit_records'], endpoint_bytes=evidence['captured_bytes'])
+
+
+def u32(x): return type(x) is int and 0 <= x < 2**32
+def same_named(plan, names, why): require(plan['stores'] == {n: n for n in names}, why)
+def logit_rows(store):
+    """(agent, row) of every Logits record: the endpoint layout layer u32::MAX, segment 0."""
+    rows = [x['at'] for x in store['captured'] if x['at']['stage'] == 'Logits']
+    require(all(at['layer'] == LOGIT_LAYER and at['segment'] == 0 for at in rows), 'Logits at layer u32::MAX, segment 0')
+    keys = {(at['agent'], at['logical_row_start']) for at in rows}; require(len(keys) == len(rows), 'unique logit rows'); return keys
+
+
+def qwen_calls(mode):
+    """continuation.rs `require_calls`: per lane one prefix call to cursor 128, then single-row decode 128..143."""
+    before, rows = (0, 128) if mode == 'ColdBaseline' else (64, 64)
+    return [c for l in range(4) for c in [dict(lane=l, before=before, input_rows=rows, after=128, output_rows=rows)] + [dict(lane=l, before=p, input_rows=1, after=p + 1, output_rows=1) for p in range(128, 144)]]
+
+
+def check_qwen_t6_continuation(out, b, case, plan, packet, extent, execution, stores, identity, policy):
+    """Qwen T6 block (#653 §1.4): t3cm (`ColdChunkMatched64`: continuation + prefix64) or t6 (`CancelledThenRecovered`:
+    continuation + before + recovered). The fixed source line carries no count, so every store is bound to the receipt
+    (`trace_records` = continuation) and to the family's source-manifest count; `planned_tensor_payload` = Σ store bytes."""
+    mode = packet.get('mode'); counts = QWEN_T6_RECORDS.get(b['family']); snapshots = QWEN_T6_SNAPSHOTS.get(mode)
+    require(counts is not None and snapshots is not None, 'frozen Qwen continuation mode and family counts')
+    same_named(plan, ('continuation',) + snapshots, 'continuation stores by mode')
+    require(plan['completion_line'] == 'Q1_QWEN_RECOVERY_CONTINUATION_COMPLETE mode=%s lanes=4 rows_per_lane=80 first64_logits=false whole_q1=false' % mode and extent['lanes'] == [0, 1, 2, 3], 'verbatim source completion line; four lanes')
+    t6 = mode == 'CancelledThenRecovered'
+    require(execution['schema'] == 'hf2q.q1.qwen-recovery-continuation.v1' and execution['mode'] == mode and execution['calls'] == qwen_calls(mode), 'receipt calls = require_calls order')
+    require(execution['captured_rows_per_lane'] == 80 and execution['cancelled_unpublished_rows_per_lane'] == (64 if t6 else 0) and execution['first64_logits_captured'] is False and execution['endpoint_scope'] == [64, 144] and execution['active_cache_boundaries'] == [128, 144], 'rows 64..143 per lane, caches at 128 and 144')
+    tail = stores['continuation']
+    require(execution['trace_records'] == len(tail['captured']) == counts['continuation'], 'continuation = trace_records = source count')
+    require(logit_rows(tail) == {('agent-' + str(l), p) for l in range(4) for p in range(64, 144)}, 'continuation logits rows 64..143 x 4 lanes')
+    require(all(len(stores[n]['captured']) == counts['snapshot'] for n in snapshots), 'every active64 snapshot store = source count')
+    require(execution['planned_tensor_payload'] == sum(s['bytes'] for s in stores.values()), 'planned payload = captured bytes of every store')
+    if t6:
+        recovery = execution['recovery']; proof = execution['recovery_proof']
+        require(type(recovery) is list and len(recovery) == 4 and all(x['recovered_cursor'] == 64 and x['scheduler_in_flight_after'] == 0 and x['client_closed_after_actual_advance'] is True for x in recovery), 'four actual cancel+recover owners')
+        # Comparison has no record count: its compared bytes bind it to the complete 64-snapshot stores.
+        require(type(proof) is dict and proof['disposition'] == 'ExactEqual' and proof['compared_bytes'] == stores['before']['bytes'] == stores['recovered']['bytes'] and 'prefix_preparation' not in execution, 'in-process recovery proof ExactEqual over the whole snapshot')
+    else:
+        prep = execution['prefix_preparation']
+        require(type(prep) is list and len(prep) == 4 and all(x['cancellation_performed'] is False and x['retained_cursor'] == 64 and x['scheduler_in_flight_after'] == 0 for x in prep) and execution['recovery'] == [] and execution['recovery_proof'] is None, 'four never-cancelled prefix64 preparations')
+    return dict(mode=mode, stores={n: len(s['captured']) for n, s in stores.items()}, trace_records=execution['trace_records'])
+
+
+def qwen_t5_receipt(plan, packet, execution, first_fork):
+    mode = packet.get('mode')
+    require(packet.get('target_layers') is None and 'target_layer_localizer' not in execution and packet.get('first_fork') == (True if first_fork else None) and ('first_fork' in execution) == first_fork, 'explicit phase / first-fork packet pairing')
+    require(execution['schema'] == QWEN_T5_SCHEMA and execution['mode'] == mode and execution['error'] is None and execution['forced_proposals'] is (mode == 'ForcedProposal'), 'Qwen T5 receipt for the packet mode')
+    return mode
+
+
+def check_qwen_t5_phase(out, b, case, plan, packet, extent, execution, stores, identity, policy):
+    """Qwen T5 phases (#653 §1.5). Preparation: no store, the frozen file + preparation-only receipt. OrdinaryBaseline /
+    ForcedProposal: `committed` (+ `raw-verifier` forced) bound to `committed_records` / `raw_records` and the source counts;
+    0 / 4 K3 transitions; the runner's validate_complete input rows and 17 decisions per lane."""
+    mode = qwen_t5_receipt(plan, packet, execution, False); counts = QWEN_T5_RECORDS.get(b['family']); forced = mode == 'ForcedProposal'
+    require(counts is not None and mode in ('Preparation', 'OrdinaryBaseline', 'ForcedProposal') and extent['lanes'] == [0, 1, 2, 3], 'Qwen T5 family counts and phase')
+    require(plan['completion_line'] == 'Q1_QWEN_T5_PHASE_COMPLETE mode=%s logical_lanes=4 explicit_MTP_selector=true forced_proposal=%s whole_q1=false' % (mode, 'true' if forced else 'false'), 'verbatim source completion line')
+    rows = [128] + list(range(131, 144)) if forced else list(range(128, 144))
+    require(execution['ordinary_input_positions'] == [rows] * 4 and type(execution['canonical_decisions']) is list and len(execution['canonical_decisions']) == 4 and all(len(d) == 17 for d in execution['canonical_decisions']), 'ordinary input rows and seed+16 decisions per lane')
+    if mode == 'Preparation':
+        frozen = out / 'output/frozen-workload.json'; prep = json.loads((out / 'output/preparation-only.json').read_text())
+        require(execution['status'] == 'CompleteWorkloadPreparationNotComparable' and plan['stores'] == {} and extent['expected_stores'] == {} and execution['committed_records'] is None and execution['raw_records'] is None and execution['actual_transitions'] == [], 'storeless preparation receipt')
+        require(prep['frozen_file_sha256'] == sha(frozen) and prep['comparable_acquisition'] is False and prep['requires_independent_review'] is True, 'frozen workload + preparation-only receipt, pending independent review')
+        return dict(mode=mode, frozen_file_sha256=prep['frozen_file_sha256'], preparation_sha256=sha(out / 'output/preparation-only.json'))
+    names = ('committed', 'raw-verifier') if forced else ('committed',); same_named(plan, names, 'Qwen T5 phase stores by mode')
+    require(execution['status'] == 'CompleteScopedAcquisition', 'complete scoped acquisition')
+    require(execution['committed_records'] == len(stores['committed']['captured']) == counts['committed'] and execution['committed_payload_plan'] == stores['committed']['bytes'], 'committed = committed_records = source count, bytes = plan')
+    if forced:
+        require(execution['raw_records'] == len(stores['raw-verifier']['captured']) == counts['raw-verifier'] and execution['raw_payload_plan'] == stores['raw-verifier']['bytes'], 'raw-verifier = raw_records = source count, bytes = plan')
+    else:
+        require(execution['raw_records'] is None, 'baseline has no raw-verifier store')
+    transitions = execution['actual_transitions']
+    require(type(transitions) is list and [t['lane'] for t in transitions] == ([0, 1, 2, 3] if forced else []), 'one actual K3 transition per lane (forced) or none')
+    return dict(mode=mode, stores={n: len(stores[n]['captured']) for n in names}, transitions=len(transitions))
+
+
+def check_qwen_t5_first_fork(out, b, case, plan, packet, extent, execution, stores, identity, policy):
+    """Qwen T5 first fork (#653 §1.5 T5-A3): agent 0 only, one logical lane; `committed` (+ `raw-verifier`) bound to the
+    receipt counts and every side-effect capture store bound to its `first_fork.capture_stores[name].records`;
+    `case_payload_plan` = Σ store bytes."""
+    mode = qwen_t5_receipt(plan, packet, execution, True); forced = mode == 'ForcedProposal'
+    require(b['family'] in ('qwen36', 'qwen38') and mode in ('OrdinaryBaseline', 'ForcedProposal'), 'Qwen first-fork arm')
+    captures = ('target-before-mtp', 'target-after-mtp') + (('post-draft-discard129',) if forced else ())
+    same_named(plan, ('committed',) + (('raw-verifier',) if forced else ()) + captures, 'first-fork stores by arm')
+    require(plan['completion_line'] == 'Q1_QWEN_T5_FIRST_FORK_COMPLETE mode=%s logical_lanes=1 agent=0 cursor=131 float_policy=Unspecified whole_q1=false' % mode, 'verbatim source completion line')
+    require(execution['status'] == 'CompleteFirstForkDiagnosticNotQ1Qualified', 'complete first-fork diagnostic')
+    ff = execution['first_fork']
+    require(ff['logical_lanes_executed'] == 1 and ff['logical_lane'] == 0 and ff['physical_slots'] == 1 and ff['all4lane_execution'] is False and extent['lanes'] == [0] and all(x['at']['agent'] == 'agent-0' for s in stores.values() for x in s['captured']), 'agent 0 only')
+    cs = ff['capture_stores']
+    require(type(cs) is dict and set(cs) == set(captures) and all(cs[n]['records'] == len(stores[n]['captured']) and cs[n]['errors'] == [] for n in captures), 'capture_stores counts = their stores')
+    require(execution['committed_records'] == len(stores['committed']['captured']) and execution['raw_records'] == (len(stores['raw-verifier']['captured']) if forced else None), 'committed/raw-verifier = receipt counts')
+    require(ff['case_payload_plan'] == sum(s['bytes'] for s in stores.values()), 'case payload plan = captured bytes of every store')
+    inputs = packet.get('first_fork_inputs')
+    require(type(inputs) is dict and ff['reviewed_inputs'] == dict(preparation_sha256=inputs['preparation']['sha256'], review_sha256=inputs['review']['sha256'], review_schema=QWEN_FROZEN_REVIEW_SCHEMA), 'first fork ran on the packet-bound reviewed preparation')
+    return dict(mode=mode, stores={n: len(s['captured']) for n, s in stores.items()})
+
+
+def gemma_frozen(packet):
+    work = load(packet['greedy_workload'], 'bound reviewed greedy144 workload')
+    require(work['family'] == 'Gemma4' and len(work['lanes']) == 4 and all(len(l) == 144 for l in work['lanes']), 'four144 Gemma workload')
+    return work['lanes']
+
+
+def gemma_t5_decisions(arm, decisions, frozen):
+    """Per-lane decisions of one complete arm against the frozen lineage; returns the accepted count a per lane
+    (None for the ordinary arm). N-gram: accepted/fallback follow accept_prefix_argmax over the injected drafts."""
+    require(type(decisions) is list and [d.get('lane') for d in decisions] == [0, 1, 2, 3], 'one decision record per lane, in order')
+    accepted = []
+    for d in decisions:
+        w = frozen[d['lane']]; t = d['transaction']
+        require(set(d) == {'lane', 'initial_argmax', 'frozen_128', 'initial_equals_frozen', 'decode_inputs', 'decode_argmax', 'transaction'} and u32(d['initial_argmax']) and d['frozen_128'] == w[128] and d['initial_equals_frozen'] is (d['initial_argmax'] == w[128]), 'initial decision recorded against frozen[128]')
+        if arm == 'OrdinaryGlobal':
+            require(t is None, 'ordinary arm has no transaction'); a = None; start = 128
+        else:
+            require(type(t) is dict and set(t) == {'proposer_ran', 'proposed', 'injected', 'injected_origin', 'verifier_argmax', 'accepted', 'rejected', 'fallback', 'rollback_cursor'} and d['initial_equals_frozen'] is True, 'closed transaction from the frozen initial decision')
+            inj = t['injected']; v = t['verifier_argmax']; a = t['accepted']
+            require(t['proposer_ran'] is True and type(t['proposed']) is list and all(u32(x) for x in t['proposed']) and t['injected_origin'] == GEMMA_INJECTED_ORIGIN, 'production proposer ran; injected diagnostic origin')
+            require(type(inj) is list and len(inj) == 3 and inj[:2] == w[129:131] and u32(inj[2]) and inj[2] != w[131] and inj[2] not in GEMMA_EOS, 'injected [f129, f130, non-EOS mut131]')
+            require(type(v) is list and len(v) == 4 and all(u32(x) for x in v), 'four verifier argmax rows')
+            lead = 0
+            while lead < 3 and v[lead] == inj[lead]: lead += 1
+            require(type(a) is int and a in (0, 1, 2) and a == lead and t['rejected'] == 3 - a and t['fallback'] == v[a] and t['rollback_cursor'] == 129 + a, 'a in {0,1,2} = leading matches, rejected 3-a, fallback, cursor 129+a')
+            start = 129 + a
+        require(d['decode_inputs'] == [dict(position=p, token=w[p]) for p in range(start, 144)], 'teacher-forced decode inputs = frozen')
+        require(type(d['decode_argmax']) is list and [x.get('position') for x in d['decode_argmax']] == list(range(start, 144)) and all(set(x) == {'position', 'token'} and u32(x['token']) for x in d['decode_argmax']), 'one decision per forward_decode row')
+        accepted.append(a)
+    return accepted
+
+
+def gemma_t5_arm(out, b, plan, packet, extent, execution, stores, identity, schema, extra_stores):
+    """Shared Gemma T5 arm rules (C2): receipt, per-store counts, logit layouts, decisions and the routing bank."""
+    arm = packet.get('arm'); names = GEMMA_T5_STORES.get(arm)
+    require(b['family'] == 'gemma' and names is not None and plan['completion_line'] is None, 'Gemma T5 arm with the Σ completion line')
+    require(plan['stores'] == {**{n: n for n in names}, **extra_stores}, 'Gemma T5 stores for this arm')
+    require(execution['schema'] == schema and execution['arm'] == arm and execution['status'] == 'CompleteScopedAcquisition' and execution['error'] is None and execution['lanes'] == extent['lanes'] == packet['lanes'] == [0, 1, 2, 3] and execution['class_b_refusal'] is None and execution['routing_witness'] == 'routing-witness.jsonl', 'complete Gemma T5 receipt for this arm')
+    counts = {n: len(stores[n]['captured']) for n in names}
+    require(execution['stores'] == counts == {n: GEMMA_T5_RECORDS[n] for n in names}, 'per-store counts = receipt = source manifest')
+    lanes = ['agent-' + str(l) for l in range(4)]
+    require(logit_rows(stores['prefork']) == {(l, 127) for l in lanes} and logit_rows(stores['committed']) == {(l, p) for l in lanes for p in range(128, 144)}, 'prefork row 127, committed rows 128..143, four lanes')
+    if 'raw-verifier' in names:
+        raw = stores['raw-verifier']['captured']
+        require(sorted(x['at']['agent'] for x in raw) == lanes and all(x['at']['stage'] == 'SpecVerifierLogits' and x['at']['logical_step'] == 128 and x['at']['layer'] == LOGIT_LAYER and x['at']['logical_row_start'] == 0 and x['at']['segment'] == 0 and x['shape'] == [4, GEMMA_VOCAB] for x in raw), 'one [4, vocab] verifier record per lane')
+    frozen = gemma_frozen(packet); accepted = gemma_t5_decisions(arm, execution['decisions'], frozen)
+    witness = b.get('routing_witness')
+    require(type(witness) is dict and witness.get('layers') == GEMMA_ROUTING_LAYERS and type(packet.get('routing_witness')) is dict, 'T5 routing witness on in bindings and packet')
+    layers = range(GEMMA_ROUTING_LAYERS)
+    if arm == 'OrdinaryGlobal':
+        expected = {('Canonical', l, p, k) for l in range(4) for p in range(144) for k in layers}
+    else:
+        expected = {(ns, l, p, k) for l in range(4) for ns, rows in (('T5Initial', range(128)), ('T5Verify', range(132)), ('T5Continuation', range(129 + accepted[l], 144))) for p in rows for k in layers}
+    seen = routing_bank(out, identity, witness, {k[0] for k in expected}, 'Ordinary' if arm == 'OrdinaryGlobal' else 'Transaction')
+    require(seen == expected, 'exact per-lane T5 routing rows x layers')
+    return arm, accepted, dict(arm=arm, stores=counts, accepted=accepted, initial_argmax=[d['initial_argmax'] for d in execution['decisions']], initial_equals_frozen=[d['initial_equals_frozen'] for d in execution['decisions']], routing_rows=len(seen))
+
+
+def check_gemma_t5_ordinary(out, b, case, plan, packet, extent, execution, stores, identity, policy):
+    """Gemma T5 OrdinaryGlobal arm (#665 §2.3): prefork 4204 + committed 4264, teacher-forced inputs 128..143, the initial
+    argmax recorded against frozen[128] (a cross-route Class B observation, never a refusal), Canonical routing bank."""
+    arm, _, evidence = gemma_t5_arm(out, b, plan, packet, extent, execution, stores, identity, GEMMA_T5_PHASE_SCHEMA, {})
+    require(arm == 'OrdinaryGlobal', 'ordinary arm'); return evidence
+
+
+def sibling_execution(b, case, check):
+    """The unique other multistore case of these bindings carrying `check`; it must be complete and its receipt must
+    embed exactly its output/execution.json."""
+    names = [n for n, c in b['cases'].items() if n != case and c.get('kind') == 'multistore' and check in c.get('checks', ())]
+    require(len(names) == 1, 'exactly one sibling ' + check + ' case in these bindings')
+    root = Path(b['cases'][names[0]]['out']); receipt = json.loads((root / 'receipt.json').read_text()); path = root / 'output/execution.json'
+    execution = json.loads(path.read_text())
+    require(receipt['case_complete'] is True and receipt['helper_evidence']['execution'] == execution, names[0] + ' complete; its receipt binds its execution.json')
+    return names[0], path, execution
+
+
+def check_gemma_t5_ngram(out, b, case, plan, packet, extent, execution, stores, identity, policy):
+    """Gemma T5 NgramTransaction arm (#665 §2.3): four injected transactions, a/fallback/cursor 129+a, teacher-forced
+    inputs 129+a..143, prefork 4204 + committed 4264 + raw-verifier 4, T5Initial/T5Verify/T5Continuation bank.
+
+    Cross-case (G5-A2, initial argmax equal to the ordinary arm): the reference is the same bindings' unique sibling
+    `gemma_t5_ordinary` case (same composition), which must be complete; its receipt.json must embed its execution.json
+    verbatim, and that receipt's per-lane initial argmax must equal this arm's. No packet field is involved."""
+    arm, accepted, evidence = gemma_t5_arm(out, b, plan, packet, extent, execution, stores, identity, GEMMA_T5_PHASE_SCHEMA, {'raw-verifier': 'raw-verifier'})
+    name, path, ordinary = sibling_execution(b, case, 'gemma_t5_ordinary')
+    require(arm == 'NgramTransaction' and ordinary['schema'] == GEMMA_T5_PHASE_SCHEMA and ordinary['arm'] == 'OrdinaryGlobal' and ordinary['status'] == 'CompleteScopedAcquisition', 'complete ordinary sibling arm')
+    require([d['initial_argmax'] for d in ordinary['decisions']] == evidence['initial_argmax'], 'initial argmax equal to the ordinary arm (same call)')
+    return dict(evidence, ordinary_case=name, ordinary_execution_sha256=sha(path))
+
+
+def check_gemma_t5_localizer(out, b, case, plan, packet, extent, execution, stores, identity, policy):
+    """Gemma T5 verifier-route localizer arm (#665 §2.6): the matching T5 arm's rules plus a nested `stages` store whose
+    extent is the bound case manifest (packet `manifest` = case `manifest`; the Rust admit binds Plan -> manifest), stage
+    coordinates per arm (ordinary: prefill rows 0..127 segment 0, decode 128..143; n-gram: verify rows 0..131 segment 1,
+    decode 129+a..143 segment 0; step 0), and the packet's `t5_receipts` (both sha-bound T5 execution.json files).
+    Branch N: frozen `accepted` = the T5 n-gram a. Branch P: OrdinaryGlobal only, `accepted` null, the bound n-gram
+    receipt carries the row-127 Class B refusal."""
+    arm, accepted, evidence = gemma_t5_arm(out, b, plan, packet, extent, execution, stores, identity, GEMMA_T5_LOCALIZER_SCHEMA, {'stages': 'stages'})
+    stage = packet.get('stage_localizer'); branch = packet.get('branch'); passed = packet.get('pass'); manifest = b['cases'][case].get('manifest')
+    require(manifest is not None and packet.get('manifest') == manifest, 'stage extent from the bound case manifest')
+    require(type(stage) is dict and set(stage) == {'rerun_id', 'layers', 'prefill_stages', 'decode_stages', 'host_payload_limit', 'accepted'} and branch in ('N', 'P') and passed in (1, 2), 'closed localizer plan, branch and pass')
+    staged = stores['stages']
+    require(execution['plan'] == stage and execution['branch'] == branch and execution['pass'] == passed and execution['stage_records'] == len(staged['captured']) and staged['bytes'] <= stage['host_payload_limit'], 'receipt echoes plan, branch, pass; stage count and bytes')
+    receipts = packet.get('t5_receipts')
+    require(type(receipts) is dict and set(receipts) == {'ordinary', 'ngram'}, 'both T5 receipts bound')
+    ordinary = load(receipts['ordinary'], 'bound T5 ordinary receipt'); ngram = load(receipts['ngram'], 'bound T5 n-gram receipt')
+    require(ordinary['schema'] == ngram['schema'] == GEMMA_T5_PHASE_SCHEMA and ordinary['arm'] == 'OrdinaryGlobal' and ordinary['status'] == 'CompleteScopedAcquisition' and ngram['arm'] == 'NgramTransaction', 'T5 receipts of both arms')
+    if branch == 'N':
+        a = [d['transaction']['accepted'] for d in ngram['decisions']]
+        require(ngram['status'] == 'CompleteScopedAcquisition' and ngram['class_b_refusal'] is None and stage['accepted'] == a and (arm == 'OrdinaryGlobal' or accepted == a), 'branch N: frozen accepted = the T5 n-gram a')
+    else:
+        refusal = ngram['class_b_refusal']
+        require(arm == 'OrdinaryGlobal' and stage['accepted'] is None and ngram['status'] == 'FailedOrIncomplete' and type(refusal) is dict and refusal['row'] == 127 and refusal['reason'] == GEMMA_ROW127_REFUSAL, 'branch P: ordinary arm only, no accepted, bound row-127 refusal')
+    if arm == 'OrdinaryGlobal':
+        prefill = {(0, r) for r in range(128)}; decode = {(0, p) for p in range(128, 144)}; per_lane = [(prefill, decode)] * 4
+    else:
+        per_lane = [({(1, r) for r in range(132)}, {(0, p) for p in range(129 + a, 144)}) for a in accepted]
+    layers = set(stage['layers']); roles = (set(stage['prefill_stages']), set(stage['decode_stages'])); seen = set()
+    for x in staged['captured']:
+        at = x['at']; lane = int(at['agent'][len('agent-'):]); key = (at['segment'], at['logical_row_start'])
+        phase = [i for i in (0, 1) if key in per_lane[lane][i]]
+        require(at['logical_step'] == 0 and at['layer'] in layers and len(phase) == 1 and at['stage'] in roles[phase[0]], 'stage record in the plan layout for this arm')
+        seen.add((lane,) + key)
+    want = {(l,) + k for l in range(4) for i in (0, 1) if roles[i] for k in per_lane[l][i]}
+    require(seen == want, 'every planned (lane, segment, row) captured')
+    refusal = ngram['class_b_refusal']
+    return dict(evidence, branch=branch, plan_pass=passed, stage_records=len(staged['captured']), stage_bytes=staged['bytes'], t5_receipts={k: v['sha256'] for k, v in receipts.items()}, ngram_class_b_refusal=refusal)
 
 
 # Closed registry of multistore check functions: (out, b, case, plan, packet, extent, execution, stores, identity, policy) -> evidence dict.
-MULTISTORE_CHECKS = {'gemma_loc4': check_gemma_loc4}
+MULTISTORE_CHECKS = {'gemma_loc4': check_gemma_loc4, 'qwen_t6_continuation': check_qwen_t6_continuation, 'qwen_t5_phase': check_qwen_t5_phase,
+                     'qwen_t5_first_fork': check_qwen_t5_first_fork, 'gemma_t5_ordinary': check_gemma_t5_ordinary,
+                     'gemma_t5_ngram': check_gemma_t5_ngram, 'gemma_t5_localizer': check_gemma_t5_localizer}
 
 
 def main():

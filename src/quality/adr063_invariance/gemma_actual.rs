@@ -17,10 +17,17 @@ pub(super) struct Packet {
     /// Warm live-resume kernel the loaded model must resolve; absent = VecHybrid.
     #[serde(default)] warm_live_kernel:WarmLiveKernel,
     /// Cohort stage localizer only: the stage plan, the lanes it covers and
-    /// every store's frozen record list (`endpoint`, `stages`).
+    /// every store's frozen record list (`endpoint`, `stages`), either inline
+    /// (`expected_stores`) or in the bound plan-only `stage_manifest` file.
     #[serde(default)] stage_localizer:Option<cohort::Plan>,
     #[serde(default)] lanes:Option<Vec<usize>>,
     #[serde(default)] expected_stores:Option<BTreeMap<String,Vec<ExpectedTensor>>>,
+    #[serde(default)] stage_manifest:Option<acquisition::FileBinding>,
+    /// Localizer mode; absent = the witness-ON cohort localizer.
+    #[serde(default)] localizer_mode:cohort::Mode,
+    /// Endpoint store this localizer's endpoint store must be `ExactEqual` to
+    /// (receipt only); DriftAll128 has none.
+    #[serde(default)] observer_effect_reference:Option<String>,
 }
 /// Gemma warm live-resume attention kernel (T1/T3/T6 64-row resumes and the
 /// localizer's `[64,64]` route). It is resolved once at model load and is not
@@ -36,8 +43,13 @@ pub(super) fn require_warm_kernel(declared:WarmLiveKernel,resolved:crate::infere
     Ok(resolved)
 }
 const ENDPOINT_PACKET_BYTES:usize=1024*1024;
-/// A localizer packet carries both frozen store lists (indent-2 JSON).
+/// An inline localizer packet carries both frozen store lists (indent-2 JSON);
+/// a plan-only one binds them in its `stage_manifest` file and keeps the 1 MiB
+/// endpoint quota.
 const LOCALIZER_PACKET_BYTES:usize=16*1024*1024;
+pub(super) fn file_safe(s:&str)->bool {
+    !s.is_empty() && s.len()<=64 && s.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'||b==b'_')
+}
 pub(super) fn preflight(p:&Packet,localizer:bool)->Result<()> {
     p.identity.validate().map_err(anyhow::Error::msg)?;p.workload.validate().map_err(anyhow::Error::msg)?;
     ensure!(p.execution_approved && p.identity.family==Family::Gemma4 && p.workload.family==Family::Gemma4,
@@ -49,19 +61,55 @@ pub(super) fn preflight(p:&Packet,localizer:bool)->Result<()> {
         "selected Gemma context/output profile required");
     ensure!(p.host_payload_limit>0 && p.host_payload_limit<=2*1024*1024*1024,
         "bounded explicit Gemma host payload required");
-    super::gemma_routing_witness::validate_budget(p.routing_witness.as_ref())?;
-    ensure!(p.stage_localizer.is_some()==localizer && p.lanes.is_some()==localizer && p.expected_stores.is_some()==localizer,
-        "stage-localizer packets run only under their own filters, and only they carry stores");
+    let drift=p.localizer_mode==cohort::Mode::DriftAll128;
+    ensure!(localizer || (!drift && p.observer_effect_reference.is_none()),
+        "localizer mode and observer-effect reference belong to stage-localizer packets only");
+    // DriftAll128 only: witness-OFF, so no witness budget/native check.
+    if !drift {super::gemma_routing_witness::validate_budget(p.routing_witness.as_ref())?;}
+    ensure!(p.stage_localizer.is_some()==localizer && p.lanes.is_some()==localizer
+        && (p.expected_stores.is_some()||p.stage_manifest.is_some())==localizer
+        && !(p.expected_stores.is_some() && p.stage_manifest.is_some()),
+        "stage-localizer packets run only under their own filters, and only they carry one store extent (inline or bound manifest)");
     if localizer {
         cohort::route(p.trajectory).map_err(anyhow::Error::msg)?;
-        ensure!(p.routing_witness.is_some(),"cohort localizer mirrors the witness-ON b3 endpoint stores");
+        p.localizer_mode.admit_native(&p.identity.native_version,env!("HF2Q_MLX_NATIVE_VERSION")).map_err(anyhow::Error::msg)?;
+        if drift {
+            ensure!(p.trajectory==Trajectory::T0ColdSerial,"DriftAll128 runs the serial All128 route only");
+            ensure!(p.routing_witness.is_none(),"DriftAll128 is witness-OFF: packet routing_witness must be null");
+            ensure!(p.observer_effect_reference.is_none(),"DriftAll128 has no observer-effect reference store");
+            ensure!(p.stage_localizer.as_ref().is_some_and(|plan|plan.decode_stages.is_empty()),
+                "DriftAll128 plan is prefill-only (decode_stages: [])");
+        } else {
+            ensure!(p.routing_witness.is_some(),"cohort localizer mirrors the witness-ON b3 endpoint stores");
+            ensure!(p.observer_effect_reference.as_deref().is_none_or(file_safe),"file-safe observer-effect reference store");
+        }
         ensure!(p.lanes.as_deref()==Some(&[0,1,2,3][..]),"cohort localizer covers all four workload lanes");
-        ensure!(p.expected_stores.as_ref().is_some_and(|s|s.len()==2 && s.contains_key(cohort::ENDPOINT_STORE)
-            && s.contains_key(cohort::STAGE_STORE)),"exactly the endpoint and stage stores");
+        if let Some(s)=&p.expected_stores {ensure!(s.len()==2 && s.contains_key(cohort::ENDPOINT_STORE)
+            && s.contains_key(cohort::STAGE_STORE),"exactly the endpoint and stage stores");}
         ensure!(std::env::var_os("HF2Q_PARALLEL_ENCODE").is_none(),
             "single-row decode stage hooks run on the owning thread only");
     }
     Ok(())
+}
+/// The localizer's frozen stage list: inline `expected_stores`, or the bound
+/// plan-only `stage_manifest` file, whose lanes and host bound must equal the
+/// packet's. Either way its endpoint list must be the source endpoint manifest;
+/// `cohort::admit` then requires the stage list to be the source manifest.
+pub(super) fn localizer_extent(p:&Packet,endpoint:&[ExpectedTensor])->Result<Vec<ExpectedTensor>> {
+    let mut stores=match (&p.expected_stores,&p.stage_manifest) {
+        (Some(stores),None)=>stores.clone(),
+        (None,Some(binding))=>{
+            let bytes=acquisition::checked_file(binding,cohort::MANIFEST_FILE_BYTES)?;
+            let m:cohort::ManifestFile=serde_json::from_slice(&bytes).context("plan-only stage manifest file")?;
+            ensure!(Some(&m.lanes)==p.lanes.as_ref() && m.host_payload_limit==p.host_payload_limit,
+                "stage manifest lanes/host_payload_limit differ from the packet's");
+            m.expected_stores
+        }
+        _=>anyhow::bail!("exactly one localizer store extent (inline or bound manifest)"),
+    };
+    ensure!(stores.len()==2 && stores.get(cohort::ENDPOINT_STORE).is_some_and(|e|e==endpoint),
+        "localizer stores are exactly endpoint (the source endpoint manifest) and stages");
+    stores.remove(cohort::STAGE_STORE).context("stage store extent")
 }
 pub(super) fn require_ordinary(t:Trajectory)->Result<()> {
     ensure!(matches!(t,Trajectory::T0ColdSerial|Trajectory::T1Resume64|Trajectory::T3Chunk64|
@@ -142,9 +190,11 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
     let mut raw=Vec::new();std::fs::File::open(path)?.take(quota as u64+1).read_to_end(&mut raw)?;
     ensure!(raw.len()<=quota,"Gemma packet quota");
     let p:Packet=serde_json::from_slice(&raw)?;preflight(&p,localizer)?;
+    ensure!(p.stage_manifest.is_none() || raw.len()<=ENDPOINT_PACKET_BYTES,"plan-only localizer packet quota");
     if let Some(t)=separate {ensure!(p.trajectory==t,"actual test filter/trajectory mismatch");}
     else {require_ordinary(p.trajectory)?;}
-    let recipe_for=|cfg:&crate::serve::config::Gemma4Config| if localizer {cohort::recipe(cfg)}
+    let drift=p.localizer_mode==cohort::Mode::DriftAll128;
+    let recipe_for=|cfg:&crate::serve::config::Gemma4Config| if localizer {cohort::recipe(cfg,p.localizer_mode)}
         else {selected_recipe(cfg,p.routing_witness.is_some())};
     let scope=acquisition::Scope::begin(&p.acquisition,&p.identity,&p.workload,&p.model,&p.output,&raw)?;
     let header=acquisition::open_model(&p.model)?;
@@ -156,23 +206,22 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
     let expected=endpoint_expected(&cfg,p.trajectory)?;
     let bytes=payload(&expected)?;
     ensure!(bytes<=p.host_payload_limit,"Gemma payload exceeds pre-load bound");
-    let witness=super::gemma_routing_witness::PAYLOAD_BYTES+super::gemma_routing_witness::METADATA_BYTES
-        +super::gemma_routing_witness::CPU_LEDGER_BYTES;
-    if p.routing_witness.is_some(){ensure!(bytes+witness<=p.host_payload_limit,
-        "routing+metadata+CPU ledger must join pre-load host bound");}
-    // Cohort localizer: both frozen store lists must be the source manifests,
-    // and endpoint + routing + stage bytes join the one packet bound.
+    // Zero in DriftAll128, whose packet has no witness budget.
+    let witness=if p.routing_witness.is_some() {super::gemma_routing_witness::PAYLOAD_BYTES
+        +super::gemma_routing_witness::METADATA_BYTES+super::gemma_routing_witness::CPU_LEDGER_BYTES} else {0};
+    ensure!(bytes+witness<=p.host_payload_limit,"routing+metadata+CPU ledger must join pre-load host bound");
+    // Localizer: both frozen store lists (inline or bound manifest) must be the
+    // source manifests, and endpoint + routing + stage bytes join the one bound.
     let stage_root=p.output.join(cohort::STAGE_STORE);
-    let (stage_plan,mut stage_targets,stage_bytes)=match (&p.stage_localizer,&p.expected_stores) {
-        (Some(plan),Some(stores))=>{
-            ensure!(stores[cohort::ENDPOINT_STORE]==expected,"packet endpoint store differs from the source endpoint manifest");
-            let frozen=&stores[cohort::STAGE_STORE];
-            let (targets,stage_bytes)=cohort::admit(&cfg,plan,frozen).map_err(anyhow::Error::msg)?;
+    let (stage_plan,mut stage_targets,stage_bytes)=match &p.stage_localizer {
+        Some(plan)=>{
+            let frozen=localizer_extent(&p,&expected)?;
+            let (targets,stage_bytes)=cohort::admit(&cfg,plan,&frozen).map_err(anyhow::Error::msg)?;
             ensure!(bytes+witness+plan.host_payload_limit<=p.host_payload_limit,
                 "endpoint+routing+stage payload must join the packet host bound");
-            (Some((plan,frozen.clone())),Some(targets),stage_bytes)
+            (Some((plan,frozen)),Some(targets),stage_bytes)
         }
-        _=>(None,None,0),
+        None=>(None,None,0),
     };
     let records=expected.len();
     let mut store=Store::new(&p.output,p.identity.clone(),p.trajectory.label().into(),expected,
@@ -197,14 +246,18 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
             .map_err(anyhow::Error::msg)?;
         if p.stage_localizer.as_ref().is_some_and(|plan|plan.prefill_stages.iter().chain(&plan.decode_stages)
             .any(|s|matches!(s,Stage::RouterLogits|Stage::RouterIds|Stage::RouterWeights))) {
-            stages.missing_capability("Gemma actual native post-softmax/renormalized selection kth+1 GPU score is not a captured stage output; the routing witness carries the selection-domain margins");
+            stages.missing_capability(if drift {"Gemma actual native post-softmax/renormalized selection kth+1 GPU score is not a captured stage output; DriftAll128 is witness-OFF and carries no selection-domain margins"}
+                else {"Gemma actual native post-softmax/renormalized selection kth+1 GPU score is not a captured stage output; the routing witness carries the selection-domain margins"});
         }
     }
     model.provision_multi_seq_kv_for_slot_aware(4)?;
     ensure!(model.multi_seq_kv_hybrid.is_some() && model.multi_seq_kv_dense.is_none()
         && model.multi_seq_kv_mlx.is_none(),"selected Hybrid only; other actual legs require explicit coverage");
-    let routing_mode=if p.trajectory==Trajectory::T6CancelRestore {super::gemma_routing_witness::Mode::Cancelled}else{super::gemma_routing_witness::Mode::Ordinary};
-    let _routing=super::gemma_routing_witness::install(model.ctx.executor.device(),&p.output,&p.identity,&observed,routing_mode,p.routing_witness.as_ref())?;
+    // DriftAll128 never installs the witness: routing comes from the production dispatch.
+    let _routing=if drift {None} else {
+        let routing_mode=if p.trajectory==Trajectory::T6CancelRestore {super::gemma_routing_witness::Mode::Cancelled}else{super::gemma_routing_witness::Mode::Ordinary};
+        super::gemma_routing_witness::install(model.ctx.executor.device(),&p.output,&p.identity,&observed,routing_mode,p.routing_witness.as_ref())?
+    };
     let _capture=endpoint::install(store).map_err(anyhow::Error::msg)?;
     let _stages=match (stage_store,stage_targets.take()) {
         (Some(stages),Some(targets))=>Some(super::family::install(Family::Gemma4,stages,targets).map_err(anyhow::Error::msg)?),
@@ -278,7 +331,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
     let stage_trace=localizer.then(|| super::family::finish().map_err(anyhow::Error::msg));
     let trace=endpoint::finish().map_err(anyhow::Error::msg)?;result?;
     let stage_trace=stage_trace.transpose()?;
-    super::gemma_routing_witness::finish()?;
+    if !drift {super::gemma_routing_witness::finish()?;}
     ensure!(trace.coverage.errors.is_empty(),"Gemma endpoint extent incomplete");
     if let Some(stages)=&stage_trace {
         ensure!(stages.coverage.errors.is_empty(),"Gemma cohort stage coverage incomplete: {:?}",stages.coverage.errors);
@@ -304,8 +357,15 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
                 "packed prefill rows via gemma_endpoint::packed_owners (lane*128); batched decode row i = slot i = lane i"
             } else {"one serial-lane lease per lane around its single-sequence prefill and single-row decode"},
             "decode_hooks":if p.trajectory==Trajectory::T2ActualCohort {"batched_body.rs capture_batched"}else{"gpu_full_attn.rs single-row capture"},
-            "observer_effect_control":"exact of this endpoint store against the b3 endpoint store of the same trajectory",
-            "route_class":"ClassB packed-versus-All128; localization implies no fix"});
+            "route":p.localizer_mode.route_label(),"localizer_mode":p.localizer_mode,
+            "observer_effect_reference":p.observer_effect_reference,"routing_witness_installed":!drift,
+            "stage_extent_source":if p.stage_manifest.is_some() {"BoundStageManifest"} else {"PacketExpectedStores"},
+            "stage_manifest":p.stage_manifest.as_ref().map(|b|serde_json::json!({"path":b.path,"sha256":b.sha256})),
+            "observer_effect_control":if drift {
+                "none in process: DriftAll128 endpoint Logits row 127 is gated offline (exact) against the preparation's retained logits"
+            } else {"exact of this endpoint store against the observer_effect_reference endpoint store of the same trajectory"},
+            "route_class":if drift {"build-drift localization: witness-OFF production routing on both builds; localization implies no fix"}
+                else {"ClassB packed-versus-All128; localization implies no fix"}});
         report.as_object_mut().context("report object")?.extend(extra.as_object().context("stage receipt")?.clone());
     }
     let mut file=OpenOptions::new().create_new(true).write(true).mode(0o600).open(p.output.join("execution.json"))?;

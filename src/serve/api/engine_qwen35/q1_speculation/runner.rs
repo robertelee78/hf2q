@@ -29,6 +29,8 @@ struct Prefixes {
 struct Packet {
     execution_approved: bool,
     first_fork: Option<bool>,
+    /// Required exactly when `first_fork` is `Some(true)`; refused otherwise.
+    first_fork_inputs: Option<FirstForkInputs>,
     target_layers: Option<bool>,
     mode: Mode,
     acquisition: Binding,
@@ -36,6 +38,62 @@ struct Packet {
     input: FileBinding,
     model: PathBuf,
     output: PathBuf,
+}
+/// The reviewed frozen-input bindings of a first-fork packet: the retained
+/// `preparation-only.json` and its independent review receipt.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirstForkInputs {
+    preparation: FileBinding,
+    review: FileBinding,
+}
+/// Independent review receipt of one T5 frozen file, schema
+/// `hf2q.q1.qwen-t5-frozen-review.v1`, closed keys:
+/// `schema`, `verdict` ("Accepted" admits; any other string refuses),
+/// `frozen_file_sha256` (sha256 of the reviewed `frozen-workload.json`),
+/// `preparation_sha256` (sha256 of the reviewed `preparation-only.json`),
+/// `reviewer` (non-empty reviewer id) and `notes` (free text).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenReview {
+    schema: String,
+    verdict: String,
+    frozen_file_sha256: String,
+    preparation_sha256: String,
+    reviewer: String,
+    #[allow(dead_code)]
+    notes: String,
+}
+pub(super) const FROZEN_REVIEW_SCHEMA: &str = "hf2q.q1.qwen-t5-frozen-review.v1";
+/// Retained Q38 first-fork inputs; still pinned by the Qwen3.8-only target
+/// layer localizer, and the hosted control of the reviewed-input rule.
+pub(super) const Q38_RETAINED_FULL144_DIGEST: &str =
+    "aeaec06b8c893e4b2445f993a66a250ff3af0b595f54c749b1bd6790073eafbc";
+pub(super) const Q38_RETAINED_FROZEN_SHA256: &str =
+    "0a4af3ac5d6dacc843536004a5d92be1353e4dd4f0c45cca63d776a6cc92b82b";
+/// First-fork reviewed-input rule; pure so hosted controls exercise it.
+/// `inputs` = (preparation-only.json bytes, review receipt bytes), both
+/// already hash-bound by the packet. The frozen input must be the file the
+/// preparation wrote and the review accepted, and the identity digest the
+/// full-144 digest the preparation computed after generation.
+pub(super) fn check_first_fork_inputs(first_fork: bool, inputs: Option<(&[u8], &[u8])>,
+    input_sha256: &str, token_vectors_sha256: &str) -> Result<()> {
+    let Some((preparation, review)) = inputs else {
+        anyhow::ensure!(!first_fork, "first-fork packet requires reviewed preparation/review bindings");
+        return Ok(());
+    };
+    anyhow::ensure!(first_fork, "first_fork_inputs only on explicit first-fork packets");
+    let p: serde_json::Value = serde_json::from_slice(preparation)?;
+    anyhow::ensure!(p["frozen_file_sha256"] == input_sha256 &&
+        p["full144_digest_computed_after_generation"] == token_vectors_sha256 &&
+        p["comparable_acquisition"] == false,
+        "preparation receipt does not bind this frozen input/full144 digest as non-comparable preparation");
+    let r: FrozenReview = serde_json::from_slice(review)?;
+    anyhow::ensure!(r.schema == FROZEN_REVIEW_SCHEMA && r.verdict == "Accepted" &&
+        !r.reviewer.trim().is_empty() && r.frozen_file_sha256 == input_sha256 &&
+        r.preparation_sha256 == hash(preparation),
+        "independent review must accept exactly this frozen file and preparation");
+    Ok(())
 }
 fn read_bound(bound: &FileBinding) -> Result<Vec<u8>> {
     anyhow::ensure!(
@@ -124,16 +182,28 @@ fn run_inner(first_fork: bool,target_layers:bool) -> Result<()> {
         "explicit first-fork packet/test pairing; no old-entrypoint relabeling");
     anyhow::ensure!(packet.target_layers==if target_layers {Some(true)}else{None},
         "explicit target-layer packet/test pairing; no old capture relabeling");
+    anyhow::ensure!(packet.first_fork_inputs.is_some() == first_fork,
+        "first_fork_inputs required exactly on explicit first-fork packets");
     if first_fork {
-        anyhow::ensure!(packet.mode != Mode::Preparation && packet.identity.family == Family::Qwen38 &&
-            packet.identity.token_vectors_sha256 == "aeaec06b8c893e4b2445f993a66a250ff3af0b595f54c749b1bd6790073eafbc",
+        anyhow::ensure!(packet.mode != Mode::Preparation &&
+            matches!(packet.identity.family, Family::Qwen38 | Family::Qwen36),
+            "first fork runs only on a reviewed generated Qwen full144 workload");
+    }
+    if target_layers {
+        anyhow::ensure!(packet.identity.family == Family::Qwen38 &&
+            packet.identity.token_vectors_sha256 == Q38_RETAINED_FULL144_DIGEST,
             "only retained generated Q38 full144 workload; no input reselection");
     }
     output_preflight(&packet.output)?;
     let input = read_bound(&packet.input)?;
-    if first_fork { anyhow::ensure!(hash(&input) ==
-        "0a4af3ac5d6dacc843536004a5d92be1353e4dd4f0c45cca63d776a6cc92b82b",
+    if target_layers { anyhow::ensure!(hash(&input) == Q38_RETAINED_FROZEN_SHA256,
         "exact retained successful preparation file"); }
+    let first_fork_inputs = packet.first_fork_inputs.as_ref()
+        .map(|i| Ok::<_, anyhow::Error>((read_bound(&i.preparation)?, read_bound(&i.review)?)))
+        .transpose()?;
+    check_first_fork_inputs(first_fork,
+        first_fork_inputs.as_ref().map(|(p, r)| (p.as_slice(), r.as_slice())),
+        &hash(&input), &packet.identity.token_vectors_sha256)?;
     let (prefixes, frozen, vocab) = if packet.mode == Mode::Preparation {
         let p: Prefixes = serde_json::from_slice(&input)?;
         anyhow::ensure!(p.family == packet.identity.family, "family mismatch");
@@ -376,7 +446,10 @@ fn run_inner(first_fork: bool,target_layers:bool) -> Result<()> {
             "cache_boundaries":[129,131],"capture_stores":first_fork_traces,
             "case_payload_plan":super::first_fork::payload_plan(&cfg,packet.mode==Mode::ForcedProposal)?,
             "initial129_exact_comparison_pending":true,"float_policy":"Unspecified",
-            "all4lane_execution":false,"rejected_tail_baseline_claim":false});
+            "all4lane_execution":false,"rejected_tail_baseline_claim":false,
+            "reviewed_inputs":packet.first_fork_inputs.as_ref().map(|i|serde_json::json!({
+                "preparation_sha256":i.preparation.sha256,"review_sha256":i.review.sha256,
+                "review_schema":FROZEN_REVIEW_SCHEMA}))});
     }
     if target_layers {
         if let Some(metadata)=target_layer_metadata {

@@ -227,7 +227,8 @@ fn localizer_prep_config_is_optional_closed_and_route_invariant() {
 #[test]
 fn cohort_localizer_prep_emits_two_admissible_multistore_packets() {
     use super::super::{gemma_actual,gemma_cohort_localizer as cohort,gemma_localizer::PREFILL_STAGES,receipt::ExpectedTensor};
-    let block=serde_json::json!({"layers":[0,1],"prefill_stages":PREFILL_STAGES,"decode_stages":cohort::DECODE_STAGES});
+    let block=serde_json::json!({"layers":[0,1],"prefill_stages":PREFILL_STAGES,"decode_stages":cohort::DECODE_STAGES,
+        "observer_effect_reference":"gemma-t0-b3","packed_observer_effect_reference":"gemma-t2-b3"});
     let mut value=localizer_config(None);value["cohort_localizer"]=block.clone();
     let c:Config=serde_json::from_value(value.clone()).unwrap();
     let mut unknown=value;unknown["cohort_localizer"]["agent"]=serde_json::json!(0);
@@ -239,20 +240,30 @@ fn cohort_localizer_prep_emits_two_admissible_multistore_packets() {
         vec!["cohort-localizer-prepared.json","cohort-localizer-packet-all128.json","cohort-localizer-packet-packed.json"]);
     let prepared:serde_json::Value=serde_json::from_slice(&files[0].1).unwrap();
     assert_eq!(prepared["supervisor_case"]["kind"],"multistore");
-    // Defaults are the b3 endpoint stores of the same trajectories.
+    // The observer-effect references are prepare-config parameters, echoed per route.
     assert_eq!(prepared["routes"][0]["observer_effect_reference"],"gemma-t0-b3");
     assert_eq!(prepared["routes"][1]["observer_effect_reference"],"gemma-t2-b3");
+    assert_eq!((prepared["localizer_mode"].clone(),prepared["packet_form"].clone()),(serde_json::json!("Cohort"),serde_json::json!("Inline")));
+    assert_eq!(prepared["route"],cohort::ROUTE);
     let export=|block:serde_json::Value| {
         let mut v=localizer_config(None);v["cohort_localizer"]=block;
         let c:Config=serde_json::from_value(v).unwrap();
         cohort_localizer_export(&c,c.cohort_localizer.as_ref().unwrap(),&cfg(),&work,&"b".repeat(40),&"c".repeat(64),b"raw")
     };
     let mut named=block.clone();named["observer_effect_reference"]=serde_json::json!("gemma-t0-b5g");
-    let named:serde_json::Value=serde_json::from_slice(&export(named).unwrap()[0].1).unwrap();
-    assert_eq!(named["routes"][0]["observer_effect_reference"],"gemma-t0-b5g");
-    assert_eq!(named["routes"][1]["observer_effect_reference"],"gemma-t2-b3");
+    let named=export(named).unwrap();
+    let prepared_named:serde_json::Value=serde_json::from_slice(&named[0].1).unwrap();
+    assert_eq!(prepared_named["routes"][0]["observer_effect_reference"],"gemma-t0-b5g");
+    assert_eq!(prepared_named["routes"][1]["observer_effect_reference"],"gemma-t2-b3");
+    let packet:serde_json::Value=serde_json::from_slice(&named[1].1).unwrap();
+    assert_eq!(packet["observer_effect_reference"],"gemma-t0-b5g");
     let mut unsafe_name=block.clone();unsafe_name["packed_observer_effect_reference"]=serde_json::json!("../gemma-t2-b3");
     assert!(export(unsafe_name).is_err());
+    // No hardcoded reference: a Cohort export without one refuses.
+    for key in ["observer_effect_reference","packed_observer_effect_reference"] {
+        let mut missing=block.clone();missing.as_object_mut().unwrap().remove(key);
+        assert!(export(missing).is_err());
+    }
     let (_,stages,stage_bytes)=cohort::manifest(&cfg(),&[0,1],&PREFILL_STAGES,&cohort::DECODE_STAGES).unwrap();
     let mut config=None;
     for ((_,bytes),trajectory) in files[1..].iter().zip(["T0ColdSerial","T2ActualCohort"]) {
@@ -276,5 +287,128 @@ fn cohort_localizer_prep_emits_two_admissible_multistore_packets() {
         let p:gemma_actual::Packet=serde_json::from_value(packet).unwrap();
         gemma_actual::preflight(&p,true).unwrap();
     }
-    assert_eq!(config.unwrap(),serde_json::json!(acquisition::config_digest(&cohort::recipe(&cfg())).unwrap()));
+    assert_eq!(config.unwrap(),serde_json::json!(acquisition::config_digest(&cohort::recipe(&cfg(),cohort::Mode::Cohort)).unwrap()));
+}
+/// What the supervisor fills into a disabled packet before the actual filter runs.
+fn supervisor_fill(packet:&mut serde_json::Value) {
+    packet["execution_approved"]=serde_json::json!(true);packet["output"]=serde_json::json!("/x/out");
+    packet["identity"]["native_checksum"]=serde_json::json!("d".repeat(64));
+    packet["acquisition"]=serde_json::json!({"composition":{"path":"/x/c","sha256":"e".repeat(64)},
+        "independent_review":{"path":"/x/r","sha256":"f".repeat(64)}});
+}
+fn cohort_work()->Workload {
+    Workload {family:Family::Gemma4,vocab_size:262144,lanes:(0..4u32).map(|lane|(0..144).map(|i|lane*1000+i).collect()).collect()}
+}
+fn cohort_export(block:serde_json::Value)->Result<Vec<(String,Vec<u8>)>> {
+    let mut v=localizer_config(None);v["cohort_localizer"]=block;
+    let c:Config=serde_json::from_value(v).unwrap();
+    cohort_localizer_export(&c,c.cohort_localizer.as_ref().unwrap(),&cfg(),&cohort_work(),&"b".repeat(40),&"c".repeat(64),b"raw")
+}
+/// The plan-only packet and its bound manifest file, with the manifest copied
+/// to a private temp path (same sha) so the actual extent loader can read it.
+fn plan_only_admitted(packet:&[u8],manifest:&[u8],tag:&str)->(super::super::gemma_actual::Packet,std::path::PathBuf) {
+    let path=std::env::temp_dir().canonicalize().unwrap().join(format!("q1-gemma-plan-only-{tag}-{}.json",std::process::id()));
+    let _=std::fs::remove_file(&path);std::fs::write(&path,manifest).unwrap();
+    let mut packet:serde_json::Value=serde_json::from_slice(packet).unwrap();
+    assert_eq!(packet["stage_manifest"]["sha256"],hash(manifest));
+    packet["stage_manifest"]["path"]=serde_json::json!(path);supervisor_fill(&mut packet);
+    let p:super::super::gemma_actual::Packet=serde_json::from_value(packet).unwrap();
+    super::super::gemma_actual::preflight(&p,true).unwrap();
+    (p,path)
+}
+#[test]
+fn cohort_localizer_plan_only_form_binds_a_manifest_and_admits_the_same_extent() {
+    use super::super::{gemma_actual,gemma_cohort_localizer as cohort,gemma_localizer::PREFILL_STAGES,protocol::Trajectory,receipt::ExpectedTensor};
+    let block=serde_json::json!({"layers":[0,1],"prefill_stages":PREFILL_STAGES,"decode_stages":cohort::DECODE_STAGES,
+        "observer_effect_reference":"gemma-t0-b5g","packed_observer_effect_reference":"gemma-t2-b3"});
+    let inline=cohort_export(block.clone()).unwrap();
+    let mut plan_only=block.clone();plan_only["packet_form"]=serde_json::json!("PlanOnly");
+    let files=cohort_export(plan_only).unwrap();
+    assert_eq!(files.iter().map(|(n,_)|n.as_str()).collect::<Vec<_>>(),
+        vec!["cohort-localizer-prepared.json","cohort-localizer-packet-all128.json","cohort-localizer-manifest-all128.json",
+            "cohort-localizer-packet-packed.json","cohort-localizer-manifest-packed.json"]);
+    let mut bad=block;bad["packet_form"]=serde_json::json!("Manifest");
+    let mut v=localizer_config(None);v["cohort_localizer"]=bad;
+    assert!(serde_json::from_value::<Config>(v).is_err());
+    let prepared:serde_json::Value=serde_json::from_slice(&files[0].1).unwrap();
+    assert_eq!(prepared["packet_form"],"PlanOnly");
+    let (_,stages,_)=cohort::manifest(&cfg(),&[0,1],&PREFILL_STAGES,&cohort::DECODE_STAGES).unwrap();
+    for (i,(name,trajectory)) in [("all128",Trajectory::T0ColdSerial),("packed",Trajectory::T2ActualCohort)].into_iter().enumerate() {
+        let (packet,manifest)=(&files[1+2*i].1,&files[2+2*i].1);
+        assert_eq!(prepared["routes"][i]["manifest"]["sha256"],hash(manifest));
+        // Packet-size control: the plan-only packet is far below 1 MiB, the manifest below 64 MiB.
+        assert!(packet.len()+65536<=1024*1024 && manifest.len() as u64<=cohort::MANIFEST_FILE_BYTES);
+        let raw:serde_json::Value=serde_json::from_slice(packet).unwrap();
+        assert!(raw.get("expected_stores").is_none());
+        assert_eq!(raw["stage_manifest"]["path"],serde_json::json!(std::path::Path::new("/private/tmp/new-q1-gemma")
+            .join(format!("cohort-localizer-manifest-{name}.json"))));
+        // The manifest file is exactly the supervisor manifest-form extent.
+        let m:cohort::ManifestFile=serde_json::from_slice(manifest).unwrap();
+        assert_eq!((m.lanes.clone(),m.host_payload_limit),(vec![0,1,2,3],raw["host_payload_limit"].as_u64().unwrap()));
+        assert_eq!(m.expected_stores.keys().collect::<Vec<_>>(),vec!["endpoint","stages"]);
+        // Same packet otherwise as the inline form, which stays valid.
+        let mut inline_raw:serde_json::Value=serde_json::from_slice(&inline[1+i].1).unwrap();
+        let inline_stores=inline_raw.as_object_mut().unwrap().remove("expected_stores").unwrap();
+        assert_eq!(serde_json::to_value(&m.expected_stores).unwrap(),inline_stores);
+        let mut stripped=raw.clone();stripped.as_object_mut().unwrap().remove("stage_manifest");
+        assert_eq!(stripped,inline_raw);
+        let (p,path)=plan_only_admitted(packet,manifest,name);
+        let endpoint=gemma_actual::endpoint_expected(&cfg(),trajectory).unwrap();
+        let frozen:Vec<ExpectedTensor>=gemma_actual::localizer_extent(&p,&endpoint).unwrap();
+        assert_eq!(frozen,stages);
+        // A changed endpoint source manifest refuses.
+        assert!(gemma_actual::localizer_extent(&p,&endpoint[1..]).is_err());
+        // A changed manifest file no longer matches its bound sha.
+        let mut changed=manifest.clone();changed.push(b'\n');std::fs::write(&path,&changed).unwrap();
+        assert!(gemma_actual::localizer_extent(&p,&endpoint).is_err());
+        std::fs::remove_file(&path).unwrap();
+        // The inline form admits the same extent.
+        let mut inline_packet:serde_json::Value=serde_json::from_slice(&inline[1+i].1).unwrap();supervisor_fill(&mut inline_packet);
+        let inline_p:gemma_actual::Packet=serde_json::from_value(inline_packet).unwrap();
+        gemma_actual::preflight(&inline_p,true).unwrap();
+        assert_eq!(gemma_actual::localizer_extent(&inline_p,&endpoint).unwrap(),stages);
+    }
+    // A manifest whose lanes/host bound differ from the packet's refuses.
+    let mut m:serde_json::Value=serde_json::from_slice(&files[2].1).unwrap();m["host_payload_limit"]=serde_json::json!(1);
+    let changed=serde_json::to_vec_pretty(&m).unwrap();
+    let mut packet:serde_json::Value=serde_json::from_slice(&files[1].1).unwrap();
+    packet["stage_manifest"]["sha256"]=serde_json::json!(hash(&changed));
+    let (p,path)=plan_only_admitted(&serde_json::to_vec(&packet).unwrap(),&changed,"host");
+    assert!(gemma_actual::localizer_extent(&p,&gemma_actual::endpoint_expected(&cfg(),Trajectory::T0ColdSerial).unwrap()).is_err());
+    std::fs::remove_file(&path).unwrap();
+}
+#[test]
+fn cohort_localizer_drift_export_is_witness_off_all128_with_its_own_key() {
+    use super::super::{gemma_actual,gemma_cohort_localizer as cohort,gemma_localizer::PREFILL_STAGES,protocol::Trajectory};
+    let block=serde_json::json!({"layers":[0,1],"prefill_stages":PREFILL_STAGES,"decode_stages":[],
+        "mode":"DriftAll128","packet_form":"PlanOnly"});
+    // The drift export accepts the build's own native pin (no published-witness check).
+    let files=cohort_export(block.clone()).unwrap();
+    assert_eq!(files.iter().map(|(n,_)|n.as_str()).collect::<Vec<_>>(),
+        vec!["cohort-localizer-prepared.json","cohort-localizer-packet-all128.json","cohort-localizer-manifest-all128.json"]);
+    let prepared:serde_json::Value=serde_json::from_slice(&files[0].1).unwrap();
+    assert_eq!((prepared["localizer_mode"].clone(),prepared["route"].clone()),
+        (serde_json::json!("DriftAll128"),serde_json::json!("gemma-all128-stage-drift-witness-off-v1")));
+    assert_eq!(prepared["routes"].as_array().unwrap().len(),1);
+    assert_eq!(prepared["routes"][0]["observer_effect_reference"],serde_json::Value::Null);
+    assert_eq!(prepared["routes"][0]["routing_witness_charge"],0);
+    let drift_key=acquisition::config_digest(&cohort::recipe(&cfg(),cohort::Mode::DriftAll128)).unwrap();
+    assert_eq!(prepared["config_sha256"],drift_key);
+    assert_ne!(drift_key,acquisition::config_digest(&cohort::recipe(&cfg(),cohort::Mode::Cohort)).unwrap());
+    let raw:serde_json::Value=serde_json::from_slice(&files[1].1).unwrap();
+    assert_eq!((raw["trajectory"].clone(),raw["routing_witness"].clone(),raw["localizer_mode"].clone()),
+        (serde_json::json!("T0ColdSerial"),serde_json::Value::Null,serde_json::json!("DriftAll128")));
+    assert_eq!(raw["stage_localizer"]["rerun_id"],"drift-all128");
+    assert_eq!(raw["identity"]["native_version"],env!("HF2Q_MLX_NATIVE_VERSION"));
+    let endpoint=gemma_actual::endpoint_expected(&cfg(),Trajectory::T0ColdSerial).unwrap();
+    let (_,stages,stage_bytes)=cohort::manifest(&cfg(),&[0,1],&PREFILL_STAGES,&[]).unwrap();
+    assert_eq!(raw["host_payload_limit"],788765696+stage_bytes);
+    let (p,path)=plan_only_admitted(&files[1].1,&files[2].1,"drift");
+    assert_eq!(gemma_actual::localizer_extent(&p,&endpoint).unwrap(),stages);
+    std::fs::remove_file(&path).unwrap();
+    // Prefill-only and reference-free.
+    let mut decode=block.clone();decode["decode_stages"]=serde_json::json!(["Norm"]);
+    assert!(cohort_export(decode).is_err());
+    let mut named=block;named["observer_effect_reference"]=serde_json::json!("gemma-t0-b5g");
+    assert!(cohort_export(named).is_err());
 }

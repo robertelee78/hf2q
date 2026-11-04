@@ -2,6 +2,7 @@
 //! Rejected verifier tail has no ordinary-baseline counterpart and is audited separately.
 use super::{acquisition::{self, FileBinding}, compare, protocol::Workload,
     qwen_cache, qwen_speculation, receipt::*, store::{hash, PAGE_BYTES}};
+use crate::inference::models::qwen35::Qwen35Config;
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -143,26 +144,36 @@ fn raw_audit(root: &Path, trace: &Trace, frozen: &Frozen) -> Result<Value> {
         "all_payload_hashes_and_pages_verified":true,"all_f32_finite":true,
         "matching_baseline_claim":false,"rejected_tail_compared_to_baseline":false}))
 }
-fn run(packet: Packet) -> Result<()> {
-    ensure!(packet.schema == "hf2q.q1.t5-artifact-comparison.v1" &&
-        packet.identity.family == Family::Qwen38, "explicit selected Q38 T5 artifact packet");
-    packet.identity.validate().map_err(anyhow::Error::msg)?;
-    let prepared = value(&packet.prepared)?;
-    let cfg = qwen_cache::selected_header_fixture(true);
-    ensure!(prepared["actual_qwen_config_debug"] == format!("{cfg:?}") &&
-        prepared["actual_qwen_config_debug_sha256"] == hash(format!("{cfg:?}").as_bytes()),
-        "actual entire header config must match manifest fixture");
-    let recipe = acquisition::ConfigRecipe {family: Family::Qwen38, capacity:262144,
+/// Family-selected source header fixture and T5 recipe (Qwen38 | Qwen36 only).
+fn selected(family: Family) -> Result<(Qwen35Config, acquisition::ConfigRecipe<'static>)> {
+    ensure!(matches!(family, Family::Qwen38 | Family::Qwen36), "explicit selected Qwen T5 artifact family");
+    let cfg = qwen_cache::selected_header_fixture(family == Family::Qwen38);
+    let recipe = acquisition::ConfigRecipe {family, capacity:262144,
         slots:1, output_allowance:8192, cache_mode:"QwenTQ8:MTP-CoherentAuto",
         route:"qwen-t5-explicit-MTP-K3-forced-proposal-v1",
         actual_model_config_sha256:hash(format!("{cfg:?}").as_bytes())};
+    Ok((cfg, recipe))
+}
+fn frozen_check(frozen: &Frozen, family: Family, cfg: &Qwen35Config, digest: &str) -> Result<()> {
+    frozen.workload.validate().map_err(anyhow::Error::msg)?;
+    ensure!(frozen.workload.family == family && frozen.workload.vocab_size == cfg.vocab_size &&
+        acquisition::tokens_digest(&frozen.workload)? == digest,
+        "actual frozen full144 token digest/family");
+    Ok(())
+}
+fn run(packet: Packet) -> Result<()> {
+    ensure!(packet.schema == "hf2q.q1.t5-artifact-comparison.v1", "explicit selected T5 artifact packet");
+    let family = packet.identity.family;
+    packet.identity.validate().map_err(anyhow::Error::msg)?;
+    let prepared = value(&packet.prepared)?;
+    let (cfg, recipe) = selected(family)?;
+    ensure!(prepared["actual_qwen_config_debug"] == format!("{cfg:?}") &&
+        prepared["actual_qwen_config_debug_sha256"] == hash(format!("{cfg:?}").as_bytes()),
+        "actual entire header config must match manifest fixture");
     ensure!(acquisition::config_digest(&recipe)? == packet.identity.config_sha256,
         "actual source-defined T5 configuration recipe");
     let frozen: Frozen = serde_json::from_slice(&checked_file(&packet.frozen,1024*1024)?)?;
-    frozen.workload.validate().map_err(anyhow::Error::msg)?;
-    ensure!(frozen.workload.family == Family::Qwen38 && frozen.workload.vocab_size == cfg.vocab_size &&
-        acquisition::tokens_digest(&frozen.workload)? == packet.identity.token_vectors_sha256,
-        "actual frozen full144 token digest/family");
+    frozen_check(&frozen, family, &cfg, &packet.identity.token_vectors_sha256)?;
     let (br,b) = load(&packet.baseline)?;
     let (fr,f) = load(&packet.forced)?;
     let (rr,r) = load(&packet.raw_verifier)?;
@@ -236,5 +247,29 @@ fn phase_gate_rejects_wrong_cursor_or_missing_decision() {
     assert!(execution(&bad,true,&frozen,"bound").is_err());
 }
 
+#[test]
+fn q36_artifact_compare_selects_family_fixture_recipe_and_frozen_lineage() {
+    let (q36, r36) = selected(Family::Qwen36).unwrap();
+    let (q38, r38) = selected(Family::Qwen38).unwrap();
+    assert_eq!(format!("{q36:?}"), format!("{:?}", qwen_cache::selected_header_fixture(false)));
+    assert_eq!(format!("{q38:?}"), format!("{:?}", qwen_cache::selected_header_fixture(true)));
+    assert_eq!((r36.family, r38.family), (Family::Qwen36, Family::Qwen38));
+    assert_ne!(acquisition::config_digest(&r36).unwrap(), acquisition::config_digest(&r38).unwrap());
+    assert!(selected(Family::Gemma4).is_err() && selected(Family::Deepseek4).is_err());
+    // Same Q36 manifest the runner writes: 1840 committed, 20 raw.
+    assert_eq!(qwen_speculation::committed(&q36,262144).unwrap().len(), 1840);
+    assert_eq!(qwen_speculation::raw(&q36).len(), 20);
+    let frozen = |family| Frozen { workload:Workload {family,vocab_size:q36.vocab_size,
+        lanes:(0..4u32).map(|lane|vec![7+lane;144]).collect()}, final_carry:std::array::from_fn(|_|Carry {token:8,terminal:false}),
+        forced_bad_ids:[0;4] };
+    let good = frozen(Family::Qwen36);
+    let digest = acquisition::tokens_digest(&good.workload).unwrap();
+    assert!(frozen_check(&good, Family::Qwen36, &q36, &digest).is_ok());
+    assert!(frozen_check(&good, Family::Qwen38, &q36, &digest).is_err(), "family-matched frozen check");
+    let q38_frozen = frozen(Family::Qwen38);
+    let q38_digest = acquisition::tokens_digest(&q38_frozen.workload).unwrap();
+    assert!(frozen_check(&q38_frozen, Family::Qwen36, &q36, &q38_digest).is_err());
+    assert!(frozen_check(&good, Family::Qwen36, &q36, &"0".repeat(64)).is_err());
+}
 #[path = "t5_artifact_compare/raw_controls.rs"]
 mod raw_controls;
