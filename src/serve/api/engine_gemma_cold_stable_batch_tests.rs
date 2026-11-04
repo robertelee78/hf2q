@@ -10,6 +10,8 @@
 //! everything but one "agent id" token, print
 //! `GEMMA_JOINT_COLD_TURN0_SOURCE=synthetic`, and the receipt is not the
 //! official turn-0 record.
+//! `gemma_joint_cold_capture_turn0_prompts` (run first in the gate session)
+//! writes that file from a recorded four-agent run.
 //!
 //! * `gemma_joint_cold_prefill_matches_per_slot_bitwise`: transaction level,
 //!   per-slot arm (`prefill_seed`) then cohort arm (Phase B, anchors, Phase
@@ -35,6 +37,103 @@ use std::sync::atomic::Ordering;
 
 const MAX_DECODE: usize = 16;
 const DECODE_ROWS: usize = 16;
+
+/// Render a recorded chat-completions request as `chat_completions` does
+/// for a text Gemma 4 request (tools in scope, template-default thinking, no
+/// kwargs): the prompt with the generation cue, and its stable boundary,
+/// the cue-less render's length when that is a strict token prefix.
+fn render_recorded_turn(model: &GemmaLoadedModel, request: &std::path::Path) -> (Vec<u32>, usize) {
+    let wire = std::fs::read(request).unwrap_or_else(|e| panic!("read {request:?}: {e}"));
+    let req: crate::serve::api::schema::ChatCompletionRequest =
+        serde_json::from_slice(&wire).unwrap_or_else(|e| panic!("parse {request:?}: {e}"));
+    assert!(
+        req.chat_template_kwargs.is_none(),
+        "{request:?} carries chat_template_kwargs"
+    );
+    let template = model.chat_template.as_str();
+    let thinking = crate::serve::template_supports_enable_thinking(template);
+    let tokens = |add_generation_prompt| {
+        let rendered = render_chat_prompt_with_tools_generation_prompt(
+            template,
+            &req.messages,
+            req.tools.as_deref(),
+            thinking,
+            None,
+            add_generation_prompt,
+        )
+        .unwrap_or_else(|e| panic!("render {request:?}: {e:#}"));
+        model
+            .tokenizer
+            .encode(rendered, false)
+            .unwrap_or_else(|e| panic!("tokenize {request:?}: {e}"))
+            .get_ids()
+            .to_vec()
+    };
+    let prompt = tokens(true);
+    let stable = tokens(false);
+    assert!(
+        !stable.is_empty() && stable.len() < prompt.len() && prompt.starts_with(&stable),
+        "{request:?}: the cue-less render is not a strict prefix (no stable boundary)"
+    );
+    (prompt, stable.len())
+}
+
+#[test]
+#[ignore = "official Gemma 4 GGUF: write HF2Q_GEMMA_COLD_TURN0_PROMPTS from a recorded four-agent run"]
+fn gemma_joint_cold_capture_turn0_prompts() {
+    let run = PathBuf::from(
+        std::env::var("HF2Q_GEMMA_COLD_TURN0_RUN")
+            .expect("HF2Q_GEMMA_COLD_TURN0_RUN names a recorded run directory (…/<run>-hf2q-…)"),
+    );
+    let out = PathBuf::from(
+        std::env::var("HF2Q_GEMMA_COLD_TURN0_PROMPTS")
+            .expect("HF2Q_GEMMA_COLD_TURN0_PROMPTS names the JSON file to write"),
+    );
+    let loaded = LoadedModel::load(&load_options()).expect("load official Gemma GGUF");
+    let LoadedModel::Gemma(model) = &loaded else {
+        panic!("HF2Q_GEMMA4_GGUF is not a Gemma 4 artifact")
+    };
+    let mut lanes = Vec::new();
+    for agent in 0..4 {
+        let turn = run.join(format!("client/agent-{agent}/turn-0"));
+        let request = turn.join("request.json");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(turn.join("receipt.json")).expect("read turn-0 receipt.json"),
+        )
+        .expect("parse turn-0 receipt.json");
+        let recorded = receipt["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("receipt usage.prompt_tokens") as usize;
+        let (prompt, boundary) = render_recorded_turn(model, &request);
+        assert_eq!(
+            prompt.len(),
+            recorded,
+            "agent {agent}: rendered {} tokens, recorded prompt_tokens {recorded}",
+            prompt.len()
+        );
+        let request_sha256 = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(std::fs::read(&request).unwrap()))
+        };
+        println!(
+            "GEMMA_JOINT_COLD_TURN0_LANE agent={agent} prompt_tokens={} boundary={boundary} request_sha256={request_sha256}",
+            prompt.len()
+        );
+        lanes.push(serde_json::json!({
+            "agent": agent,
+            "request": request,
+            "request_sha256": request_sha256,
+            "prompt_tokens": prompt,
+            "stable_prompt_prefix_tokens": boundary,
+        }));
+    }
+    std::fs::write(&out, serde_json::to_vec_pretty(&lanes).unwrap())
+        .unwrap_or_else(|e| panic!("write {out:?}: {e}"));
+    println!(
+        "GEMMA_JOINT_COLD_TURN0_CAPTURED path={} lanes=4",
+        out.display()
+    );
+}
 
 /// One gate lane: `(prompt, S)`.
 type Shape = (Vec<u32>, usize);
