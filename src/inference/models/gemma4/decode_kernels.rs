@@ -115,7 +115,7 @@ pub(crate) struct AttentionEnv {
 }
 
 impl AttentionEnv {
-    fn from_environment() -> Self {
+    pub(crate) fn from_environment() -> Self {
         Self {
             batched_flash: std::env::var(BATCHED_FLASH_ENV).ok(),
             hybrid_nwg: std::env::var(HYBRID_NWG_ENV).ok(),
