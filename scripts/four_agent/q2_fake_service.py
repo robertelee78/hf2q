@@ -30,7 +30,7 @@ import coding_long_context
 from f2_semantic import CLOCK_ID, clock_ns, semantic_timing_v3
 import qwen38_n1_process as child
 from qwen38_n1_smoke import build_request, exchange, initial_messages
-from qwen38_n1_verdict import EXPECTED, loads, qualify
+from qwen38_n1_verdict import EXPECTED, Workflow, loads, max_tools, qualify
 import qwen_n4_live_smoke as coordinator
 
 HERE = Path(__file__).resolve().parent
@@ -55,8 +55,13 @@ class Timing:
         return Timing(self.first * factor, self.gap * factor, self.unary * factor)
 
 
-def tool_arguments(turn):
-    name, arguments = EXPECTED[turn]
+# A repaired agent (--repair-turns 1): its first run_tests ports fails (StubTools fail_first_test), then
+# one repair write and rerun, then the six steps resume; the summary is turn 8.
+REPAIR_SCRIPT = list(EXPECTED[:4]) + [("write_file", None), ("run_tests", {"target": "ports"})] + list(EXPECTED[4:])
+
+
+def tool_arguments(turn, repair=False):
+    name, arguments = (REPAIR_SCRIPT if repair else EXPECTED)[turn]
     return name, ({"path": "src/ports.rs", "content": FIXED_SOURCE} if arguments is None else arguments)
 
 
@@ -150,11 +155,12 @@ class FakeService:
     - `admit_together=N` holds the first N requests until all N are open (deterministic HTTP overlap).
     A rendezvous, admission or close wait that fails is recorded and fails `__exit__` loudly.
     `bursty=True` streams the low-frame shape of hf2q Gemma: one reasoning frame, a pause of
-    `timing.gap`, then the tool name and two argument frames back to back (four progress frames)."""
+    `timing.gap`, then the tool name and two argument frames back to back (four progress frames).
+    `repair=True` answers every agent with REPAIR_SCRIPT (one repair cycle; summary at turn 8)."""
 
     def __init__(self, timing=None, faults=None, model=MODEL, slots=None, bursty=False, rendezvous=(),
-                 admit_together=None):
-        self.timing, self.model, self.bursty = timing or Timing(), model, bursty
+                 admit_together=None, repair=False):
+        self.timing, self.model, self.bursty, self.repair = timing or Timing(), model, bursty, repair
         assert not (slots and rendezvous), "a slot-capped service cannot hold a rendezvous group open"
         self.slots = None if slots is None else threading.BoundedSemaphore(slots)
         self.acks = Path(tempfile.mkdtemp(prefix="q2-rendezvous-")) if rendezvous else None
@@ -272,11 +278,11 @@ class FakeService:
         if fault == "foreign_identity":
             other = coordinator.AGENTS[(coordinator.AGENTS.index(agent) + 1) % len(coordinator.AGENTS)]
             reasoning += f" Independent coding agent {other}, workload {coordinator.WORKLOAD_ID}."
-        if turn == 6:
+        if turn == (len(REPAIR_SCRIPT) if self.repair else 6):
             call, finish, content = None, "stop", "" if fault == "empty_final" else \
                 "Fixed parse_port: it rejects zero and values above 65535; ports and all tests passed."
         else:
-            name, arguments = tool_arguments(turn)
+            name, arguments = tool_arguments(turn, self.repair)
             if fault == "wrong_args":
                 arguments = {"path": "tests/ports.rs"} if name == "read_file" else {"target": "everything"}
             text = json.dumps(arguments, separators=(",", ":"))
@@ -358,7 +364,8 @@ class FakeService:
 class StubTools:
     """Tool-receipt shape the coordinator scores; no file system sandbox or compiler is involved."""
 
-    def __init__(self, root, workload=None, variant=None):
+    def __init__(self, root, workload=None, variant=None, fail_first_test=False):
+        self.fail_next_test = fail_first_test
         self.fixture = Path(root) / "tools" / "fixture"
         (self.fixture / "src").mkdir(parents=True)
         self.files = {"src/ports.rs": "pub fn parse_port(s: &str) -> u16 { s.parse().unwrap() }\n" if workload is None
@@ -384,20 +391,24 @@ class StubTools:
             self.save()
             result = f"wrote {len(args['content'].encode())} bytes"
         else:
-            receipt.update(target=args["target"], passed=True)
-            result = json.dumps({"target": args["target"], "passed": True, "source_sha256": self.source_hash,
-                                 "output": "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"})
+            passed, self.fail_next_test = not self.fail_next_test, False
+            receipt.update(target=args["target"], passed=passed)
+            result = json.dumps({"target": args["target"], "passed": passed, "source_sha256": self.source_hash,
+                                 "output": "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
+                                 if passed else "error[E0282]: type annotations needed"})
         receipt.update(result=result, source_sha256=self.source_hash, cleanup=True, status="Complete")
         self.receipts.append(receipt)
         return result
 
 
 def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", family="qwen", instance=None,
-                phase=None, release_ns=None, on_first_token=None, server_pid=SERVER_PID, acks=None, variant=None):
+                phase=None, release_ns=None, on_first_token=None, server_pid=SERVER_PID, acks=None, variant=None,
+                repair_turns=0):
     """The agent child's turn loop with stub tools; raises the actual client rejection on a bad response.
 
     `acks` (a rendezvous service's `acks` directory): acknowledge the first progress frame of every
-    streamed turn there, after the actual `exchange` stamped it."""
+    streamed turn there, after the actual `exchange` stamped it. `repair_turns=1` runs the child's
+    repair-turn Workflow with a first run_tests that fails (pair it with FakeService(repair=True))."""
     out = Path(out)
     out.mkdir(parents=True)
     workload = None if instance is None else coding_instances.select(instance)
@@ -425,8 +436,11 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
         summary["workload_variant"] = selected.record()
     if phase is not None:
         summary["phase"] = phase
-    tools, seen = StubTools(out, workload, selected), set()
-    for turn in range(7):
+    if repair_turns:
+        summary["repair_turns"] = repair_turns
+    tools, seen = StubTools(out, workload, selected, fail_first_test=bool(repair_turns)), set()
+    protocol = Workflow(repair_turns) if repair_turns else None
+    for turn in range(max_tools(repair_turns) + 1):
         request = build_request(model, messages, schemas, turn, family, engine_kind)
         turn_out = out / f"turn-{turn}"
         turn_out.mkdir()
@@ -434,15 +448,21 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
         if acks is not None:
             callback = acknowledging(first_progress_ack(acks, agent, turn), callback)
         message, call, receipt = exchange(base, request, turn_out, turn, seen, deadline=30, engine_kind=engine_kind,
-                                          family=family, on_first_token=callback)
+                                          family=family, on_first_token=callback,
+                                          assistant_policy=None if protocol is None else protocol.policy)
         summary["turns"].append(receipt)
         messages.append(message)
         if call is not None:
             cid, name, arguments = call
             seen.add(cid)
             messages.append({"role": "tool", "tool_call_id": cid, "name": name, "content": tools.invoke(name, arguments)})
+        if protocol is not None:
+            protocol.advance(None if call is None else call[1],
+                             tools.receipts[-1]["passed"] if call is not None and call[1] == "run_tests" else None)
+        if call is None:
+            break
     summary["tools"] = tools.receipts
-    summary["status"] = qualify(summary["turns"], tools.receipts, True, tools.source_hash, tools.source_hash)
+    summary["status"] = qualify(summary["turns"], tools.receipts, True, tools.source_hash, tools.source_hash, repair_turns)
     summary.update(cleanup=True, final_source_sha256=tools.source_hash, task_completed_monotonic_ns=clock_ns(),
                    observed_final_source_sha256=child.digest(tools.fixture / "src" / "ports.rs"))
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -450,7 +470,7 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
 
 
 def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="hf2q", family="qwen", instance=None,
-             cleanup=None, run=RUN, server_pid=SERVER_PID, variant=None):
+             cleanup=None, run=RUN, server_pid=SERVER_PID, variant=None, repair_turns=0):
     """Coordinator summary over `results`; its status is the actual coordinator aggregate."""
     agents = coordinator.active_agents(phase_plan)
     cleanup = cleanup or {agent: copy.deepcopy(CLEAN) for agent in agents}
@@ -468,12 +488,15 @@ def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="h
         summary["instance"] = record
     if variant_record is not None:
         summary["workload_variant"] = variant_record
+    if repair_turns:
+        summary["repair_turns"] = repair_turns
     if phase_plan is not None:
         summary["phase"] = {"plan": phase_plan, "cohorts": [list(c) for c in coordinator.phase_cohorts(phase_plan)],
                             "releases": [{"cohort": i + 1, "release_monotonic_ns": at, "trigger_first_decode_monotonic_ns": t}
                                          for i, (at, t) in enumerate(zip(releases, triggers))]}
     summary["status"] = coordinator.aggregate(results, exits, {a: cleanup[a]["verified"] for a in agents}, server_pid, run,
-                                              engine_kind, family, record, phase_plan, variant_record)
+                                              engine_kind, family, record, phase_plan, variant_record,
+                                              repair_turns=repair_turns)
     finished = max(results[a]["task_completed_monotonic_ns"] for a in agents)
     summary.update(makespan_finished_ns=finished, own_output_four_task_makespan_seconds=(finished - releases[0]) / 1e9,
                    agents=results, exits=exits, client_cleanup=cleanup, cleanup=True,
@@ -497,7 +520,8 @@ def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
     assert slots is None or len(cohorts) == 1, "slot-capped retiming is for single-release plans"
     groups = 1 if slots is None else -(-len(agents) // slots)
     total = round(makespan_s * 1e9)
-    duration = total // (7 * groups + (2 if len(cohorts) > 1 else 0) + 1)
+    steps = max(len(results[a]["turns"]) for a in agents)  # 7, or 9 for a repaired agent
+    duration = total // (steps * groups + (2 if len(cohorts) > 1 else 0) + 1)
     gap = duration // 10
     releases, triggers, start = [origin], [None], {}
     for index, cohort in enumerate(cohorts):
@@ -507,7 +531,7 @@ def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
             triggers.append(trigger)
         for agent in cohort:
             group = 0 if slots is None else agents.index(agent) // slots
-            start[agent] = releases[index] + 1 + group * 7 * duration
+            start[agent] = releases[index] + 1 + group * steps * duration
     for agent in agents:
         lane = agents.index(agent) * (gap // 8)
         cohort = [agent in c for c in cohorts].index(True)
@@ -539,36 +563,38 @@ _TEMPLATES = {}
 _TEMPLATE_ROOT = None
 
 
-def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen", variant=None):
-    """Raw evidence of one honest run (cached per process): directory and per-agent results."""
+def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen", variant=None, repair_turns=0):
+    """Raw evidence of one honest run (cached per process): directory and per-agent results.
+    `repair_turns=1`: every agent fails its first run_tests and repairs it (REPAIR_SCRIPT)."""
     global _TEMPLATE_ROOT
-    key = (engine_kind, phase_plan, instance, family, variant)
+    key = (engine_kind, phase_plan, instance, family, variant, repair_turns)
     if key not in _TEMPLATES:
         if _TEMPLATE_ROOT is None:
             _TEMPLATE_ROOT = tempfile.TemporaryDirectory(prefix="q2-fake-templates-")
             atexit.register(_TEMPLATE_ROOT.cleanup)
         root = Path(_TEMPLATE_ROOT.name) / f"t{len(_TEMPLATES)}"
         results = {}
-        with FakeService() as service:
+        with FakeService(repair=bool(repair_turns)) as service:
             for agent in coordinator.active_agents(phase_plan):
                 results[agent] = drive_agent(service.url, root / agent, agent, engine_kind=engine_kind, family=family,
                                              instance=instance, phase=coordinator.agent_phase(phase_plan, agent),
-                                             variant=variant)
+                                             variant=variant, repair_turns=repair_turns)
         _TEMPLATES[key] = (root, results)
     return _TEMPLATES[key]
 
 
 def honest_run(client_dir, makespan_s=100.0, engine_kind="hf2q", phase_plan=None, instance=None, slots=None,
-               family="qwen", variant=None):
+               family="qwen", variant=None, repair_turns=0):
     """Write a complete client directory (raw turns + coordinator summary) whose evidence re-derives its Pass."""
-    root, results = template(engine_kind, phase_plan, instance, family, variant)
+    root, results = template(engine_kind, phase_plan, instance, family, variant, repair_turns)
     client_dir = Path(client_dir)
     client_dir.mkdir(parents=True)
     for agent in results:
         shutil.copytree(root / agent, client_dir / agent)
     results = copy.deepcopy(results)
     releases, triggers = retime(results, phase_plan, makespan_s, slots)
-    return assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, instance, variant=variant)
+    return assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, instance, variant=variant,
+                    repair_turns=repair_turns)
 
 
 def write_json(path, value):

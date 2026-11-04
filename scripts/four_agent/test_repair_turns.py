@@ -1,5 +1,7 @@
-"""Pure controls for the Qwen3.6 repair-turn workload (--repair-turns 1). No HTTP/server/model."""
+"""Controls for the Qwen3.6 repair-turn workload (--repair-turns 1). No model, server or GPU; the RunAudit
+cases use q2_fake_service's loopback HTTP stub."""
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -245,6 +247,52 @@ class Cases(unittest.TestCase):
                               str(CASES / "peer-qwen36-repair1.json"), "--reference-kind", "peer", "--dry-run"])
         plan, _ = qc.build_plan(same, {})
         self.assertEqual(plan["arms"]["subject"]["family"], "qwen36")
+
+
+class RunAudit(unittest.TestCase):
+    """Raw-evidence replay over real loopback HTTP: the actual exchange, Workflow, aggregate and Q2 audit."""
+
+    def run_dir(self, **options):
+        import q2_fake_service as fake
+        root = Path(tempfile.mkdtemp(prefix="q36-repair-audit-"))
+        self.addCleanup(shutil.rmtree, root)
+        client = root / "client"
+        return client, fake.honest_run(client, 100.0, "hf2q", **options)
+
+    def test_a_repaired_run_re_derives_its_pass(self):
+        import q2_run_audit as audit
+        client, summary = self.run_dir(repair_turns=1, instance=3)
+        self.assertEqual(summary["status"], "FourAgentProtocolCompleteAwaitingIndependentReview")
+        self.assertEqual(summary["repair_turns"], 1)
+        for agent in AGENTS:
+            result = summary["agents"][agent]
+            self.assertEqual([t["name"] for t in result["tools"]],
+                             ["read_file", "read_file", "write_file", "run_tests", "write_file", "run_tests",
+                              "read_file", "run_tests"])
+            self.assertEqual(len(result["turns"]), 9)
+        report = audit.audit_run(client, summary, None, "hf2q", True)
+        self.assertEqual(report["expected_width"], 4)
+
+    def test_the_audit_refuses_a_repaired_run_relabelled_canonical(self):
+        import q2_run_audit as audit
+        client, summary = self.run_dir(repair_turns=1)
+        stripped = json.loads(json.dumps(summary))
+        stripped.pop("repair_turns")
+        for result in stripped["agents"].values():
+            result.pop("repair_turns")
+        with self.assertRaises(Invalid):
+            audit.audit_run(client, stripped, None, "hf2q", True)
+        relabelled = json.loads(json.dumps(summary))
+        relabelled.pop("repair_turns")
+        with self.assertRaises(Invalid):
+            audit.audit_run(client, relabelled, None, "hf2q", True)
+
+    def test_canonical_runs_are_unchanged(self):
+        import q2_run_audit as audit
+        client, summary = self.run_dir()
+        self.assertNotIn("repair_turns", summary)
+        self.assertTrue(all("repair_turns" not in r and len(r["turns"]) == 7 for r in summary["agents"].values()))
+        audit.audit_run(client, summary, None, "hf2q", True)
 
 
 if __name__ == "__main__":
