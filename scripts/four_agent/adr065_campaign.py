@@ -23,10 +23,12 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 
 import adr065_stats
+import q2_traced_run
 import q3_campaign as q3
 import q3_identity
 import q3_metrics
@@ -42,8 +44,11 @@ REPO = HERE.parent.parent
 CAMPAIGN_FILE = HERE / "adr065" / "campaign-b1.json"
 CAMPAIGN_SCHEMA = "hf2q.adr065.campaign.v1"
 SCHEMA = "hf2q.adr065.campaign-run.v1"
+BUILD_RECEIPT_SCHEMA = "hf2q.adr065.build-receipt.v1"
 NATIVE = re.compile(rb"mlx-native-(\d+\.\d+\.\d+)")
 ROLES = {"A": "previous default", "B": "candidate (one kill switch changed)"}
+# Campaign-file baseline fields that stay null until the pinned main commit is built (a placeholder plan).
+BASELINE_FIELDS = ("source_commit", "sha256", "bytes", "native_checksum", "build_receipt.sha256")
 
 
 def load_campaign(path=CAMPAIGN_FILE):
@@ -110,8 +115,11 @@ def build_plan(args, campaign, source):
     case_path, case = read_case(REPO / fam["q5_case"]["path"], fam["q5_case"]["sha256"])
     qc.require(case["family"] == family and qc.engine_kind(case) == "hf2q" and q3.CLIENT in case["client"]["argv"],
                f"{case_path} must be the canonical four-agent hf2q case of {family}")
-    binary = args.baseline_bin if args.mode == "baseline" else args.binary
-    qc.require(binary, "--baseline-bin is required" if args.mode == "baseline" else "--binary is required")
+    if args.mode == "baseline":
+        binary = args.baseline_bin or expand(campaign["baseline"]["binary"]["path"], roots)
+    else:
+        binary = args.binary
+    qc.require(binary, "--binary is required")
     values = {"HF2Q_BIN": str(Path(binary).resolve()), "MODEL": expand(fam["artifact"]["path"], roots),
               "MODEL_SHA256": fam["artifact"]["sha256"],
               "CLIENT_APPROVAL_TEMPLATE": expand(fam["client_approval_template"]["path"], roots),
@@ -135,9 +143,13 @@ def build_plan(args, campaign, source):
     if args.mode == "baseline":
         qc.require(args.workloads is None, "the baseline campaign runs every predeclared workload")
         stage_runs = dict(campaign["baseline_campaign"]["runs_per_stage"])
-        plan["baseline"] = {"label": campaign["baseline"]["label"], **campaign["baseline"]["binary"],
-                            "native_version": campaign["baseline"]["native"]["version"]}
-        plan["declared"]["commit"] = campaign["baseline"]["binary"]["source_commit"]
+        base = campaign["baseline"]
+        receipt = base["binary"]["build_receipt"]
+        plan["baseline"] = {"label": base["label"], "kind": base["kind"],
+                            **{k: base["binary"][k] for k in ("source_commit", "sha256", "bytes")},
+                            "build_receipt": {"path": expand(receipt["path"], roots), "sha256": receipt["sha256"]},
+                            "native_version": base["native"]["version"], "native_checksum": base["native"]["checksum"]}
+        plan["declared"]["commit"] = base["binary"]["source_commit"]
         plan["n1_control"] = None
         fixed = None
     else:
@@ -177,7 +189,66 @@ def build_plan(args, campaign, source):
     return plan, cases
 
 
-def launch_problems(plan, ids, versions):
+def placeholders(base):
+    """Campaign-file baseline identity fields still null (the pinned main commit is not built yet)."""
+    values = {**base, "build_receipt.sha256": base["build_receipt"]["sha256"]}
+    return [field for field in BASELINE_FIELDS if values[field] is None]
+
+
+def baseline_problems(base, shas, sizes, versions, lock=q2_traced_run.git_lock):
+    """The served binary must be the campaign file's main build: its sha256 and size, its build receipt (bound by
+    sha256: source commit, binary sha256, native pin), the mlx-native pin in Cargo.lock at that commit, and the one
+    mlx-native version embedded in the binary."""
+    missing = placeholders(base)
+    if missing:
+        return [f"the campaign file's baseline identity is a placeholder ({', '.join(missing)} unset): build the "
+                "pinned main commit, write its build receipt and finalize campaign-b1.json"]
+    problems = []
+    if shas != {base["sha256"]} or sizes != {base["bytes"]}:
+        problems.append(f"the baseline binary must be the main build {base['sha256']} ({base['bytes']} bytes)")
+    receipt = base["build_receipt"]
+    document = q3_metrics.load_json(receipt["path"]) if os.path.isfile(receipt["path"]) else None
+    if document is None or q5_artifacts.sha256(receipt["path"]) != receipt["sha256"]:
+        problems.append(f"build receipt {receipt['path']} missing or not {receipt['sha256']}")
+    else:
+        expected = {"schema": BUILD_RECEIPT_SCHEMA, "source": base["source_commit"], "sha256": base["sha256"],
+                    "bytes": base["bytes"], "native_version": base["native_version"],
+                    "native_checksum": base["native_checksum"]}
+        wrong = [k for k, v in expected.items() if document.get(k) != v]
+        if wrong:
+            problems.append(f"build receipt {receipt['path']} differs from the campaign file: {', '.join(wrong)}")
+    try:
+        pin = q2_traced_run.native_pin(lock(base["source_commit"]))
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        problems.append(f"no mlx-native pin readable from Cargo.lock at {base['source_commit']}: {error}")
+    else:
+        if pin != (base["native_version"], base["native_checksum"]):
+            problems.append(f"Cargo.lock at {base['source_commit']} pins mlx-native {pin[0]} ({pin[1]}), not "
+                            f"{base['native_version']} ({base['native_checksum']})")
+    if versions != [base["native_version"]]:
+        problems.append(f"the binary must embed exactly one mlx-native version ({base['native_version']}); "
+                        f"found {versions}")
+    return problems
+
+
+def build_receipt(binary, source_checkout, command, lock=q2_traced_run.git_lock):
+    """The B1 build receipt of a binary built from a clean checkout of a main commit."""
+    checkout = Path(source_checkout).resolve()
+    git = lambda *argv: subprocess.run(["git", "-C", str(checkout), *argv], check=True, capture_output=True,
+                                       text=True, timeout=30).stdout
+    commit = git("rev-parse", "HEAD").strip()
+    qc.require(git("status", "--porcelain", "--untracked-files=no") == "", f"{checkout} has uncommitted changes")
+    version, checksum = q2_traced_run.native_pin(lock(commit))
+    embedded = native_versions(binary)
+    qc.require(embedded == [version], f"{binary} embeds mlx-native {embedded}, Cargo.lock pins {version}")
+    stat = os.stat(binary)
+    return {"schema": BUILD_RECEIPT_SCHEMA, "source": commit, "sha256": q5_artifacts.sha256(binary),
+            "bytes": stat.st_size, "native_version": version, "native_checksum": checksum,
+            "embedded_native_versions": embedded, "binary": str(Path(binary).resolve()),
+            "source_checkout": str(checkout), "command": command, "binary_mtime_ns": stat.st_mtime_ns}
+
+
+def launch_problems(plan, ids, versions, lock=q2_traced_run.git_lock):
     """Everything that keeps an ADR-065 campaign from starting; empty when launchable."""
     problems = q3_identity.arm_problems(ids)
     artifact = plan["artifact"]
@@ -193,12 +264,11 @@ def launch_problems(plan, ids, versions):
     shas = {identity["binary"]["sha256"] for identity in ids["arms"].values()}
     if len(shas) != 1:
         problems.append("every arm must run the same binary (arms differ only in a kill switch)")
-    if plan["mode"] == "baseline" and shas != {plan["baseline"]["sha256"]}:
-        problems.append(f"the baseline binary must be the released phase-1 default {plan['baseline']['sha256']}")
-    if len(versions) != 1 or (plan["mode"] == "baseline" and versions != [plan["baseline"]["native_version"]]):
-        problems.append(f"the binary must embed exactly one mlx-native version"
-                        + (f" ({plan['baseline']['native_version']})" if plan["mode"] == "baseline" else "")
-                        + f"; found {versions}")
+    if plan["mode"] == "baseline":
+        bytes_ = {identity["binary"].get("bytes") for identity in ids["arms"].values()}
+        problems += baseline_problems(plan["baseline"], shas, bytes_, versions, lock)
+    elif len(versions) != 1:
+        problems.append(f"the binary must embed exactly one mlx-native version; found {versions}")
     commit = plan["declared"].get("commit")
     if not (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit)):
         problems.append("--commit must be the 40-hex source commit of the binary")
@@ -216,13 +286,14 @@ class Driver(q3.Driver):
     """q3_campaign.Driver with a fixed block count per stage, the campaign cooldown and the run budget."""
     schema = SCHEMA
 
-    def __init__(self, *args, clock=time.monotonic, sleep=time.sleep, versions=native_versions, **kwargs):
+    def __init__(self, *args, clock=time.monotonic, sleep=time.sleep, versions=native_versions,
+                 lock=q2_traced_run.git_lock, **kwargs):
         super().__init__(*args, **kwargs)
-        self.clock, self.sleep, self.versions, self.last_end = clock, sleep, versions, None
+        self.clock, self.sleep, self.versions, self.lock, self.last_end = clock, sleep, versions, lock, None
 
     def launch_problems(self, frozen):
         binary = self.plan["declared"]["binary"]
-        return launch_problems(self.plan, frozen, self.versions(binary) if os.path.isfile(binary) else [])
+        return launch_problems(self.plan, frozen, self.versions(binary) if os.path.isfile(binary) else [], self.lock)
 
     def finished(self, stage):
         fixed = self.plan["design"]["stage_blocks"][stage["workload"]]
@@ -297,7 +368,8 @@ def parse_args(argv):
         p.add_argument("--resume", action="store_true", help="continue a Halted campaign with an identical plan")
         p.add_argument("--dry-run", action="store_true", help="print plan, identities, problems and schedule only")
         if mode == "baseline":
-            p.add_argument("--baseline-bin", required=True, help="the released phase-1 default binary")
+            p.add_argument("--baseline-bin", help="the phase-1 default binary (default: the campaign file's "
+                           "baseline.binary.path); its identity must equal the campaign file's")
             p.set_defaults(workloads=None)
         else:
             p.add_argument("--binary", required=True, help="the one binary both arms run")
@@ -312,6 +384,11 @@ def parse_args(argv):
                 p.add_argument("--pilot-of", type=Path, help="pilot campaign directory that chose a block count other than 6")
             else:
                 p.set_defaults(pilot_of=None)
+    p = sub.add_parser("build-receipt", help="write the build receipt of a main-built baseline binary")
+    p.add_argument("--binary", type=Path, required=True, help="the built hf2q binary")
+    p.add_argument("--source-checkout", type=Path, required=True, help="clean checkout of the main commit it was built from")
+    p.add_argument("--command", required=True, help="the exact build command (recorded verbatim)")
+    p.add_argument("--output", type=Path, required=True, help="receipt path (new file)")
     p = sub.add_parser("ceilings")
     p.add_argument("baseline", type=Path, help="baseline campaign directory")
     p = sub.add_parser("analyze")
@@ -327,6 +404,14 @@ def main(argv=None):
     args = parse_args(argv)
     environ = dict(os.environ)
     try:
+        if args.mode == "build-receipt":
+            qc.require(not args.output.exists(), f"{args.output} exists")
+            document = build_receipt(args.binary, args.source_checkout, args.command)
+            qc.save(args.output, document)
+            print(json.dumps({"receipt": str(args.output.resolve()), "sha256": q5_artifacts.sha256(args.output),
+                              **{k: document[k] for k in ("source", "sha256", "bytes", "native_version", "native_checksum")}},
+                             indent=2))
+            return 0
         campaign, source = load_campaign(args.campaign_file)
         if args.mode == "ceilings":
             document = write_ceilings(args.baseline, source)

@@ -6,11 +6,24 @@ This document and the campaign file [`scripts/four_agent/adr065/campaign-b1.json
 
 ## Phase-1 default and identities
 
+**Operator decision (2026-11-04).** B1 baselines the fixed engine: hf2q main, once mlx-native 0.15.18 is published and pinned on main. 0.15.18 carries the RoPE partial-rotary fix for a bug in `rope_multi.metal`, which affects Qwen3.6 and Qwen3.8. B1 is never run on the v0.1.29 release binary.
+
+The campaign file holds that commit's identity in `baseline`. Until the commit exists and is built, its fields are `null` placeholders, and the driver refuses to launch a baseline while any field is `null`.
+
 | Item | Value |
 | --- | --- |
-| Binary | v0.1.29 release asset `hf2q-aarch64-apple-darwin`, sha256 `86b64b029c6f717f3b6c58654c2aa5b29f420ffa93fe09f31348755fd2df48f2`, 55,972,368 bytes |
-| Source commit | `c40fbf37bc2bc24cebd2c57faa60891debd1179a`. Main `d817dffa` differs from it only in release tooling: no change under `src/`, `Cargo.toml` or `Cargo.lock`. |
-| Native | mlx-native `=0.15.16`. Before launch, the driver checks that the binary embeds exactly one `mlx-native-<version>` path and that it is 0.15.16. |
+| Binary | `$B1/main-build/hf2q`. It is built from a clean checkout of `source_commit` with `RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=<source_commit> CARGO_TARGET_DIR=/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool cargo build --release --locked`, then copied out of the target directory. The campaign file records its sha256 and bytes. |
+| Source commit | The hf2q main commit that pins mlx-native 0.15.18 (the `source_commit` field). |
+| Build receipt | `$B1/main-build/build-receipt.json` (`hf2q.adr065.build-receipt.v1`, written by `adr065_campaign.py build-receipt`), bound by sha256. It records source commit, binary sha256 and bytes, the mlx-native version and checksum read from `Cargo.lock` at that commit, the native versions embedded in the binary, and the build command. |
+| Native | mlx-native `=0.15.18`, with its crates.io checksum taken from `Cargo.lock` at `source_commit` (the `native.checksum` field). |
+
+Before launch, the driver checks four things against the campaign file:
+- the binary's sha256 and size;
+- the build receipt's sha256 and each of its identity fields;
+- the mlx-native version and checksum pinned in `Cargo.lock` at `source_commit`, read with `git show` from the harness repository;
+- that the binary embeds exactly one `mlx-native-<version>` path, and that it is 0.15.18.
+
+Everything else in this document is unchanged by the decision: artifacts, cases, design, fairness rule, counts, cooldown and budget.
 
 | Family | Official artifact | sha256 | Bytes | Q5 case (sha256) | Client approval template |
 | --- | --- | --- | --- | --- | --- |
@@ -18,7 +31,7 @@ This document and the campaign file [`scripts/four_agent/adr065/campaign-b1.json
 | DeepSeek-V4 Flash | `$MODELS/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf` | `50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6` | 107,431,343,264 | `q5_cases/deepseek4.json` (`d362f00e…`) | `…/deepseek4-client-approval.json` (`dfa0bf88…`) |
 | Gemma 4 26B-A4B | `$MODELS/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf` | `bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53` | 16,796,018,144 | `q5_cases/gemma4.json` (`c83d4de4…`) | `…/gemma4-client-approval.json` (`d2e30e96…`) |
 
-`$MODELS` is `/Users/robert/.local/share/hf2q/models`; `$E` is `/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023`.
+`$MODELS` is `/Users/robert/.local/share/hf2q/models`; `$E` is `/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023`; `$B1` is `/Users/robert/.local/state/hf2q/v0130/b1-503`.
 
 On 2026-11-03 all three GGUFs were hashed in full, and each sha256 equals its conversion receipt's `output.sha256` (`shasum -a 256`, evidence `/Users/robert/.local/state/hf2q/v0130/b1-503/artifact-sha256.txt`). Gemma 4 is included because Q4-GEMMA and E1 need its baseline. Runs do not re-hash the GGUF. Q5 binds it as Q3 does, through the conversion-receipt digest, checked against the campaign file's `MODEL_SHA256`. The driver also refuses an artifact whose digest or size differs from the campaign file.
 
@@ -81,14 +94,24 @@ Run from a clean checkout of the harness commit; the driver refuses uncommitted 
 
 ```sh
 B1=/Users/robert/.local/state/hf2q/v0130/b1-503
-BIN=$B1/hf0129-release/hf2q-aarch64-apple-darwin   # gh release download v0.1.29 -p 'hf2q-aarch64-apple-darwin*'
+MAIN=<40-hex main commit that pins mlx-native 0.15.18>
+# 1. Build (wait while HOST-LOCK exists; kill rust-analyzer first).
+git -C /opt/hf2q fetch origin && git -C /opt/hf2q worktree add --detach /opt/hf2q-worktrees/b1-main-build $MAIN
+(cd /opt/hf2q-worktrees/b1-main-build && RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=$MAIN \
+   CARGO_TARGET_DIR=/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool cargo build --release --locked)
+mkdir -p $B1/main-build && cp /Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool/release/hf2q $B1/main-build/hf2q
+python3 -B scripts/four_agent/adr065_campaign.py build-receipt --binary $B1/main-build/hf2q \
+  --source-checkout /opt/hf2q-worktrees/b1-main-build --output $B1/main-build/build-receipt.json \
+  --command "RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=$MAIN CARGO_TARGET_DIR=/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool cargo build --release --locked"
+# 2. Finalize campaign-b1.json: baseline.binary.{source_commit, sha256, bytes}, build_receipt.sha256 and
+#    native.checksum from that output; commit; independent re-check of the identity change before the run.
+# 3. Dry-run, then the baseline (GPU lane, HOST-LOCK held, nothing else loaded; one family at a time):
 mkdir -p "$B1/baseline"
 for F in qwen38 deepseek4 gemma4; do
-  python3 -B scripts/four_agent/adr065_campaign.py baseline --family $F --baseline-bin "$BIN" \
+  python3 -B scripts/four_agent/adr065_campaign.py baseline --family $F \
     --qe-identity "<named session/host>" --dry-run > "$B1/dry-run-$F.json"
 done
-# GPU lane, HOST-LOCK held, nothing else loaded; one family at a time:
-python3 -B scripts/four_agent/adr065_campaign.py baseline --family qwen38 --baseline-bin "$BIN" \
+python3 -B scripts/four_agent/adr065_campaign.py baseline --family qwen38 \
   --qe-identity "<named session/host>" --output "$B1/baseline/qwen38"
 python3 -B scripts/four_agent/adr065_campaign.py ceilings "$B1/baseline/qwen38"
 # ... the same for deepseek4, then gemma4.

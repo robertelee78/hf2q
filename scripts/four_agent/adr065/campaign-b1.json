@@ -4,21 +4,31 @@
   "doc": "docs/research/adr065-b1-campaign.md",
   "roots": {
     "E": "/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023",
-    "MODELS": "/Users/robert/.local/share/hf2q/models"
+    "MODELS": "/Users/robert/.local/share/hf2q/models",
+    "B1": "/Users/robert/.local/state/hf2q/v0130/b1-503"
   },
   "baseline": {
-    "label": "v0.1.29 release (phase-1 default)",
+    "label": "hf2q main with mlx-native 0.15.18 (RoPE partial-rotary fix; phase-1 default)",
+    "kind": "main-build",
     "binary": {
-      "release_asset": "https://github.com/robertelee78/hf2q/releases/download/v0.1.29/hf2q-aarch64-apple-darwin",
-      "sha256": "86b64b029c6f717f3b6c58654c2aa5b29f420ffa93fe09f31348755fd2df48f2",
-      "bytes": 55972368,
-      "source_commit": "c40fbf37bc2bc24cebd2c57faa60891debd1179a",
-      "release_proof_sha256": "0874062b2c7dc7147d44070a15e89ccca36e3a11d425c4e94d2a13060efbb09b"
+      "source_commit": null,
+      "sha256": null,
+      "bytes": null,
+      "path": "{B1}/main-build/hf2q",
+      "build_receipt": {"path": "{B1}/main-build/build-receipt.json", "sha256": null},
+      "build": {
+        "source_checkout": "/opt/hf2q-worktrees/b1-main-build (detached at source_commit, clean)",
+        "cargo_target_dir": "/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool",
+        "environment": "RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=<source_commit>",
+        "command": "cargo build --release --locked",
+        "copy": "target/release/hf2q -> {B1}/main-build/hf2q"
+      }
     },
-    "native": {"crate": "mlx-native", "version": "0.15.16"},
+    "native": {"crate": "mlx-native", "version": "0.15.18", "checksum": null},
     "notes": [
-      "main d817dffa differs from v0.1.29 only in release tooling (no src/, Cargo.toml or Cargo.lock change), so the released standalone binary is the phase-1 default of main.",
-      "The driver checks the binary sha256 and that the binary embeds exactly one mlx-native version string, equal to native.version."
+      "Operator decision 2026-11-04: B1 baselines the fixed engine, hf2q main once mlx-native 0.15.18 (RoPE partial-rotary fix in rope_multi.metal, affecting Qwen3.6/3.8) is published and pinned on main; never the v0.1.29 release.",
+      "Null fields are placeholders until that commit exists and is built; the driver refuses to launch a baseline while any is null.",
+      "Before launch the driver checks the binary's sha256 and size, the build receipt (bound by sha256: source commit, binary sha256 and size, native version and checksum), the mlx-native pin in Cargo.lock at source_commit, and that the binary embeds exactly one mlx-native version, equal to native.version."
     ]
   },
   "environment": {

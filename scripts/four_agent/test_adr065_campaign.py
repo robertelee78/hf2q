@@ -60,8 +60,20 @@ class CampaignFile(unittest.TestCase):
         self.assertEqual([round(t / 3600, 1) for t in total], declared["baseline_total_hours"])
 
 
+SOURCE_COMMIT, NATIVE_SUM, BYTES = "1" * 40, "d" * 64, 4096
+LOCK = ('[[package]]\nname = "mlx-native"\nversion = "{version}"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "{checksum}"\n')
+
+
+def fake_lock(commit, version="0.15.18", checksum=NATIVE_SUM):
+    if commit != SOURCE_COMMIT:
+        raise ac.subprocess.CalledProcessError(128, ["git", "show"])
+    return LOCK.format(version=version, checksum=checksum)
+
+
 def fake_ids(plan, binary_sha=BIN_SHA, artifact_sha=MODEL_SHA, dirty=()):
-    return {"arms": {arm: {"binary": {"path": plan["declared"]["binary"], "sha256": binary_sha, "exists": True},
+    return {"arms": {arm: {"binary": {"path": plan["declared"]["binary"], "sha256": binary_sha, "bytes": BYTES,
+                                      "exists": True},
                            "artifact": {"path": "/m.gguf", "bytes": 10, "sha256": artifact_sha},
                            "peer_build_info": None, "missing_variables": [], "file_checks": {}, "inputs": {}}
                      for arm in plan["arms"]},
@@ -113,10 +125,16 @@ class Harness(unittest.TestCase):
         nc.write_text("{}")
         self.campaign["environment"]["negative_control_receipt"] = {"path": str(nc), "sha256": q5_artifacts.sha256(nc)}
         self.campaign["families"]["qwen38"]["artifact"].update(sha256=MODEL_SHA, bytes=10)
-        self.campaign["baseline"]["binary"]["sha256"] = BIN_SHA
+        self.receipt = self.root / "build-receipt.json"
+        self.receipt.write_text(json.dumps({"schema": ac.BUILD_RECEIPT_SCHEMA, "source": SOURCE_COMMIT, "sha256": BIN_SHA,
+                                            "bytes": BYTES, "native_version": "0.15.18", "native_checksum": NATIVE_SUM}))
+        self.campaign["baseline"]["binary"].update(
+            source_commit=SOURCE_COMMIT, sha256=BIN_SHA, bytes=BYTES,
+            build_receipt={"path": str(self.receipt), "sha256": q5_artifacts.sha256(self.receipt)})
+        self.campaign["baseline"]["native"]["checksum"] = NATIVE_SUM
         self.campaign["baseline_campaign"]["runs_per_stage"] = {"n4": 3, "n1": 2, "3+1": 1, "2+2": 1, "1+3": 1}
         self.bin = self.root / "hf2q"
-        self.bin.write_bytes(b"\0mlx-native-0.15.16/src\0")
+        self.bin.write_bytes(b"\0mlx-native-0.15.18/src\0")
         self.case = HERE / "q5_cases" / "qwen38.json"
 
     def tearDown(self):
@@ -137,10 +155,10 @@ class Harness(unittest.TestCase):
             kw.setdefault("b_case", self.b_case())
         return ac.build_plan(Args(mode, **kw), self.campaign, SOURCE)
 
-    def driver(self, plan, cases, out, decide=None, ids=None, versions=lambda path: ["0.15.16"]):
+    def driver(self, plan, cases, out, decide=None, ids=None, versions=lambda path: ["0.15.18"]):
         runner, clock = FakeRunner(decide), Clock()
         driver = ac.Driver(plan, cases, out, {}, runner, lambda: 0, ids or (lambda: fake_ids(plan)),
-                           clock=clock, sleep=clock.sleep, versions=versions)
+                           clock=clock, sleep=clock.sleep, versions=versions, lock=fake_lock)
         return driver, runner, clock
 
 
@@ -156,8 +174,12 @@ class Plan(Harness):
         self.assertEqual(overrides["MODEL"], "/Users/robert/.local/share/hf2q/models/qwen38-stock/Qwen3.8-27B-vanilla.gguf")
         self.assertEqual(overrides["MODEL_SHA256"], MODEL_SHA)
         self.assertTrue(overrides["CLIENT_APPROVAL_TEMPLATE"].endswith("approval-templates-proof-8b286684/qwen38-client-approval.json"))
-        self.assertEqual(plan["declared"]["commit"], "c40fbf37bc2bc24cebd2c57faa60891debd1179a")
-        self.assertEqual(plan["baseline"]["native_version"], "0.15.16")
+        self.assertEqual(plan["declared"]["commit"], SOURCE_COMMIT)
+        self.assertEqual((plan["baseline"]["kind"], plan["baseline"]["native_version"], plan["baseline"]["native_checksum"]),
+                         ("main-build", "0.15.18", NATIVE_SUM))
+        self.assertEqual(plan["baseline"]["build_receipt"]["path"], str(self.receipt))
+        default, _ = self.plan(baseline_bin=None)
+        self.assertEqual(default["declared"]["binary"], "/Users/robert/.local/state/hf2q/v0130/b1-503/main-build/hf2q")
         self.assertEqual(plan["campaign_file"], SOURCE)
         self.assertEqual(ac.schedule(plan)["n4"]["blocks"], [["A"]] * 3)
 
@@ -193,22 +215,69 @@ class Plan(Harness):
 
     def test_launch_problems(self):
         plan, _ = self.plan()
-        self.assertEqual(ac.launch_problems(plan, fake_ids(plan), ["0.15.16"]), [])
+        self.assertEqual(ac.launch_problems(plan, fake_ids(plan), ["0.15.18"], fake_lock), [])
         problems = ac.launch_problems(plan, fake_ids(plan, binary_sha="9" * 64, artifact_sha="8" * 64, dirty=["M x"]),
-                                      ["0.15.15", "0.15.16"])
+                                      ["0.15.15", "0.15.18"], fake_lock)
         self.assertEqual(len(problems), 4, problems)
         self.assertIn("A: artifact /m.gguf is not the official", problems[0])
-        self.assertIn("released phase-1 default", problems[1])
-        self.assertIn("exactly one mlx-native version (0.15.16)", problems[2])
+        self.assertIn(f"the baseline binary must be the main build {BIN_SHA} ({BYTES} bytes)", problems[1])
+        self.assertIn("exactly one mlx-native version (0.15.18)", problems[2])
         ab, _ = self.plan("ab", commit="xyz")
-        self.assertIn("--commit must be the 40-hex source commit of the binary", ac.launch_problems(ab, fake_ids(ab), ["0.15.17"]))
+        self.assertIn("--commit must be the 40-hex source commit of the binary",
+                      ac.launch_problems(ab, fake_ids(ab), ["0.15.17"], fake_lock))
         mixed = fake_ids(ab)
         mixed["arms"]["B"]["binary"]["sha256"] = "9" * 64
         self.assertIn("every arm must run the same binary (arms differ only in a kill switch)",
-                      ac.launch_problems(ab, mixed, ["0.15.16"]))
+                      ac.launch_problems(ab, mixed, ["0.15.18"], fake_lock))
+
+    def test_checked_in_placeholder_baseline_never_launches(self):
+        self.campaign["baseline"] = ac.load_campaign()[0]["baseline"]
+        plan, _ = self.plan()
+        self.assertIsNone(plan["declared"]["commit"])
+        problems = ac.launch_problems(plan, fake_ids(plan), ["0.15.18"], fake_lock)
+        self.assertIn("the campaign file's baseline identity is a placeholder (source_commit, sha256, bytes, "
+                      "native_checksum, build_receipt.sha256 unset): build the pinned main commit, write its build "
+                      "receipt and finalize campaign-b1.json", problems)
+
+    def test_build_receipt_and_native_pin_bind_the_main_build(self):
+        plan, _ = self.plan()
+        check = lambda **kw: ac.baseline_problems(plan["baseline"], {BIN_SHA}, {BYTES}, ["0.15.18"], **kw)
+        self.assertEqual(check(lock=fake_lock), [])
+        self.assertEqual(check(lock=lambda c: fake_lock(c, version="0.15.16")),
+                         [f"Cargo.lock at {SOURCE_COMMIT} pins mlx-native 0.15.16 ({NATIVE_SUM}), not 0.15.18 ({NATIVE_SUM})"])
+        self.assertIn("no mlx-native pin readable from Cargo.lock", check(lock=lambda c: fake_lock("0" * 40))[0])
+        self.assertIn("exactly one mlx-native version (0.15.18); found ['0.15.16']",
+                      ac.baseline_problems(plan["baseline"], {BIN_SHA}, {BYTES}, ["0.15.16"], fake_lock)[0])
+        self.assertIn("must be the main build", ac.baseline_problems(plan["baseline"], {BIN_SHA}, {1}, ["0.15.18"], fake_lock)[0])
+        document = json.loads(self.receipt.read_text())
+        self.receipt.write_text(json.dumps({**document, "native_checksum": "e" * 64}))
+        self.assertIn("missing or not", check(lock=fake_lock)[0])  # the receipt's bytes changed
+        plan["baseline"]["build_receipt"]["sha256"] = q5_artifacts.sha256(self.receipt)
+        self.assertEqual(check(lock=fake_lock), [f"build receipt {self.receipt} differs from the campaign file: native_checksum"])
+
+    def test_build_receipt_command_reads_a_clean_checkout(self):
+        repo = self.root / "src"
+        repo.mkdir()
+        git = lambda *argv: ac.subprocess.run(["git", "-C", str(repo), *argv], check=True, capture_output=True, text=True).stdout
+        git("init", "-q")
+        (repo / "Cargo.lock").write_text("lock\n")
+        git("add", "Cargo.lock")
+        git("-c", "user.email=t@t", "-c", "user.name=t", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "c")
+        commit = git("rev-parse", "HEAD").strip()
+        lock = lambda c: LOCK.format(version="0.15.18", checksum=NATIVE_SUM) if c == commit else None
+        receipt = ac.build_receipt(self.bin, repo, "cargo build --release --locked", lock=lock)
+        self.assertEqual({k: receipt[k] for k in ("schema", "source", "sha256", "bytes", "native_version", "native_checksum")},
+                         {"schema": ac.BUILD_RECEIPT_SCHEMA, "source": commit, "sha256": q5_artifacts.sha256(self.bin),
+                          "bytes": self.bin.stat().st_size, "native_version": "0.15.18", "native_checksum": NATIVE_SUM})
+        (repo / "Cargo.lock").write_text("dirty\n")
+        with self.assertRaisesRegex(q3.qc.CampaignError, "uncommitted changes"):
+            ac.build_receipt(self.bin, repo, "x", lock=lock)
+        git("checkout", "-q", "Cargo.lock")
+        with self.assertRaisesRegex(q3.qc.CampaignError, "embeds mlx-native"):
+            ac.build_receipt(self.bin, repo, "x", lock=lambda c: LOCK.format(version="0.15.16", checksum=NATIVE_SUM))
 
     def test_native_versions_scan_spans_chunks(self):
-        self.assertEqual(ac.native_versions(self.bin, chunk=4), ["0.15.16"])
+        self.assertEqual(ac.native_versions(self.bin, chunk=4), ["0.15.18"])
 
 
 class Runs(Harness):
