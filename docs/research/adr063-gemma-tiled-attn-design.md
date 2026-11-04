@@ -418,18 +418,54 @@ The formula then sums over sequences:
     seq   = 25 · Σ_sliding chunks S(L, kL) + 5 · Σ_global chunks G(L)
     TOTAL = Σ over the forward's sequences (joint lanes, or 1 for a
             single-slot resume) of seq
-            + the existing vec-hybrid scratch when any lane is under 32 rows
+
+**Scope (frozen): the TOTAL and the logged observed peak cover exactly the
+same buffers.** That is the `TiledF32` route's per-chunk scratch:
+- sliding: K, V, Q, O32, mask, `blk`;
+- global: Q, O32.
+
+The logged "observed peak scratch" is the sum of `byte_len()` of exactly
+those buffers as allocated in the warm forward. Both sides exclude the same
+route-independent allocations, and code this design leaves unchanged makes
+them:
+- the sliding ring stage (`(cap − 1 + min(rows, 1024)) × (4096 + 2048 + 32)`
+  B per sliding layer per sequence);
+- the vec-hybrid slot ids, stage positions and split-K tmp, used for lanes
+  under 32 rows;
+- the layer's Q/K/V/O stream buffers.
+
+A logged peak above TOTAL therefore means the route allocated a buffer the
+formula does not know about, or allocated a larger one. Either blocks the
+receipt.
 
 Worked values:
 - A full 1,024-row sliding chunk at kL = 2,047 gives S ≈ 54.5 MB.
 - A 4,096-row sequence gives about 25 × 4 × 54.5 MB + 5 × 201 MB ≈ 6.5 GB
   with the external mask.
-- `TiledF16` today allocates the same per sliding chunk: its F16 V and extra
-  O16 replace the F32 V. On global chunks it allocates more (dense K/V plus
-  O16). `[INFERENCE]` So `TiledF32` ≤ `TiledF16` at every shape.
+
+**Against `TiledF16`, per chunk** (same L and kL, same mask and `blk`).
+`TiledF16` allocates:
+- sliding: K F16 4096·kL, V F16 4096·kL, Q 8192·L, O16 8192·L, O32 16384·L;
+- global (2 KV heads × 512): dense K F16 2048·kL, V F16 2048·kL, Q 16384·L,
+  O16 16384·L, O32 32768·L.
+
+Hence `TiledF32 − TiledF16`:
+
+| Layer | Difference | When `TiledF32` is larger |
+|---|---|---|
+| Sliding (dense F32 V) | **+4096·kL − 8192·L** | when kL > 2L |
+| Sliding (`_vcodes`) | −4096·kL − 8192·L | never |
+| Global | **−(4096·kL + 16384·L)**: dense K/V and O16 are gone | never |
+
+Sliding kL ≤ 2,047, so the sliding excess is at most 8.4 MB per chunk. The
+global saving grows with context.
+
+The review's closure note gave the global saving as 4096·kL + 8192·L. The
+O16 term is 16 heads × 512 × 2 B = 16384·L per row, so the figure above
+uses 16384·L.
 
 Checks:
-- The warm forward logs its observed peak scratch bytes and the TOTAL
+- The warm forward logs its observed peak, scoped as above, and the TOTAL
   computed from its own logged shapes (§8.1 observability).
 - The long-context Q5 receipt (§9.2) passes only if every logged peak is
   ≤ its TOTAL.
