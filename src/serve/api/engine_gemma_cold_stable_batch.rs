@@ -166,6 +166,38 @@ fn serial_preference(
     }
 }
 
+/// The scheduler reservation for one cohort lane at its serial planning
+/// point: exactly the `AdmitRequest` `admit_gemma4_slot_routed` issues for a
+/// cold lane (no preferred slot). `None` when the lane is warm at that point
+/// or no longer a valid request, so the whole group goes per slot.
+#[allow(clippy::too_many_arguments)]
+fn cohort_admit_request(
+    retained_tokens: &[Vec<u32>],
+    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    prompt: &[u32],
+    params: &SamplingParams,
+    earlier: &[(usize, &[u32], usize)],
+    max_seq_len: usize,
+    graft_len: usize,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+) -> Option<AdmitRequest> {
+    if serial_preference(retained_tokens, prompt_anchors, prompt, earlier).is_some() {
+        return None;
+    }
+    let shape =
+        validate_gemma4_generation_request(prompt.len(), params.max_tokens, max_seq_len, graft_len)
+            .ok()?;
+    Some(gemma4_slot_admit_request(
+        shape,
+        prompt.len(),
+        graft_len,
+        per_slot_kv_budget_bytes,
+        kv_bytes_per_token,
+        None,
+    ))
+}
+
 /// One reserved cohort lane. Fields are visible to the real-artifact gates,
 /// which drive the transaction phases directly.
 pub(super) struct Lane {
@@ -310,14 +342,17 @@ pub(super) fn admit_cohort(
                 )
             })
             .collect();
-        let preference = serial_preference(retained_tokens, prompt_anchors, &prompt, &earlier);
-        let shape_check = validate_gemma4_generation_request(
-            prompt.len(),
-            params.max_tokens,
+        let Some(request) = cohort_admit_request(
+            retained_tokens,
+            prompt_anchors,
+            &prompt,
+            &params,
+            &earlier,
             max_seq_len,
             graft_len,
-        );
-        let (Ok(validated), None) = (shape_check, preference) else {
+            per_slot_kv_budget_bytes,
+            kv_bytes_per_token,
+        ) else {
             // At its serial planning point this lane is warm (or no longer
             // valid): nothing was reset, so today's path runs every lane.
             for lane in &lanes {
@@ -330,14 +365,6 @@ pub(super) fn admit_cohort(
                 .chain(pending.map(|((prompt, params, reply), _)| (prompt, params, reply)));
             return per_slot!(replay.collect::<Vec<_>>());
         };
-        let request = gemma4_slot_admit_request(
-            validated,
-            prompt.len(),
-            graft_len,
-            per_slot_kv_budget_bytes,
-            kv_bytes_per_token,
-            None,
-        );
         match scheduler.admit(request) {
             Ok(admitted) => match admitted.handle {
                 Some(handle) => lanes.push(Lane {
@@ -1110,6 +1137,114 @@ fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reservation order (design §6.1): the cohort's back-to-back
+    /// `AdmitRequest`s pick the same slots, in the same order, as the
+    /// per-slot path, whose admissions interleave each lane's reset and
+    /// prefill bookkeeping, including when a released slot retains KV.
+    #[test]
+    fn gemma_cold_cohort_reservation_order_matches_per_slot_path() {
+        const KV: u64 = 1_000;
+        const BUDGET: u64 = 8 * 4_096 * KV;
+        let prompts: Vec<Vec<u32>> = (0..4u32)
+            .map(|lane| (0..465).map(|token| lane * 10_000 + token).collect())
+            .collect();
+        let params = SamplingParams {
+            max_tokens: 64,
+            stable_prompt_prefix_tokens: Some(458),
+            ..SamplingParams::default()
+        };
+        let retained = vec![Vec::new(); 4];
+        let anchors: Vec<Option<Gemma4PromptAnchor>> = (0..4).map(|_| None).collect();
+        for retained_slot in [None, Some(2u32)] {
+            let fixture = || {
+                let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(8, 4, BUDGET);
+                if let Some(slot) = retained_slot {
+                    // A finished earlier request leaves measured KV on `slot`.
+                    let mut held = Vec::new();
+                    for _ in 0..=slot {
+                        let request = gemma4_slot_admit_request(
+                            Gemma4ValidatedRequestShape {
+                                prompt_tokens: 600,
+                                max_tokens: 64,
+                            },
+                            600,
+                            0,
+                            BUDGET,
+                            KV,
+                            None,
+                        );
+                        held.push(scheduler.admit(request).unwrap().handle.unwrap());
+                    }
+                    for handle in held {
+                        let bytes = if handle.slot_id.0 == slot {
+                            600 * KV
+                        } else {
+                            0
+                        };
+                        scheduler.record_slot_high_water(handle, bytes);
+                        scheduler.release(handle);
+                    }
+                }
+                scheduler
+            };
+
+            // Per-slot path: admit, reset bookkeeping, prefill, then the next.
+            let mut serial = fixture();
+            let mut serial_requests = Vec::new();
+            let mut serial_slots = Vec::new();
+            for prompt in &prompts {
+                let req = gemma4_slot_admit_request(
+                    validate_gemma4_generation_request(465, 64, 32_768, 0).unwrap(),
+                    465,
+                    0,
+                    BUDGET,
+                    KV,
+                    preferred_gemma4_slot_for_request(
+                        &retained,
+                        &anchors,
+                        &[None, None, None, None],
+                        prompt,
+                        None,
+                    )
+                    .map(|preference| preference.slot),
+                );
+                serial_requests.push(format!("{req:?}"));
+                let handle = serial.admit(req).unwrap().handle.unwrap();
+                record_retained_slot_kv(&mut serial, handle, 0, KV);
+                serial.advance_after_prefill(handle, 465);
+                serial_slots.push(handle.slot_id);
+            }
+
+            // Cohort: every reservation first, then the resets.
+            let mut joint = fixture();
+            let mut joint_requests = Vec::new();
+            let mut handles: Vec<SlotHandle> = Vec::new();
+            for prompt in &prompts {
+                let earlier: Vec<(usize, &[u32], usize)> = handles
+                    .iter()
+                    .zip(&prompts)
+                    .map(|(handle, prompt)| (handle.slot_id.0 as usize, prompt.as_slice(), 458))
+                    .collect();
+                let req = cohort_admit_request(
+                    &retained, &anchors, prompt, &params, &earlier, 32_768, 0, BUDGET, KV,
+                )
+                .expect("cold lane");
+                joint_requests.push(format!("{req:?}"));
+                handles.push(joint.admit(req).unwrap().handle.unwrap());
+            }
+            for &handle in &handles {
+                record_retained_slot_kv(&mut joint, handle, 0, KV);
+                joint.advance_after_prefill(handle, 465);
+            }
+            let joint_slots: Vec<SlotId> = handles.iter().map(|handle| handle.slot_id).collect();
+            assert_eq!(
+                joint_requests, serial_requests,
+                "retained={retained_slot:?}"
+            );
+            assert_eq!(joint_slots, serial_slots, "retained={retained_slot:?}");
+        }
+    }
 
     #[test]
     fn gemma_cold_replay_schedule_unequal_cues() {

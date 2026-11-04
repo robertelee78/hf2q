@@ -534,13 +534,19 @@ fn gemma_cold_multi_seq_matches_per_slot_bitwise() {
 }
 
 /// An engine whose worker resolves `HF2Q_GEMMA_JOINT_COLD_PREFILL=switch`.
+/// The variable stays set until the caller has served and shut the engine
+/// down (`shutdown`), so the worker can never start without it.
 fn spawn(switch: &str) -> Engine {
     std::env::set_var(gemma_cold_batch::JOINT_COLD_PREFILL_ENV, switch);
     let loaded = LoadedModel::load(&load_options()).expect("load official Gemma GGUF");
-    let engine = Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 })
-        .expect("spawn SlotAware Gemma engine");
+    Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 })
+        .expect("spawn SlotAware Gemma engine")
+}
+
+/// Shut down an engine from `spawn`, then clear the switch.
+fn shutdown(rt: &tokio::runtime::Runtime, engine: Engine) {
+    rt.block_on(engine.shutdown()).unwrap();
     std::env::remove_var(gemma_cold_batch::JOINT_COLD_PREFILL_ENV);
-    engine
 }
 
 fn engine_turn0(engine: &Engine) -> Vec<Shape> {
@@ -616,7 +622,7 @@ fn reference_turns(
         .map(Result::unwrap)
         .collect();
     assert_eq!(cohorts(), before, "switch off never forms a cold cohort");
-    rt.block_on(engine.shutdown()).unwrap();
+    shutdown(rt, engine);
     (lanes, t0, t1)
 }
 
@@ -663,7 +669,7 @@ fn gemma_joint_cold_engine_cohort_matches_serial_turn0() {
         .map(Result::unwrap)
         .collect();
     assert_turns("turn 1", &t1, &expected1);
-    rt.block_on(engine.shutdown()).unwrap();
+    shutdown(&rt, engine);
     println!(
         "GEMMA_JOINT_COLD_ENGINE_COMPLETE cohort_lanes=4 turn0_bitwise=true turn1_bitwise=true"
     );
@@ -699,7 +705,7 @@ fn gemma_joint_cold_forward_fault_retries_each_lane_per_slot() {
         .map(Result::unwrap)
         .collect();
     assert_turns("turn 1 after fault", &t1, &expected1);
-    rt.block_on(engine.shutdown()).unwrap();
+    shutdown(&rt, engine);
     println!("GEMMA_JOINT_COLD_FORWARD_FAULT_COMPLETE retried={retried:?} outputs_bitwise=true");
 }
 
@@ -738,7 +744,7 @@ fn gemma_joint_cold_cue_fault_restores_from_boundary_anchors() {
         .map(Result::unwrap)
         .collect();
     assert_turns("turn 1 after cue fault", &t1, &expected1);
-    rt.block_on(engine.shutdown()).unwrap();
+    shutdown(&rt, engine);
     println!("GEMMA_JOINT_COLD_CUE_FAULT_COMPLETE restored={restored:?} outputs_bitwise=true");
 }
 
@@ -789,12 +795,33 @@ fn gemma_joint_cold_cancel_during_transaction() {
             &expected0[agent],
         );
     }
-    // The cancelled lane's slot is recovered and released: a fresh turn-0
-    // request for it is admitted and answers like the reference.
+    // The cancelled lane's slot was recovered from its published boundary
+    // anchor and released: the same turn-0 request now resumes warm from
+    // the S-row anchor and answers like the reference.
     let again = rt
         .block_on(engine.generate(requests[3].0.clone(), requests[3].1.clone()))
         .unwrap();
-    assert_same("agent 3 after cancellation", &again, &expected0[3]);
-    rt.block_on(engine.shutdown()).unwrap();
+    assert_eq!(
+        again.cached_tokens, lanes[3].1,
+        "agent 3 resumed its S-row anchor"
+    );
+    let expected = &expected0[3];
+    assert_eq!(
+        again.text, expected.text,
+        "agent 3 after cancellation: text"
+    );
+    assert_eq!(
+        again.logprobs, expected.logprobs,
+        "agent 3 after cancellation: logprob bits"
+    );
+    assert_eq!(
+        again.finish_reason, expected.finish_reason,
+        "agent 3 after cancellation: finish"
+    );
+    assert_eq!(
+        again.completion_tokens, expected.completion_tokens,
+        "agent 3 after cancellation: completion tokens"
+    );
+    shutdown(&rt, engine);
     println!("GEMMA_JOINT_COLD_CANCEL_COMPLETE others_bitwise=true slot_recovered=true");
 }
