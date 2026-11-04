@@ -2,7 +2,7 @@
 
 - **Status:** Accepted program scope, F1/F3 execution entry, the separately reviewed F2/Q1/Q2/C1 source implementation entry and the 2026-11-03 measurement-only entry (see "Speed program, Q1 successors and release mapping"); other implementation designs require separate approval.
 - **Date:** 2026-10-22
-- **Updated:** 2026-11-03 (design approvals) — operator approval of the designs for Q4-GEMMA-KERNEL/Q4-GEMMA-ATTN (`docs/research/adr063-gemma-tiled-attn-design.md`), Q4-TRACE (`docs/research/adr063-q4-trace-design.md`, with its three §7 answers), Q1-QWEN36-SPEC/Q1-GEMMA-SPEC (`docs/research/adr063-q1-spec-design.md`; the unlocalized-`RouteSensitive` exception is rejected, Gemma results must be localized and #665 includes the verifier-route localizer) and Q4-DS4-RACE with ADR-066 N-IQ2XXS (`docs/research/adr066-iq2xxs-subset-design.md`); Q4-QWEN36: the conversion audit found no defect, and the first third-party check is unsloth UD-Q4_K_M under the canonical setup on both engines (see "Design approvals and Qwen3.6 decisions"). Earlier 2026-11-03 (C2 sign-offs) — owner sign-off of C2 (#360) decisions D1–D5 (`docs/research/adr063-c2-design.md` §10): divergent turns are judged by the Q1 decision envelope on every teacher-forced row of each divergent turn, `RouteSensitive` blocks; append-only turns keep `ExactTranscripts` plus the bitwise same-route twin; "≤ 1.025" limits are 95% CI upper bounds at Q3's sequential precision stop; campaigns use that stop instead of fixed blocks; anchor identity omits C1's `conversation` field; cancellation discards the request's own pending anchor. Earlier 2026-11-03 (later) — Q4-DS4 result Fit; Q4-DS4-RACE now consumes ADR-066 N-IQ2XXS (the IQ2_XXS subset as its own story) instead of N1/N3/N4; operator decision D1: on the ds4 file the race is judged against the peer only, and the vs-stock makespan contrast, fairness band and stock quality gate come from a same-artifact candidate-vs-v0.1.28 record on hf2q's own DeepSeek-V4 artifact with the same candidate binary; operator decision D2: ds4 runs on the same file in a declared same-artifact native-comparison campaign (design `docs/research/adr066-iq2xxs-subset-design.md`). Earlier 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with Q4-DS4-RACE, and Q4-QWEN36, with Q4-GEMMA-KERNEL (mlx-native) and Q4-TRACE; the measurement tracks Q4-GEMMA (profiling) and Q4-DS4 (fit) are split from their implementation tracks and their designs are operator-approved; Q4-DS4-RACE consumes the IQ2_XXS subset of ADR-066 N1/N3/N4 pulled ahead of ADR-066 B2; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b with J1 joining v0.1.30, frozen limits, delivery v0.1.30); remaining verification leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
+- **Updated:** 2026-11-03 (design approvals) — operator approval of the designs for Q4-GEMMA-KERNEL/Q4-GEMMA-ATTN (`docs/research/adr063-gemma-tiled-attn-design.md`), Q4-TRACE (`docs/research/adr063-q4-trace-design.md`, with its three §7 answers), Q1-QWEN36-SPEC/Q1-GEMMA-SPEC (`docs/research/adr063-q1-spec-design.md`; the unlocalized-`RouteSensitive` exception is rejected, Gemma results must be localized and #665 includes the verifier-route localizer) and Q4-DS4-RACE with ADR-066 N-IQ2XXS (`docs/research/adr066-iq2xxs-subset-design.md`); Q4-QWEN36: the conversion audit found no defect, and the first third-party check is unsloth UD-Q4_K_M under the canonical setup on both engines (see "Design approvals and Qwen3.6 decisions"). Earlier 2026-11-03 (C2 sign-offs) — owner sign-off of C2 (#360) decisions C2 D1–D5 (`docs/research/adr063-c2-design.md` §10): divergent turns are judged by the Q1 decision envelope on every teacher-forced row of each divergent turn, `RouteSensitive` blocks; append-only turns keep `ExactTranscripts` plus the bitwise same-route twin; "≤ 1.025" limits are 95% CI upper bounds at Q3's sequential precision stop; campaigns use that stop instead of fixed blocks; anchor identity omits C1's `conversation` field; cancellation discards the request's own pending anchor. Earlier 2026-11-03 (later) — Q4-DS4 result Fit (six of seven peer runs valid; best configuration provisional); Q4-DS4-RACE now consumes ADR-066 N-IQ2XXS (the IQ2_XXS subset as its own story) instead of N1/N3/N4; Q4-DS4-RACE decision D1: on the ds4 file the race is judged against the peer only, and the vs-stock makespan contrast, fairness band and stock quality gate come from a same-artifact candidate-vs-v0.1.28 record on hf2q's own DeepSeek-V4 artifact with the same candidate binary; Q4-DS4-RACE decision D2: ds4 runs on the same file in a declared same-artifact native-comparison campaign (design `docs/research/adr066-iq2xxs-subset-design.md`). Earlier 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with Q4-DS4-RACE, and Q4-QWEN36, with Q4-GEMMA-KERNEL (mlx-native) and Q4-TRACE; the measurement tracks Q4-GEMMA (profiling) and Q4-DS4 (fit) are split from their implementation tracks and their designs are operator-approved; Q4-DS4-RACE consumes the IQ2_XXS subset of ADR-066 N1/N3/N4 pulled ahead of ADR-066 B2; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b with J1 joining v0.1.30, frozen limits, delivery v0.1.30); remaining verification leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28, v0.1.30
 - Stable source ID: ADR-063
@@ -212,17 +212,17 @@ Acceptance:
 
 - No joint turn is refused `NotEligible` because of anchor capture/restore (a reason-tagged counter reads 0), and the joint-decode eligibility rate with anchors on is within the Q3 CI of anchors off on the same workload and binary.
 
-- Frozen limits: divergent-turn worst-slot semantic TTFT, paired against cold on the same binary with the anchors kill switch, has a Q3 Williams-block (5–20 blocks) 95% CI that excludes 0 in the improving direction; append-only four-agent makespan and worst-slot TTFT p95/SSE-gap max ratios have 95% CI upper bounds ≤ 1.025 against anchors off under the Q3 sequential precision stop (owner decision D2, 2026-11-03; stricter than the Q3 regression band); process footprint with anchors on is ≤ 1.25× a fresh Q5 calibration.
+- Frozen limits: divergent-turn worst-slot semantic TTFT, paired against cold on the same binary with the anchors kill switch, has a Q3 Williams-block (5–20 blocks) 95% CI that excludes 0 in the improving direction; append-only four-agent makespan and worst-slot TTFT p95/SSE-gap max ratios have 95% CI upper bounds ≤ 1.025 against anchors off under the Q3 sequential precision stop (C2 decision D2, owner, 2026-11-03; stricter than the Q3 regression band); process footprint with anchors on is ≤ 1.25× a fresh Q5 calibration.
 
-- C2 campaigns use Q3's pre-registered sequential 2.5-point precision stop (`q3_stats.stop_decision`, 5–20 blocks), not a fixed block count; a fixed count is used only if the owner chooses one from a labelled pilot that is never pooled (owner decision D3, 2026-11-03).
+- C2 campaigns use Q3's pre-registered sequential 2.5-point precision stop (`q3_stats.stop_decision`, 5–20 blocks), not a fixed block count; a fixed count is used only if the owner chooses one from a labelled pilot that is never pooled (C2 decision D3, owner, 2026-11-03).
 
 - Fresh Q5 calibration for Qwen3.8 and Qwen3.6 with the declared anchors per slot at the declared workload precedes any C2 hardware run.
 
-- Qwen3.6 is judged by cold-versus-resumed bitwise exactness against the same-route twin, `ExactTranscripts` against anchors off on the append-only workload, and, on divergent turns, the Class B decision envelope (Q1 numeric policy §3.2, D ≤ 0.25 nat) on every logit row of each divergent turn against teacher-forced anchors-off rows on the same frozen prefix; any `RouteSensitive` row blocks C2 until localized. Task pass rate is not used while no workload on which Qwen3.6 passes is declared (Q4-QWEN36). Qwen3.8 is judged by the same rules and additionally passes the paired task-quality gate (owner decision D1, 2026-11-03: an anchors-on resume of a divergent turn is a Class B alternate route, so bitwise transcripts cannot be required there).
+- Qwen3.6 is judged by cold-versus-resumed bitwise exactness against the same-route twin, `ExactTranscripts` against anchors off on the append-only workload, and, on divergent turns, the Class B decision envelope (Q1 numeric policy §3.2, D ≤ 0.25 nat) on every logit row of each divergent turn against teacher-forced anchors-off rows on the same frozen prefix; any `RouteSensitive` row blocks C2 until localized. Task pass rate is not used while no workload on which Qwen3.6 passes is declared (Q4-QWEN36). Qwen3.8 is judged by the same rules and additionally passes the paired task-quality gate (C2 decision D1, owner, 2026-11-03: an anchors-on resume of a divergent turn is a Class B alternate route, so bitwise transcripts cannot be required there).
 
-- The anchor identity omits C1's `conversation` field, so exact prefixes are shared across clients as today (owner decision D4, 2026-11-03; departs from C1's normative identity list).
+- The anchor identity omits C1's `conversation` field, so exact prefixes are shared across clients as today (C2 decision D4, owner, 2026-11-03; departs from C1's normative identity list).
 
-- Cancellation discards the request's own pending anchor; the cancel-smoke retry TTFT and recovered-depth figures are attached to the C2 receipt (owner decision D5, 2026-11-03).
+- Cancellation discards the request's own pending anchor; the cancel-smoke retry TTFT and recovered-depth figures are attached to the C2 receipt (C2 decision D5, owner, 2026-11-03).
 
 - Primary Qwen3.8 evidence uses the vanilla official 27B dense model; grafted/abliterated variants remain separate compatibility arms. Family parity obligations for future Gemma/DeepSeek implementations remain explicit successors, not a universal multi-anchor shipping claim.
 
@@ -532,7 +532,7 @@ Acceptance:
 
 - Fairness: worst-slot TTFT p95 and SSE-gap max ratios against v0.1.28 stock stay within the stock fairness band 1.025 (`NEUTRAL_RATIO`). Vs-peer TTFT ratios are disclosed, not gated; SSE gaps against the peer are shown as not comparable.
 
-- DeepSeek-V4 exception (operator decision D1, 2026-11-03): no released hf2q opens ds4's file, so in Q4-DS4-RACE the vs-stock makespan gain, its precision, this fairness band and the v0.1.28 quality gate are taken from a same-artifact candidate-vs-v0.1.28 campaign on hf2q's own DeepSeek-V4 artifact run with the same candidate binary, bound into the ds4-file record campaign by path and sha256; the ds4-file campaign itself measures only the peer contrast.
+- DeepSeek-V4 exception (Q4-DS4-RACE decision D1, operator, 2026-11-03): no released hf2q opens ds4's file, so in Q4-DS4-RACE the vs-stock makespan gain, its precision, this fairness band and the v0.1.28 quality gate are taken from a same-artifact candidate-vs-v0.1.28 campaign on hf2q's own DeepSeek-V4 artifact run with the same candidate binary, bound into the ds4-file record campaign by path and sha256; the ds4-file campaign itself measures only the peer contrast.
 
 - Each family's accepted configuration passes a fresh Q5 calibration on the release candidate.
 
@@ -627,13 +627,13 @@ Requirement: mlx-native MUST provide, under a stated primitive contract, a tiled
 
 Acceptance:
 
-- A linked mlx-native issue states the primitive contract before implementation: input layouts (F16 K cache, dequantized TQ-HB V, Q rows), sliding and global masks, scale and softcap, supported head dimensions, F32 accumulation and F32 output, and the tolerance against an F32 reference attention.
+- A linked mlx-native issue states the primitive contract before implementation: input layouts (F16 K cache, dequantized TQ-HB V, Q rows), sliding and global masks, scale and softcap, supported head dimensions, F32 accumulation and F32 output, and the tolerance against an F64 reference attention (design §5.1).
 
 - Design approved by the operator, 2026-11-03: `docs/research/adr063-gemma-tiled-attn-design.md` §3–§7 (F16 Q and K with F32 scores, softmax, V operand, accumulator and stored O; one dispatcher pair, d256 sliding and d512 global; existing F16/BF16 entry points stay bit-identical; tolerances frozen in §5.1 against an F64 reference). It extends the #552 patch rather than adopting it.
 
 - The draft F32-accumulate/F32-output patch from the closed PR #552, kept on branch `exp/gemma-tiled-precise` (`docs/research/adr063-gemma-tiled-precise-mlx-native.patch`, with the diagnosis in `docs/research/adr063-gemma-tiled-precise.md`), is the starting point; the branch is retained until the kernel lands or is falsified.
 
-- Primitive parity tests against an F32 reference attention and against the vec-hybrid route pass at Gemma 4 warm-resume shapes, and a microbenchmark compares it with `TiledF16` and `VecHybrid` at those shapes.
+- Primitive parity tests against an F64 reference attention (design §5.1) and against the vec-hybrid route pass at Gemma 4 warm-resume shapes, and a microbenchmark compares it with `TiledF16` and `VecHybrid` at those shapes.
 
 - The kernel is merged, released, verified on crates.io and available for an exact hf2q pin.
 
@@ -737,13 +737,13 @@ Requirement: The program MUST support the IQ2_XXS ds4 file in hf2q by consuming 
 
 Acceptance:
 
-- A written design, approved before implementation, states the loader, tensor mapping and quality checks for this file. Approved by the operator, 2026-11-03: `docs/research/adr066-iq2xxs-subset-design.md` (loader changes L1–L9, no hf2q kernel; quality checks §6; race plan §7 under decisions D1/D2; harness changes §8).
+- A written design, approved before implementation, states the loader, tensor mapping and quality checks for this file. Approved by the operator, 2026-11-03: `docs/research/adr066-iq2xxs-subset-design.md` (loader changes L1–L9, no hf2q kernel; quality checks §6; race plan §7 under Q4-DS4-RACE decisions D1/D2; harness changes §8).
 
-- Starting point (Q4-DS4, #661): Fit. The peer had 7 of 7 valid runs on this file; its best valid configuration is load mode none with ubatch 1024, makespan median 65.2 s (evidence `/Users/robert/.local/state/hf2q/v0130/q4-ds4/`).
+- Starting point (Q4-DS4, #661): Fit. Six of seven peer runs were valid (f1 was `ClientFailed` and ran no model requests). By the declared makespan rule the best valid configuration is load mode none with ubatch 1024 (median 65.2 s). It is provisional and within noise of auto/1024, so before the verdict of record this story re-runs none/1024, auto/1024 and none/512 on this file (evidence `/Users/robert/.local/state/hf2q/v0130/q4-ds4/`).
 
 - Consume the IQ2_XXS storage type, CPU dequantization, grids and expert kernels of ADR-066 N-IQ2XXS, which gains parity at DeepSeek-V4-Flash expert shapes (256 experts, top-6) and proves the Q2_K expert kernels at the down shape; no duplicate kernels. ADR-066 N1/N3/N4 build on N-IQ2XXS and are not predecessors. Add the hf2q loader for this file and the quality checks (tensor-load parity, real-weight kernel parity, joint == serial bitwise on this file, paired task-quality gate).
 
-- Fresh Q5 calibration of hf2q on this file. The verdict of record runs hf2q (experiment) and the peer on this file under the Q3 design, with no stock arm, bound to a same-artifact candidate-vs-v0.1.28 campaign on hf2q's own artifact for the vs-stock contrast, fairness band and stock quality gate (operator decision D1, 2026-11-03; Q4 DeepSeek-V4 exception). ds4 runs on the same file in a separately labeled native-comparison campaign that declares the shared artifact (operator decision D2, 2026-11-03); it never enters the verdict.
+- Fresh Q5 calibration of hf2q on this file. The verdict of record runs hf2q (experiment) and the peer on this file under the Q3 design, with no stock arm, bound to a same-artifact candidate-vs-v0.1.28 campaign on hf2q's own artifact for the vs-stock contrast, fairness band and stock quality gate (Q4-DS4-RACE decision D1, operator, 2026-11-03; Q4 DeepSeek-V4 exception). ds4 runs on the same file in a separately labeled native-comparison campaign that declares the shared artifact (Q4-DS4-RACE decision D2, operator, 2026-11-03); it never enters the verdict.
 
 - A per-stage attribution of the hf2q-versus-peer gap on the same file and run (prefill, decode, MoE/attention, dispatch, scheduling, SSE cadence), with stated distortion.
 
@@ -753,7 +753,7 @@ Acceptance:
 
 Repository ownership: mlx-native owns the IQ2_XXS type, grids, kernels and their parity tests through ADR-066 N-IQ2XXS; hf2q owns the loader for this file, quality checks, the harness changes, Q5 calibration and campaigns.
 
-Validation: Independent review of the design, the parity and quality receipts and the three-arm campaign.
+Validation: Independent review of the design, the parity and quality receipts, the bound same-artifact stock record, the ds4-file campaign of record and the same-file native comparison.
 
 Predecessors: Q4-DS4 (#661, fit result), ADR-066 N-IQ2XXS (pulled ahead of ADR-066 B2, operator decision 2026-11-03), Q5 (#371).
 
@@ -1423,13 +1423,15 @@ determination), Q4-GEMMA (#660, the profiling track), Q1-QWEN38-RERUN
 tracks (Q4-DS4-RACE, Q4-GEMMA-ATTN) so that per-issue tracker blockers do
 not hold the approved measurement work.
 
-Later decisions (operator, 2026-11-03), after Q4-DS4 reported Fit (peer
-7/7 valid runs, best valid configuration load mode none / ubatch 1024,
-makespan median 65.2 s; `/Users/robert/.local/state/hf2q/v0130/q4-ds4/`)
+Later decisions (operator, 2026-11-03), after Q4-DS4 reported Fit (six of
+seven peer runs valid, f1 `ClientFailed`; provisional best valid
+configuration load mode none / ubatch 1024, makespan median 65.2 s, within
+noise of auto/1024, so Q4-DS4-RACE re-runs none/1024, auto/1024 and
+none/512; `/Users/robert/.local/state/hf2q/v0130/q4-ds4/`)
 and the Q4-DS4-RACE design review
 (`docs/research/adr066-iq2xxs-subset-design.md`):
 
-- **D1, stock arm on ds4's file.** No released hf2q opens the file, and
+- **Q4-DS4-RACE decision D1, stock arm on ds4's file.** No released hf2q opens the file, and
   comparing v0.1.28 on a different artifact would mix an artifact change
   with the engine change (AGENTS.md: compare identical artifacts). The
   ds4-file campaign of record therefore runs without a stock arm and is
@@ -1439,7 +1441,7 @@ and the Q4-DS4-RACE design review
   same candidate binary, bound by path and sha256. This needs a no-stock-arm
   campaign mode and matching `required_references`/`family_verdict`
   changes in the harness.
-- **D2, ds4 on the same file.** ds4 c97964b runs on the same file only in a
+- **Q4-DS4-RACE decision D2, ds4 on the same file.** ds4 c97964b runs on the same file only in a
   `--native-comparison` campaign whose native case declares the shared
   artifact. Both sha256 values must be present and equal, the declaration
   is part of the frozen campaign identity, `--peer-unavailable-evidence` is
@@ -1450,18 +1452,18 @@ and the Q4-DS4-RACE design review
 C2 sign-offs (owner, 2026-11-03), from `docs/research/adr063-c2-design.md`
 §10; they amend C2's acceptance text:
 
-- **D1, divergent-turn gate.** On divergent turns anchors-on resumes from a
+- **C2 decision D1, divergent-turn gate.** On divergent turns anchors-on resumes from a
   state built by a different transaction history, a Class B alternate
   route. Every logit row of each divergent turn is checked against
   teacher-forced anchors-off rows and must be `WithinDecisionEnvelope`; any
   `RouteSensitive` row blocks until localized. Append-only turns keep
   `ExactTranscripts`, and bitwise exactness is proven by the same-route twin
   on both artifacts.
-- **D2, "≤ 1.025".** Read as the paired-ratio 95% CI upper bound at Q3's
+- **C2 decision D2, "≤ 1.025".** Read as the paired-ratio 95% CI upper bound at Q3's
   sequential precision stop.
-- **D3, block count.** Q3's sequential stop, not fixed blocks.
-- **D4, anchor identity.** Omits C1's `conversation` field.
-- **D5, cancellation.** Discards the request's own pending anchor.
+- **C2 decision D3, block count.** Q3's sequential stop, not fixed blocks.
+- **C2 decision D4, anchor identity.** Omits C1's `conversation` field.
+- **C2 decision D5, cancellation.** Discards the request's own pending anchor.
 
 Design approvals and Qwen3.6 decisions (operator, 2026-11-03):
 

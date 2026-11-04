@@ -2,7 +2,7 @@
 
 Status: design for approval, revision 2 (2026-11-03). Revision 2 applies the
 independent review (ACCEPT-WITH-CONDITIONS, findings 1–14), the operator
-decisions D1 and D2 (§9) and the Q4-DS4 Fit result (§7.1). No code, build or
+Q4-DS4-RACE decisions D1 and D2 (§9) and the Q4-DS4 Fit result (§7.1). No code, build or
 GPU run backs this document. The header comparison and sample tensor parity
 in §2 were measured on the CPU from two small reads (headers and a few MB of
 tensor bytes). Every other number is quoted from source with its
@@ -78,7 +78,7 @@ Evidence directory: `/Users/robert/.local/state/hf2q/v0130/q4-ds4-race-design/`
    real-weight kernel parity (§6.2), the S3 bitwise joint == serial check on
    this file (§6.3), 0731 non-regression on hf2q's artifact (§6.4) and the
    paired task-quality gates (§6.5).
-5. **Race (§7), under operator decisions D1 and D2 (§9).** Q4-DS4 reported
+5. **Race (§7), under Q4-DS4-RACE decisions D1 and D2 (§9).** Q4-DS4 reported
    Fit. After a fresh Q5 calibration of hf2q on this file, three campaigns
    run with the same candidate binary:
    - a same-artifact candidate-vs-v0.1.28 campaign on hf2q's own artifact,
@@ -475,7 +475,7 @@ four-agent race.
 
 ### 3.8 Release and pin
 
-The work is one mlx-native PR and one release, the next patch after 0.15.16:
+The work is one mlx-native PR and one release, a later mlx-native release after 0.15.17:
 - crates.io bytes verified;
 - `mlx-native = "=<version>"` pinned in hf2q from a clean registry build;
 - the native-primitive closure of ADR-066's table.
@@ -669,9 +669,12 @@ quality campaign.
 
 ### 7.1 Preconditions
 
-- **Q4-DS4 (#661) reported Fit.** The peer had 7 of 7 valid runs on this
-  file. Its best valid configuration is load mode none with ubatch 1024,
-  makespan median 65.2 s. Evidence: `/Users/robert/.local/state/hf2q/v0130/q4-ds4/`
+- **Q4-DS4 (#661) reported Fit.** Six of seven peer runs were valid (f1 was
+  `ClientFailed` and ran no model requests). By the declared makespan rule
+  the best valid configuration is load mode none with ubatch 1024 (median
+  65.2 s). It is provisional and within noise of auto/1024, so before the
+  verdict of record Q4-DS4-RACE re-runs none/1024, auto/1024 and none/512 on
+  this file. Evidence: `/Users/robert/.local/state/hf2q/v0130/q4-ds4/`
   (`runs/peer-*`, `stage-profile-comparison.{json,txt}`).
 - Had Q4-DS4 reported no-fit, only §3 (N-IQ2XXS, ADR-066 scope) could have
   landed. §4 and every later section belong to Q4-DS4-RACE, which ADR-063
@@ -949,7 +952,7 @@ the behaviour of an existing campaign. Line numbers refer to `d817dffa`.
 
 Both are recorded in ADR-063 (commit `64c6f902`).
 
-- **D1, the stock arm: option (b), as the review recommended.**
+- **Q4-DS4-RACE decision D1, the stock arm: option (b), as the review recommended.**
   - **Why there is no stock arm on this file.** v0.1.28 and v0.1.29 cannot
     open it (`unsupported GGML type ID 16`, `R/src/gguf/mod.rs:412-414`).
     Running v0.1.28 on a different artifact would mix the artifact change
@@ -963,7 +966,7 @@ Both are recorded in ADR-063 (commit `64c6f902`).
   - **Consequence.** The Q4 vs-stock rule (95% CI of the ratio below 1)
     still applies, so the candidate must also be measurably faster than
     v0.1.28 on hf2q's artifact for a Win.
-- **D2, ds4 on the same file: the widened declaration (§8.2).**
+- **Q4-DS4-RACE decision D2, ds4 on the same file: the widened declaration (§8.2).**
   - The declaration is bound into the native case and the campaign
     identity.
   - Both sha256 values must be present and equal.
