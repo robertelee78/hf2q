@@ -28,8 +28,8 @@ SCHEMA = 'hf2q.q1.endpoint-supervisor-bindings.v1'
 REVIEW_SCHEMA = 'hf2q.q1.endpoint-operating-review.v1'
 AMBIENT = ('HF2Q_', 'MLX_', 'MTL_', 'METAL_', 'DYLD_', 'RUST_TEST_')
 NULLABLE_IDENTITY = ('native_checksum',)  # filled from the composition comparison key
-# Qwen3.8 records no active64 restore (dense, boundaries 128/144 only).
-RESTORE64_FIELD = {'gemma': 'active64_exact_copy', 'qwen38': None,
+# Qwen T1 records the source and restored active64 caches (qwen_checkpoint::captures64, both families).
+RESTORE64_FIELD = {'gemma': 'active64_exact_copy', 'qwen38': 'qwen38_restore64_exact',
                    'qwen36': 'qwen36_restore64_exact', 'deepseek': 'full_active64_exact_restore'}
 PLANNED_FIELD = {'gemma': 'planned_tensor_payload', 'qwen38': 'planned_tensor_payload_bytes',
                  'qwen36': 'planned_tensor_payload_bytes', 'deepseek': 'planned_capture_bytes'}

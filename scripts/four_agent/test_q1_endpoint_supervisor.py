@@ -67,6 +67,14 @@ class SingleRead(unittest.TestCase):
                 s.load({"path": "relative.json", "sha256": pinned}, "pin")
 
 
+class RestoreField(unittest.TestCase):
+    def test_every_qwen_family_requires_its_t1_restore64_field(self):
+        # qwen_actual.rs writes `<family>_restore64_exact` for Qwen3.6 and Qwen3.8 T1Resume64.
+        self.assertEqual(s.RESTORE64_FIELD["qwen36"], "qwen36_restore64_exact")
+        self.assertEqual(s.RESTORE64_FIELD["qwen38"], "qwen38_restore64_exact")
+        self.assertTrue(all(s.RESTORE64_FIELD.values()))
+
+
 class CasePlan(unittest.TestCase):
     def test_endpoint_plan_uses_family_launch_and_case_filter_override(self):
         b = bindings({"t0": {"trajectory": "T0ColdSerial"},

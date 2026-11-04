@@ -95,7 +95,7 @@ pub(super) fn plan(
         "explicit Qwen vocabulary/family/variant"
     );
     ensure!((144..=262144).contains(&capacity), "endpoint capacity 144..=262144");
-    ensure!(payload_limit <= 2 * 1024 * 1024 * 1024, "endpoint payload limit <= 2 GiB");
+    ensure!(payload_limit <= qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX, "endpoint payload limit <= 4 GiB");
     let recipe = qwen_checkpoint::endpoint_recipe(work.family, capacity, header_cfg);
     let mut packets = Vec::with_capacity(TRAJECTORIES.len());
     for trajectory in TRAJECTORIES {
@@ -320,7 +320,8 @@ fn run() -> Result<()> {
             "mtp_positions": config.mtp_positions,
         });
         let encoded = serde_json::to_vec_pretty(&packet)?;
-        ensure!(encoded.len() + 65536 <= 1024 * 1024, "packet must fit qwen_actual 1 MiB read");
+        ensure!(encoded.len() + 65536 <= qwen_checkpoint::ENDPOINT_PACKET_READ_LIMIT,
+            "packet must fit the qwen_actual packet read limit");
         files.push((format!("packet-{}.json", trajectory.label()), encoded));
     }
     let value = serde_json::json!({
