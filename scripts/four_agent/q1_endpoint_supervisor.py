@@ -97,7 +97,7 @@ def case_plan(b, name):
         require(type(checks) is list and checks and len(set(checks)) == len(checks) and all(type(x) is str and x in MULTISTORE_CHECKS for x in checks), 'closed registry checks')
         line = c.get('completion_line')
         require(line is None or (type(line) is str and c['completion_marker'] in line), 'fixed completion line names the marker')
-        require('manifest' not in c or (type(c['manifest']) is dict and set(c['manifest']) == {'path', 'sha256'}), 'bound extent manifest')
+        require('manifest' not in c or (type(c['manifest']) is dict and set(c['manifest']) == {'path', 'sha256'} and type(c['manifest']['path']) is str and Path(c['manifest']['path']).is_absolute()), 'bound extent manifest at an absolute path')
         return dict(kind=kind, mode='multistore', filter=c['filter'], packet_env=c['packet_env'], completion_marker=c['completion_marker'], marker_stream=c['marker_stream'], stores=dict(stores), checks=list(checks), completion_line=line)
     require(kind == 'localizer' and set(c) == LOCALIZER_CASE_KEYS and launch, 'closed localizer case: own filter/env/marker, no trajectory')
     return dict(kind=kind, mode='localizer', filter=c['filter'], packet_env=c['packet_env'], completion_marker=c['completion_marker'], marker_stream=c['marker_stream'])
@@ -294,6 +294,8 @@ def check_gemma_loc4(out, b, case, plan, packet, extent, execution, stores, iden
     """Gemma four-lane stage localizer (#652): the unchanged T0/T2 endpoint store plus a four-lane stage store."""
     trajectory = packet.get('trajectory'); stage = packet.get('stage_localizer')
     require(b['family'] == 'gemma' and plan['stores'] == {'endpoint': '.', 'stages': 'stages'} and trajectory in COHORT_ROUTES and type(stage) is dict, 'Gemma All128/packed localizer stores')
+    # The canonical routing bank is part of this route's evidence: never skipped (spec Part 3; only DriftAll128 may omit it).
+    require(type(b.get('routing_witness')) is dict and type(packet.get('routing_witness')) is dict, 'cohort localizer requires the routing witness in bindings and packet')
     require(extent['lanes'] == [0, 1, 2, 3] and policy.get('lanes') == 4 and type(policy.get('stage_payload_upper_bytes')) is int, 'four-lane extent and resource policy')
     staged = stores['stages']
     require(execution['schema'] == COHORT_SCHEMA and execution['trajectory'] == trajectory and execution['stage_route'] == COHORT_ROUTES[trajectory] and execution['rerun_id'] == stage['rerun_id'] and execution['stage_store'] == 'stages' and execution['lanes'] == [0, 1, 2, 3] and execution['stage_records'] == len(staged['captured']), 'cohort localizer receipt for this route')

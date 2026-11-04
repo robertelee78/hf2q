@@ -199,6 +199,10 @@ class MultistorePlan(unittest.TestCase):
                     {**MULTISTORE_CASE, "stores": {"endpoint": ".", "stages": "."}},
                     {**MULTISTORE_CASE, "completion_line": "OTHER_MARKER records=1"},
                     {**MULTISTORE_CASE, "manifest": {"path": "/x/m.json"}},
+                    # refused at plan time, before any launch consumes the one-attempt review
+                    {**MULTISTORE_CASE, "manifest": {"path": "m.json", "sha256": "0" * 64}},
+                    {**MULTISTORE_CASE, "manifest": {"path": "./sub/m.json", "sha256": "0" * 64}},
+                    {**MULTISTORE_CASE, "manifest": {"path": None, "sha256": "0" * 64}},
                     {**MULTISTORE_CASE, "operating_review": {"path": "/x/review.json", "sha256": "0" * 64}},
                     {k: v for k, v in MULTISTORE_CASE.items() if k != "stores"},
                     {**MULTISTORE_CASE, "marker_stream": "receipt.json"}):
@@ -301,12 +305,14 @@ class GemmaLoc4(unittest.TestCase):
                         packet={"trajectory": trajectory, "workload": {"lanes": self.LANES},
                                 "stage_localizer": {"rerun_id": "cohort-packed", "host_payload_limit": 16 * 512},
                                 "lanes": [0, 1, 2, 3], "host_payload_limit": 8 * 576 + 16 * 512,
+                                "routing_witness": {"payload_bytes": 1, "metadata_bytes": 1, "cpu_ledger_bytes": 1},
                                 "expected_stores": {"endpoint": logits, "stages": stages}},
                         execution={"whole_q1_qualified": False, "planned_tensor_payload": 8 * 576, "warm_live_kernel": "VecHybrid",
                                    "schema": s.COHORT_SCHEMA, "trajectory": trajectory, "stage_route": s.COHORT_ROUTES.get(trajectory),
                                    "rerun_id": "cohort-packed", "stage_store": "stages", "lanes": [0, 1, 2, 3],
                                    "stage_records": 512, "stage_planned_payload": 16 * 512},
-                        logits=logits, stages=stages, records=576 + 512, plan_case=dict(MULTISTORE_CASE))
+                        logits=logits, stages=stages, records=576 + 512, plan_case=dict(MULTISTORE_CASE),
+                        witness={"layers": 1, "metadata_limit_bytes": 1 << 20}, witness_rows=[(l, p) for l in range(4) for p in range(144)])
             if mutate:
                 mutate(case)
             packet = case["packet"]
@@ -314,11 +320,18 @@ class GemmaLoc4(unittest.TestCase):
             case["execution"]["packet_sha256"] = s.sha(out / "packet.json")
             write_run(out, case["execution"], case["logits"])
             (out / "output/stages").mkdir()
+            rows = [{"kind": "routing_row", "native_boundary_valid": True, "selected_copy_valid": True, "native_decode_error": None,
+                     "qualified": False, "scores_f32_bits": [0], "selected_weights_f32_bits": [0x3f800000],
+                     "at": {"namespace": "Canonical", "row": {"lane": l, "position": p}, "layer": 0}} for l, p in case["witness_rows"]]
+            (out / "output/routing-witness.jsonl").write_text("\n".join(json.dumps(x) for x in
+                [{"kind": "header", "identity": IDENTITY, "qualified": False}] + rows +
+                [{"kind": "end", "records": len(rows), "all_scored_rows_captured": True, "full_Q1_qualified": False}]) + "\n")
             (out / "output/stages/trace.json").write_text(json.dumps({"identity": IDENTITY,
                 "acquisition": {"observed_model_opens": 3, "required_model_opens": 3},
                 "coverage": {"captured": case["stages"], "expected": case["stages"], "errors": []}}))
             (out / "stdout").write_text("test result: ok.\nQ1_GEMMA_COHORT_STAGE_LOCALIZER_COMPLETE records=%d whole_q1_qualified=false\n" % case["records"])
-            b = bindings({"t0": {"trajectory": "T0ColdSerial"}, "loc4": case["plan_case"]})
+            cases = {"t0": {"trajectory": "T0ColdSerial"}, "loc4": case["plan_case"]}
+            b = {**bindings(cases), "routing_witness": case["witness"]} if case["witness"] is not None else bindings(cases)
             plan = s.case_plan(b, "loc4")
             extent = s.multistore_extent(case["plan_case"], packet, None)
             return s.validate_multistore(out, b, "loc4", plan, packet, extent, IDENTITY, case["policy"])
@@ -360,8 +373,14 @@ class GemmaLoc4(unittest.TestCase):
             c["packet"]["trajectory"] = "T3Chunk64"
         def no_plan(c):
             del c["packet"]["stage_localizer"]
+        def no_bindings_witness(c):  # the bank would otherwise go unchecked
+            c["witness"] = None
+        def no_packet_witness(c):
+            del c["packet"]["routing_witness"]
+        def short_bank(c):
+            c["witness_rows"] = c["witness_rows"][:-1]
         for mutate in (drop_lane, foreign_lane, drift, route, stage_bytes, two_lane_policy, stage_policy, host,
-                       marker, stores, missing_logit, ordinary_axis, no_plan):
+                       marker, stores, missing_logit, ordinary_axis, no_plan, no_bindings_witness, no_packet_witness, short_bank):
             with self.subTest(mutate.__name__), self.assertRaises((ValueError, KeyError, FileNotFoundError)):
                 self.run_case(mutate=mutate)
 
