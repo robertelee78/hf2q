@@ -31,7 +31,13 @@ struct LocalizerRoute {rerun_id:String,prefill_chunks:Vec<usize>}
 struct Localizer {agent:usize,layers:Vec<u32>,stages:Vec<Stage>,normalize_rows:bool,routes:Vec<LocalizerRoute>}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CohortLocalizer {layers:Vec<u32>,prefill_stages:Vec<Stage>,decode_stages:Vec<Stage>}
+struct CohortLocalizer {layers:Vec<u32>,prefill_stages:Vec<Stage>,decode_stages:Vec<Stage>,
+    /// Endpoint store the All128 route's endpoint store must be `ExactEqual` to.
+    #[serde(default="all128_reference")] observer_effect_reference:String,
+    /// Endpoint store the packed route's endpoint store must be `ExactEqual` to.
+    #[serde(default="packed_reference")] packed_observer_effect_reference:String}
+fn all128_reference()->String {"gemma-t0-b3".into()}
+fn packed_reference()->String {"gemma-t2-b3".into()}
 fn exact_hex(s:&str,n:usize)->bool {s.len()==n && s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))}
 fn output_preflight(path:&Path)->Result<()> {
     ensure!(path.is_absolute() && !path.ancestors().any(|p|p.join(".git").exists()),"private output outsideGit");
@@ -173,9 +179,13 @@ fn cohort_localizer_export(c:&Config,l:&CohortLocalizer,cfg:&crate::serve::confi
         "cpu_ledger_bytes":witness::CPU_LEDGER_BYTES});
     let charge=witness::PAYLOAD_BYTES+witness::METADATA_BYTES+witness::CPU_LEDGER_BYTES;
     let mut files=Vec::new();let mut routes=Vec::new();
+    for reference in [&l.observer_effect_reference,&l.packed_observer_effect_reference] {
+        ensure!(!reference.is_empty() && reference.len()<=64
+            && reference.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'||b==b'_'),"file-safe observer-effect reference store");
+    }
     for (name,trajectory,filter,reference) in [
-        ("all128",super::protocol::Trajectory::T0ColdSerial,"adr063_invariance::gemma_actual::q1_gemma_actual_all128_stage_localizer","gemma-t0-b3"),
-        ("packed",super::protocol::Trajectory::T2ActualCohort,"adr063_invariance::gemma_actual::q1_gemma_actual_cohort_stage_localizer","gemma-t2-b3")] {
+        ("all128",super::protocol::Trajectory::T0ColdSerial,"adr063_invariance::gemma_actual::q1_gemma_actual_all128_stage_localizer",&l.observer_effect_reference),
+        ("packed",super::protocol::Trajectory::T2ActualCohort,"adr063_invariance::gemma_actual::q1_gemma_actual_cohort_stage_localizer",&l.packed_observer_effect_reference)] {
         let endpoint=super::gemma_actual::endpoint_expected(cfg,trajectory)?;
         let endpoint_bytes=endpoint.iter().try_fold(0u64,|sum,e|e.shape.iter()
             .try_fold(e.scalar.bytes() as u64,|n,&d|n.checked_mul(d as u64)).and_then(|n|sum.checked_add(n)))

@@ -239,6 +239,20 @@ fn cohort_localizer_prep_emits_two_admissible_multistore_packets() {
         vec!["cohort-localizer-prepared.json","cohort-localizer-packet-all128.json","cohort-localizer-packet-packed.json"]);
     let prepared:serde_json::Value=serde_json::from_slice(&files[0].1).unwrap();
     assert_eq!(prepared["supervisor_case"]["kind"],"multistore");
+    // Defaults are the b3 endpoint stores of the same trajectories.
+    assert_eq!(prepared["routes"][0]["observer_effect_reference"],"gemma-t0-b3");
+    assert_eq!(prepared["routes"][1]["observer_effect_reference"],"gemma-t2-b3");
+    let export=|block:serde_json::Value| {
+        let mut v=localizer_config(None);v["cohort_localizer"]=block;
+        let c:Config=serde_json::from_value(v).unwrap();
+        cohort_localizer_export(&c,c.cohort_localizer.as_ref().unwrap(),&cfg(),&work,&"b".repeat(40),&"c".repeat(64),b"raw")
+    };
+    let mut named=block.clone();named["observer_effect_reference"]=serde_json::json!("gemma-t0-b5g");
+    let named:serde_json::Value=serde_json::from_slice(&export(named).unwrap()[0].1).unwrap();
+    assert_eq!(named["routes"][0]["observer_effect_reference"],"gemma-t0-b5g");
+    assert_eq!(named["routes"][1]["observer_effect_reference"],"gemma-t2-b3");
+    let mut unsafe_name=block.clone();unsafe_name["packed_observer_effect_reference"]=serde_json::json!("../gemma-t2-b3");
+    assert!(export(unsafe_name).is_err());
     let (_,stages,stage_bytes)=cohort::manifest(&cfg(),&[0,1],&PREFILL_STAGES,&cohort::DECODE_STAGES).unwrap();
     let mut config=None;
     for ((_,bytes),trajectory) in files[1..].iter().zip(["T0ColdSerial","T2ActualCohort"]) {

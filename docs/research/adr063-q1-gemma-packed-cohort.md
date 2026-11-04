@@ -79,10 +79,15 @@ stores therefore compare coordinate for coordinate. Both routes share one
 separate composition key (`gemma-four-lane-stage-localizer-native-routing1511-v1`).
 
 The metadata prepare's optional `cohort_localizer` block (`layers`,
-`prefill_stages`, `decode_stages`) writes `cohort-localizer-prepared.json` and
-two disabled `multistore` packets (`all128`, `packed`). The supervisor's
-`multistore` kind with check `gemma_loc4` validates both stores, all four lanes
-and the four-lane policy (`lanes: 4`, `stage_payload_upper_bytes`).
+`prefill_stages`, `decode_stages`, and optionally `observer_effect_reference`
+and `packed_observer_effect_reference`, default `gemma-t0-b3` / `gemma-t2-b3`)
+writes `cohort-localizer-prepared.json` and two disabled `multistore` packets
+(`all128`, `packed`). The supervisor's `multistore` kind with check
+`gemma_loc4` validates both stores, all four lanes and the four-lane policy
+(`lanes: 4`, `stage_payload_upper_bytes`). In the supervisor's manifest form
+the bound manifest is the extent of record: the packet carries no
+`expected_stores`, and any `lanes`/`host_payload_limit` it keeps must equal
+the manifest's (`docs/research/adr063-q1-spec-design.md` Part 3).
 
 Observer-effect control: `exact` of each localizer endpoint store against
 `gemma-t0-b3` / `gemma-t2-b3` must be `ExactEqual`. The stage localization

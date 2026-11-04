@@ -18,9 +18,11 @@ Changes:
   7. a `"kind": "multistore"` case runs one packet that writes several stores
      under output/ (e.g. a four-lane stage localizer beside its endpoints).
      Its extent (lanes, host_payload_limit, expected_stores) comes from the
-     packet or from a bound `manifest` file, never both; every store must be
-     complete and equal its frozen manifest; closed registry `checks` own the
-     family-specific receipt rules.
+     packet, or from a bound `manifest` file of record (the packet then has
+     no expected_stores, and any lanes/host_payload_limit it keeps must
+     equal the manifest's); every store must be complete and equal its
+     frozen extent; closed registry `checks` own the family-specific
+     receipt rules.
 The foreign-process denylist and the listener ports are read from the reviewed
 Gemma supervisor source (sha-pinned) so the reviewed list is reused verbatim.
 No physical-admission, performance, float-policy or whole-Q1 qualification.
@@ -105,11 +107,19 @@ def packet_scope(plan, packet):
     if plan['kind'] == 'localizer': return 'trajectory' not in packet
     return True  # multistore: the registry checks own the trajectory
 def multistore_extent(case, packet, manifest_bytes):
-    """(lanes, host_payload_limit, expected_stores) from exactly one source: the packet or the bound manifest."""
-    in_packet = MULTISTORE_EXTENT_KEYS & set(packet)
-    require((manifest_bytes is None) != (not in_packet) and (manifest_bytes is None) == ('manifest' not in case), 'extent from exactly one of packet / manifest')
-    extent = {k: packet[k] for k in MULTISTORE_EXTENT_KEYS} if manifest_bytes is None else json.loads(manifest_bytes)
-    require(type(extent) is dict and set(extent) == MULTISTORE_EXTENT_KEYS, 'closed extent: lanes, host_payload_limit, expected_stores')
+    """(lanes, host_payload_limit, expected_stores): the packet's, or, in manifest form, the bound manifest's.
+
+    Manifest form: the manifest is the extent of record. The packet may not carry `expected_stores`; a packet
+    `lanes` or `host_payload_limit` it keeps for its own runner must equal the manifest's value."""
+    require((manifest_bytes is None) == ('manifest' not in case), 'manifest case key and bound bytes agree')
+    if manifest_bytes is None:
+        require(MULTISTORE_EXTENT_KEYS <= set(packet), 'packet-form extent: lanes, host_payload_limit, expected_stores')
+        extent = {k: packet[k] for k in MULTISTORE_EXTENT_KEYS}
+    else:
+        extent = json.loads(manifest_bytes)
+        require(type(extent) is dict and set(extent) == MULTISTORE_EXTENT_KEYS, 'closed manifest: lanes, host_payload_limit, expected_stores')
+        require('expected_stores' not in packet, 'manifest form: the packet carries no expected_stores')
+        require(all(packet[k] == extent[k] for k in ('lanes', 'host_payload_limit') if k in packet), 'manifest form: packet lanes/host_payload_limit equal the manifest')
     lanes = extent['lanes']
     require(type(lanes) is list and lanes and lanes == sorted(set(lanes)) and all(type(l) is int and 0 <= l < 4 for l in lanes), 'declared distinct workload lanes')
     require(type(extent['host_payload_limit']) is int and extent['host_payload_limit'] > 0 and type(extent['expected_stores']) is dict, 'bounded extent')

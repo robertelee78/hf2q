@@ -243,21 +243,47 @@ class MultistorePlan(unittest.TestCase):
         self.assertFalse(s.packet_scope(dict(kind="localizer"), {"trajectory": "T0ColdSerial"}))
         self.assertTrue(s.packet_scope(dict(kind="multistore"), {"trajectory": "T2ActualCohort"}))
 
-    def test_extent_from_exactly_one_source(self):
-        extent = {"lanes": [0, 1, 2, 3], "host_payload_limit": 10, "expected_stores": {"a": []}}
-        self.assertEqual(s.multistore_extent(MULTISTORE_CASE, dict(extent, other=1), None), extent)
-        manifest = {**MULTISTORE_CASE, "manifest": {"path": "/x/m.json", "sha256": "0" * 64}}
-        self.assertEqual(s.multistore_extent(manifest, {"trajectory": "T5"}, json.dumps(extent).encode()), extent)
-        for case, packet, data in ((manifest, extent, json.dumps(extent).encode()),   # both
-                                   (MULTISTORE_CASE, {}, None),                       # neither
-                                   (manifest, {}, None),                              # case names an unread manifest
-                                   (MULTISTORE_CASE, {**extent, "lanes": [1, 0]}, None),
-                                   (MULTISTORE_CASE, {**extent, "lanes": [4]}, None),
-                                   (MULTISTORE_CASE, {**extent, "lanes": []}, None),
-                                   (MULTISTORE_CASE, {k: v for k, v in extent.items() if k != "lanes"}, None),
-                                   (manifest, {}, json.dumps({**extent, "extra": 1}).encode())):
+    EXTENT = {"lanes": [0, 1, 2, 3], "host_payload_limit": 10, "expected_stores": {"a": []}}
+    MANIFEST_CASE = {**MULTISTORE_CASE, "manifest": {"path": "/x/m.json", "sha256": "0" * 64}}
+
+    def manifest_extent(self, packet, manifest=None):
+        return s.multistore_extent(self.MANIFEST_CASE, packet, json.dumps(manifest or self.EXTENT).encode())
+
+    def test_packet_form_extent(self):
+        self.assertEqual(s.multistore_extent(MULTISTORE_CASE, dict(self.EXTENT, other=1), None), self.EXTENT)
+        extent = self.EXTENT
+        for packet in ({},                                                     # no extent at all
+                       {k: v for k, v in extent.items() if k != "expected_stores"},
+                       {k: v for k, v in extent.items() if k != "lanes"},
+                       {**extent, "lanes": [1, 0]}, {**extent, "lanes": [4]}, {**extent, "lanes": []},
+                       {**extent, "host_payload_limit": 0}):
             with self.assertRaises((ValueError, KeyError)):
-                s.multistore_extent(case, packet, data)
+                s.multistore_extent(MULTISTORE_CASE, packet, None)
+
+    def test_manifest_form_admits_equal_packet_lanes_and_host_limit(self):
+        self.assertEqual(self.manifest_extent({"trajectory": "T5"}), self.EXTENT)  # plan-only packet
+        packet = {"trajectory": "T2ActualCohort", "lanes": [0, 1, 2, 3], "host_payload_limit": 10}
+        self.assertEqual(self.manifest_extent(packet), self.EXTENT)
+        self.assertEqual(self.manifest_extent({"lanes": [0, 1, 2, 3]}), self.EXTENT)
+
+    def test_manifest_form_refuses_unequal_packet_lanes_or_host_limit(self):
+        for packet in ({"lanes": [0, 1, 2], "host_payload_limit": 10}, {"lanes": [0, 1, 2, 3], "host_payload_limit": 11},
+                       {"host_payload_limit": 9}):
+            with self.assertRaises(ValueError):
+                self.manifest_extent(packet)
+
+    def test_manifest_form_refuses_packet_expected_stores(self):
+        for stores in ({"a": []}, {}):
+            with self.assertRaises(ValueError):
+                self.manifest_extent({"lanes": [0, 1, 2, 3], "host_payload_limit": 10, "expected_stores": stores})
+
+    def test_manifest_binding_is_closed(self):
+        for case, data in ((self.MANIFEST_CASE, None),                                      # case names an unread manifest
+                           (MULTISTORE_CASE, json.dumps(self.EXTENT).encode()),             # bytes without a case binding
+                           (self.MANIFEST_CASE, json.dumps({**self.EXTENT, "extra": 1}).encode()),
+                           (self.MANIFEST_CASE, json.dumps({**self.EXTENT, "lanes": [3, 3]}).encode())):
+            with self.assertRaises((ValueError, KeyError)):
+                s.multistore_extent(case, {}, data)
 
 
 class GemmaLoc4(unittest.TestCase):
