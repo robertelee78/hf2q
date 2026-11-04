@@ -1,8 +1,8 @@
 # ADR-063 Q4-QWEN36: Qwen3.6 harness against Qwen's recommended agentic setup
 
 Status: C3 measured 2026-11-04 (operator decision 2026-11-03: unsloth GGUF only, canonical setup, v0.1.29
-release binary). The repair-turn workload is prepared, and its campaign has not run. C0, C1, C2, C4 and C5
-have not run. This record holds the setup diff with sources, the
+release binary). R1, the repair-turn campaign, was measured 2026-11-04: hf2q `Loss` against the peer. C0,
+C1, C2, C4 and C5 have not run. This record holds the setup diff with sources, the
 third-party diagnostic GGUFs, the paired campaigns that separate harness, conversion and model causes
 (story #662), and the C3 result. The starting point is
 [adr063-qwen36-task-failure-diagnosis.md](adr063-qwen36-task-failure-diagnosis.md): canonical workload,
@@ -200,6 +200,57 @@ turn-4 `write_file` that the strict workflow refused. In each recorded write, th
 - Each engine replays its own transcripts, so prefixes differ. This is a pre-registration flag, not an
   engine verdict. The paired repair campaign decides it. If hf2q shows a `Loss` there, the next step is a
   same-prefix fork replay of the repair turn (`$E/qwen36-fork-v1/replay.py`).
+
+### R1 result: repair-turn campaign, our GGUF
+
+Campaign `$V/q4-qwen36/campaigns/quality-qwen36-repair1-ours-20261104T054600Z`, where `$V` is
+`~/.local/state/hf2q/v0130`:
+- Manifest sha256 `694700be…`, plan `2584208b…`.
+- 48 runs. Every run has a task outcome; there are no supervisor stops and no retries. Cleanup was proven
+  on every run.
+- hf2q: v0.1.29 release binary `86b64b02…`. Peer: e86f5fd1 build `4b604952…`. GGUF: `815a22ca…`.
+- An earlier attempt, `…-20261104T011417Z`, halted at run 10 with a Q5 `swap_growth` stop (peer arm, i05).
+  The host orchestrator process had grown to 51 GB resident. That attempt is not part of the verdict; its
+  10 settled runs show the same pattern.
+- The repair-turn smokes, `q5-qwen36-repair1-20261104T011222Z` and
+  `q5-peer-qwen36-repair1-20261104T011222Z`, were CalibrationPass with 4/4 agents on both engines.
+
+| | hf2q | Peer |
+|---|---:|---:|
+| Instances passed | 14/24 | 23/24 |
+| Paired verdict | **Loss** (hf2q-only failures 10, peer-only 1, one-sided p = 0.0059) | |
+| Instances passed, canonical strict workload (same ids) | 5/24 | 4/24 |
+| Repair vs canonical, two-sided sign test | 9 gained / 0 lost, p = 0.0039 | 19 gained / 0 lost, p = 4e-6 |
+| Agents whose first `run_tests` failed | 45/96 | 57/96 |
+| Repairs used | 43 | 57 |
+| Repair compiled and its test passed | 26 | 56 |
+| Repair test failed (agent fails) | 2 | 0 |
+| Repair write byte-identical to the agent's failing first write | 16/43 | 1/57 |
+| Agent outcomes | 38 first-try passes, 21 repaired passes, 10 refused for workflow, 2 repair failures, 25 stopped after a sibling failed | 39 first-try passes, 53 repaired passes, 1 refused for workflow, 3 stopped |
+| Q5 verdicts | 14 CalibrationPass, 10 ClientFailed | 23 CalibrationPass, 1 ClientFailed |
+
+- **hf2q failure signature.** The repair-turn reasoning diagnoses E0282 correctly, for example "The compiler
+  needs a type annotation for the closure parameter. Let me fix that." The emitted `write_file` is still
+  byte-identical to the failing first write. On the next turn the agent writes again instead of calling
+  `run_tests`, and the workflow refuses it. Of the 16 identical rewrites:
+  - 14 call `write_file` again on turn 5 (8 of those rewrites change the form, 2 do not, 4 were cut mid-stream
+    by the coordinator);
+  - 2 call `run_tests`.
+  
+  The turn-4 reasoning never equals the turn-2 reasoning (0/16), so a turn is not being replayed whole.
+- **Engine difference.** Identical repair rewrites are 16/43 on hf2q vs 1/57 on the peer, Fisher two-sided
+  p = 2e-6. This confirms the pre-registered concern. The repair workload lifts both engines (the floor is
+  18/24), but hf2q stays BelowFloor while the peer passes 23/24.
+- **Next step (not started; the operator holds the GPU decision).** Run a same-prefix fork replay of the
+  repair turn on both engines, with the recorded turn-4 requests and greedy decoding, and a logprob trace
+  of the `write_file` argument tokens. Suspects to separate, as hypotheses only:
+  - hf2q's Qwen3.6 decode route on the repair turn: `auto` speculation (MTP/history proposals) or joint
+    rows;
+  - the repetition-penalty history scope (generated-only in hf2q vs the peer's prompt-inclusive 64-token
+    window);
+  - numerics.
+
+Analysis: `analyze_repair.py` writes `repair-analysis.json` in the evidence directory.
 
 ### Draft ADR-063 amendment (for the operator; the root lands the ADR edit)
 
