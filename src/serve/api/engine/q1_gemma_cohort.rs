@@ -41,7 +41,9 @@ pub(crate) fn decode(model:&mut GemmaLoadedModel,tokens:&[u32],slots:&[SlotId],p
     let lm=&mut *guard.model;
     let mut regime=crate::inference::models::gemma4::batched_body::BatchedKvRegime::Hybrid(
         guard.hybrid.as_mut().context("Gemma actual Hybrid decode scaffold")?);
-    let hidden=lm.weights.forward_decode_body_batched(tokens,slots,&[position;4],&mut regime,&mut fused,&mut lm.ctx)?;
+    let windows=slots.iter().zip(tokens).map(|(&slot,&token)|
+        crate::inference::models::gemma4::spec_verify::DecodeWindow::single(slot,position,token)).collect::<Vec<_>>();
+    let (hidden,_rows)=lm.weights.forward_decode_body_batched(&windows,&mut regime,&mut fused,&mut lm.ctx)?;
     let head=if let Some(head)=fused {head}else{lm.weights.lm_head_batched(&hidden,4,&mut lm.ctx)?};
     anyhow::ensure!(head.logits.len()==4*lm.weights.vocab_size,"Gemma actual four-row logits extent");
     let commits=slots.iter().map(|&slot|(slot,position+1)).collect::<Vec<_>>();

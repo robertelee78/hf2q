@@ -516,6 +516,11 @@ impl MlxModelWeights {
         slot_id_buf: &MlxBuffer,
         slot_ids: &[SlotId],
         seq_positions: &[usize],
+        // ADR-063 Q4-GEMMA-SPEC-SERVE R-A: `Some(rank_offsets)` iff this tick
+        // has a window wider than one row (rows are rank-major, see
+        // `spec_verify::layout_windows`). `None` keeps today's dispatch
+        // sequence byte for byte.
+        rank_offsets: Option<&[usize]>,
         regime: &mut BatchedKvRegime<'_>,
         tq_scale_factor_d512: f32,
         tq_codebook_bits: u32,
@@ -919,7 +924,23 @@ impl MlxModelWeights {
                         dump.join(" ")
                     );
                 }
-                if use_batched_flash {
+                if let Some(ranks) = rank_offsets {
+                    self.encode_hybrid_window_attention(
+                        layer_idx,
+                        bufs,
+                        n,
+                        ranks,
+                        positions_buf,
+                        slot_id_buf,
+                        seq_positions,
+                        gbuf,
+                        tq_scale_factor_d512,
+                        tq_codebook_bits,
+                        session,
+                        reg,
+                        dev,
+                    )?;
+                } else if use_batched_flash {
                     let buf = gbuf;
                     let cap = gcap;
                     let is_ring = gring;
@@ -1345,6 +1366,12 @@ impl MlxModelWeights {
                 }
             } // end BatchedKvRegime::Hybrid
             BatchedKvRegime::FullTq(multi_seq_kv_hb) => {
+                // R-A windows are defined for the default hybrid scaffold only;
+                // the speculation entry keeps FullTq lanes ordinary.
+                anyhow::ensure!(
+                    rank_offsets.is_none(),
+                    "Gemma windowed verify requires the hybrid KV scaffold (HF2Q_HYBRID_KV=1)"
+                );
                 // ADR-040 M-SPEED-LC Stage 2/3 — FullTq (byte-packed 5/6/8-bit K+V)
                 // attention phase. Same same_bucket-gating skeleton as the Hybrid arm
                 // above; SDPA uses mlx-native's `flash_attn_vec_tq_hb_batched`
@@ -2345,6 +2372,175 @@ impl MlxModelWeights {
         Ok(())
     }
 
+    /// ADR-063 Q4-GEMMA-SPEC-SERVE R-A (design §5.3) — the hybrid attention
+    /// phase of one layer for a windowed tick whose `n` rows are rank-major
+    /// (`ranks` are the rank-slice offsets, `ranks.len() == w_max + 1`).
+    ///
+    /// - Full layers (append-only): KV-encode all rows, then one batched flash
+    ///   per `(nwg, nsg)` bucket; each query's extent is `pos + 1`, so it reads
+    ///   exactly the keys the serial decode at its position reads.
+    /// - Sliding rings: per rank slice `j`, KV-encode slice `j`, flash slice
+    ///   `j`, then FWHT-undo slice `j`. Slice `j`'s ring writes overwrite
+    ///   `pos0 + j − cap`, which ranks below `j` have already read and ranks
+    ///   at or above `j` never read.
+    ///
+    /// A bucket-mixed slice is split into contiguous same-bucket runs. Every
+    /// dispatch is the batched kernel the ordinary tick uses, over a
+    /// contiguous row slice with per-row slot ids and positions.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_hybrid_window_attention(
+        &self,
+        layer_idx: usize,
+        bufs: &BatchedDecodeBuffers,
+        n: usize,
+        ranks: &[usize],
+        positions_buf: &MlxBuffer,
+        slot_id_buf: &MlxBuffer,
+        seq_positions: &[usize],
+        buf: &MultiSeqHybridKvBuffers,
+        tq_scale_factor_d512: f32,
+        tq_codebook_bits: u32,
+        session: &mut GraphSession<'_>,
+        reg: &mut KernelRegistry,
+        dev: &MlxDevice,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            ranks.len() >= 2 && ranks[0] == 0 && *ranks.last().unwrap() == n,
+            "Gemma windowed verify L{layer_idx}: rank offsets {ranks:?} do not cover {n} rows"
+        );
+        anyhow::ensure!(
+            self.kv_graft_len() == 0,
+            "Gemma windowed verify refuses a bound KV graft"
+        );
+        anyhow::ensure!(
+            buf.v_norms.byte_len() != 4,
+            "Gemma windowed verify requires TQ-HB V (HF2Q_FULL_F16_KV unsupported)"
+        );
+        let metal_dev = dev.metal_device();
+        let layer = &self.layers[layer_idx];
+        let (hd, nkv, nh) = (layer.head_dim, layer.num_kv_heads, self.num_attention_heads);
+        let is_sliding = layer.layer_type == LayerType::Sliding;
+        let v_is_k = layer.attn.v_proj.is_none();
+        let (cap, is_ring) = (buf.capacity, buf.is_sliding);
+        let q_stride = nh * hd;
+        let kv_stride = nkv * hd;
+        let tmp_stride = elems(&bufs.sdpa_tmp) / n;
+        let v_src: &MlxBuffer = if v_is_k {
+            &bufs.attn_v
+        } else {
+            &bufs.attn_v_normed
+        };
+        let ksl_of = |r: usize| -> u32 {
+            let sp = seq_positions[r];
+            if is_ring {
+                (sp + 1).min(cap) as u32
+            } else {
+                (sp + 1) as u32
+            }
+        };
+        let bucket_of = |r: usize| {
+            let k = ksl_of(r);
+            (
+                if k > 512 { 32u32 } else { 16u32 },
+                mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(k),
+            )
+        };
+        let rows = |b: &MlxBuffer, stride: usize, r0: usize, r1: usize| {
+            b.slice_view(row_off(stride, r0), (r1 - r0) * stride)
+        };
+        let ids = |b: &MlxBuffer, r0: usize, r1: usize| b.slice_view((r0 * 4) as u64, r1 - r0);
+
+        let encode = |session: &mut GraphSession<'_>, reg: &mut KernelRegistry, r0: usize, r1: usize| -> Result<()> {
+            let kn = rows(&bufs.attn_k_normed, kv_stride, r0, r1);
+            let v = rows(v_src, kv_stride, r0, r1);
+            let slots = ids(slot_id_buf, r0, r1);
+            let positions = ids(positions_buf, r0, r1);
+            session.barrier_between(&[&kn, &v], &[&buf.k, &buf.v_packed, &buf.v_norms]);
+            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16_batched(
+                session.encoder_mut(), reg, metal_dev,
+                &kn, &buf.k, &slots, &positions,
+                (r1 - r0) as u32, nkv as u32, hd as u32, cap as u32, is_ring,
+            ).map_err(|e| anyhow::anyhow!("window F16-K L{layer_idx} rows {r0}..{r1}: {e}"))?;
+            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
+                session.encoder_mut(), reg, metal_dev,
+                &v, &buf.v_packed, &buf.v_norms, &slots, &positions,
+                (r1 - r0) as u32, nkv as u32, hd as u32, cap as u32, is_ring,
+                tq_scale_factor_d512, tq_codebook_bits,
+            ).map_err(|e| anyhow::anyhow!("window FWHT-V L{layer_idx} rows {r0}..{r1}: {e}"))?;
+            Ok(())
+        };
+        let flash = |session: &mut GraphSession<'_>, reg: &mut KernelRegistry, r0: usize, r1: usize| -> Result<()> {
+            let mut start = r0;
+            while start < r1 {
+                let bucket = bucket_of(start);
+                let mut end = start + 1;
+                while end < r1 && bucket_of(end) == bucket {
+                    end += 1;
+                }
+                let max_ksl = (start..end).map(ksl_of).max().unwrap_or(1);
+                let q = rows(&bufs.attn_q_normed, q_stride, start, end);
+                let out = rows(&bufs.sdpa_out, q_stride, start, end);
+                let tmp = rows(&bufs.sdpa_tmp, tmp_stride, start, end);
+                let slots = ids(slot_id_buf, start, end);
+                let positions = ids(positions_buf, start, end);
+                let params = mlx_native::ops::flash_attn_vec_hybrid::FlashAttnVecTqHbParams {
+                    num_heads: nh as u32,
+                    num_kv_heads: nkv as u32,
+                    head_dim: hd as u32,
+                    kv_seq_len: max_ksl,
+                    kv_capacity: cap as u32,
+                    scale: 1.0,
+                    mask_type: if is_sliding { 2 } else { 1 },
+                    sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                    softcap: 0.0,
+                    ring_start: 0,
+                    scale_factor_d512: tq_scale_factor_d512,
+                    codebook_bits: tq_codebook_bits,
+                    fuse_fwht_pre: 0,
+                    nsg: bucket.1,
+                };
+                session.barrier_between(
+                    &[&q, &buf.k, &buf.v_packed, &buf.v_norms, &tmp],
+                    &[&out, &tmp],
+                );
+                mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
+                    session.encoder_mut(), reg, dev, (end - start) as u32,
+                    &q, &buf.k, &buf.v_packed, &buf.v_norms, &out, &tmp,
+                    &slots, &positions, &params,
+                ).map_err(|e| anyhow::anyhow!("window flash L{layer_idx} rows {start}..{end}: {e}"))?;
+                start = end;
+            }
+            Ok(())
+        };
+        let undo = |session: &mut GraphSession<'_>, reg: &mut KernelRegistry, r0: usize, r1: usize| -> Result<()> {
+            let out = rows(&bufs.sdpa_out, q_stride, r0, r1);
+            session.barrier_between(&[&out], &[&out]);
+            mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+                session.encoder_mut(), reg, metal_dev, &out,
+                ((r1 - r0) * nh) as u32, hd as u32,
+            ).map_err(|e| anyhow::anyhow!("window undo L{layer_idx} rows {r0}..{r1}: {e}"))
+        };
+
+        if is_ring {
+            for (phase, pair) in ranks.windows(2).enumerate() {
+                let (r0, r1) = (pair[0], pair[1]);
+                if phase > 0 {
+                    // Phase j's ring writes overwrite keys phase j−1's
+                    // queries read: order the write after those reads.
+                    session.encoder_mut().memory_barrier();
+                }
+                encode(session, reg, r0, r1)?;
+                flash(session, reg, r0, r1)?;
+                undo(session, reg, r0, r1)?;
+            }
+        } else {
+            encode(session, reg, 0, n)?;
+            flash(session, reg, 0, n)?;
+            undo(session, reg, 0, n)?;
+        }
+        Ok(())
+    }
+
     /// ADR-040 S2/S3 — the `[N,hidden]` batched decode BODY: embed-gather N
     /// tokens → run the layer loop in `[N,hidden]` (per-slot attention against
     /// each slot's `multi_seq_kv_hybrid` region) → return each slot's final
@@ -2352,33 +2548,47 @@ impl MlxModelWeights {
     /// `forward_decode_capture_hidden` leaves in `self.activations.hidden`). The
     /// SlotAware worker feeds those rows to the proven batched head + finalize.
     ///
-    /// `tokens[i]` / `slot_ids[i]` / `seq_positions[i]` describe slot `i`'s
-    /// current decode step. Both production KV regimes (see
-    /// [`BatchedKvRegime`]): hybrid F16-K + TQ-HB-V (`HF2Q_HYBRID_KV=1`,
-    /// DEFAULT) and full-TQ byte-packed K+V (`HF2Q_HYBRID_KV=0`, opt-in;
-    /// ADR-040 M-SPEED-LC Stage 2/3). Wired into `decode_batch_gemma4` under
-    /// `HF2Q_BATCHED_BODY=1`; the hybrid regime is proven byte-identical to N
-    /// serial slot-aware decodes by `slot_aware_n1` + `slot_aware_n4`.
+    /// `windows[i]` is slot `windows[i].slot`'s decode window: its tokens
+    /// are processed at `start_pos ..`. Rows are laid out rank-major
+    /// (`spec_verify::layout_windows`); a tick of width-1 windows is today's
+    /// one-row-per-slot tick with today's dispatch sequence. Both production
+    /// KV regimes (see [`BatchedKvRegime`]) run width-1 ticks: hybrid
+    /// F16-K + TQ-HB-V (`HF2Q_HYBRID_KV=1`, DEFAULT) and full-TQ byte-packed
+    /// K+V (`HF2Q_HYBRID_KV=0`, opt-in; ADR-040 M-SPEED-LC Stage 2/3); wider
+    /// windows (ADR-063 Q4-GEMMA-SPEC-SERVE R-A) run on hybrid only. The
+    /// hybrid regime is proven byte-identical to N serial slot-aware decodes
+    /// by `slot_aware_n1` + `slot_aware_n4`.
+    ///
+    /// Returns the hidden rows (empty when the head is fused into
+    /// `head_out`) and the rank-major row map; logits and hidden rows are in
+    /// row order.
     pub(crate) fn forward_decode_body_batched(
         &self,
-        tokens: &[u32],
-        slot_ids: &[SlotId],
-        seq_positions: &[usize],
+        windows: &[super::spec_verify::DecodeWindow],
         regime: &mut BatchedKvRegime<'_>,
-        // ADR-040 §25 iter-L — when HF2Q_FUSE_LMHEAD=1 (chunked path only), the
-        // lm_head is encoded as the final pipeline chunk and its output is written
-        // here (the body then returns an EMPTY Vec; the caller uses `head_out`).
-        // When the fuse is off, this stays None and the body returns hidden.
+        // ADR-040 §25 iter-L — when the lm_head fuse applies (default; opt out
+        // HF2Q_FUSE_LMHEAD=0; chunked path only), the lm_head is encoded as
+        // the final pipeline chunk and its output is written here (the body
+        // then returns an EMPTY Vec; the caller uses `head_out`). When the
+        // fuse is off, this stays None and the body returns hidden.
         head_out: &mut Option<BatchedHeadOut>,
         gpu: &mut GpuContext,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<(Vec<f32>, super::spec_verify::WindowRows)> {
+        let layout = super::spec_verify::layout_windows(windows)?;
+        let tokens = layout.tokens.as_slice();
+        let slot_ids = layout.slot_ids.as_slice();
+        let seq_positions = layout.positions.as_slice();
+        let rank_offsets = layout
+            .rows
+            .is_windowed()
+            .then_some(layout.rows.rank_offsets.as_slice());
         let _native_input = crate::inference::native_observation::ordered_input(
             "gemma4.decode.actual_token_slot_position_arrays",tokens.len(),
             slot_ids.iter().zip(seq_positions).map(|(slot,position)| (slot.0,*position,1)));
         let n = tokens.len();
         let hs = self.hidden_size;
         if n == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), layout.rows));
         }
         // tq params — read identically to the scalar (forward_gpu.rs:517/560).
         let tq_scale_factor_d512: f32 = match std::env::var("HF2Q_SCALE_FORMULA").as_deref() {
@@ -2544,6 +2754,7 @@ impl MlxModelWeights {
                         &slot_id_buf,
                         slot_ids,
                         seq_positions,
+                        rank_offsets,
                         regime,
                         tq_scale_factor_d512,
                         tq_codebook_bits,
@@ -2597,7 +2808,7 @@ impl MlxModelWeights {
                     _hp.elapsed().as_nanos() as u64,
                 );
                 *head_out = Some(BatchedHeadOut { logits });
-                return Ok(Vec::new());
+                return Ok((Vec::new(), layout.rows));
             }
         } else {
             for layer_idx in 0..num_layers {
@@ -2610,6 +2821,7 @@ impl MlxModelWeights {
                     &slot_id_buf,
                     slot_ids,
                     seq_positions,
+                    rank_offsets,
                     regime,
                     tq_scale_factor_d512,
                     tq_codebook_bits,
@@ -2675,6 +2887,6 @@ impl MlxModelWeights {
             host_phases::Phase::BodyReadback,
             _hp.elapsed().as_nanos() as u64,
         );
-        Ok(v)
+        Ok((v, layout.rows))
     }
 }
