@@ -118,6 +118,7 @@ PEER_CASE_REFUSAL = 'a Splash case is the Q3 arm --splash-case, never --peer-cas
 CLIENT_MODULES = ('native_peers.py', 'native_peer_splash.py', 'native_peer_splash_ready.py',
                   'test_native_peer_splash.py')
 PROCESSES = ('splash',)                  # build/splash serve-native (the engine child of the Python server)
+PYTHON_MODULES = ('server.server',)     # the Python server under the pinned .venv (server/server.py), engine or not
 BASELINES = {}
 AUDIT = 'native_peer_splash_audit'
 
@@ -408,6 +409,6 @@ def campaign_identity(plan):
     return identity(plan)
 
 
-def launch_problems(name, artifact, hf2q_sha256):
+def launch_problems(name, artifact, hf2q_sha256, identity=None, output=None):
     from native_peer_splash_ready import launch_problems as problems
-    return problems(name, artifact, hf2q_sha256)
+    return problems(name, artifact, hf2q_sha256, identity, output)

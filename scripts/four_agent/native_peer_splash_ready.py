@@ -48,6 +48,8 @@ TOOLCHAIN = {'xcode': ['/usr/bin/xcodebuild', '-version'], 'metal': ['/usr/bin/x
              'sdk': ['/usr/bin/xcrun', '--show-sdk-version'], 'macos': ['/usr/bin/sw_vers']}
 SPEC_KEYS = frozenset(LAUNCH_KEYS) | {'server_stdout', 'server_stderr'}
 SERVE_ENV = {'HF_HUB_OFFLINE': '1', 'HF_HUB_DISABLE_TELEMETRY': '1'}
+# kv::storageFormatName (runtime/ops/PagedKv.hpp:32-41) per kv knob; the value layout suffix is the engine's choice.
+KV_DTYPE_PREFIX = {'int8': 'q8s8_f32_scale_per_token_head_k_token_major_v_', 'bf16': 'bf16_k_token_major_v_'}
 # What a run must never inherit: Splash's own environment overrides (port, API key, defaults, crash traces) and
 # Python variables that would change the interpreter or module search path; HF_HOME/HF_HUB_CACHE would move nothing
 # here (the draft is local) but are refused so no ambient cache is consulted.
@@ -273,23 +275,40 @@ def ane_cache_dir():
     return Path(out) / 'splash-ane'
 
 
-def cross_run_state():
-    """The Neural Engine split calibration Splash remembers per Mac, and the persistent-cache namespaces."""
+def pin_dir(draft_dir):
+    """refs/splash of the draft's HF cache repository, where Splash pins the snapshots an installation links
+    (install/hub.py pin, one <sha256 of the installation path>/<commit> per installation). It pins only sources
+    with a revision (install/assembly.py pins); the local paths prepare_run passes have none (model.json
+    `sources.*.revision` null, observed in the dry run), so a run must add no pin."""
+    return Path(draft_dir).parent.parent / 'refs' / 'splash'
+
+
+def draft_pins(draft_dir):
+    folder = pin_dir(draft_dir)
+    return sorted(p.name for p in folder.iterdir()) if folder.is_dir() else []
+
+
+def cross_run_state(draft_dir):
+    """What Splash keeps between runs on this Mac: the Neural Engine split calibration, the persistent-cache
+    namespaces and any draft snapshot pins in the shared HF cache."""
     ane = ane_cache_dir()
     remembered = {p.name: sha256(p) for p in sorted(ane.glob('remembered-*')) if p.is_file()} if ane.is_dir() else {}
     prefix = Path.home() / 'Library' / 'Caches' / 'Splash' / 'prefix-cache'
     return {'ane_dir': str(ane), 'ane_remembered': remembered,
-            'prefix_cache_namespaces': sorted(p.name for p in prefix.iterdir()) if prefix.is_dir() else []}
+            'prefix_cache_namespaces': sorted(p.name for p in prefix.iterdir()) if prefix.is_dir() else [],
+            'draft_pin_dir': str(pin_dir(draft_dir)), 'draft_pins': draft_pins(draft_dir)}
 
 
 def prepare_run(spec, environ):
-    """Launcher side: the run's own model directory through prepare_local_model; returns (assembly, record)."""
+    """Launcher side: the run's own model directory through prepare_local_model; returns (assembly, record).
+    Refuses an assembly that pinned a snapshot in the shared HF cache (state outside the run directory)."""
     paths = layout(spec)
     # Splash's installer collects garbage in models_dir and stops on the AppleDouble `._*` files exFAT volumes write
     # (observed on the external drive), so the run directory must be on APFS (the internal disk).
     require(filesystem(paths['run'].parent) == 'apfs', 'the Splash run directory must be on an APFS volume')
     paths['run'].mkdir()
     paths['models'].mkdir()
+    before = draft_pins(spec['draft_dir'])
     result = subprocess.run([str(paths['python']), '-P', '-c', PREPARE, spec['model'], spec['draft_dir'],
                              str(paths['models'])], capture_output=True, timeout=1800,
                             env=serve_environ(spec, environ), cwd=str(paths['run']))
@@ -297,13 +316,15 @@ def prepare_run(spec, environ):
     (paths['run'] / 'prepare.stderr').write_bytes(result.stderr)
     require(result.returncode == 0, 'Splash prepare_local_model refused: ' + result.stderr.decode('utf-8', 'replace')[-2000:])
     assembly = loads(result.stdout.decode().strip().splitlines()[-1])
+    require(draft_pins(spec['draft_dir']) == before,
+            f"Splash pinned the draft snapshot in the shared HF cache ({pin_dir(spec['draft_dir'])})")
     return assembly, verify_assembly(spec, assembly)
 
 
 def launch_record(spec, identity, assembly, environ):
     return {'schema': 'hf2q.splash-launch.v1', 'pid': os.getpid(), 'argv': server_argv(spec, assembly['path']),
             'env': {k: v for k, v in sorted(serve_environ(spec, environ).items())}, 'spec': spec,
-            'identity': identity, 'assembly': assembly, 'state_before': cross_run_state()}
+            'identity': identity, 'assembly': assembly, 'state_before': cross_run_state(spec['draft_dir'])}
 
 
 def verify_launch(spec, packet):
@@ -363,6 +384,11 @@ def validate_status(doc, spec, pid, requests=0):
     require(_get(doc, 'ready') is True and _get(doc, 'maximum_context_tokens') == sp.CONTEXT_PER_SLOT
             and _get(doc, 'vision') is False, 'Splash /status ready, 262144 context, text only')
     require(_get(doc, 'identity.cache.build_id') == sp.BUILD_ID, 'Splash /status build_id is not the pinned build')
+    # runtime/engine/Status.cpp: identity.kv.format is kv::formatName, identity.cache.dtype kv::storageFormatName
+    # (runtime/ops/PagedKv.hpp), both of the configured --kv-format.
+    require(_get(doc, 'identity.kv.format') == knobs['kv'], f"Splash /status KV format is not {knobs['kv']}")
+    require(str(_get(doc, 'identity.cache.dtype')).startswith(KV_DTYPE_PREFIX[knobs['kv']]),
+            f"Splash /status cache dtype is not a {knobs['kv']} layout")
     verify = 'all' if sp.ARTIFACTS[q3]['dense'] else knobs['verify']
     require(_get(doc, 'verify_rows') == verify, f'Splash /status verify_rows is not {verify}')
     require(_get(doc, 'streamed_experts') is None, 'Splash streams routed experts (memory plan below the model)')
@@ -372,6 +398,7 @@ def validate_status(doc, spec, pid, requests=0):
     transport = _get(doc, 'transport')
     require(isinstance(transport, dict) and transport.get('recovering') is False and not transport.get('stopped'),
             'Splash engine is restarting or stopped')
+    require(transport.get('restarts') == 0, f"Splash engine restarted {transport.get('restarts')} time(s)")
     counts = _get(doc, 'requests')
     require(isinstance(counts, dict) and counts.get('submitted') == counts.get('completed') == requests
             and counts.get('failed') == counts.get('cancelled') == 0,
@@ -518,7 +545,7 @@ def closing(base, output):
     spec = native_spec({**inputs['spec'], 'port': str(inputs['spec']['port'])})
     status = validate_status(loads(fetch(_port(base), '/status', output, 'splash-status-final.raw')), spec,
                              inputs['server_pid'], len(turns))
-    after = cross_run_state()
+    after = cross_run_state(spec['draft_dir'])
     before = inputs['state_before']
     return {'render': render, 'status': status, 'state_before': before, 'state_after': after,
             'ane_calibration_changed': before['ane_remembered'] != after['ane_remembered'],
@@ -566,6 +593,7 @@ def campaign_identity(plan):
     # The build string is of the files and toolchain as found; launch refuses values that differ from the case's.
     return {'peer_build_info': build_info(v.get('SPLASH_COMMIT'), v.get('SPLASH_BUILD_ID'), hashes),
             'native_runtime': {'venv': venv, 'draft': draft, 'config': v.get('SPLASH_CONFIG'), 'toolchain': tools,
+                               'actual': hashes,
                                'declared': {name: v.get(var) for name, var in (
                                    ('binary_sha256', 'SPLASH_BIN_SHA256'), ('metallib_sha256', 'SPLASH_METALLIB_SHA256'),
                                    ('host_step_sha256', 'SPLASH_HOST_STEP_SHA256'),
@@ -574,8 +602,10 @@ def campaign_identity(plan):
                                'argv_template': argv_template(v, q3) if q3 in sp.ARTIFACTS else None}}
 
 
-def launch_problems(name, artifact, hf2q_sha256):
-    """Q3 refusals: Splash serves the hf2q GGUF itself, so its artifact sha256 must equal the hf2q arm's."""
+def launch_problems(name, artifact, hf2q_sha256, identity=None, output=None):
+    """Q3 refusals before any run: Splash serves the hf2q GGUF itself, so its artifact sha256 must equal the hf2q
+    arm's; the build, toolchain and venv found must be the case's declared ones; and the campaign output must be on
+    APFS (prepare_run's rule). Each would otherwise refuse every launch and leave Splash Unavailable mid-campaign."""
     problems = []
     if not (artifact or {}).get('sha256'):
         problems.append(f'{name}: the Splash artifact needs MODEL_SHA256 (the hf2q GGUF sha256)')
@@ -584,4 +614,14 @@ def launch_problems(name, artifact, hf2q_sha256):
                         f"the experiment's {str(hf2q_sha256)[:12]}...)")
     if artifact and not str(artifact.get('path', '')).endswith('.gguf'):
         problems.append(f'{name}: the Splash artifact must be the hf2q GGUF file')
+    runtime = (identity or {}).get('native_runtime') or {}
+    actual = runtime.get('actual') or {}
+    for key, declared in sorted((runtime.get('declared') or {}).items()):
+        if actual.get(key) != declared:
+            problems.append(f'{name}: {key} found {actual.get(key)} but the case declares {declared} (rebuild, '
+                            'toolchain or venv change: re-run splash_sweep.py identity and re-confirm the case)')
+    if output is not None:
+        where = next((p for p in (Path(output), *Path(output).parents) if p.exists()), None)
+        if where is None or filesystem(where) != 'apfs':
+            problems.append(f'{name}: the campaign output {output} must be on APFS (Splash run directories)')
     return problems

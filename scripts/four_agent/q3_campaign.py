@@ -229,7 +229,10 @@ def build_plan(args, environ, family):
         plan["negative_control_receipt"] = {"path": str(receipt), "sha256": sha256(receipt)}
     if record is not None:
         plan["controls_of"] = record
-    if q3_report.splash_required(plan):  # recorded in the plan: campaigns planned before Splash keep their rules
+    if "splash" in plan["measured_arms"] or splash_evidence:
+        # Recorded in the plan, so campaigns planned before Splash keep their rules. Only a campaign that runs the
+        # arm or declares Splash unavailable needs it: a peer-unavailable campaign is Unavailable already, and a
+        # controls-only campaign follows its primary's arms.
         plan["splash_required"] = True
     return plan, cases
 
@@ -241,6 +244,14 @@ def schedule_preview(plan):
                   "stop": f"after block >= {q3_stats.MIN_BLOCKS} when every required contrast has 95% half-width "
                           f"<= {q3_stats.HALF_WIDTH_PP} points; inconclusive at {q3_stats.MAX_BLOCKS}"}
             for key in plan["workloads"]}
+
+
+def memory_stop(record):
+    """A settled attempt ended by memory: a Q5 memory stop or an out-of-memory crash, before or after the client
+    started (q3_metrics.classify labels every pre-client stop load_failure, so the receipt's stop reason decides)."""
+    stop = record.get("stop") or {}
+    return (record["failure_kind"] in ("out_of_memory", "memory_stop") or stop.get("reason") in q3_metrics.MEMORY_STOPS
+            or str(record.get("reason") or "").startswith("out_of_memory:"))
 
 
 # --- driver ------------------------------------------------------------------------------------
@@ -296,7 +307,7 @@ class Driver:
             qc.require(not self.out.exists(), "campaign output must be a new directory")
             qc.require(not any((p / ".git").exists() for p in (self.out.parent.resolve(), *self.out.parent.resolve().parents)),
                        "campaign output must be outside any Git tree")
-            problems = q3_identity.launch_problems(self.plan, frozen)
+            problems = q3_identity.launch_problems(self.plan, frozen, self.out)
             qc.require(not problems, "not launchable: " + "; ".join(problems))
             self.out.mkdir(mode=0o700)
             for name in ("cases", "runs", "logs"):
@@ -426,9 +437,10 @@ class Driver:
         if entry["outcome"] == "Unavailable":
             self.manifest["unavailable"][entry["arm"]] = {"reason": f"{record['failure_kind']}: {record['reason']}",
                                                           "evidence": [record["output"]]}
-            if entry["arm"] == "splash" and record["failure_kind"] in ("out_of_memory", "memory_stop"):
-                # Decision D6: a Q5 memory stop in the campaign is answered with a recorded --max-memory cap and a
-                # re-confirmed configuration, never by running on without Splash.
+            if entry["arm"] == "splash" and memory_stop(record):
+                # Decision D6: a Q5 memory stop in the campaign (during the run, or in the load and readiness window
+                # before the client) is answered with a recorded --max-memory cap and a re-confirmed configuration,
+                # never by running on without Splash.
                 self.stop("Halted", entry, f"{entry['name']}: Splash tripped the Q5 memory stop ({record['reason']}); "
                           "record a --max-memory cap in SPLASH_CONFIG (decision D6), re-confirm that configuration "
                           "and start a new campaign", False)
@@ -574,7 +586,7 @@ def dry_run(args, environ):
     for family in args.family or q5_case.FAMILIES:
         plan, cases = build_plan(args, environ, family)
         ids = q3_identity.identities(plan, cases, environ)
-        report.append({"family": family, "launch_problems": q3_identity.launch_problems(plan, ids),
+        report.append({"family": family, "launch_problems": q3_identity.launch_problems(plan, ids, args.output),
                        "plan_sha256": qc.plan_sha256(plan), "plan": plan, "identities": ids,
                        "same_model": q3_identity.same_model(ids, q3_identity.native_arms(plan)),
                        "schedule": schedule_preview(plan),

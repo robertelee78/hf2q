@@ -72,12 +72,6 @@ def stage_arms(plan, workload):
     return [arm for arm in plan["measured_arms"] if arm != "splash" or workload in SPLASH_STAGES]
 
 
-def splash_required(plan):
-    """A default same-GGUF campaign of a Qwen family needs Splash; native-peer and native-comparison ones do not."""
-    return (plan["family"] in SPLASH_FAMILIES and native_peers.peer_kind(plan) is None
-            and not plan.get("native_comparison"))
-
-
 def stage_effects(stage, arms):
     """Experiment-vs-arm effects on makespan (primary) and the secondary metrics."""
     present = [(name, arm) for name, arm in CONTRASTS if arm in arms]

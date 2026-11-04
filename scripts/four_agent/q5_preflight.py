@@ -9,7 +9,7 @@ import os
 import re
 import socket
 
-from native_peers import process_names
+from native_peers import process_names, python_modules
 
 RUNTIME_EXECUTABLES = {
     'hf2q', 'llama-server', 'llama-cli', 'llama-bench', 'llama-mtmd-cli', 'llama-run',
@@ -19,6 +19,8 @@ RUNTIME_EXECUTABLES = {
 } | process_names()  # native-engine arms' binaries (each arm's PROCESSES)
 # Hosted peers started as `python -m <module>` or via the module's console script.
 PYTHON_MODULE_ROOTS = ('mlx_lm', 'mlx_vlm', 'vllm', 'sglang')
+# Adapter arms' Python servers, by full module name (Splash: `python -m server.server`, design section 6.1).
+PYTHON_MODULES = python_modules()
 BUILD_EXECUTABLES = {'cargo', 'rustc'}
 LAUNCHER = re.compile(r'serve_[a-z0-9_]+_opencode\.sh')
 SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish'}
@@ -59,7 +61,9 @@ def classify_argv(argv):
         while index < len(args):
             arg = args[index]
             if arg == '-m' and index + 1 < len(args):
-                return 'python-hosted-runtime' if args[index + 1].split('.')[0] in PYTHON_MODULE_ROOTS else None
+                module = args[index + 1]
+                return ('python-hosted-runtime' if module.split('.')[0] in PYTHON_MODULE_ROOTS
+                        or module in PYTHON_MODULES else None)
             if arg == '-c':
                 return None
             if arg in PYTHON_VALUE_OPTIONS:

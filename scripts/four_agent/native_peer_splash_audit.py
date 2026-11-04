@@ -22,7 +22,7 @@ import sys
 
 from native_peer_splash import ENGINE, MODEL_IDS, SPLASH_COMMIT
 from native_peer_splash_ready import token_sha256
-from qwen38_n1_verdict import loads, require
+from qwen38_n1_verdict import Invalid, loads, require
 
 STAMP = r'^\d\d:\d\d:\d\d '
 DONE = re.compile(STAMP + r'Done · input ([\d,]+) · cached ([\d,]+)(?: · deduplicated ([\d,]+))? · output ([\d,]+)(.*)$',
@@ -89,25 +89,58 @@ def audit_run(summary, client_dir, turns):
             'repetition_history': record.get('repetition_history')}
 
 
+PARITY_DIR = 'splash-prompt-parity'   # {run}/splash-prompt-parity: splash_sweep.py parity-config's default output
+
+
+def prompt_parity(run):
+    """The hf2q prompt-parity post-oracle result of one run: PassedByteIdentical only when the oracle's output binds
+    the config beside it (config_sha256) and that config's Splash renderings are this run's; PendingPostOracle when
+    the oracle has not passed (a mismatch panics and writes no output); a reason string otherwise."""
+    directory = Path(run) / PARITY_DIR
+    config_path, result_path = directory / 'config.json', directory / 'splash-prompt-parity-post-oracle.json'
+    if not config_path.is_file() or not result_path.is_file():
+        return 'PendingPostOracle'
+    try:
+        config, result = loads(config_path.read_bytes()), loads(result_path.read_bytes())
+    except (OSError, Invalid) as exc:
+        return f'unreadable prompt-parity record: {exc}'
+    if not (isinstance(result, dict) and result.get('schema') == 'hf2q.splash-prompt-parity-post-oracle.v1'
+            and result.get('hf2q_prompt_parity') == 'PassedByteIdentical'
+            and result.get('config_sha256') == hashlib.sha256(config_path.read_bytes()).hexdigest()):
+        return 'the prompt-parity result is not PassedByteIdentical for the config beside it'
+    turns = config.get('turns') if isinstance(config, dict) else None
+    root = Path(run).resolve() / 'client'
+    if not turns or not all(Path(t['splash_apply_template']['path']).resolve().is_relative_to(root) for t in turns):
+        return "the prompt-parity config does not bind this run's Splash renderings"
+    return 'PassedByteIdentical'
+
+
 def run_record(run_dir):
-    """One settled q5 run of a Splash case: audit, task outcome, memory and makespan (CLI below; the sweep reads it)."""
+    """One settled q5 run of a Splash case: audit, task outcome, memory, makespan and prompt parity (CLI below; the
+    sweep reads it). A run that stopped before the client (no summary) still yields a record, which is invalid."""
     import q2_run_audit
     import q3_metrics
     run = Path(run_dir).resolve()
-    receipt = json.loads((run / 'receipt.json').read_text())
-    summary = json.loads((run / 'client' / 'summary.json').read_text())
+    receipt = q3_metrics.load_json(run / 'receipt.json')
+    summary = q3_metrics.load_json(run / 'client' / 'summary.json')
+    launch = q3_metrics.load_json(run / 'splash' / 'launch.json')
     metrics = q3_metrics.run_metrics(run, receipt, summary, 4, None)
-    report, failure = q2_run_audit.check_run(receipt, run / 'client', summary, None, ENGINE, True)
-    ready = summary.get('native_readiness') or {}
-    return {'run': str(run), 'label': ready.get('label'), 'config': ready.get('config'),
-            'q5_verdict': (receipt.get('verdict') or {}).get('verdict'),
+    if receipt is None:
+        report, failure = None, 'Q5 receipt missing'
+    else:
+        report, failure = q2_run_audit.check_run(receipt, run / 'client', summary, None, ENGINE, True)
+    ready = (summary or {}).get('native_readiness') or {}
+    return {'run': str(run), 'label': ready.get('label'),
+            'config': ready.get('config') or ((launch or {}).get('spec') or {}).get('config'),
+            'q5_verdict': ((receipt or {}).get('verdict') or {}).get('verdict'),
             'audit': 'Pass' if failure is None else failure, 'tasks_passed': metrics['tasks_passed'],
             'final_source_sha256': metrics['final_source_sha256'], 'makespan_s': metrics['makespan_s'],
             'q5_memory': metrics['memory'],
             'splash_memory': {'ready': (ready.get('status') or {}).get('memory_actual'),
-                              'final': ((summary.get('native_closing') or {}).get('status') or {}).get('memory_actual')},
+                              'final': (((summary or {}).get('native_closing') or {}).get('status') or {}).get(
+                                  'memory_actual')},
             'trace': (report or {}).get('native_trace'), 'tokens': metrics['tokens'],
-            'worst_slot_ttft_p95_s': metrics['worst_slot_ttft_p95_s']}
+            'worst_slot_ttft_p95_s': metrics['worst_slot_ttft_p95_s'], 'prompt_parity': prompt_parity(run)}
 
 
 if __name__ == '__main__':

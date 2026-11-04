@@ -140,6 +140,7 @@ NATIVE_COMPARISON = ('native-comparison campaign; not the verdict of record: the
 # native_peers.py interface (the registry resolves kind 'omlx' to this module).
 CLIENT_MODULES = ('native_peers.py', 'native_peer_omlx.py', 'native_peer_omlx_ready.py', 'test_native_peer_omlx.py')
 PROCESSES = ('omlx', 'omlx-server')     # pyproject.toml:233-234 console script; process_title.py:8 setproctitle
+PYTHON_MODULES = ()                     # the server runs as the omlx console script (PROCESSES)
 BASELINES = {f'omlx_{q3}_native': label for q3, label in LABELS.items()}
 AUDIT = 'native_peer_omlx_audit'
 PEER_CASE_REFUSAL = ('a native oMLX --peer-case needs --native-comparison (Qwen3.8, Qwen3.6 and Gemma 4 have a '

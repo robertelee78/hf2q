@@ -341,6 +341,110 @@ class Launch(unittest.TestCase):
         self.assertIsNone(ready.build_info(sp.SPLASH_COMMIT, sp.BUILD_ID, {**hashes, 'metallib_sha256': None}))
 
 
+def status_doc(spec, pid=4242, requests=0, **changes):
+    """A /status document of the approved server (runtime/engine/Status.cpp, server/backend.py transport)."""
+    doc = {'instance': {'model': sp.MODEL_IDS[spec['q3_family']], 'port': spec['port'], 'pid': pid},
+           'ready': True, 'maximum_context_tokens': sp.CONTEXT_PER_SLOT, 'vision': False,
+           'identity': {'cache': {'build_id': sp.BUILD_ID,
+                                  'dtype': 'q8s8_f32_scale_per_token_head_k_token_major_v_dimension_major'},
+                        'kv': {'format': 'int8'}},
+           'verify_rows': 'all', 'streamed_experts': None, 'ane_ffn': {'state': 'on'},
+           'transport': {'recovering': False, 'stopped': False, 'restarts': 0},
+           'requests': {'submitted': requests, 'completed': requests, 'failed': 0, 'cancelled': 0}}
+    for dotted, value in changes.items():
+        node = doc
+        *parents, leaf = dotted.split('__')
+        for key in parents:
+            node = node[key]
+        node[leaf] = value
+    return doc
+
+
+class Checks(unittest.TestCase):
+    spec = Launch.spec
+
+    def test_status_binds_kv_format_cache_dtype_and_no_restart(self):
+        spec = ready.launch_spec(self.spec())
+        self.assertEqual(ready.validate_status(status_doc(spec), spec, 4242)['verify_rows'], 'all')
+        self.assertEqual(ready.validate_status(status_doc(spec, requests=6), spec, 4242, 6)['requests']['completed'], 6)
+        for change in ({'identity__kv__format': 'bf16'}, {'identity__cache__dtype': 'bf16_k_token_major_v_token_major'},
+                       {'transport__restarts': 1}, {'transport__recovering': True}, {'identity__cache__build_id': 'x'},
+                       {'instance__pid': 1}, {'requests__failed': 1}, {'verify_rows': 'auto'}):
+            with self.subTest(change=change), self.assertRaises(Invalid):
+                ready.validate_status(status_doc(spec, **change), spec, 4242)
+        bf16 = ready.launch_spec(self.spec(config=sp.preset('kv-bf16', 'qwen38')))
+        ready.validate_status(status_doc(bf16, identity__kv__format='bf16',
+                                         identity__cache__dtype='bf16_k_token_major_v_dimension_major'), bf16, 4242)
+
+    def test_prepare_refuses_a_non_apfs_run_directory(self):
+        spec = ready.launch_spec(self.spec())
+        with mock.patch.object(ready, 'filesystem', return_value='exfat'), \
+                mock.patch.object(ready.subprocess, 'run') as run, self.assertRaises(Invalid):
+            ready.prepare_run(spec, {})
+        run.assert_not_called()
+
+    def identity(self, **actual):
+        declared = {name: str(i) * 64 for i, name in enumerate(ready.BUILD_INFO_HASHES, 1)}
+        return {'native_runtime': {'declared': declared, 'actual': {**declared, **actual}}}
+
+    def test_launch_problems_refuse_stale_builds_and_non_apfs_output(self):
+        artifact = {'path': '/m/Qwen3.8-27B-vanilla.gguf', 'sha256': 'f' * 64}
+        with mock.patch.object(ready, 'filesystem', return_value='apfs'):
+            self.assertEqual(sp.launch_problems('splash', artifact, 'f' * 64, self.identity(), '/tmp/q3'), [])
+            stale = sp.launch_problems('splash', artifact, 'f' * 64, self.identity(toolchain_sha256='0' * 64), '/tmp/q3')
+        self.assertEqual(len(stale), 1)
+        self.assertIn('toolchain_sha256', stale[0])
+        with mock.patch.object(ready, 'filesystem', return_value='exfat'):
+            self.assertIn('APFS', sp.launch_problems('splash', artifact, 'f' * 64, self.identity(), '/Volumes/x/q3')[0])
+        self.assertIn("hf2q arm's GGUF", sp.launch_problems('splash', artifact, 'e' * 64)[0])
+
+    def test_identity_binds_the_build_time_toolchain(self):
+        versions = {'xcode': 'Xcode 27.2\nBuild version 27B52', 'clang': 'Apple clang version 21.0.0\nTarget: arm64',
+                    'metal': 'Apple metal version 32023.922\nInstalledDir: /x', 'sdk': '27.2',
+                    'macos': 'ProductVersion:\t\t27.2'}
+        recorded = 'Xcode 27.2\nBuild version 27B52\nApple clang version 21.0.0\nApple metal version 32023.922\n' \
+                   '27.2\nProductVersion:\t\t27.2\n'
+        self.assertEqual(splash_sweep.build_toolchain_problems(versions, recorded), [])
+        self.assertEqual(splash_sweep.build_toolchain_problems({**versions, 'xcode': 'Xcode 27.3'}, recorded),
+                         ['xcode: Xcode 27.3'])
+
+    def test_inventory_sees_a_leftover_splash_python_server(self):
+        import q5_preflight
+        self.assertEqual(q5_preflight.classify_argv(['/opt/splash/.venv/bin/python', '-P', '-u', '-m', 'server.server',
+                                                     '/out/splash/models/.resolved/x']), 'python-hosted-runtime')
+        self.assertEqual(q5_preflight.classify_argv(['/opt/splash/build/splash', 'serve-native']), 'runtime')
+        self.assertIsNone(q5_preflight.classify_argv(['python3', '-m', 'http.server']))
+
+    def test_run_record_of_a_run_stopped_before_the_client(self):
+        with tempfile.TemporaryDirectory() as root:
+            run = Path(root) / 'run'
+            (run / 'splash').mkdir(parents=True)
+            (run / 'receipt.json').write_text(json.dumps({'client': None, 'stop': {'reason': 'pressure_critical'},
+                                                         'verdict': {'verdict': 'MemoryStop'}}))
+            (run / 'splash' / 'launch.json').write_text(json.dumps({'spec': {'config': S0}}))
+            record = audit.run_record(run)
+            self.assertEqual((record['config'], record['q5_verdict'], record['prompt_parity']),
+                             (S0, 'MemoryStop', 'PendingPostOracle'))
+            self.assertFalse(splash_sweep.select([record])['configurations'][S0]['valid'])
+
+    def test_prompt_parity_needs_the_oracle_result_bound_to_its_config(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as root:
+            run = Path(root) / 'run'
+            directory = run / audit.PARITY_DIR
+            directory.mkdir(parents=True)
+            config = json.dumps({'turns': [{'splash_apply_template': {
+                'path': str(run / 'client' / 'agent-0' / 'turn-0' / 'splash-apply-template.raw')}}]})
+            (directory / 'config.json').write_text(config)
+            self.assertEqual(audit.prompt_parity(run), 'PendingPostOracle')
+            result = {'schema': 'hf2q.splash-prompt-parity-post-oracle.v1', 'hf2q_prompt_parity': 'PassedByteIdentical',
+                      'config_sha256': hashlib.sha256(config.encode()).hexdigest()}
+            (directory / 'splash-prompt-parity-post-oracle.json').write_text(json.dumps(result))
+            self.assertEqual(audit.prompt_parity(run), 'PassedByteIdentical')
+            (directory / 'splash-prompt-parity-post-oracle.json').write_text(json.dumps({**result, 'config_sha256': 'x'}))
+            self.assertNotEqual(audit.prompt_parity(run), 'PassedByteIdentical')
+
+
 class Audit(unittest.TestCase):
     STDOUT = ('19:00:00 Loading · hf2q/Qwen3.8-27B\n'
               '19:00:05 Started · input 1,000 · cached 0 · effort absent → xhigh · enable_thinking true · thinking on\n'
@@ -395,15 +499,13 @@ class Verdict(unittest.TestCase):
         self.assertEqual(q3_report.stage_arms(plan, 'n1'), plan['measured_arms'])
         for control in ('3+1', '2+2', '1+3'):
             self.assertNotIn('splash', q3_report.stage_arms(plan, control))
-        self.assertTrue(q3_report.splash_required(plan))
-        self.assertFalse(q3_report.splash_required({**plan, 'family': 'gemma4'}))
-        self.assertFalse(q3_report.splash_required({**plan, 'native_comparison': 'x'}))
 
 
 class Sweep(unittest.TestCase):
-    def record(self, config, makespan, passed=4, q5='CalibrationPass', audited='Pass', run='r'):
+    def record(self, config, makespan, passed=4, q5='CalibrationPass', audited='Pass', run='r',
+               parity='PassedByteIdentical'):
         return {'run': run, 'config': config, 'makespan_s': makespan, 'tasks_passed': passed, 'q5_verdict': q5,
-                'audit': audited}
+                'audit': audited, 'prompt_parity': parity}
 
     def test_select_uses_splash_outcomes_and_marks_close_calls_provisional(self):
         s0, kv = sp.preset('s0', 'qwen38'), sp.preset('kv-bf16', 'qwen38')
@@ -417,6 +519,13 @@ class Sweep(unittest.TestCase):
         self.assertTrue(close['choice']['provisional'])
         invalid = splash_sweep.select([self.record(s0, 60, q5='MemoryStop'), self.record(kv, 70, audited='bad')])
         self.assertIsNone(invalid['choice'])
+        pending = splash_sweep.select([self.record(s0, 60), self.record(kv, 50, parity='PendingPostOracle')])
+        self.assertEqual(pending['choice']['config'], s0)  # the faster point lacks proven prompt parity
+        self.assertIn('prompt-parity', pending['configurations'][kv]['reasons'][0])
+        stopped = splash_sweep.select([self.record(None, None, passed=0, q5=None, run='/runs/pre-client')])
+        (row,) = stopped['configurations'].values()
+        self.assertFalse(row['valid'])
+        self.assertIsNone(stopped['choice'])
 
     def test_derive_case_changes_only_the_configuration(self):
         import q5_case
@@ -556,8 +665,49 @@ class Campaign(unittest.TestCase):
         plan, _ = q3.build_plan(self.args('qwen38', '--splash-unavailable-evidence', str(self.evidence)), {}, 'qwen38')
         self.assertNotIn('splash', plan['measured_arms'])
         self.assertEqual(plan['splash_unavailable_evidence'][0]['path'], str(self.evidence))
+        self.assertIs(plan['splash_required'], True)  # declared unavailable: the verdict is Unavailable
+        plan, _ = q3.build_plan(self.args('qwen38', '--peer-unavailable-evidence', str(self.evidence)), {}, 'qwen38')
+        self.assertNotIn('splash', plan['measured_arms'])
+        self.assertNotIn('splash_required', plan)  # already Unavailable without the peer; no Splash gate asked
         with self.assertRaises(ValueError):
             q3.build_plan(self.args('qwen38', '--splash-case', str(HERE / 'q5_cases' / 'peer-qwen38.json')), {}, 'qwen38')
+
+    def settle_splash(self, stop, oom=False):
+        """A Splash attempt that ends before the client starts, settled and judged by the real driver."""
+        import q3_campaign as q3
+        out = self.root / 'campaign'
+        output = out / 'runs' / 'n4-b1-splash-a0'
+        output.mkdir(parents=True, exist_ok=True)
+        (output / 'receipt.json').write_text(json.dumps({'client': None, 'stop': stop,
+                                                         'verdict': {'verdict': 'Stopped', 'reason': 'x'}}))
+        (output / 'server.stderr').write_text('[metal] Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)\n'
+                                              if oom else '')
+        case = out / 'case.json'
+        case.write_text(json.dumps({'client': {'summary': '{OUT}/client/summary.json'}}))
+        driver = q3.Driver({'arms': {'splash': {'engine_kind': 'splash'}}}, {}, out, {}, None, None, None)
+        driver.manifest = {'unavailable': {}, 'status': 'Running'}
+        driver.frozen = {'arms': {'splash': {'binary': {'sha256': 'b'}, 'artifact': None, 'peer_build_info': None}}}
+        entry = {'name': 'n4-b1-splash', 'arm': 'splash', 'outcome': None, 'attempts': []}
+        record = {'name': 'n4-b1-splash-a0', 'output': str(output), 'case': str(case), 'outcome': 'Launched'}
+        stage = {'workload': 'n4', 'phase_plan': None, 'agents': 4, 'blocks': []}
+        driver.settle(stage, entry, record, 1, None)
+        self.assertEqual(entry['outcome'], 'Unavailable')
+        return driver, lambda: driver.consequences(stage, entry, record, halt_unstarted=True)
+
+    def test_a_memory_stop_before_the_client_halts_the_campaign(self):
+        import q3_campaign as q3
+        driver, judge = self.settle_splash({'reason': 'pressure_critical', 'detail': 'critical during load'})
+        with self.assertRaises(q3.Halt):
+            judge()
+        self.assertEqual(driver.manifest['status'], 'Halted')
+        self.assertIn('decision D6', driver.manifest['halted']['reason'])
+        self.assertFalse(driver.manifest['halted']['resumable'])
+        driver, judge = self.settle_splash({'reason': 'server_exited', 'detail': 'exit -6'}, oom=True)
+        with self.assertRaises(q3.Halt):
+            judge()
+        driver, judge = self.settle_splash({'reason': 'server_exited', 'detail': 'exit 1'})
+        self.assertTrue(judge())  # an ordinary load failure: Splash is Unavailable, the campaign goes on
+        self.assertIn('splash', driver.manifest['unavailable'])
 
     def test_verdict_requires_splash_for_qwen(self):
         verdict = q3_report.compute_verdict(splash_manifest())

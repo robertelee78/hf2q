@@ -443,9 +443,12 @@ decodes with its family's pinned DFlash2 draft. Q3 runs it as its own measured a
 | `q5_cases/splash-qwen38.json`, `splash-qwen36.json` | Q5 cases; `SPLASH_CONFIG` is the configuration (default: sweep point `s0`) |
 
 - **Build.** Build a clean detached clone of `031a25a6` with `make -j4 && make install-environment`, only while
-  `HOST-LOCK` is absent. Then `python3 scripts/four_agent/splash_sweep.py identity --splash-dir DIR` prints
+  `HOST-LOCK` is absent, and record the toolchain the build used (`xcodebuild -version`, `xcrun metal --version`,
+  `clang --version`, `xcrun --show-sdk-version`, `sw_vers`) in `toolchain.txt`. Then
+  `python3 scripts/four_agent/splash_sweep.py identity --splash-dir DIR --build-toolchain toolchain.txt` prints
   `SPLASH_BIN_SHA256`, `SPLASH_METALLIB_SHA256`, `SPLASH_HOST_STEP_SHA256`, `SPLASH_TOOLCHAIN_SHA256` and
-  `SPLASH_VENV_FREEZE_SHA256`. The case requires all five; it also requires `MODEL_SHA256`, the hf2q GGUF's.
+  `SPLASH_VENV_FREEZE_SHA256`, refusing a host toolchain the build did not record. The case requires all five; it
+  also requires `MODEL_SHA256`, the hf2q GGUF's.
 - **Drafts.** Qwen3.8 uses `z-lab/Qwen3.8-27B-DFlash2@50307d4c`, which is byte-identical to
   `incoai/Qwen3.8-27B-DFlash2@015e7956`. Qwen3.6 uses `incoai/Qwen3.6-35B-A3B-DFlash2@51ef7b69`. Each is an HF
   cache snapshot on the internal disk.
@@ -462,10 +465,20 @@ decodes with its family's pinned DFlash2 draft. Q3 runs it as its own measured a
     template as `tokenizer/chat_template.jinja`.
   - `{OUT}` must be on APFS (the internal disk). On the exFAT external drive, Splash's model-directory cleanup stops
     on the `._*` files macOS writes there.
+  - The run must add no draft pin to the shared HF cache (`refs/splash`); local sources carry none.
+  - `/status` must report the configured KV format and cache dtype and no engine restart, at readiness and closing.
+- **Sweep.** After each settled sweep run, write `parity-config RUN --template FILE` (default output
+  `RUN/splash-prompt-parity`) and run hf2q's `splash_prompt_parity_post_oracle` on it. `select` counts a
+  configuration valid only when every run has a `PassedByteIdentical` result there. A run that stopped before the
+  client is an invalid row of its own.
 - **Q3.** `--splash-case` defaults to `q5_cases/splash-<family>.json` for qwen38/qwen36. The arm runs only in the
   `n4` and `n1` stages (D7). `--splash-unavailable-evidence` declares Splash unavailable; the family verdict is
-  then `Unavailable`, never a Win against the peer alone. A Splash Q5 memory stop halts the campaign: record a
-  `--max-memory` cap (D6), re-confirm the configuration and start a new campaign.
+  then `Unavailable`, never a Win against the peer alone. A peer-unavailable campaign requires no Splash arm (its
+  verdict is Unavailable already).
+  - Launch refuses a campaign whose Splash build, toolchain or venv differs from the case's declared hashes, or
+    whose output is not on APFS, before any run.
+  - A Splash Q5 memory stop halts the campaign, also before the client starts (load and readiness window): record
+    a `--max-memory` cap (D6), re-confirm the configuration and start a new campaign.
 - **Quality gate.** Run `quality_campaign.py --reference-kind splash` with a Splash reference case. The F2 tier
   requires a `splash` gate for records that require Splash.
 - **Qwen3.6 workload.** The arm runs the declared Qwen3.6 workload. The repair-turn workload applies once it is

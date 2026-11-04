@@ -5,11 +5,14 @@ q5_calibration.py on a granted GPU lane, then `select` reads the settled runs.
 
   identity     print the case variables the Splash build binds (SPLASH_BIN/METALLIB/HOST_STEP/TOOLCHAIN/
                VENV_FREEZE_SHA256) from a built checkout. Reads the binaries and runs the toolchain version commands;
-               no model file is read.
+               no model file is read. --build-toolchain is the toolchain.txt the build recorded: every host toolchain
+               version line must appear in it, so SPLASH_TOOLCHAIN_SHA256 names the toolchain that built the binaries
+               (a later Xcode or Metal update is refused here and at every launch).
   derive-case  write a copy of q5_cases/splash-<family>.json for one sweep point (native_peer_splash.PRESETS), with
                an optional --max-memory cap (decision D6); only SPLASH_CONFIG, the workload id and the notes change.
   select       validity and choice over settled runs: a configuration is valid when every one of its runs is Q5
-               CalibrationPass and passes the run audits (q2_run_audit with the Splash audit module), and Splash's
+               CalibrationPass, passes the run audits (q2_run_audit with the Splash audit module) and has a
+               PassedByteIdentical prompt-parity post-oracle in RUN/splash-prompt-parity, and Splash's
                task pass fraction over its runs is at least the Q1 numeric-policy floor (0.75). Splash's own outcomes
                decide; no hf2q arm is involved (decision D10). The best is the lowest median makespan among valid
                configurations; it is provisional when the runner-up's median is within the Q3 half-width target
@@ -36,14 +39,26 @@ HERE = Path(__file__).resolve().parent
 PASS_FLOOR = quality_campaign.POLICY["paired_min_pass_fraction"]
 
 
-def identity(splash_dir):
+def build_toolchain_problems(versions, recorded):
+    """Host toolchain version lines missing from the build's toolchain.txt (clang/metal install directories, which
+    a Metal toolchain update relocates, are not compared)."""
+    lines = {line.strip() for line in recorded.splitlines()}
+    return sorted(f'{name}: {line.strip()}' for name, text in versions.items() for line in text.splitlines()
+                  if line.strip() and not line.startswith('InstalledDir:') and line.strip() not in lines
+                  and not (name == 'clang' and line.startswith(('Target:', 'Thread model:'))))
+
+
+def identity(splash_dir, build_toolchain):
     import native_peer_splash_ready as ready
     paths = ready.layout({'splash_dir': str(Path(splash_dir).resolve()), 'run_dir': '/'})
     tools = ready.toolchain()
+    missing = build_toolchain_problems(tools['versions'], Path(build_toolchain).read_text())
+    require(not missing, 'the host toolchain is not the one the Splash build recorded: ' + '; '.join(missing))
     venv = ready.venv_inventory(paths['root'])
     return {'SPLASH_BIN_SHA256': ready.sha256(paths['binary']), 'SPLASH_METALLIB_SHA256': ready.sha256(paths['metallib']),
             'SPLASH_HOST_STEP_SHA256': ready.sha256(paths['host_step']), 'SPLASH_TOOLCHAIN_SHA256': tools['sha256'],
-            'SPLASH_VENV_FREEZE_SHA256': venv['freeze_sha256'], 'toolchain': tools['versions']}
+            'SPLASH_VENV_FREEZE_SHA256': venv['freeze_sha256'], 'toolchain': tools['versions'],
+            'build_toolchain': {'path': str(Path(build_toolchain).resolve()), 'sha256': ready.sha256(Path(build_toolchain))}}
 
 
 def derive_case(case, point, max_memory=None):
@@ -64,18 +79,25 @@ def derive_case(case, point, max_memory=None):
 
 
 def select(records):
-    """records: native_peer_splash_audit.run_record outputs. Returns the validity table and the choice."""
+    """records: native_peer_splash_audit.run_record outputs. Returns the validity table and the choice. A run that
+    names no configuration (it stopped before Splash launched) is its own invalid row."""
     by_config = {}
     for record in records:
-        require(isinstance(record.get('config'), str), f"run {record.get('run')} has no Splash configuration")
-        by_config.setdefault(record['config'], []).append(record)
+        config = record.get('config') if isinstance(record.get('config'), str) else f"unconfigured run {record['run']}"
+        by_config.setdefault(config, []).append(record)
     table = {}
     for config, runs in sorted(by_config.items()):
         reasons = []
+        if any(not isinstance(r.get('config'), str) for r in runs):
+            reasons.append('the run records no Splash configuration (no readiness and no launch.json)')
         if any(r['q5_verdict'] != 'CalibrationPass' for r in runs):
             reasons.append('a run is not Q5 CalibrationPass')
         if any(r['audit'] != 'Pass' for r in runs):
             reasons.append('a run failed its audit: ' + '; '.join(str(r['audit']) for r in runs if r['audit'] != 'Pass'))
+        if any(r.get('prompt_parity') != 'PassedByteIdentical' for r in runs):
+            # Design section 7.1: request parity on every run; section 6.4: a mismatch makes the run Invalid.
+            reasons.append('a run lacks a PassedByteIdentical prompt-parity post-oracle: ' + '; '.join(
+                f"{r['run']}: {r.get('prompt_parity')}" for r in runs if r.get('prompt_parity') != 'PassedByteIdentical'))
         passed = sum(r['tasks_passed'] or 0 for r in runs)
         agents = 4 * len(runs)
         fraction = passed / agents if agents else 0.0
@@ -103,10 +125,13 @@ def select(records):
 ARCHITECTURES = {'qwen38': 'qwen35', 'qwen36': 'qwen35moe'}
 
 
-def parity_config(run_dir, template, output_dir):
-    """Oracle config (and the canonical request files it binds) for one settled Splash run."""
+def parity_config(run_dir, template, output_dir=None):
+    """Oracle config (and the canonical request files it binds) for one settled Splash run. The default directory,
+    {run}/splash-prompt-parity, is where run_record (and so `select`) reads the oracle's result."""
     import hashlib
-    run, out = Path(run_dir).resolve(), Path(output_dir).resolve()
+    from native_peer_splash_audit import PARITY_DIR
+    run = Path(run_dir).resolve()
+    out = Path(output_dir).resolve() if output_dir is not None else run / PARITY_DIR
     summary = json.loads((run / 'client' / 'summary.json').read_text())
     ready = summary.get('native_readiness') or {}
     q3 = ready.get('q3_family')
@@ -146,6 +171,8 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     ident = sub.add_parser('identity', help='print the build identity variables of a Splash checkout')
     ident.add_argument('--splash-dir', required=True)
+    ident.add_argument('--build-toolchain', type=Path, required=True,
+                       help="the build's toolchain.txt (xcodebuild/metal/clang/sdk/sw_vers output at build time)")
     derive = sub.add_parser('derive-case', help='write the Splash case of one sweep point')
     derive.add_argument('--family', choices=sorted(sp.ARTIFACTS), required=True)
     derive.add_argument('--point', choices=sorted(sp.PRESETS), required=True)
@@ -158,10 +185,11 @@ def main(argv=None):
     parity.add_argument('run', type=Path, help='q5 run directory of a Splash case')
     parity.add_argument('--template', type=Path, required=True,
                         help='reviewed GGUF-embedded template (rendered-inputs-reviewed/<family>.template.jinja)')
-    parity.add_argument('--output-dir', type=Path, required=True, help='new directory outside Git')
+    parity.add_argument('--output-dir', type=Path,
+                        help='new directory outside Git (default RUN/splash-prompt-parity, which select reads)')
     args = parser.parse_args(argv)
     if args.command == 'identity':
-        print(json.dumps(identity(args.splash_dir), indent=2))
+        print(json.dumps(identity(args.splash_dir, args.build_toolchain), indent=2))
     elif args.command == 'derive-case':
         import q5_case
         base = args.case or HERE / 'q5_cases' / f'splash-{args.family}.json'

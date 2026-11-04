@@ -29,6 +29,7 @@ INTERFACE = {
     'SLOTS': 'four-slot coding workload only',
     'CLIENT_MODULES': 'client source-freeze additions (registry, arm client modules, arm test)',
     'PROCESSES': 'executable names for the competing-runtime inventories',
+    'PYTHON_MODULES': 'full `python -m` module names of the arm\'s server for the competing-runtime inventories',
     'BASELINES': 'F2 effect baseline id -> label; never a measured column, never a win',
     'AUDIT': 'post-run audit module: audit_run, q3_section, note',
     'SAME_GGUF_UNAVAILABLE': 'verdict reason when the campaign carries --peer-unavailable-evidence',
@@ -44,7 +45,8 @@ INTERFACE = {
     'closing': '(base, coordinator output) -> record once every agent finished (outside the makespan), or None',
     'PEER_CASE_REFUSAL': 'Q3 refusal text when the arm\'s --peer-case lacks its required campaign flag',
     'campaign_identity': '(q5 plan) -> frozen identity additions (peer_build_info, native_runtime)',
-    'launch_problems': '(arm name, artifact identity, hf2q artifact sha256) -> refusal strings',
+    'launch_problems': '(arm name, artifact identity, hf2q artifact sha256) -> refusal strings; same-artifact arms '
+                       'also take (arm identity, campaign output directory)',
     'label': '(q5 case) -> arm label',
     'q3_role': '(q5 case) -> Q3 plan role',
 }
@@ -100,3 +102,7 @@ def baseline_of(kind, label):
 
 def process_names():
     return frozenset(name for kind in ADAPTER_KINDS for name in adapter(kind).PROCESSES)
+
+
+def python_modules():
+    return frozenset(name for kind in ADAPTER_KINDS for name in adapter(kind).PYTHON_MODULES)
