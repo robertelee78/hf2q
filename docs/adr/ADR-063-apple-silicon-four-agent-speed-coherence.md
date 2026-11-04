@@ -883,6 +883,8 @@ Priority: Medium. Successor scope; does not gate Q4.
 
 Delivery boundary: Measured evidence merged to main for v0.1.30.
 
+Result (2026-11-04): Localized. The packed route first diverges from All128 at layer 0, prefill `Attention` (the SDPA output), in all four lanes and on all 128 prompt rows. Layer-0 Q/K/V and RoPE outputs are exact. The batched decode body adds no divergence of its own: decode layer 0 is exact, and decode layer 1 first differs at `Attention`, which reads the prefill-written KV cache. Every observer-effect control is `ExactEqual` (5,616 records each): against `gemma-t0-b3`, against `gemma-t2-b3`, and against a same-build T0. The routing bank reproduces the b3 T0/T2 routing decision byte for byte. The repeated-token prefix (rows 29–127) diverges at the same stage with a slightly lower magnitude. Class B, so no fix is implied. Build of record: the PR #675 merge commit `b0dac052` instead of b3 `91b0c382` (root decision, 2026-11-03; bridged to b3 by the observer-effect control). Evidence: `docs/research/adr063-q1-gemma-t2-localization.md`.
+
 ### Q1-QWEN38-RERUN. Re-run Qwen3.8 Q1 T1/T3 on a build after #561
 
 Outcome: The Qwen3.8 restore-versus-cold Q1 evidence is current for the restore cursor fix.
