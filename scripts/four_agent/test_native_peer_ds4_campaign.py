@@ -293,9 +293,12 @@ class SameFileCase(unittest.TestCase):
         self.assertEqual(nd.relation(base), 'different')
         self.assertEqual((nd.relation(case), nd.label(case)), ('same_as_hf2q', 'ds4 c97964b (same ds4 file)'))
         self.assertEqual({k for k in case['variables'] if case['variables'][k] != base['variables'][k]},
-                         {'DS4_DIR', 'MODEL_SHA256', 'PORT'})
+                         {'DS4_DIR', 'DS4_BIN_SHA256', 'MODEL_SHA256', 'PORT'})
         self.assertEqual(case['variables']['MODEL_SHA256'], DS4_SHA)
-        plan = q5_case.build_plan(case, self.BUILTINS, {**self.REQUIRED, 'HF2Q_Q5_DS4_BIN_SHA256': 'd' * 64})
+        # The c97964b ds4-server sha256, equal to ds4_server_sha256 in the peer directory's build-receipt.json.
+        self.assertEqual(case['variables']['DS4_BIN_SHA256'],
+                         '4ed2679d436469244a0f644aba18c4c2fe02f0cfacabc357d9613d8f23dc160b')
+        plan = q5_case.build_plan(case, self.BUILTINS, self.REQUIRED)
         self.assertTrue(plan['complete'])
         hf2q = q5_case.loads(DS4FILE.read_bytes())['variables']['MODEL']
         self.assertEqual(plan['artifact'], {'path': hf2q, 'sha256': DS4_SHA})  # the hf2q arm's file itself

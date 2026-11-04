@@ -44,6 +44,10 @@ RECORD_KEYS = {"verdict", "verdict_ref", "campaign_ref", "campaign_status", "hal
 STOCK_RECORD = "stock_record"
 STOCK_RECORD_KEYS = {"verdict_ref", "artifact_sha256", "stock_label"}
 GATE_KEYS = {"reference", "manifest", "status", "q1_verdict", "reference_sha256"}
+# The tier's wording for a native-engine statement, by artifact relation (native_peers.same_file_baselines).
+NATIVE_STATEMENT = "the native-engine statement (different artifact)"
+NATIVE_STATEMENT_BOTH = ("the native-engine statement (different artifact, or \"same file\" for a same-file comparison "
+                         "of the native engine on hf2q's own artifact)")
 HOW_TO_READ = [
     "How to read this tier:", "",
     "- **Source.** One Q3 `verdict.json` of record per family, merged with `q3_campaign.py --rows CAMPAIGN "
@@ -64,7 +68,7 @@ HOW_TO_READ = [
     "with the gating reason.",
     "- **Peer: task makespan only.** The sentence names whichever arm finishes sooner and computes X on the slower "
     "arm's time, X = 1 − faster/slower; it is never a win. A peer arm that ran with speculation off is named the "
-    f"{PEER_SPEC_OFF}. Unavailable families show the native-engine statement (different artifact) when one exists. "
+    f"{PEER_SPEC_OFF}. Unavailable families show {NATIVE_STATEMENT} when one exists. "
     "A notice on a family's verdict marks a record that a pre-registered campaign will replace. A family verdict of "
     "Loss is never shown as a Win against stock.",
     "- **Failed** families (an experiment run failed its task, Q3 rule 1) show that run's Failure row and no speed "
@@ -82,6 +86,11 @@ HOW_TO_READ = [
     "- **Family notes** below the tables carry each family's reviewed scoreboard sentences and the disclosures the "
     "independent reviews require; they cite the reviews and add no number of their own.",
 ]
+
+
+def how_to_read(same_file):
+    """HOW_TO_READ; with same-file native rows on the board, the native-statement wording names both relations."""
+    return [line.replace(NATIVE_STATEMENT, NATIVE_STATEMENT_BOTH) for line in HOW_TO_READ] if same_file else list(HOW_TO_READ)
 
 
 def experiment_name(declared):
@@ -338,5 +347,6 @@ def verify(manifest, evidence_root, resolve):
             resolve(rec["review"], evidence_root)
         again = build_record(load(rec["verdict_ref"]), load(rec["campaign_ref"]), evidence_root,
                              (rec["verdict_ref"], rec["campaign_ref"]), gates, rec["review"])
-        for key in sorted(set(RECORD_KEYS) | ({SPLASH} if SPLASH in rec or SPLASH in again else set())):
+        optional = {key for key in (SPLASH, STOCK_RECORD) if key in rec or key in again}
+        for key in sorted(set(RECORD_KEYS) | optional):
             require(again.get(key) == rec.get(key), f"{gid}: q3_record {key} drift: receipts give {again.get(key)!r}")

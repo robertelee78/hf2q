@@ -220,6 +220,9 @@ def no_stock_refusal(args):
         return f"--no-stock-arm runs no stock arm: {', '.join(given)} refused"
     if args.controls_of is not None:
         return "--no-stock-arm has no controls-only mode: run its controls in the same campaign"
+    if args.stock_record is not None and args.peer_unavailable_evidence:
+        return ("--stock-record is judged against the peer: --peer-unavailable-evidence would leave this campaign no "
+                "contrast to measure")
     return None
 
 
@@ -442,10 +445,15 @@ class Driver:
         return self.manifest
 
     def finished(self, stage):
-        """Apply the stopping rule once the last block is complete; True when the stage is done."""
-        if not stage["blocks"] or not q3_report.block_complete(stage["blocks"][-1]):
+        """Apply the stopping rule once the last block is complete; True when the stage is done. A no-stock plan whose
+        only contrast became unavailable or failed has nothing left to measure: its stage stops at once (no_contrast)."""
+        required = q3_report.required_effects(stage, self.manifest)
+        if not required and "stock" not in self.plan["arms"]:
+            reason = q3_stats.NO_CONTRAST
+        elif not stage["blocks"] or not q3_report.block_complete(stage["blocks"][-1]):
             return False
-        reason = q3_stats.stop_decision(len(stage["blocks"]), q3_report.required_effects(stage, self.manifest))
+        else:
+            reason = q3_stats.stop_decision(len(stage["blocks"]), required)
         if reason is not None:
             stage.update(status="Complete", stop={"reason": reason, "blocks": len(stage["blocks"])})
             self.save()

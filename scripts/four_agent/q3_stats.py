@@ -11,6 +11,8 @@ MAX_BLOCKS = 20
 HALF_WIDTH_PP = 2.5    # target 95% half-width, percentage points of the arm ratio
 PEER_MARGIN = 0.95     # Q4: at least 5% lower four-agent makespan than the peer
 NEUTRAL_RATIO = 1.025  # fairness regression band (the F2 2.5-point neutral band)
+# Stop reason of a no-stock stage (--no-stock-arm) whose only contrast (the peer) became unavailable or failed.
+NO_CONTRAST = "no_contrast"
 # Two-sided 95% Student t quantiles, df = complete blocks - 1 (blocks <= 20).
 T975 = {1: 12.7062, 2: 4.3027, 3: 3.1824, 4: 2.7764, 5: 2.5706, 6: 2.4469, 7: 2.3646, 8: 2.3060,
         9: 2.2622, 10: 2.2281, 11: 2.2010, 12: 2.1788, 13: 2.1604, 14: 2.1448, 15: 2.1314,

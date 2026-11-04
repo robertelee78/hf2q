@@ -1,7 +1,7 @@
 """Markdown of the F2 'Q3 verdicts of record' tier (f2_q3_tier records and rows). Pure: no receipt reads."""
 import native_peers
-from f2_q3_tier import (FAIRNESS, HOW_TO_READ, NATIVE_COMPARISON, PEER_SPEC_OFF, PRECISION_PP, REFERENCES, SSE,
-                        STOCK_ARM, STOCK_RECORD, TOKEN_ARMS, TOKENS, UNMEASURABLE, required_references)
+from f2_q3_tier import (FAIRNESS, NATIVE_COMPARISON, PEER_SPEC_OFF, PRECISION_PP, REFERENCES, SSE,
+                        STOCK_ARM, STOCK_RECORD, TOKEN_ARMS, TOKENS, UNMEASURABLE, how_to_read, required_references)
 
 
 def ratio(row):
@@ -127,7 +127,9 @@ def render(manifest, q3_rows, native_rows, baseline_labels):
     fams, groups, band = manifest["families"], manifest["groups"], manifest["neutral_band_ratio"]
     notices = manifest.get("q3_verdict_notices") or {}  # e.g. a record a pre-registered campaign will replace
     records = {g["family"]: (gid, g["q3_record"]) for gid, g in groups.items() if "q3_record" in g}
-    out = ["## Q3 verdicts of record (F2's qualified display under option B; above Descriptive)", "", *HOW_TO_READ, "",
+    same_file = native_peers.same_file_baselines()
+    how = how_to_read(any(x["baseline_arm"] in same_file for x in native_rows))
+    out = ["## Q3 verdicts of record (F2's qualified display under option B; above Descriptive)", "", *how, "",
            "| Family | Q3 verdict of record | Makespan vs v0.1.28 stock | Makespan vs peer (task makespan only) | "
            "Worst-slot fairness, hf2q/reference [95% CI] | Quality gate | Campaign | Reviewed verdict |",
            "|---|---|---|---|---|---|---|---|"]
@@ -161,7 +163,6 @@ def render(manifest, q3_rows, native_rows, baseline_labels):
             peer_cell = sooner(peer, f"the {PEER_SPEC_OFF}" if PEER_SPEC_OFF in peer["note"] else "the peer", hf2q)
         elif rec["peer_unavailable"] or rec["verdict"] == "Unavailable":
             peer_cell = f"Unavailable: {rec['peer_unavailable'] or '; '.join(rec['reasons'])}"
-            same_file = native_peers.same_file_baselines()
             peer_cell += "".join(f". Native {baseline_labels[x['baseline_arm']]} "
                                  f"({'same file' if x['baseline_arm'] in same_file else 'different artifact'}, task "
                                  f"makespan only): "

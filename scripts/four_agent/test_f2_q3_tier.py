@@ -304,6 +304,17 @@ class StockRecordTier(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "q3_record stock_record"):
                 qwen38(BOTH, stock_record=bad)
 
+    def test_the_native_statement_wording_follows_the_relation(self):
+        same = plain(effect("deepseek4", "ds-same", "makespan_s", "ds4_samefile", 5.0, [3.0, 7.0], group="deepseek4-q3"))
+        different = plain(effect("deepseek4", "ds-diff", "makespan_s", "ds4_native", 5.0, [3.0, 7.0], group="deepseek4-q3"))
+        self.assertIn(tier.NATIVE_STATEMENT, " ".join(tier.HOW_TO_READ))
+        for rows, wording in (([different], tier.NATIVE_STATEMENT + " when"), ([different, same], tier.NATIVE_STATEMENT_BOTH)):
+            with self.subTest(rows=[x["id"] for x in rows]):
+                text = r.render(board({}, rows), [], "0" * 64)
+                self.assertIn(wording, text)
+        self.assertNotIn(tier.NATIVE_STATEMENT_BOTH, r.render(board({}, [different]), [], "0" * 64))
+        self.assertEqual(tier.how_to_read(False), tier.HOW_TO_READ)  # boards without same-file rows render unchanged
+
 
 if __name__ == "__main__":
     unittest.main()

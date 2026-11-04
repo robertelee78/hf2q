@@ -206,14 +206,14 @@ python3 -B scripts/four_agent/q3_campaign.py --family qwen38 "${STOCK[@]}" "${EX
 
 Design: `docs/research/adr066-iq2xxs-subset-design.md` §7.4 and §8. v0.1.28 and v0.1.29 cannot open ds4's DeepSeek-V4 Flash 0731 file (IQ2_XXS), so a campaign on that file has no stock arm. Its vs-stock terms come from a same-artifact record on hf2q's own artifact, measured with the same candidate binary.
 
-- **Arguments.** `--no-stock-arm` needs exactly one of `--stock-record VERDICT_JSON` (the verdict-of-record mode) or `--native-comparison` (no vs-stock row exists). `--stock-record` without `--no-stock-arm` refuses. With `--no-stock-arm`, `--stock-bin`, `--stock-commit`, `--stock-label` and `--stock-var` refuse, and so does `--controls-of` (the controls run in the same campaign). `--stock-record` needs exactly one `--family` and applies to `deepseek4` only.
+- **Arguments.** `--no-stock-arm` needs exactly one of `--stock-record VERDICT_JSON` (the verdict-of-record mode) or `--native-comparison` (no vs-stock row exists). `--stock-record` without `--no-stock-arm` refuses, and so does `--stock-record` with `--peer-unavailable-evidence` (the campaign is judged against the peer, so it would have no contrast). With `--no-stock-arm`, `--stock-bin`, `--stock-commit`, `--stock-label` and `--stock-var` refuse, and so does `--controls-of` (the controls run in the same campaign). `--stock-record` needs exactly one `--family` and applies to `deepseek4` only.
 - **Plan.** The measured arms omit `stock`, `declared.stock` is `null`, and only the experiment needs a binary and a 40-hex commit. `plan.stock_record` binds the record, following the `--controls-of` pattern: the paths and sha256 of its `verdict.json` and `campaign.json`, the family, the primary status, the recorded verdict, the stock and experiment declarations, the stock and experiment binary sha256 and the hf2q artifact sha256. The binding refuses a record that:
   - is not a `verdict.json` beside the `campaign.json` it binds (`campaign_sha256`, `identities_sha256`);
   - is not a complete `deepseek4` primary (a `Complete` primary stage of a default campaign, not controls-only);
   - is itself a no-stock campaign, or has a native peer arm or a native comparison;
   - has no vs-stock effect or no hf2q artifact sha256.
 - **Launch and every run.** `launch_problems` refuses when the record's experiment binary sha256 differs from this campaign's `--experiment-bin`, or when either bound file changed since binding. The frozen identities carry the experiment binary sha256 and the bound files' current sha256 (`identities.stock_record`), which are re-checked before every run, so a rebuilt binary or a changed record halts the campaign with `IdentityDrift`. `plan.stock_record` is part of the plan a `--resume` must reproduce. **Operating rule:** freeze the record read-only (`chmod a-w`) before binding, as for `--controls-of`.
-- **Stopping rule.** It waits on `vs_stock` only when the plan has a stock arm. A stock-record campaign waits on `vs_peer`.
+- **Stopping rule.** It waits on `vs_stock` only when the plan has a stock arm. A stock-record or no-stock native-comparison campaign waits on `vs_peer`. When the peer becomes unavailable or fails, such a stage has no contrast left: it stops at once with reason `no_contrast` (`q3_stats.NO_CONTRAST`), and so does every later stage, instead of running experiment-only blocks to the maximum.
 - **Verdict.** `verdict.json` `stock_record` re-binds the record by sha256 and carries its primary `vs_stock` makespan effect and the `vs_stock` fairness secondaries, its stock and experiment failures, and its thermal and memory validity. The family verdict uses them as its `vs_stock` and `fairness`. `stock_failures` and `experiment_failures` are the union of both campaigns, each record entry tagged `(stock record <path>)`. `thermal_valid` and `memory_valid` are the conjunction of both. `q3_stats.family_verdict` takes `stock_source` (the record's path, sha256 and status): every vs-stock reason names it, and a record that is missing, changed since binding or not `Complete` gives `Pending` with that reason, never a silent skip. The decision rules are unchanged, so a Win still needs the 95% CI of the vs-stock ratio below 1, precision and the fairness band, all from the record.
 - **No-stock native comparison.** Without a record (`--no-stock-arm --native-comparison`), `vs_stock` is the empty effect and `fairness` is `{}`. The native branch makes the verdict `Unavailable` with the comparison reason, as for any native comparison.
 - **Rows.** The workload text reads "stock `<label>` on hf2q's artifact, from record `<$E ref>`" (or "no stock arm" without a record). The vs-stock rows read `verdict.json` `stock_record.effects.vs_stock` (and `stock_record.secondary.<metric>.vs_stock` under `--of-record`), carry the record's hf2q artifact sha256, and note "baseline stock `<label>`, from the same-artifact record `<$E ref>` on hf2q's artifact". `--of-record` accepts a stock-record campaign. Its `q3_record` carries `stock_record` (the record's `$E/` verdict ref, hf2q artifact sha256 and stock label), and the tier labels the stock cell and the fairness cell "vs stock (hf2q artifact record)". The quality-gate references stay `stock-hf2q` and `peer`: the `stock-hf2q` gate must run the record's stock binary with the record's (equal) experiment binary as subject, every run on the record's hf2q artifact, and the `peer` gate must run this campaign's peer binary on the peer arm's artifact (ds4's file).
@@ -243,8 +243,10 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/current-port-balanced-c1-normal-n4-v1/client
   --output "$R/q3-stock-record/deepseek4"
 chmod a-w "$R/q3-stock-record/deepseek4/verdict.json" "$R/q3-stock-record/deepseek4/campaign.json"
 
-# 2. ds4-file campaign of record: experiment and peer on ds4's file, n4 primary then the controls.
-HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=<hf2q DeepSeek-V4 approval template for MODEL_ID "DeepSeek V4 Flash"> \
+# 2. ds4-file campaign of record: experiment and peer on ds4's file, n4 primary then the controls. The hf2q approval
+#    template is step 1's: the case's approval `set` writes `model` from MODEL_ID ("DeepSeek V4 Flash", the file's
+#    general.name that hf2q serves) at run time.
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/current-port-balanced-c1-normal-n4-v1/client-approval.json \
   python3 -B scripts/four_agent/q3_campaign.py --family deepseek4 \
   --hf2q-case scripts/four_agent/q5_cases/deepseek4-ds4file.json \
   --peer-case scripts/four_agent/q5_cases/peer-deepseek4-ds4file.json \
@@ -254,11 +256,10 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=<hf2q DeepSeek-V4 approval template for MODEL_I
   --output "$R/q3-ds4file/deepseek4"
 
 # 3. Same-file native comparison: the experiment and ds4 (--ctx 393216) on the same file; native_peer, task makespan only.
-HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=<the same hf2q approval template as step 2> \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/current-port-balanced-c1-normal-n4-v1/client-approval.json \
   python3 -B scripts/four_agent/q3_campaign.py --family deepseek4 \
   --hf2q-case scripts/four_agent/q5_cases/deepseek4-ds4file.json \
   --peer-case scripts/four_agent/q5_cases/native-ds4-deepseek4-samefile.json \
-  --peer-var DS4_BIN_SHA256=<sha256 of the c97964b ds4-server> \
   --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-ds4-deepseek4-client-approval.json \
   --native-comparison --no-stock-arm \
   --experiment-bin "$CAND" --experiment-commit "$CAND_COMMIT" "${COMMON[@]}" \

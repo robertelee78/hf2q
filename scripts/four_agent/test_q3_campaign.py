@@ -1028,7 +1028,9 @@ class StockRecord(StockRecordHarness):
                     (self.no_stock("--stock-record", record, "--stock-commit", "1" * 40), "--stock-commit refused"),
                     (self.no_stock("--stock-record", record, "--stock-label", "v0.1.28"), "--stock-label refused"),
                     (self.no_stock("--stock-record", record, "--stock-var", "PORT=1"), "--stock-var refused"),
-                    (self.no_stock("--stock-record", record, "--controls-of", record), "no controls-only mode")]
+                    (self.no_stock("--stock-record", record, "--controls-of", record), "no controls-only mode"),
+                    (self.no_stock("--stock-record", record, "--peer-unavailable-evidence", str(self.nc)),
+                     "--peer-unavailable-evidence would leave this campaign no contrast to measure")]
         for args, reason in refusals:
             with self.subTest(reason=reason), self.assertRaisesRegex(q3.qc.CampaignError, re.escape(reason)):
                 q3.build_plan(args, {}, "qwen38")
@@ -1156,6 +1158,26 @@ class StockRecord(StockRecordHarness):
                                               "campaign bound it; no vs-stock effect"])
         record.unlink()
         self.assertEqual(q3_report.compute_verdict(manifest)["stock_record"]["status"], "Missing")
+
+    def test_a_stage_without_a_remaining_contrast_stops_at_once(self):
+        record = self.record()
+
+        def peer_oom(arm, workload, call):
+            return {"outcome": "oom"} if arm == "peer" else self.win(arm, workload, call)
+        driver, runner = self.campaign(record, decide=peer_oom, workloads="n4,n1")
+        manifest = driver.run()
+        self.assertEqual(manifest["status"], "Complete")
+        self.assertEqual([(s["workload"], s["status"], s["stop"]) for s in manifest["stages"]],
+                         [("n4", "Complete", {"reason": q3_stats.NO_CONTRAST, "blocks": 0}),
+                          ("n1", "Complete", {"reason": q3_stats.NO_CONTRAST, "blocks": 0})])
+        self.assertEqual(len(runner.calls), 2)  # the two n4 warmups; never twenty blocks of experiment-only runs
+        self.assertEqual(q3_report.required_effects(manifest["stages"][0], manifest), {})
+        verdict = q3.write_verdict(self.out, manifest, [], None)
+        self.assertEqual(verdict["verdict"], "Unavailable")
+        # a plan with a stock arm keeps its contrast and its stopping rule
+        self.out = self.out.parent / "q3-qwen38-with-stock"
+        driver, _ = self.driver(peer_oom)
+        self.assertEqual(driver.run()["stages"][0]["stop"], {"reason": "precision", "blocks": 5})
 
     def test_failures_thermal_and_memory_come_from_both_campaigns(self):
         def control_failure(arm, workload, call):  # the record's n1 control stops on an experiment failure

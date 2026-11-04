@@ -278,6 +278,17 @@ class StockRecordRows(base.StockRecordHarness):
                     "families": {"qwen38": {"title": "Qwen3.8 27B", "artifact_sha256": base.DS4_ART, "note": ""}}, **rows}
         r.validate_manifest(document)
         self.assertEqual(r.verify_rows(document, self.root), [x["id"] for x in rows["rows"]])
+        # --verify re-derives the stock_record field: an edited or deleted one is drift
+        for change in ({"stock_label": "v0.1.29 release"}, None):
+            with self.subTest(change=change):
+                edited = json.loads(json.dumps(document))
+                rec = edited["groups"]["qwen38-q3-record"]["q3_record"]
+                if change is None:
+                    del rec["stock_record"]
+                else:
+                    rec["stock_record"].update(change)
+                with self.assertRaisesRegex(ValueError, "q3_record stock_record drift"):
+                    r.verify_rows(r.validate_manifest(edited), self.root)
         # a stock gate run on ds4's file is refused when the record is built
         write_receipt(stock.parent / "ref-run", base.STOCK_SHA, base.DS4_ART)
         with self.assertRaisesRegex(ValueError, "not run on the stock record's hf2q artifact"):
