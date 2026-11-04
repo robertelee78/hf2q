@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import q1_decision_policy as q
+import q1_stage_localization as loc
 from qwen38_n1_verdict import Invalid
 
 BASE = [0.0, 3.0, 2.95, 1.0, -1.0, 0.5, -2.0, 0.25]
@@ -92,6 +93,33 @@ class Envelope(unittest.TestCase):
         self.assertEqual(result["classification"], "DivergedExactInvariant")
         self.assertEqual(result["first_differing"][:2], ["Logits", "agent-1"])
 
+    def scope(self, keys):
+        path = Path(self.root) / f"scope-{len(list(Path(self.root).iterdir()))}.json"
+        path.write_text(json.dumps(keys))
+        return path
+
+    def test_scoped_exact_compares_only_the_closed_key_list(self):
+        one_ulp = list(BASE)
+        one_ulp[5] = 0.5000001
+        changed = store(self.root, "changed", [("agent-0", 0, BASE), ("agent-1", 0, one_ulp), ("agent-2", 0, BASE)])
+        agent0, agent1 = ["Logits", "agent-0", 0, 64, 0, 0], ["Logits", "agent-1", 0, 64, 0, 0]
+        path = self.scope([agent0])
+        result = q.exact(self.left, changed, path)  # agent-1 differs and agent-2 is unpaired, both out of scope
+        self.assertEqual((result["classification"], result["common_records"], result["left_only"],
+                          result["right_only"], result["differing_records"], result["scoped_records"]),
+                         ("ExactEqual", 1, 0, 0, 0, 1))
+        self.assertEqual(result["scope_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        result = q.exact(self.left, changed, self.scope([agent0, agent1]))
+        self.assertEqual((result["classification"], result["first_differing"]), ("DivergedExactInvariant", agent1))
+        self.assertNotIn("scope_sha256", q.exact(self.left, changed))
+
+    def test_scoped_exact_refuses_missing_or_malformed_keys(self):
+        right = store(self.root, "right", [("agent-0", 0, BASE), ("agent-1", 0, BASE), ("agent-2", 0, BASE)])
+        for keys in ([["Logits", "agent-2", 0, 64, 0, 0]], [], [["Logits", "agent-0", 0, 64, 0]],
+                     [["Logits", "agent-0", 0, 64, 0, True]], [["Logits", "agent-0", 0, 64, 0, 0]] * 2):
+            with self.assertRaises(Invalid):
+                q.exact(self.left, right, self.scope(keys))
+
 
 def bits(value):
     return array.array("I", array.array("f", [value]).tobytes())[0]
@@ -165,6 +193,133 @@ class Routing(unittest.TestCase):
         rows = self.rows + [routing_row(0, 0, 0, [1, 2, 3], namespace="UnpublishedCancelled")]
         with self.assertRaises(Invalid):
             q.routing(self.left, witness(self.root, "extra", rows))
+
+
+ACCEPTED = [0, 1, 2, 1]
+
+
+class RoutingMapped(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        plan = {"rerun_id": "r", "layers": [0], "prefill_stages": ["LayerOutput"], "decode_stages": ["LayerOutput"],
+                "host_payload_limit": 1, "accepted": ACCEPTED}
+        receipts = {"ngram": {"path": "n", "sha256": "1" * 64}, "ordinary": {"path": "o", "sha256": "2" * 64}}
+        self.doc = loc.build_map("N", 1, plan, receipts, ACCEPTED)
+        self.map = Path(self.root) / "map.json"
+        self.map.write_text(json.dumps(self.doc))
+        self.reference = {(lane, p, l): routing_row(lane, p, l, [1, 2, 3])
+                          for lane in range(4) for p in range(144) for l in range(30)}
+        self.candidate = {}
+        for lane in range(4):
+            for namespace, span in (("T5Initial", range(128)), ("T5Verify", range(132)),
+                                    ("T5Continuation", range(129 + ACCEPTED[lane], 144))):
+                for p in span:
+                    for l in range(30):
+                        self.candidate[(namespace, lane, p, l)] = routing_row(lane, p, l, [1, 2, 3], namespace=namespace)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_mapped(self, candidate=None, reference=None, identity=IDENTITY, key_map=None):
+        left = witness(self.root, "candidate", list((candidate or self.candidate).values()), identity=identity)
+        right = witness(self.root, "reference", list((reference or self.reference).values()))
+        return q.routing_mapped(left, right, key_map or self.map)
+
+    def test_phases_pair_each_canonical_row_once_without_t5_initial(self):
+        result = self.run_mapped()
+        self.assertEqual((result["schema"], result["classification"]), ("hf2q.q1.routing-comparison.v1", "ExactRouting"))
+        self.assertEqual(result["phase_pairs"], {"verify-prefix": 4 * 128 * 30,
+                                                 "verify-committed": 30 * sum(a + 1 for a in ACCEPTED),
+                                                 "continuation": 30 * sum(15 - a for a in ACCEPTED)})
+        self.assertEqual(sum(result["phase_pairs"].values()), 4 * 144 * 30)  # Canonical 0..127 not double counted
+        self.assertNotIn("changed_rows", result)  # no cross-phase total
+        for pairs in (p["pairs"] for p in self.doc["routing"]["phases"]):
+            self.assertFalse(any(l[0] == "T5Initial" for l, _ in pairs))
+        namespaces = [(u["side"], u["namespace"]) for u in result["unmapped"]]
+        self.assertEqual(namespaces.count(("candidate", "T5Initial")), 4 * 128 * 30)
+        self.assertEqual(namespaces.count(("candidate", "T5Verify")), 30 * sum(3 - a for a in ACCEPTED))
+        self.assertEqual(result["map_sha256"], hashlib.sha256(self.map.read_bytes()).hexdigest())
+
+    def test_changes_are_reported_per_phase_with_gaps(self):
+        candidate = dict(self.candidate)
+        candidate[("T5Verify", 2, 129, 5)] = routing_row(2, 129, 5, [1, 2, 99], kth=0.295, nxt=0.30, namespace="T5Verify")
+        candidate[("T5Continuation", 0, 140, 0)] = routing_row(0, 140, 0, [2, 1, 3], namespace="T5Continuation")
+        candidate[("T5Initial", 1, 3, 3)] = routing_row(1, 3, 3, [7, 8, 9], namespace="T5Initial")  # unmapped
+        result = self.run_mapped(candidate)
+        self.assertEqual(result["classification"], "RoutingChanged")
+        phases = result["phases"]
+        self.assertEqual([phases[p]["changed_rows"] for p in ("verify-prefix", "verify-committed", "continuation")],
+                         [0, 1, 1])
+        committed = phases["verify-committed"]
+        self.assertEqual((committed["set_changed_rows"], committed["order_only_rows"]), (1, 0))
+        self.assertAlmostEqual(committed["changed_gap_max"], 0.01, places=6)
+        flip, = committed["changed"]
+        self.assertEqual((flip["namespace"], flip["lane"], flip["position"], flip["right_key"]),
+                         ("T5Verify", 2, 129, ["Canonical", 2, 129, 5]))
+        self.assertAlmostEqual(flip["left"]["gap"], -0.005, places=6)
+        self.assertEqual((phases["continuation"]["order_only_rows"], phases["continuation"]["set_changed_rows"]), (1, 0))
+        listed = next(u for u in result["unmapped"] if (u["namespace"], u["lane"], u["position"], u["layer"])
+                      == ("T5Initial", 1, 3, 3))
+        self.assertEqual(listed["selected_ids"], [7, 8, 9])
+        self.assertAlmostEqual(listed["gap"], 0.01, places=6)
+
+    def test_unpaired_identity_or_out_of_namespace_refuses(self):
+        candidate = dict(self.candidate)
+        del candidate[("T5Continuation", 3, 143, 29)]
+        with self.assertRaises(Invalid):
+            self.run_mapped(candidate)
+        reference = dict(self.reference)
+        del reference[(0, 0, 0)]
+        with self.assertRaises(Invalid):
+            self.run_mapped(reference=reference)
+        with self.assertRaises(Invalid):
+            self.run_mapped(identity={**IDENTITY, "model_sha256": "x" * 64})
+        doc = json.loads(self.map.read_text())
+        doc["routing"]["phases"][0]["pairs"][0][0][0] = "T5Initial"  # a T5Initial <-> Canonical pair
+        bad = Path(self.root) / "bad-map.json"
+        bad.write_text(json.dumps(doc))
+        with self.assertRaises(Invalid):
+            self.run_mapped(key_map=bad)
+        doc = json.loads(self.map.read_text())
+        prefix = doc["routing"]["phases"][0]["pairs"]
+        prefix.append(prefix[0])  # an aligned, in-span pair repeated: Canonical 0..127 row mapped twice
+        bad.write_text(json.dumps(doc))
+        with self.assertRaises(Invalid):
+            self.run_mapped(key_map=bad)
+
+    def rewrite(self, edit):
+        doc = json.loads(self.map.read_text())
+        edit({p["phase"]: p["pairs"] for p in doc["routing"]["phases"]})
+        path = Path(self.root) / f"map-{len(list(Path(self.root).iterdir()))}.json"
+        path.write_text(json.dumps(doc))
+        return path
+
+    def test_misaligned_pair_or_out_of_span_position_refuses(self):
+        def swap_layers(phases):  # one-to-one and complete, but each pair joins different layers
+            pairs = phases["verify-prefix"]
+            pairs[0][1], pairs[1][1] = pairs[1][1], pairs[0][1]
+        with self.assertRaises(Invalid):
+            self.run_mapped(key_map=self.rewrite(swap_layers))
+
+        def other_lane(phases):
+            phases["continuation"][0][1][1] = (phases["continuation"][0][1][1] + 1) % 4
+        with self.assertRaises(Invalid):
+            self.run_mapped(key_map=self.rewrite(other_lane))
+
+        def committed_row_in_prefix(phases):  # lane 0 (a = 0): Canonical/T5Verify 128 moved to verify-prefix
+            moved = [p for p in phases["verify-committed"] if p[0][1] == 0]
+            phases["verify-committed"][:] = [p for p in phases["verify-committed"] if p[0][1] != 0]
+            phases["verify-prefix"].extend(moved)
+        with self.assertRaises(Invalid):
+            self.run_mapped(key_map=self.rewrite(committed_row_in_prefix))
+
+        def continuation_row_in_committed(phases):  # lane 0 (a = 0): position 129 is continuation, not verify
+            moved = [p for p in phases["continuation"] if p[0][1] == 0 and p[0][2] == 129]
+            phases["continuation"][:] = [p for p in phases["continuation"] if p not in moved]
+            phases["verify-committed"].extend([["T5Verify", *l[1:]], r] for l, r in moved)
+        with self.assertRaises(Invalid):
+            self.run_mapped(key_map=self.rewrite(continuation_row_in_committed))
 
 
 def response(tokens):

@@ -15,6 +15,8 @@ struct Active {
     targets: BTreeMap<(u64, u32, Stage), CaptureTarget>,
     pending: Vec<(u64, u32, CaptureTarget, MlxBuffer)>,
     current: Option<(u64, u32)>,
+    /// Held by a [`Pause`]: every hook is a no-op and nothing is captured.
+    paused: bool,
 }
 thread_local! {static ACTIVE:RefCell<Option<Active>>=const{RefCell::new(None)};}
 /// Same-thread lease: unwinding removes all capture buffers/TLS state.
@@ -39,21 +41,30 @@ pub fn install(
     store: Store,
     targets: BTreeMap<(u64, u32, Stage), CaptureTarget>,
 ) -> Result<Scope, String> {
+    install_or_return(family, store, targets).map_err(|(e, _)| e)
+}
+/// [`install`] that hands the store back on refusal, so the caller can still
+/// fail and finish it (a failure receipt, never a silently dropped store).
+pub fn install_or_return(
+    family: Family,
+    store: Store,
+    targets: BTreeMap<(u64, u32, Stage), CaptureTarget>,
+) -> Result<Scope, (String, Box<Store>)> {
     if targets.is_empty() || targets.len() > 4096 {
-        return Err("empty family diagnostic packet".into());
+        return Err(("empty family diagnostic packet".into(), Box::new(store)));
     }
     ACTIVE.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
-            return Err("nested family diagnostic".into());
+            return Err(("nested family diagnostic".into(), Box::new(store)));
         }
-        let id = NEXT_SCOPE
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |v| v.checked_add(1),
-            )
-            .map_err(|_| "capture scope identity overflow")?;
+        let Ok(id) = NEXT_SCOPE.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |v| v.checked_add(1),
+        ) else {
+            return Err(("capture scope identity overflow".into(), Box::new(store)));
+        };
         *slot = Some(Active {
             scope_id: id,
             family,
@@ -61,6 +72,7 @@ pub fn install(
             targets,
             pending: Vec::new(),
             current: None,
+            paused: false,
         });
         Ok(Scope {
             id,
@@ -72,8 +84,54 @@ pub fn selected(family: Family, step: u64, layer: u32, stage: Stage) -> bool {
     ACTIVE.with(|slot| {
         slot.borrow()
             .as_ref()
-            .is_some_and(|a| a.family == family && a.targets.contains_key(&(step, layer, stage)))
+            .is_some_and(|a| !a.paused && a.family == family && a.targets.contains_key(&(step, layer, stage)))
     })
+}
+/// Same-thread, non-nestable lease over the installed diagnostic: while held,
+/// every hook is a no-op (`enabled`/`selected` are false, nothing is
+/// captured or retained). Dropping it resumes the SAME scope only.
+#[must_use]
+pub struct Pause {
+    scope_id: u64,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl Drop for Pause {
+    fn drop(&mut self) {
+        ACTIVE.with(|slot| {
+            if let Some(a) = slot.borrow_mut().as_mut().filter(|a| a.scope_id == self.scope_id) {
+                a.paused = false;
+            }
+        });
+    }
+}
+pub fn pause() -> Result<Pause, String> {
+    ACTIVE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let a = slot.as_mut().ok_or("no family diagnostic to pause")?;
+        if a.paused {
+            return Err("nested family capture pause".into());
+        }
+        if !a.pending.is_empty() {
+            return Err("family capture pause with retained stages pending".into());
+        }
+        a.paused = true;
+        Ok(Pause {
+            scope_id: a.scope_id,
+            _same_thread: std::marker::PhantomData,
+        })
+    })
+}
+pub fn paused() -> bool {
+    ACTIVE.with(|slot| slot.borrow().as_ref().is_some_and(|a| a.paused))
+}
+/// Record a caller-side failure in the installed diagnostic's store before
+/// [`finish`], so an aborted run's partial stage store names its cause.
+pub fn fail(why: impl Into<String>) {
+    ACTIVE.with(|slot| {
+        if let Some(a) = slot.borrow_mut().as_mut() {
+            a.store.fail(why);
+        }
+    });
 }
 /// Must be invoked by the concrete source path AFTER its own checked drain,
 /// before any pool recycle/host cursor publication at that boundary.
@@ -90,7 +148,7 @@ pub fn drained(
         let Some(active) = slot.as_mut() else {
             return Ok(());
         };
-        if active.family != family {
+        if active.paused || active.family != family {
             return Ok(());
         }
         let Some(target) = active.targets.get(&(step, layer, stage)).cloned() else {
@@ -135,7 +193,7 @@ pub fn drained_owned_rows(
         let Some(active) = slot.as_mut() else {
             return Ok(());
         };
-        if active.family != family {
+        if active.paused || active.family != family {
             return Ok(());
         }
         let Some(target) = active.targets.get(&(step, layer, stage)).cloned() else {
@@ -181,7 +239,7 @@ pub fn retain_until_layer_drain(
         let Some(a) = slot.as_mut() else {
             return Ok(());
         };
-        if a.family != family {
+        if a.paused || a.family != family {
             return Ok(());
         }
         let Some(target) = a.targets.get(&(step, layer, stage)).cloned() else {
@@ -201,7 +259,7 @@ pub fn layer_drained(family: Family, step: u64, layer: u32, drain: &str) -> Resu
         let Some(a) = slot.as_mut() else {
             return Ok(());
         };
-        if a.family != family {
+        if a.paused || a.family != family {
             return Ok(());
         }
         let mut keep = Vec::new();
@@ -236,13 +294,13 @@ pub fn layer_drained(family: Family, step: u64, layer: u32, drain: &str) -> Resu
     })
 }
 pub fn enabled(family: Family) -> bool {
-    ACTIVE.with(|slot| slot.borrow().as_ref().is_some_and(|a| a.family == family))
+    ACTIVE.with(|slot| slot.borrow().as_ref().is_some_and(|a| !a.paused && a.family == family))
 }
 
 pub fn enter_layer(family: Family, step: u64, layer: u32) {
     ACTIVE.with(|slot| {
         if let Some(a) = slot.borrow_mut().as_mut() {
-            if a.family == family {
+            if !a.paused && a.family == family {
                 a.current = Some((step, layer));
             }
         }
@@ -252,7 +310,7 @@ pub fn retain_current(family: Family, stage: Stage, buf: &MlxBuffer) -> Result<(
     let current = ACTIVE.with(|slot| {
         slot.borrow()
             .as_ref()
-            .filter(|a| a.family == family)
+            .filter(|a| !a.paused && a.family == family)
             .and_then(|a| a.current)
     });
     if let Some((step, layer)) = current {

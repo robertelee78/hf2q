@@ -73,6 +73,13 @@ fn reviewed_workload(p:&Packet)->Result<Workload> {
 #[test]
 #[ignore="root only selected Gemma model: new reviewed greedy dataset, genuine ngram transaction"]
 fn q1_gemma_actual_ngram_transaction_trace(){run().unwrap();}
+#[path="t5_run.rs"]pub(super) mod t5_run;
+#[test]
+#[ignore="root only selected Gemma model: Q1 T5 ordinary-global or injected n-gram arm, teacher-forced 144"]
+fn q1_gemma_actual_t5_trace(){t5_run::run(false).unwrap();}
+#[test]
+#[ignore="root only selected Gemma model: Q1 T5 verifier-route stage localizer pass (branch N/P)"]
+fn q1_gemma_actual_t5_stage_localizer(){t5_run::run(true).unwrap();}
 fn run()->Result<()> {
     use crate::serve::api::engine::{LoadOptions,LoadedModel};
     ensure!(cfg!(target_endian="little"),"LE artifact encoding");

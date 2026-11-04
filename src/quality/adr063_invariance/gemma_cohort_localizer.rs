@@ -44,7 +44,8 @@ pub(super) const DECODE_STAGES: [Stage; 12] = [
 ];
 pub(super) type Targets = BTreeMap<(u64, u32, Stage), CaptureTarget>;
 /// The packet's `stage_localizer` block. Its frozen record list is the
-/// packet's `expected_stores["stages"]`, which must equal [`manifest`].
+/// packet's `expected_stores["stages"]` or the bound `stage_manifest` file's
+/// (plan-only form); either must equal [`manifest`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Plan {
@@ -58,11 +59,52 @@ pub(super) struct Plan {
 /// store at the output root and the nested stage store.
 pub(super) const ENDPOINT_STORE: &str = "endpoint";
 pub(super) const STAGE_STORE: &str = "stages";
-/// The witness-ON ordinary endpoint recipe under its own route label: both
-/// localizer routes share it, so their stage stores share one comparison key.
-pub(super) fn recipe(cfg: &crate::serve::config::Gemma4Config) -> ConfigRecipe<'static> {
-    let mut r = super::gemma_actual::selected_recipe(cfg, true);
-    r.route = ROUTE;
+/// Bound manifest file of the plan-only packet form (the supervisor's
+/// manifest-form extent): exactly these keys, stores `endpoint` and `stages`.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ManifestFile {
+    pub(super) lanes: Vec<usize>,
+    pub(super) host_payload_limit: u64,
+    pub(super) expected_stores: BTreeMap<String, Vec<ExpectedTensor>>,
+}
+pub(super) const MANIFEST_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Witness-OFF All128 build-drift route label: its own composition key.
+pub(super) const DRIFT_ROUTE: &str = "gemma-all128-stage-drift-witness-off-v1";
+/// Localizer mode. `Cohort`: the witness-ON All128/packed pair. `DriftAll128`:
+/// witness-OFF All128 prefill-only build-drift localizer; routing comes from
+/// the production dispatch. This module names no witness item; the Cohort
+/// witness checks live in `gemma_actual::routing` (the adapter the `540a4708`
+/// backport replaces), so drift's code is witness-free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum Mode {
+    #[default]
+    Cohort,
+    DriftAll128,
+}
+impl Mode {
+    pub(super) fn route_label(self) -> &'static str {
+        match self {
+            Mode::Cohort => ROUTE,
+            Mode::DriftAll128 => DRIFT_ROUTE,
+        }
+    }
+    /// Every mode: the identity native must be the build's own `Cargo.toml`
+    /// pin (`build`). Cohort additionally requires the published witness
+    /// native (`gemma_actual::routing::require_published`); DriftAll128 does not.
+    pub(super) fn admit_native(self, native: &str, build: &str) -> Result<(), String> {
+        if native != build {
+            return Err(format!("{self:?} localizer identity native {native} must be the build's own Cargo.toml pin {build}"));
+        }
+        Ok(())
+    }
+}
+/// The ordinary endpoint recipe under the mode's own route label: both cohort
+/// routes share the witness-ON one, so their stage stores share one comparison
+/// key; the drift route is witness-OFF and keyed apart.
+pub(super) fn recipe(cfg: &crate::serve::config::Gemma4Config, mode: Mode) -> ConfigRecipe<'static> {
+    let mut r = super::gemma_actual::selected_recipe(cfg, mode == Mode::Cohort);
+    r.route = mode.route_label();
     r
 }
 /// Which executed stage route a localizer trajectory is.
@@ -73,14 +115,14 @@ pub(super) fn route(t: Trajectory) -> Result<&'static str, String> {
         _ => Err("cohort stage localizer runs only All128 (T0ColdSerial) or packed (T2ActualCohort)".into()),
     }
 }
-fn ordered(all: &[Stage], wanted: &[Stage]) -> Result<Vec<Stage>, String> {
+pub(super) fn ordered(all: &[Stage], wanted: &[Stage]) -> Result<Vec<Stage>, String> {
     let ordered: Vec<Stage> = all.iter().copied().filter(|s| wanted.contains(s)).collect();
     if ordered.len() != wanted.len() || ordered != wanted {
         return Err("localizer stages must be distinct roles in source order".into());
     }
     Ok(ordered)
 }
-fn row(cfg: &crate::serve::config::Gemma4Config, layer: usize, stage: Stage) -> Result<(Scalar, Vec<usize>), String> {
+pub(super) fn row(cfg: &crate::serve::config::Gemma4Config, layer: usize, stage: Stage) -> Result<(Scalar, Vec<usize>), String> {
     match stage {
         Stage::Norm => Ok((Scalar::F32, vec![cfg.hidden_size])),
         _ => prefill_row(cfg, layer, stage).ok_or_else(|| "unsupported Gemma stage role".into()),
@@ -297,11 +339,37 @@ mod controls {
         }
         let digest = |r: &ConfigRecipe<'_>| super::super::acquisition::config_digest(r).unwrap();
         let endpoint = super::super::gemma_actual::selected_recipe(&cfg, true);
-        let localizer = recipe(&cfg);
+        let localizer = recipe(&cfg, Mode::Cohort);
         assert_eq!((localizer.route, localizer.capacity, localizer.slots), (ROUTE, 262144, 4));
         assert_eq!(localizer.cache_mode, endpoint.cache_mode);
         assert_ne!(digest(&localizer), digest(&endpoint));
         assert_ne!(digest(&localizer), digest(&super::super::gemma_localizer::localizer_recipe(&cfg, 262144)));
+    }
+    #[test]
+    fn q1_gemma_drift_all128_route_is_keyed_apart_and_admits_only_the_build_pin() {
+        let cfg = cfg();
+        let digest = |r: &ConfigRecipe<'_>| super::super::acquisition::config_digest(r).unwrap();
+        assert_eq!(Mode::default(), Mode::Cohort);
+        assert_ne!(DRIFT_ROUTE, ROUTE);
+        assert_eq!((Mode::Cohort.route_label(), Mode::DriftAll128.route_label()), (ROUTE, DRIFT_ROUTE));
+        let drift = recipe(&cfg, Mode::DriftAll128);
+        assert_eq!(drift.route, "gemma-all128-stage-drift-witness-off-v1");
+        assert_eq!(drift.cache_mode, recipe(&cfg, Mode::Cohort).cache_mode);
+        assert_ne!(digest(&drift), digest(&recipe(&cfg, Mode::Cohort)));
+        assert_ne!(digest(&drift), digest(&super::super::gemma_actual::selected_recipe(&cfg, false)));
+        assert_eq!(serde_json::to_value(Mode::DriftAll128).unwrap(), serde_json::json!("DriftAll128"));
+        // Drift accepts the build's own pin (live or a 0.15.9 diagnostic build), never another.
+        let build = env!("HF2Q_MLX_NATIVE_VERSION");
+        assert!(Mode::DriftAll128.admit_native(build, build).is_ok());
+        assert!(Mode::DriftAll128.admit_native("0.15.9", "0.15.9").is_ok());
+        assert!(Mode::DriftAll128.admit_native("0.15.9", "0.15.16").is_err());
+        // Cohort also needs the build pin; its published-witness native check
+        // is the witness-ON adapter's, which drift never calls.
+        assert!(Mode::Cohort.admit_native(build, build).is_ok());
+        assert!(Mode::Cohort.admit_native("0.15.9", "0.15.16").is_err());
+        use super::super::gemma_actual::routing::require_published;
+        assert!(require_published("0.15.16").is_ok());
+        assert!(require_published("0.15.9").is_err());
     }
     #[test]
     fn q1_gemma_owned_rows_refuse_fixed_lane_targets_and_relabelling() {

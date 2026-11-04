@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """ADR-063 Q1 decision-level numeric policy. Offline: never loads a model.
 
-  exact LEFT RIGHT     Two hf2q.adr063.invariance.v2 trace.json stores. Every
+  exact LEFT RIGHT [--scope FILE]
+                       Two hf2q.adr063.invariance.v2 trace.json stores. Every
                        common coordinate (all stages) must have identical
                        layout and payload bytes: ExactEqual, ExactOnCommon
                        (unpaired counts reported) or DivergedExactInvariant.
+                       --scope: a closed JSON list of [stage, agent,
+                       logical_row_start, layer, segment, logical_step] keys;
+                       each must be captured in both stores and only those are
+                       compared (adds scope_sha256, scoped_records).
   envelope LEFT RIGHT  Two hf2q.adr063.invariance.v2 trace.json stores over the
                        same frozen inputs. Every Logits record is joined,
                        hash-checked and classified as ExactEqual,
@@ -14,6 +19,11 @@
                        layer); selected_ids are compared in order. Each changed
                        row reports both sides' k-th minus (k+1)-th score gap,
                        boundary_ids and domain: ExactRouting or RoutingChanged.
+  routing-mapped LEFT RIGHT MAP
+                       Candidate (n-gram) and reference (Canonical) witnesses
+                       joined through a q1_stage_localization.py ngram-map
+                       key map, one-to-one per phase, each phase reported
+                       separately; every row is mapped or listed unmapped.
   fork HF2Q PEER       Two non-streamed responses with logprobs/top_logprobs
                        (chat `choices[0].logprobs.content` or the peer's
                        `/completion` `completion_probabilities`). Classifies
@@ -93,24 +103,47 @@ def verified_payload(record):
     return raw
 
 
-def exact(left_trace, right_trace):
+def scope_keys(scope_path):
+    """A closed JSON list of [stage, agent, logical_row_start, layer, segment, logical_step] keys."""
+    raw = Path(scope_path).read_bytes()
+    doc = json.loads(raw)
+    require(isinstance(doc, list) and doc, f"{scope_path}: scope must be a non-empty JSON list of coordinate keys")
+    keys = []
+    for item in doc:
+        require(isinstance(item, list) and len(item) == 6 and all(isinstance(v, str) for v in item[:2])
+                and all(type(v) is int for v in item[2:]), f"{scope_path}: malformed coordinate key {item!r}")
+        keys.append(tuple(item))
+    require(len(set(keys)) == len(keys), f"{scope_path}: duplicate coordinate key in scope")
+    return hashlib.sha256(raw).hexdigest(), keys
+
+
+def exact(left_trace, right_trace, scope=None):
     left, right = captured_records(left_trace), captured_records(right_trace)
-    common = sorted(set(left) & set(right))
+    if scope is None:
+        common = sorted(set(left) & set(right))
+        left_only, right_only = len(set(left) - set(right)), len(set(right) - set(left))
+    else:
+        scope_sha256, common = scope_keys(scope)
+        missing = [key for key in common if key not in left or key not in right]
+        require(not missing, f"{len(missing)} scoped keys not captured in both stores, first {missing[:1]}")
+        common, left_only, right_only = sorted(common), 0, 0
     differing = []
     for key in common:
         l, r = left[key], right[key]
         same_layout = (l["scalar"], l["shape"]) == (r["scalar"], r["shape"])
         if not same_layout or verified_payload(l) != verified_payload(r):
             differing.append(key)
-    unpaired = len(left) + len(right) - 2 * len(common)
     if differing:
         classification = "DivergedExactInvariant"
     else:
-        classification = "ExactEqual" if not unpaired else "ExactOnCommon"
-    return {"schema": "hf2q.q1.exact-store-comparison.v1", "classification": classification,
-            "common_records": len(common), "left_only": len(set(left) - set(right)),
-            "right_only": len(set(right) - set(left)), "differing_records": len(differing),
-            "first_differing": list(differing[0]) if differing else None}
+        classification = "ExactEqual" if not left_only + right_only else "ExactOnCommon"
+    result = {"schema": "hf2q.q1.exact-store-comparison.v1", "classification": classification,
+              "common_records": len(common), "left_only": left_only,
+              "right_only": right_only, "differing_records": len(differing),
+              "first_differing": list(differing[0]) if differing else None}
+    if scope is not None:
+        result.update(scope_sha256=scope_sha256, scoped_records=len(common))
+    return result
 
 
 # --- envelope -------------------------------------------------------------
@@ -252,32 +285,103 @@ def routing_side(event):
             "boundary_ids": event["boundary_ids"], "domain": event["at"]["domain"]}
 
 
-def routing(left_path, right_path):
+def routing_witnesses(left_path, right_path):
     left_header, left = routing_rows(left_path)
     right_header, right = routing_rows(right_path)
     for field in ROUTING_IDENTITY:
         require(left_header["identity"][field] == right_header["identity"][field],
                 f"routing witnesses differ in identity.{field}; not the same frozen inputs")
-    unpaired = sorted(set(left) ^ set(right))
-    require(not unpaired, f"{len(unpaired)} unpaired routing keys, first {unpaired[:1]}")
+    return left, right
+
+
+def routing_pairs(pairs, left, right):
+    """Selected-id comparison of joined (left key, right key) witness rows."""
     changed = []
-    for key in sorted(left):
-        l, r = left[key], right[key]
+    for lkey, rkey in pairs:
+        l, r = left[lkey], right[rkey]
         if l["selected_ids"] != r["selected_ids"]:
-            changed.append({"namespace": key[0], "lane": key[1], "position": key[2], "layer": key[3],
-                            "set_changed": set(l["selected_ids"]) != set(r["selected_ids"]),
-                            "left": routing_side(l), "right": routing_side(r)})
+            row = {"namespace": lkey[0], "lane": lkey[1], "position": lkey[2], "layer": lkey[3],
+                   "set_changed": set(l["selected_ids"]) != set(r["selected_ids"]),
+                   "left": routing_side(l), "right": routing_side(r)}
+            if rkey != lkey:
+                row["right_key"] = list(rkey)
+            changed.append(row)
     margins = [abs(side["gap"]) for row in changed for side in (row["left"], row["right"])
                if side["gap"] is not None]
-    return {"schema": "hf2q.q1.routing-comparison.v1",
-            "classification": "RoutingChanged" if changed else "ExactRouting",
-            "rows": len(left), "changed_rows": len(changed),
+    return {"rows": len(pairs), "changed_rows": len(changed),
             "set_changed_rows": sum(row["set_changed"] for row in changed),
             "order_only_rows": sum(not row["set_changed"] for row in changed),
-            "weight_bits_differing_rows": sum(left[k]["selected_weights_f32_bits"]
-                                              != right[k]["selected_weights_f32_bits"] for k in left),
+            "weight_bits_differing_rows": sum(left[l]["selected_weights_f32_bits"]
+                                              != right[r]["selected_weights_f32_bits"] for l, r in pairs),
             "changed_gap_max": max(margins) if margins else None,
             "changed": changed}
+
+
+def routing(left_path, right_path):
+    left, right = routing_witnesses(left_path, right_path)
+    unpaired = sorted(set(left) ^ set(right))
+    require(not unpaired, f"{len(unpaired)} unpaired routing keys, first {unpaired[:1]}")
+    result = routing_pairs([(key, key) for key in sorted(left)], left, right)
+    return {"schema": "hf2q.q1.routing-comparison.v1",
+            "classification": "RoutingChanged" if result["changed_rows"] else "ExactRouting", **result}
+
+
+KEY_MAP_SCHEMA = "hf2q.q1.key-map.v1"
+# routing-mapped phase -> the candidate (left, n-gram arm) namespace; the reference side is always Canonical.
+ROUTING_PHASES = {"verify-prefix": "T5Verify", "verify-committed": "T5Verify", "continuation": "T5Continuation"}
+
+
+def routing_span(phase, a):
+    """Absolute positions of one routing phase on a lane with accepted count a (design §2.5)."""
+    return {"verify-prefix": range(128), "verify-committed": range(128, 129 + a),
+            "continuation": range(129 + a, 144)}[phase]
+
+
+def routing_key(item):
+    require(isinstance(item, list) and len(item) == 4 and isinstance(item[0], str)
+            and all(type(v) is int for v in item[1:]), f"malformed routing key {item!r}")
+    return tuple(item)
+
+
+def routing_mapped(left_path, right_path, map_path):
+    """LEFT is the candidate (n-gram arm) witness, RIGHT the reference (ordinary-global) witness."""
+    raw = Path(map_path).read_bytes()
+    key_map = json.loads(raw)
+    require(key_map.get("schema") == KEY_MAP_SCHEMA, f"{map_path}: unexpected key-map schema")
+    section, accepted = key_map.get("routing"), key_map.get("accepted")
+    require(isinstance(section, dict), f"{map_path}: key map carries no routing pairs")
+    require(isinstance(accepted, list) and len(accepted) == 4 and all(type(a) is int and a in (0, 1, 2) for a in accepted),
+            f"{map_path}: routing pairs need the per-lane accepted counts a in {{0,1,2}}")
+    left, right = routing_witnesses(left_path, right_path)
+    seen_left, seen_right, phases = set(), set(), {}
+    for phase in section["phases"]:
+        name = phase["phase"]
+        require(name in ROUTING_PHASES and name not in phases, f"unknown or repeated routing phase {name!r}")
+        pairs = [(routing_key(l), routing_key(r)) for l, r in phase["pairs"]]
+        for lkey, rkey in pairs:
+            require(lkey[0] == ROUTING_PHASES[name] and rkey[0] == "Canonical",
+                    f"{name} pair {lkey}->{rkey} outside its namespaces")
+            require(lkey[1:] == rkey[1:], f"{name} pair {lkey}->{rkey} joins a different lane/position/layer")
+            require(0 <= lkey[1] < 4 and lkey[2] in routing_span(name, accepted[lkey[1]]),
+                    f"{name} pair {lkey}->{rkey} outside the phase's position span")
+            require(lkey not in seen_left and rkey not in seen_right, f"routing key mapped twice: {lkey}->{rkey}")
+            seen_left.add(lkey); seen_right.add(rkey)
+            require(lkey in left and rkey in right, f"mapped routing pair {lkey}->{rkey} not captured")
+        phases[name] = routing_pairs(pairs, left, right)
+    require(set(phases) == set(ROUTING_PHASES), "key map must carry every routing phase")
+    unmapped = {side: [routing_key(k) for k in section["unmapped"][side]] for side in ("candidate", "reference")}
+    for side, rows, seen in (("candidate", left, seen_left), ("reference", right, seen_right)):
+        listed = set(unmapped[side])
+        require(len(listed) == len(unmapped[side]) and not listed & seen, f"{side} unmapped list repeats a key")
+        unpaired = sorted(set(rows) ^ (seen | listed))
+        require(not unpaired, f"{len(unpaired)} unpaired routing keys after mapping ({side}), first {unpaired[:1]}")
+    return {"schema": "hf2q.q1.routing-comparison.v1",
+            "classification": "RoutingChanged" if any(p["changed_rows"] for p in phases.values()) else "ExactRouting",
+            "map_sha256": hashlib.sha256(raw).hexdigest(),
+            "phase_pairs": {name: p["rows"] for name, p in phases.items()}, "phases": phases,
+            "unmapped": [{"side": side, "namespace": k[0], "lane": k[1], "position": k[2], "layer": k[3],
+                          **routing_side((left if side == "candidate" else right)[k])}
+                         for side in ("candidate", "reference") for k in unmapped[side]]}
 
 
 # --- fork -----------------------------------------------------------------
@@ -441,12 +545,17 @@ def main(argv=None):
     x = sub.add_parser("exact")
     x.add_argument("left_trace")
     x.add_argument("right_trace")
+    x.add_argument("--scope")
     e = sub.add_parser("envelope")
     e.add_argument("left_trace")
     e.add_argument("right_trace")
     r = sub.add_parser("routing")
     r.add_argument("left_witness")
     r.add_argument("right_witness")
+    m = sub.add_parser("routing-mapped")
+    m.add_argument("left_witness")
+    m.add_argument("right_witness")
+    m.add_argument("key_map")
     f = sub.add_parser("fork")
     f.add_argument("hf2q_response")
     f.add_argument("peer_response")
@@ -457,11 +566,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "exact":
-            result = exact(args.left_trace, args.right_trace)
+            result = exact(args.left_trace, args.right_trace, args.scope)
         elif args.command == "envelope":
             result = envelope(args.left_trace, args.right_trace)
         elif args.command == "routing":
             result = routing(args.left_witness, args.right_witness)
+        elif args.command == "routing-mapped":
+            result = routing_mapped(args.left_witness, args.right_witness, args.key_map)
         elif args.command == "fork":
             result = fork(json.loads(Path(args.hf2q_response).read_text()),
                           json.loads(Path(args.peer_response).read_text()))

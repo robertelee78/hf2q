@@ -31,9 +31,11 @@ fn catalogue_is_exactly_four_families_times_nine_without_false_unsupported() {
     assert_eq!(cells.iter().filter(|c| c.family==Family::Gemma4 && c.adapter==Adapter::GemmaOrdinary).count(),6);
     assert_eq!(cell(Family::Gemma4,Trajectory::T2ActualCohort).adapter,Adapter::GemmaPackedCohort);
     assert_eq!(cell(Family::Gemma4,Trajectory::T6CancelRestore).adapter,Adapter::GemmaOwningWorkerRecovery);
-    for t in [Trajectory::T5GenuineSpeculation] {
-        assert_eq!(cell(Family::Gemma4,t).adapter,Adapter::Missing);
-    }
+    let t5 = cell(Family::Gemma4, Trajectory::T5GenuineSpeculation);
+    assert_eq!(t5.adapter, Adapter::GemmaNgramTransaction);
+    assert_eq!(t5.scope, "gemma_ngram global OptionC injected K3 transaction vs same-route ordinary arm");
+    assert_eq!(t5.gap, "not the slot-aware serving body");
+    assert!(cells.iter().all(|c| c.family != Family::Gemma4 || c.adapter != Adapter::Missing));
 }
 #[test]
 fn actual_generic_entry_guard_refuses_before_forward_and_names_real_separate_routes() {
@@ -46,6 +48,10 @@ fn actual_generic_entry_guard_refuses_before_forward_and_names_real_separate_rou
     }
     assert!(ordinary_preflight(Family::Deepseek4, Trajectory::T5GenuineSpeculation)
         .unwrap_err().starts_with("LocalizationIncomplete"));
+    let gemma = ordinary_preflight(Family::Gemma4, Trajectory::T5GenuineSpeculation).unwrap_err();
+    assert!(gemma.starts_with("SeparateActualAdapterRequired: gemma_ngram"), "{gemma}");
+    // The slot-aware ordinary endpoint still refuses T5 itself.
+    assert!(crate::adr063_invariance::gemma_actual::require_ordinary(Trajectory::T5GenuineSpeculation).is_err());
 }
 #[test]
 fn scoped_continuation_and_one_lane_localizers_never_become_full_matrix_extent() {

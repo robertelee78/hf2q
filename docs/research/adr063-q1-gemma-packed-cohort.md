@@ -79,19 +79,46 @@ stores therefore compare coordinate for coordinate. Both routes share one
 separate composition key (`gemma-four-lane-stage-localizer-native-routing1511-v1`).
 
 The metadata prepare's optional `cohort_localizer` block (`layers`,
-`prefill_stages`, `decode_stages`, and optionally `observer_effect_reference`
-and `packed_observer_effect_reference`, default `gemma-t0-b3` / `gemma-t2-b3`)
-writes `cohort-localizer-prepared.json` and two disabled `multistore` packets
-(`all128`, `packed`). The supervisor's `multistore` kind with check
-`gemma_loc4` validates both stores, all four lanes and the four-lane policy
-(`lanes: 4`, `stage_payload_upper_bytes`). In the supervisor's manifest form
-the bound manifest is the extent of record: the packet carries no
-`expected_stores`, and any `lanes`/`host_payload_limit` it keeps must equal
-the manifest's (`docs/research/adr063-q1-spec-design.md` Part 3).
+`prefill_stages`, `decode_stages`, the required `observer_effect_reference`
+and `packed_observer_effect_reference`, e.g. `gemma-t0-b3` / `gemma-t2-b3`, or
+`gemma-t0-b5g` for the #665 branch P reference; optional `mode` and
+`packet_form`) writes `cohort-localizer-prepared.json` and two disabled
+`multistore` packets (`all128`, `packed`). Each packet echoes its
+`observer_effect_reference`, and the localizer's `execution.json` records it
+with `route` (the recipe route label), `localizer_mode`,
+`stage_extent_source` and `routing_witness_installed`. The supervisor's
+`multistore` kind with check `gemma_loc4` validates both stores, all four
+lanes and the four-lane policy (`lanes: 4`, `stage_payload_upper_bytes`). In
+the supervisor's manifest form the bound manifest is the extent of record: the
+packet carries no `expected_stores`, and any `lanes`/`host_payload_limit` it
+keeps must equal the manifest's (`docs/research/adr063-q1-spec-design.md`
+Part 3).
 
-Observer-effect control: `exact` of each localizer endpoint store against
-`gemma-t0-b3` / `gemma-t2-b3` must be `ExactEqual`. The stage localization
-record is `scripts/four_agent/q1_stage_localization.py` (per-lane first
-divergence in execution order, router-id changes, and the rows 29–127
-repetition with its magnitude). Packed versus All128 is Class B, so a
+Packet forms: `Inline` (default, #652) freezes both store lists in the
+packet's `expected_stores` (16 MiB read). `PlanOnly` writes a
+`cohort-localizer-manifest-<route>.json` per route, exactly
+`{lanes, host_payload_limit, expected_stores}` (≤ 64 MiB), and the packet
+binds it as `stage_manifest` `{path, sha256}` instead (packet ≤ 1 MiB). In both
+forms the stage list must equal the source `manifest()`.
+
+`DriftAll128` mode (#665 §2.6, build-drift localization): All128 only,
+witness-OFF (packet `routing_witness` null, witness never installed), prefill
+only (`decode_stages: []`), plan-only form required (bound `stage_manifest`),
+`observer_effect_reference` null, own route
+`gemma-all128-stage-drift-witness-off-v1` and so its own composition key. Only
+this mode skips the published-witness native check; the identity native must
+still be the build's own `Cargo.toml` pin. Every witness reference of
+`gemma_actual`, the cohort localizer and the prepare goes through the
+witness-ON adapter `gemma_actual/routing.rs`, which only endpoint and `Cohort`
+packets reach. The `540a4708` diagnostic backport keeps the other files
+unchanged and replaces that adapter with a witness-free one of the same API
+(non-null budget and published-native checks refuse, charge 0, install
+`None`, hooks no-ops), so only `DriftAll128` runs there.
+
+Observer-effect control: `exact` of each localizer endpoint store against its
+`observer_effect_reference` store must be `ExactEqual` (DriftAll128 instead
+gates row 127 offline against the preparation's retained logits). The stage
+localization record is `scripts/four_agent/q1_stage_localization.py`
+(per-lane first divergence in execution order, router-id changes, and the rows
+29–127 repetition with its magnitude). Packed versus All128 is Class B, so a
 localized stage implies no fix.
