@@ -39,10 +39,10 @@ fn q1_qwen_actual_endpoint_trace() {
     let mut raw = Vec::new();
     std::fs::File::open(path)
         .unwrap()
-        .take(1024 * 1024 + 1)
+        .take(super::qwen_checkpoint::ENDPOINT_PACKET_READ_LIMIT as u64 + 1)
         .read_to_end(&mut raw)
         .unwrap();
-    assert!(raw.len() <= 1024 * 1024);
+    assert!(raw.len() <= super::qwen_checkpoint::ENDPOINT_PACKET_READ_LIMIT);
     let packet: Packet = serde_json::from_slice(&raw).unwrap();
     assert!(packet.execution_approved);
     packet.identity.validate().unwrap();
@@ -53,7 +53,7 @@ fn q1_qwen_actual_endpoint_trace() {
         Family::Qwen38 | Family::Qwen36
     ));
     assert!((144..=262144).contains(&packet.configured_capacity));
-    assert!(packet.requested_payload_limit <= 2 * 1024 * 1024 * 1024);
+    assert!(packet.requested_payload_limit <= super::qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX);
     let acquisition_scope = super::acquisition::Scope::begin(
         &packet.acquisition,
         &packet.identity,
@@ -178,8 +178,8 @@ fn q1_qwen_actual_endpoint_trace() {
             let values = match observation {
                 qwen_runner::Observation::Forward(values) => values,
                 qwen_runner::Observation::Restored64 => {
-                    anyhow::ensure!(packet.workload.family==Family::Qwen36 &&
-                        packet.trajectory==Trajectory::T1Resume64 && end==64,"explicit Q36 actual restore scope");
+                    anyhow::ensure!(super::qwen_checkpoint::captures64(packet.workload.family,packet.trajectory) &&
+                        packet.trajectory==Trajectory::T1Resume64 && end==64,"explicit Qwen actual restore scope");
                     anyhow::ensure!(cache.mtp_slot.as_ref().map_or(0,|slot|slot.current_len[0])==0,
                         "ordinary restore64 unexpectedly contains active MTP");
                     super::qwen_cache::after_restored64(&mut store,cache,layer,&format!("agent-{lane}"))?;
@@ -229,11 +229,14 @@ fn q1_qwen_actual_endpoint_trace() {
     acquisition_scope.check_unchanged().unwrap();
     let trace = store.finish().unwrap();
     assert!(trace.coverage.errors.is_empty());
-    let exact64 = if packet.workload.family==Family::Qwen36 && packet.trajectory==Trajectory::T1Resume64 {
+    let captures64 = super::qwen_checkpoint::captures64(packet.workload.family,packet.trajectory);
+    let exact64 = if captures64 && packet.trajectory==Trajectory::T1Resume64 {
         Some(super::qwen_checkpoint::require_restore64_exact(&trace.coverage.captured))
     } else {None};
+    // Per-family names: Qwen3.6 keeps its retained keys; Qwen3.8 records the same evidence as qwen38_*.
+    let family_prefix = match packet.workload.family {Family::Qwen38 => "qwen38", _ => "qwen36"};
     let evidence = serde_json::json!({"schema":"hf2q.adr063.q1.endpoint-acquisition.v1","packet_sha256":hash(&raw),"execution":execution,
-        "trace_records":trace.coverage.captured.len(),"planned_tensor_payload_bytes":planned_payload,"qwen36_active64_captured":super::qwen_checkpoint::captures64(packet.workload.family,packet.trajectory),"qwen36_restore64_exact":exact64,"complete_active_cache_boundaries":[128,144],"mtp_positions":packet.mtp_positions,"internal_stage_localization":"NotEstablishedByEndpointTrace",
+        "trace_records":trace.coverage.captured.len(),"planned_tensor_payload_bytes":planned_payload,(format!("{family_prefix}_active64_captured")):captures64,(format!("{family_prefix}_restore64_exact")):exact64,"complete_active_cache_boundaries":[128,144],"mtp_positions":packet.mtp_positions,"internal_stage_localization":"NotEstablishedByEndpointTrace",
         "whole_q1_qualified":false,"identity_attestation":"RequiresIndependentLaunchBuildArtifactComposition"});
     let mut file = OpenOptions::new()
         .create_new(true)

@@ -80,9 +80,7 @@ pub fn run(
                     "Qwen actual restore cursor"
                 );
                 evidence.restored_at = Some(64);
-                if work.family == Family::Qwen36 {
-                    observe(lane, 64, Observation::Restored64, &cache)?;
-                }
+                observe(lane, 64, Observation::Restored64, &cache)?;
             }
             forward(
                 model,

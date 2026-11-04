@@ -1,10 +1,17 @@
-//! Explicit Qwen3.6 ordinary active64 evidence; no new forward/math/allocator.
+//! Explicit Qwen ordinary active64 evidence (Qwen3.6 and Qwen3.8); no new forward/math/allocator.
 use super::{protocol::Trajectory, qwen_cache, receipt::*};
 use crate::inference::models::qwen35::Qwen35Config;
 use anyhow::{ensure, Context, Result};
 
+/// Largest endpoint payload a packet may request. A Qwen3.8 T1 store holds the
+/// 128/144 boundaries plus the source and restored 64-row active caches, whose
+/// fixed-size recurrent state alone exceeds the former 2 GiB bound.
+pub const ENDPOINT_PAYLOAD_LIMIT_MAX: u64 = 4 * 1024 * 1024 * 1024;
+/// Largest endpoint packet `qwen_actual` reads (and the prepare writes).
+pub const ENDPOINT_PACKET_READ_LIMIT: usize = 4 * 1024 * 1024;
+
 pub fn captures64(family: Family, trajectory: Trajectory) -> bool {
-    family == Family::Qwen36
+    matches!(family, Family::Qwen36 | Family::Qwen38)
         && matches!(trajectory, Trajectory::T1Resume64 | Trajectory::T3Chunk64)
 }
 /// The one Qwen endpoint config recipe. `qwen_actual` checks it against the
@@ -29,7 +36,7 @@ pub fn expected_cache(cfg: &Qwen35Config, family: Family, trajectory: Trajectory
         (Family::Qwen36,crate::inference::models::qwen35::Qwen35Variant::Moe) |
         (Family::Qwen38,crate::inference::models::qwen35::Qwen35Variant::Dense)),
         "explicit Qwen family/actual config variant");
-    if captures64(family,trajectory) {ensure!(mtp_positions==[0,0],"Q36 ordinary target-only MTP cursors must be zero");}
+    if captures64(family,trajectory) {ensure!(mtp_positions==[0,0],"Qwen ordinary target-only MTP cursors must be zero");}
     let mut out = Vec::new();
     for (index, boundary) in [128,144].into_iter().enumerate() {
         for lane in 0..4 {
@@ -54,7 +61,7 @@ pub fn expected_cache(cfg: &Qwen35Config, family: Family, trajectory: Trajectory
 }
 /// Header-derived whole tensor plan BEFORE model/GPU loading. Store rechecks it.
 pub fn planned_payload(cache: &[ExpectedTensor], vocab: usize, limit: u64) -> Result<u64> {
-    ensure!(limit>0 && limit<=2*1024*1024*1024,"explicit finite endpoint payload limit");
+    ensure!(limit>0 && limit<=ENDPOINT_PAYLOAD_LIMIT_MAX,"explicit finite endpoint payload limit");
     let mut bytes=576u64.checked_mul(vocab as u64).and_then(|n|n.checked_mul(4))
         .context("Qwen full144 logit byte overflow")?;
     for tensor in cache {

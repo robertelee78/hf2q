@@ -21,11 +21,47 @@ fn q36_complete_checkpoint_plan_preserves_full144_and_preload_budget() {
     assert!(expected_cache(&cfg,Family::Qwen38,Trajectory::T1Resume64,262144,[0,0]).is_err());
     assert!(expected_cache(&cfg,Family::Qwen36,Trajectory::T1Resume64,262144,[64,64]).is_err());
     assert!(planned_payload(&t1,usize::MAX,2*1024*1024*1024).is_err());
-    let q38=qwen_cache::selected_header_fixture(true);
-    let old=expected_cache(&q38,Family::Qwen38,Trajectory::T1Resume64,262144,[0,0]).unwrap();
-    assert!(old.iter().all(|t|matches!(t.at.logical_step,128|144)));
-    assert!(!captures64(Family::Qwen36,Trajectory::T2ActualCohort));
-    assert!(!captures64(Family::Qwen36,Trajectory::T6CancelRestore));
+    assert!(planned_payload(&t1,cfg.vocab_size as usize,ENDPOINT_PAYLOAD_LIMIT_MAX+1).is_err());
+    for family in [Family::Qwen36,Family::Qwen38] {
+        assert!(!captures64(family,Trajectory::T0ColdSerial));
+        assert!(!captures64(family,Trajectory::T4ReverseOrder));
+        assert!(!captures64(family,Trajectory::T7RepeatCold));
+        assert!(!captures64(family,Trajectory::T2ActualCohort));
+        assert!(!captures64(family,Trajectory::T6CancelRestore));
+        assert!(captures64(family,Trajectory::T1Resume64));
+        assert!(captures64(family,Trajectory::T3Chunk64));
+    }
+}
+/// Qwen3.8 T1/T3 carry the same direct restore-point evidence as Qwen3.6:
+/// T3 adds the source 64-row active cache, T1 adds it plus its segment+1000
+/// restored twin, and T0/T4/T7 stay at the 128/144 boundaries only.
+#[test]
+fn q38_restore64_plan_adds_source_and_restored_active64_only_to_t1_t3() {
+    let cfg=qwen_cache::selected_header_fixture(true);
+    let plan=|t|expected_cache(&cfg,Family::Qwen38,t,262144,[0,0]).unwrap();
+    let (t0,t1,t3)=(plan(Trajectory::T0ColdSerial),plan(Trajectory::T1Resume64),plan(Trajectory::T3Chunk64));
+    for t in [Trajectory::T0ColdSerial,Trajectory::T4ReverseOrder,Trajectory::T7RepeatCold] {
+        assert!(plan(t).iter().all(|e|matches!(e.at.logical_step,128|144)));
+    }
+    let extra=t3.len()-t0.len();assert!(extra>0);assert_eq!(t1.len(),t0.len()+2*extra);
+    let source=t1.iter().filter(|e|e.at.logical_step==64 && e.at.segment<1000).collect::<Vec<_>>();
+    let restored=t1.iter().filter(|e|e.at.logical_step==64 && e.at.segment>=1000).collect::<Vec<_>>();
+    assert_eq!(source.len(),extra);assert_eq!(restored.len(),extra);
+    for s in &source {
+        let mut twin=s.at.clone();twin.segment+=1000;
+        let r=restored.iter().filter(|r|r.at==twin).collect::<Vec<_>>();
+        assert_eq!(r.len(),1);assert!(r[0].scalar==s.scalar && r[0].shape==s.shape);
+    }
+    // T3 extras are exactly T1's source (non-restored) active64 records.
+    let t3_64=t3.iter().filter(|e|e.at.logical_step==64).map(|e|e.at.clone()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(t3_64,source.iter().map(|e|e.at.clone()).collect());
+    for tensors in [&t0,&t3,&t1] {
+        let coordinates=tensors.iter().map(|t|t.at.clone()).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(coordinates.len(),tensors.len());
+        planned_payload(tensors,cfg.vocab_size as usize,ENDPOINT_PAYLOAD_LIMIT_MAX).unwrap();
+    }
+    assert!(expected_cache(&cfg,Family::Qwen38,Trajectory::T1Resume64,262144,[64,64]).is_err());
+    assert!(expected_cache(&cfg,Family::Qwen36,Trajectory::T1Resume64,262144,[0,0]).is_err());
 }
 #[test]
 fn q36_actual_fullhash_gate_refuses_missing_duplicate_and_rehashed_layout() {
