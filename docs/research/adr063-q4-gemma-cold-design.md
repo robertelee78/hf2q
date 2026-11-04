@@ -4,6 +4,16 @@ Status: design for approval (2026-11-04). No code, build or hardware run backs
 this document. Every number is quoted from a retained receipt, with its path,
 or marked `[INFERENCE]`.
 
+Revision 2 (2026-11-04) applies the ACCEPT-WITH-CONDITIONS review
+(ReviewGemmaCold):
+- findings 1–8: Phase C logits source; the cursor commit; the iter-G(a)
+  33-row floor; the installed-prefill claim narrowed to the cursor-0 chunk;
+  anchor-quota wording; global-layer staging; makespan reported, not gated;
+  bitwise gates for the 32-row and mixed cues;
+- its smaller notes: reservation release before retry, self-mount clear
+  after Phase B, and the ADR requirement scoped to eligible cohorts;
+- the D4 amendment.
+
 Story: **Q4-GEMMA-COLD** (new, v0.1.30), one of the four stories the operator
 added on 2026-11-04 to close the Gemma 4 26B-A4B gap that #668 (Q4-GEMMA-ATTN)
 cannot close alone. It owns the cold-turn admission stage that the #660 profile
@@ -57,8 +67,12 @@ evidence root, created by the GPU-lane holder).
    layer-0 SDPA.
 4. **Clean cutover (operator decision D2).** The new per-sequence cold
    attention replaces the block-diagonal route in every cold multi-sequence
-   caller: the iter-G(a) cold batch and the installed cold prefill. hf2q then
-   keeps one cold multi-sequence route, and Q1 T2 becomes a Class A pair.
+   caller: the iter-G(a) cold batch and the installed cold prefill. The
+   iter-G(a) lane floor rises from 32 to 33 rows (§3.3). hf2q then keeps one
+   cold multi-sequence route, and Q1 T2 becomes a Class A pair. For installed
+   long prompts, only the cursor-0 chunk forward becomes exact. The chunk
+   plan and the later live chunks still depend on how many lanes are
+   co-installed (§3.3).
 5. **Expected effect [INFERENCE]: 0.20–0.35 s of makespan, not the profile's
    0.4–0.5 s.** The profile's upper bound assumed that hf2q's 275 ms per-slot
    prefill carries into a joint forward. It does not: by the joint warm fit,
@@ -203,6 +217,8 @@ hold:
   boundary is cold-prefilled on the linear path per slot and cannot join.
 - **Transaction cap.** `Σ P_i ≤ 4,096` (`gemma4_batch_rows_within_transaction_limit`),
   the existing Gemma transaction cap.
+- **Anchor quota.** Under the serial admission order, every lane's
+  `StableBoundary` reservation would be accepted (§3.2 step 4).
 - **Worker substrate.** Hybrid KV; cross-slot admission on; the kill switch
   on; `kv_graft_len() == 0`; `HF2Q_BATCHED_BODY` not `0`;
   `HF2Q_PREFILL_SLOT_BATCHED` not `0`; no `HF2Q_MM_ID_ROUTING_THRESHOLD`
@@ -234,10 +250,23 @@ reserve (FIFO)  →  reset (all lanes)  →  Phase B: joint boundary prefill
    `[(prompt_i[..S_i], slot_i)]`, with every lane at start 0, using the
    per-sequence cold attention of §4.3. The per-lane head rows are computed
    and discarded, as `prefill_seed` discards the boundary token.
+   `clear_gemma4_self_mounts` runs again after Phase B, as `prefill_seed`
+   does after its boundary forward (:7410).
 4. **Anchors.** In FIFO order, `gemma_full_input::capture_or_skip(slot,
    AnchorRole::StableBoundary, snapshot_gemma_hybrid_slot_anchor(scaffold,
-   slot, S_i))`. The capture role, order and sizes equal serial admission, so
-   under a binding quota the same lane is refused.
+   slot, S_i))`. The capture role, order and sizes equal serial admission.
+   Quota accounting is not identical, though. Step 2 resets every lane first,
+   which drops all the lanes' old anchors and their quota reservations
+   (`anchor_budget.rs:46`). Serial admission frees only lane k's old anchor,
+   just before lane k captures. Under a binding quota the cohort could
+   therefore refuse only a subset of the lanes serial admission would refuse,
+   and would keep an anchor that serial admission drops, which breaks
+   byte-for-byte anchor equality. To keep the claim exact, the planner
+   refuses the cohort (per-slot fallback) unless the serial order's
+   reservations all fit. That is checked model-free against the quota ledger
+   before step 2. In practice the refusal is not reached: the checkpoint
+   worker activates only when the two-generation quota plan fits
+   (`decide_for_scaffold`). A hosted control covers the refusal.
 5. **Phase C.** Process every lane's cue `prompt_i[S_i..P_i]`:
    - **All cues < 32 rows** (the Gemma generation cue is 7 rows): replay the
      cue through the batched decode body, one step per cue position, with each
@@ -252,8 +281,12 @@ reserve (FIFO)  →  reset (all lanes)  →  Phase B: joint boundary prefill
      transaction. This is exact by identity, and only the short-cue lanes
      share replay steps.
 6. **Commit.** `commit_gemma4_slot_cursors` for `(slot, 0, P_i)`,
-   all-or-nothing, after `validate_gemma4_slot_cursor(slot, P_i)` for every
-   lane.
+   all-or-nothing. Prefill and decode forwards do not move the ledger
+   cursor (`seq_lens`). The serial path commits `(cached, P)` only after
+   `prefill_seed` (:13919–13922). So every lane's cursor is still 0 here: the
+   commit validates that itself, and no separate validation at `P_i` is made.
+   The replay invariant checked before the commit is that each lane's last
+   replayed position is `P_i − 1`.
 7. **Publish (FIFO).** For each lane:
    - `Gemma4DecodeState::from_first_token(…, first_token, Some(row),
      elapsed, 0)`;
@@ -271,11 +304,11 @@ and the next scheduler tick decodes all lanes together.
 | Group shape (all slots idle) | Today | After |
 |---|---|---|
 | All cold, with boundary (turn 0) | serial per slot | **cold stable cohort** |
-| All cold, no boundary | iter-G(a) cold batch (block-diagonal, Class B) | iter-G(a) cold batch on the per-sequence cold attention (Class A; D2) |
+| All cold, no boundary | iter-G(a) cold batch (block-diagonal, Class B; lanes ≥ 32 rows) | iter-G(a) cold batch on the per-sequence cold attention (Class A; D2). The lane floor rises to **33** rows (`MIN_SUFFIX_TOKENS`): a 32-row lane runs its MoE gate/up on `mv_id` alone but on `mm_id` in the joint stream, so it goes per slot |
 | All cached, with boundary, cues ≥ 32 | stable batch (tiled F16 live attention) | unchanged |
 | Warm tool turns (full-input tags) | joint warm cohort | unchanged |
 | Mixed cold/cached | serial per slot, FIFO | unchanged |
-| Long prompts (> 4,096 rows), installed lanes at cursor 0 | `forward_prefill_batched_multi_seq` block-diagonal | per-sequence cold attention (D2) |
+| Long prompts (> 4,096 rows), installed lanes at cursor 0 | `forward_prefill_batched_multi_seq` block-diagonal | per-sequence cold attention (D2). **Only the cursor-0 chunk forward is exact** for its planned chunk. `gemma4_prefill_batch_plans` gives each of N co-installed lanes 4,096/N rows, while a lone lane takes 4,096, and later chunks use the live `Tiled` resume. The request-level output therefore still depends on the co-batch, and this row makes no request-level Class A claim |
 
 ### 3.4 Kill switch and observability
 
@@ -346,7 +379,7 @@ token-wise operations run once over the stream.
 | Embedding, input norm, Q/K/V projections, fused head norm and RoPE (per-row positions, already reset per sequence, :1537), V norm | joint over T = Σ S_i rows | Row-wise kernels; equal at layer 0 on packed T2 (#652 stage table: Query, Key, Value, RopeQuery, RopeKey 512/512 equal) |
 | KV write into each slot region (F16 K, TQ-HB V) | existing per-sequence scatter (iter-G(a) "delta 3", :4253) | Row-wise encode into the lane's own region; the cohort gate compares cache bytes |
 | **Sliding attention** | **per lane:** `permute_021_f32_to_f16` of the lane's rows (`slice_view` at row `off_i`) into lane-local head-major F16 scratch at offset 0; the lane's `[S_i, S_i]` sliding mask and `blk`, built and re-cast in the consuming layer session (the §0.19 remask rule, :3396–3428); `flash_attn_prefill_f16_d256_with_blk` with `seq_len_q = seq_len_k = S_i`; F16→BF16 cast | Same function, same inputs, same shapes as the single-slot cold call |
-| **Global attention** | **per lane:** for 64 < S_i ≤ 8,192, the tensor-mm chain (Q·Kᵀ into `pf_kq` sized for the largest lane, scale-mask-softmax, ·V, permute); for other S_i, F16 d512 FA. The predicate is the existing one, evaluated with `S_i` | Same |
+| **Global attention** | **per lane, staged by recomputation, not by copy or strided view.** In the joint stream, the fused head-norm and RoPE kernel writes the tensor-mm operands (`pf_q_perm_f32`, `pf_k_perm`, and the V operand) head-major across all T rows, so a lane is a strided sub-block there. For a global layer the cohort does not use that joint head-major output. Instead, per lane, the same fused head-norm and RoPE dispatch (and the V norm and permute) that the single-slot route issues runs with `seq_len = S_i`. Its inputs are `slice_view`s of the joint seq-major Q/K/V projection rows `[off_i, off_i + S_i)` and of `pf_positions`. It writes lane-local head-major operands at offset 0, plus the lane's rows of the joint seq-major normed buffers that the KV scatter reads. Then, for 64 < S_i ≤ 8,192, the tensor-mm chain runs (Q·Kᵀ into `pf_kq` sized for the largest lane, scale-mask-softmax, ·V, permute); for other S_i, F16 d512 FA runs. The predicate is the existing one, evaluated with `S_i`. This costs 5 layers × 4 lanes of row-wise dispatches | Same kernels, same inputs, same shapes and offset-0 operands as the single-slot cold call. The projection rows are row-invariant (first table row). No strided view and no reinterpreting copy is involved |
 | **O-projection** | **per lane,** the branch the single-slot route takes for the artifact's codec (perm021 tensor-MM, or permute-to-seq-major plus the ordinary route), `m = S_i`, writing rows `[off_i, off_i + S_i)` of the joint hidden buffer | Same kernel at the same m. It costs about 3 extra reads of about 0.25 GB of O-projection weights per forward, under 3 ms `[INFERENCE]` |
 | Residuals, post-attention norm, dense FFN, router, MoE (`mm_id` at n_tokens = T), layer tail | joint | Row-invariant for every lane above 32 rows: the joint warm gate (`gemma_joint_warm_prefill_matches_per_slot_bitwise*`) proves the same code bitwise. The concurrent Gemma prefill-MoE design states (2026-11-04) that its `mm_id` schedule change keeps per-row output independent of total rows and expert grouping, and keeps the threshold at 32 |
 | Final norm and head | per lane, last row (existing `head_rows`, :5568) | m = 1 per row, as single-slot |
@@ -368,19 +401,33 @@ Let `c_i = P_i − S_i`. For each step `j` in `0..max_i c_i`:
   `S_i + j`. The graft length is 0 by rule, and this equals the serial
   replay's `kv_graft_len() + cached_tokens + offset`, `forward_prefill.rs:3923`;
 - one `forward_decode_body_batched(tokens, slot_ids, positions,
-  BatchedKvRegime::Hybrid, &mut None, gpu)` call runs per step. That body is
-  documented and gated as byte-identical to N serial `forward_decode_slot_aware`
-  calls (`batched_body.rs:491-505`; `slot_aware_n1`/`slot_aware_n4`/`slot_aware_n8`);
-- for lanes whose step `j == c_i − 1`, one `lm_head_batched` produces their
-  logits rows. The first token is `argmax_f32_first_max` of the row, the
-  decode tick's selection. `from_first_token` then receives `Some(row)`.
+  BatchedKvRegime::Hybrid, &mut head_out, gpu)` call runs per step, with a
+  fresh `head_out: Option<BatchedHeadOut> = None`. That body is documented and
+  gated as byte-identical to N serial `forward_decode_slot_aware` calls
+  (`batched_body.rs:491-505`; `slot_aware_n1`/`slot_aware_n4`/`slot_aware_n8`);
+- logits come from the decode tick's own source, exactly as
+  `decode_batch_gemma4` reads them (engine.rs:16814):
+  - under the default fused head (chunked body, `HF2Q_FUSE_LMHEAD` not 0),
+    the body encodes the head as its final chunk, fills `head_out` and
+    returns an empty hidden vector (`batched_body.rs:2521, 2599`);
+  - otherwise it returns hidden rows and one `lm_head_batched` over them
+    produces the logits.
 
-Heads of intermediate steps are skipped. They do not feed KV, and the serial
-replay discards their tokens.
+  For lanes whose step is `j == c_i − 1`, the first token is
+  `argmax_f32_first_max` of the lane's row, the decode tick's selection, and
+  `from_first_token` receives `Some(row)`.
+
+Under the fused default the head runs on **every** replay step. Intermediate
+rows are read and discarded, as the serial replay discards its intermediate
+tokens. Heads do not feed KV. On the unfused route, intermediate steps skip
+`lm_head_batched`. Both routes leave the KV identical. The per-step cost in
+§10 already includes a head, because the measured turn-0 decode step does.
 
 Each step is its own `supervised_gemma4_gpu_call` (`gemma4_cold_cohort_cue`),
-so the watchdog bound per call is one decode step. After the last step every
-lane's cursor must equal `P_i`.
+so the watchdog bound per call is one decode step. No step moves the ledger
+cursor. The invariant checked after the last step is that each lane's last
+replayed position is `P_i − 1`. The cursor is then committed `(0, P_i)` in
+§3.2 step 6.
 
 ### 4.5 Failure and cancellation semantics
 
@@ -391,16 +438,21 @@ Stage 1).
   reset are routed per slot in FIFO order. A failed reset is an invariant
   fatal, as in `admit_gemma4_slots_batched`.
 - **Phase B non-fatal forward error:** reset every lane (a cold lane's
-  request-start state is the reset slot) and run each lane through
+  request-start state is the reset slot). Release each lane's reservation
+  with the existing pattern (`scheduler.record_slot_high_water(handle, 0)`,
+  then `scheduler.release(handle)`), so the per-slot path's own admission
+  does not meet a phantom reservation. Then run each lane through
   `admit_gemma4_slot` in FIFO order, exactly as if it had been admitted
   alone. A lane's own fault recurs per slot and fails only that request.
 - **Anchor capture error other than a quota refusal:** reset that lane and
   fail it request-locally. The other lanes continue into Phase C. A quota
   refusal skips the anchor, as serial admission does.
 - **Phase C non-fatal error:** restore each lane from its just-captured
-  boundary anchor (`restore_gemma_hybrid_slot_anchor` at `S_i`), or reset it
-  if its anchor was refused. Then finish it per slot in FIFO order through
-  the serial cue path, or a full per-slot admission after a reset.
+  boundary anchor (`restore_gemma_hybrid_slot_anchor` at `S_i`) and finish
+  its cue per slot in FIFO order through the serial cue path, keeping its
+  reservation. A lane whose anchor was refused is reset instead, its
+  reservation is released (`record_slot_high_water(handle, 0)`, then
+  `release`), and it is admitted afresh per slot.
 - **Worker-fatal GPU error** (watchdog, command-buffer fault): the worker
   fails, as for every Gemma transaction.
 - **Publication failure of one lane:** restore and fail that lane only.
@@ -514,7 +566,12 @@ it.
   - a single lane.
 
   Cue routing covers 7 → `Replay`, 40 → `JointLive`, 32 → `PerSlot`, and the
-  mixed {7, 40} → `Replay` plus `PerSlot`.
+  mixed {7, 40} → `Replay` for the 7-row lane plus `PerSlot` for the 40-row
+  lane.
+- **Anchor quota refusal.** A ledger fixture in which serial order would
+  refuse one anchor makes `stable_plan` return `None` (§3.2 step 4).
+- **iter-G(a) lane floor (D2).** `gemma_cold_batch::plan` with a 32-row lane
+  routes the group per slot. A 33-row lane joins.
 - **Reservation order.** Over the scheduler fixture, the cohort's
   `AdmitRequest` sequence equals the per-slot path's, including slot choice
   when a retained slot exists.
@@ -525,7 +582,9 @@ it.
 - **Cutover controls.** The block-diagonal mask builder and `pf_seq_id` are
   gone. Every cold multi-sequence caller takes `encode_cold_layer_attention`.
   The existing `iter_g_a` hosted controls are updated to the per-sequence
-  descriptor.
+  descriptor and the 33-row floor. The test
+  `gemma_cold_batch_preserves_existing_tiny_aggregate_and_overflow_refusals`
+  gains the 32-row case.
 
 ### 6.2 Official artifact (ignored; root runs on the GPU lane)
 
@@ -538,7 +597,14 @@ Helpers are `lane_image`, `slot_kv_hashes`, `slot_cursors` and
    - synthetic lanes {33, 64, 65, 458} with cue 7;
    - {1,100 (> sliding window), 900} with cue 1;
    - {200, 300} with cue 31;
-   - {500, 600} with cue 40 (the `JointLive` cue).
+   - {500, 600} with cue 40 (the `JointLive` cue);
+   - {300, 400} with cue 32 (the `PerSlot` cue);
+   - a mixed pair: a 400-row lane with cue 7 and a 500-row lane with cue 40
+     (`Replay` plus `PerSlot` in one transaction).
+
+   The four real turn-0 prompts differ only in the agent id, so the
+   synthetic lanes of unequal length and content carry the cross-lane
+   contamination check.
 
    It compares first token, logits row bytes, cursors, KV hashes of all 30
    layers through P, anchor bytes, and 16 greedy decode rows' logits bytes
@@ -546,8 +612,12 @@ Helpers are `lane_image`, `slot_kv_hashes`, `slot_cursors` and
 2. **`gemma_joint_cold_prefill_deterministic`.** 20 repeats of the turn-0 set,
    every repeat byte-identical to the first (the §0.19 determinism history).
 3. **`gemma_cold_multi_seq_matches_per_slot_bitwise`** (cutover). The
-   iter-G(a) cold batch (no boundary) and the installed cold prefill at
-   cursor 0 each match per-slot cold prefill bitwise. The existing
+   iter-G(a) cold batch (no boundary) with lanes {33, 64, 458, 900} matches
+   per-slot cold prefill bitwise. A group containing a 32-row lane is
+   asserted to take the per-slot route (cohort counter unchanged). The
+   installed cold prefill's **cursor-0 chunk** matches a per-slot cold
+   prefill of the same planned chunk `prompt[..end]` bitwise. This is a
+   chunk-level claim, not a request-level one (§3.3). The existing
    `gemma_cold_multi_seq_long_lane_ring_deterministic` stays green.
 4. **`gemma_joint_cold_engine_cohort_matches_serial_turn0`.** Engine level.
    Four concurrent unary turn-0 requests run with the switch on versus off.
@@ -587,7 +657,17 @@ turn-0 span +496 ms is 18% of the +2.734 s gap, and the turn-0 queue
   - turn-0 decode median ≤ 420 ms, against 345–369 ms today for the
     last-served lane;
   - cohort size 4 on turn 0 in at least 6 of 7 runs, from the cohort log line;
-  - makespan difference with a CI upper bound < 0.
+  - makespan difference: **reported, not gated.** At 7 blocks a −0.20 to
+    −0.35 s effect is within the run-to-run spread (the peer's own MT-vs-P0
+    −0.35 s had a CI of −1.21 to +0.08 s). The turn-0 span, whose spans
+    range only 1522–1577 ms, is the primary gate. The makespan verdict
+    belongs to the combined candidate's Q3-design campaign.
+- **G-S3, iter-G(a) no-boundary cold batch (D2, diagnostic, quiet host).**
+  Four 465-row prompts without a boundary, plus an 8 × 64-row set, 10
+  repeats each. Compare the per-sequence route against the block-diagonal
+  route on the base binary. The per-sequence route's transaction median must
+  be ≤ 1.05× the block-diagonal route's on each set. That shows the cutover
+  does not regress the no-boundary batch on per-lane attention.
 - **No Win claim here.** The Q4 Win (`family_verdict` == Win, ratio CI upper
   bound ≤ 0.95 against the peer's MT) is measured in Q4-GEMMA-ATTN's combined
   candidate.
@@ -655,7 +735,9 @@ binary sha256, artifact digest, native version and case file.
 6. **On any gate failure:** stop. Localize with
    `q1_gemma_actual_cohort_stage_localizer` / `…all128_stage_localizer` on
    the candidate. Record the first differing stage and lane. Do not promote.
-7. **G-S1** transaction timing: 10 + 10 repeats, ABBA, `$C/g-s1/`.
+7. **G-S1** transaction timing: 10 + 10 repeats, ABBA, `$C/g-s1/`. **G-S3**
+   (D2) no-boundary cold batch timing, per-sequence against block-diagonal
+   route, `$C/g-s3/`.
 8. **G-S2** four-agent paired replay: 7 blocks, kill switch off/on, the #660
    L1 case file and runner, Q5 `CalibrationPass` per run, `$C/g-s2/`. Then run
    `gemma_stage_profile.py compare` for the turn-0 table and
@@ -675,7 +757,7 @@ save:
   saving is three of the four fixed per-forward costs (about 113 ms) plus any
   better MoE tile use. Estimate: 4 × 187 ≈ 748 ms serial versus about
   600–640 ms joint.
-- **Anchors.** Unchanged, about 10 ms × 4, as part of today's 80–90 ms
+- **Anchors.** Unchanged, about 10 ms × 4, as part of today's 75–100 ms
   remainder.
 - **Phase C.** The serial cue costs 4 × 7 single-slot steps × about 10.6 ms ≈
   300 ms. The joint cue costs 7 width-4 steps × about 19–21 ms (the measured
@@ -685,7 +767,8 @@ save:
   Allowing for the fit's uncertainty, the makespan effect is **−0.20 to
   −0.35 s**.
 
-This replaces the profile table's 0.4–0.5 s row. The profile's upper bound
+This supersedes the profile table's 0.4–0.5 s row. The row is not edited; a
+dated note is added (D4). The profile's upper bound
 assumed that the 275 ms per-slot prefill carries into a joint 4 × 465-row
 forward. That is not so: the per-row term dominates, and hf2q's cold per-row
 cost is the prefill-kernel stories' stage (about 1.8× the peer's per row in
@@ -705,7 +788,7 @@ Win budget than the profile assumed.
 
 Outcome: The four simultaneous cold first prompts of the Gemma 4 26B-A4B four-agent task are prefilled in one joint transaction that is bitwise equal to per-slot prefill, so no agent waits for the other agents' serial prefills on turn 0.
 
-Requirement: The program MUST admit an all-idle FIFO cohort of cold Gemma 4 requests that carry an exact pre-generation boundary into one joint prefill transaction that is Q1 Class A against the per-slot route, publishing each lane's boundary anchor, cursor and first token exactly as per-slot admission does, and MUST measure its turn-0 effect on the four-agent task.
+Requirement: The program MUST admit every eligible cohort (design §3.1: all slots idle, two or more text lanes, each cold with an exact pre-generation boundary of at least 33 rows, at most 4,096 prompt rows in total, no graft, no diagnostic route override) of cold Gemma 4 requests into one joint prefill transaction that is Q1 Class A against the per-slot route, publishing each lane's boundary anchor, cursor and first token exactly as per-slot admission does. Every other group keeps its current route. It MUST measure the turn-0 effect on the four-agent task.
 
 Acceptance:
 
@@ -713,11 +796,11 @@ Acceptance:
 
 - Starting point (Q4-GEMMA #660, L1, 7 blocks, hf2q `7f295b38`): the four turn-0 requests coalesce but are admitted per slot in series. Because each carries a stable boundary, the stable batch refuses them as uncached and the cold batch refuses boundaries. The result is a server-queue staircase of 1/285/560/834 ms (lane medians), 275 ms of prefill per lane and 1.19 s of "decode" on the first-served lane. The turn-0 span is +496 ms against the peer's MT, 18% of the 2.73 s makespan gap.
 
-- Class A: on the official artifact, every cohort lane's first-token logits, cursors, all 30 layers' slot KV through the prompt, boundary anchor bytes and 16 following decode rows equal the per-slot route byte for byte, on the turn-0 prompts and the §6.2 synthetic shapes, deterministic over 20 repeats. The cold multi-sequence callers moved to the same per-sequence attention (iter-G(a) cold batch, installed cold prefill) also match per slot bitwise. Any differing byte blocks; no Class B fallback ships without a separate operator decision and the Q1 §3.5 campaign.
+- Class A: on the official artifact, every cohort lane's first-token logits, cursors, all 30 layers' slot KV through the prompt, boundary anchor bytes and 16 following decode rows equal the per-slot route byte for byte. This covers the turn-0 prompts and the §6.2 synthetic shapes, including the 32-row per-slot cue and mixed {7, 40} cues, and is deterministic over 20 repeats. The iter-G(a) cold batch moved to the same per-sequence attention (lane floor 33 rows) also matches per slot bitwise. For the installed long-prompt cold prefill, only the cursor-0 chunk forward is claimed exact. Any differing byte blocks; no Class B fallback ships without a separate operator decision and the Q1 §3.5 campaign.
 
 - `ExactTranscripts` on the four-agent workload, kill switch on against off.
 
-- Speed, paired four-agent replay (same binary, kill switch off against on, 7 paired blocks, Q5 `CalibrationPass` per run): turn-0 span median reduction ≥ 0.20 s per agent with a 95% CI excluding 0; turn-0 server queue median ≤ 30 ms; turn-0 decode median ≤ 420 ms; cohort size 4 in at least 6 of 7 runs; makespan difference CI upper bound < 0. The transaction itself takes ≤ 0.80× the per-slot sum on the turn-0 prompts.
+- Speed, paired four-agent replay (same binary, kill switch off against on, 7 paired blocks, Q5 `CalibrationPass` per run): turn-0 span median reduction ≥ 0.20 s per agent with a 95% CI excluding 0; turn-0 server queue median ≤ 30 ms; turn-0 decode median ≤ 420 ms; cohort size 4 in at least 6 of 7 runs. Makespan is reported, not gated; the makespan verdict belongs to the combined candidate. The transaction itself takes ≤ 0.80× the per-slot sum on the turn-0 prompts. The no-boundary cold batch on the new attention route takes ≤ 1.05× its previous transaction time.
 
 - The stock fairness band 1.025 (worst-slot TTFT p95, SSE-gap max) and the Q5 memory tier hold in the Q4-GEMMA-ATTN combined candidate, which carries this change; the Q4 Win is measured there, not here.
 
@@ -739,14 +822,29 @@ Delivery boundary: Qualified implementation merged to main for v0.1.30 and inclu
 - **D2. Clean cutover of the cold multi-sequence attention.** The new
   per-sequence cold attention replaces the block-diagonal BF16 route in every
   cold multi-sequence caller: the iter-G(a) cold batch and the installed cold
-  prefill at cursor 0. Graft-bound callers go per slot until a graft bitwise
-  gate exists. This removes a second cold convention, and Q1 T2 becomes a
-  Class A pair. The alternative keeps the old route for no-boundary cohorts
-  and adds the new one only for the stable cold cohort. Recommended: cutover.
+  prefill at cursor 0. It comes with three conditions (ReviewGemmaCold):
+  - iter-G(a)'s lane floor rises from 32 to 33 rows (§3.3);
+  - the installed long-prompt prefill claims exactness only for its cursor-0
+    chunk;
+  - G-S3 shows the no-boundary batch does not regress.
+
+  Graft-bound callers go per slot until a graft bitwise gate exists. This
+  removes a second cold convention, and Q1 T2 becomes a Class A pair. The
+  alternative keeps the old route for no-boundary cohorts and adds the new
+  one only for the stable cold cohort. Recommended: cutover.
 - **D3. Default on with kill switch** `HF2Q_GEMMA_JOINT_COLD_PREFILL=0`, as
   for joint warm prefill. The bitwise gates are the merge contract.
   Recommended: yes.
 - **D4. ADR wiring.** Add Q4-GEMMA-COLD as a predecessor of Q4-GEMMA-ATTN,
-  whose closing campaign is the combined candidate. Replace the #660 §7
-  cold-turn row with this design's −0.20 to −0.35 s estimate. That moves the
-  sum of all levers to about 2.1–3.2 s against the 3.0 s Win requirement.
+  whose closing campaign is the combined candidate.
+  - **#660 §7 row.** Do not edit the reviewed row in place. Add a dated note
+    (2026-11-04, this design §10): the cold-turn lever is re-estimated at
+    −0.20 to −0.35 s (from 0.4–0.5 s), which moves the sum of all levers to
+    about 2.1–3.2 s against the 3.0 s Win requirement.
+  - **If D1 stops this story** (a Class A gate fails and localization finds
+    no exact fix inside the story), the combined Q4-GEMMA-ATTN candidate
+    proceeds without Q4-GEMMA-COLD and with its kill switch default off or
+    its code reverted. The root restates the Win arithmetic without this
+    lever (about 1.9–2.9 s of levers against 3.0 s) in the ADR before the
+    closing campaign. The story then keeps its localization record as its
+    verdict and goes to the operator as `needs_decision`.
