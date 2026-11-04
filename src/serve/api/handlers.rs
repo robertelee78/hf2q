@@ -8865,6 +8865,7 @@ hf2q_qwen_mtp_fallback_requests_total {qwen_mtp_fallbacks}\n\
 # TYPE hf2q_qwen_mtp_conversation_resets_total counter\n\
 hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
 {qwen_speculation_proposers}\
+{gemma_decode_widths}\
 ",
         uptime = state.uptime_seconds(),
         ready = ready,
@@ -8897,6 +8898,7 @@ hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
         qwen_mtp_fallback_reasons = qwen_mtp_fallback_reasons,
         qwen_mtp_resets = qwen_mtp.conversation_resets.load(Ordering::Relaxed),
         qwen_speculation_proposers = qwen_speculation_proposers,
+        gemma_decode_widths = super::gemma_speculation::TELEMETRY.render_prometheus(),
     );
     // Prometheus exposition format: text/plain with a versioned content-type.
     let mut resp = (StatusCode::OK, body).into_response();

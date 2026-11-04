@@ -37,6 +37,7 @@ pub mod engine_qwen3vl;
 mod engine_supervisor;
 mod frontend_timing;
 mod gcd_policy;
+mod gemma_speculation;
 pub mod grammar;
 pub mod handlers;
 pub mod kv_spill_descriptor;

@@ -56,18 +56,19 @@ pub(super) fn gemma4_test_decode_rows(
         }
         None => crate::inference::models::gemma4::batched_body::BatchedKvRegime::FullTq(kv),
     };
-    let slot_ids: Vec<SlotId> = (0..width).map(|index| SlotId(index as u32)).collect();
+    let windows: Vec<crate::inference::models::gemma4::spec_verify::DecodeWindow> = (0..width)
+        .map(|index| {
+            crate::inference::models::gemma4::spec_verify::DecodeWindow::single(
+                SlotId(index as u32),
+                positions[index],
+                feed_tokens[index],
+            )
+        })
+        .collect();
     let mut fused_head = None;
-    let hidden = g
+    let (hidden, _rows) = g
         .weights
-        .forward_decode_body_batched(
-            &feed_tokens[..width],
-            &slot_ids,
-            &positions[..width],
-            &mut regime,
-            &mut fused_head,
-            &mut g.ctx,
-        )
+        .forward_decode_body_batched(&windows, &mut regime, &mut fused_head, &mut g.ctx)
         .unwrap_or_else(|error| panic!("batched decode body failed ({context}): {error:#}"));
     let head = match fused_head {
         Some(head) => head,

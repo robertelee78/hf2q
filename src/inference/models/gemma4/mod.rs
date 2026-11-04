@@ -31,6 +31,9 @@ pub mod native_matrix;
 mod native_storage;
 mod native_embedding;
 pub mod profile;
+#[cfg(test)]
+pub(crate) mod spec_cost;
+pub(crate) mod spec_verify;
 pub mod tokenizer;
 
 // Re-exports collapse import-site churn for the most-touched types.

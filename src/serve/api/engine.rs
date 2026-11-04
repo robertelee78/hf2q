@@ -43,6 +43,9 @@ pub(crate) mod q1_gemma_cohort;
 #[cfg(test)]
 #[path = "engine/q1_gemma_cancel.rs"]
 pub(crate) mod q1_gemma_cancel;
+#[cfg(test)]
+#[path = "engine/gemma_spec_m0.rs"]
+mod gemma_spec_m0;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -16380,6 +16383,10 @@ fn decode_batch_gemma4(
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
 ) -> Option<SlotAwareGpuFatal> {
+    // ADR-063 Q4-GEMMA-SPEC-SERVE §5.9: per-width tick wall time (the M0
+    // time-weighted width histogram reads it from a speculation-off run).
+    let _tick_timer =
+        super::gemma_speculation::GemmaDecodeTickTimer::start(handles.len(), false);
     // First-max argmax (matches dispatch_argmax_f32's `>` tie-break). Only the
     // VALUE (== logits max) feeds the rerank threshold; the index is a cosmetic
     // seed that finalize_token_from_logits never lets affect the result (the max
@@ -16555,6 +16562,16 @@ fn decode_batch_gemma4(
         // condition as a typed `iter-C2c-cont-invariant-violated` error (see
         // `forward_prefill.rs:4587-4602`); this mirrors that, no silent
         // fallback.
+        let windows: Vec<crate::inference::models::gemma4::spec_verify::DecodeWindow> = tokens
+            .iter()
+            .zip(&sids)
+            .zip(&positions)
+            .map(|((&token, &slot), &position)| {
+                crate::inference::models::gemma4::spec_verify::DecodeWindow::single(
+                    slot, position, token,
+                )
+            })
+            .collect();
         let body_res = supervised_gemma4_gpu_call(supervisor, "gemma4_decode_body", || {
             if crate::debug::INVESTIGATION_ENV.hybrid_kv {
                 match guard.hybrid.as_mut() {
@@ -16564,9 +16581,7 @@ fn decode_batch_gemma4(
                         );
                         let lm = &mut *guard.model;
                         lm.weights.forward_decode_body_batched(
-                            &tokens,
-                            &sids,
-                            &positions,
+                            &windows,
                             &mut regime,
                             &mut fused_head_out,
                             &mut lm.ctx,
@@ -16589,9 +16604,7 @@ fn decode_batch_gemma4(
                     );
                 let lm = &mut *guard.model;
                 lm.weights.forward_decode_body_batched(
-                    &tokens,
-                    &sids,
-                    &positions,
+                    &windows,
                     &mut regime,
                     &mut fused_head_out,
                     &mut lm.ctx,
@@ -16603,7 +16616,7 @@ fn decode_batch_gemma4(
             std::sync::atomic::Ordering::Relaxed,
         );
         match body_res {
-            Ok(h) => {
+            Ok((h, _rows)) => {
                 hidden_rows = h;
                 // The batched body wrote one input token for every captured
                 // slot. The scalar capture path updates this in
