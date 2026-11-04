@@ -122,6 +122,9 @@ pub struct BatchedDecodeBuffers {
     /// queries' NWG partials + S/M land in disjoint regions. Unused by the
     /// default per-slot flash.
     pub sdpa_tmp: MlxBuffer,
+    /// `[layers, N, top_k]` per-step copy of every layer's `moe_expert_ids`
+    /// for the V2 diagnostic (`HF2Q_GEMMA_ROUTING_OVERLAP=1`); `None` when off.
+    pub routing_overlap_ids: Option<MlxBuffer>,
 }
 
 /// Element count of an F32/U32 buffer (4 bytes/element).
@@ -179,6 +182,7 @@ impl BatchedDecodeBuffers {
             moe_down_id_out: f32n(&acts.moe_down_id_out, "moe_down_id_out")?,
             moe_accum: f32n(&acts.moe_accum, "moe_accum")?,
             sdpa_tmp: f32n(&acts.sdpa_tmp, "sdpa_tmp")?,
+            routing_overlap_ids: None,
         })
     }
 
@@ -1980,6 +1984,15 @@ impl MlxModelWeights {
             .map_err(|e| anyhow::anyhow!("batched MoE routing L{layer_idx} slot{i}: {e}"))?;
             }
         }
+        // V2 diagnostic (HF2Q_GEMMA_ROUTING_OVERLAP=1): copy this layer's ids
+        // into the per-step buffer; read after the step's final wait.
+        if let Some(dst) = bufs.routing_overlap_ids.as_ref() {
+            let bytes = (n * ids_stride * 4) as u64;
+            session
+                .encoder_mut()
+                .blit_copy_bytes(&bufs.moe_expert_ids, 0, dst, layer_idx as u64 * bytes, bytes)
+                .map_err(|e| anyhow::anyhow!("routing overlap ids copy L{layer_idx}: {e}"))?;
+        }
         // catsplit: fused_gelu_mul (dense SwiGLU) + per-slot MoE routing/top-k.
         cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
         #[cfg(test)]
@@ -2392,7 +2405,14 @@ impl MlxModelWeights {
         let (exec, reg) = gpu.split();
         let dev = exec.device();
 
-        let bufs = BatchedDecodeBuffers::new(dev, &self.activations, n)?;
+        let mut bufs = BatchedDecodeBuffers::new(dev, &self.activations, n)?;
+        if super::routing_overlap::enabled() {
+            let count = self.layers.len() * n * (elems(&bufs.moe_expert_ids) / n);
+            bufs.routing_overlap_ids = Some(
+                dev.alloc_buffer(count * 4, DType::U32, vec![count])
+                    .map_err(|e| anyhow::anyhow!("body_batched routing overlap alloc: {e}"))?,
+            );
+        }
 
         // Positions buffer [N] u32 for per-slot RoPE.
         let mut positions_buf = dev
@@ -2582,6 +2602,7 @@ impl MlxModelWeights {
                 enc.accumulate_gpu_busy();
             }
             drop(committed);
+            self.record_routing_overlap(&bufs, n, seq_positions, regime)?;
 
             // §25 iter-L: fused head — read exact native-head logits after the
             // single wait. The normed GPU operand is retained through the wait
@@ -2662,6 +2683,7 @@ impl MlxModelWeights {
                 host_phases::Phase::BodyWait,
                 _hp.elapsed().as_nanos() as u64,
             );
+            self.record_routing_overlap(&bufs, n, seq_positions, regime)?;
         }
 
         // Final hidden rows [n, hidden] (pre-final-norm).
@@ -2676,5 +2698,46 @@ impl MlxModelWeights {
             _hp.elapsed().as_nanos() as u64,
         );
         Ok(v)
+    }
+
+    /// V2 diagnostic (`HF2Q_GEMMA_ROUTING_OVERLAP=1`): fold this step's routed
+    /// ids and per-layer KV lengths into the worker-lifetime histograms. Called
+    /// only after the step's final wait; no-op when the buffer was not
+    /// allocated. KV lengths mirror each regime's `ksl_of` in
+    /// [`Self::encode_one_layer_batched`] (hybrid rings subtract the graft).
+    fn record_routing_overlap(
+        &self,
+        bufs: &BatchedDecodeBuffers,
+        n: usize,
+        seq_positions: &[usize],
+        regime: &BatchedKvRegime<'_>,
+    ) -> Result<()> {
+        use super::routing_overlap::{kv_len, record_step, StepLayer};
+        let Some(ids_buf) = bufs.routing_overlap_ids.as_ref() else {
+            return Ok(());
+        };
+        let ids: &[u32] = ids_buf
+            .as_slice()
+            .map_err(|e| anyhow::anyhow!("routing overlap read ids: {e}"))?;
+        let stride = elems(&bufs.moe_expert_ids) / n;
+        let graft_len = self.kv_graft_len();
+        let layers: Vec<StepLayer> = (0..self.layers.len())
+            .map(|l| {
+                let (capacity, ring, offset) = match regime {
+                    BatchedKvRegime::Hybrid(kv) => (kv[l].capacity, kv[l].is_sliding, graft_len),
+                    BatchedKvRegime::FullTq(kv) => (kv[l].capacity, kv[l].is_sliding, 0),
+                };
+                StepLayer {
+                    sliding: self.layers[l].layer_type == LayerType::Sliding,
+                    top_k: self.layers[l].moe.top_k,
+                    kv_lens: seq_positions
+                        .iter()
+                        .map(|&sp| kv_len(sp, capacity, ring, offset))
+                        .collect(),
+                }
+            })
+            .collect();
+        record_step(ids, n, stride, &layers);
+        Ok(())
     }
 }

@@ -31,6 +31,7 @@ pub mod native_matrix;
 mod native_storage;
 mod native_embedding;
 pub mod profile;
+pub(crate) mod routing_overlap;
 pub mod tokenizer;
 
 // Re-exports collapse import-site churn for the most-touched types.

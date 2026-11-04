@@ -13318,6 +13318,7 @@ fn run_slot_aware_gemma4(
         }
     }
     crate::serve::gemma_prefill_catsplit::emit_worker_exit();
+    crate::inference::models::gemma4::routing_overlap::emit_worker_exit();
 
     // Guard drops here → KV restored into `model` on every exit path.
     drop(guard);
