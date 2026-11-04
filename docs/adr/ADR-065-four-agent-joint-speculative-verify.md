@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-31
-- **Updated:** 2026-11-01 — accepted by the owner; execution waits for the ADR-063 v0.1.28 milestone to complete.
+- **Updated:** 2026-11-03 — operator decision on B1 fairness (B1 review finding 3): fairness is ADR-063 Q3's block-paired regression test (fail only if the B/A interval lower bound exceeds 1.025 on worst-slot p95 semantic TTFT or worst-slot maximum semantic SSE gap); the frozen worst-ever baseline ceilings survive only as a 1.5× per-run, per-slot safety cap, set from `CalibrationPass`, thermal-valid baseline runs; campaign completeness and the `n1` control are explicit acceptance gates (see "Measurement and acceptance rules"). Earlier 2026-11-01 — accepted by the owner; execution waits for the ADR-063 v0.1.28 milestone to complete.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speculation, joint-decode, speed
 - **Depends on:** ADR-063
@@ -98,7 +98,13 @@ Every hardware run MUST record source commit, binary SHA-256, artifact digest, n
 
 A two-arm A/B MUST use one binary with arms differing only in a kill switch, ABBA-balanced paired blocks with warm-up, and a block count fixed before qualification. This ADR extends ADR-063's 5-to-20-block bound and the F2 fixed-count rule to two arms: 6 blocks by default, or 8, 12, 16 or 20 chosen from a separately labelled pilot whose runs are never pooled, with no sequential peeking. The primary effect is the paired log-makespan Student-t 95% interval, as a percentage-point reduction. Verdicts are mutually exclusive and assigned in this order: **Loss** if the interval excludes zero unfavourably; **Win** if it excludes zero favourably with a half-width of at most 2.5 points; **Equivalent** if it contains zero and lies entirely within ±2.5 points (a bounded no-difference result); otherwise **Inconclusive**, which is never reported as neutral or as a win. Task, tool, protocol, isolation or truncation failures make a run quality-ineligible and are retained. Controls: for a change that should not engage with one agent, the N=1 control's interval MUST lie within ±2.5 points; mixed 3+1, 2+2 and 1+3 phases are reported. A story whose primary comparison is itself an N=1 A/B (J6) has no N=1 control. "The previous default" in any story means the immediately preceding default configuration of the same binary, with every other ADR-065 kill switch held at its current default.
 
-Fairness ceilings MUST be frozen from the phase-1 baseline before any candidate run: per-run, per-slot p95 semantic TTFT and per-run maximum semantic SSE gap (ADR-063 F2 estimands), each ceiling being the largest baseline value. Every candidate run and slot MUST stay at or below both ceilings; no median or pooled aggregate may hide a violating run.
+Fairness MUST be checked per workload with ADR-063 Q3's paired fairness test. For the run's worst-slot p95 semantic TTFT and its worst-slot maximum semantic SSE gap (ADR-063 F2 estimands), compute the block-paired candidate/previous-default log ratio and its Student-t 95% interval. A candidate fails if the interval's lower bound exceeds 1.025, the 2.5-point neutral band. A metric that is measurable but has no interval fails. A metric that no passing run measures (one semantic event per streamed turn) does not gate.
+
+In addition, the phase-1 baseline freezes per-run, per-slot p95 semantic TTFT and per-run maximum semantic SSE gap, each ceiling being the largest value over eligible baseline runs. A run is eligible when it passed, its Q5 verdict is `CalibrationPass`, and it saw no serious or critical thermal state. Every candidate run and slot MUST stay at or below 1.5 × both ceilings, an absolute safety cap. No median or pooled aggregate may replace either check.
+
+A campaign that is not `Complete` fails acceptance. A required `n1` control MUST complete with all of its fixed blocks quality-eligible. The Win precision test uses ADR-063's 100·(e^h − 1) half-width, slightly stricter than "a half-width of at most 2.5 points" applied to the log interval; the operator accepted the stricter reading.
+
+Amendment record (operator decision, 2026-11-03; B1 review finding 3): the two paragraphs above replace the original rule, "Fairness ceilings MUST be frozen from the phase-1 baseline before any candidate run: per-run, per-slot p95 semantic TTFT and per-run maximum semantic SSE gap (ADR-063 F2 estimands), each ceiling being the largest baseline value. Every candidate run and slot MUST stay at or below both ceilings; no median or pooled aggregate may hide a violating run." Under that rule a candidate identical to the baseline failed in about 99.7% of five-stage campaigns. Design and campaign parameters: `docs/research/adr065-b1-campaign.md` (branch `feat/adr065-b1-baseline`, `1dad1672`), implemented by `scripts/four_agent/adr065_stats.py`.
 
 Execution prerequisites apply to every hardware run: one named integration owner schedules it; the host is reserved exclusively; no peer or other hf2q process is loaded; at least 60 seconds separate engine loads; the official artifacts and Q5 case files named in B1's campaign file are used; Q5 admission is re-established whenever the binary, artifact, workload or capture footprint changes.
 
@@ -111,7 +117,7 @@ A story closes by type:
 | Native primitive | mlx-native contract and parity tests on both metallib paths; where a kernel is built, a distinct-matrix microbenchmark at served shapes, a merged and published release and verified crates.io bytes; where existing primitives suffice, a merged qualification record instead. |
 | hf2q integration | Exact native pin from a clean registry build where a primitive is consumed; applicable contract tests on the official artifact; cancel smoke; four-agent A/B against the previous default; quality and fairness as above; independent verdict. |
 | Refactor | Serving transcripts `ExactTranscripts` against the previous default; existing gates pass. |
-| Policy | Unit tests against brute force, transaction tests re-run, four-agent A/B, quality, fairness ceilings, independent verdict. |
+| Policy | Unit tests against brute force, transaction tests re-run, four-agent A/B, quality, fairness (paired test and safety cap), independent verdict. |
 
 ## Repository ownership
 
@@ -128,9 +134,9 @@ Requirement: The program MUST freeze the phase-1 baseline, fairness ceilings and
 Acceptance:
 
 - Record the phase-1 default binary, artifact digests, native version and case files for Qwen3.8 and DeepSeek-V4.
-- Run the predeclared baseline campaign and retain per-run, per-slot p95 semantic TTFT and maximum semantic SSE gap; publish the ceilings.
+- Run the predeclared baseline campaign and retain per-run, per-slot p95 semantic TTFT and maximum semantic SSE gap; publish the ceilings used by the safety cap (operator decision, 2026-11-03), computed only from `CalibrationPass`, thermal-valid baseline runs.
 - A checked-in campaign file names, per family, the official artifact path and digest, the Q5 case file, the run order, the block definition (one block is one paired A and B run; consecutive blocks alternate AB and BA so each pair of blocks forms ABBA), each later A/B's fixed block count, controls, cooldown and total run budget.
-- A checked-in two-arm analysis tool implements the fixed-count paired log-makespan interval, the Win, Loss, Equivalent and Inconclusive verdicts, the per-run fairness checks and retention of failed runs, with unit tests on synthetic receipts.
+- A checked-in two-arm analysis tool implements the fixed-count paired log-makespan interval, the Win, Loss, Equivalent and Inconclusive verdicts, the paired fairness test, the per-run and per-slot safety cap, the completeness and `n1`-control gates and retention of failed runs, with unit tests on synthetic receipts.
 
 Repository ownership: hf2q owns campaign files and receipts; no native change.
 
@@ -424,7 +430,7 @@ Acceptance:
 
 - Q5 admission for the J4 binary with the switch on, including its capture footprint.
 - Cancel smoke with the switch on.
-- Four-agent A/B against the previous default under the A/B rule, with quality and per-run fairness ceilings.
+- Four-agent A/B against the previous default under the A/B rule, with quality and fairness (paired test and per-run safety cap).
 - The default turns on only on a Win with quality and fairness passing; otherwise it stays off and the verdict is recorded.
 
 Repository ownership: hf2q.
