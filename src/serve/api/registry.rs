@@ -250,18 +250,18 @@ impl ModelRegistration {
     ///   marker (chat_template.jinja:189-205 emits calls back-to-back
     ///   with the next call's `<|tool_call>` immediately after the
     ///   previous `<tool_call|>`).
-    /// * Qwen 3.5/3.6: `"\n<tool_call>\n"` — `\n` separator + open
-    ///   marker + `\n` (mirrors the chat_template loop's
-    ///   `\n<tool_call>\n...\n</tool_call>` per-call pattern; the
-    ///   trailing `\n</tool_call>` is provided by the per-fn body-only
-    ///   shape).
+    /// * Qwen 3.5/3.6/3.8 and Qwen3-VL: `"\n<tool_call>"` — `\n`
+    ///   separator + open marker.  Each per-fn body-only alt already
+    ///   starts with the `\n` the template emits after `<tool_call>` and
+    ///   ends with `\n</tool_call>`, so together they reproduce the
+    ///   chat_template loop's `\n<tool_call>\n...\n</tool_call>` per-call
+    ///   pattern byte-for-byte.
     /// * Unknown families: empty string (combiner rejects unknown
     ///   families before this method is called).
     pub fn auto_lazy_multi_fn_inter_call(&self) -> &'static str {
         match self.family {
             "gemma4" => "<|tool_call>",
-            "qwen35" => "\n<tool_call>\n",
-            "qwen3vl" => "\n<tool_call>\n",
+            "qwen35" | "qwen3vl" => "\n<tool_call>",
             // DeepSeek puts multiple invokes inside one outer block. The
             // dedicated emitter carries that repetition; multi-function
             // combination uses a newline between body alternatives.
@@ -362,12 +362,13 @@ pub enum GrammarShape {
     ///
     /// Concrete shape:
     ///   * `parallel = false`:
-    ///       Gemma 4: `body close_marker space`
-    ///       Qwen 3.5/3.6: `body \n close_marker space` (mirrors the
-    ///         chat_template's `\n</tool_call>` close form)
+    ///       Gemma 4: `body close_marker`
+    ///       Qwen 3.5/3.6/3.8: `\n body \n close_marker` (the template
+    ///         emits `<tool_call>\n<function=...` and `</function>\n</tool_call>`;
+    ///         only the open marker itself belongs to the trigger)
     ///   * `parallel = true`:
-    ///       Gemma 4: `body close_marker ( open_marker body close_marker )* space`
-    ///       Qwen 3.5/3.6: `body \n close_marker ( \n open_marker \n body \n close_marker )* space`
+    ///       Gemma 4: `body close_marker ( open_marker body close_marker )*`
+    ///       Qwen 3.5/3.6/3.8: `\n body \n close_marker ( \n open_marker \n body \n close_marker )*`
     ///
     /// Audit recommendation reference (research-report.md §Q1+§Q2): the
     /// canonical Wave 2.6 architecture is "grammar = body validator;
@@ -3194,7 +3195,10 @@ fn qwen35_tool_call_gbnf(
     // repeat (OneOrMoreCalls) shape.
     let single_body: String = if let Some(props) = properties {
         if props.is_empty() {
-            format!("{} {}", func_open_lit, func_close_lit)
+            // The template emits `'<function=' + name + '>\n'` before any
+            // parameters, so a zero-parameter call is
+            // `<function=NAME>\n</function>`.
+            format!("{} {} {}", func_open_lit, newline_lit, func_close_lit)
         } else {
             let mut required_block_names: Vec<String> = Vec::new();
             let mut optional_block_names: Vec<String> = Vec::new();
@@ -3300,9 +3304,10 @@ fn qwen35_tool_call_gbnf(
     //     ' }}` branch.
     //   * `OneOrMoreCallsBodyOnly{p}`        → Wave 3.5 HIGH-1 Auto-lazy
     //     variant.  Strips the FIRST open marker (consumed by the
-    //     awaiting_trigger no-op gate before the grammar is engaged).
-    //     Single: `body \n close_marker`; parallel:
-    //     `body \n close_marker ( \n open_marker \n body \n close_marker )* space`.
+    //     awaiting_trigger no-op gate before the grammar is engaged) but
+    //     keeps the `\n` the template emits after it.
+    //     Single: `\n body \n close_marker`; parallel:
+    //     `\n body \n close_marker ( \n open_marker \n body \n close_marker )*`.
     //     See `GrammarShape::OneOrMoreCallsBodyOnly` doc-comment for the
     //     production-order rationale.
     // iter-219b grammar-exhaust fix (2026-05-01): drop trailing ` space`
@@ -3346,8 +3351,9 @@ fn qwen35_tool_call_gbnf(
             let open_marker = gbnf_literal("<tool_call>");
             let close_marker = gbnf_literal("</tool_call>");
             if parallel {
-                // First call: `body \n close_marker` (no leading
-                // `<tool_call>\n`).  Subsequent calls: full
+                // First call: `\n body \n close_marker` (the trigger
+                // consumed `<tool_call>`; the template's `\n` after it is
+                // still grammar-owned).  Subsequent calls: full
                 // `\n <tool_call> \n body \n </tool_call>` (matches the
                 // chat_template loop's `\n<tool_call>\n...\n</tool_call>`
                 // separator pattern).
@@ -3360,13 +3366,13 @@ fn qwen35_tool_call_gbnf(
                     ),
                 ));
                 format!(
-                    "{} {} {} ( {} {} )*",
-                    single_body, newline_lit, close_marker, newline_lit, qwen_call_rule
+                    "{} {} {} {} ( {} {} )*",
+                    newline_lit, single_body, newline_lit, close_marker, newline_lit, qwen_call_rule
                 )
             } else {
-                // Single call: body + `\n</tool_call>` (close marker
-                // preceded by `\n` per the template emission pattern).
-                format!("{} {} {}", single_body, newline_lit, close_marker)
+                // Single call: `\n` + body + `\n</tool_call>` exactly as the
+                // template emits after `<tool_call>`.
+                format!("{} {} {} {}", newline_lit, single_body, newline_lit, close_marker)
             }
         }
     };
@@ -6849,7 +6855,8 @@ mod tests {
     fn qwen35_tool_call_grammar_accepts_empty_params() {
         let schema = r#"{"type": "object", "properties": {}}"#;
         let mut rt = qwen35_runtime("ping", schema);
-        let input = b"<function=ping></function>";
+        // Template: `'<function=' + name + '>\n'` then `'</function>'`.
+        let input = b"<function=ping>\n</function>";
         assert!(rt.accept_bytes(input), "empty params form rejected");
         assert!(rt.is_accepted(), "not accepted");
     }
@@ -8236,6 +8243,206 @@ mod tests {
             .tool_call_gbnf(fn_name, &schema, GrammarShape::OneOrMoreCalls { parallel })
             .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
         grammar_runtime_for_gbnf(&gbnf)
+    }
+
+    /// Bytes the in-tree Qwen3.6/3.8 chat template emits for an assistant
+    /// turn carrying `calls`, from just after the first `<tool_call>`
+    /// (the lazy trigger) through the final `</tool_call>`.
+    fn qwen_template_native_tool_bytes(calls: &[(&str, serde_json::Value)]) -> String {
+        use crate::serve::api::schema::{ChatMessage, MessageContent, ToolCall, ToolCallFunction};
+        let user = ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Text("fix the build".into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let assistant = ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(
+                calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (name, arguments))| ToolCall {
+                        id: format!("call-{index}"),
+                        call_type: "function".into(),
+                        function: ToolCallFunction {
+                            name: (*name).into(),
+                            arguments: arguments.to_string(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            name: None,
+        };
+        let rendered = crate::serve::api::engine::render_chat_prompt_with_tools_generation_prompt(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &[user, assistant],
+            None,
+            false,
+            None,
+            false,
+        )
+        .expect("render Qwen template");
+        let start = rendered.find("<tool_call>").expect("open marker") + "<tool_call>".len();
+        let end = rendered.rfind("</tool_call>").expect("close marker") + "</tool_call>".len();
+        rendered[start..end].to_string()
+    }
+
+    const QWEN_NATIVE_READ_FILE_SCHEMA: &str = r#"{
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"]
+    }"#;
+
+    fn qwen_auto_lazy_runtime(
+        model: &str,
+        fn_name: &str,
+        schema_json: &str,
+        parallel: bool,
+    ) -> crate::serve::api::grammar::sampler::GrammarRuntime {
+        let registration = find_for(model).unwrap_or_else(|| panic!("{model} registration"));
+        assert_eq!(registration.family, "qwen35", "{model} uses the Qwen XML tool wire");
+        let schema: serde_json::Value = serde_json::from_str(schema_json).unwrap();
+        let gbnf = registration
+            .tool_call_gbnf(fn_name, &schema, GrammarShape::OneOrMoreCallsBodyOnly { parallel })
+            .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
+        let mut runtime = grammar_runtime_for_gbnf(&gbnf);
+        runtime.set_lazy_trigger(registration.tool_open.expect("tool_open").as_bytes());
+        runtime
+    }
+
+    /// #662 fork replay: after the `<tool_call>` trigger the Auto-lazy
+    /// grammar must accept the template's own `\n<function=...` bytes, token
+    /// by token, for every Qwen release on the XML tool wire.
+    #[test]
+    fn qwen_auto_lazy_grammar_accepts_template_native_tool_call_bytes() {
+        let native = qwen_template_native_tool_bytes(&[(
+            "read_file",
+            serde_json::json!({"path": "src/main.rs"}),
+        )]);
+        assert_eq!(
+            native,
+            "\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call>"
+        );
+        for model in ["qwen3.6-35b-a3b", "Qwen/Qwen3.8-27B"] {
+            let mut rt = qwen_auto_lazy_runtime(model, "read_file", QWEN_NATIVE_READ_FILE_SCHEMA, false);
+            assert!(rt.accept_bytes(b"I'll read the entry point first.\n\n"));
+            assert!(rt.accept_bytes(b"<tool_call>"));
+            assert!(!rt.is_awaiting_trigger(), "{model}: trigger did not fire");
+            // Token-by-token as the Qwen tokenizer splits it: `\n` is its own
+            // token after the `<tool_call>` special token.
+            assert!(rt.accept_bytes(b"\n"), "{model}: native newline after <tool_call> rejected");
+            assert!(rt.accept_bytes(native[1..].as_bytes()), "{model}: native body rejected");
+            assert!(rt.is_accepted(), "{model}: native call not accepted");
+        }
+
+        let ping = qwen_template_native_tool_bytes(&[("ping", serde_json::json!({}))]);
+        assert_eq!(ping, "\n<function=ping>\n</function>\n</tool_call>");
+        let mut rt = qwen_auto_lazy_runtime(
+            "qwen3.6",
+            "ping",
+            r#"{"type":"object","properties":{}}"#,
+            false,
+        );
+        assert!(rt.accept_bytes(format!("<tool_call>{ping}").as_bytes()));
+        assert!(rt.is_accepted(), "native zero-argument call not accepted");
+    }
+
+    /// The newline is required, not optional: the grammar admits exactly the
+    /// template encoding and nothing looser.
+    #[test]
+    fn qwen_auto_lazy_grammar_rejects_non_native_bytes_after_trigger() {
+        for junk in [
+            "<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call>",
+            "\n\n<function=read_file>",
+            " \n<function=read_file>",
+            "\r\n<function=read_file>",
+            "\n <function=read_file>",
+            "\n<function=read_file><parameter=path>",
+            "\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function></tool_call>",
+            "\n{\"name\":\"read_file\"}",
+        ] {
+            let mut rt =
+                qwen_auto_lazy_runtime("qwen3.6", "read_file", QWEN_NATIVE_READ_FILE_SCHEMA, false);
+            assert!(
+                !rt.accept_bytes(format!("<tool_call>{junk}").as_bytes()),
+                "non-native bytes accepted: {junk:?}"
+            );
+        }
+        let mut rt = qwen_auto_lazy_runtime("qwen3.6", "ping", r#"{"type":"object","properties":{}}"#, false);
+        assert!(
+            !rt.accept_bytes(b"<tool_call>\n<function=ping></function>"),
+            "zero-argument call without the template newline accepted"
+        );
+    }
+
+    /// Post-trigger mask: the template newline survives; the compact
+    /// `<function=` form and any other whitespace are masked.
+    #[test]
+    fn qwen_auto_lazy_mask_admits_only_native_newline_after_trigger() {
+        use crate::serve::api::grammar::mask;
+        let mut rt = qwen_auto_lazy_runtime("Qwen3.8", "read_file", QWEN_NATIVE_READ_FILE_SCHEMA, false);
+        assert!(rt.accept_bytes(b"<tool_call>"));
+        let token_bytes: Vec<Vec<u8>> = vec![
+            b"\n".to_vec(),
+            b"\n<".to_vec(),
+            b"<function=".to_vec(),
+            b"\n\n".to_vec(),
+            b" ".to_vec(),
+            b"\t".to_vec(),
+        ];
+        let mut logits = vec![0.0_f32; token_bytes.len()];
+        let masked = mask::mask_invalid_tokens(&rt, &token_bytes, &mut logits);
+        assert_eq!(masked, 4, "logits = {logits:?}");
+        assert!(logits[0].is_finite() && logits[1].is_finite());
+        assert!(logits[2..].iter().all(|logit| !logit.is_finite()));
+    }
+
+    /// Parallel Auto-lazy calls follow the template loop: the first call is
+    /// `\n body \n</tool_call>`, later calls `\n<tool_call>\n body \n</tool_call>`.
+    #[test]
+    fn qwen_auto_lazy_parallel_grammar_accepts_template_native_calls() {
+        let native = qwen_template_native_tool_bytes(&[
+            ("read_file", serde_json::json!({"path": "src/main.rs"})),
+            ("read_file", serde_json::json!({"path": "src/lib.rs"})),
+        ]);
+        assert!(native.contains("</tool_call>\n<tool_call>\n<function=read_file>"));
+        let mut rt = qwen_auto_lazy_runtime("qwen3.6", "read_file", QWEN_NATIVE_READ_FILE_SCHEMA, true);
+        assert!(rt.accept_bytes(format!("<tool_call>{native}").as_bytes()));
+        assert!(rt.is_accepted(), "native parallel calls not accepted");
+
+        let mut doubled = qwen_auto_lazy_runtime("qwen3.6", "read_file", QWEN_NATIVE_READ_FILE_SCHEMA, true);
+        let non_native = native.replacen("</tool_call>\n<tool_call>\n", "</tool_call>\n<tool_call>\n\n", 1);
+        assert!(!doubled.accept_bytes(format!("<tool_call>{non_native}").as_bytes()));
+    }
+
+    /// Unary parsing handles both the template-native body and the compact
+    /// form older hf2q grammars produced.
+    #[test]
+    fn parse_qwen35_accepts_native_and_compact_bodies() {
+        let native = qwen_template_native_tool_bytes(&[(
+            "read_file",
+            serde_json::json!({"path": "src/main.rs"}),
+        )]);
+        let native_body = native.strip_suffix("</tool_call>").unwrap();
+        for body in [
+            native_body,
+            "<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>",
+            "<function=read_file><parameter=path>src/main.rs</parameter></function>",
+        ] {
+            let parsed = parse_tool_call_body(&QWEN35, body).unwrap_or_else(|| panic!("parse {body:?}"));
+            assert_eq!(parsed.name, "read_file");
+            let args: serde_json::Value = serde_json::from_str(&parsed.arguments_json).unwrap();
+            assert_eq!(args, serde_json::json!({"path": "src/main.rs"}));
+        }
+        let ping = parse_tool_call_body(&QWEN35, "\n<function=ping>\n</function>\n").expect("ping");
+        assert_eq!(ping.name, "ping");
+        assert_eq!(ping.arguments_json, "{}");
     }
 
     /// T-QA-1: Gemma 4 eager grammar accepts the canonical marker-wrapped call.

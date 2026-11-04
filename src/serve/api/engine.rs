@@ -43244,45 +43244,53 @@ mod tool_call_stream_emitter_tests {
         assert!(saw_tc, "saw_tc MUST latch true after finalize");
     }
 
-    /// Qwen 3.5/3.6 streaming — `<function=NAME>...<parameter=KEY>VAL</parameter>...</function>`
-    /// emits one delta per closed `<parameter>` block.
+    /// Qwen 3.5/3.6/3.8 streaming — `<function=NAME>...<parameter=KEY>VAL</parameter>...</function>`
+    /// emits one delta per closed `<parameter>` block, both for the compact
+    /// body and for the template-native body that keeps the `\n` after
+    /// `<tool_call>` and before `</tool_call>` (#662).
     #[test]
     fn streaming_qwen35_emits_per_parameter_block() {
-        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(32);
-        let mut emitter = ToolCallStreamEmitter::new(Some("qwen35"), 0);
-        let mut body = String::new();
-        body.push_str("<function=lookup>");
-        emitter.advance(&body, &EventSink::new(&tx)).expect("frag1");
-        body.push_str("\n<parameter=q>\n\"hello\"\n</parameter>");
-        emitter.advance(&body, &EventSink::new(&tx)).expect("frag2");
-        body.push_str("\n<parameter=k>\n5\n</parameter>\n</function>");
-        emitter.advance(&body, &EventSink::new(&tx)).expect("frag3");
-        let mut tc_index: usize = 0;
-        let mut saw_tc: bool = false;
-        emitter
-            .finalize(
-                body.clone(),
-                Some(&super::super::registry::QWEN35),
-                ToolCallPolicy::Constrained,
-                &mut tc_index,
-                &mut saw_tc,
-                &EventSink::new(&tx),
+        for (lead, trail) in [("", ""), ("\n", "\n")] {
+            let (tx, mut rx) = mpsc::channel::<GenerationEvent>(32);
+            let mut emitter = ToolCallStreamEmitter::new(Some("qwen35"), 0);
+            let mut body = String::from(lead);
+            body.push_str("<function=lookup>");
+            emitter.advance(&body, &EventSink::new(&tx)).expect("frag1");
+            body.push_str("\n<parameter=q>\n\"hello\"\n</parameter>");
+            emitter.advance(&body, &EventSink::new(&tx)).expect("frag2");
+            body.push_str("\n<parameter=k>\n5\n</parameter>\n</function>");
+            body.push_str(trail);
+            emitter.advance(&body, &EventSink::new(&tx)).expect("frag3");
+            let mut tc_index: usize = 0;
+            let mut saw_tc: bool = false;
+            emitter
+                .finalize(
+                    body.clone(),
+                    Some(&super::super::registry::QWEN35),
+                    ToolCallPolicy::Constrained,
+                    &mut tc_index,
+                    &mut saw_tc,
+                    &EventSink::new(&tx),
+                )
+                .expect("finalize");
+            drop(tx);
+            let events = drain(&mut rx);
+            let (name, args) = rebuild_call(&events, 0);
+            assert_eq!(name.as_deref(), Some("lookup"), "lead={lead:?}");
+            let v: serde_json::Value =
+                serde_json::from_str(&args).expect("args concatenate to valid JSON");
+            let canonical = super::super::registry::parse_tool_call_body(
+                &super::super::registry::QWEN35,
+                &body,
             )
-            .expect("finalize");
-        drop(tx);
-        let events = drain(&mut rx);
-        let (name, args) = rebuild_call(&events, 0);
-        assert_eq!(name.as_deref(), Some("lookup"));
-        let v: serde_json::Value =
-            serde_json::from_str(&args).expect("args concatenate to valid JSON");
-        let canonical =
-            super::super::registry::parse_tool_call_body(&super::super::registry::QWEN35, &body)
-                .expect("canonical");
-        let cv: serde_json::Value = serde_json::from_str(&canonical.arguments_json).unwrap();
-        assert_eq!(
-            v, cv,
-            "Qwen 3.5/3.6 streaming args MUST equal canonical parse"
-        );
+            .expect("canonical");
+            let cv: serde_json::Value = serde_json::from_str(&canonical.arguments_json).unwrap();
+            assert_eq!(
+                v, cv,
+                "Qwen streaming args MUST equal canonical parse (lead={lead:?})"
+            );
+            assert_eq!(v, serde_json::json!({"q": "hello", "k": 5}));
+        }
     }
 
     /// Streaming twin of `parse_qwen35_keeps_captured_write_file_whitespace`:
@@ -58292,6 +58300,12 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
             (
                 "Qwen3.6",
                 "<tool_call><function=read_file><parameter=path>\"/tmp/a.rs\"</parameter></function></tool_call>",
+                "read_file",
+            ),
+            (
+                // Template-native Qwen3.6/3.8 encoding (#662).
+                "Qwen3.8",
+                "<tool_call>\n<function=read_file>\n<parameter=path>\n\"/tmp/a.rs\"\n</parameter>\n</function>\n</tool_call>",
                 "read_file",
             ),
         ] {
